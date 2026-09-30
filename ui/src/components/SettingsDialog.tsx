@@ -1,14 +1,22 @@
 import { useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { Bot, Check, Copy, Globe, KeyRound, Loader2, Plug, Plus, ScrollText, Server, Trash2 } from "lucide-react";
+import { AlertCircle, Bot, Check, Copy, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, Terminal, Trash2 } from "lucide-react";
 import { api, toError } from "../lib/api";
-import type { AuditEntry, ProviderAuth, ProviderKind, ProviderView } from "../lib/types";
+import type { AuditEntry, KiroStatus, ProviderAuth, ProviderKind, ProviderView } from "../lib/types";
 import { relativeTime } from "../lib/util";
 import { useStore } from "../store";
 import { useAi } from "../aiStore";
 import { Modal } from "./ui";
 
 export const PROVIDER_KINDS: { kind: ProviderKind; label: string; base: string; auth: ProviderAuth[]; model: string; hint?: string }[] = [
+  {
+    kind: "kiro",
+    label: "Kiro",
+    base: "",
+    auth: ["kiro_browser", "api_key"],
+    model: "auto",
+    hint: "Uses your Kiro subscription through kiro-cli. Sign in with the browser (Builder ID, GitHub, Google, IAM Identity Center) or use a Kiro API key (ksk_…, Pro plans).",
+  },
   { kind: "openai", label: "OpenAI", base: "https://api.openai.com/v1", auth: ["api_key"], model: "gpt-4.1" },
   { kind: "anthropic", label: "Anthropic", base: "https://api.anthropic.com/v1", auth: ["api_key"], model: "claude-sonnet-4-5" },
   { kind: "gemini", label: "Google Gemini", base: "https://generativelanguage.googleapis.com/v1beta", auth: ["api_key", "google_adc"], model: "gemini-2.5-pro" },
@@ -45,6 +53,7 @@ const AUTH_LABEL: Record<ProviderAuth, string> = {
   browser_openrouter: "Browser sign-in",
   azure_cli: "Azure CLI (az login)",
   google_adc: "Google ADC (gcloud)",
+  kiro_browser: "Browser sign-in",
   none: "No auth",
 };
 
@@ -96,7 +105,7 @@ function Providers() {
             className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12.5px] ${sel === p.id ? "bg-hover" : "hover:bg-hover"}`}
           >
             <span className="min-w-0 flex-1 truncate">{p.name}</span>
-            {(p.has_key || p.config.auth === "none" || p.config.auth === "azure_cli" || p.config.auth === "google_adc") && (
+            {(p.has_key || ["none", "azure_cli", "google_adc", "kiro_browser"].includes(p.config.auth)) && (
               <Check size={12} className="text-success" />
             )}
           </button>
@@ -143,7 +152,25 @@ function ProviderForm({
   const [fastModel, setFastModel] = useState(initial?.config.fast_model ?? "");
   const [apiVersion, setApiVersion] = useState(initial?.config.api_version ?? (kind === "azure_openai" ? "2024-10-21" : ""));
   const [models, setModels] = useState<string[]>([]);
-  const [busy, setBusy] = useState<null | "save" | "signin" | "models">(null);
+  const [busy, setBusy] = useState<null | "save" | "signin" | "models" | "status">(null);
+  const [kiro, setKiro] = useState<KiroStatus | null>(null);
+  const isKiro = kind === "kiro";
+
+  const refreshKiro = async (id = initial?.id) => {
+    if (!id) return;
+    setBusy((b) => b ?? "status");
+    try {
+      setKiro(await api.aiProviderStatus(id));
+    } catch (e) {
+      setKiro({ installed: false, signed_in: false, message: toError(e).message });
+    } finally {
+      setBusy((b) => (b === "status" ? null : b));
+    }
+  };
+  useEffect(() => {
+    if (initial?.kind === "kiro") void refreshKiro(initial.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initial?.id, initial?.config.auth]);
 
   const changeKind = (k: ProviderKind) => {
     setKind(k);
@@ -178,6 +205,7 @@ function ProviderForm({
       );
       setApiKey("");
       await onSaved(rec.id);
+      if (isKiro) await refreshKiro(rec.id);
       const ai = useAi.getState();
       if (!ai.providerId || ai.providerId === rec.id) ai.setProvider(rec.id, model.trim() || null);
       toast(`Saved ${rec.name}`, "success");
@@ -194,11 +222,13 @@ function ProviderForm({
     const id = initial?.id ?? (await save());
     if (!id) return;
     setBusy("signin");
-    useStore.getState().setSignIn({ connectionId: null, label: "Sign in to OpenRouter", event: null });
+    const label = isKiro ? "Sign in to Kiro" : "Sign in to OpenRouter";
+    useStore.getState().setSignIn({ connectionId: null, label, event: null });
     try {
       await api.aiProviderSignIn(id);
-      toast("Signed in to OpenRouter", "success");
+      toast(isKiro ? "Signed in to Kiro" : "Signed in to OpenRouter", "success");
       await onSaved(id);
+      if (isKiro) await refreshKiro(id);
     } catch (e) {
       const err = toError(e);
       if (err.kind !== "cancelled") toast(err.message, "error");
@@ -270,18 +300,44 @@ function ProviderForm({
         </div>
       </div>
       <div>
-        <L>Base URL {kind === "azure_openai" || kind === "openai_compatible" ? "(required)" : ""}</L>
-        <input className="field font-mono text-[12px]" value={baseUrl} placeholder={spec.base || "https://…"} onChange={(e) => setBaseUrl(e.target.value)} />
+        <L>{isKiro ? "kiro-cli path (optional)" : `Base URL ${kind === "azure_openai" || kind === "openai_compatible" ? "(required)" : ""}`}</L>
+        <input
+          className="field font-mono text-[12px]"
+          value={baseUrl}
+          placeholder={isKiro ? "auto-detect (PATH, ~/.local/bin)" : spec.base || "https://…"}
+          onChange={(e) => setBaseUrl(e.target.value)}
+        />
       </div>
+      {isKiro && (
+        <KiroPanel
+          status={kiro}
+          auth={auth}
+          saved={!!initial}
+          busy={busy}
+          onSignIn={signIn}
+          onRefresh={() => void refreshKiro()}
+          onSignOut={async () => {
+            if (!initial) return;
+            try {
+              await api.aiProviderSignOut(initial.id);
+              toast(auth === "kiro_browser" ? "Signed out of kiro-cli" : "API key removed", "success");
+              await onSaved(initial.id);
+              await refreshKiro();
+            } catch (e) {
+              toast(toError(e).message, "error");
+            }
+          }}
+        />
+      )}
       {auth === "api_key" && (
         <div>
-          <L>API key</L>
+          <L>{isKiro ? "Kiro API key" : "API key"}</L>
           <input
             type="password"
             className="field"
             autoComplete="off"
             value={apiKey}
-            placeholder={initial?.has_key ? "•••••••• (saved in keychain)" : "Paste key"}
+            placeholder={initial?.has_key ? "•••••••• (saved in keychain)" : isKiro ? "ksk_… (create one at app.kiro.dev → API Keys)" : "Paste key"}
             onChange={(e) => setApiKey(e.target.value)}
           />
           <p className="mt-1 text-[11px] text-muted">Stored in the OS keychain, never in the workspace database.</p>
@@ -306,7 +362,7 @@ function ProviderForm({
       )}
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <L>{kind === "azure_openai" ? "Deployment" : "Default model"}</L>
+          <L>{kind === "azure_openai" ? "Deployment" : isKiro ? "Model (auto = Kiro picks)" : "Default model"}</L>
           <div className="flex gap-1">
             <input className="field" list="prov-models" value={model} placeholder={spec.model} onChange={(e) => setModel(e.target.value)} />
             {initial && (
@@ -430,3 +486,88 @@ function Audit() {
     </div>
   );
 }
+
+function KiroPanel({
+  status,
+  auth,
+  saved,
+  busy,
+  onSignIn,
+  onRefresh,
+  onSignOut,
+}: {
+  status: KiroStatus | null;
+  auth: ProviderAuth;
+  saved: boolean;
+  busy: string | null;
+  onSignIn: () => void;
+  onRefresh: () => void;
+  onSignOut: () => void;
+}) {
+  const browser = auth === "kiro_browser";
+  return (
+    <div className="space-y-2 rounded-lg border border-line bg-panel-2 p-2.5 text-[12.5px]">
+      <div className="flex items-center gap-2">
+        {!saved ? (
+          <span className="text-muted">Save the provider to check kiro-cli and sign in.</span>
+        ) : !status ? (
+          <span className="flex items-center gap-1.5 text-muted">
+            <Loader2 size={12} className="animate-spin" /> Checking kiro-cli…
+          </span>
+        ) : status.signed_in ? (
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Check size={13} className="shrink-0 text-success" />
+            <span className="truncate">
+              Signed in{status.identity ? ` as ${status.identity}` : ""}
+              {status.account_type ? <span className="text-muted"> · {status.account_type}</span> : null}
+            </span>
+          </span>
+        ) : (
+          <span className="flex min-w-0 items-center gap-1.5">
+            <AlertCircle size={13} className="shrink-0 text-warning" />
+            <span className="truncate">{status.message ?? "Not signed in"}</span>
+          </span>
+        )}
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          {saved && (
+            <button className="icon-btn h-7 w-7" title="Check again" aria-label="Check Kiro status" onClick={onRefresh} disabled={!!busy}>
+              {busy === "status" ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            </button>
+          )}
+          {browser && status?.signed_in && (
+            <button className="btn-ghost py-1" onClick={onSignOut} disabled={!!busy}>
+              <LogOut size={12} /> Sign out
+            </button>
+          )}
+          {browser && (!status || !status.signed_in) && status?.installed !== false && (
+            <button className="btn-primary py-1" onClick={onSignIn} disabled={!!busy}>
+              {busy === "signin" ? <Loader2 size={12} className="animate-spin" /> : <Globe size={12} />} Sign in with browser
+            </button>
+          )}
+          {!browser && saved && status?.signed_in && (
+            <button className="btn-ghost py-1" onClick={onSignOut} disabled={!!busy}>
+              <Trash2 size={12} /> Remove key
+            </button>
+          )}
+        </div>
+      </div>
+      {status?.installed === false && (
+        <p className="text-[11.5px] text-muted">
+          Install Kiro CLI: <span className="font-mono select-text">curl -fsSL https://cli.kiro.dev/install | bash</span>, then check again.
+        </p>
+      )}
+      {status?.cli_path && <p className="truncate font-mono text-[11px] text-muted" title={status.cli_path}>{status.cli_path}</p>}
+      <p className="flex items-start gap-1.5 text-[11px] text-muted">
+        <Terminal size={12} className="mt-px shrink-0" />
+        {browser
+          ? "Sign-in opens a terminal running `kiro-cli login`; finish in the browser and DataBrain continues automatically."
+          : "The key stays in the OS keychain and is only passed to kiro-cli for each request. A kiro-cli browser session, if present, takes precedence."}
+      </p>
+      <p className="text-[11px] text-muted">
+        Kiro runs with a DataBrain-managed agent (<span className="font-mono">~/.kiro/agents/databrain-sql.json</span>) that can only use
+        DataBrain's tools; queries and editor changes still ask you here.
+      </p>
+    </div>
+  );
+}
+

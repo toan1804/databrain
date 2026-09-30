@@ -144,6 +144,9 @@ pub struct SaveProviderArgs {
 pub fn save_provider(state: &AppState, args: SaveProviderArgs) -> Result<AiProviderRecord> {
     let kind = ProviderKind::parse(&args.record.kind).ok_or_else(|| EngineError::new("invalid", "unknown provider type"))?;
     let cfg: ProviderConfig = serde_json::from_value(args.record.config.clone()).map_err(|e| EngineError::new("invalid", e.to_string()))?;
+    if kind == ProviderKind::Kiro && cfg.cli_env.keys().any(|k| k.eq_ignore_ascii_case("KIRO_API_KEY")) {
+        return Err(EngineError::new("invalid", "store the Kiro API key in the API key field (keychain), not in the environment"));
+    }
     if kind == ProviderKind::AzureOpenai && cfg.base_url.as_deref().is_none_or(str::is_empty) {
         return Err(EngineError::new("invalid", "Azure OpenAI needs the resource endpoint URL"));
     }
@@ -169,19 +172,63 @@ pub async fn list_models(state: &AppState, id: &str) -> Result<Vec<ModelInfo>> {
     p.list_models().await.map_err(ai_err)
 }
 
-/// OpenRouter browser sign-in: stores the returned key on the provider.
+fn kiro_provider(state: &AppState, rec: &AiProviderRecord) -> Result<databrain_ai::kiro::KiroProvider> {
+    let cfg: ProviderConfig = serde_json::from_value(rec.config.clone()).unwrap_or_default();
+    let key = databrain_ai::providers::KeySource::Stored { store: state.secrets.clone(), reference: SecretRef::for_ai_provider(&rec.id) };
+    databrain_ai::kiro::KiroProvider::new(&cfg, key).map_err(ai_err)
+}
+
+/// Kiro only: is kiro-cli installed, and signed in with the configured method?
+pub async fn provider_status(state: &AppState, id: &str) -> Result<databrain_ai::kiro::KiroStatus> {
+    let rec = state.workspace.get_ai_provider(id)?;
+    if ProviderKind::parse(&rec.kind) != Some(ProviderKind::Kiro) {
+        return Err(EngineError::new("invalid", "status is available for Kiro providers"));
+    }
+    Ok(kiro_provider(state, &rec)?.status().await)
+}
+
+/// Browser sign-in. OpenRouter: PKCE, stores the returned key. Kiro: runs
+/// `kiro-cli login` in a terminal window and waits for the session.
 pub async fn provider_sign_in(state: &AppState, id: &str) -> Result<()> {
     let mut rec = state.workspace.get_ai_provider(id)?;
-    if ProviderKind::parse(&rec.kind) != Some(ProviderKind::Openrouter) {
-        return Err(EngineError::new("invalid", "browser sign-in is available for OpenRouter; other providers use API keys"));
-    }
-    let ui = AppInteraction::new(state.ui.clone(), state.ai.sign_in_cancel.clone());
-    let key = databrain_ai::providers::openrouter_sign_in(&ui).await.map_err(ai_err)?;
-    state.secrets.set(&SecretRef::for_ai_provider(id), &SecretString::from(key))?;
+    let kind = ProviderKind::parse(&rec.kind);
     let mut cfg: ProviderConfig = serde_json::from_value(rec.config.clone()).unwrap_or_default();
-    cfg.auth = ProviderAuth::BrowserOpenrouter;
+    match kind {
+        Some(ProviderKind::Openrouter) => {
+            let ui = AppInteraction::new(state.ui.clone(), state.ai.sign_in_cancel.clone());
+            let key = databrain_ai::providers::openrouter_sign_in(&ui).await.map_err(ai_err)?;
+            state.secrets.set(&SecretRef::for_ai_provider(id), &SecretString::from(key))?;
+            cfg.auth = ProviderAuth::BrowserOpenrouter;
+        }
+        Some(ProviderKind::Kiro) => {
+            let kiro = kiro_provider(state, &rec)?;
+            let cancel = CancellationToken::new();
+            *state.ai.sign_in_cancel.lock() = cancel.clone();
+            let ui = state.ui.clone();
+            kiro.sign_in_browser(cancel, || ui.emit(AUTH_EVENT, json!({"type": "terminal_opened", "command": "kiro-cli login"})))
+                .await
+                .map_err(ai_err)?;
+            state.ui.emit(AUTH_EVENT, json!({"type": "finished"}));
+            cfg.auth = ProviderAuth::KiroBrowser;
+        }
+        _ => return Err(EngineError::new("invalid", "browser sign-in is available for OpenRouter and Kiro; other providers use API keys")),
+    }
     rec.config = serde_json::to_value(cfg).unwrap_or_default();
     state.workspace.save_ai_provider(rec)?;
+    Ok(())
+}
+
+/// Sign out: Kiro ends the kiro-cli browser session; others drop the stored key.
+pub async fn provider_sign_out(state: &AppState, id: &str) -> Result<()> {
+    let rec = state.workspace.get_ai_provider(id)?;
+    if ProviderKind::parse(&rec.kind) == Some(ProviderKind::Kiro) {
+        let cfg: ProviderConfig = serde_json::from_value(rec.config.clone()).unwrap_or_default();
+        if cfg.auth == ProviderAuth::KiroBrowser {
+            kiro_provider(state, &rec)?.sign_out().await.map_err(ai_err)?;
+            return Ok(());
+        }
+    }
+    state.secrets.delete(&SecretRef::for_ai_provider(id))?;
     Ok(())
 }
 

@@ -28,6 +28,8 @@ pub enum ProviderKind {
     LmStudio,
     /// Any other OpenAI-compatible endpoint (vLLM, llama.cpp, gateways).
     OpenaiCompatible,
+    /// Kiro, driven through the local `kiro-cli` (Agent Client Protocol).
+    Kiro,
 }
 
 impl ProviderKind {
@@ -44,6 +46,7 @@ impl ProviderKind {
             ProviderKind::Ollama => "ollama",
             ProviderKind::LmStudio => "lm_studio",
             ProviderKind::OpenaiCompatible => "openai_compatible",
+            ProviderKind::Kiro => "kiro",
         }
     }
     pub fn default_base_url(self) -> &'static str {
@@ -56,6 +59,7 @@ impl ProviderKind {
             ProviderKind::Ollama => "http://localhost:11434/v1",
             ProviderKind::LmStudio => "http://localhost:1234/v1",
             ProviderKind::OpenaiCompatible => "",
+            ProviderKind::Kiro => "",
         }
     }
     /// Local runtimes don't need a key.
@@ -75,6 +79,9 @@ pub enum ProviderAuth {
     AzureCli,
     /// Google ADC bearer token (Vertex-style gateways / Gemini with OAuth).
     GoogleAdc,
+    /// Kiro browser sign-in (`kiro-cli login` session: Builder ID, GitHub,
+    /// Google, IAM Identity Center).
+    KiroBrowser,
     None,
 }
 
@@ -91,6 +98,10 @@ pub struct ProviderConfig {
     pub api_version: Option<String>,
     pub extra_headers: BTreeMap<String, String>,
     pub max_output_tokens: Option<u32>,
+    /// CLI providers (Kiro): extra environment for the child process.
+    pub cli_env: BTreeMap<String, String>,
+    /// Kiro: directory for the managed agent config (default ~/.kiro/agents).
+    pub agents_dir: Option<String>,
 }
 
 #[async_trait]
@@ -98,6 +109,10 @@ pub trait LlmProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     async fn list_models(&self) -> Result<Vec<ModelInfo>>;
     async fn chat_stream(&self, req: ChatRequest) -> Result<BoxStream<'static, Result<ChatEvent>>>;
+    /// Agent-style providers (Kiro) run whole turns instead of chat calls.
+    fn as_kiro(&self) -> Option<&crate::kiro::KiroProvider> {
+        None
+    }
 }
 
 /// Resolves the API key / bearer token for a provider on each request.
@@ -110,7 +125,7 @@ pub enum KeySource {
 }
 
 impl KeySource {
-    async fn get(&self) -> Result<Option<String>> {
+    pub(crate) async fn get(&self) -> Result<Option<String>> {
         Ok(match self {
             KeySource::None => None,
             KeySource::Inline(k) => Some(k.clone()),
@@ -156,6 +171,9 @@ async fn check(resp: reqwest::Response, provider: &str) -> Result<reqwest::Respo
 
 /// Build a provider from its record + key source.
 pub fn build(kind: ProviderKind, cfg: &ProviderConfig, key: KeySource) -> Result<Arc<dyn LlmProvider>> {
+    if kind == ProviderKind::Kiro {
+        return Ok(Arc::new(crate::kiro::KiroProvider::new(cfg, key)?));
+    }
     let base = cfg
         .base_url
         .clone()

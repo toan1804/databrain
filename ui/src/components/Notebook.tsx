@@ -71,6 +71,10 @@ export function NotebookView({ tabId, notebookId, visible }: { tabId: string; no
   const connections = useStore((s) => s.connections);
   const updateTab = useStore((s) => s.updateTab);
   const toast = useStore((s) => s.toast);
+  // Subscribed (not read once) so Run all / Stop always reflects the cells' state.
+  const anyRunning = useStore((s) =>
+    Object.entries(s.runs).some(([k, r]) => r.running && k.startsWith(`nb:${notebookId}:`)),
+  );
 
   useEffect(() => {
     let alive = true;
@@ -260,7 +264,6 @@ export function NotebookView({ tabId, notebookId, visible }: { tabId: string; no
       </div>
     );
 
-  const anyRunning = nb.cells.some((c) => useStore.getState().runs[cellKey(notebookId, c.id)]?.running);
 
   return (
     <div className="flex h-full min-h-0 flex-col" style={{ display: visible ? "flex" : "none" }}>

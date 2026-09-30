@@ -58,7 +58,9 @@ export function SignInDialog() {
         <div className="space-y-3 text-center text-[13px]">
           <Globe size={28} className="mx-auto text-accent" />
           <p>
-            {ev?.type === "browser_opened"
+            {ev?.type === "terminal_opened"
+              ? `A Terminal window is running \`${ev.command}\`. Choose how to sign in there, then finish in your browser.`
+              : ev?.type === "browser_opened"
               ? "Continue in the browser window that just opened."
               : ev?.type === "finished"
                 ? "Finishing sign-in…"

@@ -437,9 +437,19 @@ export type ProviderKind =
   | "openrouter"
   | "ollama"
   | "lm_studio"
-  | "openai_compatible";
+  | "openai_compatible"
+  | "kiro";
 
-export type ProviderAuth = "api_key" | "browser_openrouter" | "azure_cli" | "google_adc" | "none";
+export type ProviderAuth = "api_key" | "browser_openrouter" | "azure_cli" | "google_adc" | "kiro_browser" | "none";
+
+export interface KiroStatus {
+  installed: boolean;
+  cli_path?: string | null;
+  signed_in: boolean;
+  account_type?: string | null;
+  identity?: string | null;
+  message?: string | null;
+}
 
 export interface ProviderConfig {
   base_url?: string | null;
@@ -449,6 +459,8 @@ export interface ProviderConfig {
   api_version?: string | null;
   extra_headers?: Record<string, string>;
   max_output_tokens?: number | null;
+  cli_env?: Record<string, string>;
+  agents_dir?: string | null;
 }
 
 export interface AiProviderRecord {
@@ -560,6 +572,7 @@ export interface DeviceCodePrompt {
 export type AuthEvent =
   | { type: "browser_opened"; url: string }
   | { type: "device_code"; prompt: DeviceCodePrompt }
+  | { type: "terminal_opened"; command: string }
   | { type: "finished" };
 
 export interface KnObject {

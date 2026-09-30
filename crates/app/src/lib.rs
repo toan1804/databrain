@@ -157,6 +157,15 @@ async fn ai_provider_sign_in(state: State<'_, AppState>, id: String) -> R<()> {
     ai_api::provider_sign_in(&state, &id).await
 }
 
+#[tauri::command]
+async fn ai_provider_status(state: State<'_, AppState>, id: String) -> R<databrain_ai::kiro::KiroStatus> {
+    ai_api::provider_status(&state, &id).await
+}
+#[tauri::command]
+async fn ai_provider_sign_out(state: State<'_, AppState>, id: String) -> R<()> {
+    ai_api::provider_sign_out(&state, &id).await
+}
+
 // ---- AI agent
 #[tauri::command]
 async fn ai_send(state: State<'_, AppState>, args: ai_api::AiSendArgs) -> R<String> {
@@ -501,6 +510,8 @@ pub fn run() {
             ai_delete_provider,
             ai_list_models,
             ai_provider_sign_in,
+            ai_provider_status,
+            ai_provider_sign_out,
             ai_send,
             ai_cancel,
             ai_respond,

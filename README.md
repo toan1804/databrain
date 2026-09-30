@@ -17,7 +17,7 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
   - Per-cell connection override and AI actions. Notebooks are saved and can be put in folders.
 - **Results:** virtualized grid, sort, filters, find, column stats, copy. Export to CSV, TSV, JSON, NDJSON, Markdown, SQL INSERT, Parquet or XLSX.
 - **AI mode** (⌘L panel, ⌘I inline edit):
-  - Providers: OpenAI, Anthropic, Gemini, Azure OpenAI, OpenRouter (browser sign-in), Ollama, LM Studio, or any OpenAI-compatible server.
+  - Providers: Kiro (browser sign-in or `ksk_` API key, through `kiro-cli`), OpenAI, Anthropic, Gemini, Azure OpenAI, OpenRouter (browser sign-in), Ollama, LM Studio, or any OpenAI-compatible server.
   - The assistant uses indexed schema metadata plus your notes/glossary as knowledge. It proposes SQL as diffs, runs queries after approval (per-connection policy), and analyzes results.
   - Fix/Explain/Analyze buttons; conversation history; audit log.
 - **MCP:** `databrain-mcp` (stdio) exposes opted-in connections to Kiro CLI, Claude Code, Cursor… (Settings → MCP / Kiro shows the config snippet).
@@ -27,6 +27,7 @@ Runtime notes:
 - Oracle needs Oracle Instant Client.
 - Google/Snowflake/Entra browser OAuth needs your own OAuth client ID.
 - DuckDB's Excel/Delta/Iceberg extensions download on first use.
+- Kiro needs Kiro CLI installed (`curl -fsSL https://cli.kiro.dev/install | bash`). API keys require a Kiro Pro plan or higher. DataBrain writes one agent config, `~/.kiro/agents/databrain-sql.json`, which limits Kiro to DataBrain's tools.
 
 ## Requirements
 

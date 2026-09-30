@@ -2,6 +2,7 @@
 //! engine, and the agent loop.
 
 pub mod agent;
+pub mod kiro;
 pub mod knowledge;
 pub mod mcp;
 pub mod policy;

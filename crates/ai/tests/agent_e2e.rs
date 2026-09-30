@@ -304,3 +304,116 @@ async fn mcp_server_lists_and_calls_tools() {
     assert_eq!(resps[4]["result"]["isError"], true);
     assert_eq!(resps[5]["error"]["code"], -32601);
 }
+
+// ------------------------------------------------------------------ Kiro (fake kiro-cli)
+
+fn fake_kiro() -> Option<String> {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-kiro-cli");
+    (cfg!(unix) && std::process::Command::new("python3").arg("--version").output().is_ok()).then(|| p.to_string_lossy().into_owned())
+}
+
+#[tokio::test]
+async fn kiro_provider_drives_databrain_tools_over_acp_and_mcp() {
+    let Some(cli) = fake_kiro() else { return eprintln!("skipped: needs python3") };
+    let f = fixture(1, AiPolicy::default()).await;
+    let agents = f._dir.0.join("kiro-agents");
+    let log = f._dir.0.join("fake-kiro.log");
+    let rec = f
+        .ws
+        .save_ai_provider(AiProviderRecord {
+            id: String::new(),
+            kind: "kiro".into(),
+            name: "Kiro".into(),
+            config: serde_json::to_value(ProviderConfig {
+                base_url: Some(cli),
+                agents_dir: Some(agents.to_string_lossy().into()),
+                cli_env: [("FAKE_KIRO_LOG".to_string(), log.to_string_lossy().into_owned())].into_iter().collect(),
+                ..Default::default()
+            })
+            .unwrap(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    let agent = Agent { engine: f.engine.clone(), hub: f.hub.clone(), secrets: f.secrets.clone(), max_steps: 8 };
+    let events = Arc::new(Events::default());
+    let host = Arc::new(Host { approvals: AtomicUsize::new(0), approve: true });
+    let mut r = req(&f);
+    r.provider_id = Some(rec.id.clone());
+
+    // No API key stored yet → clear auth error before anything runs.
+    let e = agent.run(r.clone(), "run0".into(), host.clone(), events.clone(), Default::default()).await.unwrap_err();
+    assert!(e.to_string().contains("API key"), "{e}");
+
+    f.secrets.set(&SecretRef::for_ai_provider(&rec.id), &"ksk_test".to_string().into()).unwrap();
+    let text = agent.run(r, "run1".into(), host, events.clone(), Default::default()).await.unwrap();
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(text.contains("customers") && text.contains("orders"), "{text}\n{logged}");
+
+    // What the fake Kiro observed.
+    let lines: Vec<Value> = std::fs::read_to_string(&log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let spawn = lines.iter().find(|l| l.get("argv").is_some()).unwrap();
+    assert_eq!(spawn["argv"], json!(["acp", "--agent", "databrain-sql"]));
+    assert_eq!(spawn["has_key"], json!(true));
+    let facts = lines.iter().find(|l| l.get("tools").is_some()).unwrap();
+    assert_eq!(facts["context_block"], json!(true));
+    assert_eq!(facts["no_token"], json!(401));
+    assert_eq!(facts["origin"], json!(403));
+    assert_eq!(facts["perm_databrain"], json!("allow"));
+    assert_eq!(facts["perm_shell"], json!("deny"));
+    assert_eq!(facts["fs_refused"], json!(true));
+    assert!(facts["tools"].as_array().unwrap().iter().any(|t| t == "run_query"));
+
+    // Managed agent config restricts Kiro to DataBrain's tools.
+    let agent_cfg: Value = serde_json::from_str(&std::fs::read_to_string(agents.join("databrain-sql.json")).unwrap()).unwrap();
+    assert_eq!(agent_cfg["tools"], json!(["@databrain"]));
+
+    // UI saw the DataBrain tool card and streamed text; the answer is persisted.
+    let evs = events.0.lock().clone();
+    assert!(evs.iter().any(|e| matches!(e, AgentEvent::ToolFinished { tool, .. } if tool == "list_tables")));
+    assert!(evs.iter().any(|e| matches!(e, AgentEvent::TextDelta { .. })));
+    let sid = evs.iter().find_map(|e| match e { AgentEvent::Finished { session_id, .. } => Some(session_id.clone()), _ => None }).unwrap();
+    let msgs = f.ws.list_ai_messages(&sid).unwrap();
+    assert_eq!(msgs.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(), vec!["user", "assistant"]);
+    assert_eq!(f.ws.get_setting(&format!("kiro_session:{sid}")).unwrap(), Some(json!("kiro-sess-1")));
+
+    // Models come from the ACP session.
+    let (p, _, _) = databrain_ai::provider_for(&rec, f.secrets.clone()).unwrap();
+    let models: Vec<String> = p.list_models().await.unwrap().into_iter().map(|m| m.id).collect();
+    assert_eq!(models, vec!["auto", "claude-sonnet-4.5"]);
+}
+
+
+/// Live: `DATABRAIN_KIRO_LIVE=1 KIRO_API_KEY=ksk_… cargo test -p databrain-ai --test agent_e2e kiro_live -- --nocapture`
+/// Uses the real kiro-cli and consumes a few Kiro credits.
+#[tokio::test]
+async fn kiro_live() {
+    if std::env::var("DATABRAIN_KIRO_LIVE").is_err() {
+        return;
+    }
+    let key = std::env::var("KIRO_API_KEY").expect("KIRO_API_KEY");
+    let f = fixture(1, AiPolicy { run_query: RunQueryPolicy::AutoRead, ..Default::default() }).await;
+    let rec = f
+        .ws
+        .save_ai_provider(AiProviderRecord {
+            id: String::new(),
+            kind: "kiro".into(),
+            name: "Kiro".into(),
+            config: serde_json::to_value(ProviderConfig { default_model: Some("claude-haiku-4.5".into()), ..Default::default() }).unwrap(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    f.secrets.set(&SecretRef::for_ai_provider(&rec.id), &key.into()).unwrap();
+    let agent = Agent { engine: f.engine.clone(), hub: f.hub.clone(), secrets: f.secrets.clone(), max_steps: 8 };
+    let events = Arc::new(Events::default());
+    let host = Arc::new(Host { approvals: AtomicUsize::new(0), approve: true });
+    let mut r = req(&f);
+    r.provider_id = Some(rec.id);
+    r.message = "Using run_query, compute total order amount per country. Answer with the top country and its total.".into();
+    let text = agent.run(r, "live".into(), host, events.clone(), Default::default()).await.unwrap();
+    let tools: Vec<String> = events.0.lock().iter().filter_map(|e| match e { AgentEvent::ToolFinished { tool, .. } => Some(tool.clone()), _ => None }).collect();
+    eprintln!("tools: {tools:?}\nanswer: {text}");
+    assert!(tools.iter().any(|t| t == "run_query"), "{tools:?}");
+    assert!(text.contains("Vietnam") && text.contains("300"), "{text}");
+}

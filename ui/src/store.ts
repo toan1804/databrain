@@ -150,6 +150,26 @@ interface State {
 }
 
 const TAB_SAVE_DELAY = 400;
+
+/**
+ * Job events that arrived before the `run_query` response told us the job id.
+ * Fast statements (warm session) can finish before the response is delivered;
+ * without this buffer their `job_finished` would be dropped and the run would
+ * look stuck. Replayed as soon as the run is registered.
+ */
+const earlyEvents = new Map<string, { at: number; events: JobEvent[] }>();
+const EARLY_TTL_MS = 60_000;
+
+function bufferEarly(e: JobEvent) {
+  const now = Date.now();
+  for (const [id, v] of earlyEvents) if (now - v.at > EARLY_TTL_MS) earlyEvents.delete(id);
+  const entry = earlyEvents.get(e.job_id) ?? { at: now, events: [] };
+  entry.events.push(e);
+  earlyEvents.set(e.job_id, entry);
+}
+
+/** Test hook. */
+export const _earlyEventCount = () => earlyEvents.size;
 let tabSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
 function persistTabs(tabs: Tab[]) {
@@ -454,6 +474,11 @@ export const useStore = create<State>((set, get) => ({
             },
           },
         }));
+        const early = earlyEvents.get(resp.job_id);
+        if (early) {
+          earlyEvents.delete(resp.job_id);
+          for (const ev of early.events) get().handleJobEvent(ev);
+        }
         return true;
       } catch (e) {
         const err = toError(e);
@@ -536,7 +561,30 @@ export const useStore = create<State>((set, get) => ({
 
   cancelTab: async (tabId) => {
     const run = get().runs[tabId];
-    if (run?.jobId && run.running) await api.cancelQuery(run.jobId);
+    if (!run?.jobId || !run.running) return;
+    const jobId = run.jobId;
+    const found = await api.cancelQuery(jobId).catch(() => false);
+    if (found) return;
+    // The backend no longer knows this job (it already ended, and its final
+    // event was lost): mark the run as finished so the UI is never stuck.
+    set((s) => {
+      const r = s.runs[tabId];
+      if (!r || r.jobId !== jobId || !r.running) return {};
+      return {
+        runs: {
+          ...s.runs,
+          [tabId]: {
+            ...r,
+            running: false,
+            finishedStatus: "cancelled",
+            durationMs: Date.now() - r.startedAt,
+            statements: r.statements.map((x) =>
+              x.status === "pending" || x.status === "running" ? { ...x, status: "cancelled" } : x,
+            ),
+          },
+        },
+      };
+    });
   },
 
   setActiveStatement: (tabId, index) =>
@@ -546,7 +594,13 @@ export const useStore = create<State>((set, get) => ({
       return { runs: { ...s.runs, [tabId]: { ...run, activeIndex: index } } };
     }),
 
-  handleJobEvent: (e) =>
+  handleJobEvent: (e) => {
+    const cur = get().runs[e.tab_id];
+    if (!cur || cur.jobId !== e.job_id) {
+      // Either stale (older job) or early (response not received yet).
+      bufferEarly(e);
+      return;
+    }
     set((s) => {
       const run = s.runs[e.tab_id];
       if (!run || run.jobId !== e.job_id) return {};
@@ -605,7 +659,8 @@ export const useStore = create<State>((set, get) => ({
           };
       }
       return { runs: { ...s.runs, [e.tab_id]: next } };
-    }),
+    });
+  },
 
   refreshSavedQueries: async () => {
     const savedQueries = await api.listSavedQueries(null);

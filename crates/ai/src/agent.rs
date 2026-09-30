@@ -82,7 +82,7 @@ pub fn provider_for(rec: &AiProviderRecord, secrets: Arc<dyn SecretStore>) -> Re
     let kind = ProviderKind::parse(&rec.kind).ok_or_else(|| AiError::Config(format!("unknown provider kind {}", rec.kind)))?;
     let cfg: ProviderConfig = serde_json::from_value(rec.config.clone()).unwrap_or_default();
     let key = match cfg.auth {
-        ProviderAuth::None => KeySource::None,
+        ProviderAuth::None | ProviderAuth::KiroBrowser => KeySource::None,
         ProviderAuth::ApiKey | ProviderAuth::BrowserOpenrouter => {
             if kind.is_local() && secrets.get(&SecretRef::for_ai_provider(&rec.id)).ok().flatten().is_none() {
                 KeySource::None
@@ -221,6 +221,7 @@ impl Agent {
             .clone()
             .filter(|m| !m.is_empty())
             .or(cfg.default_model.clone())
+            .or_else(|| provider.as_kiro().map(|_| "auto".to_string()))
             .ok_or_else(|| AiError::Config(format!("choose a model for \"{}\"", rec.name)))?;
 
         // Session.
@@ -275,6 +276,32 @@ impl Agent {
             cancel: cancel.clone(),
             results: parking_lot::Mutex::new(req.context.result_id.clone().into_iter().collect()),
         };
+
+        if let Some(kiro) = provider.as_kiro() {
+            let key = format!("kiro_session:{sid}");
+            let previous = ws.get_setting(&key).ok().flatten().and_then(|v| v.as_str().map(str::to_string));
+            let ws2 = ws.clone();
+            let prompt = format!("[DataBrain context]\n{system}\n[/DataBrain context]\n\n{}", messages.last().map(|m| m.text.clone()).unwrap_or_default());
+            let text = kiro
+                .run_turn(crate::kiro::KiroTurn {
+                    session_id: sid.clone(),
+                    run_id: run_id.clone(),
+                    prompt,
+                    model: Some(model.clone()),
+                    ctx: Arc::new(ctx),
+                    sink: sink.clone(),
+                    cancel: cancel.clone(),
+                    previous_session: previous,
+                    save_session: Some(Box::new(move |k: &str| {
+                        let _ = ws2.set_setting(&key, &json!(k));
+                    })),
+                })
+                .await?;
+            let assistant = Message::assistant(text.clone(), vec![]);
+            ws.add_ai_message(&sid, "assistant", &serde_json::to_value(&assistant).unwrap_or_default(), (None, None))?;
+            sink.emit(AgentEvent::Finished { session_id: sid, run_id, text: text.clone() });
+            return Ok(text);
+        }
 
         let mut final_text = String::new();
         for _step in 0..self.max_steps {

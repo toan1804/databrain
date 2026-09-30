@@ -650,6 +650,11 @@ Phases 0–2 are built, plus most of phases 3–7: AI mode, knowledge, agent wit
 - **MCP server** is a separate stdio binary (`databrain-mcp`), with no network endpoint. Only connections with `mcp_enabled` are visible to it, and approvals that need the UI are refused. Kiro CLI is supported through it (`~/.kiro/settings/mcp.json`).
 - **DuckDB** (bundled, `duckdb` 1.10506 / DuckDB 1.5) reads local files via `read_csv`/`read_parquet`/`read_json_auto`/`read_xlsx`/`delta_scan`/`iceberg_scan`. Attached files become views in the `files` schema. The Excel, Delta and Iceberg extensions download on first use. DuckDB's Arrow 58 batches are converted to the workspace's Arrow 59 over IPC.
 - **Notebooks** (workspace v3) store cells as JSON. Each SQL cell keeps its own results (run key `nb:{notebook}:{cell}`), and all cells share one database session through `RunRequest.session_key = nb:{notebook}`, so temp tables carry across cells.
+- **Kiro provider** has no public model API, so it runs through `kiro-cli acp` (Agent Client Protocol over stdio). Each turn:
+  - DataBrain starts a temporary MCP endpoint that exposes its tools. It listens only on 127.0.0.1 with a random port and a per-turn bearer token, rejects browser `Origin` headers and wrong `Host` headers, and stops when the turn ends.
+  - Kiro runs with a managed agent (`databrain-sql`) whose tools are limited to `@databrain`. DataBrain refuses Kiro's other permission requests and all fs/terminal requests. The usual DataBrain approvals still apply.
+  - Auth is either the `kiro-cli login` browser session (run in a terminal window, then detected with `whoami`), or a `ksk_` API key from the keychain passed to the child as `KIRO_API_KEY`.
+  - The Kiro session id is stored per conversation and resumed with `session/load`.
 - **Runtime caveats:**
   - Oracle needs Oracle Instant Client installed.
   - Browser OAuth for BigQuery, Snowflake and Entra ID needs your own OAuth client ID. Databricks uses the `databricks-cli` public client.

@@ -18,6 +18,7 @@
   --success: #16a34a;
   --warning: #d97706;
   --selection: rgba(99, 102, 241, 0.18);
+  --caret: #4f46e5;
   --syn-keyword: #7c3aed;
   --syn-string: #15803d;
   --syn-number: #c2410c;
@@ -42,6 +43,7 @@
   --success: #4ade80;
   --warning: #fbbf24;
   --selection: rgba(129, 140, 248, 0.22);
+  --caret: #f5f6ff;
   --syn-keyword: #c4b5fd;
   --syn-string: #86efac;
   --syn-number: #fdba74;
@@ -170,3 +172,18 @@ select {
   border-radius: 8px;
   overflow: hidden;
 }
+
+/* Text cursor: CodeMirror's default caret is black, invisible on dark backgrounds. */
+.cm-editor .cm-cursor,
+.cm-editor .cm-dropCursor {
+  border-left: 2px solid var(--caret);
+}
+.cm-editor .cm-content {
+  caret-color: var(--caret);
+}
+input,
+textarea,
+[contenteditable="true"] {
+  caret-color: var(--caret);
+}
+

@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Stand-in for kiro-cli used by DataBrain's tests.
+
+whoami: signed in only when KIRO_API_KEY == ksk_test (checks env passing).
+acp:    speaks enough ACP to drive DataBrain's MCP endpoint: lists tools,
+        asks permission for a DataBrain tool (must be allowed) and a shell
+        tool (must be rejected), calls list_tables over MCP, probes the
+        endpoint without a token / with an Origin header, streams an answer.
+"""
+import json, os, sys, urllib.request, urllib.error
+
+args = sys.argv[1:]
+if args[:1] == ["whoami"]:
+    if os.environ.get("KIRO_API_KEY") == "ksk_test":
+        print(json.dumps({"accountType": "ApiKey", "email": "tester@example.com"}))
+        sys.exit(0)
+    print(json.dumps({"account": None})); sys.exit(1)
+if args[:1] != ["acp"]:
+    sys.exit(2)
+
+log = open(os.environ.get("FAKE_KIRO_LOG", os.devnull), "a")
+def out(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+def read():
+    line = sys.stdin.readline()
+    if not line: sys.exit(0)
+    return json.loads(line)
+def request(method, params, rid):
+    out({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+    while True:
+        m = read()
+        if m.get("id") == rid and "method" not in m: return m
+
+mcp = None
+log.write(json.dumps({"argv": args, "cwd": os.getcwd(), "has_key": "KIRO_API_KEY" in os.environ}) + "\n"); log.flush()
+
+def mcp_post(body, token=True, origin=False):
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    if token: headers.update({h["name"]: h["value"] for h in mcp["headers"]})
+    if origin: headers["Origin"] = "https://evil.example"
+    req = urllib.request.Request(mcp["url"], data=json.dumps(body).encode(), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = r.read()
+            return r.status, (json.loads(data) if data else None)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+
+while True:
+    m = read()
+    method, mid = m.get("method"), m.get("id")
+    if method == "initialize":
+        out({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}, "authMethods": []}})
+    elif method == "session/new":
+        servers = m["params"].get("mcpServers", [])
+        mcp = servers[0] if servers else None
+        out({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "kiro-sess-1", "models": {"currentModelId": "auto", "availableModels": [{"modelId": "auto", "name": "auto"}, {"modelId": "claude-sonnet-4.5", "name": "claude-sonnet-4.5"}]}}})
+    elif method == "session/load":
+        out({"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": "no such session"}})
+    elif method == "session/prompt":
+        sid = m["params"]["sessionId"]
+        prompt = m["params"]["prompt"][0]["text"]
+        facts = {"context_block": "[DataBrain context]" in prompt}
+        st, _ = mcp_post({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, token=False); facts["no_token"] = st
+        st, _ = mcp_post({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, origin=True); facts["origin"] = st
+        mcp_post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}})
+        mcp_post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        st, tl = mcp_post({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        facts["tools"] = sorted(t["name"] for t in tl["result"]["tools"])
+        opts = [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}, {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]
+        p1 = request("session/request_permission", {"sessionId": sid, "toolCall": {"toolCallId": "t1", "title": "Running: @databrain/list_tables", "_meta": {"kiro": {"mcpServerName": "databrain"}}}, "options": opts}, 900)
+        p2 = request("session/request_permission", {"sessionId": sid, "toolCall": {"toolCallId": "t2", "title": "Running: shell"}, "options": opts}, 901)
+        facts["perm_databrain"] = p1["result"]["outcome"].get("optionId")
+        facts["perm_shell"] = p2["result"]["outcome"].get("optionId")
+        fs = request("fs/read_text_file", {"sessionId": sid, "path": "/etc/hosts"}, 902)
+        facts["fs_refused"] = "error" in fs
+        st, r = mcp_post({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "list_tables", "arguments": {}}})
+        facts["list_tables"] = r["result"]["content"][0]["text"]
+        log.write(json.dumps(facts) + "\n"); log.flush()
+        for chunk in ["Tables: ", facts["list_tables"].replace("\n", ", ")]:
+            out({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": chunk}}}})
+        out({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+    elif method == "session/cancel":
+        pass
+    elif mid is not None:
+        out({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "unknown"}})
