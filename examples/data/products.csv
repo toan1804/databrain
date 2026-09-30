@@ -1,0 +1,19 @@
+product_id,name,category,unit_price
+1,Laptop Air 13,Laptops,1528.86
+2,Laptop Pro 14,Laptops,1022.31
+3,Laptop Pro 16,Laptops,1407.03
+4,Laptop Ultra 15,Laptops,1565.26
+5,Phone Mini,Phones,1045.52
+6,Phone Standard,Phones,461.2
+7,Phone Max,Phones,929.38
+8,Phone Fold,Phones,837.25
+9,Audio Earbuds,Audio,252.75
+10,Audio Headphones,Audio,141.51
+11,"Audio Speaker, portable",Audio,233.79
+12,Audio Soundbar,Audio,199.27
+13,Accessory Cable 2m,Accessories,25.57
+14,Accessory Charger 65W,Accessories,34.1
+15,"Accessory Case ""Slim""",Accessories,33.63
+16,Accessory Stand,Accessories,35.33
+17,Accessory Mouse,Accessories,36.63
+18,Accessory Keyboard,Accessories,34.78

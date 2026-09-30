@@ -1,0 +1,23 @@
+[package]
+name = "databrain-connector-duckdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+duckdb = { version = "1.10506", features = ["bundled", "parquet", "json"] }
+arrow58 = { package = "arrow", version = "58", default-features = false, features = ["ipc"] }
+databrain-connector-core = { version = "0.1.0", path = "../../connector-core" }
+databrain-auth = { version = "0.1.0", path = "../../auth" }
+async-trait = "0.1.92"
+tokio = { version = "1.53.1", features = ["rt", "sync", "macros", "time"] }
+tokio-util = "0.7.19"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }

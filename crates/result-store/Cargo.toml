@@ -1,0 +1,19 @@
+[package]
+name = "databrain-result-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+databrain-connector-core = { version = "0.1.0", path = "../connector-core" }
+parking_lot = "0.12.5"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+serde_json = "1.0.151"

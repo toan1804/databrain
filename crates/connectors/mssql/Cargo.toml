@@ -1,0 +1,23 @@
+[package]
+name = "databrain-connector-mssql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+databrain-auth = { version = "0.1.0", path = "../../auth" }
+databrain-connector-core = { version = "0.1.0", path = "../../connector-core" }
+futures = "0.3.34"
+secrecy = "0.10.3"
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "native-tls", "winauth", "sql-browser-tokio"] }
+tokio = { version = "1.53.1", features = ["rt", "sync", "macros", "time", "net"] }
+tokio-util = { version = "0.7.19", features = ["compat"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }

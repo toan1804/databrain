@@ -1,0 +1,90 @@
+# DataBrain
+
+A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and roadmap.
+
+## What works today
+
+- **Connections:**
+  - Databases: SQLite, PostgreSQL, MySQL/MariaDB, SQL Server, Oracle, Snowflake, Databricks, BigQuery, and DuckDB for local files.
+  - Sign-in: passwords/tokens/keys go in the OS keychain. Browser sign-in (OAuth PKCE, Snowflake SSO), device code, service principals, service accounts, and CLI logins (gcloud, Databricks CLI, az).
+  - SSH tunnels with host-key pinning.
+  - Folders with drag and drop.
+- **Local files:** query CSV/TSV, Parquet, JSON/NDJSON, Excel, Delta Lake and Iceberg with DuckDB. Use "Query a local file…" in the sidebar or palette, or attach files to a DuckDB connection (they appear as views in `files`).
+- **Editor:** CodeMirror 6 with dialect highlighting and schema autocomplete, run statement/selection/script, cancel, and error underlines.
+- **Notebooks:** SQL and Markdown cells on a connection.
+  - Run a cell, run all, or run from here.
+  - Output stays under each cell, and all cells share one session.
+  - Per-cell connection override and AI actions. Notebooks are saved and can be put in folders.
+- **Results:** virtualized grid, sort, filters, find, column stats, copy. Export to CSV, TSV, JSON, NDJSON, Markdown, SQL INSERT, Parquet or XLSX.
+- **AI mode** (⌘L panel, ⌘I inline edit):
+  - Providers: OpenAI, Anthropic, Gemini, Azure OpenAI, OpenRouter (browser sign-in), Ollama, LM Studio, or any OpenAI-compatible server.
+  - The assistant uses indexed schema metadata plus your notes/glossary as knowledge. It proposes SQL as diffs, runs queries after approval (per-connection policy), and analyzes results.
+  - Fix/Explain/Analyze buttons; conversation history; audit log.
+- **MCP:** `databrain-mcp` (stdio) exposes opted-in connections to Kiro CLI, Claude Code, Cursor… (Settings → MCP / Kiro shows the config snippet).
+- Safety prompts for prod and for writes, read-only connections, saved queries, history, command palette (⌘K), dark/light theme.
+
+Runtime notes:
+- Oracle needs Oracle Instant Client.
+- Google/Snowflake/Entra browser OAuth needs your own OAuth client ID.
+- DuckDB's Excel/Delta/Iceberg extensions download on first use.
+
+## Requirements
+
+- Rust ≥ 1.87 and Node ≥ 20
+- macOS: Xcode Command Line Tools. Linux: the [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/). Windows: WebView2 + MSVC build tools.
+
+## Run
+
+```sh
+cd ui
+npm install
+npm run app:dev      # Vite dev server + Tauri app with hot reload
+npm run app:build    # release bundle (.app/.dmg, .msi, .deb/.AppImage)
+```
+
+`npm run dev` alone serves the UI in a browser, but queries need the desktop backend.
+
+## Test
+
+```sh
+cargo test --workspace          # Rust unit + end-to-end (SQLite) tests
+cargo clippy --workspace --all-targets
+cd ui && npm test && npm run build
+```
+
+`examples/data` has a small sample "shop" dataset to try the app and to drive end-to-end tests (`cargo test -p databrain-app --test example_data`):
+
+- `customers.csv`, `products.csv`: CSV files with quoted commas and quotes, Unicode text and empty values.
+- `orders.parquet`, `order_items.parquet`: zstd Parquet with typed columns (TIMESTAMP, DECIMAL).
+- `orders_by_year/`: Hive-partitioned Parquet.
+- `shop.db`: a SQLite database with the same rows, foreign keys and a view.
+
+Regenerate it with `examples/data/generate.sh` (needs Python 3 and cargo).
+
+Connectors for server databases have live tests that are skipped unless a server is configured. They use the `DATABRAIN_PG_*`, `DATABRAIN_MYSQL_*`, `DATABRAIN_MSSQL_*`, `DATABRAIN_ORACLE_*`, `DATABRAIN_SF_*`, `DATABRAIN_DBX_*`, `DATABRAIN_BQ_PROJECT` and `DATABRAIN_SSH_*` variables. For example:
+
+```sh
+DATABRAIN_PG_HOST=localhost DATABRAIN_PG_USER=postgres DATABRAIN_PG_PASSWORD=... \
+  cargo test -p databrain-connector-postgres -- --nocapture
+DATABRAIN_MYSQL_HOST=127.0.0.1 DATABRAIN_MYSQL_USER=root DATABRAIN_MYSQL_PASSWORD=... \
+  cargo test -p databrain-connector-mysql -- --nocapture
+```
+
+## Layout
+
+```
+crates/
+  auth/            keychain secrets, auth methods, OAuth/device/JWT/cloud CLI credentials
+  connector-core/  Connector/Session traits, Arrow row builder, SQL splitter + classifier
+  connectors/      sqlite, postgres, mysql, mssql, oracle, cloud (snowflake/databricks/bigquery), duckdb
+  ssh-tunnel/      russh-based tunnels
+  result-store/    in-memory Arrow results: paging, filter, sort, find, stats
+  export/          CSV/TSV/JSON/NDJSON/Markdown/SQL/Parquet/XLSX writers
+  workspace/       local SQLite: connections, folders, queries, history, tabs, notebooks, AI, knowledge
+  query-engine/    sessions, jobs, cancel, row cap, safety, sign-in, SSH
+  ai/              providers, agent + tools, policy, knowledge index, MCP server
+  app/             Tauri host (commands + events) and the databrain-mcp binary
+ui/                React + TypeScript + Vite + Tailwind
+```
+
+App data (workspace DB) is stored in the OS app-data directory, for example `~/Library/Application Support/dev.databrain.app/` on macOS.

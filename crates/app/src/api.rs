@@ -1,0 +1,831 @@
+//! Backend API used by the Tauri commands. Plain async functions over
+//! [`AppState`] so the whole flow can be tested without a webview.
+//!
+//! Text offsets exchanged with the UI are UTF-16 code units (JavaScript string
+//! indices); Rust-side SQL spans are byte offsets. Conversion happens here.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use databrain_auth::{SecretRef, SecretStore};
+use databrain_connector_core::sql::{split_statements, statement_at};
+use databrain_connector_core::{
+    ConnectionConfig, ConnectorInfo, ConnectorKind, ConnectorRegistry, DbObject, ObjectDetail,
+    SchemaInfo,
+};
+use databrain_export::{ExportOptions, export_file, export_to_string};
+use databrain_query_engine::{
+    EngineError, EventHub, EventSink, QueryEngine, Result, RunRequest, RunResponse, TestResult,
+};
+use databrain_result_store::{ColumnStats, FindResult, Page, ResultInfo, ResultStore, ViewSpec};
+use databrain_workspace::{
+    ConnectionProfile, Folder, FolderKind, HistoryEntry, HistoryQuery, SavedQuery, TabState,
+    Workspace,
+};
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
+
+/// Largest page the grid may request at once.
+const MAX_PAGE: usize = 5_000;
+/// Largest number of rows copied to the clipboard at once.
+const MAX_COPY_ROWS: usize = 100_000;
+
+pub struct AppState {
+    pub engine: Arc<QueryEngine>,
+    pub workspace: Arc<Workspace>,
+    pub secrets: Arc<dyn SecretStore>,
+    pub hub: Arc<EventHub>,
+    pub ui: Arc<dyn crate::ai_api::UiBridge>,
+    pub ai: crate::ai_api::AiState,
+}
+
+pub fn default_registry() -> ConnectorRegistry {
+    #[allow(unused_mut)]
+    let mut r = ConnectorRegistry::new();
+    #[cfg(feature = "sqlite")]
+    r.register(Arc::new(databrain_connector_sqlite::SqliteConnector::new()));
+    #[cfg(feature = "postgres")]
+    r.register(Arc::new(databrain_connector_postgres::PostgresConnector::new()));
+    #[cfg(feature = "mysql")]
+    r.register(Arc::new(databrain_connector_mysql::MysqlConnector::new()));
+    #[cfg(feature = "mssql")]
+    r.register(Arc::new(databrain_connector_mssql::MssqlConnector::new()));
+    #[cfg(feature = "oracle")]
+    r.register(Arc::new(databrain_connector_oracle::OracleConnector::new()));
+    #[cfg(feature = "snowflake")]
+    r.register(Arc::new(databrain_connector_cloud::SnowflakeConnector::new()));
+    #[cfg(feature = "databricks")]
+    r.register(Arc::new(databrain_connector_cloud::DatabricksConnector::new()));
+    #[cfg(feature = "bigquery")]
+    r.register(Arc::new(databrain_connector_cloud::BigQueryConnector::new()));
+    #[cfg(feature = "duckdb")]
+    r.register(Arc::new(databrain_connector_duckdb::DuckdbConnector::new()));
+    r
+}
+
+impl AppState {
+    pub fn new(
+        workspace: Arc<Workspace>,
+        secrets: Arc<dyn SecretStore>,
+        events: Arc<dyn EventSink>,
+        ui: Arc<dyn crate::ai_api::UiBridge>,
+    ) -> Self {
+        let hub = EventHub::new(events);
+        let engine = QueryEngine::new(
+            default_registry(),
+            workspace.clone(),
+            secrets.clone(),
+            Arc::new(ResultStore::new()),
+            hub.clone(),
+        );
+        let ai = crate::ai_api::AiState::default();
+        engine.set_interaction(Arc::new(crate::ai_api::AppInteraction::new(ui.clone(), ai.sign_in_cancel.clone())));
+        Self {
+            engine,
+            workspace,
+            secrets,
+            hub,
+            ui,
+            ai,
+        }
+    }
+
+    fn results(&self) -> &Arc<ResultStore> {
+        self.engine.results()
+    }
+}
+
+fn invalid(msg: impl Into<String>) -> EngineError {
+    EngineError::new("invalid", msg)
+}
+
+/// Run CPU-heavy work off the async runtime threads.
+async fn blocking<T, F>(f: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| EngineError::new("internal", e.to_string()))?
+}
+
+// ------------------------------------------------------------ offsets
+
+pub fn byte_to_utf16(text: &str, byte: usize) -> usize {
+    let byte = byte.min(text.len());
+    let mut b = byte;
+    while !text.is_char_boundary(b) {
+        b -= 1;
+    }
+    text[..b].encode_utf16().count()
+}
+
+pub fn utf16_to_byte(text: &str, units: usize) -> usize {
+    let mut count = 0;
+    for (i, ch) in text.char_indices() {
+        if count >= units {
+            return i;
+        }
+        count += ch.len_utf16();
+    }
+    text.len()
+}
+
+// ------------------------------------------------------------ connectors & connections
+
+pub fn list_connectors(state: &AppState) -> Vec<ConnectorInfo> {
+    state.engine.registry().infos()
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConnectionView {
+    #[serde(flatten)]
+    pub profile: ConnectionProfile,
+    pub connected: bool,
+}
+
+pub fn list_connections(state: &AppState) -> Result<Vec<ConnectionView>> {
+    let connected = state.engine.connected_ids();
+    Ok(state
+        .workspace
+        .list_connections()?
+        .into_iter()
+        .map(|p| ConnectionView {
+            connected: connected.contains(&p.id),
+            profile: p,
+        })
+        .collect())
+}
+
+/// Secondary secret slots a connection may use.
+pub const SECRET_SLOTS: &[&str] = &["ssh", "client_secret", "passphrase"];
+
+#[derive(Debug, Deserialize)]
+pub struct SaveConnectionArgs {
+    pub profile: ConnectionProfile,
+    /// New password/token/key. `None` keeps the current secret.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Remove the stored secret.
+    #[serde(default)]
+    pub clear_secret: bool,
+    /// Secondary secrets by slot (`ssh`, `client_secret`, `passphrase`).
+    /// Empty string removes the slot; absent keeps it.
+    #[serde(default)]
+    pub extra_secrets: std::collections::BTreeMap<String, String>,
+}
+
+pub fn save_connection(state: &AppState, args: SaveConnectionArgs) -> Result<ConnectionProfile> {
+    let mut profile = args.profile;
+    validate_config(&profile.config)?;
+    if args.secret.is_some() {
+        profile.has_secret = true;
+    } else if args.clear_secret {
+        profile.has_secret = false;
+    } else if !profile.id.is_empty() {
+        // Keep the flag from the stored record; the UI may not know it.
+        if let Ok(existing) = state.workspace.get_connection(&profile.id) {
+            profile.has_secret = existing.has_secret;
+        }
+    }
+    let saved = state.workspace.save_connection(profile)?;
+    let r = SecretRef::for_connection(&saved.id);
+    if let Some(secret) = args.secret {
+        if let Err(e) = state.secrets.set(&r, &SecretString::from(secret)) {
+            let mut revert = saved.clone();
+            revert.has_secret = false;
+            let _ = state.workspace.save_connection(revert);
+            return Err(e.into());
+        }
+    } else if args.clear_secret {
+        state.secrets.delete(&r)?;
+    }
+    for (slot, value) in &args.extra_secrets {
+        if !SECRET_SLOTS.contains(&slot.as_str()) {
+            continue;
+        }
+        let sr = SecretRef::slot(&saved.id, slot);
+        if value.is_empty() {
+            state.secrets.delete(&sr)?;
+        } else {
+            state.secrets.set(&sr, &SecretString::from(value.clone()))?;
+        }
+    }
+    // Apply new settings (and auth method) on the next query.
+    state.engine.disconnect(&saved.id);
+    state.engine.forget_credentials(&saved.id);
+    Ok(saved)
+}
+
+fn validate_config(cfg: &ConnectionConfig) -> Result<()> {
+    use databrain_auth::AuthMethod;
+    match cfg.kind {
+        ConnectorKind::Duckdb => {}
+        ConnectorKind::Sqlite => {
+            if cfg.file_path.as_deref().is_none_or(|p| p.trim().is_empty()) {
+                return Err(invalid("Choose a database file"));
+            }
+        }
+        ConnectorKind::Snowflake if cfg.opt("account").is_none() && cfg.host.as_deref().is_none_or(str::is_empty) => {
+            return Err(invalid("Snowflake account identifier is required"));
+        }
+        ConnectorKind::Databricks if cfg.opt("http_path").is_none() && cfg.opt("warehouse_id").is_none() => {
+            return Err(invalid("SQL warehouse HTTP path is required"));
+        }
+        ConnectorKind::Bigquery if cfg.opt("project").is_none() => {
+            return Err(invalid("Billing project ID is required"));
+        }
+        _ => {}
+    }
+    match &cfg.auth {
+        AuthMethod::Password { user } | AuthMethod::KeyPair { user } | AuthMethod::ExternalBrowser { user } if user.trim().is_empty() => {
+            return Err(invalid("User name is required"));
+        }
+        _ => {}
+    }
+    if let Some(ssh) = &cfg.ssh {
+        if cfg.kind.is_cloud() || matches!(cfg.kind, ConnectorKind::Sqlite | ConnectorKind::Duckdb) {
+            return Err(invalid("SSH tunnels are only available for server databases"));
+        }
+        if ssh.host.trim().is_empty() || ssh.user.trim().is_empty() {
+            return Err(invalid("SSH host and user are required"));
+        }
+    }
+    Ok(())
+}
+
+pub fn move_to_folder(state: &AppState, kind: FolderKind, item_id: &str, folder_id: Option<String>) -> Result<()> {
+    Ok(state.workspace.move_to_folder(kind, item_id, folder_id.as_deref())?)
+}
+
+pub fn delete_connection(state: &AppState, id: &str) -> Result<()> {
+    state.engine.disconnect(id);
+    state.workspace.delete_connection(id)?;
+    state.secrets.delete(&SecretRef::for_connection(id))?;
+    Ok(())
+}
+
+pub async fn test_connection(
+    state: &AppState,
+    config: ConnectionConfig,
+    secret: Option<String>,
+    connection_id: Option<String>,
+    ssh_secret: Option<String>,
+) -> Result<TestResult> {
+    validate_config(&config)?;
+    state
+        .engine
+        .test_connection(&config, secret, connection_id.as_deref(), ssh_secret)
+        .await
+}
+
+pub async fn connect(state: &AppState, id: &str) -> Result<String> {
+    state.engine.connect(id).await
+}
+
+pub fn disconnect(state: &AppState, id: &str) {
+    state.engine.disconnect(id);
+}
+
+// ------------------------------------------------------------ explorer
+
+pub async fn list_schemas(state: &AppState, id: &str) -> Result<Vec<SchemaInfo>> {
+    state.engine.list_schemas(id).await
+}
+
+pub async fn list_objects(state: &AppState, id: &str, schema: &str) -> Result<Vec<DbObject>> {
+    state.engine.list_objects(id, schema).await
+}
+
+pub async fn describe(
+    state: &AppState,
+    id: &str,
+    schema: &str,
+    name: &str,
+) -> Result<ObjectDetail> {
+    state.engine.describe(id, schema, name).await
+}
+
+// ------------------------------------------------------------ running queries
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Span {
+    /// UTF-16 offsets.
+    pub start: usize,
+    pub end: usize,
+    pub sql: String,
+}
+
+/// Statement under the cursor (`cursor` is a UTF-16 offset).
+pub fn statement_at_cursor(kind: ConnectorKind, text: &str, cursor: usize) -> Option<Span> {
+    let spans = split_statements(text, kind);
+    let byte = utf16_to_byte(text, cursor);
+    statement_at(&spans, byte).map(|s| Span {
+        start: byte_to_utf16(text, s.start),
+        end: byte_to_utf16(text, s.end),
+        sql: s.sql.clone(),
+    })
+}
+
+pub fn run_query(state: &AppState, mut req: RunRequest) -> Result<RunResponse> {
+    let text = req.sql.clone();
+    // The engine works in bytes; the UI's base offset is UTF-16.
+    let base_utf16 = req.base_offset;
+    req.base_offset = 0;
+    let mut resp = state.engine.run(req)?;
+    let statements = match &mut resp {
+        RunResponse::Started { statements, .. } => statements,
+        RunResponse::NeedsConfirmation { statements, .. } => statements,
+    };
+    for s in statements.iter_mut() {
+        s.start = base_utf16 + byte_to_utf16(&text, s.start);
+        s.end = base_utf16 + byte_to_utf16(&text, s.end);
+    }
+    Ok(resp)
+}
+
+pub fn cancel_query(state: &AppState, job_id: &str) -> bool {
+    state.engine.cancel(job_id)
+}
+
+pub fn close_tab(state: &AppState, tab_id: &str) {
+    state.engine.close_tab(tab_id);
+}
+
+// ------------------------------------------------------------ results
+
+pub fn result_info(state: &AppState, result_id: &str) -> Result<ResultInfo> {
+    Ok(state.results().get(result_id)?.lock().info())
+}
+
+pub async fn fetch_page(
+    state: &AppState,
+    result_id: String,
+    view: ViewSpec,
+    offset: usize,
+    limit: usize,
+) -> Result<Page> {
+    let rs = state.results().get(&result_id)?;
+    blocking(move || Ok(rs.lock().page(&view, offset, limit.min(MAX_PAGE))?)).await
+}
+
+pub async fn find_in_result(
+    state: &AppState,
+    result_id: String,
+    view: ViewSpec,
+    query: String,
+    limit: usize,
+) -> Result<FindResult> {
+    let rs = state.results().get(&result_id)?;
+    blocking(move || Ok(rs.lock().find(&view, &query, limit.clamp(1, 100_000))?)).await
+}
+
+pub async fn column_stats(
+    state: &AppState,
+    result_id: String,
+    view: ViewSpec,
+    column: usize,
+) -> Result<ColumnStats> {
+    let rs = state.results().get(&result_id)?;
+    blocking(move || Ok(rs.lock().column_stats(&view, column)?)).await
+}
+
+/// Export the view to a user-chosen file. Returns rows written.
+pub async fn export_result(
+    state: &AppState,
+    result_id: String,
+    view: ViewSpec,
+    options: ExportOptions,
+    path: String,
+) -> Result<u64> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(invalid("Export path must be absolute"));
+    }
+    let rs = state.results().get(&result_id)?;
+    blocking(move || {
+        let (schema, batches) = {
+            let mut g = rs.lock();
+            (g.schema(), g.view_batches(&view, 10_000)?)
+        };
+        write_export(&path, schema, &batches, options)
+    })
+    .await
+}
+
+fn write_export(
+    path: &Path,
+    schema: databrain_connector_core::arrow::datatypes::SchemaRef,
+    batches: &[databrain_connector_core::arrow::array::RecordBatch],
+    options: ExportOptions,
+) -> Result<u64> {
+    let io = |e: std::io::Error| EngineError::new("internal", format!("{}: {e}", path.display()));
+    // Write to a temp file in the same directory, then rename, so a failed
+    // export never leaves a half-written file under the chosen name.
+    let tmp = path.with_extension(format!(
+        "{}.partial",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+    ));
+    match export_file(&tmp, schema, batches, options) {
+        Ok(rows) => {
+            std::fs::rename(&tmp, path).map_err(io)?;
+            Ok(rows)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(EngineError::new("invalid", e.to_string()))
+        }
+    }
+}
+
+/// Serialize rows `[offset, offset+limit)` of the view (optionally a subset of
+/// columns) for the clipboard.
+pub async fn copy_rows(
+    state: &AppState,
+    result_id: String,
+    view: ViewSpec,
+    offset: usize,
+    limit: usize,
+    options: ExportOptions,
+) -> Result<String> {
+    let rs = state.results().get(&result_id)?;
+    blocking(move || {
+        let (schema, batch) = {
+            let mut g = rs.lock();
+            let (b, _) = g.view_slice(&view, offset, limit.min(MAX_COPY_ROWS))?;
+            (g.schema(), b)
+        };
+        export_to_string(schema, [&batch], options)
+            .map_err(|e| EngineError::new("internal", e.to_string()))
+    })
+    .await
+}
+
+pub fn release_result(state: &AppState, result_id: &str) -> bool {
+    state.results().remove(result_id)
+}
+
+// ------------------------------------------------------------ saved queries, history, tabs, settings
+
+pub fn list_saved_queries(state: &AppState, search: Option<String>) -> Result<Vec<SavedQuery>> {
+    Ok(state.workspace.list_saved_queries(search.as_deref())?)
+}
+
+pub fn save_query(state: &AppState, query: SavedQuery) -> Result<SavedQuery> {
+    Ok(state.workspace.save_query(query)?)
+}
+
+pub fn delete_saved_query(state: &AppState, id: &str) -> Result<()> {
+    Ok(state.workspace.delete_saved_query(id)?)
+}
+
+pub fn list_folders(state: &AppState, kind: FolderKind) -> Result<Vec<Folder>> {
+    Ok(state.workspace.list_folders(kind)?)
+}
+
+pub fn save_folder(state: &AppState, folder: Folder) -> Result<Folder> {
+    Ok(state.workspace.save_folder(folder)?)
+}
+
+pub fn delete_folder(state: &AppState, id: &str) -> Result<()> {
+    Ok(state.workspace.delete_folder(id)?)
+}
+
+pub fn list_history(state: &AppState, query: HistoryQuery) -> Result<Vec<HistoryEntry>> {
+    Ok(state.workspace.list_history(&query)?)
+}
+
+pub fn clear_history(state: &AppState) -> Result<()> {
+    Ok(state.workspace.clear_history()?)
+}
+
+pub fn list_notebooks(state: &AppState) -> Result<Vec<databrain_workspace::NotebookSummary>> {
+    Ok(state.workspace.list_notebooks()?)
+}
+
+pub fn get_notebook(state: &AppState, id: &str) -> Result<databrain_workspace::Notebook> {
+    Ok(state.workspace.get_notebook(id)?)
+}
+
+pub fn save_notebook(state: &AppState, notebook: databrain_workspace::Notebook) -> Result<databrain_workspace::Notebook> {
+    Ok(state.workspace.save_notebook(notebook)?)
+}
+
+/// Deleting a notebook also releases its per-cell sessions/results.
+pub fn delete_notebook(state: &AppState, id: &str) -> Result<()> {
+    if let Ok(nb) = state.workspace.get_notebook(id) {
+        for c in nb.cells {
+            state.engine.close_tab(&format!("nb:{id}:{}", c.id));
+        }
+    }
+    state.engine.close_tab(&format!("nb:{id}"));
+    Ok(state.workspace.delete_notebook(id)?)
+}
+
+/// DuckDB SQL that reads a local file or folder (CSV, Parquet, JSON, Excel,
+/// Delta, Iceberg), e.g. `SELECT * FROM read_parquet('/x/a.parquet')`.
+#[cfg(feature = "duckdb")]
+pub fn file_scan_sql(path: &str) -> Result<String> {
+    let fmt = databrain_connector_duckdb::detect_format(path)
+        .ok_or_else(|| EngineError::new("invalid", "unsupported file type (use .csv/.tsv/.parquet/.json/.ndjson/.xlsx or a Delta/Iceberg folder)"))?;
+    Ok(format!("SELECT *\nFROM {}\nLIMIT 1000;", databrain_connector_duckdb::scan_expr(path, fmt)))
+}
+
+pub fn load_tabs(state: &AppState) -> Result<Vec<TabState>> {
+    Ok(state.workspace.list_tabs()?)
+}
+
+pub fn save_tabs(state: &AppState, tabs: Vec<TabState>) -> Result<()> {
+    Ok(state.workspace.save_tabs(&tabs)?)
+}
+
+pub fn get_settings(state: &AppState) -> Result<serde_json::Map<String, serde_json::Value>> {
+    Ok(state.workspace.all_settings()?)
+}
+
+pub fn set_setting(state: &AppState, key: &str, value: serde_json::Value) -> Result<()> {
+    if key.is_empty() || key.len() > 100 {
+        return Err(invalid("invalid setting key"));
+    }
+    Ok(state.workspace.set_setting(key, &value)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use databrain_auth::{AuthMethod, MemoryStore};
+    use databrain_export::ExportFormat;
+    use databrain_query_engine::{CollectingSink, JobEvent};
+    use databrain_result_store::{ColumnFilter, FilterOp, SortKey};
+    use databrain_workspace::EnvTag;
+    use std::time::Duration;
+
+    #[test]
+    fn utf16_offsets() {
+        let t = "é😀a";
+        assert_eq!(byte_to_utf16(t, 2), 1);
+        assert_eq!(byte_to_utf16(t, 6), 3);
+        assert_eq!(utf16_to_byte(t, 3), 6);
+        assert_eq!(utf16_to_byte(t, 99), t.len());
+        let s = statement_at_cursor(ConnectorKind::Sqlite, "select 'é';\nselect 2;", 13).unwrap();
+        assert_eq!((s.start, s.end, s.sql.as_str()), (12, 20, "select 2"));
+    }
+
+    #[derive(Default)]
+    pub(crate) struct TestUi(pub parking_lot::Mutex<Vec<(String, serde_json::Value)>>);
+    impl crate::ai_api::UiBridge for TestUi {
+        fn emit(&self, channel: &str, payload: serde_json::Value) {
+            self.0.lock().push((channel.into(), payload));
+        }
+        fn open_url(&self, _: &str) -> std::result::Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn state() -> (AppState, Arc<CollectingSink>, tempfile::TempDir) {
+        let sink = Arc::new(CollectingSink::default());
+        let ws = Arc::new(Workspace::open_in_memory().unwrap());
+        let st = AppState::new(ws, Arc::new(MemoryStore::default()), sink.clone(), Arc::new(TestUi::default()));
+        (st, sink, tempfile::tempdir().unwrap())
+    }
+
+    async fn finished_results(sink: &CollectingSink, job: &str) -> Vec<ResultInfo> {
+        for _ in 0..500 {
+            let evs = sink.0.lock().clone();
+            if evs
+                .iter()
+                .any(|e| matches!(e, JobEvent::JobFinished { job_id, .. } if job_id == job))
+            {
+                return evs
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        JobEvent::StatementFinished { job_id, result: Some(r), .. } if job_id == job => Some(r),
+                        _ => None,
+                    })
+                    .collect();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("job did not finish")
+    }
+
+    /// End-to-end: create a SQLite connection, run a script, page/filter/sort/
+    /// find/stats/copy/export the result, save a query and read history.
+    #[tokio::test]
+    async fn end_to_end_sqlite() {
+        let (st, sink, dir) = state();
+        let db = dir.path().join("demo.db");
+        let profile = save_connection(
+            &st,
+            SaveConnectionArgs {
+                profile: ConnectionProfile {
+                    id: String::new(),
+                    name: "Demo".into(),
+                    config: ConnectionConfig {
+                        kind: ConnectorKind::Sqlite,
+                        host: None,
+                        port: None,
+                        database: None,
+                        file_path: Some(db.to_string_lossy().into()),
+                        auth: AuthMethod::None,
+                        ssl_mode: Default::default(),
+                        read_only: false,
+                        options: Default::default(),
+                        ssh: None,
+                    },
+                    color: None,
+                    env: EnvTag::Dev,
+                    folder_id: None,
+                    has_secret: false,
+                    ai_policy: Default::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                secret: None,
+                clear_secret: false,
+                extra_secrets: Default::default(),
+            },
+        )
+        .unwrap();
+
+        let t = test_connection(&st, profile.config.clone(), None, None, None).await.unwrap();
+        assert!(t.server_version.starts_with("SQLite"));
+
+        let script = "create table people(id integer primary key, name text, city text, age integer);\n\
+            insert into people(name, city, age) values ('Ann','Hanoi',31),('Binh','Hue',25),('Chi','Hanoi',42),('Dung',null,19);\n\
+            select * from people;";
+        let resp = run_query(
+            &st,
+            RunRequest {
+                connection_id: profile.id.clone(),
+                tab_id: "t1".into(),
+                sql: script.into(),
+                base_offset: 5,
+                row_limit: Some(1000),
+                confirmed: false,
+                origin: Default::default(),
+                session_key: None,
+            },
+        )
+        .unwrap();
+        let RunResponse::Started { job_id, statements } = resp else {
+            panic!("expected start")
+        };
+        assert_eq!(statements.len(), 3);
+        assert_eq!(statements[0].start, 5);
+        let results = finished_results(&sink, &job_id).await;
+        assert_eq!(results.len(), 1);
+        let rid = results[0].id.clone();
+        assert_eq!(results[0].total_rows, 4);
+
+        let view = ViewSpec {
+            filters: vec![ColumnFilter {
+                column: 2,
+                op: FilterOp::Equals,
+                value: "Hanoi".into(),
+            }],
+            quick_filter: None,
+            sort: vec![SortKey {
+                column: 3,
+                descending: true,
+            }],
+        };
+        let page = fetch_page(&st, rid.clone(), view.clone(), 0, 100).await.unwrap();
+        assert_eq!(page.view_rows, 2);
+        assert_eq!(page.rows[0][1].as_deref(), Some("Chi"));
+
+        let f = find_in_result(&st, rid.clone(), ViewSpec::default(), "han".into(), 100)
+            .await
+            .unwrap();
+        assert_eq!(f.matches.len(), 2);
+
+        let stats = column_stats(&st, rid.clone(), ViewSpec::default(), 2).await.unwrap();
+        assert_eq!((stats.nulls, stats.distinct), (1, 2));
+
+        let tsv = copy_rows(
+            &st,
+            rid.clone(),
+            view.clone(),
+            0,
+            1,
+            ExportOptions::new(ExportFormat::Tsv),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tsv, "id\tname\tcity\tage\n3\tChi\tHanoi\t42\n");
+
+        let out = dir.path().join("hanoi.csv");
+        let n = export_result(
+            &st,
+            rid.clone(),
+            view,
+            ExportOptions::new(ExportFormat::Csv),
+            out.to_string_lossy().into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "id,name,city,age\n3,Chi,Hanoi,42\n1,Ann,Hanoi,31\n"
+        );
+        assert!(export_result(&st, rid.clone(), ViewSpec::default(), ExportOptions::new(ExportFormat::Csv), "rel.csv".into())
+            .await
+            .is_err());
+
+        // Explorer
+        let objs = list_objects(&st, &profile.id, "main").await.unwrap();
+        assert_eq!(objs[0].name, "people");
+        assert!(list_connections(&st).unwrap()[0].connected);
+
+        // Saved queries + history
+        save_query(
+            &st,
+            SavedQuery {
+                id: String::new(),
+                name: "Hanoi people".into(),
+                sql: "select * from people where city = 'Hanoi'".into(),
+                connection_id: Some(profile.id.clone()),
+                folder_id: None,
+                description: None,
+                tags: vec![],
+                ai_example: false,
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(list_saved_queries(&st, Some("hanoi".into())).unwrap().len(), 1);
+        assert_eq!(list_history(&st, HistoryQuery::default()).unwrap().len(), 3);
+
+        close_tab(&st, "t1");
+        assert!(result_info(&st, &rid).is_err());
+        delete_connection(&st, &profile.id).unwrap();
+        assert!(list_connections(&st).unwrap().is_empty());
+    }
+
+    #[test]
+    fn secrets_are_stored_in_secret_store_only() {
+        let (st, _sink, _dir) = state();
+        let saved = save_connection(
+            &st,
+            SaveConnectionArgs {
+                profile: ConnectionProfile {
+                    id: String::new(),
+                    name: "PG".into(),
+                    config: ConnectionConfig {
+                        kind: ConnectorKind::Postgres,
+                        host: Some("localhost".into()),
+                        port: Some(5432),
+                        database: Some("postgres".into()),
+                        file_path: None,
+                        auth: AuthMethod::Password { user: "me".into() },
+                        ssl_mode: Default::default(),
+                        read_only: false,
+                        options: Default::default(),
+                        ssh: None,
+                    },
+                    color: None,
+                    env: EnvTag::None,
+                    folder_id: None,
+                    has_secret: false,
+                    ai_policy: Default::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                secret: Some("hunter2".into()),
+                clear_secret: false,
+                extra_secrets: [("ssh".to_string(), "sshpw".to_string()), ("bogus".to_string(), "x".to_string())].into_iter().collect(),
+            },
+        )
+        .unwrap();
+        assert!(saved.has_secret);
+        let json = serde_json::to_string(&st.workspace.get_connection(&saved.id).unwrap()).unwrap();
+        assert!(!json.contains("hunter2"));
+        let r = SecretRef::for_connection(&saved.id);
+        use secrecy::ExposeSecret;
+        assert_eq!(st.secrets.get(&r).unwrap().unwrap().expose_secret(), "hunter2");
+        assert_eq!(st.secrets.get(&SecretRef::slot(&saved.id, "ssh")).unwrap().unwrap().expose_secret(), "sshpw");
+        // Folder move
+        let f = save_folder(&st, Folder { id: String::new(), parent_id: None, name: "Prod".into(), kind: FolderKind::Connections }).unwrap();
+        move_to_folder(&st, FolderKind::Connections, &saved.id, Some(f.id.clone())).unwrap();
+        assert_eq!(st.workspace.get_connection(&saved.id).unwrap().folder_id, Some(f.id));
+        #[cfg(feature = "duckdb")]
+        {
+            assert_eq!(file_scan_sql("/d/x.csv").unwrap(), "SELECT *\nFROM read_csv('/d/x.csv')\nLIMIT 1000;");
+            assert!(file_scan_sql("/d/x.exe").is_err());
+        }
+
+        // Editing without a secret keeps it; clearing removes it.
+        let mut p = saved.clone();
+        p.has_secret = false;
+        let kept = save_connection(&st, SaveConnectionArgs { profile: p.clone(), secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
+        assert!(kept.has_secret);
+        let cleared = save_connection(&st, SaveConnectionArgs { profile: p, secret: None, clear_secret: true, extra_secrets: [("ssh".to_string(), String::new())].into_iter().collect() }).unwrap();
+        assert!(!cleared.has_secret);
+        assert!(st.secrets.get(&r).unwrap().is_none());
+        assert!(st.secrets.get(&SecretRef::slot(&saved.id, "ssh")).unwrap().is_none());
+        assert!(st.secrets.get(&SecretRef::slot(&saved.id, "bogus")).unwrap().is_none());
+    }
+}

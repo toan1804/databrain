@@ -1,0 +1,72 @@
+[package]
+name = "databrain-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+default-run = "databrain"
+
+[lints]
+workspace = true
+
+[lib]
+name = "databrain_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "databrain"
+path = "src/main.rs"
+
+[[bin]]
+name = "databrain-mcp"
+path = "src/bin/databrain-mcp.rs"
+
+[dependencies]
+async-trait = "0.1.92"
+databrain-ai = { version = "0.1.0", path = "../ai" }
+databrain-auth = { version = "0.1.0", path = "../auth" }
+databrain-connector-cloud = { version = "0.1.0", path = "../connectors/cloud", default-features = false, optional = true }
+databrain-connector-core = { version = "0.1.0", path = "../connector-core" }
+databrain-connector-duckdb = { version = "0.1.0", path = "../connectors/duckdb", optional = true }
+databrain-connector-mssql = { version = "0.1.0", path = "../connectors/mssql", optional = true }
+databrain-connector-mysql = { version = "0.1.0", path = "../connectors/mysql", optional = true }
+databrain-connector-oracle = { version = "0.1.0", path = "../connectors/oracle", optional = true }
+databrain-connector-postgres = { version = "0.1.0", path = "../connectors/postgres", optional = true }
+databrain-connector-sqlite = { version = "0.1.0", path = "../connectors/sqlite", optional = true }
+databrain-export = { version = "0.1.0", path = "../export" }
+databrain-query-engine = { version = "0.1.0", path = "../query-engine" }
+databrain-result-store = { version = "0.1.0", path = "../result-store" }
+databrain-workspace = { version = "0.1.0", path = "../workspace" }
+dirs = "7.0.0"
+parking_lot = "0.12.5"
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tauri = { version = "2", features = [] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = "0.7.19"
+uuid = { version = "1.26.1", features = ["v4"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[features]
+default = ["sqlite", "postgres", "mysql", "mssql", "oracle", "snowflake", "databricks", "bigquery", "duckdb"]
+sqlite = ["dep:databrain-connector-sqlite"]
+postgres = ["dep:databrain-connector-postgres"]
+mysql = ["dep:databrain-connector-mysql"]
+mssql = ["dep:databrain-connector-mssql"]
+oracle = ["dep:databrain-connector-oracle"]
+snowflake = ["dep:databrain-connector-cloud", "databrain-connector-cloud/snowflake"]
+databricks = ["dep:databrain-connector-cloud", "databrain-connector-cloud/databricks"]
+bigquery = ["dep:databrain-connector-cloud", "databrain-connector-cloud/bigquery"]
+databrain-connector-duckdb = ["dep:databrain-connector-duckdb"]
+duckdb = ["dep:databrain-connector-duckdb"]

@@ -1,0 +1,251 @@
+customer_id,name,email,country,city,signup_date,is_vip
+1,David Nguyễn,david.1@example.com,USA,San Francisco,2022-09-08,false
+2,David Lê,david.2@example.com,UK,London,2022-03-31,false
+3,Bao Nguyễn,bao.3@example.com,Vietnam,Hồ Chí Minh,2022-08-12,false
+4,Trang Nguyễn,trang.4@example.com,UK,London,2022-07-23,false
+5,Rosa Rossi,rosa.5@example.com,USA,New York,2023-04-05,false
+6,Anna Johnson,anna.6@example.com,Vietnam,Đà Nẵng,2023-12-16,false
+7,Ines Smith,ines.7@example.com,USA,New York,2024-09-07,false
+8,David Trần,david.8@example.com,France,Paris,2022-04-10,false
+9,Lena Kowalski,lena.9@example.com,USA,San Francisco,2024-04-06,true
+10,Olivia Dubois,olivia.10@example.com,Vietnam,Hồ Chí Minh,2024-09-23,false
+11,Chloé Dubois,chloé.11@example.com,USA,San Francisco,2024-04-29,false
+12,Lena Kowalski,lena.12@example.com,USA,New York,2023-12-23,true
+13,Hiro Johnson,hiro.13@example.com,USA,San Francisco,2022-03-23,false
+14,David Rossi,david.14@example.com,USA,San Francisco,2023-04-10,false
+15,Lena Smith,lena.15@example.com,Germany,Berlin,2022-12-30,false
+16,Ines Phạm,ines.16@example.com,Vietnam,Hồ Chí Minh,2023-09-16,false
+17,Rosa Phạm,,USA,New York,2022-06-17,false
+18,Ines Andersson,ines.18@example.com,UK,London,2022-08-13,false
+19,Bao O'Brien,bao.19@example.com,Vietnam,Hà Nội,2024-04-04,false
+20,Ines Trần,ines.20@example.com,USA,New York,2024-07-24,false
+21,Khanh O'Brien,khanh.21@example.com,Japan,Tokyo,2023-02-10,false
+22,Olivia Smith,olivia.22@example.com,USA,San Francisco,2022-05-23,false
+23,Rosa Dubois,rosa.23@example.com,USA,San Francisco,2024-02-04,false
+24,Sven Rossi,sven.24@example.com,Germany,Berlin,2022-08-13,false
+25,Emma Dubois,emma.25@example.com,Japan,Tokyo,2022-04-04,false
+26,David Smith,david.26@example.com,Vietnam,Đà Nẵng,2024-03-22,false
+27,Trang Trần,trang.27@example.com,France,Paris,2023-01-26,false
+28,Olivia Dubois,olivia.28@example.com,USA,San Francisco,2024-09-21,false
+29,Anna Lê,anna.29@example.com,Vietnam,Hồ Chí Minh,2023-11-30,false
+30,Ines Johnson,ines.30@example.com,Germany,Berlin,2022-04-25,false
+31,Farid Tanaka,farid.31@example.com,Vietnam,Hà Nội,2024-09-03,false
+32,Ines Dubois,ines.32@example.com,Vietnam,Đà Nẵng,2023-06-04,false
+33,Jonas Silva,jonas.33@example.com,UK,London,2023-09-16,false
+34,Lena Johnson,,Vietnam,Đà Nẵng,2023-07-07,false
+35,Quang Andersson,quang.35@example.com,Vietnam,Hà Nội,2023-09-06,false
+36,Anna Trần,anna.36@example.com,Germany,Berlin,2024-06-18,false
+37,Jonas O'Brien,jonas.37@example.com,Vietnam,Hà Nội,2022-09-04,false
+38,Chloé Trần,chloé.38@example.com,Japan,Tokyo,2024-04-15,true
+39,Rosa Johnson,rosa.39@example.com,Vietnam,Đà Nẵng,2022-05-12,false
+40,Rosa Smith,rosa.40@example.com,USA,San Francisco,2023-06-25,false
+41,Noah O'Brien,noah.41@example.com,UK,London,2024-02-13,false
+42,Giulia Phạm,giulia.42@example.com,USA,San Francisco,2023-02-13,false
+43,Lena Tanaka,lena.43@example.com,UK,London,2023-04-08,false
+44,Hiro Trần,hiro.44@example.com,Germany,Berlin,2022-01-22,false
+45,Hiro Kowalski,hiro.45@example.com,USA,New York,2022-01-08,true
+46,Bao O'Brien,bao.46@example.com,Vietnam,Hồ Chí Minh,2024-07-16,true
+47,Khanh Trần,khanh.47@example.com,UK,London,2022-09-01,false
+48,Priya O'Brien,priya.48@example.com,UK,London,2022-05-16,false
+49,Sven Kowalski,sven.49@example.com,Japan,Tokyo,2022-09-06,false
+50,"O'Brien, Noah",noah.50@example.com,Vietnam,Hồ Chí Minh,2022-04-10,false
+51,Lena Rossi,,France,Paris,2023-04-24,false
+52,Bao Lê,bao.52@example.com,Vietnam,Hồ Chí Minh,2022-03-04,false
+53,Khanh Johnson,khanh.53@example.com,Vietnam,Hồ Chí Minh,2022-09-12,false
+54,Rosa Tanaka,rosa.54@example.com,Vietnam,Đà Nẵng,2023-03-09,false
+55,Olivia O'Brien,olivia.55@example.com,Vietnam,Hồ Chí Minh,2023-03-30,false
+56,Rosa Trần,rosa.56@example.com,Vietnam,Hà Nội,2023-10-30,false
+57,Anna Trần,anna.57@example.com,USA,New York,2022-06-20,false
+58,Priya O'Brien,priya.58@example.com,France,Paris,2024-07-13,true
+59,Minh Nguyễn,minh.59@example.com,France,Paris,2022-09-29,false
+60,Olivia García,olivia.60@example.com,France,Paris,2023-12-15,false
+61,Rosa Lê,rosa.61@example.com,Japan,Tokyo,2022-06-08,false
+62,Giulia Nguyễn,giulia.62@example.com,Brazil,São Paulo,2024-01-24,false
+63,Khanh Nguyễn,khanh.63@example.com,Vietnam,Hà Nội,2023-08-22,false
+64,Quang Smith,quang.64@example.com,Vietnam,Hà Nội,2024-09-10,false
+65,Farid Trần,farid.65@example.com,Brazil,São Paulo,2022-03-11,false
+66,Hiro Rossi,hiro.66@example.com,Vietnam,Hồ Chí Minh,2024-08-22,false
+67,Hiro Kowalski,hiro.67@example.com,Brazil,São Paulo,2022-02-10,false
+68,Noah Lê,,Brazil,São Paulo,2023-08-02,false
+69,Ines O'Brien,ines.69@example.com,Germany,Berlin,2022-09-02,false
+70,Emma Lê,emma.70@example.com,USA,San Francisco,2023-04-14,false
+71,Chloé Nguyễn,chloé.71@example.com,Japan,Tokyo,2023-09-29,false
+72,David Trần,david.72@example.com,UK,London,2022-08-07,false
+73,Emma Andersson,emma.73@example.com,Germany,Berlin,2024-06-21,true
+74,Hiro Müller,hiro.74@example.com,USA,San Francisco,2022-06-11,false
+75,Rosa Phạm,rosa.75@example.com,USA,San Francisco,2023-09-19,false
+76,Quang Nguyễn,quang.76@example.com,UK,London,2022-11-03,false
+77,David Andersson,david.77@example.com,Vietnam,Đà Nẵng,2022-09-28,true
+78,David Phạm,david.78@example.com,UK,London,2022-06-09,false
+79,Trang O'Brien,trang.79@example.com,Germany,Berlin,2022-07-28,false
+80,Ines Dubois,ines.80@example.com,Japan,Tokyo,2022-09-15,false
+81,Bao Trần,bao.81@example.com,France,Paris,2024-04-29,false
+82,Anna Müller,anna.82@example.com,Vietnam,Đà Nẵng,2023-10-15,false
+83,Farid Phạm,farid.83@example.com,Japan,Tokyo,2023-07-19,false
+84,Rosa Nguyễn,rosa.84@example.com,Vietnam,Hồ Chí Minh,2022-03-19,false
+85,Emma Dubois,,Vietnam,Hà Nội,2024-05-04,false
+86,Rosa Smith,rosa.86@example.com,France,Paris,2022-05-11,true
+87,Lena Andersson,lena.87@example.com,Vietnam,Hà Nội,2024-07-09,false
+88,Hiro Lê,hiro.88@example.com,Vietnam,Hồ Chí Minh,2022-12-29,false
+89,Noah Kowalski,noah.89@example.com,Vietnam,Đà Nẵng,2024-08-05,false
+90,Farid Johnson,farid.90@example.com,Vietnam,Đà Nẵng,2024-06-21,false
+91,Farid Phạm,farid.91@example.com,Germany,Berlin,2024-03-12,false
+92,Hiro García,hiro.92@example.com,Vietnam,Đà Nẵng,2024-03-17,false
+93,Minh Silva,minh.93@example.com,Vietnam,Hà Nội,2024-05-29,false
+94,Giulia Silva,giulia.94@example.com,Japan,Tokyo,2022-12-25,false
+95,Hiro O'Brien,hiro.95@example.com,Vietnam,Hà Nội,2023-11-07,false
+96,Khanh García,khanh.96@example.com,Vietnam,Hồ Chí Minh,2024-09-17,false
+97,Lena Lê,lena.97@example.com,UK,London,2023-02-14,false
+98,Rosa Müller,rosa.98@example.com,Vietnam,Hà Nội,2022-04-29,false
+99,Ines Smith,ines.99@example.com,Brazil,São Paulo,2024-09-12,false
+100,"Trần, Bao",bao.100@example.com,Brazil,São Paulo,2023-03-21,false
+101,Khanh Rossi,khanh.101@example.com,Brazil,São Paulo,2023-06-08,true
+102,Sven O'Brien,,USA,San Francisco,2022-02-15,false
+103,Anna Dubois,anna.103@example.com,UK,London,2023-12-05,false
+104,Giulia Müller,giulia.104@example.com,France,Paris,2022-03-13,false
+105,Khanh Kowalski,khanh.105@example.com,Germany,Berlin,2023-11-11,false
+106,Jonas Dubois,jonas.106@example.com,USA,San Francisco,2023-11-14,false
+107,Minh Phạm,minh.107@example.com,USA,San Francisco,2023-07-22,false
+108,Noah Lê,noah.108@example.com,France,Paris,2023-11-25,false
+109,Farid Kowalski,farid.109@example.com,Brazil,São Paulo,2022-11-05,false
+110,Anna García,anna.110@example.com,USA,San Francisco,2022-08-04,false
+111,Sven Kowalski,sven.111@example.com,Germany,Berlin,2023-04-22,false
+112,Giulia Dubois,giulia.112@example.com,Japan,Tokyo,2024-03-23,false
+113,Farid Lê,farid.113@example.com,Vietnam,Hồ Chí Minh,2022-10-18,false
+114,Trang Müller,trang.114@example.com,Vietnam,Hồ Chí Minh,2024-04-18,false
+115,Hiro Lê,hiro.115@example.com,USA,San Francisco,2022-08-19,false
+116,Emma Nguyễn,emma.116@example.com,Vietnam,Hà Nội,2022-09-08,false
+117,Trang Silva,trang.117@example.com,Vietnam,Hồ Chí Minh,2023-04-12,false
+118,Sven O'Brien,sven.118@example.com,France,Paris,2023-05-22,false
+119,Emma Lê,,Vietnam,Hà Nội,2024-07-03,false
+120,David Johnson,david.120@example.com,France,Paris,2022-08-13,false
+121,Quang Tanaka,quang.121@example.com,Vietnam,Hà Nội,2023-07-25,false
+122,David Tanaka,david.122@example.com,Vietnam,Đà Nẵng,2024-03-31,false
+123,Quang Dubois,quang.123@example.com,Brazil,São Paulo,2022-11-21,false
+124,Olivia Kowalski,olivia.124@example.com,UK,London,2023-03-13,false
+125,Rosa Tanaka,rosa.125@example.com,Vietnam,Đà Nẵng,2024-02-01,false
+126,Olivia García,olivia.126@example.com,USA,New York,2024-05-10,false
+127,Quang Tanaka,quang.127@example.com,USA,New York,2022-10-09,false
+128,Jonas O'Brien,jonas.128@example.com,USA,San Francisco,2022-12-10,false
+129,Rosa Trần,rosa.129@example.com,Vietnam,Đà Nẵng,2022-06-04,false
+130,Emma Phạm,emma.130@example.com,USA,New York,2022-03-07,false
+131,Khanh Dubois,khanh.131@example.com,Japan,Tokyo,2023-03-02,true
+132,Noah Rossi,noah.132@example.com,Brazil,São Paulo,2024-08-26,false
+133,Sven Rossi,sven.133@example.com,Japan,Tokyo,2022-01-07,false
+134,Jonas Johnson,jonas.134@example.com,France,Paris,2024-05-23,false
+135,Noah Dubois,noah.135@example.com,UK,London,2024-03-30,false
+136,Hiro Tanaka,,USA,New York,2022-10-07,false
+137,Anna Rossi,anna.137@example.com,Germany,Berlin,2023-11-16,false
+138,Minh Phạm,minh.138@example.com,Vietnam,Đà Nẵng,2024-05-10,false
+139,Emma Kowalski,emma.139@example.com,UK,London,2022-01-28,false
+140,Sven Kowalski,sven.140@example.com,Vietnam,Hà Nội,2022-03-27,false
+141,Emma Silva,emma.141@example.com,Japan,Tokyo,2022-07-06,true
+142,Minh Müller,minh.142@example.com,USA,New York,2023-04-11,false
+143,Minh García,minh.143@example.com,France,Paris,2022-09-16,false
+144,Priya Nguyễn,priya.144@example.com,UK,London,2022-02-23,false
+145,Lena O'Brien,lena.145@example.com,Vietnam,Hồ Chí Minh,2024-03-10,false
+146,Bao Johnson,bao.146@example.com,Vietnam,Hà Nội,2024-08-30,false
+147,Anna Kowalski,anna.147@example.com,Vietnam,Đà Nẵng,2022-09-02,false
+148,David Kowalski,david.148@example.com,USA,New York,2023-04-22,false
+149,Lena Smith,lena.149@example.com,Brazil,São Paulo,2023-09-14,false
+150,"Johnson, David",david.150@example.com,Vietnam,Đà Nẵng,2024-09-14,false
+151,Sven Nguyễn,sven.151@example.com,USA,San Francisco,2023-08-13,false
+152,Minh Rossi,minh.152@example.com,USA,New York,2022-03-19,false
+153,Hiro Trần,,USA,San Francisco,2024-05-20,false
+154,David Johnson,david.154@example.com,Brazil,São Paulo,2024-03-12,true
+155,Rosa Rossi,rosa.155@example.com,Germany,Berlin,2022-03-12,false
+156,Khanh Nguyễn,khanh.156@example.com,France,Paris,2024-04-22,false
+157,Noah Müller,noah.157@example.com,Japan,Tokyo,2023-12-26,false
+158,Farid Phạm,farid.158@example.com,UK,London,2024-09-15,false
+159,Trang Johnson,trang.159@example.com,UK,London,2024-03-04,false
+160,Noah Silva,noah.160@example.com,Brazil,São Paulo,2022-10-02,false
+161,Hiro Silva,hiro.161@example.com,Vietnam,Hồ Chí Minh,2022-10-13,false
+162,Hiro Johnson,hiro.162@example.com,Japan,Tokyo,2023-08-07,false
+163,Minh Müller,minh.163@example.com,Vietnam,Hà Nội,2023-05-22,false
+164,Farid Tanaka,farid.164@example.com,USA,New York,2022-12-30,false
+165,Khanh García,khanh.165@example.com,Brazil,São Paulo,2023-12-20,false
+166,Rosa Nguyễn,rosa.166@example.com,UK,London,2024-08-28,false
+167,Hiro Phạm,hiro.167@example.com,France,Paris,2023-05-16,false
+168,Hiro Phạm,hiro.168@example.com,Japan,Tokyo,2023-10-24,false
+169,Olivia Johnson,olivia.169@example.com,Vietnam,Hà Nội,2022-04-06,false
+170,Minh Phạm,,USA,New York,2022-11-10,false
+171,Lena Tanaka,lena.171@example.com,UK,London,2023-06-28,false
+172,Rosa Müller,rosa.172@example.com,Germany,Berlin,2023-12-21,false
+173,Jonas García,jonas.173@example.com,USA,New York,2022-05-04,false
+174,Khanh Trần,khanh.174@example.com,UK,London,2024-08-31,false
+175,Farid O'Brien,farid.175@example.com,USA,New York,2024-01-27,false
+176,Sven Johnson,sven.176@example.com,UK,London,2023-09-04,false
+177,David Silva,david.177@example.com,USA,New York,2022-10-31,false
+178,Farid García,farid.178@example.com,Vietnam,Hà Nội,2023-12-27,false
+179,Ines Nguyễn,ines.179@example.com,Vietnam,Hà Nội,2023-07-21,false
+180,Emma Lê,emma.180@example.com,Japan,Tokyo,2022-04-16,false
+181,Sven García,sven.181@example.com,Japan,Tokyo,2023-05-06,false
+182,Farid Nguyễn,farid.182@example.com,USA,San Francisco,2024-08-21,false
+183,David Silva,david.183@example.com,Vietnam,Hồ Chí Minh,2023-02-15,false
+184,Sven Lê,sven.184@example.com,Vietnam,Hà Nội,2022-06-05,false
+185,Sven García,sven.185@example.com,Vietnam,Hồ Chí Minh,2022-09-12,true
+186,Noah Kowalski,noah.186@example.com,Brazil,São Paulo,2024-03-20,false
+187,Quang Rossi,,Japan,Tokyo,2024-07-19,false
+188,Sven Rossi,sven.188@example.com,USA,San Francisco,2023-08-06,false
+189,Trang Phạm,trang.189@example.com,Vietnam,Hồ Chí Minh,2024-08-28,false
+190,Giulia García,giulia.190@example.com,Vietnam,Hồ Chí Minh,2022-06-10,false
+191,Rosa Trần,rosa.191@example.com,Vietnam,Đà Nẵng,2022-01-03,false
+192,Trang Tanaka,trang.192@example.com,USA,San Francisco,2022-02-03,false
+193,Jonas Phạm,jonas.193@example.com,Japan,Tokyo,2022-03-14,false
+194,Ines Johnson,ines.194@example.com,Brazil,São Paulo,2023-11-09,false
+195,Giulia Rossi,giulia.195@example.com,Vietnam,Hồ Chí Minh,2023-07-12,false
+196,Emma Andersson,emma.196@example.com,USA,San Francisco,2024-04-26,false
+197,Bao Smith,bao.197@example.com,USA,San Francisco,2023-09-02,false
+198,Sven Andersson,sven.198@example.com,USA,San Francisco,2023-03-26,false
+199,Jonas Phạm,jonas.199@example.com,France,Paris,2024-08-23,false
+200,"Tanaka, Rosa",rosa.200@example.com,Japan,Tokyo,2022-03-24,false
+201,Noah Phạm,noah.201@example.com,Germany,Berlin,2023-09-11,false
+202,Chloé O'Brien,chloé.202@example.com,Brazil,São Paulo,2023-08-25,false
+203,Ines Kowalski,ines.203@example.com,Vietnam,Hà Nội,2024-02-21,false
+204,Priya Dubois,,Japan,Tokyo,2024-07-27,false
+205,Sven Rossi,sven.205@example.com,Japan,Tokyo,2024-09-19,true
+206,Lena Rossi,lena.206@example.com,Germany,Berlin,2022-11-25,false
+207,Farid Müller,farid.207@example.com,France,Paris,2023-12-12,false
+208,Minh Silva,minh.208@example.com,UK,London,2022-02-07,false
+209,Khanh García,khanh.209@example.com,Germany,Berlin,2022-04-29,false
+210,Minh Silva,minh.210@example.com,UK,London,2024-04-24,false
+211,Rosa Tanaka,rosa.211@example.com,France,Paris,2022-02-25,false
+212,Lena Kowalski,lena.212@example.com,Japan,Tokyo,2023-10-03,false
+213,Bao O'Brien,bao.213@example.com,USA,San Francisco,2023-07-17,false
+214,Jonas Tanaka,jonas.214@example.com,Japan,Tokyo,2022-05-05,true
+215,Trang Johnson,trang.215@example.com,USA,New York,2023-12-28,false
+216,Rosa Nguyễn,rosa.216@example.com,UK,London,2023-02-22,true
+217,David Tanaka,david.217@example.com,Vietnam,Hồ Chí Minh,2023-10-26,false
+218,Priya Andersson,priya.218@example.com,USA,San Francisco,2023-06-06,false
+219,Noah Silva,noah.219@example.com,Japan,Tokyo,2023-04-29,false
+220,Rosa Smith,rosa.220@example.com,France,Paris,2022-07-15,false
+221,Quang Phạm,,Vietnam,Đà Nẵng,2024-06-03,true
+222,Noah Müller,noah.222@example.com,UK,London,2022-10-01,false
+223,Jonas Phạm,jonas.223@example.com,USA,San Francisco,2024-05-07,false
+224,Priya Silva,priya.224@example.com,Vietnam,Đà Nẵng,2023-04-03,false
+225,Lena Müller,lena.225@example.com,UK,London,2024-02-21,false
+226,Olivia Andersson,olivia.226@example.com,Germany,Berlin,2024-06-09,false
+227,Hiro Kowalski,hiro.227@example.com,France,Paris,2022-08-28,false
+228,Noah Nguyễn,noah.228@example.com,Germany,Berlin,2024-02-02,false
+229,Minh Rossi,minh.229@example.com,Vietnam,Đà Nẵng,2023-05-23,false
+230,Emma Dubois,emma.230@example.com,Brazil,São Paulo,2022-12-06,false
+231,Olivia Trần,olivia.231@example.com,UK,London,2024-07-21,false
+232,Emma Rossi,emma.232@example.com,Vietnam,Đà Nẵng,2022-03-18,false
+233,Ines Müller,ines.233@example.com,Brazil,São Paulo,2023-12-11,false
+234,Chloé Silva,chloé.234@example.com,Germany,Berlin,2024-05-22,false
+235,Rosa Rossi,rosa.235@example.com,Germany,Berlin,2023-10-04,false
+236,Priya Silva,priya.236@example.com,UK,London,2022-02-06,false
+237,Hiro Lê,hiro.237@example.com,USA,San Francisco,2022-08-21,false
+238,Noah Trần,,Vietnam,Hồ Chí Minh,2023-03-31,false
+239,Jonas Andersson,jonas.239@example.com,Vietnam,Hà Nội,2022-02-17,false
+240,Bao García,bao.240@example.com,Germany,Berlin,2023-01-19,false
+241,Hiro Dubois,hiro.241@example.com,France,Paris,2023-08-03,false
+242,Farid Smith,farid.242@example.com,Vietnam,Đà Nẵng,2022-03-22,false
+243,Minh Kowalski,minh.243@example.com,USA,New York,2023-05-25,false
+244,Emma O'Brien,emma.244@example.com,Japan,Tokyo,2023-10-16,false
+245,Ines Lê,ines.245@example.com,Vietnam,Hà Nội,2024-07-09,false
+246,Jonas Lê,jonas.246@example.com,UK,London,2022-06-11,true
+247,Lena Kowalski,lena.247@example.com,USA,San Francisco,2023-10-17,false
+248,Ines Tanaka,ines.248@example.com,USA,San Francisco,2022-07-23,false
+249,Priya Trần,priya.249@example.com,USA,New York,2023-01-26,false
+250,"García, Sven",sven.250@example.com,USA,San Francisco,2022-01-23,false

@@ -1,0 +1,23 @@
+[package]
+name = "databrain-connector-mysql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+databrain-auth = { version = "0.1.0", path = "../../auth" }
+databrain-connector-core = { version = "0.1.0", path = "../../connector-core" }
+futures = "0.3.34"
+mysql_async = { version = "=0.36.1", default-features = false, features = ["minimal", "native-tls-tls"] }
+secrecy = "0.10.3"
+tokio = { version = "1.53.1", features = ["rt", "sync", "macros", "time"] }
+tokio-util = "0.7.19"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }

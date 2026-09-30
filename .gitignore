@@ -1,0 +1,8 @@
+/target
+ui/node_modules
+ui/dist
+crates/app/gen
+*.db-wal
+*.db-shm
+.DS_Store
+examples/data/_staging

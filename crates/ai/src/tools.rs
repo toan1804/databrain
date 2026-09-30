@@ -1,0 +1,520 @@
+//! Tools the AI can call. Each tool is described by a JSON Schema (sent to
+//! the model and exposed over MCP) and executed here with policy checks.
+
+use std::sync::Arc;
+
+use databrain_query_engine::{EventHub, QueryEngine, RunRequest};
+use databrain_result_store::ViewSpec;
+use databrain_workspace::{ConnectionProfile, KnNote, NoteStatus, Origin, SavedQuery};
+use serde_json::{Value, json};
+
+use crate::knowledge;
+use crate::policy::{self, Decision, is_pii};
+use crate::resultsql;
+use crate::types::{AiError, Result, ToolSpec};
+
+/// Where a tool call originated (for approvals and audit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caller {
+    /// In-app agent: `Ask` decisions go to the approval UI.
+    Agent,
+    /// External MCP client: `Ask` decisions are denied unless auto-approved.
+    Mcp,
+}
+
+pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
+    let s = |name: &str, description: &str, parameters: Value| ToolSpec { name: name.into(), description: description.into(), parameters };
+    let mut v = vec![
+        s(
+            "search_schema",
+            "Search the connection's tables, views, columns and business notes by keywords. Returns the best matching tables as compact DDL. Use this before writing SQL when unsure which tables exist.",
+            json!({"type": "object", "properties": {"query": {"type": "string", "description": "Keywords, e.g. 'monthly revenue by customer'"}}, "required": ["query"]}),
+        ),
+        s(
+            "describe_table",
+            "Get columns, types, keys, comments and related tables for one table or view.",
+            json!({"type": "object", "properties": {"table": {"type": "string", "description": "schema.table or table"}}, "required": ["table"]}),
+        ),
+        s(
+            "list_tables",
+            "List indexed table names (optionally only in one schema). Use search_schema for relevance ranking.",
+            json!({"type": "object", "properties": {"schema": {"type": "string"}}}),
+        ),
+        s(
+            "get_sample_rows",
+            "Fetch a few sample rows of a table to understand value formats (only if the connection allows sample data).",
+            json!({"type": "object", "properties": {"table": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}, "required": ["table"]}),
+        ),
+        s(
+            "run_query",
+            "Execute SQL on the connection. Reads are row-capped; the user may need to approve. Returns a summary (columns, row count, column stats) and a result_id for query_result. Raw rows are only returned if the connection allows it.",
+            json!({"type": "object", "properties": {"sql": {"type": "string"}, "purpose": {"type": "string", "description": "One short sentence shown to the user when asking for approval"}}, "required": ["sql"]}),
+        ),
+        s(
+            "query_result",
+            "Run SQLite SQL over a previous result stored locally as table `result` (e.g. SELECT region, sum(amount) FROM result GROUP BY 1). Nothing is sent to the database.",
+            json!({"type": "object", "properties": {"result_id": {"type": "string"}, "sql": {"type": "string"}}, "required": ["result_id", "sql"]}),
+        ),
+        s(
+            "result_summary",
+            "Columns, row count and per-column statistics of a stored result (current grid result if result_id is omitted).",
+            json!({"type": "object", "properties": {"result_id": {"type": "string"}}}),
+        ),
+        s(
+            "add_knowledge_note",
+            "Propose a business rule / glossary note for future questions (e.g. 'active customer = status in (1,2)'). The user approves it before it is used.",
+            json!({"type": "object", "properties": {"target": {"type": "string", "description": "schema.table, schema.table.column, or omit for glossary"}, "note": {"type": "string"}}, "required": ["note"]}),
+        ),
+        s(
+            "save_query",
+            "Save a query to the user's saved queries (asks for approval).",
+            json!({"type": "object", "properties": {"name": {"type": "string"}, "sql": {"type": "string"}, "description": {"type": "string"}}, "required": ["name", "sql"]}),
+        ),
+    ];
+    if include_editor {
+        v.push(s(
+            "get_editor",
+            "Read the SQL in the user's current editor tab, their selection, and the last error.",
+            json!({"type": "object", "properties": {}}),
+        ));
+        v.push(s(
+            "write_editor",
+            "Put SQL into the user's editor. mode: replace_selection | insert_at_cursor | replace_all | new_tab. The user sees a diff and accepts or rejects it.",
+            json!({"type": "object", "properties": {"sql": {"type": "string"}, "mode": {"type": "string", "enum": ["replace_selection", "insert_at_cursor", "replace_all", "new_tab"]}, "title": {"type": "string"}}, "required": ["sql"]}),
+        ));
+    }
+    v
+}
+
+/// Hooks into the host for tools that need the UI.
+#[async_trait::async_trait]
+pub trait ToolHost: Send + Sync {
+    /// Ask the user to approve an action. Returns the (possibly edited)
+    /// argument value on approval, `None` on denial.
+    async fn approve(&self, tool: &str, summary: &str, detail: &Value) -> Option<Value>;
+    /// Current editor state for `get_editor`.
+    async fn editor_state(&self) -> Option<Value> {
+        None
+    }
+    /// Apply an editor change proposal (`write_editor`). Returns whether the
+    /// user accepted it.
+    async fn propose_edit(&self, _proposal: &Value) -> bool {
+        false
+    }
+    /// Result currently shown in the grid.
+    fn current_result(&self) -> Option<String> {
+        None
+    }
+}
+
+pub struct ToolContext {
+    pub engine: Arc<QueryEngine>,
+    pub hub: Arc<EventHub>,
+    pub profile: ConnectionProfile,
+    pub session_id: Option<String>,
+    pub caller: Caller,
+    pub host: Arc<dyn ToolHost>,
+    pub cancel: tokio_util::sync::CancellationToken,
+    /// Results produced by this session (allowed for query_result).
+    pub results: parking_lot::Mutex<Vec<String>>,
+}
+
+pub struct ToolOutput {
+    /// Sent back to the model.
+    pub content: String,
+    /// Shown in the UI (structured).
+    pub display: Value,
+}
+
+fn out(content: impl Into<String>, display: Value) -> ToolOutput {
+    ToolOutput { content: content.into(), display }
+}
+
+fn arg<'a>(args: &'a Value, k: &str) -> Result<&'a str> {
+    args.get(k).and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).ok_or_else(|| AiError::Policy(format!("missing argument `{k}`")))
+}
+
+impl ToolContext {
+    fn audit(&self, tool: &str, args: &Value, decision: &str, summary: Option<&str>) {
+        let _ = self.engine.workspace().add_audit(self.session_id.as_deref(), Some(&self.profile.id), tool, args, decision, summary);
+    }
+
+    /// Execute one tool call. Errors are returned to the model as text.
+    pub async fn call(&self, name: &str, args: &Value) -> ToolOutput {
+        let r = match name {
+            "search_schema" => self.search_schema(args),
+            "describe_table" => self.describe_table(args),
+            "list_tables" => self.list_tables(args),
+            "get_sample_rows" => self.sample_rows(args).await,
+            "run_query" => self.run_query(args).await,
+            "query_result" => self.query_result(args),
+            "result_summary" => self.result_summary(args),
+            "add_knowledge_note" => self.add_note(args).await,
+            "save_query" => self.save_query(args).await,
+            "get_editor" => match self.host.editor_state().await {
+                Some(v) => Ok(out(v.to_string(), v)),
+                None => Err(AiError::Policy("no editor available".into())),
+            },
+            "write_editor" => self.write_editor(args).await,
+            other => Err(AiError::Policy(format!("unknown tool `{other}`"))),
+        };
+        match r {
+            Ok(o) => o,
+            Err(e) => {
+                let decision = if matches!(e, AiError::Policy(_)) { "blocked" } else { "error" };
+                self.audit(name, args, decision, Some(&e.to_string()));
+                out(format!("ERROR: {e}"), json!({"error": e.to_string()}))
+            }
+        }
+    }
+
+    fn policy(&self) -> &databrain_workspace::AiPolicy {
+        &self.profile.ai_policy
+    }
+
+    fn search_schema(&self, args: &Value) -> Result<ToolOutput> {
+        let q = arg(args, "query")?;
+        let r = knowledge::retrieve(self.engine.workspace(), &self.profile.id, q, 8, 12_000)?;
+        self.audit("search_schema", args, "allowed", Some(&format!("{} tables", r.tables.len())));
+        if r.tables.is_empty() {
+            let hint = if self.engine.workspace().kn_count(&self.profile.id)? == 0 {
+                "The knowledge index is empty; ask the user to index this connection (AI panel → Knowledge → Index)."
+            } else {
+                "No matching tables. Try other keywords or list_tables."
+            };
+            return Ok(out(hint, json!({"tables": []})));
+        }
+        let mut text = r.text.clone();
+        if !r.notes.is_empty() {
+            text.push_str("\n\nGlossary:\n");
+            for n in &r.notes {
+                text.push_str(&format!("- {n}\n"));
+            }
+        }
+        Ok(out(text, json!({"tables": r.tables})))
+    }
+
+    fn describe_table(&self, args: &Value) -> Result<ToolOutput> {
+        let t = arg(args, "table")?;
+        let ws = self.engine.workspace();
+        let o = ws.kn_get(&self.profile.id, t)?.ok_or_else(|| AiError::Policy(format!("table `{t}` not found in the index; use search_schema")))?;
+        let full = o.full_name();
+        let notes: Vec<String> = ws
+            .kn_notes(&self.profile.id)?
+            .into_iter()
+            .filter(|n| n.status == NoteStatus::Approved && n.target.as_deref().is_some_and(|x| x.to_ascii_lowercase().starts_with(&full.to_ascii_lowercase()) || x.eq_ignore_ascii_case(&o.name)))
+            .map(|n| n.body)
+            .collect();
+        let pol = self.policy().clone();
+        let mut text = knowledge::render_object(&o, &|c| is_pii(&pol, Some(&full), c), &notes);
+        // Tables that reference this one.
+        let refs: Vec<String> = ws
+            .kn_objects(&self.profile.id)?
+            .into_iter()
+            .filter(|x| x.foreign_keys.iter().any(|f| f.ref_table.eq_ignore_ascii_case(&o.name)))
+            .map(|x| x.full_name())
+            .take(10)
+            .collect();
+        if !refs.is_empty() {
+            text.push_str(&format!("\nReferenced by: {}", refs.join(", ")));
+        }
+        self.audit("describe_table", args, "allowed", None);
+        Ok(out(text, json!({"table": full})))
+    }
+
+    fn list_tables(&self, args: &Value) -> Result<ToolOutput> {
+        let schema = args.get("schema").and_then(|s| s.as_str());
+        let names: Vec<String> = self
+            .engine
+            .workspace()
+            .kn_objects(&self.profile.id)?
+            .into_iter()
+            .filter(|o| schema.is_none_or(|s| o.schema.eq_ignore_ascii_case(s)))
+            .map(|o| o.full_name())
+            .take(500)
+            .collect();
+        self.audit("list_tables", args, "allowed", Some(&format!("{} tables", names.len())));
+        Ok(out(if names.is_empty() { "No indexed tables.".into() } else { names.join("\n") }, json!({"count": names.len()})))
+    }
+
+    async fn gate(&self, tool: &str, decision: Decision, summary: &str, detail: &Value) -> Result<Value> {
+        match decision {
+            Decision::Allow => {
+                self.audit(tool, detail, "allowed", None);
+                Ok(detail.clone())
+            }
+            Decision::Deny(reason) => Err(AiError::Policy(reason)),
+            Decision::Ask(reason) => {
+                if self.caller == Caller::Mcp {
+                    // The MCP host shows its own approval UI; only allow what
+                    // the connection policy auto-approves.
+                    return Err(AiError::Policy(format!("{reason}: requires approval in DataBrain (set Run query = auto for reads)")));
+                }
+                match self.host.approve(tool, &format!("{reason}. {summary}"), detail).await {
+                    Some(v) => {
+                        self.audit(tool, &v, "approved", None);
+                        Ok(v)
+                    }
+                    None => {
+                        self.audit(tool, detail, "denied", None);
+                        Err(AiError::Policy("the user declined".into()))
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_query(&self, args: &Value) -> Result<ToolOutput> {
+        let sql = arg(args, "sql")?.to_string();
+        let purpose = args.get("purpose").and_then(|p| p.as_str()).unwrap_or("");
+        let review = policy::review_sql(&self.profile, &sql);
+        let approved = self.gate("run_query", review.decision.clone(), purpose, &json!({"sql": sql, "purpose": purpose, "kind": review.kind})).await?;
+        let sql = approved.get("sql").and_then(|s| s.as_str()).unwrap_or(&sql).to_string();
+        // Re-review edited SQL.
+        if let Decision::Deny(r) = policy::review_sql(&self.profile, &sql).decision {
+            return Err(AiError::Policy(r));
+        }
+        let cap = 1000usize;
+        let run_sql = if review.kind.is_read() { policy::cap_rows(self.profile.config.kind, &sql, cap) } else { sql.clone() };
+        let tab = format!("ai:{}", self.session_id.clone().unwrap_or_else(|| "mcp".into()));
+        let outcomes = self
+            .engine
+            .run_and_wait(
+                &self.hub,
+                RunRequest {
+                    connection_id: self.profile.id.clone(),
+                    tab_id: tab,
+                    sql: run_sql,
+                    base_offset: 0,
+                    row_limit: Some(cap),
+                    confirmed: true,
+                    origin: if self.caller == Caller::Mcp { Origin::Mcp } else { Origin::Ai },
+                    session_key: None,
+                },
+                Some(self.cancel.clone()),
+            )
+            .await?;
+        let mut text = String::new();
+        let mut display = Vec::new();
+        for o in &outcomes {
+            if let Some(e) = &o.error {
+                text.push_str(&format!("Statement {} failed: {}\n", o.index + 1, e.message));
+                display.push(json!({"index": o.index, "error": e.message}));
+                continue;
+            }
+            match &o.result {
+                Some(r) => {
+                    self.results.lock().push(r.id.clone());
+                    text.push_str(&format!("Statement {} returned {} rows{} in {} ms. result_id={}\n", o.index + 1, r.total_rows, if r.truncated { " (capped)" } else { "" }, o.duration_ms, r.id));
+                    text.push_str(&self.summarize(&r.id)?);
+                    display.push(json!({"index": o.index, "result": r, "duration_ms": o.duration_ms}));
+                }
+                None => {
+                    text.push_str(&format!("Statement {} OK{}.\n", o.index + 1, o.rows_affected.map(|n| format!(", {n} rows affected")).unwrap_or_default()));
+                    display.push(json!({"index": o.index, "rows_affected": o.rows_affected}));
+                }
+            }
+        }
+        self.audit("run_query", &json!({"sql": sql}), "executed", Some(text.lines().next().unwrap_or("")));
+        Ok(out(text, json!({"sql": sql, "statements": display})))
+    }
+
+    /// Schema + stats + (optionally) first rows, masked per policy.
+    fn summarize(&self, result_id: &str) -> Result<String> {
+        let rs = self.engine.results().get(result_id).map_err(|e| AiError::Internal(e.to_string()))?;
+        let mut g = rs.lock();
+        let info = g.info();
+        let view = ViewSpec::default();
+        let pol = self.policy().clone();
+        let mut s = String::from("Columns:\n");
+        for (i, c) in info.columns.iter().enumerate() {
+            let pii = is_pii(&pol, None, &c.name);
+            s.push_str(&format!("- {} ({})", c.name, c.db_type.clone().unwrap_or_else(|| c.data_type.clone())));
+            if !pii && info.total_rows > 0 {
+                if let Ok(st) = g.column_stats(&view, i) {
+                    s.push_str(&format!(" nulls={} distinct={}", st.nulls, st.distinct));
+                    if pol.share_sample_values || pol.share_result_rows {
+                        if let (Some(mn), Some(mx)) = (&st.min, &st.max) {
+                            s.push_str(&format!(" min={} max={}", trunc(mn, 40), trunc(mx, 40)));
+                        }
+                    }
+                }
+            } else if pii {
+                s.push_str(" [PII]");
+            }
+            s.push('\n');
+        }
+        if pol.share_result_rows && info.total_rows > 0 {
+            let n = (pol.max_rows_to_model as usize).min(info.total_rows);
+            let page = g.page(&view, 0, n).map_err(|e| AiError::Internal(e.to_string()))?;
+            s.push_str(&format!("First {n} rows (TSV):\n"));
+            s.push_str(&info.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join("\t"));
+            s.push('\n');
+            for row in page.rows {
+                let cells: Vec<String> = row
+                    .iter()
+                    .zip(&info.columns)
+                    .map(|(v, c)| if is_pii(&pol, None, &c.name) { "***".into() } else { v.as_deref().map(|x| trunc(x, 80)).unwrap_or_else(|| "NULL".into()) })
+                    .collect();
+                s.push_str(&cells.join("\t"));
+                s.push('\n');
+            }
+        } else if info.total_rows > 0 {
+            s.push_str("(Raw rows are not shared on this connection; use query_result to aggregate locally.)\n");
+        }
+        Ok(s)
+    }
+
+    fn result_summary(&self, args: &Value) -> Result<ToolOutput> {
+        let id = args
+            .get("result_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| self.host.current_result())
+            .ok_or_else(|| AiError::Policy("no result available".into()))?;
+        let text = self.summarize(&id)?;
+        self.audit("result_summary", args, "allowed", None);
+        Ok(out(format!("result_id={id}\n{text}"), json!({"result_id": id})))
+    }
+
+    fn allowed_result(&self, id: &str) -> bool {
+        self.results.lock().iter().any(|r| r == id) || self.host.current_result().as_deref() == Some(id)
+    }
+
+    fn query_result(&self, args: &Value) -> Result<ToolOutput> {
+        let id = arg(args, "result_id")?;
+        let sql = arg(args, "sql")?;
+        if !self.allowed_result(id) {
+            return Err(AiError::Policy("unknown result_id".into()));
+        }
+        let rs = self.engine.results().get(id).map_err(|e| AiError::Internal(e.to_string()))?;
+        let (names, batches) = {
+            let mut g = rs.lock();
+            let names: Vec<String> = g.schema().fields().iter().map(|f| f.name().clone()).collect();
+            (names, g.view_batches(&ViewSpec::default(), 50_000).map_err(|e| AiError::Internal(e.to_string()))?)
+        };
+        let pol = self.policy().clone();
+        // Block PII columns from being selected in local aggregates' output.
+        if names.iter().any(|n| is_pii(&pol, None, n) && sql.to_ascii_lowercase().contains(&n.to_ascii_lowercase())) {
+            return Err(AiError::Policy("the query references a PII column".into()));
+        }
+        let t = resultsql::query(&names, &batches, sql, 200)?;
+        let mut text = t.columns.join("\t");
+        text.push('\n');
+        for r in &t.rows {
+            text.push_str(&r.iter().map(|v| match v { Value::String(s) => trunc(s, 80), Value::Null => "NULL".into(), o => o.to_string() }).collect::<Vec<_>>().join("\t"));
+            text.push('\n');
+        }
+        if t.truncated {
+            text.push_str("(first 200 rows)\n");
+        }
+        self.audit("query_result", args, "allowed", Some(&format!("{} rows", t.rows.len())));
+        Ok(out(text, json!({"columns": t.columns, "rows": t.rows, "truncated": t.truncated})))
+    }
+
+    async fn sample_rows(&self, args: &Value) -> Result<ToolOutput> {
+        if !self.policy().share_sample_values && !self.policy().share_result_rows {
+            return Err(AiError::Policy("sharing sample data is disabled for this connection".into()));
+        }
+        let t = arg(args, "table")?;
+        let o = self
+            .engine
+            .workspace()
+            .kn_get(&self.profile.id, t)?
+            .ok_or_else(|| AiError::Policy(format!("table `{t}` not found")))?;
+        let n = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(5).clamp(1, 20) as usize;
+        let kind = self.profile.config.kind;
+        let full = format!("{}.{}", databrain_connector_core::quote_path(kind, &o.schema), databrain_connector_core::quote_ident(kind, &o.name));
+        let sql = policy::cap_rows(kind, &format!("SELECT * FROM {full}"), n);
+        // Sampling is a read the user enabled via policy; no approval prompt.
+        let outcomes = self
+            .engine
+            .run_and_wait(
+                &self.hub,
+                RunRequest {
+                    connection_id: self.profile.id.clone(),
+                    tab_id: format!("ai-sample:{}", self.session_id.clone().unwrap_or_default()),
+                    sql,
+                    base_offset: 0,
+                    row_limit: Some(n),
+                    confirmed: true,
+                    origin: Origin::Ai,
+                    session_key: None,
+                },
+                Some(self.cancel.clone()),
+            )
+            .await?;
+        let o = outcomes.into_iter().next().ok_or_else(|| AiError::Internal("no result".into()))?;
+        if let Some(e) = o.error {
+            return Err(AiError::Policy(e.message));
+        }
+        let r = o.result.ok_or_else(|| AiError::Internal("no rows".into()))?;
+        let rs = self.engine.results().get(&r.id).map_err(|e| AiError::Internal(e.to_string()))?;
+        let page = rs.lock().page(&ViewSpec::default(), 0, n).map_err(|e| AiError::Internal(e.to_string()))?;
+        let pol = self.policy().clone();
+        let mut text = r.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join("\t");
+        text.push('\n');
+        for row in page.rows {
+            text.push_str(
+                &row.iter()
+                    .zip(&r.columns)
+                    .map(|(v, c)| if is_pii(&pol, Some(&full), &c.name) { "***".into() } else { v.as_deref().map(|x| trunc(x, 60)).unwrap_or_else(|| "NULL".into()) })
+                    .collect::<Vec<_>>()
+                    .join("\t"),
+            );
+            text.push('\n');
+        }
+        self.engine.results().remove(&r.id);
+        self.audit("get_sample_rows", args, "allowed", None);
+        Ok(out(text, json!({"table": t})))
+    }
+
+    async fn add_note(&self, args: &Value) -> Result<ToolOutput> {
+        let note = arg(args, "note")?;
+        let target = args.get("target").and_then(|t| t.as_str()).filter(|t| !t.is_empty()).map(str::to_string);
+        let saved = self.engine.workspace().kn_save_note(KnNote {
+            id: String::new(),
+            connection_id: self.profile.id.clone(),
+            target,
+            body: note.to_string(),
+            author: "ai".into(),
+            status: NoteStatus::Proposed,
+            created_at: 0,
+        })?;
+        self.audit("add_knowledge_note", args, "proposed", None);
+        Ok(out("Note proposed; the user will review it in Knowledge.", json!({"note": saved})))
+    }
+
+    async fn save_query(&self, args: &Value) -> Result<ToolOutput> {
+        let v = self.gate("save_query", Decision::Ask("Save query".into()), arg(args, "name")?, args).await?;
+        let saved = self.engine.workspace().save_query(SavedQuery {
+            id: String::new(),
+            name: v.get("name").and_then(|n| n.as_str()).unwrap_or("AI query").to_string(),
+            sql: v.get("sql").and_then(|n| n.as_str()).unwrap_or_default().to_string(),
+            connection_id: Some(self.profile.id.clone()),
+            folder_id: None,
+            description: v.get("description").and_then(|d| d.as_str()).map(str::to_string),
+            tags: vec!["ai".into()],
+            ai_example: false,
+            created_at: 0,
+            updated_at: 0,
+        })?;
+        Ok(out(format!("Saved as \"{}\".", saved.name), json!({"saved_query": saved})))
+    }
+
+    async fn write_editor(&self, args: &Value) -> Result<ToolOutput> {
+        let sql = arg(args, "sql")?;
+        let mode = args.get("mode").and_then(|m| m.as_str()).unwrap_or("replace_selection");
+        let proposal = json!({"sql": sql, "mode": mode, "title": args.get("title")});
+        let accepted = self.host.propose_edit(&proposal).await;
+        self.audit("write_editor", &proposal, if accepted { "approved" } else { "denied" }, None);
+        Ok(out(
+            if accepted { "The user applied the SQL in the editor." } else { "The user did not apply the change." },
+            json!({"proposal": proposal, "accepted": accepted}),
+        ))
+    }
+}
+
+fn trunc(s: &str, n: usize) -> String {
+    if s.chars().count() > n { s.chars().take(n).collect::<String>() + "…" } else { s.to_string() }
+}

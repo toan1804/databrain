@@ -1,0 +1,357 @@
+//! AI mode, knowledge and sign-in API used by Tauri commands.
+//!
+//! The UI is reached through [`UiBridge`] (Tauri events in the app, a
+//! recorder in tests). Approvals and editor proposals are request/response:
+//! the backend emits a request with an id and waits for the UI to answer via
+//! `ai_respond`.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use databrain_ai::{Agent, AgentEvent, AgentRequest, AgentSink, ModelInfo, ProviderAuth, ProviderConfig, ProviderKind, ToolHost};
+use databrain_auth::{AuthError, AuthStatus, CancellationToken, DeviceCodePrompt, Interaction, SecretRef, SecretString};
+use databrain_query_engine::{EngineError, Result};
+use databrain_workspace::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry, KnNote, KnObject, KnState};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::sync::oneshot;
+
+use crate::api::AppState;
+
+/// Events pushed to the UI.
+pub trait UiBridge: Send + Sync {
+    /// `channel` is the Tauri event name.
+    fn emit(&self, channel: &str, payload: Value);
+    fn open_url(&self, url: &str) -> std::result::Result<(), String>;
+}
+
+pub const AI_EVENT: &str = "ai-event";
+pub const AUTH_EVENT: &str = "auth-event";
+pub const KNOWLEDGE_EVENT: &str = "knowledge-event";
+
+#[derive(Default, Clone)]
+pub struct AiState {
+    /// Pending UI requests (approval / editor proposal / editor state).
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+    /// Running agent turns, cancellable by run id.
+    runs: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// Cancels the in-progress interactive sign-in.
+    pub sign_in_cancel: Arc<Mutex<CancellationToken>>,
+}
+
+impl AiState {
+    async fn ask(&self, ui: &dyn UiBridge, kind: &str, payload: Value, timeout: Duration) -> Option<Value> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().insert(id.clone(), tx);
+        let mut p = payload;
+        p["type"] = kind.into();
+        p["request_id"] = id.clone().into();
+        ui.emit(AI_EVENT, p);
+        let r = tokio::time::timeout(timeout, rx).await.ok().and_then(|r| r.ok());
+        self.pending.lock().remove(&id);
+        r
+    }
+}
+
+// ------------------------------------------------------------------ sign-in interaction
+
+pub struct AppInteraction {
+    ui: Arc<dyn UiBridge>,
+    cancel: Arc<Mutex<CancellationToken>>,
+}
+
+impl AppInteraction {
+    pub fn new(ui: Arc<dyn UiBridge>, cancel: Arc<Mutex<CancellationToken>>) -> Self {
+        Self { ui, cancel }
+    }
+}
+
+#[async_trait]
+impl Interaction for AppInteraction {
+    async fn open_url(&self, url: &str) -> std::result::Result<(), AuthError> {
+        *self.cancel.lock() = CancellationToken::new();
+        self.ui.emit(AUTH_EVENT, json!({"type": "browser_opened", "url": url}));
+        self.ui.open_url(url).map_err(AuthError::Flow)
+    }
+    async fn device_code(&self, prompt: &DeviceCodePrompt) {
+        *self.cancel.lock() = CancellationToken::new();
+        let _ = self.ui.open_url(prompt.verification_uri_complete.as_deref().unwrap_or(&prompt.verification_uri));
+        self.ui.emit(AUTH_EVENT, json!({"type": "device_code", "prompt": prompt}));
+    }
+    async fn finished(&self) {
+        self.ui.emit(AUTH_EVENT, json!({"type": "finished"}));
+    }
+    fn cancel_token(&self) -> CancellationToken {
+        self.cancel.lock().clone()
+    }
+}
+
+pub async fn sign_in(state: &AppState, connection_id: &str) -> Result<AuthStatus> {
+    state.engine.disconnect(connection_id);
+    state.engine.sign_in(connection_id).await
+}
+
+pub async fn sign_out(state: &AppState, connection_id: &str) -> Result<()> {
+    state.engine.sign_out(connection_id).await
+}
+
+pub fn auth_status(state: &AppState, connection_id: &str) -> Result<AuthStatus> {
+    state.engine.auth_status(connection_id)
+}
+
+pub fn cancel_sign_in(state: &AppState) {
+    state.ai.sign_in_cancel.lock().cancel();
+}
+
+// ------------------------------------------------------------------ providers
+
+fn ai_err(e: databrain_ai::AiError) -> EngineError {
+    let kind = serde_json::to_value(&e).ok().and_then(|v| v["kind"].as_str().map(str::to_string)).unwrap_or_else(|| "internal".into());
+    EngineError::new(&kind, e.to_string())
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderView {
+    #[serde(flatten)]
+    pub record: AiProviderRecord,
+    pub has_key: bool,
+}
+
+pub fn list_providers(state: &AppState) -> Result<Vec<ProviderView>> {
+    Ok(state
+        .workspace
+        .list_ai_providers()?
+        .into_iter()
+        .map(|r| ProviderView {
+            has_key: state.secrets.get(&SecretRef::for_ai_provider(&r.id)).ok().flatten().is_some(),
+            record: r,
+        })
+        .collect())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaveProviderArgs {
+    pub record: AiProviderRecord,
+    /// New API key; empty string clears it; absent keeps it.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+pub fn save_provider(state: &AppState, args: SaveProviderArgs) -> Result<AiProviderRecord> {
+    let kind = ProviderKind::parse(&args.record.kind).ok_or_else(|| EngineError::new("invalid", "unknown provider type"))?;
+    let cfg: ProviderConfig = serde_json::from_value(args.record.config.clone()).map_err(|e| EngineError::new("invalid", e.to_string()))?;
+    if kind == ProviderKind::AzureOpenai && cfg.base_url.as_deref().is_none_or(str::is_empty) {
+        return Err(EngineError::new("invalid", "Azure OpenAI needs the resource endpoint URL"));
+    }
+    let saved = state.workspace.save_ai_provider(args.record)?;
+    let r = SecretRef::for_ai_provider(&saved.id);
+    match args.api_key.as_deref() {
+        Some("") => state.secrets.delete(&r)?,
+        Some(k) => state.secrets.set(&r, &SecretString::from(k.trim().to_string()))?,
+        None => {}
+    }
+    Ok(saved)
+}
+
+pub fn delete_provider(state: &AppState, id: &str) -> Result<()> {
+    state.workspace.delete_ai_provider(id)?;
+    state.secrets.delete(&SecretRef::for_ai_provider(id))?;
+    Ok(())
+}
+
+pub async fn list_models(state: &AppState, id: &str) -> Result<Vec<ModelInfo>> {
+    let rec = state.workspace.get_ai_provider(id)?;
+    let (p, _, _) = databrain_ai::provider_for(&rec, state.secrets.clone()).map_err(ai_err)?;
+    p.list_models().await.map_err(ai_err)
+}
+
+/// OpenRouter browser sign-in: stores the returned key on the provider.
+pub async fn provider_sign_in(state: &AppState, id: &str) -> Result<()> {
+    let mut rec = state.workspace.get_ai_provider(id)?;
+    if ProviderKind::parse(&rec.kind) != Some(ProviderKind::Openrouter) {
+        return Err(EngineError::new("invalid", "browser sign-in is available for OpenRouter; other providers use API keys"));
+    }
+    let ui = AppInteraction::new(state.ui.clone(), state.ai.sign_in_cancel.clone());
+    let key = databrain_ai::providers::openrouter_sign_in(&ui).await.map_err(ai_err)?;
+    state.secrets.set(&SecretRef::for_ai_provider(id), &SecretString::from(key))?;
+    let mut cfg: ProviderConfig = serde_json::from_value(rec.config.clone()).unwrap_or_default();
+    cfg.auth = ProviderAuth::BrowserOpenrouter;
+    rec.config = serde_json::to_value(cfg).unwrap_or_default();
+    state.workspace.save_ai_provider(rec)?;
+    Ok(())
+}
+
+// ------------------------------------------------------------------ agent
+
+struct UiSink(Arc<dyn UiBridge>);
+
+impl AgentSink for UiSink {
+    fn emit(&self, e: AgentEvent) {
+        self.0.emit(AI_EVENT, serde_json::to_value(e).unwrap_or_default());
+    }
+}
+
+struct UiHost {
+    ui: Arc<dyn UiBridge>,
+    ai: AiState,
+    run_id: String,
+    result_id: Option<String>,
+    tab_id: Option<String>,
+}
+
+#[async_trait]
+impl ToolHost for UiHost {
+    async fn approve(&self, tool: &str, summary: &str, detail: &Value) -> Option<Value> {
+        let r = self
+            .ai
+            .ask(self.ui.as_ref(), "approval_request", json!({"run_id": self.run_id, "tool": tool, "summary": summary, "detail": detail}), Duration::from_secs(600))
+            .await?;
+        r.get("approved").and_then(|a| a.as_bool()).filter(|a| *a).map(|_| r.get("detail").cloned().unwrap_or_else(|| detail.clone()))
+    }
+    async fn editor_state(&self) -> Option<Value> {
+        self.ai.ask(self.ui.as_ref(), "editor_request", json!({"run_id": self.run_id, "tab_id": self.tab_id}), Duration::from_secs(10)).await
+    }
+    async fn propose_edit(&self, proposal: &Value) -> bool {
+        self.ai
+            .ask(self.ui.as_ref(), "edit_proposal", json!({"run_id": self.run_id, "tab_id": self.tab_id, "proposal": proposal}), Duration::from_secs(600))
+            .await
+            .and_then(|r| r.get("accepted").and_then(|a| a.as_bool()))
+            .unwrap_or(false)
+    }
+    fn current_result(&self) -> Option<String> {
+        self.result_id.clone()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AiSendArgs {
+    #[serde(flatten)]
+    pub request: AgentRequest,
+    #[serde(default)]
+    pub tab_id: Option<String>,
+}
+
+/// Start an agent turn; progress arrives as `ai-event`s. Returns the run id.
+pub fn ai_send(state: &AppState, args: AiSendArgs) -> Result<String> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let cancel = CancellationToken::new();
+    state.ai.runs.lock().insert(run_id.clone(), cancel.clone());
+    let agent = Agent { engine: state.engine.clone(), hub: state.hub.clone(), secrets: state.secrets.clone(), max_steps: 12 };
+    let host = Arc::new(UiHost {
+        ui: state.ui.clone(),
+        ai: state.ai.clone(),
+        run_id: run_id.clone(),
+        result_id: args.request.context.result_id.clone(),
+        tab_id: args.tab_id.clone(),
+    });
+    let sink = Arc::new(UiSink(state.ui.clone()));
+    let runs = state.ai.runs.clone();
+    let rid = run_id.clone();
+    let session_id = args.request.session_id.clone().unwrap_or_default();
+    tokio::spawn(async move {
+        if let Err(error) = agent.run(args.request, rid.clone(), host, sink.clone(), cancel).await {
+            sink.emit(AgentEvent::Failed { session_id, run_id: rid.clone(), error });
+        }
+        runs.lock().remove(&rid);
+    });
+    Ok(run_id)
+}
+
+pub fn ai_cancel(state: &AppState, run_id: &str) -> bool {
+    match state.ai.runs.lock().get(run_id) {
+        Some(c) => {
+            c.cancel();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Answer a pending UI request (approval, edit proposal, editor state).
+pub fn ai_respond(state: &AppState, request_id: &str, response: Value) -> bool {
+    match state.ai.pending.lock().remove(request_id) {
+        Some(tx) => tx.send(response).is_ok(),
+        None => false,
+    }
+}
+
+pub fn list_sessions(state: &AppState, connection_id: Option<String>) -> Result<Vec<AiSessionRecord>> {
+    Ok(state.workspace.list_ai_sessions(connection_id.as_deref(), 100)?)
+}
+
+pub fn session_messages(state: &AppState, session_id: &str) -> Result<Vec<AiMessageRecord>> {
+    Ok(state.workspace.list_ai_messages(session_id)?)
+}
+
+pub fn delete_session(state: &AppState, id: &str) -> Result<()> {
+    Ok(state.workspace.delete_ai_session(id)?)
+}
+
+pub fn list_audit(state: &AppState) -> Result<Vec<AuditEntry>> {
+    Ok(state.workspace.list_audit(200)?)
+}
+
+// ------------------------------------------------------------------ knowledge
+
+#[derive(Debug, Serialize)]
+pub struct KnowledgeView {
+    pub state: Option<KnState>,
+    pub objects: Vec<KnObject>,
+    pub notes: Vec<KnNote>,
+}
+
+pub fn knowledge(state: &AppState, connection_id: &str) -> Result<KnowledgeView> {
+    Ok(KnowledgeView {
+        state: state.workspace.kn_state(connection_id)?,
+        objects: state.workspace.kn_objects(connection_id)?,
+        notes: state.workspace.kn_notes(connection_id)?,
+    })
+}
+
+/// Index in the background; progress/completion via `knowledge-event`.
+pub fn index_knowledge(state: &AppState, connection_id: &str) {
+    let engine = state.engine.clone();
+    let ui = state.ui.clone();
+    let cid = connection_id.to_string();
+    tokio::spawn(async move {
+        let ui2 = ui.clone();
+        let c2 = cid.clone();
+        let progress = move |schema: &str, done: usize, total: usize| {
+            ui2.emit(KNOWLEDGE_EVENT, json!({"type": "progress", "connection_id": c2, "schema": schema, "done": done, "total": total}));
+        };
+        let r = databrain_ai::knowledge::index_connection(&engine, &cid, &progress).await;
+        ui.emit(
+            KNOWLEDGE_EVENT,
+            match r {
+                Ok(report) => json!({"type": "finished", "connection_id": cid, "report": report}),
+                Err(e) => json!({"type": "failed", "connection_id": cid, "error": e.to_string()}),
+            },
+        );
+    });
+}
+
+pub fn save_note(state: &AppState, note: KnNote) -> Result<KnNote> {
+    Ok(state.workspace.kn_save_note(note)?)
+}
+
+pub fn delete_note(state: &AppState, id: &str) -> Result<()> {
+    Ok(state.workspace.kn_delete_note(id)?)
+}
+
+pub fn clear_knowledge(state: &AppState, connection_id: &str) -> Result<()> {
+    Ok(state.workspace.kn_clear(connection_id)?)
+}
+
+/// Snippet for configuring external MCP clients (Kiro CLI, Claude Code...).
+pub fn mcp_config() -> Value {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(if cfg!(windows) { "databrain-mcp.exe" } else { "databrain-mcp" })))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "databrain-mcp".into());
+    json!({"mcpServers": {"databrain": {"command": exe, "args": []}}})
+}
