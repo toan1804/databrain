@@ -15,6 +15,13 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
   - Run a cell, run all, or run from here.
   - Output stays under each cell, and all cells share one session.
   - Per-cell connection override and AI actions. Notebooks are saved and can be put in folders.
+- **Outputs:** every result gets a handle (`r12`), and you can also give it a name (`revenue`).
+  - Query outputs together with DuckDB as `results.<name>`, including joins across databases (Postgres × Snowflake × CSV…).
+  - A rerun keeps the previous version as `revenue__1`. Compare versions (rows added, removed or changed) and chart any output.
+  - @mention outputs to the AI.
+  - Pin outputs to keep them across restarts (saved as Parquet in the app-data `outputs/` folder).
+  - History links to each output. Capped outputs warn when they are queried.
+  - Notebook cells can name their output; later cells read it, and cells whose inputs changed are marked stale.
 - **Results:** virtualized grid, sort, filters, find, column stats, copy. Export to CSV, TSV, JSON, NDJSON, Markdown, SQL INSERT, Parquet or XLSX.
 - **AI mode** (⌘L panel, ⌘I inline edit):
   - Providers: Kiro (browser sign-in or `ksk_` API key, through `kiro-cli`), OpenAI, Anthropic, Gemini, Azure OpenAI, OpenRouter (browser sign-in), Ollama, LM Studio, or any OpenAI-compatible server.

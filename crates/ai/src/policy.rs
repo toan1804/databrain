@@ -75,7 +75,10 @@ pub fn cap_rows(kind: ConnectorKind, sql: &str, limit: usize) -> String {
     let lower = s.to_ascii_lowercase();
     let has_limit = lower.split_whitespace().rev().take(4).any(|w| w == "limit" || w == "fetch" || w == "top");
     let first = lower.split_whitespace().next().unwrap_or("");
-    if has_limit || !(first == "select" || first == "with") {
+    // Wrapping an ordered query in a subquery does not keep its order in
+    // most engines; the engine's row limit still stops the fetch at the cap.
+    let ordered = lower.split_whitespace().collect::<Vec<_>>().windows(2).any(|w| w == ["order", "by"]);
+    if has_limit || ordered || !(first == "select" || first == "with") {
         return s.to_string();
     }
     match kind {
@@ -140,6 +143,8 @@ mod tests {
         assert_eq!(cap_rows(ConnectorKind::Postgres, "select * from t limit 5", 50), "select * from t limit 5");
         assert!(cap_rows(ConnectorKind::Mssql, "select 1", 10).starts_with("SELECT TOP (10)"));
         assert_eq!(cap_rows(ConnectorKind::Postgres, "show tables", 10), "show tables");
+        // Ordered queries are not wrapped (a subquery would drop the order).
+        assert_eq!(cap_rows(ConnectorKind::Duckdb, "select * from t order by 2 desc", 10), "select * from t order by 2 desc");
     }
 
     #[test]

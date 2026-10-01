@@ -1,6 +1,7 @@
 //! In-memory store for query results with local view operations
 //! (filter, quick filter, sort, find, column stats) and paging for the grid.
 
+pub mod chart;
 pub mod display;
 pub mod view;
 
@@ -15,6 +16,7 @@ use databrain_connector_core::arrow::util::display::ArrayFormatter;
 use parking_lot::Mutex;
 use serde::Serialize;
 
+pub use chart::{Agg, ChartData, ChartSeries, ChartSpec};
 pub use display::{ColumnMeta, TypeFamily, column_meta};
 pub use view::{ColumnFilter, DisplayCache, FilterOp, SortKey, ViewSpec};
 
@@ -401,6 +403,27 @@ pub struct ResultStore {
 impl ResultStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Insert a complete result (e.g. restored from a snapshot).
+    pub fn insert_complete(&self, id: impl Into<String>, schema: SchemaRef, batches: Vec<RecordBatch>, truncated: bool) -> Arc<Mutex<ResultSet>> {
+        let rs = self.create(id, schema);
+        {
+            let mut g = rs.lock();
+            for b in batches {
+                g.push(b);
+            }
+            g.finish(truncated);
+        }
+        rs
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.results.lock().contains_key(id)
+    }
+
+    pub fn bytes_of(&self, id: &str) -> usize {
+        self.results.lock().get(id).map(|r| r.lock().memory_bytes()).unwrap_or(0)
     }
 
     pub fn create(&self, id: impl Into<String>, schema: SchemaRef) -> Arc<Mutex<ResultSet>> {

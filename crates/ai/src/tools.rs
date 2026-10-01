@@ -52,8 +52,18 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
         ),
         s(
             "query_result",
-            "Run SQLite SQL over a previous result stored locally as table `result` (e.g. SELECT region, sum(amount) FROM result GROUP BY 1). Nothing is sent to the database.",
+            "Run SQLite SQL over one previous result stored locally as table `result` (e.g. SELECT region, sum(amount) FROM result GROUP BY 1). `result_id` may be a result id or an output handle/name (r12, revenue). Nothing is sent to the database.",
             json!({"type": "object", "properties": {"result_id": {"type": "string"}, "sql": {"type": "string"}}, "required": ["result_id", "sql"]}),
+        ),
+        s(
+            "list_outputs",
+            "List query outputs available in DataBrain (handle, name, source connection, SQL, columns, row count, whether capped). Outputs can come from different databases.",
+            json!({"type": "object", "properties": {"filter": {"type": "string", "description": "Optional text to match in name/SQL/connection"}}}),
+        ),
+        s(
+            "query_outputs",
+            "Run DuckDB SQL locally over outputs referenced as results.<handle or name> (e.g. SELECT * FROM results.revenue r JOIN results.r12 c USING (country)). Joins outputs from different databases; nothing is sent to any database.",
+            json!({"type": "object", "properties": {"sql": {"type": "string"}, "purpose": {"type": "string"}}, "required": ["sql"]}),
         ),
         s(
             "result_summary",
@@ -149,6 +159,8 @@ impl ToolContext {
             "run_query" => self.run_query(args).await,
             "query_result" => self.query_result(args),
             "result_summary" => self.result_summary(args),
+            "list_outputs" => self.list_outputs(args),
+            "query_outputs" => self.query_outputs(args).await,
             "add_knowledge_note" => self.add_note(args).await,
             "save_query" => self.save_query(args).await,
             "get_editor" => match self.host.editor_state().await {
@@ -290,6 +302,7 @@ impl ToolContext {
                     confirmed: true,
                     origin: if self.caller == Caller::Mcp { Origin::Mcp } else { Origin::Ai },
                     session_key: None,
+                    output_name: None,
                 },
                 Some(self.cancel.clone()),
             )
@@ -305,7 +318,8 @@ impl ToolContext {
             match &o.result {
                 Some(r) => {
                     self.results.lock().push(r.id.clone());
-                    text.push_str(&format!("Statement {} returned {} rows{} in {} ms. result_id={}\n", o.index + 1, r.total_rows, if r.truncated { " (capped)" } else { "" }, o.duration_ms, r.id));
+                    let handle = self.engine.outputs().by_result(&r.id).map(|o| format!(" Output {} (query it as {}).", o.handle, o.reference())).unwrap_or_default();
+                    text.push_str(&format!("Statement {} returned {} rows{} in {} ms. result_id={}{handle}\n", o.index + 1, r.total_rows, if r.truncated { " (capped)" } else { "" }, o.duration_ms, r.id));
                     text.push_str(&self.summarize(&r.id)?);
                     display.push(json!({"index": o.index, "result": r, "duration_ms": o.duration_ms}));
                 }
@@ -320,12 +334,38 @@ impl ToolContext {
     }
 
     /// Schema + stats + (optionally) first rows, masked per policy.
+    /// Policy that governs a result: its source connection's (data is
+    /// shared on that connection's terms), falling back to this one's.
+    fn source_policy(&self, result_id: &str) -> Result<databrain_workspace::AiPolicy> {
+        let Some(o) = self.engine.outputs().by_result(result_id) else { return Ok(self.policy().clone()) };
+        if o.connection_id == self.profile.id {
+            return Ok(self.policy().clone());
+        }
+        let src = self.engine.workspace().get_connection(&o.connection_id).map_err(|_| AiError::Policy(format!("source connection of {} no longer exists", o.handle)))?;
+        if !src.ai_policy.ai_enabled {
+            return Err(AiError::Policy(format!("{} comes from \"{}\", where AI is disabled", o.handle, src.name)));
+        }
+        if self.caller == Caller::Mcp && !src.ai_policy.mcp_enabled {
+            return Err(AiError::Policy(format!("{} comes from \"{}\", which is not shared with MCP", o.handle, src.name)));
+        }
+        Ok(src.ai_policy)
+    }
+
+    /// Accept a result id or an output reference (`r12`, `revenue`, `results.x`).
+    fn resolve_result(&self, r: &str) -> Result<String> {
+        if self.engine.results().contains(r) {
+            return Ok(r.to_string());
+        }
+        let o = self.engine.outputs().ensure_loaded(r).map_err(|e| AiError::Policy(e.message))?;
+        Ok(o.result_id)
+    }
+
     fn summarize(&self, result_id: &str) -> Result<String> {
+        let pol = self.source_policy(result_id)?;
         let rs = self.engine.results().get(result_id).map_err(|e| AiError::Internal(e.to_string()))?;
         let mut g = rs.lock();
         let info = g.info();
         let view = ViewSpec::default();
-        let pol = self.policy().clone();
         let mut s = String::from("Columns:\n");
         for (i, c) in info.columns.iter().enumerate() {
             let pii = is_pii(&pol, None, &c.name);
@@ -372,6 +412,7 @@ impl ToolContext {
             .map(str::to_string)
             .or_else(|| self.host.current_result())
             .ok_or_else(|| AiError::Policy("no result available".into()))?;
+        let id = self.resolve_result(&id)?;
         let text = self.summarize(&id)?;
         self.audit("result_summary", args, "allowed", None);
         Ok(out(format!("result_id={id}\n{text}"), json!({"result_id": id})))
@@ -382,10 +423,13 @@ impl ToolContext {
     }
 
     fn query_result(&self, args: &Value) -> Result<ToolOutput> {
-        let id = arg(args, "result_id")?;
+        let id = self.resolve_result(arg(args, "result_id")?)?;
+        let id = id.as_str();
         let sql = arg(args, "sql")?;
-        if !self.allowed_result(id) {
-            return Err(AiError::Policy("unknown result_id".into()));
+        // Results of this conversation, the user's current/mentioned ones,
+        // or any output the source connection lets the AI read.
+        if !self.allowed_result(id) && !self.source_policy(id)?.share_result_rows {
+            return Err(AiError::Policy("this output was not shared with the assistant (mention it with @, or enable result rows on its connection)".into()));
         }
         let rs = self.engine.results().get(id).map_err(|e| AiError::Internal(e.to_string()))?;
         let (names, batches) = {
@@ -393,7 +437,7 @@ impl ToolContext {
             let names: Vec<String> = g.schema().fields().iter().map(|f| f.name().clone()).collect();
             (names, g.view_batches(&ViewSpec::default(), 50_000).map_err(|e| AiError::Internal(e.to_string()))?)
         };
-        let pol = self.policy().clone();
+        let pol = self.source_policy(id)?;
         // Block PII columns from being selected in local aggregates' output.
         if names.iter().any(|n| is_pii(&pol, None, n) && sql.to_ascii_lowercase().contains(&n.to_ascii_lowercase())) {
             return Err(AiError::Policy("the query references a PII column".into()));
@@ -410,6 +454,111 @@ impl ToolContext {
         }
         self.audit("query_result", args, "allowed", Some(&format!("{} rows", t.rows.len())));
         Ok(out(text, json!({"columns": t.columns, "rows": t.rows, "truncated": t.truncated})))
+    }
+
+    fn list_outputs(&self, args: &Value) -> Result<ToolOutput> {
+        let filter = args.get("filter").and_then(|f| f.as_str()).unwrap_or("").to_lowercase();
+        let mut lines = Vec::new();
+        let mut shown = Vec::new();
+        for o in self.engine.outputs().list() {
+            if o.state == databrain_query_engine::OutputState::Evicted || self.source_policy(&o.result_id).is_err() {
+                continue;
+            }
+            let hay = format!("{} {} {} {}", o.handle, o.name.clone().unwrap_or_default(), o.connection_name, o.sql).to_lowercase();
+            if !filter.is_empty() && !hay.contains(&filter) {
+                continue;
+            }
+            let cols: Vec<String> = o.columns.iter().take(30).map(|c| format!("{} {}", c.name, c.db_type.clone().unwrap_or_else(|| c.data_type.clone()))).collect();
+            lines.push(format!(
+                "- {} ({}){} — {} rows{} from \"{}\"\n  columns: {}\n  sql: {}",
+                o.reference(),
+                o.handle,
+                if self.allowed_result(&o.result_id) { " [in this conversation]" } else { "" },
+                o.rows,
+                if o.truncated { " (capped at the row limit — incomplete)" } else { "" },
+                o.connection_name,
+                cols.join(", "),
+                trunc(&o.sql.replace('\n', " "), 300)
+            ));
+            shown.push(o.handle.clone());
+            if lines.len() >= 40 {
+                break;
+            }
+        }
+        self.audit("list_outputs", args, "allowed", Some(&format!("{} outputs", lines.len())));
+        let text = if lines.is_empty() { "No outputs available. Run a query first.".to_string() } else { lines.join("\n") };
+        Ok(out(text, json!({"outputs": shown})))
+    }
+
+    async fn query_outputs(&self, args: &Value) -> Result<ToolOutput> {
+        let sql = arg(args, "sql")?.to_string();
+        let refs = self.engine.outputs().referenced(&sql);
+        if refs.is_empty() {
+            return Err(AiError::Policy("reference outputs as results.<handle or name> (see list_outputs)".into()));
+        }
+        for o in &refs {
+            let pol = self.source_policy(&o.result_id)?;
+            if !pol.share_result_rows && !self.allowed_result(&o.result_id) {
+                return Err(AiError::Policy(format!("{} is from \"{}\", which does not share result rows with the assistant; mention it with @ to allow it", o.handle, o.connection_name)));
+            }
+            if o.columns.iter().any(|c| is_pii(&pol, None, &c.name) && sql.to_ascii_lowercase().contains(&c.name.to_ascii_lowercase())) {
+                return Err(AiError::Policy(format!("the query references a sensitive column of {}", o.handle)));
+            }
+        }
+        // Local DuckDB, but still reads only.
+        let results_conn = self.engine.results_connection().map_err(|e| AiError::Internal(e.message))?;
+        if !policy::review_sql(&results_conn, &sql).kind.is_read() {
+            return Err(AiError::Policy("query_outputs only runs read-only SQL".into()));
+        }
+        let outcomes = self
+            .engine
+            .run_and_wait(
+                &self.hub,
+                RunRequest {
+                    connection_id: results_conn.id.clone(),
+                    tab_id: format!("ai-outputs:{}", self.session_id.clone().unwrap_or_else(|| "mcp".into())),
+                    sql: policy::cap_rows(databrain_connector_core::ConnectorKind::Duckdb, &sql, 1000),
+                    base_offset: 0,
+                    row_limit: Some(1000),
+                    confirmed: true,
+                    origin: if self.caller == Caller::Mcp { Origin::Mcp } else { Origin::Ai },
+                    session_key: None,
+                    output_name: None,
+                },
+                Some(self.cancel.clone()),
+            )
+            .await?;
+        let mut text = String::new();
+        let mut display = Vec::new();
+        for o in &outcomes {
+            if let Some(e) = &o.error {
+                text.push_str(&format!("ERROR: {}\n", e.message));
+                continue;
+            }
+            for n in &o.notices {
+                text.push_str(&format!("Note: {n}\n"));
+            }
+            if let Some(r) = &o.result {
+                self.results.lock().push(r.id.clone());
+                let handle = self.engine.outputs().by_result(&r.id).map(|x| x.handle).unwrap_or_default();
+                text.push_str(&format!("{} rows (output {handle}).\n", r.total_rows));
+                // Rows go back to the model: allowed because every source shares them (checked above).
+                let rs = self.engine.results().get(&r.id).map_err(|e| AiError::Internal(e.to_string()))?;
+                let page = rs.lock().page(&ViewSpec::default(), 0, 200).map_err(|e| AiError::Internal(e.to_string()))?;
+                text.push_str(&r.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join("\t"));
+                text.push('\n');
+                for row in page.rows {
+                    text.push_str(&row.iter().map(|v| v.as_deref().map(|s| trunc(s, 80)).unwrap_or_else(|| "NULL".into())).collect::<Vec<_>>().join("\t"));
+                    text.push('\n');
+                }
+                if r.total_rows > 200 {
+                    text.push_str("(first 200 rows)\n");
+                }
+                display.push(json!({"index": o.index, "result": r, "duration_ms": o.duration_ms}));
+            }
+        }
+        self.audit("query_outputs", &json!({"sql": sql}), "executed", Some(&format!("{} outputs", refs.len())));
+        Ok(out(text, json!({"sql": sql, "statements": display})))
     }
 
     async fn sample_rows(&self, args: &Value) -> Result<ToolOutput> {
@@ -440,6 +589,7 @@ impl ToolContext {
                     confirmed: true,
                     origin: Origin::Ai,
                     session_key: None,
+                    output_name: None,
                 },
                 Some(self.cancel.clone()),
             )

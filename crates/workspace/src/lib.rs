@@ -8,8 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub mod ai;
 pub mod knowledge;
 pub mod notebooks;
+pub mod outputs;
 
 pub use ai::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry};
+pub use outputs::OutputRecord;
 pub use notebooks::{CellKind, CellRunSummary, Notebook, NotebookCell, NotebookSummary};
 pub use knowledge::{IndexDelta, KnHit, KnNote, KnObject, KnState, NoteStatus};
 
@@ -250,6 +252,11 @@ pub struct HistoryEntry {
     pub rows: Option<i64>,
     pub status: RunStatus,
     pub error: Option<String>,
+    /// Output produced by this statement (`r12`) and its result id.
+    #[serde(default)]
+    pub output_handle: Option<String>,
+    #[serde(default)]
+    pub result_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -262,6 +269,8 @@ pub struct NewHistory {
     pub rows: Option<i64>,
     pub status: Option<RunStatus>,
     pub error: Option<String>,
+    pub output_handle: Option<String>,
+    pub result_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -289,6 +298,9 @@ pub struct TabState {
     /// Set for notebook tabs.
     #[serde(default)]
     pub notebook_id: Option<String>,
+    /// Set for output viewer tabs (output handle).
+    #[serde(default)]
+    pub output_ref: Option<String>,
 }
 
 const MIGRATIONS: &[&str] = &[
@@ -436,6 +448,21 @@ const MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL
     );
     ALTER TABLE tabs ADD COLUMN notebook_id TEXT;
+    "#,
+    // v4: query outputs (handles, pins, snapshots) + links
+    r#"
+    CREATE TABLE outputs (
+        result_id     TEXT PRIMARY KEY,
+        handle        TEXT NOT NULL UNIQUE,
+        name          TEXT,
+        connection_id TEXT,
+        meta_json     TEXT NOT NULL,
+        snapshot_path TEXT,
+        created_at    INTEGER NOT NULL
+    );
+    ALTER TABLE query_history ADD COLUMN output_handle TEXT;
+    ALTER TABLE query_history ADD COLUMN result_id TEXT;
+    ALTER TABLE tabs ADD COLUMN output_ref TEXT;
     "#,
 ];
 
@@ -698,8 +725,8 @@ impl Workspace {
     pub fn add_history(&self, h: NewHistory) -> Result<i64> {
         let c = self.conn.lock();
         c.execute(
-            "INSERT INTO query_history (connection_id, sql, started_at, duration_ms, rows, status, error, origin) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO query_history (connection_id, sql, started_at, duration_ms, rows, status, error, origin, output_handle, result_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 h.connection_id,
                 h.sql,
@@ -709,6 +736,8 @@ impl Workspace {
                 h.status.unwrap_or(RunStatus::Success).as_str(),
                 h.error,
                 h.origin.as_str(),
+                h.output_handle,
+                h.result_id,
             ],
         )?;
         let id = c.last_insert_rowid();
@@ -729,7 +758,7 @@ impl Workspace {
             .filter(|s| !s.is_empty())
             .map(|s| format!("%{}%", s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")));
         let mut stmt = c.prepare(
-            "SELECT h.id, h.connection_id, c.name, h.sql, h.started_at, h.duration_ms, h.rows, h.status, h.error, h.origin \
+            "SELECT h.id, h.connection_id, c.name, h.sql, h.started_at, h.duration_ms, h.rows, h.status, h.error, h.origin, h.output_handle, h.result_id \
              FROM query_history h LEFT JOIN connections c ON c.id = h.connection_id \
              WHERE (?1 IS NULL OR h.sql LIKE ?1 ESCAPE '\\') \
                AND (?2 IS NULL OR h.connection_id = ?2) \
@@ -749,6 +778,8 @@ impl Workspace {
                     rows: r.get(6)?,
                     status: RunStatus::parse(&r.get::<_, String>(7)?),
                     error: r.get(8)?,
+                    output_handle: r.get(10)?,
+                    result_id: r.get(11)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -765,7 +796,7 @@ impl Workspace {
     pub fn list_tabs(&self) -> Result<Vec<TabState>> {
         let c = self.conn.lock();
         let mut stmt = c.prepare(
-            "SELECT id, title, sql, connection_id, saved_query_id, notebook_id FROM tabs ORDER BY order_idx",
+            "SELECT id, title, sql, connection_id, saved_query_id, notebook_id, output_ref FROM tabs ORDER BY order_idx",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -776,6 +807,7 @@ impl Workspace {
                     connection_id: r.get(3)?,
                     saved_query_id: r.get(4)?,
                     notebook_id: r.get(5)?,
+                    output_ref: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -789,10 +821,10 @@ impl Workspace {
         tx.execute("DELETE FROM tabs", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO tabs (id, title, sql, connection_id, saved_query_id, order_idx, notebook_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO tabs (id, title, sql, connection_id, saved_query_id, order_idx, notebook_id, output_ref) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for (i, t) in tabs.iter().enumerate() {
-                stmt.execute(params![t.id, t.title, t.sql, t.connection_id, t.saved_query_id, i as i64, t.notebook_id])?;
+                stmt.execute(params![t.id, t.title, t.sql, t.connection_id, t.saved_query_id, i as i64, t.notebook_id, t.output_ref])?;
             }
         }
         tx.commit()?;
@@ -976,10 +1008,13 @@ mod tests {
                 rows: Some(1),
                 status: Some(if i == 2 { RunStatus::Error } else { RunStatus::Success }),
                 error: None,
+                output_handle: (i == 0).then(|| "r1".to_string()),
+                result_id: (i == 0).then(|| "job:0".to_string()),
             })
             .unwrap();
         }
         let h = ws.list_history(&HistoryQuery::default()).unwrap();
+        assert_eq!(h.last().unwrap().output_handle.as_deref(), Some("r1"));
         assert_eq!(h.len(), 3);
         assert_eq!(h[0].sql, "select 2");
         assert_eq!(h[0].status, RunStatus::Error);
@@ -1008,6 +1043,7 @@ mod tests {
                 connection_id: None,
                 saved_query_id: None,
                 notebook_id: None,
+                output_ref: None,
             },
             TabState {
                 id: "t2".into(),
@@ -1016,6 +1052,7 @@ mod tests {
                 connection_id: Some(conn.id.clone()),
                 saved_query_id: None,
                 notebook_id: None,
+                output_ref: None,
             },
         ];
         ws.save_tabs(&tabs).unwrap();

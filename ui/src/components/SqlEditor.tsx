@@ -82,9 +82,24 @@ export function useCompletionSchema(connId: string | null | undefined): { ns?: S
   const schemas = useStore((s) => (connId ? s.schemas[connId] : undefined));
   const objects = useStore((s) => s.objects);
   const columns = useStore((s) => s.columns);
+  const isDuck = useStore((s) => s.connections.find((c) => c.id === connId)?.config.kind === "duckdb");
+  const outputs = useStore((s) => s.outputs);
   return useMemo(() => {
-    if (!connId || !schemas) return {};
+    if (!connId) return {};
     const ns: Record<string, Record<string, string[]>> = {};
+    if (isDuck) {
+      // Outputs: results.<handle>, results.<name>, results.<name>__k
+      const res: Record<string, string[]> = {};
+      for (const o of outputs) {
+        if (o.state === "evicted") continue;
+        const cols = o.columns.map((c) => c.name);
+        res[o.handle] = cols;
+        if (o.name) res[o.name] = cols;
+        if (o.version_of) res[`${o.version_of[0]}__${o.version_of[1]}`] = cols;
+      }
+      if (Object.keys(res).length) ns.results = res;
+    }
+    if (!schemas) return Object.keys(ns).length ? { ns } : {};
     for (const sc of schemas) {
       const objs = objects[`${connId}|${sc.name}`];
       if (!objs) continue;
@@ -96,7 +111,7 @@ export function useCompletionSchema(connId: string | null | undefined): { ns?: S
       ns[sc.name] = tables;
     }
     return { ns, def: schemas.find((s) => s.is_default)?.name };
-  }, [connId, schemas, objects, columns]);
+  }, [connId, schemas, objects, columns, isDuck, outputs]);
 }
 
 export interface EditorHandle {

@@ -15,18 +15,26 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use databrain_auth::{AuthMethodKind, CredentialSource};
 use databrain_connector_core::arrow::ipc::reader::StreamReader;
+use databrain_connector_core::external::{ExternalTablesSlot, RESULTS_SCHEMA, referenced_results};
 use databrain_connector_core::{
     Capabilities, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject,
     ErrorKind, ExecOptions, ExecSummary, FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session,
     StreamEvent, StreamSender, TableColumns, quote_ident, quote_literal,
 };
 
-#[derive(Debug, Default)]
-pub struct DuckdbConnector;
+#[derive(Default)]
+pub struct DuckdbConnector {
+    outputs: Option<Arc<ExternalTablesSlot>>,
+}
 
 impl DuckdbConnector {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Let sessions query DataBrain outputs as `results.<name>`.
+    pub fn with_outputs(slot: Arc<ExternalTablesSlot>) -> Self {
+        Self { outputs: Some(slot) }
     }
 }
 
@@ -164,7 +172,12 @@ impl Connector for DuckdbConnector {
         })
         .await
         .map_err(|e| ConnectorError::internal(e.to_string()))??;
-        Ok(Box::new(DuckSession { interrupt: conn.interrupt_handle(), conn: Arc::new(Mutex::new(conn)) }))
+        Ok(Box::new(DuckSession {
+            interrupt: conn.interrupt_handle(),
+            conn: Arc::new(Mutex::new(conn)),
+            outputs: self.outputs.clone(),
+            loaded: Arc::default(),
+        }))
     }
 }
 
@@ -203,6 +216,149 @@ fn attach_files(conn: &duckdb::Connection, files: &[String]) -> Result<()> {
 pub struct DuckSession {
     conn: Arc<Mutex<duckdb::Connection>>,
     interrupt: Arc<duckdb::InterruptHandle>,
+    outputs: Option<Arc<ExternalTablesSlot>>,
+    /// Output tables loaded in this session: lowercase name → version key.
+    loaded: Arc<Mutex<std::collections::HashMap<String, String>>>,
+}
+
+type Loaded = Mutex<std::collections::HashMap<String, String>>;
+
+/// Load (or refresh) the outputs `sql` references into the in-memory
+/// `results` catalog of this session. Returns notices to show the user.
+fn load_outputs(conn: &duckdb::Connection, sql: &str, slot: Option<&ExternalTablesSlot>, loaded: &Loaded) -> Result<Vec<String>> {
+    let names = referenced_results(sql);
+    if names.is_empty() {
+        return Ok(vec![]);
+    }
+    let Some(tables) = slot.and_then(|s| s.get()) else {
+        return Err(ConnectorError::query("results.* refers to DataBrain outputs, which are not available in this session"));
+    };
+    let mut notices = Vec::new();
+    for name in names {
+        let t = match tables.resolve(&name) {
+            Ok(t) => t,
+            Err(e) => {
+                let known = tables.names();
+                let hint = if known.is_empty() {
+                    "No outputs yet — run a query first.".to_string()
+                } else {
+                    format!("Available: {}", known.iter().take(15).map(|n| format!("results.{n}")).collect::<Vec<_>>().join(", "))
+                };
+                return Err(ConnectorError::query(format!("results.{name}: {e}. {hint}")));
+            }
+        };
+        if let Some(n) = &t.notice {
+            notices.push(n.clone());
+        }
+        let key = name.to_ascii_lowercase();
+        let current = loaded.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?.get(&key).cloned();
+        if current.as_deref() == Some(t.version_key.as_str()) {
+            continue;
+        }
+        let attached: bool = conn
+            .query_row("SELECT count(*) > 0 FROM duckdb_databases() WHERE database_name = 'results'", [], |r| r.get(0))
+            .map_err(map_err)?;
+        if !attached {
+            conn.execute_batch(&format!("ATTACH ':memory:' AS {RESULTS_SCHEMA}")).map_err(map_err)?;
+        }
+        let batches: Vec<_> = t.batches.iter().map(normalize_for_duckdb).collect::<Result<_>>()?;
+        let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| normalize_schema(&t.schema));
+        let cols = schema
+            .fields()
+            .iter()
+            .map(|f| format!("{} {}", quote_ident(ConnectorKind::Duckdb, f.name()), duck_type(f.data_type())))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let table = quote_ident(ConnectorKind::Duckdb, &name);
+        conn.execute_batch(&format!("CREATE OR REPLACE TABLE {RESULTS_SCHEMA}.main.{table} ({cols})")).map_err(map_err)?;
+        {
+            let mut app = conn.appender_to_catalog_and_db(&name, RESULTS_SCHEMA, "main").map_err(map_err)?;
+            for b in &batches {
+                if b.num_rows() > 0 {
+                    app.append_record_batch(to_arrow58(b)?).map_err(map_err)?;
+                }
+            }
+            app.flush().map_err(map_err)?;
+        }
+        loaded.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?.insert(key, t.version_key);
+    }
+    Ok(notices)
+}
+
+use databrain_connector_core::arrow::array::RecordBatch as Batch59;
+use databrain_connector_core::arrow::datatypes::{DataType as Dt, Field as Field59, Schema as Schema59, SchemaRef as SchemaRef59, TimeUnit};
+
+/// Column type DuckDB's appender handles natively, or `None` → cast to text.
+fn native(dt: &Dt) -> Option<Dt> {
+    Some(match dt {
+        Dt::Boolean | Dt::Int8 | Dt::Int16 | Dt::Int32 | Dt::Int64 | Dt::UInt8 | Dt::UInt16 | Dt::UInt32 | Dt::UInt64 | Dt::Float32 | Dt::Float64 | Dt::Utf8 | Dt::Binary | Dt::Date32 => dt.clone(),
+        Dt::Float16 => Dt::Float32,
+        Dt::LargeUtf8 | Dt::Utf8View => Dt::Utf8,
+        Dt::LargeBinary | Dt::BinaryView | Dt::FixedSizeBinary(_) => Dt::Binary,
+        Dt::Date64 => Dt::Date32,
+        Dt::Timestamp(u, None) => Dt::Timestamp(*u, None),
+        Dt::Timestamp(_, Some(tz)) => Dt::Timestamp(TimeUnit::Microsecond, Some(tz.clone())),
+        Dt::Time32(_) | Dt::Time64(_) => Dt::Time64(TimeUnit::Microsecond),
+        Dt::Decimal128(p, _) if *p <= 38 => dt.clone(),
+        Dt::Decimal32(p, s) | Dt::Decimal64(p, s) => Dt::Decimal128(*p, *s),
+        Dt::Decimal256(..) => Dt::Float64,
+        _ => return None,
+    })
+}
+
+fn normalize_schema(s: &SchemaRef59) -> SchemaRef59 {
+    Arc::new(Schema59::new(s.fields().iter().map(|f| Field59::new(f.name(), native(f.data_type()).unwrap_or(Dt::Utf8), true)).collect::<Vec<_>>()))
+}
+
+fn normalize_for_duckdb(b: &Batch59) -> Result<Batch59> {
+    use databrain_connector_core::arrow::compute::cast;
+    let schema = normalize_schema(&b.schema());
+    let cols = b
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(c, f)| if c.data_type() == f.data_type() { Ok(c.clone()) } else { cast(c, f.data_type()) })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| ConnectorError::internal(e.to_string()))?;
+    Batch59::try_new(schema, cols).map_err(|e| ConnectorError::internal(e.to_string()))
+}
+
+fn duck_type(dt: &Dt) -> String {
+    match dt {
+        Dt::Boolean => "BOOLEAN".into(),
+        Dt::Int8 => "TINYINT".into(),
+        Dt::Int16 => "SMALLINT".into(),
+        Dt::Int32 => "INTEGER".into(),
+        Dt::Int64 => "BIGINT".into(),
+        Dt::UInt8 => "UTINYINT".into(),
+        Dt::UInt16 => "USMALLINT".into(),
+        Dt::UInt32 => "UINTEGER".into(),
+        Dt::UInt64 => "UBIGINT".into(),
+        Dt::Float32 => "FLOAT".into(),
+        Dt::Float64 => "DOUBLE".into(),
+        Dt::Binary => "BLOB".into(),
+        Dt::Date32 => "DATE".into(),
+        Dt::Timestamp(TimeUnit::Second, None) => "TIMESTAMP_S".into(),
+        Dt::Timestamp(TimeUnit::Millisecond, None) => "TIMESTAMP_MS".into(),
+        Dt::Timestamp(TimeUnit::Nanosecond, None) => "TIMESTAMP_NS".into(),
+        Dt::Timestamp(_, None) => "TIMESTAMP".into(),
+        Dt::Timestamp(_, Some(_)) => "TIMESTAMPTZ".into(),
+        Dt::Time64(_) => "TIME".into(),
+        Dt::Decimal128(p, s) => format!("DECIMAL({p},{s})"),
+        _ => "VARCHAR".into(),
+    }
+}
+
+/// Workspace Arrow (59) → DuckDB's Arrow (58), via IPC.
+fn to_arrow58(b: &Batch59) -> Result<arrow58::record_batch::RecordBatch> {
+    let mut buf = Vec::new();
+    {
+        let mut w = databrain_connector_core::arrow::ipc::writer::StreamWriter::try_new(&mut buf, &b.schema()).map_err(|e| ConnectorError::internal(e.to_string()))?;
+        w.write(b).map_err(|e| ConnectorError::internal(e.to_string()))?;
+        w.finish().map_err(|e| ConnectorError::internal(e.to_string()))?;
+    }
+    let mut r = arrow58::ipc::reader::StreamReader::try_new(Cursor::new(buf), None).map_err(|e| ConnectorError::internal(e.to_string()))?;
+    r.next().ok_or_else(|| ConnectorError::internal("empty IPC stream"))?.map_err(|e| ConnectorError::internal(e.to_string()))
 }
 
 /// Convert an arrow-58 batch to the workspace's Arrow via IPC.
@@ -217,7 +373,10 @@ fn convert_batch(b: &arrow58::record_batch::RecordBatch) -> Result<databrain_con
     r.next().ok_or_else(|| ConnectorError::internal("empty IPC stream"))?.map_err(Into::into)
 }
 
-fn run(conn: &duckdb::Connection, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
+fn run(conn: &duckdb::Connection, sql: &str, opts: &ExecOptions, tx: &StreamSender, outputs: Option<&ExternalTablesSlot>, loaded: &Loaded) -> Result<()> {
+    for n in load_outputs(conn, sql, outputs, loaded)? {
+        tx.blocking_send(Ok(StreamEvent::Notice(n)));
+    }
     // Auto-load the extension a query needs (INSTALL is a no-op once cached).
     let lower = sql.to_ascii_lowercase();
     for (f, ext) in [("delta_scan", "delta"), ("iceberg_", "iceberg"), ("read_xlsx", "excel")] {
@@ -324,6 +483,7 @@ impl Session for DuckSession {
         let conn = self.conn.clone();
         let sql = sql.to_string();
         let (cancel, interrupt) = (opts.cancel.clone(), self.interrupt.clone());
+        let (outputs, loaded) = (self.outputs.clone(), self.loaded.clone());
         let done = tokio_util::sync::CancellationToken::new();
         let done_guard = done.clone();
         tokio::spawn(async move {
@@ -338,7 +498,7 @@ impl Session for DuckSession {
                 tx.blocking_send(Err(ConnectorError::internal("lock poisoned")));
                 return;
             };
-            if let Err(e) = run(&g, &sql, &opts, &tx) {
+            if let Err(e) = run(&g, &sql, &opts, &tx, outputs.as_deref(), &loaded) {
                 let e = if opts.cancel.is_cancelled() { ConnectorError::cancelled() } else { e };
                 tx.blocking_send(Err(e));
             }
@@ -454,7 +614,7 @@ mod tests {
     use databrain_connector_core::arrow::datatypes::Int64Type;
 
     async fn session(cfg: ConnectionConfig) -> Box<dyn Session> {
-        DuckdbConnector.connect(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::None, None))).await.unwrap()
+        DuckdbConnector::new().connect(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::None, None))).await.unwrap()
     }
 
     async fn q(s: &dyn Session, sql: &str) -> databrain_connector_core::Collected {
@@ -537,11 +697,64 @@ mod tests {
         assert_eq!(q(s.as_ref(), "select 1").await.num_rows(), 1);
     }
 
+    struct FakeOutputs(std::sync::Mutex<(String, i64)>);
+    impl databrain_connector_core::external::ExternalTables for FakeOutputs {
+        fn resolve(&self, name: &str) -> std::result::Result<databrain_connector_core::external::ExternalTable, String> {
+            use databrain_connector_core::arrow::array::{Int64Array, StringArray};
+            use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
+            if name != "sales" {
+                return Err("unknown output".into());
+            }
+            let (version, n) = self.0.lock().unwrap().clone();
+            let schema = Arc::new(Schema::new(vec![Field::new("region", DataType::Utf8, true), Field::new("amount", DataType::Int64, true)]));
+            let regions: Vec<Option<&str>> = (0..n).map(|i| Some(if i % 2 == 0 { "EU" } else { "US" })).collect();
+            let batch = databrain_connector_core::arrow::array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(regions)), Arc::new(Int64Array::from((0..n).collect::<Vec<_>>()))],
+            )
+            .unwrap();
+            Ok(databrain_connector_core::external::ExternalTable {
+                name: name.into(),
+                version_key: version,
+                schema,
+                batches: vec![batch],
+                notice: Some("capped".into()),
+            })
+        }
+        fn names(&self) -> Vec<String> {
+            vec!["sales".into()]
+        }
+    }
+
+    #[tokio::test]
+    async fn queries_outputs_as_results_tables() {
+        let slot = ExternalTablesSlot::new();
+        let fake = Arc::new(FakeOutputs(std::sync::Mutex::new(("v1".into(), 4))));
+        slot.set(fake.clone());
+        let s = DuckdbConnector::with_outputs(slot)
+            .connect(&ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None), Arc::new(InlineCredentialSource::new(AuthMethod::None, None)))
+            .await
+            .unwrap();
+        let r = q(s.as_ref(), "select region, sum(amount) from results.sales group by 1 order by 1").await;
+        assert_eq!(r.num_rows(), 2);
+        assert_eq!(r.notices, vec!["capped".to_string()]);
+        // New version is reloaded; joins between outputs work.
+        *fake.0.lock().unwrap() = ("v2".into(), 10);
+        let r = q(s.as_ref(), "select count(*) from results.sales a join results.sales b using (amount)").await;
+        assert_eq!(r.batches[0].column(0).as_primitive::<Int64Type>().value(0), 10);
+        let e = s.execute("select * from results.nope", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
+        assert!(e.message.contains("results.nope") && e.message.contains("results.sales"), "{}", e.message);
+        // Without a provider, results.* is a clear error.
+        let plain = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        let e = plain.execute("select * from results.sales", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
+        assert!(e.message.contains("not available"), "{}", e.message);
+    }
+
     #[tokio::test]
     async fn bad_attached_file_is_config_error() {
         let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
         cfg.options.insert("files".into(), "/definitely/missing.csv".into());
-        let e = DuckdbConnector.connect(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::None, None))).await.err().unwrap();
+        let e = DuckdbConnector::new().connect(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::None, None))).await.err().unwrap();
         assert_eq!(e.kind, ErrorKind::Config);
         assert!(e.message.contains("missing.csv"));
     }

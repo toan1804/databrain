@@ -36,6 +36,9 @@ pub struct NotebookCell {
     pub kind: CellKind,
     #[serde(default)]
     pub source: String,
+    /// Output name; later cells query it as `results.<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_name: Option<String>,
     /// Optional per-cell connection override (else the notebook's).
     #[serde(default)]
     pub connection_id: Option<String>,
@@ -166,8 +169,8 @@ mod tests {
                 connection_id: None,
                 folder_id: None,
                 cells: vec![
-                    NotebookCell { id: String::new(), kind: CellKind::Markdown, source: "# Revenue".into(), connection_id: None, collapsed: false, last_run: None },
-                    NotebookCell { id: String::new(), kind: CellKind::Sql, source: "select 1".into(), connection_id: None, collapsed: false, last_run: None },
+                    NotebookCell { id: String::new(), kind: CellKind::Markdown, source: "# Revenue".into(), output_name: None, connection_id: None, collapsed: false, last_run: None },
+                    NotebookCell { id: String::new(), kind: CellKind::Sql, source: "select 1".into(), output_name: Some("one".into()), connection_id: None, collapsed: false, last_run: None },
                 ],
                 created_at: 0,
                 updated_at: 0,

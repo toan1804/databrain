@@ -55,6 +55,8 @@ pub struct UiContext {
     pub selection: Option<String>,
     pub last_error: Option<String>,
     pub result_id: Option<String>,
+    /// Outputs the user mentioned with @ (handles or names).
+    pub mentions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -254,7 +256,36 @@ impl Agent {
             }
             messages.drain(..start);
         }
-        let turn = Message::user(user_turn(&req));
+        // @mentioned outputs: allowed for the tools and described to the model.
+        let mut mentioned_ids = Vec::new();
+        let mut turn_text = user_turn(&req);
+        let mut lines = Vec::new();
+        for m in &req.context.mentions {
+            match self.engine.outputs().resolve(m) {
+                Some(o) => {
+                    mentioned_ids.push(o.result_id.clone());
+                    let cols: Vec<String> = o.columns.iter().take(40).map(|c| format!("{} {}", c.name, c.db_type.clone().unwrap_or_else(|| c.data_type.clone()))).collect();
+                    lines.push(format!(
+                        "- @{m} = {} ({}): {} rows{} from \"{}\"; columns: {}\n  SQL: {}",
+                        o.reference(),
+                        o.handle,
+                        o.rows,
+                        if o.truncated { " (capped at the row limit — incomplete)" } else { "" },
+                        o.connection_name,
+                        cols.join(", "),
+                        o.sql.replace('\n', " ").chars().take(600).collect::<String>()
+                    ));
+                }
+                None => lines.push(format!("- @{m}: not found")),
+            }
+        }
+        if !lines.is_empty() {
+            turn_text.push_str(&format!(
+                "\n\n[Mentioned outputs — use result_summary / query_result (one output) or query_outputs (DuckDB over results.<name>, can join outputs)]\n{}",
+                lines.join("\n")
+            ));
+        }
+        let turn = Message::user(turn_text);
         ws.add_ai_message(&sid, "user", &serde_json::to_value(&turn).unwrap_or_default(), (None, None))?;
         messages.push(turn);
 
@@ -274,7 +305,7 @@ impl Agent {
             caller: Caller::Agent,
             host,
             cancel: cancel.clone(),
-            results: parking_lot::Mutex::new(req.context.result_id.clone().into_iter().collect()),
+            results: parking_lot::Mutex::new(req.context.result_id.clone().into_iter().chain(mentioned_ids).collect()),
         };
 
         if let Some(kiro) = provider.as_kiro() {
@@ -375,7 +406,7 @@ mod tests {
             model: None,
             message: "fix it".into(),
             mode: Mode::FixError,
-            context: UiContext { editor_sql: Some("selec 1".into()), selection: None, last_error: Some("syntax error at or near \"selec\"".into()), result_id: None },
+            context: UiContext { editor_sql: Some("selec 1".into()), selection: None, last_error: Some("syntax error at or near \"selec\"".into()), result_id: None, mentions: vec![] },
         };
         let t = user_turn(&r);
         assert!(t.contains("[Editor SQL]") && t.contains("selec 1") && t.contains("[Last error]"));

@@ -4,6 +4,7 @@
 //! over a [`QueryStream`], so the grid, filtering and export are engine-agnostic.
 
 pub mod error;
+pub mod external;
 pub mod sql;
 pub mod stream;
 pub mod types;

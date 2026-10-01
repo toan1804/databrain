@@ -48,7 +48,7 @@ pub fn cell(formatter: &ArrayFormatter<'_>, array: &ArrayRef, row: usize) -> Opt
 }
 
 /// Coarse type family, used by the UI for alignment/icons and by filters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeFamily {
     Number,
@@ -89,7 +89,7 @@ pub fn is_decimal_text(field: &Field) -> bool {
         })
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct ColumnMeta {
     pub name: String,
     pub data_type: String,

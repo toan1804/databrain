@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Bookmark, Database, FileCode2, FileSearch, History, Moon, NotebookPen, Plus, Search, Settings2, Sparkles, Sun, X } from "lucide-react";
 import { useAi } from "../aiStore";
+import { openOutput, openResultsQuery, outputLabel, outputRef } from "../outputs";
 import { queryLocalFile } from "./Sidebar";
 import { fuzzyMatch, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
@@ -48,6 +49,14 @@ function Palette() {
       { id: "ai", group: "AI", label: "Open AI assistant", icon: <Sparkles size={14} />, hint: "⌘L", run: () => useAi.getState().setOpen(true, "chat") },
       { id: "ai-kn", group: "AI", label: "AI knowledge (index schema, notes)", icon: <Sparkles size={14} />, run: () => useAi.getState().setOpen(true, "knowledge") },
       { id: "settings", group: "Actions", label: "Settings: AI providers, MCP", icon: <Settings2 size={14} />, hint: "⌘,", run: () => st.setSettingsOpen(true) },
+      { id: "outputs", group: "Actions", label: "Show outputs", icon: <Bookmark size={14} />, run: () => st.setSidebarPanel("outputs") },
+      {
+        id: "query-outputs",
+        group: "Actions",
+        label: "Query outputs with SQL (results.*)",
+        icon: <Search size={14} />,
+        run: () => void openResultsQuery(st.outputs[0] ? `SELECT *\nFROM ${outputRef(st.outputs[0])}\nLIMIT 100;` : "SELECT 1;", "Results", false),
+      },
       { id: "saved", group: "Actions", label: "Show saved queries", icon: <Bookmark size={14} />, run: () => st.setSidebarPanel("saved") },
       { id: "history", group: "Actions", label: "Show history", icon: <History size={14} />, run: () => st.setSidebarPanel("history") },
     ];
@@ -73,6 +82,17 @@ function Palette() {
     }
     for (const n of st.notebooks) {
       cmds.push({ id: `nb-${n.id}`, group: "Notebooks", label: n.name, detail: `${n.cell_count} cells`, icon: <NotebookPen size={14} />, run: () => st.openNotebook(n.id, n.name) });
+    }
+    for (const o of st.outputs.slice(0, 50)) {
+      if (o.state === "evicted") continue;
+      cmds.push({
+        id: `out-${o.handle}`,
+        group: "Outputs",
+        label: `${outputLabel(o)}${o.name ? ` (${o.handle})` : ""}`,
+        detail: `${o.connection_name} · ${o.rows.toLocaleString()} rows`,
+        icon: <Search size={14} />,
+        run: () => void openOutput(o),
+      });
     }
     for (const t of st.tabs) {
       cmds.push({ id: `tab-${t.id}`, group: "Open tabs", label: t.title, icon: <FileCode2 size={14} />, run: () => st.setActiveTab(t.id) });

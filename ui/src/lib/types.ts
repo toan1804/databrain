@@ -204,6 +204,8 @@ export interface RunRequest {
   confirmed: boolean;
   origin?: "user" | "ai" | "mcp";
   session_key?: string | null;
+  /** Name the job's last result (`results.<name>` in the Results connection). */
+  output_name?: string | null;
 }
 
 export type RunResponse =
@@ -253,6 +255,7 @@ export type JobEvent =
       tab_id: string;
       index: number;
       result: ResultInfo | null;
+      output?: OutputInfo | null;
       rows_affected: number | null;
       duration_ms: number;
       notices: string[];
@@ -266,7 +269,8 @@ export type JobEvent =
       duration_ms: number;
       statement_start: number;
     }
-  | { type: "job_finished"; job_id: string; tab_id: string; status: RunStatus; duration_ms: number };
+  | { type: "job_finished"; job_id: string; tab_id: string; status: RunStatus; duration_ms: number }
+  | { type: "outputs_changed"; job_id: ""; tab_id: "" };
 
 export type FilterOp =
   | "contains"
@@ -322,6 +326,51 @@ export interface ColumnStats {
   top: { value: string | null; count: number }[];
 }
 
+export type OutputState = "live" | "on_disk" | "evicted";
+
+export interface OutputInfo {
+  handle: string;
+  name: string | null;
+  /** Older version of a named output: [name, versions back]. */
+  version_of: [string, number] | null;
+  result_id: string;
+  connection_id: string;
+  connection_name: string;
+  kind: ConnectorKind;
+  sql: string;
+  tab_id: string;
+  statement_index: number;
+  created_at: number;
+  rows: number;
+  columns: ColumnMeta[];
+  truncated: boolean;
+  row_limit: number | null;
+  bytes: number;
+  pinned: boolean;
+  state: OutputState;
+  origin: "user" | "ai" | "mcp";
+  last_used: number;
+  active: boolean;
+}
+
+export type ChartAgg = "sum" | "avg" | "count" | "min" | "max" | "none";
+
+export interface ChartSpec {
+  x: number;
+  y: number[];
+  agg: ChartAgg;
+  series?: number | null;
+  limit?: number;
+}
+
+export interface ChartData {
+  x: string[];
+  x_family: "number" | "date" | "time" | "text";
+  series: { name: string; values: (number | null)[] }[];
+  truncated: boolean;
+  rows: number;
+}
+
 export type ExportFormat = "csv" | "tsv" | "json" | "ndjson" | "markdown" | "sql_insert" | "parquet" | "xlsx";
 
 export interface ExportOptions {
@@ -355,6 +404,8 @@ export interface HistoryEntry {
   rows: number | null;
   status: RunStatus;
   error: string | null;
+  output_handle?: string | null;
+  result_id?: string | null;
 }
 
 export interface HistoryQuery {
@@ -371,6 +422,7 @@ export interface TabState {
   connection_id?: string | null;
   saved_query_id?: string | null;
   notebook_id?: string | null;
+  output_ref?: string | null;
 }
 
 export interface Span {
@@ -403,6 +455,8 @@ export interface NotebookCell {
   id: string;
   kind: CellKind;
   source: string;
+  /** Output name: later cells query it as results.<name>. */
+  output_name?: string | null;
   connection_id?: string | null;
   collapsed?: boolean;
   last_run?: CellRunSummary | null;
@@ -488,6 +542,7 @@ export interface UiContext {
   selection?: string | null;
   last_error?: string | null;
   result_id?: string | null;
+  mentions?: string[];
 }
 
 export interface AgentRequest {

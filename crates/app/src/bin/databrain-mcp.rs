@@ -33,7 +33,13 @@ async fn main() {
         }
     };
     let hub = EventHub::new(Arc::new(Quiet));
-    let engine = QueryEngine::new(databrain_app::api::default_registry(), ws, Arc::new(KeychainStore), Arc::new(ResultStore::new()), hub.clone());
+    let slot = databrain_connector_core::external::ExternalTablesSlot::new();
+    let engine = QueryEngine::new(databrain_app::api::registry_with_outputs(Some(slot.clone())), ws, Arc::new(KeychainStore), Arc::new(ResultStore::new()), hub.clone());
+    slot.set(engine.external_tables());
+    // Pinned outputs saved by the app are readable (read-only use) here too.
+    if let Some(dir) = path.parent() {
+        engine.outputs().set_snapshot_dir(dir.join("outputs"));
+    }
     let server = McpServer { engine, hub };
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     if let Err(e) = server.serve(stdin, tokio::io::stdout()).await {

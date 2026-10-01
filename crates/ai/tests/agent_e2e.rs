@@ -253,7 +253,7 @@ async fn denied_approval_and_blocked_writes() {
     // Nothing was deleted.
     let out = f
         .engine
-        .run_and_wait(&f.hub, RunRequest { connection_id: f.conn.clone(), tab_id: "t".into(), sql: "select count(*) from orders".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None }, None)
+        .run_and_wait(&f.hub, RunRequest { connection_id: f.conn.clone(), tab_id: "t".into(), sql: "select count(*) from orders".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None }, None)
         .await
         .unwrap();
     assert_eq!(out[0].result.as_ref().unwrap().total_rows, 1);
@@ -416,4 +416,78 @@ async fn kiro_live() {
     eprintln!("tools: {tools:?}\nanswer: {text}");
     assert!(tools.iter().any(|t| t == "run_query"), "{tools:?}");
     assert!(text.contains("Vietnam") && text.contains("300"), "{text}");
+}
+
+// ------------------------------------------------------------------ outputs: handles, @mentions, cross-connection policy
+
+#[tokio::test]
+async fn ai_tools_use_output_handles_with_source_policies() {
+    use databrain_connector_core::external::ExternalTablesSlot;
+    let f = fixture(1, AiPolicy::default()).await;
+    // Engine whose DuckDB sessions can see outputs.
+    let slot = ExternalTablesSlot::new();
+    let mut reg = ConnectorRegistry::new();
+    reg.register(Arc::new(databrain_connector_sqlite::SqliteConnector));
+    reg.register(Arc::new(databrain_connector_duckdb::DuckdbConnector::with_outputs(slot.clone())));
+    let engine = QueryEngine::new(reg, f.ws.clone(), f.secrets.clone(), Arc::new(ResultStore::new()), f.hub.clone());
+    slot.set(engine.external_tables());
+
+    // A second connection to the same data, with AI disabled.
+    let mut closed = f.ws.get_connection(&f.conn).unwrap();
+    closed.id = String::new();
+    closed.name = "Closed".into();
+    closed.ai_policy = AiPolicy { ai_enabled: false, ..Default::default() };
+    let closed = f.ws.save_connection(closed).unwrap();
+    // Open connection shares result rows.
+    let mut open = f.ws.get_connection(&f.conn).unwrap();
+    open.ai_policy.share_result_rows = true;
+    let open = f.ws.save_connection(open).unwrap();
+
+    let run = |conn: String, sql: &'static str, name: Option<&'static str>| {
+        let (engine, hub) = (engine.clone(), f.hub.clone());
+        async move {
+            let r = RunRequest { connection_id: conn, tab_id: uuid::Uuid::new_v4().to_string(), sql: sql.into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: name.map(Into::into) };
+            engine.run_and_wait(&hub, r, None).await.unwrap()
+        }
+    };
+    run(open.id.clone(), "select country, sum(amount) total from orders group by 1", Some("by_country")).await; // r1
+    run(closed.id.clone(), "select country, count(*) n from orders group by 1", Some("secret")).await; // r2
+
+    let ctx = databrain_ai::ToolContext {
+        engine: engine.clone(),
+        hub: f.hub.clone(),
+        profile: open.clone(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+    };
+    // Handles work wherever a result id was accepted.
+    let o = ctx.call("result_summary", &json!({"result_id": "by_country"})).await;
+    assert!(o.content.contains("country") && o.content.contains("First 2 rows"), "{}", o.content);
+    let o = ctx.call("query_result", &json!({"result_id": "r1", "sql": "select country from result order by total desc limit 1"})).await;
+    assert!(o.content.contains("Vietnam"), "{}", o.content);
+    // Outputs from a connection with AI disabled are invisible and blocked.
+    let o = ctx.call("list_outputs", &json!({})).await;
+    assert!(o.content.contains("results.by_country") && !o.content.contains("secret"), "{}", o.content);
+    let o = ctx.call("query_result", &json!({"result_id": "secret", "sql": "select * from result"})).await;
+    assert!(o.content.contains("AI is disabled"), "{}", o.content);
+    let o = ctx.call("query_outputs", &json!({"sql": "select * from results.by_country a join results.secret b using (country)"})).await;
+    assert!(o.content.contains("AI is disabled"), "{}", o.content);
+    // DuckDB over outputs (a self-join stands in for two sources).
+    let o = ctx.call("query_outputs", &json!({"sql": "select a.country, a.total from results.by_country a join results.r1 b using (country) order by 2 desc"})).await;
+    assert!(o.content.contains("2 rows") && o.content.contains("Vietnam\t300"), "{}", o.content);
+    let o = ctx.call("query_outputs", &json!({"sql": "create table x as select 1"})).await;
+    assert!(o.content.starts_with("ERROR"), "{}", o.content);
+    // MCP: an MCP-enabled connection cannot read outputs of a connection
+    // that is not shared with MCP.
+    let mut shared = f.ws.get_connection(&f.conn).unwrap();
+    shared.id = String::new();
+    shared.name = "Shared".into();
+    shared.ai_policy = AiPolicy { mcp_enabled: true, share_result_rows: true, ..Default::default() };
+    let shared = f.ws.save_connection(shared).unwrap();
+    let mcp = databrain_ai::ToolContext { caller: databrain_ai::Caller::Mcp, profile: shared, ..ctx };
+    let o = mcp.call("query_outputs", &json!({"sql": "select * from results.by_country"})).await;
+    assert!(o.content.contains("not shared with MCP"), "{}", o.content);
 }

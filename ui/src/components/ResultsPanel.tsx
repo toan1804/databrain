@@ -22,6 +22,9 @@ import {
   X,
 } from "lucide-react";
 import { useAi } from "../aiStore";
+import { ChartView } from "./ChartView";
+import { OutputChip } from "./OutputChip";
+import { outputLabel } from "../outputs";
 import { api, toError } from "../lib/api";
 import type { ColumnStats, ExportFormat, FilterOp, ResultInfo, ViewSpec } from "../lib/types";
 import {
@@ -97,6 +100,7 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
                 {s.result ? "Result" : s.error ? (s.status === "cancelled" ? "Cancelled" : "Error") : "Running"}
               </span>
               {s.result && <span className="text-[11px] text-muted">{formatCount(s.result.total_rows)}</span>}
+              {s.output && <span className="font-mono text-[10.5px] text-muted">{outputLabel(s.output)}</span>}
             </button>
           );
         })}
@@ -269,19 +273,20 @@ function Messages({ run }: { run: TabRun }) {
 
 // ------------------------------------------------------------------ result view
 
-function ResultView({
+export function ResultView({
   stmt,
   info,
   tabId,
   connectionId,
   title,
 }: {
-  stmt: StatementRun;
+  stmt: Pick<StatementRun, "durationMs" | "output">;
   info: ResultInfo;
   tabId: string;
   connectionId?: string | null;
   title?: string;
 }) {
+  const [mode, setMode] = useState<"grid" | "chart">("grid");
   const tab = useStore((s) => s.tabs.find((t) => t.id === tabId));
   const connId = connectionId !== undefined ? connectionId : tab?.connection_id;
   const conn = useStore((s) => s.connections.find((c) => c.id === connId));
@@ -351,6 +356,21 @@ function ResultView({
       }}
     >
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-2">
+        {stmt.output && <OutputChip output={stmt.output} />}
+        <div className="flex rounded-md border border-line p-0.5" role="radiogroup" aria-label="View">
+          {(["grid", "chart"] as const).map((m) => (
+            <button
+              key={m}
+              role="radio"
+              aria-checked={mode === m}
+              title={m === "grid" ? "Table" : "Chart"}
+              onClick={() => setMode(m)}
+              className={`flex h-5 w-6 items-center justify-center rounded ${mode === m ? "bg-hover text-fg" : "text-muted hover:text-fg"}`}
+            >
+              {m === "grid" ? <Table2 size={12} /> : <BarChart3 size={12} />}
+            </button>
+          ))}
+        </div>
         <div className="relative w-56">
           <ListFilter size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-muted" />
           <input
@@ -401,7 +421,7 @@ function ResultView({
               mode: "analyze_result",
               targetKey: tabId,
               connectionId: connId ?? undefined,
-              context: { result_id: info.id },
+              context: { result_id: info.id, mentions: stmt.output ? [stmt.output.name ?? stmt.output.handle] : [] },
             })
           }
         >
@@ -447,6 +467,9 @@ function ResultView({
       )}
 
       <div className="min-h-0 flex-1">
+        {mode === "chart" ? (
+          <ChartView info={info} view={view} />
+        ) : (
         <ResultGrid
           ref={grid}
           info={info}
@@ -458,6 +481,7 @@ function ResultView({
           findCurrent={findIdx}
           dialect={conn?.config.kind}
         />
+        )}
       </div>
 
       <div className="flex h-7 shrink-0 items-center gap-3 border-t border-line px-3 text-[11.5px] text-muted">

@@ -5,6 +5,7 @@ import type {
   Folder,
   FolderKind,
   NotebookSummary,
+  OutputInfo,
   ColumnInfo,
   ConnectionView,
   ConnectorInfo,
@@ -31,6 +32,7 @@ export interface StatementRun {
   plan: PlannedStatement;
   status: StatementStatus;
   result?: ResultInfo;
+  output?: OutputInfo;
   rowsAffected?: number | null;
   durationMs?: number;
   progressRows?: number;
@@ -64,7 +66,7 @@ export interface ConfirmState {
   onCancel?: () => void;
 }
 
-export type SidebarPanel = "connections" | "saved" | "notebooks" | "history";
+export type SidebarPanel = "connections" | "saved" | "notebooks" | "outputs" | "history";
 export type Theme = "dark" | "light";
 
 interface RunInput {
@@ -83,6 +85,11 @@ export interface SignInState {
 interface State {
   ready: boolean;
   folders: Record<FolderKind, Folder[]>;
+  /** All known outputs (newest first); refreshed on `outputs_changed`. */
+  outputs: OutputInfo[];
+  refreshOutputs: () => Promise<void>;
+  /** Patch an output in runs + list after rename/pin. */
+  applyOutput: (o: OutputInfo) => void;
   notebooks: NotebookSummary[];
   signIn: SignInState | null;
   settingsOpen: boolean;
@@ -129,7 +136,14 @@ interface State {
 
   runTab: (tabId: string, mode: "statement" | "all", input: RunInput) => Promise<void>;
   /** Run SQL under a run key (tab id or notebook cell key `nb:{id}:{cell}`). */
-  runSql: (runKey: string, connectionId: string, sql: string, base?: number, sessionKey?: string) => Promise<boolean>;
+  runSql: (
+    runKey: string,
+    connectionId: string,
+    sql: string,
+    base?: number,
+    sessionKey?: string,
+    outputName?: string | null,
+  ) => Promise<boolean>;
   refreshFolders: (kind?: FolderKind) => Promise<void>;
   refreshNotebooks: () => Promise<void>;
   openNotebook: (id: string, name: string) => void;
@@ -157,6 +171,8 @@ const TAB_SAVE_DELAY = 400;
  * without this buffer their `job_finished` would be dropped and the run would
  * look stuck. Replayed as soon as the run is registered.
  */
+let outputsTimer: ReturnType<typeof setTimeout> | undefined;
+
 const earlyEvents = new Map<string, { at: number; events: JobEvent[] }>();
 const EARLY_TTL_MS = 60_000;
 
@@ -185,6 +201,7 @@ function persistTabs(tabs: Tab[]) {
           connection_id: t.connection_id ?? null,
           saved_query_id: t.saved_query_id ?? null,
           notebook_id: t.notebook_id ?? null,
+          output_ref: t.output_ref ?? null,
         })),
       )
       .catch(() => {});
@@ -201,6 +218,25 @@ function nextTabTitle(tabs: Tab[]): string {
 export const useStore = create<State>((set, get) => ({
   ready: false,
   folders: { connections: [], queries: [], notebooks: [] },
+  outputs: [],
+  refreshOutputs: async () => {
+    if (!isTauri()) return;
+    try {
+      set({ outputs: await api.listOutputs() });
+    } catch {
+      /* backend restarting */
+    }
+  },
+  applyOutput: (o) =>
+    set((s) => {
+      const runs = { ...s.runs };
+      for (const [k, r] of Object.entries(runs)) {
+        if (r.statements.some((x) => x.output?.handle === o.handle)) {
+          runs[k] = { ...r, statements: r.statements.map((x) => (x.output?.handle === o.handle ? { ...x, output: o } : x)) };
+        }
+      }
+      return { runs, outputs: s.outputs.map((x) => (x.handle === o.handle ? o : x)) };
+    }),
   notebooks: [],
   signIn: null,
   settingsOpen: false,
@@ -279,6 +315,7 @@ export const useStore = create<State>((set, get) => ({
       });
       void get().refreshFolders();
       void get().refreshNotebooks();
+      void get().refreshOutputs();
     } catch (e) {
       set({ ready: true });
       get().toast(`Failed to start: ${toError(e).message}`, "error");
@@ -357,6 +394,7 @@ export const useStore = create<State>((set, get) => ({
           ? init.connection_id
           : (active?.connection_id ?? s.connections[0]?.id ?? null),
       saved_query_id: init?.saved_query_id ?? null,
+      output_ref: init?.output_ref ?? null,
     };
     const tabs = [...s.tabs, tab];
     set({ tabs, activeTabId: tab.id });
@@ -368,7 +406,7 @@ export const useStore = create<State>((set, get) => ({
     const s = get();
     const idx = s.tabs.findIndex((t) => t.id === id);
     if (idx === -1) return;
-    if (isTauri() && !s.tabs[idx].notebook_id) api.closeTab(id).catch(() => {});
+    if (isTauri() && !s.tabs[idx].notebook_id && !s.tabs[idx].output_ref) api.closeTab(id).catch(() => {});
     let tabs = s.tabs.filter((t) => t.id !== id);
     let activeTabId = s.activeTabId;
     if (tabs.length === 0) {
@@ -402,7 +440,7 @@ export const useStore = create<State>((set, get) => ({
   runTab: async (tabId, mode, input) => {
     const s = get();
     const tab = s.tabs.find((t) => t.id === tabId);
-    if (!tab || tab.notebook_id) return;
+    if (!tab || tab.notebook_id || tab.output_ref) return;
     if (!s.backendAvailable) {
       s.toast("Queries can only run inside the DataBrain desktop app", "error");
       return;
@@ -438,7 +476,7 @@ export const useStore = create<State>((set, get) => ({
     await get().runSql(tabId, conn.id, sql, base);
   },
 
-  runSql: async (runKey, connectionId, sql, base = 0, sessionKey) => {
+  runSql: async (runKey, connectionId, sql, base = 0, sessionKey, outputName) => {
     const conn = get().connections.find((c) => c.id === connectionId);
     const submit = async (confirmed: boolean): Promise<boolean> => {
       try {
@@ -450,6 +488,7 @@ export const useStore = create<State>((set, get) => ({
           row_limit: get().rowLimit > 0 ? get().rowLimit : null,
           confirmed,
           session_key: sessionKey ?? null,
+          output_name: outputName ?? null,
         });
         if (resp.status === "needs_confirmation") {
           return await new Promise<boolean>((resolve) =>
@@ -595,6 +634,11 @@ export const useStore = create<State>((set, get) => ({
     }),
 
   handleJobEvent: (e) => {
+    if (e.type === "outputs_changed") {
+      clearTimeout(outputsTimer);
+      outputsTimer = setTimeout(() => void get().refreshOutputs(), 120);
+      return;
+    }
     const cur = get().runs[e.tab_id];
     if (!cur || cur.jobId !== e.job_id) {
       // Either stale (older job) or early (response not received yet).
@@ -620,6 +664,7 @@ export const useStore = create<State>((set, get) => ({
           upd(e.index, {
             status: "done",
             result: e.result ?? undefined,
+            output: e.output ?? undefined,
             rowsAffected: e.rows_affected,
             durationMs: e.duration_ms,
             notices: e.notices,

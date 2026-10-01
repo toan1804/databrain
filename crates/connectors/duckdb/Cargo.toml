@@ -10,7 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-duckdb = { version = "1.10506", features = ["bundled", "parquet", "json"] }
+duckdb = { version = "1.10506", features = ["bundled", "parquet", "json", "appender-arrow"] }
 arrow58 = { package = "arrow", version = "58", default-features = false, features = ["ipc"] }
 databrain-connector-core = { version = "0.1.0", path = "../../connector-core" }
 databrain-auth = { version = "0.1.0", path = "../../auth" }

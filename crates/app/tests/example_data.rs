@@ -92,6 +92,7 @@ async fn query_view(st: &AppState, conn: &str, sql: &str, view: ViewSpec) -> (St
                 confirmed: true,
                 origin: Default::default(),
                 session_key: None,
+                output_name: None,
             },
             None,
         )
@@ -188,6 +189,7 @@ async fn sqlite_explorer_and_queries() {
         confirmed: true,
         origin: Default::default(),
         session_key: None,
+        output_name: None,
     });
     assert!(blocked.is_err(), "write on a read-only connection must be rejected");
 }
@@ -309,4 +311,110 @@ async fn export_sqlite_result_and_read_back_with_duckdb() {
         assert!((num(cell(&r, 0, 1)) - num(cell(&orig, 0, 1))).abs() < 0.005, "{ext}: {r:?} vs {orig:?}");
         assert_eq!((cell(&r, 0, 2), cell(&r, 0, 3)), ("1", "3000"));
     }
+}
+
+// ------------------------------------------------------------------ outputs (handles, results.*, diff, chart, pin)
+
+async fn run_named(st: &AppState, conn: &str, tab: &str, sql: &str, limit: Option<usize>, name: Option<&str>) -> Vec<databrain_query_engine::StatementOutcomeView> {
+    let out = st
+        .engine
+        .run_and_wait(
+            &st.hub,
+            RunRequest {
+                connection_id: conn.into(),
+                tab_id: tab.into(),
+                sql: sql.into(),
+                base_offset: 0,
+                row_limit: limit,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: name.map(str::to_string),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    if let Some(e) = out.iter().find_map(|o| o.error.as_ref()) {
+        panic!("query failed: {}\n{sql}", e.message);
+    }
+    out
+}
+
+#[tokio::test]
+async fn outputs_handles_cross_source_queries_diff_chart_and_pins() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Arc::new(Workspace::open(dir.path().join("ws.db")).unwrap());
+    let st = AppState::new(ws.clone(), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    st.set_snapshot_dir(dir.path().join("outputs"));
+    let (sq, dk) = (sqlite_conn(&st), duck_conn(&st));
+
+    // 1) SQLite output, named `revenue`.
+    run_named(&st, &sq, "t1", "SELECT c.country, round(sum(o.total_amount), 2) AS revenue FROM orders o JOIN customers c USING (customer_id) WHERE o.status <> 'cancelled' GROUP BY 1", None, Some("revenue")).await;
+    let rev = api::get_output(&st, "revenue").unwrap();
+    assert_eq!((rev.handle.as_str(), rev.rows, rev.connection_name.as_str()), ("r1", 7, "shop.db"));
+    assert!(rev.sql.contains("GROUP BY 1"));
+    // 2) DuckDB-over-files output in another tab: customers per country.
+    run_named(&st, &dk, "t2", "SELECT country, count(*) AS customers FROM files.customers GROUP BY 1", None, None).await;
+    let cust = api::get_output(&st, "r2").unwrap();
+    assert_eq!(cust.rows, 7);
+
+    // 3) Join both outputs in the Results connection (SQLite × CSV).
+    let res = api::results_connection(&st).unwrap();
+    assert_eq!(api::results_connection(&st).unwrap(), res, "created once");
+    let rows = query(&st, &res, "SELECT r.country, round(r.revenue / c.customers, 2) AS per_customer FROM results.revenue r JOIN results.r2 c USING (country) ORDER BY per_customer DESC").await;
+    assert_eq!(rows.len(), 7);
+    let vn = rows.iter().find(|r| r[0].as_deref() == Some("Vietnam")).unwrap();
+    assert!(num(vn[1].as_deref().unwrap()) > 0.0);
+
+    // 4) Re-run tab 1 with a filter → new version; old one is revenue__1.
+    run_named(&st, &sq, "t1", "SELECT c.country, round(sum(o.total_amount), 2) AS revenue FROM orders o JOIN customers c USING (customer_id) WHERE o.status = 'delivered' GROUP BY 1", None, Some("revenue")).await;
+    assert_eq!(api::get_output(&st, "revenue").unwrap().handle, "r4");
+    assert_eq!(api::get_output(&st, "revenue__1").unwrap().handle, "r1");
+    // r3 was the Results-connection join; handles count every output.
+    assert_eq!(api::get_output(&st, "r3").unwrap().connection_name, "Results (DuckDB)");
+
+    // 5) Diff the two versions by country: every country's revenue changed.
+    let diff = api::output_diff_sql(&st, "revenue__1", "revenue", vec!["country".into()]).unwrap();
+    let rows = query(&st, &res, &diff).await;
+    assert_eq!(rows.len(), 7, "{diff}");
+    assert!(rows.iter().all(|r| r[0].as_deref() == Some("changed")));
+    let keyless = api::output_diff_sql(&st, "revenue__1", "revenue", vec![]).unwrap();
+    assert_eq!(query(&st, &res, &keyless).await.len(), 14); // 7 removed + 7 added
+
+    // 6) Truncated outputs warn when queried.
+    run_named(&st, &sq, "t3", "SELECT * FROM orders", Some(100), Some("orders_sample")).await;
+    let o = api::get_output(&st, "orders_sample").unwrap();
+    assert!(o.truncated && o.rows == 100);
+    let out = run_named(&st, &res, "t4", "SELECT count(*) FROM results.orders_sample", None, None).await;
+    assert!(out[0].notices.iter().any(|n| n.contains("only the first 100 rows")), "{:?}", out[0].notices);
+
+    // 7) Chart data straight from an output.
+    let spec: databrain_result_store::ChartSpec = serde_json::from_value(serde_json::json!({"x": 0, "y": [1], "agg": "sum"})).unwrap();
+    let chart = api::chart_data(&st, rev.result_id.clone(), ViewSpec::default(), spec).await.unwrap();
+    assert_eq!(chart.x.len(), 7);
+    assert_eq!(chart.series[0].name, "revenue");
+
+    // 8) History links to the output.
+    let h = ws.list_history(&databrain_workspace::HistoryQuery::default()).unwrap();
+    assert!(h.iter().any(|e| e.output_handle.as_deref() == Some("r1")));
+
+    // 9) Pin, "restart", query again.
+    api::pin_output(&st, "r4".into(), true).await.unwrap();
+    assert!(api::rename_output(&st, "r2", Some("r9".into())).is_err(), "handle-like names are reserved");
+    drop(st);
+    let st2 = AppState::new(ws.clone(), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    st2.set_snapshot_dir(dir.path().join("outputs"));
+    let restored = api::get_output(&st2, "revenue").unwrap();
+    assert_eq!((restored.handle.as_str(), restored.pinned), ("r4", true));
+    assert!(api::get_output(&st2, "r2").is_err(), "unpinned outputs do not survive a restart");
+    let res2 = api::results_connection(&st2).unwrap();
+    assert_eq!(res2, res);
+    let rows = query(&st2, &res2, "SELECT count(*) FROM results.revenue").await;
+    assert_eq!(cell(&rows, 0, 0), "7");
+    // New outputs continue the numbering.
+    run_named(&st2, &sq, "t1", "SELECT 1", None, None).await;
+    let handles: Vec<u64> = api::list_outputs(&st2).iter().map(|o| o.handle[1..].parse().unwrap()).collect();
+    assert_eq!(handles.iter().filter(|h| **h == 4).count(), 1, "{handles:?}");
+    assert!(handles[0] > 8, "{handles:?}");
 }

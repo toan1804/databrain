@@ -8,6 +8,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub mod outputs;
+
+pub use outputs::{NewOutput, OutputInfo, OutputRegistry, OutputState, OutputTables};
+
 use databrain_auth::{
     AuthStatus, CredentialSource, ExposeSecret, InlineCredentialSource, Interaction, NonInteractive, SecretRef, SecretStore,
     credential_source,
@@ -125,6 +129,9 @@ pub enum JobEvent {
         tab_id: String,
         index: usize,
         result: Option<ResultInfo>,
+        /// Handle/name/provenance of the result (when there is one).
+        #[serde(default)]
+        output: Option<Box<OutputInfo>>,
         rows_affected: Option<u64>,
         duration_ms: u64,
         notices: Vec<String>,
@@ -145,6 +152,8 @@ pub enum JobEvent {
         status: RunStatus,
         duration_ms: u64,
     },
+    /// Outputs were added, renamed, pinned or evicted (job/tab ids empty).
+    OutputsChanged { job_id: String, tab_id: String },
 }
 
 pub trait EventSink: Send + Sync {
@@ -194,7 +203,8 @@ impl JobEvent {
             | JobEvent::Progress { job_id, .. }
             | JobEvent::StatementFinished { job_id, .. }
             | JobEvent::StatementFailed { job_id, .. }
-            | JobEvent::JobFinished { job_id, .. } => job_id,
+            | JobEvent::JobFinished { job_id, .. }
+            | JobEvent::OutputsChanged { job_id, .. } => job_id,
         }
     }
 }
@@ -234,6 +244,9 @@ pub struct RunRequest {
     /// and session settings). Defaults to `tab_id`.
     #[serde(default)]
     pub session_key: Option<String>,
+    /// Name the job's last result (`results.<name>` in DuckDB sessions).
+    #[serde(default)]
+    pub output_name: Option<String>,
 }
 
 impl RunRequest {
@@ -282,6 +295,9 @@ struct JobHandle {
 type SessionKey = (String, String); // (connection_id, tab_id)
 
 const META_TAB: &str = "__meta__";
+/// Connection option marking the "Results (DuckDB)" connection.
+pub const RESULTS_MARKER: &str = "databrain_results";
+
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 
 /// A live session plus the SSH tunnel it runs through (kept alive together).
@@ -303,8 +319,7 @@ pub struct QueryEngine {
     /// Serializes connection attempts per key so parallel calls share one session.
     connecting: Mutex<HashMap<SessionKey, Arc<tokio::sync::Mutex<()>>>>,
     jobs: Mutex<HashMap<String, JobHandle>>,
-    /// Result ids per tab, dropped when the tab runs again or closes.
-    tab_results: Mutex<HashMap<String, Vec<String>>>,
+    outputs: Arc<OutputRegistry>,
 }
 
 impl QueryEngine {
@@ -317,16 +332,16 @@ impl QueryEngine {
     ) -> Arc<Self> {
         Arc::new(Self {
             registry,
-            workspace,
+            workspace: workspace.clone(),
             secrets,
-            results,
             events,
             interaction: Mutex::new(Arc::new(NonInteractive)),
             creds: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             connecting: Mutex::new(HashMap::new()),
             jobs: Mutex::new(HashMap::new()),
-            tab_results: Mutex::new(HashMap::new()),
+            outputs: OutputRegistry::new(results.clone(), workspace.clone()),
+            results,
         })
     }
 
@@ -438,6 +453,47 @@ impl QueryEngine {
         Ok((rewritten, Some(Arc::new(t))))
     }
 
+    pub fn outputs(&self) -> &Arc<OutputRegistry> {
+        &self.outputs
+    }
+
+    /// For DuckDB sessions (`results.<name>`).
+    pub fn external_tables(&self) -> Arc<dyn databrain_connector_core::external::ExternalTables> {
+        Arc::new(OutputTables(self.outputs.clone()))
+    }
+
+    /// The local DuckDB connection used to query outputs together
+    /// (`results.<name>`), created on first use. Marked with the option
+    /// `databrain_results = 1`.
+    pub fn results_connection(&self) -> Result<ConnectionProfile> {
+        let existing = self
+            .workspace
+            .list_connections()?
+            .into_iter()
+            .find(|c| c.config.kind == databrain_connector_core::ConnectorKind::Duckdb && c.config.opt(RESULTS_MARKER) == Some("1"));
+        if let Some(c) = existing {
+            return Ok(c);
+        }
+        let mut config = ConnectionConfig::new(databrain_connector_core::ConnectorKind::Duckdb, databrain_auth::AuthMethod::None);
+        config.options.insert(RESULTS_MARKER.into(), "1".into());
+        Ok(self.workspace.save_connection(ConnectionProfile {
+            id: String::new(),
+            name: "Results (DuckDB)".into(),
+            config,
+            color: Some("#a78bfa".into()),
+            env: EnvTag::None,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        })?)
+    }
+
+    pub fn outputs_changed(&self) {
+        self.events.emit(JobEvent::OutputsChanged { job_id: String::new(), tab_id: String::new() });
+    }
+
     pub fn results(&self) -> &Arc<ResultStore> {
         &self.results
     }
@@ -546,11 +602,8 @@ impl QueryEngine {
             self.cancel(&id);
         }
         self.sessions.lock().retain(|(_, t), _| t != tab_id);
-        if let Some(ids) = self.tab_results.lock().remove(tab_id) {
-            for id in ids {
-                self.results.remove(&id);
-            }
-        }
+        self.outputs.close_tab(tab_id);
+        self.outputs_changed();
     }
 
     // -------------------------------------------------------------- metadata
@@ -689,6 +742,9 @@ impl QueryEngine {
                 });
             }
         }
+        if let Some(n) = req.output_name.as_deref().filter(|n| !n.is_empty()) {
+            outputs::validate_name(n)?;
+        }
         if self.jobs.lock().values().any(|j| j.tab_id == req.tab_id || j.session_key == req.session_key()) {
             return Err(EngineError::new(
                 "busy",
@@ -706,12 +762,8 @@ impl QueryEngine {
                 cancel: cancel.clone(),
             },
         );
-        // Previous results of this tab are replaced by this run.
-        if let Some(old) = self.tab_results.lock().remove(&req.tab_id) {
-            for id in old {
-                self.results.remove(&id);
-            }
-        }
+        // Previous outputs of this tab become "recent" (evictable).
+        self.outputs.begin_run(&req.tab_id);
 
         let engine = self.clone();
         let jid = job_id.clone();
@@ -808,6 +860,12 @@ impl QueryEngine {
         let job_start = Instant::now();
         let mut status = RunStatus::Success;
         let limit = req.row_limit.filter(|l| *l > 0);
+        let (conn_name, conn_kind) = self
+            .workspace
+            .get_connection(&req.connection_id)
+            .map(|p| (p.name, p.config.kind))
+            .unwrap_or_else(|_| (req.connection_id.clone(), databrain_connector_core::ConnectorKind::Sqlite));
+        let mut last_output: Option<String> = None;
 
         for stmt in &plan {
             if cancel.is_cancelled() {
@@ -827,6 +885,23 @@ impl QueryEngine {
                 .await;
             let duration_ms = t0.elapsed().as_millis() as u64;
 
+            let output = match &outcome {
+                Ok(StatementOutcome { result: Some(r), .. }) => Some(Box::new(self.outputs.add(NewOutput {
+                    result: r.clone(),
+                    connection_id: req.connection_id.clone(),
+                    connection_name: conn_name.clone(),
+                    kind: conn_kind,
+                    sql: stmt.sql.clone(),
+                    tab_id: req.tab_id.clone(),
+                    statement_index: stmt.index,
+                    row_limit: limit,
+                    origin: req.origin,
+                }))),
+                _ => None,
+            };
+            if let Some(o) = &output {
+                last_output = Some(o.handle.clone());
+            }
             let (hist_status, rows, error) = match &outcome {
                 Ok(o) => (
                     RunStatus::Success,
@@ -848,22 +923,18 @@ impl QueryEngine {
                 rows,
                 status: Some(hist_status),
                 error,
+                output_handle: output.as_ref().map(|o| o.handle.clone()),
+                result_id: output.as_ref().map(|o| o.result_id.clone()),
             });
 
             match outcome {
                 Ok(o) => {
-                    if let Some(r) = &o.result {
-                        self.tab_results
-                            .lock()
-                            .entry(req.tab_id.clone())
-                            .or_default()
-                            .push(r.id.clone());
-                    }
                     self.events.emit(JobEvent::StatementFinished {
                         job_id: job_id.clone(),
                         tab_id: req.tab_id.clone(),
                         index: stmt.index,
                         result: o.result,
+                        output,
                         rows_affected: o.rows_affected,
                         duration_ms,
                         notices: o.notices,
@@ -891,7 +962,11 @@ impl QueryEngine {
             }
         }
 
+        if let (Some(name), Some(h)) = (req.output_name.as_deref().filter(|n| !n.is_empty()), &last_output) {
+            let _ = self.outputs.set_name(h, Some(name));
+        }
         self.jobs.lock().remove(&job_id);
+        self.outputs_changed();
         self.events.emit(JobEvent::JobFinished {
             job_id,
             tab_id: req.tab_id,
@@ -1094,6 +1169,7 @@ mod tests {
             confirmed: false,
             origin: Origin::User,
             session_key: None,
+            output_name: None,
         }
     }
 
@@ -1109,7 +1185,8 @@ mod tests {
                             | JobEvent::Progress { job_id: j, .. }
                             | JobEvent::StatementFinished { job_id: j, .. }
                             | JobEvent::StatementFailed { job_id: j, .. }
-                            | JobEvent::JobFinished { job_id: j, .. } => j == job_id,
+                            | JobEvent::JobFinished { job_id: j, .. }
+                            | JobEvent::OutputsChanged { job_id: j, .. } => j == job_id,
                         })
                         .collect();
                 }
@@ -1298,9 +1375,10 @@ mod tests {
         let d = f.engine.describe(&f.conn_id, "main", "users").await.unwrap();
         assert!(d.columns[0].is_primary_key);
         assert!(f.engine.connected_ids().contains(&f.conn_id));
-        let before = f.engine.tab_results.lock().get("tab1").cloned().unwrap();
+        let before = f.engine.outputs().for_tab("tab1");
+        assert_eq!(before[0].sql, "select * from users");
         f.engine.close_tab("tab1");
-        assert!(f.engine.results().get(&before[0]).is_err());
+        assert!(f.engine.results().get(&before[0].result_id).is_err());
         f.engine.disconnect(&f.conn_id);
         assert!(f.engine.connected_ids().is_empty());
     }

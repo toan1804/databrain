@@ -31,6 +31,7 @@ uuid = { version = "1.26.1", features = ["v4"] }
 
 [dev-dependencies]
 async-trait = "0.1.92"
+databrain-connector-duckdb = { path = "../connectors/duckdb" }
 databrain-connector-sqlite = { path = "../connectors/sqlite" }
 parking_lot = "0.12.5"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

@@ -655,6 +655,13 @@ Phases 0–2 are built, plus most of phases 3–7: AI mode, knowledge, agent wit
   - Kiro runs with a managed agent (`databrain-sql`) whose tools are limited to `@databrain`. DataBrain refuses Kiro's other permission requests and all fs/terminal requests. The usual DataBrain approvals still apply.
   - Auth is either the `kiro-cli login` browser session (run in a terminal window, then detected with `whoami`), or a `ksk_` API key from the keychain passed to the child as `KIRO_API_KEY`.
   - The Kiro session id is stored per conversation and resumed with `session/load`.
+- **Outputs** (`query-engine::outputs`):
+  - Every result set is registered with a handle `rN` (the number persists), an optional name with up to 5 versions (`name`, `name__1`…), provenance (SQL, connection, row limit, truncated) and state (`live` / `on_disk` / `evicted`).
+  - A tab's latest outputs are never evicted. Older unpinned outputs are freed least-recently-used first when they pass a 1 GB budget.
+  - Pinning writes a Parquet snapshot (Arrow schema and metadata preserved) under `<appdata>/outputs/` and records it in the v4 `outputs` table. Snapshots are loaded lazily after a restart.
+  - DuckDB sessions see outputs as tables in an attached in-memory `results` catalog, loaded on reference and reloaded when a name points at new data. Exact decimals that the grid keeps as text are cast to `DECIMAL`.
+  - The "Results (DuckDB)" connection is created on first use. Diffs are generated DuckDB SQL (`ANTI JOIN` / `IS DISTINCT FROM`, or `EXCEPT ALL` without keys). Charts aggregate in Rust (`result-store::chart`).
+  - The AI tools `list_outputs` and `query_outputs` accept handles. Access to an output follows its source connection's policy (AI on/off, MCP sharing, result rows). @mentions grant per-conversation access.
 - **Runtime caveats:**
   - Oracle needs Oracle Instant Client installed.
   - Browser OAuth for BigQuery, Snowflake and Entra ID needs your own OAuth client ID. Databricks uses the `databricks-cli` public client.

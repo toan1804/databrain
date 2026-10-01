@@ -24,6 +24,9 @@ import type {
   Notebook,
   NotebookSummary,
   ProviderView,
+  ChartData,
+  ChartSpec,
+  OutputInfo,
   ColumnStats,
   ConnectionConfig,
   ConnectionProfile,
@@ -142,6 +145,15 @@ export const api = {
   saveNotebook: (notebook: Notebook) => call<Notebook>("save_notebook", { notebook }),
   deleteNotebook: (id: string) => call<void>("delete_notebook", { id }),
   fileScanSql: (path: string) => call<string>("file_scan_sql", { path }),
+
+  listOutputs: () => call<OutputInfo[]>("list_outputs"),
+  getOutput: (reference: string) => call<OutputInfo>("get_output", { reference }),
+  loadOutput: (reference: string) => call<OutputInfo>("load_output", { reference }),
+  renameOutput: (handle: string, name: string | null) => call<OutputInfo>("rename_output", { handle, name }),
+  pinOutput: (handle: string, pinned: boolean) => call<OutputInfo>("pin_output", { handle, pinned }),
+  outputDiffSql: (before: string, after: string, keys: string[]) => call<string>("output_diff_sql", { before, after, keys }),
+  resultsConnection: () => call<string>("results_connection"),
+  chartData: (resultId: string, view: ViewSpec, spec: ChartSpec) => call<ChartData>("chart_data", { resultId, view, spec }),
 
   aiListProviders: () => call<ProviderView[]>("ai_list_providers"),
   aiSaveProvider: (record: AiProviderRecord, apiKey?: string | null) =>

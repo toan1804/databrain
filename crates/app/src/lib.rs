@@ -91,6 +91,45 @@ async fn move_to_folder(state: State<'_, AppState>, kind: FolderKind, item_id: S
     api::move_to_folder(&state, kind, &item_id, folder_id)
 }
 
+// ---- outputs
+#[tauri::command]
+async fn list_outputs(state: State<'_, AppState>) -> R<Vec<api::OutputInfo>> {
+    Ok(api::list_outputs(&state))
+}
+#[tauri::command]
+async fn get_output(state: State<'_, AppState>, reference: String) -> R<api::OutputInfo> {
+    api::get_output(&state, &reference)
+}
+#[tauri::command]
+async fn load_output(state: State<'_, AppState>, reference: String) -> R<api::OutputInfo> {
+    api::load_output(&state, reference).await
+}
+#[tauri::command]
+async fn rename_output(state: State<'_, AppState>, handle: String, name: Option<String>) -> R<api::OutputInfo> {
+    api::rename_output(&state, &handle, name)
+}
+#[tauri::command]
+async fn pin_output(state: State<'_, AppState>, handle: String, pinned: bool) -> R<api::OutputInfo> {
+    api::pin_output(&state, handle, pinned).await
+}
+#[tauri::command]
+async fn output_diff_sql(state: State<'_, AppState>, before: String, after: String, keys: Vec<String>) -> R<String> {
+    api::output_diff_sql(&state, &before, &after, keys)
+}
+#[tauri::command]
+async fn results_connection(state: State<'_, AppState>) -> R<String> {
+    api::results_connection(&state)
+}
+#[tauri::command]
+async fn chart_data(
+    state: State<'_, AppState>,
+    result_id: String,
+    view: ViewSpec,
+    spec: databrain_result_store::ChartSpec,
+) -> R<databrain_result_store::ChartData> {
+    api::chart_data(&state, result_id, view, spec).await
+}
+
 // ---- notebooks
 #[tauri::command]
 async fn list_notebooks(state: State<'_, AppState>) -> R<Vec<databrain_workspace::NotebookSummary>> {
@@ -456,7 +495,9 @@ pub fn run() {
             let workspace = Arc::new(Workspace::open(dir.join("workspace.db"))?);
             let sink = Arc::new(TauriSink(app.handle().clone()));
             let ui = Arc::new(TauriUi(app.handle().clone()));
-            app.manage(AppState::new(workspace, Arc::new(KeychainStore), sink, ui));
+            let state = AppState::new(workspace, Arc::new(KeychainStore), sink, ui);
+            state.set_snapshot_dir(dir.join("outputs"));
+            app.manage(state);
             #[cfg(target_os = "macos")]
             app.set_menu(macos_menu(app.handle())?)?;
             Ok(())
@@ -496,6 +537,14 @@ pub fn run() {
             get_settings,
             set_setting,
             move_to_folder,
+            list_outputs,
+            get_output,
+            load_output,
+            rename_output,
+            pin_output,
+            output_diff_sql,
+            results_connection,
+            chart_data,
             list_notebooks,
             get_notebook,
             save_notebook,

@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 databrain-auth = { version = "0.1.0", path = "../auth" }
 databrain-connector-core = { version = "0.1.0", path = "../connector-core" }
+databrain-export = { version = "0.1.0", path = "../export" }
 databrain-result-store = { version = "0.1.0", path = "../result-store" }
 databrain-ssh-tunnel = { version = "0.1.0", path = "../ssh-tunnel" }
 databrain-workspace = { version = "0.1.0", path = "../workspace" }
@@ -25,4 +26,5 @@ uuid = { version = "1.26.1", features = ["v4"] }
 
 [dev-dependencies]
 databrain-connector-sqlite = { path = "../connectors/sqlite" }
+tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }

@@ -32,6 +32,7 @@ import { useStore } from "../store";
 import { connectionForKey, useAi, type ChatItem } from "../aiStore";
 import { editorBridge } from "../editorBridge";
 import { Markdown } from "./Markdown";
+import { extractMentions, mentionToken } from "../outputs";
 import { ResultGrid } from "./ResultGrid";
 import { ConnDot } from "./ui";
 
@@ -105,6 +106,8 @@ function Chat() {
   const [text, setText] = useState("");
   const [mode, setMode] = useState<AiMode>("chat");
   const [models, setModels] = useState<string[]>([]);
+  const outputs = useStore((s) => s.outputs);
+  const [mention, setMention] = useState<{ start: number; query: string; index: number } | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
 
@@ -118,8 +121,8 @@ function Chat() {
 
   useEffect(() => {
     const onPrefill = (e: Event) => {
-      const d = (e as CustomEvent<{ text: string; mode: AiMode }>).detail;
-      setText(d.text);
+      const d = (e as CustomEvent<{ text: string; mode: AiMode; append?: boolean }>).detail;
+      setText((t) => (d.append && t.trim() ? `${t.replace(/\s*$/, " ")}${d.text}` : d.text));
       setMode(d.mode);
       setTimeout(() => input.current?.focus(), 0);
     };
@@ -140,9 +143,40 @@ function Chat() {
     };
   }, [providerId]);
 
+  const suggestions = useMemo(() => {
+    if (!mention) return [];
+    const q = mention.query.toLowerCase();
+    return outputs
+      .filter((o) => o.state !== "evicted")
+      .filter((o) => !q || o.handle.startsWith(q) || (o.name ?? "").toLowerCase().includes(q) || o.connection_name.toLowerCase().includes(q))
+      .slice(0, 8);
+  }, [mention, outputs]);
+
+  const updateMention = (value: string, caret: number) => {
+    const before = value.slice(0, caret);
+    const m = before.match(/(^|[\s(,])@([A-Za-z_]\w*)?$/);
+    setMention(m ? { start: caret - (m[2]?.length ?? 0) - 1, query: m[2] ?? "", index: 0 } : null);
+  };
+
+  const pickMention = (o: (typeof outputs)[number]) => {
+    if (!mention) return;
+    const el = input.current;
+    const caret = el?.selectionStart ?? text.length;
+    const token = `${mentionToken(o)} `;
+    const next = text.slice(0, mention.start) + token + text.slice(caret);
+    setText(next);
+    setMention(null);
+    setTimeout(() => {
+      el?.focus();
+      const pos = mention.start + token.length;
+      el?.setSelectionRange(pos, pos);
+    }, 0);
+  };
+
   const submit = (msg = text, m = mode) => {
     if (!msg.trim() || running) return;
-    void send({ message: msg.trim(), mode: m, connectionId: connId });
+    const mentions = extractMentions(msg, outputs);
+    void send({ message: msg.trim(), mode: m, connectionId: connId, context: mentions.length ? { mentions } : undefined });
     setText("");
     setMode("chat");
   };
@@ -208,16 +242,60 @@ function Chat() {
             </button>
           </div>
         )}
-        <div className="rounded-lg border border-line bg-panel-2 focus-within:border-accent">
+        <div className="relative rounded-lg border border-line bg-panel-2 focus-within:border-accent">
+          {mention && suggestions.length > 0 && (
+            <div className="absolute bottom-full left-0 z-20 mb-1 w-full overflow-hidden rounded-lg border border-line bg-panel shadow-xl" role="listbox" aria-label="Outputs">
+              <div className="px-2 py-1 text-[10.5px] uppercase tracking-wide text-muted">Mention an output</div>
+              {suggestions.map((o, i) => (
+                <button
+                  key={o.handle}
+                  role="option"
+                  aria-selected={i === mention.index}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    pickMention(o);
+                  }}
+                  className={`flex w-full items-center gap-2 px-2 py-1 text-left text-[12px] ${i === mention.index ? "bg-hover" : ""}`}
+                >
+                  <span className="font-mono">@{o.name ?? o.handle}</span>
+                  {o.name && <span className="font-mono text-[10.5px] text-muted">{o.handle}</span>}
+                  <span className="ml-auto truncate text-[10.5px] text-muted">
+                    {o.connection_name} · {o.rows.toLocaleString()} rows
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
           <textarea
             ref={input}
             rows={3}
             value={text}
             aria-label="Message the assistant"
-            placeholder={conn ? `Ask about ${conn.name}…  (↵ send, ⇧↵ newline)` : "Choose a connection in the editor first"}
+            placeholder={conn ? `Ask about ${conn.name}… @ to mention an output  (↵ send, ⇧↵ newline)` : "Choose a connection in the editor first"}
             className="block w-full resize-none bg-transparent px-2.5 py-2 text-[13px] outline-none"
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => {
+              setText(e.target.value);
+              updateMention(e.target.value, e.target.selectionStart ?? e.target.value.length);
+            }}
+            onBlur={() => setTimeout(() => setMention(null), 100)}
             onKeyDown={(e) => {
+              if (mention && suggestions.length > 0) {
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  const d = e.key === "ArrowDown" ? 1 : -1;
+                  setMention({ ...mention, index: (mention.index + d + suggestions.length) % suggestions.length });
+                  return;
+                }
+                if (e.key === "Enter" || e.key === "Tab") {
+                  e.preventDefault();
+                  pickMention(suggestions[mention.index]);
+                  return;
+                }
+                if (e.key === "Escape") {
+                  setMention(null);
+                  return;
+                }
+              }
               if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 submit();
@@ -311,7 +389,17 @@ function ChatItemView({ item }: { item: ChatItem }) {
   switch (item.kind) {
     case "user":
       return (
-        <div className="ml-6 rounded-lg bg-accent/12 px-3 py-2 text-[13px] whitespace-pre-wrap select-text">{item.text}</div>
+        <div className="ml-6 rounded-lg bg-accent/12 px-3 py-2 text-[13px] whitespace-pre-wrap select-text">
+          {item.text.split(/((?:^|(?<=[\s(,]))@[A-Za-z_]\w*)/).map((part, i) =>
+            part.startsWith("@") ? (
+              <span key={i} className="rounded bg-accent/20 px-0.5 font-mono text-[12px] text-accent">
+                {part}
+              </span>
+            ) : (
+              part
+            ),
+          )}
+        </div>
       );
     case "assistant":
       return (
@@ -348,6 +436,8 @@ const TOOL_LABELS: Record<string, string> = {
   save_query: "Saved query",
   get_editor: "Read editor",
   write_editor: "Proposed editor change",
+  list_outputs: "Listed outputs",
+  query_outputs: "Queried outputs (DuckDB)",
 };
 
 function ToolCard({ item }: { item: Extract<ChatItem, { kind: "tool" }> }) {

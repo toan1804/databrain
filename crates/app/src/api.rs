@@ -40,6 +40,13 @@ pub struct AppState {
 }
 
 pub fn default_registry() -> ConnectorRegistry {
+    registry_with_outputs(None)
+}
+
+/// Registry whose DuckDB connector can query outputs (`results.<name>`).
+pub fn registry_with_outputs(
+    #[allow(unused_variables)] outputs: Option<Arc<databrain_connector_core::external::ExternalTablesSlot>>,
+) -> ConnectorRegistry {
     #[allow(unused_mut)]
     let mut r = ConnectorRegistry::new();
     #[cfg(feature = "sqlite")]
@@ -59,7 +66,10 @@ pub fn default_registry() -> ConnectorRegistry {
     #[cfg(feature = "bigquery")]
     r.register(Arc::new(databrain_connector_cloud::BigQueryConnector::new()));
     #[cfg(feature = "duckdb")]
-    r.register(Arc::new(databrain_connector_duckdb::DuckdbConnector::new()));
+    r.register(Arc::new(match outputs {
+        Some(slot) => databrain_connector_duckdb::DuckdbConnector::with_outputs(slot),
+        None => databrain_connector_duckdb::DuckdbConnector::new(),
+    }));
     r
 }
 
@@ -71,13 +81,15 @@ impl AppState {
         ui: Arc<dyn crate::ai_api::UiBridge>,
     ) -> Self {
         let hub = EventHub::new(events);
+        let slot = databrain_connector_core::external::ExternalTablesSlot::new();
         let engine = QueryEngine::new(
-            default_registry(),
+            registry_with_outputs(Some(slot.clone())),
             workspace.clone(),
             secrets.clone(),
             Arc::new(ResultStore::new()),
             hub.clone(),
         );
+        slot.set(engine.external_tables());
         let ai = crate::ai_api::AiState::default();
         engine.set_interaction(Arc::new(crate::ai_api::AppInteraction::new(ui.clone(), ai.sign_in_cancel.clone())));
         Self {
@@ -92,6 +104,11 @@ impl AppState {
 
     fn results(&self) -> &Arc<ResultStore> {
         self.engine.results()
+    }
+
+    /// Save pinned outputs under `dir` and restore the ones saved earlier.
+    pub fn set_snapshot_dir(&self, dir: PathBuf) {
+        self.engine.outputs().set_snapshot_dir(dir);
     }
 }
 
@@ -500,6 +517,63 @@ pub fn clear_history(state: &AppState) -> Result<()> {
     Ok(state.workspace.clear_history()?)
 }
 
+// ------------------------------------------------------------ outputs
+
+pub use databrain_query_engine::OutputInfo;
+
+pub fn list_outputs(state: &AppState) -> Vec<OutputInfo> {
+    state.engine.outputs().list()
+}
+
+/// Resolve `r12`, a name, `name__1`, `results.x` or a result id.
+pub fn get_output(state: &AppState, reference: &str) -> Result<OutputInfo> {
+    state.engine.outputs().resolve(reference).ok_or_else(|| EngineError::new("not_found", format!("output {reference} not found")))
+}
+
+/// Make sure the data is in memory (loads pinned snapshots) and return it.
+pub async fn load_output(state: &AppState, reference: String) -> Result<OutputInfo> {
+    let reg = state.engine.outputs().clone();
+    let o = blocking(move || reg.ensure_loaded(&reference)).await?;
+    state.engine.outputs_changed();
+    Ok(o)
+}
+
+pub fn rename_output(state: &AppState, handle: &str, name: Option<String>) -> Result<OutputInfo> {
+    let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    let o = state.engine.outputs().set_name(handle, name.as_deref())?;
+    state.engine.outputs_changed();
+    Ok(o)
+}
+
+pub async fn pin_output(state: &AppState, handle: String, pinned: bool) -> Result<OutputInfo> {
+    let reg = state.engine.outputs().clone();
+    let o = blocking(move || reg.set_pinned(&handle, pinned)).await?;
+    state.engine.outputs_changed();
+    Ok(o)
+}
+
+/// DuckDB SQL comparing two outputs (rows added / removed / changed).
+pub fn output_diff_sql(state: &AppState, before: &str, after: &str, keys: Vec<String>) -> Result<String> {
+    let b = get_output(state, before)?;
+    let a = get_output(state, after)?;
+    databrain_query_engine::outputs::diff_sql(&b, &a, &keys)
+}
+
+/// Id of the local DuckDB connection for `results.*` queries.
+pub fn results_connection(state: &AppState) -> Result<String> {
+    Ok(state.engine.results_connection()?.id)
+}
+
+pub async fn chart_data(
+    state: &AppState,
+    result_id: String,
+    view: ViewSpec,
+    spec: databrain_result_store::ChartSpec,
+) -> Result<databrain_result_store::ChartData> {
+    let rs = state.results().get(&result_id)?;
+    blocking(move || Ok(rs.lock().chart(&view, &spec)?)).await
+}
+
 pub fn list_notebooks(state: &AppState) -> Result<Vec<databrain_workspace::NotebookSummary>> {
     Ok(state.workspace.list_notebooks()?)
 }
@@ -666,6 +740,7 @@ mod tests {
                 confirmed: false,
                 origin: Default::default(),
                 session_key: None,
+                output_name: None,
             },
         )
         .unwrap();

@@ -18,6 +18,7 @@ import {
   Sparkles,
   History,
   KeyRound,
+  Layers,
   Loader2,
   MoreHorizontal,
   Pencil,
@@ -37,6 +38,8 @@ import { formatCount, formatDuration, relativeTime, selectTopSql, sqlPreview, qu
 import { useAi } from "../aiStore";
 import { DEFAULT_POLICY } from "./ConnectionDialog";
 import { FolderTree, createFolder, dragProps } from "./FolderTree";
+import { OutputsPanel } from "./OutputsPanel";
+import { openOutput } from "../outputs";
 import { useStore, type SidebarPanel } from "../store";
 import { editorBridge } from "../editorBridge";
 import { ConnDot, EnvBadge, MenuItem, Popover } from "./ui";
@@ -50,6 +53,7 @@ export function Sidebar() {
         {panel === "connections" && <ConnectionsPanel />}
         {panel === "saved" && <SavedPanel />}
         {panel === "notebooks" && <NotebooksPanel />}
+        {panel === "outputs" && <OutputsPanel />}
         {panel === "history" && <HistoryPanel />}
       </div>
     </div>
@@ -81,6 +85,7 @@ function ActivityRail() {
       {item("connections", <Database size={18} />, "Connections")}
       {item("saved", <Bookmark size={18} />, "Saved queries")}
       {item("notebooks", <NotebookPen size={18} />, "Notebooks")}
+      {item("outputs", <Layers size={18} />, "Outputs")}
       {item("history", <History size={18} />, "History")}
       <div className="flex-1" />
       <button
@@ -777,6 +782,25 @@ function NotebooksPanel() {
 
 // ------------------------------------------------------------------ history
 
+/** Output produced by a history entry: opens it if it is still available. */
+function HistoryOutput({ handle }: { handle: string }) {
+  const o = useStore((s) => s.outputs.find((x) => x.handle === handle));
+  const available = !!o && o.state !== "evicted";
+  return (
+    <button
+      className={`ml-auto shrink-0 rounded border px-1 font-mono text-[10px] ${available ? "border-accent/40 text-accent hover:bg-accent/10" : "border-line text-muted"}`}
+      title={available ? `Open output ${handle} (no re-run)` : `Output ${handle} is no longer in memory`}
+      disabled={!available}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (o) void openOutput(o);
+      }}
+    >
+      {o?.name ?? handle}
+    </button>
+  );
+}
+
 function HistoryPanel() {
   const version = useStore((s) => s.historyVersion);
   const newTab = useStore((s) => s.newTab);
@@ -858,6 +882,7 @@ function HistoryPanel() {
                   {h.connection_name}
                 </span>
               )}
+              {h.output_handle && <HistoryOutput handle={h.output_handle} />}
             </div>
           </div>
         ))}

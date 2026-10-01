@@ -1683,6 +1683,7 @@ dependencies = [
  "bytes",
  "databrain-auth",
  "databrain-connector-core",
+ "databrain-connector-duckdb",
  "databrain-connector-sqlite",
  "databrain-query-engine",
  "databrain-result-store",
@@ -1783,6 +1784,7 @@ dependencies = [
  "async-trait",
  "databrain-auth",
  "futures",
+ "parking_lot",
  "serde",
  "serde_json",
  "sqlparser",
@@ -1896,6 +1898,7 @@ dependencies = [
  "databrain-auth",
  "databrain-connector-core",
  "databrain-connector-sqlite",
+ "databrain-export",
  "databrain-result-store",
  "databrain-ssh-tunnel",
  "databrain-workspace",
@@ -1903,6 +1906,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "uuid",
@@ -2223,6 +2227,7 @@ dependencies = [
  "fallible-streaming-iterator",
  "hashlink 0.10.0",
  "libduckdb-sys",
+ "num",
  "num-integer",
  "strum",
 ]
@@ -4227,6 +4232,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "num"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
+dependencies = [
+ "num-bigint 0.4.8",
+ "num-complex",
+ "num-integer",
+ "num-iter",
+ "num-rational",
+ "num-traits",
+]
+
+[[package]]
 name = "num-bigint"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4292,6 +4311,17 @@ version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c92800bd69a1eac91786bcfe9da64a897eb72911b8dc3095decbd07429e8048b"
 dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-rational"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
+dependencies = [
+ "num-bigint 0.4.8",
  "num-integer",
  "num-traits",
 ]

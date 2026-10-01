@@ -40,6 +40,9 @@ import { errorField, highlight, langExtension, setError, useCompletionSchema } f
 import { ResultsPanel } from "./ResultsPanel";
 import { Markdown } from "./Markdown";
 import { ConnDot, EnvBadge } from "./ui";
+import { OutputChip } from "./OutputChip";
+import { resultsConnection } from "../outputs";
+import { cellDeps, referencedOutputs, type CellDeps } from "../lib/dataflow";
 
 const SAVE_DELAY = 700;
 
@@ -58,6 +61,8 @@ function waitForRun(key: string): Promise<void> {
     });
   });
 }
+
+
 
 export function NotebookView({ tabId, notebookId, visible }: { tabId: string; notebookId: string; visible: boolean }) {
   const [nb, setNb] = useState<NotebookT | null>(null);
@@ -163,6 +168,21 @@ export function NotebookView({ tabId, notebookId, visible }: { tabId: string; no
 
   const connId = nb?.connection_id ?? null;
   const conn = connections.find((c) => c.id === connId);
+  const outputNames = useStore((s) => s.outputs.filter((o) => o.state !== "evicted").map((o) => o.name ?? o.handle).join("\u0000"));
+  const deps = useMemo(() => (nb ? cellDeps(nb.cells, outputNames ? outputNames.split("\u0000") : []) : {}), [nb, outputNames]);
+  const runDependents = async (id: string) => {
+    const order = latest.current?.cells ?? [];
+    const seen = new Set<string>();
+    const walk = (x: string) => {
+      for (const d of deps[x]?.dependents ?? []) if (!seen.has(d)) (seen.add(d), walk(d));
+    };
+    walk(id);
+    for (const c of order) {
+      if (!seen.has(c.id)) continue;
+      const ok = await runCell(c);
+      if (!ok || useStore.getState().runs[cellKey(notebookId, c.id)]?.finishedStatus !== "success") break;
+    }
+  };
 
   const cellConn = (c: NotebookCell) => c.connection_id ?? connId;
 
@@ -176,7 +196,20 @@ export function NotebookView({ tabId, notebookId, visible }: { tabId: string; no
       }
       const sql = sqlOverride ?? editorBridge.get(cellKey(notebookId, c.id))?.state.doc.toString() ?? c.source;
       if (!sql.trim()) return true;
-      const ok = await useStore.getState().runSql(cellKey(notebookId, c.id), cid, sql, 0, `nb:${notebookId}`);
+      // Cells that read results.<name> run on the local Results connection
+      // unless their connection is DuckDB already.
+      let target = cid;
+      const kind = useStore.getState().connections.find((x) => x.id === cid)?.config.kind;
+      if (referencedOutputs(sql).length > 0 && kind !== "duckdb") {
+        try {
+          target = await resultsConnection();
+        } catch (e) {
+          toast(toError(e).message, "error");
+          return false;
+        }
+      }
+      const name = c.output_name?.trim() || null;
+      const ok = await useStore.getState().runSql(cellKey(notebookId, c.id), target, sql, 0, `nb:${notebookId}`, name);
       if (ok) await waitForRun(cellKey(notebookId, c.id));
       return ok;
     },
@@ -335,6 +368,9 @@ export function NotebookView({ tabId, notebookId, visible }: { tabId: string; no
               onDelete={() => removeCell(c.id)}
               onMove={(d) => moveCell(c.id, d)}
               onAddBelow={(k) => addCell(k, c.id)}
+              deps={deps[c.id]}
+              cellIndexOf={(id) => nb.cells.findIndex((x) => x.id === id) + 1}
+              onRunDependents={() => void runDependents(c.id)}
             />
           ))}
           <div className="flex justify-center gap-2 pt-1 pb-10">
@@ -369,6 +405,9 @@ interface CellProps {
   onDelete: () => void;
   onMove: (d: -1 | 1) => void;
   onAddBelow: (k: CellKind) => void;
+  deps?: CellDeps;
+  cellIndexOf: (id: string) => number;
+  onRunDependents: () => void;
 }
 
 function Cell(props: CellProps) {
@@ -382,6 +421,9 @@ function Cell(props: CellProps) {
   useEffect(() => registerKeyConnection(key, props.connectionId), [key, props.connectionId]);
 
   const status = run?.running ? "running" : run?.finishedStatus;
+  const deps = props.deps;
+  const lastOutput = run?.statements.slice().reverse().find((x) => x.output)?.output;
+  const viaResults = cell.kind === "sql" && (deps?.reads.length ?? 0) > 0 && conn?.config.kind !== "duckdb";
   return (
     <div
       className={`group relative rounded-xl border bg-panel transition-colors ${focused ? "border-accent/60 shadow-[0_0_0_1px_color-mix(in_srgb,var(--accent)_25%,transparent)]" : "border-line"}`}
@@ -404,6 +446,38 @@ function Cell(props: CellProps) {
           </span>
         )}
         <CellStatus cell={cell} status={status} />
+        {cell.kind === "sql" && (
+          <OutputNameField value={cell.output_name ?? ""} onChange={(v) => onChange({ output_name: v || null })} />
+        )}
+        {lastOutput && <OutputChip output={lastOutput} compact />}
+        {deps?.stale && (
+          <button
+            className="flex items-center gap-1 rounded bg-warning/15 px-1.5 py-0.5 text-[10.5px] text-warning"
+            title={`Inputs changed since this cell ran (cells ${deps.producers.map(props.cellIndexOf).join(", ")}). Click to re-run.`}
+            onClick={props.onRun}
+          >
+            stale — run
+          </button>
+        )}
+        {deps && deps.missing.length > 0 && (
+          <span className="rounded bg-danger/12 px-1.5 py-0.5 text-[10.5px] text-danger" title="No earlier cell names this output and no such output exists">
+            missing: {deps.missing.map((m) => `results.${m}`).join(", ")}
+          </span>
+        )}
+        {viaResults && (
+          <span className="rounded bg-panel-2 px-1.5 py-0.5 text-[10.5px] text-muted" title="This cell reads outputs, so it runs locally on the Results (DuckDB) connection">
+            runs on Results
+          </span>
+        )}
+        {deps && deps.dependents.length > 0 && status !== "running" && (
+          <button
+            className="rounded px-1.5 py-0.5 text-[10.5px] text-muted hover:bg-hover hover:text-fg"
+            title={`Cells ${deps.dependents.map(props.cellIndexOf).join(", ")} read this cell's output`}
+            onClick={props.onRunDependents}
+          >
+            → {deps.dependents.length} dependent{deps.dependents.length === 1 ? "" : "s"} · run
+          </button>
+        )}
         <div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
           {cell.kind === "sql" && (
             <select
@@ -516,6 +590,26 @@ function CellStatus({ cell, status }: { cell: NotebookCell; status?: string }) {
       {lr.rows !== null && lr.rows !== undefined ? `${formatCount(lr.rows)} rows · ` : ""}
       {formatDuration(lr.duration_ms)}
     </span>
+  );
+}
+
+function OutputNameField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => setDraft(value), [value]);
+  const valid = !draft || (/^[A-Za-z_][A-Za-z0-9_]*$/.test(draft) && !draft.includes("__") && !/^r\d+$/i.test(draft));
+  return (
+    <label className="flex items-center gap-1 text-[10.5px] text-muted" title="Name this cell's output; later cells can query results.<name>">
+      →
+      <input
+        className={`h-5 w-24 rounded border bg-transparent px-1 font-mono text-[11px] text-fg outline-none focus:bg-panel-2 ${valid ? "border-transparent hover:border-line focus:border-accent" : "border-danger"}`}
+        placeholder="name output"
+        aria-label="Output name"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => (valid ? onChange(draft.trim()) : setDraft(value))}
+        onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
+      />
+    </label>
   );
 }
 
