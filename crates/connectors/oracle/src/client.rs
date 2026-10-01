@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
@@ -222,35 +223,127 @@ fn run(cmd: &mut Command, what: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Download and install the latest Basic package. `dest` is where the ZIP
-/// is extracted on Windows/Linux (macOS installs to ~/Downloads, Oracle's
-/// default for the notarized DMG). Returns the library directory.
-pub fn install(dest: &Path) -> Result<PathBuf, String> {
+/// Install progress reported to the UI.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum InstallProgress {
+    Downloading { received: u64, total: Option<u64> },
+    Installing,
+    Verifying,
+}
+
+/// `instantclient_23_3` from BASIC_README ("Client Shared Library 64-bit - 23.3.0.23.09").
+pub fn folder_name(readme: &str) -> Option<String> {
+    let line = readme.lines().find(|l| l.contains("Client Shared Library"))?;
+    let ver = line.rsplit(" - ").next()?.trim();
+    let mut it = ver.split('.');
+    let (major, minor) = (it.next()?, it.next()?);
+    (major.chars().all(|c| c.is_ascii_digit()) && minor.chars().all(|c| c.is_ascii_digit())).then(|| format!("instantclient_{major}_{minor}"))
+}
+
+fn content_length(url: &str) -> Option<u64> {
+    let out = Command::new("curl").args(["-sIL", "--proto", "=https", "--max-time", "20"]).arg(url).output().ok()?;
+    // Last header block wins (after redirects).
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .rev()
+        .filter_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")).and_then(|(_, v)| v.trim().parse().ok()))
+        .next()
+}
+
+/// curl to `file`, reporting the growing file size; stops when `cancel` is set.
+fn download(url: &str, file: &Path, progress: &dyn Fn(InstallProgress), cancel: &AtomicBool) -> Result<(), String> {
+    let total = content_length(url);
+    progress(InstallProgress::Downloading { received: 0, total });
+    let mut child = Command::new("curl")
+        .args(["-fsSL", "--proto", "=https", "--retry", "2", "-o"])
+        .arg(file)
+        .arg(url)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("download: {e}"))?;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("cancelled".into());
+        }
+        if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+            if !st.success() {
+                let mut err = String::new();
+                if let Some(mut e) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = e.read_to_string(&mut err);
+                }
+                return Err(format!("download failed: {}", err.trim().lines().last().unwrap_or("network error")));
+            }
+            let received = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+            progress(InstallProgress::Downloading { received, total: total.or(Some(received)) });
+            return Ok(());
+        }
+        let received = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+        progress(InstallProgress::Downloading { received, total });
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Download and install the latest Basic package into `dest`
+/// (`<dest>/instantclient_<ver>`). Returns the library directory.
+///
+/// macOS: the DMG is mounted privately and its files are copied with
+/// symlinks preserved (Oracle's `install_ic.sh` only works for disks mounted
+/// under /Volumes, and ~/Downloads may be off-limits to apps).
+pub fn install(dest: &Path, progress: &dyn Fn(InstallProgress), cancel: &AtomicBool) -> Result<PathBuf, String> {
     let p = platform();
     let url = p.download_url.ok_or("no Instant Client build for this platform; use the download page")?;
     let tmp = std::env::temp_dir().join(format!("databrain-instantclient-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
     let file = tmp.join(url.rsplit('/').next().unwrap_or("instantclient"));
     let result = (|| {
-        run(Command::new("curl").args(["-fsSL", "--proto", "=https", "--retry", "2", "-o"]).arg(&file).arg(url), "download")?;
-        if p.os == "macos" {
+        download(url, &file, progress, cancel)?;
+        progress(InstallProgress::Installing);
+        let lib_dir = if p.os == "macos" {
             let mount = tmp.join("mnt");
             std::fs::create_dir_all(&mount).map_err(|e| e.to_string())?;
-            run(Command::new("hdiutil").args(["attach", "-nobrowse", "-readonly", "-mountpoint"]).arg(&mount).arg(&file), "mount")?;
-            // install_ic.sh copies the files to ~/Downloads/instantclient_<ver>.
-            let r = run(Command::new("sh").arg("./install_ic.sh").current_dir(&mount), "install");
-            let _ = Command::new("hdiutil").args(["detach", "-quiet"]).arg(&mount).output();
-            r?;
-            let home = dirs_home().ok_or("no home folder")?;
-            return candidate_dirs(&[home.join("Downloads")]).into_iter().next().ok_or_else(|| "installed, but the library was not found".to_string());
+            run(Command::new("hdiutil").args(["attach", "-nobrowse", "-readonly", "-noautoopen", "-mountpoint"]).arg(&mount).arg(&file), "mount")?;
+            let copied = (|| {
+                let readme = std::fs::read_to_string(mount.join("BASIC_README")).unwrap_or_default();
+                let target = dest.join(folder_name(&readme).unwrap_or_else(|| "instantclient".into()));
+                std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+                // `cp -R -P` keeps libclntsh.dylib -> libclntsh.dylib.23.1 symlinks.
+                let entries: Vec<PathBuf> = std::fs::read_dir(&mount)
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| !matches!(p.file_name().and_then(|n| n.to_str()), Some("install_ic.sh" | "INSTALL_IC_README.txt")) && !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.')))
+                    .collect();
+                if entries.is_empty() {
+                    return Err("the downloaded package is empty".to_string());
+                }
+                run(Command::new("cp").args(["-R", "-P", "-f"]).args(&entries).arg(&target), "copy")?;
+                // Writable copies so a later reinstall can overwrite them.
+                let _ = Command::new("chmod").args(["-R", "u+w"]).arg(&target).output();
+                Ok(target)
+            })();
+            let _ = Command::new("hdiutil").args(["detach", "-quiet", "-force"]).arg(&mount).output();
+            copied?
+        } else {
+            if p.os == "windows" {
+                run(Command::new("tar").arg("-xf").arg(&file).arg("-C").arg(dest), "extract")?;
+            } else if run(Command::new("unzip").args(["-oq"]).arg(&file).arg("-d").arg(dest), "extract").is_err() {
+                run(Command::new("python3").args(["-m", "zipfile", "-e"]).arg(&file).arg(dest), "extract (needs unzip or python3)")?;
+            }
+            dest.to_path_buf()
+        };
+        progress(InstallProgress::Verifying);
+        if has_lib(&lib_dir) {
+            return Ok(lib_dir);
         }
-        std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
-        if p.os == "windows" {
-            run(Command::new("tar").arg("-xf").arg(&file).arg("-C").arg(dest), "extract")?;
-        } else if run(Command::new("unzip").args(["-oq"]).arg(&file).arg("-d").arg(dest), "extract").is_err() {
-            run(Command::new("python3").args(["-m", "zipfile", "-e"]).arg(&file).arg(dest), "extract (needs unzip or python3)")?;
-        }
-        candidate_dirs(&[dest.to_path_buf()]).into_iter().next().ok_or_else(|| "extracted, but the library was not found".to_string())
+        candidate_dirs(&[lib_dir.clone(), dest.to_path_buf()])
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("installed into {}, but {} was not found there", lib_dir.display(), library_name()))
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     result
@@ -274,6 +367,9 @@ mod tests {
         assert_eq!(&found[..2], &[new.clone(), old.clone()]);
         assert!(!found.contains(&dir.join("instantclient_empty")));
         let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(folder_name("Basic Package\n\nClient Shared Library 64-bit - 23.3.0.23.09\n").as_deref(), Some("instantclient_23_3"));
+        assert_eq!(folder_name("Client Shared Library 64-bit - 19.8.0.0.0"), Some("instantclient_19_8".into()));
+        assert_eq!(folder_name("nothing here"), None);
         let p = platform();
         assert!(p.download_page.starts_with("https://www.oracle.com/"));
         assert!(p.download_url.is_none_or(|u| u.starts_with("https://download.oracle.com/")));
@@ -290,5 +386,34 @@ mod live {
         }
         let s = super::status(None, &[]);
         eprintln!("installed={} version={:?} dir={:?} msg={:?} auto_install={}", s.installed, s.version, s.lib_dir, s.message, s.platform.auto_install);
+    }
+}
+
+#[cfg(test)]
+mod live_install {
+    /// `DATABRAIN_ORACLE_INSTALL_LIVE=/tmp/dir cargo test -p databrain-connector-oracle install_live -- --nocapture`
+    /// Downloads ~115 MB from Oracle.
+    #[test]
+    fn install_live() {
+        let Ok(dest) = std::env::var("DATABRAIN_ORACLE_INSTALL_LIVE") else { return };
+        let seen = std::sync::Mutex::new((0u32, 0u64, None::<u64>, Vec::<String>::new()));
+        let progress = |p: super::InstallProgress| {
+            let mut g = seen.lock().unwrap();
+            match p {
+                super::InstallProgress::Downloading { received, total } => {
+                    g.0 += 1;
+                    g.1 = received;
+                    g.2 = total;
+                }
+                other => g.3.push(format!("{other:?}")),
+            }
+        };
+        let dir = super::install(std::path::Path::new(&dest), &progress, &std::sync::atomic::AtomicBool::new(false)).expect("install");
+        let g = seen.lock().unwrap();
+        eprintln!("dir={} updates={} received={} total={:?} phases={:?}", dir.display(), g.0, g.1, g.2, g.3);
+        assert!(g.0 > 2 && g.2 == Some(g.1));
+        let st = super::status(Some(&dir.to_string_lossy()), &[]);
+        eprintln!("installed={} version={:?} msg={:?}", st.installed, st.version, st.message);
+        assert!(st.installed);
     }
 }

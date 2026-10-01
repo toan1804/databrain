@@ -283,6 +283,12 @@ async fn oracle_install_client(app: tauri::AppHandle, state: State<'_, AppState>
         Err(databrain_query_engine::EngineError::new("unsupported", "Oracle is not enabled in this build"))
     }
 }
+#[tauri::command]
+async fn oracle_cancel_install() -> R<()> {
+    #[cfg(feature = "oracle")]
+    api::oracle_cancel_install();
+    Ok(())
+}
 /// Open Oracle's Instant Client download page for this platform (fixed URL).
 #[tauri::command]
 async fn oracle_open_download(state: State<'_, AppState>) -> R<()> {
@@ -652,6 +658,7 @@ pub fn run() {
             oracle_client_status,
             oracle_install_client,
             oracle_open_download,
+            oracle_cancel_install,
             drop_output,
             drop_unpinned_outputs,
             kn_cancel,

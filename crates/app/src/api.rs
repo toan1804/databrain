@@ -660,11 +660,33 @@ pub async fn oracle_client_status(state: &AppState, lib_dir: Option<String>, app
     Ok(st)
 }
 
-/// Download and install the latest Instant Client (Basic) for this computer.
+/// UI event channel for Instant Client install progress.
+pub const ORACLE_INSTALL_EVENT: &str = "oracle-install";
+
+/// Set to stop a running Instant Client download.
+#[cfg(feature = "oracle")]
+static ORACLE_INSTALL_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "oracle")]
+pub fn oracle_cancel_install() {
+    ORACLE_INSTALL_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Download and install the latest Instant Client (Basic) for this computer
+/// into `<app data>/oracle/instantclient_<ver>`. Progress is emitted on
+/// [`ORACLE_INSTALL_EVENT`].
 #[cfg(feature = "oracle")]
 pub async fn oracle_install_client(state: &AppState, app_dir: PathBuf) -> Result<databrain_connector_oracle::client::ClientStatus> {
     let dest = app_dir.join("oracle");
-    let dir = blocking(move || databrain_connector_oracle::client::install(&dest).map_err(|e| EngineError::new("install", e))).await?;
+    let ui = state.ui.clone();
+    ORACLE_INSTALL_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+    let dir = blocking(move || {
+        let progress = |p: databrain_connector_oracle::client::InstallProgress| ui.emit(ORACLE_INSTALL_EVENT, serde_json::to_value(&p).unwrap_or_default());
+        databrain_connector_oracle::client::install(&dest, &progress, &ORACLE_INSTALL_CANCEL).map_err(|e| {
+            if e == "cancelled" { EngineError::new("cancelled", "download cancelled") } else { EngineError::new("install", e) }
+        })
+    })
+    .await?;
     let d = dir.to_string_lossy().into_owned();
     databrain_connector_oracle::client::set_default_dir(Some(d.clone()));
     state.workspace.set_setting(ORACLE_CLIENT_SETTING, &serde_json::json!(d))?;

@@ -20,6 +20,7 @@ import type {
   IndexPlan,
   CredentialStoreKind,
   OracleClientStatus,
+  OracleInstallProgress,
   CredentialStoreView,
   MigrationReport,
   KnowledgeEvent,
@@ -188,6 +189,7 @@ export const api = {
   oracleClientStatus: (libDir?: string | null) => call<OracleClientStatus>("oracle_client_status", { libDir: libDir || null }),
   oracleInstallClient: () => call<OracleClientStatus>("oracle_install_client"),
   oracleOpenDownload: () => call<void>("oracle_open_download"),
+  oracleCancelInstall: () => call<void>("oracle_cancel_install"),
   credentialStore: () => call<CredentialStoreView>("credential_store"),
   setCredentialStore: (kind: CredentialStoreKind) => call<MigrationReport>("set_credential_store", { kind }),
   knPlan: (connectionId: string) => call<IndexPlan>("kn_plan", { connectionId }),
@@ -220,6 +222,10 @@ export function onAiEvent(handler: (e: AiChannelPayload) => void): Promise<Unlis
 
 export function onAuthEvent(handler: (e: AuthEvent) => void): Promise<UnlistenFn> {
   return listen<AuthEvent>("auth-event", (e) => handler(e.payload));
+}
+
+export function onOracleInstall(handler: (e: OracleInstallProgress) => void): Promise<UnlistenFn> {
+  return listen<OracleInstallProgress>("oracle-install", (e) => handler(e.payload));
 }
 
 export function onKnowledgeEvent(handler: (e: KnowledgeEvent) => void): Promise<UnlistenFn> {

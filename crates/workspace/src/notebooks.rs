@@ -44,6 +44,12 @@ pub struct NotebookCell {
     pub connection_id: Option<String>,
     #[serde(default)]
     pub collapsed: bool,
+    /// Editor height in px set by the user (None = grows with the SQL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_height: Option<u32>,
+    /// Output area height in px (None = default 300).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_height: Option<u32>,
     #[serde(default)]
     pub last_run: Option<CellRunSummary>,
 }
@@ -169,8 +175,8 @@ mod tests {
                 connection_id: None,
                 folder_id: None,
                 cells: vec![
-                    NotebookCell { id: String::new(), kind: CellKind::Markdown, source: "# Revenue".into(), output_name: None, connection_id: None, collapsed: false, last_run: None },
-                    NotebookCell { id: String::new(), kind: CellKind::Sql, source: "select 1".into(), output_name: Some("one".into()), connection_id: None, collapsed: false, last_run: None },
+                    NotebookCell { id: String::new(), kind: CellKind::Markdown, source: "# Revenue".into(), output_name: None, connection_id: None, collapsed: false, editor_height: None, output_height: None, last_run: None },
+                    NotebookCell { id: String::new(), kind: CellKind::Sql, source: "select 1".into(), output_name: Some("one".into()), connection_id: None, collapsed: false, editor_height: Some(240), output_height: Some(500), last_run: None },
                 ],
                 created_at: 0,
                 updated_at: 0,
@@ -180,6 +186,8 @@ mod tests {
         let list = ws.list_notebooks().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].cell_count, 2);
+        let back = ws.get_notebook(&nb.id).unwrap().cells;
+        assert_eq!((back[1].editor_height, back[1].output_height), (Some(240), Some(500)));
 
         let mut edited = nb.clone();
         edited.cells[1].last_run = Some(CellRunSummary { finished_at: 1, duration_ms: 5, rows: Some(1), error: None });

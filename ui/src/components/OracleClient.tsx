@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle2, Download, ExternalLink, FolderOpen, Loader2, RefreshCw } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { api, isTauri, toError } from "../lib/api";
-import type { OracleClientStatus } from "../lib/types";
+import { api, isTauri, onOracleInstall, toError } from "../lib/api";
+import type { OracleClientStatus, OracleInstallProgress } from "../lib/types";
+import { formatBytes } from "../lib/util";
 import { useStore } from "../store";
 import { Modal } from "./ui";
 
@@ -11,6 +12,7 @@ export function OracleClientPanel({ libDir, onUseDir, compact }: { libDir?: stri
   const toast = useStore((s) => s.toast);
   const [st, setSt] = useState<OracleClientStatus | null>(null);
   const [busy, setBusy] = useState<null | "check" | "install">(null);
+  const [prog, setProg] = useState<OracleInstallProgress | null>(null);
 
   const check = useCallback(async () => {
     if (!isTauri()) return;
@@ -32,6 +34,8 @@ export function OracleClientPanel({ libDir, onUseDir, compact }: { libDir?: stri
 
   const install = async () => {
     setBusy("install");
+    setProg(null);
+    const un = await onOracleInstall(setProg).catch(() => null);
     try {
       const r = await api.oracleInstallClient();
       setSt(r);
@@ -40,8 +44,12 @@ export function OracleClientPanel({ libDir, onUseDir, compact }: { libDir?: stri
         if (r.lib_dir) onUseDir?.(r.lib_dir);
       }
     } catch (e) {
-      toast(`Install failed: ${toError(e).message}. Use the download page instead.`, "error");
+      const err = toError(e);
+      if (err.kind === "cancelled") toast("Download cancelled", "info");
+      else toast(`Install failed: ${err.message}. Use the download page instead.`, "error");
     } finally {
+      un?.();
+      setProg(null);
       setBusy(null);
     }
   };
@@ -83,11 +91,12 @@ export function OracleClientPanel({ libDir, onUseDir, compact }: { libDir?: stri
           {busy === "check" ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
         </button>
       </div>
-      <div className="flex flex-wrap items-center gap-1.5">
+      {busy === "install" && <InstallProgressBar p={prog} onCancel={() => void api.oracleCancelInstall()} />}
+      <div className={`flex flex-wrap items-center gap-1.5 ${busy === "install" ? "hidden" : ""}`}>
         {st.platform.auto_install && (
           <button className="btn-primary py-1" onClick={() => void install()} disabled={!!busy}>
             {busy === "install" ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
-            {busy === "install" ? "Downloading and installing (~70–140 MB)…" : "Install Instant Client"}
+            Install Instant Client
           </button>
         )}
         <button className="btn-ghost border border-line py-1" onClick={() => void api.oracleOpenDownload().catch((e) => toast(toError(e).message, "error"))}>
@@ -100,13 +109,55 @@ export function OracleClientPanel({ libDir, onUseDir, compact }: { libDir?: stri
         )}
       </div>
       <p className="text-[11px] text-muted">
-        {st.platform.os === "macos"
-          ? "Installs Oracle's notarized package into ~/Downloads/instantclient_* (Oracle's default)."
-          : st.platform.auto_install
-            ? "Installs into DataBrain's app-data folder."
-            : "Download the Basic package for your system and choose its folder."}
+        {st.platform.auto_install
+          ? "Downloads Oracle's latest Basic package (~110–140 MB) and installs it into DataBrain's app-data folder."
+          : "Download the Basic package for your system and choose its folder."}
         {st.platform.note ? ` ${st.platform.note}` : ""} By installing you accept Oracle's license terms for Instant Client.
       </p>
+    </div>
+  );
+}
+
+export function installPercent(p: OracleInstallProgress | null): number | null {
+  if (!p) return null;
+  if (p.phase !== "downloading") return 100;
+  return p.total ? Math.min(100, Math.round((p.received / p.total) * 100)) : null;
+}
+
+function InstallProgressBar({ p, onCancel }: { p: OracleInstallProgress | null; onCancel: () => void }) {
+  const pct = installPercent(p);
+  const label =
+    !p
+      ? "Starting download…"
+      : p.phase === "downloading"
+        ? `Downloading ${formatBytes(p.received)}${p.total ? ` of ${formatBytes(p.total)}` : ""}${pct !== null ? ` · ${pct}%` : ""}`
+        : p.phase === "installing"
+          ? "Installing…"
+          : "Checking the library…";
+  return (
+    <div className="space-y-1">
+      <div
+        className="h-2 overflow-hidden rounded-full bg-panel-2"
+        role="progressbar"
+        aria-label="Instant Client download"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct ?? undefined}
+      >
+        <div
+          className={`h-full rounded-full bg-accent transition-[width] duration-200 ${pct === null ? "w-1/3 animate-pulse" : ""}`}
+          style={pct === null ? undefined : { width: `${pct}%` }}
+        />
+      </div>
+      <div className="flex items-center gap-2 text-[11.5px] text-muted">
+        <Loader2 size={11} className="animate-spin" />
+        <span aria-live="polite">{label}</span>
+        {(!p || p.phase === "downloading") && (
+          <button className="ml-auto text-[11.5px] hover:text-fg hover:underline" onClick={onCancel}>
+            Cancel
+          </button>
+        )}
+      </div>
     </div>
   );
 }

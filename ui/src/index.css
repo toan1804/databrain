@@ -296,3 +296,11 @@ textarea,
   caret-color: var(--caret);
 }
 
+
+/* Notebook cell with a user-set height: the editor fills it and scrolls. */
+.nb-cell-fixed .cm-editor {
+  height: 100%;
+}
+.nb-cell-fixed .cm-scroller {
+  overflow: auto;
+}

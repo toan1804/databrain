@@ -38,6 +38,8 @@ import { registerKeyConnection, useAi } from "../aiStore";
 import { editorBridge } from "../editorBridge";
 import { errorField, highlight, langExtension, setError } from "./SqlEditor";
 import { canFetchMetadata, sqlAssist } from "./sqlAssist";
+import { ResizeHandle } from "./ResizeHandle";
+import { EDITOR_MAX, EDITOR_MIN, OUTPUT_DEFAULT, OUTPUT_MAX, OUTPUT_MIN } from "../lib/resize";
 import { ResultsPanel } from "./ResultsPanel";
 import { Markdown } from "./Markdown";
 import { ConnDot, EnvBadge } from "./ui";
@@ -417,6 +419,8 @@ function Cell(props: CellProps) {
   const run = useStore((s) => s.runs[key]);
   const connections = useStore((s) => s.connections);
   const [aiOpen, setAiOpen] = useState(false);
+  const outRef = useRef<HTMLDivElement>(null);
+  const [outH, setOutH] = useState<number | null>(null);
   const conn = connections.find((c) => c.id === props.connectionId);
 
   useEffect(() => registerKeyConnection(key, props.connectionId), [key, props.connectionId]);
@@ -531,6 +535,8 @@ function Cell(props: CellProps) {
             source={cell.source}
             connectionId={props.connectionId}
             error={run?.errorRange}
+            height={cell.editor_height ?? null}
+            onResize={(h) => onChange({ editor_height: h })}
             onChange={(source) => onChange({ source })}
             onRun={props.onRun}
             onRunAdvance={props.onRunAdvance}
@@ -561,9 +567,26 @@ function Cell(props: CellProps) {
             Output{conn ? ` · ${conn.name}` : ""}
           </button>
           {!cell.collapsed && (
-            <div className="h-[300px] overflow-hidden rounded-b-xl">
-              <ResultsPanel tabId={key} connectionId={props.connectionId} title={`cell_${index + 1}`} compact />
-            </div>
+            <>
+              <div ref={outRef} className="overflow-hidden" style={{ height: outH ?? cell.output_height ?? OUTPUT_DEFAULT }}>
+                <ResultsPanel tabId={key} connectionId={props.connectionId} title={`cell_${index + 1}`} compact />
+              </div>
+              <ResizeHandle
+                label="Output height"
+                min={OUTPUT_MIN}
+                max={OUTPUT_MAX}
+                height={() => outRef.current?.getBoundingClientRect().height ?? OUTPUT_DEFAULT}
+                onChange={setOutH}
+                onCommit={(h) => {
+                  setOutH(null);
+                  onChange({ output_height: h });
+                }}
+                onReset={() => {
+                  setOutH(null);
+                  onChange({ output_height: null });
+                }}
+              />
+            </>
           )}
         </div>
       )}
@@ -621,6 +644,8 @@ function CellEditor({
   source,
   connectionId,
   error,
+  height,
+  onResize,
   onChange,
   onRun,
   onRunAdvance,
@@ -630,6 +655,9 @@ function CellEditor({
   source: string;
   connectionId: string | null;
   error?: { from: number; to: number };
+  /** Fixed height in px (null = grows with the SQL). */
+  height: number | null;
+  onResize: (h: number | null) => void;
   onChange: (s: string) => void;
   onRun: () => void;
   onRunAdvance: () => void;
@@ -719,7 +747,36 @@ function CellEditor({
     view.current?.dispatch({ effects: setError.of(error ?? null) });
   }, [error]);
 
-  return <div ref={host} className="nb-cell overflow-hidden rounded-md border border-line/60 bg-panel-2/40" />;
+  // While dragging the height is local; it is saved on release.
+  const [dragH, setDragH] = useState<number | null>(null);
+  const h = dragH ?? height;
+  useEffect(() => {
+    view.current?.requestMeasure();
+  }, [h]);
+  return (
+    <div>
+      <div
+        ref={host}
+        className={`nb-cell overflow-hidden rounded-md border border-line/60 bg-panel-2/40 ${h ? "nb-cell-fixed" : ""}`}
+        style={h ? { height: h } : undefined}
+      />
+      <ResizeHandle
+        label="Editor height"
+        min={EDITOR_MIN}
+        max={EDITOR_MAX}
+        height={() => host.current?.getBoundingClientRect().height ?? EDITOR_MIN}
+        onChange={setDragH}
+        onCommit={(v) => {
+          setDragH(null);
+          onResize(v);
+        }}
+        onReset={() => {
+          setDragH(null);
+          onResize(null);
+        }}
+      />
+    </div>
+  );
 }
 
 function MarkdownCell({ source, onChange, autoEdit }: { source: string; onChange: (s: string) => void; autoEdit: boolean }) {

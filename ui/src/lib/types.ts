@@ -464,6 +464,10 @@ export interface NotebookCell {
   output_name?: string | null;
   connection_id?: string | null;
   collapsed?: boolean;
+  /** Editor height in px (unset = grows with the SQL). */
+  editor_height?: number | null;
+  /** Output height in px (unset = 300). */
+  output_height?: number | null;
   last_run?: CellRunSummary | null;
 }
 
@@ -685,6 +689,11 @@ export interface OracleClientStatus {
   message: string | null;
   platform: { os: string; arch: string; download_page: string; download_url: string | null; auto_install: boolean; note: string | null };
 }
+
+export type OracleInstallProgress =
+  | { phase: "downloading"; received: number; total: number | null }
+  | { phase: "installing" }
+  | { phase: "verifying" };
 
 export type CredentialStoreKind = "keychain" | "vault";
 export interface CredentialStoreView {
