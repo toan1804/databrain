@@ -458,6 +458,65 @@ impl OutputRegistry {
         Ok(out)
     }
 
+    /// Drop an output: frees its data, deletes its saved snapshot (pinned or
+    /// a tab's saved last result) and forgets the handle. Older versions of
+    /// the same name move up (`revenue__2` becomes `revenue__1`). Returns
+    /// the dropped output.
+    pub fn remove(&self, reference: &str) -> Result<OutputInfo> {
+        let o = self.resolve(reference).ok_or_else(|| EngineError::new("not_found", format!("output {reference} not found")))?;
+        {
+            let mut g = self.inner.lock();
+            let g = &mut *g;
+            g.by_handle.remove(&o.handle);
+            g.by_result.remove(&o.result_id);
+            for list in g.active.values_mut() {
+                list.retain(|h| h != &o.handle);
+            }
+            g.active.retain(|_, v| !v.is_empty());
+            if let Some(base) = o.name.clone().or_else(|| o.version_of.as_ref().map(|v| v.0.clone())) {
+                let key = base.to_ascii_lowercase();
+                let next = g.names.get_mut(&key).map(|list| {
+                    list.retain(|h| h != &o.handle);
+                    list.first().cloned()
+                });
+                // Dropping the current version: the previous one becomes current.
+                if o.name.is_some() {
+                    if let Some(Some(h)) = &next {
+                        if let Some(x) = g.by_handle.get_mut(h) {
+                            x.name = Some(base.clone());
+                            x.version_of = None;
+                        }
+                    }
+                }
+                if g.names.get(&key).is_some_and(Vec::is_empty) {
+                    g.names.remove(&key);
+                } else {
+                    relabel(g, &base);
+                }
+            }
+        }
+        self.results.remove(&o.result_id);
+        if let Some(rec) = self.workspace.list_outputs().ok().and_then(|l| l.into_iter().find(|r| r.result_id == o.result_id)) {
+            self.drop_record(&rec);
+        } else if let Some(p) = self.snapshot_path(&o.result_id) {
+            let _ = std::fs::remove_file(p);
+        }
+        // The promoted version's saved metadata (if pinned) follows.
+        if let Some(n) = &o.name {
+            if let Some(cur) = self.resolve(n) {
+                self.persist_meta(&cur);
+            }
+        }
+        Ok(o)
+    }
+
+    /// Drop every output that is not pinned and not a tab's latest result.
+    /// Returns how many were dropped.
+    pub fn remove_unpinned(&self) -> usize {
+        let handles: Vec<String> = self.inner.lock().by_handle.values().filter(|o| !o.pinned && !o.active).map(|o| o.handle.clone()).collect();
+        handles.iter().filter(|h| self.remove(h).is_ok()).count()
+    }
+
     // ------------------------------------------------------------ pinning
 
     /// Pin/unpin. Pinning writes a Parquet snapshot when a snapshot directory
@@ -851,6 +910,46 @@ mod tests {
         r2.set_pinned("r1", false).unwrap();
         assert!(ws.list_outputs().unwrap().is_empty());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn remove_drops_data_snapshot_and_promotes_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = OutputRegistry::new(Arc::new(ResultStore::new()), Arc::new(Workspace::open_in_memory().unwrap()));
+        r.set_snapshot_dir(dir.path().to_path_buf());
+        let a = add(&r, "t", 1);
+        r.set_name(&a.handle, Some("rev")).unwrap();
+        r.begin_run("t");
+        let b = add(&r, "t", 2);
+        r.set_name(&b.handle, Some("rev")).unwrap();
+        r.begin_run("t");
+        let c = add(&r, "t", 3);
+        r.set_name(&c.handle, Some("rev")).unwrap(); // rev=r3, rev__1=r2, rev__2=r1
+        r.set_pinned(&c.handle, true).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // Drop a middle version: the older one moves up.
+        r.remove("rev__1").unwrap();
+        assert_eq!(r.resolve("rev__1").unwrap().handle, a.handle);
+        assert!(r.get(&b.handle).is_none() && !r.results.contains(&b.result_id));
+        // Drop the current (pinned) version: snapshot deleted, previous becomes current.
+        r.remove("rev").unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(r.resolve("rev").unwrap().handle, a.handle);
+        assert_eq!(r.get(&a.handle).unwrap().name.as_deref(), Some("rev"));
+        assert!(r.for_tab("t").is_empty(), "the tab's latest output was dropped");
+        assert!(r.remove("r99").is_err());
+
+        // Bulk: keeps pinned and the tabs' latest outputs.
+        r.begin_run("u");
+        let old = add(&r, "u", 1);
+        r.begin_run("u");
+        let latest = add(&r, "u", 1);
+        let keep = add(&r, "v", 1);
+        r.set_pinned(&keep.handle, true).unwrap();
+        r.begin_run("v");
+        assert_eq!(r.remove_unpinned(), 2, "r1 (rev) and the old run of u");
+        assert!(r.get(&old.handle).is_none() && r.get(&latest.handle).is_some() && r.get(&keep.handle).is_some());
     }
 
     #[test]

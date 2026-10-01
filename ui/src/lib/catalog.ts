@@ -1,5 +1,6 @@
 // Pure helpers for the catalog tree and catalog search (unit tested).
 import type { ConnectorKind, DbObject, ObjectKind, SchemaInfo } from "./types";
+import { qualifiedName, quoteIdent } from "./util";
 
 /** Engines whose schema ids are `catalog.schema` (three-level names). */
 export const THREE_LEVEL: ConnectorKind[] = ["databricks", "snowflake", "bigquery", "duckdb"];
@@ -135,4 +136,32 @@ export function revealKeys(connId: string, obj: DbObject, catalog?: string): str
   const keys = [treeKey.conn(connId), treeKey.schema(connId, obj.schema), treeKey.group(connId, obj.schema, groupOf(obj.kind))];
   if (catalog) keys.push(treeKey.catalog(connId, catalog));
   return keys;
+}
+
+// ------------------------------------------------------------------ copy / insert names
+
+/** Quoted schema path (`catalog.schema` parts quoted per dialect). */
+export function schemaPath(kind: ConnectorKind, schema: string): string {
+  if (kind === "bigquery") return "`" + schema.replace(/`/g, "") + "`";
+  const parts = THREE_LEVEL.includes(kind) ? splitIdent(schema) : [schema];
+  return parts.map((p) => quoteIdent(kind, p)).join(".");
+}
+
+/** Split `a.b` into parts (catalog names never contain dots in these engines). */
+function splitIdent(schema: string): string[] {
+  const i = schema.indexOf(".");
+  return i > 0 ? [schema.slice(0, i), schema.slice(i + 1)] : [schema];
+}
+
+/** Fully qualified, quoted table path, e.g. `main.sales.orders`. */
+export function tablePath(kind: ConnectorKind, schema: string, name: string): string {
+  if (kind === "duckdb" && schema.endsWith(".files")) return `files.${quoteIdent(kind, name)}`;
+  return qualifiedName(kind, schema, name);
+}
+
+/** Comma-separated quoted column list, one per line after the first few. */
+export function columnList(kind: ConnectorKind, columns: string[], qualifier?: string): string {
+  const q = (c: string) => (qualifier ? `${qualifier}.` : "") + quoteIdent(kind, c);
+  if (columns.length <= 4) return columns.map(q).join(", ");
+  return columns.map(q).join(",\n  ");
 }

@@ -154,6 +154,8 @@ export const api = {
 
   listOutputs: () => call<OutputInfo[]>("list_outputs"),
   getOutput: (reference: string) => call<OutputInfo>("get_output", { reference }),
+  dropOutput: (reference: string) => call<OutputInfo>("drop_output", { reference }),
+  dropUnpinnedOutputs: () => call<number>("drop_unpinned_outputs"),
   loadOutput: (reference: string) => call<OutputInfo>("load_output", { reference }),
   renameOutput: (handle: string, name: string | null) => call<OutputInfo>("rename_output", { handle, name }),
   pinOutput: (handle: string, pinned: boolean) => call<OutputInfo>("pin_output", { handle, pinned }),

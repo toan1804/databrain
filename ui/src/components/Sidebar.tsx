@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  ClipboardCopy,
   Columns3,
   Database,
   Eye,
@@ -29,14 +30,16 @@ import {
   RefreshCw,
   Search,
   Table2,
+  TextCursorInput,
   Trash2,
   Unplug,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { api, toError } from "../lib/api";
 import type { ConnectionView, DbObject, HistoryEntry, NotebookSummary, SavedQuery, SchemaInfo } from "../lib/types";
-import { groupOf, groupSchemas, schemaLabel, treeKey, type CatalogGroup } from "../lib/catalog";
+import { columnList, groupOf, groupSchemas, schemaLabel, schemaPath, tablePath, treeKey, type CatalogGroup } from "../lib/catalog";
 import { CatalogSearch, selectTop } from "./CatalogSearch";
+import { CatalogMenu, ColumnMenu, ObjectMenu, SchemaMenu, copyText, insertColumns, insertText } from "./CatalogMenus";
 import { formatCount, formatDuration, relativeTime, sqlPreview, quoteIdent } from "../lib/util";
 import { useAi } from "../aiStore";
 import { DEFAULT_POLICY } from "./ConnectionDialog";
@@ -432,6 +435,7 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
 function CatalogNode({ conn, group, defaultOpen }: { conn: ConnectionView; group: CatalogGroup; defaultOpen: boolean }) {
   const [expanded, setExpanded] = useTreeOpen(treeKey.catalog(conn.id, group.name), defaultOpen);
   const noun = conn.config.kind === "bigquery" ? "Project" : conn.config.kind === "databricks" ? "Catalog" : "Database";
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   return (
     <div>
       <Row
@@ -442,7 +446,25 @@ function CatalogNode({ conn, group, defaultOpen }: { conn: ConnectionView; group
         title={`${noun} ${group.name}`}
         meta={group.schemas.length}
         onClick={() => setExpanded(!expanded)}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMenu({ x: e.clientX, y: e.clientY });
+        }}
+        actions={
+          <button
+            className="icon-btn h-6 w-6"
+            title={`Copy ${noun.toLowerCase()} name`}
+            aria-label={`Copy ${noun.toLowerCase()} name`}
+            onClick={(e) => {
+              e.stopPropagation();
+              void copyText(group.name, `${noun.toLowerCase()} name`);
+            }}
+          >
+            <ClipboardCopy size={12} />
+          </button>
+        }
       />
+      {menu && <CatalogMenu conn={conn} catalog={group.name} at={menu} onClose={() => setMenu(null)} />}
       {expanded &&
         group.schemas.map((s) => (
           <SchemaNode key={s.name} conn={conn} schema={s} depth={2} defaultOpen={s.is_default || group.schemas.length === 1} />
@@ -458,6 +480,7 @@ function SchemaNode({ conn, schema: info, depth, defaultOpen }: { conn: Connecti
   const toast = useStore((s) => s.toast);
   const [expanded, setExpanded] = useTreeOpen(treeKey.schema(conn.id, schema), defaultOpen);
   const [loading, setLoading] = useState(false);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 
   const load = useCallback(
     async (force = false) => {
@@ -497,20 +520,38 @@ function SchemaNode({ conn, schema: info, depth, defaultOpen }: { conn: Connecti
         title={schema}
         meta={objects ? objects.length : undefined}
         onClick={() => setExpanded(!expanded)}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMenu({ x: e.clientX, y: e.clientY });
+        }}
         actions={
-          <button
-            className="icon-btn h-6 w-6"
-            title="Refresh"
-            aria-label="Refresh schema"
-            onClick={(e) => {
-              e.stopPropagation();
-              void load(true);
-            }}
-          >
-            <RefreshCw size={12} />
-          </button>
+          <>
+            <button
+              className="icon-btn h-6 w-6"
+              title="Copy schema path"
+              aria-label="Copy schema path"
+              onClick={(e) => {
+                e.stopPropagation();
+                void copyText(schemaPath(conn.config.kind, schema), "schema path");
+              }}
+            >
+              <ClipboardCopy size={12} />
+            </button>
+            <button
+              className="icon-btn h-6 w-6"
+              title="Refresh"
+              aria-label="Refresh schema"
+              onClick={(e) => {
+                e.stopPropagation();
+                void load(true);
+              }}
+            >
+              <RefreshCw size={12} />
+            </button>
+          </>
         }
       />
+      {menu && <SchemaMenu conn={conn} schema={info} at={menu} onClose={() => setMenu(null)} onRefresh={() => void load(true)} />}
       {expanded &&
         (flat
           ? groups[0][1].map((o) => <ObjectNode key={`${o.kind}:${o.name}`} obj={o} conn={conn} depth={depth + 1} />)
@@ -547,6 +588,8 @@ function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: ConnectionView;
   const ref = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [colMenu, setColMenu] = useState<{ x: number; y: number; column: string } | null>(null);
   const isRelation = obj.kind !== "function" && obj.kind !== "procedure";
 
   // Revealed from search: scroll into view, highlight briefly.
@@ -599,22 +642,63 @@ function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: ConnectionView;
         meta={obj.row_estimate !== undefined && obj.row_estimate > 0 ? formatCount(obj.row_estimate) : undefined}
         onClick={toggle}
         onDoubleClick={() => editorBridge.insert(activeTabId, quoteIdent(conn.config.kind, obj.name))}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMenu({ x: e.clientX, y: e.clientY });
+        }}
         actions={
-          isRelation && (
+          <>
             <button
               className="icon-btn h-6 w-6"
-              title="Select top 100 rows"
-              aria-label="Select top 100 rows"
+              title="Copy table path"
+              aria-label="Copy table path"
               onClick={(e) => {
                 e.stopPropagation();
-                selectTop(conn, obj);
+                void copyText(tablePath(conn.config.kind, obj.schema, obj.name), "table path");
               }}
             >
-              <Play size={12} />
+              <ClipboardCopy size={12} />
             </button>
-          )
+            {isRelation && (
+              <button
+                className="icon-btn h-6 w-6"
+                title="Insert column names into the editor"
+                aria-label="Insert column names into the editor"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void insertColumns(conn, obj);
+                }}
+              >
+                <Columns3 size={12} />
+              </button>
+            )}
+            {isRelation && (
+              <button
+                className="icon-btn h-6 w-6"
+                title="Select top 100 rows"
+                aria-label="Select top 100 rows"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  selectTop(conn, obj);
+                }}
+              >
+                <Play size={12} />
+              </button>
+            )}
+          </>
         }
       />
+      {menu && <ObjectMenu conn={conn} obj={obj} at={menu} onClose={() => setMenu(null)} onSelectTop={() => selectTop(conn, obj)} />}
+      {colMenu && <ColumnMenu conn={conn} obj={obj} column={colMenu.column} at={colMenu} onClose={() => setColMenu(null)} />}
+      {expanded && columns && columns.length > 1 && (
+        <Row
+          depth={depth + 1}
+          icon={<Columns3 size={12} className="text-accent" />}
+          label={<span className="text-[12px] text-accent">Insert all {columns.length} columns</span>}
+          title="Insert every column name, comma-separated, at the editor cursor"
+          onClick={() => insertText(columnList(conn.config.kind, columns.map((c) => c.name)))}
+        />
+      )}
       {expanded &&
         columns?.map((c) => (
           <Row
@@ -630,8 +714,38 @@ function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: ConnectionView;
                 </span>
               </span>
             }
-            title={c.comment}
+            title={c.comment ?? "Double-click to insert"}
             onDoubleClick={() => editorBridge.insert(activeTabId, quoteIdent(conn.config.kind, c.name))}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setColMenu({ x: e.clientX, y: e.clientY, column: c.name });
+            }}
+            actions={
+              <>
+                <button
+                  className="icon-btn h-6 w-6"
+                  title="Insert column name into the editor"
+                  aria-label={`Insert ${c.name} into the editor`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    insertText(quoteIdent(conn.config.kind, c.name));
+                  }}
+                >
+                  <TextCursorInput size={12} />
+                </button>
+                <button
+                  className="icon-btn h-6 w-6"
+                  title="Copy column name"
+                  aria-label={`Copy ${c.name}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void copyText(c.name, "column name");
+                  }}
+                >
+                  <ClipboardCopy size={12} />
+                </button>
+              </>
+            }
           />
         ))}
     </div>

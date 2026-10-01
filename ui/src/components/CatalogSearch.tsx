@@ -7,6 +7,7 @@ import { qualifiedName, quoteIdent, selectTopSql } from "../lib/util";
 import { editorBridge } from "../editorBridge";
 import { useStore } from "../store";
 import { ConnDot, MenuItem, Popover } from "./ui";
+import { ObjectMenu } from "./CatalogMenus";
 
 /** SQL reference for an object (DuckDB attached files are addressed as `files.x`). */
 export function objectRef(conn: ConnectionView, obj: DbObject): string {
@@ -296,6 +297,7 @@ function HitRow({
   onInsert: () => void;
 }) {
   const m = matchRange(query, obj.name);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const isView = obj.kind === "view" || obj.kind === "materialized_view";
   const where = path.catalog ? `${path.catalog} › ${path.schema}` : path.schema;
   return (
@@ -306,6 +308,10 @@ function HitRow({
       onMouseMove={onHover}
       onClick={onReveal}
       onDoubleClick={onInsert}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setMenu({ x: e.clientX, y: e.clientY });
+      }}
       className={`group flex h-[26px] cursor-pointer items-center gap-1.5 rounded-md pl-5 pr-1 text-[13px] ${selected ? "bg-hover" : "hover:bg-hover"}`}
     >
       <span className="flex shrink-0 text-muted">{isView ? <Eye size={13} /> : <Table2 size={13} />}</span>
@@ -323,6 +329,12 @@ function HitRow({
       <span className={`ml-auto min-w-0 shrink-[2] truncate pl-2 text-right text-[11px] text-muted ${selected ? "hidden" : "group-hover:hidden"}`}>
         {where}
       </span>
+      {menu && (
+        // Portal events bubble through React parents: keep menu clicks off the row.
+        <span onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()} onMouseMove={(e) => e.stopPropagation()}>
+          <ObjectMenu conn={conn} obj={obj} at={menu} onClose={() => setMenu(null)} onSelectTop={() => selectTop(conn, obj)} />
+        </span>
+      )}
       <span className={`shrink-0 items-center ${selected ? "flex" : "hidden group-hover:flex"}`}>
         <button
           className="icon-btn h-6 w-6"

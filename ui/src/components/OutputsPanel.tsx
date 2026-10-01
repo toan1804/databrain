@@ -1,9 +1,9 @@
 import { useMemo, useState } from "react";
-import { AlertTriangle, GitCompare, HardDrive, Layers, Pin, Search, TerminalSquare } from "lucide-react";
+import { AlertTriangle, Eraser, GitCompare, HardDrive, Layers, Pin, Search, TerminalSquare, Trash2 } from "lucide-react";
 import type { OutputInfo } from "../lib/types";
 import { formatBytes, formatCount, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
-import { formatAge, openOutput, openResultsQuery, outputRef } from "../outputs";
+import { dropOutput, dropUnpinnedOutputs, formatAge, openOutput, openResultsQuery, outputRef } from "../outputs";
 import { CompareDialog, OutputChip } from "./OutputChip";
 import { ConnDot } from "./ui";
 
@@ -45,6 +45,15 @@ export function OutputsPanel() {
           </button>
           <button className="icon-btn" title="Compare two outputs" aria-label="Compare outputs" disabled={outputs.length < 2} onClick={() => setCompare(true)}>
             <GitCompare size={14} />
+          </button>
+          <button
+            className="icon-btn"
+            title="Drop unpinned outputs (keeps pinned ones and each tab's latest result)"
+            aria-label="Drop unpinned outputs"
+            disabled={!outputs.some((o) => !o.pinned && !o.active)}
+            onClick={dropUnpinnedOutputs}
+          >
+            <Eraser size={14} />
           </button>
         </div>
       </div>
@@ -100,13 +109,31 @@ function OutputRow({ o, color }: { o: OutputInfo; color?: string | null }) {
       role="button"
       tabIndex={0}
       onDoubleClick={() => void openOutput(o)}
-      onKeyDown={(e) => e.key === "Enter" && void openOutput(o)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") void openOutput(o);
+        else if (e.key === "Delete" || (e.key === "Backspace" && (e.metaKey || e.ctrlKey))) {
+          e.preventDefault();
+          dropOutput(o);
+        }
+      }}
       className={`group mb-0.5 rounded-md px-2 py-1.5 hover:bg-hover ${evicted ? "opacity-60" : ""}`}
       title="Double-click to open"
     >
       <div className="flex items-center gap-1.5">
         <OutputChip output={o} compact />
         <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted">{sqlPreview(o.sql, 60)}</span>
+        <button
+          className="icon-btn hidden h-6 w-6 shrink-0 group-hover:flex group-focus-within:flex"
+          title="Drop output (⌘⌫)"
+          aria-label={`Drop output ${o.handle}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            dropOutput(o);
+          }}
+          onDoubleClick={(e) => e.stopPropagation()}
+        >
+          <Trash2 size={12} />
+        </button>
       </div>
       <div className="mt-1 flex items-center gap-2 pl-0.5 text-[10.5px] text-muted">
         <span className="flex min-w-0 items-center gap-1 truncate">

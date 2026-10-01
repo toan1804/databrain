@@ -249,6 +249,14 @@ async fn kn_index(state: State<'_, AppState>, connection_id: String, scope: Opti
     ai_api::index_knowledge(&state, &connection_id, scope, batch)
 }
 #[tauri::command]
+async fn drop_output(state: State<'_, AppState>, reference: String) -> R<databrain_query_engine::outputs::OutputInfo> {
+    api::drop_output(&state, reference).await
+}
+#[tauri::command]
+async fn drop_unpinned_outputs(state: State<'_, AppState>) -> R<usize> {
+    api::drop_unpinned_outputs(&state).await
+}
+#[tauri::command]
 async fn credential_store(state: State<'_, AppState>) -> R<api::CredentialStoreView> {
     Ok(api::credential_store(&state))
 }
@@ -598,6 +606,8 @@ pub fn run() {
             kn_plan,
             credential_store,
             set_credential_store,
+            drop_output,
+            drop_unpinned_outputs,
             kn_cancel,
             kn_save_note,
             kn_delete_note,

@@ -11,6 +11,7 @@ import {
   Pin,
   PinOff,
   TerminalSquare,
+  Trash2,
 } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { OutputInfo } from "../lib/types";
@@ -18,6 +19,7 @@ import { formatBytes, formatCount, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
 import {
   copyOutputRef,
+  dropOutput,
   formatAge,
   mentionInAi,
   openOutput,
@@ -108,6 +110,8 @@ export function OutputChip({ output, compact }: { output: OutputInfo; compact?: 
           <MenuItem icon={<ExternalLink size={13} />} label="Open in its own tab" disabled={o.state === "evicted"} onClick={() => (setMenu(null), void openOutput(o))} />
           <MenuItem icon={<AtSign size={13} />} label="Ask AI about it" onClick={() => (setMenu(null), mentionInAi(o))} />
           {o.state === "on_disk" && <MenuItem icon={<HardDrive size={13} />} label="Load from disk" onClick={() => (setMenu(null), void api.loadOutput(o.handle))} />}
+          <MenuSeparator />
+          <MenuItem icon={<Trash2 size={13} />} label="Drop output…" danger onClick={() => (setMenu(null), dropOutput(o))} />
         </Popover>
       )}
       {compare && <CompareDialog initial={o} onClose={() => setCompare(false)} />}

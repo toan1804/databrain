@@ -93,6 +93,8 @@ interface State {
   restoreTabOutputs: () => Promise<void>;
   /** Patch an output in runs + list after rename/pin. */
   applyOutput: (o: OutputInfo) => void;
+  /** Forget dropped outputs in runs, output tabs and the list. */
+  forgetOutputs: (handles: string[]) => void;
   notebooks: NotebookSummary[];
   signIn: SignInState | null;
   settingsOpen: boolean;
@@ -286,6 +288,23 @@ export const useStore = create<State>((set, get) => ({
       }
     }
   },
+  forgetOutputs: (handles) =>
+    set((s) => {
+      const gone = new Set(handles);
+      const runs = { ...s.runs };
+      for (const [k, r] of Object.entries(runs)) {
+        if (!r.statements.some((x) => x.output && gone.has(x.output.handle))) continue;
+        runs[k] = {
+          ...r,
+          statements: r.statements.map((x) =>
+            x.output && gone.has(x.output.handle) ? { ...x, output: undefined, result: undefined, notices: [...x.notices, `Output ${x.output.handle} was dropped. Run again to see rows.`] } : x,
+          ),
+        };
+      }
+      const tabs = s.tabs.filter((t) => !(t.output_ref && gone.has(t.output_ref)));
+      const activeTabId = tabs.some((t) => t.id === s.activeTabId) ? s.activeTabId : (tabs[0]?.id ?? null);
+      return { runs, tabs, activeTabId, outputs: s.outputs.filter((o) => !gone.has(o.handle)) };
+    }),
   applyOutput: (o) =>
     set((s) => {
       const runs = { ...s.runs };

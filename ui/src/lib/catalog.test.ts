@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cachedHits, groupSchemas, matchRange, objectMatches, rankHits, revealKeys, schemaLabel, splitSchema, treeKey } from "./catalog";
+import { columnList, schemaPath, tablePath, cachedHits, groupSchemas, matchRange, objectMatches, rankHits, revealKeys, schemaLabel, splitSchema, treeKey } from "./catalog";
 import type { DbObject, SchemaInfo } from "./types";
 
 const sch = (catalog: string | null, schema: string, is_default = false): SchemaInfo =>
@@ -67,5 +67,24 @@ describe("catalog search", () => {
   it("highlights the name term", () => {
     expect(matchRange("sales.Ord", "big_orders")).toEqual([4, 7]);
     expect(matchRange("zz", "orders")).toBeNull();
+  });
+});
+
+describe("copy names", () => {
+  it("quotes paths per dialect", () => {
+    expect(schemaPath("databricks", "main.sales")).toBe("main.sales");
+    expect(schemaPath("databricks", "main.Sales Data")).toBe("main.`Sales Data`");
+    expect(schemaPath("snowflake", "DB.PUBLIC")).toBe("DB.PUBLIC");
+    expect(schemaPath("snowflake", "db.public")).toBe('"db"."public"');
+    expect(schemaPath("postgres", "my schema")).toBe('"my schema"');
+    expect(schemaPath("bigquery", "proj-1.ds")).toBe("`proj-1.ds`");
+    expect(tablePath("databricks", "main.sales", "orders")).toBe("main.sales.orders");
+    expect(tablePath("mssql", "dbo", "Order Items")).toBe("dbo.[Order Items]");
+    expect(tablePath("duckdb", "memory.files", "sales")).toBe("files.sales");
+  });
+
+  it("builds column lists", () => {
+    expect(columnList("postgres", ["id", "Name"])).toBe('id, "Name"');
+    expect(columnList("mysql", ["a", "b", "c", "d", "e"], "o")).toBe("o.a,\n  o.b,\n  o.c,\n  o.d,\n  o.e");
   });
 });

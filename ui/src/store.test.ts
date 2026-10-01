@@ -139,3 +139,22 @@ describe("deleting a connection", () => {
     expect(Object.keys(st.objects)).toEqual(["c2|main"]);
   });
 });
+
+describe("dropping outputs", () => {
+  it("forgets dropped outputs in runs, output tabs and the list", () => {
+    const o1 = out("r1", "t", 0, { state: "live" });
+    useStore.setState({
+      outputs: [o1, out("r2", "t", 1)],
+      tabs: [{ id: "t", title: "T", sql: "" }, { id: "v", title: "r1", sql: "", output_ref: "r1" }],
+      activeTabId: "v",
+      runs: { t: restoredRun("t", [o1])! },
+    });
+    useStore.getState().forgetOutputs(["r1"]);
+    const st = useStore.getState();
+    expect(st.outputs.map((o) => o.handle)).toEqual(["r2"]);
+    expect(st.tabs.map((t) => t.id)).toEqual(["t"]);
+    expect(st.activeTabId).toBe("t");
+    expect(st.runs.t.statements[0].result).toBeUndefined();
+    expect(st.runs.t.statements[0].notices.at(-1)).toMatch(/dropped/);
+  });
+});

@@ -628,6 +628,22 @@ pub fn rename_output(state: &AppState, handle: &str, name: Option<String>) -> Re
     Ok(o)
 }
 
+/// Drop an output (data, saved snapshot and handle).
+pub async fn drop_output(state: &AppState, reference: String) -> Result<OutputInfo> {
+    let reg = state.engine.outputs().clone();
+    let o = blocking(move || reg.remove(&reference)).await?;
+    state.engine.outputs_changed();
+    Ok(o)
+}
+
+/// Drop every output that is neither pinned nor a tab's latest result.
+pub async fn drop_unpinned_outputs(state: &AppState) -> Result<usize> {
+    let reg = state.engine.outputs().clone();
+    let n = blocking(move || Ok(reg.remove_unpinned())).await?;
+    state.engine.outputs_changed();
+    Ok(n)
+}
+
 pub async fn pin_output(state: &AppState, handle: String, pinned: bool) -> Result<OutputInfo> {
     let reg = state.engine.outputs().clone();
     let o = blocking(move || reg.set_pinned(&handle, pinned)).await?;
