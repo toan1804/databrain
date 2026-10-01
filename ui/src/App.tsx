@@ -9,6 +9,7 @@ import { SaveQueryDialog } from "./components/SaveQueryDialog";
 import { CommandPalette } from "./components/CommandPalette";
 import { ConfirmDialog, Toasts } from "./components/ui";
 import { AiPanel } from "./components/AiPanel";
+import { SplitHandle } from "./components/SplitHandle";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { SignInDialog } from "./components/SignInDialog";
 import { IndexScopeDialog } from "./components/IndexScopeDialog";
@@ -91,44 +92,16 @@ export default function App() {
       .catch(() => {});
   }, []);
 
-  const dragAi = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const move = (ev: MouseEvent) => setAiW(Math.min(760, Math.max(300, window.innerWidth - ev.clientX)));
-    const up = () => {
-      window.removeEventListener("mousemove", move);
-      window.removeEventListener("mouseup", up);
-      document.body.style.cursor = "";
-      setAiW((w) => {
-        localStorage.setItem("db.aiw", String(w));
-        return w;
-      });
-    };
-    document.body.style.cursor = "col-resize";
-    window.addEventListener("mousemove", move);
-    window.addEventListener("mouseup", up);
-  };
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
     document.documentElement.style.colorScheme = theme;
   }, [theme]);
   useGlobalShortcuts();
 
-  const dragSidebar = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const move = (ev: MouseEvent) => setSidebarW(Math.min(560, Math.max(200, ev.clientX)));
-    const up = () => {
-      window.removeEventListener("mousemove", move);
-      window.removeEventListener("mouseup", up);
-      document.body.style.cursor = "";
-      setSidebarW((w) => {
-        localStorage.setItem("db.sidebar", String(w));
-        return w;
-      });
-    };
-    document.body.style.cursor = "col-resize";
-    window.addEventListener("mousemove", move);
-    window.addEventListener("mouseup", up);
-  };
+  const save = (key: string) => (w: number) => localStorage.setItem(key, String(w));
+  // Keep the editor at least 360px wide.
+  const maxSidebar = () => Math.min(640, window.innerWidth - (aiOpen ? aiW : 0) - 360);
+  const maxAi = () => Math.min(1100, window.innerWidth - sidebarW - 360);
 
   if (!ready) {
     return <div className="flex h-full items-center justify-center text-muted">Loading…</div>;
@@ -179,24 +152,30 @@ export default function App() {
         <div style={{ width: sidebarW }} className="shrink-0">
           <Sidebar />
         </div>
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="Resize sidebar"
-          onMouseDown={dragSidebar}
-          className="-ml-[3px] w-[3px] shrink-0 cursor-col-resize hover:bg-accent/40"
+        <SplitHandle
+          side="left"
+          label="Resize sidebar"
+          width={sidebarW}
+          min={200}
+          max={maxSidebar}
+          onChange={setSidebarW}
+          onCommit={save("db.sidebar")}
+          onReset={() => (setSidebarW(300), save("db.sidebar")(300))}
         />
         <div className="min-w-0 flex-1">
           <EditorPane />
         </div>
         {aiOpen && (
           <>
-            <div
-              role="separator"
-              aria-orientation="vertical"
-              aria-label="Resize assistant"
-              onMouseDown={dragAi}
-              className="-mr-[3px] w-[3px] shrink-0 cursor-col-resize hover:bg-accent/40"
+            <SplitHandle
+              side="right"
+              label="Resize assistant"
+              width={aiW}
+              min={300}
+              max={maxAi}
+              onChange={setAiW}
+              onCommit={save("db.aiw")}
+              onReset={() => (setAiW(400), save("db.aiw")(400))}
             />
             <div style={{ width: aiW }} className="shrink-0">
               <AiPanel />
