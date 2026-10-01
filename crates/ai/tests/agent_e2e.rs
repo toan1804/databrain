@@ -175,7 +175,7 @@ async fn fixture(port: u16, policy: AiPolicy) -> Fixture {
         .unwrap();
     secrets.set(&SecretRef::for_ai_provider(&provider.id), &"sk-test".to_string().into()).unwrap();
     // Index knowledge.
-    let r = databrain_ai::knowledge::index_connection(&engine, &conn.id, &|_, _, _| {}).await.unwrap();
+    let r = databrain_ai::knowledge::index_connection(&engine, &conn.id, None, &|_, _, _| {}, &Default::default()).await.unwrap();
     assert_eq!(r.objects, 2);
     Fixture { engine, hub, ws, secrets, conn: conn.id, provider: provider.id, _dir: tempdir_like::Dir(dir) }
 }
@@ -514,4 +514,64 @@ async fn kiro_live_status() {
     if !br.signed_in {
         assert!(br.message.as_deref().unwrap_or("").contains("Sign in with browser"));
     }
+}
+
+// ------------------------------------------------------------------ knowledge: plan, scope, cancel
+
+#[tokio::test]
+async fn knowledge_index_plan_scope_and_cancel() {
+    use databrain_ai::knowledge::{index_connection, plan, scope_matches};
+    let f = fixture(1, AiPolicy::default()).await;
+    let mut reg = ConnectorRegistry::new();
+    reg.register(Arc::new(databrain_connector_duckdb::DuckdbConnector::new()));
+    let engine = QueryEngine::new(reg, f.ws.clone(), f.secrets.clone(), Arc::new(ResultStore::new()), f.hub.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = databrain_connector_core::ConnectionConfig::new(databrain_connector_core::ConnectorKind::Duckdb, databrain_auth::AuthMethod::None);
+    cfg.file_path = Some(dir.path().join("lake.duckdb").to_string_lossy().into());
+    let mut p = f.ws.get_connection(&f.conn).unwrap();
+    p.id = String::new();
+    p.name = "Lake".into();
+    p.config = cfg;
+    let conn = f.ws.save_connection(p).unwrap().id;
+    let mut ddl = String::new();
+    for i in 0..60 {
+        ddl.push_str(&format!("create schema s{i:02}; create table s{i:02}.t{i:02}(id integer, name varchar);"));
+    }
+    let r = RunRequest { connection_id: conn.clone(), tab_id: "setup".into(), sql: ddl, base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None };
+    engine.run_and_wait(&f.hub, r, None).await.unwrap();
+
+    // Plan: one listing + counts, flagged as large.
+    let pl = plan(&engine, &conn).await.unwrap();
+    assert!(pl.large && pl.schemas.len() >= 60, "{} schemas", pl.schemas.len());
+    assert_eq!(pl.schemas.iter().find(|s| s.name == "lake.s07").unwrap().objects, Some(1));
+    assert_eq!(pl.total_objects, Some(60));
+
+    // Explicit scope; catalog wildcard.
+    assert!(scope_matches(&["lake.*".into()], "lake.s01") && !scope_matches(&["lake.*".into()], "lakehouse.s01"));
+    let two = ["lake.s01".to_string(), "LAKE.S02".to_string()];
+    let r = index_connection(&engine, &conn, Some(&two), &|_, _, _| {}, &Default::default()).await.unwrap();
+    assert_eq!((r.schemas, r.objects, r.cancelled), (2, 2, false));
+    assert_eq!(f.ws.kn_count(&conn).unwrap(), 2);
+
+    // Cancel after the first batch: finished schemas stay indexed.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let calls = AtomicUsize::new(0);
+    let c2 = cancel.clone();
+    let progress = move |_: &str, _: usize, _: usize| {
+        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            c2.cancel();
+        }
+    };
+    let all = ["lake.*".to_string()];
+    let r = index_connection(&engine, &conn, Some(&all), &progress, &cancel).await.unwrap();
+    assert!(r.cancelled);
+    assert!(r.objects >= 25 && r.objects < 60, "{}", r.objects);
+    let st = f.ws.kn_state(&conn).unwrap().unwrap();
+    assert!(st.error.as_deref().unwrap_or("").contains("cancelled"), "{:?}", st.error);
+    assert_eq!(st.objects as usize, f.ws.kn_count(&conn).unwrap() as usize);
+
+    // Already cancelled before start.
+    let done = tokio_util::sync::CancellationToken::new();
+    done.cancel();
+    assert!(matches!(index_connection(&engine, &conn, None, &|_, _, _| {}, &done).await, Err(databrain_ai::AiError::Cancelled)));
 }

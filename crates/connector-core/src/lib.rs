@@ -72,6 +72,20 @@ pub trait Session: Send + Sync {
         search_by_listing(self, query, limit).await
     }
 
+    /// Objects and columns of several schemas, for the AI knowledge index.
+    /// Engines with a catalog-wide information schema override this to use
+    /// a couple of queries per catalog instead of two per schema. Errors for
+    /// one schema are reported in its entry.
+    async fn bulk_metadata(&self, schemas: &[String]) -> Result<Vec<SchemaMetadata>> {
+        default_bulk_metadata(self, schemas).await
+    }
+
+    /// Number of tables/views per schema id, when the engine can count them
+    /// in one cheap query (used to size the knowledge index before running it).
+    async fn schema_object_counts(&self) -> Result<Option<HashMap<String, usize>>> {
+        Ok(None)
+    }
+
     /// Columns of every table/view in a schema (bulk, for the AI knowledge
     /// index). The default describes objects one by one.
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
@@ -93,6 +107,24 @@ pub trait Session: Send + Sync {
         }
         Ok(out)
     }
+}
+
+/// Per-schema metadata (the default for [`Session::bulk_metadata`]).
+pub async fn default_bulk_metadata<S: Session + ?Sized>(s: &S, schemas: &[String]) -> Result<Vec<SchemaMetadata>> {
+    let mut out = Vec::with_capacity(schemas.len());
+    for sc in schemas {
+        out.push(match s.list_objects(sc).await {
+            Ok(objects) => {
+                let (columns, error) = match s.schema_columns(sc).await {
+                    Ok(c) => (c, None),
+                    Err(e) => (vec![], Some(e.message)),
+                };
+                SchemaMetadata { schema: sc.clone(), objects, columns, error }
+            }
+            Err(e) => SchemaMetadata { schema: sc.clone(), objects: vec![], columns: vec![], error: Some(e.message) },
+        });
+    }
+    Ok(out)
 }
 
 /// Catalog search by listing every schema (the default for

@@ -40,6 +40,8 @@ pub struct AiState {
     runs: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// Cancels the in-progress interactive sign-in.
     pub sign_in_cancel: Arc<Mutex<CancellationToken>>,
+    /// Knowledge index runs, cancellable by connection id.
+    indexing: Arc<Mutex<HashMap<String, (u64, CancellationToken)>>>,
 }
 
 impl AiState {
@@ -364,10 +366,38 @@ pub fn knowledge(state: &AppState, connection_id: &str) -> Result<KnowledgeView>
     })
 }
 
+/// What indexing would cover (schemas, catalogs, table counts) so the UI
+/// can ask before a large run. Uses one schema listing, no per-schema queries.
+pub async fn knowledge_plan(state: &AppState, connection_id: &str) -> Result<databrain_ai::knowledge::IndexPlan> {
+    databrain_ai::knowledge::plan(&state.engine, connection_id).await.map_err(ai_err)
+}
+
 /// Index in the background; progress/completion via `knowledge-event`.
-pub fn index_knowledge(state: &AppState, connection_id: &str) {
+///
+/// `scope` (schema ids, `catalog.*`, or `*`) limits the run; it is saved as
+/// the connection's `ai_policy.index_schemas` so re-indexing uses it.
+pub fn index_knowledge(state: &AppState, connection_id: &str, scope: Option<Vec<String>>) -> Result<()> {
+    if let Some(sc) = &scope {
+        if sc.is_empty() {
+            return Err(EngineError::new("invalid", "choose at least one catalog or schema to index"));
+        }
+        let mut p = state.workspace.get_connection(connection_id)?;
+        p.ai_policy.index_schemas = if sc.iter().any(|s| s.trim() == "*") { vec!["*".into()] } else { sc.clone() };
+        state.workspace.save_connection(p)?;
+    }
+    static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let cancel = CancellationToken::new();
+    {
+        let mut runs = state.ai.indexing.lock();
+        if runs.get(connection_id).is_some_and(|(_, c)| !c.is_cancelled()) {
+            return Err(EngineError::new("busy", "this connection is already being indexed"));
+        }
+        runs.insert(connection_id.to_string(), (run, cancel.clone()));
+    }
     let engine = state.engine.clone();
     let ui = state.ui.clone();
+    let runs = state.ai.indexing.clone();
     let cid = connection_id.to_string();
     tokio::spawn(async move {
         let ui2 = ui.clone();
@@ -375,15 +405,34 @@ pub fn index_knowledge(state: &AppState, connection_id: &str) {
         let progress = move |schema: &str, done: usize, total: usize| {
             ui2.emit(KNOWLEDGE_EVENT, json!({"type": "progress", "connection_id": c2, "schema": schema, "done": done, "total": total}));
         };
-        let r = databrain_ai::knowledge::index_connection(&engine, &cid, &progress).await;
+        let r = databrain_ai::knowledge::index_connection(&engine, &cid, None, &progress, &cancel).await;
+        {
+            let mut m = runs.lock();
+            if m.get(&cid).is_some_and(|(r, _)| *r == run) {
+                m.remove(&cid);
+            }
+        }
         ui.emit(
             KNOWLEDGE_EVENT,
             match r {
                 Ok(report) => json!({"type": "finished", "connection_id": cid, "report": report}),
+                Err(databrain_ai::AiError::Cancelled) => json!({"type": "cancelled", "connection_id": cid}),
                 Err(e) => json!({"type": "failed", "connection_id": cid, "error": e.to_string()}),
             },
         );
     });
+    Ok(())
+}
+
+/// Stop a running index; schemas finished so far are kept.
+pub fn cancel_index(state: &AppState, connection_id: &str) -> bool {
+    match state.ai.indexing.lock().get(connection_id) {
+        Some((_, c)) => {
+            c.cancel();
+            true
+        }
+        None => false,
+    }
 }
 
 pub fn save_note(state: &AppState, note: KnNote) -> Result<KnNote> {

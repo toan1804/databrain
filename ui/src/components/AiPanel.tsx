@@ -23,6 +23,7 @@ import {
   Trash2,
   Wrench,
   X,
+  ListChecks,
 } from "lucide-react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { api, toError } from "../lib/api";
@@ -664,6 +665,7 @@ function Knowledge() {
   const progress = useAi((s) => s.knowledgeProgress);
   const version = useAi((s) => s.knowledgeVersion);
   const indexKnowledge = useAi((s) => s.indexKnowledge);
+  const cancelIndex = useAi((s) => s.cancelIndex);
   const [connId, setConnId] = useState<string | null>(activeConn ?? connections[0]?.id ?? null);
   const [data, setData] = useState<KnowledgeView | null>(null);
   const [filter, setFilter] = useState("");
@@ -697,6 +699,8 @@ function Knowledge() {
     }
   };
 
+  const scopeList = connections.find((c) => c.id === connId)?.ai_policy?.index_schemas ?? [];
+  const scopeText = scopeList.length === 0 ? "" : scopeList.includes("*") ? "all schemas" : scopeList.join(", ");
   const objects = (data?.objects ?? []).filter((o) => `${o.schema}.${o.name} ${o.comment ?? ""}`.toLowerCase().includes(filter.toLowerCase()));
   const proposed = data?.notes.filter((n) => n.status === "proposed") ?? [];
   const approved = data?.notes.filter((n) => n.status === "approved") ?? [];
@@ -724,16 +728,36 @@ function Knowledge() {
                 : "Not indexed yet. The assistant uses this metadata to find relevant tables."}
             </div>
           </div>
-          <button className="btn-ghost border border-line py-1" disabled={!connId || !!prog} onClick={() => connId && void indexKnowledge(connId)}>
-            {prog ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} {data?.state ? "Re-index" : "Index"}
-          </button>
+          {prog ? (
+            <button className="btn-ghost border border-line py-1" onClick={() => connId && void cancelIndex(connId)} title="Stop indexing; finished schemas are kept">
+              <X size={12} /> Cancel
+            </button>
+          ) : (
+            <>
+              <button
+                className="btn-ghost border border-line py-1"
+                disabled={!connId}
+                title="Choose catalogs and schemas to index"
+                onClick={() => connId && void indexKnowledge(connId, { choose: true })}
+              >
+                <ListChecks size={12} /> Scope…
+              </button>
+              <button className="btn-ghost border border-line py-1" disabled={!connId} onClick={() => connId && void indexKnowledge(connId)}>
+                <RefreshCw size={12} /> {data?.state ? "Re-index" : "Index"}
+              </button>
+            </>
+          )}
         </div>
+        {scopeText && <div className="mt-1 truncate text-[11px] text-muted" title={scopeText}>Scope: {scopeText}</div>}
         {prog && (
           <div className="mt-2">
             <div className="h-1.5 overflow-hidden rounded bg-panel-2">
               <div className="h-full bg-accent transition-all" style={{ width: `${prog.total ? (prog.done / prog.total) * 100 : 5}%` }} />
             </div>
-            <div className="mt-1 truncate text-[11px] text-muted">{prog.schema ? `${prog.done}/${prog.total} · ${prog.schema}` : "Starting…"}</div>
+            <div className="mt-1 flex items-center gap-1.5 truncate text-[11px] text-muted">
+              <Loader2 size={11} className="shrink-0 animate-spin" />
+              {prog.total ? `${prog.done}/${prog.total} schemas${prog.schema ? ` · ${prog.schema}` : ""}` : prog.schema || "Starting…"}
+            </div>
           </div>
         )}
         {data?.state?.error && <div className="mt-1 text-[11.5px] text-danger">{data.state.error}</div>}

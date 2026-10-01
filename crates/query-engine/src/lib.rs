@@ -657,6 +657,19 @@ impl QueryEngine {
         .await
     }
 
+    pub async fn bulk_metadata(&self, connection_id: &str, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
+        let schemas = schemas.to_vec();
+        self.with_meta(connection_id, |s| {
+            let schemas = schemas.clone();
+            async move { s.bulk_metadata(&schemas).await }
+        })
+        .await
+    }
+
+    pub async fn schema_object_counts(&self, connection_id: &str) -> Result<Option<std::collections::HashMap<String, usize>>> {
+        self.with_meta(connection_id, |s| async move { s.schema_object_counts().await }).await
+    }
+
     pub async fn schema_columns(&self, connection_id: &str, schema: &str) -> Result<Vec<databrain_connector_core::TableColumns>> {
         let schema = schema.to_string();
         self.with_meta(connection_id, |s| {

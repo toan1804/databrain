@@ -245,9 +245,16 @@ async fn kn_get(state: State<'_, AppState>, connection_id: String) -> R<ai_api::
     ai_api::knowledge(&state, &connection_id)
 }
 #[tauri::command]
-async fn kn_index(state: State<'_, AppState>, connection_id: String) -> R<()> {
-    ai_api::index_knowledge(&state, &connection_id);
-    Ok(())
+async fn kn_index(state: State<'_, AppState>, connection_id: String, scope: Option<Vec<String>>) -> R<()> {
+    ai_api::index_knowledge(&state, &connection_id, scope)
+}
+#[tauri::command]
+async fn kn_plan(state: State<'_, AppState>, connection_id: String) -> R<databrain_ai::knowledge::IndexPlan> {
+    ai_api::knowledge_plan(&state, &connection_id).await
+}
+#[tauri::command]
+async fn kn_cancel(state: State<'_, AppState>, connection_id: String) -> R<bool> {
+    Ok(ai_api::cancel_index(&state, &connection_id))
 }
 #[tauri::command]
 async fn kn_save_note(state: State<'_, AppState>, note: databrain_workspace::KnNote) -> R<databrain_workspace::KnNote> {
@@ -577,6 +584,8 @@ pub fn run() {
             mcp_config,
             kn_get,
             kn_index,
+            kn_plan,
+            kn_cancel,
             kn_save_note,
             kn_delete_note,
             kn_clear,

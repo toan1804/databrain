@@ -10,7 +10,8 @@ use databrain_workspace::{KnObject, KnState, NoteStatus, Workspace, now_ms};
 use serde::Serialize;
 
 use crate::policy::is_pii;
-use crate::types::Result;
+use crate::types::{AiError, Result};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexReport {
@@ -19,6 +20,8 @@ pub struct IndexReport {
     pub changed: usize,
     pub removed: usize,
     pub errors: Vec<String>,
+    /// Stopped by the user; schemas indexed before that are kept.
+    pub cancelled: bool,
 }
 
 /// Progress callback: (schema, done, total).
@@ -33,64 +36,183 @@ fn system_schema(name: &str) -> bool {
     ) || last.starts_with("pg_temp")
 }
 
-/// (Re)index a connection's metadata. Honors `ai_policy.index_schemas`.
-pub async fn index_connection(engine: &Arc<QueryEngine>, connection_id: &str, progress: Progress<'_>) -> Result<IndexReport> {
+/// Does a schema id match an index scope entry? Entries are schema ids
+/// (`main.sales`, `public`), `catalog.*` for a whole catalog, or `*`.
+pub fn scope_matches(scope: &[String], schema: &str) -> bool {
+    scope.iter().any(|w| {
+        let w = w.trim();
+        w == "*"
+            || w.eq_ignore_ascii_case(schema)
+            || w.strip_suffix(".*").is_some_and(|c| schema.len() > c.len() && schema[..c.len()].eq_ignore_ascii_case(c) && schema.as_bytes()[c.len()] == b'.')
+    })
+}
+
+/// Above these sizes the UI asks which catalogs/schemas to index.
+pub const LARGE_SCHEMAS: usize = 25;
+pub const LARGE_CATALOGS: usize = 3;
+pub const LARGE_OBJECTS: usize = 1000;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanSchema {
+    /// Schema id (`catalog.schema` for three-level engines).
+    pub name: String,
+    pub catalog: Option<String>,
+    pub is_default: bool,
+    /// information_schema, pg_catalog …: not indexed unless chosen.
+    pub system: bool,
+    /// Tables/views, when the engine can count them cheaply.
+    pub objects: Option<usize>,
+    /// In the saved scope (or, with no saved scope, indexed by default).
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexPlan {
+    pub schemas: Vec<PlanSchema>,
+    /// Saved scope (`ai_policy.index_schemas`); empty = never chosen (all
+    /// non-system schemas), `["*"]` = all chosen explicitly.
+    pub scope: Vec<String>,
+    pub catalogs: usize,
+    pub total_objects: Option<usize>,
+    /// Big enough that the user should pick what to index.
+    pub large: bool,
+}
+
+/// What an index run would cover: one schema listing (+ one count query
+/// where supported). No per-schema queries.
+pub async fn plan(engine: &Arc<QueryEngine>, connection_id: &str) -> Result<IndexPlan> {
+    let profile = engine.workspace().get_connection(connection_id)?;
+    let scope = profile.ai_policy.index_schemas.clone();
+    let list = engine.list_schemas(connection_id).await?;
+    let counts = engine.schema_object_counts(connection_id).await.ok().flatten();
+    let schemas: Vec<PlanSchema> = list
+        .into_iter()
+        .map(|s| {
+            let system = system_schema(&s.name);
+            PlanSchema {
+                selected: if scope.is_empty() || scope.iter().all(|w| w.trim() == "*") { !system } else { scope_matches(&scope, &s.name) },
+                objects: counts.as_ref().map(|c| c.get(&s.name).copied().unwrap_or(0)),
+                system,
+                catalog: s.catalog,
+                is_default: s.is_default,
+                name: s.name,
+            }
+        })
+        .collect();
+    let catalogs = schemas.iter().filter_map(|s| s.catalog.as_deref()).collect::<HashSet<_>>().len();
+    let total_objects = counts.map(|_| schemas.iter().filter(|s| !s.system).filter_map(|s| s.objects).sum());
+    let user = schemas.iter().filter(|s| !s.system).count();
+    let large = user > LARGE_SCHEMAS || catalogs > LARGE_CATALOGS || total_objects.is_some_and(|n| n > LARGE_OBJECTS);
+    Ok(IndexPlan { schemas, scope, catalogs, total_objects, large })
+}
+
+/// Schemas per metadata batch: progress and cancellation happen between
+/// batches (engines with bulk metadata use ~2 queries per batch).
+const BATCH: usize = 25;
+
+/// (Re)index a connection's metadata. `scope` overrides
+/// `ai_policy.index_schemas` (entries as in [`scope_matches`]; empty = all
+/// non-system schemas). Stops at the next batch boundary, or immediately
+/// for an in-flight request, when `cancel` fires; already indexed schemas
+/// are kept.
+pub async fn index_connection(
+    engine: &Arc<QueryEngine>,
+    connection_id: &str,
+    scope: Option<&[String]>,
+    progress: Progress<'_>,
+    cancel: &CancellationToken,
+) -> Result<IndexReport> {
     let ws = engine.workspace().clone();
     let profile = ws.get_connection(connection_id)?;
-    let wanted = &profile.ai_policy.index_schemas;
-    let schemas: Vec<String> = engine
-        .list_schemas(connection_id)
-        .await?
+    let wanted: Vec<String> = scope.map(<[String]>::to_vec).unwrap_or_else(|| profile.ai_policy.index_schemas.clone());
+    let listed = tokio::select! {
+        r = engine.list_schemas(connection_id) => r?,
+        _ = cancel.cancelled() => return Err(AiError::Cancelled),
+    };
+    let schemas: Vec<String> = listed
         .into_iter()
         .map(|s| s.name)
-        .filter(|s| if wanted.is_empty() { !system_schema(s) } else { wanted.iter().any(|w| w.eq_ignore_ascii_case(s)) })
+        .filter(|s| if wanted.is_empty() || wanted.iter().all(|w| w.trim() == "*") { !system_schema(s) } else { scope_matches(&wanted, s) })
         .collect();
-    let mut report = IndexReport { schemas: schemas.len(), objects: 0, changed: 0, removed: 0, errors: vec![] };
-    for (i, schema) in schemas.iter().enumerate() {
-        progress(schema, i, schemas.len());
-        let objects = match engine.list_objects(connection_id, schema).await {
-            Ok(o) => o,
+    let mut report = IndexReport { schemas: schemas.len(), objects: 0, changed: 0, removed: 0, errors: vec![], cancelled: false };
+    let mut done: Vec<String> = Vec::new();
+    for batch in schemas.chunks(BATCH) {
+        if cancel.is_cancelled() {
+            report.cancelled = true;
+            break;
+        }
+        progress(&batch[0], done.len(), schemas.len());
+        let metas = tokio::select! {
+            r = engine.bulk_metadata(connection_id, batch) => r,
+            _ = cancel.cancelled() => { report.cancelled = true; break; }
+        };
+        let metas = match metas {
+            Ok(m) => m,
             Err(e) => {
-                report.errors.push(format!("{schema}: {}", e.message));
+                report.errors.push(format!("{}…: {}", batch[0], e.message));
                 continue;
             }
         };
-        let cols = match engine.schema_columns(connection_id, schema).await {
-            Ok(c) => c,
-            Err(e) => {
-                report.errors.push(format!("{schema}: {}", e.message));
-                vec![]
-            }
-        };
-        let items: Vec<KnObject> = objects
-            .into_iter()
-            .filter(|o| !matches!(o.kind, databrain_connector_core::ObjectKind::Function | databrain_connector_core::ObjectKind::Procedure | databrain_connector_core::ObjectKind::Sequence))
-            .map(|o| {
-                let tc = cols.iter().find(|t| t.table == o.name);
-                KnObject {
-                    schema: schema.clone(),
-                    kind: serde_json::to_value(o.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "table".into()),
-                    comment: o.comment,
-                    row_estimate: o.row_estimate,
-                    columns: tc.map(|t| t.columns.clone()).unwrap_or_default(),
-                    foreign_keys: tc.map(|t| t.foreign_keys.clone()).unwrap_or_default(),
-                    name: o.name,
+        for m in metas {
+            if let Some(e) = &m.error {
+                report.errors.push(format!("{}: {e}", m.schema));
+                if m.objects.is_empty() {
+                    continue;
                 }
-            })
-            .collect();
-        report.objects += items.len();
-        let d = ws.kn_replace_schema(connection_id, schema, &items)?;
-        report.changed += d.changed;
-        report.removed += d.removed;
+            }
+            let items: Vec<KnObject> = m
+                .objects
+                .into_iter()
+                .filter(|o| !matches!(o.kind, databrain_connector_core::ObjectKind::Function | databrain_connector_core::ObjectKind::Procedure | databrain_connector_core::ObjectKind::Sequence))
+                .map(|o| {
+                    let tc = m.columns.iter().find(|t| t.table == o.name);
+                    KnObject {
+                        schema: m.schema.clone(),
+                        kind: serde_json::to_value(o.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "table".into()),
+                        comment: o.comment,
+                        row_estimate: o.row_estimate,
+                        columns: tc.map(|t| t.columns.clone()).unwrap_or_default(),
+                        foreign_keys: tc.map(|t| t.foreign_keys.clone()).unwrap_or_default(),
+                        name: o.name,
+                    }
+                })
+                .collect();
+            report.objects += items.len();
+            let d = ws.kn_replace_schema(connection_id, &m.schema, &items)?;
+            report.changed += d.changed;
+            report.removed += d.removed;
+            done.push(m.schema);
+        }
     }
-    report.removed += ws.kn_retain_schemas(connection_id, &schemas)?;
-    progress("", schemas.len(), schemas.len());
+    let indexed = if report.cancelled {
+        // Partial run: keep earlier results for schemas not reached.
+        let mut all: Vec<String> = ws.kn_state(connection_id)?.map(|s| s.schemas).unwrap_or_default();
+        all.retain(|s| schemas.contains(s));
+        for s in &done {
+            if !all.contains(s) {
+                all.push(s.clone());
+            }
+        }
+        all
+    } else {
+        report.removed += ws.kn_retain_schemas(connection_id, &schemas)?;
+        schemas.clone()
+    };
+    progress("", done.len(), schemas.len());
+    let mut error: Vec<String> = Vec::new();
+    if report.cancelled {
+        error.push(format!("Indexing cancelled after {} of {} schemas", done.len(), schemas.len()));
+    }
+    error.extend(report.errors.iter().take(20).cloned());
+    if report.errors.len() > 20 {
+        error.push(format!("…and {} more errors", report.errors.len() - 20));
+    }
     ws.kn_set_state(&KnState {
         connection_id: connection_id.to_string(),
         indexed_at: now_ms(),
         objects: ws.kn_count(connection_id)?,
-        schemas: schemas.clone(),
-        error: (!report.errors.is_empty()).then(|| report.errors.join("; ")),
+        schemas: indexed,
+        error: (!error.is_empty()).then(|| error.join("; ")),
     })?;
     Ok(report)
 }

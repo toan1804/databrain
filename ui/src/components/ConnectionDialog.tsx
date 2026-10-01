@@ -913,12 +913,12 @@ function ConnectionForm({ initial }: { initial: ConnectionProfile | null }) {
                 />
               </div>
               <div>
-                <Label htmlFor="ai-schemas">Schemas to index for knowledge (empty = all)</Label>
+                <Label htmlFor="ai-schemas">Schemas to index for knowledge (empty = ask for large databases, * = all)</Label>
                 <input
                   id="ai-schemas"
                   className="field font-mono text-[12px]"
                   value={policy.index_schemas.join(", ")}
-                  placeholder="public, analytics"
+                  placeholder="public, analytics, main.*"
                   onChange={(e) => setPolicy({ ...policy, index_schemas: e.target.value.split(",").map((x) => x.trim()).filter(Boolean) })}
                 />
               </div>

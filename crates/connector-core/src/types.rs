@@ -356,6 +356,15 @@ pub struct ObjectDetail {
     pub foreign_keys: Vec<ForeignKey>,
 }
 
+/// One schema's metadata from [`crate::Session::bulk_metadata`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaMetadata {
+    pub schema: String,
+    pub objects: Vec<DbObject>,
+    pub columns: Vec<TableColumns>,
+    pub error: Option<String>,
+}
+
 /// Column metadata for a whole schema (bulk introspection for knowledge).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TableColumns {

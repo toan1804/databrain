@@ -13,7 +13,7 @@ use databrain_connector_core::value::Column;
 use databrain_connector_core::{
     Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind,
     DbObject, ExecOptions, ExecSummary, FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result,
-    SchemaInfo, Session, StreamEvent, StreamSender, TableColumns, quote_ident, quote_literal,
+    SchemaInfo, SchemaMetadata, Session, StreamEvent, StreamSender, TableColumns, quote_ident, quote_literal,
 };
 use secrecy::ExposeSecret;
 use serde_json::json;
@@ -455,9 +455,104 @@ impl Session for DbxSession {
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
         self.0.schema_columns_filtered(schema, None).await
     }
+
+    /// Two queries per catalog (tables + columns from the catalog's
+    /// information schema) instead of two per schema.
+    async fn bulk_metadata(&self, schemas: &[String]) -> Result<Vec<SchemaMetadata>> {
+        let mut by_cat: Vec<(String, Vec<String>)> = Vec::new();
+        for s in schemas {
+            let (c, sch) = split_schema(s)?;
+            match by_cat.iter_mut().find(|(k, _)| k == c) {
+                Some((_, v)) => v.push(sch.to_string()),
+                None => by_cat.push((c.to_string(), vec![sch.to_string()])),
+            }
+        }
+        let mut out = Vec::with_capacity(schemas.len());
+        for (cat, list) in by_cat {
+            for chunk in list.chunks(200) {
+                match self.0.catalog_metadata(&cat, chunk).await {
+                    Ok(v) => out.extend(v),
+                    // e.g. hive_metastore without information_schema: per schema.
+                    Err(_) => {
+                        let ids: Vec<String> = chunk.iter().map(|s| format!("{cat}.{s}")).collect();
+                        out.extend(databrain_connector_core::default_bulk_metadata(self, &ids).await?);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn schema_object_counts(&self) -> Result<Option<std::collections::HashMap<String, usize>>> {
+        let rows = match self
+            .0
+            .run_small("SELECT table_catalog, table_schema, count(*) FROM system.information_schema.tables GROUP BY 1, 2")
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(
+            rows.iter()
+                .filter_map(|r| Some((format!("{}.{}", cell(r, 0)?, cell(r, 1)?), cell(r, 2)?.parse().ok()?)))
+                .collect(),
+        ))
+    }
 }
 
 impl Inner {
+    async fn catalog_metadata(&self, cat: &str, schemas: &[String]) -> Result<Vec<SchemaMetadata>> {
+        let list = schemas.iter().map(|s| quote_literal(s)).collect::<Vec<_>>().join(", ");
+        let cq = quote_ident(ConnectorKind::Databricks, cat);
+        let tables = self
+            .run_small(&format!(
+                "SELECT table_schema, table_name, table_type, comment FROM {cq}.information_schema.tables WHERE table_schema IN ({list})"
+            ))
+            .await?;
+        let cols = self
+            .run_small(&format!(
+                "SELECT table_schema, table_name, column_name, full_data_type, is_nullable, comment FROM {cq}.information_schema.columns \
+                 WHERE table_schema IN ({list}) ORDER BY table_schema, table_name, ordinal_position"
+            ))
+            .await?;
+        let mut out: Vec<SchemaMetadata> = schemas
+            .iter()
+            .map(|s| SchemaMetadata { schema: format!("{cat}.{s}"), objects: vec![], columns: vec![], error: None })
+            .collect();
+        let idx = |s: &str| schemas.iter().position(|x| x == s);
+        for r in &tables {
+            let (Some(s), Some(name)) = (cell(r, 0), cell(r, 1)) else { continue };
+            let Some(i) = idx(&s) else { continue };
+            let t = cell(r, 2).unwrap_or_default();
+            let schema = out[i].schema.clone();
+            out[i].objects.push(DbObject {
+                schema,
+                name,
+                kind: if t.contains("VIEW") { if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else { ObjectKind::Table },
+                comment: cell(r, 3),
+                row_estimate: None,
+            });
+        }
+        for r in &cols {
+            let (Some(s), Some(table)) = (cell(r, 0), cell(r, 1)) else { continue };
+            let Some(i) = idx(&s) else { continue };
+            let col = ColumnInfo {
+                name: cell(r, 2).unwrap_or_default(),
+                data_type: cell(r, 3).unwrap_or_default(),
+                nullable: cell(r, 4).as_deref() != Some("NO"),
+                is_primary_key: false,
+                default: None,
+                comment: cell(r, 5),
+            };
+            let cs = &mut out[i].columns;
+            match cs.last_mut() {
+                Some(t) if t.table == table => t.columns.push(col),
+                _ => cs.push(TableColumns { table, columns: vec![col], foreign_keys: vec![] }),
+            }
+        }
+        Ok(out)
+    }
+
     async fn schema_columns_filtered(&self, schema: &str, table: Option<&str>) -> Result<Vec<TableColumns>> {
         let (cat, sch) = split_schema(schema)?;
         let mut sql = format!(

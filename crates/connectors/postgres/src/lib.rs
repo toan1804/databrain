@@ -406,6 +406,19 @@ impl Session for PgSession {
             .collect())
     }
 
+    async fn schema_object_counts(&self) -> Result<Option<std::collections::HashMap<String, usize>>> {
+        let rows = self
+            .client
+            .query(
+                "select n.nspname::text, count(*) from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 where c.relkind in ('r','p','v','m','f') and not c.relispartition group by 1",
+                &[],
+            )
+            .await
+            .map_err(|e| map_err(&e))?;
+        Ok(Some(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1) as usize)).collect()))
+    }
+
     async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
         let term = databrain_connector_core::search_sql_term(query);
         let rows = self

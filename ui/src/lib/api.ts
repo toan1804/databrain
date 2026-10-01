@@ -17,6 +17,7 @@ import type {
   Folder,
   FolderKind,
   KnNote,
+  IndexPlan,
   KnowledgeEvent,
   KnowledgeView,
   KiroStatus,
@@ -175,7 +176,9 @@ export const api = {
   mcpConfig: () => call<unknown>("mcp_config"),
 
   knGet: (connectionId: string) => call<KnowledgeView>("kn_get", { connectionId }),
-  knIndex: (connectionId: string) => call<void>("kn_index", { connectionId }),
+  knPlan: (connectionId: string) => call<IndexPlan>("kn_plan", { connectionId }),
+  knCancel: (connectionId: string) => call<boolean>("kn_cancel", { connectionId }),
+  knIndex: (connectionId: string, scope?: string[] | null) => call<void>("kn_index", { connectionId, scope: scope ?? null }),
   knClear: (connectionId: string) => call<void>("kn_clear", { connectionId }),
   knSaveNote: (note: KnNote) => call<KnNote>("kn_save_note", { note }),
   knDeleteNote: (id: string) => call<void>("kn_delete_note", { id }),

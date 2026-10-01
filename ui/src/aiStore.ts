@@ -4,6 +4,7 @@
 import { create } from "zustand";
 import { api, isTauri, onAiEvent, onKnowledgeEvent, toError } from "./lib/api";
 import type {
+  IndexPlan,
   AgentEvent,
   AiMode,
   AiUiRequest,
@@ -75,6 +76,8 @@ interface AiState {
   knowledgeProgress: Record<string, { schema: string; done: number; total: number } | undefined>;
   knowledgeVersion: number;
   sessionsVersion: number;
+  /** Scope picker shown before indexing a large connection. */
+  indexPicker: { connectionId: string; plan: IndexPlan } | null;
 
   init: () => Promise<void>;
   setOpen: (open: boolean, view?: AiView) => void;
@@ -87,7 +90,13 @@ interface AiState {
   loadSession: (id: string) => Promise<void>;
   respondApproval: (itemId: string, approved: boolean, editedSql?: string) => Promise<void>;
   respondEdit: (itemId: string, accepted: boolean) => Promise<void>;
-  indexKnowledge: (connectionId: string) => Promise<void>;
+  /**
+   * Index a connection. Without `scope`, large connections whose scope was
+   * never chosen open the scope picker instead; `choose` always opens it.
+   */
+  indexKnowledge: (connectionId: string, opts?: { scope?: string[]; choose?: boolean }) => Promise<void>;
+  cancelIndex: (connectionId: string) => Promise<void>;
+  closeIndexPicker: () => void;
 }
 
 /** Connection for notebook cell editor keys (registered by the notebook view). */
@@ -244,6 +253,7 @@ export const useAi = create<AiState>((set, get) => {
     tokens: { input: 0, output: 0 },
     knowledgeProgress: {},
     knowledgeVersion: 0,
+    indexPicker: null,
     sessionsVersion: 0,
 
     init: async () => {
@@ -263,6 +273,9 @@ export const useAi = create<AiState>((set, get) => {
         }));
         const toast = useStore.getState().toast;
         if (e.type === "failed") toast(`Indexing failed: ${e.error}`, "error");
+        else if (e.type === "cancelled") toast("Indexing cancelled", "info");
+        else if (e.report.cancelled)
+          toast(`Indexing cancelled. Kept ${e.report.objects} objects already indexed.`, "info");
         else
           toast(
             `Indexed ${e.report.objects} objects in ${e.report.schemas} schemas` +
@@ -414,14 +427,44 @@ export const useAi = create<AiState>((set, get) => {
       await api.aiRespond(item.requestId, { accepted: ok });
     },
 
-    indexKnowledge: async (connectionId) => {
-      set((s) => ({ knowledgeProgress: { ...s.knowledgeProgress, [connectionId]: { schema: "", done: 0, total: 0 } } }));
+    indexKnowledge: async (connectionId, opts = {}) => {
+      const toast = useStore.getState().toast;
+      if (!opts.scope) {
+        // Size the run first (one schema listing) and ask when it is large.
+        set((s) => ({ knowledgeProgress: { ...s.knowledgeProgress, [connectionId]: { schema: "Checking size…", done: 0, total: 0 } } }));
+        let plan: IndexPlan;
+        try {
+          plan = await api.knPlan(connectionId);
+        } catch (e) {
+          set((s) => ({ knowledgeProgress: { ...s.knowledgeProgress, [connectionId]: undefined } }));
+          toast(toError(e).message, "error");
+          return;
+        }
+        set((s) => ({ knowledgeProgress: { ...s.knowledgeProgress, [connectionId]: undefined } }));
+        if (opts.choose || (plan.large && plan.scope.length === 0)) {
+          set({ indexPicker: { connectionId, plan } });
+          return;
+        }
+      }
+      set((s) => ({ indexPicker: null, knowledgeProgress: { ...s.knowledgeProgress, [connectionId]: { schema: "", done: 0, total: 0 } } }));
       try {
-        await api.knIndex(connectionId);
+        await api.knIndex(connectionId, opts.scope ?? null);
+        // The chosen scope is saved on the connection.
+        if (opts.scope) void useStore.getState().refreshConnections();
       } catch (e) {
         set((s) => ({ knowledgeProgress: { ...s.knowledgeProgress, [connectionId]: undefined } }));
+        toast(toError(e).message, "error");
+      }
+    },
+    cancelIndex: async (connectionId) => {
+      try {
+        const running = await api.knCancel(connectionId);
+        if (!running) set((s) => ({ knowledgeProgress: { ...s.knowledgeProgress, [connectionId]: undefined } }));
+        else set((s) => ({ knowledgeProgress: { ...s.knowledgeProgress, [connectionId]: { ...(s.knowledgeProgress[connectionId] ?? { done: 0, total: 0 }), schema: "Cancelling…" } } }));
+      } catch (e) {
         useStore.getState().toast(toError(e).message, "error");
       }
     },
+    closeIndexPicker: () => set({ indexPicker: null }),
   };
 });

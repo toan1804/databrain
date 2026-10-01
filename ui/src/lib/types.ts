@@ -668,5 +668,28 @@ export interface KnowledgeView {
 
 export type KnowledgeEvent =
   | { type: "progress"; connection_id: string; schema: string; done: number; total: number }
-  | { type: "finished"; connection_id: string; report: { schemas: number; objects: number; changed: number; removed: number; errors: string[] } }
+  | {
+      type: "finished";
+      connection_id: string;
+      report: { schemas: number; objects: number; changed: number; removed: number; errors: string[]; cancelled: boolean };
+    }
+  | { type: "cancelled"; connection_id: string }
   | { type: "failed"; connection_id: string; error: string };
+
+export interface PlanSchema {
+  name: string;
+  catalog?: string | null;
+  is_default: boolean;
+  system: boolean;
+  objects: number | null;
+  selected: boolean;
+}
+
+export interface IndexPlan {
+  schemas: PlanSchema[];
+  /** Saved scope; empty = never chosen, ["*"] = all. */
+  scope: string[];
+  catalogs: number;
+  total_objects: number | null;
+  large: boolean;
+}

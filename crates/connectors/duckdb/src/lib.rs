@@ -522,6 +522,18 @@ impl Session for DuckSession {
             .collect())
     }
 
+    async fn schema_object_counts(&self) -> Result<Option<std::collections::HashMap<String, usize>>> {
+        let rows = self
+            .strings(
+                "select s, count(*)::varchar from (select database_name || '.' || schema_name s from duckdb_tables() where not internal \
+                 union all select database_name || '.' || schema_name from duckdb_views() where not internal) group by 1"
+                    .into(),
+                vec![],
+            )
+            .await?;
+        Ok(Some(rows.into_iter().filter_map(|r| Some((r[0].clone()?, r[1].as_deref()?.parse().ok()?))).collect()))
+    }
+
     async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
         let term = databrain_connector_core::search_sql_term(query);
         let rows = self

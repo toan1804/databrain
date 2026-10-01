@@ -11,6 +11,7 @@ import { ConfirmDialog, Toasts } from "./components/ui";
 import { AiPanel } from "./components/AiPanel";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { SignInDialog } from "./components/SignInDialog";
+import { IndexScopeDialog } from "./components/IndexScopeDialog";
 import { InlineAi } from "./components/InlineAi";
 import { useAi } from "./aiStore";
 
@@ -207,6 +208,7 @@ export default function App() {
       <CommandPalette />
       <SettingsDialog />
       <SignInDialog />
+      <IndexScopeDialog />
       <InlineAi />
       <ConfirmDialog />
       <Toasts />
