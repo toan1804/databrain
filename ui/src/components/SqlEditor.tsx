@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useRef } from "react";
-import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
+import { useEffect, useRef } from "react";
+import { closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { MSSQL, MySQL, PLSQL, PostgreSQL, SQLite, StandardSQL, sql, type SQLDialect, type SQLNamespace } from "@codemirror/lang-sql";
 import { HighlightStyle, bracketMatching, indentOnInput, syntaxHighlighting } from "@codemirror/language";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
 import { Compartment, EditorState, StateEffect, StateField, type Extension } from "@codemirror/state";
@@ -20,6 +19,7 @@ import { tags as t } from "@lezer/highlight";
 import type { ConnectorKind } from "../lib/types";
 import { useStore } from "../store";
 import { editorBridge } from "../editorBridge";
+import { canFetchMetadata, sqlAssist, sqlLanguage } from "./sqlAssist";
 
 export const highlight = HighlightStyle.define([
   { tag: [t.keyword, t.operatorKeyword, t.modifier], color: "var(--syn-keyword)", fontWeight: "500" },
@@ -56,62 +56,9 @@ export const errorField = StateField.define<DecorationSet>({
 
 // ---- editor -----------------------------------------------------------------
 
-const DIALECTS: Record<ConnectorKind, SQLDialect> = {
-  postgres: PostgreSQL,
-  mysql: MySQL,
-  sqlite: SQLite,
-  mssql: MSSQL,
-  oracle: PLSQL,
-  snowflake: StandardSQL,
-  databricks: MySQL, // backtick identifiers
-  bigquery: MySQL, // backtick identifiers
-  duckdb: PostgreSQL,
-};
-
-export function langExtension(kind: ConnectorKind | undefined, schema: SQLNamespace | undefined, defaultSchema?: string): Extension {
-  return sql({
-    dialect: kind ? DIALECTS[kind] : PostgreSQL,
-    schema,
-    defaultSchema,
-    upperCaseKeywords: false,
-  });
-}
-
-/** Build the completion namespace from explorer metadata already loaded. */
-export function useCompletionSchema(connId: string | null | undefined): { ns?: SQLNamespace; def?: string } {
-  const schemas = useStore((s) => (connId ? s.schemas[connId] : undefined));
-  const objects = useStore((s) => s.objects);
-  const columns = useStore((s) => s.columns);
-  const isDuck = useStore((s) => s.connections.find((c) => c.id === connId)?.config.kind === "duckdb");
-  const outputs = useStore((s) => s.outputs);
-  return useMemo(() => {
-    if (!connId) return {};
-    const ns: Record<string, Record<string, string[]>> = {};
-    if (isDuck) {
-      // Outputs: results.<handle>, results.<name>, results.<name>__k
-      const res: Record<string, string[]> = {};
-      for (const o of outputs) {
-        if (o.state === "evicted") continue;
-        const cols = o.columns.map((c) => c.name);
-        res[o.handle] = cols;
-        if (o.name) res[o.name] = cols;
-        if (o.version_of) res[`${o.version_of[0]}__${o.version_of[1]}`] = cols;
-      }
-      if (Object.keys(res).length) ns.results = res;
-    }
-    if (!schemas) return Object.keys(ns).length ? { ns } : {};
-    for (const sc of schemas) {
-      const objs = objects[`${connId}|${sc.name}`];
-      if (!objs) continue;
-      const tables: Record<string, string[]> = {};
-      for (const o of objs) {
-        if (o.kind === "function" || o.kind === "procedure") continue;
-        tables[o.name] = (columns[`${connId}|${sc.name}|${o.name}`] ?? []).map((c) => c.name);
-      }
-      ns[sc.name] = tables;
-    }
-    return { ns, def: schemas.find((s) => s.is_default)?.name };
-  }, [connId, schemas, objects, columns, isDuck, outputs]);
+/** Highlighting for the connection's dialect (completion comes from sqlAssist). */
+export function langExtension(kind: ConnectorKind | undefined): Extension {
+  return sqlLanguage(kind);
 }
 
 export interface EditorHandle {
@@ -125,7 +72,6 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
   const tab = useStore((s) => s.tabs.find((x) => x.id === tabId));
   const conn = useStore((s) => s.connections.find((c) => c.id === tab?.connection_id));
   const errorRange = useStore((s) => s.runs[tabId]?.errorRange);
-  const { ns, def } = useCompletionSchema(tab?.connection_id);
 
   // Create the view once per tab.
   useEffect(() => {
@@ -153,13 +99,14 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
           indentOnInput(),
           bracketMatching(),
           closeBrackets(),
-          autocompletion({ activateOnTyping: true, icons: false }),
+          // Keywords for the clause, the connection's tables and columns.
+          sqlAssist(() => useStore.getState().tabs.find((x) => x.id === tabId)?.connection_id),
           highlightActiveLine(),
           highlightSelectionMatches(),
           syntaxHighlighting(highlight),
           placeholder("Write SQL…  ⌘↵ run statement · ⇧⌘↵ run all"),
           errorField,
-          lang.current.of(langExtension(undefined, undefined)),
+          lang.current.of(langExtension(undefined)),
           keymap.of([
             { key: "Mod-Enter", run: run("statement"), preventDefault: true },
             { key: "Shift-Mod-Enter", run: run("all"), preventDefault: true },
@@ -206,12 +153,11 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
     };
   }, [tabId]);
 
-  // Keep dialect + completion schema in sync.
+  // Keep the dialect in sync; prefetch schemas for completion.
   useEffect(() => {
-    viewRef.current?.dispatch({
-      effects: lang.current.reconfigure(langExtension(conn?.config.kind, ns, def)),
-    });
-  }, [conn?.config.kind, ns, def]);
+    viewRef.current?.dispatch({ effects: lang.current.reconfigure(langExtension(conn?.config.kind)) });
+    if (conn && canFetchMetadata(conn)) useStore.getState().loadSchemas(conn.id).catch(() => {});
+  }, [conn?.config.kind, conn?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // External document changes (e.g. opening a saved query into this tab).
   useEffect(() => {

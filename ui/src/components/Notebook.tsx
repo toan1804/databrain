@@ -5,7 +5,7 @@
 // (`nb:{notebook}`), so temp tables and session settings carry across cells.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
+import { closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { bracketMatching, indentOnInput, syntaxHighlighting } from "@codemirror/language";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
@@ -36,7 +36,8 @@ import { formatCount, formatDuration, uid } from "../lib/util";
 import { useStore } from "../store";
 import { registerKeyConnection, useAi } from "../aiStore";
 import { editorBridge } from "../editorBridge";
-import { errorField, highlight, langExtension, setError, useCompletionSchema } from "./SqlEditor";
+import { errorField, highlight, langExtension, setError } from "./SqlEditor";
+import { canFetchMetadata, sqlAssist } from "./sqlAssist";
 import { ResultsPanel } from "./ResultsPanel";
 import { Markdown } from "./Markdown";
 import { ConnDot, EnvBadge } from "./ui";
@@ -640,7 +641,9 @@ function CellEditor({
   const cb = useRef({ onChange, onRun, onRunAdvance, onFocus });
   cb.current = { onChange, onRun, onRunAdvance, onFocus };
   const conn = useStore((s) => s.connections.find((c) => c.id === connectionId));
-  const { ns, def } = useCompletionSchema(connectionId);
+  // Read on each completion request (the cell's connection can change).
+  const connRef = useRef(connectionId);
+  connRef.current = connectionId;
 
   useEffect(() => {
     if (!host.current) return;
@@ -654,12 +657,12 @@ function CellEditor({
           indentOnInput(),
           bracketMatching(),
           closeBrackets(),
-          autocompletion({ activateOnTyping: true, icons: false }),
+          sqlAssist(() => connRef.current),
           highlightSelectionMatches(),
           syntaxHighlighting(highlight),
           placeholder("SQL…  ⌘↵ run · ⇧↵ run & next · ⌘I ask AI"),
           errorField,
-          lang.current.of(langExtension(undefined, undefined)),
+          lang.current.of(langExtension(undefined)),
           keymap.of([
             { key: "Mod-Enter", run: () => (cb.current.onRun(), true), preventDefault: true },
             { key: "Shift-Enter", run: () => (cb.current.onRunAdvance(), true), preventDefault: true },
@@ -702,8 +705,9 @@ function CellEditor({
   }, [editorKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    view.current?.dispatch({ effects: lang.current.reconfigure(langExtension(conn?.config.kind, ns, def)) });
-  }, [conn?.config.kind, ns, def]);
+    view.current?.dispatch({ effects: lang.current.reconfigure(langExtension(conn?.config.kind)) });
+    if (conn && canFetchMetadata(conn)) useStore.getState().loadSchemas(conn.id).catch(() => {});
+  }, [conn?.config.kind, conn?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // External changes (AI edits applied through the bridge already go through the view).
   useEffect(() => {
