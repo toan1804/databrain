@@ -338,6 +338,7 @@ impl Session for MysqlSession {
             .map(|(name, cur)| SchemaInfo {
                 is_default: cur.as_deref() == Some(name.as_str()),
                 name,
+                catalog: None,
             })
             .collect();
         out.sort_by_key(|s| !s.is_default);

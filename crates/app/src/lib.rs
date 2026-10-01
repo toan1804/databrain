@@ -284,6 +284,11 @@ async fn list_objects(state: State<'_, AppState>, id: String, schema: String) ->
 }
 
 #[tauri::command]
+async fn search_objects(state: State<'_, AppState>, id: String, query: String, limit: Option<usize>) -> R<Vec<DbObject>> {
+    api::search_objects(&state, &id, &query, limit).await
+}
+
+#[tauri::command]
 async fn describe_object(
     state: State<'_, AppState>,
     id: String,
@@ -512,6 +517,7 @@ pub fn run() {
             disconnect,
             list_schemas,
             list_objects,
+            search_objects,
             describe_object,
             statement_at_cursor,
             run_query,

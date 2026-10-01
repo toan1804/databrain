@@ -132,6 +132,9 @@ async fn sqlite_explorer_and_queries() {
 
     let schemas = api::list_schemas(&st, &id).await.unwrap();
     assert_eq!(schemas.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["main"]);
+    let hits = api::search_objects(&st, &id, "order", None).await.unwrap();
+    assert_eq!(hits.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["orders", "order_items"]);
+    assert!(api::search_objects(&st, &id, "  ", None).await.unwrap().is_empty());
     let objects = api::list_objects(&st, &id, "main").await.unwrap();
     let names = |k: ObjectKind| objects.iter().filter(|o| o.kind == k).map(|o| o.name.clone()).collect::<Vec<_>>();
     assert_eq!(names(ObjectKind::Table), vec!["customers", "order_items", "orders", "products"]);

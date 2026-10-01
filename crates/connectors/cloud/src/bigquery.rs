@@ -420,7 +420,7 @@ impl Session for BqSession {
             let r = self.0.call(reqwest::Method::GET, url, None).await?;
             for d in r["datasets"].as_array().cloned().unwrap_or_default() {
                 let id = d.pointer("/datasetReference/datasetId").and_then(|x| x.as_str()).unwrap_or_default();
-                out.push(SchemaInfo { name: format!("{}.{id}", self.0.project), is_default: self.0.dataset.as_deref() == Some(id) });
+                out.push(SchemaInfo::in_catalog(self.0.project.clone(), id, self.0.dataset.as_deref() == Some(id)));
             }
             match r["nextPageToken"].as_str() {
                 Some(t) => token = Some(t.to_string()),

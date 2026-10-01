@@ -606,11 +606,47 @@ impl Session for SfSession {
                 if name == "INFORMATION_SCHEMA" {
                     continue;
                 }
-                out.push(SchemaInfo { is_default: cur_db.as_deref() == Some(db.as_str()) && cur_sch.as_deref() == Some(name.as_str()), name: format!("{db}.{name}") });
+                out.push(SchemaInfo::in_catalog(db.clone(), &name, cur_db.as_deref() == Some(db.as_str()) && cur_sch.as_deref() == Some(name.as_str())));
             }
         }
         out.sort_by_key(|s| !s.is_default);
         Ok(out)
+    }
+
+    async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let term = databrain_connector_core::search_sql_term(query);
+        let cur = self.0.run_small("select current_database()").await?;
+        let scope = match cur.first().and_then(|r| r.first().cloned().flatten()) {
+            // Same scope as `list_schemas`: the session database, else the account.
+            Some(db) => format!("in database {}", quote_ident(ConnectorKind::Snowflake, &db)),
+            None => "in account".to_string(),
+        };
+        let sql = format!("show terse objects like {} {scope} limit {}", quote_literal(&format!("%{term}%")), (limit * 4).max(200));
+        // SHOW TERSE OBJECTS: created_on, name, kind, database_name, schema_name
+        let mut hits: Vec<DbObject> = self
+            .0
+            .run_small(&sql)
+            .await?
+            .into_iter()
+            .filter_map(|r| {
+                let g = |i: usize| r.get(i).cloned().flatten();
+                let sch = g(4)?;
+                if sch == "INFORMATION_SCHEMA" {
+                    return None;
+                }
+                let k = g(2).unwrap_or_default();
+                Some(DbObject {
+                    schema: format!("{}.{sch}", g(3)?),
+                    name: g(1)?,
+                    kind: if k.contains("VIEW") { if k.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else if k.contains("EXTERNAL") { ObjectKind::ForeignTable } else { ObjectKind::Table },
+                    comment: None,
+                    row_estimate: None,
+                })
+            })
+            .filter(|o| databrain_connector_core::object_matches(query, &o.schema, &o.name))
+            .collect();
+        databrain_connector_core::rank_matches(query, &mut hits, limit);
+        Ok(hits)
     }
 
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {

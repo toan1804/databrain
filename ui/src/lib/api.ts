@@ -102,6 +102,8 @@ export const api = {
 
   listSchemas: (id: string) => call<SchemaInfo[]>("list_schemas", { id }),
   listObjects: (id: string, schema: string) => call<DbObject[]>("list_objects", { id, schema }),
+  searchObjects: (id: string, query: string, limit?: number) =>
+    call<DbObject[]>("search_objects", { id, query, limit: limit ?? null }),
   describeObject: (id: string, schema: string, name: string) =>
     call<ObjectDetail>("describe_object", { id, schema, name }),
 

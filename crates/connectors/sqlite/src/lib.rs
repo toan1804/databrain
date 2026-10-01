@@ -361,6 +361,7 @@ impl Session for SqliteSession {
                 .map(|name| SchemaInfo {
                     is_default: name == "main",
                     name,
+                    catalog: None,
                 })
                 .collect())
         })
@@ -610,6 +611,12 @@ mod tests {
         assert!(schemas.iter().any(|x| x.name == "main" && x.is_default));
         let objs = s.list_objects("main").await.unwrap();
         assert_eq!(objs.len(), 3);
+        assert!(schemas.iter().all(|x| x.catalog.is_none()));
+        // Catalog search (default implementation: walks schemas).
+        let hits = s.search_objects("USER", 10).await.unwrap();
+        assert_eq!(hits.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["users", "v_users"]);
+        assert_eq!(s.search_objects("main.ord", 10).await.unwrap()[0].name, "orders");
+        assert!(s.search_objects("other.ord", 10).await.unwrap().is_empty());
         let o = s.describe("main", "orders").await.unwrap();
         assert_eq!(o.foreign_keys[0].ref_table, "users");
         assert_eq!(o.foreign_keys[0].columns, vec!["user_id"]);

@@ -646,6 +646,17 @@ impl QueryEngine {
         .await
     }
 
+    /// Find tables/views by name across the connection's schemas.
+    pub async fn search_objects(&self, connection_id: &str, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let query = query.to_string();
+        let limit = limit.clamp(1, 500);
+        self.with_meta(connection_id, |s| {
+            let query = query.clone();
+            async move { s.search_objects(&query, limit).await }
+        })
+        .await
+    }
+
     pub async fn schema_columns(&self, connection_id: &str, schema: &str) -> Result<Vec<databrain_connector_core::TableColumns>> {
         let schema = schema.to_string();
         self.with_meta(connection_id, |s| {

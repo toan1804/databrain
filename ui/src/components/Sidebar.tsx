@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AlertCircle,
   Ban,
@@ -19,6 +19,7 @@ import {
   History,
   KeyRound,
   Layers,
+  Library,
   Loader2,
   MoreHorizontal,
   Pencil,
@@ -33,8 +34,10 @@ import {
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { api, toError } from "../lib/api";
-import type { ConnectionView, DbObject, HistoryEntry, NotebookSummary, SavedQuery } from "../lib/types";
-import { formatCount, formatDuration, relativeTime, selectTopSql, sqlPreview, quoteIdent } from "../lib/util";
+import type { ConnectionView, DbObject, HistoryEntry, NotebookSummary, SavedQuery, SchemaInfo } from "../lib/types";
+import { groupOf, groupSchemas, schemaLabel, treeKey, type CatalogGroup } from "../lib/catalog";
+import { CatalogSearch, selectTop } from "./CatalogSearch";
+import { formatCount, formatDuration, relativeTime, sqlPreview, quoteIdent } from "../lib/util";
 import { useAi } from "../aiStore";
 import { DEFAULT_POLICY } from "./ConnectionDialog";
 import { FolderTree, createFolder, dragProps } from "./FolderTree";
@@ -167,8 +170,20 @@ export async function queryLocalFile() {
 function ConnectionsPanel() {
   const connections = useStore((s) => s.connections);
   const openDialog = useStore((s) => s.openConnectionDialog);
-  const [filter, setFilter] = useState("");
-  const shown = connections.filter((c) => c.name.toLowerCase().includes(filter.toLowerCase()));
+  const query = useStore((s) => s.catalogSearch.query.trim().toLowerCase());
+  const named = query ? connections.filter((c) => c.name.toLowerCase().includes(query)) : connections;
+  const tree = (items: ConnectionView[], filtering: boolean) => (
+    <div role="tree" aria-label="Connections">
+      <FolderTree
+        kind="connections"
+        items={items}
+        itemId={(c) => c.id}
+        itemFolder={(c) => c.folder_id}
+        filtering={filtering}
+        renderItem={(c) => <ConnectionNode conn={c} />}
+      />
+    </div>
+  );
   return (
     <>
       <PanelHeader title="Connections">
@@ -182,26 +197,17 @@ function ConnectionsPanel() {
           <Plus size={15} />
         </button>
       </PanelHeader>
-      {connections.length > 4 && <SearchBox value={filter} onChange={setFilter} placeholder="Filter connections" />}
-      <div className="min-h-0 flex-1 overflow-auto px-1.5 pb-3" role="tree">
-        {connections.length === 0 && (
-          <div className="px-3 py-8 text-center text-[12.5px] text-muted">
-            <Database size={28} className="mx-auto mb-3 opacity-50" />
-            No connections yet.
-            <button className="btn-primary mx-auto mt-3" onClick={() => openDialog(null)}>
-              <Plus size={14} /> Add connection
-            </button>
-          </div>
-        )}
-        <FolderTree
-          kind="connections"
-          items={shown}
-          itemId={(c) => c.id}
-          itemFolder={(c) => c.folder_id}
-          filtering={!!filter}
-          renderItem={(c) => <ConnectionNode conn={c} />}
-        />
-      </div>
+      {connections.length === 0 ? (
+        <div className="px-3 py-8 text-center text-[12.5px] text-muted">
+          <Database size={28} className="mx-auto mb-3 opacity-50" />
+          No connections yet.
+          <button className="btn-primary mx-auto mt-3" onClick={() => openDialog(null)}>
+            <Plus size={14} /> Add connection
+          </button>
+        </div>
+      ) : (
+        <CatalogSearch tree={tree(connections, false)} connectionsTree={named.length ? tree(named, true) : null} />
+      )}
     </>
   );
 }
@@ -270,6 +276,13 @@ function Row({
   );
 }
 
+/** Expansion state kept in the store, so catalog search can reveal objects. */
+function useTreeOpen(key: string, fallback: boolean): [boolean, (open: boolean) => void] {
+  const stored = useStore((s) => s.treeOpen[key]);
+  const setTreeOpen = useStore((s) => s.setTreeOpen);
+  return [stored ?? fallback, useCallback((open: boolean) => setTreeOpen(key, open), [key, setTreeOpen])];
+}
+
 function ConnectionNode({ conn }: { conn: ConnectionView }) {
   const schemas = useStore((s) => s.schemas[conn.id]);
   const loadSchemas = useStore((s) => s.loadSchemas);
@@ -278,7 +291,7 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
   const newTab = useStore((s) => s.newTab);
   const toast = useStore((s) => s.toast);
   const activeConn = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId)?.connection_id);
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useTreeOpen(treeKey.conn(conn.id), false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
@@ -297,13 +310,18 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
         setLoading(false);
       }
     },
-    [conn.id, conn.name, loadSchemas, toast],
+    [conn.id, conn.name, loadSchemas, toast, setExpanded],
   );
 
+  // Load on expand (by click or by a search reveal).
+  useEffect(() => {
+    if (expanded && !schemas && !loading && !error) void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expanded, schemas]);
+
   const toggle = () => {
-    const next = !expanded;
-    setExpanded(next);
-    if (next && !schemas) void load();
+    if (!expanded) setError(null);
+    setExpanded(!expanded);
   };
 
   const openMenu = (e: React.MouseEvent) => {
@@ -312,6 +330,7 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
     setMenu({ x: e.clientX, y: e.clientY });
   };
 
+  const catalogs = useMemo(() => (schemas ? groupSchemas(schemas) : null), [schemas]);
   const interactive = ["oauth_browser", "device_code", "external_browser"].includes(conn.config.auth.method);
   return (
     <div {...dragProps("connections", conn.id)}>
@@ -336,6 +355,17 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
           <>
             <button
               className="icon-btn h-6 w-6"
+              title="Find table in this connection"
+              aria-label="Find table in this connection"
+              onClick={(e) => {
+                e.stopPropagation();
+                useStore.getState().openCatalogSearch(conn.id);
+              }}
+            >
+              <Search size={13} />
+            </button>
+            <button
+              className="icon-btn h-6 w-6"
               title="New query"
               aria-label="New query"
               onClick={(e) => {
@@ -354,6 +384,7 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
       {menu && (
         <Popover x={menu.x} y={menu.y} onClose={() => setMenu(null)} className="w-52">
           <MenuItem icon={<FileCode2 size={13} />} label="New query" onClick={() => { setMenu(null); newTab({ connection_id: conn.id }); }} />
+          <MenuItem icon={<Search size={13} />} label="Find table…" onClick={() => { setMenu(null); useStore.getState().openCatalogSearch(conn.id); }} />
           <MenuItem icon={<RefreshCw size={13} />} label={conn.connected ? "Refresh" : "Connect"} onClick={() => { setMenu(null); setExpanded(true); void load(true); }} />
           <MenuItem icon={<NotebookPen size={13} />} label="New notebook" onClick={() => { setMenu(null); void useStore.getState().newNotebook(conn.id); }} />
           <MenuItem icon={<Pencil size={13} />} label="Edit connection" onClick={() => { setMenu(null); openDialog(conn); }} />
@@ -375,19 +406,48 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
         </Popover>
       )}
       {expanded &&
-        schemas?.map((s) => (
-          <SchemaNode key={s.name} conn={conn} schema={s.name} defaultOpen={s.is_default || schemas.length === 1} />
-        ))}
+        schemas &&
+        (catalogs
+          ? catalogs.map((g) => (
+              <CatalogNode key={g.name} conn={conn} group={g} defaultOpen={g.isDefault || catalogs.length === 1} />
+            ))
+          : schemas.map((s) => (
+              <SchemaNode key={s.name} conn={conn} schema={s} depth={1} defaultOpen={s.is_default || schemas.length === 1} />
+            )))}
       {expanded && schemas?.length === 0 && <div className="py-1 pl-10 text-[12px] text-muted">No schemas</div>}
     </div>
   );
 }
 
-function SchemaNode({ conn, schema, defaultOpen }: { conn: ConnectionView; schema: string; defaultOpen: boolean }) {
+/** Top level of three-level engines: Databricks catalog, Snowflake database, BigQuery project, DuckDB database. */
+function CatalogNode({ conn, group, defaultOpen }: { conn: ConnectionView; group: CatalogGroup; defaultOpen: boolean }) {
+  const [expanded, setExpanded] = useTreeOpen(treeKey.catalog(conn.id, group.name), defaultOpen);
+  const noun = conn.config.kind === "bigquery" ? "Project" : conn.config.kind === "databricks" ? "Catalog" : "Database";
+  return (
+    <div>
+      <Row
+        depth={1}
+        expanded={expanded}
+        icon={<Library size={13} />}
+        label={group.name}
+        title={`${noun} ${group.name}`}
+        meta={group.schemas.length}
+        onClick={() => setExpanded(!expanded)}
+      />
+      {expanded &&
+        group.schemas.map((s) => (
+          <SchemaNode key={s.name} conn={conn} schema={s} depth={2} defaultOpen={s.is_default || group.schemas.length === 1} />
+        ))}
+    </div>
+  );
+}
+
+function SchemaNode({ conn, schema: info, depth, defaultOpen }: { conn: ConnectionView; schema: SchemaInfo; depth: number; defaultOpen: boolean }) {
+  const schema = info.name;
   const objects = useStore((s) => s.objects[`${conn.id}|${schema}`]);
   const loadObjects = useStore((s) => s.loadObjects);
   const toast = useStore((s) => s.toast);
-  const [expanded, setExpanded] = useState(defaultOpen);
+  const [expanded, setExpanded] = useTreeOpen(treeKey.schema(conn.id, schema), defaultOpen);
   const [loading, setLoading] = useState(false);
 
   const load = useCallback(
@@ -411,22 +471,21 @@ function SchemaNode({ conn, schema, defaultOpen }: { conn: ConnectionView; schem
 
   const groups = useMemo(() => {
     const g: Record<string, DbObject[]> = { Tables: [], Views: [], Routines: [] };
-    for (const o of objects ?? []) {
-      if (o.kind === "table" || o.kind === "foreign_table") g.Tables.push(o);
-      else if (o.kind === "view" || o.kind === "materialized_view") g.Views.push(o);
-      else g.Routines.push(o);
-    }
+    for (const o of objects ?? []) g[groupOf(o.kind)].push(o);
     return Object.entries(g).filter(([, v]) => v.length > 0);
   }, [objects]);
+  // A single kind (e.g. only tables) is listed directly, without a group row.
+  const flat = groups.length === 1 && groups[0][0] !== "Routines";
 
   return (
     <div>
       <Row
-        depth={1}
+        depth={depth}
         expanded={expanded}
         loading={loading}
         icon={<Database size={13} />}
-        label={schema}
+        label={schemaLabel(info)}
+        title={schema}
         meta={objects ? objects.length : undefined}
         onClick={() => setExpanded(!expanded)}
         actions={
@@ -444,39 +503,54 @@ function SchemaNode({ conn, schema, defaultOpen }: { conn: ConnectionView; schem
         }
       />
       {expanded &&
-        groups.map(([name, items]) => <ObjectGroup key={name} name={name} items={items} conn={conn} />)}
-      {expanded && objects?.length === 0 && <div className="py-1 pl-12 text-[12px] text-muted">Empty</div>}
+        (flat
+          ? groups[0][1].map((o) => <ObjectNode key={`${o.kind}:${o.name}`} obj={o} conn={conn} depth={depth + 1} />)
+          : groups.map(([name, items]) => <ObjectGroup key={name} name={name} items={items} conn={conn} schema={schema} depth={depth + 1} />))}
+      {expanded && objects?.length === 0 && <div className="py-1 text-[12px] text-muted" style={{ paddingLeft: 26 + (depth + 1) * 14 }}>Empty</div>}
     </div>
   );
 }
 
-function ObjectGroup({ name, items, conn }: { name: string; items: DbObject[]; conn: ConnectionView }) {
-  const [open, setOpen] = useState(name !== "Routines");
+function ObjectGroup({ name, items, conn, schema, depth }: { name: string; items: DbObject[]; conn: ConnectionView; schema: string; depth: number }) {
+  const [open, setOpen] = useTreeOpen(treeKey.group(conn.id, schema, name), name !== "Routines");
   return (
     <div>
       <Row
-        depth={2}
+        depth={depth}
         expanded={open}
         icon={null}
         label={<span className="text-[11.5px] font-medium uppercase tracking-wide text-muted">{name}</span>}
         meta={items.length}
         onClick={() => setOpen(!open)}
       />
-      {open && items.map((o) => <ObjectNode key={`${o.kind}:${o.name}`} obj={o} conn={conn} />)}
+      {open && items.map((o) => <ObjectNode key={`${o.kind}:${o.name}`} obj={o} conn={conn} depth={depth + 1} />)}
     </div>
   );
 }
 
-function ObjectNode({ obj, conn }: { obj: DbObject; conn: ConnectionView }) {
+function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: ConnectionView; depth: number }) {
   const columns = useStore((s) => s.columns[`${conn.id}|${obj.schema}|${obj.name}`]);
   const loadColumns = useStore((s) => s.loadColumns);
-  const newTab = useStore((s) => s.newTab);
-  const runTab = useStore((s) => s.runTab);
   const activeTabId = useStore((s) => s.activeTabId);
   const toast = useStore((s) => s.toast);
+  const key = treeKey.object(conn.id, obj.schema, obj.name);
+  const focused = useStore((s) => s.treeFocus === key);
+  const ref = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const isRelation = obj.kind !== "function" && obj.kind !== "procedure";
+
+  // Revealed from search: scroll into view, highlight briefly.
+  useEffect(() => {
+    if (!focused) return;
+    const el = ref.current;
+    el?.scrollIntoView({ block: "center" });
+    (el?.querySelector('[role="treeitem"]') as HTMLElement | null)?.focus({ preventScroll: true });
+    const t = setTimeout(() => {
+      if (useStore.getState().treeFocus === key) useStore.setState({ treeFocus: null });
+    }, 2500);
+    return () => clearTimeout(t);
+  }, [focused, key]);
 
   const toggle = async () => {
     if (!isRelation) return;
@@ -494,15 +568,6 @@ function ObjectNode({ obj, conn }: { obj: DbObject; conn: ConnectionView }) {
     }
   };
 
-  const selectTop = () => {
-    const sql =
-      conn.config.kind === "duckdb" && obj.schema.endsWith(".files")
-        ? `SELECT *\nFROM files.${quoteIdent("duckdb", obj.name)}\nLIMIT 100;`
-        : selectTopSql(conn.config.kind, obj.schema, obj.name);
-    const id = newTab({ title: obj.name, sql, connection_id: conn.id });
-    void runTab(id, "all", { doc: sql, selFrom: 0, selTo: 0, cursor: 0 });
-  };
-
   const icon =
     obj.kind === "view" || obj.kind === "materialized_view" ? (
       <Eye size={13} />
@@ -513,14 +578,15 @@ function ObjectNode({ obj, conn }: { obj: DbObject; conn: ConnectionView }) {
     );
 
   return (
-    <div>
+    <div ref={ref} className={focused ? "rounded-md ring-1 ring-accent/60" : undefined}>
       <Row
-        depth={3}
+        depth={depth}
         expanded={isRelation ? expanded : undefined}
         loading={loading}
         icon={icon}
         label={obj.name}
         title={obj.comment}
+        active={focused}
         meta={obj.row_estimate !== undefined && obj.row_estimate > 0 ? formatCount(obj.row_estimate) : undefined}
         onClick={toggle}
         onDoubleClick={() => editorBridge.insert(activeTabId, quoteIdent(conn.config.kind, obj.name))}
@@ -532,7 +598,7 @@ function ObjectNode({ obj, conn }: { obj: DbObject; conn: ConnectionView }) {
               aria-label="Select top 100 rows"
               onClick={(e) => {
                 e.stopPropagation();
-                selectTop();
+                selectTop(conn, obj);
               }}
             >
               <Play size={12} />
@@ -544,7 +610,7 @@ function ObjectNode({ obj, conn }: { obj: DbObject; conn: ConnectionView }) {
         columns?.map((c) => (
           <Row
             key={c.name}
-            depth={4}
+            depth={depth + 1}
             icon={c.is_primary_key ? <KeyRound size={12} className="text-warning" /> : <Columns3 size={12} />}
             label={
               <span>

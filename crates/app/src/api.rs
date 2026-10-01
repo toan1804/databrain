@@ -315,6 +315,15 @@ pub async fn list_objects(state: &AppState, id: &str, schema: &str) -> Result<Ve
     state.engine.list_objects(id, schema).await
 }
 
+/// Catalog search: tables and views whose name contains `query`
+/// (`schema.part` narrows by schema).
+pub async fn search_objects(state: &AppState, id: &str, query: &str, limit: Option<usize>) -> Result<Vec<DbObject>> {
+    if query.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    state.engine.search_objects(id, query, limit.unwrap_or(100)).await
+}
+
 pub async fn describe(
     state: &AppState,
     id: &str,

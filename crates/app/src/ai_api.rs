@@ -150,11 +150,16 @@ pub fn save_provider(state: &AppState, args: SaveProviderArgs) -> Result<AiProvi
     if kind == ProviderKind::AzureOpenai && cfg.base_url.as_deref().is_none_or(str::is_empty) {
         return Err(EngineError::new("invalid", "Azure OpenAI needs the resource endpoint URL"));
     }
+    // Validate the key before saving anything.
+    let key = match args.api_key.as_deref().map(str::trim) {
+        Some(k) if !k.is_empty() && kind == ProviderKind::Kiro => Some(databrain_ai::kiro::normalize_api_key(k).map_err(ai_err)?),
+        other => other.map(str::to_string),
+    };
     let saved = state.workspace.save_ai_provider(args.record)?;
     let r = SecretRef::for_ai_provider(&saved.id);
-    match args.api_key.as_deref() {
+    match key.as_deref() {
         Some("") => state.secrets.delete(&r)?,
-        Some(k) => state.secrets.set(&r, &SecretString::from(k.trim().to_string()))?,
+        Some(k) => state.secrets.set(&r, &SecretString::from(k.to_string()))?,
         None => {}
     }
     Ok(saved)

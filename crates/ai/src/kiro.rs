@@ -129,10 +129,13 @@ impl KiroProvider {
         cmd.args(["whoami", "--format", "json"]);
         match tokio::time::timeout(Duration::from_secs(20), cmd.output()).await {
             Ok(Ok(out)) => {
-                let (signed_in, account_type, identity) = parse_whoami(&String::from_utf8_lossy(&out.stdout));
-                let message = (!signed_in).then(|| {
-                    if self.browser { "Not signed in. Use “Sign in with browser”.".to_string() } else { "Kiro rejected the API key.".to_string() }
-                });
+                let w = parse_whoami(&String::from_utf8_lossy(&out.stdout));
+                let message = whoami_message(&w, self.browser, out.status.code(), &String::from_utf8_lossy(&out.stderr));
+                let signed_in = message.is_none();
+                let (account_type, identity) = match w {
+                    Whoami::Account { account_type, identity } => (account_type, identity),
+                    _ => (None, None),
+                };
                 KiroStatus { signed_in, account_type, identity, message, ..base }
             }
             Ok(Err(e)) => KiroStatus { message: Some(format!("cannot run kiro-cli: {e}")), ..base },
@@ -403,15 +406,103 @@ fn find_cli() -> Option<PathBuf> {
 }
 
 /// `(signed_in, account_type, identity)` from `whoami --format json`.
-pub fn parse_whoami(out: &str) -> (bool, Option<String>, Option<String>) {
-    let Ok(v) = serde_json::from_str::<Value>(out.trim()) else { return (false, None, None) };
-    if v.get("account").is_some_and(|a| a.is_null()) {
-        return (false, None, None);
+/// Result of `kiro-cli whoami --format json`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Whoami {
+    /// `{"account": null}`: no session and no API key in the environment.
+    NoAccount,
+    Account { account_type: Option<String>, identity: Option<String> },
+    /// No JSON object in the output (crash, update notice, unknown format).
+    Unreadable(String),
+}
+
+/// Parse `whoami` output. Uses the last line that is a JSON object, so
+/// notices printed before it don't break the check.
+pub fn parse_whoami(out: &str) -> Whoami {
+    let v = std::iter::once(out.trim())
+        .chain(out.lines().rev().map(str::trim))
+        .filter(|l| l.starts_with('{'))
+        .find_map(|l| serde_json::from_str::<Value>(l).ok().filter(Value::is_object));
+    let Some(v) = v else { return Whoami::Unreadable(trunc(out.trim(), 300)) };
+    if v.get("account").is_some_and(Value::is_null) {
+        return Whoami::NoAccount;
     }
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(str::to_string);
     let account_type = s("accountType").or_else(|| s("authMethod"));
     let identity = s("email").or_else(|| s("username")).or_else(|| s("startUrl"));
-    (account_type.is_some() || identity.is_some(), account_type, identity)
+    if account_type.is_none() && identity.is_none() {
+        return Whoami::NoAccount;
+    }
+    Whoami::Account { account_type, identity }
+}
+
+/// Why the configured auth mode is not usable, or `None` when it is.
+///
+/// With `KIRO_API_KEY` set, kiro-cli reports `accountType: ApiKey` even for
+/// a key it cannot use; only a resolved identity means Kiro accepted it.
+fn whoami_message(w: &Whoami, browser: bool, code: Option<i32>, stderr: &str) -> Option<String> {
+    let detail = || {
+        let e = redact_keys(stderr.trim());
+        if e.is_empty() { String::new() } else { format!(" kiro-cli said: {}", trunc(&e, 300)) }
+    };
+    match w {
+        Whoami::Account { account_type, identity } => {
+            let api_key = account_type.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("apikey"));
+            if browser && api_key {
+                Some("kiro-cli is using an API key, not a browser session. Run “Sign in with browser”.".into())
+            } else if !browser && api_key && identity.is_none() {
+                Some(format!(
+                    "Kiro did not accept the API key. Check that it is complete and not revoked (app.kiro.dev → API Keys); API keys need a Kiro Pro plan or higher.{}",
+                    detail()
+                ))
+            } else {
+                None
+            }
+        }
+        Whoami::NoAccount if browser => Some("Not signed in. Use “Sign in with browser”.".into()),
+        Whoami::NoAccount => Some(format!("kiro-cli did not pick up the API key (exit {}).{}", code.map_or("?".into(), |c| c.to_string()), detail())),
+        Whoami::Unreadable(out) => Some(format!(
+            "Unexpected output from `kiro-cli whoami` (exit {}): {}{}",
+            code.map_or("?".into(), |c| c.to_string()),
+            if out.is_empty() { "(empty)".to_string() } else { redact_keys(out) },
+            detail()
+        )),
+    }
+}
+
+fn redact_keys(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("ksk_") {
+        out.push_str(&rest[..i]);
+        out.push_str("ksk_***");
+        let tail = &rest[i + 4..];
+        let end = tail.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')).unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Clean up a pasted Kiro API key: trims whitespace and surrounding quotes
+/// and a leading `KIRO_API_KEY=`; rejects anything that is not `ksk_…`.
+pub fn normalize_api_key(raw: &str) -> Result<String> {
+    let mut k = raw.trim();
+    for p in ["export ", "KIRO_API_KEY="] {
+        k = k.strip_prefix(p).unwrap_or(k).trim();
+    }
+    for (a, b) in [('"', '"'), ('\'', '\''), ('“', '”'), ('‘', '’')] {
+        if let Some(x) = k.strip_prefix(a).and_then(|x| x.strip_suffix(b)) {
+            k = x.trim();
+        }
+    }
+    if !k.starts_with("ksk_") {
+        return Err(AiError::Config("a Kiro API key starts with “ksk_” (create one at app.kiro.dev → API Keys)".into()));
+    }
+    if !k[4..].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') || k.len() < 12 {
+        return Err(AiError::Config("the Kiro API key contains spaces, line breaks or other characters; copy it again".into()));
+    }
+    Ok(k.to_string())
 }
 
 fn is_databrain_tool(u: &Value) -> bool {
@@ -812,9 +903,40 @@ mod tests {
 
     #[test]
     fn parses_whoami() {
-        assert_eq!(parse_whoami(r#"{"account":null}"#), (false, None, None));
-        assert_eq!(parse_whoami(r#"{"accountType":"ApiKey","email":"a@b.c"}"#), (true, Some("ApiKey".into()), Some("a@b.c".into())));
-        assert!(!parse_whoami("not json").0);
+        let acct = |t: Option<&str>, i: Option<&str>| Whoami::Account { account_type: t.map(Into::into), identity: i.map(Into::into) };
+        assert_eq!(parse_whoami(r#"{"account":null}"#), Whoami::NoAccount);
+        assert_eq!(parse_whoami(r#"{"accountType":"ApiKey","email":"a@b.c"}"#), acct(Some("ApiKey"), Some("a@b.c")));
+        // A notice before the JSON line.
+        assert_eq!(parse_whoami("A new version is available\n{\"accountType\":\"BuilderId\",\"email\":\"a@b.c\"}\n"), acct(Some("BuilderId"), Some("a@b.c")));
+        assert!(matches!(parse_whoami("not json"), Whoami::Unreadable(_)));
+        assert!(matches!(parse_whoami(""), Whoami::Unreadable(_)));
+    }
+
+    #[test]
+    fn whoami_messages_per_mode() {
+        let ok_key = Whoami::Account { account_type: Some("ApiKey".into()), identity: Some("a@b.c".into()) };
+        let bad_key = Whoami::Account { account_type: Some("ApiKey".into()), identity: None };
+        let browser = Whoami::Account { account_type: Some("BuilderId".into()), identity: Some("a@b.c".into()) };
+        assert_eq!(whoami_message(&ok_key, false, Some(0), ""), None);
+        assert!(whoami_message(&bad_key, false, Some(0), "").unwrap().contains("did not accept the API key"));
+        assert_eq!(whoami_message(&browser, true, Some(0), ""), None);
+        // A browser session also satisfies API-key mode (kiro-cli prefers it).
+        assert_eq!(whoami_message(&browser, false, Some(0), ""), None);
+        assert!(whoami_message(&Whoami::NoAccount, true, Some(1), "").unwrap().contains("Sign in with browser"));
+        let m = whoami_message(&Whoami::NoAccount, false, Some(1), "bad key ksk_abc123-x end").unwrap();
+        assert!(m.contains("exit 1") && m.contains("ksk_*** end") && !m.contains("abc123"), "{m}");
+        assert!(whoami_message(&Whoami::Unreadable("boom".into()), false, Some(2), "").unwrap().contains("boom"));
+    }
+
+    #[test]
+    fn normalizes_pasted_keys() {
+        let k = "ksk_AbC123_def-456";
+        for raw in [k.to_string(), format!("  {k}\n"), format!("\"{k}\""), format!("“{k}”"), format!("export KIRO_API_KEY={k}"), format!("KIRO_API_KEY='{k}'")] {
+            assert_eq!(normalize_api_key(&raw).unwrap(), k, "{raw:?}");
+        }
+        assert!(normalize_api_key("sk-openai-key").is_err());
+        assert!(normalize_api_key("ksk_abc def123456").is_err());
+        assert!(normalize_api_key("ksk_abc\ndef123456").is_err());
     }
 
     #[test]

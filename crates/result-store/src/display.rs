@@ -105,3 +105,24 @@ pub fn column_meta(field: &Field) -> ColumnMeta {
         family: family(field),
     }
 }
+
+#[cfg(test)]
+mod tz_tests {
+    use super::*;
+    use databrain_connector_core::arrow::array::TimestampMicrosecondArray;
+    use databrain_connector_core::{BatchBuilder, ColType, Column, Value};
+
+    /// Named time zones (Databricks/Snowflake TIMESTAMP → "UTC", Parquet
+    /// files with zones like "Asia/Ho_Chi_Minh") must format without errors.
+    #[test]
+    fn formats_named_timezones() {
+        let mut b = BatchBuilder::new(&[Column::new("ts", ColType::TimestampTz, "TIMESTAMP")], 1);
+        b.push_row(vec![Value::TimestampTz(1_709_288_430_500_000)]);
+        let batch = b.finish().unwrap();
+        let s = to_display(batch.column(0).as_ref()).unwrap();
+        assert_eq!(s.value(0), "2024-03-01 10:20:30.500+00:00");
+
+        let a = TimestampMicrosecondArray::from(vec![1_709_288_430_000_000i64]).with_timezone("Asia/Ho_Chi_Minh");
+        assert_eq!(to_display(&a).unwrap().value(0), "2024-03-01 17:20:30+07:00");
+    }
+}

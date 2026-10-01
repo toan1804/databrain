@@ -396,6 +396,7 @@ impl Session for OracleSession {
             .map(|r| SchemaInfo {
                 name: r.first().cloned().flatten().unwrap_or_default(),
                 is_default: r.get(1).cloned().flatten().as_deref() == Some("Y"),
+                catalog: None,
             })
             .collect())
     }

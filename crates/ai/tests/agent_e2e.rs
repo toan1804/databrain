@@ -491,3 +491,27 @@ async fn ai_tools_use_output_handles_with_source_policies() {
     let o = mcp.call("query_outputs", &json!({"sql": "select * from results.by_country"})).await;
     assert!(o.content.contains("not shared with MCP"), "{}", o.content);
 }
+
+/// Live: `DATABRAIN_KIRO_LIVE=1 cargo test -p databrain-ai --test agent_e2e kiro_live_status -- --nocapture`
+#[tokio::test]
+async fn kiro_live_status() {
+    if std::env::var("DATABRAIN_KIRO_LIVE").is_err() {
+        return;
+    }
+    use databrain_ai::kiro::KiroProvider;
+    use databrain_ai::providers::{KeySource, ProviderAuth};
+    let key = std::env::var("KIRO_API_KEY").expect("KIRO_API_KEY");
+    let cfg = ProviderConfig { auth: ProviderAuth::ApiKey, ..Default::default() };
+    let st = KiroProvider::new(&cfg, KeySource::Inline(key)).unwrap().status().await;
+    eprintln!("api key: signed_in={} type={:?} identity_set={} msg={:?}", st.signed_in, st.account_type, st.identity.is_some(), st.message);
+    assert!(st.signed_in, "{:?}", st.message);
+    let bad = KiroProvider::new(&cfg, KeySource::Inline("ksk_invalid".into())).unwrap().status().await;
+    eprintln!("bad key: signed_in={} type={:?} msg={:?}", bad.signed_in, bad.account_type, bad.message);
+    assert!(!bad.signed_in && bad.message.as_deref().unwrap_or("").contains("did not accept"));
+    let cfg = ProviderConfig { auth: ProviderAuth::KiroBrowser, ..Default::default() };
+    let br = KiroProvider::new(&cfg, KeySource::None).unwrap().status().await;
+    eprintln!("browser: signed_in={} type={:?} msg={:?}", br.signed_in, br.account_type, br.message);
+    if !br.signed_in {
+        assert!(br.message.as_deref().unwrap_or("").contains("Sign in with browser"));
+    }
+}

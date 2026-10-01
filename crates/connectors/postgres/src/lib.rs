@@ -401,8 +401,49 @@ impl Session for PgSession {
             .map(|r| SchemaInfo {
                 name: r.get(0),
                 is_default: r.get::<_, Option<bool>>(1).unwrap_or(false),
+                catalog: None,
             })
             .collect())
+    }
+
+    async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let term = databrain_connector_core::search_sql_term(query);
+        let rows = self
+            .client
+            .query(
+                "select n.nspname::text, c.relname::text, c.relkind::text, \
+                        obj_description(c.oid, 'pg_class'), c.reltuples::float8 \
+                 from pg_catalog.pg_class c \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 where c.relkind in ('r','p','v','m','f') and not c.relispartition \
+                   and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' \
+                   and strpos(lower(c.relname), $1) > 0 \
+                 limit 2000",
+                &[&term],
+            )
+            .await
+            .map_err(|e| map_err(&e))?;
+        let mut hits: Vec<DbObject> = rows
+            .iter()
+            .map(|r| {
+                let est: Option<f64> = r.get(4);
+                DbObject {
+                    schema: r.get(0),
+                    name: r.get(1),
+                    kind: match r.get::<_, String>(2).as_str() {
+                        "v" => ObjectKind::View,
+                        "m" => ObjectKind::MaterializedView,
+                        "f" => ObjectKind::ForeignTable,
+                        _ => ObjectKind::Table,
+                    },
+                    comment: r.get(3),
+                    row_estimate: est.filter(|e| *e >= 0.0).map(|e| e as i64),
+                }
+            })
+            .filter(|o| databrain_connector_core::object_matches(query, &o.schema, &o.name))
+            .collect();
+        databrain_connector_core::rank_matches(query, &mut hits, limit);
+        Ok(hits)
     }
 
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {

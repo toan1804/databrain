@@ -365,11 +365,42 @@ impl Session for DbxSession {
             .filter_map(|r| {
                 let (c, s) = (cell(r, 0)?, cell(r, 1)?);
                 let is_default = default_cat.as_deref().is_none_or(|d| d == c) && s == default_sch;
-                Some(SchemaInfo { name: format!("{c}.{s}"), is_default })
+                Some(SchemaInfo::in_catalog(c, &s, is_default))
             })
             .collect();
         out.sort_by_key(|s| !s.is_default);
         Ok(out)
+    }
+
+    async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let term = databrain_connector_core::search_sql_term(query);
+        let sql = format!(
+            "SELECT table_catalog, table_schema, table_name, table_type, comment FROM system.information_schema.tables \
+             WHERE table_schema <> 'information_schema' AND instr(lower(table_name), {}) > 0 LIMIT {}",
+            quote_literal(&term),
+            (limit * 4).max(200)
+        );
+        let rows = match self.0.run_small(&sql).await {
+            Ok(r) => r,
+            // No Unity Catalog: walk hive_metastore schema by schema.
+            Err(_) => return databrain_connector_core::search_by_listing(self, query, limit).await,
+        };
+        let mut hits: Vec<DbObject> = rows
+            .iter()
+            .filter_map(|r| {
+                let t = cell(r, 3).unwrap_or_default();
+                Some(DbObject {
+                    schema: format!("{}.{}", cell(r, 0)?, cell(r, 1)?),
+                    name: cell(r, 2)?,
+                    kind: if t.contains("VIEW") { if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else { ObjectKind::Table },
+                    comment: cell(r, 4),
+                    row_estimate: None,
+                })
+            })
+            .filter(|o| databrain_connector_core::object_matches(query, &o.schema, &o.name))
+            .collect();
+        databrain_connector_core::rank_matches(query, &mut hits, limit);
+        Ok(hits)
     }
 
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {

@@ -475,6 +475,7 @@ impl Session for MssqlSession {
             .map(|r| SchemaInfo {
                 name: r.get::<&str, _>(0).unwrap_or_default().to_string(),
                 is_default: r.get::<bool, _>(1).unwrap_or(false),
+                catalog: None,
             })
             .collect())
     }

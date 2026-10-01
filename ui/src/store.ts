@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { revealKeys, splitSchema, treeKey } from "./lib/catalog";
 import { api, isTauri, onAuthEvent, onJobEvent, toError } from "./lib/api";
 import type {
   AuthEvent,
@@ -107,6 +108,11 @@ interface State {
   theme: Theme;
   rowLimit: number;
   sidebarPanel: SidebarPanel;
+  /** Explorer expansion state (keys from `treeKey`). */
+  treeOpen: Record<string, boolean>;
+  /** Object key to scroll to and highlight after a search reveal. */
+  treeFocus: string | null;
+  catalogSearch: { query: string; scope: string | null; focusSeq: number };
   toasts: Toast[];
   confirm: ConfirmState | null;
   connectionDialog: { open: boolean; profile?: ConnectionView | null };
@@ -119,6 +125,12 @@ interface State {
   setTheme: (t: Theme) => void;
   setRowLimit: (n: number) => void;
   setSidebarPanel: (p: SidebarPanel) => void;
+  setTreeOpen: (key: string, open: boolean) => void;
+  /** Expand the explorer down to `obj` and scroll to it. */
+  revealObject: (connId: string, obj: DbObject) => void;
+  /** Show the catalog search (optionally scoped to one connection) and focus it. */
+  openCatalogSearch: (scope?: string | null) => void;
+  setCatalogSearch: (patch: Partial<{ query: string; scope: string | null }>) => void;
 
   refreshConnections: () => Promise<void>;
   openConnectionDialog: (profile?: ConnectionView | null) => void;
@@ -254,6 +266,9 @@ export const useStore = create<State>((set, get) => ({
   theme: "dark",
   rowLimit: 1000,
   sidebarPanel: "connections",
+  treeOpen: {},
+  treeFocus: null,
+  catalogSearch: { query: "", scope: null, focusSeq: 0 },
   toasts: [],
   confirm: null,
   connectionDialog: { open: false },
@@ -338,6 +353,30 @@ export const useStore = create<State>((set, get) => ({
     if (isTauri()) api.setSetting("row_limit", rowLimit).catch(() => {});
   },
   setSidebarPanel: (sidebarPanel) => set({ sidebarPanel }),
+  setTreeOpen: (key, open) => set((s) => ({ treeOpen: { ...s.treeOpen, [key]: open } })),
+  revealObject: (connId, obj) => {
+    const st = get();
+    const kind = st.connections.find((c) => c.id === connId)?.config.kind;
+    const catalog = kind ? splitSchema(kind, obj.schema, st.schemas[connId]).catalog : undefined;
+    const open = { ...st.treeOpen };
+    for (const k of revealKeys(connId, obj, catalog)) open[k] = true;
+    set((s) => ({
+      treeOpen: open,
+      treeFocus: treeKey.object(connId, obj.schema, obj.name),
+      sidebarPanel: "connections",
+      catalogSearch: { ...s.catalogSearch, query: "" },
+    }));
+  },
+  openCatalogSearch: (scope) =>
+    set((s) => ({
+      sidebarPanel: "connections",
+      catalogSearch: {
+        query: s.catalogSearch.query,
+        scope: scope === undefined ? s.catalogSearch.scope : scope,
+        focusSeq: s.catalogSearch.focusSeq + 1,
+      },
+    })),
+  setCatalogSearch: (patch) => set((s) => ({ catalogSearch: { ...s.catalogSearch, ...patch } })),
 
   refreshConnections: async () => {
     const connections = await api.listConnections();

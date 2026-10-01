@@ -32,6 +32,10 @@ function useGlobalShortcuts() {
       } else if (key === "k") {
         e.preventDefault();
         st.setPaletteOpen(!st.paletteOpen);
+      } else if (key === "p" && !e.shiftKey) {
+        // Find a table in the explorer.
+        e.preventDefault();
+        st.openCatalogSearch();
       } else if (key === "t") {
         e.preventDefault();
         st.newTab();

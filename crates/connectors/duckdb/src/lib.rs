@@ -509,17 +509,46 @@ impl Session for DuckSession {
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>> {
         let rows = self
             .strings(
-                "select database_name || '.' || schema_name, (database_name = current_database() and schema_name = current_schema())::varchar \
+                "select database_name, schema_name, (database_name = current_database() and schema_name = current_schema())::varchar \
                  from duckdb_schemas() where not internal and schema_name <> 'pg_catalog' \
-                 order by database_name = current_database() desc, schema_name = 'files' desc, 1"
+                 order by database_name = current_database() desc, schema_name = 'files' desc, 1, 2"
                     .into(),
                 vec![],
             )
             .await?;
         Ok(rows
             .into_iter()
-            .filter_map(|r| Some(SchemaInfo { name: r[0].clone()?, is_default: r[1].as_deref() == Some("true") }))
+            .filter_map(|r| Some(SchemaInfo::in_catalog(r[0].clone()?, r[1].as_deref()?, r[2].as_deref() == Some("true"))))
             .collect())
+    }
+
+    async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let term = databrain_connector_core::search_sql_term(query);
+        let rows = self
+            .strings(
+                "select database_name || '.' || schema_name, table_name, 'table', comment, estimated_size::varchar from duckdb_tables() \
+                 where not internal and contains(lower(table_name), ?) \
+                 union all select database_name || '.' || schema_name, view_name, 'view', comment, null from duckdb_views() \
+                 where not internal and contains(lower(view_name), ?) limit 5000"
+                    .into(),
+                vec![term.clone(), term],
+            )
+            .await?;
+        let mut hits: Vec<DbObject> = rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(DbObject {
+                    schema: r[0].clone()?,
+                    name: r[1].clone()?,
+                    kind: if r[2].as_deref() == Some("view") { ObjectKind::View } else { ObjectKind::Table },
+                    comment: r[3].clone().filter(|c| !c.is_empty()),
+                    row_estimate: r[4].as_deref().and_then(|n| n.parse().ok()),
+                })
+            })
+            .filter(|o| databrain_connector_core::object_matches(query, &o.schema, &o.name))
+            .collect();
+        databrain_connector_core::rank_matches(query, &mut hits, limit);
+        Ok(hits)
     }
 
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {
@@ -647,7 +676,14 @@ mod tests {
 
         // Attached files appear in the explorer as views.
         let schemas = s.list_schemas().await.unwrap();
-        let files_schema = schemas.iter().find(|x| x.name.ends_with(".files")).unwrap().name.clone();
+        let files = schemas.iter().find(|x| x.name.ends_with(".files")).unwrap();
+        let files_schema = files.name.clone();
+        // Three-level names: database (catalog) → schema.
+        assert_eq!(files.name, format!("{}.files", files.catalog.as_deref().unwrap()));
+        let hits = s.search_objects("ale", 10).await.unwrap();
+        assert_eq!(hits.iter().map(|o| (o.schema.as_str(), o.name.as_str())).collect::<Vec<_>>(), vec![(files_schema.as_str(), "sales")]);
+        assert_eq!(s.search_objects("files.ev", 10).await.unwrap()[0].name, "events");
+        assert!(s.search_objects("x'; drop table t; --", 10).await.unwrap().is_empty());
         let objs = s.list_objects(&files_schema).await.unwrap();
         assert_eq!(objs.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["events", "sales"]);
         let d = s.describe(&files_schema, "sales").await.unwrap();

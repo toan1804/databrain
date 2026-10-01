@@ -36,6 +36,15 @@ function Palette() {
     const active = st.tabs.find((t) => t.id === st.activeTabId);
     const cmds: Command[] = [
       { id: "new-tab", group: "Actions", label: "New query tab", icon: <Plus size={14} />, hint: "⌘T", run: () => st.newTab() },
+      {
+        id: "find-table",
+        group: "Actions",
+        label: "Find table…",
+        icon: <Search size={14} />,
+        hint: "⌘P",
+        // After the palette closes, so focus lands in the search box.
+        run: () => setTimeout(() => st.openCatalogSearch(), 0),
+      },
       { id: "new-conn", group: "Actions", label: "New connection", icon: <Database size={14} />, run: () => st.openConnectionDialog(null) },
       {
         id: "theme",

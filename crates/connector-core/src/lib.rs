@@ -65,6 +65,13 @@ pub trait Session: Send + Sync {
 
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail>;
 
+    /// Find tables and views by name across every schema (catalog search).
+    /// The default walks schemas one by one; engines with a global catalog
+    /// view override it with a single query.
+    async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        search_by_listing(self, query, limit).await
+    }
+
     /// Columns of every table/view in a schema (bulk, for the AI knowledge
     /// index). The default describes objects one by one.
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
@@ -86,6 +93,24 @@ pub trait Session: Send + Sync {
         }
         Ok(out)
     }
+}
+
+/// Catalog search by listing every schema (the default for
+/// [`Session::search_objects`]); stops early once plenty of hits are found.
+pub async fn search_by_listing<S: Session + ?Sized>(s: &S, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+    let mut hits = Vec::new();
+    for sc in s.list_schemas().await? {
+        let Ok(objs) = s.list_objects(&sc.name).await else { continue };
+        hits.extend(objs.into_iter().filter(|o| {
+            !matches!(o.kind, ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Sequence)
+                && object_matches(query, &o.schema, &o.name)
+        }));
+        if hits.len() >= limit * 4 {
+            break;
+        }
+    }
+    rank_matches(query, &mut hits, limit);
+    Ok(hits)
 }
 
 /// Connectors available in this build (populated by the app based on

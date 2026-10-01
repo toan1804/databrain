@@ -219,7 +219,8 @@ function ProviderForm({
   };
 
   const signIn = async () => {
-    const id = initial?.id ?? (await save());
+    // Save first when the form's sign-in method differs from the stored one.
+    const id = initial && initial.config.auth === auth ? initial.id : await save();
     if (!id) return;
     setBusy("signin");
     const label = isKiro ? "Sign in to Kiro" : "Sign in to OpenRouter";
@@ -313,6 +314,7 @@ function ProviderForm({
           status={kiro}
           auth={auth}
           saved={!!initial}
+          pending={!!initial && (initial.config.auth !== auth || (auth === "api_key" && !!apiKey))}
           busy={busy}
           onSignIn={signIn}
           onRefresh={() => void refreshKiro()}
@@ -495,10 +497,13 @@ function KiroPanel({
   onSignIn,
   onRefresh,
   onSignOut,
+  pending,
 }: {
   status: KiroStatus | null;
   auth: ProviderAuth;
   saved: boolean;
+  /** The form has a different sign-in method or a new key that is not saved yet. */
+  pending: boolean;
   busy: string | null;
   onSignIn: () => void;
   onRefresh: () => void;
@@ -510,6 +515,10 @@ function KiroPanel({
       <div className="flex items-center gap-2">
         {!saved ? (
           <span className="text-muted">Save the provider to check kiro-cli and sign in.</span>
+        ) : pending ? (
+          <span className="text-muted">
+            {browser ? "Save, or use “Sign in with browser”, to switch to browser sign-in." : "Save to check this API key with kiro-cli."}
+          </span>
         ) : !status ? (
           <span className="flex items-center gap-1.5 text-muted">
             <Loader2 size={12} className="animate-spin" /> Checking kiro-cli…
@@ -534,17 +543,17 @@ function KiroPanel({
               {busy === "status" ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
             </button>
           )}
-          {browser && status?.signed_in && (
+          {!pending && browser && status?.signed_in && (
             <button className="btn-ghost py-1" onClick={onSignOut} disabled={!!busy}>
               <LogOut size={12} /> Sign out
             </button>
           )}
-          {browser && (!status || !status.signed_in) && status?.installed !== false && (
+          {browser && (pending || !status || !status.signed_in) && status?.installed !== false && (
             <button className="btn-primary py-1" onClick={onSignIn} disabled={!!busy}>
               {busy === "signin" ? <Loader2 size={12} className="animate-spin" /> : <Globe size={12} />} Sign in with browser
             </button>
           )}
-          {!browser && saved && status?.signed_in && (
+          {!pending && !browser && saved && status?.signed_in && (
             <button className="btn-ghost py-1" onClick={onSignOut} disabled={!!busy}>
               <Trash2 size={12} /> Remove key
             </button>

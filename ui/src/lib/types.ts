@@ -140,8 +140,11 @@ export interface TestResult {
 }
 
 export interface SchemaInfo {
+  /** Qualified id (`catalog.schema` for three-level engines). */
   name: string;
   is_default: boolean;
+  /** Databricks catalog, Snowflake database, BigQuery project, DuckDB database. */
+  catalog?: string | null;
 }
 
 export type ObjectKind =

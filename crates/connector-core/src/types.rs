@@ -236,9 +236,70 @@ impl FieldSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchemaInfo {
+    /// Fully qualified schema id passed back to `list_objects` (for
+    /// three-level engines this is `catalog.schema`).
     pub name: String,
     /// Schema the session resolves unqualified names against.
     pub is_default: bool,
+    /// Top level (Databricks catalog, Snowflake database, BigQuery project,
+    /// DuckDB database) for engines with three-level names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
+}
+
+impl SchemaInfo {
+    pub fn new(name: impl Into<String>, is_default: bool) -> Self {
+        Self { name: name.into(), is_default, catalog: None }
+    }
+
+    /// `catalog.schema` entry; `name` becomes the qualified id.
+    pub fn in_catalog(catalog: impl Into<String>, schema: &str, is_default: bool) -> Self {
+        let catalog = catalog.into();
+        Self { name: format!("{catalog}.{schema}"), is_default, catalog: Some(catalog) }
+    }
+}
+
+/// Matching for catalog search: case-insensitive substring of the object
+/// name, or of `schema.name` when the query is qualified (`sales.ord`).
+pub fn object_matches(query: &str, schema: &str, name: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return false;
+    }
+    let n = name.to_lowercase();
+    if !q.contains('.') {
+        return n.contains(&q);
+    }
+    format!("{}.{n}", schema.to_lowercase()).contains(&q)
+}
+
+/// The part of a search query that applies to the object name (after the
+/// last dot), for engines that filter server-side.
+pub fn search_name_term(query: &str) -> String {
+    query.trim().rsplit('.').next().unwrap_or_default().to_string()
+}
+
+/// Lower-cased name term for server-side filtering, reduced to characters
+/// that are safe inside any dialect's string literal (letters, digits, `_`,
+/// `-`, `$`, space). Results are re-checked with [`object_matches`].
+pub fn search_sql_term(query: &str) -> String {
+    search_name_term(query)
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '$' | ' '))
+        .collect()
+}
+
+/// Rank search hits: exact name, then prefix, then shorter names first.
+pub fn rank_matches(query: &str, hits: &mut Vec<DbObject>, limit: usize) {
+    let term = search_name_term(query).to_lowercase();
+    hits.sort_by_cached_key(|o| {
+        let n = o.name.to_lowercase();
+        let tier = if n == term { 0 } else if n.starts_with(&term) { 1 } else { 2 };
+        (tier, n.len(), o.schema.clone(), o.name.clone())
+    });
+    hits.dedup_by(|a, b| a.schema == b.schema && a.name == b.name);
+    hits.truncate(limit);
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -302,4 +363,28 @@ pub struct TableColumns {
     pub columns: Vec<ColumnInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub foreign_keys: Vec<ForeignKey>,
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    fn obj(schema: &str, name: &str) -> DbObject {
+        DbObject { schema: schema.into(), name: name.into(), kind: ObjectKind::Table, comment: None, row_estimate: None }
+    }
+
+    #[test]
+    fn matches_and_ranks() {
+        assert!(object_matches("ORD", "s", "orders"));
+        assert!(object_matches("main.sales.ord", "main.sales", "orders"));
+        assert!(!object_matches("crm.ord", "main.sales", "orders"));
+        assert!(!object_matches("  ", "s", "orders"));
+        assert_eq!(search_sql_term("cat.sch.Ord'x"), "ordx");
+        let mut v = vec![obj("a", "big_orders"), obj("a", "orders_2024"), obj("b", "orders"), obj("a", "orders"), obj("a", "orders")];
+        rank_matches("orders", &mut v, 3);
+        let got: Vec<_> = v.iter().map(|o| format!("{}.{}", o.schema, o.name)).collect();
+        assert_eq!(got, vec!["a.orders", "b.orders", "a.orders_2024"]);
+        let s = SchemaInfo::in_catalog("main", "sales", true);
+        assert_eq!((s.name.as_str(), s.catalog.as_deref()), ("main.sales", Some("main")));
+    }
 }
