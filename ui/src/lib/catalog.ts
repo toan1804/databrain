@@ -154,8 +154,12 @@ function splitIdent(schema: string): string[] {
 }
 
 /** Fully qualified, quoted table path, e.g. `main.sales.orders`. */
+/** Explorer schema id under which DuckDB connections list DataBrain outputs. */
+export const RESULTS_SCHEMA_ID = "results.main";
+
 export function tablePath(kind: ConnectorKind, schema: string, name: string): string {
   if (kind === "duckdb" && schema.endsWith(".files")) return `files.${quoteIdent(kind, name)}`;
+  if (kind === "duckdb" && schema === RESULTS_SCHEMA_ID) return `results.${quoteIdent(kind, name)}`;
   return qualifiedName(kind, schema, name);
 }
 

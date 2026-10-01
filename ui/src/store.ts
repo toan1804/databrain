@@ -122,6 +122,8 @@ interface State {
   connectionDialog: { open: boolean; profile?: ConnectionView | null; folderId?: string | null };
   saveQueryDialog: { open: boolean; tabId?: string };
   paletteOpen: boolean;
+  /** Show the Oracle Instant Client install prompt. */
+  oracleClientPrompt: boolean;
 
   init: () => Promise<void>;
   toast: (message: string, kind?: Toast["kind"]) => void;
@@ -266,7 +268,24 @@ export const useStore = create<State>((set, get) => ({
   refreshOutputs: async () => {
     if (!isTauri()) return;
     try {
-      set({ outputs: await api.listOutputs() });
+      const outputs = await api.listOutputs();
+      set((s) => {
+        // DuckDB explorers list outputs under results.main: drop stale caches.
+        const duck = new Set(s.connections.filter((c) => c.config.kind === "duckdb").map((c) => c.id));
+        const objects = Object.fromEntries(Object.entries(s.objects).filter(([k]) => !k.endsWith("|results.main")));
+        const columns = Object.fromEntries(Object.entries(s.columns).filter(([k]) => !k.includes("|results.main|")));
+        const schemas = Object.fromEntries(
+          Object.entries(s.schemas).filter(([id, list]) => !(duck.has(id) && outputs.length > 0 && !list.some((x) => x.name === "results.main"))),
+        );
+        return { outputs, objects, columns, schemas };
+      });
+      // Reload what the explorer shows open.
+      const st = get();
+      for (const c of st.connections) {
+        if (c.config.kind !== "duckdb") continue;
+        if (st.treeOpen[`c|${c.id}`] && !st.schemas[c.id]) st.loadSchemas(c.id).catch(() => {});
+        if (st.treeOpen[`s|${c.id}|results.main`] && st.schemas[c.id]?.some((x) => x.name === "results.main")) st.loadObjects(c.id, "results.main").catch(() => {});
+      }
     } catch {
       /* backend restarting */
     }
@@ -335,6 +354,7 @@ export const useStore = create<State>((set, get) => ({
   treeOpen: {},
   treeFocus: null,
   catalogSearch: { query: "", scope: null, focusSeq: 0 },
+  oracleClientPrompt: false,
   toasts: [],
   confirm: null,
   connectionDialog: { open: false },
@@ -389,6 +409,8 @@ export const useStore = create<State>((set, get) => ({
         savedQueries,
       });
       await onJobEvent((e) => get().handleJobEvent(e));
+      window.addEventListener("db:oracle-client-missing", () => set({ oracleClientPrompt: true }));
+      void import("./components/OracleClient").then((m) => m.checkOracleClientAtStartup());
       await onAuthEvent((event) => {
         const cur = get().signIn;
         if (event.type === "finished") set({ signIn: cur ? { ...cur, event } : null });
@@ -818,6 +840,7 @@ export const useStore = create<State>((set, get) => ({
           break;
         case "statement_failed": {
           const cancelled = e.error.kind === "cancelled";
+          if (e.error.code === "oracle_client_missing") setTimeout(() => set({ oracleClientPrompt: true }), 0);
           upd(e.index, {
             status: cancelled ? "cancelled" : "error",
             error: e.error,

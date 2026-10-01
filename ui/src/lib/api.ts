@@ -19,6 +19,7 @@ import type {
   KnNote,
   IndexPlan,
   CredentialStoreKind,
+  OracleClientStatus,
   CredentialStoreView,
   MigrationReport,
   KnowledgeEvent,
@@ -73,7 +74,10 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
   try {
     return await invoke<T>(cmd, args);
   } catch (e) {
-    throw toError(e);
+    const err = toError(e);
+    // Any command can hit a missing Oracle client (connect, explorer, test).
+    if (err.code === "oracle_client_missing" && typeof window !== "undefined") window.dispatchEvent(new CustomEvent("db:oracle-client-missing"));
+    throw err;
   }
 }
 
@@ -181,6 +185,9 @@ export const api = {
   mcpConfig: () => call<unknown>("mcp_config"),
 
   knGet: (connectionId: string) => call<KnowledgeView>("kn_get", { connectionId }),
+  oracleClientStatus: (libDir?: string | null) => call<OracleClientStatus>("oracle_client_status", { libDir: libDir || null }),
+  oracleInstallClient: () => call<OracleClientStatus>("oracle_install_client"),
+  oracleOpenDownload: () => call<void>("oracle_open_download"),
   credentialStore: () => call<CredentialStoreView>("credential_store"),
   setCredentialStore: (kind: CredentialStoreKind) => call<MigrationReport>("set_credential_store", { kind }),
   knPlan: (connectionId: string) => call<IndexPlan>("kn_plan", { connectionId }),

@@ -223,6 +223,38 @@ pub struct DuckSession {
 
 type Loaded = Mutex<std::collections::HashMap<String, String>>;
 
+/// Explorer schema id for DataBrain outputs (`results.<name>` in SQL).
+pub const RESULTS_SCHEMA_ID: &str = "results.main";
+
+impl DuckSession {
+    /// Outputs as explorer objects (no data loaded).
+    fn output_catalog(&self) -> Vec<databrain_connector_core::external::ExternalInfo> {
+        self.outputs.as_ref().and_then(|s| s.get()).map(|t| t.catalog()).unwrap_or_default()
+    }
+
+    fn output_objects(&self) -> Vec<DbObject> {
+        self.output_catalog()
+            .into_iter()
+            .map(|i| DbObject { schema: RESULTS_SCHEMA_ID.into(), name: i.name, kind: ObjectKind::Table, comment: i.comment, row_estimate: i.rows })
+            .collect()
+    }
+
+    fn output_columns(&self) -> Vec<TableColumns> {
+        self.output_catalog()
+            .into_iter()
+            .map(|i| TableColumns {
+                table: i.name,
+                columns: i
+                    .columns
+                    .into_iter()
+                    .map(|(name, data_type)| ColumnInfo { name, data_type, nullable: true, is_primary_key: false, default: None, comment: None })
+                    .collect(),
+                foreign_keys: vec![],
+            })
+            .collect()
+    }
+}
+
 /// Load (or refresh) the outputs `sql` references into the in-memory
 /// `results` catalog of this session. Returns notices to show the user.
 fn load_outputs(conn: &duckdb::Connection, sql: &str, slot: Option<&ExternalTablesSlot>, loaded: &Loaded) -> Result<Vec<String>> {
@@ -510,7 +542,7 @@ impl Session for DuckSession {
         let rows = self
             .strings(
                 "select database_name, schema_name, (database_name = current_database() and schema_name = current_schema())::varchar \
-                 from duckdb_schemas() where not internal and schema_name <> 'pg_catalog' \
+                 from duckdb_schemas() where not internal and schema_name <> 'pg_catalog' and database_name <> 'results' \
                  order by database_name = current_database() desc, schema_name = 'files' desc, 1, 2"
                     .into(),
                 vec![],
@@ -519,6 +551,7 @@ impl Session for DuckSession {
         Ok(rows
             .into_iter()
             .filter_map(|r| Some(SchemaInfo::in_catalog(r[0].clone()?, r[1].as_deref()?, r[2].as_deref() == Some("true"))))
+            .chain((!self.output_catalog().is_empty()).then(|| SchemaInfo::in_catalog("results", "main", false)))
             .collect())
     }
 
@@ -531,7 +564,16 @@ impl Session for DuckSession {
                 vec![],
             )
             .await?;
-        Ok(Some(rows.into_iter().filter_map(|r| Some((r[0].clone()?, r[1].as_deref()?.parse().ok()?))).collect()))
+        let mut counts: std::collections::HashMap<String, usize> = rows
+            .into_iter()
+            .filter_map(|r| Some((r[0].clone()?, r[1].as_deref()?.parse().ok()?)))
+            .filter(|(s, _): &(String, usize)| !s.starts_with("results."))
+            .collect();
+        let n = self.output_catalog().len();
+        if n > 0 {
+            counts.insert(RESULTS_SCHEMA_ID.into(), n);
+        }
+        Ok(Some(counts))
     }
 
     async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
@@ -539,9 +581,9 @@ impl Session for DuckSession {
         let rows = self
             .strings(
                 "select database_name || '.' || schema_name, table_name, 'table', comment, estimated_size::varchar from duckdb_tables() \
-                 where not internal and contains(lower(table_name), ?) \
+                 where not internal and database_name <> 'results' and contains(lower(table_name), ?) \
                  union all select database_name || '.' || schema_name, view_name, 'view', comment, null from duckdb_views() \
-                 where not internal and contains(lower(view_name), ?) limit 5000"
+                 where not internal and database_name <> 'results' and contains(lower(view_name), ?) limit 5000"
                     .into(),
                 vec![term.clone(), term],
             )
@@ -557,6 +599,7 @@ impl Session for DuckSession {
                     row_estimate: r[4].as_deref().and_then(|n| n.parse().ok()),
                 })
             })
+            .chain(self.output_objects())
             .filter(|o| databrain_connector_core::object_matches(query, &o.schema, &o.name))
             .collect();
         databrain_connector_core::rank_matches(query, &mut hits, limit);
@@ -564,6 +607,9 @@ impl Session for DuckSession {
     }
 
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {
+        if schema == RESULTS_SCHEMA_ID {
+            return Ok(self.output_objects());
+        }
         let (db, sch) = schema.split_once('.').ok_or_else(|| ConnectorError::query("expected database.schema"))?;
         let rows = self
             .strings(
@@ -589,6 +635,11 @@ impl Session for DuckSession {
     }
 
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
+        if schema == RESULTS_SCHEMA_ID {
+            let object = self.output_objects().into_iter().find(|o| o.name == name).ok_or_else(|| ConnectorError::query(format!("output {name} not found")))?;
+            let columns = self.output_columns().into_iter().find(|t| t.table == name).map(|t| t.columns).unwrap_or_default();
+            return Ok(ObjectDetail { object, columns, ddl: None, foreign_keys: vec![] });
+        }
         let object = self
             .list_objects(schema)
             .await?
@@ -612,6 +663,9 @@ impl Session for DuckSession {
     }
 
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
+        if schema == RESULTS_SCHEMA_ID {
+            return Ok(self.output_columns());
+        }
         self.columns(schema, None).await
     }
 }
@@ -772,6 +826,14 @@ mod tests {
         fn names(&self) -> Vec<String> {
             vec!["sales".into()]
         }
+        fn catalog(&self) -> Vec<databrain_connector_core::external::ExternalInfo> {
+            vec![databrain_connector_core::external::ExternalInfo {
+                name: "sales".into(),
+                columns: vec![("region".into(), "VARCHAR".into()), ("amount".into(), "BIGINT".into())],
+                rows: Some(4),
+                comment: Some("output r1".into()),
+            }]
+        }
     }
 
     #[tokio::test]
@@ -792,6 +854,16 @@ mod tests {
         assert_eq!(r.batches[0].column(0).as_primitive::<Int64Type>().value(0), 10);
         let e = s.execute("select * from results.nope", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
         assert!(e.message.contains("results.nope") && e.message.contains("results.sales"), "{}", e.message);
+        // Explorer: outputs are listed (with columns) under results.main,
+        // also after `results` was attached by the queries above.
+        let schemas = s.list_schemas().await.unwrap();
+        assert_eq!(schemas.iter().filter(|x| x.catalog.as_deref() == Some("results")).map(|x| x.name.as_str()).collect::<Vec<_>>(), vec![RESULTS_SCHEMA_ID]);
+        let objs = s.list_objects(RESULTS_SCHEMA_ID).await.unwrap();
+        assert_eq!(objs.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["sales"]);
+        let d = s.describe(RESULTS_SCHEMA_ID, "sales").await.unwrap();
+        assert_eq!(d.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["region", "amount"]);
+        assert_eq!(s.search_objects("sal", 5).await.unwrap()[0].schema, RESULTS_SCHEMA_ID);
+        assert_eq!(s.schema_object_counts().await.unwrap().unwrap().get(RESULTS_SCHEMA_ID), Some(&1));
         // Without a provider, results.* is a clear error.
         let plain = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
         let e = plain.execute("select * from results.sales", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();

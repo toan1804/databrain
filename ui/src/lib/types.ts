@@ -678,6 +678,14 @@ export type KnowledgeEvent =
   | { type: "cancelled"; connection_id: string }
   | { type: "failed"; connection_id: string; error: string };
 
+export interface OracleClientStatus {
+  installed: boolean;
+  version: string | null;
+  lib_dir: string | null;
+  message: string | null;
+  platform: { os: string; arch: string; download_page: string; download_url: string | null; auto_install: boolean; note: string | null };
+}
+
 export type CredentialStoreKind = "keychain" | "vault";
 export interface CredentialStoreView {
   kind: CredentialStoreKind;

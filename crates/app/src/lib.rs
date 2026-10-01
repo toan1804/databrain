@@ -257,6 +257,47 @@ async fn drop_unpinned_outputs(state: State<'_, AppState>) -> R<usize> {
     api::drop_unpinned_outputs(&state).await
 }
 #[tauri::command]
+async fn oracle_client_status(app: tauri::AppHandle, state: State<'_, AppState>, lib_dir: Option<String>) -> R<serde_json::Value> {
+    #[cfg(feature = "oracle")]
+    {
+        let st = api::oracle_client_status(&state, lib_dir, app.path().app_data_dir().ok()).await?;
+        Ok(serde_json::to_value(st).unwrap_or_default())
+    }
+    #[cfg(not(feature = "oracle"))]
+    {
+        let _ = (app, state, lib_dir);
+        Err(databrain_query_engine::EngineError::new("unsupported", "Oracle is not enabled in this build"))
+    }
+}
+#[tauri::command]
+async fn oracle_install_client(app: tauri::AppHandle, state: State<'_, AppState>) -> R<serde_json::Value> {
+    #[cfg(feature = "oracle")]
+    {
+        let dir = app.path().app_data_dir().map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?;
+        let st = api::oracle_install_client(&state, dir).await?;
+        Ok(serde_json::to_value(st).unwrap_or_default())
+    }
+    #[cfg(not(feature = "oracle"))]
+    {
+        let _ = (app, state);
+        Err(databrain_query_engine::EngineError::new("unsupported", "Oracle is not enabled in this build"))
+    }
+}
+/// Open Oracle's Instant Client download page for this platform (fixed URL).
+#[tauri::command]
+async fn oracle_open_download(state: State<'_, AppState>) -> R<()> {
+    #[cfg(feature = "oracle")]
+    {
+        let url = databrain_connector_oracle::client::platform().download_page;
+        state.ui.open_url(url).map_err(|e| databrain_query_engine::EngineError::new("internal", e))
+    }
+    #[cfg(not(feature = "oracle"))]
+    {
+        let _ = state;
+        Err(databrain_query_engine::EngineError::new("unsupported", "Oracle is not enabled in this build"))
+    }
+}
+#[tauri::command]
 async fn credential_store(state: State<'_, AppState>) -> R<api::CredentialStoreView> {
     Ok(api::credential_store(&state))
 }
@@ -529,6 +570,7 @@ pub fn run() {
             let state = AppState::new(workspace, store.clone(), sink, ui);
             state.set_credential_store(store, dir.clone());
             state.set_snapshot_dir(dir.join("outputs"));
+            api::apply_oracle_client_setting(&state);
             app.manage(state);
             #[cfg(target_os = "macos")]
             app.set_menu(macos_menu(app.handle())?)?;
@@ -607,6 +649,9 @@ pub fn run() {
             kn_plan,
             credential_store,
             set_credential_store,
+            oracle_client_status,
+            oracle_install_client,
+            oracle_open_download,
             drop_output,
             drop_unpinned_outputs,
             kn_cancel,

@@ -727,6 +727,26 @@ impl ExternalTables for OutputTables {
     fn names(&self) -> Vec<String> {
         self.0.table_names()
     }
+
+    fn catalog(&self) -> Vec<databrain_connector_core::external::ExternalInfo> {
+        let mut out = Vec::new();
+        for name in self.0.table_names() {
+            let Some(o) = self.0.resolve(&name) else { continue };
+            let what = if name == o.handle { "output".to_string() } else if o.name.as_deref() == Some(name.as_str()) { format!("output {}", o.handle) } else { format!("older version, {}", o.handle) };
+            out.push(databrain_connector_core::external::ExternalInfo {
+                columns: o.columns.iter().map(|c| (c.name.clone(), c.db_type.clone().unwrap_or_else(|| c.data_type.clone()))).collect(),
+                rows: Some(o.rows as i64),
+                comment: Some(format!("{what} · {} · {}{}", o.connection_name, crate::outputs::one_line(&o.sql, 120), if o.truncated { " · capped at the row limit" } else { "" })),
+                name,
+            });
+        }
+        out
+    }
+}
+
+pub(crate) fn one_line(s: &str, max: usize) -> String {
+    let t: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.chars().count() <= max { t } else { format!("{}…", t.chars().take(max - 1).collect::<String>()) }
 }
 
 /// Make a result natural to query in SQL: exact decimals that the grid keeps

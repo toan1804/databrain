@@ -12,6 +12,7 @@ import { AiPanel } from "./components/AiPanel";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { SignInDialog } from "./components/SignInDialog";
 import { IndexScopeDialog } from "./components/IndexScopeDialog";
+import { OracleClientDialog } from "./components/OracleClient";
 import { InlineAi } from "./components/InlineAi";
 import { useAi } from "./aiStore";
 
@@ -209,6 +210,7 @@ export default function App() {
       <SettingsDialog />
       <SignInDialog />
       <IndexScopeDialog />
+      <OracleClientDialog />
       <InlineAi />
       <ConfirmDialog />
       <Toasts />

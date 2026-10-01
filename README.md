@@ -32,7 +32,7 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
 - Safety prompts for prod and for writes, read-only connections, saved queries, history, command palette (⌘K), dark/light theme.
 
 Runtime notes:
-- Oracle needs Oracle Instant Client.
+- Oracle needs Oracle Instant Client. DataBrain checks for it (connection dialog, startup when Oracle connections exist, and on connect errors) and can download and install Oracle's latest Basic package in one click (macOS DMG into `~/Downloads/instantclient_*`; Windows/Linux ZIP into the app-data folder; Linux also needs `libaio`).
 - Google/Snowflake/Entra browser OAuth needs your own OAuth client ID.
 - DuckDB's Excel/Delta/Iceberg extensions download on first use.
 - Kiro needs Kiro CLI installed (`curl -fsSL https://cli.kiro.dev/install | bash`). API keys require a Kiro Pro plan or higher. DataBrain writes one agent config, `~/.kiro/agents/databrain-sql.json`, which limits Kiro to DataBrain's tools.

@@ -629,6 +629,48 @@ pub fn rename_output(state: &AppState, handle: &str, name: Option<String>) -> Re
     Ok(o)
 }
 
+/// Setting with the Instant Client folder found or installed by DataBrain.
+pub const ORACLE_CLIENT_SETTING: &str = "oracle_client_dir";
+
+/// Use the saved Instant Client folder for Oracle connections without one.
+pub fn apply_oracle_client_setting(state: &AppState) {
+    #[cfg(feature = "oracle")]
+    {
+        let dir = state.workspace.get_setting(ORACLE_CLIENT_SETTING).ok().flatten().and_then(|v| v.as_str().map(str::to_string));
+        databrain_connector_oracle::client::set_default_dir(dir);
+    }
+    #[cfg(not(feature = "oracle"))]
+    let _ = state;
+}
+
+/// Is Oracle Instant Client available? (`lib_dir`: a folder to check first.)
+#[cfg(feature = "oracle")]
+pub async fn oracle_client_status(state: &AppState, lib_dir: Option<String>, app_dir: Option<PathBuf>) -> Result<databrain_connector_oracle::client::ClientStatus> {
+    let extra: Vec<PathBuf> = app_dir.into_iter().map(|d| d.join("oracle")).collect();
+    let st = blocking(move || Ok(databrain_connector_oracle::client::status(lib_dir.as_deref(), &extra))).await?;
+    if st.installed {
+        if let Some(d) = &st.lib_dir {
+            // Remember the folder for connections that don't set one.
+            if databrain_connector_oracle::client::default_dir().is_none() {
+                databrain_connector_oracle::client::set_default_dir(Some(d.clone()));
+                state.workspace.set_setting(ORACLE_CLIENT_SETTING, &serde_json::json!(d))?;
+            }
+        }
+    }
+    Ok(st)
+}
+
+/// Download and install the latest Instant Client (Basic) for this computer.
+#[cfg(feature = "oracle")]
+pub async fn oracle_install_client(state: &AppState, app_dir: PathBuf) -> Result<databrain_connector_oracle::client::ClientStatus> {
+    let dest = app_dir.join("oracle");
+    let dir = blocking(move || databrain_connector_oracle::client::install(&dest).map_err(|e| EngineError::new("install", e))).await?;
+    let d = dir.to_string_lossy().into_owned();
+    databrain_connector_oracle::client::set_default_dir(Some(d.clone()));
+    state.workspace.set_setting(ORACLE_CLIENT_SETTING, &serde_json::json!(d))?;
+    oracle_client_status(state, Some(d), Some(app_dir)).await
+}
+
 /// Drop an output (data, saved snapshot and handle).
 pub async fn drop_output(state: &AppState, reference: String) -> Result<OutputInfo> {
     let reg = state.engine.outputs().clone();

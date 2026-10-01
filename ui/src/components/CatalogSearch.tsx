@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AlertCircle, ChevronDown, Eye, Loader2, Play, Search, Table2, TextCursorInput, X } from "lucide-react";
 import { api, toError } from "../lib/api";
-import { cachedHits, matchRange, objectMatches, rankHits, splitSchema } from "../lib/catalog";
+import { RESULTS_SCHEMA_ID, cachedHits, matchRange, objectMatches, rankHits, splitSchema, tablePath } from "../lib/catalog";
 import type { ConnectionView, DbObject } from "../lib/types";
-import { qualifiedName, quoteIdent, selectTopSql } from "../lib/util";
+import { selectTopSql } from "../lib/util";
 import { editorBridge } from "../editorBridge";
 import { useStore } from "../store";
 import { ConnDot, MenuItem, Popover } from "./ui";
@@ -11,14 +11,13 @@ import { ObjectMenu } from "./CatalogMenus";
 
 /** SQL reference for an object (DuckDB attached files are addressed as `files.x`). */
 export function objectRef(conn: ConnectionView, obj: DbObject): string {
-  if (conn.config.kind === "duckdb" && obj.schema.endsWith(".files")) return `files.${quoteIdent("duckdb", obj.name)}`;
-  return qualifiedName(conn.config.kind, obj.schema, obj.name);
+  return tablePath(conn.config.kind, obj.schema, obj.name);
 }
 
 /** Open a new tab with `SELECT * … LIMIT 100` for the object and run it. */
 export function selectTop(conn: ConnectionView, obj: DbObject) {
   const sql =
-    conn.config.kind === "duckdb" && obj.schema.endsWith(".files")
+    conn.config.kind === "duckdb" && (obj.schema.endsWith(".files") || obj.schema === RESULTS_SCHEMA_ID)
       ? `SELECT *\nFROM ${objectRef(conn, obj)}\nLIMIT 100;`
       : selectTopSql(conn.config.kind, obj.schema, obj.name);
   const st = useStore.getState();

@@ -319,6 +319,7 @@ export function tableApply(p: MetaProvider, o: DbObject): string {
   const def = defaultSchema(p.schemas());
   const known = (p.schemas() ?? []).find((s) => s.name === o.schema);
   if (k === "duckdb" && o.schema.endsWith(".files")) return `files.${quoteIdent(k, o.name)}`;
+  if (k === "duckdb" && o.schema === "results.main") return `results.${quoteIdent(k, o.name)}`;
   let parts: string[];
   if (threeLevel(k) && (known?.catalog || o.schema.includes("."))) {
     const cat = known?.catalog ?? o.schema.slice(0, o.schema.indexOf("."));

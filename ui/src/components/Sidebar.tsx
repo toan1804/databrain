@@ -424,7 +424,13 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
         schemas &&
         (catalogs
           ? catalogs.map((g) => (
-              <CatalogNode key={g.name} conn={conn} group={g} defaultOpen={g.isDefault || catalogs.length === 1} />
+              <CatalogNode
+                key={g.name}
+                conn={conn}
+                group={g}
+                // The Results connection exists to query outputs: show them.
+                defaultOpen={g.isDefault || catalogs.length === 1 || (g.name === "results" && conn.config.options?.databrain_results === "1")}
+              />
             ))
           : schemas.map((s) => (
               <SchemaNode key={s.name} conn={conn} schema={s} depth={1} defaultOpen={s.is_default || schemas.length === 1} />

@@ -32,6 +32,22 @@ pub trait ExternalTables: Send + Sync {
     fn resolve(&self, name: &str) -> Result<ExternalTable, String>;
     /// Names that can currently be referenced (for error messages).
     fn names(&self) -> Vec<String>;
+    /// Catalog view for explorers: every referenceable name with its
+    /// columns, without loading data. Defaults to names only.
+    fn catalog(&self) -> Vec<ExternalInfo> {
+        self.names().into_iter().map(|name| ExternalInfo { name, ..Default::default() }).collect()
+    }
+}
+
+/// Explorer metadata of an external table (no data).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExternalInfo {
+    pub name: String,
+    /// (column, type) pairs.
+    pub columns: Vec<(String, String)>,
+    pub rows: Option<i64>,
+    /// Shown as the table comment (source connection, SQL…).
+    pub comment: Option<String>,
 }
 
 /// Late-bound holder: connectors are built before the engine that implements

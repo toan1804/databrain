@@ -16,6 +16,7 @@ databrain-connector-core = { version = "0.1.0", path = "../../connector-core" }
 futures = "0.3.34"
 oracle = "0.6.3"
 secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["rt", "sync", "macros", "time", "net"] }
 
 [dev-dependencies]

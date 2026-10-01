@@ -4,7 +4,9 @@
 //! set the `client_lib_dir` option or the platform library path). The driver
 //! API is synchronous, so all calls run on blocking threads.
 
-use std::sync::{Arc, Mutex, Once};
+pub mod client;
+
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use databrain_auth::{AuthMethodKind, Credential, CredentialSource};
@@ -27,18 +29,10 @@ impl OracleConnector {
     }
 }
 
-static INIT: Once = Once::new();
-
 fn init_client(lib_dir: Option<&str>) {
-    let dir = lib_dir.map(str::to_string);
-    INIT.call_once(|| {
-        if let Some(d) = dir {
-            let mut p = oracle::InitParams::new();
-            if p.oracle_client_lib_dir(d).is_ok() {
-                let _ = p.init();
-            }
-        }
-    });
+    // Retries on every connect until the library loads (e.g. right after
+    // installing Instant Client), using the folder found automatically.
+    let _ = client::init_client(lib_dir, &[]);
 }
 
 fn map_err(e: oracle::Error) -> ConnectorError {
@@ -62,9 +56,11 @@ fn map_err(e: oracle::Error) -> ConnectorError {
     }
     let msg = e.to_string();
     if msg.contains("DPI-1047") {
+        // `oracle_client_missing` lets the UI offer the one-click install.
         return ConnectorError::connection(format!(
-            "{msg}\n\nInstall Oracle Instant Client and set the connection's “Instant Client directory” option."
-        ));
+            "Oracle Instant Client was not found (DPI-1047). Install it from the connection dialog (“Install Instant Client”), or set the connection's “Instant Client directory”.\n\n{msg}"
+        ))
+        .with_code("oracle_client_missing");
     }
     ConnectorError::query(msg)
 }
