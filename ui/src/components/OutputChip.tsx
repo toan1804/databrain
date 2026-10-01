@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { pairColumns } from "../lib/compare";
 import {
   AlertTriangle,
   AtSign,
@@ -12,6 +13,7 @@ import {
   PinOff,
   TerminalSquare,
   Trash2,
+  X,
 } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { OutputInfo } from "../lib/types";
@@ -138,7 +140,20 @@ export function CompareDialog({ initial, onClose }: { initial?: OutputInfo; onCl
   const [after, setAfter] = useState(initial?.handle ?? outputs[0]?.handle ?? "");
   const b = outputs.find((o) => o.handle === before);
   const a = outputs.find((o) => o.handle === after);
-  const common = useMemo(() => (a && b ? a.columns.map((c) => c.name).filter((n) => b.columns.some((x) => x.name === n)) : []), [a, b]);
+  // Columns matched by name (any case) plus pairs the user adds.
+  const [manual, setManual] = useState<[string, string][]>([]);
+  const [pickBefore, setPickBefore] = useState("");
+  const [pickAfter, setPickAfter] = useState("");
+  const match = useMemo(
+    () => pairColumns(b?.columns.map((c) => c.name) ?? [], a?.columns.map((c) => c.name) ?? [], manual),
+    [a, b, manual],
+  );
+  const common = useMemo(() => match.pairs.map((p) => p.after), [match]);
+  useEffect(() => {
+    setManual([]);
+    setPickBefore("");
+    setPickAfter("");
+  }, [before, after]);
   const [keys, setKeys] = useState<string[]>(() => {
     const first = initial?.columns[0]?.name;
     return first && /(^id$|_id$|^key$|^code$|name$|country|date)/i.test(first) ? [first] : [];
@@ -147,7 +162,12 @@ export function CompareDialog({ initial, onClose }: { initial?: OutputInfo; onCl
   const run = async () => {
     if (!a || !b) return;
     try {
-      const sql = await api.outputDiffSql(b.handle, a.handle, keys.filter((k) => common.includes(k)));
+      const sql = await api.outputDiffSql(
+        b.handle,
+        a.handle,
+        keys.filter((k) => common.includes(k)),
+        match.pairs.filter((p) => p.how === "manual").map((p) => [p.before, p.after] as [string, string]),
+      );
       await openResultsQuery(sql, `Diff ${outputLabel(b)} → ${outputLabel(a)}`);
       onClose();
     } catch (e) {
@@ -190,7 +210,7 @@ export function CompareDialog({ initial, onClose }: { initial?: OutputInfo; onCl
         <div>
           <div className="mb-1 text-[11.5px] font-medium text-muted">Key columns (match rows by)</div>
           {common.length === 0 ? (
-            <p className="text-danger">These outputs have no columns in common.</p>
+            <p className="text-danger">No columns match by name. Match columns below to compare them.</p>
           ) : (
             <div className="flex flex-wrap gap-1.5">
               {common.map((c) => (
@@ -204,6 +224,77 @@ export function CompareDialog({ initial, onClose }: { initial?: OutputInfo; onCl
           <p className="mt-1.5 text-[11.5px] text-muted">
             With keys: rows added, removed and changed (with before values). Without keys: whole rows that differ. Runs locally in DuckDB.
           </p>
+        </div>
+
+        <div>
+          <div className="mb-1 text-[11.5px] font-medium text-muted">Matched columns ({match.pairs.length})</div>
+          <div className="max-h-36 space-y-0.5 overflow-auto rounded-md border border-line p-1.5">
+            {match.pairs.length === 0 && <div className="text-[11.5px] text-muted">None yet.</div>}
+            {match.pairs.map((p) => (
+              <div key={p.after} className="flex items-center gap-1.5 font-mono text-[11.5px]">
+                <span className="min-w-0 truncate">{p.before}</span>
+                {p.before !== p.after && (
+                  <>
+                    <span className="text-muted">→</span>
+                    <span className="min-w-0 truncate">{p.after}</span>
+                  </>
+                )}
+                <span className="ml-auto shrink-0 font-sans text-[10.5px] text-muted">
+                  {p.how === "same" ? "same name" : p.how === "case" ? "same name, other case" : "matched by you"}
+                </span>
+                {p.how === "manual" && (
+                  <button
+                    className="icon-btn h-5 w-5 shrink-0"
+                    aria-label={`Unmatch ${p.before} and ${p.after}`}
+                    title="Unmatch"
+                    onClick={() => setManual((m) => m.filter(([x, y]) => !(x === p.before && y === p.after)))}
+                  >
+                    <X size={11} />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+          {(match.onlyBefore.length > 0 || match.onlyAfter.length > 0) && (
+            <div className="mt-2">
+              <div className="mb-1 text-[11.5px] text-muted">
+                Not matched: {match.onlyBefore.length} before, {match.onlyAfter.length} after. These are left out of the comparison unless you match them
+                (e.g. val_dt ↔ value_date).
+              </div>
+              {match.onlyBefore.length > 0 && match.onlyAfter.length > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <select className="field h-7 min-w-0 flex-1 py-0 font-mono text-[11.5px]" aria-label="Before column" value={pickBefore} onChange={(e) => setPickBefore(e.target.value)}>
+                    <option value="">Before column…</option>
+                    {match.onlyBefore.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="text-muted">↔</span>
+                  <select className="field h-7 min-w-0 flex-1 py-0 font-mono text-[11.5px]" aria-label="After column" value={pickAfter} onChange={(e) => setPickAfter(e.target.value)}>
+                    <option value="">After column…</option>
+                    {match.onlyAfter.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className="btn-ghost shrink-0 border border-line py-1"
+                    disabled={!pickBefore || !pickAfter}
+                    onClick={() => {
+                      setManual((m) => [...m, [pickBefore, pickAfter]]);
+                      setPickBefore("");
+                      setPickAfter("");
+                    }}
+                  >
+                    Match
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
           {(a?.truncated || b?.truncated) && (
             <p className="mt-1 flex items-center gap-1 text-[11.5px] text-warning">
               <AlertTriangle size={11} /> One side is capped at the row limit, so missing rows may be reported as removed or added.

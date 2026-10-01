@@ -113,8 +113,8 @@ async fn pin_output(state: State<'_, AppState>, handle: String, pinned: bool) ->
     api::pin_output(&state, handle, pinned).await
 }
 #[tauri::command]
-async fn output_diff_sql(state: State<'_, AppState>, before: String, after: String, keys: Vec<String>) -> R<String> {
-    api::output_diff_sql(&state, &before, &after, keys)
+async fn output_diff_sql(state: State<'_, AppState>, before: String, after: String, keys: Vec<String>, mapping: Option<Vec<(String, String)>>) -> R<String> {
+    api::output_diff_sql(&state, &before, &after, keys, mapping.unwrap_or_default())
 }
 #[tauri::command]
 async fn results_connection(state: State<'_, AppState>) -> R<String> {

@@ -791,24 +791,81 @@ fn decimal_type(col: &dyn Array) -> DataType {
 /// DuckDB SQL comparing two outputs. With key columns: rows `added`,
 /// `removed` and `changed` (with `<col> (before)` for changed values).
 /// Without keys: whole-row differences (multiset).
-pub fn diff_sql(before: &OutputInfo, after: &OutputInfo, keys: &[String]) -> Result<String> {
-    let q = |s: &str| q_min(s);
-    let bcols: HashSet<&str> = before.columns.iter().map(|c| c.name.as_str()).collect();
-    let common: Vec<&str> = after.columns.iter().map(|c| c.name.as_str()).filter(|c| bcols.contains(c)).collect();
-    if common.is_empty() {
-        return Err(EngineError::new("invalid", format!("{} and {} have no columns in common", before.handle, after.handle)));
+/// Pair the columns of two outputs as (before, after) names: user pairs
+/// first (`extra`, e.g. `val_dt` ↔ `value_date`), then equal names, then
+/// names equal ignoring case (`test` ↔ `Test`). Each column is used once.
+pub fn column_pairs(before: &OutputInfo, after: &OutputInfo, extra: &[(String, String)]) -> Result<Vec<(String, String)>> {
+    let bnames: Vec<&str> = before.columns.iter().map(|c| c.name.as_str()).collect();
+    let anames: Vec<&str> = after.columns.iter().map(|c| c.name.as_str()).collect();
+    let mut used_b: HashSet<String> = HashSet::new();
+    let mut used_a: HashSet<String> = HashSet::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (bc, ac) in extra {
+        if !bnames.contains(&bc.as_str()) {
+            return Err(EngineError::new("invalid", format!("column {bc} is not in {}", before.handle)));
+        }
+        if !anames.contains(&ac.as_str()) {
+            return Err(EngineError::new("invalid", format!("column {ac} is not in {}", after.handle)));
+        }
+        if used_b.contains(bc) || used_a.contains(ac) {
+            return Err(EngineError::new("invalid", format!("column {bc} or {ac} is matched twice")));
+        }
+        used_b.insert(bc.clone());
+        used_a.insert(ac.clone());
+        pairs.push((bc.clone(), ac.clone()));
     }
-    for k in keys {
-        if !common.contains(&k.as_str()) {
-            return Err(EngineError::new("invalid", format!("key column {k} is not in both outputs")));
+    for exact in [true, false] {
+        for ac in &anames {
+            if used_a.contains(*ac) {
+                continue;
+            }
+            let hit = bnames.iter().find(|bc| !used_b.contains(**bc) && if exact { *bc == ac } else { bc.eq_ignore_ascii_case(ac) });
+            if let Some(bc) = hit {
+                used_b.insert(bc.to_string());
+                used_a.insert(ac.to_string());
+                pairs.push((bc.to_string(), ac.to_string()));
+            }
         }
     }
+    // Keep the after output's column order.
+    pairs.sort_by_key(|(_, a)| anames.iter().position(|x| x == a).unwrap_or(usize::MAX));
+    Ok(pairs)
+}
+
+pub fn diff_sql(before: &OutputInfo, after: &OutputInfo, keys: &[String]) -> Result<String> {
+    diff_sql_mapped(before, after, keys, &[])
+}
+
+/// Diff SQL over matched columns (see [`column_pairs`]). Before-side columns
+/// are renamed to the after-side names; `keys` use after-side names (or the
+/// before-side name of a pair, or any case).
+pub fn diff_sql_mapped(before: &OutputInfo, after: &OutputInfo, keys: &[String], extra: &[(String, String)]) -> Result<String> {
+    let q = |s: &str| q_min(s);
+    let pairs = column_pairs(before, after, extra)?;
+    if pairs.is_empty() {
+        return Err(EngineError::new("invalid", format!("{} and {} have no matching columns; match some columns by hand", before.handle, after.handle)));
+    }
+    let common: Vec<&str> = pairs.iter().map(|(_, a)| a.as_str()).collect();
+    let mut key_names: Vec<String> = Vec::new();
+    for k in keys {
+        let hit = pairs.iter().find(|(b, a)| a == k || b == k).or_else(|| pairs.iter().find(|(b, a)| a.eq_ignore_ascii_case(k) || b.eq_ignore_ascii_case(k)));
+        match hit {
+            Some((_, a)) => key_names.push(a.clone()),
+            None => return Err(EngineError::new("invalid", format!("key column {k} is not matched in both outputs"))),
+        }
+    }
+    let keys = &key_names;
     let (a, b) = (before.reference(), after.reference());
     let cols = common.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
-    let header = format!("-- Differences from {} (before) to {} (after)\n", before.handle, after.handle);
+    let a_cols = pairs.iter().map(|(bc, ac)| if bc == ac { q(ac) } else { format!("{} AS {}", q(bc), q(ac)) }).collect::<Vec<_>>().join(", ");
+    let renamed: Vec<String> = pairs.iter().filter(|(bc, ac)| bc != ac).map(|(bc, ac)| format!("{bc} → {ac}")).collect();
+    let mut header = format!("-- Differences from {} (before) to {} (after)\n", before.handle, after.handle);
+    if !renamed.is_empty() {
+        header.push_str(&format!("-- Matched columns: {}\n", renamed.join(", ")));
+    }
     if keys.is_empty() {
         return Ok(format!(
-            "{header}WITH a AS (SELECT {cols} FROM {a}), b AS (SELECT {cols} FROM {b})\n\
+            "{header}WITH a AS (SELECT {a_cols} FROM {a}), b AS (SELECT {cols} FROM {b})\n\
              SELECT 'removed' AS _change, * FROM (SELECT * FROM a EXCEPT ALL SELECT * FROM b)\n\
              UNION ALL\n\
              SELECT 'added' AS _change, * FROM (SELECT * FROM b EXCEPT ALL SELECT * FROM a)\n\
@@ -829,7 +886,7 @@ pub fn diff_sql(before: &OutputInfo, after: &OutputInfo, keys: &[String]) -> Res
     };
     let changed_select = if changed_cols.is_empty() { key_list.clone() } else { format!("{key_list}, {}", changed_cols.join(", ")) };
     Ok(format!(
-        "{header}WITH a AS (SELECT {cols} FROM {a}), b AS (SELECT {cols} FROM {b})\n\
+        "{header}WITH a AS (SELECT {a_cols} FROM {a}), b AS (SELECT {cols} FROM {b})\n\
          SELECT 'added' AS _change, * FROM b ANTI JOIN a USING ({using})\n\
          UNION ALL BY NAME\n\
          SELECT 'removed' AS _change, * FROM a ANTI JOIN b USING ({using})\n\

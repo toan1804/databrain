@@ -378,12 +378,24 @@ async fn outputs_handles_cross_source_queries_diff_chart_and_pins() {
     assert_eq!(api::get_output(&st, "r3").unwrap().connection_name, "Results (DuckDB)");
 
     // 5) Diff the two versions by country: every country's revenue changed.
-    let diff = api::output_diff_sql(&st, "revenue__1", "revenue", vec!["country".into()]).unwrap();
+    let diff = api::output_diff_sql(&st, "revenue__1", "revenue", vec!["country".into()], vec![]).unwrap();
     let rows = query(&st, &res, &diff).await;
     assert_eq!(rows.len(), 7, "{diff}");
     assert!(rows.iter().all(|r| r[0].as_deref() == Some("changed")));
-    let keyless = api::output_diff_sql(&st, "revenue__1", "revenue", vec![]).unwrap();
+    let keyless = api::output_diff_sql(&st, "revenue__1", "revenue", vec![], vec![]).unwrap();
     assert_eq!(query(&st, &res, &keyless).await.len(), 14); // 7 removed + 7 added
+
+    // 5b) Different column names: COUNTRY matches country (case), and the
+    //     user pairs total ↔ revenue by hand.
+    run_named(&st, &sq, "t5", "SELECT c.country AS COUNTRY, round(sum(o.total_amount), 2) AS total FROM orders o JOIN customers c USING (customer_id) WHERE o.status = 'delivered' GROUP BY 1", None, Some("renamed")).await;
+    let r = api::output_diff_sql(&st, "renamed", "revenue", vec!["country".into()], vec![]).unwrap();
+    assert!(r.contains("COUNTRY AS country") || r.contains("\"COUNTRY\" AS country"), "{r}");
+    let rows = query(&st, &res, &r).await;
+    assert!(rows.iter().all(|x| x[0].as_deref() != Some("changed")), "revenue is unmatched, so only keys compare: {r}");
+    let mapped = api::output_diff_sql(&st, "renamed", "revenue", vec!["country".into()], vec![("total".into(), "revenue".into())]).unwrap();
+    assert!(mapped.contains("total → revenue"), "{mapped}");
+    assert_eq!(query(&st, &res, &mapped).await.len(), 0, "same data under other names: no differences\n{mapped}");
+    assert!(api::output_diff_sql(&st, "renamed", "revenue", vec![], vec![("nope".into(), "revenue".into())]).is_err());
 
     // 6) Truncated outputs warn when queried.
     run_named(&st, &sq, "t3", "SELECT * FROM orders", Some(100), Some("orders_sample")).await;

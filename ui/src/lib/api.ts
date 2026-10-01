@@ -164,7 +164,8 @@ export const api = {
   loadOutput: (reference: string) => call<OutputInfo>("load_output", { reference }),
   renameOutput: (handle: string, name: string | null) => call<OutputInfo>("rename_output", { handle, name }),
   pinOutput: (handle: string, pinned: boolean) => call<OutputInfo>("pin_output", { handle, pinned }),
-  outputDiffSql: (before: string, after: string, keys: string[]) => call<string>("output_diff_sql", { before, after, keys }),
+  outputDiffSql: (before: string, after: string, keys: string[], mapping: [string, string][] = []) =>
+    call<string>("output_diff_sql", { before, after, keys, mapping }),
   resultsConnection: () => call<string>("results_connection"),
   chartData: (resultId: string, view: ViewSpec, spec: ChartSpec) => call<ChartData>("chart_data", { resultId, view, spec }),
 
