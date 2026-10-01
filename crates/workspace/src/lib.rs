@@ -110,6 +110,9 @@ pub struct AiPolicy {
     pub pii_columns: Vec<String>,
     /// Schemas to include in the knowledge index (empty = all).
     pub index_schemas: Vec<String>,
+    /// Schemas fetched per metadata request while indexing (bigger = fewer
+    /// queries on engines with bulk metadata, e.g. Databricks).
+    pub index_batch: u32,
     /// Expose this connection to external agents through the MCP server.
     pub mcp_enabled: bool,
 }
@@ -127,6 +130,7 @@ impl Default for AiPolicy {
             max_rows_to_model: 50,
             pii_columns: vec![],
             index_schemas: vec![],
+            index_batch: 25,
             mcp_enabled: false,
         }
     }
@@ -566,9 +570,23 @@ impl Workspace {
         self.get_connection(&p.id)
     }
 
+    /// Delete a connection and the data that only belongs to it (AI
+    /// knowledge: indexed metadata, notes, index state). Saved queries,
+    /// history, notebooks and AI conversations are kept (their connection
+    /// becomes unset). Secrets are removed by the caller (secret store).
     pub fn delete_connection(&self, id: &str) -> Result<()> {
-        let c = self.conn.lock();
-        c.execute("DELETE FROM connections WHERE id = ?1", [id])?;
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let n = tx.execute("DELETE FROM connections WHERE id = ?1", [id])?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("connection {id}")));
+        }
+        tx.execute("DELETE FROM kn_objects WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM kn_fts WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM kn_notes WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM kn_state WHERE connection_id = ?1", [id])?;
+        tx.execute("UPDATE tabs SET connection_id = NULL WHERE connection_id = ?1", [id])?;
+        tx.commit()?;
         Ok(())
     }
 

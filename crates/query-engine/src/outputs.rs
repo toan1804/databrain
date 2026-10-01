@@ -10,7 +10,10 @@
 //! - older outputs are *recent*: kept in memory until the budget is exceeded,
 //!   then the least recently used are evicted (metadata stays, data is freed);
 //! - *pinned* outputs are never evicted and, when a snapshot directory is set,
-//!   are saved as Parquet and restored on the next start.
+//!   are saved as Parquet and restored on the next start;
+//! - each tab's latest (active) outputs are saved when the app quits
+//!   ([`OutputRegistry::persist_active`], up to [`AUTO_MAX_BYTES`] each) and
+//!   restored with the tab, so a reopened tab still shows its last result.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -33,6 +36,10 @@ const KEEP_VERSIONS: usize = 5;
 /// Metadata entries kept for evicted outputs.
 const MAX_ENTRIES: usize = 400;
 const DEFAULT_BUDGET: usize = 1024 * 1024 * 1024;
+/// Largest active output saved on quit (in-memory size).
+pub const AUTO_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Total size of active outputs saved on quit.
+pub const AUTO_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -160,20 +167,25 @@ impl OutputRegistry {
     pub fn set_snapshot_dir(&self, dir: PathBuf) {
         *self.snapshot_dir.lock() = Some(dir);
         let Ok(records) = self.workspace.list_outputs() else { return };
+        let open_tabs: HashSet<String> = self.workspace.list_tabs().map(|t| t.into_iter().map(|t| t.id).collect()).unwrap_or_default();
         let mut g = self.inner.lock();
         for rec in records {
             let Ok(mut info) = serde_json::from_value::<OutputInfo>(rec.meta.clone()) else { continue };
             let on_disk = rec.snapshot_path.as_deref().is_some_and(|p| std::path::Path::new(p).is_file());
-            if !on_disk {
-                let _ = self.workspace.delete_output(&rec.result_id);
+            // Saved on quit as a tab's last result: only while the tab exists.
+            let tab_output = !info.pinned;
+            if !on_disk || (tab_output && !open_tabs.contains(&info.tab_id)) {
+                self.drop_record(&rec);
                 continue;
             }
             if g.by_handle.contains_key(&info.handle) {
                 continue;
             }
             info.state = if self.results.contains(&info.result_id) { OutputState::Live } else { OutputState::OnDisk };
-            info.pinned = true;
-            info.active = false;
+            info.active = tab_output;
+            if tab_output {
+                g.active.entry(info.tab_id.clone()).or_default().push(info.handle.clone());
+            }
             info.version_of = None;
             if let Some(n) = &info.name {
                 let key = n.to_ascii_lowercase();
@@ -189,6 +201,71 @@ impl OutputRegistry {
             g.by_result.insert(info.result_id.clone(), info.handle.clone());
             g.by_handle.insert(info.handle.clone(), info);
         }
+    }
+
+    fn drop_record(&self, rec: &OutputRecord) {
+        let _ = self.workspace.delete_output(&rec.result_id);
+        if let Some(p) = &rec.snapshot_path {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// Save each tab's latest outputs (called when the app quits) so they
+    /// are shown again after a restart, and drop saved tab outputs that are
+    /// no longer current. Pinned outputs are handled by [`Self::set_pinned`].
+    /// Returns the number of outputs written.
+    pub fn persist_active(&self) -> usize {
+        let Some(_) = self.snapshot_dir.lock().clone() else { return 0 };
+        let mut active: Vec<OutputInfo> = {
+            let g = self.inner.lock();
+            g.active.values().flatten().filter_map(|h| g.by_handle.get(h)).filter(|o| !o.pinned).cloned().collect()
+        };
+        active.sort_by_key(|o| std::cmp::Reverse(o.last_used));
+        let saved: HashMap<String, OutputRecord> = self.workspace.list_outputs().unwrap_or_default().into_iter().map(|r| (r.result_id.clone(), r)).collect();
+        let mut keep: HashSet<String> = HashSet::new();
+        let (mut total, mut written) = (0usize, 0usize);
+        for o in active {
+            let bytes = if o.state == OutputState::Live { self.results.bytes_of(&o.result_id) } else { o.bytes };
+            if bytes > AUTO_MAX_BYTES || total + bytes > AUTO_TOTAL_BYTES {
+                continue;
+            }
+            let Some(path) = self.snapshot_path(&o.result_id) else { continue };
+            let have_file = saved.contains_key(&o.result_id) && path.is_file();
+            if !have_file {
+                if o.state != OutputState::Live {
+                    continue;
+                }
+                let Ok(rs) = self.results.get(&o.result_id) else { continue };
+                let (schema, batch) = {
+                    let mut g = rs.lock();
+                    let Ok(b) = g.combined() else { continue };
+                    (g.schema(), b)
+                };
+                if databrain_export::write_snapshot(&path, schema, &[batch]).is_err() {
+                    continue;
+                }
+                written += 1;
+            }
+            let _ = self.workspace.save_output(&OutputRecord {
+                result_id: o.result_id.clone(),
+                handle: o.handle.clone(),
+                name: o.name.clone(),
+                connection_id: Some(o.connection_id.clone()),
+                meta: serde_json::to_value(&o).unwrap_or_default(),
+                snapshot_path: Some(path.to_string_lossy().into_owned()),
+                created_at: o.created_at,
+            });
+            total += bytes;
+            keep.insert(o.result_id);
+        }
+        // Previously saved tab outputs that are no longer a tab's latest.
+        for (id, rec) in saved {
+            let pinned = serde_json::from_value::<OutputInfo>(rec.meta.clone()).map(|i| i.pinned).unwrap_or(true);
+            if !pinned && !keep.contains(&id) {
+                self.drop_record(&rec);
+            }
+        }
+        written
     }
 
     fn snapshot_path(&self, result_id: &str) -> Option<PathBuf> {
@@ -774,6 +851,44 @@ mod tests {
         r2.set_pinned("r1", false).unwrap();
         assert!(ws.list_outputs().unwrap().is_empty());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn tab_outputs_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Arc::new(Workspace::open(dir.path().join("w.db")).unwrap());
+        let tab = |id: &str| databrain_workspace::TabState { id: id.into(), title: id.into(), sql: String::new(), connection_id: None, saved_query_id: None, notebook_id: None, output_ref: None };
+        ws.save_tabs(&[tab("t1"), tab("t2")]).unwrap();
+        let snaps = dir.path().join("outputs");
+        {
+            let r = OutputRegistry::new(Arc::new(ResultStore::new()), ws.clone());
+            r.set_snapshot_dir(snaps.clone());
+            add(&r, "t1", 3); // r1: replaced by r2 below
+            r.begin_run("t1");
+            add(&r, "t1", 5); // r2: latest of t1
+            add(&r, "t2", 7); // r3: latest of t2
+            let p = add(&r, "gone", 2); // r4: tab closed before quit
+            r.set_pinned(&p.handle, true).unwrap();
+            assert_eq!(r.persist_active(), 2);
+            assert_eq!(r.persist_active(), 0, "unchanged outputs are not rewritten");
+        }
+        // Restart; tab t2 was closed meanwhile.
+        ws.save_tabs(&[tab("t1")]).unwrap();
+        let store = Arc::new(ResultStore::new());
+        let r = OutputRegistry::new(store, ws.clone());
+        r.set_snapshot_dir(snaps.clone());
+        let t1 = r.for_tab("t1");
+        assert_eq!(t1.iter().map(|o| (o.handle.as_str(), o.state, o.active, o.pinned)).collect::<Vec<_>>(), vec![("r2", OutputState::OnDisk, true, false)]);
+        assert!(r.for_tab("t2").is_empty());
+        assert!(r.get("r4").unwrap().pinned, "pinned output kept although its tab is gone");
+        assert_eq!(r.ensure_loaded("r2").unwrap().rows, 5);
+        // New run of t1, quit: the old snapshot is dropped.
+        r.begin_run("t1");
+        add(&r, "t1", 1);
+        r.persist_active();
+        let files = std::fs::read_dir(&snaps).unwrap().count();
+        assert_eq!(files, 2, "r4 (pinned) + new t1 output");
+        assert_eq!(add(&r, "x", 1).handle, "r6", "handles keep counting after restart");
     }
 
     #[test]

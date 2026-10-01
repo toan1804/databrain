@@ -1752,6 +1752,7 @@ dependencies = [
 name = "databrain-auth"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "async-trait",
  "base64 0.23.1",
  "dirs 7.0.0",
@@ -1763,6 +1764,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",

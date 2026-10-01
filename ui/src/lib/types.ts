@@ -70,6 +70,8 @@ export interface AiPolicy {
   max_rows_to_model: number;
   pii_columns: string[];
   index_schemas: string[];
+  /** Schemas per metadata request while indexing (default 25). */
+  index_batch?: number;
   mcp_enabled: boolean;
 }
 
@@ -676,6 +678,17 @@ export type KnowledgeEvent =
   | { type: "cancelled"; connection_id: string }
   | { type: "failed"; connection_id: string; error: string };
 
+export type CredentialStoreKind = "keychain" | "vault";
+export interface CredentialStoreView {
+  kind: CredentialStoreKind;
+  vault_dir: string | null;
+  switchable: boolean;
+}
+export interface MigrationReport {
+  moved: number;
+  failed: string[];
+}
+
 export interface PlanSchema {
   name: string;
   catalog?: string | null;
@@ -692,4 +705,6 @@ export interface IndexPlan {
   catalogs: number;
   total_objects: number | null;
   large: boolean;
+  /** Saved schemas-per-request setting. */
+  batch: number;
 }

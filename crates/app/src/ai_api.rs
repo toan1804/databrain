@@ -376,13 +376,18 @@ pub async fn knowledge_plan(state: &AppState, connection_id: &str) -> Result<dat
 ///
 /// `scope` (schema ids, `catalog.*`, or `*`) limits the run; it is saved as
 /// the connection's `ai_policy.index_schemas` so re-indexing uses it.
-pub fn index_knowledge(state: &AppState, connection_id: &str, scope: Option<Vec<String>>) -> Result<()> {
-    if let Some(sc) = &scope {
-        if sc.is_empty() {
-            return Err(EngineError::new("invalid", "choose at least one catalog or schema to index"));
-        }
+pub fn index_knowledge(state: &AppState, connection_id: &str, scope: Option<Vec<String>>, batch: Option<u32>) -> Result<()> {
+    if scope.is_some() || batch.is_some() {
         let mut p = state.workspace.get_connection(connection_id)?;
-        p.ai_policy.index_schemas = if sc.iter().any(|s| s.trim() == "*") { vec!["*".into()] } else { sc.clone() };
+        if let Some(sc) = &scope {
+            if sc.is_empty() {
+                return Err(EngineError::new("invalid", "choose at least one catalog or schema to index"));
+            }
+            p.ai_policy.index_schemas = if sc.iter().any(|s| s.trim() == "*") { vec!["*".into()] } else { sc.clone() };
+        }
+        if let Some(b) = batch {
+            p.ai_policy.index_batch = b.clamp(1, databrain_ai::knowledge::MAX_BATCH as u32);
+        }
         state.workspace.save_connection(p)?;
     }
     static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);

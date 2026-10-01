@@ -89,6 +89,8 @@ interface State {
   /** All known outputs (newest first); refreshed on `outputs_changed`. */
   outputs: OutputInfo[];
   refreshOutputs: () => Promise<void>;
+  /** Show each tab's last results from the previous session (active tab first). */
+  restoreTabOutputs: () => Promise<void>;
   /** Patch an output in runs + list after rename/pin. */
   applyOutput: (o: OutputInfo) => void;
   notebooks: NotebookSummary[];
@@ -139,6 +141,8 @@ interface State {
   loadObjects: (connId: string, schema: string, force?: boolean) => Promise<DbObject[]>;
   loadColumns: (connId: string, schema: string, name: string) => Promise<ColumnInfo[]>;
   disconnect: (connId: string) => Promise<void>;
+  /** Ask, then delete a connection (secrets and AI knowledge too). Resolves true when deleted. */
+  deleteConnection: (connId: string) => Promise<boolean>;
 
   newTab: (init?: Partial<Tab>) => string;
   closeTab: (id: string) => void;
@@ -176,6 +180,32 @@ interface State {
 }
 
 const TAB_SAVE_DELAY = 400;
+
+/** Notice shown on a result restored from the previous session. */
+export const RESTORED_NOTICE = "Restored from your last session. Run again for fresh data.";
+
+/**
+ * Run state that shows a tab's saved outputs (its last results, saved when
+ * the app quit) without re-running anything. `null` when the tab has none.
+ */
+export function restoredRun(tabId: string, outputs: OutputInfo[]): TabRun | null {
+  const mine = outputs.filter((o) => o.tab_id === tabId && o.active && o.state !== "evicted").sort((a, b) => a.statement_index - b.statement_index);
+  if (!mine.length) return null;
+  return {
+    jobId: null,
+    running: false,
+    startedAt: Math.min(...mine.map((o) => o.created_at)),
+    finishedStatus: "success",
+    statements: mine.map((o) => ({
+      plan: { index: o.statement_index, sql: o.sql, start: 0, end: 0, classification: { kind: "read", missing_where: false, keyword: "" } },
+      status: "done",
+      result: { id: o.result_id, columns: o.columns, total_rows: o.rows, complete: true, truncated: o.truncated, bytes: o.bytes },
+      output: o,
+      notices: [RESTORED_NOTICE],
+    })),
+    activeIndex: mine.length - 1,
+  };
+}
 
 /**
  * Job events that arrived before the `run_query` response told us the job id.
@@ -237,6 +267,23 @@ export const useStore = create<State>((set, get) => ({
       set({ outputs: await api.listOutputs() });
     } catch {
       /* backend restarting */
+    }
+  },
+  restoreTabOutputs: async () => {
+    const { tabs, activeTabId } = get();
+    const order = [...tabs].filter((t) => !t.notebook_id && !t.output_ref).sort((a, b) => Number(b.id === activeTabId) - Number(a.id === activeTabId));
+    for (const t of order) {
+      const outs = get().outputs.filter((o) => o.tab_id === t.id && o.active);
+      if (!outs.length || get().runs[t.id]) continue;
+      try {
+        // Saved results are read from disk on first use.
+        const loaded = await Promise.all(outs.map((o) => (o.state === "on_disk" ? api.loadOutput(o.handle) : Promise.resolve(o))));
+        const run = restoredRun(t.id, loaded);
+        // The user may have run the tab meanwhile.
+        if (run && !get().runs[t.id]) set((s) => ({ runs: { ...s.runs, [t.id]: run } }));
+      } catch {
+        // Snapshot missing or unreadable: the tab just starts empty.
+      }
     }
   },
   applyOutput: (o) =>
@@ -330,7 +377,9 @@ export const useStore = create<State>((set, get) => ({
       });
       void get().refreshFolders();
       void get().refreshNotebooks();
-      void get().refreshOutputs();
+      void get()
+        .refreshOutputs()
+        .then(() => get().restoreTabOutputs());
     } catch (e) {
       set({ ready: true });
       get().toast(`Failed to start: ${toError(e).message}`, "error");
@@ -411,6 +460,44 @@ export const useStore = create<State>((set, get) => ({
     set((s) => ({ columns: { ...s.columns, [key]: d.columns } }));
     return d.columns;
   },
+  deleteConnection: (connId) =>
+    new Promise<boolean>((resolve) => {
+      const conn = get().connections.find((c) => c.id === connId);
+      if (!conn) return resolve(false);
+      const tabs = get().tabs.filter((t) => t.connection_id === connId).length;
+      get().askConfirm({
+        title: `Delete connection "${conn.name}"?`,
+        reasons: [
+          "Removes the connection, its saved password/SSH/OAuth credentials and its AI knowledge (indexed schema and notes).",
+          "Saved queries, history and notebooks are kept, without a connection.",
+          ...(tabs ? [`${tabs} open tab${tabs === 1 ? "" : "s"} will have no connection.`] : []),
+          ...(conn.env === "prod" ? ["This is a production connection."] : []),
+        ],
+        confirmLabel: "Delete",
+        onCancel: () => resolve(false),
+        onConfirm: async () => {
+          try {
+            await api.deleteConnection(connId);
+          } catch (e) {
+            // "partial": deleted, but a secret could not be removed.
+            const err = toError(e);
+            get().toast(err.message, err.kind === "partial" ? "info" : "error");
+            if (err.kind !== "partial") return resolve(false);
+          }
+          const drop = <T,>(m: Record<string, T>) => Object.fromEntries(Object.entries(m).filter(([k]) => k !== connId && !k.startsWith(connId + "|")));
+          set((s) => ({
+            schemas: drop(s.schemas),
+            objects: drop(s.objects),
+            columns: drop(s.columns),
+            tabs: s.tabs.map((t) => (t.connection_id === connId ? { ...t, connection_id: null } : t)),
+            catalogSearch: s.catalogSearch.scope === connId ? { ...s.catalogSearch, scope: null } : s.catalogSearch,
+          }));
+          await get().refreshConnections();
+          get().toast(`Deleted "${conn.name}"`, "success");
+          resolve(true);
+        },
+      });
+    }),
   disconnect: async (connId) => {
     await api.disconnect(connId);
     set((s) => {

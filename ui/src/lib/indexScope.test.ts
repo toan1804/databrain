@@ -18,6 +18,7 @@ const plan = (schemas: PlanSchema[], scope: string[] = [], large = true): IndexP
   catalogs: new Set(schemas.map((x) => x.catalog)).size,
   total_objects: schemas.reduce((n, x) => n + (x.objects ?? 0), 0),
   large,
+  batch: 25,
 });
 
 const p = plan([
@@ -55,6 +56,14 @@ describe("index scope", () => {
     const all = new Set(["main.sales", "main.crm", "dev.a", "dev.b"]);
     expect(estimateQueries("databricks", p, all)).toBe(4);
     expect(estimateQueries("snowflake", p, all)).toBe(8);
+    // 1,000 schemas in one catalog: 25 per batch → 80 queries; 200 → 10;
+    // 500 → 12 (each IN list holds at most 200 schemas).
+    const big = plan(Array.from({ length: 1000 }, (_, i) => s("lake", `s${i}`, 1)));
+    const every = new Set(big.schemas.map((x) => x.name));
+    expect(estimateQueries("databricks", big, every)).toBe(80);
+    expect(estimateQueries("databricks", big, every, 200)).toBe(10);
+    expect(estimateQueries("databricks", big, every, 500)).toBe(12);
+    expect(estimateQueries("databricks", big, every, 0)).toBe(80);
     expect(selectedObjects(p, new Set(["dev.a", "main.crm"]))).toBe(105);
     expect(selectedObjects(plan([{ ...s("x", "y", 0), objects: null }]), new Set(["x.y"]))).toBeNull();
   });

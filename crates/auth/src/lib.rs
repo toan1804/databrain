@@ -10,6 +10,7 @@ pub mod cloud;
 pub mod jwt;
 pub mod loopback;
 pub mod oauth;
+pub mod vault;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -18,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 pub use oauth::{ClientAuthStyle, OAuthConfig, TokenSet};
+pub use vault::{MigrationReport, StoreKind, SwitchableStore, VaultStore};
 pub use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 pub use tokio_util::sync::CancellationToken;

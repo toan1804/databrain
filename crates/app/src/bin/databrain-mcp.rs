@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use databrain_ai::mcp::McpServer;
-use databrain_auth::KeychainStore;
+use databrain_auth::SwitchableStore;
 use databrain_query_engine::{EventHub, EventSink, JobEvent, QueryEngine};
 use databrain_result_store::ResultStore;
 use databrain_workspace::Workspace;
@@ -34,7 +34,10 @@ async fn main() {
     };
     let hub = EventHub::new(Arc::new(Quiet));
     let slot = databrain_connector_core::external::ExternalTablesSlot::new();
-    let engine = QueryEngine::new(databrain_app::api::registry_with_outputs(Some(slot.clone())), ws, Arc::new(KeychainStore), Arc::new(ResultStore::new()), hub.clone());
+    // Same credential store as the app (keychain or the local vault).
+    let vault_dir = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    let secrets = Arc::new(SwitchableStore::new(databrain_app::api::saved_store_kind(&ws), &vault_dir));
+    let engine = QueryEngine::new(databrain_app::api::registry_with_outputs(Some(slot.clone())), ws, secrets, Arc::new(ResultStore::new()), hub.clone());
     slot.set(engine.external_tables());
     // Pinned outputs saved by the app are readable (read-only use) here too.
     if let Some(dir) = path.parent() {

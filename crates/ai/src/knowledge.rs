@@ -76,6 +76,8 @@ pub struct IndexPlan {
     pub total_objects: Option<usize>,
     /// Big enough that the user should pick what to index.
     pub large: bool,
+    /// Saved schemas-per-batch setting.
+    pub batch: usize,
 }
 
 /// What an index run would cover: one schema listing (+ one count query
@@ -103,12 +105,15 @@ pub async fn plan(engine: &Arc<QueryEngine>, connection_id: &str) -> Result<Inde
     let total_objects = counts.map(|_| schemas.iter().filter(|s| !s.system).filter_map(|s| s.objects).sum());
     let user = schemas.iter().filter(|s| !s.system).count();
     let large = user > LARGE_SCHEMAS || catalogs > LARGE_CATALOGS || total_objects.is_some_and(|n| n > LARGE_OBJECTS);
-    Ok(IndexPlan { schemas, scope, catalogs, total_objects, large })
+    let batch = (profile.ai_policy.index_batch as usize).clamp(1, MAX_BATCH);
+    Ok(IndexPlan { schemas, scope, catalogs, total_objects, large, batch })
 }
 
-/// Schemas per metadata batch: progress and cancellation happen between
-/// batches (engines with bulk metadata use ~2 queries per batch).
-const BATCH: usize = 25;
+/// Default schemas per metadata batch: progress and cancellation happen
+/// between batches (engines with bulk metadata use ~2 queries per batch).
+pub const DEFAULT_BATCH: usize = 25;
+/// Upper bound for `ai_policy.index_batch`.
+pub const MAX_BATCH: usize = 500;
 
 /// (Re)index a connection's metadata. `scope` overrides
 /// `ai_policy.index_schemas` (entries as in [`scope_matches`]; empty = all
@@ -135,8 +140,9 @@ pub async fn index_connection(
         .filter(|s| if wanted.is_empty() || wanted.iter().all(|w| w.trim() == "*") { !system_schema(s) } else { scope_matches(&wanted, s) })
         .collect();
     let mut report = IndexReport { schemas: schemas.len(), objects: 0, changed: 0, removed: 0, errors: vec![], cancelled: false };
+    let batch_size = (profile.ai_policy.index_batch as usize).clamp(1, MAX_BATCH);
     let mut done: Vec<String> = Vec::new();
-    for batch in schemas.chunks(BATCH) {
+    for batch in schemas.chunks(batch_size) {
         if cancel.is_cancelled() {
             report.cancelled = true;
             break;

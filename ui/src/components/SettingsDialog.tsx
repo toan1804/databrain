@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { AlertCircle, Bot, Check, Copy, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, Terminal, Trash2 } from "lucide-react";
+import { AlertCircle, Bot, Check, Copy, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, ShieldCheck, Terminal, Trash2 } from "lucide-react";
 import { api, toError } from "../lib/api";
-import type { AuditEntry, KiroStatus, ProviderAuth, ProviderKind, ProviderView } from "../lib/types";
+import type { AuditEntry, CredentialStoreKind, CredentialStoreView, KiroStatus, ProviderAuth, ProviderKind, ProviderView } from "../lib/types";
 import { relativeTime } from "../lib/util";
 import { useStore } from "../store";
 import { useAi } from "../aiStore";
@@ -60,7 +60,7 @@ const AUTH_LABEL: Record<ProviderAuth, string> = {
 export function SettingsDialog() {
   const open = useStore((s) => s.settingsOpen);
   const setOpen = useStore((s) => s.setSettingsOpen);
-  const [section, setSection] = useState<"providers" | "mcp" | "audit">("providers");
+  const [section, setSection] = useState<"providers" | "security" | "mcp" | "audit">("providers");
   if (!open) return null;
   const item = (id: typeof section, icon: React.ReactNode, label: string) => (
     <button
@@ -77,11 +77,13 @@ export function SettingsDialog() {
       <div className="flex min-h-[460px] gap-4">
         <div className="w-40 shrink-0 space-y-0.5">
           {item("providers", <Bot size={14} />, "AI providers")}
+          {item("security", <ShieldCheck size={14} />, "Passwords")}
           {item("mcp", <Plug size={14} />, "MCP / Kiro")}
           {item("audit", <ScrollText size={14} />, "AI audit log")}
         </div>
         <div className="min-w-0 flex-1">
           {section === "providers" && <Providers />}
+          {section === "security" && <CredentialStore />}
           {section === "mcp" && <Mcp />}
           {section === "audit" && <Audit />}
         </div>
@@ -400,6 +402,90 @@ function ProviderForm({
           {busy === "save" ? <Loader2 size={13} className="animate-spin" /> : <KeyRound size={13} />} {initial ? "Save" : "Add provider"}
         </button>
       </div>
+    </div>
+  );
+}
+
+/** Where passwords, tokens and API keys are kept: OS keychain or local vault. */
+function CredentialStore() {
+  const toast = useStore((s) => s.toast);
+  const askConfirm = useStore((s) => s.askConfirm);
+  const [view, setView] = useState<CredentialStoreView | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    api.credentialStore().then(setView).catch((e) => toast(toError(e).message, "error"));
+  }, [toast]);
+
+  const apply = async (kind: CredentialStoreKind) => {
+    setBusy(true);
+    try {
+      const r = await api.setCredentialStore(kind);
+      setView(await api.credentialStore());
+      toast(
+        `Saved passwords now use the ${kind === "vault" ? "local vault" : "OS keychain"}` +
+          (r.moved ? ` (${r.moved} moved)` : "") +
+          (r.failed.length ? `. ${r.failed.length} could not be read and stay where they were; enter them again if needed.` : ""),
+        r.failed.length ? "info" : "success",
+      );
+    } catch (e) {
+      toast(toError(e).message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const choose = (kind: CredentialStoreKind) => {
+    if (!view || view.kind === kind) return;
+    askConfirm({
+      title: kind === "vault" ? "Move saved passwords to the local vault?" : "Move saved passwords to the OS keychain?",
+      reasons:
+        kind === "vault"
+          ? [
+              "Every saved password, token and API key is copied from the keychain into an encrypted file in DataBrain's app-data folder, then removed from the keychain.",
+              "macOS may ask for your login password once per item while they are read (choose “Always Allow”). After that, DataBrain no longer asks.",
+            ]
+          : ["Every saved secret is moved from the local vault into the OS keychain and the vault is emptied.", "macOS may ask for access when they are read later."],
+      confirmLabel: "Move passwords",
+      onConfirm: () => void apply(kind),
+    });
+  };
+
+  const option = (kind: CredentialStoreKind, title: string, body: React.ReactNode) => (
+    <label
+      className={`flex cursor-pointer items-start gap-2.5 rounded-lg border p-3 ${view?.kind === kind ? "border-accent bg-accent/5" : "border-line hover:bg-hover"}`}
+    >
+      <input type="radio" name="credential-store" className="mt-0.5" checked={view?.kind === kind} disabled={busy || !view?.switchable} onChange={() => choose(kind)} />
+      <div className="space-y-1">
+        <div className="font-medium">{title}</div>
+        <div className="text-[12px] text-muted">{body}</div>
+      </div>
+    </label>
+  );
+
+  return (
+    <div className="space-y-3 text-[12.5px]">
+      <div>
+        <div className="text-[14px] font-semibold">Saved passwords</div>
+        <p className="text-[12px] text-muted">Where database passwords, SSH passwords, OAuth tokens and AI API keys are stored. They are never written to the workspace database.</p>
+      </div>
+      {option(
+        "keychain",
+        "OS keychain (most secure)",
+        <>macOS Keychain, Windows Credential Manager or the Linux Secret Service. macOS can ask for your login password when DataBrain reads an item, again after app updates.</>,
+      )}
+      {option(
+        "vault",
+        "DataBrain vault (no prompts, like DBeaver)",
+        <>
+          An encrypted file (AES-256-GCM) in DataBrain's app-data folder, with its key in a separate file only your user can read. No keychain prompts. Anyone who can read
+          your user files, or a backup of that folder, can decrypt it, so prefer the keychain on shared or unmanaged computers.
+          {view?.vault_dir && <span className="mt-1 block select-text font-mono text-[11px]">{view.vault_dir}/vault.json, vault.key</span>}
+        </>,
+      )}
+      {busy && (
+        <div className="flex items-center gap-1.5 text-muted">
+          <Loader2 size={12} className="animate-spin" /> Moving saved passwords…
+        </div>
+      )}
     </div>
   );
 }

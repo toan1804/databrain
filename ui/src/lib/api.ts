@@ -18,6 +18,9 @@ import type {
   FolderKind,
   KnNote,
   IndexPlan,
+  CredentialStoreKind,
+  CredentialStoreView,
+  MigrationReport,
   KnowledgeEvent,
   KnowledgeView,
   KiroStatus,
@@ -176,9 +179,12 @@ export const api = {
   mcpConfig: () => call<unknown>("mcp_config"),
 
   knGet: (connectionId: string) => call<KnowledgeView>("kn_get", { connectionId }),
+  credentialStore: () => call<CredentialStoreView>("credential_store"),
+  setCredentialStore: (kind: CredentialStoreKind) => call<MigrationReport>("set_credential_store", { kind }),
   knPlan: (connectionId: string) => call<IndexPlan>("kn_plan", { connectionId }),
   knCancel: (connectionId: string) => call<boolean>("kn_cancel", { connectionId }),
-  knIndex: (connectionId: string, scope?: string[] | null) => call<void>("kn_index", { connectionId, scope: scope ?? null }),
+  knIndex: (connectionId: string, scope?: string[] | null, batch?: number | null) =>
+    call<void>("kn_index", { connectionId, scope: scope ?? null, batch: batch ?? null }),
   knClear: (connectionId: string) => call<void>("kn_clear", { connectionId }),
   knSaveNote: (note: KnNote) => call<KnNote>("kn_save_note", { note }),
   knDeleteNote: (id: string) => call<void>("kn_delete_note", { id }),

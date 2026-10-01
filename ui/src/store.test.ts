@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { JobEvent, RunRequest } from "./lib/types";
+import type { JobEvent, OutputInfo, RunRequest } from "./lib/types";
 
 // Fake backend: run_query emits the job's events *before* resolving, like a
 // warm session finishing a fast statement before the IPC response arrives.
@@ -7,6 +7,10 @@ let jobSeq = 0;
 let emitBeforeResolve = true;
 const cancelResult = { value: false };
 let handler: ((e: JobEvent) => void) | null = null;
+const out = (handle: string, tab: string, index: number, extra: Record<string, unknown> = {}) =>
+  ({ handle, tab_id: tab, statement_index: index, active: true, state: "on_disk", result_id: `res-${handle}`, sql: `select ${index}`, columns: [], rows: 3, truncated: false, bytes: 10, created_at: 1, ...extra }) as unknown as OutputInfo;
+let outputs: OutputInfo[] = [];
+const deleted: string[] = [];
 
 vi.mock("./lib/api", () => ({
   isTauri: () => false,
@@ -26,10 +30,15 @@ vi.mock("./lib/api", () => ({
       return { status: "started", job_id, statements: [plan] };
     },
     cancelQuery: async () => cancelResult.value,
+    deleteConnection: async (id: string) => {
+      deleted.push(id);
+    },
+    listConnections: async () => [],
+    loadOutput: async (handle: string) => ({ ...outputs.find((o) => o.handle === handle)!, state: "live" }),
   },
 }));
 
-const { useStore, _earlyEventCount } = await import("./store");
+const { useStore, _earlyEventCount, restoredRun, RESTORED_NOTICE } = await import("./store");
 
 beforeEach(() => {
   handler = (e) => useStore.getState().handleJobEvent(e);
@@ -70,5 +79,63 @@ describe("job event ordering", () => {
     cancelResult.value = true;
     await useStore.getState().cancelTab(key);
     expect(useStore.getState().runs[key].running).toBe(true);
+  });
+});
+
+describe("restoring tab results after a restart", () => {
+  it("builds a finished run from the tab's saved outputs", () => {
+    const run = restoredRun("t1", [out("r3", "t1", 1), out("r2", "t1", 0), out("r9", "t2", 0), out("r1", "t1", 0, { active: false })])!;
+    expect(run.statements.map((s) => s.output?.handle)).toEqual(["r2", "r3"]);
+    expect(run.statements[1].result).toMatchObject({ id: "res-r3", total_rows: 3, complete: true });
+    expect(run.statements[0].notices).toEqual([RESTORED_NOTICE]);
+    expect(run.running).toBe(false);
+    expect(run.activeIndex).toBe(1);
+    expect(restoredRun("t3", [out("r1", "t1", 0)])).toBeNull();
+  });
+
+  it("loads saved outputs and does not overwrite a newer run", async () => {
+    outputs = [out("r1", "a", 0), out("r2", "b", 0)];
+    useStore.setState({
+      tabs: [{ id: "a", title: "A", sql: "" }, { id: "b", title: "B", sql: "" }],
+      activeTabId: "b",
+      outputs,
+      runs: { a: { jobId: "j", running: true, startedAt: 0, statements: [], activeIndex: null } },
+    });
+    await useStore.getState().restoreTabOutputs();
+    const runs = useStore.getState().runs;
+    expect(runs.a.jobId).toBe("j"); // kept
+    expect(runs.b.statements[0].output?.state).toBe("live"); // loaded from disk
+  });
+});
+
+describe("deleting a connection", () => {
+  const conn = { id: "c1", name: "Prod PG", env: "prod", connected: true } as never;
+  it("asks first and does nothing when cancelled", async () => {
+    useStore.setState({ connections: [conn], tabs: [{ id: "t", title: "T", sql: "", connection_id: "c1" }] });
+    const p = useStore.getState().deleteConnection("c1");
+    const ask = useStore.getState().confirm!;
+    expect(ask.reasons.join(" ")).toMatch(/production/);
+    expect(ask.reasons.join(" ")).toMatch(/1 open tab/);
+    useStore.getState().askConfirm(null);
+    ask.onCancel?.();
+    expect(await p).toBe(false);
+    expect(deleted).toEqual([]);
+  });
+
+  it("deletes, clears caches and detaches tabs on confirm", async () => {
+    useStore.setState({
+      connections: [conn],
+      tabs: [{ id: "t", title: "T", sql: "", connection_id: "c1" }],
+      schemas: { c1: [], c2: [] },
+      objects: { "c1|main": [], "c2|main": [] },
+    });
+    const p = useStore.getState().deleteConnection("c1");
+    useStore.getState().confirm!.onConfirm();
+    expect(await p).toBe(true);
+    expect(deleted).toEqual(["c1"]);
+    const st = useStore.getState();
+    expect(st.tabs[0].connection_id).toBeNull();
+    expect(Object.keys(st.schemas)).toEqual(["c2"]);
+    expect(Object.keys(st.objects)).toEqual(["c2|main"]);
   });
 });

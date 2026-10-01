@@ -117,7 +117,10 @@ export function OutputChip({ output, compact }: { output: OutputInfo; compact?: 
 
 /** Pick two outputs + key columns, open a diff query on the Results connection. */
 export function CompareDialog({ initial, onClose }: { initial?: OutputInfo; onClose: () => void }) {
-  const outputs = useStore((s) => s.outputs.filter((o) => o.state !== "evicted"));
+  // Select the stored array and derive in a memo: a selector returning a new
+  // array each call makes zustand re-render forever (blank app).
+  const all = useStore((s) => s.outputs);
+  const outputs = useMemo(() => all.filter((o) => o.state !== "evicted"), [all]);
   const toast = useStore((s) => s.toast);
   const defaultBefore = useMemo(() => {
     if (!initial) return outputs[1]?.handle ?? "";

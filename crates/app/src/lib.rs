@@ -6,7 +6,7 @@ pub mod api;
 use std::sync::Arc;
 
 use api::{AppState, ConnectionView, SaveConnectionArgs, Span};
-use databrain_auth::KeychainStore;
+use databrain_auth::SwitchableStore;
 use databrain_connector_core::{
     ConnectionConfig, ConnectorInfo, ConnectorKind, DbObject, ObjectDetail, SchemaInfo,
 };
@@ -245,8 +245,16 @@ async fn kn_get(state: State<'_, AppState>, connection_id: String) -> R<ai_api::
     ai_api::knowledge(&state, &connection_id)
 }
 #[tauri::command]
-async fn kn_index(state: State<'_, AppState>, connection_id: String, scope: Option<Vec<String>>) -> R<()> {
-    ai_api::index_knowledge(&state, &connection_id, scope)
+async fn kn_index(state: State<'_, AppState>, connection_id: String, scope: Option<Vec<String>>, batch: Option<u32>) -> R<()> {
+    ai_api::index_knowledge(&state, &connection_id, scope, batch)
+}
+#[tauri::command]
+async fn credential_store(state: State<'_, AppState>) -> R<api::CredentialStoreView> {
+    Ok(api::credential_store(&state))
+}
+#[tauri::command]
+async fn set_credential_store(state: State<'_, AppState>, kind: databrain_auth::StoreKind) -> R<databrain_auth::MigrationReport> {
+    api::set_credential_store(&state, kind).await
 }
 #[tauri::command]
 async fn kn_plan(state: State<'_, AppState>, connection_id: String) -> R<databrain_ai::knowledge::IndexPlan> {
@@ -507,7 +515,10 @@ pub fn run() {
             let workspace = Arc::new(Workspace::open(dir.join("workspace.db"))?);
             let sink = Arc::new(TauriSink(app.handle().clone()));
             let ui = Arc::new(TauriUi(app.handle().clone()));
-            let state = AppState::new(workspace, Arc::new(KeychainStore), sink, ui);
+            // Passwords/tokens: OS keychain or the local encrypted vault (Settings → Security).
+            let store = Arc::new(SwitchableStore::new(api::saved_store_kind(&workspace), &dir));
+            let state = AppState::new(workspace, store.clone(), sink, ui);
+            state.set_credential_store(store, dir.clone());
             state.set_snapshot_dir(dir.join("outputs"));
             app.manage(state);
             #[cfg(target_os = "macos")]
@@ -585,11 +596,21 @@ pub fn run() {
             kn_get,
             kn_index,
             kn_plan,
+            credential_store,
+            set_credential_store,
             kn_cancel,
             kn_save_note,
             kn_delete_note,
             kn_clear,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running DataBrain");
+        .build(tauri::generate_context!())
+        .expect("error while building DataBrain")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Keep each tab's last result for the next start.
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.engine.outputs().persist_active();
+                }
+            }
+        });
 }

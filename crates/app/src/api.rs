@@ -37,6 +37,59 @@ pub struct AppState {
     pub hub: Arc<EventHub>,
     pub ui: Arc<dyn crate::ai_api::UiBridge>,
     pub ai: crate::ai_api::AiState,
+    /// Set when `secrets` is the switchable keychain/vault store.
+    pub credential_store: parking_lot::Mutex<Option<(Arc<databrain_auth::SwitchableStore>, PathBuf)>>,
+}
+
+/// Where DataBrain keeps passwords and tokens.
+#[derive(Debug, Clone, Serialize)]
+pub struct CredentialStoreView {
+    pub kind: databrain_auth::StoreKind,
+    /// Folder of `vault.json` / `vault.key`.
+    pub vault_dir: Option<String>,
+    pub switchable: bool,
+}
+
+/// Setting key for the credential store choice.
+pub const CREDENTIAL_STORE_SETTING: &str = "credential_store";
+
+/// Read the saved store choice (keychain when unset).
+pub fn saved_store_kind(ws: &Workspace) -> databrain_auth::StoreKind {
+    ws.get_setting(CREDENTIAL_STORE_SETTING).ok().flatten().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default()
+}
+
+/// Every secret reference the workspace can own (for migration).
+fn all_secret_refs(state: &AppState) -> Result<Vec<SecretRef>> {
+    let mut refs = Vec::new();
+    for c in state.workspace.list_connections()? {
+        refs.push(SecretRef::for_connection(&c.id));
+        for slot in SECRET_SLOTS.iter().chain(["oauth"].iter()) {
+            refs.push(SecretRef::slot(&c.id, slot));
+        }
+    }
+    for p in state.workspace.list_ai_providers()? {
+        refs.push(SecretRef::for_ai_provider(&p.id));
+        refs.push(SecretRef::slot(&format!("ai:{}", p.id), "oauth"));
+    }
+    Ok(refs)
+}
+
+pub fn credential_store(state: &AppState) -> CredentialStoreView {
+    match &*state.credential_store.lock() {
+        Some((s, dir)) => CredentialStoreView { kind: s.kind(), vault_dir: Some(dir.to_string_lossy().into_owned()), switchable: true },
+        None => CredentialStoreView { kind: databrain_auth::StoreKind::Keychain, vault_dir: None, switchable: false },
+    }
+}
+
+/// Switch between the OS keychain and the local vault, moving saved secrets.
+/// Reading from the keychain can show one macOS prompt per saved secret
+/// (once); afterwards the vault needs no prompts.
+pub async fn set_credential_store(state: &AppState, kind: databrain_auth::StoreKind) -> Result<databrain_auth::MigrationReport> {
+    let store = state.credential_store.lock().as_ref().map(|(s, _)| s.clone()).ok_or_else(|| invalid("the credential store cannot be changed in this build"))?;
+    let refs = all_secret_refs(state)?;
+    let report = blocking(move || store.switch(kind, &refs).map_err(EngineError::from)).await?;
+    state.workspace.set_setting(CREDENTIAL_STORE_SETTING, &serde_json::to_value(kind).unwrap_or_default())?;
+    Ok(report)
 }
 
 pub fn default_registry() -> ConnectorRegistry {
@@ -99,7 +152,13 @@ impl AppState {
             hub,
             ui,
             ai,
+            credential_store: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Use the switchable keychain/vault store (`secrets` must be the same store).
+    pub fn set_credential_store(&self, store: Arc<databrain_auth::SwitchableStore>, vault_dir: PathBuf) {
+        *self.credential_store.lock() = Some((store, vault_dir));
     }
 
     fn results(&self) -> &Arc<ResultStore> {
@@ -276,10 +335,25 @@ pub fn move_to_folder(state: &AppState, kind: FolderKind, item_id: &str, folder_
     Ok(state.workspace.move_to_folder(kind, item_id, folder_id.as_deref())?)
 }
 
+/// Delete a connection: closes its sessions, removes it, its AI knowledge
+/// and every secret it owns (password, SSH, client secret, key passphrase,
+/// cached OAuth tokens). Saved queries, history and notebooks are kept.
 pub fn delete_connection(state: &AppState, id: &str) -> Result<()> {
     state.engine.disconnect(id);
+    state.engine.forget_credentials(id);
     state.workspace.delete_connection(id)?;
-    state.secrets.delete(&SecretRef::for_connection(id))?;
+    // The connection is gone either way; a secret that cannot be removed
+    // now is unreachable, so report but don't fail.
+    let mut errors = Vec::new();
+    let refs = std::iter::once(SecretRef::for_connection(id)).chain(SECRET_SLOTS.iter().chain(["oauth"].iter()).map(|s| SecretRef::slot(id, s)));
+    for r in refs {
+        if let Err(e) = state.secrets.delete(&r) {
+            errors.push(e.to_string());
+        }
+    }
+    if let Some(e) = errors.first() {
+        return Err(EngineError::new("partial", format!("connection deleted, but a saved secret could not be removed: {e}")));
+    }
     Ok(())
 }
 
@@ -847,6 +921,84 @@ mod tests {
         assert!(result_info(&st, &rid).is_err());
         delete_connection(&st, &profile.id).unwrap();
         assert!(list_connections(&st).unwrap().is_empty());
+    }
+
+    /// Switching to the local vault moves saved passwords; the connection
+    /// keeps working and a restart (new store instance) reads the vault.
+    #[tokio::test]
+    async fn credential_store_switch_moves_secrets() {
+        use databrain_auth::{StoreKind, SwitchableStore, VaultStore};
+        use secrecy::ExposeSecret;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Arc::new(Workspace::open_in_memory().unwrap());
+        let keychain = Arc::new(MemoryStore::default());
+        struct Shared(Arc<MemoryStore>);
+        impl SecretStore for Shared {
+            fn get(&self, r: &SecretRef) -> std::result::Result<Option<secrecy::SecretString>, databrain_auth::AuthError> { self.0.get(r) }
+            fn set(&self, r: &SecretRef, v: &secrecy::SecretString) -> std::result::Result<(), databrain_auth::AuthError> { self.0.set(r, v) }
+            fn delete(&self, r: &SecretRef) -> std::result::Result<(), databrain_auth::AuthError> { self.0.delete(r) }
+        }
+        let store = Arc::new(SwitchableStore::with_stores(StoreKind::Keychain, Box::new(Shared(keychain.clone())), Box::new(VaultStore::new(dir.path()))));
+        let st = AppState::new(ws.clone(), store.clone(), Arc::new(CollectingSink::default()), Arc::new(TestUi::default()));
+        st.set_credential_store(store.clone(), dir.path().to_path_buf());
+        assert_eq!(credential_store(&st).kind, StoreKind::Keychain);
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Postgres, databrain_auth::AuthMethod::Password { user: "me".into() });
+        cfg.host = Some("localhost".into());
+        let saved = save_connection(
+            &st,
+            SaveConnectionArgs {
+                profile: ConnectionProfile { id: String::new(), name: "PG".into(), config: cfg, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+                secret: Some("hunter2".into()),
+                clear_secret: false,
+                extra_secrets: [("ssh".to_string(), "sshpw".to_string())].into_iter().collect(),
+            },
+        )
+        .unwrap();
+
+        let rep = set_credential_store(&st, StoreKind::Vault).await.unwrap();
+        assert_eq!((rep.moved, rep.failed.len()), (2, 0));
+        assert_eq!(credential_store(&st).kind, StoreKind::Vault);
+        assert_eq!(saved_store_kind(&ws), StoreKind::Vault);
+        assert!(keychain.get(&SecretRef::for_connection(&saved.id)).unwrap().is_none(), "removed from the keychain");
+        assert_eq!(st.secrets.get(&SecretRef::for_connection(&saved.id)).unwrap().unwrap().expose_secret(), "hunter2");
+        // "Restart": a new vault store reads the same files.
+        let again = SwitchableStore::with_stores(saved_store_kind(&ws), Box::new(MemoryStore::default()), Box::new(VaultStore::new(dir.path())));
+        assert_eq!(again.get(&SecretRef::slot(&saved.id, "ssh")).unwrap().unwrap().expose_secret(), "sshpw");
+    }
+
+    /// Deleting removes the connection, all its secrets and AI knowledge;
+    /// saved queries survive with no connection.
+    #[test]
+    fn delete_connection_cleans_up() {
+        let (st, _sink, _dir) = state();
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "me".into() });
+        cfg.host = Some("db".into());
+        let saved = save_connection(
+            &st,
+            SaveConnectionArgs {
+                profile: ConnectionProfile { id: String::new(), name: "PG".into(), config: cfg, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+                secret: Some("pw".into()),
+                clear_secret: false,
+                extra_secrets: [("ssh".to_string(), "sshpw".to_string()), ("client_secret".to_string(), "cs".to_string())].into_iter().collect(),
+            },
+        )
+        .unwrap();
+        let id = saved.id.clone();
+        st.secrets.set(&SecretRef::slot(&id, "oauth"), &"tokens".to_string().into()).unwrap();
+        st.workspace
+            .kn_save_note(databrain_workspace::KnNote { id: String::new(), connection_id: id.clone(), target: None, body: "rule".into(), author: "user".into(), status: databrain_workspace::NoteStatus::Approved, created_at: 0 })
+            .unwrap();
+        let q = save_query(&st, SavedQuery { id: String::new(), name: "q".into(), sql: "select 1".into(), connection_id: Some(id.clone()), folder_id: None, description: None, tags: vec![], ai_example: false, created_at: 0, updated_at: 0 }).unwrap();
+
+        delete_connection(&st, &id).unwrap();
+        assert!(list_connections(&st).unwrap().is_empty());
+        for r in [SecretRef::for_connection(&id), SecretRef::slot(&id, "ssh"), SecretRef::slot(&id, "client_secret"), SecretRef::slot(&id, "oauth")] {
+            assert!(st.secrets.get(&r).unwrap().is_none(), "{r:?} left behind");
+        }
+        assert!(st.workspace.kn_notes(&id).unwrap().is_empty());
+        let kept = list_saved_queries(&st, None).unwrap();
+        assert_eq!(kept.iter().find(|x| x.id == q.id).unwrap().connection_id, None);
+        assert!(delete_connection(&st, &id).is_err(), "unknown id");
     }
 
     #[test]

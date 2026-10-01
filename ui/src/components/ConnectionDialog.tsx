@@ -63,6 +63,7 @@ export const DEFAULT_POLICY: AiPolicy = {
   max_rows_to_model: 50,
   pii_columns: [],
   index_schemas: [],
+  index_batch: 25,
   mcp_enabled: false,
 };
 
@@ -327,22 +328,7 @@ function ConnectionForm({ initial }: { initial: ConnectionProfile | null }) {
 
   const remove = async () => {
     if (!initial) return;
-    useStore.getState().askConfirm({
-      title: `Delete "${initial.name}"?`,
-      reasons: ["The connection and its saved credentials will be removed. Saved queries are kept."],
-      confirmLabel: "Delete",
-      onConfirm: async () => {
-        try {
-          await api.deleteConnection(initial.id);
-          const st = useStore.getState();
-          await st.refreshConnections();
-          st.tabs.filter((t) => t.connection_id === initial.id).forEach((t) => st.updateTab(t.id, { connection_id: null }));
-          close();
-        } catch (e) {
-          toast(toError(e).message, "error");
-        }
-      },
-    });
+    if (await useStore.getState().deleteConnection(initial.id)) close();
   };
 
   const browseDb = async (create: boolean) => {

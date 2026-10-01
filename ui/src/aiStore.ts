@@ -94,7 +94,7 @@ interface AiState {
    * Index a connection. Without `scope`, large connections whose scope was
    * never chosen open the scope picker instead; `choose` always opens it.
    */
-  indexKnowledge: (connectionId: string, opts?: { scope?: string[]; choose?: boolean }) => Promise<void>;
+  indexKnowledge: (connectionId: string, opts?: { scope?: string[]; batch?: number; choose?: boolean }) => Promise<void>;
   cancelIndex: (connectionId: string) => Promise<void>;
   closeIndexPicker: () => void;
 }
@@ -448,9 +448,9 @@ export const useAi = create<AiState>((set, get) => {
       }
       set((s) => ({ indexPicker: null, knowledgeProgress: { ...s.knowledgeProgress, [connectionId]: { schema: "", done: 0, total: 0 } } }));
       try {
-        await api.knIndex(connectionId, opts.scope ?? null);
-        // The chosen scope is saved on the connection.
-        if (opts.scope) void useStore.getState().refreshConnections();
+        await api.knIndex(connectionId, opts.scope ?? null, opts.batch ?? null);
+        // The chosen scope / batch size are saved on the connection.
+        if (opts.scope || opts.batch) void useStore.getState().refreshConnections();
       } catch (e) {
         set((s) => ({ knowledgeProgress: { ...s.knowledgeProgress, [connectionId]: undefined } }));
         toast(toError(e).message, "error");

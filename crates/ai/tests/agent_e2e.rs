@@ -570,6 +570,16 @@ async fn knowledge_index_plan_scope_and_cancel() {
     assert!(st.error.as_deref().unwrap_or("").contains("cancelled"), "{:?}", st.error);
     assert_eq!(st.objects as usize, f.ws.kn_count(&conn).unwrap() as usize);
 
+    // Bigger batches: fewer metadata calls (progress fires once per batch).
+    let mut p = f.ws.get_connection(&conn).unwrap();
+    p.ai_policy.index_batch = 100;
+    f.ws.save_connection(p).unwrap();
+    let calls = AtomicUsize::new(0);
+    let r = index_connection(&engine, &conn, Some(&all), &|_, _, _| { calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }, &Default::default()).await.unwrap();
+    assert_eq!((r.objects, r.cancelled), (60, false));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "one batch + final");
+    assert_eq!(plan(&engine, &conn).await.unwrap().batch, 100);
+
     // Already cancelled before start.
     let done = tokio_util::sync::CancellationToken::new();
     done.cancel();

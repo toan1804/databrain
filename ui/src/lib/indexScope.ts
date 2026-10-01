@@ -52,18 +52,31 @@ export function buildScope(plan: IndexPlan, selected: Set<string>): string[] {
   return [...out, ...sys];
 }
 
-/** Engines that fetch metadata per catalog in bulk (see `Session::bulk_metadata`). */
 const BULK: ConnectorKind[] = ["databricks"];
 
-/** Rough number of metadata queries an index run will send. */
-export function estimateQueries(kind: ConnectorKind, plan: IndexPlan, selected: Set<string>): number {
+export const DEFAULT_BATCH = 25;
+export const MAX_BATCH = 500;
+/** Databricks puts at most this many schemas in one `IN (…)` list. */
+const IN_LIST = 200;
+
+/** Engines that fetch metadata per catalog in bulk (see `Session::bulk_metadata`). */
+export const isBulk = (kind: ConnectorKind) => BULK.includes(kind);
+
+/**
+ * Rough number of metadata queries an index run will send. Mirrors the
+ * backend: schemas are processed in batches of `batch` (in plan order);
+ * bulk engines send 2 queries (tables + columns) per catalog in a batch.
+ */
+export function estimateQueries(kind: ConnectorKind, plan: IndexPlan, selected: Set<string>, batch = DEFAULT_BATCH): number {
   const chosen = plan.schemas.filter((s) => selected.has(s.name));
-  if (!BULK.includes(kind)) return chosen.length * 2;
-  const perCat = new Map<string, number>();
-  for (const s of chosen) perCat.set(s.catalog ?? "", (perCat.get(s.catalog ?? "") ?? 0) + 1);
-  // Batches of 25 schemas, 2 queries (tables + columns) per batch and catalog.
+  if (!isBulk(kind)) return chosen.length * 2;
+  const size = Math.min(Math.max(1, Math.floor(batch) || DEFAULT_BATCH), MAX_BATCH);
   let n = 0;
-  for (const v of perCat.values()) n += Math.ceil(v / 25) * 2;
+  for (let i = 0; i < chosen.length; i += size) {
+    const perCat = new Map<string, number>();
+    for (const s of chosen.slice(i, i + size)) perCat.set(s.catalog ?? "", (perCat.get(s.catalog ?? "") ?? 0) + 1);
+    for (const v of perCat.values()) n += Math.ceil(v / IN_LIST) * 2;
+  }
   return n;
 }
 

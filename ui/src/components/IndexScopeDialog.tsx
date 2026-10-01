@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight, Library, Search } from "lucide-react";
 import { useAi } from "../aiStore";
-import { buildScope, estimateQueries, initialSelection, planCatalogs, selectedObjects } from "../lib/indexScope";
+import { DEFAULT_BATCH, MAX_BATCH, buildScope, estimateQueries, initialSelection, isBulk, planCatalogs, selectedObjects } from "../lib/indexScope";
 import { schemaLabel } from "../lib/catalog";
 import { formatCount } from "../lib/util";
 import { useStore } from "../store";
@@ -23,7 +23,14 @@ function ScopeDialog() {
   const index = useAi((s) => s.indexKnowledge);
   const conn = useStore((s) => s.connections.find((c) => c.id === connectionId));
   const [selected, setSelected] = useState<Set<string>>(() => initialSelection(plan));
+  // Expanded catalogs without a filter; collapsed ones while filtering
+  // (matches start expanded but can still be collapsed).
   const [open, setOpen] = useState<Set<string>>(() => new Set());
+  const [closedInFilter, setClosedInFilter] = useState<Set<string>>(() => new Set());
+  const [batchText, setBatchText] = useState(String(plan.batch || DEFAULT_BATCH));
+  const batchNum = Number(batchText);
+  const batchOk = Number.isInteger(batchNum) && batchNum >= 1 && batchNum <= MAX_BATCH;
+  const batch = batchOk ? batchNum : plan.batch || DEFAULT_BATCH;
   const [filter, setFilter] = useState("");
   const [showSystem, setShowSystem] = useState(false);
 
@@ -39,7 +46,7 @@ function ScopeDialog() {
   );
 
   const kind = conn?.config.kind ?? "postgres";
-  const queries = estimateQueries(kind, plan, selected);
+  const queries = estimateQueries(kind, plan, selected, batch);
   const tables = selectedObjects(plan, selected);
   const scope = buildScope(plan, selected);
 
@@ -66,7 +73,11 @@ function ScopeDialog() {
           <button className="btn-ghost" onClick={close}>
             Cancel
           </button>
-          <button className="btn-primary" disabled={selected.size === 0} onClick={() => void index(connectionId, { scope })}>
+          <button
+            className="btn-primary"
+            disabled={selected.size === 0 || !batchOk}
+            onClick={() => void index(connectionId, { scope, batch: batch !== plan.batch ? batch : undefined })}
+          >
             Index {selected.size === plan.schemas.length ? "all" : formatCount(selected.size)}
           </button>
         </>
@@ -103,6 +114,9 @@ function ScopeDialog() {
               aria-label="Filter catalogs and schemas"
               value={filter}
               autoFocus
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
               onChange={(e) => setFilter(e.target.value)}
             />
           </div>
@@ -113,30 +127,49 @@ function ScopeDialog() {
             {q ? "Clear shown" : "None"}
           </button>
         </div>
-        <label className="flex items-center gap-1.5 text-[11.5px] text-muted">
-          <input type="checkbox" checked={showSystem} onChange={(e) => setShowSystem(e.target.checked)} /> Show system schemas
-        </label>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] text-muted">
+          <label className="flex items-center gap-1.5">
+            <input type="checkbox" checked={showSystem} onChange={(e) => setShowSystem(e.target.checked)} /> Show system schemas
+          </label>
+          <label className="flex items-center gap-1.5" title={isBulk(kind) ? "Schemas of a catalog fetched together: tables + columns in 2 queries per batch (Databricks reads at most 200 schemas per query)." : "Progress and Cancel apply between batches. This database is read one schema at a time (2 queries per schema)."}>
+            Schemas per batch
+            <input
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={MAX_BATCH}
+              className={`field h-6 w-20 py-0 ${batchOk ? "" : "border-danger"}`}
+              aria-label="Schemas per batch"
+              aria-invalid={!batchOk}
+              value={batchText}
+              onChange={(e) => setBatchText(e.target.value)}
+            />
+            <span>{batchOk ? (isBulk(kind) ? "bigger = fewer queries" : "") : `1–${MAX_BATCH}`}</span>
+          </label>
+        </div>
 
         <div className="max-h-[46vh] overflow-auto rounded-lg border border-line p-1" role="tree" aria-label="Catalogs and schemas">
           {shown.length === 0 && <div className="p-3 text-center text-muted">Nothing matches.</div>}
           {shown.map((c) => {
             const names = c.schemas.map((s) => s.name);
             const n = names.filter((x) => selected.has(x)).length;
-            const isOpen = !c.name || !!q || open.has(c.name);
+            const isOpen = !c.name || (q ? !closedInFilter.has(c.name) : open.has(c.name));
             const objs = c.schemas.reduce<number | null>((t, s) => (t === null || s.objects === null ? null : t + s.objects), 0);
             const head = c.name ? (
               <div key={`c:${c.name}`} role="treeitem" aria-expanded={isOpen} className="flex h-7 items-center gap-1.5 rounded-md px-1 hover:bg-hover">
                 <button
                   className="flex h-5 w-5 items-center justify-center text-muted"
                   aria-label={isOpen ? "Collapse" : "Expand"}
-                  onClick={() =>
-                    setOpen((o) => {
+                  onClick={() => {
+                    const flip = (o: Set<string>) => {
                       const x = new Set(o);
                       if (x.has(c.name)) x.delete(c.name);
                       else x.add(c.name);
                       return x;
-                    })
-                  }
+                    };
+                    if (q) setClosedInFilter(flip);
+                    else setOpen(flip);
+                  }}
                 >
                   {isOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
                 </button>

@@ -45,7 +45,7 @@ import { OutputsPanel } from "./OutputsPanel";
 import { openOutput } from "../outputs";
 import { useStore, type SidebarPanel } from "../store";
 import { editorBridge } from "../editorBridge";
-import { ConnDot, EnvBadge, MenuItem, Popover } from "./ui";
+import { ConnDot, EnvBadge, MenuItem, MenuSeparator, Popover } from "./ui";
 
 export function Sidebar() {
   const panel = useStore((s) => s.sidebarPanel);
@@ -225,6 +225,7 @@ function Row({
   actions,
   active,
   title,
+  onDelete,
 }: {
   depth: number;
   expanded?: boolean;
@@ -238,6 +239,8 @@ function Row({
   actions?: ReactNode;
   active?: boolean;
   title?: string;
+  /** ⌘⌫ / Ctrl+Delete on the focused row. */
+  onDelete?: () => void;
 }) {
   return (
     <div
@@ -252,6 +255,9 @@ function Row({
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           onClick?.();
+        } else if (onDelete && (e.key === "Backspace" || e.key === "Delete") && (e.metaKey || e.ctrlKey)) {
+          e.preventDefault();
+          onDelete();
         }
       }}
       className={`group flex h-[26px] cursor-pointer items-center gap-1.5 rounded-md pr-1 text-[13px] hover:bg-hover ${
@@ -351,6 +357,7 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
         }
         onClick={toggle}
         onContextMenu={openMenu}
+        onDelete={() => void useStore.getState().deleteConnection(conn.id)}
         actions={
           <>
             <button
@@ -403,6 +410,8 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
           {conn.connected && (
             <MenuItem icon={<Unplug size={13} />} label="Disconnect" onClick={() => { setMenu(null); setExpanded(false); void disconnect(conn.id); }} />
           )}
+          <MenuSeparator />
+          <MenuItem icon={<Trash2 size={13} />} label="Delete connection…" hint="⌘⌫" danger onClick={() => { setMenu(null); void useStore.getState().deleteConnection(conn.id); }} />
         </Popover>
       )}
       {expanded &&
