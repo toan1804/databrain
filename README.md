@@ -34,7 +34,7 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
 Runtime notes:
 - Oracle needs Oracle Instant Client. DataBrain checks for it (connection dialog, startup when Oracle connections exist, and on connect errors) and can download and install Oracle's latest Basic package in one click (into the app-data folder `oracle/instantclient_*`, with a progress bar; Linux also needs `libaio`).
 - Google/Snowflake/Entra browser OAuth needs your own OAuth client ID.
-- DuckDB's Excel/Delta/Iceberg extensions download on first use.
+- DuckDB is compiled into the app (with Parquet and JSON). Its Excel, Delta, Iceberg, Avro, httpfs and ICU extensions are downloaded at build time and shipped inside the bundle, so nothing is downloaded at runtime.
 - Kiro needs Kiro CLI installed (`curl -fsSL https://cli.kiro.dev/install | bash`). API keys require a Kiro Pro plan or higher. DataBrain writes one agent config, `~/.kiro/agents/databrain-sql.json`, which limits Kiro to DataBrain's tools.
 
 ## Requirements
@@ -52,6 +52,8 @@ npm run app:build    # release bundle (.app/.dmg, .msi, .deb/.AppImage)
 ```
 
 `npm run dev` alone serves the UI in a browser, but queries need the desktop backend.
+
+`npm run app:build` produces a self-contained app for the build machine (macOS: `target/release/bundle/macos/DataBrain.app` and a `.dmg`; Windows: `.msi`/`.exe`; Linux: `.deb`/`.AppImage`). The bundle includes `databrain-mcp` and the DuckDB extensions; SQLite, DuckDB and (on Linux) OpenSSL are linked statically. Build on each target platform (DuckDB extensions are platform-specific). External tools stay optional: Oracle Instant Client (offered in-app), Kiro CLI, and cloud CLIs for CLI sign-in.
 
 ## Test
 

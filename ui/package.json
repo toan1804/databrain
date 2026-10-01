@@ -10,7 +10,8 @@
     "test": "vitest run",
     "tauri": "TAURI_APP_PATH=../crates/app TAURI_FRONTEND_PATH=. tauri",
     "app:dev": "npm run tauri dev",
-    "app:build": "npm run tauri build"
+    "app:build": "npm run tauri build",
+    "fetch:duckdb-ext": "node ../scripts/fetch-duckdb-extensions.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "6.20.3",

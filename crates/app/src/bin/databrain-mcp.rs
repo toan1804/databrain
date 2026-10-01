@@ -42,6 +42,9 @@ async fn main() {
     // Pinned outputs saved by the app are readable (read-only use) here too.
     if let Some(dir) = path.parent() {
         engine.outputs().set_snapshot_dir(dir.join("outputs"));
+        // Extensions copied there by the app.
+        #[cfg(feature = "duckdb")]
+        databrain_connector_duckdb::set_extension_dir(Some(dir.join("duckdb_extensions").to_string_lossy().into_owned()));
     }
     let server = McpServer { engine, hub };
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());

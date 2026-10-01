@@ -577,6 +577,9 @@ pub fn run() {
             state.set_credential_store(store, dir.clone());
             state.set_snapshot_dir(dir.join("outputs"));
             api::apply_oracle_client_setting(&state);
+            // DuckDB extensions are shipped in the bundle (no runtime download).
+            let bundled = app.path().resource_dir().map(|d| d.join("duckdb-extensions")).unwrap_or_default();
+            api::seed_duckdb_extensions(&bundled, &dir.join("duckdb_extensions"));
             app.manage(state);
             #[cfg(target_os = "macos")]
             app.set_menu(macos_menu(app.handle())?)?;

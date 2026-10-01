@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../../ui/dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeDevCommand": "npm run fetch:duckdb-ext && npm run dev",
+    "beforeBuildCommand": "npm run fetch:duckdb-ext && npm run build"
   },
   "app": {
     "windows": [
@@ -36,6 +36,12 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "resources/duckdb-extensions/": "duckdb-extensions/"
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
   }
 }

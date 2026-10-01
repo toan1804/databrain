@@ -6,3 +6,6 @@ crates/app/gen
 *.db-shm
 .DS_Store
 examples/data/_staging
+
+# Fetched at build time
+crates/app/resources/duckdb-extensions/v*/

@@ -91,6 +91,37 @@ pub fn scan_expr(path: &str, format: FileFormat) -> String {
     }
 }
 
+/// Folder with DuckDB extensions shipped in the app (`<dir>/v1.x.y/<platform>/*.duckdb_extension`).
+static EXTENSION_DIR: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Use `dir` as DuckDB's extension directory for new sessions (the app
+/// seeds it with the bundled extensions, so nothing is downloaded).
+pub fn set_extension_dir(dir: Option<String>) {
+    if let Ok(mut g) = EXTENSION_DIR.write() {
+        *g = dir;
+    }
+}
+
+pub fn extension_dir() -> Option<String> {
+    EXTENSION_DIR.read().ok().and_then(|g| g.clone())
+}
+
+/// DuckDB version and platform of this build, e.g. ("v1.5.6", "osx_arm64").
+pub fn version_and_platform() -> Result<(String, String)> {
+    let c = duckdb::Connection::open_in_memory().map_err(map_err)?;
+    let v: String = c.query_row("select version()", [], |r| r.get(0)).map_err(map_err)?;
+    let p: String = c.query_row("select platform from pragma_platform()", [], |r| r.get(0)).map_err(map_err)?;
+    Ok((v, p))
+}
+
+/// Load an extension: from the extension directory first (bundled, works
+/// offline), downloading it only when it is not there.
+fn load_extension(conn: &duckdb::Connection, ext: &str) {
+    if conn.execute_batch(&format!("LOAD {ext};")).is_err() {
+        let _ = conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"));
+    }
+}
+
 fn required_extension(f: FileFormat) -> Option<&'static str> {
     match f {
         FileFormat::Excel => Some("excel"),
@@ -147,7 +178,7 @@ impl Connector for DuckdbConnector {
                 FieldSpec::new("files", "Attached files").placeholder("One path per line: .csv .parquet .json .xlsx, Delta/Iceberg folders")
                     .help("Each file becomes a view in the `files` schema"),
             ],
-            note: Some("Query any file directly, e.g. SELECT * FROM 'data/*.parquet'. Delta, Iceberg and Excel download a DuckDB extension on first use."),
+            note: Some("Query any file directly, e.g. SELECT * FROM 'data/*.parquet'. Excel, Delta and Iceberg support is included."),
         }
     }
 
@@ -165,7 +196,11 @@ impl Connector for DuckdbConnector {
                 duckdb::Connection::open_with_flags(&path, c)
             }
             .map_err(|e| ConnectorError::connection(e.to_string()))?;
-            // Let DuckDB fetch known extensions (delta, iceberg, excel, httpfs) on demand.
+            // Bundled extensions (excel, delta, iceberg, httpfs, icu…) live in
+            // the app's extension directory; unknown ones still download on demand.
+            if let Some(dir) = extension_dir() {
+                let _ = conn.execute_batch(&format!("SET extension_directory = {}", quote_literal(&dir)));
+            }
             let _ = conn.execute_batch("SET autoinstall_known_extensions = true; SET autoload_known_extensions = true;");
             attach_files(&conn, &files)?;
             Ok(conn)
@@ -192,7 +227,7 @@ fn attach_files(conn: &duckdb::Connection, files: &[String]) -> Result<()> {
     for f in files {
         let Some(fmt) = detect_format(f) else { continue };
         if let Some(ext) = required_extension(fmt) {
-            let _ = conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"));
+            load_extension(conn, ext);
         }
         let name = view_name(f, &taken);
         taken.push(name.clone());
@@ -409,11 +444,11 @@ fn run(conn: &duckdb::Connection, sql: &str, opts: &ExecOptions, tx: &StreamSend
     for n in load_outputs(conn, sql, outputs, loaded)? {
         tx.blocking_send(Ok(StreamEvent::Notice(n)));
     }
-    // Auto-load the extension a query needs (INSTALL is a no-op once cached).
+    // Load the extension a query needs (bundled copy first).
     let lower = sql.to_ascii_lowercase();
     for (f, ext) in [("delta_scan", "delta"), ("iceberg_", "iceberg"), ("read_xlsx", "excel")] {
         if lower.contains(f) {
-            let _ = conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"));
+            load_extension(conn, ext);
         }
     }
     let mut stmt = conn.prepare(sql).map_err(map_err)?;
@@ -877,5 +912,30 @@ mod tests {
         let e = DuckdbConnector::new().connect(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::None, None))).await.err().unwrap();
         assert_eq!(e.kind, ErrorKind::Config);
         assert!(e.message.contains("missing.csv"));
+    }
+}
+
+#[cfg(test)]
+mod bundled_extensions {
+    use super::*;
+
+    /// With the app's extension folder set, Excel loads without any download.
+    /// Runs when `crates/app/resources/duckdb-extensions` was fetched
+    /// (`node scripts/fetch-duckdb-extensions.mjs`).
+    #[test]
+    fn loads_bundled_excel_offline() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/resources/duckdb-extensions");
+        let (v, p) = version_and_platform().unwrap();
+        if !dir.join(&v).join(&p).join("excel.duckdb_extension").is_file() {
+            eprintln!("skipped: bundled extensions not fetched");
+            return;
+        }
+        let c = duckdb::Connection::open_in_memory().unwrap();
+        c.execute_batch(&format!("SET extension_directory = {}; SET autoinstall_known_extensions = false;", quote_literal(&dir.to_string_lossy()))).unwrap();
+        load_extension(&c, "excel");
+        let path: String = c
+            .query_row("select install_path from duckdb_extensions() where extension_name = 'excel' and loaded", [], |r| r.get(0))
+            .unwrap();
+        assert!(path.starts_with(&*dir.to_string_lossy()), "{path}");
     }
 }

@@ -629,6 +629,35 @@ pub fn rename_output(state: &AppState, handle: &str, name: Option<String>) -> Re
     Ok(o)
 }
 
+/// Copy the DuckDB extensions shipped in the bundle (`bundled`) into the
+/// writable app-data folder `dest` (missing or changed files only) and use it
+/// as DuckDB's extension directory. Returns the number of files copied.
+pub fn seed_duckdb_extensions(bundled: &Path, dest: &Path) -> usize {
+    fn walk(src: &Path, dst: &Path, n: &mut usize) {
+        let Ok(rd) = std::fs::read_dir(src) else { return };
+        for e in rd.flatten() {
+            let (s, d) = (e.path(), dst.join(e.file_name()));
+            if s.is_dir() {
+                walk(&s, &d, n);
+            } else if s.extension().is_some_and(|x| x == "duckdb_extension") {
+                let same = matches!((std::fs::metadata(&s), std::fs::metadata(&d)), (Ok(a), Ok(b)) if a.len() == b.len());
+                if same {
+                    continue;
+                }
+                let tmp = d.with_extension("duckdb_extension.tmp");
+                if std::fs::create_dir_all(dst).is_ok() && std::fs::copy(&s, &tmp).is_ok() && std::fs::rename(&tmp, &d).is_ok() {
+                    *n += 1;
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    walk(bundled, dest, &mut n);
+    #[cfg(feature = "duckdb")]
+    databrain_connector_duckdb::set_extension_dir(Some(dest.to_string_lossy().into_owned()));
+    n
+}
+
 /// Setting with the Instant Client folder found or installed by DataBrain.
 pub const ORACLE_CLIENT_SETTING: &str = "oracle_client_dir";
 
@@ -1045,6 +1074,22 @@ mod tests {
         // "Restart": a new vault store reads the same files.
         let again = SwitchableStore::with_stores(saved_store_kind(&ws), Box::new(MemoryStore::default()), Box::new(VaultStore::new(dir.path())));
         assert_eq!(again.get(&SecretRef::slot(&saved.id, "ssh")).unwrap().unwrap().expose_secret(), "sshpw");
+    }
+
+    #[test]
+    fn seeds_bundled_duckdb_extensions() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let plat = src.path().join("v1.5.6/osx_arm64");
+        std::fs::create_dir_all(&plat).unwrap();
+        std::fs::write(plat.join("excel.duckdb_extension"), b"bin").unwrap();
+        std::fs::write(src.path().join("README.md"), b"x").unwrap();
+        assert_eq!(seed_duckdb_extensions(src.path(), dst.path()), 1);
+        assert!(dst.path().join("v1.5.6/osx_arm64/excel.duckdb_extension").is_file());
+        assert!(!dst.path().join("README.md").exists());
+        assert_eq!(seed_duckdb_extensions(src.path(), dst.path()), 0, "unchanged files are not copied again");
+        #[cfg(feature = "duckdb")]
+        assert_eq!(databrain_connector_duckdb::extension_dir().as_deref(), Some(&*dst.path().to_string_lossy()));
     }
 
     /// Deleting removes the connection, all its secrets and AI knowledge;
