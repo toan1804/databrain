@@ -43,7 +43,7 @@ import { CatalogMenu, ColumnMenu, ObjectMenu, SchemaMenu, copyText, insertColumn
 import { formatCount, formatDuration, relativeTime, sqlPreview, quoteIdent } from "../lib/util";
 import { useAi } from "../aiStore";
 import { DEFAULT_POLICY } from "./ConnectionDialog";
-import { FolderTree, createFolder, dragProps } from "./FolderTree";
+import { FolderTree, MoveToFolderItems, createFolder, dragProps } from "./FolderTree";
 import { OutputsPanel } from "./OutputsPanel";
 import { openOutput } from "../outputs";
 import { useStore, type SidebarPanel } from "../store";
@@ -184,6 +184,7 @@ function ConnectionsPanel() {
         itemFolder={(c) => c.folder_id}
         filtering={filtering}
         renderItem={(c) => <ConnectionNode conn={c} />}
+        newItem={{ label: "New connection here", create: (folderId) => openDialog(null, folderId) }}
       />
     </div>
   );
@@ -392,7 +393,7 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
         }
       />
       {menu && (
-        <Popover x={menu.x} y={menu.y} onClose={() => setMenu(null)} className="w-52">
+        <Popover x={menu.x} y={menu.y} onClose={() => setMenu(null)} className="max-h-[75vh] w-60 overflow-auto">
           <MenuItem icon={<FileCode2 size={13} />} label="New query" onClick={() => { setMenu(null); newTab({ connection_id: conn.id }); }} />
           <MenuItem icon={<Search size={13} />} label="Find table…" onClick={() => { setMenu(null); useStore.getState().openCatalogSearch(conn.id); }} />
           <MenuItem icon={<RefreshCw size={13} />} label={conn.connected ? "Refresh" : "Connect"} onClick={() => { setMenu(null); setExpanded(true); void load(true); }} />
@@ -413,6 +414,8 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
           {conn.connected && (
             <MenuItem icon={<Unplug size={13} />} label="Disconnect" onClick={() => { setMenu(null); setExpanded(false); void disconnect(conn.id); }} />
           )}
+          <MenuSeparator />
+          <MoveToFolderItems kind="connections" id={conn.id} current={conn.folder_id} onDone={() => setMenu(null)} />
           <MenuSeparator />
           <MenuItem icon={<Trash2 size={13} />} label="Delete connection…" hint="⌘⌫" danger onClick={() => { setMenu(null); void useStore.getState().deleteConnection(conn.id); }} />
         </Popover>

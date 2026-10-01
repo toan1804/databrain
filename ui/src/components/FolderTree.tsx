@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { ChevronDown, ChevronRight, Folder as FolderIcon, FolderOpen, FolderPlus, Pencil, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Folder as FolderIcon, FolderOpen, FolderPlus, Pencil, Plus, Trash2 } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { Folder, FolderKind } from "../lib/types";
 import { useStore } from "../store";
@@ -58,6 +58,7 @@ export function FolderTree<T>({
   itemFolder,
   renderItem,
   filtering,
+  newItem,
 }: {
   kind: FolderKind;
   items: T[];
@@ -66,6 +67,8 @@ export function FolderTree<T>({
   renderItem: (t: T) => ReactNode;
   /** While searching, show matches flat (folders with no match hidden). */
   filtering?: boolean;
+  /** "New … here" action in folder menus and empty folders. */
+  newItem?: { label: string; create: (folderId: string) => void };
 }) {
   const folders = useStore((s) => s.folders[kind]);
   const refreshFolders = useStore((s) => s.refreshFolders);
@@ -194,6 +197,19 @@ export function FolderTree<T>({
                 {renderItem(i)}
               </div>
             ))}
+            {n === 0 && !filtering && (
+              <div className="py-1 text-[11.5px] text-muted" style={{ paddingLeft: 26 + (depth + 1) * 14 }} {...dropProps(f.id)}>
+                Empty. Drag items here{newItem ? (
+                  <>
+                    {" "}or{" "}
+                    <button className="text-accent hover:underline" onClick={() => newItem.create(f.id)}>
+                      {newItem.label.toLowerCase()}
+                    </button>
+                  </>
+                ) : null}
+                .
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -208,6 +224,7 @@ export function FolderTree<T>({
       ))}
       {menu && (
         <Popover x={menu.x} y={menu.y} onClose={() => setMenu(null)} className="w-48">
+          {newItem && <MenuItem icon={<Plus size={13} />} label={newItem.label} onClick={() => (setMenu(null), toggle(menu.folder.id, true), newItem.create(menu.folder.id))} />}
           <MenuItem icon={<Pencil size={13} />} label="Rename" onClick={() => (setMenu(null), setRenaming(menu.folder.id))} />
           <MenuItem
             icon={<FolderPlus size={13} />}
@@ -221,5 +238,45 @@ export function FolderTree<T>({
         </Popover>
       )}
     </div>
+  );
+}
+
+/** "Move to folder" submenu entries (works without drag and drop). */
+export function MoveToFolderItems({ kind, id, current, onDone }: { kind: FolderKind; id: string; current: string | null | undefined; onDone: () => void }) {
+  const folders = useStore((s) => s.folders[kind]);
+  const move = async (folderId: string | null) => {
+    onDone();
+    const st = useStore.getState();
+    try {
+      await api.moveToFolder(kind, id, folderId);
+      if (kind === "connections") await st.refreshConnections();
+      else if (kind === "queries") await st.refreshSavedQueries();
+      else await st.refreshNotebooks();
+    } catch (e) {
+      st.toast(toError(e).message, "error");
+    }
+  };
+  const byId = new Map(folders.map((f) => [f.id, f]));
+  const path = (f: Folder): string => (f.parent_id && byId.get(f.parent_id) ? `${path(byId.get(f.parent_id)!)} / ${f.name}` : f.name);
+  const sorted = [...folders].sort((a, b) => path(a).localeCompare(path(b)));
+  return (
+    <>
+      <div className="px-2 pb-0.5 pt-1 text-[10.5px] font-semibold uppercase tracking-wide text-muted">Move to folder</div>
+      {current && <MenuItem icon={<FolderOpen size={13} />} label="Top level (no folder)" onClick={() => void move(null)} />}
+      {sorted
+        .filter((f) => f.id !== current)
+        .map((f) => (
+          <MenuItem key={f.id} icon={<FolderIcon size={13} />} label={path(f)} onClick={() => void move(f.id)} />
+        ))}
+      <MenuItem
+        icon={<FolderPlus size={13} />}
+        label="New folder…"
+        onClick={async () => {
+          const f = await createFolder(kind);
+          if (f) await move(f.id);
+          else onDone();
+        }}
+      />
+    </>
   );
 }

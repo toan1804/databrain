@@ -119,7 +119,7 @@ interface State {
   catalogSearch: { query: string; scope: string | null; focusSeq: number };
   toasts: Toast[];
   confirm: ConfirmState | null;
-  connectionDialog: { open: boolean; profile?: ConnectionView | null };
+  connectionDialog: { open: boolean; profile?: ConnectionView | null; folderId?: string | null };
   saveQueryDialog: { open: boolean; tabId?: string };
   paletteOpen: boolean;
 
@@ -137,7 +137,7 @@ interface State {
   setCatalogSearch: (patch: Partial<{ query: string; scope: string | null }>) => void;
 
   refreshConnections: () => Promise<void>;
-  openConnectionDialog: (profile?: ConnectionView | null) => void;
+  openConnectionDialog: (profile?: ConnectionView | null, folderId?: string | null) => void;
   closeConnectionDialog: () => void;
   loadSchemas: (connId: string, force?: boolean) => Promise<SchemaInfo[]>;
   loadObjects: (connId: string, schema: string, force?: boolean) => Promise<DbObject[]>;
@@ -450,7 +450,7 @@ export const useStore = create<State>((set, get) => ({
     const connections = await api.listConnections();
     set({ connections });
   },
-  openConnectionDialog: (profile) => set({ connectionDialog: { open: true, profile } }),
+  openConnectionDialog: (profile, folderId) => set({ connectionDialog: { open: true, profile, folderId: folderId ?? null } }),
   closeConnectionDialog: () => set({ connectionDialog: { open: false } }),
 
   loadSchemas: async (connId, force = false) => {

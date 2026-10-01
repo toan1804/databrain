@@ -88,14 +88,14 @@ function Check({ checked, onChange, label, help }: { checked: boolean; onChange:
 }
 
 export function ConnectionDialog() {
-  const { open, profile } = useStore((s) => s.connectionDialog);
+  const { open, profile, folderId } = useStore((s) => s.connectionDialog);
   if (!open) return null;
-  return <ConnectionForm key={profile?.id ?? "new"} initial={profile ?? null} />;
+  return <ConnectionForm key={profile?.id ?? "new"} initial={profile ?? null} folderId={folderId ?? null} />;
 }
 
 type Section = "general" | "auth" | "ssh" | "ai";
 
-function ConnectionForm({ initial }: { initial: ConnectionProfile | null }) {
+function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | null; folderId: string | null }) {
   const connectors = useStore((s) => s.connectors);
   const close = useStore((s) => s.closeConnectionDialog);
   const toast = useStore((s) => s.toast);
@@ -227,7 +227,7 @@ function ConnectionForm({ initial }: { initial: ConnectionProfile | null }) {
       },
       color,
       env,
-      folder_id: initial?.folder_id ?? null,
+      folder_id: initial ? (initial.folder_id ?? null) : folderId,
       has_secret: initial?.has_secret ?? false,
       ai_policy: policy,
       created_at: initial?.created_at ?? 0,
