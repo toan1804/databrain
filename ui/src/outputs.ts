@@ -37,6 +37,11 @@ export async function openResultsQuery(sql: string, title: string, run = true) {
   }
 }
 
+/** SQL that queries an output. */
+export function outputQuerySql(o: OutputInfo): string {
+  return `SELECT *\nFROM ${outputRef(o)}\nLIMIT 1000;`;
+}
+
 export function queryOutput(o: OutputInfo) {
   void openResultsQuery(`SELECT *\nFROM ${outputRef(o)}\nLIMIT 1000;`, `Query ${outputLabel(o)}`, false);
 }
