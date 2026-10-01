@@ -475,10 +475,11 @@ pub async fn find_in_result(
     result_id: String,
     view: ViewSpec,
     query: String,
+    columns: Option<Vec<usize>>,
     limit: usize,
 ) -> Result<FindResult> {
     let rs = state.results().get(&result_id)?;
-    blocking(move || Ok(rs.lock().find(&view, &query, limit.clamp(1, 100_000))?)).await
+    blocking(move || Ok(rs.lock().find_in(&view, &query, columns.as_deref(), limit.clamp(1, 100_000))?)).await
 }
 
 pub async fn column_stats(
@@ -869,7 +870,7 @@ mod tests {
         assert_eq!(page.view_rows, 2);
         assert_eq!(page.rows[0][1].as_deref(), Some("Chi"));
 
-        let f = find_in_result(&st, rid.clone(), ViewSpec::default(), "han".into(), 100)
+        let f = find_in_result(&st, rid.clone(), ViewSpec::default(), "han".into(), None, 100)
             .await
             .unwrap();
         assert_eq!(f.matches.len(), 2);

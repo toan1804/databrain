@@ -168,9 +168,118 @@ select {
   background: color-mix(in srgb, var(--accent) 18%, transparent);
   transition: background 0.6s;
 }
-.cm-tooltip-autocomplete {
+/* CodeMirror's built-in tooltips/panels are light-only (pale background)
+   while the text inherits the app color, which is white in dark mode.
+   Theme them with the app palette in both modes. `!important` beats the
+   base theme's generated, more specific selectors. */
+.cm-editor .cm-tooltip {
+  background: var(--panel-2) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--border) !important;
   border-radius: 8px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.25);
+}
+.cm-editor .cm-tooltip-autocomplete {
   overflow: hidden;
+}
+.cm-editor .cm-tooltip-autocomplete > ul {
+  font-family: var(--font-mono) !important;
+  font-size: 12.5px;
+  max-height: 18em !important;
+}
+.cm-editor .cm-tooltip-autocomplete > ul > li {
+  color: var(--text);
+  padding: 2px 8px !important;
+  line-height: 1.55;
+}
+.cm-editor .cm-tooltip-autocomplete > ul > li[aria-selected] {
+  background: var(--accent) !important;
+  color: var(--accent-fg) !important;
+}
+.cm-editor .cm-completionMatchedText {
+  text-decoration: none !important;
+  font-weight: 700;
+  color: var(--accent);
+}
+.cm-editor li[aria-selected] .cm-completionMatchedText {
+  color: inherit;
+}
+.cm-editor .cm-completionDetail {
+  color: var(--muted);
+  font-style: normal !important;
+  margin-left: 0.8em;
+}
+.cm-editor li[aria-selected] .cm-completionDetail {
+  color: inherit;
+  opacity: 0.8;
+}
+.cm-editor .cm-completionIcon {
+  color: var(--muted);
+  opacity: 1 !important;
+}
+.cm-editor li[aria-selected] .cm-completionIcon {
+  color: inherit;
+}
+.cm-editor .cm-completionInfo,
+.cm-editor .cm-tooltip.cm-completionInfo {
+  background: var(--panel-2) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--border) !important;
+  padding: 6px 9px !important;
+  font-size: 12px;
+  max-width: 360px;
+}
+.cm-editor .cm-tooltip-hover,
+.cm-editor .cm-tooltip-lint {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.cm-editor .cm-diagnostic-error {
+  border-left-color: var(--danger) !important;
+}
+.cm-editor .cm-tooltip-arrow::before,
+.cm-editor .cm-tooltip-arrow::after {
+  border-top-color: var(--panel-2) !important;
+  border-bottom-color: var(--panel-2) !important;
+}
+
+/* Search / replace panel (⌘F). */
+.cm-editor .cm-panels {
+  background: var(--panel-2) !important;
+  color: var(--text) !important;
+  border-color: var(--border) !important;
+}
+.cm-editor .cm-panel.cm-search {
+  font-size: 12.5px;
+}
+.cm-editor .cm-textfield {
+  background: var(--panel) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 6px;
+  padding: 2px 6px !important;
+}
+.cm-editor .cm-button {
+  background: var(--panel) !important;
+  background-image: none !important;
+  color: var(--text) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 6px;
+}
+.cm-editor .cm-button:hover {
+  background: var(--hover) !important;
+}
+.cm-editor .cm-panel button[name="close"] {
+  color: var(--muted) !important;
+}
+.cm-editor .cm-searchMatch {
+  background: color-mix(in srgb, var(--warning) 30%, transparent) !important;
+}
+.cm-editor .cm-searchMatch-selected {
+  background: color-mix(in srgb, var(--accent) 40%, transparent) !important;
+}
+.cm-editor .cm-selectionMatch {
+  background: color-mix(in srgb, var(--accent) 16%, transparent) !important;
 }
 
 /* Text cursor: CodeMirror's default caret is black, invisible on dark backgrounds. */

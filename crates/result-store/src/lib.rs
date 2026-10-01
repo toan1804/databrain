@@ -263,6 +263,12 @@ impl ResultSet {
 
     /// Find cells containing `query` (case-insensitive) within the view.
     pub fn find(&mut self, spec: &ViewSpec, query: &str, limit: usize) -> Result<FindResult> {
+        self.find_in(spec, query, None, limit)
+    }
+
+    /// Find `query` (case-insensitive substring of the displayed value),
+    /// optionally only in the given columns.
+    pub fn find_in(&mut self, spec: &ViewSpec, query: &str, columns: Option<&[usize]>, limit: usize) -> Result<FindResult> {
         let mut matches = Vec::new();
         if query.is_empty() || self.total_rows == 0 {
             return Ok(FindResult {
@@ -276,12 +282,25 @@ impl ResultSet {
         let pattern = databrain_connector_core::arrow::array::Scalar::new(
             databrain_connector_core::arrow::array::StringArray::from(vec![format!("%{pat}%")]),
         );
+        let cols: Vec<usize> = match columns {
+            Some(c) if !c.is_empty() => {
+                let mut c: Vec<usize> = c.iter().copied().filter(|&i| i < batch.num_columns()).collect();
+                c.sort_unstable();
+                c.dedup();
+                c
+            }
+            _ => (0..batch.num_columns()).collect(),
+        };
         let mut masks = Vec::with_capacity(batch.num_columns());
         for c in 0..batch.num_columns() {
-            let text = self.display_cache.get(&batch, c)?;
-            masks.push(compute::kernels::comparison::ilike(text.as_ref(), &pattern)?);
+            if cols.binary_search(&c).is_ok() {
+                let text = self.display_cache.get(&batch, c)?;
+                masks.push(Some(compute::kernels::comparison::ilike(text.as_ref(), &pattern)?));
+            } else {
+                masks.push(None);
+            }
         }
-        let hit = |row: usize, col: usize| masks[col].is_valid(row) && masks[col].value(row);
+        let hit = |row: usize, col: usize| masks[col].as_ref().is_some_and(|m| m.is_valid(row) && m.value(row));
         let n_view = idx.as_ref().map(|i| i.len()).unwrap_or(batch.num_rows());
         for vr in 0..n_view {
             let row = idx.as_ref().map(|i| i.value(vr) as usize).unwrap_or(vr);
@@ -588,6 +607,13 @@ mod tests {
         assert!(f.truncated);
         // LIKE metacharacters are literal
         assert!(rs.find(&ViewSpec::default(), "%", 10).unwrap().matches.is_empty());
+        // Only in chosen columns: "1" appears in ids and scores, column 0 only here.
+        let all = rs.find(&ViewSpec::default(), "1", 100).unwrap();
+        let ids_only = rs.find_in(&ViewSpec::default(), "1", Some(&[0]), 100).unwrap();
+        assert!(ids_only.matches.iter().all(|m| m.col == 0));
+        assert!(!ids_only.matches.is_empty() && ids_only.matches.len() <= all.matches.len());
+        assert!(rs.find_in(&ViewSpec::default(), "ali", Some(&[0]), 100).unwrap().matches.is_empty());
+        assert_eq!(rs.find_in(&ViewSpec::default(), "ali", Some(&[1, 99]), 100).unwrap().matches.len(), 2);
     }
 
     #[test]

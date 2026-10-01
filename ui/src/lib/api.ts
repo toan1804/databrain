@@ -120,8 +120,8 @@ export const api = {
   resultInfo: (resultId: string) => call<ResultInfo>("result_info", { resultId }),
   fetchPage: (resultId: string, view: ViewSpec, offset: number, limit: number) =>
     call<Page>("fetch_page", { resultId, view, offset, limit }),
-  findInResult: (resultId: string, view: ViewSpec, query: string, limit: number) =>
-    call<FindResult>("find_in_result", { resultId, view, query, limit }),
+  findInResult: (resultId: string, view: ViewSpec, query: string, limit: number, columns?: number[] | null) =>
+    call<FindResult>("find_in_result", { resultId, view, query, limit, columns: columns ?? null }),
   columnStats: (resultId: string, view: ViewSpec, column: number) =>
     call<ColumnStats>("column_stats", { resultId, view, column }),
   exportResult: (resultId: string, view: ViewSpec, options: ExportOptions, path: string) =>

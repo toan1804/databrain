@@ -142,10 +142,14 @@ export function dropUnpinnedOutputs() {
 /** Put `@name` in the assistant input. */
 export function mentionInAi(o: OutputInfo) {
   useAi.getState().setOpen(true, "chat");
-  setTimeout(
-    () => window.dispatchEvent(new CustomEvent("db:ai-prefill", { detail: { text: `${mentionToken(o)} `, mode: "chat", append: true } })),
-    30,
-  );
+  // The panel may still be mounting: retry until its listener takes it.
+  const detail: { text: string; mode: "chat"; append: boolean; handled?: boolean } = { text: `${mentionToken(o)} `, mode: "chat", append: true };
+  let tries = 0;
+  const attempt = () => {
+    window.dispatchEvent(new CustomEvent("db:ai-prefill", { detail }));
+    if (!detail.handled && ++tries < 20) setTimeout(attempt, 50);
+  };
+  setTimeout(attempt, 0);
 }
 
 export function formatAge(ms: number): string {

@@ -122,7 +122,9 @@ function Chat() {
 
   useEffect(() => {
     const onPrefill = (e: Event) => {
-      const d = (e as CustomEvent<{ text: string; mode: AiMode; append?: boolean }>).detail;
+      const d = (e as CustomEvent<{ text: string; mode: AiMode; append?: boolean; handled?: boolean }>).detail;
+      if (d.handled) return;
+      d.handled = true;
       setText((t) => (d.append && t.trim() ? `${t.replace(/\s*$/, " ")}${d.text}` : d.text));
       setMode(d.mode);
       setTimeout(() => input.current?.focus(), 0);

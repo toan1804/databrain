@@ -364,9 +364,10 @@ async fn find_in_result(
     result_id: String,
     view: ViewSpec,
     query: String,
+    columns: Option<Vec<usize>>,
     limit: usize,
 ) -> R<FindResult> {
-    api::find_in_result(&state, result_id, view, query, limit).await
+    api::find_in_result(&state, result_id, view, query, columns, limit).await
 }
 
 #[tauri::command]

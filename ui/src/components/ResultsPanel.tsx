@@ -24,7 +24,8 @@ import {
 import { useAi } from "../aiStore";
 import { ChartView } from "./ChartView";
 import { OutputChip } from "./OutputChip";
-import { outputLabel } from "../outputs";
+import { mentionInAi, outputLabel } from "../outputs";
+import { planFind } from "../lib/find";
 import { api, toError } from "../lib/api";
 import type { ColumnStats, ExportFormat, FilterOp, ResultInfo, ViewSpec } from "../lib/types";
 import {
@@ -298,6 +299,10 @@ export function ResultView({
   const [findQuery, setFindQuery] = useState("");
   const [find, setFind] = useState<{ matches: { row: number; col: number }[]; truncated: boolean }>({ matches: [], truncated: false });
   const [findIdx, setFindIdx] = useState(0);
+  /** Column the find bar is limited to (null = all columns). */
+  const [findScope, setFindScope] = useState<number | null>(null);
+  const columnNames = useMemo(() => info.columns.map((c) => c.name), [info.columns]);
+  const plan = useMemo(() => planFind(findQuery, columnNames, findScope), [findQuery, columnNames, findScope]);
   const [headerMenu, setHeaderMenu] = useState<{ col: number; x: number; y: number } | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
   const grid = useRef<GridHandle>(null);
@@ -312,13 +317,13 @@ export function ResultView({
 
   // Find within the current view.
   useEffect(() => {
-    if (!findOpen || !findQuery) {
+    if (!findOpen || !plan.term) {
       setFind({ matches: [], truncated: false });
       return;
     }
     const t = setTimeout(async () => {
       try {
-        const r = await api.findInResult(info.id, view, findQuery, 10_000);
+        const r = await api.findInResult(info.id, view, plan.term, 10_000, plan.columns);
         setFind(r);
         setFindIdx(0);
         if (r.matches[0]) grid.current?.scrollToCell(r.matches[0].col, r.matches[0].row);
@@ -327,7 +332,10 @@ export function ResultView({
       }
     }, 200);
     return () => clearTimeout(t);
-  }, [findOpen, findQuery, view, info.id, toast]);
+  }, [findOpen, plan.term, plan.columns?.join(","), view, info.id, toast]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Scroll to a column (keeps the current match row when there is one). */
+  const jumpToColumn = (col: number) => grid.current?.scrollToCell(col, find.matches[findIdx]?.row ?? 0);
 
   const step = (d: number) => {
     const n = find.matches.length;
@@ -414,18 +422,22 @@ export function ResultView({
         </button>
         <button
           className="btn-ghost border border-line py-1"
-          title="Ask the AI to analyze this result"
-          onClick={() =>
+          title={stmt.output ? `Open the AI assistant with @${outputLabel(stmt.output)} mentioned, then ask your own question` : "Ask the AI to analyze this result"}
+          onClick={() => {
+            if (stmt.output) {
+              mentionInAi(stmt.output);
+              return;
+            }
             void send({
               message: "Analyze this result and summarize the key findings.",
               mode: "analyze_result",
               targetKey: tabId,
               connectionId: connId ?? undefined,
-              context: { result_id: info.id, mentions: stmt.output ? [stmt.output.name ?? stmt.output.handle] : [] },
-            })
-          }
+              context: { result_id: info.id, mentions: [] },
+            });
+          }}
         >
-          <Sparkles size={13} /> Analyze
+          <Sparkles size={13} /> Ask AI
         </button>
         <button className="btn-ghost border border-line py-1" onClick={() => setExportOpen(true)}>
           <Download size={13} /> Export
@@ -438,8 +450,9 @@ export function ResultView({
           <input
             ref={findInput}
             className="field w-64 py-0.5"
-            placeholder="Find in results"
+            placeholder={findScope === null ? "Find values or columns (column: value)" : `Find in ${columnNames[findScope]}`}
             aria-label="Find in results"
+            title="Type text to find in cells. “country: viet” searches only the country column; matching column names are listed to jump to."
             value={findQuery}
             onChange={(e) => setFindQuery(e.target.value)}
             onKeyDown={(e) => {
@@ -447,8 +460,27 @@ export function ResultView({
               if (e.key === "Escape") setFindOpen(false);
             }}
           />
+          <select
+            className="field h-6 w-40 py-0 text-[11.5px]"
+            aria-label="Search in column"
+            title="Search in one column"
+            value={findScope ?? ""}
+            onChange={(e) => {
+              const v = e.target.value === "" ? null : Number(e.target.value);
+              setFindScope(v);
+              if (v !== null) jumpToColumn(v);
+              findInput.current?.focus();
+            }}
+          >
+            <option value="">All columns</option>
+            {columnNames.map((c, i) => (
+              <option key={i} value={i}>
+                {c}
+              </option>
+            ))}
+          </select>
           <span className="min-w-[80px] text-[11.5px] text-muted" aria-live="polite">
-            {findQuery
+            {plan.term
               ? find.matches.length
                 ? `${findIdx + 1} / ${formatCount(find.matches.length)}${find.truncated ? "+" : ""}`
                 : "No matches"
@@ -460,6 +492,27 @@ export function ResultView({
           <button className="icon-btn h-6 w-6" aria-label="Next match" onClick={() => step(1)}>
             <ChevronDown size={14} />
           </button>
+          {plan.nameMatches.length > 0 && (
+            <div className="flex min-w-0 items-center gap-1 overflow-hidden text-[11.5px]">
+              <span className="shrink-0 text-muted">Columns:</span>
+              {plan.nameMatches.slice(0, 6).map((i) => (
+                <button
+                  key={i}
+                  className="shrink-0 rounded border border-line px-1.5 font-mono text-[11px] hover:border-accent hover:text-accent"
+                  title={`Go to column ${columnNames[i]} and search only in it`}
+                  onClick={() => {
+                    jumpToColumn(i);
+                    setFindScope(i);
+                    setFindQuery("");
+                    findInput.current?.focus();
+                  }}
+                >
+                  {columnNames[i]}
+                </button>
+              ))}
+              {plan.nameMatches.length > 6 && <span className="text-muted">+{plan.nameMatches.length - 6}</span>}
+            </div>
+          )}
           <button className="icon-btn ml-auto h-6 w-6" aria-label="Close find" onClick={() => setFindOpen(false)}>
             <X size={14} />
           </button>
