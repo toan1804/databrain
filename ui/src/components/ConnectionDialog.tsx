@@ -66,6 +66,7 @@ export const DEFAULT_POLICY: AiPolicy = {
   index_schemas: [],
   index_batch: 25,
   mcp_enabled: false,
+  auto_approve_notes: false,
 };
 
 function Label({ children, htmlFor }: { children: React.ReactNode; htmlFor?: string }) {
@@ -894,6 +895,12 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
                 <Check checked={policy.share_sample_values} onChange={(v) => setPolicy({ ...policy, share_sample_values: v })} label="Share sample values" help="A few rows to understand columns" />
                 <Check checked={policy.share_result_rows} onChange={(v) => setPolicy({ ...policy, share_result_rows: v })} label="Share result rows" help="Lets the AI analyze query output" />
                 <Check checked={policy.allow_write} onChange={(v) => setPolicy({ ...policy, allow_write: v })} label="Allow write statements" help="Always asks; blocked on read-only" />
+                <Check
+                  checked={policy.auto_approve_notes}
+                  onChange={(v) => setPolicy({ ...policy, auto_approve_notes: v })}
+                  label="Save AI notes directly"
+                  help="Notes the AI adds or updates while exploring skip review in Knowledge"
+                />
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>

@@ -24,13 +24,18 @@ import {
   Wrench,
   X,
   ListChecks,
+  FileDown,
+  FileUp,
 } from "lucide-react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { api, toError } from "../lib/api";
-import type { AiMode, AiSessionRecord, KnNote, KnowledgeView, ResultInfo } from "../lib/types";
+import type { AiMode, AiSessionRecord, KnNote, KnowledgeView, NotesImportPreview, ResultInfo } from "../lib/types";
 import { emptyView, formatCount, lineDiff, relativeTime, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
-import { connectionForKey, useAi, type ChatItem } from "../aiStore";
+import { connectionForKey, useAi, visibleItems, type ChatItem } from "../aiStore";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { exportFileName } from "../lib/notesImport";
+import { ImportNotesDialog } from "./ImportNotesDialog";
 import { editorBridge } from "../editorBridge";
 import { Markdown } from "./Markdown";
 import { extractMentions, mentionToken } from "../outputs";
@@ -221,7 +226,7 @@ function Chat() {
             </div>
           </div>
         )}
-        {items.map((it) => (
+        {visibleItems(items).map((it) => (
           <ChatItemView key={it.id} item={it} />
         ))}
         {running && items[items.length - 1]?.kind !== "assistant" && (
@@ -435,7 +440,9 @@ const TOOL_LABELS: Record<string, string> = {
   run_query: "Ran query",
   query_result: "Queried result",
   result_summary: "Summarized result",
-  add_knowledge_note: "Proposed knowledge note",
+  add_knowledge_note: "Added knowledge note",
+  update_knowledge_note: "Updated knowledge note",
+  list_knowledge_notes: "Read notes & glossary",
   save_query: "Saved query",
   get_editor: "Read editor",
   write_editor: "Proposed editor change",
@@ -672,7 +679,31 @@ function Knowledge() {
   const [data, setData] = useState<KnowledgeView | null>(null);
   const [filter, setFilter] = useState("");
   const [note, setNote] = useState({ target: "", body: "" });
+  const [importing, setImporting] = useState<NotesImportPreview | null>(null);
   const prog = connId ? progress[connId] : undefined;
+  const connName = connections.find((c) => c.id === connId)?.name ?? "notes";
+
+  const exportNotes = async () => {
+    if (!connId) return;
+    const path = await saveDialog({ defaultPath: exportFileName(connName), filters: [{ name: "DataBrain notes", extensions: ["json"] }] });
+    if (!path) return;
+    try {
+      const n = await api.knExportNotes(connId, path);
+      toast(`Exported ${n} note${n === 1 ? "" : "s"}. Share the file; others import it in Knowledge.`, "success");
+    } catch (e) {
+      toast(toError(e).message, "error");
+    }
+  };
+  const importNotes = async () => {
+    if (!connId) return;
+    const path = await openDialog({ multiple: false, directory: false, filters: [{ name: "DataBrain notes", extensions: ["json"] }] });
+    if (typeof path !== "string") return;
+    try {
+      setImporting(await api.knReadNotesFile(connId, path));
+    } catch (e) {
+      toast(toError(e).message, "error");
+    }
+  };
 
   const load = () => {
     if (!connId) return;
@@ -694,6 +725,7 @@ function Knowledge() {
         author: n.author ?? "user",
         status: n.status ?? "approved",
         created_at: n.created_at ?? 0,
+        replaces: n.replaces ?? null,
       });
       load();
     } catch (e) {
@@ -772,25 +804,51 @@ function Knowledge() {
       {proposed.length > 0 && (
         <div>
           <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted">Proposed by AI · review</div>
-          {proposed.map((n) => (
+          {proposed.map((n) => {
+            const old = n.replaces ? approved.find((a) => a.id === n.replaces) : undefined;
+            return (
             <div key={n.id} className="mb-1.5 rounded-lg border border-warning/40 bg-warning/5 p-2">
-              {n.target && <div className="font-mono text-[11px] text-muted">{n.target}</div>}
+              <div className="flex items-center gap-1.5 text-[10.5px] font-medium uppercase text-muted">
+                {old ? "Update" : "New"}
+                {n.target && <span className="font-mono normal-case">{n.target}</span>}
+              </div>
+              {old && <div className="whitespace-pre-wrap text-muted line-through decoration-muted/60">{old.body}</div>}
               <div className="whitespace-pre-wrap">{n.body}</div>
               <div className="mt-1.5 flex justify-end gap-1">
                 <button className="btn-ghost py-0.5" onClick={() => void api.knDeleteNote(n.id).then(load)}>
                   Discard
                 </button>
                 <button className="btn-primary py-0.5" onClick={() => void saveNote({ ...n, status: "approved" })}>
-                  <Check size={12} /> Approve
+                  <Check size={12} /> {old ? "Apply update" : "Approve"}
                 </button>
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
       <div>
-        <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted">Notes & glossary</div>
+        <div className="mb-1 flex items-center gap-1">
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">Notes & glossary</span>
+          <button className="btn-ghost ml-auto py-0.5 text-[11.5px]" disabled={!connId} onClick={() => void importNotes()} title="Import a notes file shared by someone else">
+            <FileUp size={12} /> Import…
+          </button>
+          <button className="btn-ghost py-0.5 text-[11.5px]" disabled={!connId || approved.length === 0} onClick={() => void exportNotes()} title="Save approved notes to a file you can share">
+            <FileDown size={12} /> Export…
+          </button>
+        </div>
+        {importing && connId && (
+          <ImportNotesDialog
+            connectionId={connId}
+            preview={importing}
+            onClose={() => setImporting(null)}
+            onDone={() => {
+              setImporting(null);
+              load();
+            }}
+          />
+        )}
         <form
           className="mb-2 space-y-1.5"
           onSubmit={(e) => {

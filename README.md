@@ -27,7 +27,8 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
 - **Results:** virtualized grid, sort, filters, find, column stats, copy. Export to CSV, TSV, JSON, NDJSON, Markdown, SQL INSERT, Parquet or XLSX.
 - **AI mode** (⌘L panel, ⌘I inline edit):
   - Providers: Kiro (browser sign-in or `ksk_` API key, through `kiro-cli`), OpenAI, Anthropic, Gemini, Azure OpenAI, OpenRouter (browser sign-in), Ollama, LM Studio, or any OpenAI-compatible server.
-  - The assistant uses indexed schema metadata plus your notes/glossary as knowledge. It proposes SQL as diffs, runs queries after approval (per-connection policy), and analyzes results.
+  - The assistant uses indexed schema metadata plus your notes/glossary as knowledge. While exploring it records what it learns (code meanings, business rules, join paths) and updates outdated notes; changes wait for review in Knowledge unless the connection's "Save AI notes directly" is on.
+  - Share notes: Knowledge → Export… writes a `.databrain-notes.json` file; Import… shows new notes, ones you already have, and ones that differ. For each difference, keep yours, use the file's, keep both, edit a merge, or let the AI merge them. It proposes SQL as diffs, runs queries after approval (per-connection policy), and analyzes results.
   - Fix/Explain/Analyze buttons; conversation history; audit log.
 - **MCP:** `databrain-mcp` (stdio) exposes opted-in connections to Kiro CLI, Claude Code, Cursor… (Settings → MCP / Kiro shows the config snippet).
 - Safety prompts for prod and for writes, read-only connections, saved queries, history, command palette (⌘K), dark/light theme.

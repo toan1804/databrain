@@ -5,6 +5,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  ImportAction,
+  NotesImportPreview,
   ExcelSheet,
   TableLayout,
   AgentEvent,
@@ -204,6 +206,9 @@ export const api = {
   knClear: (connectionId: string) => call<void>("kn_clear", { connectionId }),
   knSaveNote: (note: KnNote) => call<KnNote>("kn_save_note", { note }),
   knDeleteNote: (id: string) => call<void>("kn_delete_note", { id }),
+  knExportNotes: (connectionId: string, path: string) => call<number>("kn_export_notes", { connectionId, path }),
+  knReadNotesFile: (connectionId: string, path: string) => call<NotesImportPreview>("kn_read_notes_file", { connectionId, path }),
+  knImportNotes: (connectionId: string, actions: ImportAction[]) => call<number>("kn_import_notes", { connectionId, actions }),
 
   listHistory: (query: HistoryQuery) => call<HistoryEntry[]>("list_history", { query }),
   clearHistory: () => call<void>("clear_history"),

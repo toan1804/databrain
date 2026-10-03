@@ -134,6 +134,19 @@ function defaultTargetKey(): string | null {
   return active?.notebook_id ? null : (active?.id ?? null);
 }
 
+let aiInitStarted = false;
+
+/**
+ * Items to show. A tool call waiting for approval is shown once, as the
+ * approval card: its own "running" card (same SQL) is hidden until it ends.
+ */
+export function visibleItems(items: ChatItem[]): ChatItem[] {
+  return items.filter((it, i) => {
+    if (it.kind !== "tool" || it.done) return true;
+    return !items.slice(i + 1).some((n) => n.kind === "approval" && n.tool === it.tool && n.state === "pending");
+  });
+}
+
 export const useAi = create<AiState>((set, get) => {
   const patchItem = (id: string, patch: Partial<ChatItem>) =>
     set((s) => ({ items: s.items.map((i) => (i.id === id ? ({ ...i, ...patch } as ChatItem) : i)) }));
@@ -154,6 +167,7 @@ export const useAi = create<AiState>((set, get) => {
         });
         break;
       case "tool_started":
+        if (get().items.some((i) => i.kind === "tool" && i.callId === e.call_id)) break;
         set((s) => ({
           items: [
             ...s.items.map((i) => (i.kind === "assistant" ? { ...i, streaming: false } : i)),
@@ -167,7 +181,7 @@ export const useAi = create<AiState>((set, get) => {
             i.kind === "tool" && i.callId === e.call_id ? { ...i, done: true, content: e.content, display: e.display } : i,
           ),
         }));
-        if (e.tool === "add_knowledge_note") set((s) => ({ knowledgeVersion: s.knowledgeVersion + 1 }));
+        if (e.tool === "add_knowledge_note" || e.tool === "update_knowledge_note") set((s) => ({ knowledgeVersion: s.knowledgeVersion + 1 }));
         if (e.tool === "save_query") void useStore.getState().refreshSavedQueries();
         break;
       case "usage":
@@ -213,6 +227,7 @@ export const useAi = create<AiState>((set, get) => {
       return;
     }
     if (r.type === "approval_request") {
+      if (get().items.some((i) => i.kind === "approval" && i.requestId === r.request_id)) return;
       set((s) => ({
         items: [
           ...s.items,
@@ -221,6 +236,7 @@ export const useAi = create<AiState>((set, get) => {
       }));
       return;
     }
+    if (get().items.some((i) => i.kind === "edit" && i.requestId === r.request_id)) return;
     const target = r.proposal.mode === "new_tab" ? null : key;
     set((s) => ({
       items: [
@@ -257,7 +273,10 @@ export const useAi = create<AiState>((set, get) => {
     sessionsVersion: 0,
 
     init: async () => {
-      if (!isTauri()) return;
+      // Once: a second listener (StrictMode double effect) showed every
+      // approval and tool card twice.
+      if (!isTauri() || aiInitStarted) return;
+      aiInitStarted = true;
       await onAiEvent((e) => {
         if (e.type === "approval_request" || e.type === "edit_proposal" || e.type === "editor_request") handleRequest(e);
         else handleAgent(e);

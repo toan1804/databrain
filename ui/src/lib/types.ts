@@ -73,6 +73,8 @@ export interface AiPolicy {
   /** Schemas per metadata request while indexing (default 25). */
   index_batch?: number;
   mcp_enabled: boolean;
+  /** AI notes are saved directly instead of waiting for review. */
+  auto_approve_notes: boolean;
 }
 
 export interface AuthStatus {
@@ -682,6 +684,34 @@ export interface KnNote {
   author: "user" | "ai" | string;
   status: "approved" | "proposed";
   created_at: number;
+  /** AI update proposal: approving it replaces this note id. */
+  replaces?: string | null;
+}
+
+/** A note in a shared notes file (no local ids). */
+export interface NoteEntry {
+  target?: string | null;
+  body: string;
+  author?: string | null;
+}
+
+export interface ImportItem {
+  incoming: NoteEntry;
+  kind: "new" | "same" | "conflict";
+  existing: KnNote[];
+}
+
+export interface ImportAction {
+  incoming: NoteEntry;
+  action: "add" | "skip" | "replace" | "merge";
+  existing_ids: string[];
+  body?: string;
+  target?: string | null;
+}
+
+export interface NotesImportPreview {
+  source?: { connection: string; kind: string } | null;
+  items: ImportItem[];
 }
 
 export interface KnState {

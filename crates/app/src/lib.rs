@@ -335,6 +335,18 @@ async fn kn_delete_note(state: State<'_, AppState>, id: String) -> R<()> {
     ai_api::delete_note(&state, &id)
 }
 #[tauri::command]
+async fn kn_export_notes(state: State<'_, AppState>, connection_id: String, path: String) -> R<usize> {
+    ai_api::export_notes(&state, &connection_id, &path)
+}
+#[tauri::command]
+async fn kn_read_notes_file(state: State<'_, AppState>, connection_id: String, path: String) -> R<ai_api::NotesImportPreview> {
+    ai_api::read_notes_file(&state, &connection_id, &path)
+}
+#[tauri::command]
+async fn kn_import_notes(state: State<'_, AppState>, connection_id: String, actions: Vec<databrain_workspace::ImportAction>) -> R<usize> {
+    ai_api::import_notes(&state, &connection_id, actions)
+}
+#[tauri::command]
 async fn kn_clear(state: State<'_, AppState>, connection_id: String) -> R<()> {
     ai_api::clear_knowledge(&state, &connection_id)
 }
@@ -681,6 +693,9 @@ pub fn run() {
             kn_cancel,
             kn_save_note,
             kn_delete_note,
+            kn_export_notes,
+            kn_read_notes_file,
+            kn_import_notes,
             kn_clear,
         ])
         .build(tauri::generate_context!())

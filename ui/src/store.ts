@@ -266,6 +266,8 @@ function nextTabTitle(tabs: Tab[]): string {
   return `Query ${n}`;
 }
 
+let storeInitStarted = false;
+
 /** `explorer_schemas` setting: { connectionId: [schema ids] }. */
 export function parseSchemaFilter(v: unknown): Record<string, string[]> {
   if (!v || typeof v !== "object") return {};
@@ -382,6 +384,10 @@ export const useStore = create<State>((set, get) => ({
   paletteOpen: false,
 
   init: async () => {
+    // Once per app: React StrictMode runs effects twice in dev, which would
+    // register every backend event listener twice.
+    if (storeInitStarted) return;
+    storeInitStarted = true;
     if (!isTauri()) {
       const id = uid();
       set({

@@ -85,7 +85,7 @@ pub enum NoteStatus {
 }
 
 impl NoteStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             NoteStatus::Approved => "approved",
             NoteStatus::Proposed => "proposed",
@@ -94,6 +94,130 @@ impl NoteStatus {
     fn parse(s: &str) -> Self {
         if s == "proposed" { NoteStatus::Proposed } else { NoteStatus::Approved }
     }
+}
+
+/// `format` value of a notes file.
+pub const NOTES_FORMAT: &str = "databrain-notes";
+
+/// Shareable notes & glossary file (`*.databrain-notes.json`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotesFile {
+    pub format: String,
+    pub version: u32,
+    #[serde(default)]
+    pub exported_at: i64,
+    #[serde(default)]
+    pub source: Option<NotesSource>,
+    pub notes: Vec<NoteEntry>,
+}
+
+impl NotesFile {
+    pub fn validate(&self) -> Result<()> {
+        if self.format != NOTES_FORMAT {
+            return Err(Error::Invalid("not a DataBrain notes file".into()));
+        }
+        if self.version > 1 {
+            return Err(Error::Invalid(format!("notes file version {} is newer than this app supports", self.version)));
+        }
+        if self.notes.len() > 20_000 {
+            return Err(Error::Invalid("notes file has too many notes".into()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotesSource {
+    pub connection: String,
+    pub kind: String,
+}
+
+/// One note in a file (no ids: they are local).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoteEntry {
+    #[serde(default)]
+    pub target: Option<String>,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportKind {
+    /// Nothing similar exists.
+    New,
+    /// Same subject and same text: nothing to do.
+    Same,
+    /// Same subject (target, or glossary term), different text.
+    Conflict,
+}
+
+/// One incoming note compared with the existing notes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportItem {
+    pub incoming: NoteEntry,
+    pub kind: ImportKind,
+    /// Existing notes about the same subject.
+    pub existing: Vec<KnNote>,
+}
+
+/// What to do with an incoming note: `add`, `skip`, `replace` (delete
+/// `existing_ids`, add the incoming text) or `merge` (delete `existing_ids`,
+/// add `body`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportAction {
+    pub incoming: NoteEntry,
+    pub action: String,
+    #[serde(default)]
+    pub existing_ids: Vec<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+/// Subject of a note: its target, or for glossary notes the term before
+/// `:` / `=` / ` - ` (e.g. "active customer = …" → "active customer").
+pub fn note_subject(target: Option<&str>, body: &str) -> String {
+    if let Some(t) = target.map(str::trim).filter(|t| !t.is_empty()) {
+        return format!("t:{}", t.to_lowercase());
+    }
+    let first = body.trim().lines().next().unwrap_or("");
+    let cut = [":", "=", " - ", " — ", " means "].iter().filter_map(|s| first.find(s)).min();
+    match cut {
+        Some(i) if i > 0 && i <= 60 => format!("g:{}", normalize(&first[..i])),
+        _ => format!("b:{}", normalize(body)),
+    }
+}
+
+fn normalize(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase().trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace()).to_string()
+}
+
+/// Compare incoming notes with existing ones (see [`ImportKind`]).
+pub fn plan_import(existing: &[KnNote], incoming: &[NoteEntry]) -> Vec<ImportItem> {
+    let mut seen = HashSet::new();
+    incoming
+        .iter()
+        .filter(|n| !n.body.trim().is_empty())
+        // Duplicates inside the file: keep the first.
+        .filter(|n| seen.insert((note_subject(n.target.as_deref(), &n.body), normalize(&n.body))))
+        .map(|n| {
+            let subject = note_subject(n.target.as_deref(), &n.body);
+            let body = normalize(&n.body);
+            let same_subject: Vec<KnNote> = existing.iter().filter(|e| note_subject(e.target.as_deref(), &e.body) == subject).cloned().collect();
+            let identical = existing.iter().any(|e| normalize(&e.body) == body && e.target.as_deref().map(str::to_lowercase) == n.target.as_deref().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()));
+            let kind = if identical {
+                ImportKind::Same
+            } else if same_subject.is_empty() {
+                ImportKind::New
+            } else {
+                ImportKind::Conflict
+            };
+            ImportItem { incoming: n.clone(), kind, existing: if kind == ImportKind::Conflict { same_subject } else { vec![] } }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -112,6 +236,9 @@ pub struct KnNote {
     pub status: NoteStatus,
     #[serde(default)]
     pub created_at: i64,
+    /// AI proposal that updates an existing note: approving it replaces that note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<String>,
 }
 
 fn user() -> String {
@@ -355,11 +482,21 @@ impl Workspace {
             n.id = new_id();
             n.created_at = now_ms();
         }
+        n.target = n.target.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
         let c = self.conn.lock();
+        // Approving an update: the new text takes the old note's place.
+        if n.status == NoteStatus::Approved {
+            if let Some(old) = n.replaces.take() {
+                if old != n.id {
+                    c.execute("DELETE FROM kn_notes WHERE id = ?1 AND connection_id = ?2", params![old, n.connection_id])?;
+                    c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [&old])?;
+                }
+            }
+        }
         c.execute(
-            "INSERT INTO kn_notes (id, connection_id, target, body, author, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-             ON CONFLICT(id) DO UPDATE SET target = excluded.target, body = excluded.body, status = excluded.status",
-            params![n.id, n.connection_id, n.target, n.body.trim(), n.author, n.status.as_str(), n.created_at],
+            "INSERT INTO kn_notes (id, connection_id, target, body, author, status, created_at, replaces) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(id) DO UPDATE SET target = excluded.target, body = excluded.body, status = excluded.status, replaces = excluded.replaces",
+            params![n.id, n.connection_id, n.target, n.body.trim(), n.author, n.status.as_str(), n.created_at, n.replaces],
         )?;
         c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [&n.id])?;
         if n.status == NoteStatus::Approved {
@@ -374,7 +511,7 @@ impl Workspace {
     pub fn kn_notes(&self, connection_id: &str) -> Result<Vec<KnNote>> {
         let c = self.conn.lock();
         let mut stmt = c.prepare(
-            "SELECT id, connection_id, target, body, author, status, created_at FROM kn_notes WHERE connection_id = ?1 ORDER BY created_at DESC",
+            "SELECT id, connection_id, target, body, author, status, created_at, replaces FROM kn_notes WHERE connection_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt
             .query_map([connection_id], |r| {
@@ -386,6 +523,7 @@ impl Workspace {
                     author: r.get(4)?,
                     status: NoteStatus::parse(&r.get::<_, String>(5)?),
                     created_at: r.get(6)?,
+                    replaces: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -397,6 +535,69 @@ impl Workspace {
         c.execute("DELETE FROM kn_notes WHERE id = ?1", [id])?;
         c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [id])?;
         Ok(())
+    }
+
+    /// Approved notes of a connection as a shareable file.
+    pub fn kn_export_notes(&self, connection_id: &str) -> Result<NotesFile> {
+        let profile = self.get_connection(connection_id)?;
+        let mut notes: Vec<NoteEntry> = self
+            .kn_notes(connection_id)?
+            .into_iter()
+            .filter(|n| n.status == NoteStatus::Approved)
+            .map(|n| NoteEntry { target: n.target, body: n.body, author: Some(n.author) })
+            .collect();
+        notes.sort_by(|a, b| (a.target.is_none(), a.target.as_deref().unwrap_or(""), &a.body).cmp(&(b.target.is_none(), b.target.as_deref().unwrap_or(""), &b.body)));
+        Ok(NotesFile {
+            format: NOTES_FORMAT.into(),
+            version: 1,
+            exported_at: now_ms(),
+            source: Some(NotesSource { connection: profile.name, kind: profile.config.kind.as_str().to_string() }),
+            notes,
+        })
+    }
+
+    /// Compare a notes file with the connection's approved notes.
+    pub fn kn_import_plan(&self, connection_id: &str, file: &NotesFile) -> Result<Vec<ImportItem>> {
+        file.validate()?;
+        let existing: Vec<KnNote> = self.kn_notes(connection_id)?.into_iter().filter(|n| n.status == NoteStatus::Approved).collect();
+        Ok(plan_import(&existing, &file.notes))
+    }
+
+    /// Apply the user's choices. Returns how many notes were added or changed.
+    pub fn kn_import_apply(&self, connection_id: &str, actions: &[ImportAction]) -> Result<usize> {
+        let mut n = 0;
+        for a in actions {
+            let body = a.body.clone().unwrap_or_else(|| a.incoming.body.clone());
+            match a.action.as_str() {
+                "skip" => continue,
+                "add" | "replace" | "merge" => {
+                    if body.trim().is_empty() {
+                        continue;
+                    }
+                    if a.action != "add" {
+                        for id in &a.existing_ids {
+                            // Only this connection's notes.
+                            let c = self.conn.lock();
+                            c.execute("DELETE FROM kn_notes WHERE id = ?1 AND connection_id = ?2", params![id, connection_id])?;
+                            c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [id])?;
+                        }
+                    }
+                    self.kn_save_note(KnNote {
+                        id: String::new(),
+                        connection_id: connection_id.to_string(),
+                        target: a.target.clone().or_else(|| a.incoming.target.clone()),
+                        body,
+                        author: if a.action == "merge" { "merged".into() } else { a.incoming.author.clone().unwrap_or_else(|| "import".into()) },
+                        status: NoteStatus::Approved,
+                        created_at: 0,
+                        replaces: None,
+                    })?;
+                    n += 1;
+                }
+                other => return Err(Error::Invalid(format!("unknown import action {other}"))),
+            }
+        }
+        Ok(n)
     }
 
     /// Saved queries flagged as AI examples for a connection.
@@ -468,6 +669,7 @@ mod tests {
                 author: "ai".into(),
                 status: NoteStatus::Proposed,
                 created_at: 0,
+                replaces: None,
             })
             .unwrap();
         assert!(ws.kn_search("c1", "recurring revenue", 5).unwrap().is_empty());

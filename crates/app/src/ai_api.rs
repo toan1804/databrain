@@ -448,6 +448,38 @@ pub fn delete_note(state: &AppState, id: &str) -> Result<()> {
     Ok(state.workspace.kn_delete_note(id)?)
 }
 
+/// Write the connection's approved notes & glossary to `path` (JSON).
+pub fn export_notes(state: &AppState, connection_id: &str, path: &str) -> Result<usize> {
+    let file = state.workspace.kn_export_notes(connection_id)?;
+    let text = serde_json::to_string_pretty(&file).map_err(|e| EngineError::new("internal", e.to_string()))?;
+    std::fs::write(path, text).map_err(|e| EngineError::new("io", format!("cannot write {path}: {e}")))?;
+    Ok(file.notes.len())
+}
+
+#[derive(Debug, Serialize)]
+pub struct NotesImportPreview {
+    pub source: Option<databrain_workspace::NotesSource>,
+    pub items: Vec<databrain_workspace::ImportItem>,
+}
+
+/// Read a notes file and compare it with the connection's notes.
+pub fn read_notes_file(state: &AppState, connection_id: &str, path: &str) -> Result<NotesImportPreview> {
+    let meta = std::fs::metadata(path).map_err(|e| EngineError::new("io", format!("cannot read {path}: {e}")))?;
+    if meta.len() > 50 * 1024 * 1024 {
+        return Err(EngineError::new("invalid", "notes file is larger than 50 MB"));
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| EngineError::new("io", format!("cannot read {path}: {e}")))?;
+    let file: databrain_workspace::NotesFile =
+        serde_json::from_str(&text).map_err(|e| EngineError::new("invalid", format!("not a DataBrain notes file: {e}")))?;
+    let items = state.workspace.kn_import_plan(connection_id, &file)?;
+    Ok(NotesImportPreview { source: file.source, items })
+}
+
+pub fn import_notes(state: &AppState, connection_id: &str, actions: Vec<databrain_workspace::ImportAction>) -> Result<usize> {
+    state.workspace.get_connection(connection_id)?;
+    Ok(state.workspace.kn_import_apply(connection_id, &actions)?)
+}
+
 pub fn clear_knowledge(state: &AppState, connection_id: &str) -> Result<()> {
     Ok(state.workspace.kn_clear(connection_id)?)
 }

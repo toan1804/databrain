@@ -13,7 +13,7 @@ pub mod outputs;
 pub use ai::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry};
 pub use outputs::OutputRecord;
 pub use notebooks::{CellKind, CellRunSummary, Notebook, NotebookCell, NotebookSummary};
-pub use knowledge::{IndexDelta, KnHit, KnNote, KnObject, KnState, NoteStatus};
+pub use knowledge::{ImportAction, ImportItem, ImportKind, IndexDelta, KnHit, KnNote, KnObject, KnState, NoteEntry, NoteStatus, NotesFile, NotesSource};
 
 use databrain_connector_core::ConnectionConfig;
 use parking_lot::Mutex;
@@ -115,6 +115,9 @@ pub struct AiPolicy {
     pub index_batch: u32,
     /// Expose this connection to external agents through the MCP server.
     pub mcp_enabled: bool,
+    /// Notes the AI adds or updates are saved directly instead of waiting
+    /// for review in Knowledge.
+    pub auto_approve_notes: bool,
 }
 
 impl Default for AiPolicy {
@@ -132,6 +135,7 @@ impl Default for AiPolicy {
             index_schemas: vec![],
             index_batch: 25,
             mcp_enabled: false,
+            auto_approve_notes: false,
         }
     }
 }
@@ -467,6 +471,10 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE query_history ADD COLUMN output_handle TEXT;
     ALTER TABLE query_history ADD COLUMN result_id TEXT;
     ALTER TABLE tabs ADD COLUMN output_ref TEXT;
+    "#,
+    // v5: AI note updates point at the note they replace
+    r#"
+    ALTER TABLE kn_notes ADD COLUMN replaces TEXT;
     "#,
 ];
 
@@ -1098,5 +1106,77 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
         }
     }
-}
 
+    #[test]
+    fn notes_export_import_round_trip() {
+        use crate::knowledge::{ImportAction, ImportKind};
+        let ws = Workspace::open_in_memory().unwrap();
+        let a = ws.save_connection(profile("A")).unwrap();
+        let b = ws.save_connection(profile("B")).unwrap();
+        let note = |conn: &str, target: Option<&str>, body: &str| KnNote {
+            id: String::new(),
+            connection_id: conn.into(),
+            target: target.map(String::from),
+            body: body.into(),
+            author: "user".into(),
+            status: NoteStatus::Approved,
+            created_at: 0,
+            replaces: None,
+        };
+        ws.kn_save_note(note(&a.id, Some("public.orders"), "Orders with status 9 are test orders.")).unwrap();
+        ws.kn_save_note(note(&a.id, None, "Active customer: has an order in the last 90 days")).unwrap();
+        ws.kn_save_note(note(&a.id, None, "MRR = monthly recurring revenue")).unwrap();
+        ws.kn_save_note(KnNote { status: NoteStatus::Proposed, ..note(&a.id, None, "pending, not exported") }).unwrap();
+        // B already knows some of it.
+        ws.kn_save_note(note(&b.id, None, "MRR = monthly recurring revenue")).unwrap();
+        let old = ws.kn_save_note(note(&b.id, None, "Active customer: logged in this month")).unwrap();
+
+        let file = ws.kn_export_notes(&a.id).unwrap();
+        assert_eq!(file.notes.len(), 3, "approved notes only");
+        let text = serde_json::to_string(&file).unwrap();
+        let file: NotesFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(file.source.as_ref().unwrap().connection, "A");
+
+        let plan = ws.kn_import_plan(&b.id, &file).unwrap();
+        let kind = |body: &str| plan.iter().find(|p| p.incoming.body.starts_with(body)).unwrap();
+        assert_eq!(kind("Orders").kind, ImportKind::New);
+        assert_eq!(kind("MRR").kind, ImportKind::Same);
+        let conflict = kind("Active");
+        assert_eq!(conflict.kind, ImportKind::Conflict, "same glossary term, different text");
+        assert_eq!(conflict.existing[0].id, old.id);
+
+        let acts = vec![
+            ImportAction { incoming: kind("Orders").incoming.clone(), action: "add".into(), existing_ids: vec![], body: None, target: None },
+            ImportAction {
+                incoming: conflict.incoming.clone(),
+                action: "merge".into(),
+                existing_ids: vec![old.id.clone()],
+                body: Some("Active customer: logged in this month and has an order in the last 90 days".into()),
+                target: None,
+            },
+        ];
+        assert_eq!(ws.kn_import_apply(&b.id, &acts).unwrap(), 2);
+        let notes = ws.kn_notes(&b.id).unwrap();
+        assert_eq!(notes.len(), 3);
+        assert!(notes.iter().all(|n| n.id != old.id), "merged note replaced the old one");
+        assert!(notes.iter().any(|n| n.target.as_deref() == Some("public.orders")));
+        assert!(ws.kn_import_plan(&b.id, &NotesFile { format: "x".into(), ..file.clone() }).is_err());
+        // Importing again: nothing new.
+        assert!(ws.kn_import_plan(&b.id, &ws.kn_export_notes(&b.id).unwrap()).unwrap().iter().all(|p| p.kind == ImportKind::Same));
+    }
+
+    #[test]
+    fn approving_an_update_replaces_the_note() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let a = ws.save_connection(profile("A")).unwrap();
+        let base = KnNote { id: String::new(), connection_id: a.id.clone(), target: None, body: "status 2 = closed".into(), author: "user".into(), status: NoteStatus::Approved, created_at: 0, replaces: None };
+        let old = ws.kn_save_note(base.clone()).unwrap();
+        let upd = ws.kn_save_note(KnNote { body: "status 2 = closed, 3 = archived".into(), author: "ai".into(), status: NoteStatus::Proposed, replaces: Some(old.id.clone()), ..base }).unwrap();
+        assert_eq!(ws.kn_notes(&a.id).unwrap().len(), 2, "old note kept while the update is pending");
+        assert_eq!(ws.kn_notes(&a.id).unwrap().iter().find(|n| n.id == upd.id).unwrap().replaces.as_deref(), Some(old.id.as_str()));
+        ws.kn_save_note(KnNote { status: NoteStatus::Approved, ..upd }).unwrap();
+        let notes = ws.kn_notes(&a.id).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].body.contains("archived") && notes[0].replaces.is_none());
+    }
+}

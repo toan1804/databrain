@@ -585,3 +585,56 @@ async fn knowledge_index_plan_scope_and_cancel() {
     done.cancel();
     assert!(matches!(index_connection(&engine, &conn, None, &|_, _, _| {}, &done).await, Err(databrain_ai::AiError::Cancelled)));
 }
+
+#[tokio::test]
+async fn knowledge_note_tools_add_list_update() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = mock_openai(requests.clone()).await;
+    let f = fixture(port, AiPolicy::default()).await;
+    let ctx = databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: f.ws.get_connection(&f.conn).unwrap(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+    };
+    let o = ctx.call("add_knowledge_note", &json!({"target": "main.orders", "note": "status 2 = shipped"})).await;
+    assert!(o.content.contains("review"), "{}", o.content);
+    let o = ctx.call("add_knowledge_note", &json!({"note": "STATUS 2 =  shipped"})).await;
+    assert!(o.content.contains("identical note already exists"), "no duplicates: {}", o.content);
+    // A user note the AI later corrects.
+    let user = f
+        .ws
+        .kn_save_note(databrain_workspace::KnNote {
+            id: String::new(),
+            connection_id: f.conn.clone(),
+            target: None,
+            body: "Revenue excludes tax".into(),
+            author: "user".into(),
+            status: databrain_workspace::NoteStatus::Approved,
+            created_at: 0,
+            replaces: None,
+        })
+        .unwrap();
+    let o = ctx.call("list_knowledge_notes", &json!({"filter": "revenue"})).await;
+    assert!(o.content.contains(&user.id) && !o.content.contains("shipped"), "{}", o.content);
+    let o = ctx.call("update_knowledge_note", &json!({"id": user.id, "note": "Revenue excludes tax and refunds"})).await;
+    assert!(o.content.contains("review"), "{}", o.content);
+    let notes = f.ws.kn_notes(&f.conn).unwrap();
+    let upd = notes.iter().find(|n| n.replaces.as_deref() == Some(user.id.as_str())).expect("update proposal");
+    assert_eq!(upd.status, databrain_workspace::NoteStatus::Proposed);
+    assert!(notes.iter().any(|n| n.id == user.id), "user note kept until the update is approved");
+    // Auto-approve: saved directly and the old text is replaced.
+    let mut p = f.ws.get_connection(&f.conn).unwrap();
+    p.ai_policy.auto_approve_notes = true;
+    let auto = databrain_ai::ToolContext { profile: p, ..ctx };
+    let o = auto.call("update_knowledge_note", &json!({"id": user.id, "note": "Revenue excludes tax, refunds and shipping"})).await;
+    assert!(o.content.contains("saved"), "{}", o.content);
+    let notes = f.ws.kn_notes(&f.conn).unwrap();
+    assert!(notes.iter().all(|n| n.id != user.id));
+    assert!(notes.iter().any(|n| n.body.ends_with("shipping") && n.status == databrain_workspace::NoteStatus::Approved));
+    assert!(auto.call("update_knowledge_note", &json!({"id": "nope", "note": "x"})).await.content.starts_with("ERROR"));
+}
