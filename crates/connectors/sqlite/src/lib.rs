@@ -565,6 +565,7 @@ mod tests {
         let opts = ExecOptions {
             batch_size: 100,
             cancel: CancellationToken::new(),
+            ..Default::default()
         };
         let r = s
             .execute(
@@ -589,6 +590,7 @@ mod tests {
         let opts = ExecOptions {
             batch_size: 1000,
             cancel: cancel.clone(),
+            ..Default::default()
         };
         let stream = s
             .execute(

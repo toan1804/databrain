@@ -1028,6 +1028,8 @@ impl QueryEngine {
                 ExecOptions {
                     batch_size,
                     cancel: cancel.clone(),
+                    // One row past the cap tells us the result was truncated.
+                    max_rows: limit.map(|l| l.saturating_add(1)),
                 },
             )
             .await?;

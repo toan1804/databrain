@@ -609,6 +609,7 @@ mod tests {
                 ExecOptions {
                     batch_size: 10,
                     cancel: cancel.clone(),
+                    ..Default::default()
                 },
             )
             .await

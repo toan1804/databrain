@@ -69,6 +69,9 @@ impl Connector for DatabricksConnector {
                 FieldSpec::new("http_path", "SQL warehouse HTTP path").required().placeholder("/sql/1.0/warehouses/abc123def456"),
                 FieldSpec::new("catalog", "Default catalog").placeholder("main"),
                 FieldSpec::new("schema", "Default schema").placeholder("default"),
+                FieldSpec::new("result_transfer", "Result transfer")
+                    .placeholder("auto")
+                    .help("auto: large results download from cloud storage (no 25 MiB limit). inline: only through the workspace API (25 MiB limit), for networks that block cloud storage."),
             ],
             note: Some("Browser sign-in uses the Databricks CLI OAuth app (redirect http://localhost:8020)."),
         }
@@ -108,12 +111,13 @@ impl Connector for DatabricksConnector {
         let host = normalize_host(cfg.host.as_deref().filter(|h| !h.is_empty()).ok_or_else(|| ConnectorError::config("workspace host is required"))?);
         let s = DbxSession(Arc::new(Inner {
             base: format!("https://{host}/api/2.0/sql/statements"),
-            host,
+            origin: format!("https://{host}"),
             warehouse: warehouse_id(cfg)?,
             creds,
             http: http(),
             catalog: Mutex::new(cfg.opt("catalog").map(str::to_string)),
             schema: Mutex::new(cfg.opt("schema").map(str::to_string)),
+            inline_only: cfg.opt("result_transfer").is_some_and(|v| v.eq_ignore_ascii_case("inline")),
         }));
         // Validate credentials + warehouse up front.
         s.0.run_small("SELECT 1").await?;
@@ -124,7 +128,8 @@ impl Connector for DatabricksConnector {
 pub struct DbxSession(Arc<Inner>);
 
 struct Inner {
-    host: String,
+    /// `https://<host>`, joined with the API's chunk links.
+    origin: String,
     base: String,
     warehouse: String,
     creds: Arc<dyn CredentialSource>,
@@ -132,6 +137,8 @@ struct Inner {
     /// Session context emulated client-side (the API is stateless): `USE` updates these.
     catalog: Mutex<Option<String>>,
     schema: Mutex<Option<String>>,
+    /// "Result transfer: Inline" option: never use EXTERNAL_LINKS.
+    inline_only: bool,
 }
 
 fn col_type(type_name: &str) -> ColType {
@@ -173,12 +180,16 @@ impl Inner {
     }
 
     async fn submit(&self, sql: &str, row_limit: Option<usize>) -> Result<serde_json::Value> {
+        self.submit_as(sql, row_limit, Disposition::Inline).await
+    }
+
+    async fn submit_as(&self, sql: &str, row_limit: Option<usize>, disposition: Disposition) -> Result<serde_json::Value> {
         let mut body = json!({
             "statement": sql,
             "warehouse_id": self.warehouse,
             "wait_timeout": "10s",
             "on_wait_timeout": "CONTINUE",
-            "disposition": "INLINE",
+            "disposition": disposition.as_str(),
             "format": "JSON_ARRAY",
         });
         if let Some(c) = self.catalog.lock().await.clone() {
@@ -220,30 +231,82 @@ impl Inner {
     }
 
     async fn run_small(&self, sql: &str) -> Result<Vec<Vec<serde_json::Value>>> {
+        let cancel = databrain_connector_core::CancellationToken::new();
         let resp = self.submit(sql, Some(100_000)).await?;
-        let resp = self.wait(resp, &databrain_connector_core::CancellationToken::new()).await?;
+        let resp = match self.wait(resp, &cancel).await {
+            // Metadata of a huge catalog can pass 25 MiB: fetch it through links.
+            Err(e) if is_inline_limit(&e.message) && !self.inline_only => {
+                let resp = self.submit_as(sql, Some(100_000), Disposition::ExternalLinks).await?;
+                self.wait(resp, &cancel).await?
+            }
+            r => r?,
+        };
+        let id = resp["statement_id"].as_str().unwrap_or_default().to_string();
         let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
         let mut chunk = resp.get("result").cloned();
         while let Some(c) = chunk {
-            if let Some(arr) = c["data_array"].as_array() {
-                rows.extend(arr.iter().map(|r| r.as_array().cloned().unwrap_or_default()));
-            }
-            chunk = match c.get("next_chunk_internal_link").and_then(|l| l.as_str()) {
-                Some(link) => Some(self.request(reqwest::Method::GET, format!("https://{}{link}", self.host), None).await?),
-                None => None,
-            };
+            rows.extend(self.chunk_rows(&id, &c).await?.iter().map(|r| r.as_array().cloned().unwrap_or_default()));
+            chunk = self.next_chunk(&c).await?;
         }
         Ok(rows)
     }
 
+    /// Rows of a result chunk: inline `data_array`, or downloaded from its external link.
+    async fn chunk_rows(&self, statement_id: &str, chunk: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
+        match first_link(chunk) {
+            Some(link) => self.download(statement_id, &link).await,
+            None => Ok(chunk["data_array"].as_array().cloned().unwrap_or_default()),
+        }
+    }
+
+    /// Next chunk after `chunk`, if any (EXTERNAL_LINKS puts the link on the link entry).
+    async fn next_chunk(&self, chunk: &serde_json::Value) -> Result<Option<serde_json::Value>> {
+        let next = chunk
+            .get("next_chunk_internal_link")
+            .or_else(|| chunk.pointer("/external_links/0/next_chunk_internal_link"))
+            .and_then(|l| l.as_str());
+        match next {
+            Some(link) => Ok(Some(self.request(reqwest::Method::GET, format!("{}{link}", self.origin), None).await?)),
+            None => Ok(None),
+        }
+    }
+
     async fn stream(&self, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
+        // INLINE results are capped at 25 MiB by the server ("Inline byte limit
+        // exceeded"), so results go through EXTERNAL_LINKS (cloud-storage URLs,
+        // up to 100 GiB). Workspaces that block those links fall back to INLINE.
+        let first = if self.inline_only { Disposition::Inline } else { Disposition::ExternalLinks };
+        match self.stream_as(sql, opts, tx, first).await {
+            Err(StreamFail::Links(e)) if first == Disposition::ExternalLinks => {
+                tx.send(StreamEvent::Notice(format!(
+                    "Could not download the result from cloud storage ({}); ran again with inline results (25 MiB limit). Set \"Result transfer\" to Inline on this connection to skip the first try.",
+                    e.message
+                )))
+                .await;
+                self.stream_as(sql, opts, tx, Disposition::Inline).await.map_err(StreamFail::into_inner)
+            }
+            r => r.map_err(StreamFail::into_inner),
+        }
+    }
+
+    async fn stream_as(&self, sql: &str, opts: &ExecOptions, tx: &StreamSender, disposition: Disposition) -> std::result::Result<(), StreamFail> {
         // Emulate USE for subsequent statements (the API is stateless).
         let kw = databrain_connector_core::sql::leading_keyword(sql);
-        let resp = self.submit(sql, None).await?;
-        let resp = self.wait(resp, &opts.cancel).await?;
+        let resp = match self.submit_as(sql, opts.max_rows, disposition).await {
+            Ok(r) => r,
+            // Links disabled for this workspace: rejected at submit time.
+            Err(e) if disposition == Disposition::ExternalLinks && mentions_links(&e.message) => return Err(StreamFail::Links(e)),
+            Err(e) => return Err(StreamFail::Other(e)),
+        };
+        let resp = match self.wait(resp, &opts.cancel).await {
+            Ok(r) => r,
+            Err(e) if disposition == Disposition::ExternalLinks && mentions_links(&e.message) => return Err(StreamFail::Links(e)),
+            Err(e) => return Err(StreamFail::Other(e)),
+        };
         if kw == "USE" {
             self.apply_use(sql).await;
         }
+        let statement_id = resp["statement_id"].as_str().unwrap_or_default().to_string();
         let columns: Vec<Column> = resp
             .pointer("/manifest/schema/columns")
             .and_then(|c| c.as_array())
@@ -261,29 +324,69 @@ impl Inner {
             tx.send(StreamEvent::Done(ExecSummary::default())).await;
             return Ok(());
         }
-        let Some(mut sink) = RowSink::start(&columns, opts.batch_size, tx).await else { return Ok(()) };
         let mut chunk = resp.get("result").cloned();
+        // Download the first external chunk before announcing the schema, so a
+        // blocked link can still fall back to INLINE cleanly.
+        let mut pending: Option<Vec<serde_json::Value>> = None;
+        if let Some(c) = &chunk {
+            if let Some(link) = first_link(c) {
+                match self.download(&statement_id, &link).await {
+                    Ok(rows) => pending = Some(rows),
+                    Err(e) => return Err(StreamFail::Links(e)),
+                }
+            }
+        }
+        let Some(mut sink) = RowSink::start(&columns, opts.batch_size, tx).await else { return Ok(()) };
         'outer: while let Some(c) = chunk {
-            if let Some(arr) = c["data_array"].as_array() {
-                for r in arr {
-                    let row = r.as_array().cloned().unwrap_or_default();
-                    let vals = sink.types.clone().into_iter().enumerate().map(|(i, t)| json_cell(t, row.get(i).unwrap_or(&serde_json::Value::Null)));
-                    if !sink.push(vals).await? {
-                        break 'outer;
-                    }
+            let rows: Vec<serde_json::Value> = match pending.take() {
+                Some(r) => r,
+                None => self.chunk_rows(&statement_id, &c).await.map_err(StreamFail::Other)?,
+            };
+            for r in &rows {
+                let row = r.as_array().cloned().unwrap_or_default();
+                let vals = sink.types.clone().into_iter().enumerate().map(|(i, t)| json_cell(t, row.get(i).unwrap_or(&serde_json::Value::Null)));
+                if !sink.push(vals).await.map_err(StreamFail::Other)? {
+                    break 'outer;
                 }
             }
             if opts.cancel.is_cancelled() {
-                return Err(ConnectorError::cancelled());
+                return Err(StreamFail::Other(ConnectorError::cancelled()));
             }
-            chunk = match c.get("next_chunk_internal_link").and_then(|l| l.as_str()) {
-                Some(link) => Some(self.request(reqwest::Method::GET, format!("https://{}{link}", self.host), None).await?),
-                None => None,
-            };
+            chunk = self.next_chunk(&c).await.map_err(StreamFail::Other)?;
         }
-        sink.finish().await?;
+        sink.finish().await.map_err(StreamFail::Other)?;
         tx.send(StreamEvent::Done(ExecSummary::default())).await;
         Ok(())
+    }
+
+    /// Fetch one EXTERNAL_LINKS chunk (JSON_ARRAY rows). The URL is a presigned
+    /// cloud-storage link: no Authorization header, and it is never logged.
+    /// An expired link is renewed once through the chunk API.
+    async fn download(&self, statement_id: &str, link: &ChunkLink) -> Result<Vec<serde_json::Value>> {
+        match self.fetch_chunk(&link.url).await {
+            Ok(rows) => Ok(rows),
+            // Expired (links live ≤ 15 minutes): ask for a fresh one, once.
+            Err((Some(400 | 403 | 404), _)) if !statement_id.is_empty() => {
+                let fresh = self
+                    .request(reqwest::Method::GET, format!("{}/{statement_id}/result/chunks/{}", self.base, link.chunk_index), None)
+                    .await?;
+                let link = first_link(&fresh).ok_or_else(|| ConnectorError::internal("result chunk has no download link"))?;
+                self.fetch_chunk(&link.url).await.map_err(|(_, e)| e)
+            }
+            Err((_, e)) => Err(e),
+        }
+    }
+
+    /// GET a presigned URL; the error carries the HTTP status when there was one.
+    async fn fetch_chunk(&self, url: &str) -> std::result::Result<Vec<serde_json::Value>, (Option<u16>, ConnectorError)> {
+        let fail = |e: reqwest::Error| (None, ConnectorError::connection(format!("result download failed: {}", redact_url(&e.to_string()))));
+        let resp = self.http.get(url).send().await.map_err(fail)?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err((Some(status.as_u16()), ConnectorError::connection(format!("result download failed: HTTP {status}"))));
+        }
+        let bytes = resp.bytes().await.map_err(fail)?;
+        serde_json::from_slice(&bytes).map_err(|e| (None, ConnectorError::internal(format!("unexpected result chunk: {e}"))))
     }
 
     async fn apply_use(&self, sql: &str) {
@@ -304,6 +407,73 @@ impl Inner {
             *self.schema.lock().await = Some(t);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    Inline,
+    ExternalLinks,
+}
+
+impl Disposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Disposition::Inline => "INLINE",
+            Disposition::ExternalLinks => "EXTERNAL_LINKS",
+        }
+    }
+}
+
+/// Why a streamed statement failed: external links could not be used
+/// (retry inline), or anything else.
+enum StreamFail {
+    Links(ConnectorError),
+    Other(ConnectorError),
+}
+
+impl StreamFail {
+    fn into_inner(self) -> ConnectorError {
+        match self {
+            StreamFail::Links(e) | StreamFail::Other(e) => e,
+        }
+    }
+}
+
+struct ChunkLink {
+    url: String,
+    chunk_index: u64,
+}
+
+/// First external link of a result chunk (EXTERNAL_LINKS disposition).
+fn first_link(chunk: &serde_json::Value) -> Option<ChunkLink> {
+    let l = chunk.pointer("/external_links/0")?;
+    Some(ChunkLink { url: l["external_link"].as_str()?.to_string(), chunk_index: l["chunk_index"].as_u64().unwrap_or(0) })
+}
+
+/// Server errors that mean EXTERNAL_LINKS is not available for this workspace.
+fn mentions_links(msg: &str) -> bool {
+    if is_inline_limit(msg) {
+        return false;
+    }
+    let m = msg.to_ascii_lowercase();
+    m.contains("external_links") || m.contains("external links") || m.contains("disposition")
+}
+
+/// "Inline byte limit exceeded" (INLINE results are capped at 25 MiB).
+fn is_inline_limit(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("inline byte limit") || (m.contains("inline") && m.contains("limit") && m.contains("external"))
+}
+
+/// Drop query strings from URLs in error text (presigned URLs carry credentials).
+fn redact_url(s: &str) -> String {
+    s.split_whitespace()
+        .map(|w| match w.find('?') {
+            Some(i) if w.contains("://") => format!("{}?…", &w[..i]),
+            _ => w.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn split_schema(path: &str) -> Result<(&str, &str)> {
@@ -665,5 +835,177 @@ mod tests {
         let r = s.execute("SELECT 1 AS a, 'x' AS b, current_timestamp() AS c", ExecOptions::default()).await.unwrap().collect().await.unwrap();
         assert_eq!(r.num_rows(), 1);
         assert!(!s.list_schemas().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn classifies_link_errors() {
+        let inline = "Inline byte limit exceeded. Statements executed with disposition=INLINE can have a result size of at most 26214400 bytes. Please execute the Statement with disposition EXTERNAL_LINKS";
+        assert!(is_inline_limit(inline));
+        assert!(!mentions_links(inline), "the inline-limit error must not trigger the inline fallback");
+        assert!(mentions_links("EXTERNAL_LINKS disposition is disabled for this workspace"));
+        assert_eq!(redact_url("error sending request for url (https://s3.x/a/b?X-Amz-Signature=secret)"), "error sending request for url (https://s3.x/a/b?…");
+        let c = json!({"external_links": [{"external_link": "https://x/y", "chunk_index": 3}]});
+        let l = first_link(&c).unwrap();
+        assert_eq!((l.url.as_str(), l.chunk_index), ("https://x/y", 3));
+        assert!(first_link(&json!({"data_array": []})).is_none());
+    }
+
+    /// Fake Databricks + cloud storage on localhost.
+    mod mock {
+        use super::*;
+        use std::sync::Mutex as StdMutex;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Default)]
+        pub struct Log {
+            pub requests: Vec<(String, String, bool, String)>, // method, path, had auth header, body
+        }
+
+        /// `blob_mode`: "ok", "expire_once" (first blob GET → 403), "blocked" (every blob GET → 403).
+        pub async fn serve(blob_mode: &'static str) -> (String, Arc<StdMutex<Log>>) {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", l.local_addr().unwrap());
+            let log = Arc::new(StdMutex::new(Log::default()));
+            let (o, lg) = (origin.clone(), log.clone());
+            let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = l.accept().await else { break };
+                    let (o, lg, expired) = (o.clone(), lg.clone(), expired.clone());
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 8192];
+                        // Read headers, then the body by Content-Length.
+                        let (head, body) = loop {
+                            let n = sock.read(&mut tmp).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&buf[..i]).to_string();
+                                let len = head.lines().find_map(|h| h.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                                while buf.len() < i + 4 + len {
+                                    let n = sock.read(&mut tmp).await.unwrap_or(0);
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    buf.extend_from_slice(&tmp[..n]);
+                                }
+                                break (head, String::from_utf8_lossy(&buf[i + 4..]).to_string());
+                            }
+                        };
+                        let mut first = head.lines().next().unwrap_or("").split_whitespace();
+                        let (method, path) = (first.next().unwrap_or("").to_string(), first.next().unwrap_or("").to_string());
+                        let auth = head.to_ascii_lowercase().contains("\r\nauthorization:");
+                        lg.lock().unwrap().requests.push((method.clone(), path.clone(), auth, body.clone()));
+                        let cols = json!({"columns": [{"name": "n", "type_name": "LONG", "type_text": "BIGINT"}, {"name": "s", "type_name": "STRING", "type_text": "STRING"}]});
+                        let link = |i: u32, next: bool| {
+                            let mut e = json!({"chunk_index": i, "external_link": format!("{o}/blob/{i}?sig=secret"), "row_count": 2});
+                            if next {
+                                e["next_chunk_internal_link"] = json!(format!("/api/2.0/sql/statements/st1/result/chunks/{}", i + 1));
+                            }
+                            json!({"external_links": [e]})
+                        };
+                        let (status, out) = if method == "POST" && path == "/api/2.0/sql/statements" {
+                            let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                            if v["disposition"] == "INLINE" {
+                                (200, json!({"statement_id": "st2", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols}, "result": {"data_array": [["7", "inline"]]}}))
+                            } else {
+                                (200, json!({"statement_id": "st1", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols}, "result": link(0, true)}))
+                            }
+                        } else if path == "/api/2.0/sql/statements/st1/result/chunks/1" {
+                            (200, link(1, false))
+                        } else if path == "/api/2.0/sql/statements/st1/result/chunks/0" {
+                            (200, link(0, true))
+                        } else if let Some(rest) = path.strip_prefix("/blob/") {
+                            let i: u32 = rest.split('?').next().unwrap().parse().unwrap();
+                            let deny = blob_mode == "blocked" || (blob_mode == "expire_once" && !expired.swap(true, std::sync::atomic::Ordering::SeqCst));
+                            if deny {
+                                (403, json!({"error": "expired"}))
+                            } else {
+                                (200, json!([[format!("{}", i * 2), format!("r{}", i * 2)], [format!("{}", i * 2 + 1), null]]))
+                            }
+                        } else {
+                            (404, json!({"message": "not found"}))
+                        };
+                        let text = out.to_string();
+                        let resp = format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{text}", text.len());
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    });
+                }
+            });
+            (origin, log)
+        }
+
+        pub fn session(origin: &str, inline_only: bool) -> DbxSession {
+            use databrain_auth::InlineCredentialSource;
+            DbxSession(Arc::new(Inner {
+                base: format!("{origin}/api/2.0/sql/statements"),
+                origin: origin.to_string(),
+                warehouse: "w1".into(),
+                creds: Arc::new(InlineCredentialSource::new(AuthMethod::ApiToken { user: None }, Some("tok".to_string().into()))),
+                http: http(),
+                catalog: Mutex::new(None),
+                schema: Mutex::new(None),
+                inline_only,
+            }))
+        }
+    }
+
+    fn texts(r: &databrain_connector_core::Collected) -> Vec<String> {
+        use databrain_connector_core::arrow::util::display::{ArrayFormatter, FormatOptions};
+        let mut out = vec![];
+        for b in &r.batches {
+            let f = ArrayFormatter::try_new(b.column(1).as_ref(), &FormatOptions::default().with_null("NULL")).unwrap();
+            for i in 0..b.num_rows() {
+                out.push(f.value(i).to_string());
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn large_results_use_external_links() {
+        let (origin, log) = mock::serve("ok").await;
+        let s = mock::session(&origin, false);
+        let opts = ExecOptions { max_rows: Some(1001), ..Default::default() };
+        let r = s.execute("SELECT * FROM big", opts).await.unwrap().collect().await.unwrap();
+        assert_eq!(r.num_rows(), 4, "two chunks of two rows");
+        assert_eq!(texts(&r), vec!["r0", "NULL", "r2", "NULL"]);
+        let log = log.lock().unwrap();
+        let post: serde_json::Value = serde_json::from_str(&log.requests[0].3).unwrap();
+        assert_eq!(post["disposition"], "EXTERNAL_LINKS");
+        assert_eq!(post["row_limit"], 1001, "row cap passed to the server");
+        for (m, p, auth, _) in &log.requests {
+            if p.starts_with("/blob/") {
+                assert!(!auth, "presigned download must not carry the token: {m} {p}");
+            } else {
+                assert!(auth, "API call without token: {m} {p}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_link_is_renewed() {
+        let (origin, log) = mock::serve("expire_once").await;
+        let s = mock::session(&origin, false);
+        let r = s.execute("SELECT * FROM big", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        assert_eq!(r.num_rows(), 4);
+        assert!(log.lock().unwrap().requests.iter().any(|(_, p, _, _)| p == "/api/2.0/sql/statements/st1/result/chunks/0"), "fresh link requested");
+    }
+
+    #[tokio::test]
+    async fn blocked_storage_falls_back_to_inline() {
+        let (origin, _) = mock::serve("blocked").await;
+        let s = mock::session(&origin, false);
+        let r = s.execute("SELECT * FROM big", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        assert_eq!(texts(&r), vec!["inline"]);
+        assert!(r.notices.iter().any(|n| n.contains("inline")), "{:?}", r.notices);
+        // Inline-only connections never try links.
+        let (origin, log) = mock::serve("ok").await;
+        let r = mock::session(&origin, true).execute("SELECT 1", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        assert_eq!(texts(&r), vec!["inline"]);
+        assert!(log.lock().unwrap().requests.iter().all(|(_, p, _, _)| !p.starts_with("/blob/")));
     }
 }

@@ -508,6 +508,17 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
                       </div>
                     </div>
                   );
+                if (f.key === "result_transfer")
+                  return (
+                    <div key={f.key}>
+                      <Label htmlFor={id}>{f.label}</Label>
+                      <select id={id} className="field" value={values.result_transfer === "inline" ? "inline" : ""} onChange={(e) => setValue("result_transfer", e.target.value)}>
+                        <option value="">Auto (large results from cloud storage)</option>
+                        <option value="inline">Inline only (25 MiB limit)</option>
+                      </select>
+                      {f.help && <p className="mt-1 text-[11.5px] text-muted">{f.help}</p>}
+                    </div>
+                  );
                 if (f.key === "excel_sheets")
                   return (
                     <div key={f.key} className="col-span-2">

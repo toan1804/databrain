@@ -1063,7 +1063,7 @@ mod tests {
     async fn batches_and_cancel() {
         let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
         let r = s
-            .execute("select * from range(5000)", ExecOptions { batch_size: 1000, cancel: Default::default() })
+            .execute("select * from range(5000)", ExecOptions { batch_size: 1000, ..Default::default() })
             .await
             .unwrap()
             .collect()
@@ -1073,7 +1073,7 @@ mod tests {
         assert!(r.batches.iter().all(|b| b.num_rows() <= 1000));
         let cancel = databrain_connector_core::CancellationToken::new();
         let st = s
-            .execute("select count(*) from range(10000000000) a, range(1000) b", ExecOptions { batch_size: 10, cancel: cancel.clone() })
+            .execute("select count(*) from range(10000000000) a, range(1000) b", ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() })
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

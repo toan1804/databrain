@@ -678,7 +678,7 @@ mod tests {
         assert!(!s.list_schemas().await.unwrap().is_empty());
         let cancel = databrain_connector_core::CancellationToken::new();
         let st = s
-            .execute("waitfor delay '00:00:30'", ExecOptions { batch_size: 10, cancel: cancel.clone() })
+            .execute("waitfor delay '00:00:30'", ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() })
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;

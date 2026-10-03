@@ -14,6 +14,10 @@ pub struct ExecOptions {
     /// Cancelled by the query engine when the user presses Stop or the row
     /// cap is reached. Connectors must stop producing and cancel server-side.
     pub cancel: CancellationToken,
+    /// Most rows the caller will keep (row cap + 1 to detect truncation).
+    /// A hint: connectors whose server can limit the result (Databricks
+    /// `row_limit`) pass it on so less data is produced and transferred.
+    pub max_rows: Option<usize>,
 }
 
 impl Default for ExecOptions {
@@ -21,6 +25,7 @@ impl Default for ExecOptions {
         Self {
             batch_size: 1000,
             cancel: CancellationToken::new(),
+            max_rows: None,
         }
     }
 }
