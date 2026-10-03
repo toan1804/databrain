@@ -176,6 +176,13 @@ export interface ColumnInfo {
   comment?: string;
 }
 
+export interface ExcelSheet {
+  name: string;
+  /** Used range, e.g. `A1:G120`; absent for an empty sheet. */
+  range?: string;
+  hidden: boolean;
+}
+
 export interface IndexInfo {
   name: string;
   columns: string[];

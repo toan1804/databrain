@@ -148,9 +148,16 @@ async fn delete_notebook(state: State<'_, AppState>, id: String) -> R<()> {
     api::delete_notebook(&state, &id)
 }
 #[tauri::command]
-async fn file_scan_sql(path: String) -> R<String> {
+async fn file_scan_sql(path: String, all_sheets: Option<bool>) -> R<String> {
     #[cfg(feature = "duckdb")]
-    return api::file_scan_sql(&path);
+    return api::file_scan_sql(&path, all_sheets.unwrap_or(false));
+    #[cfg(not(feature = "duckdb"))]
+    Err(databrain_query_engine::EngineError::new("invalid", format!("DuckDB support is not built in ({path})")))
+}
+#[tauri::command]
+async fn excel_sheets(path: String) -> R<Vec<api::ExcelSheet>> {
+    #[cfg(feature = "duckdb")]
+    return api::excel_sheets(&path);
     #[cfg(not(feature = "duckdb"))]
     Err(databrain_query_engine::EngineError::new("invalid", format!("DuckDB support is not built in ({path})")))
 }
@@ -640,6 +647,7 @@ pub fn run() {
             save_notebook,
             delete_notebook,
             file_scan_sql,
+            excel_sheets,
             sign_in,
             sign_out,
             auth_status,

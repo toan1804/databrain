@@ -9,6 +9,7 @@ import { SaveQueryDialog } from "./components/SaveQueryDialog";
 import { CommandPalette } from "./components/CommandPalette";
 import { ConfirmDialog, Toasts } from "./components/ui";
 import { AiPanel } from "./components/AiPanel";
+import { ExcelSheetDialog } from "./components/ExcelSheetDialog";
 import { SplitHandle } from "./components/SplitHandle";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { SignInDialog } from "./components/SignInDialog";
@@ -192,6 +193,7 @@ export default function App() {
       <OracleClientDialog />
       <InlineAi />
       <ConfirmDialog />
+      <ExcelSheetDialog />
       <Toasts />
     </div>
   );

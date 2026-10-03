@@ -284,13 +284,60 @@ async fn query_local_file_suggestions_run() {
     let st = state();
     let id = add_connection(&st, "scratch", ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None));
     for (file, rows) in [("customers.csv", 250), ("products.csv", 18), ("orders.parquet", 1000), ("order_items.parquet", 1000), ("orders_by_year", 1000)] {
-        let sql = api::file_scan_sql(&data(file)).unwrap();
+        let sql = api::file_scan_sql(&data(file), false).unwrap();
         let r = query(&st, &id, &sql).await;
         assert_eq!(r.len(), rows, "{file}: {sql}");
     }
     // Direct glob over the partition folder, without attaching anything.
     let glob = format!("SELECT count(*) FROM '{}/*/*.parquet'", data("orders_by_year"));
     assert_eq!(cell(&query(&st, &id, &glob).await, 0, 0), "3000");
+}
+
+/// Excel workbook with several sheets and a blank header cell: first sheet by
+/// default, every sheet on request, all columns read.
+#[tokio::test]
+async fn query_local_excel_sheets() {
+    let ext = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/duckdb-extensions");
+    if ext.is_dir() {
+        databrain_connector_duckdb::set_extension_dir(Some(ext.to_string_lossy().into_owned()));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("book.xlsx");
+    let mut wb = rust_xlsxwriter::Workbook::new();
+    let a = wb.add_worksheet().set_name("Orders").unwrap();
+    a.write_string(0, 0, "id").unwrap();
+    a.write_string(0, 2, "total").unwrap(); // B1 blank
+    for r in 1..=3u32 {
+        a.write_number(r, 0, r as f64).unwrap();
+        a.write_string(r, 1, "note").unwrap();
+        a.write_number(r, 2, 10.0 * r as f64).unwrap();
+    }
+    let b = wb.add_worksheet().set_name("Customers").unwrap();
+    b.write_string(0, 0, "name").unwrap();
+    b.write_string(1, 0, "Ann").unwrap();
+    wb.save(&p).unwrap();
+    let path = p.to_string_lossy().to_string();
+
+    let sheets = api::excel_sheets(&path).unwrap();
+    assert_eq!(sheets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["Orders", "Customers"]);
+
+    let st = state();
+    let id = add_connection(&st, "scratch", ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None));
+    let first = api::file_scan_sql(&path, false).unwrap();
+    assert!(!first.contains("Customers"), "{first}");
+    let out = run_named(&st, &id, "x1", &first, None, None).await;
+    assert_eq!(out.len(), 1);
+    let res = out[0].result.as_ref().unwrap_or_else(|| panic!("{:?}", out[0].error));
+    assert_eq!(res.total_rows, 3);
+    let cols: Vec<&str> = res.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(cols, vec!["id", "column_B", "total"], "{first}");
+
+    let all = api::file_scan_sql(&path, true).unwrap();
+    assert!(all.contains("-- Sheet: Orders") && all.contains("-- Sheet: Customers"), "{all}");
+    let out = run_named(&st, &id, "x2", &all, None, None).await;
+    assert_eq!(out.len(), 2, "one result per sheet");
+    assert!(out.iter().all(|o| o.error.is_none()), "{out:?}");
+    assert_eq!(out[1].result.as_ref().unwrap().total_rows, 1);
 }
 
 // ------------------------------------------------------------------ export round trip

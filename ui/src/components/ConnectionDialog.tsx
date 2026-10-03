@@ -508,6 +508,17 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
                       </div>
                     </div>
                   );
+                if (f.key === "excel_sheets")
+                  return (
+                    <div key={f.key} className="col-span-2">
+                      <Check
+                        checked={values.excel_sheets === "all"}
+                        onChange={(v) => setValue("excel_sheets", v ? "all" : "")}
+                        label="Read every sheet of Excel files"
+                        help="Off: each .xlsx becomes one view of its first sheet. On: one view per sheet with data (the first keeps the file's name, others are <file>_<sheet>)."
+                      />
+                    </div>
+                  );
                 if (f.key === "trust_cert")
                   return (
                     <div key={f.key} className="col-span-2">

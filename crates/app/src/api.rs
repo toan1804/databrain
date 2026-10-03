@@ -798,11 +798,45 @@ pub fn delete_notebook(state: &AppState, id: &str) -> Result<()> {
 
 /// DuckDB SQL that reads a local file or folder (CSV, Parquet, JSON, Excel,
 /// Delta, Iceberg), e.g. `SELECT * FROM read_parquet('/x/a.parquet')`.
+/// Excel: the first sheet, or one statement per non-empty sheet with `all_sheets`.
 #[cfg(feature = "duckdb")]
-pub fn file_scan_sql(path: &str) -> Result<String> {
-    let fmt = databrain_connector_duckdb::detect_format(path)
+pub fn file_scan_sql(path: &str, all_sheets: bool) -> Result<String> {
+    use databrain_connector_duckdb::{FileFormat, detect_format, excel_sources, file_scan_expr};
+    let fmt = detect_format(path)
         .ok_or_else(|| EngineError::new("invalid", "unsupported file type (use .csv/.tsv/.parquet/.json/.ndjson/.xlsx or a Delta/Iceberg folder)"))?;
-    Ok(format!("SELECT *\nFROM {}\nLIMIT 1000;", databrain_connector_duckdb::file_scan_expr(path, fmt)))
+    if fmt == FileFormat::Excel {
+        let srcs = excel_sources(path, all_sheets).map_err(|e| EngineError::new("invalid", e.to_string()))?;
+        if srcs.is_empty() {
+            return Err(EngineError::new("invalid", "every sheet in this workbook is empty"));
+        }
+        let many = srcs.len() > 1;
+        return Ok(srcs
+            .into_iter()
+            .map(|(sheet, src)| {
+                let label = if many { format!("-- Sheet: {sheet}\n") } else { String::new() };
+                format!("{label}SELECT *\nFROM {src}\nLIMIT 1000;")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"));
+    }
+    Ok(format!("SELECT *\nFROM {}\nLIMIT 1000;", file_scan_expr(path, fmt)))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExcelSheet {
+    pub name: String,
+    pub range: Option<String>,
+    pub hidden: bool,
+}
+
+/// Sheets of an .xlsx file (workbook order) with their used ranges.
+#[cfg(feature = "duckdb")]
+pub fn excel_sheets(path: &str) -> Result<Vec<ExcelSheet>> {
+    Ok(databrain_connector_duckdb::xlsx::sheets(path)
+        .map_err(|e| EngineError::new("invalid", e))?
+        .into_iter()
+        .map(|s| ExcelSheet { name: s.name, range: s.range, hidden: s.hidden })
+        .collect())
 }
 
 pub fn load_tabs(state: &AppState) -> Result<Vec<TabState>> {
@@ -1181,8 +1215,8 @@ mod tests {
         assert_eq!(st.workspace.get_connection(&saved.id).unwrap().folder_id, Some(f.id));
         #[cfg(feature = "duckdb")]
         {
-            assert_eq!(file_scan_sql("/d/x.csv").unwrap(), "SELECT *\nFROM read_csv('/d/x.csv')\nLIMIT 1000;");
-            assert!(file_scan_sql("/d/x.exe").is_err());
+            assert_eq!(file_scan_sql("/d/x.csv", false).unwrap(), "SELECT *\nFROM read_csv('/d/x.csv')\nLIMIT 1000;");
+            assert!(file_scan_sql("/d/x.exe", false).is_err());
         }
 
         // Editing without a secret keeps it; clearing removes it.

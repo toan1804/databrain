@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  ExcelSheet,
   TableLayout,
   AgentEvent,
   AgentRequest,
@@ -157,7 +158,8 @@ export const api = {
   getNotebook: (id: string) => call<Notebook>("get_notebook", { id }),
   saveNotebook: (notebook: Notebook) => call<Notebook>("save_notebook", { notebook }),
   deleteNotebook: (id: string) => call<void>("delete_notebook", { id }),
-  fileScanSql: (path: string) => call<string>("file_scan_sql", { path }),
+  fileScanSql: (path: string, allSheets = false) => call<string>("file_scan_sql", { path, allSheets }),
+  excelSheets: (path: string) => call<ExcelSheet[]>("excel_sheets", { path }),
 
   listOutputs: () => call<OutputInfo[]>("list_outputs"),
   getOutput: (reference: string) => call<OutputInfo>("get_output", { reference }),

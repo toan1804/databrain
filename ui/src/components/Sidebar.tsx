@@ -45,6 +45,7 @@ import { useAi } from "../aiStore";
 import { DEFAULT_POLICY } from "./ConnectionDialog";
 import { FolderTree, MoveToFolderItems, createFolder, dragProps } from "./FolderTree";
 import { OutputsPanel } from "./OutputsPanel";
+import { askExcelSheets } from "./ExcelSheetDialog";
 import { openOutput } from "../outputs";
 import { useStore, type SidebarPanel } from "../store";
 import { editorBridge } from "../editorBridge";
@@ -145,7 +146,17 @@ export async function queryLocalFile() {
   });
   if (typeof picked !== "string") return;
   try {
-    const sql = await api.fileScanSql(picked);
+    // Workbooks with several sheets: first sheet (default) or all of them.
+    let allSheets = false;
+    if (/\.xlsx$/i.test(picked)) {
+      const sheets = await api.excelSheets(picked);
+      if (sheets.filter((s) => s.range).length > 1) {
+        const pick = await askExcelSheets(picked, sheets);
+        if (pick === null) return;
+        allSheets = pick;
+      }
+    }
+    const sql = await api.fileScanSql(picked, allSheets);
     let conn = st.connections.find((c) => c.config.kind === "duckdb" && !c.config.file_path);
     if (!conn) {
       const saved = await api.saveConnection({

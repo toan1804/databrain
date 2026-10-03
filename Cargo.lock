@@ -1735,6 +1735,7 @@ dependencies = [
  "dirs 7.0.0",
  "openssl",
  "parking_lot",
+ "rust_xlsxwriter",
  "secrecy",
  "serde",
  "serde_json",
@@ -1821,6 +1822,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "zip 7.2.0",
 ]
 
 [[package]]
