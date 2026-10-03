@@ -798,7 +798,7 @@ pub fn delete_notebook(state: &AppState, id: &str) -> Result<()> {
 pub fn file_scan_sql(path: &str) -> Result<String> {
     let fmt = databrain_connector_duckdb::detect_format(path)
         .ok_or_else(|| EngineError::new("invalid", "unsupported file type (use .csv/.tsv/.parquet/.json/.ndjson/.xlsx or a Delta/Iceberg folder)"))?;
-    Ok(format!("SELECT *\nFROM {}\nLIMIT 1000;", databrain_connector_duckdb::scan_expr(path, fmt)))
+    Ok(format!("SELECT *\nFROM {}\nLIMIT 1000;", databrain_connector_duckdb::file_scan_expr(path, fmt)))
 }
 
 pub fn load_tabs(state: &AppState) -> Result<Vec<TabState>> {

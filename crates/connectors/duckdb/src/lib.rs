@@ -91,6 +91,103 @@ pub fn scan_expr(path: &str, format: FileFormat) -> String {
     }
 }
 
+/// Like [`scan_expr`], but Excel column types are checked against every row
+/// (see [`excel_scan`]). Opens a private in-memory DuckDB for the check.
+pub fn file_scan_expr(path: &str, format: FileFormat) -> String {
+    if format != FileFormat::Excel {
+        return scan_expr(path, format);
+    }
+    let Ok(conn) = duckdb::Connection::open_in_memory() else { return scan_expr(path, format) };
+    if let Some(dir) = extension_dir() {
+        let _ = conn.execute_batch(&format!("SET extension_directory = {}", quote_literal(&dir)));
+    }
+    load_extension(&conn, "excel");
+    excel_scan(&conn, path)
+}
+
+/// Read an .xlsx file with column types that fit every row.
+///
+/// DuckDB's `read_xlsx` takes each column's type from the first data row, so
+/// a column that starts with a number (or an empty cell) becomes DOUBLE and
+/// fails later on text such as `A-12` (or turns `0042` into 42). This checks
+/// each typed column over the whole sheet and reads the columns that do not
+/// fit as text. When every column fits, plain `read_xlsx(path)` is returned.
+pub fn excel_scan(conn: &duckdb::Connection, path: &str) -> String {
+    let lit = quote_literal(path);
+    let plain = format!("read_xlsx({lit})");
+    let text = format!("read_xlsx({lit}, all_varchar = true)");
+    let describe = |src: &str| -> Option<Vec<(String, String)>> {
+        let mut st = conn.prepare(&format!("DESCRIBE SELECT * FROM {src}")).ok()?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).ok()?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().ok()
+    };
+    let Some(typed) = describe(&plain) else { return plain };
+    let Some(texts) = describe(&text) else { return plain };
+    if typed.iter().map(|c| &c.0).ne(texts.iter().map(|c| &c.0)) {
+        // Header detection differed: text for everything is the safe choice.
+        return text;
+    }
+    let qi = |n: &str| quote_ident(ConnectorKind::Duckdb, n);
+    // Cells (as text) that do not fit the inferred type. Number, date and
+    // time cells come through as numbers (dates as Excel serial numbers).
+    let misfit = |name: &str, ty: &str| -> Option<String> {
+        let v = qi(name);
+        let present = format!("{v} IS NOT NULL AND trim({v}) <> ''");
+        match ty {
+            "VARCHAR" => None,
+            "BOOLEAN" => Some(format!("{present} AND lower(trim({v})) NOT IN ('true', 'false', '1', '0')")),
+            // Leading zeros (`0042`) mean an identifier stored as text.
+            _ => Some(format!("{present} AND (TRY_CAST({v} AS DOUBLE) IS NULL OR regexp_matches(trim({v}), '^[+-]?0[0-9]'))")),
+        }
+    };
+    let checks: Vec<(usize, String)> = typed.iter().enumerate().filter_map(|(i, (n, t))| misfit(n, t).map(|w| (i, w))).collect();
+    if checks.is_empty() {
+        return plain;
+    }
+    let agg = checks.iter().map(|(_, w)| format!("count(*) FILTER (WHERE {w})")).collect::<Vec<_>>().join(", ");
+    let bad: Vec<bool> = match conn.prepare(&format!("SELECT {agg} FROM {text}")).and_then(|mut st| {
+        st.query_row([], |r| (0..checks.len()).map(|i| r.get::<_, i64>(i).map(|n| n > 0)).collect::<std::result::Result<Vec<_>, _>>())
+    }) {
+        Ok(b) => b,
+        Err(_) => return plain,
+    };
+    if !bad.contains(&true) {
+        return plain;
+    }
+    let mut to_text = vec![false; typed.len()];
+    for ((i, _), b) in checks.iter().zip(bad) {
+        to_text[*i] = b;
+    }
+    // Read everything as text once and convert the columns that fit.
+    let cols = typed
+        .iter()
+        .zip(to_text)
+        .map(|((n, t), as_text)| {
+            let v = qi(n);
+            let num = format!("TRY_CAST({v} AS DOUBLE)");
+            // Excel serial numbers count days from 1899-12-30.
+            let expr = match t.as_str() {
+                // Mixed date column: show date cells as dates, keep the text.
+                "DATE" if as_text => format!("coalesce(strftime(DATE '1899-12-30' + CAST(floor({num}) AS INTEGER), '%Y-%m-%d'), {v})"),
+                "TIMESTAMP" if as_text => format!(
+                    "coalesce(strftime(TIMESTAMP '1899-12-30' + to_microseconds(CAST(round({num} * 86400000000) AS BIGINT)), '%Y-%m-%d %H:%M:%S'), {v})"
+                ),
+                _ if as_text => return v,
+                "VARCHAR" => return v,
+                "BOOLEAN" => format!("CASE lower(trim({v})) WHEN 'true' THEN true WHEN '1' THEN true WHEN 'false' THEN false WHEN '0' THEN false END"),
+                "DATE" => format!("(DATE '1899-12-30' + CAST(floor({num}) AS INTEGER))"),
+                "TIMESTAMP" => format!("(TIMESTAMP '1899-12-30' + to_microseconds(CAST(round({num} * 86400000000) AS BIGINT)))"),
+                "TIME" => format!("CAST(TIMESTAMP '1899-12-30' + to_microseconds(CAST(round(({num} - floor({num})) * 86400000000) AS BIGINT)) AS TIME)"),
+                "DOUBLE" => num,
+                other => format!("TRY_CAST({v} AS {other})"),
+            };
+            format!("{expr} AS {v}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("(SELECT {cols} FROM {text})")
+}
+
 /// Folder with DuckDB extensions shipped in the app (`<dir>/v1.x.y/<platform>/*.duckdb_extension`).
 static EXTENSION_DIR: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
@@ -231,11 +328,8 @@ fn attach_files(conn: &duckdb::Connection, files: &[String]) -> Result<()> {
         }
         let name = view_name(f, &taken);
         taken.push(name.clone());
-        let sql = format!(
-            "CREATE OR REPLACE VIEW files.{} AS SELECT * FROM {}",
-            quote_ident(ConnectorKind::Duckdb, &name),
-            scan_expr(f, fmt)
-        );
+        let src = if fmt == FileFormat::Excel { excel_scan(conn, f) } else { scan_expr(f, fmt) };
+        let sql = format!("CREATE OR REPLACE VIEW files.{} AS SELECT * FROM {src}", quote_ident(ConnectorKind::Duckdb, &name));
         if let Err(e) = conn.execute_batch(&sql) {
             return Err(ConnectorError::new(ErrorKind::Config, format!("cannot read {f}: {e}")));
         }
@@ -937,5 +1031,99 @@ mod bundled_extensions {
             .query_row("select install_path from duckdb_extensions() where extension_name = 'excel' and loaded", [], |r| r.get(0))
             .unwrap();
         assert!(path.starts_with(&*dir.to_string_lossy()), "{path}");
+    }
+}
+
+#[cfg(test)]
+mod excel_types {
+    use super::*;
+    use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
+
+    /// Sheet whose first data row suggests numbers/dates for columns that
+    /// hold text further down.
+    fn mixed_sheet(path: &std::path::Path) {
+        let mut wb = Workbook::new();
+        let ws = wb.add_worksheet();
+        let date = Format::new().set_num_format("yyyy-mm-dd");
+        for (c, h) in ["id", "code", "name", "when", "amount", "day"].iter().enumerate() {
+            ws.write_string(0, c as u16, *h).unwrap();
+        }
+        let d = |n: u8| ExcelDateTime::from_ymd(2023, 3, n).unwrap();
+        ws.write_number(1, 0, 1).unwrap();
+        ws.write_number(1, 1, 100).unwrap();
+        ws.write_number(1, 4, 1.5).unwrap();
+        ws.write_datetime_with_format(1, 3, d(15), &date).unwrap();
+        ws.write_datetime_with_format(1, 5, d(15), &date).unwrap();
+        ws.write_number(2, 0, 2).unwrap();
+        ws.write_string(2, 1, "A-12").unwrap();
+        ws.write_string(2, 2, "Bob").unwrap();
+        ws.write_string(2, 3, "n/a").unwrap();
+        ws.write_number(2, 4, 2).unwrap();
+        ws.write_datetime_with_format(2, 5, d(16), &date).unwrap();
+        ws.write_number(3, 0, 3).unwrap();
+        ws.write_string(3, 1, "0042").unwrap();
+        ws.write_string(3, 2, "Ann").unwrap();
+        ws.write_datetime_with_format(3, 3, d(17), &date).unwrap();
+        ws.write_number(3, 4, 3.25).unwrap();
+        ws.write_datetime_with_format(3, 5, d(17), &date).unwrap();
+        wb.save(path).unwrap();
+    }
+
+    fn conn() -> Option<duckdb::Connection> {
+        let c = duckdb::Connection::open_in_memory().unwrap();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/resources/duckdb-extensions");
+        if dir.is_dir() {
+            c.execute_batch(&format!("SET extension_directory = {}", quote_literal(&dir.to_string_lossy()))).unwrap();
+        }
+        load_extension(&c, "excel");
+        c.execute_batch("SELECT excel_text(1, '0')").ok().map(|_| c)
+    }
+
+    #[test]
+    fn mixed_columns_are_read_as_text() {
+        let Some(c) = conn() else { return eprintln!("skipped: excel extension unavailable") };
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("mixed.xlsx");
+        mixed_sheet(&p);
+        let path = p.to_string_lossy().to_string();
+        // DuckDB's own inference (first row only) fails on this sheet.
+        let plain = c.prepare(&format!("SELECT * FROM read_xlsx({})", quote_literal(&path))).and_then(|mut s| s.query_arrow([]).map(|r| r.count()));
+        assert!(plain.is_err(), "expected read_xlsx to fail on mixed columns");
+        let src = excel_scan(&c, &path);
+        let types: Vec<(String, String)> = c
+            .prepare(&format!("DESCRIBE SELECT * FROM {src}"))
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let ty = |n: &str| types.iter().find(|t| t.0 == n).map(|t| t.1.as_str()).unwrap();
+        assert_eq!(ty("id"), "DOUBLE", "{src}");
+        assert_eq!(ty("code"), "VARCHAR");
+        assert_eq!(ty("name"), "VARCHAR", "empty first cell, text below");
+        assert_eq!(ty("when"), "VARCHAR");
+        assert_eq!(ty("amount"), "DOUBLE");
+        assert_eq!(ty("day"), "DATE", "consistent dates stay dates");
+        let rows: Vec<(String, Option<String>, String, String)> = c
+            .prepare(&format!("SELECT code, name, \"when\", CAST(day AS VARCHAR) FROM {src}"))
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows[0], ("100".into(), None, "2023-03-15".into(), "2023-03-15".into()));
+        assert_eq!(rows[1].0, "A-12");
+        assert_eq!(rows[1].2, "n/a");
+        assert_eq!(rows[2].0, "0042", "leading zeros kept");
+    }
+
+    #[test]
+    fn consistent_sheet_uses_plain_read_xlsx() {
+        let Some(c) = conn() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ok.xlsx");
+        c.execute_batch(&format!("COPY (SELECT range AS n, 'x' || range AS s FROM range(5)) TO {} (FORMAT xlsx, HEADER true)", quote_literal(&p.to_string_lossy())))
+            .unwrap();
+        assert_eq!(excel_scan(&c, &p.to_string_lossy()), format!("read_xlsx({})", quote_literal(&p.to_string_lossy())));
     }
 }

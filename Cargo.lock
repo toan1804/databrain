@@ -1817,6 +1817,7 @@ dependencies = [
  "databrain-auth",
  "databrain-connector-core",
  "duckdb",
+ "rust_xlsxwriter",
  "tempfile",
  "tokio",
  "tokio-util",
