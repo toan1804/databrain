@@ -487,8 +487,8 @@ impl Session for MssqlSession {
                    (select sum(p.rows) from sys.partitions p where p.object_id = o.object_id and p.index_id in (0,1)) \
                  from sys.objects o \
                  left join sys.extended_properties ep on ep.major_id = o.object_id and ep.minor_id = 0 and ep.name = 'MS_Description' \
-                 where schema_name(o.schema_id) = @P1 and o.type in ('U','V','P','FN','IF','TF') and o.is_ms_shipped = 0 \
-                 order by case rtrim(o.type) when 'U' then 0 when 'V' then 1 else 2 end, o.name",
+                 where schema_name(o.schema_id) = @P1 and o.type in ('U','V','P','FN','IF','TF','SO') and o.is_ms_shipped = 0 \
+                 order by case rtrim(o.type) when 'U' then 0 when 'V' then 1 when 'SO' then 3 else 2 end, o.name",
                 vec![schema.into()],
             )
             .await?;
@@ -501,6 +501,7 @@ impl Session for MssqlSession {
                     "U" => ObjectKind::Table,
                     "V" => ObjectKind::View,
                     "P" => ObjectKind::Procedure,
+                    "SO" => ObjectKind::Sequence,
                     _ => ObjectKind::Function,
                 },
                 comment: r.get::<&str, _>(2).map(str::to_string),
@@ -561,7 +562,8 @@ impl Session for MssqlSession {
         let objs = self.list_objects(schema).await?;
         let object = objs
             .into_iter()
-            .find(|o| o.name == name)
+            .filter(|o| o.name == name)
+            .min_by_key(|o| !o.kind.is_relation())
             .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
         let columns: Vec<ColumnInfo> = self
             .rows(COLUMNS_SQL, vec![schema.into(), name.into()])

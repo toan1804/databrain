@@ -20,6 +20,8 @@ import {
   History,
   KeyRound,
   Layers,
+  ListChecks,
+  ListOrdered,
   Library,
   Loader2,
   MoreHorizontal,
@@ -37,7 +39,22 @@ import {
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { api, toError } from "../lib/api";
 import type { ConnectionView, DbObject, HistoryEntry, NotebookSummary, SavedQuery, SchemaInfo } from "../lib/types";
-import { columnList, groupOf, groupSchemas, schemaLabel, schemaPath, tablePath, treeKey, type CatalogGroup } from "../lib/catalog";
+import {
+  GROUP_PAGE,
+  isRelationKind,
+  columnList,
+  groupObjects,
+  groupOpenByDefault,
+  groupSchemas,
+  pageObjects,
+  schemaLabel,
+  schemaPath,
+  tablePath,
+  treeKey,
+  visibleSchemas,
+  type CatalogGroup,
+  type ObjectGroupName,
+} from "../lib/catalog";
 import { CatalogSearch, selectTop } from "./CatalogSearch";
 import { CatalogMenu, ColumnMenu, ObjectMenu, SchemaMenu, copyText, insertColumns, insertText } from "./CatalogMenus";
 import { formatCount, formatDuration, relativeTime, sqlPreview, quoteIdent } from "../lib/util";
@@ -351,7 +368,23 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
     setMenu({ x: e.clientX, y: e.clientY });
   };
 
-  const catalogs = useMemo(() => (schemas ? groupSchemas(schemas) : null), [schemas]);
+  const chosen = useStore((s) => s.schemaFilter[conn.id]);
+  // Schema of an object revealed by ⌘P search (`o|conn|schema|name`).
+  const revealed = useStore((s) => (chosen && s.treeFocus?.startsWith(`o|${conn.id}|`) ? s.treeFocus.slice(conn.id.length + 3, s.treeFocus.lastIndexOf("|")) : null));
+  // Stays listed after the highlight fades (until the schema choice changes).
+  const [sticky, setSticky] = useState<string | null>(null);
+  useEffect(() => {
+    if (revealed) setSticky(revealed);
+  }, [revealed]);
+  useEffect(() => setSticky(null), [chosen]);
+  const extra = revealed ?? sticky;
+  const shownSchemas = useMemo(() => (schemas ? visibleSchemas(schemas, chosen, extra) : undefined), [schemas, chosen, extra]);
+  const filtered = !!schemas && !!shownSchemas && shownSchemas.length < schemas.length;
+  const catalogs = useMemo(() => (shownSchemas ? groupSchemas(shownSchemas) : null), [shownSchemas]);
+  const pickSchemas = () => {
+    setMenu(null);
+    useStore.setState({ schemaPicker: conn.id });
+  };
   const interactive = ["oauth_browser", "device_code", "external_browser"].includes(conn.config.auth.method);
   return (
     <div {...dragProps("connections", conn.id)}>
@@ -407,6 +440,10 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
         <Popover x={menu.x} y={menu.y} onClose={() => setMenu(null)} className="max-h-[75vh] w-60 overflow-auto">
           <MenuItem icon={<FileCode2 size={13} />} label="New query" onClick={() => { setMenu(null); newTab({ connection_id: conn.id }); }} />
           <MenuItem icon={<Search size={13} />} label="Find table…" onClick={() => { setMenu(null); useStore.getState().openCatalogSearch(conn.id); }} />
+          <MenuItem icon={<ListChecks size={13} />} label="Choose schemas…" hint={chosen ? `${chosen.length} shown` : undefined} onClick={pickSchemas} />
+          {chosen && (
+            <MenuItem icon={<Eye size={13} />} label="Show all schemas" onClick={() => { setMenu(null); useStore.getState().setSchemaFilter(conn.id, null); }} />
+          )}
           <MenuItem icon={<RefreshCw size={13} />} label={conn.connected ? "Refresh" : "Connect"} onClick={() => { setMenu(null); setExpanded(true); void load(true); }} />
           <MenuItem icon={<NotebookPen size={13} />} label="New notebook" onClick={() => { setMenu(null); void useStore.getState().newNotebook(conn.id); }} />
           <MenuItem icon={<Pencil size={13} />} label="Edit connection" onClick={() => { setMenu(null); openDialog(conn); }} />
@@ -431,8 +468,21 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
           <MenuItem icon={<Trash2 size={13} />} label="Delete connection…" hint="⌘⌫" danger onClick={() => { setMenu(null); void useStore.getState().deleteConnection(conn.id); }} />
         </Popover>
       )}
+      {expanded && filtered && (
+        <Row
+          depth={1}
+          icon={<ListChecks size={12} className="text-accent" />}
+          label={
+            <span className="text-[11.5px] text-muted">
+              {shownSchemas!.length} of {schemas!.length} schemas · <span className="text-accent">change</span>
+            </span>
+          }
+          title="Choose which schemas are listed"
+          onClick={() => useStore.setState({ schemaPicker: conn.id })}
+        />
+      )}
       {expanded &&
-        schemas &&
+        shownSchemas &&
         (catalogs
           ? catalogs.map((g) => (
               <CatalogNode
@@ -443,8 +493,8 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
                 defaultOpen={g.isDefault || catalogs.length === 1 || (g.name === "results" && conn.config.options?.databrain_results === "1")}
               />
             ))
-          : schemas.map((s) => (
-              <SchemaNode key={s.name} conn={conn} schema={s} depth={1} defaultOpen={s.is_default || schemas.length === 1} />
+          : shownSchemas.map((s) => (
+              <SchemaNode key={s.name} conn={conn} schema={s} depth={1} defaultOpen={s.is_default || shownSchemas.length === 1} />
             )))}
       {expanded && schemas?.length === 0 && <div className="py-1 pl-10 text-[12px] text-muted">No schemas</div>}
     </div>
@@ -521,13 +571,9 @@ function SchemaNode({ conn, schema: info, depth, defaultOpen }: { conn: Connecti
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expanded]);
 
-  const groups = useMemo(() => {
-    const g: Record<string, DbObject[]> = { Tables: [], Views: [], Routines: [] };
-    for (const o of objects ?? []) g[groupOf(o.kind)].push(o);
-    return Object.entries(g).filter(([, v]) => v.length > 0);
-  }, [objects]);
-  // A single kind (e.g. only tables) is listed directly, without a group row.
-  const flat = groups.length === 1 && groups[0][0] !== "Routines";
+  const groups = useMemo(() => groupObjects(objects ?? []), [objects]);
+  // Only tables (or only views): no folder row, unless the list needs paging/filtering.
+  const flat = groups.length === 1 && groupOpenByDefault(groups[0][0]) && groups[0][1].length <= GROUP_PAGE;
 
   return (
     <div>
@@ -581,28 +627,80 @@ function SchemaNode({ conn, schema: info, depth, defaultOpen }: { conn: Connecti
   );
 }
 
-function ObjectGroup({ name, items, conn, schema, depth }: { name: string; items: DbObject[]; conn: ConnectionView; schema: string; depth: number }) {
-  const [open, setOpen] = useTreeOpen(treeKey.group(conn.id, schema, name), name !== "Routines");
+function ObjectGroup({ name, items, conn, schema, depth }: { name: ObjectGroupName; items: DbObject[]; conn: ConnectionView; schema: string; depth: number }) {
+  const [open, setOpen] = useTreeOpen(treeKey.group(conn.id, schema, name), groupOpenByDefault(name));
+  const [limit, setLimit] = useState(GROUP_PAGE);
+  const [filter, setFilter] = useState("");
+  // An object revealed by ⌘P search is rendered even past the page.
+  const focus = useStore((s) => (s.treeFocus?.startsWith(`o|${conn.id}|${schema}|`) ? s.treeFocus : null));
+  const { shown, matched } = useMemo(
+    () => pageObjects(items, filter, limit, focus ? (o) => treeKey.object(conn.id, o.schema, o.name) === focus : undefined),
+    [items, filter, limit, focus, conn.id],
+  );
+  const big = items.length > GROUP_PAGE;
+  const rest = matched - Math.min(limit, matched);
   return (
     <div>
       <Row
         depth={depth}
         expanded={open}
-        icon={null}
+        icon={groupIcon(name)}
         label={<span className="text-[11.5px] font-medium uppercase tracking-wide text-muted">{name}</span>}
-        meta={items.length}
+        meta={filter ? `${matched}/${items.length}` : items.length}
         onClick={() => setOpen(!open)}
       />
-      {open && items.map((o) => <ObjectNode key={`${o.kind}:${o.name}`} obj={o} conn={conn} depth={depth + 1} />)}
+      {open && big && (
+        <div className="py-0.5 pr-1" style={{ paddingLeft: 22 + (depth + 1) * 14 }}>
+          <input
+            className="field h-6 py-0 text-[12px]"
+            placeholder={`Filter ${items.length.toLocaleString()} ${name.toLowerCase()}…`}
+            aria-label={`Filter ${name.toLowerCase()} in ${schema}`}
+            value={filter}
+            onChange={(e) => {
+              setFilter(e.target.value);
+              setLimit(GROUP_PAGE);
+            }}
+            onKeyDown={(e) => e.key === "Escape" && setFilter("")}
+          />
+        </div>
+      )}
+      {open && shown.map((o) => <ObjectNode key={`${o.kind}:${o.name}`} obj={o} conn={conn} depth={depth + 1} />)}
+      {open && filter && matched === 0 && <div className="py-1 text-[12px] text-muted" style={{ paddingLeft: 26 + (depth + 1) * 14 }}>No match</div>}
+      {open && rest > 0 && (
+        <div className="flex items-center gap-2 py-0.5 text-[12px]" style={{ paddingLeft: 26 + (depth + 1) * 14 }}>
+          <span className="text-muted">{rest.toLocaleString()} more</span>
+          <button className="text-accent hover:underline" onClick={() => setLimit((l) => l + GROUP_PAGE * 5)}>
+            Show {Math.min(rest, GROUP_PAGE * 5).toLocaleString()} more
+          </button>
+          {rest > GROUP_PAGE * 5 && (
+            <button className="text-muted hover:text-fg hover:underline" onClick={() => setLimit(Number.MAX_SAFE_INTEGER)} title="Rendering thousands of rows can be slow">
+              Show all
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
+}
+
+function groupIcon(name: ObjectGroupName): ReactNode {
+  switch (name) {
+    case "Functions":
+    case "Procedures":
+      return <FunctionSquare size={12} />;
+    case "Sequences":
+      return <ListOrdered size={12} />;
+    default:
+      return null;
+  }
 }
 
 function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: ConnectionView; depth: number }) {
   const columns = useStore((s) => s.columns[`${conn.id}|${obj.schema}|${obj.name}`]);
   const loadColumns = useStore((s) => s.loadColumns);
-  const activeTabId = useStore((s) => s.activeTabId);
   const toast = useStore((s) => s.toast);
+  // Read at click time: subscribing every row to the active tab re-renders the whole tree on tab switches.
+  const activeTab = () => useStore.getState().activeTabId;
   const key = treeKey.object(conn.id, obj.schema, obj.name);
   const focused = useStore((s) => s.treeFocus === key);
   const ref = useRef<HTMLDivElement>(null);
@@ -610,7 +708,7 @@ function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: ConnectionView;
   const [loading, setLoading] = useState(false);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const [colMenu, setColMenu] = useState<{ x: number; y: number; column: string } | null>(null);
-  const isRelation = obj.kind !== "function" && obj.kind !== "procedure";
+  const isRelation = isRelationKind(obj.kind);
 
   // Revealed from search: scroll into view, highlight briefly.
   useEffect(() => {
@@ -645,6 +743,8 @@ function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: ConnectionView;
       <Eye size={13} />
     ) : isRelation ? (
       <Table2 size={13} />
+    ) : obj.kind === "sequence" ? (
+      <ListOrdered size={13} />
     ) : (
       <FunctionSquare size={13} />
     );
@@ -661,7 +761,7 @@ function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: ConnectionView;
         active={focused}
         meta={obj.row_estimate !== undefined && obj.row_estimate > 0 ? formatCount(obj.row_estimate) : undefined}
         onClick={toggle}
-        onDoubleClick={() => editorBridge.insert(activeTabId, quoteIdent(conn.config.kind, obj.name))}
+        onDoubleClick={() => editorBridge.insert(activeTab(), quoteIdent(conn.config.kind, obj.name))}
         onContextMenu={(e) => {
           e.preventDefault();
           setMenu({ x: e.clientX, y: e.clientY });
@@ -735,7 +835,7 @@ function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: ConnectionView;
               </span>
             }
             title={c.comment ?? "Double-click to insert"}
-            onDoubleClick={() => editorBridge.insert(activeTabId, quoteIdent(conn.config.kind, c.name))}
+            onDoubleClick={() => editorBridge.insert(activeTab(), quoteIdent(conn.config.kind, c.name))}
             onContextMenu={(e) => {
               e.preventDefault();
               setColMenu({ x: e.clientX, y: e.clientY, column: c.name });

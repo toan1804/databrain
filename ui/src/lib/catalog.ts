@@ -114,12 +114,77 @@ export function matchRange(query: string, name: string): [number, number] | null
   return i < 0 ? null : [i, i + t.length];
 }
 
-export type ObjectGroupName = "Tables" | "Views" | "Routines";
+/** Tables and views (have columns, can be selected from). */
+export function isRelationKind(kind: ObjectKind): boolean {
+  return kind === "table" || kind === "view" || kind === "materialized_view" || kind === "foreign_table";
+}
+
+/** Explorer folders under a schema, in display order. */
+export const OBJECT_GROUPS = ["Tables", "Views", "Materialized views", "Functions", "Procedures", "Sequences", "Other"] as const;
+export type ObjectGroupName = (typeof OBJECT_GROUPS)[number];
 
 export function groupOf(kind: ObjectKind): ObjectGroupName {
-  if (kind === "table" || kind === "foreign_table") return "Tables";
-  if (kind === "view" || kind === "materialized_view") return "Views";
-  return "Routines";
+  switch (kind) {
+    case "table":
+    case "foreign_table":
+      return "Tables";
+    case "view":
+      return "Views";
+    case "materialized_view":
+      return "Materialized views";
+    case "function":
+      return "Functions";
+    case "procedure":
+      return "Procedures";
+    case "sequence":
+      return "Sequences";
+    default:
+      return "Other";
+  }
+}
+
+/** Objects grouped into explorer folders (empty folders left out). */
+export function groupObjects(objects: DbObject[]): [ObjectGroupName, DbObject[]][] {
+  const g = new Map<ObjectGroupName, DbObject[]>(OBJECT_GROUPS.map((n) => [n, []]));
+  for (const o of objects) g.get(groupOf(o.kind))!.push(o);
+  return [...g].filter(([, v]) => v.length > 0);
+}
+
+/** Folders that start open: things you query. Routines and sequences start closed. */
+export function groupOpenByDefault(name: ObjectGroupName): boolean {
+  return name === "Tables" || name === "Views" || name === "Materialized views";
+}
+
+/** Rows rendered per folder before "Show more" (keeps 10k-table schemas fast). */
+export const GROUP_PAGE = 200;
+
+/**
+ * Visible slice of a folder: items matching `filter` (substring, any case),
+ * the first `limit` of them, plus `keep` (an item revealed by search) when
+ * it falls outside the slice.
+ */
+export function pageObjects(items: DbObject[], filter: string, limit: number, keep?: (o: DbObject) => boolean): { shown: DbObject[]; matched: number } {
+  const f = filter.trim().toLowerCase();
+  const matched = f ? items.filter((o) => o.name.toLowerCase().includes(f)) : items;
+  const shown = matched.slice(0, limit);
+  if (keep && !shown.some(keep)) {
+    const k = matched.find(keep) ?? items.find(keep);
+    if (k) shown.push(k);
+  }
+  return { shown, matched: matched.length };
+}
+
+// ------------------------------------------------------------------ schema filter
+
+/** Schemas to list for a connection: all, or the chosen ones (unknown names ignored). */
+export function visibleSchemas(schemas: SchemaInfo[], chosen: string[] | undefined, also?: string | null): SchemaInfo[] {
+  if (!chosen || chosen.length === 0) return schemas;
+  const set = new Set(chosen);
+  // A schema with an object revealed by search is shown even when not chosen.
+  if (also) set.add(also);
+  const out = schemas.filter((s) => set.has(s.name));
+  // Every chosen schema is gone (renamed/dropped): show all rather than nothing.
+  return out.length ? out : schemas;
 }
 
 // Tree expansion keys (kept in the store so search can reveal an object).

@@ -35,6 +35,37 @@ const loading = new Set<string>();
 
 const INTERACTIVE = ["oauth_browser", "device_code", "external_browser"];
 
+// Loaded objects of a connection, flattened and indexed by name. Rebuilt only
+// when the store's `objects` map changes (not per keystroke).
+const indexCache = new WeakMap<object, Map<string, { all: DbObject[]; byName: Map<string, DbObject[]> }>>();
+function cachedIndex(connId: string) {
+  const objects = useStore.getState().objects;
+  let perMap = indexCache.get(objects);
+  if (!perMap) {
+    perMap = new Map();
+    indexCache.set(objects, perMap);
+  }
+  let idx = perMap.get(connId);
+  if (!idx) {
+    const all: DbObject[] = [];
+    const byName = new Map<string, DbObject[]>();
+    const prefix = `${connId}|`;
+    for (const [k, v] of Object.entries(objects)) {
+      if (!k.startsWith(prefix)) continue;
+      for (const o of v) {
+        all.push(o);
+        const n = o.name.toLowerCase();
+        const list = byName.get(n);
+        if (list) list.push(o);
+        else byName.set(n, [o]);
+      }
+    }
+    idx = { all, byName };
+    perMap.set(connId, idx);
+  }
+  return idx;
+}
+
 /**
  * May completion connect on its own? Yes when already connected or when no
  * interactive sign-in (browser/device code) would pop up while typing.
@@ -77,12 +108,8 @@ export function storeProvider(connId: string): MetaProvider | null {
         return undefined;
       }
     },
-    cachedObjects: () => {
-      const all = useStore.getState().objects;
-      const out: DbObject[] = [];
-      for (const [k, v] of Object.entries(all)) if (k.startsWith(`${connId}|`)) out.push(...v);
-      return out;
-    },
+    cachedObjects: () => cachedIndex(connId).all,
+    cachedNamed: (name) => cachedIndex(connId).byName.get(name.toLowerCase()) ?? [],
     searchTables: (prefix) => {
       if (!live) return Promise.resolve([]);
       const key = `${connId}|${prefix.toLowerCase()}`;

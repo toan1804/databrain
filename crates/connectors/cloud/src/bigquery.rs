@@ -461,6 +461,26 @@ impl Session for BqSession {
                 None => break,
             }
         }
+        // Routines: UDFs, table functions and procedures (best effort).
+        let mut token: Option<String> = None;
+        for _ in 0..20 {
+            let mut url = format!("{API}/projects/{project}/datasets/{dataset}/routines?maxResults=1000");
+            if let Some(t) = &token {
+                url.push_str(&format!("&pageToken={}", urlencode(t)));
+            }
+            let Ok(r) = self.0.call(reqwest::Method::GET, url, None).await else { break };
+            for t in r["routines"].as_array().cloned().unwrap_or_default() {
+                let kind = if t["routineType"].as_str() == Some("PROCEDURE") { ObjectKind::Procedure } else { ObjectKind::Function };
+                let name = t.pointer("/routineReference/routineId").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                if !name.is_empty() {
+                    out.push(DbObject { schema: schema.to_string(), name, kind, comment: None, row_estimate: None });
+                }
+            }
+            match r["nextPageToken"].as_str() {
+                Some(t) => token = Some(t.to_string()),
+                None => break,
+            }
+        }
         Ok(out)
     }
 

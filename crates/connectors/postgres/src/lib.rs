@@ -467,8 +467,8 @@ impl Session for PgSession {
                         obj_description(c.oid, 'pg_class'), c.reltuples::float8 \
                  from pg_catalog.pg_class c \
                  join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
-                 where n.nspname = $1 and c.relkind in ('r','p','v','m','f') and not c.relispartition \
-                 order by c.relkind in ('v','m'), c.relname",
+                 where n.nspname = $1 and c.relkind in ('r','p','v','m','f','S') and not c.relispartition \
+                 order by c.relkind in ('v','m'), c.relkind = 'S', c.relname",
                 &[&schema],
             )
             .await
@@ -480,9 +480,11 @@ impl Session for PgSession {
                     "v" => ObjectKind::View,
                     "m" => ObjectKind::MaterializedView,
                     "f" => ObjectKind::ForeignTable,
+                    "S" => ObjectKind::Sequence,
                     _ => ObjectKind::Table,
                 };
                 let est: Option<f64> = r.get(3);
+                let est = est.filter(|_| kind != ObjectKind::Sequence);
                 DbObject {
                     schema: schema.to_string(),
                     name: r.get(0),

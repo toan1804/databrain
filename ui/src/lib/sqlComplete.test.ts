@@ -159,3 +159,29 @@ describe("sqlComplete: key column badges", () => {
     expect(cols.find((o) => o.label === "amount")?.detail).toBe("orders");
   });
 });
+
+describe("sqlComplete: very large catalogs", () => {
+  it("stays fast with 20k cached tables and caps the options", async () => {
+    const objs: DbObject[] = Array.from({ length: 20_000 }, (_, i) => t(`s${i % 50}`, `table_${i}`));
+    const schemas: SchemaInfo[] = Array.from({ length: 50 }, (_, i) => ({ name: `s${i}`, is_default: i === 0 }));
+    let schemaCalls = 0;
+    const p: MetaProvider = {
+      kind: "postgres",
+      schemas: () => (schemaCalls++, schemas),
+      objects: async () => objs,
+      cachedObjects: () => objs,
+      searchTables: async () => [],
+      columns: async () => [],
+    };
+    const t0 = performance.now();
+    for (const typed of ["t", "ta", "tab", "table_1", "table_12"]) {
+      const sql = `select * from ${typed}`;
+      const r = await completeSql(sql, sql.length, p);
+      expect(r!.options.length).toBeLessThanOrEqual(300);
+      expect(r!.options[0].label.startsWith(typed)).toBe(true);
+    }
+    const ms = (performance.now() - t0) / 5;
+    expect(ms).toBeLessThan(150);
+    expect(schemaCalls).toBe(5); // once per request, not per table
+  });
+});

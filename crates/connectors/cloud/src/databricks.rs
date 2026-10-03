@@ -417,7 +417,7 @@ impl Session for DbxSession {
                 r.into_iter().map(|x| vec![x.get(1).cloned().unwrap_or_default(), json!("TABLE"), serde_json::Value::Null]).collect()
             }
         };
-        Ok(rows
+        let mut out: Vec<DbObject> = rows
             .iter()
             .filter_map(|r| {
                 let name = cell(r, 0)?;
@@ -430,7 +430,17 @@ impl Session for DbxSession {
                     row_estimate: None,
                 })
             })
-            .collect())
+            .collect();
+        // Unity Catalog functions (best effort).
+        let q = format!(
+            "SELECT routine_name, comment FROM {}.information_schema.routines WHERE routine_schema = {} ORDER BY routine_name",
+            quote_ident(ConnectorKind::Databricks, cat),
+            quote_literal(sch)
+        );
+        if let Ok(rows) = self.0.run_small(&q).await {
+            out.extend(rows.iter().filter_map(|r| Some(DbObject { schema: schema.to_string(), name: cell(r, 0)?, kind: ObjectKind::Function, comment: cell(r, 1), row_estimate: None })));
+        }
+        Ok(out)
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
@@ -457,7 +467,8 @@ impl Session for DbxSession {
             .list_objects(schema)
             .await?
             .into_iter()
-            .find(|o| o.name == name)
+            .filter(|o| o.name == name)
+            .min_by_key(|o| !o.kind.is_relation())
             .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
         let cols = self.0.schema_columns_filtered(schema, Some(name)).await?;
         let columns = cols.into_iter().next().map(|t| t.columns).unwrap_or_default();

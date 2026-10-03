@@ -315,6 +315,13 @@ pub enum ObjectKind {
     Other,
 }
 
+impl ObjectKind {
+    /// Tables and views (things with columns), as opposed to routines and sequences.
+    pub fn is_relation(self) -> bool {
+        matches!(self, ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView | ObjectKind::ForeignTable)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DbObject {
     pub schema: String,

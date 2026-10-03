@@ -132,6 +132,11 @@ interface State {
   setRowLimit: (n: number) => void;
   setSidebarPanel: (p: SidebarPanel) => void;
   setTreeOpen: (key: string, open: boolean) => void;
+  /** Schemas shown in the explorer per connection (absent = all). Saved in settings. */
+  schemaFilter: Record<string, string[]>;
+  setSchemaFilter: (connId: string, schemas: string[] | null) => void;
+  /** Connection whose "Choose schemas" dialog is open. */
+  schemaPicker: string | null;
   /** Expand the explorer down to `obj` and scroll to it. */
   revealObject: (connId: string, obj: DbObject) => void;
   /** Show the catalog search (optionally scoped to one connection) and focus it. */
@@ -261,6 +266,19 @@ function nextTabTitle(tabs: Tab[]): string {
   return `Query ${n}`;
 }
 
+/** `explorer_schemas` setting: { connectionId: [schema ids] }. */
+export function parseSchemaFilter(v: unknown): Record<string, string[]> {
+  if (!v || typeof v !== "object") return {};
+  const out: Record<string, string[]> = {};
+  for (const [k, list] of Object.entries(v as Record<string, unknown>)) {
+    if (Array.isArray(list)) {
+      const names = list.filter((x): x is string => typeof x === "string");
+      if (names.length) out[k] = names;
+    }
+  }
+  return out;
+}
+
 export const useStore = create<State>((set, get) => ({
   ready: false,
   folders: { connections: [], queries: [], notebooks: [] },
@@ -352,6 +370,8 @@ export const useStore = create<State>((set, get) => ({
   rowLimit: 1000,
   sidebarPanel: "connections",
   treeOpen: {},
+  schemaFilter: {},
+  schemaPicker: null,
   treeFocus: null,
   catalogSearch: { query: "", scope: null, focusSeq: 0 },
   oracleClientPrompt: false,
@@ -407,6 +427,7 @@ export const useStore = create<State>((set, get) => ({
         theme,
         rowLimit,
         savedQueries,
+        schemaFilter: parseSchemaFilter(settings.explorer_schemas),
       });
       await onJobEvent((e) => get().handleJobEvent(e));
       window.addEventListener("db:oracle-client-missing", () => set({ oracleClientPrompt: true }));
@@ -444,6 +465,13 @@ export const useStore = create<State>((set, get) => ({
   },
   setSidebarPanel: (sidebarPanel) => set({ sidebarPanel }),
   setTreeOpen: (key, open) => set((s) => ({ treeOpen: { ...s.treeOpen, [key]: open } })),
+  setSchemaFilter: (connId, schemas) => {
+    const next = { ...get().schemaFilter };
+    if (schemas && schemas.length) next[connId] = schemas;
+    else delete next[connId];
+    set({ schemaFilter: next });
+    void api.setSetting("explorer_schemas", next).catch(() => {});
+  },
   revealObject: (connId, obj) => {
     const st = get();
     const kind = st.connections.find((c) => c.id === connId)?.config.kind;
@@ -526,6 +554,7 @@ export const useStore = create<State>((set, get) => ({
             if (err.kind !== "partial") return resolve(false);
           }
           const drop = <T,>(m: Record<string, T>) => Object.fromEntries(Object.entries(m).filter(([k]) => k !== connId && !k.startsWith(connId + "|")));
+          if (get().schemaFilter[connId]) get().setSchemaFilter(connId, null);
           set((s) => ({
             schemas: drop(s.schemas),
             objects: drop(s.objects),

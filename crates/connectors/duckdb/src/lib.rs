@@ -833,23 +833,40 @@ impl Session for DuckSession {
             .strings(
                 "select table_name, 'table', comment, estimated_size::varchar from duckdb_tables() where database_name = ? and schema_name = ? \
                  union all select view_name, 'view', comment, null from duckdb_views() where database_name = ? and schema_name = ? and not internal \
-                 order by 2, 1"
+                 union all select sequence_name, 'sequence', comment, null from duckdb_sequences() where database_name = ? and schema_name = ? \
+                 union all select distinct function_name, 'function', null, null from duckdb_functions() \
+                   where database_name = ? and schema_name = ? and not internal and function_type in ('macro', 'table_macro') \
+                 order by 1"
                     .into(),
-                vec![db.into(), sch.into(), db.into(), sch.into()],
+                vec![db.into(), sch.into(), db.into(), sch.into(), db.into(), sch.into(), db.into(), sch.into()],
             )
             .await?;
-        Ok(rows
+        let mut out: Vec<DbObject> = rows
             .into_iter()
             .filter_map(|r| {
                 Some(DbObject {
                     schema: schema.to_string(),
                     name: r[0].clone()?,
-                    kind: if r[1].as_deref() == Some("view") { ObjectKind::View } else { ObjectKind::Table },
+                    kind: match r[1].as_deref() {
+                        Some("view") => ObjectKind::View,
+                        Some("sequence") => ObjectKind::Sequence,
+                        Some("function") => ObjectKind::Function,
+                        _ => ObjectKind::Table,
+                    },
                     comment: r[2].clone().filter(|c| !c.is_empty()),
                     row_estimate: r[3].as_deref().and_then(|n| n.parse().ok()),
                 })
             })
-            .collect())
+            .collect();
+        // Tables, views, sequences, functions; by name within each (stable sort).
+        let rank = |k: ObjectKind| match k {
+            ObjectKind::Table => 0,
+            ObjectKind::View => 1,
+            ObjectKind::Sequence => 2,
+            _ => 3,
+        };
+        out.sort_by_key(|o| rank(o.kind));
+        Ok(out)
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
@@ -886,7 +903,8 @@ impl Session for DuckSession {
             .list_objects(schema)
             .await?
             .into_iter()
-            .find(|o| o.name == name)
+            .filter(|o| o.name == name)
+            .min_by_key(|o| !o.kind.is_relation())
             .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
         let columns = self.columns(schema, Some(name)).await?.into_iter().next().map(|t| t.columns).unwrap_or_default();
         let (db, sch) = schema.split_once('.').unwrap_or((schema, "main"));
@@ -956,6 +974,18 @@ mod tests {
 
     async fn q(s: &dyn Session, sql: &str) -> databrain_connector_core::Collected {
         s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn lists_sequences_and_macros() {
+        let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        q(&*s, "CREATE TABLE t (a INT); CREATE VIEW v AS SELECT 1; CREATE SEQUENCE seq1; CREATE MACRO add1(x) AS x + 1; CREATE MACRO t(x) AS x").await;
+        let objs = s.list_objects("memory.main").await.unwrap();
+        let k = |n: &str, kind: ObjectKind| objs.iter().any(|o| o.name == n && o.kind == kind);
+        assert!(k("t", ObjectKind::Table) && k("v", ObjectKind::View) && k("seq1", ObjectKind::Sequence) && k("add1", ObjectKind::Function), "{objs:?}");
+        assert_eq!(objs[0].kind, ObjectKind::Table, "tables first");
+        // A macro with a table's name does not hide the table.
+        assert_eq!(s.describe("memory.main", "t").await.unwrap().object.kind, ObjectKind::Table);
     }
 
     #[tokio::test]

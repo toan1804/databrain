@@ -14,6 +14,8 @@ export interface MetaProvider {
   objects(schema: string): Promise<DbObject[] | undefined>;
   /** Already-loaded objects of every schema (no I/O). */
   cachedObjects(): DbObject[];
+  /** Already-loaded objects named `name` (any case); faster than scanning cachedObjects on big catalogs. */
+  cachedNamed?(name: string): DbObject[];
   /** Server-side table search by name (may be empty when offline). */
   searchTables(prefix: string): Promise<DbObject[]>;
   /** Column names of a table (may load). */
@@ -292,7 +294,7 @@ export async function resolveTable(p: MetaProvider, parts: string[]): Promise<{ 
     if (p.kind === "duckdb" && parts.length === 2) return { schema: parts[0], name }; // results.x, files.x
     return { schema: parts.slice(0, -1).join("."), name };
   }
-  const cached = p.cachedObjects().filter((o) => o.name.toLowerCase() === name.toLowerCase());
+  const cached = p.cachedNamed ? p.cachedNamed(name) : p.cachedObjects().filter((o) => o.name.toLowerCase() === name.toLowerCase());
   const def = defaultSchema(p.schemas());
   const inDef = cached.find((o) => o.schema === def?.name);
   if (inDef || cached[0]) return { schema: (inDef ?? cached[0]).schema, name: (inDef ?? cached[0]).name };
@@ -335,6 +337,26 @@ export function tableApply(p: MetaProvider, o: DbObject): string {
   return [...parts, o.name].map((x) => quoteIdent(k, x)).join(".");
 }
 
+const MAX_TABLE_OPTIONS = 300;
+
+/** Tables/views whose name matches `typed` (see matchRank), best first, at most `limit`. */
+export function matchingRelations(objects: DbObject[], typed: string, limit: number): DbObject[] {
+  const buckets: DbObject[][] = [[], [], []];
+  for (const o of objects) {
+    if (o.kind === "function" || o.kind === "procedure" || o.kind === "sequence" || o.kind === "other") continue;
+    const r = matchRank(o.name, typed);
+    if (r >= 0) buckets[r].push(o);
+  }
+  const out: DbObject[] = [];
+  for (const b of buckets) {
+    for (const o of b) {
+      if (out.length >= limit) return out;
+      out.push(o);
+    }
+  }
+  return out;
+}
+
 function tableOption(p: MetaProvider, o: DbObject, boost = 0): SqlOption {
   const def = defaultSchema(p.schemas());
   const sc = (p.schemas() ?? []).find((s) => s.name === o.schema);
@@ -353,7 +375,10 @@ function tableOption(p: MetaProvider, o: DbObject, boost = 0): SqlOption {
  * Completions at `pos` in `doc`. `explicit` = invoked with Ctrl-Space (show
  * suggestions even without typed text). Returns null when nothing fits.
  */
-export async function completeSql(doc: string, pos: number, p: MetaProvider, explicit = false): Promise<SqlCompletion | null> {
+export async function completeSql(doc: string, pos: number, provider: MetaProvider, explicit = false): Promise<SqlCompletion | null> {
+  // Read the schema list once per request (it is consulted per table option).
+  const schemaList = provider.schemas();
+  const p: MetaProvider = { ...provider, schemas: () => schemaList };
   const clean = blankLiterals(doc);
   // Inside a string or comment: no completion.
   if (clean[pos - 1] === " " && doc[pos - 1] !== " " && doc[pos - 1] !== "\n" && doc[pos - 1] !== "\t") return null;
@@ -414,9 +439,8 @@ export async function completeSql(doc: string, pos: number, p: MetaProvider, exp
     // schema. → tables
     const sc = findSchema(p, path);
     if (sc) {
-      const objs = (await p.objects(sc.name)) ?? [];
+      const objs = matchingRelations((await p.objects(sc.name)) ?? [], typed, MAX_TABLE_OPTIONS);
       for (const o of objs) {
-        if (o.kind === "function" || o.kind === "procedure" || o.kind === "sequence") continue;
         opts.push({ label: o.name, type: o.kind === "view" || o.kind === "materialized_view" ? "view" : "table", detail: schemaLabel(sc), apply: quoteIdent(k, o.name) });
       }
     }
@@ -435,9 +459,11 @@ export async function completeSql(doc: string, pos: number, p: MetaProvider, exp
   if (ctx === "start" || (stmtBefore.trim() === "" && !typed)) {
     opts.push(...kw(STATEMENT_START, typed, 5));
   } else if (ctx === "table") {
-    // Tables of the connection: cached first, then server search.
-    const cached = p.cachedObjects().filter((o) => o.kind !== "function" && o.kind !== "procedure" && o.kind !== "sequence");
+    // Tables of the connection: cached first, then server search. On big
+    // catalogs (10k+ tables) only names matching the typed text are turned
+    // into options, best matches first.
     const def = defaultSchema(p.schemas());
+    const cached = matchingRelations(p.cachedObjects(), typed, MAX_TABLE_OPTIONS);
     for (const o of cached) opts.push(tableOption(p, o, o.schema === def?.name ? 3 : 1));
     if (typed.length >= 1) {
       for (const o of await p.searchTables(typed)) opts.push(tableOption(p, o, o.schema === def?.name ? 3 : 1));

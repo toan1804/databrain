@@ -10,6 +10,7 @@ import { CommandPalette } from "./components/CommandPalette";
 import { ConfirmDialog, Toasts } from "./components/ui";
 import { AiPanel } from "./components/AiPanel";
 import { ExcelSheetDialog } from "./components/ExcelSheetDialog";
+import { SchemaPickerDialog } from "./components/SchemaPickerDialog";
 import { SplitHandle } from "./components/SplitHandle";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { SignInDialog } from "./components/SignInDialog";
@@ -194,6 +195,7 @@ export default function App() {
       <InlineAi />
       <ConfirmDialog />
       <ExcelSheetDialog />
+      <SchemaPickerDialog />
       <Toasts />
     </div>
   );

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { columnList, schemaPath, tablePath, cachedHits, groupSchemas, matchRange, objectMatches, rankHits, revealKeys, schemaLabel, splitSchema, treeKey } from "./catalog";
+import { GROUP_PAGE, groupObjects, groupOpenByDefault, pageObjects, visibleSchemas, columnList, schemaPath, tablePath, cachedHits, groupSchemas, matchRange, objectMatches, rankHits, revealKeys, schemaLabel, splitSchema, treeKey } from "./catalog";
 import type { DbObject, SchemaInfo } from "./types";
 
 const sch = (catalog: string | null, schema: string, is_default = false): SchemaInfo =>
@@ -87,5 +87,48 @@ describe("copy names", () => {
   it("builds column lists", () => {
     expect(columnList("postgres", ["id", "Name"])).toBe('id, "Name"');
     expect(columnList("mysql", ["a", "b", "c", "d", "e"], "o")).toBe("o.a,\n  o.b,\n  o.c,\n  o.d,\n  o.e");
+  });
+});
+
+describe("catalog: big schemas and schema filter", () => {
+  const mk = (n: number, kind: DbObject["kind"] = "table"): DbObject[] => Array.from({ length: n }, (_, i) => ({ schema: "s", name: `t${i}`, kind }));
+
+  it("groups objects into separate folders per kind, in display order", () => {
+    const objs: DbObject[] = [
+      { schema: "s", name: "seq", kind: "sequence" },
+      { schema: "s", name: "f", kind: "function" },
+      { schema: "s", name: "mv", kind: "materialized_view" },
+      { schema: "s", name: "t", kind: "table" },
+      { schema: "s", name: "p", kind: "procedure" },
+      { schema: "s", name: "ft", kind: "foreign_table" },
+    ];
+    expect(groupObjects(objs).map(([n, v]) => [n, v.map((o) => o.name)])).toEqual([
+      ["Tables", ["t", "ft"]],
+      ["Materialized views", ["mv"]],
+      ["Functions", ["f"]],
+      ["Procedures", ["p"]],
+      ["Sequences", ["seq"]],
+    ]);
+    expect(groupOpenByDefault("Tables")).toBe(true);
+    expect(groupOpenByDefault("Sequences")).toBe(false);
+    expect(revealKeys("c", { schema: "s", name: "seq", kind: "sequence" })).toContain(treeKey.group("c", "s", "Sequences"));
+  });
+
+  it("pages and filters long folders, keeping a revealed object", () => {
+    const items = mk(10_000);
+    expect(pageObjects(items, "", GROUP_PAGE).shown).toHaveLength(GROUP_PAGE);
+    const f = pageObjects(items, "T999", GROUP_PAGE);
+    expect(f.matched).toBe(11); // t999, t9990..t9999
+    const kept = pageObjects(items, "", GROUP_PAGE, (o) => o.name === "t9876");
+    expect(kept.shown).toHaveLength(GROUP_PAGE + 1);
+    expect(kept.shown.at(-1)!.name).toBe("t9876");
+  });
+
+  it("lists chosen schemas only, falling back to all when none exist", () => {
+    const schemas = [{ name: "a", is_default: true }, { name: "b", is_default: false }, { name: "c", is_default: false }];
+    expect(visibleSchemas(schemas, undefined).map((s) => s.name)).toEqual(["a", "b", "c"]);
+    expect(visibleSchemas(schemas, ["c"]).map((s) => s.name)).toEqual(["c"]);
+    expect(visibleSchemas(schemas, ["c"], "a").map((s) => s.name)).toEqual(["a", "c"]);
+    expect(visibleSchemas(schemas, ["gone"]).map((s) => s.name)).toEqual(["a", "b", "c"]);
   });
 });

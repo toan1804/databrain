@@ -656,7 +656,7 @@ impl Session for SfSession {
             quote_ident(ConnectorKind::Snowflake, db),
             quote_literal(sch)
         );
-        Ok(self
+        let mut out: Vec<DbObject> = self
             .0
             .run_small(&sql)
             .await?
@@ -672,7 +672,16 @@ impl Session for SfSession {
                     row_estimate: g(3).and_then(|n| n.parse().ok()),
                 })
             })
-            .collect())
+            .collect();
+        // Routines and sequences (best effort: missing privileges just leave them out).
+        let db_q = quote_ident(ConnectorKind::Snowflake, db);
+        for (view, col, kind) in [("functions", "function_name", ObjectKind::Function), ("procedures", "procedure_name", ObjectKind::Procedure), ("sequences", "sequence_name", ObjectKind::Sequence)] {
+            let q = format!("select distinct {col} from {db_q}.information_schema.{view} where {}_schema = {} order by 1", view.trim_end_matches('s'), quote_literal(sch));
+            if let Ok(rows) = self.0.run_small(&q).await {
+                out.extend(rows.into_iter().filter_map(|r| r.first().cloned().flatten()).map(|name| DbObject { schema: schema.to_string(), name, kind, comment: None, row_estimate: None }));
+            }
+        }
+        Ok(out)
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
@@ -709,7 +718,8 @@ impl Session for SfSession {
             .list_objects(schema)
             .await?
             .into_iter()
-            .find(|o| o.name == name)
+            .filter(|o| o.name == name)
+            .min_by_key(|o| !o.kind.is_relation())
             .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
         let columns = self.columns(schema, Some(name)).await?.into_iter().next().map(|t| t.columns).unwrap_or_default();
         let full = format!("{}.{}", databrain_connector_core::quote_path(ConnectorKind::Snowflake, schema), quote_ident(ConnectorKind::Snowflake, name));

@@ -2,7 +2,7 @@
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { ClipboardCopy, Columns3, Play, RefreshCw, TextCursorInput } from "lucide-react";
 import { toError } from "../lib/api";
-import { columnList, schemaLabel, schemaPath, splitSchema, tablePath } from "../lib/catalog";
+import { isRelationKind, columnList, schemaLabel, schemaPath, splitSchema, tablePath } from "../lib/catalog";
 import type { ConnectionView, DbObject, SchemaInfo } from "../lib/types";
 import { quoteIdent } from "../lib/util";
 import { editorBridge } from "../editorBridge";
@@ -116,7 +116,7 @@ export function ObjectMenu({
   const { catalog, schema } = splitSchema(kind, obj.schema, known);
   const path = tablePath(kind, obj.schema, obj.name);
   const sPath = schemaPath(kind, obj.schema);
-  const isRelation = obj.kind !== "function" && obj.kind !== "procedure";
+  const isRelation = isRelationKind(obj.kind);
   const run = (f: () => void) => () => (onClose(), f());
   return (
     <Popover x={at.x} y={at.y} onClose={onClose} className="w-72">

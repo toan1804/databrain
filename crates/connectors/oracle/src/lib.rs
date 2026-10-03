@@ -483,7 +483,8 @@ impl Session for OracleSession {
             .list_objects(schema)
             .await?
             .into_iter()
-            .find(|o| o.name == name)
+            .filter(|o| o.name == name)
+            .min_by_key(|o| !o.kind.is_relation())
             .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
         let columns: Vec<ColumnInfo> = self.columns(schema, Some(name)).await?.into_iter().map(|(_, c)| c).collect();
         let obj_type = match object.kind {
