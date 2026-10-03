@@ -10,7 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-arrow = { version = "59.3.0", default-features = false, features = ["ipc", "csv", "json", "chrono-tz"] }
+arrow = { version = "59.3.0", default-features = false, features = ["ipc", "ipc_compression", "csv", "json", "chrono-tz"] }
 async-trait = "0.1.92"
 databrain-auth = { version = "0.1.0", path = "../auth" }
 futures = "0.3.34"
