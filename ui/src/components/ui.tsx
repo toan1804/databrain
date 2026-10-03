@@ -17,19 +17,28 @@ export function Modal({
   width?: number;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  // Latest onClose without re-running the effects: callers pass a new
+  // function on every render, which used to re-focus the first field on each
+  // keystroke (typing in a search box lost the cursor).
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
-        onClose();
+        closeRef.current();
       }
     };
     window.addEventListener("keydown", onKey, true);
-    // Focus the first input for keyboard users.
-    const first = ref.current?.querySelector<HTMLElement>("input, select, textarea, button");
-    first?.focus();
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [onClose]);
+  }, []);
+  // Focus once when opened: an autoFocus field, else the first field in the body.
+  useEffect(() => {
+    const root = ref.current;
+    if (!root || root.contains(document.activeElement)) return;
+    const first = root.querySelector<HTMLElement>("[autofocus], .modal-body input, .modal-body select, .modal-body textarea, input, select, textarea, button");
+    first?.focus();
+  }, []);
 
   return createPortal(
     <div
@@ -50,7 +59,7 @@ export function Modal({
             <X size={15} />
           </button>
         </div>
-        <div className="min-h-0 flex-1 overflow-auto p-4">{children}</div>
+        <div className="modal-body min-h-0 flex-1 overflow-auto p-4">{children}</div>
         {footer && (
           <div className="flex items-center justify-end gap-2 border-t border-line px-4 py-3">
             {footer}

@@ -489,12 +489,13 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
                 key={g.name}
                 conn={conn}
                 group={g}
+                filtered={!!chosen}
                 // The Results connection exists to query outputs: show them.
                 defaultOpen={g.isDefault || catalogs.length === 1 || (g.name === "results" && conn.config.options?.databrain_results === "1")}
               />
             ))
           : shownSchemas.map((s) => (
-              <SchemaNode key={s.name} conn={conn} schema={s} depth={1} defaultOpen={s.is_default || shownSchemas.length === 1} />
+              <SchemaNode key={s.name} conn={conn} schema={s} depth={1} defaultOpen={!chosen && (s.is_default || shownSchemas.length === 1)} />
             )))}
       {expanded && schemas?.length === 0 && <div className="py-1 pl-10 text-[12px] text-muted">No schemas</div>}
     </div>
@@ -502,7 +503,7 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
 }
 
 /** Top level of three-level engines: Databricks catalog, Snowflake database, BigQuery project, DuckDB database. */
-function CatalogNode({ conn, group, defaultOpen }: { conn: ConnectionView; group: CatalogGroup; defaultOpen: boolean }) {
+function CatalogNode({ conn, group, defaultOpen, filtered = false }: { conn: ConnectionView; group: CatalogGroup; defaultOpen: boolean; filtered?: boolean }) {
   const [expanded, setExpanded] = useTreeOpen(treeKey.catalog(conn.id, group.name), defaultOpen);
   const noun = conn.config.kind === "bigquery" ? "Project" : conn.config.kind === "databricks" ? "Catalog" : "Database";
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
@@ -537,7 +538,7 @@ function CatalogNode({ conn, group, defaultOpen }: { conn: ConnectionView; group
       {menu && <CatalogMenu conn={conn} catalog={group.name} at={menu} onClose={() => setMenu(null)} />}
       {expanded &&
         group.schemas.map((s) => (
-          <SchemaNode key={s.name} conn={conn} schema={s} depth={2} defaultOpen={s.is_default || group.schemas.length === 1} />
+          <SchemaNode key={s.name} conn={conn} schema={s} depth={2} defaultOpen={!filtered && (s.is_default || group.schemas.length === 1)} />
         ))}
     </div>
   );
