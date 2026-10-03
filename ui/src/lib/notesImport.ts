@@ -17,7 +17,7 @@ export interface ImportChoices {
 export function defaultChoices(items: ImportItem[]): ImportChoices {
   const c: ImportChoices = { addNew: {}, conflicts: {}, merged: {} };
   items.forEach((it, i) => {
-    if (it.kind === "new") c.addNew[i] = true;
+    if (it.kind === "new") c.addNew[i] = !it.invalid_target;
     if (it.kind === "conflict") {
       c.conflicts[i] = "keep";
       c.merged[i] = mergeTexts(it.existing.map((e) => e.body), it.incoming.body);
@@ -45,6 +45,7 @@ export function mergeTexts(existing: string[], incoming: string): string {
 export function toActions(items: ImportItem[], c: ImportChoices): ImportAction[] {
   const acts: ImportAction[] = [];
   items.forEach((it, i) => {
+    if (it.invalid_target) return;
     if (it.kind === "new" && c.addNew[i]) acts.push({ incoming: it.incoming, action: "add", existing_ids: [] });
     if (it.kind !== "conflict") return;
     const ids = it.existing.map((e) => e.id);

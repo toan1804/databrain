@@ -206,6 +206,8 @@ export const api = {
   knClear: (connectionId: string) => call<void>("kn_clear", { connectionId }),
   knSaveNote: (note: KnNote) => call<KnNote>("kn_save_note", { note }),
   knDeleteNote: (id: string) => call<void>("kn_delete_note", { id }),
+  knCheckTarget: (connectionId: string, target: string) =>
+    call<{ ok: boolean; target?: string | null; error?: string | null }>("kn_check_target", { connectionId, target }),
   knExportNotes: (connectionId: string, path: string) => call<number>("kn_export_notes", { connectionId, path }),
   knReadNotesFile: (connectionId: string, path: string) => call<NotesImportPreview>("kn_read_notes_file", { connectionId, path }),
   knImportNotes: (connectionId: string, actions: ImportAction[]) => call<number>("kn_import_notes", { connectionId, actions }),

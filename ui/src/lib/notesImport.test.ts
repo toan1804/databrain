@@ -43,3 +43,17 @@ describe("notesImport", () => {
     expect(exportFileName("???")).toBe("notes.databrain-notes.json");
   });
 });
+
+describe("notesImport: unknown tables", () => {
+  it("never imports notes about tables this connection lacks", () => {
+    const bad: ImportItem[] = [
+      { incoming: { body: "x", target: "ghost.t" }, kind: "new", existing: [], invalid_target: "not found in this connection: ghost.t" },
+      { incoming: { body: "y", target: "ghost.t" }, kind: "conflict", existing: [kn("e9", "z", "ghost.t")], invalid_target: "not found" },
+    ];
+    const c = defaultChoices(bad);
+    expect(c.addNew[0]).toBe(false);
+    c.addNew[0] = true;
+    c.conflicts[1] = "theirs";
+    expect(toActions(bad, c)).toEqual([]);
+  });
+});

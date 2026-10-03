@@ -638,3 +638,32 @@ async fn knowledge_note_tools_add_list_update() {
     assert!(notes.iter().any(|n| n.body.ends_with("shipping") && n.status == databrain_workspace::NoteStatus::Approved));
     assert!(auto.call("update_knowledge_note", &json!({"id": "nope", "note": "x"})).await.content.starts_with("ERROR"));
 }
+
+#[tokio::test]
+async fn note_targets_must_be_real_tables() {
+    use databrain_ai::knowledge::check_note_target;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = mock_openai(requests.clone()).await;
+    let f = fixture(port, AiPolicy::default()).await;
+    // Live lookups (index may be empty): canonical names, several tables, a column.
+    assert_eq!(check_note_target(&f.engine, &f.conn, "ORDERS and main.customers").await.unwrap(), "main.orders and main.customers");
+    assert_eq!(check_note_target(&f.engine, &f.conn, "orders & customers.EMAIL").await.unwrap(), "main.orders & main.customers.email");
+    let e = check_note_target(&f.engine, &f.conn, "orders & nope_table").await.unwrap_err();
+    assert!(e.contains("nope_table") && !e.contains("orders,"), "{e}");
+    assert!(check_note_target(&f.engine, &f.conn, "orders.no_such_column").await.is_err());
+    let ctx = databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: f.ws.get_connection(&f.conn).unwrap(),
+        session_id: None,
+        caller: databrain_ai::Caller::Agent,
+        host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+    };
+    let o = ctx.call("add_knowledge_note", &json!({"target": "orders or ghost", "note": "x"})).await;
+    assert!(o.content.starts_with("ERROR") && o.content.contains("ghost"), "{}", o.content);
+    let o = ctx.call("add_knowledge_note", &json!({"target": "orders & customers", "note": "join on customer_id"})).await;
+    assert!(!o.content.starts_with("ERROR"), "{}", o.content);
+    assert!(f.ws.kn_notes(&f.conn).unwrap().iter().any(|n| n.target.as_deref() == Some("main.orders & main.customers")));
+}

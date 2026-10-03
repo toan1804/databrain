@@ -78,7 +78,7 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
         s(
             "add_knowledge_note",
             "Record a durable fact learned while exploring, for future questions: a business rule, the meaning of a code or status value, a join path, a data caveat (e.g. 'active customer = status in (1,2)'). One fact per note; no query results or personal data.",
-            json!({"type": "object", "properties": {"target": {"type": "string", "description": "schema.table, schema.table.column, or omit for glossary"}, "note": {"type": "string"}}, "required": ["note"]}),
+            json!({"type": "object", "properties": {"target": {"type": "string", "description": "Existing table(s): schema.table or schema.table.column; several joined with & (e.g. join paths: sales.orders & crm.customers). Omit for glossary"}, "note": {"type": "string"}}, "required": ["note"]}),
         ),
         s(
             "update_knowledge_note",
@@ -226,8 +226,11 @@ impl ToolContext {
         let notes: Vec<String> = ws
             .kn_notes(&self.profile.id)?
             .into_iter()
-            .filter(|n| n.status == NoteStatus::Approved && n.target.as_deref().is_some_and(|x| x.to_ascii_lowercase().starts_with(&full.to_ascii_lowercase()) || x.eq_ignore_ascii_case(&o.name)))
-            .map(|n| n.body)
+            .filter(|n| n.status == NoteStatus::Approved && n.target.as_deref().is_some_and(|x| databrain_workspace::target_mentions(x, &full, &o.name)))
+            .map(|n| match n.target.as_deref() {
+                Some(t) if !t.eq_ignore_ascii_case(&full) => format!("{t}: {}", n.body),
+                _ => n.body,
+            })
             .collect();
         let pol = self.policy().clone();
         let mut text = knowledge::render_object(&o, &|c| is_pii(&pol, Some(&full), c), &notes);
@@ -643,9 +646,20 @@ impl ToolContext {
         }
     }
 
+    /// Validated, canonical target (tables must exist in this connection).
+    async fn checked_target(&self, target: Option<&str>) -> Result<Option<String>> {
+        match target.map(str::trim).filter(|t| !t.is_empty()) {
+            None => Ok(None),
+            Some(t) => knowledge::check_note_target(&self.engine, &self.profile.id, t)
+                .await
+                .map(Some)
+                .map_err(|e| AiError::Policy(format!("invalid target `{t}`: {e}. Use real tables (schema.table, several joined with &), or omit target for a glossary note"))),
+        }
+    }
+
     async fn add_note(&self, args: &Value) -> Result<ToolOutput> {
         let note = arg(args, "note")?;
-        let target = args.get("target").and_then(|t| t.as_str()).filter(|t| !t.is_empty()).map(str::to_string);
+        let target = self.checked_target(args.get("target").and_then(|t| t.as_str())).await?;
         let ws = self.engine.workspace();
         // Same text already there: nothing to add.
         let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
@@ -677,7 +691,7 @@ impl ToolContext {
             .find(|n| n.id == id)
             .ok_or_else(|| AiError::Policy(format!("note {id} not found; use list_knowledge_notes")))?;
         let target = match args.get("target").and_then(|t| t.as_str()) {
-            Some(t) => Some(t.to_string()).filter(|t| !t.is_empty()),
+            Some(t) => self.checked_target(Some(t)).await?,
             None => old.target.clone(),
         };
         let status = self.ai_note_status();

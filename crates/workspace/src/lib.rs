@@ -13,7 +13,7 @@ pub mod outputs;
 pub use ai::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry};
 pub use outputs::OutputRecord;
 pub use notebooks::{CellKind, CellRunSummary, Notebook, NotebookCell, NotebookSummary};
-pub use knowledge::{ImportAction, ImportItem, ImportKind, IndexDelta, KnHit, KnNote, KnObject, KnState, NoteEntry, NoteStatus, NotesFile, NotesSource};
+pub use knowledge::{join_target, split_target, target_mentions, ImportAction, ImportItem, ImportKind, IndexDelta, KnHit, KnNote, KnObject, KnState, NoteEntry, NoteStatus, NotesFile, NotesSource};
 
 use databrain_connector_core::ConnectionConfig;
 use parking_lot::Mutex;

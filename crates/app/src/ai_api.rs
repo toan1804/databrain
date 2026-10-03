@@ -440,8 +440,29 @@ pub fn cancel_index(state: &AppState, connection_id: &str) -> bool {
     }
 }
 
-pub fn save_note(state: &AppState, note: KnNote) -> Result<KnNote> {
+/// Save a note. Its target must name tables (columns) of the connection; it
+/// is stored with canonical names.
+pub async fn save_note(state: &AppState, mut note: KnNote) -> Result<KnNote> {
+    if let Some(t) = note.target.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let canon = databrain_ai::knowledge::check_note_target(&state.engine, &note.connection_id, t).await.map_err(|e| EngineError::new("invalid", e))?;
+        note.target = Some(canon);
+    }
     Ok(state.workspace.kn_save_note(note)?)
+}
+
+#[derive(Debug, Serialize)]
+pub struct TargetCheck {
+    pub ok: bool,
+    /// Canonical target when ok.
+    pub target: Option<String>,
+    pub error: Option<String>,
+}
+
+pub async fn check_target(state: &AppState, connection_id: &str, target: &str) -> TargetCheck {
+    match databrain_ai::knowledge::check_note_target(&state.engine, connection_id, target).await {
+        Ok(t) => TargetCheck { ok: true, target: Some(t), error: None },
+        Err(e) => TargetCheck { ok: false, target: None, error: Some(e) },
+    }
 }
 
 pub fn delete_note(state: &AppState, id: &str) -> Result<()> {
@@ -463,7 +484,7 @@ pub struct NotesImportPreview {
 }
 
 /// Read a notes file and compare it with the connection's notes.
-pub fn read_notes_file(state: &AppState, connection_id: &str, path: &str) -> Result<NotesImportPreview> {
+pub async fn read_notes_file(state: &AppState, connection_id: &str, path: &str) -> Result<NotesImportPreview> {
     let meta = std::fs::metadata(path).map_err(|e| EngineError::new("io", format!("cannot read {path}: {e}")))?;
     if meta.len() > 50 * 1024 * 1024 {
         return Err(EngineError::new("invalid", "notes file is larger than 50 MB"));
@@ -471,12 +492,33 @@ pub fn read_notes_file(state: &AppState, connection_id: &str, path: &str) -> Res
     let text = std::fs::read_to_string(path).map_err(|e| EngineError::new("io", format!("cannot read {path}: {e}")))?;
     let file: databrain_workspace::NotesFile =
         serde_json::from_str(&text).map_err(|e| EngineError::new("invalid", format!("not a DataBrain notes file: {e}")))?;
-    let items = state.workspace.kn_import_plan(connection_id, &file)?;
+    let mut items = state.workspace.kn_import_plan(connection_id, &file)?;
+    // Tables the notes are about must exist here (checked once per target).
+    let mut seen: HashMap<String, Option<String>> = HashMap::new();
+    for it in items.iter_mut() {
+        let Some(t) = it.incoming.target.clone().filter(|t| !t.trim().is_empty()) else { continue };
+        if !seen.contains_key(&t) {
+            let r = if seen.len() < 500 { databrain_ai::knowledge::check_note_target(&state.engine, connection_id, &t).await.err() } else { None };
+            seen.insert(t.clone(), r);
+        }
+        it.invalid_target = seen[&t].clone();
+    }
     Ok(NotesImportPreview { source: file.source, items })
 }
 
-pub fn import_notes(state: &AppState, connection_id: &str, actions: Vec<databrain_workspace::ImportAction>) -> Result<usize> {
+pub async fn import_notes(state: &AppState, connection_id: &str, mut actions: Vec<databrain_workspace::ImportAction>) -> Result<usize> {
     state.workspace.get_connection(connection_id)?;
+    let mut bad = Vec::new();
+    for a in actions.iter_mut().filter(|a| a.action != "skip") {
+        let Some(t) = a.target.clone().or_else(|| a.incoming.target.clone()).filter(|t| !t.trim().is_empty()) else { continue };
+        match databrain_ai::knowledge::check_note_target(&state.engine, connection_id, &t).await {
+            Ok(canon) => a.target = Some(canon),
+            Err(e) => bad.push(format!("{t}: {e}")),
+        }
+    }
+    if !bad.is_empty() {
+        return Err(EngineError::new("invalid", format!("some notes are about tables this connection does not have: {}", bad.join("; "))));
+    }
     Ok(state.workspace.kn_import_apply(connection_id, &actions)?)
 }
 

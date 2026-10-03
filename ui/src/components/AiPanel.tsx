@@ -36,6 +36,7 @@ import { connectionForKey, useAi, visibleItems, type ChatItem } from "../aiStore
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { exportFileName } from "../lib/notesImport";
 import { ImportNotesDialog } from "./ImportNotesDialog";
+import { NoteTargetInput, type TargetState } from "./NoteTargetInput";
 import { editorBridge } from "../editorBridge";
 import { Markdown } from "./Markdown";
 import { extractMentions, mentionToken } from "../outputs";
@@ -679,6 +680,8 @@ function Knowledge() {
   const [data, setData] = useState<KnowledgeView | null>(null);
   const [filter, setFilter] = useState("");
   const [note, setNote] = useState({ target: "", body: "" });
+  const [targetState, setTargetState] = useState<TargetState>({ status: "empty" });
+  const targetOk = targetState.status === "empty" || targetState.status === "ok";
   const [importing, setImporting] = useState<NotesImportPreview | null>(null);
   const prog = connId ? progress[connId] : undefined;
   const connName = connections.find((c) => c.id === connId)?.name ?? "notes";
@@ -728,8 +731,10 @@ function Knowledge() {
         replaces: n.replaces ?? null,
       });
       load();
+      return true;
     } catch (e) {
       toast(toError(e).message, "error");
+      return false;
     }
   };
 
@@ -853,18 +858,19 @@ function Knowledge() {
           className="mb-2 space-y-1.5"
           onSubmit={(e) => {
             e.preventDefault();
-            if (!note.body.trim()) return;
-            void saveNote({ target: note.target.trim(), body: note.body.trim() });
-            setNote({ target: "", body: "" });
+            if (!note.body.trim() || !targetOk) return;
+            void saveNote({ target: note.target.trim(), body: note.body.trim() }).then((ok) => ok && setNote({ target: "", body: "" }));
           }}
         >
-          <input
-            className="field py-1 font-mono text-[11.5px]"
-            placeholder="schema.table or schema.table.column (optional)"
-            aria-label="Note target"
-            value={note.target}
-            onChange={(e) => setNote({ ...note, target: e.target.value })}
-          />
+          {connId && (
+            <NoteTargetInput
+              connId={connId}
+              value={note.target}
+              onChange={(target) => setNote((n) => ({ ...n, target }))}
+              indexed={data?.objects ?? []}
+              onState={setTargetState}
+            />
+          )}
           <textarea
             className="field min-h-[52px]"
             placeholder='Business rule, e.g. "Active customer = status IN (1, 2)"'
@@ -873,7 +879,7 @@ function Knowledge() {
             onChange={(e) => setNote({ ...note, body: e.target.value })}
           />
           <div className="flex justify-end">
-            <button type="submit" className="btn-primary py-1" disabled={!note.body.trim()}>
+            <button type="submit" className="btn-primary py-1" disabled={!note.body.trim() || !targetOk} title={targetOk ? undefined : "Fix the tables first"}>
               Add note
             </button>
           </div>

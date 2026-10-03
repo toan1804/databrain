@@ -328,7 +328,11 @@ async fn kn_cancel(state: State<'_, AppState>, connection_id: String) -> R<bool>
 }
 #[tauri::command]
 async fn kn_save_note(state: State<'_, AppState>, note: databrain_workspace::KnNote) -> R<databrain_workspace::KnNote> {
-    ai_api::save_note(&state, note)
+    ai_api::save_note(&state, note).await
+}
+#[tauri::command]
+async fn kn_check_target(state: State<'_, AppState>, connection_id: String, target: String) -> R<ai_api::TargetCheck> {
+    Ok(ai_api::check_target(&state, &connection_id, &target).await)
 }
 #[tauri::command]
 async fn kn_delete_note(state: State<'_, AppState>, id: String) -> R<()> {
@@ -340,11 +344,11 @@ async fn kn_export_notes(state: State<'_, AppState>, connection_id: String, path
 }
 #[tauri::command]
 async fn kn_read_notes_file(state: State<'_, AppState>, connection_id: String, path: String) -> R<ai_api::NotesImportPreview> {
-    ai_api::read_notes_file(&state, &connection_id, &path)
+    ai_api::read_notes_file(&state, &connection_id, &path).await
 }
 #[tauri::command]
 async fn kn_import_notes(state: State<'_, AppState>, connection_id: String, actions: Vec<databrain_workspace::ImportAction>) -> R<usize> {
-    ai_api::import_notes(&state, &connection_id, actions)
+    ai_api::import_notes(&state, &connection_id, actions).await
 }
 #[tauri::command]
 async fn kn_clear(state: State<'_, AppState>, connection_id: String) -> R<()> {
@@ -694,6 +698,7 @@ pub fn run() {
             kn_save_note,
             kn_delete_note,
             kn_export_notes,
+            kn_check_target,
             kn_read_notes_file,
             kn_import_notes,
             kn_clear,

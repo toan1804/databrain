@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use databrain_query_engine::QueryEngine;
-use databrain_workspace::{KnObject, KnState, NoteStatus, Workspace, now_ms};
+use databrain_workspace::{KnObject, KnState, NoteStatus, Workspace, join_target, now_ms, split_target, target_mentions};
 use serde::Serialize;
 
 use crate::policy::is_pii;
@@ -292,9 +292,14 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
             if let Some(n) = notes_all.iter().find(|n| n.id == h.reference) {
                 if n.target.is_none() {
                     glossary.push(n.body.clone());
-                } else if let Some(o) = ws.kn_get(connection_id, n.target.as_deref().unwrap_or(""))? {
-                    if seen.insert(o.full_name()) {
-                        chosen.push(o);
+                } else {
+                    // Every table the note is about (`a & b`, `a or b`).
+                    for (_, p) in split_target(n.target.as_deref().unwrap_or("")) {
+                        if let Some((o, _)) = ws.kn_resolve_path(connection_id, &p)? {
+                            if seen.insert(o.full_name()) {
+                                chosen.push(o);
+                            }
+                        }
                     }
                 }
             }
@@ -337,7 +342,7 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
         let full = o.full_name();
         let table_notes: Vec<String> = notes_all
             .iter()
-            .filter(|n| n.target.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(&full) || t.eq_ignore_ascii_case(&o.name) || t.to_ascii_lowercase().starts_with(&format!("{}.", full.to_ascii_lowercase()))))
+            .filter(|n| n.target.as_deref().is_some_and(|t| target_mentions(t, &full, &o.name)))
             .map(|n| match n.target.as_deref() {
                 Some(t) if !t.eq_ignore_ascii_case(&full) => format!("{t}: {}", n.body),
                 _ => n.body.clone(),
@@ -353,6 +358,73 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
         tables.push(full);
     }
     Ok(Retrieved { tables, text: text.trim_end().to_string(), notes: glossary })
+}
+
+/// Check a note target against the connection: every table (and column)
+/// must exist. Separate tables with `&`, `,`, `and` or `or`. Uses the
+/// knowledge index first, then the live connection. Returns the target with
+/// canonical names (`sales.orders & crm.customers.customer_id`), or why not.
+pub async fn check_note_target(engine: &QueryEngine, connection_id: &str, target: &str) -> std::result::Result<String, String> {
+    let parts = split_target(target);
+    if parts.is_empty() {
+        return Err("no table given".into());
+    }
+    if parts.len() > 20 {
+        return Err("at most 20 tables per note".into());
+    }
+    let ws = engine.workspace();
+    let mut out = Vec::new();
+    let mut missing = Vec::new();
+    let mut offline: Option<String> = None;
+    for (sep, path) in parts {
+        if let Ok(Some((o, col))) = ws.kn_resolve_path(connection_id, &path) {
+            out.push((sep, match col { Some(c) => format!("{}.{c}", o.full_name()), None => o.full_name() }));
+            continue;
+        }
+        match resolve_live(engine, connection_id, &path).await {
+            Ok(Some(p)) => out.push((sep, p)),
+            Ok(None) => missing.push(path),
+            Err(e) => {
+                offline.get_or_insert(e);
+                missing.push(path);
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(join_target(&out));
+    }
+    let list = missing.join(", ");
+    Err(match offline {
+        Some(e) => format!("cannot check {list}: not in the knowledge index and the connection is unavailable ({e})"),
+        None => format!("not found in this connection: {list}"),
+    })
+}
+
+/// `path` = `[catalog.]schema.table[.column]` or a bare `table`, looked up live.
+async fn resolve_live(engine: &QueryEngine, connection_id: &str, path: &str) -> std::result::Result<Option<String>, String> {
+    let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();
+    // Splits where the table is part k and at most one column follows.
+    for k in (0..parts.len()).rev() {
+        let rest = &parts[k + 1..];
+        if rest.len() > 1 {
+            break;
+        }
+        let table = parts[k];
+        let schema_written = parts[..k].join(".").to_ascii_lowercase();
+        let hits = engine.search_objects(connection_id, table, 50).await.map_err(|e| e.message)?;
+        let hit = hits.iter().filter(|o| o.kind.is_relation() && o.name.eq_ignore_ascii_case(table)).find(|o| {
+            let s = o.schema.to_ascii_lowercase();
+            schema_written.is_empty() || s == schema_written || s.ends_with(&format!(".{schema_written}"))
+        });
+        let Some(o) = hit else { continue };
+        let full = format!("{}.{}", o.schema, o.name);
+        let Some(col) = rest.first() else { return Ok(Some(full)) };
+        let d = engine.describe(connection_id, &o.schema, &o.name).await.map_err(|e| e.message)?;
+        if let Some(c) = d.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)) {
+            return Ok(Some(format!("{full}.{}", c.name)));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

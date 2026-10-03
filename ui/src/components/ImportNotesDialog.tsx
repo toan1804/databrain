@@ -90,10 +90,17 @@ export function ImportNotesDialog({
               (it, i) =>
                 it.kind === "new" && (
                   <label key={i} className="flex cursor-pointer items-start gap-2 rounded px-1 py-0.5 hover:bg-hover">
-                    <input type="checkbox" className="mt-1" checked={!!c.addNew[i]} onChange={(e) => setC({ ...c, addNew: { ...c.addNew, [i]: e.target.checked } })} />
-                    <span className="min-w-0">
+                    <input
+                      type="checkbox"
+                      className="mt-1"
+                      disabled={!!it.invalid_target}
+                      checked={!!c.addNew[i] && !it.invalid_target}
+                      onChange={(e) => setC({ ...c, addNew: { ...c.addNew, [i]: e.target.checked } })}
+                    />
+                    <span className={`min-w-0 ${it.invalid_target ? "opacity-60" : ""}`}>
                       {it.incoming.target && <span className="mr-1.5 font-mono text-[11px] text-muted">{it.incoming.target}</span>}
                       <span className="whitespace-pre-wrap">{it.incoming.body}</span>
+                      {it.invalid_target && <span className="block text-[11px] text-danger">Skipped: {it.invalid_target}</span>}
                     </span>
                   </label>
                 ),
@@ -116,6 +123,7 @@ export function ImportNotesDialog({
                 it.kind === "conflict" && (
                   <div key={i} className="mb-2 rounded-md border border-line p-2">
                     <div className="mb-1 font-mono text-[11px] text-muted">{it.incoming.target || it.existing[0]?.target || "glossary"}</div>
+                    {it.invalid_target && <div className="mb-1 text-[11px] text-danger">Kept yours: {it.invalid_target}</div>}
                     <div className="grid grid-cols-2 gap-2">
                       <div>
                         <div className="text-[10.5px] font-medium uppercase text-muted">Yours</div>

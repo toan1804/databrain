@@ -96,6 +96,64 @@ impl NoteStatus {
     }
 }
 
+/// Separators between tables in a note target: `a & b`, `a and b`, `a or b`, `a, b`.
+pub const TARGET_SEPARATORS: [&str; 4] = ["&", ",", "and", "or"];
+
+/// Table paths of a note target with the separator before each one (`""` for
+/// the first): `sales.orders & crm.customers.id` → [("", "sales.orders"), ("&", "crm.customers.id")].
+/// Identifier quotes are dropped. A target without a separator is one path.
+pub fn split_target(target: &str) -> Vec<(String, String)> {
+    let spaced = target.replace('&', " & ").replace(',', " , ");
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut sep = String::new();
+    for tok in spaced.split_whitespace() {
+        let low = tok.to_ascii_lowercase();
+        if TARGET_SEPARATORS.contains(&low.as_str()) {
+            sep = low;
+            continue;
+        }
+        let path: String = tok.chars().filter(|c| !matches!(c, '"' | '`' | '[' | ']')).collect();
+        let path = path.trim_matches('.').to_string();
+        if path.is_empty() {
+            continue;
+        }
+        // Two paths with no separator between them: treat as "&".
+        let s = if out.is_empty() { String::new() } else if sep.is_empty() { "&".into() } else { std::mem::take(&mut sep) };
+        sep.clear();
+        out.push((s, path));
+    }
+    out
+}
+
+/// Join paths back into a target, e.g. `sales.orders & crm.customers`.
+pub fn join_target(parts: &[(String, String)]) -> String {
+    let mut s = String::new();
+    for (sep, path) in parts {
+        if !s.is_empty() {
+            match sep.as_str() {
+                "," => s.push_str(", "),
+                other => {
+                    s.push(' ');
+                    s.push_str(if other.is_empty() { "&" } else { other });
+                    s.push(' ');
+                }
+            }
+        }
+        s.push_str(path);
+    }
+    s
+}
+
+/// Does the note target mention the table `full` (`schema.table`), alone, in a
+/// list, or through one of its columns?
+pub fn target_mentions(target: &str, full: &str, name: &str) -> bool {
+    let full = full.to_ascii_lowercase();
+    split_target(target).iter().any(|(_, p)| {
+        let p = p.to_ascii_lowercase();
+        p == full || p.eq_ignore_ascii_case(name) || p.starts_with(&format!("{full}.")) || full.ends_with(&format!(".{p}"))
+    })
+}
+
 /// `format` value of a notes file.
 pub const NOTES_FORMAT: &str = "databrain-notes";
 
@@ -160,6 +218,9 @@ pub struct ImportItem {
     pub kind: ImportKind,
     /// Existing notes about the same subject.
     pub existing: Vec<KnNote>,
+    /// Why the target cannot be used on this connection (tables missing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_target: Option<String>,
 }
 
 /// What to do with an incoming note: `add`, `skip`, `replace` (delete
@@ -215,7 +276,7 @@ pub fn plan_import(existing: &[KnNote], incoming: &[NoteEntry]) -> Vec<ImportIte
             } else {
                 ImportKind::Conflict
             };
-            ImportItem { incoming: n.clone(), kind, existing: if kind == ImportKind::Conflict { same_subject } else { vec![] } }
+            ImportItem { incoming: n.clone(), kind, existing: if kind == ImportKind::Conflict { same_subject } else { vec![] }, invalid_target: None }
         })
         .collect()
 }
@@ -451,6 +512,21 @@ impl Workspace {
         .optional()?)
     }
 
+    /// Resolve one target path (`schema.table` or `schema.table.column`, bare
+    /// `table` too) against the index: the table and the column, if any.
+    pub fn kn_resolve_path(&self, connection_id: &str, path: &str) -> Result<Option<(KnObject, Option<String>)>> {
+        if let Some(o) = self.kn_get(connection_id, path)? {
+            return Ok(Some((o, None)));
+        }
+        let Some((table, col)) = path.rsplit_once('.') else { return Ok(None) };
+        if let Some(o) = self.kn_get(connection_id, table)? {
+            if let Some(c) = o.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)).map(|c| c.name.clone()) {
+                return Ok(Some((o, Some(c))));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn kn_search(&self, connection_id: &str, text: &str, limit: usize) -> Result<Vec<KnHit>> {
         let Some(q) = fts_query(text) else { return Ok(vec![]) };
         let c = self.conn.lock();
@@ -655,6 +731,18 @@ mod tests {
 
         ws.kn_retain_schemas("c1", &[]).unwrap();
         assert_eq!(ws.kn_count("c1").unwrap(), 0);
+    }
+
+    #[test]
+    fn note_targets_split_into_tables() {
+        let p = split_target("sales.orders & crm.customers and `x`.\"y\" OR dim.date, a.b.c");
+        assert_eq!(p.iter().map(|(s, t)| (s.as_str(), t.as_str())).collect::<Vec<_>>(), vec![("", "sales.orders"), ("&", "crm.customers"), ("and", "x.y"), ("or", "dim.date"), (",", "a.b.c")]);
+        assert_eq!(join_target(&p), "sales.orders & crm.customers and x.y or dim.date, a.b.c");
+        assert_eq!(split_target("a.b c.d").last().unwrap().0, "&", "missing separator means &");
+        assert!(split_target("  & ").is_empty());
+        assert!(target_mentions("sales.orders & crm.customers.id", "crm.customers", "customers"));
+        assert!(target_mentions("main.orders", "memory.main.orders", "orders"), "schema written without catalog");
+        assert!(!target_mentions("sales.orders_old", "sales.orders", "orders"));
     }
 
     #[test]

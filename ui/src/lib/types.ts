@@ -699,6 +699,8 @@ export interface ImportItem {
   incoming: NoteEntry;
   kind: "new" | "same" | "conflict";
   existing: KnNote[];
+  /** Tables of the note that this connection does not have. */
+  invalid_target?: string | null;
 }
 
 export interface ImportAction {
