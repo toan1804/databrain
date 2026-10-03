@@ -1,19 +1,21 @@
 import { useEffect, useMemo, useState } from "react";
-import { Database, Search } from "lucide-react";
-import { groupSchemas, schemaLabel } from "../lib/catalog";
-import type { SchemaInfo } from "../lib/types";
+import { Database, Library, Search } from "lucide-react";
+import { filterLevel, filterNames, topLevelNoun } from "../lib/catalog";
 import { useStore } from "../store";
 import { Modal } from "./ui";
 
 /** Rows rendered at once; narrow with the search box beyond that. */
 const MAX_ROWS = 400;
 
-/** "Choose schemas…" for a connection: which schemas the explorer lists. */
+/**
+ * "Choose catalogs/schemas…": which top-level items the explorer lists for a
+ * connection. Catalogs (databases, projects) on Databricks, Snowflake,
+ * BigQuery and DuckDB; schemas on the other engines.
+ */
 export function SchemaPickerDialog() {
   const connId = useStore((s) => s.schemaPicker);
   const conn = useStore((s) => s.connections.find((c) => c.id === s.schemaPicker));
   const schemas = useStore((s) => (s.schemaPicker ? s.schemas[s.schemaPicker] : undefined));
-  const saved = useStore((s) => (s.schemaPicker ? s.schemaFilter[s.schemaPicker] : undefined));
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
@@ -23,24 +25,26 @@ export function SchemaPickerDialog() {
     if (!connId) return;
     setQuery("");
     setError(null);
-    setPicked(new Set(saved ?? []));
-    if (!useStore.getState().schemas[connId]) {
+    const st = useStore.getState();
+    setPicked(filterNames(st.schemas[connId] ?? [], st.schemaFilter[connId]));
+    if (!st.schemas[connId]) {
       setLoading(true);
-      useStore
-        .getState()
-        .loadSchemas(connId)
+      st.loadSchemas(connId)
+        .then((s) => setPicked(filterNames(s, useStore.getState().schemaFilter[connId])))
         .catch((e) => setError(String(e?.message ?? e)))
         .finally(() => setLoading(false));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connId]);
 
-  const all = useMemo(() => schemas ?? [], [schemas]);
+  const level = useMemo(() => filterLevel(schemas ?? []), [schemas]);
   const q = query.trim().toLowerCase();
-  const matched = useMemo(() => (q ? all.filter((s) => s.name.toLowerCase().includes(q)) : all), [all, q]);
-  const groups = useMemo(() => groupSchemas(matched.slice(0, MAX_ROWS)), [matched]);
+  const matched = useMemo(() => (q ? level.items.filter((i) => i.name.toLowerCase().includes(q)) : level.items), [level, q]);
 
   if (!connId || !conn) return null;
+  const kind = conn.config.kind;
+  const noun = level.kind === "catalog" ? topLevelNoun(kind) : "schema";
+  const nouns = `${noun}s`;
   const close = () => useStore.setState({ schemaPicker: null });
   const toggle = (names: string[], on: boolean) =>
     setPicked((p) => {
@@ -50,32 +54,26 @@ export function SchemaPickerDialog() {
       return n;
     });
   const save = () => {
-    // Everything picked = no filter (new schemas then show up too).
-    const list = all.filter((s) => picked.has(s.name)).map((s) => s.name);
-    useStore.getState().setSchemaFilter(connId, list.length === 0 || list.length === all.length ? null : list);
+    // Everything (or nothing) picked = no filter, so new ones show up too.
+    const list = level.items.filter((i) => picked.has(i.name)).map((i) => i.name);
+    useStore.getState().setSchemaFilter(connId, list.length === 0 || list.length === level.items.length ? null : list);
     close();
   };
-  const row = (s: SchemaInfo, indent: boolean) => (
-    <label key={s.name} className={`flex cursor-pointer items-center gap-2 rounded px-1.5 py-0.5 hover:bg-hover ${indent ? "pl-6" : ""}`}>
-      <input type="checkbox" checked={picked.has(s.name)} onChange={(e) => toggle([s.name], e.target.checked)} />
-      <span className="min-w-0 truncate font-mono text-[12px]">{indent ? schemaLabel(s) : s.name}</span>
-      {s.is_default && <span className="ml-auto shrink-0 text-[10.5px] text-muted">default</span>}
-    </label>
-  );
+  const count = level.items.filter((i) => picked.has(i.name)).length;
 
   return (
     <Modal
       title={
         <span className="flex items-center gap-2">
-          <Database size={15} /> Schemas shown for {conn.name}
+          <Database size={15} /> {nouns[0].toUpperCase() + nouns.slice(1)} shown for {conn.name}
         </span>
       }
       onClose={close}
-      width={520}
+      width={480}
       footer={
         <>
           <span className="mr-auto text-[11.5px] text-muted">
-            {picked.size === 0 ? "None selected: all schemas are shown" : `${picked.size} of ${all.length} selected`}
+            {count === 0 ? `None selected: all ${nouns} are shown` : `${count} of ${level.items.length} selected`}
           </span>
           <button className="btn-ghost" onClick={close}>
             Cancel
@@ -88,49 +86,43 @@ export function SchemaPickerDialog() {
     >
       <div className="space-y-2">
         <p className="text-[12px] text-muted">
-          Only the selected schemas are listed in the explorer. Queries, autocomplete and ⌘P search still see every schema. Schemas created later are hidden until you add them.
+          Only the selected {nouns} are listed in the explorer{level.kind === "catalog" ? `, each with all of its schemas` : ""}. Queries, autocomplete and ⌘P search
+          still see everything. {nouns[0].toUpperCase() + nouns.slice(1)} created later are hidden until you add them.
         </p>
         <div className="flex items-center gap-2">
           <div className="relative flex-1">
             <Search size={13} className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-muted" />
-            <input className="field h-7 pl-7 text-[12.5px]" placeholder={`Filter ${all.length} schemas…`} value={query} onChange={(e) => setQuery(e.target.value)} autoFocus aria-label="Filter schemas" />
+            <input
+              className="field h-7 pl-7 text-[12.5px]"
+              placeholder={`Filter ${level.items.length} ${nouns}…`}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              autoFocus
+              aria-label={`Filter ${nouns}`}
+            />
           </div>
-          <button className="btn-ghost border border-line py-1 text-[12px]" onClick={() => toggle(matched.map((s) => s.name), true)} disabled={!matched.length}>
+          <button className="btn-ghost border border-line py-1 text-[12px]" onClick={() => toggle(matched.map((i) => i.name), true)} disabled={!matched.length}>
             Select {q ? "matches" : "all"}
           </button>
-          <button className="btn-ghost border border-line py-1 text-[12px]" onClick={() => toggle(matched.map((s) => s.name), false)} disabled={!matched.length}>
+          <button className="btn-ghost border border-line py-1 text-[12px]" onClick={() => toggle(matched.map((i) => i.name), false)} disabled={!matched.length}>
             Clear
           </button>
         </div>
-        <div className="max-h-[50vh] overflow-auto rounded-md border border-line p-1" role="group" aria-label="Schemas">
-          {loading && <div className="p-2 text-[12px] text-muted">Loading schemas…</div>}
+        <div className="max-h-[50vh] overflow-auto rounded-md border border-line p-1" role="group" aria-label={nouns}>
+          {loading && <div className="p-2 text-[12px] text-muted">Loading {nouns}…</div>}
           {error && <div className="p-2 text-[12px] text-danger">{error}</div>}
-          {schemas && matched.length === 0 && <div className="p-2 text-[12px] text-muted">No schemas match.</div>}
-          {groups
-            ? groups.map((g) => {
-                const names = g.schemas.map((s) => s.name);
-                const on = names.filter((n) => picked.has(n)).length;
-                return (
-                  <div key={g.name}>
-                    <label className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-0.5 font-medium hover:bg-hover">
-                      <input
-                        type="checkbox"
-                        checked={on === names.length}
-                        ref={(el) => {
-                          if (el) el.indeterminate = on > 0 && on < names.length;
-                        }}
-                        onChange={(e) => toggle(names, e.target.checked)}
-                      />
-                      <span className="min-w-0 truncate text-[12.5px]">{g.name}</span>
-                      <span className="ml-auto text-[10.5px] text-muted">
-                        {on}/{names.length}
-                      </span>
-                    </label>
-                    {g.schemas.map((s) => row(s, true))}
-                  </div>
-                );
-              })
-            : matched.slice(0, MAX_ROWS).map((s) => row(s, false))}
+          {schemas && matched.length === 0 && <div className="p-2 text-[12px] text-muted">No {nouns} match.</div>}
+          {matched.slice(0, MAX_ROWS).map((i) => (
+            <label key={i.name} className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-0.5 hover:bg-hover">
+              <input type="checkbox" checked={picked.has(i.name)} onChange={(e) => toggle([i.name], e.target.checked)} />
+              {level.kind === "catalog" ? <Library size={12} className="shrink-0 text-muted" /> : <Database size={12} className="shrink-0 text-muted" />}
+              <span className="min-w-0 truncate font-mono text-[12px]">{i.name}</span>
+              <span className="ml-auto shrink-0 text-[10.5px] text-muted">
+                {i.isDefault ? "default" : ""}
+                {level.kind === "catalog" && `${i.isDefault ? " · " : ""}${i.count} schema${i.count === 1 ? "" : "s"}`}
+              </span>
+            </label>
+          ))}
           {matched.length > MAX_ROWS && (
             <div className="p-1.5 text-[11.5px] text-muted">
               Showing {MAX_ROWS} of {matched.length}. Type to narrow the list; "Select {q ? "matches" : "all"}" applies to all {matched.length}.

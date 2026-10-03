@@ -176,13 +176,43 @@ export function pageObjects(items: DbObject[], filter: string, limit: number, ke
 
 // ------------------------------------------------------------------ schema filter
 
-/** Schemas to list for a connection: all, or the chosen ones (unknown names ignored). */
+/** Top-level items the explorer filter chooses from: catalogs, or schemas on two-level engines. */
+export function filterLevel(schemas: SchemaInfo[]): { kind: "catalog" | "schema"; items: { name: string; count: number; isDefault: boolean }[] } {
+  const groups = groupSchemas(schemas);
+  if (groups) return { kind: "catalog", items: groups.map((g) => ({ name: g.name, count: g.schemas.length, isDefault: g.isDefault })) };
+  return { kind: "schema", items: schemas.map((s) => ({ name: s.name, count: 0, isDefault: s.is_default })) };
+}
+
+/** Saved filter as top-level names (older filters listed `catalog.schema` ids). */
+export function filterNames(schemas: SchemaInfo[], chosen: string[] | undefined): Set<string> {
+  const out = new Set<string>();
+  if (!chosen) return out;
+  const byName = new Map(schemas.map((s) => [s.name, s]));
+  const catalogs = !!groupSchemas(schemas);
+  for (const c of chosen) {
+    const s = byName.get(c);
+    out.add(catalogs && s?.catalog ? s.catalog : c);
+  }
+  return out;
+}
+
+/** Noun for the explorer's top level of a connection kind. */
+export function topLevelNoun(kind: ConnectorKind, plural = false): string {
+  const n = kind === "bigquery" ? "project" : kind === "databricks" ? "catalog" : THREE_LEVEL.includes(kind) ? "database" : "schema";
+  return plural ? `${n}s` : n;
+}
+
+/**
+ * Schemas to list for a connection. The filter holds top-level names: catalogs
+ * (databases/projects) on three-level engines, schemas elsewhere; a chosen
+ * catalog lists all of its schemas. Unknown names are ignored.
+ */
 export function visibleSchemas(schemas: SchemaInfo[], chosen: string[] | undefined, also?: string | null): SchemaInfo[] {
   if (!chosen || chosen.length === 0) return schemas;
   const set = new Set(chosen);
   // A schema with an object revealed by search is shown even when not chosen.
   if (also) set.add(also);
-  const out = schemas.filter((s) => set.has(s.name));
+  const out = schemas.filter((s) => set.has(s.name) || (!!s.catalog && set.has(s.catalog)));
   // Every chosen schema is gone (renamed/dropped): show all rather than nothing.
   return out.length ? out : schemas;
 }

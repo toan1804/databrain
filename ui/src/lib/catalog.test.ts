@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { GROUP_PAGE, groupObjects, groupOpenByDefault, pageObjects, visibleSchemas, columnList, schemaPath, tablePath, cachedHits, groupSchemas, matchRange, objectMatches, rankHits, revealKeys, schemaLabel, splitSchema, treeKey } from "./catalog";
+import { filterLevel, filterNames, topLevelNoun, GROUP_PAGE, groupObjects, groupOpenByDefault, pageObjects, visibleSchemas, columnList, schemaPath, tablePath, cachedHits, groupSchemas, matchRange, objectMatches, rankHits, revealKeys, schemaLabel, splitSchema, treeKey } from "./catalog";
 import type { DbObject, SchemaInfo } from "./types";
 
 const sch = (catalog: string | null, schema: string, is_default = false): SchemaInfo =>
@@ -130,5 +130,35 @@ describe("catalog: big schemas and schema filter", () => {
     expect(visibleSchemas(schemas, ["c"]).map((s) => s.name)).toEqual(["c"]);
     expect(visibleSchemas(schemas, ["c"], "a").map((s) => s.name)).toEqual(["a", "c"]);
     expect(visibleSchemas(schemas, ["gone"]).map((s) => s.name)).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("catalog: top-level explorer filter", () => {
+  const three = [
+    { name: "main.sales", catalog: "main", is_default: true },
+    { name: "main.crm", catalog: "main", is_default: false },
+    { name: "dev.lab", catalog: "dev", is_default: false },
+  ];
+  const two = [
+    { name: "HR", is_default: true },
+    { name: "SALES", is_default: false },
+  ];
+
+  it("chooses catalogs on three-level engines and schemas elsewhere", () => {
+    expect(filterLevel(three)).toEqual({ kind: "catalog", items: [{ name: "main", count: 2, isDefault: true }, { name: "dev", count: 1, isDefault: false }] });
+    expect(filterLevel(two).kind).toBe("schema");
+    expect(filterLevel(two).items.map((i) => i.name)).toEqual(["HR", "SALES"]);
+    expect(topLevelNoun("databricks", true)).toBe("catalogs");
+    expect(topLevelNoun("snowflake")).toBe("database");
+    expect(topLevelNoun("oracle", true)).toBe("schemas");
+  });
+
+  it("a chosen catalog lists all of its schemas; old schema-id filters still work", () => {
+    expect(visibleSchemas(three, ["dev"]).map((s) => s.name)).toEqual(["dev.lab"]);
+    expect(visibleSchemas(three, ["main"]).map((s) => s.name)).toEqual(["main.sales", "main.crm"]);
+    expect(visibleSchemas(two, ["SALES"]).map((s) => s.name)).toEqual(["SALES"]);
+    // Saved before: "main.crm" → shown as catalog main in the picker.
+    expect([...filterNames(three, ["main.crm"])]).toEqual(["main"]);
+    expect([...filterNames(two, ["HR"])]).toEqual(["HR"]);
   });
 });

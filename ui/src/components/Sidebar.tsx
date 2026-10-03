@@ -50,6 +50,7 @@ import {
   schemaLabel,
   schemaPath,
   tablePath,
+  topLevelNoun,
   treeKey,
   visibleSchemas,
   type CatalogGroup,
@@ -380,6 +381,7 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
   const extra = revealed ?? sticky;
   const shownSchemas = useMemo(() => (schemas ? visibleSchemas(schemas, chosen, extra) : undefined), [schemas, chosen, extra]);
   const filtered = !!schemas && !!shownSchemas && shownSchemas.length < schemas.length;
+  const topNoun = topLevelNoun(conn.config.kind, true);
   const catalogs = useMemo(() => (shownSchemas ? groupSchemas(shownSchemas) : null), [shownSchemas]);
   const pickSchemas = () => {
     setMenu(null);
@@ -440,9 +442,9 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
         <Popover x={menu.x} y={menu.y} onClose={() => setMenu(null)} className="max-h-[75vh] w-60 overflow-auto">
           <MenuItem icon={<FileCode2 size={13} />} label="New query" onClick={() => { setMenu(null); newTab({ connection_id: conn.id }); }} />
           <MenuItem icon={<Search size={13} />} label="Find table…" onClick={() => { setMenu(null); useStore.getState().openCatalogSearch(conn.id); }} />
-          <MenuItem icon={<ListChecks size={13} />} label="Choose schemas…" hint={chosen ? `${chosen.length} shown` : undefined} onClick={pickSchemas} />
+          <MenuItem icon={<ListChecks size={13} />} label={`Choose ${topNoun}…`} hint={chosen ? `${chosen.length} shown` : undefined} onClick={pickSchemas} />
           {chosen && (
-            <MenuItem icon={<Eye size={13} />} label="Show all schemas" onClick={() => { setMenu(null); useStore.getState().setSchemaFilter(conn.id, null); }} />
+            <MenuItem icon={<Eye size={13} />} label={`Show all ${topNoun}`} onClick={() => { setMenu(null); useStore.getState().setSchemaFilter(conn.id, null); }} />
           )}
           <MenuItem icon={<RefreshCw size={13} />} label={conn.connected ? "Refresh" : "Connect"} onClick={() => { setMenu(null); setExpanded(true); void load(true); }} />
           <MenuItem icon={<NotebookPen size={13} />} label="New notebook" onClick={() => { setMenu(null); void useStore.getState().newNotebook(conn.id); }} />
@@ -474,10 +476,11 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
           icon={<ListChecks size={12} className="text-accent" />}
           label={
             <span className="text-[11.5px] text-muted">
-              {shownSchemas!.length} of {schemas!.length} schemas · <span className="text-accent">change</span>
+              {catalogs ? `${catalogs.length} of ${groupSchemas(schemas!)?.length ?? 0}` : `${shownSchemas!.length} of ${schemas!.length}`} {topNoun} ·{" "}
+              <span className="text-accent">change</span>
             </span>
           }
-          title="Choose which schemas are listed"
+          title={`Choose which ${topNoun} are listed`}
           onClick={() => useStore.setState({ schemaPicker: conn.id })}
         />
       )}
@@ -491,7 +494,7 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
                 group={g}
                 filtered={!!chosen}
                 // The Results connection exists to query outputs: show them.
-                defaultOpen={g.isDefault || catalogs.length === 1 || (g.name === "results" && conn.config.options?.databrain_results === "1")}
+                defaultOpen={!chosen && (g.isDefault || catalogs.length === 1 || (g.name === "results" && conn.config.options?.databrain_results === "1"))}
               />
             ))
           : shownSchemas.map((s) => (
