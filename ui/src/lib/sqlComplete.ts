@@ -18,6 +18,8 @@ export interface MetaProvider {
   searchTables(prefix: string): Promise<DbObject[]>;
   /** Column names of a table (may load). */
   columns(schema: string, table: string): Promise<string[] | undefined>;
+  /** Key roles of a table's columns (`partition key`, `indexed`…), when known (no I/O). */
+  columnRoles?(schema: string, table: string): Record<string, string> | undefined;
   /** Extra virtual tables, e.g. DuckDB `results.<output>`. */
   virtualTables?(): { schema: string; name: string; columns: string[] }[];
 }
@@ -141,7 +143,7 @@ export function splitPath(path: string): string[] {
   return parts;
 }
 
-interface TableRef {
+export interface TableRef {
   /** Dotted reference as written, unquoted parts. */
   parts: string[];
   alias?: string;
@@ -282,7 +284,7 @@ function findSchema(p: MetaProvider, written: string[]): SchemaInfo | undefined 
 }
 
 /** Resolve a table reference to (schema id, table) using known metadata. */
-async function resolveTable(p: MetaProvider, parts: string[]): Promise<{ schema: string; name: string } | undefined> {
+export async function resolveTable(p: MetaProvider, parts: string[]): Promise<{ schema: string; name: string } | undefined> {
   const name = parts[parts.length - 1];
   if (parts.length > 1) {
     const sc = findSchema(p, parts.slice(0, -1));
@@ -298,7 +300,7 @@ async function resolveTable(p: MetaProvider, parts: string[]): Promise<{ schema:
   return undefined;
 }
 
-async function columnsFor(p: MetaProvider, parts: string[]): Promise<{ table: string; columns: string[] } | undefined> {
+async function columnsFor(p: MetaProvider, parts: string[]): Promise<{ table: string; columns: string[]; roles?: Record<string, string> } | undefined> {
   const virt = p.virtualTables?.() ?? [];
   const last = parts[parts.length - 1].toLowerCase();
   const v = virt.find((t) => t.name.toLowerCase() === last && (parts.length === 1 || parts[parts.length - 2].toLowerCase() === t.schema.toLowerCase()));
@@ -306,7 +308,7 @@ async function columnsFor(p: MetaProvider, parts: string[]): Promise<{ table: st
   const r = await resolveTable(p, parts);
   if (!r) return undefined;
   const cols = await p.columns(r.schema, r.name);
-  return cols ? { table: r.name, columns: cols } : undefined;
+  return cols ? { table: r.name, columns: cols, roles: p.columnRoles?.(r.schema, r.name) } : undefined;
 }
 
 /**
@@ -391,7 +393,10 @@ export async function completeSql(doc: string, pos: number, p: MetaProvider, exp
       const ref = refs.find((r) => r.alias?.toLowerCase() === path[0].toLowerCase() || (!r.alias && r.parts[r.parts.length - 1].toLowerCase() === path[0].toLowerCase()));
       if (ref) {
         const c = await columnsFor(p, ref.parts);
-        for (const col of c?.columns ?? []) opts.push({ label: col, type: "column", detail: c?.table, apply: quoteIdent(k, col), boost: 10 });
+        for (const col of c?.columns ?? []) {
+          const role = c?.roles?.[col.toLowerCase()];
+          opts.push({ label: col, type: "column", detail: role ? `${c?.table} · ${role}` : c?.table, apply: quoteIdent(k, col), boost: role ? 12 : 10 });
+        }
       }
     }
     // virtual schemas (DuckDB results.)
@@ -457,7 +462,11 @@ export async function completeSql(doc: string, pos: number, p: MetaProvider, exp
     // Expression: columns of the statement's tables, aliases, functions, keywords.
     const cols = await Promise.all(refs.map((r) => columnsFor(p, r.parts)));
     cols.forEach((c, i) => {
-      for (const col of c?.columns ?? []) opts.push({ label: col, type: "column", detail: c!.table, apply: quoteIdent(k, col), boost: 10 });
+      for (const col of c?.columns ?? []) {
+        const role = c!.roles?.[col.toLowerCase()];
+        // Key columns first: filtering/joining on them is fast.
+        opts.push({ label: col, type: "column", detail: role ? `${c!.table} · ${role}` : c!.table, apply: quoteIdent(k, col), boost: role ? 12 : 10 });
+      }
       const r = refs[i];
       opts.push({ label: r.alias ?? r.parts[r.parts.length - 1], type: "alias", detail: r.alias ? r.parts.join(".") : "table", apply: `${quoteIdent(k, r.alias ?? r.parts[r.parts.length - 1])}.`, reopen: true, boost: 4 });
     });

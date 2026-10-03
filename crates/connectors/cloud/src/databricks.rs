@@ -433,6 +433,25 @@ impl Session for DbxSession {
             .collect())
     }
 
+    async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
+        use databrain_connector_core::{parse_list_text, query_table, TableLayout};
+        let full = format!("{}.{}", databrain_connector_core::quote_path(ConnectorKind::Databricks, schema), quote_ident(ConnectorKind::Databricks, name));
+        let mut l = TableLayout::default();
+        // Views and non-Delta tables have no detail: no hints, not an error.
+        let Ok((names, rows)) = query_table(self, &format!("DESCRIBE DETAIL {full}")).await else { return Ok(l) };
+        let Some(r) = rows.first() else { return Ok(l) };
+        let get = |n: &str| names.iter().position(|x| x.eq_ignore_ascii_case(n)).and_then(|i| r.get(i).cloned().flatten());
+        l.partition_by = get("partitionColumns").as_deref().map(parse_list_text).unwrap_or_default();
+        if !l.partition_by.is_empty() {
+            l.partition_kind = Some("identity".into());
+        }
+        l.cluster_by = get("clusteringColumns").as_deref().map(parse_list_text).unwrap_or_default();
+        if let (Some(files), Some(bytes)) = (get("numFiles"), get("sizeInBytes").and_then(|b| b.parse::<f64>().ok())) {
+            l.notes.push(format!("{} · {files} files · {:.1} GB", get("format").unwrap_or_else(|| "delta".into()), bytes / 1e9));
+        }
+        Ok(l)
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let object = self
             .list_objects(schema)

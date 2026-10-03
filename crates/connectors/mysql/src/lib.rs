@@ -389,6 +389,49 @@ impl Session for MysqlSession {
         Ok(out)
     }
 
+    async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
+        use databrain_connector_core::{group_indexes, query_text, quote_literal, truthy, TableLayout};
+        let (s, t) = (quote_literal(schema), quote_literal(name));
+        let idx = query_text(
+            self,
+            &format!(
+                "select index_name, coalesce(column_name, '(expression)'), case when non_unique = 0 then 1 else 0 end, \
+                        case when index_name = 'PRIMARY' then 1 else 0 end, index_type \
+                 from information_schema.statistics where table_schema = {s} and table_name = {t} \
+                 order by index_name = 'PRIMARY' desc, index_name, seq_in_index"
+            ),
+        )
+        .await?;
+        let mut l = TableLayout {
+            indexes: group_indexes(idx.into_iter().map(|r| {
+                let m = r[4].clone().map(|m| m.to_ascii_lowercase()).filter(|m| m != "btree");
+                (r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default(), truthy(&r[2]), truthy(&r[3]), m)
+            })),
+            ..Default::default()
+        };
+        if let Ok(p) = query_text(
+            self,
+            &format!(
+                "select partition_method, partition_expression, count(*) from information_schema.partitions \
+                 where table_schema = {s} and table_name = {t} and partition_name is not null group by 1, 2"
+            ),
+        )
+        .await
+        {
+            if let Some(r) = p.first() {
+                l.partition_kind = r[0].as_deref().map(|m| m.to_ascii_lowercase());
+                l.partition_by = r[1].as_deref().map(|e| databrain_connector_core::split_key_list(e).into_iter().map(|x| databrain_connector_core::unquote_ident(&x)).collect()).unwrap_or_default();
+                if let Some(n) = &r[2] {
+                    l.notes.push(format!("{n} partitions"));
+                }
+            }
+        }
+        if let Ok(r) = query_text(self, &format!("select table_rows from information_schema.tables where table_schema = {s} and table_name = {t}")).await {
+            l.row_estimate = r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok());
+        }
+        Ok(l)
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let meta: Vec<(String, Option<String>, Option<u64>)> = self
             .query_rows(
@@ -574,5 +617,16 @@ mod tests {
         cancel.cancel();
         let _ = stream.collect().await;
         assert!(!s.list_schemas().await.unwrap().is_empty());
+        if let Ok(db) = std::env::var("DATABRAIN_MYSQL_DB") {
+            let run = |sql: &'static str| s.execute(sql, ExecOptions::default());
+            run("drop table if exists databrain_layout_t").await.unwrap().collect().await.unwrap();
+            run("create table databrain_layout_t (id int, day date, cust varchar(20), primary key (id, day), key i_cust (cust, day)) partition by range columns (day) (partition p0 values less than ('2030-01-01'))")
+                .await.unwrap().collect().await.unwrap();
+            let l = s.table_layout(&db, "databrain_layout_t").await.unwrap();
+            run("drop table databrain_layout_t").await.unwrap().collect().await.unwrap();
+            assert!(l.indexes[0].primary && l.indexes[0].columns == vec!["id", "day"], "{l:?}");
+            assert_eq!(l.indexes[1].columns, vec!["cust", "day"]);
+            assert_eq!(l.partition_by, vec!["day"], "{l:?}");
+        }
     }
 }

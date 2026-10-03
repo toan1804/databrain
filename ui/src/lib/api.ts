@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  TableLayout,
   AgentEvent,
   AgentRequest,
   AiMessageRecord,
@@ -115,6 +116,7 @@ export const api = {
     call<DbObject[]>("search_objects", { id, query, limit: limit ?? null }),
   describeObject: (id: string, schema: string, name: string) =>
     call<ObjectDetail>("describe_object", { id, schema, name }),
+  tableLayout: (id: string, schema: string, name: string) => call<TableLayout>("table_layout", { id, schema, name }),
 
   statementAtCursor: (kind: ConnectorKind, text: string, cursor: number) =>
     call<Span | null>("statement_at_cursor", { kind, text, cursor }),

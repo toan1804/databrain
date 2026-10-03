@@ -12,6 +12,7 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
 - **Explorer:** three-level engines (Databricks, Snowflake, BigQuery, DuckDB) show catalog → schema → tables. Find tables with ⌘P: it searches every connected database, or one connection that you choose, with `schema.name` matching. Each match can be shown in the tree, inserted into the editor, or opened with a select of the top 100 rows.
 - **Local files:** query CSV/TSV, Parquet, JSON/NDJSON, Excel, Delta Lake and Iceberg with DuckDB. Use "Query a local file…" in the sidebar or palette, or attach files to a DuckDB connection (they appear as views in `files`).
 - **Editor:** CodeMirror 6 with dialect highlighting and schema autocomplete, run statement/selection/script, cancel, and error underlines.
+  - Query hints from each table's indexes, partitions and cluster keys (all engines). A filter that skips the partition column, wraps a partition or indexed column in a function or cast, or uses `LIKE '%…'` on an indexed column is underlined, with the reason on hover. Hovering a table name shows its layout. Autocomplete lists key columns first, tagged `partition key`, `cluster key`, `primary key` or `indexed`.
 - **Notebooks:** SQL and Markdown cells on a connection.
   - Run a cell, run all, or run from here.
   - Output stays under each cell, and all cells share one session.

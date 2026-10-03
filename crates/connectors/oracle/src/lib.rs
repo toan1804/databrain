@@ -433,6 +433,51 @@ impl Session for OracleSession {
             .collect())
     }
 
+    async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
+        use databrain_connector_core::{group_indexes, query_text, quote_literal, truthy, TableLayout};
+        let (s, t) = (quote_literal(schema), quote_literal(name));
+        let idx = query_text(
+            self,
+            &format!(
+                "select ic.index_name, ic.column_name, case when i.uniqueness = 'UNIQUE' then 1 else 0 end, \
+                        case when c.constraint_name is not null then 1 else 0 end, i.index_type \
+                 from all_ind_columns ic \
+                 join all_indexes i on i.owner = ic.index_owner and i.index_name = ic.index_name \
+                 left join all_constraints c on c.owner = i.table_owner and c.index_name = i.index_name and c.constraint_type = 'P' \
+                 where ic.table_owner = {s} and ic.table_name = {t} \
+                 order by 4 desc, ic.index_name, ic.column_position"
+            ),
+        )
+        .await?;
+        let mut l = TableLayout {
+            indexes: group_indexes(idx.into_iter().map(|r| {
+                let m = r[4].clone().map(|m| m.to_ascii_lowercase()).filter(|m| m != "normal");
+                (r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default(), truthy(&r[2]), truthy(&r[3]), m)
+            })),
+            ..Default::default()
+        };
+        if let Ok(p) = query_text(
+            self,
+            &format!(
+                "select k.column_name, lower(p.partitioning_type), p.partition_count from all_part_key_columns k \
+                 join all_part_tables p on p.owner = k.owner and p.table_name = k.name \
+                 where k.owner = {s} and k.name = {t} and k.object_type = 'TABLE' order by k.column_position"
+            ),
+        )
+        .await
+        {
+            l.partition_by = p.iter().filter_map(|r| r[0].clone()).collect();
+            l.partition_kind = p.first().and_then(|r| r[1].clone());
+            if let Some(n) = p.first().and_then(|r| r[2].clone()) {
+                l.notes.push(format!("{n} partitions"));
+            }
+        }
+        if let Ok(r) = query_text(self, &format!("select num_rows from all_tables where owner = {s} and table_name = {t}")).await {
+            l.row_estimate = r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok());
+        }
+        Ok(l)
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let object = self
             .list_objects(schema)

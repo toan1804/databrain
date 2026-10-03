@@ -356,6 +356,110 @@ pub struct ObjectDetail {
     pub foreign_keys: Vec<ForeignKey>,
 }
 
+/// An index (or primary/unique key) on a table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct IndexInfo {
+    pub name: String,
+    /// Key columns in order (expressions as written by the server).
+    pub columns: Vec<String>,
+    #[serde(default)]
+    pub unique: bool,
+    #[serde(default)]
+    pub primary: bool,
+    /// Access method when not the engine default, e.g. `hash`, `gin`, `clustered`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+}
+
+/// How a table is physically organised: what makes filters and joins fast.
+/// Used for query hints in the editor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TableLayout {
+    #[serde(default)]
+    pub indexes: Vec<IndexInfo>,
+    /// Partition columns (or expressions), e.g. `order_date`.
+    #[serde(default)]
+    pub partition_by: Vec<String>,
+    /// e.g. `range`, `list`, `hash`, `day`, `hive`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_kind: Option<String>,
+    /// Clustering / sort keys (Snowflake, BigQuery, Databricks liquid clustering and Z-order).
+    #[serde(default)]
+    pub cluster_by: Vec<String>,
+    /// The server rejects queries without a partition filter (BigQuery `require_partition_filter`).
+    #[serde(default)]
+    pub requires_partition_filter: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_estimate: Option<i64>,
+    /// Extra facts worth showing (e.g. "ZORDER BY (a, b)", "heap: no clustered index").
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl TableLayout {
+    /// Layout with only the primary key, from column metadata.
+    pub fn from_columns(columns: &[ColumnInfo]) -> Self {
+        let pk: Vec<String> = columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect();
+        let mut l = TableLayout::default();
+        if !pk.is_empty() {
+            l.indexes.push(IndexInfo { name: "PRIMARY KEY".into(), columns: pk, unique: true, primary: true, method: None });
+        }
+        l
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indexes.is_empty() && self.partition_by.is_empty() && self.cluster_by.is_empty() && self.notes.is_empty()
+    }
+}
+
+/// Split a key list such as `a, date_trunc('day', b), "c,d"` at top-level commas.
+pub fn split_key_list(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let (mut depth, mut cur, mut quote) = (0i32, String::new(), None::<char>);
+    for ch in s.chars() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => {
+                quote = None;
+                cur.push(c);
+            }
+            (Some(_), c) => cur.push(c),
+            (None, '\'' | '"' | '`') => {
+                quote = Some(ch);
+                cur.push(ch);
+            }
+            (None, '(' | '[') => {
+                depth += 1;
+                cur.push(ch);
+            }
+            (None, ')' | ']') => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            (None, ',') if depth == 0 => {
+                if !cur.trim().is_empty() {
+                    out.push(cur.trim().to_string());
+                }
+                cur.clear();
+            }
+            (None, c) => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// Strip one level of identifier quotes (`"a"`, `` `a` ``, `[a]`).
+pub fn unquote_ident(s: &str) -> String {
+    let t = s.trim();
+    let b = t.as_bytes();
+    if b.len() >= 2 && ((b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'`' && b[b.len() - 1] == b'`') || (b[0] == b'[' && b[b.len() - 1] == b']')) {
+        return t[1..t.len() - 1].to_string();
+    }
+    t.to_string()
+}
+
 /// One schema's metadata from [`crate::Session::bulk_metadata`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaMetadata {
@@ -372,6 +476,39 @@ pub struct TableColumns {
     pub columns: Vec<ColumnInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub foreign_keys: Vec<ForeignKey>,
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn splits_key_lists() {
+        assert_eq!(split_key_list("a, date_trunc('day', b) , \"c,d\""), vec!["a", "date_trunc('day', b)", "\"c,d\""]);
+        assert_eq!(split_key_list("  "), Vec::<String>::new());
+        assert_eq!(unquote_ident("`x`"), "x");
+        assert_eq!(unquote_ident("[x y]"), "x y");
+        assert_eq!(crate::parse_list_text("[a, \"b c\"]"), vec!["a", "b c"]);
+        assert_eq!(crate::parse_list_text("[]"), Vec::<String>::new());
+        assert_eq!(crate::parse_call_list("RANGE (order_date)"), ("range".to_string(), vec!["order_date".to_string()]));
+        assert_eq!(crate::parse_call_list("LINEAR(a, \"B\")").1, vec!["a", "B"]);
+        let ix = crate::group_indexes([
+            ("i".to_string(), "a".to_string(), false, false, None),
+            ("pk".into(), "id".into(), false, true, None),
+            ("i".into(), "b".into(), false, false, None),
+        ]);
+        assert_eq!(ix[0].name, "pk");
+        assert!(ix[0].unique);
+        assert_eq!(ix[1].columns, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn primary_key_from_columns() {
+        let c = |n: &str, pk| ColumnInfo { name: n.into(), data_type: "int".into(), nullable: false, is_primary_key: pk, default: None, comment: None };
+        let l = TableLayout::from_columns(&[c("a", true), c("b", false), c("c", true)]);
+        assert_eq!(l.indexes[0].columns, vec!["a", "c"]);
+        assert!(TableLayout::from_columns(&[c("b", false)]).is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -763,6 +763,30 @@ impl Session for DuckSession {
             .collect())
     }
 
+    async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
+        use databrain_connector_core::{parse_list_text, query_text, truthy, IndexInfo, TableLayout};
+        if schema == RESULTS_SCHEMA_ID {
+            return Ok(TableLayout::default());
+        }
+        let (db, sch) = schema.split_once('.').unwrap_or((schema, "main"));
+        let w = format!("database_name = {} AND schema_name = {} AND table_name = {}", quote_literal(db), quote_literal(sch), quote_literal(name));
+        let mut l = TableLayout::default();
+        for r in query_text(self, &format!("SELECT constraint_type, constraint_column_names FROM duckdb_constraints() WHERE {w} AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')")).await? {
+            let primary = r[0].as_deref() == Some("PRIMARY KEY");
+            let columns = r[1].as_deref().map(parse_list_text).unwrap_or_default();
+            l.indexes.push(IndexInfo { name: r[0].clone().unwrap_or_default(), columns, unique: true, primary, method: None });
+        }
+        for r in query_text(self, &format!("SELECT index_name, expressions, is_unique, is_primary FROM duckdb_indexes() WHERE {w}")).await? {
+            let columns = r[1].as_deref().map(parse_list_text).unwrap_or_default();
+            l.indexes.push(IndexInfo { name: r[0].clone().unwrap_or_default(), columns, unique: truthy(&r[2]), primary: truthy(&r[3]), method: Some("art".into()) });
+        }
+        l.indexes.sort_by_key(|i| !i.primary);
+        if let Ok(r) = query_text(self, &format!("SELECT estimated_size FROM duckdb_tables() WHERE {w}")).await {
+            l.row_estimate = r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok());
+        }
+        Ok(l)
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         if schema == RESULTS_SCHEMA_ID {
             let object = self.output_objects().into_iter().find(|o| o.name == name).ok_or_else(|| ConnectorError::query(format!("output {name} not found")))?;
@@ -843,6 +867,18 @@ mod tests {
 
     async fn q(s: &dyn Session, sql: &str) -> databrain_connector_core::Collected {
         s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn table_layout_lists_keys_and_indexes() {
+        let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        q(&*s, "CREATE TABLE o (id INTEGER PRIMARY KEY, code VARCHAR UNIQUE, cust INTEGER, day DATE)").await;
+        q(&*s, "CREATE INDEX o_cust ON o (cust, day)").await;
+        let l = s.table_layout("memory.main", "o").await.unwrap();
+        assert!(l.indexes[0].primary, "{l:?}");
+        assert_eq!(l.indexes[0].columns, vec!["id"]);
+        assert!(l.indexes.iter().any(|i| i.unique && i.columns == vec!["code"]), "{l:?}");
+        assert!(l.indexes.iter().any(|i| i.name == "o_cust" && i.columns == vec!["cust", "day"]), "{l:?}");
     }
 
     #[test]

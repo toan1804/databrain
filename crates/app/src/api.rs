@@ -407,6 +407,10 @@ pub async fn describe(
     state.engine.describe(id, schema, name).await
 }
 
+pub async fn table_layout(state: &AppState, id: &str, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
+    state.engine.table_layout(id, schema, name).await
+}
+
 // ------------------------------------------------------------ running queries
 
 #[derive(Debug, Serialize, PartialEq, Eq)]

@@ -8,7 +8,9 @@ import type { EditorView } from "@codemirror/view";
 import { api } from "../lib/api";
 import { completeSql, type MetaProvider, type SqlOption } from "../lib/sqlComplete";
 import type { ConnectorKind, DbObject } from "../lib/types";
+import { columnRoles } from "../lib/queryHints";
 import { useStore } from "../store";
+import { cachedLayout, loadLayout } from "./queryHintsExt";
 
 const DIALECTS: Record<ConnectorKind, SQLDialect> = {
   postgres: PostgreSQL,
@@ -98,6 +100,11 @@ export function storeProvider(connId: string): MetaProvider | null {
       } catch {
         return undefined;
       }
+    },
+    columnRoles: (schema, table) => {
+      const l = cachedLayout(connId, schema, table);
+      if (l === undefined && live) void loadLayout(connId, schema, table);
+      return l ? columnRoles(l) : undefined;
     },
     virtualTables: () =>
       conn.config.kind !== "duckdb"

@@ -20,6 +20,7 @@ import type { ConnectorKind } from "../lib/types";
 import { useStore } from "../store";
 import { editorBridge } from "../editorBridge";
 import { canFetchMetadata, sqlAssist, sqlLanguage } from "./sqlAssist";
+import { queryHints } from "./queryHintsExt";
 
 export const highlight = HighlightStyle.define([
   { tag: [t.keyword, t.operatorKeyword, t.modifier], color: "var(--syn-keyword)", fontWeight: "500" },
@@ -101,6 +102,8 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
           closeBrackets(),
           // Keywords for the clause, the connection's tables and columns.
           sqlAssist(() => useStore.getState().tabs.find((x) => x.id === tabId)?.connection_id),
+          // Partition / index / cluster key hints (underlines + hover).
+          queryHints(() => useStore.getState().tabs.find((x) => x.id === tabId)?.connection_id),
           highlightActiveLine(),
           highlightSelectionMatches(),
           syntaxHighlighting(highlight),

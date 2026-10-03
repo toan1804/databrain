@@ -147,6 +147,11 @@ async fn sqlite_explorer_and_queries() {
     assert_eq!(orders.foreign_keys[0].ref_table, "customers");
     assert!(orders.ddl.as_deref().unwrap().contains("CHECK (status IN"));
 
+    // Query hints: primary key + secondary index of the sample database.
+    let layout = api::table_layout(&st, &id, "main", "orders").await.unwrap();
+    assert_eq!(layout.indexes[0].columns, vec!["order_id"]);
+    assert!(layout.indexes.iter().any(|i| i.name == "orders_customer" && i.columns == vec!["customer_id"]), "{layout:?}");
+
     let counts = query(
         &st,
         &id,

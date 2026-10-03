@@ -86,7 +86,13 @@ pub trait Session: Send + Sync {
         Ok(None)
     }
 
-    /// Columns of every table/view in a schema (bulk, for the AI knowledge
+    /// Indexes, partitioning and clustering of a table (editor query hints).
+    /// The default reports the primary key from [`Session::describe`].
+    async fn table_layout(&self, schema: &str, name: &str) -> Result<TableLayout> {
+        Ok(TableLayout::from_columns(&self.describe(schema, name).await?.columns))
+    }
+
+    //// Columns of every table/view in a schema (bulk, for the AI knowledge
     /// index). The default describes objects one by one.
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
         let mut out = Vec::new();
@@ -107,6 +113,81 @@ pub trait Session: Send + Sync {
         }
         Ok(out)
     }
+}
+
+/// Run a small metadata query and return every cell as text (NULL → None;
+/// lists as `[a, b]`). For catalog queries in `table_layout` implementations.
+pub async fn query_text<S: Session + ?Sized>(s: &S, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+    Ok(query_table(s, sql).await?.1)
+}
+
+/// [`query_text`] plus the column names.
+#[allow(clippy::type_complexity)]
+pub async fn query_table<S: Session + ?Sized>(s: &S, sql: &str) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
+    use arrow::array::Array;
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+    let c = s.execute(sql, ExecOptions::default()).await?.collect().await?;
+    let opts = FormatOptions::default();
+    let mut rows = Vec::new();
+    for b in &c.batches {
+        let fmts: Vec<ArrayFormatter> = b
+            .columns()
+            .iter()
+            .map(|a| ArrayFormatter::try_new(a.as_ref(), &opts).map_err(|e| ConnectorError::internal(e.to_string())))
+            .collect::<Result<_>>()?;
+        for i in 0..b.num_rows() {
+            rows.push(b.columns().iter().zip(&fmts).map(|(a, f)| (!a.is_null(i)).then(|| f.value(i).to_string())).collect());
+        }
+    }
+    let names = c.schema.map(|sc| sc.fields().iter().map(|f| f.name().clone()).collect()).unwrap_or_default();
+    Ok((names, rows))
+}
+
+/// Group one-row-per-key-column index rows `(index, column, unique, primary,
+/// method)` into indexes, keeping the first-seen order.
+pub fn group_indexes(rows: impl IntoIterator<Item = (String, String, bool, bool, Option<String>)>) -> Vec<IndexInfo> {
+    let mut out: Vec<IndexInfo> = Vec::new();
+    for (name, col, unique, primary, method) in rows {
+        match out.iter_mut().find(|i| i.name == name) {
+            Some(i) => i.columns.push(col),
+            None => out.push(IndexInfo { name, columns: vec![col], unique: unique || primary, primary, method }),
+        }
+    }
+    out.sort_by_key(|i| !i.primary);
+    out
+}
+
+/// `[a, b]` / `["a","b"]` / `a, b` → items (Databricks/DuckDB list text).
+pub fn parse_list_text(s: &str) -> Vec<String> {
+    let t = s.trim();
+    let t = t.strip_prefix('[').and_then(|x| x.strip_suffix(']')).unwrap_or(t);
+    split_key_list(t)
+        .into_iter()
+        .map(|x| {
+            let x = x.trim();
+            let x = x.strip_prefix('\'').and_then(|y| y.strip_suffix('\'')).unwrap_or(x);
+            unquote_ident(x)
+        })
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+/// `RANGE (a, b)` / `LINEAR(a, b)` → ("range", ["a", "b"]); no parens → ("", [text]).
+pub fn parse_call_list(s: &str) -> (String, Vec<String>) {
+    let t = s.trim();
+    match (t.find('('), t.rfind(')')) {
+        (Some(o), Some(c)) if c > o => {
+            let items = split_key_list(&t[o + 1..c]).into_iter().map(|x| unquote_ident(&x)).collect();
+            (t[..o].trim().to_ascii_lowercase(), items)
+        }
+        _ if t.is_empty() => (String::new(), vec![]),
+        _ => (String::new(), vec![unquote_ident(t)]),
+    }
+}
+
+/// Truthy cell text from catalog queries (`t`, `true`, `1`, `YES`, `UNIQUE`).
+pub fn truthy(v: &Option<String>) -> bool {
+    matches!(v.as_deref().map(|x| x.trim().to_ascii_lowercase()).as_deref(), Some("t" | "true" | "1" | "yes" | "y" | "unique"))
 }
 
 /// Per-schema metadata (the default for [`Session::bulk_metadata`]).

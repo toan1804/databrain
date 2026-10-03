@@ -519,6 +519,57 @@ impl Session for PgSession {
         Ok(out)
     }
 
+    async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
+        use databrain_connector_core::{group_indexes, parse_call_list, query_text, quote_literal, truthy, TableLayout};
+        let (s, t) = (quote_literal(schema), quote_literal(name));
+        let idx = query_text(
+            self,
+            &format!(
+                "select i.relname::text, coalesce(a.attname::text, pg_catalog.pg_get_indexdef(ix.indexrelid, k.n::int, true)), \
+                        ix.indisunique, ix.indisprimary, am.amname::text \
+                 from pg_catalog.pg_index ix \
+                 join pg_catalog.pg_class c on c.oid = ix.indrelid \
+                 join pg_catalog.pg_namespace ns on ns.oid = c.relnamespace \
+                 join pg_catalog.pg_class i on i.oid = ix.indexrelid \
+                 join pg_catalog.pg_am am on am.oid = i.relam \
+                 cross join lateral unnest(ix.indkey::int2[]) with ordinality as k(attnum, n) \
+                 left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = k.attnum and k.attnum > 0 \
+                 where ns.nspname = {s} and c.relname = {t} and k.n <= ix.indnkeyatts \
+                 order by ix.indisprimary desc, i.relname, k.n"
+            ),
+        )
+        .await?;
+        let mut l = TableLayout {
+            indexes: group_indexes(idx.into_iter().map(|r| {
+                let m = r[4].clone().filter(|m| m != "btree");
+                (r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default(), truthy(&r[2]), truthy(&r[3]), m)
+            })),
+            ..Default::default()
+        };
+        let meta = query_text(
+            self,
+            &format!(
+                "select case when c.relkind = 'p' then pg_catalog.pg_get_partkeydef(c.oid) end, c.reltuples::bigint, \
+                        (select count(*) from pg_catalog.pg_inherits h where h.inhparent = c.oid) \
+                 from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 where n.nspname = {s} and c.relname = {t}"
+            ),
+        )
+        .await?;
+        if let Some(r) = meta.first() {
+            if let Some(def) = &r[0] {
+                let (kind, cols) = parse_call_list(def);
+                l.partition_by = cols;
+                l.partition_kind = (!kind.is_empty()).then_some(kind);
+                if let Some(n) = &r[2] {
+                    l.notes.push(format!("{n} partitions"));
+                }
+            }
+            l.row_estimate = r[1].as_deref().and_then(|x| x.parse().ok()).filter(|n: &i64| *n >= 0);
+        }
+        Ok(l)
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let obj = self
             .client
@@ -797,5 +848,16 @@ mod tests {
         cancel.cancel();
         assert!(stream.collect().await.unwrap_err().is_cancelled());
         assert!(!s.list_schemas().await.unwrap().is_empty());
+        // Indexes + partition key for query hints.
+        let run = |sql: &'static str| s.execute(sql, ExecOptions::default());
+        run("drop table if exists databrain_layout_t").await.unwrap().collect().await.unwrap();
+        run("create table databrain_layout_t (id int, day date not null, cust text, primary key (id, day)) partition by range (day)").await.unwrap().collect().await.unwrap();
+        run("create index databrain_layout_i on databrain_layout_t (cust, lower(cust))").await.unwrap().collect().await.unwrap();
+        let l = s.table_layout("public", "databrain_layout_t").await.unwrap();
+        run("drop table databrain_layout_t").await.unwrap().collect().await.unwrap();
+        assert_eq!(l.partition_by, vec!["day"], "{l:?}");
+        assert_eq!(l.partition_kind.as_deref(), Some("range"));
+        assert!(l.indexes[0].primary && l.indexes[0].columns == vec!["id", "day"], "{l:?}");
+        assert_eq!(l.indexes[1].columns, vec!["cust", "lower(cust)"], "{l:?}");
     }
 }

@@ -675,6 +675,35 @@ impl Session for SfSession {
             .collect())
     }
 
+    async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
+        use databrain_connector_core::{parse_call_list, query_text, quote_literal, TableLayout};
+        let (db, sch) = schema.split_once('.').ok_or_else(|| ConnectorError::query("expected database.schema"))?;
+        let mut l = TableLayout::from_columns(&self.describe(schema, name).await?.columns);
+        if let Some(pk) = l.indexes.first_mut() {
+            pk.method = Some("not enforced".into());
+        }
+        let rows = query_text(
+            self,
+            &format!(
+                "select clustering_key, row_count, auto_clustering_on from {}.information_schema.tables where table_schema = {} and table_name = {}",
+                quote_ident(ConnectorKind::Snowflake, db),
+                quote_literal(sch),
+                quote_literal(name)
+            ),
+        )
+        .await?;
+        if let Some(r) = rows.first() {
+            if let Some(k) = r[0].as_deref().filter(|k| !k.is_empty()) {
+                l.cluster_by = parse_call_list(k).1;
+                if r[2].as_deref() == Some("NO") {
+                    l.notes.push("automatic clustering is off".into());
+                }
+            }
+            l.row_estimate = r[1].as_deref().and_then(|x| x.parse().ok());
+        }
+        Ok(l)
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let object = self
             .list_objects(schema)

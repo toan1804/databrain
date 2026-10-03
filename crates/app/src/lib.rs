@@ -369,6 +369,11 @@ async fn describe_object(
 }
 
 #[tauri::command]
+async fn table_layout(state: State<'_, AppState>, id: String, schema: String, name: String) -> R<databrain_connector_core::TableLayout> {
+    api::table_layout(&state, &id, &schema, &name).await
+}
+
+#[tauri::command]
 async fn statement_at_cursor(kind: ConnectorKind, text: String, cursor: usize) -> R<Option<Span>> {
     Ok(api::statement_at_cursor(kind, &text, cursor))
 }
@@ -597,6 +602,7 @@ pub fn run() {
             list_objects,
             search_objects,
             describe_object,
+            table_layout,
             statement_at_cursor,
             run_query,
             cancel_query,

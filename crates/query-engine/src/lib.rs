@@ -20,7 +20,7 @@ use databrain_ssh_tunnel::{SshSecret, Tunnel, TunnelSpec};
 use databrain_connector_core::sql::{Classification, StatementKind, classify, split_statements};
 use databrain_connector_core::{
     CancellationToken, ConnectionConfig, ConnectorError, ConnectorRegistry, DbObject, ErrorKind,
-    ExecOptions, ObjectDetail, SchemaInfo, Session, StreamEvent,
+    ExecOptions, ObjectDetail, SchemaInfo, Session, StreamEvent, TableLayout,
 };
 use databrain_result_store::{ResultInfo, ResultStore};
 use databrain_workspace::{ConnectionProfile, EnvTag, NewHistory, Origin, RunStatus, Workspace, now_ms};
@@ -689,6 +689,16 @@ impl QueryEngine {
         self.with_meta(connection_id, |s| {
             let (schema, name) = (schema.clone(), name.clone());
             async move { s.describe(&schema, &name).await }
+        })
+        .await
+    }
+
+    /// Indexes, partitioning and clustering of a table (editor query hints).
+    pub async fn table_layout(&self, connection_id: &str, schema: &str, name: &str) -> Result<TableLayout> {
+        let (schema, name) = (schema.to_string(), name.to_string());
+        self.with_meta(connection_id, |s| {
+            let (schema, name) = (schema.clone(), name.clone());
+            async move { s.table_layout(&schema, &name).await }
         })
         .await
     }

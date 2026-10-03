@@ -176,6 +176,25 @@ export interface ColumnInfo {
   comment?: string;
 }
 
+export interface IndexInfo {
+  name: string;
+  columns: string[];
+  unique: boolean;
+  primary: boolean;
+  method?: string;
+}
+
+/** Indexes, partitioning and clustering of a table (query hints). */
+export interface TableLayout {
+  indexes: IndexInfo[];
+  partition_by: string[];
+  partition_kind?: string;
+  cluster_by: string[];
+  requires_partition_filter: boolean;
+  row_estimate?: number;
+  notes: string[];
+}
+
 export interface ObjectDetail {
   object: DbObject;
   columns: ColumnInfo[];

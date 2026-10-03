@@ -60,6 +60,7 @@ import { registerKeyConnection, useAi } from "../aiStore";
 import { editorBridge } from "../editorBridge";
 import { errorField, highlight, langExtension, setError } from "./SqlEditor";
 import { canFetchMetadata, sqlAssist } from "./sqlAssist";
+import { queryHints } from "./queryHintsExt";
 import { ResizeHandle } from "./ResizeHandle";
 import {
   EDITOR_MAX,
@@ -926,6 +927,7 @@ function CellEditor({
           bracketMatching(),
           closeBrackets(),
           sqlAssist(() => connRef.current),
+          queryHints(() => connRef.current),
           highlightSelectionMatches(),
           syntaxHighlighting(highlight),
           placeholder("SQL…  ⌘↵ run · ⇧↵ run & next · ⌘I ask AI"),

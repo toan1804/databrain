@@ -464,6 +464,32 @@ impl Session for BqSession {
         Ok(out)
     }
 
+    async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
+        use databrain_connector_core::TableLayout;
+        let (project, dataset) = split_dataset(schema)?;
+        let t = self.0.call(reqwest::Method::GET, format!("{API}/projects/{project}/datasets/{dataset}/tables/{name}"), None).await?;
+        let mut l = TableLayout::default();
+        if let Some(tp) = t.get("timePartitioning") {
+            l.partition_by = vec![tp["field"].as_str().unwrap_or("_PARTITIONTIME").to_string()];
+            l.partition_kind = tp["type"].as_str().map(|k| k.to_ascii_lowercase());
+            l.requires_partition_filter = tp["requirePartitionFilter"].as_bool().unwrap_or(false);
+        } else if let Some(rp) = t.get("rangePartitioning") {
+            l.partition_by = rp["field"].as_str().map(|f| vec![f.to_string()]).unwrap_or_default();
+            l.partition_kind = Some("range".into());
+        }
+        l.requires_partition_filter |= t["requirePartitionFilter"].as_bool().unwrap_or(false);
+        l.cluster_by = t
+            .pointer("/clustering/fields")
+            .and_then(|f| f.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        l.row_estimate = t["numRows"].as_str().and_then(|n| n.parse().ok());
+        if let Some(b) = t["numBytes"].as_str().and_then(|n| n.parse::<f64>().ok()) {
+            l.notes.push(format!("{:.1} GB", b / 1e9));
+        }
+        Ok(l)
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let (project, dataset) = split_dataset(schema)?;
         let t = self

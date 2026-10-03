@@ -400,6 +400,27 @@ impl Session for SqliteSession {
         .await
     }
 
+    async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
+        use databrain_connector_core::{group_indexes, query_text, quote_literal, truthy, TableLayout};
+        let (s, t) = (quote_literal(schema), quote_literal(name));
+        let idx = query_text(
+            self,
+            &format!(
+                "SELECT il.name, coalesce(ii.name, '(expression)'), il.\"unique\", il.origin = 'pk', NULL \
+                 FROM pragma_index_list({t}, {s}) il JOIN pragma_index_info(il.name, {s}) ii \
+                 ORDER BY il.origin = 'pk' DESC, il.name, ii.seqno"
+            ),
+        )
+        .await?;
+        let mut indexes = group_indexes(idx.into_iter().map(|r| (r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default(), truthy(&r[2]), truthy(&r[3]), None)));
+        // INTEGER PRIMARY KEY is the rowid: no entry in index_list.
+        if !indexes.iter().any(|i| i.primary) {
+            let pk = TableLayout::from_columns(&self.describe(schema, name).await?.columns).indexes;
+            indexes.splice(0..0, pk);
+        }
+        Ok(TableLayout { indexes, ..Default::default() })
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let (schema, name) = (schema.to_string(), name.to_string());
         self.with_conn(move |c| {
@@ -649,5 +670,21 @@ mod tests {
             .unwrap_err();
         assert!(err.message.to_lowercase().contains("readonly"), "{}", err.message);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn table_layout_lists_indexes() {
+        let s = session().await;
+        exec(&*s, "CREATE TABLE o (id INTEGER PRIMARY KEY, cust TEXT, day TEXT, email TEXT)").await;
+        exec(&*s, "CREATE INDEX o_cust_day ON o (cust, day)").await;
+        exec(&*s, "CREATE UNIQUE INDEX o_email ON o (lower(email))").await;
+        let l = s.table_layout("main", "o").await.unwrap();
+        assert_eq!(l.indexes[0].columns, vec!["id"]);
+        assert!(l.indexes[0].primary);
+        let cd = l.indexes.iter().find(|i| i.name == "o_cust_day").unwrap();
+        assert_eq!(cd.columns, vec!["cust", "day"]);
+        let em = l.indexes.iter().find(|i| i.name == "o_email").unwrap();
+        assert!(em.unique);
+        assert_eq!(em.columns, vec!["(expression)"]);
     }
 }

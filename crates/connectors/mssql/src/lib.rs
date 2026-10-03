@@ -509,6 +509,54 @@ impl Session for MssqlSession {
             .collect())
     }
 
+    async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
+        use databrain_connector_core::{group_indexes, query_text, quote_literal, truthy, TableLayout};
+        let obj = format!("N{}", quote_literal(&format!("{}.{}", quote_ident(ConnectorKind::Mssql, schema), quote_ident(ConnectorKind::Mssql, name))));
+        let idx = query_text(
+            self,
+            &format!(
+                "select i.name, c.name, cast(i.is_unique as int), cast(i.is_primary_key as int), lower(i.type_desc) \
+                 from sys.indexes i \
+                 join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id \
+                 join sys.columns c on c.object_id = ic.object_id and c.column_id = ic.column_id \
+                 where i.object_id = object_id({obj}) and ic.is_included_column = 0 and ic.key_ordinal > 0 \
+                 order by i.is_primary_key desc, i.name, ic.key_ordinal"
+            ),
+        )
+        .await?;
+        let mut l = TableLayout {
+            indexes: group_indexes(idx.into_iter().map(|r| {
+                let m = r[4].clone().filter(|m| m != "nonclustered");
+                (r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default(), truthy(&r[2]), truthy(&r[3]), m)
+            })),
+            ..Default::default()
+        };
+        let heap = query_text(self, &format!("select count(*) from sys.indexes where object_id = object_id({obj}) and type = 0")).await.ok();
+        if heap.as_ref().and_then(|r| r.first()).and_then(|r| r[0].as_deref()) == Some("1") {
+            l.notes.push("heap: no clustered index".into());
+        }
+        if let Ok(p) = query_text(
+            self,
+            &format!(
+                "select c.name, lower(pf.type_desc) from sys.indexes i \
+                 join sys.partition_schemes ps on ps.data_space_id = i.data_space_id \
+                 join sys.partition_functions pf on pf.function_id = ps.function_id \
+                 join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id and ic.partition_ordinal > 0 \
+                 join sys.columns c on c.object_id = ic.object_id and c.column_id = ic.column_id \
+                 where i.object_id = object_id({obj}) and i.index_id in (0, 1) order by ic.partition_ordinal"
+            ),
+        )
+        .await
+        {
+            l.partition_by = p.iter().filter_map(|r| r[0].clone()).collect();
+            l.partition_kind = p.first().and_then(|r| r[1].clone());
+        }
+        if let Ok(r) = query_text(self, &format!("select sum(rows) from sys.partitions where object_id = object_id({obj}) and index_id in (0, 1)")).await {
+            l.row_estimate = r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok());
+        }
+        Ok(l)
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let objs = self.list_objects(schema).await?;
         let object = objs

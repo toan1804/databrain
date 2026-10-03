@@ -159,6 +159,46 @@ select {
 .cm-activeLine {
   background: color-mix(in srgb, var(--hover) 55%, transparent) !important;
 }
+/* Query hints (partition / index / cluster key) */
+.cm-hint-warn {
+  text-decoration: underline wavy var(--warning);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.cm-hint-info {
+  text-decoration: underline dotted color-mix(in srgb, var(--accent) 80%, transparent);
+  text-underline-offset: 3px;
+}
+.cm-editor .cm-tooltip.cm-tooltip-hover:has(.cm-hint-card) {
+  border-radius: 6px;
+}
+.cm-hint-card {
+  max-width: 460px;
+  padding: 6px 9px;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.cm-hint-card > div + div {
+  margin-top: 2px;
+}
+.cm-hint-card-warn {
+  color: var(--warning);
+}
+.cm-hint-card-info {
+  color: var(--accent);
+}
+.cm-hint-card-title {
+  margin-top: 4px;
+  font-weight: 600;
+  font-family: ui-monospace, monospace;
+}
+.cm-hint-card-warn + .cm-hint-card-title,
+.cm-hint-card-info + .cm-hint-card-title {
+  border-top: 1px solid var(--border);
+  padding-top: 4px;
+}
+
 .cm-error-underline {
   text-decoration: underline wavy var(--danger);
   text-underline-offset: 3px;

@@ -146,3 +146,16 @@ describe("completion", () => {
     expect(await at("-- sel|")).toEqual([]);
   });
 });
+
+describe("sqlComplete: key column badges", () => {
+  it("labels and ranks partition/index columns first", async () => {
+    const p = { ...provider(), columnRoles: (_s: string, t: string) => (t === "orders" ? { created_at: "partition key", customer_id: "indexed" } : undefined) };
+    const r = await completeSql("select * from orders where ", 27, p, true);
+    const cols = r!.options.filter((o) => o.type === "column");
+    expect(cols.slice(0, 2).map((o) => [o.label, o.detail])).toEqual([
+      ["customer_id", "orders · indexed"],
+      ["created_at", "orders · partition key"],
+    ]);
+    expect(cols.find((o) => o.label === "amount")?.detail).toBe("orders");
+  });
+});
