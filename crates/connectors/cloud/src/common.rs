@@ -15,6 +15,37 @@ pub fn http() -> reqwest::Client {
         .expect("http client")
 }
 
+/// Client for presigned cloud-storage downloads (S3 / ADLS / GCS result chunks).
+/// Idle connections are dropped after 10 s: object stores close idle
+/// keep-alive connections early, and reusing a closed one fails with
+/// "error sending request". Each attempt is bounded by its own timeout.
+pub fn storage_http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .connect_timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(32)
+        .tcp_keepalive(Duration::from_secs(20))
+        .user_agent(concat!("DataBrain/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("storage http client")
+}
+
+/// Error text with its source chain ("error sending request: …: connection reset").
+pub fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut msg = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        let t = s.to_string();
+        if !msg.contains(&t) {
+            msg.push_str(": ");
+            msg.push_str(&t);
+        }
+        src = s.source();
+    }
+    msg
+}
+
 pub fn net_err(e: reqwest::Error) -> ConnectorError {
     let mut msg = e.to_string();
     let mut src = std::error::Error::source(&e);

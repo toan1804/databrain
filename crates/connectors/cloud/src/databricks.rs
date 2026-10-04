@@ -122,6 +122,7 @@ impl Connector for DatabricksConnector {
             catalog: Mutex::new(cfg.opt("catalog").map(str::to_string)),
             schema: Mutex::new(cfg.opt("schema").map(str::to_string)),
             inline_only: cfg.opt("result_transfer").is_some_and(|v| v.eq_ignore_ascii_case("inline")),
+            storage: crate::common::storage_http(),
             fetch_parallel: cfg.opt("fetch_parallel").and_then(|v| v.parse().ok()).filter(|n: &usize| (1..=32).contains(n)).unwrap_or(FETCH_PARALLEL),
         }));
         // Validate credentials + warehouse up front.
@@ -146,6 +147,8 @@ struct Inner {
     inline_only: bool,
     /// Result chunks downloaded at once.
     fetch_parallel: usize,
+    /// Client for presigned cloud-storage downloads.
+    storage: reqwest::Client,
 }
 
 fn col_type(type_name: &str) -> ColType {
@@ -335,10 +338,10 @@ impl Inner {
         }
         let schema = databrain_connector_core::value::schema_for(&columns);
         // Links the first response already carries (often only chunk 0).
-        let mut known: HashMap<u64, String> = HashMap::new();
+        let mut known: HashMap<u64, ChunkLink> = HashMap::new();
         for l in resp.pointer("/result/external_links").and_then(|v| v.as_array()).into_iter().flatten() {
-            if let (Some(i), Some(u)) = (l["chunk_index"].as_u64(), l["external_link"].as_str()) {
-                known.insert(i, u.to_string());
+            if let Some(link) = parse_link(l) {
+                known.insert(link.chunk_index, link);
             }
         }
         let total = resp
@@ -356,8 +359,8 @@ impl Inner {
         let fetch = |i: u64| {
             let (known, id, schema) = (known.clone(), statement_id.clone(), schema.clone());
             async move {
-                let url = known.get(&i).cloned();
-                let bytes = self.chunk_bytes(&id, i, url).await?;
+                let link = known.get(&i).cloned();
+                let bytes = self.chunk_bytes(&id, i, link).await?;
                 tokio::task::spawn_blocking(move || decode_arrow(&bytes, &schema))
                     .await
                     .map_err(|e| ConnectorError::internal(e.to_string()))?
@@ -393,33 +396,86 @@ impl Inner {
         Ok(())
     }
 
-    /// Bytes of chunk `i`: from `url` when known, else via the chunk API.
-    /// An expired link (≤ 15 minutes) is renewed once.
-    async fn chunk_bytes(&self, statement_id: &str, i: u64, url: Option<String>) -> Result<Vec<u8>> {
-        let resolve = || async {
-            let c = self.request(reqwest::Method::GET, format!("{}/{statement_id}/result/chunks/{i}", self.base), None).await?;
-            first_link(&c).map(|l| l.url).ok_or_else(|| ConnectorError::internal(format!("result chunk {i} has no download link")))
-        };
-        let url = match url {
-            Some(u) => u,
-            None => resolve().await?,
-        };
-        match self.get_bytes(&url).await {
-            Ok(b) => Ok(b),
-            Err((Some(400 | 403 | 404), _)) => self.get_bytes(&resolve().await?).await.map_err(|(_, e)| e),
-            Err((_, e)) => Err(e),
+    /// Bytes of result chunk `i`, with retries:
+    /// - network errors, timeouts, 408/429/5xx and broken bodies are retried
+    ///   with exponential backoff and jitter (Retry-After is honored);
+    /// - expired presigned links (400/403/404, or past their `expiration`) are
+    ///   renewed through the chunk API, then retried.
+    async fn chunk_bytes(&self, statement_id: &str, i: u64, link: Option<ChunkLink>) -> Result<Vec<u8>> {
+        let mut link = link;
+        let mut refreshes = 0u32;
+        let mut last: Option<String> = None;
+        for attempt in 0..DOWNLOAD_ATTEMPTS {
+            // Missing, expired or about to expire: ask for a fresh link.
+            if link.as_ref().is_none_or(|l| l.expiring()) {
+                if statement_id.is_empty() && link.is_some() {
+                    // Nothing to renew from; try the link we have.
+                } else {
+                    match self.resolve_link(statement_id, i).await {
+                        Ok(l) => link = Some(l),
+                        Err(e) if e.kind == databrain_connector_core::ErrorKind::Connection && attempt + 1 < DOWNLOAD_ATTEMPTS => {
+                            last = Some(e.message);
+                            backoff_sleep(attempt, None).await;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            let l = link.as_ref().ok_or_else(|| ConnectorError::internal(format!("result chunk {i} has no download link")))?;
+            match self.get_bytes(&l.url).await {
+                Ok(b) => return Ok(b),
+                Err(f) => {
+                    last = Some(f.message.clone());
+                    match f.class {
+                        Retry::Expired if refreshes < MAX_LINK_REFRESHES && !statement_id.is_empty() => {
+                            refreshes += 1;
+                            link = None; // renewed at the top of the loop, no wait
+                        }
+                        Retry::Transient if attempt + 1 < DOWNLOAD_ATTEMPTS => backoff_sleep(attempt, f.retry_after).await,
+                        _ => break,
+                    }
+                }
+            }
         }
+        Err(ConnectorError::connection(format!(
+            "result chunk {i} download failed after retries: {}",
+            last.unwrap_or_else(|| "unknown error".into())
+        )))
     }
 
-    /// GET a presigned URL (no Authorization header; the URL is never logged).
-    async fn get_bytes(&self, url: &str) -> std::result::Result<Vec<u8>, (Option<u16>, ConnectorError)> {
-        let fail = |e: reqwest::Error| (None, ConnectorError::connection(format!("result download failed: {}", redact_url(&e.to_string()))));
-        let resp = self.http.get(url).send().await.map_err(fail)?;
+    /// Fresh download link for chunk `i` from the statement API.
+    async fn resolve_link(&self, statement_id: &str, i: u64) -> Result<ChunkLink> {
+        let c = self.request(reqwest::Method::GET, format!("{}/{statement_id}/result/chunks/{i}", self.base), None).await?;
+        first_link(&c).ok_or_else(|| ConnectorError::internal(format!("result chunk {i} has no download link")))
+    }
+
+    /// One GET of a presigned URL (no Authorization header; the URL is never logged).
+    async fn get_bytes(&self, url: &str) -> std::result::Result<Vec<u8>, FetchFail> {
+        let net = |e: reqwest::Error| FetchFail {
+            class: Retry::Transient,
+            retry_after: None,
+            message: redact_url(&crate::common::error_chain(&e)),
+        };
+        let resp = self.storage.get(url).send().await.map_err(net)?;
         let status = resp.status();
         if !status.is_success() {
-            return Err((Some(status.as_u16()), ConnectorError::connection(format!("result download failed: HTTP {status}"))));
+            let code = status.as_u16();
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(|s| std::time::Duration::from_secs(s.min(30)));
+            let class = match code {
+                400 | 403 | 404 => Retry::Expired,
+                408 | 429 | 500..=599 => Retry::Transient,
+                _ => Retry::Fatal,
+            };
+            return Err(FetchFail { class, retry_after, message: format!("HTTP {status}") });
         }
-        resp.bytes().await.map(|b| b.to_vec()).map_err(fail)
+        // A body cut off mid-way is retried like any network error.
+        resp.bytes().await.map(|b| b.to_vec()).map_err(net)
     }
 
     async fn stream_as(&self, sql: &str, opts: &ExecOptions, tx: &StreamSender, disposition: Disposition) -> std::result::Result<(), StreamFail> {
@@ -469,30 +525,8 @@ impl Inner {
     /// cloud-storage link: no Authorization header, and it is never logged.
     /// An expired link is renewed once through the chunk API.
     async fn download(&self, statement_id: &str, link: &ChunkLink) -> Result<Vec<serde_json::Value>> {
-        match self.fetch_chunk(&link.url).await {
-            Ok(rows) => Ok(rows),
-            // Expired (links live ≤ 15 minutes): ask for a fresh one, once.
-            Err((Some(400 | 403 | 404), _)) if !statement_id.is_empty() => {
-                let fresh = self
-                    .request(reqwest::Method::GET, format!("{}/{statement_id}/result/chunks/{}", self.base, link.chunk_index), None)
-                    .await?;
-                let link = first_link(&fresh).ok_or_else(|| ConnectorError::internal("result chunk has no download link"))?;
-                self.fetch_chunk(&link.url).await.map_err(|(_, e)| e)
-            }
-            Err((_, e)) => Err(e),
-        }
-    }
-
-    /// GET a presigned URL; the error carries the HTTP status when there was one.
-    async fn fetch_chunk(&self, url: &str) -> std::result::Result<Vec<serde_json::Value>, (Option<u16>, ConnectorError)> {
-        let fail = |e: reqwest::Error| (None, ConnectorError::connection(format!("result download failed: {}", redact_url(&e.to_string()))));
-        let resp = self.http.get(url).send().await.map_err(fail)?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err((Some(status.as_u16()), ConnectorError::connection(format!("result download failed: HTTP {status}"))));
-        }
-        let bytes = resp.bytes().await.map_err(fail)?;
-        serde_json::from_slice(&bytes).map_err(|e| (None, ConnectorError::internal(format!("unexpected result chunk: {e}"))))
+        let bytes = self.chunk_bytes(statement_id, link.chunk_index, Some(link.clone())).await?;
+        serde_json::from_slice(&bytes).map_err(|e| ConnectorError::internal(format!("unexpected result chunk: {e}")))
     }
 
     async fn apply_use(&self, sql: &str) {
@@ -566,15 +600,74 @@ fn mentions_format(msg: &str) -> bool {
     m.contains("arrow_stream") || m.contains("arrow stream") || (m.contains("format") && m.contains("not supported"))
 }
 
+#[derive(Clone)]
 struct ChunkLink {
     url: String,
     chunk_index: u64,
+    /// When the presigned URL stops working (from the API's `expiration`).
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl ChunkLink {
+    /// Expired or about to: renew before use (links live ≤ 15 minutes, and a
+    /// download started at the last second can still fail).
+    fn expiring(&self) -> bool {
+        self.expires_at.is_some_and(|t| t - chrono::Utc::now() < chrono::Duration::seconds(LINK_MARGIN_SECS))
+    }
+}
+
+fn parse_link(l: &serde_json::Value) -> Option<ChunkLink> {
+    Some(ChunkLink {
+        url: l["external_link"].as_str()?.to_string(),
+        chunk_index: l["chunk_index"].as_u64().unwrap_or(0),
+        expires_at: l["expiration"].as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.with_timezone(&chrono::Utc)),
+    })
 }
 
 /// First external link of a result chunk (EXTERNAL_LINKS disposition).
 fn first_link(chunk: &serde_json::Value) -> Option<ChunkLink> {
-    let l = chunk.pointer("/external_links/0")?;
-    Some(ChunkLink { url: l["external_link"].as_str()?.to_string(), chunk_index: l["chunk_index"].as_u64().unwrap_or(0) })
+    parse_link(chunk.pointer("/external_links/0")?)
+}
+
+/// Attempts per chunk download (network errors, throttling, 5xx).
+const DOWNLOAD_ATTEMPTS: u32 = 7;
+/// Renewals of an expired presigned link per chunk.
+const MAX_LINK_REFRESHES: u32 = 3;
+/// Renew a link this many seconds before it expires.
+const LINK_MARGIN_SECS: i64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// Network error, timeout, 408/429/5xx: back off and retry.
+    Transient,
+    /// 400/403/404 from storage: the presigned link expired; renew it.
+    Expired,
+    Fatal,
+}
+
+struct FetchFail {
+    class: Retry,
+    retry_after: Option<std::time::Duration>,
+    message: String,
+}
+
+/// Backoff before retry `attempt` (0-based): 250 ms × 2ⁿ capped at 8 s, with
+/// ±50% jitter so parallel downloads don't retry in lockstep. Retry-After wins.
+fn backoff_delay(attempt: u32, retry_after: Option<std::time::Duration>) -> std::time::Duration {
+    if let Some(d) = retry_after {
+        return d;
+    }
+    // Tests use tiny delays.
+    let unit = if cfg!(test) { 2 } else { 250 };
+    let base = (unit << attempt.min(5)).min(unit * 32);
+    // Cheap jitter without a RNG dependency.
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos() as u64).unwrap_or(0);
+    let jitter = nanos % (base + 1);
+    std::time::Duration::from_millis(base / 2 + jitter)
+}
+
+async fn backoff_sleep(attempt: u32, retry_after: Option<std::time::Duration>) {
+    tokio::time::sleep(backoff_delay(attempt, retry_after)).await;
 }
 
 /// Server errors that mean EXTERNAL_LINKS is not available for this workspace.
@@ -1067,6 +1160,8 @@ mod tests {
         pub struct Log {
             pub requests: Vec<(String, String, bool, String)>, // method, path, had auth header, body
             pub arrow_posts: Option<u32>,
+            /// Requests per blob path (without query).
+            pub hits: std::collections::HashMap<String, u32>,
             pub in_flight: usize,
             pub max_in_flight: usize,
         }
@@ -1141,13 +1236,18 @@ mod tests {
                         lg.lock().unwrap().requests.push((method.clone(), path.clone(), auth, body.clone()));
                         let cols = json!({"columns": [{"name": "n", "type_name": "LONG", "type_text": "BIGINT"}, {"name": "s", "type_name": "STRING", "type_text": "STRING"}]});
                         // Arrow results: CHUNKS chunks (links via the chunk API); JSON: 2 chunks.
-                        let link = |i: u32, next: bool, fmt: &str| {
-                            let mut e = json!({"chunk_index": i, "external_link": format!("{o}/blob/{fmt}/{i}?sig=secret"), "row_count": 2});
+                        // "stale_links": the statement response carries already-expired links.
+                        let link_at = |i: u32, next: bool, fmt: &str, fresh: bool| {
+                            let (sig, exp) = if fresh { ("secret", chrono::Utc::now() + chrono::Duration::minutes(10)) } else { ("old", chrono::Utc::now() - chrono::Duration::minutes(1)) };
+                            let mut e = json!({"chunk_index": i, "external_link": format!("{o}/blob/{fmt}/{i}?sig={sig}"), "row_count": 2, "expiration": exp.to_rfc3339()});
                             if next {
                                 e["next_chunk_internal_link"] = json!(format!("/api/2.0/sql/statements/st1/result/chunks/{}", i + 1));
                             }
                             json!({"external_links": [e]})
                         };
+                        let stale = blob_mode == "stale_links";
+                        let link = |i: u32, next: bool, fmt: &str| link_at(i, next, fmt, true);
+                        let first = |fmt: &str, next: bool| link_at(0, next, fmt, !stale);
                         let mut raw: Option<Vec<u8>> = None;
                         let (status, out) = if method == "POST" && path == "/api/2.0/sql/statements" {
                             let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
@@ -1157,9 +1257,9 @@ mod tests {
                                 (400, json!({"message": "ARROW_STREAM format is not supported for this warehouse"}))
                             } else if v["format"] == "ARROW_STREAM" {
                                 *lg.lock().unwrap().arrow_posts.get_or_insert(0) += 1;
-                                (200, json!({"statement_id": "st1", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols, "total_chunk_count": CHUNKS}, "result": link(0, false, "arrow")}))
+                                (200, json!({"statement_id": "st1", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols, "total_chunk_count": CHUNKS}, "result": first("arrow", false)}))
                             } else {
-                                (200, json!({"statement_id": "st1", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols}, "result": link(0, true, "json")}))
+                                (200, json!({"statement_id": "st1", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols}, "result": first("json", true)}))
                             }
                         } else if let Some(i) = path.strip_prefix("/api/2.0/sql/statements/st1/result/chunks/") {
                             let i: u32 = i.parse().unwrap();
@@ -1168,7 +1268,24 @@ mod tests {
                         } else if let Some(rest) = path.strip_prefix("/blob/") {
                             let (fmt, rest) = rest.split_once('/').unwrap();
                             let i: u32 = rest.split('?').next().unwrap().parse().unwrap();
-                            let deny = blob_mode == "blocked" || (blob_mode == "expire_once" && !expired.swap(true, std::sync::atomic::Ordering::SeqCst));
+                            let hit = {
+                                let mut g = lg.lock().unwrap();
+                                let h = g.hits.entry(format!("{fmt}/{i}")).or_insert(0);
+                                *h += 1;
+                                *h
+                            };
+                            let deny = blob_mode == "blocked"
+                                || blob_mode == "always_403"
+                                || path.contains("sig=old")
+                                || (blob_mode == "expire_once" && !expired.swap(true, std::sync::atomic::Ordering::SeqCst));
+                            if blob_mode == "flaky" && hit == 1 {
+                                // Connection dropped mid-request ("error sending request").
+                                return;
+                            }
+                            if (blob_mode == "flaky" && hit == 2) || blob_mode == "always_503" {
+                                let _ = sock.write_all(b"HTTP/1.1 503 Slow Down\r\nretry-after: 0\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                                return;
+                            }
                             if deny {
                                 (403, json!({"error": "expired"}))
                             } else if fmt == "arrow" {
@@ -1207,6 +1324,7 @@ mod tests {
                 schema: Mutex::new(None),
                 inline_only,
                 fetch_parallel: 4,
+                storage: crate::common::storage_http(),
             }))
         }
     }
@@ -1297,5 +1415,80 @@ mod tests {
         let r = mock::session(&origin, true).execute("SELECT 1", ExecOptions::default()).await.unwrap().collect().await.unwrap();
         assert_eq!(texts(&r), vec!["inline"]);
         assert!(log.lock().unwrap().requests.iter().all(|(_, p, _, _)| !p.starts_with("/blob/")));
+    }
+
+    #[tokio::test]
+    async fn dropped_connections_and_503_are_retried() {
+        let (origin, log) = mock::serve("flaky").await;
+        let r = mock::session(&origin, false).execute("SELECT * FROM big", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        assert_eq!(ints(&r), (0..mock::CHUNKS as i64 * 2).collect::<Vec<_>>());
+        let log = log.lock().unwrap();
+        assert!(log.hits.values().all(|h| *h == 3), "drop, 503, then ok for every chunk: {:?}", log.hits);
+    }
+
+    #[tokio::test]
+    async fn expired_links_are_renewed_before_download() {
+        let (origin, log) = mock::serve("stale_links").await;
+        let r = mock::session(&origin, false).execute("SELECT * FROM big", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        assert_eq!(r.num_rows(), mock::CHUNKS as usize * 2);
+        {
+            let log = log.lock().unwrap();
+            assert!(log.requests.iter().all(|(_, p, _, _)| !p.contains("sig=old")), "expired link never used");
+            assert!(log.requests.iter().any(|(_, p, _, _)| p == "/api/2.0/sql/statements/st1/result/chunks/0"));
+        }
+        // JSON chunks too.
+        let (origin, _) = mock::serve("stale_links").await;
+        let s = mock::session(&origin, false);
+        let r = s.0.stream_json_for_test("SELECT * FROM big").await;
+        assert_eq!(r, vec!["r0", "NULL", "r2", "NULL"]);
+    }
+
+    #[tokio::test]
+    async fn give_up_with_a_clear_error() {
+        let (origin, log) = mock::serve("always_503").await;
+        let s = mock::session(&origin, true);
+        let e = s.0.chunk_bytes("st1", 2, None).await.unwrap_err();
+        assert!(e.message.contains("chunk 2") && e.message.contains("after retries") && e.message.contains("503"), "{}", e.message);
+        assert_eq!(log.lock().unwrap().hits.values().sum::<u32>(), DOWNLOAD_ATTEMPTS);
+        let (origin, log) = mock::serve("always_403").await;
+        let e = mock::session(&origin, true).0.chunk_bytes("st1", 1, None).await.unwrap_err();
+        assert!(e.message.contains("403"), "{}", e.message);
+        assert_eq!(log.lock().unwrap().hits.values().sum::<u32>(), MAX_LINK_REFRESHES + 1, "renewed a few times, then stopped");
+    }
+
+    #[test]
+    fn backoff_grows_and_honors_retry_after() {
+        assert_eq!(backoff_delay(3, Some(std::time::Duration::from_secs(4))), std::time::Duration::from_secs(4));
+        for a in 0..10 {
+            let d = backoff_delay(a, None).as_millis() as u64;
+            let base = (2u64 << a.min(5)).min(64);
+            assert!(d >= base / 2 && d <= base / 2 + base, "attempt {a}: {d}");
+        }
+        let past = json!({"external_link": "https://x", "chunk_index": 1, "expiration": "2020-01-01T00:00:00Z"});
+        assert!(parse_link(&past).unwrap().expiring());
+        let future = json!({"external_link": "https://x", "chunk_index": 1, "expiration": (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339()});
+        assert!(!parse_link(&future).unwrap().expiring());
+        assert!(!parse_link(&json!({"external_link": "https://x"})).unwrap().expiring(), "no expiration: use as is");
+    }
+
+    impl Inner {
+        /// JSON-chunk path (`Disposition::ExternalLinks`), column `s` as text.
+        async fn stream_json_for_test(&self, sql: &str) -> Vec<String> {
+            use databrain_connector_core::arrow::util::display::{ArrayFormatter, FormatOptions};
+            let (tx, stream) = databrain_connector_core::QueryStream::channel(4);
+            let opts = ExecOptions::default();
+            let r = self.stream_as(sql, &opts, &tx, Disposition::ExternalLinks).await;
+            assert!(r.is_ok());
+            drop(tx);
+            let c = stream.collect().await.unwrap();
+            let mut out = vec![];
+            for b in &c.batches {
+                let f = ArrayFormatter::try_new(b.column(1).as_ref(), &FormatOptions::default().with_null("NULL")).unwrap();
+                for i in 0..b.num_rows() {
+                    out.push(f.value(i).to_string());
+                }
+            }
+            out
+        }
     }
 }
