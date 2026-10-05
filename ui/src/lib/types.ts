@@ -726,8 +726,14 @@ export interface KnState {
 
 export interface KnowledgeView {
   state: KnState | null;
-  objects: KnObject[];
   notes: KnNote[];
+}
+
+/** A page of indexed objects (`kn_objects`). */
+export interface KnObjectPage {
+  objects: KnObject[];
+  /** Objects matching the filter, all pages. */
+  total: number;
 }
 
 export type KnowledgeEvent =

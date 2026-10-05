@@ -376,34 +376,44 @@ impl Workspace {
     pub fn kn_replace_schema(&self, connection_id: &str, schema: &str, objects: &[KnObject]) -> Result<IndexDelta> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
-        let existing: Vec<(String, String)> = {
+        let existing: std::collections::HashMap<String, String> = {
             let mut stmt = tx.prepare("SELECT name, content_hash FROM kn_objects WHERE connection_id = ?1 AND schema_name = ?2")?;
             stmt.query_map(params![connection_id, schema], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+                .collect::<rusqlite::Result<_>>()?
         };
         let now = now_ms();
         let mut delta = IndexDelta::default();
         let keep: HashSet<&str> = objects.iter().map(|o| o.name.as_str()).collect();
-        for (name, _) in existing.iter().filter(|(n, _)| !keep.contains(n.as_str())) {
-            let r = format!("{schema}.{name}");
+        // Search rows to drop: removed and changed objects. Deleted in one
+        // statement at the end: a `ref = ?` delete scans the whole FTS table,
+        // so one per object made big schemas quadratic (and held the
+        // workspace lock, stalling the app).
+        let mut stale_refs: Vec<String> = Vec::new();
+        for name in existing.keys().filter(|n| !keep.contains(n.as_str())) {
             tx.execute("DELETE FROM kn_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3", params![connection_id, schema, name])?;
-            tx.execute("DELETE FROM kn_fts WHERE connection_id = ?1 AND source = 'object' AND ref = ?2", params![connection_id, r])?;
+            stale_refs.push(format!("{schema}.{name}"));
             delta.removed += 1;
         }
+        let mut fresh: Vec<&KnObject> = Vec::new();
         for o in objects {
             let hash = o.hash();
-            if existing.iter().any(|(n, h)| *n == o.name && *h == hash) {
-                delta.unchanged += 1;
-                continue;
+            match existing.get(&o.name) {
+                Some(h) if *h == hash => {
+                    delta.unchanged += 1;
+                    continue;
+                }
+                Some(_) => stale_refs.push(o.full_name()),
+                None => {}
             }
-            let r = o.full_name();
-            tx.execute(
+            fresh.push(o);
+            tx.prepare_cached(
                 "INSERT INTO kn_objects (connection_id, schema_name, name, kind, comment, row_estimate, columns_json, fks_json, content_hash, indexed_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
                  ON CONFLICT(connection_id, schema_name, name) DO UPDATE SET kind = excluded.kind, comment = excluded.comment, \
                    row_estimate = excluded.row_estimate, columns_json = excluded.columns_json, fks_json = excluded.fks_json, \
                    content_hash = excluded.content_hash, indexed_at = excluded.indexed_at",
-                params![
+            )?
+            .execute(params![
                     connection_id,
                     o.schema,
                     o.name,
@@ -416,12 +426,19 @@ impl Workspace {
                     now
                 ],
             )?;
-            tx.execute("DELETE FROM kn_fts WHERE connection_id = ?1 AND source = 'object' AND ref = ?2", params![connection_id, r])?;
-            tx.execute(
-                "INSERT INTO kn_fts (connection_id, source, ref, title, body) VALUES (?1, 'object', ?2, ?3, ?4)",
-                params![connection_id, r, o.name, o.search_body()],
-            )?;
             delta.changed += 1;
+        }
+        if !stale_refs.is_empty() {
+            tx.execute(
+                "DELETE FROM kn_fts WHERE rowid IN (SELECT rowid FROM kn_fts WHERE connection_id = ?1 AND source = 'object' AND ref IN (SELECT value FROM json_each(?2)))",
+                params![connection_id, serde_json::to_string(&stale_refs)?],
+            )?;
+        }
+        {
+            let mut ins = tx.prepare_cached("INSERT INTO kn_fts (connection_id, source, ref, title, body) VALUES (?1, 'object', ?2, ?3, ?4)")?;
+            for o in fresh {
+                ins.execute(params![connection_id, o.full_name(), o.name, o.search_body()])?;
+            }
         }
         tx.commit()?;
         Ok(delta)
@@ -529,6 +546,22 @@ impl Workspace {
         )?;
         let rows = stmt.query_map([connection_id], Self::kn_object_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// A page of indexed objects whose `schema.name comment` contains `filter`
+    /// (case-insensitive; empty = all), ordered by schema and name, plus how
+    /// many match in total. Keeps the Knowledge view fast on 10k+ tables.
+    pub fn kn_list_objects(&self, connection_id: &str, filter: &str, offset: usize, limit: usize) -> Result<(Vec<KnObject>, usize)> {
+        let c = self.conn.lock();
+        let q = filter.trim().to_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        const MATCH: &str = "connection_id = ?1 AND (?2 = '' OR lower(schema_name || '.' || name || ' ' || coalesce(comment, '')) LIKE '%' || ?2 || '%' ESCAPE '\\')";
+        let total: i64 = c.query_row(&format!("SELECT count(*) FROM kn_objects WHERE {MATCH}"), params![connection_id, q], |r| r.get(0))?;
+        let mut stmt = c.prepare_cached(&format!(
+            "SELECT schema_name, name, kind, comment, row_estimate, columns_json, fks_json FROM kn_objects WHERE {MATCH} \
+             ORDER BY schema_name, name LIMIT ?3 OFFSET ?4"
+        ))?;
+        let rows = stmt.query_map(params![connection_id, q, limit as i64, offset as i64], Self::kn_object_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, total as usize))
     }
 
     /// Completion from the local index (no network): tables/views whose name
@@ -804,6 +837,25 @@ mod tests {
     }
 
     #[test]
+    fn object_pages_with_filter() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let many: Vec<KnObject> = (0..12_000).map(|i| obj("big", &format!("t{i:05}"), &["id"], (i % 1000 == 0).then_some("Orders_100% done"))).collect();
+        ws.kn_replace_schema("c1", "big", &many).unwrap();
+        ws.kn_replace_schema("c2", "big", &[obj("big", "other", &[], None)]).unwrap();
+        let t = std::time::Instant::now();
+        let (page, total) = ws.kn_list_objects("c1", "", 0, 300).unwrap();
+        assert_eq!((page.len(), total), (300, 12_000));
+        assert_eq!(page[0].name, "t00000");
+        assert_eq!(page[0].columns.len(), 1);
+        assert_eq!(ws.kn_list_objects("c1", "", 300, 2).unwrap().0[0].name, "t00300");
+        // schema.name and comments, case-insensitive; `%` / `_` are literal.
+        assert_eq!(ws.kn_list_objects("c1", "BIG.T0001", 0, 5).unwrap().1, 10);
+        assert_eq!(ws.kn_list_objects("c1", "100% done", 0, 5).unwrap().1, 12);
+        assert_eq!(ws.kn_list_objects("c1", "t_", 0, 5).unwrap().1, 0);
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[test]
     fn index_search_incremental() {
         let ws = Workspace::open_in_memory().unwrap();
         let objs = vec![
@@ -818,6 +870,15 @@ mod tests {
 
         let hits = ws.kn_search("c1", "revenue by customer orders", 5).unwrap();
         assert_eq!(hits[0].reference, "public.customer_orders");
+        // Search rows follow removals and changes (one row per object).
+        assert!(ws.kn_search("c1", "inventory", 5).unwrap().iter().all(|h| h.reference != "public.inventory"));
+        let mut changed = objs[1].clone();
+        changed.comment = Some("Loyalty members".into());
+        let d = ws.kn_replace_schema("c1", "public", &[objs[0].clone(), changed]).unwrap();
+        assert_eq!((d.changed, d.unchanged), (1, 1));
+        let hits = ws.kn_search("c1", "loyalty", 5).unwrap();
+        assert_eq!(hits.iter().map(|h| h.reference.as_str()).collect::<Vec<_>>(), vec!["public.customers"]);
+        assert_eq!(ws.kn_search("c1", "customers", 10).unwrap().iter().filter(|h| h.reference == "public.customers").count(), 1);
         assert!(ws.kn_search("c1", "", 5).unwrap().is_empty());
         assert!(ws.kn_search("other", "orders", 5).unwrap().is_empty());
         // FTS syntax characters are neutralized.

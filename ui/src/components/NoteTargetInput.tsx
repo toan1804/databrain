@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Columns3, Loader2, Table2, TriangleAlert } from "lucide-react";
 import { api } from "../lib/api";
 import { applySuggestion, currentSegment, findTable, suggest, type Suggestion, type TargetTable } from "../lib/noteTarget";
-import type { DbObject, KnObject } from "../lib/types";
+import type { DbObject } from "../lib/types";
 import { useStore } from "../store";
 import { canFetchMetadata } from "./sqlAssist";
 
@@ -17,14 +17,11 @@ export function NoteTargetInput({
   connId,
   value,
   onChange,
-  indexed,
   onState,
 }: {
   connId: string;
   value: string;
   onChange: (v: string) => void;
-  /** Knowledge index objects (with columns) of the connection. */
-  indexed: KnObject[];
   onState: (s: TargetState) => void;
 }) {
   const ref = useRef<HTMLInputElement>(null);
@@ -32,6 +29,8 @@ export function NoteTargetInput({
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const [found, setFound] = useState<DbObject[]>([]);
+  // Matches from the knowledge index / metadata cache for the typed word (no network).
+  const [local, setLocal] = useState<TargetTable[]>([]);
   const [state, setState] = useState<TargetState>({ status: "empty" });
   const cached = useStore((s) => s.objects);
   const columnsCache = useStore((s) => s.columns);
@@ -40,7 +39,7 @@ export function NoteTargetInput({
 
   const seg = currentSegment(value, cursor);
   const tables = useMemo<TargetTable[]>(() => {
-    const out: TargetTable[] = indexed.map((o) => ({ schema: o.schema, name: o.name, columns: o.columns.map((c) => c.name) }));
+    const out: TargetTable[] = [...local];
     const add = (o: DbObject) => {
       if (o.kind === "function" || o.kind === "procedure" || o.kind === "sequence" || o.kind === "other") return;
       out.push({ schema: o.schema, name: o.name, columns: columnsCache[`${connId}|${o.schema}|${o.name}`]?.map((c) => c.name) });
@@ -48,8 +47,39 @@ export function NoteTargetInput({
     for (const [k, list] of Object.entries(cached)) if (k.startsWith(`${connId}|`)) list.forEach(add);
     found.forEach(add);
     return out;
-  }, [indexed, cached, columnsCache, found, connId]);
+  }, [local, cached, columnsCache, found, connId]);
   const items: Suggestion[] = useMemo(() => (open ? suggest(seg.word, tables) : []), [open, seg.word, tables]);
+
+  // Local index: tables matching the last part of the word, and after
+  // `table.` that table with its columns. Queried per word, never loaded whole.
+  useEffect(() => {
+    if (!open) return;
+    const word = seg.word;
+    const dot = word.lastIndexOf(".");
+    const before = dot > 0 ? word.slice(0, dot) : "";
+    const after = word.slice(dot + 1);
+    let stale = false;
+    const t = setTimeout(async () => {
+      try {
+        const byName = (schema: string | null, q: string, n: number) => api.completeTablesLocal(connId, schema, q, n).catch(() => [] as DbObject[]);
+        const lists = await Promise.all([
+          byName(null, after, 30), // `ord` or `sales.ord` by table name
+          before ? byName(before, after, 30) : Promise.resolve([]), // `schema.ta…`
+          before ? byName(null, before.split(".").pop() ?? before, 10) : Promise.resolve([]), // `table.` for its columns
+        ]);
+        const out: TargetTable[] = lists.flat().map((o) => ({ schema: o.schema, name: o.name }));
+        const owner = before ? findTable(out, before) : undefined;
+        if (owner) owner.columns = (await api.completeColumnsLocal(connId, owner.schema, owner.name).catch(() => null)) ?? undefined;
+        if (!stale) setLocal(out);
+      } catch {
+        /* completion is best effort */
+      }
+    }, 80);
+    return () => {
+      stale = true;
+      clearTimeout(t);
+    };
+  }, [open, connId, seg.word]);
 
   // Server search for tables not loaded yet.
   useEffect(() => {

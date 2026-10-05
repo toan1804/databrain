@@ -252,6 +252,10 @@ async fn kn_get(state: State<'_, AppState>, connection_id: String) -> R<ai_api::
     ai_api::knowledge(&state, &connection_id)
 }
 #[tauri::command]
+async fn kn_objects(state: State<'_, AppState>, connection_id: String, filter: String, offset: usize, limit: usize) -> R<ai_api::KnObjectPage> {
+    ai_api::knowledge_objects(&state, &connection_id, &filter, offset, limit)
+}
+#[tauri::command]
 async fn kn_index(state: State<'_, AppState>, connection_id: String, scope: Option<Vec<String>>, batch: Option<u32>, full: Option<bool>) -> R<()> {
     ai_api::index_knowledge(&state, &connection_id, scope, batch, full.unwrap_or(false))
 }
@@ -704,6 +708,7 @@ pub fn run() {
             ai_audit,
             mcp_config,
             kn_get,
+            kn_objects,
             kn_index,
             kn_plan,
             credential_store,

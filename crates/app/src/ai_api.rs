@@ -354,16 +354,25 @@ pub fn list_audit(state: &AppState) -> Result<Vec<AuditEntry>> {
 #[derive(Debug, Serialize)]
 pub struct KnowledgeView {
     pub state: Option<KnState>,
-    pub objects: Vec<KnObject>,
     pub notes: Vec<KnNote>,
 }
 
+/// Index state and notes. Objects are paged with [`knowledge_objects`]
+/// (an index can hold 10k+ tables).
 pub fn knowledge(state: &AppState, connection_id: &str) -> Result<KnowledgeView> {
-    Ok(KnowledgeView {
-        state: state.workspace.kn_state(connection_id)?,
-        objects: state.workspace.kn_objects(connection_id)?,
-        notes: state.workspace.kn_notes(connection_id)?,
-    })
+    Ok(KnowledgeView { state: state.workspace.kn_state(connection_id)?, notes: state.workspace.kn_notes(connection_id)? })
+}
+
+#[derive(Serialize)]
+pub struct KnObjectPage {
+    pub objects: Vec<KnObject>,
+    /// Objects matching the filter (all pages).
+    pub total: usize,
+}
+
+pub fn knowledge_objects(state: &AppState, connection_id: &str, filter: &str, offset: usize, limit: usize) -> Result<KnObjectPage> {
+    let (objects, total) = state.workspace.kn_list_objects(connection_id, filter, offset, limit.clamp(1, 1000))?;
+    Ok(KnObjectPage { objects, total })
 }
 
 /// What indexing would cover (schemas, catalogs, table counts) so the UI

@@ -28,6 +28,7 @@ import type {
   CredentialStoreView,
   MigrationReport,
   KnowledgeEvent,
+  KnObjectPage,
   KnowledgeView,
   KiroStatus,
   ModelInfo,
@@ -201,6 +202,9 @@ export const api = {
   mcpConfig: () => call<unknown>("mcp_config"),
 
   knGet: (connectionId: string) => call<KnowledgeView>("kn_get", { connectionId }),
+  /** Indexed objects matching `filter` (schema.name or comment), one page at a time. */
+  knObjects: (connectionId: string, filter: string, offset: number, limit: number) =>
+    call<KnObjectPage>("kn_objects", { connectionId, filter, offset, limit }),
   oracleClientStatus: (libDir?: string | null) => call<OracleClientStatus>("oracle_client_status", { libDir: libDir || null }),
   oracleInstallClient: () => call<OracleClientStatus>("oracle_install_client"),
   oracleOpenDownload: () => call<void>("oracle_open_download"),

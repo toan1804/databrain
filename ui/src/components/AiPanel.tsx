@@ -29,7 +29,7 @@ import {
 } from "lucide-react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { api, toError } from "../lib/api";
-import type { AiMode, AiSessionRecord, KnNote, KnowledgeView, NotesImportPreview, ResultInfo } from "../lib/types";
+import type { AiMode, AiSessionRecord, KnNote, KnObject, KnowledgeView, NotesImportPreview, ResultInfo } from "../lib/types";
 import { emptyView, formatCount, lineDiff, relativeTime, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
 import { connectionForKey, useAi, visibleItems, type ChatItem } from "../aiStore";
@@ -668,6 +668,9 @@ function Sessions() {
 
 // ------------------------------------------------------------------ knowledge
 
+/** Indexed objects shown per page in Knowledge. */
+const OBJECT_PAGE = 200;
+
 function Knowledge() {
   const connections = useStore((s) => s.connections);
   const activeConn = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId)?.connection_id ?? null);
@@ -679,6 +682,7 @@ function Knowledge() {
   const [connId, setConnId] = useState<string | null>(activeConn ?? connections[0]?.id ?? null);
   const [data, setData] = useState<KnowledgeView | null>(null);
   const [filter, setFilter] = useState("");
+  const [objects, setObjects] = useState<{ list: KnObject[]; total: number } | null>(null);
   const [note, setNote] = useState({ target: "", body: "" });
   const [targetState, setTargetState] = useState<TargetState>({ status: "empty" });
   const targetOk = targetState.status === "empty" || targetState.status === "ok";
@@ -717,6 +721,32 @@ function Knowledge() {
   };
   useEffect(load, [connId, version]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Indexed objects: one page at a time, filtered in the workspace DB (an
+  // index can hold 10k+ tables; never load them all into the view).
+  useEffect(() => {
+    if (!connId) return setObjects(null);
+    let stale = false;
+    const t = setTimeout(
+      () =>
+        void api
+          .knObjects(connId, filter, 0, OBJECT_PAGE)
+          .then((p) => !stale && setObjects({ list: p.objects, total: p.total }))
+          .catch(() => {}),
+      filter ? 150 : 0,
+    );
+    return () => {
+      stale = true;
+      clearTimeout(t);
+    };
+  }, [connId, version, filter]);
+  const moreObjects = () => {
+    if (!connId || !objects) return;
+    void api
+      .knObjects(connId, filter, objects.list.length, OBJECT_PAGE)
+      .then((p) => setObjects((o) => (o ? { list: [...o.list, ...p.objects], total: p.total } : o)))
+      .catch((e) => toast(toError(e).message, "error"));
+  };
+
   const saveNote = async (n: Partial<KnNote>) => {
     if (!connId) return;
     try {
@@ -740,7 +770,6 @@ function Knowledge() {
 
   const scopeList = connections.find((c) => c.id === connId)?.ai_policy?.index_schemas ?? [];
   const scopeText = scopeList.length === 0 ? "" : scopeList.includes("*") ? "all schemas" : scopeList.join(", ");
-  const objects = (data?.objects ?? []).filter((o) => `${o.schema}.${o.name} ${o.comment ?? ""}`.toLowerCase().includes(filter.toLowerCase()));
   const proposed = data?.notes.filter((n) => n.status === "proposed") ?? [];
   const approved = data?.notes.filter((n) => n.status === "approved") ?? [];
 
@@ -758,8 +787,8 @@ function Knowledge() {
       </div>
 
       <div className="rounded-lg border border-line p-2.5">
-        <div className="flex items-center gap-2">
-          <div className="flex-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="min-w-[9rem] flex-1">
             <div className="font-medium">Schema index</div>
             <div className="text-[11.5px] text-muted">
               {data?.state
@@ -767,6 +796,7 @@ function Knowledge() {
                 : "Not indexed yet. The assistant uses this metadata to find relevant tables."}
             </div>
           </div>
+          <div className="flex flex-wrap gap-1.5">
           {prog ? (
             <button className="btn-ghost border border-line py-1" onClick={() => connId && void cancelIndex(connId)} title="Stop indexing; finished schemas are kept">
               <X size={12} /> Cancel
@@ -801,6 +831,7 @@ function Knowledge() {
               )}
             </>
           )}
+          </div>
         </div>
         {scopeText && <div className="mt-1 truncate text-[11px] text-muted" title={scopeText}>Scope: {scopeText}</div>}
         {prog && (
@@ -849,7 +880,7 @@ function Knowledge() {
       )}
 
       <div>
-        <div className="mb-1 flex items-center gap-1">
+        <div className="mb-1 flex flex-wrap items-center gap-1">
           <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">Notes & glossary</span>
           <button className="btn-ghost ml-auto py-0.5 text-[11.5px]" disabled={!connId} onClick={() => void importNotes()} title="Import a notes file shared by someone else">
             <FileUp size={12} /> Import…
@@ -882,7 +913,6 @@ function Knowledge() {
               connId={connId}
               value={note.target}
               onChange={(target) => setNote((n) => ({ ...n, target }))}
-              indexed={data?.objects ?? []}
               onState={setTargetState}
             />
           )}
@@ -914,14 +944,15 @@ function Knowledge() {
         ))}
       </div>
 
-      {data && data.objects.length > 0 && (
+      {objects && (objects.total > 0 || filter) && (
         <div>
-          <div className="mb-1 flex items-center gap-2">
+          <div className="mb-1 flex flex-wrap items-center gap-2">
             <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">Indexed objects</span>
-            <input className="field ml-auto h-6 w-36 py-0 text-[11.5px]" placeholder="Filter" aria-label="Filter objects" value={filter} onChange={(e) => setFilter(e.target.value)} />
+            <span className="text-[11px] text-muted">{formatCount(objects.total)}</span>
+            <input className="field ml-auto h-6 w-36 min-w-0 py-0 text-[11.5px]" placeholder="Filter" aria-label="Filter objects" value={filter} onChange={(e) => setFilter(e.target.value)} />
           </div>
           <div className="space-y-0.5">
-            {objects.slice(0, 300).map((o) => (
+            {objects.list.map((o) => (
               <div key={`${o.schema}.${o.name}`} className="rounded px-1.5 py-1 hover:bg-hover" title={o.columns.map((c) => `${c.name} ${c.data_type}`).join("\n")}>
                 <span className="font-mono text-[11.5px]">
                   {o.schema}.{o.name}
@@ -932,7 +963,12 @@ function Knowledge() {
                 {o.comment && <div className="truncate text-[11px] text-muted">{o.comment}</div>}
               </div>
             ))}
-            {objects.length > 300 && <div className="text-[11px] text-muted">…{objects.length - 300} more</div>}
+            {objects.total === 0 && <div className="text-[11px] text-muted">No match</div>}
+            {objects.total > objects.list.length && (
+              <button className="btn-ghost py-0.5 text-[11.5px]" onClick={moreObjects}>
+                Show {formatCount(Math.min(OBJECT_PAGE, objects.total - objects.list.length))} more of {formatCount(objects.total - objects.list.length)}
+              </button>
+            )}
           </div>
         </div>
       )}
