@@ -52,3 +52,14 @@ describe("notebook dataflow", () => {
     expect(cellDeps([cell("a", "select 1", "base"), cell("b", "select * from results.base__1")], []).b.producers).toEqual(["a"]);
   });
 });
+
+describe("SQL written for outputs", () => {
+  it("starts with one DuckDB header line that is not read as an output", async () => {
+    const { DUCKDB_HEADER, withDuckdbHeader } = await import("./dataflow");
+    const sql = withDuckdbHeader(`SELECT *\nFROM ${outputRef(out("r3", "revenue"))}\nLIMIT 1000;`);
+    expect(sql.split("\n")[0]).toBe(DUCKDB_HEADER);
+    expect(sql).toContain("FROM results.revenue");
+    expect(withDuckdbHeader(sql)).toBe(sql);
+    expect(referencedOutputs(sql)).toEqual(["revenue"]);
+  });
+});

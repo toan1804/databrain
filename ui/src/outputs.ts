@@ -4,7 +4,7 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { api, toError } from "./lib/api";
 import type { OutputInfo } from "./lib/types";
 import { formatCount } from "./lib/util";
-import { mentionToken, outputLabel, outputRef } from "./lib/dataflow";
+import { DUCKDB_HEADER, mentionToken, outputLabel, outputRef, withDuckdbHeader } from "./lib/dataflow";
 
 export { extractMentions, mentionToken, outputLabel, outputRef, referencedOutputs } from "./lib/dataflow";
 import { useStore } from "./store";
@@ -25,8 +25,11 @@ export function isResultsConnection(id: string | null | undefined): boolean {
   return !!c && c.config.kind === "duckdb" && c.config.options?.databrain_results === "1";
 }
 
+export { DUCKDB_HEADER, withDuckdbHeader };
+
 /** New tab on the Results connection with `sql`, optionally run at once. */
 export async function openResultsQuery(sql: string, title: string, run = true) {
+  sql = withDuckdbHeader(sql);
   try {
     const conn = await resultsConnection();
     const st = useStore.getState();
@@ -39,11 +42,11 @@ export async function openResultsQuery(sql: string, title: string, run = true) {
 
 /** SQL that queries an output. */
 export function outputQuerySql(o: OutputInfo): string {
-  return `SELECT *\nFROM ${outputRef(o)}\nLIMIT 1000;`;
+  return withDuckdbHeader(`SELECT *\nFROM ${outputRef(o)}\nLIMIT 1000;`);
 }
 
 export function queryOutput(o: OutputInfo) {
-  void openResultsQuery(`SELECT *\nFROM ${outputRef(o)}\nLIMIT 1000;`, `Query ${outputLabel(o)}`, false);
+  void openResultsQuery(outputQuerySql(o), `Query ${outputLabel(o)}`, false);
 }
 
 /** Open the stored data in an output viewer tab (no re-run). */

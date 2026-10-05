@@ -30,6 +30,14 @@ export function extractMentions(text: string, outputs: OutputInfo[]): string[] {
 }
 
 /** Output names referenced as results.<name> in SQL (comments/strings ignored, roughly). */
+/** First line of SQL written for outputs, so it is clear which engine runs it. */
+export const DUCKDB_HEADER = "-- Runs locally on DuckDB (Results connection): outputs are results.<name>, DuckDB SQL syntax.";
+
+/** `sql` with the DuckDB header line (once). */
+export function withDuckdbHeader(sql: string): string {
+  return sql.startsWith(DUCKDB_HEADER) ? sql : `${DUCKDB_HEADER}\n${sql}`;
+}
+
 export function referencedOutputs(sql: string): string[] {
   const clean = sql.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "").replace(/'(?:[^']|'')*'/g, "''");
   const out: string[] = [];

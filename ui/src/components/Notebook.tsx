@@ -245,7 +245,19 @@ export function NotebookView({
     }
   };
 
-  const cellConn = (c: NotebookCell) => c.connection_id ?? connId;
+  // Cells that read results.<name> default to the local Results (DuckDB)
+  // connection: that is where they run, so the editor's completion, the AI
+  // and the cell's connection label use it too.
+  const readsOutputs = nb?.cells.some((c) => c.kind === "sql" && !c.connection_id && (deps[c.id]?.reads.length ?? 0) > 0) ?? false;
+  const [resultsId, setResultsId] = useState<string | null>(null);
+  useEffect(() => {
+    if (readsOutputs && !resultsId) resultsConnection().then(setResultsId).catch(() => {});
+  }, [readsOutputs, resultsId]);
+  const cellConn = (c: NotebookCell) => {
+    if (c.connection_id) return c.connection_id;
+    if (c.kind === "sql" && (deps[c.id]?.reads.length ?? 0) > 0 && conn?.config.kind !== "duckdb" && resultsId) return resultsId;
+    return connId;
+  };
 
   const runCell = useCallback(
     async (c: NotebookCell, sqlOverride?: string) => {
@@ -563,10 +575,10 @@ function Cell(props: CellProps) {
     .slice()
     .reverse()
     .find((x) => x.output)?.output;
-  const viaResults =
-    cell.kind === "sql" &&
-    (deps?.reads.length ?? 0) > 0 &&
-    conn?.config.kind !== "duckdb";
+  // Reads outputs: runs on Results (chosen automatically, or because the
+  // chosen connection is not DuckDB).
+  const autoResults = cell.kind === "sql" && !cell.connection_id && (deps?.reads.length ?? 0) > 0 && props.connectionId !== props.notebookConnection;
+  const viaResults = cell.kind === "sql" && (deps?.reads.length ?? 0) > 0 && (autoResults || conn?.config.kind !== "duckdb");
   return (
     <div
       className={`group relative rounded-xl border bg-panel transition-colors ${focused ? "border-accent/60 shadow-[0_0_0_1px_color-mix(in_srgb,var(--accent)_25%,transparent)]" : "border-line"}`}
@@ -654,7 +666,7 @@ function Cell(props: CellProps) {
                 onChange({ connection_id: e.target.value || null })
               }
             >
-              <option value="">Notebook connection</option>
+              <option value="">{autoResults ? "Results (reads outputs)" : "Notebook connection"}</option>
               {connections.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.name}
