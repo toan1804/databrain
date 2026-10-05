@@ -151,6 +151,19 @@ async fn sqlite_explorer_and_queries() {
     let layout = api::table_layout(&st, &id, "main", "orders").await.unwrap();
     assert_eq!(layout.indexes[0].columns, vec!["order_id"]);
     assert!(layout.indexes.iter().any(|i| i.name == "orders_customer" && i.columns == vec!["customer_id"]), "{layout:?}");
+    // Browsing fills the metadata cache: completion answers locally without the AI index.
+    st.engine.workspace().meta_clear(&id).unwrap();
+    assert!(api::complete_tables_local(&st, &id, None, "ord", 10).unwrap().is_empty());
+    api::list_objects(&st, &id, "main").await.unwrap();
+    let local = api::complete_tables_local(&st, &id, Some("main"), "ord", 10).unwrap();
+    assert_eq!(local.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["orders", "order_items"]);
+    assert!(api::complete_columns_local(&st, &id, "main", "customers").unwrap().is_none());
+    api::describe(&st, &id, "main", "customers").await.unwrap();
+    assert!(api::complete_columns_local(&st, &id, "main", "customers").unwrap().unwrap().contains(&"customer_id".to_string()));
+    // Completion searches one schema on the server, best matches first.
+    let hits = api::complete_tables(&st, &id, Some("main"), "ORD", 10).await.unwrap();
+    assert_eq!(hits.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["orders", "order_items"]);
+    assert!(api::complete_tables(&st, &id, None, "", 10).await.unwrap().is_empty());
     // Query tips after a run: references as written in SQL are resolved.
     let hl = databrain_app::ai_api::hint_layouts(&st, &id, vec!["ORDERS".into(), "main.customers".into(), "nope".into()]).await.unwrap();
     assert_eq!((hl[0].schema.as_deref(), hl[0].name.as_deref()), (Some("main"), Some("orders")));

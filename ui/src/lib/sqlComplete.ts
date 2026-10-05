@@ -10,13 +10,13 @@ export interface MetaProvider {
   kind: ConnectorKind;
   /** Known schemas (undefined while not loaded). */
   schemas(): SchemaInfo[] | undefined;
-  /** Tables/views of a schema (may load). */
-  objects(schema: string): Promise<DbObject[] | undefined>;
+  /** Tables/views of a schema matching `typed` (may search the server; never loads a whole big schema). */
+  objects(schema: string, typed: string): Promise<DbObject[] | undefined>;
   /** Already-loaded objects of every schema (no I/O). */
   cachedObjects(): DbObject[];
   /** Already-loaded objects named `name` (any case); faster than scanning cachedObjects on big catalogs. */
   cachedNamed?(name: string): DbObject[];
-  /** Server-side table search by name (may be empty when offline). */
+  /** Table search by name: local index + server (may be empty when offline). */
   searchTables(prefix: string): Promise<DbObject[]>;
   /** Column names of a table (may load). */
   columns(schema: string, table: string): Promise<string[] | undefined>;
@@ -439,7 +439,7 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
     // schema. → tables
     const sc = findSchema(p, path);
     if (sc) {
-      const objs = matchingRelations((await p.objects(sc.name)) ?? [], typed, MAX_TABLE_OPTIONS);
+      const objs = matchingRelations((await p.objects(sc.name, typed)) ?? [], typed, MAX_TABLE_OPTIONS);
       for (const o of objs) {
         opts.push({ label: o.name, type: o.kind === "view" || o.kind === "materialized_view" ? "view" : "table", detail: schemaLabel(sc), apply: quoteIdent(k, o.name) });
       }

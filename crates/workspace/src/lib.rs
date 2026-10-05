@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod ai;
 pub mod knowledge;
+pub mod meta_cache;
 pub mod notebooks;
 pub mod outputs;
 
@@ -476,6 +477,27 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE kn_notes ADD COLUMN replaces TEXT;
     "#,
+    // v6: metadata cache (tables and columns seen while browsing, for completion)
+    r#"
+    CREATE TABLE meta_objects (
+        connection_id TEXT NOT NULL,
+        schema_name   TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        kind          TEXT NOT NULL,
+        comment       TEXT,
+        row_estimate  INTEGER,
+        seen_at       INTEGER NOT NULL,
+        PRIMARY KEY (connection_id, schema_name, name)
+    );
+    CREATE TABLE meta_columns (
+        connection_id TEXT NOT NULL,
+        schema_name   TEXT NOT NULL,
+        table_name    TEXT NOT NULL,
+        columns_json  TEXT NOT NULL,
+        seen_at       INTEGER NOT NULL,
+        PRIMARY KEY (connection_id, schema_name, table_name)
+    );
+    "#,
 ];
 
 /// Maximum history rows kept; older rows are pruned on insert.
@@ -593,6 +615,8 @@ impl Workspace {
         tx.execute("DELETE FROM kn_fts WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM kn_notes WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM kn_state WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM meta_objects WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1", [id])?;
         tx.execute("UPDATE tabs SET connection_id = NULL WHERE connection_id = ?1", [id])?;
         tx.commit()?;
         Ok(())

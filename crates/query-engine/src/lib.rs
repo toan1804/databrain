@@ -657,6 +657,17 @@ impl QueryEngine {
         .await
     }
 
+    /// Tables/views of one schema matching `query` (editor completion).
+    pub async fn search_schema(&self, connection_id: &str, schema: &str, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let (schema, query) = (schema.to_string(), query.to_string());
+        let limit = limit.clamp(1, 1000);
+        self.with_meta(connection_id, |s| {
+            let (schema, query) = (schema.clone(), query.clone());
+            async move { s.search_schema(&schema, &query, limit).await }
+        })
+        .await
+    }
+
     pub async fn bulk_metadata(&self, connection_id: &str, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
         let schemas = schemas.to_vec();
         self.with_meta(connection_id, |s| {

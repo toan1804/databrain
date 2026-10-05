@@ -72,6 +72,14 @@ pub trait Session: Send + Sync {
         search_by_listing(self, query, limit).await
     }
 
+    /// Tables/views of one schema whose name contains `query` (empty = any),
+    /// best matches first, at most `limit` (editor completion). The default
+    /// lists the schema; engines with a catalog view filter server-side so
+    /// huge schemas are never transferred whole.
+    async fn search_schema(&self, schema: &str, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        search_schema_by_listing(self, schema, query, limit).await
+    }
+
     /// Objects and columns of several schemas, for the AI knowledge index.
     /// Engines with a catalog-wide information schema override this to use
     /// a couple of queries per catalog instead of two per schema. Errors for
@@ -210,6 +218,19 @@ pub async fn default_bulk_metadata<S: Session + ?Sized>(s: &S, schemas: &[String
 
 /// Catalog search by listing every schema (the default for
 /// [`Session::search_objects`]); stops early once plenty of hits are found.
+/// [`Session::search_schema`] by listing the schema and filtering.
+pub async fn search_schema_by_listing<S: Session + ?Sized>(s: &S, schema: &str, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+    let q = query.trim().to_lowercase();
+    let mut hits: Vec<DbObject> = s
+        .list_objects(schema)
+        .await?
+        .into_iter()
+        .filter(|o| o.kind.is_relation() && (q.is_empty() || o.name.to_lowercase().contains(&q)))
+        .collect();
+    rank_matches(query, &mut hits, limit);
+    Ok(hits)
+}
+
 pub async fn search_by_listing<S: Session + ?Sized>(s: &S, query: &str, limit: usize) -> Result<Vec<DbObject>> {
     let mut hits = Vec::new();
     for sc in s.list_schemas().await? {

@@ -386,7 +386,10 @@ pub async fn list_schemas(state: &AppState, id: &str) -> Result<Vec<SchemaInfo>>
 }
 
 pub async fn list_objects(state: &AppState, id: &str, schema: &str) -> Result<Vec<DbObject>> {
-    state.engine.list_objects(id, schema).await
+    let objs = state.engine.list_objects(id, schema).await?;
+    // Remember it for completion / search (best effort).
+    let _ = state.engine.workspace().meta_put_schema(id, schema, &objs);
+    Ok(objs)
 }
 
 /// Catalog search: tables and views whose name contains `query`
@@ -395,7 +398,38 @@ pub async fn search_objects(state: &AppState, id: &str, query: &str, limit: Opti
     if query.trim().is_empty() {
         return Ok(vec![]);
     }
-    state.engine.search_objects(id, query, limit.unwrap_or(100)).await
+    let hits = state.engine.search_objects(id, query, limit.unwrap_or(100)).await?;
+    let _ = state.engine.workspace().meta_add_objects(id, &hits);
+    Ok(hits)
+}
+
+/// Completion, local part: tables from the knowledge index (no network, instant).
+pub fn complete_tables_local(state: &AppState, id: &str, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+    let rows = state.engine.workspace().kn_complete(id, schema, query, limit.clamp(1, 500))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(schema, name, kind, comment)| {
+            let kind: databrain_connector_core::ObjectKind = serde_json::from_value(serde_json::Value::String(kind)).unwrap_or(databrain_connector_core::ObjectKind::Table);
+            kind.is_relation().then_some(DbObject { schema, name, kind, comment, row_estimate: None })
+        })
+        .collect())
+}
+
+/// Completion, remote part: filtered on the server (schema-scoped when given),
+/// so big catalogs are never loaded whole.
+pub async fn complete_tables(state: &AppState, id: &str, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+    let hits = match schema {
+        Some(s) => state.engine.search_schema(id, s, query, limit).await?,
+        None if query.trim().is_empty() => vec![],
+        None => state.engine.search_objects(id, query, limit).await?,
+    };
+    let _ = state.engine.workspace().meta_add_objects(id, &hits);
+    Ok(hits)
+}
+
+/// Column names of a table from the knowledge index (no network).
+pub fn complete_columns_local(state: &AppState, id: &str, schema: &str, name: &str) -> Result<Option<Vec<String>>> {
+    Ok(state.engine.workspace().kn_column_names(id, schema, name)?)
 }
 
 pub async fn describe(
@@ -404,7 +438,11 @@ pub async fn describe(
     schema: &str,
     name: &str,
 ) -> Result<ObjectDetail> {
-    state.engine.describe(id, schema, name).await
+    let d = state.engine.describe(id, schema, name).await?;
+    if !d.columns.is_empty() {
+        let _ = state.engine.workspace().meta_put_columns(id, schema, name, &d.columns);
+    }
+    Ok(d)
 }
 
 pub async fn table_layout(state: &AppState, id: &str, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {

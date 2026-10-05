@@ -381,6 +381,18 @@ async fn list_objects(state: State<'_, AppState>, id: String, schema: String) ->
 }
 
 #[tauri::command]
+fn complete_tables_local(state: State<'_, AppState>, id: String, schema: Option<String>, query: String, limit: usize) -> R<Vec<DbObject>> {
+    api::complete_tables_local(&state, &id, schema.as_deref(), &query, limit)
+}
+#[tauri::command]
+async fn complete_tables(state: State<'_, AppState>, id: String, schema: Option<String>, query: String, limit: usize) -> R<Vec<DbObject>> {
+    api::complete_tables(&state, &id, schema.as_deref(), &query, limit).await
+}
+#[tauri::command]
+fn complete_columns_local(state: State<'_, AppState>, id: String, schema: String, name: String) -> R<Option<Vec<String>>> {
+    api::complete_columns_local(&state, &id, &schema, &name)
+}
+#[tauri::command]
 async fn search_objects(state: State<'_, AppState>, id: String, query: String, limit: Option<usize>) -> R<Vec<DbObject>> {
     api::search_objects(&state, &id, &query, limit).await
 }
@@ -628,6 +640,9 @@ pub fn run() {
             list_schemas,
             list_objects,
             search_objects,
+            complete_tables_local,
+            complete_tables,
+            complete_columns_local,
             describe_object,
             table_layout,
             statement_at_cursor,

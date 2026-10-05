@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result, Workspace, new_id, now_ms};
 
+/// (schema, name, kind, comment) of a completion hit from the index.
+pub type KnCompletion = (String, String, String, Option<String>);
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KnObject {
     pub schema: String,
@@ -492,6 +495,47 @@ impl Workspace {
         Ok(rows)
     }
 
+    /// Completion from the local index (no network): tables/views whose name
+    /// contains `query` (empty = any), in `schema` when given, prefix matches
+    /// and short names first. Returns (schema, name, kind, comment).
+    pub fn kn_complete(&self, connection_id: &str, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<KnCompletion>> {
+        let c = self.conn.lock();
+        let q = query.trim().to_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let mut stmt = c.prepare_cached(
+            // The knowledge index and the metadata cache (tables seen while browsing).
+            "SELECT schema_name, name, max(kind), max(comment) FROM ( \
+                 SELECT schema_name, name, kind, comment FROM kn_objects WHERE connection_id = ?1 \
+                 UNION ALL SELECT schema_name, name, kind, comment FROM meta_objects WHERE connection_id = ?1 \
+             ) WHERE (?2 IS NULL OR schema_name = ?2) AND lower(name) LIKE '%' || ?3 || '%' ESCAPE '\\' \
+             GROUP BY schema_name, name \
+             ORDER BY lower(name) NOT LIKE ?3 || '%' ESCAPE '\\', length(name), name LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(params![connection_id, schema, q, limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Column names of a table (exact schema id): knowledge index, else the metadata cache.
+    pub fn kn_column_names(&self, connection_id: &str, schema: &str, name: &str) -> Result<Option<Vec<String>>> {
+        if let Some(cols) = self.kn_indexed_column_names(connection_id, schema, name)? {
+            return Ok(Some(cols));
+        }
+        self.meta_column_names(connection_id, schema, name)
+    }
+
+    fn kn_indexed_column_names(&self, connection_id: &str, schema: &str, name: &str) -> Result<Option<Vec<String>>> {
+        let c = self.conn.lock();
+        let json: Option<String> = c
+            .query_row(
+                "SELECT columns_json FROM kn_objects WHERE connection_id = ?1 AND schema_name = ?2 AND lower(name) = lower(?3)",
+                params![connection_id, schema, name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(json.map(|j| serde_json::from_str::<Vec<ColumnInfo>>(&j).unwrap_or_default().into_iter().map(|c| c.name).collect()))
+    }
+
     /// Look up an object by `schema.name` or bare `name` (case-insensitive).
     pub fn kn_get(&self, connection_id: &str, reference: &str) -> Result<Option<KnObject>> {
         let c = self.conn.lock();
@@ -703,6 +747,23 @@ mod tests {
                 .collect(),
             foreign_keys: vec![],
         }
+    }
+
+    #[test]
+    fn completion_from_the_index() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let objs = vec![obj("s", "customer_orders", &["a"], None), obj("s", "customers", &["customer_id", "email"], None), obj("s", "big_customer", &[], None), obj("s", "x_y", &[], None), obj("s", "xay", &[], None)];
+        ws.kn_replace_schema("c1", "s", &objs).unwrap();
+        ws.kn_replace_schema("c1", "t", &[obj("t", "customers", &[], None)]).unwrap();
+        let names = |s: Option<&str>, q: &str| ws.kn_complete("c1", s, q, 10).unwrap().into_iter().map(|r| format!("{}.{}", r.0, r.1)).collect::<Vec<_>>();
+        // Prefix matches first, then shorter names.
+        assert_eq!(names(Some("s"), "CUST"), vec!["s.customers", "s.customer_orders", "s.big_customer"]);
+        assert_eq!(names(None, "customers"), vec!["s.customers", "t.customers"]);
+        // `_` is literal, not a wildcard.
+        assert_eq!(names(Some("s"), "x_"), vec!["s.x_y"]);
+        assert_eq!(ws.kn_complete("c1", Some("s"), "", 2).unwrap().len(), 2);
+        assert_eq!(ws.kn_column_names("c1", "s", "CUSTOMERS").unwrap().unwrap(), vec!["customer_id", "email"]);
+        assert!(ws.kn_column_names("c1", "s", "nope").unwrap().is_none());
     }
 
     #[test]

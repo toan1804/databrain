@@ -117,6 +117,14 @@ export const api = {
   listObjects: (id: string, schema: string) => call<DbObject[]>("list_objects", { id, schema }),
   searchObjects: (id: string, query: string, limit?: number) =>
     call<DbObject[]>("search_objects", { id, query, limit: limit ?? null }),
+  /** Completion: tables from the local knowledge index (no network). */
+  completeTablesLocal: (id: string, schema: string | null, query: string, limit: number) =>
+    call<DbObject[]>("complete_tables_local", { id, schema, query, limit }),
+  /** Completion: tables filtered on the server (one schema when given). */
+  completeTables: (id: string, schema: string | null, query: string, limit: number) =>
+    call<DbObject[]>("complete_tables", { id, schema, query, limit }),
+  completeColumnsLocal: (id: string, schema: string, name: string) =>
+    call<string[] | null>("complete_columns_local", { id, schema, name }),
   describeObject: (id: string, schema: string, name: string) =>
     call<ObjectDetail>("describe_object", { id, schema, name }),
   tableLayout: (id: string, schema: string, name: string) => call<TableLayout>("table_layout", { id, schema, name }),

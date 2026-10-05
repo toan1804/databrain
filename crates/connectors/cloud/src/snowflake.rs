@@ -649,6 +649,36 @@ impl Session for SfSession {
         Ok(hits)
     }
 
+    async fn search_schema(&self, schema: &str, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let (db, sch) = schema.split_once('.').ok_or_else(|| ConnectorError::query("expected database.schema"))?;
+        let term = databrain_connector_core::search_sql_term(query);
+        let t = quote_literal(&term);
+        let sql = format!(
+            "select table_name, table_type, comment, row_count from {}.information_schema.tables where table_schema = {} and contains(lower(table_name), {t}) \
+             order by startswith(lower(table_name), {t}) desc, length(table_name), table_name limit {}",
+            quote_ident(ConnectorKind::Snowflake, db),
+            quote_literal(sch),
+            limit.clamp(1, 1000)
+        );
+        Ok(self
+            .0
+            .run_small(&sql)
+            .await?
+            .into_iter()
+            .filter_map(|r| {
+                let g = |i: usize| r.get(i).cloned().flatten();
+                let t = g(1).unwrap_or_default();
+                Some(DbObject {
+                    schema: schema.to_string(),
+                    name: g(0)?,
+                    kind: if t.contains("VIEW") { if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else if t.contains("EXTERNAL") { ObjectKind::ForeignTable } else { ObjectKind::Table },
+                    comment: g(2),
+                    row_estimate: g(3).and_then(|n| n.parse().ok()),
+                })
+            })
+            .collect())
+    }
+
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {
         let (db, sch) = schema.split_once('.').ok_or_else(|| ConnectorError::query("expected database.schema"))?;
         let sql = format!(

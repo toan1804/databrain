@@ -65,6 +65,27 @@ export function CatalogSearch({ tree, connectionsTree }: { tree: ReactNode; conn
     inputRef.current?.select();
   }, [focusSeq]);
 
+  // Local metadata cache (tables seen before, any session): instant, no debounce.
+  const [local, setLocal] = useState<Record<string, DbObject[]>>({});
+  const localSeq = useRef(0);
+  useEffect(() => {
+    if (!q) {
+      setLocal({});
+      return;
+    }
+    const mine = ++localSeq.current;
+    const term = q.trim().split(".").pop() ?? "";
+    for (const c of targets) {
+      api
+        .completeTablesLocal(c.id, null, term, LIMIT * 2)
+        .then((hits) => {
+          if (localSeq.current === mine) setLocal((l) => ({ ...l, [c.id]: hits }));
+        })
+        .catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q, targetKey]);
+
   // Server-side search, debounced; stale responses are dropped.
   useEffect(() => {
     if (!q) {
@@ -98,10 +119,14 @@ export function CatalogSearch({ tree, connectionsTree }: { tree: ReactNode; conn
     if (!q) return [];
     return targets.map((c) => {
       const r = remote[c.id];
-      const merged = [...cachedHits(q, c.id, objects), ...(r?.hits ?? []).filter((o) => objectMatches(q, o.schema, o.name))];
+      const merged = [
+        ...cachedHits(q, c.id, objects),
+        ...(local[c.id] ?? []).filter((o) => objectMatches(q, o.schema, o.name)),
+        ...(r?.hits ?? []).filter((o) => objectMatches(q, o.schema, o.name)),
+      ];
       return { conn: c, hits: rankHits(q, merged, LIMIT), loading: r?.loading ?? true, error: r?.error };
     });
-  }, [q, targets, remote, objects]);
+  }, [q, targets, remote, local, objects]);
   const flat = useMemo(() => sections.flatMap((s) => s.hits.map((obj) => ({ conn: s.conn, obj }))), [sections]);
 
   useEffect(() => setActive(0), [q, targetKey]);

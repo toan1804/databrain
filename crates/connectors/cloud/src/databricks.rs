@@ -911,6 +911,38 @@ impl Session for DbxSession {
         Ok(out)
     }
 
+    async fn search_schema(&self, schema: &str, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let (cat, sch) = split_schema(schema)?;
+        let term = databrain_connector_core::search_sql_term(query);
+        let t = quote_literal(&term);
+        let sql = format!(
+            "SELECT table_name, table_type, comment FROM {}.information_schema.tables WHERE table_schema = {} AND instr(lower(table_name), {t}) > 0 \
+             ORDER BY CASE WHEN instr(lower(table_name), {t}) = 1 THEN 0 ELSE 1 END, length(table_name), table_name LIMIT {}",
+            quote_ident(ConnectorKind::Databricks, cat),
+            quote_literal(sch),
+            limit.clamp(1, 1000)
+        );
+        let Ok(rows) = self.0.run_small(&sql).await else {
+            // hive_metastore: no information_schema.
+            return databrain_connector_core::search_schema_by_listing(self, schema, query, limit).await;
+        };
+        let mut hits: Vec<DbObject> = rows
+            .iter()
+            .filter_map(|r| {
+                let t = cell(r, 1).unwrap_or_default();
+                Some(DbObject {
+                    schema: schema.to_string(),
+                    name: cell(r, 0)?,
+                    kind: if t.contains("VIEW") { if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else { ObjectKind::Table },
+                    comment: cell(r, 2),
+                    row_estimate: None,
+                })
+            })
+            .collect();
+        databrain_connector_core::rank_matches(query, &mut hits, limit);
+        Ok(hits)
+    }
+
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
         use databrain_connector_core::{parse_list_text, query_table, TableLayout};
         let full = format!("{}.{}", databrain_connector_core::quote_path(ConnectorKind::Databricks, schema), quote_ident(ConnectorKind::Databricks, name));

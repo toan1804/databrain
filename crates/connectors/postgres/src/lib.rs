@@ -459,6 +459,42 @@ impl Session for PgSession {
         Ok(hits)
     }
 
+    async fn search_schema(&self, schema: &str, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let term = databrain_connector_core::search_sql_term(query);
+        let rows = self
+            .client
+            .query(
+                "select c.relname::text, c.relkind::text, obj_description(c.oid, 'pg_class'), c.reltuples::float8 \
+                 from pg_catalog.pg_class c \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 where n.nspname = $1 and c.relkind in ('r','p','v','m','f') and not c.relispartition \
+                   and strpos(lower(c.relname), $2) > 0 \
+                 order by strpos(lower(c.relname), $2) <> 1, length(c.relname), c.relname \
+                 limit $3",
+                &[&schema, &term, &(limit.clamp(1, 1000) as i64)],
+            )
+            .await
+            .map_err(|e| map_err(&e))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let est: Option<f64> = r.get(3);
+                DbObject {
+                    schema: schema.to_string(),
+                    name: r.get(0),
+                    kind: match r.get::<_, String>(1).as_str() {
+                        "v" => ObjectKind::View,
+                        "m" => ObjectKind::MaterializedView,
+                        "f" => ObjectKind::ForeignTable,
+                        _ => ObjectKind::Table,
+                    },
+                    comment: r.get(2),
+                    row_estimate: est.filter(|e| *e >= 0.0).map(|e| e as i64),
+                }
+            })
+            .collect())
+    }
+
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {
         let rows = self
             .client
