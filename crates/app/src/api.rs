@@ -700,6 +700,34 @@ pub fn seed_duckdb_extensions(bundled: &Path, dest: &Path) -> usize {
     n
 }
 
+/// Setting: where the thin Oracle driver is downloaded from (empty = default release).
+pub const ORACLE_AGENT_URL_SETTING: &str = "oracle_agent_url";
+/// UI event channel for the thin driver's first-use download.
+pub const ORACLE_AGENT_EVENT: &str = "oracle-agent";
+
+/// Thin Oracle driver: download folder (`<app data>/oracle-agent`), release
+/// location, and download progress for the UI.
+pub fn setup_oracle_agent(state: &AppState, app_dir: &Path) {
+    #[cfg(feature = "oracle")]
+    {
+        use databrain_connector_oracle::agent;
+        agent::set_dir(Some(app_dir.join("oracle-agent")));
+        agent::set_base_url(state.workspace.get_setting(ORACLE_AGENT_URL_SETTING).ok().flatten().and_then(|v| v.as_str().map(str::to_string)));
+        let ui = state.ui.clone();
+        agent::set_progress_hook(Some(Arc::new(move |p: agent::Download| {
+            ui.emit(
+                ORACLE_AGENT_EVENT,
+                match p {
+                    agent::Download::Progress { done, total } => serde_json::json!({"type": "progress", "done": done, "total": total}),
+                    agent::Download::Finished { ok } => serde_json::json!({"type": "finished", "ok": ok}),
+                },
+            )
+        })));
+    }
+    #[cfg(not(feature = "oracle"))]
+    let _ = (state, app_dir);
+}
+
 /// Setting with the Instant Client folder found or installed by DataBrain.
 pub const ORACLE_CLIENT_SETTING: &str = "oracle_client_dir";
 

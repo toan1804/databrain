@@ -35,14 +35,14 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
 - Safety prompts for prod and for writes, read-only connections, saved queries, history, command palette (⌘K), dark/light theme.
 
 Runtime notes:
-- Oracle needs Oracle Instant Client. DataBrain checks for it (connection dialog, startup when Oracle connections exist, and on connect errors) and can download and install Oracle's latest Basic package in one click (into the app-data folder `oracle/instantclient_*`, with a progress bar; Linux also needs `libaio`).
+- Oracle needs no Oracle software by default: the thin driver (a small helper using [go-ora](https://github.com/sijms/go-ora), Oracle 10g+, TLS/wallets, native network encryption via "Driver options") is downloaded on the first Oracle connection (about 5 MB, into the app-data folder `oracle-agent/`, checked against SHA-256 sums built into DataBrain). Choose the "Oracle Instant Client" driver on a connection for thick-only features; DataBrain then checks for Instant Client and can install Oracle's latest Basic package in one click (into `oracle/instantclient_*`; Linux also needs `libaio`).
 - Google/Snowflake/Entra browser OAuth needs your own OAuth client ID.
 - DuckDB is compiled into the app (with Parquet and JSON). Its Excel, Delta, Iceberg, Avro, httpfs and ICU extensions are downloaded at build time and shipped inside the bundle, so nothing is downloaded at runtime.
 - Kiro needs Kiro CLI installed (`curl -fsSL https://cli.kiro.dev/install | bash`). API keys require a Kiro Pro plan or higher. DataBrain writes one agent config, `~/.kiro/agents/databrain-sql.json`, which limits Kiro to DataBrain's tools.
 
 ## Requirements
 
-- Rust ≥ 1.87 and Node ≥ 20
+- Rust ≥ 1.87 and Node ≥ 20 (Go ≥ 1.27 only to build the Oracle thin driver helper)
 - macOS: Xcode Command Line Tools. Linux: the [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/). Windows: WebView2 + MSVC build tools.
 
 ## Run
@@ -57,6 +57,10 @@ npm run app:build    # release bundle (.app/.dmg, .msi, .deb/.AppImage)
 `npm run dev` alone serves the UI in a browser, but queries need the desktop backend.
 
 `npm run app:build` produces a self-contained app for the build machine (macOS: `target/release/bundle/macos/DataBrain.app` and a `.dmg`; Windows: `.msi`/`.exe`; Linux: `.deb`/`.AppImage`). The bundle includes `databrain-mcp` and the DuckDB extensions; SQLite, DuckDB and (on Linux) OpenSSL are linked statically. Build on each target platform (DuckDB extensions are platform-specific). External tools stay optional: Oracle Instant Client (offered in-app), Kiro CLI, and cloud CLIs for CLI sign-in.
+
+### Oracle thin driver releases
+
+The helper lives in `crates/connectors/oracle/agent` (Go). `node scripts/build-oracle-agent.mjs` builds every platform reproducibly into `target/oracle-agent/`, writes the gzip files to upload to `target/oracle-agent/dist/`, and updates `agent/SHA256SUMS` (compiled into DataBrain). Upload the `.gz` files to `{base}/v{RELEASE}/` (`agent::DEFAULT_BASE_URL`, `agent::RELEASE`; the `oracle_agent_url` setting or `DATABRAIN_ORACLE_AGENT_URL` override the base). `tauri dev` builds the helper for your computer when Go is installed, so development needs no download.
 
 ## Test
 

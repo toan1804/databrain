@@ -6,7 +6,7 @@
   "build": {
     "frontendDist": "../../ui/dist",
     "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run fetch:duckdb-ext && npm run dev",
+    "beforeDevCommand": "npm run fetch:duckdb-ext && npm run build:oracle-agent -- --host --if-go && npm run dev",
     "beforeBuildCommand": "npm run fetch:duckdb-ext && npm run build"
   },
   "app": {

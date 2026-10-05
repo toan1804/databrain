@@ -247,6 +247,12 @@ export function onAuthEvent(handler: (e: AuthEvent) => void): Promise<UnlistenFn
   return listen<AuthEvent>("auth-event", (e) => handler(e.payload));
 }
 
+/** First-use download of the thin Oracle driver. */
+export type OracleAgentEvent = { type: "progress"; done: number; total: number | null } | { type: "finished"; ok: boolean };
+export function onOracleAgent(handler: (e: OracleAgentEvent) => void): Promise<UnlistenFn> {
+  return listen<OracleAgentEvent>("oracle-agent", (e) => handler(e.payload));
+}
+
 export function onOracleInstall(handler: (e: OracleInstallProgress) => void): Promise<UnlistenFn> {
   return listen<OracleInstallProgress>("oracle-install", (e) => handler(e.payload));
 }

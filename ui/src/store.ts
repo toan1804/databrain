@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { revealKeys, splitSchema, treeKey } from "./lib/catalog";
-import { api, isTauri, onAuthEvent, onJobEvent, toError } from "./lib/api";
+import { api, isTauri, onAuthEvent, onJobEvent, onOracleAgent, toError } from "./lib/api";
 import { computeRunTips, type RunTips } from "./queryTips";
 import type {
   AuthEvent,
@@ -443,6 +443,17 @@ export const useStore = create<State>((set, get) => ({
       });
       await onJobEvent((e) => get().handleJobEvent(e));
       window.addEventListener("db:oracle-client-missing", () => set({ oracleClientPrompt: true }));
+      // Thin Oracle driver: downloaded once, on the first Oracle connection.
+      let agentToast = false;
+      void onOracleAgent((e) => {
+        if (e.type === "progress" && !agentToast) {
+          agentToast = true;
+          get().toast("Downloading the Oracle driver (about 5 MB, once)…", "info");
+        } else if (e.type === "finished" && agentToast) {
+          agentToast = false;
+          if (e.ok) get().toast("Oracle driver ready", "success"); // failures surface as the connection error
+        }
+      }).catch(() => {});
       void import("./components/OracleClient").then((m) => m.checkOracleClientAtStartup());
       await onAuthEvent((event) => {
         const cur = get().signIn;

@@ -45,6 +45,9 @@ async fn main() {
         // Extensions copied there by the app.
         #[cfg(feature = "duckdb")]
         databrain_connector_duckdb::set_extension_dir(Some(dir.join("duckdb_extensions").to_string_lossy().into_owned()));
+        // The thin Oracle driver downloaded by the app.
+        #[cfg(feature = "oracle")]
+        databrain_connector_oracle::agent::set_dir(Some(dir.join("oracle-agent")));
     }
     let server = McpServer { engine, hub };
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());

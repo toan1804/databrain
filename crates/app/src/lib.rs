@@ -621,6 +621,7 @@ pub fn run() {
             state.set_credential_store(store, dir.clone());
             state.set_snapshot_dir(dir.join("outputs"));
             api::apply_oracle_client_setting(&state);
+            api::setup_oracle_agent(&state, &dir);
             // DuckDB extensions are shipped in the bundle (no runtime download).
             let bundled = app.path().resource_dir().map(|d| d.join("duckdb-extensions")).unwrap_or_default();
             api::seed_duckdb_extensions(&bundled, &dir.join("duckdb_extensions"));

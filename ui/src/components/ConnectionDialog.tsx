@@ -509,6 +509,20 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
                       </div>
                     </div>
                   );
+                if (kind === "oracle" && f.key === "driver")
+                  return (
+                    <div key={f.key} className="col-span-2">
+                      <Label htmlFor={id}>{f.label}</Label>
+                      <select id={id} className="field" value={values.driver === "instant_client" ? "instant_client" : ""} onChange={(e) => setValue("driver", e.target.value)}>
+                        <option value="">Thin (no Oracle software; downloaded on first use, 5 MB)</option>
+                        <option value="instant_client">Oracle Instant Client</option>
+                      </select>
+                      {f.help && <p className="mt-1 text-[11px] text-muted">{f.help}</p>}
+                    </div>
+                  );
+                // Each Oracle driver has its own settings.
+                if (kind === "oracle" && f.key === "client_lib_dir" && values.driver !== "instant_client") return null;
+                if (kind === "oracle" && f.key === "driver_options" && values.driver === "instant_client") return null;
                 if (f.key === "result_transfer")
                   return (
                     <div key={f.key}>
@@ -542,7 +556,7 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
                       />
                     </div>
                   );
-                const wide = ["host", "account", "http_path", "connect_string", "client_lib_dir", "authenticator"].includes(f.key);
+                const wide = ["host", "account", "http_path", "connect_string", "client_lib_dir", "authenticator", "driver_options"].includes(f.key);
                 const invalid = f.key === "port" && !portValid;
                 return (
                   <div key={f.key} className={wide ? "col-span-2" : ""}>
@@ -564,7 +578,7 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
               })}
             </div>
 
-            {kind === "oracle" && (
+            {kind === "oracle" && values.driver === "instant_client" && (
               <OracleClientPanel libDir={values.client_lib_dir || null} onUseDir={(d) => setValue("client_lib_dir", d)} />
             )}
 

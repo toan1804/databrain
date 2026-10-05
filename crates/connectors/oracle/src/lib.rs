@@ -1,9 +1,15 @@
-//! Oracle Database connector built on `oracle` (ODPI-C).
+//! Oracle connector with two drivers:
 //!
-//! Requires Oracle Instant Client at runtime (download from oracle.com and
-//! set the `client_lib_dir` option or the platform library path). The driver
-//! API is synchronous, so all calls run on blocking threads.
+//! - **Thin** (default): a helper process using go-ora, downloaded on first
+//!   use (see [`agent`]). No Oracle software needed.
+//! - **Instant Client** (`driver = instant_client`): the `oracle` crate over
+//!   ODPI-C, for features go-ora lacks (e.g. OS authentication). Needs
+//!   Oracle Instant Client; its API is synchronous, so calls run on
+//!   blocking threads.
+//!
+//! Catalog queries are the same for both drivers.
 
+pub mod agent;
 pub mod client;
 
 use std::sync::{Arc, Mutex};
@@ -104,9 +110,13 @@ impl Connector for OracleConnector {
                 FieldSpec::new("service_name", "Service name").required().placeholder("FREEPDB1 / ORCLPDB1"),
                 FieldSpec::new("connect_string", "Connect string").placeholder("(optional) TNS alias or full descriptor")
                     .help("Overrides host/port/service"),
+                FieldSpec::new("driver", "Driver").help("Thin needs no Oracle software; Instant Client is for OS authentication and other thick-only features"),
+                FieldSpec::new("driver_options", "Driver options")
+                    .placeholder("SSL=true; WALLET=/path/to/wallet; ENCRYPTION=REQUIRED")
+                    .help("Thin driver: go-ora options separated by ';'"),
                 FieldSpec::new("client_lib_dir", "Instant Client directory").placeholder("/opt/oracle/instantclient_23_3"),
             ],
-            note: Some("Requires Oracle Instant Client installed on this computer."),
+            note: Some("The thin driver (default) needs no Oracle software; it is downloaded on first use (5 MB)."),
         }
     }
 
@@ -115,29 +125,84 @@ impl Connector for OracleConnector {
             Credential::Password { user, password } => (user, password.expose_secret().to_string()),
             _ => return Err(ConnectorError::config("Oracle requires user/password authentication")),
         };
+        if !uses_instant_client(cfg) {
+            let path = agent::ensure().await?;
+            let a = agent::Agent::spawn(&path).await?;
+            let options: serde_json::Map<String, serde_json::Value> = parse_driver_options(cfg.opt("driver_options").unwrap_or(""))
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
+            a.call(serde_json::json!({
+                "op": "connect",
+                "user": user,
+                "password": password,
+                "host": cfg.host_or_default(),
+                "port": cfg.port.unwrap_or(1521),
+                "service": cfg.opt("service_name").or(cfg.database.as_deref().filter(|d| !d.is_empty())).unwrap_or("FREEPDB1"),
+                "connect_string": cfg.opt("connect_string").unwrap_or(""),
+                "options": options,
+                "read_only": cfg.read_only,
+            }))
+            .await?;
+            return Ok(Box::new(OracleSession { backend: Backend::Thin(a) }));
+        }
         let cs = connect_string(cfg);
         let lib = cfg.opt("client_lib_dir").map(str::to_string);
         let read_only = cfg.read_only;
         let conn = blocking(move || {
             init_client(lib.as_deref());
             let mut c = Connection::connect(&user, &password, &cs).map_err(map_err)?;
-            c.set_autocommit(true);
+            // Read-only: one READ ONLY transaction, never committed (with
+            // autocommit on, it would end right after it starts).
+            c.set_autocommit(!read_only);
             if read_only {
                 c.execute("set transaction read only", &[]).map_err(map_err)?;
-                c.set_autocommit(false);
             }
             let _ = c.execute("alter session set nls_date_format = 'YYYY-MM-DD HH24:MI:SS'", &[]);
             Ok(c)
         })
         .await?;
-        Ok(Box::new(OracleSession { conn: Arc::new(conn), lock: Arc::new(Mutex::new(())) }))
+        Ok(Box::new(OracleSession { backend: Backend::Thick { conn: Arc::new(conn), lock: Arc::new(Mutex::new(())) } }))
     }
 }
 
+/// Instant Client (thick) driver chosen for this connection?
+pub fn uses_instant_client(cfg: &ConnectionConfig) -> bool {
+    matches!(cfg.opt("driver").map(str::trim), Some("instant_client" | "thick"))
+}
+
+/// `KEY=value; KEY=value` (also newlines) → pairs.
+fn parse_driver_options(s: &str) -> Vec<(String, String)> {
+    s.split([';', '\n'])
+        .filter_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            let k = k.trim();
+            (!k.is_empty()).then(|| (k.to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+enum Backend {
+    Thick {
+        conn: Arc<Connection>,
+        /// Serializes statements on the connection.
+        lock: Arc<Mutex<()>>,
+    },
+    Thin(Arc<agent::Agent>),
+}
+
 pub struct OracleSession {
-    conn: Arc<Connection>,
-    /// Serializes statements on the connection.
-    lock: Arc<Mutex<()>>,
+    backend: Backend,
+}
+
+/// SQL as Oracle accepts it (no trailing `;`, except for PL/SQL blocks) and
+/// whether it returns rows.
+fn prepare_sql(sql: &str) -> (&str, bool) {
+    let trimmed = sql.trim_end();
+    let kw = databrain_connector_core::sql::leading_keyword(trimmed);
+    let plsql_like = kw == "BEGIN" || kw == "DECLARE" || (kw == "CREATE" && trimmed.to_ascii_uppercase().contains(" END"));
+    let sql = if !plsql_like { trimmed.trim_end_matches(';') } else { trimmed };
+    (sql, kw == "SELECT" || kw == "WITH")
 }
 
 fn col_type(t: &OracleType) -> ColType {
@@ -190,12 +255,7 @@ fn convert(t: ColType, v: &SqlValue) -> Value {
 
 fn run(conn: &Connection, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
     // Oracle rejects a trailing semicolon in SQL (but PL/SQL blocks need theirs).
-    let trimmed = sql.trim_end();
-    let plsql_like = {
-        let kw = databrain_connector_core::sql::leading_keyword(trimmed);
-        kw == "BEGIN" || kw == "DECLARE" || (kw == "CREATE" && trimmed.to_ascii_uppercase().contains(" END"))
-    };
-    let sql = if !plsql_like { trimmed.trim_end_matches(';') } else { trimmed };
+    let (sql, _) = prepare_sql(sql);
     let batch = opts.batch_size.clamp(1, 10_000);
     let mut stmt = conn
         .statement(sql)
@@ -220,7 +280,10 @@ fn run(conn: &Connection, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> R
     if !tx.blocking_send(Ok(StreamEvent::Schema(b.schema()))) {
         return Ok(());
     }
-    for row in rows {
+    for (n, row) in rows.enumerate() {
+        if opts.max_rows.is_some_and(|m| n >= m) {
+            break; // the caller keeps no more
+        }
         let row = row.map_err(map_err)?;
         b.push_row(row.sql_values().iter().zip(&types).map(|(v, t)| convert(*t, v)));
         if b.is_full() && !tx.blocking_send(Ok(StreamEvent::Batch(b.finish()?))) {
@@ -336,7 +399,10 @@ impl OracleSession {
     }
 
     async fn with_conn<T: Send + 'static>(&self, f: impl FnOnce(&Connection) -> Result<T> + Send + 'static) -> Result<T> {
-        let (conn, lock) = (self.conn.clone(), self.lock.clone());
+        let Backend::Thick { conn, lock } = &self.backend else {
+            return Err(ConnectorError::internal("Instant Client call on a thin connection"));
+        };
+        let (conn, lock) = (conn.clone(), lock.clone());
         blocking(move || {
             let _g = lock.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?;
             f(&conn)
@@ -345,6 +411,9 @@ impl OracleSession {
     }
 
     async fn query_named(&self, sql: &'static str, params: Vec<(&'static str, Option<String>)>) -> Result<Vec<Vec<Option<String>>>> {
+        if let Backend::Thin(a) = &self.backend {
+            return a.text(sql, &params).await;
+        }
         self.with_conn(move |c| {
             let binds: Vec<(&str, &dyn ToSql)> = params.iter().map(|(k, v)| (*k, v as &dyn ToSql)).collect();
             // Catalog queries return many rows: fetch them in large round trips.
@@ -367,6 +436,9 @@ impl OracleSession {
 
     /// A catalog query built at runtime (owner lists), rows as text.
     async fn query_dynamic(&self, sql: String) -> Result<Vec<Vec<Option<String>>>> {
+        if let Backend::Thin(a) = &self.backend {
+            return a.text(&sql, &[]).await;
+        }
         self.with_conn(move |c| {
             let mut st = c.statement(&sql).fetch_array_size(METADATA_FETCH).prefetch_rows(METADATA_FETCH).build().map_err(map_err)?;
             let rs = st.query(&[]).map_err(map_err)?;
@@ -454,6 +526,16 @@ impl Session for OracleSession {
     }
 
     async fn server_version(&self) -> Result<String> {
+        if let Backend::Thin(a) = &self.backend {
+            for sql in ["select banner from v$version where rownum = 1", "select 'Oracle ' || version from product_component_version where rownum = 1"] {
+                if let Ok(rows) = a.text(sql, &[]).await {
+                    if let Some(v) = rows.into_iter().next().and_then(|r| r.into_iter().next().flatten()) {
+                        return Ok(v);
+                    }
+                }
+            }
+            return Ok("Oracle".into());
+        }
         self.with_conn(|c| {
             let (v, banner) = c.server_version().map_err(map_err)?;
             Ok(if banner.is_empty() { format!("Oracle {v}") } else { banner.lines().next().unwrap_or("").to_string() })
@@ -462,16 +544,22 @@ impl Session for OracleSession {
     }
 
     async fn ping(&self) -> Result<()> {
+        if let Backend::Thin(a) = &self.backend {
+            return a.call(serde_json::json!({"op": "ping"})).await.map(|_| ());
+        }
         self.with_conn(|c| c.ping().map_err(map_err)).await
     }
 
     async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+        let (conn, lock) = match &self.backend {
+            Backend::Thin(a) => return Ok(thin_execute(a.clone(), sql, opts)),
+            Backend::Thick { conn, lock } => (conn.clone(), lock.clone()),
+        };
         let (tx, stream) = QueryStream::channel(4);
-        let (conn, lock) = (self.conn.clone(), self.lock.clone());
         let sql = sql.to_string();
         let done = tokio_util_token();
         let (cancel, done2) = (opts.cancel.clone(), done.clone());
-        let breaker = self.conn.clone();
+        let breaker = conn.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -618,8 +706,14 @@ impl Session for OracleSession {
             _ => "TABLE",
         };
         let (s, n) = (schema.to_string(), name.to_string());
-        let ddl = self
-            .with_conn(move |c| {
+        let ddl = if let Backend::Thin(a) = &self.backend {
+            a.text("select dbms_metadata.get_ddl(:t, :n, :s) from dual", &[("t", Some(obj_type.to_string())), ("n", Some(n)), ("s", Some(s))])
+                .await
+                .ok()
+                .and_then(|r| r.into_iter().next().and_then(|r| r.into_iter().next().flatten()))
+                .map(|d| d.trim().to_string())
+        } else {
+            self.with_conn(move |c| {
                 let r = c.query_row_as::<String>(
                     "select dbms_metadata.get_ddl(:1, :2, :3) from dual",
                     &[&obj_type, &n, &s],
@@ -627,7 +721,8 @@ impl Session for OracleSession {
                 Ok(r.ok().map(|d| d.trim().to_string()))
             })
             .await?
-            .or_else(|| {
+        };
+        let ddl = ddl.or_else(|| {
                 (object.kind == ObjectKind::Table).then(|| {
                     let cols: Vec<String> = columns
                         .iter()
@@ -691,6 +786,106 @@ impl Session for OracleSession {
     }
 }
 
+/// Run a statement through the thin driver, streaming batches as they arrive.
+fn thin_execute(a: Arc<agent::Agent>, sql: &str, opts: ExecOptions) -> QueryStream {
+    let (tx, stream) = QueryStream::channel(4);
+    let (sql, is_query) = prepare_sql(sql);
+    let sql = sql.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = thin_run(&a, &sql, is_query, &opts, &tx).await {
+            let e = if opts.cancel.is_cancelled() { ConnectorError::cancelled() } else { e };
+            tx.send_err(e).await;
+        }
+    });
+    stream
+}
+
+async fn thin_run(a: &agent::Agent, sql: &str, is_query: bool, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
+    use agent::Frame;
+    let batch = opts.batch_size.clamp(1, 10_000);
+    let req = serde_json::json!({
+        "op": if is_query { "query" } else { "exec" },
+        "sql": sql,
+        "batch_size": batch,
+        "max_rows": opts.max_rows.unwrap_or(0),
+    });
+    let (id, mut r) = a.start(req).await?;
+    let mut builder: Option<(BatchBuilder, usize)> = None;
+    let mut cancelled = false;
+    // Stop asked (Stop button / row cap / consumer gone): tell the helper,
+    // then keep reading until it ends the request.
+    loop {
+        let frame = tokio::select! {
+            f = agent::Agent::next(&mut r, id) => f?,
+            _ = opts.cancel.cancelled(), if !cancelled => {
+                cancelled = true;
+                a.cancel(id).await;
+                continue;
+            }
+        };
+        match frame {
+            Frame::Json(j) => match j["type"].as_str() {
+                Some("schema") => {
+                    let cols: Vec<Column> = j["columns"]
+                        .as_array()
+                        .map(|c| {
+                            c.iter()
+                                .map(|c| {
+                                    let t = match c["type"].as_str() {
+                                        Some("int64") => ColType::Int64,
+                                        Some("float64") => ColType::Float64,
+                                        Some("timestamp") => ColType::Timestamp,
+                                        Some("timestamptz") => ColType::TimestampTz,
+                                        Some("binary") => ColType::Binary,
+                                        Some("bool") => ColType::Bool,
+                                        _ => ColType::Utf8,
+                                    };
+                                    Column::new(c["name"].as_str().unwrap_or(""), t, c["db_type"].as_str().unwrap_or("").to_string())
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let b = BatchBuilder::new(&cols, batch);
+                    if !cancelled && !tx.send(StreamEvent::Schema(b.schema())).await {
+                        cancelled = true;
+                        a.cancel(id).await;
+                    }
+                    builder = Some((b, cols.len()));
+                }
+                Some("done") => {
+                    if cancelled {
+                        return Err(ConnectorError::cancelled());
+                    }
+                    if let Some((b, _)) = builder.as_mut() {
+                        if !b.is_empty() {
+                            tx.send(StreamEvent::Batch(b.finish()?)).await;
+                        }
+                    }
+                    let rows_affected = j["rows_affected"].as_u64();
+                    tx.send(StreamEvent::Done(ExecSummary { rows_affected })).await;
+                    return Ok(());
+                }
+                Some("error") => return Err(agent::reply_error(&j)),
+                _ => {}
+            },
+            Frame::Batch { ncols, nrows, data, .. } => {
+                if cancelled {
+                    continue;
+                }
+                let Some((b, n)) = builder.as_mut() else { continue };
+                if *n != ncols {
+                    return Err(ConnectorError::internal("Oracle driver sent a batch with the wrong column count"));
+                }
+                agent::decode_rows(&data, ncols, nrows, |row| b.push_row(row.into_iter()))?;
+                if b.is_full() && !tx.send(StreamEvent::Batch(b.finish()?)).await {
+                    cancelled = true;
+                    a.cancel(id).await;
+                }
+            }
+        }
+    }
+}
+
 fn tokio_util_token() -> databrain_connector_core::CancellationToken {
     databrain_connector_core::CancellationToken::new()
 }
@@ -724,26 +919,143 @@ mod tests {
         is::<Connection>();
     }
 
-    /// Live: DATABRAIN_ORACLE_HOST, _USER, _PASSWORD, _SERVICE (e.g. gvenzl/oracle-free).
-    #[tokio::test]
-    async fn live_roundtrip() {
-        let Ok(host) = std::env::var("DATABRAIN_ORACLE_HOST") else {
-            eprintln!("skipping: DATABRAIN_ORACLE_HOST not set");
-            return;
-        };
+    async fn live(driver: &str) -> Option<Box<dyn Session>> {
+        live_with(driver, false).await
+    }
+
+    async fn live_with(driver: &str, read_only: bool) -> Option<Box<dyn Session>> {
         use databrain_auth::InlineCredentialSource;
+        let host = std::env::var("DATABRAIN_ORACLE_HOST").ok()?;
         let user = std::env::var("DATABRAIN_ORACLE_USER").unwrap_or_else(|_| "system".into());
         let mut cfg = ConnectionConfig::new(ConnectorKind::Oracle, AuthMethod::Password { user: user.clone() });
         cfg.host = Some(host);
+        cfg.port = std::env::var("DATABRAIN_ORACLE_PORT").ok().and_then(|p| p.parse().ok());
         cfg.options.insert("service_name".into(), std::env::var("DATABRAIN_ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".into()));
-        if let Ok(d) = std::env::var("DATABRAIN_ORACLE_LIB_DIR") {
-            cfg.options.insert("client_lib_dir".into(), d);
+        cfg.options.insert("driver".into(), driver.into());
+        cfg.read_only = read_only;
+        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_ORACLE_PASSWORD").ok().map(secrecy::SecretString::from)));
+        Some(OracleConnector.connect(&cfg, creds).await.unwrap())
+    }
+
+    /// Live, thin driver (needs a built helper: `node scripts/build-oracle-agent.mjs --host`).
+    #[tokio::test]
+    async fn live_thin_driver() {
+        check_driver("thin").await;
+    }
+
+    /// Live, Instant Client driver: same checks (DATABRAIN_ORACLE_LIB_DIR).
+    #[tokio::test]
+    async fn live_instant_client_driver() {
+        let Ok(d) = std::env::var("DATABRAIN_ORACLE_LIB_DIR") else {
+            return eprintln!("skipping: DATABRAIN_ORACLE_LIB_DIR not set");
+        };
+        init_client(Some(&d));
+        check_driver("instant_client").await;
+    }
+
+    async fn check_driver(driver: &str) {
+        let Some(s) = live(driver).await else {
+            eprintln!("skipping: DATABRAIN_ORACLE_HOST not set");
+            return;
+        };
+        let run = |sql: &'static str| {
+            let s = &s;
+            async move { s.execute(sql, ExecOptions::default()).await.unwrap().collect().await }
+        };
+        assert!(s.server_version().await.unwrap().contains("Oracle"));
+        s.ping().await.unwrap();
+
+        // Types: same mapping as the Instant Client driver.
+        let r = run("select 1 as a, 'x' as b, date '2024-01-02' as c, 1.5 as d, cast(null as date) as e, \
+                     timestamp '2024-01-02 03:04:05.123456 +02:00' as f, hextoraw('ff00') as g, to_clob('long text') as h, \
+                     12345678901234567890 as i, cast(2.5 as binary_double) as j, cast(42 as number(10)) as k from dual").await.unwrap();
+        let b = &r.batches[0];
+        let f = |i: usize| databrain_connector_core::arrow::util::display::ArrayFormatter::try_new(b.column(i).as_ref(), &Default::default()).unwrap().value(0).to_string();
+        let types: Vec<String> = b.schema().fields().iter().map(|f| f.data_type().to_string()).collect();
+        assert_eq!(f(1), "x");
+        assert_eq!(f(2), "2024-01-02T00:00:00");
+        assert_eq!(f(3), "1.5");
+        assert!(b.column(4).is_null(0));
+        assert!(f(5).starts_with("2024-01-02T01:04:05.123456"), "{}", f(5));
+        assert_eq!(f(6), "ff00");
+        assert_eq!(f(7), "long text");
+        assert_eq!(f(8), "12345678901234567890", "exact NUMBER kept as text");
+        assert_eq!(f(9), "2.5");
+        assert_eq!((f(10).as_str(), types[10].as_str()), ("42", "Int64"));
+        assert_eq!(types[9], "Float64");
+
+        // Errors carry the ORA code and position.
+        let e = run("select * from no_such_table_xyz").await.unwrap_err();
+        assert_eq!(e.code.as_deref(), Some("ORA-00942"), "{e:?}");
+        assert!(e.position.is_some(), "{e:?}");
+
+        // DDL/DML, many rows in several batches, the catalog.
+        let _ = run("drop table kb_thin purge").await;
+        run("create table kb_thin (id number(10) primary key, name varchar2(40), note varchar2(100))").await.unwrap();
+        run("comment on table kb_thin is 'thin test'").await.unwrap();
+        let ins = run("insert into kb_thin select level, 'n' || level, null from dual connect by level <= 25000").await.unwrap();
+        assert_eq!(ins.summary.rows_affected, Some(25000));
+        let all = s.execute("select * from kb_thin order by id", ExecOptions { batch_size: 1000, ..Default::default() }).await.unwrap().collect().await.unwrap();
+        assert_eq!((all.num_rows(), all.batches.len()), (25000, 25));
+        let me = s.list_schemas().await.unwrap().into_iter().find(|x| x.is_default).unwrap().name;
+        let m = s.bulk_metadata(std::slice::from_ref(&me)).await.unwrap();
+        let o = m[0].objects.iter().find(|o| o.name == "KB_THIN").unwrap();
+        assert_eq!(o.comment.as_deref(), Some("thin test"));
+        let t = m[0].columns.iter().find(|t| t.table == "KB_THIN").unwrap();
+        assert!(t.columns[0].is_primary_key && t.columns[1].data_type == "VARCHAR2(40)");
+        let d = s.describe(&me, "KB_THIN").await.unwrap();
+        assert!(d.ddl.unwrap_or_default().contains("CREATE TABLE"));
+        let f0 = s.schema_fingerprints().await.unwrap().unwrap()[&me].clone();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        run("alter table kb_thin add (extra number)").await.unwrap();
+        assert_ne!(f0, s.schema_fingerprints().await.unwrap().unwrap()[&me]);
+
+        // Cancel a long query; the session stays usable.
+        let cancel = databrain_connector_core::CancellationToken::new();
+        let st = s
+            .execute("select count(*) from all_objects a, all_objects b, all_objects c", ExecOptions { cancel: cancel.clone(), ..Default::default() })
+            .await
+            .unwrap();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            c2.cancel();
+        });
+        let t0 = std::time::Instant::now();
+        let e = st.collect().await.unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Cancelled, "{e:?}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(run("select 7 from dual").await.unwrap().num_rows(), 1);
+
+        // Row cap: stops early.
+        let capped = s.execute("select * from kb_thin", ExecOptions { max_rows: Some(10), ..Default::default() }).await.unwrap().collect().await.unwrap();
+        assert_eq!(capped.num_rows(), 10);
+        run("drop table kb_thin purge").await.unwrap();
+
+        // Read-only connections: reads work, writes are refused by the server.
+        let ro = live_with(driver, true).await.unwrap();
+        assert_eq!(ro.execute("select 1 from dual", ExecOptions::default()).await.unwrap().collect().await.unwrap().num_rows(), 1);
+        let e = ro.execute("create table kb_ro (x int)", ExecOptions::default()).await.unwrap().collect().await;
+        let e2 = ro.execute("insert into kb_ro values (1)", ExecOptions::default()).await.unwrap().collect().await;
+        // (The engine refuses writes on read-only connections before they reach
+        // the driver; this checks the server-side guard of the thin driver.)
+        if driver == "thin" {
+            assert!(e.is_err() || e2.is_err(), "write refused on a read-only connection");
         }
-        let creds = Arc::new(InlineCredentialSource::new(
-            AuthMethod::Password { user },
-            std::env::var("DATABRAIN_ORACLE_PASSWORD").ok().map(secrecy::SecretString::from),
-        ));
-        let s = OracleConnector.connect(&cfg, creds).await.unwrap();
+        let _ = s.execute("drop table kb_ro purge", ExecOptions::default()).await.unwrap().collect().await;
+    }
+
+    /// Live: DATABRAIN_ORACLE_HOST, _USER, _PASSWORD, _SERVICE (e.g. gvenzl/oracle-free).
+    #[tokio::test]
+    async fn live_roundtrip() {
+        // DATABRAIN_ORACLE_DRIVER=instant_client tests the thick driver (+ DATABRAIN_ORACLE_LIB_DIR).
+        if let Ok(d) = std::env::var("DATABRAIN_ORACLE_LIB_DIR") {
+            init_client(Some(&d));
+        }
+        let Some(s) = live(&std::env::var("DATABRAIN_ORACLE_DRIVER").unwrap_or_else(|_| "thin".into())).await else {
+            eprintln!("skipping: DATABRAIN_ORACLE_HOST not set");
+            return;
+        };
         let r = s
             .execute("select 1 as a, 'x' as b, sysdate as c, 1.5 as d from dual;", ExecOptions::default())
             .await

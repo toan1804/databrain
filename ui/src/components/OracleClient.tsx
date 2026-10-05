@@ -177,9 +177,11 @@ export function OracleClientDialog() {
 /** At startup: if Oracle connections exist, check once and prompt when missing. */
 export async function checkOracleClientAtStartup() {
   const st = useStore.getState();
-  if (!isTauri() || !st.connections.some((c) => c.config.kind === "oracle")) return;
+  // Only connections using the Instant Client driver need it (thin is the default).
+  const thick = st.connections.filter((c) => c.config.kind === "oracle" && c.config.options?.driver === "instant_client");
+  if (!isTauri() || thick.length === 0) return;
   try {
-    const dir = st.connections.map((c) => (c.config.kind === "oracle" ? c.config.options?.client_lib_dir : undefined)).find(Boolean) ?? null;
+    const dir = thick.map((c) => c.config.options?.client_lib_dir).find(Boolean) ?? null;
     const r = await api.oracleClientStatus(dir);
     if (!r.installed) useStore.setState({ oracleClientPrompt: true });
   } catch {
