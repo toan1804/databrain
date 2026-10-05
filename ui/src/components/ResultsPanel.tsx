@@ -43,6 +43,7 @@ import {
   upsertFilter,
 } from "../lib/util";
 import { useStore, type StatementRun, type TabRun } from "../store";
+import { optimizePrompt } from "../queryTips";
 import { ResultGrid, type GridHandle } from "./ResultGrid";
 import { Modal, Popover } from "./ui";
 
@@ -149,6 +150,31 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
 }
 
 /** Suggestions for the statement shown, from its tables' indexes / partitions / cluster keys. */
+/**
+ * Select the statement in the editor (the AI's rewrite replaces exactly it)
+ * and send it with its tips and table layouts, nothing else.
+ */
+function askToOptimize(run: TabRun, tabId: string, index: number) {
+  const st = run.tips?.statements.find((s) => s.index === index);
+  const message = run.tips && optimizePrompt(run.tips, index, run.statements[index]?.durationMs);
+  if (!st || !message) return;
+  const v = editorBridge.get(tabId);
+  const end = st.start + st.sql.length;
+  if (!v || end > v.state.doc.length || v.state.doc.sliceString(st.start, end) !== st.sql) {
+    useStore.getState().toast("The statement was edited since it ran; run it again to get tips for the new version", "info");
+    return;
+  }
+  v.dispatch({ selection: { anchor: st.start, head: end }, effects: EditorView.scrollIntoView(st.start, { y: "center" }) });
+  void useAi.getState().send({
+    message,
+    mode: "optimize",
+    targetKey: tabId,
+    connectionId: run.connectionId,
+    // Only the statement: not the rest of the editor, the last error or the result.
+    context: { editor_sql: null, selection: st.sql, last_error: null, result_id: null },
+  });
+}
+
 function TipsBar({ run, tabId }: { run: TabRun; tabId: string }) {
   const [hidden, setHidden] = useState<string | null>(null);
   const [open, setOpen] = useState(true);
@@ -175,7 +201,16 @@ function TipsBar({ run, tabId }: { run: TabRun; tabId: string }) {
           {stmt?.status !== "running" && stmt?.durationMs !== undefined && <span className="font-normal text-muted">· ran in {formatDuration(stmt.durationMs)}</span>}
           {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
         </button>
-        <button className="icon-btn ml-auto h-5 w-5" aria-label="Hide tips" title="Hide tips for this run" onClick={() => setHidden(run.jobId)}>
+        {stmt && run.tips && (
+          <button
+            className="btn-ghost ml-auto py-0.5 text-[11.5px]"
+            title="Ask the AI to rewrite this statement, using only the statement, its tips and its tables' layouts"
+            onClick={() => askToOptimize(run, tabId, stmt.plan.index)}
+          >
+            <Sparkles size={12} /> Improve with AI
+          </button>
+        )}
+        <button className={`icon-btn h-5 w-5 ${stmt && run.tips ? "" : "ml-auto"}`} aria-label="Hide tips" title="Hide tips for this run" onClick={() => setHidden(run.jobId)}>
           <X size={12} />
         </button>
       </div>

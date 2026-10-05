@@ -45,6 +45,8 @@ pub enum Mode {
     FixError,
     Explain,
     AnalyzeResult,
+    /// Make the selected (slow) statement cheaper, using the query tips sent with it.
+    Optimize,
 }
 
 /// Editor/result context sent with each request.
@@ -148,6 +150,11 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
         Mode::Edit => "\nTask: rewrite the SELECTED SQL according to the instruction and apply it with write_editor mode replace_selection. Preserve behavior unless asked otherwise.\n",
         Mode::FixError => "\nTask: the last query failed. Diagnose the error using the schema, then propose the corrected SQL with write_editor (replace_selection if a selection exists, else replace_all). Explain the cause in one or two sentences.\n",
         Mode::Explain => "\nTask: explain what the SQL does in plain language: purpose, joins, filters, grouping, and any performance or correctness concerns. Do not run it.\n",
+        Mode::Optimize => "\nTask: make the SELECTED SQL statement faster. Its query tips (found from the tables' indexes, partitions and cluster keys) and table layouts come with it. \
+            Check them with describe_table / table metadata as needed; do not run the slow statement itself. Rewrite it so it returns exactly the same rows \
+            (e.g. sargable filters instead of functions on indexed or partition columns, a partition filter, pushing filters into joins), apply the rewrite \
+            with write_editor mode replace_selection, and explain each change in one line. If the rewrite would change the results, or the fix is an index / \
+            partitioning change, say so and give that DDL as a suggestion in a ```sql block instead of applying it.\n",
         Mode::AnalyzeResult => "\nTask: analyze the current result. Start with result_summary, compute what you need with query_result (SQLite syntax over table `result`), then give: key findings, notable patterns or anomalies, and 2-3 suggested follow-up queries.\n",
     });
     if !retrieved.text.is_empty() {
@@ -180,7 +187,7 @@ fn user_turn(req: &AgentRequest) -> String {
             t.push_str(&format!("\n\n[{label}]\n```sql\n{}\n```", v.chars().take(20_000).collect::<String>()));
         }
     };
-    if matches!(req.mode, Mode::Edit | Mode::FixError | Mode::Explain | Mode::Generate) || c.selection.is_some() {
+    if matches!(req.mode, Mode::Edit | Mode::FixError | Mode::Explain | Mode::Generate | Mode::Optimize) || c.selection.is_some() {
         add(&mut t, "Selected SQL", &c.selection);
     }
     if c.selection.is_none() || matches!(req.mode, Mode::FixError) {
@@ -413,5 +420,21 @@ mod tests {
         };
         let t = user_turn(&r);
         assert!(t.contains("[Editor SQL]") && t.contains("selec 1") && t.contains("[Last error]"));
+    }
+
+    #[test]
+    fn optimize_sends_only_the_statement() {
+        let r = AgentRequest {
+            session_id: None,
+            connection_id: "c".into(),
+            provider_id: None,
+            model: None,
+            message: "Make this faster.\n\n[Query tips]\n- no partition filter".into(),
+            mode: serde_json::from_str("\"optimize\"").unwrap(),
+            context: UiContext { editor_sql: None, selection: Some("select * from events".into()), last_error: None, result_id: None, mentions: vec![] },
+        };
+        let t = user_turn(&r);
+        assert!(t.contains("[Selected SQL]") && t.contains("select * from events") && t.contains("[Query tips]"));
+        assert!(!t.contains("[Editor SQL]"));
     }
 }

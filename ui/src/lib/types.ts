@@ -573,7 +573,7 @@ export interface ModelInfo {
   name?: string | null;
 }
 
-export type AiMode = "chat" | "generate" | "edit" | "fix_error" | "explain" | "analyze_result";
+export type AiMode = "chat" | "generate" | "edit" | "fix_error" | "explain" | "analyze_result" | "optimize";
 
 export interface UiContext {
   editor_sql?: string | null;

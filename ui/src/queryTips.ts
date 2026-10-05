@@ -124,3 +124,37 @@ export async function computeRunTips(
   });
   return out;
 }
+
+/**
+ * Message asking the AI to make one statement faster. Its context is only
+ * that statement (sent as the selection) plus its tips and the layouts of
+ * the tables it uses; not the rest of the editor or the result.
+ */
+export function optimizePrompt(tips: RunTips, statementIndex: number, durationMs?: number): string | null {
+  const st = tips.statements.find((s) => s.index === statementIndex);
+  if (!st) return null;
+  const end = st.start + st.sql.length;
+  const mine = tips.tips.filter((t) => t.statementIndex === statementIndex);
+  const lines = [`Make this query faster${durationMs ? ` (it ran for ${Math.round(durationMs / 1000)} s)` : ""}. Keep the same results.`];
+  if (mine.length) {
+    lines.push("", "[Query tips]");
+    for (const t of mine) lines.push(`- ${t.message} (at: ${st.sql.slice(t.from - st.start, t.to - st.start).replace(/\s+/g, " ").slice(0, 120)})`);
+  }
+  const seen = new Set<string>();
+  const tables = tips.tables.filter((t) => t.from >= st.start && t.to <= end && !seen.has(t.title.toLowerCase()) && seen.add(t.title.toLowerCase()));
+  if (tables.length) {
+    lines.push("", "[Table layouts]");
+    for (const t of tables) {
+      const l = t.layout;
+      const parts: string[] = [];
+      if (l.row_estimate !== undefined) parts.push(`~${l.row_estimate} rows`);
+      if (l.partition_by.length) parts.push(`partitioned by ${l.partition_kind ? `${l.partition_kind} ` : ""}(${l.partition_by.join(", ")})${l.requires_partition_filter ? ", partition filter required" : ""}`);
+      if (l.cluster_by.length) parts.push(`clustered by (${l.cluster_by.join(", ")})`);
+      for (const i of l.indexes.slice(0, 12)) parts.push(`${i.primary ? "primary key" : i.unique ? "unique index" : "index"} ${i.name} (${i.columns.join(", ")})`);
+      if (l.indexes.length > 12) parts.push(`${l.indexes.length - 12} more indexes`);
+      parts.push(...l.notes);
+      lines.push(`- ${t.title}: ${parts.join("; ") || "no indexes, partitions or cluster keys"}`);
+    }
+  }
+  return lines.join("\n");
+}
