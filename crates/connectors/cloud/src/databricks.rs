@@ -1013,6 +1013,25 @@ impl Session for DbxSession {
         Ok(out)
     }
 
+    /// Unity Catalog: per schema, relation count, latest `last_altered`
+    /// (definition changes only, not data writes) and a hash of names,
+    /// types and comments, in one query. Hive metastore: not supported.
+    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let rows = match self
+            .0
+            .run_small(
+                "SELECT table_catalog, table_schema, concat(count(*), '/', cast(max(last_altered) AS STRING), '/', \
+                        cast(sum(hash(table_name, table_type, comment)) AS STRING)) \
+                 FROM system.information_schema.tables WHERE table_schema <> 'information_schema' GROUP BY 1, 2",
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(rows.iter().filter_map(|r| Some((format!("{}.{}", cell(r, 0)?, cell(r, 1)?), cell(r, 2).unwrap_or_default()))).collect()))
+    }
+
     async fn schema_object_counts(&self) -> Result<Option<std::collections::HashMap<String, usize>>> {
         let rows = match self
             .0

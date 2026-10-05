@@ -767,9 +767,109 @@ impl Session for SfSession {
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
         self.columns(schema, None).await
     }
+
+    /// HASH_AGG of table and column definitions per schema, one query per
+    /// database (LAST_ALTERED is not used: data loads change it too).
+    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let mut out = std::collections::HashMap::new();
+        for db in self.databases().await? {
+            let d = quote_ident(ConnectorKind::Snowflake, &db);
+            let sql = format!(
+                "select table_schema, 't' || count(*) || ':' || hash_agg(table_name, table_type, comment) from {d}.information_schema.tables group by 1 \
+                 union all \
+                 select table_schema, 'c' || count(*) || ':' || hash_agg(table_name, column_name, ordinal_position, data_type, character_maximum_length, numeric_precision, numeric_scale, is_nullable, comment) \
+                 from {d}.information_schema.columns group by 1"
+            );
+            let Ok(rows) = self.0.run_small(&sql).await else { continue };
+            let mut parts: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+            for r in rows {
+                if let (Some(s), Some(f)) = (r.first().cloned().flatten(), r.get(1).cloned().flatten()) {
+                    parts.entry(format!("{db}.{s}")).or_default().push(f);
+                }
+            }
+            for (k, mut v) in parts {
+                v.sort();
+                out.insert(k, v.join("/"));
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Two information_schema queries per database for the whole batch
+    /// (instead of five per schema: tables, functions, procedures,
+    /// sequences, columns).
+    async fn bulk_metadata(&self, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
+        match self.bulk_metadata_batched(schemas).await {
+            Ok(m) => Ok(m),
+            Err(_) => databrain_connector_core::default_bulk_metadata(self, schemas).await,
+        }
+    }
 }
 
 impl SfSession {
+    /// Databases in scope (as in `list_schemas`): the session's, else all.
+    async fn databases(&self) -> Result<Vec<String>> {
+        let cur = self.0.run_small("select current_database()").await?;
+        if let Some(db) = cur.first().and_then(|r| r.first().cloned().flatten()) {
+            return Ok(vec![db]);
+        }
+        Ok(self.0.run_small("show terse databases").await?.into_iter().filter_map(|r| r.get(1).cloned().flatten()).collect())
+    }
+
+    async fn bulk_metadata_batched(&self, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
+        let mut by_db: Vec<(String, Vec<String>)> = Vec::new();
+        for s in schemas {
+            let (db, sch) = s.split_once('.').ok_or_else(|| ConnectorError::query("expected database.schema"))?;
+            match by_db.iter_mut().find(|(d, _)| d == db) {
+                Some((_, v)) => v.push(sch.to_string()),
+                None => by_db.push((db.to_string(), vec![sch.to_string()])),
+            }
+        }
+        let (mut objects, mut columns) = (Vec::new(), Vec::new());
+        for (db, list) in by_db {
+            let d = quote_ident(ConnectorKind::Snowflake, &db);
+            let inl = list.iter().map(|s| quote_literal(s)).collect::<Vec<_>>().join(", ");
+            for r in self
+                .0
+                .run_small(&format!("select table_schema, table_name, table_type, comment, row_count from {d}.information_schema.tables where table_schema in ({inl}) order by 1, 2"))
+                .await?
+            {
+                let g = |i: usize| r.get(i).cloned().flatten();
+                let t = g(2).unwrap_or_default();
+                let (Some(sch), Some(name)) = (g(0), g(1)) else { continue };
+                objects.push(DbObject {
+                    schema: format!("{db}.{sch}"),
+                    name,
+                    kind: if t.contains("VIEW") { if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else if t.contains("EXTERNAL") { ObjectKind::ForeignTable } else { ObjectKind::Table },
+                    comment: g(3),
+                    row_estimate: g(4).and_then(|n| n.parse().ok()),
+                });
+            }
+            for r in self
+                .0
+                .run_small(&format!(
+                    "select table_schema, table_name, column_name, data_type, character_maximum_length, numeric_precision, numeric_scale, is_nullable, column_default, comment \
+                     from {d}.information_schema.columns where table_schema in ({inl}) order by 1, 2, ordinal_position"
+                ))
+                .await?
+            {
+                let g = |i: usize| r.get(i).cloned().flatten();
+                let base = g(3).unwrap_or_default();
+                let data_type = match base.as_str() {
+                    "TEXT" => g(4).map(|l| format!("VARCHAR({l})")).unwrap_or("VARCHAR".into()),
+                    "NUMBER" => format!("NUMBER({},{})", g(5).unwrap_or("38".into()), g(6).unwrap_or("0".into())),
+                    _ => base,
+                };
+                columns.push((
+                    format!("{db}.{}", g(0).unwrap_or_default()),
+                    g(1).unwrap_or_default(),
+                    ColumnInfo { name: g(2).unwrap_or_default(), data_type, nullable: g(7).as_deref() != Some("NO"), is_primary_key: false, default: g(8), comment: g(9) },
+                ));
+            }
+        }
+        Ok(databrain_connector_core::assemble_metadata(schemas, objects, columns, vec![]))
+    }
+
     async fn columns(&self, schema: &str, table: Option<&str>) -> Result<Vec<TableColumns>> {
         let (db, sch) = schema.split_once('.').ok_or_else(|| ConnectorError::query("expected database.schema"))?;
         let mut sql = format!(

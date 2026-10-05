@@ -352,6 +352,89 @@ impl MssqlSession {
         .await
     }
 
+    /// A catalog query built at runtime (schema lists as N'' literals).
+    async fn rows_dyn(&self, sql: String) -> Result<Vec<tiberius::Row>> {
+        self.with_conn(move |c| Box::pin(async move { c.simple_query(sql).await.map_err(map_err)?.into_first_result().await.map_err(map_err) })).await
+    }
+
+    async fn bulk_metadata_batched(&self, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
+        if schemas.is_empty() {
+            return Ok(vec![]);
+        }
+        let list = schemas.iter().map(|s| format!("N{}", databrain_connector_core::quote_literal(s))).collect::<Vec<_>>().join(", ");
+        let s = |r: &tiberius::Row, i: usize| r.get::<&str, _>(i).map(str::to_string);
+        let objects = self
+            .rows_dyn(format!(
+                "select schema_name(o.schema_id), o.name, rtrim(o.type), cast(ep.value as nvarchar(4000)), \
+                   (select sum(p.rows) from sys.partitions p where p.object_id = o.object_id and p.index_id in (0,1)) \
+                 from sys.objects o \
+                 left join sys.extended_properties ep on ep.class = 1 and ep.major_id = o.object_id and ep.minor_id = 0 and ep.name = 'MS_Description' \
+                 where schema_name(o.schema_id) in ({list}) and o.type in ('U','V') and o.is_ms_shipped = 0 order by 1, 2"
+            ))
+            .await?
+            .iter()
+            .map(|r| DbObject {
+                schema: s(r, 0).unwrap_or_default(),
+                name: s(r, 1).unwrap_or_default(),
+                kind: if r.get::<&str, _>(2) == Some("V") { ObjectKind::View } else { ObjectKind::Table },
+                comment: s(r, 3),
+                row_estimate: r.get::<i64, _>(4),
+            })
+            .collect();
+        // Same columns as COLUMNS_SQL, primary keys joined once instead of a subquery per column.
+        let columns = self
+            .rows_dyn(format!(
+                "select o.name, c.name, \
+                   t.name + case when t.name in ('varchar','char','varbinary','binary') then '(' + case when c.max_length = -1 then 'max' else cast(c.max_length as varchar(10)) end + ')' \
+                                 when t.name in ('nvarchar','nchar') then '(' + case when c.max_length = -1 then 'max' else cast(c.max_length / 2 as varchar(10)) end + ')' \
+                                 when t.name in ('decimal','numeric') then '(' + cast(c.precision as varchar(10)) + ',' + cast(c.scale as varchar(10)) + ')' else '' end, \
+                   c.is_nullable, cast(case when pk.column_id is not null then 1 else 0 end as bit), \
+                   object_definition(c.default_object_id), cast(ep.value as nvarchar(4000)), schema_name(o.schema_id) \
+                 from sys.columns c join sys.objects o on o.object_id = c.object_id join sys.types t on t.user_type_id = c.user_type_id \
+                 left join (select ic.object_id, ic.column_id from sys.index_columns ic join sys.indexes i on i.object_id = ic.object_id and i.index_id = ic.index_id where i.is_primary_key = 1) pk \
+                   on pk.object_id = c.object_id and pk.column_id = c.column_id \
+                 left join sys.extended_properties ep on ep.class = 1 and ep.major_id = c.object_id and ep.minor_id = c.column_id and ep.name = 'MS_Description' \
+                 where schema_name(o.schema_id) in ({list}) and o.type in ('U','V') \
+                 order by schema_name(o.schema_id), o.name, c.column_id"
+            ))
+            .await?
+            .iter()
+            .map(|r| {
+                let (table, col) = column_from(r);
+                (s(r, 7).unwrap_or_default(), table, col)
+            })
+            .collect();
+        let fk_rows = self
+            .rows_dyn(format!(
+                "select schema_name(fk.schema_id), object_name(fk.parent_object_id), fk.name, pc.name, rs.name, rt.name, rc.name \
+                 from sys.foreign_keys fk \
+                 join sys.foreign_key_columns fkc on fkc.constraint_object_id = fk.object_id \
+                 join sys.columns pc on pc.object_id = fkc.parent_object_id and pc.column_id = fkc.parent_column_id \
+                 join sys.tables rt on rt.object_id = fkc.referenced_object_id \
+                 join sys.schemas rs on rs.schema_id = rt.schema_id \
+                 join sys.columns rc on rc.object_id = fkc.referenced_object_id and rc.column_id = fkc.referenced_column_id \
+                 where schema_name(fk.schema_id) in ({list}) \
+                 order by 1, 2, 3, fkc.constraint_column_id"
+            ))
+            .await?;
+        let mut fks: Vec<(String, String, ForeignKey)> = Vec::new();
+        let mut last: Option<(String, String, String)> = None;
+        for r in &fk_rows {
+            let g = |i: usize| s(r, i).unwrap_or_default();
+            let key = (g(0), g(1), g(2));
+            if last.as_ref() == Some(&key) {
+                if let Some((_, _, fk)) = fks.last_mut() {
+                    fk.columns.push(g(3));
+                    fk.ref_columns.push(g(6));
+                }
+            } else {
+                fks.push((key.0.clone(), key.1.clone(), ForeignKey { columns: vec![g(3)], ref_schema: g(4), ref_table: g(5), ref_columns: vec![g(6)] }));
+                last = Some(key);
+            }
+        }
+        Ok(databrain_connector_core::assemble_metadata(schemas, objects, columns, fks))
+    }
+
     async fn foreign_keys(&self, schema: &str, table: Option<&str>) -> Result<Vec<(String, ForeignKey)>> {
         let rows = self
             .rows(
@@ -582,6 +665,32 @@ impl Session for MssqlSession {
         };
         let foreign_keys = self.foreign_keys(schema, Some(name)).await?.into_iter().map(|(_, f)| f).collect();
         Ok(ObjectDetail { object, columns, ddl, foreign_keys })
+    }
+
+    /// Per schema: object count + last modify_date of tables, views and
+    /// foreign keys (ALTER TABLE updates it), plus a checksum of
+    /// MS_Description comments (which do not touch modify_date).
+    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let rows = self
+            .rows(
+                "select s.name, concat( \
+                   (select count(*) from sys.objects o where o.schema_id = s.schema_id and o.type in ('U','V','F') and o.is_ms_shipped = 0), '/', \
+                   (select convert(varchar(30), max(o.modify_date), 126) from sys.objects o where o.schema_id = s.schema_id and o.type in ('U','V','F')), '/', \
+                   (select checksum_agg(checksum(ep.major_id, ep.minor_id, cast(ep.value as nvarchar(4000)))) from sys.extended_properties ep \
+                      join sys.objects o on o.object_id = ep.major_id where ep.class = 1 and ep.name = 'MS_Description' and o.schema_id = s.schema_id)) \
+                 from sys.schemas s",
+                vec![],
+            )
+            .await?;
+        Ok(Some(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect()))
+    }
+
+    /// Three catalog queries for the whole batch of schemas.
+    async fn bulk_metadata(&self, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
+        match self.bulk_metadata_batched(schemas).await {
+            Ok(m) => Ok(m),
+            Err(_) => databrain_connector_core::default_bulk_metadata(self, schemas).await,
+        }
     }
 
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {

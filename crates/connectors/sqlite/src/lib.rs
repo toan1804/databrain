@@ -368,6 +368,21 @@ impl Session for SqliteSession {
         .await
     }
 
+    /// `PRAGMA schema_version` of each attached database: SQLite bumps it
+    /// on every schema change.
+    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let schemas = self.list_schemas().await?;
+        self.with_conn(move |c| {
+            let mut out = std::collections::HashMap::new();
+            for s in schemas {
+                let v: i64 = c.query_row(&format!("PRAGMA {}.schema_version", quote_ident(ConnectorKind::Sqlite, &s.name)), [], |r| r.get(0)).map_err(map_err)?;
+                out.insert(s.name, v.to_string());
+            }
+            Ok(Some(out))
+        })
+        .await
+    }
+
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {
         let schema = schema.to_string();
         self.with_conn(move |c| {
@@ -532,6 +547,18 @@ mod tests {
             .collect()
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn schema_fingerprint_changes_with_ddl_only() {
+        let s = session().await;
+        exec(s.as_ref(), "create table t(id integer primary key)").await;
+        let f = |m: Option<std::collections::HashMap<String, String>>| m.unwrap()["main"].clone();
+        let a = f(s.schema_fingerprints().await.unwrap());
+        exec(s.as_ref(), "insert into t values (1)").await;
+        assert_eq!(a, f(s.schema_fingerprints().await.unwrap()), "data change");
+        exec(s.as_ref(), "alter table t add column name text").await;
+        assert_ne!(a, f(s.schema_fingerprints().await.unwrap()), "schema change");
     }
 
     #[tokio::test]
