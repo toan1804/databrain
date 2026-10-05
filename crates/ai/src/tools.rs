@@ -47,7 +47,7 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
         ),
         s(
             "run_query",
-            "Execute SQL on the connection. Reads are row-capped; the user may need to approve. Returns a summary (columns, row count, column stats) and a result_id for query_result. Raw rows are only returned if the connection allows it.",
+            "Execute SQL on the connection (not for results.<name> outputs: use query_outputs). Reads are row-capped; the user may need to approve. Returns a summary (columns, row count, column stats) and a result_id for query_result. Raw rows are only returned if the connection allows it.",
             json!({"type": "object", "properties": {"sql": {"type": "string"}, "purpose": {"type": "string", "description": "One short sentence shown to the user when asking for approval"}}, "required": ["sql"]}),
         ),
         s(
@@ -293,6 +293,11 @@ impl ToolContext {
 
     async fn run_query(&self, args: &Value) -> Result<ToolOutput> {
         let sql = arg(args, "sql")?.to_string();
+        // results.<output> only exists on the Results (DuckDB) connection:
+        // such SQL runs there, never on the current connection.
+        if self.profile.config.kind != databrain_connector_core::ConnectorKind::Duckdb && !self.engine.outputs().referenced(&sql).is_empty() {
+            return self.query_outputs(args).await;
+        }
         let purpose = args.get("purpose").and_then(|p| p.as_str()).unwrap_or("");
         let review = policy::review_sql(&self.profile, &sql);
         let approved = self.gate("run_query", review.decision.clone(), purpose, &json!({"sql": sql, "purpose": purpose, "kind": review.kind})).await?;

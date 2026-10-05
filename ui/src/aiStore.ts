@@ -15,6 +15,8 @@ import type {
 import { uid } from "./lib/util";
 import { useStore } from "./store";
 import { editorBridge } from "./editorBridge";
+import { referencedOutputs, withDuckdbHeader } from "./lib/dataflow";
+import { resultsConnection } from "./outputs";
 
 export type ChatItem =
   | { id: string; kind: "user"; text: string; mode: AiMode }
@@ -432,15 +434,34 @@ export const useAi = create<AiState>((set, get) => {
       if (!item || item.kind !== "edit" || item.state !== "pending") return;
       let ok = accepted;
       if (accepted) {
+        // SQL over outputs (results.<name>) runs on the Results (DuckDB) connection.
+        const readsOutputs = referencedOutputs(item.proposal.sql).length > 0;
+        const st = useStore.getState();
+        const tab = item.targetKey ? st.tabs.find((t) => t.id === item.targetKey) : undefined;
+        const tabKind = st.connections.find((c) => c.id === tab?.connection_id)?.config.kind;
         if (item.proposal.mode === "new_tab" || !item.targetKey) {
-          useStore.getState().newTab({
-            title: item.proposal.title || "AI query",
-            sql: item.proposal.sql,
-            connection_id: get().connectionId,
-          });
+          if (readsOutputs) {
+            const results = await resultsConnection().catch(() => null);
+            st.newTab({ title: item.proposal.title || "AI query", sql: withDuckdbHeader(item.proposal.sql), connection_id: results ?? get().connectionId });
+          } else {
+            st.newTab({ title: item.proposal.title || "AI query", sql: item.proposal.sql, connection_id: get().connectionId });
+          }
+        } else if (readsOutputs && tab && tabKind !== "duckdb" && item.proposal.mode === "replace_all") {
+          // The whole query tab becomes a query over outputs: switch it to Results.
+          const results = await resultsConnection().catch(() => null);
+          const sql = withDuckdbHeader(item.proposal.sql);
+          if (!editorBridge.apply(item.targetKey, { ...item.proposal, sql })) {
+            st.toast("The target editor was closed", "error");
+            ok = false;
+          } else if (results) {
+            st.updateTab(tab.id, { connection_id: results });
+            st.toast("This query reads outputs, so the tab now runs on Results (DuckDB)", "info");
+          }
         } else if (!editorBridge.apply(item.targetKey, item.proposal)) {
           useStore.getState().toast("The target editor was closed", "error");
           ok = false;
+        } else if (readsOutputs && tab && tabKind !== "duckdb") {
+          st.toast("The inserted SQL reads outputs (results.<name>); run it on the Results (DuckDB) connection", "info");
         }
       }
       patchItem(itemId, { state: ok ? "accepted" : "rejected" } as Partial<ChatItem>);

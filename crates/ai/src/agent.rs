@@ -179,6 +179,12 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
     s
 }
 
+/// How the model must use outputs (stored results), sent with @mentions.
+pub(crate) const OUTPUTS_RULE: &str = "these are stored results, not tables of the current connection. Query them only with \
+query_outputs (DuckDB SQL over results.<name>, can join outputs) or result_summary / query_result; never with run_query on the \
+current connection. SQL you write for them (write_editor) is DuckDB SQL, runs on the Results (DuckDB) connection, and must start \
+with the line: -- Runs locally on DuckDB (Results connection): outputs are results.<name>, DuckDB SQL syntax.";
+
 fn user_turn(req: &AgentRequest) -> String {
     let c = &req.context;
     let mut t = req.message.clone();
@@ -291,7 +297,7 @@ impl Agent {
         }
         if !lines.is_empty() {
             turn_text.push_str(&format!(
-                "\n\n[Mentioned outputs — use result_summary / query_result (one output) or query_outputs (DuckDB over results.<name>, can join outputs)]\n{}",
+                "\n\n[Mentioned outputs — {OUTPUTS_RULE}]\n{}",
                 lines.join("\n")
             ));
         }

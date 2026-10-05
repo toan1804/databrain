@@ -480,6 +480,9 @@ async fn ai_tools_use_output_handles_with_source_policies() {
     assert!(o.content.contains("2 rows") && o.content.contains("Vietnam\t300"), "{}", o.content);
     let o = ctx.call("query_outputs", &json!({"sql": "create table x as select 1"})).await;
     assert!(o.content.starts_with("ERROR"), "{}", o.content);
+    // run_query on the current (SQLite) connection with results.<name> runs on Results (DuckDB) instead.
+    let o = ctx.call("run_query", &json!({"sql": "select country, total from results.by_country order by total desc"})).await;
+    assert!(o.content.contains("Vietnam\t300"), "{}", o.content);
     // MCP: an MCP-enabled connection cannot read outputs of a connection
     // that is not shared with MCP.
     let mut shared = f.ws.get_connection(&f.conn).unwrap();
