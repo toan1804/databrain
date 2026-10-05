@@ -39,3 +39,30 @@ describe("queryTips", () => {
     expect(ddl.tips).toEqual([]);
   });
 });
+
+describe("slow statements", () => {
+  it("picks statements running or done after the threshold", async () => {
+    const { slowStatements } = await import("./queryTips");
+    const now = 1_000_000;
+    const st = [
+      { id: "fast", status: "done", durationMs: 2_000 },
+      { id: "slow", status: "done", durationMs: 61_000 },
+      { id: "long-running", status: "running", startedAt: now - 60_000 },
+      { id: "just-started", status: "running", startedAt: now - 5_000 },
+      { id: "failed", status: "error", durationMs: 90_000 },
+    ];
+    expect(slowStatements(st, 60_000, now).map((s) => s.id)).toEqual(["slow", "long-running"]);
+    expect(slowStatements(st, 1_000, now).map((s) => s.id)).toEqual(["fast", "slow", "long-running", "just-started"]);
+    expect(slowStatements(st, 0, now)).toEqual([]);
+  });
+
+  it("computes tips for a statement that is still running", async () => {
+    const { computeRunTips, clearTipCache } = await import("./queryTips");
+    clearTipCache();
+    const sql = "select * from public.events where date(created_at) = current_date";
+    const plan = { index: 0, sql, start: 0, end: sql.length, classification: { kind: "read" as const, missing_where: false, keyword: "SELECT" } };
+    const layout = { indexes: [], partition_by: ["created_at"], cluster_by: [], requires_partition_filter: false, notes: [] };
+    const r = await computeRunTips("c", "postgres", [{ plan, status: "running" }], async () => [{ written: "public.events", layout }]);
+    expect(r.tips.length).toBeGreaterThan(0);
+  });
+});

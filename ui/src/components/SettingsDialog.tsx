@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { AlertCircle, Bot, Check, Copy, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, ShieldCheck, Terminal, Trash2 } from "lucide-react";
+import { AlertCircle, Bot, Check, Copy, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, ShieldCheck, Terminal, Trash2, Timer } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { AuditEntry, CredentialStoreKind, CredentialStoreView, KiroStatus, ProviderAuth, ProviderKind, ProviderView } from "../lib/types";
 import { relativeTime } from "../lib/util";
@@ -60,7 +60,7 @@ const AUTH_LABEL: Record<ProviderAuth, string> = {
 export function SettingsDialog() {
   const open = useStore((s) => s.settingsOpen);
   const setOpen = useStore((s) => s.setSettingsOpen);
-  const [section, setSection] = useState<"providers" | "security" | "mcp" | "audit">("providers");
+  const [section, setSection] = useState<"providers" | "queries" | "security" | "mcp" | "audit">("providers");
   if (!open) return null;
   const item = (id: typeof section, icon: React.ReactNode, label: string) => (
     <button
@@ -77,18 +77,56 @@ export function SettingsDialog() {
       <div className="flex min-h-[460px] gap-4">
         <div className="w-40 shrink-0 space-y-0.5">
           {item("providers", <Bot size={14} />, "AI providers")}
+          {item("queries", <Timer size={14} />, "Queries")}
           {item("security", <ShieldCheck size={14} />, "Passwords")}
           {item("mcp", <Plug size={14} />, "MCP / Kiro")}
           {item("audit", <ScrollText size={14} />, "AI audit log")}
         </div>
         <div className="min-w-0 flex-1">
           {section === "providers" && <Providers />}
+          {section === "queries" && <Queries />}
           {section === "security" && <CredentialStore />}
           {section === "mcp" && <Mcp />}
           {section === "audit" && <Audit />}
         </div>
       </div>
     </Modal>
+  );
+}
+
+function Queries() {
+  const seconds = useStore((s) => s.slowQuerySeconds);
+  const setSeconds = useStore((s) => s.setSlowQuerySeconds);
+  const [text, setText] = useState(String(seconds));
+  const n = Number(text);
+  const valid = text.trim() !== "" && Number.isInteger(n) && n >= 0 && n <= 86_400;
+  return (
+    <div className="max-w-md space-y-2 text-[12.5px]">
+      <h3 className="text-[13px] font-medium">Slow queries</h3>
+      <label htmlFor="slow-query-seconds" className="block text-[12px] text-muted">
+        Show tips for queries running longer than (seconds)
+      </label>
+      <div className="flex items-center gap-2">
+        <input
+          id="slow-query-seconds"
+          className={`field w-28 ${valid ? "" : "border-danger"}`}
+          inputMode="numeric"
+          value={text}
+          aria-invalid={!valid}
+          onChange={(e) => {
+            setText(e.target.value);
+            const v = Number(e.target.value);
+            if (e.target.value.trim() !== "" && Number.isInteger(v) && v >= 0 && v <= 86_400) setSeconds(v);
+          }}
+        />
+        <span className="text-muted">{n === 0 && valid ? "tips off" : valid ? `= ${n >= 60 ? `${+(n / 60).toFixed(1)} min` : `${n} s`}` : "0–86400"}</span>
+      </div>
+      <p className="text-[11.5px] text-muted">
+        When a query is still running after this long, DataBrain reads the indexes, partitions and cluster keys of its tables on a separate
+        connection session (the query keeps running) and lists ways to make it cheaper above the result. Faster queries get no tips. 0 turns
+        tips off.
+      </p>
+    </div>
   );
 }
 

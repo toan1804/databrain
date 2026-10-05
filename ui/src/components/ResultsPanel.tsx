@@ -152,7 +152,9 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
 function TipsBar({ run, tabId }: { run: TabRun; tabId: string }) {
   const [hidden, setHidden] = useState<string | null>(null);
   const [open, setOpen] = useState(true);
-  const idx = run.activeIndex;
+  // The active statement's tips, or (while a script runs) the running one's.
+  const running = run.statements.find((s) => s.status === "running");
+  const idx = run.activeIndex ?? running?.plan.index ?? null;
   const tips = (run.tips?.tips ?? []).filter((t) => idx === null || t.statementIndex === idx);
   if (!tips.length || hidden === run.jobId) return null;
   const stmt = idx !== null ? run.statements[idx] : undefined;
@@ -168,8 +170,9 @@ function TipsBar({ run, tabId }: { run: TabRun; tabId: string }) {
       <div className="flex items-center gap-1.5 px-2 py-1">
         <button className="flex items-center gap-1.5 font-medium" onClick={() => setOpen(!open)} aria-expanded={open}>
           <Lightbulb size={13} className={warn ? "text-warning" : "text-accent"} />
-          {tips.length} tip{tips.length === 1 ? "" : "s"} to speed up this query
-          {stmt?.durationMs !== undefined && <span className="font-normal text-muted">· ran in {formatDuration(stmt.durationMs)}</span>}
+          {tips.length} tip{tips.length === 1 ? "" : "s"} to speed up this {stmt?.status === "running" ? "slow query" : "query"}
+          {stmt?.status === "running" && stmt.startedAt !== undefined && <span className="font-normal text-muted">· still running (over {formatDuration(Date.now() - stmt.startedAt)})</span>}
+          {stmt?.status !== "running" && stmt?.durationMs !== undefined && <span className="font-normal text-muted">· ran in {formatDuration(stmt.durationMs)}</span>}
           {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
         </button>
         <button className="icon-btn ml-auto h-5 w-5" aria-label="Hide tips" title="Hide tips for this run" onClick={() => setHidden(run.jobId)}>

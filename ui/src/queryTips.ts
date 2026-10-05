@@ -1,6 +1,9 @@
-// Query tips: after a statement runs, look at the tables it used (indexes,
-// partitions, cluster keys) and suggest how to make it cheaper. Computed once
-// per run, shown under the result and as underlines on the ran statement.
+// Query tips for slow statements: once a statement has run longer than the
+// slow-query threshold (Settings → Queries, default 1 minute), look at the
+// tables it uses (indexes, partitions, cluster keys) and suggest how to make
+// it cheaper. Computed while it is still running, on the connection's
+// metadata session (not the busy one), and refreshed when the run ends.
+// Shown above the result and as underlines on the statement.
 import { api } from "./lib/api";
 import { analyzeStatement, refsWithPos, type HintLevel, type LayoutRef } from "./lib/queryHints";
 import type { ConnectorKind, PlannedStatement, TableLayout } from "./lib/types";
@@ -61,9 +64,24 @@ export function clearTipCache() {
 }
 
 /** Statements worth tips: reads (and changes that filter rows) that finished. */
+/** Default slow-query threshold (Settings → Queries). */
+export const DEFAULT_SLOW_QUERY_SECONDS = 60;
+
 function analysable(s: { plan: PlannedStatement; status: string }): boolean {
   const k = s.plan.classification.kind;
-  return s.status === "done" && (k === "read" || k === "dml");
+  return (s.status === "done" || s.status === "running") && (k === "read" || k === "dml");
+}
+
+/**
+ * Statements that count as slow at `now`: finished after running at least
+ * `thresholdMs`, or still running for that long. A threshold of 0 or less
+ * turns tips off.
+ */
+export function slowStatements<T extends { status: string; durationMs?: number; startedAt?: number }>(statements: T[], thresholdMs: number, now: number): T[] {
+  if (!(thresholdMs > 0)) return [];
+  return statements.filter((s) =>
+    s.status === "running" ? s.startedAt !== undefined && now - s.startedAt >= thresholdMs : s.status === "done" && (s.durationMs ?? 0) >= thresholdMs,
+  );
 }
 
 /**

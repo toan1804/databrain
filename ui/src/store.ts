@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { revealKeys, splitSchema, treeKey } from "./lib/catalog";
 import { api, isTauri, onAuthEvent, onJobEvent, onOracleAgent, toError } from "./lib/api";
-import { computeRunTips, type RunTips } from "./queryTips";
+import { DEFAULT_SLOW_QUERY_SECONDS, computeRunTips, slowStatements, type RunTips } from "./queryTips";
 import type {
   AuthEvent,
   Folder,
@@ -37,6 +37,8 @@ export interface StatementRun {
   output?: OutputInfo;
   rowsAffected?: number | null;
   durationMs?: number;
+  /** When the statement started running (ms since epoch). */
+  startedAt?: number;
   progressRows?: number;
   notices: string[];
   error?: EngineError;
@@ -115,6 +117,9 @@ interface State {
   columns: Record<string, ColumnInfo[]>; // key `${conn}|${schema}|${name}`
   theme: Theme;
   rowLimit: number;
+  /** Tips are computed for statements running at least this long (0 = off). */
+  slowQuerySeconds: number;
+  setSlowQuerySeconds: (s: number) => void;
   sidebarPanel: SidebarPanel;
   /** Explorer expansion state (keys from `treeKey`). */
   treeOpen: Record<string, boolean>;
@@ -185,7 +190,7 @@ interface State {
   handleJobEvent: (e: JobEvent) => void;
 
   refreshSavedQueries: () => Promise<void>;
-  /** Index / partition / cluster-key tips for a finished run. */
+  /** Index / partition / cluster-key tips for the run's slow statements. */
   computeTips: (runKey: string, jobId: string) => Promise<void>;
   openSavedQuery: (q: SavedQuery) => void;
   saveTabQuery: (tabId: string) => Promise<void>;
@@ -376,6 +381,7 @@ export const useStore = create<State>((set, get) => ({
   columns: {},
   theme: "dark",
   rowLimit: 1000,
+  slowQuerySeconds: DEFAULT_SLOW_QUERY_SECONDS,
   sidebarPanel: "connections",
   treeOpen: {},
   schemaFilter: {},
@@ -414,6 +420,7 @@ export const useStore = create<State>((set, get) => ({
       ]);
       const theme = settings.theme === "light" ? "light" : "dark";
       const rowLimit = typeof settings.row_limit === "number" ? settings.row_limit : 1000;
+      const slowQuerySeconds = typeof settings.slow_query_seconds === "number" ? settings.slow_query_seconds : DEFAULT_SLOW_QUERY_SECONDS;
       let restored: Tab[] = tabs;
       if (restored.length === 0) {
         restored = [
@@ -438,6 +445,7 @@ export const useStore = create<State>((set, get) => ({
         activeTabId: active,
         theme,
         rowLimit,
+        slowQuerySeconds,
         savedQueries,
         schemaFilter: parseSchemaFilter(settings.explorer_schemas),
       });
@@ -485,6 +493,11 @@ export const useStore = create<State>((set, get) => ({
   setRowLimit: (rowLimit) => {
     set({ rowLimit });
     if (isTauri()) api.setSetting("row_limit", rowLimit).catch(() => {});
+  },
+  setSlowQuerySeconds: (n) => {
+    const slowQuerySeconds = Number.isFinite(n) ? Math.max(0, Math.round(n)) : DEFAULT_SLOW_QUERY_SECONDS;
+    set({ slowQuerySeconds });
+    if (isTauri()) api.setSetting("slow_query_seconds", slowQuerySeconds).catch(() => {});
   },
   setSidebarPanel: (sidebarPanel) => set({ sidebarPanel }),
   setTreeOpen: (key, open) => set((s) => ({ treeOpen: { ...s.treeOpen, [key]: open } })),
@@ -874,9 +887,20 @@ export const useStore = create<State>((set, get) => ({
       };
       let next: TabRun = { ...run, statements };
       switch (e.type) {
-        case "statement_started":
-          upd(e.index, { status: "running" });
+        case "statement_started": {
+          upd(e.index, { status: "running", startedAt: Date.now() });
+          // Still running after the slow-query threshold: look for why now,
+          // on another session, instead of waiting for it to end.
+          const ms = get().slowQuerySeconds * 1000;
+          if (ms > 0) {
+            const { tab_id, job_id, index } = e;
+            setTimeout(() => {
+              const r = get().runs[tab_id];
+              if (r?.jobId === job_id && r.statements[index]?.status === "running") void get().computeTips(tab_id, job_id);
+            }, ms + 50);
+          }
           break;
+        }
         case "progress":
           upd(e.index, { progressRows: e.rows });
           break;
@@ -935,8 +959,10 @@ export const useStore = create<State>((set, get) => ({
     const connId = run.connectionId;
     if (!connId) return;
     const conn = get().connections.find((c) => c.id === connId);
+    const slow = slowStatements(run.statements, get().slowQuerySeconds * 1000, Date.now());
+    if (!slow.length) return; // fast queries get no tips
     try {
-      const tips = await computeRunTips(connId, conn?.config.kind, run.statements);
+      const tips = await computeRunTips(connId, conn?.config.kind, slow);
       set((s) => {
         const cur = s.runs[runKey];
         if (!cur || cur.jobId !== jobId) return {};
