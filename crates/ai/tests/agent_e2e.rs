@@ -673,6 +673,12 @@ async fn note_targets_must_be_real_tables() {
     let e = check_note_target(&f.engine, &f.conn, "orders & nope_table").await.unwrap_err();
     assert!(e.contains("nope_table") && !e.contains("orders,"), "{e}");
     assert!(check_note_target(&f.engine, &f.conn, "orders.no_such_column").await.is_err());
+    // Tables seen in the explorer / completion count without asking the
+    // database (`cached_only` only exists in that cache, so the database can't have answered).
+    use databrain_connector_core::{ColumnInfo, DbObject, ObjectKind};
+    f.ws.meta_add_objects(&f.conn, &[DbObject { schema: "main".into(), name: "cached_only".into(), kind: ObjectKind::Table, comment: None, row_estimate: None }]).unwrap();
+    f.ws.meta_put_columns(&f.conn, "main", "cached_only", &[ColumnInfo { name: "Code".into(), data_type: "text".into(), nullable: true, is_primary_key: false, default: None, comment: None }]).unwrap();
+    assert_eq!(check_note_target(&f.engine, &f.conn, "CACHED_ONLY & main.cached_only.code").await.unwrap(), "main.cached_only & main.cached_only.Code");
     let ctx = databrain_ai::ToolContext {
         engine: f.engine.clone(),
         hub: f.hub.clone(),

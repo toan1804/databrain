@@ -3,6 +3,7 @@ import { Check, Columns3, Loader2, Table2, TriangleAlert } from "lucide-react";
 import { api } from "../lib/api";
 import { applySuggestion, currentSegment, findTable, suggest, type Suggestion, type TargetTable } from "../lib/noteTarget";
 import type { DbObject } from "../lib/types";
+import { useAi } from "../aiStore";
 import { useStore } from "../store";
 import { canFetchMetadata } from "./sqlAssist";
 
@@ -36,6 +37,8 @@ export function NoteTargetInput({
   const columnsCache = useStore((s) => s.columns);
   const conn = useStore((s) => s.connections.find((c) => c.id === connId));
   const live = !!conn && canFetchMetadata(conn);
+  // Re-check when an indexing run finishes (the index may now know the tables).
+  const indexVersion = useAi((s) => s.knowledgeVersion);
 
   const seg = currentSegment(value, cursor);
   const tables = useMemo<TargetTable[]>(() => {
@@ -115,7 +118,7 @@ export function NoteTargetInput({
       stale = true;
       clearTimeout(t);
     };
-  }, [connId, value]);
+  }, [connId, value, indexVersion]);
   useEffect(() => onState(state), [state]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const accept = (s: Suggestion) => {

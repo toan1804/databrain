@@ -422,7 +422,12 @@ pub async fn check_note_target(engine: &QueryEngine, connection_id: &str, target
             out.push((sep, match col { Some(c) => format!("{}.{c}", o.full_name()), None => o.full_name() }));
             continue;
         }
-        match resolve_live(engine, connection_id, &path).await {
+        // Tables seen in the explorer / ⌘P / completion (works while indexing).
+        if let Ok(Some(p)) = ws.meta_resolve_path(connection_id, &path) {
+            out.push((sep, p));
+            continue;
+        }
+        match live_limited(resolve_live(engine, connection_id, &path)).await {
             Ok(Some(p)) => out.push((sep, p)),
             Ok(None) => missing.push(path),
             Err(e) => {
@@ -436,7 +441,7 @@ pub async fn check_note_target(engine: &QueryEngine, connection_id: &str, target
     }
     let list = missing.join(", ");
     Err(match offline {
-        Some(e) => format!("cannot check {list}: not in the knowledge index and the connection is unavailable ({e})"),
+        Some(e) => format!("cannot check {list}: not in the knowledge index or the tables seen in the explorer, and the connection did not answer ({e})"),
         None => format!("not found in this connection: {list}"),
     })
 }
@@ -447,6 +452,9 @@ pub async fn check_note_target(engine: &QueryEngine, connection_id: &str, target
 pub async fn resolve_table(engine: &QueryEngine, connection_id: &str, path: &str) -> std::result::Result<Option<(String, String)>, String> {
     if let Ok(Some(o)) = engine.workspace().kn_get(connection_id, path) {
         return Ok(Some((o.schema, o.name)));
+    }
+    if let Ok(Some(hit)) = engine.workspace().meta_get(connection_id, path) {
+        return Ok(Some(hit));
     }
     let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();
     let Some(table) = parts.last() else { return Ok(None) };
@@ -460,6 +468,16 @@ pub async fn resolve_table(engine: &QueryEngine, connection_id: &str, path: &str
             schema_written.is_empty() || s == schema_written || s.ends_with(&format!(".{schema_written}"))
         })
         .map(|o| (o.schema, o.name)))
+}
+
+/// Live lookups share the connection's metadata session with indexing, so
+/// they can wait behind an indexing batch: give up after this long.
+const LIVE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(if cfg!(test) { 1 } else { 10 });
+
+async fn live_limited<T>(f: impl std::future::Future<Output = std::result::Result<T, String>>) -> std::result::Result<T, String> {
+    tokio::time::timeout(LIVE_CHECK_TIMEOUT, f)
+        .await
+        .unwrap_or_else(|_| Err(format!("no answer in {} s; the connection may be busy indexing, try again when it finishes", LIVE_CHECK_TIMEOUT.as_secs())))
 }
 
 /// `path` = `[catalog.]schema.table[.column]` or a bare `table`, looked up live.
@@ -492,6 +510,15 @@ async fn resolve_live(engine: &QueryEngine, connection_id: &str, path: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A live check stuck behind indexing gives up with a clear error.
+    #[tokio::test]
+    async fn live_checks_time_out() {
+        let t = std::time::Instant::now();
+        let e = live_limited(std::future::pending::<std::result::Result<(), String>>()).await.unwrap_err();
+        assert!(e.contains("busy indexing"), "{e}");
+        assert!(t.elapsed() < std::time::Duration::from_secs(3));
+    }
     use databrain_connector_core::{ColumnInfo, ForeignKey};
 
     #[test]

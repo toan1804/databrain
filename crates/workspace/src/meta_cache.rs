@@ -73,6 +73,42 @@ impl Workspace {
         Ok(json.map(|j| serde_json::from_str::<Vec<ColumnInfo>>(&j).unwrap_or_default().into_iter().map(|c| c.name).collect()))
     }
 
+    /// A table/view seen while browsing (explorer, ⌘P, completion), by
+    /// `schema.name` or bare `name` (case-insensitive; the schema may be the
+    /// last part of a `catalog.schema` id). Returns (schema, name).
+    pub fn meta_get(&self, connection_id: &str, reference: &str) -> Result<Option<(String, String)>> {
+        let (schema, name) = match reference.rsplit_once('.') {
+            Some((s, n)) => (Some(s.replace(['"', '`', '[', ']'], "")), n),
+            None => (None, reference),
+        };
+        let name = name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT schema_name, name FROM meta_objects \
+                 WHERE connection_id = ?1 AND lower(name) = lower(?2) AND kind NOT IN ('function', 'procedure', 'sequence', 'other') \
+                   AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR lower(schema_name) LIKE '%.' || lower(?3)) \
+                 ORDER BY length(schema_name) LIMIT 1",
+                params![connection_id, name, schema],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// `[catalog.]schema.table[.column]` or `table[.column]` from the cache.
+    /// `Ok(None)` when the table, or a column that was asked for, is not
+    /// cached (columns are cached only for tables that were opened).
+    pub fn meta_resolve_path(&self, connection_id: &str, path: &str) -> Result<Option<String>> {
+        if let Some((s, n)) = self.meta_get(connection_id, path)? {
+            return Ok(Some(format!("{s}.{n}")));
+        }
+        let Some((table, col)) = path.rsplit_once('.') else { return Ok(None) };
+        let Some((s, n)) = self.meta_get(connection_id, table)? else { return Ok(None) };
+        let cols = self.meta_column_names(connection_id, &s, &n)?.unwrap_or_default();
+        Ok(cols.into_iter().find(|c| c.eq_ignore_ascii_case(col)).map(|c| format!("{s}.{n}.{c}")))
+    }
+
     /// Number of cached objects of a connection.
     pub fn meta_count(&self, connection_id: &str) -> Result<i64> {
         Ok(self.conn.lock().query_row("SELECT count(*) FROM meta_objects WHERE connection_id = ?1", [connection_id], |r| r.get(0))?)
@@ -109,6 +145,14 @@ mod tests {
         let cols = vec![ColumnInfo { name: "id".into(), data_type: "int".into(), nullable: false, is_primary_key: true, default: None, comment: None }];
         ws.meta_put_columns("c", "s", "orders", &cols).unwrap();
         assert_eq!(ws.kn_column_names("c", "s", "ORDERS").unwrap().unwrap(), vec!["id"]);
+        // Note targets: table, schema.table, catalog.schema ids, cached columns.
+        assert_eq!(ws.meta_resolve_path("c", "ORDERS").unwrap().as_deref(), Some("s.orders"));
+        assert_eq!(ws.meta_resolve_path("c", "s.orders.ID").unwrap().as_deref(), Some("s.orders.id"));
+        assert!(ws.meta_resolve_path("c", "s.orders.nope").unwrap().is_none());
+        assert!(ws.meta_resolve_path("c", "x.orders").unwrap().is_none());
+        assert!(ws.meta_resolve_path("c", "f").unwrap().is_none(), "functions are not tables");
+        ws.meta_add_objects("c", &[o("main.sales", "items", ObjectKind::Table)]).unwrap();
+        assert_eq!(ws.meta_resolve_path("c", "sales.items").unwrap().as_deref(), Some("main.sales.items"));
         ws.delete_connection_cache_for_test("c");
         assert_eq!(ws.meta_count("c").unwrap(), 0);
         assert!(ws.kn_column_names("c", "s", "orders").unwrap().is_none());
