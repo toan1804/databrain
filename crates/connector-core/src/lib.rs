@@ -65,6 +65,17 @@ pub trait Session: Send + Sync {
 
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail>;
 
+    /// Full DDL of an object (explorer "Show DDL"). `None` when the engine
+    /// can't produce it. The default uses [`Session::describe`] for tables
+    /// and views; engines override it for complete table DDL (constraints,
+    /// indexes, comments) and for routines.
+    async fn object_ddl(&self, schema: &str, name: &str, kind: ObjectKind) -> Result<Option<String>> {
+        if !kind.is_relation() {
+            return Ok(None);
+        }
+        Ok(self.describe(schema, name).await?.ddl)
+    }
+
     /// Find tables and views by name across every schema (catalog search).
     /// The default walks schemas one by one; engines with a global catalog
     /// view override it with a single query.

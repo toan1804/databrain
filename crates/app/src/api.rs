@@ -439,6 +439,11 @@ pub async fn complete_routines(state: &AppState, id: &str, schema: Option<&str>,
     Ok(hits)
 }
 
+/// DDL of an object for the explorer's "Show DDL".
+pub async fn object_ddl(state: &AppState, id: &str, schema: &str, name: &str, kind: databrain_connector_core::ObjectKind) -> Result<Option<String>> {
+    state.engine.object_ddl(id, schema, name, kind).await
+}
+
 /// Functions/procedures of an Oracle package (`pkg.` completion).
 pub async fn package_members(state: &AppState, id: &str, schema: &str, package: &str) -> Result<Vec<DbObject>> {
     state.engine.package_members(id, schema, package).await

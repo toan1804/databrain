@@ -696,6 +696,16 @@ impl QueryEngine {
         .await
     }
 
+    /// Full DDL of an object (`None`: not available for this engine/kind).
+    pub async fn object_ddl(&self, connection_id: &str, schema: &str, name: &str, kind: databrain_connector_core::ObjectKind) -> Result<Option<String>> {
+        let (schema, name) = (schema.to_string(), name.to_string());
+        self.with_meta(connection_id, |s| {
+            let (schema, name) = (schema.clone(), name.clone());
+            async move { s.object_ddl(&schema, &name, kind).await }
+        })
+        .await
+    }
+
     /// Functions/procedures of a package (Oracle).
     pub async fn package_members(&self, connection_id: &str, schema: &str, package: &str) -> Result<Vec<DbObject>> {
         let (schema, package) = (schema.to_string(), package.to_string());

@@ -432,6 +432,21 @@ impl Session for MysqlSession {
         Ok(l)
     }
 
+    /// Tables and views: SHOW CREATE (via describe). Routines: SHOW CREATE FUNCTION/PROCEDURE.
+    async fn object_ddl(&self, schema: &str, name: &str, kind: ObjectKind) -> Result<Option<String>> {
+        let what = match kind {
+            ObjectKind::Function => "FUNCTION",
+            ObjectKind::Procedure => "PROCEDURE",
+            k if k.is_relation() => return Ok(self.describe(schema, name).await?.ddl),
+            _ => return Ok(None),
+        };
+        let show = format!("SHOW CREATE {what} {}.{}", quote_ident(ConnectorKind::Mysql, schema), quote_ident(ConnectorKind::Mysql, name));
+        let mut c = self.conn.lock().await;
+        let row: Option<mysql_async::Row> = c.query_first(show).await.map_err(map_err)?;
+        // Columns: name, sql_mode, Create Function|Procedure, …
+        Ok(row.and_then(|mut r| r.take::<Option<String>, _>(2).flatten()).map(|d| format!("{d};")))
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let meta: Vec<(String, Option<String>, Option<u64>)> = self
             .query_rows(
@@ -691,6 +706,26 @@ mod tests {
         cfg.port = std::env::var("DATABRAIN_MYSQL_PORT").ok().and_then(|p| p.parse().ok());
         let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_MYSQL_PASSWORD").ok().map(secrecy::SecretString::from)));
         let s = MysqlConnector.connect(&cfg, creds).await.unwrap();
+        // Show DDL: table, view, function, procedure.
+        for stmt in [
+            "drop database if exists kb_ddl",
+            "create database kb_ddl",
+            "create table kb_ddl.t (id int primary key, n varchar(10))",
+            "create view kb_ddl.v as select id from kb_ddl.t",
+            "create function kb_ddl.twice(x int) returns int deterministic return x * 2",
+            "create procedure kb_ddl.noop() begin end",
+        ] {
+            s.execute(stmt, ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        }
+        let ddl = |n: &'static str, k: ObjectKind| {
+            let s = &s;
+            async move { s.object_ddl("kb_ddl", n, k).await.unwrap().unwrap_or_default() }
+        };
+        assert!(ddl("t", ObjectKind::Table).await.starts_with("CREATE TABLE `t`"));
+        assert!(ddl("v", ObjectKind::View).await.contains("VIEW `kb_ddl`.`v` AS"));
+        assert!(ddl("twice", ObjectKind::Function).await.contains("FUNCTION `twice`"));
+        assert!(ddl("noop", ObjectKind::Procedure).await.contains("PROCEDURE `noop`"));
+        s.execute("drop database kb_ddl", ExecOptions::default()).await.unwrap().collect().await.unwrap();
         let run = |sql: &'static str| {
             let s = &s;
             async move {

@@ -29,6 +29,7 @@ import type {
   MigrationReport,
   KnowledgeEvent,
   KnObjectPage,
+  ObjectKind,
   KnowledgeView,
   KiroStatus,
   ModelInfo,
@@ -130,6 +131,8 @@ export const api = {
   /** Completion: functions/procedures/packages filtered on the server. */
   completeRoutines: (id: string, schema: string | null, query: string, limit: number) =>
     call<DbObject[]>("complete_routines", { id, schema, query, limit }),
+  /** Full DDL of a table, view or routine (null when the engine can't produce it). */
+  objectDdl: (id: string, schema: string, name: string, kind: ObjectKind) => call<string | null>("object_ddl", { id, schema, name, kind }),
   /** Functions/procedures of an Oracle package. */
   packageMembers: (id: string, schema: string, pkg: string) => call<DbObject[]>("package_members", { id, schema, package: pkg }),
   completeColumnsLocal: (id: string, schema: string, name: string) =>

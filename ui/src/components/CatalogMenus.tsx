@@ -1,7 +1,7 @@
 // Copy / insert actions for catalog objects (explorer tree and catalog search).
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { ClipboardCopy, Columns3, Play, RefreshCw, TextCursorInput } from "lucide-react";
-import { toError } from "../lib/api";
+import { ClipboardCopy, Columns3, FileCode2, Play, RefreshCw, TextCursorInput } from "lucide-react";
+import { api, toError } from "../lib/api";
 import { isRelationKind, columnList, schemaLabel, schemaPath, splitSchema, tablePath } from "../lib/catalog";
 import type { ConnectionView, DbObject, SchemaInfo } from "../lib/types";
 import { quoteIdent } from "../lib/util";
@@ -27,6 +27,28 @@ export function insertText(text: string) {
     return;
   }
   editorBridge.insert(st.activeTabId, text);
+}
+
+/** DDL of an object from the connection (null + a toast when unavailable). */
+export async function loadDdl(conn: ConnectionView, obj: DbObject): Promise<string | null> {
+  const st = useStore.getState();
+  try {
+    const ddl = await api.objectDdl(conn.id, obj.schema, obj.name, obj.kind);
+    if (!ddl?.trim()) {
+      st.toast(`DDL is not available for ${obj.name} on this connection`, "info");
+      return null;
+    }
+    return ddl;
+  } catch (e) {
+    st.toast(toError(e).message, "error");
+    return null;
+  }
+}
+
+/** Open an object's DDL in a new query tab on its connection. */
+export async function showDdl(conn: ConnectionView, obj: DbObject) {
+  const ddl = await loadDdl(conn, obj);
+  if (ddl) useStore.getState().newTab({ title: `${obj.name} DDL`, sql: ddl.endsWith("\n") ? ddl : `${ddl}\n`, connection_id: conn.id });
 }
 
 /** Load (if needed) and insert/copy a table's column list. */
@@ -146,6 +168,20 @@ export function ObjectMenu({
       <MenuItem icon={<TextCursorInput size={13} />} label="Insert table path" onClick={run(() => insertText(path))} />
       {isRelation && <MenuItem icon={<Columns3 size={13} />} label="Insert column names" onClick={run(() => void insertColumns(conn, obj))} />}
       {isRelation && onSelectTop && <MenuItem icon={<Play size={13} />} label="Select top 100 rows" onClick={run(onSelectTop)} />}
+      {obj.kind !== "other" && (
+        <>
+          <MenuSeparator />
+          <MenuItem icon={<FileCode2 size={13} />} label="Show DDL" hint="new tab" onClick={run(() => void showDdl(conn, obj))} />
+          <MenuItem
+            icon={<ClipboardCopy size={13} />}
+            label="Copy DDL"
+            onClick={run(async () => {
+              const ddl = await loadDdl(conn, obj);
+              if (ddl) void copyText(ddl, "DDL");
+            })}
+          />
+        </>
+      )}
     </Popover>
   );
 }

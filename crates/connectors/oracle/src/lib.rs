@@ -736,6 +736,11 @@ impl Session for OracleSession {
         Ok(l)
     }
 
+    /// DBMS_METADATA for every kind (packages: spec and body).
+    async fn object_ddl(&self, schema: &str, name: &str, _kind: ObjectKind) -> Result<Option<String>> {
+        Ok(self.describe(schema, name).await?.ddl)
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let object = self
             .list_objects(schema)
@@ -1095,6 +1100,13 @@ mod tests {
         let m = s.package_members(&me, "DB_PKG_SALES").await.unwrap();
         let m: Vec<(&str, ObjectKind)> = m.iter().map(|o| (o.name.as_str(), o.kind)).collect();
         assert_eq!(m, vec![("NET", ObjectKind::Function), ("REFRESH", ObjectKind::Procedure)], "{driver}: overloads once");
+        // Show DDL: package (spec + body), function, procedure.
+        run(&s, "create or replace package body db_pkg_sales as function net(x number) return number is begin return x; end; \
+                 function net(x number, y number) return number is begin return x - y; end; procedure refresh is begin null; end; end;").await;
+        let p = s.object_ddl(&me, "DB_PKG_SALES", ObjectKind::Package).await.unwrap().unwrap();
+        assert!(p.contains("PACKAGE \"") && p.contains("PACKAGE BODY"), "{driver}: {p}");
+        assert!(s.object_ddl(&me, "DB_FN_TOTAL", ObjectKind::Function).await.unwrap().unwrap().contains("FUNCTION"));
+        assert!(s.object_ddl(&me, "DB_PROC_LOG", ObjectKind::Procedure).await.unwrap().unwrap().contains("PROCEDURE"));
         let sys = s.package_members("SYS", "DBMS_OUTPUT").await.unwrap();
         assert!(sys.iter().any(|o| o.name == "PUT_LINE" && o.kind == ObjectKind::Procedure), "{driver}");
         for d in ["drop function db_fn_total", "drop procedure db_proc_log", "drop package db_pkg_sales"] {

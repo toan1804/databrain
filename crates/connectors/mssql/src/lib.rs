@@ -267,7 +267,10 @@ fn is_dml(sql: &str) -> bool {
     let kw = leading_keyword(sql);
     let writes = matches!(
         kw.as_str(),
-        "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "GRANT" | "REVOKE"
+        // DDL (CREATE/ALTER/DROP) runs as a plain batch: CREATE PROCEDURE,
+        // VIEW, FUNCTION and TRIGGER must start a batch, which an RPC
+        // (sp_executesql) call is not.
+        "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE" | "GRANT" | "REVOKE"
     );
     writes
         && !sql
@@ -641,6 +644,47 @@ impl Session for MssqlSession {
         Ok(l)
     }
 
+    /// Tables: columns plus keys, foreign keys, checks and indexes. Views,
+    /// procedures and functions: their definition.
+    async fn object_ddl(&self, schema: &str, name: &str, _kind: ObjectKind) -> Result<Option<String>> {
+        let d = self.describe(schema, name).await?;
+        if d.object.kind != ObjectKind::Table {
+            return Ok(d.ddl);
+        }
+        let full = format!("{}.{}", quote_ident(ConnectorKind::Mssql, schema), quote_ident(ConnectorKind::Mssql, name));
+        // One row per extra line: (0 = inside CREATE TABLE, 1 = after it, text).
+        let extra = self.rows(MSSQL_TABLE_EXTRAS, vec![full.clone()]).await;
+        let Ok(extra) = extra else { return Ok(d.ddl) }; // e.g. no STRING_AGG (before 2017)
+        let mut inside: Vec<String> = Vec::new();
+        let mut after: Vec<String> = Vec::new();
+        for r in &extra {
+            let line = r.get::<&str, _>(1).unwrap_or_default().to_string();
+            if r.get::<i32, _>(0) == Some(0) { inside.push(format!("    {line}")) } else { after.push(format!("{line};")) }
+        }
+        let mut lines: Vec<String> = d
+            .columns
+            .iter()
+            .map(|c| {
+                let mut l = format!("    {} {}", quote_ident(ConnectorKind::Mssql, &c.name), c.data_type);
+                if !c.nullable {
+                    l.push_str(" NOT NULL");
+                }
+                if let Some(def) = &c.default {
+                    l.push_str(" DEFAULT ");
+                    l.push_str(def);
+                }
+                l
+            })
+            .collect();
+        lines.extend(inside);
+        let mut ddl = format!("CREATE TABLE {full} (\n{}\n);", lines.join(",\n"));
+        for a in after {
+            ddl.push('\n');
+            ddl.push_str(&a);
+        }
+        Ok(Some(ddl))
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let objs = self.list_objects(schema).await?;
         let object = objs
@@ -712,6 +756,44 @@ impl Session for MssqlSession {
     }
 }
 
+/// Keys, foreign keys and checks (inside CREATE TABLE) and other indexes
+/// (after it) of the table `@P1`, as DDL lines.
+const MSSQL_TABLE_EXTRAS: &str = "\
+  select 0 as part, 'CONSTRAINT ' + quotename(k.name) + case when k.type = 'PK' then ' PRIMARY KEY ' else ' UNIQUE ' end \
+       + case when i.type = 1 then 'CLUSTERED ' else 'NONCLUSTERED ' end + '(' \
+       + (select string_agg(quotename(c.name) + case when ic.is_descending_key = 1 then ' DESC' else '' end, ', ') within group (order by ic.key_ordinal) \
+          from sys.index_columns ic join sys.columns c on c.object_id = ic.object_id and c.column_id = ic.column_id \
+          where ic.object_id = i.object_id and ic.index_id = i.index_id and ic.is_included_column = 0) + ')', \
+       case k.type when 'PK' then 0 else 1 end as o1, k.name as o2 \
+  from sys.key_constraints k join sys.indexes i on i.object_id = k.parent_object_id and i.index_id = k.unique_index_id \
+  where k.parent_object_id = object_id(@P1) \
+  union all \
+  select 0, 'CONSTRAINT ' + quotename(f.name) + ' FOREIGN KEY (' \
+       + (select string_agg(quotename(c.name), ', ') within group (order by fc.constraint_column_id) from sys.foreign_key_columns fc \
+          join sys.columns c on c.object_id = fc.parent_object_id and c.column_id = fc.parent_column_id where fc.constraint_object_id = f.object_id) \
+       + ') REFERENCES ' + quotename(schema_name(r.schema_id)) + '.' + quotename(r.name) + ' (' \
+       + (select string_agg(quotename(c.name), ', ') within group (order by fc.constraint_column_id) from sys.foreign_key_columns fc \
+          join sys.columns c on c.object_id = fc.referenced_object_id and c.column_id = fc.referenced_column_id where fc.constraint_object_id = f.object_id) + ')' \
+       + case f.delete_referential_action when 1 then ' ON DELETE CASCADE' when 2 then ' ON DELETE SET NULL' when 3 then ' ON DELETE SET DEFAULT' else '' end \
+       + case f.update_referential_action when 1 then ' ON UPDATE CASCADE' when 2 then ' ON UPDATE SET NULL' when 3 then ' ON UPDATE SET DEFAULT' else '' end, \
+       2, f.name \
+  from sys.foreign_keys f join sys.objects r on r.object_id = f.referenced_object_id where f.parent_object_id = object_id(@P1) \
+  union all \
+  select 0, 'CONSTRAINT ' + quotename(cc.name) + ' CHECK ' + cc.definition, 3, cc.name \
+  from sys.check_constraints cc where cc.parent_object_id = object_id(@P1) \
+  union all \
+  select 1, 'CREATE ' + case when i.is_unique = 1 then 'UNIQUE ' else '' end + case when i.type = 1 then 'CLUSTERED ' else 'NONCLUSTERED ' end \
+       + 'INDEX ' + quotename(i.name) + ' ON ' + @P1 + ' (' \
+       + (select string_agg(quotename(c.name) + case when ic.is_descending_key = 1 then ' DESC' else '' end, ', ') within group (order by ic.key_ordinal) \
+          from sys.index_columns ic join sys.columns c on c.object_id = ic.object_id and c.column_id = ic.column_id \
+          where ic.object_id = i.object_id and ic.index_id = i.index_id and ic.is_included_column = 0) + ')' \
+       + coalesce(' INCLUDE (' + (select string_agg(quotename(c.name), ', ') from sys.index_columns ic join sys.columns c \
+          on c.object_id = ic.object_id and c.column_id = ic.column_id where ic.object_id = i.object_id and ic.index_id = i.index_id and ic.is_included_column = 1) + ')', '') \
+       + coalesce(' WHERE ' + i.filter_definition, ''), \
+       4, i.name \
+  from sys.indexes i where i.object_id = object_id(@P1) and i.is_primary_key = 0 and i.is_unique_constraint = 0 and i.type in (1, 2) and i.is_hypothetical = 0 \
+  order by 1, 3, 4";
+
 fn table_ddl(full: &str, columns: &[ColumnInfo]) -> String {
     let mut lines: Vec<String> = columns
         .iter()
@@ -757,6 +839,7 @@ mod tests {
         assert!(!is_dml("insert into t output inserted.id values (1)"));
         assert!(!is_dml("select 1"));
         assert!(!is_dml("exec sp_who"));
+        assert!(!is_dml("create procedure p as select 1"), "DDL runs as a batch");
     }
 
     /// Live: DATABRAIN_MSSQL_HOST, _USER, _PASSWORD (e.g. the mcr.microsoft.com/mssql/server image).
@@ -770,6 +853,11 @@ mod tests {
         let user = std::env::var("DATABRAIN_MSSQL_USER").unwrap_or_else(|_| "sa".into());
         let mut cfg = ConnectionConfig::new(ConnectorKind::Mssql, AuthMethod::Password { user: user.clone() });
         cfg.host = Some(host);
+        cfg.port = std::env::var("DATABRAIN_MSSQL_PORT").ok().and_then(|p| p.parse().ok());
+        // DATABRAIN_MSSQL_SSL=disable for local test servers whose TLS macOS refuses (Azure SQL Edge).
+        if std::env::var("DATABRAIN_MSSQL_SSL").as_deref() == Ok("disable") {
+            cfg.ssl_mode = databrain_connector_core::SslMode::Disable;
+        }
         cfg.options.insert("trust_cert".into(), "true".into());
         let creds = Arc::new(InlineCredentialSource::new(
             AuthMethod::Password { user },
@@ -794,5 +882,45 @@ mod tests {
         cancel.cancel();
         assert!(st.collect().await.unwrap_err().is_cancelled());
         assert_eq!(s.execute("select 2", ExecOptions::default()).await.unwrap().collect().await.unwrap().num_rows(), 1);
+
+        // Show DDL: a table with every kind of constraint and an index, recreated from its DDL.
+        let run = |sql: String| {
+            let s = &s;
+            async move { s.execute(&sql, ExecOptions::default()).await.unwrap().collect().await.unwrap_or_else(|e| panic!("{sql}: {e}")) }
+        };
+        for stmt in [
+            "if object_id('dbo.kb_orders') is not null drop table dbo.kb_orders",
+            "if object_id('dbo.kb_customers') is not null drop table dbo.kb_customers",
+            "create table dbo.kb_customers (id int not null constraint pk_kb_customers primary key, email nvarchar(100) not null constraint uq_kb_email unique)",
+            "create table dbo.kb_orders (id int not null, customer_id int not null, status varchar(10) not null constraint df_kb_status default 'new', \
+               total decimal(10,2), constraint pk_kb_orders primary key clustered (id desc), \
+               constraint fk_kb_customer foreign key (customer_id) references dbo.kb_customers (id) on delete cascade, \
+               constraint ck_kb_status check (status in ('new','paid')))",
+            "create index ix_kb_status on dbo.kb_orders (status) include (total) where status <> 'paid'",
+        ] {
+            run(stmt.into()).await;
+        }
+        let ddl = s.object_ddl("dbo", "kb_orders", ObjectKind::Table).await.unwrap().unwrap();
+        for part in [
+            "CREATE TABLE [dbo].[kb_orders] (",
+            "CONSTRAINT [pk_kb_orders] PRIMARY KEY CLUSTERED ([id] DESC)",
+            "CONSTRAINT [fk_kb_customer] FOREIGN KEY ([customer_id]) REFERENCES [dbo].[kb_customers] ([id]) ON DELETE CASCADE",
+            "CONSTRAINT [ck_kb_status] CHECK",
+            "CREATE NONCLUSTERED INDEX [ix_kb_status] ON [dbo].[kb_orders] ([status]) INCLUDE ([total]) WHERE",
+        ] {
+            assert!(ddl.contains(part), "missing {part:?} in\n{ddl}");
+        }
+        assert!(s.object_ddl("dbo", "kb_customers", ObjectKind::Table).await.unwrap().unwrap().contains("CONSTRAINT [uq_kb_email] UNIQUE NONCLUSTERED ([email])"));
+        run("drop table dbo.kb_orders".into()).await;
+        for stmt in ddl.split(";\n").map(str::trim).filter(|x| !x.is_empty()) {
+            run(stmt.trim_end_matches(';').to_string()).await;
+        }
+        assert_eq!(s.object_ddl("dbo", "kb_orders", ObjectKind::Table).await.unwrap().unwrap(), ddl, "same DDL after recreating");
+        run("if object_id('dbo.kb_noop') is not null drop procedure dbo.kb_noop".into()).await;
+        run("create procedure dbo.kb_noop as select 1".into()).await;
+        assert!(s.object_ddl("dbo", "kb_noop", ObjectKind::Procedure).await.unwrap().unwrap().contains("procedure dbo.kb_noop"));
+        for stmt in ["drop table dbo.kb_orders", "drop table dbo.kb_customers", "drop procedure dbo.kb_noop"] {
+            run(stmt.into()).await;
+        }
     }
 }

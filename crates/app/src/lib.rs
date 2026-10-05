@@ -401,6 +401,10 @@ async fn complete_routines(state: State<'_, AppState>, id: String, schema: Optio
     api::complete_routines(&state, &id, schema.as_deref(), &query, limit).await
 }
 #[tauri::command]
+async fn object_ddl(state: State<'_, AppState>, id: String, schema: String, name: String, kind: databrain_connector_core::ObjectKind) -> R<Option<String>> {
+    api::object_ddl(&state, &id, &schema, &name, kind).await
+}
+#[tauri::command]
 async fn package_members(state: State<'_, AppState>, id: String, schema: String, package: String) -> R<Vec<DbObject>> {
     api::package_members(&state, &id, &schema, &package).await
 }
@@ -663,6 +667,7 @@ pub fn run() {
             complete_routines_local,
             complete_routines,
             package_members,
+            object_ddl,
             describe_object,
             table_layout,
             statement_at_cursor,
