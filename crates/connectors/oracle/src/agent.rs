@@ -137,8 +137,14 @@ async fn download_into(root: &Path, base: &str) -> Result<PathBuf> {
 
 async fn install(dir: &Path, file: &str, want: &str, url: &str, hook: Option<&ProgressHook>) -> Result<PathBuf> {
     let gz = download(url, hook).await.map_err(|e| {
-        ConnectorError::connection(format!("Could not download the Oracle driver ({url}): {e}. Check the network, or switch the connection's driver to Instant Client."))
-            .with_code("oracle_agent_download")
+        let msg = if e.contains("404") {
+            format!(
+                "The thin Oracle driver {RELEASE} is not published at {url} (HTTP 404). Upload the release files (node scripts/build-oracle-agent.mjs → target/oracle-agent/dist), set the oracle_agent_url setting to where they are, or switch the connection's driver to Instant Client."
+            )
+        } else {
+            format!("Could not download the Oracle driver ({url}): {e}. Check the network, or switch the connection's driver to Instant Client.")
+        };
+        ConnectorError::connection(msg).with_code("oracle_agent_download")
     })?;
     let bin = {
         use std::io::Read;
