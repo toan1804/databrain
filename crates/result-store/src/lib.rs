@@ -4,12 +4,13 @@
 pub mod chart;
 pub mod display;
 pub mod view;
+mod wide;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use databrain_connector_core::arrow::array::{Array, RecordBatch, UInt32Array};
-use databrain_connector_core::arrow::compute::{self, concat_batches};
+use databrain_connector_core::arrow::compute;
 use databrain_connector_core::arrow::datatypes::SchemaRef;
 use databrain_connector_core::arrow::error::ArrowError;
 use databrain_connector_core::arrow::util::display::ArrayFormatter;
@@ -107,6 +108,8 @@ pub struct ResultSet {
     truncated: bool,
     view_cache: Option<ViewCache>,
     display_cache: DisplayCache,
+    /// Bytes per text/binary column before 64-bit offsets are used (tests lower it).
+    wide_limit: usize,
 }
 
 impl ResultSet {
@@ -121,6 +124,7 @@ impl ResultSet {
             truncated: false,
             view_cache: None,
             display_cache: DisplayCache::default(),
+            wide_limit: display::MAX_SMALL_BYTES,
         }
     }
 
@@ -164,7 +168,10 @@ impl ResultSet {
         }
     }
 
-    /// All rows as one batch (concatenated lazily and cached).
+    /// All rows as one batch (concatenated lazily and cached). Text/binary
+    /// columns with more than 2 GiB of values come back with 64-bit offsets
+    /// (`LargeUtf8`/`LargeBinary`); use [`ResultSet::view_batches`] for
+    /// batches with the result's own types.
     pub fn combined(&mut self) -> Result<RecordBatch> {
         if let Some(c) = &self.combined {
             return Ok(c.clone());
@@ -172,7 +179,7 @@ impl ResultSet {
         let c = if self.batches.len() == 1 {
             self.batches[0].clone()
         } else {
-            concat_batches(&self.schema, &self.batches)?
+            wide::concat_wide(&self.schema, &self.batches, self.wide_limit)?
         };
         // Once complete, keep only the combined copy to halve memory use.
         if self.complete {
@@ -217,21 +224,27 @@ impl ResultSet {
         limit: usize,
     ) -> Result<(RecordBatch, Vec<u32>)> {
         let batch = self.combined()?;
-        match self.view_indices(spec)? {
+        let (b, ids) = match self.view_indices(spec)? {
             None => {
                 let start = offset.min(batch.num_rows());
                 let len = limit.min(batch.num_rows() - start);
                 let ids = (start as u32..(start + len) as u32).collect();
-                Ok((batch.slice(start, len), ids))
+                (batch.slice(start, len), ids)
             }
             Some(idx) => {
                 let start = offset.min(idx.len());
                 let len = limit.min(idx.len() - start);
                 let part = idx.slice(start, len);
                 let taken = compute::take_record_batch(&batch, &part)?;
-                Ok((taken, part.values().to_vec()))
+                (taken, part.values().to_vec())
             }
-        }
+        };
+        // The result's own types again (fits unless the slice itself passes 2 GiB).
+        let b = match wide::narrow(&self.schema, b.clone()) {
+            Ok(n) => n,
+            Err(_) => b,
+        };
+        Ok((b, ids))
     }
 
     pub fn page(&mut self, spec: &ViewSpec, offset: usize, limit: usize) -> Result<Page> {
@@ -278,10 +291,7 @@ impl ResultSet {
         }
         let batch = self.combined()?;
         let idx = self.view_indices(spec)?;
-        let pat = view::like_escape(query);
-        let pattern = databrain_connector_core::arrow::array::Scalar::new(
-            databrain_connector_core::arrow::array::StringArray::from(vec![format!("%{pat}%")]),
-        );
+        let pattern = format!("%{}%", view::like_escape(query));
         let cols: Vec<usize> = match columns {
             Some(c) if !c.is_empty() => {
                 let mut c: Vec<usize> = c.iter().copied().filter(|&i| i < batch.num_columns()).collect();
@@ -295,7 +305,7 @@ impl ResultSet {
         for c in 0..batch.num_columns() {
             if cols.binary_search(&c).is_ok() {
                 let text = self.display_cache.get(&batch, c)?;
-                masks.push(Some(compute::kernels::comparison::ilike(text.as_ref(), &pattern)?));
+                masks.push(Some(text.ilike(&pattern, false)?));
             } else {
                 masks.push(None);
             }
@@ -399,17 +409,37 @@ impl ResultSet {
         })
     }
 
-    /// The view as a sequence of batches (for export), `chunk` rows each.
+    /// The view as a sequence of batches (for export, outputs), at most
+    /// `chunk` rows each, always with the result's own column types: a chunk
+    /// whose text passes 2 GiB is split further.
     pub fn view_batches(&mut self, spec: &ViewSpec, chunk: usize) -> Result<Vec<RecordBatch>> {
         let n = self.view_len(spec)?;
         let chunk = chunk.max(1);
         let mut out = Vec::with_capacity(n.div_ceil(chunk));
         let mut off = 0;
         while off < n {
-            out.push(self.view_slice(spec, off, chunk)?.0);
-            off += chunk;
+            let len = chunk.min(n - off);
+            self.push_narrow(spec, off, len, &mut out)?;
+            off += len;
         }
         Ok(out)
+    }
+
+    fn push_narrow(&mut self, spec: &ViewSpec, off: usize, len: usize, out: &mut Vec<RecordBatch>) -> Result<()> {
+        let (b, _) = self.view_slice(spec, off, len)?;
+        let own = b.schema().fields().iter().zip(self.schema.fields()).all(|(a, f)| a.data_type() == f.data_type());
+        if own {
+            out.push(b);
+            return Ok(());
+        }
+        if len <= 1 {
+            // One value over 2 GiB: only the wide type can hold it.
+            out.push(b);
+            return Ok(());
+        }
+        let half = len / 2;
+        self.push_narrow(spec, off, half, out)?;
+        self.push_narrow(spec, off + half, len - half, out)
     }
 }
 
@@ -640,6 +670,79 @@ mod tests {
         assert_eq!(bs.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), vec![2, 2, 1]);
         assert!(store.remove("x"));
         assert!(store.get("x").is_err());
+    }
+
+    /// Same operations on a result whose text passes the 32-bit limit
+    /// (lowered here so the test stays small): combined with 64-bit
+    /// offsets, handed out with the result's own types.
+    #[test]
+    fn text_over_the_offset_limit() {
+        let mut rs = sample();
+        rs.wide_limit = 8; // "Alice" + "bob" + "alicia" + "Carol" = 19 bytes
+        let c = rs.combined().unwrap();
+        assert_eq!(c.schema().field(1).data_type(), &DataType::LargeUtf8);
+        assert_eq!(c.schema().field(3).data_type(), &DataType::LargeUtf8, "decimal text too (14 bytes)");
+        assert!(display::is_decimal_text(c.schema().field(3)), "metadata kept");
+        assert_eq!(c.schema().field(0).data_type(), &DataType::Int64);
+        // Paging, filters, quick filter, sort (decimal text numeric), find, stats.
+        assert_eq!(ids(&rs.page(&ViewSpec::default(), 3, 10).unwrap()), vec!["4", "5"]);
+        let f = ViewSpec { filters: vec![ColumnFilter { column: 1, op: FilterOp::Contains, value: "ALI".into() }], ..Default::default() };
+        assert_eq!(ids(&rs.page(&f, 0, 10).unwrap()), vec!["1", "4"]);
+        let eq = ViewSpec { filters: vec![ColumnFilter { column: 1, op: FilterOp::Equals, value: "bob".into() }], ..Default::default() };
+        assert_eq!(ids(&rs.page(&eq, 0, 10).unwrap()), vec!["2"]);
+        let q = ViewSpec { quick_filter: Some("carol".into()), ..Default::default() };
+        assert_eq!(ids(&rs.page(&q, 0, 10).unwrap()), vec!["5"]);
+        let sorted = ViewSpec { sort: vec![SortKey { column: 3, descending: false }], ..Default::default() };
+        assert_eq!(ids(&rs.page(&sorted, 0, 10).unwrap()), vec!["4", "2", "5", "1", "3"]);
+        let by_name = ViewSpec { sort: vec![SortKey { column: 1, descending: false }], ..Default::default() };
+        assert_eq!(ids(&rs.page(&by_name, 0, 10).unwrap()), vec!["1", "5", "4", "2", "3"]);
+        assert_eq!(rs.find(&ViewSpec::default(), "ali", 10).unwrap().matches.len(), 2);
+        assert_eq!(rs.column_stats(&ViewSpec::default(), 1).unwrap().distinct, 4);
+        // Slices and export/output chunks have the result's own types.
+        let (slice, _) = rs.view_slice(&sorted, 0, 2).unwrap();
+        assert_eq!(slice.schema().field(1).data_type(), &DataType::Utf8);
+        for b in rs.view_batches(&f, 1).unwrap() {
+            assert_eq!(b.schema(), rs.schema());
+        }
+    }
+
+    #[test]
+    fn display_text_switches_to_64_bit_offsets() {
+        let a = Int64Array::from(vec![Some(12345), None, Some(678)]);
+        let small = display::to_display_limited(&a, 100).unwrap();
+        assert!(matches!(small, display::DisplayText::Small(_)));
+        let large = display::to_display_limited(&a, 6).unwrap();
+        assert!(matches!(large, display::DisplayText::Large(_)));
+        assert_eq!((large.value(0), large.is_null(1), large.value(2), large.len()), ("12345", true, "678", 3));
+        let m = large.ilike("%7%", false).unwrap();
+        assert_eq!((m.value(0), m.is_null(1), m.value(2)), (false, true, true));
+    }
+
+    /// Real 2 GiB+: `cargo test -p databrain-result-store --release -- --ignored over_2gib` (about 7 GB of RAM).
+    #[test]
+    #[ignore]
+    fn over_2gib_of_text() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), Field::new("doc", DataType::Utf8, false)]));
+        let mut rs = ResultSet::new("big", schema.clone());
+        let doc = "x".repeat(1 << 20); // 1 MiB per value
+        let per_batch = 256; // 256 MiB per batch
+        for b in 0..9 {
+            let ids: Vec<i64> = (0..per_batch).map(|i| (b * per_batch + i) as i64).collect();
+            let docs = StringArray::from(vec![doc.as_str(); per_batch]);
+            rs.push(RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ids)), Arc::new(docs)]).unwrap());
+        }
+        rs.finish(false);
+        // 2.25 GiB of text in one column: the case that failed with "Offset overflow".
+        let page = rs.page(&ViewSpec::default(), 2300, 2).unwrap();
+        assert_eq!(page.row_ids, vec![2300, 2301]);
+        assert_eq!(rs.view_slice(&ViewSpec::default(), 2300, 2).unwrap().0.schema(), schema, "pages get the result's own types");
+        let sorted = ViewSpec { sort: vec![SortKey { column: 0, descending: true }], ..Default::default() };
+        assert_eq!(rs.page(&sorted, 0, 1).unwrap().row_ids, vec![2303]);
+        // One chunk asked for everything: split into chunks that fit 32-bit offsets.
+        let chunks = rs.view_batches(&ViewSpec::default(), 1_000_000).unwrap();
+        assert!(chunks.len() >= 2, "{}", chunks.len());
+        assert_eq!(chunks.iter().map(|b| b.num_rows()).sum::<usize>(), 2304);
+        assert!(chunks.iter().all(|b| b.schema() == schema));
     }
 
     #[test]

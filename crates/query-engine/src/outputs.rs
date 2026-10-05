@@ -24,7 +24,7 @@ use databrain_connector_core::arrow::compute::cast;
 use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use databrain_connector_core::external::{ExternalTable, ExternalTables, RESULTS_SCHEMA};
 use databrain_connector_core::{ConnectorKind, quote_ident};
-use databrain_result_store::{ColumnMeta, ResultInfo, ResultStore, display};
+use databrain_result_store::{ColumnMeta, ResultInfo, ResultStore, ViewSpec, display};
 use databrain_workspace::{Origin, OutputRecord, Workspace, now_ms};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,8 @@ use serde::{Deserialize, Serialize};
 use crate::{EngineError, Result};
 
 /// Versions kept per name (current + previous ones).
+/// Rows per batch when an output is saved or read by SQL.
+const SNAPSHOT_CHUNK: usize = 65_536;
 const KEEP_VERSIONS: usize = 5;
 /// Metadata entries kept for evicted outputs.
 const MAX_ENTRIES: usize = 400;
@@ -236,12 +238,12 @@ impl OutputRegistry {
                     continue;
                 }
                 let Ok(rs) = self.results.get(&o.result_id) else { continue };
-                let (schema, batch) = {
+                let (schema, batches) = {
                     let mut g = rs.lock();
-                    let Ok(b) = g.combined() else { continue };
+                    let Ok(b) = g.view_batches(&ViewSpec::default(), SNAPSHOT_CHUNK) else { continue };
                     (g.schema(), b)
                 };
-                if databrain_export::write_snapshot(&path, schema, &[batch]).is_err() {
+                if databrain_export::write_snapshot(&path, schema, &batches).is_err() {
                     continue;
                 }
                 written += 1;
@@ -534,11 +536,11 @@ impl OutputRegistry {
         if pinned {
             if let Some(path) = self.snapshot_path(&info.result_id) {
                 let rs = self.results.get(&info.result_id).map_err(|e| EngineError::new("not_found", e.to_string()))?;
-                let (schema, batch) = {
+                let (schema, batches) = {
                     let mut g = rs.lock();
-                    (g.schema(), g.combined().map_err(|e| EngineError::new("internal", e.to_string()))?)
+                    (g.schema(), g.view_batches(&ViewSpec::default(), SNAPSHOT_CHUNK).map_err(|e| EngineError::new("internal", e.to_string()))?)
                 };
-                databrain_export::write_snapshot(&path, schema, &[batch]).map_err(|e| EngineError::new("internal", format!("cannot save {handle}: {e}")))?;
+                databrain_export::write_snapshot(&path, schema, &batches).map_err(|e| EngineError::new("internal", format!("cannot save {handle}: {e}")))?;
                 self.workspace.save_output(&OutputRecord {
                     result_id: info.result_id.clone(),
                     handle: info.handle.clone(),
@@ -708,11 +710,13 @@ impl ExternalTables for OutputTables {
     fn resolve(&self, name: &str) -> std::result::Result<ExternalTable, String> {
         let o = self.0.ensure_loaded(name).map_err(|e| e.message)?;
         let rs = self.0.results.get(&o.result_id).map_err(|e| e.to_string())?;
-        let (schema, batch) = {
+        // Chunks with the result's own types (a single combined batch can need
+        // 64-bit offsets, which DuckDB's appender would cast back and overflow).
+        let (schema, chunks) = {
             let mut g = rs.lock();
-            (g.schema(), g.combined().map_err(|e| e.to_string())?)
+            (g.schema(), g.view_batches(&ViewSpec::default(), SNAPSHOT_CHUNK).map_err(|e| e.to_string())?)
         };
-        let (schema, batch) = sql_ready(&schema, &batch).map_err(|e| e.to_string())?;
+        let (schema, batches) = sql_ready_all(&schema, &chunks).map_err(|e| e.to_string())?;
         let notice = o.truncated.then(|| {
             format!(
                 "results.{name} ({}) holds only the first {} rows{} — totals over it may be incomplete. Re-run its query with a higher row limit for complete data.",
@@ -721,7 +725,7 @@ impl ExternalTables for OutputTables {
                 o.row_limit.map(|l| format!(" (row limit {l})")).unwrap_or_default()
             )
         });
-        Ok(ExternalTable { name: name.to_string(), version_key: o.result_id, schema, batches: vec![batch], notice })
+        Ok(ExternalTable { name: name.to_string(), version_key: o.result_id, schema, batches, notice })
     }
 
     fn names(&self) -> Vec<String> {
@@ -749,38 +753,54 @@ pub(crate) fn one_line(s: &str, max: usize) -> String {
     if t.chars().count() <= max { t } else { format!("{}…", t.chars().take(max - 1).collect::<String>()) }
 }
 
-/// Make a result natural to query in SQL: exact decimals that the grid keeps
-/// as text become DECIMAL(p,s) (or DOUBLE when too wide); metadata dropped.
-pub fn sql_ready(schema: &SchemaRef, batch: &RecordBatch) -> std::result::Result<(SchemaRef, RecordBatch), databrain_connector_core::arrow::error::ArrowError> {
+/// Outputs as DuckDB reads them: decimals kept as text become DECIMAL
+/// (precision/scale from every value of every batch) or DOUBLE.
+pub fn sql_ready_all(schema: &SchemaRef, batches: &[RecordBatch]) -> std::result::Result<(SchemaRef, Vec<RecordBatch>), databrain_connector_core::arrow::error::ArrowError> {
     let mut fields = Vec::with_capacity(schema.fields().len());
-    let mut cols: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    for (f, col) in schema.fields().iter().zip(batch.columns()) {
-        if display::is_decimal_text(f) {
-            let target = decimal_type(col.as_ref());
-            let c = cast(col, &target).or_else(|_| cast(col, &DataType::Float64))?;
-            fields.push(Field::new(f.name(), c.data_type().clone(), true));
-            cols.push(c);
+    for (i, f) in schema.fields().iter().enumerate() {
+        let dt = if display::is_decimal_text(f) {
+            decimal_type(batches.iter().map(|b| b.column(i).as_ref()))
         } else {
-            fields.push(Field::new(f.name(), f.data_type().clone(), true));
-            cols.push(col.clone());
-        }
+            f.data_type().clone()
+        };
+        fields.push(Field::new(f.name(), dt, true));
     }
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema.clone(), cols)?;
-    Ok((schema, batch))
+    let out_schema = Arc::new(Schema::new(fields));
+    let mut out = Vec::with_capacity(batches.len());
+    for b in batches {
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(b.num_columns());
+        for (i, (f, col)) in schema.fields().iter().zip(b.columns()).enumerate() {
+            let target = out_schema.field(i).data_type();
+            cols.push(if display::is_decimal_text(f) {
+                cast(col, target)? // the type fits every value of every batch
+            } else {
+                col.clone()
+            });
+        }
+        out.push(RecordBatch::try_new(out_schema.clone(), cols)?);
+    }
+    Ok((out_schema, out))
 }
 
-fn decimal_type(col: &dyn Array) -> DataType {
-    let Some(s) = col.as_any().downcast_ref::<StringArray>() else { return DataType::Float64 };
+/// [`sql_ready_all`] for one batch.
+pub fn sql_ready(schema: &SchemaRef, batch: &RecordBatch) -> std::result::Result<(SchemaRef, RecordBatch), databrain_connector_core::arrow::error::ArrowError> {
+    let (s, mut b) = sql_ready_all(schema, std::slice::from_ref(batch))?;
+    Ok((s, b.remove(0)))
+}
+
+fn decimal_type<'a>(cols: impl Iterator<Item = &'a dyn Array>) -> DataType {
     let (mut int_digits, mut scale) = (1usize, 0usize);
-    for v in s.iter().flatten() {
-        let v = v.trim().trim_start_matches(['-', '+']);
-        if v.contains(['e', 'E']) || v.eq_ignore_ascii_case("nan") || v.contains("inf") {
-            return DataType::Float64;
+    for col in cols {
+        let Some(s) = col.as_any().downcast_ref::<StringArray>() else { return DataType::Float64 };
+        for v in s.iter().flatten() {
+            let v = v.trim().trim_start_matches(['-', '+']);
+            if v.contains(['e', 'E']) || v.eq_ignore_ascii_case("nan") || v.contains("inf") {
+                return DataType::Float64;
+            }
+            let (i, f) = v.split_once('.').unwrap_or((v, ""));
+            int_digits = int_digits.max(i.trim_start_matches('0').len().max(1));
+            scale = scale.max(f.len());
         }
-        let (i, f) = v.split_once('.').unwrap_or((v, ""));
-        int_digits = int_digits.max(i.trim_start_matches('0').len().max(1));
-        scale = scale.max(f.len());
     }
     let p = int_digits + scale;
     if p > 38 { DataType::Float64 } else { DataType::Decimal128(p.max(1) as u8, scale as i8) }
@@ -1076,5 +1096,18 @@ mod tests {
         let (s, b) = sql_ready(&schema, &batch).unwrap();
         assert_eq!(s.field(0).data_type(), &DataType::Decimal128(4, 2));
         assert_eq!(b.column(0).null_count(), 1);
+    }
+
+    /// Chunks of one output get one DECIMAL type fitting every chunk.
+    #[test]
+    fn decimal_type_spans_chunks() {
+        let mut md = std::collections::HashMap::new();
+        md.insert(databrain_connector_core::value::META_DB_TYPE.to_string(), "numeric".to_string());
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("amount", DataType::Utf8, true).with_metadata(md)]));
+        let b1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["12.5"]))]).unwrap();
+        let b2 = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["12345.125"]))]).unwrap();
+        let (s, bs) = sql_ready_all(&schema, &[b1, b2]).unwrap();
+        assert_eq!(s.field(0).data_type(), &DataType::Decimal128(8, 3));
+        assert!(bs.iter().all(|b| b.schema() == s));
     }
 }

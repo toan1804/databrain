@@ -4,10 +4,9 @@
 use std::sync::Arc;
 
 use databrain_connector_core::arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, RecordBatch, Scalar, StringArray, UInt32Array,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, LargeStringArray, RecordBatch, Scalar, StringArray, UInt32Array,
 };
 use databrain_connector_core::arrow::compute::kernels::cmp;
-use databrain_connector_core::arrow::compute::kernels::comparison::{ilike, nilike};
 use databrain_connector_core::arrow::compute::{
     self, CastOptions, SortColumn, SortOptions, and_kleene, cast_with_options, is_not_null,
     is_null, lexsort_to_indices, or_kleene,
@@ -15,7 +14,7 @@ use databrain_connector_core::arrow::compute::{
 use databrain_connector_core::arrow::datatypes::DataType;
 use serde::{Deserialize, Serialize};
 
-use crate::display::{self, is_decimal_text};
+use crate::display::{self, DisplayText, is_decimal_text};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -83,9 +82,6 @@ pub(crate) fn like_escape(s: &str) -> String {
     out
 }
 
-fn pattern_scalar(p: String) -> Scalar<StringArray> {
-    Scalar::new(StringArray::from(vec![p]))
-}
 
 /// Column as it should be compared: decimals-as-text become Float64.
 fn comparable(batch: &RecordBatch, col: usize) -> Result<ArrayRef> {
@@ -98,7 +94,7 @@ fn comparable(batch: &RecordBatch, col: usize) -> Result<ArrayRef> {
     }
 }
 
-fn display_col(cache: &mut DisplayCache, batch: &RecordBatch, col: usize) -> Result<Arc<StringArray>> {
+fn display_col(cache: &mut DisplayCache, batch: &RecordBatch, col: usize) -> Result<Arc<DisplayText>> {
     cache.get(batch, col)
 }
 
@@ -106,11 +102,11 @@ fn display_col(cache: &mut DisplayCache, batch: &RecordBatch, col: usize) -> Res
 #[derive(Default)]
 pub struct DisplayCache {
     rows: usize,
-    cols: Vec<Option<Arc<StringArray>>>,
+    cols: Vec<Option<Arc<DisplayText>>>,
 }
 
 impl DisplayCache {
-    pub fn get(&mut self, batch: &RecordBatch, col: usize) -> Result<Arc<StringArray>> {
+    pub fn get(&mut self, batch: &RecordBatch, col: usize) -> Result<Arc<DisplayText>> {
         if self.rows != batch.num_rows() || self.cols.len() != batch.num_columns() {
             self.rows = batch.num_rows();
             self.cols = vec![None; batch.num_columns()];
@@ -144,12 +140,7 @@ fn filter_mask(
                 FilterOp::EndsWith => format!("%{v}"),
                 _ => format!("%{v}%"),
             };
-            let s = pattern_scalar(pat);
-            return Ok(if f.op == FilterOp::NotContains {
-                nilike(text.as_ref(), &s)?
-            } else {
-                ilike(text.as_ref(), &s)?
-            });
+            return Ok(text.ilike(&pat, f.op == FilterOp::NotContains)?);
         }
         _ => {}
     }
@@ -159,6 +150,8 @@ fn filter_mask(
     let lit = StringArray::from(vec![f.value.trim().to_string()]);
     let typed = if matches!(col.data_type(), DataType::Utf8) {
         Arc::new(StringArray::from(vec![f.value.clone()])) as ArrayRef
+    } else if matches!(col.data_type(), DataType::LargeUtf8) {
+        Arc::new(LargeStringArray::from(vec![f.value.clone()])) as ArrayRef
     } else {
         let opts = CastOptions {
             safe: false,
@@ -191,11 +184,11 @@ pub(crate) fn any_contains(
     q: &str,
     cache: &mut DisplayCache,
 ) -> Result<BooleanArray> {
-    let pat = pattern_scalar(format!("%{}%", like_escape(q)));
+    let pat = format!("%{}%", like_escape(q));
     let mut acc: Option<BooleanArray> = None;
     for c in 0..batch.num_columns() {
         let text = cache.get(batch, c)?;
-        let m = ilike(text.as_ref(), &pat)?;
+        let m = text.ilike(&pat, false)?;
         acc = Some(match acc {
             None => m,
             Some(prev) => or_kleene(&prev, &m)?,

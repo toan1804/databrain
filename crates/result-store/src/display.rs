@@ -1,7 +1,8 @@
 //! Converting Arrow values into display strings shared by the grid, find,
 //! copy and export.
 
-use databrain_connector_core::arrow::array::{Array, ArrayRef, StringArray, StringBuilder};
+use databrain_connector_core::arrow::array::{Array, ArrayRef, BooleanArray, LargeStringArray, LargeStringBuilder, Scalar, StringArray, StringBuilder};
+use databrain_connector_core::arrow::compute::kernels::comparison::{ilike, nilike};
 use databrain_connector_core::arrow::datatypes::{DataType, Field};
 use databrain_connector_core::arrow::error::ArrowError;
 use databrain_connector_core::arrow::util::display::{ArrayFormatter, FormatOptions};
@@ -20,14 +21,86 @@ pub fn format_options() -> FormatOptions<'static> {
         .with_datetime_format(Some(TS_FORMAT))
 }
 
-/// Format every value of `array` into a `StringArray` (nulls stay null).
-pub fn to_display(array: &dyn Array) -> Result<StringArray, ArrowError> {
+/// Display strings of a column. 32-bit offsets normally; 64-bit when the
+/// text of the column passes 2 GiB (a `StringArray` can't hold it).
+#[derive(Debug, Clone)]
+pub enum DisplayText {
+    Small(StringArray),
+    Large(LargeStringArray),
+}
+
+impl DisplayText {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Small(a) => a.len(),
+            Self::Large(a) => a.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn is_null(&self, i: usize) -> bool {
+        match self {
+            Self::Small(a) => a.is_null(i),
+            Self::Large(a) => a.is_null(i),
+        }
+    }
+    pub fn value(&self, i: usize) -> &str {
+        match self {
+            Self::Small(a) => a.value(i),
+            Self::Large(a) => a.value(i),
+        }
+    }
+    /// Case-insensitive LIKE (`negate` = NOT ILIKE).
+    pub fn ilike(&self, pattern: &str, negate: bool) -> Result<BooleanArray, ArrowError> {
+        let op = if negate { nilike } else { ilike };
+        match self {
+            Self::Small(a) => op(a, &Scalar::new(StringArray::from(vec![pattern]))),
+            Self::Large(a) => op(a, &Scalar::new(LargeStringArray::from(vec![pattern]))),
+        }
+    }
+}
+
+/// Largest text a 32-bit-offset array can hold.
+pub(crate) const MAX_SMALL_BYTES: usize = i32::MAX as usize;
+
+/// Format every value of `array` as display text (nulls stay null).
+pub fn to_display(array: &dyn Array) -> Result<DisplayText, ArrowError> {
+    to_display_limited(array, MAX_SMALL_BYTES)
+}
+
+pub(crate) fn to_display_limited(array: &dyn Array, small_limit: usize) -> Result<DisplayText, ArrowError> {
     if let Some(s) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(s.clone());
+        return Ok(DisplayText::Small(s.clone()));
+    }
+    if let Some(s) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(DisplayText::Large(s.clone()));
     }
     let opts = format_options();
     let f = ArrayFormatter::try_new(array, &opts)?;
+    // 32-bit offsets unless the text turns out to pass the limit.
     let mut b = StringBuilder::with_capacity(array.len(), array.len() * 8);
+    let mut bytes = 0usize;
+    let mut buf = String::new();
+    for i in 0..array.len() {
+        if array.is_null(i) {
+            b.append_null();
+            continue;
+        }
+        buf.clear();
+        use std::fmt::Write;
+        let _ = write!(buf, "{}", f.value(i));
+        bytes += buf.len();
+        if bytes > small_limit {
+            return to_large(array, &f);
+        }
+        b.append_value(&buf);
+    }
+    Ok(DisplayText::Small(b.finish()))
+}
+
+fn to_large(array: &dyn Array, f: &ArrayFormatter<'_>) -> Result<DisplayText, ArrowError> {
+    let mut b = LargeStringBuilder::with_capacity(array.len(), array.len() * 8);
     for i in 0..array.len() {
         if array.is_null(i) {
             b.append_null();
@@ -35,7 +108,7 @@ pub fn to_display(array: &dyn Array) -> Result<StringArray, ArrowError> {
             b.append_value(f.value(i).to_string());
         }
     }
-    Ok(b.finish())
+    Ok(DisplayText::Large(b.finish()))
 }
 
 /// Format a single cell (`None` for SQL NULL).
@@ -82,7 +155,7 @@ pub fn family(field: &Field) -> TypeFamily {
 
 /// Exact decimals are transported as text; treat them as numbers for sort/filter.
 pub fn is_decimal_text(field: &Field) -> bool {
-    matches!(field.data_type(), DataType::Utf8)
+    matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
         && field.metadata().get(META_DB_TYPE).is_some_and(|t| {
             let t = t.to_ascii_lowercase();
             t.starts_with("numeric") || t.starts_with("decimal") || t == "newdecimal" || t == "money"

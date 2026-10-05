@@ -131,7 +131,7 @@ impl ResultSet {
             })
             .collect::<Result<_>>()?;
         let series_col = spec.series.map(|c| display::to_display(batch.column(c).as_ref())).transpose()?;
-        let label = |a: &databrain_connector_core::arrow::array::StringArray, i: usize| if a.is_null(i) { "NULL".to_string() } else { a.value(i).to_string() };
+        let label = |a: &display::DisplayText, i: usize| if a.is_null(i) { "NULL".to_string() } else { a.value(i).to_string() };
         let ynames: Vec<String> = spec.y.iter().map(|&c| schema.field(c).name().clone()).collect();
 
         if spec.agg == Agg::None {
