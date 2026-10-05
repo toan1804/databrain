@@ -151,6 +151,12 @@ async fn sqlite_explorer_and_queries() {
     let layout = api::table_layout(&st, &id, "main", "orders").await.unwrap();
     assert_eq!(layout.indexes[0].columns, vec!["order_id"]);
     assert!(layout.indexes.iter().any(|i| i.name == "orders_customer" && i.columns == vec!["customer_id"]), "{layout:?}");
+    // Query tips after a run: references as written in SQL are resolved.
+    let hl = databrain_app::ai_api::hint_layouts(&st, &id, vec!["ORDERS".into(), "main.customers".into(), "nope".into()]).await.unwrap();
+    assert_eq!((hl[0].schema.as_deref(), hl[0].name.as_deref()), (Some("main"), Some("orders")));
+    assert!(hl[0].layout.as_ref().unwrap().indexes.iter().any(|i| i.name == "orders_customer"));
+    assert_eq!(hl[1].name.as_deref(), Some("customers"));
+    assert!(hl[2].layout.is_none() && hl[2].error.is_some());
 
     let counts = query(
         &st,

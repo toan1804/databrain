@@ -20,8 +20,12 @@ import {
   Table2,
   Wrench,
   X,
+  Lightbulb,
+  ChevronRight,
 } from "lucide-react";
+import { EditorView } from "@codemirror/view";
 import { useAi } from "../aiStore";
+import { editorBridge } from "../editorBridge";
 import { ChartView } from "./ChartView";
 import { OutputChip } from "./OutputChip";
 import { mentionInAi, outputLabel } from "../outputs";
@@ -117,6 +121,7 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
           <RunSummary run={run} />
         </div>
       </div>
+      {!showMessages && <TipsBar run={run} tabId={tabId} />}
       <div className="min-h-0 flex-1">
         {showMessages ? (
           <Messages run={run} />
@@ -139,6 +144,50 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
           <Messages run={run} />
         )}
       </div>
+    </div>
+  );
+}
+
+/** Suggestions for the statement shown, from its tables' indexes / partitions / cluster keys. */
+function TipsBar({ run, tabId }: { run: TabRun; tabId: string }) {
+  const [hidden, setHidden] = useState<string | null>(null);
+  const [open, setOpen] = useState(true);
+  const idx = run.activeIndex;
+  const tips = (run.tips?.tips ?? []).filter((t) => idx === null || t.statementIndex === idx);
+  if (!tips.length || hidden === run.jobId) return null;
+  const stmt = idx !== null ? run.statements[idx] : undefined;
+  const warn = tips.some((t) => t.level === "warn");
+  const show = (from: number, to: number) => {
+    const v = editorBridge.get(tabId);
+    if (!v || to > v.state.doc.length) return;
+    v.dispatch({ selection: { anchor: from, head: to }, effects: EditorView.scrollIntoView(from, { y: "center" }) });
+    v.focus();
+  };
+  return (
+    <div className={`shrink-0 border-b border-line text-[12px] ${warn ? "bg-warning/5" : "bg-accent/5"}`} role="region" aria-label="Query tips">
+      <div className="flex items-center gap-1.5 px-2 py-1">
+        <button className="flex items-center gap-1.5 font-medium" onClick={() => setOpen(!open)} aria-expanded={open}>
+          <Lightbulb size={13} className={warn ? "text-warning" : "text-accent"} />
+          {tips.length} tip{tips.length === 1 ? "" : "s"} to speed up this query
+          {stmt?.durationMs !== undefined && <span className="font-normal text-muted">· ran in {formatDuration(stmt.durationMs)}</span>}
+          {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        </button>
+        <button className="icon-btn ml-auto h-5 w-5" aria-label="Hide tips" title="Hide tips for this run" onClick={() => setHidden(run.jobId)}>
+          <X size={12} />
+        </button>
+      </div>
+      {open && (
+        <ul className="max-h-32 space-y-0.5 overflow-auto px-2 pb-1.5">
+          {tips.map((t, i) => (
+            <li key={i}>
+              <button className="flex w-full items-start gap-1.5 rounded px-1 py-0.5 text-left hover:bg-hover" onClick={() => show(t.from, t.to)} title="Show in the editor">
+                <span className={`mt-1 h-1.5 w-1.5 shrink-0 rounded-full ${t.level === "warn" ? "bg-warning" : "bg-accent"}`} />
+                <span className="min-w-0">{t.message}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

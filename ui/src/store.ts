@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { revealKeys, splitSchema, treeKey } from "./lib/catalog";
 import { api, isTauri, onAuthEvent, onJobEvent, toError } from "./lib/api";
+import { computeRunTips, type RunTips } from "./queryTips";
 import type {
   AuthEvent,
   Folder,
@@ -51,6 +52,9 @@ export interface TabRun {
   /** Index into `statements` of the result shown in the grid. */
   activeIndex: number | null;
   errorRange?: { from: number; to: number };
+  /** Suggestions to improve the query, computed after it ran. */
+  tips?: RunTips;
+  connectionId?: string;
 }
 
 export interface Toast {
@@ -181,6 +185,8 @@ interface State {
   handleJobEvent: (e: JobEvent) => void;
 
   refreshSavedQueries: () => Promise<void>;
+  /** Index / partition / cluster-key tips for a finished run. */
+  computeTips: (runKey: string, jobId: string) => Promise<void>;
   openSavedQuery: (q: SavedQuery) => void;
   saveTabQuery: (tabId: string) => Promise<void>;
   setSaveQueryDialog: (s: { open: boolean; tabId?: string }) => void;
@@ -712,6 +718,7 @@ export const useStore = create<State>((set, get) => ({
               startedAt: Date.now(),
               statements: resp.statements.map((p) => ({ plan: p, status: "pending", notices: [] })),
               activeIndex: null,
+              connectionId,
             },
           },
         }));
@@ -901,6 +908,7 @@ export const useStore = create<State>((set, get) => ({
           if (next.activeIndex === null && statements.length > 0) {
             next.activeIndex = statements.length - 1;
           }
+          if (e.status !== "cancelled") setTimeout(() => void get().computeTips(e.tab_id, e.job_id), 0);
           return {
             runs: { ...s.runs, [e.tab_id]: next },
             historyVersion: s.historyVersion + 1,
@@ -908,6 +916,24 @@ export const useStore = create<State>((set, get) => ({
       }
       return { runs: { ...s.runs, [e.tab_id]: next } };
     });
+  },
+
+  computeTips: async (runKey, jobId) => {
+    const run = get().runs[runKey];
+    if (!run || run.jobId !== jobId) return;
+    const connId = run.connectionId;
+    if (!connId) return;
+    const conn = get().connections.find((c) => c.id === connId);
+    try {
+      const tips = await computeRunTips(connId, conn?.config.kind, run.statements);
+      set((s) => {
+        const cur = s.runs[runKey];
+        if (!cur || cur.jobId !== jobId) return {};
+        return { runs: { ...s.runs, [runKey]: { ...cur, tips } } };
+      });
+    } catch {
+      // Tips are best effort.
+    }
   },
 
   refreshSavedQueries: async () => {

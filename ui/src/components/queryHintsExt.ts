@@ -1,14 +1,13 @@
-// Editor query hints: underline filters that defeat partitions / indexes /
-// cluster keys, and show a table's layout on hover. Layouts come from the
-// backend (`table_layout`) and are cached per connection for a few minutes.
+// Editor query tips: after a query runs, underline filters that defeat
+// partitions / indexes / cluster keys and show table layouts on hover (see
+// queryTips.ts). The layout cache below also feeds completion badges.
 import { StateEffect, StateField, type Extension } from "@codemirror/state";
-import { Decoration, EditorView, ViewPlugin, hoverTooltip, type DecorationSet, type ViewUpdate } from "@codemirror/view";
+import { Decoration, EditorView, ViewPlugin, hoverTooltip, type DecorationSet } from "@codemirror/view";
 import { api } from "../lib/api";
-import { analyzeStatement, layoutSummary, refsWithPos, type Hint, type LayoutRef, type RefAt } from "../lib/queryHints";
-import { blankLiterals, resolveTable } from "../lib/sqlComplete";
+import { layoutSummary } from "../lib/queryHints";
 import type { TableLayout } from "../lib/types";
+import type { RunTips } from "../queryTips";
 import { useStore } from "../store";
-import { canFetchMetadata, storeProvider } from "./sqlAssist";
 
 // ---- layout cache -------------------------------------------------------------
 
@@ -52,10 +51,13 @@ export function forgetLayouts(conn: string) {
   for (const k of [...cache.keys()]) if (k.startsWith(prefix)) cache.delete(k);
 }
 
-// ---- analysis -----------------------------------------------------------------
+// ---- run tips -------------------------------------------------------------------
 
-export interface DocHint extends Hint {
-  table?: string;
+export interface DocHint {
+  from: number;
+  to: number;
+  level: "warn" | "info";
+  message: string;
 }
 
 interface Analysis {
@@ -64,44 +66,16 @@ interface Analysis {
   tables: { from: number; to: number; title: string; layout: TableLayout }[];
 }
 
-const MAX_DOC = 100_000;
-
-/** Hints and layout cards for a whole document (exported for tests). */
-export async function analyze(doc: string, connId: string): Promise<Analysis> {
-  const out: Analysis = { hints: [], tables: [] };
-  const st = useStore.getState();
-  const conn = st.connections.find((c) => c.id === connId);
-  const p = storeProvider(connId);
-  if (!conn || !p || doc.length > MAX_DOC) return out;
-  // Only look up layouts when that doesn't open a sign-in prompt.
-  if (!canFetchMetadata(conn)) return out;
-  const clean = blankLiterals(doc);
-  let start = 0;
-  const stmts: [number, number][] = [];
-  for (let i = 0; i <= clean.length; i++) {
-    if (i === clean.length || clean[i] === ";") {
-      if (clean.slice(start, i).trim()) stmts.push([start, i]);
-      start = i + 1;
-    }
-  }
-  for (const [a, b] of stmts.slice(0, 50)) {
-    const text = doc.slice(a, b);
-    const refs = refsWithPos(text).filter((r) => !(p.kind === "duckdb" && r.parts[0]?.toLowerCase() === "results"));
-    const known: LayoutRef[] = [];
-    await Promise.all(
-      refs.map(async (ref: RefAt) => {
-        const t = await resolveTable(p, ref.parts);
-        if (!t) return;
-        const layout = await loadLayout(connId, t.schema, t.name);
-        if (!layout) return;
-        known.push({ ref, layout });
-        out.tables.push({ from: a + ref.from, to: a + ref.to, title: ref.parts.join("."), layout });
-      }),
-    );
-    known.sort((x, y) => x.ref.from - y.ref.from);
-    for (const h of analyzeStatement(text, known, p.kind)) out.hints.push({ ...h, from: a + h.from, to: a + h.to });
-  }
-  return out;
+/** Tips of the last run, limited to statements the editor still shows unchanged. */
+function tipsForView(view: EditorView, tips: RunTips | undefined): Analysis {
+  if (!tips) return { hints: [], tables: [] };
+  const doc = view.state.doc;
+  const intact = (pos: number) =>
+    tips.statements.some((st) => pos >= st.start && pos <= st.start + st.sql.length && st.start + st.sql.length <= doc.length && doc.sliceString(st.start, st.start + st.sql.length) === st.sql);
+  return {
+    hints: tips.tips.filter((t) => intact(t.from)).map((t) => ({ from: t.from, to: t.to, level: t.level, message: t.message })),
+    tables: tips.tables.filter((t) => intact(t.from)),
+  };
 }
 
 // ---- editor state -------------------------------------------------------------
@@ -132,52 +106,24 @@ const analysisField = StateField.define<{ a: Analysis; deco: DecorationSet }>({
   provide: (f) => EditorView.decorations.from(f, (v) => v.deco),
 });
 
-function hintPlugin(getConnId: () => string | null | undefined) {
+function hintPlugin(getKey: () => string | null | undefined) {
   return ViewPlugin.fromClass(
     class {
-      timer: ReturnType<typeof setTimeout> | undefined;
-      run = 0;
       unsub: () => void;
-      lastConn: string | undefined;
+      last: RunTips | undefined | null = null;
       constructor(readonly view: EditorView) {
-        this.schedule(50);
-        listeners.add(this.onLayout);
-        // Re-analyze when the editor's connection changes or (dis)connects.
-        const sig = () => {
-          const id = getConnId();
-          const c = id ? useStore.getState().connections.find((x) => x.id === id) : undefined;
-          return `${id}|${c?.connected}`;
+        // Tips arrive after a run finishes; a new run clears them.
+        const sync = () => {
+          const key = getKey();
+          const tips = key ? useStore.getState().runs[key]?.tips : undefined;
+          if (tips === this.last) return;
+          this.last = tips;
+          queueMicrotask(() => this.view.dispatch({ effects: setAnalysis.of(tipsForView(this.view, tips)) }));
         };
-        this.lastConn = sig();
-        this.unsub = useStore.subscribe(() => {
-          const s = sig();
-          if (s !== this.lastConn) {
-            this.lastConn = s;
-            this.schedule(100);
-          }
-        });
-      }
-      onLayout = () => this.schedule(100);
-      update(u: ViewUpdate) {
-        if (u.docChanged) this.schedule(600);
-      }
-      schedule(ms: number) {
-        clearTimeout(this.timer);
-        this.timer = setTimeout(() => void this.analyze(), ms);
-      }
-      async analyze() {
-        const id = getConnId();
-        const run = ++this.run;
-        const doc = this.view.state.doc.toString();
-        const a = id ? await analyze(doc, id) : { hints: [], tables: [] };
-        // Stale (the text changed meanwhile) or destroyed.
-        if (run !== this.run || this.view.state.doc.toString() !== doc) return;
-        this.view.dispatch({ effects: setAnalysis.of(a) });
+        this.unsub = useStore.subscribe(sync);
+        sync();
       }
       destroy() {
-        clearTimeout(this.timer);
-        this.run++;
-        listeners.delete(this.onLayout);
         this.unsub();
       }
     },
@@ -221,7 +167,11 @@ const hover = hoverTooltip(
   { hoverTime: 250 },
 );
 
-/** Query hints for the connection returned by `getConnId` (read on each analysis). */
-export function queryHints(getConnId: () => string | null | undefined): Extension {
-  return [analysisField, hintPlugin(getConnId), hover];
+/**
+ * Query tips in the editor of run key `getKey` (tab id or notebook cell key):
+ * after a run, filters that defeat partitions / indexes / cluster keys are
+ * underlined with the reason on hover, and table names show their layout.
+ */
+export function queryHints(getKey: () => string | null | undefined): Extension {
+  return [analysisField, hintPlugin(getKey), hover];
 }

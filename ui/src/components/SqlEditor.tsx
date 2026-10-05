@@ -102,8 +102,8 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
           closeBrackets(),
           // Keywords for the clause, the connection's tables and columns.
           sqlAssist(() => useStore.getState().tabs.find((x) => x.id === tabId)?.connection_id),
-          // Partition / index / cluster key hints (underlines + hover).
-          queryHints(() => useStore.getState().tabs.find((x) => x.id === tabId)?.connection_id),
+          // Tips after a run: partition / index / cluster key (underlines + hover).
+          queryHints(() => tabId),
           highlightActiveLine(),
           highlightSelectionMatches(),
           syntaxHighlighting(highlight),

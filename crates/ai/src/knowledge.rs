@@ -400,6 +400,27 @@ pub async fn check_note_target(engine: &QueryEngine, connection_id: &str, target
     })
 }
 
+/// Resolve a table reference as written in SQL (`orders`, `sales.orders`,
+/// `main.sales.orders`) to (schema id, table name): knowledge index first,
+/// then the live connection.
+pub async fn resolve_table(engine: &QueryEngine, connection_id: &str, path: &str) -> std::result::Result<Option<(String, String)>, String> {
+    if let Ok(Some(o)) = engine.workspace().kn_get(connection_id, path) {
+        return Ok(Some((o.schema, o.name)));
+    }
+    let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();
+    let Some(table) = parts.last() else { return Ok(None) };
+    let schema_written = parts[..parts.len() - 1].join(".").to_ascii_lowercase();
+    let hits = engine.search_objects(connection_id, table, 50).await.map_err(|e| e.message)?;
+    Ok(hits
+        .into_iter()
+        .filter(|o| o.kind.is_relation() && o.name.eq_ignore_ascii_case(table))
+        .find(|o| {
+            let s = o.schema.to_ascii_lowercase();
+            schema_written.is_empty() || s == schema_written || s.ends_with(&format!(".{schema_written}"))
+        })
+        .map(|o| (o.schema, o.name)))
+}
+
 /// `path` = `[catalog.]schema.table[.column]` or a bare `table`, looked up live.
 async fn resolve_live(engine: &QueryEngine, connection_id: &str, path: &str) -> std::result::Result<Option<String>, String> {
     let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();

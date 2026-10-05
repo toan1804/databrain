@@ -927,7 +927,7 @@ function CellEditor({
           bracketMatching(),
           closeBrackets(),
           sqlAssist(() => connRef.current),
-          queryHints(() => connRef.current),
+          queryHints(() => editorKey),
           highlightSelectionMatches(),
           syntaxHighlighting(highlight),
           placeholder("SQL…  ⌘↵ run · ⇧↵ run & next · ⌘I ask AI"),

@@ -331,6 +331,10 @@ async fn kn_save_note(state: State<'_, AppState>, note: databrain_workspace::KnN
     ai_api::save_note(&state, note).await
 }
 #[tauri::command]
+async fn hint_layouts(state: State<'_, AppState>, connection_id: String, tables: Vec<String>) -> R<Vec<ai_api::HintLayout>> {
+    ai_api::hint_layouts(&state, &connection_id, tables).await
+}
+#[tauri::command]
 async fn kn_check_target(state: State<'_, AppState>, connection_id: String, target: String) -> R<ai_api::TargetCheck> {
     Ok(ai_api::check_target(&state, &connection_id, &target).await)
 }
@@ -699,6 +703,7 @@ pub fn run() {
             kn_delete_note,
             kn_export_notes,
             kn_check_target,
+            hint_layouts,
             kn_read_notes_file,
             kn_import_notes,
             kn_clear,

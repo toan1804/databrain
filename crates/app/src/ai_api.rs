@@ -450,6 +450,40 @@ pub async fn save_note(state: &AppState, mut note: KnNote) -> Result<KnNote> {
     Ok(state.workspace.kn_save_note(note)?)
 }
 
+/// Layout of a table referenced by an executed query (for query tips).
+#[derive(Debug, Serialize)]
+pub struct HintLayout {
+    /// The reference as written (`sales.orders`).
+    pub written: String,
+    pub schema: Option<String>,
+    pub name: Option<String>,
+    pub layout: Option<databrain_connector_core::TableLayout>,
+    pub error: Option<String>,
+}
+
+/// Resolve the tables a query used and fetch their indexes / partitions /
+/// cluster keys. Errors are reported per table.
+pub async fn hint_layouts(state: &AppState, connection_id: &str, tables: Vec<String>) -> Result<Vec<HintLayout>> {
+    let mut out = Vec::new();
+    for written in tables.into_iter().take(30) {
+        let mut h = HintLayout { written: written.clone(), schema: None, name: None, layout: None, error: None };
+        match databrain_ai::knowledge::resolve_table(&state.engine, connection_id, &written).await {
+            Ok(Some((schema, name))) => {
+                match state.engine.table_layout(connection_id, &schema, &name).await {
+                    Ok(l) => h.layout = Some(l),
+                    Err(e) => h.error = Some(e.message),
+                }
+                h.schema = Some(schema);
+                h.name = Some(name);
+            }
+            Ok(None) => h.error = Some("table not found".into()),
+            Err(e) => h.error = Some(e),
+        }
+        out.push(h);
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Serialize)]
 pub struct TargetCheck {
     pub ok: bool,
