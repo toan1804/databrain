@@ -70,7 +70,7 @@ export function nameTerm(query: string): string {
   return parts[parts.length - 1] ?? "";
 }
 
-const isRelation = (k: ObjectKind) => k !== "function" && k !== "procedure" && k !== "sequence";
+const isRelation = (k: ObjectKind) => k !== "function" && k !== "procedure" && k !== "package" && k !== "sequence";
 
 /** Exact name, then prefix, then shorter names; de-duplicated and capped. */
 export function rankHits(query: string, hits: DbObject[], limit = 100): DbObject[] {
@@ -120,7 +120,7 @@ export function isRelationKind(kind: ObjectKind): boolean {
 }
 
 /** Explorer folders under a schema, in display order. */
-export const OBJECT_GROUPS = ["Tables", "Views", "Materialized views", "Functions", "Procedures", "Sequences", "Other"] as const;
+export const OBJECT_GROUPS = ["Tables", "Views", "Materialized views", "Functions", "Procedures", "Packages", "Sequences", "Other"] as const;
 export type ObjectGroupName = (typeof OBJECT_GROUPS)[number];
 
 export function groupOf(kind: ObjectKind): ObjectGroupName {
@@ -136,6 +136,8 @@ export function groupOf(kind: ObjectKind): ObjectGroupName {
       return "Functions";
     case "procedure":
       return "Procedures";
+    case "package":
+      return "Packages";
     case "sequence":
       return "Sequences";
     default:

@@ -427,6 +427,23 @@ pub async fn complete_tables(state: &AppState, id: &str, schema: Option<&str>, q
     Ok(hits)
 }
 
+/// Completion of functions/procedures/packages, local part (explorer and earlier lookups).
+pub fn complete_routines_local(state: &AppState, id: &str, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+    Ok(state.engine.workspace().meta_complete_routines(id, schema, query, limit.clamp(1, 500))?)
+}
+
+/// Completion of functions/procedures/packages, filtered on the server.
+pub async fn complete_routines(state: &AppState, id: &str, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+    let hits = state.engine.search_routines(id, schema, query, limit).await?;
+    let _ = state.engine.workspace().meta_add_objects(id, &hits);
+    Ok(hits)
+}
+
+/// Functions/procedures of an Oracle package (`pkg.` completion).
+pub async fn package_members(state: &AppState, id: &str, schema: &str, package: &str) -> Result<Vec<DbObject>> {
+    state.engine.package_members(id, schema, package).await
+}
+
 /// Column names of a table from the knowledge index (no network).
 pub fn complete_columns_local(state: &AppState, id: &str, schema: &str, name: &str) -> Result<Option<Vec<String>>> {
     Ok(state.engine.workspace().kn_column_names(id, schema, name)?)

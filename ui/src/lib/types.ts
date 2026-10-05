@@ -158,6 +158,7 @@ export type ObjectKind =
   | "foreign_table"
   | "function"
   | "procedure"
+  | "package"
   | "sequence"
   | "other";
 

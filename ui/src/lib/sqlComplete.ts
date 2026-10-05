@@ -22,11 +22,15 @@ export interface MetaProvider {
   columns(schema: string, table: string): Promise<string[] | undefined>;
   /** Key roles of a table's columns (`partition key`, `indexed`…), when known (no I/O). */
   columnRoles?(schema: string, table: string): Record<string, string> | undefined;
+  /** Functions/procedures/packages matching `typed`, in `schema` or anywhere useful (local + server). */
+  routines?(schema: string | null, typed: string): Promise<DbObject[]>;
+  /** Functions/procedures of a package (Oracle `pkg.`). */
+  packageMembers?(schema: string, pkg: string): Promise<DbObject[]>;
   /** Extra virtual tables, e.g. DuckDB `results.<output>`. */
   virtualTables?(): { schema: string; name: string; columns: string[] }[];
 }
 
-export type OptionType = "keyword" | "function" | "table" | "view" | "column" | "schema" | "catalog" | "alias";
+export type OptionType = "keyword" | "function" | "procedure" | "package" | "table" | "view" | "column" | "schema" | "catalog" | "alias";
 
 export interface SqlOption {
   label: string;
@@ -343,7 +347,7 @@ const MAX_TABLE_OPTIONS = 300;
 export function matchingRelations(objects: DbObject[], typed: string, limit: number): DbObject[] {
   const buckets: DbObject[][] = [[], [], []];
   for (const o of objects) {
-    if (o.kind === "function" || o.kind === "procedure" || o.kind === "sequence" || o.kind === "other") continue;
+    if (o.kind === "function" || o.kind === "procedure" || o.kind === "package" || o.kind === "sequence" || o.kind === "other") continue;
     const r = matchRank(o.name, typed);
     if (r >= 0) buckets[r].push(o);
   }
@@ -367,6 +371,83 @@ function tableOption(p: MetaProvider, o: DbObject, boost = 0): SqlOption {
     apply: tableApply(p, o),
     boost,
   };
+}
+
+// ------------------------------------------------------------------ aliases
+
+/** Words that can't be a table alias (`as`, `on`, `or`…). */
+const RESERVED_ALIAS = new Set([
+  "as", "at", "by", "do", "go", "if", "in", "is", "no", "of", "on", "or", "to", "all", "and", "any", "asc", "end", "for", "key", "not", "set",
+  "top", "use", "desc", "from", "full", "into", "join", "left", "like", "null", "only", "over", "right", "some", "then", "true", "union",
+  "user", "when", "with", "case", "cast", "else", "false", "group", "inner", "limit", "order", "outer", "table", "where", "select", "values",
+  ...NOT_ALIAS,
+]);
+
+/**
+ * Short alias for a table: the initials of its words (`customer_orders` →
+ * `co`, `OrderItems` → `oi`, `orders` → `o`), made unique among `taken`.
+ */
+export function makeAlias(name: string, taken: Iterable<string>): string {
+  const used = new Set([...taken].map((t) => t.toLowerCase()));
+  const words = name
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .split(/[^A-Za-z0-9]+/)
+    .filter((w) => /^[A-Za-z]/.test(w));
+  let base = words.map((w) => w[0]).join("").toLowerCase() || "t";
+  if (base.length > 4) base = base.slice(0, 4);
+  for (let n = 1; ; n++) {
+    const a = n === 1 ? base : `${base}${n}`;
+    if (!used.has(a) && !RESERVED_ALIAS.has(a)) return a;
+  }
+}
+
+/** Is the word being completed a FROM/JOIN item (where an alias belongs)? */
+function aliasPosition(before: string): boolean {
+  const toks = before.match(new RegExp(`${IDENT}|[(),;*=<>!+\\-/]|\\S`, "g")) ?? [];
+  const last = toks[toks.length - 1]?.toLowerCase();
+  if (last === "from" || last === "join") return true;
+  if (last !== ",") return false;
+  for (let j = toks.length - 2; j >= 0; j--) {
+    const t = toks[j].toLowerCase();
+    if (t === "from") return true;
+    if (TABLE_KEYWORDS.has(t) || EXPR_KEYWORDS.has(t) || t === "(" || t === ")") return false;
+  }
+  return false;
+}
+
+/** Something already follows the word (the rest of a name, or an alias). */
+function aliasFollows(after: string): boolean {
+  if (/^[\w$."`[]/.test(after)) return true;
+  const m = new RegExp(`^\\s+(?:as\\s+)?(${IDENT})`, "i").exec(after);
+  return !!m && !NOT_ALIAS.has(m[1].toLowerCase()) && !RESERVED_ALIAS.has(m[1].toLowerCase());
+}
+
+// ------------------------------------------------------------------ routines
+
+function routineOption(p: MetaProvider, o: DbObject, insert: string, boost = 0): SqlOption {
+  const def = defaultSchema(p.schemas());
+  const where = o.schema === def?.name ? undefined : o.schema;
+  if (o.kind === "package") return { label: o.name, type: "package", detail: where ? `${where} · package` : "package", apply: `${insert}.`, reopen: true, boost };
+  const type = o.kind === "procedure" ? "procedure" : "function";
+  return { label: o.name, type, detail: where ? `${where} · ${type}` : type, apply: `${insert}(`, boost };
+}
+
+/** Routine reference as inserted: schema-qualified, so it runs as is. */
+function routineApply(p: MetaProvider, o: DbObject): string {
+  return tableApply(p, o);
+}
+
+/** The package `path` names (`pkg` or `schema.pkg`), if any. */
+async function findPackage(p: MetaProvider, path: string[]): Promise<{ schema: string; name: string } | undefined> {
+  if (!p.packageMembers || path.length > 2) return undefined;
+  const name = path[path.length - 1].toLowerCase();
+  const schema = path.length === 2 ? findSchema(p, [path[0]])?.name ?? path[0] : null;
+  const isPkg = (o: DbObject) => o.kind === "package" && o.name.toLowerCase() === name && (!schema || o.schema.toLowerCase() === schema.toLowerCase());
+  const cached = (p.cachedNamed ? p.cachedNamed(name) : p.cachedObjects()).find(isPkg);
+  if (cached) return cached;
+  const def = defaultSchema(p.schemas());
+  const found = ((await p.routines?.(schema, path[path.length - 1])) ?? []).filter(isPkg);
+  return found.find((o) => o.schema === def?.name) ?? found[0];
 }
 
 // ------------------------------------------------------------------ entry point
@@ -408,6 +489,16 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
   const refs = tableRefs(stmt);
   const ctes = cteNames(stmt);
   const k = p.kind;
+  // Picking a table in FROM/JOIN also writes an alias (`public.orders o`),
+  // unless one is already there.
+  const withAlias = aliasPosition(clean.slice(s0, start)) && !aliasFollows(clean.slice(pos, pos + 200));
+  const taken = new Set<string>(ctes);
+  for (const r of refs) {
+    if (r.alias) taken.add(r.alias);
+    taken.add(r.parts[r.parts.length - 1]);
+  }
+  /** Add an alias to a table option inserted in FROM/JOIN. */
+  const aliased = (o: SqlOption, table: string): SqlOption => (withAlias ? { ...o, apply: `${o.apply ?? o.label} ${makeAlias(table, taken)}` } : o);
 
   // ---- dotted path: alias.col, schema.table, catalog.schema, results.x
   if (parts.length > 1) {
@@ -426,7 +517,7 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
     }
     // virtual schemas (DuckDB results.)
     for (const v of p.virtualTables?.() ?? []) {
-      if (path.length === 1 && v.schema.toLowerCase() === path[0].toLowerCase()) opts.push({ label: v.name, type: "table", detail: v.schema, apply: quoteIdent(k, v.name) });
+      if (path.length === 1 && v.schema.toLowerCase() === path[0].toLowerCase()) opts.push(aliased({ label: v.name, type: "table", detail: v.schema, apply: quoteIdent(k, v.name) }, v.name));
     }
     // catalog. → schemas
     if (threeLevel(k) && path.length === 1) {
@@ -436,12 +527,27 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
         }
       }
     }
-    // schema. → tables
+    // schema. → tables (and, outside FROM, functions/procedures/packages)
     const sc = findSchema(p, path);
     if (sc) {
       const objs = matchingRelations((await p.objects(sc.name, typed)) ?? [], typed, MAX_TABLE_OPTIONS);
       for (const o of objs) {
-        opts.push({ label: o.name, type: o.kind === "view" || o.kind === "materialized_view" ? "view" : "table", detail: schemaLabel(sc), apply: quoteIdent(k, o.name) });
+        opts.push(aliased({ label: o.name, type: o.kind === "view" || o.kind === "materialized_view" ? "view" : "table", detail: schemaLabel(sc), apply: quoteIdent(k, o.name) }, o.name));
+      }
+      if (ctx !== "table" && p.routines) {
+        for (const o of await p.routines(sc.name, typed)) {
+          if (o.schema.toLowerCase() === sc.name.toLowerCase() && (ctx !== "expr" || o.kind !== "procedure")) opts.push(routineOption(p, o, quoteIdent(k, o.name), -1));
+        }
+      }
+    }
+    // pkg. / schema.pkg. → the package's functions and procedures
+    if (ctx !== "table" && !opts.some((o) => o.type === "column")) {
+      const pkg = await findPackage(p, path);
+      if (pkg) {
+        for (const m of await p.packageMembers!(pkg.schema, pkg.name)) {
+          if (ctx === "expr" && m.kind === "procedure") continue; // not callable in SQL
+          opts.push({ label: m.name, type: m.kind === "procedure" ? "procedure" : "function", detail: pkg.name, apply: `${quoteIdent(k, m.name)}(` });
+        }
       }
     }
     // schema.table. (or catalog.schema.table.) → columns
@@ -458,18 +564,20 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
   const fns = [...FUNCTIONS, ...(DIALECT_FUNCTIONS[k] ?? [])];
   if (ctx === "start" || (stmtBefore.trim() === "" && !typed)) {
     opts.push(...kw(STATEMENT_START, typed, 5));
+    // Procedure calls: `BEGIN pkg.proc…`, `CALL proc(…)`, `EXEC proc`.
+    if (typed.length >= 2 && p.routines) for (const o of await p.routines(null, typed)) opts.push(routineOption(p, o, routineApply(p, o)));
   } else if (ctx === "table") {
     // Tables of the connection: cached first, then server search. On big
     // catalogs (10k+ tables) only names matching the typed text are turned
     // into options, best matches first.
     const def = defaultSchema(p.schemas());
     const cached = matchingRelations(p.cachedObjects(), typed, MAX_TABLE_OPTIONS);
-    for (const o of cached) opts.push(tableOption(p, o, o.schema === def?.name ? 3 : 1));
+    for (const o of cached) opts.push(aliased(tableOption(p, o, o.schema === def?.name ? 3 : 1), o.name));
     if (typed.length >= 1) {
-      for (const o of await p.searchTables(typed)) opts.push(tableOption(p, o, o.schema === def?.name ? 3 : 1));
+      for (const o of await p.searchTables(typed)) opts.push(aliased(tableOption(p, o, o.schema === def?.name ? 3 : 1), o.name));
     }
-    for (const c of ctes) opts.push({ label: c, type: "table", detail: "CTE", boost: 6 });
-    for (const v of p.virtualTables?.() ?? []) opts.push({ label: v.name, type: "table", detail: v.schema, apply: `${v.schema}.${quoteIdent(k, v.name)}` });
+    for (const c of ctes) opts.push(aliased({ label: c, type: "table", detail: "CTE", boost: 6 }, c));
+    for (const v of p.virtualTables?.() ?? []) opts.push(aliased({ label: v.name, type: "table", detail: v.schema, apply: `${v.schema}.${quoteIdent(k, v.name)}` }, v.name));
     // Namespaces to drill into.
     const schemas = p.schemas() ?? [];
     const cats = new Set<string>();
@@ -497,6 +605,10 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
       opts.push({ label: r.alias ?? r.parts[r.parts.length - 1], type: "alias", detail: r.alias ? r.parts.join(".") : "table", apply: `${quoteIdent(k, r.alias ?? r.parts[r.parts.length - 1])}.`, reopen: true, boost: 4 });
     });
     opts.push(...kw(fns, typed, 2, "function").map((f) => ({ ...f, apply: `${f.label}(` })));
+    // The connection's own functions and packages (procedures can't be used in SQL).
+    if (typed.length >= 1 && p.routines) {
+      for (const o of await p.routines(null, typed)) if (o.kind !== "procedure") opts.push(routineOption(p, o, routineApply(p, o), 1));
+    }
     opts.push(...kw(IN_EXPRESSION, typed, 1));
   }
   const ranked = filterRank(opts, typed);

@@ -393,6 +393,18 @@ async fn complete_tables(state: State<'_, AppState>, id: String, schema: Option<
     api::complete_tables(&state, &id, schema.as_deref(), &query, limit).await
 }
 #[tauri::command]
+fn complete_routines_local(state: State<'_, AppState>, id: String, schema: Option<String>, query: String, limit: usize) -> R<Vec<DbObject>> {
+    api::complete_routines_local(&state, &id, schema.as_deref(), &query, limit)
+}
+#[tauri::command]
+async fn complete_routines(state: State<'_, AppState>, id: String, schema: Option<String>, query: String, limit: usize) -> R<Vec<DbObject>> {
+    api::complete_routines(&state, &id, schema.as_deref(), &query, limit).await
+}
+#[tauri::command]
+async fn package_members(state: State<'_, AppState>, id: String, schema: String, package: String) -> R<Vec<DbObject>> {
+    api::package_members(&state, &id, &schema, &package).await
+}
+#[tauri::command]
 fn complete_columns_local(state: State<'_, AppState>, id: String, schema: String, name: String) -> R<Option<Vec<String>>> {
     api::complete_columns_local(&state, &id, &schema, &name)
 }
@@ -648,6 +660,9 @@ pub fn run() {
             complete_tables_local,
             complete_tables,
             complete_columns_local,
+            complete_routines_local,
+            complete_routines,
+            package_members,
             describe_object,
             table_layout,
             statement_at_cursor,

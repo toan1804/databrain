@@ -685,6 +685,27 @@ impl QueryEngine {
         .await
     }
 
+    /// Functions/procedures/packages matching `query` (editor completion).
+    pub async fn search_routines(&self, connection_id: &str, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let (schema, query) = (schema.map(str::to_string), query.to_string());
+        let limit = limit.clamp(1, 1000);
+        self.with_meta(connection_id, |s| {
+            let (schema, query) = (schema.clone(), query.clone());
+            async move { s.search_routines(schema.as_deref(), &query, limit).await }
+        })
+        .await
+    }
+
+    /// Functions/procedures of a package (Oracle).
+    pub async fn package_members(&self, connection_id: &str, schema: &str, package: &str) -> Result<Vec<DbObject>> {
+        let (schema, package) = (schema.to_string(), package.to_string());
+        self.with_meta(connection_id, |s| {
+            let (schema, package) = (schema.clone(), package.clone());
+            async move { s.package_members(&schema, &package).await }
+        })
+        .await
+    }
+
     /// Tables/views of one schema matching `query` (editor completion).
     pub async fn search_schema(&self, connection_id: &str, schema: &str, query: &str, limit: usize) -> Result<Vec<DbObject>> {
         let (schema, query) = (schema.to_string(), query.to_string());

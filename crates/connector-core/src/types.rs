@@ -311,11 +311,18 @@ pub enum ObjectKind {
     ForeignTable,
     Function,
     Procedure,
+    /// Oracle package (functions and procedures as `package.member`).
+    Package,
     Sequence,
     Other,
 }
 
 impl ObjectKind {
+    /// Things you call: functions, procedures, packages.
+    pub fn is_routine(self) -> bool {
+        matches!(self, ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Package)
+    }
+
     /// Tables and views (things with columns), as opposed to routines and sequences.
     pub fn is_relation(self) -> bool {
         matches!(self, ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView | ObjectKind::ForeignTable)

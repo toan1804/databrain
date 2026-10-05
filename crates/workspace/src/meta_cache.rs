@@ -43,7 +43,8 @@ impl Workspace {
              ON CONFLICT (connection_id, schema_name, name) DO UPDATE SET kind = excluded.kind, comment = excluded.comment, \
              row_estimate = coalesce(excluded.row_estimate, row_estimate), seen_at = excluded.seen_at",
         )?;
-        for o in objects.iter().filter(|o| o.kind.is_relation()) {
+        // Tables/views and routines (completion); sequences and others are not needed.
+        for o in objects.iter().filter(|o| o.kind.is_relation() || o.kind.is_routine()) {
             st.execute(params![connection_id, o.schema, o.name, kind_str(o.kind), o.comment, o.row_estimate, now])?;
         }
         Ok(())
@@ -87,7 +88,7 @@ impl Workspace {
             .lock()
             .query_row(
                 "SELECT schema_name, name FROM meta_objects \
-                 WHERE connection_id = ?1 AND lower(name) = lower(?2) AND kind NOT IN ('function', 'procedure', 'sequence', 'other') \
+                 WHERE connection_id = ?1 AND lower(name) = lower(?2) AND kind NOT IN ('function', 'procedure', 'package', 'sequence', 'other') \
                    AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR lower(schema_name) LIKE '%.' || lower(?3)) \
                  ORDER BY length(schema_name) LIMIT 1",
                 params![connection_id, name, schema],
@@ -107,6 +108,32 @@ impl Workspace {
         let Some((s, n)) = self.meta_get(connection_id, table)? else { return Ok(None) };
         let cols = self.meta_column_names(connection_id, &s, &n)?.unwrap_or_default();
         Ok(cols.into_iter().find(|c| c.eq_ignore_ascii_case(col)).map(|c| format!("{s}.{n}.{c}")))
+    }
+
+    /// Cached functions/procedures/packages whose name contains `query`, in
+    /// `schema` when given; prefix matches and short names first.
+    pub fn meta_complete_routines(&self, connection_id: &str, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let q = query.trim().to_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT schema_name, name, kind, comment FROM meta_objects \
+             WHERE connection_id = ?1 AND kind IN ('function', 'procedure', 'package') AND (?2 IS NULL OR lower(schema_name) = lower(?2)) \
+               AND lower(name) LIKE '%' || ?3 || '%' ESCAPE '\\' \
+             ORDER BY lower(name) NOT LIKE ?3 || '%' ESCAPE '\\', length(name), name LIMIT ?4",
+        )?;
+        let rows = st
+            .query_map(params![connection_id, schema, q, limit as i64], |r| {
+                let kind: String = r.get(2)?;
+                Ok(DbObject {
+                    schema: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: serde_json::from_value(serde_json::Value::String(kind)).unwrap_or(ObjectKind::Function),
+                    comment: r.get(3)?,
+                    row_estimate: None,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Number of cached objects of a connection.
@@ -134,7 +161,9 @@ mod tests {
     fn listings_replace_searches_add() {
         let ws = Workspace::open_in_memory().unwrap();
         ws.meta_put_schema("c", "s", &[o("s", "orders", ObjectKind::Table), o("s", "old", ObjectKind::Table), o("s", "f", ObjectKind::Function)]).unwrap();
-        assert_eq!(ws.meta_count("c").unwrap(), 2, "functions are not cached");
+        assert_eq!(ws.meta_count("c").unwrap(), 3, "tables and routines are cached");
+        // Routines are for routine completion only, never tables.
+        assert_eq!(ws.meta_complete_routines("c", None, "", 10).unwrap().iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["f"]);
         ws.meta_add_objects("c", &[o("t", "orders_archive", ObjectKind::View)]).unwrap();
         // A new listing of `s` drops tables that are gone, keeps other schemas.
         ws.meta_put_schema("c", "s", &[o("s", "orders", ObjectKind::Table)]).unwrap();

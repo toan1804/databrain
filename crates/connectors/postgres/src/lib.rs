@@ -495,6 +495,33 @@ impl Session for PgSession {
             .collect())
     }
 
+    /// One pg_proc query: the given schema, else every schema on the
+    /// search path (system schemas left out; their functions are keywords).
+    async fn search_routines(&self, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let term = databrain_connector_core::search_sql_term(query);
+        let rows = self
+            .client
+            .query(
+                "select distinct on (n.nspname, p.proname) n.nspname::text, p.proname::text, p.prokind::text \
+                 from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace \
+                 where p.prokind in ('f','p') and strpos(lower(p.proname), $1) > 0 \
+                   and case when $2::text is null then n.nspname = any(current_schemas(false)) else n.nspname = $2 end \
+                   and n.nspname not in ('pg_catalog','information_schema')",
+                &[&term, &schema],
+            )
+            .await
+            .map_err(|e| map_err(&e))?;
+        let mut objs: Vec<DbObject> = rows
+            .iter()
+            .map(|r| {
+                let kind = if r.get::<_, String>(2) == "p" { ObjectKind::Procedure } else { ObjectKind::Function };
+                DbObject { schema: r.get(0), name: r.get(1), kind, comment: None, row_estimate: None }
+            })
+            .collect();
+        databrain_connector_core::rank_matches(query, &mut objs, limit.clamp(1, 1000));
+        Ok(objs)
+    }
+
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {
         let rows = self
             .client
@@ -986,6 +1013,32 @@ mod tests {
         cfg.database = std::env::var("DATABRAIN_PG_DB").ok();
         let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_PG_PASSWORD").ok().map(secrecy::SecretString::from)));
         Some(PostgresConnector.connect(&cfg, creds).await.unwrap())
+    }
+
+    /// Live: routine completion (pg_proc): search path vs a given schema, procedures, ranking.
+    #[tokio::test]
+    async fn live_search_routines() {
+        let Some(s) = live_session().await else {
+            return eprintln!("skipping: DATABRAIN_PG_HOST not set");
+        };
+        for stmt in [
+            "drop schema if exists kb_r cascade",
+            "drop function if exists public.kb_total(int)",
+            "create schema kb_r",
+            "create function public.kb_total(x int) returns int language sql as 'select x * 2'",
+            "create function kb_r.kb_total_tax(x int) returns int language sql as 'select x'",
+            "create procedure kb_r.kb_refresh() language sql as 'select 1'",
+        ] {
+            s.execute(stmt, ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        }
+        let names = |v: Vec<DbObject>| v.into_iter().map(|o| format!("{}.{} {:?}", o.schema, o.name, o.kind)).collect::<Vec<_>>();
+        // No schema: the search path only (kb_r is not on it); no pg_catalog functions.
+        assert_eq!(names(s.search_routines(None, "KB_", 50).await.unwrap()), vec!["public.kb_total Function"]);
+        assert!(s.search_routines(None, "now", 50).await.unwrap().is_empty());
+        assert_eq!(names(s.search_routines(Some("kb_r"), "kb", 50).await.unwrap()), vec!["kb_r.kb_refresh Procedure", "kb_r.kb_total_tax Function"]);
+        for stmt in ["drop schema kb_r cascade", "drop function public.kb_total(int)"] {
+            s.execute(stmt, ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        }
     }
 
     /// Live: bulk metadata (one batch query) and schema fingerprints for incremental indexing.

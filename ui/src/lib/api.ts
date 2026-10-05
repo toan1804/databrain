@@ -124,6 +124,14 @@ export const api = {
   /** Completion: tables filtered on the server (one schema when given). */
   completeTables: (id: string, schema: string | null, query: string, limit: number) =>
     call<DbObject[]>("complete_tables", { id, schema, query, limit }),
+  /** Completion: functions/procedures/packages seen before (no network). */
+  completeRoutinesLocal: (id: string, schema: string | null, query: string, limit: number) =>
+    call<DbObject[]>("complete_routines_local", { id, schema, query, limit }),
+  /** Completion: functions/procedures/packages filtered on the server. */
+  completeRoutines: (id: string, schema: string | null, query: string, limit: number) =>
+    call<DbObject[]>("complete_routines", { id, schema, query, limit }),
+  /** Functions/procedures of an Oracle package. */
+  packageMembers: (id: string, schema: string, pkg: string) => call<DbObject[]>("package_members", { id, schema, package: pkg }),
   completeColumnsLocal: (id: string, schema: string, name: string) =>
     call<string[] | null>("complete_columns_local", { id, schema, name }),
   describeObject: (id: string, schema: string, name: string) =>

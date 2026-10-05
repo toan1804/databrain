@@ -44,7 +44,7 @@ export function NoteTargetInput({
   const tables = useMemo<TargetTable[]>(() => {
     const out: TargetTable[] = [...local];
     const add = (o: DbObject) => {
-      if (o.kind === "function" || o.kind === "procedure" || o.kind === "sequence" || o.kind === "other") return;
+      if (o.kind === "function" || o.kind === "procedure" || o.kind === "package" || o.kind === "sequence" || o.kind === "other") return;
       out.push({ schema: o.schema, name: o.name, columns: columnsCache[`${connId}|${o.schema}|${o.name}`]?.map((c) => c.name) });
     };
     for (const [k, list] of Object.entries(cached)) if (k.startsWith(`${connId}|`)) list.forEach(add);

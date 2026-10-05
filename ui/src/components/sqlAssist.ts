@@ -172,8 +172,28 @@ export function storeProvider(connId: string, onLate?: () => void): MetaProvider
     if (remote.value) return merge(localHits, remote.value);
     return merge(localHits, await withBudget(remote.p, [] as DbObject[], onLate));
   };
+  /** Routines: explorer-loaded, local cache, then the server (same budget as tables). */
+  const routines = async (schema: string | null, prefix: string): Promise<DbObject[]> => {
+    const q = prefix.toLowerCase();
+    const scope = `r|${connId}|${schema ?? "*"}`;
+    const loaded = cachedIndex(connId).all.filter(
+      (o) => (o.kind === "function" || o.kind === "procedure" || o.kind === "package") && (!schema || o.schema === schema) && o.name.toLowerCase().includes(q),
+    );
+    const local = await cached(`l|${scope}|${q}`, () => api.completeRoutinesLocal(connId, schema, prefix, SEARCH_LIMIT).catch(() => [] as DbObject[])).p;
+    if (!live) return merge(loaded, local);
+    const remote = cached(`${scope}|${q}`, () => api.completeRoutines(connId, schema, prefix, SEARCH_LIMIT).catch(() => [] as DbObject[]));
+    if (remote.value) return merge(loaded, local, remote.value);
+    return merge(loaded, local, await withBudget(remote.p, [] as DbObject[], onLate));
+  };
   return {
     kind: conn.config.kind,
+    routines,
+    packageMembers: (schema, pkg) => {
+      if (!live) return Promise.resolve([]);
+      const key = `pkg|${connId}|${schema}|${pkg}`;
+      const e = cached(key, () => api.packageMembers(connId, schema, pkg).catch(() => [] as DbObject[]));
+      return e.value ? Promise.resolve(e.value) : withBudget(e.p, [] as DbObject[], onLate);
+    },
     schemas: () => {
       const s = useStore.getState().schemas[connId];
       if (!s && live) once(`s|${connId}`, () => useStore.getState().loadSchemas(connId).then(() => onLate?.()));
@@ -230,6 +250,8 @@ export function storeProvider(connId: string, onLate?: () => void): MetaProvider
 const CM_TYPE: Record<SqlOption["type"], string> = {
   keyword: "keyword",
   function: "function",
+  procedure: "method",
+  package: "namespace",
   table: "class",
   view: "interface",
   column: "property",

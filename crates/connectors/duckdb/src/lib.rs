@@ -1001,6 +1001,10 @@ mod tests {
         assert_eq!(objs[0].kind, ObjectKind::Table, "tables first");
         // A macro with a table's name does not hide the table.
         assert_eq!(s.describe("memory.main", "t").await.unwrap().object.kind, ObjectKind::Table);
+        // Routine completion (default: the default schema's listing), routines only.
+        let r = s.search_routines(Some("memory.main"), "ADD", 10).await.unwrap();
+        assert_eq!(r.iter().map(|o| (o.name.as_str(), o.kind)).collect::<Vec<_>>(), vec![("add1", ObjectKind::Function)]);
+        assert!(s.search_routines(Some("memory.main"), "seq", 10).await.unwrap().is_empty(), "sequences are not routines");
     }
 
     #[tokio::test]

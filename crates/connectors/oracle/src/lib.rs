@@ -678,6 +678,7 @@ impl Session for OracleSession {
                     "VIEW" => ObjectKind::View,
                     "MATERIALIZED VIEW" => ObjectKind::MaterializedView,
                     "PROCEDURE" => ObjectKind::Procedure,
+                    "PACKAGE" => ObjectKind::Package,
                     "SEQUENCE" => ObjectKind::Sequence,
                     _ => ObjectKind::Function,
                 };
@@ -749,6 +750,7 @@ impl Session for OracleSession {
             ObjectKind::MaterializedView => "MATERIALIZED_VIEW",
             ObjectKind::Procedure => "PROCEDURE",
             ObjectKind::Function => "FUNCTION",
+            ObjectKind::Package => "PACKAGE",
             ObjectKind::Sequence => "SEQUENCE",
             _ => "TABLE",
         };
@@ -796,6 +798,68 @@ impl Session for OracleSession {
 
     /// Last DDL time and object count per owner (one aggregate over
     /// ALL_OBJECTS): ALTER, COMMENT, CREATE and DROP all change it.
+    /// One query over ALL_OBJECTS: the schema's (or the current schema's)
+    /// routines first, then other owners' (e.g. SYS's DBMS_OUTPUT, used
+    /// through public synonyms) when no schema was written.
+    async fn search_routines(&self, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        let q = query.trim().to_uppercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let rows = self
+            .query_named(
+                "select owner, object_name, object_type from ( \
+                   select owner, object_name, object_type from all_objects \
+                   where object_type in ('FUNCTION','PROCEDURE','PACKAGE') \
+                     and object_name like '%' || :q || '%' escape '\\' \
+                     and (owner = nvl(:owner, sys_context('USERENV','CURRENT_SCHEMA')) or :owner is null) \
+                   order by case when owner = nvl(:owner, sys_context('USERENV','CURRENT_SCHEMA')) then 0 else 1 end, \
+                            case when object_name like :q || '%' escape '\\' then 0 else 1 end, length(object_name), object_name, owner \
+                 ) where rownum <= :lim",
+                vec![("q", Some(q)), ("owner", schema.map(str::to_string)), ("lim", Some(limit.clamp(1, 1000).to_string()))],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let g = |i: usize| r.get(i).cloned().flatten();
+                let kind = match g(2)?.as_str() {
+                    "PROCEDURE" => ObjectKind::Procedure,
+                    "PACKAGE" => ObjectKind::Package,
+                    _ => ObjectKind::Function,
+                };
+                Some(DbObject { schema: g(0)?, name: g(1)?, kind, comment: None, row_estimate: None })
+            })
+            .collect())
+    }
+
+    /// Public functions/procedures of a package (overloads once). A member
+    /// with a return value (argument at position 0) is a function.
+    async fn package_members(&self, schema: &str, package: &str) -> Result<Vec<DbObject>> {
+        let rows = self
+            .query_named(
+                "select p.procedure_name, \
+                        max(case when exists (select 1 from all_arguments a where a.owner = p.owner and a.package_name = p.object_name \
+                                 and a.object_name = p.procedure_name and a.position = 0 and a.argument_name is null) then 1 else 0 end) \
+                 from all_procedures p \
+                 where p.owner = :owner and p.object_name = :pkg and p.procedure_name is not null \
+                 group by p.procedure_name order by p.procedure_name",
+                vec![("owner", Some(schema.to_string())), ("pkg", Some(package.to_string()))],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let name = r.first().cloned().flatten()?;
+                let function = r.get(1).cloned().flatten().as_deref() == Some("1");
+                Some(DbObject {
+                    schema: format!("{schema}.{package}"),
+                    name,
+                    kind: if function { ObjectKind::Function } else { ObjectKind::Procedure },
+                    comment: None,
+                    row_estimate: None,
+                })
+            })
+            .collect())
+    }
+
     async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         let rows = self
             .query_named(
@@ -1004,6 +1068,40 @@ mod tests {
         check_driver("instant_client").await;
     }
 
+    async fn run(s: &OracleSession, sql: &str) {
+        s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// Routine completion: standalone functions/procedures, packages and
+    /// their members (functions vs procedures), other owners' packages.
+    async fn check_routines(driver: &str) {
+        let Some(s) = live_session(driver, false).await else { return };
+        for ddl in [
+            "create or replace function db_fn_total(x number) return number is begin return x * 2; end;",
+            "create or replace procedure db_proc_log(m varchar2) is begin null; end;",
+            "create or replace package db_pkg_sales as function net(x number) return number; function net(x number, y number) return number; procedure refresh; end;",
+        ] {
+            run(&s, ddl).await;
+        }
+        let me = s.query_dynamic("select sys_context('USERENV','CURRENT_SCHEMA') from dual".into()).await.unwrap()[0][0].clone().unwrap();
+        let hits = s.search_routines(None, "db_", 50).await.unwrap();
+        let kinds: Vec<(String, ObjectKind)> = hits.iter().filter(|o| o.schema == me).map(|o| (o.name.clone(), o.kind)).collect();
+        for want in [("DB_FN_TOTAL", ObjectKind::Function), ("DB_PROC_LOG", ObjectKind::Procedure), ("DB_PKG_SALES", ObjectKind::Package)] {
+            assert!(kinds.contains(&(want.0.to_string(), want.1)), "{driver}: {want:?} in {kinds:?}");
+        }
+        assert!(s.search_routines(Some(&me), "PKG_SAL", 5).await.unwrap().iter().any(|o| o.name == "DB_PKG_SALES"));
+        // SYS packages used through public synonyms.
+        assert!(s.search_routines(None, "dbms_outp", 20).await.unwrap().iter().any(|o| o.name == "DBMS_OUTPUT" && o.kind == ObjectKind::Package), "{driver}");
+        let m = s.package_members(&me, "DB_PKG_SALES").await.unwrap();
+        let m: Vec<(&str, ObjectKind)> = m.iter().map(|o| (o.name.as_str(), o.kind)).collect();
+        assert_eq!(m, vec![("NET", ObjectKind::Function), ("REFRESH", ObjectKind::Procedure)], "{driver}: overloads once");
+        let sys = s.package_members("SYS", "DBMS_OUTPUT").await.unwrap();
+        assert!(sys.iter().any(|o| o.name == "PUT_LINE" && o.kind == ObjectKind::Procedure), "{driver}");
+        for d in ["drop function db_fn_total", "drop procedure db_proc_log", "drop package db_pkg_sales"] {
+            run(&s, d).await;
+        }
+    }
+
     /// A catalog query whose caller stops waiting (cancelled indexing) is
     /// stopped on the server, and the session answers the next query at once.
     async fn check_abandoned_catalog_query(driver: &str) {
@@ -1020,6 +1118,7 @@ mod tests {
 
     async fn check_driver(driver: &str) {
         check_abandoned_catalog_query(driver).await;
+        check_routines(driver).await;
         let Some(s) = live(driver).await else {
             eprintln!("skipping: DATABRAIN_ORACLE_HOST not set");
             return;

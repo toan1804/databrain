@@ -80,6 +80,19 @@ pub trait Session: Send + Sync {
         search_schema_by_listing(self, schema, query, limit).await
     }
 
+    /// Functions, procedures and packages whose name contains `query`, in
+    /// `schema` (or the default schema when `None`), best matches first
+    /// (editor completion). The default lists the schema; engines with a
+    /// routine catalog override it with one filtered query.
+    async fn search_routines(&self, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        search_routines_by_listing(self, schema, query, limit).await
+    }
+
+    /// Members (functions/procedures) of a package (Oracle). Empty elsewhere.
+    async fn package_members(&self, _schema: &str, _package: &str) -> Result<Vec<DbObject>> {
+        Ok(vec![])
+    }
+
     /// Objects and columns of several schemas, for the AI knowledge index.
     /// Engines with a catalog-wide information schema override this to use
     /// a couple of queries per catalog instead of two per schema. Errors for
@@ -279,12 +292,35 @@ pub async fn search_schema_by_listing<S: Session + ?Sized>(s: &S, schema: &str, 
     Ok(hits)
 }
 
+/// [`Session::search_routines`] by listing one schema (the given one, else the default).
+pub async fn search_routines_by_listing<S: Session + ?Sized>(s: &S, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+    let schema = match schema {
+        Some(sc) => sc.to_string(),
+        None => {
+            let all = s.list_schemas().await?;
+            match all.iter().find(|sc| sc.is_default).or(all.first()) {
+                Some(sc) => sc.name.clone(),
+                None => return Ok(vec![]),
+            }
+        }
+    };
+    let q = query.trim().to_lowercase();
+    let mut hits: Vec<DbObject> = s
+        .list_objects(&schema)
+        .await?
+        .into_iter()
+        .filter(|o| o.kind.is_routine() && (q.is_empty() || o.name.to_lowercase().contains(&q)))
+        .collect();
+    rank_matches(query, &mut hits, limit);
+    Ok(hits)
+}
+
 pub async fn search_by_listing<S: Session + ?Sized>(s: &S, query: &str, limit: usize) -> Result<Vec<DbObject>> {
     let mut hits = Vec::new();
     for sc in s.list_schemas().await? {
         let Ok(objs) = s.list_objects(&sc.name).await else { continue };
         hits.extend(objs.into_iter().filter(|o| {
-            !matches!(o.kind, ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Sequence)
+            !matches!(o.kind, ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Package | ObjectKind::Sequence)
                 && object_matches(query, &o.schema, &o.name)
         }));
         if hits.len() >= limit * 4 {
