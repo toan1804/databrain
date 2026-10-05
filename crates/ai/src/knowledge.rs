@@ -144,6 +144,14 @@ pub async fn index_connection_with(
     progress: Progress<'_>,
     cancel: &CancellationToken,
 ) -> Result<IndexReport> {
+    // Indexing's own connection session is closed however the run ends.
+    struct EndSession<'a>(&'a QueryEngine, &'a str);
+    impl Drop for EndSession<'_> {
+        fn drop(&mut self) {
+            self.0.end_index_session(self.1);
+        }
+    }
+    let _end = EndSession(engine, connection_id);
     let ws = engine.workspace().clone();
     let profile = ws.get_connection(connection_id)?;
     let wanted: Vec<String> = scope.map(<[String]>::to_vec).unwrap_or_else(|| profile.ai_policy.index_schemas.clone());

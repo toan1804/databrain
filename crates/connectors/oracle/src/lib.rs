@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod client;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -90,6 +91,32 @@ fn owner_list(owners: &[String]) -> String {
     owners.iter().map(|o| databrain_connector_core::quote_literal(o)).collect::<Vec<_>>().join(", ")
 }
 
+#[derive(Default)]
+struct CallState {
+    /// The caller stopped waiting.
+    abandoned: AtomicBool,
+    /// The statement holds the connection now.
+    running: AtomicBool,
+}
+
+struct BreakOnDrop {
+    conn: Arc<Connection>,
+    state: Arc<CallState>,
+    armed: bool,
+}
+
+impl Drop for BreakOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.state.abandoned.store(true, Ordering::SeqCst);
+        if self.state.running.load(Ordering::SeqCst) {
+            let _ = self.conn.break_execution();
+        }
+    }
+}
+
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(f).await.map_err(|e| ConnectorError::internal(e.to_string()))?
 }
@@ -121,6 +148,12 @@ impl Connector for OracleConnector {
     }
 
     async fn connect(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>> {
+        Ok(Box::new(open(cfg, creds).await?))
+    }
+}
+
+async fn open(cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<OracleSession> {
+    {
         let (user, password) = match creds.get().await? {
             Credential::Password { user, password } => (user, password.expose_secret().to_string()),
             _ => return Err(ConnectorError::config("Oracle requires user/password authentication")),
@@ -144,7 +177,7 @@ impl Connector for OracleConnector {
                 "read_only": cfg.read_only,
             }))
             .await?;
-            return Ok(Box::new(OracleSession { backend: Backend::Thin(a) }));
+            return Ok(OracleSession { backend: Backend::Thin(a) });
         }
         let cs = connect_string(cfg);
         let lib = cfg.opt("client_lib_dir").map(str::to_string);
@@ -162,7 +195,7 @@ impl Connector for OracleConnector {
             Ok(c)
         })
         .await?;
-        Ok(Box::new(OracleSession { backend: Backend::Thick { conn: Arc::new(conn), lock: Arc::new(Mutex::new(())) } }))
+        Ok(OracleSession { backend: Backend::Thick { conn: Arc::new(conn), lock: Arc::new(Mutex::new(())) } })
     }
 }
 
@@ -403,11 +436,25 @@ impl OracleSession {
             return Err(ConnectorError::internal("Instant Client call on a thin connection"));
         };
         let (conn, lock) = (conn.clone(), lock.clone());
-        blocking(move || {
+        // The blocking call can't be aborted. If the caller stops waiting,
+        // `BreakOnDrop` skips it when it hasn't started, or breaks the
+        // statement (OCIBreak → ORA-01013) when it is running, so the
+        // connection is free for the next caller.
+        let state = Arc::new(CallState::default());
+        let mut guard = BreakOnDrop { conn: conn.clone(), state: state.clone(), armed: true };
+        let r = blocking(move || {
             let _g = lock.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?;
-            f(&conn)
+            if state.abandoned.load(Ordering::SeqCst) {
+                return Err(ConnectorError::cancelled());
+            }
+            state.running.store(true, Ordering::SeqCst);
+            let r = f(&conn);
+            state.running.store(false, Ordering::SeqCst);
+            r
         })
-        .await
+        .await;
+        guard.armed = false; // finished: nothing to stop
+        r
     }
 
     async fn query_named(&self, sql: &'static str, params: Vec<(&'static str, Option<String>)>) -> Result<Vec<Vec<Option<String>>>> {
@@ -924,6 +971,10 @@ mod tests {
     }
 
     async fn live_with(driver: &str, read_only: bool) -> Option<Box<dyn Session>> {
+        Some(Box::new(live_session(driver, read_only).await?))
+    }
+
+    async fn live_session(driver: &str, read_only: bool) -> Option<OracleSession> {
         use databrain_auth::InlineCredentialSource;
         let host = std::env::var("DATABRAIN_ORACLE_HOST").ok()?;
         let user = std::env::var("DATABRAIN_ORACLE_USER").unwrap_or_else(|_| "system".into());
@@ -934,7 +985,7 @@ mod tests {
         cfg.options.insert("driver".into(), driver.into());
         cfg.read_only = read_only;
         let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_ORACLE_PASSWORD").ok().map(secrecy::SecretString::from)));
-        Some(OracleConnector.connect(&cfg, creds).await.unwrap())
+        Some(open(&cfg, creds).await.unwrap())
     }
 
     /// Live, thin driver (needs a built helper: `node scripts/build-oracle-agent.mjs --host`).
@@ -953,7 +1004,22 @@ mod tests {
         check_driver("instant_client").await;
     }
 
+    /// A catalog query whose caller stops waiting (cancelled indexing) is
+    /// stopped on the server, and the session answers the next query at once.
+    async fn check_abandoned_catalog_query(driver: &str) {
+        let Some(s) = live_session(driver, false).await else { return };
+        let slow = "select count(*) from all_objects a, all_objects b, all_objects c".to_string();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), s.query_dynamic(slow)).await;
+        assert!(r.is_err(), "the slow query should still be running");
+        let t = std::time::Instant::now();
+        let rows = tokio::time::timeout(std::time::Duration::from_secs(15), s.query_dynamic("select 'ok' from dual".into())).await.expect("session still busy");
+        assert_eq!(rows.unwrap()[0][0].as_deref(), Some("ok"), "{driver}");
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "{driver}: next query waited {:?}", t.elapsed());
+        eprintln!("{driver}: next catalog query answered {:?} after abandoning a slow one", t.elapsed());
+    }
+
     async fn check_driver(driver: &str) {
+        check_abandoned_catalog_query(driver).await;
         let Some(s) = live(driver).await else {
             eprintln!("skipping: DATABRAIN_ORACLE_HOST not set");
             return;

@@ -337,9 +337,17 @@ impl Agent {
     }
 
     /// A request with a single reply (`ok`, `rows`, `done`); errors mapped.
-    pub async fn call(&self, req: Json) -> Result<Json> {
+    ///
+    /// Cancel-safe: if the caller stops waiting (cancelled indexing, a
+    /// timeout), the helper is told to cancel the request, so the server
+    /// stops the statement and the session is free for the next request
+    /// instead of finishing a catalog query nobody reads.
+    pub async fn call(self: &Arc<Self>, req: Json) -> Result<Json> {
         let (id, mut r) = self.start(req).await?;
-        match Self::next(&mut r, id).await? {
+        let mut pending = CancelOnDrop { agent: Some(self.clone()), id };
+        let reply = Self::next(&mut r, id).await;
+        pending.agent = None; // answered (or the helper is gone)
+        match reply? {
             Frame::Json(j) if j["type"] == "error" => Err(reply_error(&j)),
             Frame::Json(j) => Ok(j),
             Frame::Batch { .. } => Err(dead("unexpected batch")),
@@ -351,13 +359,28 @@ impl Agent {
     }
 
     /// Catalog query: every cell as text.
-    pub async fn text(&self, sql: &str, binds: &[(&str, Option<String>)]) -> Result<Vec<Vec<Option<String>>>> {
+    pub async fn text(self: &Arc<Self>, sql: &str, binds: &[(&str, Option<String>)]) -> Result<Vec<Vec<Option<String>>>> {
         let b: serde_json::Map<String, Json> = binds.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
         let j = self.call(json!({"op": "text", "sql": sql, "binds": b})).await?;
         Ok(j["rows"]
             .as_array()
             .map(|rows| rows.iter().map(|r| r.as_array().map(|c| c.iter().map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default()).collect())
             .unwrap_or_default())
+    }
+}
+
+/// Sends a cancel for request `id` when dropped while still armed.
+struct CancelOnDrop {
+    agent: Option<Arc<Agent>>,
+    id: u64,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let (Some(a), Ok(rt)) = (self.agent.take(), tokio::runtime::Handle::try_current()) else { return };
+        let id = self.id;
+        // Its reply frames are skipped by the next request (`next`).
+        rt.spawn(async move { a.cancel(id).await });
     }
 }
 

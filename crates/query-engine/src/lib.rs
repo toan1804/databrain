@@ -295,6 +295,9 @@ struct JobHandle {
 type SessionKey = (String, String); // (connection_id, tab_id)
 
 const META_TAB: &str = "__meta__";
+/// AI indexing's own session (server databases): long catalog reads never
+/// make the explorer or completion wait, and cancelling can close it.
+const INDEX_TAB: &str = "__index__";
 /// Connection option marking the "Results (DuckDB)" connection.
 pub const RESULTS_MARKER: &str = "databrain_results";
 
@@ -613,16 +616,41 @@ impl QueryEngine {
         F: Fn(Arc<dyn Session>) -> Fut,
         Fut: std::future::Future<Output = databrain_connector_core::Result<T>>,
     {
-        let s = self.session(connection_id, META_TAB).await?;
+        self.with_tab(connection_id, META_TAB, f).await
+    }
+
+    async fn with_tab<T, F, Fut>(&self, connection_id: &str, tab: &str, f: F) -> Result<T>
+    where
+        F: Fn(Arc<dyn Session>) -> Fut,
+        Fut: std::future::Future<Output = databrain_connector_core::Result<T>>,
+    {
+        let s = self.session(connection_id, tab).await?;
         match f(s).await {
             Ok(v) => Ok(v),
             Err(e) if e.kind == ErrorKind::Connection => {
                 // Stale connection: reconnect once.
-                self.drop_session(connection_id, META_TAB);
-                let s = self.session(connection_id, META_TAB).await?;
+                self.drop_session(connection_id, tab);
+                let s = self.session(connection_id, tab).await?;
                 Ok(f(s).await?)
             }
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Session used by AI indexing: its own for server databases; local
+    /// files (SQLite, DuckDB) share the metadata session (one handle per file).
+    fn index_tab(&self, connection_id: &str) -> &'static str {
+        match self.workspace.get_connection(connection_id).map(|p| p.config.kind) {
+            Ok(databrain_connector_core::ConnectorKind::Sqlite | databrain_connector_core::ConnectorKind::Duckdb) | Err(_) => META_TAB,
+            Ok(_) => INDEX_TAB,
+        }
+    }
+
+    /// Close indexing's session (after a run or a cancel). Dropping it ends
+    /// the server session, which also stops a statement still running there.
+    pub fn end_index_session(&self, connection_id: &str) {
+        if self.index_tab(connection_id) == INDEX_TAB {
+            self.drop_session(connection_id, INDEX_TAB);
         }
     }
 
@@ -670,7 +698,7 @@ impl QueryEngine {
 
     pub async fn bulk_metadata(&self, connection_id: &str, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
         let schemas = schemas.to_vec();
-        self.with_meta(connection_id, |s| {
+        self.with_tab(connection_id, self.index_tab(connection_id), |s| {
             let schemas = schemas.clone();
             async move { s.bulk_metadata(&schemas).await }
         })
@@ -678,7 +706,7 @@ impl QueryEngine {
     }
 
     pub async fn schema_fingerprints(&self, connection_id: &str) -> Result<Option<std::collections::HashMap<String, String>>> {
-        self.with_meta(connection_id, |s| async move { s.schema_fingerprints().await }).await
+        self.with_tab(connection_id, self.index_tab(connection_id), |s| async move { s.schema_fingerprints().await }).await
     }
 
     pub async fn schema_object_counts(&self, connection_id: &str) -> Result<Option<std::collections::HashMap<String, usize>>> {
