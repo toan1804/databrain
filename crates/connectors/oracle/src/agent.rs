@@ -78,8 +78,27 @@ fn sha256_hex(b: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(b))
 }
 
-/// An installed helper, if any: `DATABRAIN_ORACLE_AGENT`, the download
-/// folder, then (debug builds) `target/oracle-agent/` of the source tree.
+/// The helper built from this source tree (`node scripts/build-oracle-agent.mjs`,
+/// run by `tauri dev` / `tauri build` when Go is installed), if present and
+/// matching SHA256SUMS. Found in debug and release builds made from the tree.
+pub fn built_from_source() -> Option<PathBuf> {
+    let file = file_name();
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/oracle-agent").join(&file);
+    if !p.is_file() {
+        return None;
+    }
+    // A stale build (other source than the sums) is not used in release builds.
+    if !cfg!(debug_assertions) {
+        let want = expected_sha256(&file)?;
+        if sha256_hex(&std::fs::read(&p).ok()?) != want {
+            return None;
+        }
+    }
+    Some(p)
+}
+
+/// An installed helper, if any: `DATABRAIN_ORACLE_AGENT`, the one built
+/// from this source tree, then the download folder.
 pub fn installed() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("DATABRAIN_ORACLE_AGENT") {
         let p = PathBuf::from(p);
@@ -87,20 +106,13 @@ pub fn installed() -> Option<PathBuf> {
             return Some(p);
         }
     }
+    if let Some(p) = built_from_source() {
+        return Some(p);
+    }
     let file = file_name();
-    if let Some(d) = DIR.read().unwrap().clone() {
-        let p = d.join(RELEASE).join(&file);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if cfg!(debug_assertions) {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/oracle-agent").join(&file);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
+    let d = DIR.read().unwrap().clone()?;
+    let p = d.join(RELEASE).join(&file);
+    p.is_file().then_some(p)
 }
 
 static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -429,6 +441,19 @@ mod tests {
         assert_eq!(p, tmp.join(RELEASE).join(file_name()));
         drop(Agent::spawn(&p).await.unwrap());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The helper built from the source tree is used without downloading
+    /// (debug and release builds), and only when it matches SHA256SUMS in release.
+    #[tokio::test]
+    async fn uses_helper_built_from_source() {
+        let Some(p) = built_from_source() else {
+            return eprintln!("skipping: run `node scripts/build-oracle-agent.mjs --host` first");
+        };
+        assert_eq!(installed().as_deref(), Some(p.as_path()));
+        set_dir(None); // no download folder: ensure() must not need one
+        assert_eq!(ensure().await.unwrap(), p);
+        drop(Agent::spawn(&p).await.unwrap());
     }
 
     #[test]
