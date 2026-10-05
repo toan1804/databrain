@@ -18,6 +18,9 @@
   --success: #16a34a;
   --warning: #d97706;
   --selection: rgba(99, 102, 241, 0.18);
+  /* Editor selection: solid enough to read the selected text on (focused / not focused). */
+  --editor-selection: #c7cbfa;
+  --editor-selection-blur: #dfe1ea;
   --caret: #4f46e5;
   --syn-keyword: #7c3aed;
   --syn-string: #15803d;
@@ -43,11 +46,13 @@
   --success: #4ade80;
   --warning: #fbbf24;
   --selection: rgba(129, 140, 248, 0.22);
+  --editor-selection: #2c3466;
+  --editor-selection-blur: #262833;
   --caret: #f5f6ff;
   --syn-keyword: #c4b5fd;
   --syn-string: #86efac;
   --syn-number: #fdba74;
-  --syn-comment: #6b7080;
+  --syn-comment: #8a8fa0;
   --syn-type: #67e8f9;
   --syn-fn: #93c5fd;
   --syn-ident: #fcd34d;
@@ -96,6 +101,34 @@ select {
 
 ::selection {
   background: var(--selection);
+}
+
+/* Native controls (select popups, datalist suggestions, scrollbars, date
+   pickers) follow the theme; without this WebKit draws them light, or with
+   dark text on a dark box. */
+:root {
+  color-scheme: light;
+}
+.dark {
+  color-scheme: dark;
+}
+select option,
+select optgroup {
+  background-color: var(--panel);
+  color: var(--text);
+}
+
+/* Editor selection. CodeMirror draws it as a layer (drawSelection) with
+   its light-theme grey by default, which made white text unreadable in dark
+   mode. Selected text keeps its syntax colors on a solid background. */
+.cm-editor .cm-selectionLayer .cm-selectionBackground {
+  background: var(--editor-selection-blur) !important;
+}
+.cm-editor.cm-focused .cm-selectionLayer .cm-selectionBackground {
+  background: var(--editor-selection) !important;
+}
+.cm-editor .cm-content ::selection {
+  background: transparent !important; /* the layer above shows it */
 }
 
 * {
