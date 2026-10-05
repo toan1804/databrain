@@ -699,6 +699,48 @@ impl Session for PgSession {
         })
     }
 
+    /// One catalog aggregate for every schema: relations (oid, row version,
+    /// size class), columns, constraints and comments. Any DDL creates new
+    /// catalog row versions (xmin), so the value changes.
+    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let rows = self
+            .client
+            .query(
+                "with rel as ( \
+                   select c.relnamespace ns, count(*) n, \
+                          sum(hashtext(c.oid::text || ':' || c.xmin::text || ':' || c.relname || ':' || \
+                                       floor(log(greatest(c.reltuples, 1)::numeric))::text)) h \
+                   from pg_catalog.pg_class c where c.relkind in ('r','p','v','m','f') and not c.relispartition group by 1), \
+                 att as ( \
+                   select c.relnamespace ns, sum(hashtext(a.attrelid::text || ':' || a.attnum || ':' || a.xmin::text)) h \
+                   from pg_catalog.pg_attribute a join pg_catalog.pg_class c on c.oid = a.attrelid \
+                   where c.relkind in ('r','p','v','m','f') and not c.relispartition and a.attnum > 0 group by 1), \
+                 con as ( \
+                   select c.relnamespace ns, sum(hashtext(k.oid::text || ':' || k.xmin::text)) h \
+                   from pg_catalog.pg_constraint k join pg_catalog.pg_class c on c.oid = k.conrelid group by 1), \
+                 des as ( \
+                   select c.relnamespace ns, sum(hashtext(d.objoid::text || ':' || d.objsubid || ':' || md5(d.description))) h \
+                   from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid \
+                   where d.classoid = 'pg_catalog.pg_class'::regclass group by 1) \
+                 select n.nspname::text, concat_ws('/', coalesce(rel.n, 0), rel.h, att.h, con.h, des.h) \
+                 from pg_catalog.pg_namespace n \
+                 left join rel on rel.ns = n.oid left join att on att.ns = n.oid \
+                 left join con on con.ns = n.oid left join des on des.ns = n.oid",
+                &[],
+            )
+            .await
+            .map_err(|e| map_err(&e))?;
+        Ok(Some(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))).collect()))
+    }
+
+    async fn bulk_metadata(&self, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
+        match self.bulk_metadata_batched(schemas).await {
+            Ok(m) => Ok(m),
+            // E.g. no privilege on one catalog view: schema by schema reports per-schema errors.
+            Err(_) => databrain_connector_core::default_bulk_metadata(self, schemas).await,
+        }
+    }
+
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
         let rows = self
             .client
@@ -743,6 +785,99 @@ impl Session for PgSession {
 }
 
 impl PgSession {
+    /// Three catalog queries for the whole batch of schemas (objects,
+    /// columns, foreign keys), instead of three per schema.
+    async fn bulk_metadata_batched(&self, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
+        let names: Vec<String> = schemas.to_vec();
+        let objects = self
+            .client
+            .query(
+                "select n.nspname::text, c.relname::text, c.relkind::text, d.description, c.reltuples::float8 \
+                 from pg_catalog.pg_class c \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 left join pg_catalog.pg_description d on d.objoid = c.oid and d.classoid = 'pg_catalog.pg_class'::regclass and d.objsubid = 0 \
+                 where n.nspname::text = any($1::text[]) and c.relkind in ('r','p','v','m','f') and not c.relispartition \
+                 order by 1, 2",
+                &[&names],
+            )
+            .await
+            .map_err(|e| map_err(&e))?
+            .iter()
+            .map(|r| {
+                let est: Option<f64> = r.get(4);
+                DbObject {
+                    schema: r.get(0),
+                    name: r.get(1),
+                    kind: match r.get::<_, String>(2).as_str() {
+                        "v" => ObjectKind::View,
+                        "m" => ObjectKind::MaterializedView,
+                        "f" => ObjectKind::ForeignTable,
+                        _ => ObjectKind::Table,
+                    },
+                    comment: r.get(3),
+                    row_estimate: est.filter(|e| *e >= 0.0).map(|e| e as i64),
+                }
+            })
+            .collect();
+        let columns = self
+            .client
+            .query(
+                "select n.nspname::text, c.relname::text, a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                        not a.attnotnull, coalesce(a.attnum = any(i.indkey), false), d.description \
+                 from pg_catalog.pg_attribute a \
+                 join pg_catalog.pg_class c on c.oid = a.attrelid \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 left join pg_catalog.pg_index i on i.indrelid = a.attrelid and i.indisprimary \
+                 left join pg_catalog.pg_description d on d.objoid = a.attrelid and d.classoid = 'pg_catalog.pg_class'::regclass and d.objsubid = a.attnum \
+                 where n.nspname::text = any($1::text[]) and c.relkind in ('r','p','v','m','f') and not c.relispartition \
+                   and a.attnum > 0 and not a.attisdropped \
+                 order by 1, 2, a.attnum",
+                &[&names],
+            )
+            .await
+            .map_err(|e| map_err(&e))?
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, String>(1),
+                    ColumnInfo { name: r.get(2), data_type: r.get(3), nullable: r.get(4), is_primary_key: r.get(5), default: None, comment: r.get(6) },
+                )
+            })
+            .collect();
+        let fks = self.foreign_keys_in(&names, None).await?;
+        Ok(databrain_connector_core::assemble_metadata(schemas, objects, columns, fks))
+    }
+
+    /// Foreign keys of the tables of several schemas: (schema, table, key).
+    async fn foreign_keys_in(&self, schemas: &[String], table: Option<&str>) -> Result<Vec<(String, String, ForeignKey)>> {
+        let rows = self
+            .client
+            .query(
+                "select n.nspname::text, c.relname::text, \
+                        array(select a.attname::text from unnest(k.conkey) with ordinality u(n, o) \
+                              join pg_catalog.pg_attribute a on a.attrelid = k.conrelid and a.attnum = u.n order by u.o), \
+                        rn.nspname::text, rc.relname::text, \
+                        array(select a.attname::text from unnest(k.confkey) with ordinality u(n, o) \
+                              join pg_catalog.pg_attribute a on a.attrelid = k.confrelid and a.attnum = u.n order by u.o) \
+                 from pg_catalog.pg_constraint k \
+                 join pg_catalog.pg_class c on c.oid = k.conrelid \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 join pg_catalog.pg_class rc on rc.oid = k.confrelid \
+                 join pg_catalog.pg_namespace rn on rn.oid = rc.relnamespace \
+                 where k.contype = 'f' and n.nspname::text = any($1::text[]) and ($2::text is null or c.relname = $2)",
+                &[&schemas, &table],
+            )
+            .await
+            .map_err(|e| map_err(&e))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (r.get::<_, String>(0), r.get::<_, String>(1), ForeignKey { columns: r.get(2), ref_schema: r.get(3), ref_table: r.get(4), ref_columns: r.get(5) })
+            })
+            .collect())
+    }
+
     /// Foreign keys of one table (or all tables of the schema).
     async fn foreign_keys(&self, schema: &str, table: Option<&str>) -> Result<Vec<(String, ForeignKey)>> {
         let rows = self
@@ -841,6 +976,69 @@ mod tests {
         );
     }
 
+    async fn live_session() -> Option<Box<dyn Session>> {
+        let host = std::env::var("DATABRAIN_PG_HOST").ok()?;
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        let user = std::env::var("DATABRAIN_PG_USER").unwrap_or_else(|_| "postgres".into());
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: user.clone() });
+        cfg.host = Some(host);
+        cfg.port = std::env::var("DATABRAIN_PG_PORT").ok().and_then(|p| p.parse().ok());
+        cfg.database = std::env::var("DATABRAIN_PG_DB").ok();
+        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_PG_PASSWORD").ok().map(secrecy::SecretString::from)));
+        Some(PostgresConnector.connect(&cfg, creds).await.unwrap())
+    }
+
+    /// Live: bulk metadata (one batch query) and schema fingerprints for incremental indexing.
+    #[tokio::test]
+    async fn live_bulk_metadata_and_fingerprints() {
+        let Some(s) = live_session().await else {
+            eprintln!("skipping: DATABRAIN_PG_HOST not set");
+            return;
+        };
+        let run = |sql: &'static str| async {
+            for stmt in sql.split(';').map(str::trim).filter(|x| !x.is_empty()) {
+                s.execute(stmt, ExecOptions::default()).await.unwrap().collect().await.unwrap();
+            }
+        };
+        run("drop schema if exists kb_a cascade; drop schema if exists kb_b cascade; drop schema if exists kb_c cascade").await;
+        run("create schema kb_a; create schema kb_b; create schema kb_c; \
+             create table kb_a.customers (id int primary key, email text); comment on column kb_a.customers.email is 'login'; \
+             comment on table kb_a.customers is 'People'; \
+             create table kb_b.orders (id int primary key, customer_id int references kb_a.customers(id), total numeric(10,2)); \
+             create view kb_b.big_orders as select * from kb_b.orders where total > 100; \
+             create table kb_c.untouched (x int)").await;
+        let m = s.bulk_metadata(&["kb_a".into(), "kb_b".into()]).await.unwrap();
+        assert_eq!(m[0].objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["customers"]);
+        assert_eq!(m[0].objects[0].comment.as_deref(), Some("People"));
+        let cust = &m[0].columns[0];
+        assert!(cust.columns[0].is_primary_key && cust.columns[1].comment.as_deref() == Some("login"));
+        let orders = m[1].columns.iter().find(|t| t.table == "orders").unwrap();
+        assert_eq!(orders.columns.iter().map(|c| c.data_type.as_str()).collect::<Vec<_>>(), vec!["integer", "integer", "numeric(10,2)"]);
+        assert_eq!((orders.foreign_keys[0].ref_schema.as_str(), orders.foreign_keys[0].ref_table.as_str()), ("kb_a", "customers"));
+        assert!(m[1].objects.iter().any(|o| o.name == "big_orders" && o.kind == ObjectKind::View));
+        // Same result as the per-schema path.
+        assert_eq!(s.schema_columns("kb_b").await.unwrap().iter().find(|t| t.table == "orders").unwrap(), orders);
+
+        let fp = |m: &std::collections::HashMap<String, String>, k: &str| m.get(k).cloned().unwrap();
+        let f0 = s.schema_fingerprints().await.unwrap().unwrap();
+        assert_eq!(f0, s.schema_fingerprints().await.unwrap().unwrap(), "stable without changes");
+        run("alter table kb_a.customers add column name text").await;
+        let f1 = s.schema_fingerprints().await.unwrap().unwrap();
+        assert_ne!(fp(&f0, "kb_a"), fp(&f1, "kb_a"), "new column");
+        assert_eq!(fp(&f0, "kb_c"), fp(&f1, "kb_c"), "other schemas unchanged");
+        run("comment on column kb_b.orders.total is 'gross'").await;
+        let f2 = s.schema_fingerprints().await.unwrap().unwrap();
+        assert_ne!(fp(&f1, "kb_b"), fp(&f2, "kb_b"), "comment");
+        run("alter table kb_b.orders rename column total to amount").await;
+        let f3 = s.schema_fingerprints().await.unwrap().unwrap();
+        assert_ne!(fp(&f2, "kb_b"), fp(&f3, "kb_b"), "renamed column");
+        run("drop view kb_b.big_orders").await;
+        assert_ne!(fp(&f3, "kb_b"), fp(&s.schema_fingerprints().await.unwrap().unwrap(), "kb_b"), "dropped view");
+        run("insert into kb_c.untouched values (1); analyze kb_c.untouched").await;
+        assert_eq!(fp(&f3, "kb_c"), fp(&s.schema_fingerprints().await.unwrap().unwrap(), "kb_c"), "data changes are not schema changes");
+        run("drop schema kb_a cascade; drop schema kb_b cascade; drop schema kb_c cascade").await;
+    }
+
     /// Runs against a live server when `DATABRAIN_PG_URL`-style env vars are set:
     /// DATABRAIN_PG_HOST, DATABRAIN_PG_USER, DATABRAIN_PG_PASSWORD, DATABRAIN_PG_DB.
     #[tokio::test]
@@ -854,6 +1052,7 @@ mod tests {
         let pw = std::env::var("DATABRAIN_PG_PASSWORD").ok();
         let mut cfg = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: user.clone() });
         cfg.host = Some(host);
+        cfg.port = std::env::var("DATABRAIN_PG_PORT").ok().and_then(|p| p.parse().ok());
         cfg.database = std::env::var("DATABRAIN_PG_DB").ok();
         let creds = Arc::new(InlineCredentialSource::new(
             AuthMethod::Password { user },

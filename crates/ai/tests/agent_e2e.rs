@@ -580,6 +580,28 @@ async fn knowledge_index_plan_scope_and_cancel() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "one batch + final");
     assert_eq!(plan(&engine, &conn).await.unwrap().batch, 100);
 
+    // Incremental: nothing changed → no schema is re-read.
+    let calls = AtomicUsize::new(0);
+    let r = index_connection(&engine, &conn, Some(&all), &|_, _, _| { calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }, &Default::default()).await.unwrap();
+    assert_eq!((r.objects, r.skipped, r.changed), (60, 60, 0));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "no batch, final only");
+    // One table altered → only its schema is re-read.
+    let alter = RunRequest { connection_id: conn.clone(), tab_id: "setup".into(), sql: "alter table s07.t07 add column email varchar".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None };
+    // Each DuckDB session opens the file on its own (one writer at a time).
+    engine.disconnect(&conn);
+    engine.run_and_wait(&f.hub, alter, None).await.unwrap();
+    engine.disconnect(&conn);
+    let r = index_connection(&engine, &conn, Some(&all), &|_, _, _| {}, &Default::default()).await.unwrap();
+    assert_eq!((r.objects, r.skipped, r.changed), (60, 59, 1));
+    assert!(f.ws.kn_get(&conn, "lake.s07.t07").unwrap().unwrap().columns.iter().any(|c| c.name == "email"));
+    // Full rebuild ignores fingerprints.
+    let r = databrain_ai::knowledge::index_connection_with(&engine, &conn, Some(&all), true, &|_, _, _| {}, &Default::default()).await.unwrap();
+    assert_eq!((r.objects, r.skipped), (60, 0));
+    // Clearing the index forgets fingerprints too.
+    f.ws.kn_clear(&conn).unwrap();
+    let r = index_connection(&engine, &conn, Some(&all), &|_, _, _| {}, &Default::default()).await.unwrap();
+    assert_eq!((r.objects, r.skipped), (60, 0));
+
     // Already cancelled before start.
     let done = tokio_util::sync::CancellationToken::new();
     done.cancel();

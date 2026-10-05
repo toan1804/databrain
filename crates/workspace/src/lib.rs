@@ -498,6 +498,16 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (connection_id, schema_name, table_name)
     );
     "#,
+    // v7: per-schema fingerprints for incremental AI indexing
+    r#"
+    CREATE TABLE kn_schema_state (
+        connection_id TEXT NOT NULL,
+        schema_name   TEXT NOT NULL,
+        fingerprint   TEXT NOT NULL,
+        indexed_at    INTEGER NOT NULL,
+        PRIMARY KEY (connection_id, schema_name)
+    );
+    "#,
 ];
 
 /// Maximum history rows kept; older rows are pruned on insert.
@@ -616,6 +626,7 @@ impl Workspace {
         tx.execute("DELETE FROM kn_notes WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM kn_state WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM meta_objects WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM kn_schema_state WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1", [id])?;
         tx.execute("UPDATE tabs SET connection_id = NULL WHERE connection_id = ?1", [id])?;
         tx.commit()?;

@@ -427,6 +427,28 @@ impl Workspace {
         Ok(delta)
     }
 
+    /// Fingerprints of the schemas as last indexed (see `Session::schema_fingerprints`).
+    pub fn kn_fingerprints(&self, connection_id: &str) -> Result<std::collections::HashMap<String, String>> {
+        let c = self.conn.lock();
+        let mut stmt = c.prepare("SELECT schema_name, fingerprint FROM kn_schema_state WHERE connection_id = ?1")?;
+        let rows = stmt.query_map([connection_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Record (or forget, with `None`) the fingerprint a schema was indexed at.
+    pub fn kn_set_fingerprint(&self, connection_id: &str, schema: &str, fingerprint: Option<&str>) -> Result<()> {
+        let c = self.conn.lock();
+        match fingerprint {
+            Some(f) => c.execute(
+                "INSERT INTO kn_schema_state (connection_id, schema_name, fingerprint, indexed_at) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(connection_id, schema_name) DO UPDATE SET fingerprint = excluded.fingerprint, indexed_at = excluded.indexed_at",
+                params![connection_id, schema, f, now_ms()],
+            )?,
+            None => c.execute("DELETE FROM kn_schema_state WHERE connection_id = ?1 AND schema_name = ?2", params![connection_id, schema])?,
+        };
+        Ok(())
+    }
+
     /// Remove indexed schemas that no longer exist / are excluded.
     pub fn kn_retain_schemas(&self, connection_id: &str, schemas: &[String]) -> Result<usize> {
         let current: Vec<String> = {
@@ -438,6 +460,10 @@ impl Workspace {
         for s in current.iter().filter(|s| !schemas.contains(s)) {
             removed += self.kn_replace_schema(connection_id, s, &[])?.removed;
         }
+        self.conn.lock().execute(
+            "DELETE FROM kn_schema_state WHERE connection_id = ?1 AND schema_name NOT IN (SELECT value FROM json_each(?2))",
+            params![connection_id, serde_json::to_string(schemas)?],
+        )?;
         Ok(removed)
     }
 
@@ -467,6 +493,16 @@ impl Workspace {
             },
         )
         .optional()?)
+    }
+
+    /// Number of indexed objects in the given schemas.
+    pub fn kn_objects_in(&self, connection_id: &str, schemas: &[String]) -> Result<usize> {
+        let n: i64 = self.conn.lock().query_row(
+            "SELECT count(*) FROM kn_objects WHERE connection_id = ?1 AND schema_name IN (SELECT value FROM json_each(?2))",
+            params![connection_id, serde_json::to_string(schemas)?],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     pub fn kn_count(&self, connection_id: &str) -> Result<i64> {
@@ -591,6 +627,7 @@ impl Workspace {
         c.execute("DELETE FROM kn_objects WHERE connection_id = ?1", [connection_id])?;
         c.execute("DELETE FROM kn_fts WHERE connection_id = ?1 AND source = 'object'", [connection_id])?;
         c.execute("DELETE FROM kn_state WHERE connection_id = ?1", [connection_id])?;
+        c.execute("DELETE FROM kn_schema_state WHERE connection_id = ?1", [connection_id])?;
         Ok(())
     }
 

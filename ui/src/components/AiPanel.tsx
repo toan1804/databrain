@@ -781,9 +781,24 @@ function Knowledge() {
               >
                 <ListChecks size={12} /> Scope…
               </button>
-              <button className="btn-ghost border border-line py-1" disabled={!connId} onClick={() => connId && void indexKnowledge(connId)}>
-                <RefreshCw size={12} /> {data?.state ? "Re-index" : "Index"}
+              <button
+                className="btn-ghost border border-line py-1"
+                disabled={!connId}
+                title={data?.state ? "Re-read schemas whose tables or columns changed since the last run" : "Index tables and columns for the AI"}
+                onClick={() => connId && void indexKnowledge(connId)}
+              >
+                <RefreshCw size={12} /> {data?.state ? "Update" : "Index"}
               </button>
+              {data?.state && (
+                <button
+                  className="btn-ghost border border-line py-1"
+                  disabled={!connId}
+                  title="Re-read every schema, changed or not"
+                  onClick={() => connId && void indexKnowledge(connId, { full: true })}
+                >
+                  Rebuild
+                </button>
+              )}
             </>
           )}
         </div>

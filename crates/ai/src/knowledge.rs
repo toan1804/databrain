@@ -2,7 +2,7 @@
 //! store and retrieving the most relevant tables (BM25 + foreign-key
 //! expansion) rendered as compact DDL for prompts.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use databrain_query_engine::QueryEngine;
@@ -22,6 +22,10 @@ pub struct IndexReport {
     pub errors: Vec<String>,
     /// Stopped by the user; schemas indexed before that are kept.
     pub cancelled: bool,
+    /// Schemas not re-read because their definitions did not change since
+    /// the last run (engines with schema fingerprints: Postgres, Oracle).
+    #[serde(default)]
+    pub skipped: usize,
 }
 
 /// Progress callback: (schema, done, total).
@@ -127,6 +131,19 @@ pub async fn index_connection(
     progress: Progress<'_>,
     cancel: &CancellationToken,
 ) -> Result<IndexReport> {
+    index_connection_with(engine, connection_id, scope, false, progress, cancel).await
+}
+
+/// [`index_connection`]; `full` re-reads every schema even when its
+/// fingerprint says nothing changed.
+pub async fn index_connection_with(
+    engine: &Arc<QueryEngine>,
+    connection_id: &str,
+    scope: Option<&[String]>,
+    full: bool,
+    progress: Progress<'_>,
+    cancel: &CancellationToken,
+) -> Result<IndexReport> {
     let ws = engine.workspace().clone();
     let profile = ws.get_connection(connection_id)?;
     let wanted: Vec<String> = scope.map(<[String]>::to_vec).unwrap_or_else(|| profile.ai_policy.index_schemas.clone());
@@ -139,10 +156,31 @@ pub async fn index_connection(
         .map(|s| s.name)
         .filter(|s| if wanted.is_empty() || wanted.iter().all(|w| w.trim() == "*") { !system_schema(s) } else { scope_matches(&wanted, s) })
         .collect();
-    let mut report = IndexReport { schemas: schemas.len(), objects: 0, changed: 0, removed: 0, errors: vec![], cancelled: false };
-    let batch_size = (profile.ai_policy.index_batch as usize).clamp(1, MAX_BATCH);
+    let mut report = IndexReport { schemas: schemas.len(), objects: 0, changed: 0, removed: 0, errors: vec![], cancelled: false, skipped: 0 };
+    // Incremental: one catalog query tells which schemas changed since the
+    // last run; unchanged ones are not fetched again.
+    let current: HashMap<String, String> = tokio::select! {
+        r = engine.schema_fingerprints(connection_id) => r.ok().flatten().unwrap_or_default(),
+        _ = cancel.cancelled() => return Err(AiError::Cancelled),
+    };
+    let stored = if full { HashMap::new() } else { ws.kn_fingerprints(connection_id)? };
+    let indexed_before: HashSet<String> = ws.kn_state(connection_id)?.map(|s| s.schemas.into_iter().collect()).unwrap_or_default();
     let mut done: Vec<String> = Vec::new();
-    for batch in schemas.chunks(batch_size) {
+    let mut todo: Vec<String> = Vec::new();
+    for s in &schemas {
+        match (current.get(s), stored.get(s)) {
+            (Some(now), Some(then)) if now == then && indexed_before.contains(s) => {
+                report.skipped += 1;
+                done.push(s.clone());
+            }
+            _ => todo.push(s.clone()),
+        }
+    }
+    if report.skipped > 0 {
+        report.objects += ws.kn_objects_in(connection_id, &done)?;
+    }
+    let batch_size = (profile.ai_policy.index_batch as usize).clamp(1, MAX_BATCH);
+    for batch in todo.chunks(batch_size) {
         if cancel.is_cancelled() {
             report.cancelled = true;
             break;
@@ -187,6 +225,9 @@ pub async fn index_connection(
             let d = ws.kn_replace_schema(connection_id, &m.schema, &items)?;
             report.changed += d.changed;
             report.removed += d.removed;
+            // Fingerprint taken before the fetch: a change during the run is picked up next time.
+            let fp = if m.error.is_none() { current.get(&m.schema).map(String::as_str) } else { None };
+            ws.kn_set_fingerprint(connection_id, &m.schema, fp)?;
             done.push(m.schema);
         }
     }

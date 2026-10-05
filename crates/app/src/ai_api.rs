@@ -376,7 +376,9 @@ pub async fn knowledge_plan(state: &AppState, connection_id: &str) -> Result<dat
 ///
 /// `scope` (schema ids, `catalog.*`, or `*`) limits the run; it is saved as
 /// the connection's `ai_policy.index_schemas` so re-indexing uses it.
-pub fn index_knowledge(state: &AppState, connection_id: &str, scope: Option<Vec<String>>, batch: Option<u32>) -> Result<()> {
+/// Index in the background. Only schemas whose definitions changed since the
+/// last run are re-read, unless `full`.
+pub fn index_knowledge(state: &AppState, connection_id: &str, scope: Option<Vec<String>>, batch: Option<u32>, full: bool) -> Result<()> {
     if scope.is_some() || batch.is_some() {
         let mut p = state.workspace.get_connection(connection_id)?;
         if let Some(sc) = &scope {
@@ -410,7 +412,7 @@ pub fn index_knowledge(state: &AppState, connection_id: &str, scope: Option<Vec<
         let progress = move |schema: &str, done: usize, total: usize| {
             ui2.emit(KNOWLEDGE_EVENT, json!({"type": "progress", "connection_id": c2, "schema": schema, "done": done, "total": total}));
         };
-        let r = databrain_ai::knowledge::index_connection(&engine, &cid, None, &progress, &cancel).await;
+        let r = databrain_ai::knowledge::index_connection_with(&engine, &cid, None, full, &progress, &cancel).await;
         {
             let mut m = runs.lock();
             if m.get(&cid).is_some_and(|(r, _)| *r == run) {

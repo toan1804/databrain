@@ -677,6 +677,10 @@ impl QueryEngine {
         .await
     }
 
+    pub async fn schema_fingerprints(&self, connection_id: &str) -> Result<Option<std::collections::HashMap<String, String>>> {
+        self.with_meta(connection_id, |s| async move { s.schema_fingerprints().await }).await
+    }
+
     pub async fn schema_object_counts(&self, connection_id: &str) -> Result<Option<std::collections::HashMap<String, usize>>> {
         self.with_meta(connection_id, |s| async move { s.schema_object_counts().await }).await
     }

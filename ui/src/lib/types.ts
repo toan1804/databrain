@@ -735,7 +735,7 @@ export type KnowledgeEvent =
   | {
       type: "finished";
       connection_id: string;
-      report: { schemas: number; objects: number; changed: number; removed: number; errors: string[]; cancelled: boolean };
+      report: { schemas: number; objects: number; changed: number; removed: number; errors: string[]; cancelled: boolean; skipped?: number };
     }
   | { type: "cancelled"; connection_id: string }
   | { type: "failed"; connection_id: string; error: string };

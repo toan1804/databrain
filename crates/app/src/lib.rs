@@ -252,8 +252,8 @@ async fn kn_get(state: State<'_, AppState>, connection_id: String) -> R<ai_api::
     ai_api::knowledge(&state, &connection_id)
 }
 #[tauri::command]
-async fn kn_index(state: State<'_, AppState>, connection_id: String, scope: Option<Vec<String>>, batch: Option<u32>) -> R<()> {
-    ai_api::index_knowledge(&state, &connection_id, scope, batch)
+async fn kn_index(state: State<'_, AppState>, connection_id: String, scope: Option<Vec<String>>, batch: Option<u32>, full: Option<bool>) -> R<()> {
+    ai_api::index_knowledge(&state, &connection_id, scope, batch, full.unwrap_or(false))
 }
 #[tauri::command]
 async fn drop_output(state: State<'_, AppState>, reference: String) -> R<databrain_query_engine::outputs::OutputInfo> {

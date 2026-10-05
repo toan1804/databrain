@@ -209,8 +209,9 @@ export const api = {
   setCredentialStore: (kind: CredentialStoreKind) => call<MigrationReport>("set_credential_store", { kind }),
   knPlan: (connectionId: string) => call<IndexPlan>("kn_plan", { connectionId }),
   knCancel: (connectionId: string) => call<boolean>("kn_cancel", { connectionId }),
-  knIndex: (connectionId: string, scope?: string[] | null, batch?: number | null) =>
-    call<void>("kn_index", { connectionId, scope: scope ?? null, batch: batch ?? null }),
+  /** Index in the background; unchanged schemas are skipped unless `full`. */
+  knIndex: (connectionId: string, scope?: string[] | null, batch?: number | null, full = false) =>
+    call<void>("kn_index", { connectionId, scope: scope ?? null, batch: batch ?? null, full }),
   knClear: (connectionId: string) => call<void>("kn_clear", { connectionId }),
   knSaveNote: (note: KnNote) => call<KnNote>("kn_save_note", { note }),
   knDeleteNote: (id: string) => call<void>("kn_delete_note", { id }),

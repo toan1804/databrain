@@ -773,6 +773,21 @@ impl Session for DuckSession {
             .collect())
     }
 
+    /// Hash of every column definition and comment per schema (local
+    /// catalogs: cheap). `results` outputs are left out (always re-read).
+    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let rows = self
+            .strings(
+                "select database_name || '.' || schema_name, \
+                        md5(string_agg(table_name || ':' || column_name || ':' || data_type || ':' || coalesce(comment, ''), ',' order by table_name, column_index)) \
+                 from duckdb_columns() where not internal and database_name <> 'results' group by 1"
+                    .into(),
+                vec![],
+            )
+            .await?;
+        Ok(Some(rows.into_iter().filter_map(|r| Some((r[0].clone()?, r[1].clone()?))).collect()))
+    }
+
     async fn schema_object_counts(&self) -> Result<Option<std::collections::HashMap<String, usize>>> {
         let rows = self
             .strings(

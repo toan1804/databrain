@@ -88,6 +88,14 @@ pub trait Session: Send + Sync {
         default_bulk_metadata(self, schemas).await
     }
 
+    /// A cheap fingerprint of each schema's table/column definitions (schema
+    /// id → opaque text), computed in one catalog query. When a schema's
+    /// fingerprint is unchanged since the last index run its metadata is not
+    /// fetched again. `None` = not supported (every schema is re-read).
+    async fn schema_fingerprints(&self) -> Result<Option<HashMap<String, String>>> {
+        Ok(None)
+    }
+
     /// Number of tables/views per schema id, when the engine can count them
     /// in one cheap query (used to size the knowledge index before running it).
     async fn schema_object_counts(&self) -> Result<Option<HashMap<String, usize>>> {
@@ -199,6 +207,46 @@ pub fn truthy(v: &Option<String>) -> bool {
 }
 
 /// Per-schema metadata (the default for [`Session::bulk_metadata`]).
+/// Group flat catalog rows (from one multi-schema query each) into
+/// [`SchemaMetadata`] per requested schema. Linear time, whatever the size.
+pub fn assemble_metadata(
+    schemas: &[String],
+    objects: Vec<DbObject>,
+    columns: Vec<(String, String, ColumnInfo)>,
+    foreign_keys: Vec<(String, String, ForeignKey)>,
+) -> Vec<SchemaMetadata> {
+    let mut out: Vec<SchemaMetadata> = schemas.iter().map(|s| SchemaMetadata { schema: s.clone(), objects: vec![], columns: vec![], error: None }).collect();
+    let pos: HashMap<&str, usize> = schemas.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+    let mut tables: HashMap<(usize, String), usize> = HashMap::new();
+    for o in objects {
+        if let Some(&i) = pos.get(o.schema.as_str()) {
+            out[i].objects.push(o);
+        }
+    }
+    let mut cols: Vec<Vec<TableColumns>> = vec![Vec::new(); schemas.len()];
+    for (schema, table, c) in columns {
+        let Some(&i) = pos.get(schema.as_str()) else { continue };
+        let k = (i, table);
+        match tables.get(&k) {
+            Some(&j) => cols[i][j].columns.push(c),
+            None => {
+                tables.insert(k.clone(), cols[i].len());
+                cols[i].push(TableColumns { table: k.1, columns: vec![c], foreign_keys: vec![] });
+            }
+        }
+    }
+    for (schema, table, fk) in foreign_keys {
+        let Some(&i) = pos.get(schema.as_str()) else { continue };
+        if let Some(&j) = tables.get(&(i, table)) {
+            cols[i][j].foreign_keys.push(fk);
+        }
+    }
+    for (m, c) in out.iter_mut().zip(cols) {
+        m.columns = c;
+    }
+    out
+}
+
 pub async fn default_bulk_metadata<S: Session + ?Sized>(s: &S, schemas: &[String]) -> Result<Vec<SchemaMetadata>> {
     let mut out = Vec::with_capacity(schemas.len());
     for sc in schemas {
@@ -302,4 +350,26 @@ pub fn quote_path(kind: ConnectorKind, path: &str) -> String {
 /// Quote a string literal with single quotes.
 pub fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assembles_flat_rows_per_schema() {
+        let col = |n: &str| ColumnInfo { name: n.into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None };
+        let obj = |s: &str, n: &str| DbObject { schema: s.into(), name: n.into(), kind: ObjectKind::Table, comment: None, row_estimate: None };
+        let fk = ForeignKey { columns: vec!["a_id".into()], ref_schema: "a".into(), ref_table: "t".into(), ref_columns: vec!["id".into()] };
+        let m = assemble_metadata(
+            &["a".into(), "b".into(), "empty".into()],
+            vec![obj("a", "t"), obj("b", "u"), obj("zz", "ignored")],
+            vec![("a".into(), "t".into(), col("id")), ("b".into(), "u".into(), col("x")), ("a".into(), "t".into(), col("name")), ("b".into(), "u".into(), col("a_id"))],
+            vec![("b".into(), "u".into(), fk.clone()), ("b".into(), "missing".into(), fk.clone())],
+        );
+        assert_eq!(m.iter().map(|s| s.schema.as_str()).collect::<Vec<_>>(), vec!["a", "b", "empty"]);
+        assert_eq!(m[0].columns[0].columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["id", "name"], "non-adjacent rows still grouped, in order");
+        assert_eq!(m[1].columns[0].foreign_keys, vec![fk]);
+        assert!(m[2].objects.is_empty() && m[2].columns.is_empty() && m[2].error.is_none());
+    }
 }
