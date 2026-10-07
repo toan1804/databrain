@@ -1,8 +1,0 @@
-# Project-wide Cargo settings (apply on every machine that builds this repo).
-
-[env]
-# rustc can overflow its stack while expanding `tauri::generate_handler!`
-# for the ~75 app commands (deeply nested async futures), especially on
-# Windows (1 MB default main-thread stack) or Linux with a low `ulimit -s`.
-# rustc reads RUST_MIN_STACK for its worker threads; 64 MiB is ample.
-RUST_MIN_STACK = "67108864"
