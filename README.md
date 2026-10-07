@@ -52,7 +52,7 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
   - Runs don't ask for confirmation, also on production connections (the load panel warns about those); read-only connections are refused. `:name` parameters are not filled in for job steps.
 - **Outputs:** every result gets a handle (`r12`), and you can also give it a name (`revenue`).
   - Query outputs together with DuckDB as `results.<name>`, including joins across databases (Postgres × Snowflake × CSV…).
-  - A rerun keeps the previous version as `revenue__1`. Compare versions (rows added, removed or changed) and chart any output.
+  - A rerun keeps the previous version as `revenue__1`. Compare versions or any two outputs (rows added, removed or changed) and chart any output. Columns are matched by name (also ignoring case); in the compare dialog each column of the after output has a list to pick its before column (`a` ↔ `a1`, `b` ↔ `b2`, …), to override an automatic match or to leave it out, and several pairs can be typed at once (`a = a1, b = b2`, `r1.a -> r2.a1`).
   - @mention outputs to the AI.
   - Pin outputs to keep them across restarts (saved as Parquet in the app-data `outputs/` folder).
   - History links to each output. Capped outputs warn when they are queried.

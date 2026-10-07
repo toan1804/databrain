@@ -829,6 +829,12 @@ fn decimal_type<'a>(cols: impl Iterator<Item = &'a dyn Array>) -> DataType {
 /// first (`extra`, e.g. `val_dt` ↔ `value_date`), then equal names, then
 /// names equal ignoring case (`test` ↔ `Test`). Each column is used once.
 pub fn column_pairs(before: &OutputInfo, after: &OutputInfo, extra: &[(String, String)]) -> Result<Vec<(String, String)>> {
+    column_pairs_with(before, after, extra, true)
+}
+
+/// [`column_pairs`]; with `auto` false only the `extra` pairs are used (the
+/// user chose every pair, including leaving some columns out).
+pub fn column_pairs_with(before: &OutputInfo, after: &OutputInfo, extra: &[(String, String)], auto: bool) -> Result<Vec<(String, String)>> {
     let bnames: Vec<&str> = before.columns.iter().map(|c| c.name.as_str()).collect();
     let anames: Vec<&str> = after.columns.iter().map(|c| c.name.as_str()).collect();
     let mut used_b: HashSet<String> = HashSet::new();
@@ -848,7 +854,7 @@ pub fn column_pairs(before: &OutputInfo, after: &OutputInfo, extra: &[(String, S
         used_a.insert(ac.clone());
         pairs.push((bc.clone(), ac.clone()));
     }
-    for exact in [true, false] {
+    for exact in [true, false].into_iter().filter(|_| auto) {
         for ac in &anames {
             if used_a.contains(*ac) {
                 continue;
@@ -874,8 +880,13 @@ pub fn diff_sql(before: &OutputInfo, after: &OutputInfo, keys: &[String]) -> Res
 /// are renamed to the after-side names; `keys` use after-side names (or the
 /// before-side name of a pair, or any case).
 pub fn diff_sql_mapped(before: &OutputInfo, after: &OutputInfo, keys: &[String], extra: &[(String, String)]) -> Result<String> {
+    diff_sql_with(before, after, keys, extra, true)
+}
+
+/// [`diff_sql_mapped`]; `auto` false: compare only the given pairs.
+pub fn diff_sql_with(before: &OutputInfo, after: &OutputInfo, keys: &[String], extra: &[(String, String)], auto: bool) -> Result<String> {
     let q = |s: &str| q_min(s);
-    let pairs = column_pairs(before, after, extra)?;
+    let pairs = column_pairs_with(before, after, extra, auto)?;
     if pairs.is_empty() {
         return Err(EngineError::new("invalid", format!("{} and {} have no matching columns; match some columns by hand", before.handle, after.handle)));
     }
@@ -958,6 +969,28 @@ mod tests {
             row_limit: None,
             origin: Origin::User,
         })
+    }
+
+    #[test]
+    fn several_user_column_pairs_and_exact_mapping() {
+        let r = reg();
+        let mut b = add(&r, "t1", 1);
+        let mut a = add(&r, "t2", 1);
+        let col = |o: &OutputInfo, n: &str| databrain_result_store::ColumnMeta { name: n.into(), ..o.columns[0].clone() };
+        b.columns = ["id", "a", "b", "c"].iter().map(|n| col(&b, n)).collect();
+        a.columns = ["id", "a1", "b2", "c"].iter().map(|n| col(&a, n)).collect();
+        let m = vec![("a".to_string(), "a1".to_string()), ("b".to_string(), "b2".to_string())];
+        let p = column_pairs(&b, &a, &m).unwrap();
+        let s = |v: &[(String, String)]| v.iter().map(|(x, y)| format!("{x}>{y}")).collect::<Vec<_>>();
+        assert_eq!(s(&p), ["id>id", "a>a1", "b>b2", "c>c"]);
+        // Exact: only the given pairs (c and id left out).
+        assert_eq!(s(&column_pairs_with(&b, &a, &m, false).unwrap()), ["a>a1", "b>b2"]);
+        // An auto match can be overridden: b.c ↔ a.a1, and a.c not compared.
+        let o = vec![("id".to_string(), "id".to_string()), ("c".to_string(), "a1".to_string())];
+        assert_eq!(s(&column_pairs_with(&b, &a, &o, false).unwrap()), ["id>id", "c>a1"]);
+        let sql = diff_sql_with(&b, &a, &["id".into()], &m, true).unwrap();
+        assert!(sql.contains("-- Matched columns: a → a1, b → b2"), "{sql}");
+        assert!(sql.contains("\"a\" AS a1") || sql.contains("a AS a1"), "{sql}");
     }
 
     #[test]

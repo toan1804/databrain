@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
-import { pairColumns } from "../lib/compare";
+import { pairColumns, parseMapping, setPair } from "../lib/compare";
 import {
   AlertTriangle,
   AtSign,
@@ -13,7 +13,6 @@ import {
   PinOff,
   TerminalSquare,
   Trash2,
-  X,
 } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { OutputInfo } from "../lib/types";
@@ -248,22 +247,33 @@ export function CompareDialog({
   const a = outputs.find((o) => o.handle === after);
   // Columns matched by name (any case) plus pairs the user adds.
   const [manual, setManual] = useState<[string, string][]>([]);
-  const [pickBefore, setPickBefore] = useState("");
-  const [pickAfter, setPickAfter] = useState("");
-  const match = useMemo(
-    () =>
-      pairColumns(
-        b?.columns.map((c) => c.name) ?? [],
-        a?.columns.map((c) => c.name) ?? [],
-        manual,
-      ),
-    [a, b, manual],
-  );
+  /** After-side columns left out of the comparison. */
+  const [excluded, setExcluded] = useState<string[]>([]);
+  const [typed, setTyped] = useState("");
+  const [typedErrors, setTypedErrors] = useState<string[]>([]);
+  const beforeCols = useMemo(() => b?.columns.map((c) => c.name) ?? [], [b]);
+  const afterCols = useMemo(() => a?.columns.map((c) => c.name) ?? [], [a]);
+  const match = useMemo(() => pairColumns(beforeCols, afterCols, manual, excluded), [beforeCols, afterCols, manual, excluded]);
+  const choose = (after: string, before: string | null) => {
+    const next = setPair(manual, excluded, after, before);
+    setManual(next.manual);
+    setExcluded(next.excluded);
+  };
+  const applyTyped = () => {
+    const r = parseMapping(typed, beforeCols, afterCols);
+    let st = { manual, excluded };
+    for (const [bc, ac] of r.pairs) st = setPair(st.manual, st.excluded, ac, bc);
+    setManual(st.manual);
+    setExcluded(st.excluded);
+    setTypedErrors(r.errors);
+    if (!r.errors.length) setTyped("");
+  };
   const common = useMemo(() => match.pairs.map((p) => p.after), [match]);
   useEffect(() => {
     setManual([]);
-    setPickBefore("");
-    setPickAfter("");
+    setExcluded([]);
+    setTyped("");
+    setTypedErrors([]);
   }, [before, after]);
   const [keys, setKeys] = useState<string[]>(() => {
     const first = initial?.columns[0]?.name;
@@ -279,9 +289,9 @@ export function CompareDialog({
         b.handle,
         a.handle,
         keys.filter((k) => common.includes(k)),
-        match.pairs
-          .filter((p) => p.how === "manual")
-          .map((p) => [p.before, p.after] as [string, string]),
+        // Every pair as shown (the user may have left some out).
+        match.pairs.map((p) => [p.before, p.after] as [string, string]),
+        true,
       );
       await openResultsQuery(sql, `Diff ${outputLabel(b)} → ${outputLabel(a)}`);
       onClose();
@@ -372,101 +382,90 @@ export function CompareDialog({
         </div>
 
         <div>
-          <div className="mb-1 text-[11.5px] font-medium text-muted">
-            Matched columns ({match.pairs.length})
-          </div>
-          <div className="max-h-36 space-y-0.5 overflow-auto rounded-md border border-line p-1.5">
-            {match.pairs.length === 0 && (
-              <div className="text-[11.5px] text-muted">None yet.</div>
-            )}
-            {match.pairs.map((p) => (
-              <div
-                key={p.after}
-                className="flex items-center gap-1.5 font-mono text-[11.5px]"
+          <div className="mb-1 flex items-center text-[11.5px] font-medium text-muted">
+            <span>
+              Matched columns ({match.pairs.length} of {afterCols.length})
+            </span>
+            {(manual.length > 0 || excluded.length > 0) && (
+              <button
+                className="ml-auto text-[11px] font-normal text-accent hover:underline"
+                onClick={() => (setManual([]), setExcluded([]))}
               >
-                <span className="min-w-0 truncate">{p.before}</span>
-                {p.before !== p.after && (
-                  <>
-                    <span className="text-muted">→</span>
-                    <span className="min-w-0 truncate">{p.after}</span>
-                  </>
-                )}
-                <span className="ml-auto shrink-0 font-sans text-[10.5px] text-muted">
-                  {p.how === "same"
-                    ? "same name"
-                    : p.how === "case"
-                      ? "same name, other case"
-                      : "matched by you"}
-                </span>
-                {p.how === "manual" && (
-                  <button
-                    className="icon-btn h-5 w-5 shrink-0"
-                    aria-label={`Unmatch ${p.before} and ${p.after}`}
-                    title="Unmatch"
-                    onClick={() =>
-                      setManual((m) =>
-                        m.filter(
-                          ([x, y]) => !(x === p.before && y === p.after),
-                        ),
-                      )
-                    }
-                  >
-                    <X size={11} />
-                  </button>
-                )}
-              </div>
-            ))}
+                Reset to automatic
+              </button>
+            )}
           </div>
-          {(match.onlyBefore.length > 0 || match.onlyAfter.length > 0) && (
-            <div className="mt-2">
-              <div className="mb-1 text-[11.5px] text-muted">
-                Not matched: {match.onlyBefore.length} before,{" "}
-                {match.onlyAfter.length} after. These are left out of the
-                comparison unless you match them (e.g. val_dt ↔ value_date).
-              </div>
-              {match.onlyBefore.length > 0 && match.onlyAfter.length > 0 && (
-                <div className="flex items-center gap-1.5">
-                  <select
-                    className="field h-7 min-w-0 flex-1 py-0 font-mono text-[11.5px]"
-                    aria-label="Before column"
-                    value={pickBefore}
-                    onChange={(e) => setPickBefore(e.target.value)}
-                  >
-                    <option value="">Before column…</option>
-                    {match.onlyBefore.map((c) => (
-                      <option key={c} value={c}>
-                        {c}
-                      </option>
-                    ))}
-                  </select>
-                  <span className="text-muted">↔</span>
-                  <select
-                    className="field h-7 min-w-0 flex-1 py-0 font-mono text-[11.5px]"
-                    aria-label="After column"
-                    value={pickAfter}
-                    onChange={(e) => setPickAfter(e.target.value)}
-                  >
-                    <option value="">After column…</option>
-                    {match.onlyAfter.map((c) => (
-                      <option key={c} value={c}>
-                        {c}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    className="btn-ghost shrink-0 border border-line py-1"
-                    disabled={!pickBefore || !pickAfter}
-                    onClick={() => {
-                      setManual((m) => [...m, [pickBefore, pickAfter]]);
-                      setPickBefore("");
-                      setPickAfter("");
-                    }}
-                  >
-                    Match
-                  </button>
-                </div>
-              )}
+          <div className="max-h-56 overflow-auto rounded-md border border-line">
+            <table className="w-full font-mono text-[11.5px]">
+              <thead className="sticky top-0 bg-panel-2 font-sans text-[10.5px] text-muted">
+                <tr>
+                  <th className="px-2 py-1 text-left font-medium">After ({a ? outputLabel(a) : "…"})</th>
+                  <th className="w-4" />
+                  <th className="px-2 py-1 text-left font-medium">Before ({b ? outputLabel(b) : "…"})</th>
+                  <th className="px-2 py-1 text-right font-medium">How</th>
+                </tr>
+              </thead>
+              <tbody>
+                {afterCols.map((ac) => {
+                  const p = match.pairs.find((x) => x.after === ac);
+                  return (
+                    <tr key={ac} className="border-t border-line/60">
+                      <td className="max-w-0 truncate px-2 py-0.5" title={ac}>
+                        {ac}
+                      </td>
+                      <td className="text-center text-muted">←</td>
+                      <td className="px-1 py-0.5">
+                        <select
+                          className={`field h-6 w-full py-0 font-mono text-[11.5px] ${p ? "" : "text-muted"}`}
+                          aria-label={`Before column matched to ${ac}`}
+                          value={p?.before ?? ""}
+                          onChange={(e) => choose(ac, e.target.value || null)}
+                        >
+                          <option value="">— not compared —</option>
+                          {beforeCols.map((bc) => {
+                            const other = match.pairs.find((x) => x.before === bc && x.after !== ac);
+                            return (
+                              <option key={bc} value={bc}>
+                                {bc}
+                                {other ? `  (now ↔ ${other.after})` : ""}
+                              </option>
+                            );
+                          })}
+                        </select>
+                      </td>
+                      <td className="whitespace-nowrap px-2 py-0.5 text-right font-sans text-[10.5px] text-muted">
+                        {!p ? "" : p.how === "same" ? "same name" : p.how === "case" ? "other case" : "by you"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {match.onlyBefore.length > 0 && (
+            <div className="mt-1 text-[11.5px] text-muted">
+              Before columns not compared: <span className="font-mono">{match.onlyBefore.join(", ")}</span>
             </div>
+          )}
+          <div className="mt-2 flex items-center gap-1.5">
+            <input
+              className="field h-7 min-w-0 flex-1 py-0 font-mono text-[11.5px]"
+              placeholder="Match several at once: a = a1, b = b2"
+              aria-label="Column pairs (before = after)"
+              value={typed}
+              onChange={(e) => setTyped(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && typed.trim() && applyTyped()}
+            />
+            <button className="btn-ghost shrink-0 border border-line py-1" disabled={!typed.trim()} onClick={applyTyped}>
+              Match
+            </button>
+          </div>
+          {typedErrors.length > 0 && (
+            <ul className="mt-1 space-y-0.5 text-[11.5px] text-danger">
+              {typedErrors.map((e) => (
+                <li key={e}>{e}</li>
+              ))}
+            </ul>
           )}
           {(a?.truncated || b?.truncated) && (
             <p className="mt-1 flex items-center gap-1 text-[11.5px] text-warning">

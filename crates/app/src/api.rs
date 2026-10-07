@@ -1314,10 +1314,11 @@ pub async fn pin_output(state: &AppState, handle: String, pinned: bool) -> Resul
 /// DuckDB SQL comparing two outputs (rows added / removed / changed).
 /// `mapping`: extra (before column, after column) pairs chosen by the user;
 /// equal names and names equal ignoring case are matched automatically.
-pub fn output_diff_sql(state: &AppState, before: &str, after: &str, keys: Vec<String>, mapping: Vec<(String, String)>) -> Result<String> {
+/// `exact`: `mapping` is the complete list of pairs (no automatic matching).
+pub fn output_diff_sql(state: &AppState, before: &str, after: &str, keys: Vec<String>, mapping: Vec<(String, String)>, exact: bool) -> Result<String> {
     let b = get_output(state, before)?;
     let a = get_output(state, after)?;
-    databrain_query_engine::outputs::diff_sql_mapped(&b, &a, &keys, &mapping)
+    databrain_query_engine::outputs::diff_sql_with(&b, &a, &keys, &mapping, !exact)
 }
 
 /// Id of the local DuckDB connection for `results.*` queries.
