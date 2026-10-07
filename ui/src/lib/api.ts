@@ -59,6 +59,8 @@ import type {
   RunResponse,
   SavedQuery,
   SchemaInfo,
+  ParamSpan,
+  ParamValue,
   CatalogInfo,
   CachedExplorer,
   CachedListing,
@@ -162,6 +164,11 @@ export const api = {
     call<ObjectDetail>("describe_object", { id, schema, name }),
   tableLayout: (id: string, schema: string, name: string) => call<TableLayout>("table_layout", { id, schema, name }),
 
+  /** `:name` parameters of an editor text (outside strings/comments, not `::` casts). */
+  sqlParameters: (kind: ConnectorKind, text: string) => call<ParamSpan[]>("sql_parameters", { kind, text }),
+  /** What each value becomes in the SQL (`'2026-09-09'`, `2000`; null = empty). */
+  previewParameters: (kind: ConnectorKind, values: Record<string, ParamValue>) =>
+    call<Record<string, string | null>>("preview_parameters", { kind, values }),
   statementAtCursor: (kind: ConnectorKind, text: string, cursor: number) =>
     call<Span | null>("statement_at_cursor", { kind, text, cursor }),
   runQuery: (req: RunRequest) => call<RunResponse>("run_query", { req }),

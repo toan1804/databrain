@@ -248,6 +248,9 @@ pub struct RunRequest {
     /// Name the job's last result (`results.<name>` in DuckDB sessions).
     #[serde(default)]
     pub output_name: Option<String>,
+    /// Values of `:name` parameters in `sql` (editor parameter boxes).
+    #[serde(default)]
+    pub params: HashMap<String, databrain_connector_core::sql::ParamValue>,
 }
 
 impl RunRequest {
@@ -905,6 +908,27 @@ impl QueryEngine {
             .collect()
     }
 
+    /// Put the values of `:name` parameters into the statements (spans stay
+    /// those of the editor text; classification sees the real SQL).
+    fn bind_parameters(plan: &mut [PlannedStatement], kind: databrain_connector_core::ConnectorKind, params: &HashMap<String, databrain_connector_core::sql::ParamValue>) -> Result<()> {
+        let mut missing: Vec<String> = Vec::new();
+        for p in plan.iter_mut() {
+            match databrain_connector_core::sql::substitute_parameters(&p.sql, kind, params) {
+                Ok(sql) if sql != p.sql => {
+                    p.classification = classify(&sql, kind);
+                    p.sql = sql;
+                }
+                Ok(_) => {}
+                Err(names) => missing.extend(names.into_iter().filter(|n| !missing.contains(n)).collect::<Vec<_>>()),
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let list = missing.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", ");
+        Err(EngineError { code: Some("missing_parameters".into()), ..EngineError::new("invalid", format!("Enter a value for {list}")) })
+    }
+
     /// Reasons the user must confirm before running, if any.
     fn safety_reasons(profile: &ConnectionProfile, plan: &[PlannedStatement]) -> Vec<String> {
         let mut reasons = Vec::new();
@@ -935,10 +959,11 @@ impl QueryEngine {
 
     pub fn run(self: &Arc<Self>, req: RunRequest) -> Result<RunResponse> {
         let profile = self.workspace.get_connection(&req.connection_id)?;
-        let plan = self.plan(&profile, &req.sql);
+        let mut plan = self.plan(&profile, &req.sql);
         if plan.is_empty() {
             return Err(EngineError::new("invalid", "Nothing to run"));
         }
+        Self::bind_parameters(&mut plan, profile.config.kind, &req.params)?;
         if profile.config.read_only {
             if let Some(p) = plan.iter().find(|p| p.classification.kind.is_write()) {
                 return Err(EngineError::new(
@@ -1391,6 +1416,7 @@ mod tests {
             origin: Origin::User,
             session_key: None,
             output_name: None,
+            params: Default::default(),
         }
     }
 
@@ -1422,6 +1448,27 @@ mod tests {
             RunResponse::Started { job_id, .. } => job_id,
             other => panic!("expected start, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn parameters_are_bound_before_running() {
+        let f = fixture(EnvTag::Dev);
+        let sql = "select :d as d, :n as n, typeof(:n) as t, ':d' as lit";
+        let e = f.engine.run(req(&f, sql)).unwrap_err();
+        assert_eq!((e.kind.as_str(), e.code.as_deref()), ("invalid", Some("missing_parameters")));
+        assert!(e.message.contains(":d") && e.message.contains(":n"), "{}", e.message);
+        let mut r = req(&f, sql);
+        r.params.insert("d".into(), databrain_connector_core::sql::ParamValue { value: "2026-09-09".into(), raw: false });
+        r.params.insert("n".into(), databrain_connector_core::sql::ParamValue { value: "2000".into(), raw: false });
+        let resp = f.engine.run(r).unwrap();
+        let RunResponse::Started { job_id, statements } = resp else { panic!() };
+        assert_eq!(statements[0].sql, "select '2026-09-09' as d, 2000 as n, typeof(2000) as t, ':d' as lit");
+        assert_eq!((statements[0].start, statements[0].end), (0, sql.len()), "spans of the editor text");
+        let evs = wait_job(&f, &job_id).await;
+        let rid = evs.iter().find_map(|e| match e { JobEvent::StatementFinished { result: Some(r), .. } => Some(r.id.clone()), _ => None }).expect("result");
+        let page = f.engine.results().get(&rid).unwrap().lock().page(&Default::default(), 0, 1).unwrap();
+        let row = format!("{:?}", page.rows[0]);
+        assert!(row.contains("2026-09-09") && row.contains("integer"), "{row}");
     }
 
     #[tokio::test]

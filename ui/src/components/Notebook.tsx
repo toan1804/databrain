@@ -48,7 +48,7 @@ import {
   Type,
   Wand2,
 } from "lucide-react";
-import { api, toError } from "../lib/api";
+import { api, isTauri, toError } from "../lib/api";
 import type {
   CellKind,
   Notebook as NotebookT,
@@ -60,6 +60,8 @@ import { registerKeyConnection, useAi } from "../aiStore";
 import { editorBridge } from "../editorBridge";
 import { editorContextMenu, errorField, highlight, langExtension, setError } from "./SqlEditor";
 import { SqlContextMenu, formatKey } from "./SqlContextMenu";
+import { ParamBar } from "./ParamBar";
+import { paramField, paramNames, setParamSpans } from "./paramsExt";
 import { canFetchMetadata, sqlAssist } from "./sqlAssist";
 import { queryHints } from "./queryHintsExt";
 import { ResizeHandle } from "./ResizeHandle";
@@ -287,6 +289,9 @@ export function NotebookView({
         }
       }
       const name = c.output_name?.trim() || null;
+      // `:name` parameters come from the bar at the top of the notebook.
+      const params = await useStore.getState().paramsFor(tabId, kind ?? "postgres", sql);
+      if (!params) return false;
       const ok = await useStore
         .getState()
         .runSql(
@@ -296,12 +301,28 @@ export function NotebookView({
           0,
           `nb:${notebookId}`,
           name,
+          params,
         );
       if (ok) await waitForRun(cellKey(notebookId, c.id));
       return ok;
     },
-    [notebookId, toast],
+    [notebookId, tabId, toast],
   );
+
+  // Parameters of every SQL cell, for the bar at the top (debounced).
+  // Each cell is scanned on its own (an unclosed quote in one cell must not hide the next one's).
+  const sqlSources = JSON.stringify(nb?.cells.filter((c) => c.kind === "sql" && c.source.includes(":")).map((c) => c.source) ?? []);
+  const nbKind = conn?.config.kind;
+  useEffect(() => {
+    if (!isTauri()) return;
+    const t = setTimeout(() => {
+      const sources: string[] = JSON.parse(sqlSources);
+      Promise.all(sources.map((src) => api.sqlParameters(nbKind ?? "postgres", src)))
+        .then((all) => useStore.getState().setParamNames(tabId, paramNames(all.flat())))
+        .catch(() => {});
+    }, 250);
+    return () => clearTimeout(t);
+  }, [sqlSources, nbKind, tabId]);
 
   const runAll = async (fromIndex = 0) => {
     if (!latest.current) return;
@@ -469,6 +490,7 @@ export function NotebookView({
               : "Saved"}
         </span>
       </div>
+      <ParamBar tabId={tabId} kind={conn?.config.kind} />
 
       <div className="min-h-0 flex-1 overflow-auto bg-bg/40 px-4 py-4">
         <div className="mx-auto max-w-[1100px] space-y-3">
@@ -947,6 +969,7 @@ function CellEditor({
           syntaxHighlighting(highlight),
           placeholder("SQL…  ⌘↵ run · ⇧↵ run & next · ⌘I ask AI"),
           errorField,
+          paramField,
           lang.current.of(langExtension(undefined)),
           keymap.of([
             {
@@ -1016,6 +1039,22 @@ function CellEditor({
         .loadSchemas(conn.id)
         .catch(() => {});
   }, [conn?.config.kind, conn?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Highlight `:name` parameters (values are set in the notebook's parameter bar).
+  useEffect(() => {
+    if (!isTauri()) return;
+    const kind = conn?.config.kind ?? "postgres";
+    const t = setTimeout(() => {
+      const found = source.includes(":") ? api.sqlParameters(kind, source) : Promise.resolve([]);
+      found
+        .then((spans) => {
+          const v = view.current;
+          if (v && v.state.doc.toString() === source) v.dispatch({ effects: setParamSpans.of(spans) });
+        })
+        .catch(() => {});
+    }, 200);
+    return () => clearTimeout(t);
+  }, [source, conn?.config.kind]);
 
   // External changes (AI edits applied through the bridge already go through the view).
   useEffect(() => {

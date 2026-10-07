@@ -10,7 +10,9 @@ import type {
   OutputInfo,
   CatalogInfo,
   ColumnInfo,
+  ConnectorKind,
   ObjectKind,
+  ParamValue,
   ConnectionView,
   ConnectorInfo,
   DbObject,
@@ -163,6 +165,19 @@ interface State {
   setTreeOpen: (key: string, open: boolean) => void;
   /** Schemas shown in the explorer per connection (absent = all). Saved in settings. */
   schemaFilter: Record<string, string[]>;
+  /** Parameter values per query tab (`:name` → value). Saved in settings. */
+  params: Record<string, Record<string, ParamValue>>;
+  /** `:name` parameters found in each query tab's SQL (in order, unique). */
+  paramNames: Record<string, string[]>;
+  /** Parameter box to focus (a run was missing its value). */
+  paramFocus: { tabId: string; name: string; seq: number } | null;
+  setParam: (tabId: string, name: string, patch: Partial<ParamValue>) => void;
+  setParamNames: (tabId: string, names: string[]) => void;
+  /**
+   * Values for the parameters `sql` uses, from tab/notebook `tabId`; `null`
+   * (with a toast and the first empty box focused) when one has no value.
+   */
+  paramsFor: (tabId: string, kind: ConnectorKind, sql: string) => Promise<Record<string, ParamValue> | null>;
   setSchemaFilter: (connId: string, schemas: string[] | null) => void;
   /** Connection whose "Choose schemas" dialog is open. */
   schemaPicker: string | null;
@@ -206,6 +221,7 @@ interface State {
     base?: number,
     sessionKey?: string,
     outputName?: string | null,
+    params?: Record<string, ParamValue>,
   ) => Promise<boolean>;
   refreshFolders: (kind?: FolderKind) => Promise<void>;
   refreshNotebooks: () => Promise<void>;
@@ -347,6 +363,29 @@ function nextTabTitle(tabs: Tab[]): string {
 
 let storeInitStarted = false;
 
+/** `editor_params` setting: { tabId: { name: { value, raw } } }, for tabs that still exist. */
+function parseParams(v: unknown, tabIds: string[]): Record<string, Record<string, ParamValue>> {
+  const out: Record<string, Record<string, ParamValue>> = {};
+  if (!v || typeof v !== "object") return out;
+  for (const id of tabIds) {
+    const m = (v as Record<string, unknown>)[id];
+    if (!m || typeof m !== "object") continue;
+    const vals: Record<string, ParamValue> = {};
+    for (const [k, x] of Object.entries(m as Record<string, unknown>)) {
+      if (x && typeof x === "object" && typeof (x as ParamValue).value === "string") vals[k] = { value: (x as ParamValue).value, raw: !!(x as ParamValue).raw };
+    }
+    out[id] = vals;
+  }
+  return out;
+}
+
+let paramsSaveTimer: ReturnType<typeof setTimeout> | undefined;
+function persistParams(params: Record<string, Record<string, ParamValue>>) {
+  if (!isTauri()) return;
+  clearTimeout(paramsSaveTimer);
+  paramsSaveTimer = setTimeout(() => void api.setSetting("editor_params", params).catch(() => {}), TAB_SAVE_DELAY);
+}
+
 /** `explorer_schemas` setting: { connectionId: [schema ids] }. */
 export function parseSchemaFilter(v: unknown): Record<string, string[]> {
   if (!v || typeof v !== "object") return {};
@@ -461,6 +500,9 @@ export const useStore = create<State>((set, get) => ({
   sidebarPanel: "connections",
   treeOpen: {},
   schemaFilter: {},
+  params: {},
+  paramNames: {},
+  paramFocus: null,
   schemaPicker: null,
   treeFocus: null,
   catalogSearch: { query: "", scope: null, focusSeq: 0 },
@@ -525,6 +567,7 @@ export const useStore = create<State>((set, get) => ({
         slowQuerySeconds,
         savedQueries,
         schemaFilter: parseSchemaFilter(settings.explorer_schemas),
+        params: parseParams(settings.editor_params, restored.map((t) => t.id)),
       });
       await onJobEvent((e) => get().handleJobEvent(e));
       window.addEventListener("db:oracle-client-missing", () => set({ oracleClientPrompt: true }));
@@ -579,6 +622,27 @@ export const useStore = create<State>((set, get) => ({
   },
   setSidebarPanel: (sidebarPanel) => set({ sidebarPanel }),
   setTreeOpen: (key, open) => set((s) => ({ treeOpen: { ...s.treeOpen, [key]: open } })),
+  setParam: (tabId, name, patch) => {
+    const cur = get().params[tabId]?.[name] ?? { value: "" };
+    const params = { ...get().params, [tabId]: { ...get().params[tabId], [name]: { ...cur, ...patch } } };
+    set({ params });
+    persistParams(params);
+  },
+  setParamNames: (tabId, names) => {
+    const prev = get().paramNames[tabId];
+    if (prev && prev.length === names.length && prev.every((n, i) => n === names[i])) return;
+    set((s) => ({ paramNames: { ...s.paramNames, [tabId]: names } }));
+  },
+  paramsFor: async (tabId, kind, sql) => {
+    const values = get().params[tabId] ?? {};
+    if (!sql.includes(":")) return values;
+    const used = await api.sqlParameters(kind, sql).catch(() => []);
+    const missing = [...new Set(used.map((p) => p.name))].filter((n) => !values[n]?.value.trim());
+    if (!missing.length) return values;
+    get().toast(`Enter a value for ${missing.map((n) => `:${n}`).join(", ")}`, "error");
+    set((st) => ({ paramFocus: { tabId, name: missing[0], seq: (st.paramFocus?.seq ?? 0) + 1 } }));
+    return null;
+  },
   setSchemaFilter: (connId, schemas) => {
     const next = { ...get().schemaFilter };
     if (schemas && schemas.length) next[connId] = schemas;
@@ -894,7 +958,10 @@ export const useStore = create<State>((set, get) => ({
     if (activeTabId === id) activeTabId = tabs[Math.min(idx, tabs.length - 1)].id;
     const runs = { ...s.runs };
     delete runs[id];
-    set({ tabs, activeTabId, runs });
+    const params = { ...s.params };
+    delete params[id];
+    set({ tabs, activeTabId, runs, params });
+    persistParams(params);
     persistTabs(tabs);
   },
   setActiveTab: (id) => {
@@ -949,11 +1016,14 @@ export const useStore = create<State>((set, get) => ({
       s.toast("Nothing to run", "info");
       return;
     }
+    // `:name` parameters: every one in the statement needs a value.
+    const values = await get().paramsFor(tabId, conn.config.kind, sql);
+    if (!values) return;
 
-    await get().runSql(tabId, conn.id, sql, base);
+    await get().runSql(tabId, conn.id, sql, base, undefined, undefined, values);
   },
 
-  runSql: async (runKey, connectionId, sql, base = 0, sessionKey, outputName) => {
+  runSql: async (runKey, connectionId, sql, base = 0, sessionKey, outputName, params) => {
     const conn = get().connections.find((c) => c.id === connectionId);
     const submit = async (confirmed: boolean): Promise<boolean> => {
       try {
@@ -966,6 +1036,7 @@ export const useStore = create<State>((set, get) => ({
           confirmed,
           session_key: sessionKey ?? null,
           output_name: outputName ?? null,
+          params: params ?? {},
         });
         if (resp.status === "needs_confirmation") {
           return await new Promise<boolean>((resolve) =>

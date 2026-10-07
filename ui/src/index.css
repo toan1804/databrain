@@ -377,3 +377,11 @@ textarea,
 .nb-cell-fixed .cm-scroller {
   overflow: auto;
 }
+
+/* `:name` parameters in the SQL editor */
+.cm-param {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 3px;
+  font-weight: 500;
+}

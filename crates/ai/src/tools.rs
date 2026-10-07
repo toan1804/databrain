@@ -323,6 +323,7 @@ impl ToolContext {
                     origin: if self.caller == Caller::Mcp { Origin::Mcp } else { Origin::Ai },
                     session_key: None,
                     output_name: None,
+                    params: Default::default(),
                 },
                 Some(self.cancel.clone()),
             )
@@ -544,6 +545,7 @@ impl ToolContext {
                     origin: if self.caller == Caller::Mcp { Origin::Mcp } else { Origin::Ai },
                     session_key: None,
                     output_name: None,
+                    params: Default::default(),
                 },
                 Some(self.cancel.clone()),
             )
@@ -610,6 +612,7 @@ impl ToolContext {
                     origin: Origin::Ai,
                     session_key: None,
                     output_name: None,
+                    params: Default::default(),
                 },
                 Some(self.cancel.clone()),
             )

@@ -630,3 +630,225 @@ mod tests {
         assert_eq!(c("totally not sql ;;"), StatementKind::Other);
     }
 }
+
+// ------------------------------------------------------------------ parameters
+
+/// A `:name` parameter in a script (byte offsets of `:name`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParamSpan {
+    pub name: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// `:name` parameters outside strings, quoted identifiers and comments.
+/// Not parameters: `::type` casts, `col:field` / `$1:field` paths (a name,
+/// digit, quote or bracket right before the colon), `:=` assignments, and
+/// Oracle trigger `:new` / `:old`.
+pub fn find_parameters(text: &str, kind: ConnectorKind) -> Vec<ParamSpan> {
+    let b = text.as_bytes();
+    let n = b.len();
+    let lx = lex(kind);
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    while i < n {
+        let c = b[i];
+        match c {
+            b'-' if i + 1 < n && b[i + 1] == b'-' => i = skip_line(b, i),
+            b'#' if lx.hash_comment => i = skip_line(b, i),
+            b'/' if lx.slash_comment && i + 1 < n && b[i + 1] == b'/' => i = skip_line(b, i),
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                i = text[i + 2..].find("*/").map_or(n, |p| i + 2 + p + 2);
+            }
+            b'\'' | b'"' if lx.triple_quotes && b[i..].starts_with(if c == b'"' { b"\"\"\"" } else { b"'''" }) => {
+                let q = &text[i..i + 3];
+                i = text[i + 3..].find(q).map_or(n, |p| i + 3 + p + 3);
+            }
+            b'\'' => i = skip_quoted(b, i, b'\'', lx.backslash_escapes),
+            b'"' => i = skip_quoted(b, i, b'"', lx.backslash_escapes && kind != ConnectorKind::Snowflake),
+            b'`' if lx.backtick => i = skip_quoted(b, i, b'`', false),
+            b'[' if lx.brackets => i = text[i..].find(']').map_or(n, |p| i + p + 1),
+            b'$' if lx.dollar => match dollar_tag(text, i) {
+                Some(tag) if matches!(kind, ConnectorKind::Postgres | ConnectorKind::Duckdb) || tag == "$$" => {
+                    let body = i + tag.len();
+                    i = text[body..].find(tag).map_or(n, |p| body + p + tag.len());
+                }
+                _ => i += 1,
+            },
+            b':' => {
+                if i + 1 < n && b[i + 1] == b':' {
+                    i += 2;
+                    continue;
+                }
+                let attached = i > 0 && (word(b[i - 1]) || matches!(b[i - 1], b'.' | b']' | b'"' | b'`' | b'\'' | b')' | b'$'));
+                let starts = i + 1 < n && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_');
+                if attached || !starts {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < n && word(b[j]) {
+                    j += 1;
+                }
+                let name = &text[i + 1..j];
+                let trigger_row = kind == ConnectorKind::Oracle && (name.eq_ignore_ascii_case("new") || name.eq_ignore_ascii_case("old"));
+                if !trigger_row {
+                    out.push(ParamSpan { name: name.to_string(), start: i, end: j });
+                }
+                i = j;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// A value typed for a parameter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
+pub struct ParamValue {
+    pub value: String,
+    /// Insert as typed (an SQL expression such as `current_date`), no quoting.
+    #[serde(default)]
+    pub raw: bool,
+}
+
+/// The SQL that replaces a parameter. Numbers (`2000`, `-1.5`, `1e3`),
+/// `NULL`/`TRUE`/`FALSE` and complete string literals (`'2026-09-09'`) are
+/// kept; anything else becomes a string literal (`2026-09-09` →
+/// `'2026-09-09'`), escaped for the dialect. Numbers with a leading zero
+/// (`007`, codes) are strings. `None` when the value is empty.
+pub fn render_param(v: &ParamValue, kind: ConnectorKind) -> Option<String> {
+    let t = v.value.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if v.raw || is_number(t) || ["null", "true", "false"].iter().any(|k| t.eq_ignore_ascii_case(k)) || is_string_literal(t, kind) {
+        return Some(t.to_string());
+    }
+    Some(quote_string(t, kind))
+}
+
+fn is_number(t: &str) -> bool {
+    let s = t.strip_prefix(['-', '+']).unwrap_or(t);
+    let (mant, exp) = match s.find(['e', 'E']) {
+        Some(p) => (&s[..p], Some(&s[p + 1..])),
+        None => (s, None),
+    };
+    let (int, frac) = match mant.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (mant, None),
+    };
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|c| c.is_ascii_digit());
+    let int_ok = digits(int) || (int.is_empty() && frac.is_some_and(digits));
+    let frac_ok = frac.is_none_or(|f| f.is_empty() && !int.is_empty() || digits(f));
+    let exp_ok = exp.is_none_or(|e| digits(e.strip_prefix(['-', '+']).unwrap_or(e)));
+    // `007` is a code, not a number; `0`, `0.5` are numbers.
+    let leading_zero = int.len() > 1 && int.starts_with('0');
+    int_ok && frac_ok && exp_ok && !leading_zero
+}
+
+/// One complete `'…'` literal (optionally `N'…'` / `E'…'`).
+fn is_string_literal(t: &str, kind: ConnectorKind) -> bool {
+    let b = t.as_bytes();
+    let start = match b.first() {
+        Some(b'\'') => 0,
+        Some(b'N' | b'n' | b'E' | b'e') if b.get(1) == Some(&b'\'') => 1,
+        _ => return false,
+    };
+    b.len() >= start + 2 && skip_quoted(b, start, b'\'', lex(kind).backslash_escapes) == b.len() && b[b.len() - 1] == b'\''
+}
+
+/// `'text'` with the dialect's escaping (doubled quotes; backslashes where
+/// the dialect treats them as escapes).
+pub fn quote_string(t: &str, kind: ConnectorKind) -> String {
+    if lex(kind).backslash_escapes {
+        format!("'{}'", t.replace('\\', "\\\\").replace('\'', "\\'"))
+    } else {
+        format!("'{}'", t.replace('\'', "''"))
+    }
+}
+
+/// Replace every parameter of `sql`. Errors with the names that have no value.
+pub fn substitute_parameters(sql: &str, kind: ConnectorKind, values: &std::collections::HashMap<String, ParamValue>) -> Result<String, Vec<String>> {
+    let spans = find_parameters(sql, kind);
+    if spans.is_empty() {
+        return Ok(sql.to_string());
+    }
+    let mut missing: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(sql.len());
+    let mut at = 0;
+    for s in &spans {
+        match values.get(&s.name).and_then(|v| render_param(v, kind)) {
+            Some(lit) => {
+                out.push_str(&sql[at..s.start]);
+                out.push_str(&lit);
+                at = s.end;
+            }
+            None if !missing.contains(&s.name) => missing.push(s.name.clone()),
+            None => {}
+        }
+    }
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+    out.push_str(&sql[at..]);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod param_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use ConnectorKind as K;
+
+    fn names(sql: &str, k: K) -> Vec<String> {
+        find_parameters(sql, k).into_iter().map(|p| p.name).collect()
+    }
+
+    #[test]
+    fn finds_parameters_in_code_only() {
+        assert_eq!(names("select * from t where d = :data_date and n > :min_n", K::Postgres), vec!["data_date", "min_n"]);
+        assert_eq!(names("select x::date, ':nope', \"a:b\" -- :c\n /* :d */ from t where y = :p", K::Postgres), vec!["p"]);
+        assert_eq!(names("select $$ :x $$, $f$ :y $f$, :z", K::Postgres), vec!["z"]);
+        assert_eq!(names("select src:customer.name, $1:field, t.c:path from s where a = :p", K::Snowflake), vec!["p"]);
+        assert_eq!(names("set @a := 1; select `x:y`, :p # :q", K::Mysql), vec!["p"]);
+        assert_eq!(names("select [a:b], :p from t", K::Mssql), vec!["p"]);
+        assert_eq!(names("select '12:30', 12:30, :p1, :_x, :1 from dual", K::Oracle), vec!["p1", "_x"]);
+        assert_eq!(names("create trigger t before insert on x for each row begin :new.id := :seq; end;", K::Oracle), vec!["seq"]);
+        let p = &find_parameters("a = :name", K::Sqlite)[0];
+        assert_eq!((p.start, p.end), (4, 9));
+    }
+
+    #[test]
+    fn renders_values_by_type() {
+        let r = |v: &str, k: K| render_param(&ParamValue { value: v.into(), raw: false }, k);
+        assert_eq!(r("2026-09-09", K::Postgres).as_deref(), Some("'2026-09-09'"));
+        assert_eq!(r("'2026-09-09'", K::Postgres).as_deref(), Some("'2026-09-09'"), "already a literal");
+        assert_eq!(r(" 2000 ", K::Postgres).as_deref(), Some("2000"));
+        for n in ["-1.5", "0", "0.25", ".5", "1e6", "3.", "+7"] {
+            assert_eq!(r(n, K::Postgres).as_deref(), Some(n), "{n}");
+        }
+        assert_eq!(r("007", K::Postgres).as_deref(), Some("'007'"), "codes keep their zeros");
+        assert_eq!(r("1.2.3", K::Postgres).as_deref(), Some("'1.2.3'"));
+        assert_eq!(r("NULL", K::Postgres).as_deref(), Some("NULL"));
+        assert_eq!(r("O'Brien", K::Postgres).as_deref(), Some("'O''Brien'"));
+        assert_eq!(r("O'Brien", K::Bigquery).as_deref(), Some("'O\\'Brien'"));
+        assert_eq!(r("a\\b", K::Mysql).as_deref(), Some("'a\\\\b'"));
+        assert_eq!(r("'it''s'", K::Postgres).as_deref(), Some("'it''s'"));
+        assert_eq!(r("'a' or '1'='1'", K::Postgres).as_deref(), Some("'''a'' or ''1''=''1'''"), "not one literal: quoted whole");
+        assert_eq!(r("N'x'", K::Mssql).as_deref(), Some("N'x'"));
+        assert_eq!(r("   ", K::Postgres), None);
+        assert_eq!(render_param(&ParamValue { value: "current_date - 1".into(), raw: true }, K::Postgres).as_deref(), Some("current_date - 1"));
+    }
+
+    #[test]
+    fn substitutes_or_reports_missing() {
+        let mut v = HashMap::new();
+        v.insert("d".to_string(), ParamValue { value: "2026-09-09".into(), raw: false });
+        v.insert("n".to_string(), ParamValue { value: "2000".into(), raw: false });
+        assert_eq!(substitute_parameters("select :d, :n, ':d', :d", K::Postgres, &v).unwrap(), "select '2026-09-09', 2000, ':d', '2026-09-09'");
+        assert_eq!(substitute_parameters("select :d, :x, :y, :x", K::Postgres, &v).unwrap_err(), vec!["x", "y"]);
+        assert_eq!(substitute_parameters("select 1", K::Postgres, &HashMap::new()).unwrap(), "select 1");
+    }
+}

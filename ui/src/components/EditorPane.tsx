@@ -8,6 +8,7 @@ import { ConnDot, EnvBadge } from "./ui";
 import { NotebookView } from "./Notebook";
 import { OutputTab } from "./OutputTab";
 import { DdlTab } from "./DdlTab";
+import { ParamBar } from "./ParamBar";
 import { useAi } from "../aiStore";
 
 const ROW_LIMITS = [100, 500, 1000, 5000, 10000, 50000, 100000, 0];
@@ -15,6 +16,7 @@ const ROW_LIMITS = [100, 500, 1000, 5000, 10000, 50000, 100000, 0];
 export function EditorPane() {
   const tabs = useStore((s) => s.tabs);
   const activeId = useStore((s) => s.activeTabId);
+  const connections = useStore((s) => s.connections);
   const [split, setSplit] = useState(() => Number(localStorage.getItem("db.split")) || 0.45);
   const [collapsed, setCollapsed] = useState(false);
   const container = useRef<HTMLDivElement>(null);
@@ -67,6 +69,7 @@ export function EditorPane() {
         ))}
       <div className={active && !isQueryTab(active) ? "hidden" : "contents"}>
       <Toolbar />
+      {isQueryTab(active) && <ParamBar tabId={active.id} kind={connections.find((c) => c.id === active.connection_id)?.config.kind} />}
       <div ref={container} className="flex min-h-0 flex-1 flex-col">
         <div className="min-h-0" style={{ flex: collapsed ? "1 1 auto" : `0 0 ${split * 100}%` }}>
           {tabs

@@ -278,6 +278,19 @@ export interface PlannedStatement {
   classification: { kind: StatementKind; missing_where: boolean; keyword: string };
 }
 
+/** Value typed for a `:name` parameter; `raw` = insert as an SQL expression (no quoting). */
+export interface ParamValue {
+  value: string;
+  raw?: boolean;
+}
+
+/** A `:name` parameter in the editor (UTF-16 offsets of `:name`). */
+export interface ParamSpan {
+  name: string;
+  from: number;
+  to: number;
+}
+
 export interface RunRequest {
   connection_id: string;
   tab_id: string;
@@ -289,6 +302,8 @@ export interface RunRequest {
   session_key?: string | null;
   /** Name the job's last result (`results.<name>` in the Results connection). */
   output_name?: string | null;
+  /** Values of the statement's `:name` parameters. */
+  params?: Record<string, ParamValue>;
 }
 
 export type RunResponse =

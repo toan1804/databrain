@@ -479,6 +479,19 @@ async fn table_layout(state: State<'_, AppState>, id: String, schema: String, na
 }
 
 #[tauri::command]
+fn sql_parameters(kind: ConnectorKind, text: String) -> Vec<api::ParamSpanView> {
+    api::sql_parameters(kind, &text)
+}
+
+#[tauri::command]
+fn preview_parameters(
+    kind: ConnectorKind,
+    values: std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>,
+) -> std::collections::HashMap<String, Option<String>> {
+    api::preview_parameters(kind, values)
+}
+
+#[tauri::command]
 async fn statement_at_cursor(kind: ConnectorKind, text: String, cursor: usize) -> R<Option<Span>> {
     Ok(api::statement_at_cursor(kind, &text, cursor))
 }
@@ -726,6 +739,8 @@ pub fn run() {
             describe_object,
             table_layout,
             statement_at_cursor,
+            sql_parameters,
+            preview_parameters,
             run_query,
             cancel_query,
             close_tab,

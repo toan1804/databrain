@@ -253,7 +253,7 @@ async fn denied_approval_and_blocked_writes() {
     // Nothing was deleted.
     let out = f
         .engine
-        .run_and_wait(&f.hub, RunRequest { connection_id: f.conn.clone(), tab_id: "t".into(), sql: "select count(*) from orders".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None }, None)
+        .run_and_wait(&f.hub, RunRequest { connection_id: f.conn.clone(), tab_id: "t".into(), sql: "select count(*) from orders".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None, params: Default::default() }, None)
         .await
         .unwrap();
     assert_eq!(out[0].result.as_ref().unwrap().total_rows, 1);
@@ -446,7 +446,7 @@ async fn ai_tools_use_output_handles_with_source_policies() {
     let run = |conn: String, sql: &'static str, name: Option<&'static str>| {
         let (engine, hub) = (engine.clone(), f.hub.clone());
         async move {
-            let r = RunRequest { connection_id: conn, tab_id: uuid::Uuid::new_v4().to_string(), sql: sql.into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: name.map(Into::into) };
+            let r = RunRequest { connection_id: conn, tab_id: uuid::Uuid::new_v4().to_string(), sql: sql.into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: name.map(Into::into), params: Default::default() };
             engine.run_and_wait(&hub, r, None).await.unwrap()
         }
     };
@@ -540,7 +540,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
     for i in 0..60 {
         ddl.push_str(&format!("create schema s{i:02}; create table s{i:02}.t{i:02}(id integer, name varchar);"));
     }
-    let r = RunRequest { connection_id: conn.clone(), tab_id: "setup".into(), sql: ddl, base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None };
+    let r = RunRequest { connection_id: conn.clone(), tab_id: "setup".into(), sql: ddl, base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None, params: Default::default() };
     engine.run_and_wait(&f.hub, r, None).await.unwrap();
 
     // Plan: one listing + counts, flagged as large.
@@ -589,7 +589,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
     assert_eq!((r.objects, r.skipped, r.changed), (60, 60, 0));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "no batch, final only");
     // One table altered → only its schema is re-read.
-    let alter = RunRequest { connection_id: conn.clone(), tab_id: "setup".into(), sql: "alter table s07.t07 add column email varchar".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None };
+    let alter = RunRequest { connection_id: conn.clone(), tab_id: "setup".into(), sql: "alter table s07.t07 add column email varchar".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None, params: Default::default() };
     // Each DuckDB session opens the file on its own (one writer at a time).
     engine.disconnect(&conn);
     engine.run_and_wait(&f.hub, alter, None).await.unwrap();

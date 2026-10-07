@@ -735,6 +735,30 @@ pub fn statement_at_cursor(kind: ConnectorKind, text: &str, cursor: usize) -> Op
     })
 }
 
+/// A `:name` parameter in the editor (UTF-16 offsets).
+#[derive(Debug, Clone, Serialize)]
+pub struct ParamSpanView {
+    pub name: String,
+    pub from: usize,
+    pub to: usize,
+}
+
+/// `:name` parameters of an editor text (not in strings/comments, not `::` casts).
+pub fn sql_parameters(kind: ConnectorKind, text: &str) -> Vec<ParamSpanView> {
+    databrain_connector_core::sql::find_parameters(text, kind)
+        .into_iter()
+        .map(|p| ParamSpanView { from: byte_to_utf16(text, p.start), to: byte_to_utf16(text, p.end), name: p.name })
+        .collect()
+}
+
+/// The SQL each parameter value becomes (`None` = empty), for the editor's preview.
+pub fn preview_parameters(
+    kind: ConnectorKind,
+    values: std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>,
+) -> std::collections::HashMap<String, Option<String>> {
+    values.into_iter().map(|(k, v)| (k, databrain_connector_core::sql::render_param(&v, kind))).collect()
+}
+
 pub fn run_query(state: &AppState, mut req: RunRequest) -> Result<RunResponse> {
     let text = req.sql.clone();
     // The engine works in bytes; the UI's base offset is UTF-16.
@@ -1200,6 +1224,20 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn parameter_spans_are_utf16_and_previews_typed() {
+        // "é" and "😀" are 1 and 2 UTF-16 units (2 and 4 bytes).
+        let text = "select 'é😀', :day";
+        let p = sql_parameters(ConnectorKind::Postgres, text);
+        assert_eq!((p[0].name.as_str(), p[0].from, p[0].to), ("day", 14, 18));
+        let mut v = std::collections::HashMap::new();
+        v.insert("day".to_string(), databrain_connector_core::sql::ParamValue { value: "2026-09-09".into(), raw: false });
+        v.insert("n".to_string(), databrain_connector_core::sql::ParamValue { value: "2000".into(), raw: false });
+        let out = preview_parameters(ConnectorKind::Postgres, v);
+        assert_eq!(out["day"].as_deref(), Some("'2026-09-09'"));
+        assert_eq!(out["n"].as_deref(), Some("2000"));
+    }
+
+    #[test]
     fn utf16_offsets() {
         let t = "é😀a";
         assert_eq!(byte_to_utf16(t, 2), 1);
@@ -1305,6 +1343,7 @@ mod tests {
                 origin: Default::default(),
                 session_key: None,
                 output_name: None,
+                params: Default::default(),
             },
         )
         .unwrap();
