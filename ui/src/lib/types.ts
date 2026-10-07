@@ -358,7 +358,7 @@ export interface RunRequest {
   base_offset: number;
   row_limit: number | null;
   confirmed: boolean;
-  origin?: "user" | "ai" | "mcp";
+  origin?: "user" | "ai" | "mcp" | "job";
   session_key?: string | null;
   /** Name the job's last result (`results.<name>` in the Results connection). */
   output_name?: string | null;
@@ -506,7 +506,7 @@ export interface OutputInfo {
   bytes: number;
   pinned: boolean;
   state: OutputState;
-  origin: "user" | "ai" | "mcp";
+  origin: "user" | "ai" | "mcp" | "job";
   last_used: number;
   active: boolean;
 }
@@ -913,4 +913,101 @@ export interface IndexPlan {
   large: boolean;
   /** Saved schemas-per-request setting. */
   batch: number;
+}
+
+// ------------------------------------------------------------------ jobs
+
+export type JobNodeKind = "query" | "load" | "export";
+export type FileFormat = "csv" | "parquet" | "json";
+export type LoadMode = "append" | "truncate" | "replace";
+export type NodeRunStatus = "pending" | "running" | "success" | "error" | "skipped" | "cancelled";
+
+export interface NodeRunSummary {
+  status: NodeRunStatus | "";
+  finished_at: number;
+  duration_ms: number;
+  rows?: number | null;
+  error?: string | null;
+  /** File written by an export step. */
+  file?: string | null;
+}
+
+export interface JobNode {
+  id: string;
+  /** Output name: downstream DuckDB steps read it as `results.<name>`. */
+  name: string;
+  kind: JobNodeKind;
+  /** Query steps: where the SQL runs (none = Results DuckDB). */
+  connection_id?: string | null;
+  sql: string;
+  x: number;
+  y: number;
+  target_connection_id?: string | null;
+  target_table?: string | null;
+  load_mode: LoadMode;
+  /** Export: folder (empty = Downloads). */
+  export_folder?: string | null;
+  /** Export: file name; `{step}`, `{job}`, `{date}`, `{time}` are replaced (empty = `{step}_{date}_{time}`). */
+  export_file?: string | null;
+  export_format?: FileFormat;
+  last_run?: NodeRunSummary | null;
+}
+
+export interface JobEdge {
+  from: string;
+  to: string;
+}
+
+export interface JobSchedule {
+  enabled: boolean;
+  mode: "interval" | "daily";
+  minutes: number;
+  /** Local "HH:MM". */
+  at: string;
+  /** 0 = Sunday; empty = every day. */
+  weekdays: number[];
+}
+
+export interface Job {
+  id: string;
+  name: string;
+  nodes: JobNode[];
+  edges: JobEdge[];
+  schedule: JobSchedule;
+  last_scheduled_at?: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface NodeRunRecord extends NodeRunSummary {
+  node_id: string;
+  name: string;
+}
+
+export interface JobRun {
+  id: number;
+  job_id: string;
+  trigger: "manual" | "schedule";
+  started_at: number;
+  finished_at?: number | null;
+  status: "running" | "success" | "error" | "cancelled";
+  nodes: NodeRunRecord[];
+  error?: string | null;
+}
+
+export interface JobSummary {
+  id: string;
+  name: string;
+  node_count: number;
+  /** Output names its steps own. */
+  step_names: string[];
+  schedule: JobSchedule;
+  next_run_at?: number | null;
+  last_run?: JobRun | null;
+  updated_at: number;
+}
+
+export interface JobRunEvent {
+  job_id: string;
+  run: JobRun;
 }

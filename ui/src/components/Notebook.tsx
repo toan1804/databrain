@@ -47,6 +47,7 @@ import {
   Trash2,
   Type,
   Wand2,
+  Workflow,
 } from "lucide-react";
 import { api, isTauri, toError } from "../lib/api";
 import type {
@@ -56,6 +57,7 @@ import type {
 } from "../lib/types";
 import { formatCount, formatDuration, uid } from "../lib/util";
 import { useStore } from "../store";
+import { useJobs } from "../jobsStore";
 import { registerKeyConnection, useAi } from "../aiStore";
 import { editorBridge } from "../editorBridge";
 import { editorContextMenu, errorField, highlight, langExtension, setError } from "./SqlEditor";
@@ -482,6 +484,14 @@ export function NotebookView({
           onClick={() => addCell("markdown", focused ?? undefined)}
         >
           <Type size={13} /> Text
+        </button>
+        <button
+          className="btn-ghost py-1"
+          disabled={!nb.cells.some((c) => c.kind === "sql" && c.source.trim())}
+          title="Create a job with one step per SQL cell, each running after the cell above"
+          onClick={() => latest.current && void useJobs.getState().createFromNotebook(latest.current)}
+        >
+          <Workflow size={13} /> Create job
         </button>
         <span className="ml-auto text-[11.5px] text-muted" aria-live="polite">
           {saving === "saving"
@@ -914,7 +924,7 @@ function OutputNameField({
 
 // ------------------------------------------------------------------ editors
 
-function CellEditor({
+export function CellEditor({
   editorKey,
   source,
   connectionId,

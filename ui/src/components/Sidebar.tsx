@@ -36,6 +36,8 @@ import {
   Trash2,
   Unplug,
   WifiOff,
+  Workflow,
+  Square,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { api, toError } from "../lib/api";
@@ -66,6 +68,8 @@ import { useAi } from "../aiStore";
 import { DEFAULT_POLICY } from "./ConnectionDialog";
 import { FolderTree, MoveToFolderItems, createFolder, dragProps } from "./FolderTree";
 import { OutputsPanel } from "./OutputsPanel";
+import { useJobs } from "../jobsStore";
+import { scheduleText } from "../lib/jobGraph";
 import { askExcelSheets } from "./ExcelSheetDialog";
 import { openOutput } from "../outputs";
 import { useStore, type SidebarPanel } from "../store";
@@ -81,6 +85,7 @@ export function Sidebar() {
         {panel === "connections" && <ConnectionsPanel />}
         {panel === "saved" && <SavedPanel />}
         {panel === "notebooks" && <NotebooksPanel />}
+        {panel === "jobs" && <JobsPanel />}
         {panel === "outputs" && <OutputsPanel />}
         {panel === "history" && <HistoryPanel />}
       </div>
@@ -113,6 +118,7 @@ function ActivityRail() {
       {item("connections", <Database size={18} />, "Connections")}
       {item("saved", <Bookmark size={18} />, "Saved queries")}
       {item("notebooks", <NotebookPen size={18} />, "Notebooks")}
+      {item("jobs", <Workflow size={18} />, "Jobs")}
       {item("outputs", <Layers size={18} />, "Outputs")}
       {item("history", <History size={18} />, "History")}
       <div className="flex-1" />
@@ -1179,6 +1185,95 @@ function NotebooksPanel() {
             );
           }}
         />
+      </div>
+    </>
+  );
+}
+
+// ------------------------------------------------------------------ jobs
+
+function JobsPanel() {
+  const jobs = useJobs((s) => s.jobs);
+  const running = useJobs((s) => s.running);
+  const live = useJobs((s) => s.runs);
+  const [search, setSearch] = useState("");
+  const shown = jobs.filter((j) => j.name.toLowerCase().includes(search.toLowerCase().trim()));
+  useEffect(() => {
+    void useJobs.getState().init().catch(() => {});
+    void useJobs.getState().refresh().catch(() => {});
+  }, []);
+  return (
+    <>
+      <PanelHeader title="Jobs">
+        <button className="icon-btn" title="New job" aria-label="New job" onClick={() => void useJobs.getState().create()}>
+          <Plus size={15} />
+        </button>
+      </PanelHeader>
+      {jobs.length > 4 && <SearchBox value={search} onChange={setSearch} placeholder="Search jobs" />}
+      <div className="min-h-0 flex-1 overflow-auto px-1.5 pb-3">
+        {jobs.length === 0 && (
+          <div className="px-3 py-8 text-center text-[12.5px] text-muted">
+            <Workflow size={26} className="mx-auto mb-3 opacity-50" />
+            Jobs run SQL steps in order: query several connections, combine the results with DuckDB, load them into another database. By hand or on a schedule.
+            <button className="btn-primary mx-auto mt-3" onClick={() => void useJobs.getState().create()}>
+              <Plus size={14} /> New job
+            </button>
+          </div>
+        )}
+        {shown.map((j) => {
+          const isRunning = !!running[j.id];
+          const last = live[j.id] ?? j.last_run;
+          return (
+            <div
+              key={j.id}
+              role="button"
+              tabIndex={0}
+              onClick={() => useJobs.getState().open(j.id, j.name)}
+              onKeyDown={(e) => e.key === "Enter" && useJobs.getState().open(j.id, j.name)}
+              className="group mb-0.5 cursor-pointer rounded-md px-2 py-1.5 hover:bg-hover"
+            >
+              <div className="flex items-center gap-1.5">
+                {isRunning ? (
+                  <Loader2 size={13} className="shrink-0 animate-spin text-accent" />
+                ) : (
+                  <Workflow size={13} className={`shrink-0 ${last?.status === "error" ? "text-danger" : last?.status === "success" ? "text-success" : "text-muted"}`} />
+                )}
+                <span className="min-w-0 flex-1 truncate font-medium">{j.name}</span>
+                <button
+                  className="icon-btn hidden h-5 w-5 group-hover:flex"
+                  aria-label={isRunning ? `Stop ${j.name}` : `Run ${j.name}`}
+                  title={isRunning ? "Stop" : "Run now"}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void (isRunning ? useJobs.getState().cancel(j.id) : useJobs.getState().run(j.id));
+                  }}
+                >
+                  {isRunning ? <Square size={11} /> : <Play size={12} />}
+                </button>
+                <button
+                  className="icon-btn hidden h-5 w-5 group-hover:flex"
+                  aria-label={`Delete ${j.name}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    useJobs.getState().remove(j);
+                  }}
+                >
+                  <Trash2 size={12} />
+                </button>
+              </div>
+              <div className="mt-0.5 flex flex-wrap items-center gap-x-2 pl-5 text-[10.5px] text-muted">
+                <span>{j.node_count} steps</span>
+                <span>{scheduleText(j.schedule)}</span>
+                {j.schedule.enabled && j.next_run_at && <span title={new Date(j.next_run_at).toLocaleString()}>next {new Date(j.next_run_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>}
+                {last && !isRunning && (
+                  <span className={last.status === "error" ? "text-danger" : undefined} title={last.error ?? undefined}>
+                    {last.status} {relativeTime(last.started_at)}
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })}
       </div>
     </>
   );

@@ -34,6 +34,8 @@ export interface Tab extends TabState {
   ddl?: DdlRef | null;
   /** Lineage diagram of SQL from an editor (`sql` holds the analysed text); not saved across restarts. */
   lineage?: LineageRef | null;
+  /** Job editor (the job is saved in the workspace); not saved across restarts. */
+  job_id?: string | null;
 }
 
 /** Where a lineage tab's SQL came from. */
@@ -56,7 +58,7 @@ export interface DdlRef {
 }
 
 /** Tabs that hold an editable SQL editor (not notebooks, outputs or DDL views). */
-export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.lineage;
+export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.lineage && !t.job_id;
 
 export type StatementStatus = "pending" | "running" | "done" | "error" | "cancelled";
 
@@ -103,7 +105,7 @@ export interface ConfirmState {
   onCancel?: () => void;
 }
 
-export type SidebarPanel = "connections" | "saved" | "notebooks" | "outputs" | "history";
+export type SidebarPanel = "connections" | "saved" | "notebooks" | "jobs" | "outputs" | "history";
 export type Theme = "dark" | "light";
 
 interface RunInput {
@@ -354,7 +356,7 @@ function persistTabs(tabs: Tab[]) {
     api
       .saveTabs(
         // DDL views are reloaded from the server on demand, not restored.
-        tabs.filter((t) => !t.ddl && !t.lineage).map((t) => ({
+        tabs.filter((t) => !t.ddl && !t.lineage && !t.job_id).map((t) => ({
           id: t.id,
           title: t.title,
           sql: t.sql,
@@ -951,6 +953,7 @@ export const useStore = create<State>((set, get) => ({
       output_ref: init?.output_ref ?? null,
       ddl: init?.ddl ?? null,
       lineage: init?.lineage ?? null,
+      job_id: init?.job_id ?? null,
     };
     const tabs = [...s.tabs, tab];
     set({ tabs, activeTabId: tab.id });
@@ -1203,6 +1206,8 @@ export const useStore = create<State>((set, get) => ({
       outputsTimer = setTimeout(() => void get().refreshOutputs(), 120);
       return;
     }
+    // Job steps report through "job-run" events (jobsStore).
+    if (e.tab_id.startsWith("job:")) return;
     const cur = get().runs[e.tab_id];
     if (!cur || cur.jobId !== e.job_id) {
       // Either stale (older job) or early (response not received yet).

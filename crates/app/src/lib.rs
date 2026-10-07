@@ -2,6 +2,7 @@
 
 pub mod ai_api;
 pub mod api;
+pub mod jobs;
 
 use std::sync::Arc;
 
@@ -137,6 +138,72 @@ async fn chart_data(
 }
 
 // ---- notebooks
+#[tauri::command]
+async fn list_jobs(state: State<'_, AppState>) -> R<api::JobListing> {
+    api::list_jobs(&state)
+}
+
+#[tauri::command]
+async fn get_job(state: State<'_, AppState>, id: String) -> R<databrain_workspace::Job> {
+    api::get_job(&state, &id)
+}
+
+#[tauri::command]
+async fn save_job(state: State<'_, AppState>, job: databrain_workspace::Job) -> R<databrain_workspace::Job> {
+    api::save_job(&state, job)
+}
+
+#[tauri::command]
+async fn delete_job(state: State<'_, AppState>, id: String) -> R<()> {
+    api::delete_job(&state, &id)
+}
+
+#[tauri::command]
+async fn run_job(state: State<'_, AppState>, id: String, nodes: Option<Vec<String>>) -> R<databrain_workspace::JobRun> {
+    api::run_job(&state, &id, nodes)
+}
+
+#[tauri::command]
+async fn cancel_job(state: State<'_, AppState>, id: String) -> R<bool> {
+    Ok(api::cancel_job(&state, &id))
+}
+
+/// What else uses an output name (for a step of job `job_id`), or null.
+#[tauri::command]
+async fn output_name_user(state: State<'_, AppState>, name: String, job_id: String) -> R<Option<String>> {
+    api::output_name_user(&state, &name, &job_id)
+}
+
+/// Folder export steps use when they have none (Downloads).
+#[tauri::command]
+async fn default_export_folder() -> R<Option<String>> {
+    Ok(dirs::download_dir().or_else(|| dirs::home_dir().map(|h| h.join("Downloads"))).map(|d| d.to_string_lossy().into_owned()))
+}
+
+/// Show the file an export step last wrote in Finder/Explorer. Only files
+/// recorded by the job are revealed (not arbitrary paths).
+#[tauri::command]
+async fn reveal_job_file(app: AppHandle, state: State<'_, AppState>, job_id: String, node_id: String) -> R<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let job = state.workspace.get_job(&job_id)?;
+    let file = job
+        .nodes
+        .iter()
+        .find(|n| n.id == node_id)
+        .and_then(|n| n.last_run.as_ref())
+        .and_then(|r| r.file.clone())
+        .ok_or_else(|| EngineError::new("not_found", "This step hasn't written a file yet"))?;
+    if !std::path::Path::new(&file).exists() {
+        return Err(EngineError::new("not_found", format!("{file} no longer exists")));
+    }
+    app.opener().reveal_item_in_dir(&file).map_err(|e| EngineError::new("internal", e.to_string()))
+}
+
+#[tauri::command]
+async fn job_runs(state: State<'_, AppState>, id: String, limit: Option<i64>) -> R<Vec<databrain_workspace::JobRun>> {
+    api::job_runs(&state, &id, limit)
+}
+
 #[tauri::command]
 async fn list_notebooks(state: State<'_, AppState>) -> R<Vec<databrain_workspace::NotebookSummary>> {
     api::list_notebooks(&state)
@@ -726,7 +793,10 @@ pub fn run() {
             // DuckDB extensions are shipped in the bundle (no runtime download).
             let bundled = app.path().resource_dir().map(|d| d.join("duckdb-extensions")).unwrap_or_default();
             api::seed_duckdb_extensions(&bundled, &dir.join("duckdb_extensions"));
+            let jobs = state.job_ctx();
             app.manage(state);
+            // Scheduled jobs run while the app is open.
+            tauri::async_runtime::spawn(async move { jobs::spawn_scheduler(jobs) });
             #[cfg(target_os = "macos")]
             app.set_menu(macos_menu(app.handle())?)?;
             Ok(())
@@ -798,6 +868,16 @@ pub fn run() {
             results_connection,
             chart_data,
             list_notebooks,
+            list_jobs,
+            get_job,
+            save_job,
+            delete_job,
+            run_job,
+            cancel_job,
+            job_runs,
+            default_export_folder,
+            output_name_user,
+            reveal_job_file,
             get_notebook,
             save_notebook,
             delete_notebook,

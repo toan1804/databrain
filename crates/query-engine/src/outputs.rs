@@ -412,6 +412,8 @@ impl OutputRegistry {
     pub fn set_name(&self, handle: &str, name: Option<&str>) -> Result<OutputInfo> {
         if let Some(n) = name {
             validate_name(n)?;
+            let tab = self.inner.lock().by_handle.get(handle).map(|o| o.tab_id.clone()).unwrap_or_default();
+            self.check_owner(n, &tab)?;
         }
         let mut drop_ids = Vec::new();
         let out = {
@@ -458,6 +460,18 @@ impl OutputRegistry {
         }
         self.persist_meta(&out);
         Ok(out)
+    }
+
+    /// Names of job steps belong to them: only runs of that step (run key
+    /// `tab`) may produce `results.<name>`.
+    pub fn check_owner(&self, name: &str, tab: &str) -> Result<()> {
+        match self.workspace.job_step_owner(name) {
+            Ok(Some(owner)) if owner.tab() != tab => Err(EngineError::new(
+                "invalid",
+                format!("results.{name} is the output of {}; only that step can produce it. Choose another name.", owner.describe()),
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Drop an output: frees its data, deletes its saved snapshot (pinned or

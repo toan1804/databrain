@@ -3,6 +3,8 @@
 //! Values use the same display formatting as the grid, so an export matches
 //! what the user sees. JSON keeps numbers and booleans typed.
 
+pub mod load;
+
 use std::io::Write;
 
 use databrain_connector_core::arrow::array::{Array, RecordBatch};

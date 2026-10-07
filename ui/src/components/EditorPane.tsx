@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronsDownUp, FileCode2, FileText, Network, Table2, Lightbulb, Loader2, Play, PlayCircle, Plus, Save, Sparkles, Square, X } from "lucide-react";
+import { ChevronsDownUp, FileCode2, FileText, Network, Table2, Lightbulb, Loader2, Play, PlayCircle, Plus, Save, Sparkles, Square, X, Workflow } from "lucide-react";
 import { isQueryTab, useActiveTab, useStore, type Tab } from "../store";
 import { editorBridge } from "../editorBridge";
 import { SqlEditor } from "./SqlEditor";
@@ -9,6 +9,8 @@ import { NotebookView } from "./Notebook";
 import { OutputTab } from "./OutputTab";
 import { DdlTab } from "./DdlTab";
 import { ParamBar } from "./ParamBar";
+import { JobTab } from "./JobTab";
+import { TabErrorBoundary } from "./TabErrorBoundary";
 import { LineageTab, openLineage } from "./LineageTab";
 import { useAi } from "../aiStore";
 
@@ -51,28 +53,45 @@ export function EditorPane() {
         .filter((t) => t.notebook_id)
         .map((t) => (
           <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
-            <NotebookView tabId={t.id} notebookId={t.notebook_id!} visible={t.id === activeId} />
+            <TabErrorBoundary label="notebook">
+              <NotebookView tabId={t.id} notebookId={t.notebook_id!} visible={t.id === activeId} />
+            </TabErrorBoundary>
           </div>
         ))}
       {tabs
         .filter((t) => t.output_ref)
         .map((t) => (
           <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
-            <OutputTab tabId={t.id} reference={t.output_ref!} visible={t.id === activeId} />
+            <TabErrorBoundary label="output">
+              <OutputTab tabId={t.id} reference={t.output_ref!} visible={t.id === activeId} />
+            </TabErrorBoundary>
           </div>
         ))}
       {tabs
         .filter((t) => t.ddl)
         .map((t) => (
           <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
-            <DdlTab tabId={t.id} reference={t.ddl!} visible={t.id === activeId} />
+            <TabErrorBoundary label="DDL view">
+              <DdlTab tabId={t.id} reference={t.ddl!} visible={t.id === activeId} />
+            </TabErrorBoundary>
+          </div>
+        ))}
+      {tabs
+        .filter((t) => t.job_id)
+        .map((t) => (
+          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
+            <TabErrorBoundary label="job">
+              <JobTab tabId={t.id} jobId={t.job_id!} visible={t.id === activeId} />
+            </TabErrorBoundary>
           </div>
         ))}
       {tabs
         .filter((t) => t.lineage)
         .map((t) => (
           <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
-            <LineageTab tabId={t.id} visible={t.id === activeId} />
+            <TabErrorBoundary label="lineage view">
+              <LineageTab tabId={t.id} visible={t.id === activeId} />
+            </TabErrorBoundary>
           </div>
         ))}
       <div className={active && !isQueryTab(active) ? "hidden" : "contents"}>
@@ -171,6 +190,8 @@ function TabBar() {
               <FileCode2 size={12} className="shrink-0 text-muted" />
             ) : t.lineage ? (
               <Network size={12} className="shrink-0 text-muted" />
+            ) : t.job_id ? (
+              <Workflow size={12} className="shrink-0 text-muted" />
             ) : (
               <ConnDot color={conn?.color} />
             )}

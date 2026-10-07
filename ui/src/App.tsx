@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useJobs } from "./jobsStore";
 import { Command, Moon, Settings2, Sparkles, Sun, TriangleAlert } from "lucide-react";
 import { useStore } from "./store";
 import { editorBridge } from "./editorBridge";
@@ -91,6 +92,7 @@ export default function App() {
       .getState()
       .init()
       .then(() => useAi.getState().init())
+      .then(() => useJobs.getState().init())
       .catch(() => {});
   }, []);
 

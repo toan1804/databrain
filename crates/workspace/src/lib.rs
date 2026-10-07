@@ -6,6 +6,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod ai;
+pub mod jobs;
 pub mod knowledge;
 pub mod meta_cache;
 pub mod notebooks;
@@ -14,6 +15,7 @@ pub mod outputs;
 pub use ai::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry};
 pub use outputs::OutputRecord;
 pub use meta_cache::{CachedColumns, CachedListing, ExplorerCacheState};
+pub use jobs::{FileFormat, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, JobSummary, LoadMode, NodeRunRecord, NodeRunSummary, ScheduleMode, StepOwner};
 pub use notebooks::{CellKind, CellRunSummary, Notebook, NotebookCell, NotebookSummary};
 pub use knowledge::{join_target, split_target, target_mentions, ImportAction, ImportItem, ImportKind, IndexDelta, KnHit, KnNote, KnObject, KnState, NoteEntry, NoteStatus, NotesFile, NotesSource};
 
@@ -149,6 +151,8 @@ pub enum Origin {
     User,
     Ai,
     Mcp,
+    /// A job step (manual or scheduled run).
+    Job,
 }
 
 impl Origin {
@@ -157,12 +161,14 @@ impl Origin {
             Origin::User => "user",
             Origin::Ai => "ai",
             Origin::Mcp => "mcp",
+            Origin::Job => "job",
         }
     }
     fn parse(s: &str) -> Self {
         match s {
             "ai" => Origin::Ai,
             "mcp" => Origin::Mcp,
+            "job" => Origin::Job,
             _ => Origin::User,
         }
     }
@@ -555,6 +561,28 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE meta_objects_v8 RENAME TO meta_objects;
     CREATE INDEX meta_objects_name ON meta_objects (connection_id, name);
     ALTER TABLE meta_columns ADD COLUMN stale INTEGER NOT NULL DEFAULT 0;
+    "#,
+    // v9: jobs (graphs of SQL steps) and their runs
+    r#"
+    CREATE TABLE jobs (
+        id                TEXT PRIMARY KEY,
+        name              TEXT NOT NULL,
+        spec_json         TEXT NOT NULL,
+        last_scheduled_at INTEGER,
+        created_at        INTEGER NOT NULL,
+        updated_at        INTEGER NOT NULL
+    );
+    CREATE TABLE job_runs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id      TEXT NOT NULL,
+        trigger     TEXT NOT NULL,
+        started_at  INTEGER NOT NULL,
+        finished_at INTEGER,
+        status      TEXT NOT NULL,
+        nodes_json  TEXT NOT NULL,
+        error       TEXT
+    );
+    CREATE INDEX job_runs_job ON job_runs (job_id, id DESC);
     "#,
 ];
 

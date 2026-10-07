@@ -5,6 +5,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  Job,
+  JobRun,
+  JobRunEvent,
+  JobSummary,
   ImportAction,
   NotesImportPreview,
   ExcelSheet,
@@ -210,6 +214,19 @@ export const api = {
   moveToFolder: (kind: FolderKind, itemId: string, folderId: string | null) =>
     call<void>("move_to_folder", { kind, itemId, folderId }),
 
+  listJobs: () => call<{ jobs: JobSummary[]; running: string[] }>("list_jobs"),
+  getJob: (id: string) => call<Job>("get_job", { id }),
+  saveJob: (job: Job) => call<Job>("save_job", { job }),
+  deleteJob: (id: string) => call<void>("delete_job", { id }),
+  /** `nodes`: run only these steps (their upstream outputs must exist). */
+  runJob: (id: string, nodes?: string[]) => call<JobRun>("run_job", { id, nodes: nodes ?? null }),
+  cancelJob: (id: string) => call<boolean>("cancel_job", { id }),
+  /** What else uses an output name (for a step of `jobId`), or null when free. */
+  outputNameUser: (name: string, jobId: string) => call<string | null>("output_name_user", { name, jobId }),
+  defaultExportFolder: () => call<string | null>("default_export_folder"),
+  /** Show the file a job's export step last wrote. */
+  revealJobFile: (jobId: string, nodeId: string) => call<void>("reveal_job_file", { jobId, nodeId }),
+  jobRuns: (id: string, limit?: number) => call<JobRun[]>("job_runs", { id, limit: limit ?? null }),
   listNotebooks: () => call<NotebookSummary[]>("list_notebooks"),
   getNotebook: (id: string) => call<Notebook>("get_notebook", { id }),
   saveNotebook: (notebook: Notebook) => call<Notebook>("save_notebook", { notebook }),
@@ -284,6 +301,10 @@ export const api = {
 
 export function onJobEvent(handler: (e: JobEvent) => void): Promise<UnlistenFn> {
   return listen<JobEvent>("job-event", (e) => handler(e.payload));
+}
+
+export function onJobRun(handler: (e: JobRunEvent) => void): Promise<UnlistenFn> {
+  return listen<JobRunEvent>("job-run", (e) => handler(e.payload));
 }
 
 type AiChannelPayload = AgentEvent | AiUiRequest;
