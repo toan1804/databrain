@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { HighlightStyle, bracketMatching, indentOnInput, syntaxHighlighting } from "@codemirror/language";
@@ -21,6 +21,21 @@ import { useStore } from "../store";
 import { editorBridge } from "../editorBridge";
 import { canFetchMetadata, sqlAssist, sqlLanguage } from "./sqlAssist";
 import { queryHints } from "./queryHintsExt";
+import { SqlContextMenu, formatKey } from "./SqlContextMenu";
+
+/** Right-click: keep a selection that contains the click, else put the cursor there; then open the menu. */
+export function editorContextMenu(open: (at: { x: number; y: number }) => void) {
+  return EditorView.domEventHandlers({
+    contextmenu: (e, view) => {
+      e.preventDefault();
+      const pos = view.posAtCoords({ x: e.clientX, y: e.clientY });
+      const sel = view.state.selection.main;
+      if (pos !== null && (sel.empty || pos < sel.from || pos > sel.to)) view.dispatch({ selection: { anchor: pos } });
+      open({ x: e.clientX, y: e.clientY });
+      return true;
+    },
+  });
+}
 
 export const highlight = HighlightStyle.define([
   { tag: [t.keyword, t.operatorKeyword, t.modifier], color: "var(--syn-keyword)", fontWeight: "500" },
@@ -73,6 +88,7 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
   const tab = useStore((s) => s.tabs.find((x) => x.id === tabId));
   const conn = useStore((s) => s.connections.find((c) => c.id === tab?.connection_id));
   const errorRange = useStore((s) => s.runs[tabId]?.errorRange);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 
   // Create the view once per tab.
   useEffect(() => {
@@ -86,6 +102,11 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
         cursor: sel.head,
       });
       return true;
+    };
+    const kindNow = () => {
+      const st = useStore.getState();
+      const cid = st.tabs.find((x) => x.id === tabId)?.connection_id;
+      return st.connections.find((c) => c.id === cid)?.config.kind;
     };
     const initial = useStore.getState().tabs.find((x) => x.id === tabId)?.sql ?? "";
     const view = new EditorView({
@@ -129,6 +150,7 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
               },
               preventDefault: true,
             },
+            formatKey(() => viewRef.current, kindNow),
             ...closeBracketsKeymap,
             ...defaultKeymap,
             ...searchKeymap,
@@ -136,6 +158,7 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
             ...completionKeymap,
             indentWithTab,
           ]),
+          editorContextMenu(setMenu),
           EditorView.updateListener.of((u) => {
             if (!u.docChanged) return;
             const st = useStore.getState();
@@ -188,5 +211,10 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
     }
   }, [visible]);
 
-  return <div ref={host} className="h-full" style={{ display: visible ? "block" : "none" }} />;
+  return (
+    <>
+      <div ref={host} className="h-full" style={{ display: visible ? "block" : "none" }} />
+      {menu && viewRef.current && <SqlContextMenu view={viewRef.current} kind={conn?.config.kind} at={menu} onClose={() => setMenu(null)} />}
+    </>
+  );
 }

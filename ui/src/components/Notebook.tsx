@@ -58,7 +58,8 @@ import { formatCount, formatDuration, uid } from "../lib/util";
 import { useStore } from "../store";
 import { registerKeyConnection, useAi } from "../aiStore";
 import { editorBridge } from "../editorBridge";
-import { errorField, highlight, langExtension, setError } from "./SqlEditor";
+import { editorContextMenu, errorField, highlight, langExtension, setError } from "./SqlEditor";
+import { SqlContextMenu, formatKey } from "./SqlContextMenu";
 import { canFetchMetadata, sqlAssist } from "./sqlAssist";
 import { queryHints } from "./queryHintsExt";
 import { ResizeHandle } from "./ResizeHandle";
@@ -925,6 +926,8 @@ function CellEditor({
   // Read on each completion request (the cell's connection can change).
   const connRef = useRef(connectionId);
   connRef.current = connectionId;
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const kindNow = () => useStore.getState().connections.find((c) => c.id === connRef.current)?.config.kind;
 
   useEffect(() => {
     if (!host.current) return;
@@ -968,6 +971,7 @@ function CellEditor({
               },
               preventDefault: true,
             },
+            formatKey(() => view.current, kindNow),
             ...closeBracketsKeymap,
             ...defaultKeymap,
             ...searchKeymap,
@@ -975,6 +979,7 @@ function CellEditor({
             ...completionKeymap,
             indentWithTab,
           ]),
+          editorContextMenu(setMenu),
           EditorView.updateListener.of((u) => {
             if (u.docChanged) cb.current.onChange(u.state.doc.toString());
           }),
@@ -1038,6 +1043,7 @@ function CellEditor({
         className={`nb-cell overflow-hidden rounded-md border border-line/60 bg-panel-2/40 ${h ? "nb-cell-fixed" : ""}`}
         style={h ? { height: h } : undefined}
       />
+      {menu && view.current && <SqlContextMenu view={view.current} kind={conn?.config.kind} at={menu} onClose={() => setMenu(null)} />}
       <ResizeHandle
         label="Editor height"
         min={EDITOR_MIN}
