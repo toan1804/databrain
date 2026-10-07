@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub mod outputs;
+pub mod probe;
 
 pub use outputs::{NewOutput, OutputInfo, OutputRegistry, OutputState, OutputTables};
 
@@ -322,6 +323,8 @@ pub struct QueryEngine {
     /// Serializes connection attempts per key so parallel calls share one session.
     connecting: Mutex<HashMap<SessionKey, Arc<tokio::sync::Mutex<()>>>>,
     jobs: Mutex<HashMap<String, JobHandle>>,
+    /// Running connection tests (Test button), cancellable by id.
+    tests: Mutex<HashMap<String, CancellationToken>>,
     outputs: Arc<OutputRegistry>,
 }
 
@@ -343,6 +346,7 @@ impl QueryEngine {
             sessions: Mutex::new(HashMap::new()),
             connecting: Mutex::new(HashMap::new()),
             jobs: Mutex::new(HashMap::new()),
+            tests: Mutex::new(HashMap::new()),
             outputs: OutputRegistry::new(results.clone(), workspace.clone()),
             results,
         })
@@ -503,9 +507,72 @@ impl QueryEngine {
 
     // -------------------------------------------------------------- sessions
 
+    /// Seconds a connection attempt may take before it is reported as failed
+    /// (setting `connect_timeout_secs`, default 20). Browser/device sign-in
+    /// is not limited (the user may take a while), only cancellable.
+    pub fn connect_timeout(&self) -> Duration {
+        let secs = self.workspace.get_setting("connect_timeout_secs").ok().flatten().and_then(|v| v.as_u64()).unwrap_or(20);
+        Duration::from_secs(secs.clamp(3, 600))
+    }
+
+    /// DNS + TCP check of the first network hop, so an unreachable server
+    /// fails within seconds with a clear reason instead of the driver's own
+    /// (long, sometimes retried) timeout.
+    async fn preflight(&self, cfg: &ConnectionConfig) -> Result<()> {
+        let default_port = self.registry.get(cfg.kind)?.info().default_port;
+        let Some((host, port)) = probe::target(cfg, default_port) else { return Ok(()) };
+        probe::reach(&host, port, self.connect_timeout().min(Duration::from_secs(8))).await
+    }
+
     /// Test a configuration without saving it. `secret` overrides the stored
     /// secret; if `None` and `connection_id` is given, the stored one is used.
+    /// `test_id` lets [`QueryEngine::cancel_test`] stop it; it also gives up
+    /// after [`QueryEngine::connect_timeout`] (unless sign-in is interactive).
     pub async fn test_connection(
+        &self,
+        cfg: &ConnectionConfig,
+        secret: Option<String>,
+        connection_id: Option<&str>,
+        ssh_secret: Option<String>,
+        test_id: Option<&str>,
+    ) -> Result<TestResult> {
+        let token = CancellationToken::new();
+        if let Some(id) = test_id {
+            if let Some(old) = self.tests.lock().insert(id.to_string(), token.clone()) {
+                old.cancel();
+            }
+        }
+        let limit = (!cfg.auth.is_interactive()).then(|| self.connect_timeout());
+        let work = self.test_connection_inner(cfg, secret, connection_id, ssh_secret);
+        let r = tokio::select! {
+            r = work => r,
+            _ = token.cancelled() => Err(EngineError::new("cancelled", "Test cancelled")),
+            _ = async { match limit { Some(d) => tokio::time::sleep(d).await, None => std::future::pending().await } } => Err(EngineError::new(
+                "connection",
+                format!("No connection after {} s: the server did not finish the handshake/sign-in (check host, port, SSL and firewall)", limit.unwrap_or_default().as_secs()),
+            )),
+        };
+        // Not cancelled = the entry is still ours (a newer test with the same
+        // id cancels this one, and cancel_test removes it).
+        if let Some(id) = test_id.filter(|_| !token.is_cancelled()) {
+            self.tests.lock().remove(id);
+        }
+        r
+    }
+
+    /// Stop a running [`QueryEngine::test_connection`]; dropping it closes
+    /// the half-open socket/tunnel. `false` when it already finished.
+    pub fn cancel_test(&self, test_id: &str) -> bool {
+        match self.tests.lock().remove(test_id) {
+            Some(t) => {
+                t.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    async fn test_connection_inner(
         &self,
         cfg: &ConnectionConfig,
         secret: Option<String>,
@@ -532,6 +599,7 @@ impl QueryEngine {
             (None, None) => Arc::new(InlineCredentialSource::new(cfg.auth.clone(), None)),
         };
         let start = Instant::now();
+        self.preflight(cfg).await?;
         let (cfg, _tunnel) = self.tunnel(cfg, connection_id, ssh_secret.as_deref()).await?;
         let session = connector.connect(&cfg, creds).await?;
         let server_version = session.server_version().await?;
@@ -559,6 +627,7 @@ impl QueryEngine {
         let profile = self.workspace.get_connection(connection_id)?;
         let connector = self.registry.get(profile.config.kind)?;
         let creds = self.credentials(&profile)?;
+        self.preflight(&profile.config).await?;
         let (cfg, tunnel) = self.tunnel(&profile.config, Some(&profile.id), None).await?;
         let session: Arc<dyn Session> = match connector.connect(&cfg, creds.clone()).await {
             Ok(s) => Arc::from(s),
@@ -582,6 +651,12 @@ impl QueryEngine {
     /// Close every session of a connection (after editing or deleting it).
     pub fn disconnect(&self, connection_id: &str) {
         self.sessions.lock().retain(|(c, _), _| c != connection_id);
+    }
+
+    /// A session on a separate tab, for tests that set up data.
+    #[doc(hidden)]
+    pub async fn session_for_tests(&self, connection_id: &str) -> Result<Arc<dyn Session>> {
+        self.session(connection_id, "__tests__").await
     }
 
     /// Connection ids that currently have at least one open session.
@@ -670,6 +745,42 @@ impl QueryEngine {
         self.with_meta(connection_id, |s| {
             let schema = schema.clone();
             async move { s.list_objects(&schema).await }
+        })
+        .await
+    }
+
+    /// Catalogs of three-level engines (`None` for two-level ones).
+    pub async fn list_catalogs(&self, connection_id: &str) -> Result<Option<Vec<databrain_connector_core::CatalogInfo>>> {
+        self.with_meta(connection_id, |s| async move { s.list_catalogs().await }).await
+    }
+
+    pub async fn list_catalog_schemas(&self, connection_id: &str, catalog: &str) -> Result<Vec<SchemaInfo>> {
+        let catalog = catalog.to_string();
+        self.with_meta(connection_id, |s| {
+            let catalog = catalog.clone();
+            async move { s.list_catalog_schemas(&catalog).await }
+        })
+        .await
+    }
+
+    pub async fn explorer_fingerprints(&self, connection_id: &str) -> Result<Option<HashMap<String, String>>> {
+        self.with_meta(connection_id, |s| async move { s.explorer_fingerprints().await }).await
+    }
+
+    pub async fn object_versions(&self, connection_id: &str, schema: &str) -> Result<Option<HashMap<String, String>>> {
+        let schema = schema.to_string();
+        self.with_meta(connection_id, |s| {
+            let schema = schema.clone();
+            async move { s.object_versions(&schema).await }
+        })
+        .await
+    }
+
+    pub async fn list_objects_named(&self, connection_id: &str, schema: &str, names: &[String]) -> Result<Vec<DbObject>> {
+        let (schema, names) = (schema.to_string(), names.to_vec());
+        self.with_meta(connection_id, |s| {
+            let (schema, names) = (schema.clone(), names.clone());
+            async move { s.list_objects_named(&schema, &names).await }
         })
         .await
     }

@@ -126,7 +126,45 @@ function Queries() {
         connection session (the query keeps running) and lists ways to make it cheaper above the result. Faster queries get no tips. 0 turns
         tips off.
       </p>
+      <ConnectTimeout />
     </div>
+  );
+}
+
+/** `connect_timeout_secs`: how long Test / connect may take before it fails. */
+function ConnectTimeout() {
+  const [text, setText] = useState("20");
+  useEffect(() => {
+    api
+      .getSettings()
+      .then((s) => typeof s.connect_timeout_secs === "number" && setText(String(s.connect_timeout_secs)))
+      .catch(() => {});
+  }, []);
+  const n = Number(text);
+  const valid = Number.isInteger(n) && n >= 3 && n <= 600;
+  return (
+    <>
+      <h3 className="pt-3 text-[13px] font-medium">Connecting</h3>
+      <label htmlFor="connect-timeout" className="block text-[12px] text-muted">
+        Give up connecting after (seconds)
+      </label>
+      <input
+        id="connect-timeout"
+        className={`field w-28 ${valid ? "" : "border-danger"}`}
+        inputMode="numeric"
+        value={text}
+        aria-invalid={!valid}
+        onChange={(e) => {
+          setText(e.target.value);
+          const v = Number(e.target.value);
+          if (Number.isInteger(v) && v >= 3 && v <= 600) void api.setSetting("connect_timeout_secs", v).catch(() => {});
+        }}
+      />
+      <p className="text-[11.5px] text-muted">
+        Test and connect first check that the host answers (at most 8 s), so a wrong host or closed port fails at once; the whole attempt stops after
+        this long. Browser sign-in is not limited. 3–600.
+      </p>
+    </>
   );
 }
 

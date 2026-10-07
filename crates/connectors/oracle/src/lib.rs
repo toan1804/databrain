@@ -865,6 +865,52 @@ impl Session for OracleSession {
             .collect())
     }
 
+    /// Every object type the explorer lists: count + hash of name and DDL time.
+    async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let rows = self
+            .query_named(
+                "select owner, count(*) || '/' || sum(ora_hash(object_type || ':' || object_name || ':' || to_char(last_ddl_time, 'YYYYMMDDHH24MISS'))) \
+                 from all_objects where object_type in ('TABLE','VIEW','MATERIALIZED VIEW','PROCEDURE','FUNCTION','PACKAGE','SEQUENCE') \
+                   and object_name not like 'BIN$%' group by owner",
+                vec![],
+            )
+            .await?;
+        Ok(Some(rows.into_iter().filter_map(|r| Some((r.first().cloned().flatten()?, r.get(1).cloned().flatten().unwrap_or_default()))).collect()))
+    }
+
+    /// last_ddl_time per object (same kinds and de-duplication as `list_objects`).
+    async fn object_versions(&self, schema: &str) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let rows = self
+            .query_named(
+                "select object_name, object_type, to_char(last_ddl_time, 'YYYYMMDDHH24MISS') from all_objects \
+                 where owner = :owner and object_type in ('TABLE','VIEW','MATERIALIZED VIEW','PROCEDURE','FUNCTION','PACKAGE','SEQUENCE') \
+                   and object_name not like 'BIN$%' \
+                 order by case object_type when 'TABLE' then 0 when 'VIEW' then 1 when 'MATERIALIZED VIEW' then 1 else 2 end, object_name",
+                vec![("owner", Some(schema.to_string()))],
+            )
+            .await?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = std::collections::HashMap::new();
+        for r in rows {
+            let g = |i: usize| r.get(i).cloned().flatten();
+            let (Some(name), Some(t)) = (g(0), g(1)) else { continue };
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let kind = match t.as_str() {
+                "TABLE" => ObjectKind::Table,
+                "VIEW" => ObjectKind::View,
+                "MATERIALIZED VIEW" => ObjectKind::MaterializedView,
+                "PROCEDURE" => ObjectKind::Procedure,
+                "PACKAGE" => ObjectKind::Package,
+                "SEQUENCE" => ObjectKind::Sequence,
+                _ => ObjectKind::Function,
+            };
+            out.insert(databrain_connector_core::version_key(kind, &name), g(2).unwrap_or_default());
+        }
+        Ok(Some(out))
+    }
+
     async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         let rows = self
             .query_named(

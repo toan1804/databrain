@@ -575,6 +575,7 @@ impl Workspace {
             "SELECT schema_name, name, max(kind), max(comment) FROM ( \
                  SELECT schema_name, name, kind, comment FROM kn_objects WHERE connection_id = ?1 \
                  UNION ALL SELECT schema_name, name, kind, comment FROM meta_objects WHERE connection_id = ?1 \
+                   AND kind IN ('table', 'view', 'materialized_view', 'foreign_table') \
              ) WHERE (?2 IS NULL OR schema_name = ?2) AND lower(name) LIKE '%' || ?3 || '%' ESCAPE '\\' \
              GROUP BY schema_name, name \
              ORDER BY lower(name) NOT LIKE ?3 || '%' ESCAPE '\\', length(name), name LIMIT ?4",

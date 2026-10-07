@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { CheckCircle2, FilePlus2, FolderOpen, FolderPlus, Globe, Info, Loader2, LogOut, Plus, Trash2, XCircle } from "lucide-react";
+import { CheckCircle2, FilePlus2, FolderOpen, FolderPlus, Globe, Info, Loader2, LogOut, Plus, Square, Trash2, XCircle } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type {
   AiPolicy,
@@ -99,7 +99,14 @@ type Section = "general" | "auth" | "ssh" | "ai";
 
 function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | null; folderId: string | null }) {
   const connectors = useStore((s) => s.connectors);
-  const close = useStore((s) => s.closeConnectionDialog);
+  const closeDialog = useStore((s) => s.closeConnectionDialog);
+  /** Id of the running Test, so Cancel (or closing the dialog) can stop it. */
+  const testId = useRef<string | null>(null);
+  const [testSecs, setTestSecs] = useState(0);
+  const close = () => {
+    if (testId.current) void api.cancelTestConnection(testId.current).catch(() => {});
+    closeDialog();
+  };
   const toast = useStore((s) => s.toast);
   const isEdit = !!initial;
   const sorted = useMemo(
@@ -266,17 +273,35 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
   };
 
   const test = async () => {
+    const id = crypto.randomUUID();
+    testId.current = id;
     setBusy("test");
     setTestResult(null);
+    setTestSecs(0);
+    const started = Date.now();
+    const tick = setInterval(() => setTestSecs(Math.floor((Date.now() - started) / 1000)), 1000);
     try {
       const p = buildProfile();
-      const r = await api.testConnection(p.config, secret || null, isEdit && !clearSecret ? p.id : null, sshSecret || null);
-      setTestResult({ ok: true, text: `Connected in ${r.latency_ms} ms — ${r.server_version}` });
+      const r = await api.testConnection(p.config, secret || null, isEdit && !clearSecret ? p.id : null, sshSecret || null, id);
+      if (testId.current === id) setTestResult({ ok: true, text: `Connected in ${r.latency_ms} ms — ${r.server_version}` });
     } catch (e) {
-      setTestResult({ ok: false, text: toError(e).message });
+      const err = toError(e);
+      if (testId.current === id) setTestResult({ ok: false, text: err.kind === "cancelled" ? "Test cancelled" : err.message });
     } finally {
-      setBusy(null);
+      clearInterval(tick);
+      if (testId.current === id) {
+        testId.current = null;
+        setBusy(null);
+      }
     }
+  };
+  const cancelTest = () => {
+    const id = testId.current;
+    if (!id) return;
+    testId.current = null;
+    void api.cancelTestConnection(id).catch(() => {});
+    setBusy(null);
+    setTestResult({ ok: false, text: "Test cancelled" });
   };
 
   const persist = async (): Promise<ConnectionProfile | null> => {
@@ -286,7 +311,14 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
       await st.refreshConnections();
       useStore.setState((s) => {
         const drop = <T,>(m: Record<string, T>) => Object.fromEntries(Object.entries(m).filter(([k]) => !k.startsWith(saved.id)));
-        return { schemas: drop(s.schemas), objects: drop(s.objects), columns: drop(s.columns) };
+        return {
+          schemas: drop(s.schemas),
+          objects: drop(s.objects),
+          columns: drop(s.columns),
+          catalogs: drop(s.catalogs),
+          catalogSchemas: drop(s.catalogSchemas),
+          explorer: drop(s.explorer),
+        };
       });
       const tab = st.tabs.find((t) => t.id === st.activeTabId);
       if (tab && !tab.connection_id && !tab.notebook_id) st.updateTab(tab.id, { connection_id: saved.id });
@@ -386,9 +418,15 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
             </button>
           )}
           {!canSubmit && missing.length > 0 && <span className="mr-auto truncate text-[11.5px] text-muted">Required: {missing.join(", ")}</span>}
-          <button className="btn-ghost" onClick={test} disabled={!canSubmit || !!busy}>
-            {busy === "test" && <Loader2 size={14} className="animate-spin" />} Test
-          </button>
+          {busy === "test" ? (
+            <button className="btn-ghost" onClick={cancelTest} title="Stop the connection test">
+              <Loader2 size={14} className="animate-spin" /> Testing{testSecs ? ` ${testSecs}s` : "…"} <Square size={11} className="ml-1" /> Stop
+            </button>
+          ) : (
+            <button className="btn-ghost" onClick={test} disabled={!canSubmit || !!busy}>
+              Test
+            </button>
+          )}
           <button className="btn-ghost" onClick={close}>
             Cancel
           </button>

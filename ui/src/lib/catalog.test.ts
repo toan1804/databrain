@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { filterLevel, filterNames, topLevelNoun, GROUP_PAGE, groupObjects, groupOpenByDefault, pageObjects, visibleSchemas, columnList, schemaPath, tablePath, cachedHits, groupSchemas, matchRange, objectMatches, rankHits, revealKeys, schemaLabel, splitSchema, treeKey } from "./catalog";
+import { filterLevel, filterNames, topLevelNoun, GROUP_PAGE, groupObjects, groupOpenByDefault, pageObjects, visibleSchemas, columnList, schemaPath, tablePath, cachedHits, groupSchemas, matchRange, objectMatches, rankHits, revealKeys, schemaLabel, splitSchema, treeKey, mergeCatalogSchemas, visibleCatalogs, prefetchSchemas, cacheAge } from "./catalog";
 import type { DbObject, SchemaInfo } from "./types";
 
 const sch = (catalog: string | null, schema: string, is_default = false): SchemaInfo =>
@@ -160,5 +160,39 @@ describe("catalog: top-level explorer filter", () => {
     // Saved before: "main.crm" → shown as catalog main in the picker.
     expect([...filterNames(three, ["main.crm"])]).toEqual(["main"]);
     expect([...filterNames(two, ["HR"])]).toEqual(["HR"]);
+  });
+});
+
+describe("catalog-first explorer", () => {
+  const cats = [
+    { name: "main", is_default: true },
+    { name: "dev", is_default: false },
+  ];
+  it("merges one catalog's schemas in catalog order", () => {
+    let all = mergeCatalogSchemas(undefined, "dev", [sch("dev", "a")], cats);
+    all = mergeCatalogSchemas(all, "main", [sch("main", "z", true), sch("main", "b")], cats);
+    expect(all.map((s) => s.name)).toEqual(["main.z", "main.b", "dev.a"]);
+    all = mergeCatalogSchemas(all, "dev", [sch("dev", "c")], cats);
+    expect(all.map((s) => s.name)).toEqual(["main.z", "main.b", "dev.c"]);
+  });
+  it("filters catalogs, accepting old schema-id filters and search reveals", () => {
+    expect(visibleCatalogs(cats, undefined)).toEqual(cats);
+    expect(visibleCatalogs(cats, ["dev"]).map((c) => c.name)).toEqual(["dev"]);
+    expect(visibleCatalogs(cats, ["dev.sales"]).map((c) => c.name)).toEqual(["dev"]);
+    expect(visibleCatalogs(cats, ["dev"], "main.x").map((c) => c.name)).toEqual(["main", "dev"]);
+    expect(visibleCatalogs(cats, ["gone"])).toEqual(cats);
+  });
+  it("prefetches default, open, then others; skips cached", () => {
+    const list = [sch(null, "a"), sch(null, "b"), sch(null, "c", true), sch(null, "d")];
+    expect(prefetchSchemas(list, new Set(["d"]), new Set(), 3)).toEqual(["c", "d", "a"]);
+    expect(prefetchSchemas(list, new Set(), new Set(["c", "a"]))).toEqual(["b", "d"]);
+  });
+  it("formats cache age", () => {
+    const now = 10_000_000_000;
+    expect(cacheAge(null, now)).toBe("never");
+    expect(cacheAge(now - 5_000, now)).toBe("just now");
+    expect(cacheAge(now - 5 * 60_000, now)).toBe("5 min ago");
+    expect(cacheAge(now - 3 * 3_600_000, now)).toBe("3 h ago");
+    expect(cacheAge(now - 5 * 86_400_000, now)).toBe("5 days ago");
   });
 });

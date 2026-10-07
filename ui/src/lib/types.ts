@@ -151,6 +151,55 @@ export interface SchemaInfo {
   catalog?: string | null;
 }
 
+/** Top level of three-level engines (Databricks catalog, Snowflake database, BigQuery project, DuckDB database). */
+export interface CatalogInfo {
+  name: string;
+  is_default: boolean;
+}
+
+export interface ExplorerCacheState {
+  checked_at: number | null;
+  catalogs_at: number | null;
+  schemas_at: number | null;
+  listed_schemas: number;
+}
+
+/** What the explorer cache (local SQLite) holds for a connection. */
+export interface CachedExplorer {
+  catalogs: CatalogInfo[] | null;
+  schemas: SchemaInfo[] | null;
+  catalog_schemas: Record<string, SchemaInfo[]>;
+  state: ExplorerCacheState;
+}
+
+export interface CachedListing {
+  objects: DbObject[];
+  listed_at: number;
+}
+
+export interface CachedColumns {
+  columns: ColumnInfo[];
+  /** The table changed (or may have) since: show, but describe again when online. */
+  stale: boolean;
+}
+
+export interface SchemaRefresh {
+  schema: string;
+  mode: "unchanged" | "incremental" | "full";
+  added: number;
+  changed: number;
+  removed: number;
+  objects: DbObject[];
+}
+
+export interface ExplorerRevalidation {
+  refreshed: SchemaRefresh[];
+  unchanged: number;
+  deferred: string[];
+  fingerprints: boolean;
+  skipped: boolean;
+}
+
 export type ObjectKind =
   | "table"
   | "view"

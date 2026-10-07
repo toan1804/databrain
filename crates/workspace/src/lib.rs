@@ -13,6 +13,7 @@ pub mod outputs;
 
 pub use ai::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry};
 pub use outputs::OutputRecord;
+pub use meta_cache::{CachedColumns, CachedListing, ExplorerCacheState};
 pub use notebooks::{CellKind, CellRunSummary, Notebook, NotebookCell, NotebookSummary};
 pub use knowledge::{join_target, split_target, target_mentions, ImportAction, ImportItem, ImportKind, IndexDelta, KnHit, KnNote, KnObject, KnState, NoteEntry, NoteStatus, NotesFile, NotesSource};
 
@@ -508,6 +509,53 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (connection_id, schema_name)
     );
     "#,
+    // v8: explorer cache (catalog/schema lists, complete listings, object
+    // versions, stale columns) for instant/offline explorer and incremental refresh
+    r#"
+    CREATE TABLE meta_conn_state (
+        connection_id TEXT PRIMARY KEY,
+        identity      TEXT,
+        catalogs_at   INTEGER,
+        schemas_at    INTEGER,
+        checked_at    INTEGER
+    );
+    CREATE TABLE meta_catalogs (
+        connection_id TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        is_default    INTEGER NOT NULL,
+        pos           INTEGER NOT NULL,
+        schemas_at    INTEGER,
+        PRIMARY KEY (connection_id, name)
+    );
+    CREATE TABLE meta_schemas (
+        connection_id TEXT NOT NULL,
+        schema_name   TEXT NOT NULL,
+        catalog       TEXT,
+        is_default    INTEGER NOT NULL,
+        pos           INTEGER NOT NULL,
+        listed_at     INTEGER,
+        listed_fp     TEXT,
+        PRIMARY KEY (connection_id, schema_name)
+    );
+    -- A table and a function may share a name: kind joins the key.
+    CREATE TABLE meta_objects_v8 (
+        connection_id TEXT NOT NULL,
+        schema_name   TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        kind          TEXT NOT NULL,
+        comment       TEXT,
+        row_estimate  INTEGER,
+        seen_at       INTEGER NOT NULL,
+        version       TEXT,
+        PRIMARY KEY (connection_id, schema_name, kind, name)
+    );
+    INSERT INTO meta_objects_v8 (connection_id, schema_name, name, kind, comment, row_estimate, seen_at)
+        SELECT connection_id, schema_name, name, kind, comment, row_estimate, seen_at FROM meta_objects;
+    DROP TABLE meta_objects;
+    ALTER TABLE meta_objects_v8 RENAME TO meta_objects;
+    CREATE INDEX meta_objects_name ON meta_objects (connection_id, name);
+    ALTER TABLE meta_columns ADD COLUMN stale INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 /// Maximum history rows kept; older rows are pruned on insert.
@@ -607,6 +655,8 @@ impl Workspace {
             ],
         )?;
         drop(c);
+        // Another server (or user): the cached explorer describes something else.
+        self.meta_check_identity(&p.id, &p.config)?;
         self.get_connection(&p.id)
     }
 
@@ -628,6 +678,9 @@ impl Workspace {
         tx.execute("DELETE FROM meta_objects WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM kn_schema_state WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM meta_schemas WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM meta_conn_state WHERE connection_id = ?1", [id])?;
         tx.execute("UPDATE tabs SET connection_id = NULL WHERE connection_id = ?1", [id])?;
         tx.commit()?;
         Ok(())

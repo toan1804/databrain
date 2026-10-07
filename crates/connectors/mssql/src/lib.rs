@@ -714,6 +714,51 @@ impl Session for MssqlSession {
     /// Per schema: object count + last modify_date of tables, views and
     /// foreign keys (ALTER TABLE updates it), plus a checksum of
     /// MS_Description comments (which do not touch modify_date).
+    /// Every object the explorer lists (tables, views, routines, sequences):
+    /// count + checksum of (id, modify_date) + table comments.
+    async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let rows = self
+            .rows(
+                "select s.name, concat( \
+                   (select count(*) from sys.objects o where o.schema_id = s.schema_id and o.type in ('U','V','P','FN','IF','TF','SO') and o.is_ms_shipped = 0), '/', \
+                   (select checksum_agg(checksum(o.object_id, o.modify_date)) from sys.objects o \
+                      where o.schema_id = s.schema_id and o.type in ('U','V','P','FN','IF','TF','SO') and o.is_ms_shipped = 0), '/', \
+                   (select checksum_agg(checksum(ep.major_id, ep.minor_id, cast(ep.value as nvarchar(4000)))) from sys.extended_properties ep \
+                      join sys.objects o on o.object_id = ep.major_id where ep.class = 1 and ep.name = 'MS_Description' and o.schema_id = s.schema_id)) \
+                 from sys.schemas s",
+                vec![],
+            )
+            .await?;
+        Ok(Some(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect()))
+    }
+
+    /// modify_date per object (any ALTER, column change) + its comments.
+    async fn object_versions(&self, schema: &str) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let rows = self
+            .rows(
+                "select rtrim(o.type), o.name, concat(convert(varchar(30), o.modify_date, 126), ':', \
+                   (select checksum_agg(checksum(ep.minor_id, cast(ep.value as nvarchar(4000)))) from sys.extended_properties ep \
+                      where ep.class = 1 and ep.major_id = o.object_id and ep.name = 'MS_Description')) \
+                 from sys.objects o where schema_name(o.schema_id) = @P1 and o.type in ('U','V','P','FN','IF','TF','SO') and o.is_ms_shipped = 0",
+                vec![schema.into()],
+            )
+            .await?;
+        Ok(Some(
+            rows.iter()
+                .filter_map(|r| {
+                    let kind = match r.get::<&str, _>(0)? {
+                        "U" => ObjectKind::Table,
+                        "V" => ObjectKind::View,
+                        "P" => ObjectKind::Procedure,
+                        "SO" => ObjectKind::Sequence,
+                        _ => ObjectKind::Function,
+                    };
+                    Some((databrain_connector_core::version_key(kind, r.get::<&str, _>(1)?), r.get::<&str, _>(2).unwrap_or_default().to_string()))
+                })
+                .collect(),
+        ))
+    }
+
     async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         let rows = self
             .rows(

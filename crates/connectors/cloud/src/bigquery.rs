@@ -431,6 +431,11 @@ impl Session for BqSession {
         Ok(out)
     }
 
+    /// The billing project (its datasets are what `list_schemas` lists).
+    async fn list_catalogs(&self) -> Result<Option<Vec<databrain_connector_core::CatalogInfo>>> {
+        Ok(Some(vec![databrain_connector_core::CatalogInfo { name: self.0.project.clone(), is_default: true }]))
+    }
+
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {
         let (project, dataset) = split_dataset(schema)?;
         let mut out = Vec::new();

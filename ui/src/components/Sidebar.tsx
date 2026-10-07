@@ -35,6 +35,7 @@ import {
   TextCursorInput,
   Trash2,
   Unplug,
+  WifiOff,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { api, toError } from "../lib/api";
@@ -53,7 +54,9 @@ import {
   topLevelNoun,
   treeKey,
   visibleSchemas,
-  type CatalogGroup,
+  visibleCatalogs,
+  cacheAge,
+  THREE_LEVEL,
   type ObjectGroupName,
 } from "../lib/catalog";
 import { CatalogSearch, selectTop } from "./CatalogSearch";
@@ -322,9 +325,14 @@ function useTreeOpen(key: string, fallback: boolean): [boolean, (open: boolean) 
   return [stored ?? fallback, useCallback((open: boolean) => setTreeOpen(key, open), [key, setTreeOpen])];
 }
 
+/** Connections whose explorer was opened this session (cache shown, then checked). */
+const explorerOpened = new Set<string>();
+
 function ConnectionNode({ conn }: { conn: ConnectionView }) {
   const schemas = useStore((s) => s.schemas[conn.id]);
-  const loadSchemas = useStore((s) => s.loadSchemas);
+  const catalogList = useStore((s) => (THREE_LEVEL.includes(conn.config.kind) ? s.catalogs[conn.id] : undefined));
+  const status = useStore((s) => s.explorer[conn.id]);
+  const openExplorer = useStore((s) => s.openExplorer);
   const disconnect = useStore((s) => s.disconnect);
   const openDialog = useStore((s) => s.openConnectionDialog);
   const newTab = useStore((s) => s.newTab);
@@ -335,13 +343,16 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
   const [error, setError] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 
+  const loaded = !!(catalogList ?? schemas);
   const load = useCallback(
     async (force = false) => {
+      explorerOpened.add(conn.id);
       setLoading(true);
       setError(null);
       try {
-        await loadSchemas(conn.id, force);
+        await openExplorer(conn.id, force);
       } catch (e) {
+        explorerOpened.delete(conn.id);
         setError(toError(e).message);
         setExpanded(false);
         toast(`${conn.name}: ${toError(e).message}`, "error");
@@ -349,14 +360,14 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
         setLoading(false);
       }
     },
-    [conn.id, conn.name, loadSchemas, toast, setExpanded],
+    [conn.id, conn.name, openExplorer, toast, setExpanded],
   );
 
-  // Load on expand (by click or by a search reveal).
+  // Open on expand (by click or by a search reveal): the cache shows at once, the server is asked meanwhile.
   useEffect(() => {
-    if (expanded && !schemas && !loading && !error) void load();
+    if (expanded && (!explorerOpened.has(conn.id) || !loaded) && !loading && !error) void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded, schemas]);
+  }, [expanded, loaded]);
 
   const toggle = () => {
     if (!expanded) setError(null);
@@ -379,10 +390,14 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
   }, [revealed]);
   useEffect(() => setSticky(null), [chosen]);
   const extra = revealed ?? sticky;
-  const shownSchemas = useMemo(() => (schemas ? visibleSchemas(schemas, chosen, extra) : undefined), [schemas, chosen, extra]);
-  const filtered = !!schemas && !!shownSchemas && shownSchemas.length < schemas.length;
+  // Catalog-first (three-level engines): catalogs are listed before any schema.
+  const shownCatalogs = useMemo(() => (catalogList ? visibleCatalogs(catalogList, chosen, extra) : null), [catalogList, chosen, extra]);
+  const shownSchemas = useMemo(() => (!catalogList && schemas ? visibleSchemas(schemas, chosen, extra) : undefined), [catalogList, schemas, chosen, extra]);
+  const groups = useMemo(() => (shownSchemas ? groupSchemas(shownSchemas) : null), [shownSchemas]);
+  const filtered = catalogList
+    ? !!shownCatalogs && shownCatalogs.length < catalogList.length
+    : !!schemas && !!shownSchemas && shownSchemas.length < schemas.length;
   const topNoun = topLevelNoun(conn.config.kind, true);
-  const catalogs = useMemo(() => (shownSchemas ? groupSchemas(shownSchemas) : null), [shownSchemas]);
   const pickSchemas = () => {
     setMenu(null);
     useStore.setState({ schemaPicker: conn.id });
@@ -403,6 +418,7 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
             <EnvBadge env={conn.env} />
             {conn.config.read_only && <span className="text-[10px] text-muted">RO</span>}
             {error && <AlertCircle size={12} className="text-danger" />}
+            {!error && status?.offline && expanded && <WifiOff size={12} className="text-warning" aria-label="Offline: showing cached explorer" />}
           </span>
         }
         onClick={toggle}
@@ -470,14 +486,31 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
           <MenuItem icon={<Trash2 size={13} />} label="Delete connection…" hint="⌘⌫" danger onClick={() => { setMenu(null); void useStore.getState().deleteConnection(conn.id); }} />
         </Popover>
       )}
+      {expanded && status?.offline && (
+        <Row
+          depth={1}
+          icon={<WifiOff size={12} className="text-warning" />}
+          label={
+            <span className="text-[11.5px] text-muted">
+              Offline · cached {cacheAge(status.checkedAt)} · <span className="text-accent">retry</span>
+            </span>
+          }
+          title={`Cannot reach the server, showing what was cached (tables, columns; completion works too).\n${status.offline}`}
+          onClick={() => void load()}
+        />
+      )}
       {expanded && filtered && (
         <Row
           depth={1}
           icon={<ListChecks size={12} className="text-accent" />}
           label={
             <span className="text-[11.5px] text-muted">
-              {catalogs ? `${catalogs.length} of ${groupSchemas(schemas!)?.length ?? 0}` : `${shownSchemas!.length} of ${schemas!.length}`} {topNoun} ·{" "}
-              <span className="text-accent">change</span>
+              {catalogList
+                ? `${shownCatalogs!.length} of ${catalogList.length}`
+                : groups
+                  ? `${groups.length} of ${groupSchemas(schemas!)?.length ?? 0}`
+                  : `${shownSchemas!.length} of ${schemas!.length}`}{" "}
+              {topNoun} · <span className="text-accent">change</span>
             </span>
           }
           title={`Choose which ${topNoun} are listed`}
@@ -485,64 +518,122 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
         />
       )}
       {expanded &&
+        shownCatalogs &&
+        shownCatalogs.map((c) => (
+          <CatalogNode
+            key={c.name}
+            conn={conn}
+            name={c.name}
+            filtered={!!chosen}
+            // The Results connection exists to query outputs: show them.
+            defaultOpen={!chosen && (c.is_default || shownCatalogs.length === 1 || (c.name === "results" && conn.config.options?.databrain_results === "1"))}
+          />
+        ))}
+      {expanded &&
         shownSchemas &&
-        (catalogs
-          ? catalogs.map((g) => (
+        (groups
+          ? groups.map((g) => (
               <CatalogNode
                 key={g.name}
                 conn={conn}
-                group={g}
+                name={g.name}
+                schemas={g.schemas}
                 filtered={!!chosen}
-                // The Results connection exists to query outputs: show them.
-                defaultOpen={!chosen && (g.isDefault || catalogs.length === 1 || (g.name === "results" && conn.config.options?.databrain_results === "1"))}
+                defaultOpen={!chosen && (g.isDefault || groups.length === 1 || (g.name === "results" && conn.config.options?.databrain_results === "1"))}
               />
             ))
           : shownSchemas.map((s) => (
               <SchemaNode key={s.name} conn={conn} schema={s} depth={1} defaultOpen={!chosen && (s.is_default || shownSchemas.length === 1)} />
             )))}
-      {expanded && schemas?.length === 0 && <div className="py-1 pl-10 text-[12px] text-muted">No schemas</div>}
+      {expanded && !catalogList && schemas?.length === 0 && <div className="py-1 pl-10 text-[12px] text-muted">No schemas</div>}
+      {expanded && catalogList?.length === 0 && <div className="py-1 pl-10 text-[12px] text-muted">No {topNoun}</div>}
     </div>
   );
 }
 
-/** Top level of three-level engines: Databricks catalog, Snowflake database, BigQuery project, DuckDB database. */
-function CatalogNode({ conn, group, defaultOpen, filtered = false }: { conn: ConnectionView; group: CatalogGroup; defaultOpen: boolean; filtered?: boolean }) {
-  const [expanded, setExpanded] = useTreeOpen(treeKey.catalog(conn.id, group.name), defaultOpen);
+/**
+ * Top level of three-level engines: Databricks catalog, Snowflake database,
+ * BigQuery project, DuckDB database. Its schemas come with it (`schemas`) or
+ * are listed when it opens (cache first).
+ */
+function CatalogNode({ conn, name, schemas: given, defaultOpen, filtered = false }: { conn: ConnectionView; name: string; schemas?: SchemaInfo[]; defaultOpen: boolean; filtered?: boolean }) {
+  const [expanded, setExpanded] = useTreeOpen(treeKey.catalog(conn.id, name), defaultOpen);
+  const listed = useStore((s) => s.catalogSchemas[`${conn.id}|${name}`]);
+  const loadCatalogSchemas = useStore((s) => s.loadCatalogSchemas);
+  const toast = useStore((s) => s.toast);
+  const schemas = given ?? listed;
+  const [loading, setLoading] = useState(false);
   const noun = conn.config.kind === "bigquery" ? "Project" : conn.config.kind === "databricks" ? "Catalog" : "Database";
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const load = useCallback(
+    async (force = false) => {
+      setLoading(true);
+      try {
+        await loadCatalogSchemas(conn.id, name, force);
+      } catch (e) {
+        toast(`${name}: ${toError(e).message}`, "error");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [conn.id, name, loadCatalogSchemas, toast],
+  );
+  useEffect(() => {
+    if (expanded && !given && !loading) void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expanded]);
+  const sorted = useMemo(
+    () => (schemas ? [...schemas].sort((a, b) => Number(b.is_default) - Number(a.is_default) || schemaLabel(a).localeCompare(schemaLabel(b))) : undefined),
+    [schemas],
+  );
   return (
     <div>
       <Row
         depth={1}
         expanded={expanded}
+        loading={loading && !schemas}
         icon={<Library size={13} />}
-        label={group.name}
-        title={`${noun} ${group.name}`}
-        meta={group.schemas.length}
+        label={name}
+        title={`${noun} ${name}`}
+        meta={schemas?.length}
         onClick={() => setExpanded(!expanded)}
         onContextMenu={(e) => {
           e.preventDefault();
           setMenu({ x: e.clientX, y: e.clientY });
         }}
         actions={
-          <button
-            className="icon-btn h-6 w-6"
-            title={`Copy ${noun.toLowerCase()} name`}
-            aria-label={`Copy ${noun.toLowerCase()} name`}
-            onClick={(e) => {
-              e.stopPropagation();
-              void copyText(group.name, `${noun.toLowerCase()} name`);
-            }}
-          >
-            <ClipboardCopy size={12} />
-          </button>
+          <>
+            <button
+              className="icon-btn h-6 w-6"
+              title={`Copy ${noun.toLowerCase()} name`}
+              aria-label={`Copy ${noun.toLowerCase()} name`}
+              onClick={(e) => {
+                e.stopPropagation();
+                void copyText(name, `${noun.toLowerCase()} name`);
+              }}
+            >
+              <ClipboardCopy size={12} />
+            </button>
+            {!given && (
+              <button
+                className="icon-btn h-6 w-6"
+                title="Refresh schemas"
+                aria-label={`Refresh schemas of ${name}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void load(true);
+                }}
+              >
+                <RefreshCw size={12} />
+              </button>
+            )}
+          </>
         }
       />
-      {menu && <CatalogMenu conn={conn} catalog={group.name} at={menu} onClose={() => setMenu(null)} />}
+      {menu && <CatalogMenu conn={conn} catalog={name} at={menu} onClose={() => setMenu(null)} />}
       {expanded &&
-        group.schemas.map((s) => (
-          <SchemaNode key={s.name} conn={conn} schema={s} depth={2} defaultOpen={!filtered && (s.is_default || group.schemas.length === 1)} />
-        ))}
+        sorted?.map((s) => <SchemaNode key={s.name} conn={conn} schema={s} depth={2} defaultOpen={!filtered && (s.is_default || sorted.length === 1)} />)}
+      {expanded && sorted?.length === 0 && <div className="py-1 text-[12px] text-muted" style={{ paddingLeft: 26 + 2 * 14 }}>No schemas</div>}
     </div>
   );
 }

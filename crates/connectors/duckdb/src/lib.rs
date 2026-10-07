@@ -773,6 +773,23 @@ impl Session for DuckSession {
             .collect())
     }
 
+    async fn list_catalogs(&self) -> Result<Option<Vec<databrain_connector_core::CatalogInfo>>> {
+        let rows = self
+            .strings(
+                "select database_name, (database_name = current_database())::varchar from duckdb_databases() \
+                 where not internal and database_name <> 'results' order by database_name = current_database() desc, 1"
+                    .into(),
+                vec![],
+            )
+            .await?;
+        Ok(Some(
+            rows.into_iter()
+                .filter_map(|r| Some(databrain_connector_core::CatalogInfo { name: r[0].clone()?, is_default: r[1].as_deref() == Some("true") }))
+                .chain((!self.output_catalog().is_empty()).then(|| databrain_connector_core::CatalogInfo { name: "results".into(), is_default: false }))
+                .collect(),
+        ))
+    }
+
     /// Hash of every column definition and comment per schema (local
     /// catalogs: cheap). `results` outputs are left out (always re-read).
     async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
@@ -989,6 +1006,18 @@ mod tests {
 
     async fn q(s: &dyn Session, sql: &str) -> databrain_connector_core::Collected {
         s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn catalogs_first() {
+        let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        q(&*s, "ATTACH ':memory:' AS other; CREATE SCHEMA other.sales").await;
+        let cats = s.list_catalogs().await.unwrap().unwrap();
+        assert_eq!(cats.iter().map(|c| (c.name.as_str(), c.is_default)).collect::<Vec<_>>(), vec![("memory", true), ("other", false)]);
+        let sch: Vec<String> = s.list_catalog_schemas("other").await.unwrap().into_iter().map(|x| x.name).collect();
+        let all: Vec<String> = s.list_schemas().await.unwrap().into_iter().filter(|x| x.catalog.as_deref() == Some("other")).map(|x| x.name).collect();
+        assert!(sch.contains(&"other.sales".to_string()));
+        assert_eq!(sch, all, "same ids as list_schemas");
     }
 
     #[tokio::test]

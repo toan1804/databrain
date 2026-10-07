@@ -840,6 +840,38 @@ impl Session for DbxSession {
         Ok(out)
     }
 
+    async fn list_catalogs(&self) -> Result<Option<Vec<databrain_connector_core::CatalogInfo>>> {
+        let default_cat = self.0.catalog.lock().await.clone();
+        let rows = match self.0.run_small("SHOW CATALOGS").await {
+            Ok(r) => r,
+            Err(_) => vec![vec![json!("hive_metastore")]],
+        };
+        let mut out: Vec<databrain_connector_core::CatalogInfo> = rows
+            .iter()
+            .filter_map(|r| cell(r, 0))
+            .map(|name| databrain_connector_core::CatalogInfo { is_default: default_cat.as_deref() == Some(name.as_str()), name })
+            .collect();
+        out.sort_by(|a, b| b.is_default.cmp(&a.is_default).then_with(|| a.name.cmp(&b.name)));
+        Ok(Some(out))
+    }
+
+    async fn list_catalog_schemas(&self, catalog: &str) -> Result<Vec<SchemaInfo>> {
+        let default_cat = self.0.catalog.lock().await.clone();
+        let default_sch = self.0.schema.lock().await.clone().unwrap_or_else(|| "default".into());
+        let rows = self.0.run_small(&format!("SHOW SCHEMAS IN {}", quote_ident(ConnectorKind::Databricks, catalog))).await?;
+        let mut out: Vec<SchemaInfo> = rows
+            .iter()
+            .filter_map(|r| cell(r, 0))
+            .filter(|s| s != "information_schema")
+            .map(|s| {
+                let is_default = default_cat.as_deref().is_none_or(|d| d == catalog) && s == default_sch;
+                SchemaInfo::in_catalog(catalog, &s, is_default)
+            })
+            .collect();
+        out.sort_by(|a, b| b.is_default.cmp(&a.is_default).then_with(|| a.name.cmp(&b.name)));
+        Ok(out)
+    }
+
     async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
         let term = databrain_connector_core::search_sql_term(query);
         let sql = format!(

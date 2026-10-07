@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { revealKeys, splitSchema, treeKey } from "./lib/catalog";
+import { THREE_LEVEL, mergeCatalogSchemas, prefetchSchemas, revealKeys, splitSchema, treeKey } from "./lib/catalog";
 import { api, isTauri, onAuthEvent, onJobEvent, onOracleAgent, toError } from "./lib/api";
 import { DEFAULT_SLOW_QUERY_SECONDS, computeRunTips, slowStatements, type RunTips } from "./queryTips";
 import type {
@@ -8,6 +8,7 @@ import type {
   FolderKind,
   NotebookSummary,
   OutputInfo,
+  CatalogInfo,
   ColumnInfo,
   ConnectionView,
   ConnectorInfo,
@@ -115,6 +116,12 @@ interface State {
   schemas: Record<string, SchemaInfo[]>;
   objects: Record<string, DbObject[]>; // key `${conn}|${schema}`
   columns: Record<string, ColumnInfo[]>; // key `${conn}|${schema}|${name}`
+  /** Catalogs of three-level engines, listed before any schema. */
+  catalogs: Record<string, CatalogInfo[]>;
+  /** Schema lists per catalog (key `${conn}|${catalog}`); merged into `schemas` too. */
+  catalogSchemas: Record<string, SchemaInfo[]>;
+  /** Where the explorer of a connection comes from (cache / live) and whether it is offline. */
+  explorer: Record<string, ExplorerStatus>;
   theme: Theme;
   rowLimit: number;
   /** Tips are computed for statements running at least this long (0 = off). */
@@ -156,6 +163,15 @@ interface State {
   openConnectionDialog: (profile?: ConnectionView | null, folderId?: string | null) => void;
   closeConnectionDialog: () => void;
   loadSchemas: (connId: string, force?: boolean) => Promise<SchemaInfo[]>;
+  /**
+   * Open a connection's explorer: show the local cache at once, then list the
+   * top level live (catalogs on three-level engines, schemas elsewhere),
+   * check cached schemas for changes and prefetch tables in the background.
+   * Throws only when there is neither a cache nor a connection.
+   */
+  openExplorer: (connId: string, force?: boolean) => Promise<void>;
+  /** Schemas of one catalog (cache first, then live). */
+  loadCatalogSchemas: (connId: string, catalog: string, force?: boolean) => Promise<SchemaInfo[]>;
   loadObjects: (connId: string, schema: string, force?: boolean) => Promise<DbObject[]>;
   loadColumns: (connId: string, schema: string, name: string) => Promise<ColumnInfo[]>;
   disconnect: (connId: string) => Promise<void>;
@@ -198,6 +214,32 @@ interface State {
   setPaletteOpen: (open: boolean) => void;
   askConfirm: (c: ConfirmState | null) => void;
 }
+
+export interface ExplorerStatus {
+  /** Showing the cached tree; `offline` = the server could not be reached. */
+  offline?: string | null;
+  /** When the cache was last checked against the server. */
+  checkedAt?: number | null;
+  /** The engine has schema fingerprints (otherwise schemas are re-listed when opened). */
+  fingerprints?: boolean;
+  /** Listed schemas not checked yet (refreshed when opened). */
+  deferred?: string[];
+  /** Background check running. */
+  checking?: boolean;
+}
+
+/** Schema loads in flight (dedupes clicks, prefetch and completion). */
+const inflight = new Map<string, Promise<unknown>>();
+function once<T>(key: string, f: () => Promise<T>): Promise<T> {
+  const have = inflight.get(key) as Promise<T> | undefined;
+  if (have) return have;
+  const p = f().finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
+
+/** Background prefetch, one schema at a time so it never competes with clicks much. */
+let prefetchChain: Promise<unknown> = Promise.resolve();
 
 const TAB_SAVE_DELAY = 400;
 
@@ -308,13 +350,18 @@ export const useStore = create<State>((set, get) => ({
         const schemas = Object.fromEntries(
           Object.entries(s.schemas).filter(([id, list]) => !(duck.has(id) && outputs.length > 0 && !list.some((x) => x.name === "results.main"))),
         );
-        return { outputs, objects, columns, schemas };
+        // Catalog-first: the `results` catalog appears with the first output.
+        const catalogs = Object.fromEntries(
+          Object.entries(s.catalogs).filter(([id, list]) => !(duck.has(id) && outputs.length > 0 && !list.some((x) => x.name === "results"))),
+        );
+        return { outputs, objects, columns, schemas, catalogs };
       });
       // Reload what the explorer shows open.
       const st = get();
       for (const c of st.connections) {
         if (c.config.kind !== "duckdb") continue;
-        if (st.treeOpen[`c|${c.id}`] && !st.schemas[c.id]) st.loadSchemas(c.id).catch(() => {});
+        if (st.treeOpen[`c|${c.id}`] && !st.catalogs[c.id] && !st.schemas[c.id]) st.openExplorer(c.id).catch(() => {});
+        else if (st.treeOpen[`c|${c.id}`] && !st.catalogs[c.id]) st.loadSchemas(c.id).catch(() => {});
         if (st.treeOpen[`s|${c.id}|results.main`] && st.schemas[c.id]?.some((x) => x.name === "results.main")) st.loadObjects(c.id, "results.main").catch(() => {});
       }
     } catch {
@@ -379,6 +426,9 @@ export const useStore = create<State>((set, get) => ({
   schemas: {},
   objects: {},
   columns: {},
+  catalogs: {},
+  catalogSchemas: {},
+  explorer: {},
   theme: "dark",
   rowLimit: 1000,
   slowQuerySeconds: DEFAULT_SLOW_QUERY_SECONDS,
@@ -540,30 +590,196 @@ export const useStore = create<State>((set, get) => ({
   closeConnectionDialog: () => set({ connectionDialog: { open: false } }),
 
   loadSchemas: async (connId, force = false) => {
+    // On three-level engines this may be the explored catalogs' schemas only (enough for completion).
     const cached = get().schemas[connId];
     if (cached && !force) return cached;
-    const schemas = await api.listSchemas(connId);
+    if (!force && !cached) {
+      const c = await api.cachedExplorer(connId).catch(() => null);
+      if (c?.schemas) {
+        set((s) => ({ schemas: { ...s.schemas, [connId]: c.schemas! } }));
+        // Up to date in the background.
+        void once(`schemas|${connId}`, () => api.listSchemas(connId))
+          .then((schemas) => set((s) => ({ schemas: { ...s.schemas, [connId]: schemas } })))
+          .catch(() => {});
+        return c.schemas;
+      }
+    }
+    const schemas = await once(`schemas|${connId}`, () => api.listSchemas(connId));
     set((s) => ({ schemas: { ...s.schemas, [connId]: schemas } }));
     get()
       .refreshConnections()
       .catch(() => {});
     return schemas;
   },
+  openExplorer: async (connId, force = false) => {
+    const conn = get().connections.find((c) => c.id === connId);
+    if (!conn) return;
+    const three = THREE_LEVEL.includes(conn.config.kind);
+    // 1. The cache, at once (no network).
+    const cache = force ? null : await api.cachedExplorer(connId).catch(() => null);
+    const fromCache = !!cache && (three ? !!cache.catalogs : !!cache.schemas);
+    if (cache && fromCache) {
+      set((s) => {
+        const catalogSchemas = { ...s.catalogSchemas };
+        let schemas = s.schemas[connId] ?? cache.schemas ?? undefined;
+        for (const [cat, list] of Object.entries(cache.catalog_schemas)) {
+          catalogSchemas[`${connId}|${cat}`] = list;
+          if (!cache.schemas) schemas = mergeCatalogSchemas(schemas, cat, list, cache.catalogs ?? undefined);
+        }
+        return {
+          catalogs: cache.catalogs ? { ...s.catalogs, [connId]: cache.catalogs } : s.catalogs,
+          catalogSchemas,
+          schemas: schemas ? { ...s.schemas, [connId]: schemas } : s.schemas,
+          explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], checkedAt: cache.state.checked_at } },
+        };
+      });
+    }
+    // 2. The top level, live.
+    const live = (async () => {
+      if (three) {
+        const cats = await once(`catalogs|${connId}`, () => api.listCatalogs(connId));
+        if (cats) {
+          set((s) => ({ catalogs: { ...s.catalogs, [connId]: cats } }));
+          return;
+        }
+      }
+      const schemas = await once(`schemas|${connId}`, () => api.listSchemas(connId));
+      set((s) => ({ schemas: { ...s.schemas, [connId]: schemas } }));
+    })();
+    try {
+      await live;
+    } catch (e) {
+      if (!fromCache) throw e;
+      // Offline: keep the cached tree, say so.
+      set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], offline: toError(e).message, checking: false } } }));
+      return;
+    }
+    set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], offline: null } } }));
+    get()
+      .refreshConnections()
+      .catch(() => {});
+    // 3. Background: which cached schemas changed (refreshed table by table), then prefetch.
+    void (async () => {
+      const st = get();
+      const open = Object.entries(st.treeOpen)
+        .filter(([k, v]) => v && k.startsWith(`s|${connId}|`))
+        .map(([k]) => k.slice(connId.length + 3));
+      set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], checking: true } } }));
+      try {
+        const r = await api.revalidateExplorer(connId, open, force);
+        set((s) => {
+          const objects = { ...s.objects };
+          let columns = s.columns;
+          for (const x of r.refreshed) {
+            if (x.mode === "unchanged") continue;
+            objects[`${connId}|${x.schema}`] = x.objects;
+            // Columns re-read from the cache (changed tables are marked stale there).
+            const pre = `${connId}|${x.schema}|`;
+            columns = Object.fromEntries(Object.entries(columns).filter(([k]) => !k.startsWith(pre)));
+          }
+          const prev = s.explorer[connId];
+          return {
+            objects,
+            columns,
+            explorer: {
+              ...s.explorer,
+              [connId]: {
+                ...prev,
+                checking: false,
+                checkedAt: r.skipped ? prev?.checkedAt : Date.now(),
+                fingerprints: r.skipped ? prev?.fingerprints : r.fingerprints,
+                deferred: r.skipped ? prev?.deferred : r.deferred,
+              },
+            },
+          };
+        });
+      } catch {
+        set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], checking: false } } }));
+      }
+      // Default catalog's schemas, then tables of likely-clicked schemas.
+      const cats = get().catalogs[connId];
+      if (three && cats) {
+        const want = cats.filter((c) => c.is_default || get().treeOpen[treeKey.catalog(connId, c.name)]).slice(0, 4);
+        for (const c of want) await get().loadCatalogSchemas(connId, c.name).catch(() => {});
+      }
+      const all = get().schemas[connId] ?? [];
+      const have = new Set<string>();
+      for (const sc of all) {
+        if (get().objects[`${connId}|${sc.name}`]) have.add(sc.name);
+      }
+      const cachedListed = await Promise.all(
+        prefetchSchemas(all, new Set(open), have, 16).map(async (name) => [name, await api.cachedObjects(connId, name).catch(() => null)] as const),
+      );
+      const todo = cachedListed.filter(([, c]) => !c).map(([n]) => n).slice(0, 8);
+      for (const name of todo) {
+        prefetchChain = prefetchChain.then(() => (get().explorer[connId]?.offline ? undefined : get().loadObjects(connId, name).catch(() => {})));
+      }
+    })();
+  },
+  loadCatalogSchemas: async (connId, catalog, force = false) => {
+    const key = `${connId}|${catalog}`;
+    const put = (list: SchemaInfo[]) =>
+      set((s) => ({
+        catalogSchemas: { ...s.catalogSchemas, [key]: list },
+        schemas: { ...s.schemas, [connId]: mergeCatalogSchemas(s.schemas[connId], catalog, list, s.catalogs[connId]) },
+      }));
+    const have = get().catalogSchemas[key];
+    if (have && !force) {
+      // From the cache: bring it up to date once per session, quietly.
+      if (!get().explorer[connId]?.offline)
+        void once(`cat|${key}`, () => api.listCatalogSchemas(connId, catalog))
+          .then((list) => JSON.stringify(list) !== JSON.stringify(get().catalogSchemas[key]) && put(list))
+          .catch(() => {});
+      return have;
+    }
+    const list = await once(`cat|${key}`, () => api.listCatalogSchemas(connId, catalog));
+    put(list);
+    return list;
+  },
   loadObjects: async (connId, schema, force = false) => {
     const key = `${connId}|${schema}`;
-    const cached = get().objects[key];
-    if (cached && !force) return cached;
-    const objs = await api.listObjects(connId, schema);
-    set((s) => ({ objects: { ...s.objects, [key]: objs } }));
+    const have = get().objects[key];
+    if (have && !force) return have;
+    const put = (objs: DbObject[]) => set((s) => ({ objects: { ...s.objects, [key]: objs } }));
+    if (force) {
+      // Refresh button: only changed tables are fetched when the engine has versions.
+      const r = await once(`obj|${key}`, () => api.refreshSchema(connId, schema));
+      put(r.objects);
+      if (r.mode !== "unchanged") {
+        const pre = `${key}|`;
+        set((s) => ({ columns: Object.fromEntries(Object.entries(s.columns).filter(([k]) => !k.startsWith(pre))) }));
+      }
+      return r.objects;
+    }
+    const cached = await api.cachedObjects(connId, schema).catch(() => null);
+    if (cached) {
+      put(cached.objects);
+      const ex = get().explorer[connId];
+      // Not covered by the fingerprint check (none on this engine, or deferred): check it now.
+      if (ex && !ex.offline && (ex.fingerprints === false || ex.deferred?.includes(schema)))
+        void once(`obj|${key}`, () => api.refreshSchema(connId, schema))
+          .then((r) => r.mode !== "unchanged" && put(r.objects))
+          .catch(() => {});
+      return cached.objects;
+    }
+    const objs = await once(`obj|${key}`, () => api.listObjects(connId, schema));
+    put(objs);
     return objs;
   },
   loadColumns: async (connId, schema, name) => {
     const key = `${connId}|${schema}|${name}`;
-    const cached = get().columns[key];
-    if (cached) return cached;
-    const d = await api.describeObject(connId, schema, name);
-    set((s) => ({ columns: { ...s.columns, [key]: d.columns } }));
-    return d.columns;
+    const have = get().columns[key];
+    if (have) return have;
+    const put = (cols: ColumnInfo[]) => set((s) => ({ columns: { ...s.columns, [key]: cols } }));
+    const live = () => once(`col|${key}`, () => api.describeObject(connId, schema, name)).then((d) => (put(d.columns), d.columns));
+    const cached = await api.cachedColumns(connId, schema, name).catch(() => null);
+    if (cached) {
+      put(cached.columns);
+      // Changed since: shown now, replaced when the server answers.
+      if (cached.stale && !get().explorer[connId]?.offline) void live().catch(() => {});
+      return cached.columns;
+    }
+    return live();
   },
   deleteConnection: (connId) =>
     new Promise<boolean>((resolve) => {
@@ -609,7 +825,7 @@ export const useStore = create<State>((set, get) => ({
     set((s) => {
       const drop = <T,>(m: Record<string, T>) =>
         Object.fromEntries(Object.entries(m).filter(([k]) => !k.startsWith(connId)));
-      return { schemas: drop(s.schemas), objects: drop(s.objects), columns: drop(s.columns) };
+      return { schemas: drop(s.schemas), objects: drop(s.objects), columns: drop(s.columns), catalogs: drop(s.catalogs), catalogSchemas: drop(s.catalogSchemas), explorer: drop(s.explorer) };
     });
     await get().refreshConnections();
   },

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Database, Library, Search } from "lucide-react";
-import { filterLevel, filterNames, topLevelNoun } from "../lib/catalog";
+import { THREE_LEVEL, filterLevel, filterNames, topLevelNoun } from "../lib/catalog";
 import { useStore } from "../store";
 import { Modal } from "./ui";
 
@@ -16,6 +16,9 @@ export function SchemaPickerDialog() {
   const connId = useStore((s) => s.schemaPicker);
   const conn = useStore((s) => s.connections.find((c) => c.id === s.schemaPicker));
   const schemas = useStore((s) => (s.schemaPicker ? s.schemas[s.schemaPicker] : undefined));
+  // Catalog-first engines: pick among catalogs, no schema list needed.
+  const catalogs = useStore((s) => (s.schemaPicker && conn && THREE_LEVEL.includes(conn.config.kind) ? s.catalogs[s.schemaPicker] : undefined));
+  const catalogSchemas = useStore((s) => s.catalogSchemas);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
@@ -26,18 +29,36 @@ export function SchemaPickerDialog() {
     setQuery("");
     setError(null);
     const st = useStore.getState();
-    setPicked(filterNames(st.schemas[connId] ?? [], st.schemaFilter[connId]));
-    if (!st.schemas[connId]) {
+    const kind = st.connections.find((c) => c.id === connId)?.config.kind;
+    const three = !!kind && THREE_LEVEL.includes(kind);
+    const pickFrom = () => {
+      const now = useStore.getState();
+      const cats = three ? now.catalogs[connId] : undefined;
+      // Old filters may hold `catalog.schema` ids: their catalog counts.
+      if (cats) return new Set((now.schemaFilter[connId] ?? []).map((c) => (cats.some((k) => k.name === c) ? c : c.split(".")[0])));
+      return filterNames(now.schemas[connId] ?? [], now.schemaFilter[connId]);
+    };
+    setPicked(pickFrom());
+    if (three ? !st.catalogs[connId] : !st.schemas[connId]) {
       setLoading(true);
-      st.loadSchemas(connId)
-        .then((s) => setPicked(filterNames(s, useStore.getState().schemaFilter[connId])))
+      (three ? st.openExplorer(connId) : st.loadSchemas(connId))
+        .then(() => setPicked(pickFrom()))
         .catch((e) => setError(String(e?.message ?? e)))
         .finally(() => setLoading(false));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connId]);
 
-  const level = useMemo(() => filterLevel(schemas ?? []), [schemas]);
+  const level = useMemo(
+    () =>
+      catalogs
+        ? {
+            kind: "catalog" as const,
+            items: catalogs.map((c) => ({ name: c.name, count: catalogSchemas[`${connId}|${c.name}`]?.length ?? -1, isDefault: c.is_default })),
+          }
+        : filterLevel(schemas ?? []),
+    [catalogs, catalogSchemas, schemas, connId],
+  );
   const q = query.trim().toLowerCase();
   const matched = useMemo(() => (q ? level.items.filter((i) => i.name.toLowerCase().includes(q)) : level.items), [level, q]);
 
@@ -78,7 +99,7 @@ export function SchemaPickerDialog() {
           <button className="btn-ghost" onClick={close}>
             Cancel
           </button>
-          <button className="btn-primary" onClick={save} disabled={!schemas}>
+          <button className="btn-primary" onClick={save} disabled={!schemas && !catalogs}>
             Save
           </button>
         </>
@@ -111,7 +132,7 @@ export function SchemaPickerDialog() {
         <div className="max-h-[50vh] overflow-auto rounded-md border border-line p-1" role="group" aria-label={nouns}>
           {loading && <div className="p-2 text-[12px] text-muted">Loading {nouns}…</div>}
           {error && <div className="p-2 text-[12px] text-danger">{error}</div>}
-          {schemas && matched.length === 0 && <div className="p-2 text-[12px] text-muted">No {nouns} match.</div>}
+          {(schemas || catalogs) && matched.length === 0 && <div className="p-2 text-[12px] text-muted">No {nouns} match.</div>}
           {matched.slice(0, MAX_ROWS).map((i) => (
             <label key={i.name} className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-0.5 hover:bg-hover">
               <input type="checkbox" checked={picked.has(i.name)} onChange={(e) => toggle([i.name], e.target.checked)} />
@@ -119,7 +140,7 @@ export function SchemaPickerDialog() {
               <span className="min-w-0 truncate font-mono text-[12px]">{i.name}</span>
               <span className="ml-auto shrink-0 text-[10.5px] text-muted">
                 {i.isDefault ? "default" : ""}
-                {level.kind === "catalog" && `${i.isDefault ? " · " : ""}${i.count} schema${i.count === 1 ? "" : "s"}`}
+                {level.kind === "catalog" && i.count >= 0 && `${i.isDefault ? " · " : ""}${i.count} schema${i.count === 1 ? "" : "s"}`}
               </span>
             </label>
           ))}

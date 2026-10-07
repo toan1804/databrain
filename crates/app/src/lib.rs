@@ -82,8 +82,14 @@ async fn test_connection(
     secret: Option<String>,
     connection_id: Option<String>,
     ssh_secret: Option<String>,
+    test_id: Option<String>,
 ) -> R<TestResult> {
-    api::test_connection(&state, config, secret, connection_id, ssh_secret).await
+    api::test_connection(&state, config, secret, connection_id, ssh_secret, test_id).await
+}
+
+#[tauri::command]
+fn cancel_test_connection(state: State<'_, AppState>, test_id: String) -> bool {
+    api::cancel_test_connection(&state, &test_id)
 }
 
 #[tauri::command]
@@ -385,6 +391,46 @@ async fn list_objects(state: State<'_, AppState>, id: String, schema: String) ->
 }
 
 #[tauri::command]
+async fn list_catalogs(state: State<'_, AppState>, id: String) -> R<Option<Vec<databrain_connector_core::CatalogInfo>>> {
+    api::list_catalogs(&state, &id).await
+}
+
+#[tauri::command]
+async fn list_catalog_schemas(state: State<'_, AppState>, id: String, catalog: String) -> R<Vec<SchemaInfo>> {
+    api::list_catalog_schemas(&state, &id, &catalog).await
+}
+
+#[tauri::command]
+fn cached_explorer(state: State<'_, AppState>, id: String) -> R<api::CachedExplorer> {
+    api::cached_explorer(&state, &id)
+}
+
+#[tauri::command]
+fn cached_objects(state: State<'_, AppState>, id: String, schema: String) -> R<Option<databrain_workspace::CachedListing>> {
+    api::cached_objects(&state, &id, &schema)
+}
+
+#[tauri::command]
+fn cached_columns(state: State<'_, AppState>, id: String, schema: String, name: String) -> R<Option<databrain_workspace::CachedColumns>> {
+    api::cached_columns(&state, &id, &schema, &name)
+}
+
+#[tauri::command]
+fn clear_explorer_cache(state: State<'_, AppState>, id: String) -> R<()> {
+    api::clear_explorer_cache(&state, &id)
+}
+
+#[tauri::command]
+async fn refresh_schema(state: State<'_, AppState>, id: String, schema: String) -> R<api::SchemaRefresh> {
+    api::refresh_schema(&state, &id, &schema).await
+}
+
+#[tauri::command]
+async fn revalidate_explorer(state: State<'_, AppState>, id: String, open: Vec<String>, force: bool) -> R<api::ExplorerRevalidation> {
+    api::revalidate_explorer(&state, &id, &open, force).await
+}
+
+#[tauri::command]
 fn complete_tables_local(state: State<'_, AppState>, id: String, schema: Option<String>, query: String, limit: usize) -> R<Vec<DbObject>> {
     api::complete_tables_local(&state, &id, schema.as_deref(), &query, limit)
 }
@@ -656,10 +702,19 @@ pub fn run() {
             save_connection,
             delete_connection,
             test_connection,
+            cancel_test_connection,
             connect,
             disconnect,
             list_schemas,
             list_objects,
+            list_catalogs,
+            list_catalog_schemas,
+            cached_explorer,
+            cached_objects,
+            cached_columns,
+            clear_explorer_cache,
+            refresh_schema,
+            revalidate_explorer,
             search_objects,
             complete_tables_local,
             complete_tables,

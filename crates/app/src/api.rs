@@ -363,12 +363,18 @@ pub async fn test_connection(
     secret: Option<String>,
     connection_id: Option<String>,
     ssh_secret: Option<String>,
+    test_id: Option<String>,
 ) -> Result<TestResult> {
     validate_config(&config)?;
     state
         .engine
-        .test_connection(&config, secret, connection_id.as_deref(), ssh_secret)
+        .test_connection(&config, secret, connection_id.as_deref(), ssh_secret, test_id.as_deref())
         .await
+}
+
+/// Stop a running connection test (dialog "Cancel").
+pub fn cancel_test_connection(state: &AppState, test_id: &str) -> bool {
+    state.engine.cancel_test(test_id)
 }
 
 pub async fn connect(state: &AppState, id: &str) -> Result<String> {
@@ -382,14 +388,251 @@ pub fn disconnect(state: &AppState, id: &str) {
 // ------------------------------------------------------------ explorer
 
 pub async fn list_schemas(state: &AppState, id: &str) -> Result<Vec<SchemaInfo>> {
-    state.engine.list_schemas(id).await
+    let schemas = state.engine.list_schemas(id).await?;
+    let _ = state.engine.workspace().meta_put_schemas(id, None, &schemas);
+    Ok(schemas)
+}
+
+/// Catalogs of three-level engines (`None` for two-level ones), listed live.
+pub async fn list_catalogs(state: &AppState, id: &str) -> Result<Option<Vec<databrain_connector_core::CatalogInfo>>> {
+    let cats = state.engine.list_catalogs(id).await?;
+    if let Some(c) = &cats {
+        let _ = state.engine.workspace().meta_put_catalogs(id, c);
+    }
+    Ok(cats)
+}
+
+/// Schemas of one catalog, listed live.
+pub async fn list_catalog_schemas(state: &AppState, id: &str, catalog: &str) -> Result<Vec<SchemaInfo>> {
+    let schemas = state.engine.list_catalog_schemas(id, catalog).await?;
+    let _ = state.engine.workspace().meta_put_schemas(id, Some(catalog), &schemas);
+    Ok(schemas)
+}
+
+/// DuckDB's `results.main` lists query outputs: always live, never cached.
+fn cacheable(state: &AppState, id: &str, schema: &str) -> bool {
+    schema != "results.main" || state.engine.workspace().get_connection(id).map(|p| p.config.kind != ConnectorKind::Duckdb).unwrap_or(true)
 }
 
 pub async fn list_objects(state: &AppState, id: &str, schema: &str) -> Result<Vec<DbObject>> {
     let objs = state.engine.list_objects(id, schema).await?;
-    // Remember it for completion / search (best effort).
-    let _ = state.engine.workspace().meta_put_schema(id, schema, &objs);
+    if cacheable(state, id, schema) {
+        // Versions make the next refresh incremental (best effort).
+        let versions = state.engine.object_versions(id, schema).await.ok().flatten();
+        let _ = state.engine.workspace().meta_put_listing(id, schema, &objs, versions.as_ref(), None);
+    }
     Ok(objs)
+}
+
+// --------------------------------------------- explorer cache (no network)
+
+/// What the explorer shows before (or without) a connection.
+#[derive(Debug, Clone, Serialize)]
+pub struct CachedExplorer {
+    /// Catalogs (three-level engines), when listed before.
+    pub catalogs: Option<Vec<databrain_connector_core::CatalogInfo>>,
+    /// The complete schema list, when listed before.
+    pub schemas: Option<Vec<SchemaInfo>>,
+    /// Schema lists of single catalogs (three-level engines).
+    pub catalog_schemas: std::collections::BTreeMap<String, Vec<SchemaInfo>>,
+    pub state: databrain_workspace::ExplorerCacheState,
+}
+
+pub fn cached_explorer(state: &AppState, id: &str) -> Result<CachedExplorer> {
+    let ws = state.engine.workspace();
+    let mut catalog_schemas = std::collections::BTreeMap::new();
+    for cat in ws.meta_listed_catalogs(id)? {
+        if let Some(list) = ws.meta_schemas(id, Some(&cat))? {
+            catalog_schemas.insert(cat, list);
+        }
+    }
+    Ok(CachedExplorer { catalogs: ws.meta_catalogs(id)?, schemas: ws.meta_schemas(id, None)?, catalog_schemas, state: ws.meta_state(id)? })
+}
+
+/// The cached listing of a schema (`None` = never listed).
+pub fn cached_objects(state: &AppState, id: &str, schema: &str) -> Result<Option<databrain_workspace::CachedListing>> {
+    if !cacheable(state, id, schema) {
+        return Ok(None);
+    }
+    Ok(state.engine.workspace().meta_listing(id, schema)?)
+}
+
+/// Cached columns of a table (`stale` = describe again when online).
+pub fn cached_columns(state: &AppState, id: &str, schema: &str, name: &str) -> Result<Option<databrain_workspace::CachedColumns>> {
+    Ok(state.engine.workspace().meta_columns(id, schema, name)?)
+}
+
+/// Forget a connection's cached explorer (it is listed again from the server).
+pub fn clear_explorer_cache(state: &AppState, id: &str) -> Result<()> {
+    Ok(state.engine.workspace().meta_clear(id)?)
+}
+
+// --------------------------------------------- incremental refresh
+
+/// Above this share of changed objects one full listing is cheaper than
+/// fetching them by name.
+const FULL_RELIST_SHARE: f64 = 0.3;
+
+/// How a schema was brought up to date.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshMode {
+    /// Nothing changed (versions equal).
+    Unchanged,
+    /// Only changed/new objects were fetched.
+    Incremental,
+    /// The whole schema was listed.
+    Full,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SchemaRefresh {
+    pub schema: String,
+    pub mode: RefreshMode,
+    pub added: usize,
+    pub changed: usize,
+    pub removed: usize,
+    /// The schema's objects now.
+    pub objects: Vec<DbObject>,
+}
+
+/// Bring one schema's listing up to date, table by table when the engine
+/// has object versions and the schema was listed before; otherwise list it.
+pub async fn refresh_schema(state: &AppState, id: &str, schema: &str) -> Result<SchemaRefresh> {
+    refresh_schema_at(state, id, schema, None).await
+}
+
+async fn refresh_schema_at(state: &AppState, id: &str, schema: &str, fingerprint: Option<&str>) -> Result<SchemaRefresh> {
+    let ws = state.engine.workspace();
+    let full = |objects: Vec<DbObject>, n: usize| SchemaRefresh { schema: schema.to_string(), mode: RefreshMode::Full, added: n, changed: 0, removed: 0, objects };
+    if !cacheable(state, id, schema) {
+        let objs = state.engine.list_objects(id, schema).await?;
+        let n = objs.len();
+        return Ok(full(objs, n));
+    }
+    let old = ws.meta_versions(id, schema)?;
+    let listed = ws.meta_listing(id, schema)?;
+    let new = state.engine.object_versions(id, schema).await?;
+    let (Some(new), Some(listed)) = (new.clone(), listed.filter(|_| !old.is_empty())) else {
+        // First listing, or no versions: list everything.
+        let objs = state.engine.list_objects(id, schema).await?;
+        ws.meta_put_listing(id, schema, &objs, new.as_ref(), fingerprint)?;
+        let n = objs.len();
+        return Ok(full(objs, n));
+    };
+    // Objects listed but without a version (added by a search) count as changed.
+    let cached_keys: std::collections::HashSet<String> =
+        listed.objects.iter().map(|o| databrain_connector_core::version_key(o.kind, &o.name)).collect();
+    let removed: Vec<String> = cached_keys.iter().filter(|k| !new.contains_key(*k)).cloned().collect();
+    let mut added = 0;
+    let mut touched: Vec<String> = Vec::new();
+    for (k, v) in &new {
+        let is_new = !cached_keys.contains(k);
+        if is_new || old.get(k) != Some(v) {
+            added += usize::from(is_new);
+            if let Some((_, name)) = k.split_once(':') {
+                touched.push(name.to_string());
+            }
+        }
+    }
+    touched.sort();
+    touched.dedup();
+    let changed = touched.len().saturating_sub(added);
+    if touched.is_empty() && removed.is_empty() {
+        if let Some(fp) = fingerprint {
+            ws.meta_set_listed_fp(id, schema, fp)?;
+        }
+        return Ok(SchemaRefresh { schema: schema.into(), mode: RefreshMode::Unchanged, added: 0, changed: 0, removed: 0, objects: listed.objects });
+    }
+    if touched.len() as f64 > (new.len().max(1) as f64) * FULL_RELIST_SHARE && touched.len() > 20 {
+        let objs = state.engine.list_objects(id, schema).await?;
+        ws.meta_put_listing(id, schema, &objs, Some(&new), fingerprint)?;
+        return Ok(SchemaRefresh { schema: schema.into(), mode: RefreshMode::Full, added, changed, removed: removed.len(), objects: objs });
+    }
+    let mut upserts = Vec::new();
+    for chunk in touched.chunks(500) {
+        upserts.extend(state.engine.list_objects_named(id, schema, chunk).await?);
+    }
+    // Only rows whose version moved (a name may cover a table and a function).
+    upserts.retain(|o| {
+        let k = databrain_connector_core::version_key(o.kind, &o.name);
+        !cached_keys.contains(&k) || old.get(&k) != new.get(&k)
+    });
+    ws.meta_apply_changes(id, schema, &upserts, &removed, &new, fingerprint)?;
+    let objects = ws.meta_listing(id, schema)?.map(|l| l.objects).unwrap_or_default();
+    Ok(SchemaRefresh { schema: schema.into(), mode: RefreshMode::Incremental, added, changed, removed: removed.len(), objects })
+}
+
+/// Result of [`revalidate_explorer`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplorerRevalidation {
+    /// Schemas whose cached listing was updated (reload them from the cache).
+    pub refreshed: Vec<SchemaRefresh>,
+    /// Listed schemas confirmed unchanged by their fingerprint.
+    pub unchanged: usize,
+    /// Listed schemas left for later (not open, or over the per-run cap).
+    pub deferred: Vec<String>,
+    /// `false` when the engine has no fingerprints (only `open` schemas were refreshed).
+    pub fingerprints: bool,
+    /// Skipped because it was checked moments ago.
+    pub skipped: bool,
+}
+
+/// At most this many changed schemas are refreshed per check; the rest when opened.
+const REVALIDATE_CAP: usize = 40;
+/// A check this recent is not repeated (unless forced).
+const RECHECK_MS: i64 = 60_000;
+
+/// After (re)connecting: one fingerprint query tells which cached schemas
+/// changed; those are refreshed table by table ([`refresh_schema`]),
+/// unchanged ones are not read at all. `open` = schemas the explorer shows
+/// expanded (refreshed first; the only ones when there are no fingerprints).
+pub async fn revalidate_explorer(state: &AppState, id: &str, open: &[String], force: bool) -> Result<ExplorerRevalidation> {
+    let ws = state.engine.workspace();
+    let st = ws.meta_state(id)?;
+    let mut out = ExplorerRevalidation { refreshed: vec![], unchanged: 0, deferred: vec![], fingerprints: true, skipped: false };
+    if !force && st.checked_at.is_some_and(|t| databrain_workspace::now_ms() - t < RECHECK_MS) {
+        out.skipped = true;
+        return Ok(out);
+    }
+    let listed = ws.meta_listed_schemas(id)?;
+    let fps = state.engine.explorer_fingerprints(id).await?;
+    ws.meta_touch_checked(id)?;
+    let open: std::collections::HashSet<&str> = open.iter().map(String::as_str).collect();
+    // Open schemas first.
+    let mut todo: Vec<(String, Option<String>)> = Vec::new();
+    for (schema, listed_fp) in listed {
+        if !cacheable(state, id, &schema) {
+            continue;
+        }
+        match &fps {
+            Some(f) => {
+                // A schema with no row may just have no tables on some engines: treat as a change.
+                let now = f.get(&schema).cloned().unwrap_or_default();
+                if listed_fp.as_deref() == Some(now.as_str()) {
+                    out.unchanged += 1;
+                } else {
+                    todo.push((schema, Some(now)));
+                }
+            }
+            None if open.contains(schema.as_str()) => todo.push((schema, None)),
+            None => out.deferred.push(schema),
+        }
+    }
+    out.fingerprints = fps.is_some();
+    todo.sort_by_key(|(s, _)| !open.contains(s.as_str()));
+    for (i, (schema, fp)) in todo.into_iter().enumerate() {
+        if i >= REVALIDATE_CAP {
+            out.deferred.push(schema);
+            continue;
+        }
+        match refresh_schema_at(state, id, &schema, fp.as_deref()).await {
+            Ok(r) => out.refreshed.push(r),
+            // E.g. dropped meanwhile: the schema list refresh removes it.
+            Err(_) => out.deferred.push(schema),
+        }
+    }
+    Ok(out)
 }
 
 /// Catalog search: tables and views whose name contains `query`
@@ -1044,7 +1287,7 @@ mod tests {
         )
         .unwrap();
 
-        let t = test_connection(&st, profile.config.clone(), None, None, None).await.unwrap();
+        let t = test_connection(&st, profile.config.clone(), None, None, None, None).await.unwrap();
         assert!(t.server_version.starts_with("SQLite"));
 
         let script = "create table people(id integer primary key, name text, city text, age integer);\n\
@@ -1317,5 +1560,230 @@ mod tests {
         assert!(st.secrets.get(&r).unwrap().is_none());
         assert!(st.secrets.get(&SecretRef::slot(&saved.id, "ssh")).unwrap().is_none());
         assert!(st.secrets.get(&SecretRef::slot(&saved.id, "bogus")).unwrap().is_none());
+    }
+
+    /// A server that accepts TCP but never answers (what makes drivers hang):
+    /// Test gives up after the connect timeout, and Cancel stops it at once.
+    /// A closed port fails right away.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connection_times_out_and_cancels() {
+        let (st, _sink, _dir) = state();
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let hold = tokio::spawn(async move {
+            let mut keep = vec![];
+            while let Ok((c, _)) = silent.accept().await {
+                keep.push(c);
+            }
+        });
+        let cfg = ConnectionConfig {
+            kind: ConnectorKind::Postgres,
+            host: Some("127.0.0.1".into()),
+            port: Some(port),
+            database: Some("x".into()),
+            file_path: None,
+            auth: AuthMethod::Password { user: "u".into() },
+            ssl_mode: databrain_connector_core::SslMode::Disable,
+            read_only: false,
+            options: Default::default(),
+            ssh: None,
+        };
+        st.engine.workspace().set_setting("connect_timeout_secs", &serde_json::json!(3)).unwrap();
+        let t = std::time::Instant::now();
+        let e = test_connection(&st, cfg.clone(), Some("p".into()), None, None, Some("a".into())).await.unwrap_err();
+        assert!(e.message.contains("No connection after 3 s"), "{}", e.message);
+        assert!(t.elapsed() < Duration::from_secs(6), "{:?}", t.elapsed());
+
+        st.engine.workspace().set_setting("connect_timeout_secs", &serde_json::json!(60)).unwrap();
+        let st = Arc::new(st);
+        let st2 = st.clone();
+        let c2 = cfg.clone();
+        let run = tokio::spawn(async move { test_connection(&st2, c2, Some("p".into()), None, None, Some("b".into())).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let t = std::time::Instant::now();
+        assert!(cancel_test_connection(&st, "b"));
+        let e = run.await.unwrap().unwrap_err();
+        assert_eq!(e.kind, "cancelled");
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(!cancel_test_connection(&st, "b"), "finished tests are forgotten");
+        hold.abort();
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let t = std::time::Instant::now();
+        let e = test_connection(&st, ConnectionConfig { port: Some(closed), ..cfg }, Some("p".into()), None, None, None).await.unwrap_err();
+        assert!(e.message.contains("refused"), "{}", e.message);
+        assert!(t.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Live Postgres (DATABRAIN_PG_*): a good Test connects, a wrong password
+    /// fails at once, and a host that drops packets fails within the probe time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connection_live_postgres() {
+        let Ok(host) = std::env::var("DATABRAIN_PG_HOST") else { return };
+        let (st, _sink, _dir) = state();
+        let cfg = ConnectionConfig {
+            kind: ConnectorKind::Postgres,
+            host: Some(host),
+            port: std::env::var("DATABRAIN_PG_PORT").ok().and_then(|p| p.parse().ok()),
+            database: Some("postgres".into()),
+            file_path: None,
+            auth: AuthMethod::Password { user: std::env::var("DATABRAIN_PG_USER").unwrap_or_else(|_| "postgres".into()) },
+            ssl_mode: databrain_connector_core::SslMode::Disable,
+            read_only: false,
+            options: Default::default(),
+            ssh: None,
+        };
+        let pw = std::env::var("DATABRAIN_PG_PASSWORD").ok();
+        let ok = test_connection(&st, cfg.clone(), pw, None, None, None).await.unwrap();
+        assert!(ok.server_version.contains("PostgreSQL"), "{}", ok.server_version);
+        let t = std::time::Instant::now();
+        let e = test_connection(&st, cfg.clone(), Some("wrong".into()), None, None, None).await.unwrap_err();
+        assert!(e.message.contains("password"), "{e:?}");
+        assert!(t.elapsed() < Duration::from_secs(3));
+        // TEST-NET-1 (RFC 5737): never routed, packets are dropped.
+        let t = std::time::Instant::now();
+        let e = test_connection(&st, ConnectionConfig { host: Some("192.0.2.1".into()), ..cfg }, Some("x".into()), None, None, None).await.unwrap_err();
+        assert!(e.message.contains("No answer") || e.message.contains("Cannot reach"), "{}", e.message);
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    }
+
+    fn save_profile(st: &AppState, name: &str, config: ConnectionConfig, secret: Option<&str>) -> ConnectionProfile {
+        save_connection(
+            st,
+            SaveConnectionArgs {
+                profile: ConnectionProfile {
+                    id: String::new(),
+                    name: name.into(),
+                    config,
+                    color: None,
+                    env: EnvTag::Dev,
+                    folder_id: None,
+                    has_secret: false,
+                    ai_policy: Default::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                secret: secret.map(str::to_string),
+                clear_secret: false,
+                extra_secrets: Default::default(),
+            },
+        )
+        .unwrap()
+    }
+
+    async fn exec(st: &AppState, id: &str, sql: &str) {
+        let s = st.engine.session_for_tests(id).await.unwrap();
+        for stmt in sql.split(';').map(str::trim).filter(|x| !x.is_empty()) {
+            s.execute(stmt, Default::default()).await.unwrap().collect().await.unwrap();
+        }
+    }
+
+    /// SQLite (fingerprints, no object versions): the explorer is served from
+    /// the cache without a connection, unchanged schemas are not listed again,
+    /// a changed one is listed again and its columns go stale.
+    #[tokio::test]
+    async fn explorer_cache_sqlite() {
+        let (st, _sink, dir) = state();
+        let db = dir.path().join("x.db");
+        let cfg = ConnectionConfig {
+            kind: ConnectorKind::Sqlite,
+            host: None,
+            port: None,
+            database: None,
+            file_path: Some(db.to_string_lossy().into()),
+            auth: AuthMethod::None,
+            ssl_mode: Default::default(),
+            read_only: false,
+            options: Default::default(),
+            ssh: None,
+        };
+        let p = save_profile(&st, "x", cfg.clone(), None);
+        assert!(cached_explorer(&st, &p.id).unwrap().schemas.is_none(), "nothing cached yet");
+        exec(&st, &p.id, "create table a (id int); create table b (id int)").await;
+        let schemas = list_schemas(&st, &p.id).await.unwrap();
+        let main = schemas[0].name.clone();
+        list_objects(&st, &p.id, &main).await.unwrap();
+        describe(&st, &p.id, &main, "a").await.unwrap();
+
+        // Restart: a new engine over the same workspace, nothing connected.
+        st.engine.disconnect(&p.id);
+        let c = cached_explorer(&st, &p.id).unwrap();
+        assert_eq!(c.schemas.unwrap().len(), schemas.len());
+        assert_eq!(cached_objects(&st, &p.id, &main).unwrap().unwrap().objects.len(), 2);
+        assert!(!cached_columns(&st, &p.id, &main, "a").unwrap().unwrap().stale);
+        assert!(st.engine.connected_ids().is_empty(), "cache reads never connect");
+
+        let r = revalidate_explorer(&st, &p.id, &[main.clone()], true).await.unwrap();
+        assert!(r.fingerprints);
+        // First check records the fingerprint (one listing), then nothing.
+        let r = revalidate_explorer(&st, &p.id, &[main.clone()], true).await.unwrap();
+        assert_eq!((r.refreshed.len(), r.unchanged), (0, 1), "{r:?}");
+        assert!(revalidate_explorer(&st, &p.id, &[], false).await.unwrap().skipped, "checked moments ago");
+
+        exec(&st, &p.id, "create table c (id int)").await;
+        let r = revalidate_explorer(&st, &p.id, &[], true).await.unwrap();
+        assert_eq!(r.refreshed.len(), 1);
+        assert_eq!(r.refreshed[0].mode, RefreshMode::Full);
+        assert_eq!(cached_objects(&st, &p.id, &main).unwrap().unwrap().objects.len(), 3);
+        assert!(cached_columns(&st, &p.id, &main, "a").unwrap().unwrap().stale, "no versions: columns are checked again");
+
+        // Pointing the connection elsewhere clears the cache.
+        let mut moved = p.clone();
+        moved.config.file_path = Some(dir.path().join("y.db").to_string_lossy().into());
+        save_profile_update(&st, moved);
+        assert!(cached_explorer(&st, &p.id).unwrap().schemas.is_none());
+    }
+
+    fn save_profile_update(st: &AppState, p: ConnectionProfile) {
+        save_connection(st, SaveConnectionArgs { profile: p, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
+    }
+
+    /// Live Postgres (object versions): after a change only the changed and
+    /// new tables are fetched; untouched tables keep fresh columns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explorer_incremental_live_postgres() {
+        let Ok(host) = std::env::var("DATABRAIN_PG_HOST") else { return };
+        let (st, _sink, _dir) = state();
+        let cfg = ConnectionConfig {
+            kind: ConnectorKind::Postgres,
+            host: Some(host),
+            port: std::env::var("DATABRAIN_PG_PORT").ok().and_then(|p| p.parse().ok()),
+            database: Some("postgres".into()),
+            file_path: None,
+            auth: AuthMethod::Password { user: std::env::var("DATABRAIN_PG_USER").unwrap_or_else(|_| "postgres".into()) },
+            ssl_mode: databrain_connector_core::SslMode::Disable,
+            read_only: false,
+            options: Default::default(),
+            ssh: None,
+        };
+        let p = save_profile(&st, "pg", cfg, std::env::var("DATABRAIN_PG_PASSWORD").ok().as_deref());
+        exec(&st, &p.id, "drop schema if exists inc_a cascade; drop schema if exists inc_b cascade").await;
+        let mut ddl = String::from("create schema inc_a; create schema inc_b; create table inc_b.z (x int);");
+        for i in 0..50 {
+            ddl.push_str(&format!("create table inc_a.t{i} (id int primary key);"));
+        }
+        exec(&st, &p.id, &ddl).await;
+        assert!(list_schemas(&st, &p.id).await.unwrap().iter().any(|s| s.name == "inc_a"));
+        assert_eq!(list_objects(&st, &p.id, "inc_a").await.unwrap().len(), 50);
+        list_objects(&st, &p.id, "inc_b").await.unwrap();
+        describe(&st, &p.id, "inc_a", "t1").await.unwrap();
+        describe(&st, &p.id, "inc_a", "t2").await.unwrap();
+
+        let r = refresh_schema(&st, &p.id, "inc_a").await.unwrap();
+        assert_eq!(r.mode, RefreshMode::Unchanged);
+        revalidate_explorer(&st, &p.id, &[], true).await.unwrap();
+
+        exec(&st, &p.id, "alter table inc_a.t1 add column note text; drop table inc_a.t3; create table inc_a.t_new (y int); create function inc_a.f() returns int language sql as 'select 1'").await;
+        let r = revalidate_explorer(&st, &p.id, &["inc_a".into()], true).await.unwrap();
+        let a = r.refreshed.iter().find(|x| x.schema == "inc_a").expect("inc_a changed");
+        assert_eq!((a.mode.clone(), a.added, a.changed, a.removed), (RefreshMode::Incremental, 2, 1, 1), "{a:?}");
+        assert!(r.refreshed.iter().all(|x| x.schema != "inc_b"), "unchanged schema not read: {r:?}");
+        let names: Vec<String> = cached_objects(&st, &p.id, "inc_a").unwrap().unwrap().objects.iter().map(|o| o.name.clone()).collect();
+        assert!(names.contains(&"t_new".to_string()) && names.contains(&"f".to_string()) && !names.contains(&"t3".to_string()));
+        assert_eq!(names.len(), 51);
+        assert!(cached_columns(&st, &p.id, "inc_a", "t1").unwrap().unwrap().stale);
+        assert!(!cached_columns(&st, &p.id, "inc_a", "t2").unwrap().unwrap().stale, "untouched table keeps fresh columns");
+        assert_eq!(refresh_schema(&st, &p.id, "inc_a").await.unwrap().mode, RefreshMode::Unchanged);
+        exec(&st, &p.id, "drop schema inc_a cascade; drop schema inc_b cascade").await;
     }
 }

@@ -234,6 +234,20 @@ impl FieldSpec {
     }
 }
 
+/// A top-level container of three-level engines (see [`crate::Session::list_catalogs`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CatalogInfo {
+    pub name: String,
+    /// The session's current catalog.
+    pub is_default: bool,
+}
+
+/// Key of [`crate::Session::object_versions`]: `kind:name` (a table and a function
+/// may share a name).
+pub fn version_key(kind: ObjectKind, name: &str) -> String {
+    format!("{}:{name}", kind.as_str())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchemaInfo {
     /// Fully qualified schema id passed back to `list_objects` (for
@@ -318,6 +332,21 @@ pub enum ObjectKind {
 }
 
 impl ObjectKind {
+    /// The serialized (snake_case) name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ObjectKind::Table => "table",
+            ObjectKind::View => "view",
+            ObjectKind::MaterializedView => "materialized_view",
+            ObjectKind::ForeignTable => "foreign_table",
+            ObjectKind::Function => "function",
+            ObjectKind::Procedure => "procedure",
+            ObjectKind::Package => "package",
+            ObjectKind::Sequence => "sequence",
+            ObjectKind::Other => "other",
+        }
+    }
+
     /// Things you call: functions, procedures, packages.
     pub fn is_routine(self) -> bool {
         matches!(self, ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Package)

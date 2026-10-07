@@ -1,5 +1,5 @@
 // Pure helpers for the catalog tree and catalog search (unit tested).
-import type { ConnectorKind, DbObject, ObjectKind, SchemaInfo } from "./types";
+import type { CatalogInfo, ConnectorKind, DbObject, ObjectKind, SchemaInfo } from "./types";
 import { qualifiedName, quoteIdent } from "./util";
 
 /** Engines whose schema ids are `catalog.schema` (three-level names). */
@@ -265,4 +265,60 @@ export function columnList(kind: ConnectorKind, columns: string[], qualifier?: s
   const q = (c: string) => (qualifier ? `${qualifier}.` : "") + quoteIdent(kind, c);
   if (columns.length <= 4) return columns.map(q).join(", ");
   return columns.map(q).join(",\n  ");
+}
+
+// ------------------------------------------------------------------ explorer cache / catalog-first
+
+/**
+ * Replace one catalog's schemas inside a connection's schema list (catalog
+ * order kept as `catalogs` says; unknown catalogs last).
+ */
+export function mergeCatalogSchemas(all: SchemaInfo[] | undefined, catalog: string, list: SchemaInfo[], catalogs?: CatalogInfo[]): SchemaInfo[] {
+  const rest = (all ?? []).filter((s) => s.catalog !== catalog);
+  const merged = [...rest, ...list];
+  if (!catalogs) return merged;
+  const pos = new Map(catalogs.map((c, i) => [c.name, i]));
+  const at = (s: SchemaInfo) => pos.get(s.catalog ?? "") ?? Number.MAX_SAFE_INTEGER;
+  // Stable: schema order inside a catalog stays the server's.
+  return merged.map((s, i) => [s, i] as const).sort((a, b) => at(a[0]) - at(b[0]) || a[1] - b[1]).map(([s]) => s);
+}
+
+/**
+ * Catalogs to list for a connection. The filter holds catalog names (older
+ * filters: `catalog.schema` ids, whose catalog counts); `also` = a schema id
+ * revealed by search, whose catalog is shown too.
+ */
+export function visibleCatalogs(catalogs: CatalogInfo[], chosen: string[] | undefined, also?: string | null): CatalogInfo[] {
+  if (!chosen || chosen.length === 0) return catalogs;
+  const want = new Set(chosen.map((c) => (catalogs.some((k) => k.name === c) ? c : c.split(".")[0])));
+  if (also) want.add(also.split(".")[0]);
+  const out = catalogs.filter((c) => want.has(c.name));
+  return out.length ? out : catalogs;
+}
+
+/**
+ * Schemas whose tables are listed in the background when the explorer opens
+ * (so clicking them shows at once): the default schema, the ones left open,
+ * then the first few others, skipping what is loaded or cached already.
+ */
+export function prefetchSchemas(schemas: SchemaInfo[], open: Set<string>, have: Set<string>, max = 8): string[] {
+  const order = [...schemas.filter((s) => s.is_default), ...schemas.filter((s) => !s.is_default && open.has(s.name)), ...schemas.filter((s) => !s.is_default && !open.has(s.name))];
+  const out: string[] = [];
+  for (const s of order) {
+    if (out.length >= max) break;
+    if (!have.has(s.name) && !out.includes(s.name)) out.push(s.name);
+  }
+  return out;
+}
+
+/** "cached 5 min ago" style age of a cache timestamp (ms). */
+export function cacheAge(at: number | null | undefined, now = Date.now()): string {
+  if (!at) return "never";
+  const s = Math.max(0, Math.round((now - at) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h} h ago`;
+  return `${Math.round(h / 24)} days ago`;
 }

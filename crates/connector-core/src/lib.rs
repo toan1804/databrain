@@ -63,6 +63,42 @@ pub trait Session: Send + Sync {
 
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>>;
 
+    /// Top level of three-level engines (Databricks catalogs, Snowflake
+    /// databases, BigQuery projects, DuckDB databases), so the explorer can
+    /// show them before any schema is listed. `None` = two-level engine.
+    async fn list_catalogs(&self) -> Result<Option<Vec<CatalogInfo>>> {
+        Ok(None)
+    }
+
+    /// Schemas of one catalog (ids as in [`Session::list_schemas`]). The
+    /// default filters the full schema list.
+    async fn list_catalog_schemas(&self, catalog: &str) -> Result<Vec<SchemaInfo>> {
+        Ok(self.list_schemas().await?.into_iter().filter(|s| s.catalog.as_deref() == Some(catalog)).collect())
+    }
+
+    /// Fingerprint per schema of everything the explorer lists (tables,
+    /// views, routines, sequences, columns, comments): unchanged = the cached
+    /// listing is still right. Defaults to [`Session::schema_fingerprints`].
+    async fn explorer_fingerprints(&self) -> Result<Option<HashMap<String, String>>> {
+        self.schema_fingerprints().await
+    }
+
+    /// Opaque version of every object [`Session::list_objects`] returns, keyed
+    /// by [`version_key`]; it changes when the object's definition, columns
+    /// or comment change. Lets a changed schema be refreshed table by table
+    /// (only changed tables are fetched; their cached columns go stale).
+    /// Must cover exactly the listed objects. `None` = not supported.
+    async fn object_versions(&self, _schema: &str) -> Result<Option<HashMap<String, String>>> {
+        Ok(None)
+    }
+
+    /// [`Session::list_objects`] limited to `names` (changed objects after a
+    /// version diff). The default lists the schema and filters.
+    async fn list_objects_named(&self, schema: &str, names: &[String]) -> Result<Vec<DbObject>> {
+        let want: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        Ok(self.list_objects(schema).await?.into_iter().filter(|o| want.contains(o.name.as_str())).collect())
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail>;
 
     /// Full DDL of an object (explorer "Show DDL"). `None` when the engine
@@ -418,5 +454,18 @@ mod tests {
         assert_eq!(m[0].columns[0].columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["id", "name"], "non-adjacent rows still grouped, in order");
         assert_eq!(m[1].columns[0].foreign_keys, vec![fk]);
         assert!(m[2].objects.is_empty() && m[2].columns.is_empty() && m[2].error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod explorer_tests {
+    use super::*;
+
+    #[test]
+    fn version_keys_match_serde() {
+        for k in [ObjectKind::Table, ObjectKind::MaterializedView, ObjectKind::ForeignTable, ObjectKind::Sequence, ObjectKind::Package, ObjectKind::Other] {
+            assert_eq!(serde_json::to_value(k).unwrap().as_str().unwrap(), k.as_str());
+        }
+        assert_eq!(version_key(ObjectKind::View, "v1"), "view:v1");
     }
 }

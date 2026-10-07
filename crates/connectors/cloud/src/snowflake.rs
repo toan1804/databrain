@@ -613,6 +613,28 @@ impl Session for SfSession {
         Ok(out)
     }
 
+    /// The session database when one is set (like `list_schemas`), else every database.
+    async fn list_catalogs(&self) -> Result<Option<Vec<databrain_connector_core::CatalogInfo>>> {
+        let cur = self.0.run_small("select current_database()").await?;
+        let cur_db = cur.first().and_then(|r| r.first().cloned().flatten());
+        let dbs = self.databases().await?;
+        Ok(Some(dbs.into_iter().map(|name| databrain_connector_core::CatalogInfo { is_default: cur_db.as_deref() == Some(name.as_str()), name }).collect()))
+    }
+
+    async fn list_catalog_schemas(&self, catalog: &str) -> Result<Vec<SchemaInfo>> {
+        let cur = self.0.run_small("select current_database(), current_schema()").await?;
+        let (cur_db, cur_sch) = cur.first().map(|r| (r.first().cloned().flatten(), r.get(1).cloned().flatten())).unwrap_or((None, None));
+        let rows = self.0.run_small(&format!("show terse schemas in database {}", quote_ident(ConnectorKind::Snowflake, catalog))).await?;
+        let mut out: Vec<SchemaInfo> = rows
+            .into_iter()
+            .filter_map(|r| r.get(1).cloned().flatten())
+            .filter(|n| n != "INFORMATION_SCHEMA")
+            .map(|n| SchemaInfo::in_catalog(catalog, &n, cur_db.as_deref() == Some(catalog) && cur_sch.as_deref() == Some(n.as_str())))
+            .collect();
+        out.sort_by_key(|s| !s.is_default);
+        Ok(out)
+    }
+
     async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
         let term = databrain_connector_core::search_sql_term(query);
         let cur = self.0.run_small("select current_database()").await?;

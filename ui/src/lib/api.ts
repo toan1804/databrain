@@ -59,6 +59,12 @@ import type {
   RunResponse,
   SavedQuery,
   SchemaInfo,
+  CatalogInfo,
+  CachedExplorer,
+  CachedListing,
+  CachedColumns,
+  SchemaRefresh,
+  ExplorerRevalidation,
   Span,
   TabState,
   TestResult,
@@ -107,7 +113,10 @@ export const api = {
     secret: string | null,
     connectionId: string | null,
     sshSecret: string | null = null,
-  ) => call<TestResult>("test_connection", { config, secret, connectionId, sshSecret }),
+    testId: string | null = null,
+  ) => call<TestResult>("test_connection", { config, secret, connectionId, sshSecret, testId }),
+  /** Stop a running test (the dialog's Cancel button). */
+  cancelTestConnection: (testId: string) => call<boolean>("cancel_test_connection", { testId }),
   signIn: (id: string) => call<AuthStatus>("sign_in", { id }),
   signOut: (id: string) => call<void>("sign_out", { id }),
   authStatus: (id: string) => call<AuthStatus>("auth_status", { id }),
@@ -117,6 +126,18 @@ export const api = {
 
   listSchemas: (id: string) => call<SchemaInfo[]>("list_schemas", { id }),
   listObjects: (id: string, schema: string) => call<DbObject[]>("list_objects", { id, schema }),
+  /** Catalogs of three-level engines (null for two-level ones). */
+  listCatalogs: (id: string) => call<CatalogInfo[] | null>("list_catalogs", { id }),
+  listCatalogSchemas: (id: string, catalog: string) => call<SchemaInfo[]>("list_catalog_schemas", { id, catalog }),
+  /** Explorer cache (local, no network). */
+  cachedExplorer: (id: string) => call<CachedExplorer>("cached_explorer", { id }),
+  cachedObjects: (id: string, schema: string) => call<CachedListing | null>("cached_objects", { id, schema }),
+  cachedColumns: (id: string, schema: string, name: string) => call<CachedColumns | null>("cached_columns", { id, schema, name }),
+  clearExplorerCache: (id: string) => call<void>("clear_explorer_cache", { id }),
+  /** Bring one schema up to date: only changed objects are fetched when the engine has versions. */
+  refreshSchema: (id: string, schema: string) => call<SchemaRefresh>("refresh_schema", { id, schema }),
+  /** One fingerprint query; changed cached schemas are refreshed table by table. */
+  revalidateExplorer: (id: string, open: string[], force: boolean) => call<ExplorerRevalidation>("revalidate_explorer", { id, open, force }),
   searchObjects: (id: string, query: string, limit?: number) =>
     call<DbObject[]>("search_objects", { id, query, limit: limit ?? null }),
   /** Completion: tables from the local knowledge index (no network). */

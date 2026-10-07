@@ -516,6 +516,46 @@ impl Session for MysqlSession {
     /// Per-schema checksum of table names/types/comments, column definitions
     /// and foreign keys: three aggregate queries over information_schema.
     /// Row counts are left out, so data changes do not count.
+    /// [`Session::schema_fingerprints`] plus routines (the explorer lists them).
+    async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let Some(mut out) = self.schema_fingerprints().await? else { return Ok(None) };
+        let rows: Vec<(String, String)> = self
+            .query_rows(
+                "select routine_schema, cast(concat('r', count(*), ':', sum(crc32(concat_ws(':', routine_name, routine_type, created, last_altered)))) as char) \
+                 from information_schema.routines group by routine_schema",
+                vec![],
+            )
+            .await?;
+        for (sch, f) in rows {
+            let e = out.entry(sch).or_default();
+            e.push('/');
+            e.push_str(&f);
+        }
+        Ok(Some(out))
+    }
+
+    async fn object_versions(&self, schema: &str) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let rows: Vec<(String, String)> = self
+            .query_rows(
+                "select concat(if(t.table_type like '%VIEW%', 'view', 'table'), ':', t.table_name), \
+                        cast(concat_ws(':', coalesce(t.create_time, ''), crc32(coalesce(t.table_comment, '')), coalesce(c.h, 0), coalesce(k.h, 0)) as char) \
+                 from information_schema.tables t \
+                 left join (select table_name, sum(crc32(concat_ws(':', column_name, ordinal_position, column_type, is_nullable, column_key, \
+                                   column_comment, coalesce(column_default, '')))) h \
+                            from information_schema.columns where table_schema = ? group by table_name) c on c.table_name = t.table_name \
+                 left join (select table_name, sum(crc32(concat_ws(':', constraint_name, column_name, coalesce(referenced_table_name, ''), \
+                                   coalesce(referenced_column_name, '')))) h \
+                            from information_schema.key_column_usage where table_schema = ? group by table_name) k on k.table_name = t.table_name \
+                 where t.table_schema = ? \
+                 union all \
+                 select concat(if(routine_type = 'PROCEDURE', 'procedure', 'function'), ':', routine_name), cast(concat_ws(':', created, last_altered) as char) \
+                 from information_schema.routines where routine_schema = ?",
+                vec![schema.into(), schema.into(), schema.into(), schema.into()],
+            )
+            .await?;
+        Ok(Some(rows.into_iter().collect()))
+    }
+
     async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for sql in [
@@ -691,6 +731,49 @@ mod tests {
         );
     }
 
+    /// Live: explorer fingerprints include routines; per-object versions.
+    #[tokio::test]
+    async fn live_explorer_versions() {
+        let Ok(host) = std::env::var("DATABRAIN_MYSQL_HOST") else {
+            return eprintln!("skipping: DATABRAIN_MYSQL_HOST not set");
+        };
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        let user = std::env::var("DATABRAIN_MYSQL_USER").unwrap_or_else(|_| "root".into());
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Mysql, AuthMethod::Password { user: user.clone() });
+        cfg.host = Some(host);
+        cfg.port = std::env::var("DATABRAIN_MYSQL_PORT").ok().and_then(|p| p.parse().ok());
+        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_MYSQL_PASSWORD").ok().map(secrecy::SecretString::from)));
+        let s = MysqlConnector.connect(&cfg, creds).await.unwrap();
+        let run = |sql: &'static str| {
+            let s = &s;
+            async move { s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap() }
+        };
+        run("drop database if exists ex_a").await;
+        run("create database ex_a").await;
+        run("create table ex_a.t1 (id int primary key)").await;
+        run("create table ex_a.t2 (x int)").await;
+        run("create view ex_a.v1 as select id from ex_a.t1").await;
+        let fp = |m: std::collections::HashMap<String, String>| m.get("ex_a").cloned().unwrap();
+        let f0 = fp(s.explorer_fingerprints().await.unwrap().unwrap());
+        let v0 = s.object_versions("ex_a").await.unwrap().unwrap();
+        let mut keys: Vec<&str> = v0.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["table:t1", "table:t2", "view:v1"]);
+        let mut listed: Vec<String> = s.list_objects("ex_a").await.unwrap().iter().map(|o| databrain_connector_core::version_key(o.kind, &o.name)).collect();
+        listed.sort();
+        assert_eq!(listed, keys);
+        run("create function ex_a.f(a int) returns int deterministic return a").await;
+        assert_ne!(f0, fp(s.explorer_fingerprints().await.unwrap().unwrap()), "new function");
+        run("alter table ex_a.t2 add column z text comment 'zed'").await;
+        let v1 = s.object_versions("ex_a").await.unwrap().unwrap();
+        assert!(v1.contains_key("function:f"));
+        assert_ne!(v0["table:t2"], v1["table:t2"]);
+        assert_eq!(v0["table:t1"], v1["table:t1"]);
+        run("insert into ex_a.t2 values (1, 'a')").await;
+        assert_eq!(v1, s.object_versions("ex_a").await.unwrap().unwrap(), "data changes are not definition changes");
+        run("drop database ex_a").await;
+    }
+
     /// Live: bulk metadata (one batch query set) and schema fingerprints.
     /// DATABRAIN_MYSQL_HOST (+ _PORT, _USER, _PASSWORD).
     #[tokio::test]
@@ -781,6 +864,7 @@ mod tests {
         let mut cfg = ConnectionConfig::new(ConnectorKind::Mysql, AuthMethod::Password { user: user.clone() });
         cfg.host = Some(host);
         cfg.database = std::env::var("DATABRAIN_MYSQL_DB").ok();
+        cfg.port = std::env::var("DATABRAIN_MYSQL_PORT").ok().and_then(|p| p.parse().ok());
         let creds = Arc::new(InlineCredentialSource::new(
             AuthMethod::Password { user },
             std::env::var("DATABRAIN_MYSQL_PASSWORD").ok().map(secrecy::SecretString::from),

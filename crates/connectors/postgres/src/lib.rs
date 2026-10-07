@@ -631,65 +631,63 @@ impl Session for PgSession {
     }
 
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {
+        self.list_objects_filtered(schema, None).await
+    }
+
+    async fn list_objects_named(&self, schema: &str, names: &[String]) -> Result<Vec<DbObject>> {
+        self.list_objects_filtered(schema, Some(names)).await
+    }
+
+    /// Everything `list_objects` lists, per schema: relations and sequences
+    /// (row version + columns + constraints + comments) and routines (all
+    /// overloads), so any DDL on any of them changes the value.
+    async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         let rows = self
             .client
             .query(
-                "select c.relname::text, c.relkind::text, \
-                        obj_description(c.oid, 'pg_class'), c.reltuples::float8 \
-                 from pg_catalog.pg_class c \
-                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
-                 where n.nspname = $1 and c.relkind in ('r','p','v','m','f','S') and not c.relispartition \
-                 order by c.relkind in ('v','m'), c.relkind = 'S', c.relname",
-                &[&schema],
+                "with rel as (select c.oid, c.relnamespace ns, c.xmin, c.relname from pg_catalog.pg_class c \
+                              where c.relkind in ('r','p','v','m','f','S') and not c.relispartition), \
+                 h as ( \
+                   select ns, hashtext(oid::text || ':' || xmin::text || ':' || relname) h from rel \
+                   union all select r.ns, hashtext(a.attrelid::text || ':' || a.attnum || ':' || a.xmin::text) \
+                     from pg_catalog.pg_attribute a join rel r on r.oid = a.attrelid where a.attnum > 0 \
+                   union all select r.ns, hashtext(k.oid::text || ':' || k.xmin::text) from pg_catalog.pg_constraint k join rel r on r.oid = k.conrelid \
+                   union all select r.ns, hashtext(d.objoid::text || ':' || d.objsubid || ':' || md5(d.description)) \
+                     from pg_catalog.pg_description d join rel r on r.oid = d.objoid where d.classoid = 'pg_catalog.pg_class'::regclass \
+                   union all select p.pronamespace, hashtext(p.oid::text || ':' || p.xmin::text) from pg_catalog.pg_proc p where p.prokind in ('f','p')) \
+                 select n.nspname::text, count(h.h) || '/' || coalesce(sum(h.h), 0) \
+                 from pg_catalog.pg_namespace n left join h on h.ns = n.oid group by n.nspname",
+                &[],
             )
             .await
             .map_err(|e| map_err(&e))?;
-        let mut out: Vec<DbObject> = rows
-            .iter()
-            .map(|r| {
-                let kind = match r.get::<_, String>(1).as_str() {
-                    "v" => ObjectKind::View,
-                    "m" => ObjectKind::MaterializedView,
-                    "f" => ObjectKind::ForeignTable,
-                    "S" => ObjectKind::Sequence,
-                    _ => ObjectKind::Table,
-                };
-                let est: Option<f64> = r.get(3);
-                let est = est.filter(|_| kind != ObjectKind::Sequence);
-                DbObject {
-                    schema: schema.to_string(),
-                    name: r.get(0),
-                    kind,
-                    comment: r.get(2),
-                    row_estimate: est.filter(|e| *e >= 0.0).map(|e| e as i64),
-                }
-            })
-            .collect();
+        Ok(Some(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))).collect()))
+    }
 
-        let funcs = self
+    async fn object_versions(&self, schema: &str) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let rows = self
             .client
             .query(
-                "select p.proname::text, p.prokind::text \
+                "select case c.relkind when 'v' then 'view' when 'm' then 'materialized_view' when 'f' then 'foreign_table' \
+                          when 'S' then 'sequence' else 'table' end || ':' || c.relname, \
+                        concat_ws(':', c.xmin::text, \
+                          (select sum(hashtext(a.attnum || ':' || a.xmin::text)) from pg_catalog.pg_attribute a where a.attrelid = c.oid and a.attnum > 0), \
+                          (select sum(hashtext(k.oid::text || ':' || k.xmin::text)) from pg_catalog.pg_constraint k where k.conrelid = c.oid), \
+                          (select sum(hashtext(d.objsubid || ':' || md5(d.description))) from pg_catalog.pg_description d \
+                             where d.objoid = c.oid and d.classoid = 'pg_catalog.pg_class'::regclass)) \
+                 from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 where n.nspname = $1 and c.relkind in ('r','p','v','m','f','S') and not c.relispartition \
+                 union all \
+                 select case p.prokind when 'p' then 'procedure' else 'function' end || ':' || p.proname, \
+                        sum(hashtext(p.oid::text || ':' || p.xmin::text))::text \
                  from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace \
-                 where n.nspname = $1 and p.prokind in ('f','p') \
-                 and n.nspname not in ('pg_catalog','information_schema') \
-                 group by 1, 2 order by 1",
+                 where n.nspname = $1 and p.prokind in ('f','p') and n.nspname not in ('pg_catalog','information_schema') \
+                 group by p.proname, p.prokind",
                 &[&schema],
             )
             .await
             .map_err(|e| map_err(&e))?;
-        out.extend(funcs.iter().map(|r| DbObject {
-            schema: schema.to_string(),
-            name: r.get(0),
-            kind: if r.get::<_, String>(1) == "p" {
-                ObjectKind::Procedure
-            } else {
-                ObjectKind::Function
-            },
-            comment: None,
-            row_estimate: None,
-        }));
-        Ok(out)
+        Ok(Some(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))).collect()))
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
@@ -920,6 +918,71 @@ impl Session for PgSession {
 }
 
 impl PgSession {
+    async fn list_objects_filtered(&self, schema: &str, names: Option<&[String]>) -> Result<Vec<DbObject>> {
+        let names: Option<Vec<String>> = names.map(<[String]>::to_vec);
+        let rows = self
+            .client
+            .query(
+                "select c.relname::text, c.relkind::text, \
+                        obj_description(c.oid, 'pg_class'), c.reltuples::float8 \
+                 from pg_catalog.pg_class c \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 where n.nspname = $1 and c.relkind in ('r','p','v','m','f','S') and not c.relispartition \
+                   and ($2::text[] is null or c.relname = any($2)) \
+                 order by c.relkind in ('v','m'), c.relkind = 'S', c.relname",
+                &[&schema, &names],
+            )
+            .await
+            .map_err(|e| map_err(&e))?;
+        let mut out: Vec<DbObject> = rows
+            .iter()
+            .map(|r| {
+                let kind = match r.get::<_, String>(1).as_str() {
+                    "v" => ObjectKind::View,
+                    "m" => ObjectKind::MaterializedView,
+                    "f" => ObjectKind::ForeignTable,
+                    "S" => ObjectKind::Sequence,
+                    _ => ObjectKind::Table,
+                };
+                let est: Option<f64> = r.get(3);
+                let est = est.filter(|_| kind != ObjectKind::Sequence);
+                DbObject {
+                    schema: schema.to_string(),
+                    name: r.get(0),
+                    kind,
+                    comment: r.get(2),
+                    row_estimate: est.filter(|e| *e >= 0.0).map(|e| e as i64),
+                }
+            })
+            .collect();
+
+        let funcs = self
+            .client
+            .query(
+                "select p.proname::text, p.prokind::text \
+                 from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace \
+                 where n.nspname = $1 and p.prokind in ('f','p') \
+                 and n.nspname not in ('pg_catalog','information_schema') \
+                 and ($2::text[] is null or p.proname = any($2)) \
+                 group by 1, 2 order by 1",
+                &[&schema, &names],
+            )
+            .await
+            .map_err(|e| map_err(&e))?;
+        out.extend(funcs.iter().map(|r| DbObject {
+            schema: schema.to_string(),
+            name: r.get(0),
+            kind: if r.get::<_, String>(1) == "p" {
+                ObjectKind::Procedure
+            } else {
+                ObjectKind::Function
+            },
+            comment: None,
+            row_estimate: None,
+        }));
+        Ok(out)
+    }
+
     /// Three catalog queries for the whole batch of schemas (objects,
     /// columns, foreign keys), instead of three per schema.
     async fn bulk_metadata_batched(&self, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
@@ -1189,6 +1252,56 @@ mod tests {
         for stmt in ["drop schema kb_r cascade", "drop function public.kb_total(int)"] {
             s.execute(stmt, ExecOptions::default()).await.unwrap().collect().await.unwrap();
         }
+    }
+
+    /// Live: explorer fingerprints cover routines/sequences; object versions
+    /// change only for the object that changed; named listing.
+    #[tokio::test]
+    async fn live_explorer_versions() {
+        let Some(s) = live_session().await else {
+            return eprintln!("skipping: DATABRAIN_PG_HOST not set");
+        };
+        let run = |sql: &'static str| async {
+            for stmt in sql.split(';').map(str::trim).filter(|x| !x.is_empty()) {
+                s.execute(stmt, ExecOptions::default()).await.unwrap().collect().await.unwrap();
+            }
+        };
+        run("drop schema if exists ex_a cascade; drop schema if exists ex_b cascade").await;
+        run("create schema ex_a; create schema ex_b; create table ex_a.t1 (id int primary key); create table ex_a.t2 (x int); \
+             create view ex_a.v1 as select * from ex_a.t1; create sequence ex_a.s1; create table ex_b.other (y int)").await;
+        let fp = |m: &std::collections::HashMap<String, String>, k: &str| m.get(k).cloned().unwrap();
+        let f0 = s.explorer_fingerprints().await.unwrap().unwrap();
+        assert_eq!(fp(&f0, "ex_a"), fp(&s.explorer_fingerprints().await.unwrap().unwrap(), "ex_a"), "stable");
+        let v0 = s.object_versions("ex_a").await.unwrap().unwrap();
+        let mut keys: Vec<&str> = v0.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["sequence:s1", "table:t1", "table:t2", "view:v1"]);
+        // Same objects as the listing.
+        let mut listed: Vec<String> = s.list_objects("ex_a").await.unwrap().iter().map(|o| databrain_connector_core::version_key(o.kind, &o.name)).collect();
+        listed.sort();
+        assert_eq!(listed, keys);
+
+        run("create function ex_a.f(a int) returns int language sql as 'select a'").await;
+        let f1 = s.explorer_fingerprints().await.unwrap().unwrap();
+        assert_ne!(fp(&f0, "ex_a"), fp(&f1, "ex_a"), "new function");
+        assert_eq!(fp(&f0, "ex_b"), fp(&f1, "ex_b"));
+        let v1 = s.object_versions("ex_a").await.unwrap().unwrap();
+        assert!(v1.contains_key("function:f"));
+        assert_eq!(v0["table:t1"], v1["table:t1"]);
+
+        run("alter table ex_a.t2 add column z text; comment on table ex_a.t1 is 'hello'").await;
+        let v2 = s.object_versions("ex_a").await.unwrap().unwrap();
+        assert_ne!(v1["table:t2"], v2["table:t2"], "new column");
+        assert_ne!(v1["table:t1"], v2["table:t1"], "comment");
+        assert_eq!(v1["view:v1"], v2["view:v1"], "untouched");
+        run("insert into ex_a.t2 values (1, 'a'); analyze ex_a.t2").await;
+        assert_eq!(v2, s.object_versions("ex_a").await.unwrap().unwrap(), "data changes are not definition changes");
+
+        let named = s.list_objects_named("ex_a", &["t2".into(), "f".into()]).await.unwrap();
+        let mut n: Vec<String> = named.iter().map(|o| databrain_connector_core::version_key(o.kind, &o.name)).collect();
+        n.sort();
+        assert_eq!(n, vec!["function:f", "table:t2"]);
+        run("drop schema ex_a cascade; drop schema ex_b cascade").await;
     }
 
     /// Live: bulk metadata (one batch query) and schema fingerprints for incremental indexing.
