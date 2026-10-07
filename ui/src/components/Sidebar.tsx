@@ -98,7 +98,8 @@ function ActivityRail() {
   const setPanel = useStore((s) => s.setSidebarPanel);
   const aiOpen = useAi((s) => s.open);
   const setAiOpen = useAi((s) => s.setOpen);
-  const item = (p: SidebarPanel, icon: ReactNode, label: string) => (
+  const scheduled = useJobs((s) => s.jobs.filter((j) => j.schedule.enabled).length);
+  const item = (p: SidebarPanel, icon: ReactNode, label: string, dot = false) => (
     <button
       key={p}
       title={label}
@@ -111,6 +112,7 @@ function ActivityRail() {
     >
       {panel === p && <span className="absolute left-[-6px] h-5 w-[3px] rounded-r bg-accent" />}
       {icon}
+      {dot && <span className="absolute right-2 top-2 h-2 w-2 rounded-full bg-danger ring-2 ring-bg" aria-hidden />}
     </button>
   );
   return (
@@ -118,7 +120,7 @@ function ActivityRail() {
       {item("connections", <Database size={18} />, "Connections")}
       {item("saved", <Bookmark size={18} />, "Saved queries")}
       {item("notebooks", <NotebookPen size={18} />, "Notebooks")}
-      {item("jobs", <Workflow size={18} />, "Jobs")}
+      {item("jobs", <Workflow size={18} />, scheduled ? `Jobs · ${scheduled} scheduled` : "Jobs", scheduled > 0)}
       {item("outputs", <Layers size={18} />, "Outputs")}
       {item("history", <History size={18} />, "History")}
       <div className="flex-1" />

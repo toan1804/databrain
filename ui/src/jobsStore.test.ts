@@ -78,3 +78,20 @@ describe("jobs store", () => {
     expect(useStore.getState().tabs.find((t) => t.id === useStore.getState().activeTabId)!.job_id).toBe("job1");
   });
 });
+
+describe("scheduled runs", () => {
+  it("announces a scheduled run once, and not manual or finished ones", async () => {
+    const { announceScheduled } = await import("./jobsStore");
+    const toasts: string[] = [];
+    const orig = useStore.getState().toast;
+    useStore.setState({ toast: (m: string) => void toasts.push(m) });
+    const jobs = [{ id: "j1", name: "Nightly", node_count: 1, step_names: [], schedule: { enabled: true, mode: "interval" as const, minutes: 60, at: "08:00", weekdays: [] }, updated_at: 0 }];
+    const run = { id: 7, job_id: "j1", trigger: "schedule" as const, started_at: 0, status: "running" as const, nodes: [] };
+    announceScheduled(jobs, run);
+    announceScheduled(jobs, { ...run, nodes: [] });
+    announceScheduled(jobs, { ...run, id: 8, trigger: "manual" });
+    announceScheduled(jobs, { ...run, id: 9, status: "success" });
+    expect(toasts).toEqual(['Starting scheduled job "Nightly"…']);
+    useStore.setState({ toast: orig });
+  });
+});

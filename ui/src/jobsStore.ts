@@ -40,6 +40,15 @@ interface JobsState {
 }
 
 let started = false;
+/** Scheduled runs already announced ("Starting job …"). */
+const announced = new Set<number>();
+
+export function announceScheduled(jobs: JobSummary[], run: JobRun) {
+  if (run.trigger !== "schedule" || run.status !== "running" || announced.has(run.id)) return;
+  announced.add(run.id);
+  const name = jobs.find((j) => j.id === run.job_id)?.name ?? "a scheduled job";
+  useStore.getState().toast(`Starting scheduled job "${name}"…`, "info");
+}
 let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
 export const useJobs = create<JobsState>((set, get) => ({
@@ -56,6 +65,7 @@ export const useJobs = create<JobsState>((set, get) => ({
     started = true;
     await onJobRun(({ job_id, run }) => {
       set((s) => ({ runs: { ...s.runs, [job_id]: run }, running: { ...s.running, [job_id]: run.status === "running" } }));
+      announceScheduled(get().jobs, run);
       if (run.status !== "running") {
         // Next run time and last status in the list.
         clearTimeout(refreshTimer);
@@ -67,6 +77,8 @@ export const useJobs = create<JobsState>((set, get) => ({
       }
     });
     await get().refresh();
+    // Scheduled runs started at launch, before this listener existed.
+    for (const j of get().jobs) if (j.last_run && get().running[j.id]) announceScheduled(get().jobs, j.last_run);
   },
   open: (id, name) => {
     const st = useStore.getState();

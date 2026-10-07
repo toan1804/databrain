@@ -27,6 +27,8 @@ use tokio_util::sync::CancellationToken;
 pub const JOB_RUN_EVENT: &str = "job-run";
 /// How often the scheduler looks for due jobs.
 const SCHEDULER_TICK: Duration = Duration::from_secs(15);
+/// Wait before the first pass after launch.
+const STARTUP_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct JobRunEvent {
@@ -324,6 +326,9 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
 pub fn spawn_scheduler(ctx: JobCtx) {
     let _ = ctx.workspace.close_stale_job_runs();
     tokio::spawn(async move {
+        // Let the window load and listen first, so runs started at launch
+        // are announced ("Starting scheduled job …").
+        tokio::time::sleep(STARTUP_DELAY).await;
         loop {
             tick(&ctx);
             tokio::time::sleep(SCHEDULER_TICK).await;
