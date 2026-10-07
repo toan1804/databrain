@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { EditorView } from "@codemirror/view";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { ClipboardCopy, ClipboardPaste, Scissors, TextSelect, WandSparkles } from "lucide-react";
+import { ClipboardCopy, ClipboardPaste, Network, Scissors, TextSelect, WandSparkles } from "lucide-react";
 import { toError } from "../lib/api";
 import type { ConnectorKind } from "../lib/types";
 import { useStore } from "../store";
@@ -67,7 +67,20 @@ async function paste(): Promise<string> {
 }
 
 /** Right-click menu of a SQL editor: clipboard, select all, format SQL. */
-export function SqlContextMenu({ view, kind, at, onClose }: { view: EditorView; kind: ConnectorKind | undefined; at: { x: number; y: number }; onClose: () => void }) {
+export function SqlContextMenu({
+  view,
+  kind,
+  at,
+  onClose,
+  onLineage,
+}: {
+  view: EditorView;
+  kind: ConnectorKind | undefined;
+  at: { x: number; y: number };
+  onClose: () => void;
+  /** "Show lineage" (selection or whole script) in a new tab. */
+  onLineage?: () => void;
+}) {
   const [sel] = useState(() => view.state.selection.main);
   const hasSel = !sel.empty;
   const readOnly = view.state.readOnly;
@@ -89,6 +102,7 @@ export function SqlContextMenu({ view, kind, at, onClose }: { view: EditorView; 
           onClick={run(() => void formatInView(view, kind))}
         />
         {hasSel && <MenuItem icon={<WandSparkles size={13} />} label="Format whole script" disabled={readOnly} onClick={run(() => void formatInView(view, kind, true))} />}
+        {onLineage && <MenuItem icon={<Network size={13} />} label={hasSel ? "Show lineage of selection" : "Show lineage"} hint="new tab" onClick={run(onLineage)} />}
         <MenuSeparator />
         <MenuItem
           icon={<Scissors size={13} />}

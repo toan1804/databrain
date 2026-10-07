@@ -28,6 +28,8 @@ databrain-ai = { version = "0.1.0", path = "../ai" }
 databrain-auth = { version = "0.1.0", path = "../auth" }
 databrain-connector-cloud = { version = "0.1.0", path = "../connectors/cloud", default-features = false, optional = true }
 databrain-connector-core = { version = "0.1.0", path = "../connector-core" }
+databrain-lineage = { version = "0.1.0", path = "../lineage" }
+base64 = "0.23.1"
 databrain-connector-duckdb = { version = "0.1.0", path = "../connectors/duckdb", optional = true }
 databrain-connector-mssql = { version = "0.1.0", path = "../connectors/mssql", optional = true }
 databrain-connector-mysql = { version = "0.1.0", path = "../connectors/mysql", optional = true }

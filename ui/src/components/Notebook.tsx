@@ -61,6 +61,7 @@ import { editorBridge } from "../editorBridge";
 import { editorContextMenu, errorField, highlight, langExtension, setError } from "./SqlEditor";
 import { SqlContextMenu, formatKey } from "./SqlContextMenu";
 import { ParamBar } from "./ParamBar";
+import { openLineage } from "./LineageTab";
 import { paramField, paramNames, setParamSpans } from "./paramsExt";
 import { canFetchMetadata, sqlAssist } from "./sqlAssist";
 import { queryHints } from "./queryHintsExt";
@@ -1082,7 +1083,7 @@ function CellEditor({
         className={`nb-cell overflow-hidden rounded-md border border-line/60 bg-panel-2/40 ${h ? "nb-cell-fixed" : ""}`}
         style={h ? { height: h } : undefined}
       />
-      {menu && view.current && <SqlContextMenu view={view.current} kind={conn?.config.kind} at={menu} onClose={() => setMenu(null)} />}
+      {menu && view.current && <SqlContextMenu view={view.current} kind={conn?.config.kind} at={menu} onClose={() => setMenu(null)} onLineage={() => openLineage(editorKey, connectionId ?? undefined)} />}
       <ResizeHandle
         label="Editor height"
         min={EDITOR_MIN}

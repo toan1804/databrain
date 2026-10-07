@@ -766,6 +766,23 @@ impl QueryEngine {
         .await
     }
 
+    /// [`Session::check_sql`] on the metadata session, at most 10 s.
+    pub async fn check_sql(&self, connection_id: &str, sql: &str) -> Result<bool> {
+        let sql = sql.to_string();
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            self.with_meta(connection_id, |s| {
+                let sql = sql.clone();
+                async move { s.check_sql(&sql).await }
+            }),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(EngineError::new("timeout", "The database took more than 10 s to check the query")),
+        }
+    }
+
     pub async fn explorer_fingerprints(&self, connection_id: &str) -> Result<Option<HashMap<String, String>>> {
         self.with_meta(connection_id, |s| async move { s.explorer_fingerprints().await }).await
     }

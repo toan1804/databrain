@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronsDownUp, FileCode2, FileText, Table2, Lightbulb, Loader2, Play, PlayCircle, Plus, Save, Sparkles, Square, X } from "lucide-react";
+import { ChevronsDownUp, FileCode2, FileText, Network, Table2, Lightbulb, Loader2, Play, PlayCircle, Plus, Save, Sparkles, Square, X } from "lucide-react";
 import { isQueryTab, useActiveTab, useStore, type Tab } from "../store";
 import { editorBridge } from "../editorBridge";
 import { SqlEditor } from "./SqlEditor";
@@ -9,6 +9,7 @@ import { NotebookView } from "./Notebook";
 import { OutputTab } from "./OutputTab";
 import { DdlTab } from "./DdlTab";
 import { ParamBar } from "./ParamBar";
+import { LineageTab, openLineage } from "./LineageTab";
 import { useAi } from "../aiStore";
 
 const ROW_LIMITS = [100, 500, 1000, 5000, 10000, 50000, 100000, 0];
@@ -65,6 +66,13 @@ export function EditorPane() {
         .map((t) => (
           <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
             <DdlTab tabId={t.id} reference={t.ddl!} visible={t.id === activeId} />
+          </div>
+        ))}
+      {tabs
+        .filter((t) => t.lineage)
+        .map((t) => (
+          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
+            <LineageTab tabId={t.id} visible={t.id === activeId} />
           </div>
         ))}
       <div className={active && !isQueryTab(active) ? "hidden" : "contents"}>
@@ -161,6 +169,8 @@ function TabBar() {
               <Table2 size={12} className="shrink-0 text-muted" />
             ) : t.ddl ? (
               <FileCode2 size={12} className="shrink-0 text-muted" />
+            ) : t.lineage ? (
+              <Network size={12} className="shrink-0 text-muted" />
             ) : (
               <ConnDot color={conn?.color} />
             )}
@@ -305,6 +315,9 @@ function Toolbar() {
 
       <div className="ml-auto flex items-center gap-1">
         {conn?.config.read_only && <span className="rounded bg-panel-2 px-1.5 py-0.5 text-[11px] text-muted">read-only</span>}
+        <button className="btn-ghost py-1" title="Column lineage of the statement or selection, in a new tab" onClick={() => openLineage(tab.id)}>
+          <Network size={13} /> Lineage
+        </button>
         <button
           className="btn-ghost py-1"
           disabled={!conn}

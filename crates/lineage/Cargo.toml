@@ -1,0 +1,15 @@
+[package]
+name = "databrain-lineage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+databrain-connector-core = { version = "0.1.0", path = "../connector-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+sqlparser = { version = "0.63.0", default-features = false, features = ["std", "visitor"] }

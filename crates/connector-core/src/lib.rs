@@ -162,6 +162,25 @@ pub trait Session: Send + Sync {
         Ok(None)
     }
 
+    /// Check a query with the database without running it (`EXPLAIN`, no
+    /// `ANALYZE`): unknown tables/columns and type errors come back as the
+    /// error, with `position` (1-based character in `sql`) when the engine
+    /// gives one. `Ok(false)` = this engine has no cheap check.
+    async fn check_sql(&self, sql: &str) -> Result<bool> {
+        let prefix = match self.kind() {
+            ConnectorKind::Postgres | ConnectorKind::Mysql | ConnectorKind::Duckdb | ConnectorKind::Snowflake => "EXPLAIN ",
+            ConnectorKind::Sqlite => "EXPLAIN QUERY PLAN ",
+            _ => return Ok(false),
+        };
+        let shift = |mut e: ConnectorError| {
+            e.position = e.position.and_then(|p| p.checked_sub(prefix.chars().count() as u32)).filter(|p| *p > 0);
+            e
+        };
+        let stream = self.execute(&format!("{prefix}{sql}"), ExecOptions::default()).await.map_err(shift)?;
+        stream.collect().await.map_err(shift)?;
+        Ok(true)
+    }
+
     /// Indexes, partitioning and clustering of a table (editor query hints).
     /// The default reports the primary key from [`Session::describe`].
     async fn table_layout(&self, schema: &str, name: &str) -> Result<TableLayout> {

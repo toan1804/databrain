@@ -15,6 +15,7 @@ members = [
     "crates/export",
     "crates/workspace",
     "crates/query-engine",
+    "crates/lineage",
     "crates/ai",
     "crates/app",
 ]

@@ -479,6 +479,28 @@ async fn table_layout(state: State<'_, AppState>, id: String, schema: String, na
 }
 
 #[tauri::command]
+async fn sql_lineage(
+    state: State<'_, AppState>,
+    connection_id: Option<String>,
+    kind: ConnectorKind,
+    sql: String,
+    params: Option<std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>>,
+    check: bool,
+) -> R<api::LineageView> {
+    api::lineage(&state, connection_id.as_deref(), kind, &sql, params.unwrap_or_default(), check).await
+}
+
+#[tauri::command]
+fn save_text_file(path: String, contents: String) -> R<()> {
+    api::save_text_file(&path, &contents)
+}
+
+#[tauri::command]
+fn save_base64_file(path: String, data: String) -> R<()> {
+    api::save_base64_file(&path, &data)
+}
+
+#[tauri::command]
 fn sql_parameters(kind: ConnectorKind, text: String) -> Vec<api::ParamSpanView> {
     api::sql_parameters(kind, &text)
 }
@@ -740,6 +762,9 @@ pub fn run() {
             table_layout,
             statement_at_cursor,
             sql_parameters,
+            sql_lineage,
+            save_text_file,
+            save_base64_file,
             preview_parameters,
             run_query,
             cancel_query,

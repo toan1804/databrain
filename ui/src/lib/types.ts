@@ -278,6 +278,66 @@ export interface PlannedStatement {
   classification: { kind: StatementKind; missing_where: boolean; keyword: string };
 }
 
+// ---- lineage
+
+export interface LineageRange {
+  start: number;
+  end: number;
+}
+
+export type LineageNodeKind = "table" | "cte" | "subquery" | "set_op" | "result";
+export type LineageEdgeKind = "direct" | "transform" | "aggregate" | "filter" | "join";
+
+export interface LineageColumn {
+  name: string;
+  span?: LineageRange;
+  expr?: string;
+}
+
+export interface LineageNode {
+  id: string;
+  kind: LineageNodeKind;
+  name: string;
+  columns: LineageColumn[];
+  columns_known: boolean;
+  written: boolean;
+  statement?: number;
+  span?: LineageRange;
+}
+
+export interface LineageEdge {
+  from: string;
+  from_column?: string;
+  to: string;
+  to_column?: string;
+  kind: LineageEdgeKind;
+  span?: LineageRange;
+  /** Filters/joins: the clause (`LEFT JOIN customers c ON c.id = o.customer_id`, `WHERE …`). */
+  detail?: string;
+}
+
+export interface LineageGraph {
+  nodes: LineageNode[];
+  edges: LineageEdge[];
+  statements: { index: number; kind: string; range: LineageRange; query?: LineageRange; result?: string; error?: string }[];
+  warnings: { message: string; span?: LineageRange }[];
+  partial: boolean;
+  unknown_tables: string[];
+}
+
+export interface LineageCheck {
+  index: number;
+  status: "ok" | "error" | "unsupported" | "skipped" | "offline" | "timeout";
+  message?: string;
+  position?: number;
+}
+
+export interface LineageView {
+  graph: LineageGraph;
+  checks: LineageCheck[];
+  described: string[];
+}
+
 /** Value typed for a `:name` parameter; `raw` = insert as an SQL expression (no quoting). */
 export interface ParamValue {
   value: string;

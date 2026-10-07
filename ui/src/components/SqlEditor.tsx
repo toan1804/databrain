@@ -22,6 +22,7 @@ import { editorBridge } from "../editorBridge";
 import { canFetchMetadata, sqlAssist, sqlLanguage } from "./sqlAssist";
 import { queryHints } from "./queryHintsExt";
 import { SqlContextMenu, formatKey } from "./SqlContextMenu";
+import { openLineage } from "./LineageTab";
 import { paramField, paramNames, setParamSpans } from "./paramsExt";
 import { api, isTauri } from "../lib/api";
 
@@ -237,7 +238,7 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
   return (
     <>
       <div ref={host} className="h-full" style={{ display: visible ? "block" : "none" }} />
-      {menu && viewRef.current && <SqlContextMenu view={viewRef.current} kind={conn?.config.kind} at={menu} onClose={() => setMenu(null)} />}
+      {menu && viewRef.current && <SqlContextMenu view={viewRef.current} kind={conn?.config.kind} at={menu} onClose={() => setMenu(null)} onLineage={() => openLineage(tabId)} />}
     </>
   );
 }

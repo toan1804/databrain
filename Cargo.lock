@@ -1720,6 +1720,7 @@ name = "databrain-app"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "databrain-ai",
  "databrain-auth",
  "databrain-connector-cloud",
@@ -1731,6 +1732,7 @@ dependencies = [
  "databrain-connector-postgres",
  "databrain-connector-sqlite",
  "databrain-export",
+ "databrain-lineage",
  "databrain-query-engine",
  "databrain-result-store",
  "databrain-workspace",
@@ -1916,6 +1918,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "databrain-lineage"
+version = "0.1.0"
+dependencies = [
+ "databrain-connector-core",
+ "serde",
+ "sqlparser",
 ]
 
 [[package]]
@@ -6622,6 +6633,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3679862809bd1f92e563cf6fd820e28f39135303668001c10331d5027183e8b4"
 dependencies = [
  "log",
+ "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser_derive"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2905ae8e8148d8f7f5748ea95d1e949fa4fc1d7f5161547b758ad118b2e4b0aa"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
 ]
 
 [[package]]

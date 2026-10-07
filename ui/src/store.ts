@@ -32,6 +32,20 @@ export interface Tab extends TabState {
   dirty?: boolean;
   /** Read-only DDL view of an object (explorer "Show DDL"); not saved across restarts. */
   ddl?: DdlRef | null;
+  /** Lineage diagram of SQL from an editor (`sql` holds the analysed text); not saved across restarts. */
+  lineage?: LineageRef | null;
+}
+
+/** Where a lineage tab's SQL came from. */
+export interface LineageRef {
+  /** Editor key (query tab id or notebook cell key). */
+  source: string;
+  /** Offset of the analysed text in the source editor (a selection). */
+  base: number;
+  /** The whole editor (Refresh re-reads it) rather than a selection. */
+  whole: boolean;
+  /** A tab of one column's flow (node by name, as node ids follow the analysis). */
+  column?: { node: string; column?: string } | null;
 }
 
 /** The object a DDL tab shows (on the tab's connection). */
@@ -42,7 +56,7 @@ export interface DdlRef {
 }
 
 /** Tabs that hold an editable SQL editor (not notebooks, outputs or DDL views). */
-export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl;
+export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.lineage;
 
 export type StatementStatus = "pending" | "running" | "done" | "error" | "cancelled";
 
@@ -340,7 +354,7 @@ function persistTabs(tabs: Tab[]) {
     api
       .saveTabs(
         // DDL views are reloaded from the server on demand, not restored.
-        tabs.filter((t) => !t.ddl).map((t) => ({
+        tabs.filter((t) => !t.ddl && !t.lineage).map((t) => ({
           id: t.id,
           title: t.title,
           sql: t.sql,
@@ -936,6 +950,7 @@ export const useStore = create<State>((set, get) => ({
       saved_query_id: init?.saved_query_id ?? null,
       output_ref: init?.output_ref ?? null,
       ddl: init?.ddl ?? null,
+      lineage: init?.lineage ?? null,
     };
     const tabs = [...s.tabs, tab];
     set({ tabs, activeTabId: tab.id });

@@ -60,6 +60,7 @@ import type {
   SavedQuery,
   SchemaInfo,
   ParamSpan,
+  LineageView,
   ParamValue,
   CatalogInfo,
   CachedExplorer,
@@ -164,6 +165,11 @@ export const api = {
     call<ObjectDetail>("describe_object", { id, schema, name }),
   tableLayout: (id: string, schema: string, name: string) => call<TableLayout>("table_layout", { id, schema, name }),
 
+  /** Column lineage of a script; `check` = describe uncached tables and EXPLAIN each query (never runs it). */
+  sqlLineage: (connectionId: string | null, kind: ConnectorKind, sql: string, params: Record<string, ParamValue>, check: boolean) =>
+    call<LineageView>("sql_lineage", { connectionId, kind, sql, params, check }),
+  saveTextFile: (path: string, contents: string) => call<void>("save_text_file", { path, contents }),
+  saveBase64File: (path: string, data: string) => call<void>("save_base64_file", { path, data }),
   /** `:name` parameters of an editor text (outside strings/comments, not `::` casts). */
   sqlParameters: (kind: ConnectorKind, text: string) => call<ParamSpan[]>("sql_parameters", { kind, text }),
   /** What each value becomes in the SQL (`'2026-09-09'`, `2000`; null = empty). */
