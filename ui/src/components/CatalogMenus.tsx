@@ -1,7 +1,7 @@
 // Copy / insert actions for catalog objects (explorer tree and catalog search).
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { ClipboardCopy, Columns3, FileCode2, Play, RefreshCw, TextCursorInput } from "lucide-react";
-import { api, toError } from "../lib/api";
+import { toError } from "../lib/api";
 import { isRelationKind, columnList, schemaLabel, schemaPath, splitSchema, tablePath } from "../lib/catalog";
 import type { ConnectionView, DbObject, SchemaInfo } from "../lib/types";
 import { quoteIdent } from "../lib/util";
@@ -22,33 +22,22 @@ export async function copyText(text: string, what: string) {
 export function insertText(text: string) {
   const st = useStore.getState();
   const tab = st.tabs.find((t) => t.id === st.activeTabId);
-  if (!tab || tab.output_ref) {
+  if (!tab || tab.output_ref || tab.ddl) {
     st.toast("Open a query tab to insert into the editor", "info");
     return;
   }
   editorBridge.insert(st.activeTabId, text);
 }
 
-/** DDL of an object from the connection (null + a toast when unavailable). */
-export async function loadDdl(conn: ConnectionView, obj: DbObject): Promise<string | null> {
+/**
+ * Open an object's DDL in a read-only tab right away; the tab loads it from
+ * the server (with a spinner). An already open DDL tab of the object is reused.
+ */
+export function showDdl(conn: ConnectionView, obj: DbObject) {
   const st = useStore.getState();
-  try {
-    const ddl = await api.objectDdl(conn.id, obj.schema, obj.name, obj.kind);
-    if (!ddl?.trim()) {
-      st.toast(`DDL is not available for ${obj.name} on this connection`, "info");
-      return null;
-    }
-    return ddl;
-  } catch (e) {
-    st.toast(toError(e).message, "error");
-    return null;
-  }
-}
-
-/** Open an object's DDL in a new query tab on its connection. */
-export async function showDdl(conn: ConnectionView, obj: DbObject) {
-  const ddl = await loadDdl(conn, obj);
-  if (ddl) useStore.getState().newTab({ title: `${obj.name} DDL`, sql: ddl.endsWith("\n") ? ddl : `${ddl}\n`, connection_id: conn.id });
+  const open = st.tabs.find((t) => t.ddl && t.connection_id === conn.id && t.ddl.schema === obj.schema && t.ddl.name === obj.name && t.ddl.kind === obj.kind);
+  if (open) return st.setActiveTab(open.id);
+  st.newTab({ title: `${obj.name} DDL`, sql: "", connection_id: conn.id, ddl: { schema: obj.schema, name: obj.name, kind: obj.kind } });
 }
 
 /** Load (if needed) and insert/copy a table's column list. */
@@ -171,15 +160,7 @@ export function ObjectMenu({
       {obj.kind !== "other" && (
         <>
           <MenuSeparator />
-          <MenuItem icon={<FileCode2 size={13} />} label="Show DDL" hint="new tab" onClick={run(() => void showDdl(conn, obj))} />
-          <MenuItem
-            icon={<ClipboardCopy size={13} />}
-            label="Copy DDL"
-            onClick={run(async () => {
-              const ddl = await loadDdl(conn, obj);
-              if (ddl) void copyText(ddl, "DDL");
-            })}
-          />
+          <MenuItem icon={<FileCode2 size={13} />} label="Show DDL" hint="new tab" onClick={run(() => showDdl(conn, obj))} />
         </>
       )}
     </Popover>

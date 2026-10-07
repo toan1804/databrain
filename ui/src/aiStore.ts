@@ -133,7 +133,7 @@ function defaultTargetKey(): string | null {
   if (focused && (focused === active?.id || (active?.notebook_id && focused.startsWith(`nb:${active.notebook_id}:`)))) {
     return focused;
   }
-  return active?.notebook_id ? null : (active?.id ?? null);
+  return active?.notebook_id || active?.ddl ? null : (active?.id ?? null);
 }
 
 let aiInitStarted = false;

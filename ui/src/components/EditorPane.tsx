@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronsDownUp, FileText, Table2, Lightbulb, Loader2, Play, PlayCircle, Plus, Save, Sparkles, Square, X } from "lucide-react";
-import { useActiveTab, useStore, type Tab } from "../store";
+import { ChevronsDownUp, FileCode2, FileText, Table2, Lightbulb, Loader2, Play, PlayCircle, Plus, Save, Sparkles, Square, X } from "lucide-react";
+import { isQueryTab, useActiveTab, useStore, type Tab } from "../store";
 import { editorBridge } from "../editorBridge";
 import { SqlEditor } from "./SqlEditor";
 import { ResultsPanel } from "./ResultsPanel";
 import { ConnDot, EnvBadge } from "./ui";
 import { NotebookView } from "./Notebook";
 import { OutputTab } from "./OutputTab";
+import { DdlTab } from "./DdlTab";
 import { useAi } from "../aiStore";
 
 const ROW_LIMITS = [100, 500, 1000, 5000, 10000, 50000, 100000, 0];
@@ -57,12 +58,19 @@ export function EditorPane() {
             <OutputTab tabId={t.id} reference={t.output_ref!} visible={t.id === activeId} />
           </div>
         ))}
-      <div className={active?.notebook_id || active?.output_ref ? "hidden" : "contents"}>
+      {tabs
+        .filter((t) => t.ddl)
+        .map((t) => (
+          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
+            <DdlTab tabId={t.id} reference={t.ddl!} visible={t.id === activeId} />
+          </div>
+        ))}
+      <div className={active && !isQueryTab(active) ? "hidden" : "contents"}>
       <Toolbar />
       <div ref={container} className="flex min-h-0 flex-1 flex-col">
         <div className="min-h-0" style={{ flex: collapsed ? "1 1 auto" : `0 0 ${split * 100}%` }}>
           {tabs
-            .filter((t) => !t.notebook_id && !t.output_ref)
+            .filter(isQueryTab)
             .map((t) => (
               <SqlEditor key={t.id} tabId={t.id} visible={t.id === activeId} />
             ))}
@@ -84,7 +92,7 @@ export function EditorPane() {
             <ChevronsDownUp size={11} />
           </button>
         </div>
-        {!collapsed && <div className="min-h-0 flex-1 bg-panel">{activeId && !active?.notebook_id && !active?.output_ref && <ResultsPanel tabId={activeId} />}</div>}
+        {!collapsed && <div className="min-h-0 flex-1 bg-panel">{activeId && isQueryTab(active) && <ResultsPanel tabId={activeId} />}</div>}
       </div>
       </div>
     </div>
@@ -148,6 +156,8 @@ function TabBar() {
               <FileText size={12} className="shrink-0 text-muted" />
             ) : t.output_ref ? (
               <Table2 size={12} className="shrink-0 text-muted" />
+            ) : t.ddl ? (
+              <FileCode2 size={12} className="shrink-0 text-muted" />
             ) : (
               <ConnDot color={conn?.color} />
             )}

@@ -10,6 +10,7 @@ import type {
   OutputInfo,
   CatalogInfo,
   ColumnInfo,
+  ObjectKind,
   ConnectionView,
   ConnectorInfo,
   DbObject,
@@ -27,7 +28,19 @@ import { errorRange, uid } from "./lib/util";
 export interface Tab extends TabState {
   /** Unsaved changes relative to the linked saved query. */
   dirty?: boolean;
+  /** Read-only DDL view of an object (explorer "Show DDL"); not saved across restarts. */
+  ddl?: DdlRef | null;
 }
+
+/** The object a DDL tab shows (on the tab's connection). */
+export interface DdlRef {
+  schema: string;
+  name: string;
+  kind: ObjectKind;
+}
+
+/** Tabs that hold an editable SQL editor (not notebooks, outputs or DDL views). */
+export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl;
 
 export type StatementStatus = "pending" | "running" | "done" | "error" | "cancelled";
 
@@ -310,7 +323,8 @@ function persistTabs(tabs: Tab[]) {
   tabSaveTimer = setTimeout(() => {
     api
       .saveTabs(
-        tabs.map((t) => ({
+        // DDL views are reloaded from the server on demand, not restored.
+        tabs.filter((t) => !t.ddl).map((t) => ({
           id: t.id,
           title: t.title,
           sql: t.sql,
@@ -382,7 +396,7 @@ export const useStore = create<State>((set, get) => ({
   },
   restoreTabOutputs: async () => {
     const { tabs, activeTabId } = get();
-    const order = [...tabs].filter((t) => !t.notebook_id && !t.output_ref).sort((a, b) => Number(b.id === activeTabId) - Number(a.id === activeTabId));
+    const order = [...tabs].filter(isQueryTab).sort((a, b) => Number(b.id === activeTabId) - Number(a.id === activeTabId));
     for (const t of order) {
       const outs = get().outputs.filter((o) => o.tab_id === t.id && o.active);
       if (!outs.length || get().runs[t.id]) continue;
@@ -857,6 +871,7 @@ export const useStore = create<State>((set, get) => ({
           : (active?.connection_id ?? s.connections[0]?.id ?? null),
       saved_query_id: init?.saved_query_id ?? null,
       output_ref: init?.output_ref ?? null,
+      ddl: init?.ddl ?? null,
     };
     const tabs = [...s.tabs, tab];
     set({ tabs, activeTabId: tab.id });
@@ -868,7 +883,7 @@ export const useStore = create<State>((set, get) => ({
     const s = get();
     const idx = s.tabs.findIndex((t) => t.id === id);
     if (idx === -1) return;
-    if (isTauri() && !s.tabs[idx].notebook_id && !s.tabs[idx].output_ref) api.closeTab(id).catch(() => {});
+    if (isTauri() && isQueryTab(s.tabs[idx])) api.closeTab(id).catch(() => {});
     let tabs = s.tabs.filter((t) => t.id !== id);
     let activeTabId = s.activeTabId;
     if (tabs.length === 0) {
@@ -902,7 +917,7 @@ export const useStore = create<State>((set, get) => ({
   runTab: async (tabId, mode, input) => {
     const s = get();
     const tab = s.tabs.find((t) => t.id === tabId);
-    if (!tab || tab.notebook_id || tab.output_ref) return;
+    if (!isQueryTab(tab)) return;
     if (!s.backendAvailable) {
       s.toast("Queries can only run inside the DataBrain desktop app", "error");
       return;
@@ -1224,7 +1239,7 @@ export const useStore = create<State>((set, get) => ({
   saveTabQuery: async (tabId) => {
     const s = get();
     const tab = s.tabs.find((t) => t.id === tabId);
-    if (!tab) return;
+    if (!isQueryTab(tab)) return;
     const existing = tab.saved_query_id
       ? s.savedQueries.find((q) => q.id === tab.saved_query_id)
       : undefined;
