@@ -136,6 +136,20 @@ pub enum JobEvent {
         rows_affected: Option<u64>,
         duration_ms: u64,
         notices: Vec<String>,
+        /// Time the server took to run it, when the connector reports it
+        /// separately from the download (see [`JobEvent::Downloading`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_ms: Option<u64>,
+    },
+    /// The server finished running the statement and the result is being
+    /// downloaded (`elapsed_ms` = time on the server). `notice`: shown to
+    /// the user (large results fetched through external links).
+    Downloading {
+        job_id: String,
+        tab_id: String,
+        index: usize,
+        notice: Option<String>,
+        elapsed_ms: u64,
     },
     StatementFailed {
         job_id: String,
@@ -203,6 +217,7 @@ impl JobEvent {
             JobEvent::StatementStarted { job_id, .. }
             | JobEvent::Progress { job_id, .. }
             | JobEvent::StatementFinished { job_id, .. }
+            | JobEvent::Downloading { job_id, .. }
             | JobEvent::StatementFailed { job_id, .. }
             | JobEvent::JobFinished { job_id, .. }
             | JobEvent::OutputsChanged { job_id, .. } => job_id,
@@ -328,6 +343,8 @@ pub struct QueryEngine {
     jobs: Mutex<HashMap<String, JobHandle>>,
     /// Running connection tests (Test button), cancellable by id.
     tests: Mutex<HashMap<String, CancellationToken>>,
+    /// Running full exports (query re-run straight to a file), by id.
+    exports: Mutex<HashMap<String, CancellationToken>>,
     outputs: Arc<OutputRegistry>,
 }
 
@@ -350,6 +367,7 @@ impl QueryEngine {
             connecting: Mutex::new(HashMap::new()),
             jobs: Mutex::new(HashMap::new()),
             tests: Mutex::new(HashMap::new()),
+            exports: Mutex::new(HashMap::new()),
             outputs: OutputRegistry::new(results.clone(), workspace.clone()),
             results,
         })
@@ -1151,6 +1169,83 @@ impl QueryEngine {
         Ok(o.rows as u64)
     }
 
+    /// Run one read statement again without a row limit and stream every
+    /// row straight into `path` (nothing is kept in memory, except for XLSX).
+    /// Runs on its own session; written to a temp file, renamed when done.
+    /// Cancel with [`QueryEngine::cancel_export`]. Returns rows written.
+    pub async fn export_query(
+        &self,
+        export_id: &str,
+        connection_id: &str,
+        sql: &str,
+        path: &std::path::Path,
+        opts: databrain_export::ExportOptions,
+    ) -> Result<u64> {
+        let profile = self.workspace.get_connection(connection_id)?;
+        let kind = profile.config.kind;
+        if split_statements(sql, kind).len() != 1 {
+            return Err(EngineError::new("invalid", "Only a single statement can be exported again"));
+        }
+        let c = classify(sql, kind);
+        if !c.kind.is_read() {
+            return Err(EngineError::new("invalid", format!("Only queries that read data are run again for an export ({} would run again)", c.keyword)));
+        }
+        let cancel = CancellationToken::new();
+        self.exports.lock().insert(export_id.to_string(), cancel.clone());
+        let tab = format!("__export__:{export_id}");
+        let tmp = path.with_extension(format!("{}.partial", path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")));
+        let out = self.export_stream(connection_id, &tab, sql, &tmp, opts, &cancel).await;
+        self.exports.lock().remove(export_id);
+        self.drop_session(connection_id, &tab);
+        match out {
+            Ok(rows) => {
+                std::fs::rename(&tmp, path).map_err(|e| EngineError::new("internal", format!("{}: {e}", path.display())))?;
+                Ok(rows)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    }
+
+    async fn export_stream(&self, connection_id: &str, tab: &str, sql: &str, tmp: &std::path::Path, opts: databrain_export::ExportOptions, cancel: &CancellationToken) -> Result<u64> {
+        let session = tokio::select! {
+            s = self.session(connection_id, tab) => s?,
+            _ = cancel.cancelled() => return Err(ConnectorError::cancelled().into()),
+        };
+        let mut stream = session.execute(sql, ExecOptions { batch_size: 10_000, cancel: cancel.clone(), max_rows: None }).await?;
+        let mut writer: Option<databrain_export::FileWriter> = None;
+        let fail = |e: databrain_export::ExportError| EngineError::new("invalid", e.to_string());
+        loop {
+            let ev = tokio::select! {
+                ev = stream.next() => ev,
+                _ = cancel.cancelled() => return Err(ConnectorError::cancelled().into()),
+            };
+            match ev {
+                None => return Err(EngineError::new("internal", "result stream ended unexpectedly")),
+                Some(Ok(StreamEvent::Schema(schema))) => writer = Some(databrain_export::FileWriter::create(tmp, schema, opts.clone()).map_err(fail)?),
+                Some(Ok(StreamEvent::Batch(b))) => {
+                    if let Some(w) = writer.as_mut() {
+                        w.write(&b).map_err(fail)?;
+                    }
+                }
+                Some(Ok(StreamEvent::Notice(_) | StreamEvent::Downloading(_))) => {}
+                Some(Ok(StreamEvent::Done(_))) => {
+                    return match writer {
+                        Some(w) => w.finish().map_err(fail),
+                        None => Err(EngineError::new("invalid", "The query returned no rows to export")),
+                    };
+                }
+                Some(Err(e)) => return Err(e.into()),
+            }
+        }
+    }
+
+    pub fn cancel_export(&self, export_id: &str) -> bool {
+        self.exports.lock().get(export_id).map(|t| t.cancel()).is_some()
+    }
+
     /// Close the database sessions of a run key (keeps its outputs).
     pub fn release_sessions(&self, tab: &str) {
         self.sessions.lock().retain(|(_, t), _| t != tab);
@@ -1258,6 +1353,7 @@ impl QueryEngine {
                         rows_affected: o.rows_affected,
                         duration_ms,
                         notices: o.notices,
+                        server_ms: o.server_ms,
                     });
                 }
                 Err(e) => {
@@ -1303,6 +1399,8 @@ impl QueryEngine {
         limit: Option<usize>,
         cancel: CancellationToken,
     ) -> Result<StatementOutcome> {
+        let started = Instant::now();
+        let mut server_ms = None;
         let session = tokio::select! {
             s = self.session(&req.connection_id, req.session_key()) => s?,
             _ = cancel.cancelled() => return Err(ConnectorError::cancelled().into()),
@@ -1365,6 +1463,14 @@ impl QueryEngine {
                     }
                 }
                 Ok(StreamEvent::Notice(n)) => notices.push(n),
+                Ok(StreamEvent::Downloading(notice)) => {
+                    let ms = started.elapsed().as_millis() as u64;
+                    server_ms = Some(ms); // last one: a fallback re-runs the statement
+                    if let Some(n) = &notice {
+                        notices.push(n.clone());
+                    }
+                    self.events.emit(JobEvent::Downloading { job_id: job_id.to_string(), tab_id: req.tab_id.clone(), index: stmt.index, notice, elapsed_ms: ms });
+                }
                 Ok(StreamEvent::Done(summary)) => {
                     let info = result.as_ref().map(|rs| {
                         let mut g = rs.lock();
@@ -1375,6 +1481,7 @@ impl QueryEngine {
                         result: info,
                         rows_affected: summary.rows_affected,
                         notices,
+                        server_ms,
                     });
                 }
                 Err(e) => {
@@ -1404,6 +1511,7 @@ impl QueryEngine {
             result: info,
             rows_affected: None,
             notices,
+            server_ms,
         })
     }
 }
@@ -1412,6 +1520,7 @@ struct StatementOutcome {
     result: Option<ResultInfo>,
     rows_affected: Option<u64>,
     notices: Vec<String>,
+    server_ms: Option<u64>,
 }
 
 #[cfg(test)]
@@ -1503,14 +1612,7 @@ mod tests {
                 if evs.iter().any(|e| matches!(e, JobEvent::JobFinished { job_id: j, .. } if j == job_id)) {
                     return evs
                         .into_iter()
-                        .filter(|e| match e {
-                            JobEvent::StatementStarted { job_id: j, .. }
-                            | JobEvent::Progress { job_id: j, .. }
-                            | JobEvent::StatementFinished { job_id: j, .. }
-                            | JobEvent::StatementFailed { job_id: j, .. }
-                            | JobEvent::JobFinished { job_id: j, .. }
-                            | JobEvent::OutputsChanged { job_id: j, .. } => j == job_id,
-                        })
+                        .filter(|e| e.job_id() == job_id)
                         .collect();
                 }
             }

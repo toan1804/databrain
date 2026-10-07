@@ -417,6 +417,17 @@ export type JobEvent =
       rows_affected: number | null;
       duration_ms: number;
       notices: string[];
+      /** Time on the server, when the download was reported separately. */
+      server_ms?: number | null;
+    }
+  | {
+      /** The server finished; the result is being downloaded (`elapsed_ms` = time on the server). */
+      type: "downloading";
+      job_id: string;
+      tab_id: string;
+      index: number;
+      notice?: string | null;
+      elapsed_ms: number;
     }
   | {
       type: "statement_failed";

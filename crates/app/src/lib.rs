@@ -650,6 +650,17 @@ async fn export_result(
     api::export_result(&state, result_id, view, options, path).await
 }
 
+/// Export every row of a result's query (run again without the row limit).
+#[tauri::command]
+async fn export_full_result(state: State<'_, AppState>, result_id: String, options: ExportOptions, path: String, export_id: String) -> R<u64> {
+    api::export_full_result(&state, &result_id, options, path, &export_id).await
+}
+
+#[tauri::command]
+async fn cancel_export(state: State<'_, AppState>, export_id: String) -> R<bool> {
+    Ok(state.engine.cancel_export(&export_id))
+}
+
 #[tauri::command]
 async fn copy_rows(
     state: State<'_, AppState>,
@@ -844,6 +855,8 @@ pub fn run() {
             find_in_result,
             column_stats,
             export_result,
+            export_full_result,
+            cancel_export,
             copy_rows,
             release_result,
             list_saved_queries,

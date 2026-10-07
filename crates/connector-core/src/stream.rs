@@ -44,6 +44,11 @@ pub enum StreamEvent {
     Batch(RecordBatch),
     /// Server notice or conversion warning.
     Notice(String),
+    /// The server has finished running the statement; what follows is the
+    /// result being downloaded (cloud warehouses that hand results out in
+    /// chunks, e.g. Databricks external links). Sent once, before the
+    /// schema. With a message for the user when the result is large.
+    Downloading(Option<String>),
     Done(ExecSummary),
 }
 
@@ -77,7 +82,8 @@ impl QueryStream {
             match ev? {
                 StreamEvent::Schema(s) => out.schema = Some(s),
                 StreamEvent::Batch(b) => out.batches.push(b),
-                StreamEvent::Notice(n) => out.notices.push(n),
+                StreamEvent::Notice(n) | StreamEvent::Downloading(Some(n)) => out.notices.push(n),
+                StreamEvent::Downloading(None) => {}
                 StreamEvent::Done(s) => {
                     out.summary = s;
                     return Ok(out);

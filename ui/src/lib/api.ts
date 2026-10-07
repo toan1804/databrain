@@ -192,6 +192,10 @@ export const api = {
     call<FindResult>("find_in_result", { resultId, view, query, limit, columns: columns ?? null }),
   columnStats: (resultId: string, view: ViewSpec, column: number) =>
     call<ColumnStats>("column_stats", { resultId, view, column }),
+  /** Run the result's query again without the row limit and write every row to `path`. */
+  exportFullResult: (resultId: string, options: ExportOptions, path: string, exportId: string) =>
+    call<number>("export_full_result", { resultId, options, path, exportId }),
+  cancelExport: (exportId: string) => call<boolean>("cancel_export", { exportId }),
   exportResult: (resultId: string, view: ViewSpec, options: ExportOptions, path: string) =>
     call<number>("export_result", { resultId, view, options, path }),
   copyRows: (

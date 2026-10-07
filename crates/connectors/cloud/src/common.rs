@@ -186,3 +186,67 @@ impl Backoff {
 pub fn normalize_host(h: &str) -> String {
     h.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string()
 }
+
+/// Results above this size are "large" (Databricks' INLINE limit, 25 MiB).
+pub const LARGE_RESULT_BYTES: u64 = 25 * 1024 * 1024;
+
+/// `1.4 GB`, `820 MB`, `12 KB`.
+pub fn human_bytes(b: u64) -> String {
+    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1000.0 && i < U.len() - 1 {
+        v /= 1000.0;
+        i += 1;
+    }
+    if i == 0 { format!("{b} B") } else if v < 10.0 { format!("{v:.1} {}", U[i]) } else { format!("{v:.0} {}", U[i]) }
+}
+
+/// A presigned link without its query string (the signature): safe to show.
+pub fn link_without_signature(url: &str) -> String {
+    match url.find('?') {
+        Some(i) => format!("{}?…", &url[..i]),
+        None => url.to_string(),
+    }
+}
+
+/// Notice for a result downloaded in chunks from cloud storage, or `None`
+/// when it is small. `bytes`/`rows` may be unknown.
+pub fn large_result_notice(engine: &str, bytes: Option<u64>, rows: Option<u64>, chunks: u64, link: Option<&str>) -> Option<String> {
+    let large = match bytes {
+        Some(b) => b > LARGE_RESULT_BYTES,
+        None => chunks > 1,
+    };
+    if !large {
+        return None;
+    }
+    let mut size = Vec::new();
+    if let Some(b) = bytes {
+        size.push(human_bytes(b));
+    }
+    if let Some(r) = rows {
+        size.push(format!("{r} rows"));
+    }
+    let what = if size.is_empty() { format!("{chunks} chunks") } else { format!("{} in {chunks} chunks", size.join(", ")) };
+    let from = link.map(|l| format!(": {}", link_without_signature(l))).unwrap_or_default();
+    Some(format!(
+        "The data is large ({what}), so it is downloaded from {engine}'s external links{from}. The query has already finished on the server; the rest is the download, which can take a while."
+    ))
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    #[test]
+    fn large_result_notices() {
+        assert_eq!(human_bytes(1_400_000_000), "1.4 GB");
+        assert_eq!(human_bytes(820_000_000), "820 MB");
+        assert_eq!(large_result_notice("Databricks", Some(1000), Some(3), 1, None), None);
+        assert_eq!(large_result_notice("Databricks", None, None, 1, None), None);
+        let n = large_result_notice("Databricks", Some(1_400_000_000), Some(3_200_000), 52, Some("https://st.blob.core.windows.net/r/0?sig=SECRET&se=1")).unwrap();
+        assert!(n.starts_with("The data is large (1.4 GB, 3200000 rows in 52 chunks), so it is downloaded from Databricks's external links: https://st.blob.core.windows.net/r/0?…."), "{n}");
+        assert!(!n.contains("SECRET"));
+        assert!(large_result_notice("Snowflake", None, None, 4, None).unwrap().contains("(4 chunks)"));
+    }
+}

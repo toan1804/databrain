@@ -498,6 +498,7 @@ impl Inner {
     async fn stream(&self, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
         let rid = uuid::Uuid::new_v4().to_string();
         let data = self.query(sql, &rid, &opts.cancel).await?;
+        tx.send(StreamEvent::Downloading(chunks_notice(&data))).await;
         let rowtype = data["rowtype"].as_array().cloned().unwrap_or_default();
         let stmt_type = data["statementTypeId"].as_i64().unwrap_or(0);
         // DML (0x3000..0x4000) reports affected rows in the single result row.
@@ -952,6 +953,19 @@ impl SfSession {
         }
         Ok(out.into_iter().map(|(_, f)| f).collect())
     }
+}
+
+
+/// "The data is large…" for a result with extra chunks in cloud storage.
+fn chunks_notice(data: &serde_json::Value) -> Option<String> {
+    let chunks = data["chunks"].as_array()?;
+    if chunks.is_empty() {
+        return None;
+    }
+    let bytes: u64 = chunks.iter().filter_map(|c| c["uncompressedSize"].as_u64()).sum();
+    let rows = data["total"].as_u64();
+    let link = chunks[0]["url"].as_str();
+    crate::common::large_result_notice("Snowflake", (bytes > 0).then_some(bytes), rows, chunks.len() as u64 + 1, link)
 }
 
 #[cfg(test)]

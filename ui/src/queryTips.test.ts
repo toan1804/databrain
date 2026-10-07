@@ -54,6 +54,13 @@ describe("slow statements", () => {
     expect(slowStatements(st, 60_000, now).map((s) => s.id)).toEqual(["slow", "long-running"]);
     expect(slowStatements(st, 1_000, now).map((s) => s.id)).toEqual(["fast", "slow", "long-running", "just-started"]);
     expect(slowStatements(st, 0, now)).toEqual([]);
+    // Done on the server, slow only because of the download: no tips.
+    const dl = [
+      { id: "downloading", status: "running", startedAt: now - 90_000, downloading: true, serverMs: 4_000 },
+      { id: "downloaded", status: "done", durationMs: 90_000, serverMs: 4_000 },
+      { id: "slow-on-server", status: "done", durationMs: 95_000, serverMs: 70_000 },
+    ];
+    expect(slowStatements(dl, 60_000, now).map((s) => s.id)).toEqual(["slow-on-server"]);
   });
 
   it("computes tips for a statement that is still running", async () => {

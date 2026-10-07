@@ -330,6 +330,7 @@ impl Inner {
     async fn stream_arrow(&self, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> std::result::Result<(), StreamFail> {
         use futures::StreamExt as _;
         let resp = self.run_statement(sql, opts, Disposition::ArrowLinks).await?;
+        tx.send(StreamEvent::Downloading(links_notice(&resp))).await;
         let statement_id = resp["statement_id"].as_str().unwrap_or_default().to_string();
         let columns = manifest_columns(&resp);
         if columns.is_empty() {
@@ -480,6 +481,7 @@ impl Inner {
 
     async fn stream_as(&self, sql: &str, opts: &ExecOptions, tx: &StreamSender, disposition: Disposition) -> std::result::Result<(), StreamFail> {
         let resp = self.run_statement(sql, opts, disposition).await?;
+        tx.send(StreamEvent::Downloading(if disposition == Disposition::Inline { None } else { links_notice(&resp) })).await;
         let statement_id = resp["statement_id"].as_str().unwrap_or_default().to_string();
         let columns = manifest_columns(&resp);
         if columns.is_empty() {
@@ -694,6 +696,13 @@ fn redact_url(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// "The data is large…" for a result handed out as external links.
+fn links_notice(resp: &serde_json::Value) -> Option<String> {
+    let m = |p: &str| resp.pointer(p).and_then(|v| v.as_u64());
+    let link = resp.pointer("/result/external_links/0/external_link").and_then(|v| v.as_str());
+    crate::common::large_result_notice("Databricks", m("/manifest/total_byte_count"), m("/manifest/total_row_count"), m("/manifest/total_chunk_count").unwrap_or(1), link)
 }
 
 /// Result columns from the statement manifest.
@@ -1442,6 +1451,8 @@ mod tests {
         assert_eq!(ints(&r), (0..n * 2).collect::<Vec<_>>(), "rows in chunk order, n cast to BIGINT");
         assert_eq!(texts(&r)[..4], ["r0", "NULL", "r2", "NULL"]);
         assert_eq!(r.schema.as_ref().unwrap().field(0).data_type(), &databrain_connector_core::arrow::datatypes::DataType::Int64);
+        assert_eq!(r.notices.len(), 1, "{:?}", r.notices);
+        assert!(r.notices[0].starts_with(&format!("The data is large ({n} chunks), so it is downloaded from Databricks's external links")), "{}", r.notices[0]);
         let log = log.lock().unwrap();
         assert!(log.max_in_flight >= 3, "downloads overlap: {}", log.max_in_flight);
         // 6 chunks × 60 ms sequentially would be ≥ 360 ms.

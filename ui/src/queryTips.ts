@@ -77,10 +77,18 @@ function analysable(s: { plan: PlannedStatement; status: string }): boolean {
  * `thresholdMs`, or still running for that long. A threshold of 0 or less
  * turns tips off.
  */
-export function slowStatements<T extends { status: string; durationMs?: number; startedAt?: number }>(statements: T[], thresholdMs: number, now: number): T[] {
+/**
+ * Statements slow enough for tips. Time spent downloading a result after the
+ * server has finished (e.g. Databricks external links) doesn't count: a
+ * statement being downloaded is not checked, and a finished one is judged
+ * by its time on the server.
+ */
+export function slowStatements<T extends { status: string; durationMs?: number; startedAt?: number; downloading?: boolean; serverMs?: number }>(statements: T[], thresholdMs: number, now: number): T[] {
   if (!(thresholdMs > 0)) return [];
   return statements.filter((s) =>
-    s.status === "running" ? s.startedAt !== undefined && now - s.startedAt >= thresholdMs : s.status === "done" && (s.durationMs ?? 0) >= thresholdMs,
+    s.status === "running"
+      ? !s.downloading && s.startedAt !== undefined && now - s.startedAt >= thresholdMs
+      : s.status === "done" && (s.serverMs ?? s.durationMs ?? 0) >= thresholdMs,
   );
 }
 

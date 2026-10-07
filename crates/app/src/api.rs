@@ -1042,6 +1042,17 @@ pub async fn export_result(
     .await
 }
 
+/// Run the query that produced a result again, without the row limit, and
+/// write all its rows to `path` (grid filters and sorting don't apply).
+pub async fn export_full_result(state: &AppState, result_id: &str, options: ExportOptions, path: String, export_id: &str) -> Result<u64> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(invalid("Export path must be absolute"));
+    }
+    let o = state.engine.outputs().by_result(result_id).ok_or_else(|| invalid("The query of this result is no longer known; run it again"))?;
+    state.engine.export_query(export_id, &o.connection_id, &o.sql, &path, options).await
+}
+
 fn write_export(
     path: &Path,
     schema: databrain_connector_core::arrow::datatypes::SchemaRef,

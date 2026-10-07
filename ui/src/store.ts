@@ -74,6 +74,10 @@ export interface StatementRun {
   progressRows?: number;
   notices: string[];
   error?: EngineError;
+  /** The server has finished it; the result is being downloaded. */
+  downloading?: boolean;
+  /** Time it took on the server (excluding the download), when known. */
+  serverMs?: number;
 }
 
 export interface TabRun {
@@ -1240,6 +1244,11 @@ export const useStore = create<State>((set, get) => ({
         case "progress":
           upd(e.index, { progressRows: e.rows });
           break;
+        case "downloading": {
+          const cur = statements[e.index];
+          upd(e.index, { downloading: true, serverMs: e.elapsed_ms, notices: e.notice && cur ? [...cur.notices, e.notice] : (cur?.notices ?? []) });
+          break;
+        }
         case "statement_finished":
           upd(e.index, {
             status: "done",
@@ -1248,6 +1257,8 @@ export const useStore = create<State>((set, get) => ({
             rowsAffected: e.rows_affected,
             durationMs: e.duration_ms,
             notices: e.notices,
+            downloading: false,
+            serverMs: e.server_ms ?? statements[e.index]?.serverMs,
           });
           if (e.result) next.activeIndex = e.index;
           break;

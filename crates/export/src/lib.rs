@@ -407,38 +407,87 @@ pub fn export_file(
     batches: &[RecordBatch],
     opts: ExportOptions,
 ) -> Result<u64> {
-    let cols: Vec<usize> = if opts.columns.is_empty() {
-        (0..schema.fields().len()).collect()
-    } else {
-        opts.columns.iter().copied().filter(|c| *c < schema.fields().len()).collect()
-    };
-    match opts.format {
-        ExportFormat::Parquet => {
-            let projected = std::sync::Arc::new(schema.project(&cols)?);
-            let file = std::fs::File::create(path)?;
-            let props = parquet::file::properties::WriterProperties::builder()
-                .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
-                .build();
-            let mut w = parquet::arrow::ArrowWriter::try_new(file, projected.clone(), Some(props))?;
-            let mut n = 0u64;
-            for b in batches {
-                let pb = b.project(&cols)?;
+    let mut w = FileWriter::create(path, schema, opts)?;
+    for b in batches {
+        w.write(b)?;
+    }
+    w.finish()
+}
+
+/// Incremental file export: batches are written as they arrive (a query
+/// streamed to disk), except XLSX, whose rows are kept until [`finish`]
+/// (Excel is limited to about a million rows anyway).
+///
+/// [`finish`]: FileWriter::finish
+pub struct FileWriter {
+    inner: Writer,
+    rows: u64,
+}
+
+enum Writer {
+    Parquet { w: Box<parquet::arrow::ArrowWriter<std::fs::File>>, cols: Vec<usize>, projected: SchemaRef },
+    Xlsx { path: std::path::PathBuf, schema: SchemaRef, cols: Vec<usize>, opts: ExportOptions, batches: Vec<RecordBatch> },
+    Text(Exporter<std::io::BufWriter<std::fs::File>>),
+}
+
+impl FileWriter {
+    pub fn create(path: &std::path::Path, schema: SchemaRef, opts: ExportOptions) -> Result<Self> {
+        let cols: Vec<usize> = if opts.columns.is_empty() {
+            (0..schema.fields().len()).collect()
+        } else {
+            opts.columns.iter().copied().filter(|c| *c < schema.fields().len()).collect()
+        };
+        let inner = match opts.format {
+            ExportFormat::Parquet => {
+                let projected = std::sync::Arc::new(schema.project(&cols)?);
+                let file = std::fs::File::create(path)?;
+                let props = parquet::file::properties::WriterProperties::builder()
+                    .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
+                    .build();
+                Writer::Parquet { w: Box::new(parquet::arrow::ArrowWriter::try_new(file, projected.clone(), Some(props))?), cols, projected }
+            }
+            ExportFormat::Xlsx => Writer::Xlsx { path: path.to_path_buf(), schema, cols, opts, batches: Vec::new() },
+            _ => Writer::Text(Exporter::new(std::io::BufWriter::new(std::fs::File::create(path)?), schema, opts)),
+        };
+        Ok(Self { inner, rows: 0 })
+    }
+
+    /// Rows written so far.
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    pub fn write(&mut self, b: &RecordBatch) -> Result<()> {
+        match &mut self.inner {
+            Writer::Parquet { w, cols, projected } => {
+                let pb = b.project(cols)?;
                 // Re-attach the projected schema (keeps field metadata).
                 let pb = RecordBatch::try_new(projected.clone(), pb.columns().to_vec())?;
-                n += pb.num_rows() as u64;
                 w.write(&pb)?;
             }
-            w.close()?;
-            Ok(n)
-        }
-        ExportFormat::Xlsx => write_xlsx(path, &schema, batches, &cols, &opts),
-        _ => {
-            let file = std::fs::File::create(path)?;
-            let mut e = Exporter::new(std::io::BufWriter::new(file), schema, opts);
-            for b in batches {
-                e.write_batch(b)?;
+            Writer::Xlsx { batches, .. } => {
+                if self.rows as usize + b.num_rows() + 1 > XLSX_MAX_ROWS {
+                    return Err(ExportError::Unsupported(format!(
+                        "Excel supports at most {} rows; this export has more. Use CSV or Parquet.",
+                        XLSX_MAX_ROWS - 1
+                    )));
+                }
+                batches.push(b.clone());
             }
-            e.finish()
+            Writer::Text(e) => e.write_batch(b)?,
+        }
+        self.rows += b.num_rows() as u64;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<u64> {
+        match self.inner {
+            Writer::Parquet { w, .. } => {
+                w.close()?;
+                Ok(self.rows)
+            }
+            Writer::Xlsx { path, schema, cols, opts, batches } => write_xlsx(&path, &schema, &batches, &cols, &opts),
+            Writer::Text(e) => e.finish(),
         }
     }
 }

@@ -40,6 +40,7 @@ import {
   formatCount,
   formatDuration,
   sqlPreview,
+  uid,
   upsertFilter,
 } from "../lib/util";
 import { useStore, type StatementRun, type TabRun } from "../store";
@@ -269,7 +270,13 @@ function RunningView({ run, tabId }: { run: TabRun; tabId: string }) {
     <div className="flex h-full flex-col items-center justify-center gap-3 text-[12.5px] text-muted">
       <Loader2 size={22} className="animate-spin text-accent" />
       <div className="max-w-[70%] truncate font-mono text-[11.5px]">{cur ? sqlPreview(cur.plan.sql, 120) : "Connecting…"}</div>
+      {cur?.downloading && cur.serverMs !== undefined && <div>Finished on the server in {formatDuration(cur.serverMs)} · downloading the result</div>}
       {cur?.progressRows ? <div>{formatCount(cur.progressRows)} rows fetched</div> : null}
+      {cur?.notices.map((n, i) => (
+        <div key={i} className="max-w-[70%] select-text rounded-md border border-warning/40 bg-warning/5 px-2 py-1 text-center text-[11.5px] text-warning">
+          {n}
+        </div>
+      ))}
       <button className="btn-ghost border border-line" onClick={() => cancel(tabId)}>
         <X size={14} /> Cancel <span className="kbd ml-1">⌘.</span>
       </button>
@@ -345,6 +352,7 @@ function Messages({ run }: { run: TabRun }) {
                   ? `${formatCount(s.rowsAffected)} rows affected`
                   : "OK")}
             {s.durationMs !== undefined && ` · ${formatDuration(s.durationMs)}`}
+            {s.serverMs !== undefined && s.durationMs !== undefined && s.durationMs - s.serverMs > 1000 && ` (${formatDuration(s.serverMs)} on the server, the rest downloading)`}
             {s.status === "pending" && "Not executed"}
           </div>
           {s.error && s.status === "error" && <div className="mt-1 whitespace-pre-wrap pl-6 text-danger">{s.error.message}</div>}
@@ -850,7 +858,16 @@ function ExportDialog({
   const toast = useStore((s) => s.toast);
   const [format, setFormat] = useState<ExportFormat>("csv");
   const [header, setHeader] = useState(true);
-  const [useView, setUseView] = useState(true);
+  const [scope, setScope] = useState<"view" | "fetched" | "all">("view");
+  const useView = scope === "view";
+  const exportId = useRef<string | null>(null);
+  const [started, setStarted] = useState<number | null>(null);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (started === null) return;
+    const t = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(t);
+  }, [started]);
   const [table, setTable] = useState("my_table");
   const [busy, setBusy] = useState(false);
   const fmt = FORMATS.find((f) => f.value === format)!;
@@ -864,31 +881,37 @@ function ExportDialog({
     });
     if (typeof path !== "string") return;
     setBusy(true);
+    const options = { format, header, table_name: table || "my_table", dialect: (dialect as never) ?? null };
     try {
-      const n = await api.exportResult(info.id, useView ? view : emptyView(), {
-        format,
-        header,
-        table_name: table || "my_table",
-        dialect: (dialect as never) ?? null,
-      }, path);
+      let n: number;
+      if (scope === "all") {
+        exportId.current = uid();
+        setStarted(Date.now());
+        n = await api.exportFullResult(info.id, options, path, exportId.current);
+      } else n = await api.exportResult(info.id, useView ? view : emptyView(), options, path);
       toast(`Exported ${formatCount(n)} rows to ${path.split(/[\\/]/).pop()}`, "success");
       onClose();
     } catch (e) {
-      toast(toError(e).message, "error");
+      const err = toError(e);
+      toast(err.kind === "cancelled" ? "Export cancelled" : err.message, err.kind === "cancelled" ? "info" : "error");
     } finally {
+      exportId.current = null;
+      setStarted(null);
       setBusy(false);
     }
   };
+  const cancelExport = () => exportId.current && void api.cancelExport(exportId.current);
 
   return (
     <Modal
       title="Export results"
-      onClose={onClose}
+      onClose={() => (busy && scope === "all" ? cancelExport() : onClose())}
       width={440}
       footer={
         <>
-          <button className="btn-ghost" onClick={onClose}>
-            Cancel
+          {started !== null && <span className="mr-auto text-[12px] text-muted">Running the query and writing the file… {formatDuration(now - started)}</span>}
+          <button className="btn-ghost" onClick={() => (busy && scope === "all" ? cancelExport() : onClose())}>
+            {busy && scope === "all" ? "Stop" : "Cancel"}
           </button>
           <button className="btn-primary" onClick={run} disabled={busy}>
             {busy ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />} Export…
@@ -927,16 +950,23 @@ function ExportDialog({
         )}
         <div className="space-y-1.5 text-[13px]">
           <label className="flex items-center gap-2">
-            <input type="radio" checked={useView} onChange={() => setUseView(true)} />
+            <input type="radio" checked={scope === "view"} disabled={busy} onChange={() => setScope("view")} />
             Current view {filtered ? "(filtered/sorted)" : ""} — {formatCount(viewRows)} rows
           </label>
           <label className="flex items-center gap-2">
-            <input type="radio" checked={!useView} onChange={() => setUseView(false)} />
+            <input type="radio" checked={scope === "fetched"} disabled={busy} onChange={() => setScope("fetched")} />
             All fetched rows — {formatCount(info.total_rows)} rows
           </label>
-          {info.truncated && (
+          <label className="flex items-start gap-2">
+            <input type="radio" className="mt-1" checked={scope === "all"} disabled={busy} onChange={() => setScope("all")} />
+            <span>
+              All rows of the query, ignoring the row limit
+              <span className="block text-[11.5px] text-muted">Runs the query again and writes every row straight to the file (filters and sorting of the grid don't apply).</span>
+            </span>
+          </label>
+          {info.truncated && scope !== "all" && (
             <p className="text-[11.5px] text-warning">
-              This result was limited to {formatCount(info.total_rows)} rows. Raise the row limit and re-run to export more.
+              This result was limited to {formatCount(info.total_rows)} rows. Choose "All rows of the query" to export everything.
             </p>
           )}
         </div>
