@@ -241,6 +241,18 @@ function once<T>(key: string, f: () => Promise<T>): Promise<T> {
 /** Background prefetch, one schema at a time so it never competes with clicks much. */
 let prefetchChain: Promise<unknown> = Promise.resolve();
 
+/**
+ * Put the theme on <html> right away. Components that read CSS variables
+ * while rendering (the result grid's canvas colours) must see the new values
+ * in the same render that sees the new `theme`, so this runs before the
+ * store changes (an effect would run after that render).
+ */
+export function applyTheme(theme: Theme) {
+  if (typeof document === "undefined") return;
+  document.documentElement.classList.toggle("dark", theme === "dark");
+  document.documentElement.style.colorScheme = theme;
+}
+
 const TAB_SAVE_DELAY = 400;
 
 /** Notice shown on a result restored from the previous session. */
@@ -469,6 +481,7 @@ export const useStore = create<State>((set, get) => ({
         api.listSavedQueries(null),
       ]);
       const theme = settings.theme === "light" ? "light" : "dark";
+      applyTheme(theme);
       const rowLimit = typeof settings.row_limit === "number" ? settings.row_limit : 1000;
       const slowQuerySeconds = typeof settings.slow_query_seconds === "number" ? settings.slow_query_seconds : DEFAULT_SLOW_QUERY_SECONDS;
       let restored: Tab[] = tabs;
@@ -537,6 +550,7 @@ export const useStore = create<State>((set, get) => ({
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 
   setTheme: (theme) => {
+    applyTheme(theme);
     set({ theme });
     if (isTauri()) api.setSetting("theme", theme).catch(() => {});
   },
