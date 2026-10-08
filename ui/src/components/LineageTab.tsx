@@ -183,7 +183,8 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
   const base = useMemo(() => (graph ? layout(graph, dir, { expanded, show: traced?.cols }) : null), [graph, dir, expanded, traced]);
   const lay = useMemo(() => (base ? withPositions(base, pos) : null), [base, pos]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const colors = useMemo(themeColors, [theme]);
+  const appearance = useStore((s) => s.appearance);
+  const colors = useMemo(themeColors, [theme, appearance]);
   const inner = useMemo(() => (graph && lay ? toSvg(graph, lay, { colors, focus: traced, inner: true }) : ""), [graph, lay, colors, traced]);
 
   const fit = useCallback(() => {

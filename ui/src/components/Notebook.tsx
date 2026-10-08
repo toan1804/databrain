@@ -1026,7 +1026,7 @@ export function CellEditor({
           EditorView.contentAttributes.of({ "aria-label": "SQL cell" }),
           EditorView.theme({
             "&": { minHeight: "38px" },
-            ".cm-scroller": { fontSize: "13px" },
+            ".cm-scroller": { fontSize: "calc(var(--editor-font-size, 13.5px) - 0.5px)" },
           }),
         ],
       }),

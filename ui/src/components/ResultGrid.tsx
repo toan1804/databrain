@@ -29,8 +29,11 @@ function cssVar(name: string): string {
 
 function useGridTheme(): Partial<Theme> {
   const theme = useStore((s) => s.theme);
+  const appearance = useStore((s) => s.appearance);
   return useMemo(() => {
-    void theme; // recompute after the theme class changes
+    void theme; // recompute after the theme class or the appearance variables change
+    void appearance;
+    const size = cssVar("--grid-font-size") || "12.5px";
     const accent = cssVar("--accent");
     return {
       accentColor: accent,
@@ -57,14 +60,14 @@ function useGridTheme(): Partial<Theme> {
       drilldownBorder: cssVar("--border"),
       linkColor: accent,
       fontFamily: cssVar("--font-mono") || "ui-monospace, Menlo, monospace",
-      baseFontStyle: "12.5px",
+      baseFontStyle: size,
       headerFontStyle: "600 12px",
       markerFontStyle: "11px",
-      editorFontSize: "12.5px",
+      editorFontSize: size,
       cellHorizontalPadding: 10,
       cellVerticalPadding: 4,
     };
-  }, [theme]);
+  }, [theme, appearance]);
 }
 
 function iconFor(c: ColumnMeta): GridColumnIcon {

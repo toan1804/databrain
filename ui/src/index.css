@@ -173,7 +173,7 @@ select optgroup {
 /* CodeMirror */
 .cm-editor {
   height: 100%;
-  font-size: 13.5px;
+  font-size: var(--editor-font-size, 13.5px);
   background: var(--panel);
 }
 .cm-editor.cm-focused {

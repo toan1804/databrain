@@ -57,7 +57,7 @@ function Palette() {
       { id: "file", group: "Actions", label: "Query a local file (CSV, Parquet, JSON, Excel)…", icon: <FileSearch size={14} />, run: () => void queryLocalFile() },
       { id: "ai", group: "AI", label: "Open AI assistant", icon: <Sparkles size={14} />, hint: "⌘L", run: () => useAi.getState().setOpen(true, "chat") },
       { id: "ai-kn", group: "AI", label: "AI knowledge (index schema, notes)", icon: <Sparkles size={14} />, run: () => useAi.getState().setOpen(true, "knowledge") },
-      { id: "settings", group: "Actions", label: "Settings: AI providers, MCP", icon: <Settings2 size={14} />, hint: "⌘,", run: () => st.setSettingsOpen(true) },
+      { id: "settings", group: "Actions", label: "Settings: appearance, AI providers, MCP", icon: <Settings2 size={14} />, hint: "⌘,", run: () => st.setSettingsOpen(true) },
       { id: "outputs", group: "Actions", label: "Show outputs", icon: <Bookmark size={14} />, run: () => st.setSidebarPanel("outputs") },
       {
         id: "query-outputs",

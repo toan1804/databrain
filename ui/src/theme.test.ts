@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 // Minimal <html> stand-in (tests run in node).
 const classes = new Set<string>();
-const html = { classList: { toggle: (c: string, on: boolean) => (on ? classes.add(c) : classes.delete(c)) }, style: { colorScheme: "" } };
+const html = { classList: { toggle: (c: string, on: boolean) => (on ? classes.add(c) : classes.delete(c)) }, style: { colorScheme: "", setProperty: () => {}, removeProperty: () => {} } };
 (globalThis as { document?: unknown }).document = { documentElement: html };
 
 vi.mock("./lib/api", () => ({

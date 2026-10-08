@@ -77,7 +77,8 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
   - Share notes: Knowledge → Export… writes a `.databrain-notes.json` file; Import… shows new notes, ones you already have, and ones that differ. For each difference, keep yours, use the file's, keep both, edit a merge, or let the AI merge them. It proposes SQL as diffs, runs queries after approval (per-connection policy), and analyzes results.
   - Fix/Explain/Analyze buttons; conversation history; audit log.
 - **MCP:** `databrain-mcp` (stdio) exposes opted-in connections to Kiro CLI, Claude Code, Cursor… (Settings → MCP / Kiro shows the config snippet).
-- Safety prompts for prod and for writes, read-only connections, saved queries, history, command palette (⌘K), dark/light theme.
+- Safety prompts for prod and for writes, read-only connections, saved queries, history, command palette (⌘K).
+- **Appearance** (Settings → Appearance): dark/light theme; background presets (Default, Graphite, Slate blue, Forest, Warm paper, High contrast; each with a dark and a light version) or a custom colour, from which panels, borders and readable text are derived; interface font and code font (editor, result grid, SQL) from common fonts (marked when not installed) or any installed font by name; code font size (10–22 px).
 
 Runtime notes:
 - Oracle needs no Oracle software by default: the thin driver (a small helper using [go-ora](https://github.com/sijms/go-ora), Oracle 10g+, TLS/wallets, native network encryption via "Driver options") is downloaded on the first Oracle connection (about 5 MB, into the app-data folder `oracle-agent/`, checked against SHA-256 sums built into DataBrain). Choose the "Oracle Instant Client" driver on a connection for thick-only features; DataBrain then checks for Instant Client and can install Oracle's latest Basic package in one click (into `oracle/instantclient_*`; Linux also needs `libaio`).

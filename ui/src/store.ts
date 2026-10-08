@@ -1,3 +1,4 @@
+import { DEFAULT_APPEARANCE, applyAppearance, parseAppearance, type Appearance } from "./lib/appearance";
 import { create } from "zustand";
 import { THREE_LEVEL, mergeCatalogSchemas, prefetchSchemas, revealKeys, splitSchema, treeKey } from "./lib/catalog";
 import { api, isTauri, onAuthEvent, onJobEvent, onOracleAgent, toError } from "./lib/api";
@@ -158,6 +159,9 @@ interface State {
   /** Where the explorer of a connection comes from (cache / live) and whether it is offline. */
   explorer: Record<string, ExplorerStatus>;
   theme: Theme;
+  /** Background, fonts and code font size (Settings → Appearance). */
+  appearance: Appearance;
+  setAppearance: (patch: Partial<Appearance>) => void;
   rowLimit: number;
   /** Tips are computed for statements running at least this long (0 = off). */
   slowQuerySeconds: number;
@@ -296,13 +300,16 @@ let prefetchChain: Promise<unknown> = Promise.resolve();
  * in the same render that sees the new `theme`, so this runs before the
  * store changes (an effect would run after that render).
  */
-export function applyTheme(theme: Theme) {
+export function applyTheme(theme: Theme, appearance?: Appearance) {
   if (typeof document === "undefined") return;
   document.documentElement.classList.toggle("dark", theme === "dark");
   document.documentElement.style.colorScheme = theme;
+  // Background presets have a colour per theme.
+  if (appearance) applyAppearance(appearance, theme);
 }
 
 const TAB_SAVE_DELAY = 400;
+let appearanceSave: ReturnType<typeof setTimeout> | undefined;
 
 /** Notice shown on a result restored from the previous session. */
 export const RESTORED_NOTICE = "Restored from your last session. Run again for fresh data.";
@@ -515,6 +522,7 @@ export const useStore = create<State>((set, get) => ({
   catalogSchemas: {},
   explorer: {},
   theme: "dark",
+  appearance: DEFAULT_APPEARANCE,
   rowLimit: 1000,
   slowQuerySeconds: DEFAULT_SLOW_QUERY_SECONDS,
   sidebarPanel: "connections",
@@ -557,7 +565,8 @@ export const useStore = create<State>((set, get) => ({
         api.listSavedQueries(null),
       ]);
       const theme = settings.theme === "light" ? "light" : "dark";
-      applyTheme(theme);
+      const appearance = parseAppearance(settings.appearance);
+      applyTheme(theme, appearance);
       const rowLimit = typeof settings.row_limit === "number" ? settings.row_limit : 1000;
       const slowQuerySeconds = typeof settings.slow_query_seconds === "number" ? settings.slow_query_seconds : DEFAULT_SLOW_QUERY_SECONDS;
       let restored: Tab[] = tabs;
@@ -583,6 +592,7 @@ export const useStore = create<State>((set, get) => ({
         tabs: restored,
         activeTabId: active,
         theme,
+        appearance,
         rowLimit,
         slowQuerySeconds,
         savedQueries,
@@ -627,9 +637,18 @@ export const useStore = create<State>((set, get) => ({
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 
   setTheme: (theme) => {
-    applyTheme(theme);
+    applyTheme(theme, get().appearance);
     set({ theme });
     if (isTauri()) api.setSetting("theme", theme).catch(() => {});
+  },
+  setAppearance: (patch) => {
+    const appearance = parseAppearance({ ...get().appearance, ...patch });
+    // Before the store changes, like the theme: the grid reads the variables while rendering.
+    applyAppearance(appearance, get().theme);
+    set({ appearance });
+    // The colour picker and size slider change it continuously: save once they settle.
+    clearTimeout(appearanceSave);
+    if (isTauri()) appearanceSave = setTimeout(() => api.setSetting("appearance", get().appearance).catch(() => {}), 300);
   },
   setRowLimit: (rowLimit) => {
     set({ rowLimit });
