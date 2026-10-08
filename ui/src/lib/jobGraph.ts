@@ -116,7 +116,8 @@ export function addDownstream(job: Job, fromId: string, kind: JobNodeKind, init:
   const node = newNode(job, {
     kind,
     name: kind === "query" ? `${from.name}_next` : `${kind}_${from.name}`,
-    sql: readSql([from.name]),
+    // Load/export: empty = all rows of this step.
+    sql: kind === "query" ? readSql([from.name]) : "",
     target_table: kind === "load" ? from.name : null,
     ...spotBelow(job, from),
     ...init,
@@ -236,4 +237,79 @@ export function stepsFromCells(cells: CellSource[], names: string[], defaultConn
 /** Step name a cell starts from: its output name, else `{notebook}_{n}`. */
 export function cellStepBase(c: CellSource, notebook: string, n: number): string {
   return c.output_name?.trim() || `${notebook.toLowerCase()}_${n}`;
+}
+
+/** Comma-separated key columns of a load step → list (empty items dropped). */
+export function parseKeyColumns(text: string): string[] {
+  return text
+    .split(",")
+    .map((k) => k.trim())
+    .filter(Boolean);
+}
+
+/** What each action of a step does (a step does exactly one). */
+export const STEP_ACTIONS: { kind: JobNodeKind; title: string; hint: string }[] = [
+  { kind: "query", title: "Run a query", hint: "Run SQL on a connection; the result becomes this step's output for later steps." },
+  { kind: "load", title: "Load into a connection", hint: "Write the upstream rows into a table of a connection (insert, replace, update or merge)." },
+  { kind: "export", title: "Save to a file", hint: "Write the upstream rows to a CSV, Parquet or JSON file." },
+];
+
+/** Settings of the step's current action that switching to another one would remove. */
+export function actionSettings(node: JobNode): string[] {
+  const out: string[] = [];
+  if (node.kind === "query") {
+    if (node.sql.trim()) out.push("its SQL");
+    if (node.connection_id) out.push("its connection");
+  } else if (node.kind === "load") {
+    if (node.target_connection_id || node.target_table?.trim()) out.push("the target connection and table");
+    if (node.load_before_sql?.trim() || node.load_after_sql?.trim()) out.push("the before/after SQL");
+    if (node.key_columns?.length) out.push("the key columns");
+  } else {
+    if (node.export_folder?.trim() || node.export_file?.trim()) out.push("the folder and file name");
+  }
+  return out;
+}
+
+/**
+ * Patch that turns a step into `kind`, clearing everything that belonged to
+ * its previous action (the app does the same on save). Load and export
+ * steps start with "all rows of the upstream step".
+ */
+export function changeAction(node: JobNode, kind: JobNodeKind, upstreams: string[]): Partial<JobNode> {
+  const reset: Partial<JobNode> = {
+    kind,
+    connection_id: null,
+    target_connection_id: null,
+    target_table: null,
+    load_mode: "append",
+    load_before_sql: null,
+    load_after_sql: null,
+    key_columns: [],
+    create_table: true,
+    batch_rows: null,
+    batch_kb: null,
+    export_folder: null,
+    export_file: null,
+    export_format: "csv",
+  };
+  if (kind === node.kind) return {};
+  if (kind === "query") return { ...reset, sql: upstreams.length ? readSql(upstreams) : "" };
+  return { ...reset, sql: "", ...(kind === "load" ? { target_table: upstreams[0] ?? node.name } : {}) };
+}
+
+/** A load/export step's SQL only repeats the default (all rows of the first upstream step). */
+export function usesDefaultRows(node: JobNode, upstreams: string[]): boolean {
+  const t = node.sql.trim().replace(/\s+/g, " ").toLowerCase();
+  if (!t) return true;
+  return !!upstreams.length && t === `select * from results.${upstreams[0].toLowerCase()}`;
+}
+
+/**
+ * A batch-size box's text → value for the step: empty or 0 = default
+ * (`null`), above `max` = `max`. Whole numbers only.
+ */
+export function batchValue(text: string, max: number): number | null {
+  const n = Math.floor(Number(text.trim()));
+  if (!text.trim() || !Number.isFinite(n) || n <= 0) return null;
+  return Math.min(n, max);
 }

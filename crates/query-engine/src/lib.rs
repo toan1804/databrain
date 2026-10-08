@@ -8,9 +8,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub mod load;
 pub mod outputs;
 pub mod probe;
 
+pub use load::{LoadCheck, LoadDryRun, LoadEvent, LoadObserver, LoadReport, LoadRows, LoadSpec, NoLoadObserver};
 pub use outputs::{NewOutput, OutputInfo, OutputRegistry, OutputState, OutputTables};
 
 use databrain_auth::{
@@ -1114,59 +1116,6 @@ impl QueryEngine {
                 _ => {}
             }
         }
-    }
-
-    /// Copy the rows of an output into `table` on another connection
-    /// (job load steps). `Append` inserts, `Truncate` deletes the rows first,
-    /// `Replace` drops and creates the table from the rows' columns.
-    /// Statements run on the session `tab`; returns rows written.
-    pub async fn write_output(
-        &self,
-        reference: &str,
-        connection_id: &str,
-        tab: &str,
-        table: &str,
-        mode: databrain_workspace::LoadMode,
-        cancel: &CancellationToken,
-    ) -> Result<u64> {
-        use databrain_export::load;
-        use databrain_workspace::LoadMode;
-        let table = table.trim();
-        if table.is_empty() {
-            return Err(EngineError::new("invalid", "Choose the table to write into"));
-        }
-        let profile = self.workspace.get_connection(connection_id)?;
-        if profile.config.read_only {
-            return Err(EngineError::new("invalid", format!("Connection \"{}\" is read-only; nothing was written.", profile.name)));
-        }
-        let dialect = profile.config.kind;
-        let o = self.outputs.ensure_loaded(reference)?;
-        let (schema, batches) = {
-            let rs = self.results.get(&o.result_id).map_err(|e| EngineError::new("internal", e.to_string()))?;
-            let mut rs = rs.lock();
-            let schema = rs.schema();
-            let batches = rs.view_batches(&databrain_result_store::ViewSpec::default(), 65_536).map_err(|e| EngineError::new("internal", e.to_string()))?;
-            (schema, batches)
-        };
-        let mut statements = Vec::new();
-        match mode {
-            LoadMode::Append => {}
-            LoadMode::Truncate => statements.push(format!("DELETE FROM {}", databrain_connector_core::quote_path(dialect, table))),
-            LoadMode::Replace => {
-                statements.push(load::drop_table_sql(dialect, table));
-                statements.push(load::create_table_sql(dialect, table, &schema));
-            }
-        }
-        statements.extend(load::insert_statements(dialect, table, &schema, &batches).map_err(|e| EngineError::new("internal", e.to_string()))?);
-        let session = self.session(connection_id, tab).await?;
-        for sql in statements {
-            if cancel.is_cancelled() {
-                return Err(EngineError::new("cancelled", "Cancelled"));
-            }
-            let opts = databrain_connector_core::ExecOptions { cancel: cancel.clone(), ..Default::default() };
-            session.execute(&sql, opts).await?.collect().await?;
-        }
-        Ok(o.rows as u64)
     }
 
     /// Run one read statement again without a row limit and stream every

@@ -15,7 +15,7 @@ pub mod outputs;
 pub use ai::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry};
 pub use outputs::OutputRecord;
 pub use meta_cache::{CachedColumns, CachedListing, ExplorerCacheState};
-pub use jobs::{FileFormat, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, JobSummary, LoadMode, NodeRunRecord, NodeRunSummary, ScheduleMode, StepOwner};
+pub use jobs::{FileFormat, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, JobSummary, LoadMode, NodeRunRecord, NodeRunSummary, RunLogEntry, ScheduleMode, StepOwner, StepProgress};
 pub use notebooks::{CellKind, CellRunSummary, Notebook, NotebookCell, NotebookSummary};
 pub use knowledge::{join_target, split_target, target_mentions, ImportAction, ImportItem, ImportKind, IndexDelta, KnHit, KnNote, KnObject, KnState, NoteEntry, NoteStatus, NotesFile, NotesSource};
 
@@ -583,6 +583,10 @@ const MIGRATIONS: &[&str] = &[
         error       TEXT
     );
     CREATE INDEX job_runs_job ON job_runs (job_id, id DESC);
+    "#,
+    // v10: a log per job run (what ran, outputs, errors)
+    r#"
+    ALTER TABLE job_runs ADD COLUMN log_json TEXT;
     "#,
 ];
 

@@ -930,7 +930,7 @@ export interface IndexPlan {
 
 export type JobNodeKind = "query" | "load" | "export";
 export type FileFormat = "csv" | "parquet" | "json";
-export type LoadMode = "append" | "truncate" | "replace";
+export type LoadMode = "append" | "truncate" | "replace" | "update" | "merge";
 export type NodeRunStatus = "pending" | "running" | "success" | "error" | "skipped" | "cancelled";
 
 export interface NodeRunSummary {
@@ -941,6 +941,10 @@ export interface NodeRunSummary {
   error?: string | null;
   /** File written by an export step. */
   file?: string | null;
+  /** Things to know (a load step created its table, …). */
+  notices?: string[];
+  /** While running: rows written so far (load steps). */
+  progress?: StepProgress | null;
 }
 
 export interface JobNode {
@@ -956,12 +960,57 @@ export interface JobNode {
   target_connection_id?: string | null;
   target_table?: string | null;
   load_mode: LoadMode;
+  /** Load: SQL run on the target connection before / after the rows are written. */
+  load_before_sql?: string | null;
+  load_after_sql?: string | null;
+  /** Load (update/merge): columns identifying a row. */
+  key_columns?: string[];
+  /** Load (append/truncate): create a missing table from the rows' columns (default on). */
+  create_table?: boolean;
+  /** Load: rows per INSERT (empty = the connection's default; kept within its maximum). */
+  batch_rows?: number | null;
+  /** Load: most KB of SQL text per INSERT (empty = default). */
+  batch_kb?: number | null;
   /** Export: folder (empty = Downloads). */
   export_folder?: string | null;
   /** Export: file name; `{step}`, `{job}`, `{date}`, `{time}` are replaced (empty = `{step}_{date}_{time}`). */
   export_file?: string | null;
   export_format?: FileFormat;
   last_run?: NodeRunSummary | null;
+}
+
+export interface LoadCheck {
+  label: string;
+  sql: string;
+  status: "ok" | "error" | "warning" | "unchecked";
+  message?: string | null;
+}
+
+/** Dry run of a load step: nothing is kept. */
+export interface LoadDryRun {
+  ok: boolean;
+  /** transaction: ran on sample rows and rolled back; explain: checked one by one; none: not planned. */
+  method: "transaction" | "explain" | "none";
+  connection: string;
+  table: string;
+  table_exists?: boolean | null;
+  creates_table: boolean;
+  sample_rows?: number | null;
+  rows_error?: string | null;
+  checks: LoadCheck[];
+  notices: string[];
+  /** INSERT size the run uses. */
+  batch?: { rows: number; bytes: number } | null;
+}
+
+/** INSERT batch sizes a connection type allows. */
+export interface BatchLimits {
+  default_rows: number;
+  max_rows: number;
+  default_bytes: number;
+  max_bytes: number;
+  rows_note: string;
+  bytes_note: string;
 }
 
 export interface JobEdge {
@@ -1021,4 +1070,30 @@ export interface JobSummary {
 export interface JobRunEvent {
   job_id: string;
   run: JobRun;
+}
+
+/** One line of a run's log. */
+export interface RunLogEntry {
+  seq: number;
+  at: number;
+  node_id?: string | null;
+  step?: string | null;
+  level: "info" | "success" | "warning" | "error";
+  message: string;
+  sql?: string | null;
+  rows?: number | null;
+  duration_ms?: number | null;
+}
+
+export interface JobLogEvent {
+  job_id: string;
+  run_id: number;
+  entries: RunLogEntry[];
+}
+
+/** Rows written so far by a running load step. */
+export interface StepProgress {
+  phase: string;
+  done: number;
+  total: number;
 }

@@ -8,6 +8,8 @@ import {
   AlertTriangle,
   FileDown,
   FolderOpen,
+  FlaskConical,
+  Info,
   ArrowDownToLine,
   CalendarClock,
   CheckCircle2,
@@ -25,7 +27,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { api, toError } from "../lib/api";
-import type { FileFormat, Job, JobEdge, JobNode, JobRun, JobSchedule, LoadMode, NodeRunSummary } from "../lib/types";
+import type { BatchLimits, FileFormat, Job, JobEdge, JobNode, JobRun, JobSchedule, LoadDryRun, LoadMode, NodeRunSummary, RunLogEntry, StepProgress } from "../lib/types";
 import {
   NODE_H,
   NODE_W,
@@ -39,6 +41,12 @@ import {
   missingLinks,
   newNode,
   nodeStatus,
+  parseKeyColumns,
+  STEP_ACTIONS,
+  actionSettings,
+  changeAction,
+  usesDefaultRows,
+  batchValue,
   readSql,
   removeEdge,
   removeNode,
@@ -513,6 +521,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
               taken={taken}
               node={selected}
               status={nodeStatus(selected, run)}
+              run={run}
               running={running}
               onChange={(patch) => updateNode(selected.id, patch)}
               onRun={() => void start([selected.id])}
@@ -537,9 +546,10 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
                 onClick={() => (setMenu(null), void start([menu.node!, ...descendants(job, menu.node!)]))}
               />
               <MenuSeparator />
-              <MenuItem icon={<Plus size={13} />} label="Add downstream step" hint="DuckDB, reads this output" onClick={() => (setMenu(null), downstream(menu.node!, "query"))} />
-              <MenuItem icon={<ArrowDownToLine size={13} />} label="Load into another connection…" hint="via DuckDB" onClick={() => (setMenu(null), downstream(menu.node!, "load"))} />
-              <MenuItem icon={<FileDown size={13} />} label="Save to a local file…" hint="via DuckDB: CSV, Parquet, JSON" onClick={() => (setMenu(null), downstream(menu.node!, "export"))} />
+              <div className="px-2.5 pb-0.5 pt-1 text-[10.5px] uppercase tracking-wide text-muted">Add a step after this one that…</div>
+              <MenuItem icon={<Database size={13} />} label="Queries this output" hint="DuckDB" onClick={() => (setMenu(null), downstream(menu.node!, "query"))} />
+              <MenuItem icon={<ArrowDownToLine size={13} />} label="Loads it into a connection" onClick={() => (setMenu(null), downstream(menu.node!, "load"))} />
+              <MenuItem icon={<FileDown size={13} />} label="Saves it to a file" hint="CSV, Parquet, JSON" onClick={() => (setMenu(null), downstream(menu.node!, "export"))} />
               <OutputMenuItem jobId={jobId} node={byId.get(menu.node)!} onDone={() => setMenu(null)} />
               <MenuSeparator />
               <MenuItem icon={<Copy size={13} />} label="Duplicate" onClick={() => (setMenu(null), duplicate(menu.node!))} />
@@ -636,7 +646,7 @@ function statusText(s: NodeRunSummary | null): string {
   if (!s || !s.status) return "Not run yet";
   switch (s.status) {
     case "running":
-      return "Running…";
+      return s.progress ? `${s.progress.phase}: ${formatCount(s.progress.done)} / ${formatCount(s.progress.total)}` : "Running…";
     case "pending":
       return "Waiting for upstream steps";
     case "skipped":
@@ -717,6 +727,11 @@ function NodeCard({
           <span className="truncate">Results (DuckDB)</span>
         )}
       </div>
+      {status?.status === "running" && status.progress && (
+        <div className="mt-1">
+          <ProgressBar p={status.progress} compact />
+        </div>
+      )}
       <div className={`mt-auto flex min-w-0 items-center gap-1 text-[10.5px] ${status?.status === "error" ? "text-danger" : "text-muted"}`} title={status?.error ?? undefined}>
         <StatusIcon status={status?.status} />
         <span className="truncate">{node.sql.trim() || node.kind !== "query" ? statusText(status) : "No SQL yet"}</span>
@@ -740,6 +755,7 @@ function NodePanel({
   job,
   node,
   status,
+  run,
   running,
   onChange,
   onRun,
@@ -751,6 +767,8 @@ function NodePanel({
   taken: Map<string, string>;
   node: JobNode;
   status: NodeRunSummary | null;
+  /** The job's current or last run in this session. */
+  run?: JobRun;
   running: boolean;
   onChange: (patch: Partial<JobNode>) => void;
   onRun: () => void;
@@ -795,7 +813,6 @@ function NodePanel({
   const nameProblem = localProblem ?? (remote?.name === name && remote.user ? `results.${name} is already used by ${remote.user}` : null);
   const results = connections.find(isResults);
   const runsOn = node.kind !== "query" || !node.connection_id ? results : connections.find((c) => c.id === node.connection_id);
-  const target = connections.find((c) => c.id === node.target_connection_id);
   const others = connections.filter((c) => !isResults(c));
   const mentions = (u: JobNode) => new RegExp(`\\bresults\\s*\\.\\s*"?${u.name}"?\\b`, "i").test(node.sql);
 
@@ -827,30 +844,7 @@ function NodePanel({
         </button>
       </div>
 
-      <div className="flex rounded-md border border-line p-0.5" role="group" aria-label="Step kind">
-        {(
-          [
-            ["query", "Query", "Run SQL on a connection; the result is results." + node.name],
-            ["load", "Load into a connection", "Select rows with DuckDB and write them into a table of another connection"],
-            ["export", "Save to a file", "Select rows with DuckDB and write them to a CSV, Parquet or JSON file"],
-          ] as const
-        ).map(([k, text, hint]) => (
-          <button
-            key={k}
-            title={hint}
-            className={`flex-1 rounded px-2 py-1 text-[11.5px] ${node.kind === k ? "bg-accent/15 font-medium text-accent" : "text-muted hover:text-fg"}`}
-            onClick={() =>
-              onChange(
-                k === "query"
-                  ? { kind: k }
-                  : { kind: k, sql: node.sql.trim() ? node.sql : readSql(ups.map((u) => u.name)), ...(k === "load" ? { target_table: node.target_table ?? (ups[0]?.name || node.name) } : {}) },
-              )
-            }
-          >
-            {text}
-          </button>
-        ))}
-      </div>
+      <ActionPicker node={node} upstreams={ups.map((u) => u.name)} onChange={onChange} />
 
       {node.kind === "query" && (
         <div className="grid grid-cols-2 gap-2">
@@ -896,85 +890,51 @@ function NodePanel({
         </div>
       )}
 
-      {ups.length > 0 && (
-        <div className="text-[11.5px]">
-          <span className="text-muted">{runsOn === results ? "Reads (click to insert): " : "Runs after: "}</span>
-          {ups.map((u, i) => (
-            <span key={u.id}>
-              {i > 0 && ", "}
-              <button
-                className={`font-mono hover:underline ${runsOn === results && !mentions(u) ? "text-warning" : "text-accent"}`}
-                title={runsOn === results ? (mentions(u) ? `Uses results.${u.name}` : `Doesn't use results.${u.name} yet: click to add it`) : `Select ${u.name}`}
-                onClick={() => (runsOn === results && !mentions(u) ? onChange({ sql: node.sql.trim() ? `${node.sql.trimEnd()}\n-- results.${u.name}` : readSql([u.name]) }) : onSelect(u.id))}
-              >
-                results.{u.name}
-              </button>
-            </span>
-          ))}
-          {runsOn !== results && <div className="mt-0.5 text-[11px] text-muted">Outputs of other steps can only be read by DuckDB steps; this step only waits for them.</div>}
-        </div>
-      )}
+      {node.kind === "query" ? (
+        <>
+        {ups.length > 0 && (
+          <div className="text-[11.5px]">
+            <span className="text-muted">{runsOn === results ? "Reads (click to insert): " : "Runs after: "}</span>
+            {ups.map((u, i) => (
+              <span key={u.id}>
+                {i > 0 && ", "}
+                <button
+                  className={`font-mono hover:underline ${runsOn === results && !mentions(u) ? "text-warning" : "text-accent"}`}
+                  title={runsOn === results ? (mentions(u) ? `Uses results.${u.name}` : `Doesn't use results.${u.name} yet: click to add it`) : `Select ${u.name}`}
+                  onClick={() => (runsOn === results && !mentions(u) ? onChange({ sql: node.sql.trim() ? `${node.sql.trimEnd()}\n-- results.${u.name}` : readSql([u.name]) }) : onSelect(u.id))}
+                >
+                  results.{u.name}
+                </button>
+              </span>
+            ))}
+            {runsOn !== results && <div className="mt-0.5 text-[11px] text-muted">Outputs of other steps can only be read by DuckDB steps; this step only waits for them.</div>}
+          </div>
+        )}
 
-      <div>
-        <label className={label}>
-          SQL {node.kind === "load" ? "(DuckDB: the rows to load)" : node.kind === "export" ? "(DuckDB: the rows to save)" : runsOn ? `on ${runsOn === results ? "Results (DuckDB)" : runsOn.name}` : ""}
-        </label>
-        <CellEditor
-          editorKey={EDITOR_KEY(job.id, node.id)}
-          source={node.sql}
-          connectionId={node.kind !== "query" ? (results?.id ?? null) : (node.connection_id ?? results?.id ?? null)}
-          height={240}
-          onResize={() => {}}
-          onChange={(sql) => onChange({ sql })}
-          onRun={onRun}
-          onRunAdvance={onRun}
-          onFocus={() => {}}
-        />
-      </div>
+        <div>
+          <label className={label}>
+            SQL {runsOn ? `on ${runsOn === results ? "Results (DuckDB)" : runsOn.name}` : ""}
+          </label>
+          <CellEditor
+            editorKey={EDITOR_KEY(job.id, node.id)}
+            source={node.sql}
+            connectionId={node.kind !== "query" ? (results?.id ?? null) : (node.connection_id ?? results?.id ?? null)}
+            height={240}
+            onResize={() => {}}
+            onChange={(sql) => onChange({ sql })}
+            onRun={onRun}
+            onRunAdvance={onRun}
+            onFocus={() => {}}
+          />
+        </div>
+        </>
+      ) : (
+        <RowsSection job={job} node={node} ups={ups} onChange={onChange} onSelect={onSelect} />
+      )}
 
       {node.kind === "export" && <ExportFields job={job} node={node} onChange={onChange} />}
 
-      {node.kind === "load" && (
-        <div className="space-y-2 rounded-md border border-line p-2">
-          <div className="grid grid-cols-2 gap-2">
-            <div>
-              <label className={label} htmlFor={`target-${node.id}`}>
-                Into connection
-              </label>
-              <select id={`target-${node.id}`} className={field} value={node.target_connection_id ?? ""} onChange={(e) => onChange({ target_connection_id: e.target.value || null })}>
-                <option value="">Choose…</option>
-                {connections.map((c) => (
-                  <option key={c.id} value={c.id} disabled={c.config.read_only}>
-                    {c.name}
-                    {c.config.read_only ? " (read-only)" : ""}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className={label} htmlFor={`table-${node.id}`}>
-                Table
-              </label>
-              <input id={`table-${node.id}`} className={`${field} font-mono`} placeholder="schema.table" value={node.target_table ?? ""} onChange={(e) => onChange({ target_table: e.target.value })} />
-            </div>
-          </div>
-          <div>
-            <label className={label} htmlFor={`mode-${node.id}`}>
-              Mode
-            </label>
-            <select id={`mode-${node.id}`} className={field} value={node.load_mode} onChange={(e) => onChange({ load_mode: e.target.value as LoadMode })}>
-              <option value="append">Append: insert into the existing table</option>
-              <option value="truncate">Truncate: delete its rows, then insert</option>
-              <option value="replace">Replace: drop and create the table from the rows</option>
-            </select>
-          </div>
-          {target?.env === "prod" && (
-            <div className="flex items-center gap-1 text-[11.5px] text-warning">
-              <AlertTriangle size={12} /> {target.name} is a production connection: runs write to it without asking.
-            </div>
-          )}
-        </div>
-      )}
+      {node.kind === "load" && <LoadFields job={job} node={node} onChange={onChange} />}
 
       <div className={`rounded-md border px-2 py-1.5 ${status?.status === "error" ? "border-danger/50 bg-danger/5" : "border-line"}`}>
         <div className="flex items-center gap-1.5">
@@ -995,7 +955,26 @@ function NodePanel({
             </button>
           )}
         </div>
+        {status?.status === "running" && status.progress && (
+          <div className="mt-1.5">
+            <ProgressBar p={status.progress} />
+          </div>
+        )}
+        {status?.notices?.map((n, i) => (
+          <div key={i} className="mt-1 flex items-start gap-1 text-[11.5px] text-accent">
+            <Info size={12} className="mt-0.5 shrink-0" /> <span className="min-w-0 break-words">{n}</span>
+          </div>
+        ))}
       </div>
+
+      {run?.nodes.some((r) => r.node_id === node.id) && (
+        <details open={status?.status === "running" || status?.status === "error"} className="rounded-md border border-line px-2 py-1.5">
+          <summary className="cursor-pointer text-[11px] font-medium uppercase tracking-wide text-muted">Log of this step ({run.status === "running" ? "running now" : relativeTime(run.started_at)})</summary>
+          <div className="mt-1.5">
+            <RunLog job={job} run={run} step={node.id} />
+          </div>
+        </details>
+      )}
 
       {(ups.length > 0 || downs.length > 0) && (
         <div className="grid grid-cols-2 gap-2 text-[11.5px]">
@@ -1003,6 +982,543 @@ function NodePanel({
           <NodeList title="Downstream" nodes={downs} onSelect={onSelect} empty="none" />
         </div>
       )}
+    </div>
+  );
+}
+
+/** Rows written so far by a running load step. */
+function ProgressBar({ p, compact = false }: { p: StepProgress; compact?: boolean }) {
+  const pct = p.total > 0 ? Math.min(100, (p.done / p.total) * 100) : 100;
+  return (
+    <div className={compact ? "" : "space-y-0.5"}>
+      <div
+        className={`w-full overflow-hidden rounded-full bg-line ${compact ? "h-1" : "h-1.5"}`}
+        role="progressbar"
+        aria-label={p.phase}
+        aria-valuemin={0}
+        aria-valuemax={p.total}
+        aria-valuenow={p.done}
+      >
+        <div className="h-full rounded-full bg-accent transition-[width] duration-200" style={{ width: `${pct}%` }} />
+      </div>
+      {!compact && (
+        <div className="flex justify-between text-[11px] text-muted">
+          <span>{p.phase}</span>
+          <span>
+            {formatCount(p.done)} / {formatCount(p.total)} rows · {Math.floor(pct)}%
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Log of a run: live from events while it runs, else read from the app. */
+function useRunLog(jobId: string, run: JobRun | undefined): { entries: RunLogEntry[]; loading: boolean } {
+  const live = useJobs((s) => (run ? s.logs[run.id] : undefined));
+  const [saved, setSaved] = useState<{ id: number; entries: RunLogEntry[] } | null>(null);
+  const running = run?.status === "running";
+  useEffect(() => {
+    if (!run || running) return;
+    let ok = true;
+    api
+      .jobRunLog(jobId, run.id)
+      .then((entries) => ok && setSaved({ id: run.id, entries }))
+      .catch(() => ok && setSaved({ id: run.id, entries: [] }));
+    return () => {
+      ok = false;
+    };
+  }, [jobId, run?.id, running]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (!run) return { entries: [], loading: false };
+  if (saved?.id === run.id && !running) return { entries: saved.entries, loading: false };
+  return { entries: live ?? [], loading: !running && !live };
+}
+
+const LEVEL_TONE: Record<RunLogEntry["level"], string> = { info: "text-muted", success: "text-success", warning: "text-warning", error: "text-danger" };
+
+function logText(entries: RunLogEntry[]): string {
+  return entries
+    .map((e) => {
+      const head = `${new Date(e.at).toLocaleTimeString()} ${e.level.toUpperCase().padEnd(7)} ${e.step ? `[${e.step}] ` : ""}${e.message}${e.duration_ms != null ? ` (${formatDuration(e.duration_ms)})` : ""}`;
+      return e.sql ? `${head}\n    ${e.sql.replace(/\n/g, "\n    ")}` : head;
+    })
+    .join("\n");
+}
+
+/** A run's log: what ran on which step, SQL, rows, errors. */
+function RunLog({ job, run, step, onSelect }: { job: Job; run: JobRun | undefined; step?: string; onSelect?: (id: string) => void }) {
+  const { entries, loading } = useRunLog(job.id, run);
+  const [filter, setFilter] = useState<string>(step ?? "");
+  const [onlyProblems, setOnlyProblems] = useState(false);
+  const [openSql, setOpenSql] = useState<Set<number>>(new Set());
+  const end = useRef<HTMLDivElement>(null);
+  const follow = useRef(true);
+  useEffect(() => setFilter(step ?? ""), [step]);
+  const shown = entries.filter((e) => (!filter || e.node_id === filter || (!e.node_id && !step)) && (!onlyProblems || e.level === "error" || e.level === "warning"));
+  useEffect(() => {
+    if (run?.status === "running" && follow.current) end.current?.scrollIntoView({ block: "nearest" });
+  }, [shown.length, run?.status]);
+  if (!run) return <div className="text-[11.5px] text-muted">No run yet.</div>;
+  const steps = job.nodes.filter((n) => entries.some((e) => e.node_id === n.id));
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center gap-1.5">
+        {!step && (
+          <select className="rounded-md border border-line bg-bg px-1.5 py-0.5 text-[11.5px]" value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Show the log of">
+            <option value="">All steps</option>
+            {steps.map((n) => (
+              <option key={n.id} value={n.id}>
+                {n.name}
+              </option>
+            ))}
+          </select>
+        )}
+        <label className="flex items-center gap-1 text-[11.5px]">
+          <input type="checkbox" checked={onlyProblems} onChange={(e) => setOnlyProblems(e.target.checked)} /> Errors and warnings only
+        </label>
+        <button
+          className="btn-ghost ml-auto py-0 text-[11px]"
+          disabled={!shown.length}
+          onClick={() => void navigator.clipboard.writeText(logText(shown)).then(() => useStore.getState().toast("Log copied", "info"))}
+        >
+          <Copy size={11} /> Copy
+        </button>
+      </div>
+      <div
+        className="max-h-80 overflow-y-auto rounded-md border border-line bg-bg px-1.5 py-1 font-mono text-[11px] leading-[1.45]"
+        role="log"
+        aria-live={run.status === "running" ? "polite" : "off"}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+        }}
+      >
+        {loading && <div className="text-muted">Loading…</div>}
+        {!loading && !shown.length && <div className="text-muted">{entries.length ? "Nothing matches." : run.status === "running" ? "Starting…" : "No log for this run (runs before logs were kept have none)."}</div>}
+        {shown.map((e) => (
+          <div key={e.seq} className="py-px">
+            <div className="flex items-baseline gap-1.5">
+              <span className="shrink-0 text-muted">{new Date(e.at).toLocaleTimeString()}</span>
+              {e.step && !step && (
+                <button className="shrink-0 text-accent hover:underline" onClick={() => e.node_id && onSelect?.(e.node_id)}>
+                  {e.step}
+                </button>
+              )}
+              <span className={`min-w-0 flex-1 whitespace-pre-wrap break-words ${LEVEL_TONE[e.level] === "text-muted" ? "text-fg" : LEVEL_TONE[e.level]}`}>{e.message}</span>
+              {e.duration_ms != null && <span className="shrink-0 text-muted">{formatDuration(e.duration_ms)}</span>}
+              {e.sql && (
+                <button
+                  className="shrink-0 text-muted hover:text-fg"
+                  aria-expanded={openSql.has(e.seq)}
+                  onClick={() =>
+                    setOpenSql((s) => {
+                      const n = new Set(s);
+                      if (n.has(e.seq)) n.delete(e.seq);
+                      else n.add(e.seq);
+                      return n;
+                    })
+                  }
+                >
+                  SQL
+                </button>
+              )}
+            </div>
+            {e.sql && openSql.has(e.seq) && <pre className="ml-14 mt-0.5 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-panel-2 px-1.5 py-1 text-[10.5px]">{e.sql}</pre>}
+          </div>
+        ))}
+        <div ref={end} />
+      </div>
+    </div>
+  );
+}
+
+function actionIcon(kind: JobNode["kind"], size = 14) {
+  return kind === "load" ? <ArrowDownToLine size={size} className="shrink-0 text-accent" /> : kind === "export" ? <FileDown size={size} className="shrink-0 text-accent" /> : <Database size={size} className="shrink-0 text-accent" />;
+}
+
+/** The one thing this step does, and a way to change it (clearing the old action's settings). */
+function ActionPicker({ node, upstreams, onChange }: { node: JobNode; upstreams: string[]; onChange: (patch: Partial<JobNode>) => void }) {
+  const cur = STEP_ACTIONS.find((a) => a.kind === node.kind) ?? STEP_ACTIONS[0];
+  const pick = (kind: JobNode["kind"]) => {
+    const next = STEP_ACTIONS.find((a) => a.kind === kind)!;
+    const apply = () => onChange(changeAction(node, kind, upstreams));
+    const lost = actionSettings(node);
+    if (!lost.length) return apply();
+    useStore.getState().askConfirm({
+      title: `Change "${node.name}" to "${next.title}"?`,
+      reasons: [`A step does one thing. ${lost.join(", ").replace(/^./, (c) => c.toUpperCase())} will be removed.`, "To keep this action too, add another step after this one instead."],
+      confirmLabel: "Change action",
+      onConfirm: apply,
+    });
+  };
+  return (
+    <section aria-label="Action" className="rounded-md border border-accent/40 bg-accent/5 p-2">
+      <div className={label}>Action</div>
+      <div className="flex items-start gap-2">
+        <span className="mt-0.5">{actionIcon(node.kind)}</span>
+        <div className="min-w-0 flex-1">
+          <div className="text-[12.5px] font-semibold">{cur.title}</div>
+          <div className="text-[11px] text-muted">{cur.hint}</div>
+        </div>
+        <select aria-label="Change action" className="w-auto shrink-0 rounded-md border border-line bg-bg px-1.5 py-0.5 text-[11.5px]" value="" onChange={(e) => e.target.value && pick(e.target.value as JobNode["kind"])}>
+          <option value="">Change…</option>
+          {STEP_ACTIONS.filter((a) => a.kind !== node.kind).map((a) => (
+            <option key={a.kind} value={a.kind}>
+              {a.title}
+            </option>
+          ))}
+        </select>
+      </div>
+    </section>
+  );
+}
+
+/** Rows a load/export step writes: all rows of its upstream step, or a DuckDB query. */
+function RowsSection({ job, node, ups, onChange, onSelect }: { job: Job; node: JobNode; ups: JobNode[]; onChange: (patch: Partial<JobNode>) => void; onSelect: (id: string) => void }) {
+  const names = ups.map((u) => u.name);
+  const results = useStore((s) => s.connections.find(isResults));
+  const plain = usesDefaultRows(node, names);
+  const [editing, setEditing] = useState(!plain);
+  const what = node.kind === "load" ? "load" : "save";
+  return (
+    <section aria-label="Rows" className="space-y-1.5">
+      <div className={label}>Rows to {what}</div>
+      {!ups.length && !node.sql.trim() && (
+        <div className="flex items-start gap-1 text-[11.5px] text-warning">
+          <AlertTriangle size={12} className="mt-0.5 shrink-0" /> Link an upstream step (drag its ● handle onto this one), or write SQL that selects the rows.
+        </div>
+      )}
+      {!editing && ups.length > 0 ? (
+        <div className="flex items-center gap-2 rounded-md border border-line px-2 py-1.5 text-[12px]">
+          <span className="min-w-0 flex-1">
+            All rows of{" "}
+            <button className="font-mono text-accent hover:underline" onClick={() => onSelect(ups[0].id)}>
+              results.{ups[0].name}
+            </button>
+            {ups.length > 1 && <span className="text-muted"> (the first upstream step; use SQL to combine several)</span>}
+          </span>
+          <button className="btn-ghost shrink-0 py-0.5 text-[11.5px]" onClick={() => (setEditing(true), onChange({ sql: node.sql.trim() ? node.sql : readSql(names) }))}>
+            Filter or reshape with SQL…
+          </button>
+        </div>
+      ) : (
+        <div>
+          <div className="mb-1 flex items-center gap-2 text-[11px] text-muted">
+            <span className="flex-1">DuckDB query; upstream outputs are results.&lt;step&gt;</span>
+            {ups.length > 0 && (
+              <button className="btn-ghost py-0 text-[11px]" onClick={() => (setEditing(false), onChange({ sql: "" }))}>
+                Use all rows of results.{ups[0].name}
+              </button>
+            )}
+          </div>
+          <CellEditor
+            editorKey={EDITOR_KEY(job.id, node.id)}
+            source={node.sql}
+            connectionId={results?.id ?? null}
+            height={160}
+            onResize={() => {}}
+            onChange={(sql) => onChange({ sql })}
+            onRun={() => {}}
+            onRunAdvance={() => {}}
+            onFocus={() => {}}
+          />
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** Rows and KB per INSERT, within what the target connection allows. */
+function BatchFields({ node, kind, onChange }: { node: JobNode; kind?: string; onChange: (patch: Partial<JobNode>) => void }) {
+  const [limits, setLimits] = useState<BatchLimits | null>(null);
+  useEffect(() => {
+    if (!kind) return setLimits(null);
+    let ok = true;
+    api
+      .loadBatchLimits(kind)
+      .then((l) => ok && setLimits(l))
+      .catch(() => ok && setLimits(null));
+    return () => {
+      ok = false;
+    };
+  }, [kind]);
+  const [rows, setRows] = useState(node.batch_rows ? String(node.batch_rows) : "");
+  const [kb, setKb] = useState(node.batch_kb ? String(node.batch_kb) : "");
+  useEffect(() => {
+    setRows(node.batch_rows ? String(node.batch_rows) : "");
+    setKb(node.batch_kb ? String(node.batch_kb) : "");
+  }, [node.id, node.batch_rows, node.batch_kb]);
+  // A saved value past a new target's maximum is lowered at once.
+  useEffect(() => {
+    if (!limits) return;
+    const patch: Partial<JobNode> = {};
+    if (node.batch_rows && node.batch_rows > limits.max_rows) patch.batch_rows = limits.max_rows;
+    if (node.batch_kb && node.batch_kb * 1024 > limits.max_bytes) patch.batch_kb = Math.floor(limits.max_bytes / 1024);
+    if (Object.keys(patch).length) onChange(patch);
+  }, [limits]); // eslint-disable-line react-hooks/exhaustive-deps
+  const maxKb = limits ? Math.floor(limits.max_bytes / 1024) : 65536;
+  const over = (text: string, max: number) => !!text.trim() && Number(text) > max;
+  return (
+    <div>
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <label className={label} htmlFor={`batch-rows-${node.id}`}>
+            Rows per INSERT
+          </label>
+          <input
+            id={`batch-rows-${node.id}`}
+            type="number"
+            min={1}
+            max={limits?.max_rows}
+            step={1}
+            inputMode="numeric"
+            className={`${field} ${limits && over(rows, limits.max_rows) ? "border-warning" : ""}`}
+            placeholder={limits ? `${formatCount(limits.default_rows)} (default)` : "default"}
+            value={rows}
+            onChange={(e) => setRows(e.target.value)}
+            onBlur={() => {
+              const v = batchValue(rows, limits?.max_rows ?? Number.MAX_SAFE_INTEGER);
+              setRows(v ? String(v) : "");
+              onChange({ batch_rows: v });
+            }}
+            aria-describedby={`batch-help-${node.id}`}
+          />
+        </div>
+        <div>
+          <label className={label} htmlFor={`batch-kb-${node.id}`}>
+            Max KB per INSERT
+          </label>
+          <input
+            id={`batch-kb-${node.id}`}
+            type="number"
+            min={1}
+            max={maxKb}
+            step={1}
+            inputMode="numeric"
+            className={`${field} ${limits && over(kb, maxKb) ? "border-warning" : ""}`}
+            placeholder={limits ? `${formatCount(Math.floor(limits.default_bytes / 1024))} (default)` : "default"}
+            value={kb}
+            onChange={(e) => setKb(e.target.value)}
+            onBlur={() => {
+              const v = batchValue(kb, maxKb);
+              setKb(v ? String(v) : "");
+              onChange({ batch_kb: v });
+            }}
+            aria-describedby={`batch-help-${node.id}`}
+          />
+        </div>
+      </div>
+      <div id={`batch-help-${node.id}`} className="mt-0.5 space-y-0.5 text-[11px] text-muted">
+        <div>A statement ends at whichever comes first: the rows or the size of its SQL text. Lower them when the database rejects large statements.</div>
+        {limits ? (
+          <>
+            <div>
+              At most {formatCount(limits.max_rows)} rows: {limits.rows_note}.
+            </div>
+            <div>
+              At most {formatCount(maxKb)} KB: {limits.bytes_note}.
+            </div>
+          </>
+        ) : (
+          <div>Choose the connection to see its limits.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const LOAD_MODES: { mode: LoadMode; text: string; hint: string }[] = [
+  { mode: "append", text: "Insert", hint: "Insert the rows. A missing table can be created from the rows' columns." },
+  { mode: "truncate", text: "Delete rows, then insert", hint: "Delete every row of the table, then insert. A missing table can be created." },
+  { mode: "replace", text: "Replace table", hint: "Drop the table if it exists and create it again from the rows' columns, then insert." },
+  { mode: "update", text: "Update by key", hint: "The table must exist. Rows whose key columns match are updated; the others are ignored." },
+  { mode: "merge", text: "Merge (upsert) by key", hint: "The table must exist. Rows whose key columns match are updated, the others inserted." },
+];
+
+/** Target, mode, key columns, before/after SQL and dry run of a load step. */
+function LoadFields({ job, node, onChange }: { job: Job; node: JobNode; onChange: (patch: Partial<JobNode>) => void }) {
+  const connections = useStore((s) => s.connections);
+  const target = connections.find((c) => c.id === node.target_connection_id);
+  const mode = LOAD_MODES.find((m) => m.mode === node.load_mode) ?? LOAD_MODES[0];
+  const keyed = node.load_mode === "update" || node.load_mode === "merge";
+  const [keys, setKeys] = useState((node.key_columns ?? []).join(", "));
+  useEffect(() => setKeys((node.key_columns ?? []).join(", ")), [node.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [dry, setDry] = useState<{ busy: boolean; report?: LoadDryRun; error?: string }>({ busy: false });
+  // A report is about the settings it was made with.
+  useEffect(() => setDry({ busy: false }), [node.id]);
+  const [showBefore, setShowBefore] = useState(!!node.load_before_sql?.trim());
+  const [showAfter, setShowAfter] = useState(!!node.load_after_sql?.trim());
+  const runDry = async () => {
+    setDry({ busy: true });
+    try {
+      setDry({ busy: false, report: await api.dryRunJobStep(job, node.id) });
+    } catch (e) {
+      setDry({ busy: false, error: toError(e).message });
+    }
+  };
+  const sqlBox = (which: "before" | "after", value: string | null | undefined) => (
+    <div>
+      <label className={label}>
+        {which === "before" ? "Before SQL" : "After SQL"} (on {target?.name ?? "the target connection"}, {which === "before" ? "before the rows are written" : "after they are written"})
+      </label>
+      <CellEditor
+        editorKey={`${EDITOR_KEY(job.id, node.id)}:${which}`}
+        source={value ?? ""}
+        connectionId={node.target_connection_id ?? null}
+        height={110}
+        onResize={() => {}}
+        onChange={(sql) => onChange(which === "before" ? { load_before_sql: sql } : { load_after_sql: sql })}
+        onRun={() => {}}
+        onRunAdvance={() => {}}
+        onFocus={() => {}}
+      />
+    </div>
+  );
+  return (
+    <div className="space-y-2 rounded-md border border-line p-2">
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <label className={label} htmlFor={`target-${node.id}`}>
+            Into connection
+          </label>
+          <select id={`target-${node.id}`} className={field} value={node.target_connection_id ?? ""} onChange={(e) => onChange({ target_connection_id: e.target.value || null })}>
+            <option value="">Choose…</option>
+            {connections.map((c) => (
+              <option key={c.id} value={c.id} disabled={c.config.read_only}>
+                {c.name}
+                {c.config.read_only ? " (read-only)" : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className={label} htmlFor={`table-${node.id}`}>
+            Table
+          </label>
+          <input id={`table-${node.id}`} className={`${field} font-mono`} placeholder="schema.table" value={node.target_table ?? ""} onChange={(e) => onChange({ target_table: e.target.value })} />
+        </div>
+      </div>
+      <div>
+        <label className={label} htmlFor={`mode-${node.id}`}>
+          Mode
+        </label>
+        <select id={`mode-${node.id}`} className={field} value={mode.mode} onChange={(e) => onChange({ load_mode: e.target.value as LoadMode })}>
+          {LOAD_MODES.map((m) => (
+            <option key={m.mode} value={m.mode}>
+              {m.text}
+            </option>
+          ))}
+        </select>
+        <div className="mt-0.5 text-[11px] text-muted">{mode.hint}</div>
+      </div>
+      {(node.load_mode === "append" || node.load_mode === "truncate") && (
+        <label className="flex items-center gap-1.5 text-[12px]">
+          <input type="checkbox" checked={node.create_table ?? true} onChange={(e) => onChange({ create_table: e.target.checked })} />
+          Create the table if it's missing (from the rows' columns; you get a notice)
+        </label>
+      )}
+      {keyed && (
+        <div>
+          <label className={label} htmlFor={`keys-${node.id}`}>
+            Key columns
+          </label>
+          <input
+            id={`keys-${node.id}`}
+            className={`${field} font-mono ${parseKeyColumns(keys).length ? "" : "border-warning"}`}
+            placeholder="id, region"
+            value={keys}
+            onChange={(e) => setKeys(e.target.value)}
+            onBlur={() => onChange({ key_columns: parseKeyColumns(keys) })}
+          />
+          <div className="mt-0.5 text-[11px] text-muted">
+            {parseKeyColumns(keys).length ? "Comma-separated columns that identify a row (in the rows and the table)." : "Required: the columns that identify a row, comma-separated."}
+          </div>
+        </div>
+      )}
+      <BatchFields node={node} kind={target?.config.kind} onChange={onChange} />
+      <div className="flex flex-wrap gap-1.5">
+        {!showBefore && (
+          <button className="btn-ghost border border-line py-0.5 text-[11.5px]" onClick={() => setShowBefore(true)}>
+            <Plus size={12} /> Before SQL
+          </button>
+        )}
+        {!showAfter && (
+          <button className="btn-ghost border border-line py-0.5 text-[11.5px]" onClick={() => setShowAfter(true)}>
+            <Plus size={12} /> After SQL
+          </button>
+        )}
+      </div>
+      {showBefore && sqlBox("before", node.load_before_sql)}
+      {showAfter && sqlBox("after", node.load_after_sql)}
+      {target?.env === "prod" && (
+        <div className="flex items-center gap-1 text-[11.5px] text-warning">
+          <AlertTriangle size={12} /> {target.name} is a production connection: runs write to it without asking.
+        </div>
+      )}
+      <div className="flex items-center gap-2">
+        <button
+          className="btn-ghost border border-line py-1 text-[12px]"
+          disabled={dry.busy || !node.target_connection_id}
+          title="Check every statement of this step (before SQL, the load, after SQL) without keeping any change"
+          onClick={() => void runDry()}
+        >
+          {dry.busy ? <Loader2 size={12} className="animate-spin" /> : <FlaskConical size={12} />} Dry run
+        </button>
+        <span className="text-[11px] text-muted">Checks the SQL with up to 1,000 of the rows; nothing is kept.</span>
+      </div>
+      {dry.error && <div className="text-[11.5px] text-danger">{dry.error}</div>}
+      {dry.report && <DryRunReport report={dry.report} />}
+    </div>
+  );
+}
+
+function DryRunReport({ report }: { report: LoadDryRun }) {
+  const how =
+    report.method === "transaction"
+      ? `Ran on ${report.sample_rows != null ? `${formatCount(report.sample_rows)} sample rows` : "no rows"} in a transaction, then rolled back`
+      : report.method === "explain"
+        ? "Checked statement by statement without running them (this database can't roll the whole step back)"
+        : "The step could not be planned";
+  return (
+    <div className={`rounded-md border px-2 py-1.5 text-[11.5px] ${report.ok ? "border-success/50" : "border-danger/50 bg-danger/5"}`} role="status">
+      <div className="flex items-center gap-1.5 font-medium">
+        {report.ok ? <CheckCircle2 size={12} className="text-success" /> : <XCircle size={12} className="text-danger" />}
+        {report.ok ? "Dry run passed" : "Dry run found problems"}
+      </div>
+      <div className="text-muted">
+        {how}.
+        {report.batch && ` INSERTs of up to ${formatCount(report.batch.rows)} rows / ${formatCount(Math.floor(report.batch.bytes / 1024))} KB.`}
+      </div>
+      {report.rows_error && <div className="mt-0.5 text-danger">Rows: {report.rows_error}</div>}
+      {report.notices.map((n, i) => (
+        <div key={i} className="mt-0.5 flex items-start gap-1 text-accent">
+          <Info size={12} className="mt-0.5 shrink-0" /> <span className="min-w-0 break-words">{n}</span>
+        </div>
+      ))}
+      <ul className="mt-1 space-y-0.5">
+        {report.checks.map((c, i) => (
+          <li key={i} className="flex items-start gap-1.5">
+            {c.status === "ok" ? (
+              <CheckCircle2 size={12} className="mt-0.5 shrink-0 text-success" />
+            ) : c.status === "error" ? (
+              <XCircle size={12} className="mt-0.5 shrink-0 text-danger" />
+            ) : c.status === "warning" ? (
+              <AlertTriangle size={12} className="mt-0.5 shrink-0 text-warning" />
+            ) : (
+              <CircleDashed size={12} className="mt-0.5 shrink-0 text-muted" />
+            )}
+            <div className="min-w-0 flex-1">
+              <span className="font-medium">{c.label}</span>
+              {c.message && <span className={c.status === "error" ? " text-danger" : " text-muted"}> · {c.message}</span>}
+              {c.sql && (
+                <div className="truncate font-mono text-[10.5px] text-muted" title={c.sql}>
+                  {c.sql}
+                </div>
+              )}
+            </div>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -1193,18 +1709,29 @@ function JobPanel({ job, run, onChange, onSelect }: { job: Job; run?: JobRun; on
                 </span>
                 <span className="shrink-0 text-[11px] text-muted">{r.finished_at ? formatDuration(r.finished_at - r.started_at) : "running"}</span>
               </button>
-              {(open === r.id || (r.status === "error" && open === null && r === shown[0])) && (
-                <ul className="space-y-0.5 border-t border-line px-2 py-1">
-                  {r.nodes.map((n) => (
-                    <li key={n.node_id} className="flex items-start gap-1.5">
-                      <StatusIcon status={n.status} />
-                      <button className="shrink-0 font-mono hover:underline" onClick={() => onSelect(n.node_id)}>
-                        {n.name}
-                      </button>
-                      <span className={`min-w-0 break-words text-[11px] ${n.status === "error" ? "text-danger" : "text-muted"}`}>{statusText(n)}</span>
-                    </li>
-                  ))}
-                </ul>
+              {(open === r.id || (open === null && r === shown[0] && (r.status === "error" || r.status === "running"))) && (
+                <div className="space-y-1.5 border-t border-line px-2 py-1.5">
+                  <ul className="space-y-0.5">
+                    {r.nodes.map((n) => (
+                      <li key={n.node_id} className="space-y-0.5">
+                        <div className="flex items-start gap-1.5">
+                          <StatusIcon status={n.status} />
+                          <button className="shrink-0 font-mono hover:underline" onClick={() => onSelect(n.node_id)}>
+                            {n.name}
+                          </button>
+                          <span className={`min-w-0 break-words text-[11px] ${n.status === "error" ? "text-danger" : "text-muted"}`}>{statusText(n)}</span>
+                        </div>
+                        {n.status === "running" && n.progress && (
+                          <div className="pl-5">
+                            <ProgressBar p={n.progress} />
+                          </div>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                  <div className={label}>Log</div>
+                  <RunLog job={job} run={r} onSelect={onSelect} />
+                </div>
               )}
             </li>
           ))}

@@ -1430,6 +1430,16 @@ pub fn cancel_job(state: &AppState, id: &str) -> bool {
     state.jobs.cancel(id)
 }
 
+/// Dry run of a load step of `job` as edited (nothing is kept).
+pub async fn dry_run_job_step(state: &AppState, job: databrain_workspace::Job, node_id: &str) -> Result<databrain_query_engine::LoadDryRun> {
+    crate::jobs::dry_run(&state.job_ctx(), &job, node_id).await
+}
+
+/// Log of one run of a job, oldest first.
+pub fn job_run_log(state: &AppState, id: &str, run_id: i64) -> Result<Vec<databrain_workspace::RunLogEntry>> {
+    Ok(state.workspace.job_run_log(id, run_id)?)
+}
+
 pub fn job_runs(state: &AppState, id: &str, limit: Option<i64>) -> Result<Vec<databrain_workspace::JobRun>> {
     Ok(state.workspace.job_runs(id, limit.unwrap_or(30).clamp(1, databrain_workspace::jobs::RUNS_KEPT))?)
 }

@@ -1,7 +1,7 @@
 // Jobs list, running jobs and their live runs (from "job-run" events).
 import { create } from "zustand";
-import { api, isTauri, onJobRun, toError } from "./lib/api";
-import type { Job, JobRun, JobSummary } from "./lib/types";
+import { api, isTauri, onJobRun, onJobRunLog, toError } from "./lib/api";
+import type { Job, JobRun, JobSummary, RunLogEntry } from "./lib/types";
 import { useStore } from "./store";
 import { uid } from "./lib/util";
 import { cellStepBase, stepsFromCells, uniqueName, type CellSource } from "./lib/jobGraph";
@@ -28,6 +28,8 @@ interface JobsState {
   /** Latest run per job seen in this session (live while running). */
   runs: Record<string, JobRun>;
   running: Record<string, boolean>;
+  /** Log lines of runs seen live in this session, by run id. */
+  logs: Record<number, RunLogEntry[]>;
   refresh: () => Promise<void>;
   init: () => Promise<void>;
   open: (id: string, name: string) => void;
@@ -42,6 +44,8 @@ interface JobsState {
 let started = false;
 /** Scheduled runs already announced ("Starting job …"). */
 const announced = new Set<number>();
+/** Finished runs whose notices were shown. */
+const noticed = new Set<number>();
 
 export function announceScheduled(jobs: JobSummary[], run: JobRun) {
   if (run.trigger !== "schedule" || run.status !== "running" || announced.has(run.id)) return;
@@ -55,6 +59,7 @@ export const useJobs = create<JobsState>((set, get) => ({
   jobs: [],
   runs: {},
   running: {},
+  logs: {},
   refresh: async () => {
     if (!isTauri()) return;
     const { jobs, running } = await api.listJobs();
@@ -63,10 +68,23 @@ export const useJobs = create<JobsState>((set, get) => ({
   init: async () => {
     if (started || !isTauri()) return;
     started = true;
+    await onJobRunLog(({ run_id, entries }) =>
+      set((s) => {
+        const cur = s.logs[run_id] ?? [];
+        const last = cur.length ? cur[cur.length - 1].seq : 0;
+        const fresh = entries.filter((e) => e.seq > last);
+        return fresh.length ? { logs: { ...s.logs, [run_id]: [...cur, ...fresh] } } : {};
+      }),
+    );
     await onJobRun(({ job_id, run }) => {
       set((s) => ({ runs: { ...s.runs, [job_id]: run }, running: { ...s.running, [job_id]: run.status === "running" } }));
       announceScheduled(get().jobs, run);
       if (run.status !== "running") {
+        // Tell what a step did that the user didn't set up by hand (a created table).
+        if (!noticed.has(run.id)) {
+          noticed.add(run.id);
+          for (const n of run.nodes) for (const msg of n.notices ?? []) if (msg.startsWith("Created table")) useStore.getState().toast(`${n.name}: ${msg}`, "info");
+        }
         // Next run time and last status in the list.
         clearTimeout(refreshTimer);
         refreshTimer = setTimeout(() => void get().refresh().catch(() => {}), 200);

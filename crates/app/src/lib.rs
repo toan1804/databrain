@@ -168,6 +168,18 @@ async fn cancel_job(state: State<'_, AppState>, id: String) -> R<bool> {
     Ok(api::cancel_job(&state, &id))
 }
 
+/// INSERT batch sizes a connection type allows (load steps).
+#[tauri::command]
+async fn load_batch_limits(kind: databrain_connector_core::ConnectorKind) -> R<databrain_export::load::BatchLimits> {
+    Ok(databrain_export::load::batch_limits(kind))
+}
+
+/// Check a load step without keeping any change.
+#[tauri::command]
+async fn dry_run_job_step(state: State<'_, AppState>, job: databrain_workspace::Job, node_id: String) -> R<databrain_query_engine::LoadDryRun> {
+    api::dry_run_job_step(&state, job, &node_id).await
+}
+
 /// What else uses an output name (for a step of job `job_id`), or null.
 #[tauri::command]
 async fn output_name_user(state: State<'_, AppState>, name: String, job_id: String) -> R<Option<String>> {
@@ -197,6 +209,11 @@ async fn reveal_job_file(app: AppHandle, state: State<'_, AppState>, job_id: Str
         return Err(EngineError::new("not_found", format!("{file} no longer exists")));
     }
     app.opener().reveal_item_in_dir(&file).map_err(|e| EngineError::new("internal", e.to_string()))
+}
+
+#[tauri::command]
+async fn job_run_log(state: State<'_, AppState>, id: String, run_id: i64) -> R<Vec<databrain_workspace::RunLogEntry>> {
+    api::job_run_log(&state, &id, run_id)
 }
 
 #[tauri::command]
@@ -887,6 +904,9 @@ pub fn run() {
             delete_job,
             run_job,
             cancel_job,
+            dry_run_job_step,
+            load_batch_limits,
+            job_run_log,
             job_runs,
             default_export_folder,
             output_name_user,

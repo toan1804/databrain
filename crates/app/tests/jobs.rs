@@ -56,6 +56,12 @@ fn node(id: &str, name: &str, kind: JobNodeKind, conn: Option<&str>, sql: &str) 
         target_connection_id: None,
         target_table: None,
         load_mode: LoadMode::Append,
+        load_before_sql: None,
+        load_after_sql: None,
+        key_columns: vec![],
+        create_table: true,
+        batch_rows: None,
+        batch_kb: None,
         export_folder: None,
         export_file: None,
         export_format: FileFormat::Csv,
@@ -221,9 +227,10 @@ async fn load_into_server_databases() {
                 updated_at: 0,
             })
             .unwrap();
-        for mode in [LoadMode::Replace, LoadMode::Truncate] {
+        for mode in [LoadMode::Replace, LoadMode::Truncate, LoadMode::Merge, LoadMode::Update] {
             let mut j = st.workspace.get_job(&job.id).unwrap();
             j.nodes[1].load_mode = mode;
+            j.nodes[1].key_columns = vec!["id".into()];
             st.workspace.save_job(j).unwrap();
             api::run_job(&st, &job.id, None).unwrap();
             let run = finished(&st, &job.id).await;
@@ -315,4 +322,276 @@ async fn step_names_own_their_output_names() {
     api::delete_job(&st, &job.id).unwrap();
     assert_eq!(api::output_name_user(&st, "sales", "").unwrap(), None);
     api::save_job(&st, plain_job("C", vec![node("c", "sales", JobNodeKind::Query, None, "select 1")])).unwrap();
+}
+
+fn duckdb(st: &AppState, name: &str, path: &std::path::Path) -> String {
+    let mut c = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+    c.file_path = Some(path.to_string_lossy().into_owned());
+    api::save_connection(
+        st,
+        SaveConnectionArgs {
+            profile: ConnectionProfile { id: String::new(), name: name.into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            secret: None,
+            clear_secret: false,
+            extra_secrets: Default::default(),
+        },
+    )
+    .unwrap()
+    .id
+}
+
+/// A job: `src_rows` (DuckDB rows) → `load` into `table` of `target`.
+fn load_job(st: &AppState, target: &str, table: &str, src: &str, edit: impl FnOnce(&mut JobNode)) -> Job {
+    // Step names are unique in the app: one load job at a time.
+    for j in st.workspace.list_jobs().unwrap() {
+        st.workspace.delete_job(&j.id).unwrap();
+    }
+    let mut load = node("b", "loaded", JobNodeKind::Load, None, "");
+    load.target_connection_id = Some(target.into());
+    load.target_table = Some(table.into());
+    edit(&mut load);
+    st.workspace
+        .save_job(Job {
+            id: String::new(),
+            name: format!("load {}", uuid::Uuid::new_v4()),
+            nodes: vec![node("a", &format!("src_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]), JobNodeKind::Query, None, src), load],
+            edges: vec![JobEdge { from: "a".into(), to: "b".into() }],
+            schedule: Default::default(),
+            last_scheduled_at: None,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap()
+}
+
+async fn run_all(st: &AppState, job: &Job) -> JobRun {
+    api::run_job(st, &job.id, None).unwrap();
+    finished(st, &job.id).await
+}
+
+fn step(run: &JobRun, name: &str) -> databrain_workspace::NodeRunSummary {
+    run.nodes.iter().find(|r| r.name == name).unwrap().summary.clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn load_creates_missing_table_and_runs_before_and_after_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state();
+    let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+    let job = load_job(&st, &dst, "sales", "select 1 as id, 'a' as name union all select 2, 'b'", |n| {
+        n.load_before_sql = Some("create table if not exists load_log (what text, n integer);\ninsert into load_log values ('before', (select count(*) from sqlite_master where name = 'sales'))".into());
+        n.load_after_sql = Some("insert into load_log select 'after', count(*) from sales".into());
+    });
+    let run = run_all(&st, &job).await;
+    assert_eq!(run.status, "success", "{run:?}");
+    let s = step(&run, "loaded");
+    assert_eq!(s.rows, Some(2));
+    assert!(s.notices.iter().any(|n| n.starts_with("Created table sales in dst from the rows' columns: id")), "{:?}", s.notices);
+    assert_eq!(rows(&st, &dst, "select what, n from load_log order by rowid").await, vec![vec!["before", "0"], vec!["after", "2"]]);
+    // The second run appends into the table that now exists: no notice.
+    let run = run_all(&st, &job).await;
+    assert!(step(&run, "loaded").notices.is_empty());
+    assert_eq!(rows(&st, &dst, "select count(*) from sales").await, vec![vec!["4"]]);
+
+    // Without "create the table", a missing table fails before anything runs.
+    let job = load_job(&st, &dst, "missing", "select 1 as id", |n| n.create_table = false);
+    let run = run_all(&st, &job).await;
+    let err = step(&run, "loaded").error.unwrap();
+    assert!(err.contains("doesn't exist") && err.contains("Create the table"), "{err}");
+    // Columns the table doesn't have are named.
+    let job = load_job(&st, &dst, "sales", "select 3 as id, 'x' as nope", |_| {});
+    let err = step(&run_all(&st, &job).await, "loaded").error.unwrap();
+    assert!(err.contains("has no column nope") && err.contains("its columns: id, name"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_load_is_rolled_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state();
+    let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+    rows(&st, &dst, "create table t (id integer, name text); insert into t values (1, 'kept'), (2, 'kept'); select 1").await;
+    let job = load_job(&st, &dst, "t", "select 9 as id, 'new' as name", |n| {
+        n.load_mode = LoadMode::Truncate;
+        n.load_after_sql = Some("insert into no_such_table values (1)".into());
+    });
+    let run = run_all(&st, &job).await;
+    let err = step(&run, "loaded").error.unwrap();
+    assert!(err.starts_with("After SQL 1:") && err.contains("rolled back"), "{err}");
+    assert_eq!(rows(&st, &dst, "select id, name from t order by id").await, vec![vec!["1", "kept"], vec!["2", "kept"]]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_and_merge_by_key_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state();
+    let targets = [sqlite(&st, "sq", &dir.path().join("dst.db"), false), duckdb(&st, "dk", &dir.path().join("dst.duckdb"))];
+    for dst in targets {
+        rows(&st, &dst, "create table items (id integer primary key, name text, qty integer, note text); insert into items values (1, 'a', 1, 'n1'), (2, 'b', 2, 'n2'); select 1").await;
+        let src = "select 2 as ID, 'B' as name, 20 as qty union all select 3, 'c', 30";
+        // Update: only id 2 changes (columns matched ignoring case); id 3 is ignored; `note` is kept.
+        let job = load_job(&st, &dst, "items", src, |n| {
+            n.load_mode = LoadMode::Update;
+            n.key_columns = vec!["id".into()];
+        });
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{dst}: {run:?}");
+        assert_eq!(step(&run, "loaded").rows, Some(1), "{dst}: rows updated");
+        assert_eq!(
+            rows(&st, &dst, "select id, name, qty, note from items order by id").await,
+            vec![vec!["1", "a", "1", "n1"], vec!["2", "B", "20", "n2"]]
+        );
+        // Merge: id 2 updated again, id 3 inserted.
+        let job = load_job(&st, &dst, "items", "select 2 as id, 'bb' as name, 22 as qty union all select 3, 'c', 30", |n| {
+            n.load_mode = LoadMode::Merge;
+            n.key_columns = vec!["id".into()];
+        });
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{dst}: {run:?}");
+        assert_eq!(step(&run, "loaded").rows, Some(2));
+        assert_eq!(rows(&st, &dst, "select id, name, qty from items order by id").await, vec![vec!["1", "a", "1"], vec!["2", "bb", "22"], vec!["3", "c", "30"]]);
+
+        // Update/Merge need the table and the keys.
+        let job = load_job(&st, &dst, "nope", src, |n| {
+            n.load_mode = LoadMode::Merge;
+            n.key_columns = vec!["id".into()];
+        });
+        let err = step(&run_all(&st, &job).await, "loaded").error.unwrap();
+        assert!(err.contains("Merge needs an existing table"), "{err}");
+        let job = load_job(&st, &dst, "items", src, |n| n.load_mode = LoadMode::Update);
+        assert!(step(&run_all(&st, &job).await, "loaded").error.unwrap().contains("key columns"));
+        let job = load_job(&st, &dst, "items", src, |n| {
+            n.load_mode = LoadMode::Update;
+            n.key_columns = vec!["sku".into()];
+        });
+        assert!(step(&run_all(&st, &job).await, "loaded").error.unwrap().contains("Key column sku"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dry_run_checks_without_keeping_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state();
+    let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+    rows(&st, &dst, "create table t (id integer, name text); insert into t values (1, 'kept'); select 1").await;
+
+    // Upstream not run yet: the rows can't be selected, the rest is still checked.
+    let job = load_job(&st, &dst, "fresh", "select 1 as id, 'a' as name", |n| n.load_before_sql = Some("delete from t".into()));
+    let r = api::dry_run_job_step(&st, job.clone(), "b").await.unwrap();
+    assert!(!r.ok && r.rows_error.as_deref().unwrap().contains("upstream"), "{r:?}");
+    assert_eq!(r.method, "transaction");
+    assert_eq!(r.checks[0].status, "ok", "{r:?}");
+    assert!(r.checks.iter().any(|c| c.status == "unchecked" && c.label == "Insert rows"), "{r:?}");
+
+    // After the upstream ran: everything runs on the sample rows and is rolled back.
+    api::run_job(&st, &job.id, Some(vec!["a".into()])).unwrap();
+    finished(&st, &job.id).await;
+    let r = api::dry_run_job_step(&st, job.clone(), "b").await.unwrap();
+    assert!(r.ok, "{r:?}");
+    assert_eq!((r.table_exists, r.creates_table, r.sample_rows), (Some(false), true, Some(1)));
+    assert_eq!(r.checks.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), vec!["Before SQL 1", "Create table", "Insert rows"]);
+    assert!(r.notices.iter().any(|n| n.contains("fresh doesn't exist in dst")), "{r:?}");
+    assert_eq!(rows(&st, &dst, "select count(*) from sqlite_master where name = 'fresh'").await, vec![vec!["0"]], "not created");
+    assert_eq!(rows(&st, &dst, "select count(*) from t").await, vec![vec!["1"]], "before SQL rolled back");
+
+    // A failing statement is reported with its message; the later ones are not run.
+    let mut bad = job.clone();
+    bad.nodes[1].load_after_sql = Some("update missing_table set x = 1".into());
+    let r = api::dry_run_job_step(&st, bad, "b").await.unwrap();
+    assert!(!r.ok);
+    let last = r.checks.last().unwrap();
+    assert_eq!((last.label.as_str(), last.status.as_str()), ("After SQL 1", "error"));
+    assert!(last.message.as_deref().unwrap().contains("missing_table"), "{last:?}");
+
+    // Plan errors (Update without keys) come back as one check.
+    let mut nokeys = job.clone();
+    nokeys.nodes[1].load_mode = LoadMode::Update;
+    nokeys.nodes[1].target_table = Some("t".into());
+    let r = api::dry_run_job_step(&st, nokeys, "b").await.unwrap();
+    assert_eq!(r.method, "none");
+    assert!(r.checks[0].message.as_deref().unwrap().contains("key columns"));
+}
+
+/// UI bridge that keeps every event.
+#[derive(Default)]
+struct Recorder(parking_lot::Mutex<Vec<(String, serde_json::Value)>>);
+impl databrain_app::ai_api::UiBridge for Recorder {
+    fn emit(&self, event: &str, payload: serde_json::Value) {
+        self.0.lock().push((event.into(), payload));
+    }
+    fn open_url(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_log_each_statement_and_report_insert_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let ui = Arc::new(Recorder::default());
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), ui.clone());
+    let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+    // 1,200 rows: three INSERT batches of at most 500.
+    let job = load_job(&st, &dst, "big", "select range as id, 'r' || range as name from range(1200)", |n| {
+        n.load_before_sql = Some("create table if not exists audit (n integer)".into());
+        n.load_after_sql = Some("insert into audit select count(*) from big".into());
+    });
+    let run = run_all(&st, &job).await;
+    assert_eq!(run.status, "success", "{run:?}");
+    assert_eq!(step(&run, "loaded").rows, Some(1200));
+
+    let log = api::job_run_log(&st, &job.id, run.id).unwrap();
+    let text: Vec<String> = log.iter().map(|e| format!("{} | {} | {}", e.step.clone().unwrap_or_default(), e.level, e.message)).collect();
+    let has = |p: &str| text.iter().any(|t| t.contains(p));
+    assert!(text[0].contains("Run of") && text[0].contains("2 steps"), "{text:#?}");
+    assert!(has("loaded | info | Started (load into a connection)"), "{text:#?}");
+    assert!(has("Statement: 1200 rows, 2 columns"), "{text:#?}");
+    assert!(has("Before SQL 1: done"), "{text:#?}");
+    assert!(has("Insert rows: 1200 rows into big in 3 batches"), "{text:#?}");
+    assert!(has("After SQL 1: done, 1 rows affected"), "{text:#?}");
+    assert!(has("Commit: done"), "{text:#?}");
+    assert!(has("loaded | success | Succeeded: 1200 rows"), "{text:#?}");
+    assert!(text.last().unwrap().contains("Run succeeded: 2 succeeded, 0 failed"), "{text:#?}");
+    let before = log.iter().find(|e| e.message.starts_with("Before SQL 1")).unwrap();
+    assert_eq!(before.sql.as_deref(), Some("create table if not exists audit (n integer)"));
+    assert!(log.windows(2).all(|w| w[0].seq < w[1].seq));
+
+    // Live: log lines as events, and the step's progress reaching 1200 / 1200.
+    let events = ui.0.lock().clone();
+    assert!(events.iter().any(|(e, p)| e == "job-run-log" && p["entries"][0]["message"].as_str().is_some_and(|m| m.starts_with("Insert rows"))));
+    let progress: Vec<(u64, u64)> = events
+        .iter()
+        .filter(|(e, _)| e == "job-run")
+        .filter_map(|(_, p)| p["run"]["nodes"].as_array()?.iter().find(|n| n["name"] == "loaded")?.get("progress").map(|g| (g["done"].as_u64().unwrap(), g["total"].as_u64().unwrap())))
+        .collect();
+    assert_eq!(progress.last(), Some(&(1200, 1200)), "{progress:?}");
+
+    // A failing statement is logged with its SQL and error.
+    let mut j = st.workspace.get_job(&job.id).unwrap();
+    j.nodes[1].load_after_sql = Some("insert into nowhere values (1)".into());
+    st.workspace.save_job(j).unwrap();
+    let run = run_all(&st, &job).await;
+    let log = api::job_run_log(&st, &job.id, run.id).unwrap();
+    let failed = log.iter().find(|e| e.level == "error" && e.message.starts_with("After SQL 1 failed")).expect("after SQL error logged");
+    assert_eq!(failed.sql.as_deref(), Some("insert into nowhere values (1)"));
+    assert!(log.iter().any(|e| e.message.contains("Rolling back")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_per_insert_batch_is_configurable() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state();
+    let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+    let job = load_job(&st, &dst, "batched", "select range as id from range(1200)", |n| n.batch_rows = Some(100));
+    let run = run_all(&st, &job).await;
+    assert_eq!(run.status, "success", "{run:?}");
+    let log = api::job_run_log(&st, &job.id, run.id).unwrap();
+    assert!(log.iter().any(|e| e.message.contains("INSERTs of up to 100 rows")), "{log:#?}");
+    assert!(log.iter().any(|e| e.message.contains("1200 rows into batched in 12 batches")), "{log:#?}");
+    assert_eq!(rows(&st, &dst, "select count(*) from batched").await, vec![vec!["1200"]]);
+
+    // Past SQLite's 1,000,000-byte statement limit: lowered, and the dry run says so.
+    let mut j = st.workspace.get_job(&job.id).unwrap();
+    j.nodes[1].batch_kb = Some(4096);
+    let r = api::dry_run_job_step(&st, j, "b").await.unwrap();
+    assert_eq!(r.batch.unwrap().bytes, 1_000_000);
+    assert!(r.notices.iter().any(|n| n.contains("SQLITE_MAX_SQL_LENGTH")), "{r:?}");
 }

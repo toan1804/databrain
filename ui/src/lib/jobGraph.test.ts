@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cellStepBase, stepsFromCells, addDownstream, addEdge, exportFileName, nameProblem, newNode, updateStep, ancestors, descendants, edgeProblem, missingLinks, nodeStatus, removeNode, scheduleText, uniqueName } from "./jobGraph";
+import { cellStepBase, stepsFromCells, addDownstream, addEdge, exportFileName, nameProblem, newNode, updateStep, ancestors, descendants, edgeProblem, missingLinks, nodeStatus, parseKeyColumns, changeAction, actionSettings, usesDefaultRows, batchValue, removeNode, scheduleText, uniqueName } from "./jobGraph";
 import type { Job, JobNode } from "./types";
 
 const n = (id: string, name: string, sql = "", x = 0, y = 0): JobNode => ({ id, name, kind: "query", sql, x, y, load_mode: "append" });
@@ -76,7 +76,7 @@ describe("job graph", () => {
 
   it("export steps and their file names", () => {
     const e = addDownstream(j, "c", "export");
-    expect(e.job.nodes.find((x) => x.id === e.id)).toMatchObject({ kind: "export", name: "export_joined", sql: "select *\nfrom results.joined", export_format: "csv" });
+    expect(e.job.nodes.find((x) => x.id === e.id)).toMatchObject({ kind: "export", name: "export_joined", sql: "", export_format: "csv" });
     const at = new Date(2026, 9, 8, 2, 5, 9);
     expect(exportFileName(null, "sales", "J", "csv", at)).toBe("sales_2026-10-08_020509.csv");
     expect(exportFileName("{job} {date}", "s", "Night/ly", "parquet", at)).toBe("Night_ly 2026-10-08.parquet");
@@ -114,5 +114,43 @@ describe("job graph", () => {
     ]);
     expect(nodes.map((n) => n.y)).toEqual([60, 206, 352]);
     expect(cellStepBase({ source: "x" }, "Sales", 3)).toBe("sales_3");
+  });
+});
+
+describe("parseKeyColumns", () => {
+  it("splits on commas and drops empty items", () => {
+    expect(parseKeyColumns(" id, region ,, ")).toEqual(["id", "region"]);
+    expect(parseKeyColumns("")).toEqual([]);
+  });
+});
+
+describe("one action per step", () => {
+  const base: JobNode = { id: "x", name: "x", kind: "load", sql: "", x: 0, y: 0, load_mode: "merge", target_connection_id: "pg", target_table: "t", key_columns: ["id"], load_before_sql: "delete from t" };
+  it("lists what a change of action removes", () => {
+    expect(actionSettings(base)).toEqual(["the target connection and table", "the before/after SQL", "the key columns"]);
+    expect(actionSettings({ ...base, kind: "query", sql: " " })).toEqual([]);
+  });
+  it("clears the other actions' settings", () => {
+    const q = { ...base, ...changeAction(base, "query", ["orders"]) };
+    expect(q).toMatchObject({ kind: "query", target_connection_id: null, target_table: null, load_before_sql: null, key_columns: [], load_mode: "append", sql: "select *\nfrom results.orders" });
+    const e = { ...q, ...changeAction(q, "export", ["orders"]) };
+    expect(e).toMatchObject({ kind: "export", sql: "", connection_id: null });
+    expect(changeAction(e, "load", ["orders"])).toMatchObject({ kind: "load", target_table: "orders" });
+    expect(changeAction(e, "export", [])).toEqual({});
+  });
+  it("knows when a step reads all upstream rows", () => {
+    expect(usesDefaultRows({ ...base, sql: "" }, [])).toBe(true);
+    expect(usesDefaultRows({ ...base, sql: "SELECT *\n FROM results.Orders" }, ["orders"])).toBe(true);
+    expect(usesDefaultRows({ ...base, sql: "select id from results.orders" }, ["orders"])).toBe(false);
+  });
+});
+
+describe("batchValue", () => {
+  it("keeps whole numbers within the maximum; empty is the default", () => {
+    expect(batchValue("", 1000)).toBeNull();
+    expect(batchValue("0", 1000)).toBeNull();
+    expect(batchValue("abc", 1000)).toBeNull();
+    expect(batchValue("250.7", 1000)).toBe(250);
+    expect(batchValue("5000", 1000)).toBe(1000);
   });
 });

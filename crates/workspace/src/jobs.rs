@@ -50,13 +50,35 @@ impl FileFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadMode {
-    /// Insert into an existing table.
+    /// Insert the rows. A missing table is created from the rows' columns
+    /// when `create_table` is on.
     #[default]
     Append,
-    /// Delete the table's rows, then insert.
+    /// Delete the table's rows, then insert (missing table: as `Append`).
     Truncate,
     /// Drop the table (if it exists), create it from the rows' columns, insert.
     Replace,
+    /// Update rows of an existing table whose `key_columns` match; rows
+    /// without a match are ignored.
+    Update,
+    /// Update rows whose `key_columns` match and insert the others (upsert);
+    /// the table must exist.
+    Merge,
+}
+
+impl LoadMode {
+    /// Modes matching rows by `key_columns`.
+    pub fn needs_keys(self) -> bool {
+        matches!(self, LoadMode::Update | LoadMode::Merge)
+    }
+    /// Modes writing into a table that must already exist.
+    pub fn needs_table(self) -> bool {
+        self.needs_keys()
+    }
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -74,6 +96,60 @@ pub struct NodeRunSummary {
     /// File written by an export step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Things the user should know (a load step created its table, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
+    /// While running: rows written so far out of the total (load steps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<StepProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct StepProgress {
+    /// What is being done ("Inserting rows", "Staging rows").
+    pub phase: String,
+    pub done: u64,
+    pub total: u64,
+}
+
+/// One line of a run's log, for tracing what ran and what came back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RunLogEntry {
+    /// Order in the run (from 1).
+    pub seq: u64,
+    /// Epoch ms.
+    pub at: i64,
+    /// Step it belongs to (`None` for the run itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    /// `info`, `success`, `warning`, `error`.
+    pub level: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+}
+
+/// Lines kept per run log (the rest is summarised in one line).
+pub const LOG_KEPT: usize = 5000;
+/// Longest SQL text kept per log line.
+pub const LOG_SQL_CHARS: usize = 8000;
+
+/// `sql` cut to [`LOG_SQL_CHARS`].
+pub fn log_sql(sql: &str) -> String {
+    if sql.len() <= LOG_SQL_CHARS {
+        return sql.to_string();
+    }
+    let mut end = LOG_SQL_CHARS;
+    while !sql.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} … ({} more characters)", &sql[..end], sql.len() - end)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,6 +174,26 @@ pub struct JobNode {
     pub target_table: Option<String>,
     #[serde(default)]
     pub load_mode: LoadMode,
+    /// Load: SQL run on the target connection before the rows are written
+    /// (one or more statements).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_before_sql: Option<String>,
+    /// Load: SQL run on the target connection after the rows are written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_after_sql: Option<String>,
+    /// Load (Update/Merge): columns identifying a row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_columns: Vec<String>,
+    /// Load (Append/Truncate): create a missing table from the rows' columns.
+    #[serde(default = "yes")]
+    pub create_table: bool,
+    /// Load: rows per INSERT statement (`None` = the connection's default;
+    /// kept within its maximum).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_rows: Option<u32>,
+    /// Load: most KB of SQL text per INSERT statement (`None` = default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_kb: Option<u32>,
     /// Export: folder of the file (empty = Downloads).
     #[serde(default)]
     pub export_folder: Option<String>,
@@ -109,6 +205,37 @@ pub struct JobNode {
     pub export_format: FileFormat,
     #[serde(default)]
     pub last_run: Option<NodeRunSummary>,
+}
+
+impl JobNode {
+    /// A step does one thing: drop the settings of the other actions, so a
+    /// query step can't also carry a load target or a file name.
+    pub fn keep_own_settings(&mut self) {
+        let load = self.kind == JobNodeKind::Load;
+        let export = self.kind == JobNodeKind::Export;
+        if self.kind != JobNodeKind::Query {
+            // Load and export steps select their rows on DuckDB.
+            self.connection_id = None;
+        }
+        if !load {
+            self.target_connection_id = None;
+            self.target_table = None;
+            self.load_mode = LoadMode::default();
+            self.load_before_sql = None;
+            self.load_after_sql = None;
+            self.key_columns.clear();
+            self.create_table = true;
+            self.batch_rows = None;
+            self.batch_kb = None;
+        } else if !self.load_mode.needs_keys() {
+            self.key_columns.clear();
+        }
+        if !export {
+            self.export_folder = None;
+            self.export_file = None;
+            self.export_format = FileFormat::default();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,6 +568,7 @@ impl Workspace {
             if n.id.is_empty() {
                 n.id = new_id();
             }
+            n.keep_own_settings();
         }
         let ids: Vec<String> = job.nodes.iter().map(|n| n.id.clone()).collect();
         let mut edges: Vec<JobEdge> = Vec::new();
@@ -528,6 +656,24 @@ impl Workspace {
         Ok(())
     }
 
+    /// Save the whole log of a run (replaces what was saved before).
+    pub fn set_job_run_log(&self, run_id: i64, log: &[RunLogEntry]) -> Result<()> {
+        let json = serde_json::to_string(log).map_err(|e| Error::Invalid(e.to_string()))?;
+        self.conn.lock().execute("UPDATE job_runs SET log_json = ?2 WHERE id = ?1", params![run_id, json])?;
+        Ok(())
+    }
+
+    /// Log of a run of `job_id`, oldest first (empty for runs before logs existed).
+    pub fn job_run_log(&self, job_id: &str, run_id: i64) -> Result<Vec<RunLogEntry>> {
+        let json: Option<String> = self
+            .conn
+            .lock()
+            .query_row("SELECT log_json FROM job_runs WHERE id = ?1 AND job_id = ?2", params![run_id, job_id], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("run {run_id}")))?;
+        Ok(json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())
+    }
+
     /// Newest first.
     pub fn job_runs(&self, job_id: &str, limit: i64) -> Result<Vec<JobRun>> {
         let c = self.conn.lock();
@@ -561,6 +707,12 @@ mod tests {
             target_connection_id: None,
             target_table: None,
             load_mode: LoadMode::Append,
+            load_before_sql: None,
+            load_after_sql: None,
+            key_columns: vec![],
+            create_table: true,
+            batch_rows: None,
+            batch_kb: None,
             export_folder: None,
             export_file: None,
             export_format: FileFormat::Csv,
@@ -619,6 +771,14 @@ mod tests {
         assert_eq!(ws.job_runs(&j.id, 10).unwrap()[0].nodes[0].summary.rows, Some(3));
         assert_eq!(ws.list_jobs().unwrap()[0].last_run.as_ref().unwrap().status, "success");
 
+        // Run log: saved whole, read back per run of its job.
+        assert!(ws.job_run_log(&j.id, run.id).unwrap().is_empty());
+        let line = RunLogEntry { seq: 1, at: 5, node_id: Some("n1".into()), step: Some("orders".into()), level: "info".into(), message: "Ran".into(), sql: Some("select 1".into()), rows: Some(1), duration_ms: Some(2) };
+        ws.set_job_run_log(run.id, std::slice::from_ref(&line)).unwrap();
+        assert_eq!(ws.job_run_log(&j.id, run.id).unwrap(), vec![line]);
+        assert!(ws.job_run_log("other", run.id).is_err());
+        assert!(log_sql(&"é".repeat(LOG_SQL_CHARS)).ends_with("more characters)"));
+
         ws.start_job_run(&j.id, "schedule").unwrap();
         assert_eq!(ws.close_stale_job_runs().unwrap(), 1);
         // The job itself can be saved again with its names.
@@ -626,6 +786,31 @@ mod tests {
         ws.delete_job(&j.id).unwrap();
         assert!(ws.get_job(&j.id).is_err());
         assert!(ws.job_runs(&j.id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn steps_keep_only_their_own_action() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let mut q = node("q");
+        q.target_table = Some("t".into());
+        q.export_file = Some("f.csv".into());
+        q.load_before_sql = Some("delete from t".into());
+        let mut l = node("l");
+        l.kind = JobNodeKind::Load;
+        l.connection_id = Some("pg".into());
+        l.target_table = Some("t".into());
+        l.key_columns = vec!["id".into()];
+        l.export_folder = Some("/tmp".into());
+        let mut m = node("m");
+        m.kind = JobNodeKind::Load;
+        m.load_mode = LoadMode::Merge;
+        m.key_columns = vec!["id".into()];
+        let j = ws.save_job(job(vec![q, l, m], vec![])).unwrap();
+        let (q, l, m) = (&j.nodes[0], &j.nodes[1], &j.nodes[2]);
+        assert_eq!((q.target_table.as_deref(), q.export_file.as_deref(), q.load_before_sql.as_deref()), (None, None, None));
+        assert_eq!((l.connection_id.as_deref(), l.target_table.as_deref(), l.export_folder.as_deref()), (None, Some("t"), None));
+        assert!(l.key_columns.is_empty(), "insert doesn't use keys");
+        assert_eq!(m.key_columns, vec!["id"]);
     }
 
     #[test]

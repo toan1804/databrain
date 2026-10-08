@@ -8,7 +8,11 @@ import type {
   Job,
   JobRun,
   JobRunEvent,
+  JobLogEvent,
+  RunLogEntry,
   JobSummary,
+  LoadDryRun,
+  BatchLimits,
   ImportAction,
   NotesImportPreview,
   ExcelSheet,
@@ -225,11 +229,17 @@ export const api = {
   /** `nodes`: run only these steps (their upstream outputs must exist). */
   runJob: (id: string, nodes?: string[]) => call<JobRun>("run_job", { id, nodes: nodes ?? null }),
   cancelJob: (id: string) => call<boolean>("cancel_job", { id }),
+  /** Check a load step of `job` (as edited) without keeping any change. */
+  dryRunJobStep: (job: Job, nodeId: string) => call<LoadDryRun>("dry_run_job_step", { job, nodeId }),
+  /** INSERT batch sizes a connection type allows (load steps). */
+  loadBatchLimits: (kind: string) => call<BatchLimits>("load_batch_limits", { kind }),
   /** What else uses an output name (for a step of `jobId`), or null when free. */
   outputNameUser: (name: string, jobId: string) => call<string | null>("output_name_user", { name, jobId }),
   defaultExportFolder: () => call<string | null>("default_export_folder"),
   /** Show the file a job's export step last wrote. */
   revealJobFile: (jobId: string, nodeId: string) => call<void>("reveal_job_file", { jobId, nodeId }),
+  /** Log of one run of a job, oldest first. */
+  jobRunLog: (id: string, runId: number) => call<RunLogEntry[]>("job_run_log", { id, runId }),
   jobRuns: (id: string, limit?: number) => call<JobRun[]>("job_runs", { id, limit: limit ?? null }),
   listNotebooks: () => call<NotebookSummary[]>("list_notebooks"),
   getNotebook: (id: string) => call<Notebook>("get_notebook", { id }),
@@ -310,6 +320,10 @@ export function onJobEvent(handler: (e: JobEvent) => void): Promise<UnlistenFn> 
 
 export function onJobRun(handler: (e: JobRunEvent) => void): Promise<UnlistenFn> {
   return listen<JobRunEvent>("job-run", (e) => handler(e.payload));
+}
+
+export function onJobRunLog(handler: (e: JobLogEvent) => void): Promise<UnlistenFn> {
+  return listen<JobLogEvent>("job-run-log", (e) => handler(e.payload));
 }
 
 type AiChannelPayload = AgentEvent | AiUiRequest;
