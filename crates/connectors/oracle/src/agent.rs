@@ -21,7 +21,7 @@ pub const PROTOCOL: &str = "1";
 /// Release of the helper binaries (download folder and file names).
 pub const RELEASE: &str = "0.1.0";
 /// Where releases are published: `{base}/v{RELEASE}/{file}.gz`.
-pub const DEFAULT_BASE_URL: &str = "https://github.com/databrain-app/databrain/releases/download/oracle-agent";
+pub const DEFAULT_BASE_URL: &str = "https://github.com/toan1804/databrain/releases/download/oracle-agent";
 /// `sha256  file` lines of the uncompressed binaries of [`RELEASE`].
 const SHA256SUMS: &str = include_str!("../agent/SHA256SUMS");
 
