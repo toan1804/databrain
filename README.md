@@ -2,6 +2,18 @@
 
 A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design and roadmap.
 
+## Download
+
+| Platform | Download |
+|---|---|
+| macOS (Apple Silicon) | [DataBrain_0.1.0_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.1.0/DataBrain_0.1.0_aarch64.dmg) |
+| Linux | Coming soon |
+| Windows | Coming soon |
+
+All versions are on the [Releases](https://github.com/toan1804/databrain/releases) page. To build it yourself, see [Run](#run).
+
+The macOS app is not signed yet, so macOS blocks it on first open: right-click DataBrain.app → Open → Open (or System Settings → Privacy & Security → Open Anyway). Intel Macs: build from source for now.
+
 ## What works today
 
 - **Connections:**
