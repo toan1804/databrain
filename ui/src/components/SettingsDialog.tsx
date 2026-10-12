@@ -6,7 +6,7 @@ import type { AuditEntry, CredentialStoreKind, CredentialStoreView, KiroStatus, 
 import { relativeTime } from "../lib/util";
 import { useStore } from "../store";
 import { useAi } from "../aiStore";
-import { Modal } from "./ui";
+import { ComboInput, Modal } from "./ui";
 import { AppearanceSettings } from "./AppearanceSettings";
 
 export const PROVIDER_KINDS: { kind: ProviderKind; label: string; base: string; auth: ProviderAuth[]; model: string; hint?: string }[] = [
@@ -447,22 +447,17 @@ function ProviderForm({
         <div>
           <L>{kind === "azure_openai" ? "Deployment" : isKiro ? "Model (auto = Kiro picks)" : "Default model"}</L>
           <div className="flex gap-1">
-            <input className="field" list="prov-models" value={model} placeholder={spec.model} onChange={(e) => setModel(e.target.value)} />
+            <ComboInput className="field" options={models} value={model} placeholder={spec.model} onChange={setModel} />
             {initial && (
               <button className="btn-ghost shrink-0 border border-line px-2" title="Load models" onClick={loadModels} disabled={!!busy}>
                 {busy === "models" ? <Loader2 size={12} className="animate-spin" /> : <Server size={12} />}
               </button>
             )}
           </div>
-          <datalist id="prov-models">
-            {models.map((m) => (
-              <option key={m} value={m} />
-            ))}
-          </datalist>
         </div>
         <div>
           <L>Fast model (inline edits)</L>
-          <input className="field" list="prov-models" value={fastModel} placeholder="(optional)" onChange={(e) => setFastModel(e.target.value)} />
+          <ComboInput className="field" options={models} value={fastModel} placeholder="(optional)" onChange={setFastModel} />
         </div>
       </div>
       {kind === "azure_openai" && (

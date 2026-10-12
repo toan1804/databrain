@@ -26,6 +26,29 @@ export function formatCount(n: number): string {
   return n.toLocaleString("en-US");
 }
 
+/** Where a combo input's list goes: under the field, or above it when there is more room there; never over the field and never outside the window. */
+export function placeComboList(
+  field: { left: number; top: number; bottom: number; width: number },
+  win: { width: number; height: number },
+  minWidth = 220,
+  gap = 2,
+  margin = 4,
+): { left: number; top?: number; bottom?: number; width: number; maxHeight: number } {
+  const width = Math.min(Math.max(field.width, minWidth), win.width - 2 * margin);
+  const left = Math.max(margin, Math.min(field.left, win.width - width - margin));
+  const below = win.height - field.bottom - gap - margin;
+  const above = field.top - gap - margin;
+  if (below >= 160 || below >= above) return { left, top: field.bottom + gap, width, maxHeight: Math.max(0, Math.min(260, below)) };
+  return { left, bottom: win.height - field.top + gap, width, maxHeight: Math.max(0, Math.min(260, above)) };
+}
+
+/** Suggestions of a combo input for `value`: all of them when the box is empty or holds one exactly (to switch), else the ones containing it. */
+export function comboMatches(options: string[], value: string): string[] {
+  const q = value.trim().toLowerCase();
+  if (!q || options.some((o) => o.toLowerCase() === q)) return options;
+  return options.filter((o) => o.toLowerCase().includes(q));
+}
+
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   const units = ["KB", "MB", "GB"];

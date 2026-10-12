@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import { createPortal } from "react-dom";
 import { AlertTriangle, CheckCircle2, Info, X, XCircle } from "lucide-react";
 import { useStore } from "../store";
+import { comboMatches, placeComboList } from "../lib/util";
 import { ExportsTray } from "./ExportsTray";
 
 export function Modal({
@@ -26,6 +27,9 @@ export function Modal({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        // An open suggestion list (ComboInput) closes first, not the dialog.
+        const t = e.target as HTMLElement | null;
+        if (t?.getAttribute?.("role") === "combobox" && t.getAttribute("aria-expanded") === "true") return;
         e.stopPropagation();
         closeRef.current();
       }
@@ -154,6 +158,137 @@ export function MenuItem({
 
 export function MenuSeparator() {
   return <div className="my-1 h-px bg-line" />;
+}
+
+/**
+ * Text input with a themed list of suggestions (replaces `<datalist>`, whose
+ * native popup in the macOS WebView ignores the app theme: dark text on a
+ * dark list once the field has a value). Free text is still allowed.
+ */
+export function ComboInput({
+  value,
+  options,
+  onChange,
+  className = "",
+  listMinWidth = 220,
+  ...rest
+}: {
+  value: string;
+  options: string[];
+  onChange: (v: string) => void;
+  className?: string;
+  listMinWidth?: number;
+  placeholder?: string;
+  "aria-label"?: string;
+  id?: string;
+  disabled?: boolean;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(-1);
+  const [pos, setPos] = useState<{ left: number; top?: number; bottom?: number; width: number; maxHeight: number } | null>(null);
+  const items = open ? comboMatches(options, value) : [];
+  const listId = useRef(`combo-${Math.random().toString(36).slice(2)}`).current;
+  const shown = open && items.length > 0;
+
+  // Place the list under the field, or above it when there is no room below (AI panel footer).
+  useLayoutEffect(() => {
+    if (!shown || !ref.current) return;
+    const place = () => {
+      const r = ref.current!.getBoundingClientRect();
+      setPos(placeComboList(r, { width: window.innerWidth, height: window.innerHeight }, listMinWidth));
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [shown, listMinWidth]);
+  useEffect(() => {
+    if (active >= 0) listRef.current?.children[active]?.scrollIntoView({ block: "nearest" });
+  }, [active]);
+
+  const pick = (v: string) => {
+    onChange(v);
+    setOpen(false);
+    setActive(-1);
+  };
+
+  return (
+    <>
+      <input
+        {...rest}
+        ref={ref}
+        className={className}
+        value={value}
+        role="combobox"
+        aria-autocomplete="list"
+        aria-expanded={shown}
+        aria-controls={listId}
+        aria-activedescendant={shown && active >= 0 ? `${listId}-${active}` : undefined}
+        autoComplete="off"
+        spellCheck={false}
+        onChange={(e) => {
+          onChange(e.target.value);
+          setOpen(true);
+          setActive(-1);
+        }}
+        onFocus={() => setOpen(true)}
+        onClick={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
+            if (!shown) return setOpen(true);
+            const n = items.length;
+            setActive((a) => (e.key === "ArrowDown" ? (a + 1) % n : a <= 0 ? n - 1 : a - 1));
+          } else if (e.key === "Enter" && shown && active >= 0) {
+            e.preventDefault();
+            pick(items[active]);
+          } else if (e.key === "Escape" && shown) {
+            // Close the list only, not the dialog around it.
+            e.preventDefault();
+            e.stopPropagation();
+            setOpen(false);
+          }
+        }}
+      />
+      {shown &&
+        pos &&
+        createPortal(
+          <ul
+            ref={listRef}
+            id={listId}
+            role="listbox"
+            className="fixed z-[70] overflow-auto rounded-md border border-line bg-panel py-0.5 text-fg shadow-lg"
+            style={{ left: pos.left, top: pos.top, bottom: pos.bottom, width: pos.width, maxHeight: pos.maxHeight }}
+          >
+            {items.map((o, i) => (
+              <li
+                key={o}
+                id={`${listId}-${i}`}
+                role="option"
+                aria-selected={i === active}
+                className={`cursor-pointer truncate px-2 py-1 font-mono text-[11.5px] ${i === active ? "bg-hover" : ""} ${o === value ? "text-accent" : ""}`}
+                title={o}
+                // mousedown, so the field doesn't blur (and close the list) first
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  pick(o);
+                }}
+                onMouseEnter={() => setActive(i)}
+              >
+                {o}
+              </li>
+            ))}
+          </ul>,
+          document.body,
+        )}
+    </>
+  );
 }
 
 export function Toasts() {

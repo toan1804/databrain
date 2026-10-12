@@ -41,7 +41,7 @@ import { editorBridge } from "../editorBridge";
 import { Markdown } from "./Markdown";
 import { extractMentions, mentionToken } from "../outputs";
 import { ResultGrid } from "./ResultGrid";
-import { ConnDot } from "./ui";
+import { ComboInput, ConnDot } from "./ui";
 
 export function AiPanel() {
   const view = useAi((s) => s.view);
@@ -328,19 +328,14 @@ function Chat() {
                 </option>
               ))}
             </select>
-            <input
-              list="ai-models"
+            <ComboInput
               className="h-6 w-[120px] rounded border border-line bg-panel px-1 text-[11px] outline-none"
               aria-label="Model"
               placeholder={provider?.config.default_model ?? "model"}
               value={model ?? ""}
-              onChange={(e) => setProvider(providerId, e.target.value || null)}
+              options={models}
+              onChange={(v) => setProvider(providerId, v || null)}
             />
-            <datalist id="ai-models">
-              {models.map((m) => (
-                <option key={m} value={m} />
-              ))}
-            </datalist>
             {running ? (
               <button className="btn-danger h-6 px-2 py-0" onClick={() => void cancel()} aria-label="Stop">
                 <Square size={11} fill="currentColor" />

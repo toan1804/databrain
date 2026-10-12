@@ -1,13 +1,55 @@
 import { describe, expect, it } from "vitest";
 import {
+  comboMatches,
   errorRange,
   formatDuration,
   fuzzyMatch,
+  placeComboList,
   quoteIdent,
   selectTopSql,
   toggleSort,
   upsertFilter,
 } from "./util";
+
+describe("comboMatches", () => {
+  const models = ["gpt-4o", "gpt-4o-mini", "claude-sonnet-4"];
+  it("lists every option when empty or when one is picked, else the matching ones", () => {
+    expect(comboMatches(models, "")).toEqual(models);
+    expect(comboMatches(models, "  ")).toEqual(models);
+    expect(comboMatches(models, "GPT-4o")).toEqual(models);
+    expect(comboMatches(models, "mini")).toEqual(["gpt-4o-mini"]);
+    expect(comboMatches(models, "o1")).toEqual([]);
+  });
+});
+
+describe("placeComboList", () => {
+  const win = { width: 1200, height: 800 };
+  const overlaps = (f: { top: number; bottom: number }, p: ReturnType<typeof placeComboList>) => {
+    const top = p.top ?? win.height - p.bottom! - p.maxHeight;
+    const bottom = p.top !== undefined ? p.top + p.maxHeight : win.height - p.bottom!;
+    return top < f.bottom && bottom > f.top;
+  };
+  it("goes under a field with room below", () => {
+    const f = { left: 100, top: 100, bottom: 124, width: 300 };
+    const p = placeComboList(f, win);
+    expect(p).toMatchObject({ top: 126, left: 100, width: 300, maxHeight: 260 });
+    expect(overlaps(f, p)).toBe(false);
+  });
+  it("goes above a field at the bottom of the window (AI panel footer), inside the window", () => {
+    const f = { left: 1100, top: 770, bottom: 794, width: 120 };
+    const p = placeComboList(f, win);
+    expect(p.top).toBeUndefined();
+    expect(p.bottom).toBe(win.height - 770 + 2);
+    expect(overlaps(f, p)).toBe(false);
+    expect(p.left + p.width).toBeLessThanOrEqual(win.width - 4);
+    expect(p.width).toBe(220);
+  });
+  it("is never wider than the window", () => {
+    const p = placeComboList({ left: 0, top: 10, bottom: 30, width: 50 }, { width: 150, height: 400 });
+    expect(p.left).toBe(4);
+    expect(p.width).toBe(142);
+  });
+});
 
 describe("toggleSort", () => {
   it("cycles asc -> desc -> off", () => {
