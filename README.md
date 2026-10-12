@@ -6,7 +6,7 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
 
 | Platform | Download |
 |---|---|
-| macOS (Apple Silicon) | [DataBrain_0.1.0_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.1.0/DataBrain_0.1.0_aarch64.dmg) |
+| macOS (Apple Silicon) | [DataBrain_0.1.1_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.1.1/DataBrain_0.1.1_aarch64.dmg) |
 | Linux | Coming soon |
 | Windows | Coming soon |
 

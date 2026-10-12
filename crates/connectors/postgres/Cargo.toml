@@ -11,8 +11,8 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
-databrain-auth = { version = "0.1.0", path = "../../auth" }
-databrain-connector-core = { version = "0.1.0", path = "../../connector-core" }
+databrain-auth = { version = "0.1.1", path = "../../auth" }
+databrain-connector-core = { version = "0.1.1", path = "../../connector-core" }
 futures = "0.3.34"
 native-tls = "0.2.18"
 postgres-native-tls = "0.5.3"

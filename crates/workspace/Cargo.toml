@@ -11,8 +11,8 @@ workspace = true
 
 [dependencies]
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
-databrain-auth = { version = "0.1.0", path = "../auth" }
-databrain-connector-core = { version = "0.1.0", path = "../connector-core" }
+databrain-auth = { version = "0.1.1", path = "../auth" }
+databrain-connector-core = { version = "0.1.1", path = "../connector-core" }
 parking_lot = "0.12.5"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }

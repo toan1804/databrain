@@ -11,8 +11,8 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
-databrain-auth = { version = "0.1.0", path = "../../auth" }
-databrain-connector-core = { version = "0.1.0", path = "../../connector-core" }
+databrain-auth = { version = "0.1.1", path = "../../auth" }
+databrain-connector-core = { version = "0.1.1", path = "../../connector-core" }
 futures = "0.3.34"
 secrecy = "0.10.3"
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "native-tls", "winauth", "sql-browser-tokio"] }

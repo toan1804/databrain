@@ -12,11 +12,11 @@ workspace = true
 [dependencies]
 async-trait = "0.1.92"
 bytes = "1.12.1"
-databrain-auth = { version = "0.1.0", path = "../auth" }
-databrain-connector-core = { version = "0.1.0", path = "../connector-core" }
-databrain-query-engine = { version = "0.1.0", path = "../query-engine" }
-databrain-result-store = { version = "0.1.0", path = "../result-store" }
-databrain-workspace = { version = "0.1.0", path = "../workspace" }
+databrain-auth = { version = "0.1.1", path = "../auth" }
+databrain-connector-core = { version = "0.1.1", path = "../connector-core" }
+databrain-query-engine = { version = "0.1.1", path = "../query-engine" }
+databrain-result-store = { version = "0.1.1", path = "../result-store" }
+databrain-workspace = { version = "0.1.1", path = "../workspace" }
 futures = "0.3.34"
 parking_lot = "0.12.5"
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "json", "stream", "http2", "charset"] }

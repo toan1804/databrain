@@ -24,22 +24,22 @@ path = "src/bin/databrain-mcp.rs"
 
 [dependencies]
 async-trait = "0.1.92"
-databrain-ai = { version = "0.1.0", path = "../ai" }
-databrain-auth = { version = "0.1.0", path = "../auth" }
-databrain-connector-cloud = { version = "0.1.0", path = "../connectors/cloud", default-features = false, optional = true }
-databrain-connector-core = { version = "0.1.0", path = "../connector-core" }
-databrain-lineage = { version = "0.1.0", path = "../lineage" }
+databrain-ai = { version = "0.1.1", path = "../ai" }
+databrain-auth = { version = "0.1.1", path = "../auth" }
+databrain-connector-cloud = { version = "0.1.1", path = "../connectors/cloud", default-features = false, optional = true }
+databrain-connector-core = { version = "0.1.1", path = "../connector-core" }
+databrain-lineage = { version = "0.1.1", path = "../lineage" }
 base64 = "0.23.1"
-databrain-connector-duckdb = { version = "0.1.0", path = "../connectors/duckdb", optional = true }
-databrain-connector-mssql = { version = "0.1.0", path = "../connectors/mssql", optional = true }
-databrain-connector-mysql = { version = "0.1.0", path = "../connectors/mysql", optional = true }
-databrain-connector-oracle = { version = "0.1.0", path = "../connectors/oracle", optional = true }
-databrain-connector-postgres = { version = "0.1.0", path = "../connectors/postgres", optional = true }
-databrain-connector-sqlite = { version = "0.1.0", path = "../connectors/sqlite", optional = true }
-databrain-export = { version = "0.1.0", path = "../export" }
-databrain-query-engine = { version = "0.1.0", path = "../query-engine" }
-databrain-result-store = { version = "0.1.0", path = "../result-store" }
-databrain-workspace = { version = "0.1.0", path = "../workspace" }
+databrain-connector-duckdb = { version = "0.1.1", path = "../connectors/duckdb", optional = true }
+databrain-connector-mssql = { version = "0.1.1", path = "../connectors/mssql", optional = true }
+databrain-connector-mysql = { version = "0.1.1", path = "../connectors/mysql", optional = true }
+databrain-connector-oracle = { version = "0.1.1", path = "../connectors/oracle", optional = true }
+databrain-connector-postgres = { version = "0.1.1", path = "../connectors/postgres", optional = true }
+databrain-connector-sqlite = { version = "0.1.1", path = "../connectors/sqlite", optional = true }
+databrain-export = { version = "0.1.1", path = "../export" }
+databrain-query-engine = { version = "0.1.1", path = "../query-engine" }
+databrain-result-store = { version = "0.1.1", path = "../result-store" }
+databrain-workspace = { version = "0.1.1", path = "../workspace" }
 dirs = "7.0.0"
 parking_lot = "0.12.5"
 secrecy = "0.10.3"
