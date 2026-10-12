@@ -200,6 +200,8 @@ export const api = {
   exportFullResult: (resultId: string, options: ExportOptions, path: string, exportId: string) =>
     call<number>("export_full_result", { resultId, options, path, exportId }),
   cancelExport: (exportId: string) => call<boolean>("cancel_export", { exportId }),
+  /** Show the file a finished full export wrote in Finder/Explorer. */
+  revealExportFile: (exportId: string) => call<void>("reveal_export_file", { exportId }),
   exportResult: (resultId: string, view: ViewSpec, options: ExportOptions, path: string) =>
     call<number>("export_result", { resultId, view, options, path }),
   copyRows: (
@@ -340,6 +342,13 @@ export function onAuthEvent(handler: (e: AuthEvent) => void): Promise<UnlistenFn
 export type OracleAgentEvent = { type: "progress"; done: number; total: number | null } | { type: "finished"; ok: boolean };
 export function onOracleAgent(handler: (e: OracleAgentEvent) => void): Promise<UnlistenFn> {
   return listen<OracleAgentEvent>("oracle-agent", (e) => handler(e.payload));
+}
+
+/** Progress of a full export (query run again straight to a file). */
+export type ExportPhase = "connecting" | "running" | "downloading" | "writing" | "finishing";
+export type ExportProgressEvent = { export_id: string; phase: ExportPhase; rows: number; bytes: number };
+export function onExportProgress(handler: (e: ExportProgressEvent) => void): Promise<UnlistenFn> {
+  return listen<ExportProgressEvent>("export-progress", (e) => handler(e.payload));
 }
 
 export function onOracleInstall(handler: (e: OracleInstallProgress) => void): Promise<UnlistenFn> {

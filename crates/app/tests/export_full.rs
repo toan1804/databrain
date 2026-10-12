@@ -19,6 +19,17 @@ impl databrain_app::ai_api::UiBridge for NoUi {
         Ok(())
     }
 }
+/// Records UI events.
+#[derive(Default)]
+struct Ui(parking_lot::Mutex<Vec<(String, serde_json::Value)>>);
+impl databrain_app::ai_api::UiBridge for Ui {
+    fn emit(&self, ch: &str, v: serde_json::Value) {
+        self.0.lock().push((ch.to_string(), v));
+    }
+    fn open_url(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 async fn run(st: &AppState, conn: &str, sql: &str, limit: Option<usize>) -> databrain_query_engine::StatementOutcomeView {
     let out = st
@@ -56,4 +67,26 @@ async fn exports_all_rows_past_the_row_limit() {
         let e = api::export_full_result(&st, &res.id, ExportOptions::new(ExportFormat::Csv), dir.path().join("x.csv").to_string_lossy().into_owned(), "x2").await.unwrap_err();
         assert!(e.message.contains("Only queries that read data"), "{}", e.message);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reports_progress_and_remembers_the_file() {
+    let ui = Arc::new(Ui::default());
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), ui.clone());
+    let duck = st.engine.results_connection().unwrap().id;
+    let r = run(&st, &duck, "select i from range(50000) t(i)", Some(10)).await;
+    let info = r.result.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.csv");
+    let n = api::export_full_result(&st, &info.id, ExportOptions::new(ExportFormat::Csv), path.to_string_lossy().into_owned(), "p1").await.unwrap();
+    assert_eq!(n, 50000);
+    let events: Vec<serde_json::Value> = ui.0.lock().iter().filter(|(c, _)| c == api::EXPORT_EVENT).map(|(_, v)| v.clone()).collect();
+    assert!(events.iter().all(|e| e["export_id"] == "p1"));
+    let phases: Vec<&str> = events.iter().filter_map(|e| e["phase"].as_str()).collect();
+    assert_eq!(phases.first(), Some(&"connecting"));
+    assert!(phases.contains(&"running") && phases.contains(&"writing"), "{phases:?}");
+    assert_eq!(phases.last(), Some(&"finishing"));
+    assert_eq!(events.last().unwrap()["rows"], 50000);
+    assert_eq!(st.engine.exported_file("p1").as_deref(), Some(path.as_path()));
+    assert!(st.engine.exported_file("nope").is_none());
 }

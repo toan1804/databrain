@@ -177,6 +177,33 @@ pub trait EventSink: Send + Sync {
     fn emit(&self, event: JobEvent);
 }
 
+/// Stage of a full export ([`QueryEngine::export_query`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportPhase {
+    /// Opening a session of its own.
+    Connecting,
+    /// The query runs; no rows yet.
+    Running,
+    /// The server finished; the result is downloaded from cloud storage.
+    Downloading,
+    /// Rows are being written to the file.
+    Writing,
+    /// All rows are in; the file is being completed (Parquet/XLSX footer).
+    Finishing,
+}
+
+/// Progress of a full export: rows written so far and the file's size.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ExportProgress {
+    pub phase: ExportPhase,
+    pub rows: u64,
+    pub bytes: u64,
+}
+
+/// Minimum time between two "rows written" reports of a full export.
+pub const EXPORT_PROGRESS_EVERY: Duration = Duration::from_millis(250);
+
 /// Fans events out to a primary sink (the UI) and in-process subscribers
 /// (the AI agent and MCP server wait for their jobs through this).
 pub struct EventHub {
@@ -347,6 +374,8 @@ pub struct QueryEngine {
     tests: Mutex<HashMap<String, CancellationToken>>,
     /// Running full exports (query re-run straight to a file), by id.
     exports: Mutex<HashMap<String, CancellationToken>>,
+    /// Files written by finished full exports, by id.
+    exported: Mutex<HashMap<String, std::path::PathBuf>>,
     outputs: Arc<OutputRegistry>,
 }
 
@@ -370,6 +399,7 @@ impl QueryEngine {
             jobs: Mutex::new(HashMap::new()),
             tests: Mutex::new(HashMap::new()),
             exports: Mutex::new(HashMap::new()),
+            exported: Mutex::new(HashMap::new()),
             outputs: OutputRegistry::new(results.clone(), workspace.clone()),
             results,
         })
@@ -1122,6 +1152,9 @@ impl QueryEngine {
     /// row straight into `path` (nothing is kept in memory, except for XLSX).
     /// Runs on its own session; written to a temp file, renamed when done.
     /// Cancel with [`QueryEngine::cancel_export`]. Returns rows written.
+    ///
+    /// `progress` is called when the phase changes and, while rows are
+    /// written, at most every [`EXPORT_PROGRESS_EVERY`].
     pub async fn export_query(
         &self,
         export_id: &str,
@@ -1129,6 +1162,7 @@ impl QueryEngine {
         sql: &str,
         path: &std::path::Path,
         opts: databrain_export::ExportOptions,
+        progress: &(dyn Fn(ExportProgress) + Send + Sync),
     ) -> Result<u64> {
         let profile = self.workspace.get_connection(connection_id)?;
         let kind = profile.config.kind;
@@ -1143,12 +1177,13 @@ impl QueryEngine {
         self.exports.lock().insert(export_id.to_string(), cancel.clone());
         let tab = format!("__export__:{export_id}");
         let tmp = path.with_extension(format!("{}.partial", path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")));
-        let out = self.export_stream(connection_id, &tab, sql, &tmp, opts, &cancel).await;
+        let out = self.export_stream(connection_id, &tab, sql, &tmp, opts, &cancel, progress).await;
         self.exports.lock().remove(export_id);
         self.drop_session(connection_id, &tab);
         match out {
             Ok(rows) => {
                 std::fs::rename(&tmp, path).map_err(|e| EngineError::new("internal", format!("{}: {e}", path.display())))?;
+                self.exported.lock().insert(export_id.to_string(), path.to_path_buf());
                 Ok(rows)
             }
             Err(e) => {
@@ -1158,14 +1193,33 @@ impl QueryEngine {
         }
     }
 
-    async fn export_stream(&self, connection_id: &str, tab: &str, sql: &str, tmp: &std::path::Path, opts: databrain_export::ExportOptions, cancel: &CancellationToken) -> Result<u64> {
+    #[allow(clippy::too_many_arguments)]
+    async fn export_stream(
+        &self,
+        connection_id: &str,
+        tab: &str,
+        sql: &str,
+        tmp: &std::path::Path,
+        opts: databrain_export::ExportOptions,
+        cancel: &CancellationToken,
+        progress: &(dyn Fn(ExportProgress) + Send + Sync),
+    ) -> Result<u64> {
+        let report = |phase: ExportPhase, rows: u64| {
+            let bytes = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
+            progress(ExportProgress { phase, rows, bytes });
+        };
+        report(ExportPhase::Connecting, 0);
         let session = tokio::select! {
             s = self.session(connection_id, tab) => s?,
             _ = cancel.cancelled() => return Err(ConnectorError::cancelled().into()),
         };
+        report(ExportPhase::Running, 0);
         let mut stream = session.execute(sql, ExecOptions { batch_size: 10_000, cancel: cancel.clone(), max_rows: None }).await?;
         let mut writer: Option<databrain_export::FileWriter> = None;
         let fail = |e: databrain_export::ExportError| EngineError::new("invalid", e.to_string());
+        let mut rows = 0u64;
+        let mut phase = ExportPhase::Running;
+        let mut last = Instant::now();
         loop {
             let ev = tokio::select! {
                 ev = stream.next() => ev,
@@ -1177,12 +1231,25 @@ impl QueryEngine {
                 Some(Ok(StreamEvent::Batch(b))) => {
                     if let Some(w) = writer.as_mut() {
                         w.write(&b).map_err(fail)?;
+                        rows += b.num_rows() as u64;
+                        if phase != ExportPhase::Writing || last.elapsed() >= EXPORT_PROGRESS_EVERY {
+                            phase = ExportPhase::Writing;
+                            last = Instant::now();
+                            report(phase, rows);
+                        }
                     }
                 }
-                Some(Ok(StreamEvent::Notice(_) | StreamEvent::Downloading(_))) => {}
+                Some(Ok(StreamEvent::Downloading(_))) => {
+                    phase = ExportPhase::Downloading;
+                    report(phase, rows);
+                }
+                Some(Ok(StreamEvent::Notice(_))) => {}
                 Some(Ok(StreamEvent::Done(_))) => {
                     return match writer {
-                        Some(w) => w.finish().map_err(fail),
+                        Some(w) => {
+                            report(ExportPhase::Finishing, rows);
+                            w.finish().map_err(fail)
+                        }
                         None => Err(EngineError::new("invalid", "The query returned no rows to export")),
                     };
                 }
@@ -1193,6 +1260,11 @@ impl QueryEngine {
 
     pub fn cancel_export(&self, export_id: &str) -> bool {
         self.exports.lock().get(export_id).map(|t| t.cancel()).is_some()
+    }
+
+    /// File written by a finished full export (to show it in Finder/Explorer).
+    pub fn exported_file(&self, export_id: &str) -> Option<std::path::PathBuf> {
+        self.exported.lock().get(export_id).cloned()
     }
 
     /// Close the database sessions of a run key (keeps its outputs).

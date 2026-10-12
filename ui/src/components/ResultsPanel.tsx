@@ -22,9 +22,12 @@ import {
   X,
   Lightbulb,
   ChevronRight,
+  Square,
 } from "lucide-react";
 import { EditorView } from "@codemirror/view";
 import { useAi } from "../aiStore";
+import { useExports } from "../exportsStore";
+import { ExportCard } from "./ExportsTray";
 import { editorBridge } from "../editorBridge";
 import { ChartView } from "./ChartView";
 import { OutputChip } from "./OutputChip";
@@ -40,7 +43,6 @@ import {
   formatCount,
   formatDuration,
   sqlPreview,
-  uid,
   upsertFilter,
 } from "../lib/util";
 import { useStore, type StatementRun, type TabRun } from "../store";
@@ -860,14 +862,30 @@ function ExportDialog({
   const [header, setHeader] = useState(true);
   const [scope, setScope] = useState<"view" | "fetched" | "all">("view");
   const useView = scope === "view";
-  const exportId = useRef<string | null>(null);
-  const [started, setStarted] = useState<number | null>(null);
+  // A full export runs in the background (exports store); the dialog shows it
+  // until it ends or the user sends it to the background.
+  const [bgId, setBgId] = useState<string | null>(null);
+  const bg = useExports((s) => (bgId ? s.items.find((x) => x.id === bgId) : undefined));
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
-    if (started === null) return;
-    const t = setInterval(() => setNow(Date.now()), 500);
-    return () => clearInterval(t);
-  }, [started]);
+    if (!bgId) return;
+    useExports.getState().setInDialog(bgId);
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => {
+      clearInterval(t);
+      useExports.getState().setInDialog(null);
+    };
+  }, [bgId]);
+  // Finished while the dialog is open: say so and close; stopped: close.
+  const ended = useRef(false);
+  useEffect(() => {
+    if (!bgId || ended.current) return;
+    if (!bg || bg.status === "done") {
+      ended.current = true;
+      if (bg) toast(`Exported ${formatCount(bg.rows)} rows to ${bg.fileName}`, "success");
+      onClose();
+    }
+  }, [bgId, bg, onClose, toast]);
   const [table, setTable] = useState("my_table");
   const [busy, setBusy] = useState(false);
   const fmt = FORMATS.find((f) => f.value === format)!;
@@ -880,38 +898,80 @@ function ExportDialog({
       filters: [{ name: fmt.label, extensions: [fmt.ext] }],
     });
     if (typeof path !== "string") return;
-    setBusy(true);
     const options = { format, header, table_name: table || "my_table", dialect: (dialect as never) ?? null };
+    if (scope === "all") {
+      setBgId(await useExports.getState().start({ resultId: info.id, options, path, source: defaultName }));
+      return;
+    }
+    setBusy(true);
     try {
-      let n: number;
-      if (scope === "all") {
-        exportId.current = uid();
-        setStarted(Date.now());
-        n = await api.exportFullResult(info.id, options, path, exportId.current);
-      } else n = await api.exportResult(info.id, useView ? view : emptyView(), options, path);
+      const n = await api.exportResult(info.id, useView ? view : emptyView(), options, path);
       toast(`Exported ${formatCount(n)} rows to ${path.split(/[\\/]/).pop()}`, "success");
       onClose();
     } catch (e) {
-      const err = toError(e);
-      toast(err.kind === "cancelled" ? "Export cancelled" : err.message, err.kind === "cancelled" ? "info" : "error");
+      toast(toError(e).message, "error");
     } finally {
-      exportId.current = null;
-      setStarted(null);
       setBusy(false);
     }
   };
-  const cancelExport = () => exportId.current && void api.cancelExport(exportId.current);
+  const running = bg?.status === "running";
+  const failed = bg?.status === "failed";
+  // Closing the dialog keeps a running export going (shown in the tray).
+  const close = () => {
+    if (failed) useExports.getState().dismiss(bg.id);
+    onClose();
+  };
+
+  if (bg) {
+    return (
+      <Modal
+        title="Export results"
+        onClose={close}
+        width={440}
+        footer={
+          running ? (
+            <>
+              <button className="btn-ghost mr-auto" onClick={() => useExports.getState().cancel(bg.id)} disabled={bg.stopping}>
+                <Square size={12} /> Stop
+              </button>
+              <button className="btn-primary" onClick={onClose} title="Keep exporting while you work; progress shows at the bottom right">
+                Run in background
+              </button>
+            </>
+          ) : (
+            <>
+              <button className="btn-ghost" onClick={() => (setBgId(null), useExports.getState().dismiss(bg.id))}>
+                Back
+              </button>
+              <button className="btn-primary" onClick={close}>
+                Close
+              </button>
+            </>
+          )
+        }
+      >
+        <div className="space-y-3">
+          <ExportCard x={bg} now={now} bare />
+          {running && (
+            <p className="text-[11.5px] text-muted">
+              The query runs again on its own session and every row goes straight to the file. You can keep working: choose "Run in background" and the
+              progress stays at the bottom right, with Stop and Show file.
+            </p>
+          )}
+        </div>
+      </Modal>
+    );
+  }
 
   return (
     <Modal
       title="Export results"
-      onClose={() => (busy && scope === "all" ? cancelExport() : onClose())}
+      onClose={onClose}
       width={440}
       footer={
         <>
-          {started !== null && <span className="mr-auto text-[12px] text-muted">Running the query and writing the file… {formatDuration(now - started)}</span>}
-          <button className="btn-ghost" onClick={() => (busy && scope === "all" ? cancelExport() : onClose())}>
-            {busy && scope === "all" ? "Stop" : "Cancel"}
+          <button className="btn-ghost" onClick={onClose}>
+            Cancel
           </button>
           <button className="btn-primary" onClick={run} disabled={busy}>
             {busy ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />} Export…

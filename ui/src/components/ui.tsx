@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import { createPortal } from "react-dom";
 import { AlertTriangle, CheckCircle2, Info, X, XCircle } from "lucide-react";
 import { useStore } from "../store";
+import { ExportsTray } from "./ExportsTray";
 
 export function Modal({
   title,
@@ -160,6 +161,7 @@ export function Toasts() {
   const dismiss = useStore((s) => s.dismissToast);
   return (
     <div className="pointer-events-none fixed bottom-4 right-4 z-[60] flex w-[360px] flex-col gap-2" aria-live="polite">
+      <ExportsTray />
       {toasts.map((t) => (
         <div
           key={t.id}

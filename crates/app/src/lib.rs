@@ -678,6 +678,18 @@ async fn cancel_export(state: State<'_, AppState>, export_id: String) -> R<bool>
     Ok(state.engine.cancel_export(&export_id))
 }
 
+/// Show the file a finished full export wrote in Finder/Explorer. Only files
+/// written by an export of this session are revealed (not arbitrary paths).
+#[tauri::command]
+async fn reveal_export_file(app: AppHandle, state: State<'_, AppState>, export_id: String) -> R<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let file = state.engine.exported_file(&export_id).ok_or_else(|| EngineError::new("not_found", "This export hasn't written a file"))?;
+    if !file.exists() {
+        return Err(EngineError::new("not_found", format!("{} no longer exists", file.display())));
+    }
+    app.opener().reveal_item_in_dir(&file).map_err(|e| EngineError::new("internal", e.to_string()))
+}
+
 #[tauri::command]
 async fn copy_rows(
     state: State<'_, AppState>,
@@ -874,6 +886,7 @@ pub fn run() {
             export_result,
             export_full_result,
             cancel_export,
+            reveal_export_file,
             copy_rows,
             release_result,
             list_saved_queries,

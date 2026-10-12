@@ -1042,15 +1042,26 @@ pub async fn export_result(
     .await
 }
 
+/// UI event channel for the progress of full exports (`{export_id, phase, rows, bytes}`).
+pub const EXPORT_EVENT: &str = "export-progress";
+
 /// Run the query that produced a result again, without the row limit, and
 /// write all its rows to `path` (grid filters and sorting don't apply).
+/// Progress goes to the UI on [`EXPORT_EVENT`].
 pub async fn export_full_result(state: &AppState, result_id: &str, options: ExportOptions, path: String, export_id: &str) -> Result<u64> {
     let path = PathBuf::from(path);
     if !path.is_absolute() {
         return Err(invalid("Export path must be absolute"));
     }
     let o = state.engine.outputs().by_result(result_id).ok_or_else(|| invalid("The query of this result is no longer known; run it again"))?;
-    state.engine.export_query(export_id, &o.connection_id, &o.sql, &path, options).await
+    let ui = state.ui.clone();
+    let id = export_id.to_string();
+    let progress = move |p: databrain_query_engine::ExportProgress| {
+        let mut v = serde_json::to_value(p).unwrap_or_default();
+        v["export_id"] = serde_json::Value::String(id.clone());
+        ui.emit(EXPORT_EVENT, v);
+    };
+    state.engine.export_query(export_id, &o.connection_id, &o.sql, &path, options, &progress).await
 }
 
 fn write_export(

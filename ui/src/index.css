@@ -378,6 +378,26 @@ textarea,
   overflow: auto;
 }
 
+/* Progress of unknown length (full exports): a segment sweeping across. */
+@keyframes progress-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+.progress-indeterminate {
+  animation: progress-sweep 1.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .progress-indeterminate {
+    animation: none;
+    width: 100%;
+    opacity: 0.6;
+  }
+}
+
 /* `:name` parameters in the SQL editor */
 .cm-param {
   color: var(--accent);
