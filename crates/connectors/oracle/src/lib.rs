@@ -11,6 +11,7 @@
 
 pub mod agent;
 pub mod client;
+mod ddl;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -564,6 +565,127 @@ impl OracleSession {
         }
         Ok(out.into_iter().map(|(t, _, f)| (t, f)).collect())
     }
+
+    /// The object's real kind (a materialized view is also a TABLE).
+    async fn object_kind(&self, owner: &str, name: &str) -> Result<Option<ObjectKind>> {
+        let rows = self.query_named(ddl::OBJECT_TYPE_SQL, binds(owner, name)).await?;
+        Ok(rows.first().and_then(|r| r.first().cloned().flatten()).map(|t| kind_of(&t)))
+    }
+
+    /// A dictionary query for one object; `fallback` (older Oracle) when the
+    /// first fails (unknown column/view). Optional parts pass `None` there
+    /// and get no rows instead of an error.
+    async fn dict(&self, sql: &'static str, fallback: Option<&'static str>, owner: &str, name: &str) -> Result<ddl::Rows> {
+        match self.query_named(sql, binds(owner, name)).await {
+            Ok(r) => Ok(r),
+            Err(e) => match fallback {
+                Some(f) => self.query_named(f, binds(owner, name)).await.map_err(|_| e),
+                None => Err(e),
+            },
+        }
+    }
+
+    /// Optional part of the DDL: no rows when the view isn't there or not readable.
+    async fn dict_opt(&self, sql: &'static str, fallback: Option<&'static str>, owner: &str, name: &str) -> ddl::Rows {
+        self.dict(sql, fallback, owner, name).await.unwrap_or_default()
+    }
+
+    async fn dictionary_ddl(&self, owner: &str, name: &str, kind: ObjectKind) -> Result<Option<String>> {
+        Ok(match kind {
+            ObjectKind::View => {
+                let v = self.dict(ddl::VIEW_SQL, None, owner, name).await?;
+                let cols = self.dict_opt(ddl::VIEW_COLUMNS_SQL, None, owner, name).await;
+                ddl::view_ddl(owner, name, &v, &cols)
+            }
+            ObjectKind::MaterializedView => {
+                let mv = self.dict(ddl::MVIEW_SQL, Some(ddl::MVIEW_SQL_NO_COMMENTS), owner, name).await?;
+                let idx = self.dict_opt(ddl::INDEXES_SQL, None, owner, name).await;
+                ddl::mview_ddl(owner, name, &mv, &idx)
+            }
+            ObjectKind::Procedure | ObjectKind::Function | ObjectKind::Package | ObjectKind::Other => {
+                let (ty, body_ty) = match kind {
+                    ObjectKind::Procedure => ("PROCEDURE", None),
+                    ObjectKind::Function => ("FUNCTION", None),
+                    ObjectKind::Package => ("PACKAGE", Some("PACKAGE BODY")),
+                    _ => ("TYPE", Some("TYPE BODY")),
+                };
+                let src = |t: &'static str| {
+                    let mut b = binds(owner, name);
+                    b.push(("t", Some(t.to_string())));
+                    self.query_named(ddl::SOURCE_SQL, b)
+                };
+                let spec = ddl::source_ddl(&src(ty).await?);
+                if let Some(bt) = body_ty {
+                    // The body needs EXECUTE plus ownership or CREATE ANY: spec alone otherwise.
+                    let body = ddl::source_ddl(&src(bt).await.unwrap_or_default());
+                    spec.map(|s| match body {
+                        Some(b) => format!("{s}\n\n{b}"),
+                        None => s,
+                    })
+                } else {
+                    spec
+                }
+            }
+            ObjectKind::Sequence => ddl::sequence_ddl(owner, name, &self.dict(ddl::SEQUENCE_SQL, None, owner, name).await?),
+            _ => {
+                let parts = ddl::TableParts {
+                    columns: self.dict(ddl::COLUMNS_SQL, Some(ddl::COLUMNS_SQL_11G), owner, name).await?,
+                    table: self.dict_opt(ddl::TABLE_SQL, None, owner, name).await,
+                    constraints: self.dict_opt(ddl::CONSTRAINTS_SQL, None, owner, name).await,
+                    indexes: self.dict_opt(ddl::INDEXES_SQL, None, owner, name).await,
+                    col_comments: self.dict_opt(ddl::COL_COMMENTS_SQL, None, owner, name).await,
+                    part: self.dict_opt(ddl::PART_SQL, Some(ddl::PART_SQL_10G), owner, name).await,
+                    part_keys: vec![],
+                    partitions: vec![],
+                };
+                let partitioned = !parts.part.is_empty();
+                let parts = if partitioned {
+                    ddl::TableParts {
+                        part_keys: self.dict_opt(ddl::PART_KEYS_SQL, None, owner, name).await,
+                        partitions: self.dict_opt(ddl::PARTITIONS_SQL, None, owner, name).await,
+                        ..parts
+                    }
+                } else {
+                    parts
+                };
+                ddl::table_ddl(owner, name, &parts)
+            }
+        })
+    }
+
+    /// DBMS_METADATA.GET_DDL (own objects, or with SELECT_CATALOG_ROLE).
+    async fn metadata_ddl(&self, owner: &str, name: &str, kind: ObjectKind) -> Option<String> {
+        let ty = match kind {
+            ObjectKind::View => "VIEW",
+            ObjectKind::MaterializedView => "MATERIALIZED_VIEW",
+            ObjectKind::Procedure => "PROCEDURE",
+            ObjectKind::Function => "FUNCTION",
+            ObjectKind::Package => "PACKAGE",
+            ObjectKind::Sequence => "SEQUENCE",
+            _ => "TABLE",
+        };
+        let mut b = binds(owner, name);
+        b.push(("t", Some(ty.to_string())));
+        let rows = self.query_named("select dbms_metadata.get_ddl(:t, :n, :o) from dual", b).await.ok()?;
+        rows.into_iter().next().and_then(|r| r.into_iter().next().flatten()).map(|d| d.trim().to_string()).filter(|d| !d.is_empty())
+    }
+}
+
+fn binds(owner: &str, name: &str) -> Vec<(&'static str, Option<String>)> {
+    vec![("o", Some(owner.to_string())), ("n", Some(name.to_string()))]
+}
+
+fn kind_of(object_type: &str) -> ObjectKind {
+    match object_type {
+        "VIEW" => ObjectKind::View,
+        "MATERIALIZED VIEW" => ObjectKind::MaterializedView,
+        "PROCEDURE" => ObjectKind::Procedure,
+        "FUNCTION" => ObjectKind::Function,
+        "PACKAGE" => ObjectKind::Package,
+        "SEQUENCE" => ObjectKind::Sequence,
+        "TYPE" => ObjectKind::Other,
+        _ => ObjectKind::Table,
+    }
 }
 
 #[async_trait]
@@ -736,67 +858,52 @@ impl Session for OracleSession {
         Ok(l)
     }
 
-    /// DBMS_METADATA for every kind (packages: spec and body).
-    async fn object_ddl(&self, schema: &str, name: &str, _kind: ObjectKind) -> Result<Option<String>> {
-        Ok(self.describe(schema, name).await?.ddl)
+    /// Built from the ALL_* views (see [`ddl`]): works for every object the
+    /// user can see, with a few small queries. DBMS_METADATA only when
+    /// that gives nothing (e.g. a wrapped or invisible source).
+    async fn object_ddl(&self, schema: &str, name: &str, kind: ObjectKind) -> Result<Option<String>> {
+        let kind = self.object_kind(schema, name).await.unwrap_or(None).unwrap_or(kind);
+        let built = self.dictionary_ddl(schema, name, kind).await;
+        match built {
+            Ok(Some(d)) => Ok(Some(d)),
+            other => match self.metadata_ddl(schema, name, kind).await {
+                Some(d) => Ok(Some(d)),
+                None => match other {
+                    Err(e) => Err(e),
+                    Ok(_) => Err(ConnectorError::query(format!(
+                        "no definition of {schema}.{name} is visible to this user (it may not exist, or its source needs more privileges)"
+                    ))),
+                },
+            },
+        }
     }
 
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
-        let object = self
-            .list_objects(schema)
-            .await?
-            .into_iter()
-            .filter(|o| o.name == name)
-            .min_by_key(|o| !o.kind.is_relation())
-            .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
+        let found = self
+            .query_named(
+                "select o.object_type, c.comments, to_char(t.num_rows) from all_objects o \
+                 left join all_tab_comments c on c.owner = o.owner and c.table_name = o.object_name \
+                 left join all_tables t on t.owner = o.owner and t.table_name = o.object_name \
+                 where o.owner = :o and o.object_name = :n \
+                   and o.object_type in ('TABLE','VIEW','MATERIALIZED VIEW','PROCEDURE','FUNCTION','PACKAGE','SEQUENCE') \
+                 order by decode(o.object_type, 'MATERIALIZED VIEW', 0, 'TABLE', 1, 'VIEW', 2, 3)",
+                vec![("o", Some(schema.to_string())), ("n", Some(name.to_string()))],
+            )
+            .await?;
+        let r = found.first().ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
+        let g = |i: usize| r.get(i).cloned().flatten();
+        let kind = g(0).as_deref().map(kind_of).unwrap_or(ObjectKind::Table);
+        let object = DbObject { schema: schema.to_string(), name: name.to_string(), kind, comment: g(1), row_estimate: g(2).and_then(|n| n.parse().ok()) };
         let columns: Vec<ColumnInfo> = self.columns(schema, Some(name)).await?.into_iter().map(|(_, c)| c).collect();
-        let obj_type = match object.kind {
-            ObjectKind::View => "VIEW",
-            ObjectKind::MaterializedView => "MATERIALIZED_VIEW",
-            ObjectKind::Procedure => "PROCEDURE",
-            ObjectKind::Function => "FUNCTION",
-            ObjectKind::Package => "PACKAGE",
-            ObjectKind::Sequence => "SEQUENCE",
-            _ => "TABLE",
-        };
-        let (s, n) = (schema.to_string(), name.to_string());
-        let ddl = if let Backend::Thin(a) = &self.backend {
-            a.text("select dbms_metadata.get_ddl(:t, :n, :s) from dual", &[("t", Some(obj_type.to_string())), ("n", Some(n)), ("s", Some(s))])
-                .await
-                .ok()
-                .and_then(|r| r.into_iter().next().and_then(|r| r.into_iter().next().flatten()))
-                .map(|d| d.trim().to_string())
-        } else {
-            self.with_conn(move |c| {
-                let r = c.query_row_as::<String>(
-                    "select dbms_metadata.get_ddl(:1, :2, :3) from dual",
-                    &[&obj_type, &n, &s],
-                );
-                Ok(r.ok().map(|d| d.trim().to_string()))
+        let ddl = self.dictionary_ddl(schema, name, kind).await.ok().flatten().or_else(|| {
+            (kind == ObjectKind::Table).then(|| {
+                let cols: Vec<String> = columns
+                    .iter()
+                    .map(|c| format!("    {} {}{}", quote_ident(ConnectorKind::Oracle, &c.name), c.data_type, if c.nullable { "" } else { " NOT NULL" }))
+                    .collect();
+                format!("CREATE TABLE {}.{} (\n{}\n);", quote_ident(ConnectorKind::Oracle, schema), quote_ident(ConnectorKind::Oracle, name), cols.join(",\n"))
             })
-            .await?
-        };
-        let ddl = ddl.or_else(|| {
-                (object.kind == ObjectKind::Table).then(|| {
-                    let cols: Vec<String> = columns
-                        .iter()
-                        .map(|c| {
-                            format!(
-                                "    {} {}{}",
-                                quote_ident(ConnectorKind::Oracle, &c.name),
-                                c.data_type,
-                                if c.nullable { "" } else { " NOT NULL" }
-                            )
-                        })
-                        .collect();
-                    format!(
-                        "CREATE TABLE {}.{} (\n{}\n);",
-                        quote_ident(ConnectorKind::Oracle, schema),
-                        quote_ident(ConnectorKind::Oracle, name),
-                        cols.join(",\n")
-                    )
-                })
-            });
+        });
         let foreign_keys = self.foreign_keys(schema, Some(name)).await?.into_iter().map(|(_, f)| f).collect();
         Ok(ObjectDetail { object, columns, ddl, foreign_keys })
     }
@@ -1150,7 +1257,8 @@ mod tests {
         run(&s, "create or replace package body db_pkg_sales as function net(x number) return number is begin return x; end; \
                  function net(x number, y number) return number is begin return x - y; end; procedure refresh is begin null; end; end;").await;
         let p = s.object_ddl(&me, "DB_PKG_SALES", ObjectKind::Package).await.unwrap().unwrap();
-        assert!(p.contains("PACKAGE \"") && p.contains("PACKAGE BODY"), "{driver}: {p}");
+        let up = p.to_uppercase();
+        assert!(up.contains("CREATE OR REPLACE PACKAGE DB_PKG_SALES") && up.contains("CREATE OR REPLACE PACKAGE BODY DB_PKG_SALES"), "{driver}: {p}");
         assert!(s.object_ddl(&me, "DB_FN_TOTAL", ObjectKind::Function).await.unwrap().unwrap().contains("FUNCTION"));
         assert!(s.object_ddl(&me, "DB_PROC_LOG", ObjectKind::Procedure).await.unwrap().unwrap().contains("PROCEDURE"));
         let sys = s.package_members("SYS", "DBMS_OUTPUT").await.unwrap();
@@ -1228,6 +1336,16 @@ mod tests {
         assert!(t.columns[0].is_primary_key && t.columns[1].data_type == "VARCHAR2(40)");
         let d = s.describe(&me, "KB_THIN").await.unwrap();
         assert!(d.ddl.unwrap_or_default().contains("CREATE TABLE"));
+        // Show DDL from the dictionary: constraints, indexes, comments; views.
+        run("create index kb_thin_name on kb_thin (upper(name), note desc)").await.unwrap();
+        run("create or replace view kb_thin_v as select id, name from kb_thin where id > 10").await.unwrap();
+        let t = s.object_ddl(&me, "KB_THIN", ObjectKind::Table).await.unwrap().unwrap();
+        assert!(t.contains("PRIMARY KEY (\"ID\")") && t.contains("\"NAME\" VARCHAR2(40 BYTE)"), "{driver}: {t}");
+        assert!(t.contains("CREATE INDEX") && t.contains("UPPER(\"NAME\")") && t.contains("\"NOTE\" DESC"), "{driver}: {t}");
+        assert!(t.contains("COMMENT ON TABLE") && t.contains("'thin test'"), "{driver}: {t}");
+        let v = s.object_ddl(&me, "KB_THIN_V", ObjectKind::View).await.unwrap().unwrap();
+        assert!(v.starts_with("CREATE OR REPLACE VIEW") && v.contains("where id > 10"), "{driver}: {v}");
+        run("drop view kb_thin_v").await.unwrap();
         let f0 = s.schema_fingerprints().await.unwrap().unwrap()[&me].clone();
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         run("alter table kb_thin add (extra number)").await.unwrap();
