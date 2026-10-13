@@ -89,6 +89,8 @@ export function AiPanel() {
 
 // ------------------------------------------------------------------ chat
 
+const NO_MODELS: string[] = [];
+
 const QUICK: { mode: AiMode; label: string; prompt: string; icon: React.ReactNode }[] = [
   { mode: "generate", label: "Write SQL", prompt: "", icon: <FileCode2 size={12} /> },
   { mode: "explain", label: "Explain query", prompt: "Explain what the query in my editor does.", icon: <Lightbulb size={12} /> },
@@ -112,7 +114,7 @@ function Chat() {
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
   const [text, setText] = useState("");
   const [mode, setMode] = useState<AiMode>("chat");
-  const [models, setModels] = useState<string[]>([]);
+  const models = useAi((s) => (providerId ? s.models[providerId] : undefined)) ?? NO_MODELS;
   const outputs = useStore((s) => s.outputs);
   const [mention, setMention] = useState<{ start: number; query: string; index: number } | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
@@ -140,16 +142,8 @@ function Chat() {
   }, []);
 
   useEffect(() => {
-    setModels([]);
-    if (!providerId) return;
-    let alive = true;
-    api
-      .aiListModels(providerId)
-      .then((m) => alive && setModels(m.map((x) => x.id)))
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
+    // Shared list: loaded once per provider (and kept), not per render or pick.
+    if (providerId) void useAi.getState().loadModels(providerId).catch(() => {});
   }, [providerId]);
 
   const suggestions = useMemo(() => {
@@ -414,9 +408,16 @@ function ChatItemView({ item }: { item: ChatItem }) {
       );
     case "error":
       return (
-        <div className="flex items-start gap-2 rounded-lg border border-danger/40 bg-danger/10 p-2 text-[12.5px]" role="alert">
-          <AlertCircle size={14} className="mt-px shrink-0 text-danger" />
-          <span className="break-words">{item.text}</span>
+        <div className="rounded-lg border border-danger/40 bg-danger/10 p-2 text-[12.5px]" role="alert">
+          <div className="flex items-start gap-2">
+            <AlertCircle size={14} className="mt-px shrink-0 text-danger" />
+            <span className="break-words">{item.text}</span>
+          </div>
+          {item.providerId !== undefined && (
+            <button className="btn-ghost mt-1.5 border border-line py-1 text-[12px]" onClick={() => useAi.getState().openProviderSettings(item.providerId)}>
+              <Settings2 size={12} /> Open provider settings to sign in again
+            </button>
+          )}
         </div>
       );
     case "tool":

@@ -62,6 +62,10 @@ export function SettingsDialog() {
   const open = useStore((s) => s.settingsOpen);
   const setOpen = useStore((s) => s.setSettingsOpen);
   const [section, setSection] = useState<"providers" | "appearance" | "queries" | "security" | "mcp" | "audit">("providers");
+  const focusProvider = useAi((s) => s.settingsProvider);
+  useEffect(() => {
+    if (focusProvider) setSection("providers");
+  }, [focusProvider]);
   if (!open) return null;
   const item = (id: typeof section, icon: React.ReactNode, label: string) => (
     <button
@@ -174,7 +178,14 @@ function ConnectTimeout() {
 function Providers() {
   const providers = useAi((s) => s.providers);
   const refresh = useAi((s) => s.refreshProviders);
-  const [sel, setSel] = useState<string | "new" | null>(providers[0]?.id ?? "new");
+  const focus = useAi((s) => s.settingsProvider);
+  const [sel, setSel] = useState<string | "new" | null>(focus ?? providers[0]?.id ?? "new");
+  // "Sign in again" from the AI panel: show that provider.
+  useEffect(() => {
+    if (!focus) return;
+    if (providers.some((p) => p.id === focus)) setSel(focus);
+    useAi.setState({ settingsProvider: null });
+  }, [focus, providers]);
   const current = providers.find((p) => p.id === sel) ?? null;
   return (
     <div className="flex h-full gap-3">
@@ -232,7 +243,7 @@ function ProviderForm({
   const [model, setModel] = useState(initial?.config.default_model ?? "");
   const [fastModel, setFastModel] = useState(initial?.config.fast_model ?? "");
   const [apiVersion, setApiVersion] = useState(initial?.config.api_version ?? (kind === "azure_openai" ? "2024-10-21" : ""));
-  const [models, setModels] = useState<string[]>([]);
+  const [models, setModels] = useState<string[]>(() => (initial ? (useAi.getState().models[initial.id] ?? []) : []));
   const [busy, setBusy] = useState<null | "save" | "signin" | "models" | "status">(null);
   const [kiro, setKiro] = useState<KiroStatus | null>(null);
   const isKiro = kind === "kiro";
@@ -285,6 +296,8 @@ function ProviderForm({
         auth === "api_key" && apiKey ? apiKey : null,
       );
       setApiKey("");
+      // A new key or address may list other models.
+      if (auth === "api_key" && apiKey) void useAi.getState().loadModels(rec.id, true).catch(() => {});
       await onSaved(rec.id);
       if (isKiro) await refreshKiro(rec.id);
       const ai = useAi.getState();
@@ -309,6 +322,7 @@ function ProviderForm({
     try {
       await api.aiProviderSignIn(id);
       toast(isKiro ? "Signed in to Kiro" : "Signed in to OpenRouter", "success");
+      void useAi.getState().loadModels(id, true).then(setModels).catch(() => {});
       await onSaved(id);
       if (isKiro) await refreshKiro(id);
     } catch (e) {
@@ -324,13 +338,26 @@ function ProviderForm({
     if (!initial) return;
     setBusy("models");
     try {
-      setModels((await api.aiListModels(initial.id)).map((m) => m.id));
+      setModels(await useAi.getState().loadModels(initial.id, true));
     } catch (e) {
       toast(toError(e).message, "error");
     } finally {
       setBusy(null);
     }
   };
+  // A saved provider lists its models on its own (cached; quiet when it can't, e.g. not signed in).
+  useEffect(() => {
+    if (!initial) return;
+    let alive = true;
+    void useAi
+      .getState()
+      .loadModels(initial.id)
+      .then((m) => alive && setModels(m))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [initial?.id, initial?.config.auth, initial?.has_key]);
 
   const remove = () =>
     useStore.getState().askConfirm({

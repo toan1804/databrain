@@ -9,8 +9,40 @@ vi.mock("./lib/api", () => ({
   onAuthEvent: async () => () => {},
   onAiEvent: async () => () => {},
   onKnowledgeEvent: async () => () => {},
-  api: {},
+  api: {
+    setSetting: async () => {},
+    aiListModels: async (id: string) => {
+      modelCalls.push(id);
+      return [{ id: `${id}-a` }, { id: `${id}-b` }];
+    },
+  },
 }));
+const modelCalls: string[] = [];
+
+describe("aiStore: provider settings and models", () => {
+  it("offers provider settings for sign-in and key errors only", async () => {
+    const { needsProviderSettings } = await import("./aiStore");
+    expect(needsProviderSettings({ kind: "auth", message: "Kiro: Not signed in. Use “Sign in with browser”." })).toBe(true);
+    expect(needsProviderSettings({ kind: "provider", message: "HTTP 401: invalid api key" })).toBe(true);
+    expect(needsProviderSettings({ kind: "config", message: "choose a model for \"OpenAI\"" })).toBe(true);
+    expect(needsProviderSettings({ kind: "provider", message: "rate limited, retry later" })).toBe(false);
+    expect(needsProviderSettings({ kind: "policy", message: "provider \"x\" is not allowed for this connection" })).toBe(false);
+  });
+
+  it("loads a provider's models once and shares them", async () => {
+    const { useAi } = await import("./aiStore");
+    const [a, b] = await Promise.all([useAi.getState().loadModels("p1"), useAi.getState().loadModels("p1")]);
+    expect(a).toEqual(["p1-a", "p1-b"]);
+    expect(b).toBe(a);
+    // Picking a model does not drop the list.
+    useAi.getState().setProvider("p1", "p1-b");
+    expect(useAi.getState().models.p1).toEqual(["p1-a", "p1-b"]);
+    await useAi.getState().loadModels("p1");
+    expect(modelCalls).toEqual(["p1"]);
+    await useAi.getState().loadModels("p1", true);
+    expect(modelCalls).toEqual(["p1", "p1"]);
+  });
+});
 
 describe("aiStore: chat items", () => {
   it("shows a tool waiting for approval once, as the approval card", async () => {

@@ -50,7 +50,13 @@ export type ChatItem =
       before: string;
       state: "pending" | "accepted" | "rejected";
     }
-  | { id: string; kind: "error"; text: string };
+  | {
+      id: string;
+      kind: "error";
+      text: string;
+      /** Sign-in expired or provider misconfigured: offer to open this provider's settings. */
+      providerId?: string | null;
+    };
 
 export type AiView = "chat" | "history" | "knowledge";
 
@@ -87,6 +93,13 @@ interface AiState {
   setView: (view: AiView) => void;
   refreshProviders: () => Promise<void>;
   setProvider: (id: string | null, model?: string | null) => void;
+  /** Models of each provider (shared by the AI panel and Settings, kept across restarts). */
+  models: Record<string, string[]>;
+  /** Load a provider's models (once; `force` asks again). Throws on failure. */
+  loadModels: (providerId: string, force?: boolean) => Promise<string[]>;
+  /** Provider to show when Settings opens (sign in again, fix its config). */
+  settingsProvider: string | null;
+  openProviderSettings: (providerId?: string | null) => void;
   send: (input: SendInput) => Promise<void>;
   cancel: () => Promise<void>;
   newChat: () => void;
@@ -167,6 +180,24 @@ function defaultTargetKey(): string | null {
 
 let aiInitStarted = false;
 
+/** An error the user fixes in the provider's settings (expired sign-in, bad key, missing model). */
+export function needsProviderSettings(e: { kind: string; message: string }): boolean {
+  if (e.kind === "auth") return true;
+  if (e.kind === "policy") return false;
+  return /not signed in|sign in|signed out|log ?in|expired|unauthori[sz]ed|forbidden|invalid (api )?key|\b40[13]\b|choose a model|add an ai provider/i.test(e.message);
+}
+
+const MODELS_KEY = "db.ai.models";
+function savedModels(): Record<string, string[]> {
+  try {
+    const v = JSON.parse(localStorage.getItem(MODELS_KEY) ?? "{}");
+    return v && typeof v === "object" ? v : {};
+  } catch {
+    return {};
+  }
+}
+const modelLoads = new Map<string, Promise<string[]>>();
+
 /**
  * Items to show. A tool call waiting for approval is shown once, as the
  * approval card: its own "running" card (same SQL) is hidden until it ends.
@@ -233,7 +264,7 @@ export const useAi = create<AiState>((set, get) => {
               return i;
             }),
             ...(e.type === "failed" && e.error.kind !== "cancelled"
-              ? [{ id: uid(), kind: "error" as const, text: e.error.message }]
+              ? [{ id: uid(), kind: "error" as const, text: e.error.message, providerId: needsProviderSettings(e.error) ? s.providerId : undefined }]
               : []),
           ],
         }));
@@ -304,6 +335,36 @@ export const useAi = create<AiState>((set, get) => {
     knowledgeVersion: 0,
     indexPicker: null,
     sessionsVersion: 0,
+    models: savedModels(),
+    settingsProvider: null,
+
+    loadModels: (providerId, force = false) => {
+      const have = get().models[providerId];
+      if (have?.length && !force) return Promise.resolve(have);
+      const running = modelLoads.get(providerId);
+      if (running) return running;
+      const p = api
+        .aiListModels(providerId)
+        .then((list) => {
+          const ids = [...new Set(list.map((m) => m.id))];
+          const models = { ...get().models, [providerId]: ids };
+          set({ models });
+          try {
+            localStorage.setItem(MODELS_KEY, JSON.stringify(models));
+          } catch {
+            /* storage full: kept in memory */
+          }
+          return ids;
+        })
+        .finally(() => modelLoads.delete(providerId));
+      modelLoads.set(providerId, p);
+      return p;
+    },
+
+    openProviderSettings: (providerId) => {
+      set({ settingsProvider: providerId ?? get().providerId });
+      useStore.getState().setSettingsOpen(true);
+    },
 
     init: async () => {
       // Once: a second listener (StrictMode double effect) showed every
@@ -430,7 +491,11 @@ export const useAi = create<AiState>((set, get) => {
         });
         set({ runId });
       } catch (e) {
-        set((s) => ({ running: false, items: [...s.items, { id: uid(), kind: "error", text: toError(e).message }] }));
+        const err = toError(e);
+        set((s) => ({
+          running: false,
+          items: [...s.items, { id: uid(), kind: "error", text: err.message, providerId: needsProviderSettings(err) ? s.providerId : undefined }],
+        }));
       }
     },
 
