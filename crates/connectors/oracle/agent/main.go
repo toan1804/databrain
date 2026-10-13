@@ -21,17 +21,20 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	go_ora "github.com/sijms/go-ora/v2"
@@ -74,11 +77,14 @@ type column struct {
 type writer struct {
 	mu sync.Mutex
 	w  *bufio.Writer
+	// Frames written so far (a query is only retried before its first one).
+	frames uint64
 }
 
 func (w *writer) frame(kind byte, payload []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.frames++
 	var h [5]byte
 	binary.BigEndian.PutUint32(h[:4], uint32(len(payload)))
 	h[4] = kind
@@ -140,6 +146,68 @@ type session struct {
 	conn *sql.Conn
 	tx   *sql.Tx // read-only connections run everything in a READ ONLY transaction
 	ro   bool
+	// The connect request, to reconnect after the connection is lost.
+	req *request
+}
+
+// notSent: the statement never reached the server (database/sql closes a
+// *sql.Conn for good after the driver reports a broken connection, and
+// every later call fails with ErrConnDone), so running it again is safe.
+func notSent(err error) bool {
+	return errors.Is(err, sql.ErrConnDone) || errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrTxDone)
+}
+
+// lostConn: the connection is unusable (idle timeout, killed session,
+// network drop, a cancel whose break failed).
+func lostConn(err error) bool {
+	if notSent(err) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	var oe *network.OracleError
+	if errors.As(err, &oe) {
+		switch oe.ErrCode {
+		// end-of-file on channel, not connected, connection lost, not logged on, session killed
+		case 3113, 3114, 3135, 1012, 28:
+			return true
+		}
+	}
+	var ne net.Error
+	return errors.As(err, &ne)
+}
+
+// reconnect opens a new connection with the same settings (session state
+// such as ALTER SESSION or package variables starts fresh).
+func (s *session) reconnect(ctx context.Context) error {
+	if s.req == nil {
+		return errors.New("not connected")
+	}
+	s.close()
+	s.db, s.conn, s.tx = nil, nil, nil
+	return s.connect(ctx, s.req)
+}
+
+// withReconnect runs f; when the connection turns out to be lost, it
+// reconnects, and runs f again when that is safe: the statement never
+// reached the server, or it is a catalog/text query (nothing streamed yet).
+func (s *session) withReconnect(ctx context.Context, w *writer, r *request, f func() error) error {
+	w.mu.Lock()
+	before := w.frames
+	w.mu.Unlock()
+	err := f()
+	if err == nil || ctx.Err() != nil || s.req == nil || !lostConn(err) {
+		return err
+	}
+	if rerr := s.reconnect(ctx); rerr != nil {
+		return fmt.Errorf("the connection to Oracle was lost (%v) and reconnecting failed: %w", err, rerr)
+	}
+	w.mu.Lock()
+	streamed := w.frames != before
+	w.mu.Unlock()
+	if !streamed && (notSent(err) || r.Op == "text" || r.Op == "ping") {
+		return f()
+	}
+	return fmt.Errorf("the connection to Oracle was lost while running the statement (%v); DataBrain reconnected, run it again", err)
 }
 
 // q is what statements run on: the read-only transaction or the connection.
@@ -305,7 +373,7 @@ func (s *session) connect(ctx context.Context, r *request) error {
 		return err
 	}
 	_, _ = conn.ExecContext(ctx, "alter session set nls_date_format = 'YYYY-MM-DD HH24:MI:SS'")
-	s.db, s.conn, s.ro = db, conn, r.ReadOnly
+	s.db, s.conn, s.ro, s.req = db, conn, r.ReadOnly, r
 	return nil
 }
 
@@ -647,16 +715,16 @@ func (s *session) handle(ctx context.Context, w *writer, r *request) error {
 		if s.conn == nil {
 			return errors.New("not connected")
 		}
-		if err := s.conn.PingContext(ctx); err != nil {
+		if err := s.withReconnect(ctx, w, r, func() error { return s.conn.PingContext(ctx) }); err != nil {
 			return err
 		}
 		return w.json(map[string]any{"id": r.ID, "type": "ok"})
 	case "query":
-		return s.query(ctx, w, r)
+		return s.withReconnect(ctx, w, r, func() error { return s.query(ctx, w, r) })
 	case "text":
-		return s.textQuery(ctx, w, r)
+		return s.withReconnect(ctx, w, r, func() error { return s.textQuery(ctx, w, r) })
 	case "exec":
-		return s.exec(ctx, w, r)
+		return s.withReconnect(ctx, w, r, func() error { return s.exec(ctx, w, r) })
 	}
 	return fmt.Errorf("unknown op %q", r.Op)
 }
