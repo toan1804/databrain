@@ -107,7 +107,8 @@ export function SchemaPickerDialog() {
     >
       <div className="space-y-2">
         <p className="text-[12px] text-muted">
-          Only the selected {nouns} are listed in the explorer{level.kind === "catalog" ? `, each with all of its schemas` : ""}. Queries, autocomplete and ⌘P search
+          Only the selected {nouns} are listed in the explorer{level.kind === "catalog" ? `, each with all of its schemas` : ""}, and their tables are read in the
+          background so autocomplete knows them without opening each one. Queries, autocomplete and ⌘P search
           still see everything. {nouns[0].toUpperCase() + nouns.slice(1)} created later are hidden until you add them.
         </p>
         <div className="flex items-center gap-2">

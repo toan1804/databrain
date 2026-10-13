@@ -38,6 +38,8 @@ pub struct AppState {
     pub ui: Arc<dyn crate::ai_api::UiBridge>,
     pub ai: crate::ai_api::AiState,
     pub jobs: Arc<crate::jobs::JobsState>,
+    /// Explorer cache writes, after the explorer has its answer.
+    pub meta: Arc<crate::meta_writer::MetaWriter>,
     /// Set when `secrets` is the switchable keychain/vault store.
     pub credential_store: parking_lot::Mutex<Option<(Arc<databrain_auth::SwitchableStore>, PathBuf)>>,
 }
@@ -154,6 +156,7 @@ impl AppState {
             ui,
             ai,
             jobs: Arc::new(crate::jobs::JobsState::default()),
+            meta: Arc::default(),
             credential_store: parking_lot::Mutex::new(None),
         }
     }
@@ -391,15 +394,17 @@ pub fn disconnect(state: &AppState, id: &str) {
 
 pub async fn list_schemas(state: &AppState, id: &str) -> Result<Vec<SchemaInfo>> {
     let schemas = state.engine.list_schemas(id).await?;
-    let _ = state.engine.workspace().meta_put_schemas(id, None, &schemas);
+    let (ws, id2, s2) = (state.workspace.clone(), id.to_string(), schemas.clone());
+    state.meta.push_blocking(move || drop(ws.meta_put_schemas(&id2, None, &s2)));
     Ok(schemas)
 }
 
 /// Catalogs of three-level engines (`None` for two-level ones), listed live.
 pub async fn list_catalogs(state: &AppState, id: &str) -> Result<Option<Vec<databrain_connector_core::CatalogInfo>>> {
     let cats = state.engine.list_catalogs(id).await?;
-    if let Some(c) = &cats {
-        let _ = state.engine.workspace().meta_put_catalogs(id, c);
+    if let Some(c) = cats.clone() {
+        let (ws, id2) = (state.workspace.clone(), id.to_string());
+        state.meta.push_blocking(move || drop(ws.meta_put_catalogs(&id2, &c)));
     }
     Ok(cats)
 }
@@ -407,7 +412,8 @@ pub async fn list_catalogs(state: &AppState, id: &str) -> Result<Option<Vec<data
 /// Schemas of one catalog, listed live.
 pub async fn list_catalog_schemas(state: &AppState, id: &str, catalog: &str) -> Result<Vec<SchemaInfo>> {
     let schemas = state.engine.list_catalog_schemas(id, catalog).await?;
-    let _ = state.engine.workspace().meta_put_schemas(id, Some(catalog), &schemas);
+    let (ws, id2, cat, s2) = (state.workspace.clone(), id.to_string(), catalog.to_string(), schemas.clone());
+    state.meta.push_blocking(move || drop(ws.meta_put_schemas(&id2, Some(&cat), &s2)));
     Ok(schemas)
 }
 
@@ -416,14 +422,23 @@ fn cacheable(state: &AppState, id: &str, schema: &str) -> bool {
     schema != "results.main" || state.engine.workspace().get_connection(id).map(|p| p.config.kind != ConnectorKind::Duckdb).unwrap_or(true)
 }
 
+/// The listing goes to the explorer at once; the object versions (for the
+/// next incremental refresh) are read and everything is saved afterwards.
 pub async fn list_objects(state: &AppState, id: &str, schema: &str) -> Result<Vec<DbObject>> {
     let objs = state.engine.list_objects(id, schema).await?;
     if cacheable(state, id, schema) {
-        // Versions make the next refresh incremental (best effort).
-        let versions = state.engine.object_versions(id, schema).await.ok().flatten();
-        let _ = state.engine.workspace().meta_put_listing(id, schema, &objs, versions.as_ref(), None);
+        let (engine, ws, id2, sc, o2) = (state.engine.clone(), state.workspace.clone(), id.to_string(), schema.to_string(), objs.clone());
+        state.meta.push(async move {
+            let versions = engine.object_versions(&id2, &sc).await.ok().flatten();
+            let _ = tokio::task::spawn_blocking(move || ws.meta_put_listing(&id2, &sc, &o2, versions.as_ref(), None)).await;
+        });
     }
     Ok(objs)
+}
+
+/// Wait for queued explorer cache writes (tests, and before reading the cache to refresh it).
+pub async fn flush_explorer_cache(state: &AppState) {
+    state.meta.flush().await;
 }
 
 // --------------------------------------------- explorer cache (no network)
@@ -465,7 +480,9 @@ pub fn cached_columns(state: &AppState, id: &str, schema: &str, name: &str) -> R
 }
 
 /// Forget a connection's cached explorer (it is listed again from the server).
-pub fn clear_explorer_cache(state: &AppState, id: &str) -> Result<()> {
+/// Queued after pending writes, so none of them puts old rows back.
+pub async fn clear_explorer_cache(state: &AppState, id: &str) -> Result<()> {
+    state.meta.flush().await;
     Ok(state.engine.workspace().meta_clear(id)?)
 }
 
@@ -505,6 +522,8 @@ pub async fn refresh_schema(state: &AppState, id: &str, schema: &str) -> Result<
 }
 
 async fn refresh_schema_at(state: &AppState, id: &str, schema: &str, fingerprint: Option<&str>) -> Result<SchemaRefresh> {
+    // Compare against the listings saved so far, not ones still queued.
+    state.meta.flush().await;
     let ws = state.engine.workspace();
     let full = |objects: Vec<DbObject>, n: usize| SchemaRefresh { schema: schema.to_string(), mode: RefreshMode::Full, added: n, changed: 0, removed: 0, objects };
     if !cacheable(state, id, schema) {
@@ -590,6 +609,7 @@ const RECHECK_MS: i64 = 60_000;
 /// unchanged ones are not read at all. `open` = schemas the explorer shows
 /// expanded (refreshed first; the only ones when there are no fingerprints).
 pub async fn revalidate_explorer(state: &AppState, id: &str, open: &[String], force: bool) -> Result<ExplorerRevalidation> {
+    state.meta.flush().await;
     let ws = state.engine.workspace();
     let st = ws.meta_state(id)?;
     let mut out = ExplorerRevalidation { refreshed: vec![], unchanged: 0, deferred: vec![], fingerprints: true, skipped: false };
@@ -644,8 +664,17 @@ pub async fn search_objects(state: &AppState, id: &str, query: &str, limit: Opti
         return Ok(vec![]);
     }
     let hits = state.engine.search_objects(id, query, limit.unwrap_or(100)).await?;
-    let _ = state.engine.workspace().meta_add_objects(id, &hits);
+    save_hits(state, id, &hits);
     Ok(hits)
+}
+
+/// Objects found by a search or completion: added to the cache in the background.
+fn save_hits(state: &AppState, id: &str, hits: &[DbObject]) {
+    if hits.is_empty() {
+        return;
+    }
+    let (ws, id2, h) = (state.workspace.clone(), id.to_string(), hits.to_vec());
+    state.meta.push_blocking(move || drop(ws.meta_add_objects(&id2, &h)));
 }
 
 /// Completion, local part: tables from the knowledge index (no network, instant).
@@ -668,7 +697,7 @@ pub async fn complete_tables(state: &AppState, id: &str, schema: Option<&str>, q
         None if query.trim().is_empty() => vec![],
         None => state.engine.search_objects(id, query, limit).await?,
     };
-    let _ = state.engine.workspace().meta_add_objects(id, &hits);
+    save_hits(state, id, &hits);
     Ok(hits)
 }
 
@@ -707,7 +736,8 @@ pub async fn describe(
 ) -> Result<ObjectDetail> {
     let d = state.engine.describe(id, schema, name).await?;
     if !d.columns.is_empty() {
-        let _ = state.engine.workspace().meta_put_columns(id, schema, name, &d.columns);
+        let (ws, id2, s2, n2, cols) = (state.workspace.clone(), id.to_string(), schema.to_string(), name.to_string(), d.columns.clone());
+        state.meta.push_blocking(move || drop(ws.meta_put_columns(&id2, &s2, &n2, &cols)));
     }
     Ok(d)
 }
@@ -842,6 +872,8 @@ pub async fn lineage(
             }
         }
         if !described.is_empty() {
+            // The described columns are read back from the cache.
+            state.meta.flush().await;
             graph = databrain_lineage::analyze(&masked, kind, &cat(conn.clone()));
         }
     }
@@ -2058,6 +2090,7 @@ mod tests {
         let main = schemas[0].name.clone();
         list_objects(&st, &p.id, &main).await.unwrap();
         describe(&st, &p.id, &main, "a").await.unwrap();
+        flush_explorer_cache(&st).await;
 
         // Restart: a new engine over the same workspace, nothing connected.
         st.engine.disconnect(&p.id);

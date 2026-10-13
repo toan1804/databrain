@@ -34,6 +34,7 @@ vi.mock("./lib/api", () => ({
     revalidateExplorer: (_id: string, open: string[]) =>
       live(`revalidate:${open.join(",")}`, { refreshed: !cache ? [] : [{ schema: "main.sales", mode: "incremental", added: 1, changed: 0, removed: 0, objects: [t("main.sales", "orders"), t("main.sales", "new_one")] }], unchanged: 3, deferred: [], fingerprints: true, skipped: false }),
     describeObject: (_id: string, s: string, n: string) => live(`describe:${s}.${n}`, { columns: [{ name: "id" }, { name: "added_col" }] }),
+    setSetting: async () => {},
   },
 }));
 
@@ -119,5 +120,29 @@ describe("explorer cache", () => {
     await useStore.getState().loadColumns("c", "main.sales", "x");
     await settle();
     expect(calls).toEqual([]);
+  });
+
+  it("lists the tables of every chosen catalog's schemas, cache first", async () => {
+    useStore.setState({ catalogs: { c: [{ name: "main", is_default: true }, { name: "dev", is_default: false }] } });
+    cachedListings["main.hr"] = [t("main.hr", "people")];
+    await useStore.getState().exploreChosen("c"); // no filter: nothing
+    expect(calls).toEqual([]);
+    useStore.getState().setSchemaFilter("c", ["main"]);
+    await settle();
+    await settle();
+    const objects = useStore.getState().objects;
+    expect(objects["c|main.sales"]?.map((o) => o.name)).toEqual(["fresh"]);
+    expect(objects["c|main.hr"]?.map((o) => o.name)).toEqual(["people"]);
+    expect(calls).toContain("listObjects:main.sales");
+    expect(calls).not.toContain("listObjects:main.hr");
+    expect(calls).not.toContain("listCatalogSchemas:dev");
+    useStore.getState().setSchemaFilter("c", null);
+  });
+
+  it("chosen schemas on a two-level engine", async () => {
+    const { chosenSchemaIds } = await import("./store");
+    const s = (name: string): SchemaInfo => ({ name, is_default: false });
+    expect(chosenSchemaIds([s("a"), s("b"), s("c")], ["c", "a", "gone"])).toEqual(["a", "c"]);
+    expect(chosenSchemaIds([sch("main", "x"), sch("dev", "y")], ["dev"])).toEqual(["dev.y"]);
   });
 });

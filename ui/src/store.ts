@@ -225,6 +225,11 @@ interface State {
   /** Schemas of one catalog (cache first, then live). */
   loadCatalogSchemas: (connId: string, catalog: string, force?: boolean) => Promise<SchemaInfo[]>;
   loadObjects: (connId: string, schema: string, force?: boolean) => Promise<DbObject[]>;
+  /**
+   * Tables of every chosen schema ("Choose schemas/catalogs…"), listed in the
+   * background (cache first), so completion knows them without opening each.
+   */
+  exploreChosen: (connId: string) => Promise<void>;
   loadColumns: (connId: string, schema: string, name: string) => Promise<ColumnInfo[]>;
   disconnect: (connId: string) => Promise<void>;
   /** Ask, then delete a connection (secrets and AI knowledge too). Resolves true when deleted. */
@@ -293,6 +298,17 @@ function once<T>(key: string, f: () => Promise<T>): Promise<T> {
 
 /** Background prefetch, one schema at a time so it never competes with clicks much. */
 let prefetchChain: Promise<unknown> = Promise.resolve();
+/** Bumped when a connection's chosen schemas change: older queued loads are dropped. */
+const exploreGen = new Map<string, number>();
+
+/**
+ * Schema ids to list for a saved filter: the chosen schemas (two-level), or
+ * every schema of the chosen catalogs. Names that match nothing are skipped.
+ */
+export function chosenSchemaIds(schemas: SchemaInfo[], chosen: string[]): string[] {
+  const set = new Set(chosen);
+  return schemas.filter((s) => set.has(s.name) || (!!s.catalog && set.has(s.catalog))).map((s) => s.name);
+}
 
 /**
  * Put the theme on <html> right away. Components that read CSS variables
@@ -688,6 +704,8 @@ export const useStore = create<State>((set, get) => ({
     else delete next[connId];
     set({ schemaFilter: next });
     void api.setSetting("explorer_schemas", next).catch(() => {});
+    if (schemas && schemas.length) void get().exploreChosen(connId);
+    else exploreGen.set(connId, (exploreGen.get(connId) ?? 0) + 1);
   },
   revealObject: (connId, obj) => {
     const st = get();
@@ -845,7 +863,37 @@ export const useStore = create<State>((set, get) => ({
       for (const name of todo) {
         prefetchChain = prefetchChain.then(() => (get().explorer[connId]?.offline ? undefined : get().loadObjects(connId, name).catch(() => {})));
       }
+      // Chosen schemas: all of them, so completion knows their tables.
+      void get().exploreChosen(connId);
     })();
+  },
+  exploreChosen: async (connId) => {
+    const chosen = get().schemaFilter[connId];
+    if (!chosen?.length) return;
+    const gen = (exploreGen.get(connId) ?? 0) + 1;
+    exploreGen.set(connId, gen);
+    const current = () => exploreGen.get(connId) === gen && !get().explorer[connId]?.offline;
+    const kind = get().connections.find((c) => c.id === connId)?.config.kind;
+    const cats = kind && THREE_LEVEL.includes(kind) ? get().catalogs[connId] : undefined;
+    let ids: string[];
+    if (cats) {
+      // Catalog filter (older ones held `catalog.schema` ids: their catalog counts).
+      const names = [...new Set(chosen.map((c) => (cats.some((k) => k.name === c) ? c : c.split(".")[0])))].filter((c) => cats.some((k) => k.name === c));
+      ids = [];
+      for (const cat of names) {
+        if (!current()) return;
+        const list = await get().loadCatalogSchemas(connId, cat).catch(() => [] as SchemaInfo[]);
+        ids.push(...list.map((s) => s.name));
+      }
+    } else {
+      const all = get().schemas[connId] ?? (await get().loadSchemas(connId).catch(() => [] as SchemaInfo[]));
+      ids = chosenSchemaIds(all, chosen);
+    }
+    for (const id of ids) {
+      if (get().objects[`${connId}|${id}`]) continue;
+      prefetchChain = prefetchChain.then(() => (current() && !get().objects[`${connId}|${id}`] ? get().loadObjects(connId, id).catch(() => {}) : undefined));
+    }
+    await prefetchChain;
   },
   loadCatalogSchemas: async (connId, catalog, force = false) => {
     const key = `${connId}|${catalog}`;

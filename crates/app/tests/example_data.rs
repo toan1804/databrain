@@ -152,14 +152,16 @@ async fn sqlite_explorer_and_queries() {
     let layout = api::table_layout(&st, &id, "main", "orders").await.unwrap();
     assert_eq!(layout.indexes[0].columns, vec!["order_id"]);
     assert!(layout.indexes.iter().any(|i| i.name == "orders_customer" && i.columns == vec!["customer_id"]), "{layout:?}");
-    // Browsing fills the metadata cache: completion answers locally without the AI index.
-    st.engine.workspace().meta_clear(&id).unwrap();
+    // Browsing fills the metadata cache (in the background): completion answers locally without the AI index.
+    api::clear_explorer_cache(&st, &id).await.unwrap();
     assert!(api::complete_tables_local(&st, &id, None, "ord", 10).unwrap().is_empty());
     api::list_objects(&st, &id, "main").await.unwrap();
+    api::flush_explorer_cache(&st).await;
     let local = api::complete_tables_local(&st, &id, Some("main"), "ord", 10).unwrap();
     assert_eq!(local.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["orders", "order_items"]);
     assert!(api::complete_columns_local(&st, &id, "main", "customers").unwrap().is_none());
     api::describe(&st, &id, "main", "customers").await.unwrap();
+    api::flush_explorer_cache(&st).await;
     assert!(api::complete_columns_local(&st, &id, "main", "customers").unwrap().unwrap().contains(&"customer_id".to_string()));
     // Completion searches one schema on the server, best matches first.
     let hits = api::complete_tables(&st, &id, Some("main"), "ORD", 10).await.unwrap();

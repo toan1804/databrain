@@ -3,6 +3,7 @@
 pub mod ai_api;
 pub mod api;
 pub mod jobs;
+pub mod meta_writer;
 
 use std::sync::Arc;
 
@@ -500,8 +501,8 @@ fn cached_columns(state: State<'_, AppState>, id: String, schema: String, name: 
 }
 
 #[tauri::command]
-fn clear_explorer_cache(state: State<'_, AppState>, id: String) -> R<()> {
-    api::clear_explorer_cache(&state, &id)
+async fn clear_explorer_cache(state: State<'_, AppState>, id: String) -> R<()> {
+    api::clear_explorer_cache(&state, &id).await
 }
 
 #[tauri::command]
