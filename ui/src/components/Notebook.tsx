@@ -66,6 +66,7 @@ import { ParamBar } from "./ParamBar";
 import { openLineage } from "./LineageTab";
 import { paramField, paramNames, setParamSpans } from "./paramsExt";
 import { canFetchMetadata, sqlAssist } from "./sqlAssist";
+import { sqlFolding } from "./sqlFold";
 import { queryHints } from "./queryHintsExt";
 import { ResizeHandle } from "./ResizeHandle";
 import {
@@ -969,6 +970,7 @@ export function CellEditor({
       state: EditorState.create({
         doc: source,
         extensions: [
+          sqlFolding(),
           history(),
           drawSelection(),
           indentOnInput(),

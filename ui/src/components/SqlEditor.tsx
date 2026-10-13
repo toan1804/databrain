@@ -25,6 +25,7 @@ import { SqlContextMenu, formatKey } from "./SqlContextMenu";
 import { openLineage } from "./LineageTab";
 import { paramField, paramNames, setParamSpans } from "./paramsExt";
 import { api, isTauri } from "../lib/api";
+import { sqlFolding } from "./sqlFold";
 
 /** Right-click: keep a selection that contains the click, else put the cursor there; then open the menu. */
 export function editorContextMenu(open: (at: { x: number; y: number }) => void) {
@@ -119,6 +120,7 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
         extensions: [
           lineNumbers(),
           highlightActiveLineGutter(),
+          sqlFolding(),
           history(),
           drawSelection(),
           indentOnInput(),

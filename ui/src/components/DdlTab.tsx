@@ -1,14 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EditorState } from "@codemirror/state";
 import { EditorView, lineNumbers } from "@codemirror/view";
 import { syntaxHighlighting } from "@codemirror/language";
 import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
 import { keymap } from "@codemirror/view";
-import { AlertCircle, ClipboardCopy, FileCode2, Loader2, Lock, RefreshCw } from "lucide-react";
+import { AlertCircle, AlignLeft, ClipboardCopy, FileCode2, Loader2, Lock, RefreshCw } from "lucide-react";
 import { api, toError } from "../lib/api";
 import { tablePath } from "../lib/catalog";
+import { formatSql } from "../lib/formatSql";
 import { useStore, type DdlRef } from "../store";
 import { highlight, langExtension } from "./SqlEditor";
+import { sqlFolding } from "./sqlFold";
 import { copyText } from "./CatalogMenus";
 import { ConnDot } from "./ui";
 
@@ -43,7 +45,27 @@ export function DdlTab({ tabId, reference, visible }: { tabId: string; reference
     void load();
   }, [load]);
 
-  const ddl = state.status === "ready" ? state.ddl : null;
+  const raw = state.status === "ready" ? state.ddl : null;
+  // Format: the DDL as DataBrain formats SQL (connection's dialect); off = as the server returned it.
+  const [formatted, setFormatted] = useState(() => localStorage.getItem("db.ddl.format") === "1");
+  const pretty = useMemo(() => {
+    if (!raw || !formatted) return null;
+    try {
+      const f = formatSql(raw, conn?.config.kind);
+      return { text: f.endsWith("\n") ? f : `${f}\n`, error: null };
+    } catch (e) {
+      return { text: null, error: e instanceof Error ? e.message : String(e) };
+    }
+  }, [raw, formatted, conn?.config.kind]);
+  const ddl = pretty?.text ?? raw;
+  const toggleFormat = () => {
+    const on = !formatted;
+    setFormatted(on);
+    localStorage.setItem("db.ddl.format", on ? "1" : "0");
+  };
+  useEffect(() => {
+    if (pretty?.error) useStore.getState().toast(`Could not format this DDL, showing it as returned: ${pretty.error}`, "info");
+  }, [pretty?.error]);
   const path = conn ? tablePath(conn.config.kind, reference.schema, reference.name) : reference.name;
   const openInEditor = () => {
     if (ddl) useStore.getState().newTab({ title: `${reference.name} DDL (edit)`, sql: ddl, connection_id: conn?.id ?? null });
@@ -66,7 +88,16 @@ export function DdlTab({ tabId, reference, visible }: { tabId: string; reference
           <Lock size={10} /> read-only
         </span>
         <div className="ml-auto flex items-center gap-1">
-          <button className="btn-ghost py-1" onClick={() => ddl && void copyText(ddl, "DDL")} disabled={!ddl} title="Copy the DDL">
+          <button
+            className={`btn-ghost py-1 ${formatted ? "bg-hover text-fg" : ""}`}
+            onClick={toggleFormat}
+            disabled={!raw}
+            aria-pressed={formatted}
+            title={formatted ? "Formatted in the connection's dialect: click to show the DDL as the server returned it" : "Format the DDL in the connection's dialect"}
+          >
+            <AlignLeft size={13} /> {formatted ? "Formatted" : "Format"}
+          </button>
+          <button className="btn-ghost py-1" onClick={() => ddl && void copyText(ddl, "DDL")} disabled={!ddl} title="Copy the DDL as shown">
             <ClipboardCopy size={13} /> Copy
           </button>
           <button className="btn-ghost py-1" onClick={openInEditor} disabled={!ddl} title="Open a copy in an editable query tab">
@@ -113,6 +144,7 @@ function DdlView({ text, kind }: { text: string; kind: Parameters<typeof langExt
         doc: text,
         extensions: [
           lineNumbers(),
+          sqlFolding(),
           langExtension(kind),
           syntaxHighlighting(highlight),
           highlightSelectionMatches(),
