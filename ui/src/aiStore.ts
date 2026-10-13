@@ -9,6 +9,7 @@ import type {
   AiMode,
   AiUiRequest,
   EditProposal,
+  PlannedStatement,
   ProviderView,
   UiContext,
 } from "./lib/types";
@@ -115,15 +116,43 @@ export function connectionForKey(key: string | null | undefined): string | null 
 }
 
 /** Last result id and error message for a run key. */
-export function runContext(key: string | null | undefined): { resultId: string | null; error: string | null } {
+export function runContext(key: string | null | undefined): {
+  resultId: string | null;
+  error: string | null;
+  failed: PlannedStatement | null;
+} {
   const run = key ? useStore.getState().runs[key] : undefined;
-  if (!run) return { resultId: null, error: null };
+  if (!run) return { resultId: null, error: null, failed: null };
   const active = run.activeIndex !== null ? run.statements[run.activeIndex] : undefined;
   const failed = run.statements.find((s) => s.status === "error");
   return {
     resultId: active?.result?.id ?? run.statements.find((s) => s.result)?.result?.id ?? null,
     error: failed?.error?.message ?? null,
+    failed: failed?.plan ?? null,
   };
+}
+
+/**
+ * Where the failed statement is in the editor text now: at its run offsets
+ * when unchanged, else the occurrence nearest to them. Null if it was edited away.
+ */
+export function locateStatement(doc: string, plan: Pick<PlannedStatement, "sql" | "start" | "end">): { from: number; to: number } | null {
+  const sql = plan.sql.trim();
+  if (!sql) return null;
+  const at = doc.indexOf(sql, plan.start);
+  if (at >= 0 && at <= plan.end) return { from: at, to: at + sql.length };
+  let best = -1;
+  for (let i = doc.indexOf(sql); i >= 0; i = doc.indexOf(sql, i + 1)) {
+    if (best < 0 || Math.abs(i - plan.start) < Math.abs(best - plan.start)) best = i;
+  }
+  return best >= 0 ? { from: best, to: best + sql.length } : null;
+}
+
+/** 1-based editor line of `offset`. */
+export function lineOf(doc: string, offset: number): number {
+  let n = 1;
+  for (let i = doc.indexOf("\n"); i >= 0 && i < offset; i = doc.indexOf("\n", i + 1)) n++;
+  return n;
 }
 
 function defaultTargetKey(): string | null {
@@ -224,7 +253,9 @@ export const useAi = create<AiState>((set, get) => {
       const ctx = runContext(key);
       void api.aiRespond(
         r.request_id,
-        snap ? { sql: snap.sql, selection: snap.selection, last_error: ctx.error, result_id: ctx.resultId } : { sql: null, note: "No editor is open" },
+        snap
+          ? { sql: snap.sql, selection: snap.selection, last_error: ctx.error, failed_sql: ctx.failed?.sql.trim() ?? null, result_id: ctx.resultId }
+          : { sql: null, note: "No editor is open" },
       );
       return;
     }
@@ -349,12 +380,27 @@ export const useAi = create<AiState>((set, get) => {
       const key = targetKey !== undefined ? targetKey : defaultTargetKey();
       const conn = connectionId ?? connectionForKey(key) ?? get().connectionId;
       if (!conn) return st.toast("Choose a connection for the assistant", "error");
-      const snap = editorBridge.snapshot(key);
       const rc = runContext(key);
+      // Fix error: the statement that failed is the one to fix, wherever the
+      // cursor is. Select it so the fix replaces only that statement.
+      let failedSql: string | null = null;
+      let failedLine: number | null = null;
+      if (mode === "fix_error" && rc.failed) {
+        const doc = editorBridge.snapshot(key)?.sql;
+        const at = doc !== undefined ? locateStatement(doc, rc.failed) : null;
+        if (doc !== undefined && at) {
+          editorBridge.select(key, at.from, at.to);
+          failedLine = lineOf(doc, at.from);
+        }
+        failedSql = rc.failed.sql.trim();
+      }
+      const snap = editorBridge.snapshot(key);
       const ctx: UiContext = {
         editor_sql: snap?.sql ?? null,
         selection: snap?.selection ?? null,
         last_error: rc.error,
+        failed_sql: failedSql,
+        failed_line: failedLine,
         result_id: rc.resultId,
         ...context,
       };
@@ -457,7 +503,7 @@ export const useAi = create<AiState>((set, get) => {
             st.updateTab(tab.id, { connection_id: results });
             st.toast("This query reads outputs, so the tab now runs on Results (DuckDB)", "info");
           }
-        } else if (!editorBridge.apply(item.targetKey, item.proposal)) {
+        } else if (!editorBridge.apply(item.targetKey, item.proposal, item.before)) {
           useStore.getState().toast("The target editor was closed", "error");
           ok = false;
         } else if (readsOutputs && tab && tabKind !== "duckdb") {

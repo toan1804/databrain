@@ -39,6 +39,13 @@ export const editorBridge = {
   focus(key: string | null | undefined) {
     this.get(key)?.focus();
   },
+  /** Select `from..to` and scroll it into view. */
+  select(key: string | null | undefined, from: number, to: number) {
+    const v = this.get(key);
+    if (!v) return;
+    const len = v.state.doc.length;
+    v.dispatch({ selection: { anchor: Math.min(from, len), head: Math.min(to, len) }, scrollIntoView: true });
+  },
   /** Editor snapshot for the AI (`get_editor`). */
   snapshot(key: string | null | undefined): { sql: string; selection: string | null } | null {
     const v = this.get(key);
@@ -46,12 +53,28 @@ export const editorBridge = {
     const { from, to } = v.state.selection.main;
     return { sql: v.state.doc.toString(), selection: to > from ? v.state.sliceDoc(from, to) : null };
   },
-  /** Apply an accepted AI proposal. Returns false if the editor is gone. */
-  apply(key: string | null | undefined, p: EditProposal): boolean {
+  /**
+   * Apply an accepted AI proposal. Returns false if the editor is gone.
+   * `target` is the text the proposal was made for (the selection then): a
+   * `replace_selection` edit replaces it even if the selection has moved since.
+   */
+  apply(key: string | null | undefined, p: EditProposal, target?: string): boolean {
     const v = this.get(key);
     if (!v) return false;
-    const { from, to } = v.state.selection.main;
+    let { from, to } = v.state.selection.main;
     const len = v.state.doc.length;
+    if (p.mode === "replace_selection" && target && v.state.sliceDoc(from, to) !== target) {
+      const doc = v.state.doc.toString();
+      // The occurrence nearest to the cursor.
+      let best = -1;
+      for (let i = doc.indexOf(target); i >= 0; i = doc.indexOf(target, i + 1)) {
+        if (best < 0 || Math.abs(i - from) < Math.abs(best - from)) best = i;
+      }
+      if (best >= 0) {
+        from = best;
+        to = best + target.length;
+      }
+    }
     const change =
       p.mode === "replace_all"
         ? { from: 0, to: len, insert: p.sql }

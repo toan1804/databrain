@@ -25,3 +25,20 @@ describe("aiStore: chat items", () => {
     expect(visibleItems(approved).map((i) => i.id)).toEqual(["1", "2"]);
   });
 });
+
+describe("aiStore: failed statement", () => {
+  const doc = "select 1;\n\nselec 2 from t;\n";
+  it("finds the failed statement at its run offsets, then by text when the doc moved", async () => {
+    const { locateStatement, lineOf } = await import("./aiStore");
+    const at = locateStatement(doc, { sql: "selec 2 from t", start: 11, end: 25 })!;
+    expect(doc.slice(at.from, at.to)).toBe("selec 2 from t");
+    expect(lineOf(doc, at.from)).toBe(3);
+    // Text inserted above since the run: still found, nearest to the old offset.
+    const moved = "-- note\n" + doc;
+    const m = locateStatement(moved, { sql: "selec 2 from t", start: 11, end: 25 })!;
+    expect(moved.slice(m.from, m.to)).toBe("selec 2 from t");
+    expect(lineOf(moved, m.from)).toBe(4);
+    // Edited away: not found.
+    expect(locateStatement("select 1;", { sql: "selec 2 from t", start: 11, end: 25 })).toBeNull();
+  });
+});

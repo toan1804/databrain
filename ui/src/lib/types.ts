@@ -714,6 +714,10 @@ export interface UiContext {
   editor_sql?: string | null;
   selection?: string | null;
   last_error?: string | null;
+  /** The statement that ran and failed (Fix error). */
+  failed_sql?: string | null;
+  /** Its 1-based line in the editor, when found there. */
+  failed_line?: number | null;
   result_id?: string | null;
   mentions?: string[];
 }

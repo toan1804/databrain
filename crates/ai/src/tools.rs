@@ -94,7 +94,7 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
     if include_editor {
         v.push(s(
             "get_editor",
-            "Read the SQL in the user's current editor tab, their selection, and the last error.",
+            "Read the SQL in the user's current editor tab, their selection, the last error, and the statement that failed (failed_sql).",
             json!({"type": "object", "properties": {}}),
         ));
         v.push(s(

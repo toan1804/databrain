@@ -56,6 +56,10 @@ pub struct UiContext {
     pub editor_sql: Option<String>,
     pub selection: Option<String>,
     pub last_error: Option<String>,
+    /// The statement that ran and failed (Fix error); the editor may hold others.
+    pub failed_sql: Option<String>,
+    /// Its 1-based line in the editor, when found there.
+    pub failed_line: Option<u32>,
     pub result_id: Option<String>,
     /// Outputs the user mentioned with @ (handles or names).
     pub mentions: Vec<String>,
@@ -148,7 +152,10 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
         Mode::Chat => "",
         Mode::Generate => "\nTask: write SQL for the user's request and place it in the editor with write_editor (mode replace_selection when a selection exists, otherwise replace_all). Keep the chat answer to one or two sentences.\n",
         Mode::Edit => "\nTask: rewrite the SELECTED SQL according to the instruction and apply it with write_editor mode replace_selection. Preserve behavior unless asked otherwise.\n",
-        Mode::FixError => "\nTask: the last query failed. Diagnose the error using the schema, then propose the corrected SQL with write_editor (replace_selection if a selection exists, else replace_all). Explain the cause in one or two sentences.\n",
+        Mode::FixError => "\nTask: the last query failed. Diagnose the error using the schema, then propose the corrected SQL with write_editor (replace_selection if a selection exists, else replace_all). Explain the cause in one or two sentences.\n\
+            When a [Failed statement] is given, that statement is the one that ran and failed; the error is about it, not about the other statements \
+            in the editor. Fix only that statement: it is the selection, so write_editor mode replace_selection with just the corrected statement \
+            (never the whole script), and leave the other statements unchanged.\n",
         Mode::Explain => "\nTask: explain what the SQL does in plain language: purpose, joins, filters, grouping, and any performance or correctness concerns. Do not run it.\n",
         Mode::Optimize => "\nTask: make the SELECTED SQL statement faster. Its query tips (found from the tables' indexes, partitions and cluster keys) and table layouts come with it. \
             Check them with describe_table / table metadata as needed; do not run the slow statement itself. Rewrite it so it returns exactly the same rows \
@@ -193,11 +200,23 @@ fn user_turn(req: &AgentRequest) -> String {
             t.push_str(&format!("\n\n[{label}]\n```sql\n{}\n```", v.chars().take(20_000).collect::<String>()));
         }
     };
-    if matches!(req.mode, Mode::Edit | Mode::FixError | Mode::Explain | Mode::Generate | Mode::Optimize) || c.selection.is_some() {
+    let failed = c.failed_sql.as_deref().map(str::trim).filter(|s| !s.is_empty() && matches!(req.mode, Mode::FixError));
+    if let Some(f) = failed {
+        let line = c.failed_line.map(|l| format!(", line {l} of the editor")).unwrap_or_default();
+        t.push_str(&format!(
+            "\n\n[Failed statement{line}: the one that ran and failed; fix this one]\n```sql\n{}\n```",
+            f.chars().take(20_000).collect::<String>()
+        ));
+    }
+    let same_as_failed = |s: &Option<String>| failed.is_some() && s.as_deref().map(str::trim) == failed;
+    if (matches!(req.mode, Mode::Edit | Mode::FixError | Mode::Explain | Mode::Generate | Mode::Optimize) || c.selection.is_some())
+        && !same_as_failed(&c.selection)
+    {
         add(&mut t, "Selected SQL", &c.selection);
     }
     if c.selection.is_none() || matches!(req.mode, Mode::FixError) {
-        add(&mut t, "Editor SQL", &c.editor_sql);
+        let label = if failed.is_some() { "Editor SQL (whole script, for context only)" } else { "Editor SQL" };
+        add(&mut t, label, &c.editor_sql);
     }
     if let Some(e) = c.last_error.as_deref().filter(|e| !e.is_empty()) {
         t.push_str(&format!("\n\n[Last error]\n{e}"));
@@ -422,10 +441,35 @@ mod tests {
             model: None,
             message: "fix it".into(),
             mode: Mode::FixError,
-            context: UiContext { editor_sql: Some("selec 1".into()), selection: None, last_error: Some("syntax error at or near \"selec\"".into()), result_id: None, mentions: vec![] },
+            context: UiContext { editor_sql: Some("selec 1".into()), last_error: Some("syntax error at or near \"selec\"".into()), ..Default::default() },
         };
         let t = user_turn(&r);
         assert!(t.contains("[Editor SQL]") && t.contains("selec 1") && t.contains("[Last error]"));
+    }
+
+    #[test]
+    fn fix_error_names_the_failed_statement() {
+        let r = AgentRequest {
+            session_id: None,
+            connection_id: "c".into(),
+            provider_id: None,
+            model: None,
+            message: "fix it".into(),
+            mode: Mode::FixError,
+            context: UiContext {
+                editor_sql: Some("select 1;\nselec 2;".into()),
+                selection: Some("selec 2".into()),
+                last_error: Some("syntax error at or near \"selec\"".into()),
+                failed_sql: Some("selec 2".into()),
+                failed_line: Some(2),
+                ..Default::default()
+            },
+        };
+        let t = user_turn(&r);
+        assert!(t.contains("[Failed statement, line 2 of the editor"), "{t}");
+        assert!(t.contains("[Editor SQL (whole script, for context only)]"));
+        // The selection is the failed statement: not sent twice.
+        assert!(!t.contains("[Selected SQL]"));
     }
 
     #[test]
@@ -437,7 +481,7 @@ mod tests {
             model: None,
             message: "Make this faster.\n\n[Query tips]\n- no partition filter".into(),
             mode: serde_json::from_str("\"optimize\"").unwrap(),
-            context: UiContext { editor_sql: None, selection: Some("select * from events".into()), last_error: None, result_id: None, mentions: vec![] },
+            context: UiContext { selection: Some("select * from events".into()), ..Default::default() },
         };
         let t = user_turn(&r);
         assert!(t.contains("[Selected SQL]") && t.contains("select * from events") && t.contains("[Query tips]"));

@@ -25,7 +25,7 @@ import {
   Square,
 } from "lucide-react";
 import { EditorView } from "@codemirror/view";
-import { useAi } from "../aiStore";
+import { lineOf, locateStatement, useAi } from "../aiStore";
 import { useExports } from "../exportsStore";
 import { ExportCard } from "./ExportsTray";
 import { editorBridge } from "../editorBridge";
@@ -139,7 +139,7 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
             title={title}
           />
         ) : active?.error ? (
-          <ErrorView stmt={active} tabId={tabId} connectionId={connectionId} />
+          <ErrorView stmt={active} tabId={tabId} connectionId={connectionId} count={run.statements.length} />
         ) : active?.status === "done" ? (
           <DoneView stmt={active} />
         ) : run.running ? (
@@ -286,13 +286,18 @@ function RunningView({ run, tabId }: { run: TabRun; tabId: string }) {
   );
 }
 
-function ErrorView({ stmt, tabId, connectionId }: { stmt: StatementRun; tabId: string; connectionId?: string | null }) {
+function ErrorView({ stmt, tabId, connectionId, count }: { stmt: StatementRun; tabId: string; connectionId?: string | null; count: number }) {
   const e = stmt.error!;
   const cancelled = stmt.status === "cancelled";
   const send = useAi((s) => s.send);
+  // Line in the editor, so "statement 1" isn't read as the editor's first one
+  // when only a later statement was run.
+  const doc = editorBridge.snapshot(tabId)?.sql;
+  const at = doc !== undefined ? locateStatement(doc, stmt.plan) : null;
+  const line = doc !== undefined && at ? lineOf(doc, at.from) : null;
   const fix = () =>
     void send({
-      message: `Fix this error:\n${e.message}`,
+      message: `Fix this error in the statement that failed${line ? ` (line ${line})` : ""}:\n${e.message}`,
       mode: "fix_error",
       targetKey: tabId,
       connectionId: connectionId ?? undefined,
@@ -306,7 +311,9 @@ function ErrorView({ stmt, tabId, connectionId }: { stmt: StatementRun; tabId: s
       >
         <div className="mb-1 flex items-center gap-2 text-[13px] font-semibold">
           {cancelled ? <Ban size={15} className="text-muted" /> : <AlertCircle size={15} className="text-danger" />}
-          {cancelled ? "Query cancelled" : `Statement ${stmt.plan.index + 1} failed`}
+          {cancelled
+            ? "Query cancelled"
+            : `${count > 1 ? `Statement ${stmt.plan.index + 1} of ${count}` : "Statement"} failed${line ? ` · line ${line}` : ""}`}
           {e.code && <span className="rounded bg-panel px-1.5 font-mono text-[11px] text-muted">{e.code}</span>}
         </div>
         {!cancelled && <pre className="whitespace-pre-wrap break-words font-mono text-[12px] select-text">{e.message}</pre>}
