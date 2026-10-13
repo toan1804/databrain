@@ -1,6 +1,6 @@
 # go1.27.1; upload target/oracle-agent/dist/*.gz to the release
-c638fc29a62676bc46c4fdd915a91583214899060ceeaf33e4925be1e9b31a58  databrain-oracle-agent-darwin-arm64
-4bd7460b5ec706761e3092bd819fc059eb6475c60cec7fc145a11c72def6c326  databrain-oracle-agent-darwin-amd64
-5ea01ad2c9c297107f1d22799feae152854b63b1e21bd364c88e6193644dc2af  databrain-oracle-agent-linux-amd64
-377fbb76e22c93be65def5e4fa8085d8d6acd336c4f9941a12df6c9899b45d15  databrain-oracle-agent-linux-arm64
-753237e3e858c8607b080990803c0f6408f45cb62be3f11f00034933962be540  databrain-oracle-agent-windows-amd64.exe
+1b59c254f703c38bf242cb5e1d983ea8c6c63990cfc418f211a4fd0e7a95756b  databrain-oracle-agent-darwin-arm64
+9d4ad47620322836e9113de1bafa7940c03eca7988216d18d268c3ade882da03  databrain-oracle-agent-darwin-amd64
+7c17c3ecfca0d7163b94f96b9e7caf6d257424f72d339785b7e87f9d9e165116  databrain-oracle-agent-linux-amd64
+f341590e73636996cb89ac497c25e8f13b8656ac6c46103cd6f355294c8d094f  databrain-oracle-agent-linux-arm64
+1e491f767b6cb668c53ab99f6c53f2faf52efb78e56b2ad3773fac3d16bce8b5  databrain-oracle-agent-windows-amd64.exe

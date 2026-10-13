@@ -19,7 +19,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 /// Wire protocol version (`Version` in main.go).
 pub const PROTOCOL: &str = "1";
 /// Release of the helper binaries (download folder and file names).
-pub const RELEASE: &str = "0.1.0";
+/// 0.1.1: reconnects after a lost connection ("sql: connection is already closed").
+pub const RELEASE: &str = "0.1.1";
 /// Where releases are published: `{base}/v{RELEASE}/{file}.gz`.
 pub const DEFAULT_BASE_URL: &str = "https://github.com/toan1804/databrain/releases/download/oracle-agent";
 /// `sha256  file` lines of the uncompressed binaries of [`RELEASE`].

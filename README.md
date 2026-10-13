@@ -121,6 +121,25 @@ npm run app:build    # release bundle (.app/.dmg, .msi, .deb/.AppImage)
 
 The helper lives in `crates/connectors/oracle/agent` (Go). `node scripts/build-oracle-agent.mjs` builds every platform reproducibly into `target/oracle-agent/`, writes the gzip files to upload to `target/oracle-agent/dist/`, and updates `agent/SHA256SUMS` (compiled into DataBrain). Upload the `.gz` files to `{base}/v{RELEASE}/` (`agent::DEFAULT_BASE_URL`, `agent::RELEASE`; the `oracle_agent_url` setting or `DATABRAIN_ORACLE_AGENT_URL` override the base). `tauri dev` and `tauri build` build the helper for your computer when Go is installed (`target/oracle-agent/`), and DataBrain uses that copy directly, so builds made on a machine with Go never download it.
 
+Releasing a new helper (each release gets its own download folder, so installed apps keep working with the one they were built for, and a new app downloads its own):
+
+1. Bump `RELEASE` in `crates/connectors/oracle/src/agent.rs` (e.g. `0.1.1`).
+2. `node scripts/build-oracle-agent.mjs` (Go 1.27; the sums depend on the Go version) and commit `agent/SHA256SUMS` with the change.
+3. Publish the five `.gz` files under the tag `oracle-agent/v{RELEASE}`:
+
+   ```sh
+   gh release create oracle-agent/v0.1.1 target/oracle-agent/dist/*.gz \
+     --repo toan1804/databrain --title "Oracle thin driver 0.1.1" --notes "Reconnects after a lost connection." --latest=false
+   ```
+
+4. Check one download before releasing the app (the URL DataBrain uses):
+
+   ```sh
+   curl -sL https://github.com/toan1804/databrain/releases/download/oracle-agent/v0.1.1/databrain-oracle-agent-darwin-arm64.gz | gunzip | shasum -a 256
+   ```
+
+   The sum must equal the `darwin-arm64` line of `agent/SHA256SUMS`. Then build and release the app as usual.
+
 ## Test
 
 ```sh
