@@ -159,7 +159,7 @@ impl KiroProvider {
         if st.signed_in {
             return Ok(st);
         }
-        open_login_terminal(&program)?;
+        open_login_terminal(&program).await?;
         on_started();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
         loop {
@@ -521,22 +521,59 @@ fn trunc(s: &str, n: usize) -> String {
     format!("{}…(truncated)", &s[..end])
 }
 
-fn open_login_terminal(program: &Path) -> Result<()> {
+/// Is a macOS app process running (`pgrep -x`)?
+#[cfg(target_os = "macos")]
+async fn app_running(name: &str) -> bool {
+    Command::new("pgrep").args(["-x", name]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().await.is_ok_and(|s| s.success())
+}
+
+async fn open_login_terminal(program: &Path) -> Result<()> {
     let prog = program.to_string_lossy().to_string();
     let spawn = |c: &mut std::process::Command| c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(|_| ());
     #[cfg(target_os = "macos")]
     {
-        let script = std::env::temp_dir().join("databrain-kiro-login.command");
+        let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let tmp = std::env::temp_dir();
+        let script = tmp.join("databrain-kiro-login.command");
+        // Written by the script as it starts: proof that Terminal ran it.
+        let marker = tmp.join("databrain-kiro-login.started");
         let body = format!(
-            "#!/bin/sh\n# Opened by DataBrain to sign in to Kiro.\nunset KIRO_API_KEY\n'{}' login\necho\necho 'Done. You can close this window and return to DataBrain.'\n",
-            prog.replace('\'', "'\\''")
+            "#!/bin/sh\n# Opened by DataBrain to sign in to Kiro.\ntouch {}\nunset KIRO_API_KEY\n{} login\necho\necho 'Done. You can close this window and return to DataBrain.'\n",
+            q(&marker.to_string_lossy()),
+            q(&prog)
         );
         std::fs::write(&script, body).map_err(|e| AiError::Internal(e.to_string()))?;
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700));
         }
-        return spawn(std::process::Command::new("open").args(["-a", "Terminal"]).arg(&script)).map_err(|e| AiError::Internal(format!("cannot open Terminal: {e}")));
+        let _ = std::fs::remove_file(&marker);
+        // Terminal not running: a script opened while it is still launching can
+        // be dropped (the first sign-in did nothing). Start it and wait first.
+        if !app_running("Terminal").await {
+            spawn(std::process::Command::new("open").args(["-a", "Terminal"])).map_err(|e| AiError::Internal(format!("cannot open Terminal: {e}")))?;
+            let t = tokio::time::Instant::now();
+            while !app_running("Terminal").await && t.elapsed() < Duration::from_secs(15) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            // Its first window and shell.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+        // Open the script; again if it did not start (at most 3 tries).
+        for attempt in 0..3 {
+            spawn(std::process::Command::new("open").args(["-a", "Terminal"]).arg(&script)).map_err(|e| AiError::Internal(format!("cannot open Terminal: {e}")))?;
+            let t = tokio::time::Instant::now();
+            while t.elapsed() < Duration::from_secs(if attempt == 0 { 6 } else { 8 }) {
+                if marker.exists() {
+                    let _ = std::fs::remove_file(&marker);
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        return Err(AiError::Config(format!(
+            "Terminal did not start the sign-in. Run `{prog} login` in a terminal, then retry (or check Terminal → Settings → Profiles → Shell)."
+        )));
     }
     #[cfg(target_os = "windows")]
     {
