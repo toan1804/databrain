@@ -271,6 +271,20 @@ export const useAi = create<AiState>((set, get) => {
         }));
         if (e.tool === "add_knowledge_note" || e.tool === "update_knowledge_note") set((s) => ({ knowledgeVersion: s.knowledgeVersion + 1 }));
         if (e.tool === "save_query") void useStore.getState().refreshSavedQueries();
+        if (e.tool === "create_job") {
+          // Show the new job: refresh the Jobs list and open it in a tab.
+          const d = e.display as { job_id?: string; name?: string } | null;
+          if (d?.job_id) {
+            const { job_id, name } = d;
+            void import("./jobsStore").then(({ useJobs }) =>
+              useJobs
+                .getState()
+                .refresh()
+                .then(() => useJobs.getState().open(job_id, name ?? "Job"))
+                .catch(() => {}),
+            );
+          }
+        }
         break;
       case "usage":
         set((s) => ({ tokens: { input: s.tokens.input + e.input, output: s.tokens.output + e.output } }));

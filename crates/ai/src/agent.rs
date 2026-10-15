@@ -137,7 +137,15 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
          - When exploring teaches you something durable (what a code or status means, a business rule, the right join \
            path, a data caveat), record it with add_knowledge_note, or fix an outdated note with update_knowledge_note \
            (check list_knowledge_notes first). Keep notes short and factual; never store result values or personal data.\n\
-         - Be concise. Put SQL in ```sql fenced blocks.\n",
+         - Be concise. Put SQL in ```sql fenced blocks.\n\n\
+         Jobs (sidebar → Jobs): a job is a graph of steps run in order, by hand or on a schedule. Each step does one thing and its \
+         result is an output named after the step: a query step runs SQL on one connection; a step on the \"Results\" (DuckDB) \
+         connection reads earlier steps as results.<step> (DuckDB SQL), which is how a job combines several databases; a load step \
+         writes its upstream rows into a table of any connection (append, truncate, replace, update/merge by key columns, with \
+         optional before/after SQL); an export step saves them to a CSV/Parquet/JSON file. Use list_jobs / get_job to explain or \
+         debug a job. To build one: list_connections, check each source's tables with search_schema / describe_table (connection \
+         argument), write each step in its connection's dialect, then create_job; keep source queries filtered and narrow, and do \
+         the joins across databases in a Results step.\n",
         profile.name,
         kind.dialect_name(),
         server.map(|v| format!(" ({v})")).unwrap_or_default(),

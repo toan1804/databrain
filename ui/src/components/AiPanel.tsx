@@ -519,6 +519,10 @@ const TOOL_LABELS: Record<string, string> = {
   write_editor: "Proposed editor change",
   list_outputs: "Listed outputs",
   query_outputs: "Queried outputs (DuckDB)",
+  list_connections: "Listed connections",
+  list_jobs: "Listed jobs",
+  get_job: "Read job",
+  create_job: "Created job",
 };
 
 function ToolCard({ item }: { item: Extract<ChatItem, { kind: "tool" }> }) {
@@ -582,7 +586,7 @@ function ApprovalCard({
     <div className={`rounded-lg border p-2 text-[12.5px] ${pending ? "border-warning/50 bg-warning/5" : "border-line"}`}>
       <div className="mb-1 flex items-center gap-1.5 font-medium">
         <ShieldAlert size={13} className="text-warning" />
-        {item.tool === "run_query" ? "Run this query?" : `Allow ${item.tool}?`}
+        {item.tool === "run_query" ? "Run this query?" : item.tool === "create_job" ? "Create this job?" : `Allow ${item.tool}?`}
         {!pending && (
           <span className={`ml-auto text-[11px] ${item.state === "approved" ? "text-success" : "text-muted"}`}>
             {item.state === "approved" ? "Approved" : "Declined"}
@@ -601,7 +605,10 @@ function ApprovalCard({
         ) : (
           <pre className="whitespace-pre-wrap font-mono text-[11.5px] select-text">{sql}</pre>
         ))}
-      {initialSql === undefined && (
+      {initialSql === undefined && typeof item.detail.preview === "string" && (
+        <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded border border-line bg-panel-2 p-1.5 font-mono text-[11px] select-text">{item.detail.preview}</pre>
+      )}
+      {initialSql === undefined && typeof item.detail.preview !== "string" && (
         <pre className="max-h-32 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-muted">{JSON.stringify(item.detail, null, 2)}</pre>
       )}
       {pending && (

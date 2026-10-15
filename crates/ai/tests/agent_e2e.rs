@@ -698,3 +698,50 @@ async fn note_targets_must_be_real_tables() {
     assert!(!o.content.starts_with("ERROR"), "{}", o.content);
     assert!(f.ws.kn_notes(&f.conn).unwrap().iter().any(|n| n.target.as_deref() == Some("main.orders & main.customers")));
 }
+
+/// The assistant reads and creates jobs across connections (with approval).
+#[tokio::test]
+async fn creates_a_job_across_connections() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = mock_openai(requests.clone()).await;
+    let f = fixture(port, AiPolicy::default()).await;
+    let profile = f.ws.get_connection(&f.conn).unwrap();
+    let ctx = |approve: bool| databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: profile.clone(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: Arc::new(Host { approvals: AtomicUsize::new(0), approve }),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+    };
+    let c = ctx(true);
+    let conns = c.call("list_connections", &json!({})).await.content;
+    assert!(conns.contains(&profile.name) && conns.contains("Results"), "{conns}");
+    // Schema tools take another connection by name.
+    let d = c.call("describe_table", &json!({"table": "orders", "connection": profile.name})).await.content;
+    assert!(!d.starts_with("ERROR"), "{d}");
+    let job = json!({
+        "name": "Revenue by country",
+        "steps": [
+            {"name": "ai_orders", "connection": profile.name, "sql": "select country, amount from orders"},
+            {"name": "ai_by_country", "connection": "Results", "sql": "select country, sum(amount) total from results.ai_orders group by 1"},
+            {"name": "ai_file", "action": "export", "after": ["ai_by_country"], "format": "csv"}
+        ]
+    });
+    assert!(ctx(false).call("create_job", &job).await.content.contains("declined"));
+    assert!(f.ws.list_jobs().unwrap().is_empty());
+    let o = c.call("create_job", &job).await;
+    assert!(o.content.starts_with("Created job"), "{}", o.content);
+    let saved = f.ws.list_jobs().unwrap();
+    assert_eq!(saved.len(), 1);
+    let j = f.ws.get_job(&saved[0].id).unwrap();
+    assert_eq!(j.nodes.len(), 3);
+    assert_eq!(j.edges.len(), 2, "results.ai_orders links the steps");
+    let g = c.call("get_job", &json!({"job": "revenue by country"})).await.content;
+    assert!(g.contains("ai_by_country = query on \"Results") && g.contains("(after ai_orders)"), "{g}");
+    assert!(c.call("list_jobs", &json!({})).await.content.contains("Revenue by country"));
+    // A second job can't take the same output names.
+    assert!(c.call("create_job", &job).await.content.contains("already"));
+}

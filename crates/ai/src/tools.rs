@@ -28,17 +28,17 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
         s(
             "search_schema",
             "Search the connection's tables, views, columns and business notes by keywords. Returns the best matching tables as compact DDL. Use this before writing SQL when unsure which tables exist.",
-            json!({"type": "object", "properties": {"query": {"type": "string", "description": "Keywords, e.g. 'monthly revenue by customer'"}}, "required": ["query"]}),
+            json!({"type": "object", "properties": {"query": {"type": "string", "description": "Keywords, e.g. 'monthly revenue by customer'"}, "connection": {"type": "string", "description": "Another connection (name from list_connections); default: the current one"}}, "required": ["query"]}),
         ),
         s(
             "describe_table",
             "Get columns, types, keys, comments and related tables for one table or view.",
-            json!({"type": "object", "properties": {"table": {"type": "string", "description": "schema.table or table"}}, "required": ["table"]}),
+            json!({"type": "object", "properties": {"table": {"type": "string", "description": "schema.table or table"}, "connection": {"type": "string", "description": "Another connection (name from list_connections); default: the current one"}}, "required": ["table"]}),
         ),
         s(
             "list_tables",
             "List indexed table names (optionally only in one schema). Use search_schema for relevance ranking.",
-            json!({"type": "object", "properties": {"schema": {"type": "string"}}}),
+            json!({"type": "object", "properties": {"schema": {"type": "string"}, "connection": {"type": "string", "description": "Another connection (name from list_connections); default: the current one"}}}),
         ),
         s(
             "get_sample_rows",
@@ -84,6 +84,26 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
             "update_knowledge_note",
             "Correct or extend an existing note (id from list_knowledge_notes) with the full new text, keeping facts that are still true. Also used to merge imported notes into existing ones.",
             json!({"type": "object", "properties": {"id": {"type": "string"}, "note": {"type": "string", "description": "Complete new text"}, "target": {"type": "string"}}, "required": ["id", "note"]}),
+        ),
+        s(
+            "list_connections",
+            "List the user's connections the assistant may use (name, engine, environment, read-only), including the Results (DuckDB) connection that combines outputs. Use it to plan jobs that read from several databases.",
+            json!({"type": "object", "properties": {}}),
+        ),
+        s(
+            "list_jobs",
+            "List the user's jobs (steps, schedule, last run status).",
+            json!({"type": "object", "properties": {"filter": {"type": "string"}}}),
+        ),
+        s(
+            "get_job",
+            "Show one job in full: each step's action, connection, SQL, links (runs after), load/export settings and last run outcome (errors included).",
+            json!({"type": "object", "properties": {"job": {"type": "string", "description": "Job name or id"}}, "required": ["job"]}),
+        ),
+        s(
+            "create_job",
+            "Create a job (asks the user to approve): SQL steps that run in order, by hand or on a schedule. Steps can run on different connections; a step on \"Results\" reads earlier steps' outputs as results.<step> with DuckDB SQL, to join data across databases. Then load steps write rows into a table of any connection and export steps save a file. Check table names with search_schema / describe_table (connection argument) first.",
+            crate::jobs::create_job_schema(),
         ),
         s(
             "save_query",
@@ -175,6 +195,10 @@ impl ToolContext {
             "update_knowledge_note" => self.update_note(args).await,
             "list_knowledge_notes" => self.list_notes(args),
             "save_query" => self.save_query(args).await,
+            "list_connections" => self.list_connections(),
+            "list_jobs" => self.list_jobs(args),
+            "get_job" => self.get_job(args),
+            "create_job" => self.create_job(args).await,
             "get_editor" => match self.host.editor_state().await {
                 Some(v) => Ok(out(v.to_string(), v)),
                 None => Err(AiError::Policy("no editor available".into())),
@@ -192,16 +216,122 @@ impl ToolContext {
         }
     }
 
+    /// Connection a schema tool looks at: `connection` (name or id) or the current one.
+    fn schema_target(&self, args: &Value) -> Result<ConnectionProfile> {
+        let Some(want) = args.get("connection").and_then(|c| c.as_str()).map(str::trim).filter(|c| !c.is_empty()) else {
+            return Ok(self.profile.clone());
+        };
+        if want == self.profile.id || want.eq_ignore_ascii_case(&self.profile.name) {
+            return Ok(self.profile.clone());
+        }
+        let refs = self.conn_refs()?;
+        let c = crate::jobs::resolve_conn(&refs, want)?;
+        Ok(self.engine.workspace().get_connection(&c.id)?)
+    }
+
+    /// Connections for jobs: every saved one, plus the Results (DuckDB) connection.
+    fn conn_refs(&self) -> Result<Vec<crate::jobs::ConnRef>> {
+        let results = self.engine.results_connection().ok().map(|p| p.id);
+        Ok(self
+            .engine
+            .workspace()
+            .list_connections()?
+            .into_iter()
+            .map(|p| crate::jobs::ConnRef {
+                results: results.as_deref() == Some(p.id.as_str()),
+                ai_enabled: p.ai_policy.ai_enabled || results.as_deref() == Some(p.id.as_str()),
+                read_only: p.config.read_only,
+                kind: p.config.kind,
+                name: p.name,
+                id: p.id,
+            })
+            .collect())
+    }
+
+    fn list_connections(&self) -> Result<ToolOutput> {
+        let ws = self.engine.workspace();
+        let results = self.engine.results_connection().ok().map(|p| p.id);
+        let mut text = String::new();
+        let mut shown = Vec::new();
+        for p in ws.list_connections()? {
+            let is_results = results.as_deref() == Some(p.id.as_str());
+            if !p.ai_policy.ai_enabled && !is_results {
+                continue;
+            }
+            let env = serde_json::to_value(p.env).ok().and_then(|v| v.as_str().map(str::to_string)).filter(|e| e != "none");
+            let indexed = ws.kn_count(&p.id).unwrap_or(0);
+            text.push_str(&format!(
+                "- \"{}\" · {}{}{}{}{}\n",
+                p.name,
+                p.config.kind.dialect_name(),
+                env.as_deref().map(|e| format!(" · {e}")).unwrap_or_default(),
+                if p.config.read_only { " · read-only" } else { "" },
+                if p.id == self.profile.id { " · current" } else { "" },
+                if is_results { " · Results: DuckDB over outputs (results.<name>), use it to combine connections in a job".to_string() } else { format!(" · {indexed} tables indexed") },
+            ));
+            shown.push(json!({"id": p.id, "name": p.name, "kind": p.config.kind}));
+        }
+        self.audit("list_connections", &json!({}), "allowed", Some(&format!("{} connections", shown.len())));
+        Ok(out(text, json!({"connections": shown})))
+    }
+
+    fn list_jobs(&self, args: &Value) -> Result<ToolOutput> {
+        let f = args.get("filter").and_then(|f| f.as_str()).unwrap_or("").to_lowercase();
+        let jobs = self.engine.workspace().list_jobs()?;
+        let mut text = String::new();
+        for j in jobs.iter().filter(|j| f.is_empty() || j.name.to_lowercase().contains(&f) || j.step_names.iter().any(|n| n.to_lowercase().contains(&f))) {
+            let last = j.last_run.as_ref().map(|r| format!(" · last run {}", r.status)).unwrap_or_default();
+            let sch = if j.schedule.enabled { " · scheduled" } else { "" };
+            text.push_str(&format!("- \"{}\" (id {}): steps {}{sch}{last}\n", j.name, j.id, j.step_names.join(", ")));
+        }
+        if text.is_empty() {
+            text = "No jobs.".into();
+        }
+        self.audit("list_jobs", args, "allowed", None);
+        Ok(out(text, json!({"count": jobs.len()})))
+    }
+
+    fn get_job(&self, args: &Value) -> Result<ToolOutput> {
+        let want = arg(args, "job")?;
+        let ws = self.engine.workspace();
+        let id = ws
+            .list_jobs()?
+            .into_iter()
+            .find(|j| j.id == want || j.name.eq_ignore_ascii_case(want))
+            .map(|j| j.id)
+            .ok_or_else(|| AiError::Policy(format!("no job \"{want}\" (see list_jobs)")))?;
+        let job = ws.get_job(&id)?;
+        self.audit("get_job", args, "allowed", None);
+        Ok(out(crate::jobs::describe(&job, &self.conn_refs()?), json!({"job_id": job.id, "name": job.name})))
+    }
+
+    async fn create_job(&self, args: &Value) -> Result<ToolOutput> {
+        let ws = self.engine.workspace();
+        let taken: std::collections::HashSet<String> = ws.job_step_names()?.into_iter().map(|(n, _)| n).collect();
+        let refs = self.conn_refs()?;
+        let (job, notes) = crate::jobs::build_job(args, &refs, &taken)?;
+        let preview = crate::jobs::describe(&job, &refs);
+        self.gate("create_job", Decision::Ask("Create a job".into()), &format!("\"{}\" with {} steps", job.name, job.nodes.len()), &json!({"preview": preview, "name": job.name}))
+            .await?;
+        let saved = ws.save_job(job)?;
+        let mut text = format!("Created job \"{}\" (id {}). It is not run yet; the user runs it from its tab (Run) or the schedule does.\n{preview}", saved.name, saved.id);
+        for n in notes {
+            text.push_str(&format!("Note: {n}\n"));
+        }
+        Ok(out(text, json!({"job_id": saved.id, "name": saved.name})))
+    }
+
     fn policy(&self) -> &databrain_workspace::AiPolicy {
         &self.profile.ai_policy
     }
 
     fn search_schema(&self, args: &Value) -> Result<ToolOutput> {
         let q = arg(args, "query")?;
-        let r = knowledge::retrieve(self.engine.workspace(), &self.profile.id, q, 8, 12_000)?;
+        let target = self.schema_target(args)?;
+        let r = knowledge::retrieve(self.engine.workspace(), &target.id, q, 8, 12_000)?;
         self.audit("search_schema", args, "allowed", Some(&format!("{} tables", r.tables.len())));
         if r.tables.is_empty() {
-            let hint = if self.engine.workspace().kn_count(&self.profile.id)? == 0 {
+            let hint = if self.engine.workspace().kn_count(&target.id)? == 0 {
                 "The knowledge index is empty; ask the user to index this connection (AI panel → Knowledge → Index)."
             } else {
                 "No matching tables. Try other keywords or list_tables."
@@ -220,11 +350,12 @@ impl ToolContext {
 
     fn describe_table(&self, args: &Value) -> Result<ToolOutput> {
         let t = arg(args, "table")?;
+        let target = self.schema_target(args)?;
         let ws = self.engine.workspace();
-        let o = ws.kn_get(&self.profile.id, t)?.ok_or_else(|| AiError::Policy(format!("table `{t}` not found in the index; use search_schema")))?;
+        let o = ws.kn_get(&target.id, t)?.ok_or_else(|| AiError::Policy(format!("table `{t}` not found in the index; use search_schema")))?;
         let full = o.full_name();
         let notes: Vec<String> = ws
-            .kn_notes(&self.profile.id)?
+            .kn_notes(&target.id)?
             .into_iter()
             .filter(|n| n.status == NoteStatus::Approved && n.target.as_deref().is_some_and(|x| databrain_workspace::target_mentions(x, &full, &o.name)))
             .map(|n| match n.target.as_deref() {
@@ -232,11 +363,11 @@ impl ToolContext {
                 _ => n.body,
             })
             .collect();
-        let pol = self.policy().clone();
+        let pol = target.ai_policy.clone();
         let mut text = knowledge::render_object(&o, &|c| is_pii(&pol, Some(&full), c), &notes);
         // Tables that reference this one.
         let refs: Vec<String> = ws
-            .kn_objects(&self.profile.id)?
+            .kn_objects(&target.id)?
             .into_iter()
             .filter(|x| x.foreign_keys.iter().any(|f| f.ref_table.eq_ignore_ascii_case(&o.name)))
             .map(|x| x.full_name())
@@ -251,10 +382,11 @@ impl ToolContext {
 
     fn list_tables(&self, args: &Value) -> Result<ToolOutput> {
         let schema = args.get("schema").and_then(|s| s.as_str());
+        let target = self.schema_target(args)?;
         let names: Vec<String> = self
             .engine
             .workspace()
-            .kn_objects(&self.profile.id)?
+            .kn_objects(&target.id)?
             .into_iter()
             .filter(|o| schema.is_none_or(|s| o.schema.eq_ignore_ascii_case(s)))
             .map(|o| o.full_name())
