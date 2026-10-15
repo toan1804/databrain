@@ -145,11 +145,30 @@ export function groupOf(kind: ObjectKind): ObjectGroupName {
   }
 }
 
-/** Objects grouped into explorer folders (empty folders left out). */
-export function groupObjects(objects: DbObject[]): [ObjectGroupName, DbObject[]][] {
+/** Folders each engine lists under a schema (shown even when empty). */
+const ENGINE_GROUPS: Record<ConnectorKind, ObjectGroupName[]> = {
+  postgres: ["Tables", "Views", "Materialized views", "Functions", "Procedures", "Sequences"],
+  mysql: ["Tables", "Views", "Functions", "Procedures"],
+  mssql: ["Tables", "Views", "Functions", "Procedures", "Sequences"],
+  oracle: ["Tables", "Views", "Materialized views", "Functions", "Procedures", "Packages", "Sequences"],
+  sqlite: ["Tables", "Views"],
+  duckdb: ["Tables", "Views", "Functions", "Sequences"],
+  snowflake: ["Tables", "Views", "Materialized views", "Functions", "Procedures", "Sequences"],
+  databricks: ["Tables", "Views", "Materialized views", "Functions"],
+  bigquery: ["Tables", "Views", "Materialized views", "Functions", "Procedures"],
+};
+
+/**
+ * Objects grouped into explorer folders. With `kind`, every folder the engine
+ * has is listed, also when the schema has none of that kind (so it is clear
+ * there are no functions, rather than that they are not shown); other folders
+ * only when they have objects. Without `kind`, only non-empty folders.
+ */
+export function groupObjects(objects: DbObject[], kind?: ConnectorKind): [ObjectGroupName, DbObject[]][] {
   const g = new Map<ObjectGroupName, DbObject[]>(OBJECT_GROUPS.map((n) => [n, []]));
   for (const o of objects) g.get(groupOf(o.kind))!.push(o);
-  return [...g].filter(([, v]) => v.length > 0);
+  const always = new Set(kind ? ENGINE_GROUPS[kind] : []);
+  return [...g].filter(([n, v]) => v.length > 0 || always.has(n));
 }
 
 /** Folders that start open: things you query. Routines and sequences start closed. */

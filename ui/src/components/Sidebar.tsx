@@ -44,6 +44,7 @@ import { api, toError } from "../lib/api";
 import type { ConnectionView, DbObject, HistoryEntry, NotebookSummary, SavedQuery, SchemaInfo } from "../lib/types";
 import {
   GROUP_PAGE,
+  RESULTS_SCHEMA_ID,
   isRelationKind,
   columnList,
   groupObjects,
@@ -674,7 +675,10 @@ function SchemaNode({ conn, schema: info, depth, defaultOpen }: { conn: Connecti
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expanded]);
 
-  const groups = useMemo(() => groupObjects(objects ?? []), [objects]);
+  // Every folder the engine has, also empty ones; DuckDB's attached files and
+  // outputs are views only, so they keep the plain list.
+  const virtual = conn.config.kind === "duckdb" && (schema.endsWith(".files") || schema === RESULTS_SCHEMA_ID);
+  const groups = useMemo(() => (objects ? groupObjects(objects, virtual ? undefined : conn.config.kind) : []), [objects, virtual, conn.config.kind]);
   // Only tables (or only views): no folder row, unless the list needs paging/filtering.
   const flat = groups.length === 1 && groupOpenByDefault(groups[0][0]) && groups[0][1].length <= GROUP_PAGE;
 
@@ -725,7 +729,7 @@ function SchemaNode({ conn, schema: info, depth, defaultOpen }: { conn: Connecti
         (flat
           ? groups[0][1].map((o) => <ObjectNode key={`${o.kind}:${o.name}`} obj={o} conn={conn} depth={depth + 1} />)
           : groups.map(([name, items]) => <ObjectGroup key={name} name={name} items={items} conn={conn} schema={schema} depth={depth + 1} />))}
-      {expanded && objects?.length === 0 && <div className="py-1 text-[12px] text-muted" style={{ paddingLeft: 26 + (depth + 1) * 14 }}>Empty</div>}
+      {expanded && objects?.length === 0 && virtual && <div className="py-1 text-[12px] text-muted" style={{ paddingLeft: 26 + (depth + 1) * 14 }}>Empty</div>}
     </div>
   );
 }
@@ -768,6 +772,11 @@ function ObjectGroup({ name, items, conn, schema, depth }: { name: ObjectGroupNa
         </div>
       )}
       {open && shown.map((o) => <ObjectNode key={`${o.kind}:${o.name}`} obj={o} conn={conn} depth={depth + 1} />)}
+      {open && items.length === 0 && (
+        <div className="py-1 text-[12px] text-muted" style={{ paddingLeft: 26 + (depth + 1) * 14 }}>
+          No {name.toLowerCase()}
+        </div>
+      )}
       {open && filter && matched === 0 && <div className="py-1 text-[12px] text-muted" style={{ paddingLeft: 26 + (depth + 1) * 14 }}>No match</div>}
       {open && rest > 0 && (
         <div className="flex items-center gap-2 py-0.5 text-[12px]" style={{ paddingLeft: 26 + (depth + 1) * 14 }}>

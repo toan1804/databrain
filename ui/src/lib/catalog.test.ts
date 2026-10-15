@@ -111,6 +111,11 @@ describe("catalog: big schemas and schema filter", () => {
     ]);
     expect(groupOpenByDefault("Tables")).toBe(true);
     expect(groupOpenByDefault("Sequences")).toBe(false);
+    // With the engine: all of its folders, empty ones too.
+    const only = [{ schema: "s", name: "t", kind: "table" as const }];
+    expect(groupObjects(only, "mysql").map(([n, v]) => [n, v.length])).toEqual([["Tables", 1], ["Views", 0], ["Functions", 0], ["Procedures", 0]]);
+    expect(groupObjects(only, "oracle").map(([n]) => n)).toEqual(["Tables", "Views", "Materialized views", "Functions", "Procedures", "Packages", "Sequences"]);
+    expect(groupObjects(only, "sqlite").map(([n]) => n)).toEqual(["Tables", "Views"]);
     expect(revealKeys("c", { schema: "s", name: "seq", kind: "sequence" })).toContain(treeKey.group("c", "s", "Sequences"));
   });
 
