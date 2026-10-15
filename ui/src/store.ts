@@ -124,6 +124,24 @@ export interface SignInState {
   connectionId: string | null;
   label: string;
   event: AuthEvent | null;
+  /**
+   * Opened by the backend's own sign-in (connecting from the explorer, a
+   * query, completion…), not by a Sign in button that closes it when its
+   * call returns: closed as soon as the browser hands the sign-in back.
+   */
+  implicit?: boolean;
+}
+
+/**
+ * Next sign-in dialog state for an auth event. A dialog opened by an explicit
+ * sign-in stays until that call returns ("Finishing sign-in…"); one the
+ * backend opened on its own closes when the sign-in finishes, since nothing
+ * else would close it (the connection then just carries on).
+ */
+export function nextSignIn(cur: SignInState | null, event: AuthEvent): SignInState | null {
+  if (event.type === "finished") return cur && !cur.implicit ? { ...cur, event } : null;
+  if (cur) return { ...cur, event };
+  return { connectionId: null, label: "Sign in", event, implicit: true };
 }
 
 interface State {
@@ -630,9 +648,13 @@ export const useStore = create<State>((set, get) => ({
       }).catch(() => {});
       void import("./components/OracleClient").then((m) => m.checkOracleClientAtStartup());
       await onAuthEvent((event) => {
-        const cur = get().signIn;
-        if (event.type === "finished") set({ signIn: cur ? { ...cur, event } : null });
-        else set({ signIn: { connectionId: cur?.connectionId ?? null, label: cur?.label ?? "Sign in", event } });
+        const was = get().signIn;
+        const next = nextSignIn(was, event);
+        set({ signIn: next });
+        if (event.type === "finished" && was?.implicit) {
+          // The connection the sign-in was for is connected (or failed) now.
+          void get().refreshConnections().catch(() => {});
+        }
       });
       void get().refreshFolders();
       void get().refreshNotebooks();

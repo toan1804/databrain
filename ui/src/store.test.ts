@@ -158,3 +158,18 @@ describe("dropping outputs", () => {
     expect(st.runs.t.statements[0].notices.at(-1)).toMatch(/dropped/);
   });
 });
+
+describe("sign-in dialog", () => {
+  it("closes on its own when the backend signed in by itself, stays for an explicit sign-in", async () => {
+    const { nextSignIn } = await import("./store");
+    const opened = nextSignIn(null, { type: "browser_opened", url: "https://x" });
+    expect(opened?.implicit).toBe(true);
+    expect(nextSignIn(opened, { type: "finished" })).toBeNull();
+    const explicit = { connectionId: "c", label: "Sign in to dbx", event: null };
+    const waiting = nextSignIn(explicit, { type: "browser_opened", url: "https://x" });
+    expect(waiting?.label).toBe("Sign in to dbx");
+    expect(waiting?.implicit).toBeFalsy();
+    expect(nextSignIn(waiting, { type: "finished" })?.event).toEqual({ type: "finished" });
+    expect(nextSignIn(null, { type: "finished" })).toBeNull();
+  });
+});
