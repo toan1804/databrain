@@ -255,6 +255,7 @@ impl KiroProvider {
                 kiro_session = Some(prev.clone());
             }
         }
+        let resumed = kiro_session.is_some();
         let kiro_session = match kiro_session {
             Some(s) => s,
             None => {
@@ -307,7 +308,12 @@ impl KiroProvider {
                 _ => {}
             }
         };
-        let prompt = json!({"sessionId": kiro_session, "prompt": [{"type": "text", "text": t.prompt}]});
+        let text_in = if resumed || t.history.trim().is_empty() {
+            t.prompt.clone()
+        } else {
+            format!("[Earlier in this conversation]\n{}\n[/Earlier in this conversation]\n\n{}", t.history.trim(), t.prompt)
+        };
+        let prompt = json!({"sessionId": kiro_session, "prompt": [{"type": "text", "text": text_in}]});
         let result = acp.call(&mut incoming, "session/prompt", prompt, &t.cancel, on_update).await;
         if matches!(result, Err(AiError::Cancelled)) {
             // Ask Kiro to stop, give it a moment, then the child is killed on drop.
@@ -339,6 +345,9 @@ pub(crate) struct KiroTurn {
     pub cancel: CancellationToken,
     pub previous_session: Option<String>,
     pub save_session: Option<SaveSession>,
+    /// Earlier turns of this conversation as text, sent when Kiro can't
+    /// continue its own session (so the question keeps its context).
+    pub history: String,
 }
 
 #[async_trait]

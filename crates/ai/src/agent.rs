@@ -200,6 +200,28 @@ query_outputs (DuckDB SQL over results.<name>, can join outputs) or result_summa
 current connection. SQL you write for them (write_editor) is DuckDB SQL, runs on the Results (DuckDB) connection, and must start \
 with the line: -- Runs locally on DuckDB (Results connection): outputs are results.<name>, DuckDB SQL syntax.";
 
+/// Earlier turns as plain text (newest kept, about 12k characters), for
+/// providers that only get the latest prompt. Tool calls are summarised.
+fn history_text(messages: &[Message]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut size = 0;
+    for m in messages.iter().rev() {
+        let body = match m.role {
+            Role::User => format!("User: {}", m.text.trim()),
+            Role::Assistant if !m.text.trim().is_empty() => format!("Assistant: {}", m.text.trim()),
+            _ => continue,
+        };
+        let body: String = body.chars().take(3000).collect();
+        size += body.len();
+        if size > 12_000 {
+            break;
+        }
+        parts.push(body);
+    }
+    parts.reverse();
+    parts.join("\n\n")
+}
+
 fn user_turn(req: &AgentRequest) -> String {
     let c = &req.context;
     let mut t = req.message.clone();
@@ -366,6 +388,7 @@ impl Agent {
                     sink: sink.clone(),
                     cancel: cancel.clone(),
                     previous_session: previous,
+                    history: history_text(&messages[..messages.len().saturating_sub(1)]),
                     save_session: Some(Box::new(move |k: &str| {
                         let _ = ws2.set_setting(&key, &json!(k));
                     })),
@@ -478,6 +501,14 @@ mod tests {
         assert!(t.contains("[Editor SQL (whole script, for context only)]"));
         // The selection is the failed statement: not sent twice.
         assert!(!t.contains("[Selected SQL]"));
+    }
+
+    #[test]
+    fn history_keeps_earlier_turns_in_order() {
+        let msgs = vec![Message::user("top 5 customers?"), Message::assistant("Here they are: …", vec![]), Message::user("and by month?")];
+        let h = history_text(&msgs[..2]);
+        assert_eq!(h, "User: top 5 customers?\n\nAssistant: Here they are: …");
+        assert!(history_text(&[]).is_empty());
     }
 
     #[test]

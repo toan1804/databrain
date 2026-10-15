@@ -236,14 +236,24 @@ export function visibleItems(items: ChatItem[]): ChatItem[] {
 }
 
 export const useAi = create<AiState>((set, get) => {
+  /** Events and UI requests that arrived before ai_send returned the run id. */
+  let early: AgentEvent[] = [];
+  let earlyRequests: AiUiRequest[] = [];
   const patchItem = (id: string, patch: Partial<ChatItem>) =>
     set((s) => ({ items: s.items.map((i) => (i.id === id ? ({ ...i, ...patch } as ChatItem) : i)) }));
 
   const handleAgent = (e: AgentEvent) => {
-    if (e.run_id !== get().runId) return;
+    if (e.run_id !== get().runId) {
+      // Events of the run being started arrive before ai_send returns its id:
+      // keep them and replay them once the id is known (dropping "started"
+      // lost the session id, so every question began a new conversation).
+      if (get().running && get().runId === null) early.push(e);
+      return;
+    }
+    // The conversation continues in this session, whichever event says so first.
+    if (e.session_id && get().sessionId !== e.session_id) set({ sessionId: e.session_id });
     switch (e.type) {
       case "started":
-        set({ sessionId: e.session_id });
         break;
       case "text_delta":
         set((s) => {
@@ -331,6 +341,10 @@ export const useAi = create<AiState>((set, get) => {
 
   const handleRequest = (r: AiUiRequest) => {
     if (r.run_id !== get().runId) {
+      if (get().running && get().runId === null) {
+        earlyRequests.push(r);
+        return;
+      }
       // Stale run: decline so the backend does not wait for the timeout.
       void api.aiRespond(r.request_id, r.type === "edit_proposal" ? { accepted: false } : { approved: false });
       return;
@@ -540,14 +554,16 @@ export const useAi = create<AiState>((set, get) => {
         result_id: rc.resultId,
         ...context,
       };
-      // A different connection starts a new session.
-      const sessionId = get().connectionId === conn ? get().sessionId : null;
+      // One conversation across questions, also after switching connections
+      // (each turn is told which connection it is on). New chat starts over.
+      const sessionId = get().sessionId;
       set((s) => ({
         open: true,
         view: "chat",
         items: sessionId ? [...s.items, { id: uid(), kind: "user", text: message, mode }] : [{ id: uid(), kind: "user", text: message, mode }],
         sessionId,
         running: true,
+        runId: null,
         lastInput: input,
         targetKey: key,
         connectionId: conn,
@@ -566,6 +582,13 @@ export const useAi = create<AiState>((set, get) => {
           tab_id: key,
         });
         set({ runId });
+        // Replay what this run sent before its id was known.
+        const evs = early.filter((x) => x.run_id === runId);
+        const reqs = earlyRequests.filter((x) => x.run_id === runId);
+        early = [];
+        earlyRequests = [];
+        for (const x of evs) handleAgent(x);
+        for (const x of reqs) handleRequest(x);
       } catch (e) {
         const err = toError(e);
         set((s) => ({
