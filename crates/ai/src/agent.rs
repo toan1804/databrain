@@ -60,6 +60,9 @@ pub struct UiContext {
     pub failed_sql: Option<String>,
     /// Its 1-based line in the editor, when found there.
     pub failed_line: Option<u32>,
+    /// Job open in the active tab: the user is asking about it.
+    pub open_job_id: Option<String>,
+    pub open_job_name: Option<String>,
     pub result_id: Option<String>,
     /// Outputs the user mentioned with @ (handles or names).
     pub mentions: Vec<String>,
@@ -255,6 +258,12 @@ fn user_turn(req: &AgentRequest) -> String {
     }
     if let Some(r) = &c.result_id {
         t.push_str(&format!("\n\n[Current result_id: {r}]"));
+    }
+    if let Some(id) = c.open_job_id.as_deref().filter(|s| !s.is_empty()) {
+        t.push_str(&format!(
+            "\n\n[Open job: \"{}\" (id {id}). The user is looking at this job: \"the job\" / \"this job\" means it. Read it with get_job before answering; change it with update_job.]",
+            c.open_job_name.as_deref().unwrap_or("job")
+        ));
     }
     t
 }
@@ -503,6 +512,8 @@ mod tests {
         assert!(t.contains("[Editor SQL (whole script, for context only)]"));
         // The selection is the failed statement: not sent twice.
         assert!(!t.contains("[Selected SQL]"));
+        let j = AgentRequest { context: UiContext { open_job_id: Some("j1".into()), open_job_name: Some("Daily revenue".into()), ..Default::default() }, ..r };
+        assert!(user_turn(&j).contains("[Open job: \"Daily revenue\" (id j1)"));
     }
 
     #[test]

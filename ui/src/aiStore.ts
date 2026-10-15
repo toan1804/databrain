@@ -190,7 +190,8 @@ function defaultTargetKey(): string | null {
   if (focused && (focused === active?.id || (active?.notebook_id && focused.startsWith(`nb:${active.notebook_id}:`)))) {
     return focused;
   }
-  return active?.notebook_id || active?.ddl ? null : (active?.id ?? null);
+  // Only query tabs have an editor to read or write.
+  return active?.notebook_id || active?.ddl || active?.job_id || active?.lineage || active?.output_ref ? null : (active?.id ?? null);
 }
 
 /** What the assistant is doing now, for the status line while it works. */

@@ -718,6 +718,9 @@ export interface UiContext {
   failed_sql?: string | null;
   /** Its 1-based line in the editor, when found there. */
   failed_line?: number | null;
+  /** Job open in the active tab (the user is asking about it). */
+  open_job_id?: string | null;
+  open_job_name?: string | null;
   result_id?: string | null;
   mentions?: string[];
 }

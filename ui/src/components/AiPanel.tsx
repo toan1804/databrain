@@ -22,6 +22,7 @@ import {
   Sparkles,
   Square,
   Trash2,
+  Workflow,
   Wrench,
   X,
   ListChecks,
@@ -40,7 +41,7 @@ import { ImportNotesDialog } from "./ImportNotesDialog";
 import { NoteTargetInput, type TargetState } from "./NoteTargetInput";
 import { editorBridge } from "../editorBridge";
 import { Markdown } from "./Markdown";
-import { extractMentions, mentionToken } from "../outputs";
+import { extractMentions, mentionToken, resultsConnection } from "../outputs";
 import { ResultGrid } from "./ResultGrid";
 import { ComboInput, ConnDot } from "./ui";
 
@@ -124,7 +125,18 @@ function Chat() {
   const scroller = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
 
-  const connId = connectionForKey(activeTab?.id) ?? aiConn ?? activeTab?.connection_id ?? null;
+  // A job tab has no connection of its own: the assistant works on jobs
+  // there, on the last connection it used, else the Results (DuckDB) one.
+  const jobTab = activeTab?.job_id ? { id: activeTab.job_id, name: activeTab.title } : null;
+  // Sidebar → Jobs with no connection in the editor: ask about jobs the same way.
+  const jobsPanel = useStore((s) => s.sidebarPanel === "jobs");
+  const [resultsId, setResultsId] = useState<string | null>(null);
+  const editorConn = jobTab ? null : (connectionForKey(activeTab?.id) ?? aiConn ?? activeTab?.connection_id ?? null);
+  const needsJobConn = (!!jobTab || (jobsPanel && !editorConn)) && !(aiConn && connections.some((c) => c.id === aiConn && c.ai_policy?.ai_enabled !== false));
+  useEffect(() => {
+    if (needsJobConn && !resultsId) void resultsConnection().then(setResultsId).catch(() => {});
+  }, [needsJobConn, resultsId]);
+  const connId = jobTab || (jobsPanel && !editorConn) ? (needsJobConn ? resultsId : aiConn) : editorConn;
   const conn = connections.find((c) => c.id === connId);
   const provider = providers.find((p) => p.id === providerId);
 
@@ -184,7 +196,11 @@ function Chat() {
     // While the assistant works the question waits and is sent when it finishes.
     if (!msg.trim()) return;
     const mentions = extractMentions(msg, outputs);
-    void send({ message: msg.trim(), mode: m, connectionId: connId, context: mentions.length ? { mentions } : undefined });
+    const context = {
+      ...(mentions.length ? { mentions } : {}),
+      ...(jobTab ? { open_job_id: jobTab.id, open_job_name: jobTab.name } : {}),
+    };
+    void send({ message: msg.trim(), mode: m, connectionId: connId, targetKey: jobTab ? null : undefined, context: Object.keys(context).length ? context : undefined });
     setText("");
     setMode("chat");
   };
@@ -298,10 +314,14 @@ function Chat() {
             aria-label="Message the assistant"
             placeholder={
               !conn
-                ? "Choose a connection in the editor first"
+                ? jobTab
+                  ? "Preparing the assistant for jobs…"
+                  : "Choose a connection in the editor first"
                 : running
                   ? "The assistant is working… type your next question, it is sent when it finishes"
-                  : `Ask about ${conn.name}… @ to mention an output  (↵ send, ⇧↵ newline)`
+                  : jobTab
+                    ? `Ask about the job "${jobTab.name}": explain it, fix its errors, add a step…  (↵ send)`
+                    : `Ask about ${conn.name}… @ to mention an output  (↵ send, ⇧↵ newline)`
             }
             className="block w-full resize-none bg-transparent px-2.5 py-2 text-[13px] outline-none"
             onChange={(e) => {
@@ -338,6 +358,12 @@ function Chat() {
               <ConnDot color={conn?.color} connected={conn?.connected} />
               <span className="truncate">{conn?.name ?? "no connection"}</span>
             </span>
+            {jobTab && (
+              <span className="flex min-w-0 shrink items-center gap-1 rounded bg-accent/10 px-1 text-[11px] text-accent" title="The assistant knows which job is open">
+                <Workflow size={10} className="shrink-0" />
+                <span className="truncate">{jobTab.name}</span>
+              </span>
+            )}
             <select
               className="ml-auto h-6 max-w-[110px] rounded border border-line bg-panel px-1 text-[11px] outline-none"
               aria-label="AI provider"
