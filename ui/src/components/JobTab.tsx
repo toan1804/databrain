@@ -104,6 +104,22 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
         setJob(j);
       })
       .catch((e) => setLoadError(toError(e).message));
+    // Changed elsewhere (the assistant's update_job): show the saved version.
+    const onChanged = (ev: Event) => {
+      if ((ev as CustomEvent<{ id: string }>).detail?.id !== jobId) return;
+      clearTimeout(timer.current);
+      dirty.current = false;
+      void api
+        .getJob(jobId)
+        .then((j) => {
+          latest.current = j;
+          setJob(j);
+          setSave({ state: "saved" });
+        })
+        .catch(() => {});
+    };
+    window.addEventListener("db:job-changed", onChanged);
+    return () => window.removeEventListener("db:job-changed", onChanged);
   }, [jobId]);
 
   const persist = useCallback(async () => {

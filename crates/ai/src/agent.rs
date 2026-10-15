@@ -145,7 +145,9 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
          optional before/after SQL); an export step saves them to a CSV/Parquet/JSON file. Use list_jobs / get_job to explain or \
          debug a job. To build one: list_connections, check each source's tables with search_schema / describe_table (connection \
          argument), write each step in its connection's dialect, then create_job; keep source queries filtered and narrow, and do \
-         the joins across databases in a Results step.\n",
+         the joins across databases in a Results step. To change or fix a job: get_job (it shows the latest run's errors and the \
+         failing statement, and the job's spec), find the cause (describe_table on the step's connection, run_query to test a \
+         corrected SELECT), then update_job with the complete corrected spec; never create a second job to fix one.\n",
         profile.name,
         kind.dialect_name(),
         server.map(|v| format!(" ({v})")).unwrap_or_default(),

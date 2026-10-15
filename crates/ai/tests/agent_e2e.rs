@@ -744,4 +744,25 @@ async fn creates_a_job_across_connections() {
     assert!(c.call("list_jobs", &json!({})).await.content.contains("Revenue by country"));
     // A second job can't take the same output names.
     assert!(c.call("create_job", &job).await.content.contains("already"));
+    assert!(g.contains("Spec (edit and send to update_job)"), "{g}");
+
+    // Fix the job: change a step's SQL, drop the export, add a schedule.
+    let fix = json!({
+        "job": "Revenue by country",
+        "steps": [
+            {"name": "ai_orders", "connection": profile.name, "sql": "select country, amount from orders where amount > 0"},
+            {"name": "ai_by_country", "connection": "Results", "sql": "select country, sum(amount) total from results.ai_orders group by 1"}
+        ],
+        "schedule": {"daily_at": "07:00"}
+    });
+    assert!(ctx(false).call("update_job", &fix).await.content.contains("declined"));
+    assert_eq!(f.ws.get_job(&j.id).unwrap().nodes.len(), 3, "unchanged when declined");
+    let o = c.call("update_job", &fix).await;
+    assert!(o.content.starts_with("Updated job") && o.content.contains("changes step ai_orders") && o.content.contains("removes step ai_file"), "{}", o.content);
+    let after = f.ws.get_job(&j.id).unwrap();
+    assert_eq!(after.nodes.len(), 2);
+    assert_eq!(after.nodes[0].id, j.nodes[0].id, "the step kept its id");
+    assert!(after.schedule.enabled && after.schedule.at == "07:00");
+    // Same again: nothing to change.
+    assert!(c.call("update_job", &fix).await.content.starts_with("Nothing changes"));
 }

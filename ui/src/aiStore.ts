@@ -281,11 +281,13 @@ export const useAi = create<AiState>((set, get) => {
         }));
         if (e.tool === "add_knowledge_note" || e.tool === "update_knowledge_note") set((s) => ({ knowledgeVersion: s.knowledgeVersion + 1 }));
         if (e.tool === "save_query") void useStore.getState().refreshSavedQueries();
-        if (e.tool === "create_job") {
+        if (e.tool === "create_job" || e.tool === "update_job") {
           // Show the new job: refresh the Jobs list and open it in a tab.
           const d = e.display as { job_id?: string; name?: string } | null;
           if (d?.job_id) {
             const { job_id, name } = d;
+            // An open job tab shows the new version.
+            if (e.tool === "update_job") window.dispatchEvent(new CustomEvent("db:job-changed", { detail: { id: job_id } }));
             void import("./jobsStore").then(({ useJobs }) =>
               useJobs
                 .getState()

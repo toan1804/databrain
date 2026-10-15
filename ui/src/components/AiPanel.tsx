@@ -523,6 +523,7 @@ const TOOL_LABELS: Record<string, string> = {
   list_jobs: "Listed jobs",
   get_job: "Read job",
   create_job: "Created job",
+  update_job: "Updated job",
 };
 
 function ToolCard({ item }: { item: Extract<ChatItem, { kind: "tool" }> }) {
@@ -586,7 +587,7 @@ function ApprovalCard({
     <div className={`rounded-lg border p-2 text-[12.5px] ${pending ? "border-warning/50 bg-warning/5" : "border-line"}`}>
       <div className="mb-1 flex items-center gap-1.5 font-medium">
         <ShieldAlert size={13} className="text-warning" />
-        {item.tool === "run_query" ? "Run this query?" : item.tool === "create_job" ? "Create this job?" : `Allow ${item.tool}?`}
+        {item.tool === "run_query" ? "Run this query?" : item.tool === "create_job" ? "Create this job?" : item.tool === "update_job" ? "Change this job?" : `Allow ${item.tool}?`}
         {!pending && (
           <span className={`ml-auto text-[11px] ${item.state === "approved" ? "text-success" : "text-muted"}`}>
             {item.state === "approved" ? "Approved" : "Declined"}

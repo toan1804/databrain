@@ -97,13 +97,18 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
         ),
         s(
             "get_job",
-            "Show one job in full: each step's action, connection, SQL, links (runs after), load/export settings and last run outcome (errors included).",
+            "Show one job in full: each step's action, connection, SQL, links (runs after), load/export settings, last run outcome and the errors of its latest run (with the failing SQL), plus its spec as JSON to edit with update_job.",
             json!({"type": "object", "properties": {"job": {"type": "string", "description": "Job name or id"}}, "required": ["job"]}),
         ),
         s(
             "create_job",
             "Create a job (asks the user to approve): SQL steps that run in order, by hand or on a schedule. Steps can run on different connections; a step on \"Results\" reads earlier steps' outputs as results.<step> with DuckDB SQL, to join data across databases. Then load steps write rows into a table of any connection and export steps save a file. Check table names with search_schema / describe_table (connection argument) first.",
             crate::jobs::create_job_schema(),
+        ),
+        s(
+            "update_job",
+            "Change or fix an existing job (asks the user to approve, showing what changes): send the COMPLETE new list of steps in the create_job shape, starting from get_job's spec. Steps whose name is kept keep their place and history; steps left out are removed; use `rename` to rename steps (results.<old> in other steps follows). Omit schedule to keep it. Read the job and its latest errors with get_job first, and check tables with describe_table on the step's connection.",
+            crate::jobs::update_job_schema(),
         ),
         s(
             "save_query",
@@ -199,6 +204,7 @@ impl ToolContext {
             "list_jobs" => self.list_jobs(args),
             "get_job" => self.get_job(args),
             "create_job" => self.create_job(args).await,
+            "update_job" => self.update_job(args).await,
             "get_editor" => match self.host.editor_state().await {
                 Some(v) => Ok(out(v.to_string(), v)),
                 None => Err(AiError::Policy("no editor available".into())),
@@ -291,8 +297,8 @@ impl ToolContext {
         Ok(out(text, json!({"count": jobs.len()})))
     }
 
-    fn get_job(&self, args: &Value) -> Result<ToolOutput> {
-        let want = arg(args, "job")?;
+    /// The job a tool argument names (name or id).
+    fn find_job(&self, want: &str) -> Result<databrain_workspace::Job> {
         let ws = self.engine.workspace();
         let id = ws
             .list_jobs()?
@@ -300,9 +306,50 @@ impl ToolContext {
             .find(|j| j.id == want || j.name.eq_ignore_ascii_case(want))
             .map(|j| j.id)
             .ok_or_else(|| AiError::Policy(format!("no job \"{want}\" (see list_jobs)")))?;
-        let job = ws.get_job(&id)?;
+        Ok(ws.get_job(&id)?)
+    }
+
+    fn get_job(&self, args: &Value) -> Result<ToolOutput> {
+        let job = self.find_job(arg(args, "job")?)?;
+        let ws = self.engine.workspace();
+        let refs = self.conn_refs()?;
+        let mut text = crate::jobs::describe(&job, &refs);
+        // Latest run: what failed, with the statement (to fix it).
+        if let Some(run) = ws.job_runs(&job.id, 1)?.into_iter().next() {
+            text.push_str(&format!("\nLatest run ({}, {}){}\n", run.trigger, run.status, run.error.as_deref().map(|e| format!(": {e}")).unwrap_or_default()));
+            let log = ws.job_run_log(&job.id, run.id).unwrap_or_default();
+            let bad: Vec<_> = log.iter().filter(|l| l.level == "error" || l.level == "warning").collect();
+            for l in bad.iter().rev().take(15).rev() {
+                text.push_str(&format!("- [{}] {}{}\n", l.level, l.step.as_deref().map(|s| format!("{s}: ")).unwrap_or_default(), trunc(&l.message, 600)));
+                if let Some(sql) = &l.sql {
+                    text.push_str(&format!("  statement: {}\n", trunc(sql, 1500)));
+                }
+            }
+        }
+        text.push_str(&format!("\nSpec (edit and send to update_job):\n{}\n", serde_json::to_string_pretty(&crate::jobs::spec_of(&job, &refs)).unwrap_or_default()));
         self.audit("get_job", args, "allowed", None);
-        Ok(out(crate::jobs::describe(&job, &self.conn_refs()?), json!({"job_id": job.id, "name": job.name})))
+        Ok(out(text, json!({"job_id": job.id, "name": job.name})))
+    }
+
+    async fn update_job(&self, args: &Value) -> Result<ToolOutput> {
+        let old = self.find_job(arg(args, "job")?)?;
+        let ws = self.engine.workspace();
+        let taken: std::collections::HashSet<String> = ws.job_step_names()?.into_iter().filter(|(_, o)| o.job_id != old.id).map(|(n, _)| n).collect();
+        let refs = self.conn_refs()?;
+        let (job, notes) = crate::jobs::merge_job(&old, args, &refs, &taken)?;
+        let changes = crate::jobs::changes(&old, &job);
+        if changes.is_empty() {
+            return Ok(out("Nothing changes: the job is already like that.", json!({"job_id": old.id, "name": old.name})));
+        }
+        let preview = format!("Changes:\n{}\n\nAfter the change:\n{}", changes.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"), crate::jobs::describe(&job, &refs));
+        self.gate("update_job", Decision::Ask("Change a job".into()), &format!("\"{}\": {}", old.name, changes.join("; ")), &json!({"preview": preview, "name": old.name}))
+            .await?;
+        let saved = ws.save_job(job)?;
+        let mut text = format!("Updated job \"{}\". It is not run; the user runs it (Run) or its schedule does.\n{preview}", saved.name);
+        for n in notes {
+            text.push_str(&format!("\nNote: {n}"));
+        }
+        Ok(out(text, json!({"job_id": saved.id, "name": saved.name, "updated": true})))
     }
 
     async fn create_job(&self, args: &Value) -> Result<ToolOutput> {
