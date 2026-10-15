@@ -6,6 +6,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Clock,
   Copy,
   Database,
   FileCode2,
@@ -32,7 +33,7 @@ import { api, toError } from "../lib/api";
 import type { AiMode, AiSessionRecord, KnNote, KnObject, KnowledgeView, NotesImportPreview, ResultInfo } from "../lib/types";
 import { emptyView, formatCount, lineDiff, relativeTime, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
-import { connectionForKey, useAi, visibleItems, type ChatItem } from "../aiStore";
+import { connectionForKey, useAi, visibleItems, workingStatus, type ChatItem } from "../aiStore";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { exportFileName } from "../lib/notesImport";
 import { ImportNotesDialog } from "./ImportNotesDialog";
@@ -101,6 +102,9 @@ const QUICK: { mode: AiMode; label: string; prompt: string; icon: React.ReactNod
 function Chat() {
   const items = useAi((s) => s.items);
   const running = useAi((s) => s.running);
+  const queued = useAi((s) => s.queued);
+  const removeQueued = useAi((s) => s.removeQueued);
+  const sendQueued = useAi((s) => s.sendQueued);
   const send = useAi((s) => s.send);
   const cancel = useAi((s) => s.cancel);
   const providers = useAi((s) => s.providers);
@@ -177,7 +181,8 @@ function Chat() {
   };
 
   const submit = (msg = text, m = mode) => {
-    if (!msg.trim() || running) return;
+    // While the assistant works the question waits and is sent when it finishes.
+    if (!msg.trim()) return;
     const mentions = extractMentions(msg, outputs);
     void send({ message: msg.trim(), mode: m, connectionId: connId, context: mentions.length ? { mentions } : undefined });
     setText("");
@@ -224,14 +229,31 @@ function Chat() {
         {visibleItems(items).map((it) => (
           <ChatItemView key={it.id} item={it} />
         ))}
-        {running && items[items.length - 1]?.kind !== "assistant" && (
-          <div className="flex items-center gap-2 text-[12px] text-muted">
-            <Loader2 size={13} className="animate-spin" /> Thinking…
-          </div>
-        )}
       </div>
 
       <div className="shrink-0 border-t border-line p-2">
+        {running && <WorkingBar items={items} onStop={() => void cancel()} />}
+        {queued.length > 0 && (
+          <div className="mb-1.5 space-y-1" aria-label="Waiting questions">
+            {queued.map((q, i) => (
+              <div key={q.id} className="flex items-center gap-1.5 rounded-md border border-dashed border-line bg-panel-2 px-2 py-1 text-[11.5px]">
+                <Clock size={11} className="shrink-0 text-muted" />
+                <span className="min-w-0 flex-1 truncate" title={q.message}>
+                  {q.message}
+                </span>
+                <span className="shrink-0 text-muted">{running ? (i === 0 ? "sends when the assistant finishes" : "waiting") : "not sent"}</span>
+                {!running && i === 0 && (
+                  <button className="shrink-0 text-accent hover:underline" onClick={() => sendQueued(q.id)}>
+                    Send now
+                  </button>
+                )}
+                <button className="shrink-0 text-muted hover:text-fg" aria-label="Remove waiting question" title="Don't send" onClick={() => removeQueued(q.id)}>
+                  <X size={11} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         {aiDisabled && (
           <div className="mb-1.5 flex items-center gap-1.5 rounded-md bg-warning/10 px-2 py-1 text-[11.5px] text-warning">
             <ShieldAlert size={12} /> AI is disabled for this connection (Edit connection → AI).
@@ -274,7 +296,13 @@ function Chat() {
             rows={3}
             value={text}
             aria-label="Message the assistant"
-            placeholder={conn ? `Ask about ${conn.name}… @ to mention an output  (↵ send, ⇧↵ newline)` : "Choose a connection in the editor first"}
+            placeholder={
+              !conn
+                ? "Choose a connection in the editor first"
+                : running
+                  ? "The assistant is working… type your next question, it is sent when it finishes"
+                  : `Ask about ${conn.name}… @ to mention an output  (↵ send, ⇧↵ newline)`
+            }
             className="block w-full resize-none bg-transparent px-2.5 py-2 text-[13px] outline-none"
             onChange={(e) => {
               setText(e.target.value);
@@ -331,8 +359,14 @@ function Chat() {
               onChange={(v) => setProvider(providerId, v || null)}
             />
             {running ? (
-              <button className="btn-danger h-6 px-2 py-0" onClick={() => void cancel()} aria-label="Stop">
-                <Square size={11} fill="currentColor" />
+              <button
+                className="btn-ghost h-6 border border-line px-2 py-0"
+                onClick={() => submit()}
+                disabled={!text.trim() || !conn}
+                aria-label="Send when the assistant finishes"
+                title="Send when the assistant finishes (↵)"
+              >
+                <Clock size={12} />
               </button>
             ) : (
               <button className="btn-primary h-6 px-2 py-0" onClick={() => submit()} disabled={!text.trim() || !conn} aria-label="Send">
@@ -348,6 +382,32 @@ function Chat() {
         )}
       </div>
     </>
+  );
+}
+
+/** Status line while the assistant works: what it is doing, for how long, and Stop. */
+function WorkingBar({ items, onStop }: { items: ChatItem[]; onStop: () => void }) {
+  const [started] = useState(() => Date.now());
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const st = workingStatus(items);
+  const secs = Math.max(0, Math.round((now - started) / 1000));
+  return (
+    <div
+      className={`mb-1.5 flex items-center gap-2 rounded-md px-2 py-1 text-[11.5px] ${st.waitingForYou ? "bg-warning/10 text-warning" : "bg-accent/10 text-accent"}`}
+      role="status"
+      aria-live="polite"
+    >
+      <Loader2 size={12} className={st.waitingForYou ? "" : "animate-spin"} />
+      <span className="min-w-0 flex-1 truncate">{st.text}</span>
+      <span className="shrink-0 tabular-nums opacity-75">{secs < 60 ? `${secs} s` : `${Math.floor(secs / 60)} min ${secs % 60} s`}</span>
+      <button className="btn-danger h-5 shrink-0 px-1.5 py-0 text-[11px]" onClick={onStop} aria-label="Stop the assistant">
+        <Square size={9} fill="currentColor" /> Stop
+      </button>
+    </div>
   );
 }
 
@@ -413,10 +473,24 @@ function ChatItemView({ item }: { item: ChatItem }) {
             <AlertCircle size={14} className="mt-px shrink-0 text-danger" />
             <span className="break-words">{item.text}</span>
           </div>
-          {item.providerId !== undefined && (
-            <button className="btn-ghost mt-1.5 border border-line py-1 text-[12px]" onClick={() => useAi.getState().openProviderSettings(item.providerId)}>
-              <Settings2 size={12} /> Open provider settings to sign in again
-            </button>
+          {item.reauthed && <div className="mt-1.5 text-[11.5px] text-success">Signed in again. Send the question again?</div>}
+          {(item.providerId !== undefined || item.retry) && (
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              {item.retry && (
+                <button
+                  className={`${item.reauthed ? "btn-primary" : "btn-ghost border border-line"} py-1 text-[12px]`}
+                  onClick={() => useAi.getState().resend(item.id)}
+                  title={item.retry.message}
+                >
+                  <RefreshCw size={12} /> Resend question
+                </button>
+              )}
+              {item.providerId !== undefined && !item.reauthed && (
+                <button className="btn-ghost border border-line py-1 text-[12px]" onClick={() => useAi.getState().openProviderSettings(item.providerId)}>
+                  <Settings2 size={12} /> Open provider settings to sign in again
+                </button>
+              )}
+            </div>
           )}
         </div>
       );

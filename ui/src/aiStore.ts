@@ -56,6 +56,10 @@ export type ChatItem =
       text: string;
       /** Sign-in expired or provider misconfigured: offer to open this provider's settings. */
       providerId?: string | null;
+      /** The question that failed, to send again (after signing in again, or any error). */
+      retry?: SendInput;
+      /** The provider was signed in again since: offer the resend first. */
+      reauthed?: boolean;
     };
 
 export type AiView = "chat" | "history" | "knowledge";
@@ -103,6 +107,17 @@ interface AiState {
   send: (input: SendInput) => Promise<void>;
   cancel: () => Promise<void>;
   newChat: () => void;
+  /** Questions asked while the assistant was working, sent in order when it finishes. */
+  queued: (SendInput & { id: string })[];
+  removeQueued: (id: string) => void;
+  /** The question of the run in progress (kept for "Resend" when it fails). */
+  lastInput: SendInput | null;
+  /** Send a failed question again (the error card goes away). */
+  resend: (errorItemId: string) => void;
+  /** After signing in to a provider again: its errors offer "Resend question" first. */
+  markReauthed: (providerId: string) => void;
+  /** Send a waiting question now (after a failure or Stop, when it is not sent on its own). */
+  sendQueued: (id: string) => void;
   loadSession: (id: string) => Promise<void>;
   respondApproval: (itemId: string, approved: boolean, editedSql?: string) => Promise<void>;
   respondEdit: (itemId: string, accepted: boolean) => Promise<void>;
@@ -176,6 +191,17 @@ function defaultTargetKey(): string | null {
     return focused;
   }
   return active?.notebook_id || active?.ddl ? null : (active?.id ?? null);
+}
+
+/** What the assistant is doing now, for the status line while it works. */
+export function workingStatus(items: ChatItem[]): { text: string; waitingForYou: boolean } {
+  const last = items[items.length - 1];
+  if (items.some((i) => i.kind === "approval" && i.state === "pending")) return { text: "Waiting for your approval above", waitingForYou: true };
+  if (items.some((i) => i.kind === "edit" && i.state === "pending")) return { text: "Waiting for you to accept or reject the change above", waitingForYou: true };
+  const tool = [...items].reverse().find((i) => i.kind === "tool" && !i.done);
+  if (tool && tool.kind === "tool") return { text: `Working: ${tool.tool.replace(/_/g, " ")}…`, waitingForYou: false };
+  if (last?.kind === "assistant" && last.streaming) return { text: "Writing the answer…", waitingForYou: false };
+  return { text: "Thinking…", waitingForYou: false };
 }
 
 let aiInitStarted = false;
@@ -264,10 +290,27 @@ export const useAi = create<AiState>((set, get) => {
               return i;
             }),
             ...(e.type === "failed" && e.error.kind !== "cancelled"
-              ? [{ id: uid(), kind: "error" as const, text: e.error.message, providerId: needsProviderSettings(e.error) ? s.providerId : undefined }]
+              ? [
+                  {
+                    id: uid(),
+                    kind: "error" as const,
+                    text: e.error.message,
+                    providerId: needsProviderSettings(e.error) ? s.providerId : undefined,
+                    retry: s.lastInput ?? undefined,
+                  },
+                ]
               : []),
           ],
         }));
+        // The next question asked meanwhile goes out now. After a failure or
+        // Stop it waits for the user (Send now / remove).
+        if (e.type === "finished") {
+          const [next, ...rest] = get().queued;
+          if (next) {
+            set({ queued: rest });
+            setTimeout(() => void get().send(next), 0);
+          }
+        }
         break;
     }
   };
@@ -336,6 +379,19 @@ export const useAi = create<AiState>((set, get) => {
     indexPicker: null,
     sessionsVersion: 0,
     models: savedModels(),
+    queued: [],
+    lastInput: null,
+    resend: (itemId) => {
+      const it = get().items.find((i) => i.id === itemId);
+      if (it?.kind !== "error" || !it.retry) return;
+      const retry = it.retry;
+      set((s) => ({ items: s.items.filter((i) => i.id !== itemId) }));
+      void get().send(retry);
+    },
+    markReauthed: (providerId) =>
+      set((s) => ({
+        items: s.items.map((i) => (i.kind === "error" && i.retry && (i.providerId === providerId || i.providerId === null) ? { ...i, reauthed: true } : i)),
+      })),
     settingsProvider: null,
 
     loadModels: (providerId, force = false) => {
@@ -429,10 +485,15 @@ export const useAi = create<AiState>((set, get) => {
       void api.setSetting("ai_model", m).catch(() => {});
     },
 
-    send: async ({ message, mode = "chat", targetKey, connectionId, context }) => {
+    send: async (input) => {
+      const { message, mode = "chat", targetKey, connectionId, context } = input;
       const st = useStore.getState();
       if (!st.backendAvailable) return st.toast("AI needs the desktop app", "error");
-      if (get().running) return st.toast("The assistant is still working — stop it first", "info");
+      if (get().running) {
+        // Asked while the assistant works: sent when the current answer is done.
+        set((s) => ({ queued: [...s.queued, { ...input, id: uid() }] }));
+        return;
+      }
       if (!get().providerId) {
         st.toast("Add an AI provider first", "info");
         st.setSettingsOpen(true);
@@ -473,6 +534,7 @@ export const useAi = create<AiState>((set, get) => {
         items: sessionId ? [...s.items, { id: uid(), kind: "user", text: message, mode }] : [{ id: uid(), kind: "user", text: message, mode }],
         sessionId,
         running: true,
+        lastInput: input,
         targetKey: key,
         connectionId: conn,
         tokens: sessionId ? s.tokens : { input: 0, output: 0 },
@@ -494,7 +556,7 @@ export const useAi = create<AiState>((set, get) => {
         const err = toError(e);
         set((s) => ({
           running: false,
-          items: [...s.items, { id: uid(), kind: "error", text: err.message, providerId: needsProviderSettings(err) ? s.providerId : undefined }],
+          items: [...s.items, { id: uid(), kind: "error", text: err.message, providerId: needsProviderSettings(err) ? s.providerId : undefined, retry: input }],
         }));
       }
     },
@@ -506,7 +568,15 @@ export const useAi = create<AiState>((set, get) => {
 
     newChat: () => {
       if (get().running) void get().cancel();
-      set({ sessionId: null, items: [], runId: null, running: false, tokens: { input: 0, output: 0 }, view: "chat" });
+      set({ sessionId: null, items: [], runId: null, running: false, queued: [], tokens: { input: 0, output: 0 }, view: "chat" });
+    },
+
+    removeQueued: (id) => set((s) => ({ queued: s.queued.filter((q) => q.id !== id) })),
+    sendQueued: (id) => {
+      const q = get().queued.find((x) => x.id === id);
+      if (!q || get().running) return;
+      set((s) => ({ queued: s.queued.filter((x) => x.id !== id) }));
+      void get().send(q);
     },
 
     loadSession: async (id) => {

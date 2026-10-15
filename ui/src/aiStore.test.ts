@@ -74,3 +74,46 @@ describe("aiStore: failed statement", () => {
     expect(locateStatement("select 1;", { sql: "selec 2 from t", start: 11, end: 25 })).toBeNull();
   });
 });
+
+describe("aiStore: while the assistant works", () => {
+  it("queues a new question instead of dropping it", async () => {
+    const { useAi } = await import("./aiStore");
+    const { useStore } = await import("./store");
+    useStore.setState({ backendAvailable: true });
+    useAi.setState({ running: true, queued: [] });
+    await useAi.getState().send({ message: "and by month?" });
+    expect(useAi.getState().queued.map((q) => q.message)).toEqual(["and by month?"]);
+    useAi.getState().removeQueued(useAi.getState().queued[0].id);
+    expect(useAi.getState().queued).toEqual([]);
+    useAi.setState({ running: false });
+  });
+
+  it("says what it is doing", async () => {
+    const { workingStatus } = await import("./aiStore");
+    expect(workingStatus([]).text).toBe("Thinking…");
+    expect(workingStatus([{ id: "1", kind: "tool", callId: "c", tool: "run_query", args: {}, done: false }]).text).toBe("Working: run query…");
+    expect(workingStatus([{ id: "1", kind: "assistant", text: "x", streaming: true }]).text).toBe("Writing the answer…");
+    const wait = workingStatus([{ id: "1", kind: "approval", requestId: "r", tool: "run_query", summary: "", detail: {}, state: "pending" }]);
+    expect(wait.waitingForYou).toBe(true);
+  });
+});
+
+describe("aiStore: resend a failed question", () => {
+  it("marks errors after signing in again and sends the question again", async () => {
+    const { useAi } = await import("./aiStore");
+    const retry = { message: "top customers?" };
+    useAi.setState({
+      running: true,
+      queued: [],
+      items: [{ id: "e1", kind: "error", text: "Kiro: Not signed in", providerId: "p1", retry }],
+    });
+    useAi.getState().markReauthed("p1");
+    const e = useAi.getState().items[0];
+    expect(e.kind === "error" && e.reauthed).toBe(true);
+    // Still busy: the question waits instead of being dropped.
+    useAi.getState().resend("e1");
+    expect(useAi.getState().items).toEqual([]);
+    expect(useAi.getState().queued.map((q) => q.message)).toEqual(["top customers?"]);
+    useAi.setState({ running: false, queued: [] });
+  });
+});

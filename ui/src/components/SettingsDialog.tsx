@@ -297,7 +297,10 @@ function ProviderForm({
       );
       setApiKey("");
       // A new key or address may list other models.
-      if (auth === "api_key" && apiKey) void useAi.getState().loadModels(rec.id, true).catch(() => {});
+      if (auth === "api_key" && apiKey) {
+        void useAi.getState().loadModels(rec.id, true).catch(() => {});
+        useAi.getState().markReauthed(rec.id);
+      }
       await onSaved(rec.id);
       if (isKiro) await refreshKiro(rec.id);
       const ai = useAi.getState();
@@ -322,6 +325,7 @@ function ProviderForm({
     try {
       await api.aiProviderSignIn(id);
       toast(isKiro ? "Signed in to Kiro" : "Signed in to OpenRouter", "success");
+      useAi.getState().markReauthed(id);
       void useAi.getState().loadModels(id, true).then(setModels).catch(() => {});
       await onSaved(id);
       if (isKiro) await refreshKiro(id);
