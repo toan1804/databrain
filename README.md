@@ -6,7 +6,8 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
 
 | Platform | Download |
 |---|---|
-| macOS (Apple Silicon) | [DataBrain_0.1.1_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.1.1/DataBrain_0.1.1_aarch64.dmg) |
+| macOS (Apple Silicon) | [DataBrain_0.2.0_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.2.0/DataBrain_0.2.0_aarch64.dmg) |
+| macOS (Apple Silicon), without DuckDB | [DataBrain-no-duckdb_0.2.0_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.2.0/DataBrain-no-duckdb_0.2.0_aarch64.dmg) (uses the DuckDB installed on the computer, see "Runtime notes" below) |
 | Linux | Coming soon |
 | Windows | Coming soon |
 
