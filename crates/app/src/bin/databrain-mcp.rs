@@ -37,6 +37,11 @@ async fn main() {
     // Same credential store as the app (keychain or the local vault).
     let vault_dir = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
     let secrets = Arc::new(SwitchableStore::new(databrain_app::api::saved_store_kind(&ws), &vault_dir));
+    // System-engine builds: the DuckDB library installed on the computer.
+    #[cfg(feature = "duckdb-system")]
+    if let Some(e) = databrain_app::api::load_duckdb_engine_from_settings(&ws).error {
+        eprintln!("databrain-mcp: DuckDB engine not loaded ({e}); DuckDB connections and outputs won't work");
+    }
     let engine = QueryEngine::new(databrain_app::api::registry_with_outputs(Some(slot.clone())), ws, secrets, Arc::new(ResultStore::new()), hub.clone());
     slot.set(engine.external_tables());
     // Pinned outputs saved by the app are readable (read-only use) here too.
@@ -45,6 +50,7 @@ async fn main() {
         // Extensions copied there by the app.
         #[cfg(feature = "duckdb")]
         databrain_connector_duckdb::set_extension_dir(Some(dir.join("duckdb_extensions").to_string_lossy().into_owned()));
+
         // The thin Oracle driver downloaded by the app.
         #[cfg(feature = "oracle")]
         databrain_connector_oracle::agent::set_dir(Some(dir.join("oracle-agent")));

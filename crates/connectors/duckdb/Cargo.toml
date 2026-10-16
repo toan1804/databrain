@@ -10,16 +10,26 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-duckdb = { version = "1.10506", features = ["bundled", "parquet", "json", "appender-arrow"] }
+# Engine: compiled in (`bundled`, default) or the DuckDB library installed
+# on the computer, loaded at runtime (`system`). Pinned: the system engine's
+# trampolines (crates/duckdb-dynload) are generated from this version.
+duckdb = { version = "=1.10506.0", default-features = false, features = ["appender-arrow"] }
+databrain-duckdb-dynload = { version = "0.2.0", path = "../../duckdb-dynload", optional = true, features = ["system"] }
+serde = { version = "1.0.229", features = ["derive"] }
 arrow58 = { package = "arrow", version = "58", default-features = false, features = ["ipc"] }
-databrain-connector-core = { version = "0.1.1", path = "../../connector-core" }
-databrain-auth = { version = "0.1.1", path = "../../auth" }
+databrain-connector-core = { version = "0.2.0", path = "../../connector-core" }
+databrain-auth = { version = "0.2.0", path = "../../auth" }
 async-trait = "0.1.92"
 tokio = { version = "1.53.1", features = ["rt", "sync", "macros", "time"] }
 tokio-util = "0.7.19"
 
 # Read sheet names and used ranges of .xlsx files (DuckDB cannot list sheets).
 zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
+
+[features]
+default = ["bundled"]
+bundled = ["duckdb/bundled", "duckdb/parquet", "duckdb/json"]
+system = ["dep:databrain-duckdb-dynload"]
 
 [dev-dependencies]
 rust_xlsxwriter = "0.96.0"

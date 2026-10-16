@@ -1,0 +1,22 @@
+[package]
+name = "databrain-duckdb-dynload"
+description = "Loads the DuckDB library installed on the computer at runtime (builds without the bundled engine)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Not the workspace lints: this crate is FFI (`unsafe` throughout).
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+# Must be the version the `duckdb` crate uses: api.rs is generated from it.
+libduckdb-sys = { version = "=1.10506.0", default-features = false }
+libloading = "=0.7.4"
+
+[features]
+# Define DuckDB's C API here and load the library at runtime. Only for
+# builds without the bundled engine (both at once = duplicate symbols).
+system = []

@@ -1,7 +1,7 @@
 {
   "name": "databrain-ui",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,6 +11,8 @@
     "tauri": "TAURI_APP_PATH=../crates/app TAURI_FRONTEND_PATH=. tauri",
     "app:dev": "npm run tauri dev",
     "app:build": "npm run tauri build",
+    "app:build:no-duckdb": "node ../scripts/build-system-duckdb.mjs",
+    "app:dev:no-duckdb": "node ../scripts/build-system-duckdb.mjs --dev",
     "fetch:duckdb-ext": "node ../scripts/fetch-duckdb-extensions.mjs",
     "build:oracle-agent": "node ../scripts/build-oracle-agent.mjs"
   },

@@ -10,7 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-databrain-connector-core = { version = "0.1.1", path = "../connector-core" }
+databrain-connector-core = { version = "0.2.0", path = "../connector-core" }
 russh = "0.63.1"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["net", "io-util", "sync", "macros", "rt", "time"] }

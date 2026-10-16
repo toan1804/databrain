@@ -100,6 +100,7 @@ Runtime notes:
 - Oracle needs no Oracle software by default: the thin driver (a small helper using [go-ora](https://github.com/sijms/go-ora), Oracle 10g+, TLS/wallets, native network encryption via "Driver options") is downloaded on the first Oracle connection (about 5 MB, into the app-data folder `oracle-agent/`, checked against SHA-256 sums built into DataBrain). Choose the "Oracle Instant Client" driver on a connection for thick-only features; DataBrain then checks for Instant Client and can install Oracle's latest Basic package in one click (into `oracle/instantclient_*`; Linux also needs `libaio`).
 - Google/Snowflake/Entra browser OAuth needs your own OAuth client ID.
 - DuckDB is compiled into the app (with Parquet and JSON). Its Excel, Delta, Iceberg, Avro, httpfs and ICU extensions are downloaded at build time and shipped inside the bundle, so nothing is downloaded at runtime.
+- Without bundled DuckDB ("no-duckdb" downloads, `DataBrain-no-duckdb_<version>_…`): for computers that already have DuckDB. The app is about 85 MB instead of 290 MB on macOS and uses the DuckDB library installed on the computer (`libduckdb.dylib`, `libduckdb.so` or `duckdb.dll`, DuckDB 1.5 or newer; the CLI alone is not enough), loaded at startup from Homebrew's and the usual install folders, `DATABRAIN_DUCKDB_LIB`, or the file chosen in Settings → DuckDB engine. Extensions come from DuckDB's own folder (`~/.duckdb/extensions`) and are installed on first use. The app starts without the library: a banner explains how to install it (`brew install duckdb`, or libduckdb from duckdb.org), lets you choose the file or look again, and links to the download with DuckDB included; until then Results, outputs, jobs that combine connections, local files and DuckDB connections say the engine is missing.
 - Terminal (Settings → Terminal): CLI sign-ins that need a terminal (`kiro-cli login`) open the one chosen there. The list shows the terminals found on the computer (macOS: Terminal, iTerm, Ghostty, WezTerm, Alacritty, kitty apps; Windows: cmd, Windows PowerShell, PowerShell 7, Windows Terminal, Git Bash, WezTerm, Alacritty in their install folders or on PATH; Linux: well-known terminals on PATH plus any `.desktop` entry in the TerminalEmulator category; Rescan looks again), plus Automatic (tries them in order), a custom command (`{script}`, `{sh}`, `{cmd}`, `{ps1}` are filled in), or none. A terminal that doesn't run the command within a few seconds counts as blocked (for example PowerShell blocked by IT): Automatic tries the next, and in the end the sign-in dialog shows the command to copy and run yourself, and waits for it. PowerShell gets the command with `-EncodedCommand`, so script execution policies don't stop it. Test opens the chosen terminal once.
 - Kiro needs Kiro CLI installed (`curl -fsSL https://cli.kiro.dev/install | bash`). API keys require a Kiro Pro plan or higher. DataBrain writes one agent config, `~/.kiro/agents/databrain-sql.json`, which limits Kiro to DataBrain's tools.
 
@@ -115,9 +116,12 @@ cd ui
 npm install
 npm run app:dev      # Vite dev server + Tauri app with hot reload
 npm run app:build    # release bundle (.app/.dmg, .msi, .deb/.AppImage)
+npm run app:build:no-duckdb   # the same without bundled DuckDB (uses the computer's libduckdb)
 ```
 
 `npm run dev` alone serves the UI in a browser, but queries need the desktop backend.
+
+`app:build:no-duckdb` (`scripts/build-system-duckdb.mjs`) builds with `--no-default-features --features system-duckdb` and no bundled extensions, and names the installers `DataBrain-no-duckdb_…`. The `duckdb` crate is then built without its bundled engine; its C functions are defined in `crates/duckdb-dynload` as calls into the library loaded at runtime (generated from libduckdb-sys by `scripts/gen-duckdb-dynload.py`; run it again when the `duckdb` crate version changes, it is pinned). `node scripts/build-system-duckdb.mjs --cargo <cargo args>` runs any cargo command for this build, e.g. its test with a real library: `DATABRAIN_DUCKDB_LIB=/path/libduckdb.dylib node scripts/build-system-duckdb.mjs --cargo test -p databrain-connector-duckdb --no-default-features --features system --test system_engine`.
 
 `npm run app:build` produces a self-contained app for the build machine (macOS: `target/release/bundle/macos/DataBrain.app` and a `.dmg`; Windows: `.msi`/`.exe`; Linux: `.deb`/`.AppImage`). The bundle includes `databrain-mcp` and the DuckDB extensions; SQLite, DuckDB and (on Linux) OpenSSL are linked statically. Build on each target platform (DuckDB extensions are platform-specific). External tools stay optional: Oracle Instant Client (offered in-app), Kiro CLI, and cloud CLIs for CLI sign-in.
 
@@ -177,6 +181,7 @@ crates/
   auth/            keychain secrets, auth methods, OAuth/device/JWT/cloud CLI credentials
   connector-core/  Connector/Session traits, Arrow row builder, SQL splitter + classifier
   connectors/      sqlite, postgres, mysql, mssql, oracle, cloud (snowflake/databricks/bigquery), duckdb
+  duckdb-dynload/  DuckDB's C API loaded at runtime (builds without bundled DuckDB)
   ssh-tunnel/      russh-based tunnels
   result-store/    in-memory Arrow results: paging, filter, sort, find, stats
   export/          CSV/TSV/JSON/NDJSON/Markdown/SQL/Parquet/XLSX writers

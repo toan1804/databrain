@@ -1,0 +1,9 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run build:oracle-agent -- --host --if-go && npm run dev",
+    "beforeBuildCommand": "npm run build:oracle-agent -- --host --if-go && npm run build"
+  },
+  "bundle": {
+    "resources": null
+  }
+}

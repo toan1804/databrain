@@ -81,6 +81,7 @@ import type {
   TestResult,
   ViewSpec,
   ProviderUsage,
+  DuckdbEngineStatus,
   TerminalLaunch,
   TerminalOption,
   TerminalSetting,
@@ -277,6 +278,8 @@ export const api = {
   aiProviderStatus: (id: string) => call<KiroStatus>("ai_provider_status", { id }),
   aiProviderUsage: (id: string, sinceDay: number, sinceMonth: number) =>
     call<ProviderUsage>("ai_provider_usage", { id, sinceDay, sinceMonth }),
+  duckdbEngineStatus: () => call<DuckdbEngineStatus>("duckdb_engine_status"),
+  duckdbEngineLoad: (path: string | null) => call<DuckdbEngineStatus>("duckdb_engine_load", { path }),
   openLink: (url: string) => call<void>("open_link", { url }),
   terminalOptions: () => call<TerminalOption[]>("terminal_options"),
   appInDownloads: () => call<string | null>("app_in_downloads"),

@@ -121,7 +121,7 @@ pub fn registry_with_outputs(
     r.register(Arc::new(databrain_connector_cloud::DatabricksConnector::new()));
     #[cfg(feature = "bigquery")]
     r.register(Arc::new(databrain_connector_cloud::BigQueryConnector::new()));
-    #[cfg(feature = "duckdb")]
+    #[cfg(feature = "duckdb-engine")]
     r.register(Arc::new(match outputs {
         Some(slot) => databrain_connector_duckdb::DuckdbConnector::with_outputs(slot),
         None => databrain_connector_duckdb::DuckdbConnector::new(),
@@ -1234,9 +1234,38 @@ pub fn seed_duckdb_extensions(bundled: &Path, dest: &Path) -> usize {
     }
     let mut n = 0;
     walk(bundled, dest, &mut n);
+    // The system engine uses DuckDB's own extension folder (~/.duckdb):
+    // the extensions DuckDB already installed there match its version.
     #[cfg(feature = "duckdb")]
     databrain_connector_duckdb::set_extension_dir(Some(dest.to_string_lossy().into_owned()));
     n
+}
+
+/// Setting: the DuckDB library chosen by the user (system-engine builds).
+pub const DUCKDB_LIBRARY_SETTING: &str = "duckdb_library_path";
+
+/// System-engine builds: load the DuckDB library (the saved choice first,
+/// then the usual places). Bundled builds: nothing to do.
+#[cfg(feature = "duckdb-engine")]
+pub fn load_duckdb_engine_from_settings(ws: &Workspace) -> databrain_connector_duckdb::EngineStatus {
+    let saved = ws.get_setting(DUCKDB_LIBRARY_SETTING).ok().flatten().and_then(|v| v.as_str().map(str::to_string)).filter(|s| !s.trim().is_empty());
+    databrain_connector_duckdb::load_engine(saved.as_deref())
+}
+
+/// Load the library at `path` (a file or folder) and remember it when it works.
+#[cfg(feature = "duckdb-engine")]
+pub fn load_duckdb_engine(state: &AppState, path: Option<String>) -> Result<databrain_connector_duckdb::EngineStatus> {
+    let path = path.filter(|p| !p.trim().is_empty());
+    let st = databrain_connector_duckdb::load_engine(path.as_deref());
+    if let (Some(p), true, false) = (&path, st.available, st.bundled) {
+        let from_it = st.path.as_deref().is_some_and(|l| std::path::Path::new(l).starts_with(p));
+        // Loaded from it, or another library is already in use (a process
+        // can't switch): remember it for the next start.
+        if from_it || std::path::Path::new(p).exists() {
+            state.workspace.set_setting(DUCKDB_LIBRARY_SETTING, &serde_json::json!(if from_it { st.path.clone().unwrap_or_default() } else { p.clone() }))?;
+        }
+    }
+    Ok(st)
 }
 
 /// Setting: where the thin Oracle driver is downloaded from (empty = default release).
@@ -1501,7 +1530,7 @@ pub fn delete_notebook(state: &AppState, id: &str) -> Result<()> {
 /// DuckDB SQL that reads a local file or folder (CSV, Parquet, JSON, Excel,
 /// Delta, Iceberg), e.g. `SELECT * FROM read_parquet('/x/a.parquet')`.
 /// Excel: the first sheet, or one statement per non-empty sheet with `all_sheets`.
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "duckdb-engine")]
 pub fn file_scan_sql(path: &str, all_sheets: bool) -> Result<String> {
     use databrain_connector_duckdb::{FileFormat, detect_format, excel_sources, file_scan_expr};
     let fmt = detect_format(path)
@@ -1532,7 +1561,7 @@ pub struct ExcelSheet {
 }
 
 /// Sheets of an .xlsx file (workbook order) with their used ranges.
-#[cfg(feature = "duckdb")]
+#[cfg(feature = "duckdb-engine")]
 pub fn excel_sheets(path: &str) -> Result<Vec<ExcelSheet>> {
     Ok(databrain_connector_duckdb::xlsx::sheets(path)
         .map_err(|e| EngineError::new("invalid", e))?
@@ -1930,7 +1959,7 @@ mod tests {
         let f = save_folder(&st, Folder { id: String::new(), parent_id: None, name: "Prod".into(), kind: FolderKind::Connections }).unwrap();
         move_to_folder(&st, FolderKind::Connections, &saved.id, Some(f.id.clone())).unwrap();
         assert_eq!(st.workspace.get_connection(&saved.id).unwrap().folder_id, Some(f.id));
-        #[cfg(feature = "duckdb")]
+        #[cfg(feature = "duckdb-engine")]
         {
             assert_eq!(file_scan_sql("/d/x.csv", false).unwrap(), "SELECT *\nFROM read_csv('/d/x.csv')\nLIMIT 1000;");
             assert!(file_scan_sql("/d/x.exe", false).is_err());

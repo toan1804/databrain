@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { AlertCircle, Bot, Check, Copy, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, ShieldCheck, Terminal, Trash2, Timer, Palette } from "lucide-react";
+import { AlertCircle, Bot, Database, Check, Copy, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, ShieldCheck, Terminal, Trash2, Timer, Palette } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { AuditEntry, TerminalLaunch, TerminalOption, TerminalSetting, CredentialStoreKind, CredentialStoreView, KiroStatus, ProviderAuth, ProviderKind, ProviderView } from "../lib/types";
 import { relativeTime } from "../lib/util";
@@ -9,6 +9,7 @@ import { useAi } from "../aiStore";
 import { ComboInput, Modal } from "./ui";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { UsageDetails } from "./ProviderUsage";
+import { DuckdbEngineSettings } from "./DuckdbEngine";
 
 export const PROVIDER_KINDS: { kind: ProviderKind; label: string; base: string; auth: ProviderAuth[]; model: string; hint?: string }[] = [
   {
@@ -62,7 +63,7 @@ const AUTH_LABEL: Record<ProviderAuth, string> = {
 export function SettingsDialog() {
   const open = useStore((s) => s.settingsOpen);
   const setOpen = useStore((s) => s.setSettingsOpen);
-  const [section, setSection] = useState<"providers" | "appearance" | "queries" | "terminal" | "security" | "mcp" | "audit">("providers");
+  const [section, setSection] = useState<"providers" | "appearance" | "queries" | "duckdb" | "terminal" | "security" | "mcp" | "audit">("providers");
   const focusProvider = useAi((s) => s.settingsProvider);
   useEffect(() => {
     if (focusProvider) setSection("providers");
@@ -85,6 +86,7 @@ export function SettingsDialog() {
           {item("providers", <Bot size={14} />, "AI providers")}
           {item("appearance", <Palette size={14} />, "Appearance")}
           {item("queries", <Timer size={14} />, "Queries")}
+          {item("duckdb", <Database size={14} />, "DuckDB engine")}
           {item("terminal", <Terminal size={14} />, "Terminal")}
           {item("security", <ShieldCheck size={14} />, "Passwords")}
           {item("mcp", <Plug size={14} />, "MCP / Kiro")}
@@ -94,6 +96,7 @@ export function SettingsDialog() {
           {section === "providers" && <Providers />}
           {section === "appearance" && <AppearanceSettings />}
           {section === "queries" && <Queries />}
+          {section === "duckdb" && <DuckdbEngineSettings />}
           {section === "terminal" && <TerminalSettings />}
           {section === "security" && <CredentialStore />}
           {section === "mcp" && <Mcp />}

@@ -240,16 +240,16 @@ async fn delete_notebook(state: State<'_, AppState>, id: String) -> R<()> {
 }
 #[tauri::command]
 async fn file_scan_sql(path: String, all_sheets: Option<bool>) -> R<String> {
-    #[cfg(feature = "duckdb")]
+    #[cfg(feature = "duckdb-engine")]
     return api::file_scan_sql(&path, all_sheets.unwrap_or(false));
-    #[cfg(not(feature = "duckdb"))]
+    #[cfg(not(feature = "duckdb-engine"))]
     Err(databrain_query_engine::EngineError::new("invalid", format!("DuckDB support is not built in ({path})")))
 }
 #[tauri::command]
 async fn excel_sheets(path: String) -> R<Vec<api::ExcelSheet>> {
-    #[cfg(feature = "duckdb")]
+    #[cfg(feature = "duckdb-engine")]
     return api::excel_sheets(&path);
-    #[cfg(not(feature = "duckdb"))]
+    #[cfg(not(feature = "duckdb-engine"))]
     Err(databrain_query_engine::EngineError::new("invalid", format!("DuckDB support is not built in ({path})")))
 }
 
@@ -310,6 +310,25 @@ async fn open_link(app: AppHandle, url: String) -> R<()> {
 #[tauri::command]
 async fn ai_provider_usage(state: State<'_, AppState>, id: String, since_day: i64, since_month: i64) -> R<ai_api::ProviderUsage> {
     ai_api::provider_usage(&state, &id, since_day, since_month).await
+}
+/// DuckDB engine: bundled, or the system library (found or not).
+#[tauri::command]
+async fn duckdb_engine_status() -> R<serde_json::Value> {
+    #[cfg(feature = "duckdb-engine")]
+    return Ok(serde_json::to_value(databrain_connector_duckdb::engine_status()).unwrap_or_default());
+    #[cfg(not(feature = "duckdb-engine"))]
+    Ok(serde_json::json!({"bundled": false, "available": false, "error": "DuckDB support is not built in", "tried": [], "file_name": ""}))
+}
+/// Look for the DuckDB library again, or at `path` (file or folder).
+#[tauri::command]
+async fn duckdb_engine_load(state: State<'_, AppState>, path: Option<String>) -> R<serde_json::Value> {
+    #[cfg(feature = "duckdb-engine")]
+    return Ok(serde_json::to_value(api::load_duckdb_engine(&state, path)?).unwrap_or_default());
+    #[cfg(not(feature = "duckdb-engine"))]
+    {
+        let _ = (state, path);
+        Err(databrain_query_engine::EngineError::new("unsupported", "DuckDB support is not built in"))
+    }
 }
 #[tauri::command]
 async fn terminal_options() -> R<Vec<databrain_auth::terminal::TerminalOption>> {
@@ -898,6 +917,9 @@ pub fn run() {
             state.set_snapshot_dir(dir.join("outputs"));
             api::apply_oracle_client_setting(&state);
             api::setup_oracle_agent(&state, &dir);
+            // System-engine builds: find the DuckDB library installed on the computer.
+            #[cfg(feature = "duckdb-engine")]
+            let _ = api::load_duckdb_engine_from_settings(&state.workspace);
             // DuckDB extensions are shipped in the bundle (no runtime download).
             let bundled = app.path().resource_dir().map(|d| d.join("duckdb-extensions")).unwrap_or_default();
             api::seed_duckdb_extensions(&bundled, &dir.join("duckdb_extensions"));
@@ -1008,6 +1030,8 @@ pub fn run() {
             ai_provider_sign_in,
             ai_provider_status,
             terminal_options,
+            duckdb_engine_status,
+            duckdb_engine_load,
             ai_provider_usage,
             open_link,
             app_in_downloads,

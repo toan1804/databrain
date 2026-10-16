@@ -19,6 +19,7 @@ import { IndexScopeDialog } from "./components/IndexScopeDialog";
 import { OracleClientDialog } from "./components/OracleClient";
 import { InlineAi } from "./components/InlineAi";
 import { MoveToApplications } from "./components/MoveToApplications";
+import { DuckdbEngineBanner } from "./components/DuckdbEngine";
 import { useAi } from "./aiStore";
 
 function useGlobalShortcuts() {
@@ -149,6 +150,7 @@ export default function App() {
         </button>
       </div>
       <MoveToApplications />
+      <DuckdbEngineBanner />
       {!backend && (
         <div className="flex items-center gap-2 border-b border-warning/40 bg-warning/10 px-3 py-1.5 text-[12px] text-warning" role="status">
           <TriangleAlert size={13} /> Backend not available — run inside the desktop app (<span className="font-mono">npm run tauri dev</span>).

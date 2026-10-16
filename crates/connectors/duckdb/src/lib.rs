@@ -107,6 +107,7 @@ pub fn file_scan_expr(path: &str, format: FileFormat) -> String {
 
 /// Private DuckDB with the Excel extension loaded.
 fn excel_conn() -> Result<duckdb::Connection> {
+    engine()?;
     let conn = duckdb::Connection::open_in_memory().map_err(map_err)?;
     if let Some(dir) = extension_dir() {
         let _ = conn.execute_batch(&format!("SET extension_directory = {}", quote_literal(&dir)));
@@ -260,6 +261,82 @@ pub fn excel_scan(conn: &duckdb::Connection, path: &str, sheet: Option<&xlsx::Sh
     format!("(SELECT {cols} FROM {})", skip_empty(&text))
 }
 
+#[cfg(all(feature = "bundled", feature = "system"))]
+compile_error!("enable either the `bundled` or the `system` DuckDB engine, not both (build with --no-default-features)");
+#[cfg(not(any(feature = "bundled", feature = "system")))]
+compile_error!("enable the `bundled` or the `system` DuckDB engine");
+
+/// Which DuckDB engine this build uses.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineStatus {
+    /// The engine is compiled into the app.
+    pub bundled: bool,
+    /// Ready to use (always, when bundled).
+    pub available: bool,
+    /// The library in use (system engine).
+    pub path: Option<String>,
+    pub version: Option<String>,
+    /// Why no library could be loaded.
+    pub error: Option<String>,
+    /// Places looked at (system engine, when none was loaded).
+    pub tried: Vec<String>,
+    /// Library file to look for on this OS.
+    pub file_name: String,
+}
+
+#[cfg(feature = "system")]
+static LOAD_ERROR: std::sync::RwLock<Option<(String, Vec<String>)>> = std::sync::RwLock::new(None);
+
+/// Load the DuckDB library installed on the computer (builds without the
+/// bundled engine). `path`: a file or folder chosen by the user. No-op when
+/// the engine is bundled or a library is already loaded.
+pub fn load_engine(path: Option<&str>) -> EngineStatus {
+    #[cfg(feature = "system")]
+    if databrain_duckdb_dynload::loaded().is_none() {
+        match databrain_duckdb_dynload::load(path.map(std::path::Path::new)) {
+            Ok(_) => *LOAD_ERROR.write().unwrap_or_else(|e| e.into_inner()) = None,
+            Err(e) => {
+                let tried = e.tried.iter().map(|(p, r)| format!("{}: {r}", p.display())).collect();
+                *LOAD_ERROR.write().unwrap_or_else(|e| e.into_inner()) = Some((e.to_string(), tried));
+            }
+        }
+    }
+    let _ = path;
+    engine_status()
+}
+
+pub fn engine_status() -> EngineStatus {
+    #[cfg(feature = "system")]
+    {
+        let loaded = databrain_duckdb_dynload::loaded();
+        let err = LOAD_ERROR.read().ok().and_then(|g| g.clone());
+        EngineStatus {
+            bundled: false,
+            available: loaded.is_some(),
+            path: loaded.map(|l| l.path.to_string_lossy().into_owned()),
+            version: loaded.map(|l| l.version.clone()),
+            error: if loaded.is_some() { None } else { Some(err.as_ref().map(|e| e.0.clone()).unwrap_or_else(|| "not loaded yet".into())) },
+            tried: if loaded.is_some() { vec![] } else { err.map(|e| e.1).unwrap_or_default() },
+            file_name: databrain_duckdb_dynload::lib_file_name().into(),
+        }
+    }
+    #[cfg(not(feature = "system"))]
+    EngineStatus { bundled: true, available: true, path: None, version: None, error: None, tried: vec![], file_name: String::new() }
+}
+
+/// Fails with a guide when this build has no DuckDB engine to use.
+fn engine() -> Result<()> {
+    if engine_status().available {
+        return Ok(());
+    }
+    Err(ConnectorError::unsupported(format!(
+        "DuckDB engine not found. This DataBrain build uses the DuckDB installed on your computer, and {} was not found. \
+         Install DuckDB (macOS: brew install duckdb; or download libduckdb for your system from https://duckdb.org/docs/installation), \
+         then choose the library in Settings → DuckDB engine, or install the DataBrain download that includes DuckDB.",
+        if cfg!(target_os = "macos") { "libduckdb.dylib" } else if cfg!(windows) { "duckdb.dll" } else { "libduckdb.so" }
+    )))
+}
+
 /// Folder with DuckDB extensions shipped in the app (`<dir>/v1.x.y/<platform>/*.duckdb_extension`).
 static EXTENSION_DIR: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
@@ -277,6 +354,7 @@ pub fn extension_dir() -> Option<String> {
 
 /// DuckDB version and platform of this build, e.g. ("v1.5.6", "osx_arm64").
 pub fn version_and_platform() -> Result<(String, String)> {
+    engine()?;
     let c = duckdb::Connection::open_in_memory().map_err(map_err)?;
     let v: String = c.query_row("select version()", [], |r| r.get(0)).map_err(map_err)?;
     let p: String = c.query_row("select platform from pragma_platform()", [], |r| r.get(0)).map_err(map_err)?;
@@ -354,6 +432,7 @@ impl Connector for DuckdbConnector {
     }
 
     async fn connect(&self, cfg: &ConnectionConfig, _creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>> {
+        engine()?;
         let path = cfg.file_path.clone().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| ":memory:".into());
         let files = files_of(cfg);
         let all_sheets = cfg.opt("excel_sheets") == Some("all");

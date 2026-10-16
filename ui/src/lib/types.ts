@@ -1156,3 +1156,15 @@ export interface ProviderUsage {
   tokens_today: [number, number];
   tokens_month: [number, number];
 }
+
+/** DuckDB engine of this build: compiled in, or the library on the computer. */
+export interface DuckdbEngineStatus {
+  bundled: boolean;
+  available: boolean;
+  path?: string | null;
+  version?: string | null;
+  error?: string | null;
+  tried: string[];
+  /** libduckdb.dylib / libduckdb.so / duckdb.dll */
+  file_name: string;
+}
