@@ -81,6 +81,7 @@ import type {
   TestResult,
   ViewSpec,
   ProviderUsage,
+  HistoryClear,
   DuckdbEngineStatus,
   TerminalLaunch,
   TerminalOption,
@@ -322,7 +323,8 @@ export const api = {
   knImportNotes: (connectionId: string, actions: ImportAction[]) => call<number>("kn_import_notes", { connectionId, actions }),
 
   listHistory: (query: HistoryQuery) => call<HistoryEntry[]>("list_history", { query }),
-  clearHistory: () => call<void>("clear_history"),
+  /** Deletes the entries and the results they produced (not pinned or on-screen ones). Returns how many went. */
+  clearHistory: (what: HistoryClear) => call<number>("clear_history", { what }),
 
   loadTabs: () => call<TabState[]>("load_tabs"),
   saveTabs: (tabs: TabState[]) => call<void>("save_tabs", { tabs }),

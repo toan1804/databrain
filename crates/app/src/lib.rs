@@ -837,8 +837,8 @@ async fn list_history(state: State<'_, AppState>, query: HistoryQuery) -> R<Vec<
 }
 
 #[tauri::command]
-async fn clear_history(state: State<'_, AppState>) -> R<()> {
-    api::clear_history(&state)
+async fn clear_history(state: State<'_, AppState>, what: Option<databrain_workspace::HistoryClear>) -> R<usize> {
+    api::clear_history(&state, what)
 }
 
 #[tauri::command]
@@ -928,7 +928,20 @@ pub fn run() {
             let bundled = app.path().resource_dir().map(|d| d.join("duckdb-extensions")).unwrap_or_default();
             api::seed_duckdb_extensions(&bundled, &dir.join("duckdb_extensions"));
             let jobs = state.job_ctx();
+            let (ws, engine) = (state.workspace.clone(), state.engine.clone());
             app.manage(state);
+            // History older than the retention setting (default a month), now and daily.
+            {
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        let w = ws.clone();
+                        if let Ok(Ok((_, ids))) = tokio::task::spawn_blocking(move || w.prune_history()).await {
+                            api::drop_history_results(&engine, &ids);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+                    }
+                });
+            }
             // Scheduled jobs run while the app is open.
             tauri::async_runtime::spawn(async move { jobs::spawn_scheduler(jobs) });
             #[cfg(target_os = "macos")]

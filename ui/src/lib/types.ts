@@ -1168,3 +1168,6 @@ export interface DuckdbEngineStatus {
   /** libduckdb.dylib / libduckdb.so / duckdb.dll */
   file_name: string;
 }
+
+/** What "Clear history" deletes. */
+export type HistoryClear = { kind: "all" } | { kind: "ai" } | { kind: "older_than_days"; days: number };

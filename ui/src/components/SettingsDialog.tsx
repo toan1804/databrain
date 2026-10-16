@@ -140,7 +140,63 @@ function Queries() {
         tips off.
       </p>
       <ConnectTimeout />
+      <HistoryRetention />
     </div>
+  );
+}
+
+/** `history_retention_days`: history (and its results) older than this is deleted; 0 keeps everything. */
+function HistoryRetention() {
+  const [keep, setKeep] = useState(false);
+  const [text, setText] = useState("30");
+  useEffect(() => {
+    api
+      .getSettings()
+      .then((s) => {
+        const v = s.history_retention_days;
+        if (typeof v === "number") {
+          setKeep(v === 0);
+          if (v > 0) setText(String(v));
+        }
+      })
+      .catch(() => {});
+  }, []);
+  const n = Number(text);
+  const valid = Number.isInteger(n) && n >= 1 && n <= 3650;
+  return (
+    <>
+      <h3 className="pt-3 text-[13px] font-medium">History</h3>
+      <label className="flex items-center gap-2 text-[12px]">
+        <input
+          type="checkbox"
+          checked={!keep}
+          onChange={(e) => {
+            setKeep(!e.target.checked);
+            void api.setSetting("history_retention_days", e.target.checked ? (valid ? n : 30) : 0).catch(() => {});
+          }}
+        />
+        Delete queries older than
+        <input
+          id="history-days"
+          aria-label="Days of history to keep"
+          className={`field h-7 w-20 py-0 ${valid || keep ? "" : "border-danger"}`}
+          inputMode="numeric"
+          disabled={keep}
+          value={text}
+          aria-invalid={!valid}
+          onChange={(e) => {
+            setText(e.target.value);
+            const v = Number(e.target.value);
+            if (Number.isInteger(v) && v >= 1 && v <= 3650) void api.setSetting("history_retention_days", v).catch(() => {});
+          }}
+        />
+        days
+      </label>
+      <p className="text-[11.5px] text-muted">
+        Checked at start and every few hours; the results those queries produced are deleted with them (pinned outputs and results shown in a tab
+        are kept). Unchecked, history is never deleted automatically (only the newest 5,000 are kept). Default: 30 days.
+      </p>
+    </>
   );
 }
 

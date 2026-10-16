@@ -305,6 +305,22 @@ pub struct HistoryQuery {
     pub exclude_ai: bool,
 }
 
+/// What "Clear history" deletes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "days", rename_all = "snake_case")]
+pub enum HistoryClear {
+    /// Everything.
+    All,
+    /// Statements run by the AI assistant and MCP clients.
+    Ai,
+    /// Entries older than this many days (keeps the recent ones).
+    OlderThanDays(u32),
+}
+
+/// Setting: delete history older than this many days (0 = keep it all).
+pub const HISTORY_RETENTION_SETTING: &str = "history_retention_days";
+pub const HISTORY_RETENTION_DEFAULT_DAYS: u32 = 30;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TabState {
     pub id: String,
@@ -936,9 +952,52 @@ impl Workspace {
         Ok(rows)
     }
 
+    /// Days of history kept (Settings → Queries); `None` = keep it all.
+    pub fn history_retention_days(&self) -> Option<u32> {
+        match self.get_setting(HISTORY_RETENTION_SETTING).ok().flatten() {
+            None => Some(HISTORY_RETENTION_DEFAULT_DAYS),
+            Some(v) => v.as_u64().map(|d| d as u32).filter(|d| *d > 0),
+        }
+    }
+
+    /// Apply the retention setting; returns entries deleted and their result ids.
+    pub fn prune_history(&self) -> Result<(usize, Vec<String>)> {
+        match self.history_retention_days() {
+            Some(days) => self.clear_history_results(HistoryClear::OlderThanDays(days)),
+            None => Ok((0, vec![])),
+        }
+    }
+
     pub fn clear_history(&self) -> Result<()> {
-        self.conn.lock().execute("DELETE FROM query_history", [])?;
-        Ok(())
+        self.clear_history_by(HistoryClear::All).map(|_| ())
+    }
+
+    /// Delete part of the history; returns how many entries went.
+    pub fn clear_history_by(&self, what: HistoryClear) -> Result<usize> {
+        Ok(self.clear_history_results(what)?.0)
+    }
+
+    /// Like [`Self::clear_history_by`], also returning the result ids of the
+    /// deleted entries (their outputs are dropped too).
+    pub fn clear_history_results(&self, what: HistoryClear) -> Result<(usize, Vec<String>)> {
+        let c = self.conn.lock();
+        let (cond, cutoff) = match what {
+            HistoryClear::All => ("1 = 1", 0),
+            HistoryClear::Ai => ("origin IN ('ai', 'mcp')", 0),
+            HistoryClear::OlderThanDays(days) => ("started_at < ?1", now_ms() - days as i64 * 86_400_000),
+        };
+        let uses_cutoff = matches!(what, HistoryClear::OlderThanDays(_));
+        let sel = format!("SELECT result_id FROM query_history WHERE {cond} AND result_id IS NOT NULL");
+        let mut stmt = c.prepare(&sel)?;
+        let ids: Vec<String> = if uses_cutoff {
+            stmt.query_map(params![cutoff], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        } else {
+            stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        drop(stmt);
+        let del = format!("DELETE FROM query_history WHERE {cond}");
+        let n = if uses_cutoff { c.execute(&del, params![cutoff])? } else { c.execute(&del, [])? };
+        Ok((n, ids))
     }
 
     // ---------------------------------------------------------------- tabs
@@ -1186,6 +1245,19 @@ mod tests {
             })
             .unwrap();
         assert_eq!(page.len(), 1);
+        // Clearing: AI only, then by age (retention), keeping recent entries.
+        {
+            let old = now_ms() - 40 * 86_400_000;
+            ws.conn.lock().execute("UPDATE query_history SET started_at = ?1 WHERE sql = 'select 0'", params![old]).unwrap();
+        }
+        assert_eq!(ws.history_retention_days(), Some(30), "default: one month");
+        ws.set_setting(HISTORY_RETENTION_SETTING, &serde_json::json!(0)).unwrap();
+        assert_eq!((ws.history_retention_days(), ws.prune_history().unwrap().0), (None, 0), "0 = keep everything");
+        ws.set_setting(HISTORY_RETENTION_SETTING, &serde_json::json!(30)).unwrap();
+        assert_eq!(ws.clear_history_by(HistoryClear::Ai).unwrap(), 1);
+        assert_eq!(ws.prune_history().unwrap(), (1, vec!["job:0".to_string()]), "the 40-day-old entry, with its result");
+        assert_eq!(ws.list_history(&HistoryQuery::default()).unwrap().iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(), ["select 2"]);
+        ws.conn.lock().execute("DELETE FROM settings WHERE key = ?1", params![HISTORY_RETENTION_SETTING]).unwrap();
 
         let tabs = vec![
             TabState {

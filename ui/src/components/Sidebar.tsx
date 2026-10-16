@@ -41,7 +41,7 @@ import {
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { api, toError } from "../lib/api";
-import type { ConnectionView, DbObject, HistoryEntry, NotebookSummary, SavedQuery, SchemaInfo } from "../lib/types";
+import type { ConnectionView, DbObject, HistoryClear, HistoryEntry, NotebookSummary, SavedQuery, SchemaInfo } from "../lib/types";
 import {
   GROUP_PAGE,
   RESULTS_SCHEMA_ID,
@@ -75,7 +75,7 @@ import { askExcelSheets } from "./ExcelSheetDialog";
 import { openOutput } from "../outputs";
 import { useStore, type SidebarPanel } from "../store";
 import { editorBridge } from "../editorBridge";
-import { ConnDot, EnvBadge, MenuItem, MenuSeparator, Popover } from "./ui";
+import { ConnDot, EnvBadge, MenuItem, MenuSeparator, Modal, Popover } from "./ui";
 
 export function Sidebar() {
   const panel = useStore((s) => s.sidebarPanel);
@@ -1326,32 +1326,47 @@ function HistoryPanel() {
       return !v;
     });
 
+  // 50 at a time; scrolling near the end loads the next 50.
+  const [more, setMore] = useState(true);
+  const [clearing, setClearing] = useState(false);
+  const busy = useRef(false);
+  const query = useCallback((before: number | null) => api.listHistory({ search: search || null, limit: HISTORY_PAGE, before, exclude_ai: !showAi }), [search, showAi]);
+
   const load = useCallback(async () => {
     setLoading(true);
+    busy.current = true;
     try {
-      setItems(await api.listHistory({ search: search || null, limit: 300, exclude_ai: !showAi }));
+      const page = await query(null);
+      setItems(page);
+      setMore(page.length === HISTORY_PAGE);
     } catch (e) {
       toast(toError(e).message, "error");
     } finally {
+      busy.current = false;
       setLoading(false);
     }
-  }, [search, toast, showAi]);
+  }, [query, toast]);
+
+  const loadMore = useCallback(async () => {
+    if (busy.current || !more || items.length === 0) return;
+    busy.current = true;
+    setLoading(true);
+    try {
+      const page = await query(items[items.length - 1].id);
+      setItems((cur) => [...cur, ...page.filter((p) => !cur.some((c) => c.id === p.id))]);
+      setMore(page.length === HISTORY_PAGE);
+    } catch (e) {
+      toast(toError(e).message, "error");
+    } finally {
+      busy.current = false;
+      setLoading(false);
+    }
+  }, [items, more, query, toast]);
 
   useEffect(() => {
     const t = setTimeout(() => void load(), 150);
     return () => clearTimeout(t);
   }, [load, version]);
-
-  const clear = () =>
-    useStore.getState().askConfirm({
-      title: "Clear query history?",
-      reasons: ["All history entries will be deleted."],
-      confirmLabel: "Clear history",
-      onConfirm: async () => {
-        await api.clearHistory();
-        await load();
-      },
-    });
 
   return (
     <>
@@ -1366,12 +1381,29 @@ function HistoryPanel() {
         >
           <Sparkles size={14} />
         </button>
-        <button className="icon-btn" title="Clear history" aria-label="Clear history" onClick={clear} disabled={items.length === 0}>
+        <button className="icon-btn" title="Clear history…" aria-label="Clear history" onClick={() => setClearing(true)}>
           <Trash2 size={14} />
         </button>
       </PanelHeader>
       <SearchBox value={search} onChange={setSearch} placeholder="Search history" />
-      <div className="min-h-0 flex-1 overflow-auto px-1.5 pb-3">
+      {clearing && (
+        <ClearHistoryDialog
+          onClose={() => setClearing(false)}
+          onDone={(n) => {
+            setClearing(false);
+            toast(n === 0 ? "Nothing to delete" : `Deleted ${n.toLocaleString()} history entr${n === 1 ? "y" : "ies"} and their results`, "success");
+            void load();
+            void useStore.getState().refreshOutputs();
+          }}
+        />
+      )}
+      <div
+        className="min-h-0 flex-1 overflow-auto px-1.5 pb-3"
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          if (el.scrollHeight - el.scrollTop - el.clientHeight < 200) void loadMore();
+        }}
+      >
         {items.length === 0 && !loading && (
           <div className="px-3 py-8 text-center text-[12.5px] text-muted">
             <History size={26} className="mx-auto mb-3 opacity-50" />
@@ -1416,6 +1448,11 @@ function HistoryPanel() {
                   {h.connection_name}
                 </span>
               )}
+              {h.origin === "job" && (
+                <span className="flex shrink-0 items-center gap-0.5 rounded bg-hover px-1 text-fg" title="Run by a job step">
+                  <Workflow size={9} /> Job
+                </span>
+              )}
               {(h.origin === "ai" || h.origin === "mcp") && (
                 <span className="flex shrink-0 items-center gap-0.5 rounded bg-accent/10 px-1 text-accent" title={h.origin === "mcp" ? "Run by an MCP client" : "Run by the AI assistant"}>
                   <Sparkles size={9} /> {h.origin === "mcp" ? "MCP" : "AI"}
@@ -1425,8 +1462,85 @@ function HistoryPanel() {
             </div>
           </div>
         ))}
+        {items.length > 0 && (
+          <div className="py-2 text-center text-[11px] text-muted">
+            {more ? (loading ? "Loading…" : <button className="text-accent hover:underline" onClick={() => void loadMore()}>Show more</button>) : `${items.length.toLocaleString()} entries`}
+          </div>
+        )}
       </div>
     </>
+  );
+}
+
+const HISTORY_PAGE = 50;
+
+/** Clear history: AI queries (default), entries older than N days, or all.
+ *  The results those entries produced are dropped too. */
+function ClearHistoryDialog({ onClose, onDone }: { onClose: () => void; onDone: (deleted: number) => void }) {
+  const [kind, setKind] = useState<"ai" | "older_than_days" | "all">("ai");
+  const [days, setDays] = useState("7");
+  const [busy, setBusy] = useState(false);
+  const toast = useStore((s) => s.toast);
+  const n = Number(days);
+  const daysOk = Number.isInteger(n) && n >= 1 && n <= 3650;
+  const go = async () => {
+    setBusy(true);
+    try {
+      const what: HistoryClear = kind === "older_than_days" ? { kind, days: n } : { kind };
+      onDone(await api.clearHistory(what));
+    } catch (e) {
+      toast(toError(e).message, "error");
+      setBusy(false);
+    }
+  };
+  const opt = (k: typeof kind, label: string, hint: string, extra?: ReactNode) => (
+    <label className={`flex cursor-pointer gap-2 rounded-md border px-2.5 py-2 ${kind === k ? "border-accent bg-accent/5" : "border-line"}`}>
+      <input type="radio" name="clear-history" className="mt-0.5" checked={kind === k} onChange={() => setKind(k)} />
+      <span className="min-w-0 flex-1">
+        <span className="block text-[12.5px]">{label}</span>
+        <span className="block text-[11px] text-muted">{hint}</span>
+        {extra}
+      </span>
+    </label>
+  );
+  return (
+    <Modal
+      title="Clear query history"
+      onClose={onClose}
+      width={420}
+      footer={
+        <>
+          <button className="btn-ghost" onClick={onClose}>
+            Cancel
+          </button>
+          <button className={kind === "all" ? "btn-danger" : "btn-primary"} disabled={busy || (kind === "older_than_days" && !daysOk)} onClick={() => void go()}>
+            {busy ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />} Delete
+          </button>
+        </>
+      }
+    >
+      <div className="space-y-2" role="radiogroup" aria-label="What to delete">
+        {opt("ai", "Queries run by the AI assistant", "From the AI panel and MCP clients; yours and jobs' stay.")}
+        {opt(
+          "older_than_days",
+          "Keep only recent queries",
+          "Delete everything older than:",
+          <span className="mt-1 flex items-center gap-1.5 text-[12px]">
+            <input
+              className={`field h-7 w-20 py-0 ${daysOk ? "" : "border-danger"}`}
+              inputMode="numeric"
+              aria-label="Days to keep"
+              value={days}
+              onFocus={() => setKind("older_than_days")}
+              onChange={(e) => setDays(e.target.value)}
+            />
+            days
+          </span>,
+        )}
+        {opt("all", "All queries", "Every history entry.")}
+        <p className="pt-1 text-[11px] text-muted">The results these queries produced are deleted too, except pinned outputs and results still shown in a tab.</p>
+      </div>
+    </Modal>
   );
 }
 

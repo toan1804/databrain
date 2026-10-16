@@ -1178,8 +1178,29 @@ pub fn list_history(state: &AppState, query: HistoryQuery) -> Result<Vec<History
     Ok(state.workspace.list_history(&query)?)
 }
 
-pub fn clear_history(state: &AppState) -> Result<()> {
-    Ok(state.workspace.clear_history()?)
+pub fn clear_history(state: &AppState, what: Option<databrain_workspace::HistoryClear>) -> Result<usize> {
+    let (n, ids) = state.workspace.clear_history_results(what.unwrap_or(databrain_workspace::HistoryClear::All))?;
+    drop_history_results(&state.engine, &ids);
+    Ok(n)
+}
+
+/// Results of deleted history entries go too: their outputs (memory and
+/// saved snapshots), except pinned ones and those still shown in a tab.
+pub fn drop_history_results(engine: &QueryEngine, result_ids: &[String]) -> usize {
+    let outs = engine.outputs();
+    let mut n = 0;
+    for id in result_ids {
+        match outs.by_result(id) {
+            Some(o) if !o.pinned && !o.active => n += usize::from(outs.remove(&o.handle).is_ok()),
+            Some(_) => {}
+            // Not an output (any more): just free the stored rows.
+            None => n += usize::from(engine.results().remove(id)),
+        }
+    }
+    if n > 0 {
+        engine.outputs_changed();
+    }
+    n
 }
 
 // ------------------------------------------------------------ outputs
@@ -1816,6 +1837,26 @@ mod tests {
         .unwrap();
         assert_eq!(list_saved_queries(&st, Some("hanoi".into())).unwrap().len(), 1);
         assert_eq!(list_history(&st, HistoryQuery::default()).unwrap().len(), 3);
+
+        // Clearing history drops the results it produced, except what a tab still shows.
+        let again = |sql: &str| RunRequest {
+            connection_id: profile.id.clone(),
+            tab_id: "t1".into(),
+            sql: sql.into(),
+            base_offset: 0,
+            row_limit: Some(1000),
+            confirmed: true,
+            origin: Default::default(),
+            session_key: None,
+            output_name: None,
+            params: Default::default(),
+        };
+        let RunResponse::Started { job_id, .. } = run_query(&st, again("select count(*) from people")).unwrap() else { panic!() };
+        let latest = finished_results(&sink, &job_id).await[0].id.clone();
+        assert!(result_info(&st, &rid).is_ok());
+        assert_eq!(clear_history(&st, Some(databrain_workspace::HistoryClear::All)).unwrap(), 4);
+        assert!(result_info(&st, &rid).is_err(), "the older result went with its history entry");
+        assert!(result_info(&st, &latest).is_ok(), "the tab's current result stays");
 
         close_tab(&st, "t1");
         assert!(result_info(&st, &rid).is_err());
