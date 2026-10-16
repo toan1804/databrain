@@ -18,6 +18,7 @@ import { ArrowDown, ArrowUp, Ban, Copy, Filter, FilterX, X } from "lucide-react"
 import { api, toError } from "../lib/api";
 import type { ColumnMeta, ExportFormat, ResultInfo, ViewSpec } from "../lib/types";
 import { pageRange, toggleSort, upsertFilter } from "../lib/util";
+import { columnTypeInfo, ENGINE_NAMES } from "../lib/columnType";
 import { useStore } from "../store";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
 
@@ -127,6 +128,13 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
     rows: CompactSelection.empty(),
   });
   const [menu, setMenu] = useState<{ x: number; y: number; cell: Item } | null>(null);
+  /** Column header under the pointer: its type is shown in a tooltip. */
+  const [hoverHead, setHoverHead] = useState<{ col: number; x: number; y: number } | null>(null);
+  const outputs = useStore((s) => s.outputs);
+  const tip = useMemo(() => {
+    const c = hoverHead && info.columns[hoverHead.col];
+    return c ? columnTypeInfo(c, info.id, outputs) : null;
+  }, [hoverHead, info.columns, info.id, outputs]);
   const autoSized = useRef(false);
 
   const fetchPage = useCallback(
@@ -310,6 +318,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
   return (
     <div
       className="relative h-full w-full"
+      onMouseLeave={() => setHoverHead(null)}
       onKeyDown={(e) => {
         if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "c") {
           e.preventDefault();
@@ -349,6 +358,12 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
           onViewChange({ ...view, sort: toggleSort(view.sort, col, e.shiftKey) });
         }}
         onHeaderMenuClick={(col, bounds) => onHeaderMenu(col, bounds.x, bounds.y + bounds.height)}
+        onItemHovered={(a) => {
+          if (a.kind === "header" && a.location[0] >= 0) {
+            const [col] = a.location;
+            setHoverHead((h) => (h?.col === col ? h : { col, x: a.bounds.x, y: a.bounds.y + a.bounds.height + 4 }));
+          } else setHoverHead(null);
+        }}
         onCellContextMenu={(cell, e) => {
           e.preventDefault();
           const inSel =
@@ -368,6 +383,26 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         }}
         getCellsForSelection={undefined}
       />
+      {tip && hoverHead && !menu && (
+        <div
+          role="tooltip"
+          className="pointer-events-none fixed z-50 max-w-sm rounded-md border border-line bg-panel px-2 py-1.5 text-[11.5px] shadow-lg"
+          style={{ left: Math.max(4, Math.min(hoverHead.x, window.innerWidth - 300)), top: hoverHead.y }}
+        >
+          <div className="font-medium">{tip.name}</div>
+          <div className="font-mono text-accent">{tip.type}</div>
+          {tip.engine && <div className="text-[10.5px] text-muted">{ENGINE_NAMES[tip.engine as keyof typeof ENGINE_NAMES] ?? tip.engine} type</div>}
+          {tip.sources.map((src) => (
+            <div key={src.ref} className="mt-1 border-t border-line pt-1">
+              <span className="font-mono">{src.type}</span>
+              <span className="text-muted">
+                {" "}
+                in {src.ref} ({src.connection}, {ENGINE_NAMES[src.engine as keyof typeof ENGINE_NAMES] ?? src.engine})
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
       {menu && (
         <Popover x={menu.x} y={menu.y} onClose={() => setMenu(null)} className="w-60">
           <MenuItem

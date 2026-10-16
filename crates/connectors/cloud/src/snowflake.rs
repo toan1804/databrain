@@ -297,7 +297,10 @@ fn col_type(rt: &serde_json::Value) -> (ColType, String) {
     let db = match t.as_str() {
         "fixed" if scale == 0 => format!("number({precision})"),
         "fixed" => format!("number({precision},{scale})"),
-        "text" => "varchar".into(),
+        "text" => match rt["length"].as_i64() {
+            Some(n) if n > 0 && n < 16_777_216 => format!("varchar({n})"),
+            _ => "varchar".into(),
+        },
         other => other.to_string(),
     };
     (ct, db)

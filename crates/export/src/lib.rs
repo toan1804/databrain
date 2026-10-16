@@ -609,6 +609,19 @@ pub fn read_snapshot(path: &std::path::Path) -> Result<(SchemaRef, Vec<RecordBat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_keep_database_types() {
+        use databrain_connector_core::value::META_DB_TYPE;
+        let md = std::collections::HashMap::from([(META_DB_TYPE.to_string(), "numeric(12,2)".to_string())]);
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("amount", DataType::Utf8, true).with_metadata(md)]));
+        let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["1.50"]))]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.parquet");
+        write_snapshot(&p, schema, &[b]).unwrap();
+        let (back, _) = read_snapshot(&p).unwrap();
+        assert_eq!(back.field(0).metadata().get(META_DB_TYPE).map(String::as_str), Some("numeric(12,2)"));
+    }
     use databrain_connector_core::arrow::array::{BinaryArray, BooleanArray, Int64Array, StringArray};
     use databrain_connector_core::arrow::datatypes::{Field, Schema};
     use std::sync::Arc;

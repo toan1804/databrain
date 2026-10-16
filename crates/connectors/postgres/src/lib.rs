@@ -177,6 +177,38 @@ pub struct PgSession {
     tls: MakeTlsConnector,
 }
 
+/// The type as Postgres writes it (`format_type`): `character varying(255)`,
+/// `numeric(12,2)`, `integer[]`, user types by name.
+fn type_name(t: &Type, typmod: i32) -> String {
+    let (base, array) = match t.kind() {
+        tokio_postgres::types::Kind::Array(inner) => (inner.clone(), true),
+        _ => (t.clone(), false),
+    };
+    let m = typmod - 4; // VARHDRSZ
+    let name = match base.name() {
+        "int2" => "smallint".into(),
+        "int4" => "integer".into(),
+        "int8" => "bigint".into(),
+        "float4" => "real".into(),
+        "float8" => "double precision".into(),
+        "bool" => "boolean".into(),
+        "varchar" if m >= 0 => format!("character varying({m})"),
+        "varchar" => "character varying".into(),
+        "bpchar" if m >= 0 => format!("character({m})"),
+        "bpchar" => "character".into(),
+        "numeric" if m >= 0 => format!("numeric({},{})", (m >> 16) & 0xffff, m & 0xffff),
+        "timestamp" if typmod >= 0 => format!("timestamp({typmod}) without time zone"),
+        "timestamp" => "timestamp without time zone".into(),
+        "timestamptz" if typmod >= 0 => format!("timestamp({typmod}) with time zone"),
+        "timestamptz" => "timestamp with time zone".into(),
+        "time" => "time without time zone".into(),
+        "timetz" => "time with time zone".into(),
+        "bit" | "varbit" if typmod >= 0 => format!("{}({typmod})", if base.name() == "bit" { "bit" } else { "bit varying" }),
+        other => other.to_string(),
+    };
+    if array { format!("{name}[]") } else { name }
+}
+
 fn col_type(t: &Type) -> ColType {
     match *t {
         Type::BOOL => ColType::Bool,
@@ -277,7 +309,7 @@ async fn run(
     let columns: Vec<Column> = stmt
         .columns()
         .iter()
-        .map(|c| Column::new(c.name(), col_type(c.type_()), c.type_().name()))
+        .map(|c| Column::new(c.name(), col_type(c.type_()), type_name(c.type_(), c.type_modifier())))
         .collect();
     let types: Vec<ColType> = columns.iter().map(|c| c.col_type).collect();
     drop(stmt);
@@ -1143,6 +1175,21 @@ fn table_ddl(schema: &str, name: &str, columns: &[ColumnInfo]) -> String {
         quote(name),
         lines.join(",\n")
     )
+}
+
+#[cfg(test)]
+mod type_name_tests {
+    use super::*;
+    #[test]
+    fn names_types_like_postgres() {
+        assert_eq!(type_name(&Type::INT4, -1), "integer");
+        assert_eq!(type_name(&Type::VARCHAR, 259), "character varying(255)");
+        assert_eq!(type_name(&Type::NUMERIC, ((12 << 16) | 2) + 4), "numeric(12,2)");
+        assert_eq!(type_name(&Type::NUMERIC, -1), "numeric");
+        assert_eq!(type_name(&Type::INT4_ARRAY, -1), "integer[]");
+        assert_eq!(type_name(&Type::TIMESTAMPTZ, 3), "timestamp(3) with time zone");
+        assert_eq!(type_name(&Type::TEXT, -1), "text");
+    }
 }
 
 #[cfg(test)]

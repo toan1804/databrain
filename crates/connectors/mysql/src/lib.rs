@@ -172,13 +172,64 @@ fn col_type(c: &mysql_async::Column) -> ColType {
     }
 }
 
+/// The type as MySQL writes it (`varchar(255)`, `decimal(12,2)`,
+/// `int unsigned`), from the result's column definition.
 fn type_name(c: &mysql_async::Column) -> String {
-    let t = format!("{:?}", c.column_type());
-    let mut s = t.trim_start_matches("MYSQL_TYPE_").to_ascii_lowercase();
-    if c.flags().contains(ColumnFlags::UNSIGNED_FLAG) {
-        s.push_str(" unsigned");
-    }
-    s
+    let binary = c.character_set() == BINARY_CHARSET;
+    // Lengths are in bytes; utf8mb4 = 4 per character, utf8mb3 = 3.
+    let per_char = match c.character_set() {
+        45 | 46 | 224..=247 | 255 => 4,
+        33 | 83 | 192..=215 => 3,
+        _ => 1,
+    };
+    sql_type_name(c.column_type(), c.column_length(), c.decimals(), c.flags().contains(ColumnFlags::UNSIGNED_FLAG), binary, per_char)
+}
+
+fn sql_type_name(t: ColumnType, len: u32, decimals: u8, unsigned: bool, binary: bool, per_char: u32) -> String {
+    use ColumnType::*;
+    let chars = len / per_char.max(1);
+    let fsp = if decimals > 0 && decimals <= 6 { format!("({decimals})") } else { String::new() };
+    let name = match t {
+        MYSQL_TYPE_TINY => "tinyint".to_string(),
+        MYSQL_TYPE_SHORT => "smallint".into(),
+        MYSQL_TYPE_INT24 => "mediumint".into(),
+        MYSQL_TYPE_LONG => "int".into(),
+        MYSQL_TYPE_LONGLONG => "bigint".into(),
+        MYSQL_TYPE_FLOAT => "float".into(),
+        MYSQL_TYPE_DOUBLE => "double".into(),
+        MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL => {
+            // Display length counts the sign and the point.
+            let p = len.saturating_sub(u32::from(decimals > 0) + u32::from(!unsigned));
+            format!("decimal({p},{decimals})")
+        }
+        MYSQL_TYPE_YEAR => "year".into(),
+        MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => "date".into(),
+        MYSQL_TYPE_TIME | MYSQL_TYPE_TIME2 => format!("time{fsp}"),
+        MYSQL_TYPE_DATETIME | MYSQL_TYPE_DATETIME2 => format!("datetime{fsp}"),
+        MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIMESTAMP2 => format!("timestamp{fsp}"),
+        MYSQL_TYPE_BIT => format!("bit({len})"),
+        MYSQL_TYPE_JSON => "json".into(),
+        MYSQL_TYPE_ENUM => "enum".into(),
+        MYSQL_TYPE_SET => "set".into(),
+        MYSQL_TYPE_GEOMETRY => "geometry".into(),
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING if binary => format!("varbinary({len})"),
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING => format!("varchar({chars})"),
+        MYSQL_TYPE_STRING if binary => format!("binary({len})"),
+        MYSQL_TYPE_STRING => format!("char({chars})"),
+        MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_BLOB => {
+            // The protocol says "blob" for all; the length (in characters for text) tells which.
+            let size = match if binary { len } else { chars } {
+                0..=255 => "tiny",
+                256..=65_535 => "",
+                65_536..=16_777_215 => "medium",
+                _ => "long",
+            };
+            format!("{size}{}", if binary { "blob" } else { "text" })
+        }
+        other => format!("{other:?}").trim_start_matches("MYSQL_TYPE_").to_ascii_lowercase(),
+    };
+    let int = matches!(t, MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG | MYSQL_TYPE_LONGLONG | MYSQL_TYPE_FLOAT | MYSQL_TYPE_DOUBLE | MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL);
+    if unsigned && int { format!("{name} unsigned") } else { name }
 }
 
 fn convert(t: ColType, v: mysql_async::Value) -> Value {
@@ -905,5 +956,22 @@ mod tests {
             assert_eq!(l.indexes[1].columns, vec!["cust", "day"]);
             assert_eq!(l.partition_by, vec!["day"], "{l:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod type_name_tests {
+    use super::*;
+    use ColumnType::*;
+    #[test]
+    fn names_types_like_mysql() {
+        assert_eq!(sql_type_name(MYSQL_TYPE_VAR_STRING, 1020, 0, false, false, 4), "varchar(255)");
+        assert_eq!(sql_type_name(MYSQL_TYPE_NEWDECIMAL, 14, 2, false, false, 1), "decimal(12,2)");
+        assert_eq!(sql_type_name(MYSQL_TYPE_NEWDECIMAL, 12, 2, true, false, 1), "decimal(11,2) unsigned");
+        assert_eq!(sql_type_name(MYSQL_TYPE_LONGLONG, 20, 0, true, false, 1), "bigint unsigned");
+        assert_eq!(sql_type_name(MYSQL_TYPE_DATETIME, 26, 6, false, false, 1), "datetime(6)");
+        assert_eq!(sql_type_name(MYSQL_TYPE_BLOB, 262_140, 0, false, false, 4), "text");
+        assert_eq!(sql_type_name(MYSQL_TYPE_BLOB, 4_294_967_295, 0, false, true, 1), "longblob");
+        assert_eq!(sql_type_name(MYSQL_TYPE_STRING, 16, 0, false, true, 1), "binary(16)");
     }
 }
