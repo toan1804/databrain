@@ -868,6 +868,11 @@ async fn clear_history(state: State<'_, AppState>, what: Option<databrain_worksp
 }
 
 #[tauri::command]
+async fn delete_history_entry(state: State<'_, AppState>, id: i64) -> R<()> {
+    api::delete_history_entry(&state, id)
+}
+
+#[tauri::command]
 async fn load_tabs(state: State<'_, AppState>) -> R<Vec<TabState>> {
     api::load_tabs(&state)
 }
@@ -964,6 +969,9 @@ pub fn run() {
                         if let Ok(Ok((_, ids))) = tokio::task::spawn_blocking(move || w.prune_history()).await {
                             api::drop_history_results(&engine, &ids);
                         }
+                        // AI conversations, with their own retention setting.
+                        let w = ws.clone();
+                        let _ = tokio::task::spawn_blocking(move || w.prune_ai_history()).await;
                         tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
                     }
                 });
@@ -1029,6 +1037,7 @@ pub fn run() {
             save_folder,
             delete_folder,
             list_history,
+            delete_history_entry,
             clear_history,
             load_tabs,
             save_tabs,

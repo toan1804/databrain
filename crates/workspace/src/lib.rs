@@ -320,6 +320,8 @@ pub enum HistoryClear {
 /// Setting: delete history older than this many days (0 = keep it all).
 pub const HISTORY_RETENTION_SETTING: &str = "history_retention_days";
 pub const HISTORY_RETENTION_DEFAULT_DAYS: u32 = 30;
+/// Setting: delete AI conversations idle for longer than this many days (0 = keep them).
+pub const AI_HISTORY_RETENTION_SETTING: &str = "ai_history_retention_days";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TabState {
@@ -952,6 +954,14 @@ impl Workspace {
         Ok(rows)
     }
 
+    /// Delete one history entry; returns its result id (to drop the result too).
+    pub fn delete_history_entry(&self, id: i64) -> Result<Option<String>> {
+        let c = self.conn.lock();
+        let rid: Option<Option<String>> = c.query_row("SELECT result_id FROM query_history WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
+        c.execute("DELETE FROM query_history WHERE id = ?1", params![id])?;
+        Ok(rid.flatten())
+    }
+
     /// Days of history kept (Settings → Queries); `None` = keep it all.
     pub fn history_retention_days(&self) -> Option<u32> {
         match self.get_setting(HISTORY_RETENTION_SETTING).ok().flatten() {
@@ -1257,6 +1267,9 @@ mod tests {
         assert_eq!(ws.clear_history_by(HistoryClear::Ai).unwrap(), 1);
         assert_eq!(ws.prune_history().unwrap(), (1, vec!["job:0".to_string()]), "the 40-day-old entry, with its result");
         assert_eq!(ws.list_history(&HistoryQuery::default()).unwrap().iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(), ["select 2"]);
+        let last = ws.list_history(&HistoryQuery::default()).unwrap()[0].id;
+        assert_eq!(ws.delete_history_entry(last).unwrap(), None);
+        assert!(ws.list_history(&HistoryQuery::default()).unwrap().is_empty());
         ws.conn.lock().execute("DELETE FROM settings WHERE key = ?1", params![HISTORY_RETENTION_SETTING]).unwrap();
 
         let tabs = vec![

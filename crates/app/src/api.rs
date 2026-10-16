@@ -1184,6 +1184,14 @@ pub fn clear_history(state: &AppState, what: Option<databrain_workspace::History
     Ok(n)
 }
 
+/// Delete one history entry and the result it produced (unless pinned or shown in a tab).
+pub fn delete_history_entry(state: &AppState, id: i64) -> Result<()> {
+    if let Some(rid) = state.workspace.delete_history_entry(id)? {
+        drop_history_results(&state.engine, &[rid]);
+    }
+    Ok(())
+}
+
 /// Results of deleted history entries go too: their outputs (memory and
 /// saved snapshots), except pinned ones and those still shown in a tab.
 pub fn drop_history_results(engine: &QueryEngine, result_ids: &[String]) -> usize {

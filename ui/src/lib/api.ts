@@ -327,6 +327,7 @@ export const api = {
 
   listHistory: (query: HistoryQuery) => call<HistoryEntry[]>("list_history", { query }),
   /** Deletes the entries and the results they produced (not pinned or on-screen ones). Returns how many went. */
+  deleteHistoryEntry: (id: number) => call<void>("delete_history_entry", { id }),
   clearHistory: (what: HistoryClear) => call<number>("clear_history", { what }),
 
   loadTabs: () => call<TabState[]>("load_tabs"),

@@ -140,45 +140,53 @@ function Queries() {
         tips off.
       </p>
       <ConnectTimeout />
-      <HistoryRetention />
+      <h3 className="pt-3 text-[13px] font-medium">History</h3>
+      <HistoryRetention
+        setting="history_retention_days"
+        label="Delete queries older than"
+        hint="Checked at start and every few hours; the results those queries produced are deleted with them (pinned outputs and results shown in a tab are kept). Unchecked, history is never deleted automatically (only the newest 5,000 are kept). Default: 30 days."
+      />
+      <HistoryRetention
+        setting="ai_history_retention_days"
+        label="Delete AI conversations not used for"
+        hint="AI panel conversations (their messages, and Kiro's session for them) are deleted once nobody has continued them for this long. Unchecked, they are kept. Default: 30 days."
+      />
     </div>
   );
 }
 
-/** `history_retention_days`: history (and its results) older than this is deleted; 0 keeps everything. */
-function HistoryRetention() {
+/** A retention setting in days (0 = keep everything), default 30. */
+function HistoryRetention({ setting, label, hint }: { setting: string; label: string; hint: string }) {
   const [keep, setKeep] = useState(false);
   const [text, setText] = useState("30");
   useEffect(() => {
     api
       .getSettings()
       .then((s) => {
-        const v = s.history_retention_days;
+        const v = s[setting];
         if (typeof v === "number") {
           setKeep(v === 0);
           if (v > 0) setText(String(v));
         }
       })
       .catch(() => {});
-  }, []);
+  }, [setting]);
   const n = Number(text);
   const valid = Number.isInteger(n) && n >= 1 && n <= 3650;
   return (
-    <>
-      <h3 className="pt-3 text-[13px] font-medium">History</h3>
+    <div className="space-y-1">
       <label className="flex items-center gap-2 text-[12px]">
         <input
           type="checkbox"
           checked={!keep}
           onChange={(e) => {
             setKeep(!e.target.checked);
-            void api.setSetting("history_retention_days", e.target.checked ? (valid ? n : 30) : 0).catch(() => {});
+            void api.setSetting(setting, e.target.checked ? (valid ? n : 30) : 0).catch(() => {});
           }}
         />
-        Delete queries older than
+        {label}
         <input
-          id="history-days"
-          aria-label="Days of history to keep"
+          aria-label={`${label} (days)`}
           className={`field h-7 w-20 py-0 ${valid || keep ? "" : "border-danger"}`}
           inputMode="numeric"
           disabled={keep}
@@ -187,16 +195,13 @@ function HistoryRetention() {
           onChange={(e) => {
             setText(e.target.value);
             const v = Number(e.target.value);
-            if (Number.isInteger(v) && v >= 1 && v <= 3650) void api.setSetting("history_retention_days", v).catch(() => {});
+            if (Number.isInteger(v) && v >= 1 && v <= 3650) void api.setSetting(setting, v).catch(() => {});
           }}
         />
         days
       </label>
-      <p className="text-[11.5px] text-muted">
-        Checked at start and every few hours; the results those queries produced are deleted with them (pinned outputs and results shown in a tab
-        are kept). Unchecked, history is never deleted automatically (only the newest 5,000 are kept). Default: 30 days.
-      </p>
-    </>
+      <p className="text-[11.5px] text-muted">{hint}</p>
+    </div>
   );
 }
 

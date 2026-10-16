@@ -1426,7 +1426,7 @@ function HistoryPanel() {
             title={h.error ?? h.sql}
             onClick={() => newTab({ sql: h.sql, connection_id: h.connection_id ?? undefined })}
             onKeyDown={(e) => e.key === "Enter" && newTab({ sql: h.sql, connection_id: h.connection_id ?? undefined })}
-            className="mb-0.5 cursor-pointer rounded-md px-2 py-1.5 hover:bg-hover"
+            className="group mb-0.5 cursor-pointer rounded-md px-2 py-1.5 hover:bg-hover"
           >
             <div className="flex items-start gap-1.5">
               {h.status === "success" ? (
@@ -1437,6 +1437,25 @@ function HistoryPanel() {
                 <Ban size={12} className="mt-0.5 shrink-0 text-muted" />
               )}
               <span className="line-clamp-2 min-w-0 flex-1 break-all font-mono text-[11.5px]">{sqlPreview(h.sql, 140)}</span>
+              <button
+                type="button"
+                className="icon-btn -my-0.5 h-5 w-5 shrink-0 opacity-0 hover:text-danger focus:opacity-100 group-hover:opacity-100"
+                aria-label="Delete this query from history"
+                title="Delete from history (and its result)"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void api
+                    .deleteHistoryEntry(h.id)
+                    .then(() => {
+                      setItems((cur) => cur.filter((x) => x.id !== h.id));
+                      void useStore.getState().refreshOutputs();
+                    })
+                    .catch((err) => toast(toError(err).message, "error"));
+                }}
+                onKeyDown={(e) => e.stopPropagation()}
+              >
+                <Trash2 size={11} />
+              </button>
             </div>
             <div className="mt-1 flex items-center gap-2 pl-[18px] text-[10.5px] text-muted">
               <span>{relativeTime(h.started_at)}</span>

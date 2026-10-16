@@ -3,7 +3,7 @@
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result, Workspace, new_id, now_ms};
+use crate::{AI_HISTORY_RETENTION_SETTING, Error, Result, Workspace, new_id, now_ms};
 
 /// A configured AI provider. `config` is interpreted by the AI crate
 /// (base URL, auth method, default model, ...). Never contains secrets.
@@ -149,8 +149,35 @@ impl Workspace {
     }
 
     pub fn delete_ai_session(&self, id: &str) -> Result<()> {
-        self.conn.lock().execute("DELETE FROM ai_sessions WHERE id = ?1", [id])?;
+        let c = self.conn.lock();
+        c.execute("DELETE FROM ai_sessions WHERE id = ?1", [id])?;
+        // Kiro's own session id for it.
+        c.execute("DELETE FROM settings WHERE key = ?1", [format!("kiro_session:{id}")])?;
         Ok(())
+    }
+
+    /// Days of AI conversations kept (Settings → AI); `None` = keep them all.
+    pub fn ai_history_retention_days(&self) -> Option<u32> {
+        match self.get_setting(AI_HISTORY_RETENTION_SETTING).ok().flatten() {
+            None => Some(crate::HISTORY_RETENTION_DEFAULT_DAYS),
+            Some(v) => v.as_u64().map(|d| d as u32).filter(|d| *d > 0),
+        }
+    }
+
+    /// Delete conversations not used for longer than the retention setting
+    /// (their messages go with them). Returns how many went.
+    pub fn prune_ai_history(&self) -> Result<usize> {
+        let Some(days) = self.ai_history_retention_days() else { return Ok(0) };
+        let cutoff = now_ms() - days as i64 * 86_400_000;
+        let ids: Vec<String> = {
+            let c = self.conn.lock();
+            let mut st = c.prepare("SELECT id FROM ai_sessions WHERE updated_at < ?1")?;
+            st.query_map([cutoff], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        for id in &ids {
+            self.delete_ai_session(id)?;
+        }
+        Ok(ids.len())
     }
 
     pub fn add_ai_message(
@@ -269,5 +296,14 @@ mod tests {
         ws.add_ai_message(&b.id, "assistant", &serde_json::json!({}), (Some(5), Some(5))).unwrap();
         assert_eq!(ws.ai_token_totals("p1", 0).unwrap(), (100, 20));
         assert_eq!(ws.ai_token_totals("p1", i64::MAX).unwrap(), (0, 0));
+        // Retention: conversations idle for longer than the setting are deleted with their messages.
+        assert_eq!(ws.ai_history_retention_days(), Some(30));
+        ws.conn.lock().execute("UPDATE ai_sessions SET updated_at = ?1 WHERE id = ?2", rusqlite::params![crate::now_ms() - 31 * 86_400_000, a.id]).unwrap();
+        ws.set_setting(crate::AI_HISTORY_RETENTION_SETTING, &serde_json::json!(0)).unwrap();
+        assert_eq!(ws.prune_ai_history().unwrap(), 0, "0 = keep everything");
+        ws.set_setting(crate::AI_HISTORY_RETENTION_SETTING, &serde_json::json!(30)).unwrap();
+        assert_eq!(ws.prune_ai_history().unwrap(), 1);
+        assert!(ws.list_ai_messages(&a.id).unwrap().is_empty());
+        assert_eq!(ws.ai_token_totals("p2", 0).unwrap(), (5, 5), "recent conversation kept");
     }
 }
