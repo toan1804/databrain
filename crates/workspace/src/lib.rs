@@ -300,6 +300,9 @@ pub struct HistoryQuery {
     /// Return entries with `id < before` (pagination).
     #[serde(default)]
     pub before: Option<i64>,
+    /// Leave out statements run by the assistant (AI panel and MCP clients).
+    #[serde(default)]
+    pub exclude_ai: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -909,10 +912,11 @@ impl Workspace {
              WHERE (?1 IS NULL OR h.sql LIKE ?1 ESCAPE '\\') \
                AND (?2 IS NULL OR h.connection_id = ?2) \
                AND (?3 IS NULL OR h.id < ?3) \
+               AND (?5 = 0 OR h.origin NOT IN ('ai', 'mcp')) \
              ORDER BY h.id DESC LIMIT ?4",
         )?;
         let rows = stmt
-            .query_map(params![search, q.connection_id, q.before, limit], |r| {
+            .query_map(params![search, q.connection_id, q.before, limit, q.exclude_ai], |r| {
                 Ok(HistoryEntry {
                     origin: Origin::parse(&r.get::<_, String>(9)?),
                     id: r.get(0)?,
@@ -1166,6 +1170,8 @@ mod tests {
         assert_eq!(h[0].status, RunStatus::Error);
         assert_eq!(h[0].connection_name.as_deref(), Some("A"));
         assert_eq!(h[1].origin, Origin::Ai);
+        let mine = ws.list_history(&HistoryQuery { exclude_ai: true, ..Default::default() }).unwrap();
+        assert_eq!(mine.iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(), ["select 2", "select 0"]);
         let h = ws
             .list_history(&HistoryQuery {
                 search: Some("1".into()),

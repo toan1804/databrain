@@ -573,6 +573,8 @@ export interface HistoryEntry {
   rows: number | null;
   status: RunStatus;
   error: string | null;
+  /** Who ran it: you, the AI assistant, an MCP client or a job. */
+  origin?: "user" | "ai" | "mcp" | "job";
   output_handle?: string | null;
   result_id?: string | null;
 }
@@ -582,6 +584,8 @@ export interface HistoryQuery {
   connection_id?: string | null;
   limit?: number | null;
   before?: number | null;
+  /** Leave out statements run by the assistant (AI panel, MCP). */
+  exclude_ai?: boolean;
 }
 
 export interface TabState {

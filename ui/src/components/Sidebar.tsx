@@ -1318,17 +1318,24 @@ function HistoryPanel() {
   const [search, setSearch] = useState("");
   const [items, setItems] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(false);
+  // AI queries (assistant, MCP) are hidden unless asked for; remembered.
+  const [showAi, setShowAi] = useState(() => localStorage.getItem("db.history.showAi") === "1");
+  const toggleAi = () =>
+    setShowAi((v) => {
+      localStorage.setItem("db.history.showAi", v ? "0" : "1");
+      return !v;
+    });
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setItems(await api.listHistory({ search: search || null, limit: 300 }));
+      setItems(await api.listHistory({ search: search || null, limit: 300, exclude_ai: !showAi }));
     } catch (e) {
       toast(toError(e).message, "error");
     } finally {
       setLoading(false);
     }
-  }, [search, toast]);
+  }, [search, toast, showAi]);
 
   useEffect(() => {
     const t = setTimeout(() => void load(), 150);
@@ -1350,6 +1357,15 @@ function HistoryPanel() {
     <>
       <PanelHeader title="History">
         {loading && <Loader2 size={13} className="mr-1 animate-spin text-muted" />}
+        <button
+          className={`icon-btn ${showAi ? "text-accent" : ""}`}
+          title={showAi ? "Showing queries run by the AI assistant: click to hide them" : "Show queries run by the AI assistant"}
+          aria-label="Include AI queries"
+          aria-pressed={showAi}
+          onClick={toggleAi}
+        >
+          <Sparkles size={14} />
+        </button>
         <button className="icon-btn" title="Clear history" aria-label="Clear history" onClick={clear} disabled={items.length === 0}>
           <Trash2 size={14} />
         </button>
@@ -1360,6 +1376,14 @@ function HistoryPanel() {
           <div className="px-3 py-8 text-center text-[12.5px] text-muted">
             <History size={26} className="mx-auto mb-3 opacity-50" />
             {search ? "No matches" : "Queries you run appear here."}
+            {!showAi && (
+              <div className="mt-1 text-[11px]">
+                AI queries are hidden ·{" "}
+                <button className="text-accent underline" onClick={toggleAi}>
+                  show them
+                </button>
+              </div>
+            )}
           </div>
         )}
         {items.map((h) => (
@@ -1390,6 +1414,11 @@ function HistoryPanel() {
                 <span className="flex min-w-0 items-center gap-1 truncate">
                   <Plug size={10} />
                   {h.connection_name}
+                </span>
+              )}
+              {(h.origin === "ai" || h.origin === "mcp") && (
+                <span className="flex shrink-0 items-center gap-0.5 rounded bg-accent/10 px-1 text-accent" title={h.origin === "mcp" ? "Run by an MCP client" : "Run by the AI assistant"}>
+                  <Sparkles size={9} /> {h.origin === "mcp" ? "MCP" : "AI"}
                 </span>
               )}
               {h.output_handle && <HistoryOutput handle={h.output_handle} />}
