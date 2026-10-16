@@ -5,6 +5,7 @@
 //! the backend emits a request with an id and waits for the UI to answer via
 //! `ai_respond`.
 
+use databrain_auth::terminal::{Launch, TerminalJob, TerminalSetting};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -212,7 +213,8 @@ pub async fn provider_sign_in(state: &AppState, id: &str) -> Result<()> {
             let cancel = CancellationToken::new();
             *state.ai.sign_in_cancel.lock() = cancel.clone();
             let ui = state.ui.clone();
-            kiro.sign_in_browser(cancel, || ui.emit(AUTH_EVENT, json!({"type": "terminal_opened", "command": "kiro-cli login"})))
+            let terminal = terminal_setting(state);
+            kiro.sign_in_browser(cancel, &terminal, |l| ui.emit(AUTH_EVENT, launch_event(l, "kiro-cli login")))
                 .await
                 .map_err(ai_err)?;
             state.ui.emit(AUTH_EVENT, json!({"type": "finished"}));
@@ -223,6 +225,32 @@ pub async fn provider_sign_in(state: &AppState, id: &str) -> Result<()> {
     rec.config = serde_json::to_value(cfg).unwrap_or_default();
     state.workspace.save_ai_provider(rec)?;
     Ok(())
+}
+
+/// Settings → Terminal (`terminal`): which terminal runs CLI sign-ins.
+pub fn terminal_setting(state: &AppState) -> TerminalSetting {
+    state.workspace.get_setting("terminal").ok().flatten().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default()
+}
+
+/// Sign-in dialog event: a terminal runs `command`, or the user must run it.
+fn launch_event(l: &Launch, short: &str) -> Value {
+    match l {
+        Launch::Opened { terminal } => json!({"type": "terminal_opened", "command": short, "terminal": terminal}),
+        Launch::Manual { command, reason } => json!({"type": "run_command", "command": command, "reason": reason}),
+    }
+}
+
+/// Settings → Terminal → Test: opens the terminal with a short message.
+pub async fn terminal_test(setting: TerminalSetting) -> Launch {
+    let job = TerminalJob {
+        name: "terminal-test",
+        title: "DataBrain terminal test",
+        program: None,
+        args: &[],
+        unset_env: &[],
+        done_message: "DataBrain can open this terminal. You can close this window.",
+    };
+    databrain_auth::terminal::launch(&setting, &job).await
 }
 
 /// Sign out: Kiro ends the kiro-cli browser session; others drop the stored key.

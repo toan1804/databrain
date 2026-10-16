@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { AlertCircle, Bot, Check, Copy, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, ShieldCheck, Terminal, Trash2, Timer, Palette } from "lucide-react";
 import { api, toError } from "../lib/api";
-import type { AuditEntry, CredentialStoreKind, CredentialStoreView, KiroStatus, ProviderAuth, ProviderKind, ProviderView } from "../lib/types";
+import type { AuditEntry, TerminalLaunch, TerminalOption, TerminalSetting, CredentialStoreKind, CredentialStoreView, KiroStatus, ProviderAuth, ProviderKind, ProviderView } from "../lib/types";
 import { relativeTime } from "../lib/util";
 import { useStore } from "../store";
 import { useAi } from "../aiStore";
@@ -61,7 +61,7 @@ const AUTH_LABEL: Record<ProviderAuth, string> = {
 export function SettingsDialog() {
   const open = useStore((s) => s.settingsOpen);
   const setOpen = useStore((s) => s.setSettingsOpen);
-  const [section, setSection] = useState<"providers" | "appearance" | "queries" | "security" | "mcp" | "audit">("providers");
+  const [section, setSection] = useState<"providers" | "appearance" | "queries" | "terminal" | "security" | "mcp" | "audit">("providers");
   const focusProvider = useAi((s) => s.settingsProvider);
   useEffect(() => {
     if (focusProvider) setSection("providers");
@@ -84,6 +84,7 @@ export function SettingsDialog() {
           {item("providers", <Bot size={14} />, "AI providers")}
           {item("appearance", <Palette size={14} />, "Appearance")}
           {item("queries", <Timer size={14} />, "Queries")}
+          {item("terminal", <Terminal size={14} />, "Terminal")}
           {item("security", <ShieldCheck size={14} />, "Passwords")}
           {item("mcp", <Plug size={14} />, "MCP / Kiro")}
           {item("audit", <ScrollText size={14} />, "AI audit log")}
@@ -92,6 +93,7 @@ export function SettingsDialog() {
           {section === "providers" && <Providers />}
           {section === "appearance" && <AppearanceSettings />}
           {section === "queries" && <Queries />}
+          {section === "terminal" && <TerminalSettings />}
           {section === "security" && <CredentialStore />}
           {section === "mcp" && <Mcp />}
           {section === "audit" && <Audit />}
@@ -134,6 +136,114 @@ function Queries() {
         tips off.
       </p>
       <ConnectTimeout />
+    </div>
+  );
+}
+
+const IS_WINDOWS = typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
+
+/** `terminal`: which terminal runs CLI sign-ins (`kiro-cli login`). */
+function TerminalSettings() {
+  const [options, setOptions] = useState<TerminalOption[]>([]);
+  const [value, setValue] = useState<TerminalSetting>({ kind: "auto", custom: "" });
+  const [test, setTest] = useState<{ busy: boolean; result?: TerminalLaunch; error?: string }>({ busy: false });
+  useEffect(() => {
+    api.terminalOptions().then(setOptions).catch(() => {});
+    api
+      .getSettings()
+      .then((s) => {
+        const t = s.terminal as Partial<TerminalSetting> | undefined;
+        if (t && typeof t === "object") setValue({ kind: t.kind || "auto", custom: t.custom ?? "" });
+      })
+      .catch(() => {});
+  }, []);
+  const save = (next: TerminalSetting) => {
+    setValue(next);
+    setTest({ busy: false });
+    void api.setSetting("terminal", next).catch(() => {});
+  };
+  const example = IS_WINDOWS ? `"C:\\Program Files\\Git\\bin\\bash.exe" -l {sh}` : "open -na Ghostty --args -e {script}";
+  return (
+    <div className="max-w-lg space-y-2 text-[12.5px]">
+      <h3 className="text-[13px] font-medium">Terminal for sign-ins</h3>
+      <p className="text-[11.5px] text-muted">
+        Some sign-ins run a command in a terminal (Kiro: <code>kiro-cli login</code>). DataBrain lists the terminals it finds on this computer; if
+        the default one is blocked (for example PowerShell or cmd blocked by IT), choose another here, or give your own command. A terminal that doesn't run the command within a few seconds counts as blocked:
+        Automatic then tries the next one, and in the end DataBrain shows the command to run yourself.
+      </p>
+      <label htmlFor="terminal-kind" className="block text-[12px] text-muted">
+        Open with
+      </label>
+      <div className="flex items-center gap-2">
+        <select id="terminal-kind" className="field min-w-0 flex-1" value={value.kind} onChange={(e) => save({ ...value, kind: e.target.value })}>
+          {options.map((o) => (
+            <option key={o.id} value={o.id}>
+              {o.label}
+            </option>
+          ))}
+          {/* Chosen earlier, gone now (uninstalled): keep it visible. */}
+          {options.length > 0 && !options.some((o) => o.id === value.kind) && <option value={value.kind}>{value.kind} (not found on this computer)</option>}
+        </select>
+        <button className="btn-ghost" title="Look for terminals again (after installing one)" onClick={() => void api.terminalOptions().then(setOptions).catch(() => {})}>
+          <RefreshCw size={13} /> Rescan
+        </button>
+      </div>
+      {(() => {
+        const found = options.filter((o) => o.detail).length;
+        const cur = options.find((o) => o.id === value.kind);
+        return (
+          <p className="text-[11.5px] text-muted">
+            {cur?.detail ? <>Found at <code className="break-all">{cur.detail}</code>. </> : null}
+            {options.length > 0 && `${found} terminal${found === 1 ? "" : "s"} found on this computer${value.kind === "auto" && found ? ", tried in the order listed" : ""}.`}
+          </p>
+        );
+      })()}
+      {value.kind === "custom" && (
+        <>
+          <label htmlFor="terminal-custom" className="block text-[12px] text-muted">
+            Command
+          </label>
+          <input
+            id="terminal-custom"
+            className="field w-full font-mono"
+            placeholder={example}
+            value={value.custom}
+            spellCheck={false}
+            onChange={(e) => save({ ...value, custom: e.target.value })}
+          />
+          <p className="text-[11.5px] text-muted">
+            DataBrain writes the command to a script and fills in <code>{"{script}"}</code> ({IS_WINDOWS ? ".cmd" : "shell"} script),{" "}
+            <code>{"{sh}"}</code> (shell script){IS_WINDOWS ? <>, <code>{"{cmd}"}</code> or <code>{"{ps1}"}</code> (PowerShell)</> : null}; without one,
+            the script is added at the end. Example: <code>{example}</code>
+          </p>
+        </>
+      )}
+      {value.kind === "manual" && <p className="text-[11.5px] text-muted">The sign-in dialog shows the command with a Copy button; run it in any terminal and DataBrain notices when you're signed in.</p>}
+      <div className="flex items-center gap-2 pt-1">
+        <button
+          className="btn"
+          disabled={test.busy || value.kind === "manual"}
+          onClick={() => {
+            setTest({ busy: true });
+            api
+              .terminalTest(value)
+              .then((result) => setTest({ busy: false, result }))
+              .catch((e) => setTest({ busy: false, error: toError(e).message }));
+          }}
+        >
+          {test.busy ? <Loader2 size={13} className="animate-spin" /> : <Terminal size={13} />} Test
+        </button>
+        <span role="status" className="min-w-0 text-[11.5px]">
+          {test.busy && <span className="text-muted">Opening a terminal…</span>}
+          {test.result?.type === "opened" && (
+            <span className="text-success">
+              <Check size={12} className="inline" /> {test.result.terminal} works.
+            </span>
+          )}
+          {test.result?.type === "manual" && <span className="text-danger">Didn't start: {test.result.reason ?? "no terminal"}</span>}
+          {test.error && <span className="text-danger">{test.error}</span>}
+        </span>
+      </div>
     </div>
   );
 }

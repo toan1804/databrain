@@ -809,8 +809,25 @@ export interface DeviceCodePrompt {
 export type AuthEvent =
   | { type: "browser_opened"; url: string }
   | { type: "device_code"; prompt: DeviceCodePrompt }
-  | { type: "terminal_opened"; command: string }
+  | { type: "terminal_opened"; command: string; terminal?: string }
+  /** No terminal could be opened (or the user runs it): show the command. */
+  | { type: "run_command"; command: string; reason?: string | null }
   | { type: "finished" };
+
+/** Settings → Terminal: "auto", "manual", "custom" or a preset id. */
+export interface TerminalSetting {
+  kind: string;
+  custom: string;
+}
+
+export interface TerminalOption {
+  id: string;
+  label: string;
+  /** Where it was found on this computer (found terminals only). */
+  detail?: string | null;
+}
+
+export type TerminalLaunch = { type: "opened"; terminal: string } | { type: "manual"; command: string; reason?: string | null };
 
 export interface KnObject {
   schema: string;

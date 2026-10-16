@@ -80,6 +80,9 @@ import type {
   TabState,
   TestResult,
   ViewSpec,
+  TerminalLaunch,
+  TerminalOption,
+  TerminalSetting,
 } from "./types";
 
 export const isTauri = (): boolean =>
@@ -271,6 +274,8 @@ export const api = {
   aiProviderSignIn: (id: string) => call<void>("ai_provider_sign_in", { id }),
   aiProviderSignOut: (id: string) => call<void>("ai_provider_sign_out", { id }),
   aiProviderStatus: (id: string) => call<KiroStatus>("ai_provider_status", { id }),
+  terminalOptions: () => call<TerminalOption[]>("terminal_options"),
+  terminalTest: (setting: TerminalSetting) => call<TerminalLaunch>("terminal_test", { setting }),
   aiSend: (args: AgentRequest) => call<string>("ai_send", { args }),
   aiCancel: (runId: string) => call<boolean>("ai_cancel", { runId }),
   aiRespond: (requestId: string, response: unknown) => call<boolean>("ai_respond", { requestId, response }),

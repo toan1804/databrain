@@ -299,6 +299,14 @@ async fn ai_provider_status(state: State<'_, AppState>, id: String) -> R<databra
     ai_api::provider_status(&state, &id).await
 }
 #[tauri::command]
+async fn terminal_options() -> R<Vec<databrain_auth::terminal::TerminalOption>> {
+    Ok(databrain_auth::terminal::options())
+}
+#[tauri::command]
+async fn terminal_test(setting: databrain_auth::terminal::TerminalSetting) -> R<databrain_auth::terminal::Launch> {
+    Ok(ai_api::terminal_test(setting).await)
+}
+#[tauri::command]
 async fn ai_provider_sign_out(state: State<'_, AppState>, id: String) -> R<()> {
     ai_api::provider_sign_out(&state, &id).await
 }
@@ -940,6 +948,8 @@ pub fn run() {
             ai_list_models,
             ai_provider_sign_in,
             ai_provider_status,
+            terminal_options,
+            terminal_test,
             ai_provider_sign_out,
             ai_send,
             ai_cancel,

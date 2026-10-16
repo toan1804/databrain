@@ -10,6 +10,7 @@ pub mod cloud;
 pub mod jwt;
 pub mod loopback;
 pub mod oauth;
+pub mod terminal;
 pub mod vault;
 
 use std::collections::HashMap;
