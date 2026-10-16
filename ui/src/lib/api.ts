@@ -80,6 +80,7 @@ import type {
   TabState,
   TestResult,
   ViewSpec,
+  ProviderUsage,
   TerminalLaunch,
   TerminalOption,
   TerminalSetting,
@@ -274,6 +275,9 @@ export const api = {
   aiProviderSignIn: (id: string) => call<void>("ai_provider_sign_in", { id }),
   aiProviderSignOut: (id: string) => call<void>("ai_provider_sign_out", { id }),
   aiProviderStatus: (id: string) => call<KiroStatus>("ai_provider_status", { id }),
+  aiProviderUsage: (id: string, sinceDay: number, sinceMonth: number) =>
+    call<ProviderUsage>("ai_provider_usage", { id, sinceDay, sinceMonth }),
+  openLink: (url: string) => call<void>("open_link", { url }),
   terminalOptions: () => call<TerminalOption[]>("terminal_options"),
   appInDownloads: () => call<string | null>("app_in_downloads"),
   moveToApplications: (replace: boolean) => call<void>("move_to_applications", { replace }),

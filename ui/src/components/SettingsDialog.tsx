@@ -8,6 +8,7 @@ import { useStore } from "../store";
 import { useAi } from "../aiStore";
 import { ComboInput, Modal } from "./ui";
 import { AppearanceSettings } from "./AppearanceSettings";
+import { UsageDetails } from "./ProviderUsage";
 
 export const PROVIDER_KINDS: { kind: ProviderKind; label: string; base: string; auth: ProviderAuth[]; model: string; hint?: string }[] = [
   {
@@ -607,6 +608,7 @@ function ProviderForm({
           <input className="field" value={apiVersion} onChange={(e) => setApiVersion(e.target.value)} />
         </div>
       )}
+      {initial && <ProviderUsageSection id={initial.id} />}
       <div className="flex items-center justify-end gap-2 pt-1">
         {initial && (
           <button className="btn-ghost mr-auto text-danger" onClick={remove}>
@@ -617,6 +619,20 @@ function ProviderForm({
           {busy === "save" ? <Loader2 size={13} className="animate-spin" /> : <KeyRound size={13} />} {initial ? "Save" : "Add provider"}
         </button>
       </div>
+    </div>
+  );
+}
+
+/** Budget (credits/balance) and token use of a saved provider. */
+function ProviderUsageSection({ id }: { id: string }) {
+  const entry = useAi((s) => s.usage[id]);
+  const load = useAi((s) => s.loadUsage);
+  useEffect(() => {
+    void load(id);
+  }, [id, load]);
+  return (
+    <div className="rounded-md border border-line p-2.5">
+      <UsageDetails providerId={id} usage={entry?.data} error={entry?.error} loading={!entry || entry.loading} />
     </div>
   );
 }

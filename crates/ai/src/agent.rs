@@ -24,6 +24,8 @@ pub enum AgentEvent {
     ToolStarted { session_id: String, run_id: String, call_id: String, tool: String, args: Value },
     ToolFinished { session_id: String, run_id: String, call_id: String, tool: String, content: String, display: Value },
     Usage { session_id: String, run_id: String, input: u32, output: u32 },
+    /// Kiro: credits a turn spent and how full the context is.
+    Metering { session_id: String, run_id: String, credits: f64, context_percent: Option<f64> },
     Finished { session_id: String, run_id: String, text: String },
     Failed { session_id: String, run_id: String, error: AiError },
 }

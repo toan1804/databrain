@@ -180,6 +180,45 @@ pub async fn list_models(state: &AppState, id: &str) -> Result<Vec<ModelInfo>> {
     p.list_models().await.map_err(ai_err)
 }
 
+/// Budget and token use of a provider (Settings, AI panel).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderUsage {
+    /// Credits/balance, when the provider reports them.
+    pub budget: Option<databrain_ai::Budget>,
+    /// Why the budget couldn't be read (sign-in, network…).
+    pub budget_error: Option<String>,
+    /// Whether this provider has a budget API at all.
+    pub budget_supported: bool,
+    /// Tokens (input, output) of DataBrain's conversations with it.
+    pub tokens_today: (i64, i64),
+    pub tokens_month: (i64, i64),
+}
+
+/// `since_day` / `since_month`: local midnight of today and of the 1st (ms).
+pub async fn provider_usage(state: &AppState, id: &str, since_day: i64, since_month: i64) -> Result<ProviderUsage> {
+    let rec = state.workspace.get_ai_provider(id)?;
+    let kind = ProviderKind::parse(&rec.kind);
+    let cfg: ProviderConfig = serde_json::from_value(rec.config.clone()).unwrap_or_default();
+    let deepseek = cfg.base_url.as_deref().is_some_and(|u| u.contains("api.deepseek.com"));
+    let budget_supported = matches!(kind, Some(ProviderKind::Kiro | ProviderKind::Openrouter)) || deepseek;
+    let (mut budget, mut budget_error) = (None, None);
+    if budget_supported {
+        let (p, _, _) = databrain_ai::provider_for(&rec, state.secrets.clone()).map_err(ai_err)?;
+        match tokio::time::timeout(Duration::from_secs(30), p.budget()).await {
+            Ok(Ok(b)) => budget = b,
+            Ok(Err(e)) => budget_error = Some(e.to_string()),
+            Err(_) => budget_error = Some("the provider didn't answer in time".into()),
+        }
+    }
+    Ok(ProviderUsage {
+        budget,
+        budget_error,
+        budget_supported,
+        tokens_today: state.workspace.ai_token_totals(id, since_day)?,
+        tokens_month: state.workspace.ai_token_totals(id, since_month)?,
+    })
+}
+
 fn kiro_provider(state: &AppState, rec: &AiProviderRecord) -> Result<databrain_ai::kiro::KiroProvider> {
     let cfg: ProviderConfig = serde_json::from_value(rec.config.clone()).unwrap_or_default();
     let key = databrain_ai::providers::KeySource::Stored { store: state.secrets.clone(), reference: SecretRef::for_ai_provider(&rec.id) };

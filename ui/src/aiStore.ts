@@ -10,6 +10,7 @@ import type {
   AiUiRequest,
   EditProposal,
   PlannedStatement,
+  ProviderUsage,
   ProviderView,
   UiContext,
 } from "./lib/types";
@@ -89,6 +90,13 @@ interface AiState {
   alsoConnections: string[];
   setAlsoConnections: (ids: string[]) => void;
   tokens: { input: number; output: number };
+  /** Kiro: credits this chat spent, and how full its context is (%). */
+  credits: number;
+  contextPercent: number | null;
+  /** Budget and token totals per provider (loaded on demand). */
+  usage: Record<string, { data?: ProviderUsage; error?: string; loading: boolean; at: number }>;
+  /** Load a provider's usage; cached for a minute unless `force`. */
+  loadUsage: (providerId: string, force?: boolean) => Promise<void>;
   knowledgeProgress: Record<string, { schema: string; done: number; total: number } | undefined>;
   knowledgeVersion: number;
   sessionsVersion: number;
@@ -306,8 +314,13 @@ export const useAi = create<AiState>((set, get) => {
       case "usage":
         set((s) => ({ tokens: { input: s.tokens.input + e.input, output: s.tokens.output + e.output } }));
         break;
+      case "metering":
+        set((s) => ({ credits: s.credits + e.credits, contextPercent: e.context_percent ?? s.contextPercent }));
+        break;
       case "finished":
       case "failed":
+        // The budget moved: refresh it if it is shown.
+        if (get().providerId && get().usage[get().providerId!]) void get().loadUsage(get().providerId!, true);
         set((s) => ({
           running: false,
           runId: null,
@@ -422,6 +435,23 @@ export const useAi = create<AiState>((set, get) => {
       set({ alsoConnections: uniq });
     },
     tokens: { input: 0, output: 0 },
+    credits: 0,
+    contextPercent: null,
+    usage: {},
+    loadUsage: async (providerId, force = false) => {
+      const cur = get().usage[providerId];
+      if (cur?.loading || (!force && cur?.data && Date.now() - cur.at < 60_000)) return;
+      set((s) => ({ usage: { ...s.usage, [providerId]: { ...cur, loading: true, at: cur?.at ?? 0 } } }));
+      const now = new Date();
+      const day = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+      const month = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+      try {
+        const data = await api.aiProviderUsage(providerId, day, month);
+        set((s) => ({ usage: { ...s.usage, [providerId]: { data, loading: false, at: Date.now() } } }));
+      } catch (e) {
+        set((s) => ({ usage: { ...s.usage, [providerId]: { ...s.usage[providerId], error: toError(e).message, loading: false, at: Date.now() } } }));
+      }
+    },
     knowledgeProgress: {},
     knowledgeVersion: 0,
     indexPicker: null,
@@ -590,6 +620,8 @@ export const useAi = create<AiState>((set, get) => {
         targetKey: key,
         connectionId: conn,
         tokens: sessionId ? s.tokens : { input: 0, output: 0 },
+        credits: sessionId ? s.credits : 0,
+        contextPercent: sessionId ? s.contextPercent : null,
       }));
       localStorage.setItem("db.ai.open", "1");
       try {
@@ -627,7 +659,7 @@ export const useAi = create<AiState>((set, get) => {
 
     newChat: () => {
       if (get().running) void get().cancel();
-      set({ sessionId: null, items: [], runId: null, running: false, queued: [], tokens: { input: 0, output: 0 }, view: "chat" });
+      set({ sessionId: null, items: [], runId: null, running: false, queued: [], tokens: { input: 0, output: 0 }, credits: 0, contextPercent: null, view: "chat" });
     },
 
     removeQueued: (id) => set((s) => ({ queued: s.queued.filter((q) => q.id !== id) })),
@@ -655,7 +687,9 @@ export const useAi = create<AiState>((set, get) => {
             if (last && last.kind === "tool") last.content = c.text ?? "";
           }
         }
-        set({ sessionId: id, items, connectionId: sess?.connection_id ?? get().connectionId, view: "chat", runId: null, running: false });
+        // Tokens the stored conversation used (Kiro credits are not stored).
+        const tokens = msgs.reduce((t, m) => ({ input: t.input + (m.tokens_in ?? 0), output: t.output + (m.tokens_out ?? 0) }), { input: 0, output: 0 });
+        set({ sessionId: id, items, connectionId: sess?.connection_id ?? get().connectionId, view: "chat", runId: null, running: false, tokens, credits: 0, contextPercent: null });
       } catch (e) {
         useStore.getState().toast(toError(e).message, "error");
       }

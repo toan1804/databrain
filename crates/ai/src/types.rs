@@ -1,6 +1,7 @@
 //! Provider-neutral chat types.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +85,35 @@ pub struct ModelInfo {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// Account budget a provider reports (credits, prepaid balance, key limit).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Budget {
+    /// Plan or key name ("KIRO POWER", "Free tier").
+    pub plan: Option<String>,
+    pub meters: Vec<BudgetMeter>,
+    /// When the allowance renews (YYYY-MM-DD), if it does.
+    pub resets_on: Option<String>,
+    /// Where to see details or buy more.
+    pub manage_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct BudgetMeter {
+    pub label: String,
+    /// Spent so far (this cycle, or ever when nothing resets).
+    pub used: Option<f64>,
+    /// Allowance; `None` = no limit (or not reported).
+    pub limit: Option<f64>,
+    /// Left to spend, when the provider says so directly (balances).
+    pub remaining: Option<f64>,
+    /// "credits", "USD", "CNY"…
+    pub unit: String,
+}
+
+pub(crate) fn num(v: &Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
 #[derive(Debug, Clone, thiserror::Error, Serialize)]

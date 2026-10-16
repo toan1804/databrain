@@ -113,6 +113,11 @@ pub trait LlmProvider: Send + Sync {
     fn as_kiro(&self) -> Option<&crate::kiro::KiroProvider> {
         None
     }
+    /// The account's credits/balance, for providers that report it with the
+    /// key in use (`None`: this provider has no such API).
+    async fn budget(&self) -> Result<Option<Budget>> {
+        Ok(None)
+    }
 }
 
 /// Resolves the API key / bearer token for a provider on each request.
@@ -232,6 +237,43 @@ impl OpenAi {
     }
 }
 
+impl OpenAi {
+    /// OpenRouter: the key's spend and limit (`/key`), plus the account's
+    /// purchased credits (`/credits`, when the key may read it).
+    async fn openrouter_budget(&self) -> Result<Budget> {
+        let v: Value = check(self.req(reqwest::Method::GET, "/key").await?.send().await.map_err(net)?, "key").await?.json().await.map_err(net)?;
+        Ok(openrouter_budget(&v["data"], self.credits().await))
+    }
+
+    async fn credits(&self) -> Option<Value> {
+        let r = self.req(reqwest::Method::GET, "/credits").await.ok()?.send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.json::<Value>().await.ok().map(|v| v["data"].clone())
+    }
+}
+
+pub(crate) fn openrouter_budget(key: &Value, credits: Option<Value>) -> Budget {
+    let mut meters = Vec::new();
+    if let Some(c) = credits.filter(|c| c.is_object()) {
+        let (total, used) = (num(&c["total_credits"]), num(&c["total_usage"]));
+        meters.push(BudgetMeter { label: "Account credits".into(), used, limit: total, remaining: total.zip(used).map(|(t, u)| t - u), unit: "USD".into() });
+    }
+    meters.push(BudgetMeter {
+        label: "This key".into(),
+        used: num(&key["usage"]),
+        limit: num(&key["limit"]),
+        remaining: num(&key["limit_remaining"]),
+        unit: "USD".into(),
+    });
+    if let Some(m) = num(&key["usage_monthly"]) {
+        meters.push(BudgetMeter { label: "This key, this month".into(), used: Some(m), limit: None, remaining: None, unit: "USD".into() });
+    }
+    let plan = if key["is_free_tier"].as_bool() == Some(true) { Some("Free tier".to_string()) } else { key["label"].as_str().map(str::to_string) };
+    Budget { plan, meters, resets_on: None, manage_url: Some("https://openrouter.ai/settings/credits".into()) }
+}
+
 pub fn openai_messages(system: &str, messages: &[Message]) -> Vec<Value> {
     let mut out = vec![json!({"role": "system", "content": system})];
     for m in messages {
@@ -280,6 +322,22 @@ impl LlmProvider for OpenAi {
             .unwrap_or_default();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
+    }
+
+    async fn budget(&self) -> Result<Option<Budget>> {
+        if self.kind == ProviderKind::Openrouter {
+            return self.openrouter_budget().await.map(Some);
+        }
+        // DeepSeek (OpenAI-compatible) has a balance endpoint.
+        if self.base.contains("api.deepseek.com") {
+            let v: Value = check(self.req(reqwest::Method::GET, "/user/balance").await?.send().await.map_err(net)?, "balance").await?.json().await.map_err(net)?;
+            let meters = v["balance_infos"]
+                .as_array()
+                .map(|a| a.iter().map(|b| BudgetMeter { label: "Balance".into(), used: None, limit: None, remaining: num(&b["total_balance"]), unit: b["currency"].as_str().unwrap_or("").into() }).collect())
+                .unwrap_or_default();
+            return Ok(Some(Budget { plan: None, meters, resets_on: None, manage_url: Some("https://platform.deepseek.com/usage".into()) }));
+        }
+        Ok(None)
     }
 
     async fn chat_stream(&self, req: ChatRequest) -> Result<BoxStream<'static, Result<ChatEvent>>> {
@@ -712,6 +770,18 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_openrouter_budget() {
+        let b = openrouter_budget(
+            &json!({"label": "sk-or-v1-abc", "usage": 1.25, "limit": 10, "limit_remaining": 8.75, "usage_monthly": 0.5, "is_free_tier": false}),
+            Some(json!({"total_credits": 20, "total_usage": 4.5})),
+        );
+        assert_eq!(b.meters[0], BudgetMeter { label: "Account credits".into(), used: Some(4.5), limit: Some(20.0), remaining: Some(15.5), unit: "USD".into() });
+        assert_eq!((b.meters[1].used, b.meters[1].limit, b.meters[1].remaining), (Some(1.25), Some(10.0), Some(8.75)));
+        let unlimited = openrouter_budget(&json!({"usage": 3, "limit": null, "is_free_tier": true}), None);
+        assert_eq!((unlimited.meters[0].limit, unlimited.plan.as_deref()), (None, Some("Free tier")));
+    }
+
     use super::*;
 
     fn bytes_stream(chunks: Vec<&'static str>) -> BoxStream<'static, reqwest::Result<bytes::Bytes>> {

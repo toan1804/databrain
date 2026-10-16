@@ -171,6 +171,18 @@ impl Workspace {
         Ok(id)
     }
 
+    /// Tokens (input, output) reported for a provider's conversations since
+    /// `since_ms` (messages of deleted conversations are not counted).
+    pub fn ai_token_totals(&self, provider_id: &str, since_ms: i64) -> Result<(i64, i64)> {
+        let c = self.conn.lock();
+        Ok(c.query_row(
+            "SELECT COALESCE(SUM(m.tokens_in), 0), COALESCE(SUM(m.tokens_out), 0) FROM ai_messages m JOIN ai_sessions s ON s.id = m.session_id \
+             WHERE s.provider_id = ?1 AND m.created_at >= ?2",
+            params![provider_id, since_ms],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
     pub fn list_ai_messages(&self, session_id: &str) -> Result<Vec<AiMessageRecord>> {
         let c = self.conn.lock();
         let mut stmt = c.prepare(
@@ -241,4 +253,21 @@ fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AiSessionRecord> {
         created_at: r.get(5)?,
         updated_at: r.get(6)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{AiSessionRecord, Workspace};
+
+    #[test]
+    fn totals_tokens_per_provider() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let s = |p: &str| ws.save_ai_session(AiSessionRecord { id: String::new(), title: "t".into(), connection_id: None, provider_id: Some(p.into()), model: None, created_at: 0, updated_at: 0 }).unwrap();
+        let (a, b) = (s("p1"), s("p2"));
+        ws.add_ai_message(&a.id, "assistant", &serde_json::json!({}), (Some(100), Some(20))).unwrap();
+        ws.add_ai_message(&a.id, "user", &serde_json::json!({}), (None, None)).unwrap();
+        ws.add_ai_message(&b.id, "assistant", &serde_json::json!({}), (Some(5), Some(5))).unwrap();
+        assert_eq!(ws.ai_token_totals("p1", 0).unwrap(), (100, 20));
+        assert_eq!(ws.ai_token_totals("p1", i64::MAX).unwrap(), (0, 0));
+    }
 }

@@ -758,6 +758,8 @@ export type AgentEvent =
   | ({ type: "tool_started"; call_id: string; tool: string; args: Record<string, unknown> } & Ev)
   | ({ type: "tool_finished"; call_id: string; tool: string; content: string; display: unknown } & Ev)
   | ({ type: "usage"; input: number; output: number } & Ev)
+  /** Kiro: credits a turn spent and how full its context is (%). */
+  | ({ type: "metering"; credits: number; context_percent: number | null } & Ev)
   | ({ type: "finished"; text: string } & Ev)
   | ({ type: "failed"; error: AiError } & Ev);
 
@@ -788,6 +790,8 @@ export interface AiMessageRecord {
   session_id: string;
   role: "user" | "assistant" | "tool";
   content: { text?: string; tool_calls?: { id: string; name: string; arguments: unknown }[]; tool_name?: string } | string;
+  tokens_in?: number | null;
+  tokens_out?: number | null;
   created_at: number;
 }
 
@@ -1126,4 +1130,29 @@ export interface StepProgress {
   phase: string;
   done: number;
   total: number;
+}
+
+/** Account budget a provider reports (credits, balance, key limit). */
+export interface BudgetMeter {
+  label: string;
+  used: number | null;
+  limit: number | null;
+  remaining: number | null;
+  unit: string;
+}
+
+export interface Budget {
+  plan: string | null;
+  meters: BudgetMeter[];
+  resets_on: string | null;
+  manage_url: string | null;
+}
+
+export interface ProviderUsage {
+  budget: Budget | null;
+  budget_error: string | null;
+  budget_supported: boolean;
+  /** [input, output] tokens of DataBrain's conversations. */
+  tokens_today: [number, number];
+  tokens_month: [number, number];
 }

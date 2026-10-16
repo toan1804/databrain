@@ -298,6 +298,19 @@ async fn ai_provider_sign_in(state: State<'_, AppState>, id: String) -> R<()> {
 async fn ai_provider_status(state: State<'_, AppState>, id: String) -> R<databrain_ai::kiro::KiroStatus> {
     ai_api::provider_status(&state, &id).await
 }
+/// Open a provider's billing page in the browser (https only).
+#[tauri::command]
+async fn open_link(app: AppHandle, url: String) -> R<()> {
+    use tauri_plugin_opener::OpenerExt;
+    if !url.starts_with("https://") {
+        return Err(EngineError::new("invalid", "only https links can be opened"));
+    }
+    app.opener().open_url(url, None::<&str>).map_err(|e| EngineError::new("internal", e.to_string()))
+}
+#[tauri::command]
+async fn ai_provider_usage(state: State<'_, AppState>, id: String, since_day: i64, since_month: i64) -> R<ai_api::ProviderUsage> {
+    ai_api::provider_usage(&state, &id, since_day, since_month).await
+}
 #[tauri::command]
 async fn terminal_options() -> R<Vec<databrain_auth::terminal::TerminalOption>> {
     Ok(databrain_auth::terminal::options())
@@ -995,6 +1008,8 @@ pub fn run() {
             ai_provider_sign_in,
             ai_provider_status,
             terminal_options,
+            ai_provider_usage,
+            open_link,
             app_in_downloads,
             move_to_applications,
             terminal_test,

@@ -45,6 +45,7 @@ import { Markdown } from "./Markdown";
 import { extractMentions, mentionToken, resultsConnection } from "../outputs";
 import { ResultGrid } from "./ResultGrid";
 import { ComboInput, ConnDot } from "./ui";
+import { UsageFooter } from "./ProviderUsage";
 
 export function AiPanel() {
   const view = useAi((s) => s.view);
@@ -113,7 +114,6 @@ function Chat() {
   const providerId = useAi((s) => s.providerId);
   const model = useAi((s) => s.model);
   const setProvider = useAi((s) => s.setProvider);
-  const tokens = useAi((s) => s.tokens);
   const aiConn = useAi((s) => s.connectionId);
   const connections = useStore((s) => s.connections);
   const activeTab = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId));
@@ -402,11 +402,7 @@ function Chat() {
             )}
           </div>
         </div>
-        {(tokens.input > 0 || tokens.output > 0) && (
-          <div className="mt-1 text-right text-[10.5px] text-muted">
-            {formatCount(tokens.input)} in · {formatCount(tokens.output)} out tokens
-          </div>
-        )}
+        <UsageFooter />
       </div>
     </>
   );

@@ -298,6 +298,13 @@ impl KiroProvider {
                     foreign.lock().insert(id.clone(), title.clone());
                     sink.emit(AgentEvent::ToolStarted { session_id: sid.clone(), run_id: rid.clone(), call_id: id, tool: title, args: u.get("rawInput").cloned().unwrap_or_default() });
                 }
+                Some("_kiro_metadata") => {
+                    let credits: f64 = u.get("meteringUsage").and_then(|m| m.as_array()).map(|a| a.iter().filter(|m| m["unit"].as_str() == Some("credit")).filter_map(|m| m["value"].as_f64()).sum()).unwrap_or(0.0);
+                    let context = u.get("contextUsagePercentage").and_then(|c| c.as_f64());
+                    if credits > 0.0 || context.is_some() {
+                        sink.emit(AgentEvent::Metering { session_id: sid.clone(), run_id: rid.clone(), credits, context_percent: context });
+                    }
+                }
                 Some("tool_call_update") => {
                     let id = u.get("toolCallId").and_then(|s| s.as_str()).unwrap_or_default();
                     let done = matches!(u.get("status").and_then(|s| s.as_str()), Some("completed" | "failed"));
@@ -380,12 +387,58 @@ impl LlmProvider for KiroProvider {
         Err(AiError::Config("Kiro runs as an agent through kiro-cli; use the assistant panel".into()))
     }
 
+    /// Plan credits, as Kiro's `/usage` command reports them.
+    async fn budget(&self) -> Result<Option<Budget>> {
+        let (acp, mut incoming) = self.spawn_acp(None).await?;
+        let cancel = CancellationToken::new();
+        let init = json!({"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false}, "clientInfo": {"name": "databrain", "version": env!("CARGO_PKG_VERSION")}});
+        acp.call(&mut incoming, "initialize", init, &cancel, |_| {}).await?;
+        let r = acp.call(&mut incoming, "session/new", json!({"cwd": acp.cwd.to_string_lossy(), "mcpServers": []}), &cancel, |_| {}).await?;
+        let sid = r.get("sessionId").and_then(|s| s.as_str()).unwrap_or_default().to_string();
+        let r = acp
+            .call(&mut incoming, "_kiro.dev/commands/execute", json!({"sessionId": sid, "command": {"command": "usage", "args": {}}}), &cancel, |_| {})
+            .await?;
+        Ok(r.get("data").map(kiro_budget))
+    }
+
     fn as_kiro(&self) -> Option<&KiroProvider> {
         Some(self)
     }
 }
 
 // ------------------------------------------------------------------ helpers
+
+/// `/usage` data: plan, credits used of the plan's allowance, bonus and
+/// add-on credits, reset date.
+pub(crate) fn kiro_budget(d: &Value) -> Budget {
+    let mut meters = Vec::new();
+    for b in d["usageBreakdowns"].as_array().into_iter().flatten() {
+        let unit = if b["resourceType"].as_str() == Some("CREDIT") { "credits".to_string() } else { b["displayName"].as_str().unwrap_or("units").to_lowercase() };
+        let (used, limit) = (num(&b["used"]), num(&b["limit"]).filter(|_| b["hasLimit"].as_bool() != Some(false)));
+        meters.push(BudgetMeter {
+            label: b["displayName"].as_str().unwrap_or("Credits").to_string(),
+            used,
+            limit,
+            remaining: used.zip(limit).map(|(u, l)| (l - u).max(0.0)),
+            unit: unit.clone(),
+        });
+        if let Some(o) = num(&b["currentOverages"]).filter(|o| *o > 0.0) {
+            meters.push(BudgetMeter { label: "Overage".into(), used: Some(o), limit: None, remaining: None, unit });
+        }
+    }
+    for (key, label) in [("bonusCredits", "Bonus credits"), ("addOnCredits", "Add-on credits")] {
+        for b in d[key].as_array().into_iter().flatten() {
+            let (used, limit) = (num(&b["used"]).or(num(&b["usedCredits"])), num(&b["limit"]).or(num(&b["totalCredits"])).or(num(&b["amount"])));
+            meters.push(BudgetMeter { label: label.into(), used, limit, remaining: num(&b["remaining"]).or(used.zip(limit).map(|(u, l)| (l - u).max(0.0))), unit: "credits".into() });
+        }
+    }
+    Budget {
+        plan: d["planName"].as_str().map(str::to_string),
+        meters,
+        resets_on: d["billingCycleReset"].as_str().map(str::to_string),
+        manage_url: Some("https://app.kiro.dev/account/usage".into()),
+    }
+}
 
 fn not_installed() -> AiError {
     AiError::Config("kiro-cli not found. Install it from https://kiro.dev/cli (or set its path in the provider settings)".into())
@@ -677,6 +730,14 @@ impl Acp {
                     on_update(u);
                 }
             }
+            // Context use and credits spent by a turn.
+            ("_kiro.dev/metadata", None) => {
+                if let Some(p) = msg.get("params") {
+                    let mut u = p.clone();
+                    u["sessionUpdate"] = json!("_kiro_metadata");
+                    on_update(&u);
+                }
+            }
             ("session/request_permission", Some(id)) => {
                 let params = msg.get("params").cloned().unwrap_or_default();
                 let tool = params.get("toolCall").cloned().unwrap_or_default();
@@ -891,6 +952,14 @@ async fn handle_mcp(sh: &McpShared, msg: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_kiro_usage() {
+        let d = json!({"planName": "KIRO POWER", "billingCycleReset": "2026-11-01", "usageBreakdowns": [{"resourceType": "CREDIT", "displayName": "Credits", "used": 6368.25, "limit": 10000.0, "currentOverages": 0.0, "hasLimit": true}], "bonusCredits": [], "addOnCredits": []});
+        let b = kiro_budget(&d);
+        assert_eq!((b.plan.as_deref(), b.resets_on.as_deref()), (Some("KIRO POWER"), Some("2026-11-01")));
+        assert_eq!(b.meters, vec![BudgetMeter { label: "Credits".into(), used: Some(6368.25), limit: Some(10000.0), remaining: Some(3631.75), unit: "credits".into() }]);
+    }
 
     #[test]
     fn parses_whoami() {
