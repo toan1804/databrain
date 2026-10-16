@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { AlertTriangle, CheckCircle2, Info, X, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronDown, Info, X, XCircle } from "lucide-react";
 import { useStore } from "../store";
 import { comboMatches, placeComboList } from "../lib/util";
 import { ExportsTray } from "./ExportsTray";
@@ -282,6 +282,157 @@ export function ComboInput({
                 onMouseEnter={() => setActive(i)}
               >
                 {o}
+              </li>
+            ))}
+          </ul>,
+          document.body,
+        )}
+    </>
+  );
+}
+
+/** A button that opens a list attached to it, like ComboInput's: under the
+ *  button, or above it when there is no room below (the AI panel footer),
+ *  never covering it. Single choice; ↑/↓, Enter, Esc, type to filter. */
+export function ListPicker({
+  value,
+  options,
+  onChange,
+  className = "",
+  listMinWidth = 200,
+  placeholder = "Choose…",
+  "aria-label": ariaLabel,
+}: {
+  value: string | null;
+  options: { value: string; label: string; hint?: string }[];
+  onChange: (v: string) => void;
+  className?: string;
+  listMinWidth?: number;
+  placeholder?: string;
+  "aria-label"?: string;
+}) {
+  const btn = useRef<HTMLButtonElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
+  const [open, setOpen] = useState(false);
+  const [filter, setFilter] = useState("");
+  const [active, setActive] = useState(0);
+  const [pos, setPos] = useState<ReturnType<typeof placeComboList> | null>(null);
+  const listId = useRef(`picker-${Math.random().toString(36).slice(2)}`).current;
+  const q = filter.trim().toLowerCase();
+  const items = q ? options.filter((o) => o.label.toLowerCase().includes(q) || o.hint?.toLowerCase().includes(q)) : options;
+  const current = options.find((o) => o.value === value);
+  const close = (focus = true) => {
+    setOpen(false);
+    setFilter("");
+    if (focus) btn.current?.focus();
+  };
+  const show = () => {
+    setActive(Math.max(0, options.findIndex((o) => o.value === value)));
+    setOpen(true);
+  };
+  const pick = (v: string) => {
+    onChange(v);
+    close();
+  };
+
+  useLayoutEffect(() => {
+    if (!open || !btn.current) return;
+    const place = () => setPos(placeComboList(btn.current!.getBoundingClientRect(), { width: window.innerWidth, height: window.innerHeight }, listMinWidth));
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open, listMinWidth]);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (!listRef.current?.contains(e.target as Node) && !btn.current?.contains(e.target as Node)) close(false);
+    };
+    window.addEventListener("mousedown", onDown);
+    return () => window.removeEventListener("mousedown", onDown);
+  }, [open]);
+  useEffect(() => {
+    if (open) listRef.current?.children[active]?.scrollIntoView({ block: "nearest" });
+  }, [active, open]);
+
+  return (
+    <>
+      <button
+        ref={btn}
+        type="button"
+        className={`flex items-center gap-1 text-left ${className}`}
+        role="combobox"
+        aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={listId}
+        aria-activedescendant={open && items[active] ? `${listId}-${active}` : undefined}
+        title={current?.label}
+        onClick={() => (open ? close() : show())}
+        onKeyDown={(e) => {
+          if (!open) {
+            if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              show();
+            }
+            return;
+          }
+          const n = items.length;
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
+            if (n) setActive((a) => (e.key === "ArrowDown" ? (a + 1) % n : a <= 0 ? n - 1 : a - 1));
+          } else if (e.key === "Enter") {
+            e.preventDefault();
+            if (items[active]) pick(items[active].value);
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            close();
+          } else if (e.key === "Backspace") {
+            setFilter((f) => f.slice(0, -1));
+            setActive(0);
+          } else if (e.key.length === 1 && !e.metaKey && !e.ctrlKey) {
+            setFilter((f) => f + e.key);
+            setActive(0);
+          }
+        }}
+      >
+        <span className={`min-w-0 flex-1 truncate ${current ? "" : "text-muted"}`}>{current?.label ?? placeholder}</span>
+        <ChevronDown size={10} className={`shrink-0 text-muted transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open &&
+        pos &&
+        createPortal(
+          <ul
+            ref={listRef}
+            id={listId}
+            role="listbox"
+            aria-label={ariaLabel}
+            className="fixed z-[70] overflow-auto rounded-md border border-line bg-panel py-0.5 text-fg shadow-lg"
+            style={{ left: pos.left, top: pos.top, bottom: pos.bottom, width: pos.width, maxHeight: pos.maxHeight }}
+          >
+            {filter && <li className="px-2 py-0.5 text-[10.5px] text-muted">Filter: {filter}</li>}
+            {items.length === 0 && <li className="px-2 py-1 text-[11.5px] text-muted">No match</li>}
+            {items.map((o, i) => (
+              <li
+                key={o.value}
+                id={`${listId}-${i}`}
+                role="option"
+                aria-selected={o.value === value}
+                className={`flex cursor-pointer items-center gap-2 px-2 py-1 text-[11.5px] ${i === active ? "bg-hover" : ""} ${o.value === value ? "text-accent" : ""}`}
+                title={o.label}
+                // mousedown, so the button doesn't lose focus (and close the list) first
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  pick(o.value);
+                }}
+                onMouseEnter={() => setActive(i)}
+              >
+                <span className="min-w-0 flex-1 truncate">{o.label}</span>
+                {o.hint && <span className="shrink-0 text-[10px] text-muted">{o.hint}</span>}
               </li>
             ))}
           </ul>,

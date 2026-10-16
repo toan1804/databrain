@@ -44,7 +44,7 @@ import { editorBridge } from "../editorBridge";
 import { Markdown } from "./Markdown";
 import { extractMentions, mentionToken, resultsConnection } from "../outputs";
 import { ResultGrid } from "./ResultGrid";
-import { ComboInput, ConnDot } from "./ui";
+import { ComboInput, ConnDot, ListPicker } from "./ui";
 import { UsageFooter } from "./ProviderUsage";
 
 export function AiPanel() {
@@ -365,18 +365,14 @@ function Chat() {
                 <span className="truncate">{jobTab.name}</span>
               </span>
             )}
-            <select
-              className="ml-auto h-6 max-w-[110px] rounded border border-line bg-panel px-1 text-[11px] outline-none"
+            <ListPicker
+              className="ml-auto h-6 w-[110px] rounded border border-line bg-panel px-1 text-[11px] outline-none hover:border-accent/60 focus:border-accent"
               aria-label="AI provider"
-              value={providerId ?? ""}
-              onChange={(e) => setProvider(e.target.value || null)}
-            >
-              {providers.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-            </select>
+              placeholder="No provider"
+              value={providerId}
+              options={providers.map((p) => ({ value: p.id, label: p.name, hint: p.kind }))}
+              onChange={(v) => setProvider(v || null)}
+            />
             <ComboInput
               className="h-6 w-[120px] rounded border border-line bg-panel px-1 text-[11px] outline-none"
               aria-label="Model"
