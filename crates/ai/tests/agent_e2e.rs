@@ -722,6 +722,15 @@ async fn creates_a_job_across_connections() {
     // Schema tools take another connection by name.
     let d = c.call("describe_table", &json!({"table": "orders", "connection": profile.name})).await.content;
     assert!(!d.starts_with("ERROR"), "{d}");
+    // run_query on another connection, in its dialect.
+    let other = |name: &str, ai: bool| ConnectionProfile { id: String::new(), name: name.into(), ai_policy: AiPolicy { ai_enabled: ai, ..AiPolicy::default() }, ..profile.clone() };
+    f.ws.save_connection(other("Shop copy", true)).unwrap();
+    f.ws.save_connection(other("Secret", false)).unwrap();
+    let q = c.call("run_query", &json!({"sql": "select count(*) n from customers", "connection": "shop copy"})).await.content;
+    assert!(q.starts_with("Ran (on \"Shop copy\")") && q.contains("returned 1 rows"), "{q}");
+    assert!(c.call("run_query", &json!({"sql": "select 1", "connection": "Secret"})).await.content.contains("AI is disabled"));
+    assert!(!c.call("list_connections", &json!({})).await.content.contains("Secret"));
+    assert!(c.call("run_query", &json!({"sql": "select 1", "connection": "nope"})).await.content.contains("no connection"));
     let job = json!({
         "name": "Revenue by country",
         "steps": [

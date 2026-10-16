@@ -85,6 +85,9 @@ interface AiState {
   running: boolean;
   targetKey: string | null;
   connectionId: string | null;
+  /** Other connections the assistant may use too (ids, kept across restarts). */
+  alsoConnections: string[];
+  setAlsoConnections: (ids: string[]) => void;
   tokens: { input: number; output: number };
   knowledgeProgress: Record<string, { schema: string; done: number; total: number } | undefined>;
   knowledgeVersion: number;
@@ -404,6 +407,19 @@ export const useAi = create<AiState>((set, get) => {
     running: false,
     targetKey: null,
     connectionId: null,
+    alsoConnections: (() => {
+      try {
+        const v = JSON.parse(localStorage.getItem("db.ai.alsoConns") ?? "[]");
+        return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+      } catch {
+        return [];
+      }
+    })(),
+    setAlsoConnections: (ids) => {
+      const uniq = [...new Set(ids)];
+      localStorage.setItem("db.ai.alsoConns", JSON.stringify(uniq));
+      set({ alsoConnections: uniq });
+    },
     tokens: { input: 0, output: 0 },
     knowledgeProgress: {},
     knowledgeVersion: 0,
@@ -555,6 +571,8 @@ export const useAi = create<AiState>((set, get) => {
         failed_sql: failedSql,
         failed_line: failedLine,
         result_id: rc.resultId,
+        // Connections chosen in the panel besides this one (AI on, still saved).
+        connections: get().alsoConnections.filter((id) => id !== conn && useStore.getState().connections.some((c) => c.id === id && c.ai_policy?.ai_enabled !== false)),
         ...context,
       };
       // One conversation across questions, also after switching connections

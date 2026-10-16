@@ -60,6 +60,10 @@ pub struct UiContext {
     pub failed_sql: Option<String>,
     /// Its 1-based line in the editor, when found there.
     pub failed_line: Option<u32>,
+    /// Other connections the user chose for this question (names or ids):
+    /// the assistant may look up and query them too.
+    #[serde(default)]
+    pub connections: Vec<String>,
     /// Job open in the active tab: the user is asking about it.
     pub open_job_id: Option<String>,
     pub open_job_name: Option<String>,
@@ -361,13 +365,43 @@ impl Agent {
                 lines.join("\n")
             ));
         }
+        // Other connections chosen for this question (AI-enabled only).
+        let mut others: Vec<ConnectionProfile> = Vec::new();
+        let all = if req.context.connections.is_empty() { vec![] } else { ws.list_connections()? };
+        for want in &req.context.connections {
+            let w = want.trim();
+            if let Some(p) = all.iter().find(|&p| p.id == w || p.name.eq_ignore_ascii_case(w)).cloned() {
+                if p.id != profile.id && p.ai_policy.ai_enabled && !others.iter().any(|o| o.id == p.id) {
+                    others.push(p);
+                }
+            }
+        }
+        if !others.is_empty() {
+            let names: Vec<String> = others.iter().map(|p| format!("\"{}\" ({})", p.name, p.config.kind.dialect_name())).collect();
+            turn_text.push_str(&format!(
+                "\n\n[Connections for this question: \"{}\" (current) and {}. Pass `connection` to list_tables, search_schema, describe_table and run_query to work on another one, in its own dialect; combine their outputs with query_outputs over results.<handle>.]",
+                profile.name,
+                names.join(", ")
+            ));
+        }
         let turn = Message::user(turn_text);
         ws.add_ai_message(&sid, "user", &serde_json::to_value(&turn).unwrap_or_default(), (None, None))?;
         messages.push(turn);
 
         // Context.
         let retrieval_q = format!("{} {}", req.message, req.context.selection.clone().or(req.context.editor_sql.clone()).unwrap_or_default());
-        let retrieved = knowledge::retrieve(&ws, &profile.id, &retrieval_q, 8, 14_000).unwrap_or(knowledge::Retrieved { tables: vec![], text: String::new(), notes: vec![] });
+        let budget = if others.is_empty() { 14_000 } else { 8_000 };
+        let mut retrieved = knowledge::retrieve(&ws, &profile.id, &retrieval_q, 8, budget).unwrap_or(knowledge::Retrieved { tables: vec![], text: String::new(), notes: vec![] });
+        // The chosen connections' relevant tables too, labelled by connection.
+        let per = 12_000 / others.len().max(1);
+        for p in &others {
+            if let Ok(r) = knowledge::retrieve(&ws, &p.id, &retrieval_q, 5, per) {
+                if !r.text.is_empty() {
+                    retrieved.text.push_str(&format!("\n\n[Connection \"{}\" ({}): pass connection=\"{}\"]\n{}", p.name, p.config.kind.dialect_name(), p.name, r.text));
+                }
+                retrieved.notes.extend(r.notes.into_iter().map(|n| format!("[{}] {n}", p.name)));
+            }
+        }
         let examples: Vec<(String, String)> = ws.ai_examples(&profile.id)?.into_iter().map(|q| (q.name, q.sql)).collect();
         let server = self.engine.connect(&profile.id).await.ok();
         let system = system_prompt(&profile, server.as_deref(), req.mode, &retrieved, &examples);

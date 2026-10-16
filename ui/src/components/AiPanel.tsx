@@ -31,7 +31,7 @@ import {
 } from "lucide-react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { api, toError } from "../lib/api";
-import type { AiMode, AiSessionRecord, KnNote, KnObject, KnowledgeView, NotesImportPreview, ResultInfo } from "../lib/types";
+import type { AiMode, AiSessionRecord, ConnectionView, KnNote, KnObject, KnowledgeView, NotesImportPreview, ResultInfo } from "../lib/types";
 import { emptyView, formatCount, lineDiff, relativeTime, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
 import { connectionForKey, useAi, visibleItems, workingStatus, type ChatItem } from "../aiStore";
@@ -43,7 +43,7 @@ import { editorBridge } from "../editorBridge";
 import { Markdown } from "./Markdown";
 import { extractMentions, mentionToken, resultsConnection } from "../outputs";
 import { ResultGrid } from "./ResultGrid";
-import { ComboInput, ConnDot } from "./ui";
+import { ComboInput, ConnDot, Popover } from "./ui";
 
 export function AiPanel() {
   const view = useAi((s) => s.view);
@@ -136,7 +136,10 @@ function Chat() {
   useEffect(() => {
     if (needsJobConn && !resultsId) void resultsConnection().then(setResultsId).catch(() => {});
   }, [needsJobConn, resultsId]);
-  const connId = jobTab || (jobsPanel && !editorConn) ? (needsJobConn ? resultsId : aiConn) : editorConn;
+  const also = useAi((s) => s.alsoConnections);
+  const firstAlso = also.find((id) => connections.some((c) => c.id === id && c.ai_policy?.ai_enabled !== false)) ?? null;
+  // No editor connection: the first connection chosen in the picker leads.
+  const connId = (jobTab || (jobsPanel && !editorConn) ? (needsJobConn ? (firstAlso ?? resultsId) : aiConn) : editorConn) ?? firstAlso;
   const conn = connections.find((c) => c.id === connId);
   const provider = providers.find((p) => p.id === providerId);
 
@@ -354,10 +357,7 @@ function Chat() {
             }}
           />
           <div className="flex items-center gap-1.5 px-2 pb-1.5">
-            <span className="flex min-w-0 items-center gap-1 text-[11px] text-muted" title="Connection used by the assistant">
-              <ConnDot color={conn?.color} connected={conn?.connected} />
-              <span className="truncate">{conn?.name ?? "no connection"}</span>
-            </span>
+            <ConnectionPicker current={conn ?? null} />
             {jobTab && (
               <span className="flex min-w-0 shrink items-center gap-1 rounded bg-accent/10 px-1 text-[11px] text-accent" title="The assistant knows which job is open">
                 <Workflow size={10} className="shrink-0" />
@@ -1077,5 +1077,65 @@ function Knowledge() {
         </div>
       )}
     </div>
+  );
+}
+
+/** The assistant's connections: the current one (from the editor) plus
+ *  any others the user picks, so one question can span several databases. */
+function ConnectionPicker({ current }: { current: ConnectionView | null }) {
+  const connections = useStore((s) => s.connections);
+  const also = useAi((s) => s.alsoConnections);
+  const setAlso = useAi((s) => s.setAlsoConnections);
+  const [at, setAt] = useState<{ x: number; y: number } | null>(null);
+  const usable = connections.filter((c) => c.ai_policy?.ai_enabled !== false);
+  const extra = usable.filter((c) => c.id !== current?.id && also.includes(c.id));
+  const toggle = (id: string) => setAlso(also.includes(id) ? also.filter((x) => x !== id) : [...also, id]);
+  return (
+    <>
+      <button
+        type="button"
+        className="flex min-w-0 items-center gap-1 rounded px-1 text-[11px] text-muted hover:bg-hover hover:text-fg"
+        title={["Connections the assistant uses", current?.name, ...extra.map((c) => c.name)].filter(Boolean).join("\n")}
+        aria-haspopup="dialog"
+        aria-expanded={!!at}
+        onClick={(e) => {
+          const r = e.currentTarget.getBoundingClientRect();
+          setAt(at ? null : { x: r.left, y: r.top - 8 - Math.min(320, 64 + usable.length * 26) });
+        }}
+      >
+        <ConnDot color={current?.color} connected={current?.connected} />
+        <span className="truncate">{current?.name ?? "no connection"}</span>
+        {extra.length > 0 && <span className="shrink-0 rounded bg-accent/15 px-1 text-accent">+{extra.length}</span>}
+        <ChevronDown size={10} className="shrink-0" />
+      </button>
+      {at && (
+        <Popover x={at.x} y={at.y} onClose={() => setAt(null)} className="w-72">
+          <div role="dialog" aria-label="Connections for the assistant">
+            <div className="px-2 pb-1 pt-0.5 text-[11px] text-muted">
+              The assistant works on the current connection and can also look up and query the ones you tick (each with its own AI policy and approvals).
+            </div>
+            <div className="max-h-64 overflow-auto">
+              {usable.length === 0 && <div className="px-2 py-1 text-xs text-muted">No connection has AI turned on.</div>}
+              {usable.map((c) => {
+                const isCurrent = c.id === current?.id;
+                return (
+                  <label key={c.id} className={`flex items-center gap-2 rounded px-2 py-1 text-xs ${isCurrent ? "opacity-80" : "cursor-pointer hover:bg-hover"}`}>
+                    <input type="checkbox" checked={isCurrent || also.includes(c.id)} disabled={isCurrent} onChange={() => toggle(c.id)} />
+                    <ConnDot color={c.color} connected={c.connected} />
+                    <span className="min-w-0 flex-1 truncate">{c.name}</span>
+                    <span className="shrink-0 text-[10px] text-muted">{isCurrent ? "current" : c.config.kind}</span>
+                  </label>
+                );
+              })}
+            </div>
+            {extra.length > 0 && (
+              <button type="button" className="mt-1 w-full rounded px-2 py-1 text-left text-[11px] text-muted hover:bg-hover" onClick={() => setAlso([])}>
+                Only the current connection
+              </button>
+            )}
+          </div>
+        </Popover>
+      )}
+    </>
   );
 }

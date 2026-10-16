@@ -47,8 +47,8 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
         ),
         s(
             "run_query",
-            "Execute SQL on the connection (not for results.<name> outputs: use query_outputs). Reads are row-capped; the user may need to approve. Returns a summary (columns, row count, column stats) and a result_id for query_result. Raw rows are only returned if the connection allows it.",
-            json!({"type": "object", "properties": {"sql": {"type": "string"}, "purpose": {"type": "string", "description": "One short sentence shown to the user when asking for approval"}}, "required": ["sql"]}),
+            "Execute SQL on the current connection, or on another one with `connection` (not for results.<name> outputs: use query_outputs). Write it in that connection's dialect. Reads are row-capped; the user may need to approve. Returns a summary (columns, row count, column stats), a result_id for query_result and an output handle (results.<handle>) to combine results of several connections with query_outputs. Raw rows are only returned if the connection allows it.",
+            json!({"type": "object", "properties": {"sql": {"type": "string"}, "connection": {"type": "string", "description": "Optional: name or id of another connection (see list_connections); default the current one"}, "purpose": {"type": "string", "description": "One short sentence shown to the user when asking for approval"}}, "required": ["sql"]}),
         ),
         s(
             "query_result",
@@ -87,7 +87,7 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
         ),
         s(
             "list_connections",
-            "List the user's connections the assistant may use (name, engine, environment, read-only), including the Results (DuckDB) connection that combines outputs. Use it to plan jobs that read from several databases.",
+            "List the user's connections the assistant may use (name, engine, environment, read-only, connected), including the Results (DuckDB) connection that combines outputs. Pass a name as `connection` to run_query, list_tables, search_schema and describe_table to work on it; use it to answer across databases and to plan jobs.",
             json!({"type": "object", "properties": {}}),
         ),
         s(
@@ -232,7 +232,12 @@ impl ToolContext {
         }
         let refs = self.conn_refs()?;
         let c = crate::jobs::resolve_conn(&refs, want)?;
-        Ok(self.engine.workspace().get_connection(&c.id)?)
+        let p = self.engine.workspace().get_connection(&c.id)?;
+        // MCP hosts only see connections shared with them.
+        if self.caller == Caller::Mcp && !p.ai_policy.mcp_enabled && !c.results {
+            return Err(AiError::Policy(format!("\"{}\" is not shared with MCP", p.name)));
+        }
+        Ok(p)
     }
 
     /// Connections for jobs: every saved one, plus the Results (DuckDB) connection.
@@ -259,6 +264,7 @@ impl ToolContext {
         let results = self.engine.results_connection().ok().map(|p| p.id);
         let mut text = String::new();
         let mut shown = Vec::new();
+        let connected = self.engine.connected_ids();
         for p in ws.list_connections()? {
             let is_results = results.as_deref() == Some(p.id.as_str());
             if !p.ai_policy.ai_enabled && !is_results {
@@ -267,11 +273,12 @@ impl ToolContext {
             let env = serde_json::to_value(p.env).ok().and_then(|v| v.as_str().map(str::to_string)).filter(|e| e != "none");
             let indexed = ws.kn_count(&p.id).unwrap_or(0);
             text.push_str(&format!(
-                "- \"{}\" · {}{}{}{}{}\n",
+                "- \"{}\" · {}{}{}{}{}{}\n",
                 p.name,
                 p.config.kind.dialect_name(),
                 env.as_deref().map(|e| format!(" · {e}")).unwrap_or_default(),
                 if p.config.read_only { " · read-only" } else { "" },
+                if connected.contains(&p.id) { " · connected" } else { "" },
                 if p.id == self.profile.id { " · current" } else { "" },
                 if is_results { " · Results: DuckDB over outputs (results.<name>), use it to combine connections in a job".to_string() } else { format!(" · {indexed} tables indexed") },
             ));
@@ -472,28 +479,33 @@ impl ToolContext {
 
     async fn run_query(&self, args: &Value) -> Result<ToolOutput> {
         let sql = arg(args, "sql")?.to_string();
+        // `connection`: another connection (its own policy applies).
+        let target = self.schema_target(args)?;
         // results.<output> only exists on the Results (DuckDB) connection:
         // such SQL runs there, never on the current connection.
-        if self.profile.config.kind != databrain_connector_core::ConnectorKind::Duckdb && !self.engine.outputs().referenced(&sql).is_empty() {
+        if target.config.kind != databrain_connector_core::ConnectorKind::Duckdb && !self.engine.outputs().referenced(&sql).is_empty() {
             return self.query_outputs(args).await;
         }
         let purpose = args.get("purpose").and_then(|p| p.as_str()).unwrap_or("");
-        let review = policy::review_sql(&self.profile, &sql);
-        let approved = self.gate("run_query", review.decision.clone(), purpose, &json!({"sql": sql, "purpose": purpose, "kind": review.kind})).await?;
+        let review = policy::review_sql(&target, &sql);
+        let on = if target.id == self.profile.id { String::new() } else { format!(" (on \"{}\")", target.name) };
+        let approved = self
+            .gate("run_query", review.decision.clone(), &format!("{purpose}{on}"), &json!({"sql": sql, "purpose": purpose, "kind": review.kind, "connection": target.name}))
+            .await?;
         let sql = approved.get("sql").and_then(|s| s.as_str()).unwrap_or(&sql).to_string();
         // Re-review edited SQL.
-        if let Decision::Deny(r) = policy::review_sql(&self.profile, &sql).decision {
+        if let Decision::Deny(r) = policy::review_sql(&target, &sql).decision {
             return Err(AiError::Policy(r));
         }
         let cap = 1000usize;
-        let run_sql = if review.kind.is_read() { policy::cap_rows(self.profile.config.kind, &sql, cap) } else { sql.clone() };
+        let run_sql = if review.kind.is_read() { policy::cap_rows(target.config.kind, &sql, cap) } else { sql.clone() };
         let tab = format!("ai:{}", self.session_id.clone().unwrap_or_else(|| "mcp".into()));
         let outcomes = self
             .engine
             .run_and_wait(
                 &self.hub,
                 RunRequest {
-                    connection_id: self.profile.id.clone(),
+                    connection_id: target.id.clone(),
                     tab_id: tab,
                     sql: run_sql,
                     base_offset: 0,
@@ -529,8 +541,8 @@ impl ToolContext {
                 }
             }
         }
-        self.audit("run_query", &json!({"sql": sql}), "executed", Some(text.lines().next().unwrap_or("")));
-        Ok(out(text, json!({"sql": sql, "statements": display})))
+        self.audit("run_query", &json!({"sql": sql, "connection": target.name}), "executed", Some(text.lines().next().unwrap_or("")));
+        Ok(out(format!("{}{text}", if on.is_empty() { String::new() } else { format!("Ran{on}.\n") }), json!({"sql": sql, "statements": display, "connection_id": target.id})))
     }
 
     /// Schema + stats + (optionally) first rows, masked per policy.
