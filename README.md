@@ -12,7 +12,7 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
 
 All versions are on the [Releases](https://github.com/toan1804/databrain/releases) page. To build it yourself, see [Run](#run).
 
-The macOS app is not signed yet, so macOS blocks it on first open: right-click DataBrain.app → Open → Open (or System Settings → Privacy & Security → Open Anyway). Intel Macs: build from source for now.
+The macOS app is not signed yet, so macOS blocks it on first open: right-click DataBrain.app → Open → Open (or System Settings → Privacy & Security → Open Anyway). Intel Macs: build from source for now. Move DataBrain.app to Applications before opening it: run from the Downloads folder, macOS asks for access to Downloads (the app reads its own files there); DataBrain then offers "Move to Applications" in a banner. Otherwise only jobs that save files ask for a folder's access, the first time such a step runs.
 
 ## What works today
 

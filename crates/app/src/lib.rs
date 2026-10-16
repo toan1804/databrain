@@ -687,6 +687,52 @@ async fn cancel_export(state: State<'_, AppState>, export_id: String) -> R<bool>
     Ok(state.engine.cancel_export(&export_id))
 }
 
+/// The running DataBrain.app when it is inside the Downloads folder (macOS):
+/// launching it from there makes macOS ask for Downloads access, because the
+/// app reads its own bundle. `None` elsewhere.
+fn bundle_in_downloads() -> Option<std::path::PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    // …/DataBrain.app/Contents/MacOS/databrain
+    let bundle = exe.parent()?.parent()?.parent()?.to_path_buf();
+    if bundle.extension().is_none_or(|e| e != "app") {
+        return None;
+    }
+    let downloads = dirs::download_dir().or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))?;
+    bundle.starts_with(&downloads).then_some(bundle)
+}
+
+#[tauri::command]
+async fn app_in_downloads() -> R<Option<String>> {
+    Ok(bundle_in_downloads().map(|p| p.to_string_lossy().into_owned()))
+}
+
+/// Copy the app to /Applications, open that copy and quit this one. The copy
+/// in Downloads is left for the user to delete. `replace`: an existing
+/// /Applications/DataBrain.app is replaced (the UI asks first).
+#[tauri::command]
+async fn move_to_applications(app: AppHandle, replace: bool) -> R<()> {
+    let src = bundle_in_downloads().ok_or_else(|| EngineError::new("invalid", "DataBrain is not running from the Downloads folder"))?;
+    let name = src.file_name().map(|n| n.to_owned()).unwrap_or_else(|| "DataBrain.app".into());
+    let dst = std::path::Path::new("/Applications").join(name);
+    if dst.exists() {
+        if !replace {
+            return Err(EngineError::new("exists", format!("{} already exists", dst.display())));
+        }
+        std::fs::remove_dir_all(&dst).map_err(|e| EngineError::new("internal", format!("can't replace {}: {e}", dst.display())))?;
+    }
+    // ditto keeps the bundle's symlinks, permissions and attributes.
+    let out = tokio::process::Command::new("/usr/bin/ditto").arg(&src).arg(&dst).output().await.map_err(|e| EngineError::new("internal", e.to_string()))?;
+    if !out.status.success() {
+        return Err(EngineError::new("internal", format!("copying to Applications failed: {}", String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    std::process::Command::new("/usr/bin/open").arg("-n").arg(&dst).spawn().map_err(|e| EngineError::new("internal", e.to_string()))?;
+    app.exit(0);
+    Ok(())
+}
+
 /// Show the file a finished full export wrote in Finder/Explorer. Only files
 /// written by an export of this session are revealed (not arbitrary paths).
 #[tauri::command]
@@ -949,6 +995,8 @@ pub fn run() {
             ai_provider_sign_in,
             ai_provider_status,
             terminal_options,
+            app_in_downloads,
+            move_to_applications,
             terminal_test,
             ai_provider_sign_out,
             ai_send,

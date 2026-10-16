@@ -18,6 +18,7 @@ import { SignInDialog } from "./components/SignInDialog";
 import { IndexScopeDialog } from "./components/IndexScopeDialog";
 import { OracleClientDialog } from "./components/OracleClient";
 import { InlineAi } from "./components/InlineAi";
+import { MoveToApplications } from "./components/MoveToApplications";
 import { useAi } from "./aiStore";
 
 function useGlobalShortcuts() {
@@ -147,6 +148,7 @@ export default function App() {
           {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
         </button>
       </div>
+      <MoveToApplications />
       {!backend && (
         <div className="flex items-center gap-2 border-b border-warning/40 bg-warning/10 px-3 py-1.5 text-[12px] text-warning" role="status">
           <TriangleAlert size={13} /> Backend not available — run inside the desktop app (<span className="font-mono">npm run tauri dev</span>).
