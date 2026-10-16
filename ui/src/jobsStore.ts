@@ -65,7 +65,15 @@ export const useJobs = create<JobsState>((set, get) => ({
   refresh: async () => {
     if (!isTauri()) return;
     const { jobs, running } = await api.listJobs();
-    set({ jobs, running: Object.fromEntries(running.map((id) => [id, true])) });
+    // A list read before a run started (e.g. the save right before "Run job")
+    // must not hide that run: runs whose events say "running" stay running.
+    set((s) => ({
+      jobs,
+      running: {
+        ...Object.fromEntries(Object.entries(s.runs).filter(([, r]) => r.status === "running").map(([id]) => [id, true])),
+        ...Object.fromEntries(running.map((id) => [id, true])),
+      },
+    }));
   },
   init: async () => {
     if (started || !isTauri()) return;

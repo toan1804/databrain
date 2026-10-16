@@ -77,7 +77,8 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
   const connections = useStore((s) => s.connections);
   const run = useJobs((s) => s.runs[jobId]);
   const taken = useTakenNames(jobId);
-  const running = useJobs((s) => !!s.running[jobId]);
+  // Running per the run's own events too (the job list can lag behind).
+  const running = useJobs((s) => !!s.running[jobId] || s.runs[jobId]?.status === "running");
   const [job, setJob] = useState<Job | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [save, setSave] = useState<{ state: "saved" | "pending" | "saving" | "error"; message?: string }>({ state: "saved" });

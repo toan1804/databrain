@@ -35,3 +35,19 @@ describe("job runs", () => {
     expect(useJobs.getState().running.j).toBe(false);
   });
 });
+
+describe("job Stop button", () => {
+  it("stays while a run runs, even if an older job list arrives after it started", async () => {
+    const { useJobs } = await import("./jobsStore");
+    useJobs.setState({ runs: {}, running: {} });
+    onRun?.({ job_id: "k", run: { ...run("running"), job_id: "k" } });
+    expect(useJobs.getState().running.k).toBe(true);
+    // listJobs (mocked) says nothing is running: read before the run started.
+    await useJobs.getState().refresh();
+    expect(useJobs.getState().running.k).toBe(true);
+    onRun?.({ job_id: "k", run: { ...run("cancelled"), job_id: "k" } });
+    expect(useJobs.getState().running.k).toBe(false);
+    await useJobs.getState().refresh();
+    expect(useJobs.getState().running.k).toBeFalsy();
+  });
+});
