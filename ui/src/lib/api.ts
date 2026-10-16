@@ -32,6 +32,7 @@ import type {
   IndexPlan,
   CredentialStoreKind,
   OracleClientStatus,
+  OracleAgentInfo,
   OracleInstallProgress,
   CredentialStoreView,
   MigrationReport,
@@ -301,6 +302,8 @@ export const api = {
   knObjects: (connectionId: string, filter: string, offset: number, limit: number) =>
     call<KnObjectPage>("kn_objects", { connectionId, filter, offset, limit }),
   oracleClientStatus: (libDir?: string | null) => call<OracleClientStatus>("oracle_client_status", { libDir: libDir || null }),
+  oracleAgentInfo: () => call<OracleAgentInfo>("oracle_agent_info"),
+  oracleAgentInstallFile: (path: string) => call<OracleAgentInfo>("oracle_agent_install_file", { path }),
   oracleInstallClient: () => call<OracleClientStatus>("oracle_install_client"),
   oracleOpenDownload: () => call<void>("oracle_open_download"),
   oracleCancelInstall: () => call<void>("oracle_cancel_install"),

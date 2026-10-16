@@ -116,6 +116,77 @@ pub fn installed() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
+/// What the user needs to install the helper by hand (blocked networks).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentInfo {
+    /// The helper in use, if one is installed.
+    pub installed: Option<String>,
+    /// File for this computer (the `.gz` is what the release offers).
+    pub file_name: String,
+    /// Where DataBrain downloads it from.
+    pub url: String,
+    /// SHA-256 of the uncompressed helper (checked when installing).
+    pub sha256: Option<String>,
+    pub release: String,
+}
+
+pub fn info() -> AgentInfo {
+    let file = file_name();
+    let base = std::env::var("DATABRAIN_ORACLE_AGENT_URL").ok().or_else(|| BASE_URL.read().unwrap().clone()).unwrap_or_else(|| DEFAULT_BASE_URL.into());
+    AgentInfo {
+        installed: installed().map(|p| p.to_string_lossy().into_owned()),
+        url: format!("{}/v{RELEASE}/{file}.gz", base.trim_end_matches('/')),
+        sha256: expected_sha256(&file),
+        file_name: file,
+        release: RELEASE.into(),
+    }
+}
+
+/// Install the helper from a file the user downloaded (the release's `.gz`,
+/// or the uncompressed helper). It must match the SHA-256 built into
+/// DataBrain, so only DataBrain's own helper can be installed.
+pub fn install_from_file(path: &Path) -> Result<PathBuf> {
+    let root = DIR.read().unwrap().clone().ok_or_else(|| ConnectorError::config("Oracle driver folder not set"))?;
+    install_file_into(&root, path)
+}
+
+fn install_file_into(root: &Path, path: &Path) -> Result<PathBuf> {
+    let file = file_name();
+    let want = expected_sha256(&file).ok_or_else(|| ConnectorError::config(format!("No Oracle driver build for this computer ({file}). Use the Instant Client driver instead.")))?;
+    let dir = root.join(RELEASE);
+    let raw = std::fs::read(path).map_err(|e| ConnectorError::config(format!("cannot read {}: {e}", path.display())))?;
+    let bin = if raw.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(&raw[..]).read_to_end(&mut out).map_err(|e| ConnectorError::config(format!("{} is not a valid .gz file: {e}", path.display())))?;
+        out
+    } else {
+        raw
+    };
+    let got = sha256_hex(&bin);
+    if got != want {
+        return Err(ConnectorError::config(format!(
+            "{} is not the Oracle driver {RELEASE} for this computer (SHA-256 {got}, expected {want}). Download {file}.gz from the release page.",
+            path.display()
+        )));
+    }
+    write_helper(&dir, &file, &bin)
+}
+
+fn write_helper(dir: &Path, file: &str, bin: &[u8]) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).map_err(|e| ConnectorError::internal(format!("cannot create {}: {e}", dir.display())))?;
+    let tmp = dir.join(format!("{file}.part"));
+    std::fs::write(&tmp, bin).map_err(|e| ConnectorError::internal(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+    }
+    let dest = dir.join(file);
+    std::fs::rename(&tmp, &dest).map_err(|e| ConnectorError::internal(e.to_string()))?;
+    Ok(dest)
+}
+
 static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The helper path, downloading it on first use.
@@ -155,7 +226,7 @@ async fn install(dir: &Path, file: &str, want: &str, url: &str, hook: Option<&Pr
                 "The thin Oracle driver {RELEASE} is not published at {url} (HTTP 404). Upload the release files (node scripts/build-oracle-agent.mjs → target/oracle-agent/dist), set the oracle_agent_url setting to where they are, or switch the connection's driver to Instant Client."
             )
         } else {
-            format!("Could not download the Oracle driver ({url}): {e}. Check the network, or switch the connection's driver to Instant Client.")
+            format!("Could not download the Oracle driver ({url}): {e}. If the network blocks it, download that file another way and choose it in the connection's Driver section (\"Install from a downloaded file\"), or switch the driver to Instant Client.")
         };
         ConnectorError::connection(msg).with_code("oracle_agent_download")
     })?;
@@ -169,17 +240,7 @@ async fn install(dir: &Path, file: &str, want: &str, url: &str, hook: Option<&Pr
     if got != want {
         return Err(ConnectorError::connection(format!("Oracle driver checksum mismatch (expected {want}, got {got}); not installed")).with_code("oracle_agent_download"));
     }
-    std::fs::create_dir_all(dir).map_err(|e| ConnectorError::internal(format!("cannot create {}: {e}", dir.display())))?;
-    let tmp = dir.join(format!("{file}.part"));
-    std::fs::write(&tmp, &bin).map_err(|e| ConnectorError::internal(e.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
-    }
-    let dest = dir.join(file);
-    std::fs::rename(&tmp, &dest).map_err(|e| ConnectorError::internal(e.to_string()))?;
-    Ok(dest)
+    write_helper(dir, file, &bin)
 }
 
 async fn download(url: &str, hook: Option<&ProgressHook>) -> std::result::Result<Vec<u8>, String> {
@@ -460,6 +521,16 @@ mod tests {
         assert!(!tmp.join(RELEASE).join(file_name()).exists());
         // Plain http to other hosts is refused.
         assert!(download_into(&tmp, "http://example.com").await.unwrap_err().message.contains("https"));
+        // A file the user downloaded: a wrong one is refused, the right one installed.
+        let other = tmp.join("other.gz");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&other, b"not the driver").unwrap();
+        assert!(install_file_into(&tmp, &other).unwrap_err().message.contains("SHA-256"));
+        let mine = tmp.join("manual.gz");
+        std::fs::write(&mine, &gz).unwrap();
+        let p = install_file_into(&tmp, &mine).unwrap();
+        assert_eq!(p, tmp.join(RELEASE).join(file_name()));
+        std::fs::remove_file(&p).unwrap();
         // Good download: installed and runs.
         let p = download_into(&tmp, &serve(gz).await).await.unwrap();
         assert_eq!(p, tmp.join(RELEASE).join(file_name()));

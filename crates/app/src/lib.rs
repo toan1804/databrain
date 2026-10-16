@@ -402,6 +402,32 @@ async fn drop_output(state: State<'_, AppState>, reference: String) -> R<databra
 async fn drop_unpinned_outputs(state: State<'_, AppState>) -> R<usize> {
     api::drop_unpinned_outputs(&state).await
 }
+/// Thin Oracle driver: installed or not, and what to download by hand.
+#[tauri::command]
+async fn oracle_agent_info() -> R<serde_json::Value> {
+    #[cfg(feature = "oracle")]
+    return Ok(serde_json::to_value(databrain_connector_oracle::agent::info()).unwrap_or_default());
+    #[cfg(not(feature = "oracle"))]
+    Err(databrain_query_engine::EngineError::new("unsupported", "Oracle is not enabled in this build"))
+}
+/// Install the thin driver from a downloaded file (checked against the built-in SHA-256).
+#[tauri::command]
+async fn oracle_agent_install_file(path: String) -> R<serde_json::Value> {
+    #[cfg(feature = "oracle")]
+    {
+        let p = std::path::PathBuf::from(path);
+        tokio::task::spawn_blocking(move || databrain_connector_oracle::agent::install_from_file(&p))
+            .await
+            .map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?
+            .map_err(databrain_query_engine::EngineError::from)?;
+        Ok(serde_json::to_value(databrain_connector_oracle::agent::info()).unwrap_or_default())
+    }
+    #[cfg(not(feature = "oracle"))]
+    {
+        let _ = path;
+        Err(databrain_query_engine::EngineError::new("unsupported", "Oracle is not enabled in this build"))
+    }
+}
 #[tauri::command]
 async fn oracle_client_status(app: tauri::AppHandle, state: State<'_, AppState>, lib_dir: Option<String>) -> R<serde_json::Value> {
     #[cfg(feature = "oracle")]
@@ -1071,6 +1097,8 @@ pub fn run() {
             credential_store,
             set_credential_store,
             oracle_client_status,
+            oracle_agent_info,
+            oracle_agent_install_file,
             oracle_install_client,
             oracle_open_download,
             oracle_cancel_install,

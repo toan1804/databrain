@@ -1171,3 +1171,12 @@ export interface DuckdbEngineStatus {
 
 /** What "Clear history" deletes. */
 export type HistoryClear = { kind: "all" } | { kind: "ai" } | { kind: "older_than_days"; days: number };
+
+/** Thin Oracle driver: installed or not, and what to download by hand. */
+export interface OracleAgentInfo {
+  installed: string | null;
+  file_name: string;
+  url: string;
+  sha256: string | null;
+  release: string;
+}

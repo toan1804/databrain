@@ -15,7 +15,7 @@ import type {
   SslMode,
 } from "../lib/types";
 import { useStore } from "../store";
-import { OracleClientPanel } from "./OracleClient";
+import { OracleAgentPanel, OracleClientPanel } from "./OracleClient";
 import { Modal } from "./ui";
 
 const COLORS = ["#818cf8", "#22d3ee", "#34d399", "#fbbf24", "#f97316", "#f87171", "#e879f9", "#94a3b8"];
@@ -615,6 +615,8 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
                 );
               })}
             </div>
+
+            {kind === "oracle" && values.driver !== "instant_client" && <OracleAgentPanel />}
 
             {kind === "oracle" && values.driver === "instant_client" && (
               <OracleClientPanel libDir={values.client_lib_dir || null} onUseDir={(d) => setValue("client_lib_dir", d)} />

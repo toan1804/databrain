@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, CheckCircle2, Download, ExternalLink, FolderOpen, Loader2, RefreshCw } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Copy, Download, ExternalLink, FolderOpen, Loader2, RefreshCw } from "lucide-react";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { api, isTauri, onOracleInstall, toError } from "../lib/api";
-import type { OracleClientStatus, OracleInstallProgress } from "../lib/types";
+import type { OracleAgentInfo, OracleClientStatus, OracleInstallProgress } from "../lib/types";
 import { formatBytes } from "../lib/util";
 import { useStore } from "../store";
 import { Modal } from "./ui";
@@ -187,4 +188,78 @@ export async function checkOracleClientAtStartup() {
   } catch {
     /* Oracle not enabled in this build */
   }
+}
+
+/** Thin driver: downloaded on first use; where the network blocks that,
+ *  download the file another way and install it from disk here. */
+export function OracleAgentPanel() {
+  const toast = useStore((s) => s.toast);
+  const [info, setInfo] = useState<OracleAgentInfo | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (isTauri()) api.oracleAgentInfo().then(setInfo).catch(() => {});
+  }, []);
+  if (!info) return null;
+  const choose = async () => {
+    const picked = await openDialog({ multiple: false, directory: false, title: `Choose ${info.file_name}.gz` }).catch(() => null);
+    if (typeof picked !== "string") return;
+    setBusy(true);
+    try {
+      setInfo(await api.oracleAgentInstallFile(picked));
+      toast("Oracle thin driver installed", "success");
+    } catch (e) {
+      toast(toError(e).message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const copy = (t: string, what: string) => void writeText(t).then(() => toast(`${what} copied`, "success"));
+  return (
+    <div className="space-y-1.5 rounded-md border border-line p-2.5 text-[12px]">
+      <div className="flex items-center gap-2">
+        {info.installed ? <CheckCircle2 size={14} className="shrink-0 text-success" /> : <Download size={14} className="shrink-0 text-muted" />}
+        <span className="min-w-0 flex-1">
+          {info.installed ? `Thin driver ${info.release} is installed.` : `Thin driver ${info.release} is downloaded on the first connection (about 5 MB).`}
+        </span>
+        <button type="button" className="btn-ghost shrink-0 py-0.5 text-[11.5px]" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+          {info.installed ? "Install another copy…" : "Download blocked?"}
+        </button>
+      </div>
+      {open && (
+        <div className="space-y-1.5 pl-6">
+          <p className="text-[11.5px] text-muted">
+            If your network blocks the download, get this file another way (another network, a browser that is allowed, a colleague), then choose
+            it here. It is checked against the SHA-256 built into DataBrain, so only DataBrain's own driver is accepted.
+          </p>
+          <div className="flex items-center gap-1">
+            <code className="min-w-0 flex-1 break-all rounded border border-line bg-panel-2 px-1.5 py-1 font-mono text-[11px] select-text">{info.url}</code>
+            <button type="button" className="icon-btn shrink-0" aria-label="Copy the download link" title="Copy link" onClick={() => copy(info.url, "Link")}>
+              <Copy size={12} />
+            </button>
+          </div>
+          {info.sha256 && (
+            <div className="flex items-center gap-1 text-[10.5px] text-muted">
+              <span className="shrink-0">SHA-256 (unzipped):</span>
+              <code className="min-w-0 flex-1 truncate font-mono select-text" title={info.sha256}>
+                {info.sha256}
+              </code>
+              <button type="button" className="icon-btn shrink-0" aria-label="Copy the SHA-256" onClick={() => copy(info.sha256!, "SHA-256")}>
+                <Copy size={11} />
+              </button>
+            </div>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <button type="button" className="btn py-1" disabled={busy} onClick={() => void choose()}>
+              {busy ? <Loader2 size={13} className="animate-spin" /> : <FolderOpen size={13} />} Install from a downloaded file…
+            </button>
+            <button type="button" className="btn-ghost py-1" onClick={() => void api.openLink(info.url).catch(() => {})}>
+              Open the link <ExternalLink size={11} />
+            </button>
+          </div>
+          <p className="text-[10.5px] text-muted">Either {info.file_name}.gz as downloaded or the unzipped {info.file_name}.</p>
+        </div>
+      )}
+    </div>
+  );
 }
