@@ -16,6 +16,7 @@
 //! Runs don't prompt (the job was set up by hand); read-only connections
 //! are still refused.
 
+use futures::FutureExt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,6 +57,8 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(200);
 #[derive(Default)]
 pub struct JobsState {
     running: Mutex<HashMap<String, CancellationToken>>,
+    /// Steps running now, by (job id, step id): stop one step only.
+    steps: Mutex<HashMap<(String, String), CancellationToken>>,
 }
 
 impl JobsState {
@@ -64,6 +67,17 @@ impl JobsState {
     }
     pub fn running_ids(&self) -> Vec<String> {
         self.running.lock().keys().cloned().collect()
+    }
+    /// Stop one running step; the rest of the run goes on (steps after it
+    /// are cancelled, as it didn't succeed).
+    pub fn cancel_step(&self, job_id: &str, node_id: &str) -> bool {
+        match self.steps.lock().get(&(job_id.to_string(), node_id.to_string())) {
+            Some(t) => {
+                t.cancel();
+                true
+            }
+            None => false,
+        }
     }
     pub fn cancel(&self, job_id: &str) -> bool {
         match self.running.lock().get(job_id) {
@@ -307,7 +321,17 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
                 }
                 let ups: Vec<String> = upstream(&n.id).into_iter().filter(|u| selected.contains(u)).collect();
                 let t = tracer.for_node(n);
-                if let Some(failed) = ups.iter().find(|u| matches!(status.get(*u), Some(&"error" | &"skipped" | &"cancelled"))) {
+                // Stopped: what hasn't run is cancelled, not skipped as if a step failed.
+                let stopped = cancel.is_cancelled() || ups.iter().any(|u| status.get(u) == Some(&"cancelled"));
+                if stopped {
+                    status.insert(n.id.clone(), "cancelled");
+                    t.log("warning", "Not started: the run was stopped", None, None, None);
+                    t.with_run(|run| {
+                        run.nodes.retain(|r| r.node_id != n.id);
+                        run.nodes.push(record(n, "cancelled", None, None, None));
+                    });
+                    changed = true;
+                } else if let Some(failed) = ups.iter().find(|u| matches!(status.get(*u), Some(&"error" | &"skipped"))) {
                     status.insert(n.id.clone(), "skipped");
                     let name = job.nodes.iter().find(|x| &x.id == failed).map(|x| x.name.clone()).unwrap_or_default();
                     t.log("warning", format!("Skipped: upstream step {name} did not succeed"), None, None, None);
@@ -316,20 +340,20 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
                         run.nodes.push(record(n, "skipped", None, None, Some("an upstream step failed".into())));
                     });
                     changed = true;
-                } else if cancel.is_cancelled() {
-                    status.insert(n.id.clone(), "cancelled");
-                    t.log("warning", "Not started: the run was stopped", None, None, None);
-                    t.with_run(|run| run.nodes.push(record(n, "cancelled", None, None, None)));
-                    changed = true;
                 } else if ups.iter().all(|u| status.get(u) == Some(&"success")) {
                     status.insert(n.id.clone(), "running");
                     t.log("info", format!("Started ({})", action_text(n)), None, None, None);
                     t.with_run(|run| run.nodes.push(record(n, "running", None, None, None)));
                     let (c, node, job_id, job_name, cancel) = (ctx.clone(), n.clone(), job.id.clone(), job.name.clone(), cancel.child_token());
+                    ctx.jobs.steps.lock().insert((job.id.clone(), n.id.clone()), cancel.clone());
                     let ups_names: Vec<String> = upstream(&n.id).iter().filter_map(|u| job.nodes.iter().find(|x| &x.id == u).map(|x| x.name.clone())).collect();
                     set.spawn(async move {
                         let started = Instant::now();
-                        let out = run_node(&c, &job_id, &job_name, &node, &ups_names, &cancel, &t).await;
+                        // A panic fails this step only (the run must still finish).
+                        let out = std::panic::AssertUnwindSafe(run_node(&c, &job_id, &job_name, &node, &ups_names, &cancel, &t))
+                            .catch_unwind()
+                            .await
+                            .unwrap_or_else(|_| Err(EngineError::new("internal", "the step stopped unexpectedly")));
                         (node, started, out, t)
                     });
                     changed = true;
@@ -339,6 +363,8 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
         tracer.save();
         let Some(done) = set.join_next().await else { break };
         let Ok((node, started, out, t)) = done else { continue };
+        let step_token = ctx.jobs.steps.lock().remove(&(job.id.clone(), node.id.clone()));
+        let step_stopped = step_token.is_some_and(|t| t.is_cancelled());
         let took = started.elapsed().as_millis() as i64;
         let rec = match out {
             Ok(out) => {
@@ -349,9 +375,9 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
                 r.summary.notices = out.notices;
                 r
             }
-            Err(e) if cancel.is_cancelled() || e.kind == "cancelled" => {
+            Err(e) if cancel.is_cancelled() || step_stopped || e.kind == "cancelled" => {
                 status.insert(node.id.clone(), "cancelled");
-                t.log("warning", "Cancelled", None, None, Some(took));
+                t.log("warning", if step_stopped && !cancel.is_cancelled() { "Stopped by the user" } else { "Cancelled" }, None, None, Some(took));
                 record(&node, "cancelled", Some(started), None, Some(e.message))
             }
             Err(e) => {

@@ -39,6 +39,8 @@ interface JobsState {
   remove: (j: { id: string; name: string }) => void;
   run: (id: string, nodes?: string[]) => Promise<void>;
   cancel: (id: string) => Promise<void>;
+  /** Stop one running step (the others go on). */
+  cancelStep: (id: string, nodeId: string) => Promise<void>;
 }
 
 let started = false;
@@ -195,12 +197,19 @@ export const useJobs = create<JobsState>((set, get) => ({
   run: async (id, nodes) => {
     try {
       const run = await api.runJob(id, nodes);
-      set((s) => ({ runs: { ...s.runs, [id]: run }, running: { ...s.running, [id]: true } }));
+      // The run's events can arrive before this reply (a step that fails at
+      // once, e.g. on a connection that can't connect): keep the newer state
+      // instead of putting back the "just started" run, which stayed
+      // "Waiting for upstream steps" forever.
+      set((s) => (s.runs[id] && s.runs[id].id >= run.id ? {} : { runs: { ...s.runs, [id]: run }, running: { ...s.running, [id]: true } }));
     } catch (e) {
       useStore.getState().toast(toError(e).message, "error");
     }
   },
   cancel: async (id) => {
     await api.cancelJob(id).catch(() => false);
+  },
+  cancelStep: async (id, nodeId) => {
+    await api.cancelJobStep(id, nodeId).catch(() => false);
   },
 }));

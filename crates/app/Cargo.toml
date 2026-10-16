@@ -23,6 +23,7 @@ name = "databrain-mcp"
 path = "src/bin/databrain-mcp.rs"
 
 [dependencies]
+futures = "0.3.34"
 async-trait = "0.1.92"
 databrain-ai = { version = "0.2.0", path = "../ai" }
 databrain-auth = { version = "0.2.0", path = "../auth" }

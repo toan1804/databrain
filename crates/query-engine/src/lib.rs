@@ -1111,10 +1111,14 @@ impl QueryEngine {
             .map(|p| StatementOutcomeView { index: p.index, sql: p.sql.clone(), result: None, rows_affected: None, error: None, duration_ms: 0, notices: vec![] })
             .collect();
         let cancel = cancel.unwrap_or_default();
+        // Forwarded once: `cancelled()` stays ready, so selecting on it again
+        // would spin and starve the task that interrupts the statement.
+        let mut forwarded = false;
         loop {
             let ev = tokio::select! {
                 ev = rx.recv() => ev,
-                _ = cancel.cancelled() => {
+                _ = cancel.cancelled(), if !forwarded => {
+                    forwarded = true;
                     self.cancel(&job_id);
                     continue;
                 }

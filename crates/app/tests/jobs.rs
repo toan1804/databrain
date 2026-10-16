@@ -595,3 +595,116 @@ async fn rows_per_insert_batch_is_configurable() {
     assert_eq!(r.batch.unwrap().bytes, 1_000_000);
     assert!(r.notices.iter().any(|n| n.contains("SQLITE_MAX_SQL_LENGTH")), "{r:?}");
 }
+
+/// Stop ends a running job at once: the step's statement is cancelled, the
+/// step and the run are marked cancelled. The same for a single step run
+/// ("Run this step"), which runs as the job's run too.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_cancels_the_running_step() {
+    let st = state();
+    let dir = tempfile::tempdir().unwrap();
+    let a = sqlite(&st, "A", &dir.path().join("a.db"), false);
+    // About a minute of work if nothing stops it.
+    let slow = "with recursive c(i) as (select 1 union all select i + 1 from c where i < 300000000) select count(*) from c";
+    let job = Job {
+        id: String::new(),
+        name: "Slow".into(),
+        nodes: vec![node("n1", "slow_step", JobNodeKind::Query, Some(&a), slow), node("n2", "after_slow", JobNodeKind::Query, Some(&a), "select 1")],
+        edges: vec![JobEdge { from: "n1".into(), to: "n2".into() }],
+        schedule: JobSchedule::default(),
+        created_at: 0,
+        updated_at: 0,
+        last_scheduled_at: None,
+    };
+    let job = st.workspace.save_job(job).unwrap();
+    for only in [None, Some(vec!["n1".to_string()])] {
+        api::run_job(&st, &job.id, only.clone()).unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let t = std::time::Instant::now();
+        assert!(api::cancel_job(&st, &job.id), "a run to stop ({only:?})");
+        let run = finished(&st, &job.id).await;
+        assert!(t.elapsed() < Duration::from_secs(5), "stopped in {:?} ({only:?})", t.elapsed());
+        assert_eq!(run.status, "cancelled", "{run:?}");
+        let s = run.nodes.iter().find(|n| n.node_id == "n1").unwrap();
+        assert_eq!(s.summary.status, "cancelled", "{run:?}");
+        if only.is_none() {
+            assert_eq!(run.nodes.iter().find(|n| n.node_id == "n2").map(|n| n.summary.status.as_str()), Some("cancelled"), "{run:?}");
+        }
+        assert!(!st.jobs.is_running(&job.id));
+    }
+}
+
+/// Stopping one running step: it is cancelled, the steps after it don't run.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_one_step() {
+    let st = state();
+    let dir = tempfile::tempdir().unwrap();
+    let a = sqlite(&st, "A", &dir.path().join("a.db"), false);
+    let slow = "with recursive c(i) as (select 1 union all select i + 1 from c where i < 300000000) select count(*) from c";
+    let job = st
+        .workspace
+        .save_job(Job {
+            id: String::new(),
+            name: "Two".into(),
+            nodes: vec![node("n1", "slow_one", JobNodeKind::Query, Some(&a), slow), node("n2", "quick_one", JobNodeKind::Query, Some(&a), "select 1")],
+            edges: vec![],
+            schedule: JobSchedule::default(),
+            created_at: 0,
+            updated_at: 0,
+            last_scheduled_at: None,
+        })
+        .unwrap();
+    api::run_job(&st, &job.id, None).unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(api::cancel_job_step(&st, &job.id, "n1"));
+    let run = finished(&st, &job.id).await;
+    assert_eq!(step(&run, "slow_one").status, "cancelled", "{run:?}");
+    assert_eq!(step(&run, "quick_one").status, "success", "{run:?}");
+    assert!(!api::cancel_job_step(&st, &job.id, "n1"), "nothing left to stop");
+}
+
+/// A step on a connection that can't connect fails quickly, every time.
+#[tokio::test(flavor = "multi_thread")]
+async fn unreachable_connection_fails_each_run() {
+    let st = state();
+    let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
+    c.file_path = Some("/nonexistent-dir/x.db".into());
+    c.read_only = true;
+    let bad = api::save_connection(
+        &st,
+        SaveConnectionArgs {
+            profile: ConnectionProfile { id: String::new(), name: "Bad".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            secret: None,
+            clear_secret: false,
+            extra_secrets: Default::default(),
+        },
+    )
+    .unwrap()
+    .id;
+    let job = st
+        .workspace
+        .save_job(Job {
+            id: String::new(),
+            name: "Bad".into(),
+            nodes: vec![node("n1", "bad_one", JobNodeKind::Query, Some(&bad), "select 1")],
+            edges: vec![],
+            schedule: JobSchedule::default(),
+            created_at: 0,
+            updated_at: 0,
+            last_scheduled_at: None,
+        })
+        .unwrap();
+    for i in 0..8 {
+        let r = loop {
+            match api::run_job(&st, &job.id, Some(vec!["n1".into()])) {
+                Ok(r) => break r,
+                Err(e) if e.kind == "busy" => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(e) => panic!("{e:?}"),
+            }
+        };
+        let run = finished(&st, &job.id).await;
+        assert_eq!((run.id, run.status.as_str()), (r.id, "error"), "run {i}: {run:?}");
+        assert_eq!(step(&run, "bad_one").status, "error");
+    }
+}
+

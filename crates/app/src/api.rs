@@ -1502,6 +1502,10 @@ pub fn cancel_job(state: &AppState, id: &str) -> bool {
     state.jobs.cancel(id)
 }
 
+pub fn cancel_job_step(state: &AppState, id: &str, node_id: &str) -> bool {
+    state.jobs.cancel_step(id, node_id)
+}
+
 /// Dry run of a load step of `job` as edited (nothing is kept).
 pub async fn dry_run_job_step(state: &AppState, job: databrain_workspace::Job, node_id: &str) -> Result<databrain_query_engine::LoadDryRun> {
     crate::jobs::dry_run(&state.job_ctx(), &job, node_id).await

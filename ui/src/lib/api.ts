@@ -236,6 +236,7 @@ export const api = {
   /** `nodes`: run only these steps (their upstream outputs must exist). */
   runJob: (id: string, nodes?: string[]) => call<JobRun>("run_job", { id, nodes: nodes ?? null }),
   cancelJob: (id: string) => call<boolean>("cancel_job", { id }),
+  cancelJobStep: (id: string, nodeId: string) => call<boolean>("cancel_job_step", { id, nodeId }),
   /** Check a load step of `job` (as edited) without keeping any change. */
   dryRunJobStep: (job: Job, nodeId: string) => call<LoadDryRun>("dry_run_job_step", { job, nodeId }),
   /** INSERT batch sizes a connection type allows (load steps). */

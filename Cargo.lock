@@ -1737,6 +1737,7 @@ dependencies = [
  "databrain-result-store",
  "databrain-workspace",
  "dirs 7.0.0",
+ "futures",
  "openssl",
  "parking_lot",
  "rust_xlsxwriter",

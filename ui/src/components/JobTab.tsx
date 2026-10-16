@@ -482,6 +482,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
                 linking={!!link && link.from !== n.id}
                 onPointerDown={(e) => onNodeDown(e, n)}
                 onPortDown={(e) => onPortDown(e, n)}
+                onStop={() => void useJobs.getState().cancelStep(jobId, n.id)}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
@@ -553,7 +554,11 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
         <Popover x={menu.x} y={menu.y} onClose={() => setMenu(null)}>
           {menu.node ? (
             <>
-              <MenuItem icon={<Play size={13} />} label="Run this step" disabled={running} onClick={() => (setMenu(null), void start([menu.node!]))} />
+              {nodeStatus(byId.get(menu.node)!, run)?.status === "running" ? (
+                <MenuItem icon={<Square size={12} />} label="Stop this step" danger onClick={() => (setMenu(null), void useJobs.getState().cancelStep(jobId, menu.node!))} />
+              ) : (
+                <MenuItem icon={<Play size={13} />} label="Run this step" disabled={running} onClick={() => (setMenu(null), void start([menu.node!]))} />
+              )}
               <MenuItem
                 icon={<PlayCircle size={13} />}
                 label="Run from here"
@@ -685,9 +690,11 @@ function NodeCard({
   linking,
   onPointerDown,
   onPortDown,
+  onStop,
   onContextMenu,
 }: {
   node: JobNode;
+  onStop: () => void;
   status: NodeRunSummary | null;
   selected: boolean;
   dim: boolean;
@@ -750,7 +757,22 @@ function NodeCard({
       )}
       <div className={`mt-auto flex min-w-0 items-center gap-1 text-[10.5px] ${status?.status === "error" ? "text-danger" : "text-muted"}`} title={status?.error ?? undefined}>
         <StatusIcon status={status?.status} />
-        <span className="truncate">{node.sql.trim() || node.kind !== "query" ? statusText(status) : "No SQL yet"}</span>
+        <span className="min-w-0 flex-1 truncate">{node.sql.trim() || node.kind !== "query" ? statusText(status) : "No SQL yet"}</span>
+        {status?.status === "running" && (
+          <button
+            type="button"
+            className="shrink-0 rounded px-1 text-danger hover:bg-danger/10"
+            aria-label={`Stop ${node.name}`}
+            title="Stop this step"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              onStop();
+            }}
+          >
+            <Square size={10} />
+          </button>
+        )}
       </div>
       <span
         data-port
@@ -852,9 +874,15 @@ function NodePanel({
             <div className="mt-0.5 text-[11px] text-muted">Unique across the app: only this step produces results.{name || node.name}</div>
           )}
         </div>
-        <button className="btn-primary mt-4 py-1" onClick={onRun} disabled={running} title="Run only this step (upstream outputs must exist)">
-          <Play size={12} /> Run step
-        </button>
+        {status?.status === "running" ? (
+          <button className="btn-ghost mt-4 py-1 text-danger" onClick={() => void useJobs.getState().cancelStep(job.id, node.id)}>
+            <Square size={12} /> Stop this step
+          </button>
+        ) : (
+          <button className="btn-primary mt-4 py-1" onClick={onRun} disabled={running} title="Run only this step (upstream outputs must exist)">
+            <Play size={12} /> Run step
+          </button>
+        )}
         <button className="icon-btn mt-4 h-7 w-7" aria-label="Delete step" title="Delete step" onClick={onDelete}>
           <Trash2 size={13} />
         </button>

@@ -168,6 +168,10 @@ async fn run_job(state: State<'_, AppState>, id: String, nodes: Option<Vec<Strin
 async fn cancel_job(state: State<'_, AppState>, id: String) -> R<bool> {
     Ok(api::cancel_job(&state, &id))
 }
+#[tauri::command]
+async fn cancel_job_step(state: State<'_, AppState>, id: String, node_id: String) -> R<bool> {
+    Ok(api::cancel_job_step(&state, &id, &node_id))
+}
 
 /// INSERT batch sizes a connection type allows (load steps).
 #[tauri::command]
@@ -1007,6 +1011,7 @@ pub fn run() {
             delete_job,
             run_job,
             cancel_job,
+            cancel_job_step,
             dry_run_job_step,
             load_batch_limits,
             job_run_log,
