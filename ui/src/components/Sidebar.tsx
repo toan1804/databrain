@@ -1154,6 +1154,7 @@ function NotebooksPanel() {
         )}
         <FolderTree
           kind="notebooks"
+          newItem={{ label: "New notebook", create: (folderId) => void newNotebook(null, folderId) }}
           items={shown}
           itemId={(n) => n.id}
           itemFolder={(n) => n.folder_id}

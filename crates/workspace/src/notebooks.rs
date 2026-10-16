@@ -124,7 +124,9 @@ impl Workspace {
         .ok_or_else(|| Error::NotFound(format!("notebook {id}")))
     }
 
-    /// Insert (empty id) or update. Cells without ids get one.
+    /// Insert (empty id) or update. Cells without ids get one. The folder is
+    /// only set on insert; afterwards `move_to_folder` changes it, so an open
+    /// notebook saving its edits doesn't move it back out of its folder.
     pub fn save_notebook(&self, mut nb: Notebook) -> Result<Notebook> {
         if nb.name.trim().is_empty() {
             return Err(Error::Invalid("notebook name is required".into()));
@@ -146,7 +148,7 @@ impl Workspace {
             "INSERT INTO notebooks (id, name, connection_id, folder_id, cells_json, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, connection_id = excluded.connection_id,
-               folder_id = excluded.folder_id, cells_json = excluded.cells_json, updated_at = excluded.updated_at",
+               cells_json = excluded.cells_json, updated_at = excluded.updated_at",
             params![nb.id, nb.name.trim(), nb.connection_id, nb.folder_id, cells, nb.created_at, nb.updated_at],
         )?;
         drop(c);
@@ -196,6 +198,13 @@ mod tests {
         assert_eq!(saved.created_at, nb.created_at);
         assert_eq!(saved.cells[0].kind, CellKind::Sql);
         assert_eq!(saved.cells[0].last_run.as_ref().unwrap().rows, Some(1));
+
+        // Moved into a folder while open: saving the open copy (folder None) keeps the folder.
+        let f0 = ws.save_folder(crate::Folder { id: String::new(), parent_id: None, name: "Kept".into(), kind: FolderKind::Notebooks }).unwrap();
+        ws.move_to_folder(FolderKind::Notebooks, &nb.id, Some(&f0.id)).unwrap();
+        let saved = ws.save_notebook(Notebook { folder_id: None, ..saved }).unwrap();
+        assert_eq!(saved.folder_id.as_deref(), Some(f0.id.as_str()));
+        ws.move_to_folder(FolderKind::Notebooks, &nb.id, None).unwrap();
 
         let f = ws
             .save_folder(crate::Folder { id: String::new(), parent_id: None, name: "Analyses".into(), kind: FolderKind::Notebooks })

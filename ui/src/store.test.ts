@@ -11,6 +11,7 @@ const out = (handle: string, tab: string, index: number, extra: Record<string, u
   ({ handle, tab_id: tab, statement_index: index, active: true, state: "on_disk", result_id: `res-${handle}`, sql: `select ${index}`, columns: [], rows: 3, truncated: false, bytes: 10, created_at: 1, ...extra }) as unknown as OutputInfo;
 let outputs: OutputInfo[] = [];
 const deleted: string[] = [];
+const savedNotebooks: Record<string, unknown>[] = [];
 
 vi.mock("./lib/api", () => ({
   isTauri: () => false,
@@ -34,6 +35,11 @@ vi.mock("./lib/api", () => ({
       deleted.push(id);
     },
     listConnections: async () => [],
+    saveNotebook: async (nb: Record<string, unknown>) => {
+      savedNotebooks.push(nb);
+      return { ...nb, id: "nb-new" };
+    },
+    listNotebooks: async () => [],
     loadOutput: async (handle: string) => ({ ...outputs.find((o) => o.handle === handle)!, state: "live" }),
   },
 }));
@@ -171,5 +177,15 @@ describe("sign-in dialog", () => {
     expect(waiting?.implicit).toBeFalsy();
     expect(nextSignIn(waiting, { type: "finished" })?.event).toEqual({ type: "finished" });
     expect(nextSignIn(null, { type: "finished" })).toBeNull();
+  });
+});
+
+describe("new notebook", () => {
+  it("starts without a connection, in the folder it was created from", async () => {
+    useStore.setState({ connections: [{ id: "c1" } as never], tabs: [{ id: "t", title: "q", sql: "", connection_id: "c1" }], activeTabId: "t" });
+    await useStore.getState().newNotebook(null, "f1");
+    expect(savedNotebooks.at(-1)).toMatchObject({ connection_id: null, folder_id: "f1" });
+    await useStore.getState().newNotebook();
+    expect(savedNotebooks.at(-1)).toMatchObject({ connection_id: null, folder_id: null });
   });
 });

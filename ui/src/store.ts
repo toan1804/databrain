@@ -273,7 +273,8 @@ interface State {
   refreshFolders: (kind?: FolderKind) => Promise<void>;
   refreshNotebooks: () => Promise<void>;
   openNotebook: (id: string, name: string) => void;
-  newNotebook: (connectionId?: string | null) => Promise<void>;
+  /** A new notebook: no connection unless given (the user picks one), at the root or in `folderId`. */
+  newNotebook: (connectionId?: string | null, folderId?: string | null) => Promise<void>;
   signInConnection: (connectionId: string) => Promise<boolean>;
   setSignIn: (s: SignInState | null) => void;
   setSettingsOpen: (open: boolean) => void;
@@ -1214,10 +1215,9 @@ export const useStore = create<State>((set, get) => ({
     set({ tabs, activeTabId: tab.id });
     persistTabs(tabs);
   },
-  newNotebook: async (connectionId) => {
+  newNotebook: async (connectionId, folderId) => {
     const s = get();
-    const conn =
-      connectionId !== undefined ? connectionId : (s.tabs.find((t) => t.id === s.activeTabId)?.connection_id ?? s.connections[0]?.id ?? null);
+    const conn = connectionId ?? null;
     let n = 1;
     while (s.notebooks.some((x) => x.name === `Notebook ${n}`)) n++;
     try {
@@ -1225,7 +1225,7 @@ export const useStore = create<State>((set, get) => ({
         id: "",
         name: `Notebook ${n}`,
         connection_id: conn,
-        folder_id: null,
+        folder_id: folderId ?? null,
         cells: [
           { id: uid(), kind: "markdown", source: "# Notebook\nDescribe the analysis here." },
           { id: uid(), kind: "sql", source: "" },

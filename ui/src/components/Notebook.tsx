@@ -429,7 +429,7 @@ export function NotebookView({
       style={{ display: visible ? "flex" : "none" }}
     >
       <div
-        className={`flex h-10 shrink-0 items-center gap-2 border-b px-2 ${conn?.env === "prod" ? "border-danger/50 bg-danger/5" : "border-line"}`}
+        className={`@container flex h-10 shrink-0 items-center gap-2 overflow-x-auto overflow-y-hidden border-b px-2 [&>*]:shrink-0 [&_button]:whitespace-nowrap ${conn?.env === "prod" ? "border-danger/50 bg-danger/5" : "border-line"}`}
       >
         <FileText size={14} className="text-muted" />
         <input
@@ -461,8 +461,8 @@ export function NotebookView({
         {conn && <EnvBadge env={conn.env} />}
         <div className="mx-1 h-5 w-px bg-line" />
         {runningAll || anyRunning ? (
-          <button className="btn-danger py-1" onClick={stop}>
-            <Square size={12} fill="currentColor" /> Stop
+          <button className="btn-danger py-1" onClick={stop} title="Stop" aria-label="Stop">
+            <Square size={12} fill="currentColor" /> <span className="@max-[640px]:hidden">Stop</span>
           </button>
         ) : (
           <button
@@ -470,31 +470,37 @@ export function NotebookView({
             onClick={() => void runAll()}
             disabled={!conn}
             title="Run all cells in order (stops at the first error)"
+            aria-label="Run all"
           >
-            <PlayCircle size={14} /> Run all
+            <PlayCircle size={14} /> <span className="@max-[640px]:hidden">Run all</span>
           </button>
         )}
         <button
           className="btn-ghost py-1"
           onClick={() => addCell("sql", focused ?? undefined)}
+          title="Add a SQL cell"
+          aria-label="Add a SQL cell"
         >
-          <Code2 size={13} /> SQL
+          <Code2 size={13} /> <span className="@max-[640px]:hidden">SQL</span>
         </button>
         <button
           className="btn-ghost py-1"
           onClick={() => addCell("markdown", focused ?? undefined)}
+          title="Add a text cell"
+          aria-label="Add a text cell"
         >
-          <Type size={13} /> Text
+          <Type size={13} /> <span className="@max-[640px]:hidden">Text</span>
         </button>
         <button
           className="btn-ghost py-1"
           disabled={!nb.cells.some((c) => c.kind === "sql" && c.source.trim())}
           title="Create a job with one step per SQL cell, each running after the cell above"
+          aria-label="Create job"
           onClick={() => latest.current && void useJobs.getState().createFromNotebook(latest.current)}
         >
-          <Workflow size={13} /> Create job
+          <Workflow size={13} /> <span className="@max-[640px]:hidden">Create job</span>
         </button>
-        <span className="ml-auto text-[11.5px] text-muted" aria-live="polite">
+        <span className="ml-auto whitespace-nowrap pl-2 text-[11.5px] text-muted" aria-live="polite">
           {saving === "saving"
             ? "Saving…"
             : saving === "pending"
