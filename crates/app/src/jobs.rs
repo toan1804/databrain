@@ -276,7 +276,11 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
         None => job.nodes.iter().map(|n| n.id.clone()).collect(),
     };
     let tracer = Tracer::new(ctx, run.clone());
-    let trigger = if run.trigger == "schedule" { "on its schedule" } else { "by hand" };
+    let trigger = match run.trigger.as_str() {
+        "schedule" => "on its schedule",
+        "ai" => "by the AI assistant (approved)",
+        _ => "by hand",
+    };
     tracer.log(
         "info",
         match &only {

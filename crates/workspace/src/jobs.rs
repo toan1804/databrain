@@ -373,7 +373,7 @@ pub struct NodeRunRecord {
 pub struct JobRun {
     pub id: i64,
     pub job_id: String,
-    /// "manual" or "schedule".
+    /// "manual", "schedule" or "ai" (the assistant, after approval).
     pub trigger: String,
     pub started_at: i64,
     pub finished_at: Option<i64>,

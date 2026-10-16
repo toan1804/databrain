@@ -106,6 +106,15 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
             crate::jobs::create_job_schema(),
         ),
         s(
+            "run_job",
+            "Run an existing job now, or only some of its steps (asks the user to approve). Waits until it finishes (up to `wait_seconds`, default 300) and returns each step's status, rows, errors, and the outputs it produced (results.<step>, readable with query_outputs, e.g. to show the comparison step's rows). Use after create_job/update_job when the user wants the result, or to re-run a job.",
+            json!({"type": "object", "properties": {
+                "job": {"type": "string", "description": "Name or id of the job"},
+                "steps": {"type": "array", "items": {"type": "string"}, "description": "Optional: only these steps (names), not the whole job"},
+                "wait_seconds": {"type": "integer", "description": "How long to wait for it (10-1800, default 300)"}
+            }, "required": ["job"]}),
+        ),
+        s(
             "update_job",
             "Change or fix an existing job (asks the user to approve, showing what changes): send the COMPLETE new list of steps in the create_job shape, starting from get_job's spec. Steps whose name is kept keep their place and history; steps left out are removed; use `rename` to rename steps (results.<old> in other steps follows). Omit schedule to keep it. Read the job and its latest errors with get_job first, and check tables with describe_table on the step's connection.",
             crate::jobs::update_job_schema(),
@@ -149,6 +158,11 @@ pub trait ToolHost: Send + Sync {
     /// Result currently shown in the grid.
     fn current_result(&self) -> Option<String> {
         None
+    }
+    /// Start a job run (`only`: those step ids). Returns the run id.
+    /// Hosts without a job runner (MCP, tests) can't.
+    async fn start_job(&self, _job_id: &str, _only: Option<Vec<String>>) -> std::result::Result<i64, String> {
+        Err("running jobs is only available in the DataBrain app".into())
     }
 }
 
@@ -205,6 +219,7 @@ impl ToolContext {
             "get_job" => self.get_job(args),
             "create_job" => self.create_job(args).await,
             "update_job" => self.update_job(args).await,
+            "run_job" => self.run_job(args).await,
             "get_editor" => match self.host.editor_state().await {
                 Some(v) => Ok(out(v.to_string(), v)),
                 None => Err(AiError::Policy("no editor available".into())),
@@ -336,6 +351,76 @@ impl ToolContext {
         text.push_str(&format!("\nSpec (edit and send to update_job):\n{}\n", serde_json::to_string_pretty(&crate::jobs::spec_of(&job, &refs)).unwrap_or_default()));
         self.audit("get_job", args, "allowed", None);
         Ok(out(text, json!({"job_id": job.id, "name": job.name})))
+    }
+
+    async fn run_job(&self, args: &Value) -> Result<ToolOutput> {
+        let job = self.find_job(arg(args, "job")?)?;
+        let refs = self.conn_refs()?;
+        let want: Vec<String> = args.get("steps").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).collect()).unwrap_or_default();
+        let mut only_ids = Vec::new();
+        for w in &want {
+            let n = job.nodes.iter().find(|n| n.name.eq_ignore_ascii_case(w) || n.id == *w).ok_or_else(|| AiError::Policy(format!("job \"{}\" has no step \"{w}\"", job.name)))?;
+            only_ids.push(n.id.clone());
+        }
+        let scope = if want.is_empty() { "all steps".to_string() } else { format!("steps {}", want.join(", ")) };
+        // What a run changes: loads write tables, exports write files.
+        let writes: Vec<String> = job
+            .nodes
+            .iter()
+            .filter(|n| only_ids.is_empty() || only_ids.contains(&n.id))
+            .filter_map(|n| match n.kind {
+                databrain_workspace::JobNodeKind::Load => Some(format!("{} loads into {}", n.name, n.target_table.as_deref().unwrap_or("a table"))),
+                databrain_workspace::JobNodeKind::Export => Some(format!("{} writes a {} file", n.name, n.export_format.extension())),
+                _ => None,
+            })
+            .collect();
+        let preview = format!(
+            "Runs {scope} of \"{}\".{}\n\n{}",
+            job.name,
+            if writes.is_empty() { " It only reads data.".to_string() } else { format!(" It changes data: {}.", writes.join("; ")) },
+            crate::jobs::describe(&job, &refs)
+        );
+        self.gate("run_job", Decision::Ask("Run a job".into()), &format!("\"{}\" ({scope})", job.name), &json!({"preview": preview, "name": job.name}))
+            .await?;
+        let run_id = self.host.start_job(&job.id, (!only_ids.is_empty()).then_some(only_ids)).await.map_err(AiError::Policy)?;
+        let wait = args.get("wait_seconds").and_then(|v| v.as_u64()).unwrap_or(300).clamp(10, 1800);
+        let ws = self.engine.workspace();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait);
+        let run = loop {
+            let r = ws.job_runs(&job.id, 20)?.into_iter().find(|r| r.id == run_id);
+            if let Some(r) = r.filter(|r| r.status != "running") {
+                break Some(r);
+            }
+            if tokio::time::Instant::now() > deadline {
+                break None;
+            }
+            tokio::select! {
+                _ = self.cancel.cancelled() => return Err(AiError::Cancelled),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+            }
+        };
+        let Some(run) = run else {
+            return Ok(out(
+                format!("Job \"{}\" is still running after {wait} s; it keeps running. Check it later with get_job.", job.name),
+                json!({"job_id": job.id, "name": job.name, "run_id": run_id, "running": true}),
+            ));
+        };
+        let mut text = format!("Job \"{}\" finished: {}{}\n", job.name, run.status, run.error.as_deref().map(|e| format!(" ({e})")).unwrap_or_default());
+        for n in &run.nodes {
+            let st = &n.summary;
+            text.push_str(&format!(
+                "- {}: {}{}{}{}\n",
+                n.name,
+                st.status,
+                st.rows.map(|r| format!(", {r} rows")).unwrap_or_default(),
+                st.error.as_deref().map(|e| format!(", error: {}", trunc(e, 600))).unwrap_or_default(),
+                if st.status == "success" && self.engine.outputs().resolve(&n.name).is_some() { format!(" → output results.{}", n.name) } else { String::new() },
+            ));
+        }
+        if run.status != "success" {
+            text.push_str("Use get_job to see the failing statement.\n");
+        }
+        Ok(out(text, json!({"job_id": job.id, "name": job.name, "run_id": run_id, "status": run.status})))
     }
 
     async fn update_job(&self, args: &Value) -> Result<ToolOutput> {

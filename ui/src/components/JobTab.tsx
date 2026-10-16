@@ -1721,7 +1721,7 @@ function JobPanel({ job, run, onChange, onSelect }: { job: Job; run?: JobRun; on
                 <StatusIcon status={r.status === "running" ? "running" : r.status} />
                 <span className="min-w-0 flex-1 truncate">
                   {new Date(r.started_at).toLocaleString()}
-                  <span className="text-muted"> · {r.trigger === "schedule" ? "scheduled" : "manual"}</span>
+                  <span className="text-muted"> · {r.trigger === "schedule" ? "scheduled" : r.trigger === "ai" ? "by AI" : "manual"}</span>
                 </span>
                 <span className="shrink-0 text-[11px] text-muted">{r.finished_at ? formatDuration(r.finished_at - r.started_at) : "running"}</span>
               </button>

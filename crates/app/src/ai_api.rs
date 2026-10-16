@@ -283,10 +283,14 @@ struct UiHost {
     run_id: String,
     result_id: Option<String>,
     tab_id: Option<String>,
+    jobs: crate::jobs::JobCtx,
 }
 
 #[async_trait]
 impl ToolHost for UiHost {
+    async fn start_job(&self, job_id: &str, only: Option<Vec<String>>) -> std::result::Result<i64, String> {
+        crate::jobs::start(&self.jobs, job_id, "ai", only).map(|r| r.id).map_err(|e| e.message)
+    }
     async fn approve(&self, tool: &str, summary: &str, detail: &Value) -> Option<Value> {
         let r = self
             .ai
@@ -329,6 +333,7 @@ pub fn ai_send(state: &AppState, args: AiSendArgs) -> Result<String> {
         run_id: run_id.clone(),
         result_id: args.request.context.result_id.clone(),
         tab_id: args.tab_id.clone(),
+        jobs: state.job_ctx(),
     });
     let sink = Arc::new(UiSink(state.ui.clone()));
     let runs = state.ai.runs.clone();

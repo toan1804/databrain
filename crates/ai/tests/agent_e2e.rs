@@ -772,6 +772,11 @@ async fn creates_a_job_across_connections() {
     assert_eq!(after.nodes.len(), 2);
     assert_eq!(after.nodes[0].id, j.nodes[0].id, "the step kept its id");
     assert!(after.schedule.enabled && after.schedule.at == "07:00");
+    // Running a job needs the app's runner and the user's approval.
+    assert!(ctx(false).call("run_job", &json!({"job": "Revenue by country"})).await.content.contains("declined"));
+    let r = c.call("run_job", &json!({"job": "Revenue by country"})).await.content;
+    assert!(r.contains("only available in the DataBrain app"), "{r}");
+    assert!(c.call("run_job", &json!({"job": "Revenue by country", "steps": ["nope"]})).await.content.contains("has no step"));
     // Same again: nothing to change.
     assert!(c.call("update_job", &fix).await.content.starts_with("Nothing changes"));
 }

@@ -154,7 +154,14 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
          argument), write each step in its connection's dialect, then create_job; keep source queries filtered and narrow, and do \
          the joins across databases in a Results step. To change or fix a job: get_job (it shows the latest run's errors and the \
          failing statement, and the job's spec), find the cause (describe_table on the step's connection, run_query to test a \
-         corrected SELECT), then update_job with the complete corrected spec; never create a second job to fix one.\n",
+         corrected SELECT), then update_job with the complete corrected spec; never create a second job to fix one. \
+         To run a job (or some of its steps) and read its outputs: run_job; the user approves each run, so say what it will do.\n\n\
+         Comparing or checking data across connections (row counts, missing or different rows, totals, reconciliations): for a \
+         quick one-off look, run_query on each connection (narrow, filtered queries) and compare the outputs with query_outputs \
+         over results.<handle>. When the user wants it repeatable, kept, saved to a file or a table, scheduled, or the data is \
+         large, propose a job instead: one query step per connection, a Results (DuckDB) step that joins/compares them (e.g. FULL \
+         OUTER JOIN on the key with a status column: only_in_a, only_in_b, different), then optionally a load or export step. \
+         Explain the plan first, create_job (the user approves), then offer run_job and summarise the comparison step's output.\n",
         profile.name,
         kind.dialect_name(),
         server.map(|v| format!(" ({v})")).unwrap_or_default(),
