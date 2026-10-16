@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Bookmark, Database, FileCode2, FileSearch, History, Moon, NotebookPen, Plus, Search, Settings2, Sparkles, Sun, X } from "lucide-react";
+import { Bookmark, Database, FileCode2, FileSearch, History, Moon, NotebookPen, Play, Plus, Search, Settings2, Sparkles, Square, Sun, Workflow, X } from "lucide-react";
 import { useAi } from "../aiStore";
+import { useJobs } from "../jobsStore";
 import { openOutput, openResultsQuery, outputLabel, outputRef } from "../outputs";
 import { queryLocalFile } from "./Sidebar";
-import { fuzzyMatch, sqlPreview } from "../lib/util";
+import { fuzzyMatch, relativeTime, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
 import { ConnDot } from "./ui";
 
@@ -32,6 +33,12 @@ function Palette() {
   const input = useRef<HTMLInputElement>(null);
   const list = useRef<HTMLDivElement>(null);
 
+  const jobs = useJobs((s) => s.jobs);
+  const jobsRunning = useJobs((s) => s.running);
+  useEffect(() => {
+    void useJobs.getState().init().catch(() => {});
+  }, []);
+
   const commands = useMemo<Command[]>(() => {
     const active = st.tabs.find((t) => t.id === st.activeTabId);
     const cmds: Command[] = [
@@ -54,6 +61,8 @@ function Palette() {
         run: () => st.setTheme(st.theme === "dark" ? "light" : "dark"),
       },
       { id: "new-nb", group: "Actions", label: "New notebook", icon: <NotebookPen size={14} />, run: () => void st.newNotebook() },
+      { id: "new-job", group: "Actions", label: "New job", icon: <Workflow size={14} />, run: () => void useJobs.getState().create() },
+      { id: "jobs", group: "Actions", label: "Show jobs", icon: <Workflow size={14} />, run: () => st.setSidebarPanel("jobs") },
       { id: "file", group: "Actions", label: "Query a local file (CSV, Parquet, JSON, Excel)…", icon: <FileSearch size={14} />, run: () => void queryLocalFile() },
       { id: "ai", group: "AI", label: "Open AI assistant", icon: <Sparkles size={14} />, hint: "⌘L", run: () => useAi.getState().setOpen(true, "chat") },
       { id: "ai-kn", group: "AI", label: "AI knowledge (index schema, notes)", icon: <Sparkles size={14} />, run: () => useAi.getState().setOpen(true, "knowledge") },
@@ -92,6 +101,24 @@ function Palette() {
     for (const n of st.notebooks) {
       cmds.push({ id: `nb-${n.id}`, group: "Notebooks", label: n.name, detail: `${n.cell_count} cells`, icon: <NotebookPen size={14} />, run: () => st.openNotebook(n.id, n.name) });
     }
+    for (const j of jobs) {
+      const run = jobsRunning[j.id];
+      const last = j.last_run;
+      const detail = [
+        `${j.node_count} step${j.node_count === 1 ? "" : "s"}`,
+        run ? "running" : last ? `last run ${last.status} ${relativeTime(last.started_at)}` : null,
+        j.schedule.enabled ? "scheduled" : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      const ui = useJobs.getState();
+      cmds.push({ id: `job-${j.id}`, group: "Jobs", label: j.name, detail, icon: <Workflow size={14} />, run: () => ui.open(j.id, j.name) });
+      cmds.push(
+        run
+          ? { id: `job-stop-${j.id}`, group: "Jobs", label: `Stop job: ${j.name}`, icon: <Square size={13} />, run: () => void ui.cancel(j.id) }
+          : { id: `job-run-${j.id}`, group: "Jobs", label: `Run job: ${j.name}`, detail: `${j.node_count} steps`, icon: <Play size={14} />, run: () => void ui.run(j.id) },
+      );
+    }
     for (const o of st.outputs.slice(0, 50)) {
       if (o.state === "evicted") continue;
       cmds.push({
@@ -117,7 +144,7 @@ function Palette() {
       });
     }
     return cmds;
-  }, [st]);
+  }, [st, jobs, jobsRunning]);
 
   const shown = useMemo(
     () => commands.filter((c) => fuzzyMatch(q, `${c.group} ${c.label} ${c.detail ?? ""}`)).slice(0, 60),
