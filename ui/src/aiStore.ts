@@ -41,6 +41,8 @@ export type ChatItem =
       summary: string;
       detail: Record<string, unknown>;
       state: "pending" | "approved" | "denied";
+      /** Approved by "Auto-approve" rather than by hand. */
+      auto?: boolean;
     }
   | {
       id: string;
@@ -50,6 +52,8 @@ export type ChatItem =
       proposal: EditProposal;
       before: string;
       state: "pending" | "accepted" | "rejected";
+      /** Applied by "Auto-approve" rather than by hand. */
+      auto?: boolean;
     }
   | {
       id: string;
@@ -130,8 +134,11 @@ interface AiState {
   /** Send a waiting question now (after a failure or Stop, when it is not sent on its own). */
   sendQueued: (id: string) => void;
   loadSession: (id: string) => Promise<void>;
-  respondApproval: (itemId: string, approved: boolean, editedSql?: string) => Promise<void>;
-  respondEdit: (itemId: string, accepted: boolean) => Promise<void>;
+  respondApproval: (itemId: string, approved: boolean, editedSql?: string, auto?: boolean) => Promise<void>;
+  respondEdit: (itemId: string, accepted: boolean, auto?: boolean) => Promise<void>;
+  /** Approve every request of this conversation (queries, writes, jobs, edits) without asking. Off again for a new or another conversation. */
+  autoApprove: boolean;
+  setAutoApprove: (on: boolean) => void;
   /**
    * Index a connection. Without `scope`, large connections whose scope was
    * never chosen open the scope picker instead; `choose` always opens it.
@@ -383,21 +390,21 @@ export const useAi = create<AiState>((set, get) => {
     }
     if (r.type === "approval_request") {
       if (get().items.some((i) => i.kind === "approval" && i.requestId === r.request_id)) return;
+      const id = uid();
       set((s) => ({
-        items: [
-          ...s.items,
-          { id: uid(), kind: "approval", requestId: r.request_id, tool: r.tool, summary: r.summary, detail: r.detail ?? {}, state: "pending" },
-        ],
+        items: [...s.items, { id, kind: "approval", requestId: r.request_id, tool: r.tool, summary: r.summary, detail: r.detail ?? {}, state: "pending" }],
       }));
+      if (get().autoApprove) void get().respondApproval(id, true, undefined, true);
       return;
     }
     if (get().items.some((i) => i.kind === "edit" && i.requestId === r.request_id)) return;
     const target = r.proposal.mode === "new_tab" ? null : key;
+    const editId = uid();
     set((s) => ({
       items: [
         ...s.items,
         {
-          id: uid(),
+          id: editId,
           kind: "edit",
           requestId: r.request_id,
           targetKey: target,
@@ -407,6 +414,7 @@ export const useAi = create<AiState>((set, get) => {
         },
       ],
     }));
+    if (get().autoApprove) void get().respondEdit(editId, true, true);
   };
 
   return {
@@ -417,6 +425,7 @@ export const useAi = create<AiState>((set, get) => {
     model: null,
     sessionId: null,
     items: [],
+    autoApprove: false,
     runId: null,
     running: false,
     targetKey: null,
@@ -659,7 +668,7 @@ export const useAi = create<AiState>((set, get) => {
 
     newChat: () => {
       if (get().running) void get().cancel();
-      set({ sessionId: null, items: [], runId: null, running: false, queued: [], tokens: { input: 0, output: 0 }, credits: 0, contextPercent: null, view: "chat" });
+      set({ sessionId: null, items: [], autoApprove: false, runId: null, running: false, queued: [], tokens: { input: 0, output: 0 }, credits: 0, contextPercent: null, view: "chat" });
     },
 
     removeQueued: (id) => set((s) => ({ queued: s.queued.filter((q) => q.id !== id) })),
@@ -689,21 +698,31 @@ export const useAi = create<AiState>((set, get) => {
         }
         // Tokens the stored conversation used (Kiro credits are not stored).
         const tokens = msgs.reduce((t, m) => ({ input: t.input + (m.tokens_in ?? 0), output: t.output + (m.tokens_out ?? 0) }), { input: 0, output: 0 });
-        set({ sessionId: id, items, connectionId: sess?.connection_id ?? get().connectionId, view: "chat", runId: null, running: false, tokens, credits: 0, contextPercent: null });
+        set({ sessionId: id, items, autoApprove: id === get().sessionId && get().autoApprove, connectionId: sess?.connection_id ?? get().connectionId, view: "chat", runId: null, running: false, tokens, credits: 0, contextPercent: null });
       } catch (e) {
         useStore.getState().toast(toError(e).message, "error");
       }
     },
 
-    respondApproval: async (itemId, approved, editedSql) => {
+    setAutoApprove: (on) => {
+      set({ autoApprove: on });
+      if (!on) return;
+      // What is already waiting is approved too.
+      for (const i of get().items) {
+        if (i.kind === "approval" && i.state === "pending") void get().respondApproval(i.id, true, undefined, true);
+        if (i.kind === "edit" && i.state === "pending") void get().respondEdit(i.id, true, true);
+      }
+    },
+
+    respondApproval: async (itemId, approved, editedSql, auto) => {
       const item = get().items.find((i) => i.id === itemId);
       if (!item || item.kind !== "approval" || item.state !== "pending") return;
       const detail = editedSql !== undefined ? { ...item.detail, sql: editedSql } : item.detail;
-      patchItem(itemId, { state: approved ? "approved" : "denied", detail } as Partial<ChatItem>);
+      patchItem(itemId, { state: approved ? "approved" : "denied", detail, auto: !!auto } as Partial<ChatItem>);
       await api.aiRespond(item.requestId, { approved, detail });
     },
 
-    respondEdit: async (itemId, accepted) => {
+    respondEdit: async (itemId, accepted, auto) => {
       const item = get().items.find((i) => i.id === itemId);
       if (!item || item.kind !== "edit" || item.state !== "pending") return;
       let ok = accepted;
@@ -738,7 +757,7 @@ export const useAi = create<AiState>((set, get) => {
           st.toast("The inserted SQL reads outputs (results.<name>); run it on the Results (DuckDB) connection", "info");
         }
       }
-      patchItem(itemId, { state: ok ? "accepted" : "rejected" } as Partial<ChatItem>);
+      patchItem(itemId, { state: ok ? "accepted" : "rejected", auto: ok && !!auto } as Partial<ChatItem>);
       await api.aiRespond(item.requestId, { accepted: ok });
     },
 

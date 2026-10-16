@@ -6,6 +6,7 @@ vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => {}, removeIt
 let handler: ((e: AgentEvent) => void) | null = null;
 const sent: { session_id?: string | null; context?: { connections?: string[] } }[] = [];
 let n = 0;
+const responses: { request_id: string; body: unknown }[] = [];
 
 vi.mock("./lib/api", () => ({
   isTauri: () => true,
@@ -19,6 +20,9 @@ vi.mock("./lib/api", () => ({
   onKnowledgeEvent: async () => () => {},
   api: {
     getSettings: async () => ({}),
+    aiRespond: async (request_id: string, body: unknown) => {
+      responses.push({ request_id, body });
+    },
     setSetting: async () => {},
     aiListProviders: async () => [{ id: "p", name: "P", kind: "openai", config: {}, has_key: true }],
     aiSend: async (req: (typeof sent)[number]) => {
@@ -56,5 +60,27 @@ describe("AI on several connections", () => {
     useAi.getState().setAlsoConnections(["c2", "off", "gone", "c1"]);
     await useAi.getState().send({ message: "compare both", connectionId: "c1", targetKey: null });
     expect(sent.at(-1)?.context?.connections).toEqual(["c2"]);
+  });
+});
+
+describe("auto-approve", () => {
+  it("approves this conversation's requests, and asks again in a new chat", async () => {
+    const { useAi } = await import("./aiStore");
+    const ask = (id: string) => handler?.({ type: "approval_request", run_id: "rx", request_id: id, tool: "run_query", summary: "write", detail: { sql: "delete from t" } } as unknown as AgentEvent);
+    useAi.setState({ runId: "rx", running: true, items: [], autoApprove: false });
+    ask("q1");
+    expect(responses.find((r) => r.request_id === "q1")).toBeUndefined();
+    // Turning it on approves what is waiting, and what comes next.
+    useAi.getState().setAutoApprove(true);
+    ask("q2");
+    await Promise.resolve();
+    expect(responses.filter((r) => ["q1", "q2"].includes(r.request_id)).map((r) => (r.body as { approved: boolean }).approved)).toEqual([true, true]);
+    expect(useAi.getState().items.filter((i) => i.kind === "approval").every((i) => i.kind === "approval" && i.state === "approved" && i.auto)).toBe(true);
+    // A new conversation asks again.
+    useAi.getState().newChat();
+    expect(useAi.getState().autoApprove).toBe(false);
+    useAi.setState({ runId: "rx", running: true });
+    ask("q3");
+    expect(responses.find((r) => r.request_id === "q3")).toBeUndefined();
   });
 });

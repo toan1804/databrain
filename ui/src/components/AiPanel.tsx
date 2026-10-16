@@ -20,6 +20,7 @@ import {
   Send,
   Settings2,
   ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Square,
   Trash2,
@@ -363,6 +364,7 @@ function Chat() {
           />
           <div className="flex items-center gap-1.5 px-2 pb-1.5">
             <ConnectionPicker current={conn ?? null} />
+            <AutoApproveToggle />
             {jobTab && (
               <span className="flex min-w-0 shrink items-center gap-1 rounded bg-accent/10 px-1 text-[11px] text-accent" title="The assistant knows which job is open">
                 <Workflow size={10} className="shrink-0" />
@@ -614,7 +616,7 @@ function ApprovalCard({
         {item.tool === "run_query" ? "Run this query?" : item.tool === "create_job" ? "Create this job?" : item.tool === "update_job" ? "Change this job?" : item.tool === "run_job" ? "Run this job?" : `Allow ${item.tool}?`}
         {!pending && (
           <span className={`ml-auto text-[11px] ${item.state === "approved" ? "text-success" : "text-muted"}`}>
-            {item.state === "approved" ? "Approved" : "Declined"}
+            {item.state === "approved" ? (item.auto ? "Auto-approved" : "Approved") : "Declined"}
           </span>
         )}
       </div>
@@ -669,7 +671,7 @@ function EditCard({ item, onRespond }: { item: Extract<ChatItem, { kind: "edit" 
         <span className="text-[11px] font-normal text-muted">→ {target}</span>
         {!pending && (
           <span className={`ml-auto text-[11px] ${item.state === "accepted" ? "text-success" : "text-muted"}`}>
-            {item.state === "accepted" ? "Applied" : "Rejected"}
+            {item.state === "accepted" ? (item.auto ? "Auto-applied" : "Applied") : "Rejected"}
           </span>
         )}
       </div>
@@ -1300,5 +1302,30 @@ function InputResizeHandle({ height, onChange }: { height: number; onChange: (h:
     >
       <div className="mx-auto mt-[5px] h-[3px] w-10 rounded-full bg-line opacity-0 transition-opacity group-hover/resize:opacity-100 group-focus-visible/resize:opacity-100 group-active/resize:bg-accent" />
     </div>
+  );
+}
+
+/** Approve every request of this conversation without asking (off again for a new or another conversation). */
+function AutoApproveToggle() {
+  const on = useAi((s) => s.autoApprove);
+  const set = useAi((s) => s.setAutoApprove);
+  return (
+    <button
+      type="button"
+      aria-pressed={on}
+      aria-label="Auto-approve this conversation"
+      title={
+        on
+          ? "Auto-approve is on for this conversation: queries (writes too), job changes and runs, and edits are approved without asking. Click to ask again."
+          : "Auto-approve: approve every request of this conversation (queries, writes, jobs, editor changes) without asking. Only for this conversation; a new chat asks again."
+      }
+      onClick={() => set(!on)}
+      className={`flex h-6 shrink-0 items-center gap-1 rounded border px-1.5 text-[11px] ${
+        on ? "border-warning/60 bg-warning/15 text-warning" : "border-line text-muted hover:border-accent/60 hover:text-fg"
+      }`}
+    >
+      <ShieldCheck size={11} />
+      {on && <span>Auto</span>}
+    </button>
   );
 }
