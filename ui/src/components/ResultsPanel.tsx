@@ -9,7 +9,6 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronUp,
-  Copy,
   Download,
   Filter,
   ListFilter,
@@ -520,9 +519,6 @@ export function ResultView({
         </div>
         <button className="icon-btn" title="Find (⌘F)" aria-label="Find in results" onClick={openFind}>
           <Search size={14} />
-        </button>
-        <button className="icon-btn" title="Copy selection (⌘C)" aria-label="Copy selection" onClick={() => grid.current?.copySelection("tsv", true)}>
-          <Copy size={14} />
         </button>
         <button
           className="btn-ghost border border-line py-1"
