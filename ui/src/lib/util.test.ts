@@ -103,6 +103,10 @@ describe("misc", () => {
     expect(quoteIdent("postgres", "Order Items")).toBe('"Order Items"');
     expect(quoteIdent("mysql", "a`b")).toBe("`a``b`");
     expect(selectTopSql("sqlite", "main", "t")).toBe("SELECT *\nFROM main.t\nLIMIT 100;");
+    // SQL Server without a database: `database.schema` ids are two parts.
+    expect(selectTopSql("mssql", "shop.dbo", "orders")).toBe("SELECT TOP 100 *\nFROM shop.dbo.orders;");
+    expect(selectTopSql("mssql", "My DB.dbo", "Order Items")).toBe("SELECT TOP 100 *\nFROM [My DB].dbo.[Order Items];");
+    expect(selectTopSql("mssql", "dbo", "orders")).toBe("SELECT TOP 100 *\nFROM dbo.orders;");
   });
   it("formats durations", () => {
     expect(formatDuration(12)).toBe("12 ms");

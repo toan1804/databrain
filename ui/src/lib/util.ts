@@ -153,7 +153,13 @@ export function quoteIdent(kind: ConnectorKind, ident: string): string {
 
 /** Qualified name. Cloud/DuckDB schema names are `catalog.schema` paths. */
 export function qualifiedName(kind: ConnectorKind, schema: string, name: string): string {
-  const parts = ["snowflake", "databricks", "bigquery", "duckdb"].includes(kind) ? schema.split(".") : [schema];
+  // SQL Server without a database: schema ids are `database.schema` (split at the first dot).
+  const i = schema.indexOf(".");
+  const parts = ["snowflake", "databricks", "bigquery", "duckdb"].includes(kind)
+    ? schema.split(".")
+    : kind === "mssql" && i > 0
+      ? [schema.slice(0, i), schema.slice(i + 1)]
+      : [schema];
   if (kind === "bigquery") return "`" + [...parts, name].join(".").replace(/`/g, "") + "`";
   return [...parts, name].map((p) => quoteIdent(kind, p)).join(".");
 }
