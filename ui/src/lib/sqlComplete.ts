@@ -3,7 +3,7 @@
 // and `schema.` / `alias.` paths. Pure logic over a metadata provider (tested
 // without CodeMirror); see components/sqlAssist.ts for the editor adapter.
 import type { ConnectorKind, DbObject, SchemaInfo } from "./types";
-import { THREE_LEVEL, schemaLabel } from "./catalog";
+import { mayHaveCatalog, schemaLabel } from "./catalog";
 import { quoteIdent } from "./util";
 
 export interface MetaProvider {
@@ -270,8 +270,9 @@ function kw(words: string[], typed: string, boost = 0, type: OptionType = "keywo
 
 // ------------------------------------------------------------------ resolution
 
+/** Schemas of this kind may carry a catalog; callers also check the schema's own `catalog`. */
 function threeLevel(kind: ConnectorKind) {
-  return THREE_LEVEL.includes(kind);
+  return mayHaveCatalog(kind);
 }
 
 function defaultSchema(schemas: SchemaInfo[] | undefined): SchemaInfo | undefined {

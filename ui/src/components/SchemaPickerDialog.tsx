@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Database, Library, Search } from "lucide-react";
-import { THREE_LEVEL, filterLevel, filterNames, topLevelNoun } from "../lib/catalog";
+import { filterLevel, filterNames, isThreeLevel, topLevelNoun } from "../lib/catalog";
 import { useStore } from "../store";
 import { Modal } from "./ui";
 
@@ -17,7 +17,7 @@ export function SchemaPickerDialog() {
   const conn = useStore((s) => s.connections.find((c) => c.id === s.schemaPicker));
   const schemas = useStore((s) => (s.schemaPicker ? s.schemas[s.schemaPicker] : undefined));
   // Catalog-first engines: pick among catalogs, no schema list needed.
-  const catalogs = useStore((s) => (s.schemaPicker && conn && THREE_LEVEL.includes(conn.config.kind) ? s.catalogs[s.schemaPicker] : undefined));
+  const catalogs = useStore((s) => (s.schemaPicker && conn && isThreeLevel(conn.config) ? s.catalogs[s.schemaPicker] : undefined));
   const catalogSchemas = useStore((s) => s.catalogSchemas);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
@@ -29,8 +29,8 @@ export function SchemaPickerDialog() {
     setQuery("");
     setError(null);
     const st = useStore.getState();
-    const kind = st.connections.find((c) => c.id === connId)?.config.kind;
-    const three = !!kind && THREE_LEVEL.includes(kind);
+    const cfg = st.connections.find((c) => c.id === connId)?.config;
+    const three = !!cfg && isThreeLevel(cfg);
     const pickFrom = () => {
       const now = useStore.getState();
       const cats = three ? now.catalogs[connId] : undefined;

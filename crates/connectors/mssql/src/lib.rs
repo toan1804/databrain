@@ -58,7 +58,9 @@ impl Connector for MssqlConnector {
             fields: vec![
                 FieldSpec::new("host", "Host").required().placeholder("localhost or myserver.database.windows.net"),
                 FieldSpec::new("port", "Port").placeholder("1433"),
-                FieldSpec::new("database", "Database").placeholder("master"),
+                FieldSpec::new("database", "Database")
+                    .placeholder("(all databases)")
+                    .help("Empty: the explorer lists every database you can access, like catalogs; name tables as database.schema.table"),
                 FieldSpec::new("instance", "Instance name").placeholder("(optional, e.g. SQLEXPRESS)"),
                 FieldSpec::new("tenant", "Entra tenant").placeholder("organizations").help("For Microsoft Entra ID sign-in"),
                 FieldSpec::new("trust_cert", "Trust server certificate").placeholder("false"),
@@ -146,8 +148,9 @@ impl Connector for MssqlConnector {
             _ => return Err(ConnectorError::config("unsupported authentication method for SQL Server")),
         });
         let use_browser = cfg.opt("instance").is_some() && cfg.port.is_none();
+        let all_dbs = cfg.database.as_deref().is_none_or(|d| d.trim().is_empty());
         let conn = open(&c, use_browser).await?;
-        Ok(Box::new(MssqlSession { config: c, use_browser, conn: Arc::new(Mutex::new(Some(conn))) }))
+        Ok(Box::new(MssqlSession { config: c, use_browser, conn: Arc::new(Mutex::new(Some(conn))), all_dbs }))
     }
 }
 
@@ -201,6 +204,33 @@ pub struct MssqlSession {
     config: Config,
     use_browser: bool,
     conn: Arc<Mutex<Option<Conn>>>,
+    /// No database configured: every accessible database is a catalog and
+    /// schema ids are `database.schema` (like Databricks catalogs).
+    all_dbs: bool,
+}
+
+/// `[db]` quoted for T-SQL.
+fn qname(n: &str) -> String {
+    format!("[{}]", n.replace(']', "]]"))
+}
+
+/// Run `sql` (with `@P1..@Pn` parameters) in database `db`'s context, so
+/// `sys.*`, `schema_name()` and `object_id()` refer to that database.
+fn in_db(db: Option<&str>, sql: &str, params: usize) -> String {
+    let Some(db) = db else { return sql.to_string() };
+    let mut out = format!("exec {}.sys.sp_executesql N'{}'", qname(db), sql.replace('\'', "''"));
+    if params > 0 {
+        let decl = (1..=params).map(|i| format!("@P{i} nvarchar(max)")).collect::<Vec<_>>().join(", ");
+        let pass = (1..=params).map(|i| format!("@P{i} = @P{i}")).collect::<Vec<_>>().join(", ");
+        out.push_str(&format!(", N'{decl}', {pass}"));
+    }
+    out
+}
+
+/// One batch running `sql` in each database (a database that fails, e.g. no
+/// access, is skipped). `db_name()` in `sql` gives the database.
+fn each_db(dbs: &[String], sql: &str) -> String {
+    dbs.iter().map(|d| format!("begin try {} end try begin catch end catch;", in_db(Some(d), sql, 0))).collect::<Vec<_>>().join("\n")
 }
 
 fn col_type(t: ColumnType) -> (ColType, &'static str) {
@@ -370,14 +400,62 @@ impl MssqlSession {
         r
     }
 
-    async fn rows(&self, sql: &'static str, params: Vec<String>) -> Result<Vec<tiberius::Row>> {
+    async fn rows(&self, sql: impl Into<String>, params: Vec<String>) -> Result<Vec<tiberius::Row>> {
+        let sql: String = sql.into();
         self.with_conn(move |c| {
             Box::pin(async move {
                 let p: Vec<&dyn tiberius::ToSql> = params.iter().map(|s| s as &dyn tiberius::ToSql).collect();
-                c.query(sql, &p).await.map_err(map_err)?.into_first_result().await.map_err(map_err)
+                c.query(sql.as_str(), &p).await.map_err(map_err)?.into_first_result().await.map_err(map_err)
             })
         })
         .await
+    }
+
+    /// Split a schema id: `(database, schema)` in all-databases mode.
+    fn split<'a>(&self, schema: &'a str) -> (Option<&'a str>, &'a str) {
+        match (self.all_dbs, schema.split_once('.')) {
+            (true, Some((db, s))) => (Some(db), s),
+            _ => (None, schema),
+        }
+    }
+
+    /// The schema id of `schema` in `db` (`db.schema` in all-databases mode).
+    fn id(&self, db: Option<&str>, schema: &str) -> String {
+        match db {
+            Some(db) if self.all_dbs => format!("{db}.{schema}"),
+            _ => schema.to_string(),
+        }
+    }
+
+    /// `rows` in the context of the schema id's database.
+    async fn rows_in(&self, db: Option<&str>, sql: &str, params: Vec<String>) -> Result<Vec<tiberius::Row>> {
+        self.rows(in_db(db, sql, params.len()), params).await
+    }
+
+    /// Every result set of a batch (`each_db`).
+    async fn rows_all(&self, sql: String) -> Result<Vec<tiberius::Row>> {
+        self.with_conn(move |c| {
+            Box::pin(async move { Ok(c.simple_query(sql).await.map_err(map_err)?.into_results().await.map_err(map_err)?.into_iter().flatten().collect()) })
+        })
+        .await
+    }
+
+    /// Databases the login can open: `(name, is the session's default)`,
+    /// user databases first. `model` and `tempdb` are left out.
+    async fn databases(&self) -> Result<Vec<(String, bool)>> {
+        let rows = self
+            .rows(
+                "select name, cast(case when name = db_name() and database_id > 4 then 1 else 0 end as bit) from sys.databases \
+                 where state = 0 and name not in ('model', 'tempdb') and has_dbaccess(name) = 1 \
+                 order by case when name = db_name() and database_id > 4 then 0 when database_id > 4 then 1 else 2 end, name",
+                vec![],
+            )
+            .await?;
+        Ok(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<bool, _>(1).unwrap_or(false)))).collect())
+    }
+
+    async fn db_names(&self) -> Result<Vec<String>> {
+        Ok(self.databases().await?.into_iter().map(|d| d.0).collect())
     }
 
     /// A catalog query built at runtime (schema lists as N'' literals).
@@ -385,14 +463,42 @@ impl MssqlSession {
         self.with_conn(move |c| Box::pin(async move { c.simple_query(sql).await.map_err(map_err)?.into_first_result().await.map_err(map_err) })).await
     }
 
+    async fn query_text_in(&self, db: Option<&str>, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+        databrain_connector_core::query_text(self, &in_db(db, sql, 0)).await
+    }
+
+    async fn rows_dyn_in(&self, db: Option<&str>, sql: String) -> Result<Vec<tiberius::Row>> {
+        self.rows_dyn(in_db(db, &sql, 0)).await
+    }
+
     async fn bulk_metadata_batched(&self, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
         if schemas.is_empty() {
             return Ok(vec![]);
         }
+        // One database at a time (all-databases mode), each with three queries.
+        let mut by_db: Vec<(Option<String>, Vec<String>)> = Vec::new();
+        for id in schemas {
+            let (db, sch) = self.split(id);
+            let db = db.map(str::to_string);
+            match by_db.iter_mut().find(|(d, _)| *d == db) {
+                Some((_, l)) => l.push(sch.to_string()),
+                None => by_db.push((db, vec![sch.to_string()])),
+            }
+        }
+        let mut out = Vec::new();
+        for (db, plain) in by_db {
+            out.extend(self.bulk_metadata_db(db.as_deref(), &plain).await?);
+        }
+        Ok(out)
+    }
+
+    /// `bulk_metadata` of plain schema names of one database; results use schema ids.
+    async fn bulk_metadata_db(&self, db: Option<&str>, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
         let list = schemas.iter().map(|s| format!("N{}", databrain_connector_core::quote_literal(s))).collect::<Vec<_>>().join(", ");
         let s = |r: &tiberius::Row, i: usize| r.get::<&str, _>(i).map(str::to_string);
+        let id = |r: &tiberius::Row, i: usize| self.id(db, &s(r, i).unwrap_or_default());
         let objects = self
-            .rows_dyn(format!(
+            .rows_dyn_in(db, format!(
                 "select schema_name(o.schema_id), o.name, rtrim(o.type), cast(ep.value as nvarchar(4000)), \
                    (select sum(p.rows) from sys.partitions p where p.object_id = o.object_id and p.index_id in (0,1)) \
                  from sys.objects o \
@@ -402,7 +508,7 @@ impl MssqlSession {
             .await?
             .iter()
             .map(|r| DbObject {
-                schema: s(r, 0).unwrap_or_default(),
+                schema: id(r, 0),
                 name: s(r, 1).unwrap_or_default(),
                 kind: if r.get::<&str, _>(2) == Some("V") { ObjectKind::View } else { ObjectKind::Table },
                 comment: s(r, 3),
@@ -411,7 +517,7 @@ impl MssqlSession {
             .collect();
         // Same columns as COLUMNS_SQL, primary keys joined once instead of a subquery per column.
         let columns = self
-            .rows_dyn(format!(
+            .rows_dyn_in(db, format!(
                 "select o.name, c.name, \
                    t.name + case when t.name in ('varchar','char','varbinary','binary') then '(' + case when c.max_length = -1 then 'max' else cast(c.max_length as varchar(10)) end + ')' \
                                  when t.name in ('nvarchar','nchar') then '(' + case when c.max_length = -1 then 'max' else cast(c.max_length / 2 as varchar(10)) end + ')' \
@@ -429,11 +535,11 @@ impl MssqlSession {
             .iter()
             .map(|r| {
                 let (table, col) = column_from(r);
-                (s(r, 7).unwrap_or_default(), table, col)
+                (id(r, 7), table, col)
             })
             .collect();
         let fk_rows = self
-            .rows_dyn(format!(
+            .rows_dyn_in(db, format!(
                 "select schema_name(fk.schema_id), object_name(fk.parent_object_id), fk.name, pc.name, rs.name, rt.name, rc.name \
                  from sys.foreign_keys fk \
                  join sys.foreign_key_columns fkc on fkc.constraint_object_id = fk.object_id \
@@ -449,23 +555,26 @@ impl MssqlSession {
         let mut last: Option<(String, String, String)> = None;
         for r in &fk_rows {
             let g = |i: usize| s(r, i).unwrap_or_default();
-            let key = (g(0), g(1), g(2));
+            let key = (self.id(db, &g(0)), g(1), g(2));
             if last.as_ref() == Some(&key) {
                 if let Some((_, _, fk)) = fks.last_mut() {
                     fk.columns.push(g(3));
                     fk.ref_columns.push(g(6));
                 }
             } else {
-                fks.push((key.0.clone(), key.1.clone(), ForeignKey { columns: vec![g(3)], ref_schema: g(4), ref_table: g(5), ref_columns: vec![g(6)] }));
+                fks.push((key.0.clone(), key.1.clone(), ForeignKey { columns: vec![g(3)], ref_schema: self.id(db, &g(4)), ref_table: g(5), ref_columns: vec![g(6)] }));
                 last = Some(key);
             }
         }
-        Ok(databrain_connector_core::assemble_metadata(schemas, objects, columns, fks))
+        let ids: Vec<String> = schemas.iter().map(|x| self.id(db, x)).collect();
+        Ok(databrain_connector_core::assemble_metadata(&ids, objects, columns, fks))
     }
 
-    async fn foreign_keys(&self, schema: &str, table: Option<&str>) -> Result<Vec<(String, ForeignKey)>> {
+    async fn foreign_keys(&self, schema_id: &str, table: Option<&str>) -> Result<Vec<(String, ForeignKey)>> {
+        let (db, schema) = self.split(schema_id);
         let rows = self
-            .rows(
+            .rows_in(
+                db,
                 "select object_name(fk.parent_object_id), fk.name, pc.name, rs.name, rt.name, rc.name \
                  from sys.foreign_keys fk \
                  join sys.foreign_key_columns fkc on fkc.constraint_object_id = fk.object_id \
@@ -487,12 +596,33 @@ impl MssqlSession {
                     fk.columns.push(s(2));
                     fk.ref_columns.push(s(5));
                 }
-                None => out.push((t, name, ForeignKey { columns: vec![s(2)], ref_schema: s(3), ref_table: s(4), ref_columns: vec![s(5)] })),
+                None => out.push((t, name, ForeignKey { columns: vec![s(2)], ref_schema: self.id(db, &s(3)), ref_table: s(4), ref_columns: vec![s(5)] })),
             }
         }
         Ok(out.into_iter().map(|(t, _, f)| (t, f)).collect())
     }
 }
+
+const EXPLORER_FINGERPRINTS_SQL: &str = "select s.name, concat( \
+                   (select count(*) from sys.objects o where o.schema_id = s.schema_id and o.type in ('U','V','P','FN','IF','TF','SO') and o.is_ms_shipped = 0), '/', \
+                   (select checksum_agg(checksum(o.object_id, o.modify_date)) from sys.objects o \
+                      where o.schema_id = s.schema_id and o.type in ('U','V','P','FN','IF','TF','SO') and o.is_ms_shipped = 0), '/', \
+                   (select checksum_agg(checksum(ep.major_id, ep.minor_id, cast(ep.value as nvarchar(4000)))) from sys.extended_properties ep \
+                      join sys.objects o on o.object_id = ep.major_id where ep.class = 1 and ep.name = 'MS_Description' and o.schema_id = s.schema_id)) \
+                 from sys.schemas s";
+
+const SCHEMA_FINGERPRINTS_SQL: &str = "select s.name, concat( \
+                   (select count(*) from sys.objects o where o.schema_id = s.schema_id and o.type in ('U','V','F') and o.is_ms_shipped = 0), '/', \
+                   (select convert(varchar(30), max(o.modify_date), 126) from sys.objects o where o.schema_id = s.schema_id and o.type in ('U','V','F')), '/', \
+                   (select checksum_agg(checksum(ep.major_id, ep.minor_id, cast(ep.value as nvarchar(4000)))) from sys.extended_properties ep \
+                      join sys.objects o on o.object_id = ep.major_id where ep.class = 1 and ep.name = 'MS_Description' and o.schema_id = s.schema_id)) \
+                 from sys.schemas s";
+
+/// Schemas of the current database, `(name, is the user's default)`.
+const SCHEMAS_SQL: &str = "select s.name, cast(case when s.name = schema_name() then 1 else 0 end as bit) from sys.schemas s \
+    where s.name not like 'db[_]%' and s.name not in ('sys','INFORMATION_SCHEMA','guest') \
+    order by case when s.name = schema_name() then 0 else 1 end, s.name";
+const SCHEMA_FILTER: &str = "s.name not like 'db[_]%' and s.name not in ('sys','INFORMATION_SCHEMA','guest')";
 
 const COLUMNS_SQL: &str = "select o.name, c.name, \
     t.name + case when t.name in ('varchar','char','varbinary','binary') then '(' + case when c.max_length = -1 then 'max' else cast(c.max_length as varchar(10)) end + ')' \
@@ -573,34 +703,91 @@ impl Session for MssqlSession {
     }
 
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>> {
-        let rows = self
-            .rows(
-                "select s.name, cast(case when s.name = schema_name() then 1 else 0 end as bit) from sys.schemas s \
-                 where s.name not like 'db[_]%' and s.name not in ('sys','INFORMATION_SCHEMA','guest') \
-                 order by case when s.name = schema_name() then 0 else 1 end, s.name",
-                vec![],
-            )
-            .await?;
+        if !self.all_dbs {
+            let rows = self.rows(SCHEMAS_SQL, vec![]).await?;
+            return Ok(rows
+                .iter()
+                .map(|r| SchemaInfo { name: r.get::<&str, _>(0).unwrap_or_default().to_string(), is_default: r.get::<bool, _>(1).unwrap_or(false), catalog: None })
+                .collect());
+        }
+        // Every database's schemas in one batch.
+        let dbs = self.databases().await?;
+        let names: Vec<String> = dbs.iter().map(|d| d.0.clone()).collect();
+        let sql = format!("select db_name(), s.name, cast(case when s.name = schema_name() then 1 else 0 end as bit) from sys.schemas s where {SCHEMA_FILTER}");
+        let rows = self.rows_all(each_db(&names, &sql)).await?;
+        let mut out: Vec<SchemaInfo> = rows
+            .iter()
+            .filter_map(|r| {
+                let (db, sch) = (r.get::<&str, _>(0)?, r.get::<&str, _>(1)?);
+                let default_db = dbs.iter().any(|(n, d)| *d && n == db);
+                Some(SchemaInfo::in_catalog(db, sch, default_db && r.get::<bool, _>(2).unwrap_or(false)))
+            })
+            .collect();
+        out.sort_by_key(|s| !s.is_default);
+        Ok(out)
+    }
+
+    async fn list_catalogs(&self) -> Result<Option<Vec<databrain_connector_core::CatalogInfo>>> {
+        if !self.all_dbs {
+            return Ok(None);
+        }
+        Ok(Some(self.databases().await?.into_iter().map(|(name, is_default)| databrain_connector_core::CatalogInfo { name, is_default }).collect()))
+    }
+
+    async fn list_catalog_schemas(&self, catalog: &str) -> Result<Vec<SchemaInfo>> {
+        if !self.all_dbs {
+            return Ok(self.list_schemas().await?.into_iter().filter(|s| s.catalog.as_deref() == Some(catalog)).collect());
+        }
+        let default_db = self.databases().await?.into_iter().any(|(n, d)| d && n == catalog);
+        let rows = self.rows_in(Some(catalog), SCHEMAS_SQL, vec![]).await?;
         Ok(rows
             .iter()
-            .map(|r| SchemaInfo {
-                name: r.get::<&str, _>(0).unwrap_or_default().to_string(),
-                is_default: r.get::<bool, _>(1).unwrap_or(false),
-                catalog: None,
-            })
+            .filter_map(|r| Some(SchemaInfo::in_catalog(catalog, r.get::<&str, _>(0)?, default_db && r.get::<bool, _>(1).unwrap_or(false))))
             .collect())
     }
 
+    async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        if !self.all_dbs {
+            return databrain_connector_core::search_by_listing(self, query, limit).await;
+        }
+        // One query per database, in one batch.
+        let term = databrain_connector_core::search_sql_term(query).replace('[', "[[]").replace('%', "[%]").replace('_', "[_]");
+        let sql = format!(
+            "select top {} db_name(), schema_name(o.schema_id), o.name, rtrim(o.type) from sys.objects o \
+             where o.type in ('U','V') and o.is_ms_shipped = 0 and lower(o.name) like N{}",
+            (limit * 4).max(200),
+            databrain_connector_core::quote_literal(&format!("%{term}%"))
+        );
+        let rows = self.rows_all(each_db(&self.db_names().await?, &sql)).await?;
+        let mut hits: Vec<DbObject> = rows
+            .iter()
+            .filter_map(|r| {
+                Some(DbObject {
+                    schema: format!("{}.{}", r.get::<&str, _>(0)?, r.get::<&str, _>(1)?),
+                    name: r.get::<&str, _>(2)?.to_string(),
+                    kind: if r.get::<&str, _>(3) == Some("V") { ObjectKind::View } else { ObjectKind::Table },
+                    comment: None,
+                    row_estimate: None,
+                })
+            })
+            .filter(|o| databrain_connector_core::object_matches(query, &o.schema, &o.name))
+            .collect();
+        databrain_connector_core::rank_matches(query, &mut hits, limit);
+        Ok(hits)
+    }
+
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {
+        let (db, sch) = self.split(schema);
         let rows = self
-            .rows(
+            .rows_in(
+                db,
                 "select o.name, rtrim(o.type), cast(ep.value as nvarchar(4000)), \
                    (select sum(p.rows) from sys.partitions p where p.object_id = o.object_id and p.index_id in (0,1)) \
                  from sys.objects o \
                  left join sys.extended_properties ep on ep.major_id = o.object_id and ep.minor_id = 0 and ep.name = 'MS_Description' \
                  where schema_name(o.schema_id) = @P1 and o.type in ('U','V','P','FN','IF','TF','SO') and o.is_ms_shipped = 0 \
                  order by case rtrim(o.type) when 'U' then 0 when 'V' then 1 when 'SO' then 3 else 2 end, o.name",
-                vec![schema.into()],
+                vec![sch.into()],
             )
             .await?;
         Ok(rows
@@ -622,10 +809,11 @@ impl Session for MssqlSession {
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
-        use databrain_connector_core::{group_indexes, query_text, quote_literal, truthy, TableLayout};
+        use databrain_connector_core::{group_indexes, quote_literal, truthy, TableLayout};
+        let (db, schema) = self.split(schema);
         let obj = format!("N{}", quote_literal(&format!("{}.{}", quote_ident(ConnectorKind::Mssql, schema), quote_ident(ConnectorKind::Mssql, name))));
-        let idx = query_text(
-            self,
+        let idx = self.query_text_in(
+            db,
             &format!(
                 "select i.name, c.name, cast(i.is_unique as int), cast(i.is_primary_key as int), lower(i.type_desc) \
                  from sys.indexes i \
@@ -643,12 +831,12 @@ impl Session for MssqlSession {
             })),
             ..Default::default()
         };
-        let heap = query_text(self, &format!("select count(*) from sys.indexes where object_id = object_id({obj}) and type = 0")).await.ok();
+        let heap = self.query_text_in(db, &format!("select count(*) from sys.indexes where object_id = object_id({obj}) and type = 0")).await.ok();
         if heap.as_ref().and_then(|r| r.first()).and_then(|r| r[0].as_deref()) == Some("1") {
             l.notes.push("heap: no clustered index".into());
         }
-        if let Ok(p) = query_text(
-            self,
+        if let Ok(p) = self.query_text_in(
+            db,
             &format!(
                 "select c.name, lower(pf.type_desc) from sys.indexes i \
                  join sys.partition_schemes ps on ps.data_space_id = i.data_space_id \
@@ -663,7 +851,7 @@ impl Session for MssqlSession {
             l.partition_by = p.iter().filter_map(|r| r[0].clone()).collect();
             l.partition_kind = p.first().and_then(|r| r[1].clone());
         }
-        if let Ok(r) = query_text(self, &format!("select sum(rows) from sys.partitions where object_id = object_id({obj}) and index_id in (0, 1)")).await {
+        if let Ok(r) = self.query_text_in(db, &format!("select sum(rows) from sys.partitions where object_id = object_id({obj}) and index_id in (0, 1)")).await {
             l.row_estimate = r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok());
         }
         Ok(l)
@@ -676,9 +864,10 @@ impl Session for MssqlSession {
         if d.object.kind != ObjectKind::Table {
             return Ok(d.ddl);
         }
+        let (db, schema) = self.split(schema);
         let full = format!("{}.{}", quote_ident(ConnectorKind::Mssql, schema), quote_ident(ConnectorKind::Mssql, name));
         // One row per extra line: (0 = inside CREATE TABLE, 1 = after it, text).
-        let extra = self.rows(MSSQL_TABLE_EXTRAS, vec![full.clone()]).await;
+        let extra = self.rows_in(db, MSSQL_TABLE_EXTRAS, vec![full.clone()]).await;
         let Ok(extra) = extra else { return Ok(d.ddl) }; // e.g. no STRING_AGG (before 2017)
         let mut inside: Vec<String> = Vec::new();
         let mut after: Vec<String> = Vec::new();
@@ -717,17 +906,18 @@ impl Session for MssqlSession {
             .filter(|o| o.name == name)
             .min_by_key(|o| !o.kind.is_relation())
             .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
+        let (db, sch) = self.split(schema);
         let columns: Vec<ColumnInfo> = self
-            .rows(COLUMNS_SQL, vec![schema.into(), name.into()])
+            .rows_in(db, COLUMNS_SQL, vec![sch.into(), name.into()])
             .await?
             .iter()
             .map(|r| column_from(r).1)
             .collect();
-        let full = format!("{}.{}", quote_ident(ConnectorKind::Mssql, schema), quote_ident(ConnectorKind::Mssql, name));
+        let full = format!("{}.{}", quote_ident(ConnectorKind::Mssql, sch), quote_ident(ConnectorKind::Mssql, name));
         let ddl = match object.kind {
             ObjectKind::Table => Some(table_ddl(&full, &columns)),
             _ => self
-                .rows("select object_definition(object_id(@P1))", vec![full.clone()])
+                .rows_in(db, "select object_definition(object_id(@P1))", vec![full.clone()])
                 .await?
                 .first()
                 .and_then(|r| r.get::<&str, _>(0).map(str::to_string)),
@@ -742,25 +932,21 @@ impl Session for MssqlSession {
     /// Every object the explorer lists (tables, views, routines, sequences):
     /// count + checksum of (id, modify_date) + table comments.
     async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
-        let rows = self
-            .rows(
-                "select s.name, concat( \
-                   (select count(*) from sys.objects o where o.schema_id = s.schema_id and o.type in ('U','V','P','FN','IF','TF','SO') and o.is_ms_shipped = 0), '/', \
-                   (select checksum_agg(checksum(o.object_id, o.modify_date)) from sys.objects o \
-                      where o.schema_id = s.schema_id and o.type in ('U','V','P','FN','IF','TF','SO') and o.is_ms_shipped = 0), '/', \
-                   (select checksum_agg(checksum(ep.major_id, ep.minor_id, cast(ep.value as nvarchar(4000)))) from sys.extended_properties ep \
-                      join sys.objects o on o.object_id = ep.major_id where ep.class = 1 and ep.name = 'MS_Description' and o.schema_id = s.schema_id)) \
-                 from sys.schemas s",
-                vec![],
-            )
-            .await?;
+        if !self.all_dbs {
+            let rows = self.rows(EXPLORER_FINGERPRINTS_SQL, vec![]).await?;
+            return Ok(Some(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect()));
+        }
+        let sql = format!("select db_name() + '.' + x.n, x.f from ({}) x(n, f)", EXPLORER_FINGERPRINTS_SQL);
+        let rows = self.rows_all(each_db(&self.db_names().await?, &sql)).await?;
         Ok(Some(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect()))
     }
 
     /// modify_date per object (any ALTER, column change) + its comments.
     async fn object_versions(&self, schema: &str) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let (db, schema) = self.split(schema);
         let rows = self
-            .rows(
+            .rows_in(
+                db,
                 "select rtrim(o.type), o.name, concat(convert(varchar(30), o.modify_date, 126), ':', \
                    (select checksum_agg(checksum(ep.minor_id, cast(ep.value as nvarchar(4000)))) from sys.extended_properties ep \
                       where ep.class = 1 and ep.major_id = o.object_id and ep.name = 'MS_Description')) \
@@ -785,17 +971,12 @@ impl Session for MssqlSession {
     }
 
     async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
-        let rows = self
-            .rows(
-                "select s.name, concat( \
-                   (select count(*) from sys.objects o where o.schema_id = s.schema_id and o.type in ('U','V','F') and o.is_ms_shipped = 0), '/', \
-                   (select convert(varchar(30), max(o.modify_date), 126) from sys.objects o where o.schema_id = s.schema_id and o.type in ('U','V','F')), '/', \
-                   (select checksum_agg(checksum(ep.major_id, ep.minor_id, cast(ep.value as nvarchar(4000)))) from sys.extended_properties ep \
-                      join sys.objects o on o.object_id = ep.major_id where ep.class = 1 and ep.name = 'MS_Description' and o.schema_id = s.schema_id)) \
-                 from sys.schemas s",
-                vec![],
-            )
-            .await?;
+        if !self.all_dbs {
+            let rows = self.rows(SCHEMA_FINGERPRINTS_SQL, vec![]).await?;
+            return Ok(Some(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect()));
+        }
+        let sql = format!("select db_name() + '.' + x.n, x.f from ({}) x(n, f)", SCHEMA_FINGERPRINTS_SQL);
+        let rows = self.rows_all(each_db(&self.db_names().await?, &sql)).await?;
         Ok(Some(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect()))
     }
 
@@ -808,7 +989,8 @@ impl Session for MssqlSession {
     }
 
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
-        let rows = self.rows(COLUMNS_SQL, vec![schema.into(), String::new()]).await?;
+        let (db, sch) = self.split(schema);
+        let rows = self.rows_in(db, COLUMNS_SQL, vec![sch.into(), String::new()]).await?;
         let mut out: Vec<TableColumns> = Vec::new();
         for r in &rows {
             let (table, col) = column_from(r);
@@ -890,6 +1072,21 @@ fn table_ddl(full: &str, columns: &[ColumnInfo]) -> String {
 mod tests {
     use super::*;
     use databrain_connector_core::value::days_from_civil;
+
+    #[test]
+    fn catalog_queries_run_in_the_schemas_database() {
+        assert_eq!(in_db(None, "select 1", 0), "select 1");
+        assert_eq!(in_db(Some("Sales]DB"), "select N'x' where a = @P1", 1), "exec [Sales]]DB].sys.sp_executesql N'select N''x'' where a = @P1', N'@P1 nvarchar(max)', @P1 = @P1");
+        let b = each_db(&["a".into(), "b".into()], "select db_name()");
+        assert_eq!(b.matches("begin try exec").count(), 2);
+        assert!(b.contains("[b].sys.sp_executesql"));
+        let s = MssqlSession { config: Config::new(), use_browser: false, conn: Arc::new(Mutex::new(None)), all_dbs: true };
+        assert_eq!(s.split("shop.dbo"), (Some("shop"), "dbo"));
+        assert_eq!(s.id(Some("shop"), "dbo"), "shop.dbo");
+        let two = MssqlSession { all_dbs: false, ..s };
+        assert_eq!(two.split("dbo"), (None, "dbo"));
+        assert_eq!(two.id(Some("shop"), "dbo"), "dbo");
+    }
 
     #[test]
     fn tls_errors_say_what_to_change() {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { filterLevel, filterNames, topLevelNoun, GROUP_PAGE, groupObjects, groupOpenByDefault, pageObjects, visibleSchemas, columnList, schemaPath, tablePath, cachedHits, groupSchemas, matchRange, objectMatches, rankHits, revealKeys, schemaLabel, splitSchema, treeKey, mergeCatalogSchemas, visibleCatalogs, prefetchSchemas, cacheAge } from "./catalog";
+import { isThreeLevel, filterLevel, filterNames, topLevelNoun, GROUP_PAGE, groupObjects, groupOpenByDefault, pageObjects, visibleSchemas, columnList, schemaPath, tablePath, cachedHits, groupSchemas, matchRange, objectMatches, rankHits, revealKeys, schemaLabel, splitSchema, treeKey, mergeCatalogSchemas, visibleCatalogs, prefetchSchemas, cacheAge } from "./catalog";
 import type { DbObject, SchemaInfo } from "./types";
 
 const sch = (catalog: string | null, schema: string, is_default = false): SchemaInfo =>
@@ -199,5 +199,20 @@ describe("catalog-first explorer", () => {
     expect(cacheAge(now - 5 * 60_000, now)).toBe("5 min ago");
     expect(cacheAge(now - 3 * 3_600_000, now)).toBe("3 h ago");
     expect(cacheAge(now - 5 * 86_400_000, now)).toBe("5 days ago");
+  });
+});
+
+describe("SQL Server without a database", () => {
+  it("lists databases as catalogs and names them in paths", () => {
+    expect(isThreeLevel({ kind: "mssql", database: null })).toBe(true);
+    expect(isThreeLevel({ kind: "mssql", database: " " })).toBe(true);
+    expect(isThreeLevel({ kind: "mssql", database: "shop" })).toBe(false);
+    expect(isThreeLevel({ kind: "postgres", database: null })).toBe(false);
+    expect(topLevelNoun({ kind: "mssql", database: null }, true)).toBe("databases");
+    expect(topLevelNoun({ kind: "mssql", database: "shop" }, true)).toBe("schemas");
+    expect(schemaPath("mssql", "shop.dbo")).toBe("shop.dbo");
+    expect(schemaPath("mssql", "My DB.dbo")).toBe("[My DB].dbo");
+    expect(schemaPath("mssql", "dbo")).toBe("dbo");
+    expect(splitSchema("mssql", "shop.dbo")).toEqual({ catalog: "shop", schema: "dbo" });
   });
 });

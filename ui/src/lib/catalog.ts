@@ -5,6 +5,23 @@ import { qualifiedName, quoteIdent } from "./util";
 /** Engines whose schema ids are `catalog.schema` (three-level names). */
 export const THREE_LEVEL: ConnectorKind[] = ["databricks", "snowflake", "bigquery", "duckdb"];
 
+/** Engines whose schema ids may be `catalog.schema`: THREE_LEVEL, and SQL Server without a database (each database is a catalog). */
+const MAYBE_THREE_LEVEL: ConnectorKind[] = [...THREE_LEVEL, "mssql"];
+
+/** Connection settings enough to tell its levels. */
+export type LevelConfig = { kind: ConnectorKind; database?: string | null };
+
+/** Whether a connection's explorer starts at catalogs (schema ids `catalog.schema`). */
+export function isThreeLevel(c: LevelConfig | ConnectorKind): boolean {
+  if (typeof c === "string") return THREE_LEVEL.includes(c);
+  return THREE_LEVEL.includes(c.kind) || (c.kind === "mssql" && !c.database?.trim());
+}
+
+/** Schema ids of this kind can carry a catalog (`a.b` is catalog `a`, schema `b`). */
+export function mayHaveCatalog(kind: ConnectorKind): boolean {
+  return MAYBE_THREE_LEVEL.includes(kind);
+}
+
 export interface CatalogGroup {
   name: string;
   schemas: SchemaInfo[];
@@ -45,7 +62,7 @@ export function schemaLabel(s: { name: string; catalog?: string | null }): strin
 export function splitSchema(kind: ConnectorKind, schema: string, known?: SchemaInfo[]): { catalog?: string; schema: string } {
   const hit = known?.find((s) => s.name === schema);
   if (hit) return { catalog: hit.catalog ?? undefined, schema: schemaLabel(hit) };
-  if (THREE_LEVEL.includes(kind)) {
+  if (mayHaveCatalog(kind)) {
     const i = schema.indexOf(".");
     if (i > 0) return { catalog: schema.slice(0, i), schema: schema.slice(i + 1) };
   }
@@ -218,8 +235,10 @@ export function filterNames(schemas: SchemaInfo[], chosen: string[] | undefined)
 }
 
 /** Noun for the explorer's top level of a connection kind. */
-export function topLevelNoun(kind: ConnectorKind, plural = false): string {
-  const n = kind === "bigquery" ? "project" : kind === "databricks" ? "catalog" : THREE_LEVEL.includes(kind) ? "database" : "schema";
+export function topLevelNoun(conn: ConnectorKind | LevelConfig, plural = false): string {
+  const kind = typeof conn === "string" ? conn : conn.kind;
+  const three = typeof conn === "string" ? mayHaveCatalog(kind) : isThreeLevel(conn);
+  const n = kind === "bigquery" ? "project" : kind === "databricks" ? "catalog" : three ? "database" : "schema";
   return plural ? `${n}s` : n;
 }
 
@@ -259,7 +278,7 @@ export function revealKeys(connId: string, obj: DbObject, catalog?: string): str
 /** Quoted schema path (`catalog.schema` parts quoted per dialect). */
 export function schemaPath(kind: ConnectorKind, schema: string): string {
   if (kind === "bigquery") return "`" + schema.replace(/`/g, "") + "`";
-  const parts = THREE_LEVEL.includes(kind) ? splitIdent(schema) : [schema];
+  const parts = mayHaveCatalog(kind) ? splitIdent(schema) : [schema];
   return parts.map((p) => quoteIdent(kind, p)).join(".");
 }
 

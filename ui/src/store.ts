@@ -1,6 +1,6 @@
 import { DEFAULT_APPEARANCE, applyAppearance, parseAppearance, type Appearance } from "./lib/appearance";
 import { create } from "zustand";
-import { THREE_LEVEL, mergeCatalogSchemas, prefetchSchemas, revealKeys, splitSchema, treeKey } from "./lib/catalog";
+import { isThreeLevel, mergeCatalogSchemas, prefetchSchemas, revealKeys, splitSchema, treeKey } from "./lib/catalog";
 import { api, isTauri, onAuthEvent, onJobEvent, onOracleAgent, toError } from "./lib/api";
 import { DEFAULT_SLOW_QUERY_SECONDS, computeRunTips, slowStatements, type RunTips } from "./queryTips";
 import type {
@@ -786,7 +786,7 @@ export const useStore = create<State>((set, get) => ({
   openExplorer: async (connId, force = false) => {
     const conn = get().connections.find((c) => c.id === connId);
     if (!conn) return;
-    const three = THREE_LEVEL.includes(conn.config.kind);
+    const three = isThreeLevel(conn.config);
     // 1. The cache, at once (no network).
     const cache = force ? null : await api.cachedExplorer(connId).catch(() => null);
     const fromCache = !!cache && (three ? !!cache.catalogs : !!cache.schemas);
@@ -896,8 +896,8 @@ export const useStore = create<State>((set, get) => ({
     const gen = (exploreGen.get(connId) ?? 0) + 1;
     exploreGen.set(connId, gen);
     const current = () => exploreGen.get(connId) === gen && !get().explorer[connId]?.offline;
-    const kind = get().connections.find((c) => c.id === connId)?.config.kind;
-    const cats = kind && THREE_LEVEL.includes(kind) ? get().catalogs[connId] : undefined;
+    const cfg = get().connections.find((c) => c.id === connId)?.config;
+    const cats = cfg && isThreeLevel(cfg) ? get().catalogs[connId] : undefined;
     let ids: string[];
     if (cats) {
       // Catalog filter (older ones held `catalog.schema` ids: their catalog counts).

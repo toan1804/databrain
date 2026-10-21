@@ -59,7 +59,7 @@ import {
   visibleSchemas,
   visibleCatalogs,
   cacheAge,
-  THREE_LEVEL,
+  isThreeLevel,
   type ObjectGroupName,
 } from "../lib/catalog";
 import { CatalogSearch, selectTop } from "./CatalogSearch";
@@ -339,7 +339,7 @@ const explorerOpened = new Set<string>();
 
 function ConnectionNode({ conn }: { conn: ConnectionView }) {
   const schemas = useStore((s) => s.schemas[conn.id]);
-  const catalogList = useStore((s) => (THREE_LEVEL.includes(conn.config.kind) ? s.catalogs[conn.id] : undefined));
+  const catalogList = useStore((s) => (isThreeLevel(conn.config) ? s.catalogs[conn.id] : undefined));
   const status = useStore((s) => s.explorer[conn.id]);
   const openExplorer = useStore((s) => s.openExplorer);
   const disconnect = useStore((s) => s.disconnect);
@@ -406,7 +406,7 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
   const filtered = catalogList
     ? !!shownCatalogs && shownCatalogs.length < catalogList.length
     : !!schemas && !!shownSchemas && shownSchemas.length < schemas.length;
-  const topNoun = topLevelNoun(conn.config.kind, true);
+  const topNoun = topLevelNoun(conn.config, true);
   const pickSchemas = () => {
     setMenu(null);
     useStore.setState({ schemaPicker: conn.id });
