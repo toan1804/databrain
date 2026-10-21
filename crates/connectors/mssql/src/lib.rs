@@ -179,8 +179,22 @@ fn map_err(e: tiberius::error::Error) -> ConnectorError {
         tiberius::error::Error::Routing { host, port } => {
             ConnectorError::connection(format!("server redirected to {host}:{port}; connect to that address"))
         }
+        tiberius::error::Error::Tls(m) => ConnectorError::connection(tls_hint(&m)),
         other => ConnectorError::query(other.to_string()),
     }
+}
+
+/// TLS errors with what to change (rustls speaks TLS 1.2 and 1.3 only).
+fn tls_hint(m: &str) -> String {
+    let l = m.to_ascii_lowercase();
+    let hint = if l.contains("protocolversion") || l.contains("peerincompatible") || l.contains("handshakefailure") {
+        "The server may only offer TLS 1.0/1.1 (SQL Server 2014 and older without the TLS 1.2 update); update it, or set SSL to Disable."
+    } else if l.contains("certificate") || l.contains("unknownissuer") || l.contains("notvalidforname") {
+        "The server's certificate is not trusted: turn on \"Trust server certificate\" or use SSL Prefer/Require."
+    } else {
+        ""
+    };
+    if hint.is_empty() { format!("TLS error: {m}") } else { format!("TLS error: {m}. {hint}") }
 }
 
 pub struct MssqlSession {
@@ -878,6 +892,13 @@ mod tests {
     use databrain_connector_core::value::days_from_civil;
 
     #[test]
+    fn tls_errors_say_what_to_change() {
+        assert!(tls_hint("received fatal alert: ProtocolVersion").contains("TLS 1.0/1.1"));
+        assert!(tls_hint("invalid peer certificate: UnknownIssuer").contains("Trust server certificate"));
+        assert_eq!(tls_hint("eof"), "TLS error: eof");
+    }
+
+    #[test]
     fn converts_dates() {
         use databrain_connector_core::value::{format_date, format_timestamp};
         let d = convert(ColumnData::DateTime(Some(tiberius::time::DateTime::new(45_000, 300 * 3661))));
@@ -910,7 +931,7 @@ mod tests {
         let mut cfg = ConnectionConfig::new(ConnectorKind::Mssql, AuthMethod::Password { user: user.clone() });
         cfg.host = Some(host);
         cfg.port = std::env::var("DATABRAIN_MSSQL_PORT").ok().and_then(|p| p.parse().ok());
-        // DATABRAIN_MSSQL_SSL=disable for local test servers whose TLS macOS refuses (Azure SQL Edge).
+        // DATABRAIN_MSSQL_SSL=disable to test without TLS.
         if std::env::var("DATABRAIN_MSSQL_SSL").as_deref() == Ok("disable") {
             cfg.ssl_mode = databrain_connector_core::SslMode::Disable;
         }
