@@ -21,7 +21,7 @@ The macOS app is not signed yet, so macOS blocks it on first open: right-click D
   - Databases: SQLite, PostgreSQL, MySQL/MariaDB, SQL Server, Oracle, Snowflake, Databricks, BigQuery, and DuckDB for local files.
   - Sign-in: passwords/tokens/keys go in the OS keychain. Browser sign-in (OAuth PKCE, Snowflake SSO), device code, service principals, service accounts, and CLI logins (gcloud, Databricks CLI, az).
   - SSH tunnels with host-key pinning.
-  - Test fails fast: a DNS + TCP check tells "unknown host", "connection refused" and "no answer" apart within seconds, the whole attempt gives up after the connect timeout (Settings → Queries → Connecting, default 20 s; browser sign-in is not limited), and Stop cancels it.
+  - Test fails fast: a DNS + TCP check tells "unknown host", "connection refused" and "no answer" apart within seconds, the whole attempt gives up after the connect timeout (Settings → Queries → Connecting, default 20 s; browser sign-in is not limited), and Stop cancels it. A failed test's error can be copied, and "Ask AI" explains it and what to change, right in the dialog (the settings are sent without passwords or keys; the conversation stays in the AI panel).
   - Folders with drag and drop.
 - **Explorer:** three-level engines (Databricks, Snowflake, BigQuery, DuckDB) show catalog → schema → tables, catalogs first: a catalog's schemas are listed when it opens.
   - Cached locally (app-data SQLite): catalogs, schemas, tables and columns you have seen show at once on the next start, before connecting, and stay browsable offline ("Offline · cached 2 h ago"; completion uses the same cache).

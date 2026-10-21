@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { CheckCircle2, FilePlus2, FolderOpen, FolderPlus, Globe, Info, Loader2, LogOut, Plus, Square, Trash2, XCircle } from "lucide-react";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { CheckCircle2, Copy, FilePlus2, FolderOpen, FolderPlus, Globe, Info, Loader2, LogOut, Plus, Square, Trash2, XCircle } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type {
   AiPolicy,
@@ -16,6 +17,7 @@ import type {
 } from "../lib/types";
 import { useStore } from "../store";
 import { OracleAgentPanel, OracleClientPanel } from "./OracleClient";
+import { AskAiAboutError, connectionErrorQuestion } from "./AskAiError";
 import { Modal } from "./ui";
 
 const COLORS = ["#818cf8", "#22d3ee", "#34d399", "#fbbf24", "#f97316", "#f87171", "#e879f9", "#94a3b8"];
@@ -1008,13 +1010,31 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
 
         {testResult && (
           <div
-            className={`flex items-start gap-2 rounded-lg border px-3 py-2 text-[12.5px] ${
+            className={`flex flex-wrap items-start gap-2 rounded-lg border px-3 py-2 text-[12.5px] ${
               testResult.ok ? "border-success/40 bg-success/10" : "border-danger/40 bg-danger/10"
             }`}
             role="status"
           >
             {testResult.ok ? <CheckCircle2 size={15} className="mt-px shrink-0 text-success" /> : <XCircle size={15} className="mt-px shrink-0 text-danger" />}
-            <span className="break-words">{testResult.text}</span>
+            <span className="min-w-0 flex-1 break-words select-text">{testResult.text}</span>
+            {!testResult.ok && testResult.text !== "Test cancelled" && (
+              <AskAiAboutError error={testResult.text} connectionId={initial?.id ?? null} question={() => connectionErrorQuestion(testResult.text, buildProfile().config)} />
+            )}
+            {!testResult.ok && (
+              <button
+                type="button"
+                className="icon-btn -my-1 h-6 w-6 shrink-0"
+                aria-label="Copy the error"
+                title="Copy the error"
+                onClick={() =>
+                  void writeText(testResult.text)
+                    .then(() => useStore.getState().toast("Error copied", "success"))
+                    .catch((e) => useStore.getState().toast(toError(e).message, "error"))
+                }
+              >
+                <Copy size={13} />
+              </button>
+            )}
           </div>
         )}
         <button type="submit" className="hidden" />
