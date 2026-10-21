@@ -728,6 +728,8 @@ export interface UiContext {
   open_job_id?: string | null;
   open_job_name?: string | null;
   result_id?: string | null;
+  /** Not about this connection's data (a connection test error): the assistant doesn't connect, read the schema or use tools. */
+  no_database?: boolean;
   mentions?: string[];
 }
 

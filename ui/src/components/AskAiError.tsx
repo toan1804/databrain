@@ -6,7 +6,7 @@ import { Markdown } from "./Markdown";
 
 export { connectionErrorQuestion } from "../lib/aiQuestions";
 
-/** The connection the assistant runs on: this one if it is saved with AI on, else the AI panel's, else any with AI on. */
+/** The connection the conversation is filed under (the assistant doesn't use it): this one if it is saved with AI on, else the AI panel's, else any with AI on. */
 function aiConnection(preferred: string | null): string | null {
   const conns = useStore.getState().connections;
   const ok = (id: string | null | undefined) => !!id && conns.some((c) => c.id === id && c.ai_policy?.ai_enabled);
@@ -40,7 +40,14 @@ export function AskAiAboutError({ error, question, connectionId }: { error: stri
     ai.newChat();
     setSince(0);
     setAsked(error);
-    await ai.send({ message: question(), connectionId: conn, targetKey: null });
+    // The question is about the settings, not data: the assistant must not
+    // connect to the connection it runs on (that could start its sign-in).
+    await ai.send({
+      message: question(),
+      connectionId: conn,
+      targetKey: null,
+      context: { no_database: true, editor_sql: null, selection: null, last_error: null, failed_sql: null, failed_line: null, result_id: null, connections: [], mentions: [] },
+    });
   };
 
   const answer = since === null || asked !== error ? [] : items.slice(since).filter((i) => i.kind === "assistant" || i.kind === "error");

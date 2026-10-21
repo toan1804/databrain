@@ -780,3 +780,32 @@ async fn creates_a_job_across_connections() {
     // Same again: nothing to change.
     assert!(c.call("update_job", &fix).await.content.starts_with("Nothing changes"));
 }
+
+/// "Ask AI" about a connection test error: the conversation is filed under a
+/// connection, but the assistant must not connect to it (that could start a
+/// sign-in), read its schema, or run tools.
+#[tokio::test]
+async fn no_database_questions_never_connect() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = mock_openai(requests.clone()).await;
+    let f = fixture(port, AiPolicy::default()).await;
+    f.engine.disconnect(&f.conn);
+    assert!(!f.engine.connected_ids().contains(&f.conn));
+    let agent = Agent { engine: f.engine.clone(), hub: f.hub.clone(), secrets: f.secrets.clone(), max_steps: 8 };
+    let host = Arc::new(Host { approvals: AtomicUsize::new(0), approve: true });
+    let mut r = req(&f);
+    r.message = "Why did the connection test fail? connection refused".into();
+    r.context.no_database = true;
+    agent.run(r, "r1".into(), host.clone(), Arc::new(Events::default()), Default::default()).await.unwrap();
+    let reqs = requests.lock().clone();
+    let system = reqs[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(!system.contains("main.orders"), "no schema in the prompt: {system}");
+    assert!(reqs[0]["tools"].as_array().is_none_or(|t| t.is_empty()), "no tools offered");
+    // The mock calls tools anyway: each one is refused.
+    for q in &reqs[1..] {
+        let last = q["messages"].as_array().unwrap().iter().rfind(|m| m["role"] == "tool").unwrap()["content"].as_str().unwrap().to_string();
+        assert!(last.contains("tools are off"), "{last}");
+    }
+    assert_eq!(host.approvals.load(Ordering::SeqCst), 0);
+    assert!(!f.engine.connected_ids().contains(&f.conn), "the connection was not opened");
+}

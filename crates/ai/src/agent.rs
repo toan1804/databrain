@@ -70,6 +70,10 @@ pub struct UiContext {
     pub open_job_id: Option<String>,
     pub open_job_name: Option<String>,
     pub result_id: Option<String>,
+    /// The question is not about this connection's data (e.g. why another
+    /// connection's test failed): don't connect, retrieve or use tools.
+    #[serde(default)]
+    pub no_database: bool,
     /// Outputs the user mentioned with @ (handles or names).
     pub mentions: Vec<String>,
 }
@@ -127,6 +131,11 @@ pub fn provider_for(rec: &AiProviderRecord, secrets: Arc<dyn SecretStore>) -> Re
     };
     Ok((providers::build(kind, &cfg, key)?, cfg, kind))
 }
+
+/// System prompt for questions that need no database (connection errors).
+const NO_DATABASE_PROMPT: &str = "You are DataBrain's assistant, embedded in a desktop SQL client. The user asks about a database connection \
+    that could not be set up (its settings and error are in the message). Explain the error, the likely causes and what to change, \
+    concisely. You have no tools and no access to any database for this question: answer from the message only.";
 
 pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mode, retrieved: &knowledge::Retrieved, examples: &[(String, String)]) -> String {
     let kind = profile.config.kind;
@@ -400,7 +409,9 @@ impl Agent {
         // Context.
         let retrieval_q = format!("{} {}", req.message, req.context.selection.clone().or(req.context.editor_sql.clone()).unwrap_or_default());
         let budget = if others.is_empty() { 14_000 } else { 8_000 };
-        let mut retrieved = knowledge::retrieve(&ws, &profile.id, &retrieval_q, 8, budget).unwrap_or(knowledge::Retrieved { tables: vec![], text: String::new(), notes: vec![] });
+        let offline = req.context.no_database;
+        let empty = || knowledge::Retrieved { tables: vec![], text: String::new(), notes: vec![] };
+        let mut retrieved = if offline { empty() } else { knowledge::retrieve(&ws, &profile.id, &retrieval_q, 8, budget).unwrap_or_else(|_| empty()) };
         // The chosen connections' relevant tables too, labelled by connection.
         let per = 12_000 / others.len().max(1);
         for p in &others {
@@ -411,17 +422,20 @@ impl Agent {
                 retrieved.notes.extend(r.notes.into_iter().map(|n| format!("[{}] {n}", p.name)));
             }
         }
-        let examples: Vec<(String, String)> = ws.ai_examples(&profile.id)?.into_iter().map(|q| (q.name, q.sql)).collect();
-        let server = self.engine.connect(&profile.id).await.ok();
-        let system = system_prompt(&profile, server.as_deref(), req.mode, &retrieved, &examples);
-        let tools = specs(true);
+        let (system, tools) = if offline {
+            (NO_DATABASE_PROMPT.to_string(), vec![])
+        } else {
+            let examples: Vec<(String, String)> = ws.ai_examples(&profile.id)?.into_iter().map(|q| (q.name, q.sql)).collect();
+            let server = self.engine.connect(&profile.id).await.ok();
+            (system_prompt(&profile, server.as_deref(), req.mode, &retrieved, &examples), specs(true))
+        };
 
         let ctx = ToolContext {
             engine: self.engine.clone(),
             hub: self.hub.clone(),
             profile: profile.clone(),
             session_id: Some(sid.clone()),
-            caller: Caller::Agent,
+            caller: if offline { Caller::AgentNoDatabase } else { Caller::Agent },
             host,
             cancel: cancel.clone(),
             results: parking_lot::Mutex::new(req.context.result_id.clone().into_iter().chain(mentioned_ids).collect()),

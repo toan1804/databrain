@@ -20,6 +20,9 @@ pub enum Caller {
     Agent,
     /// External MCP client: `Ask` decisions are denied unless auto-approved.
     Mcp,
+    /// In-app agent answering without the database (a connection-settings
+    /// question): no tool may connect, so nothing signs in.
+    AgentNoDatabase,
 }
 
 pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
@@ -200,6 +203,9 @@ impl ToolContext {
 
     /// Execute one tool call. Errors are returned to the model as text.
     pub async fn call(&self, name: &str, args: &Value) -> ToolOutput {
+        if self.caller == Caller::AgentNoDatabase {
+            return out("ERROR: tools are off for this question (it is about connection settings, not data): answer from the text you were given", Value::Null);
+        }
         let r = match name {
             "search_schema" => self.search_schema(args),
             "describe_table" => self.describe_table(args),
