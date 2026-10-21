@@ -444,6 +444,58 @@ impl Workspace {
         Ok(delta)
     }
 
+    /// Add or refresh single objects (indexing chosen tables), keeping the
+    /// rest of their schemas. Returns how many changed.
+    pub fn kn_upsert_objects(&self, connection_id: &str, objects: &[KnObject]) -> Result<usize> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let now = now_ms();
+        let mut changed = 0;
+        for o in objects {
+            let hash = o.hash();
+            let old: Option<String> = tx
+                .query_row(
+                    "SELECT content_hash FROM kn_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3",
+                    params![connection_id, o.schema, o.name],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if old.as_deref() == Some(hash.as_str()) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO kn_objects (connection_id, schema_name, name, kind, comment, row_estimate, columns_json, fks_json, content_hash, indexed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT(connection_id, schema_name, name) DO UPDATE SET kind = excluded.kind, comment = excluded.comment, \
+                   row_estimate = excluded.row_estimate, columns_json = excluded.columns_json, fks_json = excluded.fks_json, \
+                   content_hash = excluded.content_hash, indexed_at = excluded.indexed_at",
+                params![
+                    connection_id,
+                    o.schema,
+                    o.name,
+                    o.kind,
+                    o.comment,
+                    o.row_estimate,
+                    serde_json::to_string(&o.columns)?,
+                    serde_json::to_string(&o.foreign_keys)?,
+                    hash,
+                    now
+                ],
+            )?;
+            tx.execute(
+                "DELETE FROM kn_fts WHERE rowid IN (SELECT rowid FROM kn_fts WHERE connection_id = ?1 AND source = 'object' AND ref = ?2)",
+                params![connection_id, o.full_name()],
+            )?;
+            tx.execute(
+                "INSERT INTO kn_fts (connection_id, source, ref, title, body) VALUES (?1, 'object', ?2, ?3, ?4)",
+                params![connection_id, o.full_name(), o.name, o.search_body()],
+            )?;
+            changed += 1;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
     /// Fingerprints of the schemas as last indexed (see `Session::schema_fingerprints`).
     pub fn kn_fingerprints(&self, connection_id: &str) -> Result<std::collections::HashMap<String, String>> {
         let c = self.conn.lock();

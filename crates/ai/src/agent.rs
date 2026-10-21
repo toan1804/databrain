@@ -146,7 +146,8 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
          fully-qualified table names when there are several schemas.\n\n\
          Rules:\n\
          - Ground every table and column in the schema below or in search_schema/describe_table results. Never invent names; \
-           if something is missing, search first, then say so.\n\
+           if something is missing, search first; a table the user names that the index doesn't have can be read with index_tables \
+           (the user approves it) — never ask the user to type a table's columns.\n\
          - For questions about data, write the query and run it with run_query when useful, then answer from the results. \
            Do not claim results you have not seen.\n\
          - Prefer query_result to aggregate a stored result locally instead of re-querying or asking for raw rows.\n\

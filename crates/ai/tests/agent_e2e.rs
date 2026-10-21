@@ -809,3 +809,40 @@ async fn no_database_questions_never_connect() {
     assert_eq!(host.approvals.load(Ordering::SeqCst), 0);
     assert!(!f.engine.connected_ids().contains(&f.conn), "the connection was not opened");
 }
+
+/// A table missing from the index is read from the database after approval,
+/// added to the index (keeping the rest), and described right away.
+#[tokio::test]
+async fn index_tables_adds_missing_tables_after_approval() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = mock_openai(requests.clone()).await;
+    let f = fixture(port, AiPolicy::default()).await;
+    f.ws.kn_clear(&f.conn).unwrap();
+    let ctx = |approve: bool| databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: f.ws.get_connection(&f.conn).unwrap(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: Arc::new(Host { approvals: AtomicUsize::new(0), approve }),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+    };
+    let missing = ctx(true).call("describe_table", &json!({"table": "orders"})).await;
+    assert!(missing.content.contains("index_tables"), "{}", missing.content);
+    // Declined: nothing indexed.
+    let no = ctx(false).call("index_tables", &json!({"tables": ["orders"]})).await;
+    assert!(no.content.contains("declined"), "{}", no.content);
+    assert_eq!(f.ws.kn_count(&f.conn).unwrap(), 0);
+    // Approved: orders is indexed (a wrong name is reported), described at once.
+    let c = ctx(true);
+    let o = c.call("index_tables", &json!({"tables": ["orders", "nope_table"], "reason": "revenue question"})).await;
+    assert!(o.content.contains("Indexed 1 of 2") && o.content.contains("country") && o.content.contains("nope_table: not indexed"), "{}", o.content);
+    assert_eq!(f.ws.kn_count(&f.conn).unwrap(), 1);
+    let d = c.call("describe_table", &json!({"table": "orders"})).await;
+    assert!(d.content.contains("customer_id"), "{}", d.content);
+    // Indexing another keeps the first.
+    c.call("index_tables", &json!({"tables": ["main.customers"]})).await;
+    assert_eq!(f.ws.kn_count(&f.conn).unwrap(), 2);
+    assert!(f.ws.kn_state(&f.conn).unwrap().is_some_and(|s| s.objects == 2));
+}

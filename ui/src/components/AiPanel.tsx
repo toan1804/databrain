@@ -531,6 +531,7 @@ function ChatItemView({ item }: { item: ChatItem }) {
 const TOOL_LABELS: Record<string, string> = {
   search_schema: "Searched schema",
   describe_table: "Described table",
+  index_tables: "Indexed tables",
   list_tables: "Listed tables",
   get_sample_rows: "Sampled rows",
   run_query: "Ran query",
@@ -613,7 +614,7 @@ function ApprovalCard({
     <div className={`rounded-lg border p-2 text-[12.5px] ${pending ? "border-warning/50 bg-warning/5" : "border-line"}`}>
       <div className="mb-1 flex items-center gap-1.5 font-medium">
         <ShieldAlert size={13} className="text-warning" />
-        {item.tool === "run_query" ? "Run this query?" : item.tool === "create_job" ? "Create this job?" : item.tool === "update_job" ? "Change this job?" : item.tool === "run_job" ? "Run this job?" : `Allow ${item.tool}?`}
+        {item.tool === "run_query" ? "Run this query?" : item.tool === "create_job" ? "Create this job?" : item.tool === "update_job" ? "Change this job?" : item.tool === "run_job" ? "Run this job?" : item.tool === "index_tables" ? "Index these tables?" : `Allow ${item.tool}?`}
         {!pending && (
           <span className={`ml-auto text-[11px] ${item.state === "approved" ? "text-success" : "text-muted"}`}>
             {item.state === "approved" ? (item.auto ? "Auto-approved" : "Approved") : "Declined"}

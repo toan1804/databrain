@@ -39,6 +39,15 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
             json!({"type": "object", "properties": {"table": {"type": "string", "description": "schema.table or table"}, "connection": {"type": "string", "description": "Another connection (name from list_connections); default: the current one"}}, "required": ["table"]}),
         ),
         s(
+            "index_tables",
+            "Add tables or views missing from the knowledge index: reads their columns, keys and comments from the database (after the user approves) and returns them. Use it when search_schema/describe_table can't find a table the user names, instead of asking the user for its structure.",
+            json!({"type": "object", "properties": {
+                "tables": {"type": "array", "items": {"type": "string"}, "description": "schema.table (catalog.schema.table on three-level engines) or a bare table name; up to 20"},
+                "reason": {"type": "string", "description": "One line for the user: why these tables are needed"},
+                "connection": {"type": "string", "description": "Another connection (name from list_connections); default: the current one"}
+            }, "required": ["tables"]}),
+        ),
+        s(
             "list_tables",
             "List indexed table names (optionally only in one schema). Use search_schema for relevance ranking.",
             json!({"type": "object", "properties": {"schema": {"type": "string"}, "connection": {"type": "string", "description": "Another connection (name from list_connections); default: the current one"}}}),
@@ -209,6 +218,7 @@ impl ToolContext {
         let r = match name {
             "search_schema" => self.search_schema(args),
             "describe_table" => self.describe_table(args),
+            "index_tables" => self.index_tables(args).await,
             "list_tables" => self.list_tables(args),
             "get_sample_rows" => self.sample_rows(args).await,
             "run_query" => self.run_query(args).await,
@@ -477,9 +487,9 @@ impl ToolContext {
         self.audit("search_schema", args, "allowed", Some(&format!("{} tables", r.tables.len())));
         if r.tables.is_empty() {
             let hint = if self.engine.workspace().kn_count(&target.id)? == 0 {
-                "The knowledge index is empty; ask the user to index this connection (AI panel → Knowledge → Index)."
+                "The knowledge index is empty. Use index_tables for the tables the question names (don't ask the user for their columns); for broad questions, suggest indexing the connection (AI panel → Knowledge → Index)."
             } else {
-                "No matching tables. Try other keywords or list_tables."
+                "No matching tables in the index. Try other keywords or list_tables; if the user named a table, index_tables reads it from the database."
             };
             return Ok(out(hint, json!({"tables": []})));
         }
@@ -497,7 +507,7 @@ impl ToolContext {
         let t = arg(args, "table")?;
         let target = self.schema_target(args)?;
         let ws = self.engine.workspace();
-        let o = ws.kn_get(&target.id, t)?.ok_or_else(|| AiError::Policy(format!("table `{t}` not found in the index; use search_schema")))?;
+        let o = ws.kn_get(&target.id, t)?.ok_or_else(|| AiError::Policy(format!("table `{t}` is not in the knowledge index; search_schema with other words, or index_tables to read it from the database (don't ask the user for its columns)")))?;
         let full = o.full_name();
         let notes: Vec<String> = ws
             .kn_notes(&target.id)?
@@ -523,6 +533,53 @@ impl ToolContext {
         }
         self.audit("describe_table", args, "allowed", None);
         Ok(out(text, json!({"table": full})))
+    }
+
+    async fn index_tables(&self, args: &Value) -> Result<ToolOutput> {
+        let target = self.schema_target(args)?;
+        let tables: Vec<String> = match args.get("tables") {
+            Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect(),
+            Some(Value::String(t)) => t.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect(),
+            _ => vec![],
+        };
+        if tables.is_empty() {
+            return Err(AiError::Policy("missing argument `tables`".into()));
+        }
+        if tables.len() > 20 {
+            return Err(AiError::Policy("index at most 20 tables at a time; for whole schemas, ask the user to index the connection (AI panel → Knowledge)".into()));
+        }
+        let reason = args.get("reason").and_then(|r| r.as_str()).unwrap_or("").trim();
+        let summary = format!(
+            "Read the structure (columns, keys, comments) of {} from \"{}\" into the knowledge index{}. No data is read.",
+            tables.join(", "),
+            target.name,
+            if reason.is_empty() { String::new() } else { format!(" ({reason})") }
+        );
+        let detail = json!({"tables": tables, "connection": target.name});
+        // Metadata only. MCP hosts ask their user themselves; in the app the user approves.
+        let decision = if self.caller == Caller::Mcp { Decision::Allow } else { Decision::Ask("Index tables".into()) };
+        self.gate("index_tables", decision, &summary, &detail).await?;
+        let results = knowledge::index_tables(&self.engine, &target.id, &tables).await?;
+        let pol = target.ai_policy.clone();
+        let mut text = String::new();
+        let mut ok = Vec::new();
+        let mut failed = Vec::new();
+        for (want, r) in &results {
+            match r {
+                Ok(o) => {
+                    let full = o.full_name();
+                    text.push_str(&knowledge::render_object(o, &|c| is_pii(&pol, Some(&full), c), &[]));
+                    text.push('\n');
+                    ok.push(full);
+                }
+                Err(e) => {
+                    text.push_str(&format!("-- {want}: not indexed: {e}\n"));
+                    failed.push(json!({"table": want, "error": e}));
+                }
+            }
+        }
+        self.audit("index_tables", args, "approved", Some(&format!("{} indexed, {} failed", ok.len(), failed.len())));
+        Ok(out(format!("Indexed {} of {} tables.\n{text}", ok.len(), results.len()), json!({"indexed": ok, "failed": failed, "connection": target.name})))
     }
 
     fn list_tables(&self, args: &Value) -> Result<ToolOutput> {

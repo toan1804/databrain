@@ -272,6 +272,48 @@ pub async fn index_connection_with(
     Ok(report)
 }
 
+/// Index chosen tables only (the AI found a table missing from the index):
+/// each name is looked up (index, explorer cache, then the server), described
+/// live and added to the index; the rest of the index is kept. Per name:
+/// the indexed object or why it could not be indexed.
+pub async fn index_tables(engine: &QueryEngine, connection_id: &str, names: &[String]) -> Result<Vec<(String, std::result::Result<KnObject, String>)>> {
+    let ws = engine.workspace().clone();
+    let mut out = Vec::new();
+    let mut fresh = Vec::new();
+    for want in names.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
+        let r: std::result::Result<KnObject, String> = async {
+            let (schema, name) = live_limited(resolve_table(engine, connection_id, want))
+                .await?
+                .ok_or_else(|| format!("no table or view named `{want}` on this connection"))?;
+            let d = live_limited(async { engine.describe(connection_id, &schema, &name).await.map_err(|e| e.message) }).await?;
+            if !d.object.kind.is_relation() {
+                return Err(format!("`{schema}.{name}` is not a table or view"));
+            }
+            Ok(KnObject {
+                kind: serde_json::to_value(d.object.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "table".into()),
+                comment: d.object.comment,
+                row_estimate: d.object.row_estimate,
+                columns: d.columns,
+                foreign_keys: d.foreign_keys,
+                schema,
+                name,
+            })
+        }
+        .await;
+        if let Ok(o) = &r {
+            fresh.push(o.clone());
+        }
+        out.push((want.to_string(), r));
+    }
+    if !fresh.is_empty() {
+        ws.kn_upsert_objects(connection_id, &fresh)?;
+        let objects = ws.kn_count(connection_id)?;
+        let st = ws.kn_state(connection_id)?.unwrap_or(KnState { connection_id: connection_id.to_string(), indexed_at: 0, objects: 0, schemas: vec![], error: None });
+        ws.kn_set_state(&KnState { objects, indexed_at: if st.indexed_at == 0 { now_ms() } else { st.indexed_at }, ..st })?;
+    }
+    Ok(out)
+}
+
 /// Compact DDL-like description for prompts. PII columns are listed but
 /// flagged so the model avoids selecting them.
 pub fn render_object(o: &KnObject, pii: &dyn Fn(&str) -> bool, notes: &[String]) -> String {
