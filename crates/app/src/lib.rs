@@ -210,6 +210,9 @@ async fn reveal_job_file(app: AppHandle, state: State<'_, AppState>, job_id: Str
         .and_then(|n| n.last_run.as_ref())
         .and_then(|r| r.file.clone())
         .ok_or_else(|| EngineError::new("not_found", "This step hasn't written a file yet"))?;
+    if file.contains("://") {
+        return Err(EngineError::new("invalid", format!("This file is in object storage: {file}")));
+    }
     if !std::path::Path::new(&file).exists() {
         return Err(EngineError::new("not_found", format!("{file} no longer exists")));
     }
@@ -248,6 +251,41 @@ async fn file_scan_sql(path: String, all_sheets: Option<bool>) -> R<String> {
     return api::file_scan_sql(&path, all_sheets.unwrap_or(false));
     #[cfg(not(feature = "duckdb-engine"))]
     Err(databrain_query_engine::EngineError::new("invalid", format!("DuckDB support is not built in ({path})")))
+}
+#[tauri::command]
+async fn storage_scan_sql(state: State<'_, AppState>, connection_id: String, url: String) -> R<String> {
+    #[cfg(feature = "duckdb-engine")]
+    return api::storage_scan_sql(&state, &connection_id, &url).await;
+    #[cfg(not(feature = "duckdb-engine"))]
+    {
+        let _ = (state, connection_id, url);
+        Err(databrain_query_engine::EngineError::new("invalid", "DuckDB support is not built in"))
+    }
+}
+#[tauri::command]
+async fn storage_list(state: State<'_, AppState>, connection_id: String, url: String, limit: Option<usize>) -> R<Vec<api::StorageObject>> {
+    #[cfg(feature = "duckdb-engine")]
+    return api::storage_list(&state, &connection_id, &url, limit.unwrap_or(5000)).await;
+    #[cfg(not(feature = "duckdb-engine"))]
+    {
+        let _ = (state, connection_id, url, limit);
+        Err(databrain_query_engine::EngineError::new("invalid", "DuckDB support is not built in"))
+    }
+}
+#[tauri::command]
+async fn storage_buckets(
+    state: State<'_, AppState>,
+    config: databrain_connector_core::ConnectionConfig,
+    secret: Option<String>,
+    connection_id: Option<String>,
+) -> R<serde_json::Value> {
+    #[cfg(feature = "duckdb-engine")]
+    return api::storage_buckets(&state, &config, secret, connection_id.as_deref()).await.map(|v| serde_json::to_value(v).unwrap_or_default());
+    #[cfg(not(feature = "duckdb-engine"))]
+    {
+        let _ = (state, config, secret, connection_id);
+        Err(databrain_query_engine::EngineError::new("invalid", "DuckDB support is not built in"))
+    }
 }
 #[tauri::command]
 async fn excel_sheets(path: String) -> R<Vec<api::ExcelSheet>> {
@@ -1072,6 +1110,9 @@ pub fn run() {
             delete_notebook,
             file_scan_sql,
             excel_sheets,
+            storage_scan_sql,
+            storage_list,
+            storage_buckets,
             sign_in,
             sign_out,
             auth_status,

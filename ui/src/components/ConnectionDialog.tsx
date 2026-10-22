@@ -16,10 +16,12 @@ import type {
   SshConfig,
   SslMode,
 } from "../lib/types";
-import { useStore } from "../store";
+import { useStore, type ConnectionPreset } from "../store";
 import { OracleAgentPanel, OracleClientPanel } from "./OracleClient";
 import { AskAiAboutError, connectionErrorQuestion } from "./AskAiError";
 import { Modal } from "./ui";
+import { STORAGE_PROVIDERS, bucketNoun, providerOf, usesSecret, type StorageAuth } from "../lib/storage";
+import type { StorageBucket } from "../lib/types";
 
 const COLORS = ["#818cf8", "#22d3ee", "#34d399", "#fbbf24", "#f97316", "#f87171", "#e879f9", "#94a3b8"];
 const ENVS: { value: EnvTag; label: string }[] = [
@@ -93,14 +95,14 @@ function Check({ checked, onChange, label, help }: { checked: boolean; onChange:
 }
 
 export function ConnectionDialog() {
-  const { open, profile, folderId } = useStore((s) => s.connectionDialog);
+  const { open, profile, folderId, preset } = useStore((s) => s.connectionDialog);
   if (!open) return null;
-  return <ConnectionForm key={profile?.id ?? "new"} initial={profile ?? null} folderId={folderId ?? null} />;
+  return <ConnectionForm key={profile?.id ?? "new"} initial={profile ?? null} folderId={folderId ?? null} preset={profile ? undefined : preset} />;
 }
 
-type Section = "general" | "auth" | "ssh" | "ai";
+type Section = "general" | "auth" | "storage" | "ssh" | "ai";
 
-function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | null; folderId: string | null }) {
+function ConnectionForm({ initial, folderId, preset }: { initial: ConnectionProfile | null; folderId: string | null; preset?: ConnectionPreset }) {
   const connectors = useStore((s) => s.connectors);
   const closeDialog = useStore((s) => s.closeConnectionDialog);
   /** Id of the running Test, so Cancel (or closing the dialog) can stop it. */
@@ -118,8 +120,8 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
     [connectors],
   );
 
-  const [section, setSection] = useState<Section>("general");
-  const [kind, setKind] = useState<ConnectorKind>(initial?.config.kind ?? sorted[0]?.kind ?? "sqlite");
+  const [section, setSection] = useState<Section>(preset?.section ?? "general");
+  const [kind, setKind] = useState<ConnectorKind>(initial?.config.kind ?? preset?.kind ?? sorted[0]?.kind ?? "sqlite");
   const info = connectors.find((c) => c.kind === kind);
   const [name, setName] = useState(initial?.name ?? "");
   const [values, setValues] = useState<Record<string, string>>(() => {
@@ -129,7 +131,7 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
       port: c?.port ? String(c.port) : "",
       database: c?.database ?? "",
       file_path: c?.file_path ?? "",
-      ...(c?.options ?? {}),
+      ...(c?.options ?? preset?.options ?? {}),
     };
   });
   const setValue = (k: string, v: string) => setValues((s) => ({ ...s, [k]: v }));
@@ -188,8 +190,17 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
   const usesFile = info?.uses_file ?? false;
   const fields = info?.fields ?? [];
 
+  // DuckDB: the object storage access key id is the auth user, its secret the keychain secret.
+  const storageProvider = kind === "duckdb" ? providerOf(values.storage) : undefined;
+  const storageAuth: StorageAuth = (values.storage_auth as StorageAuth) || "keys";
+  // S3 family keys: access key id (user) + secret. Azure secrets (account key,
+  // SAS, connection string, client secret) are a token.
+  const storageSecret = !!storageProvider && usesSecret(storageAuth);
+  const storageKeys = storageSecret && storageProvider?.id !== "azure";
+
   const buildAuth = (): AuthMethod => {
     const u = user.trim();
+    if (kind === "duckdb") return storageKeys ? { method: "password", user: u } : storageSecret ? { method: "api_token", user: null } : { method: "none" };
     const o: OAuthParams = Object.fromEntries(
       Object.entries(oauth).filter(([, v]) => v !== undefined && v !== null && String(v).trim() !== ""),
     );
@@ -251,6 +262,10 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
   const defaultName = () => {
     if (kind === "duckdb") {
       const first = (values.files ?? "").split("\n").find((l) => l.trim());
+      if (storageProvider && !values.file_path?.trim() && !first) {
+        const bucket = (values.storage_bucket ?? "").replace(/^[a-z0-9]+:\/\//i, "").split("/")[0];
+        return `${storageProvider.label.split(" (")[0]}${bucket ? ` · ${bucket}` : ""}`;
+      }
       return values.file_path?.trim() ? values.file_path.split(/[\\/]/).pop()! : first ? `DuckDB · ${first.split(/[\\/]/).pop()}` : "DuckDB";
     }
     if (usesFile) return values.file_path?.split(/[\\/]/).pop() || info?.display_name || kind;
@@ -258,12 +273,17 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
     return `${values.database || values.catalog || values.dataset || info?.display_name || kind}@${main}`;
   };
 
-  const needsUser = ["password", "key_pair", "external_browser"].includes(authKind);
+  const needsUser = kind === "duckdb" ? storageKeys : ["password", "key_pair", "external_browser"].includes(authKind);
   const needsClientId =
     ["device_code", "client_credentials"].includes(authKind) || (authKind === "oauth_browser" && kind !== "databricks");
   const portValid = !values.port || (/^\d+$/.test(values.port) && +values.port > 0 && +values.port < 65536);
   const missing = fields.filter((f) => f.required && !(values[f.key] ?? "").trim()).map((f) => f.label);
-  if (needsUser && !user.trim()) missing.push("User");
+  if (needsUser && !user.trim()) missing.push(kind === "duckdb" ? "Access key ID" : "User");
+  if (storageProvider?.id === "s3_compatible" && !(values.storage_endpoint ?? "").trim()) missing.push("Endpoint");
+  if (storageProvider?.id === "azure" && storageAuth !== "connection_string" && !(values.storage_account ?? "").trim()) missing.push("Storage account");
+  if (storageProvider?.id === "azure" && storageAuth === "service_principal" && !(values.storage_tenant ?? "").trim()) missing.push("Tenant ID");
+  if (storageProvider?.id === "azure" && storageAuth === "service_principal" && !(values.storage_client_id ?? "").trim()) missing.push("Client ID");
+  if (storageProvider?.id === "r2" && !(values.storage_account_id ?? "").trim() && !(values.storage_endpoint ?? "").trim()) missing.push("Cloudflare account ID");
   if (needsClientId && !oauth.client_id?.trim()) missing.push("OAuth client ID");
   if (sshOn && (!ssh.host.trim() || !ssh.user.trim())) missing.push("SSH host/user");
   const canSubmit = missing.length === 0 && portValid;
@@ -310,7 +330,9 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
 
   const persist = async (): Promise<ConnectionProfile | null> => {
     try {
-      const saved = await api.saveConnection(buildProfile(), secret || null, clearSecret && !secret, secretSlots());
+      // DuckDB without storage keys: drop a saved secret access key.
+      const dropSecret = kind === "duckdb" && !storageSecret && !!initial?.has_secret;
+      const saved = await api.saveConnection(buildProfile(), dropSecret ? null : secret || null, dropSecret || (clearSecret && !secret), secretSlots());
       const st = useStore.getState();
       await st.refreshConnections();
       useStore.setState((s) => {
@@ -472,6 +494,7 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
         <div className="flex gap-1 border-b border-line pb-2" role="tablist">
           {sectionBtn("general", "General")}
           {sectionBtn("auth", "Authentication", !usesFile)}
+          {sectionBtn("storage", storageProvider ? `Object storage · ${storageProvider.label.split(" (")[0]}` : "Object storage", kind === "duckdb")}
           {sectionBtn("ssh", "SSH tunnel", !!info?.capabilities.ssh)}
           {sectionBtn("ai", "AI")}
         </div>
@@ -511,6 +534,8 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
             <div className="grid grid-cols-2 gap-3">
               {fields.map((f) => {
                 const id = `c-f-${f.key}`;
+                // Shown under Object storage.
+                if (f.key.startsWith("storage")) return null;
                 if (f.key === "file_path")
                   return (
                     <div key={f.key} className="col-span-2">
@@ -846,6 +871,22 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
           </div>
         )}
 
+        {section === "storage" && kind === "duckdb" && (
+          <StorageSection
+            values={values}
+            setValue={setValue}
+            user={user}
+            setUser={setUser}
+            secret={secret}
+            setSecret={setSecret}
+            secretPlaceholder={secretPlaceholder}
+            canClear={!!initial?.has_secret && !secret && storageSecret}
+            listBuckets={() => api.storageBuckets(buildProfile().config, secret || null, isEdit && !clearSecret ? (initial?.id ?? null) : null)}
+            clear={clearSecret}
+            onClear={setClearSecret}
+          />
+        )}
+
         {section === "ssh" && info?.capabilities.ssh && (
           <div className="space-y-3">
             <Check checked={sshOn} onChange={setSshOn} label="Connect through an SSH tunnel" help="The database host/port are resolved from the SSH server." />
@@ -1042,6 +1083,282 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
         <button type="submit" className="hidden" />
       </form>
     </Modal>
+  );
+}
+
+/** DuckDB → Object storage: where the bucket is and how to sign in. */
+function StorageSection({
+  values,
+  setValue,
+  user,
+  setUser,
+  secret,
+  setSecret,
+  secretPlaceholder,
+  canClear,
+  clear,
+  onClear,
+  listBuckets,
+}: {
+  listBuckets: () => Promise<StorageBucket[]>;
+  values: Record<string, string>;
+  setValue: (k: string, v: string) => void;
+  user: string;
+  setUser: (v: string) => void;
+  secret: string;
+  setSecret: (v: string) => void;
+  secretPlaceholder: string;
+  canClear: boolean;
+  clear: boolean;
+  onClear: (v: boolean) => void;
+}) {
+  const provider = providerOf(values.storage);
+  const auth: StorageAuth = (values.storage_auth as StorageAuth) || "keys";
+  const isS3 = provider?.id === "s3" || provider?.id === "s3_compatible";
+  const azure = provider?.id === "azure";
+  const auths: { id: StorageAuth; label: string }[] = azure
+    ? [
+        { id: "keys", label: "Account key" },
+        { id: "connection_string", label: "Connection string" },
+        { id: "sas", label: "SAS token" },
+        { id: "service_principal", label: "Service principal" },
+        { id: "chain", label: "Azure CLI / managed identity" },
+        { id: "anonymous", label: "Public container" },
+      ]
+    : [
+        { id: "keys", label: provider?.id === "gcs" ? "HMAC keys" : "Access keys" },
+        ...(isS3 ? [{ id: "chain" as const, label: "AWS credential chain" }] : []),
+        { id: "anonymous", label: "Public bucket (no sign-in)" },
+      ];
+  const [buckets, setBuckets] = useState<{ loading: boolean; list?: StorageBucket[]; error?: string } | null>(null);
+  const noun = bucketNoun(provider?.id);
+  const loadBuckets = async () => {
+    setBuckets({ loading: true });
+    try {
+      setBuckets({ loading: false, list: await listBuckets() });
+    } catch (e) {
+      setBuckets({ loading: false, error: toError(e).message });
+    }
+  };
+  const keyLabels =
+    provider?.id === "gcs"
+      ? ["HMAC access ID", "HMAC secret"]
+      : provider?.id === "r2"
+        ? ["Access key ID (R2 API token)", "Secret access key"]
+        : ["Access key ID", "Secret access key"];
+  return (
+    <div className="space-y-3">
+      <div>
+        <Label htmlFor="st-provider">Storage</Label>
+        <select
+          id="st-provider"
+          className="field"
+          value={provider?.id ?? ""}
+          onChange={(e) => {
+            setValue("storage", e.target.value);
+            // The credential chain is AWS only.
+            // Sign-ins differ between Azure and the S3 family.
+            const az = e.target.value === "azure";
+            const keep = auth === "keys" || auth === "anonymous" || (auth === "chain" && (az || ["s3", "s3_compatible"].includes(e.target.value))) || (az && ["connection_string", "sas", "service_principal"].includes(auth));
+            if (!keep) setValue("storage_auth", "");
+            setBuckets(null);
+          }}
+        >
+          <option value="">None (local files and public HTTPS URLs only)</option>
+          {STORAGE_PROVIDERS.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.label}
+            </option>
+          ))}
+        </select>
+        <p className="mt-1 text-[11.5px] text-muted">
+          {provider ? (
+            <>
+              Query files with their URL, e.g. <span className="font-mono">SELECT * FROM &apos;{provider.example}&apos;</span>, or add URLs to Attached files. Keys are kept in the OS keychain and given to DuckDB as a temporary secret for each session (never written to a database file).
+            </>
+          ) : (
+            "Read files in S3, Cloudflare R2, Google Cloud Storage or an S3-compatible server such as MinIO."
+          )}
+        </p>
+      </div>
+
+      {provider && (
+        <>
+          <div>
+            <Label>Sign-in</Label>
+            <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label="Storage sign-in">
+              {auths.map((a) => (
+                <button
+                  type="button"
+                  key={a.id}
+                  role="radio"
+                  aria-checked={auth === a.id}
+                  onClick={() => setValue("storage_auth", a.id === "keys" ? "" : a.id)}
+                  className={`rounded-md border px-2.5 py-1 text-[12.5px] ${auth === a.id ? "border-accent bg-accent/10" : "border-line hover:bg-hover"}`}
+                >
+                  {a.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {azure && (
+            <div className="space-y-3">
+              {auth !== "connection_string" && (
+                <div>
+                  <Label htmlFor="st-account">Storage account *</Label>
+                  <input id="st-account" className="field font-mono text-[12px]" value={values.storage_account ?? ""} placeholder="mystorageaccount" spellCheck={false} onChange={(e) => setValue("storage_account", e.target.value)} />
+                </div>
+              )}
+              {auth === "keys" && <SecretField label="Account key" value={secret} onChange={setSecret} placeholder={secretPlaceholder} canClear={canClear} clear={clear} onClear={onClear} />}
+              {auth === "sas" && <SecretField label="SAS token" value={secret} onChange={setSecret} placeholder={secretPlaceholder || "sv=…&sig=…"} canClear={canClear} clear={clear} onClear={onClear} />}
+              {auth === "connection_string" && (
+                <SecretField label="Connection string" value={secret} onChange={setSecret} placeholder={secretPlaceholder || "DefaultEndpointsProtocol=https;AccountName=…;AccountKey=…"} canClear={canClear} clear={clear} onClear={onClear} />
+              )}
+              {auth === "service_principal" && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <Label htmlFor="st-tenant">Tenant (directory) ID *</Label>
+                    <input id="st-tenant" className="field font-mono text-[12px]" value={values.storage_tenant ?? ""} onChange={(e) => setValue("storage_tenant", e.target.value)} />
+                  </div>
+                  <div>
+                    <Label htmlFor="st-client">Client (application) ID *</Label>
+                    <input id="st-client" className="field font-mono text-[12px]" value={values.storage_client_id ?? ""} onChange={(e) => setValue("storage_client_id", e.target.value)} />
+                  </div>
+                  <div className="col-span-2">
+                    <SecretField label="Client secret" value={secret} onChange={setSecret} placeholder={secretPlaceholder} canClear={canClear} clear={clear} onClear={onClear} />
+                  </div>
+                </div>
+              )}
+              {auth === "chain" && (
+                <p className="text-[11.5px] text-muted">
+                  Uses the Azure CLI login (run <span className="font-mono">az login</span> first), the AZURE_* environment variables, or the machine&apos;s managed identity. The identity needs a Storage Blob Data role on the account.
+                </p>
+              )}
+              <div>
+                <Label htmlFor="st-endpoint">Blob endpoint (optional)</Label>
+                <input
+                  id="st-endpoint"
+                  className="field font-mono text-[12px]"
+                  value={values.storage_endpoint ?? ""}
+                  placeholder="https://<account>.blob.core.windows.net (Azurite: http://127.0.0.1:10000/devstoreaccount1)"
+                  onChange={(e) => setValue("storage_endpoint", e.target.value)}
+                />
+              </div>
+              <p className="text-[11.5px] text-muted">
+                URLs: <span className="font-mono">az://container/path/file.parquet</span>, or ADLS Gen2 <span className="font-mono">abfss://container@account.dfs.core.windows.net/path/</span>.
+              </p>
+            </div>
+          )}
+
+          {auth === "keys" && !azure && (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label htmlFor="st-key">{keyLabels[0]} *</Label>
+                <input id="st-key" className="field font-mono text-[12px]" value={user} autoComplete="off" spellCheck={false} onChange={(e) => setUser(e.target.value)} />
+              </div>
+              <SecretField label={keyLabels[1]} value={secret} onChange={setSecret} placeholder={secretPlaceholder} canClear={canClear} clear={clear} onClear={onClear} />
+            </div>
+          )}
+          {auth === "chain" && !azure && (
+            <div>
+              <Label htmlFor="st-profile">AWS profile (optional)</Label>
+              <input id="st-profile" className="field" value={values.storage_profile ?? ""} placeholder="default" onChange={(e) => setValue("storage_profile", e.target.value)} />
+              <p className="mt-1 text-[11.5px] text-muted">
+                Uses the AWS SDK&apos;s credentials: environment variables, ~/.aws/credentials and config profiles, SSO (run <span className="font-mono">aws sso login</span> first) or the instance role.
+              </p>
+            </div>
+          )}
+
+          <div className="grid grid-cols-2 gap-3">
+            {provider.id === "r2" && (
+              <div>
+                <Label htmlFor="st-acct">Cloudflare account ID *</Label>
+                <input id="st-acct" className="field font-mono text-[12px]" value={values.storage_account_id ?? ""} onChange={(e) => setValue("storage_account_id", e.target.value)} />
+              </div>
+            )}
+            {isS3 && (
+              <div>
+                <Label htmlFor="st-region">Region{provider.id === "s3_compatible" ? " (optional)" : ""}</Label>
+                <input id="st-region" className="field" value={values.storage_region ?? ""} placeholder="us-east-1" onChange={(e) => setValue("storage_region", e.target.value)} />
+              </div>
+            )}
+            {provider.id !== "gcs" && !azure && (
+              <div className={provider.id === "r2" ? "" : "col-span-1"}>
+                <Label htmlFor="st-endpoint">Endpoint{provider.id === "s3_compatible" ? " *" : " (optional)"}</Label>
+                <input
+                  id="st-endpoint"
+                  className="field font-mono text-[12px]"
+                  value={values.storage_endpoint ?? ""}
+                  placeholder={provider.id === "s3_compatible" ? "http://localhost:9000" : provider.id === "r2" ? "<account>.r2.cloudflarestorage.com" : "s3.amazonaws.com"}
+                  onChange={(e) => setValue("storage_endpoint", e.target.value)}
+                />
+              </div>
+            )}
+            {isS3 && (
+              <div>
+                <Label htmlFor="st-style">URL style</Label>
+                <select id="st-style" className="field" value={values.storage_url_style ?? ""} onChange={(e) => setValue("storage_url_style", e.target.value)}>
+                  <option value="">{provider.id === "s3_compatible" ? "Default (path: host/bucket/key)" : "Default (virtual host: bucket.host/key)"}</option>
+                  <option value="path">Path (host/bucket/key)</option>
+                  <option value="vhost">Virtual host (bucket.host/key)</option>
+                </select>
+              </div>
+            )}
+            {provider.id === "s3_compatible" && (
+              <div className="mt-5">
+                <Check
+                  checked={values.storage_use_ssl !== "false" && !/^http:\/\//i.test(values.storage_endpoint ?? "")}
+                  onChange={(v) => setValue("storage_use_ssl", v ? "" : "false")}
+                  label="Use TLS (https)"
+                  help="Off for http:// endpoints such as a local MinIO."
+                />
+              </div>
+            )}
+            <div className="col-span-2">
+              <Label htmlFor="st-bucket">{azure ? "Container" : "Bucket"} (optional)</Label>
+              <div className="flex gap-2">
+                <input
+                  id="st-bucket"
+                  className="field font-mono text-[12px]"
+                  value={values.storage_bucket ?? ""}
+                  placeholder={`my-${noun} or my-${noun}/prefix`}
+                  spellCheck={false}
+                  onChange={(e) => setValue("storage_bucket", e.target.value)}
+                />
+                {auth !== "anonymous" && (
+                  <button type="button" className="btn-ghost shrink-0 border border-line" onClick={() => void loadBuckets()} disabled={buckets?.loading}>
+                    {buckets?.loading ? <Loader2 size={13} className="animate-spin" /> : <FolderOpen size={13} />} List {bucketNoun(provider.id, true)}
+                  </button>
+                )}
+              </div>
+              {buckets?.error && <p className="mt-1 text-[11.5px] break-words text-danger select-text">{buckets.error}</p>}
+              {buckets?.list && (
+                <div className="mt-1.5 max-h-[150px] overflow-auto rounded-md border border-line p-1" role="listbox" aria-label={bucketNoun(provider.id, true)}>
+                  {buckets.list.length === 0 && <div className="px-2 py-2 text-[12px] text-muted">No {bucketNoun(provider.id, true)} in this account</div>}
+                  {buckets.list.map((b) => (
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={values.storage_bucket === b.name}
+                      key={b.name}
+                      className={`flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[12.5px] hover:bg-hover ${values.storage_bucket === b.name ? "bg-hover" : ""}`}
+                      onClick={() => setValue("storage_bucket", b.name)}
+                    >
+                      <span className="min-w-0 flex-1 truncate font-mono">{b.name}</span>
+                      {b.created && <span className="shrink-0 text-[11px] text-muted">{b.created.slice(0, 10)}</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <p className="mt-1 text-[11.5px] text-muted">
+                Test and connecting check that it can be listed, and &quot;Browse object storage&quot; opens it. Other {bucketNoun(provider.id, true)} work too, by URL.
+              </p>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 

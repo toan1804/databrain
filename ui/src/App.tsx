@@ -11,6 +11,7 @@ import { CommandPalette } from "./components/CommandPalette";
 import { ConfirmDialog, Toasts } from "./components/ui";
 import { AiPanel } from "./components/AiPanel";
 import { ExcelSheetDialog } from "./components/ExcelSheetDialog";
+import { RemoteFileDialog } from "./components/RemoteFileDialog";
 import { SchemaPickerDialog } from "./components/SchemaPickerDialog";
 import { SplitHandle } from "./components/SplitHandle";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -191,6 +192,7 @@ export default function App() {
           </>
         )}
       </div>
+      <RemoteFileDialog />
       <ConnectionDialog />
       <SaveQueryDialog />
       <CommandPalette />

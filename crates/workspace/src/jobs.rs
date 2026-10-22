@@ -194,9 +194,14 @@ pub struct JobNode {
     /// Load: most KB of SQL text per INSERT statement (`None` = default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_kb: Option<u32>,
-    /// Export: folder of the file (empty = Downloads).
+    /// Export: folder of the file (empty = Downloads), or with
+    /// `export_connection_id` an object storage folder URL (`s3://bucket/reports/`).
     #[serde(default)]
     pub export_folder: Option<String>,
+    /// Export to object storage: the DuckDB connection whose storage
+    /// settings sign the upload (`None` = a local folder).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_connection_id: Option<String>,
     /// Export: file name, `{step}`, `{job}`, `{date}`, `{time}` replaced
     /// (empty = `{step}_{date}_{time}`); the extension is added when missing.
     #[serde(default)]
@@ -232,6 +237,7 @@ impl JobNode {
         }
         if !export {
             self.export_folder = None;
+            self.export_connection_id = None;
             self.export_file = None;
             self.export_format = FileFormat::default();
         }
@@ -714,6 +720,7 @@ mod tests {
             batch_rows: None,
             batch_kb: None,
             export_folder: None,
+            export_connection_id: None,
             export_file: None,
             export_format: FileFormat::Csv,
             last_run: None,

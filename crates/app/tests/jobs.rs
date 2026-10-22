@@ -63,6 +63,7 @@ fn node(id: &str, name: &str, kind: JobNodeKind, conn: Option<&str>, sql: &str) 
         batch_rows: None,
         batch_kb: None,
         export_folder: None,
+        export_connection_id: None,
         export_file: None,
         export_format: FileFormat::Csv,
         last_run: None,
@@ -281,6 +282,86 @@ async fn export_steps_write_files_with_duckdb() {
     let json = std::fs::read_to_string(rec("out_2").file.unwrap()).unwrap();
     assert_eq!(json.lines().count(), 2);
     assert!(json.contains("\"name\":\"b\""), "{json}");
+}
+
+/// A DuckDB connection with object storage (secret saved in the store).
+fn storage_conn(st: &AppState, name: &str, auth: AuthMethod, options: &[(&str, &str)], secret: &str) -> String {
+    let mut c = ConnectionConfig::new(ConnectorKind::Duckdb, auth);
+    for (k, v) in options {
+        c.options.insert((*k).into(), (*v).into());
+    }
+    api::save_connection(
+        st,
+        SaveConnectionArgs {
+            profile: ConnectionProfile { id: String::new(), name: name.into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            secret: Some(secret.into()),
+            clear_secret: false,
+            extra_secrets: Default::default(),
+        },
+    )
+    .unwrap()
+    .id
+}
+
+/// Export steps write to S3-compatible storage and Azure Blob Storage, and a
+/// bad destination fails the step before it runs. Live servers:
+/// DATABRAIN_S3_ENDPOINT/_KEY/_SECRET/_BUCKET, DATABRAIN_AZURE_ACCOUNT/_KEY/_CONTAINER (+ _ENDPOINT).
+#[tokio::test(flavor = "multi_thread")]
+async fn export_steps_write_to_object_storage() {
+    let st = state();
+    let mut targets: Vec<(String, String)> = vec![];
+    if let (Ok(key), Ok(secret), Ok(bucket)) = (std::env::var("DATABRAIN_S3_KEY"), std::env::var("DATABRAIN_S3_SECRET"), std::env::var("DATABRAIN_S3_BUCKET")) {
+        let endpoint = std::env::var("DATABRAIN_S3_ENDPOINT").unwrap_or_default();
+        let kind = if endpoint.is_empty() { "s3" } else { "s3_compatible" };
+        let id = storage_conn(&st, "S3", AuthMethod::Password { user: key }, &[("storage", kind), ("storage_endpoint", &endpoint), ("storage_region", "us-east-1")], &secret);
+        targets.push((id, format!("s3://{bucket}/job-test-{}/", std::process::id())));
+    }
+    if let (Ok(account), Ok(key), Ok(container)) = (std::env::var("DATABRAIN_AZURE_ACCOUNT"), std::env::var("DATABRAIN_AZURE_KEY"), std::env::var("DATABRAIN_AZURE_CONTAINER")) {
+        let endpoint = std::env::var("DATABRAIN_AZURE_ENDPOINT").unwrap_or_default();
+        let id = storage_conn(&st, "Azure", AuthMethod::ApiToken { user: None }, &[("storage", "azure"), ("storage_account", &account), ("storage_endpoint", &endpoint)], &key);
+        targets.push((id, format!("az://{container}/job-test-{}", std::process::id())));
+    }
+    let local = sqlite(&st, "Local", &tempfile::tempdir().unwrap().keep().join("x.db"), false);
+    let mut nodes = vec![node("a", "obj_rows", JobNodeKind::Query, None, "select 1 as id, 'x' as name union all select 2, 'y'")];
+    let mut edges = vec![];
+    for (i, (conn, folder)) in targets.iter().enumerate() {
+        let id = format!("e{i}");
+        let mut e = node(&id, &format!("obj_out_{i}"), JobNodeKind::Export, None, "");
+        e.export_connection_id = Some(conn.clone());
+        e.export_folder = Some(folder.clone());
+        e.export_file = Some("report {step}".into());
+        e.export_format = FileFormat::Parquet;
+        nodes.push(e);
+        edges.push(JobEdge { from: "a".into(), to: id });
+    }
+    // Not a storage connection, and no URL: both fail before running.
+    let mut bad = node("b1", "obj_bad_conn", JobNodeKind::Export, None, "select 1");
+    bad.export_connection_id = Some(local);
+    bad.export_folder = Some("s3://b/x/".into());
+    nodes.push(bad);
+    if let Some((conn, _)) = targets.first() {
+        let mut no_url = node("b2", "obj_no_url", JobNodeKind::Export, None, "select 1");
+        no_url.export_connection_id = Some(conn.clone());
+        no_url.export_folder = Some("/tmp".into());
+        nodes.push(no_url);
+    }
+    let job = st.workspace.save_job(Job { id: String::new(), name: "Obj".into(), nodes, edges, schedule: Default::default(), last_scheduled_at: None, created_at: 0, updated_at: 0 }).unwrap();
+    assert!(job.nodes.iter().any(|n| n.export_connection_id.is_some()), "kept on save");
+    api::run_job(&st, &job.id, None).unwrap();
+    let run = finished(&st, &job.id).await;
+    let rec = |n: &str| run.nodes.iter().find(|r| r.name == n).unwrap().summary.clone();
+    assert!(rec("obj_bad_conn").error.unwrap().contains("has no object storage"));
+    if targets.is_empty() {
+        return eprintln!("skipped the uploads: set DATABRAIN_S3_* or DATABRAIN_AZURE_*");
+    }
+    assert!(rec("obj_no_url").error.unwrap().contains("folder URL"));
+    for (i, (conn, folder)) in targets.iter().enumerate() {
+        let s = rec(&format!("obj_out_{i}"));
+        let file = s.file.unwrap_or_else(|| panic!("{:?}", s.error));
+        let want = format!("{}report obj_out_{i}.parquet", if folder.ends_with('/') { folder.clone() } else { format!("{folder}/") });
+        assert_eq!(file, want);
+        assert_eq!(rows(&st, conn, &format!("select count(*), max(name) from '{file}'")).await, vec![vec!["2".to_string(), "y".to_string()]]);
+    }
 }
 
 fn plain_job(name: &str, nodes: Vec<JobNode>) -> Job {

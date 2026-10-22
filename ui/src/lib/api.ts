@@ -16,6 +16,8 @@ import type {
   ImportAction,
   NotesImportPreview,
   ExcelSheet,
+  StorageObject,
+  StorageBucket,
   TableLayout,
   AgentEvent,
   AgentRequest,
@@ -257,6 +259,13 @@ export const api = {
   deleteNotebook: (id: string) => call<void>("delete_notebook", { id }),
   fileScanSql: (path: string, allSheets = false) => call<string>("file_scan_sql", { path, allSheets }),
   excelSheets: (path: string) => call<ExcelSheet[]>("excel_sheets", { path }),
+  /** SQL reading a file or folder in object storage, on a DuckDB connection with its storage settings. */
+  storageScanSql: (connectionId: string, url: string) => call<string>("storage_scan_sql", { connectionId, url }),
+  /** Objects under a prefix (recursive, up to `limit`). */
+  storageList: (connectionId: string, url: string, limit?: number) => call<StorageObject[]>("storage_list", { connectionId, url, limit }),
+  /** Buckets (Azure: containers) of the storage account; `config` as edited, the secret typed or saved. */
+  storageBuckets: (config: ConnectionConfig, secret: string | null, connectionId: string | null) =>
+    call<StorageBucket[]>("storage_buckets", { config, secret, connectionId }),
 
   listOutputs: () => call<OutputInfo[]>("list_outputs"),
   getOutput: (reference: string) => call<OutputInfo>("get_output", { reference }),

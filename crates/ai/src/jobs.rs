@@ -53,7 +53,8 @@ pub fn create_job_schema() -> Value {
                         "before_sql": {"type": "string", "description": "load: SQL run on the target before writing (e.g. delete a day's rows)"},
                         "after_sql": {"type": "string", "description": "load: SQL run on the target after writing"},
                         "format": {"type": "string", "enum": ["csv", "parquet", "json"], "description": "export: file format (default csv)"},
-                        "folder": {"type": "string", "description": "export: folder (default Downloads)"},
+                        "folder": {"type": "string", "description": "export: local folder (default Downloads), or with storage_connection an object storage folder URL (s3://bucket/reports/, gs://…, r2://…, az://container/…)"},
+                        "storage_connection": {"type": "string", "description": "export to object storage: the DuckDB connection with the storage settings (list_connections); folder is then a URL"},
                         "file": {"type": "string", "description": "export: file name; {step} {job} {date} {time} are filled in"}
                     },
                     "required": ["name"]
@@ -272,6 +273,19 @@ pub fn build_job(args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Re
                     _ => "csv",
                 };
                 node["export_format"] = json!(fmt);
+                if let Some(sc) = s(st, "storage_connection") {
+                    let c = resolve_conn(conns, sc)?;
+                    if c.kind != ConnectorKind::Duckdb || c.results {
+                        return Err(AiError::Policy(format!("export step \"{n}\": \"{}\" is not a DuckDB connection with object storage", c.name)));
+                    }
+                    if c.read_only {
+                        return Err(AiError::Policy(format!("\"{}\" is read-only; an export step can't write through it", c.name)));
+                    }
+                    if !s(st, "folder").is_some_and(|f| f.contains("://")) {
+                        return Err(AiError::Policy(format!("export step \"{n}\" writes to object storage: folder must be a URL such as s3://bucket/reports/")));
+                    }
+                    node["export_connection_id"] = json!(c.id);
+                }
                 node["export_folder"] = json!(s(st, "folder"));
                 node["export_file"] = json!(s(st, "file"));
             }
@@ -353,10 +367,11 @@ pub fn describe(job: &Job, conns: &[ConnRef]) -> String {
                 if n.load_mode == LoadMode::Append || n.load_mode == LoadMode::Truncate { if n.create_table { ", creates a missing table" } else { "" } } else { "" },
             )),
             JobNodeKind::Export => t.push_str(&format!(
-                "- {} = save to a {} file in {}{after}\n",
+                "- {} = save to a {} file in {}{}{after}\n",
                 n.name,
                 n.export_format.extension(),
                 n.export_folder.as_deref().unwrap_or("Downloads"),
+                if n.export_connection_id.is_some() { " (object storage)" } else { "" },
             )),
         }
         if !n.sql.trim().is_empty() {
@@ -437,6 +452,9 @@ pub fn spec_of(job: &Job, conns: &[ConnRef]) -> Value {
                     v["format"] = json!(n.export_format.extension());
                     if let Some(f) = &n.export_folder {
                         v["folder"] = json!(f);
+                    }
+                    if let Some(c) = &n.export_connection_id {
+                        v["storage_connection"] = json!(cname(Some(c)));
                     }
                     if let Some(f) = &n.export_file {
                         v["file"] = json!(f);
@@ -519,6 +537,7 @@ pub fn changes(old: &Job, new: &Job) -> Vec<String> {
                     && a.load_after_sql == b.load_after_sql
                     && a.export_format == b.export_format
                     && a.export_folder == b.export_folder
+                    && a.export_connection_id == b.export_connection_id
                     && a.export_file == b.export_file
                     && deps(old, &o.id) == deps(new, &n.id);
                 if !same {

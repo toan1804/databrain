@@ -232,6 +232,19 @@ export interface ColumnInfo {
   comment?: string;
 }
 
+/** An object in object storage (`s3://bucket/key`). */
+export interface StorageObject {
+  path: string;
+  size: number | null;
+  modified: string | null;
+}
+
+/** A bucket (Azure: container) of a storage account. */
+export interface StorageBucket {
+  name: string;
+  created: string | null;
+}
+
 export interface ExcelSheet {
   name: string;
   /** Used range, e.g. `A1:G120`; absent for an empty sheet. */
@@ -1011,8 +1024,10 @@ export interface JobNode {
   batch_rows?: number | null;
   /** Load: most KB of SQL text per INSERT (empty = default). */
   batch_kb?: number | null;
-  /** Export: folder (empty = Downloads). */
+  /** Export: folder (empty = Downloads), or an object storage folder URL with `export_connection_id`. */
   export_folder?: string | null;
+  /** Export to object storage: the DuckDB connection whose storage settings sign the upload. */
+  export_connection_id?: string | null;
   /** Export: file name; `{step}`, `{job}`, `{date}`, `{time}` are replaced (empty = `{step}_{date}_{time}`). */
   export_file?: string | null;
   export_format?: FileFormat;

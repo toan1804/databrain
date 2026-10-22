@@ -5,6 +5,9 @@ import { useStore } from "../store";
 import { comboMatches, placeComboList } from "../lib/util";
 import { ExportsTray } from "./ExportsTray";
 
+/** Open dialogs, newest last: Escape closes only the top one. */
+const modalStack: object[] = [];
+
 export function Modal({
   title,
   onClose,
@@ -25,8 +28,12 @@ export function Modal({
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   useEffect(() => {
+    const me = {};
+    modalStack.push(me);
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        // A dialog opened over this one closes first.
+        if (modalStack[modalStack.length - 1] !== me) return;
         // An open suggestion list (ComboInput) closes first, not the dialog.
         const t = e.target as HTMLElement | null;
         if (t?.getAttribute?.("role") === "combobox" && t.getAttribute("aria-expanded") === "true") return;
@@ -35,7 +42,10 @@ export function Modal({
       }
     };
     window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("keydown", onKey, true);
+      modalStack.splice(modalStack.indexOf(me), 1);
+    };
   }, []);
   // Focus once when opened: an autoFocus field, else the first field in the body.
   useEffect(() => {

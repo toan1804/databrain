@@ -13,7 +13,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 
-export const EXTENSIONS = ["excel", "delta", "iceberg", "avro", "httpfs", "icu"];
+// httpfs reads object storage (S3, R2, GCS, S3-compatible, HTTPS); aws adds
+// the AWS credential chain (profiles, SSO, environment, instance roles);
+// azure reads Azure Blob Storage and ADLS Gen2 (az://, abfss://).
+export const EXTENSIONS = ["excel", "delta", "iceberg", "avro", "httpfs", "aws", "azure", "icu"];
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 

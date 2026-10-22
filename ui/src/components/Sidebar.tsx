@@ -8,6 +8,7 @@ import {
   ChevronDown,
   ChevronRight,
   ClipboardCopy,
+  Cloud,
   Columns3,
   Database,
   Eye,
@@ -74,6 +75,8 @@ import { OutputsPanel } from "./OutputsPanel";
 import { useJobs } from "../jobsStore";
 import { scheduleText } from "../lib/jobGraph";
 import { askExcelSheets } from "./ExcelSheetDialog";
+import { openRemoteFile } from "./RemoteFileDialog";
+import { storageOf } from "../lib/storage";
 import { openOutput } from "../outputs";
 import { useStore, type SidebarPanel } from "../store";
 import { editorBridge } from "../editorBridge";
@@ -168,6 +171,27 @@ function SearchBox({ value, onChange, placeholder }: { value: string; onChange: 
 
 // ------------------------------------------------------------------ connections
 
+/** The DuckDB connection for local files (no database file, no object storage); created when missing. */
+export async function localFilesConnection(): Promise<ConnectionView | undefined> {
+  const st = useStore.getState();
+  const find = () => useStore.getState().connections.find((c) => c.config.kind === "duckdb" && !c.config.file_path && !c.config.options?.storage);
+  const have = find();
+  if (have) return have;
+  const saved = await api.saveConnection({
+    id: "",
+    name: "Local files (DuckDB)",
+    config: { kind: "duckdb", auth: { method: "none" }, ssl_mode: "disable", read_only: false, options: {} },
+    color: "#fbbf24",
+    env: "none",
+    has_secret: false,
+    ai_policy: DEFAULT_POLICY,
+    created_at: 0,
+    updated_at: 0,
+  }, null);
+  await st.refreshConnections();
+  return useStore.getState().connections.find((c) => c.id === saved.id);
+}
+
 /** Open a local file with DuckDB: reuse/create a "Local files" connection and run a scan query. */
 export async function queryLocalFile() {
   const st = useStore.getState();
@@ -189,22 +213,7 @@ export async function queryLocalFile() {
       }
     }
     const sql = await api.fileScanSql(picked, allSheets);
-    let conn = st.connections.find((c) => c.config.kind === "duckdb" && !c.config.file_path);
-    if (!conn) {
-      const saved = await api.saveConnection({
-        id: "",
-        name: "Local files (DuckDB)",
-        config: { kind: "duckdb", auth: { method: "none" }, ssl_mode: "disable", read_only: false, options: {} },
-        color: "#fbbf24",
-        env: "none",
-        has_secret: false,
-        ai_policy: DEFAULT_POLICY,
-        created_at: 0,
-        updated_at: 0,
-      }, null);
-      await st.refreshConnections();
-      conn = useStore.getState().connections.find((c) => c.id === saved.id);
-    }
+    const conn = await localFilesConnection();
     if (!conn) return;
     const id = useStore.getState().newTab({ title: picked.split(/[\\/]/).pop() ?? "file", sql, connection_id: conn.id });
     void useStore.getState().runTab(id, "all", { doc: sql, selFrom: 0, selTo: 0, cursor: 0 });
@@ -248,6 +257,9 @@ function ConnectionsPanel() {
         <button className="icon-btn" title="Query a local file (CSV, Parquet, JSON, Excel) with DuckDB" aria-label="Query a local file" onClick={() => void queryLocalFile()}>
           <FileSearch size={14} />
         </button>
+        <button className="icon-btn" title="Query a file in object storage (S3, R2, GCS, MinIO…)" aria-label="Query a file in object storage" onClick={() => openRemoteFile()}>
+          <Cloud size={14} />
+        </button>
         <button className="icon-btn" title="New folder" aria-label="New folder" onClick={() => void createFolder("connections")}>
           <FolderPlus size={14} />
         </button>
@@ -269,11 +281,12 @@ function ConnectionsPanel() {
         )}
       </div>
       {blankMenu && (
-        <Popover x={blankMenu.x} y={blankMenu.y} onClose={() => setBlankMenu(null)} className="w-52">
+        <Popover x={blankMenu.x} y={blankMenu.y} onClose={() => setBlankMenu(null)} className="w-64">
           <MenuItem icon={<Plus size={13} />} label="New connection…" onClick={() => (setBlankMenu(null), openDialog(null))} />
           <MenuItem icon={<FolderPlus size={13} />} label="New folder" onClick={() => (setBlankMenu(null), void createFolder("connections"))} />
           <MenuSeparator />
           <MenuItem icon={<FileSearch size={13} />} label="Query a local file…" onClick={() => (setBlankMenu(null), void queryLocalFile())} />
+          <MenuItem icon={<Cloud size={13} />} label="Query a file in object storage…" onClick={() => (setBlankMenu(null), openRemoteFile())} />
         </Popover>
       )}
     </>
@@ -496,6 +509,14 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
           )}
           <MenuItem icon={<RefreshCw size={13} />} label={conn.connected ? "Refresh" : "Connect"} onClick={() => { setMenu(null); setExpanded(true); void load(true); }} />
           <MenuItem icon={<NotebookPen size={13} />} label="New notebook" onClick={() => { setMenu(null); void useStore.getState().newNotebook(conn.id); }} />
+          {storageOf(conn) && (
+            <MenuItem
+              icon={<Cloud size={13} />}
+              label="Browse object storage…"
+              hint={storageOf(conn)?.label.split(" (")[0]}
+              onClick={() => { setMenu(null); openRemoteFile({ connectionId: conn.id }); }}
+            />
+          )}
           <MenuItem icon={<Pencil size={13} />} label="Edit connection" onClick={() => { setMenu(null); openDialog(conn); }} />
           {interactive && (
             <MenuItem icon={<LogIn size={13} />} label="Sign in again" onClick={() => { setMenu(null); void useStore.getState().signInConnection(conn.id); }} />

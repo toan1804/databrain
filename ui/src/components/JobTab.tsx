@@ -55,6 +55,8 @@ import {
   upstreamOf,
 } from "../lib/jobGraph";
 import { formatCount, formatDuration, relativeTime } from "../lib/util";
+import { isRemote, storageOf } from "../lib/storage";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { isQueryTab, useStore } from "../store";
 import { useJobs } from "../jobsStore";
 import { openOutput, resultsConnection } from "../outputs";
@@ -985,7 +987,20 @@ function NodePanel({
         <div className="flex items-center gap-1.5">
           <StatusIcon status={status?.status} />
           <span className={`min-w-0 flex-1 whitespace-pre-wrap break-words ${status?.status === "error" ? "text-danger" : "text-muted"}`}>{statusText(status)}</span>
-          {status?.status === "success" && status.file && (
+          {status?.status === "success" && status.file && isRemote(status.file) && (
+            <button
+              className="btn-ghost shrink-0 py-0.5 text-[11.5px]"
+              title={status.file}
+              onClick={() =>
+                void writeText(status.file!)
+                  .then(() => useStore.getState().toast("File URL copied", "success"))
+                  .catch((e) => useStore.getState().toast(toError(e).message, "error"))
+              }
+            >
+              <Copy size={12} /> Copy URL
+            </button>
+          )}
+          {status?.status === "success" && status.file && !isRemote(status.file) && (
             <button
               className="btn-ghost shrink-0 py-0.5 text-[11.5px]"
               title={status.file}
@@ -1571,6 +1586,8 @@ function DryRunReport({ report }: { report: LoadDryRun }) {
 /** Last part of a folder path ("Downloads" when none is set). */
 function folderName(f?: string | null): string {
   const t = f?.trim().replace(/[/\\]+$/, "");
+  // Object storage: the whole URL says where (bucket and folder).
+  if (t && isRemote(t)) return t;
   return t ? (t.split(/[/\\]/).pop() ?? t) : "Downloads";
 }
 
@@ -1584,14 +1601,96 @@ function ExportFields({ job, node, onChange }: { job: Job; node: JobNode; onChan
       .catch(() => {});
   }, []);
   const format = node.export_format ?? "csv";
+  const connections = useStore((s) => s.connections);
+  const storages = connections.filter((c) => storageOf(c));
+  const remote = !!node.export_connection_id;
+  const storageConn = connections.find((c) => c.id === node.export_connection_id);
+  const storage = storageOf(storageConn);
   const folder = node.export_folder?.trim() || downloads || "Downloads";
   const preview = exportFileName(node.export_file, node.name, job.name, format);
+  const remoteFolder = (node.export_folder ?? "").trim();
+  const remoteOk = isRemote(remoteFolder) && !/^https?:/i.test(remoteFolder);
   const choose = async () => {
     const picked = await openDialog({ directory: true, multiple: false, defaultPath: node.export_folder?.trim() || downloads || undefined, title: "Folder to save the file in" }).catch(() => null);
     if (typeof picked === "string") onChange({ export_folder: picked });
   };
+  const setRemote = (on: boolean) => {
+    if (on === remote) return;
+    if (on) {
+      const c = storages[0];
+      onChange({ export_connection_id: c?.id ?? "", export_folder: storageOf(c)?.root ?? null });
+    } else onChange({ export_connection_id: null, export_folder: null });
+  };
   return (
     <div className="space-y-2 rounded-md border border-line p-2">
+      <div className="flex gap-1" role="radiogroup" aria-label="Where to save the file">
+        {[
+          { on: false, text: "Local folder" },
+          { on: true, text: "Object storage" },
+        ].map((o) => (
+          <button
+            key={o.text}
+            role="radio"
+            aria-checked={remote === o.on}
+            className={`rounded-md border px-2 py-0.5 text-[11.5px] ${remote === o.on ? "border-accent bg-accent/10" : "border-line hover:bg-hover"}`}
+            onClick={() => setRemote(o.on)}
+          >
+            {o.text}
+          </button>
+        ))}
+      </div>
+      {remote ? (
+        <div className="space-y-2">
+          <div>
+            <label className={label} htmlFor={`sc-${node.id}`}>
+              Storage connection
+            </label>
+            <div className="flex gap-1">
+              <select
+                id={`sc-${node.id}`}
+                className={`${field} min-w-0 flex-1`}
+                value={node.export_connection_id ?? ""}
+                onChange={(e) => {
+                  const c = connections.find((x) => x.id === e.target.value);
+                  const root = storageOf(c)?.root;
+                  // A folder of another storage can't be kept (other scheme / bucket).
+                  onChange({ export_connection_id: e.target.value, export_folder: root ?? (isRemote(remoteFolder) ? remoteFolder : null) });
+                }}
+              >
+                <option value="">Choose…</option>
+                {storages.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name} · {storageOf(c)?.label.split(" (")[0]}
+                  </option>
+                ))}
+              </select>
+              <button
+                className="btn-ghost shrink-0 py-1"
+                title="Add a DuckDB connection with object storage"
+                onClick={() => useStore.getState().openConnectionDialog(null, null, { kind: "duckdb", section: "storage", options: { storage: "s3" } })}
+              >
+                <Plus size={12} /> New…
+              </button>
+            </div>
+            {storages.length === 0 && <div className="mt-1 text-[11px] text-muted">No connection has object storage yet: add one (a DuckDB connection with S3, R2, GCS, Azure or MinIO set up).</div>}
+            {storageConn?.config.read_only && <div className="mt-1 text-[11px] text-danger">This connection is read-only: it can&apos;t write files.</div>}
+          </div>
+          <div>
+            <label className={label} htmlFor={`sf-${node.id}`}>
+              Folder URL
+            </label>
+            <input
+              id={`sf-${node.id}`}
+              className={`${field} font-mono ${remoteFolder && !remoteOk ? "border-danger" : ""}`}
+              placeholder={`${storage?.scheme ?? "s3"}://${storage?.provider === "azure" ? "container" : "bucket"}/reports/`}
+              spellCheck={false}
+              value={node.export_folder ?? ""}
+              onChange={(e) => onChange({ export_folder: e.target.value || null })}
+            />
+            {remoteFolder && !remoteOk && <div className="mt-1 text-[11px] text-danger">Use the storage&apos;s URL, e.g. {storage?.scheme ?? "s3"}://bucket/folder/</div>}
+          </div>
+        </div>
+      ) : (
       <div>
         <label className={label}>Folder</label>
         <div className="flex gap-1">
@@ -1608,6 +1707,7 @@ function ExportFields({ job, node, onChange }: { job: Job; node: JobNode; onChan
           )}
         </div>
       </div>
+      )}
       <div className="grid grid-cols-[1fr_auto] gap-2">
         <div className="min-w-0">
           <label className={label} htmlFor={`file-${node.id}`}>
@@ -1633,7 +1733,7 @@ function ExportFields({ job, node, onChange }: { job: Job; node: JobNode; onChan
         </div>
       </div>
       <div className="text-[11px] text-muted">
-        Next run writes <span className="font-mono text-fg">{preview}</span>
+        Next run writes <span className="font-mono text-fg">{remote && remoteOk ? `${remoteFolder.replace(/\/*$/, "/")}${preview}` : preview}</span>
         {node.export_file?.trim() && !/\{(date|time)\}/.test(node.export_file) ? " (replaced on each run)" : ""}. In the name, {"{step}"}, {"{job}"}, {"{date}"} and {"{time}"} are filled in; leave it empty for a new name per run.
       </div>
     </div>

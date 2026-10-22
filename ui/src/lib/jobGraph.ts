@@ -89,6 +89,7 @@ export function newNode(job: Job, init: Partial<JobNode> & { x: number; y: numbe
     target_table: null,
     load_mode: "append",
     export_folder: null,
+    export_connection_id: null,
     export_file: null,
     export_format: "csv",
     last_run: null,
@@ -223,6 +224,7 @@ export function stepsFromCells(cells: CellSource[], names: string[], defaultConn
       y: 60 + nodes.length * (NODE_H + GAP_Y),
       load_mode: "append",
       export_folder: null,
+      export_connection_id: null,
       export_file: null,
       export_format: "csv",
       last_run: null,
@@ -265,7 +267,7 @@ export function actionSettings(node: JobNode): string[] {
     if (node.load_before_sql?.trim() || node.load_after_sql?.trim()) out.push("the before/after SQL");
     if (node.key_columns?.length) out.push("the key columns");
   } else {
-    if (node.export_folder?.trim() || node.export_file?.trim()) out.push("the folder and file name");
+    if (node.export_folder?.trim() || node.export_file?.trim() || node.export_connection_id) out.push("the folder and file name");
   }
   return out;
 }
@@ -289,6 +291,7 @@ export function changeAction(node: JobNode, kind: JobNodeKind, upstreams: string
     batch_rows: null,
     batch_kb: null,
     export_folder: null,
+    export_connection_id: null,
     export_file: null,
     export_format: "csv",
   };

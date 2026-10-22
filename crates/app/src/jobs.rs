@@ -460,12 +460,72 @@ pub fn export_folder(node: &JobNode) -> Result<std::path::PathBuf> {
 
 /// DuckDB statement writing `select` to `path`.
 pub fn copy_sql(select: &str, path: &std::path::Path, format: FileFormat) -> String {
+    copy_sql_to(select, &path.to_string_lossy(), format)
+}
+
+/// DuckDB statement writing `select` to `target` (a path or a storage URL).
+pub fn copy_sql_to(select: &str, target: &str, format: FileFormat) -> String {
     let opts = match format {
         FileFormat::Csv => "FORMAT csv, HEADER true",
         FileFormat::Parquet => "FORMAT parquet, COMPRESSION zstd",
         FileFormat::Json => "FORMAT json",
     };
-    format!("COPY ({select}) TO {} ({opts})", databrain_connector_core::quote_literal(&path.to_string_lossy()))
+    format!("COPY ({select}) TO {} ({opts})", databrain_connector_core::quote_literal(target))
+}
+
+/// Where an export step writes: a local folder, or an object storage folder
+/// through a DuckDB connection with storage settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportTarget {
+    Local(std::path::PathBuf),
+    /// (connection id, folder URL ending in `/`).
+    Remote { connection_id: String, folder: String },
+}
+
+impl ExportTarget {
+    /// The file `name` in this folder.
+    pub fn file(&self, name: &str) -> String {
+        match self {
+            ExportTarget::Local(dir) => dir.join(name).to_string_lossy().into_owned(),
+            ExportTarget::Remote { folder, .. } => format!("{folder}{name}"),
+        }
+    }
+}
+
+/// Check an export step's destination before anything runs.
+pub fn export_target(ctx: &JobCtx, node: &JobNode) -> Result<ExportTarget> {
+    let Some(conn_id) = node.export_connection_id.as_deref().filter(|c| !c.is_empty()) else {
+        return export_folder(node).map(ExportTarget::Local);
+    };
+    let conn = ctx.workspace.get_connection(conn_id).map_err(|_| EngineError::new("invalid", "The storage connection of this step was deleted: choose another one"))?;
+    if conn.config.kind != databrain_connector_core::ConnectorKind::Duckdb || conn.config.opt("storage").is_none_or(|s| s.trim().is_empty()) {
+        return Err(EngineError::new("invalid", format!("\"{}\" has no object storage: set it up in the connection's Object storage section", conn.name)));
+    }
+    if conn.config.read_only {
+        return Err(EngineError::new("invalid", format!("\"{}\" is read-only: it can't write files", conn.name)));
+    }
+    let folder = node.export_folder.as_deref().map(str::trim).unwrap_or_default();
+    if !folder.contains("://") {
+        return Err(EngineError::new("invalid", format!("Enter the folder URL to write to, e.g. {}", storage_example(conn.config.opt("storage").unwrap_or("s3")))));
+    }
+    let (scheme, rest) = folder.split_once("://").unwrap_or_default();
+    if rest.trim_matches('/').is_empty() {
+        return Err(EngineError::new("invalid", "The folder URL needs a bucket (or container)"));
+    }
+    if matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return Err(EngineError::new("invalid", "Files can't be written to an http(s) URL: use the storage's own URL (s3://, gs://, r2://, az://)"));
+    }
+    let folder = if folder.ends_with('/') { folder.to_string() } else { format!("{folder}/") };
+    Ok(ExportTarget::Remote { connection_id: conn.id, folder })
+}
+
+fn storage_example(storage: &str) -> &'static str {
+    match storage {
+        "gcs" => "gs://my-bucket/reports/",
+        "r2" => "r2://my-bucket/reports/",
+        "azure" => "az://my-container/reports/",
+        _ => "s3://my-bucket/reports/",
+    }
 }
 
 /// One SQL run on a run key (no prompt); fails with the first error. Each
@@ -543,7 +603,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
         return Err(EngineError::new("invalid", "This step has no SQL"));
     }
     // Checked before the query runs, so a missing folder fails fast.
-    let folder = if node.kind == JobNodeKind::Export { Some(export_folder(node)?) } else { None };
+    let folder = if node.kind == JobNodeKind::Export { Some(export_target(ctx, node)?) } else { None };
     let duck_id = connection_id.clone();
     let outcomes = run_sql(ctx, connection_id, tab.clone(), sql, Some(node.name.clone()), cancel, t).await?;
     let last = outcomes.last();
@@ -561,12 +621,18 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
         .ok_or_else(|| EngineError::new("invalid", "The SQL returned no rows (it must end with a SELECT)"))?;
     if let Some(folder) = folder {
         let name = databrain_workspace::jobs::export_file_name(node.export_file.as_deref(), &node.name, job_name, node.export_format, now_ms());
-        let path = folder.join(name);
+        let file = folder.file(&name);
         // By handle: exactly this run's rows, even if another step has the same name.
         let select = format!("select * from results.{}", output.handle);
-        t.log("info", format!("Writing {} rows to {}", output.rows, path.display()), None, None, None);
-        run_sql(ctx, duck_id, format!("{tab}:export"), copy_sql(&select, &path, node.export_format), None, cancel, t).await?;
-        return Ok(NodeOut { rows: output.rows as i64, file: Some(path.to_string_lossy().into_owned()), notices: vec![] });
+        // Object storage: the storage connection's session (its secret signs
+        // the upload) reads the output as results.<handle> too.
+        let on = match &folder {
+            ExportTarget::Local(_) => duck_id,
+            ExportTarget::Remote { connection_id, .. } => connection_id.clone(),
+        };
+        t.log("info", format!("Writing {} rows to {file}", output.rows), None, None, None);
+        run_sql(ctx, on, format!("{tab}:export"), copy_sql_to(&select, &file, node.export_format), None, cancel, t).await?;
+        return Ok(NodeOut { rows: output.rows as i64, file: Some(file), notices: vec![] });
     }
     let target = node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;
     let report = ctx.engine.write_output(&output.handle, target, &format!("{tab}:load"), &load_spec(node), cancel, t).await?;

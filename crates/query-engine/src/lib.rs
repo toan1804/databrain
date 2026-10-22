@@ -346,6 +346,8 @@ const META_TAB: &str = "__meta__";
 /// AI indexing's own session (server databases): long catalog reads never
 /// make the explorer or completion wait, and cancelling can close it.
 const INDEX_TAB: &str = "__index__";
+/// Object storage listings and probes (DuckDB connections).
+const STORAGE_TAB: &str = "__storage__";
 /// Connection option marking the "Results (DuckDB)" connection.
 pub const RESULTS_MARKER: &str = "databrain_results";
 
@@ -814,6 +816,25 @@ impl QueryEngine {
             async move { s.list_catalog_schemas(&catalog).await }
         })
         .await
+    }
+
+    /// Run a helper query (file listing, format probe) on the connection's
+    /// own `storage` session, so it never waits behind explorer requests or
+    /// a tab's query. Gives up after 60 s.
+    pub async fn helper_query(&self, connection_id: &str, sql: &str) -> Result<databrain_connector_core::Collected> {
+        let sql = sql.to_string();
+        match tokio::time::timeout(
+            Duration::from_secs(60),
+            self.with_tab(connection_id, STORAGE_TAB, |s| {
+                let sql = sql.clone();
+                async move { s.execute(&sql, databrain_connector_core::ExecOptions::default()).await?.collect().await }
+            }),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(EngineError::new("timeout", "The storage took more than 60 s to answer")),
+        }
     }
 
     /// [`Session::check_sql`] on the metadata session, at most 10 s.

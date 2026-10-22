@@ -8,12 +8,14 @@
 //!
 //! "Attached files" (`files` option, one path per line) are exposed as views
 //! in the `files` schema, so they show up in the explorer and in AI knowledge.
+//! Paths may be object storage URLs (`s3://`, `r2://`, `gs://`, `https://`);
+//! the connection's object storage settings ([`storage`]) sign the requests.
 
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use databrain_auth::{AuthMethodKind, CredentialSource};
+use databrain_auth::{AuthMethod, AuthMethodKind, Credential, CredentialSource, ExposeSecret};
 use databrain_connector_core::arrow::ipc::reader::StreamReader;
 use databrain_connector_core::external::{ExternalTablesSlot, RESULTS_SCHEMA, referenced_results};
 use databrain_connector_core::{
@@ -50,6 +52,9 @@ pub enum FileFormat {
 }
 
 pub fn detect_format(path: &str) -> Option<FileFormat> {
+    if is_remote(path) {
+        return detect_ext(path);
+    }
     let p = std::path::Path::new(path.trim_end_matches(['/', '\\']));
     if p.is_dir() {
         if p.join("_delta_log").is_dir() {
@@ -61,7 +66,12 @@ pub fn detect_format(path: &str) -> Option<FileFormat> {
         // A directory of parquet files.
         return Some(FileFormat::Parquet);
     }
-    let lower = path.to_ascii_lowercase();
+    detect_ext(path)
+}
+
+/// Format from the file extension only (also for URLs and globs).
+pub fn detect_ext(path: &str) -> Option<FileFormat> {
+    let lower = path.split(['?', '#']).next().unwrap_or(path).to_ascii_lowercase();
     let lower = lower.trim_end_matches(".gz").trim_end_matches(".zst");
     let ext = lower.rsplit('.').next()?;
     Some(match ext {
@@ -92,6 +102,87 @@ pub fn scan_expr(path: &str, format: FileFormat) -> String {
 }
 
 pub mod xlsx;
+pub mod storage;
+
+use storage::{StorageConfig, is_remote};
+
+/// How a remote path is read: its format and the SQL that reads it. Folders
+/// (`s3://b/table/`) are recognised as Delta (`_delta_log/`), Iceberg
+/// (`metadata/`) or a set of files of one type (Hive partitions included).
+/// Needs a session with the storage secret, as it lists the folder.
+pub fn remote_source(conn: &duckdb::Connection, url: &str) -> Result<(FileFormat, String)> {
+    if let Some(r) = remote_by_name(url) {
+        return Ok(r);
+    }
+    let sql = remote_probe_sql(url);
+    let probe = conn
+        .query_row(&sql, [], |r| Ok((r.get::<_, i64>(0)? > 0, r.get::<_, i64>(1)? > 0, r.get::<_, Option<String>>(2)?)))
+        .map_err(map_err)?;
+    remote_decide(url, probe)
+}
+
+/// A URL whose name says its format (`x.parquet`, `data/*.csv`), else `None`.
+pub fn remote_by_name(url: &str) -> Option<(FileFormat, String)> {
+    let u = url.trim();
+    let base = u.trim_end_matches('/');
+    let last = base.rsplit('/').next().unwrap_or(base);
+    let globbed = u.contains(['*', '?', '[']);
+    if u.ends_with('/') || !(globbed || last.contains('.')) {
+        return None;
+    }
+    let fmt = detect_ext(u)?;
+    let lit = quote_literal(u);
+    Some((
+        fmt,
+        match fmt {
+            FileFormat::Parquet if globbed => format!("read_parquet({lit}, hive_partitioning = true)"),
+            _ => scan_expr(u, fmt),
+        },
+    ))
+}
+
+/// One row: has `_delta_log/*.json`, has `metadata/*.json`, first file below.
+pub fn remote_probe_sql(url: &str) -> String {
+    let base = url.trim().trim_end_matches('/');
+    let g = |p: String| quote_literal(&p);
+    format!(
+        "SELECT (SELECT count(*) FROM (SELECT 1 FROM glob({}) LIMIT 1)), (SELECT count(*) FROM (SELECT 1 FROM glob({}) LIMIT 1)), (SELECT min(file) FROM (SELECT file FROM glob({}) LIMIT 1))",
+        g(format!("{base}/_delta_log/*.json")),
+        g(format!("{base}/metadata/*.json")),
+        g(format!("{base}/**")),
+    )
+}
+
+/// Format and source of a remote folder from [`remote_probe_sql`]'s row.
+pub fn remote_decide(url: &str, (delta, iceberg, first): (bool, bool, Option<String>)) -> Result<(FileFormat, String)> {
+    let u = url.trim();
+    let base = u.trim_end_matches('/');
+    if delta {
+        return Ok((FileFormat::Delta, scan_expr(base, FileFormat::Delta)));
+    }
+    if iceberg {
+        return Ok((FileFormat::Iceberg, scan_expr(base, FileFormat::Iceberg)));
+    }
+    let Some(file) = first else {
+        return Err(ConnectorError::new(ErrorKind::Config, format!("nothing found at {u} (check the bucket, the path and the access rights)")));
+    };
+    // A single object named without an extension it can be read by.
+    if file.trim_end_matches('/') == base {
+        return Err(ConnectorError::new(ErrorKind::Config, format!("{u}: unknown file type (use .csv, .parquet, .json or a folder)")));
+    }
+    let fmt = detect_ext(&file).ok_or_else(|| ConnectorError::new(ErrorKind::Config, format!("{u}: no CSV, Parquet or JSON files found (first file: {file})")))?;
+    let ext = file.rsplit('.').next().unwrap_or("parquet");
+    let pattern = quote_literal(&format!("{base}/**/*.{ext}"));
+    Ok((
+        fmt,
+        match fmt {
+            FileFormat::Parquet => format!("read_parquet({pattern}, hive_partitioning = true)"),
+            FileFormat::Csv => format!("read_csv({pattern}, hive_partitioning = true, union_by_name = true)"),
+            FileFormat::Json => format!("read_json_auto({pattern}, hive_partitioning = true)"),
+            _ => scan_expr(&file, fmt),
+        },
+    ))
+}
 
 /// Like [`scan_expr`], but Excel files are read with [`excel_scan`] (first
 /// sheet). Opens a private in-memory DuckDB for the checks.
@@ -384,7 +475,12 @@ pub fn view_name(path: &str, taken: &[String]) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".into());
-    let stem = stem.split('.').next().unwrap_or(&stem).to_string();
+    let mut stem = stem.split('.').next().unwrap_or(&stem).to_string();
+    // `s3://b/sales/*.parquet`: named after the folder, not the glob.
+    if stem.contains(['*', '?', '[']) {
+        let parent = path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).nth(1).unwrap_or("");
+        stem = parent.split('.').next().unwrap_or(parent).to_string();
+    }
     let mut base: String = stem.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
     if base.is_empty() || base.starts_with(|c: char| c.is_ascii_digit()) {
         base = format!("f_{base}");
@@ -416,26 +512,63 @@ impl Connector for DuckdbConnector {
         ConnectorInfo {
             kind: ConnectorKind::Duckdb,
             traits: ConnectorKind::Duckdb.traits(),
-            display_name: "DuckDB (local files)",
+            display_name: "DuckDB (files & object storage)",
             default_port: None,
             uses_file: true,
-            auth_methods: vec![AuthMethodKind::None],
+            // Password = S3 access key id + secret access key; API token =
+            // an Azure account key, SAS token, connection string or client secret.
+            auth_methods: vec![AuthMethodKind::None, AuthMethodKind::Password, AuthMethodKind::ApiToken],
             capabilities: Capabilities { transactions: true, cancel: true, schemas: true, read_only_sessions: true, ssh: false },
             fields: vec![
                 FieldSpec::new("file_path", "Database file").placeholder(":memory: (or /path/to/db.duckdb)"),
-                FieldSpec::new("files", "Attached files").placeholder("One path per line: .csv .parquet .json .xlsx, Delta/Iceberg folders")
+                FieldSpec::new("files", "Attached files").placeholder("One path or URL per line: .csv .parquet .json .xlsx, Delta/Iceberg folders, s3://bucket/data/*.parquet")
                     .help("Each file becomes a view in the `files` schema"),
                 // "first" (default) or "all": one view per sheet, <file>_<sheet>.
                 FieldSpec::new("excel_sheets", "Excel sheets").placeholder("first"),
+                // Object storage (empty = none): s3, r2, gcs, s3_compatible.
+                FieldSpec::new("storage", "Object storage"),
+                // keys (default), chain (AWS credential chain), anonymous.
+                FieldSpec::new("storage_auth", "Storage sign-in"),
+                FieldSpec::new("storage_profile", "AWS profile"),
+                FieldSpec::new("storage_region", "Region"),
+                FieldSpec::new("storage_endpoint", "Endpoint"),
+                FieldSpec::new("storage_account_id", "Cloudflare account ID"),
+                FieldSpec::new("storage_url_style", "URL style"),
+                FieldSpec::new("storage_use_ssl", "Use TLS"),
+                FieldSpec::new("storage_bucket", "Bucket"),
+                FieldSpec::new("storage_account", "Azure storage account"),
+                FieldSpec::new("storage_tenant", "Azure tenant"),
+                FieldSpec::new("storage_client_id", "Azure client id"),
             ],
-            note: Some("Query any file directly, e.g. SELECT * FROM 'data/*.parquet'. Excel, Delta and Iceberg support is included."),
+            note: Some("Query any file directly, e.g. SELECT * FROM 'data/*.parquet' or 's3://bucket/data/*.parquet' (set up the bucket under Object storage). Excel, Delta and Iceberg support is included."),
         }
     }
 
-    async fn connect(&self, cfg: &ConnectionConfig, _creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>> {
+    fn validate(&self, cfg: &ConnectionConfig) -> std::result::Result<(), String> {
+        StorageConfig::from_config(cfg).map(|_| ()).map_err(|e| e.message)
+    }
+
+    async fn connect(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>> {
         engine()?;
         let path = cfg.file_path.clone().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| ":memory:".into());
         let files = files_of(cfg);
+        // Object storage: a TEMPORARY secret per session (kept in memory only).
+        let storage = StorageConfig::from_config(cfg)?;
+        let mut secret_sql = Vec::new();
+        let mut redact = Vec::new();
+        if let Some(st) = &storage {
+            let keys = if st.auth.uses_secret() { storage_secret(cfg, creds.as_ref()).await? } else { None };
+            if let Some((_, s)) = &keys {
+                redact.push(s.clone());
+            }
+            secret_sql = st.secret_sql(keys.as_ref().map(|(u, s)| (u.as_str(), s.as_str())))?;
+        }
+        let exts: Vec<&'static str> = match &storage {
+            Some(st) => st.extensions().to_vec(),
+            None if files.iter().any(|f| is_remote(f)) => vec!["httpfs"],
+            None => vec![],
+        };
+        let storage_root = storage.as_ref().and_then(|s| s.root_url());
         let all_sheets = cfg.opt("excel_sheets") == Some("all");
         let read_only = cfg.read_only && path != ":memory:";
         let conn = tokio::task::spawn_blocking(move || -> Result<duckdb::Connection> {
@@ -454,6 +587,20 @@ impl Connector for DuckdbConnector {
                 let _ = conn.execute_batch(&format!("SET extension_directory = {}", quote_literal(&dir)));
             }
             let _ = conn.execute_batch("SET autoinstall_known_extensions = true; SET autoload_known_extensions = true;");
+            for ext in &exts {
+                load_extension(&conn, ext);
+            }
+            for sql in &secret_sql {
+                conn.execute_batch(sql).map_err(|e| {
+                    // Never echo the secret back, whatever DuckDB's message says.
+                    let mut msg = e.to_string();
+                    for r in &redact {
+                        msg = msg.replace(r.as_str(), "•••");
+                    }
+                    ConnectorError::new(ErrorKind::Config, format!("object storage: {msg}"))
+                })?;
+            }
+            drop(secret_sql);
             attach_files(&conn, &files, all_sheets)?;
             Ok(conn)
         })
@@ -464,8 +611,21 @@ impl Connector for DuckdbConnector {
             conn: Arc::new(Mutex::new(conn)),
             outputs: self.outputs.clone(),
             loaded: Arc::default(),
+            storage_root,
         }))
     }
+}
+
+/// The object storage secret of a connection: (S3 access key id or "", secret).
+pub async fn storage_secret(cfg: &ConnectionConfig, creds: &dyn CredentialSource) -> Result<Option<(String, String)>> {
+    if matches!(cfg.auth, AuthMethod::None) {
+        return Ok(None);
+    }
+    Ok(match creds.get().await? {
+        Credential::Password { user, password } => Some((user, password.expose_secret().to_string())),
+        Credential::Bearer { token, user } => Some((user.unwrap_or_default(), token.expose_secret().to_string())),
+        _ => None,
+    })
 }
 
 /// Create `files.<name>` views over attached files. Unreadable files are
@@ -477,6 +637,20 @@ fn attach_files(conn: &duckdb::Connection, files: &[String], all_sheets: bool) -
     conn.execute_batch("CREATE SCHEMA IF NOT EXISTS files").map_err(map_err)?;
     let mut taken = Vec::new();
     for f in files {
+        if is_remote(f) {
+            let (fmt, src) = remote_source(conn, f).map_err(|e| ConnectorError::new(ErrorKind::Config, format!("cannot read {f}: {}", e.message)))?;
+            if let Some(ext) = required_extension(fmt) {
+                load_extension(conn, ext);
+            }
+            let name = view_name(f, &taken);
+            taken.push(name.clone());
+            let ident = quote_ident(ConnectorKind::Duckdb, &name);
+            if let Err(e) = conn.execute_batch(&format!("CREATE OR REPLACE VIEW files.{ident} AS SELECT * FROM {src}")) {
+                return Err(ConnectorError::new(ErrorKind::Config, format!("cannot read {f}: {e}")));
+            }
+            let _ = conn.execute_batch(&format!("COMMENT ON VIEW files.{ident} IS {}", quote_literal(&format!("File: {f}"))));
+            continue;
+        }
         let Some(fmt) = detect_format(f) else { continue };
         if let Some(ext) = required_extension(fmt) {
             load_extension(conn, ext);
@@ -517,6 +691,8 @@ pub struct DuckSession {
     outputs: Option<Arc<ExternalTablesSlot>>,
     /// Output tables loaded in this session: lowercase name → version key.
     loaded: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Object storage bucket to check on connect (`s3://bucket/prefix/`).
+    storage_root: Option<String>,
 }
 
 type Loaded = Mutex<std::collections::HashMap<String, String>>;
@@ -801,7 +977,15 @@ impl Session for DuckSession {
 
     async fn server_version(&self) -> Result<String> {
         let r = self.strings("select version()".into(), vec![]).await?;
-        Ok(format!("DuckDB {}", r.first().and_then(|r| r[0].clone()).unwrap_or_default()))
+        let version = format!("DuckDB {}", r.first().and_then(|r| r[0].clone()).unwrap_or_default());
+        // With a bucket set, check that it can be listed (Test shows the error).
+        let Some(root) = &self.storage_root else { return Ok(version) };
+        let sql = format!("SELECT count(*) FROM (SELECT file FROM glob({}) LIMIT 1)", quote_literal(&format!("{root}**")));
+        match self.strings(sql, vec![]).await {
+            Ok(r) if r.first().and_then(|r| r[0].as_deref()) == Some("0") => Ok(format!("{version} · {root} is empty or not listable")),
+            Ok(_) => Ok(format!("{version} · {root} reachable")),
+            Err(e) => Err(ConnectorError::new(ErrorKind::Config, format!("object storage: cannot list {root}: {}", e.message))),
+        }
     }
 
     async fn ping(&self) -> Result<()> {
@@ -1282,6 +1466,125 @@ mod tests {
         assert!(e.message.contains("not available"), "{}", e.message);
     }
 
+    /// Live S3-compatible storage (MinIO, SeaweedFS, AWS…): `DATABRAIN_S3_ENDPOINT`
+    /// (empty for AWS), `DATABRAIN_S3_KEY`, `DATABRAIN_S3_SECRET`,
+    /// `DATABRAIN_S3_BUCKET` (must exist and be writable), optional `DATABRAIN_S3_REGION`.
+    #[tokio::test]
+    async fn object_storage_live() {
+        let (Ok(key), Ok(secret), Ok(bucket)) = (std::env::var("DATABRAIN_S3_KEY"), std::env::var("DATABRAIN_S3_SECRET"), std::env::var("DATABRAIN_S3_BUCKET")) else {
+            eprintln!("skipped: set DATABRAIN_S3_KEY, DATABRAIN_S3_SECRET, DATABRAIN_S3_BUCKET");
+            return;
+        };
+        let endpoint = std::env::var("DATABRAIN_S3_ENDPOINT").unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::Password { user: key.clone() });
+        let opts: [(&str, String); 4] = [
+            ("storage", if endpoint.is_empty() { "s3".into() } else { "s3_compatible".into() }),
+            ("storage_endpoint", endpoint.clone()),
+            ("storage_region", std::env::var("DATABRAIN_S3_REGION").unwrap_or_else(|_| "us-east-1".into())),
+            ("storage_bucket", bucket.clone()),
+        ];
+        for (k, v) in opts {
+            if !v.is_empty() {
+                cfg.options.insert(k.into(), v);
+            }
+        }
+        let creds = || Arc::new(InlineCredentialSource::new(cfg.auth.clone(), Some(databrain_auth::SecretString::from(secret.clone()))));
+        let s = DuckdbConnector::new().connect(&cfg, creds()).await.unwrap();
+        let root = format!("s3://{bucket}/databrain-test-{}", std::process::id());
+        // Write a file, a Hive-partitioned folder and a CSV, then read them back.
+        q(&*s, &format!("COPY (SELECT range AS id, range % 3 AS grp FROM range(10)) TO '{root}/one.parquet'")).await;
+        q(&*s, &format!("COPY (SELECT range AS id, range % 2 AS part FROM range(6)) TO '{root}/parts' (FORMAT parquet, PARTITION_BY (part))")).await;
+        q(&*s, &format!("COPY (SELECT 'a,b' AS name, 1 AS n) TO '{root}/x.csv' (HEADER)")).await;
+        let n = |r: &databrain_connector_core::Collected| r.batches[0].column(0).as_primitive::<Int64Type>().value(0);
+        assert_eq!(n(&q(&*s, &format!("SELECT count(*) FROM '{root}/one.parquet'")).await), 10);
+        assert!(s.server_version().await.unwrap().contains("reachable"));
+        // The secret is temporary and redacted for queries (the AI can run SQL too).
+        let r = q(&*s, "SELECT persistent::VARCHAR || ' ' || secret_string FROM duckdb_secrets() WHERE name = 'databrain_storage'").await;
+        let shown = r.batches[0].column(0).as_string_view_opt().map(|a| a.value(0).to_string()).unwrap_or_else(|| r.batches[0].column(0).as_string::<i32>().value(0).to_string());
+        assert!(shown.starts_with("false ") && !shown.contains(&secret), "{shown}");
+
+        // The folder is recognised as Parquet with partitions, through `files`.
+        let mut with_files = cfg.clone();
+        with_files.options.insert("files".into(), format!("{root}/parts/\n{root}/x.csv\n{root}/*.parquet"));
+        let s2 = DuckdbConnector::new().connect(&with_files, creds()).await.unwrap();
+        assert_eq!(n(&q(&*s2, "SELECT count(*) FROM files.parts WHERE part = 1").await), 3);
+        assert_eq!(n(&q(&*s2, "SELECT n::BIGINT FROM files.x").await), 1);
+        assert_eq!(n(&q(&*s2, &format!("SELECT count(*) FROM files.{}", view_name(&format!("{root}/*.parquet"), &[]))).await), 10);
+
+        // The account's buckets (signed ListBuckets request).
+        let st = storage::StorageConfig::from_config(&cfg).unwrap().unwrap();
+        let buckets = storage::buckets::list_buckets(&st, Some((&key, &secret))).await.unwrap();
+        assert!(buckets.iter().any(|b| b.name == bucket), "{buckets:?}");
+        assert!(storage::buckets::list_buckets(&st, Some((&key, "wrong"))).await.is_err());
+
+        // Listing, for the browser.
+        let r = q(&*s, &storage::list_sql(&format!("{root}/"), 100)).await;
+        let total: usize = r.batches.iter().map(|b| b.num_rows()).sum();
+        assert!(total >= 4, "one.parquet, x.csv and the partition files");
+
+        // Wrong secret: a clear storage error, never the secret itself.
+        let bad = DuckdbConnector::new()
+            .connect(&cfg, Arc::new(InlineCredentialSource::new(cfg.auth.clone(), Some(databrain_auth::SecretString::from("wrong-secret-xyz".to_string())))))
+            .await
+            .unwrap();
+        let e = bad.server_version().await.unwrap_err();
+        assert!(e.message.contains("object storage") && !e.message.contains("wrong-secret-xyz"), "{}", e.message);
+    }
+
+    /// Live Azure Blob Storage (or Azurite): `DATABRAIN_AZURE_ACCOUNT`,
+    /// `DATABRAIN_AZURE_KEY`, `DATABRAIN_AZURE_CONTAINER` (must exist),
+    /// optional `DATABRAIN_AZURE_ENDPOINT` (`http://127.0.0.1:10000/devstoreaccount1`).
+    #[tokio::test]
+    async fn azure_storage_live() {
+        let (Ok(account), Ok(key), Ok(container)) = (std::env::var("DATABRAIN_AZURE_ACCOUNT"), std::env::var("DATABRAIN_AZURE_KEY"), std::env::var("DATABRAIN_AZURE_CONTAINER")) else {
+            eprintln!("skipped: set DATABRAIN_AZURE_ACCOUNT, DATABRAIN_AZURE_KEY, DATABRAIN_AZURE_CONTAINER");
+            return;
+        };
+        let endpoint = std::env::var("DATABRAIN_AZURE_ENDPOINT").unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::ApiToken { user: None });
+        cfg.options.insert("storage".into(), "azure".into());
+        cfg.options.insert("storage_account".into(), account.clone());
+        cfg.options.insert("storage_bucket".into(), container.clone());
+        if !endpoint.is_empty() {
+            cfg.options.insert("storage_endpoint".into(), endpoint.clone());
+        }
+        let creds = |s: &str| Arc::new(InlineCredentialSource::new(AuthMethod::ApiToken { user: None }, Some(databrain_auth::SecretString::from(s.to_string()))));
+        let s = DuckdbConnector::new().connect(&cfg, creds(&key)).await.unwrap();
+        let root = format!("az://{container}/databrain-test-{}", std::process::id());
+        q(&*s, &format!("COPY (SELECT range AS id FROM range(7)) TO '{root}/seven.parquet'")).await;
+        q(&*s, &format!("COPY (SELECT range AS id, range % 2 AS part FROM range(6)) TO '{root}/parts' (FORMAT parquet, PARTITION_BY (part))")).await;
+        let n = |r: &databrain_connector_core::Collected| r.batches[0].column(0).as_primitive::<Int64Type>().value(0);
+        assert_eq!(n(&q(&*s, &format!("SELECT count(*) FROM '{root}/seven.parquet'")).await), 7);
+        assert!(s.server_version().await.unwrap().contains("reachable"));
+        let mut with_files = cfg.clone();
+        with_files.options.insert("files".into(), format!("{root}/parts/"));
+        let s2 = DuckdbConnector::new().connect(&with_files, creds(&key)).await.unwrap();
+        assert_eq!(n(&q(&*s2, "SELECT count(*) FROM files.parts WHERE part = 0").await), 3);
+        let listed: usize = q(&*s, &storage::list_sql(&format!("{root}/"), 100)).await.batches.iter().map(|b| b.num_rows()).sum();
+        assert!(listed >= 3);
+
+        // Containers of the account (Shared Key), and the same through a connection string.
+        let st = storage::StorageConfig::from_config(&cfg).unwrap().unwrap();
+        let containers = storage::buckets::list_buckets(&st, Some(("", &key))).await.unwrap();
+        assert!(containers.iter().any(|c| c.name == container), "{containers:?}");
+        let blob = st.azure_blob_endpoint(None).unwrap();
+        let cs = format!("DefaultEndpointsProtocol={};AccountName={account};AccountKey={key};BlobEndpoint={blob};", if blob.starts_with("http:") { "http" } else { "https" });
+        let mut by_cs = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::ApiToken { user: None });
+        by_cs.options.insert("storage".into(), "azure".into());
+        by_cs.options.insert("storage_auth".into(), "connection_string".into());
+        let st2 = storage::StorageConfig::from_config(&by_cs).unwrap().unwrap();
+        assert!(storage::buckets::list_buckets(&st2, Some(("", &cs))).await.unwrap().iter().any(|c| c.name == container));
+        let s3 = DuckdbConnector::new().connect(&by_cs, creds(&cs)).await.unwrap();
+        assert_eq!(n(&q(&*s3, &format!("SELECT count(*) FROM '{root}/seven.parquet'")).await), 7);
+
+        // A wrong key: a storage error that never shows the key.
+        let wrong = "d3Jvbmcta2V5LXh5eg==";
+        assert!(storage::buckets::list_buckets(&st, Some(("", wrong))).await.is_err());
+        let bad = DuckdbConnector::new().connect(&cfg, creds(wrong)).await.unwrap();
+        let e = bad.server_version().await.unwrap_err();
+        assert!(e.message.contains("object storage") && !e.message.contains(wrong), "{}", e.message);
+    }
+
     #[tokio::test]
     async fn bad_attached_file_is_config_error() {
         let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
@@ -1314,6 +1617,38 @@ mod bundled_extensions {
             .query_row("select install_path from duckdb_extensions() where extension_name = 'excel' and loaded", [], |r| r.get(0))
             .unwrap();
         assert!(path.starts_with(&*dir.to_string_lossy()), "{path}");
+    }
+
+    /// Object storage: httpfs and aws (credential chain) load from the bundle.
+    #[test]
+    fn loads_bundled_storage_extensions_offline() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/resources/duckdb-extensions");
+        let (v, p) = version_and_platform().unwrap();
+        if !dir.join(&v).join(&p).join("aws.duckdb_extension").is_file() {
+            eprintln!("skipped: bundled extensions not fetched");
+            return;
+        }
+        let c = duckdb::Connection::open_in_memory().unwrap();
+        c.execute_batch(&format!("SET extension_directory = {}; SET autoinstall_known_extensions = false;", quote_literal(&dir.to_string_lossy()))).unwrap();
+        for ext in ["httpfs", "aws"] {
+            load_extension(&c, ext);
+            let loaded: bool = c.query_row("select loaded from duckdb_extensions() where extension_name = ?", [ext], |r| r.get(0)).unwrap();
+            assert!(loaded, "{ext}");
+        }
+        // Keys secrets don't touch the network.
+        let st = storage::StorageConfig::from_config(&{
+            let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, databrain_auth::AuthMethod::None);
+            cfg.options.insert("storage".into(), "r2".into());
+            cfg.options.insert("storage_account_id".into(), "acct".into());
+            cfg
+        })
+        .unwrap()
+        .unwrap();
+        for sql in st.secret_sql(Some(("k", "s"))).unwrap() {
+            c.execute_batch(&sql).unwrap();
+        }
+        let n: i64 = c.query_row("select count(*) from duckdb_secrets() where name like 'databrain_storage%' and not persistent", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "temporary secrets for r2:// and s3://");
     }
 }
 

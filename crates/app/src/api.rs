@@ -1577,6 +1577,91 @@ pub fn file_scan_sql(path: &str, all_sheets: bool) -> Result<String> {
     Ok(format!("SELECT *\nFROM {}\nLIMIT 1000;", file_scan_expr(path, fmt)))
 }
 
+/// Rows of a helper query as text (NULL → `None`).
+#[cfg(feature = "duckdb-engine")]
+fn collected_strings(c: &databrain_connector_core::Collected) -> Vec<Vec<Option<String>>> {
+    use databrain_connector_core::arrow::util::display::{ArrayFormatter, FormatOptions};
+    let mut out = Vec::new();
+    for b in &c.batches {
+        let cols: Vec<_> = b.columns().iter().map(|a| (a.clone(), ArrayFormatter::try_new(a.as_ref(), &FormatOptions::default()).ok())).collect();
+        for i in 0..b.num_rows() {
+            out.push(cols.iter().map(|(a, f)| if a.is_null(i) { None } else { f.as_ref().map(|f| f.value(i).to_string()) }).collect());
+        }
+    }
+    out
+}
+
+/// SQL that reads a file or folder in object storage (`s3://`, `r2://`,
+/// `gs://`, `https://`) on a DuckDB connection, with its storage secret.
+/// Folders are read as Delta, Iceberg or all their files of one type.
+#[cfg(feature = "duckdb-engine")]
+pub async fn storage_scan_sql(state: &AppState, connection_id: &str, url: &str) -> Result<String> {
+    use databrain_connector_duckdb as dk;
+    let url = url.trim();
+    if !dk::storage::is_remote(url) {
+        return Err(EngineError::new("invalid", "enter a URL such as s3://bucket/path/file.parquet"));
+    }
+    let (_, src) = match dk::remote_by_name(url) {
+        Some(r) => r,
+        None => {
+            let c = state.engine.helper_query(connection_id, &dk::remote_probe_sql(url)).await?;
+            let row = collected_strings(&c).into_iter().next().unwrap_or_default();
+            let yes = |i: usize| row.get(i).cloned().flatten().is_some_and(|v| v != "0");
+            dk::remote_decide(url, (yes(0), yes(1), row.get(2).cloned().flatten())).map_err(|e| EngineError::new("invalid", e.message))?
+        }
+    };
+    Ok(format!("SELECT *\nFROM {src}\nLIMIT 1000;"))
+}
+
+/// Buckets (or Azure containers) of a DuckDB connection's object storage.
+/// `config` is the connection as edited; the secret is `secret` when given,
+/// else the saved connection's (like Test).
+#[cfg(feature = "duckdb-engine")]
+pub async fn storage_buckets(state: &AppState, config: &ConnectionConfig, secret: Option<String>, connection_id: Option<&str>) -> Result<Vec<databrain_connector_duckdb::storage::buckets::Bucket>> {
+    use databrain_connector_duckdb::storage::{StorageConfig, buckets};
+    let st = StorageConfig::from_config(config).map_err(|e| EngineError::new("invalid", e.message))?.ok_or_else(|| EngineError::new("invalid", "This connection has no object storage"))?;
+    let secret = match (secret.filter(|s| !s.is_empty()), connection_id) {
+        (Some(s), _) => Some(s),
+        (None, Some(id)) if st.auth.uses_secret() => state.secrets.get(&SecretRef::for_connection(id))?.map(|s| secrecy::ExposeSecret::expose_secret(&s).to_string()),
+        _ => None,
+    };
+    let user = config.auth.user().unwrap_or_default().to_string();
+    let mut list = buckets::list_buckets(&st, secret.as_deref().map(|s| (user.as_str(), s))).await.map_err(|e| EngineError::new("invalid", e.message))?;
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(list)
+}
+
+#[derive(Debug, Serialize)]
+pub struct StorageObject {
+    pub path: String,
+    pub size: Option<u64>,
+    pub modified: Option<String>,
+}
+
+/// Objects under a prefix (recursively, up to `limit`), for the storage browser.
+#[cfg(feature = "duckdb-engine")]
+pub async fn storage_list(state: &AppState, connection_id: &str, url: &str, limit: usize) -> Result<Vec<StorageObject>> {
+    use databrain_connector_duckdb as dk;
+    if !dk::storage::is_remote(url) {
+        return Err(EngineError::new("invalid", "enter a URL such as s3://bucket/ or s3://bucket/folder/"));
+    }
+    let c = match state.engine.helper_query(connection_id, &dk::storage::list_sql(url, limit.clamp(1, 20_000))).await {
+        Ok(c) => c,
+        // An empty prefix is not an error.
+        Err(e) if e.message.contains("No files found") => return Ok(vec![]),
+        Err(e) => return Err(e),
+    };
+    Ok(collected_strings(&c)
+        .into_iter()
+        .filter_map(|r| {
+            let mut it = r.into_iter();
+            let path = it.next().flatten()?;
+            let size = it.next().flatten().and_then(|v| v.parse().ok());
+            Some(StorageObject { path, size, modified: it.next().flatten() })
+        })
+        .collect())
+}
+
 #[derive(Debug, Serialize)]
 pub struct ExcelSheet {
     pub name: String,
@@ -2314,5 +2399,43 @@ mod tests {
         let pos = v.checks[1].position.expect("postgres gives a position");
         assert_eq!(&sql[pos..pos + 5], "amout", "{:?}", v.checks[1]);
         exec(&st, &p.id, "drop table lin_t").await;
+    }
+
+    /// Object storage through a saved DuckDB connection (secret in the store):
+    /// listing and the SQL for files and folders. Needs a live S3-compatible
+    /// server: DATABRAIN_S3_ENDPOINT, _KEY, _SECRET, _BUCKET.
+    #[cfg(feature = "duckdb-engine")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn object_storage_browse_and_scan() {
+        let (Ok(key), Ok(secret), Ok(bucket)) = (std::env::var("DATABRAIN_S3_KEY"), std::env::var("DATABRAIN_S3_SECRET"), std::env::var("DATABRAIN_S3_BUCKET")) else {
+            return eprintln!("skipped: set DATABRAIN_S3_KEY, DATABRAIN_S3_SECRET, DATABRAIN_S3_BUCKET");
+        };
+        let (st, _sink, _dir) = state();
+        let endpoint = std::env::var("DATABRAIN_S3_ENDPOINT").unwrap_or_default();
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, databrain_auth::AuthMethod::Password { user: key });
+        cfg.options.insert("storage".into(), if endpoint.is_empty() { "s3".into() } else { "s3_compatible".into() });
+        if !endpoint.is_empty() {
+            cfg.options.insert("storage_endpoint".into(), endpoint);
+        }
+        cfg.options.insert("storage_region".into(), "us-east-1".into());
+        let p = save_profile(&st, "S3", cfg, Some(&secret));
+        let root = format!("s3://{bucket}/app-test-{}", std::process::id());
+        exec(&st, &p.id, &format!("COPY (SELECT range AS id, range % 2 AS part FROM range(6)) TO '{root}/sales' (FORMAT parquet, PARTITION_BY (part))")).await;
+        exec(&st, &p.id, &format!("COPY (SELECT 1 AS a) TO '{root}/one.csv' (HEADER)")).await;
+
+        let objs = storage_list(&st, &p.id, &format!("{root}/"), 100).await.unwrap();
+        assert!(objs.iter().any(|o| o.path.ends_with("/one.csv") && o.size.is_some_and(|s| s > 0)), "{objs:?}");
+        assert!(objs.iter().filter(|o| o.path.contains("/sales/part=")).count() >= 2);
+        assert!(storage_list(&st, &p.id, &format!("{root}/nothing-here/"), 100).await.unwrap().is_empty());
+
+        assert_eq!(storage_scan_sql(&st, &p.id, &format!("{root}/one.csv")).await.unwrap(), format!("SELECT *\nFROM read_csv('{root}/one.csv')\nLIMIT 1000;"));
+        let folder = storage_scan_sql(&st, &p.id, &format!("{root}/sales/")).await.unwrap();
+        assert!(folder.contains(&format!("read_parquet('{root}/sales/**/*.parquet', hive_partitioning = true)")), "{folder}");
+        assert!(storage_scan_sql(&st, &p.id, &format!("{root}/nothing-here/")).await.is_err());
+        assert!(storage_scan_sql(&st, &p.id, "/local/file.csv").await.is_err());
+        // Buckets with the saved secret (as in the connection dialog after saving).
+        let saved = st.workspace.get_connection(&p.id).unwrap();
+        assert!(storage_buckets(&st, &saved.config, None, Some(&p.id)).await.unwrap().iter().any(|b| b.name == bucket));
+        assert!(storage_buckets(&st, &saved.config, Some("wrong".into()), Some(&p.id)).await.is_err());
     }
 }

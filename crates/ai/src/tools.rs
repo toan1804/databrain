@@ -303,10 +303,16 @@ impl ToolContext {
             }
             let env = serde_json::to_value(p.env).ok().and_then(|v| v.as_str().map(str::to_string)).filter(|e| e != "none");
             let indexed = ws.kn_count(&p.id).unwrap_or(0);
+            // DuckDB with object storage: it reads and writes those URLs.
+            let storage = p.config.opt("storage").filter(|s| !s.trim().is_empty()).map(|s| {
+                let bucket = p.config.opt("storage_bucket").map(|b| format!(", bucket {b}")).unwrap_or_default();
+                format!(" · object storage: {s}{bucket} (query by URL; export steps can write there with storage_connection)")
+            });
             text.push_str(&format!(
-                "- \"{}\" · {}{}{}{}{}{}\n",
+                "- \"{}\" · {}{}{}{}{}{}{}\n",
                 p.name,
                 p.config.kind.dialect_name(),
+                storage.unwrap_or_default(),
                 env.as_deref().map(|e| format!(" · {e}")).unwrap_or_default(),
                 if p.config.read_only { " · read-only" } else { "" },
                 if connected.contains(&p.id) { " · connected" } else { "" },

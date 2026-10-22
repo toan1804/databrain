@@ -29,6 +29,13 @@ import type {
 } from "./lib/types";
 import { errorRange, uid } from "./lib/util";
 
+/** A new connection's starting point (type, settings, section shown first). */
+export interface ConnectionPreset {
+  kind?: ConnectorKind;
+  options?: Record<string, string>;
+  section?: "general" | "storage";
+}
+
 export interface Tab extends TabState {
   /** Unsaved changes relative to the linked saved query. */
   dirty?: boolean;
@@ -193,7 +200,7 @@ interface State {
   catalogSearch: { query: string; scope: string | null; focusSeq: number };
   toasts: Toast[];
   confirm: ConfirmState | null;
-  connectionDialog: { open: boolean; profile?: ConnectionView | null; folderId?: string | null };
+  connectionDialog: { open: boolean; profile?: ConnectionView | null; folderId?: string | null; preset?: ConnectionPreset };
   saveQueryDialog: { open: boolean; tabId?: string };
   paletteOpen: boolean;
   /** Show the Oracle Instant Client install prompt. */
@@ -231,7 +238,7 @@ interface State {
   setCatalogSearch: (patch: Partial<{ query: string; scope: string | null }>) => void;
 
   refreshConnections: () => Promise<void>;
-  openConnectionDialog: (profile?: ConnectionView | null, folderId?: string | null) => void;
+  openConnectionDialog: (profile?: ConnectionView | null, folderId?: string | null, preset?: ConnectionPreset) => void;
   closeConnectionDialog: () => void;
   loadSchemas: (connId: string, force?: boolean) => Promise<SchemaInfo[]>;
   /**
@@ -759,7 +766,7 @@ export const useStore = create<State>((set, get) => ({
     const connections = await api.listConnections();
     set({ connections });
   },
-  openConnectionDialog: (profile, folderId) => set({ connectionDialog: { open: true, profile, folderId: folderId ?? null } }),
+  openConnectionDialog: (profile, folderId, preset) => set({ connectionDialog: { open: true, profile, folderId: folderId ?? null, preset } }),
   closeConnectionDialog: () => set({ connectionDialog: { open: false } }),
 
   loadSchemas: async (connId, force = false) => {

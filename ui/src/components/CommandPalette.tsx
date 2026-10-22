@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Bookmark, Database, FileCode2, FileSearch, History, Moon, NotebookPen, Play, Plus, Search, Settings2, Sparkles, Square, Sun, Workflow, X } from "lucide-react";
+import { Bookmark, Cloud, Database, FileCode2, FileSearch, History, Moon, NotebookPen, Play, Plus, Search, Settings2, Sparkles, Square, Sun, Workflow, X } from "lucide-react";
 import { useAi } from "../aiStore";
 import { useJobs } from "../jobsStore";
 import { openOutput, openResultsQuery, outputLabel, outputRef } from "../outputs";
 import { queryLocalFile } from "./Sidebar";
+import { openRemoteFile } from "./RemoteFileDialog";
 import { fuzzyMatch, relativeTime, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
 import { ConnDot } from "./ui";
@@ -64,6 +65,7 @@ function Palette() {
       { id: "new-job", group: "Actions", label: "New job", icon: <Workflow size={14} />, run: () => void useJobs.getState().create() },
       { id: "jobs", group: "Actions", label: "Show jobs", icon: <Workflow size={14} />, run: () => st.setSidebarPanel("jobs") },
       { id: "file", group: "Actions", label: "Query a local file (CSV, Parquet, JSON, Excel)…", icon: <FileSearch size={14} />, run: () => void queryLocalFile() },
+      { id: "remote-file", group: "Actions", label: "Query a file in object storage (S3, R2, GCS, MinIO…)…", icon: <Cloud size={14} />, run: () => openRemoteFile() },
       { id: "ai", group: "AI", label: "Open AI assistant", icon: <Sparkles size={14} />, hint: "⌘L", run: () => useAi.getState().setOpen(true, "chat") },
       { id: "ai-kn", group: "AI", label: "AI knowledge (index schema, notes)", icon: <Sparkles size={14} />, run: () => useAi.getState().setOpen(true, "knowledge") },
       { id: "settings", group: "Actions", label: "Settings: appearance, AI providers, MCP", icon: <Settings2 size={14} />, hint: "⌘,", run: () => st.setSettingsOpen(true) },
