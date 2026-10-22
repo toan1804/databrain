@@ -773,8 +773,8 @@ function Sessions() {
 
 // ------------------------------------------------------------------ knowledge
 
-/** Indexed objects shown per page in Knowledge. */
-const OBJECT_PAGE = 200;
+/** Indexed tables shown at first and added by each "Show more". */
+const OBJECT_PAGE = 25;
 
 function Knowledge() {
   const connections = useStore((s) => s.connections);
