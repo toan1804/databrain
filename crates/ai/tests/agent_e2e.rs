@@ -257,9 +257,14 @@ async fn denied_approval_and_blocked_writes() {
         .await
         .unwrap();
     assert_eq!(out[0].result.as_ref().unwrap().total_rows, 1);
-    // MCP callers cannot trigger approval prompts.
+    // MCP: the client approved the call, so DataBrain doesn't ask again (one approval)…
     let mcp = databrain_ai::ToolContext { caller: databrain_ai::Caller::Mcp, ..ctx };
-    assert!(mcp.call("run_query", &json!({"sql": "select 1"})).await.content.contains("requires approval"));
+    let o = mcp.call("run_query", &json!({"sql": "select 1"})).await;
+    assert!(o.content.contains("returned 1 row"), "{}", o.content);
+    // …but what the policy forbids is still refused.
+    let o = mcp.call("run_query", &json!({"sql": "delete from orders"})).await;
+    assert!(o.content.starts_with("ERROR") && o.content.contains("not allowed"), "{}", o.content);
+    assert!(f.ws.list_audit(50).unwrap().iter().any(|a| a.tool == "run_query" && a.decision == "approved by MCP client"));
     // Auto-read policy runs without prompts.
     let mut p = f.ws.get_connection(&f.conn).unwrap();
     p.ai_policy.run_query = RunQueryPolicy::AutoRead;

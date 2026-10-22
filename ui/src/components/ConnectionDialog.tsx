@@ -1002,7 +1002,7 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
                 checked={policy.mcp_enabled}
                 onChange={(v) => setPolicy({ ...policy, mcp_enabled: v })}
                 label="Allow external agents (MCP)"
-                help="Kiro CLI, Claude Code etc. can use this connection via the local databrain-mcp server, under the rules above."
+                help="Kiro CLI, Claude Code etc. can use this connection via the local databrain-mcp server, under the rules above. Their own tool approval counts as the approval (DataBrain doesn't ask again); what the rules forbid is still refused."
               />
             </fieldset>
           </div>

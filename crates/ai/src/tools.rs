@@ -556,9 +556,7 @@ impl ToolContext {
             if reason.is_empty() { String::new() } else { format!(" ({reason})") }
         );
         let detail = json!({"tables": tables, "connection": target.name});
-        // Metadata only. MCP hosts ask their user themselves; in the app the user approves.
-        let decision = if self.caller == Caller::Mcp { Decision::Allow } else { Decision::Ask("Index tables".into()) };
-        self.gate("index_tables", decision, &summary, &detail).await?;
+        self.gate("index_tables", Decision::Ask("Index tables".into()), &summary, &detail).await?;
         let results = knowledge::index_tables(&self.engine, &target.id, &tables).await?;
         let pol = target.ai_policy.clone();
         let mut text = String::new();
@@ -607,9 +605,12 @@ impl ToolContext {
             Decision::Deny(reason) => Err(AiError::Policy(reason)),
             Decision::Ask(reason) => {
                 if self.caller == Caller::Mcp {
-                    // The MCP host shows its own approval UI; only allow what
-                    // the connection policy auto-approves.
-                    return Err(AiError::Policy(format!("{reason}: requires approval in DataBrain (set Run query = auto for reads)")));
+                    // The MCP client (Kiro CLI, Claude Code…) asked its user
+                    // before calling the tool: that is the approval. DataBrain's
+                    // hard rules (Deny: read-only, production, writes not
+                    // allowed, queries off) were applied above.
+                    self.audit(tool, detail, "approved by MCP client", Some(&reason));
+                    return Ok(detail.clone());
                 }
                 match self.host.approve(tool, &format!("{reason}. {summary}"), detail).await {
                     Some(v) => {

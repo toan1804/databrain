@@ -1,8 +1,9 @@
 //! Model Context Protocol server (JSON-RPC 2.0, newline-delimited over
 //! stdio). Lets external agents such as Kiro CLI or Claude Code use
 //! DataBrain's tools on connections that opted in (`ai_policy.mcp_enabled`).
-//! The same policy engine applies; anything that would need an approval
-//! prompt is refused, so only auto-approved reads run.
+//! The same policy engine applies. The MCP client asks its user before each
+//! tool call, so that counts as the approval for what DataBrain would ask
+//! about; what the connection's policy forbids is still refused.
 
 use std::sync::Arc;
 
