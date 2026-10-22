@@ -935,8 +935,8 @@ impl ToolContext {
             .ok_or_else(|| AiError::Policy(format!("table `{t}` not found")))?;
         let n = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(5).clamp(1, 20) as usize;
         let kind = self.profile.config.kind;
-        let full = format!("{}.{}", databrain_connector_core::quote_path(kind, &o.schema), databrain_connector_core::quote_ident(kind, &o.name));
-        let sql = policy::cap_rows(kind, &format!("SELECT * FROM {full}"), n);
+        let full = o.full_name();
+        let sql = databrain_connector_core::traits::preview_query(kind, &o.schema, &o.name, n);
         // Sampling is a read the user enabled via policy; no approval prompt.
         let outcomes = self
             .engine

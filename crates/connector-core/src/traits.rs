@@ -147,6 +147,9 @@ pub struct SqlSyntax {
     pub block_on_alter: bool,
     /// `:new` / `:old` are trigger rows, not parameters (Oracle).
     pub trigger_row_binds: bool,
+    /// `:name` parameters (DataBrain's own); off where `:` is the language's
+    /// syntax (Cypher `(:Label)`, MongoDB `{a: 1}`).
+    pub colon_params: bool,
 }
 
 /// Column types for `CREATE TABLE` from Arrow types.
@@ -264,6 +267,19 @@ pub struct LoadTraits {
     pub transactions: Option<LoadTransactions>,
 }
 
+/// How "first rows of a table" is written (explorer preview, AI samples).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Preview {
+    /// `SELECT * FROM t` with the row limit syntax.
+    Sql,
+    /// `db.getSiblingDB("db").getCollection("c").find({}).limit(n)`.
+    MongoFind,
+    /// `MATCH (n:Label) RETURN n LIMIT n` (schema `Nodes`) or
+    /// `MATCH ()-[r:TYPE]->() RETURN r LIMIT n` (schema `Relationships`).
+    Cypher,
+}
+
 /// Where the first network hop of a connection goes (the quick DNS + TCP
 /// check before connecting).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -294,9 +310,13 @@ pub struct SourceTraits {
     pub whole_path_quotes: bool,
     /// Tables are written with their catalog even inside the session's (BigQuery).
     pub always_qualify_catalog: bool,
+    /// Explorer folder for tables (`Collections`, `Labels`) and views.
+    pub table_folder: &'static str,
+    pub view_folder: &'static str,
     /// What the top level is called (`catalog`, `database`, `project`).
     pub catalog_noun: &'static str,
     pub row_limit: RowLimit,
+    pub preview: Preview,
     /// Prefix that checks a query without running it; `None` = no check.
     pub explain: Option<&'static str>,
     /// Reached over HTTPS APIs (no SSH tunnel).
@@ -331,6 +351,7 @@ pub const STANDARD_SYNTAX: SqlSyntax = SqlSyntax {
     block_objects: &[],
     block_on_alter: false,
     trigger_row_binds: false,
+    colon_params: true,
 };
 
 pub const STANDARD_TYPES: TypeNames = TypeNames {
@@ -380,8 +401,11 @@ pub const STANDARD: SourceTraits = SourceTraits {
     levels: NameLevels::Two,
     whole_path_quotes: false,
     always_qualify_catalog: false,
+    table_folder: "Tables",
+    view_folder: "Views",
     catalog_noun: "database",
     row_limit: RowLimit::Limit,
+    preview: Preview::Sql,
     explain: None,
     cloud: false,
     local: false,
@@ -661,6 +685,42 @@ pub const DUCKDB: SourceTraits = SourceTraits {
     ..STANDARD
 };
 
+/// MongoDB: databases (shown as schemas) → collections (tables). Queries are mongosh-style
+/// (`db.orders.find({…})`) or JSON commands (`{"find": "orders"}`).
+pub const MONGODB: SourceTraits = SourceTraits {
+    name: "MongoDB",
+    language: QueryLanguage::MongoJson,
+    table_folder: "Collections",
+    preview: Preview::MongoFind,
+    dialect_name: "MongoDB query (mongosh-style db.<collection>.find/aggregate/countDocuments/distinct/insertOne/updateMany/deleteMany…, or a JSON database command; `use <db>` on the first line picks the database)",
+    catalog_noun: "database",
+    explain: None,
+    network: NetworkTarget::HostPort,
+    formatter: "",
+    syntax: SqlSyntax { colon_params: false, ..STANDARD_SYNTAX },
+    load: None,
+    ..STANDARD
+};
+
+/// Neo4j: one database; "schemas" are Nodes and Relationships, objects are
+/// labels and relationship types. Queries are Cypher.
+pub const NEO4J: SourceTraits = SourceTraits {
+    name: "Neo4j",
+    language: QueryLanguage::Cypher,
+    table_folder: "Labels",
+    view_folder: "Relationship types",
+    preview: Preview::Cypher,
+    dialect_name: "Neo4j Cypher (MATCH (n:Label) … RETURN …; labels and relationship types are the tables)",
+    quote: IdentQuote::Backtick,
+    catalog_noun: "database",
+    explain: Some("EXPLAIN "),
+    network: NetworkTarget::HostPort,
+    formatter: "",
+    syntax: SqlSyntax { backtick: true, slash_comment: true, colon_params: false, ..STANDARD_SYNTAX },
+    load: None,
+    ..STANDARD
+};
+
 impl ConnectorKind {
     /// What this source type is like (see [`SourceTraits`]).
     pub fn traits(self) -> &'static SourceTraits {
@@ -674,9 +734,43 @@ impl ConnectorKind {
             ConnectorKind::Databricks => &DATABRICKS,
             ConnectorKind::Bigquery => &BIGQUERY,
             ConnectorKind::Duckdb => &DUCKDB,
+            ConnectorKind::Mongodb => &MONGODB,
+            ConnectorKind::Neo4j => &NEO4J,
         }
     }
 }
+
+/// The query that shows the first `n` rows of `schema.name`.
+pub fn preview_query(kind: ConnectorKind, schema: &str, name: &str, n: usize) -> String {
+    let t = kind.traits();
+    match t.preview {
+        Preview::MongoFind => {
+            let coll = serde_json::to_string(name).unwrap_or_default();
+            let db = serde_json::to_string(schema).unwrap_or_default();
+            format!("db.getSiblingDB({db}).getCollection({coll}).find({{}}).limit({n})")
+        }
+        Preview::Cypher => {
+            let label = crate::quote_ident(kind, name);
+            if schema.eq_ignore_ascii_case(NEO4J_RELATIONSHIPS) {
+                format!("MATCH (a)-[r:{label}]->(b) RETURN a, r, b LIMIT {n}")
+            } else {
+                format!("MATCH (n:{label}) RETURN n LIMIT {n}")
+            }
+        }
+        Preview::Sql => {
+            let full = format!("{}.{}", crate::quote_path(kind, schema), crate::quote_ident(kind, name));
+            match t.row_limit {
+                RowLimit::Top => format!("SELECT TOP {n} * FROM {full}"),
+                RowLimit::FetchFirst => format!("SELECT * FROM {full} FETCH FIRST {n} ROWS ONLY"),
+                RowLimit::Limit => format!("SELECT * FROM {full} LIMIT {n}"),
+            }
+        }
+    }
+}
+
+/// Neo4j's explorer "schemas".
+pub const NEO4J_NODES: &str = "Nodes";
+pub const NEO4J_RELATIONSHIPS: &str = "Relationships";
 
 #[cfg(test)]
 mod tests {
@@ -694,8 +788,19 @@ mod tests {
         if std::env::var_os("UPDATE_SOURCE_TRAITS").is_some() {
             std::fs::write(&path, &text).unwrap();
         }
-        let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
-        assert!(on_disk == text, "ui/src/lib/sourceTraits.json is out of date: run UPDATE_SOURCE_TRAITS=1 cargo test -p databrain-connector-core traits");
+        // Compared as JSON: key order depends on serde_json features the
+        // workspace enables (`preserve_order`), not on the content.
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_default()).unwrap_or_default();
+        assert!(on_disk == serde_json::Value::Object(map), "ui/src/lib/sourceTraits.json is out of date: run UPDATE_SOURCE_TRAITS=1 cargo test -p databrain-connector-core traits");
+    }
+
+    #[test]
+    fn preview_queries() {
+        assert_eq!(preview_query(ConnectorKind::Postgres, "public", "t", 5), "SELECT * FROM \"public\".\"t\" LIMIT 5");
+        assert_eq!(preview_query(ConnectorKind::Mssql, "dbo", "t", 5), "SELECT TOP 5 * FROM [dbo].[t]");
+        assert_eq!(preview_query(ConnectorKind::Mongodb, "shop", "orders", 5), "db.getSiblingDB(\"shop\").getCollection(\"orders\").find({}).limit(5)");
+        assert_eq!(preview_query(ConnectorKind::Neo4j, "Nodes", "Person", 5), "MATCH (n:`Person`) RETURN n LIMIT 5");
+        assert_eq!(preview_query(ConnectorKind::Neo4j, "Relationships", "ACTED_IN", 5), "MATCH (a)-[r:`ACTED_IN`]->(b) RETURN a, r, b LIMIT 5");
     }
 
     #[test]

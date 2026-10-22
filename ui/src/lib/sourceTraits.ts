@@ -21,6 +21,11 @@ export interface SourceTraits {
   /** Tables keep their catalog even inside the session's (BigQuery). */
   always_qualify_catalog: boolean;
   catalog_noun: string;
+  /** Explorer folder names for tables and views (`Collections`, `Labels`). */
+  table_folder: string;
+  view_folder: string;
+  /** How "first rows of a table" is written. */
+  preview: "sql" | "mongo_find" | "cypher";
   row_limit: "limit" | "top" | "fetch_first";
   explain: string | null;
   cloud: boolean;
@@ -43,6 +48,9 @@ const FALLBACK: SourceTraits = {
   whole_path_quotes: false,
   always_qualify_catalog: false,
   catalog_noun: "database",
+  table_folder: "Tables",
+  view_folder: "Views",
+  preview: "sql",
   row_limit: "limit",
   explain: null,
   cloud: false,

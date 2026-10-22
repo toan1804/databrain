@@ -43,6 +43,7 @@
     "name": "BigQuery",
     "network": "unknown",
     "parser": "bigquery",
+    "preview": "sql",
     "quote": "backtick_backslash",
     "row_limit": "limit",
     "ssl_setting": false,
@@ -57,6 +58,7 @@
       "block_on_alter": false,
       "block_starts": [],
       "brackets": false,
+      "colon_params": true,
       "delimiter_directive": false,
       "dollar": "none",
       "hash_comment": true,
@@ -64,7 +66,9 @@
       "trigger_row_binds": false,
       "triple_quotes": true
     },
+    "table_folder": "Tables",
     "upper_folding": false,
+    "view_folder": "Views",
     "whole_path_quotes": true
   },
   "databricks": {
@@ -111,6 +115,7 @@
     "name": "Databricks",
     "network": "https_host",
     "parser": "databricks",
+    "preview": "sql",
     "quote": "backtick",
     "row_limit": "limit",
     "ssl_setting": false,
@@ -123,6 +128,7 @@
       "block_on_alter": false,
       "block_starts": [],
       "brackets": false,
+      "colon_params": true,
       "delimiter_directive": false,
       "dollar": "none",
       "hash_comment": false,
@@ -130,7 +136,9 @@
       "trigger_row_binds": false,
       "triple_quotes": false
     },
+    "table_folder": "Tables",
     "upper_folding": false,
+    "view_folder": "Views",
     "whole_path_quotes": false
   },
   "duckdb": {
@@ -182,6 +190,7 @@
     "name": "DuckDB",
     "network": "unknown",
     "parser": "duckdb",
+    "preview": "sql",
     "quote": "double",
     "row_limit": "limit",
     "ssl_setting": false,
@@ -194,6 +203,7 @@
       "block_on_alter": false,
       "block_starts": [],
       "brackets": false,
+      "colon_params": true,
       "delimiter_directive": false,
       "dollar": "tagged",
       "hash_comment": false,
@@ -201,7 +211,49 @@
       "trigger_row_binds": false,
       "triple_quotes": false
     },
+    "table_folder": "Tables",
     "upper_folding": false,
+    "view_folder": "Views",
+    "whole_path_quotes": false
+  },
+  "mongodb": {
+    "always_qualify_catalog": false,
+    "catalog_noun": "database",
+    "cloud": false,
+    "dialect_name": "MongoDB query (mongosh-style db.<collection>.find/aggregate/countDocuments/distinct/insertOne/updateMany/deleteMany…, or a JSON database command; `use <db>` on the first line picks the database)",
+    "explain": null,
+    "formatter": "",
+    "language": "mongo_json",
+    "levels": "two",
+    "load": null,
+    "local": false,
+    "name": "MongoDB",
+    "network": "host_port",
+    "parser": "generic",
+    "preview": "mongo_find",
+    "quote": "double",
+    "row_limit": "limit",
+    "ssl_setting": false,
+    "syntax": {
+      "backslash_escapes": false,
+      "backslash_in_double_quotes": false,
+      "backtick": false,
+      "block_end": "none",
+      "block_objects": [],
+      "block_on_alter": false,
+      "block_starts": [],
+      "brackets": false,
+      "colon_params": false,
+      "delimiter_directive": false,
+      "dollar": "none",
+      "hash_comment": false,
+      "slash_comment": false,
+      "trigger_row_binds": false,
+      "triple_quotes": false
+    },
+    "table_folder": "Collections",
+    "upper_folding": false,
+    "view_folder": "Views",
     "whole_path_quotes": false
   },
   "mssql": {
@@ -253,6 +305,7 @@
     "name": "SQL Server",
     "network": "host_port",
     "parser": "mssql",
+    "preview": "sql",
     "quote": "bracket",
     "row_limit": "top",
     "ssl_setting": false,
@@ -271,6 +324,7 @@
       "block_on_alter": true,
       "block_starts": [],
       "brackets": true,
+      "colon_params": true,
       "delimiter_directive": false,
       "dollar": "none",
       "hash_comment": false,
@@ -278,7 +332,9 @@
       "trigger_row_binds": false,
       "triple_quotes": false
     },
+    "table_folder": "Tables",
     "upper_folding": false,
+    "view_folder": "Views",
     "whole_path_quotes": false
   },
   "mysql": {
@@ -330,6 +386,7 @@
     "name": "MySQL",
     "network": "host_port",
     "parser": "mysql",
+    "preview": "sql",
     "quote": "backtick",
     "row_limit": "limit",
     "ssl_setting": true,
@@ -342,6 +399,7 @@
       "block_on_alter": false,
       "block_starts": [],
       "brackets": false,
+      "colon_params": true,
       "delimiter_directive": true,
       "dollar": "none",
       "hash_comment": true,
@@ -349,7 +407,49 @@
       "trigger_row_binds": false,
       "triple_quotes": false
     },
+    "table_folder": "Tables",
     "upper_folding": false,
+    "view_folder": "Views",
+    "whole_path_quotes": false
+  },
+  "neo4j": {
+    "always_qualify_catalog": false,
+    "catalog_noun": "database",
+    "cloud": false,
+    "dialect_name": "Neo4j Cypher (MATCH (n:Label) … RETURN …; labels and relationship types are the tables)",
+    "explain": "EXPLAIN ",
+    "formatter": "",
+    "language": "cypher",
+    "levels": "two",
+    "load": null,
+    "local": false,
+    "name": "Neo4j",
+    "network": "host_port",
+    "parser": "generic",
+    "preview": "cypher",
+    "quote": "backtick",
+    "row_limit": "limit",
+    "ssl_setting": false,
+    "syntax": {
+      "backslash_escapes": false,
+      "backslash_in_double_quotes": false,
+      "backtick": true,
+      "block_end": "none",
+      "block_objects": [],
+      "block_on_alter": false,
+      "block_starts": [],
+      "brackets": false,
+      "colon_params": false,
+      "delimiter_directive": false,
+      "dollar": "none",
+      "hash_comment": false,
+      "slash_comment": true,
+      "trigger_row_binds": false,
+      "triple_quotes": false
+    },
+    "table_folder": "Labels",
+    "upper_folding": false,
+    "view_folder": "Relationship types",
     "whole_path_quotes": false
   },
   "oracle": {
@@ -396,6 +496,7 @@
     "name": "Oracle",
     "network": "host_port",
     "parser": "oracle",
+    "preview": "sql",
     "quote": "double",
     "row_limit": "fetch_first",
     "ssl_setting": false,
@@ -417,6 +518,7 @@
         "BEGIN"
       ],
       "brackets": false,
+      "colon_params": true,
       "delimiter_directive": false,
       "dollar": "none",
       "hash_comment": false,
@@ -424,7 +526,9 @@
       "trigger_row_binds": true,
       "triple_quotes": false
     },
+    "table_folder": "Tables",
     "upper_folding": true,
+    "view_folder": "Views",
     "whole_path_quotes": false
   },
   "postgres": {
@@ -476,6 +580,7 @@
     "name": "PostgreSQL",
     "network": "host_port",
     "parser": "postgres",
+    "preview": "sql",
     "quote": "double",
     "row_limit": "limit",
     "ssl_setting": true,
@@ -488,6 +593,7 @@
       "block_on_alter": false,
       "block_starts": [],
       "brackets": false,
+      "colon_params": true,
       "delimiter_directive": false,
       "dollar": "tagged",
       "hash_comment": false,
@@ -495,7 +601,9 @@
       "trigger_row_binds": false,
       "triple_quotes": false
     },
+    "table_folder": "Tables",
     "upper_folding": false,
+    "view_folder": "Views",
     "whole_path_quotes": false
   },
   "snowflake": {
@@ -542,6 +650,7 @@
     "name": "Snowflake",
     "network": "unknown",
     "parser": "snowflake",
+    "preview": "sql",
     "quote": "double",
     "row_limit": "limit",
     "ssl_setting": false,
@@ -554,6 +663,7 @@
       "block_on_alter": false,
       "block_starts": [],
       "brackets": false,
+      "colon_params": true,
       "delimiter_directive": false,
       "dollar": "plain",
       "hash_comment": false,
@@ -561,7 +671,9 @@
       "trigger_row_binds": false,
       "triple_quotes": false
     },
+    "table_folder": "Tables",
     "upper_folding": true,
+    "view_folder": "Views",
     "whole_path_quotes": false
   },
   "sqlite": {
@@ -613,6 +725,7 @@
     "name": "SQLite",
     "network": "unknown",
     "parser": "sqlite",
+    "preview": "sql",
     "quote": "double",
     "row_limit": "limit",
     "ssl_setting": false,
@@ -627,6 +740,7 @@
       "block_on_alter": false,
       "block_starts": [],
       "brackets": true,
+      "colon_params": true,
       "delimiter_directive": false,
       "dollar": "none",
       "hash_comment": false,
@@ -634,7 +748,9 @@
       "trigger_row_binds": false,
       "triple_quotes": false
     },
+    "table_folder": "Tables",
     "upper_folding": false,
+    "view_folder": "Views",
     "whole_path_quotes": false
   }
 }

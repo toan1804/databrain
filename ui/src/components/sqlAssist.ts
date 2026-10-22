@@ -13,7 +13,7 @@ import { columnRoles } from "../lib/queryHints";
 import { useStore } from "../store";
 import { cachedLayout, loadLayout } from "./queryHintsExt";
 
-const DIALECTS: Record<ConnectorKind, SQLDialect> = {
+const DIALECTS: Partial<Record<ConnectorKind, SQLDialect>> = {
   postgres: PostgreSQL,
   mysql: MySQL,
   sqlite: SQLite,

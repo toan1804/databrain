@@ -26,7 +26,8 @@ pub fn target(cfg: &ConnectionConfig, default_port: Option<u16>) -> Option<(Stri
         NetworkTarget::HostPort => {
             // Oracle connect strings and SQL Server named instances (found
             // through the browser service) don't say where they go.
-            if cfg.opt("connect_string").is_some() || (cfg.opt("instance").is_some() && cfg.port.is_none()) {
+            // A connection string/URI (Oracle, MongoDB, Neo4j) may name several hosts or an SRV record.
+            if cfg.opt("connect_string").is_some() || cfg.opt("uri").is_some() || (cfg.opt("instance").is_some() && cfg.port.is_none()) {
                 return None;
             }
             let host = cfg.host_or_default().trim().to_string();
@@ -105,6 +106,10 @@ mod tests {
         let mut m = cfg(ConnectorKind::Mssql, "db", None);
         m.options.insert("instance".into(), "SQLEXPRESS".into());
         assert_eq!(target(&m, Some(1433)), None, "named instance: port found by the browser service");
+        let mut g = cfg(ConnectorKind::Mongodb, "", None);
+        g.options.insert("uri".into(), "mongodb+srv://c.example.net".into());
+        assert_eq!(target(&g, Some(27017)), None);
+        assert_eq!(target(&cfg(ConnectorKind::Neo4j, "graph", None), Some(7687)), Some(("graph".into(), 7687)));
         let mut o = cfg(ConnectorKind::Oracle, "db", None);
         o.options.insert("connect_string".into(), "(DESCRIPTION=…)".into());
         assert_eq!(target(&o, Some(1521)), None);

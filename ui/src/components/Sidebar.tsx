@@ -60,6 +60,7 @@ import {
   visibleSchemas,
   visibleCatalogs,
   cacheAge,
+  groupLabel,
   isThreeLevel,
   type ObjectGroupName,
 } from "../lib/catalog";
@@ -753,7 +754,7 @@ function ObjectGroup({ name, items, conn, schema, depth }: { name: ObjectGroupNa
         depth={depth}
         expanded={open}
         icon={groupIcon(name)}
-        label={<span className="text-[11.5px] font-medium uppercase tracking-wide text-muted">{name}</span>}
+        label={<span className="text-[11.5px] font-medium uppercase tracking-wide text-muted">{groupLabel(name, conn.config.kind)}</span>}
         meta={filter ? `${matched}/${items.length}` : items.length}
         onClick={() => setOpen(!open)}
       />

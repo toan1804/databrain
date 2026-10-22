@@ -32,7 +32,9 @@ databrain-connector-core = { version = "0.2.0", path = "../connector-core" }
 databrain-lineage = { version = "0.2.0", path = "../lineage" }
 base64 = "0.23.1"
 databrain-connector-duckdb = { version = "0.2.0", path = "../connectors/duckdb", optional = true, default-features = false }
+databrain-connector-mongodb = { version = "0.2.0", path = "../connectors/mongodb", optional = true }
 databrain-connector-mssql = { version = "0.2.0", path = "../connectors/mssql", optional = true }
+databrain-connector-neo4j = { version = "0.2.0", path = "../connectors/neo4j", optional = true }
 databrain-connector-mysql = { version = "0.2.0", path = "../connectors/mysql", optional = true }
 databrain-connector-oracle = { version = "0.2.0", path = "../connectors/oracle", optional = true }
 databrain-connector-postgres = { version = "0.2.0", path = "../connectors/postgres", optional = true }
@@ -68,17 +70,19 @@ tempfile = "3.27.0"
 rust_xlsxwriter = "0.96.0"
 
 [features]
-default = ["sqlite", "postgres", "mysql", "mssql", "oracle", "snowflake", "databricks", "bigquery", "duckdb"]
+default = ["sqlite", "postgres", "mysql", "mssql", "oracle", "snowflake", "databricks", "bigquery", "duckdb", "mongodb", "neo4j"]
 # Every connector, with the DuckDB library installed on the computer instead
 # of the bundled engine (smaller app). Build with --no-default-features:
 #   node scripts/build-system-duckdb.mjs
-system-duckdb = ["sqlite", "postgres", "mysql", "mssql", "oracle", "snowflake", "databricks", "bigquery", "duckdb-system"]
+system-duckdb = ["sqlite", "postgres", "mysql", "mssql", "oracle", "snowflake", "databricks", "bigquery", "duckdb-system", "mongodb", "neo4j"]
 duckdb-system = ["duckdb-engine", "databrain-connector-duckdb?/system"]
 sqlite = ["dep:databrain-connector-sqlite"]
 postgres = ["dep:databrain-connector-postgres"]
 mysql = ["dep:databrain-connector-mysql"]
 mssql = ["dep:databrain-connector-mssql"]
 oracle = ["dep:databrain-connector-oracle"]
+mongodb = ["dep:databrain-connector-mongodb"]
+neo4j = ["dep:databrain-connector-neo4j"]
 snowflake = ["dep:databrain-connector-cloud", "databrain-connector-cloud/snowflake"]
 databricks = ["dep:databrain-connector-cloud", "databrain-connector-cloud/databricks"]
 bigquery = ["dep:databrain-connector-cloud", "databrain-connector-cloud/bigquery"]

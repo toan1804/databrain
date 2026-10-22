@@ -121,6 +121,10 @@ pub fn registry_with_outputs(
     r.register(Arc::new(databrain_connector_cloud::DatabricksConnector::new()));
     #[cfg(feature = "bigquery")]
     r.register(Arc::new(databrain_connector_cloud::BigQueryConnector::new()));
+    #[cfg(feature = "mongodb")]
+    r.register(Arc::new(databrain_connector_mongodb::MongoConnector));
+    #[cfg(feature = "neo4j")]
+    r.register(Arc::new(databrain_connector_neo4j::Neo4jConnector));
     #[cfg(feature = "duckdb-engine")]
     r.register(Arc::new(match outputs {
         Some(slot) => databrain_connector_duckdb::DuckdbConnector::with_outputs(slot),

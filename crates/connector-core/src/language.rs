@@ -71,17 +71,32 @@ fn mongo_kind(text: &str) -> StatementKind {
 }
 
 /// The command name: the first key of a JSON command, or the method of a
-/// `db.collection.method(` call.
+/// `db…collection.method(` call (after `use x` lines; `getSiblingDB` and
+/// `getCollection` are accessors, not the method).
 fn mongo_op(t: &str) -> Option<String> {
+    let t = t.trim_start();
+    let t = t.lines().skip_while(|l| l.trim().is_empty() || l.trim_start().starts_with("use ")).collect::<Vec<_>>().join("\n");
     let t = t.trim();
     if let Some(rest) = t.strip_prefix('{') {
         let rest = rest.trim_start().strip_prefix('"')?;
         return Some(rest[..rest.find('"')?].to_string());
     }
-    let call = t.strip_prefix("db.")?;
-    let paren = call.find('(')?;
-    let path = &call[..paren];
-    Some(path.rsplit('.').next()?.trim().to_string())
+    let mut rest = t.strip_prefix("db")?;
+    loop {
+        let r = rest.trim_start().strip_prefix('.')?;
+        let end = r.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))?;
+        let (name, after) = (&r[..end], r[end..].trim_start());
+        if !after.starts_with('(') {
+            // A collection name.
+            rest = after;
+            continue;
+        }
+        if name == "getsiblingdb" || name == "getcollection" {
+            rest = &after[after.find(')')? + 1..];
+            continue;
+        }
+        return Some(name.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +131,9 @@ mod tests {
         assert_eq!(k("db.orders.deleteMany({})", L::MongoJson), S::Dml);
         assert_eq!(k("db.orders.drop()", L::MongoJson), S::Ddl);
         assert_eq!(k("what is this", L::MongoJson), S::Unknown);
+        assert_eq!(k("use shop\ndb.getSiblingDB(\"x\").getCollection(\"o\").find({}).limit(5)", L::MongoJson), S::Read);
+        assert_eq!(k("db.getCollection('o').insertOne({})", L::MongoJson), S::Dml);
+        assert_eq!(k("db.runCommand({ping: 1})", L::MongoJson), S::Unknown);
         assert_eq!(k("SELECT * FROM ks.users WHERE id = 1", L::Cql), S::Read);
         assert_eq!(k("BEGIN BATCH INSERT INTO t (a) VALUES (1); APPLY BATCH", L::Cql), S::Dml);
         assert_eq!(k("CREATE TABLE ks.t (id int PRIMARY KEY)", L::Cql), S::Ddl);

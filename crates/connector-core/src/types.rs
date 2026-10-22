@@ -15,10 +15,12 @@ pub enum ConnectorKind {
     Databricks,
     Bigquery,
     Duckdb,
+    Mongodb,
+    Neo4j,
 }
 
 impl ConnectorKind {
-    pub const ALL: [ConnectorKind; 9] = [
+    pub const ALL: [ConnectorKind; 11] = [
         ConnectorKind::Sqlite,
         ConnectorKind::Postgres,
         ConnectorKind::Mysql,
@@ -28,6 +30,8 @@ impl ConnectorKind {
         ConnectorKind::Databricks,
         ConnectorKind::Bigquery,
         ConnectorKind::Duckdb,
+        ConnectorKind::Mongodb,
+        ConnectorKind::Neo4j,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -41,6 +45,8 @@ impl ConnectorKind {
             ConnectorKind::Databricks => "databricks",
             ConnectorKind::Bigquery => "bigquery",
             ConnectorKind::Duckdb => "duckdb",
+            ConnectorKind::Mongodb => "mongodb",
+            ConnectorKind::Neo4j => "neo4j",
         }
     }
 

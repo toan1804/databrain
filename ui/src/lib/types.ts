@@ -9,7 +9,9 @@ export type ConnectorKind =
   | "snowflake"
   | "databricks"
   | "bigquery"
-  | "duckdb";
+  | "duckdb"
+  | "mongodb"
+  | "neo4j";
 export type SslMode = "disable" | "prefer" | "require" | "verify_full";
 export type EnvTag = "none" | "dev" | "staging" | "prod";
 

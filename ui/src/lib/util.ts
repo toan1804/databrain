@@ -166,8 +166,15 @@ export function qualifiedName(kind: ConnectorKind, schema: string, name: string)
 }
 
 export function selectTopSql(kind: ConnectorKind, schema: string, table: string, n = 100): string {
+  const t = traitsOf(kind);
+  // Same as the backend's `traits::preview_query`.
+  if (t.preview === "mongo_find") return `db.getSiblingDB(${JSON.stringify(schema)}).getCollection(${JSON.stringify(table)}).find({}).limit(${n})`;
+  if (t.preview === "cypher") {
+    const label = quoteIdent(kind, table);
+    return schema.toLowerCase() === "relationships" ? `MATCH (a)-[r:${label}]->(b)\nRETURN a, r, b\nLIMIT ${n}` : `MATCH (n:${label})\nRETURN n\nLIMIT ${n}`;
+  }
   const q = qualifiedName(kind, schema, table);
-  switch (traitsOf(kind).row_limit) {
+  switch (t.row_limit) {
     case "top":
       return `SELECT TOP ${n} *\nFROM ${q};`;
     case "fetch_first":

@@ -19,6 +19,9 @@ The macOS app is not signed yet, so macOS blocks it on first open: right-click D
 
 - **Connections:**
   - Databases: SQLite, PostgreSQL, MySQL/MariaDB, SQL Server, Oracle, Snowflake, Databricks, BigQuery, and DuckDB for local files.
+  - MongoDB: host and port or a connection string (`mongodb+srv://…` for Atlas). The explorer lists databases and their collections and views; describing a collection samples 200 documents to list its fields and types, and Show DDL gives `createCollection`/`createIndex` commands. Queries are mongosh-style, one command per run (`db.orders.find({status: "A"}).sort({at: -1}).limit(10)`, `aggregate`, `countDocuments`, `distinct`, `insertOne`/`updateMany`/`deleteMany`…, `db.runCommand({…})`, `use shop` on the first line), with `ObjectId(…)`, `ISODate(…)` and relaxed JSON, or a JSON database command (`{"find": "orders"}`). Documents come back as rows: top-level fields are columns (types inferred from the first 1,000 documents), nested documents and arrays are JSON text, so they work with outputs, DuckDB joins, export and the AI like any result. Writes ask first like SQL writes.
+  - Neo4j: host and port or a URI (`neo4j+s://…` for Aura). The explorer lists node labels (Nodes) and relationship types (Relationships) with their properties, counts, and constraints/indexes as DDL. Queries are Cypher; columns follow the `RETURN` order, and a returned node or relationship is shown as its properties (`_id`, `_labels`, then each property).
+  - MongoDB and Neo4j are not load targets for jobs (save to a file or load into another database instead), and lineage, Format and SQL completion are for SQL connections only.
   - Sign-in: passwords/tokens/keys go in the OS keychain. Browser sign-in (OAuth PKCE, Snowflake SSO), device code, service principals, service accounts, and CLI logins (gcloud, Databricks CLI, az).
   - SSH tunnels with host-key pinning.
   - Test fails fast: a DNS + TCP check tells "unknown host", "connection refused" and "no answer" apart within seconds, the whole attempt gives up after the connect timeout (Settings → Queries → Connecting, default 20 s; browser sign-in is not limited), and Stop cancels it. A failed test's error can be copied, and "Ask AI" explains it and what to change, right in the dialog (the settings are sent without passwords or keys; the conversation stays in the AI panel).
@@ -168,7 +171,7 @@ cd ui && npm test && npm run build
 
 Regenerate it with `examples/data/generate.sh` (needs Python 3 and cargo).
 
-Connectors for server databases have live tests that are skipped unless a server is configured. They use the `DATABRAIN_PG_*`, `DATABRAIN_MYSQL_*`, `DATABRAIN_MSSQL_*`, `DATABRAIN_ORACLE_*`, `DATABRAIN_SF_*`, `DATABRAIN_DBX_*`, `DATABRAIN_BQ_PROJECT` and `DATABRAIN_SSH_*` variables. For example:
+Connectors for server databases have live tests that are skipped unless a server is configured. They use the `DATABRAIN_PG_*`, `DATABRAIN_MYSQL_*`, `DATABRAIN_MSSQL_*`, `DATABRAIN_ORACLE_*`, `DATABRAIN_SF_*`, `DATABRAIN_DBX_*`, `DATABRAIN_BQ_PROJECT`, `DATABRAIN_MONGO_URI`, `DATABRAIN_NEO4J_URI` (+ `DATABRAIN_NEO4J_USER`/`DATABRAIN_NEO4J_PASSWORD`) and `DATABRAIN_SSH_*` variables. For example:
 
 ```sh
 DATABRAIN_PG_HOST=localhost DATABRAIN_PG_USER=postgres DATABRAIN_PG_PASSWORD=... \
@@ -183,7 +186,7 @@ DATABRAIN_MYSQL_HOST=127.0.0.1 DATABRAIN_MYSQL_USER=root DATABRAIN_MYSQL_PASSWOR
 crates/
   auth/            keychain secrets, auth methods, OAuth/device/JWT/cloud CLI credentials
   connector-core/  Connector/Session traits, SourceTraits (what each database type is like), Arrow row builder, statement splitter + classifier per query language
-  connectors/      sqlite, postgres, mysql, mssql, oracle, cloud (snowflake/databricks/bigquery), duckdb
+  connectors/      sqlite, postgres, mysql, mssql, oracle, cloud (snowflake/databricks/bigquery), duckdb, mongodb, neo4j
   duckdb-dynload/  DuckDB's C API loaded at runtime (builds without bundled DuckDB)
   ssh-tunnel/      russh-based tunnels
   result-store/    in-memory Arrow results: paging, filter, sort, find, stats

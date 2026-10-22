@@ -11,6 +11,8 @@ members = [
     "crates/connectors/oracle",
     "crates/connectors/cloud",
     "crates/connectors/duckdb",
+    "crates/connectors/mongodb",
+    "crates/connectors/neo4j",
     "crates/duckdb-dynload",
     "crates/result-store",
     "crates/export",

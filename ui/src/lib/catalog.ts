@@ -159,7 +159,7 @@ export function groupOf(kind: ObjectKind): ObjectGroupName {
 }
 
 /** Folders each engine lists under a schema (shown even when empty). */
-const ENGINE_GROUPS: Record<ConnectorKind, ObjectGroupName[]> = {
+const ENGINE_GROUPS: Partial<Record<ConnectorKind, ObjectGroupName[]>> = {
   postgres: ["Tables", "Views", "Materialized views", "Functions", "Procedures", "Sequences"],
   mysql: ["Tables", "Views", "Functions", "Procedures"],
   mssql: ["Tables", "Views", "Functions", "Procedures", "Sequences"],
@@ -169,7 +169,15 @@ const ENGINE_GROUPS: Record<ConnectorKind, ObjectGroupName[]> = {
   snowflake: ["Tables", "Views", "Materialized views", "Functions", "Procedures", "Sequences"],
   databricks: ["Tables", "Views", "Materialized views", "Functions"],
   bigquery: ["Tables", "Views", "Materialized views", "Functions", "Procedures"],
+  mongodb: ["Tables", "Views"],
 };
+
+/** Folder name as the engine calls it (MongoDB "Collections", Neo4j "Labels"). */
+export function groupLabel(name: ObjectGroupName, kind?: ConnectorKind): string {
+  if (!kind) return name;
+  const t = traitsOf(kind);
+  return name === "Tables" ? t.table_folder : name === "Views" ? t.view_folder : name;
+}
 
 /**
  * Objects grouped into explorer folders. With `kind`, every folder the engine
@@ -180,7 +188,7 @@ const ENGINE_GROUPS: Record<ConnectorKind, ObjectGroupName[]> = {
 export function groupObjects(objects: DbObject[], kind?: ConnectorKind): [ObjectGroupName, DbObject[]][] {
   const g = new Map<ObjectGroupName, DbObject[]>(OBJECT_GROUPS.map((n) => [n, []]));
   for (const o of objects) g.get(groupOf(o.kind))!.push(o);
-  const always = new Set(kind ? ENGINE_GROUPS[kind] : []);
+  const always = new Set(kind ? (ENGINE_GROUPS[kind] ?? []) : []);
   return [...g].filter(([n, v]) => v.length > 0 || always.has(n));
 }
 

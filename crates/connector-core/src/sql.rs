@@ -645,6 +645,9 @@ pub struct ParamSpan {
 /// digit, quote or bracket right before the colon), `:=` assignments, and
 /// Oracle trigger `:new` / `:old`.
 pub fn find_parameters(text: &str, kind: ConnectorKind) -> Vec<ParamSpan> {
+    if !kind.traits().syntax.colon_params {
+        return vec![];
+    }
     let b = text.as_bytes();
     let n = b.len();
     let lx = lex(kind);

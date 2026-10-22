@@ -132,6 +132,29 @@ pub fn provider_for(rec: &AiProviderRecord, secrets: Arc<dyn SecretStore>) -> Re
     Ok((providers::build(kind, &cfg, key)?, cfg, kind))
 }
 
+/// How to write queries for connections that don't speak SQL (empty for SQL).
+fn language_rules(kind: databrain_connector_core::ConnectorKind) -> String {
+    use databrain_connector_core::QueryLanguage as L;
+    let t = kind.traits();
+    match t.language {
+        L::Sql => String::new(),
+        L::MongoJson => "\nThis connection is MongoDB, not SQL: \"schemas\" are databases and \"tables\" are collections; describe_table lists \
+            the fields found in sampled documents. run_query and write_editor take ONE mongosh-style command, e.g. \
+            `db.getSiblingDB(\"shop\").orders.find({status: \"A\"}, {name: 1}).sort({at: -1}).limit(20)`, \
+            `db.getSiblingDB(\"shop\").orders.aggregate([{$match: {}}, {$group: {_id: \"$country\", n: {$sum: 1}}}])`, \
+            countDocuments, distinct, insertOne/insertMany, updateOne/updateMany, deleteOne/deleteMany, or a JSON database command \
+            ({\"find\": \"orders\"}); `use <database>` on the first line picks the database. Always name the database (getSiblingDB or use) \
+            unless the connection has a default one. Nested fields come back as JSON text columns. Put commands in ```javascript blocks. \
+            To join with other sources, run each side and combine the outputs with query_outputs (DuckDB SQL over results.<handle>).\n".into(),
+        L::Cypher => "\nThis connection is Neo4j, not SQL: write Cypher. The schema lists node labels (schema Nodes) and relationship types \
+            (schema Relationships) as tables with their properties as columns. Return properties rather than whole nodes when you can \
+            (`MATCH (p:Person)-[:ACTED_IN]->(m:Movie) RETURN p.name AS actor, m.title AS movie LIMIT 25`); always add LIMIT. \
+            A returned node or relationship becomes columns of its properties. Put queries in ```cypher blocks. \
+            To join with other sources, combine outputs with query_outputs (DuckDB SQL over results.<handle>).\n".into(),
+        L::Cql => format!("\nThis connection is {}: write CQL (no joins; filter on the partition key; always add LIMIT).\n", t.name),
+    }
+}
+
 /// System prompt for questions that need no database (connection errors).
 const NO_DATABASE_PROMPT: &str = "You are DataBrain's assistant, embedded in a desktop SQL client. The user asks about a database connection \
     that could not be set up (its settings and error are in the message). Explain the error, the likely causes and what to change, \
@@ -200,6 +223,7 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
             partitioning change, say so and give that DDL as a suggestion in a ```sql block instead of applying it.\n",
         Mode::AnalyzeResult => "\nTask: analyze the current result. Start with result_summary, compute what you need with query_result (SQLite syntax over table `result`), then give: key findings, notable patterns or anomalies, and 2-3 suggested follow-up queries.\n",
     });
+    s.push_str(&language_rules(kind));
     if !retrieved.text.is_empty() {
         s.push_str("\nRelevant schema (from the knowledge index):\n```sql\n");
         s.push_str(&retrieved.text);

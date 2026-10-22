@@ -3,6 +3,7 @@
 //! Each connector turns native driver results into Arrow record batches sent
 //! over a [`QueryStream`], so the grid, filtering and export are engine-agnostic.
 
+pub mod documents;
 pub mod error;
 pub mod language;
 pub mod external;
