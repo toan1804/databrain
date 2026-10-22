@@ -1,4 +1,5 @@
-// AI mode state: providers, the current chat run, UI requests from the agent
+// AI mode state: providers, the open conversations (each with its own run,
+// queue and approvals; several can work at once), UI requests from the agent
 // (approvals, editor proposals) and knowledge indexing progress.
 
 import { create } from "zustand";
@@ -76,27 +77,113 @@ export interface SendInput {
   targetKey?: string | null;
   connectionId?: string | null;
   context?: UiContext;
+  /** Conversation to ask in (default: the one shown). */
+  chatId?: string;
 }
 
-interface AiState {
-  open: boolean;
-  view: AiView;
-  providers: ProviderView[];
-  providerId: string | null;
-  model: string | null;
+/** One conversation (a tab in the AI panel). Several can work at the same time. */
+export interface Conversation {
+  id: string;
   sessionId: string | null;
+  /** Saved title (from history), else the first question is used. */
+  title: string | null;
   items: ChatItem[];
   runId: string | null;
   running: boolean;
   targetKey: string | null;
   connectionId: string | null;
+  tokens: { input: number; output: number };
+  credits: number;
+  contextPercent: number | null;
+  queued: (SendInput & { id: string })[];
+  lastInput: SendInput | null;
+  autoApprove: boolean;
+  /** Finished while another conversation was shown. */
+  unread: boolean;
+  /** Its saved messages are being read. */
+  loading: boolean;
+  /** Restored tab whose messages are read when it is shown. */
+  needsLoad?: boolean;
+}
+
+/** Fields of the shown conversation mirrored at the top of the store. */
+type Mirrored = Pick<
+  Conversation,
+  "sessionId" | "items" | "runId" | "running" | "targetKey" | "connectionId" | "tokens" | "credits" | "contextPercent" | "queued" | "lastInput" | "autoApprove"
+>;
+
+function mirror(c: Conversation): Mirrored {
+  return {
+    sessionId: c.sessionId,
+    items: c.items,
+    runId: c.runId,
+    running: c.running,
+    targetKey: c.targetKey,
+    connectionId: c.connectionId,
+    tokens: c.tokens,
+    credits: c.credits,
+    contextPercent: c.contextPercent,
+    queued: c.queued,
+    lastInput: c.lastInput,
+    autoApprove: c.autoApprove,
+  };
+}
+
+export function emptyConversation(connectionId: string | null = null): Conversation {
+  return {
+    id: uid(),
+    sessionId: null,
+    title: null,
+    items: [],
+    runId: null,
+    running: false,
+    targetKey: null,
+    connectionId,
+    tokens: { input: 0, output: 0 },
+    credits: 0,
+    contextPercent: null,
+    queued: [],
+    lastInput: null,
+    autoApprove: false,
+    unread: false,
+    loading: false,
+  };
+}
+
+/** Tab label: the saved title, else the first question. */
+export function conversationTitle(c: Conversation): string {
+  if (c.title) return c.title;
+  const q = c.items.find((i) => i.kind === "user");
+  return q && q.kind === "user" ? q.text.replace(/\s+/g, " ").slice(0, 60) : "New chat";
+}
+
+function isBlank(c: Conversation): boolean {
+  return !c.sessionId && !c.running && !c.loading && c.items.length === 0 && c.queued.length === 0;
+}
+
+const CHATS_KEY = "db.ai.chats";
+/** Most conversations open at once (the oldest idle one closes for a new one). */
+export const MAX_CHATS = 12;
+
+interface AiState extends Mirrored {
+  open: boolean;
+  view: AiView;
+  /** Open conversations, in tab order. The fields below mirror the shown one. */
+  chats: Conversation[];
+  activeChatId: string;
+  /** Start a conversation (reuses a blank shown one). Returns its id. */
+  newChat: (opts?: { activate?: boolean }) => string;
+  switchChat: (id: string) => void;
+  /** Close a conversation's tab (stops it if it is working; it stays in History). */
+  closeChat: (id: string) => void;
+  /** History entry deleted: close its tab. */
+  forgetSession: (sessionId: string) => void;
+  providers: ProviderView[];
+  providerId: string | null;
+  model: string | null;
   /** Other connections the assistant may use too (ids, kept across restarts). */
   alsoConnections: string[];
   setAlsoConnections: (ids: string[]) => void;
-  tokens: { input: number; output: number };
-  /** Kiro: credits this chat spent, and how full its context is (%). */
-  credits: number;
-  contextPercent: number | null;
   /** Budget and token totals per provider (loaded on demand). */
   usage: Record<string, { data?: ProviderUsage; error?: string; loading: boolean; at: number }>;
   /** Load a provider's usage; cached for a minute unless `force`. */
@@ -120,13 +207,9 @@ interface AiState {
   settingsProvider: string | null;
   openProviderSettings: (providerId?: string | null) => void;
   send: (input: SendInput) => Promise<void>;
-  cancel: () => Promise<void>;
-  newChat: () => void;
-  /** Questions asked while the assistant was working, sent in order when it finishes. */
-  queued: (SendInput & { id: string })[];
+  /** Stop a conversation's run (default: the shown one). */
+  cancel: (chatId?: string) => Promise<void>;
   removeQueued: (id: string) => void;
-  /** The question of the run in progress (kept for "Resend" when it fails). */
-  lastInput: SendInput | null;
   /** Send a failed question again (the error card goes away). */
   resend: (errorItemId: string) => void;
   /** After signing in to a provider again: its errors offer "Resend question" first. */
@@ -136,8 +219,7 @@ interface AiState {
   loadSession: (id: string) => Promise<void>;
   respondApproval: (itemId: string, approved: boolean, editedSql?: string, auto?: boolean) => Promise<void>;
   respondEdit: (itemId: string, accepted: boolean, auto?: boolean) => Promise<void>;
-  /** Approve every request of this conversation (queries, writes, jobs, edits) without asking. Off again for a new or another conversation. */
-  autoApprove: boolean;
+  /** Approve every request of the shown conversation (queries, writes, jobs, edits) without asking. Off for a new or another conversation. */
   setAutoApprove: (on: boolean) => void;
   /**
    * Index a connection. Without `scope`, large connections whose scope was
@@ -258,45 +340,136 @@ export const useAi = create<AiState>((set, get) => {
   /** Events and UI requests that arrived before ai_send returned the run id. */
   let early: AgentEvent[] = [];
   let earlyRequests: AiUiRequest[] = [];
-  const patchItem = (id: string, patch: Partial<ChatItem>) =>
-    set((s) => ({ items: s.items.map((i) => (i.id === id ? ({ ...i, ...patch } as ChatItem) : i)) }));
+
+  const chat = (id: string | null | undefined) => (id ? get().chats.find((c) => c.id === id) : undefined);
+  const byRun = (runId: string) => get().chats.find((c) => c.runId === runId);
+  /** A conversation waits for ai_send to return its run id. */
+  const starting = () => get().chats.some((c) => c.running && c.runId === null);
+
+  /** Open tabs (saved conversations only), restored at the next start. */
+  const persist = () => {
+    const { chats, activeChatId } = get();
+    const saved = chats.filter((c) => c.sessionId);
+    const active = saved.findIndex((c) => c.id === activeChatId);
+    try {
+      localStorage.setItem(CHATS_KEY, JSON.stringify({ chats: saved.map((c) => ({ sessionId: c.sessionId, title: conversationTitle(c) })), active }));
+    } catch {
+      /* storage full: tabs are not restored */
+    }
+  };
+
+  /** Change one conversation; the shown one is mirrored at the top of the store. */
+  const update = (id: string, fn: (c: Conversation) => Partial<Conversation>) =>
+    set((s) => {
+      let shown: Conversation | undefined;
+      const chats = s.chats.map((c) => {
+        if (c.id !== id) return c;
+        const n = { ...c, ...fn(c) };
+        if (n.id === s.activeChatId) shown = n;
+        return n;
+      });
+      return shown ? { chats, ...mirror(shown) } : { chats };
+    });
+
+  const patchItem = (chatId: string, id: string, patch: Partial<ChatItem>) =>
+    update(chatId, (c) => ({ items: c.items.map((i) => (i.id === id ? ({ ...i, ...patch } as ChatItem) : i)) }));
+
+  /** The conversation holding a card. */
+  const chatOfItem = (itemId: string) => get().chats.find((c) => c.items.some((i) => i.id === itemId));
+
+  /** Add a conversation tab (closing the oldest idle one past the limit). */
+  const addChat = (c: Conversation, activate: boolean) => {
+    set((s) => {
+      let chats = [...s.chats, c];
+      if (chats.length > MAX_CHATS) {
+        const drop = chats.find((x) => x.id !== c.id && x.id !== s.activeChatId && !x.running && !x.queued.length);
+        if (drop) chats = chats.filter((x) => x !== drop);
+      }
+      return activate ? { chats, activeChatId: c.id, ...mirror(c) } : { chats };
+    });
+    persist();
+  };
+
+  /** Read a saved conversation's messages into its tab. */
+  const loadMessages = async (chatId: string, sessionId: string) => {
+    update(chatId, () => ({ loading: true, needsLoad: false }));
+    try {
+      const [msgs, sessions] = await Promise.all([api.aiSessionMessages(sessionId), api.aiSessions(null)]);
+      const sess = sessions.find((s) => s.id === sessionId);
+      if (!sess && msgs.length === 0) {
+        // Deleted meanwhile (history clean-up): the tab goes away.
+        get().closeChat(chatId);
+        return;
+      }
+      const items: ChatItem[] = [];
+      for (const m of msgs) {
+        const c = typeof m.content === "string" ? { text: m.content } : m.content;
+        if (m.role === "user" && c.text) items.push({ id: uid(), kind: "user", text: c.text, mode: "chat" });
+        else if (m.role === "assistant") {
+          if (c.text) items.push({ id: uid(), kind: "assistant", text: c.text, streaming: false });
+          for (const tc of c.tool_calls ?? [])
+            items.push({ id: uid(), kind: "tool", callId: tc.id, tool: tc.name, args: (tc.arguments as Record<string, unknown>) ?? {}, done: true });
+        } else if (m.role === "tool") {
+          const last = [...items].reverse().find((i) => i.kind === "tool" && !i.content);
+          if (last && last.kind === "tool") last.content = c.text ?? "";
+        }
+      }
+      // Tokens the stored conversation used (Kiro credits are not stored).
+      const tokens = msgs.reduce((t, m) => ({ input: t.input + (m.tokens_in ?? 0), output: t.output + (m.tokens_out ?? 0) }), { input: 0, output: 0 });
+      update(chatId, (c) => ({
+        // A question asked while loading stays after the stored messages.
+        items: [...items, ...c.items],
+        title: sess?.title ?? c.title,
+        connectionId: c.connectionId ?? sess?.connection_id ?? get().connectionId,
+        tokens: { input: tokens.input + c.tokens.input, output: tokens.output + c.tokens.output },
+        loading: false,
+      }));
+      persist();
+    } catch (e) {
+      update(chatId, () => ({ loading: false }));
+      useStore.getState().toast(toError(e).message, "error");
+    }
+  };
 
   const handleAgent = (e: AgentEvent) => {
-    if (e.run_id !== get().runId) {
-      // Events of the run being started arrive before ai_send returns its id:
+    const c = byRun(e.run_id);
+    if (!c) {
+      // Events of a run being started arrive before ai_send returns its id:
       // keep them and replay them once the id is known (dropping "started"
       // lost the session id, so every question began a new conversation).
-      if (get().running && get().runId === null) early.push(e);
+      if (starting()) early.push(e);
       return;
     }
+    const id = c.id;
     // The conversation continues in this session, whichever event says so first.
-    if (e.session_id && get().sessionId !== e.session_id) set({ sessionId: e.session_id });
+    if (e.session_id && c.sessionId !== e.session_id) {
+      update(id, () => ({ sessionId: e.session_id }));
+      persist();
+    }
     switch (e.type) {
       case "started":
         break;
       case "text_delta":
-        set((s) => {
-          const last = s.items[s.items.length - 1];
+        update(id, (c) => {
+          const last = c.items[c.items.length - 1];
           if (last?.kind === "assistant" && last.streaming) {
-            return { items: [...s.items.slice(0, -1), { ...last, text: last.text + e.text }] };
+            return { items: [...c.items.slice(0, -1), { ...last, text: last.text + e.text }] };
           }
-          return { items: [...s.items, { id: uid(), kind: "assistant", text: e.text, streaming: true }] };
+          return { items: [...c.items, { id: uid(), kind: "assistant", text: e.text, streaming: true }] };
         });
         break;
       case "tool_started":
-        if (get().items.some((i) => i.kind === "tool" && i.callId === e.call_id)) break;
-        set((s) => ({
+        if (c.items.some((i) => i.kind === "tool" && i.callId === e.call_id)) break;
+        update(id, (c) => ({
           items: [
-            ...s.items.map((i) => (i.kind === "assistant" ? { ...i, streaming: false } : i)),
+            ...c.items.map((i) => (i.kind === "assistant" ? { ...i, streaming: false } : i)),
             { id: uid(), kind: "tool", callId: e.call_id, tool: e.tool, args: e.args ?? {}, done: false },
           ],
         }));
         break;
       case "tool_finished":
-        set((s) => ({
-          items: s.items.map((i) =>
-            i.kind === "tool" && i.callId === e.call_id ? { ...i, done: true, content: e.content, display: e.display } : i,
-          ),
+        update(id, (c) => ({
+          items: c.items.map((i) => (i.kind === "tool" && i.callId === e.call_id ? { ...i, done: true, content: e.content, display: e.display } : i)),
         }));
         if (e.tool === "add_knowledge_note" || e.tool === "update_knowledge_note" || e.tool === "index_tables") set((s) => ({ knowledgeVersion: s.knowledgeVersion + 1 }));
         if (e.tool === "save_query") void useStore.getState().refreshSavedQueries();
@@ -319,21 +492,22 @@ export const useAi = create<AiState>((set, get) => {
         }
         break;
       case "usage":
-        set((s) => ({ tokens: { input: s.tokens.input + e.input, output: s.tokens.output + e.output } }));
+        update(id, (c) => ({ tokens: { input: c.tokens.input + e.input, output: c.tokens.output + e.output } }));
         break;
       case "metering":
-        set((s) => ({ credits: s.credits + e.credits, contextPercent: e.context_percent ?? s.contextPercent }));
+        update(id, (c) => ({ credits: c.credits + e.credits, contextPercent: e.context_percent ?? c.contextPercent }));
         break;
       case "finished":
-      case "failed":
+      case "failed": {
         // The budget moved: refresh it if it is shown.
         if (get().providerId && get().usage[get().providerId!]) void get().loadUsage(get().providerId!, true);
-        set((s) => ({
+        const providerId = get().providerId;
+        update(id, (c) => ({
           running: false,
           runId: null,
-          sessionsVersion: s.sessionsVersion + 1,
+          unread: c.id !== get().activeChatId || c.unread,
           items: [
-            ...s.items.map((i): ChatItem => {
+            ...c.items.map((i): ChatItem => {
               if (i.kind === "assistant") return { ...i, streaming: false };
               if (i.kind === "tool" && !i.done) return { ...i, done: true };
               if (i.kind === "approval" && i.state === "pending") return { ...i, state: "denied" };
@@ -346,29 +520,32 @@ export const useAi = create<AiState>((set, get) => {
                     id: uid(),
                     kind: "error" as const,
                     text: e.error.message,
-                    providerId: needsProviderSettings(e.error) ? s.providerId : undefined,
-                    retry: s.lastInput ?? undefined,
+                    providerId: needsProviderSettings(e.error) ? providerId : undefined,
+                    retry: c.lastInput ?? undefined,
                   },
                 ]
               : []),
           ],
         }));
+        set((s) => ({ sessionsVersion: s.sessionsVersion + 1 }));
         // The next question asked meanwhile goes out now. After a failure or
         // Stop it waits for the user (Send now / remove).
         if (e.type === "finished") {
-          const [next, ...rest] = get().queued;
+          const [next, ...rest] = chat(id)?.queued ?? [];
           if (next) {
-            set({ queued: rest });
-            setTimeout(() => void get().send(next), 0);
+            update(id, () => ({ queued: rest }));
+            setTimeout(() => void get().send({ ...next, chatId: id }), 0);
           }
         }
         break;
+      }
     }
   };
 
   const handleRequest = (r: AiUiRequest) => {
-    if (r.run_id !== get().runId) {
-      if (get().running && get().runId === null) {
+    const c = byRun(r.run_id);
+    if (!c) {
+      if (starting()) {
         earlyRequests.push(r);
         return;
       }
@@ -376,7 +553,8 @@ export const useAi = create<AiState>((set, get) => {
       void api.aiRespond(r.request_id, r.type === "edit_proposal" ? { accepted: false } : { approved: false });
       return;
     }
-    const key = get().targetKey;
+    const id = c.id;
+    const key = c.targetKey;
     if (r.type === "editor_request") {
       const snap = editorBridge.snapshot(key);
       const ctx = runContext(key);
@@ -388,21 +566,25 @@ export const useAi = create<AiState>((set, get) => {
       );
       return;
     }
+    // A conversation in the background that needs an answer is marked.
+    const unread = id !== get().activeChatId && !c.autoApprove;
     if (r.type === "approval_request") {
-      if (get().items.some((i) => i.kind === "approval" && i.requestId === r.request_id)) return;
-      const id = uid();
-      set((s) => ({
-        items: [...s.items, { id, kind: "approval", requestId: r.request_id, tool: r.tool, summary: r.summary, detail: r.detail ?? {}, state: "pending" }],
+      if (c.items.some((i) => i.kind === "approval" && i.requestId === r.request_id)) return;
+      const itemId = uid();
+      update(id, (c) => ({
+        unread: c.unread || unread,
+        items: [...c.items, { id: itemId, kind: "approval", requestId: r.request_id, tool: r.tool, summary: r.summary, detail: r.detail ?? {}, state: "pending" }],
       }));
-      if (get().autoApprove) void get().respondApproval(id, true, undefined, true);
+      if (c.autoApprove) void get().respondApproval(itemId, true, undefined, true);
       return;
     }
-    if (get().items.some((i) => i.kind === "edit" && i.requestId === r.request_id)) return;
+    if (c.items.some((i) => i.kind === "edit" && i.requestId === r.request_id)) return;
     const target = r.proposal.mode === "new_tab" ? null : key;
     const editId = uid();
-    set((s) => ({
+    update(id, (c) => ({
+      unread: c.unread || unread,
       items: [
-        ...s.items,
+        ...c.items,
         {
           id: editId,
           kind: "edit",
@@ -414,22 +596,35 @@ export const useAi = create<AiState>((set, get) => {
         },
       ],
     }));
-    if (get().autoApprove) void get().respondEdit(editId, true, true);
+    if (c.autoApprove) void get().respondEdit(editId, true, true);
   };
+
+  // Conversations open at the last start: their tabs come back, and their
+  // messages are read when they are shown.
+  const restored = (() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(CHATS_KEY) ?? "null") as { chats?: { sessionId?: unknown; title?: unknown }[]; active?: number } | null;
+      const chats = (v?.chats ?? [])
+        .filter((x) => typeof x?.sessionId === "string")
+        .slice(0, MAX_CHATS)
+        .map((x): Conversation => ({ ...emptyConversation(), sessionId: x.sessionId as string, title: typeof x.title === "string" ? x.title : null, needsLoad: true }));
+      return { chats, active: chats[v?.active ?? -1] ?? chats[0] };
+    } catch {
+      return { chats: [], active: undefined };
+    }
+  })();
+  const first = restored.active ?? emptyConversation();
+  const initialChats = restored.chats.length ? restored.chats : [first];
 
   return {
     open: localStorage.getItem("db.ai.open") === "1",
     view: "chat",
+    chats: initialChats,
+    activeChatId: first.id,
+    ...mirror(first),
     providers: [],
     providerId: null,
     model: null,
-    sessionId: null,
-    items: [],
-    autoApprove: false,
-    runId: null,
-    running: false,
-    targetKey: null,
-    connectionId: null,
     alsoConnections: (() => {
       try {
         const v = JSON.parse(localStorage.getItem("db.ai.alsoConns") ?? "[]");
@@ -443,9 +638,6 @@ export const useAi = create<AiState>((set, get) => {
       localStorage.setItem("db.ai.alsoConns", JSON.stringify(uniq));
       set({ alsoConnections: uniq });
     },
-    tokens: { input: 0, output: 0 },
-    credits: 0,
-    contextPercent: null,
     usage: {},
     loadUsage: async (providerId, force = false) => {
       const cur = get().usage[providerId];
@@ -466,19 +658,21 @@ export const useAi = create<AiState>((set, get) => {
     indexPicker: null,
     sessionsVersion: 0,
     models: savedModels(),
-    queued: [],
-    lastInput: null,
     resend: (itemId) => {
-      const it = get().items.find((i) => i.id === itemId);
-      if (it?.kind !== "error" || !it.retry) return;
+      const c = chatOfItem(itemId);
+      const it = c?.items.find((i) => i.id === itemId);
+      if (!c || it?.kind !== "error" || !it.retry) return;
       const retry = it.retry;
-      set((s) => ({ items: s.items.filter((i) => i.id !== itemId) }));
-      void get().send(retry);
+      update(c.id, (c) => ({ items: c.items.filter((i) => i.id !== itemId) }));
+      void get().send({ ...retry, chatId: c.id });
     },
-    markReauthed: (providerId) =>
-      set((s) => ({
-        items: s.items.map((i) => (i.kind === "error" && i.retry && (i.providerId === providerId || i.providerId === null) ? { ...i, reauthed: true } : i)),
-      })),
+    markReauthed: (providerId) => {
+      for (const c of get().chats)
+        if (c.items.some((i) => i.kind === "error" && i.retry))
+          update(c.id, (c) => ({
+            items: c.items.map((i) => (i.kind === "error" && i.retry && (i.providerId === providerId || i.providerId === null) ? { ...i, reauthed: true } : i)),
+          }));
+    },
     settingsProvider: null,
 
     loadModels: (providerId, force = false) => {
@@ -540,6 +734,9 @@ export const useAi = create<AiState>((set, get) => {
             e.report.errors.length ? "info" : "success",
           );
       });
+      // The shown restored conversation is read now; the others when opened.
+      const shown = chat(get().activeChatId);
+      if (shown?.needsLoad && shown.sessionId) void loadMessages(shown.id, shown.sessionId);
       const [settings] = await Promise.all([api.getSettings(), get().refreshProviders()]);
       const pid = typeof settings.ai_provider === "string" ? settings.ai_provider : null;
       const providers = get().providers;
@@ -576,9 +773,14 @@ export const useAi = create<AiState>((set, get) => {
       const { message, mode = "chat", targetKey, connectionId, context } = input;
       const st = useStore.getState();
       if (!st.backendAvailable) return st.toast("AI needs the desktop app", "error");
-      if (get().running) {
-        // Asked while the assistant works: sent when the current answer is done.
-        set((s) => ({ queued: [...s.queued, { ...input, id: uid() }] }));
+      const c = chat(input.chatId) ?? chat(get().activeChatId);
+      if (!c) return;
+      const id = c.id;
+      const { chatId: _ignored, ...plain } = input;
+      void _ignored;
+      if (c.running) {
+        // Asked while this conversation works: sent when its answer is done.
+        update(id, (c) => ({ queued: [...c.queued, { ...plain, id: uid() }] }));
         return;
       }
       if (!get().providerId) {
@@ -587,7 +789,7 @@ export const useAi = create<AiState>((set, get) => {
         return;
       }
       const key = targetKey !== undefined ? targetKey : defaultTargetKey();
-      const conn = connectionId ?? connectionForKey(key) ?? get().connectionId;
+      const conn = connectionId ?? connectionForKey(key) ?? c.connectionId ?? get().connectionId;
       if (!conn) return st.toast("Choose a connection for the assistant", "error");
       const rc = runContext(key);
       // Fix error: the statement that failed is the one to fix, wherever the
@@ -617,21 +819,17 @@ export const useAi = create<AiState>((set, get) => {
       };
       // One conversation across questions, also after switching connections
       // (each turn is told which connection it is on). New chat starts over.
-      const sessionId = get().sessionId;
-      set((s) => ({
-        open: true,
-        view: "chat",
-        items: sessionId ? [...s.items, { id: uid(), kind: "user", text: message, mode }] : [{ id: uid(), kind: "user", text: message, mode }],
-        sessionId,
+      const sessionId = c.sessionId;
+      update(id, (c) => ({
+        items: [...c.items, { id: uid(), kind: "user", text: message, mode }],
         running: true,
         runId: null,
-        lastInput: input,
+        lastInput: plain,
         targetKey: key,
         connectionId: conn,
-        tokens: sessionId ? s.tokens : { input: 0, output: 0 },
-        credits: sessionId ? s.credits : 0,
-        contextPercent: sessionId ? s.contextPercent : null,
+        unread: false,
       }));
+      set({ open: true, view: "chat" });
       localStorage.setItem("db.ai.open", "1");
       try {
         const runId = await api.aiSend({
@@ -644,87 +842,140 @@ export const useAi = create<AiState>((set, get) => {
           context: ctx,
           tab_id: key,
         });
-        set({ runId });
+        // Closed while starting: stop the run it started.
+        if (!chat(id)) {
+          void api.aiCancel(runId);
+          return;
+        }
+        update(id, () => ({ runId }));
         // Replay what this run sent before its id was known.
         const evs = early.filter((x) => x.run_id === runId);
         const reqs = earlyRequests.filter((x) => x.run_id === runId);
-        early = [];
-        earlyRequests = [];
+        early = early.filter((x) => x.run_id !== runId);
+        earlyRequests = earlyRequests.filter((x) => x.run_id !== runId);
+        if (!starting()) {
+          early = [];
+          earlyRequests = [];
+        }
         for (const x of evs) handleAgent(x);
         for (const x of reqs) handleRequest(x);
       } catch (e) {
         const err = toError(e);
-        set((s) => ({
+        const providerId = get().providerId;
+        update(id, (c) => ({
           running: false,
-          items: [...s.items, { id: uid(), kind: "error", text: err.message, providerId: needsProviderSettings(err) ? s.providerId : undefined, retry: input }],
+          items: [...c.items, { id: uid(), kind: "error", text: err.message, providerId: needsProviderSettings(err) ? providerId : undefined, retry: plain }],
         }));
       }
     },
 
-    cancel: async () => {
-      const id = get().runId;
+    cancel: async (chatId) => {
+      const id = chat(chatId ?? get().activeChatId)?.runId;
       if (id) await api.aiCancel(id);
     },
 
-    newChat: () => {
-      if (get().running) void get().cancel();
-      set({ sessionId: null, items: [], autoApprove: false, runId: null, running: false, queued: [], tokens: { input: 0, output: 0 }, credits: 0, contextPercent: null, view: "chat" });
-    },
-
-    removeQueued: (id) => set((s) => ({ queued: s.queued.filter((q) => q.id !== id) })),
-    sendQueued: (id) => {
-      const q = get().queued.find((x) => x.id === id);
-      if (!q || get().running) return;
-      set((s) => ({ queued: s.queued.filter((x) => x.id !== id) }));
-      void get().send(q);
-    },
-
-    loadSession: async (id) => {
-      try {
-        const [msgs, sessions] = await Promise.all([api.aiSessionMessages(id), api.aiSessions(null)]);
-        const sess = sessions.find((s) => s.id === id);
-        const items: ChatItem[] = [];
-        for (const m of msgs) {
-          const c = typeof m.content === "string" ? { text: m.content } : m.content;
-          if (m.role === "user" && c.text) items.push({ id: uid(), kind: "user", text: c.text, mode: "chat" });
-          else if (m.role === "assistant") {
-            if (c.text) items.push({ id: uid(), kind: "assistant", text: c.text, streaming: false });
-            for (const tc of c.tool_calls ?? [])
-              items.push({ id: uid(), kind: "tool", callId: tc.id, tool: tc.name, args: (tc.arguments as Record<string, unknown>) ?? {}, done: true });
-          } else if (m.role === "tool") {
-            const last = [...items].reverse().find((i) => i.kind === "tool" && !i.content);
-            if (last && last.kind === "tool") last.content = c.text ?? "";
-          }
-        }
-        // Tokens the stored conversation used (Kiro credits are not stored).
-        const tokens = msgs.reduce((t, m) => ({ input: t.input + (m.tokens_in ?? 0), output: t.output + (m.tokens_out ?? 0) }), { input: 0, output: 0 });
-        set({ sessionId: id, items, autoApprove: id === get().sessionId && get().autoApprove, connectionId: sess?.connection_id ?? get().connectionId, view: "chat", runId: null, running: false, tokens, credits: 0, contextPercent: null });
-      } catch (e) {
-        useStore.getState().toast(toError(e).message, "error");
+    newChat: (opts = {}) => {
+      const activate = opts.activate ?? true;
+      const shown = chat(get().activeChatId);
+      if (shown && isBlank(shown)) {
+        if (activate) set({ view: "chat" });
+        return shown.id;
       }
+      // A new conversation keeps the connection the assistant was on.
+      const c = emptyConversation(shown?.connectionId ?? null);
+      addChat(c, activate);
+      if (activate) set({ view: "chat" });
+      return c.id;
+    },
+
+    switchChat: (id) => {
+      const c = chat(id);
+      if (!c) return;
+      set({ activeChatId: id, view: "chat" });
+      update(id, () => ({ unread: false }));
+      if (c.needsLoad && c.sessionId) void loadMessages(id, c.sessionId);
+      persist();
+    },
+
+    closeChat: (id) => {
+      const c = chat(id);
+      if (!c) return;
+      if (c.runId) void api.aiCancel(c.runId).catch(() => {});
+      // Nobody will answer its open requests: decline them now.
+      for (const i of c.items) {
+        if (i.kind === "approval" && i.state === "pending") void api.aiRespond(i.requestId, { approved: false }).catch(() => {});
+        if (i.kind === "edit" && i.state === "pending") void api.aiRespond(i.requestId, { accepted: false }).catch(() => {});
+      }
+      const { chats, activeChatId } = get();
+      const at = chats.findIndex((x) => x.id === id);
+      let rest = chats.filter((x) => x.id !== id);
+      if (!rest.length) rest = [emptyConversation(c.connectionId)];
+      const next = activeChatId === id ? rest[Math.min(at, rest.length - 1)] : chat(activeChatId)!;
+      set({ chats: rest, activeChatId: next.id, ...mirror(next) });
+      if (activeChatId === id && next.needsLoad && next.sessionId) void loadMessages(next.id, next.sessionId);
+      persist();
+    },
+
+    forgetSession: (sessionId) => {
+      for (const c of get().chats) if (c.sessionId === sessionId) get().closeChat(c.id);
+    },
+
+    removeQueued: (qid) => {
+      const c = get().chats.find((c) => c.queued.some((q) => q.id === qid));
+      if (c) update(c.id, (c) => ({ queued: c.queued.filter((q) => q.id !== qid) }));
+    },
+    sendQueued: (qid) => {
+      const c = get().chats.find((c) => c.queued.some((q) => q.id === qid));
+      const q = c?.queued.find((x) => x.id === qid);
+      if (!c || !q || c.running) return;
+      update(c.id, (c) => ({ queued: c.queued.filter((x) => x.id !== qid) }));
+      void get().send({ ...q, chatId: c.id });
+    },
+
+    loadSession: async (sessionId) => {
+      // Already open: show its tab.
+      const open = get().chats.find((c) => c.sessionId === sessionId);
+      if (open) return get().switchChat(open.id);
+      const shown = chat(get().activeChatId);
+      let id: string;
+      if (shown && isBlank(shown)) {
+        id = shown.id;
+        update(id, () => ({ sessionId }));
+        set({ view: "chat" });
+      } else {
+        const c = { ...emptyConversation(), sessionId };
+        addChat(c, true);
+        set({ view: "chat" });
+        id = c.id;
+      }
+      await loadMessages(id, sessionId);
     },
 
     setAutoApprove: (on) => {
-      set({ autoApprove: on });
+      const id = get().activeChatId;
+      update(id, () => ({ autoApprove: on }));
       if (!on) return;
       // What is already waiting is approved too.
-      for (const i of get().items) {
+      for (const i of chat(id)?.items ?? []) {
         if (i.kind === "approval" && i.state === "pending") void get().respondApproval(i.id, true, undefined, true);
         if (i.kind === "edit" && i.state === "pending") void get().respondEdit(i.id, true, true);
       }
     },
 
     respondApproval: async (itemId, approved, editedSql, auto) => {
-      const item = get().items.find((i) => i.id === itemId);
-      if (!item || item.kind !== "approval" || item.state !== "pending") return;
+      const c = chatOfItem(itemId);
+      const item = c?.items.find((i) => i.id === itemId);
+      if (!c || !item || item.kind !== "approval" || item.state !== "pending") return;
       const detail = editedSql !== undefined ? { ...item.detail, sql: editedSql } : item.detail;
-      patchItem(itemId, { state: approved ? "approved" : "denied", detail, auto: !!auto } as Partial<ChatItem>);
+      patchItem(c.id, itemId, { state: approved ? "approved" : "denied", detail, auto: !!auto } as Partial<ChatItem>);
       await api.aiRespond(item.requestId, { approved, detail });
     },
 
     respondEdit: async (itemId, accepted, auto) => {
-      const item = get().items.find((i) => i.id === itemId);
-      if (!item || item.kind !== "edit" || item.state !== "pending") return;
+      const c = chatOfItem(itemId);
+      const item = c?.items.find((i) => i.id === itemId);
+      if (!c || !item || item.kind !== "edit" || item.state !== "pending") return;
+      const chatConn = c.connectionId;
       let ok = accepted;
       if (accepted) {
         // SQL over outputs (results.<name>) runs on the Results (DuckDB) connection.
@@ -735,9 +986,9 @@ export const useAi = create<AiState>((set, get) => {
         if (item.proposal.mode === "new_tab" || !item.targetKey) {
           if (readsOutputs) {
             const results = await resultsConnection().catch(() => null);
-            st.newTab({ title: item.proposal.title || "AI query", sql: withDuckdbHeader(item.proposal.sql), connection_id: results ?? get().connectionId });
+            st.newTab({ title: item.proposal.title || "AI query", sql: withDuckdbHeader(item.proposal.sql), connection_id: results ?? chatConn });
           } else {
-            st.newTab({ title: item.proposal.title || "AI query", sql: item.proposal.sql, connection_id: get().connectionId });
+            st.newTab({ title: item.proposal.title || "AI query", sql: item.proposal.sql, connection_id: chatConn });
           }
         } else if (readsOutputs && tab && tabKind !== "duckdb" && item.proposal.mode === "replace_all") {
           // The whole query tab becomes a query over outputs: switch it to Results.
@@ -757,7 +1008,7 @@ export const useAi = create<AiState>((set, get) => {
           st.toast("The inserted SQL reads outputs (results.<name>); run it on the Results (DuckDB) connection", "info");
         }
       }
-      patchItem(itemId, { state: ok ? "accepted" : "rejected", auto: ok && !!auto } as Partial<ChatItem>);
+      patchItem(c.id, itemId, { state: ok ? "accepted" : "rejected", auto: ok && !!auto } as Partial<ChatItem>);
       await api.aiRespond(item.requestId, { accepted: ok });
     },
 

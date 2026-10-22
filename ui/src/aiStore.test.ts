@@ -19,6 +19,14 @@ vi.mock("./lib/api", () => ({
 }));
 const modelCalls: string[] = [];
 
+/** Change the shown conversation (as the store does: in `chats`, mirrored at the top). */
+async function setShown(patch: Record<string, unknown>) {
+  const { useAi } = await import("./aiStore");
+  const s = useAi.getState();
+  const chats = s.chats.map((c) => (c.id === s.activeChatId ? { ...c, ...patch } : c));
+  useAi.setState({ chats, ...patch });
+}
+
 describe("aiStore: provider settings and models", () => {
   it("offers provider settings for sign-in and key errors only", async () => {
     const { needsProviderSettings } = await import("./aiStore");
@@ -80,12 +88,12 @@ describe("aiStore: while the assistant works", () => {
     const { useAi } = await import("./aiStore");
     const { useStore } = await import("./store");
     useStore.setState({ backendAvailable: true });
-    useAi.setState({ running: true, queued: [] });
+    await setShown({ running: true, queued: [] });
     await useAi.getState().send({ message: "and by month?" });
     expect(useAi.getState().queued.map((q) => q.message)).toEqual(["and by month?"]);
     useAi.getState().removeQueued(useAi.getState().queued[0].id);
     expect(useAi.getState().queued).toEqual([]);
-    useAi.setState({ running: false });
+    await setShown({ running: false });
   });
 
   it("says what it is doing", async () => {
@@ -102,7 +110,7 @@ describe("aiStore: resend a failed question", () => {
   it("marks errors after signing in again and sends the question again", async () => {
     const { useAi } = await import("./aiStore");
     const retry = { message: "top customers?" };
-    useAi.setState({
+    await setShown({
       running: true,
       queued: [],
       items: [{ id: "e1", kind: "error", text: "Kiro: Not signed in", providerId: "p1", retry }],
@@ -114,6 +122,6 @@ describe("aiStore: resend a failed question", () => {
     useAi.getState().resend("e1");
     expect(useAi.getState().items).toEqual([]);
     expect(useAi.getState().queued.map((q) => q.message)).toEqual(["top customers?"]);
-    useAi.setState({ running: false, queued: [] });
+    await setShown({ running: false, queued: [] });
   });
 });

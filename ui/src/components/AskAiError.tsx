@@ -1,10 +1,12 @@
 import { useState } from "react";
 import { Loader2, Sparkles } from "lucide-react";
-import { useAi } from "../aiStore";
+import { useAi, type ChatItem } from "../aiStore";
 import { useStore } from "../store";
 import { Markdown } from "./Markdown";
 
 export { connectionErrorQuestion } from "../lib/aiQuestions";
+
+const NO_ITEMS: ChatItem[] = [];
 
 /** The connection the conversation is filed under (the assistant doesn't use it): this one if it is saved with AI on, else the AI panel's, else any with AI on. */
 function aiConnection(preferred: string | null): string | null {
@@ -21,28 +23,31 @@ function aiConnection(preferred: string | null): string | null {
  * (dialogs cover the AI panel), and the conversation stays in AI history.
  */
 export function AskAiAboutError({ error, question, connectionId }: { error: string; question: () => string; connectionId: string | null }) {
-  // Index in the AI conversation where our question starts.
-  const [since, setSince] = useState<number | null>(null);
+  // The conversation of our question (its own tab in the AI panel), and the error it was about.
+  const [chatId, setChatId] = useState<string | null>(null);
   const [asked, setAsked] = useState<string | null>(null);
-  const items = useAi((s) => s.items);
-  const running = useAi((s) => s.running);
+  const chat = useAi((s) => (chatId ? s.chats.find((c) => c.id === chatId) : undefined));
+  const items = chat?.items ?? NO_ITEMS;
+  const running = !!chat?.running;
   const toast = useStore((s) => s.toast);
 
   const ask = async () => {
     const ai = useAi.getState();
-    if (ai.running) return toast("The assistant is busy with another question; try again when it finishes", "info");
     if (!ai.providerId) {
       toast("Add an AI provider first", "info");
       return useStore.getState().setSettingsOpen(true);
     }
     const conn = aiConnection(connectionId);
     if (!conn) return toast("Turn on AI for one connection first (its AI settings); the assistant runs on a connection", "error");
-    ai.newChat();
-    setSince(0);
+    // A conversation of its own, so it never waits for (or mixes into) another
+    // one; the AI panel keeps showing what it showed.
+    const id = ai.newChat({ activate: false });
+    setChatId(id);
     setAsked(error);
     // The question is about the settings, not data: the assistant must not
     // connect to the connection it runs on (that could start its sign-in).
     await ai.send({
+      chatId: id,
       message: question(),
       connectionId: conn,
       targetKey: null,
@@ -50,16 +55,16 @@ export function AskAiAboutError({ error, question, connectionId }: { error: stri
     });
   };
 
-  const answer = since === null || asked !== error ? [] : items.slice(since).filter((i) => i.kind === "assistant" || i.kind === "error");
+  const answer = !chat || asked !== error ? [] : items.filter((i) => i.kind === "assistant" || i.kind === "error");
   const last = answer.at(-1);
-  const thinking = since !== null && asked === error && running && !(last?.kind === "assistant" && last.text);
+  const thinking = !!chat && asked === error && running && !(last?.kind === "assistant" && last.text);
 
   return (
     <>
       <button type="button" className="btn-ghost -my-1 h-6 shrink-0 px-1.5 py-0 text-[11.5px]" title="Ask the AI assistant what this error means and how to fix it" onClick={() => void ask()} disabled={thinking}>
         {thinking ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />} Ask AI
       </button>
-      {since !== null && asked === error && (thinking || last) && (
+      {!!chat && asked === error && (thinking || last) && (
         <div className="basis-full rounded-md border border-line bg-panel p-2 text-[12.5px]" aria-live="polite">
           {last?.kind === "assistant" && last.text ? (
             <Markdown text={last.text} className="text-[12.5px]" />
@@ -68,7 +73,7 @@ export function AskAiAboutError({ error, question, connectionId }: { error: stri
           ) : (
             <span className="text-muted">Asking the assistant…</span>
           )}
-          {!running && last?.kind === "assistant" && <p className="mt-1.5 text-[11px] text-muted">The conversation is also in the AI panel (⌘L), to ask more.</p>}
+          {!running && last?.kind === "assistant" && <p className="mt-1.5 text-[11px] text-muted">The conversation is also in the AI panel (⌘L), in its own tab, to ask more.</p>}
         </div>
       )}
     </>

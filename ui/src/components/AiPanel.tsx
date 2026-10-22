@@ -36,7 +36,7 @@ import { api, toError } from "../lib/api";
 import type { AiMode, AiSessionRecord, ConnectionView, KnNote, KnObject, KnowledgeView, NotesImportPreview, ResultInfo } from "../lib/types";
 import { emptyView, formatCount, lineDiff, placeComboList, relativeTime, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
-import { connectionForKey, useAi, visibleItems, workingStatus, type ChatItem } from "../aiStore";
+import { connectionForKey, conversationTitle, useAi, visibleItems, workingStatus, type ChatItem, type Conversation } from "../aiStore";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { exportFileName } from "../lib/notesImport";
 import { ImportNotesDialog } from "./ImportNotesDialog";
@@ -53,6 +53,7 @@ export function AiPanel() {
   const setView = useAi((s) => s.setView);
   const setOpen = useAi((s) => s.setOpen);
   const newChat = useAi((s) => s.newChat);
+  const activeChatId = useAi((s) => s.activeChatId);
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
 
   const tab = (v: typeof view, icon: React.ReactNode, label: string) => (
@@ -74,7 +75,7 @@ export function AiPanel() {
         {tab("history", <History size={13} />, "History")}
         {tab("knowledge", <BookOpen size={13} />, "Knowledge")}
         <div className="ml-auto flex items-center">
-          <button className="icon-btn" title="New chat" aria-label="New chat" onClick={newChat}>
+          <button className="icon-btn" title="New chat (opens next to the others)" aria-label="New chat" onClick={() => newChat()}>
             <MessageSquarePlus size={14} />
           </button>
           <button className="icon-btn" title="AI settings" aria-label="AI settings" onClick={() => setSettingsOpen(true)}>
@@ -85,7 +86,8 @@ export function AiPanel() {
           </button>
         </div>
       </div>
-      {view === "chat" && <Chat />}
+      {view === "chat" && <ChatTabs />}
+      {view === "chat" && <Chat key={activeChatId} chatId={activeChatId} />}
       {view === "history" && <Sessions />}
       {view === "knowledge" && <Knowledge />}
     </div>
@@ -103,7 +105,112 @@ const QUICK: { mode: AiMode; label: string; prompt: string; icon: React.ReactNod
   { mode: "analyze_result", label: "Analyze result", prompt: "Analyze the current result and summarize the key findings.", icon: <Sparkles size={12} /> },
 ];
 
-function Chat() {
+/** Unsent question per conversation (kept while switching tabs). */
+const drafts = new Map<string, string>();
+
+/** Open conversations as tabs; each keeps working while another is shown. */
+function ChatTabs() {
+  const chats = useAi((s) => s.chats);
+  const active = useAi((s) => s.activeChatId);
+  const switchChat = useAi((s) => s.switchChat);
+  const closeChat = useAi((s) => s.closeChat);
+  const newChat = useAi((s) => s.newChat);
+  const bar = useRef<HTMLDivElement>(null);
+
+  // Keep the shown conversation in view.
+  useEffect(() => {
+    const el = bar.current;
+    const tab = el?.querySelector<HTMLElement>('[aria-selected="true"]');
+    if (!el || !tab) return;
+    const b = el.getBoundingClientRect();
+    const r = tab.getBoundingClientRect();
+    if (r.left < b.left) el.scrollLeft -= b.left - r.left + 4;
+    else if (r.right > b.right) el.scrollLeft += r.right - b.right + 4;
+  }, [active, chats.length]);
+
+  const close = (c: Conversation) => {
+    const pending = c.items.some((i) => (i.kind === "approval" || i.kind === "edit") && i.state === "pending");
+    if (!c.running && !pending) {
+      drafts.delete(c.id);
+      return closeChat(c.id);
+    }
+    useStore.getState().askConfirm({
+      title: `Close "${conversationTitle(c)}"?`,
+      reasons: ["The assistant is still working on it: closing stops it and declines what waits for approval. The conversation so far stays in History."],
+      confirmLabel: "Stop and close",
+      onConfirm: () => {
+        drafts.delete(c.id);
+        closeChat(c.id);
+      },
+    });
+  };
+
+  // One blank conversation: nothing to switch between.
+  if (chats.length === 1 && !chats[0].sessionId && chats[0].items.length === 0) return null;
+
+  return (
+    <div
+      ref={bar}
+      role="tablist"
+      aria-label="Conversations"
+      className="flex h-8 shrink-0 items-center gap-0.5 overflow-x-auto border-b border-line px-1.5"
+      onWheel={(e) => {
+        if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) e.currentTarget.scrollLeft += e.deltaY;
+      }}
+    >
+      {chats.map((c) => {
+        const selected = c.id === active;
+        const title = conversationTitle(c);
+        const waiting = c.items.some((i) => (i.kind === "approval" || i.kind === "edit") && i.state === "pending");
+        return (
+          <div
+            key={c.id}
+            role="tab"
+            tabIndex={0}
+            aria-selected={selected}
+            title={`${title}${c.running ? (waiting ? " · waiting for your approval" : " · working…") : c.unread ? " · new answer" : ""}`}
+            onClick={() => switchChat(c.id)}
+            onAuxClick={(e) => e.button === 1 && close(c)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                switchChat(c.id);
+              }
+            }}
+            className={`group flex h-6 min-w-[72px] max-w-[160px] shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 text-[11.5px] ${
+              selected ? "bg-hover text-fg" : "text-muted hover:bg-hover/60 hover:text-fg"
+            }`}
+          >
+            {waiting ? (
+              <ShieldAlert size={11} className="shrink-0 text-warning" aria-label="Waiting for approval" />
+            ) : c.running || c.loading ? (
+              <Loader2 size={11} className="shrink-0 animate-spin text-accent" aria-label={c.loading ? "Loading" : "Working"} />
+            ) : c.unread ? (
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent" aria-label="New answer" />
+            ) : null}
+            <span className="min-w-0 flex-1 truncate">{title}</span>
+            <button
+              aria-label={`Close ${title}`}
+              title="Close (stays in History)"
+              onClick={(e) => {
+                e.stopPropagation();
+                close(c);
+              }}
+              className={`shrink-0 rounded p-0.5 text-muted hover:bg-panel hover:text-fg ${selected ? "" : "opacity-0 group-hover:opacity-100 focus:opacity-100"}`}
+            >
+              <X size={10} />
+            </button>
+          </div>
+        );
+      })}
+      <button className="icon-btn h-6 w-6 shrink-0" title="New chat" aria-label="New chat" onClick={() => newChat()}>
+        <MessageSquarePlus size={12} />
+      </button>
+    </div>
+  );
+}
+
+function Chat({ chatId }: { chatId: string }) {
   const items = useAi((s) => s.items);
   const running = useAi((s) => s.running);
   const queued = useAi((s) => s.queued);
@@ -119,7 +226,11 @@ function Chat() {
   const connections = useStore((s) => s.connections);
   const activeTab = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId));
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
-  const [text, setText] = useState("");
+  const [text, setText] = useState(() => drafts.get(chatId) ?? "");
+  useEffect(() => {
+    if (text) drafts.set(chatId, text);
+    else drafts.delete(chatId);
+  }, [chatId, text]);
   const [mode, setMode] = useState<AiMode>("chat");
   const models = useAi((s) => (providerId ? s.models[providerId] : undefined)) ?? NO_MODELS;
   const outputs = useStore((s) => s.outputs);
@@ -207,7 +318,7 @@ function Chat() {
       ...(mentions.length ? { mentions } : {}),
       ...(jobTab ? { open_job_id: jobTab.id, open_job_name: jobTab.name } : {}),
     };
-    void send({ message: msg.trim(), mode: m, connectionId: connId, targetKey: jobTab ? null : undefined, context: Object.keys(context).length ? context : undefined });
+    void send({ chatId, message: msg.trim(), mode: m, connectionId: connId, targetKey: jobTab ? null : undefined, context: Object.keys(context).length ? context : undefined });
     setText("");
     setMode("chat");
   };
@@ -255,7 +366,7 @@ function Chat() {
       </div>
 
       <div className="shrink-0 border-t border-line p-2">
-        {running && <WorkingBar items={items} onStop={() => void cancel()} />}
+        {running && <WorkingBar items={items} onStop={() => void cancel(chatId)} />}
         {queued.length > 0 && (
           <div className="mb-1.5 space-y-1" aria-label="Waiting questions">
             {queued.map((q, i) => (
@@ -707,6 +818,7 @@ function Sessions() {
   const version = useAi((s) => s.sessionsVersion);
   const loadSession = useAi((s) => s.loadSession);
   const current = useAi((s) => s.sessionId);
+  const openSessions = useAi((s) => s.chats.map((c) => c.sessionId).join(","));
   const connections = useStore((s) => s.connections);
   const toast = useStore((s) => s.toast);
   const [items, setItems] = useState<AiSessionRecord[]>([]);
@@ -743,12 +855,20 @@ function Sessions() {
             >
               <div className="flex items-center gap-1.5">
                 <span className="min-w-0 flex-1 truncate text-[12.5px]">{s.title}</span>
+                {openSessions.split(",").includes(s.id) && (
+                  <span className="shrink-0 rounded bg-panel-2 px-1 text-[10px] text-muted" title="Open in a conversation tab">
+                    open
+                  </span>
+                )}
                 <button
                   className="icon-btn hidden h-5 w-5 group-hover:flex"
                   aria-label={`Delete ${s.title}`}
                   onClick={(e) => {
                     e.stopPropagation();
-                    void api.aiDeleteSession(s.id).then(load);
+                    void api.aiDeleteSession(s.id).then(() => {
+                      useAi.getState().forgetSession(s.id);
+                      return load();
+                    });
                   }}
                 >
                   <Trash2 size={11} />
