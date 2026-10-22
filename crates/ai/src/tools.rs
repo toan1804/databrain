@@ -557,7 +557,7 @@ impl ToolContext {
         );
         let detail = json!({"tables": tables, "connection": target.name});
         self.gate("index_tables", Decision::Ask("Index tables".into()), &summary, &detail).await?;
-        let results = knowledge::index_tables(&self.engine, &target.id, &tables).await?;
+        let results = knowledge::index_tables(&self.engine, &target.id, &tables, &self.cancel).await?;
         let pol = target.ai_policy.clone();
         let mut text = String::new();
         let mut ok = Vec::new();

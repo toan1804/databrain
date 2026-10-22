@@ -276,18 +276,23 @@ pub async fn index_connection_with(
 /// each name is looked up (index, explorer cache, then the server), described
 /// live and added to the index; the rest of the index is kept. Per name:
 /// the indexed object or why it could not be indexed.
-pub async fn index_tables(engine: &QueryEngine, connection_id: &str, names: &[String]) -> Result<Vec<(String, std::result::Result<KnObject, String>)>> {
+pub async fn index_tables(
+    engine: &QueryEngine,
+    connection_id: &str,
+    names: &[String],
+    cancel: &CancellationToken,
+) -> Result<Vec<(String, std::result::Result<KnObject, String>)>> {
     let ws = engine.workspace().clone();
     let mut out = Vec::new();
     let mut fresh = Vec::new();
     for want in names.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
-        let r: std::result::Result<KnObject, String> = async {
-            let (schema, name) = live_limited(resolve_table(engine, connection_id, want))
-                .await?
-                .ok_or_else(|| format!("no table or view named `{want}` on this connection"))?;
-            let d = live_limited(async { engine.describe(connection_id, &schema, &name).await.map_err(|e| e.message) }).await?;
+        // The user approved this: wait as long as the database needs (a first
+        // connect, a sign-in, a busy metadata session, a large catalog);
+        // Stop cancels it. Only a stuck server gives up, after INDEX_TABLE_TIMEOUT.
+        let work = async {
+            let d = describe_named(engine, connection_id, want).await?;
             if !d.object.kind.is_relation() {
-                return Err(format!("`{schema}.{name}` is not a table or view"));
+                return Err(format!("`{}.{}` is not a table or view", d.object.schema, d.object.name));
             }
             Ok(KnObject {
                 kind: serde_json::to_value(d.object.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "table".into()),
@@ -295,11 +300,14 @@ pub async fn index_tables(engine: &QueryEngine, connection_id: &str, names: &[St
                 row_estimate: d.object.row_estimate,
                 columns: d.columns,
                 foreign_keys: d.foreign_keys,
-                schema,
-                name,
+                schema: d.object.schema,
+                name: d.object.name,
             })
-        }
-        .await;
+        };
+        let r: std::result::Result<KnObject, String> = tokio::select! {
+            r = tokio::time::timeout(INDEX_TABLE_TIMEOUT, work) => r.unwrap_or_else(|_| Err(format!("no answer from the database in {} s", INDEX_TABLE_TIMEOUT.as_secs()))),
+            _ = cancel.cancelled() => return Err(AiError::Cancelled),
+        };
         if let Ok(o) = &r {
             fresh.push(o.clone());
         }
@@ -312,6 +320,22 @@ pub async fn index_tables(engine: &QueryEngine, connection_id: &str, names: &[St
         ws.kn_set_state(&KnState { objects, indexed_at: if st.indexed_at == 0 { now_ms() } else { st.indexed_at }, ..st })?;
     }
     Ok(out)
+}
+
+/// Per table of `index_tables`: generous, it only stops a server that hangs.
+const INDEX_TABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(if cfg!(test) { 5 } else { 300 });
+
+/// Describe `schema.table` (or a bare `table`) as written: a qualified name is
+/// described directly (no catalog search); otherwise, or when that fails
+/// (different case, a name only the search knows), it is looked up first.
+async fn describe_named(engine: &QueryEngine, connection_id: &str, want: &str) -> std::result::Result<databrain_connector_core::ObjectDetail, String> {
+    if let Some((schema, name)) = want.rsplit_once('.').filter(|(s, n)| !s.is_empty() && !n.is_empty()) {
+        if let Ok(d) = engine.describe(connection_id, schema, name).await {
+            return Ok(d);
+        }
+    }
+    let (schema, name) = resolve_table(engine, connection_id, want).await?.ok_or_else(|| format!("no table or view named `{want}` on this connection"))?;
+    engine.describe(connection_id, &schema, &name).await.map_err(|e| e.message)
 }
 
 /// Compact DDL-like description for prompts. PII columns are listed but
