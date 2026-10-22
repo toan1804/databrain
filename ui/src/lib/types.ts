@@ -134,6 +134,8 @@ export interface ConnectorInfo {
     read_only_sessions: boolean;
     ssh: boolean;
   };
+  /** What the source type is like (quoting, levels, language, loads…). */
+  traits?: import("./sourceTraits").SourceTraits;
   fields: FieldSpec[];
   note?: string;
 }

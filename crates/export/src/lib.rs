@@ -10,7 +10,7 @@ use std::io::Write;
 use databrain_connector_core::arrow::array::{Array, RecordBatch};
 use databrain_connector_core::arrow::datatypes::{DataType, SchemaRef};
 use databrain_connector_core::arrow::util::display::ArrayFormatter;
-use databrain_connector_core::{ConnectorKind, quote_ident, quote_literal};
+use databrain_connector_core::{ConnectorKind, quote_ident};
 use databrain_result_store::display::{format_options, is_decimal_text};
 use serde::{Deserialize, Serialize};
 
@@ -377,22 +377,16 @@ fn json_value(cell: Option<&str>, kind: Kind) -> serde_json::Value {
     }
 }
 
+/// A value for `INSERT … VALUES`, written the way the dialect reads it
+/// (same rules as job loads: `crate::load`).
 fn sql_value(cell: Option<&str>, kind: Kind, dialect: ConnectorKind) -> String {
-    let Some(s) = cell else {
-        return "NULL".into();
+    let lit = match kind {
+        Kind::Number => load::Lit::Number,
+        Kind::Bool => load::Lit::Bool,
+        Kind::Binary => load::Lit::Binary,
+        Kind::Other => load::Lit::Text,
     };
-    match kind {
-        Kind::Number if s.parse::<f64>().is_ok_and(|f| f.is_finite()) => s.to_string(),
-        Kind::Bool => match dialect {
-            ConnectorKind::Postgres => s.to_uppercase(),
-            _ => if s == "true" { "1".into() } else { "0".into() },
-        },
-        Kind::Binary => match dialect {
-            ConnectorKind::Postgres => format!("'\\x{s}'::bytea"),
-            _ => format!("X'{s}'"),
-        },
-        _ => quote_literal(s),
-    }
+    load::literal(cell, lit, dialect)
 }
 
 /// Excel's row limit (including the header row).

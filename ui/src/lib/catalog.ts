@@ -1,25 +1,21 @@
 // Pure helpers for the catalog tree and catalog search (unit tested).
 import type { CatalogInfo, ConnectorKind, DbObject, ObjectKind, SchemaInfo } from "./types";
 import { qualifiedName, quoteIdent } from "./util";
-
-/** Engines whose schema ids are `catalog.schema` (three-level names). */
-export const THREE_LEVEL: ConnectorKind[] = ["databricks", "snowflake", "bigquery", "duckdb"];
-
-/** Engines whose schema ids may be `catalog.schema`: THREE_LEVEL, and SQL Server without a database (each database is a catalog). */
-const MAYBE_THREE_LEVEL: ConnectorKind[] = [...THREE_LEVEL, "mssql"];
+import { kindIsThreeLevel, kindMayHaveCatalog, traitsOf } from "./sourceTraits";
 
 /** Connection settings enough to tell its levels. */
 export type LevelConfig = { kind: ConnectorKind; database?: string | null };
 
 /** Whether a connection's explorer starts at catalogs (schema ids `catalog.schema`). */
 export function isThreeLevel(c: LevelConfig | ConnectorKind): boolean {
-  if (typeof c === "string") return THREE_LEVEL.includes(c);
-  return THREE_LEVEL.includes(c.kind) || (c.kind === "mssql" && !c.database?.trim());
+  if (typeof c === "string") return kindIsThreeLevel(c);
+  const levels = traitsOf(c.kind).levels;
+  return levels === "three" || (levels === "three_without_database" && !c.database?.trim());
 }
 
 /** Schema ids of this kind can carry a catalog (`a.b` is catalog `a`, schema `b`). */
 export function mayHaveCatalog(kind: ConnectorKind): boolean {
-  return MAYBE_THREE_LEVEL.includes(kind);
+  return kindMayHaveCatalog(kind);
 }
 
 export interface CatalogGroup {
@@ -238,7 +234,7 @@ export function filterNames(schemas: SchemaInfo[], chosen: string[] | undefined)
 export function topLevelNoun(conn: ConnectorKind | LevelConfig, plural = false): string {
   const kind = typeof conn === "string" ? conn : conn.kind;
   const three = typeof conn === "string" ? mayHaveCatalog(kind) : isThreeLevel(conn);
-  const n = kind === "bigquery" ? "project" : kind === "databricks" ? "catalog" : three ? "database" : "schema";
+  const n = three ? traitsOf(kind).catalog_noun : "schema";
   return plural ? `${n}s` : n;
 }
 
@@ -277,7 +273,7 @@ export function revealKeys(connId: string, obj: DbObject, catalog?: string): str
 
 /** Quoted schema path (`catalog.schema` parts quoted per dialect). */
 export function schemaPath(kind: ConnectorKind, schema: string): string {
-  if (kind === "bigquery") return "`" + schema.replace(/`/g, "") + "`";
+  if (traitsOf(kind).whole_path_quotes) return "`" + schema.replace(/`/g, "") + "`";
   const parts = mayHaveCatalog(kind) ? splitIdent(schema) : [schema];
   return parts.map((p) => quoteIdent(kind, p)).join(".");
 }

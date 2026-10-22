@@ -18,7 +18,7 @@ import { ArrowDown, ArrowUp, Ban, Copy, Filter, FilterX, X } from "lucide-react"
 import { api, toError } from "../lib/api";
 import type { ColumnMeta, ExportFormat, ResultInfo, ViewSpec } from "../lib/types";
 import { pageRange, toggleSort, upsertFilter } from "../lib/util";
-import { columnTypeInfo, ENGINE_NAMES } from "../lib/columnType";
+import { columnTypeInfo, engineName } from "../lib/columnType";
 import { useStore } from "../store";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
 
@@ -391,13 +391,13 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         >
           <div className="font-medium">{tip.name}</div>
           <div className="font-mono text-accent">{tip.type}</div>
-          {tip.engine && <div className="text-[10.5px] text-muted">{ENGINE_NAMES[tip.engine as keyof typeof ENGINE_NAMES] ?? tip.engine} type</div>}
+          {tip.engine && <div className="text-[10.5px] text-muted">{engineName(tip.engine)} type</div>}
           {tip.sources.map((src) => (
             <div key={src.ref} className="mt-1 border-t border-line pt-1">
               <span className="font-mono">{src.type}</span>
               <span className="text-muted">
                 {" "}
-                in {src.ref} ({src.connection}, {ENGINE_NAMES[src.engine as keyof typeof ENGINE_NAMES] ?? src.engine})
+                in {src.ref} ({src.connection}, {engineName(src.engine)})
               </span>
             </div>
           ))}

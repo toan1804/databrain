@@ -4,13 +4,13 @@
 use databrain_connector_core::arrow::array::{Array, RecordBatch};
 use databrain_connector_core::arrow::datatypes::{DataType, Field, SchemaRef};
 use databrain_connector_core::arrow::util::display::ArrayFormatter;
+use databrain_connector_core::traits::{CreateIfMissing, LoadTraits, MergeStyle, StageTable, TextLiteral};
 use databrain_connector_core::{ConnectorKind, quote_ident, quote_literal, quote_path};
 use databrain_result_store::display::{format_options, is_decimal_text};
 
 use crate::Result;
 
 const KB: usize = 1024;
-const MB: usize = 1024 * KB;
 
 /// How big one INSERT of a load may be: rows in its VALUES list and bytes
 /// of SQL text (whichever is reached first ends the statement).
@@ -33,29 +33,30 @@ pub struct BatchLimits {
     pub bytes_note: &'static str,
 }
 
-/// Rows per INSERT no dialect goes past (one statement this large is
-/// already slow to build and parse).
-const APP_MAX_ROWS: usize = 10_000;
+/// How rows are written into `dialect`. Every SQL load target has these;
+/// a source without them (`traits().load == None`) is refused before any
+/// SQL is built (`is_load_target`), so this falls back to standard SQL.
+fn lt(dialect: ConnectorKind) -> &'static LoadTraits {
+    static STANDARD: std::sync::OnceLock<LoadTraits> = std::sync::OnceLock::new();
+    dialect.traits().load.as_ref().unwrap_or_else(|| STANDARD.get_or_init(|| databrain_connector_core::traits::POSTGRES.load.unwrap()))
+}
+
+/// Whether rows can be loaded into this kind of database.
+pub fn is_load_target(dialect: ConnectorKind) -> bool {
+    dialect.traits().load.is_some()
+}
 
 /// Batch limits of `dialect`.
 pub fn batch_limits(dialect: ConnectorKind) -> BatchLimits {
-    use ConnectorKind as K;
-    let app_rows = "DataBrain's limit per statement";
-    let (default_rows, max_rows, rows_note) = match dialect {
-        K::Mssql => (500, 1000, "SQL Server allows at most 1,000 rows in one VALUES list"),
-        // INSERT ALL is slow to parse with many INTO clauses.
-        K::Oracle => (100, 1000, "DataBrain's limit for Oracle INSERT ALL (parsing slows down with many rows)"),
-        _ => (500, APP_MAX_ROWS, app_rows),
-    };
-    let (default_bytes, max_bytes, bytes_note) = match dialect {
-        K::Sqlite => (1_000_000, 1_000_000, "SQLite's default SQLITE_MAX_SQL_LENGTH is 1,000,000 bytes"),
-        K::Bigquery => (1_000_000, 1_000_000, "BigQuery limits the query text to 1,024 KB"),
-        K::Snowflake => (1_000_000, 1_000_000, "kept under 1 MB of SQL text for Snowflake"),
-        K::Databricks => (MB, 16 * MB, "the warehouse rejects requests past its message size; lower this if large inserts fail"),
-        K::Mysql => (MB, 16 * MB, "must also stay under the server's max_allowed_packet"),
-        _ => (MB, 64 * MB, "DataBrain's limit per statement"),
-    };
-    BatchLimits { default_rows, max_rows, default_bytes, max_bytes, rows_note, bytes_note }
+    let l = lt(dialect);
+    BatchLimits {
+        default_rows: l.default_rows,
+        max_rows: l.max_rows,
+        default_bytes: l.default_bytes,
+        max_bytes: l.max_bytes,
+        rows_note: l.rows_note,
+        bytes_note: l.bytes_note,
+    }
 }
 
 impl BatchLimits {
@@ -88,7 +89,7 @@ impl BatchLimits {
 }
 
 #[derive(Clone, Copy)]
-enum Lit {
+pub(crate) enum Lit {
     Number,
     Bool,
     Binary,
@@ -111,74 +112,20 @@ fn lit_kind(f: &Field) -> Lit {
 
 /// Column type for a `CREATE TABLE` in `dialect`.
 pub fn column_type(dialect: ConnectorKind, f: &Field) -> &'static str {
-    use ConnectorKind as K;
-    let dt = f.data_type();
+    let t = &lt(dialect).types;
     if is_decimal_text(f) {
-        return match dialect {
-            K::Oracle => "NUMBER",
-            K::Bigquery => "BIGNUMERIC",
-            K::Snowflake | K::Databricks => "DECIMAL(38, 10)",
-            _ => "NUMERIC",
-        };
+        return t.decimal;
     }
-    match dt {
-        DataType::Boolean => match dialect {
-            K::Mssql => "BIT",
-            K::Oracle => "NUMBER(1)",
-            K::Bigquery => "BOOL",
-            _ => "BOOLEAN",
-        },
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => match dialect {
-            K::Oracle => "NUMBER(19)",
-            K::Bigquery => "INT64",
-            K::Sqlite => "INTEGER",
-            _ => "BIGINT",
-        },
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => match dialect {
-            K::Postgres => "DOUBLE PRECISION",
-            K::Mssql => "FLOAT",
-            K::Oracle => "BINARY_DOUBLE",
-            K::Bigquery => "FLOAT64",
-            K::Sqlite => "REAL",
-            _ => "DOUBLE",
-        },
-        DataType::Decimal128(..) | DataType::Decimal256(..) => match dialect {
-            K::Oracle => "NUMBER",
-            K::Bigquery => "BIGNUMERIC",
-            K::Snowflake | K::Databricks => "DECIMAL(38, 10)",
-            _ => "NUMERIC",
-        },
-        DataType::Date32 | DataType::Date64 => "DATE",
-        DataType::Timestamp(_, tz) => match (dialect, tz.is_some()) {
-            (K::Mssql, false) => "DATETIME2",
-            (K::Mssql, true) => "DATETIMEOFFSET",
-            (K::Mysql, _) => "DATETIME(6)",
-            (K::Postgres, true) => "TIMESTAMPTZ",
-            (K::Oracle, true) => "TIMESTAMP WITH TIME ZONE",
-            (K::Snowflake, true) => "TIMESTAMP_TZ",
-            (K::Bigquery, false) => "DATETIME",
-            (K::Bigquery, true) => "TIMESTAMP",
-            (K::Duckdb, true) => "TIMESTAMPTZ",
-            _ => "TIMESTAMP",
-        },
-        DataType::Time32(_) | DataType::Time64(_) => match dialect {
-            K::Oracle => "VARCHAR2(32)",
-            _ => "TIME",
-        },
-        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => match dialect {
-            K::Postgres => "BYTEA",
-            K::Mssql => "VARBINARY(MAX)",
-            K::Bigquery => "BYTES",
-            K::Snowflake | K::Databricks => "BINARY",
-            _ => "BLOB",
-        },
-        _ => match dialect {
-            K::Mssql => "NVARCHAR(MAX)",
-            K::Oracle => "CLOB",
-            K::Bigquery | K::Databricks => "STRING",
-            K::Snowflake => "VARCHAR",
-            _ => "TEXT",
-        },
+    match f.data_type() {
+        DataType::Boolean => t.boolean,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => t.integer,
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => t.float,
+        DataType::Decimal128(..) | DataType::Decimal256(..) => t.decimal,
+        DataType::Date32 | DataType::Date64 => t.date,
+        DataType::Timestamp(_, tz) => if tz.is_some() { t.timestamp_tz } else { t.timestamp },
+        DataType::Time32(_) | DataType::Time64(_) => t.time,
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => t.binary,
+        _ => t.text,
     }
 }
 
@@ -197,10 +144,10 @@ pub fn create_table_sql(dialect: ConnectorKind, table: &str, schema: &SchemaRef)
 /// (it may have been created by SQL run just before).
 pub fn create_table_if_missing_sql(dialect: ConnectorKind, table: &str, schema: &SchemaRef) -> String {
     let create = create_table_sql(dialect, table, schema);
-    match dialect {
-        ConnectorKind::Oracle => format!("BEGIN EXECUTE IMMEDIATE '{}'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;", create.replace('\'', "''")),
-        ConnectorKind::Mssql => format!("IF OBJECT_ID(N'{}', N'U') IS NULL {create}", quote_path(dialect, table).replace('\'', "''")),
-        _ => create.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),
+    match lt(dialect).create_if_missing {
+        CreateIfMissing::PlsqlBlock => format!("BEGIN EXECUTE IMMEDIATE '{}'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;", create.replace('\'', "''")),
+        CreateIfMissing::ObjectIdCheck => format!("IF OBJECT_ID(N'{}', N'U') IS NULL {create}", quote_path(dialect, table).replace('\'', "''")),
+        CreateIfMissing::IfNotExists => create.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),
     }
 }
 
@@ -208,10 +155,7 @@ pub fn create_table_if_missing_sql(dialect: ConnectorKind, table: &str, schema: 
 /// only when the table exists and can be read.
 pub fn probe_sql(dialect: ConnectorKind, table: &str) -> String {
     let t = quote_path(dialect, table);
-    match dialect {
-        ConnectorKind::Bigquery => format!("SELECT * FROM {t} LIMIT 0"),
-        _ => format!("SELECT * FROM {t} WHERE 1 = 0"),
-    }
+    if lt(dialect).probe_limit0 { format!("SELECT * FROM {t} LIMIT 0") } else { format!("SELECT * FROM {t} WHERE 1 = 0") }
 }
 
 /// `DELETE FROM table` (Truncate mode: transactional everywhere, unlike `TRUNCATE`).
@@ -222,14 +166,14 @@ pub fn delete_all_sql(dialect: ConnectorKind, table: &str) -> String {
 /// Engines where the staging table of Update/Merge is a session temporary
 /// table; elsewhere it is a regular table next to the target, dropped after.
 pub fn stage_is_temporary(dialect: ConnectorKind) -> bool {
-    !matches!(dialect, ConnectorKind::Oracle | ConnectorKind::Databricks | ConnectorKind::Bigquery)
+    !matches!(lt(dialect).stage, StageTable::Regular | StageTable::RegularLimit0)
 }
 
 /// Name (unquoted path) of the staging table for `target`, `suffix` making it unique.
 pub fn stage_table_name(dialect: ConnectorKind, target: &str, suffix: &str) -> String {
     let name = format!("databrain_stage_{suffix}");
-    match dialect {
-        ConnectorKind::Mssql => format!("#{name}"),
+    match lt(dialect).stage {
+        StageTable::HashSelectInto => format!("#{name}"),
         _ if stage_is_temporary(dialect) => name,
         _ => match target.rsplit_once('.') {
             Some((q, _)) => format!("{q}.{name}"),
@@ -241,24 +185,23 @@ pub fn stage_table_name(dialect: ConnectorKind, target: &str, suffix: &str) -> S
 /// Create the empty staging table with the target's own types for `cols`
 /// (`CREATE … AS SELECT … WHERE 1 = 0`), so key comparisons match exactly.
 pub fn create_stage_sql(dialect: ConnectorKind, stage: &str, target: &str, cols: &[String]) -> String {
-    use ConnectorKind as K;
     let (s, t) = (quote_path(dialect, stage), quote_path(dialect, target));
     let list = cols.iter().map(|c| quote_ident(dialect, c)).collect::<Vec<_>>().join(", ");
-    match dialect {
+    match lt(dialect).stage {
         // UNION ALL drops the IDENTITY property SELECT INTO would copy.
-        K::Mssql => format!("SELECT {list} INTO {s} FROM {t} WHERE 1 = 0 UNION ALL SELECT {list} FROM {t} WHERE 1 = 0"),
-        K::Postgres | K::Duckdb | K::Sqlite => format!("CREATE TEMP TABLE {s} AS SELECT {list} FROM {t} WHERE 1 = 0"),
-        K::Mysql | K::Snowflake => format!("CREATE TEMPORARY TABLE {s} AS SELECT {list} FROM {t} WHERE 1 = 0"),
-        K::Bigquery => format!("CREATE TABLE {s} AS SELECT {list} FROM {t} LIMIT 0"),
-        _ => format!("CREATE TABLE {s} AS SELECT {list} FROM {t} WHERE 1 = 0"),
+        StageTable::HashSelectInto => format!("SELECT {list} INTO {s} FROM {t} WHERE 1 = 0 UNION ALL SELECT {list} FROM {t} WHERE 1 = 0"),
+        StageTable::Temp => format!("CREATE TEMP TABLE {s} AS SELECT {list} FROM {t} WHERE 1 = 0"),
+        StageTable::Temporary | StageTable::TemporaryDropTemporary => format!("CREATE TEMPORARY TABLE {s} AS SELECT {list} FROM {t} WHERE 1 = 0"),
+        StageTable::RegularLimit0 => format!("CREATE TABLE {s} AS SELECT {list} FROM {t} LIMIT 0"),
+        StageTable::Regular => format!("CREATE TABLE {s} AS SELECT {list} FROM {t} WHERE 1 = 0"),
     }
 }
 
 /// Drop the staging table (never fails when it is already gone).
 pub fn drop_stage_sql(dialect: ConnectorKind, stage: &str) -> String {
-    match dialect {
-        ConnectorKind::Mysql => format!("DROP TEMPORARY TABLE IF EXISTS {}", quote_path(dialect, stage)),
-        ConnectorKind::Mssql => format!("IF OBJECT_ID('tempdb..{}') IS NOT NULL DROP TABLE {}", stage.replace('\'', "''"), quote_path(dialect, stage)),
+    match lt(dialect).stage {
+        StageTable::TemporaryDropTemporary => format!("DROP TEMPORARY TABLE IF EXISTS {}", quote_path(dialect, stage)),
+        StageTable::HashSelectInto => format!("IF OBJECT_ID('tempdb..{}') IS NOT NULL DROP TABLE {}", stage.replace('\'', "''"), quote_path(dialect, stage)),
         _ => drop_table_sql(dialect, stage),
     }
 }
@@ -266,19 +209,19 @@ pub fn drop_stage_sql(dialect: ConnectorKind, stage: &str) -> String {
 /// Engines that update/merge with a native `MERGE`; the others use
 /// `UPDATE … FROM` / `UPDATE … JOIN` and `INSERT … WHERE NOT EXISTS`.
 fn native_merge(dialect: ConnectorKind) -> bool {
-    matches!(dialect, ConnectorKind::Mssql | ConnectorKind::Oracle | ConnectorKind::Snowflake | ConnectorKind::Databricks | ConnectorKind::Bigquery)
+    !matches!(lt(dialect).merge, MergeStyle::UpdateFrom | MergeStyle::UpdateJoin)
 }
 
 fn merge_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[String], keys: &[String], insert: bool) -> String {
-    use ConnectorKind as K;
+    let style = lt(dialect).merge;
     let q = |c: &str| quote_ident(dialect, c);
     let (t, s) = (quote_path(dialect, target), quote_path(dialect, stage));
     let on = keys.iter().map(|k| format!("tg.{} = src.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
-    let set_target = |c: &str| if dialect == K::Bigquery { q(c) } else { format!("tg.{}", q(c)) };
+    let set_target = |c: &str| if style == MergeStyle::MergeNoInto { q(c) } else { format!("tg.{}", q(c)) };
     let sets: Vec<String> = cols.iter().filter(|c| !keys.contains(c)).map(|c| format!("{} = src.{}", set_target(c), q(c))).collect();
-    let (head, on) = match dialect {
-        K::Oracle => (format!("MERGE INTO {t} tg USING {s} src"), format!("({on})")),
-        K::Bigquery => (format!("MERGE {t} AS tg USING {s} AS src"), on),
+    let (head, on) = match style {
+        MergeStyle::MergeNoAs => (format!("MERGE INTO {t} tg USING {s} src"), format!("({on})")),
+        MergeStyle::MergeNoInto => (format!("MERGE {t} AS tg USING {s} AS src"), on),
         _ => (format!("MERGE INTO {t} AS tg USING {s} AS src"), on),
     };
     let mut sql = format!("{head} ON {on}");
@@ -290,7 +233,7 @@ fn merge_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[String],
         let vals = cols.iter().map(|c| format!("src.{}", q(c))).collect::<Vec<_>>().join(", ");
         sql.push_str(&format!(" WHEN NOT MATCHED THEN INSERT ({list}) VALUES ({vals})"));
     }
-    if dialect == K::Mssql {
+    if style == MergeStyle::MergeSemicolon {
         // SQL Server requires MERGE to end with a semicolon.
         sql.push(';');
     }
@@ -305,8 +248,8 @@ fn update_join_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[St
     if set.is_empty() {
         return None;
     }
-    Some(match dialect {
-        ConnectorKind::Mysql => format!("UPDATE {t} AS tg JOIN {s} AS src ON {on} SET {}", set.iter().map(|c| format!("tg.{} = src.{}", q(c), q(c))).collect::<Vec<_>>().join(", ")),
+    Some(match lt(dialect).merge {
+        MergeStyle::UpdateJoin => format!("UPDATE {t} AS tg JOIN {s} AS src ON {on} SET {}", set.iter().map(|c| format!("tg.{} = src.{}", q(c), q(c))).collect::<Vec<_>>().join(", ")),
         _ => format!("UPDATE {t} AS tg SET {} FROM {s} AS src WHERE {on}", set.iter().map(|c| format!("{} = src.{}", q(c), q(c))).collect::<Vec<_>>().join(", ")),
     })
 }
@@ -342,37 +285,27 @@ pub fn merge_from_stage_sql(dialect: ConnectorKind, target: &str, stage: &str, c
 /// `DROP TABLE IF EXISTS` in `dialect` (Oracle: a block ignoring "does not exist").
 pub fn drop_table_sql(dialect: ConnectorKind, table: &str) -> String {
     let t = quote_path(dialect, table);
-    match dialect {
-        ConnectorKind::Oracle => format!("BEGIN EXECUTE IMMEDIATE 'DROP TABLE {}'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;", t.replace('\'', "''")),
-        _ => format!("DROP TABLE IF EXISTS {t}"),
+    match lt(dialect).drop_in_plsql_block {
+        true => format!("BEGIN EXECUTE IMMEDIATE 'DROP TABLE {}'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;", t.replace('\'', "''")),
+        false => format!("DROP TABLE IF EXISTS {t}"),
     }
 }
 
-fn literal(cell: Option<&str>, kind: Lit, dialect: ConnectorKind) -> String {
-    use ConnectorKind as K;
+pub(crate) fn literal(cell: Option<&str>, kind: Lit, dialect: ConnectorKind) -> String {
+    let l = lt(dialect);
     let Some(s) = cell else { return "NULL".into() };
     match kind {
         Lit::Number if s.parse::<f64>().is_ok_and(|f| f.is_finite()) => s.to_string(),
-        Lit::Bool => match dialect {
-            K::Postgres | K::Duckdb | K::Snowflake | K::Bigquery | K::Databricks | K::Mysql => s.to_uppercase(),
-            _ => if s == "true" { "1".into() } else { "0".into() },
-        },
-        Lit::Binary => match dialect {
-            K::Postgres => format!("'\\x{s}'::bytea"),
-            K::Mssql => format!("0x{s}"),
-            K::Oracle => format!("HEXTORAW('{s}')"),
-            K::Bigquery => format!("FROM_HEX('{s}')"),
-            K::Snowflake => format!("TO_BINARY('{s}', 'HEX')"),
-            K::Databricks => format!("unhex('{s}')"),
-            _ => format!("X'{s}'"),
-        },
+        Lit::Bool if l.bool_words => s.to_uppercase(),
+        Lit::Bool => if s == "true" { "1".into() } else { "0".into() },
+        Lit::Binary => l.binary_literal.replace("{}", s),
         // Oracle doesn't read text as a date without NLS settings: typed literals.
-        Lit::Date if dialect == K::Oracle => format!("DATE {}", quote_literal(s)),
-        Lit::Timestamp if dialect == K::Oracle => format!("TIMESTAMP {}", quote_literal(s)),
-        _ => match dialect {
-            K::Mssql => format!("N{}", quote_literal(s)),
-            K::Mysql | K::Databricks | K::Bigquery => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")),
-            _ => quote_literal(s),
+        Lit::Date if l.typed_datetime_literals => format!("DATE {}", quote_literal(s)),
+        Lit::Timestamp if l.typed_datetime_literals => format!("TIMESTAMP {}", quote_literal(s)),
+        _ => match l.text_literal {
+            TextLiteral::NPrefix => format!("N{}", quote_literal(s)),
+            TextLiteral::BackslashEscaped => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")),
+            TextLiteral::Plain => quote_literal(s),
         },
     }
 }
@@ -402,11 +335,11 @@ impl InsertSql {
     /// Bytes of the statement around the rows, and added per row.
     fn overhead(&self) -> (usize, usize) {
         let (t, cols) = (&self.table, &self.cols);
-        match self.dialect {
+        match lt(self.dialect).insert_all {
             // `INSERT ALL INTO t (cols) VALUES (…) … SELECT 1 FROM DUAL`
-            ConnectorKind::Oracle => ("INSERT ALL".len() + " SELECT 1 FROM DUAL".len(), format!(" INTO {t} ({cols}) VALUES ").len()),
+            true => ("INSERT ALL".len() + " SELECT 1 FROM DUAL".len(), format!(" INTO {t} ({cols}) VALUES ").len()),
             // `INSERT INTO t (cols) VALUES (…), (…)`
-            _ => (format!("INSERT INTO {t} ({cols}) VALUES ").len(), 2),
+            false => (format!("INSERT INTO {t} ({cols}) VALUES ").len(), 2),
         }
     }
 
@@ -440,9 +373,9 @@ impl InsertSql {
         }
         let n = rows.len();
         let (t, cols) = (&self.table, &self.cols);
-        let sql = match self.dialect {
-            ConnectorKind::Oracle => format!("INSERT ALL {} SELECT 1 FROM DUAL", rows.iter().map(|r| format!("INTO {t} ({cols}) VALUES {r}")).collect::<Vec<_>>().join(" ")),
-            _ => format!("INSERT INTO {t} ({cols}) VALUES {}", rows.join(", ")),
+        let sql = match lt(self.dialect).insert_all {
+            true => format!("INSERT ALL {} SELECT 1 FROM DUAL", rows.iter().map(|r| format!("INTO {t} ({cols}) VALUES {r}")).collect::<Vec<_>>().join(" ")),
+            false => format!("INSERT INTO {t} ({cols}) VALUES {}", rows.join(", ")),
         };
         Ok(Some((sql, n)))
     }
@@ -464,6 +397,7 @@ pub fn insert_statements(dialect: ConnectorKind, table: &str, schema: &SchemaRef
 
 #[cfg(test)]
 mod tests {
+    const MB: usize = 1024 * KB;
     use super::*;
     use databrain_connector_core::arrow::array::{BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray};
     use databrain_connector_core::arrow::datatypes::{Schema, TimeUnit};

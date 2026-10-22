@@ -219,20 +219,7 @@ fn short(sql: &str) -> String {
 }
 
 fn engine_name(k: ConnectorKind) -> &'static str {
-    use ConnectorKind as K;
-    match k {
-        K::Postgres => "PostgreSQL",
-        K::Mysql => "MySQL",
-        K::Mssql => "SQL Server",
-        K::Oracle => "Oracle",
-        K::Sqlite => "SQLite",
-        K::Duckdb => "DuckDB",
-        K::Snowflake => "Snowflake",
-        K::Databricks => "Databricks",
-        K::Bigquery => "BigQuery",
-        #[allow(unreachable_patterns)]
-        _ => "this database",
-    }
+    k.traits().name
 }
 
 /// Statements of before/after SQL.
@@ -242,21 +229,19 @@ fn user_statements(sql: Option<&str>, dialect: ConnectorKind) -> Vec<String> {
 
 /// Transaction statements when the whole plan can run in one.
 fn transaction(dialect: ConnectorKind, plan: &[Act]) -> Option<Tx> {
-    use ConnectorKind as K;
-    match dialect {
-        K::Postgres | K::Sqlite | K::Duckdb => Some(Tx { begin: "BEGIN", commit: "COMMIT", rollback: "ROLLBACK" }),
-        K::Mssql => Some(Tx { begin: "BEGIN TRANSACTION", commit: "COMMIT TRANSACTION", rollback: "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION" }),
-        K::Mysql => {
-            // DDL commits implicitly in MySQL (temporary tables don't).
-            let ddl = plan.iter().any(|a| match a {
-                Act::Sql { kind: ActKind::Ddl, .. } => true,
-                Act::Sql { kind: ActKind::User, sql, .. } => classify(sql, dialect).kind == StatementKind::Ddl,
-                _ => false,
-            });
-            (!ddl).then_some(Tx { begin: "START TRANSACTION", commit: "COMMIT", rollback: "ROLLBACK" })
+    let t = dialect.traits().load.as_ref()?.transactions?;
+    if t.ddl_commits {
+        // DDL commits implicitly (MySQL; temporary tables don't).
+        let ddl = plan.iter().any(|a| match a {
+            Act::Sql { kind: ActKind::Ddl, .. } => true,
+            Act::Sql { kind: ActKind::User, sql, .. } => classify(sql, dialect).kind == StatementKind::Ddl,
+            _ => false,
+        });
+        if ddl {
+            return None;
         }
-        _ => None,
     }
+    Some(Tx { begin: t.begin, commit: t.commit, rollback: t.rollback })
 }
 
 /// Run one statement; rows affected when the driver reports them.
@@ -435,6 +420,9 @@ impl QueryEngine {
             return Err(EngineError::new("invalid", format!("Connection \"{}\" is read-only; nothing was written.", profile.name)));
         }
         let dialect = profile.config.kind;
+        if !sqlgen::is_load_target(dialect) {
+            return Err(EngineError::new("invalid", format!("Rows can't be loaded into {} connections (\"{}\"); save them to a file instead.", engine_name(dialect), profile.name)));
+        }
         let keys_in: Vec<String> = spec.key_columns.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
         if spec.mode.needs_keys() && keys_in.is_empty() {
             return Err(EngineError::new("invalid", "Choose the key columns that identify a row (Update and Merge match rows by them)"));
@@ -599,9 +587,9 @@ impl QueryEngine {
         notices.extend(lowered);
         let tx = transaction(dialect, &plan);
         if tx.is_none() {
-            notices.push(match dialect {
-                ConnectorKind::Mysql => "MySQL commits DDL at once, so this step doesn't run in a transaction: if it fails partway, what ran before stays.".to_string(),
-                d => format!("{} doesn't run this step in a transaction: if it fails partway, what ran before stays.", engine_name(d)),
+            notices.push(match dialect.traits().load.and_then(|l| l.transactions) {
+                Some(_) => format!("{} commits DDL at once, so this step doesn't run in a transaction: if it fails partway, what ran before stays.", engine_name(dialect)),
+                None => format!("{} doesn't run this step in a transaction: if it fails partway, what ran before stays.", engine_name(dialect)),
             });
         }
         Ok(Prepared { dialect, connection: conn, table, session, exists: Some(exists), creates, plan, schema, tx, batch, permanent_stage, notices })

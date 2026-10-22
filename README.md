@@ -182,7 +182,7 @@ DATABRAIN_MYSQL_HOST=127.0.0.1 DATABRAIN_MYSQL_USER=root DATABRAIN_MYSQL_PASSWOR
 ```
 crates/
   auth/            keychain secrets, auth methods, OAuth/device/JWT/cloud CLI credentials
-  connector-core/  Connector/Session traits, Arrow row builder, SQL splitter + classifier
+  connector-core/  Connector/Session traits, SourceTraits (what each database type is like), Arrow row builder, statement splitter + classifier per query language
   connectors/      sqlite, postgres, mysql, mssql, oracle, cloud (snowflake/databricks/bigquery), duckdb
   duckdb-dynload/  DuckDB's C API loaded at runtime (builds without bundled DuckDB)
   ssh-tunnel/      russh-based tunnels
@@ -195,5 +195,7 @@ crates/
   app/             Tauri host (commands + events) and the databrain-mcp binary
 ui/                React + TypeScript + Vite + Tailwind
 ```
+
+Adding a database type: see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §5.1–5.2 ("Source traits" and "Adding a database type").
 
 App data (workspace DB) is stored in the OS app-data directory, for example `~/Library/Application Support/dev.databrain.app/` on macOS.

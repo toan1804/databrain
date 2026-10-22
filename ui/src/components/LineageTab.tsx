@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { traitsOf } from "../lib/sourceTraits";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { AlertCircle, AlertTriangle, ArrowDown, ArrowRight, CheckCircle2, Columns3, ExternalLink, Rows3, ChevronDown, ClipboardCopy, Download, Loader2, Maximize2, Network, RefreshCw, TextCursorInput, WifiOff, X } from "lucide-react";
 import { api, isTauri, toError } from "../lib/api";
@@ -27,6 +28,8 @@ export function openLineage(editorKey: string, connectionId?: string | null) {
   const sql = whole ? doc : doc.slice(sel.from, sel.to);
   if (!sql.trim()) return st.toast("Nothing to trace: write a query first", "info");
   const conn = connectionId !== undefined ? connectionId : (srcTab?.connection_id ?? nbTab?.connection_id ?? null);
+  const kind = st.connections.find((c) => c.id === conn)?.config.kind;
+  if (kind && traitsOf(kind).language !== "sql") return st.toast(`Lineage traces SQL; ${traitsOf(kind).name} queries aren't supported`, "info");
   const lineage = { source: editorKey, base: whole ? 0 : sel.from, whole };
   const existing = st.tabs.find((t) => t.lineage?.source === editorKey && !t.lineage.column);
   if (existing) {

@@ -415,6 +415,7 @@ impl Connector for DuckdbConnector {
     fn info(&self) -> ConnectorInfo {
         ConnectorInfo {
             kind: ConnectorKind::Duckdb,
+            traits: ConnectorKind::Duckdb.traits(),
             display_name: "DuckDB (local files)",
             default_port: None,
             uses_file: true,

@@ -26,9 +26,17 @@ impl SqliteConnector {
 
 #[async_trait]
 impl Connector for SqliteConnector {
+    fn validate(&self, cfg: &ConnectionConfig) -> std::result::Result<(), String> {
+        if cfg.file_path.as_deref().is_none_or(|p| p.trim().is_empty()) {
+            return Err("Choose a database file".into());
+        }
+        Ok(())
+    }
+
     fn info(&self) -> ConnectorInfo {
         ConnectorInfo {
             kind: ConnectorKind::Sqlite,
+            traits: ConnectorKind::Sqlite.traits(),
             display_name: "SQLite",
             default_port: None,
             uses_file: true,

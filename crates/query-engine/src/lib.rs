@@ -769,8 +769,8 @@ impl QueryEngine {
     /// files (SQLite, DuckDB) share the metadata session (one handle per file).
     fn index_tab(&self, connection_id: &str) -> &'static str {
         match self.workspace.get_connection(connection_id).map(|p| p.config.kind) {
-            Ok(databrain_connector_core::ConnectorKind::Sqlite | databrain_connector_core::ConnectorKind::Duckdb) | Err(_) => META_TAB,
-            Ok(_) => INDEX_TAB,
+            Ok(k) if !k.traits().local => INDEX_TAB,
+            _ => META_TAB,
         }
     }
 

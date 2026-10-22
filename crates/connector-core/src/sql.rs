@@ -4,24 +4,26 @@
 use serde::Serialize;
 use sqlparser::ast::{Query, SetExpr, Statement};
 use sqlparser::dialect::{
-    BigQueryDialect, DatabricksDialect, Dialect, DuckDbDialect, MsSqlDialect, MySqlDialect, OracleDialect,
+    BigQueryDialect, DatabricksDialect, Dialect, DuckDbDialect, GenericDialect, MsSqlDialect, MySqlDialect, OracleDialect,
     PostgreSqlDialect, SQLiteDialect, SnowflakeDialect,
 };
 use sqlparser::parser::Parser;
 
+use crate::traits::{BlockEnd, DollarQuotes, SourceTraits, SqlParser, SqlSyntax};
 use crate::types::ConnectorKind;
 
 pub fn dialect_for(kind: ConnectorKind) -> Box<dyn Dialect> {
-    match kind {
-        ConnectorKind::Postgres => Box::new(PostgreSqlDialect {}),
-        ConnectorKind::Mysql => Box::new(MySqlDialect {}),
-        ConnectorKind::Sqlite => Box::new(SQLiteDialect {}),
-        ConnectorKind::Mssql => Box::new(MsSqlDialect {}),
-        ConnectorKind::Oracle => Box::new(OracleDialect {}),
-        ConnectorKind::Snowflake => Box::new(SnowflakeDialect {}),
-        ConnectorKind::Databricks => Box::new(DatabricksDialect {}),
-        ConnectorKind::Bigquery => Box::new(BigQueryDialect {}),
-        ConnectorKind::Duckdb => Box::new(DuckDbDialect {}),
+    match kind.traits().parser {
+        SqlParser::Postgres => Box::new(PostgreSqlDialect {}),
+        SqlParser::Mysql => Box::new(MySqlDialect {}),
+        SqlParser::Sqlite => Box::new(SQLiteDialect {}),
+        SqlParser::Mssql => Box::new(MsSqlDialect {}),
+        SqlParser::Oracle => Box::new(OracleDialect {}),
+        SqlParser::Snowflake => Box::new(SnowflakeDialect {}),
+        SqlParser::Databricks => Box::new(DatabricksDialect {}),
+        SqlParser::Bigquery => Box::new(BigQueryDialect {}),
+        SqlParser::Duckdb => Box::new(DuckDbDialect {}),
+        SqlParser::Generic => Box::new(GenericDialect {}),
     }
 }
 
@@ -47,15 +49,18 @@ struct Lex {
 }
 
 fn lex(kind: ConnectorKind) -> Lex {
-    use ConnectorKind as K;
+    lex_of(&kind.traits().syntax)
+}
+
+fn lex_of(x: &SqlSyntax) -> Lex {
     Lex {
-        backslash_escapes: matches!(kind, K::Mysql | K::Bigquery | K::Databricks | K::Snowflake),
-        backtick: matches!(kind, K::Mysql | K::Sqlite | K::Databricks | K::Bigquery),
-        hash_comment: matches!(kind, K::Mysql | K::Bigquery),
-        slash_comment: kind == K::Snowflake,
-        brackets: matches!(kind, K::Sqlite | K::Mssql),
-        dollar: matches!(kind, K::Postgres | K::Snowflake | K::Duckdb),
-        triple_quotes: kind == K::Bigquery,
+        backslash_escapes: x.backslash_escapes,
+        backtick: x.backtick,
+        hash_comment: x.hash_comment,
+        slash_comment: x.slash_comment,
+        brackets: x.brackets,
+        dollar: x.dollar != DollarQuotes::None,
+        triple_quotes: x.triple_quotes,
     }
 }
 
@@ -71,7 +76,7 @@ enum Block {
     EndWord,
 }
 
-fn block_kind(kind: ConnectorKind, seg: &str) -> Block {
+fn block_kind(x: &SqlSyntax, seg: &str) -> Block {
     let mut w = words(strip_leading_comments(seg)).map(|x| x.to_ascii_uppercase());
     let first = w.next().unwrap_or_default();
     let rest: Vec<String> = w.take(6).collect();
@@ -89,38 +94,19 @@ fn block_kind(kind: ConnectorKind, seg: &str) -> Block {
         }
         it.next()
     };
-    match kind {
-        ConnectorKind::Oracle => {
-            if first == "DECLARE" || first == "BEGIN" {
-                return Block::SlashLine;
-            }
-            if first == "CREATE"
-                && after_create().is_some_and(|o| {
-                    matches!(o, "PROCEDURE" | "FUNCTION" | "PACKAGE" | "TRIGGER" | "TYPE")
-                })
-            {
-                return Block::SlashLine;
-            }
-            Block::None
-        }
-        ConnectorKind::Mssql => {
-            if (first == "CREATE" || first == "ALTER")
-                && after_create().is_some_and(|o| {
-                    matches!(o, "PROCEDURE" | "PROC" | "FUNCTION" | "TRIGGER" | "VIEW")
-                })
-            {
-                return Block::GoLine;
-            }
-            Block::None
-        }
-        ConnectorKind::Sqlite if first == "CREATE" && after_create() == Some("TRIGGER") => {
-            Block::EndWord
-        }
-        ConnectorKind::Bigquery if first == "CREATE" && after_create() == Some("PROCEDURE") => {
-            Block::EndWord
-        }
-        _ => Block::None,
+    let block = match x.block_end {
+        BlockEnd::None => return Block::None,
+        BlockEnd::SlashLine => Block::SlashLine,
+        BlockEnd::GoLine => Block::GoLine,
+        BlockEnd::EndWord => Block::EndWord,
+    };
+    if x.block_starts.contains(&first.as_str()) {
+        return block;
     }
+    if (first == "CREATE" || (x.block_on_alter && first == "ALTER")) && after_create().is_some_and(|o| x.block_objects.contains(&o)) {
+        return block;
+    }
+    Block::None
 }
 
 fn is_go_line(line: &str) -> bool {
@@ -136,9 +122,18 @@ fn is_go_line(line: &str) -> bool {
 /// dialect's procedural-block conventions: Postgres/Snowflake dollar quoting,
 /// MySQL `DELIMITER`, Oracle `/` lines, SQL Server `GO`, SQLite triggers.
 pub fn split_statements(text: &str, kind: ConnectorKind) -> Vec<StatementSpan> {
+    split_with(text, kind.traits())
+}
+
+/// [`split_statements`] for a source's traits (testable without a kind).
+pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
+    if !t.language.splits_on_semicolon() {
+        return crate::language::split_whole(text);
+    }
+    let syntax = &t.syntax;
     let b = text.as_bytes();
     let n = b.len();
-    let lx = lex(kind);
+    let lx = lex_of(syntax);
 
     let mut out = Vec::new();
     let mut delimiter: Vec<u8> = b";".to_vec();
@@ -167,9 +162,9 @@ pub fn split_statements(text: &str, kind: ConnectorKind) -> Vec<StatementSpan> {
         if i == 0 || b[i - 1] == b'\n' {
             let line_end = text[i..].find('\n').map(|p| i + p).unwrap_or(n);
             let line = text[i..line_end].trim();
-            let directive = match kind {
-                ConnectorKind::Mysql
-                    if line.len() > 10
+            let directive = match syntax.block_end {
+                _ if syntax.delimiter_directive
+                    && line.len() > 10
                         && line.is_char_boundary(10)
                         && line[..10].eq_ignore_ascii_case("delimiter ") =>
                 {
@@ -179,8 +174,8 @@ pub fn split_statements(text: &str, kind: ConnectorKind) -> Vec<StatementSpan> {
                     }
                     true
                 }
-                ConnectorKind::Oracle => line == "/",
-                ConnectorKind::Mssql => is_go_line(line),
+                BlockEnd::SlashLine => line == "/",
+                BlockEnd::GoLine => is_go_line(line),
                 _ => false,
             };
             if directive {
@@ -195,7 +190,7 @@ pub fn split_statements(text: &str, kind: ConnectorKind) -> Vec<StatementSpan> {
         if b[i..].starts_with(&delimiter) {
             let seg = &text[seg_start..i];
             let keep = delimiter == b";"
-                && match block_kind(kind, seg) {
+                && match block_kind(syntax, seg) {
                     Block::None => false,
                     Block::SlashLine | Block::GoLine => true,
                     Block::EndWord => !last_word_is_end(seg),
@@ -254,7 +249,7 @@ pub fn split_statements(text: &str, kind: ConnectorKind) -> Vec<StatementSpan> {
                     b,
                     i,
                     b'"',
-                    lx.backslash_escapes && kind != ConnectorKind::Snowflake,
+                    syntax.backslash_in_double_quotes,
                 )
             }
             b'`' if lx.backtick => i = skip_quoted(b, i, b'`', false),
@@ -265,7 +260,7 @@ pub fn split_statements(text: &str, kind: ConnectorKind) -> Vec<StatementSpan> {
                 }
             }
             b'$' if lx.dollar => match dollar_tag(text, i) {
-                Some(tag) if matches!(kind, ConnectorKind::Postgres | ConnectorKind::Duckdb) || tag == "$$" => {
+                Some(tag) if syntax.dollar == DollarQuotes::Tagged || tag == "$$" => {
                     let body = i + tag.len();
                     i = match text[body..].find(tag) {
                         Some(p) => body + p + tag.len(),
@@ -325,7 +320,7 @@ fn dollar_tag(text: &str, i: usize) -> Option<&str> {
     (j < b.len() && b[j] == b'$').then(|| &text[i..=j])
 }
 
-fn words(s: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn words(s: &str) -> impl Iterator<Item = &str> {
     s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|w| !w.is_empty())
 }
@@ -400,6 +395,10 @@ pub struct Classification {
 /// Classify one statement. Uses the SQL parser when possible and falls back
 /// to keyword heuristics (conservatively) when parsing fails.
 pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
+    let language = kind.traits().language;
+    if !language.is_sql() {
+        return crate::language::classify(sql, language);
+    }
     let keyword = leading_keyword(sql);
     let dialect = dialect_for(kind);
     match Parser::parse_sql(dialect.as_ref(), sql) {
@@ -483,7 +482,7 @@ fn set_expr_kind(e: &SetExpr) -> StatementKind {
     }
 }
 
-fn keyword_kind(kw: &str) -> StatementKind {
+pub(crate) fn keyword_kind(kw: &str) -> StatementKind {
     use StatementKind as K;
     match kw {
         "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "VALUES" | "TABLE" => {
@@ -666,11 +665,11 @@ pub fn find_parameters(text: &str, kind: ConnectorKind) -> Vec<ParamSpan> {
                 i = text[i + 3..].find(q).map_or(n, |p| i + 3 + p + 3);
             }
             b'\'' => i = skip_quoted(b, i, b'\'', lx.backslash_escapes),
-            b'"' => i = skip_quoted(b, i, b'"', lx.backslash_escapes && kind != ConnectorKind::Snowflake),
+            b'"' => i = skip_quoted(b, i, b'"', kind.traits().syntax.backslash_in_double_quotes),
             b'`' if lx.backtick => i = skip_quoted(b, i, b'`', false),
             b'[' if lx.brackets => i = text[i..].find(']').map_or(n, |p| i + p + 1),
             b'$' if lx.dollar => match dollar_tag(text, i) {
-                Some(tag) if matches!(kind, ConnectorKind::Postgres | ConnectorKind::Duckdb) || tag == "$$" => {
+                Some(tag) if kind.traits().syntax.dollar == DollarQuotes::Tagged || tag == "$$" => {
                     let body = i + tag.len();
                     i = text[body..].find(tag).map_or(n, |p| body + p + tag.len());
                 }
@@ -692,7 +691,7 @@ pub fn find_parameters(text: &str, kind: ConnectorKind) -> Vec<ParamSpan> {
                     j += 1;
                 }
                 let name = &text[i + 1..j];
-                let trigger_row = kind == ConnectorKind::Oracle && (name.eq_ignore_ascii_case("new") || name.eq_ignore_ascii_case("old"));
+                let trigger_row = kind.traits().syntax.trigger_row_binds && (name.eq_ignore_ascii_case("new") || name.eq_ignore_ascii_case("old"));
                 if !trigger_row {
                     out.push(ParamSpan { name: name.to_string(), start: i, end: j });
                 }

@@ -4,9 +4,11 @@
 //! over a [`QueryStream`], so the grid, filtering and export are engine-agnostic.
 
 pub mod error;
+pub mod language;
 pub mod external;
 pub mod sql;
 pub mod stream;
+pub mod traits;
 pub mod types;
 pub mod value;
 
@@ -20,6 +22,7 @@ pub use arrow;
 pub use error::{ConnectorError, ErrorKind, Result};
 pub use stream::{Collected, ExecOptions, ExecSummary, QueryStream, StreamEvent, StreamSender};
 pub use tokio_util::sync::CancellationToken;
+pub use traits::{QueryLanguage, SourceTraits};
 pub use types::*;
 pub use value::{BatchBuilder, ColType, Column, Value};
 
@@ -29,6 +32,13 @@ pub trait Connector: Send + Sync {
 
     fn kind(&self) -> ConnectorKind {
         self.info().kind
+    }
+
+    /// Check settings before saving or testing: a short message naming what
+    /// is missing (`Choose a database file`). Required form fields
+    /// ([`FieldSpec::required`]) are checked by the app already.
+    fn validate(&self, _cfg: &ConnectionConfig) -> std::result::Result<(), String> {
+        Ok(())
     }
 
     /// OAuth endpoints / CLI hints used to build the credential source.
@@ -167,11 +177,7 @@ pub trait Session: Send + Sync {
     /// error, with `position` (1-based character in `sql`) when the engine
     /// gives one. `Ok(false)` = this engine has no cheap check.
     async fn check_sql(&self, sql: &str) -> Result<bool> {
-        let prefix = match self.kind() {
-            ConnectorKind::Postgres | ConnectorKind::Mysql | ConnectorKind::Duckdb | ConnectorKind::Snowflake => "EXPLAIN ",
-            ConnectorKind::Sqlite => "EXPLAIN QUERY PLAN ",
-            _ => return Ok(false),
-        };
+        let Some(prefix) = self.kind().traits().explain else { return Ok(false) };
         let shift = |mut e: ConnectorError| {
             e.position = e.position.and_then(|p| p.checked_sub(prefix.chars().count() as u32)).filter(|p| *p > 0);
             e
@@ -431,13 +437,12 @@ impl ConnectorRegistry {
 
 /// Quote an identifier for the dialect.
 pub fn quote_ident(kind: ConnectorKind, ident: &str) -> String {
-    match kind {
-        ConnectorKind::Mysql | ConnectorKind::Databricks => {
-            format!("`{}`", ident.replace('`', "``"))
-        }
-        ConnectorKind::Bigquery => format!("`{}`", ident.replace('`', "\\`")),
-        ConnectorKind::Mssql => format!("[{}]", ident.replace(']', "]]")),
-        _ => format!("\"{}\"", ident.replace('"', "\"\"")),
+    use traits::IdentQuote as Q;
+    match kind.traits().quote {
+        Q::Backtick => format!("`{}`", ident.replace('`', "``")),
+        Q::BacktickBackslash => format!("`{}`", ident.replace('`', "\\`")),
+        Q::Bracket => format!("[{}]", ident.replace(']', "]]")),
+        Q::Double => format!("\"{}\"", ident.replace('"', "\"\"")),
     }
 }
 

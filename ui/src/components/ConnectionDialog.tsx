@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { traitsOf } from "../lib/sourceTraits";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { CheckCircle2, Copy, FilePlus2, FolderOpen, FolderPlus, Globe, Info, Loader2, LogOut, Plus, Square, Trash2, XCircle } from "lucide-react";
@@ -27,9 +28,9 @@ const ENVS: { value: EnvTag; label: string }[] = [
   { value: "staging", label: "Staging" },
   { value: "prod", label: "Production" },
 ];
+const rank = (k: ConnectorKind) => (KIND_ORDER.includes(k) ? KIND_ORDER.indexOf(k) : KIND_ORDER.length);
 const KIND_ORDER: ConnectorKind[] = ["postgres", "mysql", "sqlite", "mssql", "oracle", "duckdb", "snowflake", "databricks", "bigquery"];
 const TOP_LEVEL = new Set(["host", "port", "database", "file_path"]);
-const SSL_KINDS: ConnectorKind[] = ["postgres", "mysql"];
 
 export const AUTH_LABELS: Record<AuthMethodKind, string> = {
   none: "None",
@@ -112,7 +113,8 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
   const toast = useStore((s) => s.toast);
   const isEdit = !!initial;
   const sorted = useMemo(
-    () => [...connectors].sort((a, b) => KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind)),
+    // Known kinds in this order, new ones after them by name.
+    () => [...connectors].sort((a, b) => rank(a.kind) - rank(b.kind) || a.display_name.localeCompare(b.display_name)),
     [connectors],
   );
 
@@ -624,7 +626,7 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
               <OracleClientPanel libDir={values.client_lib_dir || null} onUseDir={(d) => setValue("client_lib_dir", d)} />
             )}
 
-            {SSL_KINDS.includes(kind) && (
+            {traitsOf(kind).ssl_setting && (
               <div>
                 <Label htmlFor="c-ssl">SSL</Label>
                 <select id="c-ssl" className="field" value={ssl} onChange={(e) => setSsl(e.target.value as SslMode)}>

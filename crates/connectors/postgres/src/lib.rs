@@ -53,6 +53,7 @@ impl Connector for PostgresConnector {
     fn info(&self) -> ConnectorInfo {
         ConnectorInfo {
             kind: ConnectorKind::Postgres,
+            traits: ConnectorKind::Postgres.traits(),
             display_name: "PostgreSQL",
             default_port: Some(5432),
             uses_file: false,

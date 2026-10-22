@@ -1,5 +1,6 @@
 // CodeMirror adapter for lib/sqlComplete: SQL highlighting per dialect plus
 // completion from the connection's metadata (store caches + server search).
+import { traitsOf } from "../lib/sourceTraits";
 import { autocompletion, startCompletion, type Completion, type CompletionContext, type CompletionResult } from "@codemirror/autocomplete";
 import { MSSQL, MySQL, PLSQL, PostgreSQL, SQLite, StandardSQL, type SQLDialect } from "@codemirror/lang-sql";
 import { LanguageSupport } from "@codemirror/language";
@@ -26,7 +27,8 @@ const DIALECTS: Record<ConnectorKind, SQLDialect> = {
 
 /** Highlighting only: lang-sql's own completion (every keyword of the dialect) is left out. */
 export function sqlLanguage(kind: ConnectorKind | undefined): Extension {
-  return new LanguageSupport((kind ? DIALECTS[kind] : PostgreSQL).language);
+  // Kinds without a SQL dialect here (new or non-SQL sources): standard SQL highlighting.
+  return new LanguageSupport(((kind && DIALECTS[kind]) || StandardSQL).language);
 }
 
 // Completion metadata is fetched on demand, filtered by what was typed (like
@@ -290,6 +292,8 @@ export function sqlAssist(getConnId: () => string | null | undefined): Extension
       if (view && view.state.doc === doc0) startCompletion(view);
     };
     const p = id ? storeProvider(id, onLate) : null;
+    // SQL completion only for SQL sources (other languages: none yet).
+    if (p && traitsOf(p.kind).language !== "sql") return null;
     const lineFrom = (pos: number) => ctx.state.doc.lineAt(pos).from;
     const base = ctx.pos > WINDOW_BEFORE ? lineFrom(ctx.pos - WINDOW_BEFORE) : 0;
     const doc = ctx.state.doc.sliceString(base, Math.min(ctx.state.doc.length, ctx.pos + WINDOW_AFTER));

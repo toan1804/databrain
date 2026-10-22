@@ -81,10 +81,15 @@ pub fn cap_rows(kind: ConnectorKind, sql: &str, limit: usize) -> String {
     if has_limit || ordered || !(first == "select" || first == "with") {
         return s.to_string();
     }
-    match kind {
-        ConnectorKind::Mssql => format!("SELECT TOP ({limit}) * FROM (\n{s}\n) AS _q"),
-        ConnectorKind::Oracle => format!("SELECT * FROM (\n{s}\n) WHERE ROWNUM <= {limit}"),
-        _ => format!("SELECT * FROM (\n{s}\n) AS _q LIMIT {limit}"),
+    use databrain_connector_core::traits::RowLimit;
+    if !kind.traits().language.is_sql() {
+        // Other languages cap rows through the session's row limit.
+        return s.to_string();
+    }
+    match kind.traits().row_limit {
+        RowLimit::Top => format!("SELECT TOP ({limit}) * FROM (\n{s}\n) AS _q"),
+        RowLimit::FetchFirst => format!("SELECT * FROM (\n{s}\n) WHERE ROWNUM <= {limit}"),
+        RowLimit::Limit => format!("SELECT * FROM (\n{s}\n) AS _q LIMIT {limit}"),
     }
 }
 

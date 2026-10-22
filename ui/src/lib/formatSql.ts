@@ -1,21 +1,10 @@
 // SQL formatting for the editor (selection or whole script), per dialect.
 import { format, type SqlLanguage } from "sql-formatter";
 import type { ConnectorKind } from "./types";
-
-const DIALECT: Record<ConnectorKind, SqlLanguage> = {
-  postgres: "postgresql",
-  mysql: "mysql",
-  mssql: "transactsql",
-  oracle: "plsql",
-  sqlite: "sqlite",
-  duckdb: "duckdb",
-  snowflake: "snowflake",
-  databricks: "spark",
-  bigquery: "bigquery",
-};
+import { traitsOf } from "./sourceTraits";
 
 export function formatterDialect(kind: ConnectorKind | undefined): SqlLanguage {
-  return (kind && DIALECT[kind]) || "sql";
+  return (traitsOf(kind).formatter || "sql") as SqlLanguage;
 }
 
 /**
@@ -29,6 +18,7 @@ export function formatSql(sql: string, kind: ConnectorKind | undefined, opts: { 
   const trail = sql.match(/\s*$/)?.[0] ?? "";
   const body = sql.trim();
   if (!body) return sql;
+  if (traitsOf(kind).language !== "sql") throw new Error(`Format works on SQL; ${traitsOf(kind).name} queries are left as written`);
   // Indent continuation lines like the first line (selection inside a block).
   const indent = lead.slice(lead.lastIndexOf("\n") + 1);
   const run = (language: SqlLanguage) =>

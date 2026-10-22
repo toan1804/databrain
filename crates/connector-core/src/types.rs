@@ -46,25 +46,12 @@ impl ConnectorKind {
 
     /// Human name of the SQL dialect (used in AI prompts).
     pub fn dialect_name(self) -> &'static str {
-        match self {
-            ConnectorKind::Sqlite => "SQLite",
-            ConnectorKind::Postgres => "PostgreSQL",
-            ConnectorKind::Mysql => "MySQL/MariaDB",
-            ConnectorKind::Mssql => "Microsoft SQL Server (T-SQL)",
-            ConnectorKind::Oracle => "Oracle SQL / PL/SQL",
-            ConnectorKind::Snowflake => "Snowflake SQL",
-            ConnectorKind::Databricks => "Databricks SQL (Spark SQL)",
-            ConnectorKind::Bigquery => "BigQuery GoogleSQL",
-            ConnectorKind::Duckdb => "DuckDB SQL (read local files with read_csv/read_parquet/read_json/delta_scan/iceberg_scan)",
-        }
+        self.traits().dialect_name
     }
 
     /// Connectors reached over HTTPS APIs (no raw TCP, so no SSH tunnel).
     pub fn is_cloud(self) -> bool {
-        matches!(
-            self,
-            ConnectorKind::Snowflake | ConnectorKind::Databricks | ConnectorKind::Bigquery
-        )
+        self.traits().cloud
     }
 }
 
@@ -190,6 +177,8 @@ pub struct ConnectorInfo {
     /// Supported auth methods, recommended first.
     pub auth_methods: Vec<AuthMethodKind>,
     pub capabilities: Capabilities,
+    /// What the source type is like (quoting, levels, language, loads…).
+    pub traits: &'static crate::traits::SourceTraits,
     /// Connection form fields (beyond auth) the UI should show.
     pub fields: Vec<FieldSpec>,
     /// Runtime requirement shown in the UI (e.g. Oracle Instant Client).

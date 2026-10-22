@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use databrain_connector_core::{ConnectionConfig, ConnectorKind};
+use databrain_connector_core::ConnectionConfig;
 use tokio::net::{TcpStream, lookup_host};
 
 use crate::EngineError;
@@ -21,24 +21,24 @@ pub fn target(cfg: &ConnectionConfig, default_port: Option<u16>) -> Option<(Stri
         let h = ssh.host.trim();
         return (!h.is_empty()).then(|| (h.to_string(), ssh.port));
     }
-    match cfg.kind {
-        ConnectorKind::Postgres | ConnectorKind::Mysql | ConnectorKind::Oracle | ConnectorKind::Mssql => {
-            if cfg.kind == ConnectorKind::Oracle && cfg.opt("connect_string").is_some() {
-                return None;
-            }
-            if cfg.kind == ConnectorKind::Mssql && cfg.opt("instance").is_some() && cfg.port.is_none() {
+    use databrain_connector_core::traits::NetworkTarget;
+    match cfg.kind.traits().network {
+        NetworkTarget::HostPort => {
+            // Oracle connect strings and SQL Server named instances (found
+            // through the browser service) don't say where they go.
+            if cfg.opt("connect_string").is_some() || (cfg.opt("instance").is_some() && cfg.port.is_none()) {
                 return None;
             }
             let host = cfg.host_or_default().trim().to_string();
             Some((host, cfg.port.or(default_port)?))
         }
-        ConnectorKind::Databricks => {
+        NetworkTarget::HttpsHost => {
             let h = cfg.host.as_deref()?.trim();
             let h = h.strip_prefix("https://").unwrap_or(h);
             let h = h.split('/').next().unwrap_or("").trim();
             (!h.is_empty()).then(|| (h.to_string(), 443))
         }
-        _ => None,
+        NetworkTarget::Unknown => None,
     }
 }
 
@@ -79,6 +79,7 @@ pub async fn reach(host: &str, port: u16, timeout: Duration) -> Result<(), Engin
 mod tests {
     use super::*;
     use databrain_auth::AuthMethod;
+    use databrain_connector_core::ConnectorKind;
 
     fn cfg(kind: ConnectorKind, host: &str, port: Option<u16>) -> ConnectionConfig {
         ConnectionConfig {

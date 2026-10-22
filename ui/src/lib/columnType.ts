@@ -1,16 +1,7 @@
-import type { ColumnMeta, ConnectorKind, OutputInfo } from "./types";
+import type { ColumnMeta, OutputInfo } from "./types";
+import { engineName } from "./sourceTraits";
 
-export const ENGINE_NAMES: Record<ConnectorKind, string> = {
-  sqlite: "SQLite",
-  postgres: "PostgreSQL",
-  mysql: "MySQL",
-  mssql: "SQL Server",
-  oracle: "Oracle",
-  snowflake: "Snowflake",
-  databricks: "Databricks",
-  bigquery: "BigQuery",
-  duckdb: "DuckDB",
-};
+export { engineName };
 
 export interface ColumnTypeInfo {
   name: string;

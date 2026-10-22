@@ -44,6 +44,7 @@ impl Connector for MssqlConnector {
     fn info(&self) -> ConnectorInfo {
         ConnectorInfo {
             kind: ConnectorKind::Mssql,
+            traits: ConnectorKind::Mssql.traits(),
             display_name: "SQL Server",
             default_port: Some(1433),
             uses_file: false,

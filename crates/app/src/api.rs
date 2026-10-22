@@ -259,7 +259,7 @@ pub struct SaveConnectionArgs {
 
 pub fn save_connection(state: &AppState, args: SaveConnectionArgs) -> Result<ConnectionProfile> {
     let mut profile = args.profile;
-    validate_config(&profile.config)?;
+    validate_config(state, &profile.config)?;
     if args.secret.is_some() {
         profile.has_secret = true;
     } else if args.clear_secret {
@@ -299,26 +299,10 @@ pub fn save_connection(state: &AppState, args: SaveConnectionArgs) -> Result<Con
     Ok(saved)
 }
 
-fn validate_config(cfg: &ConnectionConfig) -> Result<()> {
+fn validate_config(state: &AppState, cfg: &ConnectionConfig) -> Result<()> {
     use databrain_auth::AuthMethod;
-    match cfg.kind {
-        ConnectorKind::Duckdb => {}
-        ConnectorKind::Sqlite => {
-            if cfg.file_path.as_deref().is_none_or(|p| p.trim().is_empty()) {
-                return Err(invalid("Choose a database file"));
-            }
-        }
-        ConnectorKind::Snowflake if cfg.opt("account").is_none() && cfg.host.as_deref().is_none_or(str::is_empty) => {
-            return Err(invalid("Snowflake account identifier is required"));
-        }
-        ConnectorKind::Databricks if cfg.opt("http_path").is_none() && cfg.opt("warehouse_id").is_none() => {
-            return Err(invalid("SQL warehouse HTTP path is required"));
-        }
-        ConnectorKind::Bigquery if cfg.opt("project").is_none() => {
-            return Err(invalid("Billing project ID is required"));
-        }
-        _ => {}
-    }
+    // What the connector itself requires (a file, an account, a project…).
+    state.engine.registry().get(cfg.kind)?.validate(cfg).map_err(invalid)?;
     match &cfg.auth {
         AuthMethod::Password { user } | AuthMethod::KeyPair { user } | AuthMethod::ExternalBrowser { user } if user.trim().is_empty() => {
             return Err(invalid("User name is required"));
@@ -326,7 +310,7 @@ fn validate_config(cfg: &ConnectionConfig) -> Result<()> {
         _ => {}
     }
     if let Some(ssh) = &cfg.ssh {
-        if cfg.kind.is_cloud() || matches!(cfg.kind, ConnectorKind::Sqlite | ConnectorKind::Duckdb) {
+        if cfg.kind.is_cloud() || cfg.kind.traits().local {
             return Err(invalid("SSH tunnels are only available for server databases"));
         }
         if ssh.host.trim().is_empty() || ssh.user.trim().is_empty() {
@@ -370,7 +354,7 @@ pub async fn test_connection(
     ssh_secret: Option<String>,
     test_id: Option<String>,
 ) -> Result<TestResult> {
-    validate_config(&config)?;
+    validate_config(state, &config)?;
     state
         .engine
         .test_connection(&config, secret, connection_id.as_deref(), ssh_secret, test_id.as_deref())
@@ -830,6 +814,9 @@ pub async fn lineage(
     params: std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>,
     check: bool,
 ) -> Result<LineageView> {
+    if !kind.traits().language.is_sql() {
+        return Err(invalid(format!("Lineage traces SQL; {} queries aren't supported", kind.traits().name)));
+    }
     let ws = state.engine.workspace().clone();
     let masked = mask_parameters(sql, kind);
     let cat = |id: Option<String>| {

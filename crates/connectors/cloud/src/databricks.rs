@@ -54,9 +54,17 @@ fn warehouse_id(cfg: &ConnectionConfig) -> Result<String> {
 
 #[async_trait]
 impl Connector for DatabricksConnector {
+    fn validate(&self, cfg: &ConnectionConfig) -> std::result::Result<(), String> {
+        if cfg.opt("http_path").is_none() && cfg.opt("warehouse_id").is_none() {
+            return Err("SQL warehouse HTTP path is required".into());
+        }
+        Ok(())
+    }
+
     fn info(&self) -> ConnectorInfo {
         ConnectorInfo {
             kind: ConnectorKind::Databricks,
+            traits: ConnectorKind::Databricks.traits(),
             display_name: "Databricks",
             default_port: None,
             uses_file: false,

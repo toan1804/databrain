@@ -167,6 +167,31 @@ pub trait Session: Send + Sync {
 
 Each connector is behind a Cargo feature flag. Native types map to Arrow. Types Arrow can't represent fall back to `Utf8`, and the original type name is kept in field metadata.
 
+### 5.1 Source traits: what a database type is like
+
+Everything the rest of the app needs to know about a database type is declared once, in `crates/connector-core/src/traits.rs` as a `SourceTraits` constant per `ConnectorKind` (served to the UI with each connector in `ConnectorInfo.traits`). Shared code reads these fields instead of matching on the kind:
+
+| Field | Used by |
+|---|---|
+| `language` (`sql`, `cql`, `cypher`, `mongo_json`), `parser` | statement splitter and read/write classifier (`sql.rs`, `language.rs`), lineage, Format and SQL completion (SQL only) |
+| `quote`, `upper_folding`, `levels`, `whole_path_quotes`, `always_qualify_catalog`, `catalog_noun` | identifier quoting and qualified names (Rust `quote_ident`, UI `quoteIdent`/`qualifiedName`), explorer catalog levels and wording, completion |
+| `row_limit` | AI row caps, "Select top 100 rows" |
+| `explain` | EXPLAIN checks (lineage "Check with database"); `None` = no check |
+| `syntax` (quotes, comments, `$$`, `DELIMITER`, block ends like `/` or `GO`) | statement splitting and `:name` parameters |
+| `load` (`None` = not a load target): types, batch limits, literals, staging, merge style, transactions | job load steps and SQL INSERT export (`crates/export/src/load.rs`) |
+| `cloud`, `local`, `network`, `ssl_setting`, `dialect_name`, `name`, `formatter` | SSH rules, the quick network check, the connection form, AI prompts, messages |
+
+The UI keeps a copy in `ui/src/lib/sourceTraits.json` for its tests and pure helpers; the app replaces it with the backend's at start. A Rust test fails when the copy is stale (`UPDATE_SOURCE_TRAITS=1 cargo test -p databrain-connector-core traits` rewrites it).
+
+### 5.2 Adding a database type
+
+1. Add the variant to `ConnectorKind` (`types.rs`: enum, `ALL`, `as_str`) and its `SourceTraits` in `traits.rs`, starting from `traits::STANDARD` and overriding what differs. A non-SQL source sets `language` and `load: None`: lineage, Format, SQL completion and "load into" turn off for it on their own. A new query language also needs a `classify` arm in `language.rs` (what reads vs. writes).
+2. Write the connector crate under `crates/connectors/<name>`: `impl Connector` (`info()` with the form fields and auth methods, `validate()` for required settings, `connect()`) and `impl Session` (`execute` returning Arrow batches, `list_schemas`, `list_objects`, `describe`; `list_catalogs` for three-level sources; the rest have defaults). Results are Arrow, so the grid, outputs, DuckDB joins over `results.<name>`, export, charts and the AI's result tools work unchanged; nested values go in as JSON text columns.
+3. Register it in the app (`crates/app`: the registry and a Cargo feature) and add the kind to the UI's `ConnectorKind` type union.
+4. Run `UPDATE_SOURCE_TRAITS=1 cargo test -p databrain-connector-core traits`, then the workspace tests.
+
+Connector-specific UI (a driver panel, sign-in hints) stays optional; without it the generic connection form is built from `info().fields`.
+
 ---
 
 ## 6. Authentication (cloud data platforms and AI providers)

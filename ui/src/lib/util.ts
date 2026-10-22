@@ -6,6 +6,7 @@ import type {
   SortKey,
   ViewSpec,
 } from "./types";
+import { traitsOf } from "./sourceTraits";
 
 export const emptyView = (): ViewSpec => ({ filters: [], quick_filter: null, sort: [] });
 
@@ -133,42 +134,47 @@ export function errorRange(
   return { from, to: Math.min(stmt.end, from + Math.max(1, len)) };
 }
 
-const UPPER_FOLDING: ConnectorKind[] = ["oracle", "snowflake"];
-
 export function quoteIdent(kind: ConnectorKind, ident: string): string {
+  const t = traitsOf(kind);
   // Unquoted identifiers fold to upper case in Oracle/Snowflake, lower elsewhere.
-  const safe = UPPER_FOLDING.includes(kind) ? /^[A-Z_][A-Z0-9_$]*$/ : /^[a-z_][a-z0-9_]*$/;
+  const safe = t.upper_folding ? /^[A-Z_][A-Z0-9_$]*$/ : /^[a-z_][a-z0-9_]*$/;
   if (safe.test(ident)) return ident;
-  switch (kind) {
-    case "mysql":
-    case "databricks":
-    case "bigquery":
+  switch (t.quote) {
+    case "backtick":
+    case "backtick_backslash":
       return "`" + ident.replace(/`/g, "``") + "`";
-    case "mssql":
+    case "bracket":
       return "[" + ident.replace(/]/g, "]]") + "]";
     default:
       return '"' + ident.replace(/"/g, '""') + '"';
   }
 }
 
-/** Qualified name. Cloud/DuckDB schema names are `catalog.schema` paths. */
+/** Qualified name. Schema ids of catalog engines are `catalog.schema` paths. */
 export function qualifiedName(kind: ConnectorKind, schema: string, name: string): string {
-  // SQL Server without a database: schema ids are `database.schema` (split at the first dot).
+  const t = traitsOf(kind);
   const i = schema.indexOf(".");
-  const parts = ["snowflake", "databricks", "bigquery", "duckdb"].includes(kind)
-    ? schema.split(".")
-    : kind === "mssql" && i > 0
-      ? [schema.slice(0, i), schema.slice(i + 1)]
-      : [schema];
-  if (kind === "bigquery") return "`" + [...parts, name].join(".").replace(/`/g, "") + "`";
+  const parts =
+    t.levels === "three"
+      ? schema.split(".")
+      : t.levels === "three_without_database" && i > 0
+        ? // SQL Server without a database: `database.schema` (split at the first dot).
+          [schema.slice(0, i), schema.slice(i + 1)]
+        : [schema];
+  if (t.whole_path_quotes) return "`" + [...parts, name].join(".").replace(/`/g, "") + "`";
   return [...parts, name].map((p) => quoteIdent(kind, p)).join(".");
 }
 
 export function selectTopSql(kind: ConnectorKind, schema: string, table: string, n = 100): string {
   const q = qualifiedName(kind, schema, table);
-  if (kind === "mssql") return `SELECT TOP ${n} *\nFROM ${q};`;
-  if (kind === "oracle") return `SELECT *\nFROM ${q}\nFETCH FIRST ${n} ROWS ONLY`;
-  return `SELECT *\nFROM ${q}\nLIMIT ${n};`;
+  switch (traitsOf(kind).row_limit) {
+    case "top":
+      return `SELECT TOP ${n} *\nFROM ${q};`;
+    case "fetch_first":
+      return `SELECT *\nFROM ${q}\nFETCH FIRST ${n} ROWS ONLY`;
+    default:
+      return `SELECT *\nFROM ${q}\nLIMIT ${n};`;
+  }
 }
 
 /** First line of SQL, trimmed, for titles and list items. */

@@ -77,6 +77,7 @@ impl Connector for MysqlConnector {
     fn info(&self) -> ConnectorInfo {
         ConnectorInfo {
             kind: ConnectorKind::Mysql,
+            traits: ConnectorKind::Mysql.traits(),
             display_name: "MySQL / MariaDB",
             default_port: Some(3306),
             uses_file: false,

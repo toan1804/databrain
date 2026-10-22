@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { traitsOf } from "../lib/sourceTraits";
 import {
   AlertCircle,
   Ban,
@@ -572,7 +573,7 @@ function CatalogNode({ conn, name, schemas: given, defaultOpen, filtered = false
   const toast = useStore((s) => s.toast);
   const schemas = given ?? listed;
   const [loading, setLoading] = useState(false);
-  const noun = conn.config.kind === "bigquery" ? "Project" : conn.config.kind === "databricks" ? "Catalog" : "Database";
+  const noun = ((n) => n.charAt(0).toUpperCase() + n.slice(1))(traitsOf(conn.config.kind).catalog_noun);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const load = useCallback(
     async (force = false) => {

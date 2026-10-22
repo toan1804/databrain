@@ -1,4 +1,5 @@
 import { DEFAULT_APPEARANCE, applyAppearance, parseAppearance, type Appearance } from "./lib/appearance";
+import { setSourceTraits } from "./lib/sourceTraits";
 import { create } from "zustand";
 import { isThreeLevel, mergeCatalogSchemas, prefetchSchemas, revealKeys, splitSchema, treeKey } from "./lib/catalog";
 import { api, isTauri, onAuthEvent, onJobEvent, onOracleAgent, toError } from "./lib/api";
@@ -593,7 +594,7 @@ export const useStore = create<State>((set, get) => ({
     }
     try {
       const [connectors, connections, tabs, settings, savedQueries] = await Promise.all([
-        api.listConnectors(),
+        api.listConnectors().then((c) => (setSourceTraits(c), c)),
         api.listConnections(),
         api.loadTabs(),
         api.getSettings(),

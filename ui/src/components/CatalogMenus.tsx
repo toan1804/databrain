@@ -1,4 +1,5 @@
 // Copy / insert actions for catalog objects (explorer tree and catalog search).
+import { traitsOf } from "../lib/sourceTraits";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { ClipboardCopy, Columns3, FileCode2, Play, RefreshCw, TextCursorInput } from "lucide-react";
 import { toError } from "../lib/api";
@@ -58,7 +59,7 @@ export async function insertColumns(conn: ConnectionView, obj: DbObject) {
 
 type At = { x: number; y: number };
 
-const nounOf = (conn: ConnectionView) => (conn.config.kind === "bigquery" ? "project" : conn.config.kind === "databricks" ? "catalog" : "database");
+const nounOf = (conn: ConnectionView) => traitsOf(conn.config.kind).catalog_noun;
 
 export function CatalogMenu({ conn, catalog, at, onClose }: { conn: ConnectionView; catalog: string; at: At; onClose: () => void }) {
   const kind = conn.config.kind;

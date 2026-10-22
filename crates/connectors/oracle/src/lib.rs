@@ -127,6 +127,7 @@ impl Connector for OracleConnector {
     fn info(&self) -> ConnectorInfo {
         ConnectorInfo {
             kind: ConnectorKind::Oracle,
+            traits: ConnectorKind::Oracle.traits(),
             display_name: "Oracle",
             default_port: Some(1521),
             uses_file: false,

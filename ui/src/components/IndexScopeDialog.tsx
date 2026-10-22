@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { traitsOf } from "../lib/sourceTraits";
 import { AlertTriangle, ChevronDown, ChevronRight, Library, Search } from "lucide-react";
 import { useAi } from "../aiStore";
 import { DEFAULT_BATCH, MAX_BATCH, buildScope, estimateQueries, initialSelection, isBulk, planCatalogs, selectedObjects } from "../lib/indexScope";
@@ -90,7 +91,7 @@ function ScopeDialog() {
             This connection has{" "}
             {threeLevel && (
               <>
-                <b>{formatCount(plan.catalogs)}</b> {kind === "bigquery" ? "projects" : kind === "databricks" ? "catalogs" : "databases"},{" "}
+                <b>{formatCount(plan.catalogs)}</b> {traitsOf(kind).catalog_noun}s,{" "}
               </>
             )}
             <b>{formatCount(plan.schemas.filter((s) => !s.system).length)}</b> schemas

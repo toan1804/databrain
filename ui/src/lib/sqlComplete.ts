@@ -4,6 +4,7 @@
 // without CodeMirror); see components/sqlAssist.ts for the editor adapter.
 import type { ConnectorKind, DbObject, SchemaInfo } from "./types";
 import { mayHaveCatalog, schemaLabel } from "./catalog";
+import { traitsOf } from "./sourceTraits";
 import { quoteIdent } from "./util";
 
 export interface MetaProvider {
@@ -334,11 +335,11 @@ export function tableApply(p: MetaProvider, o: DbObject): string {
     const cat = known?.catalog ?? o.schema.slice(0, o.schema.indexOf("."));
     const sch = known ? schemaLabel(known) : o.schema.slice(cat.length + 1);
     // Same catalog as the session: schema.table resolves (BigQuery needs the project).
-    parts = cat === def?.catalog && k !== "bigquery" ? [sch] : [cat, sch];
+    parts = cat === def?.catalog && !traitsOf(k).always_qualify_catalog ? [sch] : [cat, sch];
   } else {
     parts = [o.schema];
   }
-  if (k === "bigquery") return "`" + [...parts, o.name].join(".") + "`";
+  if (traitsOf(k).whole_path_quotes) return "`" + [...parts, o.name].join(".") + "`";
   return [...parts, o.name].map((x) => quoteIdent(k, x)).join(".");
 }
 

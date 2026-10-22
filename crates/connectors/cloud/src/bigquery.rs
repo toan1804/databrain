@@ -36,9 +36,17 @@ impl BigQueryConnector {
 
 #[async_trait]
 impl Connector for BigQueryConnector {
+    fn validate(&self, cfg: &ConnectionConfig) -> std::result::Result<(), String> {
+        if cfg.opt("project").is_none() {
+            return Err("Billing project ID is required".into());
+        }
+        Ok(())
+    }
+
     fn info(&self) -> ConnectorInfo {
         ConnectorInfo {
             kind: ConnectorKind::Bigquery,
+            traits: ConnectorKind::Bigquery.traits(),
             display_name: "BigQuery",
             default_port: None,
             uses_file: false,

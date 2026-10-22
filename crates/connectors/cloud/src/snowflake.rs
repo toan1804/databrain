@@ -63,9 +63,17 @@ fn jwt_account(account: &str) -> String {
 
 #[async_trait]
 impl Connector for SnowflakeConnector {
+    fn validate(&self, cfg: &ConnectionConfig) -> std::result::Result<(), String> {
+        if cfg.opt("account").is_none() && cfg.host.as_deref().is_none_or(str::is_empty) {
+            return Err("Snowflake account identifier is required".into());
+        }
+        Ok(())
+    }
+
     fn info(&self) -> ConnectorInfo {
         ConnectorInfo {
             kind: ConnectorKind::Snowflake,
+            traits: ConnectorKind::Snowflake.traits(),
             display_name: "Snowflake",
             default_port: None,
             uses_file: false,
