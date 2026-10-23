@@ -369,6 +369,29 @@ impl ToolContext {
         Ok(out(text, json!({"job_id": job.id, "name": job.name})))
     }
 
+    /// Steps of a job the AI builds or runs use only tables their
+    /// connections let the AI read (query steps) and write (query and load steps).
+    fn check_job_tables(&self, job: &databrain_workspace::Job, only: &[String]) -> Result<()> {
+        let ws = self.engine.workspace();
+        for n in job.nodes.iter().filter(|n| only.is_empty() || only.contains(&n.id)) {
+            let conn = |id: &str| ws.get_connection(id).map_err(|_| AiError::Policy(format!("step {}: its connection no longer exists", n.name)));
+            match n.kind {
+                databrain_workspace::JobNodeKind::Query => {
+                    if let Some(c) = n.connection_id.as_deref().filter(|c| !c.is_empty()) {
+                        crate::access::check_sql(&conn(c)?, &n.sql).map_err(|r| AiError::Policy(format!("step {}: {r}", n.name)))?;
+                    }
+                }
+                databrain_workspace::JobNodeKind::Load => {
+                    if let (Some(c), Some(t)) = (n.target_connection_id.as_deref().filter(|c| !c.is_empty()), n.target_table.as_deref()) {
+                        crate::access::check_write_table(&conn(c)?, t).map_err(|r| AiError::Policy(format!("step {}: {r}", n.name)))?;
+                    }
+                }
+                databrain_workspace::JobNodeKind::Export => {}
+            }
+        }
+        Ok(())
+    }
+
     async fn run_job(&self, args: &Value) -> Result<ToolOutput> {
         let job = self.find_job(arg(args, "job")?)?;
         let refs = self.conn_refs()?;
@@ -379,6 +402,7 @@ impl ToolContext {
             only_ids.push(n.id.clone());
         }
         let scope = if want.is_empty() { "all steps".to_string() } else { format!("steps {}", want.join(", ")) };
+        self.check_job_tables(&job, &only_ids)?;
         // What a run changes: loads write tables, exports write files.
         let writes: Vec<String> = job
             .nodes
@@ -445,6 +469,7 @@ impl ToolContext {
         let taken: std::collections::HashSet<String> = ws.job_step_names()?.into_iter().filter(|(_, o)| o.job_id != old.id).map(|(n, _)| n).collect();
         let refs = self.conn_refs()?;
         let (job, notes) = crate::jobs::merge_job(&old, args, &refs, &taken)?;
+        self.check_job_tables(&job, &[])?;
         let changes = crate::jobs::changes(&old, &job);
         if changes.is_empty() {
             return Ok(out("Nothing changes: the job is already like that.", json!({"job_id": old.id, "name": old.name})));
@@ -465,6 +490,7 @@ impl ToolContext {
         let taken: std::collections::HashSet<String> = ws.job_step_names()?.into_iter().map(|(n, _)| n).collect();
         let refs = self.conn_refs()?;
         let (job, notes) = crate::jobs::build_job(args, &refs, &taken)?;
+        self.check_job_tables(&job, &[])?;
         let preview = crate::jobs::describe(&job, &refs);
         self.gate("create_job", Decision::Ask("Create a job".into()), &format!("\"{}\" with {} steps", job.name, job.nodes.len()), &json!({"preview": preview, "name": job.name}))
             .await?;
@@ -699,6 +725,9 @@ impl ToolContext {
     /// shared on that connection's terms), falling back to this one's.
     fn source_policy(&self, result_id: &str) -> Result<databrain_workspace::AiPolicy> {
         let Some(o) = self.engine.outputs().by_result(result_id) else { return Ok(self.policy().clone()) };
+        // The tables the output was read from must be readable by the AI
+        // (a query the user ran on a table the AI may not read stays hidden).
+        self.check_output_tables(&o, 0)?;
         if o.connection_id == self.profile.id {
             return Ok(self.policy().clone());
         }
@@ -710,6 +739,23 @@ impl ToolContext {
             return Err(AiError::Policy(format!("{} comes from \"{}\", which is not shared with MCP", o.handle, src.name)));
         }
         Ok(src.ai_policy)
+    }
+
+    /// The output's SQL reads only tables its connection lets the AI read;
+    /// outputs combined on DuckDB (`results.<x>`) are checked through their inputs.
+    fn check_output_tables(&self, o: &databrain_query_engine::outputs::OutputInfo, depth: usize) -> Result<()> {
+        let src = if o.connection_id == self.profile.id { self.profile.clone() } else { self.engine.workspace().get_connection(&o.connection_id).map_err(|_| AiError::Policy(format!("source connection of {} no longer exists", o.handle)))? };
+        if let Err(r) = crate::access::check_sql(&src, &o.sql) {
+            return Err(AiError::Policy(format!("{} can't be shared with the assistant: {r}", o.handle)));
+        }
+        if depth < 5 && src.config.kind == databrain_connector_core::ConnectorKind::Duckdb {
+            for input in self.engine.outputs().referenced(&o.sql) {
+                if input.result_id != o.result_id {
+                    self.check_output_tables(&input, depth + 1)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Accept a result id or an output reference (`r12`, `revenue`, `results.x`).
@@ -936,6 +982,7 @@ impl ToolContext {
         let n = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(5).clamp(1, 20) as usize;
         let kind = self.profile.config.kind;
         let full = o.full_name();
+        crate::access::check_read_table(&self.profile, &full).map_err(AiError::Policy)?;
         let sql = databrain_connector_core::traits::preview_query(kind, &o.schema, &o.name, n);
         // Sampling is a read the user enabled via policy; no approval prompt.
         let outcomes = self

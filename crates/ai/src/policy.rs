@@ -28,7 +28,14 @@ pub fn review_sql(profile: &ConnectionProfile, sql: &str) -> SqlReview {
     let policy = &profile.ai_policy;
     let stmts: Vec<Classification> = split_statements(sql, kind).iter().map(|s| classify(&s.sql, kind)).collect();
     let worst = stmts.iter().map(|c| c.kind).max().unwrap_or(StatementKind::Unknown);
-    let decision = decide(profile, policy, &stmts, worst);
+    let mut decision = decide(profile, policy, &stmts, worst);
+    // Tables the AI may read / write (checked after the connection-wide rules,
+    // so their reasons come first).
+    if !matches!(decision, Decision::Deny(_)) {
+        if let Err(reason) = crate::access::check_sql(profile, sql) {
+            decision = Decision::Deny(reason);
+        }
+    }
     SqlReview { decision, statements: stmts, kind: worst }
 }
 
@@ -140,6 +147,10 @@ mod tests {
         assert!(matches!(review_sql(&prod, "update t set a=1 where id=1").decision, Decision::Deny(_)));
         let never = profile(EnvTag::Dev, AiPolicy { run_query: RunQueryPolicy::Never, ..Default::default() });
         assert!(matches!(review_sql(&never, "select 1").decision, Decision::Deny(_)));
+        // Table rules: an allowed read still runs (even automatically), a denied one never.
+        let rules = profile(EnvTag::Dev, AiPolicy { run_query: RunQueryPolicy::AutoRead, read_deny: vec!["%.hr.%".into()], ..Default::default() });
+        assert_eq!(review_sql(&rules, "select * from sales.orders").decision, Decision::Allow);
+        assert!(matches!(review_sql(&rules, "select * from hr.pay").decision, Decision::Deny(r) if r.contains("hr.pay")));
     }
 
     #[test]

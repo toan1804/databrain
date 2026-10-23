@@ -500,6 +500,89 @@ async fn ai_tools_use_output_handles_with_source_policies() {
     assert!(o.content.contains("not shared with MCP"), "{}", o.content);
 }
 
+/// Table access rules: run_query, sample_rows, outputs the user made from a
+/// denied table, and jobs the AI builds all respect them; MCP too.
+#[tokio::test]
+async fn table_access_rules() {
+    use databrain_connector_core::external::ExternalTablesSlot;
+    let rules = AiPolicy {
+        run_query: RunQueryPolicy::AutoRead,
+        share_sample_values: true,
+        share_result_rows: true,
+        mcp_enabled: true,
+        allow_write: true,
+        read_deny: vec!["'%customers%'".into()],
+        write_allow: vec!["main.scratch%".into()],
+        ..Default::default()
+    };
+    let f = fixture(1, rules).await;
+    let slot = ExternalTablesSlot::new();
+    let mut reg = ConnectorRegistry::new();
+    reg.register(Arc::new(databrain_connector_sqlite::SqliteConnector));
+    reg.register(Arc::new(databrain_connector_duckdb::DuckdbConnector::with_outputs(slot.clone())));
+    let engine = QueryEngine::new(reg, f.ws.clone(), f.secrets.clone(), Arc::new(ResultStore::new()), f.hub.clone());
+    slot.set(engine.external_tables());
+    let ctx = databrain_ai::ToolContext {
+        engine: engine.clone(),
+        hub: f.hub.clone(),
+        profile: f.ws.get_connection(&f.conn).unwrap(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+    };
+    let o = ctx.call("run_query", &json!({"sql": "select country, sum(amount) from orders group by 1"})).await;
+    assert!(o.content.contains("returned 2 rows"), "{}", o.content);
+    for sql in ["select * from customers", "select o.* from orders o join main.customers c on c.id = o.customer_id", "select * from orders where customer_id in (select id from customers)"] {
+        let o = ctx.call("run_query", &json!({"sql": sql})).await;
+        assert!(o.content.starts_with("ERROR") && o.content.contains("main.customers"), "{sql}: {}", o.content);
+    }
+    // Writes: only main.scratch*.
+    let o = ctx.call("run_query", &json!({"sql": "create table scratch_a as select * from orders"})).await;
+    assert!(!o.content.starts_with("ERROR"), "{}", o.content);
+    let o = ctx.call("run_query", &json!({"sql": "delete from orders where id = 1"})).await;
+    assert!(o.content.contains("may only write tables matching 'main.scratch%'"), "{}", o.content);
+    // sample_rows and MCP.
+    let o = ctx.call("get_sample_rows", &json!({"table": "main.customers"})).await;
+    assert!(o.content.starts_with("ERROR") && o.content.contains("deny"), "{}", o.content);
+    let mcp = databrain_ai::ToolContext { caller: databrain_ai::Caller::Mcp, profile: ctx.profile.clone(), engine: engine.clone(), hub: f.hub.clone(), session_id: Some("m".into()), host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }), cancel: Default::default(), results: Mutex::new(vec![]) };
+    assert!(mcp.call("run_query", &json!({"sql": "select email from customers"})).await.content.starts_with("ERROR"));
+
+    // The user queried customers in a tab: the AI can't read that output, nor
+    // one combined from it on DuckDB.
+    let run = |conn: String, sql: &'static str, name: &'static str| {
+        let (engine, hub) = (engine.clone(), f.hub.clone());
+        async move {
+            let r = RunRequest { connection_id: conn, tab_id: uuid::Uuid::new_v4().to_string(), sql: sql.into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: Some(name.into()), params: Default::default() };
+            let o = engine.run_and_wait(&hub, r, None).await.unwrap();
+            assert!(o.iter().all(|x| x.error.is_none()), "{:?}", o[0].error);
+        }
+    };
+    run(f.conn.clone(), "select name, email from customers", "people").await;
+    let duck = engine.results_connection().unwrap().id;
+    run(duck, "select count(*) n from results.people", "people_count").await;
+    for r in ["people", "people_count"] {
+        let o = ctx.call("query_result", &json!({"result_id": r, "sql": "select * from result"})).await;
+        assert!(o.content.starts_with("ERROR") && o.content.contains("can't be shared"), "{r}: {}", o.content);
+    }
+    let o = ctx.call("list_outputs", &json!({})).await;
+    assert!(!o.content.contains("results.people"), "{}", o.content);
+
+    // Jobs the AI builds: a query step on a denied table, or a load into a
+    // table outside the write rules, are refused before asking.
+    let o = ctx.call("create_job", &json!({"name": "J1", "steps": [{"name": "j_cust", "connection": "Shop", "sql": "select * from customers"}]})).await;
+    assert!(o.content.starts_with("ERROR") && o.content.contains("step j_cust"), "{}", o.content);
+    let o = ctx
+        .call("create_job", &json!({"name": "J2", "steps": [{"name": "j_ord", "connection": "Shop", "sql": "select * from orders"}, {"name": "j_load", "action": "load", "after": ["j_ord"], "target_connection": "Shop", "target_table": "main.orders_copy"}]}))
+        .await;
+    assert!(o.content.starts_with("ERROR") && o.content.contains("step j_load"), "{}", o.content);
+    let o = ctx
+        .call("create_job", &json!({"name": "J3", "steps": [{"name": "j_ord3", "connection": "Shop", "sql": "select * from orders"}, {"name": "j_load3", "action": "load", "after": ["j_ord3"], "target_connection": "Shop", "target_table": "main.scratch_copy"}]}))
+        .await;
+    assert!(!o.content.starts_with("ERROR"), "{}", o.content);
+}
+
 /// Live: `DATABRAIN_KIRO_LIVE=1 cargo test -p databrain-ai --test agent_e2e kiro_live_status -- --nocapture`
 #[tokio::test]
 async fn kiro_live_status() {

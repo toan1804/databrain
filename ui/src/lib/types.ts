@@ -77,6 +77,14 @@ export interface AiPolicy {
   mcp_enabled: boolean;
   /** AI notes are saved directly instead of waiting for review. */
   auto_approve_notes: boolean;
+  /** Tables the AI may read: LIKE patterns on catalog.schema.table / schema.table / table (empty = all). */
+  read_allow?: string[];
+  /** Tables the AI may never read (wins over read_allow). */
+  read_deny?: string[];
+  /** Tables the AI may write (empty = all, when writes are allowed). */
+  write_allow?: string[];
+  /** Tables the AI may never write. */
+  write_deny?: string[];
 }
 
 export interface AuthStatus {

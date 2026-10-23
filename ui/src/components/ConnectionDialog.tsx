@@ -20,6 +20,7 @@ import { useStore } from "../store";
 import { OracleAgentPanel, OracleClientPanel } from "./OracleClient";
 import { AskAiAboutError, connectionErrorQuestion } from "./AskAiError";
 import { Modal } from "./ui";
+import { formatPatterns, parsePatterns, tableAccess } from "../lib/aiAccess";
 
 const COLORS = ["#818cf8", "#22d3ee", "#34d399", "#fbbf24", "#f97316", "#f87171", "#e879f9", "#94a3b8"];
 const ENVS: { value: EnvTag; label: string }[] = [
@@ -70,6 +71,10 @@ export const DEFAULT_POLICY: AiPolicy = {
   index_batch: 25,
   mcp_enabled: false,
   auto_approve_notes: false,
+  read_allow: [],
+  read_deny: [],
+  write_allow: [],
+  write_deny: [],
 };
 
 function Label({ children, htmlFor }: { children: React.ReactNode; htmlFor?: string }) {
@@ -990,6 +995,7 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
                   onChange={(e) => setPolicy({ ...policy, pii_columns: e.target.value.split(",").map((x) => x.trim()).filter(Boolean) })}
                 />
               </div>
+              <TableAccessFields policy={policy} setPolicy={setPolicy} />
               <div>
                 <Label htmlFor="ai-schemas">Schemas to index for knowledge (empty = ask for large databases, * = all)</Label>
                 <input
@@ -1042,6 +1048,82 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
         <button type="submit" className="hidden" />
       </form>
     </Modal>
+  );
+}
+
+/** Read and write table rules for the AI (LIKE patterns), with a "try a table" check. */
+function TableAccessFields({ policy, setPolicy }: { policy: AiPolicy; setPolicy: (p: AiPolicy) => void }) {
+  // Kept as typed while editing; parsed into the policy on every change.
+  const [text, setText] = useState(() => ({
+    read_allow: formatPatterns(policy.read_allow),
+    read_deny: formatPatterns(policy.read_deny),
+    write_allow: formatPatterns(policy.write_allow),
+    write_deny: formatPatterns(policy.write_deny),
+  }));
+  const [probe, setProbe] = useState("");
+  type Key = keyof typeof text;
+  const field = (key: Key, label: string, placeholder: string, disabled = false) => (
+    <div>
+      <Label htmlFor={`ai-${key}`}>{label}</Label>
+      <textarea
+        id={`ai-${key}`}
+        className="field min-h-[52px] font-mono text-[12px]"
+        value={text[key]}
+        placeholder={placeholder}
+        disabled={disabled}
+        spellCheck={false}
+        onChange={(e) => {
+          setText({ ...text, [key]: e.target.value });
+          setPolicy({ ...policy, [key]: parsePatterns(e.target.value) });
+        }}
+      />
+    </div>
+  );
+  const list = (k: Key) => policy[k] ?? [];
+  const read = probe.trim() ? tableAccess(list("read_allow"), list("read_deny"), probe.trim()) : null;
+  const write = probe.trim() ? tableAccess(list("write_allow"), list("write_deny"), probe.trim()) : null;
+  const any = (["read_allow", "read_deny", "write_allow", "write_deny"] as Key[]).some((k) => list(k).length > 0);
+  return (
+    <div className="space-y-2 rounded-lg border border-line p-3">
+      <div className="text-[12.5px] font-medium">Tables the AI may use</div>
+      <p className="text-[11.5px] text-muted">
+        SQL LIKE patterns, comma separated (<span className="font-mono">%</span> any text, <span className="font-mono">_</span> one character, not case-sensitive), matched against{" "}
+        <span className="font-mono">catalog.schema.table</span>, <span className="font-mono">schema.table</span> and <span className="font-mono">table</span>. Unqualified names in SQL use the
+        connection&apos;s default database and schema. Empty &quot;like&quot; = every table; &quot;not like&quot; always wins. Applies to the assistant&apos;s queries, sample rows, results it reads
+        (also from your own queries) and jobs it builds or runs, and to MCP clients.
+      </p>
+      <div className="grid grid-cols-2 gap-3">
+        {field("read_allow", "AI read access: like", "'catalog_read%', '%schema_can_read%'")}
+        {field("read_deny", "AI read access: not like", "'cannot_read%', '%.hr.%'")}
+        {field("write_allow", "AI write access: like", "'%.scratch.%'", !policy.allow_write)}
+        {field("write_deny", "AI write access: not like", "'%.prod_%'", !policy.allow_write)}
+      </div>
+      {!policy.allow_write && <p className="text-[11px] text-muted">Write rules apply once &quot;Allow write statements&quot; is on.</p>}
+      {any && (
+        <p className="text-[11px] text-muted">
+          While rules are set, the assistant can&apos;t run SQL whose tables can&apos;t be told (procedure calls, unparsed SQL, Neo4j Cypher) or that changes the default schema (USE, SET search_path).
+        </p>
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          className="field max-w-[260px] font-mono text-[12px]"
+          placeholder="Try a table: catalog.schema.table"
+          aria-label="Try a table name against the rules"
+          value={probe}
+          spellCheck={false}
+          onChange={(e) => setProbe(e.target.value)}
+        />
+        {read && write && (
+          <span className="text-[11.5px]" role="status">
+            <span className={read.ok ? "text-success" : "text-danger"}>read {read.ok ? "allowed" : "denied"}</span>
+            <span className="text-muted"> ({read.why})</span>
+            {" · "}
+            <span className={write.ok && policy.allow_write ? "text-success" : "text-danger"}>write {write.ok && policy.allow_write ? "allowed" : "denied"}</span>
+            <span className="text-muted"> ({policy.allow_write ? write.why : "writes are off"})</span>
+          </span>
+        )}
+      </div>
+    </div>
   );
 }
 

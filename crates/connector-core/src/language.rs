@@ -99,6 +99,105 @@ fn mongo_op(t: &str) -> Option<String> {
     }
 }
 
+/// Collections a MongoDB command reads and writes (`db.coll` when `use db` or
+/// `getSiblingDB("db")` names the database, else `coll`). `$lookup`,
+/// `$graphLookup` and `$unionWith` read their collections; `$out` and
+/// `$merge` write theirs. A command whose collection can't be found is opaque.
+pub fn mongo_table_refs(text: &str) -> crate::tables::TableRefs {
+    use crate::tables::TableRefs;
+    let mut out = TableRefs::default();
+    let mut db: Option<String> = None;
+    let mut body = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(name) = l.strip_prefix("use ") {
+            db = Some(name.trim().trim_end_matches(';').trim_matches(|c| c == '"' || c == '\'').to_string());
+            out.changes_default = false;
+        } else {
+            body.push(line);
+        }
+    }
+    let body = body.join("\n");
+    let t = body.trim();
+    let lower = t.to_ascii_lowercase();
+    let quoted = |s: &str| -> Option<String> {
+        let s = s.trim_start();
+        let q = s.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let rest = &s[1..];
+        Some(rest[..rest.find(q)?].to_string())
+    };
+    // `db.getSiblingDB("x")` picks the database.
+    if let Some(i) = lower.find("getsiblingdb(") {
+        if let Some(n) = quoted(&t[i + "getsiblingdb(".len()..]) {
+            db = Some(n);
+        }
+    }
+    let name = |coll: String| match &db {
+        Some(d) => vec![d.clone(), coll],
+        None => vec![coll],
+    };
+    // The main collection.
+    let main = if t.starts_with('{') {
+        // `{"find": "orders", …}`: the first key's string value.
+        t.find(':').and_then(|i| quoted(&t[i + 1..]))
+    } else if let Some(i) = lower.find("getcollection(") {
+        quoted(&t[i + "getcollection(".len()..])
+    } else {
+        // db[.getSiblingDB(..)].coll.method(
+        let mut rest = lower.strip_prefix("db").map(|_| &t[2..]);
+        let mut found = None;
+        while let Some(r) = rest {
+            let Some(r) = r.trim_start().strip_prefix('.') else { break };
+            let end = r.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')).unwrap_or(r.len());
+            let (n, after) = (&r[..end], r[end..].trim_start());
+            if after.starts_with('(') {
+                if n.eq_ignore_ascii_case("getSiblingDB") {
+                    rest = after.find(')').map(|j| &after[j + 1..]);
+                    continue;
+                }
+                break;
+            }
+            found = Some(n.to_string());
+            rest = Some(after);
+        }
+        found
+    };
+    let Some(main) = main.filter(|m| !m.is_empty()) else {
+        out.opaque.push(leading_keyword(text));
+        return out;
+    };
+    let writes = matches!(mongo_kind(text), StatementKind::Dml | StatementKind::Ddl | StatementKind::Unknown);
+    let pipeline_writes = lower.contains("$out") || lower.contains("$merge");
+    if writes && !(pipeline_writes && lower.contains("aggregate")) {
+        out.writes.push(name(main.clone()));
+    } else {
+        out.reads.push(name(main.clone()));
+    }
+    // Other collections named in the pipeline: after `from:`, `coll:`,
+    // `$unionWith:` (reads) and `$out:` / `into:` (writes).
+    let mut scan = |keys: &[&str], write: bool| {
+        for key in keys {
+            let mut from = 0;
+            while let Some(i) = lower[from..].find(key) {
+                let at = from + i + key.len();
+                from = at;
+                let after = t[at..].trim_start().trim_start_matches(['"', '\'']).trim_start();
+                let Some(after) = after.strip_prefix(':') else { continue };
+                if let Some(c) = quoted(after) {
+                    let n = name(c);
+                    let list = if write { &mut out.writes } else { &mut out.reads };
+                    if !list.contains(&n) {
+                        list.push(n);
+                    }
+                }
+            }
+        }
+    };
+    scan(&["from", "coll", "$unionwith"], false);
+    scan(&["$out", "into"], true);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +240,21 @@ mod tests {
         assert_eq!(k("MATCH (p:Person {name: 'A'}) SET p.age = 3", L::Cypher), S::Dml);
         assert_eq!(k("CREATE INDEX FOR (p:Person) ON (p.name)", L::Cypher), S::Ddl);
         assert_eq!(k("CALL db.labels()", L::Cypher), S::Unknown);
+    }
+
+    #[test]
+    fn mongo_collections() {
+        let n = |v: &[Vec<String>]| v.iter().map(|t| t.join(".")).collect::<Vec<_>>();
+        let r = mongo_table_refs("db.orders.find({status: 'A'})");
+        assert_eq!((n(&r.reads), n(&r.writes)), (vec!["orders".to_string()], vec![]));
+        let r = mongo_table_refs("use shop\ndb.orders.aggregate([{$lookup: {from: 'customers', localField: 'c', foreignField: '_id', as: 'c'}}, {$out: 'copy'}])");
+        assert_eq!(n(&r.reads), ["shop.orders", "shop.customers"]);
+        assert_eq!(n(&r.writes), ["shop.copy"]);
+        let r = mongo_table_refs(r#"{"insert": "logs", "documents": [{}]}"#);
+        assert_eq!(n(&r.writes), ["logs"]);
+        let r = mongo_table_refs("db.getSiblingDB(\"hr\").getCollection(\"pay\").deleteMany({})");
+        assert_eq!(n(&r.writes), ["hr.pay"]);
+        assert!(!mongo_table_refs("db.runCommand({ping: 1})").opaque.is_empty() || !mongo_table_refs("db.runCommand({ping: 1})").reads.is_empty());
+        assert!(!mongo_table_refs("what").opaque.is_empty());
     }
 }

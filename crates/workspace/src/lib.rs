@@ -122,6 +122,16 @@ pub struct AiPolicy {
     /// Notes the AI adds or updates are saved directly instead of waiting
     /// for review in Knowledge.
     pub auto_approve_notes: bool,
+    /// Tables the AI may read: LIKE patterns (`%`, `_`; case-insensitive)
+    /// matched against `catalog.schema.table`, `schema.table` and `table`.
+    /// Empty = every table.
+    pub read_allow: Vec<String>,
+    /// Tables the AI may never read (wins over `read_allow`).
+    pub read_deny: Vec<String>,
+    /// Tables the AI may write (with writes allowed). Empty = every table.
+    pub write_allow: Vec<String>,
+    /// Tables the AI may never write.
+    pub write_deny: Vec<String>,
 }
 
 impl Default for AiPolicy {
@@ -140,6 +150,10 @@ impl Default for AiPolicy {
             index_batch: 25,
             mcp_enabled: false,
             auto_approve_notes: false,
+            read_allow: vec![],
+            read_deny: vec![],
+            write_allow: vec![],
+            write_deny: vec![],
         }
     }
 }

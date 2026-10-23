@@ -1,6 +1,7 @@
 //! DataBrain AI mode: LLM providers, database knowledge, tools with a policy
 //! engine, and the agent loop.
 
+pub mod access;
 pub mod agent;
 pub mod jobs;
 pub mod kiro;

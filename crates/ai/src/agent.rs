@@ -207,6 +207,27 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
         },
         kind.dialect_name()
     );
+    // Table access rules: say them up front so the model doesn't try denied tables.
+    let pol = &profile.ai_policy;
+    if crate::access::has_rules(pol) {
+        let l = |v: &[String]| v.iter().map(|p| p.trim()).filter(|p| !p.is_empty()).map(|p| format!("'{}'", p.trim_matches('\''))).collect::<Vec<_>>().join(", ");
+        s.push_str("\nTable access on this connection (enforced; other tables are refused): ");
+        let mut parts = Vec::new();
+        if !l(&pol.read_allow).is_empty() {
+            parts.push(format!("read only tables matching {}", l(&pol.read_allow)));
+        }
+        if !l(&pol.read_deny).is_empty() {
+            parts.push(format!("never read {}", l(&pol.read_deny)));
+        }
+        if !l(&pol.write_allow).is_empty() {
+            parts.push(format!("write only tables matching {}", l(&pol.write_allow)));
+        }
+        if !l(&pol.write_deny).is_empty() {
+            parts.push(format!("never write {}", l(&pol.write_deny)));
+        }
+        s.push_str(&parts.join("; "));
+        s.push_str(". Patterns are SQL LIKE, matched against catalog.schema.table, schema.table and table. Use fully-qualified table names, don't change the default schema (USE / SET search_path), and don't call procedures. If the user asks for a table outside these rules, say it isn't allowed for the assistant.\n");
+    }
     s.push_str(match mode {
         Mode::Chat => "",
         Mode::Generate => "\nTask: write SQL for the user's request and place it in the editor with write_editor (mode replace_selection when a selection exists, otherwise replace_all). Keep the chat answer to one or two sentences.\n",

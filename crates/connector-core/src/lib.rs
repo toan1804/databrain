@@ -9,6 +9,7 @@ pub mod language;
 pub mod external;
 pub mod sql;
 pub mod stream;
+pub mod tables;
 pub mod traits;
 pub mod types;
 pub mod value;
