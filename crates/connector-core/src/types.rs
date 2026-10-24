@@ -131,6 +131,47 @@ pub struct ConnectionConfig {
 }
 
 impl ConnectionConfig {
+    /// The settings with stray whitespace removed from what is never meant
+    /// to have it: host, database, file path, user names, option values,
+    /// the SSH host and user (pasted values often end with a space or
+    /// newline). Passwords are secrets and not part of the config.
+    pub fn normalized(&self) -> ConnectionConfig {
+        use databrain_auth::AuthMethod as A;
+        fn trim(s: &mut String) {
+            let t = s.trim();
+            if t.len() != s.len() {
+                *s = t.to_string();
+            }
+        }
+        fn trim_opt(s: &mut Option<String>) {
+            if let Some(v) = s {
+                trim(v);
+            }
+        }
+        let mut c = self.clone();
+        trim_opt(&mut c.host);
+        trim_opt(&mut c.database);
+        trim_opt(&mut c.file_path);
+        match &mut c.auth {
+            A::Password { user } | A::KeyPair { user } | A::ExternalBrowser { user } => trim(user),
+            A::ApiToken { user } => trim_opt(user),
+            A::OauthBrowser(p) | A::DeviceCode(p) | A::ClientCredentials(p) => {
+                trim_opt(&mut p.user);
+                trim_opt(&mut p.client_id);
+                trim_opt(&mut p.tenant);
+            }
+            _ => {}
+        }
+        for v in c.options.values_mut() {
+            trim(v);
+        }
+        if let Some(s) = c.ssh.as_mut() {
+            trim(&mut s.host);
+            trim(&mut s.user);
+        }
+        c
+    }
+
     pub fn host_or_default(&self) -> &str {
         self.host
             .as_deref()
@@ -570,5 +611,24 @@ mod search_tests {
         assert_eq!(got, vec!["a.orders", "b.orders", "a.orders_2024"]);
         let s = SchemaInfo::in_catalog("main", "sales", true);
         assert_eq!((s.name.as_str(), s.catalog.as_deref()), ("main.sales", Some("main")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalized_trims_pasted_settings() {
+        let mut c = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: " admin\n".into() });
+        c.host = Some(" db.example.com ".into());
+        c.database = Some("sales\t".into());
+        c.options.insert("schema".into(), " public ".into());
+        c.ssh = Some(SshConfig { host: "bastion ".into(), port: 22, user: " ec2-user".into(), auth: SshAuth::Agent, host_key_fingerprint: None });
+        let n = c.normalized();
+        assert_eq!((n.host.as_deref(), n.database.as_deref(), n.opt("schema")), (Some("db.example.com"), Some("sales"), Some("public")));
+        assert_eq!(n.auth, AuthMethod::Password { user: "admin".into() });
+        let s = n.ssh.unwrap();
+        assert_eq!((s.host.as_str(), s.user.as_str()), ("bastion", "ec2-user"));
     }
 }

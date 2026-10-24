@@ -690,6 +690,7 @@ impl Workspace {
 
     /// Insert or update. Empty `id` creates a new profile. Returns the saved profile.
     pub fn save_connection(&self, mut p: ConnectionProfile) -> Result<ConnectionProfile> {
+        p.config = p.config.normalized();
         if p.name.trim().is_empty() {
             return Err(Error::Invalid("connection name is required".into()));
         }

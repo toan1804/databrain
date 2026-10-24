@@ -434,12 +434,13 @@ impl QueryEngine {
             return Ok(c.clone());
         }
         let connector = self.registry.get(profile.config.kind)?;
+        let config = profile.config.normalized();
         let src = credential_source(
-            &profile.config.auth,
+            &config.auth,
             &profile.id,
             self.secrets.clone(),
             self.interaction(),
-            connector.auth_context(&profile.config),
+            connector.auth_context(&config),
         )?;
         self.creds.lock().insert(profile.id.clone(), src.clone());
         Ok(src)
@@ -632,6 +633,7 @@ impl QueryEngine {
         connection_id: Option<&str>,
         ssh_secret: Option<String>,
     ) -> Result<TestResult> {
+        let cfg = &cfg.normalized();
         let connector = self.registry.get(cfg.kind)?;
         let creds: Arc<dyn CredentialSource> = match (secret, connection_id) {
             (Some(s), _) => Arc::new(InlineCredentialSource::new(cfg.auth.clone(), Some(SecretString::from(s)))),
@@ -677,7 +679,8 @@ impl QueryEngine {
         if let Some(s) = self.sessions.lock().get(&key) {
             return Ok(s.session.clone());
         }
-        let profile = self.workspace.get_connection(connection_id)?;
+        let mut profile = self.workspace.get_connection(connection_id)?;
+        profile.config = profile.config.normalized();
         let connector = self.registry.get(profile.config.kind)?;
         let creds = self.credentials(&profile)?;
         self.preflight(&profile.config).await?;

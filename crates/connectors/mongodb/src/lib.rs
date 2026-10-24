@@ -79,7 +79,16 @@ impl Connector for MongoConnector {
                 u
             }
         };
-        let mut o = ClientOptions::parse(&uri).await.map_err(|e| ConnectorError::config(format!("Invalid connection string: {e}")))?;
+        let mut o = ClientOptions::parse(&uri).await.map_err(|e| {
+            // user:password@ in the string: reserved characters must be percent-encoded there.
+            let has_userinfo = uri.split_once("://").is_some_and(|(_, r)| r.contains('@'));
+            let hint = if has_userinfo {
+                " If the password contains @ : / ? # [ ] or %, percent-encode it in the connection string (@ is %40), or leave the user and password out of the string and enter them in the fields below."
+            } else {
+                ""
+            };
+            ConnectorError::config(format!("Invalid connection string: {e}.{hint}"))
+        })?;
         o.app_name = Some("DataBrain".into());
         o.connect_timeout.get_or_insert(Duration::from_secs(15));
         o.server_selection_timeout.get_or_insert(Duration::from_secs(15));

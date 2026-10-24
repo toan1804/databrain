@@ -153,7 +153,19 @@ impl Connector for MssqlConnector {
         });
         let use_browser = cfg.opt("instance").is_some() && cfg.port.is_none();
         let all_dbs = cfg.database.as_deref().is_none_or(|d| d.trim().is_empty());
-        let conn = open(&c, use_browser).await?;
+        let conn = if cfg.ssl_mode == SslMode::Prefer {
+            // tiberius panics when the server can't encrypt; Prefer then
+            // means a plain connection (as encrypt=false in other drivers).
+            match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(open(&c, use_browser))).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    c.encryption(EncryptionLevel::NotSupported);
+                    open(&c, use_browser).await?
+                }
+            }
+        } else {
+            open(&c, use_browser).await?
+        };
         Ok(Box::new(MssqlSession { config: c, use_browser, conn: Arc::new(Mutex::new(Some(conn))), state: Default::default(), user_rowcount: Default::default(), all_dbs }))
     }
 }
