@@ -361,6 +361,8 @@ export interface ParamSpan {
   name: string;
   from: number;
   to: number;
+  /** Oracle `&name` / `&&name`: replaced by the value as typed. */
+  textual?: boolean;
 }
 
 export interface RunRequest {

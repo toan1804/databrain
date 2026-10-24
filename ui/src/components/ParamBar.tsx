@@ -14,6 +14,7 @@ import { useStore } from "../store";
  */
 export function ParamBar({ tabId, kind }: { tabId: string; kind: ConnectorKind | undefined }) {
   const names = useStore((s) => s.paramNames[tabId]);
+  const textual = useStore((s) => s.paramTextual[tabId]);
   const values = useStore((s) => s.params[tabId]);
   const focus = useStore((s) => (s.paramFocus?.tabId === tabId ? s.paramFocus : null));
   const setParam = useStore((s) => s.setParam);
@@ -57,11 +58,17 @@ export function ParamBar({ tabId, kind }: { tabId: string; kind: ConnectorKind |
           const empty = !v.value.trim();
           const shown = preview[n];
           const id = `param-${tabId}-${n}`;
-          const tip = empty ? `:${n} needs a value` : `:${n} → ${shown ?? v.value}${v.raw ? " (SQL expression)" : ""}`;
+          const sigil = textual?.includes(n) ? "&" : ":";
+          const tip = empty
+            ? `${sigil}${n} needs a value`
+            : sigil === "&"
+              ? `&${n} → ${v.value} (replaced as typed, like SQL*Plus)`
+              : `:${n} → ${shown ?? v.value}${v.raw ? " (SQL expression)" : ""}`;
           return (
             <div key={n} className="group flex h-6 items-center gap-1" title={tip}>
               <label htmlFor={id} className="font-mono text-[12px] text-accent">
-                :{n}
+                {textual?.includes(n) ? "&" : ":"}
+                {n}
               </label>
               <div className="relative">
                 <input

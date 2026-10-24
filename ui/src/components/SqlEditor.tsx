@@ -23,7 +23,7 @@ import { canFetchMetadata, sqlAssist, sqlLanguage } from "./sqlAssist";
 import { queryHints } from "./queryHintsExt";
 import { SqlContextMenu, formatKey } from "./SqlContextMenu";
 import { openLineage } from "./LineageTab";
-import { paramField, paramNames, setParamSpans } from "./paramsExt";
+import { paramField, paramNames, setParamSpans, textualNames } from "./paramsExt";
 import { api, isTauri } from "../lib/api";
 import { sqlFolding } from "./sqlFold";
 
@@ -207,14 +207,14 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
     const sql = tab?.sql ?? "";
     const kind = conn?.config.kind ?? "postgres";
     const t = setTimeout(() => {
-      const found = sql.includes(":") ? api.sqlParameters(kind, sql) : Promise.resolve([]);
+      const found = sql.includes(":") || sql.includes("&") ? api.sqlParameters(kind, sql) : Promise.resolve([]);
       found
         .then((spans) => {
           const v = viewRef.current;
           // Typed meanwhile: the next run of this effect will catch up.
           if (!v || v.state.doc.toString() !== sql) return;
           v.dispatch({ effects: setParamSpans.of(spans) });
-          useStore.getState().setParamNames(tabId, paramNames(spans));
+          useStore.getState().setParamNames(tabId, paramNames(spans), textualNames(spans));
         })
         .catch(() => {});
     }, 200);

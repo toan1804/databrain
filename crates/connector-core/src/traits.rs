@@ -147,6 +147,8 @@ pub struct SqlSyntax {
     pub block_on_alter: bool,
     /// `:new` / `:old` are trigger rows, not parameters (Oracle).
     pub trigger_row_binds: bool,
+    /// SQL*Plus substitution variables `&name` / `&&name` (Oracle).
+    pub ampersand_vars: bool,
     /// `:name` parameters (DataBrain's own); off where `:` is the language's
     /// syntax (Cypher `(:Label)`, MongoDB `{a: 1}`).
     pub colon_params: bool,
@@ -351,6 +353,7 @@ pub const STANDARD_SYNTAX: SqlSyntax = SqlSyntax {
     block_objects: &[],
     block_on_alter: false,
     trigger_row_binds: false,
+    ampersand_vars: false,
     colon_params: true,
 };
 
@@ -547,6 +550,7 @@ pub const ORACLE: SourceTraits = SourceTraits {
         block_starts: &["DECLARE", "BEGIN"],
         block_objects: &["PROCEDURE", "FUNCTION", "PACKAGE", "TRIGGER", "TYPE"],
         trigger_row_binds: true,
+        ampersand_vars: true,
         ..STANDARD_SYNTAX
     },
     load: Some(LoadTraits {

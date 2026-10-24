@@ -48,6 +48,7 @@
     "row_limit": "limit",
     "ssl_setting": false,
     "syntax": {
+      "ampersand_vars": false,
       "backslash_escapes": true,
       "backslash_in_double_quotes": true,
       "backtick": true,
@@ -120,6 +121,7 @@
     "row_limit": "limit",
     "ssl_setting": false,
     "syntax": {
+      "ampersand_vars": false,
       "backslash_escapes": true,
       "backslash_in_double_quotes": true,
       "backtick": true,
@@ -195,6 +197,7 @@
     "row_limit": "limit",
     "ssl_setting": false,
     "syntax": {
+      "ampersand_vars": false,
       "backslash_escapes": false,
       "backslash_in_double_quotes": false,
       "backtick": false,
@@ -235,6 +238,7 @@
     "row_limit": "limit",
     "ssl_setting": false,
     "syntax": {
+      "ampersand_vars": false,
       "backslash_escapes": false,
       "backslash_in_double_quotes": false,
       "backtick": false,
@@ -310,6 +314,7 @@
     "row_limit": "top",
     "ssl_setting": false,
     "syntax": {
+      "ampersand_vars": false,
       "backslash_escapes": false,
       "backslash_in_double_quotes": false,
       "backtick": false,
@@ -391,6 +396,7 @@
     "row_limit": "limit",
     "ssl_setting": true,
     "syntax": {
+      "ampersand_vars": false,
       "backslash_escapes": true,
       "backslash_in_double_quotes": true,
       "backtick": true,
@@ -436,6 +442,7 @@
     "row_limit": "limit",
     "ssl_setting": false,
     "syntax": {
+      "ampersand_vars": false,
       "backslash_escapes": false,
       "backslash_in_double_quotes": false,
       "backtick": true,
@@ -506,6 +513,7 @@
     "row_limit": "fetch_first",
     "ssl_setting": false,
     "syntax": {
+      "ampersand_vars": true,
       "backslash_escapes": false,
       "backslash_in_double_quotes": false,
       "backtick": false,
@@ -590,6 +598,7 @@
     "row_limit": "limit",
     "ssl_setting": true,
     "syntax": {
+      "ampersand_vars": false,
       "backslash_escapes": false,
       "backslash_in_double_quotes": false,
       "backtick": false,
@@ -663,6 +672,7 @@
     "row_limit": "limit",
     "ssl_setting": false,
     "syntax": {
+      "ampersand_vars": false,
       "backslash_escapes": true,
       "backslash_in_double_quotes": false,
       "backtick": false,
@@ -738,6 +748,7 @@
     "row_limit": "limit",
     "ssl_setting": false,
     "syntax": {
+      "ampersand_vars": false,
       "backslash_escapes": false,
       "backslash_in_double_quotes": false,
       "backtick": true,

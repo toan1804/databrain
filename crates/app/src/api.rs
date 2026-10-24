@@ -960,13 +960,16 @@ pub struct ParamSpanView {
     pub name: String,
     pub from: usize,
     pub to: usize,
+    /// Oracle `&name`: replaced by the value as typed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub textual: bool,
 }
 
 /// `:name` parameters of an editor text (not in strings/comments, not `::` casts).
 pub fn sql_parameters(kind: ConnectorKind, text: &str) -> Vec<ParamSpanView> {
     databrain_connector_core::sql::find_parameters(text, kind)
         .into_iter()
-        .map(|p| ParamSpanView { from: byte_to_utf16(text, p.start), to: byte_to_utf16(text, p.end), name: p.name })
+        .map(|p| ParamSpanView { from: byte_to_utf16(text, p.start), to: byte_to_utf16(text, p.end), name: p.name, textual: p.textual })
         .collect()
 }
 

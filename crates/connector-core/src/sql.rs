@@ -742,22 +742,67 @@ mod tests {
 
 // ------------------------------------------------------------------ parameters
 
-/// A `:name` parameter in a script (byte offsets of `:name`).
+/// A parameter in a script (byte offsets of `:name` / `&name`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ParamSpan {
     pub name: String,
     pub start: usize,
     pub end: usize,
+    /// Oracle substitution variable (`&name`, `&&name`, SQL*Plus style): the
+    /// value replaces the text as typed (also inside `'…'`), not as a literal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub textual: bool,
+}
+
+/// `&name` / `&&name` (an optional `.` after the name ends it, as in
+/// SQL*Plus) in `b[from..to]`.
+fn ampersand_vars(text: &str, from: usize, to: usize, out: &mut Vec<ParamSpan>) {
+    let mut i = from;
+    while i < to {
+        match ampersand_at(text, i, to) {
+            Some(p) => {
+                i = p.end;
+                out.push(p);
+            }
+            None => i += 1,
+        }
+    }
+}
+
+/// The substitution variable starting at `i`, if any.
+fn ampersand_at(text: &str, i: usize, to: usize) -> Option<ParamSpan> {
+    let b = text.as_bytes();
+    if b.get(i) != Some(&b'&') {
+        return None;
+    }
+    let mut j = i + 1;
+    if j < to && b[j] == b'&' {
+        j += 1;
+    }
+    if !(j < to && (b[j].is_ascii_alphabetic() || b[j] == b'_')) {
+        return None;
+    }
+    let name_start = j;
+    while j < to && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] == b'$' || b[j] == b'#') {
+        j += 1;
+    }
+    let name = text[name_start..j].to_string();
+    if j < to && b[j] == b'.' {
+        j += 1;
+    }
+    Some(ParamSpan { name, start: i, end: j, textual: true })
 }
 
 /// `:name` parameters outside strings, quoted identifiers and comments.
 /// Not parameters: `::type` casts, `col:field` / `$1:field` paths (a name,
 /// digit, quote or bracket right before the colon), `:=` assignments, and
-/// Oracle trigger `:new` / `:old`.
+/// Oracle trigger `:new` / `:old`. Oracle also has SQL*Plus substitution
+/// variables `&name` / `&&name`, in code and inside `'…'`.
 pub fn find_parameters(text: &str, kind: ConnectorKind) -> Vec<ParamSpan> {
     if !kind.traits().syntax.colon_params {
         return vec![];
     }
+    let amp = kind.traits().syntax.ampersand_vars;
     let b = text.as_bytes();
     let n = b.len();
     let lx = lex(kind);
@@ -767,6 +812,13 @@ pub fn find_parameters(text: &str, kind: ConnectorKind) -> Vec<ParamSpan> {
     while i < n {
         let c = b[i];
         match c {
+            b'&' if amp => match ampersand_at(text, i, n) {
+                Some(p) => {
+                    i = p.end;
+                    out.push(p);
+                }
+                None => i += 1,
+            },
             b'-' if i + 1 < n && b[i + 1] == b'-' => i = skip_line(b, i),
             b'#' if lx.hash_comment => i = skip_line(b, i),
             b'/' if lx.slash_comment && i + 1 < n && b[i + 1] == b'/' => i = skip_line(b, i),
@@ -777,7 +829,13 @@ pub fn find_parameters(text: &str, kind: ConnectorKind) -> Vec<ParamSpan> {
                 let q = &text[i..i + 3];
                 i = text[i + 3..].find(q).map_or(n, |p| i + 3 + p + 3);
             }
-            b'\'' => i = skip_quoted(b, i, b'\'', lx.backslash_escapes),
+            b'\'' => {
+                let end = skip_quoted(b, i, b'\'', lx.backslash_escapes);
+                if amp {
+                    ampersand_vars(text, i + 1, end.saturating_sub(1).max(i + 1), &mut out);
+                }
+                i = end;
+            }
             b'"' => i = skip_quoted(b, i, b'"', kind.traits().syntax.backslash_in_double_quotes),
             b'`' if lx.backtick => i = skip_quoted(b, i, b'`', false),
             b'[' if lx.brackets => i = text[i..].find(']').map_or(n, |p| i + p + 1),
@@ -806,7 +864,7 @@ pub fn find_parameters(text: &str, kind: ConnectorKind) -> Vec<ParamSpan> {
                 let name = &text[i + 1..j];
                 let trigger_row = kind.traits().syntax.trigger_row_binds && (name.eq_ignore_ascii_case("new") || name.eq_ignore_ascii_case("old"));
                 if !trigger_row {
-                    out.push(ParamSpan { name: name.to_string(), start: i, end: j });
+                    out.push(ParamSpan { name: name.to_string(), start: i, end: j, textual: false });
                 }
                 i = j;
             }
@@ -891,7 +949,12 @@ pub fn substitute_parameters(sql: &str, kind: ConnectorKind, values: &std::colle
     let mut out = String::with_capacity(sql.len());
     let mut at = 0;
     for s in &spans {
-        match values.get(&s.name).and_then(|v| render_param(v, kind)) {
+        let lit = values.get(&s.name).and_then(|v| match s.textual {
+            // SQL*Plus: the text as typed.
+            true => Some(v.value.clone()).filter(|t| !t.trim().is_empty()),
+            false => render_param(v, kind),
+        });
+        match lit {
             Some(lit) => {
                 out.push_str(&sql[at..s.start]);
                 out.push_str(&lit);
@@ -930,6 +993,25 @@ mod param_tests {
         assert_eq!(names("create trigger t before insert on x for each row begin :new.id := :seq; end;", K::Oracle), vec!["seq"]);
         let p = &find_parameters("a = :name", K::Sqlite)[0];
         assert_eq!((p.start, p.end), (4, 9));
+    }
+
+    #[test]
+    fn oracle_substitution_variables() {
+        let spans = find_parameters("select * from emp where deptno = &dept and ename = '&&who' and x = 'Tom & Jerry' -- &c\n and t = '&tbl._x'", K::Oracle);
+        let v: Vec<(&str, bool)> = spans.iter().map(|p| (p.name.as_str(), p.textual)).collect();
+        assert_eq!(v, vec![("dept", true), ("who", true), ("tbl", true)]);
+        assert_eq!(names("select a & b from t", K::Postgres), Vec::<String>::new(), "only Oracle");
+        let mut vals = HashMap::new();
+        vals.insert("dept".to_string(), ParamValue { value: "10".into(), raw: false });
+        vals.insert("who".to_string(), ParamValue { value: "SMITH".into(), raw: false });
+        vals.insert("tbl".to_string(), ParamValue { value: "emp".into(), raw: false });
+        let sql = "select * from emp where deptno = &dept and ename = '&&who' and t = '&tbl._x' and n = :n";
+        vals.insert("n".to_string(), ParamValue { value: "O'Hara".into(), raw: false });
+        assert_eq!(
+            substitute_parameters(sql, K::Oracle, &vals).unwrap(),
+            "select * from emp where deptno = 10 and ename = 'SMITH' and t = 'emp_x' and n = 'O''Hara'",
+            "as typed, inside quotes too; `.` ends the name"
+        );
     }
 
     #[test]

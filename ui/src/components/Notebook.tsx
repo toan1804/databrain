@@ -64,7 +64,7 @@ import { editorContextMenu, errorField, highlight, langExtension, setError } fro
 import { SqlContextMenu, formatKey } from "./SqlContextMenu";
 import { ParamBar } from "./ParamBar";
 import { openLineage } from "./LineageTab";
-import { paramField, paramNames, setParamSpans } from "./paramsExt";
+import { paramField, paramNames, setParamSpans, textualNames } from "./paramsExt";
 import { canFetchMetadata, sqlAssist } from "./sqlAssist";
 import { sqlFolding } from "./sqlFold";
 import { queryHints } from "./queryHintsExt";
@@ -315,14 +315,14 @@ export function NotebookView({
 
   // Parameters of every SQL cell, for the bar at the top (debounced).
   // Each cell is scanned on its own (an unclosed quote in one cell must not hide the next one's).
-  const sqlSources = JSON.stringify(nb?.cells.filter((c) => c.kind === "sql" && c.source.includes(":")).map((c) => c.source) ?? []);
+  const sqlSources = JSON.stringify(nb?.cells.filter((c) => c.kind === "sql" && (c.source.includes(":") || c.source.includes("&"))).map((c) => c.source) ?? []);
   const nbKind = conn?.config.kind;
   useEffect(() => {
     if (!isTauri()) return;
     const t = setTimeout(() => {
       const sources: string[] = JSON.parse(sqlSources);
       Promise.all(sources.map((src) => api.sqlParameters(nbKind ?? "postgres", src)))
-        .then((all) => useStore.getState().setParamNames(tabId, paramNames(all.flat())))
+        .then((all) => useStore.getState().setParamNames(tabId, paramNames(all.flat()), textualNames(all.flat())))
         .catch(() => {});
     }, 250);
     return () => clearTimeout(t);
@@ -1064,7 +1064,7 @@ export function CellEditor({
     if (!isTauri()) return;
     const kind = conn?.config.kind ?? "postgres";
     const t = setTimeout(() => {
-      const found = source.includes(":") ? api.sqlParameters(kind, source) : Promise.resolve([]);
+      const found = source.includes(":") || source.includes("&") ? api.sqlParameters(kind, source) : Promise.resolve([]);
       found
         .then((spans) => {
           const v = view.current;

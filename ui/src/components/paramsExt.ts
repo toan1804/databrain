@@ -30,3 +30,9 @@ export const paramField = StateField.define<DecorationSet>({
 export function paramNames(spans: ParamSpan[]): string[] {
   return [...new Set(spans.map((s) => s.name))];
 }
+
+/** Names used only as Oracle `&name` substitution variables (shown with `&`). */
+export function textualNames(spans: ParamSpan[]): string[] {
+  const colon = new Set(spans.filter((s) => !s.textual).map((s) => s.name));
+  return [...new Set(spans.filter((s) => s.textual && !colon.has(s.name)).map((s) => s.name))];
+}
