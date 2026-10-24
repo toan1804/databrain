@@ -1044,6 +1044,19 @@ pub async fn find_in_result(
     blocking(move || Ok(rs.lock().find_with(&view, &query, columns.as_deref(), limit.clamp(1, 100_000), whole_word)?)).await
 }
 
+/// Count / distinct / sum / min / max / avg of the selected cells.
+pub async fn summarize_selection(
+    state: &AppState,
+    result_id: String,
+    view: ViewSpec,
+    columns: Vec<usize>,
+    offset: usize,
+    limit: usize,
+) -> Result<databrain_result_store::SelectionSummary> {
+    let rs = state.results().get(&result_id)?;
+    blocking(move || Ok(rs.lock().summarize(&view, &columns, offset, limit.min(MAX_COPY_ROWS))?)).await
+}
+
 pub async fn column_stats(
     state: &AppState,
     result_id: String,

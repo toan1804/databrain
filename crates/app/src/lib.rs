@@ -669,6 +669,18 @@ fn preview_parameters(
 }
 
 #[tauri::command]
+async fn summarize_selection(
+    state: State<'_, AppState>,
+    result_id: String,
+    view: ViewSpec,
+    columns: Vec<usize>,
+    offset: usize,
+    limit: usize,
+) -> R<databrain_result_store::SelectionSummary> {
+    api::summarize_selection(&state, result_id, view, columns, offset, limit).await
+}
+
+#[tauri::command]
 async fn statement_at_cursor(kind: ConnectorKind, text: String, cursor: usize) -> R<Option<Span>> {
     Ok(api::statement_at_cursor(kind, &text, cursor))
 }
@@ -1019,6 +1031,7 @@ pub fn run() {
             table_layout,
             statement_at_cursor,
             statement_spans,
+            summarize_selection,
             sql_parameters,
             sql_lineage,
             save_text_file,

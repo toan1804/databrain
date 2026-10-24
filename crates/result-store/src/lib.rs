@@ -72,6 +72,25 @@ pub fn contains_word(hay: &str, needle: &str) -> bool {
     false
 }
 
+/// Most distinct values counted for a selection summary.
+const MAX_DISTINCT: usize = 100_000;
+
+/// Count, distinct and (for numbers) sum / min / max / avg of selected cells.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SelectionSummary {
+    pub cells: usize,
+    pub non_null: usize,
+    pub distinct: usize,
+    /// More distinct values than counted.
+    pub distinct_capped: bool,
+    /// Cells holding a number (numeric columns only).
+    pub numbers: usize,
+    pub sum: Option<f64>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub avg: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CellMatch {
     /// Row position within the view.
@@ -237,6 +256,53 @@ impl ResultSet {
             Some(i) => i.len(),
             None => self.total_rows,
         })
+    }
+
+    /// Summary of a selection: rows `[offset, offset+limit)` of the view, in
+    /// `columns` (empty = all). Numbers (also exact decimals) are summed.
+    pub fn summarize(&mut self, spec: &ViewSpec, columns: &[usize], offset: usize, limit: usize) -> Result<SelectionSummary> {
+        let (batch, _) = self.view_slice(spec, offset, limit)?;
+        let cols: Vec<usize> = if columns.is_empty() { (0..batch.num_columns()).collect() } else { columns.iter().copied().filter(|&c| c < batch.num_columns()).collect() };
+        let opts = display::format_options();
+        let mut s = SelectionSummary::default();
+        let mut distinct = std::collections::HashSet::new();
+        let (mut sum, mut min, mut max) = (0f64, f64::INFINITY, f64::NEG_INFINITY);
+        for &c in &cols {
+            let a = batch.column(c);
+            let numeric = display::family(batch.schema().field(c)) == display::TypeFamily::Number;
+            let f = ArrayFormatter::try_new(a.as_ref(), &opts)?;
+            for r in 0..batch.num_rows() {
+                s.cells += 1;
+                if a.is_null(r) {
+                    continue;
+                }
+                s.non_null += 1;
+                let text = f.value(r).to_string();
+                if numeric {
+                    if let Ok(v) = text.parse::<f64>() {
+                        if v.is_finite() {
+                            s.numbers += 1;
+                            sum += v;
+                            min = min.min(v);
+                            max = max.max(v);
+                        }
+                    }
+                }
+                if distinct.len() < MAX_DISTINCT {
+                    distinct.insert(text);
+                } else {
+                    s.distinct_capped = true;
+                }
+            }
+        }
+        s.distinct = distinct.len();
+        if s.numbers > 0 {
+            s.sum = Some(sum);
+            s.min = Some(min);
+            s.max = Some(max);
+            s.avg = Some(sum / s.numbers as f64);
+        }
+        Ok(s)
     }
 
     /// Rows `[offset, offset+limit)` of the view as a batch plus original ids.
@@ -626,6 +692,16 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(rs.page(&bad, 0, 10), Err(Error::InvalidFilterValue(_))));
+    }
+
+    #[test]
+    fn selection_summary() {
+        let mut rs = sample();
+        let s = rs.summarize(&ViewSpec::default(), &[2, 3], 0, 100).unwrap();
+        assert!(s.cells > 0 && s.numbers > 0 && s.sum.is_some() && s.min <= s.max, "{s:?}");
+        let names = rs.summarize(&ViewSpec::default(), &[1], 0, 100).unwrap();
+        assert_eq!((names.numbers, names.sum), (0, None), "text is counted, not summed");
+        assert_eq!(names.cells, rs.info().total_rows);
     }
 
     #[test]

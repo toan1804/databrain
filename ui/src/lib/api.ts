@@ -64,6 +64,7 @@ import type {
   ObjectDetail,
   Page,
   ResultInfo,
+  SelectionSummary,
   RunRequest,
   RunResponse,
   SavedQuery,
@@ -202,6 +203,8 @@ export const api = {
     call<Page>("fetch_page", { resultId, view, offset, limit }),
   findInResult: (resultId: string, view: ViewSpec, query: string, limit: number, columns?: number[] | null, wholeWord = false) =>
     call<FindResult>("find_in_result", { resultId, view, query, limit, columns: columns ?? null, wholeWord }),
+  summarizeSelection: (resultId: string, view: ViewSpec, columns: number[], offset: number, limit: number) =>
+    call<SelectionSummary>("summarize_selection", { resultId, view, columns, offset, limit }),
   columnStats: (resultId: string, view: ViewSpec, column: number) =>
     call<ColumnStats>("column_stats", { resultId, view, column }),
   /** Run the result's query again without the row limit and write every row to `path`. */

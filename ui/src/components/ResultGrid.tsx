@@ -14,7 +14,7 @@ import {
   type Theme,
 } from "@glideapps/glide-data-grid";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { ArrowDown, ArrowUp, Ban, Copy, Filter, FilterX, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Ban, Copy, Filter, FilterX, Rows3, X } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { ColumnMeta, ExportFormat, ResultInfo, ViewSpec } from "../lib/types";
 import { pageRange, toggleSort, upsertFilter } from "../lib/util";
@@ -121,10 +121,14 @@ interface Props {
   findMatches: { row: number; col: number }[];
   findCurrent: number;
   dialect: string | undefined;
+  /** The selected rectangle changed (null: nothing selected). */
+  onSelectionRange?: (range: { cols: number[]; offset: number; limit: number } | null) => void;
+  /** "Transpose selected rows" from the cell menu. */
+  onTranspose?: (range: { cols: number[]; offset: number; limit: number }) => void;
 }
 
 export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
-  { info, view, onViewChange, onHeaderMenu, onViewRows, findMatches, findCurrent, dialect },
+  { info, view, onViewChange, onHeaderMenu, onViewRows, findMatches, findCurrent, dialect, onSelectionRange, onTranspose },
   ref,
 ) {
   const theme = useGridTheme();
@@ -280,6 +284,10 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
     }
     return null;
   }, [selection, rows]);
+
+  useEffect(() => {
+    onSelectionRange?.(selectedRange());
+  }, [selection, selectedRange]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const copy = useCallback(
     async (format: ExportFormat, header: boolean, range = selectedRange()) => {
@@ -441,6 +449,17 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
           <MenuItem icon={<Copy size={13} />} label="Copy as JSON" onClick={() => { setMenu(null); void copy("json", false); }} />
           <MenuItem icon={<Copy size={13} />} label="Copy as Markdown" onClick={() => { setMenu(null); void copy("markdown", true); }} />
           <MenuItem icon={<Copy size={13} />} label="Copy as SQL INSERT" onClick={() => { setMenu(null); void copy("sql_insert", false); }} />
+          {onTranspose && (
+            <MenuItem
+              icon={<Rows3 size={13} />}
+              label="Transpose selected rows"
+              onClick={() => {
+                setMenu(null);
+                const r = selectedRange();
+                if (r) onTranspose({ cols: r.cols, offset: r.offset, limit: r.limit });
+              }}
+            />
+          )}
           <MenuSeparator />
           <MenuItem icon={<Filter size={13} />} label="Filter: equals this value" onClick={() => { setMenu(null); filterBy(menu.cell, "equals"); }} />
           <MenuItem icon={<FilterX size={13} />} label="Filter: not this value" onClick={() => { setMenu(null); filterBy(menu.cell, "not_equals"); }} />

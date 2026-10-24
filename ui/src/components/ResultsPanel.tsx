@@ -47,6 +47,7 @@ import {
 import { useStore, type StatementRun, type TabRun } from "../store";
 import { optimizePrompt } from "../queryTips";
 import { ResultGrid, type GridHandle } from "./ResultGrid";
+import { SelectionSummaryBar, TransposeDialog, type GridRange } from "./SelectionTools";
 import { Modal, Popover } from "./ui";
 
 export interface ResultsPanelProps {
@@ -408,6 +409,8 @@ export function ResultView({
   /** Column the find bar is limited to (null = all columns). */
   const [findScope, setFindScope] = useState<number | null>(null);
   const [wholeWord, setWholeWord] = useState(false);
+  const [selRange, setSelRange] = useState<GridRange | null>(null);
+  const [transpose, setTranspose] = useState<GridRange | null>(null);
   const columnNames = useMemo(() => info.columns.map((c) => c.name), [info.columns]);
   const plan = useMemo(() => planFind(findQuery, columnNames, findScope), [findQuery, columnNames, findScope]);
   const [headerMenu, setHeaderMenu] = useState<{ col: number; x: number; y: number } | null>(null);
@@ -646,6 +649,8 @@ export function ResultView({
           findMatches={find.matches}
           findCurrent={findIdx}
           dialect={conn?.config.kind}
+          onSelectionRange={setSelRange}
+          onTranspose={setTranspose}
         />
         )}
       </div>
@@ -661,8 +666,11 @@ export function ResultView({
         )}
         <span>{info.columns.length} columns</span>
         {stmt.durationMs !== undefined && <span>{formatDuration(stmt.durationMs)}</span>}
-        <span className="ml-auto">{formatBytes(info.bytes)}</span>
+        <span className="ml-auto" />
+        {mode === "grid" && <SelectionSummaryBar info={info} view={view} range={selRange} />}
+        <span>{formatBytes(info.bytes)}</span>
       </div>
+      {transpose && <TransposeDialog info={info} view={view} range={transpose} onClose={() => setTranspose(null)} />}
 
       {headerMenu && (
         <ColumnMenu

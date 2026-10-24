@@ -556,6 +556,19 @@ export interface ChartData {
 
 export type ExportFormat = "csv" | "tsv" | "json" | "ndjson" | "markdown" | "sql_insert" | "parquet" | "xlsx";
 
+/** Count / distinct / sum… of the selected cells in a result grid. */
+export interface SelectionSummary {
+  cells: number;
+  non_null: number;
+  distinct: number;
+  distinct_capped: boolean;
+  numbers: number;
+  sum: number | null;
+  min: number | null;
+  max: number | null;
+  avg: number | null;
+}
+
 export interface ExportOptions {
   format: ExportFormat;
   header: boolean;
