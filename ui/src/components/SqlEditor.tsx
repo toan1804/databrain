@@ -26,6 +26,7 @@ import { openLineage } from "./LineageTab";
 import { paramField, paramNames, setParamSpans, textualNames } from "./paramsExt";
 import { api, isTauri } from "../lib/api";
 import { sqlFolding } from "./sqlFold";
+import { statementTarget } from "../lib/statementNav";
 
 /** Right-click: keep a selection that contains the click, else put the cursor there; then open the menu. */
 export function editorContextMenu(open: (at: { x: number; y: number }) => void) {
@@ -112,6 +113,18 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
       const cid = st.tabs.find((x) => x.id === tabId)?.connection_id;
       return st.connections.find((c) => c.id === cid)?.config.kind;
     };
+    // ⌘⌥↓ / ⌘⌥↑: cursor to the next / previous statement (as the splitter sees them).
+    const gotoStatement = (dir: 1 | -1) => (view: EditorView) => {
+      if (!isTauri()) return false;
+      const doc = view.state.doc.toString();
+      const cursor = view.state.selection.main.head;
+      void api.statementSpans(kindNow() ?? "postgres", doc).then((spans) => {
+        if (view.state.doc.toString() !== doc) return; // edited meanwhile
+        const to = statementTarget(spans, cursor, dir);
+        if (to !== null) view.dispatch({ selection: { anchor: to }, scrollIntoView: true });
+      });
+      return true;
+    };
     const initial = useStore.getState().tabs.find((x) => x.id === tabId)?.sql ?? "";
     const view = new EditorView({
       parent: host.current,
@@ -140,6 +153,8 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
           keymap.of([
             { key: "Mod-Enter", run: run("statement"), preventDefault: true },
             { key: "Shift-Mod-Enter", run: run("all"), preventDefault: true },
+            { key: "Mod-Alt-ArrowDown", run: gotoStatement(1), preventDefault: true },
+            { key: "Mod-Alt-ArrowUp", run: gotoStatement(-1), preventDefault: true },
             {
               key: "Mod-i",
               run: () => {

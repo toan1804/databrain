@@ -192,6 +192,7 @@ export const api = {
     call<Record<string, string | null>>("preview_parameters", { kind, values }),
   statementAtCursor: (kind: ConnectorKind, text: string, cursor: number) =>
     call<Span | null>("statement_at_cursor", { kind, text, cursor }),
+  statementSpans: (kind: ConnectorKind, text: string) => call<Span[]>("statement_spans", { kind, text }),
   runQuery: (req: RunRequest) => call<RunResponse>("run_query", { req }),
   cancelQuery: (jobId: string) => call<boolean>("cancel_query", { jobId }),
   closeTab: (tabId: string) => call<void>("close_tab", { tabId }),
@@ -199,8 +200,8 @@ export const api = {
   resultInfo: (resultId: string) => call<ResultInfo>("result_info", { resultId }),
   fetchPage: (resultId: string, view: ViewSpec, offset: number, limit: number) =>
     call<Page>("fetch_page", { resultId, view, offset, limit }),
-  findInResult: (resultId: string, view: ViewSpec, query: string, limit: number, columns?: number[] | null) =>
-    call<FindResult>("find_in_result", { resultId, view, query, limit, columns: columns ?? null }),
+  findInResult: (resultId: string, view: ViewSpec, query: string, limit: number, columns?: number[] | null, wholeWord = false) =>
+    call<FindResult>("find_in_result", { resultId, view, query, limit, columns: columns ?? null, wholeWord }),
   columnStats: (resultId: string, view: ViewSpec, column: number) =>
     call<ColumnStats>("column_stats", { resultId, view, column }),
   /** Run the result's query again without the row limit and write every row to `path`. */

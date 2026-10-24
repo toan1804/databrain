@@ -755,6 +755,14 @@ pub fn statement_at_cursor(kind: ConnectorKind, text: &str, cursor: usize) -> Op
     })
 }
 
+/// Every statement of `text` (UTF-16 offsets).
+pub fn statement_spans(kind: ConnectorKind, text: &str) -> Vec<Span> {
+    split_statements(text, kind)
+        .into_iter()
+        .map(|s| Span { start: byte_to_utf16(text, s.start), end: byte_to_utf16(text, s.end), sql: s.sql })
+        .collect()
+}
+
 // ------------------------------------------------------------ lineage
 
 /// The database's check of one statement (`EXPLAIN`, not run).
@@ -1030,9 +1038,10 @@ pub async fn find_in_result(
     query: String,
     columns: Option<Vec<usize>>,
     limit: usize,
+    whole_word: bool,
 ) -> Result<FindResult> {
     let rs = state.results().get(&result_id)?;
-    blocking(move || Ok(rs.lock().find_in(&view, &query, columns.as_deref(), limit.clamp(1, 100_000))?)).await
+    blocking(move || Ok(rs.lock().find_with(&view, &query, columns.as_deref(), limit.clamp(1, 100_000), whole_word)?)).await
 }
 
 pub async fn column_stats(

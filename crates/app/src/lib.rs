@@ -672,6 +672,11 @@ fn preview_parameters(
 async fn statement_at_cursor(kind: ConnectorKind, text: String, cursor: usize) -> R<Option<Span>> {
     Ok(api::statement_at_cursor(kind, &text, cursor))
 }
+/// Every statement of an editor text (next/previous statement keys).
+#[tauri::command]
+async fn statement_spans(kind: ConnectorKind, text: String) -> R<Vec<Span>> {
+    Ok(api::statement_spans(kind, &text))
+}
 
 #[tauri::command]
 async fn run_query(state: State<'_, AppState>, req: RunRequest) -> R<RunResponse> {
@@ -713,8 +718,9 @@ async fn find_in_result(
     query: String,
     columns: Option<Vec<usize>>,
     limit: usize,
+    whole_word: Option<bool>,
 ) -> R<FindResult> {
-    api::find_in_result(&state, result_id, view, query, columns, limit).await
+    api::find_in_result(&state, result_id, view, query, columns, limit, whole_word.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -1012,6 +1018,7 @@ pub fn run() {
             describe_object,
             table_layout,
             statement_at_cursor,
+            statement_spans,
             sql_parameters,
             sql_lineage,
             save_text_file,

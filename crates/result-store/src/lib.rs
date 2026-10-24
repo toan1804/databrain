@@ -49,6 +49,29 @@ pub struct Page {
     pub rows: Vec<Vec<Option<String>>>,
 }
 
+/// `needle` occurs in `hay` with no letter, digit or `_` right before or
+/// after it (both lower-cased).
+pub fn contains_word(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let mut from = 0;
+    while let Some(p) = hay[from..].find(needle) {
+        let at = from + p;
+        let before = hay[..at].chars().next_back();
+        let after = hay[at + needle.len()..].chars().next();
+        // A needle that itself starts/ends with punctuation needs no boundary there.
+        let starts = !needle.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let ends = !needle.chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if (starts || !word(before)) && (ends || !word(after)) {
+            return true;
+        }
+        from = at + needle.chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CellMatch {
     /// Row position within the view.
@@ -282,6 +305,12 @@ impl ResultSet {
     /// Find `query` (case-insensitive substring of the displayed value),
     /// optionally only in the given columns.
     pub fn find_in(&mut self, spec: &ViewSpec, query: &str, columns: Option<&[usize]>, limit: usize) -> Result<FindResult> {
+        self.find_with(spec, query, columns, limit, false)
+    }
+
+    /// [`ResultSet::find_in`]; `whole_word`: only where `query` is a whole
+    /// word of the value (`id` finds `id` and `a id`, not `paid`).
+    pub fn find_with(&mut self, spec: &ViewSpec, query: &str, columns: Option<&[usize]>, limit: usize, whole_word: bool) -> Result<FindResult> {
         let mut matches = Vec::new();
         if query.is_empty() || self.total_rows == 0 {
             return Ok(FindResult {
@@ -305,7 +334,13 @@ impl ResultSet {
         for c in 0..batch.num_columns() {
             if cols.binary_search(&c).is_ok() {
                 let text = self.display_cache.get(&batch, c)?;
-                masks.push(Some(text.ilike(&pattern, false)?));
+                let mut m = text.ilike(&pattern, false)?;
+                if whole_word {
+                    // The substring match narrowed down; keep whole-word hits.
+                    let needle = query.to_lowercase();
+                    m = (0..m.len()).map(|r| Some(m.is_valid(r) && m.value(r) && contains_word(&text.value(r).to_lowercase(), &needle))).collect();
+                }
+                masks.push(Some(m));
             } else {
                 masks.push(None);
             }
@@ -591,6 +626,22 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(rs.page(&bad, 0, 10), Err(Error::InvalidFilterValue(_))));
+    }
+
+    #[test]
+    fn whole_word_find() {
+        assert!(contains_word("a id", "id") && contains_word("id", "id") && contains_word("user-id", "id"));
+        assert!(!contains_word("paid", "id") && !contains_word("id_x", "id") && !contains_word("idx", "id"));
+        assert!(contains_word("x paid id", "id"), "a later occurrence counts");
+        assert!(contains_word("é id", "id") && !contains_word("éid", "id"));
+        assert!(contains_word("a.b", ".b"), "punctuation at the edge needs no boundary");
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec![Some("paid"), Some("ID 7"), None, Some("my id")]))]).unwrap();
+        let mut rs = ResultSet::new("w", schema);
+        rs.push(b);
+        let rows = |rs: &mut ResultSet, w: bool| -> Vec<u32> { rs.find_with(&ViewSpec::default(), "id", None, 10, w).unwrap().matches.iter().map(|m| m.row).collect() };
+        assert_eq!(rows(&mut rs, false), vec![0, 1, 3]);
+        assert_eq!(rows(&mut rs, true), vec![1, 3]);
     }
 
     #[test]

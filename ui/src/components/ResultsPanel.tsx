@@ -77,6 +77,9 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
           <span>
             <span className="kbd">⇧</span> <span className="kbd">⌘</span> <span className="kbd">↵</span> run all
           </span>
+          <span>
+            <span className="kbd">⌘</span> <span className="kbd">⌥</span> <span className="kbd">↑</span>/<span className="kbd">↓</span> previous / next statement
+          </span>
         </div>
       </div>
     );
@@ -404,6 +407,7 @@ export function ResultView({
   const [findIdx, setFindIdx] = useState(0);
   /** Column the find bar is limited to (null = all columns). */
   const [findScope, setFindScope] = useState<number | null>(null);
+  const [wholeWord, setWholeWord] = useState(false);
   const columnNames = useMemo(() => info.columns.map((c) => c.name), [info.columns]);
   const plan = useMemo(() => planFind(findQuery, columnNames, findScope), [findQuery, columnNames, findScope]);
   const [headerMenu, setHeaderMenu] = useState<{ col: number; x: number; y: number } | null>(null);
@@ -426,7 +430,7 @@ export function ResultView({
     }
     const t = setTimeout(async () => {
       try {
-        const r = await api.findInResult(info.id, view, plan.term, 10_000, plan.columns);
+        const r = await api.findInResult(info.id, view, plan.term, 10_000, plan.columns, wholeWord);
         setFind(r);
         setFindIdx(0);
         if (r.matches[0]) grid.current?.scrollToCell(r.matches[0].col, r.matches[0].row);
@@ -435,7 +439,7 @@ export function ResultView({
       }
     }, 200);
     return () => clearTimeout(t);
-  }, [findOpen, plan.term, plan.columns?.join(","), view, info.id, toast]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [findOpen, plan.term, plan.columns?.join(","), wholeWord, view, info.id, toast]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /** Scroll to a column (keeps the current match row when there is one). */
   const jumpToColumn = (col: number) => grid.current?.scrollToCell(col, find.matches[findIdx]?.row ?? 0);
@@ -579,6 +583,15 @@ export function ResultView({
               </option>
             ))}
           </select>
+          <button
+            className={`icon-btn h-6 w-6 font-mono text-[11px] ${wholeWord ? "bg-accent/15 text-accent" : ""}`}
+            aria-label="Whole words only"
+            aria-pressed={wholeWord}
+            title="Whole words only (id finds “id” and “a id”, not “paid”)"
+            onClick={() => (setWholeWord((w) => !w), findInput.current?.focus())}
+          >
+            ab
+          </button>
           <span className="min-w-[80px] text-[11.5px] text-muted" aria-live="polite">
             {plan.term
               ? find.matches.length
