@@ -355,7 +355,14 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 struct Live {
     session: Arc<dyn Session>,
     _tunnel: Option<Arc<Tunnel>>,
+    /// Last time a statement or catalog call used it.
+    last_used: parking_lot::Mutex<Instant>,
 }
+
+/// Setting: close sessions unused for this many minutes (0 = never).
+pub const IDLE_DISCONNECT_SETTING: &str = "idle_disconnect_minutes";
+/// Default for [`IDLE_DISCONNECT_SETTING`].
+pub const IDLE_DISCONNECT_DEFAULT_MINUTES: u64 = 60;
 
 pub struct QueryEngine {
     registry: ConnectorRegistry,
@@ -667,6 +674,7 @@ impl QueryEngine {
     async fn session(&self, connection_id: &str, tab_id: &str) -> Result<Arc<dyn Session>> {
         let key = (connection_id.to_string(), tab_id.to_string());
         if let Some(s) = self.sessions.lock().get(&key) {
+            *s.last_used.lock() = Instant::now();
             return Ok(s.session.clone());
         }
         let gate = self
@@ -694,7 +702,7 @@ impl QueryEngine {
             }
             Err(e) => return Err(e.into()),
         };
-        self.sessions.lock().insert(key, Live { session: session.clone(), _tunnel: tunnel });
+        self.sessions.lock().insert(key, Live { session: session.clone(), _tunnel: tunnel, last_used: parking_lot::Mutex::new(Instant::now()) });
         Ok(session)
     }
 
@@ -702,6 +710,34 @@ impl QueryEngine {
         self.sessions
             .lock()
             .remove(&(connection_id.to_string(), tab_id.to_string()));
+    }
+
+    /// Close sessions unused for `idle` (their connections go back to the
+    /// server; the next statement reconnects). Kept: sessions with a running
+    /// statement, an open transaction, or still referenced elsewhere (an
+    /// export or catalog call in progress). Returns how many were closed.
+    pub fn close_idle(&self, idle: Duration) -> usize {
+        let busy: Vec<String> = self.jobs.lock().values().map(|j| j.session_key.clone()).collect();
+        let now = Instant::now();
+        let mut g = self.sessions.lock();
+        let before = g.len();
+        g.retain(|(_, key), live| {
+            let in_use = busy.contains(key) || Arc::strong_count(&live.session) > 1;
+            in_use || live.session.in_transaction() || now.duration_since(*live.last_used.lock()) < idle
+        });
+        before - g.len()
+    }
+
+    /// The idle time after which sessions close ([`IDLE_DISCONNECT_SETTING`]); `None` = never.
+    pub fn idle_disconnect(&self) -> Option<Duration> {
+        let minutes = self
+            .workspace
+            .get_setting(IDLE_DISCONNECT_SETTING)
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(IDLE_DISCONNECT_DEFAULT_MINUTES);
+        (minutes > 0).then(|| Duration::from_secs(minutes * 60))
     }
 
     /// Close every session of a connection (after editing or deleting it).
@@ -1799,6 +1835,28 @@ mod tests {
             .unwrap();
         assert_eq!(info.total_rows, 2);
         assert!(!info.truncated);
+    }
+
+    #[tokio::test]
+    async fn idle_sessions_close_but_not_mid_transaction() {
+        let f = fixture(EnvTag::None);
+        let job = started(f.engine.run(req(&f, "select 1")).unwrap());
+        wait_job(&f, &job).await;
+        assert!(f.engine.connected_ids().contains(&f.conn_id));
+        assert_eq!(f.engine.close_idle(Duration::from_secs(3600)), 0, "recently used");
+        assert_eq!(f.engine.close_idle(Duration::ZERO), 1);
+        assert!(f.engine.connected_ids().is_empty());
+        // An open transaction keeps the session (and its uncommitted rows).
+        let job = started(f.engine.run(req(&f, "begin")).unwrap());
+        wait_job(&f, &job).await;
+        assert_eq!(f.engine.close_idle(Duration::ZERO), 0);
+        let job = started(f.engine.run(req(&f, "rollback")).unwrap());
+        wait_job(&f, &job).await;
+        assert_eq!(f.engine.close_idle(Duration::ZERO), 1);
+        // Setting: minutes, 0 = never.
+        assert_eq!(f.engine.idle_disconnect(), Some(Duration::from_secs(IDLE_DISCONNECT_DEFAULT_MINUTES * 60)));
+        f.ws.set_setting(IDLE_DISCONNECT_SETTING, &serde_json::json!(0)).unwrap();
+        assert_eq!(f.engine.idle_disconnect(), None);
     }
 
     #[tokio::test]

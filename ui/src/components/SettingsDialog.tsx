@@ -140,6 +140,7 @@ function Queries() {
         tips off.
       </p>
       <ConnectTimeout />
+      <IdleDisconnect />
       <h3 className="pt-3 text-[13px] font-medium">History</h3>
       <HistoryRetention
         setting="history_retention_days"
@@ -309,6 +310,42 @@ function TerminalSettings() {
           {test.error && <span className="text-danger">{test.error}</span>}
         </span>
       </div>
+    </div>
+  );
+}
+
+/** `idle_disconnect_minutes`: sessions unused this long close (0 = never). */
+function IdleDisconnect() {
+  const [text, setText] = useState("60");
+  useEffect(() => {
+    api
+      .getSettings()
+      .then((s) => typeof s.idle_disconnect_minutes === "number" && setText(String(s.idle_disconnect_minutes)))
+      .catch(() => {});
+  }, []);
+  const n = Number(text);
+  const valid = text.trim() !== "" && Number.isInteger(n) && n >= 0 && n <= 1440;
+  return (
+    <div className="space-y-1 pt-3">
+      <h3 className="text-[13px] font-medium">Idle connections</h3>
+      <label htmlFor="idle-disconnect" className="block text-[12px] text-muted">
+        Disconnect sessions not used for (minutes)
+      </label>
+      <input
+        id="idle-disconnect"
+        className={`field w-28 ${valid ? "" : "border-danger"}`}
+        inputMode="numeric"
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value);
+          const v = Number(e.target.value);
+          if (Number.isInteger(v) && v >= 0 && v <= 1440) void api.setSetting("idle_disconnect_minutes", v).catch(() => {});
+        }}
+      />
+      <p className="text-[11.5px] text-muted">
+        Frees the server's connections while you're away; the next query reconnects. A tab with an open transaction or a running query keeps its
+        session. 0 never disconnects. Default: 60.
+      </p>
     </div>
   );
 }

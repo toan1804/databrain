@@ -996,6 +996,18 @@ pub fn run() {
             }
             // Scheduled jobs run while the app is open.
             tauri::async_runtime::spawn(async move { jobs::spawn_scheduler(jobs) });
+            // Idle sessions go back to the server (setting idle_disconnect_minutes).
+            {
+                let engine = app.state::<AppState>().engine.clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        if let Some(idle) = engine.idle_disconnect() {
+                            engine.close_idle(idle);
+                        }
+                    }
+                });
+            }
             #[cfg(target_os = "macos")]
             app.set_menu(macos_menu(app.handle())?)?;
             Ok(())
