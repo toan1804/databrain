@@ -230,6 +230,13 @@ export function storeProvider(connId: string, onLate?: () => void): MetaProvider
       if (local?.length) return local;
       return withBudget(remote, undefined, onLate);
     },
+    columnComments: (schema, table) => {
+      const have = useStore.getState().columns[`${connId}|${schema}|${table}`];
+      if (!have) return undefined;
+      const out: Record<string, string> = {};
+      for (const c of have) if (c.comment) out[c.name.toLowerCase()] = c.comment;
+      return out;
+    },
     columnRoles: (schema, table) => {
       const l = cachedLayout(connId, schema, table);
       if (l === undefined && live) void loadLayout(connId, schema, table);

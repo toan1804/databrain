@@ -628,9 +628,11 @@ impl Workspace {
                  SELECT schema_name, name, kind, comment FROM kn_objects WHERE connection_id = ?1 \
                  UNION ALL SELECT schema_name, name, kind, comment FROM meta_objects WHERE connection_id = ?1 \
                    AND kind IN ('table', 'view', 'materialized_view', 'foreign_table') \
-             ) WHERE (?2 IS NULL OR schema_name = ?2) AND lower(name) LIKE '%' || ?3 || '%' ESCAPE '\\' \
+             ) WHERE (?2 IS NULL OR schema_name = ?2) \
+               AND (lower(name) LIKE '%' || ?3 || '%' ESCAPE '\\' \
+                    OR (length(?3) >= 3 AND lower(coalesce(comment, '')) LIKE '%' || ?3 || '%' ESCAPE '\\')) \
              GROUP BY schema_name, name \
-             ORDER BY lower(name) NOT LIKE ?3 || '%' ESCAPE '\\', length(name), name LIMIT ?4",
+             ORDER BY lower(name) NOT LIKE '%' || ?3 || '%' ESCAPE '\\', lower(name) NOT LIKE ?3 || '%' ESCAPE '\\', length(name), name LIMIT ?4",
         )?;
         let rows = stmt
             .query_map(params![connection_id, schema, q, limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
@@ -885,6 +887,11 @@ mod tests {
         // `_` is literal, not a wildcard.
         assert_eq!(names(Some("s"), "x_"), vec!["s.x_y"]);
         assert_eq!(ws.kn_complete("c1", Some("s"), "", 2).unwrap().len(), 2);
+        // Comments are searched too (3+ characters), after name matches.
+        ws.kn_replace_schema("c1", "u", &[obj("u", "fct_rev", &[], Some("Daily revenue by country")), obj("u", "revenue_raw", &[], None)]).unwrap();
+        assert_eq!(names(Some("u"), "revenue"), vec!["u.revenue_raw", "u.fct_rev"]);
+        assert!(names(Some("u"), "da").is_empty(), "short text: names only");
+        assert_eq!(names(Some("u"), "daily"), vec!["u.fct_rev"]);
         assert_eq!(ws.kn_column_names("c1", "s", "CUSTOMERS").unwrap().unwrap(), vec!["customer_id", "email"]);
         assert!(ws.kn_column_names("c1", "s", "nope").unwrap().is_none());
     }

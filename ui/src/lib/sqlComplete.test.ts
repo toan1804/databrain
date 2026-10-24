@@ -250,3 +250,24 @@ describe("sqlComplete: very large catalogs", () => {
     expect(schemaCalls).toBe(5); // once per request, not per table
   });
 });
+
+describe("comments", () => {
+  it("finds tables and columns by their comments, after name matches", async () => {
+    const p = provider();
+    const objs = [
+      { schema: "public", name: "fct_rev", kind: "table" as const, comment: "Daily revenue by country" },
+      { schema: "public", name: "revenue_raw", kind: "table" as const },
+    ];
+    p.cachedObjects = () => objs;
+    p.searchTables = async () => [];
+    p.columns = async () => ["amt", "ccy"];
+    p.columnComments = () => ({ amt: "Net revenue in USD" });
+    const tables = await completeSql("select * from revenue", 21, p);
+    expect(tables?.options.map((o) => o.label)).toEqual(["revenue_raw", "fct_rev"]);
+    expect(tables?.options[1].detail).toContain("“Daily revenue by country”");
+    const cols = await completeSql("select reve from fct_rev", 11, p);
+    expect(cols?.options.filter((o) => o.type === "column").map((o) => o.label)).toEqual(["amt"]);
+    // Two letters: names only.
+    expect((await completeSql("select * from da", 16, p))?.options.some((o) => o.label === "fct_rev")).toBeFalsy();
+  });
+});

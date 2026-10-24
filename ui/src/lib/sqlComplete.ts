@@ -21,6 +21,8 @@ export interface MetaProvider {
   searchTables(prefix: string): Promise<DbObject[]>;
   /** Column names of a table (may load). */
   columns(schema: string, table: string): Promise<string[] | undefined>;
+  /** Column comments by lower-case name, when known (no I/O). */
+  columnComments?(schema: string, table: string): Record<string, string> | undefined;
   /** Key roles of a table's columns (`partition key`, `indexed`…), when known (no I/O). */
   columnRoles?(schema: string, table: string): Record<string, string> | undefined;
   /** Functions/procedures/packages matching `typed`, in `schema` or anywhere useful (local + server). */
@@ -42,6 +44,8 @@ export interface SqlOption {
   /** Re-open completion after inserting (namespaces ending in "."). */
   reopen?: boolean;
   boost?: number;
+  /** Also matched by this text (a table or column comment). */
+  match?: string;
 }
 
 export interface SqlCompletion {
@@ -230,6 +234,20 @@ export function clauseContext(before: string): Context {
 
 // ------------------------------------------------------------------ matching
 
+/** Shortest typed text that also searches comments. */
+const COMMENT_MATCH_MIN = 3;
+
+/** `typed` appears in `comment` (comment search: 3+ characters). */
+export function commentMatches(comment: string | undefined, typed: string): boolean {
+  return !!comment && typed.length >= COMMENT_MATCH_MIN && comment.toLowerCase().includes(typed.toLowerCase());
+}
+
+/** A comment shortened for the completion list. */
+function commentDetail(c: string): string {
+  const one = c.replace(/\s+/g, " ").trim();
+  return `“${one.length > 48 ? `${one.slice(0, 47)}…` : one}”`;
+}
+
 /** 0 = exact, 1 = prefix, 2 = word-part prefix (`id` → `customer_id`), -1 = no match. */
 export function matchRank(label: string, typed: string): number {
   if (!typed) return 1;
@@ -252,7 +270,12 @@ function filterRank(opts: SqlOption[], typed: string, limit = 200): SqlOption[] 
       if (o.type === "column" && o.detail && prev.o.detail && !prev.o.detail.split(", ").includes(o.detail)) prev.o = { ...prev.o, detail: `${prev.o.detail}, ${o.detail}` };
       return;
     }
-    const r = matchRank(o.label, typed);
+    let r = matchRank(o.label, typed);
+    if (r < 0 && commentMatches(o.match, typed)) {
+      // Found by its comment: after name matches, with the comment shown.
+      r = 3;
+      o = { ...o, detail: [o.detail, commentDetail(o.match!)].filter(Boolean).join(" · ") };
+    }
     if (r < 0) return;
     const entry = { o, r, i };
     seen.set(key, entry);
@@ -308,7 +331,10 @@ export async function resolveTable(p: MetaProvider, parts: string[]): Promise<{ 
   return undefined;
 }
 
-async function columnsFor(p: MetaProvider, parts: string[]): Promise<{ table: string; columns: string[]; roles?: Record<string, string> } | undefined> {
+async function columnsFor(
+  p: MetaProvider,
+  parts: string[],
+): Promise<{ table: string; columns: string[]; roles?: Record<string, string>; comments?: Record<string, string> } | undefined> {
   const virt = p.virtualTables?.() ?? [];
   const last = parts[parts.length - 1].toLowerCase();
   const v = virt.find((t) => t.name.toLowerCase() === last && (parts.length === 1 || parts[parts.length - 2].toLowerCase() === t.schema.toLowerCase()));
@@ -316,7 +342,7 @@ async function columnsFor(p: MetaProvider, parts: string[]): Promise<{ table: st
   const r = await resolveTable(p, parts);
   if (!r) return undefined;
   const cols = await p.columns(r.schema, r.name);
-  return cols ? { table: r.name, columns: cols, roles: p.columnRoles?.(r.schema, r.name) } : undefined;
+  return cols ? { table: r.name, columns: cols, roles: p.columnRoles?.(r.schema, r.name), comments: p.columnComments?.(r.schema, r.name) } : undefined;
 }
 
 /**
@@ -347,11 +373,12 @@ const MAX_TABLE_OPTIONS = 300;
 
 /** Tables/views whose name matches `typed` (see matchRank), best first, at most `limit`. */
 export function matchingRelations(objects: DbObject[], typed: string, limit: number): DbObject[] {
-  const buckets: DbObject[][] = [[], [], []];
+  const buckets: DbObject[][] = [[], [], [], []];
   for (const o of objects) {
     if (o.kind === "function" || o.kind === "procedure" || o.kind === "package" || o.kind === "sequence" || o.kind === "other") continue;
     const r = matchRank(o.name, typed);
     if (r >= 0) buckets[r].push(o);
+    else if (commentMatches(o.comment, typed)) buckets[3].push(o);
   }
   const out: DbObject[] = [];
   for (const b of buckets) {
@@ -372,6 +399,7 @@ function tableOption(p: MetaProvider, o: DbObject, boost = 0): SqlOption {
     detail: o.schema === def?.name ? undefined : sc ? (sc.catalog ? `${sc.catalog}.${schemaLabel(sc)}` : sc.name) : o.schema,
     apply: tableApply(p, o),
     boost,
+    match: o.comment,
   };
 }
 
@@ -513,7 +541,7 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
         const c = await columnsFor(p, ref.parts);
         for (const col of c?.columns ?? []) {
           const role = c?.roles?.[col.toLowerCase()];
-          opts.push({ label: col, type: "column", detail: role ? `${c?.table} · ${role}` : c?.table, apply: quoteIdent(k, col), boost: role ? 12 : 10 });
+          opts.push({ label: col, type: "column", detail: role ? `${c?.table} · ${role}` : c?.table, apply: quoteIdent(k, col), boost: role ? 12 : 10, match: c?.comments?.[col.toLowerCase()] });
         }
       }
     }
@@ -534,7 +562,7 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
     if (sc) {
       const objs = matchingRelations((await p.objects(sc.name, typed)) ?? [], typed, MAX_TABLE_OPTIONS);
       for (const o of objs) {
-        opts.push(aliased({ label: o.name, type: o.kind === "view" || o.kind === "materialized_view" ? "view" : "table", detail: schemaLabel(sc), apply: quoteIdent(k, o.name) }, o.name));
+        opts.push(aliased({ label: o.name, type: o.kind === "view" || o.kind === "materialized_view" ? "view" : "table", detail: schemaLabel(sc), apply: quoteIdent(k, o.name), match: o.comment }, o.name));
       }
       if (ctx !== "table" && p.routines) {
         for (const o of await p.routines(sc.name, typed)) {
@@ -555,7 +583,7 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
     // schema.table. (or catalog.schema.table.) → columns
     if (!opts.length || path.length >= 2) {
       const c = await columnsFor(p, path);
-      for (const col of c?.columns ?? []) opts.push({ label: col, type: "column", detail: c?.table, apply: quoteIdent(k, col) });
+      for (const col of c?.columns ?? []) opts.push({ label: col, type: "column", detail: c?.table, apply: quoteIdent(k, col), match: c?.comments?.[col.toLowerCase()] });
     }
     const ranked = filterRank(opts, typed);
     return ranked.length ? { from: wordFrom, options: ranked } : null;
@@ -601,7 +629,7 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
       for (const col of c?.columns ?? []) {
         const role = c!.roles?.[col.toLowerCase()];
         // Key columns first: filtering/joining on them is fast.
-        opts.push({ label: col, type: "column", detail: role ? `${c!.table} · ${role}` : c!.table, apply: quoteIdent(k, col), boost: role ? 12 : 10 });
+        opts.push({ label: col, type: "column", detail: role ? `${c!.table} · ${role}` : c!.table, apply: quoteIdent(k, col), boost: role ? 12 : 10, match: c!.comments?.[col.toLowerCase()] });
       }
       const r = refs[i];
       opts.push({ label: r.alias ?? r.parts[r.parts.length - 1], type: "alias", detail: r.alias ? r.parts.join(".") : "table", apply: `${quoteIdent(k, r.alias ?? r.parts[r.parts.length - 1])}.`, reopen: true, boost: 4 });
