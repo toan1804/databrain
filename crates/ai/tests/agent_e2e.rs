@@ -304,6 +304,11 @@ async fn mcp_server_lists_and_calls_tools() {
     let tools = resps[1]["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|t| t["name"] == "search_schema" && t["inputSchema"]["required"][0] == "connection"));
     assert!(!tools.iter().any(|t| t["name"] == "write_editor"));
+    // Annotations: read tools can be auto-approved, run_query can't.
+    let ann = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap()["annotations"].clone();
+    assert_eq!((ann("search_schema")["readOnlyHint"].clone(), ann("search_schema")["destructiveHint"].clone()), (json!(true), json!(false)));
+    assert_eq!((ann("run_query")["readOnlyHint"].clone(), ann("run_query")["destructiveHint"].clone()), (json!(false), json!(true)));
+    assert!(tools.iter().all(|t| t["annotations"]["openWorldHint"] == json!(false)), "every tool is annotated");
     assert!(resps[2]["result"]["content"][0]["text"].as_str().unwrap().contains("Shop"));
     assert!(resps[3]["result"]["content"][0]["text"].as_str().unwrap().contains("returned 1 rows"));
     assert_eq!(resps[4]["result"]["isError"], true);

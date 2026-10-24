@@ -29,11 +29,31 @@ pub struct McpServer {
     pub hub: Arc<EventHub>,
 }
 
+/// MCP tool annotations: what a tool does, so clients can auto-approve the
+/// safe ones. `(read_only, destructive, idempotent)`; nothing reaches outside
+/// the user's own connections and DataBrain workspace.
+fn annotations(name: &str) -> Value {
+    let (read_only, destructive, idempotent) = match name {
+        "list_connections" | "search_schema" | "describe_table" | "list_tables" | "get_sample_rows" | "query_result" | "result_summary"
+        | "list_outputs" | "query_outputs" | "list_knowledge_notes" | "list_jobs" | "get_job" => (true, false, true),
+        // Refreshes DataBrain's own index of table descriptions.
+        "index_tables" => (false, false, true),
+        "add_knowledge_note" | "save_query" | "create_job" => (false, false, false),
+        // Replaces a note / a job's steps.
+        "update_knowledge_note" | "update_job" => (false, true, true),
+        // SQL (writes where the connection's AI policy allows them) and jobs
+        // (load steps write into tables).
+        _ => (false, true, false),
+    };
+    json!({"readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": false})
+}
+
 fn tool_list() -> Vec<Value> {
     let mut out = vec![json!({
         "name": "list_connections",
         "description": "List DataBrain database connections available to this agent (name, type, environment).",
         "inputSchema": {"type": "object", "properties": {}},
+        "annotations": annotations("list_connections"),
     })];
     for t in specs(false) {
         // `save_query` and notes are allowed; every tool gets a `connection` argument.
@@ -42,7 +62,7 @@ fn tool_list() -> Vec<Value> {
         let mut req: Vec<Value> = schema["required"].as_array().cloned().unwrap_or_default();
         req.insert(0, json!("connection"));
         schema["required"] = Value::Array(req);
-        out.push(json!({"name": t.name, "description": t.description, "inputSchema": schema}));
+        out.push(json!({"name": t.name, "description": t.description, "inputSchema": schema, "annotations": annotations(&t.name)}));
     }
     out
 }
