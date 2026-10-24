@@ -43,6 +43,9 @@ function Palette() {
     const active = st.tabs.find((t) => t.id === st.activeTabId);
     const cmds: Command[] = [
       { id: "new-tab", group: "Actions", label: "New query tab", icon: <Plus size={14} />, hint: "⌘T", run: () => st.newTab() },
+      ...(st.closedTabs.length
+        ? [{ id: "reopen-tab", group: "Actions", label: `Reopen closed tab “${st.closedTabs[st.closedTabs.length - 1].tab.title}”`, icon: <History size={14} />, hint: "⇧⌘T", run: () => void st.reopenClosedTab() }]
+        : []),
       {
         id: "find-table",
         group: "Actions",

@@ -189,3 +189,28 @@ describe("new notebook", () => {
     expect(savedNotebooks.at(-1)).toMatchObject({ connection_id: null, folder_id: null });
   });
 });
+
+describe("reopen closed tabs", () => {
+  it("brings back the last closed tab with its SQL and parameters, in place", () => {
+    useStore.setState({
+      tabs: [
+        { id: "a", title: "A", sql: "select 1", connection_id: "c1" },
+        { id: "b", title: "B", sql: "select :d", connection_id: "c1" },
+        { id: "c", title: "C", sql: "", connection_id: "c1" },
+      ],
+      activeTabId: "b",
+      closedTabs: [],
+      params: { b: { d: { value: "2026-01-01" } } },
+    });
+    const st = () => useStore.getState();
+    st().closeTab("c"); // empty: not remembered
+    st().closeTab("b");
+    expect(st().closedTabs.map((c) => c.tab.title)).toEqual(["B"]);
+    expect(st().reopenClosedTab()).toBe(true);
+    const t = st().tabs[1];
+    expect([t.title, t.sql, t.id !== "b"]).toEqual(["B", "select :d", true]);
+    expect(st().activeTabId).toBe(t.id);
+    expect(st().params[t.id]).toEqual({ d: { value: "2026-01-01" } });
+    expect(st().reopenClosedTab()).toBe(false);
+  });
+});

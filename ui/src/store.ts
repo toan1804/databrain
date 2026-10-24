@@ -258,6 +258,10 @@ interface State {
 
   newTab: (init?: Partial<Tab>) => string;
   closeTab: (id: string) => void;
+  /** Recently closed tabs, newest last (⌘⇧T reopens them). */
+  closedTabs: { tab: Tab; index: number; params?: Record<string, ParamValue> }[];
+  /** Reopen the most recently closed tab where it was. False when none. */
+  reopenClosedTab: () => boolean;
   setActiveTab: (id: string) => void;
   updateTab: (id: string, patch: Partial<Tab>) => void;
   moveTab: (from: number, to: number) => void;
@@ -549,6 +553,7 @@ export const useStore = create<State>((set, get) => ({
   connectors: [],
   connections: [],
   tabs: [],
+  closedTabs: [],
   activeTabId: null,
   runs: {},
   savedQueries: [],
@@ -1076,9 +1081,33 @@ export const useStore = create<State>((set, get) => ({
     delete runs[id];
     const params = { ...s.params };
     delete params[id];
-    set({ tabs, activeTabId, runs, params });
+    // Remembered to reopen (not empty scratch tabs); the editor text and
+    // parameters come back, the result doesn't (its session was closed).
+    const closed = s.tabs[idx];
+    const keep = !!(closed.sql.trim() || closed.notebook_id || closed.output_ref || closed.ddl || closed.job_id || closed.saved_query_id);
+    const closedTabs = keep ? [...s.closedTabs, { tab: closed, index: idx, params: s.params[id] }].slice(-20) : s.closedTabs;
+    set({ tabs, activeTabId, runs, params, closedTabs });
     persistParams(params);
     persistTabs(tabs);
+  },
+  reopenClosedTab: () => {
+    const s = get();
+    const last = s.closedTabs[s.closedTabs.length - 1];
+    if (!last) return false;
+    // A new id: the old one's session and outputs are gone.
+    const tab: Tab = { ...last.tab, id: uid() };
+    const savedParams = last.params;
+    const tabs = s.tabs.slice();
+    // Replace the lone empty tab left after closing the last one.
+    const lone = tabs.length === 1 && !tabs[0].sql.trim() && isQueryTab(tabs[0]);
+    if (lone) tabs.splice(0, 1);
+    tabs.splice(Math.min(last.index, tabs.length), 0, tab);
+    const params = savedParams ? { ...s.params, [tab.id]: savedParams } : s.params;
+    set({ tabs, activeTabId: tab.id, closedTabs: s.closedTabs.slice(0, -1), params });
+    persistParams(params);
+    persistTabs(tabs);
+    if (isTauri()) api.setSetting("active_tab", tab.id).catch(() => {});
+    return true;
   },
   setActiveTab: (id) => {
     set({ activeTabId: id });

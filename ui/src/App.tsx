@@ -44,6 +44,9 @@ function useGlobalShortcuts() {
         // Find a table in the explorer.
         e.preventDefault();
         st.openCatalogSearch();
+      } else if (key === "t" && e.shiftKey) {
+        e.preventDefault();
+        if (!st.reopenClosedTab()) st.toast("No closed tab to reopen", "info");
       } else if (key === "t") {
         e.preventDefault();
         st.newTab();
