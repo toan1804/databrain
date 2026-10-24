@@ -429,6 +429,13 @@ impl Session for MysqlSession {
         Ok(v.unwrap_or_default())
     }
 
+    fn in_transaction(&self) -> bool {
+        // Also one a procedure or `SET autocommit = 0` opened (the server
+        // reports it after each statement).
+        self.state.in_transaction()
+            || self.conn.try_lock().is_ok_and(|c| c.last_ok_packet().is_some_and(|p| p.status_flags().contains(StatusFlags::SERVER_STATUS_IN_TRANS)))
+    }
+
     async fn ping(&self) -> Result<()> {
         self.conn.lock().await.ping().await.map_err(map_err)
     }

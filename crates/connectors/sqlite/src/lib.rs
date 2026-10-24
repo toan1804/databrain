@@ -309,6 +309,11 @@ impl Session for SqliteSession {
         Ok(format!("SQLite {}", rusqlite::version()))
     }
 
+    fn in_transaction(&self) -> bool {
+        // SQLite knows: autocommit is off between BEGIN and COMMIT.
+        self.conn.try_lock().is_ok_and(|c| !c.is_autocommit())
+    }
+
     async fn ping(&self) -> Result<()> {
         self.with_conn(|c| {
             c.query_row("select 1", [], |_| Ok(()))

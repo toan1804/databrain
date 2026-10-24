@@ -958,7 +958,7 @@ function ExportDialog({
           <ExportCard x={bg} now={now} bare />
           {running && (
             <p className="text-[11.5px] text-muted">
-              The query runs again on its own session and every row goes straight to the file. You can keep working: choose "Run in background" and the
+              The query runs again (on its own session, or on the tab's when a transaction is open there) and every row goes straight to the file. You can keep working: choose "Run in background" and the
               progress stays at the bottom right, with Stop and Show file.
             </p>
           )}

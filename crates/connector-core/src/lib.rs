@@ -70,6 +70,12 @@ pub trait Session: Send + Sync {
 
     async fn ping(&self) -> Result<()>;
 
+    /// A transaction is (probably) open on the session: statements on
+    /// another session would not see its uncommitted changes.
+    fn in_transaction(&self) -> bool {
+        false
+    }
+
     /// Execute a single statement and stream its result.
     async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream>;
 

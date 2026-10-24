@@ -1084,7 +1084,7 @@ pub async fn export_full_result(state: &AppState, result_id: &str, options: Expo
         v["export_id"] = serde_json::Value::String(id.clone());
         ui.emit(EXPORT_EVENT, v);
     };
-    state.engine.export_query(export_id, &o.connection_id, &o.sql, &path, options, &progress).await
+    state.engine.export_query(export_id, &o.connection_id, Some(o.session()), &o.sql, &path, options, &progress).await
 }
 
 fn write_export(

@@ -470,6 +470,10 @@ impl Session for PgSession {
         Ok(row.get(0))
     }
 
+    fn in_transaction(&self) -> bool {
+        self.link.state.in_transaction()
+    }
+
     async fn ping(&self) -> Result<()> {
         self.client()
             .simple_query("select 1")

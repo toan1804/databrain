@@ -90,3 +90,44 @@ async fn reports_progress_and_remembers_the_file() {
     assert_eq!(st.engine.exported_file("p1").as_deref(), Some(path.as_path()));
     assert!(st.engine.exported_file("nope").is_none());
 }
+
+/// A full export of a result read inside an open transaction sees the same
+/// uncommitted rows (it runs on the tab's session, not a new one).
+#[tokio::test(flavor = "multi_thread")]
+async fn export_reads_through_the_open_transaction() {
+    use databrain_auth::AuthMethod;
+    use databrain_connector_core::{ConnectionConfig, ConnectorKind};
+    use databrain_workspace::{ConnectionProfile, EnvTag};
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
+    c.file_path = Some(dir.path().join("tx.db").to_string_lossy().into_owned());
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "tx".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    let conn = api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    run(&st, &conn, "create table t (a int)", None).await;
+    run(&st, &conn, "insert into t values (1)", None).await;
+    run(&st, &conn, "begin", None).await;
+    run(&st, &conn, "insert into t values (2), (3)", None).await;
+    let r = run(&st, &conn, "select a from t order by a", Some(1)).await;
+    let info = r.result.unwrap();
+    assert!(info.truncated);
+    let path = dir.path().join("all.csv");
+    let n = api::export_full_result(&st, &info.id, ExportOptions::new(ExportFormat::Csv), path.to_string_lossy().into_owned(), "tx1").await.unwrap();
+    assert_eq!(n, 3, "the uncommitted rows are exported too");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n1\n2\n3\n");
+    // The transaction is still open on the tab's session.
+    run(&st, &conn, "rollback", None).await;
+    let after = run(&st, &conn, "select count(*) from t", None).await;
+    assert_eq!(after.result.unwrap().total_rows, 1);
+}

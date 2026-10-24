@@ -1157,15 +1157,20 @@ impl QueryEngine {
 
     /// Run one read statement again without a row limit and stream every
     /// row straight into `path` (nothing is kept in memory, except for XLSX).
-    /// Runs on its own session; written to a temp file, renamed when done.
+    /// Runs on its own session, except when `session_key` (the session the
+    /// statement first ran on) has an open transaction: then on that one,
+    /// so the export sees the same uncommitted rows as the grid did (the tab
+    /// is busy meanwhile). Written to a temp file, renamed when done.
     /// Cancel with [`QueryEngine::cancel_export`]. Returns rows written.
     ///
     /// `progress` is called when the phase changes and, while rows are
     /// written, at most every [`EXPORT_PROGRESS_EVERY`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn export_query(
         &self,
         export_id: &str,
         connection_id: &str,
+        session_key: Option<&str>,
         sql: &str,
         path: &std::path::Path,
         opts: databrain_export::ExportOptions,
@@ -1182,11 +1187,30 @@ impl QueryEngine {
         }
         let cancel = CancellationToken::new();
         self.exports.lock().insert(export_id.to_string(), cancel.clone());
-        let tab = format!("__export__:{export_id}");
+        // The original session, when its transaction holds rows others can't see.
+        let shared = session_key.filter(|k| {
+            self.sessions.lock().get(&(connection_id.to_string(), k.to_string())).is_some_and(|s| s.session.in_transaction())
+        });
+        let tab = match shared {
+            Some(k) => {
+                if self.jobs.lock().values().any(|j| j.session_key == k) {
+                    self.exports.lock().remove(export_id);
+                    return Err(EngineError::new("busy", "A query is running in this tab: wait for it, or commit, to export everything"));
+                }
+                // Busy like a running query until the export ends.
+                self.jobs.lock().insert(format!("export:{export_id}"), JobHandle { tab_id: k.to_string(), session_key: k.to_string(), cancel: cancel.clone() });
+                k.to_string()
+            }
+            None => format!("__export__:{export_id}"),
+        };
         let tmp = path.with_extension(format!("{}.partial", path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")));
         let out = self.export_stream(connection_id, &tab, sql, &tmp, opts, &cancel, progress).await;
         self.exports.lock().remove(export_id);
-        self.drop_session(connection_id, &tab);
+        if shared.is_some() {
+            self.jobs.lock().remove(&format!("export:{export_id}"));
+        } else {
+            self.drop_session(connection_id, &tab);
+        }
         match out {
             Ok(rows) => {
                 std::fs::rename(&tmp, path).map_err(|e| EngineError::new("internal", format!("{}: {e}", path.display())))?;
@@ -1339,6 +1363,7 @@ impl QueryEngine {
                     statement_index: stmt.index,
                     row_limit: limit,
                     origin: req.origin,
+                    session_key: req.session_key().to_string(),
                 }))),
                 _ => None,
             };

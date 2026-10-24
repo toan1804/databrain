@@ -736,6 +736,10 @@ impl Session for MssqlSession {
             .unwrap_or_default())
     }
 
+    fn in_transaction(&self) -> bool {
+        self.state.in_transaction()
+    }
+
     async fn ping(&self) -> Result<()> {
         self.rows("select 1", vec![]).await.map(|_| ())
     }

@@ -82,9 +82,17 @@ pub struct OutputInfo {
     /// Latest run of its tab (shown in the UI).
     #[serde(default)]
     pub active: bool,
+    /// Database session the statement ran on, when not `tab_id` (a
+    /// notebook's cells share `nb:{notebook}`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_key: String,
 }
 
 impl OutputInfo {
+    /// The session the statement ran on.
+    pub fn session(&self) -> &str {
+        if self.session_key.is_empty() { &self.tab_id } else { &self.session_key }
+    }
     /// Preferred SQL reference, e.g. `results.revenue` or `results.r12`.
     pub fn reference(&self) -> String {
         let t = match (&self.name, &self.version_of) {
@@ -114,6 +122,8 @@ pub struct NewOutput {
     pub statement_index: usize,
     pub row_limit: Option<usize>,
     pub origin: Origin,
+    /// Session it ran on (empty: `tab_id`).
+    pub session_key: String,
 }
 
 #[derive(Default)]
@@ -317,6 +327,7 @@ impl OutputRegistry {
                 origin: n.origin,
                 last_used: now,
                 active: true,
+                session_key: if n.session_key == n.tab_id { String::new() } else { n.session_key },
             };
             g.by_result.insert(info.result_id.clone(), handle.clone());
             g.active.entry(n.tab_id).or_default().push(handle.clone());
@@ -968,6 +979,7 @@ mod tests {
             statement_index: 0,
             row_limit: None,
             origin: Origin::User,
+            session_key: String::new(),
         })
     }
 
