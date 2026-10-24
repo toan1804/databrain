@@ -1785,7 +1785,7 @@ mod tests {
         assert_eq!(page.view_rows, 2);
         assert_eq!(page.rows[0][1].as_deref(), Some("Chi"));
 
-        let f = find_in_result(&st, rid.clone(), ViewSpec::default(), "han".into(), None, 100)
+        let f = find_in_result(&st, rid.clone(), ViewSpec::default(), "han".into(), None, 100, false)
             .await
             .unwrap();
         assert_eq!(f.matches.len(), 2);
