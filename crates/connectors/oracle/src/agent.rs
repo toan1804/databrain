@@ -20,7 +20,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 pub const PROTOCOL: &str = "1";
 /// Release of the helper binaries (download folder and file names).
 /// 0.1.1: reconnects after a lost connection ("sql: connection is already closed").
-pub const RELEASE: &str = "0.1.1";
+/// 0.1.2: columns go-ora can't decode (SDO_GEOMETRY, XMLTYPE, objects: "TTC
+///        error") are converted to text on the server and the first page retried.
+pub const RELEASE: &str = "0.1.2";
 /// Where releases are published: `{base}/v{RELEASE}/{file}.gz`.
 pub const DEFAULT_BASE_URL: &str = "https://github.com/toan1804/databrain/releases/download/oracle-agent";
 /// `sha256  file` lines of the uncompressed binaries of [`RELEASE`].

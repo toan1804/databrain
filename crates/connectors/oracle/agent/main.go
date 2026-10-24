@@ -64,6 +64,9 @@ type request struct {
 	Binds     map[string]*string `json:"binds,omitempty"`
 	BatchSize int                `json:"batch_size,omitempty"`
 	MaxRows   int                `json:"max_rows,omitempty"`
+
+	// db_type shown for columns converted to text by a retry (by position).
+	labels map[int]string
 }
 
 type column struct {
@@ -148,6 +151,28 @@ type session struct {
 	ro   bool
 	// The connect request, to reconnect after the connection is lost.
 	req *request
+	// ALTER SESSION statements run so far, replayed after a reconnect
+	// (e.g. current_schema, which unqualified names depend on).
+	setup []string
+}
+
+// maxSetup bounds the remembered ALTER SESSION statements.
+const maxSetup = 64
+
+func isAlterSession(sql string) bool {
+	f := strings.Fields(strings.ToUpper(sql))
+	return len(f) >= 2 && f[0] == "ALTER" && f[1] == "SESSION"
+}
+
+func (s *session) remember(sql string) {
+	for _, x := range s.setup {
+		if x == sql {
+			return
+		}
+	}
+	if len(s.setup) < maxSetup {
+		s.setup = append(s.setup, sql)
+	}
 }
 
 // notSent: the statement never reached the server (database/sql closes a
@@ -176,15 +201,22 @@ func lostConn(err error) bool {
 	return errors.As(err, &ne)
 }
 
-// reconnect opens a new connection with the same settings (session state
-// such as ALTER SESSION or package variables starts fresh).
+// reconnect opens a new connection with the same settings. ALTER SESSION
+// statements run before are replayed; other session state (package
+// variables, temporary tables' rows) starts fresh.
 func (s *session) reconnect(ctx context.Context) error {
 	if s.req == nil {
 		return errors.New("not connected")
 	}
 	s.close()
 	s.db, s.conn, s.tx = nil, nil, nil
-	return s.connect(ctx, s.req)
+	if err := s.connect(ctx, s.req); err != nil {
+		return err
+	}
+	for _, q := range s.setup {
+		_, _ = s.conn.ExecContext(ctx, q)
+	}
+	return nil
 }
 
 // withReconnect runs f; when the connection turns out to be lost, it
@@ -600,9 +632,19 @@ func (s *session) query(ctx context.Context, w *writer, r *request) error {
 	for i, ct := range cts {
 		cols[i] = colType(ct)
 		dests[i] = dest(cols[i])
+		if l, ok := r.labels[i]; ok {
+			cols[i].DbType = l
+		}
 	}
-	if err := w.json(map[string]any{"id": r.ID, "type": "schema", "columns": cols}); err != nil {
-		return err
+	// The schema goes out with the first batch (or at the end): until then
+	// nothing is streamed, so a first page that can't be read can be retried.
+	schemaSent := false
+	sendSchema := func() error {
+		if schemaSent {
+			return nil
+		}
+		schemaSent = true
+		return w.json(map[string]any{"id": r.ID, "type": "schema", "columns": cols})
 	}
 	batch := r.BatchSize
 	if batch <= 0 || batch > 10000 {
@@ -613,6 +655,9 @@ func (s *session) query(ctx context.Context, w *writer, r *request) error {
 	flush := func() error {
 		if n == 0 {
 			return nil
+		}
+		if err := sendSchema(); err != nil {
+			return err
 		}
 		head := make([]byte, 16)
 		binary.BigEndian.PutUint64(head[:8], r.ID)
@@ -644,6 +689,9 @@ func (s *session) query(ctx context.Context, w *writer, r *request) error {
 		return err
 	}
 	if err := flush(); err != nil {
+		return err
+	}
+	if err := sendSchema(); err != nil {
 		return err
 	}
 	return w.json(map[string]any{"id": r.ID, "type": "done"})
@@ -695,6 +743,9 @@ func (s *session) exec(ctx context.Context, w *writer, r *request) error {
 	if err != nil {
 		return err
 	}
+	if isAlterSession(r.SQL) {
+		s.remember(r.SQL)
+	}
 	reply := map[string]any{"id": r.ID, "type": "done"}
 	if n, err := res.RowsAffected(); err == nil {
 		reply["rows_affected"] = n
@@ -720,7 +771,17 @@ func (s *session) handle(ctx context.Context, w *writer, r *request) error {
 		}
 		return w.json(map[string]any{"id": r.ID, "type": "ok"})
 	case "query":
-		return s.withReconnect(ctx, w, r, func() error { return s.query(ctx, w, r) })
+		w.mu.Lock()
+		before := w.frames
+		w.mu.Unlock()
+		err := s.withReconnect(ctx, w, r, func() error { return s.query(ctx, w, r) })
+		if !undecodable(err) || ctx.Err() != nil {
+			return err
+		}
+		w.mu.Lock()
+		streamed := w.frames != before
+		w.mu.Unlock()
+		return s.retryReadable(ctx, w, r, err, streamed)
 	case "text":
 		return s.withReconnect(ctx, w, r, func() error { return s.textQuery(ctx, w, r) })
 	case "exec":
