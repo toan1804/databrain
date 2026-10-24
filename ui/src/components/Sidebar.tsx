@@ -35,6 +35,7 @@ import {
   Table2,
   TextCursorInput,
   Trash2,
+  Upload,
   Unplug,
   WifiOff,
   Workflow,
@@ -168,8 +169,12 @@ function SearchBox({ value, onChange, placeholder }: { value: string; onChange: 
 
 // ------------------------------------------------------------------ connections
 
-/** Open a local file with DuckDB: reuse/create a "Local files" connection and run a scan query. */
-export async function queryLocalFile() {
+/**
+ * Open a local file with DuckDB: reuse/create a "Local files" connection and
+ * run a scan query. `importIt`: every row is read (no row limit) and
+ * "Load into…" opens on the result, to copy the file into a table.
+ */
+export async function queryLocalFile(importIt = false) {
   const st = useStore.getState();
   const picked = await openDialog({
     multiple: false,
@@ -207,7 +212,10 @@ export async function queryLocalFile() {
     }
     if (!conn) return;
     const id = useStore.getState().newTab({ title: picked.split(/[\\/]/).pop() ?? "file", sql, connection_id: conn.id });
-    void useStore.getState().runTab(id, "all", { doc: sql, selFrom: 0, selTo: 0, cursor: 0 });
+    if (importIt) {
+      useStore.getState().setLoadIntoOnResult(id, true);
+      void useStore.getState().runSql(id, conn.id, sql, 0, undefined, undefined, undefined, null);
+    } else void useStore.getState().runTab(id, "all", { doc: sql, selFrom: 0, selTo: 0, cursor: 0 });
   } catch (e) {
     st.toast(toError(e).message, "error");
   }
@@ -274,6 +282,7 @@ function ConnectionsPanel() {
           <MenuItem icon={<FolderPlus size={13} />} label="New folder" onClick={() => (setBlankMenu(null), void createFolder("connections"))} />
           <MenuSeparator />
           <MenuItem icon={<FileSearch size={13} />} label="Query a local file…" onClick={() => (setBlankMenu(null), void queryLocalFile())} />
+          <MenuItem icon={<Upload size={13} />} label="Import a file into a table…" onClick={() => (setBlankMenu(null), void queryLocalFile(true))} />
         </Popover>
       )}
     </>

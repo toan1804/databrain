@@ -1051,6 +1051,23 @@ export interface LoadCheck {
   message?: string | null;
 }
 
+/** "Load into…" a table from the result grid. */
+export interface LoadResultArgs {
+  target_connection_id: string;
+  table: string;
+  mode: LoadMode;
+  key_columns: string[];
+  create_table: boolean;
+}
+
+/** Outcome of a load. */
+export interface LoadReport {
+  rows: number;
+  created_table: boolean;
+  transaction: boolean;
+  notices: string[];
+}
+
 /** Dry run of a load step: nothing is kept. */
 export interface LoadDryRun {
   ok: boolean;

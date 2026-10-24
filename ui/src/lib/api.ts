@@ -65,6 +65,8 @@ import type {
   Page,
   ResultInfo,
   SelectionSummary,
+  LoadResultArgs,
+  LoadReport,
   RunRequest,
   RunResponse,
   SavedQuery,
@@ -203,6 +205,10 @@ export const api = {
     call<Page>("fetch_page", { resultId, view, offset, limit }),
   findInResult: (resultId: string, view: ViewSpec, query: string, limit: number, columns?: number[] | null, wholeWord = false) =>
     call<FindResult>("find_in_result", { resultId, view, query, limit, columns: columns ?? null, wholeWord }),
+  /** Copy a result's fetched rows into a table (job load code). */
+  loadResult: (resultId: string, args: LoadResultArgs, loadId: string) => call<LoadReport>("load_result", { resultId, args, loadId }),
+  cancelLoad: (loadId: string) => call<boolean>("cancel_load", { loadId }),
+  dryRunResultLoad: (resultId: string, args: LoadResultArgs) => call<LoadDryRun>("dry_run_result_load", { resultId, args }),
   summarizeSelection: (resultId: string, view: ViewSpec, columns: number[], offset: number, limit: number) =>
     call<SelectionSummary>("summarize_selection", { resultId, view, columns, offset, limit }),
   columnStats: (resultId: string, view: ViewSpec, column: number) =>
@@ -374,6 +380,12 @@ export type ExportPhase = "connecting" | "running" | "downloading" | "writing" |
 export type ExportProgressEvent = { export_id: string; phase: ExportPhase; rows: number; bytes: number };
 export function onExportProgress(handler: (e: ExportProgressEvent) => void): Promise<UnlistenFn> {
   return listen<ExportProgressEvent>("export-progress", (e) => handler(e.payload));
+}
+
+/** Progress of a "Load into…" from the grid. */
+export type LoadProgressEvent = { load_id: string; done: number; total: number };
+export function onLoadProgress(handler: (e: LoadProgressEvent) => void): Promise<UnlistenFn> {
+  return listen<LoadProgressEvent>("load-progress", (e) => handler(e.payload));
 }
 
 export function onOracleInstall(handler: (e: OracleInstallProgress) => void): Promise<UnlistenFn> {

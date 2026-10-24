@@ -1551,6 +1551,91 @@ pub fn cancel_job_step(state: &AppState, id: &str, node_id: &str) -> bool {
     state.jobs.cancel_step(id, node_id)
 }
 
+/// Where and how to load a result's rows ("Load into…" on the grid).
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoadResultArgs {
+    pub target_connection_id: String,
+    pub table: String,
+    #[serde(default)]
+    pub mode: databrain_workspace::LoadMode,
+    #[serde(default)]
+    pub key_columns: Vec<String>,
+    #[serde(default = "default_true")]
+    pub create_table: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl LoadResultArgs {
+    fn spec(&self) -> databrain_query_engine::LoadSpec {
+        databrain_query_engine::LoadSpec { table: self.table.trim().to_string(), mode: self.mode, key_columns: self.key_columns.clone(), create_table: self.create_table, ..Default::default() }
+    }
+}
+
+/// UI event channel of loads from the grid (`{load_id, done, total}`).
+pub const LOAD_EVENT: &str = "load-progress";
+
+static LOADS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, databrain_connector_core::CancellationToken>>> = std::sync::LazyLock::new(Default::default);
+
+struct LoadProgress {
+    ui: Arc<dyn crate::ai_api::UiBridge>,
+    id: String,
+}
+
+impl databrain_query_engine::LoadObserver for LoadProgress {
+    fn event(&self, e: databrain_query_engine::LoadEvent) {
+        if let databrain_query_engine::LoadEvent::Progress { done, total, .. } = e {
+            self.ui.emit(LOAD_EVENT, serde_json::json!({"load_id": self.id, "done": done, "total": total}));
+        }
+    }
+}
+
+/// Copy the rows of a result (what was fetched) into a table of a
+/// connection, with the job load code: append / truncate / replace /
+/// update / merge, creating a missing table.
+pub async fn load_result(state: &AppState, result_id: &str, args: LoadResultArgs, load_id: &str) -> Result<databrain_query_engine::LoadReport> {
+    let o = state.engine.outputs().by_result(result_id).ok_or_else(|| invalid("This result is no longer available; run the query again"))?;
+    let target = state.workspace.get_connection(&args.target_connection_id)?;
+    if target.config.read_only {
+        return Err(invalid(format!("Connection \"{}\" is read-only", target.name)));
+    }
+    let cancel = databrain_connector_core::CancellationToken::new();
+    LOADS.lock().insert(load_id.to_string(), cancel.clone());
+    let tab = format!("__load__:{load_id}");
+    let obs = LoadProgress { ui: state.ui.clone(), id: load_id.to_string() };
+    let r = state.engine.write_output(&o.handle, &args.target_connection_id, &tab, &args.spec(), &cancel, &obs).await;
+    LOADS.lock().remove(load_id);
+    state.engine.close_tab(&tab);
+    r
+}
+
+/// Stop a running [`load_result`].
+pub fn cancel_load(load_id: &str) -> bool {
+    LOADS.lock().get(load_id).map(|c| c.cancel()).is_some()
+}
+
+/// Check a load of a result without keeping any change (its first 1,000 rows).
+pub async fn dry_run_result_load(state: &AppState, result_id: &str, args: LoadResultArgs) -> Result<databrain_query_engine::LoadDryRun> {
+    let rows = state.engine.result_rows(result_id)?;
+    let mut left = 1000usize;
+    let mut sample = Vec::new();
+    for b in rows.batches {
+        if left == 0 {
+            break;
+        }
+        let n = b.num_rows().min(left);
+        sample.push(b.slice(0, n));
+        left -= n;
+    }
+    let rows = databrain_query_engine::LoadRows { schema: rows.schema, batches: sample };
+    let tab = format!("__loadcheck__:{}", uuid::Uuid::new_v4());
+    let r = state.engine.dry_run_load(Some(&rows), None, &args.target_connection_id, &tab, &args.spec()).await;
+    state.engine.close_tab(&tab);
+    Ok(r)
+}
+
 /// Dry run of a load step of `job` as edited (nothing is kept).
 pub async fn dry_run_job_step(state: &AppState, job: databrain_workspace::Job, node_id: &str) -> Result<databrain_query_engine::LoadDryRun> {
     crate::jobs::dry_run(&state.job_ctx(), &job, node_id).await

@@ -1372,7 +1372,7 @@ function BatchFields({ node, kind, onChange }: { node: JobNode; kind?: string; o
   );
 }
 
-const LOAD_MODES: { mode: LoadMode; text: string; hint: string }[] = [
+export const LOAD_MODES: { mode: LoadMode; text: string; hint: string }[] = [
   { mode: "append", text: "Insert", hint: "Insert the rows. A missing table can be created from the rows' columns." },
   { mode: "truncate", text: "Delete rows, then insert", hint: "Delete every row of the table, then insert. A missing table can be created." },
   { mode: "replace", text: "Replace table", hint: "Drop the table if it exists and create it again from the rows' columns, then insert." },
@@ -1517,7 +1517,7 @@ function LoadFields({ job, node, onChange }: { job: Job; node: JobNode; onChange
   );
 }
 
-function DryRunReport({ report }: { report: LoadDryRun }) {
+export function DryRunReport({ report }: { report: LoadDryRun }) {
   const how =
     report.method === "transaction"
       ? `Ran on ${report.sample_rows != null ? `${formatCount(report.sample_rows)} sample rows` : "no rows"} in a transaction, then rolled back`

@@ -67,6 +67,7 @@ function Palette() {
       { id: "new-job", group: "Actions", label: "New job", icon: <Workflow size={14} />, run: () => void useJobs.getState().create() },
       { id: "jobs", group: "Actions", label: "Show jobs", icon: <Workflow size={14} />, run: () => st.setSidebarPanel("jobs") },
       { id: "file", group: "Actions", label: "Query a local file (CSV, Parquet, JSON, Excel)…", icon: <FileSearch size={14} />, run: () => void queryLocalFile() },
+      { id: "import-file", group: "Actions", label: "Import a file (CSV, Excel, Parquet, JSON) into a table…", icon: <FileSearch size={14} />, run: () => void queryLocalFile(true) },
       { id: "ai", group: "AI", label: "Open AI assistant", icon: <Sparkles size={14} />, hint: "⌘L", run: () => useAi.getState().setOpen(true, "chat") },
       { id: "ai-kn", group: "AI", label: "AI knowledge (index schema, notes)", icon: <Sparkles size={14} />, run: () => useAi.getState().setOpen(true, "knowledge") },
       { id: "settings", group: "Actions", label: "Settings: appearance, AI providers, MCP", icon: <Settings2 size={14} />, hint: "⌘,", run: () => st.setSettingsOpen(true) },

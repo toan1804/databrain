@@ -22,6 +22,7 @@ import {
   Lightbulb,
   ChevronRight,
   Square,
+  Upload,
 } from "lucide-react";
 import { EditorView } from "@codemirror/view";
 import { lineOf, locateStatement, useAi } from "../aiStore";
@@ -48,6 +49,7 @@ import { useStore, type StatementRun, type TabRun } from "../store";
 import { optimizePrompt } from "../queryTips";
 import { ResultGrid, type GridHandle } from "./ResultGrid";
 import { SelectionSummaryBar, TransposeDialog, type GridRange } from "./SelectionTools";
+import { LoadIntoDialog } from "./LoadIntoDialog";
 import { Modal, Popover } from "./ui";
 
 export interface ResultsPanelProps {
@@ -415,6 +417,14 @@ export function ResultView({
   const plan = useMemo(() => planFind(findQuery, columnNames, findScope), [findQuery, columnNames, findScope]);
   const [headerMenu, setHeaderMenu] = useState<{ col: number; x: number; y: number } | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
+  const [loadOpen, setLoadOpen] = useState(false);
+  // Importing a file: its result opens "Load into…" once.
+  const loadPending = useStore((s) => !!s.loadIntoOnResult[tabId]);
+  useEffect(() => {
+    if (!loadPending) return;
+    useStore.getState().setLoadIntoOnResult(tabId, false);
+    setLoadOpen(true);
+  }, [loadPending, tabId]);
   const grid = useRef<GridHandle>(null);
   const findInput = useRef<HTMLInputElement>(null);
   const toast = useStore((s) => s.toast);
@@ -546,6 +556,13 @@ export function ResultView({
         >
           <Sparkles size={13} /> Ask AI
         </button>
+        <button
+          className="btn-ghost border border-line py-1"
+          onClick={() => setLoadOpen(true)}
+          title="Copy these rows into a table of any connection (insert, replace, update or merge by key)"
+        >
+          <Upload size={13} /> Load into…
+        </button>
         <button className="btn-ghost border border-line py-1" onClick={() => setExportOpen(true)}>
           <Download size={13} /> Export
         </button>
@@ -671,6 +688,7 @@ export function ResultView({
         <span>{formatBytes(info.bytes)}</span>
       </div>
       {transpose && <TransposeDialog info={info} view={view} range={transpose} onClose={() => setTranspose(null)} />}
+      {loadOpen && <LoadIntoDialog info={info} sql={stmt.output?.sql ?? ""} outputName={stmt.output?.name} onClose={() => setLoadOpen(false)} />}
 
       {headerMenu && (
         <ColumnMenu

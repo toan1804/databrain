@@ -258,6 +258,9 @@ interface State {
 
   newTab: (init?: Partial<Tab>) => string;
   closeTab: (id: string) => void;
+  /** Tabs whose next result opens "Load into…" (importing a file). */
+  loadIntoOnResult: Record<string, boolean>;
+  setLoadIntoOnResult: (tabId: string, on: boolean) => void;
   /** Recently closed tabs, newest last (⌘⇧T reopens them). */
   closedTabs: { tab: Tab; index: number; params?: Record<string, ParamValue> }[];
   /** Reopen the most recently closed tab where it was. False when none. */
@@ -276,6 +279,8 @@ interface State {
     sessionKey?: string,
     outputName?: string | null,
     params?: Record<string, ParamValue>,
+    /** Override the row limit (null = every row). */
+    rowLimit?: number | null,
   ) => Promise<boolean>;
   refreshFolders: (kind?: FolderKind) => Promise<void>;
   refreshNotebooks: () => Promise<void>;
@@ -554,6 +559,14 @@ export const useStore = create<State>((set, get) => ({
   connections: [],
   tabs: [],
   closedTabs: [],
+  loadIntoOnResult: {},
+  setLoadIntoOnResult: (tabId, on) =>
+    set((s) => {
+      const next = { ...s.loadIntoOnResult };
+      if (on) next[tabId] = true;
+      else delete next[tabId];
+      return { loadIntoOnResult: next };
+    }),
   activeTabId: null,
   runs: {},
   savedQueries: [],
@@ -1168,7 +1181,7 @@ export const useStore = create<State>((set, get) => ({
     await get().runSql(tabId, conn.id, sql, base, undefined, undefined, values);
   },
 
-  runSql: async (runKey, connectionId, sql, base = 0, sessionKey, outputName, params) => {
+  runSql: async (runKey, connectionId, sql, base = 0, sessionKey, outputName, params, rowLimit) => {
     const conn = get().connections.find((c) => c.id === connectionId);
     const submit = async (confirmed: boolean): Promise<boolean> => {
       try {
@@ -1177,7 +1190,7 @@ export const useStore = create<State>((set, get) => ({
           tab_id: runKey,
           sql,
           base_offset: base,
-          row_limit: get().rowLimit > 0 ? get().rowLimit : null,
+          row_limit: rowLimit !== undefined ? rowLimit : get().rowLimit > 0 ? get().rowLimit : null,
           confirmed,
           session_key: sessionKey ?? null,
           output_name: outputName ?? null,
