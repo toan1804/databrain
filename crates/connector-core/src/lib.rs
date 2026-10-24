@@ -4,6 +4,7 @@
 //! over a [`QueryStream`], so the grid, filtering and export are engine-agnostic.
 
 pub mod documents;
+pub mod conn_state;
 pub mod error;
 pub mod language;
 pub mod external;
@@ -21,6 +22,7 @@ use async_trait::async_trait;
 use databrain_auth::{AuthContext, CredentialSource};
 
 pub use arrow;
+pub use conn_state::ConnState;
 pub use error::{ConnectorError, ErrorKind, Result};
 pub use stream::{Collected, ExecOptions, ExecSummary, QueryStream, StreamEvent, StreamSender};
 pub use tokio_util::sync::CancellationToken;

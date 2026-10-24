@@ -1,18 +1,19 @@
 //! MySQL / MariaDB connector built on `mysql_async` (text protocol).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use databrain_auth::{AuthMethodKind, Credential, CredentialSource};
 use databrain_connector_core::value::{Column, parse_date, parse_datetime};
 use databrain_connector_core::{
-    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError,
+    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnState, ConnectionConfig, Connector, ConnectorError,
     ConnectorInfo, ConnectorKind, DbObject, ErrorKind, ExecOptions, ExecSummary, FieldSpec, ForeignKey,
     ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, SslMode, StreamEvent, StreamSender,
     TableColumns, Value, quote_ident,
 };
-use mysql_async::consts::{ColumnFlags, ColumnType};
+use mysql_async::consts::{ColumnFlags, ColumnType, StatusFlags};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, OptsBuilder, SslOpts};
 use secrecy::ExposeSecret;
@@ -119,9 +120,10 @@ impl Connector for MysqlConnector {
         };
         let (conn, opts) = conn;
         Ok(Box::new(MysqlSession {
-            conn_id: conn.id(),
+            conn_id: Arc::new(AtomicU32::new(conn.id())),
             conn: Arc::new(Mutex::new(conn)),
             opts,
+            state: Default::default(),
         }))
     }
 }
@@ -142,8 +144,11 @@ fn map_err(e: mysql_async::Error) -> ConnectorError {
 
 pub struct MysqlSession {
     conn: Arc<Mutex<Conn>>,
-    conn_id: u32,
+    /// Thread id of `conn` (it changes when the connection is replaced).
+    conn_id: Arc<AtomicU32>,
     opts: Opts,
+    /// What the connection carries (transactions, SET, USE, temp tables).
+    state: Arc<ConnState>,
 }
 
 fn col_type(c: &mysql_async::Column) -> ColType {
@@ -259,14 +264,31 @@ fn convert(t: ColType, v: mysql_async::Value) -> Value {
     }
 }
 
-async fn run(conn: Arc<Mutex<Conn>>, sql: String, opts: ExecOptions, tx: StreamSender) -> Result<()> {
-    let mut guard = conn.lock().await;
+/// What `run` needs besides the statement.
+struct Ctx {
+    conn: Arc<Mutex<Conn>>,
+    /// Thread id of the current connection (for KILL).
+    conn_id: Arc<AtomicU32>,
+    opts: Opts,
+    state: Arc<ConnState>,
+    /// Set once the statement no longer needs the server: a late cancel must
+    /// not KILL whatever runs next on the connection.
+    finished: Arc<AtomicBool>,
+}
+
+async fn run(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSender) -> Result<()> {
+    let mut guard = ctx.conn.lock().await;
+    ctx.state.observe(&sql, ConnectorKind::Mysql);
+    // An open transaction counts too, also one a procedure started.
+    let in_tx = guard.last_ok_packet().is_some_and(|p| p.status_flags().contains(StatusFlags::SERVER_STATUS_IN_TRANS));
+    let replaceable = ctx.state.replaceable() && !in_tx;
     let mut result = guard.query_iter(sql).await.map_err(map_err)?;
 
     let columns = result.columns().unwrap_or_else(|| Arc::from(Vec::new()));
     if columns.is_empty() {
         let affected = result.affected_rows();
         result.drop_result().await.map_err(map_err)?;
+        ctx.finished.store(true, Ordering::SeqCst);
         tx.send(StreamEvent::Done(ExecSummary {
             rows_affected: Some(affected),
         }))
@@ -285,6 +307,10 @@ async fn run(conn: Arc<Mutex<Conn>>, sql: String, opts: ExecOptions, tx: StreamS
         return Ok(());
     }
 
+    let max = opts.max_rows.unwrap_or(usize::MAX);
+    let mut rows = 0usize;
+    // Stopped before the end: the row limit, or the consumer went away.
+    let mut stopped = false;
     while let Some(row) = result.next().await.map_err(map_err)? {
         let vals = row.unwrap();
         builder.push_row(
@@ -292,16 +318,38 @@ async fn run(conn: Arc<Mutex<Conn>>, sql: String, opts: ExecOptions, tx: StreamS
                 .zip(types.iter())
                 .map(|(v, t)| convert(*t, v)),
         );
+        rows += 1;
+        if rows >= max {
+            stopped = true;
+            break;
+        }
         if builder.is_full() && !tx.send(StreamEvent::Batch(builder.finish()?)).await {
+            stopped = true;
             break;
         }
         if opts.cancel.is_cancelled() {
             return Err(ConnectorError::cancelled());
         }
     }
-    // Drain any additional result sets (e.g. from CALL) so the connection
-    // is ready for the next statement.
-    result.drop_result().await.map_err(map_err)?;
+    if stopped {
+        // The rest of the result is still coming. Reading it takes as long
+        // as the whole result; a clean connection is replaced instead.
+        drop(result);
+        ctx.finished.store(true, Ordering::SeqCst);
+        let replaced = replaceable && replace_conn(ctx, &mut guard).await;
+        if !replaced {
+            // Keep the connection (transaction, settings): stop the
+            // statement on the server, then read what is left.
+            MysqlSession::kill_query(ctx.opts.clone(), ctx.conn_id.load(Ordering::SeqCst)).await;
+            settle_kill(&mut guard).await;
+        }
+    } else {
+        // Drain any additional result sets (e.g. from CALL) so the connection
+        // is ready for the next statement.
+        result.drop_result().await.map_err(map_err)?;
+        ctx.finished.store(true, Ordering::SeqCst);
+    }
+    drop(guard);
     if !builder.is_empty() && !tx.send(StreamEvent::Batch(builder.finish()?)).await {
         return Ok(());
     }
@@ -314,6 +362,40 @@ async fn run(conn: Arc<Mutex<Conn>>, sql: String, opts: ExecOptions, tx: StreamS
     }
     tx.send(StreamEvent::Done(ExecSummary::default())).await;
     Ok(())
+}
+
+/// Open a new connection in place of `conn`, which is still receiving a
+/// result, and end the old one on the server (`KILL` from the new
+/// connection: no extra login). False when no new connection could be
+/// opened; `conn` is then unchanged.
+async fn replace_conn(ctx: &Ctx, conn: &mut Conn) -> bool {
+    let Ok(Ok(mut fresh)) = tokio::time::timeout(Duration::from_secs(5), Conn::new(ctx.opts.clone())).await else {
+        return false;
+    };
+    let old_id = conn.id();
+    let _ = fresh.query_drop(format!("KILL {old_id}")).await;
+    ctx.conn_id.store(fresh.id(), Ordering::SeqCst);
+    // Dropping the old connection reads its remains in the background
+    // until the server's close.
+    drop(std::mem::replace(conn, fresh));
+    ctx.state.reset();
+    true
+}
+
+/// After `KILL QUERY`: read the rest of the interrupted result. If the
+/// statement had already finished, the kill is still pending on the
+/// connection and would stop the next statement: let a no-op take it.
+async fn settle_kill(conn: &mut Conn) {
+    let interrupted = |e: &mysql_async::Error| matches!(e, mysql_async::Error::Server(se) if se.code == 1317);
+    // The dropped result is read before the next command.
+    match conn.query_drop("DO 0").await {
+        Err(e) if interrupted(&e) => {
+            // Either the statement or this no-op took the kill; one more
+            // no-op tells (a second 1317 can't happen).
+            let _ = conn.query_drop("DO 0").await;
+        }
+        _ => {}
+    }
 }
 
 impl MysqlSession {
@@ -353,21 +435,35 @@ impl Session for MysqlSession {
 
     async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
         let (tx, stream) = QueryStream::channel(4);
-        let conn = self.conn.clone();
-        let (kill_opts, id) = (self.opts.clone(), self.conn_id);
+        let ctx = Ctx {
+            conn: self.conn.clone(),
+            conn_id: self.conn_id.clone(),
+            opts: self.opts.clone(),
+            state: self.state.clone(),
+            finished: Arc::new(AtomicBool::new(false)),
+        };
         let sql = sql.to_string();
         tokio::spawn(async move {
             let cancel = opts.cancel.clone();
-            let work = run(conn, sql, opts, tx.clone());
+            let work = run(&ctx, sql, opts, tx.clone());
             tokio::pin!(work);
             let res = tokio::select! {
                 r = &mut work => r,
                 _ = cancel.cancelled() => {
-                    Self::kill_query(kill_opts, id).await;
-                    match tokio::time::timeout(Duration::from_secs(10), &mut work).await {
+                    // Nothing to stop when the statement is done with the
+                    // server (e.g. stopped at the row limit just now).
+                    let kill = !ctx.finished.load(Ordering::SeqCst);
+                    if kill {
+                        Self::kill_query(ctx.opts.clone(), ctx.conn_id.load(Ordering::SeqCst)).await;
+                    }
+                    let r = match tokio::time::timeout(Duration::from_secs(10), &mut work).await {
                         Ok(Ok(())) => Ok(()),
                         _ => Err(ConnectorError::cancelled()),
+                    };
+                    if kill {
+                        settle_kill(&mut *ctx.conn.lock().await).await;
                     }
+                    r
                 }
             };
             if let Err(e) = res {

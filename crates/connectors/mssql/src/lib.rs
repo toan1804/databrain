@@ -3,7 +3,10 @@
 //! Auth: SQL login, Windows (NTLM, `DOMAIN\user`), and Microsoft Entra ID
 //! tokens (browser, device code, service principal or `az login`).
 //! Cancellation drops the connection (TDS attention is not supported by the
-//! driver); the next statement reconnects transparently.
+//! driver); the next statement reconnects transparently. At the row limit a
+//! plain read stops on the server (`SET ROWCOUNT`); other statements stop
+//! reading and replace the connection, unless it carries session state
+//! (`databrain_connector_core::ConnState`), when the rest is read instead.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -151,7 +154,7 @@ impl Connector for MssqlConnector {
         let use_browser = cfg.opt("instance").is_some() && cfg.port.is_none();
         let all_dbs = cfg.database.as_deref().is_none_or(|d| d.trim().is_empty());
         let conn = open(&c, use_browser).await?;
-        Ok(Box::new(MssqlSession { config: c, use_browser, conn: Arc::new(Mutex::new(Some(conn))), all_dbs }))
+        Ok(Box::new(MssqlSession { config: c, use_browser, conn: Arc::new(Mutex::new(Some(conn))), state: Default::default(), user_rowcount: Default::default(), all_dbs }))
     }
 }
 
@@ -205,6 +208,10 @@ pub struct MssqlSession {
     config: Config,
     use_browser: bool,
     conn: Arc<Mutex<Option<Conn>>>,
+    /// What the connection carries (transactions, SET, #temp tables).
+    state: Arc<databrain_connector_core::ConnState>,
+    /// The user ran `SET ROWCOUNT`: the row limit must not reset it.
+    user_rowcount: Arc<std::sync::atomic::AtomicBool>,
     /// No database configured: every accessible database is a catalog and
     /// schema ids are `database.schema` (like Databricks catalogs).
     all_dbs: bool,
@@ -334,15 +341,52 @@ fn is_dml(sql: &str) -> bool {
             .any(|w| w.eq_ignore_ascii_case("OUTPUT"))
 }
 
-async fn run(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
+/// How `run` ended.
+enum Ended {
+    /// The result was read to the end (or the statement returned none).
+    Complete,
+    /// The row limit was reached (`last` still to send) or the consumer went
+    /// away. With `unread`, the rest of the result was not read: the
+    /// connection must not be used again (tiberius would read it first).
+    Stopped { last: Option<databrain_connector_core::arrow::record_batch::RecordBatch>, unread: bool },
+}
+
+/// Run `sql`. A plain read stops on the server at the row limit (`SET
+/// ROWCOUNT`, reset right after; not when the user set ROWCOUNT). Other
+/// statements stop reading at the limit: `replaceable` (the connection
+/// carries no session state) at once, otherwise after reading the rest so
+/// the connection, and its transaction or settings, stay usable.
+async fn run(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &StreamSender, replaceable: bool, user_rowcount: bool) -> Result<Ended> {
     if is_dml(sql) {
         let r = conn.execute(sql, &[]).await.map_err(map_err)?;
         tx.send(StreamEvent::Done(ExecSummary { rows_affected: Some(r.rows_affected().iter().sum()) })).await;
-        return Ok(());
+        return Ok(Ended::Complete);
     }
+    let server_cap = opts
+        .max_rows
+        .filter(|_| !user_rowcount && databrain_connector_core::sql::classify(sql, ConnectorKind::Mssql).kind.is_read());
+    let Some(n) = server_cap else {
+        return read(conn, sql, opts, tx, replaceable).await;
+    };
+    // Same line: error line numbers stay those of the user's SQL.
+    let r = read(conn, &format!("set rowcount {n}; {sql}"), opts, tx, false).await;
+    let reset = match conn.simple_query("set rowcount 0").await {
+        Ok(s) => s.into_results().await.map(|_| ()).map_err(map_err),
+        Err(e) => Err(map_err(e)),
+    };
+    // The statement's own error comes first.
+    let ended = r?;
+    reset?;
+    Ok(ended)
+}
+
+async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &StreamSender, replaceable: bool) -> Result<Ended> {
     let mut stream = conn.simple_query(sql).await.map_err(map_err)?;
     let mut builder: Option<BatchBuilder> = None;
     let mut extra_sets = 0usize;
+    let mut rows = 0usize;
+    let max = opts.max_rows.unwrap_or(usize::MAX);
+    let gone = Ended::Stopped { last: None, unread: true };
     while let Some(item) = stream.next().await {
         match item.map_err(map_err)? {
             QueryItem::Metadata(meta) => {
@@ -360,7 +404,7 @@ async fn run(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &StreamSender) 
                     .collect();
                 let b = BatchBuilder::new(&cols, opts.batch_size.max(1));
                 if !tx.send(StreamEvent::Schema(b.schema())).await {
-                    return Ok(());
+                    return Ok(gone);
                 }
                 builder = Some(b);
             }
@@ -370,22 +414,34 @@ async fn run(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &StreamSender) 
                 }
                 let Some(b) = builder.as_mut() else { continue };
                 b.push_row(row.into_iter().map(convert));
+                rows += 1;
+                if rows >= max {
+                    // The caller keeps no more rows.
+                    let last = if b.is_empty() { None } else { Some(b.finish()?) };
+                    if replaceable {
+                        return Ok(Ended::Stopped { last, unread: true });
+                    }
+                    while let Some(item) = stream.next().await {
+                        item.map_err(map_err)?;
+                    }
+                    return Ok(Ended::Stopped { last, unread: false });
+                }
                 if b.is_full() && !tx.send(StreamEvent::Batch(b.finish()?)).await {
-                    return Ok(());
+                    return Ok(gone);
                 }
             }
         }
     }
     if let Some(b) = builder.as_mut() {
         if !b.is_empty() && !tx.send(StreamEvent::Batch(b.finish()?)).await {
-            return Ok(());
+            return Ok(Ended::Complete);
         }
     }
     if extra_sets > 0 {
         tx.send(StreamEvent::Notice(format!("{extra_sets} additional result set(s) not shown"))).await;
     }
     tx.send(StreamEvent::Done(ExecSummary::default())).await;
-    Ok(())
+    Ok(Ended::Complete)
 }
 
 impl MssqlSession {
@@ -393,6 +449,7 @@ impl MssqlSession {
         let mut g = self.conn.lock().await;
         if g.is_none() {
             *g = Some(open(&self.config, self.use_browser).await?);
+            self.state.reset();
         }
         let r = f(g.as_mut().expect("connected")).await;
         if matches!(&r, Err(e) if e.kind == databrain_connector_core::ErrorKind::Connection) {
@@ -674,30 +731,66 @@ impl Session for MssqlSession {
     async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
         let (tx, stream) = QueryStream::channel(4);
         let conn = self.conn.clone();
+        let state = self.state.clone();
+        let user_rowcount = self.user_rowcount.clone();
         let (config, browser) = (self.config.clone(), self.use_browser);
         let sql = sql.to_string();
         tokio::spawn(async move {
             let mut g = conn.lock().await;
             if g.is_none() {
                 match open(&config, browser).await {
-                    Ok(c) => *g = Some(c),
+                    Ok(c) => {
+                        *g = Some(c);
+                        state.reset();
+                    }
                     Err(e) => {
                         tx.send_err(e).await;
                         return;
                     }
                 }
             }
+            state.observe(&sql, ConnectorKind::Mssql);
+            let replaceable = state.replaceable();
+            let lower = sql.to_ascii_lowercase();
+            if lower.contains("rowcount") && lower.contains("set") {
+                user_rowcount.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let user_rowcount = user_rowcount.load(std::sync::atomic::Ordering::SeqCst);
             let c = g.as_mut().expect("connected");
             let res = tokio::select! {
-                r = run(c, &sql, &opts, &tx) => r,
+                r = run(c, &sql, &opts, &tx, replaceable, user_rowcount) => r,
                 _ = opts.cancel.cancelled() => Err(ConnectorError::cancelled()),
             };
-            if let Err(e) = res {
-                if e.is_cancelled() || e.kind == databrain_connector_core::ErrorKind::Connection {
-                    // Connection state is unknown after an aborted read.
-                    *g = None;
+            match res {
+                Ok(Ended::Complete) => {}
+                Ok(Ended::Stopped { last, unread }) => {
+                    if unread {
+                        // Stopped mid-result: reading the rest would take as
+                        // long as the whole result. Close this connection
+                        // (the server stops sending) and open a new one for
+                        // the next statement.
+                        *g = None;
+                    }
+                    drop(g);
+                    if let Some(b) = last {
+                        if !tx.send(StreamEvent::Batch(b)).await {
+                            return;
+                        }
+                    }
+                    tx.send(StreamEvent::Done(ExecSummary::default())).await;
                 }
-                tx.send_err(e).await;
+                Err(mut e) => {
+                    if e.is_cancelled() || e.kind == databrain_connector_core::ErrorKind::Connection {
+                        // Connection state is unknown after an aborted read.
+                        *g = None;
+                        if e.is_cancelled() && !replaceable {
+                            e.message.push_str(
+                                ". SQL Server statements can only be stopped by closing the connection: its open transaction, SET options and #temp tables are gone",
+                            );
+                        }
+                    }
+                    tx.send_err(e).await;
+                }
             }
         });
         Ok(stream)
@@ -1081,7 +1174,7 @@ mod tests {
         let b = each_db(&["a".into(), "b".into()], "select db_name()");
         assert_eq!(b.matches("begin try exec").count(), 2);
         assert!(b.contains("[b].sys.sp_executesql"));
-        let s = MssqlSession { config: Config::new(), use_browser: false, conn: Arc::new(Mutex::new(None)), all_dbs: true };
+        let s = MssqlSession { config: Config::new(), use_browser: false, conn: Arc::new(Mutex::new(None)), state: Default::default(), user_rowcount: Default::default(), all_dbs: true };
         assert_eq!(s.split("shop.dbo"), (Some("shop"), "dbo"));
         assert_eq!(s.id(Some("shop"), "dbo"), "shop.dbo");
         let two = MssqlSession { all_dbs: false, ..s };

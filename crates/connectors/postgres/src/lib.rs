@@ -7,13 +7,14 @@
 //! common types become typed Arrow columns for sorting and filtering.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use databrain_auth::{AuthMethodKind, Credential, CredentialSource};
 use databrain_connector_core::value::{Column, parse_date, parse_datetime, parse_time};
 use databrain_connector_core::{
-    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError,
+    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnState, ConnectionConfig, Connector, ConnectorError,
     ConnectorInfo, ConnectorKind, DbObject, ExecOptions, ExecSummary, FieldSpec, ForeignKey, ObjectDetail,
     ObjectKind, QueryStream, Result, SchemaInfo, Session, SslMode, StreamEvent, StreamSender, TableColumns,
     Value,
@@ -120,19 +121,61 @@ impl Connector for PostgresConnector {
             SslMode::Require | SslMode::VerifyFull => tokio_postgres::config::SslMode::Require,
         });
         let tls = tls_connector(cfg.ssl_mode)?;
-        let (client, connection) = pg.connect(tls.clone()).await.map_err(|e| {
-            let mut ce = map_err(&e);
-            ce.kind = databrain_connector_core::ErrorKind::Connection;
-            ce
-        })?;
-        tokio::spawn(async move {
-            // Ends when the client is dropped or the socket closes.
-            let _ = connection.await;
-        });
+        let (client, task) = open_link(&pg, tls.clone()).await?;
         Ok(Box::new(PgSession {
-            client: Arc::new(client),
+            link: Arc::new(Link { pg, tls: tls.clone(), current: std::sync::RwLock::new((Arc::new(client), task)), state: ConnState::new() }),
             tls,
         }))
+    }
+}
+
+/// Connect and run the connection's I/O task.
+async fn open_link(pg: &tokio_postgres::Config, tls: MakeTlsConnector) -> Result<(Client, tokio::task::AbortHandle)> {
+    let (client, connection) = pg.connect(tls).await.map_err(|e| {
+        let mut ce = map_err(&e);
+        ce.kind = databrain_connector_core::ErrorKind::Connection;
+        ce
+    })?;
+    // Ends when the client is dropped, the socket closes, or it is aborted.
+    let task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    Ok((client, task.abort_handle()))
+}
+
+/// The session's connection, replaceable: a result cut at the row limit
+/// would otherwise keep arriving (the connection reads and discards it up
+/// to the end before the next statement).
+struct Link {
+    pg: tokio_postgres::Config,
+    tls: MakeTlsConnector,
+    current: std::sync::RwLock<(Arc<Client>, tokio::task::AbortHandle)>,
+    /// What the connection carries (transactions, SET, temp tables).
+    state: ConnState,
+}
+
+impl Link {
+    fn client(&self) -> Arc<Client> {
+        self.current.read().unwrap_or_else(|e| e.into_inner()).0.clone()
+    }
+
+    /// Put a new connection in place of `old` and close `old` (the server
+    /// stops sending when its socket goes away). False when no new
+    /// connection could be opened; nothing changes then.
+    async fn replace(&self, old: &Arc<Client>) -> bool {
+        let Ok(Ok((client, task))) = tokio::time::timeout(Duration::from_secs(15), open_link(&self.pg, self.tls.clone())).await else {
+            return false;
+        };
+        let mut cur = self.current.write().unwrap_or_else(|e| e.into_inner());
+        if !Arc::ptr_eq(&cur.0, old) {
+            // Replaced meanwhile (can't happen: one statement at a time).
+            task.abort();
+            return true;
+        }
+        let (_, old_task) = std::mem::replace(&mut *cur, (Arc::new(client), task));
+        old_task.abort();
+        self.state.reset();
+        true
     }
 }
 
@@ -174,8 +217,14 @@ fn map_err(e: &tokio_postgres::Error) -> ConnectorError {
 }
 
 pub struct PgSession {
-    client: Arc<Client>,
+    link: Arc<Link>,
     tls: MakeTlsConnector,
+}
+
+impl PgSession {
+    fn client(&self) -> Arc<Client> {
+        self.link.client()
+    }
 }
 
 /// The type as Postgres writes it (`format_type`): `character varying(255)`,
@@ -287,15 +336,19 @@ fn parse_timestamptz(s: &str) -> Option<i64> {
 }
 
 async fn run(
-    client: Arc<Client>,
+    link: Arc<Link>,
     sql: String,
     opts: ExecOptions,
     tx: StreamSender,
+    finished: Arc<AtomicBool>,
 ) -> Result<()> {
+    link.state.observe(&sql, ConnectorKind::Postgres);
+    let client = link.client();
     let stmt = client.prepare(&sql).await.map_err(|e| map_err(&e))?;
 
     if stmt.columns().is_empty() {
         let msgs = client.simple_query(&sql).await.map_err(|e| map_err(&e))?;
+        finished.store(true, Ordering::SeqCst);
         let affected = msgs.iter().rev().find_map(|m| match m {
             SimpleQueryMessage::CommandComplete(n) => Some(*n),
             _ => None,
@@ -324,6 +377,10 @@ async fn run(
     let stream = client.simple_query_raw(&sql).await.map_err(|e| map_err(&e))?;
     futures::pin_mut!(stream);
     let mut seen_first_set = false;
+    let max = opts.max_rows.unwrap_or(usize::MAX);
+    let mut rows = 0usize;
+    // Stopped before the end: the row limit, or the consumer went away.
+    let mut stopped = false;
     while let Some(msg) = stream.next().await {
         match msg.map_err(|e| map_err(&e))? {
             SimpleQueryMessage::RowDescription(_) => {
@@ -339,8 +396,14 @@ async fn run(
                     Some(s) => parse_text(*t, s),
                 });
                 builder.push_row(vals);
+                rows += 1;
+                if rows >= max {
+                    stopped = true;
+                    break;
+                }
                 if builder.is_full() && !tx.send(StreamEvent::Batch(builder.finish()?)).await {
-                    return Ok(());
+                    stopped = true;
+                    break;
                 }
             }
             SimpleQueryMessage::CommandComplete(_) => {}
@@ -350,6 +413,29 @@ async fn run(
             return Err(ConnectorError::cancelled());
         }
     }
+    if stopped {
+        // The rest of the result is still coming, and the connection reads
+        // it all before the next statement. A clean connection is replaced
+        // instead; one with a transaction or settings is kept.
+        finished.store(true, Ordering::SeqCst);
+        let replaced = link.state.replaceable() && link.replace(&client).await;
+        if !replaced {
+            if !link.state.in_transaction() {
+                // Outside a transaction a cancel loses nothing; inside one
+                // it would abort the transaction, so the rest is read.
+                let _ = client.cancel_token().cancel_query(link.tls.clone()).await;
+            }
+            while let Some(msg) = stream.next().await {
+                if let Err(e) = msg {
+                    if map_err(&e).is_cancelled() {
+                        break;
+                    }
+                    return Err(map_err(&e));
+                }
+            }
+        }
+    }
+    finished.store(true, Ordering::SeqCst);
     if !builder.is_empty() && !tx.send(StreamEvent::Batch(builder.finish()?)).await {
         return Ok(());
     }
@@ -372,7 +458,7 @@ impl Session for PgSession {
 
     async fn server_version(&self) -> Result<String> {
         let row = self
-            .client
+            .client()
             .query_one("select version()", &[])
             .await
             .map_err(|e| map_err(&e))?;
@@ -380,7 +466,7 @@ impl Session for PgSession {
     }
 
     async fn ping(&self) -> Result<()> {
-        self.client
+        self.client()
             .simple_query("select 1")
             .await
             .map(|_| ())
@@ -389,20 +475,25 @@ impl Session for PgSession {
 
     async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
         let (tx, stream) = QueryStream::channel(4);
-        let client = self.client.clone();
-        let cancel_token = client.cancel_token();
+        let link = self.link.clone();
+        let cancel_token = link.client().cancel_token();
         let tls = self.tls.clone();
         let sql = sql.to_string();
+        let finished = Arc::new(AtomicBool::new(false));
         tokio::spawn(async move {
             let cancel = opts.cancel.clone();
-            let work = run(client, sql, opts, tx.clone());
+            let work = run(link, sql, opts, tx.clone(), finished.clone());
             tokio::pin!(work);
             let res = tokio::select! {
                 r = &mut work => r,
                 _ = cancel.cancelled() => {
                     // Ask the server to cancel, then let the query finish with
-                    // its cancellation error (bounded wait).
-                    let _ = cancel_token.cancel_query(tls).await;
+                    // its cancellation error (bounded wait). Not when the
+                    // statement is done with the server (e.g. stopped at the
+                    // row limit just now): the cancel could hit the next one.
+                    if !finished.load(Ordering::SeqCst) {
+                        let _ = cancel_token.cancel_query(tls).await;
+                    }
                     match tokio::time::timeout(Duration::from_secs(10), &mut work).await {
                         Ok(Ok(())) => Ok(()),
                         _ => Err(ConnectorError::cancelled()),
@@ -419,7 +510,7 @@ impl Session for PgSession {
 
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>> {
         let rows = self
-            .client
+            .client()
             .query(
                 "select nspname::text, nspname = current_schema() \
                  from pg_catalog.pg_namespace \
@@ -441,7 +532,7 @@ impl Session for PgSession {
 
     async fn schema_object_counts(&self) -> Result<Option<std::collections::HashMap<String, usize>>> {
         let rows = self
-            .client
+            .client()
             .query(
                 "select n.nspname::text, count(*) from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
                  where c.relkind in ('r','p','v','m','f') and not c.relispartition group by 1",
@@ -455,7 +546,7 @@ impl Session for PgSession {
     async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
         let term = databrain_connector_core::search_sql_term(query);
         let rows = self
-            .client
+            .client()
             .query(
                 "select n.nspname::text, c.relname::text, c.relkind::text, \
                         obj_description(c.oid, 'pg_class'), c.reltuples::float8 \
@@ -495,7 +586,7 @@ impl Session for PgSession {
     async fn search_schema(&self, schema: &str, query: &str, limit: usize) -> Result<Vec<DbObject>> {
         let term = databrain_connector_core::search_sql_term(query);
         let rows = self
-            .client
+            .client()
             .query(
                 "select c.relname::text, c.relkind::text, obj_description(c.oid, 'pg_class'), c.reltuples::float8 \
                  from pg_catalog.pg_class c \
@@ -533,7 +624,7 @@ impl Session for PgSession {
     async fn search_routines(&self, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<DbObject>> {
         let term = databrain_connector_core::search_sql_term(query);
         let rows = self
-            .client
+            .client()
             .query(
                 "select distinct on (n.nspname, p.proname) n.nspname::text, p.proname::text, p.prokind::text \
                  from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace \
@@ -559,10 +650,10 @@ impl Session for PgSession {
     /// key, other indexes and comments. Views as before. Functions and
     /// procedures: pg_get_functiondef (all overloads).
     async fn object_ddl(&self, schema: &str, name: &str, kind: ObjectKind) -> Result<Option<String>> {
-        let q = |sql: &'static str, oid: u32| async move { self.client.query(sql, &[&oid]).await.map_err(|e| map_err(&e)) };
+        let q = |sql: &'static str, oid: u32| async move { self.client().query(sql, &[&oid]).await.map_err(|e| map_err(&e)) };
         if matches!(kind, ObjectKind::Function | ObjectKind::Procedure) {
             let rows = self
-                .client
+                .client()
                 .query(
                     "select pg_catalog.pg_get_functiondef(p.oid) from pg_catalog.pg_proc p \
                      join pg_catalog.pg_namespace n on n.oid = p.pronamespace \
@@ -583,7 +674,7 @@ impl Session for PgSession {
         }
         // Names quoted the way Postgres prints them (only when needed).
         let head = self
-            .client
+            .client()
             .query_one(
                 "select c.oid, format('%I.%I', n.nspname, c.relname) from pg_catalog.pg_class c \
                  join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = $1 and c.relname = $2",
@@ -676,7 +767,7 @@ impl Session for PgSession {
     /// overloads), so any DDL on any of them changes the value.
     async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         let rows = self
-            .client
+            .client()
             .query(
                 "with rel as (select c.oid, c.relnamespace ns, c.xmin, c.relname from pg_catalog.pg_class c \
                               where c.relkind in ('r','p','v','m','f','S') and not c.relispartition), \
@@ -699,7 +790,7 @@ impl Session for PgSession {
 
     async fn object_versions(&self, schema: &str) -> Result<Option<std::collections::HashMap<String, String>>> {
         let rows = self
-            .client
+            .client()
             .query(
                 "select case c.relkind when 'v' then 'view' when 'm' then 'materialized_view' when 'f' then 'foreign_table' \
                           when 'S' then 'sequence' else 'table' end || ':' || c.relname, \
@@ -776,7 +867,7 @@ impl Session for PgSession {
 
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let obj = self
-            .client
+            .client()
             .query_opt(
                 "select c.oid, c.relkind::text, obj_description(c.oid, 'pg_class'), c.reltuples::float8 \
                  from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
@@ -796,7 +887,7 @@ impl Session for PgSession {
         };
 
         let cols = self
-            .client
+            .client()
             .query(
                 "select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod), \
                         not a.attnotnull, \
@@ -827,7 +918,7 @@ impl Session for PgSession {
         let ddl = match kind {
             ObjectKind::View | ObjectKind::MaterializedView => {
                 let def: Option<String> = self
-                    .client
+                    .client()
                     .query_one("select pg_catalog.pg_get_viewdef($1::oid, true)", &[&oid])
                     .await
                     .map_err(|e| map_err(&e))?
@@ -870,7 +961,7 @@ impl Session for PgSession {
     /// catalog row versions (xmin), so the value changes.
     async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         let rows = self
-            .client
+            .client()
             .query(
                 "with rel as ( \
                    select c.relnamespace ns, count(*) n, \
@@ -909,7 +1000,7 @@ impl Session for PgSession {
 
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
         let rows = self
-            .client
+            .client()
             .query(
                 "select c.relname::text, a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod), \
                         not a.attnotnull, coalesce(a.attnum = any(i.indkey), false), \
@@ -954,7 +1045,7 @@ impl PgSession {
     async fn list_objects_filtered(&self, schema: &str, names: Option<&[String]>) -> Result<Vec<DbObject>> {
         let names: Option<Vec<String>> = names.map(<[String]>::to_vec);
         let rows = self
-            .client
+            .client()
             .query(
                 "select c.relname::text, c.relkind::text, \
                         obj_description(c.oid, 'pg_class'), c.reltuples::float8 \
@@ -990,7 +1081,7 @@ impl PgSession {
             .collect();
 
         let funcs = self
-            .client
+            .client()
             .query(
                 "select p.proname::text, p.prokind::text \
                  from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace \
@@ -1021,7 +1112,7 @@ impl PgSession {
     async fn bulk_metadata_batched(&self, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
         let names: Vec<String> = schemas.to_vec();
         let objects = self
-            .client
+            .client()
             .query(
                 "select n.nspname::text, c.relname::text, c.relkind::text, d.description, c.reltuples::float8 \
                  from pg_catalog.pg_class c \
@@ -1051,7 +1142,7 @@ impl PgSession {
             })
             .collect();
         let columns = self
-            .client
+            .client()
             .query(
                 "select n.nspname::text, c.relname::text, a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod), \
                         not a.attnotnull, coalesce(a.attnum = any(i.indkey), false), d.description \
@@ -1083,7 +1174,7 @@ impl PgSession {
     /// Foreign keys of the tables of several schemas: (schema, table, key).
     async fn foreign_keys_in(&self, schemas: &[String], table: Option<&str>) -> Result<Vec<(String, String, ForeignKey)>> {
         let rows = self
-            .client
+            .client()
             .query(
                 "select n.nspname::text, c.relname::text, \
                         array(select a.attname::text from unnest(k.conkey) with ordinality u(n, o) \
@@ -1112,7 +1203,7 @@ impl PgSession {
     /// Foreign keys of one table (or all tables of the schema).
     async fn foreign_keys(&self, schema: &str, table: Option<&str>) -> Result<Vec<(String, ForeignKey)>> {
         let rows = self
-            .client
+            .client()
             .query(
                 "select c.relname::text, \
                         array(select a.attname::text from unnest(k.conkey) with ordinality u(n, o) \
