@@ -23,6 +23,7 @@ import {
   ChevronRight,
   Square,
   Upload,
+  Pencil,
 } from "lucide-react";
 import { EditorView } from "@codemirror/view";
 import { lineOf, locateStatement, useAi } from "../aiStore";
@@ -34,7 +35,8 @@ import { OutputChip } from "./OutputChip";
 import { mentionInAi, outputLabel } from "../outputs";
 import { planFind } from "../lib/find";
 import { api, toError } from "../lib/api";
-import type { ColumnStats, ExportFormat, FilterOp, ResultInfo, ViewSpec } from "../lib/types";
+import type { ColumnStats, EditStatement, EditTarget, ExportFormat, FilterOp, ResultInfo, ViewSpec } from "../lib/types";
+import { editCount, emptyEdits, toChanges, type PendingEdits } from "../lib/gridEdits";
 import {
   FILTER_OPS,
   emptyView,
@@ -45,7 +47,7 @@ import {
   sqlPreview,
   upsertFilter,
 } from "../lib/util";
-import { useStore, type StatementRun, type TabRun } from "../store";
+import { isQueryTab, useStore, type StatementRun, type TabRun } from "../store";
 import { optimizePrompt } from "../queryTips";
 import { ResultGrid, type GridHandle } from "./ResultGrid";
 import { SelectionSummaryBar, TransposeDialog, type GridRange } from "./SelectionTools";
@@ -429,6 +431,62 @@ export function ResultView({
   const findInput = useRef<HTMLInputElement>(null);
   const toast = useStore((s) => s.toast);
 
+  // Editing the result's table: pending changes, previewed and saved as SQL.
+  const [target, setTarget] = useState<EditTarget | null>(null);
+  const [edits, setEdits] = useState<PendingEdits>(emptyEdits);
+  const [preview, setPreview] = useState<EditStatement[] | null>(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    setTarget(null);
+    setEdits(emptyEdits());
+  }, [info.id]);
+  const changes = editCount(edits);
+
+  const startEditing = async () => {
+    try {
+      setTarget(await api.editTarget(info.id));
+      setMode("grid");
+    } catch (e) {
+      toast(toError(e).message, "error");
+    }
+  };
+  const stopEditing = () => {
+    if (changes && !window.confirm(`Discard ${changes} unsaved change${changes === 1 ? "" : "s"}?`)) return;
+    setTarget(null);
+    setEdits(emptyEdits());
+  };
+  const showPreview = async () => {
+    if (!target) return;
+    try {
+      setPreview(await api.editPreview(info.id, target, toChanges(edits)));
+    } catch (e) {
+      toast(toError(e).message, "error");
+    }
+  };
+  const saveEdits = async () => {
+    if (!target || !changes) return;
+    setSaving(true);
+    try {
+      const r = await api.applyEdits(info.id, toChanges(edits));
+      setPreview(null);
+      setEdits(emptyEdits());
+      toast(
+        `${formatCount(r.rows)} row${r.rows === 1 ? "" : "s"} changed${r.in_open_transaction ? " in the open transaction — COMMIT to keep" : ""}`,
+        "success",
+      );
+      // Refresh the result from the database (same run key and session).
+      const sql = stmt.output?.sql;
+      if (sql && connId && isQueryTab(tab)) void useStore.getState().runSql(tabId, connId, sql);
+      else if (sql && connId && tabId.startsWith("nb:"))
+        void useStore.getState().runSql(tabId, connId, sql, 0, tabId.split(":").slice(0, 2).join(":"), stmt.output?.name);
+      else toast("Re-run the query to see the saved rows", "info");
+    } catch (e) {
+      toast(toError(e).message, "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
   // Debounced quick filter.
   useEffect(() => {
     const t = setTimeout(() => setView((v) => ({ ...v, quick_filter: quick.trim() || null })), 250);
@@ -557,6 +615,14 @@ export function ResultView({
           <Sparkles size={13} /> Ask AI
         </button>
         <button
+          className={`btn-ghost border py-1 ${target ? "border-accent text-accent" : "border-line"}`}
+          aria-pressed={!!target}
+          onClick={() => (target ? stopEditing() : void startEditing())}
+          title="Edit cells, add and delete rows of the table this result comes from (needs a primary key)"
+        >
+          <Pencil size={13} /> Edit
+        </button>
+        <button
           className="btn-ghost border border-line py-1"
           onClick={() => setLoadOpen(true)}
           title="Copy these rows into a table of any connection (insert, replace, update or merge by key)"
@@ -652,6 +718,36 @@ export function ResultView({
         </div>
       )}
 
+      {target && (
+        <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line bg-accent/8 px-2 text-[12px]">
+          <Pencil size={13} className="text-accent" />
+          <span className="truncate">
+            Editing <span className="font-mono">{target.schema ? `${target.schema}.` : ""}{target.table}</span>
+          </span>
+          <span className="text-muted" aria-live="polite">
+            · {changes ? `${formatCount(changes)} change${changes === 1 ? "" : "s"}` : "double-click a cell to change it, right-click for rows"}
+          </span>
+          {target.apply === "statements" && (
+            <span className="rounded bg-warning/15 px-1.5 text-warning" title="This database has no transactions here: changes are written one statement at a time">
+              no rollback
+            </span>
+          )}
+          <span className="ml-auto" />
+          <button className="btn-ghost h-6 py-0 text-[11.5px]" disabled={!changes} onClick={() => void showPreview()}>
+            Preview SQL
+          </button>
+          <button className="btn-ghost h-6 py-0 text-[11.5px]" disabled={!changes} onClick={() => setEdits(emptyEdits())}>
+            Discard
+          </button>
+          <button className="btn-primary h-6 py-0 text-[11.5px]" disabled={!changes || saving} onClick={() => void saveEdits()}>
+            {saving ? <Loader2 size={12} className="animate-spin" /> : null} Save
+          </button>
+          <button className="btn-ghost h-6 py-0 text-[11.5px]" onClick={stopEditing}>
+            Done editing
+          </button>
+        </div>
+      )}
+
       <div className="min-h-0 flex-1">
         {mode === "chart" ? (
           <ChartView info={info} view={view} />
@@ -668,6 +764,7 @@ export function ResultView({
           dialect={conn?.config.kind}
           onSelectionRange={setSelRange}
           onTranspose={setTranspose}
+          edit={target ? { target, edits, onEdits: setEdits } : null}
         />
         )}
       </div>
@@ -689,6 +786,35 @@ export function ResultView({
       </div>
       {transpose && <TransposeDialog info={info} view={view} range={transpose} onClose={() => setTranspose(null)} />}
       {loadOpen && <LoadIntoDialog info={info} sql={stmt.output?.sql ?? ""} outputName={stmt.output?.name} onClose={() => setLoadOpen(false)} />}
+      {preview && (
+        <Modal
+          title="SQL to save"
+          width={720}
+          onClose={() => setPreview(null)}
+          footer={
+            <>
+              <button className="btn-ghost" onClick={() => void navigator.clipboard.writeText(preview.map((s) => `${s.sql};`).join("\n"))}>
+                Copy
+              </button>
+              <button className="btn-ghost" onClick={() => setPreview(null)}>
+                Close
+              </button>
+              <button className="btn-primary" disabled={saving} onClick={() => void saveEdits()}>
+                Save
+              </button>
+            </>
+          }
+        >
+          <p className="mb-2 text-[12px] text-muted">
+            {target?.apply === "statements"
+              ? "Run one by one: this database has no transaction to roll back."
+              : "Run in one transaction; each UPDATE and DELETE must change exactly one row or everything is rolled back."}
+          </p>
+          <pre className="max-h-[50vh] overflow-auto rounded-md border border-line bg-panel-2 p-2 font-mono text-[11.5px]">
+            {preview.map((s) => `${s.sql};`).join("\n")}
+          </pre>
+        </Modal>
+      )}
 
       {headerMenu && (
         <ColumnMenu

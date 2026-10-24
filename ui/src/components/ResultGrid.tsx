@@ -14,9 +14,10 @@ import {
   type Theme,
 } from "@glideapps/glide-data-grid";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { ArrowDown, ArrowUp, Ban, Copy, Filter, FilterX, Rows3, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Ban, Copy, Filter, FilterX, Rows3, Trash2, Undo2, X } from "lucide-react";
 import { api, toError } from "../lib/api";
-import type { ColumnMeta, ExportFormat, ResultInfo, ViewSpec } from "../lib/types";
+import type { ColumnMeta, EditTarget, ExportFormat, ResultInfo, ViewSpec } from "../lib/types";
+import { addRow, removeNewRow, revertRows, setCell, setNewCell, toggleDelete, type PendingEdits } from "../lib/gridEdits";
 import { pageRange, toggleSort, upsertFilter } from "../lib/util";
 import { columnTypeInfo, engineName } from "../lib/columnType";
 import { useStore } from "../store";
@@ -125,16 +126,24 @@ interface Props {
   onSelectionRange?: (range: { cols: number[]; offset: number; limit: number } | null) => void;
   /** "Transpose selected rows" from the cell menu. */
   onTranspose?: (range: { cols: number[]; offset: number; limit: number }) => void;
+  /** Editing: cells of the target table's columns can be changed. */
+  edit?: { target: EditTarget; edits: PendingEdits; onEdits: (e: PendingEdits) => void } | null;
 }
 
+const CHANGED_BG = "rgba(250, 204, 21, 0.20)";
+const DELETED_BG = "rgba(239, 68, 68, 0.14)";
+const NEW_BG = "rgba(34, 197, 94, 0.12)";
+
 export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
-  { info, view, onViewChange, onHeaderMenu, onViewRows, findMatches, findCurrent, dialect, onSelectionRange, onTranspose },
+  { info, view, onViewChange, onHeaderMenu, onViewRows, findMatches, findCurrent, dialect, onSelectionRange, onTranspose, edit },
   ref,
 ) {
   const theme = useGridTheme();
   const toast = useStore((s) => s.toast);
   const gridRef = useRef<DataEditorRef>(null);
   const pages = useRef(new Map<number, (string | null)[][]>());
+  /** Original row ids of each page (editing finds rows by them). */
+  const pageIds = useRef(new Map<number, number[]>());
   const inflight = useRef(new Set<number>());
   const generation = useRef(0);
   const visible = useRef<Rectangle>({ x: 0, y: 0, width: 10, height: 40 });
@@ -164,6 +173,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         const page = await api.fetchPage(info.id, view, p * PAGE, PAGE);
         if (gen !== generation.current) return;
         pages.current.set(p, page.rows);
+        pageIds.current.set(p, page.row_ids);
         setRows(page.view_rows);
         onViewRows(page.view_rows);
         if (!autoSized.current && p === 0) {
@@ -188,6 +198,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
   useEffect(() => {
     generation.current++;
     pages.current.clear();
+    pageIds.current.clear();
     inflight.current.clear();
     const r = visible.current;
     void fetchPage(0);
@@ -227,28 +238,92 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
     [info.columns, view.sort, view.filters, widths],
   );
 
+  /** Original row id and fetched key values of a view row (null when not fetched). */
+  const rowIdentity = useCallback(
+    (row: number): { id: number; key: (string | null)[] } | null => {
+      const p = Math.floor(row / PAGE);
+      const id = pageIds.current.get(p)?.[row % PAGE];
+      const r = pages.current.get(p)?.[row % PAGE];
+      if (id === undefined || !r || !edit) return null;
+      return { id, key: edit.target.key_columns.map((k) => r[k] ?? null) };
+    },
+    [edit],
+  );
+
   const getCellContent = useCallback(
     ([col, row]: Item): GridCell => {
+      const fam = info.columns[col]?.family;
+      const align = fam === "number" ? "right" : "left";
+      const editable = !!edit && edit.target.columns[col] != null;
+      // New rows (editing) come after the fetched ones.
+      if (edit && row >= rows) {
+        const vals = edit.edits.inserts[row - rows];
+        const has = vals?.has(col);
+        const v = vals?.get(col);
+        return {
+          kind: GridCellKind.Text,
+          data: v ?? "",
+          displayData: !has ? (editable ? "(default)" : "") : v === null ? "NULL" : cellPreview(v ?? ""),
+          allowOverlay: editable,
+          readonly: !editable,
+          style: has && v !== null ? "normal" : "faded",
+          themeOverride: { bgCell: NEW_BG },
+          contentAlign: align,
+        };
+      }
       const page = pages.current.get(Math.floor(row / PAGE));
       if (!page) return { kind: GridCellKind.Loading, allowOverlay: false };
-      const v = page[row % PAGE]?.[col];
+      let v = page[row % PAGE]?.[col];
       if (v === undefined) return { kind: GridCellKind.Loading, allowOverlay: false };
-      if (v === null) {
-        return { kind: GridCellKind.Text, data: "", displayData: "NULL", allowOverlay: false, style: "faded", copyData: "" };
+      let themeOverride: Partial<Theme> | undefined;
+      let deleted = false;
+      if (edit) {
+        const id = pageIds.current.get(Math.floor(row / PAGE))?.[row % PAGE];
+        if (id !== undefined && edit.edits.deletes.has(id)) {
+          deleted = true;
+          themeOverride = { bgCell: DELETED_BG, textDark: cssVar("--muted") };
+        } else {
+          const u = id !== undefined ? edit.edits.updates.get(id) : undefined;
+          if (u?.values.has(col)) {
+            v = u.values.get(col) ?? null;
+            themeOverride = { bgCell: CHANGED_BG };
+          }
+        }
       }
-      const fam = info.columns[col]?.family;
+      const canEdit = editable && !deleted;
+      if (v === null) {
+        return { kind: GridCellKind.Text, data: "", displayData: "NULL", allowOverlay: canEdit, readonly: !canEdit, style: "faded", copyData: "", themeOverride };
+      }
       return {
         kind: GridCellKind.Text,
         data: v,
         displayData: cellPreview(v),
         allowOverlay: true,
-        readonly: true,
-        contentAlign: fam === "number" ? "right" : "left",
+        readonly: !canEdit,
+        contentAlign: align,
+        themeOverride,
       };
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [version, info.columns],
+    [version, info.columns, edit, rows],
   );
+
+  /** A typed value: stored for a fetched row (with its key) or a new row. */
+  const editCell = (col: number, row: number, value: string | null) => {
+    if (!edit || edit.target.columns[col] == null) return;
+    if (row >= rows) return edit.onEdits(setNewCell(edit.edits, row - rows, col, value));
+    const who = rowIdentity(row);
+    if (!who || edit.edits.deletes.has(who.id)) return;
+    const original = pages.current.get(Math.floor(row / PAGE))?.[row % PAGE]?.[col] ?? null;
+    edit.onEdits(setCell(edit.edits, who.id, who.key, col, original, value));
+  };
+
+  /** View rows of the selection (or the focused cell's row). */
+  const selectedRows = (): number[] => {
+    const r = selectedRange();
+    if (!r) return [];
+    return Array.from({ length: Math.min(r.limit, 10_000) }, (_, i) => r.offset + i);
+  };
 
   const highlights = useMemo<Highlight[]>(() => {
     if (findMatches.length === 0) return [];
@@ -355,8 +430,17 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         height="100%"
         theme={theme}
         columns={columns}
-        rows={rows}
+        rows={rows + (edit ? edit.edits.inserts.length : 0)}
         getCellContent={getCellContent}
+        onCellEdited={
+          edit
+            ? ([col, row], v) => {
+                if (v.kind === GridCellKind.Text) editCell(col, row, v.data);
+              }
+            : undefined
+        }
+        trailingRowOptions={edit ? { hint: "Add row", sticky: true, tint: true } : undefined}
+        onRowAppended={edit ? () => void edit.onEdits(addRow(edit.edits)) : undefined}
         onVisibleRegionChanged={onVisibleRegionChanged}
         rowMarkers="number"
         rowMarkerWidth={Math.max(44, String(rows).length * 8 + 20)}
@@ -459,6 +543,52 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
                 if (r) onTranspose({ cols: r.cols, offset: r.offset, limit: r.limit });
               }}
             />
+          )}
+          {edit && (
+            <>
+              <MenuSeparator />
+              {edit.target.columns[menu.cell[0]] != null && (
+                <MenuItem
+                  icon={<Ban size={13} />}
+                  label="Set to NULL"
+                  onClick={() => {
+                    setMenu(null);
+                    editCell(menu.cell[0], menu.cell[1], null);
+                  }}
+                />
+              )}
+              {menu.cell[1] >= rows ? (
+                <MenuItem
+                  icon={<Trash2 size={13} />}
+                  label="Remove new row"
+                  onClick={() => {
+                    setMenu(null);
+                    edit.onEdits(removeNewRow(edit.edits, menu.cell[1] - rows));
+                  }}
+                />
+              ) : (
+                <>
+                  <MenuItem
+                    icon={<Trash2 size={13} />}
+                    label="Delete / undelete row(s)"
+                    onClick={() => {
+                      setMenu(null);
+                      const who = selectedRows().filter((r) => r < rows).map(rowIdentity).filter((x): x is { id: number; key: (string | null)[] } => !!x);
+                      edit.onEdits(toggleDelete(edit.edits, who));
+                    }}
+                  />
+                  <MenuItem
+                    icon={<Undo2 size={13} />}
+                    label="Revert row changes"
+                    onClick={() => {
+                      setMenu(null);
+                      const ids = selectedRows().map((r) => rowIdentity(r)?.id).filter((x): x is number => x !== undefined);
+                      edit.onEdits(revertRows(edit.edits, ids));
+                    }}
+                  />
+                </>
+              )}
+            </>
           )}
           <MenuSeparator />
           <MenuItem icon={<Filter size={13} />} label="Filter: equals this value" onClick={() => { setMenu(null); filterBy(menu.cell, "equals"); }} />

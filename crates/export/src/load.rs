@@ -310,6 +310,31 @@ pub(crate) fn literal(cell: Option<&str>, kind: Lit, dialect: ConnectorKind) -> 
     }
 }
 
+/// SQL literal for a value typed into a grid cell of column `f` (`None` =
+/// NULL). Numbers are written as numbers only when they are numbers;
+/// booleans and binary values are checked, so the typed text never becomes
+/// SQL of its own.
+pub fn edit_literal(f: &Field, value: Option<&str>, dialect: ConnectorKind) -> std::result::Result<String, String> {
+    let Some(v) = value else { return Ok("NULL".into()) };
+    match lit_kind(f) {
+        Lit::Bool => match v.trim().to_ascii_lowercase().as_str() {
+            "true" | "t" | "1" | "yes" | "y" => Ok(literal(Some("true"), Lit::Bool, dialect)),
+            "false" | "f" | "0" | "no" | "n" => Ok(literal(Some("false"), Lit::Bool, dialect)),
+            _ => Err(format!("{}: “{v}” is not true or false", f.name())),
+        },
+        Lit::Binary => {
+            let hex = v.trim().trim_start_matches("0x").trim_start_matches("\\x");
+            if hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                Ok(literal(Some(&hex.to_ascii_lowercase()), Lit::Binary, dialect))
+            } else {
+                Err(format!("{}: binary values are typed as hex (00ff…)", f.name()))
+            }
+        }
+        Lit::Number if v.trim().parse::<f64>().is_err() => Err(format!("{}: “{v}” is not a number", f.name())),
+        k => Ok(literal(Some(v.trim_end_matches('\n')).map(|s| if matches!(k, Lit::Number) { s.trim() } else { s }), k, dialect)),
+    }
+}
+
 /// Builds batched INSERT statements one at a time, so a large load never
 /// holds all of its SQL text in memory.
 pub struct InsertSql {

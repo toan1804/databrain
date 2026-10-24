@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use databrain_auth::{AuthContext, CredentialSource};
 
 pub use arrow;
+pub use sqlparser;
 pub use conn_state::ConnState;
 pub use error::{ConnectorError, ErrorKind, Result};
 pub use stream::{Collected, ExecOptions, ExecSummary, QueryStream, StreamEvent, StreamSender};

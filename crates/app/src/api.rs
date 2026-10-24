@@ -1551,6 +1551,35 @@ pub fn cancel_job_step(state: &AppState, id: &str, node_id: &str) -> bool {
     state.jobs.cancel_step(id, node_id)
 }
 
+// ------------------------------------------------------------ editing results
+
+fn edit_source(state: &AppState, result_id: &str) -> Result<(databrain_query_engine::OutputInfo, databrain_connector_core::arrow::datatypes::SchemaRef)> {
+    let o = state.engine.outputs().by_result(result_id).ok_or_else(|| invalid("This result is no longer available; run the query again"))?;
+    let schema = state.results().get(result_id)?.lock().schema();
+    Ok((o, schema))
+}
+
+/// The table a result can be edited in (or why not).
+pub async fn edit_target(state: &AppState, result_id: &str) -> Result<databrain_query_engine::edit::EditTarget> {
+    let (o, schema) = edit_source(state, result_id)?;
+    state.engine.edit_target(&o, &schema).await
+}
+
+/// The SQL the pending changes run (built here, not taken from the UI).
+pub fn edit_preview(state: &AppState, result_id: &str, target: &databrain_query_engine::edit::EditTarget, changes: &[databrain_query_engine::edit::RowChange]) -> Result<Vec<databrain_query_engine::edit::EditStatement>> {
+    let (_, schema) = edit_source(state, result_id)?;
+    state.engine.edit_statements(target, &schema, changes)
+}
+
+/// Save the pending changes on the session the result came from.
+pub async fn apply_edits(state: &AppState, result_id: &str, changes: Vec<databrain_query_engine::edit::RowChange>) -> Result<databrain_query_engine::edit::ApplyReport> {
+    let (o, schema) = edit_source(state, result_id)?;
+    // The target again (not the UI's copy): the key and columns it allows.
+    let target = state.engine.edit_target(&o, &schema).await?;
+    let stmts = state.engine.edit_statements(&target, &schema, &changes)?;
+    state.engine.apply_edits(&target, o.session(), &stmts).await
+}
+
 /// Where and how to load a result's rows ("Load into…" on the grid).
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoadResultArgs {

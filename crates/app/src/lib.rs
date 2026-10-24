@@ -669,6 +669,24 @@ fn preview_parameters(
 }
 
 #[tauri::command]
+async fn edit_target(state: State<'_, AppState>, result_id: String) -> R<databrain_query_engine::edit::EditTarget> {
+    api::edit_target(&state, &result_id).await
+}
+#[tauri::command]
+fn edit_preview(
+    state: State<'_, AppState>,
+    result_id: String,
+    target: databrain_query_engine::edit::EditTarget,
+    changes: Vec<databrain_query_engine::edit::RowChange>,
+) -> R<Vec<databrain_query_engine::edit::EditStatement>> {
+    api::edit_preview(&state, &result_id, &target, &changes)
+}
+#[tauri::command]
+async fn apply_edits(state: State<'_, AppState>, result_id: String, changes: Vec<databrain_query_engine::edit::RowChange>) -> R<databrain_query_engine::edit::ApplyReport> {
+    api::apply_edits(&state, &result_id, changes).await
+}
+
+#[tauri::command]
 async fn load_result(state: State<'_, AppState>, result_id: String, args: api::LoadResultArgs, load_id: String) -> R<databrain_query_engine::LoadReport> {
     api::load_result(&state, &result_id, args, &load_id).await
 }
@@ -1058,6 +1076,9 @@ pub fn run() {
             statement_spans,
             summarize_selection,
             load_result,
+            edit_target,
+            edit_preview,
+            apply_edits,
             cancel_load,
             dry_run_result_load,
             sql_parameters,

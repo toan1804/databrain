@@ -1051,6 +1051,30 @@ export interface LoadCheck {
   message?: string | null;
 }
 
+/** The table behind an editable result (see the backend's edit module). */
+export interface EditTarget {
+  connection_id: string;
+  schema: string;
+  table: string;
+  /** Result column indexes of the primary key. */
+  key_columns: number[];
+  /** Per result column: the table column (null: read-only expression). */
+  columns: (string | null)[];
+  /** transaction | block (Oracle PL/SQL) | statements (no transactions). */
+  apply: "transaction" | "block" | "statements";
+}
+
+export interface EditStatement {
+  sql: string;
+  expect_rows: number | null;
+}
+
+export interface ApplyReport {
+  statements: number;
+  rows: number;
+  in_open_transaction: boolean;
+}
+
 /** "Load into…" a table from the result grid. */
 export interface LoadResultArgs {
   target_connection_id: string;

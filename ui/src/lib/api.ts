@@ -66,6 +66,9 @@ import type {
   ResultInfo,
   SelectionSummary,
   LoadResultArgs,
+  EditTarget,
+  EditStatement,
+  ApplyReport,
   LoadReport,
   RunRequest,
   RunResponse,
@@ -91,6 +94,7 @@ import type {
   TerminalOption,
   TerminalSetting,
 } from "./types";
+import type { RowChange } from "./gridEdits";
 
 export const isTauri = (): boolean =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -205,6 +209,10 @@ export const api = {
     call<Page>("fetch_page", { resultId, view, offset, limit }),
   findInResult: (resultId: string, view: ViewSpec, query: string, limit: number, columns?: number[] | null, wholeWord = false) =>
     call<FindResult>("find_in_result", { resultId, view, query, limit, columns: columns ?? null, wholeWord }),
+  /** The table a result can be edited in (rejects with the reason when it can't). */
+  editTarget: (resultId: string) => call<EditTarget>("edit_target", { resultId }),
+  editPreview: (resultId: string, target: EditTarget, changes: RowChange[]) => call<EditStatement[]>("edit_preview", { resultId, target, changes }),
+  applyEdits: (resultId: string, changes: RowChange[]) => call<ApplyReport>("apply_edits", { resultId, changes }),
   /** Copy a result's fetched rows into a table (job load code). */
   loadResult: (resultId: string, args: LoadResultArgs, loadId: string) => call<LoadReport>("load_result", { resultId, args, loadId }),
   cancelLoad: (loadId: string) => call<boolean>("cancel_load", { loadId }),

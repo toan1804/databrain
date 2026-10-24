@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub mod edit;
 pub mod load;
 pub mod outputs;
 pub mod probe;
