@@ -462,8 +462,20 @@ func colType(ct *sql.ColumnType) column {
 		c.Type = "timestamp"
 	case strings.Contains(name, "TIME ZONE") || name == "TIMESTAMPTZ_DTY" || name == "TIMESTAMPLTZ_DTY" || name == "TIMESTAMPTZ" || name == "TIMESTAMPLTZ":
 		c.Type = "timestamptz"
-	case name == "RAW" || name == "BLOB" || name == "LONG RAW" || name == "LONGRAW":
+	case name == "RAW" || name == "BLOB" || name == "LONG RAW" || name == "LONGRAW" || name == "OCIBLOBLOCATOR":
 		c.Type = "binary"
+		// go-ora fetches LOBs inline by redefining BLOB as LONG RAW and CLOB
+		// as LONG VARCHAR (the default "LOB FETCH=INLINE"); with STREAM they
+		// stay locators. Name them as the user declared them. (A real LONG
+		// RAW column is reported the same way; BLOB is far more common.)
+		switch name {
+		case "OCIBLOBLOCATOR", "LONGRAW":
+			c.DbType = "BLOB"
+		}
+	case name == "LONGVARCHAR" || name == "OCICLOBLOCATOR":
+		c.DbType = "CLOB" // also NCLOB: go-ora does not tell them apart
+	case name == "OCIFILELOCATOR":
+		c.DbType = "BFILE" // shown as BFILENAME('DIR', 'file')
 	case name == "BOOLEAN":
 		c.Type = "bool"
 	}
@@ -579,6 +591,15 @@ func (e *enc) anyValue(v any) {
 	case time.Time:
 		e.u8(3)
 		e.str(x.Format("2006-01-02 15:04:05.999999999"))
+	case go_ora.BFile:
+		// The file reference, not its content (which may be large and needs
+		// extra round trips while the rows are still being fetched).
+		if !x.Valid {
+			e.u8(0)
+			return
+		}
+		e.u8(3)
+		e.str(fmt.Sprintf("BFILENAME('%s', '%s')", strings.ReplaceAll(x.GetDirName(), "'", "''"), strings.ReplaceAll(x.GetFileName(), "'", "''")))
 	case fmt.Stringer:
 		e.u8(3)
 		e.str(x.String())

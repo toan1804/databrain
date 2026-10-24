@@ -248,7 +248,7 @@ fn col_type(t: &OracleType) -> ColType {
         OracleType::BinaryFloat | OracleType::BinaryDouble | OracleType::Float(_) => ColType::Float64,
         OracleType::Date | OracleType::Timestamp(_) => ColType::Timestamp,
         OracleType::TimestampTZ(_) | OracleType::TimestampLTZ(_) => ColType::TimestampTz,
-        OracleType::Raw(_) | OracleType::BLOB | OracleType::LongRaw => ColType::Binary,
+        OracleType::Raw(_) | OracleType::BLOB | OracleType::LongRaw | OracleType::BFILE => ColType::Binary,
         OracleType::Boolean => ColType::Bool,
         _ => ColType::Utf8,
     }
