@@ -87,6 +87,20 @@ function iconFor(c: ColumnMeta): GridColumnIcon {
   }
 }
 
+/** Longest text drawn in a cell (the cell is one line, at most 1200 px wide). */
+const PREVIEW_CHARS = 1000;
+
+/**
+ * What a cell draws: one line. The grid draws only the first line of a
+ * multi-line value, so line breaks become ↵ (also in long values such as
+ * CLOBs, which are cut first so huge texts stay cheap to draw). The full
+ * value stays in the cell's data: double-click / Enter or copy shows it.
+ */
+function cellPreview(v: string): string {
+  const head = v.length > PREVIEW_CHARS ? v.slice(0, PREVIEW_CHARS) + "…" : v;
+  return head.replace(/\r\n|\r|\n/g, "↵");
+}
+
 function estimateWidth(name: string, sample: (string | null)[]): number {
   let chars = name.length + 3;
   for (const v of sample) if (v) chars = Math.max(chars, Math.min(v.length, 60));
@@ -222,7 +236,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
       return {
         kind: GridCellKind.Text,
         data: v,
-        displayData: v.length > 500 ? v.slice(0, 500) + "…" : v.replace(/\n/g, "↵"),
+        displayData: cellPreview(v),
         allowOverlay: true,
         readonly: true,
         contentAlign: fam === "number" ? "right" : "left",
