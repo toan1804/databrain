@@ -449,7 +449,8 @@ pub const POSTGRES: SourceTraits = SourceTraits {
     dialect_name: "PostgreSQL",
     explain: Some("EXPLAIN "),
     formatter: "postgresql",
-    syntax: SqlSyntax { dollar: DollarQuotes::Tagged, ..STANDARD_SYNTAX },
+    // SQL-standard bodies: CREATE FUNCTION … BEGIN ATOMIC …; END;
+    syntax: SqlSyntax { dollar: DollarQuotes::Tagged, block_end: BlockEnd::EndWord, block_objects: &["FUNCTION", "PROCEDURE"], ..STANDARD_SYNTAX },
     load: Some(LoadTraits {
         types: TypeNames { float: "DOUBLE PRECISION", timestamp_tz: "TIMESTAMPTZ", binary: "BYTEA", ..STANDARD_TYPES },
         binary_literal: "'\\x{}'::bytea",
@@ -472,6 +473,9 @@ pub const MYSQL: SourceTraits = SourceTraits {
         backtick: true,
         hash_comment: true,
         delimiter_directive: true,
+        // Bodies without DELIMITER: BEGIN … END; (as most clients accept).
+        block_end: BlockEnd::EndWord,
+        block_objects: &["PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"],
         ..STANDARD_SYNTAX
     },
     load: Some(LoadTraits {

@@ -13,7 +13,11 @@ use crate::traits::{BlockEnd, DollarQuotes, SourceTraits, SqlParser, SqlSyntax};
 use crate::types::ConnectorKind;
 
 pub fn dialect_for(kind: ConnectorKind) -> Box<dyn Dialect> {
-    match kind.traits().parser {
+    dialect_of(kind.traits().parser)
+}
+
+fn dialect_of(parser: SqlParser) -> Box<dyn Dialect> {
+    match parser {
         SqlParser::Postgres => Box::new(PostgreSqlDialect {}),
         SqlParser::Mysql => Box::new(MySqlDialect {}),
         SqlParser::Sqlite => Box::new(SQLiteDialect {}),
@@ -79,12 +83,16 @@ enum Block {
 fn block_kind(x: &SqlSyntax, seg: &str) -> Block {
     let mut w = words(strip_leading_comments(seg)).map(|x| x.to_ascii_uppercase());
     let first = w.next().unwrap_or_default();
-    let rest: Vec<String> = w.take(6).collect();
+    let rest: Vec<String> = w.take(12).collect();
     let after_create = || -> Option<&str> {
         let mut it = rest.iter().map(String::as_str).peekable();
         if it.peek() == Some(&"OR") {
             it.next();
             it.next(); // REPLACE / ALTER
+        }
+        // MySQL: CREATE DEFINER = user@host [SQL SECURITY …] PROCEDURE.
+        if it.peek() == Some(&"DEFINER") {
+            return it.find(|o| x.block_objects.contains(o));
         }
         while matches!(
             it.peek(),
@@ -106,8 +114,35 @@ fn block_kind(x: &SqlSyntax, seg: &str) -> Block {
     if (first == "CREATE" || (x.block_on_alter && first == "ALTER")) && after_create().is_some_and(|o| x.block_objects.contains(&o)) {
         return block;
     }
+    // Oracle 12c: WITH FUNCTION f … END; SELECT … (ends with a `/` line).
+    if first == "WITH" && block == Block::SlashLine && matches!(rest.first().map(String::as_str), Some("FUNCTION" | "PROCEDURE")) {
+        return block;
+    }
     Block::None
 }
+
+/// Words that keep `BEGIN` from opening a block (`BEGIN TRANSACTION;`).
+const BEGIN_NOT_BLOCK: &[&str] = &["TRANSACTION", "TRAN", "WORK", "DEFERRED", "IMMEDIATE", "EXCLUSIVE", "DISTRIBUTED", "NAME"];
+/// `END IF` / `END LOOP` … close constructs that are not counted as opened.
+const END_OF_UNCOUNTED: &[&str] = &["IF", "LOOP", "WHILE", "REPEAT", "FOR"];
+
+/// The next word after byte `i` (skipping spaces), upper-cased; empty when
+/// something else (`;`, `(`) comes first.
+fn next_word(text: &str, i: usize) -> String {
+    let rest = text[i..].trim_start();
+    rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("").to_ascii_uppercase()
+}
+
+/// Whether a statement can stand on its own (for blank-line separation).
+fn parses_alone(sql: &str, parser: SqlParser) -> bool {
+    Parser::parse_sql(dialect_of(parser).as_ref(), sql).is_ok_and(|s| s.len() == 1)
+}
+
+/// First words of a statement, for blank-line separation.
+const STATEMENT_STARTS: &[&str] = &[
+    "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP", "TRUNCATE", "EXEC", "EXECUTE", "CALL",
+    "DECLARE", "SET", "USE", "GRANT", "REVOKE", "BEGIN", "COMMIT", "ROLLBACK", "EXPLAIN", "SHOW", "DESCRIBE", "VALUES",
+];
 
 fn is_go_line(line: &str) -> bool {
     let mut it = line.split_whitespace();
@@ -140,6 +175,12 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
     let mut seg_start = 0usize;
     let mut has_code = false;
     let mut i = 0usize;
+    // Open BEGIN/CASE … END blocks in the current statement (EndWord dialects).
+    let mut depth = 0i32;
+    // A blank line ends a statement written without `;` when the next line
+    // starts another one. Not in T-SQL batches with variables: each
+    // statement runs on its own, so a DECLARE must stay with its uses.
+    let blank_lines_split = !(syntax.block_end == BlockEnd::GoLine && text.to_ascii_lowercase().contains("declare"));
 
     let push = |out: &mut Vec<StatementSpan>, from: usize, to: usize, has_code: bool| {
         if !has_code {
@@ -183,7 +224,22 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
                 i = (line_end + 1).min(n);
                 seg_start = i;
                 has_code = false;
+                depth = 0;
                 continue;
+            }
+            if line.is_empty() && has_code && blank_lines_split && delimiter == b";" && depth == 0 {
+                let next = text[line_end..].trim_start();
+                let first = next.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("").to_ascii_uppercase();
+                let seg = &text[seg_start..i];
+                if STATEMENT_STARTS.contains(&first.as_str())
+                    && block_kind(syntax, seg) == Block::None
+                    && !matches!(leading_keyword(seg).as_str(), "DECLARE" | "SET")
+                    && parses_alone(seg.trim(), t.parser)
+                {
+                    push(&mut out, seg_start, i, has_code);
+                    seg_start = i;
+                    has_code = false;
+                }
             }
         }
 
@@ -193,7 +249,7 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
                 && match block_kind(syntax, seg) {
                     Block::None => false,
                     Block::SlashLine | Block::GoLine => true,
-                    Block::EndWord => !last_word_is_end(seg),
+                    Block::EndWord => depth > 0,
                 };
             if keep {
                 i += 1;
@@ -203,6 +259,7 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
             i += delimiter.len();
             seg_start = i;
             has_code = false;
+            depth = 0;
             continue;
         }
 
@@ -269,6 +326,25 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
                 }
                 _ => i += 1,
             },
+            c if (c.is_ascii_alphabetic() || c == b'_') && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$' || b[i - 1] == b'.')) => {
+                let mut j = i + 1;
+                while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                if syntax.block_end == BlockEnd::EndWord {
+                    let w = &text[i..j];
+                    if w.eq_ignore_ascii_case("BEGIN") {
+                        let next = next_word(text, j);
+                        let opens = !BEGIN_NOT_BLOCK.contains(&next.as_str()) && !text[j..].trim_start().starts_with(';');
+                        depth += opens as i32;
+                    } else if w.eq_ignore_ascii_case("CASE") {
+                        depth += 1;
+                    } else if w.eq_ignore_ascii_case("END") && !END_OF_UNCOUNTED.contains(&next_word(text, j).as_str()) {
+                        depth = (depth - 1).max(0);
+                    }
+                }
+                i = j;
+            }
             _ => i += 1,
         }
     }
@@ -323,12 +399,6 @@ fn dollar_tag(text: &str, i: usize) -> Option<&str> {
 pub(crate) fn words(s: &str) -> impl Iterator<Item = &str> {
     s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .filter(|w| !w.is_empty())
-}
-
-fn last_word_is_end(s: &str) -> bool {
-    words(s)
-        .last()
-        .is_some_and(|w| w.eq_ignore_ascii_case("end"))
 }
 
 fn strip_leading_comments(mut s: &str) -> &str {
@@ -594,6 +664,46 @@ mod tests {
             Snowflake,
         );
         assert_eq!(v.len(), 2, "{v:?}");
+    }
+
+    #[test]
+    fn split_procedure_bodies_and_nested_ends() {
+        let v = |k: ConnectorKind, t: &str| sqls(t, k);
+        // MySQL bodies without DELIMITER, DEFINER, CASE … END inside.
+        assert_eq!(v(Mysql, "create procedure p() begin select 1; select 2; end;\nselect 3;"), vec!["create procedure p() begin select 1; select 2; end", "select 3"]);
+        assert_eq!(v(Mysql, "create definer=`root`@`%` procedure p() begin select 1; end;\nselect 3;").len(), 2);
+        assert_eq!(
+            v(Mysql, "create procedure p() begin declare x int; set x = case when 1 then 2 else 3 end; if x > 1 then select 1; end if; end;\nselect 3;").len(),
+            2
+        );
+        assert_eq!(v(Mysql, "create function f() returns int deterministic return 1;\nselect f();").len(), 2, "single-statement body");
+        // Repeated DELIMITER switches.
+        assert_eq!(
+            v(Mysql, "delimiter //\ncreate procedure a() begin select 1; end //\ndelimiter ;\nselect 1;\ndelimiter $$\ncreate procedure b() begin select 2; end$$\ndelimiter ;\nselect 2;"),
+            vec!["create procedure a() begin select 1; end", "select 1", "create procedure b() begin select 2; end", "select 2"]
+        );
+        // SQLite trigger with CASE; BEGIN TRANSACTION is not a block.
+        assert_eq!(v(Sqlite, "create trigger t after insert on x begin update y set a = case when new.a > 0 then 1 else 0 end; end;\nselect 1;").len(), 2);
+        assert_eq!(v(Sqlite, "begin transaction;\ninsert into t values (1);\ncommit;").len(), 3);
+        assert_eq!(v(Bigquery, "create procedure d.p() begin select case when true then 1 end; select 2; end;\nselect 3;").len(), 2);
+        assert_eq!(v(Postgres, "create function f() returns int language sql begin atomic select 1; select 2; end;\nselect 3;").len(), 2);
+        assert_eq!(v(Postgres, "begin;\nselect 1;\ncommit;").len(), 3);
+        // Oracle WITH FUNCTION ends at `/`; backslashes are plain text.
+        let o = v(Oracle, "with function f(x number) return number is begin return x * 2; end;\nselect f(1) from dual\n/\nselect 2 from dual;");
+        assert_eq!(o.len(), 2, "{o:?}");
+        assert!(o[0].ends_with("select f(1) from dual"));
+        assert_eq!(v(Oracle, "select 'C:\\' from dual; select 2 from dual;").len(), 2);
+    }
+
+    #[test]
+    fn split_statements_without_semicolons() {
+        assert_eq!(sqls("select 1\n\nselect 2\n\nupdate t set a = 1\n\nwhere b = 2", Postgres), vec!["select 1", "select 2", "update t set a = 1\n\nwhere b = 2"]);
+        assert_eq!(sqls("select 1\n\nselect 2", Mssql), vec!["select 1", "select 2"]);
+        // A blank line inside a statement keeps it whole.
+        assert_eq!(sqls("insert into t\n\nselect * from x;\nwith a as (select 1)\n\nselect * from a;", Postgres).len(), 2);
+        assert_eq!(sqls("select a\n\nfrom t", Postgres).len(), 1);
+        // T-SQL variables stay with their batch.
+        assert_eq!(sqls("declare @n int = 5\n\nselect @n", Mssql).len(), 1);
     }
 
     #[test]

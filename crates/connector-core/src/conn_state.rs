@@ -111,9 +111,9 @@ mod tests {
     fn transactions() {
         assert_eq!(after(Postgres, &["begin", "select 1"]), (false, true));
         assert_eq!(after(Postgres, &["begin", "commit"]), (true, false));
-        assert_eq!(after(Mysql, &["start transaction", "rollback to savepoint a"]).1, true);
+        assert!(after(Mysql, &["start transaction", "rollback to savepoint a"]).1);
         assert_eq!(after(Mysql, &["start transaction", "rollback"]), (true, false));
-        assert_eq!(after(Mssql, &["begin tran", "begin transaction", "commit"]).1, true, "nested");
+        assert!(after(Mssql, &["begin tran", "begin transaction", "commit"]).1, "nested");
         assert_eq!(after(Mssql, &["begin tran", "begin transaction", "commit", "commit tran"]), (true, false));
         assert_eq!(after(Mssql, &["begin try select 1 end try begin catch end catch"]), (true, false));
     }

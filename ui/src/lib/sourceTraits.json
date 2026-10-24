@@ -394,8 +394,13 @@
       "backslash_escapes": true,
       "backslash_in_double_quotes": true,
       "backtick": true,
-      "block_end": "none",
-      "block_objects": [],
+      "block_end": "end_word",
+      "block_objects": [
+        "PROCEDURE",
+        "FUNCTION",
+        "TRIGGER",
+        "EVENT"
+      ],
       "block_on_alter": false,
       "block_starts": [],
       "brackets": false,
@@ -588,8 +593,11 @@
       "backslash_escapes": false,
       "backslash_in_double_quotes": false,
       "backtick": false,
-      "block_end": "none",
-      "block_objects": [],
+      "block_end": "end_word",
+      "block_objects": [
+        "FUNCTION",
+        "PROCEDURE"
+      ],
       "block_on_alter": false,
       "block_starts": [],
       "brackets": false,
