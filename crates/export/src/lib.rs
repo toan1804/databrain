@@ -80,6 +80,11 @@ pub struct ExportOptions {
     /// Restrict to these column indices (in order). Empty = all.
     #[serde(default)]
     pub columns: Vec<usize>,
+    /// CSV/TSV for spreadsheets: text starting with `=`, `+`, `-`, `@`
+    /// (a formula when opened in Excel) gets a leading `'`. Numbers, also
+    /// negative ones, are left alone.
+    #[serde(default)]
+    pub excel_safe: bool,
 }
 
 fn yes() -> bool {
@@ -94,6 +99,7 @@ impl ExportOptions {
             table_name: None,
             dialect: None,
             columns: Vec::new(),
+            excel_safe: false,
         }
     }
 }
@@ -103,15 +109,35 @@ enum Kind {
     Number,
     Bool,
     Binary,
+    /// Postgres array (`{1,2}` text): a JSON array, elements typed as `elem`.
+    Array { elem: ArrayElem },
     Other,
 }
 
-fn kind_of(dt: &DataType, decimal_text: bool) -> Kind {
-    match dt {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArrayElem {
+    Number,
+    Bool,
+    Text,
+}
+
+fn kind_of(f: &databrain_connector_core::arrow::datatypes::Field) -> Kind {
+    match f.data_type() {
         DataType::Boolean => Kind::Bool,
         t if t.is_numeric() => Kind::Number,
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => Kind::Binary,
-        _ if decimal_text => Kind::Number,
+        _ if is_decimal_text(f) => Kind::Number,
+        DataType::Utf8 | DataType::LargeUtf8 => match f.metadata().get(databrain_connector_core::value::META_DB_TYPE).and_then(|t| t.strip_suffix("[]")) {
+            Some(base) => Kind::Array {
+                elem: match base.split('(').next().unwrap_or("").trim() {
+                    "smallint" | "integer" | "bigint" | "real" | "double precision" | "oid" => ArrayElem::Number,
+                    b if databrain_result_store::display::is_decimal_type(b) => ArrayElem::Number,
+                    "boolean" => ArrayElem::Bool,
+                    _ => ArrayElem::Text,
+                },
+            },
+            None => Kind::Other,
+        },
         _ => Kind::Other,
     }
 }
@@ -141,10 +167,7 @@ impl<W: Write> Exporter<W> {
         };
         let kinds = cols
             .iter()
-            .map(|c| {
-                let f = schema.field(*c);
-                kind_of(f.data_type(), is_decimal_text(f))
-            })
+            .map(|c| kind_of(schema.field(*c)))
             .collect();
         Self {
             out,
@@ -229,11 +252,16 @@ impl<W: Write> Exporter<W> {
                 });
             }
             match self.opts.format {
-                ExportFormat::Csv => {
-                    write_delimited(&mut self.out, cells.iter().map(|c| c.as_deref()), b',')?
-                }
-                ExportFormat::Tsv => {
-                    write_delimited(&mut self.out, cells.iter().map(|c| c.as_deref()), b'\t')?
+                ExportFormat::Csv | ExportFormat::Tsv => {
+                    if self.opts.excel_safe {
+                        for (c, k) in cells.iter_mut().zip(&self.kinds) {
+                            if let Some(s) = c.as_mut().filter(|s| *k != Kind::Number && is_formula_like(s)) {
+                                s.insert(0, '\'');
+                            }
+                        }
+                    }
+                    let delim = if self.opts.format == ExportFormat::Csv { b',' } else { b'\t' };
+                    write_delimited(&mut self.out, cells.iter().map(|c| c.as_deref()), delim)?
                 }
                 ExportFormat::Json | ExportFormat::Ndjson => {
                     let mut obj = serde_json::Map::with_capacity(cells.len());
@@ -314,6 +342,12 @@ pub fn export_to_string<'a>(
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Text a spreadsheet would run as a formula. A number (`-12.5`, `+3`,
+/// `-1e5`) is not: it opens as the number either way.
+fn is_formula_like(s: &str) -> bool {
+    s.starts_with(['=', '+', '-', '@', '\t', '\r']) && s.trim().parse::<f64>().is_err()
+}
+
 fn write_delimited<'a, W: Write>(
     out: &mut W,
     cells: impl Iterator<Item = Option<&'a str>>,
@@ -373,8 +407,84 @@ fn json_value(cell: Option<&str>, kind: Kind) -> serde_json::Value {
                 }
             }
         }
+        Kind::Array { elem } => pg_array_json(s, elem).unwrap_or_else(|| serde_json::Value::String(s.to_string())),
         _ => serde_json::Value::String(s.to_string()),
     }
+}
+
+/// A Postgres array literal (`{1,2}`, `{{a,b},{"c d",NULL}}`) as JSON;
+/// `None` when the text isn't one.
+fn pg_array_json(s: &str, elem: ArrayElem) -> Option<serde_json::Value> {
+    fn parse(b: &[u8], i: &mut usize, elem: ArrayElem) -> Option<serde_json::Value> {
+        if b.get(*i) != Some(&b'{') {
+            return None;
+        }
+        *i += 1;
+        let mut out = Vec::new();
+        if b.get(*i) == Some(&b'}') {
+            *i += 1;
+            return Some(serde_json::Value::Array(out));
+        }
+        loop {
+            let v = match b.get(*i)? {
+                b'{' => parse(b, i, elem)?,
+                b'"' => {
+                    *i += 1;
+                    let mut t = Vec::new();
+                    loop {
+                        match *b.get(*i)? {
+                            b'\\' => {
+                                t.push(*b.get(*i + 1)?);
+                                *i += 2;
+                            }
+                            b'"' => {
+                                *i += 1;
+                                break;
+                            }
+                            c => {
+                                t.push(c);
+                                *i += 1;
+                            }
+                        }
+                    }
+                    // Quoted: always the text (`"NULL"` is the word).
+                    typed(&String::from_utf8(t).ok()?, elem)
+                }
+                _ => {
+                    let start = *i;
+                    while !matches!(b.get(*i), Some(b',') | Some(b'}') | None) {
+                        *i += 1;
+                    }
+                    let t = std::str::from_utf8(&b[start..*i]).ok()?.trim();
+                    if t.eq_ignore_ascii_case("NULL") { serde_json::Value::Null } else { typed(t, elem) }
+                }
+            };
+            out.push(v);
+            match *b.get(*i)? {
+                b',' => *i += 1,
+                b'}' => {
+                    *i += 1;
+                    return Some(serde_json::Value::Array(out));
+                }
+                _ => return None,
+            }
+        }
+    }
+    fn typed(t: &str, elem: ArrayElem) -> serde_json::Value {
+        match elem {
+            ArrayElem::Number => json_value(Some(t), Kind::Number),
+            ArrayElem::Bool if t == "t" || t == "f" => serde_json::Value::Bool(t == "t"),
+            _ => serde_json::Value::String(t.to_string()),
+        }
+    }
+    // Arrays with custom bounds start with `[1:2]=`.
+    let body = match s.find("={") {
+        Some(p) if s.starts_with('[') => &s[p + 1..],
+        _ => s,
+    };
+    let mut i = 0;
+    let v = parse(body.as_bytes(), &mut i, elem)?;
+    (i == body.len()).then_some(v)
 }
 
 /// A value for `INSERT … VALUES`, written the way the dialect reads it
@@ -384,7 +494,7 @@ fn sql_value(cell: Option<&str>, kind: Kind, dialect: ConnectorKind) -> String {
         Kind::Number => load::Lit::Number,
         Kind::Bool => load::Lit::Bool,
         Kind::Binary => load::Lit::Binary,
-        Kind::Other => load::Lit::Text,
+        Kind::Array { .. } | Kind::Other => load::Lit::Text,
     };
     load::literal(cell, lit, dialect)
 }
@@ -507,10 +617,7 @@ fn write_xlsx(
     let bold = Format::new().set_bold();
     let kinds: Vec<Kind> = cols
         .iter()
-        .map(|c| {
-            let f = schema.field(*c);
-            kind_of(f.data_type(), is_decimal_text(f))
-        })
+        .map(|c| kind_of(schema.field(*c)))
         .collect();
     let mut widths: Vec<usize> = cols.iter().map(|c| schema.field(*c).name().chars().count()).collect();
     for (j, c) in cols.iter().enumerate() {
@@ -681,6 +788,55 @@ mod tests {
         let m = run(ExportFormat::Markdown);
         assert!(m.contains("| id | name | ok | raw |\n| ---: | --- | --- | --- |"));
         assert!(m.contains("it's\\|x"));
+    }
+
+    #[test]
+    fn postgres_arrays_become_json_arrays() {
+        use databrain_connector_core::value::META_DB_TYPE;
+        let f = |n: &str, t: &str| Field::new(n, DataType::Utf8, true).with_metadata(std::collections::HashMap::from([(META_DB_TYPE.to_string(), t.to_string())]));
+        let schema: SchemaRef = Arc::new(Schema::new(vec![f("ints", "integer[]"), f("tags", "text[]"), f("grid", "numeric(4,1)[]"), f("flags", "boolean[]"), f("odd", "text[]")]));
+        let b = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["{1,2,NULL}"])),
+                Arc::new(StringArray::from(vec![r#"{a,"b c","NULL","q\"x"}"#])),
+                Arc::new(StringArray::from(vec!["{{1.5,2},{3,4}}"])),
+                Arc::new(StringArray::from(vec!["{t,f}"])),
+                Arc::new(StringArray::from(vec!["not {an array"])),
+            ],
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&export_to_string(schema, [&b], ExportOptions::new(ExportFormat::Json)).unwrap()).unwrap();
+        assert_eq!(v[0]["ints"], serde_json::json!([1, 2, null]));
+        assert_eq!(v[0]["tags"], serde_json::json!(["a", "b c", "NULL", "q\"x"]));
+        assert_eq!(v[0]["grid"], serde_json::json!([[1.5, 2], [3, 4]]));
+        assert_eq!(v[0]["flags"], serde_json::json!([true, false]));
+        assert_eq!(v[0]["odd"], "not {an array", "kept as text when it isn't an array");
+    }
+
+    #[test]
+    fn excel_safe_csv_escapes_formulas_not_numbers() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, true), Field::new("n", DataType::Int64, true)]));
+        let b = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["=1+2", "-12.5", "@sum(A1)", "+x", "plain"])), Arc::new(Int64Array::from(vec![-1, -2, 3, 4, 5]))],
+        )
+        .unwrap();
+        let mut o = ExportOptions::new(ExportFormat::Csv);
+        o.excel_safe = true;
+        assert_eq!(export_to_string(schema.clone(), [&b], o).unwrap(), "t,n\n'=1+2,-1\n-12.5,-2\n'@sum(A1),3\n'+x,4\nplain,5\n");
+        let plain = export_to_string(schema, [&b], ExportOptions::new(ExportFormat::Csv)).unwrap();
+        assert!(plain.contains("\n=1+2,-1\n"), "off by default: data stays as it is");
+    }
+
+    #[test]
+    fn decimal_types_of_every_database_stay_numbers() {
+        for t in ["numeric(12,2)", "decimal", "NUMBER(10,2)", "NUMBER", "BIGNUMERIC", "money", "DECIMAL(38,10)"] {
+            assert!(databrain_result_store::display::is_decimal_type(t), "{t}");
+        }
+        for t in ["varchar(10)", "numbers", "text[]"] {
+            assert!(!databrain_result_store::display::is_decimal_type(t), "{t}");
+        }
     }
 
     #[test]

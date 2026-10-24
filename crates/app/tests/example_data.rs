@@ -374,7 +374,7 @@ async fn export_sqlite_result_and_read_back_with_duckdb() {
     let dir = tempfile::tempdir().unwrap();
     for (fmt, ext) in [(ExportFormat::Parquet, "parquet"), (ExportFormat::Csv, "csv"), (ExportFormat::Xlsx, "xlsx")] {
         let path = dir.path().join(format!("orders.{ext}")).to_string_lossy().into_owned();
-        let opts = ExportOptions { format: fmt, header: true, table_name: None, dialect: None, columns: vec![] };
+        let opts = ExportOptions::new(fmt);
         let n = api::export_result(&st, result_id.clone(), ViewSpec::default(), opts, path.clone()).await.unwrap();
         assert_eq!(n, 3000, "{ext}");
         if ext == "xlsx" {

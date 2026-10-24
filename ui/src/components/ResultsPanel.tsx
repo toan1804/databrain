@@ -863,6 +863,7 @@ function ExportDialog({
   const toast = useStore((s) => s.toast);
   const [format, setFormat] = useState<ExportFormat>("csv");
   const [header, setHeader] = useState(true);
+  const [excelSafe, setExcelSafe] = useState(false);
   const [scope, setScope] = useState<"view" | "fetched" | "all">("view");
   const useView = scope === "view";
   // A full export runs in the background (exports store); the dialog shows it
@@ -901,7 +902,7 @@ function ExportDialog({
       filters: [{ name: fmt.label, extensions: [fmt.ext] }],
     });
     if (typeof path !== "string") return;
-    const options = { format, header, table_name: table || "my_table", dialect: (dialect as never) ?? null };
+    const options = { format, header, table_name: table || "my_table", dialect: (dialect as never) ?? null, excel_safe: excelSafe };
     if (scope === "all") {
       setBgId(await useExports.getState().start({ resultId: info.id, options, path, source: defaultName }));
       return;
@@ -1003,6 +1004,11 @@ function ExportDialog({
         {(format === "csv" || format === "tsv") && (
           <label className="flex items-center gap-2 text-[13px]">
             <input type="checkbox" checked={header} onChange={(e) => setHeader(e.target.checked)} /> Include header row
+          </label>
+        )}
+        {(format === "csv" || format === "tsv") && (
+          <label className="flex items-center gap-2 text-[13px]" title="Text starting with = + - @ gets a leading ' so Excel doesn't run it as a formula. Numbers, also negative ones, stay as they are.">
+            <input type="checkbox" checked={excelSafe} onChange={(e) => setExcelSafe(e.target.checked)} /> Safe to open in Excel (text is never run as a formula)
           </label>
         )}
         {format === "sql_insert" && (

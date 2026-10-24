@@ -156,10 +156,19 @@ pub fn family(field: &Field) -> TypeFamily {
 /// Exact decimals are transported as text; treat them as numbers for sort/filter.
 pub fn is_decimal_text(field: &Field) -> bool {
     matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-        && field.metadata().get(META_DB_TYPE).is_some_and(|t| {
-            let t = t.to_ascii_lowercase();
-            t.starts_with("numeric") || t.starts_with("decimal") || t == "newdecimal" || t == "money"
-        })
+        && field.metadata().get(META_DB_TYPE).is_some_and(|t| is_decimal_type(t))
+}
+
+/// Database type names of exact decimals: `numeric(12,2)`, `decimal`,
+/// MySQL `newdecimal`, `money`, Oracle/Snowflake `NUMBER(…)`, BigQuery
+/// `BIGNUMERIC`, Databricks `DECIMAL(…)`.
+pub fn is_decimal_type(t: &str) -> bool {
+    let t = t.trim().to_ascii_lowercase();
+    if t.ends_with("[]") {
+        return false; // an array of decimals
+    }
+    let base = t.split(['(', ' ']).next().unwrap_or("");
+    matches!(base, "numeric" | "decimal" | "dec" | "newdecimal" | "money" | "smallmoney" | "number" | "bignumeric" | "bigdecimal")
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]

@@ -6,6 +6,8 @@
 //! (numeric, arrays, json, ranges, ...), while the prepared column types let
 //! common types become typed Arrow columns for sorting and filtering.
 
+mod wkb;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -366,6 +368,8 @@ async fn run(
         .map(|c| Column::new(c.name(), col_type(c.type_()), type_name(c.type_(), c.type_modifier())))
         .collect();
     let types: Vec<ColType> = columns.iter().map(|c| c.col_type).collect();
+    // PostGIS: hex EWKB becomes EWKT.
+    let geo: Vec<bool> = stmt.columns().iter().map(|c| matches!(c.type_().name(), "geometry" | "geography")).collect();
     drop(stmt);
 
     let batch_size = opts.batch_size.max(1);
@@ -393,6 +397,7 @@ async fn run(
             SimpleQueryMessage::Row(row) => {
                 let vals = types.iter().enumerate().map(|(i, t)| match row.get(i) {
                     None => Value::Null,
+                    Some(s) if geo[i] => wkb::hex_ewkb_to_ewkt(s).map(Value::Text).unwrap_or_else(|| Value::Text(s.to_string())),
                     Some(s) => parse_text(*t, s),
                 });
                 builder.push_row(vals);

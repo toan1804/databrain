@@ -560,6 +560,8 @@ export interface ExportOptions {
   table_name?: string | null;
   dialect?: ConnectorKind | null;
   columns?: number[];
+  /** CSV/TSV: prefix text that Excel would run as a formula with '. */
+  excel_safe?: boolean;
 }
 
 export interface SavedQuery {
