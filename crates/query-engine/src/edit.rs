@@ -14,7 +14,7 @@
 
 use databrain_connector_core::arrow::datatypes::SchemaRef;
 use databrain_connector_core::sql::dialect_for;
-use databrain_connector_core::{ConnectorKind, ExecOptions, quote_ident, quote_path};
+use databrain_connector_core::{ConnectorKind, ExecOptions, ObjectKind, quote_ident, quote_path};
 use databrain_export::load::edit_literal;
 use serde::{Deserialize, Serialize};
 use databrain_connector_core::sqlparser::ast::{Expr, GroupByExpr, Ident, ObjectNamePart, SelectItem, SetExpr, Statement, TableFactor};
@@ -139,6 +139,21 @@ fn fold(kind: ConnectorKind, name: &str, quoted: bool) -> String {
     }
 }
 
+/// Why an object that isn't a plain table can't be edited.
+fn not_a_table(schema: &str, name: &str, kind: ObjectKind) -> String {
+    let what = match kind {
+        ObjectKind::View => "a view",
+        ObjectKind::MaterializedView => "a materialized view",
+        ObjectKind::ForeignTable => "a foreign table",
+        ObjectKind::Function => "a function",
+        ObjectKind::Procedure => "a procedure",
+        ObjectKind::Package => "a package",
+        ObjectKind::Sequence => "a sequence",
+        ObjectKind::Table | ObjectKind::Other => "not a table",
+    };
+    format!("{schema}.{name} is {what}: only tables can be edited")
+}
+
 /// How changes are applied on a database (see [`EditTarget::apply`]).
 pub(crate) fn apply_style(kind: ConnectorKind) -> Option<(&'static str, &'static str, &'static str)> {
     match kind {
@@ -183,7 +198,19 @@ impl QueryEngine {
         };
         let detail = match self.describe(&o.connection_id, &schema_id, &src.table).await {
             Ok(d) => d,
-            Err(_) => self.describe(&o.connection_id, &schema_id, &src.table.to_uppercase()).await.or(Err(EngineError::new("invalid", format!("Table {schema_id}.{} not found", src.table))))?,
+            Err(_) => match self.describe(&o.connection_id, &schema_id, &src.table.to_uppercase()).await {
+                Ok(d) => d,
+                // Not described: say what it is if it exists (a view, a
+                // function…) rather than "not found".
+                Err(_) => {
+                    let names = [src.table.clone(), src.table.to_uppercase(), src.table.to_lowercase()];
+                    let found = self.list_objects_named(&o.connection_id, &schema_id, &names).await.ok().and_then(|objs| objs.into_iter().find(|x| x.name.eq_ignore_ascii_case(&src.table)));
+                    return match found {
+                        Some(obj) if obj.kind != ObjectKind::Table => no(&not_a_table(&schema_id, &obj.name, obj.kind)),
+                        _ => no(&format!("Table {schema_id}.{} not found", src.table)),
+                    };
+                }
+            },
         };
         let cols = &detail.columns;
         let find = |n: &str| cols.iter().find(|c| c.name.eq_ignore_ascii_case(n)).map(|c| c.name.clone());
@@ -210,6 +237,9 @@ impl QueryEngine {
         }
         let ResolvedSource { kind, schema: schema_id, detail, columns } = self.resolve_source(o, schema).await?;
         let table = detail.object.name.clone();
+        if detail.object.kind != ObjectKind::Table {
+            return no(&not_a_table(&schema_id, &table, detail.object.kind));
+        }
         let cols = &detail.columns;
         let pk: Vec<&str> = cols.iter().filter(|c| c.is_primary_key).map(|c| c.name.as_str()).collect();
         if pk.is_empty() {

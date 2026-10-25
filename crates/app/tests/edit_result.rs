@@ -112,6 +112,11 @@ async fn edits_rows_of_a_single_table_result() {
     run(&st, &conn, "create table logs (msg text)").await;
     let np = run(&st, &conn, "select * from logs").await.result.unwrap();
     assert!(api::edit_target(&st, &np.id).await.unwrap_err().message.contains("no primary key"));
+    // A view says so, not "not found" or "no primary key".
+    run(&st, &conn, "create view adults as select * from people where age >= 18").await;
+    let vw = run(&st, &conn, "select * from adults").await.result.unwrap();
+    let e = api::edit_target(&st, &vw.id).await.unwrap_err().message;
+    assert_eq!(e, "main.adults is a view: only tables can be edited");
 }
 
 #[tokio::test(flavor = "multi_thread")]
