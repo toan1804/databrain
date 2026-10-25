@@ -14,6 +14,7 @@ pub mod outputs;
 pub mod plan;
 pub mod probe;
 pub mod related;
+pub mod schema_diff;
 
 pub use load::{LoadCheck, LoadDryRun, LoadEvent, LoadObserver, LoadReport, LoadRows, LoadSpec, NoLoadObserver};
 pub use outputs::{NewOutput, OutputInfo, OutputRegistry, OutputState, OutputTables};

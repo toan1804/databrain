@@ -88,6 +88,16 @@ async fn live_server_plans() {
         Some(api::save_connection(&st, api::SaveConnectionArgs { profile, secret, clear_secret: false, extra_secrets: Default::default() }).unwrap().id)
     };
     if let Some(pg) = server(ConnectorKind::Postgres, "PG", "postgres") {
+        use databrain_query_engine::schema_diff::{DiffStatus, SchemaSide};
+        run(&st, &pg, "drop schema if exists cmp_a cascade; drop schema if exists cmp_b cascade; create schema cmp_a; create schema cmp_b; \
+            create table cmp_a.c (id int primary key, name text not null default 'x'); create table cmp_a.o (id int primary key, c_id int references cmp_a.c(id), amt numeric(12,2) not null); \
+            create table cmp_b.c (id int primary key, name varchar(10)); create table cmp_b.o (id int primary key, amt numeric(10,2))").await;
+        let side = |s: &str| SchemaSide { connection_id: pg.clone(), schema: s.into() };
+        let d = api::schema_diff(&st, &side("cmp_a"), &side("cmp_b")).await.unwrap();
+        run(&st, &pg, &d.script).await;
+        let again = api::schema_diff(&st, &side("cmp_a"), &side("cmp_b")).await.unwrap();
+        assert!(again.objects.iter().all(|o| o.status == DiffStatus::Same), "{}\n{:?}", d.script, again.objects);
+        run(&st, &pg, "drop schema cmp_a cascade; drop schema cmp_b cascade").await;
         let p = api::explain_plan(&st, &pg, "tab", "select c.relname, count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace group by c.relname", true, &none).await.unwrap();
         assert!(p.analyzed && p.execution_ms.is_some() && p.roots[0].time_ms.is_some(), "{}", p.raw);
         assert!(all_ops(&p.roots).iter().any(|o| o.contains("Join") || o.contains("Nested Loop")), "{:?}", all_ops(&p.roots));
@@ -106,4 +116,24 @@ async fn live_server_plans() {
     } else {
         eprintln!("skipping MySQL: DATABRAIN_MYSQL_HOST not set");
     }
+}
+
+/// Schema compare between two SQLite files; the script, run on the target, makes them equal.
+#[tokio::test(flavor = "multi_thread")]
+async fn compares_schemas_and_the_script_closes_the_gap() {
+    use databrain_query_engine::schema_diff::{DiffStatus, SchemaSide};
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    let dir = tempfile::tempdir().unwrap();
+    let src = conn(&st, ConnectorKind::Sqlite, &dir.path().join("src.db"));
+    let dst = conn(&st, ConnectorKind::Sqlite, &dir.path().join("dst.db"));
+    run(&st, &src, "create table customers (id integer primary key, name text not null); create table orders (id integer primary key, customer_id integer references customers(id), note text)").await;
+    run(&st, &dst, "create table customers (id integer primary key, name text not null, legacy text); create table old_log (x text)").await;
+    let side = |c: &str| SchemaSide { connection_id: c.into(), schema: "main".into() };
+    let d = api::schema_diff(&st, &side(&src), &side(&dst)).await.unwrap();
+    let status = |n: &str| d.objects.iter().find(|o| o.name == n).map(|o| o.status);
+    assert_eq!((status("orders"), status("old_log"), status("customers")), (Some(DiffStatus::OnlySource), Some(DiffStatus::OnlyTarget), Some(DiffStatus::Changed)));
+    // Run the script on the target: orders appears (the DROP of `legacy` and `old_log` stays a comment).
+    run(&st, &dst, &d.script).await;
+    let again = api::schema_diff(&st, &side(&src), &side(&dst)).await.unwrap();
+    assert_eq!(again.objects.iter().find(|o| o.name == "orders").map(|o| o.status), Some(DiffStatus::Same), "{}", again.script);
 }

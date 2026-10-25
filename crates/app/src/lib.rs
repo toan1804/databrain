@@ -692,6 +692,10 @@ async fn explain_plan(state: State<'_, AppState>, connection_id: String, session
     api::explain_plan(&state, &connection_id, &session_key, &sql, analyze, &params.unwrap_or_default()).await
 }
 #[tauri::command]
+async fn schema_diff(state: State<'_, AppState>, source: databrain_query_engine::schema_diff::SchemaSide, target: databrain_query_engine::schema_diff::SchemaSide) -> R<databrain_query_engine::schema_diff::SchemaDiff> {
+    api::schema_diff(&state, &source, &target).await
+}
+#[tauri::command]
 async fn result_links(state: State<'_, AppState>, result_id: String) -> R<Vec<databrain_query_engine::related::ResultLink>> {
     api::result_links(&state, &result_id).await
 }
@@ -1140,6 +1144,7 @@ pub fn run() {
             edit_preview,
             apply_edits,
             result_links,
+            schema_diff,
             explain_plan,
             related_rows_sql,
             cancel_load,

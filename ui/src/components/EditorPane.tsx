@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronsDownUp, FileCode2, FileText, GitFork, Network, Table2, Lightbulb, Loader2, MoreHorizontal, Play, PlayCircle, Plus, Save, Sparkles, Square, X, Workflow } from "lucide-react";
+import { ChevronsDownUp, FileCode2, FileText, GitCompare, GitFork, Network, Table2, Lightbulb, Loader2, MoreHorizontal, Play, PlayCircle, Plus, Save, Sparkles, Square, X, Workflow } from "lucide-react";
 import { isQueryTab, useActiveTab, useStore, type Tab } from "../store";
 import { editorBridge } from "../editorBridge";
 import { SqlEditor } from "./SqlEditor";
@@ -13,6 +13,7 @@ import { JobTab } from "./JobTab";
 import { TabErrorBoundary } from "./TabErrorBoundary";
 import { LineageTab, openLineage } from "./LineageTab";
 import { PlanTab, openPlan } from "./PlanTab";
+import { CompareTab } from "./CompareTab";
 import { useAi } from "../aiStore";
 import type { ConnectionView } from "../lib/types";
 
@@ -137,6 +138,15 @@ export function EditorPane() {
           <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
             <TabErrorBoundary label="lineage view">
               <LineageTab tabId={t.id} visible={t.id === activeId} />
+            </TabErrorBoundary>
+          </div>
+        ))}
+      {tabs
+        .filter((t) => t.compare)
+        .map((t) => (
+          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
+            <TabErrorBoundary label="schema compare">
+              <CompareTab tabId={t.id} visible={t.id === activeId} />
             </TabErrorBoundary>
           </div>
         ))}
@@ -285,6 +295,8 @@ function TabBar() {
               <Network size={12} className="shrink-0 text-muted" />
             ) : t.plan ? (
               <GitFork size={12} className="shrink-0 rotate-90 text-muted" />
+            ) : t.compare ? (
+              <GitCompare size={12} className="shrink-0 text-muted" />
             ) : t.job_id ? (
               <Workflow size={12} className="shrink-0 text-muted" />
             ) : (

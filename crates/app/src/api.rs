@@ -1609,6 +1609,11 @@ pub async fn explain_plan(state: &AppState, connection_id: &str, session_key: &s
     state.engine.explain(connection_id, session_key, &sql, analyze).await
 }
 
+/// Compare two schemas; the script makes `target` like `source` (not run).
+pub async fn schema_diff(state: &AppState, source: &databrain_query_engine::schema_diff::SchemaSide, target: &databrain_query_engine::schema_diff::SchemaSide) -> Result<databrain_query_engine::schema_diff::SchemaDiff> {
+    state.engine.schema_diff(source, target).await
+}
+
 /// Foreign keys from and to the table a result was read from.
 pub async fn result_links(state: &AppState, result_id: &str) -> Result<Vec<databrain_query_engine::related::ResultLink>> {
     let (o, schema) = edit_source(state, result_id)?;

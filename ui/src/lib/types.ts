@@ -1321,3 +1321,28 @@ export interface ImportReport {
   imported: number;
   errors: string[];
 }
+
+export type DiffStatus = "only_source" | "only_target" | "changed" | "same";
+
+export interface ColumnChange {
+  column?: string | null;
+  /** added | removed | type | nullable | default | primary_key | foreign_key */
+  what: string;
+  source?: string | null;
+  target?: string | null;
+}
+
+export interface ObjectDiff {
+  name: string;
+  kind: ObjectKind;
+  status: DiffStatus;
+  changes: ColumnChange[];
+}
+
+export interface SchemaDiff {
+  source_kind: ConnectorKind;
+  target_kind: ConnectorKind;
+  objects: ObjectDiff[];
+  /** Makes the target like the source (target dialect); never run by the app. */
+  script: string;
+}

@@ -1,7 +1,7 @@
 // Copy / insert actions for catalog objects (explorer tree and catalog search).
 import { traitsOf } from "../lib/sourceTraits";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { ClipboardCopy, Columns3, FileCode2, Play, RefreshCw, TextCursorInput } from "lucide-react";
+import { ClipboardCopy, Columns3, FileCode2, GitCompare, Play, RefreshCw, TextCursorInput } from "lucide-react";
 import { toError } from "../lib/api";
 import { isRelationKind, columnList, schemaLabel, schemaPath, splitSchema, tablePath } from "../lib/catalog";
 import type { ConnectionView, DbObject, SchemaInfo } from "../lib/types";
@@ -9,6 +9,7 @@ import { quoteIdent } from "../lib/util";
 import { editorBridge } from "../editorBridge";
 import { useStore } from "../store";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
+import { openCompare } from "./CompareTab";
 
 export async function copyText(text: string, what: string) {
   try {
@@ -100,6 +101,9 @@ export function SchemaMenu({
       {catalog && <MenuItem icon={<ClipboardCopy size={13} />} label={`Copy ${nounOf(conn)} name`} hint={catalog} onClick={run(() => void copyText(catalog, `${nounOf(conn)} name`))} />}
       <MenuSeparator />
       <MenuItem icon={<TextCursorInput size={13} />} label="Insert schema path" onClick={run(() => insertText(path))} />
+      {traitsOf(kind).language === "sql" && (
+        <MenuItem icon={<GitCompare size={13} />} label="Compare with another schema…" onClick={run(() => openCompare({ connection_id: conn.id, schema: schema.name }))} />
+      )}
       {onRefresh && (
         <>
           <MenuSeparator />

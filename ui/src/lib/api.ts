@@ -71,6 +71,7 @@ import type {
   ApplyReport,
   ResultLink,
   QueryPlan,
+  SchemaDiff,
   SqlFile,
   ImportSource,
   ImportPreview,
@@ -231,6 +232,8 @@ export const api = {
   editTarget: (resultId: string) => call<EditTarget>("edit_target", { resultId }),
   editPreview: (resultId: string, target: EditTarget, changes: RowChange[]) => call<EditStatement[]>("edit_preview", { resultId, target, changes }),
   applyEdits: (resultId: string, changes: RowChange[]) => call<ApplyReport>("apply_edits", { resultId, changes }),
+  /** Compare two schemas; the script makes `target` like `source` (not run). */
+  schemaDiff: (source: { connection_id: string; schema: string }, target: { connection_id: string; schema: string }) => call<SchemaDiff>("schema_diff", { source, target }),
   /** Foreign keys from and to the table a result was read from. */
   resultLinks: (resultId: string) => call<ResultLink[]>("result_links", { resultId }),
   /** EXPLAIN one statement on the tab's session (`analyze` runs it: reads only). */
