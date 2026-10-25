@@ -4,6 +4,7 @@ pub mod ai_api;
 pub mod api;
 pub mod jobs;
 pub mod meta_writer;
+pub mod conn_io;
 pub mod sql_files;
 
 use std::sync::Arc;
@@ -751,6 +752,21 @@ async fn close_tab(state: State<'_, AppState>, tab_id: String) -> R<()> {
 }
 
 #[tauri::command]
+fn export_connections(state: State<'_, AppState>, ids: Option<Vec<String>>, path: String) -> R<usize> {
+    conn_io::export_connections(&state, ids, &path)
+}
+
+#[tauri::command]
+fn import_connections_preview(state: State<'_, AppState>, source: conn_io::ImportSource, path: Option<String>) -> R<conn_io::ImportPreview> {
+    conn_io::import_preview(&state, source, path)
+}
+
+#[tauri::command]
+fn import_connections(state: State<'_, AppState>, source: conn_io::ImportSource, path: Option<String>, picks: Vec<usize>) -> R<conn_io::ImportReport> {
+    conn_io::import_apply(&state, source, path, &picks)
+}
+
+#[tauri::command]
 async fn read_sql_file(path: String) -> R<sql_files::SqlFile> {
     tauri::async_runtime::spawn_blocking(move || sql_files::read_sql_file(&path)).await.map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?
 }
@@ -1138,6 +1154,9 @@ pub fn run() {
             close_tab,
             set_auto_commit,
             read_sql_file,
+            export_connections,
+            import_connections_preview,
+            import_connections,
             write_sql_file,
             sql_file_mtimes,
             transaction_state,

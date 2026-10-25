@@ -36,6 +36,7 @@ import {
   TextCursorInput,
   Trash2,
   Upload,
+  Download,
   Unplug,
   WifiOff,
   Workflow,
@@ -75,6 +76,7 @@ import { OutputsPanel } from "./OutputsPanel";
 import { useJobs } from "../jobsStore";
 import { scheduleText } from "../lib/jobGraph";
 import { askExcelSheets } from "./ExcelSheetDialog";
+import { exportConnections } from "./ConnectionsIoDialog";
 import { openOutput } from "../outputs";
 import { useStore, type SidebarPanel } from "../store";
 import { editorBridge } from "../editorBridge";
@@ -283,6 +285,9 @@ function ConnectionsPanel() {
           <MenuSeparator />
           <MenuItem icon={<FileSearch size={13} />} label="Query a local file…" onClick={() => (setBlankMenu(null), void queryLocalFile())} />
           <MenuItem icon={<Upload size={13} />} label="Import a file into a table…" onClick={() => (setBlankMenu(null), void queryLocalFile(true))} />
+          <MenuSeparator />
+          <MenuItem icon={<Download size={13} />} label="Import connections…" onClick={() => (setBlankMenu(null), useStore.getState().setImportConnectionsOpen(true))} />
+          <MenuItem icon={<Upload size={13} />} label="Export connections…" onClick={() => (setBlankMenu(null), void exportConnections())} />
         </Popover>
       )}
     </>

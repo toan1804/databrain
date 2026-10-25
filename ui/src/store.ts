@@ -191,6 +191,9 @@ interface State {
   setAutoCommit: (tabId: string, on: boolean) => void;
   /** Recently opened or saved .sql files, newest first. */
   recentFiles: string[];
+  /** The "Import connections" dialog. */
+  importConnectionsOpen: boolean;
+  setImportConnectionsOpen: (open: boolean) => void;
   /** Open a .sql file in a tab (asks for one without `path`); focuses its tab when open. */
   openSqlFile: (path?: string) => Promise<void>;
   /** Save a tab to its file (asks for a path for other tabs, or with `saveAs`). */
@@ -647,6 +650,8 @@ export const useStore = create<State>((set, get) => ({
     if (isTauri()) api.setAutoCommit(tabId, on).catch(() => {});
   },
   recentFiles: [],
+  importConnectionsOpen: false,
+  setImportConnectionsOpen: (open) => set({ importConnectionsOpen: open }),
   openSqlFile: async (path) => {
     const s = get();
     if (!path) {

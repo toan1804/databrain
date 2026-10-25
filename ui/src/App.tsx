@@ -7,6 +7,7 @@ import { Sidebar } from "./components/Sidebar";
 import { EditorPane } from "./components/EditorPane";
 import { ConnectionDialog } from "./components/ConnectionDialog";
 import { SaveQueryDialog } from "./components/SaveQueryDialog";
+import { ImportConnectionsDialog } from "./components/ConnectionsIoDialog";
 import { CommandPalette } from "./components/CommandPalette";
 import { ConfirmDialog, Toasts } from "./components/ui";
 import { AiPanel } from "./components/AiPanel";
@@ -88,6 +89,12 @@ function useGlobalShortcuts() {
       window.removeEventListener("focus", onFocus);
     };
   }, []);
+}
+
+function ImportConnections() {
+  const open = useStore((s) => s.importConnectionsOpen);
+  const setOpen = useStore((s) => s.setImportConnectionsOpen);
+  return open ? <ImportConnectionsDialog onClose={() => setOpen(false)} /> : null;
 }
 
 export default function App() {
@@ -205,6 +212,7 @@ export default function App() {
       </div>
       <ConnectionDialog />
       <SaveQueryDialog />
+      <ImportConnections />
       <CommandPalette />
       <SettingsDialog />
       <SignInDialog />

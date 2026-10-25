@@ -5,6 +5,7 @@ import { useAi } from "../aiStore";
 import { useJobs } from "../jobsStore";
 import { openOutput, openResultsQuery, outputLabel, outputRef } from "../outputs";
 import { queryLocalFile } from "./Sidebar";
+import { exportConnections } from "./ConnectionsIoDialog";
 import { fuzzyMatch, relativeTime, sqlPreview } from "../lib/util";
 import { baseName, isQueryTab, useStore } from "../store";
 import { ConnDot } from "./ui";
@@ -56,6 +57,8 @@ function Palette() {
         run: () => setTimeout(() => st.openCatalogSearch(), 0),
       },
       { id: "new-conn", group: "Actions", label: "New connection", icon: <Database size={14} />, run: () => st.openConnectionDialog(null) },
+      { id: "import-conns", group: "Actions", label: "Import connections (DBeaver, pgpass, DataBrain file)…", icon: <Database size={14} />, run: () => st.setImportConnectionsOpen(true) },
+      { id: "export-conns", group: "Actions", label: "Export connections (without passwords)…", icon: <Database size={14} />, run: () => void exportConnections() },
       { id: "open-file", group: "Files", label: "Open SQL file…", icon: <FolderOpen size={14} />, hint: "⌘O", run: () => void st.openSqlFile() },
       ...(isQueryTab(active)
         ? [{ id: "save-file", group: "Files", label: active.file_path ? `Save to ${baseName(active.file_path)}` : "Save tab to a file…", icon: <Save size={14} />, hint: active.file_path ? "⌘S" : "⇧⌘S", run: () => void st.saveTabFile(active.id) }]

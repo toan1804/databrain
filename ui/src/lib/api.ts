@@ -72,6 +72,9 @@ import type {
   ResultLink,
   QueryPlan,
   SqlFile,
+  ImportSource,
+  ImportPreview,
+  ImportReport,
   LoadReport,
   RunRequest,
   RunResponse,
@@ -207,6 +210,10 @@ export const api = {
   cancelQuery: (jobId: string) => call<boolean>("cancel_query", { jobId }),
   closeTab: (tabId: string) => call<void>("close_tab", { tabId }),
   readSqlFile: (path: string) => call<SqlFile>("read_sql_file", { path }),
+  /** Write connections (all when `ids` is null) to a file, without secrets. */
+  exportConnections: (ids: string[] | null, path: string) => call<number>("export_connections", { ids, path }),
+  importConnectionsPreview: (source: ImportSource, path: string | null) => call<ImportPreview>("import_connections_preview", { source, path }),
+  importConnections: (source: ImportSource, path: string | null, picks: number[]) => call<ImportReport>("import_connections", { source, path, picks }),
   /** Save a file; `expectedMtime` refuses to overwrite one changed outside since. Resolves to the new mtime. */
   writeSqlFile: (path: string, text: string, expectedMtime: number | null) => call<number>("write_sql_file", { path, text, expectedMtime }),
   sqlFileMtimes: (paths: string[]) => call<(number | null)[]>("sql_file_mtimes", { paths }),

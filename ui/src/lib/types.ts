@@ -1294,3 +1294,30 @@ export interface QueryPlan {
   planning_ms?: number;
   execution_ms?: number;
 }
+
+/** Where connections are imported from. */
+export type ImportSource = "file" | "dbeaver" | "pgpass";
+
+export interface ImportCandidate {
+  index: number;
+  name: string;
+  folder: string[];
+  kind: ConnectorKind;
+  target: string;
+  user?: string | null;
+  env: EnvTag;
+  /** Name of an existing connection to the same place. */
+  existing?: string | null;
+  has_password: boolean;
+  note?: string | null;
+}
+
+export interface ImportPreview {
+  path: string;
+  candidates: ImportCandidate[];
+}
+
+export interface ImportReport {
+  imported: number;
+  errors: string[];
+}
