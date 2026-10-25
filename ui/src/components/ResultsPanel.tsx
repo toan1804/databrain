@@ -35,7 +35,7 @@ import { OutputChip } from "./OutputChip";
 import { mentionInAi, outputLabel } from "../outputs";
 import { planFind } from "../lib/find";
 import { api, toError } from "../lib/api";
-import type { ColumnStats, EditStatement, EditTarget, ExportFormat, FilterOp, ResultInfo, ViewSpec } from "../lib/types";
+import type { ColumnStats, EditStatement, EditTarget, ExportFormat, FilterOp, ResultInfo, ResultLink, ViewSpec } from "../lib/types";
 import { editCount, emptyEdits, toChanges, type PendingEdits } from "../lib/gridEdits";
 import {
   FILTER_OPS,
@@ -463,6 +463,18 @@ export function ResultView({
       toast(toError(e).message, "error");
     }
   };
+  /** Follow a foreign key: its rows open in a new query tab and run. */
+  const openRelated = async (link: ResultLink, rows: (string | null)[][]) => {
+    if (!connId) return;
+    try {
+      const sql = await api.relatedRowsSql(info.id, link, rows);
+      const s = useStore.getState();
+      const id = s.newTab({ title: link.table, sql, connection_id: connId });
+      void s.runTab(id, "all", { doc: sql, selFrom: 0, selTo: 0, cursor: 0 });
+    } catch (e) {
+      toast(toError(e).message, "error");
+    }
+  };
   const saveEdits = async () => {
     if (!target || !changes) return;
     setSaving(true);
@@ -766,6 +778,7 @@ export function ResultView({
           onSelectionRange={setSelRange}
           onTranspose={setTranspose}
           edit={target ? { target, edits, onEdits: setEdits } : null}
+          onOpenRelated={connId ? (link, rows) => void openRelated(link, rows) : undefined}
         />
         )}
       </div>

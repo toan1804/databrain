@@ -685,6 +685,14 @@ fn edit_preview(
 async fn apply_edits(state: State<'_, AppState>, result_id: String, changes: Vec<databrain_query_engine::edit::RowChange>) -> R<databrain_query_engine::edit::ApplyReport> {
     api::apply_edits(&state, &result_id, changes).await
 }
+#[tauri::command]
+async fn result_links(state: State<'_, AppState>, result_id: String) -> R<Vec<databrain_query_engine::related::ResultLink>> {
+    api::result_links(&state, &result_id).await
+}
+#[tauri::command]
+fn related_rows_sql(state: State<'_, AppState>, result_id: String, link: databrain_query_engine::related::ResultLink, rows: Vec<Vec<Option<String>>>) -> R<String> {
+    api::related_rows_sql(&state, &result_id, &link, &rows)
+}
 
 #[tauri::command]
 async fn load_result(state: State<'_, AppState>, result_id: String, args: api::LoadResultArgs, load_id: String) -> R<databrain_query_engine::LoadReport> {
@@ -1094,6 +1102,8 @@ pub fn run() {
             edit_target,
             edit_preview,
             apply_edits,
+            result_links,
+            related_rows_sql,
             cancel_load,
             dry_run_result_load,
             sql_parameters,

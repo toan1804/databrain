@@ -444,6 +444,29 @@ impl Workspace {
         Ok(delta)
     }
 
+    /// Indexed foreign keys that reference `table` (any schema of the
+    /// connection), as (schema, table, key). `None`: the connection has no
+    /// indexed objects, so the index can't tell.
+    pub fn kn_foreign_keys_to(&self, connection_id: &str, table: &str) -> Result<Option<Vec<(String, String, ForeignKey)>>> {
+        let c = self.conn.lock();
+        let any: i64 = c.query_row("SELECT COUNT(*) FROM (SELECT 1 FROM kn_objects WHERE connection_id = ?1 LIMIT 1)", [connection_id], |r| r.get(0))?;
+        if any == 0 {
+            return Ok(None);
+        }
+        let mut stmt = c.prepare("SELECT schema_name, name, fks_json FROM kn_objects WHERE connection_id = ?1 AND fks_json LIKE ?2")?;
+        let like = format!("%{}%", table.replace('%', "").replace('_', "%"));
+        let mut out = Vec::new();
+        for row in stmt.query_map(params![connection_id, like], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+            let (schema, name, json) = row?;
+            for fk in serde_json::from_str::<Vec<ForeignKey>>(&json).unwrap_or_default() {
+                if fk.ref_table.eq_ignore_ascii_case(table) {
+                    out.push((schema.clone(), name.clone(), fk));
+                }
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Add or refresh single objects (indexing chosen tables), keeping the
     /// rest of their schemas. Returns how many changed.
     pub fn kn_upsert_objects(&self, connection_id: &str, objects: &[KnObject]) -> Result<usize> {

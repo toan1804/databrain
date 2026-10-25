@@ -14,9 +14,9 @@ import {
   type Theme,
 } from "@glideapps/glide-data-grid";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { ArrowDown, ArrowUp, Ban, Copy, Filter, FilterX, Rows3, Trash2, Undo2, X } from "lucide-react";
+import { ArrowDown, ArrowDownLeft, ArrowUp, ArrowUpRight, Ban, Copy, Filter, FilterX, Rows3, Trash2, Undo2, X } from "lucide-react";
 import { api, toError } from "../lib/api";
-import type { ColumnMeta, EditTarget, ExportFormat, ResultInfo, ViewSpec } from "../lib/types";
+import type { ColumnMeta, EditTarget, ExportFormat, ResultInfo, ResultLink, ViewSpec } from "../lib/types";
 import { addRow, removeNewRow, revertRows, setCell, setNewCell, toggleDelete, type PendingEdits } from "../lib/gridEdits";
 import { pageRange, toggleSort, upsertFilter } from "../lib/util";
 import { columnTypeInfo, engineName } from "../lib/columnType";
@@ -128,6 +128,8 @@ interface Props {
   onTranspose?: (range: { cols: number[]; offset: number; limit: number }) => void;
   /** Editing: cells of the target table's columns can be changed. */
   edit?: { target: EditTarget; edits: PendingEdits; onEdits: (e: PendingEdits) => void } | null;
+  /** Follow a foreign key from the selected rows (values in `link.columns` order). */
+  onOpenRelated?: (link: ResultLink, rows: (string | null)[][]) => void;
 }
 
 const CHANGED_BG = "rgba(250, 204, 21, 0.20)";
@@ -135,7 +137,7 @@ const DELETED_BG = "rgba(239, 68, 68, 0.14)";
 const NEW_BG = "rgba(34, 197, 94, 0.12)";
 
 export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
-  { info, view, onViewChange, onHeaderMenu, onViewRows, findMatches, findCurrent, dialect, onSelectionRange, onTranspose, edit },
+  { info, view, onViewChange, onHeaderMenu, onViewRows, findMatches, findCurrent, dialect, onSelectionRange, onTranspose, edit, onOpenRelated },
   ref,
 ) {
   const theme = useGridTheme();
@@ -163,6 +165,14 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
     return c ? columnTypeInfo(c, info.id, outputs) : null;
   }, [hoverHead, info.columns, info.id, outputs]);
   const autoSized = useRef(false);
+  /** Foreign keys of the result's table (loaded on the first cell menu). */
+  const [links, setLinks] = useState<ResultLink[] | null>(null);
+  useEffect(() => setLinks(null), [info.id]);
+  const loadLinks = () => {
+    if (links !== null || !onOpenRelated) return;
+    setLinks([]);
+    api.resultLinks(info.id).then(setLinks, () => setLinks([]));
+  };
 
   const fetchPage = useCallback(
     async (p: number) => {
@@ -486,6 +496,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
             });
           }
           setMenu({ x: e.bounds.x + e.localEventX, y: e.bounds.y + e.localEventY, cell });
+          loadLinks();
         }}
         getCellsForSelection={undefined}
       />
@@ -588,6 +599,32 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
                   />
                 </>
               )}
+            </>
+          )}
+          {onOpenRelated && links && links.length > 0 && (
+            <>
+              <MenuSeparator />
+              {[...links]
+                // Keys through the clicked column first.
+                .sort((a, b) => Number(b.columns.includes(menu.cell[0])) - Number(a.columns.includes(menu.cell[0])))
+                .slice(0, 10)
+                .map((l, i) => (
+                  <MenuItem
+                    key={i}
+                    icon={l.direction === "parent" ? <ArrowUpRight size={13} /> : <ArrowDownLeft size={13} />}
+                    label={l.direction === "parent" ? `Open referenced ${l.table}` : `Rows in ${l.table} referencing this`}
+                    hint={l.direction === "parent" ? info.columns.filter((_, c) => l.columns.includes(c)).map((c) => c.name).join(", ") : l.target_columns.join(", ")}
+                    onClick={() => {
+                      setMenu(null);
+                      const vals = selectedRows()
+                        .filter((r) => r < rows)
+                        .map((r) => pages.current.get(Math.floor(r / PAGE))?.[r % PAGE])
+                        .filter((r): r is (string | null)[] => !!r)
+                        .map((r) => l.columns.map((c) => r[c] ?? null));
+                      onOpenRelated(l, vals);
+                    }}
+                  />
+                ))}
             </>
           )}
           <MenuSeparator />

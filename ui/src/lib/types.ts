@@ -1077,6 +1077,16 @@ export interface ApplyReport {
   in_open_transaction: boolean;
 }
 
+/** A foreign key from (parent) or to (children) a result's table. */
+export interface ResultLink {
+  direction: "parent" | "children";
+  schema: string;
+  table: string;
+  /** Result column indexes holding the values to look up. */
+  columns: number[];
+  target_columns: string[];
+}
+
 /** "Load into…" a table from the result grid. */
 export interface LoadResultArgs {
   target_connection_id: string;

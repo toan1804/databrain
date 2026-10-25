@@ -69,6 +69,7 @@ import type {
   EditTarget,
   EditStatement,
   ApplyReport,
+  ResultLink,
   LoadReport,
   RunRequest,
   RunResponse,
@@ -217,6 +218,10 @@ export const api = {
   editTarget: (resultId: string) => call<EditTarget>("edit_target", { resultId }),
   editPreview: (resultId: string, target: EditTarget, changes: RowChange[]) => call<EditStatement[]>("edit_preview", { resultId, target, changes }),
   applyEdits: (resultId: string, changes: RowChange[]) => call<ApplyReport>("apply_edits", { resultId, changes }),
+  /** Foreign keys from and to the table a result was read from. */
+  resultLinks: (resultId: string) => call<ResultLink[]>("result_links", { resultId }),
+  /** The query for the rows a link leads to (one value list per row, in `link.columns` order). */
+  relatedRowsSql: (resultId: string, link: ResultLink, rows: (string | null)[][]) => call<string>("related_rows_sql", { resultId, link, rows }),
   /** Copy a result's fetched rows into a table (job load code). */
   loadResult: (resultId: string, args: LoadResultArgs, loadId: string) => call<LoadReport>("load_result", { resultId, args, loadId }),
   cancelLoad: (loadId: string) => call<boolean>("cancel_load", { loadId }),

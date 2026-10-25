@@ -113,3 +113,38 @@ async fn edits_rows_of_a_single_table_result() {
     let np = run(&st, &conn, "select * from logs").await.result.unwrap();
     assert!(api::edit_target(&st, &np.id).await.unwrap_err().message.contains("no primary key"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn follows_foreign_keys_both_ways() {
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
+    c.file_path = Some(dir.path().join("fk.db").to_string_lossy().into_owned());
+    let profile = ConnectionProfile { id: String::new(), name: "fk".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
+    let conn = api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    run(&st, &conn, "create table customers (id integer primary key, name text)").await;
+    run(&st, &conn, "create table orders (id integer primary key, customer_id integer references customers(id), amount real)").await;
+    run(&st, &conn, "insert into customers values (1, 'Ann'), (2, 'Bob')").await;
+    run(&st, &conn, "insert into orders values (10, 1, 5.0), (11, 1, 7.5), (12, 2, 1.0)").await;
+
+    use databrain_query_engine::related::LinkDirection;
+    // Orders → their customer.
+    let o = run(&st, &conn, "select * from orders order by id").await.result.unwrap();
+    let links = api::result_links(&st, &o.id).await.unwrap();
+    let parent = links.iter().find(|l| l.direction == LinkDirection::Parent).expect("orders.customer_id → customers");
+    assert_eq!((parent.table.as_str(), parent.columns.clone(), parent.target_columns.clone()), ("customers", vec![1], vec!["id".to_string()]));
+    let sql = api::related_rows_sql(&st, &o.id, parent, &[vec![Some("1".into())], vec![Some("1".into())]]).unwrap();
+    assert_eq!(rows(&st, &conn, &sql).await, vec![vec![Some("1".into()), Some("Ann".into())]]);
+
+    // Customers ← their orders (the schema is read: no knowledge index here).
+    let cu = run(&st, &conn, "select id, name from customers").await.result.unwrap();
+    let links = api::result_links(&st, &cu.id).await.unwrap();
+    let children = links.iter().find(|l| l.direction == LinkDirection::Children).expect("orders reference customers");
+    assert_eq!((children.table.as_str(), children.columns.clone(), children.target_columns.clone()), ("orders", vec![0], vec!["customer_id".to_string()]));
+    let sql = api::related_rows_sql(&st, &cu.id, children, &[vec![Some("1".into())]]).unwrap();
+    assert_eq!(rows(&st, &conn, &format!("{sql} order by id")).await.len(), 2);
+
+    // Not from one table: no links (and no error).
+    let j = run(&st, &conn, "select count(*) from orders").await.result.unwrap();
+    assert!(api::result_links(&st, &j.id).await.unwrap().is_empty());
+}

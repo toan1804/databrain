@@ -12,6 +12,7 @@ pub mod edit;
 pub mod load;
 pub mod outputs;
 pub mod probe;
+pub mod related;
 
 pub use load::{LoadCheck, LoadDryRun, LoadEvent, LoadObserver, LoadReport, LoadRows, LoadSpec, NoLoadObserver};
 pub use outputs::{NewOutput, OutputInfo, OutputRegistry, OutputState, OutputTables};

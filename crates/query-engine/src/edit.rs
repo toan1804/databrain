@@ -149,17 +149,24 @@ pub(crate) fn apply_style(kind: ConnectorKind) -> Option<(&'static str, &'static
     }
 }
 
+/// A result's source table, described, with the table column of each result column.
+pub(crate) struct ResolvedSource {
+    pub kind: ConnectorKind,
+    /// Schema id (as the explorer names it).
+    pub schema: String,
+    pub detail: databrain_connector_core::ObjectDetail,
+    /// Per result column: the table column it shows (None: an expression).
+    pub columns: Vec<Option<String>>,
+}
+
 impl QueryEngine {
-    /// The table a result can be edited in, or why it can't.
-    pub async fn edit_target(&self, o: &OutputInfo, schema: &SchemaRef) -> Result<EditTarget> {
+    /// The one table a result's query reads, described, and which result
+    /// column shows which of its columns. `Err` says why there is none.
+    pub(crate) async fn resolve_source(&self, o: &OutputInfo, schema: &SchemaRef) -> Result<ResolvedSource> {
         let no = |why: &str| Err(EngineError::new("invalid", why.to_string()));
-        let profile = self.workspace().get_connection(&o.connection_id)?;
-        if profile.config.read_only {
-            return no("The connection is read-only");
-        }
-        let kind = profile.config.kind;
+        let kind = self.workspace().get_connection(&o.connection_id)?.config.kind;
         if !kind.traits().language.is_sql() {
-            return no("Only results of SQL databases can be edited");
+            return no("Only results of SQL databases have a source table");
         }
         let Some(src) = source_table(&o.sql, kind) else {
             return no("Only results of a query on one table (no join, grouping or DISTINCT) can be edited");
@@ -178,10 +185,8 @@ impl QueryEngine {
             Ok(d) => d,
             Err(_) => self.describe(&o.connection_id, &schema_id, &src.table.to_uppercase()).await.or(Err(EngineError::new("invalid", format!("Table {schema_id}.{} not found", src.table))))?,
         };
-        let table = detail.object.name.clone();
         let cols = &detail.columns;
         let find = |n: &str| cols.iter().find(|c| c.name.eq_ignore_ascii_case(n)).map(|c| c.name.clone());
-        // Result column → table column.
         let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         let explicit = !src.items.is_empty() && src.items.iter().all(Option::is_some);
         let columns: Vec<Option<String>> = if explicit && src.items.len() == names.len() {
@@ -190,6 +195,22 @@ impl QueryEngine {
             // `*` (maybe with more items): by name.
             names.iter().map(|n| find(n)).collect()
         };
+        Ok(ResolvedSource { kind, schema: schema_id, detail, columns })
+    }
+
+    /// The table a result can be edited in, or why it can't.
+    pub async fn edit_target(&self, o: &OutputInfo, schema: &SchemaRef) -> Result<EditTarget> {
+        let no = |why: &str| Err(EngineError::new("invalid", why.to_string()));
+        let profile = self.workspace().get_connection(&o.connection_id)?;
+        if profile.config.read_only {
+            return no("The connection is read-only");
+        }
+        if !profile.config.kind.traits().language.is_sql() {
+            return no("Only results of SQL databases can be edited");
+        }
+        let ResolvedSource { kind, schema: schema_id, detail, columns } = self.resolve_source(o, schema).await?;
+        let table = detail.object.name.clone();
+        let cols = &detail.columns;
         let pk: Vec<&str> = cols.iter().filter(|c| c.is_primary_key).map(|c| c.name.as_str()).collect();
         if pk.is_empty() {
             return no(&format!("{table} has no primary key: rows can't be told apart"));
