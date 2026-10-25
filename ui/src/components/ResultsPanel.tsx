@@ -555,7 +555,7 @@ export function ResultView({
 
   return (
     <div
-      className="flex h-full min-h-0 flex-col"
+      className="@container flex h-full min-h-0 flex-col"
       onKeyDownCapture={(e) => {
         if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
           e.preventDefault();
@@ -566,7 +566,7 @@ export function ResultView({
     >
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-2">
         {stmt.output && <OutputChip output={stmt.output} />}
-        <div className="flex rounded-md border border-line p-0.5" role="radiogroup" aria-label="View">
+        <div className="flex shrink-0 rounded-md border border-line p-0.5" role="radiogroup" aria-label="View">
           {(["grid", "chart"] as const).map((m) => (
             <button
               key={m}
@@ -580,7 +580,7 @@ export function ResultView({
             </button>
           ))}
         </div>
-        <div className="relative w-56">
+        <div className="relative w-56 min-w-28 shrink">
           <ListFilter size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-muted" />
           <input
             className="field py-1 pl-7 pr-6"
@@ -615,11 +615,11 @@ export function ResultView({
             </button>
           )}
         </div>
-        <button className="icon-btn" title={kbd("Find (⌘F)")} aria-label="Find in results" onClick={openFind}>
+        <button className="icon-btn shrink-0" title={kbd("Find (⌘F)")} aria-label="Find in results" onClick={openFind}>
           <Search size={14} />
         </button>
         <button
-          className={`icon-btn ${valueOpen ? "text-accent" : ""}`}
+          className={`icon-btn shrink-0 ${valueOpen ? "text-accent" : ""}`}
           title={kbd("Value panel: the selected cell's whole value (JSON, XML, binary, long text) (⇧Space)")}
           aria-label="Value panel"
           aria-pressed={valueOpen}
@@ -628,7 +628,8 @@ export function ResultView({
           <Braces size={14} />
         </button>
         <button
-          className="btn-ghost border border-line py-1"
+          className="btn-ghost shrink-0 whitespace-nowrap border border-line py-1"
+          aria-label="Ask AI"
           title={stmt.output ? `Open the AI assistant with @${outputLabel(stmt.output)} mentioned, then ask your own question` : "Ask the AI to analyze this result"}
           onClick={() => {
             if (stmt.output) {
@@ -644,25 +645,32 @@ export function ResultView({
             });
           }}
         >
-          <Sparkles size={13} /> Ask AI
+          <Sparkles size={13} /> <span className="hidden @3xl:inline">Ask AI</span>
         </button>
         <button
-          className={`btn-ghost border py-1 ${target ? "border-accent text-accent" : "border-line"}`}
+          className={`btn-ghost shrink-0 whitespace-nowrap border py-1 ${target ? "border-accent text-accent" : "border-line"}`}
           aria-pressed={!!target}
+          aria-label="Edit"
           onClick={() => (target ? stopEditing() : void startEditing())}
           title="Edit cells, add and delete rows of the table this result comes from (needs a primary key)"
         >
-          <Pencil size={13} /> Edit
+          <Pencil size={13} /> <span className="hidden @3xl:inline">Edit</span>
         </button>
         <button
-          className="btn-ghost border border-line py-1"
+          className="btn-ghost shrink-0 whitespace-nowrap border border-line py-1"
+          aria-label="Load into…"
           onClick={() => setLoadOpen(true)}
           title="Copy these rows into a table of any connection (insert, replace, update or merge by key)"
         >
-          <Upload size={13} /> Load into…
+          <Upload size={13} /> <span className="hidden @3xl:inline">Load into…</span>
         </button>
-        <button className="btn-ghost border border-line py-1" onClick={() => setExportOpen(true)}>
-          <Download size={13} /> Export
+        <button
+          className="btn-ghost shrink-0 whitespace-nowrap border border-line py-1"
+          aria-label="Export"
+          title="Export"
+          onClick={() => setExportOpen(true)}
+        >
+          <Download size={13} /> <span className="hidden @3xl:inline">Export</span>
         </button>
       </div>
 
@@ -752,29 +760,28 @@ export function ResultView({
 
       {target && (
         <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line bg-accent/8 px-2 text-[12px]">
-          <Pencil size={13} className="text-accent" />
-          <span className="truncate">
+          <Pencil size={13} className="shrink-0 text-accent" />
+          <span className="min-w-0 shrink truncate">
             Editing <span className="font-mono">{target.schema ? `${target.schema}.` : ""}{target.table}</span>
           </span>
-          <span className="text-muted" aria-live="polite">
+          <span className="min-w-0 flex-1 truncate text-muted" aria-live="polite">
             · {changes ? `${formatCount(changes)} change${changes === 1 ? "" : "s"}` : "double-click a cell to change it, right-click for rows"}
           </span>
           {target.apply === "statements" && (
-            <span className="rounded bg-warning/15 px-1.5 text-warning" title="This database has no transactions here: changes are written one statement at a time">
+            <span className="shrink-0 whitespace-nowrap rounded bg-warning/15 px-1.5 text-warning" title="This database has no transactions here: changes are written one statement at a time">
               no rollback
             </span>
           )}
-          <span className="ml-auto" />
-          <button className="btn-ghost h-6 py-0 text-[11.5px]" disabled={!changes} onClick={() => void showPreview()}>
+          <button className="btn-ghost h-6 shrink-0 whitespace-nowrap py-0 text-[11.5px]" disabled={!changes} onClick={() => void showPreview()}>
             Preview SQL
           </button>
-          <button className="btn-ghost h-6 py-0 text-[11.5px]" disabled={!changes} onClick={() => setEdits(emptyEdits())}>
+          <button className="btn-ghost h-6 shrink-0 whitespace-nowrap py-0 text-[11.5px]" disabled={!changes} onClick={() => setEdits(emptyEdits())}>
             Discard
           </button>
-          <button className="btn-primary h-6 py-0 text-[11.5px]" disabled={!changes || saving} onClick={() => void saveEdits()}>
+          <button className="btn-primary h-6 shrink-0 whitespace-nowrap py-0 text-[11.5px]" disabled={!changes || saving} onClick={() => void saveEdits()}>
             {saving ? <Loader2 size={12} className="animate-spin" /> : null} Save
           </button>
-          <button className="btn-ghost h-6 py-0 text-[11.5px]" onClick={stopEditing}>
+          <button className="btn-ghost h-6 shrink-0 whitespace-nowrap py-0 text-[11.5px]" onClick={stopEditing}>
             Done editing
           </button>
         </div>
