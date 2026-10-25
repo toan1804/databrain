@@ -1773,7 +1773,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "databrain-ai"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-auth"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1869,7 +1869,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-cloud"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrow 59.3.0",
  "async-trait",
@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-duckdb"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrow 58.4.0",
  "async-trait",
@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-mongodb"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -1938,7 +1938,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-mssql"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -1952,7 +1952,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-mysql"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -1966,7 +1966,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-neo4j"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-oracle"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -1999,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-postgres"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-sqlite"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-duckdb-dynload"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libduckdb-sys",
  "libloading",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-export"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "databrain-connector-core",
  "databrain-result-store",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-lineage"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "databrain-connector-core",
  "serde",
@@ -2059,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-query-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "databrain-auth",
  "databrain-connector-core",
@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-result-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "databrain-connector-core",
  "parking_lot",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-ssh-tunnel"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "databrain-connector-core",
  "rand 0.10.3",
@@ -2103,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-workspace"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "databrain-auth",

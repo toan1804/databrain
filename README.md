@@ -6,8 +6,8 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
 
 | Platform | Download |
 |---|---|
-| macOS (Apple Silicon) | [DataBrain_0.2.0_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.2.0/DataBrain_0.2.0_aarch64.dmg) |
-| macOS (Apple Silicon), without DuckDB | [DataBrain-no-duckdb_0.2.0_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.2.0/DataBrain-no-duckdb_0.2.0_aarch64.dmg) (uses the DuckDB installed on the computer, see "Runtime notes" below) |
+| macOS (Apple Silicon) | [DataBrain_0.2.1_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.2.1/DataBrain_0.2.1_aarch64.dmg) |
+| macOS (Apple Silicon), without DuckDB | [DataBrain-no-duckdb_0.2.1_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.2.1/DataBrain-no-duckdb_0.2.1_aarch64.dmg) (uses the DuckDB installed on the computer, see "Runtime notes" below) |
 | macOS (Intel), Windows, Linux | Built for each release by the Release workflow (`.dmg`, `-setup.exe`/`.msi`, `.AppImage`/`.deb`/`.rpm`) from the next release on |
 
 All versions are on the [Releases](https://github.com/toan1804/databrain/releases) page. To build it yourself, see [Run](#run). DataBrain checks for a newer release once a day and shows a banner with the download for your computer (Settings → Updates turns it off; nothing installs by itself).

@@ -29,24 +29,24 @@ path = "src/bin/databrain-jobs.rs"
 [dependencies]
 futures = "0.3.34"
 async-trait = "0.1.92"
-databrain-ai = { version = "0.2.0", path = "../ai" }
-databrain-auth = { version = "0.2.0", path = "../auth" }
-databrain-connector-cloud = { version = "0.2.0", path = "../connectors/cloud", default-features = false, optional = true }
-databrain-connector-core = { version = "0.2.0", path = "../connector-core" }
-databrain-lineage = { version = "0.2.0", path = "../lineage" }
+databrain-ai = { version = "0.2.1", path = "../ai" }
+databrain-auth = { version = "0.2.1", path = "../auth" }
+databrain-connector-cloud = { version = "0.2.1", path = "../connectors/cloud", default-features = false, optional = true }
+databrain-connector-core = { version = "0.2.1", path = "../connector-core" }
+databrain-lineage = { version = "0.2.1", path = "../lineage" }
 base64 = "0.23.1"
-databrain-connector-duckdb = { version = "0.2.0", path = "../connectors/duckdb", optional = true, default-features = false }
-databrain-connector-mongodb = { version = "0.2.0", path = "../connectors/mongodb", optional = true }
-databrain-connector-mssql = { version = "0.2.0", path = "../connectors/mssql", optional = true }
-databrain-connector-neo4j = { version = "0.2.0", path = "../connectors/neo4j", optional = true }
-databrain-connector-mysql = { version = "0.2.0", path = "../connectors/mysql", optional = true }
-databrain-connector-oracle = { version = "0.2.0", path = "../connectors/oracle", optional = true }
-databrain-connector-postgres = { version = "0.2.0", path = "../connectors/postgres", optional = true }
-databrain-connector-sqlite = { version = "0.2.0", path = "../connectors/sqlite", optional = true }
-databrain-export = { version = "0.2.0", path = "../export" }
-databrain-query-engine = { version = "0.2.0", path = "../query-engine" }
-databrain-result-store = { version = "0.2.0", path = "../result-store" }
-databrain-workspace = { version = "0.2.0", path = "../workspace" }
+databrain-connector-duckdb = { version = "0.2.1", path = "../connectors/duckdb", optional = true, default-features = false }
+databrain-connector-mongodb = { version = "0.2.1", path = "../connectors/mongodb", optional = true }
+databrain-connector-mssql = { version = "0.2.1", path = "../connectors/mssql", optional = true }
+databrain-connector-neo4j = { version = "0.2.1", path = "../connectors/neo4j", optional = true }
+databrain-connector-mysql = { version = "0.2.1", path = "../connectors/mysql", optional = true }
+databrain-connector-oracle = { version = "0.2.1", path = "../connectors/oracle", optional = true }
+databrain-connector-postgres = { version = "0.2.1", path = "../connectors/postgres", optional = true }
+databrain-connector-sqlite = { version = "0.2.1", path = "../connectors/sqlite", optional = true }
+databrain-export = { version = "0.2.1", path = "../export" }
+databrain-query-engine = { version = "0.2.1", path = "../query-engine" }
+databrain-result-store = { version = "0.2.1", path = "../result-store" }
+databrain-workspace = { version = "0.2.1", path = "../workspace" }
 dirs = "7.0.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "json"] }
 parking_lot = "0.12.5"

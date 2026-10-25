@@ -10,6 +10,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-databrain-connector-core = { version = "0.2.0", path = "../connector-core" }
+databrain-connector-core = { version = "0.2.1", path = "../connector-core" }
 serde = { version = "1.0.229", features = ["derive"] }
 sqlparser = { version = "0.63.0", default-features = false, features = ["std", "visitor"] }
