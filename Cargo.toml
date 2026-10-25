@@ -31,7 +31,9 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Denied everywhere; the one FFI call (databrain-jobs attaching to the
+# parent console on Windows) allows it where it is.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

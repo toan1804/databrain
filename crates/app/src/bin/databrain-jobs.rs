@@ -32,7 +32,10 @@ fn when(ms: i64) -> String {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // SAFETY: AttachConsole takes a process id constant and touches no Rust
+    // memory; failing (no parent console) is fine.
     #[cfg(windows)]
+    #[allow(unsafe_code)]
     unsafe {
         windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
     }
