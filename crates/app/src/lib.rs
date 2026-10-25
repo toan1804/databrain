@@ -6,6 +6,7 @@ pub mod jobs;
 pub mod meta_writer;
 pub mod conn_io;
 pub mod sql_files;
+pub mod updates;
 
 use std::sync::Arc;
 
@@ -884,6 +885,12 @@ async fn app_in_downloads() -> R<Option<String>> {
     Ok(bundle_in_downloads().map(|p| p.to_string_lossy().into_owned()))
 }
 
+/// The latest DataBrain release compared with this app (None: no release found).
+#[tauri::command]
+async fn check_for_update(app: AppHandle) -> R<Option<updates::UpdateInfo>> {
+    updates::check(&app.package_info().version.to_string()).await
+}
+
 /// Copy the app to /Applications, open that copy and quit this one. The copy
 /// in Downloads is left for the user to delete. `replace`: an existing
 /// /Applications/DataBrain.app is replaced (the UI asks first).
@@ -1234,6 +1241,7 @@ pub fn run() {
             ai_provider_usage,
             open_link,
             app_in_downloads,
+            check_for_update,
             move_to_applications,
             terminal_test,
             ai_provider_sign_out,

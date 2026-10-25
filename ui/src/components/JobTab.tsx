@@ -27,6 +27,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { api, toError } from "../lib/api";
+import { kbd } from "../lib/platform";
 import type { BatchLimits, FileFormat, Job, JobEdge, JobNode, JobRun, JobSchedule, LoadDryRun, LoadMode, NodeRunSummary, RunLogEntry, StepProgress } from "../lib/types";
 import {
   NODE_H,
@@ -497,7 +498,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
             <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-[12.5px] text-muted">Right-click to add a step</div>
           )}
           <div className="pointer-events-none absolute bottom-2 left-2 rounded-md border border-line bg-panel/90 px-2 py-1 text-[10.5px] text-muted">
-            Drag a step's ● handle onto another step to run it after · right-click a step to add downstream steps · drag steps to move · ⌘+scroll to zoom
+            Drag a step's ● handle onto another step to run it after · right-click a step to add downstream steps · drag steps to move · {kbd("⌘")}+scroll to zoom
           </div>
           {warnings.length > 0 && (
             <div className="absolute right-2 top-2 max-w-sm space-y-1">

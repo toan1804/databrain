@@ -186,11 +186,37 @@ impl Drop for Tunnel {
     }
 }
 
-#[cfg(unix)]
+type DynAgent = russh::keys::agent::client::AgentClient<Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin + 'static>>;
+
+/// The running SSH agent: `SSH_AUTH_SOCK` on macOS/Linux; on Windows the
+/// OpenSSH agent's pipe (or `SSH_AUTH_SOCK` when set to a pipe), then Pageant.
+async fn connect_agent() -> Result<DynAgent, TunnelError> {
+    let unavailable = |e: &dyn std::fmt::Display| TunnelError::Other(format!("SSH agent not available: {e}"));
+    #[cfg(unix)]
+    {
+        let a = russh::keys::agent::client::AgentClient::connect_env().await.map_err(|e| unavailable(&e))?;
+        Ok(a.dynamic())
+    }
+    #[cfg(windows)]
+    {
+        use russh::keys::agent::client::AgentClient;
+        let pipe = std::env::var("SSH_AUTH_SOCK").ok().filter(|p| p.starts_with(r"\\")).unwrap_or_else(|| r"\\.\pipe\openssh-ssh-agent".to_string());
+        match AgentClient::connect_named_pipe(&pipe).await {
+            Ok(a) => Ok(a.dynamic()),
+            Err(pipe_err) => match AgentClient::connect_pageant().await {
+                Ok(a) => Ok(a.dynamic()),
+                Err(_) => Err(unavailable(&format!("{pipe_err} (and Pageant is not running)"))),
+            },
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(unavailable(&"not supported on this system"))
+    }
+}
+
 async fn agent_auth(session: &mut Handle<Verifier>, user: &str) -> Result<bool, TunnelError> {
-    let mut agent = russh::keys::agent::client::AgentClient::connect_env()
-        .await
-        .map_err(|e| TunnelError::Other(format!("SSH agent not available: {e}")))?;
+    let mut agent = connect_agent().await?;
     let ids = agent
         .request_identities()
         .await
@@ -209,11 +235,6 @@ async fn agent_auth(session: &mut Handle<Verifier>, user: &str) -> Result<bool, 
         }
     }
     Ok(false)
-}
-
-#[cfg(not(unix))]
-async fn agent_auth(_session: &mut Handle<Verifier>, _user: &str) -> Result<bool, TunnelError> {
-    Err(TunnelError::Other("SSH agent authentication is only supported on macOS/Linux".into()))
 }
 
 fn expand_home(p: &str) -> String {

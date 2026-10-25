@@ -72,6 +72,7 @@ import type {
   ResultLink,
   QueryPlan,
   SchemaDiff,
+  UpdateInfo,
   SqlFile,
   ImportSource,
   ImportPreview,
@@ -330,6 +331,8 @@ export const api = {
   duckdbEngineStatus: () => call<DuckdbEngineStatus>("duckdb_engine_status"),
   duckdbEngineLoad: (path: string | null) => call<DuckdbEngineStatus>("duckdb_engine_load", { path }),
   openLink: (url: string) => call<void>("open_link", { url }),
+  /** The latest DataBrain release compared with this app (null: none found). */
+  checkForUpdate: () => call<UpdateInfo | null>("check_for_update"),
   terminalOptions: () => call<TerminalOption[]>("terminal_options"),
   appInDownloads: () => call<string | null>("app_in_downloads"),
   moveToApplications: (replace: boolean) => call<void>("move_to_applications", { replace }),

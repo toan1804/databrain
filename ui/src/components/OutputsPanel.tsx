@@ -6,6 +6,7 @@ import { useStore } from "../store";
 import { dropOutput, dropUnpinnedOutputs, formatAge, openOutput, openResultsQuery, outputRef } from "../outputs";
 import { CompareDialog, OutputChip } from "./OutputChip";
 import { ConnDot } from "./ui";
+import { kbd } from "../lib/platform";
 
 type Filter = "all" | "named" | "pinned";
 
@@ -124,7 +125,7 @@ function OutputRow({ o, color }: { o: OutputInfo; color?: string | null }) {
         <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted">{sqlPreview(o.sql, 60)}</span>
         <button
           className="icon-btn hidden h-6 w-6 shrink-0 group-hover:flex group-focus-within:flex"
-          title="Drop output (⌘⌫)"
+          title={kbd("Drop output (⌘⌫)")}
           aria-label={`Drop output ${o.handle}`}
           onClick={(e) => {
             e.stopPropagation();

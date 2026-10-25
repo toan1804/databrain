@@ -64,8 +64,11 @@ if (args[0] === "--cargo") {
   const mode = args.includes("--dev") ? "dev" : "build";
   run("npx", ["tauri", mode, "--config", config, ...args.filter((a) => a !== "--dev"), "--", ...features], ui);
   if (mode === "build") {
-    // Name the installers so they don't overwrite the full build's.
-    const dirs = ["dmg", "macos", "msi", "nsis", "deb", "appimage", "rpm"].map((d) => join(root, "target", "release", "bundle", d));
+    // Name the installers so they don't overwrite the full build's
+    // (target/release/bundle, or target/<triple>/release/bundle with --target).
+    const t = args.indexOf("--target");
+    const base = t >= 0 ? join(root, "target", args[t + 1], "release", "bundle") : join(root, "target", "release", "bundle");
+    const dirs = ["dmg", "macos", "msi", "nsis", "deb", "appimage", "rpm"].map((d) => join(base, d));
     for (const d of dirs.filter(existsSync))
       for (const f of readdirSync(d))
         if (/^DataBrain_\d/.test(f) && !f.includes("no-duckdb") && !f.endsWith(".app")) renameSync(join(d, f), join(d, f.replace(/^DataBrain_/, "DataBrain-no-duckdb_")));

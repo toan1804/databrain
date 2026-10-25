@@ -19,9 +19,11 @@ import { SignInDialog } from "./components/SignInDialog";
 import { IndexScopeDialog } from "./components/IndexScopeDialog";
 import { OracleClientDialog } from "./components/OracleClient";
 import { InlineAi } from "./components/InlineAi";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { MoveToApplications } from "./components/MoveToApplications";
 import { DuckdbEngineBanner } from "./components/DuckdbEngine";
 import { useAi } from "./aiStore";
+import { isMac, kbd } from "./lib/platform";
 
 function useGlobalShortcuts() {
   useEffect(() => {
@@ -135,7 +137,8 @@ export default function App() {
   return (
     <div className="flex h-full flex-col">
       {/* Title bar area (macOS overlay title bar leaves room for traffic lights). */}
-      <div className="flex h-9 shrink-0 items-center border-b border-line bg-bg pl-20 pr-2" data-tauri-drag-region>
+      {/* macOS draws its window buttons over this bar (overlay title bar); elsewhere the system title bar is above it. */}
+      <div className={`flex h-9 shrink-0 items-center border-b border-line bg-bg ${isMac ? "pl-20" : "pl-3"} pr-2`} data-tauri-drag-region>
         <div className="flex items-center gap-2 text-[12.5px] font-semibold tracking-tight" data-tauri-drag-region>
           <span className="flex h-5 w-5 items-center justify-center rounded-md bg-accent text-[11px] font-bold text-accent-fg">D</span>
           DataBrain
@@ -145,18 +148,18 @@ export default function App() {
           onClick={() => setPalette(true)}
         >
           <Command size={12} /> Search commands, connections, saved queries…
-          <span className="kbd ml-auto">⌘K</span>
+          <span className="kbd ml-auto">{kbd("⌘K")}</span>
         </button>
         <button
           className={`icon-btn ${aiOpen ? "text-accent" : ""}`}
           aria-label="AI assistant"
           aria-pressed={aiOpen}
-          title="AI assistant (⌘L)"
+          title={kbd("AI assistant (⌘L)")}
           onClick={() => setAiOpen(!aiOpen)}
         >
           <Sparkles size={14} />
         </button>
-        <button className="icon-btn" aria-label="Settings" title="Settings (⌘,)" onClick={() => useStore.getState().setSettingsOpen(true)}>
+        <button className="icon-btn" aria-label="Settings" title={kbd("Settings (⌘,)")} onClick={() => useStore.getState().setSettingsOpen(true)}>
           <Settings2 size={14} />
         </button>
         <button
@@ -169,6 +172,7 @@ export default function App() {
         </button>
       </div>
       <MoveToApplications />
+      <UpdateBanner />
       <DuckdbEngineBanner />
       {!backend && (
         <div className="flex items-center gap-2 border-b border-warning/40 bg-warning/10 px-3 py-1.5 text-[12px] text-warning" role="status">

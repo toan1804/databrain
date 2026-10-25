@@ -1346,3 +1346,14 @@ export interface SchemaDiff {
   /** Makes the target like the source (target dialect); never run by the app. */
   script: string;
 }
+
+export interface UpdateInfo {
+  current: string;
+  latest: string;
+  newer: boolean;
+  url: string;
+  download?: string | null;
+  download_name?: string | null;
+  notes?: string | null;
+  published_at?: string | null;
+}

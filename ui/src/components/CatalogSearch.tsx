@@ -8,6 +8,7 @@ import { editorBridge } from "../editorBridge";
 import { useStore } from "../store";
 import { ConnDot, MenuItem, Popover } from "./ui";
 import { ObjectMenu } from "./CatalogMenus";
+import { kbd } from "../lib/platform";
 
 /** SQL reference for an object (DuckDB attached files are addressed as `files.x`). */
 export function objectRef(conn: ConnectionView, obj: DbObject): string {
@@ -167,11 +168,11 @@ export function CatalogSearch({ tree, connectionsTree }: { tree: ReactNode; conn
           <Search size={13} className="pointer-events-none absolute left-2 text-muted" />
           <input
             ref={inputRef}
-            title="Find a table or connection (⌘P)"
+            title={kbd("Find a table or connection (⌘P)")}
             className="field py-1 pl-7 pr-[7.5rem]"
             placeholder="Find table…"
             value={query}
-            aria-label="Find table or connection (⌘P)"
+            aria-label={kbd("Find table or connection (⌘P)")}
             aria-controls="catalog-search-results"
             spellCheck={false}
             autoCorrect="off"
@@ -285,7 +286,7 @@ export function CatalogSearch({ tree, connectionsTree }: { tree: ReactNode; conn
             </div>
             {flat.length > 0 && (
               <div className="px-2 pt-1 text-[10.5px] leading-4 text-muted">
-                ↵ show in tree · ⌘↵ select top 100 · ⌥↵ insert name
+                {kbd("↵ show in tree · ⌘↵ select top 100 · ⌥↵ insert name")}
               </div>
             )}
             {connectionsTree && (
@@ -362,7 +363,7 @@ function HitRow({
       <span className={`shrink-0 items-center ${selected ? "flex" : "hidden group-hover:flex"}`}>
         <button
           className="icon-btn h-6 w-6"
-          title="Insert name into the editor (⌥↵)"
+          title={kbd("Insert name into the editor (⌥↵)")}
           aria-label="Insert name into the editor"
           onClick={(e) => {
             e.stopPropagation();
@@ -373,7 +374,7 @@ function HitRow({
         </button>
         <button
           className="icon-btn h-6 w-6"
-          title="Select top 100 rows (⌘↵)"
+          title={kbd("Select top 100 rows (⌘↵)")}
           aria-label="Select top 100 rows"
           onClick={(e) => {
             e.stopPropagation();

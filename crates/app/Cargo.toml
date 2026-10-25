@@ -44,6 +44,7 @@ databrain-query-engine = { version = "0.2.0", path = "../query-engine" }
 databrain-result-store = { version = "0.2.0", path = "../result-store" }
 databrain-workspace = { version = "0.2.0", path = "../workspace" }
 dirs = "7.0.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "json"] }
 parking_lot = "0.12.5"
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }

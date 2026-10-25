@@ -27,6 +27,7 @@ import { paramField, paramNames, setParamSpans, textualNames } from "./paramsExt
 import { api, isTauri } from "../lib/api";
 import { sqlFolding } from "./sqlFold";
 import { statementTarget } from "../lib/statementNav";
+import { kbd } from "../lib/platform";
 
 /** Right-click: keep a selection that contains the click, else put the cursor there; then open the menu. */
 export function editorContextMenu(open: (at: { x: number; y: number }) => void) {
@@ -146,7 +147,7 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
           highlightActiveLine(),
           highlightSelectionMatches(),
           syntaxHighlighting(highlight),
-          placeholder("Write SQL…  ⌘↵ run statement · ⇧⌘↵ run all"),
+          placeholder(kbd("Write SQL…  ⌘↵ run statement · ⇧⌘↵ run all")),
           errorField,
           paramField,
           lang.current.of(langExtension(undefined)),

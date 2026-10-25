@@ -81,6 +81,7 @@ import { openOutput } from "../outputs";
 import { useStore, type SidebarPanel } from "../store";
 import { editorBridge } from "../editorBridge";
 import { ConnDot, EnvBadge, MenuItem, MenuSeparator, Modal, Popover } from "./ui";
+import { kbd } from "../lib/platform";
 
 export function Sidebar() {
   const panel = useStore((s) => s.sidebarPanel);
@@ -131,7 +132,7 @@ function ActivityRail() {
       {item("history", <History size={18} />, "History")}
       <div className="flex-1" />
       <button
-        title="AI assistant (⌘L)"
+        title={kbd("AI assistant (⌘L)")}
         aria-label="AI assistant"
         aria-pressed={aiOpen}
         onClick={() => setAiOpen(!aiOpen)}
@@ -529,7 +530,7 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
           <MenuSeparator />
           <MoveToFolderItems kind="connections" id={conn.id} current={conn.folder_id} onDone={() => setMenu(null)} />
           <MenuSeparator />
-          <MenuItem icon={<Trash2 size={13} />} label="Delete connection…" hint="⌘⌫" danger onClick={() => { setMenu(null); void useStore.getState().deleteConnection(conn.id); }} />
+          <MenuItem icon={<Trash2 size={13} />} label="Delete connection…" hint={kbd("⌘⌫")} danger onClick={() => { setMenu(null); void useStore.getState().deleteConnection(conn.id); }} />
         </Popover>
       )}
       {expanded && status?.offline && (
@@ -1122,7 +1123,7 @@ function SavedPanel() {
             <Bookmark size={26} className="mx-auto mb-3 opacity-50" />
             {saved.length === 0 ? (
               <>
-                No saved queries. Press <span className="kbd">⌘S</span> in an editor tab to save one.
+                No saved queries. Press <span className="kbd">{kbd("⌘S")}</span> in an editor tab to save one.
               </>
             ) : (
               "No matches"

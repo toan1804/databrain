@@ -57,6 +57,7 @@ import { ValuePanel, type FocusedCell } from "./ValuePanel";
 import { PinChartDialog } from "./DashboardTab";
 import type { ChartKind } from "../lib/charts";
 import { Modal, Popover } from "./ui";
+import { kbd } from "../lib/platform";
 
 export interface ResultsPanelProps {
   tabId: string;
@@ -81,13 +82,13 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
         <div>Run a query to see results</div>
         <div className="flex gap-3 text-[11.5px]">
           <span>
-            <span className="kbd">⌘</span> <span className="kbd">↵</span> run statement
+            <span className="kbd">{kbd("⌘")}</span> <span className="kbd">↵</span> run statement
           </span>
           <span>
-            <span className="kbd">⇧</span> <span className="kbd">⌘</span> <span className="kbd">↵</span> run all
+            <span className="kbd">{kbd("⇧")}</span> <span className="kbd">{kbd("⌘")}</span> <span className="kbd">↵</span> run all
           </span>
           <span>
-            <span className="kbd">⌘</span> <span className="kbd">⌥</span> <span className="kbd">↑</span>/<span className="kbd">↓</span> previous / next statement
+            <span className="kbd">{kbd("⌘")}</span> <span className="kbd">{kbd("⌥")}</span> <span className="kbd">↑</span>/<span className="kbd">↓</span> previous / next statement
           </span>
         </div>
       </div>
@@ -291,7 +292,7 @@ function RunningView({ run, tabId }: { run: TabRun; tabId: string }) {
         </div>
       ))}
       <button className="btn-ghost border border-line" onClick={() => cancel(tabId)}>
-        <X size={14} /> Cancel <span className="kbd ml-1">⌘.</span>
+        <X size={14} /> Cancel <span className="kbd ml-1">{kbd("⌘.")}</span>
       </button>
     </div>
   );
@@ -614,12 +615,12 @@ export function ResultView({
             </button>
           )}
         </div>
-        <button className="icon-btn" title="Find (⌘F)" aria-label="Find in results" onClick={openFind}>
+        <button className="icon-btn" title={kbd("Find (⌘F)")} aria-label="Find in results" onClick={openFind}>
           <Search size={14} />
         </button>
         <button
           className={`icon-btn ${valueOpen ? "text-accent" : ""}`}
-          title="Value panel: the selected cell's whole value (JSON, XML, binary, long text) (⇧Space)"
+          title={kbd("Value panel: the selected cell's whole value (JSON, XML, binary, long text) (⇧Space)")}
           aria-label="Value panel"
           aria-pressed={valueOpen}
           onClick={() => setValueOpen(!valueOpen)}

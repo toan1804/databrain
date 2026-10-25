@@ -82,6 +82,7 @@ import { ConnDot, EnvBadge } from "./ui";
 import { OutputChip, OutputQueryTarget } from "./OutputChip";
 import { resultsConnection } from "../outputs";
 import { cellDeps, referencedOutputs, type CellDeps } from "../lib/dataflow";
+import { kbd } from "../lib/platform";
 
 const SAVE_DELAY = 700;
 
@@ -634,7 +635,7 @@ function Cell(props: CellProps) {
             className={`icon-btn h-6 w-6 ${run?.running ? "text-accent" : ""}`}
             aria-label={run?.running ? "Stop cell" : "Run cell"}
             title={
-              run?.running ? "Stop" : "Run cell (⌘↵) · run and advance (⇧↵)"
+              run?.running ? "Stop" : kbd("Run cell (⌘↵) · run and advance (⇧↵)")
             }
             onClick={() =>
               run?.running
@@ -986,7 +987,7 @@ export function CellEditor({
           queryHints(() => editorKey),
           highlightSelectionMatches(),
           syntaxHighlighting(highlight),
-          placeholder("SQL…  ⌘↵ run · ⇧↵ run & next · ⌘I ask AI"),
+          placeholder(kbd("SQL…  ⌘↵ run · ⇧↵ run & next · ⌘I ask AI")),
           errorField,
           paramField,
           lang.current.of(langExtension(undefined)),
@@ -1148,7 +1149,7 @@ function MarkdownCell({
         className="field min-h-[60px] resize-none font-mono text-[12.5px]"
         value={source}
         aria-label="Markdown cell"
-        placeholder="Markdown text…  (⌘↵ or Esc to finish)"
+        placeholder={kbd("Markdown text…  (⌘↵ or Esc to finish)")}
         onChange={(e) => {
           onChange(e.target.value);
           e.target.style.height = "auto";

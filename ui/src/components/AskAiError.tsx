@@ -1,3 +1,4 @@
+import { kbd } from "../lib/platform";
 import { useState } from "react";
 import { Loader2, Sparkles } from "lucide-react";
 import { useAi, type ChatItem } from "../aiStore";
@@ -73,7 +74,7 @@ export function AskAiAboutError({ error, question, connectionId }: { error: stri
           ) : (
             <span className="text-muted">Asking the assistant…</span>
           )}
-          {!running && last?.kind === "assistant" && <p className="mt-1.5 text-[11px] text-muted">The conversation is also in the AI panel (⌘L), in its own tab, to ask more.</p>}
+          {!running && last?.kind === "assistant" && <p className="mt-1.5 text-[11px] text-muted">The conversation is also in the AI panel ({kbd("⌘L")}), in its own tab, to ask more.</p>}
         </div>
       )}
     </>

@@ -47,6 +47,7 @@ import { extractMentions, mentionToken, resultsConnection } from "../outputs";
 import { ResultGrid } from "./ResultGrid";
 import { ComboInput, ConnDot, ListPicker } from "./ui";
 import { UsageFooter } from "./ProviderUsage";
+import { kbd } from "../lib/platform";
 
 export function AiPanel() {
   const view = useAi((s) => s.view);
@@ -81,7 +82,7 @@ export function AiPanel() {
           <button className="icon-btn" title="AI settings" aria-label="AI settings" onClick={() => setSettingsOpen(true)}>
             <Settings2 size={14} />
           </button>
-          <button className="icon-btn" title="Close (⌘L)" aria-label="Close assistant" onClick={() => setOpen(false)}>
+          <button className="icon-btn" title={kbd("Close (⌘L)")} aria-label="Close assistant" onClick={() => setOpen(false)}>
             <X size={14} />
           </button>
         </div>

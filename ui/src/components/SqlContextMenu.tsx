@@ -6,6 +6,7 @@ import { toError } from "../lib/api";
 import type { ConnectorKind } from "../lib/types";
 import { useStore } from "../store";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
+import { kbd } from "../lib/platform";
 
 /**
  * Format the selection (or the whole script when nothing is selected) in
@@ -97,7 +98,7 @@ export function SqlContextMenu({
         <MenuItem
           icon={<WandSparkles size={13} />}
           label={hasSel ? "Format selection" : "Format SQL"}
-          hint="⇧⌥F"
+          hint={kbd("⇧⌥F")}
           disabled={readOnly}
           onClick={run(() => void formatInView(view, kind))}
         />

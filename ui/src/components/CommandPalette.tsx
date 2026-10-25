@@ -10,6 +10,7 @@ import { openCompare } from "./CompareTab";
 import { fuzzyMatch, relativeTime, sqlPreview } from "../lib/util";
 import { baseName, isQueryTab, useStore } from "../store";
 import { ConnDot } from "./ui";
+import { kbd } from "../lib/platform";
 
 interface Command {
   id: string;
@@ -44,16 +45,16 @@ function Palette() {
   const commands = useMemo<Command[]>(() => {
     const active = st.tabs.find((t) => t.id === st.activeTabId);
     const cmds: Command[] = [
-      { id: "new-tab", group: "Actions", label: "New query tab", icon: <Plus size={14} />, hint: "⌘T", run: () => st.newTab() },
+      { id: "new-tab", group: "Actions", label: "New query tab", icon: <Plus size={14} />, hint: kbd("⌘T"), run: () => st.newTab() },
       ...(st.closedTabs.length
-        ? [{ id: "reopen-tab", group: "Actions", label: `Reopen closed tab “${st.closedTabs[st.closedTabs.length - 1].tab.title}”`, icon: <History size={14} />, hint: "⇧⌘T", run: () => void st.reopenClosedTab() }]
+        ? [{ id: "reopen-tab", group: "Actions", label: `Reopen closed tab “${st.closedTabs[st.closedTabs.length - 1].tab.title}”`, icon: <History size={14} />, hint: kbd("⇧⌘T"), run: () => void st.reopenClosedTab() }]
         : []),
       {
         id: "find-table",
         group: "Actions",
         label: "Find table…",
         icon: <Search size={14} />,
-        hint: "⌘P",
+        hint: kbd("⌘P"),
         // After the palette closes, so focus lands in the search box.
         run: () => setTimeout(() => st.openCatalogSearch(), 0),
       },
@@ -62,9 +63,9 @@ function Palette() {
       { id: "export-conns", group: "Actions", label: "Export connections (without passwords)…", icon: <Database size={14} />, run: () => void exportConnections() },
       { id: "compare", group: "Actions", label: "Compare schemas…", icon: <GitCompare size={14} />, run: () => openCompare() },
       ...st.dashboards.map((d) => ({ id: `dash:${d.id}`, group: "Dashboards", label: d.name, detail: `${d.charts.length} chart${d.charts.length === 1 ? "" : "s"}`, icon: <LayoutDashboard size={14} />, run: () => st.openDashboard(d.id) })),
-      { id: "open-file", group: "Files", label: "Open SQL file…", icon: <FolderOpen size={14} />, hint: "⌘O", run: () => void st.openSqlFile() },
+      { id: "open-file", group: "Files", label: "Open SQL file…", icon: <FolderOpen size={14} />, hint: kbd("⌘O"), run: () => void st.openSqlFile() },
       ...(isQueryTab(active)
-        ? [{ id: "save-file", group: "Files", label: active.file_path ? `Save to ${baseName(active.file_path)}` : "Save tab to a file…", icon: <Save size={14} />, hint: active.file_path ? "⌘S" : "⇧⌘S", run: () => void st.saveTabFile(active.id) }]
+        ? [{ id: "save-file", group: "Files", label: active.file_path ? `Save to ${baseName(active.file_path)}` : "Save tab to a file…", icon: <Save size={14} />, hint: kbd(active.file_path ? "⌘S" : "⇧⌘S"), run: () => void st.saveTabFile(active.id) }]
         : []),
       ...st.recentFiles.map((p) => ({ id: `recent:${p}`, group: "Files", label: baseName(p), detail: p, icon: <FileCode2 size={14} />, run: () => void st.openSqlFile(p) })),
       {
@@ -79,9 +80,9 @@ function Palette() {
       { id: "jobs", group: "Actions", label: "Show jobs", icon: <Workflow size={14} />, run: () => st.setSidebarPanel("jobs") },
       { id: "file", group: "Actions", label: "Query a local file (CSV, Parquet, JSON, Excel)…", icon: <FileSearch size={14} />, run: () => void queryLocalFile() },
       { id: "import-file", group: "Actions", label: "Import a file (CSV, Excel, Parquet, JSON) into a table…", icon: <FileSearch size={14} />, run: () => void queryLocalFile(true) },
-      { id: "ai", group: "AI", label: "Open AI assistant", icon: <Sparkles size={14} />, hint: "⌘L", run: () => useAi.getState().setOpen(true, "chat") },
+      { id: "ai", group: "AI", label: "Open AI assistant", icon: <Sparkles size={14} />, hint: kbd("⌘L"), run: () => useAi.getState().setOpen(true, "chat") },
       { id: "ai-kn", group: "AI", label: "AI knowledge (index schema, notes)", icon: <Sparkles size={14} />, run: () => useAi.getState().setOpen(true, "knowledge") },
-      { id: "settings", group: "Actions", label: "Settings: appearance, AI providers, MCP", icon: <Settings2 size={14} />, hint: "⌘,", run: () => st.setSettingsOpen(true) },
+      { id: "settings", group: "Actions", label: "Settings: appearance, AI providers, MCP", icon: <Settings2 size={14} />, hint: kbd("⌘,"), run: () => st.setSettingsOpen(true) },
       { id: "outputs", group: "Actions", label: "Show outputs", icon: <Bookmark size={14} />, run: () => st.setSidebarPanel("outputs") },
       {
         id: "query-outputs",
@@ -99,7 +100,7 @@ function Palette() {
         group: "Actions",
         label: "Save current query",
         icon: <Bookmark size={14} />,
-        hint: "⌘S",
+        hint: kbd("⌘S"),
         run: () => void st.saveTabQuery(active.id),
       });
     }

@@ -8,10 +8,9 @@ A modern desktop SQL client written in Rust (Tauri 2 + React). See [docs/ARCHITE
 |---|---|
 | macOS (Apple Silicon) | [DataBrain_0.2.0_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.2.0/DataBrain_0.2.0_aarch64.dmg) |
 | macOS (Apple Silicon), without DuckDB | [DataBrain-no-duckdb_0.2.0_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.2.0/DataBrain-no-duckdb_0.2.0_aarch64.dmg) (uses the DuckDB installed on the computer, see "Runtime notes" below) |
-| Linux | Coming soon |
-| Windows | Coming soon |
+| macOS (Intel), Windows, Linux | Built for each release by the Release workflow (`.dmg`, `-setup.exe`/`.msi`, `.AppImage`/`.deb`/`.rpm`) from the next release on |
 
-All versions are on the [Releases](https://github.com/toan1804/databrain/releases) page. To build it yourself, see [Run](#run).
+All versions are on the [Releases](https://github.com/toan1804/databrain/releases) page. To build it yourself, see [Run](#run). DataBrain checks for a newer release once a day and shows a banner with the download for your computer (Settings → Updates turns it off; nothing installs by itself).
 
 The macOS app is not signed yet, so macOS blocks it on first open: right-click DataBrain.app → Open → Open (or System Settings → Privacy & Security → Open Anyway). Intel Macs: build from source for now. Move DataBrain.app to Applications before opening it: run from the Downloads folder, macOS asks for access to Downloads (the app reads its own files there); DataBrain then offers "Move to Applications" in a banner. Otherwise only jobs that save files ask for a folder's access, the first time such a step runs.
 
@@ -164,6 +163,10 @@ Releasing a new helper (each release gets its own download folder, so installed 
    ```
 
    The sum must equal the `darwin-arm64` line of `agent/SHA256SUMS`. Then build and release the app as usual.
+
+### Releasing the app
+
+Push a tag `vX.Y.Z` (matching `version` in `crates/app/tauri.conf.json`): the Release workflow (`.github/workflows/release.yml`) builds the installers for macOS (Apple Silicon, with and without DuckDB, and Intel), Windows and Linux and attaches them to a draft release. Publish the draft; running apps then see it in their update check. The builds are not code-signed. The CI workflow builds and tests every push and pull request on macOS, Linux and Windows.
 
 ## Test
 

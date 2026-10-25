@@ -1825,6 +1825,7 @@ dependencies = [
  "futures",
  "openssl",
  "parking_lot",
+ "reqwest",
  "rust_xlsxwriter",
  "secrecy",
  "serde",

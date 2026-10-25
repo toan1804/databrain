@@ -3,6 +3,7 @@ import { traitsOf } from "../lib/sourceTraits";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { AlertCircle, AlertTriangle, ArrowDown, ArrowRight, CheckCircle2, Columns3, ExternalLink, Rows3, ChevronDown, ClipboardCopy, Download, Loader2, Maximize2, Network, RefreshCw, TextCursorInput, WifiOff, X } from "lucide-react";
 import { api, isTauri, toError } from "../lib/api";
+import { kbd } from "../lib/platform";
 import type { LineageCheck, LineageView, ParamValue } from "../lib/types";
 import { layout, normalize, trace, withPositions, type Direction, type Positions } from "../lib/lineageLayout";
 import { columnFlow, conditionText, explainColumn, type FlowNode } from "../lib/lineageExplain";
@@ -463,7 +464,7 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
               <Legend color={colors.accent} label="aggregated" width={2.6} />
               <Legend color={colors.warning} label="filter" dash="5 4" />
               <Legend color={colors.warning} label="join" dash="2 3" />
-              <span>· click a table to list its columns, a column to trace it · drag a table to move it · ⌘+scroll to zoom</span>
+              <span>· click a table to list its columns, a column to trace it · drag a table to move it · {kbd("⌘")}+scroll to zoom</span>
             </div>
           )}
           {warnings.length > 0 && !showWarnings && !columnTab && (

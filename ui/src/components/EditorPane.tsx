@@ -17,6 +17,7 @@ import { CompareTab } from "./CompareTab";
 import { DashboardTab } from "./DashboardTab";
 import { useAi } from "../aiStore";
 import type { ConnectionView } from "../lib/types";
+import { kbd } from "../lib/platform";
 
 const ROW_LIMITS = [100, 500, 1000, 5000, 10000, 50000, 100000, 0];
 
@@ -348,7 +349,7 @@ function TabBar() {
           </div>
         );
       })}
-      <button className="icon-btn mb-0.5 ml-0.5" title="New tab (⌘T)" aria-label="New tab" onClick={() => newTab()}>
+      <button className="icon-btn mb-0.5 ml-0.5" title={kbd("New tab (⌘T)")} aria-label="New tab" onClick={() => newTab()}>
         <Plus size={15} />
       </button>
       <div className="flex-1 self-stretch" data-tauri-drag-region />
@@ -416,7 +417,7 @@ function Toolbar() {
   };
   const saveLabel = tab.saved_query_id || tab.file_path ? "Save" : "Save as…";
   const save = () => (tab.file_path ? void useStore.getState().saveTabFile(tab.id) : void saveTabQuery(tab.id));
-  const saveTitle = tab.file_path ? `Save to ${tab.file_path} (⌘S)` : `${saveLabel} (⌘S)`;
+  const saveTitle = kbd(tab.file_path ? `Save to ${tab.file_path} (⌘S)` : `${saveLabel} (⌘S)`);
 
   return (
     <div
@@ -450,19 +451,19 @@ function Toolbar() {
       <div className="mx-1 h-5 w-px shrink-0 bg-line" />
 
       {run?.running ? (
-        <button className="btn-danger shrink-0 py-1" onClick={() => cancelTab(tab.id)} title="Cancel (⌘.)">
+        <button className="btn-danger shrink-0 py-1" onClick={() => cancelTab(tab.id)} title={kbd("Cancel (⌘.)")}>
           <Square size={12} fill="currentColor" /> Stop
         </button>
       ) : (
         <>
-          <button className="btn-primary shrink-0 py-1" onClick={() => trigger("statement")} disabled={!conn} title="Run statement or selection (⌘↵)">
+          <button className="btn-primary shrink-0 py-1" onClick={() => trigger("statement")} disabled={!conn} title={kbd("Run statement or selection (⌘↵)")}>
             <Play size={13} fill="currentColor" /> Run
           </button>
           <button
             className="btn-ghost shrink-0 py-1"
             onClick={() => trigger("all")}
             disabled={!conn}
-            title="Run all statements (⇧⌘↵)"
+            title={kbd("Run all statements (⇧⌘↵)")}
             aria-label="Run all"
           >
             <PlayCircle size={14} /> {!overflow && "Run all"}
@@ -529,7 +530,7 @@ function Toolbar() {
             <button className="btn-ghost py-1" disabled={!conn} title="Explain this query with AI" aria-label="Explain" onClick={explain}>
               <Lightbulb size={13} /> {!iconOnly && "Explain"}
             </button>
-            <button className="btn-ghost py-1" title="Edit with AI (⌘I) · open assistant (⌘L)" aria-label="AI" onClick={editWithAi}>
+            <button className="btn-ghost py-1" title={kbd("Edit with AI (⌘I) · open assistant (⌘L)")} aria-label="AI" onClick={editWithAi}>
               <Sparkles size={13} /> {!iconOnly && "AI"}
             </button>
             <button className="btn-ghost py-1" onClick={save} title={saveTitle} aria-label={saveLabel}>
@@ -549,9 +550,9 @@ function Toolbar() {
           <MenuItem icon={<Network size={13} />} label="Lineage" onClick={() => (setMore(null), openLineage(tab.id))} />
           <MenuItem icon={<GitFork size={13} className="rotate-90" />} label="Query plan" disabled={!conn} onClick={() => (setMore(null), void openPlan(tab.id))} />
           <MenuItem icon={<Lightbulb size={13} />} label="Explain" disabled={!conn} onClick={() => (setMore(null), explain())} />
-          <MenuItem icon={<Sparkles size={13} />} label="Edit with AI" hint="⌘I" onClick={() => (setMore(null), editWithAi())} />
-          <MenuItem icon={<Save size={13} />} label={saveLabel} hint="⌘S" onClick={() => (setMore(null), save())} />
-          <MenuItem icon={<FileCode2 size={13} />} label="Save to file…" hint="⇧⌘S" onClick={() => (setMore(null), void useStore.getState().saveTabFile(tab.id, true))} />
+          <MenuItem icon={<Sparkles size={13} />} label="Edit with AI" hint={kbd("⌘I")} onClick={() => (setMore(null), editWithAi())} />
+          <MenuItem icon={<Save size={13} />} label={saveLabel} hint={kbd("⌘S")} onClick={() => (setMore(null), save())} />
+          <MenuItem icon={<FileCode2 size={13} />} label="Save to file…" hint={kbd("⇧⌘S")} onClick={() => (setMore(null), void useStore.getState().saveTabFile(tab.id, true))} />
           {tab.file_path && tab.saved_query_id == null && (
             <MenuItem icon={<Save size={13} />} label="Save as saved query…" onClick={() => (setMore(null), void saveTabQuery(tab.id))} />
           )}

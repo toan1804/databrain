@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { AlertCircle, Bot, Database, Check, Copy, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, ShieldCheck, Terminal, Trash2, Timer, Palette } from "lucide-react";
+import { AlertCircle, Bot, Database, Check, Copy, Download, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, ShieldCheck, Terminal, Trash2, Timer, Palette } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { AuditEntry, TerminalLaunch, TerminalOption, TerminalSetting, CredentialStoreKind, CredentialStoreView, KiroStatus, ProviderAuth, ProviderKind, ProviderView } from "../lib/types";
 import { relativeTime } from "../lib/util";
@@ -10,6 +10,7 @@ import { ComboInput, Modal } from "./ui";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { UsageDetails } from "./ProviderUsage";
 import { DuckdbEngineSettings } from "./DuckdbEngine";
+import { UpdateSettings } from "./UpdateBanner";
 
 export const PROVIDER_KINDS: { kind: ProviderKind; label: string; base: string; auth: ProviderAuth[]; model: string; hint?: string }[] = [
   {
@@ -63,7 +64,7 @@ const AUTH_LABEL: Record<ProviderAuth, string> = {
 export function SettingsDialog() {
   const open = useStore((s) => s.settingsOpen);
   const setOpen = useStore((s) => s.setSettingsOpen);
-  const [section, setSection] = useState<"providers" | "appearance" | "queries" | "duckdb" | "terminal" | "security" | "mcp" | "audit">("providers");
+  const [section, setSection] = useState<"providers" | "appearance" | "queries" | "duckdb" | "terminal" | "security" | "mcp" | "audit" | "updates">("providers");
   const focusProvider = useAi((s) => s.settingsProvider);
   useEffect(() => {
     if (focusProvider) setSection("providers");
@@ -91,6 +92,7 @@ export function SettingsDialog() {
           {item("security", <ShieldCheck size={14} />, "Passwords")}
           {item("mcp", <Plug size={14} />, "MCP / Kiro")}
           {item("audit", <ScrollText size={14} />, "AI audit log")}
+          {item("updates", <Download size={14} />, "Updates")}
         </div>
         <div className="min-w-0 flex-1">
           {section === "providers" && <Providers />}
@@ -101,6 +103,7 @@ export function SettingsDialog() {
           {section === "security" && <CredentialStore />}
           {section === "mcp" && <Mcp />}
           {section === "audit" && <Audit />}
+          {section === "updates" && <UpdateSettings />}
         </div>
       </div>
     </Modal>

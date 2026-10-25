@@ -23,6 +23,7 @@ import { columnTypeInfo, engineName } from "../lib/columnType";
 import { useStore } from "../store";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
 import type { FocusedCell } from "./ValuePanel";
+import { kbd } from "../lib/platform";
 
 const PAGE = 200;
 
@@ -561,7 +562,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
           <MenuItem
             icon={<Copy size={13} />}
             label="Copy"
-            hint="⌘C"
+            hint={kbd("⌘C")}
             onClick={() => {
               setMenu(null);
               void copy("tsv", false);
@@ -570,7 +571,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
           <MenuItem
             icon={<Copy size={13} />}
             label="Copy with headers"
-            hint="⇧⌘C"
+            hint={kbd("⇧⌘C")}
             onClick={() => {
               setMenu(null);
               void copy("tsv", true);
@@ -581,7 +582,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
           <MenuItem icon={<Copy size={13} />} label="Copy as Markdown" onClick={() => { setMenu(null); void copy("markdown", true); }} />
           <MenuItem icon={<Copy size={13} />} label="Copy as SQL INSERT" onClick={() => { setMenu(null); void copy("sql_insert", false); }} />
           {onViewValue && (
-            <MenuItem icon={<Braces size={13} />} label="View value" hint="⇧Space" onClick={() => { setMenu(null); onViewValue(); }} />
+            <MenuItem icon={<Braces size={13} />} label="View value" hint={kbd("⇧Space")} onClick={() => { setMenu(null); onViewValue(); }} />
           )}
           {onTranspose && (
             <MenuItem
