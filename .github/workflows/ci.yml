@@ -24,6 +24,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
+      # aws-lc-sys needs NASM on Windows; use its prebuilt objects instead.
+      AWS_LC_SYS_PREBUILT_NASM: ${{ startsWith(matrix.os, 'windows') && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
 

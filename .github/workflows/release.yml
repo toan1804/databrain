@@ -34,7 +34,7 @@ jobs:
             target: aarch64-apple-darwin
             script: app:build:no-duckdb
           - name: macOS Intel
-            os: macos-13
+            os: macos-15-intel
             target: x86_64-apple-darwin
             script: app:build
           - name: Windows x64
@@ -49,6 +49,8 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      # aws-lc-sys needs NASM on Windows; use its prebuilt objects instead.
+      AWS_LC_SYS_PREBUILT_NASM: ${{ startsWith(matrix.os, 'windows') && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
