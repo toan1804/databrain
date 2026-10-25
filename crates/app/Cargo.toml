@@ -22,6 +22,10 @@ path = "src/main.rs"
 name = "databrain-mcp"
 path = "src/bin/databrain-mcp.rs"
 
+[[bin]]
+name = "databrain-jobs"
+path = "src/bin/databrain-jobs.rs"
+
 [dependencies]
 futures = "0.3.34"
 async-trait = "0.1.92"
@@ -53,12 +57,16 @@ tauri = { version = "2", features = [] }
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = "0.7.19"
 uuid = { version = "1.26.1", features = ["v4"] }
 
 # Linux: build OpenSSL from source and link it statically, so the binary
 # does not depend on the distribution's libssl version.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_System_Console"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl = { version = "0.10.81", features = ["vendored"] }
 

@@ -1245,6 +1245,7 @@ function NotebooksPanel() {
 function JobsPanel() {
   const jobs = useJobs((s) => s.jobs);
   const running = useJobs((s) => s.running);
+  const elsewhere = useJobs((s) => s.elsewhere);
   const live = useJobs((s) => s.runs);
   const [search, setSearch] = useState("");
   const shown = jobs.filter((j) => j.name.toLowerCase().includes(search.toLowerCase().trim()));
@@ -1314,6 +1315,11 @@ function JobsPanel() {
               <div className="mt-0.5 flex flex-wrap items-center gap-x-2 pl-5 text-[10.5px] text-muted">
                 <span>{j.node_count} steps</span>
                 <span>{scheduleText(j.schedule)}</span>
+                {elsewhere[j.id] && !isRunning && (
+                  <span className="text-accent" title="The background runner is running it now (Settings → Jobs)">
+                    running in background
+                  </span>
+                )}
                 {j.schedule.enabled && j.next_run_at && <span title={new Date(j.next_run_at).toLocaleString()}>next {new Date(j.next_run_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>}
                 {last && !isRunning && (
                   <span className={last.status === "error" ? "text-danger" : undefined} title={last.error ?? undefined}>

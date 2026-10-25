@@ -638,6 +638,13 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE tabs ADD COLUMN file_path TEXT;
     "#,
+    // v13: job leases (one runner per job across processes) and run heartbeats
+    r#"
+    ALTER TABLE jobs ADD COLUMN lease_owner TEXT;
+    ALTER TABLE jobs ADD COLUMN lease_until INTEGER;
+    ALTER TABLE job_runs ADD COLUMN runner TEXT;
+    ALTER TABLE job_runs ADD COLUMN heartbeat_at INTEGER;
+    "#,
 ];
 
 /// Maximum history rows kept; older rows are pruned on insert.

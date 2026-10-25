@@ -12,6 +12,8 @@ use crate::{Error, Result, Workspace, new_id, now_ms};
 
 /// Run history kept per job.
 pub const RUNS_KEPT: i64 = 200;
+/// A run whose runner hasn't reported for this long is taken as stopped.
+pub const STALE_RUN_MS: i64 = 120_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -619,6 +621,13 @@ impl Workspace {
         Ok(())
     }
 
+    /// Make a job look saved and last scheduled at `at` (tests of schedules).
+    #[doc(hidden)]
+    pub fn backdate_job_for_tests(&self, id: &str, at: i64) -> Result<()> {
+        self.conn.lock().execute("UPDATE jobs SET last_scheduled_at = ?2, updated_at = ?2 WHERE id = ?1", params![id, at])?;
+        Ok(())
+    }
+
     /// Save each node's last outcome into the job (without touching `updated_at`).
     pub fn set_job_node_results(&self, id: &str, results: &[NodeRunRecord]) -> Result<()> {
         let mut job = self.get_job(id)?;
@@ -682,12 +691,58 @@ impl Workspace {
         Ok(rows)
     }
 
-    /// Runs left "running" by a previous app session are marked cancelled.
+    /// Runs left "running" by a runner that stopped (app closed or crashed,
+    /// background runner killed) are marked cancelled: those whose runner
+    /// hasn't reported for [`STALE_RUN_MS`]. Runs of a live runner (another
+    /// process) are kept.
     pub fn close_stale_job_runs(&self) -> Result<usize> {
-        Ok(self.conn.lock().execute(
-            "UPDATE job_runs SET status = 'cancelled', finished_at = started_at, error = 'The app was closed while the job ran' WHERE status = 'running'",
-            [],
+        let before = now_ms() - STALE_RUN_MS;
+        let c = self.conn.lock();
+        c.execute("UPDATE jobs SET lease_owner = NULL, lease_until = NULL WHERE lease_until IS NOT NULL AND lease_until < ?1", [now_ms()])?;
+        Ok(c.execute(
+            "UPDATE job_runs SET status = 'cancelled', finished_at = COALESCE(heartbeat_at, started_at), error = 'The app or runner was closed while the job ran' \
+             WHERE status = 'running' AND COALESCE(heartbeat_at, started_at) < ?1",
+            [before],
         )?)
+    }
+
+    /// Take the job for `owner` (a process) until `until` (ms). False when
+    /// another owner holds an unexpired lease (it is running the job).
+    pub fn claim_job(&self, job_id: &str, owner: &str, until: i64) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE jobs SET lease_owner = ?2, lease_until = ?3 WHERE id = ?1 AND (lease_owner IS NULL OR lease_until IS NULL OR lease_until < ?4 OR lease_owner = ?2)",
+            params![job_id, owner, until, now_ms()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Give the job back (only `owner`'s lease).
+    pub fn release_job(&self, job_id: &str, owner: &str) -> Result<()> {
+        self.conn.lock().execute("UPDATE jobs SET lease_owner = NULL, lease_until = NULL WHERE id = ?1 AND lease_owner = ?2", params![job_id, owner])?;
+        Ok(())
+    }
+
+    /// Who holds the job now (owner, until), if anyone.
+    pub fn job_lease(&self, job_id: &str) -> Result<Option<(String, i64)>> {
+        let r: Option<(Option<String>, Option<i64>)> = self.conn.lock().query_row("SELECT lease_owner, lease_until FROM jobs WHERE id = ?1", [job_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        Ok(match r {
+            Some((Some(o), Some(u))) if u >= now_ms() => Some((o, u)),
+            _ => None,
+        })
+    }
+
+    /// Jobs held by another owner right now (running in another process).
+    pub fn jobs_leased_elsewhere(&self, owner: &str) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut stmt = c.prepare("SELECT id FROM jobs WHERE lease_owner IS NOT NULL AND lease_owner <> ?1 AND lease_until >= ?2")?;
+        let ids = stmt.query_map(params![owner, now_ms()], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
+    }
+
+    /// The runner of a run reports it is alive (and who it is).
+    pub fn touch_job_run(&self, run_id: i64, runner: &str) -> Result<()> {
+        self.conn.lock().execute("UPDATE job_runs SET heartbeat_at = ?2, runner = ?3 WHERE id = ?1", params![run_id, now_ms(), runner])?;
+        Ok(())
     }
 }
 
@@ -779,8 +834,24 @@ mod tests {
         assert!(ws.job_run_log("other", run.id).is_err());
         assert!(log_sql(&"é".repeat(LOG_SQL_CHARS)).ends_with("more characters)"));
 
-        ws.start_job_run(&j.id, "schedule").unwrap();
+        let live = ws.start_job_run(&j.id, "schedule").unwrap();
+        ws.touch_job_run(live.id, "app:1").unwrap();
+        assert_eq!(ws.close_stale_job_runs().unwrap(), 0, "its runner reported just now");
+        ws.conn.lock().execute("UPDATE job_runs SET heartbeat_at = 1 WHERE id = ?1", [live.id]).unwrap();
         assert_eq!(ws.close_stale_job_runs().unwrap(), 1);
+
+        // Leases: one owner at a time; expired ones can be taken.
+        let far = now_ms() + 60_000;
+        assert!(ws.claim_job(&j.id, "app:1", far).unwrap());
+        assert!(ws.claim_job(&j.id, "app:1", far).unwrap(), "the owner renews");
+        assert!(!ws.claim_job(&j.id, "cli:2", far).unwrap());
+        assert_eq!(ws.jobs_leased_elsewhere("cli:2").unwrap(), vec![j.id.clone()]);
+        assert_eq!(ws.job_lease(&j.id).unwrap().map(|l| l.0).as_deref(), Some("app:1"));
+        ws.release_job(&j.id, "cli:2").unwrap();
+        assert!(ws.job_lease(&j.id).unwrap().is_some(), "only the owner releases");
+        ws.release_job(&j.id, "app:1").unwrap();
+        assert!(ws.claim_job(&j.id, "cli:2", 1).unwrap());
+        assert!(ws.claim_job(&j.id, "app:1", far).unwrap(), "expired lease");
         // The job itself can be saved again with its names.
         ws.save_job(ws.get_job(&j.id).unwrap()).unwrap();
         ws.delete_job(&j.id).unwrap();

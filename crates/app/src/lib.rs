@@ -2,6 +2,7 @@
 
 pub mod ai_api;
 pub mod api;
+pub mod background;
 pub mod jobs;
 pub mod meta_writer;
 pub mod conn_io;
@@ -891,6 +892,19 @@ async fn check_for_update(app: AppHandle) -> R<Option<updates::UpdateInfo>> {
     updates::check(&app.package_info().version.to_string()).await
 }
 
+/// Scheduled jobs while the app is closed: on or off, installed, last pass.
+#[tauri::command]
+async fn background_jobs_status(app: AppHandle, state: State<'_, AppState>) -> R<background::BackgroundStatus> {
+    let dir = app.path().app_data_dir().map_err(|e| EngineError::new("internal", e.to_string()))?;
+    background::status(&state, &dir)
+}
+
+#[tauri::command]
+async fn set_background_jobs(app: AppHandle, state: State<'_, AppState>, on: bool) -> R<background::BackgroundStatus> {
+    let dir = app.path().app_data_dir().map_err(|e| EngineError::new("internal", e.to_string()))?;
+    background::set_enabled(&state, &dir, on)
+}
+
 /// Copy the app to /Applications, open that copy and quit this one. The copy
 /// in Downloads is left for the user to delete. `replace`: an existing
 /// /Applications/DataBrain.app is replaced (the UI asks first).
@@ -1242,6 +1256,8 @@ pub fn run() {
             open_link,
             app_in_downloads,
             check_for_update,
+            background_jobs_status,
+            set_background_jobs,
             move_to_applications,
             terminal_test,
             ai_provider_sign_out,

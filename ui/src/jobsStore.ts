@@ -28,6 +28,8 @@ interface JobsState {
   /** Latest run per job seen in this session (live while running). */
   runs: Record<string, JobRun>;
   running: Record<string, boolean>;
+  /** Running in the background runner (another process): shown, not stoppable here. */
+  elsewhere: Record<string, boolean>;
   /** Log lines of runs seen live in this session, by run id. */
   logs: Record<number, RunLogEntry[]>;
   refresh: () => Promise<void>;
@@ -61,14 +63,16 @@ export const useJobs = create<JobsState>((set, get) => ({
   jobs: [],
   runs: {},
   running: {},
+  elsewhere: {},
   logs: {},
   refresh: async () => {
     if (!isTauri()) return;
-    const { jobs, running } = await api.listJobs();
+    const { jobs, running, elsewhere } = await api.listJobs();
     // A list read before a run started (e.g. the save right before "Run job")
     // must not hide that run: runs whose events say "running" stay running.
     set((s) => ({
       jobs,
+      elsewhere: Object.fromEntries((elsewhere ?? []).map((id) => [id, true])),
       running: {
         ...Object.fromEntries(Object.entries(s.runs).filter(([, r]) => r.status === "running").map(([id]) => [id, true])),
         ...Object.fromEntries(running.map((id) => [id, true])),
@@ -105,6 +109,11 @@ export const useJobs = create<JobsState>((set, get) => ({
       }
     });
     await get().refresh();
+    // Runs of the background runner (another process) send no events: look again now and then.
+    if (typeof window !== "undefined") {
+      setInterval(() => void get().refresh().catch(() => {}), 30_000);
+      window.addEventListener("focus", () => void get().refresh().catch(() => {}));
+    }
     // Scheduled runs started at launch, before this listener existed.
     for (const j of get().jobs) if (j.last_run && get().running[j.id]) announceScheduled(get().jobs, j.last_run);
   },

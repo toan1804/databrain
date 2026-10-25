@@ -1804,6 +1804,7 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "chrono",
  "databrain-ai",
  "databrain-auth",
  "databrain-connector-cloud",
@@ -1839,6 +1840,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

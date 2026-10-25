@@ -708,3 +708,52 @@ async fn unreachable_connection_fails_each_run() {
     }
 }
 
+
+/// The app and the background runner (two processes on one workspace): a due
+/// job runs once, a job running in one can't start in the other, and the
+/// app doesn't cancel the runner's live runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn app_and_background_runner_share_jobs_safely() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workspace.db");
+    let open = |kind: &str| {
+        let mut st = AppState::new(Arc::new(Workspace::open(&path).unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+        st.jobs = Arc::new(databrain_app::jobs::JobsState::new(kind));
+        st
+    };
+    let (app, cli) = (open("app"), open("cli"));
+    let conn = sqlite(&app, "src", &dir.path().join("src.db"), false);
+    let mut job = plain_job("Nightly", vec![node("a", "nightly_rows", JobNodeKind::Query, Some(&conn), "select 1 as x")]);
+    job.schedule = JobSchedule { enabled: true, minutes: 5, ..Default::default() };
+    let job = app.workspace.save_job(job).unwrap();
+    app.workspace.backdate_job_for_tests(&job.id, databrain_workspace::now_ms() - 3_600_000).unwrap();
+
+    // Both look for due jobs at the same moment: only one starts it.
+    let (a, b) = (databrain_app::jobs::tick(&app.job_ctx()), databrain_app::jobs::tick_as(&cli.job_ctx(), "background"));
+    assert_eq!(a.len() + b.len(), 1, "app {a:?}, runner {b:?}");
+    let run = finished(&app, &job.id).await;
+    assert_eq!(run.status, "success", "{run:?}");
+    // Wait for the lease to be released, then nothing is due any more.
+    for _ in 0..100 {
+        if app.workspace.job_lease(&job.id).unwrap().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(databrain_app::jobs::tick(&app.job_ctx()).is_empty() && databrain_app::jobs::tick_as(&cli.job_ctx(), "background").is_empty());
+    assert_eq!(app.workspace.job_runs(&job.id, 10).unwrap().len(), 1);
+
+    // Running in the runner: the app refuses to start it and lists it as running elsewhere.
+    assert!(cli.workspace.claim_job(&job.id, &cli.jobs.owner, databrain_workspace::now_ms() + 60_000).unwrap());
+    let e = api::run_job(&app, &job.id, None).unwrap_err();
+    assert!(e.message.contains("background runner"), "{}", e.message);
+    assert_eq!(api::list_jobs(&app).unwrap().elsewhere, vec![job.id.clone()]);
+    cli.workspace.release_job(&job.id, &cli.jobs.owner).unwrap();
+
+    // A run of the command line is not closed by the app's stale-run check.
+    let r = databrain_app::jobs::run_and_wait(&cli.job_ctx(), &job.id, "cli").await.unwrap();
+    assert_eq!((r.status.as_str(), r.trigger.as_str()), ("success", "cli"));
+    let live = cli.workspace.start_job_run(&job.id, "background").unwrap();
+    cli.workspace.touch_job_run(live.id, &cli.jobs.owner).unwrap();
+    assert_eq!(app.workspace.close_stale_job_runs().unwrap(), 0);
+}

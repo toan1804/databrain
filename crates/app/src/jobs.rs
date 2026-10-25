@@ -53,15 +53,32 @@ pub struct JobLogEvent {
 /// Progress events are sent at most this often per run.
 const PROGRESS_EVERY: Duration = Duration::from_millis(200);
 
+/// How long a job's lease lasts; renewed every [`LEASE_RENEW`] while it runs.
+const LEASE_MS: i64 = 90_000;
+const LEASE_RENEW: Duration = Duration::from_secs(20);
+
 /// Jobs running now, cancellable by job id.
-#[derive(Default)]
 pub struct JobsState {
     running: Mutex<HashMap<String, CancellationToken>>,
     /// Steps running now, by (job id, step id): stop one step only.
     steps: Mutex<HashMap<(String, String), CancellationToken>>,
+    /// This process as a job runner (`app:<pid>:<n>` or `cli:<pid>:<n>`):
+    /// a job runs in one process at a time (lease in the workspace).
+    pub owner: String,
+}
+
+impl Default for JobsState {
+    fn default() -> Self {
+        Self::new("app")
+    }
 }
 
 impl JobsState {
+    /// `kind`: `app` (the desktop app) or `cli` (the background runner).
+    pub fn new(kind: &str) -> Self {
+        let n = uuid::Uuid::new_v4().simple().to_string();
+        Self { running: Mutex::default(), steps: Mutex::default(), owner: format!("{kind}:{}:{}", std::process::id(), &n[..8]) }
+    }
     pub fn is_running(&self, job_id: &str) -> bool {
         self.running.lock().contains_key(job_id)
     }
@@ -241,19 +258,52 @@ pub fn start(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>
         }
         running.insert(job_id.to_string(), cancel.clone());
     }
-    let run = match ctx.workspace.start_job_run(job_id, trigger) {
-        Ok(r) => r,
+    let owner = ctx.jobs.owner.clone();
+    // One process runs a job at a time (the app, or the background runner).
+    match ctx.workspace.claim_job(job_id, &owner, now_ms() + LEASE_MS) {
+        Ok(true) => {}
+        Ok(false) => {
+            ctx.jobs.running.lock().remove(job_id);
+            let by = match ctx.workspace.job_lease(job_id).ok().flatten() {
+                Some((o, _)) if o.starts_with("cli:") => "by the background runner",
+                _ => "in another DataBrain window",
+            };
+            return Err(EngineError::new("busy", format!("\"{}\" is already running {by}", job.name)));
+        }
         Err(e) => {
             ctx.jobs.running.lock().remove(job_id);
             return Err(e.into());
         }
+    }
+    let run = match ctx.workspace.start_job_run(job_id, trigger) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.jobs.running.lock().remove(job_id);
+            let _ = ctx.workspace.release_job(job_id, &owner);
+            return Err(e.into());
+        }
     };
+    let _ = ctx.workspace.touch_job_run(run.id, &owner);
     emit(ctx, &run);
     let c = ctx.clone();
     let r = run.clone();
     tokio::spawn(async move {
         let id = r.job_id.clone();
+        let run_id = r.id;
+        // Keep the lease and tell other processes the run is alive.
+        let beat = {
+            let (ws, id, owner) = (c.workspace.clone(), id.clone(), c.jobs.owner.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(LEASE_RENEW).await;
+                    let _ = ws.claim_job(&id, &owner, now_ms() + LEASE_MS);
+                    let _ = ws.touch_job_run(run_id, &owner);
+                }
+            })
+        };
         execute(&c, job, r, only, cancel).await;
+        beat.abort();
+        let _ = c.workspace.release_job(&id, &c.jobs.owner);
         c.jobs.running.lock().remove(&id);
     });
     Ok(run)
@@ -293,6 +343,8 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
     let trigger = match run.trigger.as_str() {
         "schedule" => "on its schedule",
         "ai" => "by the AI assistant (approved)",
+        "background" => "on its schedule, by the background runner (DataBrain closed)",
+        "cli" => "from the command line (databrain-jobs)",
         _ => "by hand",
     };
     tracer.log(
@@ -647,18 +699,52 @@ pub fn spawn_scheduler(ctx: JobCtx) {
     });
 }
 
-/// One scheduler pass; returns the jobs started.
+/// One scheduler pass; returns the jobs started. `trigger`: `schedule`
+/// (the app) or `background` (the runner while the app is closed).
 pub fn tick(ctx: &JobCtx) -> Vec<String> {
+    tick_as(ctx, "schedule")
+}
+
+pub fn tick_as(ctx: &JobCtx, trigger: &str) -> Vec<String> {
+    // Runs whose runner stopped (another process closed or crashed).
+    let _ = ctx.workspace.close_stale_job_runs();
     let now = now_ms();
+    let owner = ctx.jobs.owner.clone();
     let mut started = Vec::new();
     for j in ctx.workspace.list_jobs().unwrap_or_default() {
         if !j.schedule.enabled || ctx.jobs.is_running(&j.id) || j.next_run_at.is_none_or(|t| t > now) {
             continue;
         }
+        // Take the job, then look again: another process may have just run it.
+        if !ctx.workspace.claim_job(&j.id, &owner, now_ms() + LEASE_MS).unwrap_or(false) {
+            continue;
+        }
+        let due = ctx.workspace.get_job(&j.id).ok().and_then(|f| f.schedule.next_after(f.schedule_base())).is_some_and(|t| t <= now);
+        if !due {
+            let _ = ctx.workspace.release_job(&j.id, &owner);
+            continue;
+        }
         let _ = ctx.workspace.mark_job_scheduled(&j.id, now);
-        if start(ctx, &j.id, "schedule", None).is_ok() {
-            started.push(j.id);
+        match start(ctx, &j.id, trigger, None) {
+            Ok(_) => started.push(j.id),
+            Err(_) => {
+                let _ = ctx.workspace.release_job(&j.id, &owner);
+            }
         }
     }
     started
+}
+
+/// Start a run and wait for it to end (command line). Returns the run as saved.
+pub async fn run_and_wait(ctx: &JobCtx, job_id: &str, trigger: &str) -> Result<JobRun> {
+    let run = start(ctx, job_id, trigger, None)?;
+    wait_for(ctx, &[job_id.to_string()]).await;
+    Ok(ctx.workspace.job_runs(job_id, 5)?.into_iter().find(|r| r.id == run.id).unwrap_or(run))
+}
+
+/// Wait until these jobs are no longer running in this process.
+pub async fn wait_for(ctx: &JobCtx, ids: &[String]) {
+    while ids.iter().any(|id| ctx.jobs.is_running(id)) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }

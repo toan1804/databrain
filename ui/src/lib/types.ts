@@ -1357,3 +1357,13 @@ export interface UpdateInfo {
   notes?: string | null;
   published_at?: string | null;
 }
+
+/** Scheduled jobs while the app is closed (Settings → Jobs). */
+export interface BackgroundStatus {
+  enabled: boolean;
+  installed: boolean;
+  mechanism: string;
+  location: string;
+  last_tick?: number | null;
+  log_file: string;
+}

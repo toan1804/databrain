@@ -73,6 +73,7 @@ import type {
   QueryPlan,
   SchemaDiff,
   UpdateInfo,
+  BackgroundStatus,
   SqlFile,
   ImportSource,
   ImportPreview,
@@ -278,7 +279,7 @@ export const api = {
   moveToFolder: (kind: FolderKind, itemId: string, folderId: string | null) =>
     call<void>("move_to_folder", { kind, itemId, folderId }),
 
-  listJobs: () => call<{ jobs: JobSummary[]; running: string[] }>("list_jobs"),
+  listJobs: () => call<{ jobs: JobSummary[]; running: string[]; elsewhere?: string[] }>("list_jobs"),
   getJob: (id: string) => call<Job>("get_job", { id }),
   saveJob: (job: Job) => call<Job>("save_job", { job }),
   deleteJob: (id: string) => call<void>("delete_job", { id }),
@@ -333,6 +334,9 @@ export const api = {
   openLink: (url: string) => call<void>("open_link", { url }),
   /** The latest DataBrain release compared with this app (null: none found). */
   checkForUpdate: () => call<UpdateInfo | null>("check_for_update"),
+  backgroundJobsStatus: () => call<BackgroundStatus>("background_jobs_status"),
+  /** Run scheduled jobs also when the app is closed (installs or removes the OS entry). */
+  setBackgroundJobs: (on: boolean) => call<BackgroundStatus>("set_background_jobs", { on }),
   terminalOptions: () => call<TerminalOption[]>("terminal_options"),
   appInDownloads: () => call<string | null>("app_in_downloads"),
   moveToApplications: (replace: boolean) => call<void>("move_to_applications", { replace }),

@@ -1500,10 +1500,12 @@ impl AppState {
 pub struct JobListing {
     pub jobs: Vec<databrain_workspace::JobSummary>,
     pub running: Vec<String>,
+    /// Running in another process (the background runner).
+    pub elsewhere: Vec<String>,
 }
 
 pub fn list_jobs(state: &AppState) -> Result<JobListing> {
-    Ok(JobListing { jobs: state.workspace.list_jobs()?, running: state.jobs.running_ids() })
+    Ok(JobListing { jobs: state.workspace.list_jobs()?, running: state.jobs.running_ids(), elsewhere: state.workspace.jobs_leased_elsewhere(&state.jobs.owner)? })
 }
 
 pub fn get_job(state: &AppState, id: &str) -> Result<databrain_workspace::Job> {
