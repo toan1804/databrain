@@ -29,6 +29,7 @@ import type {
 } from "./lib/types";
 import { errorRange, uid } from "./lib/util";
 import { editorBridge } from "./editorBridge";
+import type { Dashboard } from "./lib/charts";
 
 export interface Tab extends TabState {
   /** Unsaved changes relative to the linked saved query. */
@@ -46,6 +47,8 @@ export interface Tab extends TabState {
   plan?: PlanRef | null;
   /** Schema compare; not saved across restarts. */
   compare?: CompareRef | null;
+  /** Dashboard of pinned charts (the dashboard is saved in settings). */
+  dashboard_id?: string | null;
 }
 
 /** The two schemas a compare tab shows (the script changes `target`). */
@@ -83,7 +86,7 @@ export interface DdlRef {
 }
 
 /** Tabs that hold an editable SQL editor (not notebooks, outputs or DDL views). */
-export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare;
+export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare && !t.dashboard_id;
 
 export type StatementStatus = "pending" | "running" | "done" | "error" | "cancelled";
 
@@ -202,6 +205,11 @@ interface State {
   /** The "Import connections" dialog. */
   importConnectionsOpen: boolean;
   setImportConnectionsOpen: (open: boolean) => void;
+  /** Dashboards of pinned charts (`dashboards` setting). */
+  dashboards: Dashboard[];
+  saveDashboards: (d: Dashboard[]) => void;
+  /** Open a dashboard in a tab (focuses it when open). */
+  openDashboard: (id: string) => void;
   /** Open a .sql file in a tab (asks for one without `path`); focuses its tab when open. */
   openSqlFile: (path?: string) => Promise<void>;
   /** Save a tab to its file (asks for a path for other tabs, or with `saveAs`). */
@@ -456,7 +464,7 @@ function persistTabs(tabs: Tab[]) {
     api
       .saveTabs(
         // DDL views are reloaded from the server on demand, not restored.
-        tabs.filter((t) => !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare).map((t) => ({
+        tabs.filter((t) => !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare && !t.dashboard_id).map((t) => ({
           id: t.id,
           title: t.title,
           sql: t.sql,
@@ -660,6 +668,20 @@ export const useStore = create<State>((set, get) => ({
   recentFiles: [],
   importConnectionsOpen: false,
   setImportConnectionsOpen: (open) => set({ importConnectionsOpen: open }),
+  dashboards: [],
+  saveDashboards: (dashboards) => {
+    set({ dashboards });
+    if (isTauri()) void api.setSetting("dashboards", dashboards).catch((e) => get().toast(toError(e).message, "error"));
+    // Tabs of dashboards that are gone close.
+    for (const t of get().tabs) if (t.dashboard_id && !dashboards.some((d) => d.id === t.dashboard_id)) get().closeTab(t.id);
+  },
+  openDashboard: (id) => {
+    const s = get();
+    const open = s.tabs.find((t) => t.dashboard_id === id);
+    if (open) return s.setActiveTab(open.id);
+    const d = s.dashboards.find((x) => x.id === id);
+    if (d) s.newTab({ title: d.name, sql: "", dashboard_id: id, connection_id: null });
+  },
   openSqlFile: async (path) => {
     const s = get();
     if (!path) {
@@ -840,6 +862,7 @@ export const useStore = create<State>((set, get) => ({
         schemaFilter: parseSchemaFilter(settings.explorer_schemas),
         params: parseParams(settings.editor_params, restored.map((t) => t.id)),
         recentFiles: Array.isArray(settings.recent_sql_files) ? settings.recent_sql_files.filter((p): p is string => typeof p === "string") : [],
+        dashboards: Array.isArray(settings.dashboards) ? (settings.dashboards as Dashboard[]).filter((d) => d && typeof d.id === "string" && Array.isArray(d.charts)) : [],
       });
       // File tabs: what is on disk now (edits not saved last time stay, marked unsaved).
       for (const t of restored.filter((x) => x.file_path)) {
@@ -1264,6 +1287,7 @@ export const useStore = create<State>((set, get) => ({
       job_id: init?.job_id ?? null,
       plan: init?.plan ?? null,
       compare: init?.compare ?? null,
+      dashboard_id: init?.dashboard_id ?? null,
     };
     const tabs = [...s.tabs, tab];
     set({ tabs, activeTabId: tab.id });
@@ -1277,6 +1301,11 @@ export const useStore = create<State>((set, get) => ({
     if (idx === -1) return;
     if (s.txOpen[id] && !window.confirm("This tab has an open transaction. Close it and roll back the uncommitted changes?")) return;
     if (isTauri() && isQueryTab(s.tabs[idx])) api.closeTab(id).catch(() => {});
+    // Dashboards: their charts' sessions and results.
+    const dash = s.tabs[idx].dashboard_id;
+    if (isTauri() && dash) {
+      for (const c of s.dashboards.find((d) => d.id === dash)?.charts ?? []) api.closeTab(`dash:${dash}:${c.id}`).catch(() => {});
+    }
     let tabs = s.tabs.filter((t) => t.id !== id);
     let activeTabId = s.activeTabId;
     if (tabs.length === 0) {

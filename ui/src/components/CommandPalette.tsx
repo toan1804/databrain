@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Bookmark, Database, FileCode2, FileSearch, FolderOpen, GitCompare, History, Moon, NotebookPen, Play, Plus, Save, Search, Settings2, Sparkles, Square, Sun, Workflow, X } from "lucide-react";
+import { Bookmark, Database, FileCode2, FileSearch, FolderOpen, GitCompare, History, LayoutDashboard, Moon, NotebookPen, Play, Plus, Save, Search, Settings2, Sparkles, Square, Sun, Workflow, X } from "lucide-react";
 import { useAi } from "../aiStore";
 import { useJobs } from "../jobsStore";
 import { openOutput, openResultsQuery, outputLabel, outputRef } from "../outputs";
@@ -61,6 +61,7 @@ function Palette() {
       { id: "import-conns", group: "Actions", label: "Import connections (DBeaver, pgpass, DataBrain file)…", icon: <Database size={14} />, run: () => st.setImportConnectionsOpen(true) },
       { id: "export-conns", group: "Actions", label: "Export connections (without passwords)…", icon: <Database size={14} />, run: () => void exportConnections() },
       { id: "compare", group: "Actions", label: "Compare schemas…", icon: <GitCompare size={14} />, run: () => openCompare() },
+      ...st.dashboards.map((d) => ({ id: `dash:${d.id}`, group: "Dashboards", label: d.name, detail: `${d.charts.length} chart${d.charts.length === 1 ? "" : "s"}`, icon: <LayoutDashboard size={14} />, run: () => st.openDashboard(d.id) })),
       { id: "open-file", group: "Files", label: "Open SQL file…", icon: <FolderOpen size={14} />, hint: "⌘O", run: () => void st.openSqlFile() },
       ...(isQueryTab(active)
         ? [{ id: "save-file", group: "Files", label: active.file_path ? `Save to ${baseName(active.file_path)}` : "Save tab to a file…", icon: <Save size={14} />, hint: active.file_path ? "⌘S" : "⇧⌘S", run: () => void st.saveTabFile(active.id) }]

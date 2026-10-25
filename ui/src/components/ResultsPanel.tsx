@@ -36,7 +36,7 @@ import { OutputChip } from "./OutputChip";
 import { mentionInAi, outputLabel } from "../outputs";
 import { planFind } from "../lib/find";
 import { api, toError } from "../lib/api";
-import type { ColumnStats, EditStatement, EditTarget, ExportFormat, FilterOp, ResultInfo, ResultLink, ViewSpec } from "../lib/types";
+import type { ChartSpec, ColumnStats, EditStatement, EditTarget, ExportFormat, FilterOp, ResultInfo, ResultLink, ViewSpec } from "../lib/types";
 import { editCount, emptyEdits, toChanges, type PendingEdits } from "../lib/gridEdits";
 import {
   FILTER_OPS,
@@ -54,6 +54,8 @@ import { ResultGrid, type GridHandle } from "./ResultGrid";
 import { SelectionSummaryBar, TransposeDialog, type GridRange } from "./SelectionTools";
 import { LoadIntoDialog } from "./LoadIntoDialog";
 import { ValuePanel, type FocusedCell } from "./ValuePanel";
+import { PinChartDialog } from "./DashboardTab";
+import type { ChartKind } from "../lib/charts";
 import { Modal, Popover } from "./ui";
 
 export interface ResultsPanelProps {
@@ -436,6 +438,7 @@ export function ResultView({
   const [valueOpen, setValueOpen] = useState(() => localStorage.getItem("db.valuePanel") === "1");
   useEffect(() => localStorage.setItem("db.valuePanel", valueOpen ? "1" : "0"), [valueOpen]);
   const [focused, setFocused] = useState<FocusedCell | null>(null);
+  const [pinning, setPinning] = useState<{ spec: ChartSpec; kind: ChartKind } | null>(null);
 
   // Editing the result's table: pending changes, previewed and saved as SQL.
   const [target, setTarget] = useState<EditTarget | null>(null);
@@ -779,7 +782,7 @@ export function ResultView({
       <div className="flex min-h-0 flex-1">
         <div className="min-h-0 min-w-0 flex-1">
         {mode === "chart" ? (
-          <ChartView info={info} view={view} />
+          <ChartView info={info} view={view} onPin={stmt.output && connId ? (spec, kind) => setPinning({ spec, kind }) : undefined} />
         ) : (
         <ResultGrid
           ref={grid}
@@ -821,6 +824,9 @@ export function ResultView({
         <span>{formatBytes(info.bytes)}</span>
       </div>
       {transpose && <TransposeDialog info={info} view={view} range={transpose} onClose={() => setTranspose(null)} />}
+      {pinning && stmt.output && connId && (
+        <PinChartDialog info={info} spec={pinning.spec} kind={pinning.kind} sql={stmt.output.sql} connectionId={stmt.output.connection_id || connId} defaultTitle={title ?? tab?.title ?? "Chart"} onClose={() => setPinning(null)} />
+      )}
       {loadOpen && <LoadIntoDialog info={info} sql={stmt.output?.sql ?? ""} outputName={stmt.output?.name} onClose={() => setLoadOpen(false)} />}
       {preview && (
         <Modal
