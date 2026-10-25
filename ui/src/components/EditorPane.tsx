@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronsDownUp, FileCode2, FileText, Network, Table2, Lightbulb, Loader2, MoreHorizontal, Play, PlayCircle, Plus, Save, Sparkles, Square, X, Workflow } from "lucide-react";
+import { ChevronsDownUp, FileCode2, FileText, GitFork, Network, Table2, Lightbulb, Loader2, MoreHorizontal, Play, PlayCircle, Plus, Save, Sparkles, Square, X, Workflow } from "lucide-react";
 import { isQueryTab, useActiveTab, useStore, type Tab } from "../store";
 import { editorBridge } from "../editorBridge";
 import { SqlEditor } from "./SqlEditor";
@@ -12,6 +12,7 @@ import { ParamBar } from "./ParamBar";
 import { JobTab } from "./JobTab";
 import { TabErrorBoundary } from "./TabErrorBoundary";
 import { LineageTab, openLineage } from "./LineageTab";
+import { PlanTab, openPlan } from "./PlanTab";
 import { useAi } from "../aiStore";
 import type { ConnectionView } from "../lib/types";
 
@@ -136,6 +137,15 @@ export function EditorPane() {
           <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
             <TabErrorBoundary label="lineage view">
               <LineageTab tabId={t.id} visible={t.id === activeId} />
+            </TabErrorBoundary>
+          </div>
+        ))}
+      {tabs
+        .filter((t) => t.plan)
+        .map((t) => (
+          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
+            <TabErrorBoundary label="query plan">
+              <PlanTab tabId={t.id} visible={t.id === activeId} />
             </TabErrorBoundary>
           </div>
         ))}
@@ -273,6 +283,8 @@ function TabBar() {
               <FileCode2 size={12} className="shrink-0 text-muted" />
             ) : t.lineage ? (
               <Network size={12} className="shrink-0 text-muted" />
+            ) : t.plan ? (
+              <GitFork size={12} className="shrink-0 rotate-90 text-muted" />
             ) : t.job_id ? (
               <Workflow size={12} className="shrink-0 text-muted" />
             ) : (
@@ -458,7 +470,7 @@ function Toolbar() {
         {overflow ? (
           <button
             className="btn-ghost py-1"
-            title="More: Lineage, Explain, AI, Save"
+            title="More: Lineage, Plan, Explain, AI, Save"
             aria-label="More actions"
             aria-haspopup="menu"
             aria-expanded={!!more}
@@ -478,6 +490,15 @@ function Toolbar() {
               onClick={() => openLineage(tab.id)}
             >
               <Network size={13} /> {!iconOnly && "Lineage"}
+            </button>
+            <button
+              className="btn-ghost py-1"
+              disabled={!conn}
+              title="Query plan of the statement or selection (EXPLAIN), in a new tab"
+              aria-label="Plan"
+              onClick={() => void openPlan(tab.id)}
+            >
+              <GitFork size={13} className="rotate-90" /> {!iconOnly && "Plan"}
             </button>
             <button className="btn-ghost py-1" disabled={!conn} title="Explain this query with AI" aria-label="Explain" onClick={explain}>
               <Lightbulb size={13} /> {!iconOnly && "Explain"}
@@ -500,6 +521,7 @@ function Toolbar() {
           )}
           {conn?.config.read_only && <div className="px-2 pb-1 text-[11px] text-muted">Read-only connection</div>}
           <MenuItem icon={<Network size={13} />} label="Lineage" onClick={() => (setMore(null), openLineage(tab.id))} />
+          <MenuItem icon={<GitFork size={13} className="rotate-90" />} label="Query plan" disabled={!conn} onClick={() => (setMore(null), void openPlan(tab.id))} />
           <MenuItem icon={<Lightbulb size={13} />} label="Explain" disabled={!conn} onClick={() => (setMore(null), explain())} />
           <MenuItem icon={<Sparkles size={13} />} label="Edit with AI" hint="⌘I" onClick={() => (setMore(null), editWithAi())} />
           <MenuItem icon={<Save size={13} />} label={saveLabel} hint="⌘S" onClick={() => (setMore(null), saveTabQuery(tab.id))} />

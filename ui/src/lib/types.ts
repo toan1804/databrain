@@ -1264,3 +1264,25 @@ export interface OracleAgentInfo {
   sha256: string | null;
   release: string;
 }
+
+/** One step of a query plan (any engine; see the backend's plan module). */
+export interface PlanNode {
+  op: string;
+  object?: string;
+  cost?: number;
+  rows?: number;
+  actual_rows?: number;
+  /** Inclusive time per loop (ms). */
+  time_ms?: number;
+  loops?: number;
+  extra: [string, string][];
+  children: PlanNode[];
+}
+
+export interface QueryPlan {
+  analyzed: boolean;
+  roots: PlanNode[];
+  raw: string;
+  planning_ms?: number;
+  execution_ms?: number;
+}

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 pub mod edit;
 pub mod load;
 pub mod outputs;
+pub mod plan;
 pub mod probe;
 pub mod related;
 

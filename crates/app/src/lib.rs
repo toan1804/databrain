@@ -686,6 +686,10 @@ async fn apply_edits(state: State<'_, AppState>, result_id: String, changes: Vec
     api::apply_edits(&state, &result_id, changes).await
 }
 #[tauri::command]
+async fn explain_plan(state: State<'_, AppState>, connection_id: String, session_key: String, sql: String, analyze: bool, params: Option<std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>>) -> R<databrain_query_engine::plan::QueryPlan> {
+    api::explain_plan(&state, &connection_id, &session_key, &sql, analyze, &params.unwrap_or_default()).await
+}
+#[tauri::command]
 async fn result_links(state: State<'_, AppState>, result_id: String) -> R<Vec<databrain_query_engine::related::ResultLink>> {
     api::result_links(&state, &result_id).await
 }
@@ -1103,6 +1107,7 @@ pub fn run() {
             edit_preview,
             apply_edits,
             result_links,
+            explain_plan,
             related_rows_sql,
             cancel_load,
             dry_run_result_load,

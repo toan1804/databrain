@@ -1602,6 +1602,13 @@ pub async fn apply_edits(state: &AppState, result_id: &str, changes: Vec<databra
     state.engine.apply_edits(&target, o.session(), &stmts).await
 }
 
+/// The query plan of one statement, on the tab's session (`analyze` runs it: reads only).
+pub async fn explain_plan(state: &AppState, connection_id: &str, session_key: &str, sql: &str, analyze: bool, params: &std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>) -> Result<databrain_query_engine::plan::QueryPlan> {
+    let kind = state.workspace.get_connection(connection_id)?.config.kind;
+    let sql = databrain_connector_core::sql::substitute_parameters(sql, kind, params).map_err(|names| invalid(&format!("Enter a value for {}", names.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", "))))?;
+    state.engine.explain(connection_id, session_key, &sql, analyze).await
+}
+
 /// Foreign keys from and to the table a result was read from.
 pub async fn result_links(state: &AppState, result_id: &str) -> Result<Vec<databrain_query_engine::related::ResultLink>> {
     let (o, schema) = edit_source(state, result_id)?;

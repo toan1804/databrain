@@ -38,6 +38,17 @@ export interface Tab extends TabState {
   lineage?: LineageRef | null;
   /** Job editor (the job is saved in the workspace); not saved across restarts. */
   job_id?: string | null;
+  /** Query plan of `sql` (EXPLAIN); not saved across restarts. */
+  plan?: PlanRef | null;
+}
+
+/** Where a plan tab's statement came from. */
+export interface PlanRef {
+  /** Query tab whose session runs the EXPLAIN (temp tables, open transaction). */
+  source: string;
+  analyze: boolean;
+  /** `:name` values the statement uses. */
+  params?: Record<string, ParamValue>;
 }
 
 /** Where a lineage tab's SQL came from. */
@@ -60,7 +71,7 @@ export interface DdlRef {
 }
 
 /** Tabs that hold an editable SQL editor (not notebooks, outputs or DDL views). */
-export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.lineage && !t.job_id;
+export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.lineage && !t.job_id && !t.plan;
 
 export type StatementStatus = "pending" | "running" | "done" | "error" | "cancelled";
 
@@ -422,7 +433,7 @@ function persistTabs(tabs: Tab[]) {
     api
       .saveTabs(
         // DDL views are reloaded from the server on demand, not restored.
-        tabs.filter((t) => !t.ddl && !t.lineage && !t.job_id).map((t) => ({
+        tabs.filter((t) => !t.ddl && !t.lineage && !t.job_id && !t.plan).map((t) => ({
           id: t.id,
           title: t.title,
           sql: t.sql,
@@ -1111,6 +1122,7 @@ export const useStore = create<State>((set, get) => ({
       ddl: init?.ddl ?? null,
       lineage: init?.lineage ?? null,
       job_id: init?.job_id ?? null,
+      plan: init?.plan ?? null,
     };
     const tabs = [...s.tabs, tab];
     set({ tabs, activeTabId: tab.id });

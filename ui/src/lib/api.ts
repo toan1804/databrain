@@ -70,6 +70,7 @@ import type {
   EditStatement,
   ApplyReport,
   ResultLink,
+  QueryPlan,
   LoadReport,
   RunRequest,
   RunResponse,
@@ -220,6 +221,9 @@ export const api = {
   applyEdits: (resultId: string, changes: RowChange[]) => call<ApplyReport>("apply_edits", { resultId, changes }),
   /** Foreign keys from and to the table a result was read from. */
   resultLinks: (resultId: string) => call<ResultLink[]>("result_links", { resultId }),
+  /** EXPLAIN one statement on the tab's session (`analyze` runs it: reads only). */
+  explainPlan: (connectionId: string, sessionKey: string, sql: string, analyze: boolean, params?: Record<string, ParamValue>) =>
+    call<QueryPlan>("explain_plan", { connectionId, sessionKey, sql, analyze, params: params ?? null }),
   /** The query for the rows a link leads to (one value list per row, in `link.columns` order). */
   relatedRowsSql: (resultId: string, link: ResultLink, rows: (string | null)[][]) => call<string>("related_rows_sql", { resultId, link, rows }),
   /** Copy a result's fetched rows into a table (job load code). */
