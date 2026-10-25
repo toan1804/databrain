@@ -203,6 +203,10 @@ export const api = {
   runQuery: (req: RunRequest) => call<RunResponse>("run_query", { req }),
   cancelQuery: (jobId: string) => call<boolean>("cancel_query", { jobId }),
   closeTab: (tabId: string) => call<void>("close_tab", { tabId }),
+  setAutoCommit: (tabId: string, on: boolean) => call<void>("set_auto_commit", { tabId, on }),
+  transactionState: (connectionId: string, sessionKey: string) => call<boolean>("transaction_state", { connectionId, sessionKey }),
+  /** COMMIT (true) or ROLLBACK; resolves to whether a transaction is still open. */
+  endTransaction: (connectionId: string, sessionKey: string, commit: boolean) => call<boolean>("end_transaction", { connectionId, sessionKey, commit }),
 
   resultInfo: (resultId: string) => call<ResultInfo>("result_info", { resultId }),
   fetchPage: (resultId: string, view: ViewSpec, offset: number, limit: number) =>

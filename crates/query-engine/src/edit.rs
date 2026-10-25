@@ -140,7 +140,7 @@ fn fold(kind: ConnectorKind, name: &str, quoted: bool) -> String {
 }
 
 /// How changes are applied on a database (see [`EditTarget::apply`]).
-fn apply_style(kind: ConnectorKind) -> Option<(&'static str, &'static str, &'static str)> {
+pub(crate) fn apply_style(kind: ConnectorKind) -> Option<(&'static str, &'static str, &'static str)> {
     match kind {
         ConnectorKind::Postgres | ConnectorKind::Sqlite | ConnectorKind::Duckdb | ConnectorKind::Snowflake => Some(("BEGIN", "COMMIT", "ROLLBACK")),
         ConnectorKind::Mysql => Some(("START TRANSACTION", "COMMIT", "ROLLBACK")),

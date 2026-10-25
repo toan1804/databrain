@@ -169,6 +169,9 @@ pub enum JobEvent {
         tab_id: String,
         status: RunStatus,
         duration_ms: u64,
+        /// The run's session has a transaction open afterwards.
+        #[serde(default)]
+        in_transaction: bool,
     },
     /// Outputs were added, renamed, pinned or evicted (job/tab ids empty).
     OutputsChanged { job_id: String, tab_id: String },
@@ -385,6 +388,9 @@ pub struct QueryEngine {
     /// Files written by finished full exports, by id.
     exported: Mutex<HashMap<String, std::path::PathBuf>>,
     outputs: Arc<OutputRegistry>,
+    /// Session keys (tabs) in manual-commit mode: writes open a transaction
+    /// the user ends with Commit or Rollback.
+    manual_commit: Mutex<std::collections::HashSet<String>>,
 }
 
 impl QueryEngine {
@@ -409,6 +415,7 @@ impl QueryEngine {
             exports: Mutex::new(HashMap::new()),
             exported: Mutex::new(HashMap::new()),
             outputs: OutputRegistry::new(results.clone(), workspace.clone()),
+            manual_commit: Mutex::new(Default::default()),
             results,
         })
     }
@@ -775,6 +782,71 @@ impl QueryEngine {
         self.sessions.lock().retain(|(_, t), _| t != tab_id);
         self.outputs.close_tab(tab_id);
         self.outputs_changed();
+    }
+
+    // -------------------------------------------------------------- transactions
+
+    /// Manual commit on or off for a session key (a tab).
+    pub fn set_manual_commit(&self, session_key: &str, manual: bool) {
+        let mut g = self.manual_commit.lock();
+        if manual {
+            g.insert(session_key.to_string());
+        } else {
+            g.remove(session_key);
+        }
+    }
+
+    pub fn is_manual_commit(&self, session_key: &str) -> bool {
+        self.manual_commit.lock().contains(session_key)
+    }
+
+    /// The session `session_key` of a connection has an open transaction
+    /// (false when it isn't connected).
+    pub fn in_transaction(&self, connection_id: &str, session_key: &str) -> bool {
+        self.sessions
+            .lock()
+            .get(&(connection_id.to_string(), session_key.to_string()))
+            .is_some_and(|l| l.session.in_transaction())
+    }
+
+    /// COMMIT or ROLLBACK the session's transaction. Returns whether one is
+    /// still open afterwards. Nothing happens without a session.
+    pub async fn end_transaction(&self, connection_id: &str, session_key: &str, commit: bool) -> Result<bool> {
+        if self.jobs.lock().values().any(|j| j.session_key == session_key) {
+            return Err(EngineError::new("busy", "A query is running in this tab: wait for it or stop it first"));
+        }
+        let Some(session) = self.sessions.lock().get(&(connection_id.to_string(), session_key.to_string())).map(|l| l.session.clone()) else {
+            return Ok(false);
+        };
+        let sql = if commit { "COMMIT" } else { "ROLLBACK" };
+        // SQL Server nests BEGIN TRAN: each COMMIT ends one level.
+        for _ in 0..32 {
+            session.execute(sql, ExecOptions::default()).await?.collect().await?;
+            if !commit || !session.in_transaction() {
+                break;
+            }
+        }
+        Ok(session.in_transaction())
+    }
+
+    /// Manual commit: open a transaction before a write when none is open.
+    async fn begin_if_manual(&self, req: &RunRequest, kind: databrain_connector_core::ConnectorKind, stmt: &PlannedStatement) -> Result<()> {
+        use databrain_connector_core::sql::StatementKind as K;
+        let write = match stmt.classification.kind {
+            K::Dml => true,
+            // MySQL commits DDL at once; elsewhere DDL is transactional.
+            K::Ddl => kind != databrain_connector_core::ConnectorKind::Mysql,
+            _ => false,
+        };
+        if !write || !self.is_manual_commit(req.session_key()) {
+            return Ok(());
+        }
+        let Some((begin, _, _)) = edit::apply_style(kind) else { return Ok(()) };
+        let session = self.session(&req.connection_id, req.session_key()).await?;
+        if !session.in_transaction() {
+            session.execute(begin, ExecOptions::default()).await?.collect().await?;
+        }
+        Ok(())
     }
 
     // -------------------------------------------------------------- metadata
@@ -1384,9 +1456,10 @@ impl QueryEngine {
             });
             let started_at = now_ms();
             let t0 = Instant::now();
-            let outcome = self
-                .run_statement(&job_id, &req, stmt, limit, cancel.child_token())
-                .await;
+            let outcome = match self.begin_if_manual(&req, conn_kind, stmt).await {
+                Ok(()) => self.run_statement(&job_id, &req, stmt, limit, cancel.child_token()).await,
+                Err(e) => Err(e),
+            };
             let duration_ms = t0.elapsed().as_millis() as u64;
 
             let output = match &outcome {
@@ -1473,11 +1546,13 @@ impl QueryEngine {
         }
         self.jobs.lock().remove(&job_id);
         self.outputs_changed();
+        let in_transaction = self.in_transaction(&req.connection_id, req.session_key());
         self.events.emit(JobEvent::JobFinished {
             job_id,
             tab_id: req.tab_id,
             status,
             duration_ms: job_start.elapsed().as_millis() as u64,
+            in_transaction,
         });
     }
 
@@ -1836,6 +1911,41 @@ mod tests {
             .unwrap();
         assert_eq!(info.total_rows, 2);
         assert!(!info.truncated);
+    }
+
+    #[tokio::test]
+    async fn manual_commit_opens_a_transaction_until_commit_or_rollback() {
+        let f = fixture(EnvTag::None);
+        let run = |sql: &str| RunRequest { confirmed: true, ..req(&f, sql) };
+        let job = started(f.engine.run(run("create table t (a int)")).unwrap());
+        wait_job(&f, &job).await;
+        f.engine.set_manual_commit("tab1", true);
+        let job = started(f.engine.run(run("insert into t values (1)")).unwrap());
+        let evs = wait_job(&f, &job).await;
+        assert!(evs.iter().any(|e| matches!(e, JobEvent::JobFinished { in_transaction: true, .. })), "{evs:?}");
+        assert!(f.engine.in_transaction(&f.conn_id, "tab1"));
+        // Reads don't open one; Rollback undoes the insert.
+        assert!(!f.engine.end_transaction(&f.conn_id, "tab1", false).await.unwrap());
+        let count = |f: &Fixture| {
+            let ws = f.engine.clone();
+            let id = f.conn_id.clone();
+            async move {
+                let s = ws.session_for_tests(&id).await.unwrap();
+                let c = s.execute("select * from t", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+                c.batches.iter().map(|b| b.num_rows()).sum::<usize>()
+            }
+        };
+        assert_eq!(count(&f).await, 0);
+        // Commit keeps it.
+        let job = started(f.engine.run(run("insert into t values (2)")).unwrap());
+        wait_job(&f, &job).await;
+        assert!(!f.engine.end_transaction(&f.conn_id, "tab1", true).await.unwrap());
+        assert_eq!(count(&f).await, 1);
+        // Auto-commit again: no transaction is left open.
+        f.engine.set_manual_commit("tab1", false);
+        let job = started(f.engine.run(run("insert into t values (3)")).unwrap());
+        wait_job(&f, &job).await;
+        assert!(!f.engine.in_transaction(&f.conn_id, "tab1"));
     }
 
     #[tokio::test]

@@ -166,6 +166,14 @@ interface State {
   tabs: Tab[];
   activeTabId: string | null;
   runs: Record<string, TabRun>;
+  /** Tabs whose session has an open transaction → the connection it is on. */
+  txOpen: Record<string, string>;
+  /** Re-read whether the tab's session has an open transaction. */
+  refreshTxState: (tabId: string, connectionId: string) => Promise<void>;
+  /** COMMIT (true) or ROLLBACK the tab's open transaction. */
+  endTransaction: (tabId: string, commit: boolean) => Promise<void>;
+  /** Manual commit (false) or auto-commit (true) for a query tab. */
+  setAutoCommit: (tabId: string, on: boolean) => void;
   savedQueries: SavedQuery[];
   historyVersion: number;
   schemas: Record<string, SchemaInfo[]>;
@@ -422,6 +430,7 @@ function persistTabs(tabs: Tab[]) {
           saved_query_id: t.saved_query_id ?? null,
           notebook_id: t.notebook_id ?? null,
           output_ref: t.output_ref ?? null,
+          auto_commit: t.auto_commit ?? null,
         })),
       )
       .catch(() => {});
@@ -569,6 +578,38 @@ export const useStore = create<State>((set, get) => ({
     }),
   activeTabId: null,
   runs: {},
+  txOpen: {},
+  refreshTxState: async (tabId, connectionId) => {
+    if (!isTauri()) return;
+    const open = await api.transactionState(connectionId, tabId).catch(() => false);
+    set((s) => {
+      const txOpen = { ...s.txOpen };
+      if (open) txOpen[tabId] = connectionId;
+      else delete txOpen[tabId];
+      return { txOpen };
+    });
+  },
+  endTransaction: async (tabId, commit) => {
+    const connId = get().txOpen[tabId];
+    if (!connId) return;
+    try {
+      const still = await api.endTransaction(connId, tabId, commit);
+      set((s) => {
+        const txOpen = { ...s.txOpen };
+        if (still) txOpen[tabId] = connId;
+        else delete txOpen[tabId];
+        return { txOpen };
+      });
+      get().toast(commit ? "Committed" : "Rolled back", "success");
+    } catch (e) {
+      get().toast(toError(e).message, "error");
+      await get().refreshTxState(tabId, connId);
+    }
+  },
+  setAutoCommit: (tabId, on) => {
+    get().updateTab(tabId, { auto_commit: on ? null : false });
+    if (isTauri()) api.setAutoCommit(tabId, on).catch(() => {});
+  },
   savedQueries: [],
   historyVersion: 0,
   schemas: {},
@@ -1081,6 +1122,7 @@ export const useStore = create<State>((set, get) => ({
     const s = get();
     const idx = s.tabs.findIndex((t) => t.id === id);
     if (idx === -1) return;
+    if (s.txOpen[id] && !window.confirm("This tab has an open transaction. Close it and roll back the uncommitted changes?")) return;
     if (isTauri() && isQueryTab(s.tabs[idx])) api.closeTab(id).catch(() => {});
     let tabs = s.tabs.filter((t) => t.id !== id);
     let activeTabId = s.activeTabId;
@@ -1092,6 +1134,8 @@ export const useStore = create<State>((set, get) => ({
     if (activeTabId === id) activeTabId = tabs[Math.min(idx, tabs.length - 1)].id;
     const runs = { ...s.runs };
     delete runs[id];
+    const txOpen = { ...s.txOpen };
+    delete txOpen[id];
     const params = { ...s.params };
     delete params[id];
     // Remembered to reopen (not empty scratch tabs); the editor text and
@@ -1099,7 +1143,7 @@ export const useStore = create<State>((set, get) => ({
     const closed = s.tabs[idx];
     const keep = !!(closed.sql.trim() || closed.notebook_id || closed.output_ref || closed.ddl || closed.job_id || closed.saved_query_id);
     const closedTabs = keep ? [...s.closedTabs, { tab: closed, index: idx, params: s.params[id] }].slice(-20) : s.closedTabs;
-    set({ tabs, activeTabId, runs, params, closedTabs });
+    set({ tabs, activeTabId, runs, params, closedTabs, txOpen });
     persistParams(params);
     persistTabs(tabs);
   },
@@ -1426,10 +1470,16 @@ export const useStore = create<State>((set, get) => ({
             next.activeIndex = statements.length - 1;
           }
           if (e.status !== "cancelled") setTimeout(() => void get().computeTips(e.tab_id, e.job_id), 0);
-          return {
-            runs: { ...s.runs, [e.tab_id]: next },
-            historyVersion: s.historyVersion + 1,
-          };
+          {
+            const txOpen = { ...s.txOpen };
+            if (e.in_transaction && run.connectionId) txOpen[e.tab_id] = run.connectionId;
+            else if (txOpen[e.tab_id] === run.connectionId) delete txOpen[e.tab_id];
+            return {
+              runs: { ...s.runs, [e.tab_id]: next },
+              historyVersion: s.historyVersion + 1,
+              txOpen,
+            };
+          }
       }
       return { runs: { ...s.runs, [e.tab_id]: next } };
     });

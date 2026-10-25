@@ -150,6 +150,12 @@ impl AppState {
             hub.clone(),
         );
         slot.set(engine.external_tables());
+        // Tabs left in manual-commit mode.
+        for t in workspace.list_tabs().unwrap_or_default() {
+            if t.auto_commit == Some(false) {
+                engine.set_manual_commit(&t.id, true);
+            }
+        }
         let ai = crate::ai_api::AiState::default();
         engine.set_interaction(Arc::new(crate::ai_api::AppInteraction::new(ui.clone(), ai.sign_in_cancel.clone())));
         Self {
@@ -1012,6 +1018,22 @@ pub fn cancel_query(state: &AppState, job_id: &str) -> bool {
 
 pub fn close_tab(state: &AppState, tab_id: &str) {
     state.engine.close_tab(tab_id);
+    state.engine.set_manual_commit(tab_id, false);
+}
+
+/// Manual commit on or off for a tab (its writes then wait for Commit).
+pub fn set_auto_commit(state: &AppState, tab_id: &str, on: bool) {
+    state.engine.set_manual_commit(tab_id, !on);
+}
+
+/// Whether the tab's session on the connection has an open transaction.
+pub fn transaction_state(state: &AppState, connection_id: &str, session_key: &str) -> bool {
+    state.engine.in_transaction(connection_id, session_key)
+}
+
+/// COMMIT or ROLLBACK the tab's transaction; returns whether one is still open.
+pub async fn end_transaction(state: &AppState, connection_id: &str, session_key: &str, commit: bool) -> Result<bool> {
+    state.engine.end_transaction(connection_id, session_key, commit).await
 }
 
 // ------------------------------------------------------------ results

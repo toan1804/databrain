@@ -13,8 +13,53 @@ import { JobTab } from "./JobTab";
 import { TabErrorBoundary } from "./TabErrorBoundary";
 import { LineageTab, openLineage } from "./LineageTab";
 import { useAi } from "../aiStore";
+import type { ConnectionView } from "../lib/types";
 
 const ROW_LIMITS = [100, 500, 1000, 5000, 10000, 50000, 100000, 0];
+
+/** Databases whose open transactions the app can tell (manual commit works there). */
+const TX_KINDS = new Set(["postgres", "mysql", "mssql", "sqlite"]);
+
+/**
+ * Auto/manual commit toggle and, while the tab's session has a transaction
+ * open, a badge with Commit and Rollback.
+ */
+function TxControls({ tab, conn, running, compact }: { tab: Tab; conn?: ConnectionView; running: boolean; compact: boolean }) {
+  const txConn = useStore((s) => s.txOpen[tab.id]);
+  const endTransaction = useStore((s) => s.endTransaction);
+  const setAutoCommit = useStore((s) => s.setAutoCommit);
+  const manual = tab.auto_commit === false;
+  const supported = !!conn && TX_KINDS.has(conn.config.kind) && !conn.config.read_only;
+  return (
+    <>
+      {(supported || manual) && (
+        <button
+          className={`btn-ghost shrink-0 border py-0.5 text-[11.5px] ${manual ? "border-warning/60 text-warning" : "border-line text-muted"}`}
+          aria-pressed={manual}
+          title={
+            manual
+              ? "Manual commit: changes stay in a transaction until you Commit or Roll back. Click for auto-commit."
+              : "Auto-commit: each statement is saved at once. Click for manual commit (changes wait for Commit)."
+          }
+          onClick={() => setAutoCommit(tab.id, manual)}
+        >
+          {manual ? "Manual commit" : compact ? "Auto" : "Auto-commit"}
+        </button>
+      )}
+      {txConn && (
+        <span className="flex shrink-0 items-center gap-1 rounded-md bg-warning/15 py-0.5 pl-2 pr-0.5 text-[11.5px] text-warning" role="status">
+          {!compact && "Transaction open"}
+          <button className="btn-ghost h-5 px-1.5 py-0 text-[11.5px] text-fg" disabled={running} title="COMMIT the open transaction" onClick={() => void endTransaction(tab.id, true)}>
+            Commit
+          </button>
+          <button className="btn-ghost h-5 px-1.5 py-0 text-[11.5px] text-fg" disabled={running} title="ROLLBACK: undo the uncommitted changes" onClick={() => void endTransaction(tab.id, false)}>
+            Rollback
+          </button>
+        </span>
+      )}
+    </>
+  );
+}
 
 export function EditorPane() {
   const tabs = useStore((s) => s.tabs);
@@ -403,6 +448,8 @@ function Toolbar() {
           ))}
         </select>
       </label>
+
+      <TxControls tab={tab} conn={conn} running={!!run?.running} compact={iconOnly} />
 
       <div className="ml-auto flex shrink-0 items-center gap-1">
         {conn?.config.read_only && !overflow && (

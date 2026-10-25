@@ -476,6 +476,7 @@ export function ResultView({
       );
       // Refresh the result from the database (same run key and session).
       const sql = stmt.output?.sql;
+      if (connId && isQueryTab(tab)) void useStore.getState().refreshTxState(tabId, connId);
       if (sql && connId && isQueryTab(tab)) void useStore.getState().runSql(tabId, connId, sql);
       else if (sql && connId && tabId.startsWith("nb:"))
         void useStore.getState().runSql(tabId, connId, sql, 0, tabId.split(":").slice(0, 2).join(":"), stmt.output?.name);

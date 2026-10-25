@@ -738,6 +738,21 @@ async fn close_tab(state: State<'_, AppState>, tab_id: String) -> R<()> {
 }
 
 #[tauri::command]
+fn set_auto_commit(state: State<'_, AppState>, tab_id: String, on: bool) {
+    api::set_auto_commit(&state, &tab_id, on);
+}
+
+#[tauri::command]
+fn transaction_state(state: State<'_, AppState>, connection_id: String, session_key: String) -> bool {
+    api::transaction_state(&state, &connection_id, &session_key)
+}
+
+#[tauri::command]
+async fn end_transaction(state: State<'_, AppState>, connection_id: String, session_key: String, commit: bool) -> R<bool> {
+    api::end_transaction(&state, &connection_id, &session_key, commit).await
+}
+
+#[tauri::command]
 async fn result_info(state: State<'_, AppState>, result_id: String) -> R<ResultInfo> {
     api::result_info(&state, &result_id)
 }
@@ -1089,6 +1104,9 @@ pub fn run() {
             run_query,
             cancel_query,
             close_tab,
+            set_auto_commit,
+            transaction_state,
+            end_transaction,
             result_info,
             fetch_page,
             find_in_result,

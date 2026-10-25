@@ -452,7 +452,7 @@ export type JobEvent =
       duration_ms: number;
       statement_start: number;
     }
-  | { type: "job_finished"; job_id: string; tab_id: string; status: RunStatus; duration_ms: number }
+  | { type: "job_finished"; job_id: string; tab_id: string; status: RunStatus; duration_ms: number; in_transaction?: boolean }
   | { type: "outputs_changed"; job_id: ""; tab_id: "" };
 
 export type FilterOp =
@@ -625,6 +625,8 @@ export interface TabState {
   saved_query_id?: string | null;
   notebook_id?: string | null;
   output_ref?: string | null;
+  /** false: manual commit (writes wait for Commit/Rollback). */
+  auto_commit?: boolean | null;
 }
 
 export interface Span {

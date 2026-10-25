@@ -352,6 +352,10 @@ pub struct TabState {
     /// Set for output viewer tabs (output handle).
     #[serde(default)]
     pub output_ref: Option<String>,
+    /// Manual commit: statements run in a transaction the user commits or
+    /// rolls back (`Some(false)`); `None`/`Some(true)` = auto-commit.
+    #[serde(default)]
+    pub auto_commit: Option<bool>,
 }
 
 const MIGRATIONS: &[&str] = &[
@@ -622,6 +626,10 @@ const MIGRATIONS: &[&str] = &[
     // v10: a log per job run (what ran, outputs, errors)
     r#"
     ALTER TABLE job_runs ADD COLUMN log_json TEXT;
+    "#,
+    // v11: manual-commit tabs
+    r#"
+    ALTER TABLE tabs ADD COLUMN auto_commit INTEGER;
     "#,
 ];
 
@@ -1030,7 +1038,7 @@ impl Workspace {
     pub fn list_tabs(&self) -> Result<Vec<TabState>> {
         let c = self.conn.lock();
         let mut stmt = c.prepare(
-            "SELECT id, title, sql, connection_id, saved_query_id, notebook_id, output_ref FROM tabs ORDER BY order_idx",
+            "SELECT id, title, sql, connection_id, saved_query_id, notebook_id, output_ref, auto_commit FROM tabs ORDER BY order_idx",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -1042,6 +1050,7 @@ impl Workspace {
                     saved_query_id: r.get(4)?,
                     notebook_id: r.get(5)?,
                     output_ref: r.get(6)?,
+                    auto_commit: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1055,10 +1064,10 @@ impl Workspace {
         tx.execute("DELETE FROM tabs", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO tabs (id, title, sql, connection_id, saved_query_id, order_idx, notebook_id, output_ref) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO tabs (id, title, sql, connection_id, saved_query_id, order_idx, notebook_id, output_ref, auto_commit) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for (i, t) in tabs.iter().enumerate() {
-                stmt.execute(params![t.id, t.title, t.sql, t.connection_id, t.saved_query_id, i as i64, t.notebook_id, t.output_ref])?;
+                stmt.execute(params![t.id, t.title, t.sql, t.connection_id, t.saved_query_id, i as i64, t.notebook_id, t.output_ref, t.auto_commit])?;
             }
         }
         tx.commit()?;
@@ -1296,6 +1305,7 @@ mod tests {
                 saved_query_id: None,
                 notebook_id: None,
                 output_ref: None,
+                auto_commit: None,
             },
             TabState {
                 id: "t2".into(),
@@ -1305,6 +1315,7 @@ mod tests {
                 saved_query_id: None,
                 notebook_id: None,
                 output_ref: None,
+                auto_commit: Some(false),
             },
         ];
         ws.save_tabs(&tabs).unwrap();
