@@ -12,6 +12,7 @@ import type {
   RunLogEntry,
   JobSummary,
   LoadDryRun,
+  LoadTarget,
   BatchLimits,
   ImportAction,
   NotesImportPreview,
@@ -247,6 +248,7 @@ export const api = {
   loadResult: (resultId: string, args: LoadResultArgs, loadId: string) => call<LoadReport>("load_result", { resultId, args, loadId }),
   cancelLoad: (loadId: string) => call<boolean>("cancel_load", { loadId }),
   dryRunResultLoad: (resultId: string, args: LoadResultArgs) => call<LoadDryRun>("dry_run_result_load", { resultId, args }),
+  checkLoadTarget: (connectionId: string, table: string) => call<LoadTarget>("check_load_target", { connectionId, table }),
   summarizeSelection: (resultId: string, view: ViewSpec, columns: number[], offset: number, limit: number) =>
     call<SelectionSummary>("summarize_selection", { resultId, view, columns, offset, limit }),
   columnStats: (resultId: string, view: ViewSpec, column: number) =>

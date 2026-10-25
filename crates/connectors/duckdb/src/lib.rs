@@ -840,7 +840,9 @@ impl Session for DuckSession {
         let rows = self
             .strings(
                 "select database_name, schema_name, (database_name = current_database() and schema_name = current_schema())::varchar \
-                 from duckdb_schemas() where not internal and schema_name <> 'pg_catalog' and database_name <> 'results' \
+                 from duckdb_schemas() \
+                 where (not internal or (schema_name = 'main' and database_name not in ('system', 'temp'))) \
+                   and schema_name <> 'pg_catalog' and database_name <> 'results' \
                  order by database_name = current_database() desc, schema_name = 'files' desc, 1, 2"
                     .into(),
                 vec![],
@@ -882,7 +884,14 @@ impl Session for DuckSession {
                 vec![],
             )
             .await?;
-        Ok(Some(rows.into_iter().filter_map(|r| Some((r[0].clone()?, r[1].clone()?))).collect()))
+        let mut map: std::collections::HashMap<String, String> = rows.into_iter().filter_map(|r| Some((r[0].clone()?, r[1].clone()?))).collect();
+        // Schemas without columns (an empty `main`) are unchanged too.
+        for s in self.list_schemas().await? {
+            if s.catalog.as_deref() != Some("results") {
+                map.entry(s.name).or_default();
+            }
+        }
+        Ok(Some(map))
     }
 
     async fn schema_object_counts(&self) -> Result<Option<std::collections::HashMap<String, usize>>> {

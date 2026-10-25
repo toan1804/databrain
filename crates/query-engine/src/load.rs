@@ -16,6 +16,10 @@
 //!   permanent DDL (which commits there). Elsewhere statements commit one
 //!   by one.
 //! - INSERT text is built one statement at a time while the rows are sent.
+//! - The target path is checked before anything is written
+//!   ([`QueryEngine::check_load_target`]): a catalog or schema that doesn't
+//!   exist (or is written in another case) stops the load with what to
+//!   create first; only the table is created automatically.
 //! - Dry run: where the transaction covers everything, the step really runs
 //!   on sample rows and is rolled back; elsewhere each statement is checked
 //!   with `EXPLAIN` when the engine has it, the rest is listed as unchecked.
@@ -25,7 +29,8 @@ use std::sync::Arc;
 use databrain_connector_core::arrow::array::RecordBatch;
 use databrain_connector_core::arrow::datatypes::{Field, Schema, SchemaRef};
 use databrain_connector_core::sql::{StatementKind, classify, split_statements};
-use databrain_connector_core::{CancellationToken, ConnectorKind, ErrorKind, ExecOptions, Session};
+use databrain_connector_core::traits::NameLevels;
+use databrain_connector_core::{CancellationToken, ConnectorKind, ErrorKind, ExecOptions, ObjectKind, Session, quote_ident, split_path};
 use databrain_export::load as sqlgen;
 use databrain_workspace::LoadMode;
 use serde::Serialize;
@@ -56,6 +61,33 @@ pub struct LoadReport {
     pub created_table: bool,
     pub transaction: bool,
     pub notices: Vec<String>,
+}
+
+/// Where a load would write, checked against the database: which parts of
+/// the path exist. Names are compared exactly (they are quoted as typed).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LoadTarget {
+    /// The table with the catalog/schema the session would use filled in.
+    pub resolved: String,
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+    pub table: String,
+    /// `None`: not checked (two-level engine, or an earlier part is missing).
+    pub catalog_exists: Option<bool>,
+    pub schema_exists: Option<bool>,
+    pub table_exists: Option<bool>,
+    /// Why rows can't go there: a missing catalog or schema, too many name
+    /// parts, a view. Loading needs these fixed first.
+    pub problems: Vec<String>,
+    /// SQL that creates what is missing, to run first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_sql: Option<String>,
+    /// The path written with the database's case (`ANALYTICS.ORDERS` for
+    /// `analytics.orders`) when that exists and what was typed doesn't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
+    /// Good to know: the default schema used, a table of another case.
+    pub notes: Vec<String>,
 }
 
 /// One statement (or group of INSERTs) of a dry run.
@@ -409,6 +441,162 @@ impl QueryEngine {
         report
     }
 
+    /// Check the path rows would be loaded into: the catalog (three-level
+    /// engines), the schema (the session's default when not given) and the
+    /// table, live from the database. A missing table is fine for modes
+    /// that create it; a missing catalog or schema is a problem.
+    pub async fn check_load_target(&self, connection_id: &str, table: &str) -> Result<LoadTarget> {
+        let profile = self.workspace.get_connection(connection_id)?;
+        let kind = profile.config.kind;
+        let conn = profile.name.clone();
+        let parts = split_path(kind, table.trim());
+        let mut t = LoadTarget { table: parts.last().cloned().unwrap_or_default(), ..Default::default() };
+        if parts.is_empty() || parts.iter().any(String::is_empty) {
+            t.problems.push("Enter the table as schema.table (or just the table, for the default schema)".into());
+            return Ok(t);
+        }
+        let levels = kind.traits().levels;
+        let catalogs = match levels {
+            NameLevels::Three | NameLevels::ThreeWithoutDatabase => self.list_catalogs(connection_id).await?,
+            _ => None,
+        };
+        if parts.len() == 3 && catalogs.is_none() && levels == NameLevels::ThreeWithoutDatabase {
+            // `otherdb.dbo.t` from a connection set to one database: valid,
+            // but that database's schemas aren't listed here.
+            t.catalog = Some(parts[0].clone());
+            t.schema = Some(parts[1].clone());
+            t.resolved = parts.join(".");
+            t.notes.push(format!("{conn} is set to one database: {} in another database can't be checked before the load", t.resolved));
+            return Ok(t);
+        }
+        let max = if catalogs.is_some() { 3 } else { 2 };
+        if parts.len() > max {
+            t.problems.push(if max == 3 {
+                format!("{} has too many parts: write catalog.schema.table, schema.table or table", table.trim())
+            } else {
+                format!("{} has too many parts: write schema.table or table", table.trim())
+            });
+            return Ok(t);
+        }
+        let q = |s: &str| quote_ident(kind, s);
+        // Same name in another case: what to suggest.
+        fn other_case(want: &str, mut have: impl Iterator<Item = String>) -> Option<String> {
+            have.find(|h| h != want && h.eq_ignore_ascii_case(want))
+        }
+
+        // Catalog.
+        let mut catalog: Option<String> = None;
+        if let Some(cats) = &catalogs {
+            let want = if parts.len() == 3 { Some(parts[0].clone()) } else { cats.iter().find(|c| c.is_default).map(|c| c.name.clone()) };
+            match want {
+                Some(c) if cats.iter().any(|x| x.name == c) => {
+                    t.catalog_exists = Some(true);
+                    catalog = Some(c);
+                }
+                Some(c) => {
+                    t.catalog_exists = Some(false);
+                    t.catalog = Some(c.clone());
+                    match other_case(&c, cats.iter().map(|x| x.name.clone())) {
+                        Some(found) => {
+                            t.problems.push(format!("{} {c} doesn't exist in {conn}; did you mean {found}? (names are matched exactly, as quoted)", catalog_word(kind)));
+                            let rest: Vec<String> = parts.iter().skip(1).cloned().collect();
+                            t.suggestion = Some(std::iter::once(found).chain(rest).collect::<Vec<_>>().join("."));
+                        }
+                        None => {
+                            t.problems.push(format!("{} {c} doesn't exist in {conn}. Create it first: only the table is created for you.", catalog_word(kind)));
+                            t.create_sql = create_catalog_sql(kind, &q(&c));
+                        }
+                    }
+                    t.resolved = parts.join(".");
+                    return Ok(t);
+                }
+                None if parts.len() < 3 => t.notes.push(format!("{conn} has no current {}: write {}.schema.table", catalog_word(kind).to_lowercase(), catalog_word(kind).to_lowercase())),
+                None => {}
+            }
+        }
+        t.catalog = catalog.clone();
+
+        // Schema.
+        let schemas = match &catalog {
+            Some(c) => self.list_catalog_schemas(connection_id, c).await?,
+            None => self.list_schemas(connection_id).await?,
+        };
+        let short = |id: &str| -> String {
+            match &catalog {
+                Some(c) => id.strip_prefix(&format!("{c}.")).unwrap_or(id).to_string(),
+                None => id.to_string(),
+            }
+        };
+        let want = if parts.len() >= 2 {
+            Some(parts[parts.len() - 2].clone())
+        } else {
+            let d = schemas.iter().find(|s| s.is_default).map(|s| short(&s.name));
+            if let Some(d) = &d {
+                t.notes.push(format!("No schema given: {} is used ({conn}'s default)", d));
+            }
+            d
+        };
+        let Some(schema) = want else {
+            // Can't tell which schema the session uses: not checked.
+            t.resolved = parts.join(".");
+            t.notes.push(format!("{conn} has no default schema to check against: write schema.table to check it"));
+            return Ok(t);
+        };
+        t.schema = Some(schema.clone());
+        let qualified = |s: &str| match &catalog {
+            Some(c) => format!("{c}.{s}"),
+            None => s.to_string(),
+        };
+        t.resolved = format!("{}.{}", qualified(&schema), t.table);
+        let Some(schema_id) = schemas.iter().find(|s| short(&s.name) == schema).map(|s| s.name.clone()) else {
+            t.schema_exists = Some(false);
+            match other_case(&schema, schemas.iter().map(|s| short(&s.name))) {
+                Some(found) => {
+                    t.problems.push(format!("{} {schema} doesn't exist in {conn}; did you mean {found}? (names are matched exactly, as quoted)", schema_word(kind)));
+                    let mut p = parts.clone();
+                    let i = p.len() - 2;
+                    if parts.len() >= 2 {
+                        p[i] = found;
+                    }
+                    t.suggestion = Some(p.join("."));
+                }
+                None => {
+                    t.problems.push(format!("{} {schema} doesn't exist in {conn}. Create it first: only the table is created for you.", schema_word(kind)));
+                    let path = match &catalog {
+                        Some(c) => format!("{}.{}", q(c), q(&schema)),
+                        None => q(&schema),
+                    };
+                    t.create_sql = create_schema_sql(kind, &path, &schema);
+                }
+            }
+            return Ok(t);
+        };
+        t.schema_exists = Some(true);
+
+        // Table.
+        let name = t.table.clone();
+        let names = vec![name.clone(), name.to_uppercase(), name.to_lowercase()];
+        let objs = self.list_objects_named(connection_id, &schema_id, &names).await?;
+        let relations: Vec<_> = objs.iter().filter(|o| o.kind.is_relation()).collect();
+        match relations.iter().find(|o| o.name == name) {
+            Some(o) if o.kind == ObjectKind::Table || o.kind == ObjectKind::ForeignTable => t.table_exists = Some(true),
+            Some(o) => {
+                t.table_exists = Some(true);
+                t.problems.push(format!("{} is a {}: rows can only be loaded into a table", t.resolved, if o.kind == ObjectKind::View { "view" } else { "materialized view" }));
+            }
+            None => {
+                t.table_exists = Some(false);
+                if let Some(o) = relations.iter().find(|o| o.name.eq_ignore_ascii_case(&name)) {
+                    t.notes.push(format!("{} exists as {} (another case): as typed, a new table {name} would be created", qualified(&schema), o.name));
+                    let mut p = parts.clone();
+                    *p.last_mut().unwrap() = o.name.clone();
+                    t.suggestion = Some(p.join("."));
+                }
+            }
+        }
+        Ok(t)
+    }
+
     /// Validate the spec, probe the table and build the statements.
     async fn prepare_load(&self, connection_id: &str, tab: &str, spec: &LoadSpec, rows: Option<&LoadRows>, dry: bool) -> Result<Prepared> {
         let table = spec.table.trim().to_string();
@@ -441,6 +629,19 @@ impl QueryEngine {
         };
         let before = user_statements(spec.before_sql.as_deref(), dialect);
         let after = user_statements(spec.after_sql.as_deref(), dialect);
+        // Not there: say why when the catalog or schema is missing, before
+        // any CREATE TABLE fails on it (before SQL may create them).
+        if !exists && before.is_empty() {
+            if let Ok(t) = self.check_load_target(connection_id, &table).await {
+                if t.catalog_exists == Some(false) || t.schema_exists == Some(false) {
+                    let mut m = t.problems.join(" ");
+                    if let Some(sql) = &t.create_sql {
+                        m.push_str(&format!(" ({sql})"));
+                    }
+                    return Err(EngineError::new("invalid", m));
+                }
+            }
+        }
         let mut notices = Vec::new();
         let conn = profile.name.clone();
         let reason = || missing_reason.clone().map(|r| format!(" ({r})")).unwrap_or_default();
@@ -746,6 +947,46 @@ async fn explain_plan(p: &Prepared, rows: &LoadRows, checks: &mut Vec<LoadCheck>
             }
         }
         checks.push(c);
+    }
+}
+
+/// What the top level of names is called on `kind`.
+fn catalog_word(kind: ConnectorKind) -> &'static str {
+    match kind {
+        ConnectorKind::Snowflake | ConnectorKind::Duckdb | ConnectorKind::Mssql => "Database",
+        ConnectorKind::Bigquery => "Project",
+        _ => "Catalog",
+    }
+}
+
+/// What a schema is called on `kind`.
+fn schema_word(kind: ConnectorKind) -> &'static str {
+    match kind {
+        ConnectorKind::Mysql => "Database",
+        ConnectorKind::Bigquery => "Dataset",
+        ConnectorKind::Sqlite => "Attached database",
+        ConnectorKind::Oracle => "Schema (user)",
+        _ => "Schema",
+    }
+}
+
+/// SQL that creates a catalog (`quoted`), where SQL can.
+fn create_catalog_sql(kind: ConnectorKind, quoted: &str) -> Option<String> {
+    match kind {
+        ConnectorKind::Snowflake | ConnectorKind::Mssql => Some(format!("CREATE DATABASE {quoted}")),
+        ConnectorKind::Databricks => Some(format!("CREATE CATALOG {quoted}")),
+        ConnectorKind::Duckdb => Some(format!("ATTACH 'file.duckdb' AS {quoted}")),
+        _ => None,
+    }
+}
+
+/// SQL that creates a schema (`path`: quoted, with its catalog).
+fn create_schema_sql(kind: ConnectorKind, path: &str, name: &str) -> Option<String> {
+    match kind {
+        ConnectorKind::Mysql => Some(format!("CREATE DATABASE {path}")),
+        ConnectorKind::Sqlite => Some(format!("ATTACH DATABASE 'file.db' AS {path}")),
+        ConnectorKind::Oracle => Some(format!("CREATE USER {path} IDENTIFIED BY \"password\" -- {name}'s tables need a user of that name")),
+        _ => Some(format!("CREATE SCHEMA {path}")),
     }
 }
 

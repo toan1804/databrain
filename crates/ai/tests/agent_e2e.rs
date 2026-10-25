@@ -679,7 +679,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
     // Incremental: nothing changed → no schema is re-read.
     let calls = AtomicUsize::new(0);
     let r = index_connection(&engine, &conn, Some(&all), &|_, _, _| { calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }, &Default::default()).await.unwrap();
-    assert_eq!((r.objects, r.skipped, r.changed), (60, 60, 0));
+    assert_eq!((r.objects, r.skipped, r.changed), (60, 61, 0), "60 schemas and the empty main, all unchanged");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "no batch, final only");
     // One table altered → only its schema is re-read.
     let alter = RunRequest { connection_id: conn.clone(), tab_id: "setup".into(), sql: "alter table s07.t07 add column email varchar".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None, params: Default::default() };
@@ -688,7 +688,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
     engine.run_and_wait(&f.hub, alter, None).await.unwrap();
     engine.disconnect(&conn);
     let r = index_connection(&engine, &conn, Some(&all), &|_, _, _| {}, &Default::default()).await.unwrap();
-    assert_eq!((r.objects, r.skipped, r.changed), (60, 59, 1));
+    assert_eq!((r.objects, r.skipped, r.changed), (60, 60, 1), "the other 59 schemas and main are skipped");
     assert!(f.ws.kn_get(&conn, "lake.s07.t07").unwrap().unwrap().columns.iter().any(|c| c.name == "email"));
     // Full rebuild ignores fingerprints.
     let r = databrain_ai::knowledge::index_connection_with(&engine, &conn, Some(&all), true, &|_, _, _| {}, &Default::default()).await.unwrap();

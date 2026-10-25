@@ -718,6 +718,10 @@ fn cancel_load(load_id: String) -> bool {
 async fn dry_run_result_load(state: State<'_, AppState>, result_id: String, args: api::LoadResultArgs) -> R<databrain_query_engine::LoadDryRun> {
     api::dry_run_result_load(&state, &result_id, args).await
 }
+#[tauri::command]
+async fn check_load_target(state: State<'_, AppState>, connection_id: String, table: String) -> R<databrain_query_engine::LoadTarget> {
+    api::check_load_target(&state, &connection_id, &table).await
+}
 
 #[tauri::command]
 async fn summarize_selection(
@@ -1170,6 +1174,7 @@ pub fn run() {
             related_rows_sql,
             cancel_load,
             dry_run_result_load,
+            check_load_target,
             sql_parameters,
             sql_lineage,
             save_text_file,

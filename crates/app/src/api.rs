@@ -1714,6 +1714,12 @@ pub async fn dry_run_result_load(state: &AppState, result_id: &str, args: LoadRe
     Ok(r)
 }
 
+/// Which parts of a load target path exist (catalog, schema, table), as
+/// "Load into…" and job load steps show it while the path is typed.
+pub async fn check_load_target(state: &AppState, connection_id: &str, table: &str) -> Result<databrain_query_engine::LoadTarget> {
+    state.engine.check_load_target(connection_id, table).await
+}
+
 /// Dry run of a load step of `job` as edited (nothing is kept).
 pub async fn dry_run_job_step(state: &AppState, job: databrain_workspace::Job, node_id: &str) -> Result<databrain_query_engine::LoadDryRun> {
     crate::jobs::dry_run(&state.job_ctx(), &job, node_id).await

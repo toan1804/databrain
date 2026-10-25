@@ -9,7 +9,7 @@ import { api, onLoadProgress, toError } from "../lib/api";
 import type { LoadDryRun, LoadMode, LoadReport, ResultInfo } from "../lib/types";
 import { formatCount, uid } from "../lib/util";
 import { useStore } from "../store";
-import { DryRunReport, LOAD_MODES } from "./JobTab";
+import { DryRunReport, LOAD_MODES, LoadTargetCheck, loadTargetBlocked, useLoadTarget } from "./JobTab";
 import { Modal } from "./ui";
 
 /** A table name to suggest: the output's name, else the table the SQL reads. */
@@ -37,7 +37,9 @@ export function LoadIntoDialog({ info, sql, outputName, onClose }: { info: Resul
   const keyed = mode === "update" || mode === "merge";
   const hint = LOAD_MODES.find((m) => m.mode === mode)?.hint;
   const args = { target_connection_id: target, table, mode, key_columns: keyed ? keys : [], create_table: create };
-  const ready = !!target && !!table.trim() && (!keyed || keys.length > 0);
+  const targetCheck = useLoadTarget(target, table);
+  const blocked = loadTargetBlocked(targetCheck, mode, create);
+  const ready = !!target && !!table.trim() && (!keyed || keys.length > 0) && !blocked;
   // A dry run is about the settings it was made with.
   useEffect(() => setDry({ busy: false }), [target, table, mode, keys.join(","), create]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -168,6 +170,7 @@ export function LoadIntoDialog({ info, sql, outputName, onClose }: { info: Resul
               </div>
             </fieldset>
           )}
+          <LoadTargetCheck check={targetCheck} mode={mode} create={create} connName={connections.find((c) => c.id === target)?.name} onUse={setTable} />
           {(mode === "append" || mode === "truncate") && (
             <label className="flex items-center gap-2">
               <input type="checkbox" checked={create} onChange={(e) => setCreate(e.target.checked)} /> Create the table when it doesn't exist

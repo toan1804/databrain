@@ -28,7 +28,8 @@ import {
 } from "lucide-react";
 import { api, toError } from "../lib/api";
 import { kbd } from "../lib/platform";
-import type { BatchLimits, FileFormat, Job, JobEdge, JobNode, JobRun, JobSchedule, LoadDryRun, LoadMode, NodeRunSummary, RunLogEntry, StepProgress } from "../lib/types";
+import type { BatchLimits, FileFormat, Job, JobEdge, JobNode, JobRun, JobSchedule, LoadDryRun, LoadMode, LoadTarget, NodeRunSummary, RunLogEntry, StepProgress } from "../lib/types";
+import { copyText } from "./CatalogMenus";
 import {
   NODE_H,
   NODE_W,
@@ -1391,7 +1392,8 @@ function LoadFields({ job, node, onChange }: { job: Job; node: JobNode; onChange
   useEffect(() => setKeys((node.key_columns ?? []).join(", ")), [node.id]); // eslint-disable-line react-hooks/exhaustive-deps
   const [dry, setDry] = useState<{ busy: boolean; report?: LoadDryRun; error?: string }>({ busy: false });
   // A report is about the settings it was made with.
-  useEffect(() => setDry({ busy: false }), [node.id]);
+  useEffect(() => setDry({ busy: false }), [node.id, node.target_connection_id, node.target_table, node.load_mode]);
+  const targetCheck = useLoadTarget(node.target_connection_id, node.target_table);
   const [showBefore, setShowBefore] = useState(!!node.load_before_sql?.trim());
   const [showAfter, setShowAfter] = useState(!!node.load_after_sql?.trim());
   const runDry = async () => {
@@ -1444,6 +1446,14 @@ function LoadFields({ job, node, onChange }: { job: Job; node: JobNode; onChange
           <input id={`table-${node.id}`} className={`${field} font-mono`} placeholder="schema.table" value={node.target_table ?? ""} onChange={(e) => onChange({ target_table: e.target.value })} />
         </div>
       </div>
+      <LoadTargetCheck
+        check={targetCheck}
+        mode={node.load_mode ?? "append"}
+        create={node.create_table ?? true}
+        beforeSql={!!node.load_before_sql?.trim()}
+        connName={target?.name}
+        onUse={(p) => onChange({ target_table: p })}
+      />
       <div>
         <label className={label} htmlFor={`mode-${node.id}`}>
           Mode
@@ -1514,6 +1524,139 @@ function LoadFields({ job, node, onChange }: { job: Job; node: JobNode; onChange
       </div>
       {dry.error && <div className="text-[11.5px] text-danger">{dry.error}</div>}
       {dry.report && <DryRunReport report={dry.report} />}
+    </div>
+  );
+}
+
+export type TargetCheck = { status: "idle" } | { status: "checking" } | { status: "ready"; target: LoadTarget } | { status: "error"; message: string };
+
+/** Check the load target path while it is typed (debounced; live from the database). */
+export function useLoadTarget(connectionId: string | null | undefined, table: string | null | undefined): TargetCheck {
+  const [state, setState] = useState<TargetCheck>({ status: "idle" });
+  useEffect(() => {
+    const t = table?.trim() ?? "";
+    if (!connectionId || !t) return setState({ status: "idle" });
+    let live = true;
+    setState({ status: "checking" });
+    const timer = setTimeout(() => {
+      api
+        .checkLoadTarget(connectionId, t)
+        .then((target) => live && setState({ status: "ready", target }))
+        .catch((e) => live && setState({ status: "error", message: toError(e).message }));
+    }, 400);
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [connectionId, table]);
+  return state;
+}
+
+/**
+ * Rows can't be loaded as set up: the catalog or schema is missing, the
+ * target is a view, or the table is missing in a mode that doesn't create it
+ * (not when before SQL runs first: it may create them).
+ */
+export function loadTargetBlocked(c: TargetCheck, mode: LoadMode, create: boolean, beforeSql = false): boolean {
+  if (c.status !== "ready" || beforeSql) return false;
+  const t = c.target;
+  if (t.problems.length) return true;
+  const creates = mode === "replace" || ((mode === "append" || mode === "truncate") && create);
+  return t.table_exists === false && !creates;
+}
+
+/** What the target check found, under the table field: what exists, and what to create first. */
+export function LoadTargetCheck({
+  check,
+  mode,
+  create,
+  beforeSql = false,
+  connName,
+  onUse,
+}: {
+  check: TargetCheck;
+  mode: LoadMode;
+  create: boolean;
+  beforeSql?: boolean;
+  connName?: string;
+  onUse: (path: string) => void;
+}) {
+  if (check.status === "idle") return null;
+  if (check.status === "checking")
+    return (
+      <div className="flex items-center gap-1.5 text-[11.5px] text-muted" role="status">
+        <Loader2 size={12} className="animate-spin" /> Checking the table path{connName ? ` on ${connName}` : ""}…
+      </div>
+    );
+  if (check.status === "error")
+    return (
+      <div className="flex items-start gap-1.5 text-[11.5px] text-muted" role="status">
+        <CircleDashed size={12} className="mt-0.5 shrink-0" /> <span className="min-w-0 break-words">Couldn't check the path: {check.message}</span>
+      </div>
+    );
+  const t = check.target;
+  const creates = mode === "replace" || ((mode === "append" || mode === "truncate") && create);
+  const blocked = loadTargetBlocked(check, mode, create, beforeSql);
+  const suggestion = t.suggestion && (
+    <button className="btn-ghost h-6 border border-line px-1.5 py-0 font-mono text-[11px]" onClick={() => onUse(t.suggestion!)} title="Use the name as the database spells it">
+      Use {t.suggestion}
+    </button>
+  );
+  if (t.problems.length) {
+    return (
+      <div className={`space-y-1 rounded-md border px-2 py-1.5 text-[11.5px] ${beforeSql ? "border-warning/50 bg-warning/5" : "border-danger/50 bg-danger/5"}`} role="alert">
+        {t.problems.map((p, i) => (
+          <div key={i} className={`flex items-start gap-1.5 ${beforeSql ? "text-warning" : "text-danger"}`}>
+            <XCircle size={12} className="mt-0.5 shrink-0" /> <span className="min-w-0 break-words">{p}</span>
+          </div>
+        ))}
+        {t.create_sql && (
+          <div className="flex items-center gap-1">
+            <code className="min-w-0 flex-1 truncate rounded bg-panel-2 px-1.5 py-0.5 font-mono text-[11px]" title={t.create_sql}>
+              {t.create_sql}
+            </code>
+            <button className="btn-ghost h-6 shrink-0 border border-line px-1.5 py-0 text-[11px]" onClick={() => void copyText(t.create_sql!, "SQL")}>
+              Copy
+            </button>
+          </div>
+        )}
+        {suggestion}
+        {beforeSql && <div className="text-muted">The before SQL runs first: it may create it.</div>}
+      </div>
+    );
+  }
+  const exists = t.table_exists === true;
+  const missing = t.table_exists === false;
+  const what = exists
+    ? mode === "replace"
+      ? "exists: it is dropped and created again from the rows' columns"
+      : mode === "truncate"
+        ? "exists: its rows are deleted, then the rows inserted"
+        : mode === "update" || mode === "merge"
+          ? "exists: rows are matched by the key columns"
+          : "exists: the rows are added to it"
+    : missing
+      ? creates
+        ? "doesn't exist yet: it is created from the rows' columns"
+        : `doesn't exist: create it first${mode === "append" || mode === "truncate" ? ', or turn on "Create the table"' : ` (${mode === "update" ? "Update" : "Merge"} doesn't create tables)`}`
+      : "";
+  return (
+    <div className="space-y-0.5 text-[11.5px]" role="status">
+      {what && (
+        <div className={`flex items-start gap-1.5 ${blocked ? "text-danger" : exists ? "text-success" : "text-accent"}`}>
+          {blocked ? <XCircle size={12} className="mt-0.5 shrink-0" /> : exists ? <CheckCircle2 size={12} className="mt-0.5 shrink-0" /> : <Info size={12} className="mt-0.5 shrink-0" />}
+          <span className="min-w-0 break-words">
+            <span className="font-mono">{t.resolved}</span> {what}
+            {missing && beforeSql && !creates ? " (or the before SQL creates it)" : ""}
+          </span>
+        </div>
+      )}
+      {t.notes.map((n, i) => (
+        <div key={i} className="flex items-start gap-1.5 text-muted">
+          <Info size={12} className="mt-0.5 shrink-0" /> <span className="min-w-0 break-words">{n}</span>
+        </div>
+      ))}
+      {suggestion}
     </div>
   );
 }

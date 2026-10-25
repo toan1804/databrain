@@ -1129,6 +1129,23 @@ export interface LoadReport {
 }
 
 /** Dry run of a load step: nothing is kept. */
+/** Which parts of a load target path exist (names compared exactly). */
+export interface LoadTarget {
+  resolved: string;
+  catalog?: string | null;
+  schema?: string | null;
+  table: string;
+  catalog_exists?: boolean | null;
+  schema_exists?: boolean | null;
+  table_exists?: boolean | null;
+  /** Fix these first: missing catalog/schema, a view, too many name parts. */
+  problems: string[];
+  create_sql?: string;
+  /** The path as the database spells it, when what was typed differs only in case. */
+  suggestion?: string;
+  notes: string[];
+}
+
 export interface LoadDryRun {
   ok: boolean;
   /** transaction: ran on sample rows and rolled back; explain: checked one by one; none: not planned. */

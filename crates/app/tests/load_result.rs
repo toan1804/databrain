@@ -68,3 +68,62 @@ async fn loads_a_result_into_another_connection() {
     let e = api::load_result(&st, &info.id, args(LoadMode::Append), "l3").await.unwrap_err();
     assert!(e.message.contains("read-only"), "{}", e.message);
 }
+
+/// The target path is checked part by part; a missing schema (or DuckDB
+/// database) stops the load before anything is created, with what to run.
+#[tokio::test(flavor = "multi_thread")]
+async fn checks_the_target_path_before_loading() {
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    let duck = st.engine.results_connection().unwrap().id;
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
+    c.file_path = Some(dir.path().join("t.db").to_string_lossy().into_owned());
+    let profile = ConnectionProfile { id: String::new(), name: "lite".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
+    let lite = api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    run(&st, &lite, "create table people (id integer primary key, name text)").await;
+    run(&st, &lite, "create view adults as select * from people").await;
+
+    // Two levels (SQLite: attached database.table).
+    let t = api::check_load_target(&st, &lite, "people").await.unwrap();
+    assert_eq!((t.resolved.as_str(), t.schema_exists, t.table_exists), ("main.people", Some(true), Some(true)));
+    assert!(t.problems.is_empty() && t.notes.iter().any(|n| n.contains("main is used")), "{t:?}");
+    let t = api::check_load_target(&st, &lite, "main.newtable").await.unwrap();
+    assert_eq!((t.table_exists, t.problems.len()), (Some(false), 0), "a missing table is fine: it can be created");
+    let t = api::check_load_target(&st, &lite, "nosuch.t").await.unwrap();
+    assert_eq!(t.schema_exists, Some(false));
+    assert!(t.problems[0].contains("nosuch doesn't exist in lite"), "{t:?}");
+    assert_eq!(t.create_sql.as_deref(), Some(r#"ATTACH DATABASE 'file.db' AS "nosuch""#));
+    let t = api::check_load_target(&st, &lite, "MAIN.People").await.unwrap();
+    assert_eq!(t.suggestion.as_deref(), Some("main.People"), "schema of another case: {t:?}");
+    let t = api::check_load_target(&st, &lite, "main.PEOPLE").await.unwrap();
+    assert_eq!((t.table_exists, t.suggestion.as_deref()), (Some(false), Some("main.people")), "table of another case: {t:?}");
+    let t = api::check_load_target(&st, &lite, "adults").await.unwrap();
+    assert!(t.problems[0].contains("is a view"), "{t:?}");
+    let t = api::check_load_target(&st, &lite, "a.b.c").await.unwrap();
+    assert!(t.problems[0].contains("too many parts"), "{t:?}");
+    let t = api::check_load_target(&st, &lite, r#""main"."people""#).await.unwrap();
+    assert_eq!(t.table_exists, Some(true), "typed quotes");
+
+    // Three levels (DuckDB: database.schema.table).
+    let t = api::check_load_target(&st, &duck, "nodb.main.t").await.unwrap();
+    assert_eq!(t.catalog_exists, Some(false));
+    assert!(t.problems[0].starts_with("Database nodb doesn't exist"), "{t:?}");
+    let t = api::check_load_target(&st, &duck, "noschema.t").await.unwrap();
+    assert_eq!((t.catalog_exists, t.schema_exists), (Some(true), Some(false)), "{t:?}");
+    assert!(t.create_sql.as_deref().unwrap_or("").starts_with("CREATE SCHEMA "), "{t:?}");
+    // A DuckDB file: its database and main schema are the defaults.
+    let mut c = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+    c.file_path = Some(dir.path().join("dst.duckdb").to_string_lossy().into_owned());
+    let profile = ConnectionProfile { id: String::new(), name: "dk".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
+    let dk = api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    let t = api::check_load_target(&st, &dk, "items").await.unwrap();
+    assert_eq!((t.resolved.as_str(), t.table_exists), ("dst.main.items", Some(false)), "{t:?}");
+
+    // Loading into a missing schema stops before CREATE TABLE, and says why.
+    let info = run(&st, &duck, "select 1 as id").await.result.unwrap();
+    let args = LoadResultArgs { target_connection_id: lite.clone(), table: "nosuch.t".into(), mode: LoadMode::Append, key_columns: vec![], create_table: true };
+    let e = api::load_result(&st, &info.id, args.clone(), "x1").await.unwrap_err();
+    assert!(e.message.contains("nosuch doesn't exist") && e.message.contains("ATTACH DATABASE"), "{}", e.message);
+    let dry = api::dry_run_result_load(&st, &info.id, args).await.unwrap();
+    assert!(!dry.ok && dry.checks[0].message.as_deref().unwrap_or("").contains("doesn't exist"), "{dry:?}");
+}
