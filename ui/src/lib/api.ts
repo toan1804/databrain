@@ -71,6 +71,7 @@ import type {
   ApplyReport,
   ResultLink,
   QueryPlan,
+  SqlFile,
   LoadReport,
   RunRequest,
   RunResponse,
@@ -205,6 +206,10 @@ export const api = {
   runQuery: (req: RunRequest) => call<RunResponse>("run_query", { req }),
   cancelQuery: (jobId: string) => call<boolean>("cancel_query", { jobId }),
   closeTab: (tabId: string) => call<void>("close_tab", { tabId }),
+  readSqlFile: (path: string) => call<SqlFile>("read_sql_file", { path }),
+  /** Save a file; `expectedMtime` refuses to overwrite one changed outside since. Resolves to the new mtime. */
+  writeSqlFile: (path: string, text: string, expectedMtime: number | null) => call<number>("write_sql_file", { path, text, expectedMtime }),
+  sqlFileMtimes: (paths: string[]) => call<(number | null)[]>("sql_file_mtimes", { paths }),
   setAutoCommit: (tabId: string, on: boolean) => call<void>("set_auto_commit", { tabId, on }),
   transactionState: (connectionId: string, sessionKey: string) => call<boolean>("transaction_state", { connectionId, sessionKey }),
   /** COMMIT (true) or ROLLBACK; resolves to whether a transaction is still open. */

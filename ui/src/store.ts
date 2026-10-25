@@ -28,10 +28,14 @@ import type {
   TabState,
 } from "./lib/types";
 import { errorRange, uid } from "./lib/util";
+import { editorBridge } from "./editorBridge";
 
 export interface Tab extends TabState {
   /** Unsaved changes relative to the linked saved query. */
   dirty?: boolean;
+  /** File tabs: the text and modification time on disk when last read or saved. */
+  file_text?: string;
+  file_mtime?: number;
   /** Read-only DDL view of an object (explorer "Show DDL"); not saved across restarts. */
   ddl?: DdlRef | null;
   /** Lineage diagram of SQL from an editor (`sql` holds the analysed text); not saved across restarts. */
@@ -185,6 +189,14 @@ interface State {
   endTransaction: (tabId: string, commit: boolean) => Promise<void>;
   /** Manual commit (false) or auto-commit (true) for a query tab. */
   setAutoCommit: (tabId: string, on: boolean) => void;
+  /** Recently opened or saved .sql files, newest first. */
+  recentFiles: string[];
+  /** Open a .sql file in a tab (asks for one without `path`); focuses its tab when open. */
+  openSqlFile: (path?: string) => Promise<void>;
+  /** Save a tab to its file (asks for a path for other tabs, or with `saveAs`). */
+  saveTabFile: (tabId: string, saveAs?: boolean) => Promise<void>;
+  /** Re-read files changed by other programs (on window focus). */
+  checkFiles: () => Promise<void>;
   savedQueries: SavedQuery[];
   historyVersion: number;
   schemas: Record<string, SchemaInfo[]>;
@@ -442,10 +454,23 @@ function persistTabs(tabs: Tab[]) {
           notebook_id: t.notebook_id ?? null,
           output_ref: t.output_ref ?? null,
           auto_commit: t.auto_commit ?? null,
+          file_path: t.file_path ?? null,
         })),
       )
       .catch(() => {});
   }, TAB_SAVE_DELAY);
+}
+
+/** File name of a path (either slash). */
+export const baseName = (p: string) => p.split(/[\\/]/).pop() || p;
+
+const RECENT_FILES = 12;
+/** Put `path` first in the recent files (`recent_sql_files` setting). */
+function rememberFile(path: string) {
+  const s = useStore.getState();
+  const recentFiles = [path, ...s.recentFiles.filter((p) => p !== path)].slice(0, RECENT_FILES);
+  useStore.setState({ recentFiles });
+  if (isTauri()) void api.setSetting("recent_sql_files", recentFiles).catch(() => {});
 }
 
 function nextTabTitle(tabs: Tab[]): string {
@@ -621,6 +646,100 @@ export const useStore = create<State>((set, get) => ({
     get().updateTab(tabId, { auto_commit: on ? null : false });
     if (isTauri()) api.setAutoCommit(tabId, on).catch(() => {});
   },
+  recentFiles: [],
+  openSqlFile: async (path) => {
+    const s = get();
+    if (!path) {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const picked = await open({ multiple: false, directory: false, filters: [{ name: "SQL", extensions: ["sql", "ddl", "pgsql", "psql", "plsql", "pks", "pkb", "txt"] }, { name: "All files", extensions: ["*"] }] });
+      if (typeof picked !== "string") return;
+      path = picked;
+    }
+    const open = s.tabs.find((t) => t.file_path === path);
+    if (open) return s.setActiveTab(open.id);
+    try {
+      const f = await api.readSqlFile(path);
+      const active = s.tabs.find((t) => t.id === s.activeTabId);
+      // Replace the lone empty scratch tab.
+      const lone = s.tabs.length === 1 && isQueryTab(active) && !active.sql.trim() && !active.file_path && !active.saved_query_id;
+      const id = s.newTab({ title: baseName(f.path), sql: f.text, file_path: f.path, file_text: f.text, file_mtime: f.mtime_ms });
+      if (lone && active) get().closeTab(active.id);
+      get().setActiveTab(id);
+      rememberFile(f.path);
+    } catch (e) {
+      s.toast(toError(e).message, "error");
+    }
+  },
+  saveTabFile: async (tabId, saveAs) => {
+    const s = get();
+    const tab = s.tabs.find((t) => t.id === tabId);
+    if (!isQueryTab(tab)) return;
+    let path = saveAs ? null : (tab.file_path ?? null);
+    const fresh = !path;
+    if (!path) {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const name = tab.file_path ? baseName(tab.file_path) : `${tab.title.replace(/[\\/:*?"<>|]/g, "_") || "query"}.sql`;
+      const picked = await save({ defaultPath: name, filters: [{ name: "SQL", extensions: ["sql"] }] });
+      if (!picked) return;
+      path = picked;
+    }
+    const text = editorBridge.get(tabId)?.state.doc.toString() ?? tab.sql;
+    try {
+      // Saving over the file the tab was read from: refuse if another program changed it.
+      const expected = !fresh && tab.file_mtime !== undefined ? tab.file_mtime : null;
+      const mtime = await api.writeSqlFile(path, text, expected);
+      get().updateTab(tabId, { file_path: path, file_text: text, file_mtime: mtime, dirty: false, title: fresh ? baseName(path) : tab.title });
+      rememberFile(path);
+      get().toast(`Saved ${baseName(path)}`, "success");
+    } catch (e) {
+      const err = toError(e);
+      if (err.kind === "conflict") {
+        get().askConfirm({
+          title: `${baseName(path)} changed on disk`,
+          reasons: [err.message, "Overwrite it with the editor's text, or cancel and reload it from the tab's menu."],
+          confirmLabel: "Overwrite",
+          onConfirm: () => {
+            void api.writeSqlFile(path!, text, null).then(
+              (mtime) => {
+                get().updateTab(tabId, { file_text: text, file_mtime: mtime, dirty: false });
+                get().toast(`Saved ${baseName(path!)}`, "success");
+              },
+              (e2) => get().toast(toError(e2).message, "error"),
+            );
+          },
+        });
+      } else get().toast(err.message, "error");
+    }
+  },
+  checkFiles: async () => {
+    const tabs = get().tabs.filter((t) => t.file_path && t.file_mtime !== undefined);
+    if (!tabs.length || !isTauri()) return;
+    const times = await api.sqlFileMtimes(tabs.map((t) => t.file_path!)).catch(() => null);
+    if (!times) return;
+    for (const [i, t] of tabs.entries()) {
+      const m = times[i];
+      if (m === null || m === t.file_mtime) continue;
+      const cur = get().tabs.find((x) => x.id === t.id);
+      if (!cur) continue;
+      const f = await api.readSqlFile(t.file_path!).catch(() => null);
+      if (!f) continue;
+      if (f.text === cur.file_text) {
+        get().updateTab(t.id, { file_mtime: f.mtime_ms });
+      } else if (!cur.dirty) {
+        get().updateTab(t.id, { sql: f.text, file_text: f.text, file_mtime: f.mtime_ms, dirty: false });
+        get().toast(`Reloaded ${baseName(f.path)} (changed on disk)`, "info");
+      } else {
+        // Ask once per outside change.
+        get().updateTab(t.id, { file_mtime: f.mtime_ms, file_text: f.text });
+        get().askConfirm({
+          title: `${baseName(f.path)} changed on disk`,
+          reasons: ["Another program changed the file, and this tab has unsaved edits."],
+          confirmLabel: "Reload from disk",
+          onConfirm: () => get().updateTab(t.id, { sql: f.text, dirty: false }),
+        });
+      }
+    }
+  },
   savedQueries: [],
   historyVersion: 0,
   schemas: {},
@@ -707,7 +826,15 @@ export const useStore = create<State>((set, get) => ({
         savedQueries,
         schemaFilter: parseSchemaFilter(settings.explorer_schemas),
         params: parseParams(settings.editor_params, restored.map((t) => t.id)),
+        recentFiles: Array.isArray(settings.recent_sql_files) ? settings.recent_sql_files.filter((p): p is string => typeof p === "string") : [],
       });
+      // File tabs: what is on disk now (edits not saved last time stay, marked unsaved).
+      for (const t of restored.filter((x) => x.file_path)) {
+        void api.readSqlFile(t.file_path!).then(
+          (f) => get().updateTab(t.id, { file_text: f.text, file_mtime: f.mtime_ms, dirty: f.text !== t.sql }),
+          () => get().updateTab(t.id, { dirty: true }),
+        );
+      }
       await onJobEvent((e) => get().handleJobEvent(e));
       window.addEventListener("db:oracle-client-missing", () => set({ oracleClientPrompt: true }));
       // Thin Oracle driver: downloaded once, on the first Oracle connection.

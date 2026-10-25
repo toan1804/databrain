@@ -40,6 +40,9 @@ function useGlobalShortcuts() {
       } else if (key === "k") {
         e.preventDefault();
         st.setPaletteOpen(!st.paletteOpen);
+      } else if (key === "o" && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        void st.openSqlFile();
       } else if (key === "p" && !e.shiftKey) {
         // Find a table in the explorer.
         e.preventDefault();
@@ -77,7 +80,13 @@ function useGlobalShortcuts() {
       }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    // Files changed by other programs while DataBrain was in the background.
+    const onFocus = () => void useStore.getState().checkFiles();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("focus", onFocus);
+    };
   }, []);
 }
 

@@ -234,7 +234,7 @@ function TabBar() {
     if (t.dirty) {
       useStore.getState().askConfirm({
         title: `Close "${t.title}"?`,
-        reasons: ["This tab has unsaved changes to its saved query."],
+        reasons: [t.file_path ? `This tab has changes not saved to ${t.file_path}.` : "This tab has unsaved changes to its saved query."],
         confirmLabel: "Close without saving",
         onConfirm: () => closeTab(t.id),
       });
@@ -390,7 +390,9 @@ function Toolbar() {
     if (!editorBridge.get(tab.id)) return setAiOpen(true);
     window.dispatchEvent(new CustomEvent("db:inline-ai", { detail: { key: tab.id } }));
   };
-  const saveLabel = tab.saved_query_id ? "Save" : "Save as…";
+  const saveLabel = tab.saved_query_id || tab.file_path ? "Save" : "Save as…";
+  const save = () => (tab.file_path ? void useStore.getState().saveTabFile(tab.id) : void saveTabQuery(tab.id));
+  const saveTitle = tab.file_path ? `Save to ${tab.file_path} (⌘S)` : `${saveLabel} (⌘S)`;
 
   return (
     <div
@@ -506,7 +508,7 @@ function Toolbar() {
             <button className="btn-ghost py-1" title="Edit with AI (⌘I) · open assistant (⌘L)" aria-label="AI" onClick={editWithAi}>
               <Sparkles size={13} /> {!iconOnly && "AI"}
             </button>
-            <button className="btn-ghost py-1" onClick={() => saveTabQuery(tab.id)} title={`${saveLabel} (⌘S)`} aria-label={saveLabel}>
+            <button className="btn-ghost py-1" onClick={save} title={saveTitle} aria-label={saveLabel}>
               <Save size={13} /> {!iconOnly && saveLabel}
             </button>
           </>
@@ -524,7 +526,11 @@ function Toolbar() {
           <MenuItem icon={<GitFork size={13} className="rotate-90" />} label="Query plan" disabled={!conn} onClick={() => (setMore(null), void openPlan(tab.id))} />
           <MenuItem icon={<Lightbulb size={13} />} label="Explain" disabled={!conn} onClick={() => (setMore(null), explain())} />
           <MenuItem icon={<Sparkles size={13} />} label="Edit with AI" hint="⌘I" onClick={() => (setMore(null), editWithAi())} />
-          <MenuItem icon={<Save size={13} />} label={saveLabel} hint="⌘S" onClick={() => (setMore(null), saveTabQuery(tab.id))} />
+          <MenuItem icon={<Save size={13} />} label={saveLabel} hint="⌘S" onClick={() => (setMore(null), save())} />
+          <MenuItem icon={<FileCode2 size={13} />} label="Save to file…" hint="⇧⌘S" onClick={() => (setMore(null), void useStore.getState().saveTabFile(tab.id, true))} />
+          {tab.file_path && tab.saved_query_id == null && (
+            <MenuItem icon={<Save size={13} />} label="Save as saved query…" onClick={() => (setMore(null), void saveTabQuery(tab.id))} />
+          )}
         </Popover>
       )}
     </div>

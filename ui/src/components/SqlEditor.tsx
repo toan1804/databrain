@@ -166,7 +166,17 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
             {
               key: "Mod-s",
               run: () => {
-                void useStore.getState().saveTabQuery(tabId);
+                const st = useStore.getState();
+                if (st.tabs.find((t) => t.id === tabId)?.file_path) void st.saveTabFile(tabId);
+                else void st.saveTabQuery(tabId);
+                return true;
+              },
+              preventDefault: true,
+            },
+            {
+              key: "Shift-Mod-s",
+              run: () => {
+                void useStore.getState().saveTabFile(tabId, true);
                 return true;
               },
               preventDefault: true,
@@ -184,7 +194,8 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
             if (!u.docChanged) return;
             const st = useStore.getState();
             const t = st.tabs.find((x) => x.id === tabId);
-            st.updateTab(tabId, { sql: u.state.doc.toString(), dirty: !!t?.saved_query_id });
+            const text = u.state.doc.toString();
+            st.updateTab(tabId, { sql: text, dirty: t?.file_text !== undefined ? text !== t.file_text : !!t?.saved_query_id });
           }),
           EditorView.contentAttributes.of({ "aria-label": "SQL editor" }),
           EditorView.domEventHandlers({ focus: () => editorBridge.setFocused(tabId) }),

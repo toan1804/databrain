@@ -627,6 +627,14 @@ export interface TabState {
   output_ref?: string | null;
   /** false: manual commit (writes wait for Commit/Rollback). */
   auto_commit?: boolean | null;
+  /** The .sql file on disk the tab edits. */
+  file_path?: string | null;
+}
+
+export interface SqlFile {
+  path: string;
+  text: string;
+  mtime_ms: number;
 }
 
 export interface Span {

@@ -1112,7 +1112,7 @@ mod tests {
     fn tab_outputs_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Arc::new(Workspace::open(dir.path().join("w.db")).unwrap());
-        let tab = |id: &str| databrain_workspace::TabState { id: id.into(), title: id.into(), sql: String::new(), connection_id: None, saved_query_id: None, notebook_id: None, output_ref: None, auto_commit: None };
+        let tab = |id: &str| databrain_workspace::TabState { id: id.into(), title: id.into(), sql: String::new(), connection_id: None, saved_query_id: None, notebook_id: None, output_ref: None, auto_commit: None, file_path: None };
         ws.save_tabs(&[tab("t1"), tab("t2")]).unwrap();
         let snaps = dir.path().join("outputs");
         {

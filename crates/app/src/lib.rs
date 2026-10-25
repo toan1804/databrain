@@ -4,6 +4,7 @@ pub mod ai_api;
 pub mod api;
 pub mod jobs;
 pub mod meta_writer;
+pub mod sql_files;
 
 use std::sync::Arc;
 
@@ -750,6 +751,22 @@ async fn close_tab(state: State<'_, AppState>, tab_id: String) -> R<()> {
 }
 
 #[tauri::command]
+async fn read_sql_file(path: String) -> R<sql_files::SqlFile> {
+    tauri::async_runtime::spawn_blocking(move || sql_files::read_sql_file(&path)).await.map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?
+}
+
+#[tauri::command]
+async fn write_sql_file(path: String, text: String, expected_mtime: Option<i64>) -> R<i64> {
+    tauri::async_runtime::spawn_blocking(move || sql_files::write_sql_file(&path, &text, expected_mtime)).await.map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?
+}
+
+/// Modification times of files (null: gone), to notice outside changes.
+#[tauri::command]
+async fn sql_file_mtimes(paths: Vec<String>) -> R<Vec<Option<i64>>> {
+    tauri::async_runtime::spawn_blocking(move || paths.iter().map(|p| sql_files::file_mtime(p)).collect()).await.map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))
+}
+
+#[tauri::command]
 fn set_auto_commit(state: State<'_, AppState>, tab_id: String, on: bool) {
     api::set_auto_commit(&state, &tab_id, on);
 }
@@ -1120,6 +1137,9 @@ pub fn run() {
             cancel_query,
             close_tab,
             set_auto_commit,
+            read_sql_file,
+            write_sql_file,
+            sql_file_mtimes,
             transaction_state,
             end_transaction,
             result_info,
