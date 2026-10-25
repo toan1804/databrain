@@ -14,7 +14,7 @@ import {
   type Theme,
 } from "@glideapps/glide-data-grid";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { ArrowDown, ArrowDownLeft, ArrowUp, ArrowUpRight, Ban, Copy, Filter, FilterX, Rows3, Trash2, Undo2, X } from "lucide-react";
+import { ArrowDown, ArrowDownLeft, ArrowUp, ArrowUpRight, Ban, Braces, Copy, Filter, FilterX, Rows3, Trash2, Undo2, X } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { ColumnMeta, EditTarget, ExportFormat, ResultInfo, ResultLink, ViewSpec } from "../lib/types";
 import { addRow, removeNewRow, revertRows, setCell, setNewCell, toggleDelete, type PendingEdits } from "../lib/gridEdits";
@@ -22,6 +22,7 @@ import { pageRange, toggleSort, upsertFilter } from "../lib/util";
 import { columnTypeInfo, engineName } from "../lib/columnType";
 import { useStore } from "../store";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
+import type { FocusedCell } from "./ValuePanel";
 
 const PAGE = 200;
 
@@ -111,6 +112,8 @@ function estimateWidth(name: string, sample: (string | null)[]): number {
 export interface GridHandle {
   scrollToCell: (col: number, row: number) => void;
   copySelection: (format: ExportFormat, header: boolean) => Promise<void>;
+  /** Change a cell while editing (value panel). */
+  setCellValue: (col: number, row: number, value: string | null) => void;
 }
 
 interface Props {
@@ -130,6 +133,10 @@ interface Props {
   edit?: { target: EditTarget; edits: PendingEdits; onEdits: (e: PendingEdits) => void } | null;
   /** Follow a foreign key from the selected rows (values in `link.columns` order). */
   onOpenRelated?: (link: ResultLink, rows: (string | null)[][]) => void;
+  /** The focused cell and its whole value (value panel). */
+  onFocusCell?: (cell: FocusedCell | null) => void;
+  /** "View value" from the cell menu. */
+  onViewValue?: () => void;
 }
 
 const CHANGED_BG = "rgba(250, 204, 21, 0.20)";
@@ -137,7 +144,7 @@ const DELETED_BG = "rgba(239, 68, 68, 0.14)";
 const NEW_BG = "rgba(34, 197, 94, 0.12)";
 
 export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
-  { info, view, onViewChange, onHeaderMenu, onViewRows, findMatches, findCurrent, dialect, onSelectionRange, onTranspose, edit, onOpenRelated },
+  { info, view, onViewChange, onHeaderMenu, onViewRows, findMatches, findCurrent, dialect, onSelectionRange, onTranspose, edit, onOpenRelated, onFocusCell, onViewValue },
   ref,
 ) {
   const theme = useGridTheme();
@@ -408,9 +415,34 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         });
       },
       copySelection: (format, header) => copy(format, header),
+      setCellValue: (col, row, value) => editCell(col, row, value),
     }),
-    [copy],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [copy, edit, rows],
   );
+
+  // Report the focused cell (its pending edit, if any) to the value panel.
+  const focus = selection.current?.cell;
+  useEffect(() => {
+    if (!onFocusCell) return;
+    if (!focus) return onFocusCell(null);
+    const [col, row] = focus;
+    const meta = info.columns[col];
+    if (!meta) return onFocusCell(null);
+    const editable = !!edit && edit.target.columns[col] != null;
+    let value: string | null | undefined;
+    if (edit && row >= rows) {
+      const vals = edit.edits.inserts[row - rows];
+      value = vals?.has(col) ? (vals.get(col) ?? null) : null;
+    } else {
+      value = pages.current.get(Math.floor(row / PAGE))?.[row % PAGE]?.[col];
+      const id = pageIds.current.get(Math.floor(row / PAGE))?.[row % PAGE];
+      const u = edit && id !== undefined ? edit.edits.updates.get(id) : undefined;
+      if (u?.values.has(col)) value = u.values.get(col) ?? null;
+    }
+    onFocusCell({ col, row, column: meta.name, family: meta.family, value, editable });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus?.[0], focus?.[1], version, edit, rows, info.columns]);
 
   const cellValue = (cell: Item): string | null | undefined =>
     pages.current.get(Math.floor(cell[1] / PAGE))?.[cell[1] % PAGE]?.[cell[0]];
@@ -431,6 +463,10 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
           e.preventDefault();
           e.stopPropagation();
           void copy("tsv", e.shiftKey);
+        } else if (e.shiftKey && e.key === " " && onViewValue) {
+          e.preventDefault();
+          e.stopPropagation();
+          onViewValue();
         }
       }}
     >
@@ -544,6 +580,9 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
           <MenuItem icon={<Copy size={13} />} label="Copy as JSON" onClick={() => { setMenu(null); void copy("json", false); }} />
           <MenuItem icon={<Copy size={13} />} label="Copy as Markdown" onClick={() => { setMenu(null); void copy("markdown", true); }} />
           <MenuItem icon={<Copy size={13} />} label="Copy as SQL INSERT" onClick={() => { setMenu(null); void copy("sql_insert", false); }} />
+          {onViewValue && (
+            <MenuItem icon={<Braces size={13} />} label="View value" hint="⇧Space" onClick={() => { setMenu(null); onViewValue(); }} />
+          )}
           {onTranspose && (
             <MenuItem
               icon={<Rows3 size={13} />}

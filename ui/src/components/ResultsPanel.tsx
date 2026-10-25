@@ -6,6 +6,7 @@ import {
   ArrowUp,
   Ban,
   BarChart3,
+  Braces,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
@@ -52,6 +53,7 @@ import { optimizePrompt } from "../queryTips";
 import { ResultGrid, type GridHandle } from "./ResultGrid";
 import { SelectionSummaryBar, TransposeDialog, type GridRange } from "./SelectionTools";
 import { LoadIntoDialog } from "./LoadIntoDialog";
+import { ValuePanel, type FocusedCell } from "./ValuePanel";
 import { Modal, Popover } from "./ui";
 
 export interface ResultsPanelProps {
@@ -430,6 +432,10 @@ export function ResultView({
   const grid = useRef<GridHandle>(null);
   const findInput = useRef<HTMLInputElement>(null);
   const toast = useStore((s) => s.toast);
+  // Value panel: the focused cell's whole value (open state kept across results).
+  const [valueOpen, setValueOpen] = useState(() => localStorage.getItem("db.valuePanel") === "1");
+  useEffect(() => localStorage.setItem("db.valuePanel", valueOpen ? "1" : "0"), [valueOpen]);
+  const [focused, setFocused] = useState<FocusedCell | null>(null);
 
   // Editing the result's table: pending changes, previewed and saved as SQL.
   const [target, setTarget] = useState<EditTarget | null>(null);
@@ -609,6 +615,15 @@ export function ResultView({
           <Search size={14} />
         </button>
         <button
+          className={`icon-btn ${valueOpen ? "text-accent" : ""}`}
+          title="Value panel: the selected cell's whole value (JSON, XML, binary, long text) (⇧Space)"
+          aria-label="Value panel"
+          aria-pressed={valueOpen}
+          onClick={() => setValueOpen(!valueOpen)}
+        >
+          <Braces size={14} />
+        </button>
+        <button
           className="btn-ghost border border-line py-1"
           title={stmt.output ? `Open the AI assistant with @${outputLabel(stmt.output)} mentioned, then ask your own question` : "Ask the AI to analyze this result"}
           onClick={() => {
@@ -761,7 +776,8 @@ export function ResultView({
         </div>
       )}
 
-      <div className="min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1">
+        <div className="min-h-0 min-w-0 flex-1">
         {mode === "chart" ? (
           <ChartView info={info} view={view} />
         ) : (
@@ -779,7 +795,13 @@ export function ResultView({
           onTranspose={setTranspose}
           edit={target ? { target, edits, onEdits: setEdits } : null}
           onOpenRelated={connId ? (link, rows) => void openRelated(link, rows) : undefined}
+          onFocusCell={setFocused}
+          onViewValue={() => setValueOpen(true)}
         />
+        )}
+        </div>
+        {valueOpen && mode === "grid" && (
+          <ValuePanel cell={focused} onClose={() => setValueOpen(false)} onEdit={target && focused ? (v) => grid.current?.setCellValue(focused.col, focused.row, v) : undefined} />
         )}
       </div>
 
