@@ -117,6 +117,15 @@ async fn edits_rows_of_a_single_table_result() {
     let vw = run(&st, &conn, "select * from adults").await.result.unwrap();
     let e = api::edit_target(&st, &vw.id).await.unwrap_err().message;
     assert_eq!(e, "main.adults is a view: only tables can be edited");
+    // What was read is kept like the explorer's cache: the next Edit asks
+    // nothing (the view is gone from the database, the cache still knows it).
+    let ws = st.engine.workspace();
+    assert!(ws.meta_columns(&conn, "main", "people").unwrap().is_some_and(|c| !c.stale && c.columns.iter().any(|c| c.is_primary_key)));
+    run(&st, &conn, "drop view adults").await;
+    assert_eq!(api::edit_target(&st, &vw.id).await.unwrap_err().message, "main.adults is a view: only tables can be edited");
+    // Cached columns of the table serve the target too (same answer).
+    let again = api::edit_target(&st, &info.id).await.unwrap();
+    assert_eq!((again.table.as_str(), again.key_columns, again.columns), ("people", vec![0], t.columns.clone()));
 }
 
 #[tokio::test(flavor = "multi_thread")]

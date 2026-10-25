@@ -513,6 +513,22 @@ impl Workspace {
             .optional()?)
     }
 
+    /// A cached object of `schema` named `name` (any case): tables and views
+    /// before routines, the exact-case name first, a table before a view.
+    pub fn meta_object(&self, connection_id: &str, schema: &str, name: &str) -> Result<Option<DbObject>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT schema_name, name, kind, comment, row_estimate FROM meta_objects \
+                 WHERE connection_id = ?1 AND lower(schema_name) = lower(?2) AND lower(name) = lower(?3) \
+                 ORDER BY kind IN ('function', 'procedure', 'package', 'sequence', 'other'), name <> ?3, kind <> 'table' LIMIT 1",
+                params![connection_id, schema, name],
+                |r| Ok(DbObject { schema: r.get(0)?, name: r.get(1)?, kind: parse_kind(&r.get::<_, String>(2)?), comment: r.get(3)?, row_estimate: r.get(4)? }),
+            )
+            .optional()?)
+    }
+
     /// `[catalog.]schema.table[.column]` or `table[.column]` from the cache.
     /// `Ok(None)` when the table, or a column that was asked for, is not
     /// cached (columns are cached only for tables that were opened).

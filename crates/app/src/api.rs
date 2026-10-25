@@ -1586,7 +1586,7 @@ fn edit_source(state: &AppState, result_id: &str) -> Result<(databrain_query_eng
 /// The table a result can be edited in (or why not).
 pub async fn edit_target(state: &AppState, result_id: &str) -> Result<databrain_query_engine::edit::EditTarget> {
     let (o, schema) = edit_source(state, result_id)?;
-    state.engine.edit_target(&o, &schema).await
+    state.engine.edit_target(&o, &schema, true).await
 }
 
 /// The SQL the pending changes run (built here, not taken from the UI).
@@ -1598,8 +1598,9 @@ pub fn edit_preview(state: &AppState, result_id: &str, target: &databrain_query_
 /// Save the pending changes on the session the result came from.
 pub async fn apply_edits(state: &AppState, result_id: &str, changes: Vec<databrain_query_engine::edit::RowChange>) -> Result<databrain_query_engine::edit::ApplyReport> {
     let (o, schema) = edit_source(state, result_id)?;
-    // The target again (not the UI's copy): the key and columns it allows.
-    let target = state.engine.edit_target(&o, &schema).await?;
+    // The target again (not the UI's copy), read from the database: the key
+    // and columns it allows now.
+    let target = state.engine.edit_target(&o, &schema, false).await?;
     let stmts = state.engine.edit_statements(&target, &schema, &changes)?;
     state.engine.apply_edits(&target, o.session(), &stmts).await
 }

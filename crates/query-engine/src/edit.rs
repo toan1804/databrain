@@ -14,7 +14,7 @@
 
 use databrain_connector_core::arrow::datatypes::SchemaRef;
 use databrain_connector_core::sql::dialect_for;
-use databrain_connector_core::{ConnectorKind, ExecOptions, ObjectKind, quote_ident, quote_path};
+use databrain_connector_core::{ConnectorKind, DbObject, ExecOptions, ObjectDetail, ObjectKind, quote_ident, quote_path};
 use databrain_export::load::edit_literal;
 use serde::{Deserialize, Serialize};
 use databrain_connector_core::sqlparser::ast::{Expr, GroupByExpr, Ident, ObjectNamePart, SelectItem, SetExpr, Statement, TableFactor};
@@ -175,9 +175,35 @@ pub(crate) struct ResolvedSource {
 }
 
 impl QueryEngine {
+    /// Describe the source table (as written, then upper case). When that
+    /// fails, an unreachable database says so; else what the object is (a
+    /// view, a function…) or that it is not there.
+    async fn describe_source(&self, cid: &str, schema_id: &str, table: &str) -> Result<ObjectDetail> {
+        let unreachable = |e: &EngineError| matches!(e.kind.as_str(), "connection" | "auth" | "config" | "cancelled");
+        let first = match self.describe(cid, schema_id, table).await {
+            Ok(d) => return Ok(d),
+            Err(e) if unreachable(&e) => return Err(EngineError { message: format!("Can't read {schema_id}.{table}: {}", e.message), ..e }),
+            Err(e) => e,
+        };
+        if table.to_uppercase() != table {
+            if let Ok(d) = self.describe(cid, schema_id, &table.to_uppercase()).await {
+                return Ok(d);
+            }
+        }
+        let names = [table.to_string(), table.to_uppercase(), table.to_lowercase()];
+        let found = self.list_objects_named(cid, schema_id, &names).await.ok().and_then(|objs| objs.into_iter().find(|x| x.name.eq_ignore_ascii_case(table)));
+        Err(match found {
+            Some(obj) if obj.kind != ObjectKind::Table => EngineError::new("invalid", not_a_table(schema_id, &obj.name, obj.kind)),
+            Some(_) => EngineError::new("invalid", format!("Can't read {schema_id}.{table}: {}", first.message)),
+            None => EngineError::new("invalid", format!("Table {schema_id}.{table} not found")),
+        })
+    }
+
     /// The one table a result's query reads, described, and which result
     /// column shows which of its columns. `Err` says why there is none.
-    pub(crate) async fn resolve_source(&self, o: &OutputInfo, schema: &SchemaRef) -> Result<ResolvedSource> {
+    /// `cached_columns`: they may come from the explorer's cache (when it has
+    /// them, not stale); foreign keys are not cached.
+    pub(crate) async fn resolve_source(&self, o: &OutputInfo, schema: &SchemaRef, cached_columns: bool) -> Result<ResolvedSource> {
         let no = |why: &str| Err(EngineError::new("invalid", why.to_string()));
         let kind = self.workspace().get_connection(&o.connection_id)?.config.kind;
         if !kind.traits().language.is_sql() {
@@ -186,31 +212,47 @@ impl QueryEngine {
         let Some(src) = source_table(&o.sql, kind) else {
             return no("Only results of a query on one table (no join, grouping or DISTINCT) can be edited");
         };
-        let schema_id = match src.schema.clone() {
+        let cid = o.connection_id.as_str();
+        let ws = self.workspace();
+        let mut schema_id = match src.schema.clone() {
             Some(s) => s,
             None => {
-                let schemas = self.list_schemas(&o.connection_id).await?;
+                // The explorer's cached schema list first: no round trip.
+                let schemas = match ws.meta_schemas(cid, None).ok().flatten().filter(|l| !l.is_empty()) {
+                    Some(l) => l,
+                    None => self.list_schemas(cid).await?,
+                };
                 match schemas.iter().find(|s| s.is_default).or(schemas.first()) {
                     Some(s) => s.name.clone(),
                     None => return no("The table's schema is not known"),
                 }
             }
         };
-        let detail = match self.describe(&o.connection_id, &schema_id, &src.table).await {
-            Ok(d) => d,
-            Err(_) => match self.describe(&o.connection_id, &schema_id, &src.table.to_uppercase()).await {
-                Ok(d) => d,
-                // Not described: say what it is if it exists (a view, a
-                // function…) rather than "not found".
-                Err(_) => {
-                    let names = [src.table.clone(), src.table.to_uppercase(), src.table.to_lowercase()];
-                    let found = self.list_objects_named(&o.connection_id, &schema_id, &names).await.ok().and_then(|objs| objs.into_iter().find(|x| x.name.eq_ignore_ascii_case(&src.table)));
-                    return match found {
-                        Some(obj) if obj.kind != ObjectKind::Table => no(&not_a_table(&schema_id, &obj.name, obj.kind)),
-                        _ => no(&format!("Table {schema_id}.{} not found", src.table)),
-                    };
+        // What the explorer has seen of it: its kind (a view is refused
+        // without asking the database) and, for edits, its columns.
+        let cached = ws.meta_object(cid, &schema_id, &src.table).ok().flatten().filter(|x| x.kind.is_relation());
+        if let Some(obj) = &cached {
+            if obj.kind != ObjectKind::Table {
+                return no(&not_a_table(&obj.schema, &obj.name, obj.kind));
+            }
+            schema_id = obj.schema.clone();
+        }
+        let from_cache = cached.as_ref().filter(|_| cached_columns).and_then(|obj| {
+            let c = ws.meta_columns(cid, &obj.schema, &obj.name).ok().flatten()?;
+            (!c.stale && !c.columns.is_empty()).then(|| ObjectDetail { object: obj.clone(), columns: c.columns, ddl: None, foreign_keys: vec![] })
+        });
+        let detail = match from_cache {
+            Some(d) => d,
+            None => {
+                let d = self.describe_source(cid, &schema_id, cached.as_ref().map_or(src.table.as_str(), |x| x.name.as_str())).await?;
+                // Remember it like the explorer does: the next Edit (and the
+                // check when saving) needs no round trip.
+                if !d.columns.is_empty() {
+                    let _ = ws.meta_add_objects(cid, &[DbObject { schema: schema_id.clone(), ..d.object.clone() }]);
+                    let _ = ws.meta_put_columns(cid, &schema_id, &d.object.name, &d.columns);
                 }
-            },
+                d
+            }
         };
         let cols = &detail.columns;
         let find = |n: &str| cols.iter().find(|c| c.name.eq_ignore_ascii_case(n)).map(|c| c.name.clone());
@@ -225,8 +267,10 @@ impl QueryEngine {
         Ok(ResolvedSource { kind, schema: schema_id, detail, columns })
     }
 
-    /// The table a result can be edited in, or why it can't.
-    pub async fn edit_target(&self, o: &OutputInfo, schema: &SchemaRef) -> Result<EditTarget> {
+    /// The table a result can be edited in, or why it can't. `cached`: from
+    /// the explorer's cache when it has the table (opening the editor: fast,
+    /// offline too); else described now (saving: the table as it is).
+    pub async fn edit_target(&self, o: &OutputInfo, schema: &SchemaRef, cached: bool) -> Result<EditTarget> {
         let no = |why: &str| Err(EngineError::new("invalid", why.to_string()));
         let profile = self.workspace().get_connection(&o.connection_id)?;
         if profile.config.read_only {
@@ -235,7 +279,7 @@ impl QueryEngine {
         if !profile.config.kind.traits().language.is_sql() {
             return no("Only results of SQL databases can be edited");
         }
-        let ResolvedSource { kind, schema: schema_id, detail, columns } = self.resolve_source(o, schema).await?;
+        let ResolvedSource { kind, schema: schema_id, detail, columns } = self.resolve_source(o, schema, cached).await?;
         let table = detail.object.name.clone();
         if detail.object.kind != ObjectKind::Table {
             return no(&not_a_table(&schema_id, &table, detail.object.kind));

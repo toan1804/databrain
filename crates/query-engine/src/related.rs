@@ -43,7 +43,7 @@ impl QueryEngine {
     /// Foreign keys from and to the table a result was read from. Empty when
     /// the result is not from one table or its key columns are not in it.
     pub async fn result_links(&self, o: &OutputInfo, schema: &SchemaRef) -> Result<Vec<ResultLink>> {
-        let Ok(src) = self.resolve_source(o, schema).await else { return Ok(vec![]) };
+        let Ok(src) = self.resolve_source(o, schema, false).await else { return Ok(vec![]) };
         let position = |col: &str| src.columns.iter().position(|c| c.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(col)));
         let mut out = Vec::new();
         for fk in &src.detail.foreign_keys {
