@@ -2,6 +2,10 @@ use super::*;
 use ConnectorKind as K;
 
 fn cat(parts: &[String]) -> Option<CatalogTable> {
+    // Like the explorer cache: a schema, when given, must match.
+    if parts.len() > 1 && !parts[parts.len() - 2].eq_ignore_ascii_case("sales") {
+        return None;
+    }
     let name = parts.last()?.to_lowercase();
     let cols: &[&str] = match name.as_str() {
         "orders" => &["id", "customer_id", "amount", "status", "created_at"],
@@ -133,7 +137,7 @@ fn script_links_written_tables() {
     let kinds: Vec<&str> = g.statements.iter().map(|s| s.kind.as_str()).collect();
     assert_eq!(kinds, vec!["create_table_as", "insert", "select"]);
     assert!(g.nodes.iter().find(|n| n.name == "tmp_paid").unwrap().written);
-    assert!(g.unknown_tables.is_empty(), "written tables are not unknown: {:?}", g.unknown_tables);
+    assert_eq!(g.unknown_tables, vec!["mart_total"], "tables the script creates are not unknown; one it inserts into is");
 }
 
 #[test]
@@ -186,4 +190,130 @@ fn unparsable_statement_is_partial() {
     assert!(g.statements[0].error.is_some());
     assert!(g.nodes.iter().any(|n| n.name == "sales.orders"), "tables found by tokens");
     assert_eq!(edges(&g), vec!["sales.customers.id -direct-> Result 2.id"]);
+}
+
+/// `from -kind-> to [statements]` lines of the table-level chain, sorted.
+fn flows_of(g: &Lineage) -> Vec<String> {
+    let mut v: Vec<String> = g
+        .flows
+        .iter()
+        .map(|f| format!("{} -{}-> {} {:?}", name(g, &f.from), serde_json_kind(f.kind), name(g, &f.to), f.statements))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn chain_through_insert_update_ctas_merge_delete() {
+    let g = run(
+        "insert into a (id, amount) select o.id, o.amount from (select * from orders where status = 'paid') o join customers c on c.id = o.customer_id;\n\
+         update b set total = a.amount * 2 from a where b.id = a.id;\n\
+         create table c as select * from b;\n\
+         merge into d using c on d.id = c.id when matched then update set total = c.total when not matched then insert (id, total) values (c.id, c.total);\n\
+         delete from d using customers x where d.id = x.id and x.country = 'VN';\n\
+         select * from d",
+    );
+    let kinds: Vec<&str> = g.statements.iter().map(|s| s.kind.as_str()).collect();
+    assert_eq!(kinds, vec!["insert", "update", "create_table_as", "merge", "delete", "select"]);
+    assert_eq!(
+        flows_of(&g),
+        vec![
+            "a -transform-> b [1]",
+            "b -direct-> c [2]",
+            "c -direct-> d [3]",
+            "d -direct-> Result 6 [5]",
+            "sales.customers -filter-> d [4]",
+            "sales.customers -join-> a [0]",
+            "sales.orders -direct-> a [0]",
+        ],
+        "the whole chain, table to table"
+    );
+    let e = edges(&g);
+    assert!(e.contains(&"a.amount -transform-> b.total".to_string()), "{e:#?}");
+    assert!(e.contains(&"a.id -filter-> b".to_string()), "UPDATE … WHERE: {e:#?}");
+    assert!(e.contains(&"c.total -direct-> d.total".to_string()) && e.contains(&"c.id -direct-> d.id".to_string()), "{e:#?}");
+    assert!(e.contains(&"c.id -join-> d".to_string()), "MERGE … ON: {e:#?}");
+    assert!(e.contains(&"sales.customers.country -filter-> d".to_string()), "{e:#?}");
+    assert!(!g.edges.iter().any(|e| e.from == e.to), "no self edges (b.id in WHERE, d.id in ON)");
+    for t in ["a", "b", "c", "d"] {
+        assert!(g.nodes.iter().find(|n| n.name == t).unwrap().written, "{t} written");
+    }
+    assert!(g.warnings.iter().all(|w| !w.message.contains("not traced yet")), "{:?}", g.warnings);
+    // Every edge says which statement it comes from.
+    let upd = g.edges.iter().find(|e| e.to_column.as_deref() == Some("total") && name(&g, &e.to) == "b").unwrap();
+    assert_eq!(upd.statement, Some(1));
+}
+
+#[test]
+fn chain_names_ddl_and_temp_tables() {
+    // Written unqualified, read qualified (and the other way round): one node.
+    let g = run("create table tmp as select id, amount from orders;\nselect amount from public.tmp;\ninsert into stage.t2 select * from tmp;\nselect * from t2");
+    assert_eq!(g.nodes.iter().filter(|n| n.name.ends_with("tmp")).count(), 1, "{:?}", g.nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+    assert!(flows_of(&g).contains(&"public.tmp -direct-> stage.t2 [2]".to_string()), "{:#?}", flows_of(&g));
+    assert!(flows_of(&g).contains(&"stage.t2 -direct-> Result 4 [3]".to_string()), "{:#?}", flows_of(&g));
+    // CREATE TABLE (cols) then INSERT without a column list: by position.
+    let g = run("create temp table s (k int, v text);\ninsert into s select id, name from customers;\nselect v from s");
+    let s = g.nodes.iter().find(|n| n.name == "s").unwrap();
+    assert!(s.temporary && s.written && s.columns_known);
+    let e = edges(&g);
+    assert!(e.contains(&"SELECT.name -direct-> s.v".to_string()), "{e:#?}");
+    assert!(e.contains(&"s.v -direct-> Result 3.v".to_string()), "{e:#?}");
+    assert_eq!(g.statements[0].kind, "create_table");
+    // A table recreated with other columns: the query's, not the catalog's.
+    let g = run("drop table orders;\ncreate table orders as select 1 as x;\nselect * from orders");
+    let e = edges(&g);
+    assert!(e.contains(&"sales.orders.x -direct-> Result 3.x".to_string()), "{e:#?}");
+    assert!(!e.iter().any(|x| x.contains("customer_id")), "{e:#?}");
+    // SET a = a + 1 isn't a self loop; TRUNCATE / ALTER are known statements.
+    let g = run("update orders set amount = amount + 1 where status = 'x';\ntruncate table customers;\nalter table customers add column vip boolean");
+    assert!(g.edges.is_empty(), "{:?}", edges(&g));
+    assert!(g.nodes.iter().find(|n| n.name == "sales.customers").unwrap().columns.iter().any(|c| c.name == "vip"));
+    let kinds: Vec<&str> = g.statements.iter().map(|s| s.kind.as_str()).collect();
+    assert_eq!(kinds, vec!["update", "truncate", "alter"]);
+    assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+}
+
+#[test]
+fn select_into_starts_a_chain() {
+    let g = analyze("select id, amount into #stage from orders where status = 'paid';\ninsert into mart (id, total) select id, amount from #stage", K::Mssql, &cat);
+    assert_eq!(g.statements[0].kind, "select_into");
+    let f = flows_of(&g);
+    assert!(f.contains(&"#stage -direct-> mart [1]".to_string()), "{f:#?}");
+    assert!(f.contains(&"sales.orders -direct-> #stage [0]".to_string()), "{f:#?}");
+    assert!(!f.contains(&"sales.orders -filter-> #stage [0]".to_string()), "values beat the filter for the same pair: {f:#?}");
+}
+
+#[test]
+fn chain_review_cases() {
+    // The catalog's `orders` is sales.orders, not a written archive.orders.
+    let g = run("insert into archive.orders (id) select id from customers;\nselect * from orders");
+    assert!(g.nodes.iter().any(|n| n.name == "sales.orders") && g.nodes.iter().any(|n| n.name == "archive.orders"));
+    assert!(edges(&g).contains(&"sales.orders.amount -direct-> Result 2.amount".to_string()), "{:#?}", edges(&g));
+    // Two explicit schemas stay two tables; the first qualified label stays.
+    let g = run("create table public.tmp as select id from orders;\nselect id from tmp;\nselect id from other.tmp");
+    let names: Vec<&str> = g.nodes.iter().filter(|n| n.kind == NodeKind::Table).map(|n| n.name.as_str()).collect();
+    assert!(names.contains(&"public.tmp") && names.contains(&"other.tmp"), "{names:?}");
+    assert!(flows_of(&g).contains(&"public.tmp -direct-> Result 2 [1]".to_string()), "{:#?}", flows_of(&g));
+    // MySQL multi-table DELETE / UPDATE … JOIN.
+    let g = analyze("delete t1 from orders t1 join customers c on c.id = t1.customer_id where c.country = 'VN'", K::Mysql, &cat);
+    assert!(!g.nodes.iter().any(|n| n.name == "t1"), "no table named after the alias");
+    assert!(g.nodes.iter().find(|n| n.name == "sales.orders").unwrap().written);
+    assert!(g.unknown_tables.is_empty(), "{:?}", g.unknown_tables);
+    let g = analyze("update orders o join customers c on c.id = o.customer_id set c.name = o.status", K::Mysql, &cat);
+    assert!(edges(&g).contains(&"sales.orders.status -direct-> sales.customers.name".to_string()), "{:#?}", edges(&g));
+    assert!(g.nodes.iter().find(|n| n.name == "sales.customers").unwrap().written);
+    // A recreated table has only its new columns.
+    let g = run("select amount from orders;\ncreate table orders as select 1 as x;\nselect * from orders");
+    let r3 = g.nodes.iter().find(|n| n.name == "Result 3").unwrap();
+    assert_eq!(r3.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["x"]);
+    // IF NOT EXISTS on a table that exists: its columns stay.
+    let g = run("create table if not exists customers (k int);\nselect * from customers");
+    let r2 = g.nodes.iter().find(|n| n.name == "Result 2").unwrap();
+    assert_eq!(r2.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["id", "name", "country"]);
+    // A table only joined in a subquery decides rows: a join flow, not a value one.
+    let g = run("select s.id from (select o.id, c.name from orders o join customers c on c.id = o.customer_id) s");
+    assert_eq!(flows_of(&g), vec!["sales.customers -join-> Result [0]", "sales.orders -direct-> Result [0]"]);
+    // Dropped only: not drawn, not looked up.
+    let g = run("drop table if exists old_stuff");
+    assert!(g.nodes.is_empty() && g.unknown_tables.is_empty());
 }

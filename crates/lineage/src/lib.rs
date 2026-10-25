@@ -2,9 +2,12 @@
 //!
 //! Each statement is parsed (sqlparser, per dialect) and every output column
 //! is traced through CTEs, subqueries, joins and set operations to the source
-//! columns it comes from. `CREATE TABLE/VIEW … AS`, `INSERT … SELECT` link the
-//! statements of a script: a table written by one statement is the same node
-//! that a later statement reads.
+//! columns it comes from. Statements that write tables link the statements of
+//! a script into one chain: a table written by one statement (`CREATE TABLE …
+//! AS`, `CREATE VIEW`, `INSERT … SELECT`, `SELECT … INTO`, `UPDATE … SET … FROM`,
+//! `MERGE … USING`, `DELETE … USING`, plain `CREATE TABLE`) is the same node a
+//! later statement reads, and [`Lineage::flows`] sums the chain up table to
+//! table (through the CTEs and subqueries between them).
 //!
 //! Table columns (for `*` and unqualified names) come from a [`Catalog`]
 //! (DataBrain's explorer cache); names that can't be resolved are reported
@@ -18,8 +21,9 @@ use databrain_connector_core::ConnectorKind;
 use databrain_connector_core::sql::{dialect_for, split_statements};
 use serde::Serialize;
 use sqlparser::ast::{
-    Expr, Ident, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned,
-    Statement, TableAlias, TableFactor, TableObject, TableWithJoins, Visit, Visitor,
+    AlterTableOperation, Assignment, AssignmentTarget, Delete, Expr, FromTable, Ident, Join, JoinConstraint, JoinOperator, Merge, MergeAction, MergeInsertKind,
+    MergeUpdateKind, ObjectName, ObjectNamePart, ObjectType, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias,
+    TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind, Visit, Visitor,
 };
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Location, Span, Token, Tokenizer};
@@ -65,8 +69,12 @@ pub struct Node {
     pub columns: Vec<Column>,
     /// Table columns came from the catalog (else only the referenced ones are listed).
     pub columns_known: bool,
-    /// Written by the script (`CREATE TABLE … AS`, `INSERT`).
+    /// Written by the script (created, inserted into, updated, merged into,
+    /// deleted from).
     pub written: bool,
+    /// Created by the script as a temporary table.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub temporary: bool,
     /// Statement that defines it (tables: none).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statement: Option<usize>,
@@ -74,7 +82,7 @@ pub struct Node {
     pub span: Option<Range>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     /// The value is copied as is.
@@ -106,12 +114,31 @@ pub struct Edge {
     /// `WHERE o.status = 'paid'`), shortened.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Statement (index) the edge comes from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statement: Option<usize>,
+}
+
+/// Table-level summary of the chain: rows of `from` (a table, or a result)
+/// end up in, or decide the rows of, `to` — through any CTEs and subqueries
+/// in between, possibly over several statements.
+#[derive(Debug, Clone, Serialize)]
+pub struct TableFlow {
+    pub from: String,
+    pub to: String,
+    /// Strongest way `from` feeds `to`: `aggregate` > `transform` > `direct`
+    /// for values; `filter` / `join` when it only decides which rows.
+    pub kind: EdgeKind,
+    /// Statements (indexes) the flow goes through, in order.
+    pub statements: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatementInfo {
     pub index: usize,
-    /// `select`, `create_table_as`, `create_view`, `insert`, `other`, `error`.
+    /// `select`, `select_into`, `create_table_as`, `create_table`,
+    /// `create_view`, `insert`, `update`, `delete`, `merge`, `drop`,
+    /// `truncate`, `alter`, `other`, `error`.
     pub kind: String,
     pub range: Range,
     /// The query part to check with the database (`EXPLAIN`), when it is a query.
@@ -138,8 +165,11 @@ pub struct Lineage {
     pub warnings: Vec<Warning>,
     /// Some statement could not be parsed: tables are shown without lineage.
     pub partial: bool,
-    /// Tables referenced whose columns are unknown (`schema.name` as written).
+    /// Database tables referenced whose columns are unknown (`schema.name` as
+    /// written); tables the script creates are not among them.
     pub unknown_tables: Vec<String>,
+    /// The chain table to table (and to the results of `SELECT`s).
+    pub flows: Vec<TableFlow>,
 }
 
 /// A table as the catalog knows it.
@@ -175,7 +205,7 @@ impl<F: Fn(&[String]) -> Option<CatalogTable>> Catalog for F {
 
 /// Lineage of every statement of `sql`.
 pub fn analyze(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> Lineage {
-    let mut b = Builder { g: Lineage::default(), cat: catalog, kind, tables: HashMap::new(), text: "", base: 0, lines: vec![], stmt: 0 };
+    let mut b = Builder { g: Lineage::default(), cat: catalog, kind, tables: HashMap::new(), created: Default::default(), text: "", base: 0, lines: vec![], stmt: 0 };
     let spans = split_statements(sql, kind);
     let many = spans.len() > 1;
     for (i, s) in spans.iter().enumerate() {
@@ -197,11 +227,129 @@ pub fn analyze(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> Lineage
             }
         }
     }
-    let mut unknown: Vec<String> = b.g.nodes.iter().filter(|n| n.kind == NodeKind::Table && !n.columns_known && !n.written).map(|n| n.name.clone()).collect();
+    // Tables the script defines have known columns; one it only inserts
+    // into, updates or deletes from is still a database table to describe.
+    let mut unknown: Vec<String> =
+        b.g.nodes.iter().enumerate().filter(|(i, n)| n.kind == NodeKind::Table && !n.columns_known && !b.created.contains(i)).map(|(_, n)| n.name.clone()).collect();
     unknown.sort();
     unknown.dedup();
     b.g.unknown_tables = unknown;
+    b.g.flows = flows(&b.g);
     b.g
+}
+
+/// Ends of the chain: tables and statement results.
+fn endpoint(n: &Node) -> bool {
+    matches!(n.kind, NodeKind::Table | NodeKind::Result) && !n.name.is_empty()
+}
+
+fn strength(k: EdgeKind) -> u8 {
+    match k {
+        EdgeKind::Join => 0,
+        EdgeKind::Filter => 1,
+        EdgeKind::Direct => 2,
+        EdgeKind::Transform => 3,
+        EdgeKind::Aggregate => 4,
+    }
+}
+
+fn is_rows(k: EdgeKind) -> bool {
+    matches!(k, EdgeKind::Filter | EdgeKind::Join)
+}
+
+/// `path` then `e`: a filter/join anywhere makes the whole path one (the
+/// first one met from the target); values keep the strongest kind.
+fn combine(path: Option<EdgeKind>, e: EdgeKind) -> EdgeKind {
+    match path {
+        None => e,
+        Some(p) if is_rows(p) => p,
+        Some(_) if is_rows(e) => e,
+        Some(p) => if strength(e) > strength(p) { e } else { p },
+    }
+}
+
+/// Better of two kinds for the same pair: values beat filters/joins.
+fn better(a: EdgeKind, b: EdgeKind) -> EdgeKind {
+    match (is_rows(a), is_rows(b)) {
+        (true, false) => b,
+        (false, true) => a,
+        _ if strength(b) > strength(a) => b,
+        _ => a,
+    }
+}
+
+/// A step of the walk back: node, column reached (`None`: the whole node),
+/// kind so far, statements so far.
+type Walk<'g> = (usize, Option<&'g str>, Option<EdgeKind>, Vec<usize>);
+
+/// Walk back from every table/result through the nodes between them,
+/// following only the columns that reach it (and the filters/joins on the
+/// rows of the nodes on the way).
+fn flows(g: &Lineage) -> Vec<TableFlow> {
+    let at: HashMap<&str, usize> = g.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
+    let mut into: HashMap<usize, Vec<&Edge>> = HashMap::new();
+    for e in &g.edges {
+        if let (Some(&f), Some(&t)) = (at.get(e.from.as_str()), at.get(e.to.as_str())) {
+            if f != t {
+                into.entry(t).or_default().push(e);
+            }
+        }
+    }
+    let mut out: Vec<TableFlow> = Vec::new();
+    let mut index: HashMap<(usize, usize), usize> = HashMap::new();
+    for (to, n) in g.nodes.iter().enumerate().filter(|(_, n)| endpoint(n)) {
+        let mut stack: Vec<Walk> = vec![(to, None, None, n.statement.into_iter().collect())];
+        let mut seen: std::collections::HashSet<(usize, Option<&str>, Option<EdgeKind>)> = std::collections::HashSet::new();
+        while let Some((cur, col, kind, stmts)) = stack.pop() {
+            for e in into.get(&cur).into_iter().flatten() {
+                // Into the column we came for (any, for the whole node), or a
+                // filter/join on the node's rows.
+                let wanted = match (col, e.to_column.as_deref()) {
+                    (_, None) | (None, _) => true,
+                    (Some(c), Some(t)) => c == t,
+                };
+                if !wanted {
+                    continue;
+                }
+                let from = at[e.from.as_str()];
+                let k = combine(kind, e.kind);
+                let mut st = stmts.clone();
+                for s in e.statement.iter().chain(g.nodes[from].statement.iter()) {
+                    if !st.contains(s) {
+                        st.push(*s);
+                    }
+                }
+                if endpoint(&g.nodes[from]) {
+                    if from == to {
+                        continue;
+                    }
+                    st.sort();
+                    match index.get(&(from, to)) {
+                        Some(&i) => {
+                            let f = &mut out[i];
+                            f.kind = better(f.kind, k);
+                            for s in st {
+                                if !f.statements.contains(&s) {
+                                    f.statements.push(s);
+                                }
+                            }
+                            f.statements.sort();
+                        }
+                        None => {
+                            index.insert((from, to), out.len());
+                            out.push(TableFlow { from: g.nodes[from].id.clone(), to: n.id.clone(), kind: k, statements: st });
+                        }
+                    }
+                } else {
+                    let c = e.from_column.as_deref();
+                    if seen.insert((from, c, Some(k))) {
+                        stack.push((from, c, Some(k), st));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 // ------------------------------------------------------------------ builder
@@ -212,6 +360,8 @@ struct Builder<'a> {
     kind: ConnectorKind,
     /// Table key (lower-case qualified name) → node index; shared by statements.
     tables: HashMap<String, usize>,
+    /// Table nodes the script creates (not database tables to describe).
+    created: std::collections::HashSet<usize>,
     text: &'a str,
     base: usize,
     lines: Vec<usize>,
@@ -322,6 +472,24 @@ fn name_parts(n: &ObjectName) -> Vec<String> {
         .collect()
 }
 
+/// Alias of a table in a statement (lower case), else its last name part.
+fn alias_or_name(alias: &Option<TableAlias>, name: &ObjectName) -> String {
+    alias.as_ref().map(|a| a.name.value.to_lowercase()).unwrap_or_else(|| name_parts(name).last().cloned().unwrap_or_default().to_lowercase())
+}
+
+/// `SELECT … INTO t FROM …` (a new table; not MySQL's `INTO @var` / `OUTFILE`):
+/// the table and whether it is temporary.
+fn select_into(q: &Query) -> Option<(ObjectName, bool)> {
+    let SetExpr::Select(s) = &*q.body else { return None };
+    let into = s.into.as_ref()?;
+    let name = match into.targets.first()? {
+        Expr::Identifier(i) if !i.value.starts_with('@') => ObjectName::from(vec![i.clone()]),
+        Expr::CompoundIdentifier(v) => ObjectName::from(v.clone()),
+        _ => return None,
+    };
+    Some((name, into.temporary))
+}
+
 fn join_keyword(op: &JoinOperator) -> &'static str {
     match op {
         JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => "LEFT JOIN",
@@ -386,6 +554,7 @@ impl<'a> Builder<'a> {
             columns: vec![],
             columns_known: kind != NodeKind::Table,
             written: false,
+            temporary: false,
             statement: (kind != NodeKind::Table).then_some(self.stmt),
             span,
         });
@@ -398,6 +567,34 @@ impl<'a> Builder<'a> {
         let display = found.as_ref().map(|t| t.name.clone()).unwrap_or_else(|| parts.join("."));
         let key = display.to_lowercase();
         if let Some(&i) = self.tables.get(&key) {
+            return i;
+        }
+        // A table the script writes, named once with its schema and once
+        // without (`create table tmp …; select … from public.tmp`): one node.
+        // Not when the catalog knows the name (it is that table), and never
+        // two different schemas.
+        let last = parts.last().map(|p| p.to_lowercase()).unwrap_or_default();
+        let mut same: Vec<usize> = if found.is_some() {
+            vec![]
+        } else {
+            self.tables
+                .iter()
+                .filter(|&(k, &i)| {
+                    let n = &self.g.nodes[i];
+                    let bare = !n.name.contains('.');
+                    n.written && (if parts.len() == 1 { k.rsplit('.').next() == Some(last.as_str()) } else { bare && *k == last })
+                })
+                .map(|(_, &i)| i)
+                .collect()
+        };
+        same.sort();
+        same.dedup();
+        if let [i] = same[..] {
+            if parts.len() > 1 {
+                // The qualified name is the better label (it was bare).
+                self.g.nodes[i].name = display.clone();
+            }
+            self.tables.insert(key, i);
             return i;
         }
         let span = self.range(name.span());
@@ -442,7 +639,7 @@ impl<'a> Builder<'a> {
         let (from, to) = (self.g.nodes[from].id.clone(), self.g.nodes[to].id.clone());
         let dup = self.g.edges.iter().any(|e| e.from == from && e.from_column == from_column && e.to == to && e.to_column == to_column && e.kind == kind);
         if !dup {
-            self.g.edges.push(Edge { from, from_column, to, to_column, kind, span, detail: None });
+            self.g.edges.push(Edge { from, from_column, to, to_column, kind, span, detail: None, statement: Some(self.stmt) });
         }
     }
 
@@ -452,6 +649,27 @@ impl<'a> Builder<'a> {
                 col.name = c.name.value.clone();
             }
         }
+    }
+
+    /// The statement creates `t` with exactly these columns. Edges of an
+    /// earlier version (a dropped and recreated table) to columns it no
+    /// longer has stay, and are drawn to the table as a whole.
+    fn define_columns(&mut self, t: usize, names: &[String]) {
+        self.g.nodes[t].columns = names.iter().map(|n| Column { name: n.clone(), span: None, expr: None }).collect();
+        self.g.nodes[t].columns_known = true;
+        self.created.insert(t);
+    }
+
+    /// `CREATE … IF NOT EXISTS` of a table the catalog knows: it stays as it is.
+    fn exists_already(&self, name: &ObjectName, if_not_exists: bool) -> bool {
+        if_not_exists && self.cat.table(&name_parts(name)).is_some()
+    }
+
+    /// Edges added since `at` from a node into itself (`SET a = a + 1`,
+    /// `WHERE` on the target's own columns): not lineage.
+    fn drop_self_edges(&mut self, at: usize) {
+        let tail: Vec<Edge> = self.g.edges.drain(at..).filter(|e| e.from != e.to).collect();
+        self.g.edges.extend(tail);
     }
 
     // ---- statements
@@ -468,6 +686,16 @@ impl<'a> Builder<'a> {
             error: None,
         };
         match st {
+            Statement::Query(q) if select_into(q).is_some() => {
+                let target = select_into(q).unwrap();
+                let id = self.write_into(&target.0, q, &[], true);
+                if target.1 {
+                    if let Some(t) = self.g.nodes.iter().position(|n| n.id == id) {
+                        self.g.nodes[t].temporary = true;
+                    }
+                }
+                self.g.statements.push(info("select_into", Some(range), Some(id)));
+            }
             Statement::Query(q) => {
                 let r = self.query(q, &Env::default());
                 let r = self.as_result(r);
@@ -479,9 +707,40 @@ impl<'a> Builder<'a> {
             Statement::CreateTable(ct) if ct.query.is_some() => {
                 let q = ct.query.as_ref().unwrap();
                 let names: Vec<String> = ct.columns.iter().map(|c| c.name.value.clone()).collect();
-                let id = self.write_into(&ct.name, q, &names, true);
+                let defines = !self.exists_already(&ct.name, ct.if_not_exists);
+                let id = self.write_into(&ct.name, q, &names, defines);
+                if ct.temporary {
+                    if let Some(t) = self.g.nodes.iter().position(|n| n.id == id) {
+                        self.g.nodes[t].temporary = true;
+                    }
+                }
                 let qr = qrange(self, q);
                 self.g.statements.push(info("create_table_as", qr, Some(id)));
+            }
+            Statement::CreateTable(ct) => {
+                let keep = self.exists_already(&ct.name, ct.if_not_exists);
+                let t = self.table_node(&ct.name);
+                let names: Vec<String> = ct.columns.iter().map(|c| c.name.value.clone()).collect();
+                if !keep {
+                    self.created.insert(t);
+                }
+                if !names.is_empty() && !keep {
+                    self.define_columns(t, &names);
+                }
+                if let Some(like) = ct.like.as_ref().map(|l| match l {
+                    sqlparser::ast::CreateTableLikeKind::Parenthesized(l) | sqlparser::ast::CreateTableLikeKind::Plain(l) => &l.name,
+                }) {
+                    // `CREATE TABLE t (LIKE s)`: same columns, no rows.
+                    let s = self.table_node(like);
+                    let cols: Vec<String> = self.g.nodes[s].columns.iter().map(|c| c.name.clone()).collect();
+                    if self.g.nodes[s].columns_known && !keep {
+                        self.define_columns(t, &cols);
+                    }
+                }
+                self.g.nodes[t].written |= !keep;
+                self.g.nodes[t].temporary |= ct.temporary && !keep;
+                let id = self.g.nodes[t].id.clone();
+                self.g.statements.push(info("create_table", None, Some(id)));
             }
             Statement::CreateView(v) => {
                 let names: Vec<String> = v.columns.iter().map(|c| c.name.value.clone()).collect();
@@ -499,6 +758,46 @@ impl<'a> Builder<'a> {
                 let id = self.write_into(name, q, &names, false);
                 let qr = qrange(self, q);
                 self.g.statements.push(info("insert", qr, Some(id)));
+            }
+            Statement::Update(u) => {
+                let id = self.update(u);
+                self.g.statements.push(info("update", None, id));
+            }
+            Statement::Delete(d) => {
+                let id = self.delete(d);
+                self.g.statements.push(info("delete", None, id));
+            }
+            Statement::Merge(m) => {
+                let id = self.merge(m);
+                self.g.statements.push(info("merge", None, id));
+            }
+            Statement::Drop { object_type: ObjectType::Table | ObjectType::View | ObjectType::MaterializedView, .. } => {
+                // Nothing flows; a table only dropped isn't drawn (nor described).
+                self.g.statements.push(info("drop", None, None));
+            }
+            Statement::Truncate(t) => {
+                for n in &t.table_names {
+                    let i = self.table_node(&n.name);
+                    self.g.nodes[i].written = true;
+                }
+                self.g.statements.push(info("truncate", None, None));
+            }
+            Statement::AlterTable(a) => {
+                let t = self.table_node(&a.name);
+                for op in &a.operations {
+                    match op {
+                        AlterTableOperation::AddColumn { column_def, .. } => {
+                            self.ensure_col(t, &column_def.name.value);
+                        }
+                        AlterTableOperation::RenameTable { .. } => {
+                            let span = Some(range);
+                            self.warn("ALTER TABLE … RENAME is not traced: the new name is a table of its own".into(), span);
+                        }
+                        _ => {}
+                    }
+                }
+                let id = self.g.nodes[t].id.clone();
+                self.g.statements.push(info("alter", None, Some(id)));
             }
             _ => self.other(st, range),
         }
@@ -525,11 +824,13 @@ impl<'a> Builder<'a> {
         let r = self.query(q, &Env::default());
         let t = self.table_node(name);
         self.g.nodes[t].written = true;
-        if defines && !self.g.nodes[t].columns_known {
-            self.g.nodes[t].columns.clear();
-            self.g.nodes[t].columns_known = true;
-        }
         let outs: Vec<String> = self.g.nodes[r].columns.iter().map(|c| c.name.clone()).collect();
+        if defines {
+            // Its columns are the query's (renamed by a column list), even
+            // when the catalog knew an older version of the table.
+            let defined: Vec<String> = outs.iter().enumerate().map(|(i, o)| names.get(i).cloned().unwrap_or_else(|| o.clone())).collect();
+            self.define_columns(t, &defined);
+        }
         let known: Vec<String> = self.g.nodes[t].columns.iter().map(|c| c.name.clone()).collect();
         for (i, o) in outs.iter().enumerate() {
             // Target column: listed names, else the table's own order (INSERT), else the query's name.
@@ -539,6 +840,202 @@ impl<'a> Builder<'a> {
             self.edge(r, Some(o.clone()), t, Some(tc), EdgeKind::Direct, None);
         }
         self.g.nodes[t].id.clone()
+    }
+
+    /// `UPDATE t SET c = e … [FROM …] [WHERE …]`: what `e` reads feeds `t.c`;
+    /// the `FROM` tables' join and `WHERE` columns decide which rows change.
+    fn update(&mut self, u: &Update) -> Option<String> {
+        let env = Env::default();
+        let TableFactor::Table { name, alias, .. } = &u.table.relation else {
+            self.warn("UPDATE of something other than a table is not traced".into(), self.range(u.table.span()));
+            return None;
+        };
+        let t = self.table_node(name);
+        self.g.nodes[t].written = true;
+        let at = self.g.edges.len();
+        let mut sources = vec![Source { alias: alias_or_name(alias, name), node: t }];
+        self.add_joins(&u.table.joins, &env, &mut sources, t);
+        if let Some(UpdateTableFromKind::BeforeSet(f) | UpdateTableFromKind::AfterSet(f)) = &u.from {
+            for twj in f {
+                self.add_from(twj, &env, &mut sources, t);
+            }
+        }
+        let scope = Env { ctes: env.ctes.clone(), outer: sources.clone() };
+        for a in &u.assignments {
+            self.assign(t, a, &sources, &scope);
+        }
+        if let Some(w) = &u.selection {
+            let at = self.g.edges.len();
+            self.rows(t, w, EdgeKind::Filter, &sources, &scope);
+            self.detail_since(at, format!("UPDATE … WHERE {w}"));
+        }
+        self.drop_self_edges(at);
+        Some(self.g.nodes[t].id.clone())
+    }
+
+    /// `SET c = e` (or `(a, b) = (…)`) of an UPDATE or MERGE into `t`; a
+    /// qualified target (`SET c.name = …` of MySQL's `UPDATE a JOIN c`)
+    /// writes into the table it names.
+    fn assign(&mut self, t: usize, a: &Assignment, sources: &[Source], env: &Env) {
+        let targets: Vec<&ObjectName> = match &a.target {
+            AssignmentTarget::ColumnName(n) => vec![n],
+            AssignmentTarget::Tuple(v) => v.iter().collect(),
+        };
+        let values: Vec<&Expr> = match (&a.value, targets.len()) {
+            (Expr::Tuple(v), n) if v.len() == n => v.iter().collect(),
+            (v, n) => vec![v; n],
+        };
+        for (target, value) in targets.into_iter().zip(values) {
+            let parts = name_parts(target);
+            let col = parts.last().cloned().unwrap_or_default();
+            let into = match parts.len() {
+                n if n > 1 => self.find_source(sources, &parts[..n - 1]).map(|s| s.node).unwrap_or(t),
+                _ => t,
+            };
+            self.g.nodes[into].written = true;
+            self.value_into(into, &col, value, sources, env);
+        }
+    }
+
+    /// Column `col` of table `t` gets the value of `e`.
+    fn value_into(&mut self, t: usize, col: &str, e: &Expr, sources: &[Source], env: &Env) {
+        let tc = self.ensure_col(t, col);
+        let r = refs(e);
+        let kind = if is_plain(e) {
+            EdgeKind::Direct
+        } else if r.aggregate {
+            EdgeKind::Aggregate
+        } else {
+            EdgeKind::Transform
+        };
+        for parts in &r.cols {
+            if let Some((src, c)) = self.resolve(sources, &env.outer, parts) {
+                let s = self.range(Span::union_iter(parts.iter().map(|i| i.span)));
+                self.edge(src, Some(c), t, Some(tc.clone()), kind, s);
+            }
+        }
+        for q in &r.subqueries {
+            let m = self.query(q, env);
+            let first = self.g.nodes[m].columns.first().map(|c| c.name.clone());
+            let s = self.range(q.span());
+            self.edge(m, first, t, Some(tc.clone()), EdgeKind::Transform, s);
+        }
+    }
+
+    /// `DELETE FROM t [USING …] WHERE …`: the other tables' columns in the
+    /// join and `WHERE` decide which rows of `t` go.
+    fn delete(&mut self, d: &Delete) -> Option<String> {
+        let env = Env::default();
+        let from = match &d.from {
+            FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
+        };
+        // Tables of the FROM by alias and name (MySQL `DELETE t1 FROM orders t1 JOIN …`).
+        let mut named: Vec<(String, ObjectName)> = Vec::new();
+        for twj in from {
+            for f in std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation)) {
+                if let TableFactor::Table { name, alias, .. } = f {
+                    named.push((alias_or_name(alias, name), name.clone()));
+                }
+            }
+        }
+        let resolve = |n: &ObjectName| -> ObjectName {
+            let parts = name_parts(n);
+            match &parts[..] {
+                [one] => named.iter().find(|(a, _)| a.eq_ignore_ascii_case(one)).map(|(_, n)| n.clone()).unwrap_or_else(|| n.clone()),
+                _ => n.clone(),
+            }
+        };
+        let targets: Vec<ObjectName> = if d.tables.is_empty() { named.first().map(|(_, n)| n.clone()).into_iter().collect() } else { d.tables.iter().map(resolve).collect() };
+        let Some(target) = targets.first().cloned() else {
+            self.warn("DELETE from something other than a table is not traced".into(), self.range(d.delete_token.0.span));
+            return None;
+        };
+        let t = self.table_node(&target);
+        for n in &targets {
+            let i = self.table_node(n);
+            self.g.nodes[i].written = true;
+        }
+        let at = self.g.edges.len();
+        let mut sources = Vec::new();
+        for twj in from.iter().chain(d.using.iter().flatten()) {
+            self.add_from(twj, &env, &mut sources, t);
+        }
+        if sources.is_empty() {
+            sources.push(Source { alias: name_parts(&target).last().cloned().unwrap_or_default().to_lowercase(), node: t });
+        }
+        let scope = Env { ctes: env.ctes.clone(), outer: sources.clone() };
+        if let Some(w) = &d.selection {
+            let at = self.g.edges.len();
+            self.rows(t, w, EdgeKind::Filter, &sources, &scope);
+            self.detail_since(at, format!("DELETE … WHERE {w}"));
+        }
+        self.drop_self_edges(at);
+        Some(self.g.nodes[t].id.clone())
+    }
+
+    /// `MERGE INTO t USING s ON … WHEN MATCHED THEN UPDATE SET … WHEN NOT
+    /// MATCHED THEN INSERT (…) VALUES (…)`: the source's columns feed the
+    /// target's; the `ON` columns join, `WHEN … AND` conditions filter.
+    fn merge(&mut self, m: &Merge) -> Option<String> {
+        let env = Env::default();
+        let TableFactor::Table { name, alias, .. } = &m.table else {
+            self.warn("MERGE into something other than a table is not traced".into(), self.range(m.table.span()));
+            return None;
+        };
+        let t = self.table_node(name);
+        self.g.nodes[t].written = true;
+        let at = self.g.edges.len();
+        let mut sources = vec![Source { alias: alias_or_name(alias, name), node: t }];
+        self.factor(&m.source, &env, &mut sources, t);
+        let scope = Env { ctes: env.ctes.clone(), outer: sources.clone() };
+        let e = self.g.edges.len();
+        self.rows(t, &m.on, EdgeKind::Join, &sources, &scope);
+        self.detail_since(e, format!("MERGE … USING {} ON {}", m.source, m.on));
+        for c in &m.clauses {
+            if let Some(p) = &c.predicate {
+                let e = self.g.edges.len();
+                self.rows(t, p, EdgeKind::Filter, &sources, &scope);
+                self.detail_since(e, format!("WHEN {} AND {p}", c.clause_kind));
+            }
+            match &c.action {
+                MergeAction::Update(u) => match &u.kind {
+                    MergeUpdateKind::Set(asg) => {
+                        for a in asg {
+                            self.assign(t, a, &sources, &scope);
+                        }
+                    }
+                    MergeUpdateKind::Wildcard => self.same_names_into(t, &sources),
+                },
+                MergeAction::Insert(ins) => match &ins.kind {
+                    MergeInsertKind::Values(v) => {
+                        let known: Vec<String> = self.g.nodes[t].columns.iter().map(|c| c.name.clone()).collect();
+                        if let Some(row) = v.rows.first() {
+                            for (i, e) in row.iter().enumerate() {
+                                let col = ins.columns.get(i).and_then(|c| name_parts(c).last().cloned()).or_else(|| known.get(i).cloned());
+                                match col {
+                                    Some(col) => self.value_into(t, &col, e, &sources, &scope),
+                                    None => self.warn(format!("MERGE … INSERT: value {} has no column (list them, or cache {})", i + 1, self.g.nodes[t].name), self.range(e.span())),
+                                }
+                            }
+                        }
+                    }
+                    _ => self.same_names_into(t, &sources),
+                },
+                _ => {}
+            }
+        }
+        self.drop_self_edges(at);
+        Some(self.g.nodes[t].id.clone())
+    }
+
+    /// `UPDATE *` / `INSERT ROW`: every source column into the target column of the same name.
+    fn same_names_into(&mut self, t: usize, sources: &[Source]) {
+        for s in sources.iter().filter(|s| s.node != t) {
+            for c in self.g.nodes[s.node].columns.clone() {
+                let tc = self.ensure_col(t, &c.name);
+                self.edge(s.node, Some(c.name), t, Some(tc), EdgeKind::Direct, None);
+            }
+        }
     }
 
     /// A statement's final relation as a Result node of its own.
@@ -792,7 +1289,11 @@ impl<'a> Builder<'a> {
 
     fn add_from(&mut self, twj: &TableWithJoins, env: &Env, sources: &mut Vec<Source>, n: usize) {
         self.factor(&twj.relation, env, sources, n);
-        for j in &twj.joins {
+        self.add_joins(&twj.joins, env, sources, n);
+    }
+
+    fn add_joins(&mut self, joins: &[Join], env: &Env, sources: &mut Vec<Source>, n: usize) {
+        for j in joins {
             let left = sources.len();
             self.factor(&j.relation, env, sources, n);
             let constraint = match &j.join_operator {

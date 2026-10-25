@@ -287,6 +287,34 @@ export function trace(g: LineageGraph, node: string, column?: string): { cols: S
   return { cols, edges };
 }
 
+/**
+ * The script as a chain of tables: tables and statement results only, one
+ * edge per table-to-table flow (through CTEs and subqueries, across
+ * statements), labelled with the statements it goes through.
+ */
+export function chainGraph(g: LineageGraph): LineageGraph {
+  const flows = g.flows ?? [];
+  const keep = new Set<string>();
+  for (const f of flows) {
+    keep.add(f.from);
+    keep.add(f.to);
+  }
+  // Tables the script touches without a flow (DDL only, a lone SELECT result).
+  for (const n of g.nodes) if ((n.kind === "table" || n.kind === "result") && n.name) keep.add(n.id);
+  const step = (i: number) => `statement ${i + 1}`;
+  return {
+    ...g,
+    nodes: g.nodes.filter((n) => keep.has(n.id)),
+    edges: flows.map((f) => ({
+      from: f.from,
+      to: f.to,
+      kind: f.kind,
+      statement: f.statements[0],
+      detail: f.statements.length ? (f.statements.length === 1 ? step(f.statements[0]) : `statements ${f.statements.map((i) => i + 1).join(", ")}`) : undefined,
+    })),
+  };
+}
+
 export const EDGE_LABEL: Record<LineageEdge["kind"], string> = {
   direct: "copied",
   transform: "computed",

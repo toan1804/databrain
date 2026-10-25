@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { traitsOf } from "../lib/sourceTraits";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { AlertCircle, AlertTriangle, ArrowDown, ArrowRight, CheckCircle2, Columns3, ExternalLink, Rows3, ChevronDown, ClipboardCopy, Download, Loader2, Maximize2, Network, RefreshCw, TextCursorInput, WifiOff, X } from "lucide-react";
+import { AlertCircle, AlertTriangle, ArrowDown, ArrowRight, CheckCircle2, Columns3, ExternalLink, Rows3, Workflow, ChevronDown, ClipboardCopy, Download, Loader2, Maximize2, Network, RefreshCw, TextCursorInput, WifiOff, X } from "lucide-react";
 import { api, isTauri, toError } from "../lib/api";
 import { kbd } from "../lib/platform";
 import type { LineageCheck, LineageView, ParamValue } from "../lib/types";
-import { layout, normalize, trace, withPositions, type Direction, type Positions } from "../lib/lineageLayout";
+import { chainGraph, layout, normalize, trace, withPositions, type Direction, type Positions } from "../lib/lineageLayout";
 import { columnFlow, conditionText, explainColumn, type FlowNode } from "../lib/lineageExplain";
 import { EXPORTS, exportText, kindLabel, toMermaid, toSvg, type DiagramColors, type ExportFormat } from "../lib/lineageExport";
 import { useStore, type Tab } from "../store";
@@ -182,14 +182,21 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
   }, [run]);
 
   const graph = load.status === "ready" ? load.view.graph : null;
-  const traced = useMemo(() => (graph && focus ? trace(graph, focus.node, focus.column) : null), [graph, focus]);
+  /** Chain view: tables and results only, one link per table-to-table flow
+   *  (`null` = automatic: on for scripts of several statements). */
+  const [chain, setChain] = useState<boolean | null>(null);
+  const isChain = !columnTab && (chain ?? (graph ? graph.statements.length > 1 : false));
+  /** What the diagram draws. */
+  const shown = useMemo(() => (graph && isChain ? chainGraph(graph) : graph), [graph, isChain]);
+  const traced = useMemo(() => (shown && focus ? trace(shown, focus.node, focus.column) : null), [shown, focus]);
   // Collapsed tables still list the traced column's path.
-  const base = useMemo(() => (graph ? layout(graph, dir, { expanded, show: traced?.cols }) : null), [graph, dir, expanded, traced]);
+  // The chain is table level: its boxes don't list columns.
+  const base = useMemo(() => (shown ? layout(shown, dir, { expanded: isChain ? new Set<string>() : expanded, show: traced?.cols }) : null), [shown, dir, expanded, traced, isChain]);
   const lay = useMemo(() => (base ? withPositions(base, pos) : null), [base, pos]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const appearance = useStore((s) => s.appearance);
   const colors = useMemo(themeColors, [theme, appearance]);
-  const inner = useMemo(() => (graph && lay ? toSvg(graph, lay, { colors, focus: traced, inner: true }) : ""), [graph, lay, colors, traced]);
+  const inner = useMemo(() => (shown && lay ? toSvg(shown, lay, { colors, focus: traced, inner: true }) : ""), [shown, lay, colors, traced]);
 
   const fit = useCallback(() => {
     const el = box.current;
@@ -202,10 +209,10 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
     const k = Math.min(1, (r.width - 24) / n.width, (r.height - 24) / n.height);
     setView({ k, x: (r.width - n.width * k) / 2 - shiftX * k, y: Math.max(12, (r.height - n.height * k) / 2) - shiftY * k });
   }, [lay]);
-  // Refit for a new graph or direction (not when tables are expanded or dragged).
+  // Refit for a new graph, direction or view (not when tables are expanded or dragged).
   useEffect(() => {
     fitted.current = false;
-  }, [graph, dir]);
+  }, [graph, dir, isChain]);
   useEffect(() => {
     if (visible && lay && !fitted.current) {
       fitted.current = true;
@@ -263,7 +270,7 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
 
   const doExport = async (format: ExportFormat) => {
     setMenu(null);
-    if (!graph || !lay) return;
+    if (!shown || !lay) return;
     const ext = EXPORTS.find((e) => e.format === format)!.ext;
     const base = (tab?.title ?? "lineage").replace(/^Lineage · /, "").replace(/[^\w.-]+/g, "_") || "lineage";
     try {
@@ -271,8 +278,8 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
       if (!path) return;
       // What's on screen: direction and moved tables.
       const n = normalize(lay);
-      if (format === "png") await api.saveBase64File(path, await svgToPng(toSvg(graph, n), n.width, n.height));
-      else await api.saveTextFile(path, exportText(format, graph, lay));
+      if (format === "png") await api.saveBase64File(path, await svgToPng(toSvg(shown, n), n.width, n.height));
+      else await api.saveTextFile(path, exportText(format, shown, lay));
       useStore.getState().toast(`Saved ${path.split(/[\\/]/).pop()}`, "success");
     } catch (e) {
       useStore.getState().toast(toError(e).message, "error");
@@ -294,7 +301,8 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
         <span className="min-w-0 truncate font-medium">{tab.title}</span>
         {graph && (
           <span className="shrink-0 text-muted">
-            · {graph.statements.length} statement{graph.statements.length === 1 ? "" : "s"} · {graph.nodes.filter((n) => n.name).length} nodes
+            · {graph.statements.length} statement{graph.statements.length === 1 ? "" : "s"} ·{" "}
+            {isChain ? `${shown?.nodes.length ?? 0} tables and results` : `${graph.nodes.filter((n) => n.name).length} nodes`}
           </span>
         )}
         {load.status === "ready" && (
@@ -318,6 +326,28 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
           </label>
           {!columnTab && (
             <>
+          <div className="flex items-center rounded-md border border-line" role="group" aria-label="Diagram view">
+            {(
+              [
+                [true, <Workflow key="c" size={13} />, "Chain", "The script as a chain of tables: what each statement reads and writes, across statements"],
+                [false, <Columns3 key="l" size={13} />, "Columns", "Column-level lineage with the queries, CTEs and subqueries in between"],
+              ] as const
+            ).map(([c, icon, text, title]) => (
+              <button
+                key={text}
+                className={`flex h-6 items-center gap-1 px-1.5 text-[11.5px] ${isChain === c ? "bg-hover text-fg" : "text-muted hover:text-fg"}`}
+                aria-pressed={isChain === c}
+                title={title}
+                onClick={() => {
+                  setChain(c);
+                  setFocus(null);
+                  setPos({});
+                }}
+              >
+                {icon} {text}
+              </button>
+            ))}
+          </div>
           <div className="flex items-center rounded-md border border-line" role="group" aria-label="Diagram direction">
             {(
               [
@@ -337,6 +367,7 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
               </button>
             ))}
           </div>
+          {!isChain && (
           <button
             className="btn-ghost py-1"
             disabled={!graph}
@@ -345,6 +376,7 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
           >
             {expanded === "all" ? <Rows3 size={13} /> : <Columns3 size={13} />} {expanded === "all" ? "Tables only" : "All columns"}
           </button>
+          )}
           {Object.keys(pos).length > 0 && (
             <button className="btn-ghost py-1" onClick={() => setPos({})} title="Put moved tables back where the layout puts them">
               Reset layout
@@ -376,7 +408,7 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
             label="Copy Mermaid"
             onClick={() => {
               setMenu(null);
-              if (graph && lay) void copyText(toMermaid(graph, lay), "Mermaid diagram");
+              if (shown && lay) void copyText(toMermaid(shown, lay), "Mermaid diagram");
             }}
           />
         </Popover>
@@ -432,6 +464,13 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
             const hit = target.closest("[data-node]");
             if (!hit) return setFocus(null);
             const node = hit.getAttribute("data-node")!;
+            if (isChain) {
+              // A table of the chain: its columns, in the column view.
+              setChain(false);
+              setPos({});
+              setExpanded(new Set([node]));
+              return setFocus({ node });
+            }
             const column = target.closest("[data-col]")?.getAttribute("data-col") ?? undefined;
             // A column: trace it. The header (or "N columns"): show/hide the table's columns.
             if (column !== undefined) return setFocus((f) => (f && f.node === node && f.column === column ? null : { node, column }));
@@ -449,10 +488,10 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
               {load.message}
             </div>
           )}
-          {graph && lay && graph.nodes.length === 0 && (
+          {shown && lay && shown.nodes.length === 0 && (
             <div className="absolute inset-0 flex items-center justify-center text-[12.5px] text-muted">No tables or columns found in this SQL.</div>
           )}
-          {graph && lay && (
+          {shown && lay && (
             <svg className="absolute inset-0 h-full w-full select-none" role="img" aria-label="Lineage diagram">
               <g transform={`translate(${view.x},${view.y}) scale(${view.k})`} dangerouslySetInnerHTML={{ __html: inner }} />
             </svg>
@@ -464,7 +503,9 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
               <Legend color={colors.accent} label="aggregated" width={2.6} />
               <Legend color={colors.warning} label="filter" dash="5 4" />
               <Legend color={colors.warning} label="join" dash="2 3" />
-              <span>· click a table to list its columns, a column to trace it · drag a table to move it · {kbd("⌘")}+scroll to zoom</span>
+              <span>
+                {isChain ? "· click a table for its column lineage" : "· click a table to list its columns, a column to trace it"} · drag a table to move it · {kbd("⌘")}+scroll to zoom
+              </span>
             </div>
           )}
           {warnings.length > 0 && !showWarnings && !columnTab && (

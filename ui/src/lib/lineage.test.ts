@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { layout, trace, colKey, anchor, withPositions, normalize, shownEdges } from "./lineageLayout";
+import { layout, trace, colKey, anchor, withPositions, normalize, shownEdges, chainGraph } from "./lineageLayout";
 import { exportText, toDrawio, toMermaid, toDot, toSvg } from "./lineageExport";
 import type { LineageGraph } from "./types";
 
@@ -169,5 +169,46 @@ describe("lineage exports", () => {
       fs.writeFileSync(`${dir}/t.drawio`, toDrawio(g));
       fs.writeFileSync(`${dir}/t.svg`, s);
     }
+  });
+});
+
+describe("chain view", () => {
+  // insert into a select … from orders (via a SELECT node); update b … from a; select * from b
+  const script: LineageGraph = {
+    nodes: [
+      { id: "n0", kind: "table", name: "sales.orders", columns: [{ name: "id" }, { name: "amount" }], columns_known: true, written: false },
+      { id: "n1", kind: "subquery", name: "SELECT", columns: [{ name: "id" }], columns_known: true, written: false, statement: 0 },
+      { id: "n2", kind: "table", name: "a", columns: [{ name: "id" }], columns_known: true, written: true, temporary: true },
+      { id: "n3", kind: "table", name: "b", columns: [{ name: "total" }], columns_known: false, written: true },
+      { id: "n4", kind: "result", name: "Result 3", columns: [{ name: "total" }], columns_known: true, written: false, statement: 2 },
+    ],
+    edges: [
+      { from: "n0", from_column: "id", to: "n1", to_column: "id", kind: "direct", statement: 0 },
+      { from: "n1", from_column: "id", to: "n2", to_column: "id", kind: "direct", statement: 0 },
+      { from: "n2", from_column: "id", to: "n3", to_column: "total", kind: "transform", statement: 1 },
+      { from: "n3", from_column: "total", to: "n4", to_column: "total", kind: "direct", statement: 2 },
+    ],
+    statements: [0, 1, 2].map((index) => ({ index, kind: "x", range: { start: 0, end: 1 } })),
+    warnings: [],
+    partial: false,
+    unknown_tables: [],
+    flows: [
+      { from: "n0", to: "n2", kind: "direct", statements: [0] },
+      { from: "n2", to: "n3", kind: "transform", statements: [1] },
+      { from: "n3", to: "n4", kind: "direct", statements: [2] },
+    ],
+  };
+  it("keeps tables and results, one edge per flow, labelled with its statements", () => {
+    const c = chainGraph(script);
+    expect(c.nodes.map((n) => n.id)).toEqual(["n0", "n2", "n3", "n4"]);
+    expect(c.edges.map((e) => `${e.from}>${e.to}:${e.kind}:${e.detail}`)).toEqual(["n0>n2:direct:statement 1", "n2>n3:transform:statement 2", "n3>n4:direct:statement 3"]);
+    const l = layout(c, "lr", { expanded: new Set() });
+    const x = (id: string) => l.byId.get(id)!.x;
+    expect(x("n0")).toBeLessThan(x("n2"));
+    expect(x("n2")).toBeLessThan(x("n3"));
+    expect(x("n3")).toBeLessThan(x("n4"));
+    expect(toSvg(c, l)).toContain("statement 2");
+    // Old graphs without flows: tables only, no edges.
+    expect(chainGraph({ ...script, flows: undefined }).edges).toEqual([]);
   });
 });

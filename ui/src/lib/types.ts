@@ -312,7 +312,10 @@ export interface LineageNode {
   name: string;
   columns: LineageColumn[];
   columns_known: boolean;
+  /** Created, inserted into, updated, merged into or deleted from by the script. */
   written: boolean;
+  /** Created by the script as a temporary table. */
+  temporary?: boolean;
   statement?: number;
   span?: LineageRange;
 }
@@ -326,6 +329,17 @@ export interface LineageEdge {
   span?: LineageRange;
   /** Filters/joins: the clause (`LEFT JOIN customers c ON c.id = o.customer_id`, `WHERE …`). */
   detail?: string;
+  /** Statement (index) the edge comes from. */
+  statement?: number;
+}
+
+/** Table-level chain: `from` (table or result) feeds, or decides the rows of, `to`. */
+export interface LineageFlow {
+  from: string;
+  to: string;
+  kind: LineageEdgeKind;
+  /** Statement indexes on the way, in order. */
+  statements: number[];
 }
 
 export interface LineageGraph {
@@ -335,6 +349,8 @@ export interface LineageGraph {
   warnings: { message: string; span?: LineageRange }[];
   partial: boolean;
   unknown_tables: string[];
+  /** The chain table to table, through CTEs/subqueries and across statements. */
+  flows?: LineageFlow[];
 }
 
 export interface LineageCheck {

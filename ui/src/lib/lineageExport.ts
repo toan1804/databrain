@@ -31,7 +31,7 @@ export const LIGHT: DiagramColors = {
 const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 
 export function kindLabel(n: LineageNode): string {
-  if (n.kind === "table") return n.written ? "written" : n.columns_known ? "table" : "table · columns not cached";
+  if (n.kind === "table") return n.temporary ? "temporary table (written)" : n.written ? "written" : n.columns_known ? "table" : "table · columns not cached";
   return { cte: "CTE", subquery: "subquery", set_op: "set operation", result: "result" }[n.kind];
 }
 
@@ -95,7 +95,7 @@ export function toSvg(g: LineageGraph, l: Layout = layout(g), opts: SvgOptions =
     const s = edgeStyle(e, c);
     const n = e.indexes.length;
     out.push(
-      `<path d="${path(a, b, l.direction === "tb")}" fill="none" stroke="${s.stroke}" stroke-width="${s.width}"${s.dash ? ` stroke-dasharray="${s.dash}"` : ""}${dim(e.indexes.some((i) => f?.edges.has(i)))}><title>${xml(e.kind + (n > 1 ? ` · ${n} column links` : ""))}</title></path>`,
+      `<path d="${path(a, b, l.direction === "tb")}" fill="none" stroke="${s.stroke}" stroke-width="${s.width}"${s.dash ? ` stroke-dasharray="${s.dash}"` : ""}${dim(e.indexes.some((i) => f?.edges.has(i)))}><title>${xml(e.kind + (n > 1 ? ` · ${n} column links` : "") + (g.edges[e.indexes[0]]?.detail ? ` · ${g.edges[e.indexes[0]].detail}` : ""))}</title></path>`,
     );
   }
   for (const n of l.nodes) {
