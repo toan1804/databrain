@@ -506,7 +506,10 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         onColumnResize={(_c, size, idx) => setWidths((w) => ({ ...w, [idx]: size }))}
         minColumnWidth={50}
         maxColumnWidth={1200}
+        // A click selects (highlights) the column, ⇧/⌘ adds to the selection;
+        // a double-click sorts by it (⇧ adds a sort key).
         onHeaderClicked={(col, e) => {
+          if (!e.isDoubleClick) return;
           e.preventDefault();
           onViewChange({ ...view, sort: toggleSort(view.sort, col, e.shiftKey) });
         }}
@@ -546,6 +549,9 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
           <div className="font-medium">{tip.name}</div>
           <div className="font-mono text-accent">{tip.type}</div>
           {tip.engine && <div className="text-[10.5px] text-muted">{engineName(tip.engine)} type</div>}
+          <div className="mt-1 border-t border-line pt-1 text-[10.5px] text-muted">
+            Click to select the column · double-click to sort ({kbd("⇧")} adds a sort key) · ▾ to sort, filter and see statistics
+          </div>
           {tip.sources.map((src) => (
             <div key={src.ref} className="mt-1 border-t border-line pt-1">
               <span className="font-mono">{src.type}</span>
