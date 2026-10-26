@@ -452,12 +452,18 @@ export function ResultView({
   }, [info.id]);
   const changes = editCount(edits);
 
+  /** Edit is checking the table (schema, columns, primary key): shown, and Edit waits. */
+  const [checkingEdit, setCheckingEdit] = useState(false);
   const startEditing = async () => {
+    if (checkingEdit) return;
+    setCheckingEdit(true);
     try {
       setTarget(await api.editTarget(info.id));
       setMode("grid");
     } catch (e) {
       toast(toError(e).message, "error");
+    } finally {
+      setCheckingEdit(false);
     }
   };
   const stopEditing = () => {
@@ -651,10 +657,12 @@ export function ResultView({
           className={`btn-ghost shrink-0 whitespace-nowrap border py-1 ${target ? "border-accent text-accent" : "border-line"}`}
           aria-pressed={!!target}
           aria-label="Edit"
+          disabled={checkingEdit}
+          aria-busy={checkingEdit}
           onClick={() => (target ? stopEditing() : void startEditing())}
           title="Edit cells, add and delete rows of the table this result comes from (needs a primary key)"
         >
-          <Pencil size={13} /> <span className="hidden @3xl:inline">Edit</span>
+          {checkingEdit ? <Loader2 size={13} className="animate-spin" /> : <Pencil size={13} />} <span className="hidden @3xl:inline">Edit</span>
         </button>
         <button
           className="btn-ghost shrink-0 whitespace-nowrap border border-line py-1"
@@ -755,6 +763,16 @@ export function ResultView({
           <button className="icon-btn ml-auto h-6 w-6" aria-label="Close find" onClick={() => setFindOpen(false)}>
             <X size={14} />
           </button>
+        </div>
+      )}
+
+      {checkingEdit && (
+        <div className="flex shrink-0 items-start gap-2 border-b border-line bg-accent/8 px-2 py-1.5 text-[12px]" role="status" aria-live="polite">
+          <Loader2 size={13} className="mt-0.5 shrink-0 animate-spin text-accent" />
+          <div className="min-w-0">
+            <div>Checking {conn?.name ?? "the database"} before editing…</div>
+            <div className="text-[11.5px] text-muted">The table this result comes from, its schema, columns and primary key (from the explorer's cache when it has them).</div>
+          </div>
         </div>
       )}
 
