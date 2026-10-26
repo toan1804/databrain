@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { traitsOf } from "../lib/sourceTraits";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { AlertCircle, AlertTriangle, ArrowDown, ArrowRight, CheckCircle2, Columns3, ExternalLink, Rows3, Workflow, ChevronDown, ClipboardCopy, Download, Loader2, Maximize2, Network, RefreshCw, TextCursorInput, WifiOff, X } from "lucide-react";
+import { AlertCircle, AlertTriangle, ArrowDown, ArrowRight, Minus, Plus, CheckCircle2, Columns3, ExternalLink, Rows3, Workflow, ChevronDown, ClipboardCopy, Download, Loader2, Maximize2, Network, RefreshCw, TextCursorInput, WifiOff, X } from "lucide-react";
 import { api, isTauri, toError } from "../lib/api";
 import { kbd } from "../lib/platform";
 import type { LineageCheck, LineageView, ParamValue } from "../lib/types";
@@ -198,6 +198,17 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
   const colors = useMemo(themeColors, [theme, appearance]);
   const inner = useMemo(() => (shown && lay ? toSvg(shown, lay, { colors, focus: traced, inner: true }) : ""), [shown, lay, colors, traced]);
 
+  /** Zoom by `f` around the middle of the diagram area (+/− buttons, keys). */
+  const zoomBy = useCallback((f: number) => {
+    const r = box.current?.getBoundingClientRect();
+    const px = r ? r.width / 2 : 0;
+    const py = r ? r.height / 2 : 0;
+    setView((v) => {
+      const k = Math.min(3, Math.max(0.15, v.k * f));
+      return { k, x: px - ((px - v.x) * k) / v.k, y: py - ((py - v.y) * k) / v.k };
+    });
+  }, []);
+
   const fit = useCallback(() => {
     const el = box.current;
     if (!el || !lay) return;
@@ -348,25 +359,6 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
               </button>
             ))}
           </div>
-          <div className="flex items-center rounded-md border border-line" role="group" aria-label="Diagram direction">
-            {(
-              [
-                ["lr", <ArrowRight key="r" size={13} />, "Left to right: sources on the left"],
-                ["tb", <ArrowDown key="d" size={13} />, "Top to bottom: sources on top"],
-              ] as const
-            ).map(([d, icon, title]) => (
-              <button
-                key={d}
-                className={`flex h-6 w-7 items-center justify-center ${dir === d ? "bg-hover text-fg" : "text-muted hover:text-fg"}`}
-                aria-pressed={dir === d}
-                aria-label={title}
-                title={title}
-                onClick={() => setDir(d)}
-              >
-                {icon}
-              </button>
-            ))}
-          </div>
           {!isChain && (
           <button
             className="btn-ghost py-1"
@@ -495,6 +487,33 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
             <svg className="absolute inset-0 h-full w-full select-none" role="img" aria-label="Lineage diagram">
               <g transform={`translate(${view.x},${view.y}) scale(${view.k})`} dangerouslySetInnerHTML={{ __html: inner }} />
             </svg>
+          )}
+          {graph && lay && (
+            <div
+              className="absolute bottom-2 right-2 flex flex-col overflow-hidden rounded-md border border-line bg-panel shadow"
+              role="group"
+              aria-label="Diagram view controls"
+              onMouseDown={(e) => e.stopPropagation()}
+              onMouseUp={(e) => e.stopPropagation()}
+            >
+              <button className="flex h-7 w-7 items-center justify-center text-muted hover:bg-hover hover:text-fg" aria-label="Zoom in" title="Zoom in" onClick={() => zoomBy(1.25)}>
+                <Plus size={14} />
+              </button>
+              <div className="border-t border-line px-0.5 py-0.5 text-center text-[9.5px] tabular-nums text-muted" aria-live="polite" title="Zoom">
+                {Math.round(view.k * 100)}%
+              </div>
+              <button className="flex h-7 w-7 items-center justify-center border-t border-line text-muted hover:bg-hover hover:text-fg" aria-label="Zoom out" title="Zoom out" onClick={() => zoomBy(0.8)}>
+                <Minus size={14} />
+              </button>
+              <button
+                className="flex h-7 w-7 items-center justify-center border-t border-line text-muted hover:bg-hover hover:text-fg"
+                aria-label={dir === "lr" ? "Lay out top to bottom" : "Lay out left to right"}
+                title={dir === "lr" ? "Left to right now: switch to top to bottom (sources on top)" : "Top to bottom now: switch to left to right (sources on the left)"}
+                onClick={() => setDir(dir === "lr" ? "tb" : "lr")}
+              >
+                {dir === "lr" ? <ArrowDown size={14} /> : <ArrowRight size={14} />}
+              </button>
+            </div>
           )}
           {graph && (
             <div className="pointer-events-none absolute bottom-2 left-2 flex gap-3 rounded-md border border-line bg-panel/90 px-2 py-1 text-[10.5px] text-muted">
