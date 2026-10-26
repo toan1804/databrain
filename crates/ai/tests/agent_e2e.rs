@@ -635,6 +635,8 @@ async fn knowledge_index_plan_scope_and_cancel() {
     }
     let r = RunRequest { connection_id: conn.clone(), tab_id: "setup".into(), sql: ddl, base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None, params: Default::default() };
     engine.run_and_wait(&f.hub, r, None).await.unwrap();
+    // The setup tab's session holds the file; Windows lets one session open it.
+    engine.disconnect(&conn);
 
     // Plan: one listing + counts, flagged as large.
     let pl = plan(&engine, &conn).await.unwrap();
