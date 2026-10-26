@@ -86,8 +86,11 @@ pub struct LoadTarget {
     /// `analytics.orders`) when that exists and what was typed doesn't.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<String>,
-    /// Good to know: the default schema used, a table of another case.
+    /// Good to know: the default schema used, a name matched in another case.
     pub notes: Vec<String>,
+    /// A part was typed in another case than the database's: `resolved`
+    /// has the database's spelling, and the load uses it.
+    pub respelled: bool,
 }
 
 /// One statement (or group of INSERTs) of a dry run.
@@ -479,37 +482,52 @@ impl QueryEngine {
             return Ok(t);
         }
         let q = |s: &str| quote_ident(kind, s);
-        // Same name in another case: what to suggest.
-        fn other_case(want: &str, mut have: impl Iterator<Item = String>) -> Option<String> {
-            have.find(|h| h != want && h.eq_ignore_ascii_case(want))
+        // The name as the database has it: exactly, else the one name that
+        // differs only in case (`account` for `ACCOUNT`). Several: ambiguous.
+        fn matching(want: &str, have: &[String]) -> std::result::Result<Option<String>, Vec<String>> {
+            if have.iter().any(|h| h == want) {
+                return Ok(Some(want.to_string()));
+            }
+            let same: Vec<String> = have.iter().filter(|h| h.eq_ignore_ascii_case(want)).cloned().collect();
+            match same.len() {
+                0 => Ok(None),
+                1 => Ok(same.into_iter().next()),
+                _ => Err(same),
+            }
         }
+        let ambiguous = |what: &str, want: &str, all: Vec<String>| format!("{what} {want} matches {} in {conn} (names differing only in case): type the exact name", all.join(", "));
+        let case_note = |t: &mut LoadTarget, what: &str, typed: &str, actual: &str| {
+            t.respelled = true;
+            t.notes.push(format!("{what} {typed} is {actual} in {conn}: loading into {actual}"));
+        };
 
         // Catalog.
         let mut catalog: Option<String> = None;
         if let Some(cats) = &catalogs {
+            let names: Vec<String> = cats.iter().map(|c| c.name.clone()).collect();
             let want = if parts.len() == 3 { Some(parts[0].clone()) } else { cats.iter().find(|c| c.is_default).map(|c| c.name.clone()) };
             match want {
-                Some(c) if cats.iter().any(|x| x.name == c) => {
-                    t.catalog_exists = Some(true);
-                    catalog = Some(c);
-                }
-                Some(c) => {
-                    t.catalog_exists = Some(false);
-                    t.catalog = Some(c.clone());
-                    match other_case(&c, cats.iter().map(|x| x.name.clone())) {
-                        Some(found) => {
-                            t.problems.push(format!("{} {c} doesn't exist in {conn}; did you mean {found}? (names are matched exactly, as quoted)", catalog_word(kind)));
-                            let rest: Vec<String> = parts.iter().skip(1).cloned().collect();
-                            t.suggestion = Some(std::iter::once(found).chain(rest).collect::<Vec<_>>().join("."));
+                Some(c) => match matching(&c, &names) {
+                    Ok(Some(found)) => {
+                        if found != c {
+                            case_note(&mut t, catalog_word(kind), &c, &found);
                         }
-                        None => {
-                            t.problems.push(format!("{} {c} doesn't exist in {conn}. Create it first: only the table is created for you.", catalog_word(kind)));
-                            t.create_sql = create_catalog_sql(kind, &q(&c));
-                        }
+                        t.catalog_exists = Some(true);
+                        catalog = Some(found);
                     }
-                    t.resolved = parts.join(".");
-                    return Ok(t);
-                }
+                    Ok(None) => {
+                        t.catalog_exists = Some(false);
+                        t.catalog = Some(c.clone());
+                        t.problems.push(format!("{} {c} doesn't exist in {conn}. Create it first: only the table is created for you.", catalog_word(kind)));
+                        t.create_sql = create_catalog_sql(kind, &q(&c));
+                        t.resolved = parts.join(".");
+                        return Ok(t);
+                    }
+                    Err(all) => {
+                        t.problems.push(ambiguous(catalog_word(kind), &c, all));
+                        return Ok(t);
+                    }
+                },
                 None if parts.len() < 3 => t.notes.push(format!("{conn} has no current {}: write {}.schema.table", catalog_word(kind).to_lowercase(), catalog_word(kind).to_lowercase())),
                 None => {}
             }
@@ -536,63 +554,68 @@ impl QueryEngine {
             }
             d
         };
-        let Some(schema) = want else {
+        let Some(typed_schema) = want else {
             // Can't tell which schema the session uses: not checked.
             t.resolved = parts.join(".");
             t.notes.push(format!("{conn} has no default schema to check against: write schema.table to check it"));
             return Ok(t);
         };
-        t.schema = Some(schema.clone());
-        let qualified = |s: &str| match &catalog {
-            Some(c) => format!("{c}.{s}"),
-            None => s.to_string(),
-        };
-        t.resolved = format!("{}.{}", qualified(&schema), t.table);
-        let Some(schema_id) = schemas.iter().find(|s| short(&s.name) == schema).map(|s| s.name.clone()) else {
-            t.schema_exists = Some(false);
-            match other_case(&schema, schemas.iter().map(|s| short(&s.name))) {
-                Some(found) => {
-                    t.problems.push(format!("{} {schema} doesn't exist in {conn}; did you mean {found}? (names are matched exactly, as quoted)", schema_word(kind)));
-                    let mut p = parts.clone();
-                    let i = p.len() - 2;
-                    if parts.len() >= 2 {
-                        p[i] = found;
-                    }
-                    t.suggestion = Some(p.join("."));
+        let schema_names: Vec<String> = schemas.iter().map(|s| short(&s.name)).collect();
+        let schema = match matching(&typed_schema, &schema_names) {
+            Ok(Some(found)) => {
+                if found != typed_schema {
+                    case_note(&mut t, schema_word(kind), &typed_schema, &found);
                 }
-                None => {
-                    t.problems.push(format!("{} {schema} doesn't exist in {conn}. Create it first: only the table is created for you.", schema_word(kind)));
-                    let path = match &catalog {
-                        Some(c) => format!("{}.{}", q(c), q(&schema)),
-                        None => q(&schema),
-                    };
-                    t.create_sql = create_schema_sql(kind, &path, &schema);
-                }
+                found
             }
-            return Ok(t);
+            Ok(None) => {
+                t.schema = Some(typed_schema.clone());
+                t.schema_exists = Some(false);
+                t.resolved = join_path(kind, catalog.iter().map(String::as_str).chain([typed_schema.as_str(), t.table.as_str()]));
+                t.problems.push(format!("{} {typed_schema} doesn't exist in {conn}. Create it first: only the table is created for you.", schema_word(kind)));
+                let path = match &catalog {
+                    Some(c) => format!("{}.{}", q(c), q(&typed_schema)),
+                    None => q(&typed_schema),
+                };
+                t.create_sql = create_schema_sql(kind, &path, &typed_schema);
+                return Ok(t);
+            }
+            Err(all) => {
+                t.problems.push(ambiguous(schema_word(kind), &typed_schema, all));
+                return Ok(t);
+            }
         };
+        let schema_id = schemas.iter().find(|s| short(&s.name) == schema).map(|s| s.name.clone()).unwrap_or_else(|| schema.clone());
+        t.schema = Some(schema.clone());
         t.schema_exists = Some(true);
 
         // Table.
-        let name = t.table.clone();
-        let names = vec![name.clone(), name.to_uppercase(), name.to_lowercase()];
+        let typed = t.table.clone();
+        let names = vec![typed.clone(), typed.to_uppercase(), typed.to_lowercase()];
         let objs = self.list_objects_named(connection_id, &schema_id, &names).await?;
         let relations: Vec<_> = objs.iter().filter(|o| o.kind.is_relation()).collect();
-        match relations.iter().find(|o| o.name == name) {
+        let rel_names: Vec<String> = relations.iter().map(|o| o.name.clone()).collect();
+        let found = match matching(&typed, &rel_names) {
+            Ok(f) => f,
+            Err(all) => {
+                t.problems.push(ambiguous("Table", &typed, all));
+                return Ok(t);
+            }
+        };
+        if let Some(f) = &found {
+            if *f != typed {
+                case_note(&mut t, "Table", &typed, f);
+            }
+            t.table = f.clone();
+        }
+        t.resolved = join_path(kind, catalog.iter().map(String::as_str).chain([schema.as_str(), t.table.as_str()]));
+        match found.and_then(|f| relations.iter().find(|o| o.name == f).copied()) {
             Some(o) if o.kind == ObjectKind::Table || o.kind == ObjectKind::ForeignTable => t.table_exists = Some(true),
             Some(o) => {
                 t.table_exists = Some(true);
                 t.problems.push(format!("{} is a {}: rows can only be loaded into a table", t.resolved, if o.kind == ObjectKind::View { "view" } else { "materialized view" }));
             }
-            None => {
-                t.table_exists = Some(false);
-                if let Some(o) = relations.iter().find(|o| o.name.eq_ignore_ascii_case(&name)) {
-                    t.notes.push(format!("{} exists as {} (another case): as typed, a new table {name} would be created", qualified(&schema), o.name));
-                    let mut p = parts.clone();
-                    *p.last_mut().unwrap() = o.name.clone();
-                    t.suggestion = Some(p.join("."));
-                }
-            }
+            None => t.table_exists = Some(false),
         }
         Ok(t)
     }
@@ -618,27 +641,29 @@ impl QueryEngine {
         let session = self.session(connection_id, tab).await?;
 
         // Does the table exist, and with which columns?
-        let (exists, target_cols, missing_reason) = match session.execute(&sqlgen::probe_sql(dialect, &table), ExecOptions::default()).await {
-            Ok(s) => match s.collect().await {
-                Ok(c) => (true, c.schema.map(|s| s.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>()), None),
-                Err(e) if matches!(e.kind, ErrorKind::Connection | ErrorKind::Auth | ErrorKind::Cancelled) => return Err(e.into()),
-                Err(e) => (false, None, Some(e.message)),
-            },
-            Err(e) if matches!(e.kind, ErrorKind::Connection | ErrorKind::Auth | ErrorKind::Cancelled) => return Err(e.into()),
-            Err(e) => (false, None, Some(e.message)),
-        };
+        let mut table = table;
+        let (mut exists, mut target_cols, mut missing_reason) = probe(&session, dialect, &table).await?;
         let before = user_statements(spec.before_sql.as_deref(), dialect);
         let after = user_statements(spec.after_sql.as_deref(), dialect);
-        // Not there: say why when the catalog or schema is missing, before
-        // any CREATE TABLE fails on it (before SQL may create them).
-        if !exists && before.is_empty() {
+        // Not there as typed: the path as the database spells it
+        // (`account` → `ACCOUNT`), or why when the catalog or schema is
+        // missing, before any CREATE TABLE fails on it (before SQL may
+        // create them).
+        if !exists {
             if let Ok(t) = self.check_load_target(connection_id, &table).await {
-                if t.catalog_exists == Some(false) || t.schema_exists == Some(false) {
+                let missing = t.catalog_exists == Some(false) || t.schema_exists == Some(false);
+                if missing && before.is_empty() {
                     let mut m = t.problems.join(" ");
                     if let Some(sql) = &t.create_sql {
                         m.push_str(&format!(" ({sql})"));
                     }
                     return Err(EngineError::new("invalid", m));
+                }
+                if !missing && t.problems.is_empty() && t.respelled {
+                    table = t.resolved.clone();
+                    if t.table_exists == Some(true) {
+                        (exists, target_cols, missing_reason) = probe(&session, dialect, &table).await?;
+                    }
                 }
             }
         }
@@ -948,6 +973,29 @@ async fn explain_plan(p: &Prepared, rows: &LoadRows, checks: &mut Vec<LoadCheck>
         }
         checks.push(c);
     }
+}
+
+/// `SELECT … WHERE 1 = 0` on `table`: (exists, its columns, why not).
+async fn probe(session: &Arc<dyn Session>, dialect: ConnectorKind, table: &str) -> Result<(bool, Option<Vec<String>>, Option<String>)> {
+    Ok(match session.execute(&sqlgen::probe_sql(dialect, table), ExecOptions::default()).await {
+        Ok(s) => match s.collect().await {
+            Ok(c) => (true, c.schema.map(|s| s.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>()), None),
+            Err(e) if matches!(e.kind, ErrorKind::Connection | ErrorKind::Auth | ErrorKind::Cancelled) => return Err(e.into()),
+            Err(e) => (false, None, Some(e.message)),
+        },
+        Err(e) if matches!(e.kind, ErrorKind::Connection | ErrorKind::Auth | ErrorKind::Cancelled) => return Err(e.into()),
+        Err(e) => (false, None, Some(e.message)),
+    })
+}
+
+/// Parts back into a path [`split_path`] reads the same (parts with a dot
+/// or a quote are quoted).
+fn join_path<'a>(kind: ConnectorKind, parts: impl IntoIterator<Item = &'a str>) -> String {
+    parts
+        .into_iter()
+        .map(|p| if p.contains(['.', '"', '`', '[', ']']) || p != p.trim() { quote_ident(kind, p) } else { p.to_string() })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// What the top level of names is called on `kind`.

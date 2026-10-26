@@ -93,10 +93,12 @@ async fn checks_the_target_path_before_loading() {
     assert_eq!(t.schema_exists, Some(false));
     assert!(t.problems[0].contains("nosuch doesn't exist in lite"), "{t:?}");
     assert_eq!(t.create_sql.as_deref(), Some(r#"ATTACH DATABASE 'file.db' AS "nosuch""#));
+    // Another case is accepted: the database's spelling is used.
     let t = api::check_load_target(&st, &lite, "MAIN.People").await.unwrap();
-    assert_eq!(t.suggestion.as_deref(), Some("main.People"), "schema of another case: {t:?}");
-    let t = api::check_load_target(&st, &lite, "main.PEOPLE").await.unwrap();
-    assert_eq!((t.table_exists, t.suggestion.as_deref()), (Some(false), Some("main.people")), "table of another case: {t:?}");
+    assert_eq!((t.resolved.as_str(), t.schema_exists, t.table_exists), ("main.people", Some(true), Some(true)), "{t:?}");
+    assert!(t.respelled && t.problems.is_empty() && t.notes.iter().any(|n| n.contains("Table People is people")), "{t:?}");
+    let t = api::check_load_target(&st, &lite, "ACCOUNT_NEW").await.unwrap();
+    assert_eq!((t.resolved.as_str(), t.table_exists), ("main.ACCOUNT_NEW", Some(false)), "a new table keeps the typed name");
     let t = api::check_load_target(&st, &lite, "adults").await.unwrap();
     assert!(t.problems[0].contains("is a view"), "{t:?}");
     let t = api::check_load_target(&st, &lite, "a.b.c").await.unwrap();

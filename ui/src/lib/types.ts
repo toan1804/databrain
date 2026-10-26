@@ -1144,6 +1144,8 @@ export interface LoadTarget {
   /** The path as the database spells it, when what was typed differs only in case. */
   suggestion?: string;
   notes: string[];
+  /** A part was typed in another case: `resolved` has the database's spelling, and the load uses it. */
+  respelled?: boolean;
 }
 
 export interface LoadDryRun {
