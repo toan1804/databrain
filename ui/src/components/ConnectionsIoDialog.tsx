@@ -9,7 +9,16 @@ import { EnvBadge, Modal } from "./ui";
 
 const SOURCES: { id: ImportSource; label: string; hint: string }[] = [
   { id: "file", label: "DataBrain file", hint: "A .databrain-connections.json file exported from DataBrain (no passwords)." },
-  { id: "dbeaver", label: "DBeaver", hint: "DBeaver's data-sources.json. Passwords stay in DBeaver: enter them after import." },
+  {
+    id: "dbeaver",
+    label: "DBeaver",
+    hint: "DBeaver's data-sources.json. Users and passwords come from credentials-config.json next to it (not when DBeaver has a master password); missing ones are entered after import.",
+  },
+  {
+    id: "datagrip",
+    label: "DataGrip",
+    hint: "DataGrip's global data sources (options/dataSources.xml of the newest DataGrip), or choose a project's .idea/dataSources.xml. Users come along; passwords stay in DataGrip's keychain: enter them after import.",
+  },
   { id: "pgpass", label: "pgpass", hint: "PostgreSQL's ~/.pgpass. Its passwords are saved to the keychain." },
 ];
 
@@ -35,7 +44,7 @@ export function ImportConnectionsDialog({ onClose }: { onClose: () => void }) {
   const [picked, setPicked] = useState<Set<number>>(new Set());
   const [busy, setBusy] = useState(false);
 
-  // DBeaver and pgpass have a usual place: look there first.
+  // DBeaver, DataGrip and pgpass have a usual place: look there first.
   useEffect(() => {
     setPreview(null);
     setError(null);
@@ -56,7 +65,8 @@ export function ImportConnectionsDialog({ onClose }: { onClose: () => void }) {
   }, [source, path]);
 
   const browse = async () => {
-    const p = await openDialog({ multiple: false, directory: false, filters: source === "pgpass" ? [] : [{ name: "JSON", extensions: ["json"] }] });
+    const filters = source === "pgpass" ? [] : source === "datagrip" ? [{ name: "DataGrip data sources", extensions: ["xml"] }] : [{ name: "JSON", extensions: ["json"] }];
+    const p = await openDialog({ multiple: false, directory: false, filters });
     if (typeof p === "string") setPath(p);
   };
 

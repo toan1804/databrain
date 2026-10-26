@@ -1802,8 +1802,10 @@ dependencies = [
 name = "databrain-app"
 version = "0.2.1"
 dependencies = [
+ "aes 0.8.4",
  "async-trait",
  "base64 0.23.1",
+ "cbc 0.1.2",
  "chrono",
  "databrain-ai",
  "databrain-auth",
@@ -1826,6 +1828,7 @@ dependencies = [
  "futures",
  "openssl",
  "parking_lot",
+ "quick-xml 0.38.4",
  "reqwest",
  "rust_xlsxwriter",
  "secrecy",

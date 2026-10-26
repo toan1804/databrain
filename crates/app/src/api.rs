@@ -268,8 +268,14 @@ pub struct SaveConnectionArgs {
 }
 
 pub fn save_connection(state: &AppState, args: SaveConnectionArgs) -> Result<ConnectionProfile> {
+    validate_config(state, &args.profile.config)?;
+    store_connection(state, args)
+}
+
+/// [`save_connection`] without checking the settings are complete (imports:
+/// a connection missing its user is saved, to be finished in its form).
+pub(crate) fn store_connection(state: &AppState, args: SaveConnectionArgs) -> Result<ConnectionProfile> {
     let mut profile = args.profile;
-    validate_config(state, &profile.config)?;
     if args.secret.is_some() {
         profile.has_secret = true;
     } else if args.clear_secret {
@@ -309,7 +315,7 @@ pub fn save_connection(state: &AppState, args: SaveConnectionArgs) -> Result<Con
     Ok(saved)
 }
 
-fn validate_config(state: &AppState, cfg: &ConnectionConfig) -> Result<()> {
+pub(crate) fn validate_config(state: &AppState, cfg: &ConnectionConfig) -> Result<()> {
     use databrain_auth::AuthMethod;
     // What the connector itself requires (a file, an account, a project…).
     state.engine.registry().get(cfg.kind)?.validate(cfg).map_err(invalid)?;

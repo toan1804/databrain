@@ -77,3 +77,31 @@ fn pgpass_import_saves_the_password() {
     assert!(c.has_secret);
     assert_eq!(secrets.get(&SecretRef::for_connection(&c.id)).unwrap().map(|s| secrecy::ExposeSecret::expose_secret(&s).to_string()).as_deref(), Some("pw1"));
 }
+
+/// A DBeaver connection without its user (kept encrypted elsewhere) and a
+/// DataGrip data source are imported, to be completed in their form.
+#[test]
+fn imports_incomplete_dbeaver_and_datagrip_connections() {
+    let (a, _) = state();
+    let dir = tempfile::tempdir().unwrap();
+    let dbeaver = dir.path().join("data-sources.json");
+    std::fs::write(&dbeaver, r#"{"connections": {"pg-1": {"provider": "postgresql", "driver": "postgres-jdbc", "name": "No user", "configuration": {"host": "pg", "port": "5432", "database": "d"}}}}"#).unwrap();
+    let path = Some(dbeaver.to_string_lossy().into_owned());
+    let p = conn_io::import_preview(&a, ImportSource::Dbeaver, path.clone()).unwrap();
+    assert!(p.candidates[0].note.as_deref().unwrap().contains("user and password"), "{:?}", p.candidates[0].note);
+    let r = conn_io::import_apply(&a, ImportSource::Dbeaver, path, &[0]).unwrap();
+    assert_eq!((r.imported, r.errors.clone()), (1, vec![]), "no 'User name is required'");
+
+    let grip = dir.path().join("dataSources.xml");
+    std::fs::write(&grip, r#"<project version="4"><component name="DataSourceManagerImpl" format="xml" multifile-model="true">
+        <data-source source="LOCAL" name="mysql@db" uuid="x"><driver-ref>mysql.8</driver-ref><jdbc-url>jdbc:mysql://db:3306/app</jdbc-url></data-source>
+      </component></project>"#).unwrap();
+    std::fs::write(dir.path().join("dataSources.local.xml"), r#"<project version="4"><component name="dataSourceStorageLocal"><data-source name="mysql@db" uuid="x"><user-name>root</user-name></data-source></component></project>"#).unwrap();
+    let path = Some(grip.to_string_lossy().into_owned());
+    let p = conn_io::import_preview(&a, ImportSource::Datagrip, path.clone()).unwrap();
+    assert_eq!((p.candidates[0].kind, p.candidates[0].user.as_deref(), p.candidates[0].target.as_str()), (ConnectorKind::Mysql, Some("root"), "db:3306/app"));
+    let r = conn_io::import_apply(&a, ImportSource::Datagrip, path, &[0]).unwrap();
+    assert_eq!(r.imported, 1);
+    let got = a.workspace.list_connections().unwrap();
+    assert!(got.iter().any(|c| c.name == "No user") && got.iter().any(|c| c.name == "mysql@db"));
+}

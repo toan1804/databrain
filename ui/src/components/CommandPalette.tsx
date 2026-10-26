@@ -59,7 +59,7 @@ function Palette() {
         run: () => setTimeout(() => st.openCatalogSearch(), 0),
       },
       { id: "new-conn", group: "Actions", label: "New connection", icon: <Database size={14} />, run: () => st.openConnectionDialog(null) },
-      { id: "import-conns", group: "Actions", label: "Import connections (DBeaver, pgpass, DataBrain file)…", icon: <Database size={14} />, run: () => st.setImportConnectionsOpen(true) },
+      { id: "import-conns", group: "Actions", label: "Import connections (DBeaver, DataGrip, pgpass, DataBrain file)…", icon: <Database size={14} />, run: () => st.setImportConnectionsOpen(true) },
       { id: "export-conns", group: "Actions", label: "Export connections (without passwords)…", icon: <Database size={14} />, run: () => void exportConnections() },
       { id: "compare", group: "Actions", label: "Compare schemas…", icon: <GitCompare size={14} />, run: () => openCompare() },
       ...st.dashboards.map((d) => ({ id: `dash:${d.id}`, group: "Dashboards", label: d.name, detail: `${d.charts.length} chart${d.charts.length === 1 ? "" : "s"}`, icon: <LayoutDashboard size={14} />, run: () => st.openDashboard(d.id) })),

@@ -1331,7 +1331,7 @@ export interface QueryPlan {
 }
 
 /** Where connections are imported from. */
-export type ImportSource = "file" | "dbeaver" | "pgpass";
+export type ImportSource = "file" | "dbeaver" | "datagrip" | "pgpass";
 
 export interface ImportCandidate {
   index: number;
