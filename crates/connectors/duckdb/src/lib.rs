@@ -1370,7 +1370,9 @@ mod bundled_extensions {
         let path: String = c
             .query_row("select install_path from duckdb_extensions() where extension_name = 'excel' and loaded", [], |r| r.get(0))
             .unwrap();
-        assert!(path.starts_with(&*dir.to_string_lossy()), "{path}");
+        // DuckDB writes the path with the system's separators (`\` on Windows).
+        let norm = |s: &str| s.replace('\\', "/");
+        assert!(norm(&path).starts_with(&norm(&dir.to_string_lossy())), "{path}");
     }
 }
 
