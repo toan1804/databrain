@@ -539,7 +539,14 @@ static FILE_DBS: std::sync::LazyLock<Mutex<std::collections::HashMap<FileKey, st
 /// live session already has it open (same access mode).
 fn connect_file(path: &str, read_only: bool) -> Result<(duckdb::Connection, Arc<FileDb>)> {
     let p = std::path::Path::new(path);
-    let key = (std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()), read_only);
+    // The same key before and after the file exists (the first session may
+    // create it): the folder is resolved (links, 8.3 names), not the file.
+    let resolved = match (p.parent().filter(|d| !d.as_os_str().is_empty()), p.file_name()) {
+        (Some(dir), Some(name)) => std::fs::canonicalize(dir).map(|d| d.join(name)).unwrap_or_else(|_| p.to_path_buf()),
+        (None, Some(name)) => std::env::current_dir().map(|d| d.join(name)).unwrap_or_else(|_| p.to_path_buf()),
+        _ => p.to_path_buf(),
+    };
+    let key = (resolved, read_only);
     let mut dbs = FILE_DBS.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?;
     dbs.retain(|_, w| w.strong_count() > 0);
     if let Some(db) = dbs.get(&key).and_then(std::sync::Weak::upgrade) {
