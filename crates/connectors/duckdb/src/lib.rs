@@ -438,16 +438,13 @@ impl Connector for DuckdbConnector {
         let files = files_of(cfg);
         let all_sheets = cfg.opt("excel_sheets") == Some("all");
         let read_only = cfg.read_only && path != ":memory:";
-        let conn = tokio::task::spawn_blocking(move || -> Result<duckdb::Connection> {
-            let conn = if path == ":memory:" {
-                duckdb::Connection::open_in_memory()
+        let (conn, db) = tokio::task::spawn_blocking(move || -> Result<(duckdb::Connection, Option<Arc<FileDb>>)> {
+            let (conn, db) = if path == ":memory:" {
+                (duckdb::Connection::open_in_memory().map_err(|e| ConnectorError::connection(e.to_string()))?, None)
             } else {
-                let c = duckdb::Config::default()
-                    .access_mode(if read_only { duckdb::AccessMode::ReadOnly } else { duckdb::AccessMode::ReadWrite })
-                    .map_err(map_err)?;
-                duckdb::Connection::open_with_flags(&path, c)
-            }
-            .map_err(|e| ConnectorError::connection(e.to_string()))?;
+                let (c, db) = connect_file(&path, read_only)?;
+                (c, Some(db))
+            };
             // Bundled extensions (excel, delta, iceberg, httpfs, icu…) live in
             // the app's extension directory; unknown ones still download on demand.
             if let Some(dir) = extension_dir() {
@@ -455,7 +452,7 @@ impl Connector for DuckdbConnector {
             }
             let _ = conn.execute_batch("SET autoinstall_known_extensions = true; SET autoload_known_extensions = true;");
             attach_files(&conn, &files, all_sheets)?;
-            Ok(conn)
+            Ok((conn, db))
         })
         .await
         .map_err(|e| ConnectorError::internal(e.to_string()))??;
@@ -463,7 +460,8 @@ impl Connector for DuckdbConnector {
             interrupt: conn.interrupt_handle(),
             conn: Arc::new(Mutex::new(conn)),
             outputs: self.outputs.clone(),
-            loaded: Arc::default(),
+            loaded: db.as_ref().map(|d| d.loaded.clone()).unwrap_or_default(),
+            _db: db,
         }))
     }
 }
@@ -515,11 +513,46 @@ pub struct DuckSession {
     conn: Arc<Mutex<duckdb::Connection>>,
     interrupt: Arc<duckdb::InterruptHandle>,
     outputs: Option<Arc<ExternalTablesSlot>>,
-    /// Output tables loaded in this session: lowercase name → version key.
-    loaded: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// Output tables loaded in the database: lowercase name → version key.
+    loaded: Arc<Loaded>,
+    /// The file database this session's connection belongs to (dropped
+    /// after `conn`, so the file closes when its last session ends).
+    _db: Option<Arc<FileDb>>,
 }
 
 type Loaded = Mutex<std::collections::HashMap<String, String>>;
+
+/// One opened database file, shared by every session on it in this process.
+/// DuckDB allows a file to be opened by one database instance at a time
+/// (on Windows even within a process: a second open fails with "File is
+/// already open"); sessions are connections to that one instance.
+struct FileDb {
+    root: Mutex<duckdb::Connection>,
+    /// The `results` catalog is per instance, so is what was loaded into it.
+    loaded: Arc<Loaded>,
+}
+
+type FileKey = (std::path::PathBuf, bool);
+static FILE_DBS: std::sync::LazyLock<Mutex<std::collections::HashMap<FileKey, std::sync::Weak<FileDb>>>> = std::sync::LazyLock::new(Default::default);
+
+/// A new connection to the database file at `path`, opening it unless a
+/// live session already has it open (same access mode).
+fn connect_file(path: &str, read_only: bool) -> Result<(duckdb::Connection, Arc<FileDb>)> {
+    let p = std::path::Path::new(path);
+    let key = (std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()), read_only);
+    let mut dbs = FILE_DBS.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?;
+    dbs.retain(|_, w| w.strong_count() > 0);
+    if let Some(db) = dbs.get(&key).and_then(std::sync::Weak::upgrade) {
+        let conn = db.root.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?.try_clone().map_err(|e| ConnectorError::connection(e.to_string()))?;
+        return Ok((conn, db));
+    }
+    let c = duckdb::Config::default().access_mode(if read_only { duckdb::AccessMode::ReadOnly } else { duckdb::AccessMode::ReadWrite }).map_err(map_err)?;
+    let root = duckdb::Connection::open_with_flags(path, c).map_err(|e| ConnectorError::connection(e.to_string()))?;
+    let conn = root.try_clone().map_err(|e| ConnectorError::connection(e.to_string()))?;
+    let db = Arc::new(FileDb { root: Mutex::new(root), loaded: Arc::default() });
+    dbs.insert(key, Arc::downgrade(&db));
+    Ok((conn, db))
+}
 
 /// Explorer schema id for DataBrain outputs (`results.<name>` in SQL).
 pub const RESULTS_SCHEMA_ID: &str = "results.main";
