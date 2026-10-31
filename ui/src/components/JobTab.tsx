@@ -576,7 +576,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
               onDelete={() => deleteNode(selected.id)}
             />
           ) : (
-            <JobPanel job={job} run={run} onChange={(patch) => update((j) => ({ ...j, ...patch }))} onSelect={(id) => setSel({ node: id })} />
+            <JobPanel job={job} run={run} canResume={canResume} onResume={() => void resume()} onChange={(patch) => update((j) => ({ ...j, ...patch }))} onSelect={(id) => setSel({ node: id })} />
           )}
         </aside>
       </div>
@@ -901,7 +901,9 @@ function NodePanel({
           {nameProblem ? (
             <div className="mt-0.5 text-[11px] text-danger">{nameProblem}. Kept: {node.name}</div>
           ) : (
-            <div className="mt-0.5 text-[11px] text-muted">Unique across the app: only this step produces results.{name || node.name}</div>
+            <div className="mt-0.5 text-[11px] text-muted" title="Unique across the app: only this step produces this output">
+              Output: <span className="font-mono">results.{name || node.name}</span>
+            </div>
           )}
         </div>
         {status?.status === "running" ? (
@@ -916,6 +918,44 @@ function NodePanel({
         <button className="icon-btn mt-4 h-7 w-7" aria-label="Delete step" title="Delete step" onClick={onDelete}>
           <Trash2 size={13} />
         </button>
+      </div>
+
+      {/* Outcome first: what happened is what you look for after a run. */}
+      <div className={`rounded-md border px-2 py-1.5 ${status?.status === "error" ? "border-danger/50 bg-danger/5" : status?.status === "success" ? "border-success/40" : "border-line"}`}>
+        <div className="flex items-center gap-1.5">
+          <StatusIcon status={status?.status} />
+          <span className={`min-w-0 flex-1 whitespace-pre-wrap break-words ${status?.status === "error" ? "text-danger" : "text-muted"}`}>{statusText(status)}</span>
+          {status?.status === "success" && status.file && (
+            <button
+              className="btn-ghost shrink-0 py-0.5 text-[11.5px]"
+              title={status.file}
+              onClick={() => api.revealJobFile(job.id, node.id).catch((e) => useStore.getState().toast(toError(e).message, "error"))}
+            >
+              <FolderOpen size={12} /> Show file
+            </button>
+          )}
+          {output && (
+            <button className="btn-ghost shrink-0 py-0.5 text-[11.5px]" onClick={() => void openOutput(output)}>
+              <Eye size={12} /> View output
+            </button>
+          )}
+        </div>
+        {status?.status === "running" && status.progress && (
+          <div className="mt-1.5">
+            <ProgressBar p={status.progress} />
+          </div>
+        )}
+        {status?.notices?.map((n, i) => (
+          <div key={i} className="mt-1 flex items-start gap-1 text-[11.5px] text-accent">
+            <Info size={12} className="mt-0.5 shrink-0" /> <span className="min-w-0 break-words">{n}</span>
+          </div>
+        ))}
+        {run?.nodes.some((r) => r.node_id === node.id) && (
+          <div className="mt-1.5 border-t border-line pt-1.5">
+            <div className="mb-1 text-[11px] text-muted">Log ({run.status === "running" ? "running now" : relativeTime(run.started_at)})</div>
+            <RunLog job={job} run={run} step={node.id} />
+          </div>
+        )}
       </div>
 
       <ActionPicker node={node} upstreams={ups.map((u) => u.name)} onChange={onChange} />
@@ -968,7 +1008,9 @@ function NodePanel({
         <>
         {ups.length > 0 && (
           <div className="text-[11.5px]">
-            <span className="text-muted">{runsOn === results ? "Reads (click to insert): " : "Runs after: "}</span>
+            <span className="text-muted" title={runsOn === results ? undefined : "Outputs of other steps can only be read by DuckDB steps; this step only waits for them."}>
+              {runsOn === results ? "Reads (click to insert): " : "Runs after: "}
+            </span>
             {ups.map((u, i) => (
               <span key={u.id}>
                 {i > 0 && ", "}
@@ -981,7 +1023,6 @@ function NodePanel({
                 </button>
               </span>
             ))}
-            {runsOn !== results && <div className="mt-0.5 text-[11px] text-muted">Outputs of other steps can only be read by DuckDB steps; this step only waits for them.</div>}
           </div>
         )}
 
@@ -1009,46 +1050,6 @@ function NodePanel({
       {node.kind === "export" && <ExportFields job={job} node={node} onChange={onChange} />}
 
       {node.kind === "load" && <LoadFields job={job} node={node} onChange={onChange} />}
-
-      <div className={`rounded-md border px-2 py-1.5 ${status?.status === "error" ? "border-danger/50 bg-danger/5" : "border-line"}`}>
-        <div className="flex items-center gap-1.5">
-          <StatusIcon status={status?.status} />
-          <span className={`min-w-0 flex-1 whitespace-pre-wrap break-words ${status?.status === "error" ? "text-danger" : "text-muted"}`}>{statusText(status)}</span>
-          {status?.status === "success" && status.file && (
-            <button
-              className="btn-ghost shrink-0 py-0.5 text-[11.5px]"
-              title={status.file}
-              onClick={() => api.revealJobFile(job.id, node.id).catch((e) => useStore.getState().toast(toError(e).message, "error"))}
-            >
-              <FolderOpen size={12} /> Show file
-            </button>
-          )}
-          {output && (
-            <button className="btn-ghost shrink-0 py-0.5 text-[11.5px]" onClick={() => void openOutput(output)}>
-              <Eye size={12} /> View output
-            </button>
-          )}
-        </div>
-        {status?.status === "running" && status.progress && (
-          <div className="mt-1.5">
-            <ProgressBar p={status.progress} />
-          </div>
-        )}
-        {status?.notices?.map((n, i) => (
-          <div key={i} className="mt-1 flex items-start gap-1 text-[11.5px] text-accent">
-            <Info size={12} className="mt-0.5 shrink-0" /> <span className="min-w-0 break-words">{n}</span>
-          </div>
-        ))}
-      </div>
-
-      {run?.nodes.some((r) => r.node_id === node.id) && (
-        <details open={status?.status === "running" || status?.status === "error"} className="rounded-md border border-line px-2 py-1.5">
-          <summary className="cursor-pointer text-[11px] font-medium uppercase tracking-wide text-muted">Log of this step ({run.status === "running" ? "running now" : relativeTime(run.started_at)})</summary>
-          <div className="mt-1.5">
-            <RunLog job={job} run={run} step={node.id} />
-          </div>
-        </details>
-      )}
 
       {(ups.length > 0 || downs.length > 0) && (
         <div className="grid grid-cols-2 gap-2 text-[11.5px]">
@@ -1121,6 +1122,8 @@ function logText(entries: RunLogEntry[]): string {
 
 /** A run's log: what ran on which step, SQL, rows, errors. */
 function RunLog({ job, run, step, onSelect }: { job: Job; run: JobRun | undefined; step?: string; onSelect?: (id: string) => void }) {
+  // One step's log sits above its settings: kept short there.
+  const maxH = step ? "max-h-48" : "max-h-80";
   const { entries, loading } = useRunLog(job.id, run);
   const [filter, setFilter] = useState<string>(step ?? "");
   const [onlyProblems, setOnlyProblems] = useState(false);
@@ -1148,7 +1151,7 @@ function RunLog({ job, run, step, onSelect }: { job: Job; run: JobRun | undefine
           </select>
         )}
         <label className="flex items-center gap-1 text-[11.5px]">
-          <input type="checkbox" checked={onlyProblems} onChange={(e) => setOnlyProblems(e.target.checked)} /> Errors and warnings only
+          <input type="checkbox" checked={onlyProblems} onChange={(e) => setOnlyProblems(e.target.checked)} /> Problems only
         </label>
         <button
           className="btn-ghost ml-auto py-0 text-[11px]"
@@ -1159,7 +1162,7 @@ function RunLog({ job, run, step, onSelect }: { job: Job; run: JobRun | undefine
         </button>
       </div>
       <div
-        className="max-h-80 overflow-y-auto rounded-md border border-line bg-bg px-1.5 py-1 font-mono text-[11px] leading-[1.45]"
+        className={`${maxH} overflow-y-auto rounded-md border border-line bg-bg px-1.5 py-1 font-mono text-[11px] leading-[1.45]`}
         role="log"
         aria-live={run.status === "running" ? "polite" : "off"}
         onScroll={(e) => {
@@ -1226,23 +1229,17 @@ function ActionPicker({ node, upstreams, onChange }: { node: JobNode; upstreams:
     });
   };
   return (
-    <section aria-label="Action" className="rounded-md border border-accent/40 bg-accent/5 p-2">
-      <div className={label}>Action</div>
-      <div className="flex items-start gap-2">
-        <span className="mt-0.5">{actionIcon(node.kind)}</span>
-        <div className="min-w-0 flex-1">
-          <div className="text-[12.5px] font-semibold">{cur.title}</div>
-          <div className="text-[11px] text-muted">{cur.hint}</div>
-        </div>
-        <select aria-label="Change action" className="w-auto shrink-0 rounded-md border border-line bg-bg px-1.5 py-0.5 text-[11.5px]" value="" onChange={(e) => e.target.value && pick(e.target.value as JobNode["kind"])}>
-          <option value="">Change…</option>
-          {STEP_ACTIONS.filter((a) => a.kind !== node.kind).map((a) => (
-            <option key={a.kind} value={a.kind}>
-              {a.title}
-            </option>
-          ))}
-        </select>
-      </div>
+    <section aria-label="Action" className="flex items-center gap-2 rounded-md border border-accent/40 bg-accent/5 px-2 py-1.5" title={cur.hint}>
+      {actionIcon(node.kind)}
+      <div className="min-w-0 flex-1 truncate text-[12.5px] font-semibold">{cur.title}</div>
+      <select aria-label="Change action" className="w-auto shrink-0 rounded-md border border-line bg-bg px-1.5 py-0.5 text-[11.5px]" value="" onChange={(e) => e.target.value && pick(e.target.value as JobNode["kind"])}>
+        <option value="">Change…</option>
+        {STEP_ACTIONS.filter((a) => a.kind !== node.kind).map((a) => (
+          <option key={a.kind} value={a.kind}>
+            {a.title}
+          </option>
+        ))}
+      </select>
     </section>
   );
 }
@@ -1831,10 +1828,44 @@ function NodeList({ title, nodes, onSelect, empty }: { title: string; nodes: Job
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const ORDER = [1, 2, 3, 4, 5, 6, 0];
 
-function JobPanel({ job, run, onChange, onSelect }: { job: Job; run?: JobRun; onChange: (patch: Partial<Job>) => void; onSelect: (id: string) => void }) {
+
+const TRIGGER: Record<JobRun["trigger"], string> = { manual: "manual", schedule: "scheduled", ai: "by AI", resume: "resumed", background: "background", cli: "command line" };
+
+/** "2 succeeded · 1 failed" for a run's steps. */
+function runCounts(r: JobRun): string {
+  const n = (st: string) => r.nodes.filter((x) => x.status === st).length;
+  return [
+    [n("success"), "succeeded"],
+    [n("error"), "failed"],
+    [n("skipped"), "skipped"],
+    [n("cancelled"), "stopped"],
+    [n("running"), "running"],
+  ]
+    .filter(([c]) => c)
+    .map(([c, w]) => `${c} ${w}`)
+    .join(" · ");
+}
+
+function JobPanel({
+  job,
+  run,
+  canResume,
+  onResume,
+  onChange,
+  onSelect,
+}: {
+  job: Job;
+  run?: JobRun;
+  /** The newest run can be resumed (it failed or was stopped). */
+  canResume: boolean;
+  onResume: () => void;
+  onChange: (patch: Partial<Job>) => void;
+  onSelect: (id: string) => void;
+}) {
   const summary = useJobs((s) => s.jobs.find((j) => j.id === job.id));
   const [runs, setRuns] = useState<JobRun[]>([]);
-  const [open, setOpen] = useState<number | null>(null);
+  // The run shown in full; the newest one unless another was picked.
+  const [picked, setPicked] = useState<number | null>(null);
   const s = job.schedule;
   const set = (patch: Partial<JobSchedule>) => onChange({ schedule: { ...s, ...patch } });
   useEffect(() => {
@@ -1844,11 +1875,13 @@ function JobPanel({ job, run, onChange, onSelect }: { job: Job; run?: JobRun; on
       .then(setRuns)
       .catch(() => {});
   }, [job.id, run?.status, run?.id]);
-  const shown = run?.status === "running" ? [run, ...runs.filter((r) => r.id !== run.id)] : runs;
+  const shown = run && !runs.some((r) => r.id === run.id) ? [run, ...runs] : runs.map((r) => (run && r.id === run.id ? run : r));
+  // A new run takes over the details.
+  useEffect(() => setPicked(null), [run?.id]);
+  const current = shown.find((r) => r.id === picked) ?? shown[0];
 
   return (
     <div className="space-y-4 p-3">
-      <div className="text-[11.5px] text-muted">Select a step to edit its connection and SQL. Steps run after their upstream steps; steps that don't depend on each other run at the same time.</div>
       <section className="space-y-2">
         <div className="flex items-center justify-between">
           <div className={label}>Schedule</div>
@@ -1856,103 +1889,141 @@ function JobPanel({ job, run, onChange, onSelect }: { job: Job; run?: JobRun; on
             <input type="checkbox" checked={s.enabled} onChange={(e) => set({ enabled: e.target.checked })} /> Run on a schedule
           </label>
         </div>
-        <div className={`space-y-2 ${s.enabled ? "" : "pointer-events-none opacity-50"}`}>
-          <div className="flex rounded-md border border-line p-0.5" role="group" aria-label="Schedule kind">
-            {(["interval", "daily"] as const).map((m) => (
-              <button key={m} className={`flex-1 rounded px-2 py-1 text-[11.5px] ${s.mode === m ? "bg-accent/15 font-medium text-accent" : "text-muted hover:text-fg"}`} onClick={() => set({ mode: m })}>
-                {m === "interval" ? "Every…" : "At a time of day"}
-              </button>
-            ))}
-          </div>
-          {s.mode === "interval" ? (
-            <div className="flex items-center gap-2">
-              <span>Every</span>
-              <input type="number" min={1} className={`${field} w-20`} value={s.minutes} onChange={(e) => set({ minutes: Math.max(1, Number(e.target.value) || 1) })} aria-label="Minutes" />
-              <span>minutes</span>
-              <select className={`${field} w-auto`} value="" onChange={(e) => e.target.value && set({ minutes: Number(e.target.value) })} aria-label="Common intervals">
-                <option value="">Presets…</option>
-                <option value="15">15 min</option>
-                <option value="60">1 hour</option>
-                <option value="360">6 hours</option>
-                <option value="1440">1 day</option>
-              </select>
+        {s.enabled && (
+          <div className="space-y-2">
+            <div className="flex rounded-md border border-line p-0.5" role="group" aria-label="Schedule kind">
+              {(["interval", "daily"] as const).map((m) => (
+                <button key={m} className={`flex-1 rounded px-2 py-1 text-[11.5px] ${s.mode === m ? "bg-accent/15 font-medium text-accent" : "text-muted hover:text-fg"}`} onClick={() => set({ mode: m })}>
+                  {m === "interval" ? "Every…" : "At a time of day"}
+                </button>
+              ))}
             </div>
-          ) : (
-            <div className="space-y-2">
+            {s.mode === "interval" ? (
               <div className="flex items-center gap-2">
+                <span>Every</span>
+                <input type="number" min={1} className={`${field} w-20`} value={s.minutes} onChange={(e) => set({ minutes: Math.max(1, Number(e.target.value) || 1) })} aria-label="Minutes" />
+                <span>min</span>
+                <select className={`${field} w-auto`} value="" onChange={(e) => e.target.value && set({ minutes: Number(e.target.value) })} aria-label="Common intervals">
+                  <option value="">Presets…</option>
+                  <option value="15">15 min</option>
+                  <option value="60">1 hour</option>
+                  <option value="360">6 hours</option>
+                  <option value="1440">1 day</option>
+                </select>
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2">
                 <span>At</span>
                 <input type="time" className={`${field} w-28`} value={s.at} onChange={(e) => set({ at: e.target.value || "08:00" })} aria-label="Time" />
-                <span className="text-muted">local time</span>
+                <div className="flex min-w-[220px] flex-1 gap-1" role="group" aria-label="Days">
+                  {ORDER.map((d) => {
+                    const on = s.weekdays.length === 0 || s.weekdays.includes(d);
+                    return (
+                      <button
+                        key={d}
+                        aria-pressed={on}
+                        className={`flex-1 rounded border px-1 py-0.5 text-[11px] ${on ? "border-accent/50 bg-accent/10 text-accent" : "border-line text-muted"}`}
+                        onClick={() => {
+                          const cur = s.weekdays.length === 0 ? ORDER : s.weekdays;
+                          const next = on ? cur.filter((x) => x !== d) : [...cur, d];
+                          set({ weekdays: next.length === 7 ? [] : next });
+                        }}
+                      >
+                        {WEEKDAYS[d]}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-              <div className="flex gap-1" role="group" aria-label="Days">
-                {ORDER.map((d) => {
-                  const on = s.weekdays.length === 0 || s.weekdays.includes(d);
-                  return (
-                    <button
-                      key={d}
-                      aria-pressed={on}
-                      className={`flex-1 rounded border px-1 py-0.5 text-[11px] ${on ? "border-accent/50 bg-accent/10 text-accent" : "border-line text-muted"}`}
-                      onClick={() => {
-                        const cur = s.weekdays.length === 0 ? ORDER : s.weekdays;
-                        const next = on ? cur.filter((x) => x !== d) : [...cur, d];
-                        set({ weekdays: next.length === 7 ? [] : next });
-                      }}
-                    >
-                      {WEEKDAYS[d]}
-                    </button>
-                  );
-                })}
-              </div>
+            )}
+            <div className="flex items-center gap-1 text-[11.5px] text-muted" title="Runs while DataBrain is open (or by the background runner). A run missed while it was closed runs once at the next start.">
+              <CalendarClock size={12} />
+              {summary?.next_run_at ? `Next run ${new Date(summary.next_run_at).toLocaleString()}` : "Saving…"}
+              <Info size={11} className="shrink-0" />
             </div>
-          )}
-          <div className="text-[11.5px] text-muted">
-            {summary?.next_run_at ? `Next run ${new Date(summary.next_run_at).toLocaleString()}` : s.enabled ? "Saving…" : ""} · runs while DataBrain is open; a run missed while it was closed runs once at the next start.
           </div>
-        </div>
+        )}
       </section>
 
-      <section>
+      <section className="space-y-2">
         <div className={label}>Runs</div>
-        {shown.length === 0 && <div className="text-muted">No runs yet.</div>}
+        {!current ? (
+          <div className="text-muted">No runs yet. Use Run job above.</div>
+        ) : (
+          <RunDetails job={job} run={current} newest={current === shown[0]} canResume={canResume} onResume={onResume} onSelect={onSelect} />
+        )}
+        {shown.length > 1 && (
+          <ul className="divide-y divide-line rounded-md border border-line" aria-label="Earlier runs">
+            {shown.map((r) => (
+              <li key={r.id}>
+                <button
+                  className={`flex w-full items-center gap-1.5 px-2 py-1 text-left hover:bg-panel-2 ${r === current ? "bg-accent/10" : ""}`}
+                  aria-current={r === current}
+                  onClick={() => setPicked(r.id)}
+                >
+                  <StatusIcon status={r.status} />
+                  <span className="shrink-0" title={new Date(r.started_at).toLocaleString()}>
+                    {relativeTime(r.started_at)}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-[11px] text-muted">
+                    {TRIGGER[r.trigger] ?? r.trigger} · {runCounts(r) || "no steps"}
+                  </span>
+                  <span className="shrink-0 text-[11px] text-muted">{r.finished_at ? formatDuration(r.finished_at - r.started_at) : "running"}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
+/** One run in full: outcome, its steps and its log. */
+function RunDetails({ job, run: r, newest, canResume, onResume, onSelect }: { job: Job; run: JobRun; newest: boolean; canResume: boolean; onResume: () => void; onSelect: (id: string) => void }) {
+  const tone = r.status === "error" ? "border-danger/50 bg-danger/5" : r.status === "success" ? "border-success/40" : r.status === "running" ? "border-accent/50" : "border-line";
+  const title = r.status === "running" ? "Running" : r.status === "success" ? "Succeeded" : r.status === "error" ? "Failed" : "Stopped";
+  return (
+    <div className={`space-y-2 rounded-md border p-2 ${tone}`}>
+      <div className="flex items-center gap-1.5">
+        <StatusIcon status={r.status} />
+        <span className="font-medium">{title}</span>
+        <span className="min-w-0 flex-1 truncate text-[11px] text-muted" title={new Date(r.started_at).toLocaleString()}>
+          {relativeTime(r.started_at)} · {TRIGGER[r.trigger] ?? r.trigger}
+          {r.finished_at ? ` · ${formatDuration(r.finished_at - r.started_at)}` : ""}
+        </span>
+        {newest && canResume && (
+          <button className="btn-primary shrink-0 py-0.5 text-[11.5px]" onClick={onResume} title="Run again the steps that did not succeed, and the steps after them">
+            <RotateCcw size={12} /> Resume
+          </button>
+        )}
+      </div>
+      {r.status === "error" && r.error && <div className="whitespace-pre-wrap break-words text-[11.5px] text-danger">{r.error}</div>}
+      {r.nodes.length > 0 && (
         <ul className="space-y-1">
-          {shown.map((r) => (
-            <li key={r.id} className="rounded-md border border-line">
-              <button className="flex w-full items-center gap-1.5 px-2 py-1 text-left" onClick={() => setOpen(open === r.id ? null : r.id)}>
-                <StatusIcon status={r.status === "running" ? "running" : r.status} />
-                <span className="min-w-0 flex-1 truncate">
-                  {new Date(r.started_at).toLocaleString()}
-                  <span className="text-muted"> · {r.trigger === "schedule" ? "scheduled" : r.trigger === "ai" ? "by AI" : r.trigger === "resume" ? "resumed" : "manual"}</span>
+          {r.nodes.map((n) => (
+            <li key={n.node_id}>
+              <div className="flex items-start gap-1.5">
+                <span className="mt-0.5">
+                  <StatusIcon status={n.status} />
                 </span>
-                <span className="shrink-0 text-[11px] text-muted">{r.finished_at ? formatDuration(r.finished_at - r.started_at) : "running"}</span>
-              </button>
-              {(open === r.id || (open === null && r === shown[0] && (r.status === "error" || r.status === "running"))) && (
-                <div className="space-y-1.5 border-t border-line px-2 py-1.5">
-                  <ul className="space-y-0.5">
-                    {r.nodes.map((n) => (
-                      <li key={n.node_id} className="space-y-0.5">
-                        <div className="flex items-start gap-1.5">
-                          <StatusIcon status={n.status} />
-                          <button className="shrink-0 font-mono hover:underline" onClick={() => onSelect(n.node_id)}>
-                            {n.name}
-                          </button>
-                          <span className={`min-w-0 break-words text-[11px] ${n.status === "error" ? "text-danger" : "text-muted"}`}>{statusText(n)}</span>
-                        </div>
-                        {n.status === "running" && n.progress && (
-                          <div className="pl-5">
-                            <ProgressBar p={n.progress} />
-                          </div>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                  <div className={label}>Log</div>
-                  <RunLog job={job} run={r} onSelect={onSelect} />
+                <button className="shrink-0 font-mono hover:underline" onClick={() => onSelect(n.node_id)} title="Select this step">
+                  {n.name}
+                </button>
+                <span className={`min-w-0 flex-1 truncate text-[11px] ${n.status === "error" ? "text-danger" : "text-muted"}`} title={statusText(n)}>
+                  {statusText(n)}
+                </span>
+              </div>
+              {n.status === "running" && n.progress && (
+                <div className="pl-5">
+                  <ProgressBar p={n.progress} />
                 </div>
               )}
             </li>
           ))}
         </ul>
-      </section>
+      )}
+      <RunLog job={job} run={r} onSelect={onSelect} />
     </div>
   );
 }
