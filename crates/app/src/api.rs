@@ -2276,7 +2276,9 @@ mod tests {
         let t = std::time::Instant::now();
         let e = test_connection(&st, ConnectionConfig { port: Some(closed), ..cfg }, Some("p".into()), None, None, None).await.unwrap_err();
         assert!(e.message.contains("refused"), "{}", e.message);
-        assert!(t.elapsed() < Duration::from_secs(2));
+        // Well before the 60 s timeout. Windows retries a refused connect
+        // (about 2 s in all), other systems fail at once.
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     }
 
     /// Live Postgres (DATABRAIN_PG_*): a good Test connects, a wrong password
