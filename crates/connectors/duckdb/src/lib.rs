@@ -816,11 +816,19 @@ impl Session for DuckSession {
         let (outputs, loaded) = (self.outputs.clone(), self.loaded.clone());
         let done = tokio_util::sync::CancellationToken::new();
         let done_guard = done.clone();
+        // duckdb-rs disconnects *before* clearing the interrupt handle's
+        // pointer, so an `interrupt()` racing a drop of the last Connection
+        // is a use-after-free. Holding a clone of `conn` keeps the connection
+        // alive until this task ends; `biased` checks `done` first so a query
+        // that already finished is never interrupted.
+        let keepalive = conn.clone();
         tokio::spawn(async move {
             tokio::select! {
-                _ = cancel.cancelled() => interrupt.interrupt(),
+                biased;
                 _ = done.cancelled() => {}
+                _ = cancel.cancelled() => interrupt.interrupt(),
             }
+            drop(keepalive);
         });
         tokio::task::spawn_blocking(move || {
             let _done = done_guard.drop_guard();
