@@ -347,6 +347,9 @@ struct JobHandle {
     cancel: CancellationToken,
 }
 
+/// Gets one run's outcome events (see [`QueryEngine::run_and_wait`]).
+type Waiter = tokio::sync::mpsc::UnboundedSender<JobEvent>;
+
 type SessionKey = (String, String); // (connection_id, tab_id)
 
 const META_TAB: &str = "__meta__";
@@ -1140,6 +1143,13 @@ impl QueryEngine {
     }
 
     pub fn run(self: &Arc<Self>, req: RunRequest) -> Result<RunResponse> {
+        self.start_run(req, None)
+    }
+
+    /// [`Self::run`]; `waiter` also gets this run's outcome events
+    /// (statement finished/failed, job finished), so a caller waiting for it
+    /// can't miss them the way a lagging broadcast subscriber can.
+    fn start_run(self: &Arc<Self>, req: RunRequest, waiter: Option<Waiter>) -> Result<RunResponse> {
         let profile = self.workspace.get_connection(&req.connection_id)?;
         let mut plan = self.plan(&profile, &req.sql);
         if plan.is_empty() {
@@ -1196,7 +1206,7 @@ impl QueryEngine {
         let jid = job_id.clone();
         let statements = plan.clone();
         tokio::spawn(async move {
-            engine.run_job(jid, req, statements, cancel).await;
+            engine.run_job(jid, req, statements, cancel, waiter).await;
         });
         Ok(RunResponse::Started {
             job_id,
@@ -1204,17 +1214,22 @@ impl QueryEngine {
         })
     }
 
-    /// Run and wait for completion (for the AI agent / MCP). Requires an
-    /// [`EventHub`]; `confirmed` skips the interactive safety prompt because
-    /// the caller has already enforced its own policy.
+    /// Run and wait for completion (for the AI agent / MCP and job steps);
+    /// `confirmed` skips the interactive safety prompt because the caller
+    /// has already enforced its own policy.
+    ///
+    /// The outcome comes on a channel of its own, not from the [`EventHub`]
+    /// broadcast: a subscriber that lags behind there loses events, and a
+    /// lost `JobFinished` left the caller (a job step, with every step
+    /// downstream of it) waiting forever after the query had ended.
     pub async fn run_and_wait(
         self: &Arc<Self>,
-        hub: &EventHub,
+        _hub: &EventHub,
         req: RunRequest,
         cancel: Option<CancellationToken>,
     ) -> Result<Vec<StatementOutcomeView>> {
-        let mut rx = hub.subscribe();
-        let statements = match self.run(req)? {
+        let (waiter, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let statements = match self.start_run(req, Some(waiter))? {
             RunResponse::Started { job_id, statements } => (job_id, statements),
             RunResponse::NeedsConfirmation { reasons, .. } => {
                 return Err(EngineError::new("invalid", reasons.join(" ")));
@@ -1238,10 +1253,9 @@ impl QueryEngine {
                     continue;
                 }
             };
-            let ev = match ev {
-                Ok(e) => e,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => return Err(EngineError::new("internal", "event channel closed")),
+            let Some(ev) = ev else {
+                // The run's task ended without saying so (it panicked).
+                return Err(EngineError::new("internal", "the query stopped unexpectedly"));
             };
             if ev.job_id() != job_id {
                 continue;
@@ -1435,7 +1449,15 @@ impl QueryEngine {
         req: RunRequest,
         plan: Vec<PlannedStatement>,
         cancel: CancellationToken,
+        waiter: Option<Waiter>,
     ) {
+        // Outcome events go to the waiter too (see `start_run`).
+        let emit = |ev: JobEvent| {
+            if let Some(w) = &waiter {
+                let _ = w.send(ev.clone());
+            }
+            self.events.emit(ev);
+        };
         let job_start = Instant::now();
         let mut status = RunStatus::Success;
         let limit = req.row_limit.filter(|l| *l > 0);
@@ -1510,7 +1532,7 @@ impl QueryEngine {
 
             match outcome {
                 Ok(o) => {
-                    self.events.emit(JobEvent::StatementFinished {
+                    emit(JobEvent::StatementFinished {
                         job_id: job_id.clone(),
                         tab_id: req.tab_id.clone(),
                         index: stmt.index,
@@ -1531,7 +1553,7 @@ impl QueryEngine {
                     if matches!(e.kind.as_str(), "connection") {
                         self.drop_session(&req.connection_id, req.session_key());
                     }
-                    self.events.emit(JobEvent::StatementFailed {
+                    emit(JobEvent::StatementFailed {
                         job_id: job_id.clone(),
                         tab_id: req.tab_id.clone(),
                         index: stmt.index,
@@ -1550,7 +1572,7 @@ impl QueryEngine {
         self.jobs.lock().remove(&job_id);
         self.outputs_changed();
         let in_transaction = self.in_transaction(&req.connection_id, req.session_key());
-        self.events.emit(JobEvent::JobFinished {
+        emit(JobEvent::JobFinished {
             job_id,
             tab_id: req.tab_id,
             status,

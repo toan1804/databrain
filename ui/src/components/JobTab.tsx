@@ -22,6 +22,7 @@ import {
   Play,
   PlayCircle,
   Plus,
+  RotateCcw,
   Square,
   Trash2,
   XCircle,
@@ -81,6 +82,9 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
   const taken = useTakenNames(jobId);
   // Running per the run's own events too (the job list can lag behind).
   const running = useJobs((s) => !!s.running[jobId] || s.runs[jobId]?.status === "running");
+  // The last run, also one from before this session (for "Resume").
+  const savedRun = useJobs((s) => s.jobs.find((j) => j.id === jobId)?.last_run ?? undefined);
+  const jobSavedAt = useJobs((s) => s.jobs.find((j) => j.id === jobId)?.updated_at ?? 0);
   const [job, setJob] = useState<Job | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [save, setSave] = useState<{ state: "saved" | "pending" | "saving" | "error"; message?: string }>({ state: "saved" });
@@ -180,6 +184,10 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
   const start = async (nodes?: string[]) => {
     if (!(await persist())) return toast("Fix the job first: " + (save.message ?? "it could not be saved"), "error");
     await useJobs.getState().run(jobId, nodes);
+  };
+  const resume = async () => {
+    if (!(await persist())) return toast("Fix the job first: " + (save.message ?? "it could not be saved"), "error");
+    await useJobs.getState().resume(jobId);
   };
 
   // ---------------------------------------------------------------- canvas
@@ -373,6 +381,14 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
   }
 
   const byId = new Map(job.nodes.map((n) => [n.id, n]));
+  // A run that failed or was stopped can be resumed: the steps that did not
+  // succeed run again, the others keep their outputs. Suggested first once
+  // the job or a connection it uses changed since (the user fixed something).
+  const lastRun = run && savedRun ? (run.id >= savedRun.id ? run : savedRun) : (run ?? savedRun);
+  const canResume = !running && !!lastRun && (lastRun.status === "error" || lastRun.status === "cancelled") && job.nodes.some((n) => n.last_run?.status !== "success");
+  const failedAt = lastRun?.finished_at ?? lastRun?.started_at ?? 0;
+  const usedConns = new Set(job.nodes.flatMap((n) => [n.connection_id, n.target_connection_id]).filter(Boolean));
+  const fixedSince = canResume && (jobSavedAt > failedAt || connections.some((c) => usedConns.has(c.id) && c.updated_at > failedAt));
   const edgePath = (a: JobNode, b: JobNode) => {
     const x1 = a.x + NODE_W / 2;
     const y1 = a.y + NODE_H;
@@ -407,9 +423,20 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
               <Square size={12} /> Stop
             </button>
           ) : (
-            <button className="btn-primary py-1" onClick={() => void start()} disabled={!job.nodes.length}>
-              <Play size={13} /> Run job
-            </button>
+            <>
+              {canResume && (
+                <button
+                  className={`${fixedSince ? "btn-primary" : "btn-ghost"} py-1`}
+                  onClick={() => void resume()}
+                  title="Run again the steps that failed, were skipped or stopped, and the steps after them. Steps that succeeded keep their outputs."
+                >
+                  <RotateCcw size={13} /> Resume
+                </button>
+              )}
+              <button className={`${fixedSince ? "btn-ghost" : "btn-primary"} py-1`} onClick={() => void start()} disabled={!job.nodes.length}>
+                <Play size={13} /> Run job
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -1894,7 +1921,7 @@ function JobPanel({ job, run, onChange, onSelect }: { job: Job; run?: JobRun; on
                 <StatusIcon status={r.status === "running" ? "running" : r.status} />
                 <span className="min-w-0 flex-1 truncate">
                   {new Date(r.started_at).toLocaleString()}
-                  <span className="text-muted"> · {r.trigger === "schedule" ? "scheduled" : r.trigger === "ai" ? "by AI" : "manual"}</span>
+                  <span className="text-muted"> · {r.trigger === "schedule" ? "scheduled" : r.trigger === "ai" ? "by AI" : r.trigger === "resume" ? "resumed" : "manual"}</span>
                 </span>
                 <span className="shrink-0 text-[11px] text-muted">{r.finished_at ? formatDuration(r.finished_at - r.started_at) : "running"}</span>
               </button>

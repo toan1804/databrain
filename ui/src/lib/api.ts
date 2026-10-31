@@ -287,6 +287,8 @@ export const api = {
   deleteJob: (id: string) => call<void>("delete_job", { id }),
   /** `nodes`: run only these steps (their upstream outputs must exist). */
   runJob: (id: string, nodes?: string[]) => call<JobRun>("run_job", { id, nodes: nodes ?? null }),
+  /** Run again the steps that did not succeed last time, and what follows them. */
+  resumeJob: (id: string) => call<JobRun>("resume_job", { id }),
   cancelJob: (id: string) => call<boolean>("cancel_job", { id }),
   cancelJobStep: (id: string, nodeId: string) => call<boolean>("cancel_job_step", { id, nodeId }),
   /** Check a load step of `job` (as edited) without keeping any change. */

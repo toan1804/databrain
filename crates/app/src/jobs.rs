@@ -243,6 +243,59 @@ impl LoadObserver for Tracer {
     }
 }
 
+/// Steps a resume of `job` runs: those whose last outcome was not a
+/// success (failed, skipped, stopped, never run) and everything downstream
+/// of them, plus any upstream step whose output is no longer available (the
+/// app restarted or freed it), so the resumed steps have what they read.
+/// Empty when every step succeeded.
+pub fn resume_steps(ctx: &JobCtx, job: &Job) -> Vec<String> {
+    let ok = |n: &JobNode| n.last_run.as_ref().is_some_and(|r| r.status == "success");
+    let has_output = |n: &JobNode| {
+        let tab = node_tab(&job.id, &n.id);
+        ctx.engine.outputs().resolve(&n.name).is_some_and(|o| o.tab_id == tab && o.state != databrain_query_engine::OutputState::Evicted)
+    };
+    let mut todo: HashSet<String> = job.nodes.iter().filter(|n| !ok(n)).map(|n| n.id.clone()).collect();
+    if todo.is_empty() {
+        return vec![];
+    }
+    // Downstream of a step that runs again: its input changes.
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for e in &job.edges {
+            if todo.contains(&e.from) && todo.insert(e.to.clone()) {
+                grew = true;
+            }
+        }
+    }
+    // Upstream outputs a resumed step reads, when they are gone.
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for e in &job.edges {
+            if todo.contains(&e.to) && !todo.contains(&e.from) && job.nodes.iter().find(|n| n.id == e.from).is_some_and(|n| !has_output(n)) {
+                todo.insert(e.from.clone());
+                grew = true;
+            }
+        }
+    }
+    job.nodes.iter().filter(|n| todo.contains(&n.id)).map(|n| n.id.clone()).collect()
+}
+
+/// Run again the steps of `job_id` that did not succeed (see [`resume_steps`]),
+/// e.g. after the user fixed what made them fail.
+pub fn resume(ctx: &JobCtx, job_id: &str) -> Result<JobRun> {
+    let job = ctx.workspace.get_job(job_id)?;
+    if ctx.workspace.job_runs(job_id, 1)?.is_empty() {
+        return Err(EngineError::new("invalid", "Nothing to resume: the job has not run yet"));
+    }
+    let steps = resume_steps(ctx, &job);
+    if steps.is_empty() {
+        return Err(EngineError::new("invalid", "Nothing to resume: every step succeeded last time"));
+    }
+    start(ctx, job_id, "resume", Some(steps))
+}
+
 /// Start a run in the background. `only`: run just these steps (their
 /// upstream outputs must already exist); `None` runs the whole job.
 pub fn start(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>>) -> Result<JobRun> {
@@ -345,6 +398,7 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
         "ai" => "by the AI assistant (approved)",
         "background" => "on its schedule, by the background runner (DataBrain closed)",
         "cli" => "from the command line (databrain-jobs)",
+        "resume" => "by hand, resuming the steps that did not succeed",
         _ => "by hand",
     };
     tracer.log(

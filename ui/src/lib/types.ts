@@ -1208,7 +1208,7 @@ export interface NodeRunRecord extends NodeRunSummary {
 export interface JobRun {
   id: number;
   job_id: string;
-  trigger: "manual" | "schedule" | "ai";
+  trigger: "manual" | "schedule" | "ai" | "resume" | "background" | "cli";
   started_at: number;
   finished_at?: number | null;
   status: "running" | "success" | "error" | "cancelled";

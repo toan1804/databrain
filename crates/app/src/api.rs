@@ -1573,6 +1573,11 @@ pub fn run_job(state: &AppState, id: &str, nodes: Option<Vec<String>>) -> Result
     crate::jobs::start(&state.job_ctx(), id, "manual", nodes)
 }
 
+/// Run again the steps that did not succeed last time (and what follows them).
+pub fn resume_job(state: &AppState, id: &str) -> Result<databrain_workspace::JobRun> {
+    crate::jobs::resume(&state.job_ctx(), id)
+}
+
 pub fn cancel_job(state: &AppState, id: &str) -> bool {
     state.jobs.cancel(id)
 }

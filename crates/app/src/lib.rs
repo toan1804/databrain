@@ -169,6 +169,11 @@ async fn run_job(state: State<'_, AppState>, id: String, nodes: Option<Vec<Strin
 }
 
 #[tauri::command]
+async fn resume_job(state: State<'_, AppState>, id: String) -> R<databrain_workspace::JobRun> {
+    api::resume_job(&state, &id)
+}
+
+#[tauri::command]
 async fn cancel_job(state: State<'_, AppState>, id: String) -> R<bool> {
     Ok(api::cancel_job(&state, &id))
 }
@@ -1230,6 +1235,7 @@ pub fn run() {
             save_job,
             delete_job,
             run_job,
+            resume_job,
             cancel_job,
             cancel_job_step,
             dry_run_job_step,

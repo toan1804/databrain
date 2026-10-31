@@ -40,6 +40,8 @@ interface JobsState {
   createFromNotebook: (nb: { name: string; connection_id?: string | null; cells: (CellSource & { kind: string })[] }) => Promise<void>;
   remove: (j: { id: string; name: string }) => void;
   run: (id: string, nodes?: string[]) => Promise<void>;
+  /** Run again the steps that did not succeed last time (after a fix). */
+  resume: (id: string) => Promise<void>;
   cancel: (id: string) => Promise<void>;
   /** Stop one running step (the others go on). */
   cancelStep: (id: string, nodeId: string) => Promise<void>;
@@ -70,14 +72,26 @@ export const useJobs = create<JobsState>((set, get) => ({
     const { jobs, running, elsewhere } = await api.listJobs();
     // A list read before a run started (e.g. the save right before "Run job")
     // must not hide that run: runs whose events say "running" stay running.
-    set((s) => ({
-      jobs,
-      elsewhere: Object.fromEntries((elsewhere ?? []).map((id) => [id, true])),
-      running: {
-        ...Object.fromEntries(Object.entries(s.runs).filter(([, r]) => r.status === "running").map(([id]) => [id, true])),
-        ...Object.fromEntries(running.map((id) => [id, true])),
-      },
-    }));
+    // But a run the app saved as finished (an event that never arrived) must
+    // not stay "running" here, with its steps "Waiting for upstream steps".
+    set((s) => {
+      const live = new Set([...running, ...(elsewhere ?? [])]);
+      const runs = { ...s.runs };
+      for (const j of jobs) {
+        const cur = runs[j.id];
+        const saved = j.last_run;
+        if (cur?.status === "running" && saved && saved.id >= cur.id && saved.status !== "running" && !live.has(j.id)) runs[j.id] = saved;
+      }
+      return {
+        jobs,
+        runs,
+        elsewhere: Object.fromEntries((elsewhere ?? []).map((id) => [id, true])),
+        running: {
+          ...Object.fromEntries(Object.entries(runs).filter(([, r]) => r.status === "running").map(([id]) => [id, true])),
+          ...Object.fromEntries(running.map((id) => [id, true])),
+        },
+      };
+    });
   },
   init: async () => {
     if (started || !isTauri()) return;
@@ -218,6 +232,14 @@ export const useJobs = create<JobsState>((set, get) => ({
       // once, e.g. on a connection that can't connect): keep the newer state
       // instead of putting back the "just started" run, which stayed
       // "Waiting for upstream steps" forever.
+      set((s) => (s.runs[id] && s.runs[id].id >= run.id ? {} : { runs: { ...s.runs, [id]: run }, running: { ...s.running, [id]: true } }));
+    } catch (e) {
+      useStore.getState().toast(toError(e).message, "error");
+    }
+  },
+  resume: async (id) => {
+    try {
+      const run = await api.resumeJob(id);
       set((s) => (s.runs[id] && s.runs[id].id >= run.id ? {} : { runs: { ...s.runs, [id]: run }, running: { ...s.running, [id]: true } }));
     } catch (e) {
       useStore.getState().toast(toError(e).message, "error");
