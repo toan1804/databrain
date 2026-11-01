@@ -3,7 +3,7 @@
 // Supports headings, paragraphs, lists, block quotes, fenced code, tables,
 // inline code, bold, italics and links (opened externally, http(s) only).
 
-import { Fragment, type ReactNode } from "react";
+import { Fragment, memo, useMemo, type ReactNode } from "react";
 
 export type CodeRenderer = (code: string, lang: string, key: number) => ReactNode;
 
@@ -118,7 +118,12 @@ export function renderInline(text: string, onLink?: (url: string) => void): Reac
   return out;
 }
 
-export function Markdown({
+/**
+ * Memoized: a chat re-renders on every streamed token, and only the message
+ * whose text changed should parse again. Pass a stable `code` and `onLink`
+ * (module-level or useCallback), or the memo can't skip.
+ */
+export const Markdown = memo(function Markdown({
   text,
   code,
   onLink,
@@ -129,7 +134,7 @@ export function Markdown({
   onLink?: (url: string) => void;
   className?: string;
 }) {
-  const blocks = parseBlocks(text);
+  const blocks = useMemo(() => parseBlocks(text), [text]);
   const inl = (t: string) => renderInline(t, onLink);
   return (
     <div className={`space-y-2 break-words text-[13px] leading-relaxed ${className}`}>
@@ -203,4 +208,4 @@ export function Markdown({
       })}
     </div>
   );
-}
+});

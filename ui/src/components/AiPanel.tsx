@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   AlertCircle,
@@ -42,7 +42,7 @@ import { exportFileName } from "../lib/notesImport";
 import { ImportNotesDialog } from "./ImportNotesDialog";
 import { NoteTargetInput, type TargetState } from "./NoteTargetInput";
 import { editorBridge } from "../editorBridge";
-import { Markdown } from "./Markdown";
+import { Markdown, type CodeRenderer } from "./Markdown";
 import { extractMentions, mentionToken, resultsConnection } from "../outputs";
 import { ResultGrid } from "./ResultGrid";
 import { ComboInput, ConnDot, ListPicker } from "./ui";
@@ -583,7 +583,11 @@ export function SqlBlock({ code, lang }: { code: string; lang: string }) {
   );
 }
 
-function ChatItemView({ item }: { item: ChatItem }) {
+/** SQL blocks in answers (module-level, so Markdown's memo holds). */
+const sqlCode: CodeRenderer = (c, l, k) => <SqlBlock key={k} code={c} lang={l} />;
+
+/** Memoized: a streamed token replaces only the last item, the others keep their identity. */
+const ChatItemView = memo(function ChatItemView({ item }: { item: ChatItem }) {
   const respondApproval = useAi((s) => s.respondApproval);
   const respondEdit = useAi((s) => s.respondEdit);
   switch (item.kind) {
@@ -604,7 +608,7 @@ function ChatItemView({ item }: { item: ChatItem }) {
     case "assistant":
       return (
         <div className="select-text">
-          <Markdown text={item.text} code={(c, l, k) => <SqlBlock key={k} code={c} lang={l} />} />
+          <Markdown text={item.text} code={sqlCode} />
           {item.streaming && <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-accent align-middle" />}
         </div>
       );
@@ -643,7 +647,7 @@ function ChatItemView({ item }: { item: ChatItem }) {
     case "edit":
       return <EditCard item={item} onRespond={respondEdit} />;
   }
-}
+});
 
 const TOOL_LABELS: Record<string, string> = {
   search_schema: "Searched schema",
