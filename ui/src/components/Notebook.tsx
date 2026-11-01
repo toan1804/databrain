@@ -1,35 +1,13 @@
 // Notebook tab: ordered SQL / Markdown cells bound to a connection.
-import { useEvent } from "../lib/hooks";
 //
 // Every SQL cell runs under its own run key (`nb:{notebook}:{cell}`) so it
 // keeps its own results, while all cells share one database session
 // (`nb:{notebook}`), so temp tables and session settings carry across cells.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  closeBrackets,
-  closeBracketsKeymap,
-  completionKeymap,
-} from "@codemirror/autocomplete";
-import {
-  defaultKeymap,
-  history,
-  historyKeymap,
-  indentWithTab,
-} from "@codemirror/commands";
-import {
-  bracketMatching,
-  indentOnInput,
-  syntaxHighlighting,
-} from "@codemirror/language";
-import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
+import { useEvent } from "../lib/hooks";
 import { Compartment, EditorState } from "@codemirror/state";
-import {
-  EditorView,
-  drawSelection,
-  keymap,
-  placeholder,
-} from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
 import {
   AlertCircle,
   ArrowDown,
@@ -61,15 +39,11 @@ import { useStore } from "../store";
 import { useJobs } from "../jobsStore";
 import { registerKeyConnection, useAi } from "../aiStore";
 import { editorBridge } from "../editorBridge";
-import { editorContextMenu, errorField, highlight, langExtension, setError } from "./SqlEditor";
-import { SqlContextMenu, formatKey } from "./SqlContextMenu";
+import { setError, sqlEditorExtensions, useDialect, useParamSpans } from "./sqlEditorSetup";
+import { SqlContextMenu } from "./SqlContextMenu";
 import { ParamBar } from "./ParamBar";
 import { openLineage } from "./LineageTab";
-import { paramField, paramNames, setParamSpans, textualNames } from "./paramsExt";
-import { canFetchMetadata, sqlAssist } from "./sqlAssist";
-import { ghostCompletion } from "./ghostExt";
-import { sqlFolding } from "./sqlFold";
-import { queryHints } from "./queryHintsExt";
+import { paramNames, textualNames } from "./paramsExt";
 import { ResizeHandle } from "./ResizeHandle";
 import {
   EDITOR_MAX,
@@ -974,7 +948,6 @@ export function CellEditor({
   const connRef = useRef(connectionId);
   connRef.current = connectionId;
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
-  const kindNow = () => useStore.getState().connections.find((c) => c.id === connRef.current)?.config.kind;
 
   useEffect(() => {
     if (!host.current) return;
@@ -983,63 +956,21 @@ export function CellEditor({
       state: EditorState.create({
         doc: source,
         extensions: [
-          sqlFolding(),
-          history(),
-          drawSelection(),
-          indentOnInput(),
-          bracketMatching(),
-          closeBrackets(),
-          sqlAssist(() => connRef.current),
-          ghostCompletion(() => connRef.current),
-          queryHints(() => editorKey),
-          highlightSelectionMatches(),
-          syntaxHighlighting(highlight),
-          placeholder(kbd("SQL…  ⌘↵ run · ⇧↵ run & next · ⌘I ask AI")),
-          errorField,
-          paramField,
-          lang.current.of(langExtension(undefined)),
-          keymap.of([
-            {
-              key: "Mod-Enter",
-              run: () => (cb.current.onRun(), true),
-              preventDefault: true,
-            },
-            {
-              key: "Shift-Enter",
-              run: () => (cb.current.onRunAdvance(), true),
-              preventDefault: true,
-            },
-            {
-              key: "Mod-i",
-              run: () => {
-                window.dispatchEvent(
-                  new CustomEvent("db:inline-ai", {
-                    detail: { key: editorKey },
-                  }),
-                );
-                return true;
-              },
-              preventDefault: true,
-            },
-            formatKey(() => view.current, kindNow),
-            ...closeBracketsKeymap,
-            ...defaultKeymap,
-            ...searchKeymap,
-            ...historyKeymap,
-            ...completionKeymap,
-            indentWithTab,
-          ]),
-          editorContextMenu(setMenu),
-          EditorView.updateListener.of((u) => {
-            if (u.docChanged) cb.current.onChange(u.state.doc.toString());
+          sqlEditorExtensions({
+            editorKey,
+            connectionId: () => connRef.current,
+            view: () => view.current,
+            lang: lang.current,
+            placeholder: kbd("SQL…  ⌘↵ run · ⇧↵ run & next · ⌘I ask AI"),
+            ariaLabel: "SQL cell",
+            keys: [
+              { key: "Mod-Enter", run: () => (cb.current.onRun(), true), preventDefault: true },
+              { key: "Shift-Enter", run: () => (cb.current.onRunAdvance(), true), preventDefault: true },
+            ],
+            onMenu: setMenu,
+            onDocChange: (text) => cb.current.onChange(text),
+            onFocus: () => cb.current.onFocus(),
           }),
-          EditorView.domEventHandlers({
-            focus: () => {
-              editorBridge.setFocused(editorKey);
-              cb.current.onFocus();
-            },
-          }),
-          EditorView.contentAttributes.of({ "aria-label": "SQL cell" }),
           EditorView.theme({
             "&": { minHeight: "38px" },
             ".cm-scroller": { fontSize: "calc(var(--editor-font-size, 13.5px) - 0.5px)" },
@@ -1058,33 +989,10 @@ export function CellEditor({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- created once per editorKey
   }, [editorKey]);
 
-  useEffect(() => {
-    view.current?.dispatch({
-      effects: lang.current.reconfigure(langExtension(conn?.config.kind)),
-    });
-    if (conn && canFetchMetadata(conn))
-      useStore
-        .getState()
-        .loadSchemas(conn.id)
-        .catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `conn` is a new object on every connections refresh
-  }, [conn?.config.kind, conn?.id]);
+  useDialect(view, lang.current, conn);
 
   // Highlight `:name` parameters (values are set in the notebook's parameter bar).
-  useEffect(() => {
-    if (!isTauri()) return;
-    const kind = conn?.config.kind ?? "postgres";
-    const t = setTimeout(() => {
-      const found = source.includes(":") || source.includes("&") ? api.sqlParameters(kind, source) : Promise.resolve([]);
-      found
-        .then((spans) => {
-          const v = view.current;
-          if (v && v.state.doc.toString() === source) v.dispatch({ effects: setParamSpans.of(spans) });
-        })
-        .catch(() => {});
-    }, 200);
-    return () => clearTimeout(t);
-  }, [source, conn?.config.kind]);
+  useParamSpans(view, source, conn?.config.kind);
 
   // External changes (AI edits applied through the bridge already go through the view).
   useEffect(() => {

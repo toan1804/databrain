@@ -10,7 +10,7 @@ import { api, toError } from "../lib/api";
 import { tablePath } from "../lib/catalog";
 import { formatSql } from "../lib/formatSql";
 import { useStore, type DdlRef } from "../store";
-import { highlight, langExtension } from "./SqlEditor";
+import { highlight, langExtension } from "./sqlEditorSetup";
 import { sqlFolding } from "./sqlFold";
 import { copyText } from "./CatalogMenus";
 import { ConnDot } from "./ui";
