@@ -9,7 +9,7 @@ import { api, onLoadProgress, toError } from "../lib/api";
 import type { LoadDryRun, LoadMode, LoadReport, ResultInfo } from "../lib/types";
 import { formatCount, uid } from "../lib/util";
 import { useStore } from "../store";
-import { DryRunReport, LOAD_MODES, LoadTargetCheck, loadTargetBlocked, useLoadTarget } from "./JobTab";
+import { DryRunReport, LOAD_MODES, LoadTargetCheck, loadTargetBlocked, useLoadTarget } from "./job/LoadFields";
 import { Modal } from "./ui";
 
 /** A table name to suggest: the output's name, else the table the SQL reads. */
