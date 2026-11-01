@@ -240,9 +240,19 @@ impl Workspace {
         decision: &str,
         summary: Option<&str>,
     ) -> Result<()> {
+        // Passwords and keys in SQL the assistant ran or proposed are not kept.
+        fn redact(v: &serde_json::Value) -> serde_json::Value {
+            match v {
+                serde_json::Value::String(s) => serde_json::Value::String(databrain_connector_core::sql::redact_secrets(s)),
+                serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(redact).collect()),
+                serde_json::Value::Object(o) => serde_json::Value::Object(o.iter().map(|(k, v)| (k.clone(), redact(v))).collect()),
+                other => other.clone(),
+            }
+        }
+        let summary = summary.map(databrain_connector_core::sql::redact_secrets);
         self.conn.lock().execute(
             "INSERT INTO ai_audit (session_id, connection_id, tool, args_json, decision, summary, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![session_id, connection_id, tool, serde_json::to_string(args)?, decision, summary, now_ms()],
+            params![session_id, connection_id, tool, serde_json::to_string(&redact(args))?, decision, summary, now_ms()],
         )?;
         Ok(())
     }

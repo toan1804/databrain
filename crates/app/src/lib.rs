@@ -1092,6 +1092,7 @@ pub fn run() {
             let store = Arc::new(SwitchableStore::new(api::saved_store_kind(&workspace), &dir));
             let state = AppState::new(workspace, store.clone(), sink, ui);
             state.set_credential_store(store, dir.clone());
+            state.move_uri_passwords();
             state.set_snapshot_dir(dir.join("outputs"));
             api::apply_oracle_client_setting(&state);
             api::setup_oracle_agent(&state, &dir);

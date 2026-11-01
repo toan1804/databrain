@@ -1159,3 +1159,164 @@ mod param_tests {
         assert_eq!(substitute_parameters("select 1", K::Postgres, &HashMap::new()).unwrap(), "select 1");
     }
 }
+
+// ------------------------------------------------------------------ redaction
+
+/// Words followed by a secret (optionally after `=` or `(`): `PASSWORD 'x'`,
+/// `PASSWORD = 'x'`, `PASSWORD('x')`, `SECRET 'x'`, `AWS_SECRET_KEY = 'x'`…
+const SECRET_WORDS: &[&str] = &[
+    "password", "secret", "secret_key", "aws_secret_key", "aws_secret_access_key", "aws_token", "session_token",
+    "account_key", "azure_sas_token", "sas_token", "master_key", "client_secret", "access_token", "refresh_token",
+    "private_key", "private_key_passphrase", "connection_string", "token",
+];
+
+/// `sql` with passwords and keys replaced by `***`, for what DataBrain keeps
+/// (query history, job run logs, the AI audit log):
+/// `CREATE USER u IDENTIFIED BY pw`, `IDENTIFIED WITH plugin BY 'pw'`,
+/// `ALTER ROLE r PASSWORD 'pw'`, `WITH PASSWORD = 'pw'`, `SET PASSWORD =
+/// PASSWORD('pw')`, `CREATE SECRET (… SECRET 'k')`, `CREDENTIALS = (AWS_SECRET_KEY = 'k')`.
+/// Only string literals (and the bare word after `IDENTIFIED BY`) change.
+pub fn redact_secrets(sql: &str) -> String {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let word_at = |i: usize| -> Option<(usize, usize)> {
+        if i >= n || !(b[i].is_ascii_alphabetic() || b[i] == b'_') || (i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) {
+            return None;
+        }
+        let mut j = i;
+        while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            j += 1;
+        }
+        Some((i, j))
+    };
+    let skip_ws = |mut i: usize| {
+        while i < n && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    // End of the quoted literal starting at `i` (doubled quotes escape).
+    let literal_end = |i: usize| -> usize {
+        let q = b[i];
+        let mut j = i + 1;
+        while j < n {
+            if b[j] == b'\\' && q == b'\'' && j + 1 < n {
+                j += 2;
+                continue;
+            }
+            if b[j] == q {
+                if j + 1 < n && b[j + 1] == q {
+                    j += 2;
+                    continue;
+                }
+                return j + 1;
+            }
+            j += 1;
+        }
+        n
+    };
+    let lower = |s: usize, e: usize| sql[s..e].to_ascii_lowercase();
+    // Spans (start, end, quote) to replace.
+    let mut cut: Vec<(usize, usize, Option<u8>)> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        match b[i] {
+            b'\'' | b'"' | b'`' => {
+                i = literal_end(i);
+                continue;
+            }
+            b'-' if i + 1 < n && b[i + 1] == b'-' => {
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                i = sql[i + 2..].find("*/").map(|k| i + 4 + k).unwrap_or(n);
+                continue;
+            }
+            _ => {}
+        }
+        let Some((s, e)) = word_at(i) else {
+            i += 1;
+            continue;
+        };
+        let w = lower(s, e);
+        let mut value_at = None;
+        let mut bare_ok = false;
+        if w == "identified" {
+            // IDENTIFIED BY x | IDENTIFIED WITH plugin (BY|AS) x
+            let mut j = skip_ws(e);
+            if let Some((s2, e2)) = word_at(j) {
+                match lower(s2, e2).as_str() {
+                    "by" => {
+                        value_at = Some(skip_ws(e2));
+                        bare_ok = true;
+                    }
+                    "with" => {
+                        j = skip_ws(e2);
+                        if let Some((_, e3)) = word_at(j).or_else(|| (j < n && matches!(b[j], b'\'' | b'"' | b'`')).then(|| (j, literal_end(j)))) {
+                            j = skip_ws(e3);
+                            if let Some((s4, e4)) = word_at(j) {
+                                if matches!(lower(s4, e4).as_str(), "by" | "as") {
+                                    value_at = Some(skip_ws(e4));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else if SECRET_WORDS.contains(&w.as_str()) {
+            let mut j = skip_ws(e);
+            if j < n && b[j] == b'=' {
+                j = skip_ws(j + 1);
+            }
+            // SET PASSWORD = PASSWORD('x')
+            if let Some((s2, e2)) = word_at(j).filter(|(s2, e2)| lower(*s2, *e2) == "password") {
+                let _ = s2;
+                j = skip_ws(e2);
+            }
+            if j < n && b[j] == b'(' {
+                j = skip_ws(j + 1);
+            }
+            value_at = Some(j);
+        }
+        if let Some(v) = value_at.filter(|v| *v < n) {
+            if matches!(b[v], b'\'' | b'"') {
+                let end = literal_end(v);
+                cut.push((v, end, Some(b[v])));
+                i = end;
+                continue;
+            }
+            if bare_ok {
+                if let Some((s2, e2)) = word_at(v) {
+                    cut.push((s2, e2, None));
+                    i = e2;
+                    continue;
+                }
+            }
+        }
+        i = e;
+    }
+    if cut.is_empty() {
+        return sql.to_string();
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0;
+    for (s, e, q) in cut {
+        out.push_str(&sql[last..s]);
+        match q {
+            Some(q) => {
+                out.push(q as char);
+                out.push_str("***");
+                out.push(q as char);
+            }
+            None => out.push_str("***"),
+        }
+        last = e;
+    }
+    out.push_str(&sql[last..]);
+    out
+}
+

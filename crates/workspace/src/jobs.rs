@@ -144,6 +144,9 @@ pub const LOG_SQL_CHARS: usize = 8000;
 
 /// `sql` cut to [`LOG_SQL_CHARS`].
 pub fn log_sql(sql: &str) -> String {
+    // Passwords and keys (`IDENTIFIED BY …`) are not kept.
+    let redacted = databrain_connector_core::sql::redact_secrets(sql);
+    let sql = redacted.as_str();
     if sql.len() <= LOG_SQL_CHARS {
         return sql.to_string();
     }
@@ -657,17 +660,25 @@ impl Workspace {
     }
 
     pub fn update_job_run(&self, run: &JobRun) -> Result<()> {
-        let nodes = serde_json::to_string(&run.nodes).map_err(|e| Error::Invalid(e.to_string()))?;
+        use databrain_connector_core::sql::redact_secrets;
+        // Errors can quote the statement (and the password in it).
+        let mut nodes = run.nodes.clone();
+        for n in &mut nodes {
+            n.summary.error = n.summary.error.as_deref().map(redact_secrets);
+        }
+        let nodes = serde_json::to_string(&nodes).map_err(|e| Error::Invalid(e.to_string()))?;
         self.conn.lock().execute(
             "UPDATE job_runs SET finished_at = ?2, status = ?3, nodes_json = ?4, error = ?5 WHERE id = ?1",
-            params![run.id, run.finished_at, run.status, nodes, run.error],
+            params![run.id, run.finished_at, run.status, nodes, run.error.as_deref().map(redact_secrets)],
         )?;
         Ok(())
     }
 
     /// Save the whole log of a run (replaces what was saved before).
     pub fn set_job_run_log(&self, run_id: i64, log: &[RunLogEntry]) -> Result<()> {
-        let json = serde_json::to_string(log).map_err(|e| Error::Invalid(e.to_string()))?;
+        // Statements and messages (which can quote one) without passwords and keys.
+        let log: Vec<RunLogEntry> = log.iter().map(|e| RunLogEntry { message: databrain_connector_core::sql::redact_secrets(&e.message), sql: e.sql.as_deref().map(databrain_connector_core::sql::redact_secrets), ..e.clone() }).collect();
+        let json = serde_json::to_string(&log).map_err(|e| Error::Invalid(e.to_string()))?;
         self.conn.lock().execute("UPDATE job_runs SET log_json = ?2 WHERE id = ?1", params![run_id, json])?;
         Ok(())
     }

@@ -176,6 +176,23 @@ impl AppState {
         *self.credential_store.lock() = Some((store, vault_dir));
     }
 
+    /// Move passwords saved in MongoDB/Neo4j connection strings (before
+    /// they went to the keychain on save) out of workspace.db. Returns how
+    /// many connections changed.
+    pub fn move_uri_passwords(&self) -> usize {
+        let mut n = 0;
+        for p in self.workspace.list_connections().unwrap_or_default() {
+            if crate::conn_io::take_uri_password(&mut p.config.clone()).is_none() {
+                continue;
+            }
+            let args = SaveConnectionArgs { profile: p, secret: None, clear_secret: false, extra_secrets: Default::default() };
+            if store_connection(self, args).is_ok() {
+                n += 1;
+            }
+        }
+        n
+    }
+
     fn results(&self) -> &Arc<ResultStore> {
         self.engine.results()
     }
@@ -274,7 +291,16 @@ pub fn save_connection(state: &AppState, args: SaveConnectionArgs) -> Result<Con
 
 /// [`save_connection`] without checking the settings are complete (imports:
 /// a connection missing its user is saved, to be finished in its form).
-pub(crate) fn store_connection(state: &AppState, args: SaveConnectionArgs) -> Result<ConnectionProfile> {
+pub(crate) fn store_connection(state: &AppState, mut args: SaveConnectionArgs) -> Result<ConnectionProfile> {
+    // A password in a MongoDB/Neo4j connection string goes to the keychain,
+    // not into workspace.db (one typed in its field, or already stored, wins).
+    if let Some(pw) = crate::conn_io::take_uri_password(&mut args.profile.config) {
+        let stored = !args.profile.id.is_empty() && !args.clear_secret && state.workspace.get_connection(&args.profile.id).is_ok_and(|c| c.has_secret);
+        if args.secret.is_none() && !stored {
+            args.secret = Some(pw);
+            args.clear_secret = false;
+        }
+    }
     let mut profile = args.profile;
     if args.secret.is_some() {
         profile.has_secret = true;

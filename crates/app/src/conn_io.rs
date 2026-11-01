@@ -156,6 +156,56 @@ fn strip_url_password(v: &str) -> String {
     }
 }
 
+/// `%40` → `@` (user info in connection strings is percent-encoded).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// `scheme://user:pass@host…` → (`scheme://host…`, user, password), decoded.
+/// `None` when the string holds no password.
+pub fn split_url_credentials(v: &str) -> Option<(String, String, String)> {
+    let start = v.find("://")? + 3;
+    let rest = &v[start..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let at = rest[..end].rfind('@')?;
+    let (user, pass) = rest[..at].split_once(':')?;
+    Some((format!("{}{}", &v[..start], &rest[at + 1..]), percent_decode(user), percent_decode(pass)))
+}
+
+/// Connection-string options that may hold `user:password@` (MongoDB, Neo4j).
+pub const URI_OPTION: &str = "uri";
+
+/// Take the password out of the connection string of `c` (MongoDB, Neo4j):
+/// the user goes to the sign-in settings, the string keeps neither, and
+/// the password is returned for the keychain. `None`: nothing to move.
+pub fn take_uri_password(c: &mut ConnectionConfig) -> Option<String> {
+    use databrain_connector_core::ConnectorKind as K;
+    if !matches!(c.kind, K::Mongodb | K::Neo4j) {
+        return None;
+    }
+    let (uri, user, pass) = split_url_credentials(c.options.get(URI_OPTION)?)?;
+    c.options.insert(URI_OPTION.into(), uri);
+    let keep_user = matches!(&c.auth, AuthMethod::Password { user: u } if !u.trim().is_empty());
+    if !keep_user {
+        c.auth = AuthMethod::Password { user };
+    }
+    Some(pass)
+}
+
 pub fn shareable(mut c: ConnectionConfig) -> ConnectionConfig {
     c.options.retain(|k, _| !secret_key(k));
     for v in c.options.values_mut() {

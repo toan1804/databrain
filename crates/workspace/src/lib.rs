@@ -650,6 +650,10 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE job_runs ADD COLUMN runner TEXT;
     ALTER TABLE job_runs ADD COLUMN heartbeat_at INTEGER;
     "#,
+    // One-time data fixes that ran (by name).
+    r#"
+    CREATE TABLE maintenance (name TEXT PRIMARY KEY, done_at INTEGER NOT NULL);
+    "#,
 ];
 
 /// Maximum history rows kept; older rows are pruned on insert.
@@ -676,6 +680,9 @@ impl Workspace {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Deleted or overwritten content (old SQL, connection settings) is
+        // zeroed, not left in free pages of the file.
+        conn.pragma_update(None, "secure_delete", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         for (i, m) in MIGRATIONS.iter().enumerate().skip(version as usize) {
@@ -684,9 +691,61 @@ impl Workspace {
             tx.pragma_update(None, "user_version", (i + 1) as i64)?;
             tx.commit()?;
         }
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        let ws = Self { conn: Mutex::new(conn) };
+        // Best effort: a failure must not keep the workspace from opening.
+        let _ = ws.redact_kept_sql();
+        Ok(ws)
+    }
+
+    /// Once: remove passwords and keys from what was kept before they were
+    /// redacted on the way in (history, job runs and their logs, AI audit).
+    fn redact_kept_sql(&self) -> Result<()> {
+        const DONE: &str = "secrets_redacted_v1";
+        let done: bool = self.conn.lock().query_row("SELECT count(*) > 0 FROM maintenance WHERE name = ?1", [DONE], |r| r.get(0))?;
+        if done {
+            return Ok(());
+        }
+        use databrain_connector_core::sql::redact_secrets as r;
+        fn json(v: &serde_json::Value) -> serde_json::Value {
+            match v {
+                serde_json::Value::String(s) => serde_json::Value::String(r(s)),
+                serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(json).collect()),
+                serde_json::Value::Object(o) => serde_json::Value::Object(o.iter().map(|(k, v)| (k.clone(), json(v))).collect()),
+                other => other.clone(),
+            }
+        }
+        let text = |s: Option<String>| s.map(|s| r(&s));
+        let json_text = |s: Option<String>| s.map(|s| serde_json::from_str::<serde_json::Value>(&s).map(|v| json(&v).to_string()).unwrap_or_else(|_| r(&s)));
+        {
+            let c = self.conn.lock();
+            let tx = c.unchecked_transaction()?;
+            let rows: Vec<(i64, String, Option<String>)> = tx.prepare("SELECT id, sql, error FROM query_history")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+            for (id, sql, error) in rows {
+                let (s2, e2) = (r(&sql), text(error.clone()));
+                if s2 != sql || e2 != error {
+                    tx.execute("UPDATE query_history SET sql = ?2, error = ?3 WHERE id = ?1", params![id, s2, e2])?;
+                }
+            }
+            let rows: Vec<(i64, String, Option<String>)> = tx.prepare("SELECT id, args_json, summary FROM ai_audit")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+            for (id, args, summary) in rows {
+                let (a2, s2) = (json_text(Some(args.clone())), text(summary.clone()));
+                if a2.as_deref() != Some(args.as_str()) || s2 != summary {
+                    tx.execute("UPDATE ai_audit SET args_json = ?2, summary = ?3 WHERE id = ?1", params![id, a2, s2])?;
+                }
+            }
+            type Run = (i64, Option<String>, Option<String>, Option<String>);
+            let rows: Vec<Run> =
+                tx.prepare("SELECT id, nodes_json, error, log_json FROM job_runs")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+            for (id, nodes, error, log) in rows {
+                let (n2, e2, l2) = (json_text(nodes.clone()), text(error.clone()), json_text(log.clone()));
+                if n2 != nodes || e2 != error || l2 != log {
+                    tx.execute("UPDATE job_runs SET nodes_json = ?2, error = ?3, log_json = ?4 WHERE id = ?1", params![id, n2, e2, l2])?;
+                }
+            }
+            tx.commit()?;
+        }
+        self.conn.lock().execute("INSERT OR IGNORE INTO maintenance (name, done_at) VALUES (?1, ?2)", params![DONE, now_ms()])?;
+        Ok(())
     }
 
     // ---------------------------------------------------------------- connections
@@ -931,7 +990,10 @@ impl Workspace {
 
     // ---------------------------------------------------------------- history
 
-    pub fn add_history(&self, h: NewHistory) -> Result<i64> {
+    pub fn add_history(&self, mut h: NewHistory) -> Result<i64> {
+        // Passwords and keys in the SQL (`CREATE USER … IDENTIFIED BY …`) are not kept.
+        h.sql = databrain_connector_core::sql::redact_secrets(&h.sql);
+        h.error = h.error.map(|e| databrain_connector_core::sql::redact_secrets(&e));
         let c = self.conn.lock();
         c.execute(
             "INSERT INTO query_history (connection_id, sql, started_at, duration_ms, rows, status, error, origin, output_handle, result_id) \
