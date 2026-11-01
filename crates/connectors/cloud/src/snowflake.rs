@@ -1019,11 +1019,11 @@ mod tests {
     }
 
     /// Live: DATABRAIN_SF_ACCOUNT, _USER, _PASSWORD (optional _WAREHOUSE).
+    #[ignore = "live: needs DATABRAIN_SF_ACCOUNT (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_roundtrip() {
         let (Ok(acct), Ok(user), Ok(pw)) = (std::env::var("DATABRAIN_SF_ACCOUNT"), std::env::var("DATABRAIN_SF_USER"), std::env::var("DATABRAIN_SF_PASSWORD")) else {
-            eprintln!("skipping: DATABRAIN_SF_* not set");
-            return;
+            panic!("live test: DATABRAIN_SF_* not set (run with --ignored)");
         };
         use databrain_auth::InlineCredentialSource;
         let mut c = ConnectionConfig::new(ConnectorKind::Snowflake, AuthMethod::Password { user: user.clone() });

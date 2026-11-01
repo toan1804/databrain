@@ -387,6 +387,7 @@ mod tests {
     }
 
     /// Live test: DATABRAIN_SSH_HOST, _USER, _PASSWORD; forwards to the SSH port itself.
+    #[ignore = "live: needs DATABRAIN_SSH_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_tunnel() {
         let (Ok(host), Ok(user), Ok(pw)) = (
@@ -394,8 +395,7 @@ mod tests {
             std::env::var("DATABRAIN_SSH_USER"),
             std::env::var("DATABRAIN_SSH_PASSWORD"),
         ) else {
-            eprintln!("skipping: DATABRAIN_SSH_* not set");
-            return;
+            panic!("live test: DATABRAIN_SSH_* not set (run with --ignored)");
         };
         let t = Tunnel::open(TunnelSpec {
             ssh_host: &host,

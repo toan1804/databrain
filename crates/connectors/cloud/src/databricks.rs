@@ -1214,6 +1214,7 @@ mod tests {
     }
 
     /// Live: DATABRAIN_DBX_HOST, _HTTP_PATH, _TOKEN.
+    #[ignore = "live: needs DATABRAIN_DBX_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_roundtrip() {
         let (Ok(host), Ok(path), Ok(token)) = (
@@ -1221,8 +1222,7 @@ mod tests {
             std::env::var("DATABRAIN_DBX_HTTP_PATH"),
             std::env::var("DATABRAIN_DBX_TOKEN"),
         ) else {
-            eprintln!("skipping: DATABRAIN_DBX_* not set");
-            return;
+            panic!("live test: DATABRAIN_DBX_* not set (run with --ignored)");
         };
         use databrain_auth::InlineCredentialSource;
         let mut c = ConnectionConfig::new(ConnectorKind::Databricks, AuthMethod::ApiToken { user: None });

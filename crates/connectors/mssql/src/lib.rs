@@ -1227,11 +1227,11 @@ mod tests {
     }
 
     /// Live: DATABRAIN_MSSQL_HOST, _USER, _PASSWORD (e.g. the mcr.microsoft.com/mssql/server image).
+    #[ignore = "live: needs DATABRAIN_MSSQL_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_roundtrip() {
         let Ok(host) = std::env::var("DATABRAIN_MSSQL_HOST") else {
-            eprintln!("skipping: DATABRAIN_MSSQL_HOST not set");
-            return;
+            panic!("live test: DATABRAIN_MSSQL_HOST not set (run with --ignored)");
         };
         use databrain_auth::{AuthMethod, InlineCredentialSource};
         let user = std::env::var("DATABRAIN_MSSQL_USER").unwrap_or_else(|_| "sa".into());

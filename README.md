@@ -58,14 +58,14 @@ cargo clippy --workspace --all-targets
 cd ui && npm test && npm run build
 ```
 
-Tests that need a database server are skipped unless one is configured with `DATABRAIN_*` variables, for example:
+Tests that need a database server are marked `#[ignore]`, so `cargo test` lists them as ignored. Run them with `--ignored` and the server's `DATABRAIN_*` variables; a missing variable fails the test rather than skipping it:
 
 ```sh
 DATABRAIN_PG_HOST=localhost DATABRAIN_PG_USER=postgres DATABRAIN_PG_PASSWORD=... \
-  cargo test -p databrain-connector-postgres
+  cargo test -p databrain-connector-postgres -- --ignored
 ```
 
-The variables are `DATABRAIN_PG_*`, `DATABRAIN_MYSQL_*`, `DATABRAIN_MSSQL_*`, `DATABRAIN_ORACLE_*`, `DATABRAIN_SF_*`, `DATABRAIN_DBX_*`, `DATABRAIN_BQ_PROJECT`, `DATABRAIN_MONGO_URI`, `DATABRAIN_NEO4J_*` and `DATABRAIN_SSH_*`. A sample dataset for trying the app is in `examples/data`.
+The variables are `DATABRAIN_PG_*`, `DATABRAIN_MYSQL_*`, `DATABRAIN_MSSQL_*`, `DATABRAIN_ORACLE_*`, `DATABRAIN_SF_*`, `DATABRAIN_DBX_*`, `DATABRAIN_BQ_PROJECT`, `DATABRAIN_MONGO_URI`, `DATABRAIN_NEO4J_*` and `DATABRAIN_SSH_*`. CI runs the Postgres, MySQL and MongoDB ones against service containers. A sample dataset for trying the app is in `examples/data`.
 
 ## Project layout
 

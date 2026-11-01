@@ -430,10 +430,11 @@ mod tests {
     }
 
     /// Live test: DATABRAIN_MONGO_URI=mongodb://localhost:27017 cargo test -p databrain-connector-mongodb -- --nocapture
+    #[ignore = "live: needs DATABRAIN_MONGO_URI (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_roundtrip() {
         let Ok(uri) = std::env::var("DATABRAIN_MONGO_URI") else {
-            return eprintln!("skipping: DATABRAIN_MONGO_URI not set");
+            panic!("live test: DATABRAIN_MONGO_URI not set (run with --ignored)");
         };
         use databrain_auth::{AuthMethod, InlineCredentialSource};
         let mut cfg = ConnectionConfig::new(ConnectorKind::Mongodb, AuthMethod::None);

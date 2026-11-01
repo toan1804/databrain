@@ -1174,7 +1174,6 @@ mod tests {
         c.options.insert("connect_string".into(), "prod_tns".into());
         assert_eq!(connect_string(&c), "prod_tns");
     }
-
     #[test]
     fn maps_types() {
         assert_eq!(col_type(&OracleType::Number(10, 0)), ColType::Int64);
@@ -1212,16 +1211,18 @@ mod tests {
     }
 
     /// Live, thin driver (needs a built helper: `node scripts/build-oracle-agent.mjs --host`).
+    #[ignore = "live: needs DATABRAIN_ORACLE_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_thin_driver() {
         check_driver("thin").await;
     }
 
     /// Live, Instant Client driver: same checks (DATABRAIN_ORACLE_LIB_DIR).
+    #[ignore = "live: needs DATABRAIN_ORACLE_HOST and DATABRAIN_ORACLE_LIB_DIR (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_instant_client_driver() {
         let Ok(d) = std::env::var("DATABRAIN_ORACLE_LIB_DIR") else {
-            return eprintln!("skipping: DATABRAIN_ORACLE_LIB_DIR not set");
+            panic!("live test: DATABRAIN_ORACLE_LIB_DIR not set (run with --ignored)");
         };
         init_client(Some(&d));
         check_driver("instant_client").await;
@@ -1234,7 +1235,7 @@ mod tests {
     /// Routine completion: standalone functions/procedures, packages and
     /// their members (functions vs procedures), other owners' packages.
     async fn check_routines(driver: &str) {
-        let Some(s) = live_session(driver, false).await else { return };
+        let s = live_session(driver, false).await.expect("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
         for ddl in [
             "create or replace function db_fn_total(x number) return number is begin return x * 2; end;",
             "create or replace procedure db_proc_log(m varchar2) is begin null; end;",
@@ -1272,7 +1273,7 @@ mod tests {
     /// A catalog query whose caller stops waiting (cancelled indexing) is
     /// stopped on the server, and the session answers the next query at once.
     async fn check_abandoned_catalog_query(driver: &str) {
-        let Some(s) = live_session(driver, false).await else { return };
+        let s = live_session(driver, false).await.expect("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
         let slow = "select count(*) from all_objects a, all_objects b, all_objects c".to_string();
         let r = tokio::time::timeout(std::time::Duration::from_secs(2), s.query_dynamic(slow)).await;
         assert!(r.is_err(), "the slow query should still be running");
@@ -1287,8 +1288,7 @@ mod tests {
         check_abandoned_catalog_query(driver).await;
         check_routines(driver).await;
         let Some(s) = live(driver).await else {
-            eprintln!("skipping: DATABRAIN_ORACLE_HOST not set");
-            return;
+            panic!("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
         };
         let run = |sql: &'static str| {
             let s = &s;
@@ -1388,6 +1388,7 @@ mod tests {
     }
 
     /// Live: DATABRAIN_ORACLE_HOST, _USER, _PASSWORD, _SERVICE (e.g. gvenzl/oracle-free).
+    #[ignore = "live: needs DATABRAIN_ORACLE_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_roundtrip() {
         // DATABRAIN_ORACLE_DRIVER=instant_client tests the thick driver (+ DATABRAIN_ORACLE_LIB_DIR).
@@ -1395,8 +1396,7 @@ mod tests {
             init_client(Some(&d));
         }
         let Some(s) = live(&std::env::var("DATABRAIN_ORACLE_DRIVER").unwrap_or_else(|_| "thin".into())).await else {
-            eprintln!("skipping: DATABRAIN_ORACLE_HOST not set");
-            return;
+            panic!("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
         };
         let r = s
             .execute("select 1 as a, 'x' as b, sysdate as c, 1.5 as d from dual;", ExecOptions::default())

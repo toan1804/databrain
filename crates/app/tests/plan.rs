@@ -71,51 +71,57 @@ async fn sqlite_and_duckdb_plans() {
     assert!(api::explain_plan(&st, &duck, "tab", "delete from t", true, &none).await.unwrap_err().message.contains("read queries"));
 }
 
-/// Live: Postgres JSON and MySQL tree plans (`DATABRAIN_PG_*`, `DATABRAIN_MYSQL_*`).
+/// A connection to the live server of `prefix` (`DATABRAIN_<prefix>_HOST`, `_USER`, `_PASSWORD`, `_PORT`, `_DB`).
+fn server(st: &AppState, kind: ConnectorKind, prefix: &str, user: &str) -> String {
+    let var = format!("DATABRAIN_{prefix}_HOST");
+    let host = std::env::var(&var).unwrap_or_else(|_| panic!("live test: {var} not set (run with --ignored)"));
+    let user = std::env::var(format!("DATABRAIN_{prefix}_USER")).unwrap_or_else(|_| user.into());
+    let mut c = ConnectionConfig::new(kind, AuthMethod::Password { user });
+    c.host = Some(host);
+    c.port = std::env::var(format!("DATABRAIN_{prefix}_PORT")).ok().and_then(|p| p.parse().ok());
+    c.database = std::env::var(format!("DATABRAIN_{prefix}_DB")).ok();
+    let profile = ConnectionProfile { id: String::new(), name: prefix.into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
+    let secret = std::env::var(format!("DATABRAIN_{prefix}_PASSWORD")).ok();
+    api::save_connection(st, api::SaveConnectionArgs { profile, secret, clear_secret: false, extra_secrets: Default::default() }).unwrap().id
+}
+
+/// Live: Postgres JSON plans and schema compare.
+#[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
 #[tokio::test(flavor = "multi_thread")]
-async fn live_server_plans() {
+async fn live_postgres_plans() {
     let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
     let none = Default::default();
-    let server = |kind: ConnectorKind, prefix: &str, user: &str| -> Option<String> {
-        let host = std::env::var(format!("DATABRAIN_{prefix}_HOST")).ok()?;
-        let user = std::env::var(format!("DATABRAIN_{prefix}_USER")).unwrap_or_else(|_| user.into());
-        let mut c = ConnectionConfig::new(kind, AuthMethod::Password { user });
-        c.host = Some(host);
-        c.port = std::env::var(format!("DATABRAIN_{prefix}_PORT")).ok().and_then(|p| p.parse().ok());
-        c.database = std::env::var(format!("DATABRAIN_{prefix}_DB")).ok();
-        let profile = ConnectionProfile { id: String::new(), name: prefix.into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
-        let secret = std::env::var(format!("DATABRAIN_{prefix}_PASSWORD")).ok();
-        Some(api::save_connection(&st, api::SaveConnectionArgs { profile, secret, clear_secret: false, extra_secrets: Default::default() }).unwrap().id)
-    };
-    if let Some(pg) = server(ConnectorKind::Postgres, "PG", "postgres") {
-        use databrain_query_engine::schema_diff::{DiffStatus, SchemaSide};
-        run(&st, &pg, "drop schema if exists cmp_a cascade; drop schema if exists cmp_b cascade; create schema cmp_a; create schema cmp_b; \
-            create table cmp_a.c (id int primary key, name text not null default 'x'); create table cmp_a.o (id int primary key, c_id int references cmp_a.c(id), amt numeric(12,2) not null); \
-            create table cmp_b.c (id int primary key, name varchar(10)); create table cmp_b.o (id int primary key, amt numeric(10,2))").await;
-        let side = |s: &str| SchemaSide { connection_id: pg.clone(), schema: s.into() };
-        let d = api::schema_diff(&st, &side("cmp_a"), &side("cmp_b")).await.unwrap();
-        run(&st, &pg, &d.script).await;
-        let again = api::schema_diff(&st, &side("cmp_a"), &side("cmp_b")).await.unwrap();
-        assert!(again.objects.iter().all(|o| o.status == DiffStatus::Same), "{}\n{:?}", d.script, again.objects);
-        run(&st, &pg, "drop schema cmp_a cascade; drop schema cmp_b cascade").await;
-        let p = api::explain_plan(&st, &pg, "tab", "select c.relname, count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace group by c.relname", true, &none).await.unwrap();
-        assert!(p.analyzed && p.execution_ms.is_some() && p.roots[0].time_ms.is_some(), "{}", p.raw);
-        assert!(all_ops(&p.roots).iter().any(|o| o.contains("Join") || o.contains("Nested Loop")), "{:?}", all_ops(&p.roots));
-    } else {
-        eprintln!("skipping Postgres: DATABRAIN_PG_HOST not set");
+    let pg = server(&st, ConnectorKind::Postgres, "PG", "postgres");
+    use databrain_query_engine::schema_diff::{DiffStatus, SchemaSide};
+    run(&st, &pg, "drop schema if exists cmp_a cascade; drop schema if exists cmp_b cascade; create schema cmp_a; create schema cmp_b; \
+        create table cmp_a.c (id int primary key, name text not null default 'x'); create table cmp_a.o (id int primary key, c_id int references cmp_a.c(id), amt numeric(12,2) not null); \
+        create table cmp_b.c (id int primary key, name varchar(10)); create table cmp_b.o (id int primary key, amt numeric(10,2))").await;
+    let side = |s: &str| SchemaSide { connection_id: pg.clone(), schema: s.into() };
+    let d = api::schema_diff(&st, &side("cmp_a"), &side("cmp_b")).await.unwrap();
+    run(&st, &pg, &d.script).await;
+    let again = api::schema_diff(&st, &side("cmp_a"), &side("cmp_b")).await.unwrap();
+    assert!(again.objects.iter().all(|o| o.status == DiffStatus::Same), "{}\n{:?}", d.script, again.objects);
+    run(&st, &pg, "drop schema cmp_a cascade; drop schema cmp_b cascade").await;
+    let p = api::explain_plan(&st, &pg, "tab", "select c.relname, count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace group by c.relname", true, &none).await.unwrap();
+    assert!(p.analyzed && p.execution_ms.is_some() && p.roots[0].time_ms.is_some(), "{}", p.raw);
+    assert!(all_ops(&p.roots).iter().any(|o| o.contains("Join") || o.contains("Nested Loop")), "{:?}", all_ops(&p.roots));
+}
+
+/// Live: MySQL tree plans.
+#[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
+#[tokio::test(flavor = "multi_thread")]
+async fn live_mysql_plans() {
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    let none = Default::default();
+    let my = server(&st, ConnectorKind::Mysql, "MYSQL", "root");
+    let sql = "select t.table_name, count(*) from information_schema.tables t join information_schema.columns c on c.table_name = t.table_name group by t.table_name";
+    let p = api::explain_plan(&st, &my, "tab", sql, false, &none).await.unwrap();
+    assert!(!p.roots.is_empty(), "{}", p.raw);
+    let a = api::explain_plan(&st, &my, "tab", sql, true, &none).await.unwrap();
+    fn any_time(n: &[PlanNode]) -> bool {
+        n.iter().any(|x| x.time_ms.is_some() || any_time(&x.children))
     }
-    if let Some(my) = server(ConnectorKind::Mysql, "MYSQL", "root") {
-        let sql = "select t.table_name, count(*) from information_schema.tables t join information_schema.columns c on c.table_name = t.table_name group by t.table_name";
-        let p = api::explain_plan(&st, &my, "tab", sql, false, &none).await.unwrap();
-        assert!(!p.roots.is_empty(), "{}", p.raw);
-        let a = api::explain_plan(&st, &my, "tab", sql, true, &none).await.unwrap();
-        fn any_time(n: &[PlanNode]) -> bool {
-            n.iter().any(|x| x.time_ms.is_some() || any_time(&x.children))
-        }
-        assert!(any_time(&a.roots), "{}", a.raw);
-    } else {
-        eprintln!("skipping MySQL: DATABRAIN_MYSQL_HOST not set");
-    }
+    assert!(any_time(&a.roots), "{}", a.raw);
 }
 
 /// Schema compare between two SQLite files; the script, run on the target, makes them equal.

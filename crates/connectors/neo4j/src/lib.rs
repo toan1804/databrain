@@ -522,10 +522,11 @@ mod tests {
     }
 
     /// Live: DATABRAIN_NEO4J_URI=neo4j://localhost:7687 DATABRAIN_NEO4J_PASSWORD=… cargo test -p databrain-connector-neo4j -- --nocapture
+    #[ignore = "live: needs DATABRAIN_NEO4J_URI (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_roundtrip() {
         let Ok(uri) = std::env::var("DATABRAIN_NEO4J_URI") else {
-            return eprintln!("skipping: DATABRAIN_NEO4J_URI not set");
+            panic!("live test: DATABRAIN_NEO4J_URI not set (run with --ignored)");
         };
         use databrain_auth::{AuthMethod, InlineCredentialSource};
         let user = std::env::var("DATABRAIN_NEO4J_USER").unwrap_or_else(|_| "neo4j".into());

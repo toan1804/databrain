@@ -2309,9 +2309,10 @@ mod tests {
 
     /// Live Postgres (DATABRAIN_PG_*): a good Test connects, a wrong password
     /// fails at once, and a host that drops packets fails within the probe time.
+    #[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_connection_live_postgres() {
-        let Ok(host) = std::env::var("DATABRAIN_PG_HOST") else { return };
+        let host = std::env::var("DATABRAIN_PG_HOST").expect("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
         let (st, _sink, _dir) = state();
         let cfg = ConnectionConfig {
             kind: ConnectorKind::Postgres,
@@ -2433,9 +2434,10 @@ mod tests {
 
     /// Live Postgres (object versions): after a change only the changed and
     /// new tables are fetched; untouched tables keep fresh columns.
+    #[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
     #[tokio::test(flavor = "multi_thread")]
     async fn explorer_incremental_live_postgres() {
-        let Ok(host) = std::env::var("DATABRAIN_PG_HOST") else { return };
+        let host = std::env::var("DATABRAIN_PG_HOST").expect("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
         let (st, _sink, _dir) = state();
         let cfg = ConnectionConfig {
             kind: ConnectorKind::Postgres,
@@ -2522,9 +2524,10 @@ mod tests {
         assert_eq!(v.graph.edges.len(), 1);
     }
 
+    #[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
     #[tokio::test(flavor = "multi_thread")]
     async fn lineage_check_live_postgres_position() {
-        let Ok(host) = std::env::var("DATABRAIN_PG_HOST") else { return };
+        let host = std::env::var("DATABRAIN_PG_HOST").expect("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
         let (st, _sink, _dir) = state();
         let cfg = ConnectionConfig {
             kind: ConnectorKind::Postgres,

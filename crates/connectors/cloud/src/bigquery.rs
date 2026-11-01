@@ -627,11 +627,11 @@ mod tests {
     }
 
     /// Live: DATABRAIN_BQ_PROJECT (uses gcloud ADC).
+    #[ignore = "live: needs DATABRAIN_BQ_PROJECT (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_roundtrip() {
         let Ok(project) = std::env::var("DATABRAIN_BQ_PROJECT") else {
-            eprintln!("skipping: DATABRAIN_BQ_PROJECT not set");
-            return;
+            panic!("live test: DATABRAIN_BQ_PROJECT not set (run with --ignored)");
         };
         use databrain_auth::{AuthMethod, MemoryStore, NonInteractive, credential_source};
         let mut c = ConnectionConfig::new(ConnectorKind::Bigquery, AuthMethod::CloudCli { profile: None });

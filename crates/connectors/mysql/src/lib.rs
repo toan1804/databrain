@@ -898,10 +898,11 @@ mod tests {
     }
 
     /// Live: explorer fingerprints include routines; per-object versions.
+    #[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_explorer_versions() {
         let Ok(host) = std::env::var("DATABRAIN_MYSQL_HOST") else {
-            return eprintln!("skipping: DATABRAIN_MYSQL_HOST not set");
+            panic!("live test: DATABRAIN_MYSQL_HOST not set (run with --ignored)");
         };
         use databrain_auth::{AuthMethod, InlineCredentialSource};
         let user = std::env::var("DATABRAIN_MYSQL_USER").unwrap_or_else(|_| "root".into());
@@ -942,11 +943,11 @@ mod tests {
 
     /// Live: bulk metadata (one batch query set) and schema fingerprints.
     /// DATABRAIN_MYSQL_HOST (+ _PORT, _USER, _PASSWORD).
+    #[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_bulk_metadata_and_fingerprints() {
         let Ok(host) = std::env::var("DATABRAIN_MYSQL_HOST") else {
-            eprintln!("skipping: DATABRAIN_MYSQL_HOST not set");
-            return;
+            panic!("live test: DATABRAIN_MYSQL_HOST not set (run with --ignored)");
         };
         use databrain_auth::{AuthMethod, InlineCredentialSource};
         let user = std::env::var("DATABRAIN_MYSQL_USER").unwrap_or_else(|_| "root".into());
@@ -983,7 +984,7 @@ mod tests {
                 }
             }
         };
-        run("drop database if exists kb_a; drop database if exists kb_b; drop database if exists kb_c; \
+        run("drop database if exists kb_b; drop database if exists kb_a; drop database if exists kb_c; \
              create database kb_a; create database kb_b; create database kb_c; \
              create table kb_a.customers (id int primary key, email varchar(100) comment 'login') comment 'People'; \
              create table kb_b.orders (id int primary key, customer_id int, total decimal(10,2), \
@@ -1002,7 +1003,9 @@ mod tests {
 
         let fps = || async { s.schema_fingerprints().await.unwrap().unwrap() };
         let f0 = fps().await;
-        assert_eq!(f0, fps().await, "stable");
+        // Only this test's schemas: tests running alongside change theirs.
+        let ours = |f: &std::collections::HashMap<String, String>| f.iter().filter(|(k, _)| k.starts_with("kb_")).map(|(k, v)| (k.clone(), v.clone())).collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(ours(&f0), ours(&fps().await), "stable");
         run("alter table kb_a.customers add column name text").await;
         let f1 = fps().await;
         assert_ne!(f0["kb_a"], f1["kb_a"], "new column");
@@ -1019,11 +1022,11 @@ mod tests {
     }
 
     /// Live test: set DATABRAIN_MYSQL_HOST (+ _USER, _PASSWORD, _DB).
+    #[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_roundtrip() {
         let Ok(host) = std::env::var("DATABRAIN_MYSQL_HOST") else {
-            eprintln!("skipping: DATABRAIN_MYSQL_HOST not set");
-            return;
+            panic!("live test: DATABRAIN_MYSQL_HOST not set (run with --ignored)");
         };
         use databrain_auth::{AuthMethod, InlineCredentialSource};
         let user = std::env::var("DATABRAIN_MYSQL_USER").unwrap_or_else(|_| "root".into());

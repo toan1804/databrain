@@ -406,12 +406,10 @@ mod tests {
 
 #[cfg(test)]
 mod live {
-    /// `DATABRAIN_ORACLE_CLIENT_LIVE=1 cargo test -p databrain-connector-oracle client_status_live -- --nocapture`
+    /// `cargo test -p databrain-connector-oracle client_status_live -- --ignored --nocapture`
+    #[ignore = "live: reports this computer's Instant Client (cargo test -- --ignored)"]
     #[test]
     fn client_status_live() {
-        if std::env::var("DATABRAIN_ORACLE_CLIENT_LIVE").is_err() {
-            return;
-        }
         let s = super::status(None, &[]);
         eprintln!("installed={} version={:?} dir={:?} msg={:?} auto_install={}", s.installed, s.version, s.lib_dir, s.message, s.platform.auto_install);
     }
@@ -419,11 +417,12 @@ mod live {
 
 #[cfg(test)]
 mod live_install {
-    /// `DATABRAIN_ORACLE_INSTALL_LIVE=/tmp/dir cargo test -p databrain-connector-oracle install_live -- --nocapture`
+    /// `DATABRAIN_ORACLE_INSTALL_LIVE=/tmp/dir cargo test -p databrain-connector-oracle install_live -- --ignored --nocapture`
     /// Downloads ~115 MB from Oracle.
+    #[ignore = "live: needs DATABRAIN_ORACLE_INSTALL_LIVE=<folder>, downloads ~140 MB (cargo test -- --ignored)"]
     #[test]
     fn install_live() {
-        let Ok(dest) = std::env::var("DATABRAIN_ORACLE_INSTALL_LIVE") else { return };
+        let dest = std::env::var("DATABRAIN_ORACLE_INSTALL_LIVE").expect("live test: DATABRAIN_ORACLE_INSTALL_LIVE not set (run with --ignored)");
         let seen = std::sync::Mutex::new((0u32, 0u64, None::<u64>, Vec::<String>::new()));
         let progress = |p: super::InstallProgress| {
             let mut g = seen.lock().unwrap();

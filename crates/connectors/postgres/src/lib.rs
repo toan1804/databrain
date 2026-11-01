@@ -1320,7 +1320,6 @@ mod tests {
         );
         assert_eq!(parse_timestamptz("infinity"), None);
     }
-
     #[test]
     fn parses_text_values() {
         assert_eq!(parse_text(ColType::Bool, "t"), Value::Bool(true));
@@ -1348,10 +1347,11 @@ mod tests {
     }
 
     /// Live: full table DDL (constraints, partition key, indexes, comments) that recreates the table; function DDL.
+    #[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_object_ddl() {
         let Some(s) = live_session().await else {
-            return eprintln!("skipping: DATABRAIN_PG_HOST not set");
+            panic!("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
         };
         let s = &s;
         let run = |sql: String| async move { s.execute(&sql, ExecOptions::default()).await.unwrap().collect().await.unwrap_or_else(|e| panic!("{sql}: {e}")) };
@@ -1390,10 +1390,11 @@ mod tests {
     }
 
     /// Live: routine completion (pg_proc): search path vs a given schema, procedures, ranking.
+    #[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_search_routines() {
         let Some(s) = live_session().await else {
-            return eprintln!("skipping: DATABRAIN_PG_HOST not set");
+            panic!("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
         };
         for stmt in [
             "drop schema if exists kb_r cascade",
@@ -1417,10 +1418,11 @@ mod tests {
 
     /// Live: explorer fingerprints cover routines/sequences; object versions
     /// change only for the object that changed; named listing.
+    #[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_explorer_versions() {
         let Some(s) = live_session().await else {
-            return eprintln!("skipping: DATABRAIN_PG_HOST not set");
+            panic!("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
         };
         let run = |sql: &'static str| async {
             for stmt in sql.split(';').map(str::trim).filter(|x| !x.is_empty()) {
@@ -1466,11 +1468,11 @@ mod tests {
     }
 
     /// Live: bulk metadata (one batch query) and schema fingerprints for incremental indexing.
+    #[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_bulk_metadata_and_fingerprints() {
         let Some(s) = live_session().await else {
-            eprintln!("skipping: DATABRAIN_PG_HOST not set");
-            return;
+            panic!("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
         };
         let run = |sql: &'static str| async {
             for stmt in sql.split(';').map(str::trim).filter(|x| !x.is_empty()) {
@@ -1518,11 +1520,11 @@ mod tests {
 
     /// Runs against a live server when `DATABRAIN_PG_URL`-style env vars are set:
     /// DATABRAIN_PG_HOST, DATABRAIN_PG_USER, DATABRAIN_PG_PASSWORD, DATABRAIN_PG_DB.
+    #[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_roundtrip() {
         let Ok(host) = std::env::var("DATABRAIN_PG_HOST") else {
-            eprintln!("skipping: DATABRAIN_PG_HOST not set");
-            return;
+            panic!("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
         };
         use databrain_auth::{AuthMethod, InlineCredentialSource};
         let user = std::env::var("DATABRAIN_PG_USER").unwrap_or_else(|_| "postgres".into());

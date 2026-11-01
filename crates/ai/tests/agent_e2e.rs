@@ -394,13 +394,11 @@ async fn kiro_provider_drives_databrain_tools_over_acp_and_mcp() {
 }
 
 
-/// Live: `DATABRAIN_KIRO_LIVE=1 KIRO_API_KEY=ksk_… cargo test -p databrain-ai --test agent_e2e kiro_live -- --nocapture`
+/// Live: `KIRO_API_KEY=ksk_… cargo test -p databrain-ai --test agent_e2e kiro_live -- --ignored --nocapture`
 /// Uses the real kiro-cli and consumes a few Kiro credits.
+#[ignore = "live: needs kiro-cli and KIRO_API_KEY, uses Kiro credits (cargo test -- --ignored)"]
 #[tokio::test]
 async fn kiro_live() {
-    if std::env::var("DATABRAIN_KIRO_LIVE").is_err() {
-        return;
-    }
     let key = std::env::var("KIRO_API_KEY").expect("KIRO_API_KEY");
     let f = fixture(1, AiPolicy { run_query: RunQueryPolicy::AutoRead, ..Default::default() }).await;
     let rec = f
@@ -588,12 +586,10 @@ async fn table_access_rules() {
     assert!(!o.content.starts_with("ERROR"), "{}", o.content);
 }
 
-/// Live: `DATABRAIN_KIRO_LIVE=1 cargo test -p databrain-ai --test agent_e2e kiro_live_status -- --nocapture`
+/// Live: `cargo test -p databrain-ai --test agent_e2e kiro_live_status -- --ignored --nocapture`
+#[ignore = "live: needs a signed-in kiro-cli (cargo test -- --ignored)"]
 #[tokio::test]
 async fn kiro_live_status() {
-    if std::env::var("DATABRAIN_KIRO_LIVE").is_err() {
-        return;
-    }
     use databrain_ai::kiro::KiroProvider;
     use databrain_ai::providers::{KeySource, ProviderAuth};
     let key = std::env::var("KIRO_API_KEY").expect("KIRO_API_KEY");

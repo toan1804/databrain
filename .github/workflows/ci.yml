@@ -65,3 +65,60 @@ jobs:
 
       - name: Rust tests
         run: cargo test --workspace --no-fail-fast
+
+  # Tests against real servers. They are #[ignore]d in `cargo test` (so a
+  # run without servers reports them as ignored, not passed) and run here
+  # with --ignored; a missing server makes them fail, never skip.
+  live:
+    name: live databases (ubuntu)
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TERM_COLOR: always
+      DATABRAIN_PG_HOST: 127.0.0.1
+      DATABRAIN_PG_PORT: 5432
+      DATABRAIN_PG_PASSWORD: pw
+      DATABRAIN_MYSQL_HOST: 127.0.0.1
+      DATABRAIN_MYSQL_PORT: 3306
+      DATABRAIN_MYSQL_PASSWORD: pw
+      DATABRAIN_MONGO_URI: mongodb://127.0.0.1:27017
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: pw
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: pw
+        ports: ["3306:3306"]
+        options: --health-cmd "mysqladmin ping -h 127.0.0.1 -ppw" --health-interval 5s --health-timeout 5s --health-retries 30
+      mongo:
+        image: mongo:7
+        ports: ["27017:27017"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux system packages (Tauri)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The app embeds ui/dist at compile time.
+      - name: UI build
+        working-directory: ui
+        run: npm ci && npm run build
+
+      - name: Live tests (Postgres, MySQL, MongoDB)
+        run: cargo test -p databrain-connector-postgres -p databrain-connector-mysql -p databrain-connector-mongodb -p databrain-app --no-fail-fast -- --ignored
