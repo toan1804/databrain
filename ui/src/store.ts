@@ -1,3 +1,4 @@
+import { flushDraft, flushDrafts } from "./drafts";
 import { DEFAULT_APPEARANCE, applyAppearance, parseAppearance, type Appearance } from "./lib/appearance";
 import { setSourceTraits } from "./lib/sourceTraits";
 import { create } from "zustand";
@@ -694,7 +695,8 @@ export const useStore = create<State>((set, get) => ({
     if (open) return s.setActiveTab(open.id);
     try {
       const f = await api.readSqlFile(path);
-      const active = s.tabs.find((t) => t.id === s.activeTabId);
+      flushDrafts();
+      const active = get().tabs.find((t) => t.id === get().activeTabId);
       // Replace the lone empty scratch tab.
       const lone = s.tabs.length === 1 && isQueryTab(active) && !active.sql.trim() && !active.file_path && !active.saved_query_id;
       const id = s.newTab({ title: baseName(f.path), sql: f.text, file_path: f.path, file_text: f.text, file_mtime: f.mtime_ms });
@@ -1296,6 +1298,7 @@ export const useStore = create<State>((set, get) => ({
     return tab.id;
   },
   closeTab: (id) => {
+    flushDraft(id);
     const s = get();
     const idx = s.tabs.findIndex((t) => t.id === id);
     if (idx === -1) return;
@@ -1330,6 +1333,7 @@ export const useStore = create<State>((set, get) => ({
     persistTabs(tabs);
   },
   reopenClosedTab: () => {
+    flushDrafts();
     const s = get();
     const last = s.closedTabs[s.closedTabs.length - 1];
     if (!last) return false;
@@ -1353,6 +1357,8 @@ export const useStore = create<State>((set, get) => ({
     if (isTauri()) api.setSetting("active_tab", id).catch(() => {});
   },
   updateTab: (id, patch) => {
+    // Text set from outside the editor (a reload, a saved query) follows what was typed.
+    if (patch.sql !== undefined) flushDraft(id);
     const tabs = get().tabs.map((t) => (t.id === id ? { ...t, ...patch } : t));
     set({ tabs });
     persistTabs(tabs);
@@ -1706,6 +1712,7 @@ export const useStore = create<State>((set, get) => ({
     });
   },
   saveTabQuery: async (tabId) => {
+    flushDraft(tabId);
     const s = get();
     const tab = s.tabs.find((t) => t.id === tabId);
     if (!isQueryTab(tab)) return;

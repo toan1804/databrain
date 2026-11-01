@@ -225,7 +225,12 @@ function Chat({ chatId }: { chatId: string }) {
   const setProvider = useAi((s) => s.setProvider);
   const aiConn = useAi((s) => s.connectionId);
   const connections = useStore((s) => s.connections);
-  const activeTab = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId));
+  // Only what the chat uses of the active tab (not the tab: it changes as its text is saved).
+  const activeTabId = useStore((s) => s.activeTabId);
+  const activeJobId = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId)?.job_id ?? null);
+  const activeTitle = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId)?.title ?? "");
+  const activeConnId = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId)?.connection_id ?? null);
+  const activeTab = activeTabId ? { id: activeTabId, job_id: activeJobId, title: activeTitle, connection_id: activeConnId } : undefined;
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
   const [text, setText] = useState(() => drafts.get(chatId) ?? "");
   useEffect(() => {
@@ -550,24 +555,24 @@ function WorkingBar({ items, onStop }: { items: ChatItem[]; onStop: () => void }
 
 /** SQL code block with copy / insert / run actions. */
 export function SqlBlock({ code, lang }: { code: string; lang: string }) {
-  const st = useStore();
+  // No store subscription: a chat has many blocks, and they read the store only when clicked.
+  const st = useStore.getState;
   const isSql = !lang || lang === "sql";
-  const target = editorBridge.focused() ?? st.activeTabId;
   return (
     <div className="overflow-hidden rounded-md border border-line bg-panel-2">
       <pre className="max-h-72 overflow-auto p-2 font-mono text-[12px] leading-snug select-text">{code}</pre>
       <div className="flex gap-1 border-t border-line px-1.5 py-1">
-        <button className="btn-ghost h-6 px-1.5 py-0 text-[11px]" onClick={() => void writeText(code).then(() => st.toast("Copied", "success"))}>
+        <button className="btn-ghost h-6 px-1.5 py-0 text-[11px]" onClick={() => void writeText(code).then(() => st().toast("Copied", "success"))}>
           <Copy size={11} /> Copy
         </button>
         {isSql && (
           <>
-            <button className="btn-ghost h-6 px-1.5 py-0 text-[11px]" onClick={() => editorBridge.insert(target, code)}>
+            <button className="btn-ghost h-6 px-1.5 py-0 text-[11px]" onClick={() => editorBridge.insert(editorBridge.focused() ?? st().activeTabId, code)}>
               <FileCode2 size={11} /> Insert
             </button>
             <button
               className="btn-ghost h-6 px-1.5 py-0 text-[11px]"
-              onClick={() => st.newTab({ title: "AI query", sql: code, connection_id: useAi.getState().connectionId })}
+              onClick={() => st().newTab({ title: "AI query", sql: code, connection_id: useAi.getState().connectionId })}
             >
               <Play size={11} /> Open in tab
             </button>

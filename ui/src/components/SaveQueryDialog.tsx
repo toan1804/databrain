@@ -1,3 +1,4 @@
+import { flushDraft } from "../drafts";
 import { useState } from "react";
 import { Loader2 } from "lucide-react";
 import { api, toError } from "../lib/api";
@@ -19,6 +20,7 @@ function SaveQueryForm({ tabId, initialName }: { tabId: string; initialName: str
   const [busy, setBusy] = useState(false);
 
   const submit = async () => {
+    flushDraft(tabId);
     const st = useStore.getState();
     const tab = st.tabs.find((t) => t.id === tabId);
     if (!tab || !name.trim()) return;

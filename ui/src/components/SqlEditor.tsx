@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { draftOf, setDraft, useDrafts } from "../drafts";
+import { memo, useEffect, useRef, useState } from "react";
 import { closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { HighlightStyle, bracketMatching, indentOnInput, syntaxHighlighting } from "@codemirror/language";
@@ -87,11 +88,14 @@ export interface EditorHandle {
   run: (mode: "statement" | "all") => void;
 }
 
-export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean }) {
+/** One per query tab, hidden ones too: memoized, so only the tab whose props change renders. */
+export const SqlEditor = memo(function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean }) {
   const host = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const lang = useRef(new Compartment());
   const tab = useStore((s) => s.tabs.find((x) => x.id === tabId));
+  // What is typed (the tab's text follows after a pause).
+  const draft = useDrafts((s) => s.text[tabId]);
   const conn = useStore((s) => s.connections.find((c) => c.id === tab?.connection_id));
   const errorRange = useStore((s) => s.runs[tabId]?.errorRange);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
@@ -196,7 +200,11 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
             const st = useStore.getState();
             const t = st.tabs.find((x) => x.id === tabId);
             const text = u.state.doc.toString();
-            st.updateTab(tabId, { sql: text, dirty: t?.file_text !== undefined ? text !== t.file_text : !!t?.saved_query_id });
+            // The text goes to the drafts, not the tabs: typing doesn't
+            // re-render what lists tabs. The tab changes only when "unsaved" flips.
+            setDraft(tabId, text);
+            const dirty = t?.file_text !== undefined ? text !== t.file_text : !!t?.saved_query_id;
+            if (t && !!t.dirty !== dirty) st.updateTab(tabId, { dirty });
           }),
           EditorView.contentAttributes.of({ "aria-label": "SQL editor" }),
           EditorView.domEventHandlers({ focus: () => editorBridge.setFocused(tabId) }),
@@ -222,6 +230,8 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
   useEffect(() => {
     const v = viewRef.current;
     if (!v || tab === undefined) return;
+    // Newer text is still being typed: this is an older flush, not an outside change.
+    if (draftOf(tabId) !== undefined) return;
     const cur = v.state.doc.toString();
     if (tab.sql !== cur) {
       v.dispatch({ changes: { from: 0, to: cur.length, insert: tab.sql } });
@@ -231,7 +241,7 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
   // `:name` parameters: highlight them and list them in the parameter bar (debounced).
   useEffect(() => {
     if (!isTauri()) return;
-    const sql = tab?.sql ?? "";
+    const sql = draft ?? tab?.sql ?? "";
     const kind = conn?.config.kind ?? "postgres";
     const t = setTimeout(() => {
       const found = sql.includes(":") || sql.includes("&") ? api.sqlParameters(kind, sql) : Promise.resolve([]);
@@ -246,7 +256,7 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
         .catch(() => {});
     }, 200);
     return () => clearTimeout(t);
-  }, [tab?.sql, conn?.config.kind, tabId]);
+  }, [draft, tab?.sql, conn?.config.kind, tabId]);
 
   useEffect(() => {
     viewRef.current?.dispatch({ effects: setError.of(errorRange ?? null) });
@@ -270,4 +280,4 @@ export function SqlEditor({ tabId, visible }: { tabId: string; visible: boolean 
       {menu && viewRef.current && <SqlContextMenu view={viewRef.current} kind={conn?.config.kind} at={menu} onClose={() => setMenu(null)} onLineage={() => openLineage(tabId)} />}
     </>
   );
-}
+});

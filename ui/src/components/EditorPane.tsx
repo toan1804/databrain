@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { ChevronsDownUp, FileCode2, FileText, GitCompare, GitFork, LayoutDashboard, Network, Table2, Lightbulb, Loader2, MoreHorizontal, Play, PlayCircle, Plus, Save, Sparkles, Square, X, Workflow } from "lucide-react";
 import { isQueryTab, useActiveTab, useStore, type Tab } from "../store";
 import { editorBridge } from "../editorBridge";
@@ -99,76 +99,9 @@ export function EditorPane() {
     <div className="flex h-full min-w-0 flex-col bg-panel">
       <TabBar />
       {tabs
-        .filter((t) => t.notebook_id)
+        .filter((t): boolean => !isQueryTab(t))
         .map((t) => (
-          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
-            <TabErrorBoundary label="notebook">
-              <NotebookView tabId={t.id} notebookId={t.notebook_id!} visible={t.id === activeId} />
-            </TabErrorBoundary>
-          </div>
-        ))}
-      {tabs
-        .filter((t) => t.output_ref)
-        .map((t) => (
-          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
-            <TabErrorBoundary label="output">
-              <OutputTab tabId={t.id} reference={t.output_ref!} visible={t.id === activeId} />
-            </TabErrorBoundary>
-          </div>
-        ))}
-      {tabs
-        .filter((t) => t.ddl)
-        .map((t) => (
-          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
-            <TabErrorBoundary label="DDL view">
-              <DdlTab tabId={t.id} reference={t.ddl!} visible={t.id === activeId} />
-            </TabErrorBoundary>
-          </div>
-        ))}
-      {tabs
-        .filter((t) => t.job_id)
-        .map((t) => (
-          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
-            <TabErrorBoundary label="job">
-              <JobTab tabId={t.id} jobId={t.job_id!} visible={t.id === activeId} />
-            </TabErrorBoundary>
-          </div>
-        ))}
-      {tabs
-        .filter((t) => t.lineage)
-        .map((t) => (
-          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
-            <TabErrorBoundary label="lineage view">
-              <LineageTab tabId={t.id} visible={t.id === activeId} />
-            </TabErrorBoundary>
-          </div>
-        ))}
-      {tabs
-        .filter((t) => t.dashboard_id)
-        .map((t) => (
-          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
-            <TabErrorBoundary label="dashboard">
-              <DashboardTab tabId={t.id} visible={t.id === activeId} />
-            </TabErrorBoundary>
-          </div>
-        ))}
-      {tabs
-        .filter((t) => t.compare)
-        .map((t) => (
-          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
-            <TabErrorBoundary label="schema compare">
-              <CompareTab tabId={t.id} visible={t.id === activeId} />
-            </TabErrorBoundary>
-          </div>
-        ))}
-      {tabs
-        .filter((t) => t.plan)
-        .map((t) => (
-          <div key={t.id} className={t.id === activeId ? "min-h-0 flex-1" : "hidden"}>
-            <TabErrorBoundary label="query plan">
-              <PlanTab tabId={t.id} visible={t.id === activeId} />
-            </TabErrorBoundary>
-          </div>
+          <TabSlot key={t.id} tab={t} active={t.id === activeId} />
         ))}
       <div className={active && !isQueryTab(active) ? "hidden" : "contents"}>
       <Toolbar />
@@ -204,6 +137,37 @@ export function EditorPane() {
     </div>
   );
 }
+
+/**
+ * A tab other than a query editor (notebook, output, DDL, job, lineage,
+ * dashboard, compare, plan), shown or hidden. Memoized: hidden tabs don't
+ * render again when another tab or the tab list changes.
+ */
+const TabSlot = memo(function TabSlot({ tab: t, active }: { tab: Tab; active: boolean }) {
+  const [label, body] = t.notebook_id
+    ? ["notebook", <NotebookView tabId={t.id} notebookId={t.notebook_id} visible={active} />]
+    : t.output_ref
+      ? ["output", <OutputTab tabId={t.id} reference={t.output_ref} visible={active} />]
+      : t.ddl
+        ? ["DDL view", <DdlTab tabId={t.id} reference={t.ddl} visible={active} />]
+        : t.job_id
+          ? ["job", <JobTab tabId={t.id} jobId={t.job_id} visible={active} />]
+          : t.lineage
+            ? ["lineage view", <LineageTab tabId={t.id} visible={active} />]
+            : t.dashboard_id
+              ? ["dashboard", <DashboardTab tabId={t.id} visible={active} />]
+              : t.compare
+                ? ["schema compare", <CompareTab tabId={t.id} visible={active} />]
+                : t.plan
+                  ? ["query plan", <PlanTab tabId={t.id} visible={active} />]
+                  : [null, null];
+  if (!body) return null;
+  return (
+    <div className={active ? "min-h-0 flex-1" : "hidden"}>
+      <TabErrorBoundary label={label!}>{body}</TabErrorBoundary>
+    </div>
+  );
+});
 
 function TabBar() {
   const tabs = useStore((s) => s.tabs);

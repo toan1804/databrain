@@ -60,6 +60,7 @@ import {
 import { formatCount, formatDuration, relativeTime } from "../lib/util";
 import { isQueryTab, useStore } from "../store";
 import { useJobs } from "../jobsStore";
+import { flushDrafts } from "../drafts";
 import { openOutput, resultsConnection } from "../outputs";
 import { CellEditor } from "./Notebook";
 import { SplitHandle } from "./SplitHandle";
@@ -655,6 +656,12 @@ function SaveState({ save }: { save: { state: string; message?: string } }) {
   return <span className="text-[11px] text-muted">{save.state === "saved" ? "Saved" : "Saving…"}</span>;
 }
 
+/** `t` with the text just typed in its editor. */
+function latestTab<T extends { id: string }>(t: T): T {
+  flushDrafts();
+  return (useStore.getState().tabs.find((x) => x.id === t.id) as T | undefined) ?? t;
+}
+
 /** Open query tabs, to start a step from one (its connection and SQL). */
 function QueryTabItems({ onPick }: { onPick: (t: { title: string; sql: string; connection_id?: string | null }) => void }) {
   // Select the stable array and filter outside the selector (a new array per call loops in zustand 5).
@@ -666,7 +673,7 @@ function QueryTabItems({ onPick }: { onPick: (t: { title: string; sql: string; c
       <MenuSeparator />
       <div className="px-3 pb-0.5 pt-1 text-[10.5px] uppercase tracking-wide text-muted">From a query tab</div>
       {tabs.slice(0, 12).map((t) => (
-        <MenuItem key={t.id} label={t.title} hint={t.sql.trim().split("\n")[0].slice(0, 40)} onClick={() => onPick(t)} />
+        <MenuItem key={t.id} label={t.title} hint={t.sql.trim().split("\n")[0].slice(0, 40)} onClick={() => onPick(latestTab(t))} />
       ))}
     </>
   );
@@ -986,8 +993,9 @@ function NodePanel({
               value=""
               disabled={!queryTabs.length}
               onChange={(e) => {
-                const t = queryTabs.find((x) => x.id === e.target.value);
-                if (!t) return;
+                const found = queryTabs.find((x) => x.id === e.target.value);
+                if (!found) return;
+                const t = latestTab(found);
                 const apply = () => onChange({ sql: t.sql, connection_id: t.connection_id ?? null });
                 if (node.sql.trim() && node.sql !== t.sql)
                   useStore.getState().askConfirm({ title: `Replace the SQL of "${node.name}"?`, reasons: [`It gets the SQL and connection of "${t.title}".`], confirmLabel: "Replace", onConfirm: apply });
