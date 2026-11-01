@@ -132,6 +132,10 @@ pub struct AiPolicy {
     pub write_allow: Vec<String>,
     /// Tables the AI may never write.
     pub write_deny: Vec<String>,
+    /// DuckDB: SQL from the AI or MCP may read and write files, use the
+    /// network, load extensions and change settings. Off: its sessions run
+    /// in a sandbox (`enable_external_access = false`, locked settings).
+    pub external_access: bool,
 }
 
 impl Default for AiPolicy {
@@ -154,6 +158,7 @@ impl Default for AiPolicy {
             read_deny: vec![],
             write_allow: vec![],
             write_deny: vec![],
+            external_access: false,
         }
     }
 }

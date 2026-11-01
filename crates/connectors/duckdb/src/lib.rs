@@ -406,6 +406,18 @@ fn map_err(e: duckdb::Error) -> ConnectorError {
     ConnectorError::query(msg)
 }
 
+/// What a sealed session refused, and how the user allows it.
+fn sandbox_hint(mut e: ConnectorError) -> ConnectorError {
+    let m = e.message.to_ascii_lowercase();
+    if m.contains("disabled through configuration") || m.contains("permission error") || m.contains("lock_configuration") || m.contains("configuration has been locked") {
+        e.message = format!(
+            "{} (SQL from the assistant runs in a DuckDB sandbox without file or network access and can't change settings; allow it in the connection's AI settings)",
+            e.message
+        );
+    }
+    e
+}
+
 fn files_of(cfg: &ConnectionConfig) -> Vec<String> {
     cfg.opt("files").map(|f| f.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect()).unwrap_or_default()
 }
@@ -438,21 +450,36 @@ impl Connector for DuckdbConnector {
         let files = files_of(cfg);
         let all_sheets = cfg.opt("excel_sheets") == Some("all");
         let read_only = cfg.read_only && path != ":memory:";
+        let sandbox = cfg.opt(SANDBOX_OPTION) == Some("1");
         let (conn, db) = tokio::task::spawn_blocking(move || -> Result<(duckdb::Connection, Option<Arc<FileDb>>)> {
-            let (conn, db) = if path == ":memory:" {
-                (duckdb::Connection::open_in_memory().map_err(|e| ConnectorError::connection(e.to_string()))?, None)
-            } else {
-                let (c, db) = connect_file(&path, read_only)?;
-                (c, Some(db))
+            // Settings and file views, then (sandboxed) the lock: once
+            // configuration is locked nothing can be changed or read from disk.
+            let setup = |conn: &duckdb::Connection| -> Result<()> {
+                // Bundled extensions (excel, delta, iceberg, httpfs, icu…) live in
+                // the app's extension directory; unknown ones still download on demand.
+                if let Some(dir) = extension_dir() {
+                    let _ = conn.execute_batch(&format!("SET extension_directory = {}", quote_literal(&dir)));
+                }
+                let _ = conn.execute_batch("SET autoinstall_known_extensions = true; SET autoload_known_extensions = true;");
+                attach_files(conn, &files, all_sheets)?;
+                if sandbox {
+                    seal(conn)?;
+                }
+                Ok(())
             };
-            // Bundled extensions (excel, delta, iceberg, httpfs, icu…) live in
-            // the app's extension directory; unknown ones still download on demand.
-            if let Some(dir) = extension_dir() {
-                let _ = conn.execute_batch(&format!("SET extension_directory = {}", quote_literal(&dir)));
+            if path == ":memory:" {
+                let conn = duckdb::Connection::open_in_memory().map_err(|e| ConnectorError::connection(e.to_string()))?;
+                setup(&conn)?;
+                return Ok((conn, None));
             }
-            let _ = conn.execute_batch("SET autoinstall_known_extensions = true; SET autoload_known_extensions = true;");
-            attach_files(&conn, &files, all_sheets)?;
-            Ok((conn, db))
+            if sandbox {
+                // Set up once, on the instance, before any session uses it.
+                let (c, db) = connect_file(&path, read_only, true, &setup)?;
+                return Ok((c, Some(db)));
+            }
+            let (c, db) = connect_file(&path, read_only, false, &|_| Ok(()))?;
+            setup(&c)?;
+            Ok((c, Some(db)))
         })
         .await
         .map_err(|e| ConnectorError::internal(e.to_string()))??;
@@ -461,9 +488,24 @@ impl Connector for DuckdbConnector {
             conn: Arc::new(Mutex::new(conn)),
             outputs: self.outputs.clone(),
             loaded: db.as_ref().map(|d| d.loaded.clone()).unwrap_or_default(),
+            sandboxed: sandbox,
             _db: db,
         }))
     }
+}
+
+use databrain_connector_core::SANDBOX_OPTION;
+
+/// Lock a database instance down for SQL the user didn't write: no file or
+/// network access (`read_csv`, `COPY … TO`, `ATTACH`, `httpfs`, extension
+/// loading) and no setting can be changed back. `results` (DataBrain's
+/// outputs, in memory) is attached first, as attaching needs access.
+fn seal(conn: &duckdb::Connection) -> Result<()> {
+    let attached: bool = conn.query_row("SELECT count(*) > 0 FROM duckdb_databases() WHERE database_name = 'results'", [], |r| r.get(0)).map_err(map_err)?;
+    if !attached {
+        conn.execute_batch(&format!("ATTACH ':memory:' AS {RESULTS_SCHEMA}")).map_err(map_err)?;
+    }
+    conn.execute_batch("SET enable_external_access = false; SET lock_configuration = true;").map_err(map_err)
 }
 
 /// Create `files.<name>` views over attached files. Unreadable files are
@@ -515,6 +557,8 @@ pub struct DuckSession {
     outputs: Option<Arc<ExternalTablesSlot>>,
     /// Output tables loaded in the database: lowercase name → version key.
     loaded: Arc<Loaded>,
+    /// Runs in a sealed instance (see [`seal`]).
+    sandboxed: bool,
     /// The file database this session's connection belongs to (dropped
     /// after `conn`, so the file closes when its last session ends).
     _db: Option<Arc<FileDb>>,
@@ -532,12 +576,16 @@ struct FileDb {
     loaded: Arc<Loaded>,
 }
 
-type FileKey = (std::path::PathBuf, bool);
+/// (resolved path, read-only, sandboxed).
+type FileKey = (std::path::PathBuf, bool, bool);
 static FILE_DBS: std::sync::LazyLock<Mutex<std::collections::HashMap<FileKey, std::sync::Weak<FileDb>>>> = std::sync::LazyLock::new(Default::default);
 
 /// A new connection to the database file at `path`, opening it unless a
-/// live session already has it open (same access mode).
-fn connect_file(path: &str, read_only: bool) -> Result<(duckdb::Connection, Arc<FileDb>)> {
+/// live session already has it open (same access mode). A new instance is
+/// prepared with `init` before any session gets it. A sandboxed instance
+/// and an open one can't share the file (one instance per file), so asking
+/// for one while the other is open fails.
+fn connect_file(path: &str, read_only: bool, sandbox: bool, init: &dyn Fn(&duckdb::Connection) -> Result<()>) -> Result<(duckdb::Connection, Arc<FileDb>)> {
     let p = std::path::Path::new(path);
     // The same key before and after the file exists (the first session may
     // create it): the folder is resolved (links, 8.3 names), not the file.
@@ -546,15 +594,25 @@ fn connect_file(path: &str, read_only: bool) -> Result<(duckdb::Connection, Arc<
         (None, Some(name)) => std::env::current_dir().map(|d| d.join(name)).unwrap_or_else(|_| p.to_path_buf()),
         _ => p.to_path_buf(),
     };
-    let key = (resolved, read_only);
+    let key = (resolved, read_only, sandbox);
     let mut dbs = FILE_DBS.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?;
     dbs.retain(|_, w| w.strong_count() > 0);
     if let Some(db) = dbs.get(&key).and_then(std::sync::Weak::upgrade) {
         let conn = db.root.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?.try_clone().map_err(|e| ConnectorError::connection(e.to_string()))?;
         return Ok((conn, db));
     }
+    if dbs.keys().any(|k| k.0 == key.0 && k.2 != sandbox) {
+        return Err(ConnectorError::config(if sandbox {
+            format!(
+                "{path} is open in DataBrain (a query tab or notebook), so the assistant can't open it in its sandbox (no file or network access). Close those tabs, or let the assistant read files and the network in the connection's AI settings."
+            )
+        } else {
+            format!("The assistant is using {path} right now; try again when it finishes.")
+        }));
+    }
     let c = duckdb::Config::default().access_mode(if read_only { duckdb::AccessMode::ReadOnly } else { duckdb::AccessMode::ReadWrite }).map_err(map_err)?;
     let root = duckdb::Connection::open_with_flags(path, c).map_err(|e| ConnectorError::connection(e.to_string()))?;
+    init(&root)?;
     let conn = root.try_clone().map_err(|e| ConnectorError::connection(e.to_string()))?;
     let db = Arc::new(FileDb { root: Mutex::new(root), loaded: Arc::default() });
     dbs.insert(key, Arc::downgrade(&db));
@@ -854,6 +912,7 @@ impl Session for DuckSession {
         let sql = sql.to_string();
         let (cancel, interrupt) = (opts.cancel.clone(), self.interrupt.clone());
         let (outputs, loaded) = (self.outputs.clone(), self.loaded.clone());
+        let sandboxed = self.sandboxed;
         let done = tokio_util::sync::CancellationToken::new();
         let done_guard = done.clone();
         // duckdb-rs disconnects *before* clearing the interrupt handle's
@@ -877,7 +936,7 @@ impl Session for DuckSession {
                 return;
             };
             if let Err(e) = run(&g, &sql, &opts, &tx, outputs.as_deref(), &loaded) {
-                let e = if opts.cancel.is_cancelled() { ConnectorError::cancelled() } else { e };
+                let e = if opts.cancel.is_cancelled() { ConnectorError::cancelled() } else if sandboxed { sandbox_hint(e) } else { e };
                 tx.blocking_send(Err(e));
             }
         });

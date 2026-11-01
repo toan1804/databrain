@@ -85,6 +85,8 @@ export interface AiPolicy {
   write_allow?: string[];
   /** Tables the AI may never write. */
   write_deny?: string[];
+  /** DuckDB: SQL from the AI or MCP may use files and the network (else sandboxed). */
+  external_access?: boolean;
 }
 
 export interface AuthStatus {

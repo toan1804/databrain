@@ -31,6 +31,11 @@ pub use traits::{QueryLanguage, SourceTraits};
 pub use types::*;
 pub use value::{BatchBuilder, ColType, Column, Value};
 
+/// Connection option set by the query engine, never by the user: the
+/// session runs SQL from the AI assistant or an MCP client, so a connector
+/// that can (DuckDB) denies it file and network access and locks settings.
+pub const SANDBOX_OPTION: &str = "databrain_sandbox";
+
 #[async_trait]
 pub trait Connector: Send + Sync {
     fn info(&self) -> ConnectorInfo;

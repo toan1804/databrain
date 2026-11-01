@@ -75,6 +75,7 @@ export const DEFAULT_POLICY: AiPolicy = {
   read_deny: [],
   write_allow: [],
   write_deny: [],
+  external_access: false,
 };
 
 function Label({ children, htmlFor }: { children: React.ReactNode; htmlFor?: string }) {
@@ -964,6 +965,14 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
                   label="Save AI notes directly"
                   help="Notes the AI adds or updates while exploring skip review in Knowledge"
                 />
+                {kind === "duckdb" && (
+                  <Check
+                    checked={!!policy.external_access}
+                    onChange={(v) => setPolicy({ ...policy, external_access: v })}
+                    label="Let the AI use files and the network"
+                    help="Off: its SQL runs in a DuckDB sandbox (no file or network access, no extension loading, settings locked)"
+                  />
+                )}
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>

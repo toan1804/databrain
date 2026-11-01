@@ -365,6 +365,8 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 struct Live {
     session: Arc<dyn Session>,
     _tunnel: Option<Arc<Tunnel>>,
+    /// Opened for SQL from the AI or MCP in a sandbox (DuckDB).
+    sandboxed: bool,
     /// Last time a statement or catalog call used it.
     last_used: parking_lot::Mutex<Instant>,
 }
@@ -686,10 +688,37 @@ impl QueryEngine {
     }
 
     async fn session(&self, connection_id: &str, tab_id: &str) -> Result<Arc<dyn Session>> {
+        self.session_for(connection_id, tab_id, Origin::User).await
+    }
+
+    /// Whether SQL from `origin` runs in a sandboxed session on this
+    /// connection: AI and MCP on DuckDB, unless the connection lets the AI
+    /// access files and the network.
+    fn sandboxed(&self, connection_id: &str, origin: Origin) -> Result<bool> {
+        if !matches!(origin, Origin::Ai | Origin::Mcp) {
+            return Ok(false);
+        }
+        let p = self.workspace.get_connection(connection_id)?;
+        Ok(p.config.kind == databrain_connector_core::ConnectorKind::Duckdb && !p.ai_policy.external_access)
+    }
+
+    /// The session of `tab_id` for SQL from `origin` (see [`Self::sandboxed`]).
+    async fn session_for(&self, connection_id: &str, tab_id: &str, origin: Origin) -> Result<Arc<dyn Session>> {
+        let sandbox = self.sandboxed(connection_id, origin)?;
         let key = (connection_id.to_string(), tab_id.to_string());
-        if let Some(s) = self.sessions.lock().get(&key) {
-            *s.last_used.lock() = Instant::now();
-            return Ok(s.session.clone());
+        {
+            let mut g = self.sessions.lock();
+            match g.get(&key) {
+                // A session opened without the sandbox is never used for it.
+                Some(s) if sandbox && !s.sandboxed => {
+                    g.remove(&key);
+                }
+                Some(s) => {
+                    *s.last_used.lock() = Instant::now();
+                    return Ok(s.session.clone());
+                }
+                None => {}
+            }
         }
         let gate = self
             .connecting
@@ -698,11 +727,24 @@ impl QueryEngine {
             .or_default()
             .clone();
         let _g = gate.lock().await;
-        if let Some(s) = self.sessions.lock().get(&key) {
+        if let Some(s) = self.sessions.lock().get(&key).filter(|s| s.sandboxed || !sandbox) {
             return Ok(s.session.clone());
         }
         let mut profile = self.workspace.get_connection(connection_id)?;
         profile.config = profile.config.normalized();
+        if profile.config.kind == databrain_connector_core::ConnectorKind::Duckdb && profile.config.file_path.as_deref().is_some_and(|f| !f.trim().is_empty()) {
+            // One database instance per file: a sandboxed one and an open
+            // one can't share it. Close the idle sessions of the other kind
+            // that hold no state (the assistant's, or the explorer's).
+            self.sessions.lock().retain(|(c, t), live| {
+                let other = c == connection_id && live.sandboxed != sandbox;
+                let stateless = !sandbox || t == META_TAB || t == INDEX_TAB;
+                !(other && stateless && Arc::strong_count(&live.session) == 1 && !live.session.in_transaction())
+            });
+        }
+        if sandbox {
+            profile.config.options.insert(databrain_connector_core::SANDBOX_OPTION.into(), "1".into());
+        }
         let connector = self.registry.get(profile.config.kind)?;
         let creds = self.credentials(&profile)?;
         self.preflight(&profile.config).await?;
@@ -716,7 +758,7 @@ impl QueryEngine {
             }
             Err(e) => return Err(e.into()),
         };
-        self.sessions.lock().insert(key, Live { session: session.clone(), _tunnel: tunnel, last_used: parking_lot::Mutex::new(Instant::now()) });
+        self.sessions.lock().insert(key, Live { session: session.clone(), _tunnel: tunnel, sandboxed: sandbox, last_used: parking_lot::Mutex::new(Instant::now()) });
         Ok(session)
     }
 
@@ -848,7 +890,7 @@ impl QueryEngine {
             return Ok(());
         }
         let Some((begin, _, _)) = edit::apply_style(kind) else { return Ok(()) };
-        let session = self.session(&req.connection_id, req.session_key()).await?;
+        let session = self.session_for(&req.connection_id, req.session_key(), req.origin).await?;
         if !session.in_transaction() {
             session.execute(begin, ExecOptions::default()).await?.collect().await?;
         }
@@ -1592,7 +1634,7 @@ impl QueryEngine {
         let started = Instant::now();
         let mut server_ms = None;
         let session = tokio::select! {
-            s = self.session(&req.connection_id, req.session_key()) => s?,
+            s = self.session_for(&req.connection_id, req.session_key(), req.origin) => s?,
             _ = cancel.cancelled() => return Err(ConnectorError::cancelled().into()),
         };
         let batch_size = limit.map(|l| l.clamp(1, 2000)).unwrap_or(2000);
