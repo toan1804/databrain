@@ -83,6 +83,29 @@ fn decide(profile: &ConnectionProfile, policy: &AiPolicy, stmts: &[Classificatio
     }
 }
 
+/// Why the AI may not write to this connection at all, if it may not: the
+/// rules [`review_sql`] applies to writes, for writes that are not SQL the
+/// AI wrote (a job's load step inserting into a table).
+pub fn write_denied(profile: &ConnectionProfile) -> Option<String> {
+    let policy = &profile.ai_policy;
+    if !policy.ai_enabled {
+        return Some("AI is disabled for this connection".into());
+    }
+    if policy.run_query == RunQueryPolicy::Never {
+        return Some("running queries is disabled for the AI on this connection".into());
+    }
+    if profile.config.read_only {
+        return Some("the connection is read-only".into());
+    }
+    if !policy.allow_write {
+        return Some("writes are not allowed for the AI on this connection".into());
+    }
+    if profile.env == EnvTag::Prod {
+        return Some("the AI may not modify a production connection".into());
+    }
+    None
+}
+
 /// Read-only connections: what `decide` allowed may still be refused.
 /// - Session and transaction statements are denied like writes (`SET
 ///   default_transaction_read_only = off`, `BEGIN READ WRITE`), except a

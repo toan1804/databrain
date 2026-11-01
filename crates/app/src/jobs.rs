@@ -13,8 +13,10 @@
 //! - Export step: the same, then DuckDB writes the rows to a file
 //!   (`COPY … TO`, CSV / Parquet / JSON) in a chosen folder (Downloads by default).
 //!
-//! Runs don't prompt (the job was set up by hand); read-only connections
-//! are still refused.
+//! Runs don't prompt (the job was set up by hand, or approved when the AI
+//! assistant built or ran it: the assistant's policy is checked then);
+//! read-only connections are still refused. A run the assistant starts
+//! runs the steps' SQL as its own queries (the DuckDB sandbox applies).
 
 use futures::FutureExt;
 use std::collections::{HashMap, HashSet};
@@ -184,6 +186,15 @@ impl Tracer {
 
     fn job_id(&self) -> String {
         self.live.lock().run.job_id.clone()
+    }
+
+    /// Who the steps' own SQL runs for: a run the AI assistant started runs
+    /// it like the assistant's queries (`Origin::Ai`: in the DuckDB sandbox
+    /// unless the connection lets the AI read files and the network).
+    /// SQL DataBrain writes for a step (`COPY … TO` an export file) is not
+    /// the AI's and runs as the job's.
+    fn step_origin(&self) -> Origin {
+        if self.live.lock().run.trigger == "ai" { Origin::Ai } else { Origin::Job }
     }
 
     /// Set this step's progress; the run is sent at most every [`PROGRESS_EVERY`]
@@ -586,14 +597,15 @@ pub fn copy_sql(select: &str, path: &std::path::Path, format: FileFormat) -> Str
 
 /// One SQL run on a run key (no prompt); fails with the first error. Each
 /// statement's outcome goes to the log.
-async fn run_sql(ctx: &JobCtx, connection_id: String, tab: String, sql: String, output_name: Option<String>, cancel: &CancellationToken, t: &Tracer) -> Result<Vec<databrain_query_engine::StatementOutcomeView>> {
+#[allow(clippy::too_many_arguments)]
+async fn run_sql(ctx: &JobCtx, connection_id: String, tab: String, sql: String, output_name: Option<String>, origin: Origin, cancel: &CancellationToken, t: &Tracer) -> Result<Vec<databrain_query_engine::StatementOutcomeView>> {
     let conn = ctx.workspace.get_connection(&connection_id).map(|p| p.name).unwrap_or_else(|_| connection_id.clone());
     t.log("info", format!("Running SQL on {conn}"), None, None, None);
     let outcomes = ctx
         .engine
         .run_and_wait(
             &ctx.hub,
-            RunRequest { connection_id, tab_id: tab, sql, base_offset: 0, row_limit: None, confirmed: true, origin: Origin::Job, session_key: None, output_name, params: HashMap::new() },
+            RunRequest { connection_id, tab_id: tab, sql, base_offset: 0, row_limit: None, confirmed: true, origin, session_key: None, output_name, params: HashMap::new() },
             Some(cancel.clone()),
         )
         .await?;
@@ -661,7 +673,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     // Checked before the query runs, so a missing folder fails fast.
     let folder = if node.kind == JobNodeKind::Export { Some(export_folder(node)?) } else { None };
     let duck_id = connection_id.clone();
-    let outcomes = run_sql(ctx, connection_id, tab.clone(), sql, Some(node.name.clone()), cancel, t).await?;
+    let outcomes = run_sql(ctx, connection_id, tab.clone(), sql, Some(node.name.clone()), t.step_origin(), cancel, t).await?;
     let last = outcomes.last();
     let rows = last.and_then(|o| o.result.as_ref().map(|r| r.total_rows as i64).or(o.rows_affected.map(|r| r as i64))).unwrap_or(0);
     if node.kind == JobNodeKind::Query {
@@ -681,7 +693,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
         // By handle: exactly this run's rows, even if another step has the same name.
         let select = format!("select * from results.{}", output.handle);
         t.log("info", format!("Writing {} rows to {}", output.rows, path.display()), None, None, None);
-        run_sql(ctx, duck_id, format!("{tab}:export"), copy_sql(&select, &path, node.export_format), None, cancel, t).await?;
+        run_sql(ctx, duck_id, format!("{tab}:export"), copy_sql(&select, &path, node.export_format), None, Origin::Job, cancel, t).await?;
         return Ok(NodeOut { rows: output.rows as i64, file: Some(path.to_string_lossy().into_owned()), notices: vec![] });
     }
     let target = node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;

@@ -872,6 +872,79 @@ async fn creates_a_job_across_connections() {
     assert!(c.call("update_job", &fix).await.content.starts_with("Nothing changes"));
 }
 
+/// Jobs the assistant builds, changes or runs follow its policy like its
+/// own queries do (runs don't prompt, so it is checked before).
+#[tokio::test]
+async fn jobs_follow_the_ai_policy() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = mock_openai(requests.clone()).await;
+    let f = fixture(port, AiPolicy::default()).await;
+    let profile = f.ws.get_connection(&f.conn).unwrap();
+    let host = Arc::new(Host { approvals: AtomicUsize::new(0), approve: true });
+    let c = databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: profile.clone(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: host.clone(),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+    };
+    let save = |name: &str, policy: AiPolicy, env: EnvTag| f.ws.save_connection(ConnectionProfile { id: String::new(), name: name.into(), ai_policy: policy, env, ..profile.clone() }).unwrap();
+    let writer = AiPolicy { allow_write: true, ..AiPolicy::default() };
+    save("Writer", writer.clone(), EnvTag::Dev);
+    save("Prod writer", writer, EnvTag::Prod);
+    let create = |steps: Value| json!({"name": "J", "steps": steps});
+    let refused = |o: &str, why: &str| o.starts_with("ERROR") && o.contains(why);
+
+    // Writes in a query step need allow_write, like run_query.
+    let o = c.call("create_job", &create(json!([{"name": "w1", "connection": "Shop", "sql": "delete from orders"}]))).await.content;
+    assert!(refused(&o, "step w1") && o.contains("not allowed"), "{o}");
+    // On the Results DuckDB too (its own policy: no writes by default).
+    let o = c.call("create_job", &create(json!([{"name": "w2", "connection": "Results", "sql": "create table x as select 1"}]))).await.content;
+    assert!(refused(&o, "step w2") && o.contains("not allowed"), "{o}");
+    // The SQL of load and export steps runs there and may only read.
+    let o = c.call("create_job", &create(json!([
+        {"name": "w3", "connection": "Shop", "sql": "select * from orders"},
+        {"name": "w4", "action": "export", "after": ["w3"], "sql": "copy (select 1) to '/tmp/x.csv'"}
+    ]))).await.content;
+    assert!(refused(&o, "may only read"), "{o}");
+    // A load writes: the target must let the AI write, never production.
+    let load = |target: &str, before: Option<&str>| {
+        create(json!([
+            {"name": "src", "connection": "Shop", "sql": "select * from orders"},
+            {"name": "dst", "action": "load", "after": ["src"], "target_connection": target, "target_table": "orders_copy", "before_sql": before}
+        ]))
+    };
+    let o = c.call("create_job", &load("Shop", None)).await.content;
+    assert!(refused(&o, "step dst") && o.contains("writes are not allowed"), "{o}");
+    let o = c.call("create_job", &load("Prod writer", None)).await.content;
+    assert!(refused(&o, "production"), "{o}");
+    assert!(f.ws.list_jobs().unwrap().is_empty(), "nothing refused was saved");
+    assert_eq!(host.approvals.load(Ordering::SeqCst), 0, "refused before asking the user");
+    let o = c.call("create_job", &load("Writer", Some("drop table orders"))).await.content;
+    assert!(o.starts_with("Created job"), "allowed with allow_write (and approval): {o}");
+
+    // A job set up by hand with a write the AI may not make: the AI can't run or change it.
+    let mut job = f.ws.get_job(&f.ws.list_jobs().unwrap()[0].id).unwrap();
+    job.nodes[0].sql = "update orders set amount = 0".into();
+    f.ws.save_job(job).unwrap();
+    let o = c.call("run_job", &json!({"job": "J"})).await.content;
+    assert!(refused(&o, "step src") && !o.contains("only available in the DataBrain app"), "refused before the run starts: {o}");
+    let o = c.call("run_job", &json!({"job": "J", "steps": ["dst"]})).await.content;
+    assert!(o.contains("only available in the DataBrain app"), "only the selected steps are checked: {o}");
+    // Load steps' before/after SQL follows the target's policy too.
+    let o = c.call("update_job", &json!({"job": "J", "steps": [
+        {"name": "src", "connection": "Shop", "sql": "select * from orders"},
+        {"name": "dst", "action": "load", "after": ["src"], "target_connection": "Writer", "target_table": "orders_copy", "after_sql": "select 1; delete from customers"}
+    ]})).await.content;
+    assert!(!o.starts_with("ERROR"), "{o}");
+    f.ws.save_connection(ConnectionProfile { ai_policy: AiPolicy::default(), ..f.ws.list_connections().unwrap().into_iter().find(|p| p.name == "Writer").unwrap() }).unwrap();
+    let o = c.call("run_job", &json!({"job": "J", "steps": ["dst"]})).await.content;
+    assert!(refused(&o, "step dst"), "the target no longer allows writes: {o}");
+}
+
 /// "Ask AI" about a connection test error: the conversation is filed under a
 /// connection, but the assistant must not connect to it (that could start a
 /// sign-in), read its schema, or run tools.

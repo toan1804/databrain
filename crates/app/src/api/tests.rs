@@ -705,3 +705,54 @@ async fn lineage_check_live_postgres_position() {
     assert_eq!(&sql[pos..pos + 5], "amout", "{:?}", v.checks[1]);
     exec(&st, &p.id, "drop table lin_t").await;
 }
+
+/// A run the AI assistant starts runs the steps' own SQL in the DuckDB
+/// sandbox, as its queries do; DataBrain's export (`COPY … TO`) still
+/// writes its file. The same job run by hand reads files.
+#[tokio::test]
+async fn ai_job_runs_are_sandboxed() {
+    let (st, _sink, dir) = state();
+    let csv = dir.path().join("secret.csv");
+    std::fs::write(&csv, "a\n1\n").unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let job: databrain_workspace::Job = serde_json::from_value(serde_json::json!({
+        "name": "Files",
+        "nodes": [
+            {"id": "s1", "name": "nums", "kind": "query", "sql": "select range as n from range(3)"},
+            {"id": "s2", "name": "nums_file", "kind": "export", "export_format": "csv", "export_folder": out.to_string_lossy(), "export_file": "nums"},
+            {"id": "s3", "name": "secret", "kind": "query", "sql": format!("select * from read_csv('{}')", csv.display())}
+        ],
+        "edges": [{"from": "s1", "to": "s2"}]
+    }))
+    .unwrap();
+    let job = save_job(&st, job).unwrap();
+    let ctx = st.job_ctx();
+    let run = |trigger: &'static str| {
+        let (ctx, id) = (ctx.clone(), job.id.clone());
+        async move {
+            let started = crate::jobs::start(&ctx, &id, trigger, None).unwrap();
+            for _ in 0..1000 {
+                let r = ctx.workspace.job_runs(&id, 5).unwrap().into_iter().find(|r| r.id == started.id).unwrap();
+                if r.status != "running" && !ctx.jobs.is_running(&id) {
+                    return r;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("run did not finish")
+        }
+    };
+    let step = |r: &databrain_workspace::JobRun, name: &str| r.nodes.iter().find(|n| n.name == name).unwrap().summary.clone();
+
+    let by_ai = run("ai").await;
+    assert_eq!(step(&by_ai, "nums").status, "success", "{by_ai:?}");
+    assert_eq!(step(&by_ai, "nums_file").status, "success", "DataBrain's own COPY still writes the export: {by_ai:?}");
+    let secret = step(&by_ai, "secret");
+    assert_eq!(secret.status, "error");
+    assert!(secret.error.as_deref().is_some_and(|e| e.contains("sandbox")), "{secret:?}");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+
+    let by_hand = run("manual").await;
+    assert_eq!(by_hand.status, "success", "{by_hand:?}");
+    assert_eq!(step(&by_hand, "secret").rows, Some(1));
+}

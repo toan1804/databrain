@@ -370,27 +370,73 @@ impl ToolContext {
         Ok(out(text, json!({"job_id": job.id, "name": job.name})))
     }
 
-    /// Steps of a job the AI builds or runs use only tables their
-    /// connections let the AI read (query steps) and write (query and load steps).
-    fn check_job_tables(&self, job: &databrain_workspace::Job, only: &[String]) -> Result<()> {
+    /// Steps of a job the AI builds or runs pass the rules its own queries
+    /// do, per step and connection (runs don't prompt, so this is where
+    /// they apply):
+    /// - query steps: `review_sql` on their connection (writes need
+    ///   `allow_write`, never on production or read-only connections; table
+    ///   rules). Steps on the Results DuckDB, and the SQL of load and export
+    ///   steps (which runs there), only read, like `query_outputs`;
+    /// - load steps: the AI may write to the target connection and table,
+    ///   and its before / after SQL passes `review_sql` there.
+    ///
+    /// Returns how the user approves: `Confirm` when a step calls functions
+    /// that could write where the AI may not (see `review_sql`), else `ask`.
+    fn review_job(&self, job: &databrain_workspace::Job, only: &[String], ask: &str) -> Result<Decision> {
         let ws = self.engine.workspace();
+        let mut confirm = Vec::new();
+        let results = std::cell::OnceCell::new();
         for n in job.nodes.iter().filter(|n| only.is_empty() || only.contains(&n.id)) {
-            let conn = |id: &str| ws.get_connection(id).map_err(|_| AiError::Policy(format!("step {}: its connection no longer exists", n.name)));
+            let step = |r: String| AiError::Policy(format!("step {}: {r}", n.name));
+            let conn = |id: &str| ws.get_connection(id).map_err(|_| step("its connection no longer exists".into()));
+            let mut review = |p: &ConnectionProfile, sql: &str| -> Result<()> {
+                match policy::review_sql(p, sql).decision {
+                    Decision::Deny(r) => Err(step(r)),
+                    Decision::Confirm(r) => {
+                        confirm.push(format!("step {}: {r}", n.name));
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            };
+            // SQL that runs on the Results DuckDB.
+            let read_outputs = |sql: &str| -> Result<()> {
+                if sql.trim().is_empty() {
+                    return Ok(());
+                }
+                if results.get().is_none() {
+                    let _ = results.set(self.engine.results_connection().map_err(|e| AiError::Internal(e.message))?);
+                }
+                if policy::review_sql(results.get().expect("set above"), sql).kind.is_read() {
+                    Ok(())
+                } else {
+                    Err(step("SQL on DataBrain's outputs (the Results DuckDB) may only read; write into a connection with a load step".into()))
+                }
+            };
             match n.kind {
-                databrain_workspace::JobNodeKind::Query => {
-                    if let Some(c) = n.connection_id.as_deref().filter(|c| !c.is_empty()) {
-                        crate::access::check_sql(&conn(c)?, &n.sql).map_err(|r| AiError::Policy(format!("step {}: {r}", n.name)))?;
-                    }
-                }
+                databrain_workspace::JobNodeKind::Query => match n.connection_id.as_deref().filter(|c| !c.is_empty()) {
+                    Some(c) => review(&conn(c)?, &n.sql)?,
+                    None => read_outputs(&n.sql)?,
+                },
                 databrain_workspace::JobNodeKind::Load => {
-                    if let (Some(c), Some(t)) = (n.target_connection_id.as_deref().filter(|c| !c.is_empty()), n.target_table.as_deref()) {
-                        crate::access::check_write_table(&conn(c)?, t).map_err(|r| AiError::Policy(format!("step {}: {r}", n.name)))?;
+                    read_outputs(&n.sql)?;
+                    if let Some(c) = n.target_connection_id.as_deref().filter(|c| !c.is_empty()) {
+                        let target = conn(c)?;
+                        if let Some(r) = policy::write_denied(&target) {
+                            return Err(step(format!("it loads into \"{}\": {r}", target.name)));
+                        }
+                        if let Some(t) = n.target_table.as_deref() {
+                            crate::access::check_write_table(&target, t).map_err(step)?;
+                        }
+                        for sql in [&n.load_before_sql, &n.load_after_sql].into_iter().flatten().filter(|s| !s.trim().is_empty()) {
+                            review(&target, sql)?;
+                        }
                     }
                 }
-                databrain_workspace::JobNodeKind::Export => {}
+                databrain_workspace::JobNodeKind::Export => read_outputs(&n.sql)?,
             }
         }
-        Ok(())
+        Ok(if confirm.is_empty() { Decision::Ask(ask.into()) } else { Decision::Confirm(confirm.join("; ")) })
     }
 
     async fn run_job(&self, args: &Value) -> Result<ToolOutput> {
@@ -403,7 +449,7 @@ impl ToolContext {
             only_ids.push(n.id.clone());
         }
         let scope = if want.is_empty() { "all steps".to_string() } else { format!("steps {}", want.join(", ")) };
-        self.check_job_tables(&job, &only_ids)?;
+        let decision = self.review_job(&job, &only_ids, "Run a job")?;
         // What a run changes: loads write tables, exports write files.
         let writes: Vec<String> = job
             .nodes
@@ -421,7 +467,7 @@ impl ToolContext {
             if writes.is_empty() { " It only reads data.".to_string() } else { format!(" It changes data: {}.", writes.join("; ")) },
             crate::jobs::describe(&job, &refs)
         );
-        self.gate("run_job", Decision::Ask("Run a job".into()), &format!("\"{}\" ({scope})", job.name), &json!({"preview": preview, "name": job.name}))
+        self.gate("run_job", decision, &format!("\"{}\" ({scope})", job.name), &json!({"preview": preview, "name": job.name}))
             .await?;
         let run_id = self.host.start_job(&job.id, (!only_ids.is_empty()).then_some(only_ids)).await.map_err(AiError::Policy)?;
         let wait = args.get("wait_seconds").and_then(|v| v.as_u64()).unwrap_or(300).clamp(10, 1800);
@@ -470,13 +516,13 @@ impl ToolContext {
         let taken: std::collections::HashSet<String> = ws.job_step_names()?.into_iter().filter(|(_, o)| o.job_id != old.id).map(|(n, _)| n).collect();
         let refs = self.conn_refs()?;
         let (job, notes) = crate::jobs::merge_job(&old, args, &refs, &taken)?;
-        self.check_job_tables(&job, &[])?;
+        let decision = self.review_job(&job, &[], "Change a job")?;
         let changes = crate::jobs::changes(&old, &job);
         if changes.is_empty() {
             return Ok(out("Nothing changes: the job is already like that.", json!({"job_id": old.id, "name": old.name})));
         }
         let preview = format!("Changes:\n{}\n\nAfter the change:\n{}", changes.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"), crate::jobs::describe(&job, &refs));
-        self.gate("update_job", Decision::Ask("Change a job".into()), &format!("\"{}\": {}", old.name, changes.join("; ")), &json!({"preview": preview, "name": old.name}))
+        self.gate("update_job", decision, &format!("\"{}\": {}", old.name, changes.join("; ")), &json!({"preview": preview, "name": old.name}))
             .await?;
         let saved = ws.save_job(job)?;
         let mut text = format!("Updated job \"{}\". It is not run; the user runs it (Run) or its schedule does.\n{preview}", saved.name);
@@ -491,9 +537,9 @@ impl ToolContext {
         let taken: std::collections::HashSet<String> = ws.job_step_names()?.into_iter().map(|(n, _)| n).collect();
         let refs = self.conn_refs()?;
         let (job, notes) = crate::jobs::build_job(args, &refs, &taken)?;
-        self.check_job_tables(&job, &[])?;
+        let decision = self.review_job(&job, &[], "Create a job")?;
         let preview = crate::jobs::describe(&job, &refs);
-        self.gate("create_job", Decision::Ask("Create a job".into()), &format!("\"{}\" with {} steps", job.name, job.nodes.len()), &json!({"preview": preview, "name": job.name}))
+        self.gate("create_job", decision, &format!("\"{}\" with {} steps", job.name, job.nodes.len()), &json!({"preview": preview, "name": job.name}))
             .await?;
         let saved = ws.save_job(job)?;
         let mut text = format!("Created job \"{}\" (id {}). It is not run yet; the user runs it from its tab (Run) or the schedule does.\n{preview}", saved.name, saved.id);
