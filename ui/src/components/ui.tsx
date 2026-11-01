@@ -1,9 +1,31 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangle, CheckCircle2, ChevronDown, Info, X, XCircle } from "lucide-react";
 import { useStore } from "../store";
 import { comboMatches, placeComboList } from "../lib/util";
 import { ExportsTray } from "./ExportsTray";
+
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"]), [contenteditable]:not([contenteditable="false"])';
+
+/** Tab and Shift+Tab cycle inside `root` (a dialog), never out of it. */
+export function trapTab(e: ReactKeyboardEvent, root: HTMLElement | null) {
+  if (e.key !== "Tab" || !root) return;
+  const items = Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) => !el.closest("[inert], [aria-hidden='true']"));
+  if (items.length === 0) {
+    e.preventDefault();
+    return;
+  }
+  const first = items[0];
+  const last = items[items.length - 1];
+  const at = document.activeElement;
+  if (e.shiftKey && (at === first || !root.contains(at))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (at === last || !root.contains(at))) {
+    e.preventDefault();
+    first.focus();
+  }
+}
 
 export function Modal({
   title,
@@ -19,6 +41,7 @@ export function Modal({
   width?: number;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const titleId = useId();
   // Latest onClose without re-running the effects: callers pass a new
   // function on every render, which used to re-focus the first field on each
   // keystroke (typing in a search box lost the cursor).
@@ -38,11 +61,21 @@ export function Modal({
     return () => window.removeEventListener("keydown", onKey, true);
   }, []);
   // Focus once when opened: an autoFocus field, else the first field in the body.
+  // Closing gives focus back to what had it (the button that opened the dialog).
   useEffect(() => {
     const root = ref.current;
-    if (!root || root.contains(document.activeElement)) return;
-    const first = root.querySelector<HTMLElement>("[autofocus], .modal-body input, .modal-body select, .modal-body textarea, input, select, textarea, button");
-    first?.focus();
+    const before = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (root && !root.contains(document.activeElement)) {
+      // In this order: one selector list would return whichever comes first in the
+      // document, i.e. the header's Close button.
+      const first = ["[autofocus]", ".modal-body input, .modal-body select, .modal-body textarea", "input, select, textarea", "button"]
+        .map((q) => root.querySelector<HTMLElement>(q))
+        .find((el) => el);
+      first?.focus();
+    }
+    return () => {
+      if (before?.isConnected) before.focus();
+    };
   }, []);
 
   return createPortal(
@@ -54,12 +87,15 @@ export function Modal({
         ref={ref}
         role="dialog"
         aria-modal="true"
-        aria-label={typeof title === "string" ? title : undefined}
+        aria-labelledby={titleId}
+        onKeyDown={(e) => trapTab(e, ref.current)}
         className="flex max-h-[80vh] flex-col rounded-xl border border-line bg-panel shadow-2xl"
         style={{ width }}
       >
         <div className="flex items-center justify-between border-b border-line px-4 py-3">
-          <div className="text-[14px] font-semibold">{title}</div>
+          <div id={titleId} className="text-[14px] font-semibold">
+            {title}
+          </div>
           <button className="icon-btn" onClick={onClose} aria-label="Close">
             <X size={15} />
           </button>

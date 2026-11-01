@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useStickToBottom } from "../lib/hooks";
 import { createPortal } from "react-dom";
 import {
   AlertCircle,
@@ -264,9 +265,8 @@ function Chat({ chatId }: { chatId: string }) {
   const conn = connections.find((c) => c.id === connId);
   const provider = providers.find((p) => p.id === providerId);
 
-  useEffect(() => {
-    scroller.current?.scrollTo({ top: scroller.current.scrollHeight });
-  }, [items]);
+  // Follows the answer while the user is at the bottom; scrolling up to read stops it.
+  const stick = useStickToBottom(scroller, items);
 
   useEffect(() => {
     const onPrefill = (e: Event) => {
@@ -324,6 +324,7 @@ function Chat({ chatId }: { chatId: string }) {
       ...(mentions.length ? { mentions } : {}),
       ...(jobTab ? { open_job_id: jobTab.id, open_job_name: jobTab.name } : {}),
     };
+    stick.pin();
     void send({ chatId, message: msg.trim(), mode: m, connectionId: connId, targetKey: jobTab ? null : undefined, context: Object.keys(context).length ? context : undefined });
     setText("");
     setMode("chat");
@@ -333,7 +334,7 @@ function Chat({ chatId }: { chatId: string }) {
 
   return (
     <>
-      <div ref={scroller} className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
+      <div ref={scroller} onScroll={stick.onScroll} className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
         {providers.length === 0 && (
           <div className="rounded-lg border border-line bg-panel-2 p-3 text-[12.5px]">
             <div className="mb-1 flex items-center gap-2 font-semibold">

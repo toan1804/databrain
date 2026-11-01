@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from "react";
+import { treeKeyDown } from "../lib/treeKeys";
 import { ChevronDown, ChevronRight, Folder as FolderIcon, FolderOpen, FolderPlus, Pencil, Plus, Trash2 } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { Folder, FolderKind } from "../lib/types";
@@ -158,7 +159,10 @@ export function FolderTree<T>({
           tabIndex={0}
           {...dropProps(f.id)}
           onClick={() => toggle(f.id)}
-          onKeyDown={(e) => e.key === "Enter" && toggle(f.id)}
+          onKeyDown={(e) => {
+            if (treeKeyDown(e, { expanded, toggle: () => toggle(f.id) })) return;
+            if (e.key === "Enter") toggle(f.id);
+          }}
           onContextMenu={(e) => {
             e.preventDefault();
             setMenu({ folder: f, x: e.clientX, y: e.clientY });

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useFindInResult } from "./useFindInResult";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import {
   AlertCircle,
@@ -557,25 +558,20 @@ export function ResultView({
     return () => clearTimeout(t);
   }, [quick]);
 
-  // Find within the current view.
-  useEffect(() => {
-    if (!findOpen || !plan.term) {
-      setFind({ matches: [], truncated: false });
-      return;
-    }
-    const t = setTimeout(async () => {
-      try {
-        const r = await api.findInResult(info.id, view, plan.term, 10_000, plan.columns, wholeWord);
-        setFind(r);
-        setFindIdx(0);
-        if (r.matches[0]) grid.current?.scrollToCell(r.matches[0].col, r.matches[0].row);
-      } catch (e) {
-        toast(toError(e).message, "error");
-      }
-    }, 200);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `plan` is rebuilt every render; its term and columns are the key
-  }, [findOpen, plan.term, plan.columns?.join(","), wholeWord, view, info.id, toast]);
+  // Find within the current view (the latest search only).
+  useFindInResult({
+    open: findOpen,
+    plan,
+    wholeWord,
+    view,
+    resultId: info.id,
+    onResult: (r) => {
+      setFind(r);
+      setFindIdx(0);
+      if (r.matches[0]) grid.current?.scrollToCell(r.matches[0].col, r.matches[0].row);
+    },
+    onError: (e) => toast(toError(e).message, "error"),
+  });
 
   /** Scroll to a column (keeps the current match row when there is one). */
   const jumpToColumn = (col: number) => grid.current?.scrollToCell(col, find.matches[findIdx]?.row ?? 0);

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { treeKeyDown } from "../lib/treeKeys";
 import { useEvent } from "../lib/hooks";
 import { traitsOf } from "../lib/sourceTraits";
 import {
@@ -336,6 +337,7 @@ function Row({
       onDoubleClick={onDoubleClick}
       onContextMenu={onContextMenu}
       onKeyDown={(e) => {
+        if (treeKeyDown(e, { expanded, toggle: onClick })) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           onClick?.();
