@@ -2,7 +2,9 @@
 
 A desktop SQL client for many databases, with column lineage, scheduled jobs and an AI assistant. Built with Rust, Tauri 2 and React.
 
-[Download](#download) · [Features](docs/FEATURES.md) · [Architecture](docs/ARCHITECTURE.md) · [Building and releasing](docs/RELEASING.md)
+[Download](#download) · [Features](docs/FEATURES.md) · [Architecture](docs/ARCHITECTURE.md) · [Building and releasing](docs/RELEASING.md) · [Changelog](CHANGELOG.md)
+
+![A query on Postgres with its results](docs/screenshots/query-results.png)
 
 ## Download
 
@@ -18,6 +20,14 @@ All versions are on the [Releases](https://github.com/toan1804/databrain/release
 > Until a release is signed with a Developer ID (see [Signing](docs/RELEASING.md#signing-and-in-app-updates)), move DataBrain.app to Applications, then right-click it → **Open** the first time.
 
 The "without DuckDB" build is about 85 MB instead of 290 MB and uses the DuckDB library installed on the computer (1.5 or newer, e.g. `brew install duckdb`).
+
+## Screenshots
+
+| AI assistant | ER diagram | Job canvas |
+|---|---|---|
+| ![The AI assistant answering from the database](docs/screenshots/ai-assistant.png) | ![ER diagram of a schema](docs/screenshots/er-diagram.png) | ![A scheduled job of three steps](docs/screenshots/job-canvas.png) |
+
+The screenshots are made from the UI with sample data (`cd ui && npm run screenshots`, Playwright against the mocked backend in `ui/e2e`).
 
 ## Features
 
@@ -95,3 +105,7 @@ ui/                React, TypeScript, Vite and Tailwind
 ```
 
 To add a database type, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §5.2 (source traits) and §5.4 (adding a database type).
+
+## License
+
+DataBrain is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option. Unless you state otherwise, any contribution you submit for inclusion is dual licensed as above, without additional terms or conditions.

@@ -10,6 +10,7 @@
     "test": "vitest run",
     "lint": "eslint . --max-warnings 0",
     "e2e": "tsc -p e2e/tsconfig.json && playwright test",
+    "screenshots": "tsc -p e2e/tsconfig.json && playwright test -c playwright.screenshots.config.ts",
     "tauri": "node ../scripts/tauri.mjs",
     "app:dev": "node ../scripts/tauri.mjs dev",
     "app:build": "node ../scripts/tauri.mjs build",

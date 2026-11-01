@@ -7,6 +7,8 @@ const PORT = 1431;
 
 export default defineConfig({
   testDir: "e2e",
+  // README screenshots have their own config (playwright.screenshots.config.ts).
+  testIgnore: "screenshots/**",
   timeout: 30_000,
   expect: { timeout: 7_000 },
   fullyParallel: true,
