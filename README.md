@@ -56,7 +56,10 @@ npm run app:build:no-duckdb   # bundle that uses the computer's DuckDB
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cd ui && npm test && npm run build
+npx playwright install chromium && npm run e2e   # UI smoke tests (in ui/)
 ```
+
+The UI smoke tests (`ui/e2e`, Playwright) run the app in Chromium against a mocked backend (`ui/e2e/tauri-mock.js` answers the Tauri commands from test data and lets a test push backend events): the explorer (tree, columns, ER diagram), the job canvas (adding and linking steps, step details, run progress) and the AI panel (streamed answers, approvals, errors).
 
 The TypeScript types of what the backend sends are generated from the Rust types: `cargo test` writes them to `ui/src/lib/bindings` (commit them; CI checks they are current).
 

@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b",
     "test": "vitest run",
+    "e2e": "tsc -p e2e/tsconfig.json && playwright test",
     "tauri": "node ../scripts/tauri.mjs",
     "app:dev": "node ../scripts/tauri.mjs dev",
     "app:build": "node ../scripts/tauri.mjs build",
@@ -36,8 +37,10 @@
     "zustand": "5.0.15"
   },
   "devDependencies": {
+    "@playwright/test": "1.64.1",
     "@tailwindcss/vite": "4.3.3",
     "@tauri-apps/cli": "2.11.5",
+    "@types/node": "20.19.43",
     "@types/react": "18.3.31",
     "@types/react-dom": "18.3.7",
     "@vitejs/plugin-react": "5.2.0",
