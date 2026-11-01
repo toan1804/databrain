@@ -156,6 +156,8 @@ impl Workspace {
             s.created_at = now;
         }
         s.updated_at = now;
+        // The title is made from the first question.
+        s.title = databrain_connector_core::sql::redact_text(&s.title);
         self.conn.lock().execute(
             "INSERT INTO ai_sessions (id, title, connection_id, provider_id, model, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT(id) DO UPDATE SET title = excluded.title, connection_id = excluded.connection_id, \
@@ -197,6 +199,10 @@ impl Workspace {
         Ok(ids.len())
     }
 
+    /// Add a message to a conversation. Passwords and keys in it (SQL the
+    /// assistant ran or proposed, a connection string in a question, a tool
+    /// result quoting them) are replaced by `***` first, as in the audit log:
+    /// the kept transcript is also what the next turn sends the model.
     pub fn add_ai_message(
         &self,
         session_id: &str,
@@ -208,7 +214,7 @@ impl Workspace {
         let now = now_ms();
         c.execute(
             "INSERT INTO ai_messages (session_id, role, content_json, tokens_in, tokens_out, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![session_id, role, serde_json::to_string(content)?, tokens.0, tokens.1, now],
+            params![session_id, role, serde_json::to_string(&redact_json(content))?, tokens.0, tokens.1, now],
         )?;
         let id = c.last_insert_rowid();
         c.execute("UPDATE ai_sessions SET updated_at = ?1 WHERE id = ?2", params![now, session_id])?;
@@ -257,19 +263,10 @@ impl Workspace {
         decision: &str,
         summary: Option<&str>,
     ) -> Result<()> {
-        // Passwords and keys in SQL the assistant ran or proposed are not kept.
-        fn redact(v: &serde_json::Value) -> serde_json::Value {
-            match v {
-                serde_json::Value::String(s) => serde_json::Value::String(databrain_connector_core::sql::redact_secrets(s)),
-                serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(redact).collect()),
-                serde_json::Value::Object(o) => serde_json::Value::Object(o.iter().map(|(k, v)| (k.clone(), redact(v))).collect()),
-                other => other.clone(),
-            }
-        }
-        let summary = summary.map(databrain_connector_core::sql::redact_secrets);
+        let summary = summary.map(databrain_connector_core::sql::redact_text);
         self.conn.lock().execute(
             "INSERT INTO ai_audit (session_id, connection_id, tool, args_json, decision, summary, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![session_id, connection_id, tool, serde_json::to_string(&redact(args))?, decision, summary, now_ms()],
+            params![session_id, connection_id, tool, serde_json::to_string(&redact_json(args))?, decision, summary, now_ms()],
         )?;
         Ok(())
     }
@@ -294,6 +291,16 @@ impl Workspace {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+}
+
+/// Every string in `v` without passwords and keys ([`redact_text`](databrain_connector_core::sql::redact_text)).
+pub(crate) fn redact_json(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => serde_json::Value::String(databrain_connector_core::sql::redact_text(s)),
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(redact_json).collect()),
+        serde_json::Value::Object(o) => serde_json::Value::Object(o.iter().map(|(k, v)| (k.clone(), redact_json(v))).collect()),
+        other => other.clone(),
     }
 }
 
@@ -332,5 +339,67 @@ mod tests {
         assert_eq!(ws.prune_ai_history().unwrap(), 1);
         assert!(ws.list_ai_messages(&a.id).unwrap().is_empty());
         assert_eq!(ws.ai_token_totals("p2", 0).unwrap(), (5, 5), "recent conversation kept");
+    }
+
+    /// What a conversation keeps: no passwords or keys in the question, the
+    /// title, tool calls' SQL or tool results; the same in the audit log.
+    #[test]
+    fn transcripts_are_redacted() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let s = ws.save_ai_session(AiSessionRecord { id: String::new(), title: "use postgres://ann:hunter2@db/app".into(), connection_id: None, provider_id: None, model: None, created_at: 0, updated_at: 0 }).unwrap();
+        assert_eq!(ws.get_ai_session(&s.id).unwrap().title, "use postgres://ann:***@db/app");
+        let user = serde_json::json!({"role": "user", "text": "Connect with postgres://ann:hunter2@db/app and run create user bob identified by 'pw1'"});
+        let assistant = serde_json::json!({"role": "assistant", "text": "", "tool_calls": [{"id": "c1", "name": "run_query", "arguments": {"sql": "ALTER ROLE r PASSWORD 'pw2'", "n": 3}}]});
+        let tool = serde_json::json!({"role": "tool", "text": "Statement 1 failed: near \"SECRET 'pw3'\"", "tool_call_id": "c1"});
+        for (role, m) in [("user", &user), ("assistant", &assistant), ("tool", &tool)] {
+            ws.add_ai_message(&s.id, role, m, (None, None)).unwrap();
+        }
+        let kept: Vec<serde_json::Value> = ws.list_ai_messages(&s.id).unwrap().into_iter().map(|m| m.content).collect();
+        let all = serde_json::to_string(&kept).unwrap();
+        for secret in ["hunter2", "pw1", "pw2", "pw3"] {
+            assert!(!all.contains(secret), "{secret} kept: {all}");
+        }
+        assert_eq!(kept[0]["text"], "Connect with postgres://ann:***@db/app and run create user bob identified by '***'");
+        assert_eq!(kept[1]["tool_calls"][0]["arguments"], serde_json::json!({"sql": "ALTER ROLE r PASSWORD '***'", "n": 3}), "structure and other values kept");
+        assert_eq!(kept[2]["tool_call_id"], "c1");
+        ws.add_audit(Some(&s.id), None, "run_query", &serde_json::json!({"sql": "attach 'mysql://root:pw4@h/db'"}), "approved", Some("password 'pw5'")).unwrap();
+        let a = &ws.list_audit(1).unwrap()[0];
+        assert_eq!(a.args["sql"], "attach 'mysql://root:***@h/db'");
+        assert_eq!(a.summary.as_deref(), Some("password '***'"));
+    }
+
+    /// Conversations kept before redaction are cleaned once when the workspace opens.
+    #[test]
+    fn redacts_kept_transcripts_once() {
+        let dir = std::env::temp_dir().join(format!("databrain-ws-redact-{}", crate::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ws.db");
+        let id = {
+            let ws = Workspace::open(&path).unwrap();
+            let s = ws.save_ai_session(AiSessionRecord { id: String::new(), title: "t".into(), connection_id: None, provider_id: None, model: None, created_at: 0, updated_at: 0 }).unwrap();
+            let c = ws.conn.lock();
+            // As an older version kept them.
+            c.execute("UPDATE ai_sessions SET title = 'about mongodb://u:old1@h' WHERE id = ?1", [&s.id]).unwrap();
+            c.execute(
+                "INSERT INTO ai_messages (session_id, role, content_json, created_at) VALUES (?1, 'user', ?2, 0)",
+                rusqlite::params![s.id, serde_json::json!({"role": "user", "text": "create user u identified by old2"}).to_string()],
+            )
+            .unwrap();
+            c.execute("INSERT INTO ai_messages (session_id, role, content_json, created_at) VALUES (?1, 'tool', 'not json: password ''old3''', 0)", [&s.id]).unwrap();
+            c.execute("INSERT INTO ai_audit (tool, args_json, decision, summary, created_at) VALUES ('run_query', ?1, 'approved', 'mysql://r:old4@h', 0)", [serde_json::json!({"sql": "attach 'pg://a:old5@h'"}).to_string()]).unwrap();
+            c.execute("DELETE FROM maintenance WHERE name = 'transcripts_redacted_v1'", []).unwrap();
+            s.id
+        };
+        let ws = Workspace::open(&path).unwrap();
+        assert_eq!(ws.get_ai_session(&id).unwrap().title, "about mongodb://u:***@h");
+        let raw: Vec<String> = ws.conn.lock().prepare("SELECT content_json FROM ai_messages ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert!(raw[0].contains("identified by ***") && !raw[0].contains("old2"), "{}", raw[0]);
+        assert_eq!(raw[1], "not json: password '***'");
+        let a = &ws.list_audit(1).unwrap()[0];
+        assert_eq!((a.args["sql"].as_str(), a.summary.as_deref()), (Some("attach 'pg://a:***@h'"), Some("mysql://r:***@h")));
+        let done: i64 = ws.conn.lock().query_row("SELECT count(*) FROM maintenance WHERE name = 'transcripts_redacted_v1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(done, 1);
+        drop(ws);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

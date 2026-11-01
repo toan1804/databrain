@@ -1329,3 +1329,90 @@ pub fn redact_secrets(sql: &str) -> String {
     out
 }
 
+/// `text` with the password of every `scheme://user:password@host` in it
+/// replaced by `***` (connection strings pasted into a question, `ATTACH
+/// 'postgres://u:pw@h'`). The user stays; a URL without a password is kept.
+pub fn redact_url_passwords(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        let start = i + 3;
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        // The authority: up to the path, query, fragment or the end of the URL in the text.
+        let end = rest.find(|c: char| matches!(c, '/' | '?' | '#' | '\'' | '"' | '`' | '<' | '>' | '(' | ')') || c.is_whitespace()).unwrap_or(rest.len());
+        if let Some(at) = rest[..end].rfind('@') {
+            if let Some(colon) = rest[..at].find(':') {
+                out.push_str(&rest[..colon + 1]);
+                out.push_str("***");
+                rest = &rest[at..];
+                continue;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What DataBrain keeps of text that may quote SQL or connection strings
+/// (AI transcripts and audit): [`redact_secrets`] and [`redact_url_passwords`].
+/// Text in double quotes is redacted too: error messages quote the SQL they
+/// failed on that way (`syntax error at or near "PASSWORD 'pw'"`).
+pub fn redact_text(text: &str) -> String {
+    let sql = redact_secrets(text);
+    let quoted = sql.split('"').enumerate().map(|(i, part)| if i % 2 == 1 { redact_secrets(part) } else { part.to_string() }).collect::<Vec<_>>().join("\"");
+    redact_url_passwords(&quoted)
+}
+
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn redacts_passwords_and_keys_in_sql() {
+        for (sql, want) in [
+            ("CREATE USER u IDENTIFIED BY hunter2", "CREATE USER u IDENTIFIED BY ***"),
+            ("create user u identified by 'p@ss'", "create user u identified by '***'"),
+            ("CREATE USER u IDENTIFIED WITH mysql_native_password BY 'pw'", "CREATE USER u IDENTIFIED WITH mysql_native_password BY '***'"),
+            ("ALTER USER u IDENTIFIED WITH 'caching_sha2_password' AS 'hash'", "ALTER USER u IDENTIFIED WITH 'caching_sha2_password' AS '***'"),
+            ("ALTER ROLE r WITH PASSWORD 'pw'", "ALTER ROLE r WITH PASSWORD '***'"),
+            ("CREATE LOGIN l WITH PASSWORD = 'pw'", "CREATE LOGIN l WITH PASSWORD = '***'"),
+            ("SET PASSWORD = PASSWORD('pw')", "SET PASSWORD = PASSWORD('***')"),
+            ("CREATE SECRET s (TYPE s3, KEY_ID 'id', SECRET 'k')", "CREATE SECRET s (TYPE s3, KEY_ID 'id', SECRET '***')"),
+            ("COPY INTO t FROM 's3://b' CREDENTIALS = (AWS_KEY_ID = 'id' AWS_SECRET_KEY = 'k')", "COPY INTO t FROM 's3://b' CREDENTIALS = (AWS_KEY_ID = 'id' AWS_SECRET_KEY = '***')"),
+            ("ALTER USER u SET RSA_PUBLIC_KEY = 'pub', PRIVATE_KEY = \"k\"", "ALTER USER u SET RSA_PUBLIC_KEY = 'pub', PRIVATE_KEY = \"***\""),
+            ("select 'it''s' as password", "select 'it''s' as password"),
+        ] {
+            assert_eq!(redact_secrets(sql), want, "{sql}");
+        }
+        // Words inside literals and comments, and other literals, are left alone.
+        let keep = "select 'password ''x''' from t -- password 'y'\n/* identified by z */ where name = 'secret'";
+        assert_eq!(redact_secrets(keep), keep);
+        assert_eq!(redact_secrets("select token from sessions"), "select token from sessions", "a column named like a secret");
+        assert_eq!(redact_secrets("pw = 'x'"), "pw = 'x'");
+        // Unterminated literal: redacted to the end.
+        assert_eq!(redact_secrets("alter role r password 'unfinished"), "alter role r password '***'");
+    }
+
+    #[test]
+    fn redacts_url_passwords_in_text() {
+        for (text, want) in [
+            ("postgres://ann:s3cret@db.example.com:5432/app", "postgres://ann:***@db.example.com:5432/app"),
+            ("connect to mongodb+srv://u:p%40ss@cluster0.x.net/?retryWrites=true please", "connect to mongodb+srv://u:***@cluster0.x.net/?retryWrites=true please"),
+            ("ATTACH 'mysql://root:pw@localhost/shop' AS m", "ATTACH 'mysql://root:***@localhost/shop' AS m"),
+            ("two: a://x:1@h and b://y:2@k", "two: a://x:***@h and b://y:***@k"),
+            ("user:p@ss with @ in it: s://u:p@ss@host/db", "user:p@ss with @ in it: s://u:***@host/db"),
+        ] {
+            assert_eq!(redact_url_passwords(text), want, "{text}");
+        }
+        for keep in ["https://example.com:8443/a@b", "s3://bucket/key", "neo4j://user@host", "no url here: a:b@c", "x://"] {
+            assert_eq!(redact_url_passwords(keep), keep);
+        }
+        assert_eq!(redact_text("create user u identified by 'pw'; -- from postgres://a:b@h"), "create user u identified by '***'; -- from postgres://a:***@h");
+        assert_eq!(redact_text("syntax error at or near \"PASSWORD 'pw'\""), "syntax error at or near \"PASSWORD '***'\"");
+        assert_eq!(redact_text("alter role r password \"pw\""), "alter role r password \"***\"");
+        let plain = "column \"a\" of \"t\" says \"hello\"";
+        assert_eq!(redact_text(plain), plain);
+    }
+}

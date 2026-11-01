@@ -723,7 +723,50 @@ impl Workspace {
         let ws = Self { conn: Mutex::new(conn) };
         // Best effort: a failure must not keep the workspace from opening.
         let _ = ws.redact_kept_sql();
+        let _ = ws.redact_kept_transcripts();
         Ok(ws)
+    }
+
+    /// Once: remove passwords and keys from AI conversations kept before
+    /// they were redacted on the way in (messages and titles; see
+    /// [`Self::add_ai_message`]), and connection-string passwords from the
+    /// audit log.
+    fn redact_kept_transcripts(&self) -> Result<()> {
+        const DONE: &str = "transcripts_redacted_v1";
+        let done: bool = self.conn.lock().query_row("SELECT count(*) > 0 FROM maintenance WHERE name = ?1", [DONE], |r| r.get(0))?;
+        if done {
+            return Ok(());
+        }
+        use databrain_connector_core::sql::redact_text;
+        let json_text = |s: &str| serde_json::from_str::<serde_json::Value>(s).map(|v| ai::redact_json(&v).to_string()).unwrap_or_else(|_| redact_text(s));
+        {
+            let c = self.conn.lock();
+            let tx = c.unchecked_transaction()?;
+            let rows: Vec<(i64, String)> = tx.prepare("SELECT id, content_json FROM ai_messages")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            for (id, content) in rows {
+                let c2 = json_text(&content);
+                if c2 != content {
+                    tx.execute("UPDATE ai_messages SET content_json = ?2 WHERE id = ?1", params![id, c2])?;
+                }
+            }
+            let rows: Vec<(String, String)> = tx.prepare("SELECT id, title FROM ai_sessions")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            for (id, title) in rows {
+                let t2 = redact_text(&title);
+                if t2 != title {
+                    tx.execute("UPDATE ai_sessions SET title = ?2 WHERE id = ?1", params![id, t2])?;
+                }
+            }
+            let rows: Vec<(i64, String, Option<String>)> = tx.prepare("SELECT id, args_json, summary FROM ai_audit")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+            for (id, args, summary) in rows {
+                let (a2, s2) = (json_text(&args), summary.as_deref().map(redact_text));
+                if a2 != args || s2 != summary {
+                    tx.execute("UPDATE ai_audit SET args_json = ?2, summary = ?3 WHERE id = ?1", params![id, a2, s2])?;
+                }
+            }
+            tx.commit()?;
+        }
+        self.conn.lock().execute("INSERT OR IGNORE INTO maintenance (name, done_at) VALUES (?1, ?2)", params![DONE, now_ms()])?;
+        Ok(())
     }
 
     /// Once: remove passwords and keys from what was kept before they were
