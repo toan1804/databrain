@@ -55,6 +55,7 @@ npm run app:build:no-duckdb   # bundle that uses the computer's DuckDB
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets
+cargo deny check                                  # advisories, licenses, sources (deny.toml)
 cd ui && npm run lint && npm test && npm run build
 npx playwright install chromium && npm run e2e   # UI smoke tests (in ui/)
 ```

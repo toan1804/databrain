@@ -12,13 +12,14 @@ workspace = true
 [dependencies]
 aes-gcm = "0.11.1"
 async-trait = "0.1.92"
+# RSA signing (key-pair JWT) and SHA-256: constant-time, already built for rustls/russh.
+aws-lc-rs = "1.18.1"
 base64 = "0.23.1"
 dirs = "7.0.0"
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 pkcs8 = { version = "0.10.2", features = ["encryption", "pem"] }
 rand = "0.8"
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "json", "form", "query", "http2", "charset"] }
-rsa = { version = "0.9.10", features = ["pem", "sha2"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

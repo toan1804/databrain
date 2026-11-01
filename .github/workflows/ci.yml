@@ -79,6 +79,16 @@ jobs:
           git status --porcelain ui/src/lib/bindings
           test -z "$(git status --porcelain ui/src/lib/bindings)" || { echo "Run cargo test and commit ui/src/lib/bindings"; exit 1; }
 
+  # Dependencies: RustSec advisories, licenses, sources (deny.toml).
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
   # The UI in Chromium against a mocked backend (ui/e2e): the explorer, the
   # job canvas and the AI panel.
   e2e:

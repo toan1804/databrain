@@ -52,9 +52,9 @@ dirs = "7.0.0"
 # Gzipped DuckDB extensions in signed macOS bundles (seed_duckdb_extensions).
 flate2 = "1.1.10"
 # DBeaver's credentials-config.json (AES-128-CBC) and DataGrip's dataSources.xml.
-aes = "=0.8.4"
-cbc = { version = "=0.1.2", features = ["alloc"] }
-quick-xml = "=0.38.4"
+aes = "0.8.4"
+cbc = { version = "0.1.2", features = ["alloc"] }
+quick-xml = "0.42.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "json"] }
 parking_lot = "0.12.5"
 secrecy = "0.10.3"
@@ -67,7 +67,7 @@ tauri-plugin-opener = "2"
 # Installs updates in place (macOS .app.tar.gz, Windows NSIS, Linux AppImage);
 # active in builds made with an updater public key (DATABRAIN_UPDATER_PUBKEY).
 tauri-plugin-updater = "2"
-chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = "0.7.19"
 uuid = { version = "1.26.1", features = ["v4"] }

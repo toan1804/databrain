@@ -512,7 +512,10 @@ struct XmlSource {
 }
 
 fn attrs_of(e: &quick_xml::events::BytesStart) -> HashMap<String, String> {
-    e.attributes().flatten().filter_map(|a| Some((String::from_utf8_lossy(a.key.as_ref()).into_owned(), a.unescape_value().ok()?.into_owned()))).collect()
+    e.attributes()
+        .flatten()
+        .filter_map(|a| Some((a.key.as_ref().to_owned(), a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok()?.into_owned())))
+        .collect()
 }
 
 /// `<data-source …>` elements of a JetBrains data sources file, with the
@@ -532,14 +535,14 @@ fn xml_sources(text: &str) -> std::result::Result<Vec<XmlSource>, String> {
     };
     loop {
         match r.read_event().map_err(|e| e.to_string())? {
-            Event::Start(e) if e.name().as_ref() == b"data-source" => {
+            Event::Start(e) if e.name().as_ref() == "data-source" => {
                 cur = Some(XmlSource { attrs: attrs_of(&e), ..Default::default() });
                 path.clear();
             }
             // `<data-source … />`: no children.
-            Event::Empty(e) if e.name().as_ref() == b"data-source" => out.push(XmlSource { attrs: attrs_of(&e), ..Default::default() }),
-            Event::Start(e) if cur.is_some() => path.push(String::from_utf8_lossy(e.name().as_ref()).into_owned()),
-            Event::End(e) if e.name().as_ref() == b"data-source" => {
+            Event::Empty(e) if e.name().as_ref() == "data-source" => out.push(XmlSource { attrs: attrs_of(&e), ..Default::default() }),
+            Event::Start(e) if cur.is_some() => path.push(e.name().as_ref().to_owned()),
+            Event::End(e) if e.name().as_ref() == "data-source" => {
                 if let Some(src) = cur.take() {
                     out.push(src);
                 }
@@ -547,20 +550,16 @@ fn xml_sources(text: &str) -> std::result::Result<Vec<XmlSource>, String> {
             Event::End(_) if cur.is_some() => {
                 path.pop();
             }
-            Event::Text(t) => {
-                if let Ok(v) = t.decode() {
-                    text_of(&mut cur, &path, &v);
-                }
-            }
+            Event::Text(t) => text_of(&mut cur, &path, &t),
             Event::GeneralRef(g) => {
                 let v = match g.resolve_char_ref() {
                     Ok(Some(ch)) => ch.to_string(),
-                    _ => match g.decode().as_deref() {
-                        Ok("amp") => "&".into(),
-                        Ok("lt") => "<".into(),
-                        Ok("gt") => ">".into(),
-                        Ok("quot") => "\"".into(),
-                        Ok("apos") => "'".into(),
+                    _ => match &*g {
+                        "amp" => "&".into(),
+                        "lt" => "<".into(),
+                        "gt" => ">".into(),
+                        "quot" => "\"".into(),
+                        "apos" => "'".into(),
                         _ => String::new(),
                     },
                 };

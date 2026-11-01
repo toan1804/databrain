@@ -1,0 +1,94 @@
+# cargo-deny: `cargo deny check` (CI runs it on every push and pull request).
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = false
+
+[advisories]
+# RustSec advisories: vulnerabilities fail, and so do unmaintained or
+# yanked crates. An exception goes in `ignore` with why it doesn't apply.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+ignore = [
+  # --- Fixed in releases that need Rust 1.88+ (the workspace's rust-version
+  # is 1.87). Raising it lets tiberius 0.13, time 0.3.47 and zip 9 in; then
+  # remove these entries.
+
+  # rustls 0.21 / rustls-webpki 0.101, through tiberius 0.12 (SQL Server TLS;
+  # rustls, not the OS's TLS, because macOS's broke off handshakes with some
+  # servers). tiberius 0.13 uses rustls 0.23 but needs Rust 1.88.
+  { id = "RUSTSEC-2026-0346", reason = "rustls 0.21 via tiberius 0.12: secrets only leak through Debug output, and DataBrain doesn't Debug-format TLS sessions; fixed by tiberius 0.13 (Rust 1.88)" },
+  { id = "RUSTSEC-2026-0349", reason = "rustls 0.21 via tiberius 0.12 (0.21 has no post-quantum key exchange to downgrade from); 0.23 is updated; fixed by tiberius 0.13 (Rust 1.88)" },
+  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101 via tiberius 0.12 (SQL Server certificates); fixed by tiberius 0.13 (Rust 1.88)" },
+  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101 via tiberius 0.12 (SQL Server certificates); fixed by tiberius 0.13 (Rust 1.88)" },
+  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101 via tiberius 0.12: DataBrain doesn't check CRLs; fixed by tiberius 0.13 (Rust 1.88)" },
+  { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101 via tiberius 0.12 (0.103 is updated); fixed by tiberius 0.13 (Rust 1.88)" },
+  # time 0.3.45 (bson, cookie, tauri): stack exhaustion on hostile format
+  # descriptions; time 0.3.47 needs Rust 1.88.
+  { id = "RUSTSEC-2026-0009", reason = "time 0.3.45: DataBrain parses no untrusted format descriptions; 0.3.47 needs Rust 1.88" },
+  # zip: the advisories are about extract(). DataBrain's own xlsx reader
+  # opens entries by name and never extracts; libduckdb-sys uses zip in its
+  # build script on its own sources; tauri-plugin-updater extracts only
+  # updates whose signature checked. zip 9 needs Rust 1.88.
+  { id = "RUSTSEC-2026-0367", reason = "zip extract(): not used on untrusted archives (see above); zip 9 needs Rust 1.88" },
+  { id = "RUSTSEC-2026-0368", reason = "zip extract(): not used on untrusted archives (see above); zip 9 needs Rust 1.88" },
+  { id = "RUSTSEC-2026-0369", reason = "zip extract(): not used on untrusted archives (see above); zip 9 needs Rust 1.88" },
+
+  # --- Upstream has no fix in a version DataBrain can take yet.
+
+  # rsa 0.10 release candidate, through russh (SSH tunnels: RSA user keys).
+  # No fixed rsa release exists. DataBrain's own RSA signing (key-pair JWT)
+  # moved to aws-lc-rs, so rsa 0.9 is gone.
+  { id = "RUSTSEC-2023-0071", reason = "rsa via russh only: one client-side signature per SSH login, no decryption oracle; no fixed rsa release" },
+  # hickory-proto 0.25 through mongodb (SRV lookups for mongodb+srv://).
+  { id = "RUSTSEC-2026-0118", reason = "hickory-proto via mongodb: DNSSEC validation, a feature that isn't enabled" },
+  { id = "RUSTSEC-2026-0119", reason = "hickory-proto via mongodb: slow encoding of DNS messages with many names; DataBrain sends single SRV/TXT queries" },
+  # quick-xml 0.38 through plist (tauri reads the app's own Info.plist).
+  # DataBrain's own XML reader (DataGrip import) is on quick-xml 0.42.
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.38 via plist/tauri: parses the app's own plist files only" },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.38 via plist/tauri: NsReader is not used" },
+  # zstd 0.13 / zstd-safe 7 through arrow-ipc and parquet 59 (spill files,
+  # Parquet export, Databricks Arrow results). Accepted until arrow moves: a
+  # newer arrow has to match the duckdb crate's (arrow 58), so it moves with
+  # duckdb.
+  { id = "RUSTSEC-2026-0391", reason = "zstd via arrow/parquet: they use the one-shot bulk API, not abandoned streaming contexts; moves with arrow/duckdb" },
+  { id = "RUSTSEC-2026-0398", reason = "zstd-safe Seekable: the seekable feature is not enabled" },
+  { id = "RUSTSEC-2026-0403", reason = "zstd-safe legacy frames (default feature of zstd): accepted until arrow/parquet move with duckdb" },
+]
+
+[licenses]
+version = 2
+# What DataBrain (MIT OR Apache-2.0) may ship.
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  # Weak copyleft, file-level: fine to link; changes to those files stay MPL.
+  "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true
+
+[bans]
+# Two versions of one crate: reported, not failed (the tree has many,
+# from upstream crates).
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

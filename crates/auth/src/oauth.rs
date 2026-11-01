@@ -5,7 +5,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngCore;
-use rsa::sha2::{Digest, Sha256};
+use aws_lc_rs::digest::{SHA256, digest};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -117,7 +117,7 @@ pub struct Pkce {
 
 pub fn pkce() -> Pkce {
     let verifier = random_token(48);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let challenge = URL_SAFE_NO_PAD.encode(digest(&SHA256, verifier.as_bytes()));
     Pkce {
         verifier,
         challenge,
@@ -467,7 +467,7 @@ mod tests {
         assert!(p.verifier.len() >= 43);
         assert_eq!(
             p.challenge,
-            URL_SAFE_NO_PAD.encode(Sha256::digest(p.verifier.as_bytes()))
+            URL_SAFE_NO_PAD.encode(digest(&SHA256, p.verifier.as_bytes()))
         );
     }
 
