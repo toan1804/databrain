@@ -1,93 +1,100 @@
-// Types mirroring the Rust backend (serde representations).
+// Types of what the backend sends and receives (serde representations).
+//
+// Generated from the Rust types (ts-rs, `cargo test` writes ./bindings):
+// change those, not these. The rest of this file is still written by hand.
+import type { JobNodeKind } from "./bindings/JobNodeKind";
+import type { FileFormat } from "./bindings/FileFormat";
+import type { LoadMode } from "./bindings/LoadMode";
+import type { NodeRunSummary } from "./bindings/NodeRunSummary";
+import type { StepProgress } from "./bindings/StepProgress";
+import type { RunLogEntry } from "./bindings/RunLogEntry";
+import type { JobNode } from "./bindings/JobNode";
+import type { JobEdge } from "./bindings/JobEdge";
+import type { JobSchedule } from "./bindings/JobSchedule";
+import type { Job } from "./bindings/Job";
+import type { JobSummary } from "./bindings/JobSummary";
+import type { NodeRunRecord } from "./bindings/NodeRunRecord";
+import type { JobRun } from "./bindings/JobRun";
+import type { ConnectorKind } from "./bindings/ConnectorKind";
+import type { SslMode } from "./bindings/SslMode";
+import type { EnvTag } from "./bindings/EnvTag";
+import type { OAuthParams } from "./bindings/OAuthParams";
+import type { AuthMethodKind } from "./bindings/AuthMethodKind";
+import type { AuthMethod } from "./bindings/AuthMethod";
+import type { SshAuth } from "./bindings/SshAuth";
+import type { SshConfig } from "./bindings/SshConfig";
+import type { RunQueryPolicy } from "./bindings/RunQueryPolicy";
+import type { AiPolicy } from "./bindings/AiPolicy";
+import type { ConnectionConfig } from "./bindings/ConnectionConfig";
+import type { ConnectionProfile } from "./bindings/ConnectionProfile";
+import type { CatalogInfo } from "./bindings/CatalogInfo";
+import type { ColumnInfo } from "./bindings/ColumnInfo";
+import type { ConnectorInfo } from "./bindings/ConnectorInfo";
+import type { DbObject } from "./bindings/DbObject";
+import type { FieldSpec } from "./bindings/FieldSpec";
+import type { IndexInfo } from "./bindings/IndexInfo";
+import type { ObjectDetail } from "./bindings/ObjectDetail";
+import type { ObjectKind } from "./bindings/ObjectKind";
+import type { SchemaInfo } from "./bindings/SchemaInfo";
+import type { TableLayout } from "./bindings/TableLayout";
+import type { ParamValue } from "./bindings/ParamValue";
+import type { StatementKind } from "./bindings/StatementKind";
+export type {
+  JobNodeKind,
+  FileFormat,
+  LoadMode,
+  NodeRunSummary,
+  StepProgress,
+  RunLogEntry,
+  JobNode,
+  JobEdge,
+  JobSchedule,
+  Job,
+  JobSummary,
+  NodeRunRecord,
+  JobRun,
+  ConnectorKind,
+  SslMode,
+  EnvTag,
+  OAuthParams,
+  AuthMethodKind,
+  AuthMethod,
+  SshAuth,
+  SshConfig,
+  RunQueryPolicy,
+  AiPolicy,
+  ConnectionConfig,
+  ConnectionProfile,
+  CatalogInfo,
+  ColumnInfo,
+  ConnectorInfo,
+  DbObject,
+  FieldSpec,
+  IndexInfo,
+  ObjectDetail,
+  ObjectKind,
+  SchemaInfo,
+  TableLayout,
+  ParamValue,
+  StatementKind,
+};
 
-export type ConnectorKind =
-  | "sqlite"
-  | "postgres"
-  | "mysql"
-  | "mssql"
-  | "oracle"
-  | "snowflake"
-  | "databricks"
-  | "bigquery"
-  | "duckdb"
-  | "mongodb"
-  | "neo4j";
-export type SslMode = "disable" | "prefer" | "require" | "verify_full";
-export type EnvTag = "none" | "dev" | "staging" | "prod";
-
-export interface OAuthParams {
-  client_id?: string;
-  scopes?: string;
-  redirect_port?: number;
-  tenant?: string;
-  user?: string;
-  authorize_url?: string;
-  token_url?: string;
+/** A `:name` parameter in the editor (UTF-16 offsets of `:name`). */
+export interface ParamSpan {
+  name: string;
+  from: number;
+  to: number;
+  /** Oracle `&name` / `&&name`: replaced by the value as typed. */
+  textual?: boolean;
 }
 
-export type AuthMethodKind =
-  | "none"
-  | "password"
-  | "api_token"
-  | "key_pair"
-  | "oauth_browser"
-  | "device_code"
-  | "client_credentials"
-  | "external_browser"
-  | "cloud_cli"
-  | "service_account";
 
-export type AuthMethod =
-  | { method: "none" }
-  | { method: "password"; user: string }
-  | { method: "api_token"; user?: string | null }
-  | { method: "key_pair"; user: string }
-  | ({ method: "oauth_browser" } & OAuthParams)
-  | ({ method: "device_code" } & OAuthParams)
-  | ({ method: "client_credentials" } & OAuthParams)
-  | { method: "external_browser"; user: string }
-  | { method: "cloud_cli"; profile?: string | null }
-  | { method: "service_account" };
 
-export type SshAuth = { method: "password" } | { method: "key"; path: string } | { method: "agent" };
 
-export interface SshConfig {
-  host: string;
-  port: number;
-  user: string;
-  auth: SshAuth;
-  host_key_fingerprint?: string | null;
-}
 
-export type RunQueryPolicy = "never" | "ask" | "auto_read";
 
-export interface AiPolicy {
-  ai_enabled: boolean;
-  allowed_providers: string[];
-  share_metadata: boolean;
-  share_sample_values: boolean;
-  share_result_rows: boolean;
-  run_query: RunQueryPolicy;
-  allow_write: boolean;
-  max_rows_to_model: number;
-  pii_columns: string[];
-  index_schemas: string[];
-  /** Schemas per metadata request while indexing (default 25). */
-  index_batch?: number;
-  mcp_enabled: boolean;
-  /** AI notes are saved directly instead of waiting for review. */
-  auto_approve_notes: boolean;
-  /** Tables the AI may read: LIKE patterns on catalog.schema.table / schema.table / table (empty = all). */
-  read_allow?: string[];
-  /** Tables the AI may never read (wins over read_allow). */
-  read_deny?: string[];
-  /** Tables the AI may write (empty = all, when writes are allowed). */
-  write_allow?: string[];
-  /** Tables the AI may never write. */
-  write_deny?: string[];
-  /** DuckDB: SQL from the AI or MCP may use files and the network (else sandboxed). */
-  external_access?: boolean;
-}
+
+
 
 export interface AuthStatus {
   signed_in: boolean;
@@ -95,81 +102,20 @@ export interface AuthStatus {
   expires_at?: number | null;
 }
 
-export interface ConnectionConfig {
-  kind: ConnectorKind;
-  host?: string | null;
-  port?: number | null;
-  database?: string | null;
-  file_path?: string | null;
-  auth: AuthMethod;
-  ssl_mode: SslMode;
-  read_only: boolean;
-  options?: Record<string, string>;
-  ssh?: SshConfig | null;
-}
 
-export interface ConnectionProfile {
-  id: string;
-  name: string;
-  config: ConnectionConfig;
-  color?: string | null;
-  env: EnvTag;
-  folder_id?: string | null;
-  has_secret: boolean;
-  ai_policy?: AiPolicy;
-  created_at: number;
-  updated_at: number;
-}
 
 export interface ConnectionView extends ConnectionProfile {
   connected: boolean;
 }
 
-export interface FieldSpec {
-  key: string;
-  label: string;
-  placeholder?: string;
-  required: boolean;
-  help?: string;
-}
 
-export interface ConnectorInfo {
-  kind: ConnectorKind;
-  display_name: string;
-  default_port: number | null;
-  uses_file: boolean;
-  auth_methods: AuthMethodKind[];
-  capabilities: {
-    transactions: boolean;
-    cancel: boolean;
-    schemas: boolean;
-    read_only_sessions: boolean;
-    ssh: boolean;
-  };
-  /** What the source type is like (quoting, levels, language, loads…). */
-  traits?: import("./sourceTraits").SourceTraits;
-  fields: FieldSpec[];
-  note?: string;
-}
 
 export interface TestResult {
   server_version: string;
   latency_ms: number;
 }
 
-export interface SchemaInfo {
-  /** Qualified id (`catalog.schema` for three-level engines). */
-  name: string;
-  is_default: boolean;
-  /** Databricks catalog, Snowflake database, BigQuery project, DuckDB database. */
-  catalog?: string | null;
-}
 
-/** Top level of three-level engines (Databricks catalog, Snowflake database, BigQuery project, DuckDB database). */
-export interface CatalogInfo {
-  name: string;
-  is_default: boolean;
-}
 
 export interface ExplorerCacheState {
   checked_at: number | null;
@@ -214,33 +160,8 @@ export interface ExplorerRevalidation {
   skipped: boolean;
 }
 
-export type ObjectKind =
-  | "table"
-  | "view"
-  | "materialized_view"
-  | "foreign_table"
-  | "function"
-  | "procedure"
-  | "package"
-  | "sequence"
-  | "other";
 
-export interface DbObject {
-  schema: string;
-  name: string;
-  kind: ObjectKind;
-  comment?: string;
-  row_estimate?: number;
-}
 
-export interface ColumnInfo {
-  name: string;
-  data_type: string;
-  nullable: boolean;
-  is_primary_key: boolean;
-  default?: string;
-  comment?: string;
-}
 
 export interface ExcelSheet {
   name: string;
@@ -249,39 +170,9 @@ export interface ExcelSheet {
   hidden: boolean;
 }
 
-export interface IndexInfo {
-  name: string;
-  columns: string[];
-  unique: boolean;
-  primary: boolean;
-  method?: string;
-}
 
-/** Indexes, partitioning and clustering of a table (query hints). */
-export interface TableLayout {
-  indexes: IndexInfo[];
-  partition_by: string[];
-  partition_kind?: string;
-  cluster_by: string[];
-  requires_partition_filter: boolean;
-  row_estimate?: number;
-  notes: string[];
-}
 
-export interface ObjectDetail {
-  object: DbObject;
-  columns: ColumnInfo[];
-  ddl?: string;
-}
 
-export type StatementKind =
-  | "read"
-  | "session"
-  | "transaction"
-  | "dml"
-  | "ddl"
-  | "other"
-  | "unknown";
 
 export interface PlannedStatement {
   index: number;
@@ -368,20 +259,7 @@ export interface LineageView {
   described: string[];
 }
 
-/** Value typed for a `:name` parameter; `raw` = insert as an SQL expression (no quoting). */
-export interface ParamValue {
-  value: string;
-  raw?: boolean;
-}
 
-/** A `:name` parameter in the editor (UTF-16 offsets of `:name`). */
-export interface ParamSpan {
-  name: string;
-  from: number;
-  to: number;
-  /** Oracle `&name` / `&&name`: replaced by the value as typed. */
-  textual?: boolean;
-}
 
 export interface RunRequest {
   connection_id: string;
@@ -1021,56 +899,9 @@ export interface IndexPlan {
 
 // ------------------------------------------------------------------ jobs
 
-export type JobNodeKind = "query" | "load" | "export";
-export type FileFormat = "csv" | "parquet" | "json";
-export type LoadMode = "append" | "truncate" | "replace" | "update" | "merge";
-export type NodeRunStatus = "pending" | "running" | "success" | "error" | "skipped" | "cancelled";
+export type NodeRunStatus = Exclude<NodeRunSummary["status"], "">;
 
-export interface NodeRunSummary {
-  status: NodeRunStatus | "";
-  finished_at: number;
-  duration_ms: number;
-  rows?: number | null;
-  error?: string | null;
-  /** File written by an export step. */
-  file?: string | null;
-  /** Things to know (a load step created its table, …). */
-  notices?: string[];
-  /** While running: rows written so far (load steps). */
-  progress?: StepProgress | null;
-}
 
-export interface JobNode {
-  id: string;
-  /** Output name: downstream DuckDB steps read it as `results.<name>`. */
-  name: string;
-  kind: JobNodeKind;
-  /** Query steps: where the SQL runs (none = Results DuckDB). */
-  connection_id?: string | null;
-  sql: string;
-  x: number;
-  y: number;
-  target_connection_id?: string | null;
-  target_table?: string | null;
-  load_mode: LoadMode;
-  /** Load: SQL run on the target connection before / after the rows are written. */
-  load_before_sql?: string | null;
-  load_after_sql?: string | null;
-  /** Load (update/merge): columns identifying a row. */
-  key_columns?: string[];
-  /** Load (append/truncate): create a missing table from the rows' columns (default on). */
-  create_table?: boolean;
-  /** Load: rows per INSERT (empty = the connection's default; kept within its maximum). */
-  batch_rows?: number | null;
-  /** Load: most KB of SQL text per INSERT (empty = default). */
-  batch_kb?: number | null;
-  /** Export: folder (empty = Downloads). */
-  export_folder?: string | null;
-  /** Export: file name; `{step}`, `{job}`, `{date}`, `{time}` are replaced (empty = `{step}_{date}_{time}`). */
-  export_file?: string | null;
-  export_format?: FileFormat;
-  last_run?: NodeRunSummary | null;
-}
 
 export interface LoadCheck {
   label: string;
@@ -1176,77 +1007,17 @@ export interface BatchLimits {
   bytes_note: string;
 }
 
-export interface JobEdge {
-  from: string;
-  to: string;
-}
 
-export interface JobSchedule {
-  enabled: boolean;
-  mode: "interval" | "daily";
-  minutes: number;
-  /** Local "HH:MM". */
-  at: string;
-  /** 0 = Sunday; empty = every day. */
-  weekdays: number[];
-}
 
-export interface Job {
-  id: string;
-  name: string;
-  nodes: JobNode[];
-  edges: JobEdge[];
-  schedule: JobSchedule;
-  last_scheduled_at?: number | null;
-  created_at: number;
-  updated_at: number;
-}
 
-export interface NodeRunRecord extends NodeRunSummary {
-  node_id: string;
-  name: string;
-}
 
-export interface JobRun {
-  id: number;
-  job_id: string;
-  trigger: "manual" | "schedule" | "ai" | "resume" | "background" | "cli";
-  started_at: number;
-  finished_at?: number | null;
-  status: "running" | "success" | "error" | "cancelled";
-  nodes: NodeRunRecord[];
-  error?: string | null;
-}
 
-export interface JobSummary {
-  id: string;
-  name: string;
-  node_count: number;
-  /** Output names its steps own. */
-  step_names: string[];
-  schedule: JobSchedule;
-  next_run_at?: number | null;
-  last_run?: JobRun | null;
-  updated_at: number;
-}
 
 export interface JobRunEvent {
   job_id: string;
   run: JobRun;
 }
 
-/** One line of a run's log. */
-export interface RunLogEntry {
-  seq: number;
-  at: number;
-  node_id?: string | null;
-  step?: string | null;
-  level: "info" | "success" | "warning" | "error";
-  message: string;
-  sql?: string | null;
-  rows?: number | null;
-  duration_ms?: number | null;
-}
 
 export interface JobLogEvent {
   job_id: string;
@@ -1254,12 +1025,6 @@ export interface JobLogEvent {
   entries: RunLogEntry[];
 }
 
-/** Rows written so far by a running load step. */
-export interface StepProgress {
-  phase: string;
-  done: number;
-  total: number;
-}
 
 /** Account budget a provider reports (credits, balance, key limit). */
 export interface BudgetMeter {

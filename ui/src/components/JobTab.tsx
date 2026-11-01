@@ -74,7 +74,7 @@ const EDITOR_KEY = (job: string, node: string) => `job:${job}:${node}`;
 type Selection = { node: string } | { edge: JobEdge } | null;
 type Menu = { x: number; y: number; node?: string; at?: { x: number; y: number } } | null;
 
-const isResults = (c: { config: { options?: Record<string, string> } }) => c.config.options?.databrain_results === "1";
+const isResults = (c: { config: { options?: Partial<Record<string, string>> } }) => c.config.options?.databrain_results === "1";
 
 export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string; visible: boolean }) {
   const toast = useStore((s) => s.toast);

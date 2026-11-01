@@ -143,7 +143,9 @@ impl SecretStore for MemoryStore {
 // ------------------------------------------------------------------ methods
 
 /// OAuth settings a user may override per connection.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields)]
 pub struct OAuthParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
@@ -167,7 +169,8 @@ pub struct OAuthParams {
 
 /// How a connection authenticates. Serialized into the connection config
 /// (never contains secrets).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AuthMethod {
     None,
@@ -248,7 +251,8 @@ impl AuthMethod {
 }
 
 /// Kinds of auth a connector can accept; drives the connection form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethodKind {
     None,

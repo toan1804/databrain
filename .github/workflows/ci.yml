@@ -66,6 +66,14 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace --no-fail-fast
 
+      # `cargo test` writes the TypeScript bindings of the Rust types (ts-rs):
+      # they must be the ones committed.
+      - name: TypeScript bindings up to date
+        if: runner.os == 'Linux'
+        run: |
+          git status --porcelain ui/src/lib/bindings
+          test -z "$(git status --porcelain ui/src/lib/bindings)" || { echo "Run cargo test and commit ui/src/lib/bindings"; exit 1; }
+
   # Tests against real servers. They are #[ignore]d in `cargo test` (so a
   # run without servers reports them as ignored, not passed) and run here
   # with --ignored; a missing server makes them fail, never skip.

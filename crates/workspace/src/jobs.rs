@@ -15,7 +15,8 @@ pub const RUNS_KEPT: i64 = 200;
 /// A run whose runner hasn't reported for this long is taken as stopped.
 pub const STALE_RUN_MS: i64 = 120_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum JobNodeKind {
     /// Run `sql` on `connection_id`; the result is the output `name`.
@@ -29,7 +30,8 @@ pub enum JobNodeKind {
     Export,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum FileFormat {
     #[default]
@@ -49,7 +51,8 @@ impl FileFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadMode {
     /// Insert the rows. A missing table is created from the rows' columns
@@ -83,57 +86,79 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct NodeRunSummary {
     #[serde(default)]
+    #[ts(type = "\"pending\" | \"running\" | \"success\" | \"error\" | \"skipped\" | \"cancelled\" | \"\"")]
     pub status: String,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub finished_at: i64,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub duration_ms: i64,
     #[serde(default)]
+    #[ts(as = "Option<f64>")]
     pub rows: Option<i64>,
     #[serde(default)]
     pub error: Option<String>,
     /// File written by an export step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub file: Option<String>,
     /// Things the user should know (a load step created its table, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
     pub notices: Vec<String>,
     /// While running: rows written so far out of the total (load steps).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub progress: Option<StepProgress>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[ts(export)]
 pub struct StepProgress {
     /// What is being done ("Inserting rows", "Staging rows").
     pub phase: String,
+    #[ts(as = "f64")]
     pub done: u64,
+    #[ts(as = "f64")]
     pub total: u64,
 }
 
 /// One line of a run's log, for tracing what ran and what came back.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct RunLogEntry {
     /// Order in the run (from 1).
+    #[ts(as = "f64")]
     pub seq: u64,
     /// Epoch ms.
+    #[ts(as = "f64")]
     pub at: i64,
     /// Step it belongs to (`None` for the run itself).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub node_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub step: Option<String>,
     /// `info`, `success`, `warning`, `error`.
+    #[ts(type = "\"info\" | \"success\" | \"warning\" | \"error\"")]
     pub level: String,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub sql: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>")]
     pub rows: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>")]
     pub duration_ms: Option<i64>,
 }
 
@@ -157,7 +182,9 @@ pub fn log_sql(sql: &str) -> String {
     format!("{} … ({} more characters)", &sql[..end], sql.len() - end)
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct JobNode {
     pub id: String,
     /// Output name: downstream DuckDB steps read it as `results.<name>`.
@@ -188,9 +215,11 @@ pub struct JobNode {
     pub load_after_sql: Option<String>,
     /// Load (Update/Merge): columns identifying a row.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
     pub key_columns: Vec<String>,
     /// Load (Append/Truncate): create a missing table from the rows' columns.
     #[serde(default = "yes")]
+    #[ts(as = "Option<bool>", optional)]
     pub create_table: bool,
     /// Load: rows per INSERT statement (`None` = the connection's default;
     /// kept within its maximum).
@@ -207,6 +236,7 @@ pub struct JobNode {
     #[serde(default)]
     pub export_file: Option<String>,
     #[serde(default)]
+    #[ts(as = "Option<FileFormat>", optional)]
     pub export_format: FileFormat,
     #[serde(default)]
     pub last_run: Option<NodeRunSummary>,
@@ -243,13 +273,15 @@ impl JobNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct JobEdge {
     pub from: String,
     pub to: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleMode {
     /// Every `minutes`.
@@ -259,7 +291,8 @@ pub enum ScheduleMode {
     Daily,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct JobSchedule {
     #[serde(default)]
     pub enabled: bool,
@@ -325,7 +358,9 @@ impl JobSchedule {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct Job {
     #[serde(default)]
     pub id: String,
@@ -338,10 +373,13 @@ pub struct Job {
     pub schedule: JobSchedule,
     /// When the scheduler last started it (epoch ms).
     #[serde(default)]
+    #[ts(as = "Option<f64>")]
     pub last_scheduled_at: Option<i64>,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub created_at: i64,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub updated_at: i64,
 }
 
@@ -353,7 +391,9 @@ impl Job {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct JobSummary {
     pub id: String,
     pub name: String,
@@ -361,12 +401,15 @@ pub struct JobSummary {
     /// Output names its steps own.
     pub step_names: Vec<String>,
     pub schedule: JobSchedule,
+    #[ts(as = "Option<f64>")]
     pub next_run_at: Option<i64>,
     pub last_run: Option<JobRun>,
+    #[ts(as = "f64")]
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct NodeRunRecord {
     pub node_id: String,
     pub name: String,
@@ -374,15 +417,22 @@ pub struct NodeRunRecord {
     pub summary: NodeRunSummary,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct JobRun {
+    #[ts(as = "f64")]
     pub id: i64,
     pub job_id: String,
     /// "manual", "schedule" or "ai" (the assistant, after approval).
+    #[ts(type = "\"manual\" | \"schedule\" | \"ai\" | \"resume\" | \"background\" | \"cli\"")]
     pub trigger: String,
+    #[ts(as = "f64")]
     pub started_at: i64,
+    #[ts(as = "Option<f64>")]
     pub finished_at: Option<i64>,
     /// "running", "success", "error", "cancelled".
+    #[ts(type = "\"running\" | \"success\" | \"error\" | \"cancelled\"")]
     pub status: String,
     pub nodes: Vec<NodeRunRecord>,
     pub error: Option<String>,

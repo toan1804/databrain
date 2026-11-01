@@ -909,7 +909,7 @@ function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: ConnectionView;
         label={obj.name}
         title={obj.comment}
         active={focused}
-        meta={obj.row_estimate !== undefined && obj.row_estimate > 0 ? formatCount(obj.row_estimate) : undefined}
+        meta={obj.row_estimate != null && obj.row_estimate > 0 ? formatCount(obj.row_estimate) : undefined}
         onClick={toggle}
         onDoubleClick={() => editorBridge.insert(activeTab(), quoteIdent(conn.config.kind, obj.name))}
         onContextMenu={(e) => {

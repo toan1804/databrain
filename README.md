@@ -58,6 +58,8 @@ cargo clippy --workspace --all-targets
 cd ui && npm test && npm run build
 ```
 
+The TypeScript types of what the backend sends are generated from the Rust types: `cargo test` writes them to `ui/src/lib/bindings` (commit them; CI checks they are current).
+
 Tests that need a database server are marked `#[ignore]`, so `cargo test` lists them as ignored. Run them with `--ignored` and the server's `DATABRAIN_*` variables; a missing variable fails the test rather than skipping it:
 
 ```sh

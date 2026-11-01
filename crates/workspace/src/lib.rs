@@ -49,7 +49,8 @@ pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvTag {
     #[default]
@@ -59,7 +60,9 @@ pub enum EnvTag {
     Prod,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ConnectionProfile {
     pub id: String,
     pub name: String,
@@ -76,12 +79,15 @@ pub struct ConnectionProfile {
     #[serde(default)]
     pub ai_policy: AiPolicy,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub created_at: i64,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum RunQueryPolicy {
     /// The AI may not execute queries.
@@ -94,7 +100,8 @@ pub enum RunQueryPolicy {
 }
 
 /// Per-connection controls on what the AI may see and do.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(default)]
 pub struct AiPolicy {
     pub ai_enabled: bool,

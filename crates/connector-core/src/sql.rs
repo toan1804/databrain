@@ -432,7 +432,8 @@ pub fn statement_at(spans: &[StatementSpan], cursor: usize) -> Option<&Statement
         .or_else(|| spans.first())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum StatementKind {
     Read,
@@ -454,7 +455,9 @@ impl StatementKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct Classification {
     pub kind: StatementKind,
     /// `UPDATE`/`DELETE` without a `WHERE` clause.
@@ -856,7 +859,9 @@ mod tests {
 // ------------------------------------------------------------------ parameters
 
 /// A parameter in a script (byte offsets of `:name` / `&name`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ParamSpan {
     pub name: String,
     pub start: usize,
@@ -988,11 +993,14 @@ pub fn find_parameters(text: &str, kind: ConnectorKind) -> Vec<ParamSpan> {
 }
 
 /// A value typed for a parameter.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ParamValue {
     pub value: String,
     /// Insert as typed (an SQL expression such as `current_date`), no quoting.
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     pub raw: bool,
 }
 

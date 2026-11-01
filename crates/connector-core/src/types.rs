@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use databrain_auth::{AuthMethod, AuthMethodKind};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorKind {
     Sqlite,
@@ -70,7 +71,8 @@ impl ConnectorKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum SshAuth {
     /// Password in the keychain slot `ssh`.
@@ -82,7 +84,9 @@ pub enum SshAuth {
 }
 
 /// SSH tunnel (bastion) settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct SshConfig {
     pub host: String,
     #[serde(default = "default_ssh_port")]
@@ -99,7 +103,8 @@ fn default_ssh_port() -> u16 {
     22
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum SslMode {
     Disable,
@@ -111,7 +116,9 @@ pub enum SslMode {
 }
 
 /// Non-secret connection settings, persisted in the workspace database.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ConnectionConfig {
     pub kind: ConnectorKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,6 +141,7 @@ pub struct ConnectionConfig {
     /// BigQuery `project`, `location`, `dataset`; SQL Server `instance`,
     /// `trust_cert`, `tenant`; Oracle `service_name`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[ts(as = "Option<std::collections::BTreeMap<String, String>>", optional)]
     pub options: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshConfig>,
@@ -213,7 +221,8 @@ impl ConnectionConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct Capabilities {
     pub transactions: bool,
     pub cancel: bool,
@@ -224,7 +233,9 @@ pub struct Capabilities {
 }
 
 /// Static description of a connector; drives the connection form in the UI.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ConnectorInfo {
     pub kind: ConnectorKind,
     pub display_name: &'static str,
@@ -234,24 +245,30 @@ pub struct ConnectorInfo {
     pub auth_methods: Vec<AuthMethodKind>,
     pub capabilities: Capabilities,
     /// What the source type is like (quoting, levels, language, loads…).
+    #[ts(type = "import(\"../sourceTraits\").SourceTraits")]
     pub traits: &'static crate::traits::SourceTraits,
     /// Connection form fields (beyond auth) the UI should show.
     pub fields: Vec<FieldSpec>,
     /// Runtime requirement shown in the UI (e.g. Oracle Instant Client).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub note: Option<&'static str>,
 }
 
 /// A connection form field. `key` is `host`, `port`, `database`, `file_path`
 /// or an `options` key.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct FieldSpec {
     pub key: &'static str,
     pub label: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub placeholder: Option<&'static str>,
     pub required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub help: Option<&'static str>,
 }
 
@@ -280,7 +297,9 @@ impl FieldSpec {
 }
 
 /// A top-level container of three-level engines (see [`crate::Session::list_catalogs`]).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct CatalogInfo {
     pub name: String,
     /// The session's current catalog.
@@ -293,7 +312,9 @@ pub fn version_key(kind: ObjectKind, name: &str) -> String {
     format!("{}:{name}", kind.as_str())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct SchemaInfo {
     /// Fully qualified schema id passed back to `list_objects` (for
     /// three-level engines this is `catalog.schema`).
@@ -303,6 +324,7 @@ pub struct SchemaInfo {
     /// Top level (Databricks catalog, Snowflake database, BigQuery project,
     /// DuckDB database) for engines with three-level names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub catalog: Option<String>,
 }
 
@@ -361,7 +383,8 @@ pub fn rank_matches(query: &str, hits: &mut Vec<DbObject>, limit: usize) {
     hits.truncate(limit);
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectKind {
     Table,
@@ -403,30 +426,40 @@ impl ObjectKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct DbObject {
     pub schema: String,
     pub name: String,
     pub kind: ObjectKind,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub comment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>")]
     pub row_estimate: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
     pub nullable: bool,
     pub is_primary_key: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub default: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ForeignKey {
     pub columns: Vec<String>,
     pub ref_schema: String,
@@ -434,18 +467,23 @@ pub struct ForeignKey {
     pub ref_columns: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ObjectDetail {
     pub object: DbObject,
     pub columns: Vec<ColumnInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub ddl: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub foreign_keys: Vec<ForeignKey>,
 }
 
 /// An index (or primary/unique key) on a table.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct IndexInfo {
     pub name: String,
     /// Key columns in order (expressions as written by the server).
@@ -456,12 +494,15 @@ pub struct IndexInfo {
     pub primary: bool,
     /// Access method when not the engine default, e.g. `hash`, `gin`, `clustered`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub method: Option<String>,
 }
 
 /// How a table is physically organised: what makes filters and joins fast.
 /// Used for query hints in the editor.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct TableLayout {
     #[serde(default)]
     pub indexes: Vec<IndexInfo>,
@@ -470,6 +511,7 @@ pub struct TableLayout {
     pub partition_by: Vec<String>,
     /// e.g. `range`, `list`, `hash`, `day`, `hive`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub partition_kind: Option<String>,
     /// Clustering / sort keys (Snowflake, BigQuery, Databricks liquid clustering and Z-order).
     #[serde(default)]
@@ -478,6 +520,7 @@ pub struct TableLayout {
     #[serde(default)]
     pub requires_partition_filter: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>")]
     pub row_estimate: Option<i64>,
     /// Extra facts worth showing (e.g. "ZORDER BY (a, b)", "heap: no clustered index").
     #[serde(default)]
