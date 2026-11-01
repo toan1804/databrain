@@ -482,6 +482,23 @@ pub fn config_from_url(url: &str) -> Option<(ConnectionConfig, Option<String>)> 
             c.database = db.filter(|d| !d.is_empty());
             let p = props(q, '&');
             user = user.or(p.get("user").cloned());
+            if scheme.eq_ignore_ascii_case("redshift") {
+                // jdbc:redshift[:iam]://host:5439/db (IAM: `cluster:region` may stand for the host).
+                c.options.insert("flavor".into(), "redshift".into());
+                if after.to_ascii_lowercase().starts_with("iam:") {
+                    c.auth = AuthMethod::CloudCli { profile: p.get("profile").cloned() };
+                    let raw = hp.rsplit('@').next().unwrap_or(hp);
+                    if let Some((cluster, region)) = raw.split_once(':').filter(|(h, r)| !h.contains('.') && !r.chars().all(|ch| ch.is_ascii_digit())) {
+                        c.options.insert("cluster_id".into(), cluster.to_string());
+                        c.options.insert("aws_region".into(), region.to_string());
+                        c.host = None;
+                    }
+                    if let Some(u) = p.get("dbuser") {
+                        c.options.insert("db_user".into(), u.clone());
+                    }
+                }
+                c.port = c.port.or(Some(5439));
+            }
         }
     }
     Some((c, user))
@@ -579,7 +596,11 @@ fn parse_datagrip(text: &str, local: &str) -> Result<Vec<Parsed>> {
         };
         let kind = cfg.kind;
         let user = src.attrs.get("uuid").and_then(|u| users.get(u)).cloned().or(url_user);
-        let (auth, need) = auth_for(kind, user.clone());
+        let (auth, need) = match &cfg.auth {
+            // Redshift IAM URL: the AWS CLI signs in.
+            a @ AuthMethod::CloudCli { .. } => (a.clone(), Some("Sign in with the AWS CLI (`aws sso login` or `aws configure`) before connecting".into())),
+            _ => auth_for(kind, user.clone()),
+        };
         cfg.auth = auth;
         cfg.read_only = src.attrs.get("read-only").is_some_and(|v| v == "true");
         let ssh = src.fields.get("ssh-properties/enabled").is_some_and(|v| v.trim() == "true");
@@ -733,6 +754,10 @@ fn parse_dbeaver(text: &str, creds: &HashMap<String, (Option<String>, Option<Str
             if let Some(w) = conf.get("provider-properties").and_then(|p| s(p, "@dbeaver-warehouse@")) {
                 cfg.options.insert("warehouse".into(), w);
             }
+        }
+        if kind == ConnectorKind::Postgres && [s(c, "provider"), s(c, "driver")].iter().flatten().any(|x| x.to_ascii_lowercase().contains("redshift")) {
+            cfg.options.insert("flavor".into(), "redshift".into());
+            cfg.port = cfg.port.or(Some(5439));
         }
         if kind == ConnectorKind::Oracle {
             let service = conf.get("provider-properties").and_then(|p| s(p, "@dbeaver-sid-service@")).is_some_and(|t| t.eq_ignore_ascii_case("SERVICE"));
@@ -960,6 +985,13 @@ mod tests {
         );
         let (ch, _) = c("jdbc:ch://localhost:9000?database=logs&user=default");
         assert_eq!((ch.host.as_deref(), ch.port, ch.database.as_deref()), (Some("localhost"), Some(8123), Some("logs")), "native port mapped to HTTP");
+        let (rs, u) = c("jdbc:redshift://ana.c1ab.eu-west-1.redshift.amazonaws.com/sales?user=bob");
+        assert_eq!((rs.kind, rs.port, rs.opt("flavor"), u.as_deref(), rs.auth.kind()), (ConnectorKind::Postgres, Some(5439), Some("redshift"), Some("bob"), databrain_auth::AuthMethodKind::None));
+        let (iam, _) = c("jdbc:redshift:iam://ana:eu-west-1/sales?Profile=prod&DbUser=etl");
+        assert_eq!((iam.host.as_deref(), iam.opt("cluster_id"), iam.opt("aws_region"), iam.opt("db_user")), (None, Some("ana"), Some("eu-west-1"), Some("etl")));
+        assert_eq!(iam.auth, AuthMethod::CloudCli { profile: Some("prod".into()) });
+        let (iam2, _) = c("jdbc:redshift:iam://ana.c1ab.eu-west-1.redshift.amazonaws.com:5439/dev");
+        assert_eq!((iam2.host.as_deref(), iam2.port, iam2.opt("cluster_id")), (Some("ana.c1ab.eu-west-1.redshift.amazonaws.com"), Some(5439), None));
     }
 
     #[test]

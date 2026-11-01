@@ -6,6 +6,7 @@
 //! (numeric, arrays, json, ranges, ...), while the prepared column types let
 //! common types become typed Arrow columns for sorting and filtering.
 
+mod redshift;
 mod wkb;
 
 use std::sync::Arc;
@@ -51,16 +52,25 @@ fn tls_connector(mode: SslMode) -> Result<MakeTlsConnector> {
     Ok(MakeTlsConnector::new(c))
 }
 
+/// Amazon Redshift (the connection's "Database type", or its endpoint host):
+/// port 5439, no startup options, IAM sign-in through the AWS CLI.
+fn redshift_flavor(cfg: &ConnectionConfig) -> bool {
+    cfg.is_redshift()
+}
+
+/// Session setup sent as SQL where startup options can't be (Redshift).
+const REDSHIFT_INIT: &str = "SET DateStyle TO ISO, MDY";
+
 #[async_trait]
 impl Connector for PostgresConnector {
     fn info(&self) -> ConnectorInfo {
         ConnectorInfo {
             kind: ConnectorKind::Postgres,
             traits: ConnectorKind::Postgres.traits(),
-            display_name: "PostgreSQL",
+            display_name: "PostgreSQL / Redshift",
             default_port: Some(5432),
             uses_file: false,
-            auth_methods: vec![AuthMethodKind::Password],
+            auth_methods: vec![AuthMethodKind::Password, AuthMethodKind::CloudCli],
             capabilities: Capabilities {
                 transactions: true,
                 cancel: true,
@@ -69,12 +79,38 @@ impl Connector for PostgresConnector {
                 ssh: true,
             },
             fields: vec![
+                FieldSpec::new("flavor", "Database type"),
                 FieldSpec::new("host", "Host").required().placeholder("localhost"),
                 FieldSpec::new("port", "Port").placeholder("5432"),
                 FieldSpec::new("database", "Database").placeholder("postgres"),
+                FieldSpec::new("cluster_id", "Cluster ID").placeholder("from the host").help("IAM sign-in, provisioned clusters"),
+                FieldSpec::new("workgroup", "Workgroup").placeholder("from the host").help("IAM sign-in, Redshift Serverless"),
+                FieldSpec::new("aws_region", "AWS region").placeholder("from the host or profile"),
+                FieldSpec::new("db_user", "Database user").placeholder("the IAM identity's own").help("IAM sign-in to a cluster as this user (redshift:GetClusterCredentials)"),
             ],
             note: None,
         }
+    }
+
+    fn auth_context(&self, cfg: &ConnectionConfig) -> databrain_auth::AuthContext {
+        if !matches!(cfg.auth, databrain_auth::AuthMethod::CloudCli { .. }) {
+            return Default::default();
+        }
+        let mut t = databrain_auth::cloud::RedshiftTarget::from_host(cfg.host_or_default());
+        if let Some(c) = cfg.opt("cluster_id") {
+            t.cluster = Some(c.to_string());
+            t.workgroup = None;
+        }
+        if let Some(w) = cfg.opt("workgroup") {
+            t.workgroup = Some(w.to_string());
+            t.cluster = None;
+        }
+        if let Some(r) = cfg.opt("aws_region") {
+            t.region = Some(r.to_string());
+        }
+        t.db_user = cfg.opt("db_user").map(str::to_string);
+        t.database = cfg.database.clone().filter(|d| !d.trim().is_empty()).unwrap_or_else(|| "dev".into());
+        databrain_auth::AuthContext { cli: Some(databrain_auth::CliKind::Redshift(t)), ..Default::default() }
     }
 
     async fn connect(
@@ -82,14 +118,18 @@ impl Connector for PostgresConnector {
         cfg: &ConnectionConfig,
         creds: Arc<dyn CredentialSource>,
     ) -> Result<Box<dyn Session>> {
+        let redshift = redshift_flavor(cfg);
         let mut pg = tokio_postgres::Config::new();
         pg.host(cfg.host_or_default())
-            .port(cfg.port.unwrap_or(5432))
-            .dbname(cfg.database.as_deref().filter(|d| !d.is_empty()).unwrap_or("postgres"))
+            .port(cfg.port.unwrap_or(if redshift { 5439 } else { 5432 }))
+            .dbname(cfg.database.as_deref().filter(|d| !d.is_empty()).unwrap_or(if redshift { "dev" } else { "postgres" }))
             .application_name("DataBrain")
             .connect_timeout(Duration::from_secs(15))
             .keepalives(true);
 
+        // Temporary credentials (IAM): a refused sign-in is reported as
+        // such, so the engine gets new ones and tries once more.
+        let mut temporary = false;
         match creds.get().await? {
             Credential::Password { user, password } => {
                 pg.user(&user);
@@ -104,6 +144,7 @@ impl Connector for PostgresConnector {
                 // e.g. cloud IAM tokens used as the password.
                 pg.user(user.as_deref().unwrap_or_default());
                 pg.password(token.expose_secret());
+                temporary = true;
             }
             _ => {
                 return Err(ConnectorError::config("unsupported authentication method for PostgreSQL"));
@@ -111,38 +152,63 @@ impl Connector for PostgresConnector {
         }
 
         // ISO dates make text results parseable regardless of server config.
-        let mut options = String::from("-c DateStyle=ISO,MDY");
-        if cfg.read_only {
-            options.push_str(" -c default_transaction_read_only=on");
+        // Redshift refuses startup options: the same is set with SQL.
+        let mut plain = pg.clone();
+        if !redshift {
+            let mut options = String::from("-c DateStyle=ISO,MDY");
+            if cfg.read_only {
+                options.push_str(" -c default_transaction_read_only=on");
+            }
+            pg.options(&options);
         }
-        pg.options(&options);
 
-        pg.ssl_mode(match cfg.ssl_mode {
+        let mode = match cfg.ssl_mode {
             SslMode::Disable => tokio_postgres::config::SslMode::Disable,
             SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
             SslMode::Require | SslMode::VerifyFull => tokio_postgres::config::SslMode::Require,
-        });
+        };
+        pg.ssl_mode(mode);
+        plain.ssl_mode(mode);
         let tls = tls_connector(cfg.ssl_mode)?;
-        let (client, task) = open_link(&pg, tls.clone()).await?;
+        let mut init = redshift.then(|| REDSHIFT_INIT.to_string());
+        let (client, task) = match open_link(&pg, tls.clone(), init.as_deref(), temporary).await {
+            // A Redshift endpoint the host didn't reveal (SSH tunnel, DNS alias).
+            Err(e) if !redshift && e.message.contains("startup parameter") && e.message.contains("options") => {
+                pg = plain;
+                init = Some(REDSHIFT_INIT.to_string());
+                open_link(&pg, tls.clone(), init.as_deref(), temporary).await?
+            }
+            r => r?,
+        };
+        let version: String = client.query_one("select version()", &[]).await.map(|r| r.get(0)).unwrap_or_default();
         Ok(Box::new(PgSession {
-            link: Arc::new(Link { pg, tls: tls.clone(), current: std::sync::RwLock::new((Arc::new(client), task)), state: ConnState::new() }),
+            link: Arc::new(Link { pg, tls: tls.clone(), init, temporary, current: std::sync::RwLock::new((Arc::new(client), task)), state: ConnState::new() }),
             tls,
             read_only: cfg.read_only,
+            redshift: redshift || version.contains("Redshift"),
         }))
     }
 }
 
-/// Connect and run the connection's I/O task.
-async fn open_link(pg: &tokio_postgres::Config, tls: MakeTlsConnector) -> Result<(Client, tokio::task::AbortHandle)> {
+/// Connect, run the connection's I/O task and the setup SQL (`init`).
+/// `temporary`: refused sign-ins are auth errors (new credentials may work).
+async fn open_link(pg: &tokio_postgres::Config, tls: MakeTlsConnector, init: Option<&str>, temporary: bool) -> Result<(Client, tokio::task::AbortHandle)> {
     let (client, connection) = pg.connect(tls).await.map_err(|e| {
         let mut ce = map_err(&e);
-        ce.kind = databrain_connector_core::ErrorKind::Connection;
+        let refused = e.as_db_error().is_some_and(|d| d.code().code().starts_with("28"));
+        ce.kind = if refused && temporary { databrain_connector_core::ErrorKind::Auth } else { databrain_connector_core::ErrorKind::Connection };
         ce
     })?;
     // Ends when the client is dropped, the socket closes, or it is aborted.
     let task = tokio::spawn(async move {
         let _ = connection.await;
     });
+    if let Some(sql) = init {
+        if let Err(e) = client.batch_execute(sql).await {
+            task.abort();
+            return Err(map_err(&e));
+        }
+    }
     Ok((client, task.abort_handle()))
 }
 
@@ -152,6 +218,9 @@ async fn open_link(pg: &tokio_postgres::Config, tls: MakeTlsConnector) -> Result
 struct Link {
     pg: tokio_postgres::Config,
     tls: MakeTlsConnector,
+    /// Setup SQL run on every new connection (Redshift: DateStyle).
+    init: Option<String>,
+    temporary: bool,
     current: std::sync::RwLock<(Arc<Client>, tokio::task::AbortHandle)>,
     /// What the connection carries (transactions, SET, temp tables).
     state: ConnState,
@@ -166,7 +235,7 @@ impl Link {
     /// stops sending when its socket goes away). False when no new
     /// connection could be opened; nothing changes then.
     async fn replace(&self, old: &Arc<Client>) -> bool {
-        let Ok(Ok((client, task))) = tokio::time::timeout(Duration::from_secs(15), open_link(&self.pg, self.tls.clone())).await else {
+        let Ok(Ok((client, task))) = tokio::time::timeout(Duration::from_secs(15), open_link(&self.pg, self.tls.clone(), self.init.as_deref(), self.temporary)).await else {
             return false;
         };
         let mut cur = self.current.write().unwrap_or_else(|e| e.into_inner());
@@ -225,6 +294,8 @@ pub struct PgSession {
     /// Read-only connection: every statement starts read-only, also after
     /// something (`set_config(…)` in a function) turned the default off.
     read_only: bool,
+    /// Amazon Redshift (PostgreSQL 8.0 catalog): its own metadata queries.
+    redshift: bool,
 }
 
 impl PgSession {
@@ -553,6 +624,9 @@ impl Session for PgSession {
     }
 
     async fn schema_object_counts(&self) -> Result<Option<std::collections::HashMap<String, usize>>> {
+        if self.redshift {
+            return Ok(None);
+        }
         let rows = self
             .client()
             .query(
@@ -566,6 +640,12 @@ impl Session for PgSession {
     }
 
     async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        if self.redshift {
+            let term = databrain_connector_core::search_sql_term(query);
+            let mut hits: Vec<DbObject> = self.rs_search_objects(&term).await?.into_iter().filter(|o| databrain_connector_core::object_matches(query, &o.schema, &o.name)).collect();
+            databrain_connector_core::rank_matches(query, &mut hits, limit);
+            return Ok(hits);
+        }
         let term = databrain_connector_core::search_sql_term(query);
         let rows = self
             .client()
@@ -606,6 +686,9 @@ impl Session for PgSession {
     }
 
     async fn search_schema(&self, schema: &str, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        if self.redshift {
+            return self.rs_search_schema(schema, &databrain_connector_core::search_sql_term(query), limit).await;
+        }
         let term = databrain_connector_core::search_sql_term(query);
         let rows = self
             .client()
@@ -644,6 +727,11 @@ impl Session for PgSession {
     /// One pg_proc query: the given schema, else every schema on the
     /// search path (system schemas left out; their functions are keywords).
     async fn search_routines(&self, schema: Option<&str>, query: &str, limit: usize) -> Result<Vec<DbObject>> {
+        if self.redshift {
+            let mut objs = self.rs_search_routines(schema, &databrain_connector_core::search_sql_term(query)).await?;
+            databrain_connector_core::rank_matches(query, &mut objs, limit.clamp(1, 1000));
+            return Ok(objs);
+        }
         let term = databrain_connector_core::search_sql_term(query);
         let rows = self
             .client()
@@ -672,6 +760,9 @@ impl Session for PgSession {
     /// key, other indexes and comments. Views as before. Functions and
     /// procedures: pg_get_functiondef (all overloads).
     async fn object_ddl(&self, schema: &str, name: &str, kind: ObjectKind) -> Result<Option<String>> {
+        if self.redshift {
+            return self.rs_object_ddl(schema, name, kind).await;
+        }
         let q = |sql: &'static str, oid: u32| async move { self.client().query(sql, &[&oid]).await.map_err(|e| map_err(&e)) };
         if matches!(kind, ObjectKind::Function | ObjectKind::Procedure) {
             let rows = self
@@ -788,6 +879,10 @@ impl Session for PgSession {
     /// (row version + columns + constraints + comments) and routines (all
     /// overloads), so any DDL on any of them changes the value.
     async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+        // Redshift: no xmin / hashtext on its catalog; schemas are listed again.
+        if self.redshift {
+            return Ok(None);
+        }
         let rows = self
             .client()
             .query(
@@ -811,6 +906,10 @@ impl Session for PgSession {
     }
 
     async fn object_versions(&self, schema: &str) -> Result<Option<std::collections::HashMap<String, String>>> {
+        if self.redshift {
+            let _ = schema;
+            return Ok(None);
+        }
         let rows = self
             .client()
             .query(
@@ -837,6 +936,9 @@ impl Session for PgSession {
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
+        if self.redshift {
+            return self.rs_table_layout(schema, name).await;
+        }
         use databrain_connector_core::{group_indexes, parse_call_list, query_text, quote_literal, truthy, TableLayout};
         let (s, t) = (quote_literal(schema), quote_literal(name));
         let idx = query_text(
@@ -888,6 +990,9 @@ impl Session for PgSession {
     }
 
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
+        if self.redshift {
+            return self.rs_describe(schema, name).await;
+        }
         let obj = self
             .client()
             .query_opt(
@@ -982,6 +1087,9 @@ impl Session for PgSession {
     /// size class), columns, constraints and comments. Any DDL creates new
     /// catalog row versions (xmin), so the value changes.
     async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+        if self.redshift {
+            return Ok(None);
+        }
         let rows = self
             .client()
             .query(
@@ -1013,6 +1121,9 @@ impl Session for PgSession {
     }
 
     async fn bulk_metadata(&self, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
+        if self.redshift {
+            return databrain_connector_core::default_bulk_metadata(self, schemas).await;
+        }
         match self.bulk_metadata_batched(schemas).await {
             Ok(m) => Ok(m),
             // E.g. no privilege on one catalog view: schema by schema reports per-schema errors.
@@ -1021,6 +1132,9 @@ impl Session for PgSession {
     }
 
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
+        if self.redshift {
+            return self.rs_schema_columns(schema).await;
+        }
         let rows = self
             .client()
             .query(
@@ -1065,6 +1179,9 @@ impl Session for PgSession {
 
 impl PgSession {
     async fn list_objects_filtered(&self, schema: &str, names: Option<&[String]>) -> Result<Vec<DbObject>> {
+        if self.redshift {
+            return self.rs_list_objects(schema, names).await;
+        }
         let names: Option<Vec<String>> = names.map(<[String]>::to_vec);
         let rows = self
             .client()
@@ -1387,6 +1504,51 @@ mod tests {
         let m = s.object_ddl("kb_ddl", "Mixed Case", ObjectKind::Table).await.unwrap().unwrap();
         assert!(m.starts_with("CREATE TABLE kb_ddl.\"Mixed Case\" (\n    \"select\" integer,\n    \"Name\" text\n)"), "{m}");
         run("drop schema kb_ddl cascade".into()).await;
+    }
+
+    /// Live, Amazon Redshift: DATABRAIN_REDSHIFT_HOST (+ _PORT, _DB, _USER, _PASSWORD).
+    /// Explorer metadata through the Redshift catalog queries.
+    #[ignore = "live: needs DATABRAIN_REDSHIFT_HOST (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_redshift_metadata() {
+        let Ok(host) = std::env::var("DATABRAIN_REDSHIFT_HOST") else {
+            panic!("live test: DATABRAIN_REDSHIFT_HOST not set (run with --ignored)");
+        };
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        let user = std::env::var("DATABRAIN_REDSHIFT_USER").unwrap_or_else(|_| "awsuser".into());
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: user.clone() });
+        cfg.host = Some(host);
+        cfg.port = std::env::var("DATABRAIN_REDSHIFT_PORT").ok().and_then(|p| p.parse().ok());
+        cfg.database = std::env::var("DATABRAIN_REDSHIFT_DB").ok();
+        cfg.options.insert("flavor".into(), "redshift".into());
+        cfg.ssl_mode = SslMode::Require;
+        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_REDSHIFT_PASSWORD").ok().map(secrecy::SecretString::from)));
+        let s = PostgresConnector.connect(&cfg, creds).await.unwrap();
+        assert!(s.server_version().await.unwrap().contains("Redshift"));
+        let s = &s;
+        let run = |sql: &'static str| async move { s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap_or_else(|e| panic!("{sql}: {e}")) };
+        run("drop schema if exists databrain_rs cascade").await;
+        run("create schema databrain_rs").await;
+        run("create table databrain_rs.customers (id int primary key, name varchar(40)) diststyle all").await;
+        run("create table databrain_rs.orders (id int primary key, customer_id int references databrain_rs.customers(id), at date default current_date) distkey(customer_id) sortkey(at)")
+            .await;
+        run("comment on table databrain_rs.orders is 'Web orders'").await;
+        assert!(s.list_schemas().await.unwrap().iter().any(|x| x.name == "databrain_rs"));
+        let objs = s.list_objects("databrain_rs").await.unwrap();
+        assert_eq!(objs.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["customers", "orders"]);
+        let d = s.describe("databrain_rs", "orders").await.unwrap();
+        assert_eq!(d.object.comment.as_deref(), Some("Web orders"));
+        assert!(d.columns[0].is_primary_key && d.columns[2].default.is_some());
+        assert_eq!(d.foreign_keys[0].ref_table, "customers");
+        assert!(d.ddl.unwrap().to_uppercase().contains("CREATE TABLE"));
+        let l = s.table_layout("databrain_rs", "orders").await.unwrap();
+        assert_eq!(l.cluster_by, vec!["at"]);
+        assert!(l.notes.iter().any(|n| n == "DISTKEY (customer_id)"), "{:?}", l.notes);
+        assert_eq!(s.schema_columns("databrain_rs").await.unwrap().len(), 2);
+        assert!(!s.search_objects("orders", 10).await.unwrap().is_empty());
+        let r = run("select current_date as d, 1.5::numeric(5,2) as n").await;
+        assert_eq!(r.num_rows(), 1);
+        run("drop schema databrain_rs cascade").await;
     }
 
     /// Live: routine completion (pg_proc): search path vs a given schema, procedures, ranking.

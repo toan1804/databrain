@@ -192,6 +192,24 @@ impl ConnectionConfig {
         c
     }
 
+    /// A Postgres connection to Amazon Redshift: the `flavor` option says
+    /// so, or the host is a Redshift endpoint.
+    pub fn is_redshift(&self) -> bool {
+        if self.kind != ConnectorKind::Postgres {
+            return false;
+        }
+        if let Some(f) = self.opt("flavor") {
+            return f.eq_ignore_ascii_case("redshift");
+        }
+        let h = self.host_or_default().trim().trim_end_matches('.').to_ascii_lowercase();
+        h.ends_with(".redshift.amazonaws.com") || h.ends_with(".redshift-serverless.amazonaws.com")
+    }
+
+    /// The port to use: the configured one, else `default` (Redshift: 5439).
+    pub fn port_or(&self, default: Option<u16>) -> Option<u16> {
+        self.port.or(if self.is_redshift() { Some(5439) } else { default })
+    }
+
     pub fn host_or_default(&self) -> &str {
         self.host
             .as_deref()

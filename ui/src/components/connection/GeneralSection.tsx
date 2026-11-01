@@ -3,11 +3,12 @@ import { traitsOf } from "../../lib/sourceTraits";
 import { FilePlus2, FolderOpen, FolderPlus, Plus } from "lucide-react";
 import type { EnvTag, SslMode } from "../../lib/types";
 import { OracleAgentPanel, OracleClientPanel } from "../OracleClient";
-import { COLORS, Check, ENVS, Label } from "./parts";
+import { COLORS, Check, ENVS, Label, REDSHIFT_KEYS, isRedshift } from "./parts";
 import { ConnectionFormState } from "./useConnectionForm";
 
 export function GeneralSection({ f }: { f: ConnectionFormState }) {
   const { kind, info, name, setName, values, setValue, ssl, setSsl, readOnly, setReadOnly, color, setColor, env, setEnv, fields, defaultName, portValid, browseDb, addFiles } = f;
+  const redshift = kind === "postgres" && isRedshift(values);
   return (
     <>
       <div className="grid grid-cols-[1fr_auto] gap-3">
@@ -77,6 +78,28 @@ export function GeneralSection({ f }: { f: ConnectionFormState }) {
                 </div>
               </div>
             );
+          if (kind === "postgres" && f.key === "flavor")
+            return (
+              <div key={f.key} className="col-span-2">
+                <Label htmlFor={id}>{f.label}</Label>
+                <select
+                  id={id}
+                  className="field"
+                  value={redshift ? "redshift" : ""}
+                  onChange={(e) => {
+                    setValue("flavor", e.target.value);
+                    // Redshift listens on 5439.
+                    if (e.target.value === "redshift" && (!values.port || values.port === "5432")) setValue("port", "5439");
+                    if (e.target.value !== "redshift" && values.port === "5439") setValue("port", "");
+                  }}
+                >
+                  <option value="">PostgreSQL (and compatible: Aurora, AlloyDB, Neon, Supabase…)</option>
+                  <option value="redshift">Amazon Redshift (provisioned or Serverless)</option>
+                </select>
+              </div>
+            );
+          // Redshift's IAM settings only for Redshift.
+          if (kind === "postgres" && REDSHIFT_KEYS.includes(f.key) && !redshift) return null;
           if (kind === "oracle" && f.key === "driver")
             return (
               <div key={f.key} className="col-span-2">

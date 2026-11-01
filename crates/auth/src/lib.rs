@@ -534,6 +534,8 @@ pub enum CliKind {
     GoogleAdc { scopes: Vec<String> },
     Databricks { host: String },
     Azure { resource: String },
+    /// Amazon Redshift: temporary database credentials from the AWS CLI.
+    Redshift(cloud::RedshiftTarget),
 }
 
 /// Token-based source with in-memory caching, persisted refresh tokens,
@@ -635,6 +637,7 @@ impl TokenSource {
                 cloud::databricks_cli(self.cli_profile.as_deref(), host).await
             }
             TokenMode::Cli(CliKind::Azure { resource }) => cloud::azure_cli(resource).await,
+            TokenMode::Cli(CliKind::Redshift(target)) => cloud::redshift_cli(self.cli_profile.as_deref(), target).await,
         }
     }
 

@@ -21,7 +21,7 @@ The "without DuckDB" build is about 85 MB instead of 290 MB and uses the DuckDB 
 
 ## Features
 
-- **Databases:** PostgreSQL, MySQL/MariaDB, SQL Server, Oracle, SQLite, ClickHouse, Snowflake, Databricks, BigQuery, DuckDB, MongoDB and Neo4j. Passwords are kept in the OS keychain. Supports browser sign-in, cloud CLI logins and SSH tunnels.
+- **Databases:** PostgreSQL, Amazon Redshift (with IAM sign-in through the AWS CLI), MySQL/MariaDB, SQL Server, Oracle, SQLite, ClickHouse, Snowflake, Databricks, BigQuery, DuckDB, MongoDB and Neo4j. Passwords are kept in the OS keychain. Supports browser sign-in, cloud CLI logins and SSH tunnels.
 - **Local files:** query CSV, Parquet, JSON, Excel, Delta Lake and Iceberg files with DuckDB.
 - **Explorer:** cached schemas that open at once and work offline, fast on catalogs with 10,000+ tables, DDL for every object, schema compare.
 - **Editor:** dialect-aware completion and formatting, `:name` parameters, transactions, query plans, tips for slow queries, `.sql` files.
@@ -67,7 +67,7 @@ DATABRAIN_PG_HOST=localhost DATABRAIN_PG_USER=postgres DATABRAIN_PG_PASSWORD=...
   cargo test -p databrain-connector-postgres -- --ignored
 ```
 
-The variables are `DATABRAIN_PG_*`, `DATABRAIN_MYSQL_*`, `DATABRAIN_MSSQL_*`, `DATABRAIN_ORACLE_*`, `DATABRAIN_SF_*`, `DATABRAIN_DBX_*`, `DATABRAIN_BQ_PROJECT`, `DATABRAIN_MONGO_URI`, `DATABRAIN_NEO4J_*`, `DATABRAIN_CLICKHOUSE_*` and `DATABRAIN_SSH_*`. CI runs the Postgres, MySQL, MongoDB and ClickHouse ones against service containers. A sample dataset for trying the app is in `examples/data`.
+The variables are `DATABRAIN_PG_*`, `DATABRAIN_MYSQL_*`, `DATABRAIN_MSSQL_*`, `DATABRAIN_ORACLE_*`, `DATABRAIN_SF_*`, `DATABRAIN_DBX_*`, `DATABRAIN_BQ_PROJECT`, `DATABRAIN_MONGO_URI`, `DATABRAIN_NEO4J_*`, `DATABRAIN_CLICKHOUSE_*`, `DATABRAIN_REDSHIFT_*` and `DATABRAIN_SSH_*`. CI runs the Postgres, MySQL, MongoDB and ClickHouse ones against service containers. A sample dataset for trying the app is in `examples/data`.
 
 ## Project layout
 

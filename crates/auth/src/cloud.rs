@@ -245,6 +245,160 @@ pub async fn databricks_cli(profile: Option<&str>, host: &str) -> Result<TokenSe
     })
 }
 
+/// Which Redshift database to get temporary credentials for.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RedshiftTarget {
+    /// Provisioned cluster identifier.
+    pub cluster: Option<String>,
+    /// Serverless workgroup name.
+    pub workgroup: Option<String>,
+    pub region: Option<String>,
+    pub database: String,
+    /// Provisioned clusters: sign in as this database user
+    /// (`get-cluster-credentials`) instead of the IAM identity's own user.
+    pub db_user: Option<String>,
+}
+
+impl RedshiftTarget {
+    /// Cluster or workgroup and region from an endpoint host name:
+    /// `<cluster>.<id>.<region>.redshift.amazonaws.com` or
+    /// `<workgroup>.<account>.<region>.redshift-serverless.amazonaws.com`.
+    pub fn from_host(host: &str) -> RedshiftTarget {
+        let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let labels: Vec<&str> = h.split('.').collect();
+        let mut t = RedshiftTarget::default();
+        if labels.len() >= 6 && labels[labels.len() - 2] == "amazonaws" {
+            match labels[labels.len() - 3] {
+                "redshift" => {
+                    t.cluster = Some(labels[0].to_string());
+                    t.region = Some(labels[2].to_string());
+                }
+                "redshift-serverless" => {
+                    t.workgroup = Some(labels[0].to_string());
+                    t.region = Some(labels[2].to_string());
+                }
+                _ => {}
+            }
+        }
+        t
+    }
+}
+
+/// Seconds the temporary password is valid (the most Redshift allows).
+const REDSHIFT_DURATION: u64 = 3600;
+
+/// `aws` arguments for a target (without the program name).
+pub fn redshift_args(profile: Option<&str>, t: &RedshiftTarget) -> Result<Vec<String>, AuthError> {
+    let mut a: Vec<String> = match (&t.workgroup, &t.cluster) {
+        (Some(w), _) => vec!["redshift-serverless".into(), "get-credentials".into(), "--workgroup-name".into(), w.clone()],
+        (None, Some(c)) => match t.db_user.as_deref().filter(|u| !u.trim().is_empty()) {
+            Some(u) => vec!["redshift".into(), "get-cluster-credentials".into(), "--cluster-identifier".into(), c.clone(), "--db-user".into(), u.trim().into()],
+            None => vec!["redshift".into(), "get-cluster-credentials-with-iam".into(), "--cluster-identifier".into(), c.clone()],
+        },
+        (None, None) => {
+            return Err(AuthError::Invalid(
+                "IAM sign-in is for Amazon Redshift: use the cluster or workgroup endpoint as the host (…redshift.amazonaws.com), or set the Cluster ID or Workgroup".into(),
+            ))
+        }
+    };
+    a.extend(["--db-name".into(), if t.database.trim().is_empty() { "dev".into() } else { t.database.trim().into() }]);
+    a.extend(["--duration-seconds".into(), REDSHIFT_DURATION.to_string(), "--output".into(), "json".into()]);
+    if let Some(r) = t.region.as_deref().filter(|r| !r.trim().is_empty()) {
+        a.extend(["--region".into(), r.trim().into()]);
+    }
+    if let Some(p) = profile.filter(|p| !p.trim().is_empty()) {
+        a.extend(["--profile".into(), p.trim().into()]);
+    }
+    Ok(a)
+}
+
+/// `2026-11-01T12:34:56+00:00` / `…56.123Z` / epoch seconds → unix seconds.
+fn parse_timestamp(v: &serde_json::Value) -> Option<u64> {
+    if let Some(n) = v.as_f64() {
+        return Some(n as u64);
+    }
+    let s = v.as_str()?.trim();
+    let (date, rest) = s.split_once('T').or_else(|| s.split_once(' '))?;
+    let mut d = date.split('-').map(|x| x.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let (time, offset) = match rest.find(['+', '-', 'Z', 'z']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let mut t = time.split(':');
+    let hh: i64 = t.next()?.parse().ok()?;
+    let mm: i64 = t.next()?.parse().ok()?;
+    let ss: i64 = t.next().unwrap_or("0").split('.').next()?.parse().ok()?;
+    let off = match offset.chars().next() {
+        Some(c @ ('+' | '-')) => {
+            let o = offset[1..].replace(':', "");
+            let (oh, om) = (o.get(..2)?.parse::<i64>().ok()?, o.get(2..4).unwrap_or("0").parse::<i64>().unwrap_or(0));
+            (if c == '-' { -1 } else { 1 }) * (oh * 3600 + om * 60)
+        }
+        _ => 0,
+    };
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * m2 + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3600 + mm * 60 + ss - off).ok()
+}
+
+/// The CLI's JSON answer: user and password (both APIs' spellings) and expiry.
+pub fn parse_redshift_credentials(out: &[u8]) -> Result<TokenSet, AuthError> {
+    let v: serde_json::Value = serde_json::from_slice(out).map_err(|e| AuthError::Flow(format!("unexpected AWS CLI output: {e}")))?;
+    let get = |a: &str, b: &str| v.get(a).or_else(|| v.get(b)).and_then(|x| x.as_str()).map(str::to_string);
+    let password = get("DbPassword", "dbPassword").ok_or_else(|| AuthError::Flow("the AWS CLI returned no database password".into()))?;
+    let user = get("DbUser", "dbUser").ok_or_else(|| AuthError::Flow("the AWS CLI returned no database user".into()))?;
+    let expires = v.get("Expiration").or_else(|| v.get("expiration")).and_then(parse_timestamp).unwrap_or(now_secs() + REDSHIFT_DURATION - 60);
+    Ok(TokenSet { access_token: password, refresh_token: None, expires_at: Some(expires), identity: Some(user) })
+}
+
+/// The `aws` program: on the PATH, else where installers put it (a GUI
+/// app's PATH on macOS often lacks Homebrew's folder).
+fn aws_program() -> PathBuf {
+    let exe = if cfg!(windows) { "aws.exe" } else { "aws" };
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    dirs.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from));
+    if let Some(h) = dirs::home_dir() {
+        dirs.push(h.join(".local/bin"));
+    }
+    if cfg!(windows) {
+        dirs.push(PathBuf::from(r"C:\Program Files\Amazon\AWSCLIV2"));
+    }
+    dirs.into_iter().map(|d| d.join(exe)).find(|p| p.is_file()).unwrap_or_else(|| PathBuf::from(exe))
+}
+
+/// Temporary Redshift credentials from the AWS CLI (its profiles, SSO,
+/// MFA and assumed roles all apply). The password is the token; the
+/// database user comes back as the identity.
+pub async fn redshift_cli(profile: Option<&str>, target: &RedshiftTarget) -> Result<TokenSet, AuthError> {
+    let args = redshift_args(profile, target)?;
+    let shown = format!("aws {} {}", args[0], args[1]);
+    let out = tokio::process::Command::new(aws_program())
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| AuthError::NotFound(format!("AWS CLI not available ({e}); install it and run `aws configure` or `aws sso login`")))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let login = match profile.filter(|p| !p.trim().is_empty()) {
+            Some(p) => format!("aws sso login --profile {}", p.trim()),
+            None => "aws sso login".into(),
+        };
+        let hint = if err.contains("SSO") || err.contains("expired") || err.contains("Unable to locate credentials") || err.contains("refresh") {
+            format!(" Sign in again with `{login}` (or `aws configure`), then connect.")
+        } else {
+            String::new()
+        };
+        return Err(AuthError::Flow(format!("`{shown}` failed: {err}.{hint}")));
+    }
+    parse_redshift_credentials(&out.stdout)
+}
+
 /// Access token from `az account get-access-token`.
 pub async fn azure_cli(resource: &str) -> Result<TokenSet, AuthError> {
     let out = tokio::process::Command::new("az")
@@ -282,6 +436,30 @@ pub async fn azure_cli(resource: &str) -> Result<TokenSet, AuthError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redshift_cli_args_and_output() {
+        let t = RedshiftTarget::from_host("analytics.c1ab2cd3ef4g.eu-west-1.redshift.amazonaws.com");
+        assert_eq!((t.cluster.as_deref(), t.region.as_deref(), t.workgroup.as_deref()), (Some("analytics"), Some("eu-west-1"), None));
+        let s = RedshiftTarget::from_host("wg1.123456789012.us-east-1.redshift-serverless.amazonaws.com");
+        assert_eq!((s.workgroup.as_deref(), s.region.as_deref()), (Some("wg1"), Some("us-east-1")));
+        assert_eq!(RedshiftTarget::from_host("db.local"), RedshiftTarget::default());
+        let a = redshift_args(Some("prod"), &RedshiftTarget { database: "sales".into(), ..t.clone() }).unwrap();
+        assert_eq!(
+            a.join(" "),
+            "redshift get-cluster-credentials-with-iam --cluster-identifier analytics --db-name sales --duration-seconds 3600 --output json --region eu-west-1 --profile prod"
+        );
+        let a = redshift_args(None, &RedshiftTarget { db_user: Some("etl".into()), ..t }).unwrap();
+        assert!(a.join(" ").starts_with("redshift get-cluster-credentials --cluster-identifier analytics --db-user etl --db-name dev"));
+        assert!(redshift_args(None, &s).unwrap().join(" ").starts_with("redshift-serverless get-credentials --workgroup-name wg1 --db-name dev"));
+        assert!(matches!(redshift_args(None, &RedshiftTarget::default()), Err(AuthError::Invalid(_))));
+
+        let t = parse_redshift_credentials(br#"{"DbUser": "IAM:alice", "DbPassword": "pw", "Expiration": "2026-11-01T12:00:00+00:00", "NextRefreshTime": "2026-11-01T23:00:00+00:00"}"#).unwrap();
+        assert_eq!((t.access_token.as_str(), t.identity.as_deref(), t.expires_at), ("pw", Some("IAM:alice"), Some(1_793_534_400)));
+        let s = parse_redshift_credentials(br#"{"dbUser": "IAMR:role", "dbPassword": "pw2", "expiration": "2026-11-01T13:30:00.5-01:30"}"#).unwrap();
+        assert_eq!((s.identity.as_deref(), s.expires_at), (Some("IAMR:role"), Some(1_793_534_400 + 3 * 3600)));
+        assert!(parse_redshift_credentials(b"{}").is_err());
+    }
 
     #[test]
     fn parses_databrickscfg() {

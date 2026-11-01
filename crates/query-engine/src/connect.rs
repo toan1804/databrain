@@ -71,7 +71,7 @@ impl QueryEngine {
             _ => SshSecret::None,
         };
         let default_port = self.registry.get(cfg.kind)?.info().default_port.unwrap_or(0);
-        let target_port = cfg.port.unwrap_or(default_port);
+        let target_port = cfg.port_or(Some(default_port)).unwrap_or(default_port);
         let t = Tunnel::open(TunnelSpec {
             ssh_host: &ssh.host,
             ssh_port: ssh.port,

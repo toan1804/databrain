@@ -32,7 +32,23 @@ export const CLI_HELP: Partial<Record<ConnectorKind, string>> = {
   bigquery: "Uses Google Application Default Credentials (run `gcloud auth application-default login`).",
   databricks: "Uses the Databricks CLI login (`databricks auth login --host …`). Profile from ~/.databrickscfg (optional).",
   mssql: "Uses the Azure CLI login (`az login`) to get an Entra ID token.",
+  postgres:
+    "Gets a temporary Redshift password from the AWS CLI on each connect (`aws redshift get-cluster-credentials-with-iam`, or `aws redshift-serverless get-credentials`): profiles, SSO, MFA and assumed roles work as in the CLI. Sign in with `aws sso login` or `aws configure` first. The cluster or workgroup and region come from the host; the user is your IAM identity's database user unless a Database user is set.",
 };
+
+/** Label of the CLI login button per type (default "CLI login"). */
+export const CLI_LABEL: Partial<Record<ConnectorKind, string>> = {
+  postgres: "IAM (AWS CLI)",
+};
+
+/** Postgres connection settings that only Redshift uses. */
+export const REDSHIFT_KEYS = ["cluster_id", "workgroup", "aws_region", "db_user"];
+
+/** A Postgres connection is Redshift: its type says so, or its host is a Redshift endpoint. */
+export function isRedshift(values: Record<string, string | undefined>): boolean {
+  if (values.flavor) return values.flavor === "redshift";
+  return /\.redshift(-serverless)?\.amazonaws\.com\.?$/i.test((values.host ?? "").trim());
+}
 
 export const TOKEN_LABEL: Partial<Record<ConnectorKind, string>> = {
   snowflake: "Programmatic access token",

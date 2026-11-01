@@ -1,14 +1,16 @@
 // Connection form, Sign-in: method, user, password or token, OAuth, CLI.
 import { Globe, Loader2, LogOut } from "lucide-react";
-import { AUTH_LABELS, CLI_HELP, Label, SecretField, TOKEN_LABEL } from "./parts";
+import { AUTH_LABELS, CLI_HELP, CLI_LABEL, Label, SecretField, TOKEN_LABEL, isRedshift } from "./parts";
 import { ConnectionFormState } from "./useConnectionForm";
 
 export function AuthSection({ f }: { f: ConnectionFormState }) {
-  const { kind, info, authKind, setAuthKind, user, setUser, oauth, setOauth, cliProfile, setCliProfile, secret, setSecret, passphrase, setPassphrase, clearSecret, setClearSecret, authStatus, busy, interactive, needsUser, needsClientId, canSubmit, signIn, signOut, secretPlaceholder, initial } = f;
+  const { kind, info, authKind, setAuthKind, user, setUser, oauth, setOauth, cliProfile, setCliProfile, secret, setSecret, passphrase, setPassphrase, clearSecret, setClearSecret, authStatus, busy, interactive, needsUser, needsClientId, canSubmit, signIn, signOut, secretPlaceholder, initial, values } = f;
+  // Postgres' CLI login is Redshift IAM: only for Redshift connections.
+  const methods = (info?.auth_methods ?? []).filter((m) => !(kind === "postgres" && m === "cloud_cli" && !isRedshift(values) && authKind !== "cloud_cli"));
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label="Authentication method">
-        {(info?.auth_methods ?? []).map((m) => (
+        {methods.map((m) => (
           <button
             type="button"
             key={m}
@@ -17,7 +19,7 @@ export function AuthSection({ f }: { f: ConnectionFormState }) {
             onClick={() => setAuthKind(m)}
             className={`rounded-md border px-2.5 py-1 text-[12.5px] ${authKind === m ? "border-accent bg-accent/10" : "border-line hover:bg-hover"}`}
           >
-            {m === "api_token" ? (TOKEN_LABEL[kind] ?? AUTH_LABELS[m]) : AUTH_LABELS[m]}
+            {m === "api_token" ? (TOKEN_LABEL[kind] ?? AUTH_LABELS[m]) : m === "cloud_cli" ? (CLI_LABEL[kind] ?? AUTH_LABELS[m]) : AUTH_LABELS[m]}
           </button>
         ))}
       </div>
@@ -152,10 +154,10 @@ export function AuthSection({ f }: { f: ConnectionFormState }) {
       {authKind === "cloud_cli" && (
         <div className="space-y-2">
           <p className="text-[12px] text-muted">{CLI_HELP[kind] ?? "Uses your local CLI login."}</p>
-          {kind === "databricks" && (
+          {(kind === "databricks" || kind === "postgres") && (
             <div>
-              <Label htmlFor="c-prof">CLI profile (optional)</Label>
-              <input id="c-prof" className="field" value={cliProfile} placeholder="DEFAULT" onChange={(e) => setCliProfile(e.target.value)} />
+              <Label htmlFor="c-prof">{kind === "postgres" ? "AWS profile (optional)" : "CLI profile (optional)"}</Label>
+              <input id="c-prof" className="field" value={cliProfile} placeholder={kind === "postgres" ? "default (or AWS_PROFILE)" : "DEFAULT"} onChange={(e) => setCliProfile(e.target.value)} />
             </div>
           )}
         </div>

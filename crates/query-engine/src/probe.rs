@@ -31,7 +31,7 @@ pub fn target(cfg: &ConnectionConfig, default_port: Option<u16>) -> Option<(Stri
                 return None;
             }
             let host = cfg.host_or_default().trim().to_string();
-            Some((host, cfg.port.or(default_port)?))
+            Some((host, cfg.port_or(default_port)?))
         }
         NetworkTarget::HttpsHost => {
             let h = cfg.host.as_deref()?.trim();
