@@ -12,7 +12,8 @@ use crate::{Error, Result, Workspace, new_id, now_ms};
 /// (schema, name, kind, comment) of a completion hit from the index.
 pub type KnCompletion = (String, String, String, Option<String>);
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct KnObject {
     pub schema: String,
     pub name: String,
@@ -20,6 +21,7 @@ pub struct KnObject {
     #[serde(default)]
     pub comment: Option<String>,
     #[serde(default)]
+    #[ts(as = "Option<f64>")]
     pub row_estimate: Option<i64>,
     pub columns: Vec<ColumnInfo>,
     #[serde(default)]
@@ -79,7 +81,8 @@ impl KnObject {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum NoteStatus {
     Approved,
@@ -187,14 +190,17 @@ impl NotesFile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct NotesSource {
     pub connection: String,
     pub kind: String,
 }
 
 /// One note in a file (no ids: they are local).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct NoteEntry {
     #[serde(default)]
     pub target: Option<String>,
@@ -203,7 +209,8 @@ pub struct NoteEntry {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportKind {
     /// Nothing similar exists.
@@ -215,7 +222,9 @@ pub enum ImportKind {
 }
 
 /// One incoming note compared with the existing notes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ImportItem {
     pub incoming: NoteEntry,
     pub kind: ImportKind,
@@ -229,9 +238,12 @@ pub struct ImportItem {
 /// What to do with an incoming note: `add`, `skip`, `replace` (delete
 /// `existing_ids`, add the incoming text) or `merge` (delete `existing_ids`,
 /// add `body`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ImportAction {
     pub incoming: NoteEntry,
+    #[ts(type = "\"add\" | \"skip\" | \"replace\" | \"merge\"")]
     pub action: String,
     #[serde(default)]
     pub existing_ids: Vec<String>,
@@ -284,7 +296,9 @@ pub fn plan_import(existing: &[KnNote], incoming: &[NoteEntry]) -> Vec<ImportIte
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct KnNote {
     #[serde(default)]
     pub id: String,
@@ -299,6 +313,7 @@ pub struct KnNote {
     #[serde(default = "approved")]
     pub status: NoteStatus,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub created_at: i64,
     /// AI proposal that updates an existing note: approving it replaces that note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,10 +327,13 @@ fn approved() -> NoteStatus {
     NoteStatus::Approved
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct KnState {
     pub connection_id: String,
+    #[ts(as = "f64")]
     pub indexed_at: i64,
+    #[ts(as = "f64")]
     pub objects: i64,
     pub schemas: Vec<String>,
     pub error: Option<String>,

@@ -32,7 +32,8 @@ pub enum ExportError {
 
 pub type Result<T> = std::result::Result<T, ExportError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportFormat {
     Csv,
@@ -65,7 +66,9 @@ impl ExportFormat {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ExportOptions {
     pub format: ExportFormat,
     /// Write a header row (CSV/TSV).
@@ -79,11 +82,13 @@ pub struct ExportOptions {
     pub dialect: Option<ConnectorKind>,
     /// Restrict to these column indices (in order). Empty = all.
     #[serde(default)]
+    #[ts(as = "Option<Vec<usize>>", optional)]
     pub columns: Vec<usize>,
     /// CSV/TSV for spreadsheets: text starting with `=`, `+`, `-`, `@`
     /// (a formula when opened in Excel) gets a leading `'`. Numbers, also
     /// negative ones, are left alone.
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     pub excel_safe: bool,
 }
 

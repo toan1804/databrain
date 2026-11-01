@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result, Workspace, new_id, now_ms};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum CellKind {
     #[default]
@@ -17,19 +18,26 @@ pub enum CellKind {
     Markdown,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct CellRunSummary {
     #[serde(default)]
+    #[ts(as = "f64")]
     pub finished_at: i64,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub duration_ms: i64,
     #[serde(default)]
+    #[ts(as = "Option<f64>")]
     pub rows: Option<i64>,
     #[serde(default)]
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct NotebookCell {
     pub id: String,
     #[serde(default)]
@@ -43,6 +51,7 @@ pub struct NotebookCell {
     #[serde(default)]
     pub connection_id: Option<String>,
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     pub collapsed: bool,
     /// Editor height in px set by the user (None = grows with the SQL).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,7 +63,9 @@ pub struct NotebookCell {
     pub last_run: Option<CellRunSummary>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct Notebook {
     #[serde(default)]
     pub id: String,
@@ -66,19 +77,24 @@ pub struct Notebook {
     #[serde(default)]
     pub cells: Vec<NotebookCell>,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub created_at: i64,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub updated_at: i64,
 }
 
 /// Listing entry (without cells).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct NotebookSummary {
     pub id: String,
     pub name: String,
     pub connection_id: Option<String>,
     pub folder_id: Option<String>,
+    #[ts(as = "f64")]
     pub cell_count: i64,
+    #[ts(as = "f64")]
     pub updated_at: i64,
 }
 

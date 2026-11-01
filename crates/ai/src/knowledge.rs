@@ -56,7 +56,8 @@ pub const LARGE_SCHEMAS: usize = 25;
 pub const LARGE_CATALOGS: usize = 3;
 pub const LARGE_OBJECTS: usize = 1000;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct PlanSchema {
     /// Schema id (`catalog.schema` for three-level engines).
     pub name: String,
@@ -70,7 +71,8 @@ pub struct PlanSchema {
     pub selected: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct IndexPlan {
     pub schemas: Vec<PlanSchema>,
     /// Saved scope (`ai_policy.index_schemas`); empty = never chosen (all

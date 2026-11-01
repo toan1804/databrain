@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::display::{self, TypeFamily};
 use crate::{Error, ResultSet, Result, ViewSpec};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum Agg {
     #[default]
@@ -25,7 +26,9 @@ pub enum Agg {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ChartSpec {
     pub x: usize,
     /// Value columns. Empty with `Count` counts rows.
@@ -45,13 +48,15 @@ fn default_limit() -> usize {
     500
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ChartSeries {
     pub name: String,
     pub values: Vec<Option<f64>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ChartData {
     pub x: Vec<String>,
     /// `number`, `date`, `time` or `text` (the UI picks an axis type).

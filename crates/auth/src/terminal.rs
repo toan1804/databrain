@@ -16,14 +16,17 @@ use std::time::Duration;
 
 /// Setting `terminal`: `kind` = "auto" (or empty), "manual", a preset id
 /// from [`options`], or "custom" with `custom` = a command line.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 #[serde(default)]
 pub struct TerminalSetting {
     pub kind: String,
     pub custom: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct TerminalOption {
     pub id: String,
     pub label: String,

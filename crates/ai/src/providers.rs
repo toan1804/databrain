@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 use crate::sse;
 use crate::types::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Openai,
@@ -68,7 +69,8 @@ impl ProviderKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAuth {
     #[default]
@@ -86,7 +88,9 @@ pub enum ProviderAuth {
 }
 
 /// Non-secret provider settings stored in `AiProviderRecord.config`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 #[serde(default)]
 pub struct ProviderConfig {
     pub base_url: Option<String>,
@@ -99,6 +103,7 @@ pub struct ProviderConfig {
     pub extra_headers: BTreeMap<String, String>,
     pub max_output_tokens: Option<u32>,
     /// CLI providers (Kiro): extra environment for the child process.
+    #[ts(as = "Option<BTreeMap<String, String>>", optional)]
     pub cli_env: BTreeMap<String, String>,
     /// Kiro: directory for the managed agent config (default ~/.kiro/agents).
     pub agents_dir: Option<String>,

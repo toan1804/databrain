@@ -55,7 +55,9 @@ pub struct KiroProvider {
 }
 
 /// Sign-in state reported by `kiro-cli whoami`.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct KiroStatus {
     pub installed: bool,
     pub cli_path: Option<String>,

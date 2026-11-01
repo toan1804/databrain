@@ -121,7 +121,8 @@ pub fn cell(formatter: &ArrayFormatter<'_>, array: &ArrayRef, row: usize) -> Opt
 }
 
 /// Coarse type family, used by the UI for alignment/icons and by filters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeFamily {
     Number,
@@ -171,7 +172,8 @@ pub fn is_decimal_type(t: &str) -> bool {
     matches!(base, "numeric" | "decimal" | "dec" | "newdecimal" | "money" | "smallmoney" | "number" | "bignumeric" | "bigdecimal")
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ColumnMeta {
     pub name: String,
     pub data_type: String,

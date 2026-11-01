@@ -86,7 +86,8 @@ pub fn runner_path() -> Result<PathBuf> {
     Ok(p)
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct BackgroundStatus {
     pub enabled: bool,
     /// The OS entry that starts the runner is in place.
@@ -96,6 +97,7 @@ pub struct BackgroundStatus {
     /// Where the OS entry is (file or task name).
     pub location: String,
     /// Last pass of the runner (ms), if any.
+    #[ts(as = "Option<f64>")]
     pub last_tick: Option<i64>,
     pub log_file: String,
 }

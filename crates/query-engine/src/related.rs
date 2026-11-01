@@ -17,7 +17,8 @@ use crate::{EngineError, OutputInfo, QueryEngine, Result};
 /// Most rows a related-rows query asks for at once.
 pub const MAX_RELATED_ROWS: usize = 1000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkDirection {
     /// The result's rows reference `table` (open the referenced row).
@@ -27,7 +28,9 @@ pub enum LinkDirection {
 }
 
 /// A foreign key between the result's table and another table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ResultLink {
     pub direction: LinkDirection,
     /// The other table (schema id as the explorer names it).

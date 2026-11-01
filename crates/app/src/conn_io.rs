@@ -49,7 +49,8 @@ pub struct SharedConnection {
     pub ai_policy: AiPolicy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportSource {
     /// A DataBrain export.
@@ -59,7 +60,9 @@ pub enum ImportSource {
     Pgpass,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ImportCandidate {
     pub index: usize,
     pub name: String,
@@ -77,13 +80,15 @@ pub struct ImportCandidate {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ImportPreview {
     pub path: String,
     pub candidates: Vec<ImportCandidate>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ImportReport {
     pub imported: usize,
     /// "name: reason" for those that could not be saved.

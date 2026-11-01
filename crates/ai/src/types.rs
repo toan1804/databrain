@@ -80,15 +80,18 @@ pub enum ChatEvent {
     Done { stop_reason: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
+#[ts(export)]
 pub struct ModelInfo {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub name: Option<String>,
 }
 
 /// Account budget a provider reports (credits, prepaid balance, key limit).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, ts_rs::TS)]
+#[ts(export)]
 pub struct Budget {
     /// Plan or key name ("KIRO POWER", "Free tier").
     pub plan: Option<String>,
@@ -99,7 +102,8 @@ pub struct Budget {
     pub manage_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, ts_rs::TS)]
+#[ts(export)]
 pub struct BudgetMeter {
     pub label: String,
     /// Spent so far (this cycle, or ever when nothing resets).
@@ -116,7 +120,8 @@ pub(crate) fn num(v: &Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
-#[derive(Debug, Clone, thiserror::Error, Serialize)]
+#[derive(Debug, Clone, thiserror::Error, Serialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub enum AiError {
     #[error("{0}")]

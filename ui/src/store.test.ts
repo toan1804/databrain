@@ -25,8 +25,8 @@ vi.mock("./lib/api", () => ({
       if (emitBeforeResolve) {
         const t = req.tab_id;
         handler?.({ type: "statement_started", job_id, tab_id: t, index: 0, sql: req.sql });
-        handler?.({ type: "statement_finished", job_id, tab_id: t, index: 0, result: null, rows_affected: 0, duration_ms: 1, notices: [] });
-        handler?.({ type: "job_finished", job_id, tab_id: t, status: "success", duration_ms: 1 });
+        handler?.({ type: "statement_finished", job_id, tab_id: t, index: 0, result: null, output: null, rows_affected: 0, duration_ms: 1, notices: [] });
+        handler?.({ type: "job_finished", job_id, tab_id: t, status: "success", duration_ms: 1, in_transaction: false });
       }
       return { status: "started", job_id, statements: [plan] };
     },

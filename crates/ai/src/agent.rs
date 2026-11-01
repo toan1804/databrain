@@ -16,12 +16,20 @@ use crate::tools::{Caller, ToolContext, ToolHost, specs};
 use crate::types::*;
 
 /// Streamed to the UI while the agent works.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     Started { session_id: String, run_id: String },
     TextDelta { session_id: String, run_id: String, text: String },
-    ToolStarted { session_id: String, run_id: String, call_id: String, tool: String, args: Value },
+    ToolStarted {
+        session_id: String,
+        run_id: String,
+        call_id: String,
+        tool: String,
+        #[ts(type = "Record<string, unknown>")]
+        args: Value,
+    },
     ToolFinished { session_id: String, run_id: String, call_id: String, tool: String, content: String, display: Value },
     Usage { session_id: String, run_id: String, input: u32, output: u32 },
     /// Kiro: credits a turn spent and how full the context is.
@@ -35,7 +43,8 @@ pub trait AgentSink: Send + Sync {
 }
 
 /// What the user is doing; adds a mode-specific instruction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     #[default]
@@ -52,7 +61,9 @@ pub enum Mode {
 }
 
 /// Editor/result context sent with each request.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 #[serde(default)]
 pub struct UiContext {
     pub editor_sql: Option<String>,
@@ -65,6 +76,7 @@ pub struct UiContext {
     /// Other connections the user chose for this question (names or ids):
     /// the assistant may look up and query them too.
     #[serde(default)]
+    #[ts(as = "Option<Vec<String>>", optional)]
     pub connections: Vec<String>,
     /// Job open in the active tab: the user is asking about it.
     pub open_job_id: Option<String>,
@@ -73,12 +85,16 @@ pub struct UiContext {
     /// The question is not about this connection's data (e.g. why another
     /// connection's test failed): don't connect, retrieve or use tools.
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     pub no_database: bool,
     /// Outputs the user mentioned with @ (handles or names).
+    #[ts(as = "Option<Vec<String>>", optional)]
     pub mentions: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct AgentRequest {
     pub session_id: Option<String>,
     pub connection_id: String,

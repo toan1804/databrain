@@ -170,7 +170,8 @@ impl Default for AiPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
     #[default]
@@ -200,7 +201,8 @@ impl Origin {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum FolderKind {
     Connections,
@@ -225,7 +227,9 @@ impl FolderKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct Folder {
     pub id: String,
     #[serde(default)]
@@ -234,7 +238,9 @@ pub struct Folder {
     pub kind: FolderKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct SavedQuery {
     pub id: String,
     pub name: String,
@@ -249,14 +255,18 @@ pub struct SavedQuery {
     pub tags: Vec<String>,
     /// Offered to the AI as a few-shot example for its connection.
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     pub ai_example: bool,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub created_at: i64,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Success,
@@ -281,16 +291,21 @@ impl RunStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct HistoryEntry {
+    #[ts(as = "f64")]
     pub id: i64,
     #[serde(default)]
     pub origin: Origin,
     pub connection_id: Option<String>,
     pub connection_name: Option<String>,
     pub sql: String,
+    #[ts(as = "f64")]
     pub started_at: i64,
+    #[ts(as = "f64")]
     pub duration_ms: i64,
+    #[ts(as = "Option<f64>")]
     pub rows: Option<i64>,
     pub status: RunStatus,
     pub error: Option<String>,
@@ -315,7 +330,9 @@ pub struct NewHistory {
     pub result_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct HistoryQuery {
     #[serde(default)]
     pub search: Option<String>,
@@ -325,14 +342,17 @@ pub struct HistoryQuery {
     pub limit: Option<u32>,
     /// Return entries with `id < before` (pagination).
     #[serde(default)]
+    #[ts(as = "Option<f64>")]
     pub before: Option<i64>,
     /// Leave out statements run by the assistant (AI panel and MCP clients).
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional)]
     pub exclude_ai: bool,
 }
 
 /// What "Clear history" deletes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(tag = "kind", content = "days", rename_all = "snake_case")]
 pub enum HistoryClear {
     /// Everything.
@@ -349,7 +369,9 @@ pub const HISTORY_RETENTION_DEFAULT_DAYS: u32 = 30;
 /// Setting: delete AI conversations idle for longer than this many days (0 = keep them).
 pub const AI_HISTORY_RETENTION_SETTING: &str = "ai_history_retention_days";
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct TabState {
     pub id: String,
     pub title: String,

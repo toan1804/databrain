@@ -45,7 +45,8 @@ pub struct AppState {
 }
 
 /// Where DataBrain keeps passwords and tokens.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct CredentialStoreView {
     pub kind: databrain_auth::StoreKind,
     /// Folder of `vault.json` / `vault.key`.
@@ -246,7 +247,8 @@ pub fn list_connectors(state: &AppState) -> Vec<ConnectorInfo> {
     state.engine.registry().infos()
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ConnectionView {
     #[serde(flatten)]
     pub profile: ConnectionProfile,
@@ -470,13 +472,15 @@ pub async fn flush_explorer_cache(state: &AppState) {
 // --------------------------------------------- explorer cache (no network)
 
 /// What the explorer shows before (or without) a connection.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct CachedExplorer {
     /// Catalogs (three-level engines), when listed before.
     pub catalogs: Option<Vec<databrain_connector_core::CatalogInfo>>,
     /// The complete schema list, when listed before.
     pub schemas: Option<Vec<SchemaInfo>>,
     /// Schema lists of single catalogs (three-level engines).
+    #[ts(type = "Record<string, Array<SchemaInfo>>")]
     pub catalog_schemas: std::collections::BTreeMap<String, Vec<SchemaInfo>>,
     pub state: databrain_workspace::ExplorerCacheState,
 }
@@ -519,7 +523,8 @@ pub async fn clear_explorer_cache(state: &AppState, id: &str) -> Result<()> {
 const FULL_RELIST_SHARE: f64 = 0.3;
 
 /// How a schema was brought up to date.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum RefreshMode {
     /// Nothing changed (versions equal).
@@ -530,7 +535,8 @@ pub enum RefreshMode {
     Full,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct SchemaRefresh {
     pub schema: String,
     pub mode: RefreshMode,
@@ -611,7 +617,8 @@ async fn refresh_schema_at(state: &AppState, id: &str, schema: &str, fingerprint
 }
 
 /// Result of [`revalidate_explorer`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ExplorerRevalidation {
     /// Schemas whose cached listing was updated (reload them from the cache).
     pub refreshed: Vec<SchemaRefresh>,
@@ -774,7 +781,8 @@ pub async fn table_layout(state: &AppState, id: &str, schema: &str, name: &str) 
 
 // ------------------------------------------------------------ running queries
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq, Eq, ts_rs::TS)]
+#[ts(export)]
 pub struct Span {
     /// UTF-16 offsets.
     pub start: usize,
@@ -804,20 +812,24 @@ pub fn statement_spans(kind: ConnectorKind, text: &str) -> Vec<Span> {
 // ------------------------------------------------------------ lineage
 
 /// The database's check of one statement (`EXPLAIN`, not run).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct LineageCheck {
     pub index: usize,
     /// `ok`, `error`, `unsupported` (no cheap check on this engine), `skipped`
     /// (not a query), `offline` (could not connect), `timeout`.
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub message: Option<String>,
     /// UTF-16 offset of the error in the script, when the engine gives one.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub position: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct LineageView {
     /// Ranges are UTF-16 offsets into the script.
     pub graph: databrain_lineage::Lineage,
@@ -1667,7 +1679,9 @@ pub fn related_rows_sql(state: &AppState, result_id: &str, link: &databrain_quer
 }
 
 /// Where and how to load a result's rows ("Load into…" on the grid).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct LoadResultArgs {
     pub target_connection_id: String,
     pub table: String,
@@ -1808,7 +1822,8 @@ pub fn file_scan_sql(path: &str, all_sheets: bool) -> Result<String> {
     Ok(format!("SELECT *\nFROM {}\nLIMIT 1000;", file_scan_expr(path, fmt)))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ExcelSheet {
     pub name: String,
     pub range: Option<String>,

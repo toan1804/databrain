@@ -1797,6 +1797,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "ts-rs",
  "uuid",
 ]
 
@@ -1847,6 +1848,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "ts-rs",
  "uuid",
  "windows-sys 0.59.0",
 ]
@@ -2056,6 +2058,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "ts-rs",
 ]
 
 [[package]]
@@ -2065,6 +2068,7 @@ dependencies = [
  "databrain-connector-core",
  "serde",
  "sqlparser",
+ "ts-rs",
 ]
 
 [[package]]
@@ -2086,6 +2090,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "ts-rs",
  "uuid",
 ]
 
@@ -2098,6 +2103,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "ts-rs",
 ]
 
 [[package]]

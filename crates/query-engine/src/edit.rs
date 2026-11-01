@@ -23,7 +23,9 @@ use databrain_connector_core::sqlparser::parser::Parser;
 use crate::{EngineError, OutputInfo, QueryEngine, Result};
 
 /// The table behind an editable result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct EditTarget {
     pub connection_id: String,
     /// Schema id (as the explorer names it) and table.
@@ -56,15 +58,20 @@ pub struct CellValue {
 }
 
 /// A statement of an apply and the rows it must touch (`None`: not checked).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct EditStatement {
     pub sql: String,
+    #[ts(as = "Option<f64>")]
     pub expect_rows: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ApplyReport {
     pub statements: usize,
+    #[ts(as = "f64")]
     pub rows: u64,
     /// Ran inside the transaction already open on the session (not committed).
     pub in_open_transaction: bool,

@@ -18,7 +18,8 @@ pub struct SchemaSide {
     pub schema: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffStatus {
     /// In the source only (the script creates it).
@@ -29,7 +30,8 @@ pub enum DiffStatus {
     Same,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ColumnChange {
     /// Column (None: table-level, e.g. the primary key or a foreign key).
     pub column: Option<String>,
@@ -40,7 +42,8 @@ pub struct ColumnChange {
     pub target: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ObjectDiff {
     pub name: String,
     pub kind: ObjectKind,
@@ -48,7 +51,8 @@ pub struct ObjectDiff {
     pub changes: Vec<ColumnChange>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct SchemaDiff {
     pub source_kind: ConnectorKind,
     pub target_kind: ConnectorKind,

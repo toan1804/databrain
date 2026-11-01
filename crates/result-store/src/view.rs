@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use crate::display::{self, DisplayText, is_decimal_text};
 use crate::{Error, Result};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum FilterOp {
     Contains,
@@ -34,7 +35,9 @@ pub enum FilterOp {
     IsNotNull,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ColumnFilter {
     pub column: usize,
     pub op: FilterOp,
@@ -42,7 +45,9 @@ pub struct ColumnFilter {
     pub value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct SortKey {
     pub column: usize,
     #[serde(default)]
@@ -51,7 +56,9 @@ pub struct SortKey {
 
 /// What the grid is showing. All parts are optional; the default is the raw
 /// result in arrival order.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct ViewSpec {
     #[serde(default)]
     pub filters: Vec<ColumnFilter>,

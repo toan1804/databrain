@@ -34,7 +34,8 @@ const SCHEDULER_TICK: Duration = Duration::from_secs(15);
 /// Wait before the first pass after launch.
 const STARTUP_DELAY: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct JobRunEvent {
     pub job_id: String,
     pub run: JobRun,
@@ -43,9 +44,11 @@ pub struct JobRunEvent {
 /// UI event with a [`JobLogEvent`] payload: new lines of a run's log.
 pub const JOB_LOG_EVENT: &str = "job-run-log";
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct JobLogEvent {
     pub job_id: String,
+    #[ts(as = "f64")]
     pub run_id: i64,
     pub entries: Vec<RunLogEntry>,
 }

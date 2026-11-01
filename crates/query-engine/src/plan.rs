@@ -25,32 +25,40 @@ use serde_json::Value;
 
 use crate::{EngineError, QueryEngine, Result};
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, ts_rs::TS)]
+#[ts(export)]
 pub struct PlanNode {
     /// What the step does (`Seq Scan`, `Hash Join`, `TABLE ACCESS FULL`…).
     pub op: String,
     /// What it works on (`on public.orders o`, `using orders_pkey`).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub object: Option<String>,
     /// Estimated cost as the engine counts it (total for the subtree).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub rows: Option<f64>,
     /// ANALYZE: rows produced (per loop where the engine says so), time in ms
     /// (inclusive, per loop) and loops.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub actual_rows: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub time_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub loops: Option<f64>,
     /// Other details (conditions, filters, buffers…), in the engine's words.
     pub extra: Vec<(String, String)>,
     pub children: Vec<PlanNode>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct QueryPlan {
     pub analyzed: bool,
     pub roots: Vec<PlanNode>,
@@ -58,8 +66,10 @@ pub struct QueryPlan {
     pub raw: String,
     /// Planning and execution time when the engine reports them (ms).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub planning_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub execution_ms: Option<f64>,
 }
 

@@ -14,14 +14,16 @@ const KB: usize = 1024;
 
 /// How big one INSERT of a load may be: rows in its VALUES list and bytes
 /// of SQL text (whichever is reached first ends the statement).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct BatchSize {
     pub rows: usize,
     pub bytes: usize,
 }
 
 /// Batch sizes a dialect allows, and what DataBrain uses by default.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct BatchLimits {
     pub default_rows: usize,
     pub max_rows: usize,

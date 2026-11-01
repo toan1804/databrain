@@ -43,7 +43,8 @@ pub const AUTO_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Total size of active outputs saved on quit.
 pub const AUTO_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputState {
     /// Data in memory.
@@ -54,7 +55,8 @@ pub enum OutputState {
     Evicted,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct OutputInfo {
     pub handle: String,
     /// Set on the current version of a named output.
@@ -68,6 +70,7 @@ pub struct OutputInfo {
     pub sql: String,
     pub tab_id: String,
     pub statement_index: usize,
+    #[ts(as = "f64")]
     pub created_at: i64,
     pub rows: usize,
     pub columns: Vec<ColumnMeta>,
@@ -78,6 +81,7 @@ pub struct OutputInfo {
     pub pinned: bool,
     pub state: OutputState,
     pub origin: Origin,
+    #[ts(as = "f64")]
     pub last_used: i64,
     /// Latest run of its tab (shown in the UI).
     #[serde(default)]

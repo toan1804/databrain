@@ -38,7 +38,8 @@ use serde::{Deserialize, Serialize};
 // ------------------------------------------------------------------ errors
 
 /// Serializable error returned to the UI.
-#[derive(Debug, Clone, Serialize, thiserror::Error)]
+#[derive(Debug, Clone, Serialize, thiserror::Error, ts_rs::TS)]
+#[ts(export)]
 #[error("{message}")]
 pub struct EngineError {
     /// Machine-readable category: `auth`, `connection`, `query`, `cancelled`,
@@ -46,9 +47,11 @@ pub struct EngineError {
     pub kind: String,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub code: Option<String>,
     /// 1-based character position of the error within the statement.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub position: Option<u32>,
 }
 
@@ -115,7 +118,8 @@ pub type Result<T, E = EngineError> = std::result::Result<T, E>;
 
 // ------------------------------------------------------------------ events
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum JobEvent {
     StatementStarted {
@@ -129,6 +133,7 @@ pub enum JobEvent {
         tab_id: String,
         index: usize,
         rows: usize,
+        #[ts(as = "f64")]
         elapsed_ms: u64,
     },
     StatementFinished {
@@ -139,12 +144,15 @@ pub enum JobEvent {
         /// Handle/name/provenance of the result (when there is one).
         #[serde(default)]
         output: Option<Box<OutputInfo>>,
+        #[ts(as = "Option<f64>")]
         rows_affected: Option<u64>,
+        #[ts(as = "f64")]
         duration_ms: u64,
         notices: Vec<String>,
         /// Time the server took to run it, when the connector reports it
         /// separately from the download (see [`JobEvent::Downloading`]).
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(as = "Option<f64>", optional)]
         server_ms: Option<u64>,
     },
     /// The server finished running the statement and the result is being
@@ -155,6 +163,7 @@ pub enum JobEvent {
         tab_id: String,
         index: usize,
         notice: Option<String>,
+        #[ts(as = "f64")]
         elapsed_ms: u64,
     },
     StatementFailed {
@@ -162,6 +171,7 @@ pub enum JobEvent {
         tab_id: String,
         index: usize,
         error: EngineError,
+        #[ts(as = "f64")]
         duration_ms: u64,
         /// Byte offset of the statement within the submitted text, so the
         /// editor can map `error.position` to a location.
@@ -171,6 +181,7 @@ pub enum JobEvent {
         job_id: String,
         tab_id: String,
         status: RunStatus,
+        #[ts(as = "f64")]
         duration_ms: u64,
         /// The run's session has a transaction open afterwards.
         #[serde(default)]
@@ -273,7 +284,9 @@ impl EventSink for CollectingSink {
 
 // ------------------------------------------------------------------ requests
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct RunRequest {
     pub connection_id: String,
     pub tab_id: String,
@@ -290,6 +303,7 @@ pub struct RunRequest {
     pub confirmed: bool,
     /// Who submitted the query (recorded in history).
     #[serde(default)]
+    #[ts(as = "Option<Origin>", optional)]
     pub origin: Origin,
     /// Share one database session between several run keys (notebook
     /// cells: each cell keeps its own results, all cells share temp tables
@@ -310,7 +324,8 @@ impl RunRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct PlannedStatement {
     pub index: usize,
     pub sql: String,
@@ -319,7 +334,8 @@ pub struct PlannedStatement {
     pub classification: Classification,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RunResponse {
     Started {
@@ -333,9 +349,11 @@ pub enum RunResponse {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct TestResult {
     pub server_version: String,
+    #[ts(as = "f64")]
     pub latency_ms: u64,
 }
 

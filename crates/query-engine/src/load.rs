@@ -53,10 +53,12 @@ pub struct LoadSpec {
 }
 
 /// Outcome of a load.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct LoadReport {
     /// Rows inserted (Append/Truncate/Replace), or updated/merged as the
     /// database reports them (the staged rows when it doesn't).
+    #[ts(as = "f64")]
     pub rows: u64,
     pub created_table: bool,
     pub transaction: bool,
@@ -65,7 +67,8 @@ pub struct LoadReport {
 
 /// Where a load would write, checked against the database: which parts of
 /// the path exist. Names are compared exactly (they are quoted as typed).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct LoadTarget {
     /// The table with the catalog/schema the session would use filled in.
     pub resolved: String,
@@ -81,10 +84,12 @@ pub struct LoadTarget {
     pub problems: Vec<String>,
     /// SQL that creates what is missing, to run first.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub create_sql: Option<String>,
     /// The path written with the database's case (`ANALYTICS.ORDERS` for
     /// `analytics.orders`) when that exists and what was typed doesn't.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub suggestion: Option<String>,
     /// Good to know: the default schema used, a name matched in another case.
     pub notes: Vec<String>,
@@ -94,18 +99,21 @@ pub struct LoadTarget {
 }
 
 /// One statement (or group of INSERTs) of a dry run.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct LoadCheck {
     pub label: String,
     pub sql: String,
     /// `ok`, `error`, `warning`, `unchecked`.
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub message: Option<String>,
 }
 
 /// Dry run report of a load step.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct LoadDryRun {
     /// No statement failed.
     pub ok: bool,
@@ -118,6 +126,7 @@ pub struct LoadDryRun {
     pub table_exists: Option<bool>,
     pub creates_table: bool,
     /// Rows the check used (a sample of the step's rows).
+    #[ts(as = "Option<f64>")]
     pub sample_rows: Option<u64>,
     /// Why the step's rows could not be selected (upstream not run yet, …).
     pub rows_error: Option<String>,

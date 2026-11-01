@@ -30,6 +30,7 @@ tokio = { version = "1.53.1", features = ["rt", "sync", "macros", "time", "net",
 tokio-util = "0.7.19"
 uuid = { version = "1.26.1", features = ["v4"] }
 tracing = "0.1"
+ts-rs = { version = "11.1", features = ["serde-json-impl", "no-serde-warnings"] }
 
 [dev-dependencies]
 async-trait = "0.1.92"

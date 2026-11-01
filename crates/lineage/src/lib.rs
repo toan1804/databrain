@@ -31,13 +31,17 @@ use sqlparser::tokenizer::{Location, Span, Token, Tokenizer};
 // ------------------------------------------------------------------ model
 
 /// Byte range in the script.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(rename = "LineageRange")]
 pub struct Range {
     pub start: usize,
     pub end: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(rename = "LineageNodeKind")]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
     /// A table or view in the database (read, or written by the script).
@@ -50,18 +54,24 @@ pub enum NodeKind {
     Result,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(rename = "LineageColumn")]
 pub struct Column {
     pub name: String,
     /// Where the column is defined (alias or expression).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub span: Option<Range>,
     /// The expression of a computed column (shortened).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub expr: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(rename = "LineageNode")]
 pub struct Node {
     pub id: String,
     pub kind: NodeKind,
@@ -74,15 +84,20 @@ pub struct Node {
     pub written: bool,
     /// Created by the script as a temporary table.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
     pub temporary: bool,
     /// Statement that defines it (tables: none).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub statement: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub span: Option<Range>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(rename = "LineageEdgeKind")]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     /// The value is copied as is.
@@ -99,30 +114,39 @@ pub enum EdgeKind {
 
 /// `from` column (or the whole node) feeds `to` column (or, for filters and
 /// joins, the rows of the `to` node).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(rename = "LineageEdge")]
 pub struct Edge {
     pub from: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub from_column: Option<String>,
     pub to: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub to_column: Option<String>,
     pub kind: EdgeKind,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub span: Option<Range>,
     /// Filters and joins: the clause it comes from (`LEFT JOIN customers c ON c.id = o.customer_id`,
     /// `WHERE o.status = 'paid'`), shortened.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub detail: Option<String>,
     /// Statement (index) the edge comes from.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub statement: Option<usize>,
 }
 
 /// Table-level summary of the chain: rows of `from` (a table, or a result)
 /// end up in, or decide the rows of, `to` — through any CTEs and subqueries
 /// in between, possibly over several statements.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(rename = "LineageFlow")]
 pub struct TableFlow {
     pub from: String,
     pub to: String,
@@ -133,7 +157,9 @@ pub struct TableFlow {
     pub statements: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(rename = "LineageStatement")]
 pub struct StatementInfo {
     pub index: usize,
     /// `select`, `select_into`, `create_table_as`, `create_table`,
@@ -143,21 +169,29 @@ pub struct StatementInfo {
     pub range: Range,
     /// The query part to check with the database (`EXPLAIN`), when it is a query.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub query: Option<Range>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub result: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(rename = "LineageWarning")]
 pub struct Warning {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub span: Option<Range>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(rename = "LineageGraph")]
 pub struct Lineage {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -169,6 +203,7 @@ pub struct Lineage {
     /// written); tables the script creates are not among them.
     pub unknown_tables: Vec<String>,
     /// The chain table to table (and to the results of `SELECT`s).
+    #[ts(as = "Option<Vec<TableFlow>>", optional)]
     pub flows: Vec<TableFlow>,
 }
 

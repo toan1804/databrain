@@ -68,6 +68,7 @@ uuid = { version = "1.26.1", features = ["v4"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 tracing = "0.1"
+ts-rs = { version = "11.1", features = ["serde-json-impl", "no-serde-warnings"] }
 
 # Linux: build OpenSSL from source and link it statically, so the binary
 # does not depend on the distribution's libssl version.

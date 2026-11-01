@@ -7,20 +7,27 @@ use crate::{AI_HISTORY_RETENTION_SETTING, Error, Result, Workspace, new_id, now_
 
 /// A configured AI provider. `config` is interpreted by the AI crate
 /// (base URL, auth method, default model, ...). Never contains secrets.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct AiProviderRecord {
     pub id: String,
+    #[ts(type = "import(\"./ProviderKind\").ProviderKind")]
     pub kind: String,
     pub name: String,
     #[serde(default)]
+    #[ts(type = "import(\"./ProviderConfig\").ProviderConfig")]
     pub config: serde_json::Value,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub created_at: i64,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct AiSessionRecord {
     pub id: String,
     pub title: String,
@@ -31,24 +38,33 @@ pub struct AiSessionRecord {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub created_at: i64,
     #[serde(default)]
+    #[ts(as = "f64")]
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct AiMessageRecord {
+    #[ts(as = "f64")]
     pub id: i64,
     pub session_id: String,
     pub role: String,
     pub content: serde_json::Value,
+    #[ts(as = "Option<f64>")]
     pub tokens_in: Option<i64>,
+    #[ts(as = "Option<f64>")]
     pub tokens_out: Option<i64>,
+    #[ts(as = "f64")]
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
 pub struct AuditEntry {
+    #[ts(as = "f64")]
     pub id: i64,
     pub session_id: Option<String>,
     pub connection_id: Option<String>,
@@ -57,6 +73,7 @@ pub struct AuditEntry {
     /// `allowed`, `approved`, `denied`, `blocked`, `error`.
     pub decision: String,
     pub summary: Option<String>,
+    #[ts(as = "f64")]
     pub created_at: i64,
 }
 

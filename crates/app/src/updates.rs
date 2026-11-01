@@ -10,7 +10,8 @@ pub const REPO: &str = "toan1804/databrain";
 /// Setting: check at startup (default on).
 pub const UPDATE_CHECK_SETTING: &str = "update_check";
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct UpdateInfo {
     pub current: String,
     pub latest: String,

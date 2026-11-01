@@ -194,7 +194,8 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 // ------------------------------------------------------------------ switchable
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum StoreKind {
     /// macOS Keychain / Windows Credential Manager / Secret Service.
@@ -205,7 +206,8 @@ pub enum StoreKind {
 }
 
 /// Outcome of [`SwitchableStore::switch`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct MigrationReport {
     pub moved: usize,
     /// References that could not be read from the old store.

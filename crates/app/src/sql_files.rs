@@ -13,11 +13,13 @@ use serde::Serialize;
 /// Largest file opened in the editor.
 pub const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct SqlFile {
     pub path: String,
     pub text: String,
     /// Modification time (ms since the epoch).
+    #[ts(as = "f64")]
     pub mtime_ms: i64,
 }
 

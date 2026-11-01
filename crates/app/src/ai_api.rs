@@ -117,7 +117,8 @@ fn ai_err(e: databrain_ai::AiError) -> EngineError {
     EngineError::new(&kind, e.to_string())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ProviderView {
     #[serde(flatten)]
     pub record: AiProviderRecord,
@@ -181,7 +182,8 @@ pub async fn list_models(state: &AppState, id: &str) -> Result<Vec<ModelInfo>> {
 }
 
 /// Budget and token use of a provider (Settings, AI panel).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ProviderUsage {
     /// Credits/balance, when the provider reports them.
     pub budget: Option<databrain_ai::Budget>,
@@ -190,7 +192,9 @@ pub struct ProviderUsage {
     /// Whether this provider has a budget API at all.
     pub budget_supported: bool,
     /// Tokens (input, output) of DataBrain's conversations with it.
+    #[ts(as = "(f64, f64)")]
     pub tokens_today: (i64, i64),
+    #[ts(as = "(f64, f64)")]
     pub tokens_month: (i64, i64),
 }
 
@@ -352,7 +356,9 @@ impl ToolHost for UiHost {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct AiSendArgs {
     #[serde(flatten)]
     pub request: AgentRequest,
@@ -423,7 +429,8 @@ pub fn list_audit(state: &AppState) -> Result<Vec<AuditEntry>> {
 
 // ------------------------------------------------------------------ knowledge
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct KnowledgeView {
     pub state: Option<KnState>,
     pub notes: Vec<KnNote>,
@@ -435,7 +442,8 @@ pub fn knowledge(state: &AppState, connection_id: &str) -> Result<KnowledgeView>
     Ok(KnowledgeView { state: state.workspace.kn_state(connection_id)?, notes: state.workspace.kn_notes(connection_id)? })
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct KnObjectPage {
     pub objects: Vec<KnObject>,
     /// Objects matching the filter (all pages).
@@ -594,7 +602,8 @@ pub fn export_notes(state: &AppState, connection_id: &str, path: &str) -> Result
     Ok(file.notes.len())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct NotesImportPreview {
     pub source: Option<databrain_workspace::NotesSource>,
     pub items: Vec<databrain_workspace::ImportItem>,

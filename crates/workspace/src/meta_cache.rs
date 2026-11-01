@@ -28,28 +28,36 @@ fn parse_kind(s: &str) -> ObjectKind {
 }
 
 /// A complete cached listing of a schema.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct CachedListing {
     pub objects: Vec<DbObject>,
     /// When it was listed (ms).
+    #[ts(as = "f64")]
     pub listed_at: i64,
 }
 
 /// Cached columns of a table; `stale` = its definition changed since (or
 /// may have): show them, but describe again when online.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct CachedColumns {
     pub columns: Vec<ColumnInfo>,
     pub stale: bool,
 }
 
 /// What a connection's explorer cache holds.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ExplorerCacheState {
     /// Last time the cache was checked against the server (ms).
+    #[ts(as = "Option<f64>")]
     pub checked_at: Option<i64>,
+    #[ts(as = "Option<f64>")]
     pub catalogs_at: Option<i64>,
+    #[ts(as = "Option<f64>")]
     pub schemas_at: Option<i64>,
+    #[ts(as = "f64")]
     pub listed_schemas: i64,
 }
 

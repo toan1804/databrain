@@ -36,7 +36,8 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A page of display-ready cells for the grid.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct Page {
     /// Rows in the current view (after filters).
     pub view_rows: usize,
@@ -76,7 +77,8 @@ pub fn contains_word(hay: &str, needle: &str) -> bool {
 const MAX_DISTINCT: usize = 100_000;
 
 /// Count, distinct and (for numbers) sum / min / max / avg of selected cells.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct SelectionSummary {
     pub cells: usize,
     pub non_null: usize,
@@ -91,38 +93,47 @@ pub struct SelectionSummary {
     pub avg: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct CellMatch {
     /// Row position within the view.
     pub row: u32,
     pub col: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct FindResult {
     pub matches: Vec<CellMatch>,
     /// True when the match list was cut at the limit.
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct TopValue {
     pub value: Option<String>,
+    #[ts(as = "f64")]
     pub count: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ColumnStats {
     pub column: usize,
+    #[ts(as = "f64")]
     pub count: u64,
+    #[ts(as = "f64")]
     pub nulls: u64,
+    #[ts(as = "f64")]
     pub distinct: u64,
     pub min: Option<String>,
     pub max: Option<String>,
     pub top: Vec<TopValue>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct ResultInfo {
     pub id: String,
     pub columns: Vec<ColumnMeta>,

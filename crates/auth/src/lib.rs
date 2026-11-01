@@ -269,7 +269,8 @@ pub enum AuthMethodKind {
 
 // ------------------------------------------------------------------ interaction
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct DeviceCodePrompt {
     pub provider: String,
     pub user_code: String,
@@ -358,11 +359,13 @@ impl fmt::Debug for Credential {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct AuthStatus {
     pub signed_in: bool,
     pub identity: Option<String>,
     /// Unix seconds.
+    #[ts(as = "Option<f64>")]
     pub expires_at: Option<u64>,
 }
 
