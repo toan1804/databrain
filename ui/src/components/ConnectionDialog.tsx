@@ -657,7 +657,16 @@ function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | nu
                 {env === "prod" && <p className="mt-1 text-[11.5px] text-muted">Statements that change data or schema ask for confirmation.</p>}
               </div>
               <div className="mt-5">
-                <Check checked={readOnly} onChange={setReadOnly} label="Read-only" help="Block INSERT/UPDATE/DELETE/DDL for this connection." />
+                <Check
+                  checked={readOnly}
+                  onChange={setReadOnly}
+                  label="Read-only"
+                  help={
+                    ["postgres", "mysql", "sqlite", "duckdb"].includes(kind)
+                      ? "Only queries run; the database session itself is read-only."
+                      : "Only queries run. This database has no read-only session, so a function or procedure that writes can't be stopped: use a database user without write permissions for a guarantee."
+                  }
+                />
               </div>
             </div>
           </>

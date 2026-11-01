@@ -122,6 +122,7 @@ impl Connector for MysqlConnector {
         Ok(Box::new(MysqlSession {
             conn_id: Arc::new(AtomicU32::new(conn.id())),
             conn: Arc::new(Mutex::new(conn)),
+            read_only: cfg.read_only,
             opts,
             state: Default::default(),
         }))
@@ -149,6 +150,9 @@ pub struct MysqlSession {
     opts: Opts,
     /// What the connection carries (transactions, SET, USE, temp tables).
     state: Arc<ConnState>,
+    /// Read-only connection: read-only is set again before each statement
+    /// (a stored function could have changed it for the session).
+    read_only: bool,
 }
 
 fn col_type(c: &mysql_async::Column) -> ColType {
@@ -274,6 +278,7 @@ struct Ctx {
     /// Set once the statement no longer needs the server: a late cancel must
     /// not KILL whatever runs next on the connection.
     finished: Arc<AtomicBool>,
+    read_only: bool,
 }
 
 async fn run(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSender) -> Result<()> {
@@ -282,6 +287,11 @@ async fn run(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSender) -> Res
     // An open transaction counts too, also one a procedure started.
     let in_tx = guard.last_ok_packet().is_some_and(|p| p.status_flags().contains(StatusFlags::SERVER_STATUS_IN_TRANS));
     let replaceable = ctx.state.replaceable() && !in_tx;
+    if ctx.read_only && !in_tx {
+        // Applies to the next transaction, which the statement is (it can't
+        // be changed while that transaction runs).
+        guard.query_drop("SET SESSION TRANSACTION READ ONLY").await.map_err(map_err)?;
+    }
     let mut result = guard.query_iter(sql).await.map_err(map_err)?;
 
     let columns = result.columns().unwrap_or_else(|| Arc::from(Vec::new()));
@@ -448,6 +458,7 @@ impl Session for MysqlSession {
             opts: self.opts.clone(),
             state: self.state.clone(),
             finished: Arc::new(AtomicBool::new(false)),
+            read_only: self.read_only,
         };
         let sql = sql.to_string();
         tokio::spawn(async move {

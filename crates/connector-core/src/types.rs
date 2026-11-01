@@ -20,6 +20,15 @@ pub enum ConnectorKind {
 }
 
 impl ConnectorKind {
+    /// The server itself keeps a read-only connection from writing (a
+    /// read-only session or file), also through functions a query calls.
+    /// Elsewhere read-only is enforced by DataBrain refusing statements it
+    /// sees as writes; a function that writes can't be told apart from a
+    /// read. Oracle: functions with autonomous transactions still write.
+    pub fn server_read_only(self) -> bool {
+        matches!(self, ConnectorKind::Postgres | ConnectorKind::Mysql | ConnectorKind::Sqlite | ConnectorKind::Duckdb)
+    }
+
     pub const ALL: [ConnectorKind; 11] = [
         ConnectorKind::Sqlite,
         ConnectorKind::Postgres,

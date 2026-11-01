@@ -11,6 +11,9 @@ use serde::Serialize;
 pub enum Decision {
     Allow,
     Ask(String),
+    /// Like `Ask`, but only the user in DataBrain can approve it: an MCP
+    /// client's own approval is not enough (it may approve tools blindly).
+    Confirm(String),
     Deny(String),
 }
 
@@ -26,9 +29,13 @@ pub struct SqlReview {
 pub fn review_sql(profile: &ConnectionProfile, sql: &str) -> SqlReview {
     let kind = profile.config.kind;
     let policy = &profile.ai_policy;
-    let stmts: Vec<Classification> = split_statements(sql, kind).iter().map(|s| classify(&s.sql, kind)).collect();
+    let pieces = split_statements(sql, kind);
+    let stmts: Vec<Classification> = pieces.iter().map(|s| classify(&s.sql, kind)).collect();
     let worst = stmts.iter().map(|c| c.kind).max().unwrap_or(StatementKind::Unknown);
     let mut decision = decide(profile, policy, &stmts, worst);
+    if profile.config.read_only && !matches!(decision, Decision::Deny(_)) {
+        decision = read_only_decision(profile, &pieces, &stmts).unwrap_or(decision);
+    }
     // Tables the AI may read / write (checked after the connection-wide rules,
     // so their reasons come first).
     if !matches!(decision, Decision::Deny(_)) {
@@ -74,6 +81,32 @@ fn decide(profile: &ConnectionProfile, policy: &AiPolicy, stmts: &[Classificatio
         RunQueryPolicy::AutoRead => Decision::Allow,
         _ => Decision::Ask("Run read-only query".into()),
     }
+}
+
+/// Read-only connections: what `decide` allowed may still be refused.
+/// - Session and transaction statements are denied like writes (`SET
+///   default_transaction_read_only = off`, `BEGIN READ WRITE`), except a
+///   harmless `USE` or `SET` (see `read_only_allows`).
+/// - Where the database has no read-only mode, a query calling functions
+///   that are not known built-ins could write through them: only the user
+///   in DataBrain may approve it, never automatically or by an MCP client.
+fn read_only_decision(profile: &ConnectionProfile, pieces: &[databrain_connector_core::sql::StatementSpan], stmts: &[Classification]) -> Option<Decision> {
+    use databrain_connector_core::sql::{read_only_allows, unknown_functions};
+    if let Some((_, c)) = pieces.iter().zip(stmts).find(|(p, c)| !read_only_allows(&p.sql, c)) {
+        return Some(Decision::Deny(format!("the connection is read-only: {} statements are not run on it", c.keyword)));
+    }
+    let kind = profile.config.kind;
+    if kind.server_read_only() {
+        return None;
+    }
+    let fns: Vec<String> = pieces.iter().flat_map(|p| unknown_functions(&p.sql, kind)).collect();
+    (!fns.is_empty()).then(|| {
+        Decision::Confirm(format!(
+            "{} has no read-only mode on the server, and this query calls {}, which could write",
+            kind.traits().name,
+            fns.join(", ")
+        ))
+    })
 }
 
 /// Wrap a read query with a row cap unless it already has one.

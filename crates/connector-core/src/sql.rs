@@ -582,6 +582,119 @@ fn contains_dml_word(sql: &str) -> bool {
     })
 }
 
+// ------------------------------------------------------------------ read-only
+
+/// Session settings a read-only connection may still change: none of them
+/// can make the session writable.
+const READ_ONLY_SETTINGS: &[&str] = &[
+    "search_path", "schema", "time", "timezone", "time_zone", "statement_timeout", "lock_timeout",
+    "idle_in_transaction_session_timeout", "datestyle", "intervalstyle", "application_name",
+    "extra_float_digits", "names", "character_set_results", "max_execution_time", "net_read_timeout",
+    "query_tag", "language", "dateformat", "datefirst", "nocount", "ansi_nulls", "quoted_identifier",
+    "textsize", "arithabort", "lock_timeout_ms", "threads", "memory_limit",
+];
+
+/// Whether a read-only connection may run this statement. Only reads, plus
+/// `USE …` and a few harmless `SET`s: transactions (`BEGIN READ WRITE`,
+/// `COMMIT` ending Oracle's read-only transaction) and other session
+/// statements (`SET default_transaction_read_only = off`, `ATTACH`,
+/// `PRAGMA`) could make the session writable.
+pub fn read_only_allows(sql: &str, c: &Classification) -> bool {
+    match c.kind {
+        StatementKind::Read => true,
+        StatementKind::Session => {
+            let mut w = words(sql).map(|w| w.to_ascii_lowercase());
+            match w.next().as_deref() {
+                // Not `USE ROLE`: another role may write.
+                Some("use") => !matches!(w.next().as_deref(), Some("role" | "secondary")),
+                Some("set") => {
+                    let mut name = w.next().unwrap_or_default();
+                    if matches!(name.as_str(), "session" | "local") {
+                        name = w.next().unwrap_or_default();
+                    }
+                    let name = name.trim_start_matches("@@").trim_start_matches("session.").trim_start_matches('@').to_string();
+                    READ_ONLY_SETTINGS.contains(&name.as_str())
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Built-in functions that never write (common to the SQL dialects).
+const PURE_FUNCTIONS: &[&str] = &[
+    "count", "sum", "avg", "min", "max", "coalesce", "nullif", "lower", "upper", "trim", "ltrim", "rtrim", "btrim",
+    "length", "len", "char_length", "character_length", "octet_length", "substr", "substring", "concat", "concat_ws",
+    "replace", "translate", "reverse", "round", "trunc", "truncate", "floor", "ceil", "ceiling", "abs", "sign", "mod",
+    "sqrt", "power", "pow", "exp", "ln", "log", "log10", "log2", "pi", "random", "rand", "cast", "try_cast", "convert",
+    "try_convert", "date_trunc", "date_part", "datepart", "datename", "extract", "now", "current_date",
+    "current_timestamp", "current_time", "localtimestamp", "localtime", "getdate", "getutcdate", "sysdate",
+    "systimestamp", "sysdatetime", "dateadd", "datediff", "date_add", "date_sub", "date_diff", "timestampdiff",
+    "timestampadd", "to_char", "to_date", "to_timestamp", "to_number", "to_varchar", "to_decimal", "date", "time",
+    "timestamp", "year", "month", "day", "hour", "minute", "second", "week", "quarter", "dayofweek", "dayofyear",
+    "last_day", "add_months", "months_between", "date_format", "str_to_date", "strftime", "strptime", "age",
+    "row_number", "rank", "dense_rank", "lag", "lead", "first_value", "last_value", "nth_value", "ntile",
+    "percent_rank", "cume_dist", "greatest", "least", "iff", "iif", "if", "ifnull", "isnull", "nvl", "nvl2", "zeroifnull",
+    "decode", "listagg", "string_agg", "array_agg", "group_concat", "split_part", "split", "position", "strpos",
+    "instr", "charindex", "locate", "left", "right", "lpad", "rpad", "format", "repeat", "regexp_replace",
+    "regexp_substr", "regexp_like", "regexp_matches", "regexp_extract", "stddev", "stddev_pop", "stddev_samp",
+    "variance", "var_pop", "var_samp", "median", "percentile_cont", "percentile_disc", "approx_count_distinct",
+    "any_value", "bool_and", "bool_or", "every", "bit_and", "bit_or", "json_extract", "json_extract_path_text",
+    "json_value", "json_query", "parse_json", "try_parse_json", "get_json_object", "to_json", "to_jsonb",
+    "json_build_object", "jsonb_build_object", "json_agg", "jsonb_agg", "array_size", "array_length",
+    "array_contains", "cardinality", "unnest", "flatten", "generate_series", "md5", "sha1", "sha2", "hash",
+    "uuid", "gen_random_uuid", "newid", "current_user", "current_schema", "current_database", "user",
+    "version", "typeof", "exists", "any", "all", "some", "grouping", "nvl", "chr", "char", "ascii", "initcap",
+    "soundex", "difference", "space", "stuff", "quotename", "object_id", "db_name", "schema_name",
+];
+
+/// Functions `sql` calls that are not known built-ins (user functions,
+/// procedures' wrappers, `pkg.fn`, `dblink`, …): on a database without a
+/// read-only session mode, one of them could write.
+pub fn unknown_functions(sql: &str, kind: ConnectorKind) -> Vec<String> {
+    use sqlparser::ast::{Expr, ObjectName, TableFactor, Visit, Visitor};
+    use std::ops::ControlFlow;
+    struct V(Vec<String>);
+    impl V {
+        fn check(&mut self, name: &ObjectName) {
+            let n = name.to_string();
+            let plain = name.0.len() == 1 && PURE_FUNCTIONS.contains(&n.trim_matches(['"', '`', '[', ']']).to_ascii_lowercase().as_str());
+            if !plain && !self.0.contains(&n) {
+                self.0.push(n);
+            }
+        }
+    }
+    impl Visitor for V {
+        type Break = ();
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            if let Expr::Function(f) = e {
+                self.check(&f.name);
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            match t {
+                TableFactor::Table { name, args: Some(_), .. } | TableFactor::Function { name, .. } => self.check(name),
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    if !kind.traits().language.is_sql() {
+        return vec![];
+    }
+    match Parser::parse_sql(dialect_for(kind).as_ref(), sql) {
+        Ok(stmts) => {
+            let mut v = V(vec![]);
+            let _ = stmts.visit(&mut v);
+            v.0
+        }
+        // Can't tell: assume the worst.
+        Err(_) => vec!["(SQL that could not be parsed)".into()],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

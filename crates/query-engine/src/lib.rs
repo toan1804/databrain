@@ -1199,15 +1199,13 @@ impl QueryEngine {
         }
         Self::bind_parameters(&mut plan, profile.config.kind, &req.params)?;
         if profile.config.read_only {
-            if let Some(p) = plan.iter().find(|p| p.classification.kind.is_write()) {
+            // Only reads (and harmless USE/SET): a transaction or session
+            // statement could turn read-only off for what follows.
+            if let Some(p) = plan.iter().find(|p| !databrain_connector_core::sql::read_only_allows(&p.sql, &p.classification)) {
+                let why = if p.classification.kind.is_write() { "" } else { ": on a read-only connection only queries run (transactions and session settings could make it writable)" };
                 return Err(EngineError::new(
                     "invalid",
-                    format!(
-                        "Connection \"{}\" is read-only; statement {} ({}) was not run.",
-                        profile.name,
-                        p.index + 1,
-                        p.classification.keyword
-                    ),
+                    format!("Connection \"{}\" is read-only; statement {} ({}) was not run{why}.", profile.name, p.index + 1, p.classification.keyword),
                 ));
             }
         }

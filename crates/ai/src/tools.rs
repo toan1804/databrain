@@ -629,7 +629,11 @@ impl ToolContext {
                 Ok(detail.clone())
             }
             Decision::Deny(reason) => Err(AiError::Policy(reason)),
-            Decision::Ask(reason) => {
+            Decision::Confirm(reason) if self.caller == Caller::Mcp => {
+                self.audit(tool, detail, "blocked", Some(&reason));
+                Err(AiError::Policy(format!("{reason}. Only the user can approve this, in DataBrain's assistant; an MCP client can't")))
+            }
+            Decision::Ask(reason) | Decision::Confirm(reason) => {
                 if self.caller == Caller::Mcp {
                     // The MCP client (Kiro CLI, Claude Code…) asked its user
                     // before calling the tool: that is the approval. DataBrain's

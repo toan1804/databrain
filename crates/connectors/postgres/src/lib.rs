@@ -127,6 +127,7 @@ impl Connector for PostgresConnector {
         Ok(Box::new(PgSession {
             link: Arc::new(Link { pg, tls: tls.clone(), current: std::sync::RwLock::new((Arc::new(client), task)), state: ConnState::new() }),
             tls,
+            read_only: cfg.read_only,
         }))
     }
 }
@@ -221,6 +222,9 @@ fn map_err(e: &tokio_postgres::Error) -> ConnectorError {
 pub struct PgSession {
     link: Arc<Link>,
     tls: MakeTlsConnector,
+    /// Read-only connection: every statement starts read-only, also after
+    /// something (`set_config(…)` in a function) turned the default off.
+    read_only: bool,
 }
 
 impl PgSession {
@@ -489,8 +493,17 @@ impl Session for PgSession {
         let tls = self.tls.clone();
         let sql = sql.to_string();
         let finished = Arc::new(AtomicBool::new(false));
+        let read_only = self.read_only && !self.link.state.in_transaction();
         tokio::spawn(async move {
             let cancel = opts.cancel.clone();
+            if read_only {
+                // A transaction that began read-only can't be made writable
+                // once it ran a query, so this holds for the whole statement.
+                if let Err(e) = link.client().batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").await {
+                    tx.send_err(map_err(&e)).await;
+                    return;
+                }
+            }
             let work = run(link, sql, opts, tx.clone(), finished.clone());
             tokio::pin!(work);
             let res = tokio::select! {
