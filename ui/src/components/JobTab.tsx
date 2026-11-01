@@ -28,7 +28,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { api, toError } from "../lib/api";
-import { kbd } from "../lib/platform";
+import { kbd, modalOpen } from "../lib/platform";
 import type { BatchLimits, FileFormat, Job, JobEdge, JobNode, JobRun, JobSchedule, LoadDryRun, LoadMode, LoadTarget, NodeRunSummary, RunLogEntry, StepProgress } from "../lib/types";
 import { copyText } from "./CatalogMenus";
 import {
@@ -315,6 +315,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
     if (!visible) return;
     const key = (e: KeyboardEvent) => {
       if (e.key !== "Delete" && e.key !== "Backspace") return;
+      if (modalOpen()) return;
       const t = e.target as HTMLElement;
       if (t.closest("input,textarea,select,.cm-editor,[contenteditable]")) return;
       if (!box.current?.contains(document.activeElement) && document.activeElement !== document.body) return;

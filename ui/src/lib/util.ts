@@ -134,11 +134,38 @@ export function errorRange(
   return { from, to: Math.min(stmt.end, from + Math.max(1, len)) };
 }
 
+/**
+ * Words some supported database reserves (a table named `order` or `user`
+ * must be quoted). A union over the dialects: quoting an identifier that
+ * needed none names the same object (words that are often schema or table
+ * names and seldom clash, like `public`, are left out to keep SQL readable).
+ */
+const RESERVED = new Set(
+  (
+    "access add all alter analyse analyze and any array as asc asymmetric authorization backup begin between bigint binary " +
+    "both break browse bulk by call cascade case cast char character check checkpoint close clustered collate column commit " +
+    "compress compute connect constraint contains continue convert create cross current_date current_role current_time " +
+    "current_timestamp current_user cursor database databases date dbcc deallocate dec decimal declare default deferrable " +
+    "delete deny desc describe disk distinct distributed div do double drop dump else elseif end escape except exclusive " +
+    "exec execute exists exit explain external false fetch fillfactor float for force foreign freetext freeze from full " +
+    "function goto grant group having holdlock identified identity if ilike immediate in index inner insert int integer " +
+    "intersect interval into is isnull join key kill lateral leading left like limit load localtime localtimestamp lock " +
+    "long loop match maxextents merge minus mod modify natural nocheck nocompress nonclustered not notnull nowait null " +
+    "numeric of off offset on only open option or order outer over overlaps partition percent pivot placing precision " +
+    "primary print prior privileges proc procedure qualify raise range read readtext real reconfigure references regexp " +
+    "rename repeat replace replication restore restrict return returning revert revoke right rlike rollback row rowcount " +
+    "rowguidcol rowid rownum rows save schema schemas select session_user set setuser similar smallint some sql symmetric " +
+    "synonym sysdate system_user table tablesample then to top trailing tran transaction trigger true truncate tsequal " +
+    "union unique unpivot update updatetext use user using values varchar varchar2 variadic view waitfor when whenever " +
+    "where while window with within writetext xor"
+  ).split(" "),
+);
+
 export function quoteIdent(kind: ConnectorKind, ident: string): string {
   const t = traitsOf(kind);
   // Unquoted identifiers fold to upper case in Oracle/Snowflake, lower elsewhere.
   const safe = t.upper_folding ? /^[A-Z_][A-Z0-9_$]*$/ : /^[a-z_][a-z0-9_]*$/;
-  if (safe.test(ident)) return ident;
+  if (safe.test(ident) && !RESERVED.has(ident.toLowerCase())) return ident;
   switch (t.quote) {
     case "backtick":
     case "backtick_backslash":

@@ -24,3 +24,8 @@ export function kbd(text: string, mac = isMac): string {
   if (mac) return text;
   return text.replace(/[⌃⌥⇧⌘]+(?:[↵⌫⎋↑↓←→]|[A-Za-z0-9.,[\]+]|\/)?/g, (m) => shortcutFor(m, false));
 }
+
+/** A modal dialog is open (app-wide shortcuts must not act behind it). */
+export function modalOpen(doc: Document = document): boolean {
+  return !!doc.querySelector('[role="dialog"][aria-modal="true"]');
+}

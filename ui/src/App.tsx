@@ -23,7 +23,7 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { MoveToApplications } from "./components/MoveToApplications";
 import { DuckdbEngineBanner } from "./components/DuckdbEngine";
 import { useAi } from "./aiStore";
-import { isMac, kbd } from "./lib/platform";
+import { isMac, kbd, modalOpen } from "./lib/platform";
 
 function useGlobalShortcuts() {
   useEffect(() => {
@@ -32,6 +32,9 @@ function useGlobalShortcuts() {
       if (!mod) return;
       const st = useStore.getState();
       const key = e.key.toLowerCase();
+      // Not behind a dialog (⌘W would close the tab under it, ⌘↵ run a
+      // query): the palette only closes again with ⌘K.
+      if (modalOpen() || (st.paletteOpen && key !== "k")) return;
       const inEditor = (e.target as HTMLElement | null)?.closest?.(".cm-editor");
       if (key === "l" && !e.shiftKey) {
         e.preventDefault();
