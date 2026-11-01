@@ -1412,7 +1412,7 @@ pub fn oracle_cancel_install() {
     ORACLE_INSTALL_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Download and install the latest Instant Client (Basic) for this computer
+/// Download, verify and install Instant Client (Basic) for this computer
 /// into `<app data>/oracle/instantclient_<ver>`. Progress is emitted on
 /// [`ORACLE_INSTALL_EVENT`].
 #[cfg(feature = "oracle")]

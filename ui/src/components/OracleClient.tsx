@@ -111,7 +111,7 @@ export function OracleClientPanel({ libDir, onUseDir, compact }: { libDir?: stri
       </div>
       <p className="text-[11px] text-muted">
         {st.platform.auto_install
-          ? "Downloads Oracle's latest Basic package (~110–140 MB) and installs it into DataBrain's app-data folder."
+          ? "Downloads Oracle's Basic package (~85–145 MB), checks it against the SHA-256 Oracle publishes, and installs it into DataBrain's app-data folder."
           : "Download the Basic package for your system and choose its folder."}
         {st.platform.note ? ` ${st.platform.note}` : ""} By installing you accept Oracle's license terms for Instant Client.
       </p>

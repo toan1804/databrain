@@ -1,7 +1,11 @@
 //! Oracle Instant Client: detection, the process-wide library directory and
 //! a one-click installer (macOS DMG via `hdiutil` + Oracle's `install_ic.sh`;
-//! Windows/Linux ZIP via `tar`/`unzip`). Downloads use Oracle's permanent
-//! "latest Basic package" links over HTTPS with the system `curl`.
+//! Windows/Linux ZIP via `tar`/`unzip`). Downloads a pinned Basic package
+//! over HTTPS with the system `curl` and checks it against the SHA-256 that
+//! Oracle publishes for it (built into DataBrain) before installing.
+//!
+//! Updating Instant Client: take the versioned link and SHA-256 of each
+//! platform's Basic package from Oracle's download pages (`download_page`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -40,8 +44,10 @@ pub struct Platform {
     pub arch: &'static str,
     /// Oracle's download page for this platform.
     pub download_page: &'static str,
-    /// Permanent link to the latest Basic package (None: no build for it).
+    /// The Basic package DataBrain installs (None: no build for it).
     pub download_url: Option<&'static str>,
+    /// SHA-256 of `download_url`, as published by Oracle.
+    pub sha256: Option<&'static str>,
     /// DataBrain can download and install it without further steps.
     pub auto_install: bool,
     /// Extra step the user must do (e.g. `libaio` on Linux).
@@ -55,7 +61,8 @@ pub fn platform() -> Platform {
             os: "macos",
             arch,
             download_page: "https://www.oracle.com/database/technologies/instant-client/macos-arm64-downloads.html",
-            download_url: Some("https://download.oracle.com/otn_software/mac/instantclient/instantclient-basic-macos-arm64.dmg"),
+            download_url: Some("https://download.oracle.com/otn_software/mac/instantclient/2326300/instantclient-basic-macos.arm64-23.26.3.0.0.dmg"),
+            sha256: Some("9ad4824c5dca702e6bb68d459e2cd738e6ee1e750c668e54a09a43fee9f5d08a"),
             auto_install: true,
             note: None,
         },
@@ -63,7 +70,8 @@ pub fn platform() -> Platform {
             os: "macos",
             arch,
             download_page: "https://www.oracle.com/database/technologies/instant-client/macos-intel-x86-downloads.html",
-            download_url: Some("https://download.oracle.com/otn_software/mac/instantclient/instantclient-basic-macos.dmg"),
+            download_url: Some("https://download.oracle.com/otn_software/mac/instantclient/1916000/instantclient-basic-macos.x64-19.16.0.0.0dbru.dmg"),
+            sha256: Some("725eeb7c00041e926b57c3db508ea7439a1935a37f480c0ac6d46eddc4205331"),
             auto_install: true,
             note: None,
         },
@@ -71,7 +79,8 @@ pub fn platform() -> Platform {
             os: "windows",
             arch,
             download_page: "https://www.oracle.com/database/technologies/instant-client/winx64-64-downloads.html",
-            download_url: Some("https://download.oracle.com/otn_software/nt/instantclient/instantclient-basic-windows.zip"),
+            download_url: Some("https://download.oracle.com/otn_software/nt/instantclient/2326400/instantclient-basic-windows.x64-23.26.4.0.0.zip"),
+            sha256: Some("09e9b81cd492f5ce6f671317c23a0e1f5dee5e786258149d216321c3dad3023f"),
             auto_install: true,
             note: Some("Instant Client also needs the Microsoft Visual C++ Redistributable."),
         },
@@ -79,7 +88,8 @@ pub fn platform() -> Platform {
             os: "linux",
             arch,
             download_page: "https://www.oracle.com/database/technologies/instant-client/linux-arm-aarch64-downloads.html",
-            download_url: Some("https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linux-arm64.zip"),
+            download_url: Some("https://download.oracle.com/otn_software/linux/instantclient/2326400/instantclient-basic-linux.arm64-23.26.4.0.0.zip"),
+            sha256: Some("688df426cabb4e5945e8409ae022acd16b92ff06582c8d93af2f41e3fb9a42f3"),
             auto_install: true,
             note: Some("Also install libaio (e.g. sudo apt install libaio1 or sudo dnf install libaio)."),
         },
@@ -87,7 +97,8 @@ pub fn platform() -> Platform {
             os: "linux",
             arch,
             download_page: "https://www.oracle.com/database/technologies/instant-client/linux-x86-64-downloads.html",
-            download_url: Some("https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip"),
+            download_url: Some("https://download.oracle.com/otn_software/linux/instantclient/2326400/instantclient-basic-linux.x64-23.26.4.0.0.zip"),
+            sha256: Some("cab59aa3b411b3b50898e456fa9aabfe48d67e25cbc1bb23303800390ce7de26"),
             auto_install: true,
             note: Some("Also install libaio (e.g. sudo apt install libaio1 or sudo dnf install libaio)."),
         },
@@ -96,6 +107,7 @@ pub fn platform() -> Platform {
             arch,
             download_page: "https://www.oracle.com/database/technologies/instant-client/downloads.html",
             download_url: None,
+            sha256: None,
             auto_install: false,
             note: None,
         },
@@ -287,7 +299,16 @@ fn download(url: &str, file: &Path, progress: &dyn Fn(InstallProgress), cancel: 
     }
 }
 
-/// Download and install the latest Basic package into `dest`
+/// SHA-256 of a file, read in chunks (packages are 100+ MB).
+fn file_sha256(path: &Path) -> Result<String, String> {
+    use sha2::Digest;
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut h = sha2::Sha256::new();
+    std::io::copy(&mut f, &mut h).map_err(|e| e.to_string())?;
+    Ok(hex::encode(h.finalize()))
+}
+
+/// Download and install the pinned Basic package into `dest`
 /// (`<dest>/instantclient_<ver>`). Returns the library directory.
 ///
 /// macOS: the DMG is mounted privately and its files are copied with
@@ -296,6 +317,7 @@ fn download(url: &str, file: &Path, progress: &dyn Fn(InstallProgress), cancel: 
 pub fn install(dest: &Path, progress: &dyn Fn(InstallProgress), cancel: &AtomicBool) -> Result<PathBuf, String> {
     let p = platform();
     let url = p.download_url.ok_or("no Instant Client build for this platform; use the download page")?;
+    let want = p.sha256.ok_or("no checksum for this platform's Instant Client; use the download page")?;
     let tmp = std::env::temp_dir().join(format!("databrain-instantclient-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
@@ -303,6 +325,11 @@ pub fn install(dest: &Path, progress: &dyn Fn(InstallProgress), cancel: &AtomicB
     let file = tmp.join(url.rsplit('/').next().unwrap_or("instantclient"));
     let result = (|| {
         download(url, &file, progress, cancel)?;
+        // Nothing is mounted or extracted before the package is the one Oracle published.
+        let got = file_sha256(&file)?;
+        if !got.eq_ignore_ascii_case(want) {
+            return Err(format!("the downloaded Instant Client is not the package Oracle published (SHA-256 {got}, expected {want}); not installed"));
+        }
         progress(InstallProgress::Installing);
         let lib_dir = if p.os == "macos" {
             let mount = tmp.join("mnt");
@@ -373,6 +400,7 @@ mod tests {
         let p = platform();
         assert!(p.download_page.starts_with("https://www.oracle.com/"));
         assert!(p.download_url.is_none_or(|u| u.starts_with("https://download.oracle.com/")));
+        assert_eq!(p.download_url.is_some(), p.sha256.is_some_and(|h| h.len() == 64), "every download has its checksum");
     }
 }
 
