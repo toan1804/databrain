@@ -135,7 +135,52 @@ pub(crate) async fn check_for_update(app: AppHandle) -> R<Option<updates::Update
     if let Err(e) = &r {
         tracing::warn!(error = %e.message, "update check failed");
     }
-    r
+    let mut info = r?;
+    if let Some(i) = info.as_mut().filter(|i| i.newer) {
+        i.installable = match signed_update(&app).await {
+            Ok(u) => u.is_some(),
+            Err(e) => {
+                tracing::info!(error = %e, "no installable update (download link only)");
+                false
+            }
+        };
+    }
+    Ok(info)
+}
+
+/// The signed update for this build, when the app was built with an updater
+/// key and the latest release has one for it.
+async fn signed_update(app: &AppHandle) -> Result<Option<tauri_plugin_updater::Update>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let key = app.config().plugins.0.get("updater").and_then(|u| u.get("pubkey")).and_then(|k| k.as_str()).unwrap_or("");
+    if key.trim().is_empty() {
+        return Err("this build has no updater key".into());
+    }
+    app.updater().map_err(|e| e.to_string())?.check().await.map_err(|e| e.to_string())
+}
+
+/// Download, verify and install the latest release, then restart the app.
+/// Progress arrives as [`updates::UPDATE_EVENT`]s.
+#[tauri::command]
+pub(crate) async fn install_update(app: AppHandle) -> R<()> {
+    let fail = |e: String| EngineError::new("update", e);
+    let update = signed_update(&app).await.map_err(fail)?.ok_or_else(|| fail("No update to install: download it from the release page".into()))?;
+    tracing::info!(version = %update.version, "installing update");
+    let mut downloaded: u64 = 0;
+    let ui = app.clone();
+    update
+        .download_and_install(
+            |chunk, total| {
+                downloaded += chunk as u64;
+                let _ = ui.emit(updates::UPDATE_EVENT, serde_json::json!({"downloaded": downloaded, "total": total}));
+            },
+            || {
+                let _ = ui.emit(updates::UPDATE_EVENT, serde_json::json!({"finished": true}));
+            },
+        )
+        .await
+        .map_err(|e| fail(format!("Could not install the update: {e}")))?;
+    app.restart()
 }
 
 /// Copy the app to /Applications, open that copy and quit this one. The copy

@@ -40,12 +40,15 @@ export function duckdbPlatform(triple) {
 async function main() {
   const i = process.argv.indexOf("--target");
   const triple = i > 0 ? process.argv[i + 1] : process.env.TAURI_ENV_TARGET_TRIPLE || undefined;
+  // Signed macOS builds: keep them gzipped (the app unpacks them at start),
+  // so notarization sees no executable code that isn't Developer ID signed.
+  const gz = process.argv.includes("--gzip") || process.env.DUCKDB_EXT_GZIP === "1";
   const version = duckdbVersion(readFileSync(join(root, "Cargo.lock"), "utf8"));
   const platform = duckdbPlatform(triple);
   const dir = join(root, "crates/app/resources/duckdb-extensions", version, platform);
   mkdirSync(dir, { recursive: true });
   for (const ext of EXTENSIONS) {
-    const file = join(dir, `${ext}.duckdb_extension`);
+    const file = join(dir, `${ext}.duckdb_extension${gz ? ".gz" : ""}`);
     if (existsSync(file) && statSync(file).size > 0) {
       console.log(`✓ ${ext} (cached)`);
       continue;
@@ -53,10 +56,12 @@ async function main() {
     const url = `https://extensions.duckdb.org/${version}/${platform}/${ext}.duckdb_extension.gz`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
-    const data = gunzipSync(Buffer.from(await res.arrayBuffer()));
+    const raw = Buffer.from(await res.arrayBuffer());
+    const unpacked = gunzipSync(raw); // also checks the download
+    const data = gz ? raw : unpacked;
     writeFileSync(`${file}.tmp`, data);
     renameSync(`${file}.tmp`, file);
-    console.log(`↓ ${ext} ${(data.length / 1e6).toFixed(1)} MB`);
+    console.log(`↓ ${ext} ${(data.length / 1e6).toFixed(1)} MB${gz ? " (gzipped)" : ""}`);
   }
   console.log(`DuckDB ${version} extensions for ${platform} in ${dir}`);
 }

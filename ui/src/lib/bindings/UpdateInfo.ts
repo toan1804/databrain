@@ -8,4 +8,8 @@ url: string,
 /**
  * The installer for this computer, when the release has one.
  */
-download: string | null, download_name: string | null, notes: string | null, published_at: string | null, };
+download: string | null, download_name: string | null, notes: string | null, published_at: string | null, 
+/**
+ * The update can be installed from the app (signed update for this build found).
+ */
+installable: boolean, };

@@ -6,22 +6,50 @@ use super::*;
 /// Copy the DuckDB extensions shipped in the bundle (`bundled`) into the
 /// writable app-data folder `dest` (missing or changed files only) and use it
 /// as DuckDB's extension directory. Returns the number of files copied.
+/// Signed macOS builds ship them gzipped (`.duckdb_extension.gz`): the notary
+/// service refuses executable code not signed with the Developer ID, and
+/// re-signing an extension would break DuckDB's own signature on it.
 pub fn seed_duckdb_extensions(bundled: &Path, dest: &Path) -> usize {
+    /// Size of a gzip member's content (its last 4 bytes, little endian).
+    fn gz_size(p: &Path) -> Option<u64> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(p).ok()?;
+        f.seek(SeekFrom::End(-4)).ok()?;
+        let mut b = [0u8; 4];
+        f.read_exact(&mut b).ok()?;
+        Some(u32::from_le_bytes(b) as u64)
+    }
     fn walk(src: &Path, dst: &Path, n: &mut usize) {
         let Ok(rd) = std::fs::read_dir(src) else { return };
         for e in rd.flatten() {
-            let (s, d) = (e.path(), dst.join(e.file_name()));
+            let s = e.path();
             if s.is_dir() {
-                walk(&s, &d, n);
-            } else if s.extension().is_some_and(|x| x == "duckdb_extension") {
-                let same = matches!((std::fs::metadata(&s), std::fs::metadata(&d)), (Ok(a), Ok(b)) if a.len() == b.len());
-                if same {
-                    continue;
-                }
-                let tmp = d.with_extension("duckdb_extension.tmp");
-                if std::fs::create_dir_all(dst).is_ok() && std::fs::copy(&s, &tmp).is_ok() && std::fs::rename(&tmp, &d).is_ok() {
-                    *n += 1;
-                }
+                walk(&s, &dst.join(e.file_name()), n);
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            let (d, gz) = match name.strip_suffix(".gz") {
+                Some(plain) if plain.ends_with(".duckdb_extension") => (dst.join(plain), true),
+                _ if name.ends_with(".duckdb_extension") => (dst.join(&name), false),
+                _ => continue,
+            };
+            let want = if gz { gz_size(&s) } else { std::fs::metadata(&s).ok().map(|m| m.len()) };
+            if want.is_some() && want == std::fs::metadata(&d).ok().map(|m| m.len()) {
+                continue;
+            }
+            let tmp = d.with_extension("duckdb_extension.tmp");
+            let written = std::fs::create_dir_all(dst).is_ok()
+                && if gz {
+                    std::fs::File::open(&s)
+                        .and_then(|f| std::fs::File::create(&tmp).and_then(|mut out| std::io::copy(&mut flate2::read::GzDecoder::new(f), &mut out)))
+                        .is_ok()
+                } else {
+                    std::fs::copy(&s, &tmp).is_ok()
+                };
+            if written && std::fs::rename(&tmp, &d).is_ok() {
+                *n += 1;
+            } else {
+                let _ = std::fs::remove_file(&tmp);
             }
         }
     }

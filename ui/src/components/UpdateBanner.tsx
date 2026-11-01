@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Download, Loader2, X } from "lucide-react";
-import { api, isTauri, toError } from "../lib/api";
+import { api, isTauri, onUpdateEvent, toError } from "../lib/api";
 import type { UpdateInfo } from "../lib/types";
 import { useStore } from "../store";
 
@@ -14,9 +14,42 @@ async function checkEnabled(): Promise<boolean> {
   return s.update_check !== false;
 }
 
+/** Install the update in place (signed builds), else open the download. */
+function useInstall(info: UpdateInfo | null | undefined) {
+  const toast = useStore((s) => s.toast);
+  const [progress, setProgress] = useState<{ done: number; total: number | null; finished: boolean } | null>(null);
+  const install = async () => {
+    if (!info) return;
+    if (!info.installable) return void api.openLink(info.download ?? info.url);
+    setProgress({ done: 0, total: null, finished: false });
+    const off = await onUpdateEvent((e) => setProgress((p) => ({ done: e.downloaded ?? p?.done ?? 0, total: e.total ?? p?.total ?? null, finished: !!e.finished || !!p?.finished })));
+    try {
+      // Restarts the app when it worked.
+      await api.installUpdate();
+    } catch (e) {
+      setProgress(null);
+      toast(`${toError(e).message}. Opening the download instead.`, "error");
+      void api.openLink(info.download ?? info.url);
+    } finally {
+      off();
+    }
+  };
+  const label = !progress
+    ? info?.installable
+      ? "Install and restart"
+      : "Download"
+    : progress.finished
+      ? "Restarting…"
+      : progress.total
+        ? `Downloading ${Math.round((progress.done / progress.total) * 100)}%`
+        : "Downloading…";
+  return { install, busy: !!progress, label };
+}
+
 /** A banner when a newer DataBrain is released (checked at most once a day). */
 export function UpdateBanner() {
   const [info, setInfo] = useState<UpdateInfo | null>(null);
+  const { install, busy, label } = useInstall(info);
   useEffect(() => {
     if (!isTauri()) return;
     const last = Number(localStorage.getItem(LAST_CHECK) ?? 0);
@@ -40,10 +73,10 @@ export function UpdateBanner() {
       <span className="min-w-0 flex-1">
         DataBrain {info.latest} is available (you have {info.current}).
       </span>
-      <button className="btn shrink-0 py-0.5" onClick={() => void api.openLink(info.download ?? info.url)} title={info.download_name ?? "Release page"}>
-        Download
+      <button className="btn shrink-0 py-0.5" disabled={busy} onClick={() => void install()} title={info.installable ? "Download, check its signature, install and restart DataBrain" : (info.download_name ?? "Release page")}>
+        {busy && <Loader2 size={12} className="animate-spin" />} {label}
       </button>
-      {info.download && (
+      {(info.download || info.installable) && (
         <button className="btn-ghost shrink-0 py-0.5" onClick={() => void api.openLink(info.url)}>
           What's new
         </button>
@@ -69,6 +102,7 @@ export function UpdateSettings() {
   const [on, setOn] = useState(true);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<UpdateInfo | null | undefined>(undefined);
+  const { install, busy: installing, label } = useInstall(result);
   useEffect(() => {
     void checkEnabled().then(setOn);
   }, []);
@@ -99,7 +133,11 @@ export function UpdateSettings() {
         />
         Check for a new version once a day
       </label>
-      <p className="text-[11.5px] text-muted">DataBrain asks GitHub for its latest release (only the app's version is sent) and shows a banner with the download for this computer. Nothing is installed by itself.</p>
+      <p className="text-[11.5px] text-muted">
+        DataBrain asks GitHub for its latest release (only the app's version is sent) and shows a banner. Signed releases install from the banner:
+        the update is downloaded, its signature is checked against the key built into DataBrain, and the app restarts. Otherwise the banner links to
+        the download for this computer. Nothing is installed without you clicking.
+      </p>
       <button className="btn-ghost border border-line" disabled={busy} onClick={() => void checkNow()}>
         {busy && <Loader2 size={13} className="animate-spin" />} Check now
       </button>
@@ -110,8 +148,8 @@ export function UpdateSettings() {
           ) : result.newer ? (
             <>
               DataBrain {result.latest} is available.{" "}
-              <button className="text-accent hover:underline" onClick={() => void api.openLink(result.download ?? result.url)}>
-                Download
+              <button className="text-accent hover:underline disabled:opacity-60" disabled={installing} onClick={() => void install()}>
+                {label}
               </button>
             </>
           ) : (

@@ -123,6 +123,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Inactive (no key) unless the build sets plugins.updater.pubkey.
+        .plugin(tauri_plugin_updater::Builder::new().target(updates::updater_target()).build())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             logging::init("databrain", Some(&dir), cfg!(debug_assertions));
@@ -311,6 +313,7 @@ pub fn run() {
             commands::system::open_link,
             commands::system::app_in_downloads,
             commands::system::check_for_update,
+            commands::system::install_update,
             commands::jobs::background_jobs_status,
             commands::jobs::set_background_jobs,
             commands::system::move_to_applications,

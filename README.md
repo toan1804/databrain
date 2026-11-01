@@ -12,10 +12,10 @@ A desktop SQL client for many databases, with column lineage, scheduled jobs and
 | macOS (Apple Silicon), without DuckDB | [DataBrain-no-duckdb_0.2.1_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.2.1/DataBrain-no-duckdb_0.2.1_aarch64.dmg) |
 | macOS (Intel), Windows, Linux | Built by the Release workflow from the next release on |
 
-All versions are on the [Releases](https://github.com/toan1804/databrain/releases) page. The app checks for updates once a day and never installs anything by itself.
+All versions are on the [Releases](https://github.com/toan1804/databrain/releases) page. The app checks for updates once a day; signed releases install from its banner when you click Install (others link to the download).
 
 > [!NOTE]
-> The macOS app is not signed yet. Move DataBrain.app to Applications, then right-click it → **Open** the first time.
+> Until a release is signed with a Developer ID (see [Signing](docs/RELEASING.md#signing-and-in-app-updates)), move DataBrain.app to Applications, then right-click it → **Open** the first time.
 
 The "without DuckDB" build is about 85 MB instead of 290 MB and uses the DuckDB library installed on the computer (1.5 or newer, e.g. `brew install duckdb`).
 

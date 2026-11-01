@@ -49,6 +49,8 @@ databrain-query-engine = { version = "0.2.1", path = "../query-engine" }
 databrain-result-store = { version = "0.2.1", path = "../result-store" }
 databrain-workspace = { version = "0.2.1", path = "../workspace" }
 dirs = "7.0.0"
+# Gzipped DuckDB extensions in signed macOS bundles (seed_duckdb_extensions).
+flate2 = "1.1.10"
 # DBeaver's credentials-config.json (AES-128-CBC) and DataGrip's dataSources.xml.
 aes = "=0.8.4"
 cbc = { version = "=0.1.2", features = ["alloc"] }
@@ -62,6 +64,9 @@ tauri = { version = "2", features = [] }
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
+# Installs updates in place (macOS .app.tar.gz, Windows NSIS, Linux AppImage);
+# active in builds made with an updater public key (DATABRAIN_UPDATER_PUBKEY).
+tauri-plugin-updater = "2"
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = "0.7.19"

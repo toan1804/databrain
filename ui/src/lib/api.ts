@@ -343,6 +343,8 @@ export const api = {
   openLink: (url: string) => call<void>("open_link", { url }),
   /** The latest DataBrain release compared with this app (null: none found). */
   checkForUpdate: () => call<UpdateInfo | null>("check_for_update"),
+  /** Download, verify and install the update, then restart (progress: `onUpdateEvent`). */
+  installUpdate: () => call<void>("install_update"),
   backgroundJobsStatus: () => call<BackgroundStatus>("background_jobs_status"),
   /** Run scheduled jobs also when the app is closed (installs or removes the OS entry). */
   setBackgroundJobs: (on: boolean) => call<BackgroundStatus>("set_background_jobs", { on }),
@@ -444,6 +446,12 @@ export function onLoadProgress(handler: (e: LoadProgressEvent) => void): Promise
 
 export function onOracleInstall(handler: (e: OracleInstallProgress) => void): Promise<UnlistenFn> {
   return listen<OracleInstallProgress>("oracle-install", (e) => handler(e.payload));
+}
+
+/** Update install progress: bytes so far (`total` when known), then `finished`. */
+export type UpdateProgress = { downloaded?: number; total?: number | null; finished?: boolean };
+export function onUpdateEvent(handler: (e: UpdateProgress) => void): Promise<UnlistenFn> {
+  return listen<UpdateProgress>("update-event", (e) => handler(e.payload));
 }
 
 export function onKnowledgeEvent(handler: (e: KnowledgeEvent) => void): Promise<UnlistenFn> {

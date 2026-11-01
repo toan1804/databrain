@@ -1,6 +1,9 @@
 //! "A new version is available": asks GitHub for the latest DataBrain
-//! release and picks the download for this computer. Nothing is installed:
-//! the UI shows a link. Only the version is sent (in the User-Agent).
+//! release and picks the download for this computer. Builds made with an
+//! updater key (signed releases) can also install it in place through the
+//! Tauri updater (`latest.json` on the release, signatures checked against
+//! the key built into the app); otherwise the UI shows a download link. Only
+//! the version is sent (in the User-Agent).
 
 use databrain_query_engine::{EngineError, Result};
 use serde::{Deserialize, Serialize};
@@ -9,6 +12,19 @@ use serde::{Deserialize, Serialize};
 pub const REPO: &str = "toan1804/databrain";
 /// Setting: check at startup (default on).
 pub const UPDATE_CHECK_SETTING: &str = "update_check";
+/// Event with install progress: `{downloaded, total}`, then `{finished: true}`.
+pub const UPDATE_EVENT: &str = "update-event";
+
+/// Key of this build in the release's `latest.json` (`darwin-aarch64`,
+/// `windows-x86_64`, …; `-no-duckdb` for the build without bundled DuckDB).
+pub fn updater_target() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        o => o,
+    };
+    let variant = if cfg!(feature = "duckdb-system") { "-no-duckdb" } else { "" };
+    format!("{os}-{}{variant}", std::env::consts::ARCH)
+}
 
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[ts(export)]
@@ -23,6 +39,9 @@ pub struct UpdateInfo {
     pub download_name: Option<String>,
     pub notes: Option<String>,
     pub published_at: Option<String>,
+    /// The update can be installed from the app (signed update for this build found).
+    #[serde(default)]
+    pub installable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +113,7 @@ fn info_for(current: &str, releases: Vec<Release>, os: &str, arch: &str, no_duck
         download_name: asset.map(|a| a.name.clone()),
         notes: r.body.map(|b| b.chars().take(2000).collect()),
         published_at: r.published_at,
+        installable: false,
     })
 }
 

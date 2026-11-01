@@ -2,8 +2,17 @@
 # a draft GitHub release for the pushed tag (vX.Y.Z). Review the draft, then
 # publish it: the app's update check only sees published releases.
 #
-# The builds are not code-signed: macOS asks to confirm the first open
-# (right-click → Open) and Windows SmartScreen warns once.
+# Signing (each part is skipped when its secrets are missing; see
+# docs/RELEASING.md):
+# - macOS: Developer ID signing and notarization (APPLE_CERTIFICATE,
+#   APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY, APPLE_ID,
+#   APPLE_PASSWORD, APPLE_TEAM_ID). Unsigned builds make macOS ask to
+#   confirm the first open (right-click → Open).
+# - In-app updates: Tauri updater bundles signed with
+#   TAURI_SIGNING_PRIVATE_KEY (+ _PASSWORD), the public key in the
+#   repository variable TAURI_UPDATER_PUBKEY, and latest.json on the release.
+#   Builds without it show a download link instead of "Install".
+# Windows builds are not code-signed (SmartScreen warns once).
 name: Release
 
 on:
@@ -51,6 +60,8 @@ jobs:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
       # aws-lc-sys needs NASM on Windows; use its prebuilt objects instead.
       AWS_LC_SYS_PREBUILT_NASM: ${{ startsWith(matrix.os, 'windows') && '1' || '0' }}
+      MACOS_SIGN: ${{ startsWith(matrix.os, 'macos') && secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+      UPDATER: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && vars.TAURI_UPDATER_PUBKEY != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,13 +91,77 @@ jobs:
         working-directory: ui
         run: npm ci
 
+      # A keychain of its own holds the Developer ID certificate for codesign.
+      - name: Import the Developer ID certificate
+        if: env.MACOS_SIGN == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kpw="$(openssl rand -hex 16)"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kpw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kpw" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$kpw" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+
       # DuckDB's extensions for this target are downloaded by the build
-      # (fetch:duckdb-ext reads TAURI_ENV_TARGET_TRIPLE). The Oracle thin
-      # driver is not built here (no Go): the app downloads the published one.
+      # (fetch:duckdb-ext reads TAURI_ENV_TARGET_TRIPLE); signed macOS builds
+      # ship them gzipped (notarization). The Oracle thin driver is not built
+      # here (no Go): the app downloads the published one.
       - name: Build
         working-directory: ui
         shell: bash
-        run: npm run ${{ matrix.script }} -- --target ${{ matrix.target }}
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ env.MACOS_SIGN == 'true' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_ID: ${{ env.MACOS_SIGN == 'true' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ env.MACOS_SIGN == 'true' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ env.MACOS_SIGN == 'true' && secrets.APPLE_TEAM_ID || '' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.UPDATER == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ env.UPDATER == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+          DUCKDB_EXT_GZIP: ${{ env.MACOS_SIGN == 'true' && '1' || '0' }}
+        run: |
+          # A variable that is set (even empty) makes the bundler sign or notarize.
+          for v in APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+            [ -n "${!v}" ] || unset "$v"
+          done
+          extra=()
+          if [ "$UPDATER" = "true" ]; then
+            node -e 'process.stdout.write(JSON.stringify({bundle: {createUpdaterArtifacts: true}, plugins: {updater: {pubkey: process.env.TAURI_UPDATER_PUBKEY}}}))' > "$RUNNER_TEMP/updater.conf.json"
+            extra=(--config "$RUNNER_TEMP/updater.conf.json")
+          fi
+          npm run ${{ matrix.script }} -- --target ${{ matrix.target }} "${extra[@]}"
+
+      - name: Check the signature and notarization
+        if: env.MACOS_SIGN == 'true'
+        run: |
+          app="$(ls -d target/${{ matrix.target }}/release/bundle/macos/*.app | head -1)"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose "$app"
+          xcrun stapler validate "$app"
+
+      # Updater bundles get names of their own (the macOS one is always
+      # DataBrain.app.tar.gz); scripts/updater-manifest.mjs reads them.
+      - name: Name the updater bundles
+        if: env.UPDATER == 'true'
+        shell: bash
+        run: |
+          b="target/${{ matrix.target }}/release/bundle"
+          ver="${TAG#v}"
+          mkdir -p updater
+          if [ -f "$b/macos/DataBrain.app.tar.gz" ]; then
+            name="DataBrain_${ver}_${{ startsWith(matrix.target, 'aarch64') && 'aarch64' || 'x64' }}${{ matrix.script == 'app:build:no-duckdb' && '-no-duckdb' || '' }}.app.tar.gz"
+            cp "$b/macos/DataBrain.app.tar.gz" "updater/$name"
+            cp "$b/macos/DataBrain.app.tar.gz.sig" "updater/$name.sig"
+          fi
+          cp "$b"/nsis/*-setup.exe.sig updater/ 2>/dev/null || true
+          cp "$b"/appimage/*.AppImage.sig updater/ 2>/dev/null || true
+          ls -l updater
 
       - name: Attach installers to the draft release
         uses: softprops/action-gh-release@v2
@@ -102,3 +177,28 @@ jobs:
             target/${{ matrix.target }}/release/bundle/deb/*.deb
             target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
             target/${{ matrix.target }}/release/bundle/rpm/*.rpm
+            updater/*
+
+  # latest.json for the Tauri updater, from the .sig files the builds attached.
+  updater-manifest:
+    name: Updater manifest
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      UPDATER: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && vars.TAURI_UPDATER_PUBKEY != '' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.UPDATER == 'true'
+        with:
+          ref: ${{ env.TAG }}
+      - name: Write and attach latest.json
+        if: env.UPDATER == 'true'
+        run: |
+          mkdir -p sigs
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sig' --dir sigs
+          node scripts/updater-manifest.mjs sigs "$TAG" "$GITHUB_REPOSITORY" > latest.json
+          cat latest.json
+          gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber

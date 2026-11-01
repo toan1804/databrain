@@ -39,7 +39,15 @@
       "resources/duckdb-extensions/": "duckdb-extensions/"
     },
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "entitlements": "Entitlements.plist"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": ["https://github.com/toan1804/databrain/releases/latest/download/latest.json"],
+      "windows": { "installMode": "passive" }
     }
   }
 }

@@ -10,7 +10,47 @@
 
 ## Releasing the app
 
-Push a tag `vX.Y.Z` (matching `version` in `crates/app/tauri.conf.json`): the Release workflow (`.github/workflows/release.yml`) builds the installers for macOS (Apple Silicon, with and without DuckDB, and Intel), Windows and Linux and attaches them to a draft release. Publish the draft; running apps then see it in their update check. The builds are not code-signed. The CI workflow builds and tests every push and pull request on macOS, Linux and Windows.
+Push a tag `vX.Y.Z` (matching `version` in `crates/app/tauri.conf.json`): the Release workflow (`.github/workflows/release.yml`) builds the installers for macOS (Apple Silicon, with and without DuckDB, and Intel), Windows and Linux and attaches them to a draft release. Publish the draft; running apps then see it in their update check (and, with an updater key, `latest.json` for in-app updates). The CI workflow builds and tests every push and pull request on macOS, Linux and Windows.
+
+## Signing and in-app updates
+
+Each part turns on when its secrets are set (Settings → Secrets and variables → Actions) and is skipped otherwise, so unsigned builds keep working.
+
+### macOS: Developer ID and notarization
+
+Without it, macOS blocks the first open of a downloaded build (right-click → Open, or System Settings → Privacy & Security → Open Anyway).
+
+| Secret | What |
+| --- | --- |
+| `APPLE_CERTIFICATE` | The "Developer ID Application" certificate with its private key, exported from Keychain Access as `.p12`, base64: `base64 -i cert.p12 \| pbcopy` |
+| `APPLE_CERTIFICATE_PASSWORD` | The password chosen when exporting the `.p12` |
+| `APPLE_SIGNING_IDENTITY` | The certificate's name, e.g. `Developer ID Application: Your Name (TEAMID1234)` (`security find-identity -v -p codesigning`) |
+| `APPLE_ID` | The Apple ID of the developer account (notarization) |
+| `APPLE_PASSWORD` | An app-specific password for that Apple ID (appleid.apple.com → Sign-In and Security) |
+| `APPLE_TEAM_ID` | The team ID (10 characters) |
+
+The workflow imports the certificate into a temporary keychain, Tauri signs the app with the hardened runtime and `crates/app/Entitlements.plist`, sends it to Apple's notary service and staples the ticket, and the workflow checks the result with `codesign`, `spctl` and `stapler`.
+
+The entitlements allow loading libraries DataBrain did not sign (`com.apple.security.cs.disable-library-validation`): DuckDB's extensions, a DuckDB library installed on the computer, and Oracle Instant Client. The DuckDB extensions are shipped gzipped in signed builds (`DUCKDB_EXT_GZIP=1` for `fetch-duckdb-extensions.mjs`) and unpacked into the app-data folder at start: the notary service rejects executable code that isn't signed with the Developer ID, and signing the extensions ourselves would break DuckDB's own signature on them.
+
+### In-app updates (Tauri updater)
+
+With an updater key, the update banner installs the new version and restarts the app instead of linking to the download. Updates are verified against the public key built into the app.
+
+1. Make a key pair once, and keep the private key and its password safe (losing them means existing installs can't update in place any more):
+   ```sh
+   cd ui && npx tauri signer generate -w ~/.tauri/databrain-updater.key
+   ```
+2. Secrets: `TAURI_SIGNING_PRIVATE_KEY` (the content of `~/.tauri/databrain-updater.key`) and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+3. Variable (not secret): `TAURI_UPDATER_PUBKEY`, the content of `~/.tauri/databrain-updater.key.pub`.
+
+The builds then also make updater bundles (`.app.tar.gz` on macOS, the NSIS installer on Windows, the AppImage on Linux) with `.sig` files, and the "Updater manifest" job writes `latest.json` on the release (`scripts/updater-manifest.mjs`). The app reads `https://github.com/toan1804/databrain/releases/latest/download/latest.json`; each build looks up its own entry (`darwin-aarch64`, `darwin-aarch64-no-duckdb`, `darwin-x86_64`, `windows-x86_64`, `linux-x86_64`). Builds made without the key, and Linux `.deb`/`.rpm` installs, keep the download link.
+
+The first release built with the key still has to be installed by hand; updates from it on install in place.
+
+### Windows
+
+Not code-signed yet: SmartScreen warns on the first run.
 
 ## Oracle thin driver releases
 
