@@ -17,6 +17,7 @@ databrain-connector-core = { version = "0.2.1", path = "../connector-core" }
 databrain-query-engine = { version = "0.2.1", path = "../query-engine" }
 databrain-result-store = { version = "0.2.1", path = "../result-store" }
 databrain-workspace = { version = "0.2.1", path = "../workspace" }
+databrain-lineage = { version = "0.2.1", path = "../lineage" }
 futures = "0.3.34"
 parking_lot = "0.12.5"
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "json", "stream", "http2", "charset"] }

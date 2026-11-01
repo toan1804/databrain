@@ -1781,6 +1781,7 @@ dependencies = [
  "databrain-connector-core",
  "databrain-connector-duckdb",
  "databrain-connector-sqlite",
+ "databrain-lineage",
  "databrain-query-engine",
  "databrain-result-store",
  "databrain-workspace",

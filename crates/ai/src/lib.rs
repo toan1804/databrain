@@ -7,6 +7,7 @@ pub mod jobs;
 pub mod kiro;
 pub mod knowledge;
 pub mod mcp;
+pub mod pii;
 pub mod policy;
 pub mod providers;
 pub mod resultsql;

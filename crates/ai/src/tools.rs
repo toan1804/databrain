@@ -771,15 +771,61 @@ impl ToolContext {
         Ok(o.result_id)
     }
 
+    /// Which columns of a result hold PII under its source connection's
+    /// rules, traced through the SQL that made it (aliases, expressions,
+    /// `SELECT *`, and outputs combined on DuckDB through their inputs).
+    fn pii_mask(&self, result_id: &str, columns: &[String], depth: usize) -> Vec<bool> {
+        let Some(o) = self.engine.outputs().by_result(result_id) else {
+            // Not an output (no SQL to trace): by name, on this connection's rules.
+            return columns.iter().map(|c| is_pii(self.policy(), None, c)).collect();
+        };
+        let src = if o.connection_id == self.profile.id { Ok(self.profile.clone()) } else { self.engine.workspace().get_connection(&o.connection_id) };
+        let Ok(src) = src else { return vec![true; columns.len()] };
+        let pol = &src.ai_policy;
+        let mut rule_columns: Vec<String> = pol.pii_columns.iter().map(|p| p.trim().rsplit('.').next().unwrap_or("").to_ascii_lowercase()).filter(|c| !c.is_empty()).collect();
+        // Inputs (`results.<x>`): their masked columns, by every name the SQL may use.
+        let mut inputs: std::collections::HashMap<String, Vec<String>> = Default::default();
+        if depth < 5 {
+            for input in self.engine.outputs().referenced(&o.sql) {
+                if input.result_id == o.result_id {
+                    continue;
+                }
+                let names: Vec<String> = input.columns.iter().map(|c| c.name.clone()).collect();
+                let masked: Vec<String> = names.iter().zip(self.pii_mask(&input.result_id, &names, depth + 1)).filter(|(_, m)| *m).map(|(n, _)| n.to_ascii_lowercase()).collect();
+                if masked.is_empty() {
+                    continue;
+                }
+                rule_columns.extend(masked.iter().cloned());
+                let mut keys = vec![input.handle.clone(), input.reference()];
+                keys.extend(input.name.clone());
+                for k in keys {
+                    let k = k.to_ascii_lowercase();
+                    let bare = k.strip_prefix("results.").unwrap_or(&k).trim_matches('"').to_string();
+                    inputs.insert(bare.clone(), masked.clone());
+                    inputs.insert(format!("results.{bare}"), masked.clone());
+                }
+            }
+        }
+        let check = |t: Option<&str>, c: &str| match t.map(|t| t.to_ascii_lowercase().replace('"', "")) {
+            Some(t) if inputs.contains_key(&t) => inputs[&t].contains(&c.to_ascii_lowercase()),
+            Some(t) if t.starts_with("results.") => false,
+            t => is_pii(pol, t.as_deref(), c),
+        };
+        crate::pii::masked_columns(&o.sql, src.config.kind, columns, &rule_columns, &check)
+    }
+
     fn summarize(&self, result_id: &str) -> Result<String> {
         let pol = self.source_policy(result_id)?;
         let rs = self.engine.results().get(result_id).map_err(|e| AiError::Internal(e.to_string()))?;
+        // Before locking the result: tracing looks outputs up (and their results).
+        let names: Vec<String> = rs.lock().info().columns.iter().map(|c| c.name.clone()).collect();
+        let mask = self.pii_mask(result_id, &names, 0);
         let mut g = rs.lock();
         let info = g.info();
         let view = ViewSpec::default();
         let mut s = String::from("Columns:\n");
         for (i, c) in info.columns.iter().enumerate() {
-            let pii = is_pii(&pol, None, &c.name);
+            let pii = mask.get(i).copied().unwrap_or(true);
             s.push_str(&format!("- {} ({})", c.name, c.db_type.clone().unwrap_or_else(|| c.data_type.clone())));
             if !pii && info.total_rows > 0 {
                 if let Ok(st) = g.column_stats(&view, i) {
@@ -804,8 +850,8 @@ impl ToolContext {
             for row in page.rows {
                 let cells: Vec<String> = row
                     .iter()
-                    .zip(&info.columns)
-                    .map(|(v, c)| if is_pii(&pol, None, &c.name) { "***".into() } else { v.as_deref().map(|x| trunc(x, 80)).unwrap_or_else(|| "NULL".into()) })
+                    .zip(&mask)
+                    .map(|(v, m)| if *m { "***".into() } else { v.as_deref().map(|x| trunc(x, 80)).unwrap_or_else(|| "NULL".into()) })
                     .collect();
                 s.push_str(&cells.join("\t"));
                 s.push('\n');
@@ -848,12 +894,23 @@ impl ToolContext {
             let names: Vec<String> = g.schema().fields().iter().map(|f| f.name().clone()).collect();
             (names, g.view_batches(&ViewSpec::default(), 50_000).map_err(|e| AiError::Internal(e.to_string()))?)
         };
-        let pol = self.source_policy(id)?;
+        let mask = self.pii_mask(id, &names, 0);
+        let masked: Vec<String> = names.iter().zip(&mask).filter(|(_, m)| **m).map(|(n, _)| n.to_ascii_lowercase()).collect();
         // Block PII columns from being selected in local aggregates' output.
-        if names.iter().any(|n| is_pii(&pol, None, n) && sql.to_ascii_lowercase().contains(&n.to_ascii_lowercase())) {
+        if masked.iter().any(|n| sql.to_ascii_lowercase().contains(n.as_str())) {
             return Err(AiError::Policy("the query references a PII column".into()));
         }
-        let t = resultsql::query(&names, &batches, sql, 200)?;
+        let mut t = resultsql::query(&names, &batches, sql, 200)?;
+        // `SELECT *` and the like return them under their own names.
+        for (i, c) in t.columns.iter().enumerate() {
+            if masked.contains(&c.to_ascii_lowercase()) {
+                for r in &mut t.rows {
+                    if let Some(v) = r.get_mut(i) {
+                        *v = Value::String("***".into());
+                    }
+                }
+            }
+        }
         let mut text = t.columns.join("\t");
         text.push('\n');
         for r in &t.rows {
@@ -912,7 +969,8 @@ impl ToolContext {
             if !pol.share_result_rows && !self.allowed_result(&o.result_id) {
                 return Err(AiError::Policy(format!("{} is from \"{}\", which does not share result rows with the assistant; mention it with @ to allow it", o.handle, o.connection_name)));
             }
-            if o.columns.iter().any(|c| is_pii(&pol, None, &c.name) && sql.to_ascii_lowercase().contains(&c.name.to_ascii_lowercase())) {
+            let names: Vec<String> = o.columns.iter().map(|c| c.name.clone()).collect();
+            if names.iter().zip(self.pii_mask(&o.result_id, &names, 0)).any(|(n, m)| m && sql.to_ascii_lowercase().contains(&n.to_ascii_lowercase())) {
                 return Err(AiError::Policy(format!("the query references a sensitive column of {}", o.handle)));
             }
         }
@@ -957,10 +1015,13 @@ impl ToolContext {
                 // Rows go back to the model: allowed because every source shares them (checked above).
                 let rs = self.engine.results().get(&r.id).map_err(|e| AiError::Internal(e.to_string()))?;
                 let page = rs.lock().page(&ViewSpec::default(), 0, 200).map_err(|e| AiError::Internal(e.to_string()))?;
-                text.push_str(&r.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join("\t"));
+                let names: Vec<String> = r.columns.iter().map(|c| c.name.clone()).collect();
+                // Masked through the inputs (`select * from results.x`, aliases).
+                let mask = self.pii_mask(&r.id, &names, 0);
+                text.push_str(&names.join("\t"));
                 text.push('\n');
                 for row in page.rows {
-                    text.push_str(&row.iter().map(|v| v.as_deref().map(|s| trunc(s, 80)).unwrap_or_else(|| "NULL".into())).collect::<Vec<_>>().join("\t"));
+                    text.push_str(&row.iter().zip(&mask).map(|(v, m)| if *m { "***".into() } else { v.as_deref().map(|s| trunc(s, 80)).unwrap_or_else(|| "NULL".into()) }).collect::<Vec<_>>().join("\t"));
                     text.push('\n');
                 }
                 if r.total_rows > 200 {
