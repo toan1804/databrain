@@ -749,14 +749,26 @@ impl QueryEngine {
         let creds = self.credentials(&profile)?;
         self.preflight(&profile.config).await?;
         let (cfg, tunnel) = self.tunnel(&profile.config, Some(&profile.id), None).await?;
-        let session: Arc<dyn Session> = match connector.connect(&cfg, creds.clone()).await {
-            Ok(s) => Arc::from(s),
+        let started = Instant::now();
+        let kind = profile.config.kind;
+        let connected = match connector.connect(&cfg, creds.clone()).await {
             Err(e) if e.kind == ErrorKind::Auth => {
                 // Expired/revoked token: refresh once and retry.
+                tracing::info!(connection = connection_id, ?kind, "sign-in refused, refreshing credentials once");
                 creds.invalidate().await;
-                Arc::from(connector.connect(&cfg, creds).await?)
+                connector.connect(&cfg, creds).await
             }
-            Err(e) => return Err(e.into()),
+            r => r,
+        };
+        let session: Arc<dyn Session> = match connected {
+            Ok(s) => {
+                tracing::info!(connection = connection_id, ?kind, tab = tab_id, sandbox, ms = started.elapsed().as_millis() as u64, "connected");
+                Arc::from(s)
+            }
+            Err(e) => {
+                tracing::warn!(connection = connection_id, ?kind, tab = tab_id, error = %e.message, "connection failed");
+                return Err(e.into());
+            }
         };
         self.sessions.lock().insert(key, Live { session: session.clone(), _tunnel: tunnel, sandboxed: sandbox, last_used: parking_lot::Mutex::new(Instant::now()) });
         Ok(session)
@@ -1612,6 +1624,8 @@ impl QueryEngine {
         self.jobs.lock().remove(&job_id);
         self.outputs_changed();
         let in_transaction = self.in_transaction(&req.connection_id, req.session_key());
+        // What ran and how it ended; never the SQL itself.
+        tracing::debug!(connection = %req.connection_id, tab = %req.tab_id, origin = req.origin.as_str(), statements = plan.len(), ?status, ms = job_start.elapsed().as_millis() as u64, "run finished");
         emit(JobEvent::JobFinished {
             job_id,
             tab_id: req.tab_id,

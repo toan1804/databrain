@@ -25,10 +25,12 @@ fn workspace_path() -> std::path::PathBuf {
 #[tokio::main]
 async fn main() {
     let path = workspace_path();
+    // stderr and a file only: stdout carries the MCP protocol.
+    databrain_app::logging::init("databrain-mcp", path.parent(), true);
     let ws = match Workspace::open(&path) {
         Ok(w) => Arc::new(w),
         Err(e) => {
-            eprintln!("databrain-mcp: cannot open workspace {}: {e}", path.display());
+            tracing::error!("cannot open workspace {}: {e}", path.display());
             std::process::exit(1);
         }
     };
@@ -40,7 +42,7 @@ async fn main() {
     // System-engine builds: the DuckDB library installed on the computer.
     #[cfg(feature = "duckdb-system")]
     if let Some(e) = databrain_app::api::load_duckdb_engine_from_settings(&ws).error {
-        eprintln!("databrain-mcp: DuckDB engine not loaded ({e}); DuckDB connections and outputs won't work");
+        tracing::warn!("DuckDB engine not loaded ({e}); DuckDB connections and outputs won't work");
     }
     let engine = QueryEngine::new(databrain_app::api::registry_with_outputs(Some(slot.clone())), ws, secrets, Arc::new(ResultStore::new()), hub.clone());
     slot.set(engine.external_tables());
@@ -58,6 +60,6 @@ async fn main() {
     let server = McpServer { engine, hub };
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     if let Err(e) = server.serve(stdin, tokio::io::stdout()).await {
-        eprintln!("databrain-mcp: {e}");
+        tracing::error!("MCP server stopped: {e}");
     }
 }

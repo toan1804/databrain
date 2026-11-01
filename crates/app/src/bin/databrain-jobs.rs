@@ -42,6 +42,7 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first().map(String::as_str) else { return usage() };
     let dir = background::data_dir();
+    databrain_app::logging::init("databrain-jobs", Some(&dir), false);
     let state = match background::headless_state(&dir) {
         Ok(s) => s,
         Err(e) => {

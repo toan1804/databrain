@@ -4,6 +4,7 @@ pub mod ai_api;
 pub mod api;
 pub mod background;
 pub mod jobs;
+pub mod logging;
 pub mod meta_writer;
 pub mod conn_io;
 pub mod sql_files;
@@ -897,8 +898,20 @@ async fn app_in_downloads() -> R<Option<String>> {
 
 /// The latest DataBrain release compared with this app (None: no release found).
 #[tauri::command]
+async fn reveal_logs(app: AppHandle) -> R<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = logging::dir(&app.path().app_data_dir().map_err(|e| EngineError::new("internal", e.to_string()))?);
+    std::fs::create_dir_all(&dir).map_err(|e| EngineError::new("internal", e.to_string()))?;
+    app.opener().reveal_item_in_dir(&dir).map_err(|e| EngineError::new("internal", e.to_string()))
+}
+
+#[tauri::command]
 async fn check_for_update(app: AppHandle) -> R<Option<updates::UpdateInfo>> {
-    updates::check(&app.package_info().version.to_string()).await
+    let r = updates::check(&app.package_info().version.to_string()).await;
+    if let Err(e) = &r {
+        tracing::warn!(error = %e.message, "update check failed");
+    }
+    r
 }
 
 /// Scheduled jobs while the app is closed: on or off, installed, last pass.
@@ -1085,6 +1098,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
+            logging::init("databrain", Some(&dir), cfg!(debug_assertions));
             let workspace = Arc::new(Workspace::open(dir.join("workspace.db"))?);
             let sink = Arc::new(TauriSink(app.handle().clone()));
             let ui = Arc::new(TauriUi(app.handle().clone()));
@@ -1237,6 +1251,7 @@ pub fn run() {
             delete_job,
             run_job,
             resume_job,
+            reveal_logs,
             cancel_job,
             cancel_job_step,
             dry_run_job_step,

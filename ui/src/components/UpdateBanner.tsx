@@ -119,6 +119,11 @@ export function UpdateSettings() {
           )}
         </p>
       )}
+      <h3 className="pt-3 text-[13px] font-medium">Diagnostic log</h3>
+      <p className="text-[11.5px] text-muted">What DataBrain did (connections, runs, jobs, assistant tool calls, errors), one file a day for a week. It holds no query text, results or passwords.</p>
+      <button className="btn-ghost border border-line" onClick={() => void api.revealLogs().catch((e) => toast(toError(e).message, "error"))}>
+        Show log files
+      </button>
     </div>
   );
 }

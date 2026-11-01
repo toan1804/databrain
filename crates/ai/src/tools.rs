@@ -207,6 +207,7 @@ fn arg<'a>(args: &'a Value, k: &str) -> Result<&'a str> {
 
 impl ToolContext {
     fn audit(&self, tool: &str, args: &Value, decision: &str, summary: Option<&str>) {
+        tracing::info!(tool, decision, caller = ?self.caller, connection = %self.profile.id, "AI tool call");
         let _ = self.engine.workspace().add_audit(self.session_id.as_deref(), Some(&self.profile.id), tool, args, decision, summary);
     }
 

@@ -337,6 +337,7 @@ pub fn start(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>
         }
     };
     let _ = ctx.workspace.touch_job_run(run.id, &owner);
+    tracing::info!(job = job_id, run = run.id, trigger, steps = only.as_ref().map_or(job.nodes.len(), Vec::len), "job run started");
     emit(ctx, &run);
     let c = ctx.clone();
     let r = run.clone();
@@ -504,6 +505,11 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
         ctx.engine.release_sessions(&format!("{}:export", node_tab(&job.id, &n.id)));
     }
     let any = |s: &str| status.values().any(|v| *v == s);
+    for (id, st) in &status {
+        if *st == "error" {
+            tracing::warn!(job = %job.id, step = %id, "job step failed");
+        }
+    }
     let final_status = if any("error") || any("skipped") {
         "error"
     } else if any("cancelled") || cancel.is_cancelled() {
@@ -542,6 +548,7 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
     );
     let _ = ctx.workspace.set_job_node_results(&job.id, &nodes);
     tracer.save();
+    tracing::info!(job = %job.id, run = run.id, trigger = %run.trigger, status = final_status, steps = nodes.len(), ms = started_run.elapsed().as_millis() as u64, "job run finished");
 }
 
 /// SQL a load step runs when it has none: its upstream's output.

@@ -300,6 +300,8 @@ export const api = {
   defaultExportFolder: () => call<string | null>("default_export_folder"),
   /** Show the file a job's export step last wrote. */
   revealJobFile: (jobId: string, nodeId: string) => call<void>("reveal_job_file", { jobId, nodeId }),
+  /** Show the folder of the diagnostic log files. */
+  revealLogs: () => call<void>("reveal_logs"),
   /** Log of one run of a job, oldest first. */
   jobRunLog: (id: string, runId: number) => call<RunLogEntry[]>("job_run_log", { id, runId }),
   jobRuns: (id: string, limit?: number) => call<JobRun[]>("job_runs", { id, limit: limit ?? null }),
