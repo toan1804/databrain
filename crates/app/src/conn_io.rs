@@ -929,6 +929,49 @@ mod tests {
     }
 
     #[test]
+    fn splits_credentials_out_of_connection_strings() {
+        let split = |v: &str| split_url_credentials(v);
+        assert_eq!(
+            split("mongodb+srv://ann:s3cr%40t@c0.x.net/db?retryWrites=true"),
+            Some(("mongodb+srv://c0.x.net/db?retryWrites=true".into(), "ann".into(), "s3cr@t".into())),
+            "decoded user and password; the rest kept"
+        );
+        assert_eq!(split("neo4j+s://neo4j:a%3Ab:c@db.example:7687"), Some(("neo4j+s://db.example:7687".into(), "neo4j".into(), "a:b:c".into())), "the first colon splits");
+        assert_eq!(split("mongodb://u:p@w@h1,h2/db"), Some(("mongodb://h1,h2/db".into(), "u".into(), "p@w".into())), "the last @ ends the user info");
+        assert_eq!(split("mongodb://u:@h/"), Some(("mongodb://h/".into(), "u".into(), String::new())));
+        for none in ["mongodb://ann@h/db", "mongodb://h:27017/db", "mongodb://h/db?authSource=a:b@c", "u:p@h", ""] {
+            assert_eq!(split(none), None, "{none}");
+        }
+
+        // MongoDB / Neo4j: the password leaves the string, the user goes to the sign-in settings.
+        let mut c = ConnectionConfig::new(ConnectorKind::Mongodb, AuthMethod::None);
+        c.options.insert(URI_OPTION.into(), "mongodb://ann:pw@h/db".into());
+        assert_eq!(take_uri_password(&mut c).as_deref(), Some("pw"));
+        assert_eq!(c.options[URI_OPTION], "mongodb://h/db");
+        assert_eq!(c.auth, AuthMethod::Password { user: "ann".into() });
+        assert_eq!(take_uri_password(&mut c), None, "nothing left to move");
+        // A user typed in its field wins over the one in the string.
+        let mut c = ConnectionConfig::new(ConnectorKind::Neo4j, AuthMethod::Password { user: "admin".into() });
+        c.options.insert(URI_OPTION.into(), "neo4j://other:pw@h:7687".into());
+        assert_eq!(take_uri_password(&mut c).as_deref(), Some("pw"));
+        assert_eq!(c.auth, AuthMethod::Password { user: "admin".into() });
+        assert_eq!(c.options[URI_OPTION], "neo4j://h:7687");
+        // Other kinds and strings without a password are left alone.
+        let mut pg = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::None);
+        pg.options.insert(URI_OPTION.into(), "postgres://u:pw@h/db".into());
+        assert_eq!(take_uri_password(&mut pg), None);
+        assert_eq!(pg.options[URI_OPTION], "postgres://u:pw@h/db");
+        let mut m = ConnectionConfig::new(ConnectorKind::Mongodb, AuthMethod::None);
+        assert_eq!(take_uri_password(&mut m), None, "no string");
+        m.options.insert(URI_OPTION.into(), "mongodb://ann@h/db".into());
+        assert_eq!(take_uri_password(&mut m), None);
+        assert_eq!((m.options[URI_OPTION].as_str(), &m.auth), ("mongodb://ann@h/db", &AuthMethod::None));
+        // Shared settings: the password is dropped, the user kept.
+        assert_eq!(strip_url_password("mongodb://u:p@w@h1,h2/db"), "mongodb://u@h1,h2/db");
+        assert_eq!(strip_url_password("https://h/a:b@c"), "https://h/a:b@c", "an @ in the path is not user info");
+    }
+
+    #[test]
     fn reads_pgpass() {
         let p = parse_pgpass("# comment\nlocalhost:5432:shop:ann:pa\\:ss\n*:*:*:bob:x\ndb.example.com:*:*:carl:\n");
         assert_eq!(p.len(), 2, "wildcard host skipped");

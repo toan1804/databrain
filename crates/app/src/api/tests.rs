@@ -796,3 +796,42 @@ async fn oracle_client_folder_is_checked_at_launch() {
     client::set_trusted(None);
     client::set_default_dir(None);
 }
+
+/// A password in a MongoDB/Neo4j connection string goes to the secret store
+/// on save, and ones kept in workspace.db before are moved at launch.
+#[test]
+fn uri_passwords_go_to_the_secret_store() {
+    use secrecy::ExposeSecret;
+    let (st, _sink, _dir) = state();
+    let profile = |name: &str, uri: &str| {
+        let mut config = ConnectionConfig::new(ConnectorKind::Mongodb, AuthMethod::None);
+        config.options.insert(crate::conn_io::URI_OPTION.into(), uri.into());
+        ConnectionProfile { id: String::new(), name: name.into(), config, color: None, env: EnvTag::Dev, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 }
+    };
+    let args = |p: ConnectionProfile, secret: Option<&str>| SaveConnectionArgs { profile: p, secret: secret.map(Into::into), clear_secret: false, extra_secrets: Default::default() };
+    let stored = |id: &str| st.secrets.get(&SecretRef::for_connection(id)).unwrap().map(|s| s.expose_secret().to_string());
+
+    let saved = save_connection(&st, args(profile("m", "mongodb://ann:p%40ss@h/db"), None)).unwrap();
+    let kept = st.workspace.get_connection(&saved.id).unwrap();
+    assert_eq!(kept.config.options[crate::conn_io::URI_OPTION], "mongodb://h/db");
+    assert_eq!(kept.config.auth, AuthMethod::Password { user: "ann".into() });
+    assert!(kept.has_secret);
+    assert_eq!(stored(&saved.id).as_deref(), Some("p@ss"));
+    // A password typed in its field wins over the one in the string, and so does one already stored.
+    let typed = save_connection(&st, args(profile("t", "mongodb://ann:in-uri@h/db"), Some("typed"))).unwrap();
+    assert_eq!(stored(&typed.id).as_deref(), Some("typed"));
+    let mut again = kept.clone();
+    again.config.options.insert(crate::conn_io::URI_OPTION.into(), "mongodb://ann:other@h/db".into());
+    save_connection(&st, args(again, None)).unwrap();
+    assert_eq!(stored(&saved.id).as_deref(), Some("p@ss"));
+    assert_eq!(st.workspace.get_connection(&saved.id).unwrap().config.options[crate::conn_io::URI_OPTION], "mongodb://h/db", "still not kept in the string");
+
+    // Saved by an older version, password in the string: moved at launch, once.
+    let old = st.workspace.save_connection(profile("old", "mongodb://bob:legacy@h/db")).unwrap();
+    assert_eq!(st.move_uri_passwords(), 1);
+    let moved = st.workspace.get_connection(&old.id).unwrap();
+    assert_eq!(moved.config.options[crate::conn_io::URI_OPTION], "mongodb://h/db");
+    assert!(moved.has_secret);
+    assert_eq!(stored(&old.id).as_deref(), Some("legacy"));
+    assert_eq!(st.move_uri_passwords(), 0);
+}

@@ -359,3 +359,26 @@ async fn metadata_and_close_tab() {
     f.engine.disconnect(&f.conn_id);
     assert!(f.engine.connected_ids().is_empty());
 }
+
+/// A read-only connection runs reads only, for every origin and even when
+/// confirmed (jobs and the AI confirm their runs): writes, transactions
+/// and session statements could make it writable.
+#[tokio::test]
+async fn read_only_connections_refuse_everything_but_reads() {
+    let f = fixture(EnvTag::Dev);
+    let id = started(f.engine.run(RunRequest { confirmed: true, ..req(&f, "create table t (a int); insert into t values (1)") }).unwrap());
+    wait_job(&f, &id).await;
+    let mut p = f.ws.get_connection(&f.conn_id).unwrap();
+    p.config.read_only = true;
+    f.ws.save_connection(p).unwrap();
+    f.engine.disconnect(&f.conn_id);
+    for origin in [Origin::User, Origin::Ai, Origin::Mcp, Origin::Job] {
+        for sql in ["delete from t", "drop table t", "select 1; insert into t values (2)", "begin", "pragma query_only = off", "attach 'x.db' as x"] {
+            let e = f.engine.run(RunRequest { confirmed: true, origin, tab_id: format!("ro-{}", origin.as_str()), ..req(&f, sql) }).unwrap_err();
+            assert!(e.message.contains("read-only") && e.message.contains("was not run"), "{origin:?} {sql}: {}", e.message);
+        }
+    }
+    let id = started(f.engine.run(req(&f, "select count(*) from t")).unwrap());
+    let evs = wait_job(&f, &id).await;
+    assert!(evs.iter().any(|e| matches!(e, JobEvent::StatementFinished { result: Some(r), .. } if r.total_rows == 1)), "{evs:?}");
+}

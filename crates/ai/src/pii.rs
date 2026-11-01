@@ -80,3 +80,59 @@ fn mentions_any(sql: &str, names: &[String]) -> bool {
     let words: HashSet<String> = sql.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).map(str::to_ascii_lowercase).collect();
     names.iter().any(|n| words.contains(&n.to_ascii_lowercase())) || sql.contains('*')
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::is_pii;
+    use databrain_workspace::AiPolicy;
+
+    /// Columns masked under `rules` (as a connection's PII settings), the way the tools ask.
+    fn masked(kind: ConnectorKind, rules: &[&str], sql: &str, columns: &[&str]) -> Vec<bool> {
+        let pol = AiPolicy { pii_columns: rules.iter().map(|r| r.to_string()).collect(), ..Default::default() };
+        let rule_columns: Vec<String> = pol.pii_columns.iter().map(|p| p.rsplit('.').next().unwrap_or("").to_ascii_lowercase()).collect();
+        let cols: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+        masked_columns(sql, kind, &cols, &rule_columns, &|t, c| is_pii(&pol, t, c))
+    }
+
+    fn pg(rules: &[&str], sql: &str, columns: &[&str]) -> Vec<bool> {
+        masked(ConnectorKind::Postgres, rules, sql, columns)
+    }
+
+    #[test]
+    fn traces_sensitive_columns_through_the_sql() {
+        let users = &["users.email"];
+        assert_eq!(pg(users, "select email, name from users", &["email", "name"]), [true, false]);
+        // Renamed, computed, aggregated: still the email.
+        assert_eq!(pg(users, "select email as contact, name from users", &["contact", "name"]), [true, false]);
+        assert_eq!(pg(users, "select lower(email) l, count(id) n from users group by 1", &["l", "n"]), [true, false]);
+        // count(*) comes from no column: masked like anything not traced, as the SQL names email.
+        assert_eq!(pg(users, "select lower(email) l, count(*) n from users group by 1", &["l", "n"]), [true, true]);
+        assert_eq!(pg(users, "select max(u.email) m from public.users u", &["m"]), [true]);
+        assert_eq!(pg(users, "select * from users", &["id", "email", "name"]), [false, true, false]);
+        assert_eq!(pg(users, "select u.* from users u", &["id", "email"]), [false, true]);
+        assert_eq!(pg(users, "with x as (select email as m from users) select m as k from x", &["k"]), [true]);
+        assert_eq!(pg(users, "select k from (select email k from users) s", &["k"]), [true]);
+        assert_eq!(pg(users, "select o.id, u.email as who from orders o join users u on u.id = o.user_id", &["id", "who"]), [false, true]);
+        assert_eq!(pg(users, "select name from users union all select email from users", &["name"]), [true], "a union mixes the columns");
+        // Used only to filter or join: the values are not in the result.
+        assert_eq!(pg(users, "select id from users where email like '%@x.io'", &["id"]), [false]);
+        // A rule for one table does not mask the same name elsewhere.
+        assert_eq!(pg(users, "select email from leads", &["email"]), [false]);
+        // A rule without a table masks the column anywhere.
+        assert_eq!(pg(&["ssn"], "select ssn as s, id from people", &["s", "id"]), [true, false]);
+        // No rules: nothing masked.
+        assert_eq!(pg(&[], "select email from users", &["email"]), [false]);
+    }
+
+    #[test]
+    fn fails_closed_when_the_sql_cannot_be_traced() {
+        let users = &["users.email"];
+        // Unparseable SQL that names a sensitive column: every column masked.
+        assert_eq!(pg(users, "selec email frm users", &["a", "b"]), [true, true]);
+        assert_eq!(pg(users, "selec name frm users", &["a"]), [false], "it names no sensitive column");
+        // Not SQL (MongoDB): by name, or masked when the query mentions a sensitive column.
+        assert_eq!(masked(ConnectorKind::Mongodb, users, "db.users.find({}, {email: 1})", &["_id", "email"]), [true, true]);
+        assert_eq!(masked(ConnectorKind::Mongodb, &["ssn"], "db.people.find({})", &["_id", "ssn"]), [false, true]);
+    }
+}

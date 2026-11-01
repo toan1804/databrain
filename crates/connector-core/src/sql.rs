@@ -1416,3 +1416,51 @@ mod redaction_tests {
         assert_eq!(redact_text(plain), plain);
     }
 }
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+    use ConnectorKind::*;
+
+    fn allows(sql: &str, k: ConnectorKind) -> bool {
+        read_only_allows(sql, &classify(sql, k))
+    }
+
+    #[test]
+    fn read_only_allows_reads_and_harmless_settings() {
+        for sql in ["select 1", "with x as (select 1) select * from x", "explain select 1", "use sales", "set search_path = a, b", "SET SESSION time_zone = '+00:00'", "set @@session.max_execution_time = 1000"] {
+            assert!(allows(sql, Postgres) || allows(sql, Mysql), "{sql}");
+        }
+        assert!(allows("use warehouse wh", Snowflake));
+        for (sql, k) in [
+            ("insert into t values (1)", Postgres),
+            ("with d as (delete from t returning *) select * from d", Postgres),
+            ("select * into t2 from t", Postgres),
+            ("explain analyze delete from t", Postgres),
+            ("begin read write", Postgres),
+            ("commit", Oracle),
+            ("set default_transaction_read_only = off", Postgres),
+            ("set session transaction read write", Mysql),
+            ("use role sysadmin", Snowflake),
+            ("use secondary roles all", Snowflake),
+            ("attach 'x.db' as x", Duckdb),
+            ("pragma query_only = 0", Sqlite),
+            ("call p()", Postgres),
+            ("exec dbo.p", Mssql),
+        ] {
+            assert!(!allows(sql, k), "{k:?}: {sql}");
+        }
+    }
+
+    #[test]
+    fn finds_functions_that_are_not_built_ins() {
+        assert!(unknown_functions("select count(*), lower(name), coalesce(a, 0) from t", Mssql).is_empty());
+        assert_eq!(unknown_functions("select dbo.f(1), g(x) from t", Mssql), vec!["dbo.f", "g"]);
+        assert_eq!(unknown_functions("select * from dbo.tvf(1)", Mssql), vec!["dbo.tvf"]);
+        // A built-in's name in a schema is not the built-in.
+        assert_eq!(unknown_functions("select evil.lower(x) from t", Postgres), vec!["evil.lower"]);
+        assert_eq!(unknown_functions("select * from t where id in (select pkg.f() from dual)", Oracle), vec!["pkg.f"]);
+        assert_eq!(unknown_functions("selec f(", Mssql), vec!["(SQL that could not be parsed)"]);
+        assert!(unknown_functions("db.c.find({})", Mongodb).is_empty(), "not SQL");
+    }
+}
