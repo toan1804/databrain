@@ -756,3 +756,43 @@ async fn ai_job_runs_are_sandboxed() {
     assert_eq!(by_hand.status, "success", "{by_hand:?}");
     assert_eq!(step(&by_hand, "secret").rows, Some(1));
 }
+
+/// The saved Instant Client folder is checked at launch like the thin
+/// driver's helper: a folder saved before manifests were kept is hashed
+/// once, then its libraries must stay the same to be loaded.
+#[cfg(feature = "oracle")]
+#[tokio::test]
+async fn oracle_client_folder_is_checked_at_launch() {
+    use databrain_connector_oracle::client;
+    let (st, _sink, dir) = state();
+    let ic = dir.path().join("instantclient_23_26");
+    std::fs::create_dir_all(&ic).unwrap();
+    std::fs::write(ic.join(client::library_name()), b"oci").unwrap();
+    let d = ic.to_string_lossy().into_owned();
+    st.workspace.set_setting(ORACLE_CLIENT_SETTING, &serde_json::json!(d)).unwrap();
+
+    apply_oracle_client_setting(&st);
+    let mut saved = None;
+    for _ in 0..500 {
+        saved = st.workspace.get_setting(ORACLE_CLIENT_MANIFEST_SETTING).unwrap();
+        if saved.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let saved = saved.expect("hashed in the background");
+    assert_eq!(saved["dir"], d.as_str());
+    assert_eq!(saved["files"][client::library_name()].as_str().map(str::len), Some(64));
+    assert_eq!(client::default_dir().as_deref(), Some(d.as_str()));
+
+    // Next launch: the saved manifest is used; a changed library is refused.
+    std::fs::write(ic.join(client::library_name()), b"replaced").unwrap();
+    apply_oracle_client_setting(&st);
+    match client::init_client(None, &[]) {
+        Err(client::InitError::Changed(e)) => assert!(e.contains(client::library_name()), "{e}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(st.workspace.get_setting(ORACLE_CLIENT_MANIFEST_SETTING).unwrap(), Some(saved), "not re-hashed over");
+    client::set_trusted(None);
+    client::set_default_dir(None);
+}

@@ -121,12 +121,53 @@ pub fn setup_oracle_agent(state: &AppState, app_dir: &Path) {
 /// Setting with the Instant Client folder found or installed by DataBrain.
 pub const ORACLE_CLIENT_SETTING: &str = "oracle_client_dir";
 
-/// Use the saved Instant Client folder for Oracle connections without one.
+/// Setting: SHA-256 of the libraries in that folder when DataBrain installed
+/// or adopted it (`{"dir": …, "files": {name: sha256}}`). They are loaded
+/// into the app, so they are checked again before Instant Client is loaded,
+/// like the thin driver's helper is before it runs.
+pub const ORACLE_CLIENT_MANIFEST_SETTING: &str = "oracle_client_manifest";
+
+#[cfg(feature = "oracle")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ClientManifest {
+    dir: String,
+    files: databrain_connector_oracle::client::Manifest,
+}
+
+/// Hash the libraries of `dir`, remember them, and check them before loading.
+#[cfg(feature = "oracle")]
+fn trust_oracle_client(ws: &Workspace, dir: &str) -> Result<()> {
+    use databrain_connector_oracle::client;
+    let files = client::manifest(Path::new(dir)).map_err(|e| EngineError::new("install", e))?;
+    ws.set_setting(ORACLE_CLIENT_MANIFEST_SETTING, &serde_json::to_value(ClientManifest { dir: dir.to_string(), files: files.clone() }).unwrap_or_default())?;
+    client::set_trusted(Some((dir.to_string(), files)));
+    Ok(())
+}
+
+/// Use the saved Instant Client folder for Oracle connections without one,
+/// and check its libraries against the saved manifest before they load. A
+/// folder saved before manifests were kept is hashed now, in the background
+/// (once; from then on it is checked).
 pub fn apply_oracle_client_setting(state: &AppState) {
     #[cfg(feature = "oracle")]
     {
-        let dir = state.workspace.get_setting(ORACLE_CLIENT_SETTING).ok().flatten().and_then(|v| v.as_str().map(str::to_string));
-        databrain_connector_oracle::client::set_default_dir(dir);
+        use databrain_connector_oracle::client;
+        let dir = state.workspace.get_setting(ORACLE_CLIENT_SETTING).ok().flatten().and_then(|v| v.as_str().map(str::to_string)).filter(|d| !d.trim().is_empty());
+        let saved: Option<ClientManifest> = state.workspace.get_setting(ORACLE_CLIENT_MANIFEST_SETTING).ok().flatten().and_then(|v| serde_json::from_value(v).ok());
+        client::set_default_dir(dir.clone());
+        match (dir, saved) {
+            (Some(d), Some(m)) if m.dir == d => client::set_trusted(Some((d, m.files))),
+            (Some(d), _) => {
+                client::set_trusted(None);
+                let ws = state.workspace.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = trust_oracle_client(&ws, &d) {
+                        tracing::warn!(dir = %d, error = %e.message, "Instant Client folder not hashed");
+                    }
+                });
+            }
+            (None, _) => client::set_trusted(None),
+        }
     }
     #[cfg(not(feature = "oracle"))]
     let _ = state;
@@ -141,6 +182,8 @@ pub async fn oracle_client_status(state: &AppState, lib_dir: Option<String>, app
         if let Some(d) = &st.lib_dir {
             // Remember the folder for connections that don't set one.
             if databrain_connector_oracle::client::default_dir().is_none() {
+                let (ws, dir) = (state.workspace.clone(), d.clone());
+                blocking(move || trust_oracle_client(&ws, &dir)).await?;
                 databrain_connector_oracle::client::set_default_dir(Some(d.clone()));
                 state.workspace.set_setting(ORACLE_CLIENT_SETTING, &serde_json::json!(d))?;
             }
@@ -177,6 +220,9 @@ pub async fn oracle_install_client(state: &AppState, app_dir: PathBuf) -> Result
     })
     .await?;
     let d = dir.to_string_lossy().into_owned();
+    // The installed libraries, as unpacked from the verified package.
+    let (ws, installed) = (state.workspace.clone(), d.clone());
+    blocking(move || trust_oracle_client(&ws, &installed)).await?;
     databrain_connector_oracle::client::set_default_dir(Some(d.clone()));
     state.workspace.set_setting(ORACLE_CLIENT_SETTING, &serde_json::json!(d))?;
     oracle_client_status(state, Some(d), Some(app_dir)).await

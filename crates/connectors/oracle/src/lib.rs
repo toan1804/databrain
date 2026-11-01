@@ -37,10 +37,15 @@ impl OracleConnector {
     }
 }
 
-fn init_client(lib_dir: Option<&str>) {
+fn init_client(lib_dir: Option<&str>) -> Result<()> {
     // Retries on every connect until the library loads (e.g. right after
     // installing Instant Client), using the folder found automatically.
-    let _ = client::init_client(lib_dir, &[]);
+    // A checked folder whose libraries changed is refused outright: the
+    // driver would otherwise load Instant Client from the search path.
+    match client::init_client(lib_dir, &[]) {
+        Err(client::InitError::Changed(m)) => Err(ConnectorError::config(m)),
+        _ => Ok(()),
+    }
 }
 
 fn map_err(e: oracle::Error) -> ConnectorError {
@@ -185,7 +190,7 @@ async fn open(cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Resul
         let lib = cfg.opt("client_lib_dir").map(str::to_string);
         let read_only = cfg.read_only;
         let conn = blocking(move || {
-            init_client(lib.as_deref());
+            init_client(lib.as_deref())?;
             let mut c = Connection::connect(&user, &password, &cs).map_err(map_err)?;
             // Read-only: one READ ONLY transaction, never committed (with
             // autocommit on, it would end right after it starts).
@@ -1224,7 +1229,7 @@ mod tests {
         let Ok(d) = std::env::var("DATABRAIN_ORACLE_LIB_DIR") else {
             panic!("live test: DATABRAIN_ORACLE_LIB_DIR not set (run with --ignored)");
         };
-        init_client(Some(&d));
+        init_client(Some(&d)).unwrap();
         check_driver("instant_client").await;
     }
 
@@ -1393,7 +1398,7 @@ mod tests {
     async fn live_roundtrip() {
         // DATABRAIN_ORACLE_DRIVER=instant_client tests the thick driver (+ DATABRAIN_ORACLE_LIB_DIR).
         if let Ok(d) = std::env::var("DATABRAIN_ORACLE_LIB_DIR") {
-            init_client(Some(&d));
+            init_client(Some(&d)).unwrap();
         }
         let Some(s) = live(&std::env::var("DATABRAIN_ORACLE_DRIVER").unwrap_or_else(|_| "thin".into())).await else {
             panic!("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");

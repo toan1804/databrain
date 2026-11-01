@@ -2,7 +2,9 @@
 //! a one-click installer (macOS DMG via `hdiutil` + Oracle's `install_ic.sh`;
 //! Windows/Linux ZIP via `tar`/`unzip`). Downloads a pinned Basic package
 //! over HTTPS with the system `curl` and checks it against the SHA-256 that
-//! Oracle publishes for it (built into DataBrain) before installing.
+//! Oracle publishes for it (built into DataBrain) before installing. The
+//! libraries of the folder DataBrain installed or adopted are hashed then
+//! ([`manifest`]) and checked again before they are loaded ([`set_trusted`]).
 //!
 //! Updating Instant Client: take the versioned link and SHA-256 of each
 //! platform's Basic package from Oracle's download pages (`download_page`).
@@ -186,20 +188,113 @@ pub struct ClientStatus {
 
 /// Point the Oracle driver at `dir` (or the default/auto-detected folder)
 /// unless it is already initialized. Retries after a failed attempt.
-pub fn init_client(dir: Option<&str>, extra: &[PathBuf]) -> Result<(), String> {
+///
+/// The folder DataBrain installed or adopted ([`set_trusted`]) is checked
+/// against its manifest first: its libraries are loaded into this process,
+/// so a folder whose libraries changed since is not used.
+pub fn init_client(dir: Option<&str>, extra: &[PathBuf]) -> Result<(), InitError> {
     if oracle::InitParams::is_initialized() {
         return Ok(());
     }
-    let chosen = dir
-        .map(str::to_string)
-        .filter(|d| !d.trim().is_empty())
-        .or_else(default_dir)
-        .or_else(|| candidate_dirs(extra).first().map(|p| p.to_string_lossy().into_owned()));
+    let chosen = chosen_dir(dir, extra);
     let mut p = oracle::InitParams::new();
     if let Some(d) = &chosen {
-        p.oracle_client_lib_dir(d.as_str()).map_err(|e| e.to_string())?;
+        check_trusted(d).map_err(InitError::Changed)?;
+        p.oracle_client_lib_dir(d.as_str()).map_err(|e| InitError::Load(e.to_string()))?;
     }
-    p.init().map(|_| ()).map_err(|e| e.to_string())
+    p.init().map(|_| ()).map_err(|e| InitError::Load(e.to_string()))
+}
+
+/// Why Instant Client was not initialized.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InitError {
+    /// The checked folder's libraries changed ([`verify`]): nothing may be
+    /// loaded for it, not even from the default search path.
+    Changed(String),
+    /// Not found or not loadable (retried on the next connect).
+    Load(String),
+}
+
+impl std::fmt::Display for InitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InitError::Changed(m) | InitError::Load(m) => f.write_str(m),
+        }
+    }
+}
+
+/// The folder Instant Client is loaded from: `dir`, the default folder, or the first found.
+fn chosen_dir(dir: Option<&str>, extra: &[PathBuf]) -> Option<String> {
+    dir.map(str::to_string)
+        .filter(|d| !d.trim().is_empty())
+        .or_else(default_dir)
+        .or_else(|| candidate_dirs(extra).first().map(|p| p.to_string_lossy().into_owned()))
+}
+
+/// SHA-256 (hex) of each shared library in an Instant Client folder, by file name.
+pub type Manifest = std::collections::BTreeMap<String, String>;
+
+/// The folder whose libraries DataBrain checked, and their hashes.
+static TRUSTED: RwLock<Option<(PathBuf, Manifest)>> = RwLock::new(None);
+
+/// Libraries of `dir` must match `manifest` before Instant Client is loaded
+/// from it (`None`: no folder is checked).
+pub fn set_trusted(trusted: Option<(String, Manifest)>) {
+    if let Ok(mut g) = TRUSTED.write() {
+        *g = trusted.map(|(d, m)| (comparable(Path::new(&d)), m));
+    }
+}
+
+fn comparable(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Shared libraries (`libclntsh.dylib.23.1`, `libnnz.so`, `oci.dll`): what
+/// the driver loads. Other files (tools, jars, readmes) are not checked.
+fn is_library(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.ends_with(".dll") || n.ends_with(".dylib") || n.contains(".dylib.") || n.ends_with(".so") || n.contains(".so.")
+}
+
+/// Hash every shared library in `dir` (links are followed: what loads is
+/// the file they point to).
+pub fn manifest(dir: &Path) -> Result<Manifest, String> {
+    let mut m = Manifest::new();
+    for e in std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if is_library(&name) && e.path().is_file() {
+            m.insert(name, file_sha256(&e.path())?);
+        }
+    }
+    if !m.contains_key(library_name()) {
+        return Err(format!("{} has no {}", dir.display(), library_name()));
+    }
+    Ok(m)
+}
+
+/// `dir`'s libraries are the ones in `want`: none changed, removed or added.
+pub fn verify(dir: &Path, want: &Manifest) -> Result<(), String> {
+    let got = manifest(dir).unwrap_or_default();
+    let mut differ: Vec<&str> = want.iter().filter(|(n, h)| got.get(*n) != Some(h)).map(|(n, _)| n.as_str()).collect();
+    differ.extend(got.keys().filter(|n| !want.contains_key(*n)).map(String::as_str));
+    if differ.is_empty() {
+        return Ok(());
+    }
+    differ.sort_unstable();
+    Err(format!(
+        "Oracle Instant Client in {} changed since DataBrain checked it ({}), so it is not loaded. Install Instant Client again from the connection's Driver section, or choose the folder again.",
+        dir.display(),
+        differ.join(", ")
+    ))
+}
+
+/// [`verify`] `dir` if it is the checked folder.
+fn check_trusted(dir: &str) -> Result<(), String> {
+    let g = TRUSTED.read().map_err(|_| "lock poisoned".to_string())?;
+    match g.as_ref() {
+        Some((d, m)) if *d == comparable(Path::new(dir)) => verify(d, m),
+        _ => Ok(()),
+    }
 }
 
 /// Is Instant Client usable? Initializes the driver when it is found.
@@ -210,7 +305,7 @@ pub fn status(dir: Option<&str>, extra: &[PathBuf]) -> ClientStatus {
         .filter(|d| !d.trim().is_empty())
         .or_else(default_dir)
         .or_else(|| candidate_dirs(extra).first().map(|p| p.to_string_lossy().into_owned()));
-    match init_client(lib_dir.as_deref(), extra).and_then(|_| oracle::Version::client().map_err(|e| e.to_string())) {
+    match init_client(lib_dir.as_deref(), extra).map_err(|e| e.to_string()).and_then(|_| oracle::Version::client().map_err(|e| e.to_string())) {
         Ok(v) => ClientStatus { installed: true, version: Some(v.to_string()), lib_dir, message: None, platform },
         Err(e) => ClientStatus {
             installed: false,
@@ -401,6 +496,68 @@ mod tests {
         assert!(p.download_page.starts_with("https://www.oracle.com/"));
         assert!(p.download_url.is_none_or(|u| u.starts_with("https://download.oracle.com/")));
         assert_eq!(p.download_url.is_some(), p.sha256.is_some_and(|h| h.len() == 64), "every download has its checksum");
+    }
+
+    /// A folder like an installed Instant Client: the main library (a link
+    /// to the versioned file, as installed on macOS), another library, a tool.
+    fn fake_client(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let versioned = format!("{}.23.1", library_name());
+        std::fs::write(dir.join(&versioned), b"oci").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&versioned, dir.join(library_name())).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(dir.join(library_name()), b"oci").unwrap();
+        std::fs::write(dir.join(if cfg!(windows) { "orannzsbb.dll" } else { "libnnz.so" }), b"nnz").unwrap();
+        std::fs::write(dir.join("BASIC_README"), b"readme").unwrap();
+    }
+
+    #[test]
+    fn checks_the_installed_libraries_before_loading() {
+        let dir = std::env::temp_dir().join(format!("dbtest-ic-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        fake_client(&dir);
+        let m = manifest(&dir).unwrap();
+        let mut names: Vec<&str> = m.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert!(m.contains_key(library_name()) && m.contains_key(&format!("{}.23.1", library_name())), "{names:?}");
+        assert!(!m.contains_key("BASIC_README"), "only libraries");
+        assert_eq!(m[library_name()], m[&format!("{}.23.1", library_name())], "a link is hashed through");
+        assert!(manifest(&dir.join("missing")).is_err());
+        assert!(manifest(&std::env::temp_dir()).is_err_and(|e| e.contains(library_name())), "a folder without the library");
+
+        verify(&dir, &m).unwrap();
+        std::fs::write(dir.join("BASIC_README"), b"edited").unwrap();
+        verify(&dir, &m).expect("other files may change");
+        // Changed, added or removed libraries are refused, by name.
+        let lib2 = if cfg!(windows) { "orannzsbb.dll" } else { "libnnz.so" };
+        std::fs::write(dir.join(lib2), b"tampered").unwrap();
+        assert!(verify(&dir, &m).is_err_and(|e| e.contains(lib2) && e.contains("not loaded")));
+        std::fs::write(dir.join(lib2), b"nnz").unwrap();
+        let extra = if cfg!(windows) { "evil.dll" } else { "libevil.so.1" };
+        std::fs::write(dir.join(extra), b"x").unwrap();
+        assert!(verify(&dir, &m).is_err_and(|e| e.contains(extra)));
+        std::fs::remove_file(dir.join(extra)).unwrap();
+        std::fs::remove_file(dir.join(lib2)).unwrap();
+        assert!(verify(&dir, &m).is_err_and(|e| e.contains(lib2)));
+        std::fs::write(dir.join(lib2), b"nnz").unwrap();
+
+        // init_client refuses the checked folder once it changed (before
+        // anything is loaded) and says why; other folders are not checked.
+        set_trusted(Some((dir.to_string_lossy().into_owned(), m.clone())));
+        std::fs::write(dir.join(format!("{}.23.1", library_name())), b"replaced").unwrap();
+        match init_client(Some(&dir.to_string_lossy()), &[]) {
+            Err(InitError::Changed(e)) => assert!(e.contains(library_name()), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        let other = dir.with_extension("other");
+        let _ = std::fs::remove_dir_all(&other);
+        fake_client(&other);
+        assert!(!matches!(init_client(Some(&other.to_string_lossy()), &[]), Err(InitError::Changed(_))));
+        set_trusted(None);
+        assert!(!matches!(init_client(Some(&dir.to_string_lossy()), &[]), Err(InitError::Changed(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
     }
 }
 
