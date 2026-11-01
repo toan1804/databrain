@@ -87,6 +87,26 @@ pub struct SourceTable {
     pub items: Vec<Option<Option<String>>>,
 }
 
+/// The one table a result's query reads, by name as written (`schema`:
+/// `None` when unqualified). Keys the grid's per-table settings; nothing is
+/// looked up in the database.
+#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
+pub struct ResultSource {
+    pub connection_id: String,
+    pub schema: Option<String>,
+    pub table: String,
+}
+
+/// [`ResultSource`] of a result's query (SQL sources, one table, no join or grouping).
+pub fn result_source(o: &OutputInfo, kind: ConnectorKind) -> Option<ResultSource> {
+    if !kind.traits().language.is_sql() {
+        return None;
+    }
+    source_table(&o.sql, kind).map(|s| ResultSource { connection_id: o.connection_id.clone(), schema: s.schema, table: s.table })
+}
+
 pub fn source_table(sql: &str, kind: ConnectorKind) -> Option<SourceTable> {
     let stmts = Parser::parse_sql(dialect_for(kind).as_ref(), sql).ok()?;
     let [Statement::Query(q)] = stmts.as_slice() else { return None };

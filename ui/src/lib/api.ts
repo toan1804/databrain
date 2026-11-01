@@ -70,6 +70,7 @@ import type {
   SelectionSummary,
   LoadResultArgs,
   EditTarget,
+  ResultSource,
   EditStatement,
   ApplyReport,
   ResultLink,
@@ -236,6 +237,8 @@ export const api = {
     call<FindResult>("find_in_result", { resultId, view, query, limit, columns: columns ?? null, wholeWord }),
   /** The table a result can be edited in (rejects with the reason when it can't). */
   editTarget: (resultId: string) => call<EditTarget>("edit_target", { resultId }),
+  /** The one table a result's query reads (null: another kind of query). */
+  resultSource: (resultId: string) => call<ResultSource | null>("result_source", { resultId }),
   editPreview: (resultId: string, target: EditTarget, changes: RowChange[]) => call<EditStatement[]>("edit_preview", { resultId, target, changes }),
   applyEdits: (resultId: string, changes: RowChange[]) => call<ApplyReport>("apply_edits", { resultId, changes }),
   /** Compare two schemas; the script makes `target` like `source` (not run). */

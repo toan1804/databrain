@@ -63,6 +63,7 @@ import type { OutputInfo } from "./bindings/OutputInfo";
 import type { OutputState } from "./bindings/OutputState";
 import type { RunStatus } from "./bindings/RunStatus";
 import type { EditTarget } from "./bindings/EditTarget";
+import type { ResultSource } from "./bindings/ResultSource";
 import type { EditStatement } from "./bindings/EditStatement";
 import type { ApplyReport } from "./bindings/ApplyReport";
 import type { ResultLink } from "./bindings/ResultLink";
@@ -219,6 +220,7 @@ export type {
   OutputState,
   RunStatus,
   EditTarget,
+  ResultSource,
   EditStatement,
   ApplyReport,
   ResultLink,

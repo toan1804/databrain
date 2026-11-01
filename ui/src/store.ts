@@ -32,6 +32,7 @@ import { errorRange, uid } from "./lib/util";
 import { editorBridge } from "./editorBridge";
 import type { Dashboard } from "./lib/charts";
 import { parseSnippets, type Snippet } from "./lib/snippets";
+import { parseQuickFilters, parseViews, rememberQuickFilter, type QuickFilterEntry, type SavedView } from "./lib/gridViews";
 
 export interface Tab extends TabState {
   /** Unsaved changes relative to the linked saved query. */
@@ -251,6 +252,13 @@ interface State {
   /** The user's SQL snippets (built-in ones are added by the editor). */
   sqlSnippets: Snippet[];
   setSqlSnippets: (s: Snippet[]) => void;
+  /** Saved result grid views (setting `grid_views`). */
+  gridViews: SavedView[];
+  saveGridView: (v: SavedView) => void;
+  deleteGridView: (id: string) => void;
+  /** Quick filters by table (`tableKey`), restored when the table's rows are shown again. */
+  quickFilters: Record<string, QuickFilterEntry>;
+  setQuickFilter: (key: string, q: string) => void;
   sidebarPanel: SidebarPanel;
   /** Explorer expansion state (keys from `treeKey`). */
   treeOpen: Record<string, boolean>;
@@ -540,6 +548,13 @@ function persistParams(params: Record<string, Record<string, ParamValue>>) {
   paramsSaveTimer = setTimeout(() => void api.setSetting("editor_params", params).catch(() => {}), TAB_SAVE_DELAY);
 }
 
+let quickSaveTimer: ReturnType<typeof setTimeout> | undefined;
+function persistQuickFilters(v: Record<string, QuickFilterEntry>) {
+  if (!isTauri()) return;
+  clearTimeout(quickSaveTimer);
+  quickSaveTimer = setTimeout(() => void api.setSetting("grid_quick_filters", v).catch(() => {}), TAB_SAVE_DELAY);
+}
+
 /** `explorer_schemas` setting: { connectionId: [schema ids] }. */
 export function parseSchemaFilter(v: unknown): Record<string, string[]> {
   if (!v || typeof v !== "object") return {};
@@ -806,6 +821,8 @@ export const useStore = create<State>((set, get) => ({
   slowQuerySeconds: DEFAULT_SLOW_QUERY_SECONDS,
   inlineAiCompletion: false,
   sqlSnippets: [],
+  gridViews: [],
+  quickFilters: {},
   sidebarPanel: "connections",
   treeOpen: {},
   schemaFilter: {},
@@ -879,6 +896,8 @@ export const useStore = create<State>((set, get) => ({
         slowQuerySeconds,
         inlineAiCompletion: settings.inline_ai_completion === true,
         sqlSnippets: parseSnippets(settings.sql_snippets),
+        gridViews: parseViews(settings.grid_views),
+        quickFilters: parseQuickFilters(settings.grid_quick_filters),
         savedQueries,
         schemaFilter: parseSchemaFilter(settings.explorer_schemas),
         params: parseParams(settings.editor_params, restored.map((t) => t.id)),
@@ -964,6 +983,23 @@ export const useStore = create<State>((set, get) => ({
     const sqlSnippets = parseSnippets(s);
     set({ sqlSnippets });
     if (isTauri()) api.setSetting("sql_snippets", sqlSnippets).catch(() => {});
+  },
+  saveGridView: (v) => {
+    const gridViews = parseViews([v, ...get().gridViews.filter((x) => x.id !== v.id)]);
+    set({ gridViews });
+    if (isTauri()) api.setSetting("grid_views", gridViews).catch(() => {});
+  },
+  deleteGridView: (id) => {
+    const gridViews = get().gridViews.filter((x) => x.id !== id);
+    set({ gridViews });
+    if (isTauri()) api.setSetting("grid_views", gridViews).catch(() => {});
+  },
+  setQuickFilter: (key, q) => {
+    const cur = get().quickFilters[key];
+    if ((cur?.q ?? "") === q.trim()) return;
+    const quickFilters = rememberQuickFilter(get().quickFilters, key, q.trim());
+    set({ quickFilters });
+    persistQuickFilters(quickFilters);
   },
   setSidebarPanel: (sidebarPanel) => set({ sidebarPanel }),
   setTreeOpen: (key, open) => set((s) => ({ treeOpen: { ...s.treeOpen, [key]: open } })),

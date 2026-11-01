@@ -216,6 +216,7 @@ pub fn run() {
             commands::results::summarize_selection,
             commands::results::load_result,
             commands::results::edit_target,
+            commands::results::result_source,
             commands::results::edit_preview,
             commands::results::apply_edits,
             commands::results::result_links,

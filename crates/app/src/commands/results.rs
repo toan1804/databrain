@@ -8,6 +8,11 @@ pub(crate) async fn edit_target(state: State<'_, AppState>, result_id: String) -
 }
 
 #[tauri::command]
+pub(crate) async fn result_source(state: State<'_, AppState>, result_id: String) -> R<Option<databrain_query_engine::edit::ResultSource>> {
+    api::result_source(&state, &result_id)
+}
+
+#[tauri::command]
 pub(crate) fn edit_preview(
     state: State<'_, AppState>,
     result_id: String,

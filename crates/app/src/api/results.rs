@@ -167,6 +167,14 @@ pub async fn edit_target(state: &AppState, result_id: &str) -> Result<databrain_
     state.engine.edit_target(&o, &schema, true).await
 }
 
+/// The one table a result's query reads (per-table grid settings); `None`
+/// for other queries and results that are gone.
+pub fn result_source(state: &AppState, result_id: &str) -> Result<Option<databrain_query_engine::edit::ResultSource>> {
+    let Some(o) = state.engine.outputs().by_result(result_id) else { return Ok(None) };
+    let kind = state.workspace.get_connection(&o.connection_id)?.config.kind;
+    Ok(databrain_query_engine::edit::result_source(&o, kind))
+}
+
 /// The SQL the pending changes run (built here, not taken from the UI).
 pub fn edit_preview(state: &AppState, result_id: &str, target: &databrain_query_engine::edit::EditTarget, changes: &[databrain_query_engine::edit::RowChange]) -> Result<Vec<databrain_query_engine::edit::EditStatement>> {
     let (_, schema) = edit_source(state, result_id)?;

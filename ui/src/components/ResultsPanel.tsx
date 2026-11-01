@@ -33,9 +33,11 @@ import { ExportCard } from "./ExportsTray";
 import { editorBridge } from "../editorBridge";
 import { ChartView } from "./ChartView";
 import { OutputChip } from "./OutputChip";
+import { GridViewsMenu } from "./GridViewsMenu";
+import { tableKey, tableLabel } from "../lib/gridViews";
 import { mentionInAi, outputLabel } from "../outputs";
 import { planFind } from "../lib/find";
-import { api, toError } from "../lib/api";
+import { api, isTauri, toError } from "../lib/api";
 import type { ChartSpec, ColumnStats, EditStatement, EditTarget, ExportFormat, FilterOp, ResultInfo, ResultLink, ViewSpec } from "../lib/types";
 import { editCount, emptyEdits, toChanges, type PendingEdits } from "../lib/gridEdits";
 import {
@@ -410,6 +412,12 @@ export function ResultView({
   const send = useAi((s) => s.send);
   const [view, setView] = useState<ViewSpec>(emptyView);
   const [quick, setQuick] = useState("");
+  const quickRef = useRef(quick);
+  quickRef.current = quick;
+  /** The table the result's query reads (`tableKey`): its quick filter is remembered. */
+  const [sourceKey, setSourceKey] = useState<string | null>(null);
+  const sourceRef = useRef<string | null>(null);
+  const keptQuick = useStore((s) => (sourceKey ? s.quickFilters[sourceKey]?.q : undefined));
   const [viewRows, setViewRows] = useState(info.total_rows);
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState("");
@@ -516,9 +524,36 @@ export function ResultView({
     }
   };
 
-  // Debounced quick filter.
+  // The result's table, and its remembered quick filter (unless one was typed meanwhile).
   useEffect(() => {
-    const t = setTimeout(() => setView((v) => ({ ...v, quick_filter: quick.trim() || null })), 250);
+    if (!isTauri()) return;
+    let alive = true;
+    api
+      .resultSource(info.id)
+      .then((src) => {
+        if (!alive || !src) return;
+        const st = useStore.getState();
+        const key = tableKey(src, st.schemas[src.connection_id]?.find((s) => s.is_default)?.name);
+        sourceRef.current = key;
+        setSourceKey(key);
+        const kept = st.quickFilters[key]?.q;
+        if (kept && quickRef.current === "") {
+          setQuick(kept);
+          setView((v) => ({ ...v, quick_filter: kept }));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [info.id]);
+
+  // Debounced quick filter (remembered for the result's table).
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setView((v) => ({ ...v, quick_filter: quick.trim() || null }));
+      if (sourceRef.current) useStore.getState().setQuickFilter(sourceRef.current, quick);
+    }, 250);
     return () => clearTimeout(t);
   }, [quick]);
 
@@ -592,6 +627,13 @@ export function ResultView({
             className="field py-1 pl-7 pr-6"
             placeholder="Filter rows…"
             aria-label="Filter rows"
+            title={
+              sourceKey && quick.trim() && keptQuick === quick.trim()
+                ? `Kept for ${tableLabel(sourceKey)}: shown again the next time its rows are. Clear it to forget it.`
+                : sourceKey
+                  ? `Rows containing this text in any column. Kept for ${tableLabel(sourceKey)}.`
+                  : "Rows containing this text in any column"
+            }
             value={quick}
             onChange={(e) => setQuick(e.target.value)}
           />
@@ -621,6 +663,15 @@ export function ResultView({
             </button>
           )}
         </div>
+        <GridViewsMenu
+          info={info}
+          view={view}
+          sourceKey={sourceKey}
+          onApply={(v) => {
+            setView(v);
+            setQuick(v.quick_filter ?? "");
+          }}
+        />
         <button className="icon-btn shrink-0" title={kbd("Find (⌘F)")} aria-label="Find in results" onClick={openFind}>
           <Search size={14} />
         </button>
