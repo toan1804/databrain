@@ -80,7 +80,7 @@ The variables are `DATABRAIN_PG_*`, `DATABRAIN_MYSQL_*`, `DATABRAIN_MSSQL_*`, `D
 ```
 crates/
   app/             Tauri host and the databrain-mcp and databrain-jobs binaries
-  query-engine/    sessions, query jobs, cancel, safety checks
+  query-engine/    sessions, query runs, cancel, safety checks, outputs, loads
   connectors/      one crate per database type
   connector-core/  connector traits, statement splitting and classification
   workspace/       local SQLite store: connections, history, notebooks, jobs
@@ -94,4 +94,4 @@ crates/
 ui/                React, TypeScript, Vite and Tailwind
 ```
 
-To add a database type, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §5.1–5.2.
+To add a database type, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §5.2 (source traits) and §5.4 (adding a database type).
