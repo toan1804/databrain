@@ -1,13 +1,14 @@
 // CodeMirror adapter for lib/sqlComplete: SQL highlighting per dialect plus
 // completion from the connection's metadata (store caches + server search).
 import { traitsOf } from "../lib/sourceTraits";
-import { autocompletion, startCompletion, type Completion, type CompletionContext, type CompletionResult } from "@codemirror/autocomplete";
+import { autocompletion, snippetCompletion, startCompletion, type Completion, type CompletionContext, type CompletionResult } from "@codemirror/autocomplete";
 import { MSSQL, MySQL, PLSQL, PostgreSQL, SQLite, StandardSQL, type SQLDialect } from "@codemirror/lang-sql";
 import { LanguageSupport } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { api } from "../lib/api";
 import { completeSql, type MetaProvider, type SqlOption } from "../lib/sqlComplete";
+import { allSnippets, matchSnippets, snippetPreview } from "../lib/snippets";
 import type { ConnectorKind, DbObject } from "../lib/types";
 import { columnRoles } from "../lib/queryHints";
 import { useStore } from "../store";
@@ -314,8 +315,18 @@ export function sqlAssist(getConnId: () => string | null | undefined): Extension
       columns: async () => undefined,
     };
     const r = await completeSql(doc, ctx.pos - base, provider, ctx.explicit);
-    if (!r || ctx.aborted) return null;
-    return { from: base + r.from, options: r.options.map(toCompletion), filter: false };
+    if (ctx.aborted) return null;
+    // Snippets for the word being typed (not after a dot: that's a path).
+    const word = ctx.matchBefore(/[\w$#@-]+$/);
+    const afterDot = word && word.from > 0 && ctx.state.sliceDoc(word.from - 1, word.from) === ".";
+    const snips = word && !afterDot && (word.to - word.from >= 2 || ctx.explicit) ? matchSnippets(ctx.state.sliceDoc(word.from, word.to), allSnippets(useStore.getState().sqlSnippets)) : [];
+    const snipOptions = snips.map((s) =>
+      snippetCompletion(s.body, { label: s.prefix, type: "text", detail: s.description ?? "snippet", info: snippetPreview(s.body), boost: -1 }),
+    );
+    if (!r) return snipOptions.length && word ? { from: word.from, options: snipOptions, filter: false } : null;
+    const options = r.options.map(toCompletion);
+    if (snipOptions.length && word && base + r.from === word.from) options.splice(Math.min(1, options.length), 0, ...snipOptions);
+    return { from: base + r.from, options, filter: false };
   };
   return autocompletion({ override: [source], activateOnTyping: true, icons: true, maxRenderedOptions: 80, defaultKeymap: true });
 }

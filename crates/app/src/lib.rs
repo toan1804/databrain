@@ -317,6 +317,7 @@ pub fn run() {
             commands::ai::terminal_test,
             commands::ai::ai_provider_sign_out,
             commands::ai::ai_send,
+            commands::ai::ai_ghost,
             commands::ai::ai_cancel,
             commands::ai::ai_respond,
             commands::ai::ai_sessions,

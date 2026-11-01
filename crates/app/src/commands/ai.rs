@@ -77,6 +77,11 @@ pub(crate) async fn ai_send(state: State<'_, AppState>, args: ai_api::AiSendArgs
 }
 
 #[tauri::command]
+pub(crate) async fn ai_ghost(state: State<'_, AppState>, request_id: String, request: databrain_ai::ghost::GhostRequest) -> R<String> {
+    ai_api::ai_ghost(&state, request_id, request).await
+}
+
+#[tauri::command]
 pub(crate) async fn ai_cancel(state: State<'_, AppState>, run_id: String) -> R<bool> {
     Ok(ai_api::ai_cancel(&state, &run_id))
 }

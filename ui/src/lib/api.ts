@@ -20,6 +20,7 @@ import type {
   TableLayout,
   AgentEvent,
   AgentRequest,
+  GhostRequest,
   AiMessageRecord,
   AiProviderRecord,
   AiSessionRecord,
@@ -351,6 +352,8 @@ export const api = {
   terminalTest: (setting: TerminalSetting) => call<TerminalLaunch>("terminal_test", { setting }),
   aiSend: (args: AgentRequest) => call<string>("ai_send", { args }),
   aiCancel: (runId: string) => call<boolean>("ai_cancel", { runId }),
+  /** Inline completion at the cursor; cancel with `aiCancel(requestId)`. */
+  aiGhost: (requestId: string, request: GhostRequest) => call<string>("ai_ghost", { requestId, request }),
   aiRespond: (requestId: string, response: unknown) => call<boolean>("ai_respond", { requestId, response }),
   aiSessions: (connectionId: string | null) => call<AiSessionRecord[]>("ai_sessions", { connectionId }),
   aiSessionMessages: (sessionId: string) => call<AiMessageRecord[]>("ai_session_messages", { sessionId }),

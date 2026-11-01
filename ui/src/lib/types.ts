@@ -154,6 +154,8 @@ import type { SqlFile } from "./bindings/SqlFile";
 import type { UpdateInfo } from "./bindings/UpdateInfo";
 /** What `ai_send` takes: the agent request and the tab it is for. */
 export type AgentRequest = AiSendArgs;
+import type { GhostRequest } from "./bindings/GhostRequest";
+export type { GhostRequest };
 import type { AiProviderRecord } from "./bindings/AiProviderRecord";
 export type {
   JobNodeKind,

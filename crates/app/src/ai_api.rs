@@ -393,6 +393,16 @@ pub fn ai_send(state: &AppState, args: AiSendArgs) -> Result<String> {
     Ok(run_id)
 }
 
+/// Inline completion at the editor's cursor. `request_id` (chosen by the
+/// editor) cancels it with [`ai_cancel`] when the user types on.
+pub async fn ai_ghost(state: &AppState, request_id: String, request: databrain_ai::ghost::GhostRequest) -> Result<String> {
+    let cancel = CancellationToken::new();
+    state.ai.runs.lock().insert(request_id.clone(), cancel.clone());
+    let r = databrain_ai::ghost::complete(&state.workspace, state.secrets.clone(), &request, &cancel).await;
+    state.ai.runs.lock().remove(&request_id);
+    r.map_err(ai_err)
+}
+
 pub fn ai_cancel(state: &AppState, run_id: &str) -> bool {
     match state.ai.runs.lock().get(run_id) {
         Some(c) => {

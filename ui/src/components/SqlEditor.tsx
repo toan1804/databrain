@@ -21,6 +21,7 @@ import type { ConnectorKind } from "../lib/types";
 import { useStore } from "../store";
 import { editorBridge } from "../editorBridge";
 import { canFetchMetadata, sqlAssist, sqlLanguage } from "./sqlAssist";
+import { ghostCompletion } from "./ghostExt";
 import { queryHints } from "./queryHintsExt";
 import { SqlContextMenu, formatKey } from "./SqlContextMenu";
 import { openLineage } from "./LineageTab";
@@ -146,6 +147,8 @@ export const SqlEditor = memo(function SqlEditor({ tabId, visible }: { tabId: st
           closeBrackets(),
           // Keywords for the clause, the connection's tables and columns.
           sqlAssist(() => useStore.getState().tabs.find((x) => x.id === tabId)?.connection_id),
+          // Inline AI suggestions (Tab accepts), when turned on in Settings → Editor.
+          ghostCompletion(() => useStore.getState().tabs.find((x) => x.id === tabId)?.connection_id),
           // Tips after a run: partition / index / cluster key (underlines + hover).
           queryHints(() => tabId),
           highlightActiveLine(),

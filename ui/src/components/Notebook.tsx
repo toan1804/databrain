@@ -66,6 +66,7 @@ import { ParamBar } from "./ParamBar";
 import { openLineage } from "./LineageTab";
 import { paramField, paramNames, setParamSpans, textualNames } from "./paramsExt";
 import { canFetchMetadata, sqlAssist } from "./sqlAssist";
+import { ghostCompletion } from "./ghostExt";
 import { sqlFolding } from "./sqlFold";
 import { queryHints } from "./queryHintsExt";
 import { ResizeHandle } from "./ResizeHandle";
@@ -984,6 +985,7 @@ export function CellEditor({
           bracketMatching(),
           closeBrackets(),
           sqlAssist(() => connRef.current),
+          ghostCompletion(() => connRef.current),
           queryHints(() => editorKey),
           highlightSelectionMatches(),
           syntaxHighlighting(highlight),

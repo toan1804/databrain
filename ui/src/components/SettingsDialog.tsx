@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { AlertCircle, Bot, Database, Check, Copy, Download, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, ShieldCheck, Terminal, Trash2, Timer, Palette, Workflow } from "lucide-react";
+import { AlertCircle, Bot, Braces, Database, Check, Copy, Download, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, ShieldCheck, Terminal, Trash2, Timer, Palette, Workflow } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { AuditEntry, TerminalLaunch, TerminalOption, TerminalSetting, CredentialStoreKind, CredentialStoreView, KiroStatus, ProviderAuth, ProviderKind, ProviderView } from "../lib/types";
 import { relativeTime } from "../lib/util";
@@ -8,6 +8,7 @@ import { useStore } from "../store";
 import { useAi } from "../aiStore";
 import { ComboInput, Modal } from "./ui";
 import { AppearanceSettings } from "./AppearanceSettings";
+import { EditorSettings } from "./EditorSettings";
 import { UsageDetails } from "./ProviderUsage";
 import { DuckdbEngineSettings } from "./DuckdbEngine";
 import { UpdateSettings } from "./UpdateBanner";
@@ -65,7 +66,7 @@ const AUTH_LABEL: Record<ProviderAuth, string> = {
 export function SettingsDialog() {
   const open = useStore((s) => s.settingsOpen);
   const setOpen = useStore((s) => s.setSettingsOpen);
-  const [section, setSection] = useState<"providers" | "appearance" | "queries" | "duckdb" | "terminal" | "security" | "mcp" | "audit" | "updates" | "jobs">("providers");
+  const [section, setSection] = useState<"providers" | "appearance" | "editor" | "queries" | "duckdb" | "terminal" | "security" | "mcp" | "audit" | "updates" | "jobs">("providers");
   const focusProvider = useAi((s) => s.settingsProvider);
   useEffect(() => {
     if (focusProvider) setSection("providers");
@@ -87,6 +88,7 @@ export function SettingsDialog() {
         <div className="w-40 shrink-0 space-y-0.5">
           {item("providers", <Bot size={14} />, "AI providers")}
           {item("appearance", <Palette size={14} />, "Appearance")}
+          {item("editor", <Braces size={14} />, "Editor")}
           {item("queries", <Timer size={14} />, "Queries")}
           {item("jobs", <Workflow size={14} />, "Jobs")}
           {item("duckdb", <Database size={14} />, "DuckDB engine")}
@@ -99,6 +101,7 @@ export function SettingsDialog() {
         <div className="min-w-0 flex-1">
           {section === "providers" && <Providers />}
           {section === "appearance" && <AppearanceSettings />}
+          {section === "editor" && <EditorSettings />}
           {section === "queries" && <Queries />}
           {section === "jobs" && <BackgroundJobsSettings />}
           {section === "duckdb" && <DuckdbEngineSettings />}

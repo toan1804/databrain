@@ -31,6 +31,7 @@ import type {
 import { errorRange, uid } from "./lib/util";
 import { editorBridge } from "./editorBridge";
 import type { Dashboard } from "./lib/charts";
+import { parseSnippets, type Snippet } from "./lib/snippets";
 
 export interface Tab extends TabState {
   /** Unsaved changes relative to the linked saved query. */
@@ -244,6 +245,12 @@ interface State {
   /** Tips are computed for statements running at least this long (0 = off). */
   slowQuerySeconds: number;
   setSlowQuerySeconds: (s: number) => void;
+  /** Inline AI suggestions while typing (off by default: it sends the SQL around the cursor to the AI provider). */
+  inlineAiCompletion: boolean;
+  setInlineAiCompletion: (on: boolean) => void;
+  /** The user's SQL snippets (built-in ones are added by the editor). */
+  sqlSnippets: Snippet[];
+  setSqlSnippets: (s: Snippet[]) => void;
   sidebarPanel: SidebarPanel;
   /** Explorer expansion state (keys from `treeKey`). */
   treeOpen: Record<string, boolean>;
@@ -797,6 +804,8 @@ export const useStore = create<State>((set, get) => ({
   appearance: DEFAULT_APPEARANCE,
   rowLimit: 1000,
   slowQuerySeconds: DEFAULT_SLOW_QUERY_SECONDS,
+  inlineAiCompletion: false,
+  sqlSnippets: [],
   sidebarPanel: "connections",
   treeOpen: {},
   schemaFilter: {},
@@ -868,6 +877,8 @@ export const useStore = create<State>((set, get) => ({
         appearance,
         rowLimit,
         slowQuerySeconds,
+        inlineAiCompletion: settings.inline_ai_completion === true,
+        sqlSnippets: parseSnippets(settings.sql_snippets),
         savedQueries,
         schemaFilter: parseSchemaFilter(settings.explorer_schemas),
         params: parseParams(settings.editor_params, restored.map((t) => t.id)),
@@ -944,6 +955,15 @@ export const useStore = create<State>((set, get) => ({
     const slowQuerySeconds = Number.isFinite(n) ? Math.max(0, Math.round(n)) : DEFAULT_SLOW_QUERY_SECONDS;
     set({ slowQuerySeconds });
     if (isTauri()) api.setSetting("slow_query_seconds", slowQuerySeconds).catch(() => {});
+  },
+  setInlineAiCompletion: (inlineAiCompletion) => {
+    set({ inlineAiCompletion });
+    if (isTauri()) api.setSetting("inline_ai_completion", inlineAiCompletion).catch(() => {});
+  },
+  setSqlSnippets: (s) => {
+    const sqlSnippets = parseSnippets(s);
+    set({ sqlSnippets });
+    if (isTauri()) api.setSetting("sql_snippets", sqlSnippets).catch(() => {});
   },
   setSidebarPanel: (sidebarPanel) => set({ sidebarPanel }),
   setTreeOpen: (key, open) => set((s) => ({ treeOpen: { ...s.treeOpen, [key]: open } })),
