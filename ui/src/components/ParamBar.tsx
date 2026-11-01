@@ -81,6 +81,8 @@ export function ParamBar({ tabId, kind }: { tabId: string; kind: ConnectorKind |
                   value={v.value}
                   aria-invalid={empty}
                   aria-label={`Value of :${n}`}
+                  // ⌘↵ in a value runs the query, as in the editor.
+                  data-run-shortcut
                   onChange={(e) => setParam(tabId, n, { value: e.target.value })}
                   spellCheck={false}
                 />

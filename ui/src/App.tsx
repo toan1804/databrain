@@ -24,6 +24,7 @@ import { MoveToApplications } from "./components/MoveToApplications";
 import { DuckdbEngineBanner } from "./components/DuckdbEngine";
 import { useAi } from "./aiStore";
 import { isMac, kbd, modalOpen } from "./lib/platform";
+import { globalRunApplies } from "./lib/shortcuts";
 
 function useGlobalShortcuts() {
   useEffect(() => {
@@ -35,7 +36,6 @@ function useGlobalShortcuts() {
       // Not behind a dialog (⌘W would close the tab under it, ⌘↵ run a
       // query): the palette only closes again with ⌘K.
       if (modalOpen() || (st.paletteOpen && key !== "k")) return;
-      const inEditor = (e.target as HTMLElement | null)?.closest?.(".cm-editor");
       if (key === "l" && !e.shiftKey) {
         e.preventDefault();
         const ai = useAi.getState();
@@ -65,8 +65,8 @@ function useGlobalShortcuts() {
       } else if (key === ".") {
         e.preventDefault();
         if (st.activeTabId) void st.cancelTab(st.activeTabId);
-      } else if (key === "enter" && !inEditor && st.activeTabId) {
-        // Run from anywhere (e.g. while the grid has focus).
+      } else if (key === "enter" && st.activeTabId && globalRunApplies(e)) {
+        // Run from outside the editor (e.g. while the grid has focus), not from a text field.
         const v = editorBridge.get(st.activeTabId);
         if (!v) return;
         e.preventDefault();
