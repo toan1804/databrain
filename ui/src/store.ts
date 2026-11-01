@@ -48,8 +48,16 @@ export interface Tab extends TabState {
   plan?: PlanRef | null;
   /** Schema compare; not saved across restarts. */
   compare?: CompareRef | null;
+  /** ER diagram of a schema (on the tab's connection); not saved across restarts. */
+  er?: ErRef | null;
   /** Dashboard of pinned charts (the dashboard is saved in settings). */
   dashboard_id?: string | null;
+}
+
+/** The schema an ER diagram tab shows (`schema` is the explorer id, `label` for display). */
+export interface ErRef {
+  schema: string;
+  label: string;
 }
 
 /** The two schemas a compare tab shows (the script changes `target`). */
@@ -87,7 +95,7 @@ export interface DdlRef {
 }
 
 /** Tabs that hold an editable SQL editor (not notebooks, outputs or DDL views). */
-export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare && !t.dashboard_id;
+export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare && !t.er && !t.dashboard_id;
 
 export type StatementStatus = "pending" | "running" | "done" | "error" | "cancelled";
 
@@ -465,7 +473,7 @@ function persistTabs(tabs: Tab[]) {
     api
       .saveTabs(
         // DDL views are reloaded from the server on demand, not restored.
-        tabs.filter((t) => !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare && !t.dashboard_id).map((t) => ({
+        tabs.filter((t) => !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare && !t.er && !t.dashboard_id).map((t) => ({
           id: t.id,
           title: t.title,
           sql: t.sql,
@@ -1289,6 +1297,7 @@ export const useStore = create<State>((set, get) => ({
       job_id: init?.job_id ?? null,
       plan: init?.plan ?? null,
       compare: init?.compare ?? null,
+      er: init?.er ?? null,
       dashboard_id: init?.dashboard_id ?? null,
     };
     const tabs = [...s.tabs, tab];

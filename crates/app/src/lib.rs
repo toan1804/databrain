@@ -207,6 +207,7 @@ pub fn run() {
             commands::explorer::package_members,
             commands::explorer::object_ddl,
             commands::explorer::describe_object,
+            commands::explorer::schema_tables,
             commands::explorer::table_layout,
             commands::queries::statement_at_cursor,
             commands::queries::statement_spans,

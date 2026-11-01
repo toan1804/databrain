@@ -1,7 +1,7 @@
 // Copy / insert actions for catalog objects (explorer tree and catalog search).
 import { traitsOf } from "../lib/sourceTraits";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { ClipboardCopy, Columns3, FileCode2, GitCompare, Play, RefreshCw, TextCursorInput } from "lucide-react";
+import { ClipboardCopy, Columns3, FileCode2, GitCompare, Play, RefreshCw, Share2, TextCursorInput } from "lucide-react";
 import { toError } from "../lib/api";
 import { isRelationKind, columnList, schemaLabel, schemaPath, splitSchema, tablePath } from "../lib/catalog";
 import type { ConnectionView, DbObject, SchemaInfo } from "../lib/types";
@@ -10,6 +10,7 @@ import { editorBridge } from "../editorBridge";
 import { useStore } from "../store";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
 import { openCompare } from "./CompareTab";
+import { openErDiagram } from "./ErTab";
 
 export async function copyText(text: string, what: string) {
   try {
@@ -102,7 +103,10 @@ export function SchemaMenu({
       <MenuSeparator />
       <MenuItem icon={<TextCursorInput size={13} />} label="Insert schema path" onClick={run(() => insertText(path))} />
       {traitsOf(kind).language === "sql" && (
-        <MenuItem icon={<GitCompare size={13} />} label="Compare with another schema…" onClick={run(() => openCompare({ connection_id: conn.id, schema: schema.name }))} />
+        <>
+          <MenuItem icon={<Share2 size={13} />} label="Show ER diagram" onClick={run(() => openErDiagram(conn.id, schema.name, name))} />
+          <MenuItem icon={<GitCompare size={13} />} label="Compare with another schema…" onClick={run(() => openCompare({ connection_id: conn.id, schema: schema.name }))} />
+        </>
       )}
       {onRefresh && (
         <>

@@ -600,8 +600,10 @@ pub struct SchemaMetadata {
     pub error: Option<String>,
 }
 
-/// Column metadata for a whole schema (bulk introspection for knowledge).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Column metadata for a whole schema (bulk introspection for knowledge, ER diagrams).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
 pub struct TableColumns {
     pub table: String,
     pub columns: Vec<ColumnInfo>,

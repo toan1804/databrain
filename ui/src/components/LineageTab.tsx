@@ -61,7 +61,7 @@ function cssVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
-function themeColors(): DiagramColors {
+export function themeColors(): DiagramColors {
   return {
     bg: cssVar("--bg") || "#0b0f17",
     panel: cssVar("--panel") || "#111827",
@@ -76,7 +76,7 @@ function themeColors(): DiagramColors {
 }
 
 /** Rasterize an SVG string (2× for sharp images); base64 PNG without the data: prefix. */
-async function svgToPng(svg: string, width: number, height: number): Promise<string> {
+export async function svgToPng(svg: string, width: number, height: number): Promise<string> {
   const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
   try {
     const img = new Image();

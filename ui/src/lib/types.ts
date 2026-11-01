@@ -34,6 +34,7 @@ import type { DbObject } from "./bindings/DbObject";
 import type { FieldSpec } from "./bindings/FieldSpec";
 import type { IndexInfo } from "./bindings/IndexInfo";
 import type { ObjectDetail } from "./bindings/ObjectDetail";
+import type { TableColumns } from "./bindings/TableColumns";
 import type { ObjectKind } from "./bindings/ObjectKind";
 import type { SchemaInfo } from "./bindings/SchemaInfo";
 import type { TableLayout } from "./bindings/TableLayout";
@@ -187,6 +188,7 @@ export type {
   FieldSpec,
   IndexInfo,
   ObjectDetail,
+  TableColumns,
   ObjectKind,
   SchemaInfo,
   TableLayout,

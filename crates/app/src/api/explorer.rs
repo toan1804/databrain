@@ -361,6 +361,13 @@ pub async fn describe(
     Ok(d)
 }
 
+/// Every table of a schema with its columns and foreign keys (ER diagram).
+pub async fn schema_tables(state: &AppState, id: &str, schema: &str) -> Result<Vec<databrain_connector_core::TableColumns>> {
+    let mut tables = state.engine.schema_columns(id, schema).await?;
+    tables.sort_by(|a, b| a.table.cmp(&b.table));
+    Ok(tables)
+}
+
 pub async fn table_layout(state: &AppState, id: &str, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
     state.engine.table_layout(id, schema, name).await
 }

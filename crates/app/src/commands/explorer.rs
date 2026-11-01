@@ -120,6 +120,11 @@ pub(crate) async fn describe_object(
 }
 
 #[tauri::command]
+pub(crate) async fn schema_tables(state: State<'_, AppState>, id: String, schema: String) -> R<Vec<databrain_connector_core::TableColumns>> {
+    api::schema_tables(&state, &id, &schema).await
+}
+
+#[tauri::command]
 pub(crate) async fn table_layout(state: State<'_, AppState>, id: String, schema: String, name: String) -> R<databrain_connector_core::TableLayout> {
     api::table_layout(&state, &id, &schema, &name).await
 }

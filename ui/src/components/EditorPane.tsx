@@ -1,5 +1,5 @@
 import { memo, useEffect, useRef, useState } from "react";
-import { ChevronsDownUp, FileCode2, FileText, GitCompare, GitFork, LayoutDashboard, Network, Table2, Lightbulb, Loader2, MoreHorizontal, Play, PlayCircle, Plus, Save, Sparkles, Square, X, Workflow } from "lucide-react";
+import { ChevronsDownUp, FileCode2, FileText, GitCompare, GitFork, LayoutDashboard, Network, Share2, Table2, Lightbulb, Loader2, MoreHorizontal, Play, PlayCircle, Plus, Save, Sparkles, Square, X, Workflow } from "lucide-react";
 import { isQueryTab, useActiveTab, useStore, type Tab } from "../store";
 import { editorBridge } from "../editorBridge";
 import { SqlEditor } from "./SqlEditor";
@@ -14,6 +14,7 @@ import { TabErrorBoundary } from "./TabErrorBoundary";
 import { LineageTab, openLineage } from "./LineageTab";
 import { PlanTab, openPlan } from "./PlanTab";
 import { CompareTab } from "./CompareTab";
+import { ErTab } from "./ErTab";
 import { DashboardTab } from "./DashboardTab";
 import { useAi } from "../aiStore";
 import type { ConnectionView } from "../lib/types";
@@ -158,6 +159,8 @@ const TabSlot = memo(function TabSlot({ tab: t, active }: { tab: Tab; active: bo
               ? ["dashboard", <DashboardTab tabId={t.id} visible={active} />]
               : t.compare
                 ? ["schema compare", <CompareTab tabId={t.id} visible={active} />]
+                : t.er
+                  ? ["ER diagram", <ErTab tabId={t.id} visible={active} />]
                 : t.plan
                   ? ["query plan", <PlanTab tabId={t.id} visible={active} />]
                   : [null, null];
@@ -272,6 +275,8 @@ function TabBar() {
               <GitFork size={12} className="shrink-0 rotate-90 text-muted" />
             ) : t.compare ? (
               <GitCompare size={12} className="shrink-0 text-muted" />
+            ) : t.er ? (
+              <Share2 size={12} className="shrink-0 text-muted" />
             ) : t.dashboard_id ? (
               <LayoutDashboard size={12} className="shrink-0 text-muted" />
             ) : t.job_id ? (
