@@ -170,6 +170,7 @@ const ENGINE_GROUPS: Partial<Record<ConnectorKind, ObjectGroupName[]>> = {
   databricks: ["Tables", "Views", "Materialized views", "Functions"],
   bigquery: ["Tables", "Views", "Materialized views", "Functions", "Procedures"],
   mongodb: ["Tables", "Views"],
+  clickhouse: ["Tables", "Views", "Materialized views"],
 };
 
 /** Folder name as the engine calls it (MongoDB "Collections", Neo4j "Labels"). */

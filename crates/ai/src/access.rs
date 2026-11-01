@@ -80,6 +80,7 @@ fn defaults(profile: &ConnectionProfile) -> Vec<Option<String>> {
             vec![Some(cat), Some("main".into())]
         }
         ConnectorKind::Mysql => vec![db],
+        ConnectorKind::Clickhouse => vec![db.or(Some("default".into()))],
         ConnectorKind::Oracle => vec![profile.config.auth.user().map(|u| u.to_ascii_uppercase())],
         ConnectorKind::Sqlite => vec![Some("main".into())],
         ConnectorKind::Mongodb => vec![db],

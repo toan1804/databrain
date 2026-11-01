@@ -23,6 +23,7 @@ const DIALECTS: Partial<Record<ConnectorKind, SQLDialect>> = {
   databricks: MySQL, // backtick identifiers
   bigquery: MySQL, // backtick identifiers
   duckdb: PostgreSQL,
+  clickhouse: MySQL, // backtick identifiers, # comments
 };
 
 /** Highlighting only: lang-sql's own completion (every keyword of the dialect) is left out. */

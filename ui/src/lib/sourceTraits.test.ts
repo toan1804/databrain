@@ -7,7 +7,7 @@ import type { ConnectorKind } from "./types";
 
 describe("source traits", () => {
   it("built-in copy covers every current kind", () => {
-    for (const k of ["sqlite", "postgres", "mysql", "mssql", "oracle", "snowflake", "databricks", "bigquery", "duckdb"]) {
+    for (const k of ["sqlite", "postgres", "mysql", "mssql", "oracle", "snowflake", "databricks", "bigquery", "duckdb", "clickhouse"]) {
       expect(traitsOf(k).name).not.toBe("this database");
     }
     expect(engineName("mssql")).toBe("SQL Server");

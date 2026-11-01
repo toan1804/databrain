@@ -53,6 +53,7 @@ pub enum SqlParser {
     Databricks,
     Bigquery,
     Duckdb,
+    Clickhouse,
 }
 
 /// How identifiers are quoted.
@@ -710,6 +711,20 @@ pub const MONGODB: SourceTraits = SourceTraits {
     ..STANDARD
 };
 
+/// ClickHouse: databases are the schemas (like MySQL); no transactions, so
+/// no load target yet (tables also need an ENGINE).
+pub const CLICKHOUSE: SourceTraits = SourceTraits {
+    parser: SqlParser::Clickhouse,
+    name: "ClickHouse",
+    dialect_name: "ClickHouse SQL",
+    quote: IdentQuote::BacktickBackslash,
+    explain: Some("EXPLAIN "),
+    ssl_setting: true,
+    syntax: SqlSyntax { backslash_escapes: true, backslash_in_double_quotes: true, backtick: true, hash_comment: true, ..STANDARD_SYNTAX },
+    load: None,
+    ..STANDARD
+};
+
 /// Neo4j: one database; "schemas" are Nodes and Relationships, objects are
 /// labels and relationship types. Queries are Cypher.
 pub const NEO4J: SourceTraits = SourceTraits {
@@ -744,6 +759,7 @@ impl ConnectorKind {
             ConnectorKind::Duckdb => &DUCKDB,
             ConnectorKind::Mongodb => &MONGODB,
             ConnectorKind::Neo4j => &NEO4J,
+            ConnectorKind::Clickhouse => &CLICKHOUSE,
         }
     }
 }

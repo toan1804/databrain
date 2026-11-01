@@ -1812,6 +1812,7 @@ dependencies = [
  "chrono",
  "databrain-ai",
  "databrain-auth",
+ "databrain-connector-clickhouse",
  "databrain-connector-cloud",
  "databrain-connector-core",
  "databrain-connector-duckdb",
@@ -1875,6 +1876,20 @@ dependencies = [
  "tokio-util",
  "ts-rs",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "databrain-connector-clickhouse"
+version = "0.2.1"
+dependencies = [
+ "async-trait",
+ "databrain-auth",
+ "databrain-connector-core",
+ "reqwest",
+ "secrecy",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 

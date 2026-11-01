@@ -18,6 +18,7 @@ pub enum ConnectorKind {
     Duckdb,
     Mongodb,
     Neo4j,
+    Clickhouse,
 }
 
 impl ConnectorKind {
@@ -27,10 +28,10 @@ impl ConnectorKind {
     /// sees as writes; a function that writes can't be told apart from a
     /// read. Oracle: functions with autonomous transactions still write.
     pub fn server_read_only(self) -> bool {
-        matches!(self, ConnectorKind::Postgres | ConnectorKind::Mysql | ConnectorKind::Sqlite | ConnectorKind::Duckdb)
+        matches!(self, ConnectorKind::Postgres | ConnectorKind::Mysql | ConnectorKind::Sqlite | ConnectorKind::Duckdb | ConnectorKind::Clickhouse)
     }
 
-    pub const ALL: [ConnectorKind; 11] = [
+    pub const ALL: [ConnectorKind; 12] = [
         ConnectorKind::Sqlite,
         ConnectorKind::Postgres,
         ConnectorKind::Mysql,
@@ -42,6 +43,7 @@ impl ConnectorKind {
         ConnectorKind::Duckdb,
         ConnectorKind::Mongodb,
         ConnectorKind::Neo4j,
+        ConnectorKind::Clickhouse,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -57,6 +59,7 @@ impl ConnectorKind {
             ConnectorKind::Duckdb => "duckdb",
             ConnectorKind::Mongodb => "mongodb",
             ConnectorKind::Neo4j => "neo4j",
+            ConnectorKind::Clickhouse => "clickhouse",
         }
     }
 

@@ -1019,7 +1019,7 @@ fn catalog_word(kind: ConnectorKind) -> &'static str {
 /// What a schema is called on `kind`.
 fn schema_word(kind: ConnectorKind) -> &'static str {
     match kind {
-        ConnectorKind::Mysql => "Database",
+        ConnectorKind::Mysql | ConnectorKind::Clickhouse => "Database",
         ConnectorKind::Bigquery => "Dataset",
         ConnectorKind::Sqlite => "Attached database",
         ConnectorKind::Oracle => "Schema (user)",
@@ -1040,7 +1040,7 @@ fn create_catalog_sql(kind: ConnectorKind, quoted: &str) -> Option<String> {
 /// SQL that creates a schema (`path`: quoted, with its catalog).
 fn create_schema_sql(kind: ConnectorKind, path: &str, name: &str) -> Option<String> {
     match kind {
-        ConnectorKind::Mysql => Some(format!("CREATE DATABASE {path}")),
+        ConnectorKind::Mysql | ConnectorKind::Clickhouse => Some(format!("CREATE DATABASE {path}")),
         ConnectorKind::Sqlite => Some(format!("ATTACH DATABASE 'file.db' AS {path}")),
         ConnectorKind::Oracle => Some(format!("CREATE USER {path} IDENTIFIED BY \"password\" -- {name}'s tables need a user of that name")),
         _ => Some(format!("CREATE SCHEMA {path}")),

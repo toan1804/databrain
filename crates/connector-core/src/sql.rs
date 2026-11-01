@@ -4,7 +4,7 @@
 use serde::Serialize;
 use sqlparser::ast::{Query, SetExpr, Statement};
 use sqlparser::dialect::{
-    BigQueryDialect, DatabricksDialect, Dialect, DuckDbDialect, GenericDialect, MsSqlDialect, MySqlDialect, OracleDialect,
+    BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect, GenericDialect, MsSqlDialect, MySqlDialect, OracleDialect,
     PostgreSqlDialect, SQLiteDialect, SnowflakeDialect,
 };
 use sqlparser::parser::Parser;
@@ -27,6 +27,7 @@ fn dialect_of(parser: SqlParser) -> Box<dyn Dialect> {
         SqlParser::Databricks => Box::new(DatabricksDialect {}),
         SqlParser::Bigquery => Box::new(BigQueryDialect {}),
         SqlParser::Duckdb => Box::new(DuckDbDialect {}),
+        SqlParser::Clickhouse => Box::new(ClickHouseDialect {}),
         SqlParser::Generic => Box::new(GenericDialect {}),
     }
 }

@@ -12,7 +12,7 @@ export const ENVS: { value: EnvTag; label: string }[] = [
   { value: "prod", label: "Production" },
 ];
 export const rank = (k: ConnectorKind) => (KIND_ORDER.includes(k) ? KIND_ORDER.indexOf(k) : KIND_ORDER.length);
-const KIND_ORDER: ConnectorKind[] = ["postgres", "mysql", "sqlite", "mssql", "oracle", "duckdb", "snowflake", "databricks", "bigquery"];
+const KIND_ORDER: ConnectorKind[] = ["postgres", "mysql", "sqlite", "mssql", "oracle", "duckdb", "clickhouse", "snowflake", "databricks", "bigquery"];
 export const TOP_LEVEL = new Set(["host", "port", "database", "file_path"]);
 
 export const AUTH_LABELS: Record<AuthMethodKind, string> = {

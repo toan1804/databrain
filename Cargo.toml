@@ -13,6 +13,7 @@ members = [
     "crates/connectors/duckdb",
     "crates/connectors/mongodb",
     "crates/connectors/neo4j",
+    "crates/connectors/clickhouse",
     "crates/duckdb-dynload",
     "crates/result-store",
     "crates/export",

@@ -89,6 +89,8 @@ jobs:
       DATABRAIN_MYSQL_PORT: 3306
       DATABRAIN_MYSQL_PASSWORD: pw
       DATABRAIN_MONGO_URI: mongodb://127.0.0.1:27017
+      DATABRAIN_CLICKHOUSE_HOST: 127.0.0.1
+      DATABRAIN_CLICKHOUSE_PASSWORD: databrain
     services:
       postgres:
         image: postgres:16-alpine
@@ -105,6 +107,14 @@ jobs:
       mongo:
         image: mongo:7
         ports: ["27017:27017"]
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_PASSWORD: databrain
+        ports: ["8123:8123"]
+        options: >-
+          --health-cmd "wget -qO- http://localhost:8123/ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v4
 
@@ -129,4 +139,4 @@ jobs:
         run: npm ci && npm run build
 
       - name: Live tests (Postgres, MySQL, MongoDB)
-        run: cargo test -p databrain-connector-postgres -p databrain-connector-mysql -p databrain-connector-mongodb -p databrain-app --no-fail-fast -- --ignored
+        run: cargo test -p databrain-connector-postgres -p databrain-connector-mysql -p databrain-connector-mongodb -p databrain-connector-clickhouse -p databrain-app --no-fail-fast -- --ignored

@@ -75,6 +75,7 @@ const DIALECT_FUNCTIONS: Partial<Record<ConnectorKind, string[]>> = {
   bigquery: ["SAFE_CAST", "FORMAT_DATE", "DATE_DIFF", "TIMESTAMP_TRUNC", "IFNULL", "QUALIFY"],
   duckdb: ["READ_CSV", "READ_PARQUET", "READ_JSON", "LIST", "STRFTIME", "DATEDIFF", "TRY_CAST", "QUALIFY"],
   postgres: ["TO_CHAR", "TO_DATE", "AGE", "GENERATE_SERIES", "JSONB_EXTRACT_PATH_TEXT"],
+  clickhouse: ["toDate", "toDateTime", "toStartOfDay", "toStartOfMonth", "formatDateTime", "countIf", "sumIf", "uniq", "uniqExact", "groupArray", "arrayJoin", "argMax", "quantile", "ifNull"],
 };
 
 const TABLE_KEYWORDS = new Set(["from", "join", "into", "update", "table"]);

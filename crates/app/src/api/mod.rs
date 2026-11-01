@@ -145,6 +145,8 @@ pub fn registry_with_outputs(
     r.register(Arc::new(databrain_connector_mongodb::MongoConnector));
     #[cfg(feature = "neo4j")]
     r.register(Arc::new(databrain_connector_neo4j::Neo4jConnector));
+    #[cfg(feature = "clickhouse")]
+    r.register(Arc::new(databrain_connector_clickhouse::ClickhouseConnector::new()));
     #[cfg(feature = "duckdb-engine")]
     r.register(Arc::new(match outputs {
         Some(slot) => databrain_connector_duckdb::DuckdbConnector::with_outputs(slot),

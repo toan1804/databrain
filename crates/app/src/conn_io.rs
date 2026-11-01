@@ -331,6 +331,7 @@ pub fn config_from_url(url: &str) -> Option<(ConnectionConfig, Option<String>)> 
         "bigquery" => K::Bigquery,
         "mongodb" | "mongodb+srv" => K::Mongodb,
         "neo4j" | "bolt" | "neo4j+s" => K::Neo4j,
+        "clickhouse" | "ch" => K::Clickhouse,
         _ => return None,
     };
     let mut c = ConnectionConfig::new(kind, AuthMethod::None);
@@ -441,6 +442,33 @@ pub fn config_from_url(url: &str) -> Option<(ConnectionConfig, Option<String>)> 
             if let Some(v) = p.get("defaultdataset") {
                 c.options.insert("dataset".into(), v.clone());
             }
+        }
+        K::Clickhouse => {
+            // jdbc:clickhouse:[http|https|grpc:]//[user@]host[:port][/db][?k=v]
+            let (proto, a) = match after.split_once("//") {
+                Some((p, r)) => (p.trim_end_matches(':').to_ascii_lowercase(), r),
+                None => (String::new(), after),
+            };
+            let (a, q) = a.split_once('?').unwrap_or((a, ""));
+            let (hp, db) = a.split_once('/').map(|(h, d)| (h, Some(d.to_string()))).unwrap_or((a, None));
+            if let Some((cred, _)) = hp.rsplit_once('@') {
+                user = cred.split(':').next().map(str::to_string).filter(|u| !u.is_empty());
+            }
+            (c.host, c.port) = host_port(hp);
+            c.database = db.filter(|d| !d.is_empty());
+            let p = props(q, '&');
+            user = user.or(p.get("user").cloned());
+            c.database = c.database.or(p.get("database").cloned());
+            let tls = proto == "https" || p.get("ssl").is_some_and(|v| v == "true" || v == "1");
+            if tls {
+                c.ssl_mode = databrain_connector_core::SslMode::Require;
+            }
+            // DataBrain talks HTTP: the native TCP ports become the HTTP ones.
+            c.port = match c.port {
+                Some(9000) => Some(8123),
+                Some(9440) => Some(8443),
+                p => p,
+            };
         }
         _ => {
             // //host:port/db?k=v (Postgres, MySQL, Neo4j `bolt://`).
@@ -644,6 +672,8 @@ fn dbeaver_kind(provider: &str, driver: &str) -> Option<ConnectorKind> {
         ConnectorKind::Mongodb
     } else if has("neo4j") {
         ConnectorKind::Neo4j
+    } else if has("clickhouse") {
+        ConnectorKind::Clickhouse
     } else {
         return None;
     })
@@ -923,6 +953,13 @@ mod tests {
         let (mg, _) = c("mongodb://u:secret@m1:27017/db");
         assert_eq!(mg.opt("uri"), Some("mongodb://u@m1:27017/db"), "no password kept");
         assert!(config_from_url("jdbc:cassandra://x").is_none());
+        let (ch, u) = c("jdbc:clickhouse:https://bob@ch.example.com:8443/analytics?ssl=true");
+        assert_eq!(
+            (ch.kind, ch.host.as_deref(), ch.port, ch.database.as_deref(), ch.ssl_mode, u.as_deref()),
+            (ConnectorKind::Clickhouse, Some("ch.example.com"), Some(8443), Some("analytics"), databrain_connector_core::SslMode::Require, Some("bob"))
+        );
+        let (ch, _) = c("jdbc:ch://localhost:9000?database=logs&user=default");
+        assert_eq!((ch.host.as_deref(), ch.port, ch.database.as_deref()), (Some("localhost"), Some(8123), Some("logs")), "native port mapped to HTTP");
     }
 
     #[test]
@@ -944,14 +981,16 @@ mod tests {
     <data-source source="LOCAL" name="file" uuid="u-3">
       <jdbc-url>jdbc:sqlite:$PROJECT_DIR$/x.db</jdbc-url>
     </data-source>
-    <data-source source="LOCAL" name="odd" uuid="u-4"><jdbc-url>jdbc:clickhouse://h</jdbc-url></data-source>
+    <data-source source="LOCAL" name="ch" uuid="u-4"><jdbc-url>jdbc:clickhouse://h</jdbc-url></data-source>
+    <data-source source="LOCAL" name="odd" uuid="u-5"><jdbc-url>jdbc:cassandra://h</jdbc-url></data-source>
   </component>
 </project>"#;
         let local = r#"<project version="4"><component name="dataSourceStorageLocal">
             <data-source name="shop@localhost" uuid="u-1"><secret-storage>master_key</secret-storage><user-name>ann</user-name></data-source>
           </component></project>"#;
         let p = parse_datagrip(xml, local).unwrap();
-        assert_eq!(p.len(), 3, "unsupported drivers are skipped");
+        assert_eq!(p.len(), 4, "unsupported drivers are skipped");
+        assert_eq!((p[3].conn.config.kind, p[3].conn.config.host.as_deref()), (ConnectorKind::Clickhouse, Some("h")));
         let pg = &p[0];
         assert_eq!((pg.conn.name.as_str(), pg.conn.config.host.as_deref(), pg.conn.config.database.as_deref(), pg.conn.folder.clone()), ("shop@localhost", Some("localhost"), Some("shop"), vec!["Prod".to_string(), "EU".to_string()]));
         assert_eq!(user_of(&pg.conn.config).as_deref(), Some("ann"), "user from dataSources.local.xml");
