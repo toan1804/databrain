@@ -3,6 +3,7 @@
 pub mod ai_api;
 pub mod api;
 pub mod background;
+mod commands;
 pub mod jobs;
 pub mod logging;
 pub mod meta_writer;
@@ -57,823 +58,6 @@ impl EventSink for TauriSink {
 
 type R<T> = Result<T, EngineError>;
 
-// Every command is `async` so Tauri runs it off the main (UI) thread.
-
-#[tauri::command]
-async fn list_connectors(state: State<'_, AppState>) -> R<Vec<ConnectorInfo>> {
-    Ok(api::list_connectors(&state))
-}
-
-#[tauri::command]
-async fn list_connections(state: State<'_, AppState>) -> R<Vec<ConnectionView>> {
-    api::list_connections(&state)
-}
-
-#[tauri::command]
-async fn save_connection(
-    state: State<'_, AppState>,
-    args: SaveConnectionArgs,
-) -> R<ConnectionProfile> {
-    api::save_connection(&state, args)
-}
-
-#[tauri::command]
-async fn delete_connection(state: State<'_, AppState>, id: String) -> R<()> {
-    api::delete_connection(&state, &id)
-}
-
-#[tauri::command]
-async fn test_connection(
-    state: State<'_, AppState>,
-    config: ConnectionConfig,
-    secret: Option<String>,
-    connection_id: Option<String>,
-    ssh_secret: Option<String>,
-    test_id: Option<String>,
-) -> R<TestResult> {
-    api::test_connection(&state, config, secret, connection_id, ssh_secret, test_id).await
-}
-
-#[tauri::command]
-fn cancel_test_connection(state: State<'_, AppState>, test_id: String) -> bool {
-    api::cancel_test_connection(&state, &test_id)
-}
-
-#[tauri::command]
-async fn move_to_folder(state: State<'_, AppState>, kind: FolderKind, item_id: String, folder_id: Option<String>) -> R<()> {
-    api::move_to_folder(&state, kind, &item_id, folder_id)
-}
-
-// ---- outputs
-#[tauri::command]
-async fn list_outputs(state: State<'_, AppState>) -> R<Vec<api::OutputInfo>> {
-    Ok(api::list_outputs(&state))
-}
-#[tauri::command]
-async fn get_output(state: State<'_, AppState>, reference: String) -> R<api::OutputInfo> {
-    api::get_output(&state, &reference)
-}
-#[tauri::command]
-async fn load_output(state: State<'_, AppState>, reference: String) -> R<api::OutputInfo> {
-    api::load_output(&state, reference).await
-}
-#[tauri::command]
-async fn rename_output(state: State<'_, AppState>, handle: String, name: Option<String>) -> R<api::OutputInfo> {
-    api::rename_output(&state, &handle, name)
-}
-#[tauri::command]
-async fn pin_output(state: State<'_, AppState>, handle: String, pinned: bool) -> R<api::OutputInfo> {
-    api::pin_output(&state, handle, pinned).await
-}
-#[tauri::command]
-async fn output_diff_sql(state: State<'_, AppState>, before: String, after: String, keys: Vec<String>, mapping: Option<Vec<(String, String)>>, exact: Option<bool>) -> R<String> {
-    api::output_diff_sql(&state, &before, &after, keys, mapping.unwrap_or_default(), exact.unwrap_or(false))
-}
-#[tauri::command]
-async fn results_connection(state: State<'_, AppState>) -> R<String> {
-    api::results_connection(&state)
-}
-#[tauri::command]
-async fn chart_data(
-    state: State<'_, AppState>,
-    result_id: String,
-    view: ViewSpec,
-    spec: databrain_result_store::ChartSpec,
-) -> R<databrain_result_store::ChartData> {
-    api::chart_data(&state, result_id, view, spec).await
-}
-
-// ---- notebooks
-#[tauri::command]
-async fn list_jobs(state: State<'_, AppState>) -> R<api::JobListing> {
-    api::list_jobs(&state)
-}
-
-#[tauri::command]
-async fn get_job(state: State<'_, AppState>, id: String) -> R<databrain_workspace::Job> {
-    api::get_job(&state, &id)
-}
-
-#[tauri::command]
-async fn save_job(state: State<'_, AppState>, job: databrain_workspace::Job) -> R<databrain_workspace::Job> {
-    api::save_job(&state, job)
-}
-
-#[tauri::command]
-async fn delete_job(state: State<'_, AppState>, id: String) -> R<()> {
-    api::delete_job(&state, &id)
-}
-
-#[tauri::command]
-async fn run_job(state: State<'_, AppState>, id: String, nodes: Option<Vec<String>>) -> R<databrain_workspace::JobRun> {
-    api::run_job(&state, &id, nodes)
-}
-
-#[tauri::command]
-async fn resume_job(state: State<'_, AppState>, id: String) -> R<databrain_workspace::JobRun> {
-    api::resume_job(&state, &id)
-}
-
-#[tauri::command]
-async fn cancel_job(state: State<'_, AppState>, id: String) -> R<bool> {
-    Ok(api::cancel_job(&state, &id))
-}
-#[tauri::command]
-async fn cancel_job_step(state: State<'_, AppState>, id: String, node_id: String) -> R<bool> {
-    Ok(api::cancel_job_step(&state, &id, &node_id))
-}
-
-/// INSERT batch sizes a connection type allows (load steps).
-#[tauri::command]
-async fn load_batch_limits(kind: databrain_connector_core::ConnectorKind) -> R<databrain_export::load::BatchLimits> {
-    Ok(databrain_export::load::batch_limits(kind))
-}
-
-/// Check a load step without keeping any change.
-#[tauri::command]
-async fn dry_run_job_step(state: State<'_, AppState>, job: databrain_workspace::Job, node_id: String) -> R<databrain_query_engine::LoadDryRun> {
-    api::dry_run_job_step(&state, job, &node_id).await
-}
-
-/// What else uses an output name (for a step of job `job_id`), or null.
-#[tauri::command]
-async fn output_name_user(state: State<'_, AppState>, name: String, job_id: String) -> R<Option<String>> {
-    api::output_name_user(&state, &name, &job_id)
-}
-
-/// Folder export steps use when they have none (Downloads).
-#[tauri::command]
-async fn default_export_folder() -> R<Option<String>> {
-    Ok(dirs::download_dir().or_else(|| dirs::home_dir().map(|h| h.join("Downloads"))).map(|d| d.to_string_lossy().into_owned()))
-}
-
-/// Show the file an export step last wrote in Finder/Explorer. Only files
-/// recorded by the job are revealed (not arbitrary paths).
-#[tauri::command]
-async fn reveal_job_file(app: AppHandle, state: State<'_, AppState>, job_id: String, node_id: String) -> R<()> {
-    use tauri_plugin_opener::OpenerExt;
-    let job = state.workspace.get_job(&job_id)?;
-    let file = job
-        .nodes
-        .iter()
-        .find(|n| n.id == node_id)
-        .and_then(|n| n.last_run.as_ref())
-        .and_then(|r| r.file.clone())
-        .ok_or_else(|| EngineError::new("not_found", "This step hasn't written a file yet"))?;
-    if !std::path::Path::new(&file).exists() {
-        return Err(EngineError::new("not_found", format!("{file} no longer exists")));
-    }
-    app.opener().reveal_item_in_dir(&file).map_err(|e| EngineError::new("internal", e.to_string()))
-}
-
-#[tauri::command]
-async fn job_run_log(state: State<'_, AppState>, id: String, run_id: i64) -> R<Vec<databrain_workspace::RunLogEntry>> {
-    api::job_run_log(&state, &id, run_id)
-}
-
-#[tauri::command]
-async fn job_runs(state: State<'_, AppState>, id: String, limit: Option<i64>) -> R<Vec<databrain_workspace::JobRun>> {
-    api::job_runs(&state, &id, limit)
-}
-
-#[tauri::command]
-async fn list_notebooks(state: State<'_, AppState>) -> R<Vec<databrain_workspace::NotebookSummary>> {
-    api::list_notebooks(&state)
-}
-#[tauri::command]
-async fn get_notebook(state: State<'_, AppState>, id: String) -> R<databrain_workspace::Notebook> {
-    api::get_notebook(&state, &id)
-}
-#[tauri::command]
-async fn save_notebook(state: State<'_, AppState>, notebook: databrain_workspace::Notebook) -> R<databrain_workspace::Notebook> {
-    api::save_notebook(&state, notebook)
-}
-#[tauri::command]
-async fn delete_notebook(state: State<'_, AppState>, id: String) -> R<()> {
-    api::delete_notebook(&state, &id)
-}
-#[tauri::command]
-async fn file_scan_sql(path: String, all_sheets: Option<bool>) -> R<String> {
-    #[cfg(feature = "duckdb-engine")]
-    return api::file_scan_sql(&path, all_sheets.unwrap_or(false));
-    #[cfg(not(feature = "duckdb-engine"))]
-    Err(databrain_query_engine::EngineError::new("invalid", format!("DuckDB support is not built in ({path})")))
-}
-#[tauri::command]
-async fn excel_sheets(path: String) -> R<Vec<api::ExcelSheet>> {
-    #[cfg(feature = "duckdb-engine")]
-    return api::excel_sheets(&path);
-    #[cfg(not(feature = "duckdb-engine"))]
-    Err(databrain_query_engine::EngineError::new("invalid", format!("DuckDB support is not built in ({path})")))
-}
-
-// ---- sign-in
-#[tauri::command]
-async fn sign_in(state: State<'_, AppState>, id: String) -> R<databrain_auth::AuthStatus> {
-    ai_api::sign_in(&state, &id).await
-}
-#[tauri::command]
-async fn sign_out(state: State<'_, AppState>, id: String) -> R<()> {
-    ai_api::sign_out(&state, &id).await
-}
-#[tauri::command]
-async fn auth_status(state: State<'_, AppState>, id: String) -> R<databrain_auth::AuthStatus> {
-    ai_api::auth_status(&state, &id)
-}
-#[tauri::command]
-async fn cancel_sign_in(state: State<'_, AppState>) -> R<()> {
-    ai_api::cancel_sign_in(&state);
-    Ok(())
-}
-
-// ---- AI providers
-#[tauri::command]
-async fn ai_list_providers(state: State<'_, AppState>) -> R<Vec<ai_api::ProviderView>> {
-    ai_api::list_providers(&state)
-}
-#[tauri::command]
-async fn ai_save_provider(state: State<'_, AppState>, args: ai_api::SaveProviderArgs) -> R<databrain_workspace::AiProviderRecord> {
-    ai_api::save_provider(&state, args)
-}
-#[tauri::command]
-async fn ai_delete_provider(state: State<'_, AppState>, id: String) -> R<()> {
-    ai_api::delete_provider(&state, &id)
-}
-#[tauri::command]
-async fn ai_list_models(state: State<'_, AppState>, id: String) -> R<Vec<databrain_ai::ModelInfo>> {
-    ai_api::list_models(&state, &id).await
-}
-#[tauri::command]
-async fn ai_provider_sign_in(state: State<'_, AppState>, id: String) -> R<()> {
-    ai_api::provider_sign_in(&state, &id).await
-}
-
-#[tauri::command]
-async fn ai_provider_status(state: State<'_, AppState>, id: String) -> R<databrain_ai::kiro::KiroStatus> {
-    ai_api::provider_status(&state, &id).await
-}
-/// Open a provider's billing page in the browser (https only).
-#[tauri::command]
-async fn open_link(app: AppHandle, url: String) -> R<()> {
-    use tauri_plugin_opener::OpenerExt;
-    if !url.starts_with("https://") {
-        return Err(EngineError::new("invalid", "only https links can be opened"));
-    }
-    app.opener().open_url(url, None::<&str>).map_err(|e| EngineError::new("internal", e.to_string()))
-}
-#[tauri::command]
-async fn ai_provider_usage(state: State<'_, AppState>, id: String, since_day: i64, since_month: i64) -> R<ai_api::ProviderUsage> {
-    ai_api::provider_usage(&state, &id, since_day, since_month).await
-}
-/// DuckDB engine: bundled, or the system library (found or not).
-#[tauri::command]
-async fn duckdb_engine_status() -> R<serde_json::Value> {
-    #[cfg(feature = "duckdb-engine")]
-    return Ok(serde_json::to_value(databrain_connector_duckdb::engine_status()).unwrap_or_default());
-    #[cfg(not(feature = "duckdb-engine"))]
-    Ok(serde_json::json!({"bundled": false, "available": false, "error": "DuckDB support is not built in", "tried": [], "file_name": ""}))
-}
-/// Look for the DuckDB library again, or at `path` (file or folder).
-#[tauri::command]
-async fn duckdb_engine_load(state: State<'_, AppState>, path: Option<String>) -> R<serde_json::Value> {
-    #[cfg(feature = "duckdb-engine")]
-    return Ok(serde_json::to_value(api::load_duckdb_engine(&state, path)?).unwrap_or_default());
-    #[cfg(not(feature = "duckdb-engine"))]
-    {
-        let _ = (state, path);
-        Err(databrain_query_engine::EngineError::new("unsupported", "DuckDB support is not built in"))
-    }
-}
-#[tauri::command]
-async fn terminal_options() -> R<Vec<databrain_auth::terminal::TerminalOption>> {
-    Ok(databrain_auth::terminal::options())
-}
-#[tauri::command]
-async fn terminal_test(setting: databrain_auth::terminal::TerminalSetting) -> R<databrain_auth::terminal::Launch> {
-    Ok(ai_api::terminal_test(setting).await)
-}
-#[tauri::command]
-async fn ai_provider_sign_out(state: State<'_, AppState>, id: String) -> R<()> {
-    ai_api::provider_sign_out(&state, &id).await
-}
-
-// ---- AI agent
-#[tauri::command]
-async fn ai_send(state: State<'_, AppState>, args: ai_api::AiSendArgs) -> R<String> {
-    ai_api::ai_send(&state, args)
-}
-#[tauri::command]
-async fn ai_cancel(state: State<'_, AppState>, run_id: String) -> R<bool> {
-    Ok(ai_api::ai_cancel(&state, &run_id))
-}
-#[tauri::command]
-async fn ai_respond(state: State<'_, AppState>, request_id: String, response: serde_json::Value) -> R<bool> {
-    Ok(ai_api::ai_respond(&state, &request_id, response))
-}
-#[tauri::command]
-async fn ai_sessions(state: State<'_, AppState>, connection_id: Option<String>) -> R<Vec<databrain_workspace::AiSessionRecord>> {
-    ai_api::list_sessions(&state, connection_id)
-}
-#[tauri::command]
-async fn ai_session_messages(state: State<'_, AppState>, session_id: String) -> R<Vec<databrain_workspace::AiMessageRecord>> {
-    ai_api::session_messages(&state, &session_id)
-}
-#[tauri::command]
-async fn ai_delete_session(state: State<'_, AppState>, id: String) -> R<()> {
-    ai_api::delete_session(&state, &id)
-}
-#[tauri::command]
-async fn ai_audit(state: State<'_, AppState>) -> R<Vec<databrain_workspace::AuditEntry>> {
-    ai_api::list_audit(&state)
-}
-#[tauri::command]
-async fn mcp_config() -> R<serde_json::Value> {
-    Ok(ai_api::mcp_config())
-}
-
-// ---- knowledge
-#[tauri::command]
-async fn kn_get(state: State<'_, AppState>, connection_id: String) -> R<ai_api::KnowledgeView> {
-    ai_api::knowledge(&state, &connection_id)
-}
-#[tauri::command]
-async fn kn_objects(state: State<'_, AppState>, connection_id: String, filter: String, offset: usize, limit: usize) -> R<ai_api::KnObjectPage> {
-    ai_api::knowledge_objects(&state, &connection_id, &filter, offset, limit)
-}
-#[tauri::command]
-async fn kn_index(state: State<'_, AppState>, connection_id: String, scope: Option<Vec<String>>, batch: Option<u32>, full: Option<bool>) -> R<()> {
-    ai_api::index_knowledge(&state, &connection_id, scope, batch, full.unwrap_or(false))
-}
-#[tauri::command]
-async fn drop_output(state: State<'_, AppState>, reference: String) -> R<databrain_query_engine::outputs::OutputInfo> {
-    api::drop_output(&state, reference).await
-}
-#[tauri::command]
-async fn drop_unpinned_outputs(state: State<'_, AppState>) -> R<usize> {
-    api::drop_unpinned_outputs(&state).await
-}
-/// Thin Oracle driver: installed or not, and what to download by hand.
-#[tauri::command]
-async fn oracle_agent_info() -> R<serde_json::Value> {
-    #[cfg(feature = "oracle")]
-    return Ok(serde_json::to_value(databrain_connector_oracle::agent::info()).unwrap_or_default());
-    #[cfg(not(feature = "oracle"))]
-    Err(databrain_query_engine::EngineError::new("unsupported", "Oracle is not enabled in this build"))
-}
-/// Install the thin driver from a downloaded file (checked against the built-in SHA-256).
-#[tauri::command]
-async fn oracle_agent_install_file(path: String) -> R<serde_json::Value> {
-    #[cfg(feature = "oracle")]
-    {
-        let p = std::path::PathBuf::from(path);
-        tokio::task::spawn_blocking(move || databrain_connector_oracle::agent::install_from_file(&p))
-            .await
-            .map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?
-            .map_err(databrain_query_engine::EngineError::from)?;
-        Ok(serde_json::to_value(databrain_connector_oracle::agent::info()).unwrap_or_default())
-    }
-    #[cfg(not(feature = "oracle"))]
-    {
-        let _ = path;
-        Err(databrain_query_engine::EngineError::new("unsupported", "Oracle is not enabled in this build"))
-    }
-}
-#[tauri::command]
-async fn oracle_client_status(app: tauri::AppHandle, state: State<'_, AppState>, lib_dir: Option<String>) -> R<serde_json::Value> {
-    #[cfg(feature = "oracle")]
-    {
-        let st = api::oracle_client_status(&state, lib_dir, app.path().app_data_dir().ok()).await?;
-        Ok(serde_json::to_value(st).unwrap_or_default())
-    }
-    #[cfg(not(feature = "oracle"))]
-    {
-        let _ = (app, state, lib_dir);
-        Err(databrain_query_engine::EngineError::new("unsupported", "Oracle is not enabled in this build"))
-    }
-}
-#[tauri::command]
-async fn oracle_install_client(app: tauri::AppHandle, state: State<'_, AppState>) -> R<serde_json::Value> {
-    #[cfg(feature = "oracle")]
-    {
-        let dir = app.path().app_data_dir().map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?;
-        let st = api::oracle_install_client(&state, dir).await?;
-        Ok(serde_json::to_value(st).unwrap_or_default())
-    }
-    #[cfg(not(feature = "oracle"))]
-    {
-        let _ = (app, state);
-        Err(databrain_query_engine::EngineError::new("unsupported", "Oracle is not enabled in this build"))
-    }
-}
-#[tauri::command]
-async fn oracle_cancel_install() -> R<()> {
-    #[cfg(feature = "oracle")]
-    api::oracle_cancel_install();
-    Ok(())
-}
-/// Open Oracle's Instant Client download page for this platform (fixed URL).
-#[tauri::command]
-async fn oracle_open_download(state: State<'_, AppState>) -> R<()> {
-    #[cfg(feature = "oracle")]
-    {
-        let url = databrain_connector_oracle::client::platform().download_page;
-        state.ui.open_url(url).map_err(|e| databrain_query_engine::EngineError::new("internal", e))
-    }
-    #[cfg(not(feature = "oracle"))]
-    {
-        let _ = state;
-        Err(databrain_query_engine::EngineError::new("unsupported", "Oracle is not enabled in this build"))
-    }
-}
-#[tauri::command]
-async fn credential_store(state: State<'_, AppState>) -> R<api::CredentialStoreView> {
-    Ok(api::credential_store(&state))
-}
-#[tauri::command]
-async fn set_credential_store(state: State<'_, AppState>, kind: databrain_auth::StoreKind) -> R<databrain_auth::MigrationReport> {
-    api::set_credential_store(&state, kind).await
-}
-#[tauri::command]
-async fn kn_plan(state: State<'_, AppState>, connection_id: String) -> R<databrain_ai::knowledge::IndexPlan> {
-    ai_api::knowledge_plan(&state, &connection_id).await
-}
-#[tauri::command]
-async fn kn_cancel(state: State<'_, AppState>, connection_id: String) -> R<bool> {
-    Ok(ai_api::cancel_index(&state, &connection_id))
-}
-#[tauri::command]
-async fn kn_save_note(state: State<'_, AppState>, note: databrain_workspace::KnNote) -> R<databrain_workspace::KnNote> {
-    ai_api::save_note(&state, note).await
-}
-#[tauri::command]
-async fn hint_layouts(state: State<'_, AppState>, connection_id: String, tables: Vec<String>) -> R<Vec<ai_api::HintLayout>> {
-    ai_api::hint_layouts(&state, &connection_id, tables).await
-}
-#[tauri::command]
-async fn kn_check_target(state: State<'_, AppState>, connection_id: String, target: String) -> R<ai_api::TargetCheck> {
-    Ok(ai_api::check_target(&state, &connection_id, &target).await)
-}
-#[tauri::command]
-async fn kn_delete_note(state: State<'_, AppState>, id: String) -> R<()> {
-    ai_api::delete_note(&state, &id)
-}
-#[tauri::command]
-async fn kn_export_notes(state: State<'_, AppState>, connection_id: String, path: String) -> R<usize> {
-    ai_api::export_notes(&state, &connection_id, &path)
-}
-#[tauri::command]
-async fn kn_read_notes_file(state: State<'_, AppState>, connection_id: String, path: String) -> R<ai_api::NotesImportPreview> {
-    ai_api::read_notes_file(&state, &connection_id, &path).await
-}
-#[tauri::command]
-async fn kn_import_notes(state: State<'_, AppState>, connection_id: String, actions: Vec<databrain_workspace::ImportAction>) -> R<usize> {
-    ai_api::import_notes(&state, &connection_id, actions).await
-}
-#[tauri::command]
-async fn kn_clear(state: State<'_, AppState>, connection_id: String) -> R<()> {
-    ai_api::clear_knowledge(&state, &connection_id)
-}
-
-#[tauri::command]
-async fn connect(state: State<'_, AppState>, id: String) -> R<String> {
-    api::connect(&state, &id).await
-}
-
-#[tauri::command]
-async fn disconnect(state: State<'_, AppState>, id: String) -> R<()> {
-    api::disconnect(&state, &id);
-    Ok(())
-}
-
-#[tauri::command]
-async fn list_schemas(state: State<'_, AppState>, id: String) -> R<Vec<SchemaInfo>> {
-    api::list_schemas(&state, &id).await
-}
-
-#[tauri::command]
-async fn list_objects(state: State<'_, AppState>, id: String, schema: String) -> R<Vec<DbObject>> {
-    api::list_objects(&state, &id, &schema).await
-}
-
-#[tauri::command]
-async fn list_catalogs(state: State<'_, AppState>, id: String) -> R<Option<Vec<databrain_connector_core::CatalogInfo>>> {
-    api::list_catalogs(&state, &id).await
-}
-
-#[tauri::command]
-async fn list_catalog_schemas(state: State<'_, AppState>, id: String, catalog: String) -> R<Vec<SchemaInfo>> {
-    api::list_catalog_schemas(&state, &id, &catalog).await
-}
-
-#[tauri::command]
-fn cached_explorer(state: State<'_, AppState>, id: String) -> R<api::CachedExplorer> {
-    api::cached_explorer(&state, &id)
-}
-
-#[tauri::command]
-fn cached_objects(state: State<'_, AppState>, id: String, schema: String) -> R<Option<databrain_workspace::CachedListing>> {
-    api::cached_objects(&state, &id, &schema)
-}
-
-#[tauri::command]
-fn cached_columns(state: State<'_, AppState>, id: String, schema: String, name: String) -> R<Option<databrain_workspace::CachedColumns>> {
-    api::cached_columns(&state, &id, &schema, &name)
-}
-
-#[tauri::command]
-async fn clear_explorer_cache(state: State<'_, AppState>, id: String) -> R<()> {
-    api::clear_explorer_cache(&state, &id).await
-}
-
-#[tauri::command]
-async fn refresh_schema(state: State<'_, AppState>, id: String, schema: String) -> R<api::SchemaRefresh> {
-    api::refresh_schema(&state, &id, &schema).await
-}
-
-#[tauri::command]
-async fn revalidate_explorer(state: State<'_, AppState>, id: String, open: Vec<String>, force: bool) -> R<api::ExplorerRevalidation> {
-    api::revalidate_explorer(&state, &id, &open, force).await
-}
-
-#[tauri::command]
-fn complete_tables_local(state: State<'_, AppState>, id: String, schema: Option<String>, query: String, limit: usize) -> R<Vec<DbObject>> {
-    api::complete_tables_local(&state, &id, schema.as_deref(), &query, limit)
-}
-#[tauri::command]
-async fn complete_tables(state: State<'_, AppState>, id: String, schema: Option<String>, query: String, limit: usize) -> R<Vec<DbObject>> {
-    api::complete_tables(&state, &id, schema.as_deref(), &query, limit).await
-}
-#[tauri::command]
-fn complete_routines_local(state: State<'_, AppState>, id: String, schema: Option<String>, query: String, limit: usize) -> R<Vec<DbObject>> {
-    api::complete_routines_local(&state, &id, schema.as_deref(), &query, limit)
-}
-#[tauri::command]
-async fn complete_routines(state: State<'_, AppState>, id: String, schema: Option<String>, query: String, limit: usize) -> R<Vec<DbObject>> {
-    api::complete_routines(&state, &id, schema.as_deref(), &query, limit).await
-}
-#[tauri::command]
-async fn object_ddl(state: State<'_, AppState>, id: String, schema: String, name: String, kind: databrain_connector_core::ObjectKind) -> R<Option<String>> {
-    api::object_ddl(&state, &id, &schema, &name, kind).await
-}
-#[tauri::command]
-async fn package_members(state: State<'_, AppState>, id: String, schema: String, package: String) -> R<Vec<DbObject>> {
-    api::package_members(&state, &id, &schema, &package).await
-}
-#[tauri::command]
-fn complete_columns_local(state: State<'_, AppState>, id: String, schema: String, name: String) -> R<Option<Vec<String>>> {
-    api::complete_columns_local(&state, &id, &schema, &name)
-}
-#[tauri::command]
-async fn search_objects(state: State<'_, AppState>, id: String, query: String, limit: Option<usize>) -> R<Vec<DbObject>> {
-    api::search_objects(&state, &id, &query, limit).await
-}
-
-#[tauri::command]
-async fn describe_object(
-    state: State<'_, AppState>,
-    id: String,
-    schema: String,
-    name: String,
-) -> R<ObjectDetail> {
-    api::describe(&state, &id, &schema, &name).await
-}
-
-#[tauri::command]
-async fn table_layout(state: State<'_, AppState>, id: String, schema: String, name: String) -> R<databrain_connector_core::TableLayout> {
-    api::table_layout(&state, &id, &schema, &name).await
-}
-
-#[tauri::command]
-async fn sql_lineage(
-    state: State<'_, AppState>,
-    connection_id: Option<String>,
-    kind: ConnectorKind,
-    sql: String,
-    params: Option<std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>>,
-    check: bool,
-) -> R<api::LineageView> {
-    api::lineage(&state, connection_id.as_deref(), kind, &sql, params.unwrap_or_default(), check).await
-}
-
-#[tauri::command]
-fn save_text_file(path: String, contents: String) -> R<()> {
-    api::save_text_file(&path, &contents)
-}
-
-#[tauri::command]
-fn save_base64_file(path: String, data: String) -> R<()> {
-    api::save_base64_file(&path, &data)
-}
-
-#[tauri::command]
-fn sql_parameters(kind: ConnectorKind, text: String) -> Vec<api::ParamSpanView> {
-    api::sql_parameters(kind, &text)
-}
-
-#[tauri::command]
-fn preview_parameters(
-    kind: ConnectorKind,
-    values: std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>,
-) -> std::collections::HashMap<String, Option<String>> {
-    api::preview_parameters(kind, values)
-}
-
-#[tauri::command]
-async fn edit_target(state: State<'_, AppState>, result_id: String) -> R<databrain_query_engine::edit::EditTarget> {
-    api::edit_target(&state, &result_id).await
-}
-#[tauri::command]
-fn edit_preview(
-    state: State<'_, AppState>,
-    result_id: String,
-    target: databrain_query_engine::edit::EditTarget,
-    changes: Vec<databrain_query_engine::edit::RowChange>,
-) -> R<Vec<databrain_query_engine::edit::EditStatement>> {
-    api::edit_preview(&state, &result_id, &target, &changes)
-}
-#[tauri::command]
-async fn apply_edits(state: State<'_, AppState>, result_id: String, changes: Vec<databrain_query_engine::edit::RowChange>) -> R<databrain_query_engine::edit::ApplyReport> {
-    api::apply_edits(&state, &result_id, changes).await
-}
-#[tauri::command]
-async fn explain_plan(state: State<'_, AppState>, connection_id: String, session_key: String, sql: String, analyze: bool, params: Option<std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>>) -> R<databrain_query_engine::plan::QueryPlan> {
-    api::explain_plan(&state, &connection_id, &session_key, &sql, analyze, &params.unwrap_or_default()).await
-}
-#[tauri::command]
-async fn schema_diff(state: State<'_, AppState>, source: databrain_query_engine::schema_diff::SchemaSide, target: databrain_query_engine::schema_diff::SchemaSide) -> R<databrain_query_engine::schema_diff::SchemaDiff> {
-    api::schema_diff(&state, &source, &target).await
-}
-#[tauri::command]
-async fn result_links(state: State<'_, AppState>, result_id: String) -> R<Vec<databrain_query_engine::related::ResultLink>> {
-    api::result_links(&state, &result_id).await
-}
-#[tauri::command]
-fn related_rows_sql(state: State<'_, AppState>, result_id: String, link: databrain_query_engine::related::ResultLink, rows: Vec<Vec<Option<String>>>) -> R<String> {
-    api::related_rows_sql(&state, &result_id, &link, &rows)
-}
-
-#[tauri::command]
-async fn load_result(state: State<'_, AppState>, result_id: String, args: api::LoadResultArgs, load_id: String) -> R<databrain_query_engine::LoadReport> {
-    api::load_result(&state, &result_id, args, &load_id).await
-}
-#[tauri::command]
-fn cancel_load(load_id: String) -> bool {
-    api::cancel_load(&load_id)
-}
-#[tauri::command]
-async fn dry_run_result_load(state: State<'_, AppState>, result_id: String, args: api::LoadResultArgs) -> R<databrain_query_engine::LoadDryRun> {
-    api::dry_run_result_load(&state, &result_id, args).await
-}
-#[tauri::command]
-async fn check_load_target(state: State<'_, AppState>, connection_id: String, table: String) -> R<databrain_query_engine::LoadTarget> {
-    api::check_load_target(&state, &connection_id, &table).await
-}
-
-#[tauri::command]
-async fn summarize_selection(
-    state: State<'_, AppState>,
-    result_id: String,
-    view: ViewSpec,
-    columns: Vec<usize>,
-    offset: usize,
-    limit: usize,
-) -> R<databrain_result_store::SelectionSummary> {
-    api::summarize_selection(&state, result_id, view, columns, offset, limit).await
-}
-
-#[tauri::command]
-async fn statement_at_cursor(kind: ConnectorKind, text: String, cursor: usize) -> R<Option<Span>> {
-    Ok(api::statement_at_cursor(kind, &text, cursor))
-}
-/// Every statement of an editor text (next/previous statement keys).
-#[tauri::command]
-async fn statement_spans(kind: ConnectorKind, text: String) -> R<Vec<Span>> {
-    Ok(api::statement_spans(kind, &text))
-}
-
-#[tauri::command]
-async fn run_query(state: State<'_, AppState>, req: RunRequest) -> R<RunResponse> {
-    api::run_query(&state, req)
-}
-
-#[tauri::command]
-async fn cancel_query(state: State<'_, AppState>, job_id: String) -> R<bool> {
-    Ok(api::cancel_query(&state, &job_id))
-}
-
-#[tauri::command]
-async fn close_tab(state: State<'_, AppState>, tab_id: String) -> R<()> {
-    api::close_tab(&state, &tab_id);
-    Ok(())
-}
-
-#[tauri::command]
-fn export_connections(state: State<'_, AppState>, ids: Option<Vec<String>>, path: String) -> R<usize> {
-    conn_io::export_connections(&state, ids, &path)
-}
-
-#[tauri::command]
-fn import_connections_preview(state: State<'_, AppState>, source: conn_io::ImportSource, path: Option<String>) -> R<conn_io::ImportPreview> {
-    conn_io::import_preview(&state, source, path)
-}
-
-#[tauri::command]
-fn import_connections(state: State<'_, AppState>, source: conn_io::ImportSource, path: Option<String>, picks: Vec<usize>) -> R<conn_io::ImportReport> {
-    conn_io::import_apply(&state, source, path, &picks)
-}
-
-#[tauri::command]
-async fn read_sql_file(path: String) -> R<sql_files::SqlFile> {
-    tauri::async_runtime::spawn_blocking(move || sql_files::read_sql_file(&path)).await.map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?
-}
-
-#[tauri::command]
-async fn write_sql_file(path: String, text: String, expected_mtime: Option<i64>) -> R<i64> {
-    tauri::async_runtime::spawn_blocking(move || sql_files::write_sql_file(&path, &text, expected_mtime)).await.map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?
-}
-
-/// Modification times of files (null: gone), to notice outside changes.
-#[tauri::command]
-async fn sql_file_mtimes(paths: Vec<String>) -> R<Vec<Option<i64>>> {
-    tauri::async_runtime::spawn_blocking(move || paths.iter().map(|p| sql_files::file_mtime(p)).collect()).await.map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))
-}
-
-#[tauri::command]
-fn set_auto_commit(state: State<'_, AppState>, tab_id: String, on: bool) {
-    api::set_auto_commit(&state, &tab_id, on);
-}
-
-#[tauri::command]
-fn transaction_state(state: State<'_, AppState>, connection_id: String, session_key: String) -> bool {
-    api::transaction_state(&state, &connection_id, &session_key)
-}
-
-#[tauri::command]
-async fn end_transaction(state: State<'_, AppState>, connection_id: String, session_key: String, commit: bool) -> R<bool> {
-    api::end_transaction(&state, &connection_id, &session_key, commit).await
-}
-
-#[tauri::command]
-async fn result_info(state: State<'_, AppState>, result_id: String) -> R<ResultInfo> {
-    api::result_info(&state, &result_id)
-}
-
-#[tauri::command]
-async fn fetch_page(
-    state: State<'_, AppState>,
-    result_id: String,
-    view: ViewSpec,
-    offset: usize,
-    limit: usize,
-) -> R<Page> {
-    api::fetch_page(&state, result_id, view, offset, limit).await
-}
-
-#[tauri::command]
-async fn find_in_result(
-    state: State<'_, AppState>,
-    result_id: String,
-    view: ViewSpec,
-    query: String,
-    columns: Option<Vec<usize>>,
-    limit: usize,
-    whole_word: Option<bool>,
-) -> R<FindResult> {
-    api::find_in_result(&state, result_id, view, query, columns, limit, whole_word.unwrap_or(false)).await
-}
-
-#[tauri::command]
-async fn column_stats(
-    state: State<'_, AppState>,
-    result_id: String,
-    view: ViewSpec,
-    column: usize,
-) -> R<ColumnStats> {
-    api::column_stats(&state, result_id, view, column).await
-}
-
-#[tauri::command]
-async fn export_result(
-    state: State<'_, AppState>,
-    result_id: String,
-    view: ViewSpec,
-    options: ExportOptions,
-    path: String,
-) -> R<u64> {
-    api::export_result(&state, result_id, view, options, path).await
-}
-
-/// Export every row of a result's query (run again without the row limit).
-#[tauri::command]
-async fn export_full_result(state: State<'_, AppState>, result_id: String, options: ExportOptions, path: String, export_id: String) -> R<u64> {
-    api::export_full_result(&state, &result_id, options, path, &export_id).await
-}
-
-#[tauri::command]
-async fn cancel_export(state: State<'_, AppState>, export_id: String) -> R<bool> {
-    Ok(state.engine.cancel_export(&export_id))
-}
-
 /// The running DataBrain.app when it is inside the Downloads folder (macOS):
 /// launching it from there makes macOS ask for Downloads access, because the
 /// app reads its own bundle. `None` elsewhere.
@@ -889,163 +73,6 @@ fn bundle_in_downloads() -> Option<std::path::PathBuf> {
     }
     let downloads = dirs::download_dir().or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))?;
     bundle.starts_with(&downloads).then_some(bundle)
-}
-
-#[tauri::command]
-async fn app_in_downloads() -> R<Option<String>> {
-    Ok(bundle_in_downloads().map(|p| p.to_string_lossy().into_owned()))
-}
-
-/// The latest DataBrain release compared with this app (None: no release found).
-#[tauri::command]
-async fn reveal_logs(app: AppHandle) -> R<()> {
-    use tauri_plugin_opener::OpenerExt;
-    let dir = logging::dir(&app.path().app_data_dir().map_err(|e| EngineError::new("internal", e.to_string()))?);
-    std::fs::create_dir_all(&dir).map_err(|e| EngineError::new("internal", e.to_string()))?;
-    app.opener().reveal_item_in_dir(&dir).map_err(|e| EngineError::new("internal", e.to_string()))
-}
-
-#[tauri::command]
-async fn check_for_update(app: AppHandle) -> R<Option<updates::UpdateInfo>> {
-    let r = updates::check(&app.package_info().version.to_string()).await;
-    if let Err(e) = &r {
-        tracing::warn!(error = %e.message, "update check failed");
-    }
-    r
-}
-
-/// Scheduled jobs while the app is closed: on or off, installed, last pass.
-#[tauri::command]
-async fn background_jobs_status(app: AppHandle, state: State<'_, AppState>) -> R<background::BackgroundStatus> {
-    let dir = app.path().app_data_dir().map_err(|e| EngineError::new("internal", e.to_string()))?;
-    background::status(&state, &dir)
-}
-
-#[tauri::command]
-async fn set_background_jobs(app: AppHandle, state: State<'_, AppState>, on: bool) -> R<background::BackgroundStatus> {
-    let dir = app.path().app_data_dir().map_err(|e| EngineError::new("internal", e.to_string()))?;
-    background::set_enabled(&state, &dir, on)
-}
-
-/// Copy the app to /Applications, open that copy and quit this one. The copy
-/// in Downloads is left for the user to delete. `replace`: an existing
-/// /Applications/DataBrain.app is replaced (the UI asks first).
-#[tauri::command]
-async fn move_to_applications(app: AppHandle, replace: bool) -> R<()> {
-    let src = bundle_in_downloads().ok_or_else(|| EngineError::new("invalid", "DataBrain is not running from the Downloads folder"))?;
-    let name = src.file_name().map(|n| n.to_owned()).unwrap_or_else(|| "DataBrain.app".into());
-    let dst = std::path::Path::new("/Applications").join(name);
-    if dst.exists() {
-        if !replace {
-            return Err(EngineError::new("exists", format!("{} already exists", dst.display())));
-        }
-        std::fs::remove_dir_all(&dst).map_err(|e| EngineError::new("internal", format!("can't replace {}: {e}", dst.display())))?;
-    }
-    // ditto keeps the bundle's symlinks, permissions and attributes.
-    let out = tokio::process::Command::new("/usr/bin/ditto").arg(&src).arg(&dst).output().await.map_err(|e| EngineError::new("internal", e.to_string()))?;
-    if !out.status.success() {
-        return Err(EngineError::new("internal", format!("copying to Applications failed: {}", String::from_utf8_lossy(&out.stderr).trim())));
-    }
-    std::process::Command::new("/usr/bin/open").arg("-n").arg(&dst).spawn().map_err(|e| EngineError::new("internal", e.to_string()))?;
-    app.exit(0);
-    Ok(())
-}
-
-/// Show the file a finished full export wrote in Finder/Explorer. Only files
-/// written by an export of this session are revealed (not arbitrary paths).
-#[tauri::command]
-async fn reveal_export_file(app: AppHandle, state: State<'_, AppState>, export_id: String) -> R<()> {
-    use tauri_plugin_opener::OpenerExt;
-    let file = state.engine.exported_file(&export_id).ok_or_else(|| EngineError::new("not_found", "This export hasn't written a file"))?;
-    if !file.exists() {
-        return Err(EngineError::new("not_found", format!("{} no longer exists", file.display())));
-    }
-    app.opener().reveal_item_in_dir(&file).map_err(|e| EngineError::new("internal", e.to_string()))
-}
-
-#[tauri::command]
-async fn copy_rows(
-    state: State<'_, AppState>,
-    result_id: String,
-    view: ViewSpec,
-    offset: usize,
-    limit: usize,
-    options: ExportOptions,
-) -> R<String> {
-    api::copy_rows(&state, result_id, view, offset, limit, options).await
-}
-
-#[tauri::command]
-async fn release_result(state: State<'_, AppState>, result_id: String) -> R<bool> {
-    Ok(api::release_result(&state, &result_id))
-}
-
-#[tauri::command]
-async fn list_saved_queries(
-    state: State<'_, AppState>,
-    search: Option<String>,
-) -> R<Vec<SavedQuery>> {
-    api::list_saved_queries(&state, search)
-}
-
-#[tauri::command]
-async fn save_query(state: State<'_, AppState>, query: SavedQuery) -> R<SavedQuery> {
-    api::save_query(&state, query)
-}
-
-#[tauri::command]
-async fn delete_saved_query(state: State<'_, AppState>, id: String) -> R<()> {
-    api::delete_saved_query(&state, &id)
-}
-
-#[tauri::command]
-async fn list_folders(state: State<'_, AppState>, kind: FolderKind) -> R<Vec<Folder>> {
-    api::list_folders(&state, kind)
-}
-
-#[tauri::command]
-async fn save_folder(state: State<'_, AppState>, folder: Folder) -> R<Folder> {
-    api::save_folder(&state, folder)
-}
-
-#[tauri::command]
-async fn delete_folder(state: State<'_, AppState>, id: String) -> R<()> {
-    api::delete_folder(&state, &id)
-}
-
-#[tauri::command]
-async fn list_history(state: State<'_, AppState>, query: HistoryQuery) -> R<Vec<HistoryEntry>> {
-    api::list_history(&state, query)
-}
-
-#[tauri::command]
-async fn clear_history(state: State<'_, AppState>, what: Option<databrain_workspace::HistoryClear>) -> R<usize> {
-    api::clear_history(&state, what)
-}
-
-#[tauri::command]
-async fn delete_history_entry(state: State<'_, AppState>, id: i64) -> R<()> {
-    api::delete_history_entry(&state, id)
-}
-
-#[tauri::command]
-async fn load_tabs(state: State<'_, AppState>) -> R<Vec<TabState>> {
-    api::load_tabs(&state)
-}
-
-#[tauri::command]
-async fn save_tabs(state: State<'_, AppState>, tabs: Vec<TabState>) -> R<()> {
-    api::save_tabs(&state, tabs)
-}
-
-#[tauri::command]
-async fn get_settings(state: State<'_, AppState>) -> R<serde_json::Map<String, serde_json::Value>> {
-    api::get_settings(&state)
-}
-
-#[tauri::command]
-async fn set_setting(state: State<'_, AppState>, key: String, value: serde_json::Value) -> R<()> {
-    api::set_setting(&state, &key, value)
 }
 
 /// macOS menu bar. The default Tauri menu binds ⌘W to "Close Window"; the
@@ -1153,172 +180,172 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            list_connectors,
-            list_connections,
-            save_connection,
-            delete_connection,
-            test_connection,
-            cancel_test_connection,
-            connect,
-            disconnect,
-            list_schemas,
-            list_objects,
-            list_catalogs,
-            list_catalog_schemas,
-            cached_explorer,
-            cached_objects,
-            cached_columns,
-            clear_explorer_cache,
-            refresh_schema,
-            revalidate_explorer,
-            search_objects,
-            complete_tables_local,
-            complete_tables,
-            complete_columns_local,
-            complete_routines_local,
-            complete_routines,
-            package_members,
-            object_ddl,
-            describe_object,
-            table_layout,
-            statement_at_cursor,
-            statement_spans,
-            summarize_selection,
-            load_result,
-            edit_target,
-            edit_preview,
-            apply_edits,
-            result_links,
-            schema_diff,
-            explain_plan,
-            related_rows_sql,
-            cancel_load,
-            dry_run_result_load,
-            check_load_target,
-            sql_parameters,
-            sql_lineage,
-            save_text_file,
-            save_base64_file,
-            preview_parameters,
-            run_query,
-            cancel_query,
-            close_tab,
-            set_auto_commit,
-            read_sql_file,
-            export_connections,
-            import_connections_preview,
-            import_connections,
-            write_sql_file,
-            sql_file_mtimes,
-            transaction_state,
-            end_transaction,
-            result_info,
-            fetch_page,
-            find_in_result,
-            column_stats,
-            export_result,
-            export_full_result,
-            cancel_export,
-            reveal_export_file,
-            copy_rows,
-            release_result,
-            list_saved_queries,
-            save_query,
-            delete_saved_query,
-            list_folders,
-            save_folder,
-            delete_folder,
-            list_history,
-            delete_history_entry,
-            clear_history,
-            load_tabs,
-            save_tabs,
-            get_settings,
-            set_setting,
-            move_to_folder,
-            list_outputs,
-            get_output,
-            load_output,
-            rename_output,
-            pin_output,
-            output_diff_sql,
-            results_connection,
-            chart_data,
-            list_notebooks,
-            list_jobs,
-            get_job,
-            save_job,
-            delete_job,
-            run_job,
-            resume_job,
-            reveal_logs,
-            cancel_job,
-            cancel_job_step,
-            dry_run_job_step,
-            load_batch_limits,
-            job_run_log,
-            job_runs,
-            default_export_folder,
-            output_name_user,
-            reveal_job_file,
-            get_notebook,
-            save_notebook,
-            delete_notebook,
-            file_scan_sql,
-            excel_sheets,
-            sign_in,
-            sign_out,
-            auth_status,
-            cancel_sign_in,
-            ai_list_providers,
-            ai_save_provider,
-            ai_delete_provider,
-            ai_list_models,
-            ai_provider_sign_in,
-            ai_provider_status,
-            terminal_options,
-            duckdb_engine_status,
-            duckdb_engine_load,
-            ai_provider_usage,
-            open_link,
-            app_in_downloads,
-            check_for_update,
-            background_jobs_status,
-            set_background_jobs,
-            move_to_applications,
-            terminal_test,
-            ai_provider_sign_out,
-            ai_send,
-            ai_cancel,
-            ai_respond,
-            ai_sessions,
-            ai_session_messages,
-            ai_delete_session,
-            ai_audit,
-            mcp_config,
-            kn_get,
-            kn_objects,
-            kn_index,
-            kn_plan,
-            credential_store,
-            set_credential_store,
-            oracle_client_status,
-            oracle_agent_info,
-            oracle_agent_install_file,
-            oracle_install_client,
-            oracle_open_download,
-            oracle_cancel_install,
-            drop_output,
-            drop_unpinned_outputs,
-            kn_cancel,
-            kn_save_note,
-            kn_delete_note,
-            kn_export_notes,
-            kn_check_target,
-            hint_layouts,
-            kn_read_notes_file,
-            kn_import_notes,
-            kn_clear,
+            commands::connections::list_connectors,
+            commands::connections::list_connections,
+            commands::connections::save_connection,
+            commands::connections::delete_connection,
+            commands::connections::test_connection,
+            commands::connections::cancel_test_connection,
+            commands::connections::connect,
+            commands::connections::disconnect,
+            commands::explorer::list_schemas,
+            commands::explorer::list_objects,
+            commands::explorer::list_catalogs,
+            commands::explorer::list_catalog_schemas,
+            commands::explorer::cached_explorer,
+            commands::explorer::cached_objects,
+            commands::explorer::cached_columns,
+            commands::explorer::clear_explorer_cache,
+            commands::explorer::refresh_schema,
+            commands::explorer::revalidate_explorer,
+            commands::explorer::search_objects,
+            commands::explorer::complete_tables_local,
+            commands::explorer::complete_tables,
+            commands::explorer::complete_columns_local,
+            commands::explorer::complete_routines_local,
+            commands::explorer::complete_routines,
+            commands::explorer::package_members,
+            commands::explorer::object_ddl,
+            commands::explorer::describe_object,
+            commands::explorer::table_layout,
+            commands::queries::statement_at_cursor,
+            commands::queries::statement_spans,
+            commands::results::summarize_selection,
+            commands::results::load_result,
+            commands::results::edit_target,
+            commands::results::edit_preview,
+            commands::results::apply_edits,
+            commands::results::result_links,
+            commands::explorer::schema_diff,
+            commands::queries::explain_plan,
+            commands::results::related_rows_sql,
+            commands::results::cancel_load,
+            commands::results::dry_run_result_load,
+            commands::results::check_load_target,
+            commands::queries::sql_parameters,
+            commands::lineage::sql_lineage,
+            commands::queries::save_text_file,
+            commands::queries::save_base64_file,
+            commands::queries::preview_parameters,
+            commands::queries::run_query,
+            commands::queries::cancel_query,
+            commands::queries::close_tab,
+            commands::queries::set_auto_commit,
+            commands::queries::read_sql_file,
+            commands::connections::export_connections,
+            commands::connections::import_connections_preview,
+            commands::connections::import_connections,
+            commands::queries::write_sql_file,
+            commands::queries::sql_file_mtimes,
+            commands::queries::transaction_state,
+            commands::queries::end_transaction,
+            commands::results::result_info,
+            commands::results::fetch_page,
+            commands::results::find_in_result,
+            commands::results::column_stats,
+            commands::results::export_result,
+            commands::results::export_full_result,
+            commands::system::cancel_export,
+            commands::system::reveal_export_file,
+            commands::results::copy_rows,
+            commands::results::release_result,
+            commands::library::list_saved_queries,
+            commands::library::save_query,
+            commands::library::delete_saved_query,
+            commands::library::list_folders,
+            commands::library::save_folder,
+            commands::library::delete_folder,
+            commands::library::list_history,
+            commands::library::delete_history_entry,
+            commands::library::clear_history,
+            commands::library::load_tabs,
+            commands::library::save_tabs,
+            commands::library::get_settings,
+            commands::library::set_setting,
+            commands::connections::move_to_folder,
+            commands::outputs::list_outputs,
+            commands::outputs::get_output,
+            commands::outputs::load_output,
+            commands::outputs::rename_output,
+            commands::outputs::pin_output,
+            commands::outputs::output_diff_sql,
+            commands::outputs::results_connection,
+            commands::outputs::chart_data,
+            commands::library::list_notebooks,
+            commands::jobs::list_jobs,
+            commands::jobs::get_job,
+            commands::jobs::save_job,
+            commands::jobs::delete_job,
+            commands::jobs::run_job,
+            commands::jobs::resume_job,
+            commands::system::reveal_logs,
+            commands::jobs::cancel_job,
+            commands::jobs::cancel_job_step,
+            commands::jobs::dry_run_job_step,
+            commands::system::load_batch_limits,
+            commands::jobs::job_run_log,
+            commands::jobs::job_runs,
+            commands::system::default_export_folder,
+            commands::jobs::output_name_user,
+            commands::system::reveal_job_file,
+            commands::library::get_notebook,
+            commands::library::save_notebook,
+            commands::library::delete_notebook,
+            commands::explorer::file_scan_sql,
+            commands::explorer::excel_sheets,
+            commands::ai::sign_in,
+            commands::ai::sign_out,
+            commands::ai::auth_status,
+            commands::ai::cancel_sign_in,
+            commands::ai::ai_list_providers,
+            commands::ai::ai_save_provider,
+            commands::ai::ai_delete_provider,
+            commands::ai::ai_list_models,
+            commands::ai::ai_provider_sign_in,
+            commands::ai::ai_provider_status,
+            commands::system::terminal_options,
+            commands::system::duckdb_engine_status,
+            commands::drivers::duckdb_engine_load,
+            commands::ai::ai_provider_usage,
+            commands::system::open_link,
+            commands::system::app_in_downloads,
+            commands::system::check_for_update,
+            commands::jobs::background_jobs_status,
+            commands::jobs::set_background_jobs,
+            commands::system::move_to_applications,
+            commands::ai::terminal_test,
+            commands::ai::ai_provider_sign_out,
+            commands::ai::ai_send,
+            commands::ai::ai_cancel,
+            commands::ai::ai_respond,
+            commands::ai::ai_sessions,
+            commands::ai::ai_session_messages,
+            commands::ai::ai_delete_session,
+            commands::ai::ai_audit,
+            commands::ai::mcp_config,
+            commands::ai::kn_get,
+            commands::ai::kn_objects,
+            commands::ai::kn_index,
+            commands::ai::kn_plan,
+            commands::system::credential_store,
+            commands::system::set_credential_store,
+            commands::drivers::oracle_client_status,
+            commands::system::oracle_agent_info,
+            commands::system::oracle_agent_install_file,
+            commands::drivers::oracle_install_client,
+            commands::system::oracle_open_download,
+            commands::drivers::oracle_cancel_install,
+            commands::outputs::drop_output,
+            commands::outputs::drop_unpinned_outputs,
+            commands::ai::kn_cancel,
+            commands::ai::kn_save_note,
+            commands::ai::kn_delete_note,
+            commands::ai::kn_export_notes,
+            commands::ai::kn_check_target,
+            commands::ai::hint_layouts,
+            commands::ai::kn_read_notes_file,
+            commands::ai::kn_import_notes,
+            commands::ai::kn_clear,
         ])
         .build(tauri::generate_context!())
         .expect("error while building DataBrain")
