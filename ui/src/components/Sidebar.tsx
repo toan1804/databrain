@@ -70,7 +70,7 @@ import { CatalogSearch, selectTop } from "./CatalogSearch";
 import { CatalogMenu, ColumnMenu, ObjectMenu, SchemaMenu, copyText, insertColumns, insertText } from "./CatalogMenus";
 import { formatCount, formatDuration, relativeTime, sqlPreview, quoteIdent } from "../lib/util";
 import { useAi } from "../aiStore";
-import { DEFAULT_POLICY } from "./ConnectionDialog";
+import { DEFAULT_POLICY } from "./connection/parts";
 import { FolderTree, MoveToFolderItems, createFolder, dragProps } from "./FolderTree";
 import { OutputsPanel } from "./OutputsPanel";
 import { useJobs } from "../jobsStore";
