@@ -43,6 +43,12 @@ index_batch: number,
  */
 mcp_enabled: boolean, 
 /**
+ * MCP: what DataBrain would ask the user about runs when the MCP client
+ * can't show DataBrain's question (no elicitation), on the strength of
+ * the client's own tool approval. Off: such calls are refused.
+ */
+mcp_client_approves: boolean, 
+/**
  * Notes the AI adds or updates are saved directly instead of waiting
  * for review in Knowledge.
  */

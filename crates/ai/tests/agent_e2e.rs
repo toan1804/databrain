@@ -257,11 +257,30 @@ async fn denied_approval_and_blocked_writes() {
         .await
         .unwrap();
     assert_eq!(out[0].result.as_ref().unwrap().total_rows, 1);
-    // MCP: the client approved the call, so DataBrain doesn't ask again (one approval)…
-    let mcp = databrain_ai::ToolContext { caller: databrain_ai::Caller::Mcp, ..ctx };
+    // MCP with a client that can't show DataBrain's question: the client's
+    // own tool approval isn't DataBrain's (clients auto-approve tools), so
+    // what DataBrain would ask about is refused…
+    struct NoElicitation;
+    #[async_trait::async_trait]
+    impl ToolHost for NoElicitation {
+        fn can_ask(&self) -> bool {
+            false
+        }
+        async fn approve(&self, _: &str, _: &str, _: &Value) -> Option<Value> {
+            unreachable!("can_ask is false")
+        }
+    }
+    let mcp = databrain_ai::ToolContext { caller: databrain_ai::Caller::Mcp, host: Arc::new(NoElicitation), ..ctx };
+    let o = mcp.call("run_query", &json!({"sql": "select 1"})).await;
+    assert!(o.content.starts_with("ERROR") && o.content.contains("elicitation"), "{}", o.content);
+    assert!(f.ws.list_audit(50).unwrap().iter().any(|a| a.tool == "run_query" && a.decision == "blocked"));
+    // …unless the connection accepts the client's approval.
+    let mut trusting = f.ws.get_connection(&f.conn).unwrap();
+    trusting.ai_policy.mcp_client_approves = true;
+    let mcp = databrain_ai::ToolContext { profile: trusting, ..mcp };
     let o = mcp.call("run_query", &json!({"sql": "select 1"})).await;
     assert!(o.content.contains("returned 1 row"), "{}", o.content);
-    // …but what the policy forbids is still refused.
+    // What the policy forbids is refused either way.
     let o = mcp.call("run_query", &json!({"sql": "delete from orders"})).await;
     assert!(o.content.starts_with("ERROR") && o.content.contains("not allowed"), "{}", o.content);
     assert!(f.ws.list_audit(50).unwrap().iter().any(|a| a.tool == "run_query" && a.decision == "approved by MCP client"));
@@ -298,8 +317,10 @@ async fn mcp_server_lists_and_calls_tools() {
     .join("\n");
     let mut out = Vec::new();
     server.serve(tokio::io::BufReader::new(input.as_bytes()), &mut out).await.unwrap();
-    let resps: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let mut resps: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(resps.len(), 6, "notification gets no response");
+    // Requests are handled concurrently: answers come as they finish, matched by id.
+    resps.sort_by_key(|r| r["id"].as_i64());
     assert_eq!(resps[0]["result"]["serverInfo"]["name"], "databrain");
     let tools = resps[1]["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|t| t["name"] == "search_schema" && t["inputSchema"]["required"][0] == "connection"));
@@ -313,6 +334,68 @@ async fn mcp_server_lists_and_calls_tools() {
     assert!(resps[3]["result"]["content"][0]["text"].as_str().unwrap().contains("returned 1 rows"));
     assert_eq!(resps[4]["result"]["isError"], true);
     assert_eq!(resps[5]["error"]["code"], -32601);
+}
+
+// ------------------------------------------------------------------ MCP elicitation
+
+/// A client that supports elicitation: DataBrain asks the user through it,
+/// and only an explicit "approve" runs the query.
+#[tokio::test]
+async fn mcp_asks_the_user_through_elicitation() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = mock_openai(requests).await;
+    // run_query = Ask (the default): every query needs the user.
+    let f = fixture(port, AiPolicy { mcp_enabled: true, ..Default::default() }).await;
+    let server = Arc::new(databrain_ai::mcp::McpServer { engine: f.engine.clone(), hub: f.hub.clone() });
+    let (client, server_io) = tokio::io::duplex(1 << 16);
+    let (server_r, server_w) = tokio::io::split(server_io);
+    let srv = server.clone();
+    let serving = tokio::spawn(async move { srv.serve(BufReader::new(server_r), server_w).await });
+    let (client_r, mut client_w) = tokio::io::split(client);
+    let mut lines = BufReader::new(client_r).lines();
+    async fn send(w: &mut (impl tokio::io::AsyncWrite + Unpin), v: Value) {
+        w.write_all(format!("{v}\n").as_bytes()).await.unwrap();
+    }
+    send(&mut client_w, json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}}, "clientInfo": {"name": "t", "version": "1"}}})).await;
+    let init: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(init["id"], 1);
+
+    // Approved: the server asks, the user approves, the query runs.
+    send(&mut client_w, json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "run_query", "arguments": {"connection": "shop", "sql": "select count(*) n from orders"}}})).await;
+    let ask: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ask["method"], "elicitation/create", "{ask}");
+    let message = ask["params"]["message"].as_str().unwrap();
+    assert!(message.contains("run_query") && message.contains("select count(*) n from orders"), "{message}");
+    assert_eq!(ask["params"]["requestedSchema"]["required"][0], "approve");
+    send(&mut client_w, json!({"jsonrpc": "2.0", "id": ask["id"], "result": {"action": "accept", "content": {"approve": true}}})).await;
+    let done: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(done["id"], 2);
+    assert_eq!(done["result"]["isError"], false, "{done}");
+    assert!(done["result"]["content"][0]["text"].as_str().unwrap().contains("returned 1 row"));
+
+    // Accepting the form without ticking "approve", or declining, doesn't run it.
+    for answer in [json!({"action": "accept", "content": {"approve": false}}), json!({"action": "decline"})] {
+        send(&mut client_w, json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "run_query", "arguments": {"connection": "shop", "sql": "select 1"}}})).await;
+        let ask: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(ask["method"], "elicitation/create");
+        send(&mut client_w, json!({"jsonrpc": "2.0", "id": ask["id"], "result": answer})).await;
+        let done: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(done["result"]["isError"], true, "{done}");
+        assert!(done["result"]["content"][0]["text"].as_str().unwrap().contains("declined"), "{done}");
+    }
+
+    // The client closes while DataBrain waits for the user: declined, and the server stops.
+    send(&mut client_w, json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "run_query", "arguments": {"connection": "shop", "sql": "select 2"}}})).await;
+    let ask: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ask["method"], "elicitation/create");
+    client_w.shutdown().await.unwrap();
+    let done: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(done["result"]["isError"], true, "{done}");
+    tokio::time::timeout(std::time::Duration::from_secs(10), serving).await.unwrap().unwrap().unwrap();
+    let audit = f.ws.list_audit(50).unwrap();
+    assert_eq!(audit.iter().filter(|a| a.tool == "run_query" && a.decision == "approved").count(), 1);
+    assert_eq!(audit.iter().filter(|a| a.tool == "run_query" && a.decision == "denied").count(), 3);
 }
 
 // ------------------------------------------------------------------ Kiro (fake kiro-cli)

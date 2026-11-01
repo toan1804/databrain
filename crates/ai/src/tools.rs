@@ -158,6 +158,12 @@ pub trait ToolHost: Send + Sync {
     /// Ask the user to approve an action. Returns the (possibly edited)
     /// argument value on approval, `None` on denial.
     async fn approve(&self, tool: &str, summary: &str, detail: &Value) -> Option<Value>;
+    /// Whether `approve` can reach the user. The MCP server can only when the
+    /// client supports elicitation; otherwise an Ask is refused unless the
+    /// connection accepts the client's own tool approval.
+    fn can_ask(&self) -> bool {
+        true
+    }
     /// Current editor state for `get_editor`.
     async fn editor_state(&self) -> Option<Value> {
         None
@@ -681,13 +687,19 @@ impl ToolContext {
                 Err(AiError::Policy(format!("{reason}. Only the user can approve this, in DataBrain's assistant; an MCP client can't")))
             }
             Decision::Ask(reason) | Decision::Confirm(reason) => {
-                if self.caller == Caller::Mcp {
-                    // The MCP client (Kiro CLI, Claude Code…) asked its user
-                    // before calling the tool: that is the approval. DataBrain's
-                    // hard rules (Deny: read-only, production, writes not
-                    // allowed, queries off) were applied above.
-                    self.audit(tool, detail, "approved by MCP client", Some(&reason));
-                    return Ok(detail.clone());
+                if self.caller == Caller::Mcp && !self.host.can_ask() {
+                    // The client can't show DataBrain's question. Its own tool
+                    // approval is not the same thing (many clients auto-approve
+                    // tools), so it counts only where the connection says so.
+                    if self.profile.ai_policy.mcp_client_approves {
+                        self.audit(tool, detail, "approved by MCP client", Some(&reason));
+                        return Ok(detail.clone());
+                    }
+                    self.audit(tool, detail, "blocked", Some(&reason));
+                    return Err(AiError::Policy(format!(
+                        "{reason}. DataBrain asks the user before this, and this MCP client can't show DataBrain's question (it doesn't support elicitation). \
+                         Run it from DataBrain's assistant, or turn on \"Accept the MCP client's approval\" in the connection's AI settings"
+                    )));
                 }
                 match self.host.approve(tool, &format!("{reason}. {summary}"), detail).await {
                     Some(v) => {

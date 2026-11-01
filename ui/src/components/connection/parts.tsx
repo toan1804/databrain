@@ -68,6 +68,7 @@ export const DEFAULT_POLICY: AiPolicy = {
   index_schemas: [],
   index_batch: 25,
   mcp_enabled: false,
+  mcp_client_approves: false,
   auto_approve_notes: false,
   read_allow: [],
   read_deny: [],

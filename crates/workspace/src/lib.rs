@@ -126,6 +126,10 @@ pub struct AiPolicy {
     pub index_batch: u32,
     /// Expose this connection to external agents through the MCP server.
     pub mcp_enabled: bool,
+    /// MCP: what DataBrain would ask the user about runs when the MCP client
+    /// can't show DataBrain's question (no elicitation), on the strength of
+    /// the client's own tool approval. Off: such calls are refused.
+    pub mcp_client_approves: bool,
     /// Notes the AI adds or updates are saved directly instead of waiting
     /// for review in Knowledge.
     pub auto_approve_notes: bool,
@@ -160,6 +164,7 @@ impl Default for AiPolicy {
             index_schemas: vec![],
             index_batch: 25,
             mcp_enabled: false,
+            mcp_client_approves: false,
             auto_approve_notes: false,
             read_allow: vec![],
             read_deny: vec![],

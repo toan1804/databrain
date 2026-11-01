@@ -78,8 +78,16 @@ export function AiSection({ f }: { f: ConnectionFormState }) {
           checked={policy.mcp_enabled}
           onChange={(v) => setPolicy({ ...policy, mcp_enabled: v })}
           label="Allow external agents (MCP)"
-          help="Kiro CLI, Claude Code etc. can use this connection via the local databrain-mcp server, under the rules above. Their own tool approval counts as the approval (DataBrain doesn't ask again); what the rules forbid is still refused."
+          help="Kiro CLI, Claude Code etc. can use this connection via the local databrain-mcp server, under the rules above. What DataBrain would ask you about, it asks through the agent (MCP elicitation); what the rules forbid is refused."
         />
+        {policy.mcp_enabled && (
+          <Check
+            checked={policy.mcp_client_approves}
+            onChange={(v) => setPolicy({ ...policy, mcp_client_approves: v })}
+            label="Accept the MCP client's approval"
+            help="For agents that can't show DataBrain's question: their own tool approval counts instead. Only turn this on if the agent asks you before every tool call (many approve tools on their own)."
+          />
+        )}
       </fieldset>
     </div>
   );
