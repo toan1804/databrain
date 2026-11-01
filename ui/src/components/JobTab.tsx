@@ -117,9 +117,10 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
   const updateNode = useCallback((id: string, patch: Partial<JobNode>) => update((j) => updateStep(j, id, patch)), [update]);
 
   // The tab title follows the job's name.
+  const name = job?.name;
   useEffect(() => {
-    if (job) useStore.getState().updateTab(tabId, { title: job.name });
-  }, [job?.name]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (name !== undefined) useStore.getState().updateTab(tabId, { title: name });
+  }, [name, tabId]);
 
   // A finished run's results become the steps' last run (already saved by the app).
   useEffect(() => {
@@ -178,6 +179,8 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
     window.addEventListener("pointerup", up);
   };
 
+  // The canvas (and `box`) exists once the job has loaded.
+  const loaded = job !== null;
   useEffect(() => {
     const el = box.current;
     if (!el) return;
@@ -195,7 +198,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
     };
     el.addEventListener("wheel", wheel, { passive: false });
     return () => el.removeEventListener("wheel", wheel);
-  }, [job !== null]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [loaded]);
 
   const onNodeDown = (e: ReactPointerEvent, n: JobNode) => {
     if (e.button !== 0 || (e.target as HTMLElement).closest("[data-port],button,input,select")) return;
@@ -259,6 +262,20 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
     window.addEventListener("pointerup", up);
   };
 
+  const deleteNode = useCallback(
+    (id: string) => {
+      const n = latest.current?.nodes.find((x) => x.id === id);
+      if (!n) return;
+      const go = () => {
+        update((j) => removeNode(j, id));
+        setSel(null);
+      };
+      if (!n.sql.trim()) return go();
+      useStore.getState().askConfirm({ title: `Delete step "${n.name}"?`, reasons: ["Its SQL and links are removed from the job."], confirmLabel: "Delete", onConfirm: go });
+    },
+    [update],
+  );
+
   // Delete / Backspace removes the selected step or link (not while typing).
   useEffect(() => {
     if (!visible) return;
@@ -275,18 +292,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
     };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
-  }); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const deleteNode = (id: string) => {
-    const n = latest.current?.nodes.find((x) => x.id === id);
-    if (!n) return;
-    const go = () => {
-      update((j) => removeNode(j, id));
-      setSel(null);
-    };
-    if (!n.sql.trim()) return go();
-    useStore.getState().askConfirm({ title: `Delete step "${n.name}"?`, reasons: ["Its SQL and links are removed from the job."], confirmLabel: "Delete", onConfirm: go });
-  };
+  }, [visible, sel, update, deleteNode]);
 
   const addAt = (at: { x: number; y: number }, init: Partial<JobNode> = {}) => {
     const cur = latest.current;

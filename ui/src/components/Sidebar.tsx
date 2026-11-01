@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEvent } from "../lib/hooks";
 import { traitsOf } from "../lib/sourceTraits";
 import {
   AlertCircle,
@@ -411,10 +412,13 @@ function ConnectionNode({ conn }: { conn: ConnectionView }) {
   );
 
   // Open on expand (by click or by a search reveal): the cache shows at once, the server is asked meanwhile.
+  // Only on expand: a failed load isn't retried until the user expands again.
+  const openIfNeeded = useEvent(() => {
+    if ((!explorerOpened.has(conn.id) || !loaded) && !loading && !error) void load();
+  });
   useEffect(() => {
-    if (expanded && (!explorerOpened.has(conn.id) || !loaded) && !loading && !error) void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded, loaded]);
+    if (expanded) openIfNeeded();
+  }, [expanded, loaded, openIfNeeded]);
 
   const toggle = () => {
     if (!expanded) setError(null);
@@ -625,10 +629,12 @@ function CatalogNode({ conn, name, schemas: given, defaultOpen, filtered = false
     },
     [conn.id, name, loadCatalogSchemas, toast],
   );
+  const openIfNeeded = useEvent(() => {
+    if (!given && !loading) void load();
+  });
   useEffect(() => {
-    if (expanded && !given && !loading) void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded]);
+    if (expanded) openIfNeeded();
+  }, [expanded, openIfNeeded]);
   const sorted = useMemo(
     () => (schemas ? [...schemas].sort((a, b) => Number(b.is_default) - Number(a.is_default) || schemaLabel(a).localeCompare(schemaLabel(b))) : undefined),
     [schemas],
@@ -708,10 +714,12 @@ function SchemaNode({ conn, schema: info, depth, defaultOpen }: { conn: Connecti
     [conn.id, schema, loadObjects, toast],
   );
 
+  const openIfNeeded = useEvent(() => {
+    if (!objects && !loading) void load();
+  });
   useEffect(() => {
-    if (expanded && !objects && !loading) void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded]);
+    if (expanded) openIfNeeded();
+  }, [expanded, openIfNeeded]);
 
   // Every folder the engine has, also empty ones; DuckDB's attached files and
   // outputs are views only, so they keep the plain list.

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEvent } from "../lib/hooks";
 import { traitsOf } from "../lib/sourceTraits";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { AlertCircle, AlertTriangle, ArrowDown, ArrowRight, Minus, Plus, CheckCircle2, Columns3, ExternalLink, Rows3, Workflow, ChevronDown, ClipboardCopy, Download, Loader2, Maximize2, Network, RefreshCw, TextCursorInput, WifiOff, X } from "lucide-react";
@@ -155,7 +156,7 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
     return (owner && st.params[owner]) || {};
   }, [ref]);
 
-  const run = useCallback(async () => {
+  const run = useEvent(async () => {
     if (!tab) return;
     const my = ++seq.current;
     setLoad({ status: "loading" });
@@ -174,12 +175,12 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
     } catch (e) {
       if (my === seq.current) setLoad({ status: "error", message: toError(e).message });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab?.sql, conn?.id, conn?.config.kind, check, paramsOf]);
+  });
 
+  // Re-run when the SQL, connection, check or parameters change.
   useEffect(() => {
     void run();
-  }, [run]);
+  }, [tab?.sql, conn?.id, conn?.config.kind, check, paramsOf, run]);
 
   const graph = load.status === "ready" ? load.view.graph : null;
   /** Chain view: tables and results only, one link per table-to-table flow
@@ -193,7 +194,6 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
   // The chain is table level: its boxes don't list columns.
   const base = useMemo(() => (shown ? layout(shown, dir, { expanded: isChain ? new Set<string>() : expanded, show: traced?.cols }) : null), [shown, dir, expanded, traced, isChain]);
   const lay = useMemo(() => (base ? withPositions(base, pos) : null), [base, pos]);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   const appearance = useStore((s) => s.appearance);
   const colors = useMemo(themeColors, [theme, appearance]);
   const inner = useMemo(() => (shown && lay ? toSvg(shown, lay, { colors, focus: traced, inner: true }) : ""), [shown, lay, colors, traced]);
@@ -297,14 +297,14 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
     }
   };
 
+  const flow = useMemo(() => (graph && focus ? columnFlow(graph, focus.node, focus.column) : null), [graph, focus]);
+  const formula = useMemo(() => (graph && focus && tab ? explainColumn(graph, tab.sql, focus.node, focus.column)?.formula : undefined), [graph, focus, tab]);
   if (!tab || !ref) return null;
   const checks = load.status === "ready" ? load.view.checks : [];
   const summary = checkSummary(checks, conn?.name);
   const warnings = graph?.warnings ?? [];
   const focusNode = focus && graph?.nodes.find((n) => n.id === focus.node);
   const focusCol = focusNode && focus?.column !== undefined ? focusNode.columns.find((c) => c.name === focus.column) : undefined;
-  const flow = useMemo(() => (graph && focus ? columnFlow(graph, focus.node, focus.column) : null), [graph, focus]);
-  const formula = useMemo(() => (graph && focus && tab ? explainColumn(graph, tab.sql, focus.node, focus.column)?.formula : undefined), [graph, focus, tab]);
   return (
     <div className="h-full min-h-0 flex-col" style={{ display: visible ? "flex" : "none" }}>
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3 text-[12.5px]">

@@ -41,7 +41,8 @@ export function LoadIntoDialog({ info, sql, outputName, onClose }: { info: Resul
   const blocked = loadTargetBlocked(targetCheck, mode, create);
   const ready = !!target && !!table.trim() && (!keyed || keys.length > 0) && !blocked;
   // A dry run is about the settings it was made with.
-  useEffect(() => setDry({ busy: false }), [target, table, mode, keys.join(","), create]); // eslint-disable-line react-hooks/exhaustive-deps
+  const keyList = keys.join(",");
+  useEffect(() => setDry({ busy: false }), [target, table, mode, keyList, create]);
 
   const runId = useRef<string | null>(null);
   useEffect(() => {

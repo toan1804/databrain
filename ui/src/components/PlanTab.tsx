@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useEvent } from "../lib/hooks";
 import { AlertTriangle, ClipboardCopy, Flame, GitFork, Loader2, RefreshCw } from "lucide-react";
 import { api, toError } from "../lib/api";
 import { flattenPlan, fmtMs, fmtNum, hottest, type PlanRow } from "../lib/plan";
@@ -65,7 +66,7 @@ export function PlanTab({ tabId, visible }: { tabId: string; visible: boolean })
   const [picked, setPicked] = useState<string | null>(null);
   const seq = useRef(0);
 
-  const load = useCallback(async () => {
+  const load = useEvent(async () => {
     if (!tab || !ref) return;
     const my = ++seq.current;
     setState({ status: "loading" });
@@ -76,13 +77,12 @@ export function PlanTab({ tabId, visible }: { tabId: string; visible: boolean })
     } catch (e) {
       if (my === seq.current) setState({ status: "error", message: toError(e).message });
     }
-    // Reload when the statement, mode or connection changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab?.sql, ref?.analyze, ref?.source, conn?.id]);
+  });
 
+  // Reload when the statement, mode or connection changes.
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [tab?.sql, ref?.analyze, ref?.source, conn?.id, load]);
 
   const rows = useMemo(() => (state.status === "ready" ? flattenPlan(state.plan.roots) : []), [state]);
   const hot = useMemo(() => hottest(rows), [rows]);

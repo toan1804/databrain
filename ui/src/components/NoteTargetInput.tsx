@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useEvent } from "../lib/hooks";
 import { Check, Columns3, Loader2, Table2, TriangleAlert } from "lucide-react";
 import { api } from "../lib/api";
 import { applySuggestion, currentSegment, findTable, suggest, type Suggestion, type TargetTable } from "../lib/noteTarget";
@@ -119,7 +120,8 @@ export function NoteTargetInput({
       clearTimeout(t);
     };
   }, [connId, value, indexVersion]);
-  useEffect(() => onState(state), [state]); // eslint-disable-line react-hooks/exhaustive-deps
+  const report = useEvent(onState);
+  useEffect(() => report(state), [state, report]);
 
   const accept = (s: Suggestion) => {
     const r = applySuggestion(value, seg, s.insert);

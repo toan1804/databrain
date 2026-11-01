@@ -12,17 +12,18 @@ function useRunLog(jobId: string, run: JobRun | undefined): { entries: RunLogEnt
   const live = useJobs((s) => (run ? s.logs[run.id] : undefined));
   const [saved, setSaved] = useState<{ id: number; entries: RunLogEntry[] } | null>(null);
   const running = run?.status === "running";
+  const runId = run?.id;
   useEffect(() => {
-    if (!run || running) return;
+    if (runId === undefined || running) return;
     let ok = true;
     api
-      .jobRunLog(jobId, run.id)
-      .then((entries) => ok && setSaved({ id: run.id, entries }))
-      .catch(() => ok && setSaved({ id: run.id, entries: [] }));
+      .jobRunLog(jobId, runId)
+      .then((entries) => ok && setSaved({ id: runId, entries }))
+      .catch(() => ok && setSaved({ id: runId, entries: [] }));
     return () => {
       ok = false;
     };
-  }, [jobId, run?.id, running]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [jobId, runId, running]);
   if (!run) return { entries: [], loading: false };
   if (saved?.id === run.id && !running) return { entries: saved.entries, loading: false };
   return { entries: live ?? [], loading: !running && !live };

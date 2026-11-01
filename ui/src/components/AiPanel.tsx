@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   AlertCircle,
@@ -830,15 +830,18 @@ function Sessions() {
   const [items, setItems] = useState<AiSessionRecord[]>([]);
   const [q, setQ] = useState("");
 
-  const load = () =>
-    api
-      .aiSessions(null)
-      .then(setItems)
-      .catch((e) => toast(toError(e).message, "error"));
+  const load = useCallback(
+    () =>
+      api
+        .aiSessions(null)
+        .then(setItems)
+        .catch((e) => toast(toError(e).message, "error")),
+    [toast],
+  );
+  // `version` bumps when sessions change elsewhere.
   useEffect(() => {
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [version]);
+  }, [load, version]);
 
   const shown = items.filter((s) => s.title.toLowerCase().includes(q.toLowerCase()));
   return (
@@ -943,14 +946,15 @@ function Knowledge() {
     }
   };
 
-  const load = () => {
+  const load = useCallback(() => {
     if (!connId) return;
     api
       .knGet(connId)
       .then(setData)
       .catch((e) => toast(toError(e).message, "error"));
-  };
-  useEffect(load, [connId, version]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [connId, toast]);
+  // `version` bumps when knowledge changes elsewhere.
+  useEffect(load, [load, version]);
 
   // Indexed objects: one page at a time, filtered in the workspace DB (an
   // index can hold 10k+ tables; never load them all into the view).

@@ -1,4 +1,5 @@
 // Settings of a load step (target, mode, keys, batch size, before/after SQL),
+import { useEvent } from "../../lib/hooks";
 // the target check and the dry run report (also used by "Load into…").
 import { useEffect, useState } from "react";
 import { AlertTriangle, FlaskConical, Info, CheckCircle2, CircleDashed, Loader2, Plus, XCircle } from "lucide-react";
@@ -32,13 +33,15 @@ function BatchFields({ node, kind, onChange }: { node: JobNode; kind?: string; o
     setKb(node.batch_kb ? String(node.batch_kb) : "");
   }, [node.id, node.batch_rows, node.batch_kb]);
   // A saved value past a new target's maximum is lowered at once.
-  useEffect(() => {
-    if (!limits) return;
+  const clamp = useEvent((limits: BatchLimits) => {
     const patch: Partial<JobNode> = {};
     if (node.batch_rows && node.batch_rows > limits.max_rows) patch.batch_rows = limits.max_rows;
     if (node.batch_kb && node.batch_kb * 1024 > limits.max_bytes) patch.batch_kb = Math.floor(limits.max_bytes / 1024);
     if (Object.keys(patch).length) onChange(patch);
-  }, [limits]); // eslint-disable-line react-hooks/exhaustive-deps
+  });
+  useEffect(() => {
+    if (limits) clamp(limits);
+  }, [limits, clamp]);
   const maxKb = limits ? Math.floor(limits.max_bytes / 1024) : 65536;
   const over = (text: string, max: number) => !!text.trim() && Number(text) > max;
   return (
@@ -125,7 +128,9 @@ export function LoadFields({ job, node, onChange }: { job: Job; node: JobNode; o
   const mode = LOAD_MODES.find((m) => m.mode === node.load_mode) ?? LOAD_MODES[0];
   const keyed = node.load_mode === "update" || node.load_mode === "merge";
   const [keys, setKeys] = useState((node.key_columns ?? []).join(", "));
-  useEffect(() => setKeys((node.key_columns ?? []).join(", ")), [node.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Reset the text for another step (not while this one is being edited).
+  const savedKeys = useEvent(() => (node.key_columns ?? []).join(", "));
+  useEffect(() => setKeys(savedKeys()), [node.id, savedKeys]);
   const [dry, setDry] = useState<{ busy: boolean; report?: LoadDryRun; error?: string }>({ busy: false });
   // A report is about the settings it was made with.
   useEffect(() => setDry({ busy: false }), [node.id, node.target_connection_id, node.target_table, node.load_mode]);

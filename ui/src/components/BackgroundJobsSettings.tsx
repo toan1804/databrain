@@ -3,6 +3,7 @@ import { Loader2 } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { BackgroundStatus } from "../lib/types";
 import { relativeTime } from "../lib/util";
+import { useEvent } from "../lib/hooks";
 import { useStore } from "../store";
 
 /**
@@ -14,12 +15,12 @@ export function BackgroundJobsSettings() {
   const toast = useStore((s) => s.toast);
   const [st, setSt] = useState<BackgroundStatus | null>(null);
   const [busy, setBusy] = useState(false);
-  const load = () => api.backgroundJobsStatus().then(setSt, (e) => toast(toError(e).message, "error"));
+  const load = useEvent(() => api.backgroundJobsStatus().then(setSt, (e) => toast(toError(e).message, "error")));
   useEffect(() => {
     void load();
     const t = setInterval(() => void load(), 30_000);
     return () => clearInterval(t);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [load]);
 
   const toggle = async (on: boolean) => {
     setBusy(true);

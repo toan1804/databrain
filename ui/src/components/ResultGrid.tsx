@@ -1,4 +1,5 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { useEvent } from "../lib/hooks";
 import {
   CompactSelection,
   DataEditor,
@@ -212,6 +213,8 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
     [info.id, info.columns, view, onViewRows, toast],
   );
 
+  // Read when the view changes; a growing total must not reset the cache.
+  const storedTotal = useEvent(() => info.total_rows);
   // Reset the cache whenever the result or view changes.
   useEffect(() => {
     generation.current++;
@@ -221,9 +224,9 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
     const r = visible.current;
     void fetchPage(0);
     // Row count of the new view is unknown until page 0 arrives; clamp to the stored total.
-    for (const p of pageRange(r.y, r.height, PAGE, info.total_rows)) if (p !== 0) void fetchPage(p);
+    for (const p of pageRange(r.y, r.height, PAGE, storedTotal())) if (p !== 0) void fetchPage(p);
     setSelection({ columns: CompactSelection.empty(), rows: CompactSelection.empty() });
-  }, [fetchPage]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [fetchPage, storedTotal]);
 
   useEffect(() => {
     autoSized.current = false;
@@ -322,7 +325,8 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         themeOverride,
       };
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // Pages live in a ref: `version` bumps when one arrives, so the grid asks again.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- version invalidates the page cache
     [version, info.columns, edit, rows],
   );
 
@@ -356,7 +360,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
       });
     });
     return out;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- version: scrolling moves the visible window (a ref)
   }, [findMatches, findCurrent, version]);
 
   /** Selected rectangle in (columns, rows) terms; falls back to the focused cell. */
@@ -378,9 +382,10 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
     return null;
   }, [selection, rows]);
 
+  const reportRange = useEvent((r: ReturnType<typeof selectedRange>) => onSelectionRange?.(r));
   useEffect(() => {
-    onSelectionRange?.(selectedRange());
-  }, [selection, selectedRange]); // eslint-disable-line react-hooks/exhaustive-deps
+    reportRange(selectedRange());
+  }, [selectedRange, reportRange]);
 
   const copy = useCallback(
     async (format: ExportFormat, header: boolean, range = selectedRange()) => {
@@ -404,6 +409,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
     [info.id, view, dialect, selectedRange, toast],
   );
 
+  const editCellNow = useEvent((col: number, row: number, value: string | null) => editCell(col, row, value));
   useImperativeHandle(
     ref,
     () => ({
@@ -416,20 +422,21 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         });
       },
       copySelection: (format, header) => copy(format, header),
-      setCellValue: (col, row, value) => editCell(col, row, value),
+      setCellValue: (col, row, value) => editCellNow(col, row, value),
     }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [copy, edit, rows],
+    [copy, editCellNow],
   );
 
   // Report the focused cell (its pending edit, if any) to the value panel.
-  const focus = selection.current?.cell;
+  const focusCol = selection.current?.cell[0];
+  const focusRow = selection.current?.cell[1];
+  const reportFocus = useEvent((cell: Parameters<NonNullable<typeof onFocusCell>>[0]) => onFocusCell?.(cell));
   useEffect(() => {
-    if (!onFocusCell) return;
-    if (!focus) return onFocusCell(null);
-    const [col, row] = focus;
+    if (focusCol === undefined || focusRow === undefined) return reportFocus(null);
+    const col = focusCol;
+    const row = focusRow;
     const meta = info.columns[col];
-    if (!meta) return onFocusCell(null);
+    if (!meta) return reportFocus(null);
     const editable = !!edit && edit.target.columns[col] != null;
     let value: string | null | undefined;
     if (edit && row >= rows) {
@@ -441,9 +448,9 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
       const u = edit && id !== undefined ? edit.edits.updates.get(id) : undefined;
       if (u?.values.has(col)) value = u.values.get(col) ?? null;
     }
-    onFocusCell({ col, row, column: meta.name, family: meta.family, value, editable });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focus?.[0], focus?.[1], version, edit, rows, info.columns]);
+    reportFocus({ col, row, column: meta.name, family: meta.family, value, editable });
+    // version: the focused cell's page may have just arrived (pages are a ref).
+  }, [focusCol, focusRow, version, edit, rows, info.columns, reportFocus]);
 
   const cellValue = (cell: Item): string | null | undefined =>
     pages.current.get(Math.floor(cell[1] / PAGE))?.[cell[1] % PAGE]?.[cell[0]];

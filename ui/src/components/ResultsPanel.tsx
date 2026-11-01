@@ -574,7 +574,8 @@ export function ResultView({
       }
     }, 200);
     return () => clearTimeout(t);
-  }, [findOpen, plan.term, plan.columns?.join(","), wholeWord, view, info.id, toast]); // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `plan` is rebuilt every render; its term and columns are the key
+  }, [findOpen, plan.term, plan.columns?.join(","), wholeWord, view, info.id, toast]);
 
   /** Scroll to a column (keeps the current match row when there is one). */
   const jumpToColumn = (col: number) => grid.current?.scrollToCell(col, find.matches[findIdx]?.row ?? 0);

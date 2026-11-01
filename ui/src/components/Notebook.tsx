@@ -1,4 +1,5 @@
 // Notebook tab: ordered SQL / Markdown cells bound to a connection.
+import { useEvent } from "../lib/hooks";
 //
 // Every SQL cell runs under its own run key (`nb:{notebook}:{cell}`) so it
 // keeps its own results, while all cells share one database session
@@ -195,9 +196,10 @@ export function NotebookView({
     [update],
   );
 
-  // Record last-run summaries when cell jobs finish.
+  // Record last-run summaries when cell jobs finish (subscribed once the notebook has loaded).
+  const loaded = nb !== null;
   useEffect(() => {
-    if (!nb) return;
+    if (!loaded) return;
     return useStore.subscribe((s, prev) => {
       for (const c of latest.current?.cells ?? []) {
         const k = cellKey(notebookId, c.id);
@@ -217,7 +219,7 @@ export function NotebookView({
         }
       }
     });
-  }, [nb === null, notebookId, updateCell]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [loaded, notebookId, updateCell]);
 
   const connId = nb?.connection_id ?? null;
   const conn = connections.find((c) => c.id === connId);
@@ -239,7 +241,10 @@ export function NotebookView({
     const seen = new Set<string>();
     const walk = (x: string) => {
       for (const d of deps[x]?.dependents ?? [])
-        if (!seen.has(d)) (seen.add(d), walk(d));
+        if (!seen.has(d)) {
+          seen.add(d);
+          walk(d);
+        }
     };
     walk(id);
     for (const c of order) {
@@ -1049,7 +1054,9 @@ export function CellEditor({
       v.destroy();
       view.current = null;
     };
-  }, [editorKey]); // eslint-disable-line react-hooks/exhaustive-deps
+    // The editor is created once per cell; later changes are dispatched into it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- created once per editorKey
+  }, [editorKey]);
 
   useEffect(() => {
     view.current?.dispatch({
@@ -1060,7 +1067,8 @@ export function CellEditor({
         .getState()
         .loadSchemas(conn.id)
         .catch(() => {});
-  }, [conn?.config.kind, conn?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `conn` is a new object on every connections refresh
+  }, [conn?.config.kind, conn?.id]);
 
   // Highlight `:name` parameters (values are set in the notebook's parameter bar).
   useEffect(() => {
@@ -1207,7 +1215,7 @@ function CellAi({
   const send = useAi((s) => s.send);
   const [text, setText] = useState("");
   const isSql = cell.kind === "sql";
-  const go = (message: string, mode: Parameters<typeof send>[0]["mode"]) => {
+  const go = useEvent((message: string, mode: Parameters<typeof send>[0]["mode"]) => {
     if (!connectionId)
       return useStore.getState().toast("Choose a connection first", "error");
     void send({
@@ -1217,7 +1225,7 @@ function CellAi({
       connectionId,
     });
     onClose();
-  };
+  });
   const quick = useMemo(
     () =>
       isSql
@@ -1258,7 +1266,7 @@ function CellAi({
               run: () => go(`Write SQL for: ${cell.source}`, "generate"),
             },
           ],
-    [isSql, hasError, cell.source], // eslint-disable-line react-hooks/exhaustive-deps
+    [isSql, hasError, cell.source, go],
   );
   return (
     <div className="mt-2 rounded-lg border border-accent/40 bg-accent/5 p-2">

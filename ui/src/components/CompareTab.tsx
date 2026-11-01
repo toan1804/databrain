@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useEvent } from "../lib/hooks";
 import { ArrowRight, ChevronDown, ChevronRight, ClipboardCopy, FileCode2, GitCompare, Loader2, Minus, Pencil, Plus } from "lucide-react";
 import { api, toError } from "../lib/api";
 import { traitsOf } from "../lib/sourceTraits";
@@ -36,6 +37,13 @@ function SidePicker({ label, side, onChange }: { label: string; side: Side | nul
   const [schemas, setSchemas] = useState<SchemaInfo[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const connId = side?.connection_id ?? "";
+  // Pick the default schema when none is chosen yet.
+  const pickDefault = useEvent((s: SchemaInfo[]) => {
+    if (side && !side.schema) {
+      const d = s.find((x) => x.is_default) ?? s[0];
+      if (d) onChange({ connection_id: connId, schema: d.name });
+    }
+  });
   useEffect(() => {
     setSchemas(null);
     setErr(null);
@@ -45,18 +53,14 @@ function SidePicker({ label, side, onChange }: { label: string; side: Side | nul
       (s) => {
         if (!alive) return;
         setSchemas(s);
-        // Pick the default schema when none is chosen yet.
-        if (side && !side.schema) {
-          const d = s.find((x) => x.is_default) ?? s[0];
-          if (d) onChange({ connection_id: connId, schema: d.name });
-        }
+        pickDefault(s);
       },
       (e) => alive && setErr(toError(e).message),
     );
     return () => {
       alive = false;
     };
-  }, [connId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [connId, pickDefault]);
   const sql = connections.filter((c) => traitsOf(c.config.kind).language === "sql");
   return (
     <fieldset className="flex min-w-0 flex-1 flex-col gap-1">

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEvent } from "../lib/hooks";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { ArrowDown, ArrowRight, ChevronDown, ClipboardCopy, Columns3, Download, Loader2, Maximize2, Minus, Plus, RefreshCw, Rows3, Search, Share2 } from "lucide-react";
 import { api, isTauri, toError } from "../lib/api";
@@ -61,10 +62,12 @@ export function ErTab({ tabId, visible }: { tabId: string; visible: boolean }) {
     }
   }, [tab?.connection_id, ref]);
 
+  // `ref` is a new object whenever the tab changes; reload for a new schema only.
+  const runOnce = useEvent(run);
+  const schema = ref?.schema;
   useEffect(() => {
-    void run();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab?.connection_id, ref?.schema]);
+    void runOnce();
+  }, [tab?.connection_id, schema, runOnce]);
 
   const er = useMemo(() => (load.status === "ready" && ref ? erGraph(ref.schema, load.tables) : null), [load, ref]);
   /** What the diagram draws: the filter and "linked only" applied. */
@@ -79,7 +82,7 @@ export function ErTab({ tabId, visible }: { tabId: string; visible: boolean }) {
   const traced = useMemo(() => (shown && focus ? trace(shown, focus.node, focus.column) : null), [shown, focus]);
   const base = useMemo(() => (shown ? layout(shown, dir, { expanded, show: traced?.cols }) : null), [shown, dir, expanded, traced]);
   const lay = useMemo(() => (base ? withPositions(base, pos) : null), [base, pos]);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // themeColors reads CSS variables, which change with the theme and appearance.
   const colors = useMemo(themeColors, [theme, appearance]);
   const inner = useMemo(() => (shown && lay ? toSvg(shown, lay, { colors, focus: traced, inner: true }) : ""), [shown, lay, colors, traced]);
 

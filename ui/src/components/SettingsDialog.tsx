@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useEvent } from "../lib/hooks";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { AlertCircle, Bot, Braces, Database, Check, Copy, Download, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, ShieldCheck, Terminal, Trash2, Timer, Palette, Workflow } from "lucide-react";
 import { api, toError } from "../lib/api";
@@ -469,7 +470,7 @@ function ProviderForm({
   const [kiro, setKiro] = useState<KiroStatus | null>(null);
   const isKiro = kind === "kiro";
 
-  const refreshKiro = async (id = initial?.id) => {
+  const refreshKiro = useEvent(async (id: string | undefined = initial?.id) => {
     if (!id) return;
     setBusy((b) => b ?? "status");
     try {
@@ -479,11 +480,13 @@ function ProviderForm({
     } finally {
       setBusy((b) => (b === "status" ? null : b));
     }
-  };
+  });
+  const savedId = initial?.id;
+  const savedKind = initial?.kind;
+  const savedAuth = initial?.config.auth;
   useEffect(() => {
-    if (initial?.kind === "kiro") void refreshKiro(initial.id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initial?.id, initial?.config.auth]);
+    if (savedId && savedKind === "kiro") void refreshKiro(savedId);
+  }, [savedId, savedKind, savedAuth, refreshKiro]);
 
   const changeKind = (k: ProviderKind) => {
     setKind(k);
@@ -571,18 +574,19 @@ function ProviderForm({
     }
   };
   // A saved provider lists its models on its own (cached; quiet when it can't, e.g. not signed in).
+  const savedHasKey = initial?.has_key;
   useEffect(() => {
-    if (!initial) return;
+    if (!savedId) return;
     let alive = true;
     void useAi
       .getState()
-      .loadModels(initial.id)
+      .loadModels(savedId)
       .then((m) => alive && setModels(m))
       .catch(() => {});
     return () => {
       alive = false;
     };
-  }, [initial?.id, initial?.config.auth, initial?.has_key]);
+  }, [savedId, savedAuth, savedHasKey]);
 
   const remove = () =>
     useStore.getState().askConfirm({

@@ -39,7 +39,7 @@ See [docs/FEATURES.md](docs/FEATURES.md) for the full reference.
 
 Requirements:
 
-- Rust 1.87+ and Node 20+ (Go 1.27+ only to build the Oracle driver helper)
+- Rust 1.87+ and Node 22.22+ (Go 1.27+ only to build the Oracle driver helper)
 - macOS: Xcode Command Line Tools · Linux: [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) · Windows: WebView2 and MSVC build tools
 
 ```sh
@@ -55,9 +55,11 @@ npm run app:build:no-duckdb   # bundle that uses the computer's DuckDB
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets
-cd ui && npm test && npm run build
+cd ui && npm run lint && npm test && npm run build
 npx playwright install chromium && npm run e2e   # UI smoke tests (in ui/)
 ```
+
+`npm run lint` is ESLint with the React hooks rules; a suppression must say why (`// eslint-disable-next-line rule -- reason`). `npm test` runs two Vitest projects: `unit` (`*.test.ts`, Node) and `dom` (`*.test.tsx`, components rendered with Testing Library in jsdom).
 
 The UI smoke tests (`ui/e2e`, Playwright) run the app in Chromium against a mocked backend (`ui/e2e/tauri-mock.js` answers the Tauri commands from test data and lets a test push backend events): the explorer (tree, columns, ER diagram), the job canvas (adding and linking steps, step details, run progress) and the AI panel (streamed answers, approvals, errors).
 

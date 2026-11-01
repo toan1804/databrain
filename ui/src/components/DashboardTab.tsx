@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useEvent } from "../lib/hooks";
 import { FileCode2, LayoutDashboard, Loader2, RefreshCw, Trash2 } from "lucide-react";
 import { pinOf, specFor, type ChartKind, type ChartPin, type Dashboard } from "../lib/charts";
 import type { ChartSpec, ResultInfo } from "../lib/types";
@@ -89,13 +90,17 @@ export function DashboardTab({ tabId, visible }: { tabId: string; visible: boole
     void useStore.getState().runSql(runKey(dash.id, c.id), c.connection_id, c.sql, 0, undefined, null, {}, DASH_ROW_LIMIT);
   };
   const refreshAll = () => dash?.charts.forEach(refresh);
-  // Run every chart's query the first time the tab is shown.
-  useEffect(() => {
-    if (visible && dash && !loaded) {
+  const firstLoad = useEvent(() => {
+    if (dash && !loaded) {
       setLoaded(true);
       refreshAll();
     }
-  }, [visible, dash?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  });
+  // Run every chart's query the first time the tab is shown.
+  const dashId = dash?.id;
+  useEffect(() => {
+    if (visible && dashId) firstLoad();
+  }, [visible, dashId, firstLoad]);
 
   if (!tab || !dash) return visible ? <p className="p-4 text-[12.5px] text-muted">This dashboard was deleted.</p> : null;
   const save = (d: Dashboard) => useStore.getState().saveDashboards(useStore.getState().dashboards.map((x) => (x.id === d.id ? d : x)));

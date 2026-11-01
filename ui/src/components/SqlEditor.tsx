@@ -1,4 +1,5 @@
 import { draftOf, setDraft, useDrafts } from "../drafts";
+import { useEvent } from "../lib/hooks";
 import { memo, useEffect, useRef, useState } from "react";
 import { closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
@@ -224,22 +225,29 @@ export const SqlEditor = memo(function SqlEditor({ tabId, visible }: { tabId: st
   }, [tabId]);
 
   // Keep the dialect in sync; prefetch schemas for completion.
-  useEffect(() => {
-    viewRef.current?.dispatch({ effects: lang.current.reconfigure(langExtension(conn?.config.kind)) });
+  // `conn` is a new object on every connections refresh: key on its id and kind.
+  const prefetch = useEvent(() => {
     if (conn && canFetchMetadata(conn)) useStore.getState().loadSchemas(conn.id).catch(() => {});
-  }, [conn?.config.kind, conn?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  });
+  const kind = conn?.config.kind;
+  const connId = conn?.id;
+  useEffect(() => {
+    viewRef.current?.dispatch({ effects: lang.current.reconfigure(langExtension(kind)) });
+    prefetch();
+  }, [kind, connId, prefetch]);
 
   // External document changes (e.g. opening a saved query into this tab).
+  const sql = tab?.sql;
   useEffect(() => {
     const v = viewRef.current;
-    if (!v || tab === undefined) return;
+    if (!v || sql === undefined) return;
     // Newer text is still being typed: this is an older flush, not an outside change.
     if (draftOf(tabId) !== undefined) return;
     const cur = v.state.doc.toString();
-    if (tab.sql !== cur) {
-      v.dispatch({ changes: { from: 0, to: cur.length, insert: tab.sql } });
+    if (sql !== cur) {
+      v.dispatch({ changes: { from: 0, to: cur.length, insert: sql } });
     }
-  }, [tab?.sql]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sql, tabId]);
 
   // `:name` parameters: highlight them and list them in the parameter bar (debounced).
   useEffect(() => {

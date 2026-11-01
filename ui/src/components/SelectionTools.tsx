@@ -57,7 +57,8 @@ export function SelectionSummaryBar({ info, view, range }: { info: ResultInfo; v
       live = false;
       clearTimeout(t);
     };
-  }, [info.id, view, key]); // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `range` is a new object per selection event; `key` is its content
+  }, [info.id, view, key]);
   if (!sum) return null;
   return (
     <span className="flex min-w-0 items-center gap-2 overflow-hidden" aria-label="Selection summary">

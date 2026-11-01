@@ -54,7 +54,10 @@ function ScopeDialog() {
   const toggle = (names: string[], on: boolean) =>
     setSelected((prev) => {
       const next = new Set(prev);
-      for (const n of names) (on ? next.add(n) : next.delete(n));
+      for (const n of names) {
+        if (on) next.add(n);
+        else next.delete(n);
+      }
       return next;
     });
   const visibleNames = shown.flatMap((c) => c.schemas.map((s) => s.name));

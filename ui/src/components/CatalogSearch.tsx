@@ -84,7 +84,8 @@ export function CatalogSearch({ tree, connectionsTree }: { tree: ReactNode; conn
         })
         .catch(() => {});
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // `targets` is a new array each render; `targetKey` is what it holds.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on targetKey
   }, [q, targetKey]);
 
   // Server-side search, debounced; stale responses are dropped.
@@ -112,7 +113,7 @@ export function CatalogSearch({ tree, connectionsTree }: { tree: ReactNode; conn
       }
     }, 200);
     return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on targetKey (`scoped` is one of the targets)
   }, [q, targetKey]);
 
   // Cached explorer objects show instantly; server hits are merged in.

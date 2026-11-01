@@ -1,4 +1,5 @@
 // Side panel of the selected step: name, action, connection, SQL or rows,
+import { useEvent } from "../../lib/hooks";
 // load or export settings, outcome and log.
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, FolderOpen, Info, Eye, Play, Square, Trash2 } from "lucide-react";
@@ -44,6 +45,7 @@ export function NodePanel({
   const queryTabs = useMemo(() => allTabs.filter(isQueryTab), [allTabs]);
   const output = useStore((s) => s.outputs.find((x) => x.tab_id === EDITOR_KEY(job.id, node.id) && x.active && x.state !== "evicted"));
   const [name, setName] = useState(node.name);
+  const rename = useEvent((name: string) => onChange({ name }));
   const ups = upstreamOf(job, node.id).map((id) => job.nodes.find((n) => n.id === id)!).filter(Boolean);
   const downs = job.edges.filter((e) => e.from === node.id).map((e) => job.nodes.find((n) => n.id === e.to)!).filter(Boolean);
   // Known at once: format, this job's steps, other jobs' steps and named outputs.
@@ -65,7 +67,7 @@ export function NodePanel({
         .then((user) => {
           if (!live) return;
           setRemote({ name, user });
-          if (!user) onChange({ name });
+          if (!user) rename(name);
         })
         .catch(() => {});
     }, 250);
@@ -73,7 +75,7 @@ export function NodePanel({
       live = false;
       clearTimeout(t);
     };
-  }, [name, localProblem]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [name, localProblem, node.name, job.id, rename]);
   const nameProblem = localProblem ?? (remote?.name === name && remote.user ? `results.${name} is already used by ${remote.user}` : null);
   const results = connections.find(isResults);
   const runsOn = node.kind !== "query" || !node.connection_id ? results : connections.find((c) => c.id === node.connection_id);

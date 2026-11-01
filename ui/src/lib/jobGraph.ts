@@ -186,7 +186,7 @@ export function exportFileName(template: string | null | undefined, step: string
     .replaceAll("{job}", job)
     .replaceAll("{date}", `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}`)
     .replaceAll("{time}", `${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`);
-  // eslint-disable-next-line no-control-regex
+  // eslint-disable-next-line no-control-regex -- control characters aren't allowed in file names
   name = name.replace(/[/\\:*?"<>|\x00-\x1f]/g, "_").trim().replace(/^\.+/, "") || step;
   return name.toLowerCase().endsWith(`.${format}`) ? name : `${name}.${format}`;
 }

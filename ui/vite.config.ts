@@ -23,7 +23,11 @@ export default defineConfig({
     chunkSizeWarningLimit: 2000,
   },
   test: {
-    environment: "node",
-    include: ["src/**/*.test.ts"],
+    projects: [
+      // Pure logic: no DOM.
+      { extends: true, test: { name: "unit", environment: "node", include: ["src/**/*.test.ts"] } },
+      // Components: rendered with Testing Library in jsdom.
+      { extends: true, test: { name: "dom", environment: "jsdom", include: ["src/**/*.test.tsx"], setupFiles: ["src/test/setup.ts"] } },
+    ],
   },
 });

@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useEvent } from "../lib/hooks";
 import { EditorState } from "@codemirror/state";
 import { EditorView, lineNumbers } from "@codemirror/view";
 import { syntaxHighlighting } from "@codemirror/language";
@@ -26,7 +27,7 @@ export function DdlTab({ tabId, reference, visible }: { tabId: string; reference
   const [state, setState] = useState<State>({ status: "loading" });
   const seq = useRef(0);
 
-  const load = useCallback(async () => {
+  const load = useEvent(async () => {
     const my = ++seq.current;
     setState({ status: "loading" });
     if (!conn) return setState({ status: "error", message: "The connection of this tab no longer exists." });
@@ -37,13 +38,12 @@ export function DdlTab({ tabId, reference, visible }: { tabId: string; reference
     } catch (e) {
       if (my === seq.current) setState({ status: "error", message: toError(e).message });
     }
-    // Reload only when the object or connection changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conn?.id, reference.schema, reference.name, reference.kind]);
+  });
 
+  // Reload only when the object or connection changes.
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [conn?.id, reference.schema, reference.name, reference.kind, load]);
 
   const raw = state.status === "ready" ? state.ddl : null;
   // Format: the DDL as DataBrain formats SQL (connection's dialect); off = as the server returned it.

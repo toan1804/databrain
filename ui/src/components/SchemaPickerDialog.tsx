@@ -47,7 +47,6 @@ export function SchemaPickerDialog() {
         .catch((e) => setError(String(e?.message ?? e)))
         .finally(() => setLoading(false));
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connId]);
 
   const level = useMemo(

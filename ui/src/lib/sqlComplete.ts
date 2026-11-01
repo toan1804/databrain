@@ -210,7 +210,7 @@ export function clauseContext(before: string): Context {
   const toks = before.match(new RegExp(`${IDENT}|[(),;*=<>!+\\-/]|\\S`, "g")) ?? [];
   if (toks.length === 0) return "start";
   // Walk back over the current FROM list: ident(.ident)* [alias] ,
-  let i = toks.length - 1;
+  const i = toks.length - 1;
   const last = toks[i].toLowerCase();
   if (TABLE_KEYWORDS.has(last)) return "table";
   if (last === ",") {
