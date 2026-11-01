@@ -122,7 +122,8 @@ mod tests {
         let t = std::time::Instant::now();
         let e = reach("127.0.0.1", port, Duration::from_secs(5)).await.unwrap_err();
         assert!(e.message.contains("refused"), "{}", e.message);
-        assert!(t.elapsed() < Duration::from_secs(2));
+        // Windows retries a refused connect (about 2 s in all).
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
     }
 
     #[tokio::test]

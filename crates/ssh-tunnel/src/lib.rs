@@ -252,7 +252,8 @@ mod tests {
 
     #[test]
     fn expands_home() {
-        let h = std::env::var("HOME").unwrap_or_default();
+        // Windows has no HOME: the profile folder is used.
+        let h = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
         assert_eq!(expand_home("~/.ssh/id_ed25519"), format!("{h}/.ssh/id_ed25519"));
         assert_eq!(expand_home("/abs"), "/abs");
     }
