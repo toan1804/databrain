@@ -945,6 +945,47 @@ async fn jobs_follow_the_ai_policy() {
     assert!(refused(&o, "step dst"), "the target no longer allows writes: {o}");
 }
 
+/// On a database without a read-only session mode, `SELECT dbo.write_fn()`
+/// can write: where the AI may not write, only the user may run it, even
+/// with automatic reads, and never an MCP client.
+#[tokio::test]
+async fn functions_that_could_write_need_the_user() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = mock_openai(requests.clone()).await;
+    let f = fixture(port, AiPolicy::default()).await;
+    let shop = f.ws.get_connection(&f.conn).unwrap();
+    let mut config = shop.config.clone();
+    config.kind = ConnectorKind::Mssql;
+    let policy = AiPolicy { run_query: RunQueryPolicy::AutoRead, mcp_enabled: true, ..AiPolicy::default() };
+    let mssql = f.ws.save_connection(ConnectionProfile { id: String::new(), name: "Warehouse".into(), config, ai_policy: policy, ..shop.clone() }).unwrap();
+    let ctx = |caller: databrain_ai::Caller, host: Arc<Host>| databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: mssql.clone(),
+        session_id: Some("s".into()),
+        caller,
+        host,
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+    };
+    let declines = Arc::new(Host { approvals: AtomicUsize::new(0), approve: false });
+    let agent = ctx(databrain_ai::Caller::Agent, declines.clone());
+    let mcp = ctx(databrain_ai::Caller::Mcp, declines.clone());
+    let call = json!({"sql": "select dbo.write_fn()"});
+    let o = mcp.call("run_query", &call).await.content;
+    assert!(o.contains("dbo.write_fn") && o.contains("an MCP client can't"), "{o}");
+    assert_eq!(declines.approvals.load(Ordering::SeqCst), 0);
+    assert!(f.ws.list_audit(5).unwrap().iter().any(|a| a.tool == "run_query" && a.decision == "blocked"));
+    let o = agent.call("run_query", &call).await.content;
+    assert!(o.contains("declined"), "{o}");
+    assert_eq!(declines.approvals.load(Ordering::SeqCst), 1, "asked although reads run automatically");
+    // A job step calling it needs the user too.
+    let job = json!({"name": "Fn", "steps": [{"name": "fn_step", "connection": "Warehouse", "sql": "select dbo.write_fn()"}]});
+    let o = mcp.call("create_job", &job).await.content;
+    assert!(o.contains("step fn_step") && o.contains("an MCP client can't"), "{o}");
+    assert!(f.ws.list_jobs().unwrap().is_empty());
+}
+
 /// "Ask AI" about a connection test error: the conversation is filed under a
 /// connection, but the assistant must not connect to it (that could start a
 /// sign-in), read its schema, or run tools.

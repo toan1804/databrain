@@ -35,6 +35,10 @@ pub fn review_sql(profile: &ConnectionProfile, sql: &str) -> SqlReview {
     let mut decision = decide(profile, policy, &stmts, worst);
     if profile.config.read_only && !matches!(decision, Decision::Deny(_)) {
         decision = read_only_decision(profile, &pieces, &stmts).unwrap_or(decision);
+    } else if !policy.allow_write && !matches!(decision, Decision::Deny(_)) {
+        // Not read-only, but the AI may not write: a "read" calling a user
+        // function can still write through it.
+        decision = function_writes(profile, &pieces, "the AI may not write on this connection").unwrap_or(decision);
     }
     // Tables the AI may read / write (checked after the connection-wide rules,
     // so their reasons come first).
@@ -110,22 +114,35 @@ pub fn write_denied(profile: &ConnectionProfile) -> Option<String> {
 /// - Session and transaction statements are denied like writes (`SET
 ///   default_transaction_read_only = off`, `BEGIN READ WRITE`), except a
 ///   harmless `USE` or `SET` (see `read_only_allows`).
-/// - Where the database has no read-only mode, a query calling functions
-///   that are not known built-ins could write through them: only the user
-///   in DataBrain may approve it, never automatically or by an MCP client.
+/// - Functions that could write need the user (see [`function_writes`]).
 fn read_only_decision(profile: &ConnectionProfile, pieces: &[databrain_connector_core::sql::StatementSpan], stmts: &[Classification]) -> Option<Decision> {
-    use databrain_connector_core::sql::{read_only_allows, unknown_functions};
+    use databrain_connector_core::sql::read_only_allows;
     if let Some((_, c)) = pieces.iter().zip(stmts).find(|(p, c)| !read_only_allows(&p.sql, c)) {
         return Some(Decision::Deny(format!("the connection is read-only: {} statements are not run on it", c.keyword)));
     }
+    function_writes(profile, pieces, "the connection is read-only")
+}
+
+/// `Confirm` when the database has no read-only session mode and the SQL
+/// calls functions that are not known built-ins (`SELECT dbo.write_fn()`
+/// is a read to the parser, but the function may write): the AI may not
+/// write here (`why`), so only the user in DataBrain may approve it, never
+/// automatically or by an MCP client.
+fn function_writes(profile: &ConnectionProfile, pieces: &[databrain_connector_core::sql::StatementSpan], why: &str) -> Option<Decision> {
+    use databrain_connector_core::sql::unknown_functions;
     let kind = profile.config.kind;
     if kind.server_read_only() {
         return None;
     }
-    let fns: Vec<String> = pieces.iter().flat_map(|p| unknown_functions(&p.sql, kind)).collect();
+    let mut fns: Vec<String> = Vec::new();
+    for f in pieces.iter().flat_map(|p| unknown_functions(&p.sql, kind)) {
+        if !fns.contains(&f) {
+            fns.push(f);
+        }
+    }
     (!fns.is_empty()).then(|| {
         Decision::Confirm(format!(
-            "{} has no read-only mode on the server, and this query calls {}, which could write",
+            "{} has no read-only mode on the server, and this query calls {}, which could write ({why})",
             kind.traits().name,
             fns.join(", ")
         ))
@@ -207,6 +224,81 @@ mod tests {
         let rules = profile(EnvTag::Dev, AiPolicy { run_query: RunQueryPolicy::AutoRead, read_deny: vec!["%.hr.%".into()], ..Default::default() });
         assert_eq!(review_sql(&rules, "select * from sales.orders").decision, Decision::Allow);
         assert!(matches!(review_sql(&rules, "select * from hr.pay").decision, Decision::Deny(r) if r.contains("hr.pay")));
+    }
+
+    fn on(kind: ConnectorKind, read_only: bool, policy: AiPolicy) -> ConnectionProfile {
+        let mut p = profile(EnvTag::Dev, policy);
+        p.config.kind = kind;
+        p.config.read_only = read_only;
+        p
+    }
+
+    fn auto_read() -> AiPolicy {
+        AiPolicy { run_query: RunQueryPolicy::AutoRead, ..Default::default() }
+    }
+
+    /// `SELECT dbo.write_fn()` parses as a read; where the server has no
+    /// read-only session mode the function can still write.
+    #[test]
+    fn confirms_functions_that_could_write() {
+        use ConnectorKind::*;
+        let calls = [
+            (Mssql, "select dbo.write_fn()", "dbo.write_fn"),
+            (Snowflake, "select db.sch.write_fn(1)", "db.sch.write_fn"),
+            (Databricks, "select main.default.write_fn(id) from t", "main.default.write_fn"),
+            (Bigquery, "select ds.write_fn()", "ds.write_fn"),
+            (Oracle, "select pkg.write_fn() from dual", "pkg.write_fn"),
+        ];
+        for (kind, sql, f) in calls {
+            // The default posture (not read-only, allow_write off), even with automatic reads.
+            for p in [on(kind, false, AiPolicy::default()), on(kind, false, auto_read()), on(kind, true, auto_read())] {
+                match review_sql(&p, sql).decision {
+                    Decision::Confirm(r) => assert!(r.contains(f) && r.contains("could write"), "{kind:?}: {r}"),
+                    d => panic!("{kind:?} read_only={} {sql}: {d:?}", p.config.read_only),
+                }
+            }
+            // Built-ins only: an ordinary read.
+            assert_eq!(review_sql(&on(kind, false, auto_read()), "select count(*), lower(name) from t").decision, Decision::Allow, "{kind:?}");
+            // The AI may write here: writes are its to make (with approval when they look like writes).
+            let writer = on(kind, false, AiPolicy { allow_write: true, ..auto_read() });
+            assert_eq!(review_sql(&writer, sql).decision, Decision::Allow, "{kind:?}");
+        }
+        // A table function counts too; each function is named once.
+        match review_sql(&on(Mssql, false, auto_read()), "select * from dbo.tvf(1) a join dbo.tvf(2) b on 1=1").decision {
+            Decision::Confirm(r) => assert_eq!(r.matches("dbo.tvf").count(), 1, "{r}"),
+            d => panic!("{d:?}"),
+        }
+        // SQL that can't be parsed: assume the worst.
+        assert!(matches!(review_sql(&on(Mssql, false, auto_read()), "select dbo.f( from").decision, Decision::Confirm(_) | Decision::Deny(_)));
+        // A read-only session on the server stops writes in functions.
+        assert_eq!(review_sql(&on(Postgres, true, auto_read()), "select public.write_fn()").decision, Decision::Allow);
+    }
+
+    #[test]
+    fn read_only_connections() {
+        use ConnectorKind::*;
+        let ro = on(Postgres, true, AiPolicy { allow_write: true, ..auto_read() });
+        for sql in ["delete from t where id = 1", "create table x (a int)", "set default_transaction_read_only = off", "begin read write", "commit", "select 1; update t set a = 1"] {
+            assert!(matches!(review_sql(&ro, sql).decision, Decision::Deny(_)), "{sql}");
+        }
+        assert_eq!(review_sql(&ro, "select * from t").decision, Decision::Allow);
+        // Harmless settings are not refused (the user approves session changes).
+        for sql in ["set search_path = sales", "set statement_timeout = 1000"] {
+            assert!(matches!(review_sql(&ro, sql).decision, Decision::Ask(_)), "{sql}");
+        }
+        let sf = on(Snowflake, true, auto_read());
+        assert!(matches!(review_sql(&sf, "use role accountadmin").decision, Decision::Deny(_)), "another role may write");
+        assert!(!matches!(review_sql(&sf, "use warehouse wh").decision, Decision::Deny(_)));
+        assert!(matches!(review_sql(&on(Mysql, true, auto_read()), "set session transaction read write").decision, Decision::Deny(_)));
+        assert!(matches!(review_sql(&on(Duckdb, true, auto_read()), "attach 'x.db' as x").decision, Decision::Deny(_)));
+        // Loads into a connection.
+        assert!(write_denied(&ro).is_some_and(|r| r.contains("read-only")));
+        assert!(write_denied(&on(Postgres, false, AiPolicy::default())).is_some_and(|r| r.contains("not allowed")));
+        let mut prod = on(Postgres, false, AiPolicy { allow_write: true, ..Default::default() });
+        assert_eq!(write_denied(&prod), None);
+        prod.env = EnvTag::Prod;
+        assert!(write_denied(&prod).is_some_and(|r| r.contains("production")));
+        assert!(write_denied(&on(Postgres, false, AiPolicy { allow_write: true, ai_enabled: false, ..Default::default() })).is_some());
     }
 
     #[test]
