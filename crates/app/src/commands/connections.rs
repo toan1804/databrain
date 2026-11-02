@@ -63,6 +63,11 @@ pub(crate) async fn reconnect(state: State<'_, AppState>, id: String) -> R<usize
 }
 
 #[tauri::command]
+pub(crate) async fn trust_ssh_host_key(state: State<'_, AppState>, host: String, port: u16, fingerprint: String) -> R<usize> {
+    api::trust_ssh_host_key(&state, &host, port, &fingerprint)
+}
+
+#[tauri::command]
 pub(crate) fn export_connections(state: State<'_, AppState>, ids: Option<Vec<String>>, path: String) -> R<usize> {
     conn_io::export_connections(&state, ids, &path)
 }

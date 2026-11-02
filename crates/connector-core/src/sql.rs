@@ -451,7 +451,7 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
         Ok(stmts) if !stmts.is_empty() => {
             let mut out = Classification { kind: StatementKind::Read, missing_where: false, keyword: keyword.clone() };
             for s in &stmts {
-                let (k, mw) = classify_ast(s, &keyword);
+                let (k, mw) = classify_ast(s);
                 out.kind = out.kind.max(k);
                 out.missing_where |= mw;
             }
@@ -463,15 +463,17 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
                 k = StatementKind::Dml;
             }
             if k == StatementKind::Read {
-                // Unparseable but looks like a read; don't claim certainty.
-                k = if keyword == "SELECT" && !contains_dml_word(sql) { StatementKind::Read } else { StatementKind::Unknown };
+                // Unparseable but looks like a read: a read only when no word
+                // in it can act (T-SQL runs `SELECT 1 EXEC xp_cmdshell …` as
+                // two statements without a separator).
+                k = if keyword == "SELECT" && !contains_dml_word(sql) && !contains_action_word(sql) { StatementKind::Read } else { StatementKind::Unknown };
             }
             Classification { kind: k, missing_where: false, keyword }
         }
     }
 }
 
-fn classify_ast(s: &Statement, keyword: &str) -> (StatementKind, bool) {
+fn classify_ast(s: &Statement) -> (StatementKind, bool) {
     use StatementKind as K;
     match s {
         Statement::Query(q) => (query_kind(q), false),
@@ -484,11 +486,12 @@ fn classify_ast(s: &Statement, keyword: &str) -> (StatementKind, bool) {
         // which EXPLAIN forms run the statement. A plain EXPLAIN of a write
         // counts as that write too: being stricter costs a confirmation.
         Statement::Explain { statement, .. } => {
-            let (inner, missing_where) = classify_ast(statement, &leading_keyword(&statement.to_string()));
+            let (inner, missing_where) = classify_ast(statement);
             (K::Read.max(inner), missing_where)
         }
         Statement::ExplainTable { .. } => (K::Read, false),
-        _ => (keyword_kind(keyword), false),
+        // The statement's own keyword: in `select 1; exec p`, EXEC's is EXEC.
+        _ => (keyword_kind(&leading_keyword(&s.to_string())), false),
     }
 }
 
@@ -525,6 +528,62 @@ pub(crate) fn keyword_kind(kw: &str) -> StatementKind {
         "" => K::Unknown,
         _ => K::Other,
     }
+}
+
+/// Words that act (run code, change state or permissions, reach files)
+/// besides INSERT/UPDATE/DELETE…: unparsed SQL with one isn't a read.
+fn contains_action_word(sql: &str) -> bool {
+    const ACTION: &[&str] = &[
+        "EXEC",
+        "EXECUTE",
+        "CALL",
+        "DO",
+        "GRANT",
+        "REVOKE",
+        "DECLARE",
+        "BEGIN",
+        "WAITFOR",
+        "KILL",
+        "SHUTDOWN",
+        "BACKUP",
+        "RESTORE",
+        "DBCC",
+        "BULK",
+        "OPENROWSET",
+        "OPENQUERY",
+        "OPENDATASOURCE",
+        "SET",
+        "USE",
+        "COPY",
+        "LOAD",
+        "ATTACH",
+        "DETACH",
+        "PRAGMA",
+        "VACUUM",
+        "REPLACE",
+        "UPSERT",
+        "RENAME",
+        "COMMENT",
+        "HANDLER",
+        "LOCK",
+        "UNLOCK",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT",
+        "RESET",
+        "DISCARD",
+        "REFRESH",
+        "IMPORT",
+        "EXPORT",
+        "UNLOAD",
+        "PUT",
+        "REMOVE",
+        "CHECKPOINT",
+        "CLUSTER",
+        "REINDEX",
+        "SYSTEM",
+    ];
+    words(sql).any(|w| ACTION.iter().any(|k| w.eq_ignore_ascii_case(k)))
 }
 
 fn contains_dml_word(sql: &str) -> bool {
@@ -1200,8 +1259,14 @@ fn is_number(t: &str) -> bool {
     int_ok && frac_ok && exp_ok && !leading_zero
 }
 
-/// One complete `'…'` literal (optionally `N'…'` / `E'…'`).
+/// One complete `'…'` literal (optionally `N'…'` / `E'…'`), kept as typed.
+/// A literal with a backslash isn't: where its end depends on whether the
+/// server reads backslashes as escapes (MySQL `NO_BACKSLASH_ESCAPES`), the
+/// typed text is quoted as a value instead.
 fn is_string_literal(t: &str, kind: ConnectorKind) -> bool {
+    if lex(kind).backslash_escapes && t.contains('\\') {
+        return false;
+    }
     let b = t.as_bytes();
     let start = match b.first() {
         Some(b'\'') => 0,
@@ -1211,10 +1276,21 @@ fn is_string_literal(t: &str, kind: ConnectorKind) -> bool {
     b.len() >= start + 2 && skip_quoted(b, start, b'\'', lex(kind).backslash_escapes) == b.len() && b[b.len() - 1] == b'\''
 }
 
-/// `'text'` with the dialect's escaping (doubled quotes; backslashes where
-/// the dialect treats them as escapes).
+/// `'text'` with the dialect's escaping: the one text escaper (parameters,
+/// load INSERTs, SQL export). Where backslashes may escape, they are
+/// doubled, so a value ending in `\` can't escape the closing quote.
+/// Quotes are doubled where the dialect accepts it, so the literal ends at
+/// the same place whether or not the server reads backslashes as escapes
+/// (MySQL `NO_BACKSLASH_ESCAPES`); BigQuery and Databricks only accept `\'`.
 pub fn quote_string(t: &str, kind: ConnectorKind) -> String {
-    if lex(kind).backslash_escapes { format!("'{}'", t.replace('\\', "\\\\").replace('\'', "\\'")) } else { format!("'{}'", t.replace('\'', "''")) }
+    if !lex(kind).backslash_escapes {
+        return format!("'{}'", t.replace('\'', "''"));
+    }
+    let t = t.replace('\\', "\\\\");
+    match kind {
+        ConnectorKind::Bigquery | ConnectorKind::Databricks => format!("'{}'", t.replace('\'', "\\'")),
+        _ => format!("'{}'", t.replace('\'', "''")),
+    }
 }
 
 /// Replace every parameter of `sql`. Errors with the names that have no value.
@@ -1254,6 +1330,39 @@ mod param_tests {
     use super::*;
     use ConnectorKind as K;
     use std::collections::HashMap;
+
+    /// A rendered value is one literal that ends at its last character
+    /// whether or not the server reads backslashes as escapes (MySQL
+    /// `NO_BACKSLASH_ESCAPES`), for hostile values and typed literals alike.
+    #[test]
+    fn values_stay_inside_their_quotes() {
+        let ends_at_last = |lit: &str, backslash: bool| {
+            let b = lit.as_bytes();
+            let start = usize::from(b[0] != b'\'');
+            skip_quoted(b, start, b'\'', backslash) == b.len()
+        };
+        let hostile = ["x\\' or 1=1 --", "a\\", "it's", "\\\\'; drop table t; --", "'x\\' or 1=1 --'", "plain"];
+        for kind in [K::Mysql, K::Clickhouse, K::Snowflake, K::Postgres, K::Mssql] {
+            for v in hostile {
+                let lit = render_param(&ParamValue { value: v.into(), raw: false }, kind).unwrap();
+                // Engines that may read backslashes are checked both ways.
+                let both = !lex(kind).backslash_escapes || ends_at_last(&lit, true);
+                assert!(both && ends_at_last(&lit, false), "{kind:?}: {v} → {lit}");
+            }
+        }
+        // BigQuery and Databricks always read backslashes (and don't accept '').
+        for kind in [K::Bigquery, K::Databricks] {
+            for v in hostile {
+                let lit = render_param(&ParamValue { value: v.into(), raw: false }, kind).unwrap();
+                assert!(ends_at_last(&lit, true) && !lit[1..lit.len() - 1].contains("''"), "{kind:?}: {v} → {lit}");
+            }
+            assert_eq!(quote_string("it's", kind), "'it\\'s'");
+        }
+        assert_eq!(quote_string("a\\b'c", K::Mysql), "'a\\\\b''c'");
+        // A typed literal is kept unless its end depends on the backslash mode.
+        assert_eq!(render_param(&ParamValue { value: "'2026-09-09'".into(), raw: false }, K::Mysql).as_deref(), Some("'2026-09-09'"));
+        assert_ne!(render_param(&ParamValue { value: "'x\\' or 1=1 --'".into(), raw: false }, K::Mysql).as_deref(), Some("'x\\' or 1=1 --'"));
+    }
 
     fn names(sql: &str, k: K) -> Vec<String> {
         find_parameters(sql, k).into_iter().map(|p| p.name).collect()

@@ -200,7 +200,7 @@ Connector-specific UI (a driver panel, sign-in hints) is optional. Without it, t
 - **Cloud CLI reuse** (`cloud.rs`): gcloud application default credentials, service account files, `~/.databrickscfg` and `databricks auth token`, the AWS CLI for Redshift IAM, and `az` for SQL Server and Azure OpenAI. DataBrain only reads these files and never changes them.
 - **Terminal sign-ins** (`terminal.rs`): runs commands such as `kiro-cli login` in the terminal the user chose, and detects terminals that don't start the command.
 - **Secret stores** (`vault.rs`): `KeychainStore` (macOS Keychain, Windows Credential Manager, Secret Service through `keyring`) or `VaultStore` (AES-256-GCM, `vault.json` plus an owner-only `vault.key` in app data). `SwitchableStore` selects one from the `credential_store` setting (keychain by default) and moves secrets when the user switches in Settings.
-- **SSH** (`crates/ssh-tunnel`): local forwarding on `127.0.0.1:<random>` through `direct-tcpip` channels. The server key's SHA-256 fingerprint is pinned on first use, and a changed key fails the connection.
+- **SSH** (`crates/ssh-tunnel`): local forwarding on `127.0.0.1:<random>` through `direct-tcpip` channels. A server with no pinned key is refused before authenticating (`TunnelError::UnknownHostKey`, code `ssh_host_key_unknown`); the app shows the fingerprint and `trust_ssh_host_key` pins it once the user trusts it. A changed key fails the connection. Imports drop pinned fingerprints.
 
 ---
 

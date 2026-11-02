@@ -92,7 +92,7 @@ export function SshSection({ f }: { f: ConnectionFormState }) {
                 </button>
               </>
             ) : (
-              <span className="text-muted">pinned on first connect (trust on first use)</span>
+              <span className="text-muted">not trusted yet: the first connection shows its fingerprint for you to check and trust</span>
             )}
           </div>
         </>

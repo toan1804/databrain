@@ -82,18 +82,13 @@ impl QueryEngine {
             target_port,
         })
         .await
-        .map_err(|e| EngineError::new("connection", e.to_string()))?;
-        // Trust on first use: pin the server key.
-        if ssh.host_key_fingerprint.is_none() {
-            if let Some(id) = owner_id {
-                if let Ok(mut p) = self.workspace.get_connection(id) {
-                    if let Some(s) = p.config.ssh.as_mut() {
-                        s.host_key_fingerprint = Some(t.fingerprint().to_string());
-                        let _ = self.workspace.save_connection(p);
-                    }
-                }
+        .map_err(|e| match e {
+            // The user checks and trusts the key (the app asks); nothing is pinned unseen.
+            databrain_ssh_tunnel::TunnelError::UnknownHostKey { .. } => {
+                EngineError { code: Some("ssh_host_key_unknown".into()), ..EngineError::new("connection", e.to_string()) }
             }
-        }
+            e => EngineError::new("connection", e.to_string()),
+        })?;
         let mut rewritten = cfg.clone();
         rewritten.host = Some("127.0.0.1".into());
         rewritten.port = Some(t.local_port());
@@ -105,6 +100,31 @@ impl QueryEngine {
     /// Seconds a connection attempt may take before it is reported as failed
     /// (setting `connect_timeout_secs`, default 20). Browser/device sign-in
     /// is not limited (the user may take a while), only cancellable.
+    /// The user checked `fingerprint` (shown when a connection through the
+    /// SSH server `host:port` was refused) and trusts it: pin it on every
+    /// saved connection through that server that has no key pinned yet.
+    /// Returns how many were updated.
+    pub fn trust_ssh_host_key(&self, host: &str, port: u16, fingerprint: &str) -> Result<usize> {
+        let fp = fingerprint.trim();
+        let valid = fp.strip_prefix("SHA256:").is_some_and(|b| !b.is_empty() && b.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')));
+        if !valid {
+            return Err(EngineError::new("invalid", format!("not an SSH key fingerprint: {fp}")));
+        }
+        let mut n = 0;
+        for mut p in self.workspace.list_connections()? {
+            let Some(s) = p.config.ssh.as_mut() else { continue };
+            if s.host_key_fingerprint.is_some() || !s.host.trim().eq_ignore_ascii_case(host.trim()) || s.port != port {
+                continue;
+            }
+            s.host_key_fingerprint = Some(fp.to_string());
+            let id = p.id.clone();
+            self.workspace.save_connection(p)?;
+            self.disconnect(&id);
+            n += 1;
+        }
+        Ok(n)
+    }
+
     pub fn connect_timeout(&self) -> Duration {
         let secs = self.workspace.get_setting("connect_timeout_secs").ok().flatten().and_then(|v| v.as_u64()).unwrap_or(20);
         Duration::from_secs(secs.clamp(3, 600))

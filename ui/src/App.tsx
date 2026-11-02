@@ -18,6 +18,7 @@ import { SettingsDialog } from "./components/SettingsDialog";
 import { SignInDialog } from "./components/SignInDialog";
 import { IndexScopeDialog } from "./components/IndexScopeDialog";
 import { OracleClientDialog } from "./components/OracleClient";
+import { SshHostKeyDialog } from "./components/SshHostKeyDialog";
 import { InlineAi } from "./components/InlineAi";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { MoveToApplications } from "./components/MoveToApplications";
@@ -225,6 +226,7 @@ export default function App() {
       <SignInDialog />
       <IndexScopeDialog />
       <OracleClientDialog />
+      <SshHostKeyDialog />
       <InlineAi />
       <ConfirmDialog />
       <ExcelSheetDialog />

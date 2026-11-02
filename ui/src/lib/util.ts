@@ -168,8 +168,10 @@ export function quoteIdent(kind: ConnectorKind, ident: string): string {
   if (safe.test(ident) && !RESERVED.has(ident.toLowerCase())) return ident;
   switch (t.quote) {
     case "backtick":
-    case "backtick_backslash":
       return "`" + ident.replace(/`/g, "``") + "`";
+    // ClickHouse, BigQuery: backslash escapes (the backslash itself first).
+    case "backtick_backslash":
+      return "`" + ident.replace(/\\/g, "\\\\").replace(/`/g, "\\`") + "`";
     case "bracket":
       return "[" + ident.replace(/]/g, "]]") + "]";
     default:

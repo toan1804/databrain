@@ -186,8 +186,11 @@ pub struct ClientStatus {
     pub installed: bool,
     /// e.g. "23.26.2.0.0"
     pub version: Option<String>,
-    /// Directory in use or found.
+    /// Directory in use or checked.
     pub lib_dir: Option<String>,
+    /// A folder with Instant Client found on the computer but not loaded:
+    /// DataBrain loads only a folder the user chose or it installed.
+    pub found: Option<String>,
     pub message: Option<String>,
     pub platform: Platform,
 }
@@ -203,11 +206,14 @@ pub fn init_client(dir: Option<&str>, extra: &[PathBuf]) -> Result<(), InitError
         return Ok(());
     }
     let chosen = chosen_dir(dir, extra);
+    // No folder chosen: nothing is loaded (not even from the system's
+    // library search path, which a download can reach).
+    let Some(d) = chosen else {
+        return Err(InitError::Load("DPI-1047: Cannot locate Oracle Instant Client: choose its folder or install it".into()));
+    };
     let mut p = oracle::InitParams::new();
-    if let Some(d) = &chosen {
-        check_trusted(d).map_err(InitError::Changed)?;
-        p.oracle_client_lib_dir(d.as_str()).map_err(|e| InitError::Load(e.to_string()))?;
-    }
+    check_trusted(&d).map_err(InitError::Changed)?;
+    p.oracle_client_lib_dir(d.as_str()).map_err(|e| InitError::Load(e.to_string()))?;
     p.init().map(|_| ()).map_err(|e| InitError::Load(e.to_string()))
 }
 
@@ -229,12 +235,17 @@ impl std::fmt::Display for InitError {
     }
 }
 
-/// The folder Instant Client is loaded from: `dir`, the default folder, or the first found.
+/// The folder Instant Client is loaded from: `dir` (the connection's),
+/// the default folder (chosen by the user or installed by DataBrain), or
+/// one in DataBrain's own folders (`extra`). Never a folder that merely
+/// exists elsewhere (Downloads, the home folder, the library path): its
+/// libraries would be loaded into the app, and a downloaded file is not a
+/// choice.
 fn chosen_dir(dir: Option<&str>, extra: &[PathBuf]) -> Option<String> {
     dir.map(str::to_string)
         .filter(|d| !d.trim().is_empty())
         .or_else(default_dir)
-        .or_else(|| candidate_dirs(extra).first().map(|p| p.to_string_lossy().into_owned()))
+        .or_else(|| candidate_dirs(extra).into_iter().find(|c| extra.iter().any(|e| c.starts_with(e))).map(|p| p.to_string_lossy().into_owned()))
 }
 
 /// SHA-256 (hex) of each shared library in an Instant Client folder, by file name.
@@ -306,24 +317,26 @@ fn check_trusted(dir: &str) -> Result<(), String> {
 /// Is Instant Client usable? Initializes the driver when it is found.
 pub fn status(dir: Option<&str>, extra: &[PathBuf]) -> ClientStatus {
     let platform = platform();
-    let lib_dir = dir
-        .map(str::to_string)
-        .filter(|d| !d.trim().is_empty())
-        .or_else(default_dir)
-        .or_else(|| candidate_dirs(extra).first().map(|p| p.to_string_lossy().into_owned()));
+    let lib_dir = chosen_dir(dir, extra);
+    // Found elsewhere: shown, not loaded (the user chooses it).
+    let found = || if lib_dir.is_none() { candidate_dirs(&[]).first().map(|p| p.to_string_lossy().into_owned()) } else { None };
     match init_client(lib_dir.as_deref(), extra).map_err(|e| e.to_string()).and_then(|_| oracle::Version::client().map_err(|e| e.to_string())) {
-        Ok(v) => ClientStatus { installed: true, version: Some(v.to_string()), lib_dir, message: None, platform },
-        Err(e) => ClientStatus {
-            installed: false,
-            version: None,
-            message: Some(if e.contains("DPI-1047") || e.contains("Cannot locate") {
-                "Oracle Instant Client was not found on this computer.".to_string()
-            } else {
-                e
-            }),
-            lib_dir,
-            platform,
-        },
+        Ok(v) => ClientStatus { installed: true, version: Some(v.to_string()), lib_dir, found: None, message: None, platform },
+        Err(e) => {
+            let found = found();
+            ClientStatus {
+                installed: false,
+                version: None,
+                message: Some(match (&found, e.contains("DPI-1047") || e.contains("Cannot locate")) {
+                    (Some(f), true) => format!("Oracle Instant Client is in {f}, but DataBrain only loads a folder you choose: use it if you trust it."),
+                    (None, true) => "Oracle Instant Client was not found on this computer.".to_string(),
+                    _ => e,
+                }),
+                lib_dir,
+                found,
+                platform,
+            }
+        }
     }
 }
 
@@ -483,6 +496,23 @@ pub fn install(dest: &Path, progress: &dyn Fn(InstallProgress), cancel: &AtomicB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a chosen folder, the default one or one in DataBrain's own
+    /// folders is loaded; whatever is in Downloads, the home folder or the
+    /// library path is found, never chosen.
+    #[test]
+    fn loads_only_chosen_or_own_folders() {
+        let own = std::env::temp_dir().join(format!("dbtest-ic-own-{}", std::process::id()));
+        let ic = own.join("instantclient_23_26");
+        std::fs::create_dir_all(&ic).unwrap();
+        std::fs::write(ic.join(library_name()), b"").unwrap();
+        set_default_dir(None);
+        assert_eq!(chosen_dir(None, &[]), None, "nothing chosen: nothing found elsewhere is used");
+        assert_eq!(chosen_dir(None, &[own.clone()]).map(PathBuf::from), Some(ic.clone()), "DataBrain's own install folder");
+        assert_eq!(chosen_dir(Some("/x/chosen"), &[own.clone()]).as_deref(), Some("/x/chosen"), "the connection's choice first");
+        assert!(matches!(init_client(None, &[]), Err(InitError::Load(_)) | Ok(())), "never loads an unchosen folder");
+        let _ = std::fs::remove_dir_all(&own);
+    }
 
     #[test]
     fn finds_instantclient_folders() {

@@ -487,6 +487,8 @@ export interface OracleClientStatus {
   installed: boolean;
   version: string | null;
   lib_dir: string | null;
+  /** Found on the computer but not loaded: the user chooses it. */
+  found: string | null;
   message: string | null;
   platform: { os: string; arch: string; download_page: string; download_url: string | null; auto_install: boolean; note: string | null };
 }

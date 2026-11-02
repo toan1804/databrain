@@ -22,6 +22,12 @@ pub enum TunnelError {
         "SSH host key mismatch for {host}: expected {expected}, got {actual}. The server key changed; if this is expected, clear the saved fingerprint in the connection's SSH settings."
     )]
     HostKeyMismatch { host: String, expected: String, actual: String },
+    /// No key is pinned for this server yet: nothing was sent to it (no
+    /// credentials). The user checks the fingerprint and trusts it first.
+    #[error(
+        "The SSH server {host} is not trusted yet. Its host key fingerprint is {fingerprint}: compare it with the server's (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub) before trusting it."
+    )]
+    UnknownHostKey { host: String, fingerprint: String },
     #[error("SSH authentication failed for {0}")]
     AuthFailed(String),
     #[error("{0}")]
@@ -41,7 +47,8 @@ pub struct TunnelSpec<'a> {
     pub user: &'a str,
     pub auth: &'a SshAuth,
     pub secret: SshSecret,
-    /// Expected `SHA256:...` fingerprint; `None` accepts and records the key.
+    /// Expected `SHA256:...` fingerprint; `None` stops before authenticating
+    /// with [`TunnelError::UnknownHostKey`] (no key is trusted unseen).
     pub expected_fingerprint: Option<&'a str>,
     pub target_host: &'a str,
     pub target_port: u16,
@@ -61,7 +68,8 @@ impl client::Handler for Verifier {
             PublicKeyOrCertificate::Certificate(c) => c.public_key().fingerprint(HashAlg::Sha256).to_string(),
         };
         *self.seen.lock().expect("poisoned") = Some(fp.clone());
-        Ok(self.expected.as_deref().is_none_or(|e| e == fp))
+        // Unknown key: refused before any credential is sent.
+        Ok(self.expected.as_deref() == Some(fp.as_str()))
     }
 }
 
@@ -92,10 +100,12 @@ impl Tunnel {
             Err(_) => return Err(TunnelError::Connect(addr, "timed out".into())),
             Ok(Err(e)) => {
                 let actual = seen.lock().expect("poisoned").clone();
-                if let (Some(expected), Some(actual)) = (spec.expected_fingerprint, actual) {
-                    if expected != actual {
+                match (spec.expected_fingerprint, actual) {
+                    (Some(expected), Some(actual)) if expected != actual => {
                         return Err(TunnelError::HostKeyMismatch { host: addr, expected: expected.into(), actual });
                     }
+                    (None, Some(fingerprint)) => return Err(TunnelError::UnknownHostKey { host: addr, fingerprint }),
+                    _ => {}
                 }
                 return Err(TunnelError::Connect(addr, e.to_string()));
             }
@@ -334,7 +344,15 @@ mod tests {
             }
         };
 
-        let t = open(None, "pw").await.unwrap();
+        // Unknown server: refused before authenticating, with its fingerprint to check.
+        match open(None, "pw").await {
+            Err(TunnelError::UnknownHostKey { fingerprint, host }) => {
+                assert_eq!(fingerprint, expected_fp);
+                assert_eq!(host, format!("127.0.0.1:{ssh_port}"));
+            }
+            other => panic!("{:?}", other.map(|t| t.fingerprint().to_string())),
+        }
+        let t = open(Some(expected_fp.clone()), "pw").await.unwrap();
         assert_eq!(t.fingerprint(), expected_fp);
         let mut c = tokio::net::TcpStream::connect(("127.0.0.1", t.local_port())).await.unwrap();
         c.write_all(b"ping").await.unwrap();
@@ -344,7 +362,7 @@ mod tests {
 
         assert!(open(Some(expected_fp.clone()), "pw").await.is_ok());
         assert!(matches!(open(Some("SHA256:wrong".into()), "pw").await, Err(TunnelError::HostKeyMismatch { .. })));
-        assert!(matches!(open(None, "bad").await, Err(TunnelError::AuthFailed(_))));
+        assert!(matches!(open(Some(expected_fp.clone()), "bad").await, Err(TunnelError::AuthFailed(_))));
     }
 
     #[tokio::test]
@@ -370,18 +388,24 @@ mod tests {
         else {
             panic!("live test: DATABRAIN_SSH_* not set (run with --ignored)");
         };
-        let t = Tunnel::open(TunnelSpec {
-            ssh_host: &host,
-            ssh_port: 22,
-            user: &user,
-            auth: &SshAuth::Password,
-            secret: SshSecret::Password(pw),
-            expected_fingerprint: None,
-            target_host: "127.0.0.1",
-            target_port: 22,
-        })
-        .await
-        .unwrap();
+        let spec = |fp: Option<String>| {
+            let (host, user, pw) = (host.clone(), user.clone(), pw.clone());
+            async move {
+                Tunnel::open(TunnelSpec {
+                    ssh_host: &host,
+                    ssh_port: 22,
+                    user: &user,
+                    auth: &SshAuth::Password,
+                    secret: SshSecret::Password(pw),
+                    expected_fingerprint: fp.as_deref(),
+                    target_host: "127.0.0.1",
+                    target_port: 22,
+                })
+                .await
+            }
+        };
+        let Err(TunnelError::UnknownHostKey { fingerprint, .. }) = spec(None).await else { panic!("an unknown key is refused first") };
+        let t = spec(Some(fingerprint)).await.unwrap();
         use tokio::io::AsyncReadExt;
         let mut s = tokio::net::TcpStream::connect(("127.0.0.1", t.local_port())).await.unwrap();
         let mut buf = [0u8; 4];

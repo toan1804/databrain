@@ -918,10 +918,16 @@ pub fn import_apply(state: &AppState, source: ImportSource, path: Option<String>
             };
             folder_id = Some(id);
         }
+        // A file never decides which SSH server is trusted: an imported
+        // fingerprint is dropped, and the user checks the key on first connect.
+        let mut config = p.conn.config.clone();
+        if let Some(ssh) = config.ssh.as_mut() {
+            ssh.host_key_fingerprint = None;
+        }
         let profile = ConnectionProfile {
             id: String::new(),
             name: p.conn.name.clone(),
-            config: p.conn.config.clone(),
+            config,
             color: p.conn.color.clone(),
             env: p.conn.env,
             folder_id,

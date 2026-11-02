@@ -121,3 +121,45 @@ fn imports_incomplete_dbeaver_and_datagrip_connections() {
     let got = a.workspace.list_connections().unwrap();
     assert!(got.iter().any(|c| c.name == "No user") && got.iter().any(|c| c.name == "mysql@db"));
 }
+
+/// An import never decides which SSH server is trusted: a fingerprint in
+/// the file is dropped. The user's own trust pins it on every saved
+/// connection through that server that has none (not on others).
+#[test]
+fn imported_ssh_keys_are_not_trusted() {
+    use databrain_connector_core::{SshAuth, SshConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("evil.databrain-connections.json");
+    let mut c = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "app".into() });
+    c.host = Some("db.internal".into());
+    c.ssh =
+        Some(SshConfig { host: "bastion".into(), port: 22, user: "u".into(), auth: SshAuth::Agent, host_key_fingerprint: Some("SHA256:attackerkey".into()) });
+    let (a, _) = state();
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "Behind bastion".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    a.workspace.save_connection(profile).unwrap();
+    conn_io::export_connections(&a, None, &file.to_string_lossy()).unwrap();
+    assert!(std::fs::read_to_string(&file).unwrap().contains("SHA256:attackerkey"), "the file carries one");
+
+    let (b, _) = state();
+    conn_io::import_apply(&b, ImportSource::File, Some(file.to_string_lossy().into_owned()), &[0]).unwrap();
+    let got = b.workspace.list_connections().unwrap().into_iter().find(|c| c.name == "Behind bastion").unwrap();
+    assert_eq!(got.config.ssh.as_ref().unwrap().host_key_fingerprint, None, "dropped on import");
+
+    // The user checked the key: pinned on connections through that server only.
+    assert!(b.engine.trust_ssh_host_key("bastion", 22, "not a fingerprint").is_err());
+    assert_eq!(b.engine.trust_ssh_host_key("BASTION", 22, "SHA256:Abc+/def=").unwrap(), 1);
+    assert_eq!(b.workspace.get_connection(&got.id).unwrap().config.ssh.unwrap().host_key_fingerprint.as_deref(), Some("SHA256:Abc+/def="));
+    assert_eq!(b.engine.trust_ssh_host_key("bastion", 22, "SHA256:other").unwrap(), 0, "an existing pin is never replaced");
+    assert_eq!(b.engine.trust_ssh_host_key("bastion", 2222, "SHA256:x").unwrap(), 0);
+}

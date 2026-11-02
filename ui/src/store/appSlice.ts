@@ -1,7 +1,7 @@
 import type { StateCreator } from "zustand";
 import { parseAppearance } from "../lib/appearance";
 import { setSourceTraits } from "../lib/sourceTraits";
-import { api, isTauri, onAuthEvent, onJobEvent, onOracleAgent, toError } from "../lib/api";
+import { type SshHostKeyPrompt, api, isTauri, onAuthEvent, onJobEvent, onOracleAgent, toError } from "../lib/api";
 import { DEFAULT_SLOW_QUERY_SECONDS } from "../queryTips";
 import { uid } from "../lib/util";
 import type { Dashboard } from "../lib/charts";
@@ -94,6 +94,7 @@ export const createAppSlice: StateCreator<State, [], [], AppSlice> = (set, get) 
       }
       await onJobEvent((e) => get().handleJobEvent(e));
       window.addEventListener("db:oracle-client-missing", () => set({ oracleClientPrompt: true }));
+      window.addEventListener("db:ssh-host-key", (e) => set({ sshHostKey: (e as CustomEvent<SshHostKeyPrompt>).detail }));
       // Thin Oracle driver: downloaded once, on the first Oracle connection.
       let agentToast = false;
       void onOracleAgent((e) => {

@@ -222,8 +222,7 @@ impl KiroProvider {
         if let Some(m) = model.filter(|m| !m.is_empty() && *m != "auto") {
             cmd.args(["--model", m]);
         }
-        let cwd = std::env::temp_dir().join("databrain-kiro");
-        let _ = std::fs::create_dir_all(&cwd);
+        let cwd = private_work_dir()?;
         cmd.current_dir(&cwd).stdin(Stdio::piped());
         Acp::spawn(cmd, cwd).await
     }
@@ -466,6 +465,45 @@ pub(crate) fn kiro_budget(d: &Value) -> Budget {
 
 fn not_installed() -> AiError {
     AiError::Config("kiro-cli not found. Install it from https://kiro.dev/cli (or set its path in the provider settings)".into())
+}
+
+/// Kiro's working folder: private to this user. A fixed name in the shared
+/// temp folder could be created (or linked elsewhere) by another user first
+/// on a multi-user computer. Under the user's cache folder
+/// (`~/Library/Caches`, `%LOCALAPPDATA%`, `$XDG_CACHE_HOME` or `~/.cache`),
+/// owner-only; else a new, randomly named owner-only folder in temp.
+fn private_work_dir() -> Result<PathBuf> {
+    let cache = if cfg!(target_os = "macos") {
+        home().map(|h| h.join("Library").join("Caches"))
+    } else if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).filter(|p| p.is_absolute()).or_else(|| home().map(|h| h.join(".cache")))
+    };
+    if let Some(dir) = cache.map(|c| c.join("databrain").join("kiro")) {
+        if std::fs::create_dir_all(&dir).is_ok() && owner_only(&dir).is_ok() {
+            return Ok(dir);
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("databrain-kiro-{}", uuid::Uuid::new_v4().simple()));
+    // `create_dir`, not `_all`: fails if anything is already there.
+    std::fs::create_dir(&dir).map_err(|e| AiError::Internal(format!("cannot create Kiro's working folder: {e}")))?;
+    owner_only(&dir)?;
+    Ok(dir)
+}
+
+/// A real folder (not a link) readable only by its owner (Unix).
+fn owner_only(dir: &std::path::Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| AiError::Internal(e.to_string()))?;
+    if !meta.is_dir() {
+        return Err(AiError::Internal(format!("{} is not a folder", dir.display())));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| AiError::Internal(e.to_string()))?;
+    }
+    Ok(())
 }
 
 fn home() -> Option<PathBuf> {
@@ -1038,6 +1076,29 @@ mod tests {
         let m = whoami_message(&Whoami::NoAccount, false, Some(1), "bad key ksk_abc123-x end").unwrap();
         assert!(m.contains("exit 1") && m.contains("ksk_*** end") && !m.contains("abc123"), "{m}");
         assert!(whoami_message(&Whoami::Unreadable("boom".into()), false, Some(2), "").unwrap().contains("boom"));
+    }
+
+    /// Kiro's working folder is the user's own, owner-only, never a fixed
+    /// name in the shared temp folder.
+    #[test]
+    fn work_dir_is_private() {
+        let d = private_work_dir().unwrap();
+        assert!(d.is_dir());
+        assert_ne!(d, std::env::temp_dir().join("databrain-kiro"), "not the shared, predictable folder");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700, "{}", d.display());
+        }
+        // A link where the folder should be is refused.
+        #[cfg(unix)]
+        {
+            let tmp = std::env::temp_dir().join(format!("dbtest-kiro-{}", std::process::id()));
+            let _ = std::fs::remove_file(&tmp);
+            std::os::unix::fs::symlink(std::env::temp_dir(), &tmp).unwrap();
+            assert!(owner_only(&tmp).is_err());
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     #[test]
