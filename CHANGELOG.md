@@ -52,6 +52,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Workspace: an older DataBrain refuses a workspace saved by a newer one (it could drop fields it doesn't know when saving) and says why; before updating an existing workspace, DataBrain keeps a copy beside it (`workspace.db.bak-before-v<N>`).
 - Assistant: streamed answers no longer show � when a character (Vietnamese text, emoji) is split across network chunks, and tool-call arguments are no longer corrupted that way.
 - Jobs no longer run twice when the computer sleeps past a run's lease: a run that lost its lease to another runner (the background runner) stops before its next step, and the lease renewal stops it too.
 - Assistant: stopping it during a batch of tool calls no longer breaks the conversation (every later question failed at the provider). Calls that didn't run get a "not run" result, and conversations already affected are repaired when they continue.
