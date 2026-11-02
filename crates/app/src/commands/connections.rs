@@ -69,12 +69,12 @@ pub(crate) async fn trust_ssh_host_key(state: State<'_, AppState>, host: String,
 
 #[tauri::command]
 pub(crate) fn export_connections(state: State<'_, AppState>, ids: Option<Vec<String>>, path: String) -> R<usize> {
-    conn_io::export_connections(&state, ids, &path)
+    conn_io::export_connections(&state, ids, &paths::checked_str(&path, paths::Purpose::WriteJson)?)
 }
 
 #[tauri::command]
 pub(crate) fn import_connections_preview(state: State<'_, AppState>, source: conn_io::ImportSource, path: Option<String>) -> R<conn_io::ImportPreview> {
-    conn_io::import_preview(&state, source, path)
+    conn_io::import_preview(&state, source, path.map(|p| paths::checked_str(&p, paths::Purpose::Import)).transpose()?)
 }
 
 #[tauri::command]
@@ -84,5 +84,5 @@ pub(crate) fn import_connections(
     path: Option<String>,
     picks: Vec<usize>,
 ) -> R<conn_io::ImportReport> {
-    conn_io::import_apply(&state, source, path, &picks)
+    conn_io::import_apply(&state, source, path.map(|p| paths::checked_str(&p, paths::Purpose::Import)).transpose()?, &picks)
 }

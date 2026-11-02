@@ -6,7 +6,7 @@ use super::*;
 #[tauri::command]
 pub(crate) async fn file_scan_sql(path: String, all_sheets: Option<bool>) -> R<String> {
     #[cfg(feature = "duckdb-engine")]
-    return api::file_scan_sql(&path, all_sheets.unwrap_or(false));
+    return api::file_scan_sql(&paths::checked_str(&path, paths::Purpose::Read)?, all_sheets.unwrap_or(false));
     #[cfg(not(feature = "duckdb-engine"))]
     Err(databrain_query_engine::EngineError::new("invalid", format!("DuckDB support is not built in ({path})")))
 }
@@ -14,7 +14,7 @@ pub(crate) async fn file_scan_sql(path: String, all_sheets: Option<bool>) -> R<S
 #[tauri::command]
 pub(crate) async fn excel_sheets(path: String) -> R<Vec<api::ExcelSheet>> {
     #[cfg(feature = "duckdb-engine")]
-    return api::excel_sheets(&path);
+    return api::excel_sheets(&paths::checked_str(&path, paths::Purpose::Read)?);
     #[cfg(not(feature = "duckdb-engine"))]
     Err(databrain_query_engine::EngineError::new("invalid", format!("DuckDB support is not built in ({path})")))
 }

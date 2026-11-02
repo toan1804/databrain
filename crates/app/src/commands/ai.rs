@@ -164,12 +164,12 @@ pub(crate) async fn kn_delete_note(state: State<'_, AppState>, id: String) -> R<
 
 #[tauri::command]
 pub(crate) async fn kn_export_notes(state: State<'_, AppState>, connection_id: String, path: String) -> R<usize> {
-    ai_api::export_notes(&state, &connection_id, &path)
+    ai_api::export_notes(&state, &connection_id, &paths::checked_str(&path, paths::Purpose::WriteJson)?)
 }
 
 #[tauri::command]
 pub(crate) async fn kn_read_notes_file(state: State<'_, AppState>, connection_id: String, path: String) -> R<ai_api::NotesImportPreview> {
-    ai_api::read_notes_file(&state, &connection_id, &path).await
+    ai_api::read_notes_file(&state, &connection_id, &paths::checked_str(&path, paths::Purpose::ReadJson)?).await
 }
 
 #[tauri::command]

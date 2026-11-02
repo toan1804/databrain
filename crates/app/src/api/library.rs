@@ -104,5 +104,8 @@ pub fn set_setting(state: &AppState, key: &str, value: serde_json::Value) -> Res
     if key.is_empty() || key.len() > 100 {
         return Err(invalid("invalid setting key"));
     }
+    if crate::paths::PROTECTED_SETTINGS.contains(&key) {
+        return Err(invalid(format!("the setting {key} is changed in Settings, not directly")));
+    }
     Ok(state.workspace.set_setting(key, &value)?)
 }
