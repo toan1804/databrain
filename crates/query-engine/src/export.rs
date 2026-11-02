@@ -49,25 +49,16 @@ impl QueryEngine {
             }
             None => format!("__export__:{export_id}"),
         };
-        let tmp = path.with_extension(format!("{}.partial", path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")));
-        let out = self.export_stream(connection_id, &tab, sql, &tmp, opts, &cancel, progress).await;
+        let out = self.export_stream(connection_id, &tab, sql, path, opts, &cancel, progress).await;
         self.exports.lock().remove(export_id);
         if shared.is_some() {
             self.jobs.lock().remove(&format!("export:{export_id}"));
         } else {
             self.drop_session(connection_id, &tab);
         }
-        match out {
-            Ok(rows) => {
-                std::fs::rename(&tmp, path).map_err(|e| EngineError::new("internal", format!("{}: {e}", path.display())))?;
-                self.exported.lock().insert(export_id.to_string(), path.to_path_buf());
-                Ok(rows)
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
-            }
-        }
+        let rows = out?;
+        self.exported.lock().insert(export_id.to_string(), path.to_path_buf());
+        Ok(rows)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -76,21 +67,22 @@ impl QueryEngine {
         connection_id: &str,
         tab: &str,
         sql: &str,
-        tmp: &std::path::Path,
+        path: &std::path::Path,
         opts: databrain_export::ExportOptions,
         cancel: &CancellationToken,
         progress: &(dyn Fn(ExportProgress) + Send + Sync),
     ) -> Result<u64> {
-        let report = |phase: ExportPhase, rows: u64| {
-            let bytes = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
+        // Size of the temp file being written (the writer renames it at the end).
+        let report = |phase: ExportPhase, rows: u64, w: Option<&databrain_export::FileWriter>| {
+            let bytes = w.and_then(|w| std::fs::metadata(w.temp_path()).ok()).map(|m| m.len()).unwrap_or(0);
             progress(ExportProgress { phase, rows, bytes });
         };
-        report(ExportPhase::Connecting, 0);
+        report(ExportPhase::Connecting, 0, None);
         let session = tokio::select! {
             s = self.session(connection_id, tab) => s?,
             _ = cancel.cancelled() => return Err(ConnectorError::cancelled().into()),
         };
-        report(ExportPhase::Running, 0);
+        report(ExportPhase::Running, 0, None);
         let mut stream = session.execute(sql, ExecOptions { batch_size: 10_000, cancel: cancel.clone(), max_rows: None }).await?;
         let mut writer: Option<databrain_export::FileWriter> = None;
         let fail = |e: databrain_export::ExportError| EngineError::new("invalid", e.to_string());
@@ -104,7 +96,7 @@ impl QueryEngine {
             };
             match ev {
                 None => return Err(EngineError::new("internal", "result stream ended unexpectedly")),
-                Some(Ok(StreamEvent::Schema(schema))) => writer = Some(databrain_export::FileWriter::create(tmp, schema, opts.clone()).map_err(fail)?),
+                Some(Ok(StreamEvent::Schema(schema))) => writer = Some(databrain_export::FileWriter::create(path, schema, opts.clone()).map_err(fail)?),
                 Some(Ok(StreamEvent::Batch(b))) => {
                     if let Some(w) = writer.as_mut() {
                         w.write(&b).map_err(fail)?;
@@ -112,19 +104,19 @@ impl QueryEngine {
                         if phase != ExportPhase::Writing || last.elapsed() >= EXPORT_PROGRESS_EVERY {
                             phase = ExportPhase::Writing;
                             last = Instant::now();
-                            report(phase, rows);
+                            report(phase, rows, Some(w));
                         }
                     }
                 }
                 Some(Ok(StreamEvent::Downloading(_))) => {
                     phase = ExportPhase::Downloading;
-                    report(phase, rows);
+                    report(phase, rows, writer.as_ref());
                 }
                 Some(Ok(StreamEvent::Notice(_))) => {}
                 Some(Ok(StreamEvent::Done(_))) => {
                     return match writer {
                         Some(w) => {
-                            report(ExportPhase::Finishing, rows);
+                            report(ExportPhase::Finishing, rows, Some(&w));
                             w.finish().map_err(fail)
                         }
                         None => Err(EngineError::new("invalid", "The query returned no rows to export")),

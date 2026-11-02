@@ -90,20 +90,9 @@ fn write_export(
     batches: &[databrain_connector_core::arrow::array::RecordBatch],
     options: ExportOptions,
 ) -> Result<u64> {
-    let io = |e: std::io::Error| EngineError::new("internal", format!("{}: {e}", path.display()));
-    // Write to a temp file in the same directory, then rename, so a failed
-    // export never leaves a half-written file under the chosen name.
-    let tmp = path.with_extension(format!("{}.partial", path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")));
-    match export_file(&tmp, schema, batches, options) {
-        Ok(rows) => {
-            std::fs::rename(&tmp, path).map_err(io)?;
-            Ok(rows)
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(EngineError::new("invalid", e.to_string()))
-        }
-    }
+    // Written to a new temp file beside it and renamed (see FileWriter), so a
+    // failed export never leaves a half-written file under the chosen name.
+    export_file(path, schema, batches, options).map_err(|e| EngineError::new("invalid", format!("{}: {e}", path.display())))
 }
 
 /// Serialize rows `[offset, offset+limit)` of the view (optionally a subset of
