@@ -80,6 +80,12 @@ export function AiSection({ f }: { f: ConnectionFormState }) {
           label="Allow external agents (MCP)"
           help="Kiro CLI, Claude Code etc. can use this connection via the local databrain-mcp server, under the rules above. What DataBrain would ask you about, it asks through the agent (MCP elicitation); what the rules forbid is refused."
         />
+        {policy.mcp_enabled && policy.run_query === "ask" && (
+          <p className="pl-6 text-[11.5px] text-muted">
+            With "Ask me every time", the agent shows you DataBrain's question before each query and the call waits for your answer (2 minutes). An agent that can't show it
+            is refused unless the box below is on. For reads without a question, choose "Automatically for read-only queries".
+          </p>
+        )}
         {policy.mcp_enabled && (
           <Check
             checked={policy.mcp_client_approves}

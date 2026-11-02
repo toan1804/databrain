@@ -410,7 +410,8 @@ Auth is the `kiro-cli login` browser session (run in the user's terminal and det
 
 - Only connections with `mcp_enabled` (and AI on) are visible. Every tool takes a required `connection` argument, and tools carry MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`).
 - Requests are handled concurrently, so a tool call waiting for the user doesn't block the client's other messages, including the answer.
-- When the policy says `Ask`, the server asks the user through the client with `elicitation/create` (the question and the SQL, 5-minute timeout). Only an explicit accept with `approve = true` runs it.
+- When the policy says `Ask`, the server asks the user through the client with `elicitation/create` (the question and the SQL). Only an explicit accept with `approve = true` runs it. A call that carries `_meta.progressToken` gets a `notifications/progress` saying the question is waiting.
+- The wait is 2 minutes (`DATABRAIN_MCP_ELICIT_SECS`, 5 s to 1 h). A timeout ends the call with a message naming the fixes (auto-read, or `mcp_client_approves`) and marks the peer `unanswered`: later `Ask` decisions in that session are refused at once instead of waiting, since a client can declare elicitation and still not show prompts in its current mode.
 - A client without elicitation support gets a refusal, unless the connection sets `mcp_client_approves`; then the call runs and is audited as "approved by MCP client".
 - `Confirm` decisions are never approved over MCP.
 - Settings → MCP shows the client config (`ai_api::mcp_config`), which points at the `databrain-mcp` binary next to the app.

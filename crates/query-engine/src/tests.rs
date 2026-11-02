@@ -21,6 +21,10 @@ impl Drop for TempFile {
 }
 
 fn fixture(env: EnvTag) -> Fixture {
+    fixture_with_store(env, Arc::new(MemoryStore::default()))
+}
+
+fn fixture_with_store(env: EnvTag, secrets: Arc<dyn SecretStore>) -> Fixture {
     let path = std::env::temp_dir().join(format!(
         "databrain-qe-{}-{}.db",
         std::process::id(),
@@ -48,13 +52,7 @@ fn fixture(env: EnvTag) -> Fixture {
         })
         .unwrap();
     let sink = Arc::new(CollectingSink::default());
-    let engine = QueryEngine::new(
-        reg,
-        ws.clone(),
-        Arc::new(MemoryStore::default()),
-        Arc::new(ResultStore::new()),
-        sink.clone(),
-    );
+    let engine = QueryEngine::new(reg, ws.clone(), secrets, Arc::new(ResultStore::new()), sink.clone());
     Fixture {
         engine,
         sink,
@@ -367,6 +365,37 @@ async fn reconnect_closes_metadata_and_idle_tabs_only() {
     wait_job(&f, &job).await;
     assert_eq!(f.engine.reconnect("other-connection"), 0);
     assert_eq!(f.engine.reconnect(&f.conn_id), 1);
+}
+
+/// A credential store that blocks (the OS keychain waiting on a permission
+/// prompt): connecting fails within the connect time limit with a message
+/// that says so, and the runtime keeps serving meanwhile.
+#[tokio::test]
+async fn blocked_credential_store_times_out_with_a_message() {
+    struct Slow;
+    impl SecretStore for Slow {
+        fn get(&self, _: &databrain_auth::SecretRef) -> std::result::Result<Option<SecretString>, databrain_auth::AuthError> {
+            std::thread::sleep(Duration::from_secs(8));
+            Ok(None)
+        }
+        fn set(&self, _: &databrain_auth::SecretRef, _: &SecretString) -> std::result::Result<(), databrain_auth::AuthError> {
+            Ok(())
+        }
+        fn delete(&self, _: &databrain_auth::SecretRef) -> std::result::Result<(), databrain_auth::AuthError> {
+            Ok(())
+        }
+    }
+    let f = fixture_with_store(EnvTag::None, Arc::new(Slow));
+    f.ws.set_setting("connect_timeout_secs", &serde_json::json!(3)).unwrap();
+    let mut p = f.ws.get_connection(&f.conn_id).unwrap();
+    p.config.auth = AuthMethod::Password { user: "u".into() };
+    f.ws.save_connection(p).unwrap();
+    let started = Instant::now();
+    let other = tokio::spawn(async { 1 + 1 });
+    let e = f.engine.session_for_tests(&f.conn_id).await.err().expect("times out");
+    assert!(e.message.contains("credential store") && e.message.contains("keychain"), "{}", e.message);
+    assert!(started.elapsed() < Duration::from_secs(7), "{:?}", started.elapsed());
+    assert_eq!(other.await.unwrap(), 2, "the runtime was not blocked");
 }
 
 #[tokio::test]

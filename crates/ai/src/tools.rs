@@ -152,6 +152,9 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
     v
 }
 
+/// What to do when an MCP client can't carry DataBrain's question.
+const MCP_ASK_HELP: &str = "Run it from DataBrain's assistant, set \"AI may run queries\" to automatic for read-only queries, or turn on \"Accept the MCP client's approval\" in the connection's AI settings";
+
 /// Hooks into the host for tools that need the UI.
 #[async_trait::async_trait]
 pub trait ToolHost: Send + Sync {
@@ -159,10 +162,15 @@ pub trait ToolHost: Send + Sync {
     /// argument value on approval, `None` on denial.
     async fn approve(&self, tool: &str, summary: &str, detail: &Value) -> Option<Value>;
     /// Whether `approve` can reach the user. The MCP server can only when the
-    /// client supports elicitation; otherwise an Ask is refused unless the
-    /// connection accepts the client's own tool approval.
+    /// client supports elicitation (and answered so far); otherwise an Ask is
+    /// refused unless the connection accepts the client's own tool approval.
     fn can_ask(&self) -> bool {
         true
+    }
+    /// Why `approve` can't reach the user (when `can_ask` is false), as a
+    /// clause for the refusal message.
+    fn cannot_ask_reason(&self) -> String {
+        "this MCP client can't show DataBrain's question (it doesn't support elicitation)".into()
     }
     /// Current editor state for `get_editor`.
     async fn editor_state(&self) -> Option<Value> {
@@ -696,15 +704,18 @@ impl ToolContext {
                         return Ok(detail.clone());
                     }
                     self.audit(tool, detail, "blocked", Some(&reason));
-                    return Err(AiError::Policy(format!(
-                        "{reason}. DataBrain asks the user before this, and this MCP client can't show DataBrain's question (it doesn't support elicitation). \
-                         Run it from DataBrain's assistant, or turn on \"Accept the MCP client's approval\" in the connection's AI settings"
-                    )));
+                    return Err(AiError::Policy(format!("{reason}. DataBrain asks the user before this, and {}. {MCP_ASK_HELP}", self.host.cannot_ask_reason())));
                 }
                 match self.host.approve(tool, &format!("{reason}. {summary}"), detail).await {
                     Some(v) => {
                         self.audit(tool, &v, "approved", None);
                         Ok(v)
+                    }
+                    // The question went out but no answer came back (the client
+                    // didn't show it, or went away): say so, not "declined".
+                    None if self.caller == Caller::Mcp && !self.host.can_ask() => {
+                        self.audit(tool, detail, "denied", Some("no answer"));
+                        Err(AiError::Policy(format!("{reason}. DataBrain asked the user through this MCP client, but {}. {MCP_ASK_HELP}", self.host.cannot_ask_reason())))
                     }
                     None => {
                         self.audit(tool, detail, "denied", None);

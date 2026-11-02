@@ -66,6 +66,7 @@ impl QueryEngine {
         let creds = self.credentials(&profile)?;
         self.preflight(&profile.config).await?;
         let (cfg, tunnel) = self.tunnel(&profile.config, Some(&profile.id), None).await?;
+        self.read_stored_secret(&profile, creds.as_ref()).await?;
         let started = Instant::now();
         let kind = profile.config.kind;
         let connected = match connector.connect(&cfg, creds.clone()).await {
@@ -89,6 +90,30 @@ impl QueryEngine {
         };
         self.sessions.lock().insert(key, Live { session: session.clone(), _tunnel: tunnel, sandboxed: sandbox, last_used: parking_lot::Mutex::new(Instant::now()) });
         Ok(session)
+    }
+
+    /// Stored secrets are read before connecting, within the connect time
+    /// limit: the OS keychain can wait on a permission prompt (another
+    /// binary, e.g. databrain-mcp, reading an item the app saved), which
+    /// inside the driver's connect would look like a hang with no message.
+    /// Read errors are left to the connector, which reports them in context.
+    async fn read_stored_secret(&self, profile: &ConnectionProfile, creds: &dyn databrain_auth::CredentialSource) -> Result<()> {
+        use databrain_auth::AuthMethod as A;
+        if !matches!(profile.config.auth, A::Password { .. } | A::ApiToken { .. } | A::KeyPair { .. }) {
+            return Ok(());
+        }
+        let limit = self.connect_timeout();
+        if tokio::time::timeout(limit, creds.get()).await.is_err() {
+            return Err(EngineError::new(
+                "timeout",
+                format!(
+                    "Reading the credentials of \"{}\" from the credential store took more than {} s. A keychain access prompt may be waiting: allow DataBrain (or databrain-mcp) to read them, or keep secrets in the local vault instead (Settings)",
+                    profile.name,
+                    limit.as_secs()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn drop_session(&self, connection_id: &str, tab_id: &str) {

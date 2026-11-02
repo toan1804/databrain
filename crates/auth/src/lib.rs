@@ -420,37 +420,41 @@ impl StoredCredentialSource {
     }
 }
 
+/// The stored secret(s) of `method` as a credential (blocking reads).
+fn stored_credential(method: &AuthMethod, store: &dyn SecretStore, secret_ref: &SecretRef, passphrase_ref: Option<&SecretRef>) -> Result<Credential, AuthError> {
+    let secret = || read_secret(store, secret_ref);
+    let required = || -> Result<SecretString, AuthError> { secret()?.ok_or_else(|| AuthError::NotFound(secret_ref.0.clone())) };
+    match method {
+        AuthMethod::None => Ok(Credential::None),
+        AuthMethod::Password { user } => Ok(Credential::Password {
+            user: user.clone(),
+            // Missing password is allowed (e.g. trust auth).
+            password: secret()?.unwrap_or_else(|| SecretString::from(String::new())),
+        }),
+        AuthMethod::ApiToken { user } => Ok(Credential::Bearer { token: required()?, user: user.clone() }),
+        AuthMethod::KeyPair { user } => Ok(Credential::KeyPair {
+            user: user.clone(),
+            private_key_pem: required()?,
+            passphrase: match passphrase_ref {
+                Some(r) => read_secret(store, r)?,
+                None => None,
+            },
+        }),
+        other => Err(AuthError::Invalid(format!("{:?} is not a stored-secret method", other.kind()))),
+    }
+}
+
 #[async_trait]
 impl CredentialSource for StoredCredentialSource {
     async fn get(&self) -> Result<Credential, AuthError> {
-        let secret = || read_secret(self.store.as_ref(), &self.secret_ref);
-        let required = || -> Result<SecretString, AuthError> {
-            secret()?.ok_or_else(|| AuthError::NotFound(self.secret_ref.0.clone()))
-        };
-        match &self.method {
-            AuthMethod::None => Ok(Credential::None),
-            AuthMethod::Password { user } => Ok(Credential::Password {
-                user: user.clone(),
-                // Missing password is allowed (e.g. trust auth).
-                password: secret()?.unwrap_or_else(|| SecretString::from(String::new())),
-            }),
-            AuthMethod::ApiToken { user } => Ok(Credential::Bearer {
-                token: required()?,
-                user: user.clone(),
-            }),
-            AuthMethod::KeyPair { user } => Ok(Credential::KeyPair {
-                user: user.clone(),
-                private_key_pem: required()?,
-                passphrase: match &self.passphrase_ref {
-                    Some(r) => read_secret(self.store.as_ref(), r)?,
-                    None => None,
-                },
-            }),
-            other => Err(AuthError::Invalid(format!(
-                "{:?} is not a stored-secret method",
-                other.kind()
-            ))),
-        }
+        // The OS keychain can block on a permission prompt (another binary,
+        // e.g. databrain-mcp, reading an item the app saved). Read on the
+        // blocking pool, so the runtime keeps serving and a caller's time
+        // limit can fire.
+        let (method, store, secret_ref, passphrase_ref) = (self.method.clone(), self.store.clone(), self.secret_ref.clone(), self.passphrase_ref.clone());
+        tokio::task::spawn_blocking(move || stored_credential(&method, store.as_ref(), &secret_ref, passphrase_ref.as_ref()))
+            .await
+            .map_err(|e| AuthError::Store(format!("credential read failed: {e}")))?
     }
     fn status(&self) -> AuthStatus {
         let has = matches!(self.method, AuthMethod::None)

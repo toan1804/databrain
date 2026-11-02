@@ -835,3 +835,175 @@ fn uri_passwords_go_to_the_secret_store() {
     assert_eq!(stored(&old.id).as_deref(), Some("legacy"));
     assert_eq!(st.move_uri_passwords(), 0);
 }
+
+/// MCP over a pipe with two shared SQLite connections: one runs reads on its
+/// own, the other asks. The client declares elicitation: the question goes
+/// to it and its answer decides; a plain read on the first connection never
+/// waits. Every exchange is bounded, so a hang fails the test.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_two_connections_ask_through_elicitation() {
+    use databrain_ai::mcp::McpServer;
+    use databrain_workspace::RunQueryPolicy;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (st, _sink, dir) = state();
+    let cfg = |file: &str| ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(dir.path().join(file).to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let mut a = save_profile(&st, "alpha", cfg("a.db"), None);
+    a.ai_policy.mcp_enabled = true;
+    a.ai_policy.run_query = RunQueryPolicy::AutoRead;
+    save_profile_update(&st, a);
+    let mut b = save_profile(&st, "beta", cfg("b.db"), None);
+    b.ai_policy.mcp_enabled = true;
+    save_profile_update(&st, b);
+
+    let server = Arc::new(McpServer { engine: st.engine.clone(), hub: st.hub.clone() });
+    let (client_rx, server_tx) = tokio::io::duplex(1 << 16);
+    let (server_rx, mut client_tx) = tokio::io::duplex(1 << 16);
+    let srv = tokio::spawn(async move { server.serve(BufReader::new(server_rx), server_tx).await });
+    let mut lines = BufReader::new(client_rx).lines();
+    async fn next(lines: &mut tokio::io::Lines<BufReader<tokio::io::DuplexStream>>) -> serde_json::Value {
+        let l = tokio::time::timeout(Duration::from_secs(10), lines.next_line()).await.expect("server answered in time").unwrap().expect("server still open");
+        serde_json::from_str::<serde_json::Value>(&l).unwrap()
+    }
+    async fn write(w: &mut tokio::io::DuplexStream, v: serde_json::Value) {
+        w.write_all(format!("{v}\n").as_bytes()).await.unwrap();
+    }
+    let call = |name: &str, conn: &str, sql: &str, id: u64| {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": {"connection": conn, "sql": sql, "purpose": "test"}}})
+    };
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}}, "clientInfo": {"name": "t", "version": "0"}}})).await;
+    let init = next(&mut lines).await;
+    assert_eq!(init["id"], 1, "{init}");
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+
+    // Auto-read connection: answers without asking anyone.
+    write(&mut client_tx, call("run_query", "alpha", "select 1 as x", 2)).await;
+    let r = next(&mut lines).await;
+    assert_eq!(r["id"], 2, "{r}");
+    assert_eq!(r["result"]["isError"], false, "{r}");
+
+    // Asking connection: the question reaches the client; accept runs it.
+    write(&mut client_tx, call("run_query", "beta", "select 2 as y", 3)).await;
+    let q = next(&mut lines).await;
+    assert_eq!(q["method"], "elicitation/create", "{q}");
+    assert!(q["params"]["message"].as_str().unwrap().contains("select 2 as y"), "{q}");
+    let qid = q["id"].clone();
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": qid, "result": {"action": "accept", "content": {"approve": true}}})).await;
+    let r = next(&mut lines).await;
+    assert_eq!(r["id"], 3, "{r}");
+    assert_eq!(r["result"]["isError"], false, "{r}");
+
+    // Decline: refused, not hung.
+    write(&mut client_tx, call("run_query", "beta", "select 3", 4)).await;
+    let q = next(&mut lines).await;
+    assert_eq!(q["method"], "elicitation/create", "{q}");
+    let qid = q["id"].clone();
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": qid, "result": {"action": "decline"}})).await;
+    let r = next(&mut lines).await;
+    assert_eq!(r["id"], 4, "{r}");
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("declined"), "{r}");
+
+    // While one question waits, the other connection still answers.
+    write(&mut client_tx, call("run_query", "beta", "select 4", 5)).await;
+    let q = next(&mut lines).await;
+    assert_eq!(q["method"], "elicitation/create", "{q}");
+    write(&mut client_tx, call("run_query", "alpha", "select 5", 6)).await;
+    let r = next(&mut lines).await;
+    assert_eq!(r["id"], 6, "answered while beta's question waits: {r}");
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": q["id"].clone(), "result": {"action": "cancel"}})).await;
+    let r = next(&mut lines).await;
+    assert_eq!((r["id"].as_u64(), r["result"]["isError"].as_bool()), (Some(5), Some(true)), "{r}");
+
+    drop(client_tx);
+    tokio::time::timeout(Duration::from_secs(10), srv).await.expect("server stops at EOF").unwrap().unwrap();
+}
+
+/// A client that declares elicitation but never answers (it doesn't show
+/// prompts in its mode): the call ends with the wait's message instead of
+/// hanging, the client was told it was waiting (progress), and the next
+/// question is refused at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_unanswered_question_ends_the_call_and_is_not_asked_again() {
+    use databrain_ai::mcp::McpServer;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    // Process-wide; the other MCP test answers at once, so a short wait is fine for it too.
+    databrain_ai::mcp::set_elicit_secs(5);
+    let (st, _sink, dir) = state();
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(dir.path().join("q.db").to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let mut p = save_profile(&st, "quiet", cfg, None);
+    p.ai_policy.mcp_enabled = true;
+    save_profile_update(&st, p);
+    let server = Arc::new(McpServer { engine: st.engine.clone(), hub: st.hub.clone() });
+    let (client_rx, server_tx) = tokio::io::duplex(1 << 16);
+    let (server_rx, mut client_tx) = tokio::io::duplex(1 << 16);
+    let srv = tokio::spawn(async move { server.serve(BufReader::new(server_rx), server_tx).await });
+    let mut lines = BufReader::new(client_rx).lines();
+    async fn next(lines: &mut tokio::io::Lines<BufReader<tokio::io::DuplexStream>>) -> serde_json::Value {
+        let l = tokio::time::timeout(Duration::from_secs(20), lines.next_line()).await.expect("server answered in time").unwrap().expect("server still open");
+        serde_json::from_str::<serde_json::Value>(&l).unwrap()
+    }
+    async fn write(w: &mut tokio::io::DuplexStream, v: serde_json::Value) {
+        w.write_all(format!("{v}\n").as_bytes()).await.unwrap();
+    }
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}}, "clientInfo": {"name": "t", "version": "0"}}})).await;
+    assert_eq!(next(&mut lines).await["id"], 1);
+    let call = |id: u64| {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"_meta": {"progressToken": "p1"}, "name": "run_query", "arguments": {"connection": "quiet", "sql": "select 1", "purpose": "t"}}})
+    };
+    let started = std::time::Instant::now();
+    write(&mut client_tx, call(2)).await;
+    let progress = next(&mut lines).await;
+    assert_eq!(progress["method"], "notifications/progress", "{progress}");
+    assert_eq!(progress["params"]["progressToken"], "p1");
+    assert!(progress["params"]["message"].as_str().unwrap().contains("Waiting"), "{progress}");
+    let ask = next(&mut lines).await;
+    assert_eq!(ask["method"], "elicitation/create", "{ask}");
+    // Nobody answers.
+    let r = next(&mut lines).await;
+    assert_eq!(r["id"], 2, "{r}");
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("didn't answer") && text.contains("Accept the MCP client's approval") && text.contains("read-only"), "{text}");
+    assert!(!text.contains("declined"), "{text}");
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_secs(5) && waited < Duration::from_secs(15), "{waited:?}");
+    // Asked again: refused at once, no new question.
+    let started = std::time::Instant::now();
+    write(&mut client_tx, call(3)).await;
+    let r = next(&mut lines).await;
+    assert_eq!(r["id"], 3, "refused without asking: {r}");
+    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("didn't answer"), "{r}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // The late answer to the first question is ignored.
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": ask["id"].clone(), "result": {"action": "accept", "content": {"approve": true}}})).await;
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "ping"})).await;
+    assert_eq!(next(&mut lines).await["id"], 4);
+    drop(client_tx);
+    tokio::time::timeout(Duration::from_secs(10), srv).await.expect("server stops at EOF").unwrap().unwrap();
+    let audit = st.workspace.list_audit(50).unwrap();
+    // One "no answer"; nothing approved. (Each refused call is also audited as blocked by the tool wrapper.)
+    assert_eq!(audit.iter().filter(|a| a.tool == "run_query" && a.decision == "denied").map(|a| a.summary.as_deref()).collect::<Vec<_>>(), vec![Some("no answer")], "{audit:?}");
+    assert!(audit.iter().all(|a| a.decision != "approved"), "{audit:?}");
+}

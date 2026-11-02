@@ -6,6 +6,9 @@
 //! client (MCP elicitation) when the client supports it; otherwise it is
 //! refused, unless the connection accepts the client's own tool approval
 //! (`ai_policy.mcp_client_approves`): many clients approve tools on their own.
+//! A question the client never answers (it declared elicitation but doesn't
+//! show prompts in its mode) times out with a message that says what to
+//! change, and no further question is asked in that session.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,8 +27,36 @@ use crate::tools::{Caller, ToolContext, ToolHost, specs};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Default wait for the user's answer to an elicitation, in seconds
+/// (`DATABRAIN_MCP_ELICIT_SECS` overrides it, 5 s to 1 h).
+pub const ELICIT_SECS: u64 = 120;
+
+/// Set by [`set_elicit_secs`] (tests); 0 = not set.
+static ELICIT_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Override the elicitation wait for this process (tests).
+#[doc(hidden)]
+pub fn set_elicit_secs(secs: u64) {
+    ELICIT_OVERRIDE.store(secs, Ordering::SeqCst);
+}
+
 /// How long DataBrain waits for the user to answer an elicitation.
-pub const ELICIT_TIMEOUT: Duration = Duration::from_secs(300);
+pub fn elicit_timeout() -> Duration {
+    let secs = match ELICIT_OVERRIDE.load(Ordering::SeqCst) {
+        0 => std::env::var("DATABRAIN_MCP_ELICIT_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(ELICIT_SECS),
+        n => n,
+    };
+    Duration::from_secs(secs.clamp(5, 3600))
+}
+
+/// Why a request to the client got no answer.
+enum NoAnswer {
+    /// The client declared elicitation but didn't answer in time: it may
+    /// not show prompts in this mode. Not asked again this session.
+    Timeout,
+    /// No way to reach the client, or it closed.
+    Gone,
+}
 
 /// The client on the other end: requests DataBrain sends it (elicitation)
 /// and their pending answers.
@@ -36,25 +67,41 @@ struct Peer {
     next_id: AtomicI64,
     /// The client declared the `elicitation` capability in `initialize`.
     elicitation: AtomicBool,
+    /// A question timed out: the client doesn't show them (or nobody is
+    /// there). Later questions are refused at once instead of waiting.
+    unanswered: AtomicBool,
     /// The input ended: nobody will answer.
     closed: AtomicBool,
 }
 
 impl Peer {
-    /// Send a request to the client and wait for its answer (None: no answer,
-    /// the connection closed or it timed out).
-    async fn request(&self, method: &str, params: Value) -> Option<Value> {
-        let out = self.out.as_ref()?;
+    /// Send a request to the client and wait for its answer.
+    async fn request(&self, method: &str, params: Value) -> std::result::Result<Value, NoAnswer> {
+        let out = self.out.as_ref().ok_or(NoAnswer::Gone)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(id, tx);
         if self.closed.load(Ordering::SeqCst) || out.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).is_err() {
             self.pending.lock().remove(&id);
-            return None;
+            return Err(NoAnswer::Gone);
         }
-        let answer = tokio::time::timeout(ELICIT_TIMEOUT, rx).await;
+        let answer = tokio::time::timeout(elicit_timeout(), rx).await;
         self.pending.lock().remove(&id);
-        answer.ok()?.ok()
+        match answer {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(_)) => Err(NoAnswer::Gone),
+            Err(_) => {
+                self.unanswered.store(true, Ordering::SeqCst);
+                Err(NoAnswer::Timeout)
+            }
+        }
+    }
+
+    /// Send a notification to the client (nothing to wait for).
+    fn notify(&self, method: &str, params: Value) {
+        if let Some(out) = &self.out {
+            let _ = out.send(json!({"jsonrpc": "2.0", "method": method, "params": params}));
+        }
     }
 
     /// An answer from the client to one of our requests.
@@ -68,12 +115,31 @@ impl Peer {
 /// Approvals over MCP: DataBrain's question, shown to the user by the client.
 struct McpHost {
     peer: Arc<Peer>,
+    /// The call's `_meta.progressToken`: while the question waits, the client
+    /// is told so (`notifications/progress`) instead of showing a bare spinner.
+    progress: Option<Value>,
 }
 
 #[async_trait::async_trait]
 impl ToolHost for McpHost {
     fn can_ask(&self) -> bool {
-        self.peer.out.is_some() && self.peer.elicitation.load(Ordering::Relaxed)
+        self.peer.out.is_some()
+            && self.peer.elicitation.load(Ordering::Relaxed)
+            && !self.peer.unanswered.load(Ordering::SeqCst)
+            && !self.peer.closed.load(Ordering::SeqCst)
+    }
+
+    fn cannot_ask_reason(&self) -> String {
+        if self.peer.out.is_none() || !self.peer.elicitation.load(Ordering::Relaxed) {
+            "this MCP client can't show DataBrain's question (it doesn't support elicitation)".into()
+        } else if self.peer.closed.load(Ordering::SeqCst) {
+            "the MCP client closed the connection".into()
+        } else {
+            format!(
+                "this MCP client didn't answer DataBrain's question within {} s (it may not show elicitation prompts in this mode; no further questions are asked in this session)",
+                elicit_timeout().as_secs()
+            )
+        }
     }
 
     async fn approve(&self, tool: &str, summary: &str, detail: &Value) -> Option<Value> {
@@ -84,6 +150,12 @@ impl ToolHost for McpHost {
         if let Some(sql) = detail.get("sql").and_then(|v| v.as_str()) {
             message.push_str(&format!("\n\n{sql}"));
         }
+        if let Some(token) = &self.progress {
+            self.peer.notify(
+                "notifications/progress",
+                json!({"progressToken": token, "progress": 1, "message": format!("Waiting for your answer to DataBrain's question (approve {tool}?) in this client")}),
+            );
+        }
         let params = json!({
             "message": message,
             "requestedSchema": {
@@ -92,7 +164,14 @@ impl ToolHost for McpHost {
                 "required": ["approve"],
             },
         });
-        let answer = self.peer.request("elicitation/create", params).await?;
+        let answer = match self.peer.request("elicitation/create", params).await {
+            Ok(a) => a,
+            Err(NoAnswer::Timeout) => {
+                tracing::warn!(tool, secs = elicit_timeout().as_secs(), "no answer to the elicitation: the client may not show prompts; not asking again this session");
+                return None;
+            }
+            Err(NoAnswer::Gone) => return None,
+        };
         let r = &answer["result"];
         // Only an explicit accept with approve = true runs it.
         (r["action"] == "accept" && r["content"]["approve"] == json!(true)).then(|| detail.clone())
@@ -153,7 +232,7 @@ impl McpServer {
             .collect()
     }
 
-    async fn call_tool(&self, name: &str, args: &Value, peer: &Arc<Peer>) -> (String, bool) {
+    async fn call_tool(&self, name: &str, args: &Value, peer: &Arc<Peer>, progress: Option<Value>) -> (String, bool) {
         if name == "list_connections" {
             let list: Vec<Value> = self
                 .connections()
@@ -178,7 +257,7 @@ impl McpServer {
             profile,
             session_id: None,
             caller: Caller::Mcp,
-            host: Arc::new(McpHost { peer: peer.clone() }),
+            host: Arc::new(McpHost { peer: peer.clone(), progress }),
             cancel: Default::default(),
             results: parking_lot::Mutex::new(vec![]),
         };
@@ -212,7 +291,8 @@ impl McpServer {
             "tools/call" => {
                 let name = msg.pointer("/params/name").and_then(|n| n.as_str()).unwrap_or("");
                 let args = msg.pointer("/params/arguments").cloned().unwrap_or(json!({}));
-                let (text, is_error) = self.call_tool(name, &args, peer).await;
+                let progress = msg.pointer("/params/_meta/progressToken").cloned().filter(|t| !t.is_null());
+                let (text, is_error) = self.call_tool(name, &args, peer, progress).await;
                 Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
             }
             m if m.starts_with("notifications/") => return None,
