@@ -449,7 +449,8 @@ pub fn quote_ident(kind: ConnectorKind, ident: &str) -> String {
     use traits::IdentQuote as Q;
     match kind.traits().quote {
         Q::Backtick => format!("`{}`", ident.replace('`', "``")),
-        Q::BacktickBackslash => format!("`{}`", ident.replace('`', "\\`")),
+        // Backslash first: a name ending in `\` must not escape the closing quote.
+        Q::BacktickBackslash => format!("`{}`", ident.replace('\\', "\\\\").replace('`', "\\`")),
         Q::Bracket => format!("[{}]", ident.replace(']', "]]")),
         Q::Double => format!("\"{}\"", ident.replace('"', "\"\"")),
     }
@@ -484,8 +485,15 @@ pub fn split_path(kind: ConnectorKind, path: &str) -> Vec<String> {
             parts.push(if quoted { p } else { p.trim().to_string() });
         }
     };
+    let backslash = kind.traits().quote == traits::IdentQuote::BacktickBackslash;
     while let Some(c) = chars.next() {
         match close {
+            // `\` escapes the next character inside backticks (ClickHouse, BigQuery).
+            Some('`') if backslash && c == '\\' => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
             Some(q) if c == q => {
                 if chars.peek() == Some(&q) {
                     cur.push(q);
@@ -533,6 +541,17 @@ mod tests {
         assert_eq!(split_path(pg, "a..b"), vec!["a", "", "b"]);
         assert!(split_path(pg, "  ").is_empty());
         assert_eq!(split_path(pg, r#"we"ird.t"#), vec![r#"we"ird"#, "t"], "a quote inside a word is a character");
+        // Backslash-escaping engines: quotes and backslashes in a name stay inside it.
+        for kind in [ConnectorKind::Clickhouse, ConnectorKind::Bigquery] {
+            for name in ["a\\", "x\\` ; DROP TABLE t; --", "back`tick", "plain"] {
+                let q = quote_ident(kind, name);
+                assert!(q.starts_with('`') && q.ends_with('`'), "{q}");
+                assert_eq!(split_path(kind, &q), vec![name.to_string()], "{kind:?}: {q}");
+            }
+            assert_eq!(quote_ident(kind, "a\\"), "`a\\\\`");
+            assert_eq!(quote_ident(kind, "a`b"), "`a\\`b`");
+        }
+        assert_eq!(split_path(ConnectorKind::Clickhouse, "`d\\`b`.`t\\\\`"), vec!["d`b", "t\\"]);
         // Typed quotes are not quoted twice.
         assert_eq!(quote_path(pg, r#""My Schema".t"#), r#""My Schema"."t""#);
         assert_eq!(quote_path(pg, "main.app.t"), r#""main"."app"."t""#);

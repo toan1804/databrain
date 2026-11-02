@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Security
 
+- ClickHouse and BigQuery identifiers escape backslashes inside backticks: a table or column name ending in `\` could close its quotes and add SQL.
 - SSH: an SSH server's key is trusted only after you see its fingerprint and choose Trust; it was pinned silently on first use, and an imported connections file could pin an attacker's key in advance (imported fingerprints are now dropped).
 - Oracle Instant Client is loaded only from a folder you chose, the one saved for connections, or the one DataBrain installed. A copy found in Downloads, the home folder or the library search path is shown with "Use the one found", not loaded and trusted on its own.
 - run_query on a DuckDB connection (the Results connection too) checks every `results.<name>` it reads like query_outputs does: outputs from a connection with AI off, not shared with MCP, or not sharing result rows were readable there.
