@@ -95,10 +95,7 @@ fn block_kind(x: &SqlSyntax, seg: &str) -> Block {
         if it.peek() == Some(&"DEFINER") {
             return it.find(|o| x.block_objects.contains(o));
         }
-        while matches!(
-            it.peek(),
-            Some(&"EDITIONABLE") | Some(&"NONEDITIONABLE") | Some(&"TEMP") | Some(&"TEMPORARY")
-        ) {
+        while matches!(it.peek(), Some(&"EDITIONABLE") | Some(&"NONEDITIONABLE") | Some(&"TEMP") | Some(&"TEMPORARY")) {
             it.next();
         }
         it.next()
@@ -141,17 +138,13 @@ fn parses_alone(sql: &str, parser: SqlParser) -> bool {
 
 /// First words of a statement, for blank-line separation.
 const STATEMENT_STARTS: &[&str] = &[
-    "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP", "TRUNCATE", "EXEC", "EXECUTE", "CALL",
-    "DECLARE", "SET", "USE", "GRANT", "REVOKE", "BEGIN", "COMMIT", "ROLLBACK", "EXPLAIN", "SHOW", "DESCRIBE", "VALUES",
+    "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP", "TRUNCATE", "EXEC", "EXECUTE", "CALL", "DECLARE", "SET", "USE",
+    "GRANT", "REVOKE", "BEGIN", "COMMIT", "ROLLBACK", "EXPLAIN", "SHOW", "DESCRIBE", "VALUES",
 ];
 
 fn is_go_line(line: &str) -> bool {
     let mut it = line.split_whitespace();
-    it.next().is_some_and(|w| w.eq_ignore_ascii_case("go"))
-        && it
-            .next()
-            .is_none_or(|n| n.chars().all(|c| c.is_ascii_digit()))
-        && it.next().is_none()
+    it.next().is_some_and(|w| w.eq_ignore_ascii_case("go")) && it.next().is_none_or(|n| n.chars().all(|c| c.is_ascii_digit())) && it.next().is_none()
 }
 
 /// Split a script into statements, respecting quotes, comments and each
@@ -191,11 +184,7 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
         let lead = raw.len() - raw.trim_start().len();
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
-            out.push(StatementSpan {
-                start: from + lead,
-                end: from + lead + trimmed.len(),
-                sql: trimmed.to_string(),
-            });
+            out.push(StatementSpan { start: from + lead, end: from + lead + trimmed.len(), sql: trimmed.to_string() });
         }
     };
 
@@ -205,11 +194,7 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
             let line_end = text[i..].find('\n').map(|p| i + p).unwrap_or(n);
             let line = text[i..line_end].trim();
             let directive = match syntax.block_end {
-                _ if syntax.delimiter_directive
-                    && line.len() > 10
-                        && line.is_char_boundary(10)
-                        && line[..10].eq_ignore_ascii_case("delimiter ") =>
-                {
+                _ if syntax.delimiter_directive && line.len() > 10 && line.is_char_boundary(10) && line[..10].eq_ignore_ascii_case("delimiter ") => {
                     let d = line[10..].trim();
                     if !d.is_empty() {
                         delimiter = d.as_bytes().to_vec();
@@ -302,14 +287,7 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
                 };
             }
             b'\'' => i = skip_quoted(b, i, b'\'', lx.backslash_escapes),
-            b'"' => {
-                i = skip_quoted(
-                    b,
-                    i,
-                    b'"',
-                    syntax.backslash_in_double_quotes,
-                )
-            }
+            b'"' => i = skip_quoted(b, i, b'"', syntax.backslash_in_double_quotes),
             b'`' if lx.backtick => i = skip_quoted(b, i, b'`', false),
             b'[' if lx.brackets => {
                 i = match text[i..].find(']') {
@@ -327,7 +305,9 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
                 }
                 _ => i += 1,
             },
-            c if (c.is_ascii_alphabetic() || c == b'_') && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$' || b[i - 1] == b'.')) => {
+            c if (c.is_ascii_alphabetic() || c == b'_')
+                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$' || b[i - 1] == b'.')) =>
+            {
                 let mut j = i + 1;
                 while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
                     j += 1;
@@ -398,8 +378,7 @@ fn dollar_tag(text: &str, i: usize) -> Option<&str> {
 }
 
 pub(crate) fn words(s: &str) -> impl Iterator<Item = &str> {
-    s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|w| !w.is_empty())
+    s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty())
 }
 
 fn strip_leading_comments(mut s: &str) -> &str {
@@ -417,20 +396,13 @@ fn strip_leading_comments(mut s: &str) -> &str {
 
 /// First keyword of a statement, upper-cased (skips comments and parens).
 pub fn leading_keyword(sql: &str) -> String {
-    words(strip_leading_comments(sql))
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase()
+    words(strip_leading_comments(sql)).next().unwrap_or("").to_ascii_uppercase()
 }
 
 /// Pick the statement for "run statement at cursor". `cursor` is a byte
 /// offset. If the cursor sits between statements, the preceding one wins.
 pub fn statement_at(spans: &[StatementSpan], cursor: usize) -> Option<&StatementSpan> {
-    spans
-        .iter()
-        .find(|s| cursor >= s.start && cursor <= s.end)
-        .or_else(|| spans.iter().rev().find(|s| s.end < cursor))
-        .or_else(|| spans.first())
+    spans.iter().find(|s| cursor >= s.start && cursor <= s.end).or_else(|| spans.iter().rev().find(|s| s.end < cursor)).or_else(|| spans.first())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, ts_rs::TS)]
@@ -477,11 +449,7 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
     let dialect = dialect_for(kind);
     match Parser::parse_sql(dialect.as_ref(), sql) {
         Ok(stmts) if !stmts.is_empty() => {
-            let mut out = Classification {
-                kind: StatementKind::Read,
-                missing_where: false,
-                keyword: keyword.clone(),
-            };
+            let mut out = Classification { kind: StatementKind::Read, missing_where: false, keyword: keyword.clone() };
             for s in &stmts {
                 let (k, mw) = classify_ast(s, &keyword);
                 out.kind = out.kind.max(k);
@@ -496,17 +464,9 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
             }
             if k == StatementKind::Read {
                 // Unparseable but looks like a read; don't claim certainty.
-                k = if keyword == "SELECT" && !contains_dml_word(sql) {
-                    StatementKind::Read
-                } else {
-                    StatementKind::Unknown
-                };
+                k = if keyword == "SELECT" && !contains_dml_word(sql) { StatementKind::Read } else { StatementKind::Unknown };
             }
-            Classification {
-                kind: k,
-                missing_where: false,
-                keyword,
-            }
+            Classification { kind: k, missing_where: false, keyword }
         }
     }
 }
@@ -518,14 +478,14 @@ fn classify_ast(s: &Statement, keyword: &str) -> (StatementKind, bool) {
         Statement::Insert(_) | Statement::Merge(_) => (K::Dml, false),
         Statement::Update(u) => (K::Dml, u.selection.is_none()),
         Statement::Delete(d) => (K::Dml, d.selection.is_none()),
-        Statement::Explain {
-            analyze, statement, ..
-        } => {
-            if *analyze {
-                classify_ast(statement, &leading_keyword(&statement.to_string()))
-            } else {
-                (K::Read, false)
-            }
+        // The inner statement decides, ANALYZE or not: `EXPLAIN (ANALYZE) …`,
+        // `EXPLAIN (ANALYZE true, BUFFERS) …` and other option lists leave
+        // `analyze` false and put it in `options`, and engines differ on
+        // which EXPLAIN forms run the statement. A plain EXPLAIN of a write
+        // counts as that write too: being stricter costs a confirmation.
+        Statement::Explain { statement, .. } => {
+            let (inner, missing_where) = classify_ast(statement, &leading_keyword(&statement.to_string()));
+            (K::Read.max(inner), missing_where)
         }
         Statement::ExplainTable { .. } => (K::Read, false),
         _ => (keyword_kind(keyword), false),
@@ -548,9 +508,7 @@ fn set_expr_kind(e: &SetExpr) -> StatementKind {
         SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => StatementKind::Read,
         SetExpr::Query(q) => query_kind(q),
         SetExpr::SetOperation { left, right, .. } => set_expr_kind(left).max(set_expr_kind(right)),
-        SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => {
-            StatementKind::Dml
-        }
+        SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => StatementKind::Dml,
         #[allow(unreachable_patterns)]
         _ => StatementKind::Unknown,
     }
@@ -559,31 +517,18 @@ fn set_expr_kind(e: &SetExpr) -> StatementKind {
 pub(crate) fn keyword_kind(kw: &str) -> StatementKind {
     use StatementKind as K;
     match kw {
-        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "VALUES" | "TABLE" => {
-            K::Read
-        }
-        "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "REPLACE" | "UPSERT" | "COPY" | "LOAD"
-        | "CALL" | "EXEC" | "EXECUTE" | "DO" | "HANDLER" => K::Dml,
-        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME" | "COMMENT" | "GRANT" | "REVOKE" => {
-            K::Ddl
-        }
-        "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "END" | "ABORT"
-        | "XA" => K::Transaction,
-        "SET" | "USE" | "RESET" | "ATTACH" | "DETACH" | "PRAGMA" | "DISCARD" | "LISTEN"
-        | "UNLISTEN" => K::Session,
+        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "VALUES" | "TABLE" => K::Read,
+        "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "REPLACE" | "UPSERT" | "COPY" | "LOAD" | "CALL" | "EXEC" | "EXECUTE" | "DO" | "HANDLER" => K::Dml,
+        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME" | "COMMENT" | "GRANT" | "REVOKE" => K::Ddl,
+        "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "END" | "ABORT" | "XA" => K::Transaction,
+        "SET" | "USE" | "RESET" | "ATTACH" | "DETACH" | "PRAGMA" | "DISCARD" | "LISTEN" | "UNLISTEN" => K::Session,
         "" => K::Unknown,
         _ => K::Other,
     }
 }
 
 fn contains_dml_word(sql: &str) -> bool {
-    words(sql).any(|w| {
-        [
-            "INSERT", "UPDATE", "DELETE", "MERGE", "INTO", "DROP", "ALTER", "CREATE", "TRUNCATE",
-        ]
-        .iter()
-        .any(|k| w.eq_ignore_ascii_case(k))
-    })
+    words(sql).any(|w| ["INSERT", "UPDATE", "DELETE", "MERGE", "INTO", "DROP", "ALTER", "CREATE", "TRUNCATE"].iter().any(|k| w.eq_ignore_ascii_case(k)))
 }
 
 // ------------------------------------------------------------------ read-only
@@ -591,11 +536,34 @@ fn contains_dml_word(sql: &str) -> bool {
 /// Session settings a read-only connection may still change: none of them
 /// can make the session writable.
 const READ_ONLY_SETTINGS: &[&str] = &[
-    "search_path", "schema", "time", "timezone", "time_zone", "statement_timeout", "lock_timeout",
-    "idle_in_transaction_session_timeout", "datestyle", "intervalstyle", "application_name",
-    "extra_float_digits", "names", "character_set_results", "max_execution_time", "net_read_timeout",
-    "query_tag", "language", "dateformat", "datefirst", "nocount", "ansi_nulls", "quoted_identifier",
-    "textsize", "arithabort", "lock_timeout_ms", "threads", "memory_limit",
+    "search_path",
+    "schema",
+    "time",
+    "timezone",
+    "time_zone",
+    "statement_timeout",
+    "lock_timeout",
+    "idle_in_transaction_session_timeout",
+    "datestyle",
+    "intervalstyle",
+    "application_name",
+    "extra_float_digits",
+    "names",
+    "character_set_results",
+    "max_execution_time",
+    "net_read_timeout",
+    "query_tag",
+    "language",
+    "dateformat",
+    "datefirst",
+    "nocount",
+    "ansi_nulls",
+    "quoted_identifier",
+    "textsize",
+    "arithabort",
+    "lock_timeout_ms",
+    "threads",
+    "memory_limit",
 ];
 
 /// Whether a read-only connection may run this statement. Only reads, plus
@@ -628,29 +596,216 @@ pub fn read_only_allows(sql: &str, c: &Classification) -> bool {
 
 /// Built-in functions that never write (common to the SQL dialects).
 const PURE_FUNCTIONS: &[&str] = &[
-    "count", "sum", "avg", "min", "max", "coalesce", "nullif", "lower", "upper", "trim", "ltrim", "rtrim", "btrim",
-    "length", "len", "char_length", "character_length", "octet_length", "substr", "substring", "concat", "concat_ws",
-    "replace", "translate", "reverse", "round", "trunc", "truncate", "floor", "ceil", "ceiling", "abs", "sign", "mod",
-    "sqrt", "power", "pow", "exp", "ln", "log", "log10", "log2", "pi", "random", "rand", "cast", "try_cast", "convert",
-    "try_convert", "date_trunc", "date_part", "datepart", "datename", "extract", "now", "current_date",
-    "current_timestamp", "current_time", "localtimestamp", "localtime", "getdate", "getutcdate", "sysdate",
-    "systimestamp", "sysdatetime", "dateadd", "datediff", "date_add", "date_sub", "date_diff", "timestampdiff",
-    "timestampadd", "to_char", "to_date", "to_timestamp", "to_number", "to_varchar", "to_decimal", "date", "time",
-    "timestamp", "year", "month", "day", "hour", "minute", "second", "week", "quarter", "dayofweek", "dayofyear",
-    "last_day", "add_months", "months_between", "date_format", "str_to_date", "strftime", "strptime", "age",
-    "row_number", "rank", "dense_rank", "lag", "lead", "first_value", "last_value", "nth_value", "ntile",
-    "percent_rank", "cume_dist", "greatest", "least", "iff", "iif", "if", "ifnull", "isnull", "nvl", "nvl2", "zeroifnull",
-    "decode", "listagg", "string_agg", "array_agg", "group_concat", "split_part", "split", "position", "strpos",
-    "instr", "charindex", "locate", "left", "right", "lpad", "rpad", "format", "repeat", "regexp_replace",
-    "regexp_substr", "regexp_like", "regexp_matches", "regexp_extract", "stddev", "stddev_pop", "stddev_samp",
-    "variance", "var_pop", "var_samp", "median", "percentile_cont", "percentile_disc", "approx_count_distinct",
-    "any_value", "bool_and", "bool_or", "every", "bit_and", "bit_or", "json_extract", "json_extract_path_text",
-    "json_value", "json_query", "parse_json", "try_parse_json", "get_json_object", "to_json", "to_jsonb",
-    "json_build_object", "jsonb_build_object", "json_agg", "jsonb_agg", "array_size", "array_length",
-    "array_contains", "cardinality", "unnest", "flatten", "generate_series", "md5", "sha1", "sha2", "hash",
-    "uuid", "gen_random_uuid", "newid", "current_user", "current_schema", "current_database", "user",
-    "version", "typeof", "exists", "any", "all", "some", "grouping", "nvl", "chr", "char", "ascii", "initcap",
-    "soundex", "difference", "space", "stuff", "quotename", "object_id", "db_name", "schema_name",
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "coalesce",
+    "nullif",
+    "lower",
+    "upper",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "btrim",
+    "length",
+    "len",
+    "char_length",
+    "character_length",
+    "octet_length",
+    "substr",
+    "substring",
+    "concat",
+    "concat_ws",
+    "replace",
+    "translate",
+    "reverse",
+    "round",
+    "trunc",
+    "truncate",
+    "floor",
+    "ceil",
+    "ceiling",
+    "abs",
+    "sign",
+    "mod",
+    "sqrt",
+    "power",
+    "pow",
+    "exp",
+    "ln",
+    "log",
+    "log10",
+    "log2",
+    "pi",
+    "random",
+    "rand",
+    "cast",
+    "try_cast",
+    "convert",
+    "try_convert",
+    "date_trunc",
+    "date_part",
+    "datepart",
+    "datename",
+    "extract",
+    "now",
+    "current_date",
+    "current_timestamp",
+    "current_time",
+    "localtimestamp",
+    "localtime",
+    "getdate",
+    "getutcdate",
+    "sysdate",
+    "systimestamp",
+    "sysdatetime",
+    "dateadd",
+    "datediff",
+    "date_add",
+    "date_sub",
+    "date_diff",
+    "timestampdiff",
+    "timestampadd",
+    "to_char",
+    "to_date",
+    "to_timestamp",
+    "to_number",
+    "to_varchar",
+    "to_decimal",
+    "date",
+    "time",
+    "timestamp",
+    "year",
+    "month",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "week",
+    "quarter",
+    "dayofweek",
+    "dayofyear",
+    "last_day",
+    "add_months",
+    "months_between",
+    "date_format",
+    "str_to_date",
+    "strftime",
+    "strptime",
+    "age",
+    "row_number",
+    "rank",
+    "dense_rank",
+    "lag",
+    "lead",
+    "first_value",
+    "last_value",
+    "nth_value",
+    "ntile",
+    "percent_rank",
+    "cume_dist",
+    "greatest",
+    "least",
+    "iff",
+    "iif",
+    "if",
+    "ifnull",
+    "isnull",
+    "nvl",
+    "nvl2",
+    "zeroifnull",
+    "decode",
+    "listagg",
+    "string_agg",
+    "array_agg",
+    "group_concat",
+    "split_part",
+    "split",
+    "position",
+    "strpos",
+    "instr",
+    "charindex",
+    "locate",
+    "left",
+    "right",
+    "lpad",
+    "rpad",
+    "format",
+    "repeat",
+    "regexp_replace",
+    "regexp_substr",
+    "regexp_like",
+    "regexp_matches",
+    "regexp_extract",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "variance",
+    "var_pop",
+    "var_samp",
+    "median",
+    "percentile_cont",
+    "percentile_disc",
+    "approx_count_distinct",
+    "any_value",
+    "bool_and",
+    "bool_or",
+    "every",
+    "bit_and",
+    "bit_or",
+    "json_extract",
+    "json_extract_path_text",
+    "json_value",
+    "json_query",
+    "parse_json",
+    "try_parse_json",
+    "get_json_object",
+    "to_json",
+    "to_jsonb",
+    "json_build_object",
+    "jsonb_build_object",
+    "json_agg",
+    "jsonb_agg",
+    "array_size",
+    "array_length",
+    "array_contains",
+    "cardinality",
+    "unnest",
+    "flatten",
+    "generate_series",
+    "md5",
+    "sha1",
+    "sha2",
+    "hash",
+    "uuid",
+    "gen_random_uuid",
+    "newid",
+    "current_user",
+    "current_schema",
+    "current_database",
+    "user",
+    "version",
+    "typeof",
+    "exists",
+    "any",
+    "all",
+    "some",
+    "grouping",
+    "nvl",
+    "chr",
+    "char",
+    "ascii",
+    "initcap",
+    "soundex",
+    "difference",
+    "space",
+    "stuff",
+    "quotename",
+    "object_id",
+    "db_name",
+    "schema_name",
 ];
 
 /// Functions `sql` calls that are not known built-ins (user functions,
@@ -705,19 +860,13 @@ mod tests {
     use ConnectorKind::*;
 
     fn sqls(text: &str, k: ConnectorKind) -> Vec<String> {
-        split_statements(text, k)
-            .into_iter()
-            .map(|s| s.sql)
-            .collect()
+        split_statements(text, k).into_iter().map(|s| s.sql).collect()
     }
 
     #[test]
     fn split_basic_and_quotes() {
         let t = "select 1; select ';' as x -- c;\n; select \"a;b\" from t;";
-        assert_eq!(
-            sqls(t, Postgres),
-            vec!["select 1", "select ';' as x -- c;", "select \"a;b\" from t"]
-        );
+        assert_eq!(sqls(t, Postgres), vec!["select 1", "select ';' as x -- c;", "select \"a;b\" from t"]);
     }
 
     #[test]
@@ -771,15 +920,9 @@ mod tests {
 
     #[test]
     fn split_cloud_dialects() {
-        assert_eq!(
-            sqls("select `a;b` from t; select 'x\\';y'", Databricks).len(),
-            2
-        );
+        assert_eq!(sqls("select `a;b` from t; select 'x\\';y'", Databricks).len(), 2);
         assert_eq!(sqls("select '''a;b''' # c;\n; select 2", Bigquery).len(), 2);
-        let v = sqls(
-            "create procedure p() returns int language sql as $$ begin return 1; end $$; // c;\nselect 1",
-            Snowflake,
-        );
+        let v = sqls("create procedure p() returns int language sql as $$ begin return 1; end $$; // c;\nselect 1", Snowflake);
         assert_eq!(v.len(), 2, "{v:?}");
     }
 
@@ -787,7 +930,10 @@ mod tests {
     fn split_procedure_bodies_and_nested_ends() {
         let v = |k: ConnectorKind, t: &str| sqls(t, k);
         // MySQL bodies without DELIMITER, DEFINER, CASE … END inside.
-        assert_eq!(v(Mysql, "create procedure p() begin select 1; select 2; end;\nselect 3;"), vec!["create procedure p() begin select 1; select 2; end", "select 3"]);
+        assert_eq!(
+            v(Mysql, "create procedure p() begin select 1; select 2; end;\nselect 3;"),
+            vec!["create procedure p() begin select 1; select 2; end", "select 3"]
+        );
         assert_eq!(v(Mysql, "create definer=`root`@`%` procedure p() begin select 1; end;\nselect 3;").len(), 2);
         assert_eq!(
             v(Mysql, "create procedure p() begin declare x int; set x = case when 1 then 2 else 3 end; if x > 1 then select 1; end if; end;\nselect 3;").len(),
@@ -796,7 +942,10 @@ mod tests {
         assert_eq!(v(Mysql, "create function f() returns int deterministic return 1;\nselect f();").len(), 2, "single-statement body");
         // Repeated DELIMITER switches.
         assert_eq!(
-            v(Mysql, "delimiter //\ncreate procedure a() begin select 1; end //\ndelimiter ;\nselect 1;\ndelimiter $$\ncreate procedure b() begin select 2; end$$\ndelimiter ;\nselect 2;"),
+            v(
+                Mysql,
+                "delimiter //\ncreate procedure a() begin select 1; end //\ndelimiter ;\nselect 1;\ndelimiter $$\ncreate procedure b() begin select 2; end$$\ndelimiter ;\nselect 2;"
+            ),
             vec!["create procedure a() begin select 1; end", "select 1", "create procedure b() begin select 2; end", "select 2"]
         );
         // SQLite trigger with CASE; BEGIN TRANSACTION is not a block.
@@ -814,7 +963,10 @@ mod tests {
 
     #[test]
     fn split_statements_without_semicolons() {
-        assert_eq!(sqls("select 1\n\nselect 2\n\nupdate t set a = 1\n\nwhere b = 2", Postgres), vec!["select 1", "select 2", "update t set a = 1\n\nwhere b = 2"]);
+        assert_eq!(
+            sqls("select 1\n\nselect 2\n\nupdate t set a = 1\n\nwhere b = 2", Postgres),
+            vec!["select 1", "select 2", "update t set a = 1\n\nwhere b = 2"]
+        );
         assert_eq!(sqls("select 1\n\nselect 2", Mssql), vec!["select 1", "select 2"]);
         // A blank line inside a statement keeps it whole.
         assert_eq!(sqls("insert into t\n\nselect * from x;\nwith a as (select 1)\n\nselect * from a;", Postgres).len(), 2);
@@ -836,20 +988,28 @@ mod tests {
     fn classify_statements() {
         let c = |s: &str| classify(s, Postgres).kind;
         assert_eq!(c("select * from t"), StatementKind::Read);
-        assert_eq!(
-            c("with x as (select 1) select * from x"),
-            StatementKind::Read
-        );
-        assert_eq!(
-            c("with d as (delete from t returning *) select * from d"),
-            StatementKind::Dml
-        );
+        assert_eq!(c("with x as (select 1) select * from x"), StatementKind::Read);
+        assert_eq!(c("with d as (delete from t returning *) select * from d"), StatementKind::Dml);
         assert_eq!(c("insert into t values (1)"), StatementKind::Dml);
         assert_eq!(c("drop table t"), StatementKind::Ddl);
         assert_eq!(c("select * into t2 from t"), StatementKind::Ddl);
         assert_eq!(c("begin"), StatementKind::Transaction);
         assert_eq!(c("explain select 1"), StatementKind::Read);
         assert_eq!(c("explain analyze delete from t"), StatementKind::Dml);
+        // Postgres option lists: sqlparser leaves `analyze` false and puts it in `options`.
+        assert_eq!(c("EXPLAIN (ANALYZE) DELETE FROM t"), StatementKind::Dml);
+        assert_eq!(c("explain (analyze true, buffers) update t set a = 1 where id = 2"), StatementKind::Dml);
+        assert_eq!(c("explain (analyze, format json) insert into t select * from s"), StatementKind::Dml);
+        assert_eq!(c("explain (analyze) create table t2 as select 1"), StatementKind::Ddl);
+        assert!(classify("EXPLAIN (ANALYZE) DELETE FROM t", Postgres).missing_where);
+        // Without ANALYZE too: the statement explained decides.
+        assert_eq!(c("explain delete from t"), StatementKind::Dml);
+        assert_eq!(c("explain (format json) select 1"), StatementKind::Read);
+        assert_eq!(c("explain (analyze) select * from t"), StatementKind::Read);
+        assert_eq!(c("explain (analyze) with d as (delete from t returning *) select * from d"), StatementKind::Dml);
+        for (k, sql) in [(Mysql, "EXPLAIN ANALYZE DELETE FROM t"), (Duckdb, "EXPLAIN ANALYZE DELETE FROM t"), (Snowflake, "EXPLAIN DELETE FROM t")] {
+            assert_eq!(classify(sql, k).kind, StatementKind::Dml, "{k:?}: {sql}");
+        }
         assert!(classify("delete from t", Postgres).missing_where);
         assert!(!classify("update t set a=1 where id=2", Postgres).missing_where);
         assert_eq!(classify("show tables", Mysql).kind, StatementKind::Read);
@@ -1054,11 +1214,7 @@ fn is_string_literal(t: &str, kind: ConnectorKind) -> bool {
 /// `'text'` with the dialect's escaping (doubled quotes; backslashes where
 /// the dialect treats them as escapes).
 pub fn quote_string(t: &str, kind: ConnectorKind) -> String {
-    if lex(kind).backslash_escapes {
-        format!("'{}'", t.replace('\\', "\\\\").replace('\'', "\\'"))
-    } else {
-        format!("'{}'", t.replace('\'', "''"))
-    }
+    if lex(kind).backslash_escapes { format!("'{}'", t.replace('\\', "\\\\").replace('\'', "\\'")) } else { format!("'{}'", t.replace('\'', "''")) }
 }
 
 /// Replace every parameter of `sql`. Errors with the names that have no value.
@@ -1096,8 +1252,8 @@ pub fn substitute_parameters(sql: &str, kind: ConnectorKind, values: &std::colle
 #[cfg(test)]
 mod param_tests {
     use super::*;
-    use std::collections::HashMap;
     use ConnectorKind as K;
+    use std::collections::HashMap;
 
     fn names(sql: &str, k: K) -> Vec<String> {
         find_parameters(sql, k).into_iter().map(|p| p.name).collect()
@@ -1174,9 +1330,24 @@ mod param_tests {
 /// Words followed by a secret (optionally after `=` or `(`): `PASSWORD 'x'`,
 /// `PASSWORD = 'x'`, `PASSWORD('x')`, `SECRET 'x'`, `AWS_SECRET_KEY = 'x'`…
 const SECRET_WORDS: &[&str] = &[
-    "password", "secret", "secret_key", "aws_secret_key", "aws_secret_access_key", "aws_token", "session_token",
-    "account_key", "azure_sas_token", "sas_token", "master_key", "client_secret", "access_token", "refresh_token",
-    "private_key", "private_key_passphrase", "connection_string", "token",
+    "password",
+    "secret",
+    "secret_key",
+    "aws_secret_key",
+    "aws_secret_access_key",
+    "aws_token",
+    "session_token",
+    "account_key",
+    "azure_sas_token",
+    "sas_token",
+    "master_key",
+    "client_secret",
+    "access_token",
+    "refresh_token",
+    "private_key",
+    "private_key_passphrase",
+    "connection_string",
+    "token",
 ];
 
 /// `sql` with passwords and keys replaced by `***`, for what DataBrain keeps
@@ -1364,7 +1535,6 @@ pub fn redact_text(text: &str) -> String {
     redact_url_passwords(&quoted)
 }
 
-
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
@@ -1380,7 +1550,10 @@ mod redaction_tests {
             ("CREATE LOGIN l WITH PASSWORD = 'pw'", "CREATE LOGIN l WITH PASSWORD = '***'"),
             ("SET PASSWORD = PASSWORD('pw')", "SET PASSWORD = PASSWORD('***')"),
             ("CREATE SECRET s (TYPE s3, KEY_ID 'id', SECRET 'k')", "CREATE SECRET s (TYPE s3, KEY_ID 'id', SECRET '***')"),
-            ("COPY INTO t FROM 's3://b' CREDENTIALS = (AWS_KEY_ID = 'id' AWS_SECRET_KEY = 'k')", "COPY INTO t FROM 's3://b' CREDENTIALS = (AWS_KEY_ID = 'id' AWS_SECRET_KEY = '***')"),
+            (
+                "COPY INTO t FROM 's3://b' CREDENTIALS = (AWS_KEY_ID = 'id' AWS_SECRET_KEY = 'k')",
+                "COPY INTO t FROM 's3://b' CREDENTIALS = (AWS_KEY_ID = 'id' AWS_SECRET_KEY = '***')",
+            ),
             ("ALTER USER u SET RSA_PUBLIC_KEY = 'pub', PRIVATE_KEY = \"k\"", "ALTER USER u SET RSA_PUBLIC_KEY = 'pub', PRIVATE_KEY = \"***\""),
             ("select 'it''s' as password", "select 'it''s' as password"),
         ] {
@@ -1399,7 +1572,10 @@ mod redaction_tests {
     fn redacts_url_passwords_in_text() {
         for (text, want) in [
             ("postgres://ann:s3cret@db.example.com:5432/app", "postgres://ann:***@db.example.com:5432/app"),
-            ("connect to mongodb+srv://u:p%40ss@cluster0.x.net/?retryWrites=true please", "connect to mongodb+srv://u:***@cluster0.x.net/?retryWrites=true please"),
+            (
+                "connect to mongodb+srv://u:p%40ss@cluster0.x.net/?retryWrites=true please",
+                "connect to mongodb+srv://u:***@cluster0.x.net/?retryWrites=true please",
+            ),
             ("ATTACH 'mysql://root:pw@localhost/shop' AS m", "ATTACH 'mysql://root:***@localhost/shop' AS m"),
             ("two: a://x:1@h and b://y:2@k", "two: a://x:***@h and b://y:***@k"),
             ("user:p@ss with @ in it: s://u:p@ss@host/db", "user:p@ss with @ in it: s://u:***@host/db"),
@@ -1428,7 +1604,15 @@ mod read_only_tests {
 
     #[test]
     fn read_only_allows_reads_and_harmless_settings() {
-        for sql in ["select 1", "with x as (select 1) select * from x", "explain select 1", "use sales", "set search_path = a, b", "SET SESSION time_zone = '+00:00'", "set @@session.max_execution_time = 1000"] {
+        for sql in [
+            "select 1",
+            "with x as (select 1) select * from x",
+            "explain select 1",
+            "use sales",
+            "set search_path = a, b",
+            "SET SESSION time_zone = '+00:00'",
+            "set @@session.max_execution_time = 1000",
+        ] {
             assert!(allows(sql, Postgres) || allows(sql, Mysql), "{sql}");
         }
         assert!(allows("use warehouse wh", Snowflake));

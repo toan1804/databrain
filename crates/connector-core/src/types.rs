@@ -211,18 +211,12 @@ impl ConnectionConfig {
     }
 
     pub fn host_or_default(&self) -> &str {
-        self.host
-            .as_deref()
-            .filter(|h| !h.is_empty())
-            .unwrap_or("localhost")
+        self.host.as_deref().filter(|h| !h.is_empty()).unwrap_or("localhost")
     }
 
     /// Non-empty option value.
     pub fn opt(&self, key: &str) -> Option<&str> {
-        self.options
-            .get(key)
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
+        self.options.get(key).map(|s| s.trim()).filter(|s| !s.is_empty())
     }
 
     /// Minimal config for tests and examples.
@@ -295,13 +289,7 @@ pub struct FieldSpec {
 
 impl FieldSpec {
     pub const fn new(key: &'static str, label: &'static str) -> Self {
-        Self {
-            key,
-            label,
-            placeholder: None,
-            required: false,
-            help: None,
-        }
+        Self { key, label, placeholder: None, required: false, help: None }
     }
     pub const fn required(mut self) -> Self {
         self.required = true;
@@ -385,11 +373,7 @@ pub fn search_name_term(query: &str) -> String {
 /// that are safe inside any dialect's string literal (letters, digits, `_`,
 /// `-`, `$`, space). Results are re-checked with [`object_matches`].
 pub fn search_sql_term(query: &str) -> String {
-    search_name_term(query)
-        .to_lowercase()
-        .chars()
-        .filter(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '$' | ' '))
-        .collect()
+    search_name_term(query).to_lowercase().chars().filter(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '$' | ' ')).collect()
 }
 
 /// Rank search hits: exact name, then prefix, then shorter names first.
@@ -397,7 +381,13 @@ pub fn rank_matches(query: &str, hits: &mut Vec<DbObject>, limit: usize) {
     let term = search_name_term(query).to_lowercase();
     hits.sort_by_cached_key(|o| {
         let n = o.name.to_lowercase();
-        let tier = if n == term { 0 } else if n.starts_with(&term) { 1 } else { 2 };
+        let tier = if n == term {
+            0
+        } else if n.starts_with(&term) {
+            1
+        } else {
+            2
+        };
         (tier, n.len(), o.schema.clone(), o.name.clone())
     });
     hits.dedup_by(|a, b| a.schema == b.schema && a.name == b.name);
@@ -543,6 +533,11 @@ pub struct TableLayout {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(as = "Option<f64>")]
     pub row_estimate: Option<i64>,
+    /// Space the table takes on the server (data, and indexes where the
+    /// engine counts them together), from its statistics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>", optional)]
+    pub size_bytes: Option<i64>,
     /// Extra facts worth showing (e.g. "ZORDER BY (a, b)", "heap: no clustered index").
     #[serde(default)]
     pub notes: Vec<String>,

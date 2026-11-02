@@ -63,6 +63,9 @@ pub struct LoadReport {
     /// database reports them (the staged rows when it doesn't).
     #[ts(as = "f64")]
     pub rows: u64,
+    /// Sync: rows of the table deleted because their key isn't among the rows.
+    #[ts(as = "f64")]
+    pub deleted: u64,
     pub created_table: bool,
     pub transaction: bool,
     pub notices: Vec<String>,
@@ -185,17 +188,30 @@ enum ActKind {
     Stage,
     /// Update/merge from the staging table: its affected rows are the step's rows.
     Write,
+    /// Sync's delete of the rows missing from the step's rows (counted apart).
+    Remove,
     /// Other DML (delete all rows).
     Dml,
 }
 
 #[derive(Debug, Clone)]
 enum Act {
-    Sql { label: String, sql: String, kind: ActKind },
+    Sql {
+        label: String,
+        sql: String,
+        kind: ActKind,
+    },
     /// Insert the rows into `table`; `target` = the step's table (not staging).
-    Insert { label: String, table: String, target: bool },
+    Insert {
+        label: String,
+        table: String,
+        target: bool,
+    },
     /// Can't be built (no rows to plan with).
-    Skip { label: String, reason: String },
+    Skip {
+        label: String,
+        reason: String,
+    },
 }
 
 impl Act {
@@ -213,6 +229,7 @@ fn mode_text(m: LoadMode) -> &'static str {
         LoadMode::Replace => "replace table",
         LoadMode::Update => "update by key",
         LoadMode::Merge => "merge by key",
+        LoadMode::Sync => "sync by key (merge, then delete rows missing from the step's rows)",
     }
 }
 
@@ -331,13 +348,29 @@ impl QueryEngine {
 
     /// Copy the rows of an output into a table of another connection (job
     /// load steps), with the step's before/after SQL, on the session `tab`.
-    pub async fn write_output(&self, reference: &str, connection_id: &str, tab: &str, spec: &LoadSpec, cancel: &CancellationToken, obs: &dyn LoadObserver) -> Result<LoadReport> {
+    pub async fn write_output(
+        &self,
+        reference: &str,
+        connection_id: &str,
+        tab: &str,
+        spec: &LoadSpec,
+        cancel: &CancellationToken,
+        obs: &dyn LoadObserver,
+    ) -> Result<LoadReport> {
         let rows = self.output_rows(reference)?;
         self.load_rows(&rows, connection_id, tab, spec, cancel, obs).await
     }
 
     /// Write `rows` as `spec` says.
-    pub async fn load_rows(&self, rows: &LoadRows, connection_id: &str, tab: &str, spec: &LoadSpec, cancel: &CancellationToken, obs: &dyn LoadObserver) -> Result<LoadReport> {
+    pub async fn load_rows(
+        &self,
+        rows: &LoadRows,
+        connection_id: &str,
+        tab: &str,
+        spec: &LoadSpec,
+        cancel: &CancellationToken,
+        obs: &dyn LoadObserver,
+    ) -> Result<LoadReport> {
         let p = self.prepare_load(connection_id, tab, spec, Some(rows), false).await?;
         obs.event(LoadEvent::Info(format!(
             "Writing {} rows into {} on {} ({}, INSERTs of up to {} rows / {} KB): {}",
@@ -360,18 +393,23 @@ impl QueryEngine {
             if let Some(tx) = &p.tx {
                 timed(&p.session, "Commit", tx.commit, cancel, obs).await.map_err(|e| labelled("Commit", e))?;
             }
-            Ok::<u64, EngineError>(n)
+            Ok::<(u64, u64), EngineError>(n)
         }
         .await;
         match result {
-            Ok(n) => {
+            Ok((n, deleted)) => {
                 let mut notices = p.notices.clone();
                 if p.creates {
                     let c = created_notice(&p, rows);
                     obs.event(LoadEvent::Info(c.clone()));
                     notices.push(c);
                 }
-                Ok(LoadReport { rows: n, created_table: p.creates, transaction: p.tx.is_some(), notices })
+                if p.plan.iter().any(|a| matches!(a, Act::Sql { kind: ActKind::Remove, .. })) {
+                    let d = format!("Sync: {n} rows written, {deleted} deleted (their key isn't among the step's rows)");
+                    obs.event(LoadEvent::Info(d.clone()));
+                    notices.push(d);
+                }
+                Ok(LoadReport { rows: n, deleted, created_table: p.creates, transaction: p.tx.is_some(), notices })
             }
             Err(e) => {
                 if p.tx.is_some() && e.kind != "cancelled" {
@@ -441,7 +479,9 @@ impl QueryEngine {
                             checks.push(LoadCheck { label: "Roll back".into(), sql: tx.rollback.into(), status: "error".into(), message: Some(e.message) });
                         }
                     }
-                    Err(e) => checks.push(LoadCheck { label: "Start the transaction".into(), sql: tx.begin.into(), status: "error".into(), message: Some(e.message) }),
+                    Err(e) => {
+                        checks.push(LoadCheck { label: "Start the transaction".into(), sql: tx.begin.into(), status: "error".into(), message: Some(e.message) })
+                    }
                 }
             }
             None => {
@@ -507,7 +547,9 @@ impl QueryEngine {
                 _ => Err(same),
             }
         }
-        let ambiguous = |what: &str, want: &str, all: Vec<String>| format!("{what} {want} matches {} in {conn} (names differing only in case): type the exact name", all.join(", "));
+        let ambiguous = |what: &str, want: &str, all: Vec<String>| {
+            format!("{what} {want} matches {} in {conn} (names differing only in case): type the exact name", all.join(", "))
+        };
         let case_note = |t: &mut LoadTarget, what: &str, typed: &str, actual: &str| {
             t.respelled = true;
             t.notes.push(format!("{what} {typed} is {actual} in {conn}: loading into {actual}"));
@@ -540,7 +582,11 @@ impl QueryEngine {
                         return Ok(t);
                     }
                 },
-                None if parts.len() < 3 => t.notes.push(format!("{conn} has no current {}: write {}.schema.table", catalog_word(kind).to_lowercase(), catalog_word(kind).to_lowercase())),
+                None if parts.len() < 3 => t.notes.push(format!(
+                    "{conn} has no current {}: write {}.schema.table",
+                    catalog_word(kind).to_lowercase(),
+                    catalog_word(kind).to_lowercase()
+                )),
                 None => {}
             }
         }
@@ -625,7 +671,11 @@ impl QueryEngine {
             Some(o) if o.kind == ObjectKind::Table || o.kind == ObjectKind::ForeignTable => t.table_exists = Some(true),
             Some(o) => {
                 t.table_exists = Some(true);
-                t.problems.push(format!("{} is a {}: rows can only be loaded into a table", t.resolved, if o.kind == ObjectKind::View { "view" } else { "materialized view" }));
+                t.problems.push(format!(
+                    "{} is a {}: rows can only be loaded into a table",
+                    t.resolved,
+                    if o.kind == ObjectKind::View { "view" } else { "materialized view" }
+                ));
             }
             None => t.table_exists = Some(false),
         }
@@ -644,9 +694,18 @@ impl QueryEngine {
         }
         let dialect = profile.config.kind;
         if !sqlgen::is_load_target(dialect) {
-            return Err(EngineError::new("invalid", format!("Rows can't be loaded into {} connections (\"{}\"); save them to a file instead.", engine_name(dialect), profile.name)));
+            return Err(EngineError::new(
+                "invalid",
+                format!("Rows can't be loaded into {} connections (\"{}\"); save them to a file instead.", engine_name(dialect), profile.name),
+            ));
         }
         let keys_in: Vec<String> = spec.key_columns.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
+        if spec.mode.needs_keys() && !sqlgen::keyed_loads(dialect) {
+            return Err(EngineError::new(
+                "invalid",
+                format!("{} can't update rows by key (\"{}\"): choose Insert, Delete rows then insert, or Replace table.", engine_name(dialect), profile.name),
+            ));
+        }
         if spec.mode.needs_keys() && keys_in.is_empty() {
             return Err(EngineError::new("invalid", "Choose the key columns that identify a row (Update and Merge match rows by them)"));
         }
@@ -703,7 +762,11 @@ impl QueryEngine {
                 if !missing.is_empty() {
                     return Err(EngineError::new(
                         "invalid",
-                        format!("{table} in {conn} has no column {} (its columns: {}). Rename them in the step's SQL, or use Replace to recreate the table.", missing.join(", "), cols.join(", ")),
+                        format!(
+                            "{table} in {conn} has no column {} (its columns: {}). Rename them in the step's SQL, or use Replace to recreate the table.",
+                            missing.join(", "),
+                            cols.join(", ")
+                        ),
                     ));
                 }
                 Some(Arc::new(Schema::new(fields)))
@@ -723,7 +786,14 @@ impl QueryEngine {
                         match match_column(k, pool) {
                             Some(c) => out.push(c.clone()),
                             None => {
-                                return Err(EngineError::new("invalid", format!("Key column {k} is not among the {} columns: {}", if row_cols.is_some() { "rows'" } else { "table's" }, pool.join(", "))));
+                                return Err(EngineError::new(
+                                    "invalid",
+                                    format!(
+                                        "Key column {k} is not among the {} columns: {}",
+                                        if row_cols.is_some() { "rows'" } else { "table's" },
+                                        pool.join(", ")
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -747,14 +817,20 @@ impl QueryEngine {
                 if !exists {
                     if !spec.create_table {
                         if before.is_empty() {
-                            return Err(EngineError::new("invalid", format!("Table {table} doesn't exist in {conn}{}. Turn on \"Create the table if it's missing\", or create it first.", reason())));
+                            return Err(EngineError::new(
+                                "invalid",
+                                format!("Table {table} doesn't exist in {conn}{}. Turn on \"Create the table if it's missing\", or create it first.", reason()),
+                            ));
                         }
                         notices.push(format!("{table} doesn't exist in {conn} yet: the before SQL must create it."));
                     } else {
                         creates = true;
-                        notices.push(format!("{table} doesn't exist in {conn}: {} creates it from the rows' columns.", if dry { "the run" } else { "this run" }));
+                        notices
+                            .push(format!("{table} doesn't exist in {conn}: {} creates it from the rows' columns.", if dry { "the run" } else { "this run" }));
                         plan.push(match &schema {
-                            Some(s) => Act::Sql { label: "Create table".into(), sql: sqlgen::create_table_if_missing_sql(dialect, &table, s), kind: ActKind::Ddl },
+                            Some(s) => {
+                                Act::Sql { label: "Create table".into(), sql: sqlgen::create_table_if_missing_sql(dialect, &table, s), kind: ActKind::Ddl }
+                            }
                             None => no_rows("Create table"),
                         });
                     }
@@ -777,8 +853,21 @@ impl QueryEngine {
                     None => plan.push(no_rows("Create table and insert rows")),
                 }
             }
-            LoadMode::Update | LoadMode::Merge => {
-                let what = if spec.mode == LoadMode::Update { "Update" } else { "Merge" };
+            LoadMode::Update | LoadMode::Merge | LoadMode::Sync => {
+                let what = match spec.mode {
+                    LoadMode::Update => "Update",
+                    LoadMode::Merge => "Merge",
+                    _ => "Sync",
+                };
+                // No rows would delete the whole table: almost always an upstream mistake.
+                if spec.mode == LoadMode::Sync && rows.is_some_and(|r| r.count() == 0) {
+                    return Err(EngineError::new(
+                        "invalid",
+                        format!(
+                            "The step has no rows: Sync would delete every row of {table} in {conn}. Use \"Delete rows, then insert\" to empty it on purpose."
+                        ),
+                    ));
+                }
                 if !exists {
                     if before.is_empty() {
                         return Err(EngineError::new("invalid", format!("{what} needs an existing table: {table} doesn't exist in {conn}{}.", reason())));
@@ -795,7 +884,11 @@ impl QueryEngine {
                         if !sqlgen::stage_is_temporary(dialect) {
                             permanent_stage = Some(stage.clone());
                         }
-                        plan.push(Act::Sql { label: "Create staging table".into(), sql: sqlgen::create_stage_sql(dialect, &stage, &table, cols), kind: ActKind::Stage });
+                        plan.push(Act::Sql {
+                            label: "Create staging table".into(),
+                            sql: sqlgen::create_stage_sql(dialect, &stage, &table, cols),
+                            kind: ActKind::Stage,
+                        });
                         plan.push(Act::Insert { label: "Stage rows".into(), table: stage.clone(), target: false });
                         let writes = if spec.mode == LoadMode::Update {
                             sqlgen::update_from_stage_sql(dialect, &table, &stage, cols, &keys)
@@ -803,6 +896,7 @@ impl QueryEngine {
                             sqlgen::merge_from_stage_sql(dialect, &table, &stage, cols, &keys)
                         };
                         let n = writes.len();
+                        let sync = spec.mode == LoadMode::Sync;
                         for (i, sql) in writes.into_iter().enumerate() {
                             let label = match (spec.mode, n, i) {
                                 (LoadMode::Update, _, _) => "Update matching rows".to_string(),
@@ -811,6 +905,13 @@ impl QueryEngine {
                                 _ => "Insert new rows".to_string(),
                             };
                             plan.push(Act::Sql { label, sql, kind: ActKind::Write });
+                        }
+                        if sync {
+                            plan.push(Act::Sql {
+                                label: "Delete rows missing from the step's rows".into(),
+                                sql: sqlgen::delete_missing_sql(dialect, &table, &stage, &keys),
+                                kind: ActKind::Remove,
+                            });
                         }
                         plan.push(Act::Sql { label: "Drop staging table".into(), sql: sqlgen::drop_stage_sql(dialect, &stage), kind: ActKind::Stage });
                     }
@@ -826,7 +927,10 @@ impl QueryEngine {
         let tx = transaction(dialect, &plan);
         if tx.is_none() {
             notices.push(match dialect.traits().load.and_then(|l| l.transactions) {
-                Some(_) => format!("{} commits DDL at once, so this step doesn't run in a transaction: if it fails partway, what ran before stays.", engine_name(dialect)),
+                Some(_) => format!(
+                    "{} commits DDL at once, so this step doesn't run in a transaction: if it fails partway, what ran before stays.",
+                    engine_name(dialect)
+                ),
                 None => format!("{} doesn't run this step in a transaction: if it fails partway, what ran before stays.", engine_name(dialect)),
             });
         }
@@ -848,8 +952,16 @@ fn created_notice(p: &Prepared, rows: &LoadRows) -> String {
 
 /// Run the plan; rows written. With `record`, each step is recorded and the
 /// run stops at the first error (dry run).
-async fn run_plan(p: &Prepared, rows: &LoadRows, cancel: &CancellationToken, mut record: Option<&mut Vec<LoadCheck>>, obs: &dyn LoadObserver) -> Result<u64> {
+/// Run the plan; returns the rows written and the rows Sync deleted.
+async fn run_plan(
+    p: &Prepared,
+    rows: &LoadRows,
+    cancel: &CancellationToken,
+    mut record: Option<&mut Vec<LoadCheck>>,
+    obs: &dyn LoadObserver,
+) -> Result<(u64, u64)> {
     let mut inserted = 0u64;
+    let mut removed = 0u64;
     let mut staged = 0u64;
     let mut affected: Option<u64> = None;
     let push = |record: &mut Option<&mut Vec<LoadCheck>>, label: &str, sql: &str, r: &Result<()>, note: Option<String>| {
@@ -869,8 +981,10 @@ async fn run_plan(p: &Prepared, rows: &LoadRows, cancel: &CancellationToken, mut
         match act {
             Act::Sql { label, sql, kind } => {
                 let r = timed(&p.session, label, sql, cancel, obs).await;
-                if let (Ok(Some(n)), ActKind::Write) = (&r, kind) {
-                    affected = Some(affected.unwrap_or(0) + n);
+                match (&r, kind) {
+                    (Ok(Some(n)), ActKind::Write) => affected = Some(affected.unwrap_or(0) + n),
+                    (Ok(Some(n)), ActKind::Remove) => removed += n,
+                    _ => {}
                 }
                 let r = r.map(|_| ());
                 push(&mut record, label, sql, &r, None);
@@ -936,7 +1050,8 @@ async fn run_plan(p: &Prepared, rows: &LoadRows, cancel: &CancellationToken, mut
             }
         }
     }
-    Ok(if staged > 0 || p.plan.iter().any(|a| matches!(a, Act::Insert { target: false, .. })) { affected.unwrap_or(staged) } else { inserted })
+    let written = if staged > 0 || p.plan.iter().any(|a| matches!(a, Act::Insert { target: false, .. })) { affected.unwrap_or(staged) } else { inserted };
+    Ok((written, removed))
 }
 
 /// Dry run without a transaction: `EXPLAIN` each statement the engine can
@@ -979,7 +1094,11 @@ async fn explain_plan(p: &Prepared, rows: &LoadRows, checks: &mut Vec<LoadCheck>
                 Ok(false) => c.message = Some(format!("{engine} has no way to check a statement without running it")),
                 Err(e) => {
                     c.status = if created_before { "warning" } else { "error" }.into();
-                    c.message = Some(if created_before { format!("{} (may be because an earlier statement creates or changes a table)", e.message) } else { e.message });
+                    c.message = Some(if created_before {
+                        format!("{} (may be because an earlier statement creates or changes a table)", e.message)
+                    } else {
+                        e.message
+                    });
                 }
             }
         }
@@ -1075,7 +1194,10 @@ mod tests {
         assert_eq!(match_column("id", &t).unwrap(), "ID");
         assert_eq!(match_column("name", &t).unwrap(), "name", "exact first");
         assert!(match_column("x", &t).is_none());
-        assert_eq!(user_statements(Some("delete from t where d = 1;\n\n update s set x = 1;"), ConnectorKind::Postgres), vec!["delete from t where d = 1", "update s set x = 1"]);
+        assert_eq!(
+            user_statements(Some("delete from t where d = 1;\n\n update s set x = 1;"), ConnectorKind::Postgres),
+            vec!["delete from t where d = 1", "update s set x = 1"]
+        );
         assert!(user_statements(Some("  "), ConnectorKind::Postgres).is_empty());
     }
 }

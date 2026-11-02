@@ -90,9 +90,7 @@ mod tests {
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
         let sig = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
-        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, key.public_key().as_ref())
-            .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)
-            .unwrap();
+        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, key.public_key().as_ref()).verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig).unwrap();
         assert_eq!(decode_payload(&jwt).unwrap()["sub"], "u");
         assert!(parse_private_key("garbage", None).is_err());
     }

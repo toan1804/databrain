@@ -83,6 +83,8 @@ import type {
   ImportPreview,
   ImportReport,
   LoadReport,
+  ParamSet,
+  RunParams,
   RunRequest,
   RunResponse,
   SavedQuery,
@@ -294,7 +296,10 @@ export const api = {
   saveJob: (job: Job) => call<Job>("save_job", { job }),
   deleteJob: (id: string) => call<void>("delete_job", { id }),
   /** `nodes`: run only these steps (their upstream outputs must exist). */
-  runJob: (id: string, nodes?: string[]) => call<JobRun>("run_job", { id, nodes: nodes ?? null }),
+  runJob: (id: string, nodes?: string[], params?: RunParams) => call<JobRun>("run_job", { id, nodes: nodes ?? null, params: params ?? null }),
+  listParamSets: () => call<ParamSet[]>("list_param_sets"),
+  saveParamSet: (set: ParamSet) => call<ParamSet>("save_param_set", { set }),
+  deleteParamSet: (id: string) => call<void>("delete_param_set", { id }),
   /** Run again the steps that did not succeed last time, and what follows them. */
   resumeJob: (id: string) => call<JobRun>("resume_job", { id }),
   cancelJob: (id: string) => call<boolean>("cancel_job", { id }),

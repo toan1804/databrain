@@ -11,19 +11,17 @@ impl QueryEngine {
         split_statements(sql, kind)
             .into_iter()
             .enumerate()
-            .map(|(index, s)| PlannedStatement {
-                index,
-                classification: classify(&s.sql, kind),
-                sql: s.sql,
-                start: s.start,
-                end: s.end,
-            })
+            .map(|(index, s)| PlannedStatement { index, classification: classify(&s.sql, kind), sql: s.sql, start: s.start, end: s.end })
             .collect()
     }
 
     /// Put the values of `:name` parameters into the statements (spans stay
     /// those of the editor text; classification sees the real SQL).
-    pub(crate) fn bind_parameters(plan: &mut [PlannedStatement], kind: databrain_connector_core::ConnectorKind, params: &HashMap<String, databrain_connector_core::sql::ParamValue>) -> Result<()> {
+    pub(crate) fn bind_parameters(
+        plan: &mut [PlannedStatement],
+        kind: databrain_connector_core::ConnectorKind,
+        params: &HashMap<String, databrain_connector_core::sql::ParamValue>,
+    ) -> Result<()> {
         let mut missing: Vec<String> = Vec::new();
         for p in plan.iter_mut() {
             match databrain_connector_core::sql::substitute_parameters(&p.sql, kind, params) {
@@ -48,23 +46,13 @@ impl QueryEngine {
         for p in plan {
             let c = &p.classification;
             if c.missing_where {
-                reasons.push(format!(
-                    "Statement {} is {} without a WHERE clause and will affect every row.",
-                    p.index + 1,
-                    c.keyword
-                ));
+                reasons.push(format!("Statement {} is {} without a WHERE clause and will affect every row.", p.index + 1, c.keyword));
             }
         }
         if profile.env == EnvTag::Prod {
-            let writes = plan
-                .iter()
-                .filter(|p| p.classification.kind.is_write() || p.classification.kind == StatementKind::Unknown)
-                .count();
+            let writes = plan.iter().filter(|p| p.classification.kind.is_write() || p.classification.kind == StatementKind::Unknown).count();
             if writes > 0 {
-                reasons.push(format!(
-                    "{writes} statement(s) may modify data or schema on the production connection \"{}\".",
-                    profile.name
-                ));
+                reasons.push(format!("{writes} statement(s) may modify data or schema on the production connection \"{}\".", profile.name));
             }
         }
         reasons
@@ -88,7 +76,11 @@ impl QueryEngine {
             // Only reads (and harmless USE/SET): a transaction or session
             // statement could turn read-only off for what follows.
             if let Some(p) = plan.iter().find(|p| !databrain_connector_core::sql::read_only_allows(&p.sql, &p.classification)) {
-                let why = if p.classification.kind.is_write() { "" } else { ": on a read-only connection only queries run (transactions and session settings could make it writable)" };
+                let why = if p.classification.kind.is_write() {
+                    ""
+                } else {
+                    ": on a read-only connection only queries run (transactions and session settings could make it writable)"
+                };
                 return Err(EngineError::new(
                     "invalid",
                     format!("Connection \"{}\" is read-only; statement {} ({}) was not run{why}.", profile.name, p.index + 1, p.classification.keyword),
@@ -98,10 +90,7 @@ impl QueryEngine {
         if !req.confirmed {
             let reasons = Self::safety_reasons(&profile, &plan);
             if !reasons.is_empty() {
-                return Ok(RunResponse::NeedsConfirmation {
-                    reasons,
-                    statements: plan,
-                });
+                return Ok(RunResponse::NeedsConfirmation { reasons, statements: plan });
             }
         }
         if let Some(n) = req.output_name.as_deref().filter(|n| !n.is_empty()) {
@@ -109,22 +98,12 @@ impl QueryEngine {
             self.outputs.check_owner(n, &req.tab_id)?;
         }
         if self.jobs.lock().values().any(|j| j.tab_id == req.tab_id || j.session_key == req.session_key()) {
-            return Err(EngineError::new(
-                "busy",
-                "A query is already running in this tab",
-            ));
+            return Err(EngineError::new("busy", "A query is already running in this tab"));
         }
 
         let job_id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
-        self.jobs.lock().insert(
-            job_id.clone(),
-            JobHandle {
-                tab_id: req.tab_id.clone(),
-                session_key: req.session_key().to_string(),
-                cancel: cancel.clone(),
-            },
-        );
+        self.jobs.lock().insert(job_id.clone(), JobHandle { tab_id: req.tab_id.clone(), session_key: req.session_key().to_string(), cancel: cancel.clone() });
         // Previous outputs of this tab become "recent" (evictable).
         self.outputs.begin_run(&req.tab_id);
 
@@ -134,10 +113,7 @@ impl QueryEngine {
         tokio::spawn(async move {
             engine.run_job(jid, req, statements, cancel, waiter).await;
         });
-        Ok(RunResponse::Started {
-            job_id,
-            statements: plan,
-        })
+        Ok(RunResponse::Started { job_id, statements: plan })
     }
 
     /// Run and wait for completion (for the AI agent / MCP and job steps);
@@ -148,12 +124,7 @@ impl QueryEngine {
     /// broadcast: a subscriber that lags behind there loses events, and a
     /// lost `JobFinished` left the caller (a job step, with every step
     /// downstream of it) waiting forever after the query had ended.
-    pub async fn run_and_wait(
-        self: &Arc<Self>,
-        _hub: &EventHub,
-        req: RunRequest,
-        cancel: Option<CancellationToken>,
-    ) -> Result<Vec<StatementOutcomeView>> {
+    pub async fn run_and_wait(self: &Arc<Self>, _hub: &EventHub, req: RunRequest, cancel: Option<CancellationToken>) -> Result<Vec<StatementOutcomeView>> {
         let (waiter, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let statements = match self.start_run(req, Some(waiter))? {
             RunResponse::Started { job_id, statements } => (job_id, statements),
@@ -164,7 +135,15 @@ impl QueryEngine {
         let (job_id, plan) = statements;
         let mut out: Vec<StatementOutcomeView> = plan
             .iter()
-            .map(|p| StatementOutcomeView { index: p.index, sql: p.sql.clone(), result: None, rows_affected: None, error: None, duration_ms: 0, notices: vec![] })
+            .map(|p| StatementOutcomeView {
+                index: p.index,
+                sql: p.sql.clone(),
+                result: None,
+                rows_affected: None,
+                error: None,
+                duration_ms: 0,
+                notices: vec![],
+            })
             .collect();
         let cancel = cancel.unwrap_or_default();
         // Forwarded once: `cancelled()` stays ready, so selecting on it again
@@ -251,12 +230,7 @@ impl QueryEngine {
                 status = RunStatus::Cancelled;
                 break;
             }
-            self.events.emit(JobEvent::StatementStarted {
-                job_id: job_id.clone(),
-                tab_id: req.tab_id.clone(),
-                index: stmt.index,
-                sql: stmt.sql.clone(),
-            });
+            self.events.emit(JobEvent::StatementStarted { job_id: job_id.clone(), tab_id: req.tab_id.clone(), index: stmt.index, sql: stmt.sql.clone() });
             let started_at = now_ms();
             let t0 = Instant::now();
             let outcome = match self.begin_if_manual(&req, conn_kind, stmt).await {
@@ -284,14 +258,7 @@ impl QueryEngine {
                 last_output = Some(o.handle.clone());
             }
             let (hist_status, rows, error) = match &outcome {
-                Ok(o) => (
-                    RunStatus::Success,
-                    o.result
-                        .as_ref()
-                        .map(|r| r.total_rows as i64)
-                        .or(o.rows_affected.map(|n| n as i64)),
-                    None,
-                ),
+                Ok(o) => (RunStatus::Success, o.result.as_ref().map(|r| r.total_rows as i64).or(o.rows_affected.map(|n| n as i64)), None),
                 Err(e) if e.kind == "cancelled" => (RunStatus::Cancelled, None, None),
                 Err(e) => (RunStatus::Error, None, Some(e.message.clone())),
             };
@@ -323,11 +290,7 @@ impl QueryEngine {
                     });
                 }
                 Err(e) => {
-                    status = if e.kind == "cancelled" {
-                        RunStatus::Cancelled
-                    } else {
-                        RunStatus::Error
-                    };
+                    status = if e.kind == "cancelled" { RunStatus::Cancelled } else { RunStatus::Error };
                     if matches!(e.kind.as_str(), "connection") {
                         self.drop_session(&req.connection_id, req.session_key());
                     }
@@ -352,13 +315,7 @@ impl QueryEngine {
         let in_transaction = self.in_transaction(&req.connection_id, req.session_key());
         // What ran and how it ended; never the SQL itself.
         tracing::debug!(connection = %req.connection_id, tab = %req.tab_id, origin = req.origin.as_str(), statements = plan.len(), ?status, ms = job_start.elapsed().as_millis() as u64, "run finished");
-        emit(JobEvent::JobFinished {
-            job_id,
-            tab_id: req.tab_id,
-            status,
-            duration_ms: job_start.elapsed().as_millis() as u64,
-            in_transaction,
-        });
+        emit(JobEvent::JobFinished { job_id, tab_id: req.tab_id, status, duration_ms: job_start.elapsed().as_millis() as u64, in_transaction });
     }
 
     pub(crate) async fn run_statement(
@@ -439,7 +396,13 @@ impl QueryEngine {
                     if let Some(n) = &notice {
                         notices.push(n.clone());
                     }
-                    self.events.emit(JobEvent::Downloading { job_id: job_id.to_string(), tab_id: req.tab_id.clone(), index: stmt.index, notice, elapsed_ms: ms });
+                    self.events.emit(JobEvent::Downloading {
+                        job_id: job_id.to_string(),
+                        tab_id: req.tab_id.clone(),
+                        index: stmt.index,
+                        notice,
+                        elapsed_ms: ms,
+                    });
                 }
                 Ok(StreamEvent::Done(summary)) => {
                     let info = result.as_ref().map(|rs| {
@@ -447,12 +410,7 @@ impl QueryEngine {
                         g.finish(false);
                         g.info()
                     });
-                    return Ok(StatementOutcome {
-                        result: info,
-                        rows_affected: summary.rows_affected,
-                        notices,
-                        server_ms,
-                    });
+                    return Ok(StatementOutcome { result: info, rows_affected: summary.rows_affected, notices, server_ms });
                 }
                 Err(e) => {
                     self.results.remove(&result_id);
@@ -467,21 +425,10 @@ impl QueryEngine {
             g.finish(true);
             g.info()
         });
-        notices.push(format!(
-            "Showing the first {} rows. Increase the row limit to fetch more.",
-            rows
-        ));
+        notices.push(format!("Showing the first {} rows. Increase the row limit to fetch more.", rows));
         // Wait for the connector to finish cancelling before the session is
         // reused; otherwise a server-side cancel could hit the next statement.
-        let _ = tokio::time::timeout(Duration::from_secs(15), async {
-            while stream.next().await.is_some() {}
-        })
-        .await;
-        Ok(StatementOutcome {
-            result: info,
-            rows_affected: None,
-            notices,
-            server_ms,
-        })
+        let _ = tokio::time::timeout(Duration::from_secs(15), async { while stream.next().await.is_some() {} }).await;
+        Ok(StatementOutcome { result: info, rows_affected: None, notices, server_ms })
     }
 }

@@ -24,27 +24,14 @@ pub struct EngineError {
 
 impl EngineError {
     pub fn new(kind: &str, message: impl Into<String>) -> Self {
-        Self {
-            kind: kind.into(),
-            message: message.into(),
-            code: None,
-            position: None,
-        }
+        Self { kind: kind.into(), message: message.into(), code: None, position: None }
     }
 }
 
 impl From<ConnectorError> for EngineError {
     fn from(e: ConnectorError) -> Self {
-        let kind = serde_json::to_value(e.kind)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| "internal".into());
-        Self {
-            kind,
-            message: e.message,
-            code: e.code,
-            position: e.position,
-        }
+        let kind = serde_json::to_value(e.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "internal".into());
+        Self { kind, message: e.message, code: e.code, position: e.position }
     }
 }
 
@@ -63,8 +50,7 @@ impl From<databrain_result_store::Error> for EngineError {
     fn from(e: databrain_result_store::Error) -> Self {
         let kind = match e {
             databrain_result_store::Error::NotFound(_) => "not_found",
-            databrain_result_store::Error::InvalidColumn(_)
-            | databrain_result_store::Error::InvalidFilterValue(_) => "invalid",
+            databrain_result_store::Error::InvalidColumn(_) | databrain_result_store::Error::InvalidFilterValue(_) => "invalid",
             _ => "internal",
         };
         Self::new(kind, e.to_string())

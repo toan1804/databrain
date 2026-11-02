@@ -8,6 +8,9 @@ import { useStore } from "../../store";
 import { COLORS, DEFAULT_POLICY, TOP_LEVEL, rank, type Section } from "./parts";
 
 /** State and actions of the connection form (one dialog, new or edit). */
+/** Connection options about DataBrain's sessions (not sent to the server). */
+export const SESSION_OPTIONS = ["connect_timeout_secs", "idle_disconnect_minutes"] as const;
+
 export function useConnectionForm(initial: ConnectionProfile | null, folderId: string | null) {
   const connectors = useStore((s) => s.connectors);
   const closeDialog = useStore((s) => s.closeConnectionDialog);
@@ -129,6 +132,11 @@ export function useConnectionForm(initial: ConnectionProfile | null, folderId: s
       if (TOP_LEVEL.has(f.key)) continue;
       const v = (values[f.key] ?? "").trim();
       if (v) options[f.key] = v;
+    }
+    // This connection's own session handling (empty = the Settings value).
+    for (const k of SESSION_OPTIONS) {
+      const v = (values[k] ?? "").trim();
+      if (/^\d+$/.test(v)) options[k] = String(Number(v));
     }
     const top = (k: string) => (fields.some((f) => f.key === k) ? (values[k] ?? "").trim() || null : null);
     return {

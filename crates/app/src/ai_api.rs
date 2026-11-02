@@ -130,10 +130,7 @@ pub fn list_providers(state: &AppState) -> Result<Vec<ProviderView>> {
         .workspace
         .list_ai_providers()?
         .into_iter()
-        .map(|r| ProviderView {
-            has_key: state.secrets.get(&SecretRef::for_ai_provider(&r.id)).ok().flatten().is_some(),
-            record: r,
-        })
+        .map(|r| ProviderView { has_key: state.secrets.get(&SecretRef::for_ai_provider(&r.id)).ok().flatten().is_some(), record: r })
         .collect())
 }
 
@@ -257,9 +254,7 @@ pub async fn provider_sign_in(state: &AppState, id: &str) -> Result<()> {
             *state.ai.sign_in_cancel.lock() = cancel.clone();
             let ui = state.ui.clone();
             let terminal = terminal_setting(state);
-            kiro.sign_in_browser(cancel, &terminal, |l| ui.emit(AUTH_EVENT, launch_event(l, "kiro-cli login")))
-                .await
-                .map_err(ai_err)?;
+            kiro.sign_in_browser(cancel, &terminal, |l| ui.emit(AUTH_EVENT, launch_event(l, "kiro-cli login"))).await.map_err(ai_err)?;
             state.ui.emit(AUTH_EVENT, json!({"type": "finished"}));
             cfg.auth = ProviderAuth::KiroBrowser;
         }
@@ -337,7 +332,12 @@ impl ToolHost for UiHost {
     async fn approve(&self, tool: &str, summary: &str, detail: &Value) -> Option<Value> {
         let r = self
             .ai
-            .ask(self.ui.as_ref(), "approval_request", json!({"run_id": self.run_id, "tool": tool, "summary": summary, "detail": detail}), Duration::from_secs(600))
+            .ask(
+                self.ui.as_ref(),
+                "approval_request",
+                json!({"run_id": self.run_id, "tool": tool, "summary": summary, "detail": detail}),
+                Duration::from_secs(600),
+            )
             .await?;
         r.get("approved").and_then(|a| a.as_bool()).filter(|a| *a).map(|_| r.get("detail").cloned().unwrap_or_else(|| detail.clone()))
     }

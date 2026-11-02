@@ -120,7 +120,12 @@ fn detect() -> Vec<Found> {
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-        let dirs = [PathBuf::from("/System/Applications/Utilities"), PathBuf::from("/Applications/Utilities"), PathBuf::from("/Applications"), home.join("Applications")];
+        let dirs = [
+            PathBuf::from("/System/Applications/Utilities"),
+            PathBuf::from("/Applications/Utilities"),
+            PathBuf::from("/Applications"),
+            home.join("Applications"),
+        ];
         let app = |name: &str| dirs.iter().map(|d| d.join(format!("{name}.app"))).find(|p| p.exists());
         if let Some(p) = app("Terminal") {
             out.push(Found { id: "terminal".into(), label: "Terminal".into(), where_: p.to_string_lossy().into(), how: How::OpenScript("Terminal".into()) });
@@ -132,7 +137,11 @@ fn detect() -> Vec<Found> {
             let ps = p.to_string_lossy().to_string();
             out.push(Found { where_: ps.clone(), ..exec("ghostty", "Ghostty", "open".into(), &["-na", &ps, "--args", "-e"], Run::Sh) });
         }
-        for (name, bin, id, before) in [("WezTerm", "wezterm", "wezterm", &["start", "--"][..]), ("Alacritty", "alacritty", "alacritty", &["-e"][..]), ("kitty", "kitty", "kitty", &[][..])] {
+        for (name, bin, id, before) in [
+            ("WezTerm", "wezterm", "wezterm", &["start", "--"][..]),
+            ("Alacritty", "alacritty", "alacritty", &["-e"][..]),
+            ("kitty", "kitty", "kitty", &[][..]),
+        ] {
             if let Some(p) = app(name) {
                 let b = p.join("Contents/MacOS").join(bin);
                 if b.exists() {
@@ -619,11 +628,24 @@ mod tests {
     fn scripts_mark_the_start_and_quote_paths() {
         let m = Path::new("/tmp/m d.started");
         let sh = sh_script(&job(), m);
-        assert!(sh.contains("touch '/tmp/m d.started'") && sh.contains("unset KIRO_API_KEY") && sh.contains("'C:\\Program Files\\Kiro'\\''s\\kiro-cli.exe' 'login'"), "{sh}");
+        assert!(
+            sh.contains("touch '/tmp/m d.started'")
+                && sh.contains("unset KIRO_API_KEY")
+                && sh.contains("'C:\\Program Files\\Kiro'\\''s\\kiro-cli.exe' 'login'"),
+            "{sh}"
+        );
         let cmd = cmd_script(&job(), m);
-        assert!(cmd.contains("type nul > \"/tmp/m d.started\"") && cmd.contains("set KIRO_API_KEY=\r\n") && cmd.contains("\"C:\\Program Files\\Kiro's\\kiro-cli.exe\" \"login\""), "{cmd}");
+        assert!(
+            cmd.contains("type nul > \"/tmp/m d.started\"")
+                && cmd.contains("set KIRO_API_KEY=\r\n")
+                && cmd.contains("\"C:\\Program Files\\Kiro's\\kiro-cli.exe\" \"login\""),
+            "{cmd}"
+        );
         let ps = ps_script(&job(), m);
-        assert!(ps.contains("New-Item -ItemType File -Force -Path '/tmp/m d.started'") && ps.contains("& 'C:\\Program Files\\Kiro''s\\kiro-cli.exe' 'login'"), "{ps}");
+        assert!(
+            ps.contains("New-Item -ItemType File -Force -Path '/tmp/m d.started'") && ps.contains("& 'C:\\Program Files\\Kiro''s\\kiro-cli.exe' 'login'"),
+            "{ps}"
+        );
         // UTF-16LE base64 of "a" = "YQA=".
         assert_eq!(ps_encoded("a"), "YQA=");
         assert_eq!(command_line(&job()), "\"C:\\Program Files\\Kiro's\\kiro-cli.exe\" login");

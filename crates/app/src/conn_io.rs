@@ -111,11 +111,7 @@ pub fn default_path(source: ImportSource) -> Option<PathBuf> {
     match source {
         ImportSource::File => None,
         ImportSource::Pgpass => Some(std::env::var_os("PGPASSFILE").map(PathBuf::from).unwrap_or_else(|| {
-            if cfg!(windows) {
-                dirs::data_dir().unwrap_or(home.clone()).join("postgresql").join("pgpass.conf")
-            } else {
-                home.join(".pgpass")
-            }
+            if cfg!(windows) { dirs::data_dir().unwrap_or(home.clone()).join("postgresql").join("pgpass.conf") } else { home.join(".pgpass") }
         })),
         ImportSource::Dbeaver => {
             let base = if cfg!(target_os = "macos") {
@@ -129,7 +125,11 @@ pub fn default_path(source: ImportSource) -> Option<PathBuf> {
         }
         // The newest DataGrip's global data sources.
         ImportSource::Datagrip => {
-            let base = if cfg!(target_os = "macos") { home.join("Library").join("Application Support").join("JetBrains") } else { dirs::config_dir()?.join("JetBrains") };
+            let base = if cfg!(target_os = "macos") {
+                home.join("Library").join("Application Support").join("JetBrains")
+            } else {
+                dirs::config_dir()?.join("JetBrains")
+            };
             let mut dirs: Vec<PathBuf> = std::fs::read_dir(&base)
                 .ok()?
                 .filter_map(|e| e.ok().map(|e| e.path()))
@@ -350,7 +350,11 @@ pub fn config_from_url(url: &str) -> Option<(ConnectionConfig, Option<String>)> 
     };
     // `k=v` pairs split by `sep`, keys lower-cased.
     let props = |s: &str, sep: char| -> HashMap<String, String> {
-        s.split(sep).filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).filter(|(_, v)| !v.is_empty()).collect()
+        s.split(sep)
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .filter(|(_, v)| !v.is_empty())
+            .collect()
     };
     match kind {
         K::Sqlite | K::Duckdb => {
@@ -590,7 +594,8 @@ fn parse_datagrip(text: &str, local: &str) -> Result<Vec<Parsed>> {
         let name = src.attrs.get("name").cloned().unwrap_or_else(|| "DataGrip data source".into());
         let url = src.fields.get("jdbc-url").map(|u| u.trim().to_string()).unwrap_or_default();
         let driver = src.fields.get("driver-ref").cloned().unwrap_or_default();
-        let Some((mut cfg, url_user)) = config_from_url(&url).or_else(|| dbeaver_kind(&driver, "").map(|k| (ConnectionConfig::new(k, AuthMethod::None), None))) else {
+        let Some((mut cfg, url_user)) = config_from_url(&url).or_else(|| dbeaver_kind(&driver, "").map(|k| (ConnectionConfig::new(k, AuthMethod::None), None)))
+        else {
             continue;
         };
         let kind = cfg.kind;
@@ -608,7 +613,11 @@ fn parse_datagrip(text: &str, local: &str) -> Result<Vec<Parsed>> {
         if ssh {
             notes.push("Its SSH tunnel is not imported: set it in the connection".into());
         }
-        out.push(Parsed { conn: SharedConnection { name, folder, env: EnvTag::None, color: None, config: cfg, ai_policy: Default::default() }, secret: None, note: (!notes.is_empty()).then(|| notes.join("; ")) });
+        out.push(Parsed {
+            conn: SharedConnection { name, folder, env: EnvTag::None, color: None, config: cfg, ai_policy: Default::default() },
+            secret: None,
+            note: (!notes.is_empty()).then(|| notes.join("; ")),
+        });
     }
     Ok(out)
 }
@@ -704,11 +713,13 @@ fn parse_dbeaver(text: &str, creds: &HashMap<String, (Option<String>, Option<Str
     let Some(conns) = v.get("connections").and_then(Value::as_object) else {
         return Err(bad("No connections in this DBeaver file"));
     };
-    let s = |o: &Value, k: &str| o.get(k).and_then(|x| match x {
-        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    });
+    let s = |o: &Value, k: &str| {
+        o.get(k).and_then(|x| match x {
+            Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+    };
     let mut out = Vec::new();
     for (id, c) in conns {
         let conf = c.get("configuration").cloned().unwrap_or(Value::Null);
@@ -775,7 +786,13 @@ fn parse_dbeaver(text: &str, creds: &HashMap<String, (Option<String>, Option<Str
                     Some("AGENT") => SshAuth::Agent,
                     _ => SshAuth::Password,
                 };
-                cfg.ssh = Some(SshConfig { host, port: s(&p, "port").and_then(|x| x.parse().ok()).unwrap_or(22), user: s(&p, "user").unwrap_or_default(), auth, host_key_fingerprint: None });
+                cfg.ssh = Some(SshConfig {
+                    host,
+                    port: s(&p, "port").and_then(|x| x.parse().ok()).unwrap_or(22),
+                    user: s(&p, "user").unwrap_or_default(),
+                    auth,
+                    host_key_fingerprint: None,
+                });
             }
         }
         let env = match s(&conf, "type").as_deref() {
@@ -791,7 +808,11 @@ fn parse_dbeaver(text: &str, creds: &HashMap<String, (Option<String>, Option<Str
             (true, false, false) => Some("Enter the password after import".to_string()),
             _ => None,
         };
-        out.push(Parsed { conn: SharedConnection { name, folder, env, color: None, config: cfg, ai_policy: Default::default() }, secret: password.filter(|_| needs_secret), note });
+        out.push(Parsed {
+            conn: SharedConnection { name, folder, env, color: None, config: cfg, ai_policy: Default::default() },
+            secret: password.filter(|_| needs_secret),
+            note,
+        });
     }
     Ok(out)
 }
@@ -811,7 +832,11 @@ fn same_place(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
         && if a.file_path.is_some() || b.file_path.is_some() {
             a.file_path == b.file_path
         } else {
-            eq(&a.host, &b.host) && (a.port.is_none() || b.port.is_none() || a.port == b.port) && eq(&a.database, &b.database) && user_of(a) == user_of(b) && a.options.get("account") == b.options.get("account")
+            eq(&a.host, &b.host)
+                && (a.port.is_none() || b.port.is_none() || a.port == b.port)
+                && eq(&a.database, &b.database)
+                && user_of(a) == user_of(b)
+                && a.options.get("account") == b.options.get("account")
         }
 }
 
@@ -881,7 +906,12 @@ pub fn import_apply(state: &AppState, source: ImportSource, path: Option<String>
             let id = match folders.get(&key) {
                 Some(id) => id.clone(),
                 None => {
-                    let f = state.workspace.save_folder(Folder { id: String::new(), parent_id: folder_id.clone(), name: key[depth - 1].clone(), kind: FolderKind::Connections })?;
+                    let f = state.workspace.save_folder(Folder {
+                        id: String::new(),
+                        parent_id: folder_id.clone(),
+                        name: key[depth - 1].clone(),
+                        kind: FolderKind::Connections,
+                    })?;
                     folders.insert(key, f.id.clone());
                     f.id
                 }
@@ -901,7 +931,10 @@ pub fn import_apply(state: &AppState, source: ImportSource, path: Option<String>
             updated_at: 0,
         };
         // Saved even when incomplete (no user yet…): finished in its form.
-        match api::store_connection(state, api::SaveConnectionArgs { profile, secret: p.secret.clone(), clear_secret: false, extra_secrets: Default::default() }) {
+        match api::store_connection(
+            state,
+            api::SaveConnectionArgs { profile, secret: p.secret.clone(), clear_secret: false, extra_secrets: Default::default() },
+        ) {
             Ok(_) => report.imported += 1,
             Err(e) => report.errors.push(format!("{}: {}", p.conn.name, e.message)),
         }
@@ -935,7 +968,11 @@ mod tests {
             Some(("mongodb+srv://c0.x.net/db?retryWrites=true".into(), "ann".into(), "s3cr@t".into())),
             "decoded user and password; the rest kept"
         );
-        assert_eq!(split("neo4j+s://neo4j:a%3Ab:c@db.example:7687"), Some(("neo4j+s://db.example:7687".into(), "neo4j".into(), "a:b:c".into())), "the first colon splits");
+        assert_eq!(
+            split("neo4j+s://neo4j:a%3Ab:c@db.example:7687"),
+            Some(("neo4j+s://db.example:7687".into(), "neo4j".into(), "a:b:c".into())),
+            "the first colon splits"
+        );
         assert_eq!(split("mongodb://u:p@w@h1,h2/db"), Some(("mongodb://h1,h2/db".into(), "u".into(), "p@w".into())), "the last @ ends the user info");
         assert_eq!(split("mongodb://u:@h/"), Some(("mongodb://h/".into(), "u".into(), String::new())));
         for none in ["mongodb://ann@h/db", "mongodb://h:27017/db", "mongodb://h/db?authSource=a:b@c", "u:p@h", ""] {
@@ -989,7 +1026,10 @@ mod tests {
         let p = parse_dbeaver(text, &HashMap::new()).unwrap();
         assert_eq!(p.len(), 2);
         let pg = p.iter().find(|x| x.conn.name == "Orders DB").unwrap();
-        assert_eq!((pg.conn.config.kind, pg.conn.config.port, pg.conn.env, pg.conn.folder.clone()), (ConnectorKind::Postgres, Some(5433), EnvTag::Prod, vec!["Prod".to_string()]));
+        assert_eq!(
+            (pg.conn.config.kind, pg.conn.config.port, pg.conn.env, pg.conn.folder.clone()),
+            (ConnectorKind::Postgres, Some(5433), EnvTag::Prod, vec!["Prod".to_string()])
+        );
         let ssh = pg.conn.config.ssh.as_ref().unwrap();
         assert_eq!((ssh.host.as_str(), ssh.port, ssh.auth.clone()), ("bastion", 2222, SshAuth::Key { path: "/k/id_rsa".into() }));
         let lite = p.iter().find(|x| x.conn.name == "Local").unwrap();
@@ -1000,15 +1040,24 @@ mod tests {
     fn reads_jdbc_urls() {
         let c = |u: &str| config_from_url(u).unwrap();
         let (pg, u) = c("jdbc:postgresql://db.local:5433/shop?user=ann&ssl=true");
-        assert_eq!((pg.kind, pg.host.as_deref(), pg.port, pg.database.as_deref(), u.as_deref()), (ConnectorKind::Postgres, Some("db.local"), Some(5433), Some("shop"), Some("ann")));
+        assert_eq!(
+            (pg.kind, pg.host.as_deref(), pg.port, pg.database.as_deref(), u.as_deref()),
+            (ConnectorKind::Postgres, Some("db.local"), Some(5433), Some("shop"), Some("ann"))
+        );
         let (ms, _) = c("jdbc:sqlserver://sql1\\inst:1433;databaseName=Sales;encrypt=true");
-        assert_eq!((ms.kind, ms.host.as_deref(), ms.port, ms.database.as_deref(), ms.opt("instance")), (ConnectorKind::Mssql, Some("sql1"), Some(1433), Some("Sales"), Some("inst")));
+        assert_eq!(
+            (ms.kind, ms.host.as_deref(), ms.port, ms.database.as_deref(), ms.opt("instance")),
+            (ConnectorKind::Mssql, Some("sql1"), Some(1433), Some("Sales"), Some("inst"))
+        );
         let (ora, _) = c("jdbc:oracle:thin:@//ora.local:1521/ORCLPDB");
         assert_eq!((ora.host.as_deref(), ora.port, ora.opt("service_name")), (Some("ora.local"), Some(1521), Some("ORCLPDB")));
         let (sid, _) = c("jdbc:oracle:thin:@ora:1521:XE");
         assert_eq!((sid.host.as_deref(), sid.database.as_deref()), (Some("ora"), Some("XE")));
         let (sf, u) = c("jdbc:snowflake://xy12345.eu-west-1.snowflakecomputing.com/?db=ANALYTICS&warehouse=WH&user=BOB");
-        assert_eq!((sf.opt("account"), sf.database.as_deref(), sf.opt("warehouse"), u.as_deref()), (Some("xy12345.eu-west-1"), Some("ANALYTICS"), Some("WH"), Some("BOB")));
+        assert_eq!(
+            (sf.opt("account"), sf.database.as_deref(), sf.opt("warehouse"), u.as_deref()),
+            (Some("xy12345.eu-west-1"), Some("ANALYTICS"), Some("WH"), Some("BOB"))
+        );
         let (db, _) = c("jdbc:databricks://adb-1.azuredatabricks.net:443/default;transportMode=http;ssl=1;httpPath=/sql/1.0/warehouses/abc;AuthMech=3");
         assert_eq!((db.host.as_deref(), db.opt("http_path")), (Some("adb-1.azuredatabricks.net"), Some("/sql/1.0/warehouses/abc")));
         let (bq, _) = c("jdbc:bigquery://https://www.googleapis.com/bigquery/v2:443;ProjectId=my-proj;OAuthType=3");
@@ -1028,9 +1077,15 @@ mod tests {
         let (ch, _) = c("jdbc:ch://localhost:9000?database=logs&user=default");
         assert_eq!((ch.host.as_deref(), ch.port, ch.database.as_deref()), (Some("localhost"), Some(8123), Some("logs")), "native port mapped to HTTP");
         let (rs, u) = c("jdbc:redshift://ana.c1ab.eu-west-1.redshift.amazonaws.com/sales?user=bob");
-        assert_eq!((rs.kind, rs.port, rs.opt("flavor"), u.as_deref(), rs.auth.kind()), (ConnectorKind::Postgres, Some(5439), Some("redshift"), Some("bob"), databrain_auth::AuthMethodKind::None));
+        assert_eq!(
+            (rs.kind, rs.port, rs.opt("flavor"), u.as_deref(), rs.auth.kind()),
+            (ConnectorKind::Postgres, Some(5439), Some("redshift"), Some("bob"), databrain_auth::AuthMethodKind::None)
+        );
         let (iam, _) = c("jdbc:redshift:iam://ana:eu-west-1/sales?Profile=prod&DbUser=etl");
-        assert_eq!((iam.host.as_deref(), iam.opt("cluster_id"), iam.opt("aws_region"), iam.opt("db_user")), (None, Some("ana"), Some("eu-west-1"), Some("etl")));
+        assert_eq!(
+            (iam.host.as_deref(), iam.opt("cluster_id"), iam.opt("aws_region"), iam.opt("db_user")),
+            (None, Some("ana"), Some("eu-west-1"), Some("etl"))
+        );
         assert_eq!(iam.auth, AuthMethod::CloudCli { profile: Some("prod".into()) });
         let (iam2, _) = c("jdbc:redshift:iam://ana.c1ab.eu-west-1.redshift.amazonaws.com:5439/dev");
         assert_eq!((iam2.host.as_deref(), iam2.port, iam2.opt("cluster_id")), (Some("ana.c1ab.eu-west-1.redshift.amazonaws.com"), Some(5439), None));
@@ -1066,7 +1121,10 @@ mod tests {
         assert_eq!(p.len(), 4, "unsupported drivers are skipped");
         assert_eq!((p[3].conn.config.kind, p[3].conn.config.host.as_deref()), (ConnectorKind::Clickhouse, Some("h")));
         let pg = &p[0];
-        assert_eq!((pg.conn.name.as_str(), pg.conn.config.host.as_deref(), pg.conn.config.database.as_deref(), pg.conn.folder.clone()), ("shop@localhost", Some("localhost"), Some("shop"), vec!["Prod".to_string(), "EU".to_string()]));
+        assert_eq!(
+            (pg.conn.name.as_str(), pg.conn.config.host.as_deref(), pg.conn.config.database.as_deref(), pg.conn.folder.clone()),
+            ("shop@localhost", Some("localhost"), Some("shop"), vec!["Prod".to_string(), "EU".to_string()])
+        );
         assert_eq!(user_of(&pg.conn.config).as_deref(), Some("ann"), "user from dataSources.local.xml");
         assert!(pg.conn.config.read_only);
         assert!(pg.note.as_deref().unwrap().contains("SSH"), "{:?}", pg.note);

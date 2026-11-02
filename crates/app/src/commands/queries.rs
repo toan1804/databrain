@@ -26,7 +26,14 @@ pub(crate) fn preview_parameters(
 }
 
 #[tauri::command]
-pub(crate) async fn explain_plan(state: State<'_, AppState>, connection_id: String, session_key: String, sql: String, analyze: bool, params: Option<std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>>) -> R<databrain_query_engine::plan::QueryPlan> {
+pub(crate) async fn explain_plan(
+    state: State<'_, AppState>,
+    connection_id: String,
+    session_key: String,
+    sql: String,
+    analyze: bool,
+    params: Option<std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>>,
+) -> R<databrain_query_engine::plan::QueryPlan> {
     api::explain_plan(&state, &connection_id, &session_key, &sql, analyze, &params.unwrap_or_default()).await
 }
 
@@ -59,18 +66,24 @@ pub(crate) async fn close_tab(state: State<'_, AppState>, tab_id: String) -> R<(
 
 #[tauri::command]
 pub(crate) async fn read_sql_file(path: String) -> R<sql_files::SqlFile> {
-    tauri::async_runtime::spawn_blocking(move || sql_files::read_sql_file(&path)).await.map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?
+    tauri::async_runtime::spawn_blocking(move || sql_files::read_sql_file(&path))
+        .await
+        .map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?
 }
 
 #[tauri::command]
 pub(crate) async fn write_sql_file(path: String, text: String, expected_mtime: Option<i64>) -> R<i64> {
-    tauri::async_runtime::spawn_blocking(move || sql_files::write_sql_file(&path, &text, expected_mtime)).await.map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?
+    tauri::async_runtime::spawn_blocking(move || sql_files::write_sql_file(&path, &text, expected_mtime))
+        .await
+        .map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?
 }
 
 /// Modification times of files (null: gone), to notice outside changes.
 #[tauri::command]
 pub(crate) async fn sql_file_mtimes(paths: Vec<String>) -> R<Vec<Option<i64>>> {
-    tauri::async_runtime::spawn_blocking(move || paths.iter().map(|p| sql_files::file_mtime(p)).collect()).await.map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))
+    tauri::async_runtime::spawn_blocking(move || paths.iter().map(|p| sql_files::file_mtime(p)).collect())
+        .await
+        .map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))
 }
 
 #[tauri::command]

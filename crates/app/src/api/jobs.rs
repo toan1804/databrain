@@ -6,7 +6,13 @@ use super::*;
 
 impl AppState {
     pub fn job_ctx(&self) -> crate::jobs::JobCtx {
-        crate::jobs::JobCtx { engine: self.engine.clone(), workspace: self.workspace.clone(), hub: self.hub.clone(), ui: self.ui.clone(), jobs: self.jobs.clone() }
+        crate::jobs::JobCtx {
+            engine: self.engine.clone(),
+            workspace: self.workspace.clone(),
+            hub: self.hub.clone(),
+            ui: self.ui.clone(),
+            jobs: self.jobs.clone(),
+        }
     }
 }
 
@@ -20,7 +26,11 @@ pub struct JobListing {
 }
 
 pub fn list_jobs(state: &AppState) -> Result<JobListing> {
-    Ok(JobListing { jobs: state.workspace.list_jobs()?, running: state.jobs.running_ids(), elsewhere: state.workspace.jobs_leased_elsewhere(&state.jobs.owner)? })
+    Ok(JobListing {
+        jobs: state.workspace.list_jobs()?,
+        running: state.jobs.running_ids(),
+        elsewhere: state.workspace.jobs_leased_elsewhere(&state.jobs.owner)?,
+    })
 }
 
 pub fn get_job(state: &AppState, id: &str) -> Result<databrain_workspace::Job> {
@@ -29,12 +39,14 @@ pub fn get_job(state: &AppState, id: &str) -> Result<databrain_workspace::Job> {
 
 /// Save a job edited by the user (the AI's tools save through the
 /// workspace). A step keeps the AI's mark (`ai_sql`) only while its SQL is
-/// as the AI saved it; a step the user wrote or changed is the user's, and
-/// a user save can't mark a step as the AI's.
+/// as the AI saved it and the user didn't clear it ("Trust this SQL"); a
+/// step the user wrote or changed is the user's, and a user save can't mark
+/// a step as the AI's.
 pub fn save_job(state: &AppState, mut job: databrain_workspace::Job) -> Result<databrain_workspace::Job> {
     let old = if job.id.is_empty() { None } else { state.workspace.get_job(&job.id).ok() };
     for n in &mut job.nodes {
-        n.ai_sql = old.as_ref().and_then(|o| o.nodes.iter().find(|x| x.id == n.id)).is_some_and(|o| o.ai_sql && o.same_sql(n));
+        let kept = old.as_ref().and_then(|o| o.nodes.iter().find(|x| x.id == n.id)).is_some_and(|o| o.ai_sql && o.same_sql(n));
+        n.ai_sql = n.ai_sql && kept;
     }
     // Names the job doesn't own yet must not be taken by other outputs.
     let owned: Vec<String> = old.as_ref().map(|j| j.nodes.iter().map(|n| n.name.to_ascii_lowercase()).collect()).unwrap_or_default();
@@ -87,7 +99,26 @@ pub fn delete_job(state: &AppState, id: &str) -> Result<()> {
 
 /// Run a job now (`nodes`: only these steps).
 pub fn run_job(state: &AppState, id: &str, nodes: Option<Vec<String>>) -> Result<databrain_workspace::JobRun> {
-    crate::jobs::start(&state.job_ctx(), id, "manual", nodes)
+    run_job_with(state, id, nodes, None)
+}
+
+/// [`run_job`] with `:name` values for this run (another set, values over it).
+pub fn run_job_with(state: &AppState, id: &str, nodes: Option<Vec<String>>, params: Option<crate::jobs::RunParams>) -> Result<databrain_workspace::JobRun> {
+    crate::jobs::start_with(&state.job_ctx(), id, "manual", nodes, params)
+}
+
+// ------------------------------------------------------------ parameter sets
+
+pub fn list_param_sets(state: &AppState) -> Result<Vec<databrain_workspace::ParamSet>> {
+    Ok(state.workspace.list_param_sets()?)
+}
+
+pub fn save_param_set(state: &AppState, set: databrain_workspace::ParamSet) -> Result<databrain_workspace::ParamSet> {
+    Ok(state.workspace.save_param_set(set)?)
+}
+
+pub fn delete_param_set(state: &AppState, id: &str) -> Result<()> {
+    Ok(state.workspace.delete_param_set(id)?)
 }
 
 /// Run again the steps that did not succeed last time (and what follows them).

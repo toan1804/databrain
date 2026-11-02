@@ -75,7 +75,10 @@ pub enum JobEvent {
         in_transaction: bool,
     },
     /// Outputs were added, renamed, pinned or evicted (job/tab ids empty).
-    OutputsChanged { job_id: String, tab_id: String },
+    OutputsChanged {
+        job_id: String,
+        tab_id: String,
+    },
 }
 
 pub trait EventSink: Send + Sync {

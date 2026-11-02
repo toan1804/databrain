@@ -162,7 +162,13 @@ pub fn candidate_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
     // Library search path.
-    let var = if cfg!(target_os = "windows") { "PATH" } else if cfg!(target_os = "macos") { "DYLD_LIBRARY_PATH" } else { "LD_LIBRARY_PATH" };
+    let var = if cfg!(target_os = "windows") {
+        "PATH"
+    } else if cfg!(target_os = "macos") {
+        "DYLD_LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    };
     if let Some(p) = std::env::var_os(var) {
         for d in std::env::split_paths(&p) {
             consider(d);
@@ -438,7 +444,10 @@ pub fn install(dest: &Path, progress: &dyn Fn(InstallProgress), cancel: &AtomicB
                 let entries: Vec<PathBuf> = std::fs::read_dir(&mount)
                     .map_err(|e| e.to_string())?
                     .filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|p| !matches!(p.file_name().and_then(|n| n.to_str()), Some("install_ic.sh" | "INSTALL_IC_README.txt")) && !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.')))
+                    .filter(|p| {
+                        !matches!(p.file_name().and_then(|n| n.to_str()), Some("install_ic.sh" | "INSTALL_IC_README.txt"))
+                            && !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.'))
+                    })
                     .collect();
                 if entries.is_empty() {
                     return Err("the downloaded package is empty".to_string());

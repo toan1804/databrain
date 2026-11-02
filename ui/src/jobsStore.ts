@@ -1,7 +1,7 @@
 // Jobs list, running jobs and their live runs (from "job-run" events).
 import { create } from "zustand";
 import { api, isTauri, onJobRun, onJobRunLog, toError } from "./lib/api";
-import type { Job, JobRun, JobSummary, RunLogEntry } from "./lib/types";
+import type { RunParams, Job, JobRun, JobSummary, RunLogEntry } from "./lib/types";
 import { useStore } from "./store";
 import { uid } from "./lib/util";
 import { cellStepBase, stepsFromCells, uniqueName, type CellSource } from "./lib/jobGraph";
@@ -37,9 +37,10 @@ interface JobsState {
   open: (id: string, name: string) => void;
   create: () => Promise<void>;
   /** A job with one step per SQL cell of a notebook, top to bottom. */
-  createFromNotebook: (nb: { name: string; connection_id?: string | null; cells: (CellSource & { kind: string })[] }) => Promise<void>;
+  /** `paramsKey`: the notebook's parameter boxes, whose values the job takes. */
+  createFromNotebook: (nb: { name: string; connection_id?: string | null; cells: (CellSource & { kind: string })[] }, paramsKey?: string) => Promise<void>;
   remove: (j: { id: string; name: string }) => void;
-  run: (id: string, nodes?: string[]) => Promise<void>;
+  run: (id: string, nodes?: string[], params?: RunParams) => Promise<void>;
   /** Run again the steps that did not succeed last time (after a fix). */
   resume: (id: string) => Promise<void>;
   cancel: (id: string) => Promise<void>;
@@ -172,7 +173,7 @@ export const useJobs = create<JobsState>((set, get) => ({
       st.toast(toError(e).message, "error");
     }
   },
-  createFromNotebook: async (nb) => {
+  createFromNotebook: async (nb, paramsKey) => {
     const st = useStore.getState();
     const cells = nb.cells.filter((c) => c.kind === "sql" && c.source.trim());
     if (!cells.length) return st.toast("This notebook has no SQL cells", "info");
@@ -193,16 +194,18 @@ export const useJobs = create<JobsState>((set, get) => ({
         nodes,
         edges,
         schedule: { enabled: false, mode: "interval", minutes: 60, at: "08:00", weekdays: [] },
+        // The notebook's current :name values become the job's own.
+        params: Object.fromEntries(Object.entries(paramsKey ? (st.params[paramsKey] ?? {}) : {}).filter(([, v]) => v.value.trim())),
         created_at: 0,
         updated_at: 0,
       });
       await get().refresh();
       get().open(saved.id, saved.name);
       const renamed = cells.filter((c, i) => c.output_name?.trim() && c.output_name.trim().toLowerCase() !== names[i].toLowerCase()).length;
-      const params = cells.some((c) => /(^|[^:\w]):[A-Za-z_]\w*/.test(c.source));
+      const params = cells.some((c) => /(^|[^:\w]):[A-Za-z_]\w*/.test(c.source)) && !Object.keys(saved.params ?? {}).length;
       const notes = [
         renamed ? `${renamed} output name(s) are used by the notebook, so the steps got new names (their SQL was updated)` : "",
-        params ? ":name parameters are not filled in for job steps" : "",
+        params ? ":name parameters have no values yet: set them in the job's Parameters" : "",
       ].filter(Boolean);
       st.toast(`Job "${saved.name}" created with ${nodes.length} steps${notes.length ? `. ${notes.join("; ")}.` : ""}`, "info");
     } catch (e) {
@@ -225,9 +228,9 @@ export const useJobs = create<JobsState>((set, get) => ({
         }
       },
     }),
-  run: async (id, nodes) => {
+  run: async (id, nodes, params) => {
     try {
-      const run = await api.runJob(id, nodes);
+      const run = await api.runJob(id, nodes, params);
       // The run's events can arrive before this reply (a step that fails at
       // once, e.g. on a connection that can't connect): keep the newer state
       // instead of putting back the "just started" run, which stayed

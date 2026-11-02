@@ -124,7 +124,13 @@ pub fn split_target(target: &str) -> Vec<(String, String)> {
             continue;
         }
         // Two paths with no separator between them: treat as "&".
-        let s = if out.is_empty() { String::new() } else if sep.is_empty() { "&".into() } else { std::mem::take(&mut sep) };
+        let s = if out.is_empty() {
+            String::new()
+        } else if sep.is_empty() {
+            "&".into()
+        } else {
+            std::mem::take(&mut sep)
+        };
         sep.clear();
         out.push((s, path));
     }
@@ -283,7 +289,10 @@ pub fn plan_import(existing: &[KnNote], incoming: &[NoteEntry]) -> Vec<ImportIte
             let subject = note_subject(n.target.as_deref(), &n.body);
             let body = normalize(&n.body);
             let same_subject: Vec<KnNote> = existing.iter().filter(|e| note_subject(e.target.as_deref(), &e.body) == subject).cloned().collect();
-            let identical = existing.iter().any(|e| normalize(&e.body) == body && e.target.as_deref().map(str::to_lowercase) == n.target.as_deref().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()));
+            let identical = existing.iter().any(|e| {
+                normalize(&e.body) == body
+                    && e.target.as_deref().map(str::to_lowercase) == n.target.as_deref().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty())
+            });
             let kind = if identical {
                 ImportKind::Same
             } else if same_subject.is_empty() {
@@ -383,9 +392,9 @@ pub fn fts_query(text: &str) -> Option<String> {
 }
 
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "from", "that", "this", "what", "which", "show", "me", "all", "of", "in", "by", "to",
-    "is", "are", "was", "how", "many", "each", "per", "a", "an", "on", "at", "give", "list", "get", "find", "select",
-    "where", "top", "last", "first", "please", "can", "you", "my", "our", "query", "sql", "write",
+    "the", "and", "for", "with", "from", "that", "this", "what", "which", "show", "me", "all", "of", "in", "by", "to", "is", "are", "was", "how", "many",
+    "each", "per", "a", "an", "on", "at", "give", "list", "get", "find", "select", "where", "top", "last", "first", "please", "can", "you", "my", "our",
+    "query", "sql", "write",
 ];
 
 impl Workspace {
@@ -396,8 +405,7 @@ impl Workspace {
         let tx = c.transaction()?;
         let existing: std::collections::HashMap<String, String> = {
             let mut stmt = tx.prepare("SELECT name, content_hash FROM kn_objects WHERE connection_id = ?1 AND schema_name = ?2")?;
-            stmt.query_map(params![connection_id, schema], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?
+            stmt.query_map(params![connection_id, schema], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
         };
         let now = now_ms();
         let mut delta = IndexDelta::default();
@@ -432,18 +440,17 @@ impl Workspace {
                    content_hash = excluded.content_hash, indexed_at = excluded.indexed_at",
             )?
             .execute(params![
-                    connection_id,
-                    o.schema,
-                    o.name,
-                    o.kind,
-                    o.comment,
-                    o.row_estimate,
-                    serde_json::to_string(&o.columns)?,
-                    serde_json::to_string(&o.foreign_keys)?,
-                    hash,
-                    now
-                ],
-            )?;
+                connection_id,
+                o.schema,
+                o.name,
+                o.kind,
+                o.comment,
+                o.row_estimate,
+                serde_json::to_string(&o.columns)?,
+                serde_json::to_string(&o.foreign_keys)?,
+                hash,
+                now
+            ])?;
             delta.changed += 1;
         }
         if !stale_refs.is_empty() {
@@ -589,19 +596,15 @@ impl Workspace {
 
     pub fn kn_state(&self, connection_id: &str) -> Result<Option<KnState>> {
         let c = self.conn.lock();
-        Ok(c.query_row(
-            "SELECT connection_id, indexed_at, objects, schemas_json, error FROM kn_state WHERE connection_id = ?1",
-            [connection_id],
-            |r| {
-                Ok(KnState {
-                    connection_id: r.get(0)?,
-                    indexed_at: r.get(1)?,
-                    objects: r.get(2)?,
-                    schemas: serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default(),
-                    error: r.get(4)?,
-                })
-            },
-        )
+        Ok(c.query_row("SELECT connection_id, indexed_at, objects, schemas_json, error FROM kn_state WHERE connection_id = ?1", [connection_id], |r| {
+            Ok(KnState {
+                connection_id: r.get(0)?,
+                indexed_at: r.get(1)?,
+                objects: r.get(2)?,
+                schemas: serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default(),
+                error: r.get(4)?,
+            })
+        })
         .optional()?)
     }
 
@@ -647,7 +650,8 @@ impl Workspace {
     pub fn kn_list_objects(&self, connection_id: &str, filter: &str, offset: usize, limit: usize) -> Result<(Vec<KnObject>, usize)> {
         let c = self.conn.lock();
         let q = filter.trim().to_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-        const MATCH: &str = "connection_id = ?1 AND (?2 = '' OR lower(schema_name || '.' || name || ' ' || coalesce(comment, '')) LIKE '%' || ?2 || '%' ESCAPE '\\')";
+        const MATCH: &str =
+            "connection_id = ?1 AND (?2 = '' OR lower(schema_name || '.' || name || ' ' || coalesce(comment, '')) LIKE '%' || ?2 || '%' ESCAPE '\\')";
         let total: i64 = c.query_row(&format!("SELECT count(*) FROM kn_objects WHERE {MATCH}"), params![connection_id, q], |r| r.get(0))?;
         let mut stmt = c.prepare_cached(&format!(
             "SELECT schema_name, name, kind, comment, row_estimate, columns_json, fks_json FROM kn_objects WHERE {MATCH} \
@@ -744,9 +748,7 @@ impl Workspace {
              WHERE kn_fts MATCH ?2 AND connection_id = ?1 ORDER BY score LIMIT ?3",
         )?;
         let rows = stmt
-            .query_map(params![connection_id, q, limit as i64], |r| {
-                Ok(KnHit { source: r.get(0)?, reference: r.get(1)?, title: r.get(2)?, score: r.get(3)? })
-            })?
+            .query_map(params![connection_id, q, limit as i64], |r| Ok(KnHit { source: r.get(0)?, reference: r.get(1)?, title: r.get(2)?, score: r.get(3)? }))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -788,7 +790,12 @@ impl Workspace {
         if n.status == NoteStatus::Approved {
             c.execute(
                 "INSERT INTO kn_fts (connection_id, source, ref, title, body) VALUES (?1, 'note', ?2, ?3, ?4)",
-                params![n.connection_id, n.id, n.target.clone().unwrap_or_else(|| "glossary".into()), format!("{} {}", n.target.clone().unwrap_or_default().replace(['_', '.'], " "), n.body)],
+                params![
+                    n.connection_id,
+                    n.id,
+                    n.target.clone().unwrap_or_else(|| "glossary".into()),
+                    format!("{} {}", n.target.clone().unwrap_or_default().replace(['_', '.'], " "), n.body)
+                ],
             )?;
         }
         Ok(n)
@@ -832,7 +839,9 @@ impl Workspace {
             .filter(|n| n.status == NoteStatus::Approved)
             .map(|n| NoteEntry { target: n.target, body: n.body, author: Some(n.author) })
             .collect();
-        notes.sort_by(|a, b| (a.target.is_none(), a.target.as_deref().unwrap_or(""), &a.body).cmp(&(b.target.is_none(), b.target.as_deref().unwrap_or(""), &b.body)));
+        notes.sort_by(|a, b| {
+            (a.target.is_none(), a.target.as_deref().unwrap_or(""), &a.body).cmp(&(b.target.is_none(), b.target.as_deref().unwrap_or(""), &b.body))
+        });
         Ok(NotesFile {
             format: NOTES_FORMAT.into(),
             version: 1,
@@ -888,11 +897,7 @@ impl Workspace {
 
     /// Saved queries flagged as AI examples for a connection.
     pub fn ai_examples(&self, connection_id: &str) -> Result<Vec<crate::SavedQuery>> {
-        Ok(self
-            .list_saved_queries(None)?
-            .into_iter()
-            .filter(|q| q.ai_example && q.connection_id.as_deref().is_none_or(|c| c == connection_id))
-            .collect())
+        Ok(self.list_saved_queries(None)?.into_iter().filter(|q| q.ai_example && q.connection_id.as_deref().is_none_or(|c| c == connection_id)).collect())
     }
 }
 
@@ -918,7 +923,13 @@ mod tests {
     #[test]
     fn completion_from_the_index() {
         let ws = Workspace::open_in_memory().unwrap();
-        let objs = vec![obj("s", "customer_orders", &["a"], None), obj("s", "customers", &["customer_id", "email"], None), obj("s", "big_customer", &[], None), obj("s", "x_y", &[], None), obj("s", "xay", &[], None)];
+        let objs = vec![
+            obj("s", "customer_orders", &["a"], None),
+            obj("s", "customers", &["customer_id", "email"], None),
+            obj("s", "big_customer", &[], None),
+            obj("s", "x_y", &[], None),
+            obj("s", "xay", &[], None),
+        ];
         ws.kn_replace_schema("c1", "s", &objs).unwrap();
         ws.kn_replace_schema("c1", "t", &[obj("t", "customers", &[], None)]).unwrap();
         let names = |s: Option<&str>, q: &str| ws.kn_complete("c1", s, q, 10).unwrap().into_iter().map(|r| format!("{}.{}", r.0, r.1)).collect::<Vec<_>>();
@@ -996,7 +1007,10 @@ mod tests {
     #[test]
     fn note_targets_split_into_tables() {
         let p = split_target("sales.orders & crm.customers and `x`.\"y\" OR dim.date, a.b.c");
-        assert_eq!(p.iter().map(|(s, t)| (s.as_str(), t.as_str())).collect::<Vec<_>>(), vec![("", "sales.orders"), ("&", "crm.customers"), ("and", "x.y"), ("or", "dim.date"), (",", "a.b.c")]);
+        assert_eq!(
+            p.iter().map(|(s, t)| (s.as_str(), t.as_str())).collect::<Vec<_>>(),
+            vec![("", "sales.orders"), ("&", "crm.customers"), ("and", "x.y"), ("or", "dim.date"), (",", "a.b.c")]
+        );
         assert_eq!(join_target(&p), "sales.orders & crm.customers and x.y or dim.date, a.b.c");
         assert_eq!(split_target("a.b c.d").last().unwrap().0, "&", "missing separator means &");
         assert!(split_target("  & ").is_empty());

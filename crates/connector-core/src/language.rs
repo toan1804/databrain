@@ -62,7 +62,14 @@ fn mongo_kind(text: &str) -> StatementKind {
         }
         Some("aggregate") if !writes_out => StatementKind::Read,
         Some("aggregate") => StatementKind::Dml,
-        Some(o) if o.starts_with("insert") || o.starts_with("update") || o.starts_with("delete") || o.starts_with("replace") || o.starts_with("findoneand") || o == "bulkwrite" => {
+        Some(o)
+            if o.starts_with("insert")
+                || o.starts_with("update")
+                || o.starts_with("delete")
+                || o.starts_with("replace")
+                || o.starts_with("findoneand")
+                || o == "bulkwrite" =>
+        {
             StatementKind::Dml
         }
         Some(o) if o.starts_with("create") || o.starts_with("drop") || o == "renamecollection" || o == "collmod" => StatementKind::Ddl,
@@ -247,7 +254,8 @@ mod tests {
         let n = |v: &[Vec<String>]| v.iter().map(|t| t.join(".")).collect::<Vec<_>>();
         let r = mongo_table_refs("db.orders.find({status: 'A'})");
         assert_eq!((n(&r.reads), n(&r.writes)), (vec!["orders".to_string()], vec![]));
-        let r = mongo_table_refs("use shop\ndb.orders.aggregate([{$lookup: {from: 'customers', localField: 'c', foreignField: '_id', as: 'c'}}, {$out: 'copy'}])");
+        let r =
+            mongo_table_refs("use shop\ndb.orders.aggregate([{$lookup: {from: 'customers', localField: 'c', foreignField: '_id', as: 'c'}}, {$out: 'copy'}])");
         assert_eq!(n(&r.reads), ["shop.orders", "shop.customers"]);
         assert_eq!(n(&r.writes), ["shop.copy"]);
         let r = mongo_table_refs(r#"{"insert": "logs", "documents": [{}]}"#);

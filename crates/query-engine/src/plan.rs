@@ -18,8 +18,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use databrain_connector_core::sql::{classify, StatementKind};
-use databrain_connector_core::{query_table, ConnectorKind, Session};
+use databrain_connector_core::sql::{StatementKind, classify};
+use databrain_connector_core::{ConnectorKind, Session, query_table};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -226,7 +226,27 @@ fn postgres_plan(raw: &str, analyze: bool) -> QueryPlan {
         if let Some(j) = s("Join Type").filter(|j| *j != "Inner" || op.contains("Join") || op == "Nested Loop") {
             op = format!("{op} ({j})");
         }
-        const SHOWN: &[&str] = &["Node Type", "Relation Name", "Schema", "Alias", "Index Name", "Join Type", "Startup Cost", "Total Cost", "Plan Rows", "Actual Rows", "Actual Total Time", "Actual Loops", "Plans", "CTE Name", "Function Name", "Parallel Aware", "Async Capable", "Plan Width", "Actual Startup Time"];
+        const SHOWN: &[&str] = &[
+            "Node Type",
+            "Relation Name",
+            "Schema",
+            "Alias",
+            "Index Name",
+            "Join Type",
+            "Startup Cost",
+            "Total Cost",
+            "Plan Rows",
+            "Actual Rows",
+            "Actual Total Time",
+            "Actual Loops",
+            "Plans",
+            "CTE Name",
+            "Function Name",
+            "Parallel Aware",
+            "Async Capable",
+            "Plan Width",
+            "Actual Startup Time",
+        ];
         let extra = p
             .as_object()
             .map(|o| o.iter().filter(|(k, _)| !SHOWN.contains(&k.as_str())).filter_map(|(k, v)| scalar_text(v).map(|t| (k.clone(), t))).collect())
@@ -357,7 +377,8 @@ fn duckdb_plan(raw: &str, analyze: bool) -> QueryPlan {
 
 fn snowflake_plan(raw: &str) -> QueryPlan {
     let v: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
-    let ops: Vec<&Value> = v.get("Operations").and_then(Value::as_array).map(|a| a.iter().flat_map(|g| g.as_array().into_iter().flatten()).collect()).unwrap_or_default();
+    let ops: Vec<&Value> =
+        v.get("Operations").and_then(Value::as_array).map(|a| a.iter().flat_map(|g| g.as_array().into_iter().flatten()).collect()).unwrap_or_default();
     let items = ops.iter().map(|o| {
         let id = o.get("id").map(|x| x.to_string()).unwrap_or_default();
         let parent = o.get("parentOperators").and_then(Value::as_array).and_then(|a| a.first()).map(|x| x.to_string()).unwrap_or_else(|| "-".into());
@@ -378,24 +399,30 @@ fn snowflake_plan(raw: &str) -> QueryPlan {
 fn mssql_rows(r: &Rows) -> Vec<PlanNode> {
     let col = |n: &str| r.0.iter().position(|c| c.eq_ignore_ascii_case(n));
     let get = |row: &Vec<Option<String>>, n: &str| col(n).and_then(|i| row.get(i).cloned().flatten());
-    let items = r.1.iter().filter(|row| get(row, "Type").is_none_or(|t| t != "SELECT" && t != "UPDATE" && t != "INSERT" && t != "DELETE") || get(row, "Parent").is_some_and(|p| p != "0")).map(|row| {
-        let mut n = PlanNode {
-            op: get(row, "PhysicalOp").or_else(|| get(row, "StmtText")).unwrap_or_default(),
-            cost: get(row, "TotalSubtreeCost").and_then(|v| v.parse().ok()),
-            rows: get(row, "EstimateRows").and_then(|v| v.parse().ok()),
-            ..Default::default()
-        };
-        if let Some(l) = get(row, "LogicalOp").filter(|l| *l != n.op) {
-            n.extra.push(("Logical".into(), l));
-        }
-        if let Some(a) = get(row, "Argument") {
-            if let Some(obj) = a.split("OBJECT:(").nth(1).and_then(|x| x.split(')').next()) {
-                n.object = Some(format!("on {obj}"));
+    let items = r
+        .1
+        .iter()
+        .filter(|row| {
+            get(row, "Type").is_none_or(|t| t != "SELECT" && t != "UPDATE" && t != "INSERT" && t != "DELETE") || get(row, "Parent").is_some_and(|p| p != "0")
+        })
+        .map(|row| {
+            let mut n = PlanNode {
+                op: get(row, "PhysicalOp").or_else(|| get(row, "StmtText")).unwrap_or_default(),
+                cost: get(row, "TotalSubtreeCost").and_then(|v| v.parse().ok()),
+                rows: get(row, "EstimateRows").and_then(|v| v.parse().ok()),
+                ..Default::default()
+            };
+            if let Some(l) = get(row, "LogicalOp").filter(|l| *l != n.op) {
+                n.extra.push(("Logical".into(), l));
             }
-            n.extra.push(("Argument".into(), a));
-        }
-        (get(row, "NodeId").unwrap_or_default(), get(row, "Parent").unwrap_or_else(|| "0".into()), n)
-    });
+            if let Some(a) = get(row, "Argument") {
+                if let Some(obj) = a.split("OBJECT:(").nth(1).and_then(|x| x.split(')').next()) {
+                    n.object = Some(format!("on {obj}"));
+                }
+                n.extra.push(("Argument".into(), a));
+            }
+            (get(row, "NodeId").unwrap_or_default(), get(row, "Parent").unwrap_or_else(|| "0".into()), n)
+        });
     by_parent(items, "0")
 }
 
@@ -404,11 +431,22 @@ fn oracle_rows(r: &Rows) -> Vec<PlanNode> {
     let get = |row: &Vec<Option<String>>, n: &str| col(n).and_then(|i| row.get(i).cloned().flatten());
     let items = r.1.iter().map(|row| {
         let op = [get(row, "OPERATION"), get(row, "OPTIONS")].into_iter().flatten().collect::<Vec<_>>().join(" ");
-        let mut n = PlanNode { op, cost: get(row, "COST").and_then(|v| v.parse().ok()), rows: get(row, "CARDINALITY").and_then(|v| v.parse().ok()), ..Default::default() };
+        let mut n = PlanNode {
+            op,
+            cost: get(row, "COST").and_then(|v| v.parse().ok()),
+            rows: get(row, "CARDINALITY").and_then(|v| v.parse().ok()),
+            ..Default::default()
+        };
         if let Some(name) = get(row, "OBJECT_NAME") {
             n.object = Some(format!("on {}{name}", get(row, "OBJECT_OWNER").map(|o| format!("{o}.")).unwrap_or_default()));
         }
-        for (k, label) in [("ACCESS_PREDICATES", "Access"), ("FILTER_PREDICATES", "Filter"), ("BYTES", "Bytes"), ("PARTITION_START", "Partition start"), ("PARTITION_STOP", "Partition stop")] {
+        for (k, label) in [
+            ("ACCESS_PREDICATES", "Access"),
+            ("FILTER_PREDICATES", "Filter"),
+            ("BYTES", "Bytes"),
+            ("PARTITION_START", "Partition start"),
+            ("PARTITION_STOP", "Partition stop"),
+        ] {
             if let Some(v) = get(row, k) {
                 n.extra.push((label.into(), v));
             }
@@ -452,7 +490,13 @@ fn by_parent(items: impl Iterator<Item = (String, String, PlanNode)>, root: &str
         }
     }
     let nodes: Vec<Arc<parking_lot::Mutex<Option<PlanNode>>>> = items.iter().map(|(_, _, n)| Arc::new(parking_lot::Mutex::new(Some(n.clone())))).collect();
-    fn build(i: usize, items: &[(String, String, PlanNode)], kids: &HashMap<String, Vec<usize>>, nodes: &[Arc<parking_lot::Mutex<Option<PlanNode>>>], depth: usize) -> PlanNode {
+    fn build(
+        i: usize,
+        items: &[(String, String, PlanNode)],
+        kids: &HashMap<String, Vec<usize>>,
+        nodes: &[Arc<parking_lot::Mutex<Option<PlanNode>>>],
+        depth: usize,
+    ) -> PlanNode {
         let mut n = nodes[i].lock().take().unwrap_or_default();
         if depth < 200 {
             for &k in kids.get(&items[i].0).map(Vec::as_slice).unwrap_or(&[]) {
@@ -506,7 +550,12 @@ mod tests {
     #[test]
     fn builds_trees_from_parent_ids() {
         let n = |op: &str| PlanNode { op: op.into(), ..Default::default() };
-        let items = vec![("0".into(), "-".into(), n("SELECT STATEMENT")), ("1".into(), "0".into(), n("HASH JOIN")), ("2".into(), "1".into(), n("TABLE ACCESS FULL")), ("3".into(), "1".into(), n("INDEX UNIQUE SCAN"))];
+        let items = vec![
+            ("0".into(), "-".into(), n("SELECT STATEMENT")),
+            ("1".into(), "0".into(), n("HASH JOIN")),
+            ("2".into(), "1".into(), n("TABLE ACCESS FULL")),
+            ("3".into(), "1".into(), n("INDEX UNIQUE SCAN")),
+        ];
         let r = by_parent(items.into_iter(), "-");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].children[0].children.iter().map(|c| c.op.as_str()).collect::<Vec<_>>(), ["TABLE ACCESS FULL", "INDEX UNIQUE SCAN"]);

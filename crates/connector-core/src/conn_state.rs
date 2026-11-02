@@ -57,10 +57,9 @@ impl ConnState {
             _ => {}
         }
         // Session state.
-        let session_kw = matches!(
-            kw.as_str(),
-            "SET" | "USE" | "RESET" | "DISCARD" | "PREPARE" | "DECLARE" | "LOCK" | "LISTEN" | "SAVEPOINT" | "XA" | "ATTACH" | "PRAGMA"
-        ) && !(mssql && kw == "DECLARE"); // T-SQL variables live for one batch
+        let session_kw =
+            matches!(kw.as_str(), "SET" | "USE" | "RESET" | "DISCARD" | "PREPARE" | "DECLARE" | "LOCK" | "LISTEN" | "SAVEPOINT" | "XA" | "ATTACH" | "PRAGMA")
+                && !(mssql && kw == "DECLARE"); // T-SQL variables live for one batch
         let temp = has(&["TEMP", "TEMPORARY", "SET_CONFIG", "PG_ADVISORY_LOCK", "GET_LOCK", "SP_SET_SESSION_CONTEXT", "IMPLICIT_TRANSACTIONS"])
             || (mssql && sql.contains('#'))
             || (kind == ConnectorKind::Mysql && sql.contains(":="));
@@ -102,7 +101,11 @@ mod tests {
     #[test]
     fn reads_and_writes_keep_the_connection_replaceable() {
         for k in [Postgres, Mysql, Mssql] {
-            assert_eq!(after(k, &["select * from t", "update t set a = 1 where id = 2", "insert into t values (1)", "with x as (select 1) select * from x"]), (true, false), "{k:?}");
+            assert_eq!(
+                after(k, &["select * from t", "update t set a = 1 where id = 2", "insert into t values (1)", "with x as (select 1) select * from x"]),
+                (true, false),
+                "{k:?}"
+            );
         }
         assert_eq!(after(Mssql, &["declare @n int = 5; select top (@n) * from t"]), (true, false));
     }

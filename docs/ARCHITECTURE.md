@@ -222,7 +222,7 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 ```
 
 - `RunRequest` names the connection, tab, SQL, row limit, origin (`user`, `ai`, `mcp`, `job`), an optional output name and an optional `session_key`. Notebook cells use `session_key = nb:{notebook}`, so all cells share one database session and temp tables carry across cells.
-- Sessions are per tab (`sessions.rs`). They support manual commit with Commit and Rollback, are closed after an idle timeout, and are reopened on demand. AI and MCP use their own sessions; DuckDB sessions for AI and MCP run sandboxed (`enable_external_access = false`, `lock_configuration = true`) unless the connection allows external access.
+- Sessions are per tab (`sessions.rs`). They support manual commit with Commit and Rollback, are closed after an idle timeout, and are reopened on demand. Opening one is bounded by the connect timeout (the connection's `connect_timeout_secs` option, else the setting; idle closing likewise reads `idle_disconnect_minutes` per connection, `0` = never; `SESSION_OPTIONS` are left out of the cache identity). It covers the tunnel, the credential read and the handshake, not browser sign-in or local files. `Connector::prepare` does one-time local setup first, outside that limit (the Oracle thin driver's download). AI and MCP use their own sessions; DuckDB sessions for AI and MCP run sandboxed (`enable_external_access = false`, `lock_configuration = true`) unless the connection allows external access.
 - `run_and_wait` is the same run for the AI, MCP and job steps. Its outcome comes on a channel of its own, so a lagging event subscriber can't lose the end of a run.
 - `connect.rs` resolves credentials, opens the SSH tunnel and applies the connect timeout. `probe.rs` does a DNS and TCP check first so a test tells "unknown host", "refused" and "no answer" apart.
 - Every run is written to `query_history` with its origin.
@@ -272,7 +272,7 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 
 ## 11. Lineage
 
-`crates/lineage` parses SQL with `sqlparser` in the connection's dialect and traces columns through CTEs, subqueries, joins, set operations and multi-statement scripts (`CREATE TABLE AS`, `INSERT ... SELECT`, `UPDATE ... FROM`, `MERGE`, ...). Table columns come from the explorer cache or a describe. Names it can't place become warnings instead of guesses. The UI lays out the diagram and its exports itself (`ui/src/lib/lineageLayout.ts`, `lineageExport.ts`).
+`crates/lineage` parses SQL with `sqlparser` in the connection's dialect and traces columns through CTEs, subqueries, joins, set operations and multi-statement scripts (`CREATE TABLE AS`, `INSERT ... SELECT`, `UPDATE ... FROM`, `MERGE`, ...). Table columns come from the explorer cache or a describe. With "Check with database", the app also reads the DDL of views the SQL reads (`CatalogTable::view_sql`), in rounds so views of views follow, and the crate traces a view's definition into the view's columns; that SQL gets no editor spans. Names it can't place become warnings instead of guesses. The UI lays out the diagram and its exports itself (`ui/src/lib/lineageLayout.ts`, `lineageExport.ts`).
 
 ---
 
@@ -280,7 +280,9 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 
 A job is a graph of steps stored in the `jobs` table. Each step runs a query, loads its upstream rows into a connection, or saves them to a file through DuckDB `COPY`. `crates/app/src/jobs.rs` runs the graph: independent branches run at the same time, a failure skips the steps after it, and each run keeps a log of up to 5,000 lines. Step results are outputs named after the step (`results.<step>`).
 
-Steps whose SQL the AI assistant or an MCP client wrote carry `JobNode::ai_sql` (set by `create_job` and `update_job`; a user save keeps it only while the SQL is unchanged). Such steps, and every step of a run the assistant starts, run with `Origin::Ai`, so the DuckDB sandbox applies on the schedule and by hand too, not only when the assistant started the run. Load steps pass the origin in `LoadSpec`, so AI-written before/after SQL on a DuckDB target is sandboxed as well.
+Steps whose SQL the AI assistant or an MCP client wrote carry `JobNode::ai_sql` (set by `create_job` and `update_job`; a user save keeps it only while the SQL is unchanged, and may clear it but never set it). Jobs saved before the flag existed are marked once at workspace open (maintenance `ai_jobs_marked_v1`): every step of a job whose name an approved `create_job` or `update_job` audit entry records. Such steps, and every step of a run the assistant starts, run with `Origin::Ai`, so the DuckDB sandbox applies on the schedule and by hand too, not only when the assistant started the run. Load steps pass the origin in `LoadSpec`, so AI-written before/after SQL on a DuckDB target is sandboxed as well.
+
+Parameter sets (`param_sets` table, `crates/workspace/src/params.rs`) are named `:name` values shared by tabs, notebooks and jobs. A job keeps `params` and `param_set` in its spec; `jobs::effective_params` merges the set's values, the job's, then a run's `RunParams` (UI "Run with…", `databrain-jobs run --set/--param`, a resume replaying the resumed run's), records them on the run (`job_runs.params_json`) and passes them in every step's `RunRequest.params`; load before/after SQL is substituted the same way.
 
 The in-app scheduler runs due jobs while the app is open. With background jobs on, `crates/app/src/background.rs` installs an OS timer that starts `databrain-jobs tick` every minute. A lease in the workspace makes sure a job runs in only one process.
 
@@ -411,7 +413,7 @@ Auth is the `kiro-cli login` browser session (run in the user's terminal and det
 `databrain-mcp` serves `McpServer` from `crates/ai/src/mcp.rs`: hand-written JSON-RPC 2.0, one message per line on stdin and stdout, protocol version `2025-06-18` (the client's version is echoed when it sends one). Methods: `initialize`, `ping`, `tools/list`, `tools/call`; notifications are ignored.
 
 - Only connections with `mcp_enabled` (and AI on) are visible. Every tool takes a required `connection` argument, and tools carry MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`).
-- Requests are handled concurrently, so a tool call waiting for the user doesn't block the client's other messages, including the answer.
+- Requests are handled concurrently, so a tool call waiting for the user doesn't block the client's other messages, including the answer. `notifications/cancelled` stops the call it names: a question it waits on ends, a running query is cancelled on the server, and no response is sent for it.
 - When the policy says `Ask`, the server asks the user through the client with `elicitation/create` (the question and the SQL). Only an explicit accept with `approve = true` runs it. A call that carries `_meta.progressToken` gets a `notifications/progress` saying the question is waiting.
 - The wait is 2 minutes (`DATABRAIN_MCP_ELICIT_SECS`, 5 s to 1 h). A timeout ends the call with a message naming the fixes (auto-read, or `mcp_client_approves`) and marks the peer `unanswered`: later `Ask` decisions in that session are refused at once instead of waiting, since a client can declare elicitation and still not show prompts in its current mode.
 - A client without elicitation support gets a refusal, unless the connection sets `mcp_client_approves`; then the call runs and is audited as "approved by MCP client".

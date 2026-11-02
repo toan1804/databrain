@@ -15,9 +15,8 @@ use databrain_connector_core::documents::{Cell, Row, RowBatcher};
 use databrain_connector_core::traits::{NEO4J_NODES, NEO4J_RELATIONSHIPS};
 use databrain_connector_core::value::days_from_civil;
 use databrain_connector_core::{
-    Capabilities, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind,
-    ExecOptions, ExecSummary, FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, Value,
-    quote_ident,
+    Capabilities, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind, ExecOptions, ExecSummary,
+    FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, Value, quote_ident,
 };
 use neo4rs::{BoltMap, BoltType, ConfigBuilder, Graph, query};
 use secrecy::ExposeSecret;
@@ -110,6 +109,16 @@ impl Neo4jSession {
             out.push(r.to_strict::<BoltMap>().map_err(|e| ConnectorError::query(e.to_string()))?);
         }
         Ok(out)
+    }
+
+    /// Nodes with label `name` (or relationships of type `name`).
+    async fn count(&self, rel: bool, name: &str) -> Option<i64> {
+        let q = quote_ident(ConnectorKind::Neo4j, name);
+        let count_q = if rel { format!("MATCH ()-[r:{q}]->() RETURN count(r) AS c") } else { format!("MATCH (n:{q}) RETURN count(n) AS c") };
+        self.rows(query(&count_q)).await.ok().and_then(|r| match r.first().and_then(|m| get(m, "c")) {
+            Some(BoltType::Integer(i)) => Some(i.value),
+            _ => None,
+        })
     }
 
     async fn strings(&self, q: neo4rs::Query, key: &str) -> Result<Vec<String>> {
@@ -429,6 +438,14 @@ impl Session for Neo4jSession {
     }
 
     /// Properties from the schema procedures, the count, and constraints/indexes as DDL.
+    /// Nodes with the label / relationships of the type: from the count store, no scan.
+    async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
+        Ok(databrain_connector_core::TableLayout {
+            row_estimate: self.count(schema.eq_ignore_ascii_case(NEO4J_RELATIONSHIPS), name).await,
+            ..Default::default()
+        })
+    }
+
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let rel = schema.eq_ignore_ascii_case(NEO4J_RELATIONSHIPS);
         let q = quote_ident(ConnectorKind::Neo4j, name);
@@ -468,22 +485,31 @@ impl Session for Neo4jSession {
                 ColumnInfo { name: n, data_type: types.join(" | "), nullable: !mandatory, is_primary_key: false, default: None, comment: None }
             })
             .collect();
-        let count_q = if rel { format!("MATCH ()-[r:{q}]->() RETURN count(r) AS c") } else { format!("MATCH (n:{q}) RETURN count(n) AS c") };
-        let row_estimate = self.rows(query(&count_q)).await.ok().and_then(|r| match r.first().and_then(|m| get(m, "c")) {
-            Some(BoltType::Integer(i)) => Some(i.value),
-            _ => None,
-        });
+        let row_estimate = self.count(rel, name).await;
         let mut ddl: Vec<String> = Vec::new();
-        for show in ["SHOW CONSTRAINTS YIELD labelsOrTypes, createStatement WHERE $l IN labelsOrTypes RETURN createStatement", "SHOW INDEXES YIELD labelsOrTypes, owningConstraint, createStatement WHERE $l IN labelsOrTypes AND owningConstraint IS NULL RETURN createStatement"] {
+        for show in [
+            "SHOW CONSTRAINTS YIELD labelsOrTypes, createStatement WHERE $l IN labelsOrTypes RETURN createStatement",
+            "SHOW INDEXES YIELD labelsOrTypes, owningConstraint, createStatement WHERE $l IN labelsOrTypes AND owningConstraint IS NULL RETURN createStatement",
+        ] {
             if let Ok(s) = self.strings(query(show).param("l", name), "createStatement").await {
                 ddl.extend(s.into_iter().map(|x| format!("{x};")));
             }
         }
-        let object = DbObject { schema: schema.to_string(), name: name.to_string(), kind: if rel { ObjectKind::View } else { ObjectKind::Table }, comment: None, row_estimate };
+        let object = DbObject {
+            schema: schema.to_string(),
+            name: name.to_string(),
+            kind: if rel { ObjectKind::View } else { ObjectKind::Table },
+            comment: None,
+            row_estimate,
+        };
         Ok(ObjectDetail {
             object,
             columns,
-            ddl: Some(if ddl.is_empty() { format!("// No constraints or indexes on {}{q}", if rel { "relationship type " } else { ":" }) } else { ddl.join("\n") }),
+            ddl: Some(if ddl.is_empty() {
+                format!("// No constraints or indexes on {}{q}", if rel { "relationship type " } else { ":" })
+            } else {
+                ddl.join("\n")
+            }),
             foreign_keys: vec![],
         })
     }

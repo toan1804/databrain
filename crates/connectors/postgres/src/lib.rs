@@ -17,10 +17,9 @@ use async_trait::async_trait;
 use databrain_auth::{AuthMethodKind, Credential, CredentialSource};
 use databrain_connector_core::value::{Column, parse_date, parse_datetime, parse_time};
 use databrain_connector_core::{
-    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnState, ConnectionConfig, Connector, ConnectorError,
-    ConnectorInfo, ConnectorKind, DbObject, ExecOptions, ExecSummary, FieldSpec, ForeignKey, ObjectDetail,
-    ObjectKind, QueryStream, Result, SchemaInfo, Session, SslMode, StreamEvent, StreamSender, TableColumns,
-    Value,
+    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnState, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject,
+    ExecOptions, ExecSummary, FieldSpec, ForeignKey, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, SslMode, StreamEvent, StreamSender,
+    TableColumns, Value,
 };
 use futures::StreamExt;
 use postgres_native_tls::MakeTlsConnector;
@@ -46,9 +45,7 @@ fn tls_connector(mode: SslMode) -> Result<MakeTlsConnector> {
         b.danger_accept_invalid_certs(true);
         b.danger_accept_invalid_hostnames(true);
     }
-    let c = b
-        .build()
-        .map_err(|e| ConnectorError::config(format!("TLS setup failed: {e}")))?;
+    let c = b.build().map_err(|e| ConnectorError::config(format!("TLS setup failed: {e}")))?;
     Ok(MakeTlsConnector::new(c))
 }
 
@@ -71,13 +68,7 @@ impl Connector for PostgresConnector {
             default_port: Some(5432),
             uses_file: false,
             auth_methods: vec![AuthMethodKind::Password, AuthMethodKind::CloudCli],
-            capabilities: Capabilities {
-                transactions: true,
-                cancel: true,
-                schemas: true,
-                read_only_sessions: true,
-                ssh: true,
-            },
+            capabilities: Capabilities { transactions: true, cancel: true, schemas: true, read_only_sessions: true, ssh: true },
             fields: vec![
                 FieldSpec::new("flavor", "Database type"),
                 FieldSpec::new("host", "Host").required().placeholder("localhost"),
@@ -86,7 +77,9 @@ impl Connector for PostgresConnector {
                 FieldSpec::new("cluster_id", "Cluster ID").placeholder("from the host").help("IAM sign-in, provisioned clusters"),
                 FieldSpec::new("workgroup", "Workgroup").placeholder("from the host").help("IAM sign-in, Redshift Serverless"),
                 FieldSpec::new("aws_region", "AWS region").placeholder("from the host or profile"),
-                FieldSpec::new("db_user", "Database user").placeholder("the IAM identity's own").help("IAM sign-in to a cluster as this user (redshift:GetClusterCredentials)"),
+                FieldSpec::new("db_user", "Database user")
+                    .placeholder("the IAM identity's own")
+                    .help("IAM sign-in to a cluster as this user (redshift:GetClusterCredentials)"),
             ],
             note: None,
         }
@@ -113,11 +106,7 @@ impl Connector for PostgresConnector {
         databrain_auth::AuthContext { cli: Some(databrain_auth::CliKind::Redshift(t)), ..Default::default() }
     }
 
-    async fn connect(
-        &self,
-        cfg: &ConnectionConfig,
-        creds: Arc<dyn CredentialSource>,
-    ) -> Result<Box<dyn Session>> {
+    async fn connect(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>> {
         let redshift = redshift_flavor(cfg);
         let mut pg = tokio_postgres::Config::new();
         pg.host(cfg.host_or_default())
@@ -235,7 +224,9 @@ impl Link {
     /// stops sending when its socket goes away). False when no new
     /// connection could be opened; nothing changes then.
     async fn replace(&self, old: &Arc<Client>) -> bool {
-        let Ok(Ok((client, task))) = tokio::time::timeout(Duration::from_secs(15), open_link(&self.pg, self.tls.clone(), self.init.as_deref(), self.temporary)).await else {
+        let Ok(Ok((client, task))) =
+            tokio::time::timeout(Duration::from_secs(15), open_link(&self.pg, self.tls.clone(), self.init.as_deref(), self.temporary)).await
+        else {
             return false;
         };
         let mut cur = self.current.write().unwrap_or_else(|e| e.into_inner());
@@ -270,9 +261,7 @@ fn map_err(e: &tokio_postgres::Error) -> ConnectorError {
         if code == "57014" {
             return ConnectorError::cancelled();
         }
-        return ConnectorError::query(msg)
-            .with_code(code)
-            .with_position(pos);
+        return ConnectorError::query(msg).with_code(code).with_position(pos);
     }
     if e.is_closed() {
         return ConnectorError::connection("connection closed");
@@ -355,27 +344,12 @@ fn parse_text(t: ColType, s: &str) -> Value {
     match t {
         ColType::Bool => Value::Bool(s == "t"),
         ColType::Int64 => s.parse().map(Value::Int).unwrap_or_else(|_| Value::Text(s.into())),
-        ColType::Float64 => s
-            .parse()
-            .map(Value::Float)
-            .unwrap_or_else(|_| Value::Text(s.into())),
-        ColType::Binary => decode_bytea(s)
-            .map(Value::Bytes)
-            .unwrap_or_else(|| Value::Text(s.into())),
-        ColType::Date => parse_date(s)
-            .filter(|_| !s.ends_with("BC"))
-            .map(Value::Date)
-            .unwrap_or_else(|| Value::Text(s.into())),
-        ColType::Timestamp => parse_datetime(s)
-            .filter(|_| !s.ends_with("BC"))
-            .map(Value::Timestamp)
-            .unwrap_or_else(|| Value::Text(s.into())),
-        ColType::TimestampTz => parse_timestamptz(s)
-            .map(Value::TimestampTz)
-            .unwrap_or_else(|| Value::Text(s.into())),
-        ColType::Time => parse_time(s)
-            .map(Value::Time)
-            .unwrap_or_else(|| Value::Text(s.into())),
+        ColType::Float64 => s.parse().map(Value::Float).unwrap_or_else(|_| Value::Text(s.into())),
+        ColType::Binary => decode_bytea(s).map(Value::Bytes).unwrap_or_else(|| Value::Text(s.into())),
+        ColType::Date => parse_date(s).filter(|_| !s.ends_with("BC")).map(Value::Date).unwrap_or_else(|| Value::Text(s.into())),
+        ColType::Timestamp => parse_datetime(s).filter(|_| !s.ends_with("BC")).map(Value::Timestamp).unwrap_or_else(|| Value::Text(s.into())),
+        ColType::TimestampTz => parse_timestamptz(s).map(Value::TimestampTz).unwrap_or_else(|| Value::Text(s.into())),
+        ColType::Time => parse_time(s).map(Value::Time).unwrap_or_else(|| Value::Text(s.into())),
         _ => Value::Text(s.to_string()),
     }
 }
@@ -385,10 +359,7 @@ fn decode_bytea(s: &str) -> Option<Vec<u8>> {
     if hex.len() % 2 != 0 {
         return None;
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-        .collect()
+    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect()
 }
 
 /// Parse `YYYY-MM-DD HH:MM:SS[.f]+HH[:MM[:SS]]` into UTC microseconds.
@@ -396,11 +367,7 @@ fn parse_timestamptz(s: &str) -> Option<i64> {
     if s.ends_with("BC") {
         return None;
     }
-    let idx = s
-        .char_indices()
-        .skip(11)
-        .find(|(_, c)| *c == '+' || *c == '-')
-        .map(|(i, _)| i)?;
+    let idx = s.char_indices().skip(11).find(|(_, c)| *c == '+' || *c == '-').map(|(i, _)| i)?;
     let (dt, off) = s.split_at(idx);
     let local = parse_datetime(dt)?;
     let sign = if off.starts_with('-') { -1 } else { 1 };
@@ -412,13 +379,7 @@ fn parse_timestamptz(s: &str) -> Option<i64> {
     Some(local - offset_us)
 }
 
-async fn run(
-    link: Arc<Link>,
-    sql: String,
-    opts: ExecOptions,
-    tx: StreamSender,
-    finished: Arc<AtomicBool>,
-) -> Result<()> {
+async fn run(link: Arc<Link>, sql: String, opts: ExecOptions, tx: StreamSender, finished: Arc<AtomicBool>) -> Result<()> {
     link.state.observe(&sql, ConnectorKind::Postgres);
     let client = link.client();
     let stmt = client.prepare(&sql).await.map_err(|e| map_err(&e))?;
@@ -430,18 +391,11 @@ async fn run(
             SimpleQueryMessage::CommandComplete(n) => Some(*n),
             _ => None,
         });
-        tx.send(StreamEvent::Done(ExecSummary {
-            rows_affected: affected,
-        }))
-        .await;
+        tx.send(StreamEvent::Done(ExecSummary { rows_affected: affected })).await;
         return Ok(());
     }
 
-    let columns: Vec<Column> = stmt
-        .columns()
-        .iter()
-        .map(|c| Column::new(c.name(), col_type(c.type_()), type_name(c.type_(), c.type_modifier())))
-        .collect();
+    let columns: Vec<Column> = stmt.columns().iter().map(|c| Column::new(c.name(), col_type(c.type_()), type_name(c.type_(), c.type_modifier()))).collect();
     let types: Vec<ColType> = columns.iter().map(|c| c.col_type).collect();
     // PostGIS: hex EWKB becomes EWKT.
     let geo: Vec<bool> = stmt.columns().iter().map(|c| matches!(c.type_().name(), "geometry" | "geography")).collect();
@@ -520,11 +474,8 @@ async fn run(
         return Ok(());
     }
     if builder.coercion_failures() > 0 {
-        tx.send(StreamEvent::Notice(format!(
-            "{} value(s) could not be converted (e.g. infinity dates) and are shown as NULL",
-            builder.coercion_failures()
-        )))
-        .await;
+        tx.send(StreamEvent::Notice(format!("{} value(s) could not be converted (e.g. infinity dates) and are shown as NULL", builder.coercion_failures())))
+            .await;
     }
     tx.send(StreamEvent::Done(ExecSummary::default())).await;
     Ok(())
@@ -537,11 +488,7 @@ impl Session for PgSession {
     }
 
     async fn server_version(&self) -> Result<String> {
-        let row = self
-            .client()
-            .query_one("select version()", &[])
-            .await
-            .map_err(|e| map_err(&e))?;
+        let row = self.client().query_one("select version()", &[]).await.map_err(|e| map_err(&e))?;
         Ok(row.get(0))
     }
 
@@ -550,11 +497,7 @@ impl Session for PgSession {
     }
 
     async fn ping(&self) -> Result<()> {
-        self.client()
-            .simple_query("select 1")
-            .await
-            .map(|_| ())
-            .map_err(|e| map_err(&e))
+        self.client().simple_query("select 1").await.map(|_| ()).map_err(|e| map_err(&e))
     }
 
     async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
@@ -613,14 +556,7 @@ impl Session for PgSession {
             )
             .await
             .map_err(|e| map_err(&e))?;
-        Ok(rows
-            .iter()
-            .map(|r| SchemaInfo {
-                name: r.get(0),
-                is_default: r.get::<_, Option<bool>>(1).unwrap_or(false),
-                catalog: None,
-            })
-            .collect())
+        Ok(rows.iter().map(|r| SchemaInfo { name: r.get(0), is_default: r.get::<_, Option<bool>>(1).unwrap_or(false), catalog: None }).collect())
     }
 
     async fn schema_object_counts(&self) -> Result<Option<std::collections::HashMap<String, usize>>> {
@@ -642,7 +578,8 @@ impl Session for PgSession {
     async fn search_objects(&self, query: &str, limit: usize) -> Result<Vec<DbObject>> {
         if self.redshift {
             let term = databrain_connector_core::search_sql_term(query);
-            let mut hits: Vec<DbObject> = self.rs_search_objects(&term).await?.into_iter().filter(|o| databrain_connector_core::object_matches(query, &o.schema, &o.name)).collect();
+            let mut hits: Vec<DbObject> =
+                self.rs_search_objects(&term).await?.into_iter().filter(|o| databrain_connector_core::object_matches(query, &o.schema, &o.name)).collect();
             databrain_connector_core::rank_matches(query, &mut hits, limit);
             return Ok(hits);
         }
@@ -939,7 +876,7 @@ impl Session for PgSession {
         if self.redshift {
             return self.rs_table_layout(schema, name).await;
         }
-        use databrain_connector_core::{group_indexes, parse_call_list, query_text, quote_literal, truthy, TableLayout};
+        use databrain_connector_core::{TableLayout, group_indexes, parse_call_list, query_text, quote_literal, truthy};
         let (s, t) = (quote_literal(schema), quote_literal(name));
         let idx = query_text(
             self,
@@ -969,7 +906,8 @@ impl Session for PgSession {
             self,
             &format!(
                 "select case when c.relkind = 'p' then pg_catalog.pg_get_partkeydef(c.oid) end, c.reltuples::bigint, \
-                        (select count(*) from pg_catalog.pg_inherits h where h.inhparent = c.oid) \
+                        (select count(*) from pg_catalog.pg_inherits h where h.inhparent = c.oid), \
+                        pg_catalog.pg_total_relation_size(c.oid) \
                  from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
                  where n.nspname = {s} and c.relname = {t}"
             ),
@@ -985,6 +923,7 @@ impl Session for PgSession {
                 }
             }
             l.row_estimate = r[1].as_deref().and_then(|x| x.parse().ok()).filter(|n: &i64| *n >= 0);
+            l.size_bytes = r.get(3).and_then(|x| x.as_deref()).and_then(|x| x.parse().ok()).filter(|n: &i64| *n > 0);
         }
         Ok(l)
     }
@@ -1032,37 +971,15 @@ impl Session for PgSession {
             .map_err(|e| map_err(&e))?;
         let columns: Vec<ColumnInfo> = cols
             .iter()
-            .map(|r| ColumnInfo {
-                name: r.get(0),
-                data_type: r.get(1),
-                nullable: r.get(2),
-                is_primary_key: r.get(3),
-                default: r.get(4),
-                comment: r.get(5),
-            })
+            .map(|r| ColumnInfo { name: r.get(0), data_type: r.get(1), nullable: r.get(2), is_primary_key: r.get(3), default: r.get(4), comment: r.get(5) })
             .collect();
 
         let ddl = match kind {
             ObjectKind::View | ObjectKind::MaterializedView => {
-                let def: Option<String> = self
-                    .client()
-                    .query_one("select pg_catalog.pg_get_viewdef($1::oid, true)", &[&oid])
-                    .await
-                    .map_err(|e| map_err(&e))?
-                    .get(0);
-                let kw = if kind == ObjectKind::View {
-                    "VIEW"
-                } else {
-                    "MATERIALIZED VIEW"
-                };
-                def.map(|d| {
-                    format!(
-                        "CREATE {kw} {}.{} AS\n{}",
-                        quote(schema),
-                        quote(name),
-                        d.trim_end()
-                    )
-                })
+                let def: Option<String> =
+                    self.client().query_one("select pg_catalog.pg_get_viewdef($1::oid, true)", &[&oid]).await.map_err(|e| map_err(&e))?.get(0);
+                let kw = if kind == ObjectKind::View { "VIEW" } else { "MATERIALIZED VIEW" };
+                def.map(|d| format!("CREATE {kw} {}.{} AS\n{}", quote(schema), quote(name), d.trim_end()))
             }
             _ => Some(table_ddl(schema, name, &columns)),
         };
@@ -1155,14 +1072,7 @@ impl Session for PgSession {
         let mut out: Vec<TableColumns> = Vec::new();
         for r in rows {
             let table: String = r.get(0);
-            let col = ColumnInfo {
-                name: r.get(1),
-                data_type: r.get(2),
-                nullable: r.get(3),
-                is_primary_key: r.get(4),
-                default: None,
-                comment: r.get(5),
-            };
+            let col = ColumnInfo { name: r.get(1), data_type: r.get(2), nullable: r.get(3), is_primary_key: r.get(4), default: None, comment: r.get(5) };
             match out.last_mut() {
                 Some(t) if t.table == table => t.columns.push(col),
                 _ => out.push(TableColumns { table, columns: vec![col], foreign_keys: vec![] }),
@@ -1209,13 +1119,7 @@ impl PgSession {
                 };
                 let est: Option<f64> = r.get(3);
                 let est = est.filter(|_| kind != ObjectKind::Sequence);
-                DbObject {
-                    schema: schema.to_string(),
-                    name: r.get(0),
-                    kind,
-                    comment: r.get(2),
-                    row_estimate: est.filter(|e| *e >= 0.0).map(|e| e as i64),
-                }
+                DbObject { schema: schema.to_string(), name: r.get(0), kind, comment: r.get(2), row_estimate: est.filter(|e| *e >= 0.0).map(|e| e as i64) }
             })
             .collect();
 
@@ -1235,11 +1139,7 @@ impl PgSession {
         out.extend(funcs.iter().map(|r| DbObject {
             schema: schema.to_string(),
             name: r.get(0),
-            kind: if r.get::<_, String>(1) == "p" {
-                ObjectKind::Procedure
-            } else {
-                ObjectKind::Function
-            },
+            kind: if r.get::<_, String>(1) == "p" { ObjectKind::Procedure } else { ObjectKind::Function },
             comment: None,
             row_estimate: None,
         }));
@@ -1334,7 +1234,11 @@ impl PgSession {
         Ok(rows
             .iter()
             .map(|r| {
-                (r.get::<_, String>(0), r.get::<_, String>(1), ForeignKey { columns: r.get(2), ref_schema: r.get(3), ref_table: r.get(4), ref_columns: r.get(5) })
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, String>(1),
+                    ForeignKey { columns: r.get(2), ref_schema: r.get(3), ref_table: r.get(4), ref_columns: r.get(5) },
+                )
             })
             .collect())
     }
@@ -1362,12 +1266,7 @@ impl PgSession {
             .map_err(|e| map_err(&e))?;
         Ok(rows
             .iter()
-            .map(|r| {
-                (
-                    r.get::<_, String>(0),
-                    ForeignKey { columns: r.get(1), ref_schema: r.get(2), ref_table: r.get(3), ref_columns: r.get(4) },
-                )
-            })
+            .map(|r| (r.get::<_, String>(0), ForeignKey { columns: r.get(1), ref_schema: r.get(2), ref_table: r.get(3), ref_columns: r.get(4) }))
             .collect())
     }
 }
@@ -1392,20 +1291,11 @@ fn table_ddl(schema: &str, name: &str, columns: &[ColumnInfo]) -> String {
             l
         })
         .collect();
-    let pk: Vec<String> = columns
-        .iter()
-        .filter(|c| c.is_primary_key)
-        .map(|c| quote(&c.name))
-        .collect();
+    let pk: Vec<String> = columns.iter().filter(|c| c.is_primary_key).map(|c| quote(&c.name)).collect();
     if !pk.is_empty() {
         lines.push(format!("    PRIMARY KEY ({})", pk.join(", ")));
     }
-    format!(
-        "CREATE TABLE {}.{} (\n{}\n);",
-        quote(schema),
-        quote(name),
-        lines.join(",\n")
-    )
+    format!("CREATE TABLE {}.{} (\n{}\n);", quote(schema), quote(name), lines.join(",\n"))
 }
 
 #[cfg(test)]
@@ -1431,24 +1321,15 @@ mod tests {
     fn parses_timestamptz_offsets() {
         let base = parse_datetime("2024-03-05 06:04:05").unwrap();
         assert_eq!(parse_timestamptz("2024-03-05 13:04:05+07"), Some(base));
-        assert_eq!(
-            parse_timestamptz("2024-03-05 00:34:05-05:30"),
-            Some(base)
-        );
+        assert_eq!(parse_timestamptz("2024-03-05 00:34:05-05:30"), Some(base));
         assert_eq!(parse_timestamptz("infinity"), None);
     }
     #[test]
     fn parses_text_values() {
         assert_eq!(parse_text(ColType::Bool, "t"), Value::Bool(true));
         assert_eq!(parse_text(ColType::Int64, "42"), Value::Int(42));
-        assert_eq!(
-            parse_text(ColType::Binary, "\\x00ff"),
-            Value::Bytes(vec![0, 255])
-        );
-        assert_eq!(
-            parse_text(ColType::Date, "infinity"),
-            Value::Text("infinity".into())
-        );
+        assert_eq!(parse_text(ColType::Binary, "\\x00ff"), Value::Bytes(vec![0, 255]));
+        assert_eq!(parse_text(ColType::Date, "infinity"), Value::Text("infinity".into()));
     }
 
     async fn live_session() -> Option<Box<dyn Session>> {
@@ -1459,7 +1340,8 @@ mod tests {
         cfg.host = Some(host);
         cfg.port = std::env::var("DATABRAIN_PG_PORT").ok().and_then(|p| p.parse().ok());
         cfg.database = std::env::var("DATABRAIN_PG_DB").ok();
-        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_PG_PASSWORD").ok().map(secrecy::SecretString::from)));
+        let creds =
+            Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_PG_PASSWORD").ok().map(secrecy::SecretString::from)));
         Some(PostgresConnector.connect(&cfg, creds).await.unwrap())
     }
 
@@ -1486,7 +1368,16 @@ mod tests {
             run(stmt.to_string()).await;
         }
         let ddl = s.object_ddl("kb_ddl", "orders", ObjectKind::Table).await.unwrap().unwrap();
-        for part in ["CREATE TABLE kb_ddl.orders", "PRIMARY KEY (id, created_at)", "FOREIGN KEY (customer_id) REFERENCES kb_ddl.customers(id) ON DELETE CASCADE", "CHECK", "PARTITION BY RANGE (created_at)", "CREATE INDEX orders_status_idx", "COMMENT ON TABLE kb_ddl.orders IS 'Web orders'", "IS 'it''s the state'"] {
+        for part in [
+            "CREATE TABLE kb_ddl.orders",
+            "PRIMARY KEY (id, created_at)",
+            "FOREIGN KEY (customer_id) REFERENCES kb_ddl.customers(id) ON DELETE CASCADE",
+            "CHECK",
+            "PARTITION BY RANGE (created_at)",
+            "CREATE INDEX orders_status_idx",
+            "COMMENT ON TABLE kb_ddl.orders IS 'Web orders'",
+            "IS 'it''s the state'",
+        ] {
             assert!(ddl.contains(part), "missing {part:?} in\n{ddl}");
         }
         // It runs: drop and recreate from the DDL.
@@ -1522,11 +1413,15 @@ mod tests {
         cfg.database = std::env::var("DATABRAIN_REDSHIFT_DB").ok();
         cfg.options.insert("flavor".into(), "redshift".into());
         cfg.ssl_mode = SslMode::Require;
-        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_REDSHIFT_PASSWORD").ok().map(secrecy::SecretString::from)));
+        let creds = Arc::new(InlineCredentialSource::new(
+            AuthMethod::Password { user },
+            std::env::var("DATABRAIN_REDSHIFT_PASSWORD").ok().map(secrecy::SecretString::from),
+        ));
         let s = PostgresConnector.connect(&cfg, creds).await.unwrap();
         assert!(s.server_version().await.unwrap().contains("Redshift"));
         let s = &s;
-        let run = |sql: &'static str| async move { s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap_or_else(|e| panic!("{sql}: {e}")) };
+        let run =
+            |sql: &'static str| async move { s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap_or_else(|e| panic!("{sql}: {e}")) };
         run("drop schema if exists databrain_rs cascade").await;
         run("create schema databrain_rs").await;
         run("create table databrain_rs.customers (id int primary key, name varchar(40)) diststyle all").await;
@@ -1593,7 +1488,8 @@ mod tests {
         };
         run("drop schema if exists ex_a cascade; drop schema if exists ex_b cascade").await;
         run("create schema ex_a; create schema ex_b; create table ex_a.t1 (id int primary key); create table ex_a.t2 (x int); \
-             create view ex_a.v1 as select * from ex_a.t1; create sequence ex_a.s1; create table ex_b.other (y int)").await;
+             create view ex_a.v1 as select * from ex_a.t1; create sequence ex_a.s1; create table ex_b.other (y int)")
+        .await;
         let fp = |m: &std::collections::HashMap<String, String>, k: &str| m.get(k).cloned().unwrap();
         let f0 = s.explorer_fingerprints().await.unwrap().unwrap();
         assert_eq!(fp(&f0, "ex_a"), fp(&s.explorer_fingerprints().await.unwrap().unwrap(), "ex_a"), "stable");
@@ -1647,7 +1543,8 @@ mod tests {
              comment on table kb_a.customers is 'People'; \
              create table kb_b.orders (id int primary key, customer_id int references kb_a.customers(id), total numeric(10,2)); \
              create view kb_b.big_orders as select * from kb_b.orders where total > 100; \
-             create table kb_c.untouched (x int)").await;
+             create table kb_c.untouched (x int)")
+        .await;
         let m = s.bulk_metadata(&["kb_a".into(), "kb_b".into()]).await.unwrap();
         assert_eq!(m[0].objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["customers"]);
         assert_eq!(m[0].objects[0].comment.as_deref(), Some("People"));
@@ -1695,16 +1592,10 @@ mod tests {
         cfg.host = Some(host);
         cfg.port = std::env::var("DATABRAIN_PG_PORT").ok().and_then(|p| p.parse().ok());
         cfg.database = std::env::var("DATABRAIN_PG_DB").ok();
-        let creds = Arc::new(InlineCredentialSource::new(
-            AuthMethod::Password { user },
-            pw.map(secrecy::SecretString::from),
-        ));
+        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, pw.map(secrecy::SecretString::from)));
         let s = PostgresConnector.connect(&cfg, creds).await.unwrap();
         let r = s
-            .execute(
-                "select 1::int as a, 'x'::text as b, now() as c, 1.5::numeric as d, null::date as e",
-                ExecOptions::default(),
-            )
+            .execute("select 1::int as a, 'x'::text as b, now() as c, 1.5::numeric as d, null::date as e", ExecOptions::default())
             .await
             .unwrap()
             .collect()
@@ -1712,17 +1603,7 @@ mod tests {
             .unwrap();
         assert_eq!(r.num_rows(), 1);
         let cancel = databrain_connector_core::CancellationToken::new();
-        let stream = s
-            .execute(
-                "select pg_sleep(30)",
-                ExecOptions {
-                    batch_size: 10,
-                    cancel: cancel.clone(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        let stream = s.execute("select pg_sleep(30)", ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         cancel.cancel();
         assert!(stream.collect().await.unwrap_err().is_cancelled());
@@ -1730,7 +1611,12 @@ mod tests {
         // Indexes + partition key for query hints.
         let run = |sql: &'static str| s.execute(sql, ExecOptions::default());
         run("drop table if exists databrain_layout_t").await.unwrap().collect().await.unwrap();
-        run("create table databrain_layout_t (id int, day date not null, cust text, primary key (id, day)) partition by range (day)").await.unwrap().collect().await.unwrap();
+        run("create table databrain_layout_t (id int, day date not null, cust text, primary key (id, day)) partition by range (day)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         run("create index databrain_layout_i on databrain_layout_t (cust, lower(cust))").await.unwrap().collect().await.unwrap();
         let l = s.table_layout("public", "databrain_layout_t").await.unwrap();
         run("drop table databrain_layout_t").await.unwrap().collect().await.unwrap();

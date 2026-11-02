@@ -8,6 +8,8 @@ use chrono::{Datelike, Duration, Local, NaiveTime, TimeZone};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
+
 use crate::{Error, Result, Workspace, new_id, now_ms};
 
 /// Run history kept per job.
@@ -69,12 +71,15 @@ pub enum LoadMode {
     /// Update rows whose `key_columns` match and insert the others (upsert);
     /// the table must exist.
     Merge,
+    /// Make the table hold exactly the rows by key: Merge, then delete the
+    /// table's rows whose key isn't among the rows. The table must exist.
+    Sync,
 }
 
 impl LoadMode {
     /// Modes matching rows by `key_columns`.
     pub fn needs_keys(self) -> bool {
-        matches!(self, LoadMode::Update | LoadMode::Merge)
+        matches!(self, LoadMode::Update | LoadMode::Merge | LoadMode::Sync)
     }
     /// Modes writing into a table that must already exist.
     pub fn needs_table(self) -> bool {
@@ -242,7 +247,8 @@ pub struct JobNode {
     /// assistant or an MCP client. Such a step runs as the AI's SQL whoever
     /// starts the run (by hand, on the schedule, from the command line): on
     /// DuckDB the AI sandbox applies. Set when the AI creates or changes the
-    /// step; a step the user changes becomes the user's.
+    /// step; a step the user changes becomes the user's, and the user can
+    /// clear it ("Trust this SQL"), never set it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[ts(as = "Option<bool>", optional)]
     pub ai_sql: bool,
@@ -394,6 +400,14 @@ pub struct Job {
     #[serde(default)]
     #[ts(as = "Option<f64>")]
     pub last_scheduled_at: Option<i64>,
+    /// Values of the steps' `:name` parameters (over those of `param_set`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[ts(as = "Option<BTreeMap<String, databrain_connector_core::sql::ParamValue>>", optional)]
+    pub params: BTreeMap<String, databrain_connector_core::sql::ParamValue>,
+    /// Saved parameter set (id) whose values the steps get.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub param_set: Option<String>,
     #[serde(default)]
     #[ts(as = "f64")]
     pub created_at: i64,
@@ -455,6 +469,10 @@ pub struct JobRun {
     pub status: String,
     pub nodes: Vec<NodeRunRecord>,
     pub error: Option<String>,
+    /// `:name` values the steps got (a resume runs with the same).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[ts(as = "Option<BTreeMap<String, databrain_connector_core::sql::ParamValue>>", optional)]
+    pub params: BTreeMap<String, databrain_connector_core::sql::ParamValue>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -465,6 +483,22 @@ struct Spec {
     edges: Vec<JobEdge>,
     #[serde(default)]
     schedule: JobSchedule,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    params: BTreeMap<String, databrain_connector_core::sql::ParamValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    param_set: Option<String>,
+}
+
+impl Spec {
+    fn of(job: &Job) -> Self {
+        Spec {
+            nodes: job.nodes.clone(),
+            edges: job.edges.clone(),
+            schedule: job.schedule.clone(),
+            params: job.params.clone(),
+            param_set: job.param_set.clone(),
+        }
+    }
 }
 
 /// Output names are SQL identifiers (`results.<name>`), same rules as
@@ -521,11 +555,7 @@ pub fn topo_order(job: &Job) -> std::result::Result<Vec<String>, Vec<String>> {
             }
         }
     }
-    if out.len() == ids.len() {
-        Ok(out)
-    } else {
-        Err(ids.iter().filter(|i| !out.iter().any(|o| o == *i)).map(|s| s.to_string()).collect())
-    }
+    if out.len() == ids.len() { Ok(out) } else { Err(ids.iter().filter(|i| !out.iter().any(|o| o == *i)).map(|s| s.to_string()).collect()) }
 }
 
 fn validate(job: &Job) -> Result<()> {
@@ -561,10 +591,11 @@ fn run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobRun> {
         status: r.get(5)?,
         nodes: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
         error: r.get(7)?,
+        params: r.get::<_, Option<String>>(8)?.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default(),
     })
 }
 
-const RUN_COLS: &str = "id, job_id, trigger, started_at, finished_at, status, nodes_json, error";
+const RUN_COLS: &str = "id, job_id, trigger, started_at, finished_at, status, nodes_json, error, params_json";
 
 impl Workspace {
     pub fn list_jobs(&self) -> Result<Vec<JobSummary>> {
@@ -604,7 +635,10 @@ impl Workspace {
         for id in ids {
             let Ok(j) = self.get_job(&id) else { continue };
             for n in &j.nodes {
-                out.push((n.name.to_ascii_lowercase(), StepOwner { job_id: j.id.clone(), job_name: j.name.clone(), node_id: n.id.clone(), step: n.name.clone() }));
+                out.push((
+                    n.name.to_ascii_lowercase(),
+                    StepOwner { job_id: j.id.clone(), job_name: j.name.clone(), node_id: n.id.clone(), step: n.name.clone() },
+                ));
             }
         }
         Ok(out)
@@ -614,6 +648,18 @@ impl Workspace {
     pub fn job_step_owner(&self, name: &str) -> Result<Option<StepOwner>> {
         let key = name.to_ascii_lowercase();
         Ok(self.job_step_names()?.into_iter().find(|(n, _)| *n == key).map(|(_, o)| o))
+    }
+
+    /// Mark every step of `job` as the AI's SQL, keeping the rest of the
+    /// job and its edit time (the schedule counts from it).
+    pub(crate) fn set_ai_sql_all(&self, job: &Job) -> Result<()> {
+        let mut spec = Spec::of(job);
+        for n in &mut spec.nodes {
+            n.ai_sql = true;
+        }
+        let spec = serde_json::to_string(&spec).map_err(|e| Error::Invalid(e.to_string()))?;
+        self.conn.lock().execute("UPDATE jobs SET spec_json = ?2 WHERE id = ?1", params![job.id, spec])?;
+        Ok(())
     }
 
     pub fn get_job(&self, id: &str) -> Result<Job> {
@@ -626,6 +672,8 @@ impl Workspace {
                 nodes: spec.nodes,
                 edges: spec.edges,
                 schedule: spec.schedule,
+                params: spec.params,
+                param_set: spec.param_set,
                 last_scheduled_at: r.get(3)?,
                 created_at: r.get(4)?,
                 updated_at: r.get(5)?,
@@ -668,8 +716,7 @@ impl Workspace {
             job.created_at = now;
         }
         job.updated_at = now;
-        let spec = serde_json::to_string(&Spec { nodes: job.nodes.clone(), edges: job.edges.clone(), schedule: job.schedule.clone() })
-            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let spec = serde_json::to_string(&Spec::of(&job)).map_err(|e| Error::Invalid(e.to_string()))?;
         let c = self.conn.lock();
         c.execute(
             "INSERT INTO jobs (id, name, spec_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -708,7 +755,7 @@ impl Workspace {
                 n.last_run = Some(r.summary.clone());
             }
         }
-        let spec = serde_json::to_string(&Spec { nodes: job.nodes, edges: job.edges, schedule: job.schedule }).map_err(|e| Error::Invalid(e.to_string()))?;
+        let spec = serde_json::to_string(&Spec::of(&job)).map_err(|e| Error::Invalid(e.to_string()))?;
         self.conn.lock().execute("UPDATE jobs SET spec_json = ?2 WHERE id = ?1", params![id, spec])?;
         Ok(())
     }
@@ -725,7 +772,24 @@ impl Workspace {
             "DELETE FROM job_runs WHERE job_id = ?1 AND id NOT IN (SELECT id FROM job_runs WHERE job_id = ?1 ORDER BY id DESC LIMIT ?2)",
             params![job_id, RUNS_KEPT],
         )?;
-        Ok(JobRun { id, job_id: job_id.into(), trigger: trigger.into(), started_at: now, finished_at: None, status: "running".into(), nodes: vec![], error: None })
+        Ok(JobRun {
+            id,
+            job_id: job_id.into(),
+            trigger: trigger.into(),
+            started_at: now,
+            finished_at: None,
+            status: "running".into(),
+            nodes: vec![],
+            error: None,
+            params: Default::default(),
+        })
+    }
+
+    /// Record the `:name` values a run's steps get.
+    pub fn set_job_run_params(&self, run_id: i64, params: &BTreeMap<String, databrain_connector_core::sql::ParamValue>) -> Result<()> {
+        let json = (!params.is_empty()).then(|| serde_json::to_string(params).unwrap_or_default());
+        self.conn.lock().execute("UPDATE job_runs SET params_json = ?2 WHERE id = ?1", params![run_id, json])?;
+        Ok(())
     }
 
     pub fn update_job_run(&self, run: &JobRun) -> Result<()> {
@@ -746,7 +810,14 @@ impl Workspace {
     /// Save the whole log of a run (replaces what was saved before).
     pub fn set_job_run_log(&self, run_id: i64, log: &[RunLogEntry]) -> Result<()> {
         // Statements and messages (which can quote one) without passwords and keys.
-        let log: Vec<RunLogEntry> = log.iter().map(|e| RunLogEntry { message: databrain_connector_core::sql::redact_secrets(&e.message), sql: e.sql.as_deref().map(databrain_connector_core::sql::redact_secrets), ..e.clone() }).collect();
+        let log: Vec<RunLogEntry> = log
+            .iter()
+            .map(|e| RunLogEntry {
+                message: databrain_connector_core::sql::redact_secrets(&e.message),
+                sql: e.sql.as_deref().map(databrain_connector_core::sql::redact_secrets),
+                ..e.clone()
+            })
+            .collect();
         let json = serde_json::to_string(&log).map_err(|e| Error::Invalid(e.to_string()))?;
         self.conn.lock().execute("UPDATE job_runs SET log_json = ?2 WHERE id = ?1", params![run_id, json])?;
         Ok(())
@@ -804,7 +875,8 @@ impl Workspace {
 
     /// Who holds the job now (owner, until), if anyone.
     pub fn job_lease(&self, job_id: &str) -> Result<Option<(String, i64)>> {
-        let r: Option<(Option<String>, Option<i64>)> = self.conn.lock().query_row("SELECT lease_owner, lease_until FROM jobs WHERE id = ?1", [job_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let r: Option<(Option<String>, Option<i64>)> =
+            self.conn.lock().query_row("SELECT lease_owner, lease_until FROM jobs WHERE id = ?1", [job_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         Ok(match r {
             Some((Some(o), Some(u))) if u >= now_ms() => Some((o, u)),
             _ => None,
@@ -856,6 +928,42 @@ mod tests {
         }
     }
 
+    /// Jobs saved before steps recorded who wrote their SQL: those the
+    /// audit log shows the AI created or changed (approved) are marked once,
+    /// keeping their edit time; others, and denied proposals, are not.
+    #[test]
+    fn marks_jobs_the_ai_wrote_before_steps_recorded_it() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let mut ai = job(vec![node("a1"), node("a2")], vec![(0, 1)]);
+        ai.name = "Nightly compare".into();
+        let ai = ws.save_job(ai).unwrap();
+        let mut mine = job(vec![node("m1")], vec![]);
+        mine.name = "Mine".into();
+        let mine = ws.save_job(mine).unwrap();
+        let mut denied = job(vec![node("d1")], vec![]);
+        denied.name = "Proposed".into();
+        let denied = ws.save_job(denied).unwrap();
+        let args = |n: &str| serde_json::json!({"name": n, "preview": "…"});
+        ws.add_audit(None, None, "create_job", &args(" nightly COMPARE "), "approved", None).unwrap();
+        ws.add_audit(None, None, "update_job", &args("Proposed"), "denied", None).unwrap();
+        ws.add_audit(None, None, "run_job", &args("Mine"), "approved", None).unwrap();
+        ws.conn.lock().execute("DELETE FROM maintenance WHERE name = 'ai_jobs_marked_v1'", []).unwrap();
+
+        assert_eq!(ws.mark_ai_written_jobs().unwrap(), vec!["Nightly compare".to_string()]);
+        let after = ws.get_job(&ai.id).unwrap();
+        assert!(after.nodes.iter().all(|n| n.ai_sql));
+        assert_eq!(after.updated_at, ai.updated_at, "the schedule's base is kept");
+        assert_eq!(after.edges, ai.edges);
+        assert!(ws.get_job(&mine.id).unwrap().nodes.iter().all(|n| !n.ai_sql), "a run approval isn't authorship");
+        assert!(ws.get_job(&denied.id).unwrap().nodes.iter().all(|n| !n.ai_sql));
+        // Once.
+        let mut cleared = ws.get_job(&ai.id).unwrap();
+        cleared.nodes[0].ai_sql = false;
+        ws.save_job(cleared).unwrap();
+        assert!(ws.mark_ai_written_jobs().unwrap().is_empty());
+        assert!(!ws.get_job(&ai.id).unwrap().nodes[0].ai_sql, "a step the user trusted stays trusted");
+    }
+
     fn job(nodes: Vec<JobNode>, edges: Vec<(usize, usize)>) -> Job {
         let mut nodes = nodes;
         for (i, n) in nodes.iter_mut().enumerate() {
@@ -868,6 +976,8 @@ mod tests {
             nodes,
             schedule: JobSchedule::default(),
             last_scheduled_at: None,
+            params: Default::default(),
+            param_set: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -898,7 +1008,11 @@ mod tests {
         let mut run = ws.start_job_run(&j.id, "manual").unwrap();
         run.status = "success".into();
         run.finished_at = Some(run.started_at + 5);
-        run.nodes = vec![NodeRunRecord { node_id: "n1".into(), name: "orders".into(), summary: NodeRunSummary { status: "success".into(), rows: Some(3), ..Default::default() } }];
+        run.nodes = vec![NodeRunRecord {
+            node_id: "n1".into(),
+            name: "orders".into(),
+            summary: NodeRunSummary { status: "success".into(), rows: Some(3), ..Default::default() },
+        }];
         ws.update_job_run(&run).unwrap();
         ws.set_job_node_results(&j.id, &run.nodes).unwrap();
         let back = ws.get_job(&j.id).unwrap();
@@ -909,7 +1023,17 @@ mod tests {
 
         // Run log: saved whole, read back per run of its job.
         assert!(ws.job_run_log(&j.id, run.id).unwrap().is_empty());
-        let line = RunLogEntry { seq: 1, at: 5, node_id: Some("n1".into()), step: Some("orders".into()), level: "info".into(), message: "Ran".into(), sql: Some("select 1".into()), rows: Some(1), duration_ms: Some(2) };
+        let line = RunLogEntry {
+            seq: 1,
+            at: 5,
+            node_id: Some("n1".into()),
+            step: Some("orders".into()),
+            level: "info".into(),
+            message: "Ran".into(),
+            sql: Some("select 1".into()),
+            rows: Some(1),
+            duration_ms: Some(2),
+        };
         ws.set_job_run_log(run.id, std::slice::from_ref(&line)).unwrap();
         assert_eq!(ws.job_run_log(&j.id, run.id).unwrap(), vec![line]);
         assert!(ws.job_run_log("other", run.id).is_err());
@@ -993,7 +1117,8 @@ pub fn export_file_name(template: Option<&str>, step: &str, job: &str, format: F
         .replace("{job}", job)
         .replace("{date}", &at.format("%Y-%m-%d").to_string())
         .replace("{time}", &at.format("%H%M%S").to_string());
-    let mut clean: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() { '_' } else { c }).collect();
+    let mut clean: String =
+        name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() { '_' } else { c }).collect();
     clean = clean.trim().trim_start_matches('.').to_string();
     if clean.is_empty() {
         clean = step.to_string();

@@ -9,36 +9,35 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod connect;
+pub mod edit;
 mod error;
 mod events;
-pub mod edit;
 mod export;
-mod metadata;
-mod run;
-mod sessions;
 pub mod load;
+mod metadata;
 pub mod outputs;
 pub mod plan;
 pub mod probe;
 pub mod related;
+mod run;
 pub mod schema_diff;
+mod sessions;
 
-pub use load::{LoadCheck, LoadDryRun, LoadTarget, LoadEvent, LoadObserver, LoadReport, LoadRows, LoadSpec, NoLoadObserver};
 pub use error::*;
 pub use events::*;
+pub use load::{LoadCheck, LoadDryRun, LoadEvent, LoadObserver, LoadReport, LoadRows, LoadSpec, LoadTarget, NoLoadObserver};
 pub use outputs::{NewOutput, OutputInfo, OutputRegistry, OutputState, OutputTables};
 
 use databrain_auth::{
-    AuthStatus, CredentialSource, ExposeSecret, InlineCredentialSource, Interaction, NonInteractive, SecretRef, SecretStore,
-    credential_source,
+    AuthStatus, CredentialSource, ExposeSecret, InlineCredentialSource, Interaction, NonInteractive, SecretRef, SecretStore, credential_source,
 };
-use databrain_ssh_tunnel::{SshSecret, Tunnel, TunnelSpec};
 use databrain_connector_core::sql::{Classification, StatementKind, classify, split_statements};
 use databrain_connector_core::{
-    CancellationToken, ConnectionConfig, ConnectorError, ConnectorRegistry, DbObject, ErrorKind,
-    ExecOptions, ObjectDetail, SchemaInfo, Session, StreamEvent, TableLayout,
+    CancellationToken, ConnectionConfig, ConnectorError, ConnectorRegistry, DbObject, ErrorKind, ExecOptions, ObjectDetail, SchemaInfo, Session, StreamEvent,
+    TableLayout,
 };
 use databrain_result_store::{ResultInfo, ResultStore};
+use databrain_ssh_tunnel::{SshSecret, Tunnel, TunnelSpec};
 use databrain_workspace::{ConnectionProfile, EnvTag, NewHistory, Origin, RunStatus, Workspace, now_ms};
 use parking_lot::Mutex;
 use secrecy::SecretString;
@@ -264,7 +263,6 @@ impl QueryEngine {
     pub fn results(&self) -> &Arc<ResultStore> {
         &self.results
     }
-
 }
 
 struct StatementOutcome {

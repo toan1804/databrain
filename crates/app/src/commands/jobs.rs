@@ -24,8 +24,28 @@ pub(crate) async fn delete_job(state: State<'_, AppState>, id: String) -> R<()> 
 }
 
 #[tauri::command]
-pub(crate) async fn run_job(state: State<'_, AppState>, id: String, nodes: Option<Vec<String>>) -> R<databrain_workspace::JobRun> {
-    api::run_job(&state, &id, nodes)
+pub(crate) async fn run_job(
+    state: State<'_, AppState>,
+    id: String,
+    nodes: Option<Vec<String>>,
+    params: Option<crate::jobs::RunParams>,
+) -> R<databrain_workspace::JobRun> {
+    api::run_job_with(&state, &id, nodes, params)
+}
+
+#[tauri::command]
+pub(crate) async fn list_param_sets(state: State<'_, AppState>) -> R<Vec<databrain_workspace::ParamSet>> {
+    api::list_param_sets(&state)
+}
+
+#[tauri::command]
+pub(crate) async fn save_param_set(state: State<'_, AppState>, set: databrain_workspace::ParamSet) -> R<databrain_workspace::ParamSet> {
+    api::save_param_set(&state, set)
+}
+
+#[tauri::command]
+pub(crate) async fn delete_param_set(state: State<'_, AppState>, id: String) -> R<()> {
+    api::delete_param_set(&state, &id)
 }
 
 #[tauri::command]

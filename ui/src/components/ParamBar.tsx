@@ -1,8 +1,99 @@
 import { useEffect, useRef, useState } from "react";
 import { Braces, Variable } from "lucide-react";
 import { api, isTauri } from "../lib/api";
-import type { ConnectorKind } from "../lib/types";
+import type { ConnectorKind, ParamValue } from "../lib/types";
 import { useStore } from "../store";
+
+/**
+ * Saved parameter sets for a query tab or notebook: apply one (fills the
+ * boxes it has values for), save the current values as a new set, update
+ * the applied set with them, or delete it.
+ */
+export function ParamSetPicker({ tabId, names }: { tabId: string; names: string[] }) {
+  const sets = useStore((s) => s.paramSets);
+  const values = useStore((s) => s.params[tabId]);
+  const [applied, setApplied] = useState("");
+  const [naming, setNaming] = useState<string | null>(null);
+  useEffect(() => {
+    void useStore.getState().loadParamSets();
+  }, []);
+  const appliedSet = sets.find((s) => s.id === applied);
+  const current = (): Record<string, ParamValue> => Object.fromEntries(names.filter((n) => values?.[n]?.value.trim()).map((n) => [n, values![n]]));
+  const st = useStore.getState();
+
+  if (naming !== null) {
+    const save = async () => {
+      const saved = await st.saveParamSet({ id: "", name: naming, values: current(), updated_at: 0 });
+      if (saved) {
+        setApplied(saved.id);
+        setNaming(null);
+        st.toast(`Saved the values as "${saved.name}"`, "success");
+      }
+    };
+    return (
+      <form
+        className="flex h-6 shrink-0 items-center gap-1"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void save();
+        }}
+      >
+        <input
+          autoFocus
+          className="field h-6 w-32 py-0 text-[12px]"
+          placeholder="Set name"
+          aria-label="Name of the new parameter set"
+          value={naming}
+          onChange={(e) => setNaming(e.target.value)}
+          onKeyDown={(e) => e.key === "Escape" && setNaming(null)}
+        />
+        <button type="submit" className="btn-primary h-6 px-2 py-0 text-[11.5px]" disabled={!naming.trim()}>
+          Save
+        </button>
+        <button type="button" className="btn-ghost h-6 px-1.5 py-0 text-[11.5px]" onClick={() => setNaming(null)}>
+          Cancel
+        </button>
+      </form>
+    );
+  }
+  return (
+    <select
+      className="field h-6 w-36 shrink-0 py-0 text-[12px]"
+      aria-label="Parameter set"
+      title="Saved sets of values: apply one, or save these values"
+      value={appliedSet ? applied : ""}
+      onChange={(e) => {
+        const v = e.target.value;
+        if (v === "__new") return setNaming("");
+        if (v === "__update" && appliedSet) {
+          void st.saveParamSet({ ...appliedSet, values: { ...appliedSet.values, ...current() } }).then((s) => s && st.toast(`Updated "${s.name}"`, "success"));
+          return;
+        }
+        if (v === "__delete" && appliedSet) {
+          void st.deleteParamSet(appliedSet.id);
+          setApplied("");
+          return;
+        }
+        const set = sets.find((s) => s.id === v);
+        if (set) {
+          st.applyParamSet(tabId, set);
+          setApplied(set.id);
+        }
+      }}
+    >
+      <option value="">{sets.length ? "Parameter set…" : "No saved sets"}</option>
+      {sets.map((s) => (
+        <option key={s.id} value={s.id}>
+          {s.name}
+        </option>
+      ))}
+      <option disabled>──────────</option>
+      <option value="__new">Save these values as a set…</option>
+      {appliedSet && <option value="__update">Update "{appliedSet.name}" with these values</option>}
+      {appliedSet && <option value="__delete">Delete set "{appliedSet.name}"</option>}
+    </select>
+  );
+}
 
 /**
  * One box per `:name` parameter of a query tab or notebook (`tabId`).
@@ -51,6 +142,7 @@ export function ParamBar({ tabId, kind }: { tabId: string; kind: ConnectorKind |
         <Variable size={13} aria-hidden />
         <span className="sr-only">Parameters</span>
       </span>
+      <ParamSetPicker tabId={tabId} names={names} />
       {/* Three rows of boxes (24px + 4px gaps), then scroll. */}
       <div className="flex max-h-[80px] min-w-0 flex-1 flex-wrap content-start gap-1 overflow-y-auto overscroll-contain">
         {names.map((n) => {

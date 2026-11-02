@@ -22,11 +22,7 @@ pub struct ExecOptions {
 
 impl Default for ExecOptions {
     fn default() -> Self {
-        Self {
-            batch_size: 1000,
-            cancel: CancellationToken::new(),
-            max_rows: None,
-        }
+        Self { batch_size: 1000, cancel: CancellationToken::new(), max_rows: None }
     }
 }
 

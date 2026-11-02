@@ -15,9 +15,8 @@ use async_trait::async_trait;
 use databrain_auth::{AuthMethodKind, Credential, CredentialSource};
 use databrain_connector_core::documents::{Cell, Row, RowBatcher};
 use databrain_connector_core::{
-    Capabilities, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ExecOptions,
-    ExecSummary, FieldSpec, IndexInfo, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender,
-    TableLayout, Value,
+    Capabilities, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ExecOptions, ExecSummary, FieldSpec,
+    IndexInfo, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender, TableLayout, Value,
 };
 use futures::StreamExt;
 use mongodb::bson::{Bson, Document, doc};
@@ -58,7 +57,9 @@ impl Connector for MongoConnector {
                     .help("Overrides host and port; the user and password below are added to it. Atlas: copy it from Connect → Drivers."),
                 FieldSpec::new("host", "Host").placeholder("localhost"),
                 FieldSpec::new("port", "Port").placeholder("27017"),
-                FieldSpec::new("database", "Database").placeholder("(all databases)").help("Default database for db.… commands; empty lists every database you can read"),
+                FieldSpec::new("database", "Database")
+                    .placeholder("(all databases)")
+                    .help("Default database for db.… commands; empty lists every database you can read"),
                 FieldSpec::new("auth_source", "Authentication database").placeholder("admin"),
                 FieldSpec::new("tls", "TLS").placeholder("false").help("true for TLS (mongodb+srv:// uses TLS already)"),
             ],
@@ -132,9 +133,10 @@ pub struct MongoSession {
 
 impl MongoSession {
     fn db(&self, name: Option<&str>) -> Result<mongodb::Database> {
-        let n = name.map(str::to_string).or_else(|| self.database.clone()).ok_or_else(|| {
-            ConnectorError::query("No database chosen: start with `use <database>` or set the connection's database")
-        })?;
+        let n = name
+            .map(str::to_string)
+            .or_else(|| self.database.clone())
+            .ok_or_else(|| ConnectorError::query("No database chosen: start with `use <database>` or set the connection's database"))?;
         Ok(self.client.database(&n))
     }
 
@@ -377,7 +379,10 @@ impl Session for MongoSession {
         let opts = info.and_then(|c| c.ok()).map(|c| mongodb::bson::to_document(&c.options).unwrap_or_default()).unwrap_or_default();
         let opts: Document = opts.into_iter().filter(|(_, v)| !matches!(v, Bson::Null)).collect();
         let q = serde_json::to_string(name).unwrap_or_default();
-        ddl.push_str(&format!("db.createCollection({q}{});\n", if opts.is_empty() { String::new() } else { format!(", {}", Bson::Document(opts).into_relaxed_extjson()) }));
+        ddl.push_str(&format!(
+            "db.createCollection({q}{});\n",
+            if opts.is_empty() { String::new() } else { format!(", {}", Bson::Document(opts).into_relaxed_extjson()) }
+        ));
         if let Ok(mut ix) = coll.list_indexes().await {
             while let Some(Ok(i)) = ix.next().await {
                 if i.keys.get("_id").is_some() && i.keys.len() == 1 {
@@ -397,6 +402,18 @@ impl Session for MongoSession {
     async fn table_layout(&self, schema: &str, name: &str) -> Result<TableLayout> {
         let coll = self.client.database(schema).collection::<Document>(name);
         let mut l = TableLayout { row_estimate: coll.estimated_document_count().await.ok().map(|n| n as i64), ..Default::default() };
+        // Storage of the documents and indexes (collStats; views have none).
+        if let Ok(st) = self.client.database(schema).run_command(doc! { "collStats": name }).await {
+            let num = |k: &str| {
+                st.get(k).and_then(|v| match v {
+                    Bson::Int32(n) => Some(*n as i64),
+                    Bson::Int64(n) => Some(*n),
+                    Bson::Double(n) => Some(*n as i64),
+                    _ => None,
+                })
+            };
+            l.size_bytes = num("totalSize").or_else(|| num("storageSize").map(|s| s + num("totalIndexSize").unwrap_or(0)));
+        }
         let mut ix = coll.list_indexes().await.map_err(err)?;
         while let Some(i) = ix.next().await {
             let i = i.map_err(err)?;

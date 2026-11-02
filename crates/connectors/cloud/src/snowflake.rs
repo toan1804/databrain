@@ -12,14 +12,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use databrain_auth::{
-    AuthContext, AuthMethodKind, ClientAuthStyle, Credential, CredentialSource, Interaction, OAuthConfig, now_secs,
-};
+use databrain_auth::{AuthContext, AuthMethodKind, ClientAuthStyle, Credential, CredentialSource, Interaction, OAuthConfig, now_secs};
 use databrain_connector_core::value::Column;
 use databrain_connector_core::{
-    Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind,
-    DbObject, ErrorKind, ExecOptions, ExecSummary, FieldSpec, ForeignKey, ObjectDetail, ObjectKind, QueryStream, Result,
-    SchemaInfo, Session, StreamEvent, StreamSender, TableColumns, Value, quote_ident, quote_literal,
+    Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind, ExecOptions,
+    ExecSummary, FieldSpec, ForeignKey, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender, TableColumns, Value,
+    quote_ident, quote_literal,
 };
 use secrecy::ExposeSecret;
 use serde_json::json;
@@ -91,7 +89,8 @@ impl Connector for SnowflakeConnector {
                 FieldSpec::new("database", "Database").placeholder("(optional)"),
                 FieldSpec::new("schema", "Schema").placeholder("PUBLIC"),
                 FieldSpec::new("role", "Role").placeholder("(optional)"),
-                FieldSpec::new("authenticator", "Okta URL").placeholder("(optional) https://myorg.okta.com for native SSO")
+                FieldSpec::new("authenticator", "Okta URL")
+                    .placeholder("(optional) https://myorg.okta.com for native SSO")
                     .help("Leave empty for external browser SSO"),
             ],
             note: Some("Browser SSO uses your identity provider via Snowflake. OAuth needs a security integration client ID."),
@@ -270,10 +269,7 @@ async fn external_browser(http: &reqwest::Client, base: &str, acct: &str, user: 
     let params = lb.wait(None, &ui.cancel_token(), Duration::from_secs(300)).await;
     ui.finished().await;
     let params = params?;
-    let token = params
-        .get("token")
-        .cloned()
-        .ok_or_else(|| ConnectorError::new(ErrorKind::Auth, "the SSO redirect did not include a token"))?;
+    let token = params.get("token").cloned().ok_or_else(|| ConnectorError::new(ErrorKind::Auth, "the SSO redirect did not include a token"))?;
     Ok((token, proof))
 }
 
@@ -361,8 +357,8 @@ impl Inner {
             .map_err(net_err)?;
         let status = resp.status();
         let text = resp.text().await.map_err(net_err)?;
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|_| ConnectorError::connection(format!("Snowflake ({status}): {}", truncate(&text, 300))))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|_| ConnectorError::connection(format!("Snowflake ({status}): {}", truncate(&text, 300))))?;
         // Session expired: renew with the master token and retry once.
         if v["code"].as_str() == Some("390112") {
             self.renew().await?;
@@ -487,22 +483,18 @@ impl Inner {
                 }
             }
         } else if let Some(key) = data["qrmk"].as_str() {
-            req = req
-                .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
-                .header("x-amz-server-side-encryption-customer-key", key);
+            req = req.header("x-amz-server-side-encryption-customer-algorithm", "AES256").header("x-amz-server-side-encryption-customer-key", key);
         }
         let bytes = req.send().await.map_err(net_err)?.bytes().await.map_err(net_err)?;
         let text = if bytes.starts_with(&[0x1f, 0x8b]) {
             let mut s = String::new();
-            flate2::read::GzDecoder::new(&bytes[..])
-                .read_to_string(&mut s)
-                .map_err(|e| ConnectorError::internal(format!("chunk decode: {e}")))?;
+            flate2::read::GzDecoder::new(&bytes[..]).read_to_string(&mut s).map_err(|e| ConnectorError::internal(format!("chunk decode: {e}")))?;
             s
         } else {
             String::from_utf8_lossy(&bytes).into_owned()
         };
-        let rows: Vec<Vec<serde_json::Value>> = serde_json::from_str(&format!("[{text}]"))
-            .map_err(|e| ConnectorError::internal(format!("chunk parse: {e}")))?;
+        let rows: Vec<Vec<serde_json::Value>> =
+            serde_json::from_str(&format!("[{text}]")).map_err(|e| ConnectorError::internal(format!("chunk parse: {e}")))?;
         Ok(rows)
     }
 
@@ -514,11 +506,7 @@ impl Inner {
         let stmt_type = data["statementTypeId"].as_i64().unwrap_or(0);
         // DML (0x3000..0x4000) reports affected rows in the single result row.
         if (0x3000..0x4000).contains(&stmt_type) {
-            let n: u64 = data["rowset"]
-                .get(0)
-                .and_then(|r| r.as_array())
-                .map(|r| r.iter().filter_map(|v| v.as_str()?.parse::<u64>().ok()).sum())
-                .unwrap_or(0);
+            let n: u64 = data["rowset"].get(0).and_then(|r| r.as_array()).map(|r| r.iter().filter_map(|v| v.as_str()?.parse::<u64>().ok()).sum()).unwrap_or(0);
             tx.send(StreamEvent::Done(ExecSummary { rows_affected: Some(n) })).await;
             return Ok(());
         }
@@ -527,16 +515,10 @@ impl Inner {
             return Ok(());
         }
         let types: Vec<(ColType, String)> = rowtype.iter().map(col_type).collect();
-        let cols: Vec<Column> = rowtype
-            .iter()
-            .zip(&types)
-            .map(|(r, (t, db))| Column::new(r["name"].as_str().unwrap_or(""), *t, db.clone()))
-            .collect();
+        let cols: Vec<Column> = rowtype.iter().zip(&types).map(|(r, (t, db))| Column::new(r["name"].as_str().unwrap_or(""), *t, db.clone())).collect();
         let Some(mut sink) = RowSink::start(&cols, opts.batch_size, tx).await else { return Ok(()) };
-        let first: Vec<Vec<serde_json::Value>> = data["rowset"]
-            .as_array()
-            .map(|a| a.iter().map(|r| r.as_array().cloned().unwrap_or_default()).collect())
-            .unwrap_or_default();
+        let first: Vec<Vec<serde_json::Value>> =
+            data["rowset"].as_array().map(|a| a.iter().map(|r| r.as_array().cloned().unwrap_or_default()).collect()).unwrap_or_default();
         let mut pending = vec![first];
         let chunks = data["chunks"].as_array().cloned().unwrap_or_default();
         let mut next_chunk = 0usize;
@@ -596,19 +578,10 @@ impl Session for SfSession {
 
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>> {
         let cur = self.0.run_small("select current_database(), current_schema()").await?;
-        let (cur_db, cur_sch) = cur
-            .first()
-            .map(|r| (r.first().cloned().flatten(), r.get(1).cloned().flatten()))
-            .unwrap_or((None, None));
+        let (cur_db, cur_sch) = cur.first().map(|r| (r.first().cloned().flatten(), r.get(1).cloned().flatten())).unwrap_or((None, None));
         let dbs: Vec<String> = match &cur_db {
             Some(d) => vec![d.clone()],
-            None => self
-                .0
-                .run_small("show terse databases")
-                .await?
-                .into_iter()
-                .filter_map(|r| r.get(1).cloned().flatten())
-                .collect(),
+            None => self.0.run_small("show terse databases").await?.into_iter().filter_map(|r| r.get(1).cloned().flatten()).collect(),
         };
         let mut out = Vec::new();
         for db in dbs {
@@ -672,7 +645,13 @@ impl Session for SfSession {
                 Some(DbObject {
                     schema: format!("{}.{sch}", g(3)?),
                     name: g(1)?,
-                    kind: if k.contains("VIEW") { if k.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else if k.contains("EXTERNAL") { ObjectKind::ForeignTable } else { ObjectKind::Table },
+                    kind: if k.contains("VIEW") {
+                        if k.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View }
+                    } else if k.contains("EXTERNAL") {
+                        ObjectKind::ForeignTable
+                    } else {
+                        ObjectKind::Table
+                    },
                     comment: None,
                     row_estimate: None,
                 })
@@ -705,7 +684,13 @@ impl Session for SfSession {
                 Some(DbObject {
                     schema: schema.to_string(),
                     name: g(0)?,
-                    kind: if t.contains("VIEW") { if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else if t.contains("EXTERNAL") { ObjectKind::ForeignTable } else { ObjectKind::Table },
+                    kind: if t.contains("VIEW") {
+                        if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View }
+                    } else if t.contains("EXTERNAL") {
+                        ObjectKind::ForeignTable
+                    } else {
+                        ObjectKind::Table
+                    },
                     comment: g(2),
                     row_estimate: g(3).and_then(|n| n.parse().ok()),
                 })
@@ -731,7 +716,13 @@ impl Session for SfSession {
                 Some(DbObject {
                     schema: schema.to_string(),
                     name: g(0)?,
-                    kind: if t.contains("VIEW") { if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else if t.contains("EXTERNAL") { ObjectKind::ForeignTable } else { ObjectKind::Table },
+                    kind: if t.contains("VIEW") {
+                        if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View }
+                    } else if t.contains("EXTERNAL") {
+                        ObjectKind::ForeignTable
+                    } else {
+                        ObjectKind::Table
+                    },
                     comment: g(2),
                     row_estimate: g(3).and_then(|n| n.parse().ok()),
                 })
@@ -739,17 +730,31 @@ impl Session for SfSession {
             .collect();
         // Routines and sequences (best effort: missing privileges just leave them out).
         let db_q = quote_ident(ConnectorKind::Snowflake, db);
-        for (view, col, kind) in [("functions", "function_name", ObjectKind::Function), ("procedures", "procedure_name", ObjectKind::Procedure), ("sequences", "sequence_name", ObjectKind::Sequence)] {
-            let q = format!("select distinct {col} from {db_q}.information_schema.{view} where {}_schema = {} order by 1", view.trim_end_matches('s'), quote_literal(sch));
+        for (view, col, kind) in [
+            ("functions", "function_name", ObjectKind::Function),
+            ("procedures", "procedure_name", ObjectKind::Procedure),
+            ("sequences", "sequence_name", ObjectKind::Sequence),
+        ] {
+            let q = format!(
+                "select distinct {col} from {db_q}.information_schema.{view} where {}_schema = {} order by 1",
+                view.trim_end_matches('s'),
+                quote_literal(sch)
+            );
             if let Ok(rows) = self.0.run_small(&q).await {
-                out.extend(rows.into_iter().filter_map(|r| r.first().cloned().flatten()).map(|name| DbObject { schema: schema.to_string(), name, kind, comment: None, row_estimate: None }));
+                out.extend(rows.into_iter().filter_map(|r| r.first().cloned().flatten()).map(|name| DbObject {
+                    schema: schema.to_string(),
+                    name,
+                    kind,
+                    comment: None,
+                    row_estimate: None,
+                }));
             }
         }
         Ok(out)
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
-        use databrain_connector_core::{parse_call_list, query_text, quote_literal, TableLayout};
+        use databrain_connector_core::{TableLayout, parse_call_list, query_text, quote_literal};
         let (db, sch) = schema.split_once('.').ok_or_else(|| ConnectorError::query("expected database.schema"))?;
         let mut l = TableLayout::from_columns(&self.describe(schema, name).await?.columns);
         if let Some(pk) = l.indexes.first_mut() {
@@ -758,7 +763,7 @@ impl Session for SfSession {
         let rows = query_text(
             self,
             &format!(
-                "select clustering_key, row_count, auto_clustering_on from {}.information_schema.tables where table_schema = {} and table_name = {}",
+                "select clustering_key, row_count, auto_clustering_on, bytes from {}.information_schema.tables where table_schema = {} and table_name = {}",
                 quote_ident(ConnectorKind::Snowflake, db),
                 quote_literal(sch),
                 quote_literal(name)
@@ -773,6 +778,7 @@ impl Session for SfSession {
                 }
             }
             l.row_estimate = r[1].as_deref().and_then(|x| x.parse().ok());
+            l.size_bytes = r.get(3).and_then(|x| x.as_deref()).and_then(|x| x.parse().ok());
         }
         Ok(l)
     }
@@ -926,7 +932,14 @@ impl SfSession {
                 _ => base,
             };
             let table = g(0).unwrap_or_default();
-            let col = ColumnInfo { name: g(1).unwrap_or_default(), data_type, nullable: g(6).as_deref() != Some("NO"), is_primary_key: false, default: g(7), comment: g(8) };
+            let col = ColumnInfo {
+                name: g(1).unwrap_or_default(),
+                data_type,
+                nullable: g(6).as_deref() != Some("NO"),
+                is_primary_key: false,
+                default: g(7),
+                comment: g(8),
+            };
             match out.last_mut() {
                 Some(t) if t.table == table => t.columns.push(col),
                 _ => out.push(TableColumns { table, columns: vec![col], foreign_keys: vec![] }),
@@ -959,13 +972,14 @@ impl SfSession {
                     fk.columns.push(g(7));
                     fk.ref_columns.push(g(3));
                 }
-                None => out.push((fk_name, ForeignKey { columns: vec![g(7)], ref_schema: format!("{}.{}", g(0), g(1)), ref_table: g(2), ref_columns: vec![g(3)] })),
+                None => {
+                    out.push((fk_name, ForeignKey { columns: vec![g(7)], ref_schema: format!("{}.{}", g(0), g(1)), ref_table: g(2), ref_columns: vec![g(3)] }))
+                }
             }
         }
         Ok(out.into_iter().map(|(_, f)| f).collect())
     }
 }
-
 
 /// "The data is large…" for a result with extra chunks in cloud storage.
 fn chunks_notice(data: &serde_json::Value) -> Option<String> {
@@ -1022,7 +1036,8 @@ mod tests {
     #[ignore = "live: needs DATABRAIN_SF_ACCOUNT (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_roundtrip() {
-        let (Ok(acct), Ok(user), Ok(pw)) = (std::env::var("DATABRAIN_SF_ACCOUNT"), std::env::var("DATABRAIN_SF_USER"), std::env::var("DATABRAIN_SF_PASSWORD")) else {
+        let (Ok(acct), Ok(user), Ok(pw)) = (std::env::var("DATABRAIN_SF_ACCOUNT"), std::env::var("DATABRAIN_SF_USER"), std::env::var("DATABRAIN_SF_PASSWORD"))
+        else {
             panic!("live test: DATABRAIN_SF_* not set (run with --ignored)");
         };
         use databrain_auth::InlineCredentialSource;
@@ -1033,7 +1048,13 @@ mod tests {
         }
         let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, Some(pw.into())));
         let s = SnowflakeConnector.connect(&c, creds).await.unwrap();
-        let r = s.execute("select 1 as a, 'x' as b, current_timestamp() as c, 1.5::number(5,2) as d", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let r = s
+            .execute("select 1 as a, 'x' as b, current_timestamp() as c, 1.5::number(5,2) as d", ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(r.num_rows(), 1);
         let r = s.execute("select seq4() from table(generator(rowcount => 50000))", ExecOptions::default()).await.unwrap().collect().await.unwrap();
         assert_eq!(r.num_rows(), 50000);

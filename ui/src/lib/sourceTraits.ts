@@ -35,7 +35,14 @@ export interface SourceTraits {
   ssl_setting: boolean;
   formatter: string;
   /** How rows are written into it; null = not a load target. */
-  load: { max_rows: number; default_rows: number; max_bytes: number; default_bytes: number } | null;
+  load: {
+    max_rows: number;
+    default_rows: number;
+    max_bytes: number;
+    default_bytes: number;
+    /** Update and Merge by key are possible (not on ClickHouse). */
+    keyed: boolean;
+  } | null;
 }
 
 const FALLBACK: SourceTraits = {

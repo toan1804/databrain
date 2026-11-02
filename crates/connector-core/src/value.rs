@@ -8,8 +8,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder,
-    StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder, UInt64Builder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -64,9 +64,7 @@ impl ColType {
             ColType::Binary => DataType::Binary,
             ColType::Date => DataType::Date32,
             ColType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
-            ColType::TimestampTz => {
-                DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")))
-            }
+            ColType::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
             ColType::Time => DataType::Time64(TimeUnit::Microsecond),
         }
     }
@@ -82,11 +80,7 @@ pub struct Column {
 
 impl Column {
     pub fn new(name: impl Into<String>, col_type: ColType, db_type: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            col_type,
-            db_type: db_type.into(),
-        }
+        Self { name: name.into(), col_type, db_type: db_type.into() }
     }
 }
 
@@ -128,9 +122,7 @@ impl ColBuilder {
             ColType::Binary => Self::Binary(BinaryBuilder::with_capacity(cap, cap * 16)),
             ColType::Date => Self::Date(Date32Builder::with_capacity(cap)),
             ColType::Timestamp => Self::Timestamp(TimestampMicrosecondBuilder::with_capacity(cap)),
-            ColType::TimestampTz => Self::TimestampTz(
-                TimestampMicrosecondBuilder::with_capacity(cap).with_timezone("UTC"),
-            ),
+            ColType::TimestampTz => Self::TimestampTz(TimestampMicrosecondBuilder::with_capacity(cap).with_timezone("UTC")),
             ColType::Time => Self::Time(Time64MicrosecondBuilder::with_capacity(cap)),
         }
     }
@@ -264,10 +256,7 @@ impl BatchBuilder {
         let types: Vec<ColType> = columns.iter().map(|c| c.col_type).collect();
         Self {
             schema: schema_for(columns),
-            builders: types
-                .iter()
-                .map(|t| ColBuilder::new(*t, capacity))
-                .collect(),
+            builders: types.iter().map(|t| ColBuilder::new(*t, capacity)).collect(),
             types,
             rows: 0,
             capacity,
@@ -314,17 +303,9 @@ impl BatchBuilder {
         let arrays: Vec<ArrayRef> = self.builders.iter_mut().map(|b| b.finish()).collect();
         let rows = self.rows;
         self.rows = 0;
-        self.builders = self
-            .types
-            .iter()
-            .map(|t| ColBuilder::new(*t, self.capacity))
-            .collect();
+        self.builders = self.types.iter().map(|t| ColBuilder::new(*t, self.capacity)).collect();
         let opts = RecordBatchOptions::new().with_row_count(Some(rows));
-        Ok(RecordBatch::try_new_with_options(
-            self.schema.clone(),
-            arrays,
-            &opts,
-        )?)
+        Ok(RecordBatch::try_new_with_options(self.schema.clone(), arrays, &opts)?)
     }
 }
 
@@ -408,11 +389,7 @@ pub fn parse_time(s: &str) -> Option<i64> {
     let sec: i64 = it.next().unwrap_or("0").parse().ok()?;
     let mut micros = 0i64;
     if !frac.is_empty() {
-        let digits: String = frac
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .take(6)
-            .collect();
+        let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).take(6).collect();
         let n = digits.len() as u32;
         micros = digits.parse::<i64>().ok()? * 10i64.pow(6 - n);
     }
@@ -424,11 +401,7 @@ pub fn parse_datetime(s: &str) -> Option<i64> {
     let s = s.trim().trim_end_matches('Z');
     let days = parse_date(s)? as i64;
     let rest = s.get(10..).unwrap_or("").trim_start_matches(['T', ' ']);
-    let t = if rest.is_empty() {
-        0
-    } else {
-        parse_time(rest)?
-    };
+    let t = if rest.is_empty() { 0 } else { parse_time(rest)? };
     Some(days * MICROS_PER_DAY + t)
 }
 
@@ -485,10 +458,7 @@ mod tests {
 
     #[test]
     fn builder_coerces_and_counts_failures() {
-        let cols = vec![
-            Column::new("id", ColType::Int64, "int"),
-            Column::new("name", ColType::Utf8, "text"),
-        ];
+        let cols = vec![Column::new("id", ColType::Int64, "int"), Column::new("name", ColType::Utf8, "text")];
         let mut b = BatchBuilder::new(&cols, 4);
         b.push_row([Value::Int(1), Value::Text("a".into())]);
         b.push_row([Value::Text("2".into()), Value::Int(7)]);

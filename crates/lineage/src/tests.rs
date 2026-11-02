@@ -12,7 +12,7 @@ fn cat(parts: &[String]) -> Option<CatalogTable> {
         "customers" => &["id", "name", "country"],
         _ => return None,
     };
-    Some(CatalogTable { name: format!("sales.{name}"), columns: cols.iter().map(|c| c.to_string()).collect() })
+    Some(CatalogTable { name: format!("sales.{name}"), columns: cols.iter().map(|c| c.to_string()).collect(), view_sql: None })
 }
 
 fn run(sql: &str) -> Lineage {
@@ -55,11 +55,9 @@ fn serde_json_kind(k: EdgeKind) -> &'static str {
 
 #[test]
 fn select_join_aggregate_filter() {
-    let g = run(
-        "select c.name, sum(o.amount) as total, upper(c.country) country_u \
+    let g = run("select c.name, sum(o.amount) as total, upper(c.country) country_u \
          from orders o join customers c on c.id = o.customer_id \
-         where o.status = 'paid' group by 1, 3",
-    );
+         where o.status = 'paid' group by 1, 3");
     assert_eq!(
         edges(&g),
         vec![
@@ -84,11 +82,9 @@ fn select_join_aggregate_filter() {
 
 #[test]
 fn ctes_star_and_subqueries() {
-    let g = run(
-        "with paid as (select * from orders where status = 'paid'), \
+    let g = run("with paid as (select * from orders where status = 'paid'), \
               per_c as (select customer_id, count(*) n from paid group by customer_id) \
-         select p.customer_id, p.n, (select max(amount) from orders) as top from per_c p",
-    );
+         select p.customer_id, p.n, (select max(amount) from orders) as top from per_c p");
     let e = edges(&g);
     assert!(e.contains(&"paid.customer_id -direct-> per_c.customer_id".to_string()), "{e:#?}");
     assert!(e.contains(&"sales.orders.amount -direct-> paid.amount".to_string()), "star expanded from the catalog");
@@ -119,11 +115,9 @@ fn union_by_position_and_unknown_tables() {
 
 #[test]
 fn script_links_written_tables() {
-    let g = run(
-        "create table tmp_paid as select id, amount from orders where status = 'paid';\n\
+    let g = run("create table tmp_paid as select id, amount from orders where status = 'paid';\n\
          insert into mart_total (total) select sum(amount) from tmp_paid;\n\
-         select * from mart_total",
-    );
+         select * from mart_total");
     let e = edges(&g);
     assert!(e.contains(&"sales.orders.amount -direct-> SELECT.amount".to_string()), "{e:#?}");
     assert!(e.contains(&"SELECT.amount -direct-> tmp_paid.amount".to_string()));
@@ -194,25 +188,21 @@ fn unparsable_statement_is_partial() {
 
 /// `from -kind-> to [statements]` lines of the table-level chain, sorted.
 fn flows_of(g: &Lineage) -> Vec<String> {
-    let mut v: Vec<String> = g
-        .flows
-        .iter()
-        .map(|f| format!("{} -{}-> {} {:?}", name(g, &f.from), serde_json_kind(f.kind), name(g, &f.to), f.statements))
-        .collect();
+    let mut v: Vec<String> =
+        g.flows.iter().map(|f| format!("{} -{}-> {} {:?}", name(g, &f.from), serde_json_kind(f.kind), name(g, &f.to), f.statements)).collect();
     v.sort();
     v
 }
 
 #[test]
 fn chain_through_insert_update_ctas_merge_delete() {
-    let g = run(
-        "insert into a (id, amount) select o.id, o.amount from (select * from orders where status = 'paid') o join customers c on c.id = o.customer_id;\n\
+    let g =
+        run("insert into a (id, amount) select o.id, o.amount from (select * from orders where status = 'paid') o join customers c on c.id = o.customer_id;\n\
          update b set total = a.amount * 2 from a where b.id = a.id;\n\
          create table c as select * from b;\n\
          merge into d using c on d.id = c.id when matched then update set total = c.total when not matched then insert (id, total) values (c.id, c.total);\n\
          delete from d using customers x where d.id = x.id and x.country = 'VN';\n\
-         select * from d",
-    );
+         select * from d");
     let kinds: Vec<&str> = g.statements.iter().map(|s| s.kind.as_str()).collect();
     assert_eq!(kinds, vec!["insert", "update", "create_table_as", "merge", "delete", "select"]);
     assert_eq!(
@@ -247,7 +237,8 @@ fn chain_through_insert_update_ctas_merge_delete() {
 #[test]
 fn chain_names_ddl_and_temp_tables() {
     // Written unqualified, read qualified (and the other way round): one node.
-    let g = run("create table tmp as select id, amount from orders;\nselect amount from public.tmp;\ninsert into stage.t2 select * from tmp;\nselect * from t2");
+    let g =
+        run("create table tmp as select id, amount from orders;\nselect amount from public.tmp;\ninsert into stage.t2 select * from tmp;\nselect * from t2");
     assert_eq!(g.nodes.iter().filter(|n| n.name.ends_with("tmp")).count(), 1, "{:?}", g.nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
     assert!(flows_of(&g).contains(&"public.tmp -direct-> stage.t2 [2]".to_string()), "{:#?}", flows_of(&g));
     assert!(flows_of(&g).contains(&"stage.t2 -direct-> Result 4 [3]".to_string()), "{:#?}", flows_of(&g));
@@ -275,7 +266,8 @@ fn chain_names_ddl_and_temp_tables() {
 
 #[test]
 fn select_into_starts_a_chain() {
-    let g = analyze("select id, amount into #stage from orders where status = 'paid';\ninsert into mart (id, total) select id, amount from #stage", K::Mssql, &cat);
+    let g =
+        analyze("select id, amount into #stage from orders where status = 'paid';\ninsert into mart (id, total) select id, amount from #stage", K::Mssql, &cat);
     assert_eq!(g.statements[0].kind, "select_into");
     let f = flows_of(&g);
     assert!(f.contains(&"#stage -direct-> mart [1]".to_string()), "{f:#?}");
@@ -316,4 +308,113 @@ fn chain_review_cases() {
     // Dropped only: not drawn, not looked up.
     let g = run("drop table if exists old_stuff");
     assert!(g.nodes.is_empty() && g.unknown_tables.is_empty());
+}
+
+/// `WITH … UPDATE/DELETE/INSERT`: the statement reads its CTEs, which are
+/// traced like those of a SELECT (no "not traced" warning).
+#[test]
+fn with_feeds_update_delete_insert() {
+    let g = run("with recent as (select customer_id, sum(amount) as total from orders group by customer_id) \
+         update customers c set name = r.total from recent r where r.customer_id = c.id");
+    assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    assert_eq!(g.statements[0].kind, "update");
+    let e = edges(&g);
+    for want in ["sales.orders.amount -aggregate-> recent.total", "recent.total -direct-> sales.customers.name", "recent.customer_id -filter-> sales.customers"]
+    {
+        assert!(e.contains(&want.to_string()), "{want}: {e:#?}");
+    }
+    assert!(flows_of(&g).iter().any(|f| f.starts_with("sales.orders -aggregate-> sales.customers")), "{:#?}", flows_of(&g));
+
+    let g = run("with gone as (select customer_id from orders where status = 'x') delete from customers where id in (select customer_id from gone)");
+    assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    assert_eq!(g.statements[0].kind, "delete");
+    assert!(edges(&g).contains(&"sales.orders.customer_id -direct-> gone.customer_id".to_string()), "{:#?}", edges(&g));
+    assert!(flows_of(&g).iter().any(|f| f.starts_with("sales.orders -filter-> sales.customers")), "{:#?}", flows_of(&g));
+
+    let g = run("with x as (select id, amount from orders) insert into archive (id, amount) select id, amount from x");
+    assert_eq!(g.statements[0].kind, "insert");
+    assert!(flows_of(&g).iter().any(|f| f.starts_with("sales.orders -direct-> archive")), "{:#?}", flows_of(&g));
+}
+
+/// A recursive CTE without a column list takes its anchor's names, so the
+/// recursive step's columns resolve; SQL Server/Oracle write it without
+/// RECURSIVE, and a CTE that reads itself is recognised as one.
+#[test]
+fn recursive_cte_without_column_list_or_keyword() {
+    let g = run("with recursive t as (select 1 as n union all select n + 1 from t where n < 5) select n from t");
+    let e = edges(&g);
+    assert!(e.contains(&"t.n -transform-> SELECT.n + 1".to_string()), "the recursive step reads t.n: {e:#?}");
+    assert!(e.contains(&"t.n -direct-> Result.n".to_string()), "{e:#?}");
+    assert_eq!(g.nodes.iter().filter(|n| n.name == "t").count(), 1, "placeholder merged");
+
+    let g = analyze(
+        "with tree as (select id, customer_id as parent from orders \
+         union all select o.id, t.parent from orders o join tree t on o.customer_id = t.id) select parent from tree",
+        K::Mssql,
+        &cat,
+    );
+    let e = edges(&g);
+    assert!(e.contains(&"tree.parent -direct-> SELECT.parent".to_string()), "the recursive step reads the CTE: {e:#?}");
+    assert!(e.contains(&"sales.orders.customer_id -direct-> SELECT.parent".to_string()), "{e:#?}");
+    assert_eq!(g.nodes.iter().filter(|n| n.name.eq_ignore_ascii_case("tree")).count(), 1, "not a database table");
+    assert!(g.unknown_tables.is_empty(), "{:?}", g.unknown_tables);
+}
+
+fn cat_with_views(parts: &[String]) -> Option<CatalogTable> {
+    let name = parts.last()?.to_lowercase();
+    let view = |cols: &[&str], sql: &str| CatalogTable {
+        name: format!("sales.{name}"),
+        columns: cols.iter().map(|c| c.to_string()).collect(),
+        view_sql: Some(sql.into()),
+    };
+    match name.as_str() {
+        "v_big" => Some(view(
+            &["id", "doubled", "name"],
+            "CREATE OR REPLACE VIEW sales.v_big AS SELECT o.id, o.amount * 2 AS doubled, c.name FROM orders o JOIN customers c ON c.id = o.customer_id",
+        )),
+        "v_top" => Some(view(&["who", "doubled"], "create view sales.v_top (who, doubled) as select name, doubled from v_big where doubled > 10")),
+        "v_bad" => Some(view(&["x"], "this is not sql")),
+        _ => cat(parts),
+    }
+}
+
+/// A view the SQL reads is traced through its definition into the tables
+/// it reads, views of views too; its SQL gets no spans in the editor.
+#[test]
+fn views_are_expanded() {
+    let sql = "select who, doubled from v_top";
+    let g = analyze(sql, K::Postgres, &cat_with_views);
+    let e = edges(&g);
+    for want in [
+        "sales.orders.amount -transform-> sales.v_big definition.doubled",
+        "sales.v_big definition.doubled -direct-> sales.v_big.doubled",
+        "sales.customers.name -direct-> sales.v_big definition.name",
+        "sales.v_top definition.name -direct-> sales.v_top.who",
+        "sales.v_top.who -direct-> Result.who",
+    ] {
+        assert!(e.contains(&want.to_string()), "{want}: {e:#?}");
+    }
+    // The chain goes table → view → view → result.
+    assert_eq!(
+        flows_of(&g),
+        vec![
+            "sales.customers -direct-> sales.v_big [0]",
+            "sales.orders -transform-> sales.v_big [0]",
+            "sales.v_big -direct-> sales.v_top [0]",
+            "sales.v_top -direct-> Result [0]"
+        ]
+    );
+    assert!(g.nodes.iter().filter(|n| n.view).count() == 2);
+    for n in &g.nodes {
+        if let Some(r) = n.span {
+            assert!(r.end <= sql.len(), "{} has a span outside the editor's SQL", n.name);
+        }
+    }
+    // A definition that can't be parsed: a plain table with a warning.
+    let g = analyze("select x from v_bad", K::Postgres, &cat_with_views);
+    assert!(g.warnings.iter().any(|w| w.message.contains("v_bad")), "{:?}", g.warnings);
+    assert_eq!(edges(&g), vec!["sales.v_bad.x -direct-> Result.x"]);
+    // A view the script writes is its own definition, not the database's.
+    let g = analyze("create or replace view v_big as select id from customers; select id from v_big", K::Postgres, &cat_with_views);
+    assert!(!edges(&g).iter().any(|e| e.contains("orders")), "{:#?}", edges(&g));
 }

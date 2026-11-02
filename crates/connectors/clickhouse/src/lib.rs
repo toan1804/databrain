@@ -13,10 +13,9 @@ use async_trait::async_trait;
 use databrain_auth::{AuthMethodKind, Credential, CredentialSource};
 use databrain_connector_core::value::{parse_date, parse_datetime};
 use databrain_connector_core::{
-    BatchBuilder, Capabilities, ColType, Column, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo,
-    ConnectorKind, DbObject, ErrorKind, ExecOptions, ExecSummary, FieldSpec, IndexInfo, ObjectDetail, ObjectKind,
-    QueryStream, Result, SchemaInfo, Session, SslMode, StreamEvent, StreamSender, TableColumns, TableLayout, Value,
-    split_key_list,
+    BatchBuilder, Capabilities, ColType, Column, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind,
+    ExecOptions, ExecSummary, FieldSpec, IndexInfo, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, SslMode, StreamEvent, StreamSender,
+    TableColumns, TableLayout, Value, split_key_list,
 };
 use secrecy::ExposeSecret;
 
@@ -143,12 +142,7 @@ impl Inner {
             // Read and SET only; enforced by the server.
             q.push(("readonly", "2".into()));
         }
-        self.http
-            .post(&self.base)
-            .query(&q)
-            .header("X-ClickHouse-User", &self.user)
-            .header("X-ClickHouse-Key", &self.password)
-            .body(sql.to_string())
+        self.http.post(&self.base).query(&q).header("X-ClickHouse-User", &self.user).header("X-ClickHouse-Key", &self.password).body(sql.to_string())
     }
 
     async fn send(&self, sql: &str, query_id: &str, in_session: bool) -> Result<reqwest::Response> {
@@ -349,7 +343,10 @@ fn server_error(code: Option<u32>, status: u16, text: &str) -> ConnectorError {
         msg = &msg[..i];
     }
     // The error name: `(UNKNOWN_TABLE)` at the end.
-    let name = msg.strip_suffix(')').and_then(|m| m.rfind(" (").map(|i| (&m[i + 2..], &m[..i]))).filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()));
+    let name = msg
+        .strip_suffix(')')
+        .and_then(|m| m.rfind(" (").map(|i| (&m[i + 2..], &m[..i])))
+        .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()));
     let (name, msg) = match name {
         Some((n, m)) => (Some(n.to_string()), m.trim_end_matches('.').to_string() + "."),
         None => (None, msg.to_string()),
@@ -476,8 +473,26 @@ fn object_kind(engine: &str) -> ObjectKind {
         "View" | "LiveView" | "WindowView" => ObjectKind::View,
         "MaterializedView" => ObjectKind::MaterializedView,
         e if [
-            "MySQL", "PostgreSQL", "MongoDB", "Redis", "SQLite", "ODBC", "JDBC", "URL", "S3", "S3Queue", "AzureBlobStorage", "AzureQueue", "HDFS",
-            "File", "Kafka", "RabbitMQ", "NATS", "DeltaLake", "Hudi", "ExternalDistributed",
+            "MySQL",
+            "PostgreSQL",
+            "MongoDB",
+            "Redis",
+            "SQLite",
+            "ODBC",
+            "JDBC",
+            "URL",
+            "S3",
+            "S3Queue",
+            "AzureBlobStorage",
+            "AzureQueue",
+            "HDFS",
+            "File",
+            "Kafka",
+            "RabbitMQ",
+            "NATS",
+            "DeltaLake",
+            "Hudi",
+            "ExternalDistributed",
         ]
         .contains(&e)
             || e.starts_with("Iceberg") =>
@@ -579,7 +594,10 @@ impl Session for ChSession {
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let t = self
             .0
-            .rows(&format!("SELECT engine, comment, total_rows, create_table_query FROM system.tables WHERE database = {} AND name = {}", lit(schema), lit(name)), false)
+            .rows(
+                &format!("SELECT engine, comment, total_rows, create_table_query FROM system.tables WHERE database = {} AND name = {}", lit(schema), lit(name)),
+                false,
+            )
             .await?;
         let Some(t) = t.into_iter().next() else {
             return Err(ConnectorError::query(format!("{schema}.{name} not found")));
@@ -619,7 +637,15 @@ impl Session for ChSession {
     /// Primary key, partition key, sorting key and data skipping indexes (MergeTree).
     async fn table_layout(&self, schema: &str, name: &str) -> Result<TableLayout> {
         let (s, n) = (lit(schema), lit(name));
-        let t = self.0.rows(&format!("SELECT primary_key, partition_key, sorting_key, total_rows, engine FROM system.tables WHERE database = {s} AND name = {n}"), false).await?;
+        let t = self
+            .0
+            .rows(
+                &format!(
+                    "SELECT primary_key, partition_key, sorting_key, total_rows, engine, total_bytes FROM system.tables WHERE database = {s} AND name = {n}"
+                ),
+                false,
+            )
+            .await?;
         let Some(t) = t.into_iter().next() else { return Ok(TableLayout::default()) };
         let get = |i: usize| t.get(i).cloned().flatten().unwrap_or_default();
         let mut indexes = Vec::new();
@@ -631,7 +657,13 @@ impl Session for ChSession {
         if let Ok(rows) = self.0.rows(&format!("SELECT name, expr, type FROM system.data_skipping_indices WHERE database = {s} AND table = {n}"), false).await {
             for r in rows {
                 let g = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
-                indexes.push(IndexInfo { name: g(0), columns: split_key_list(&g(1)), unique: false, primary: false, method: Some(g(2)).filter(|m| !m.is_empty()) });
+                indexes.push(IndexInfo {
+                    name: g(0),
+                    columns: split_key_list(&g(1)),
+                    unique: false,
+                    primary: false,
+                    method: Some(g(2)).filter(|m| !m.is_empty()),
+                });
             }
         }
         let engine = get(4);
@@ -642,6 +674,7 @@ impl Session for ChSession {
             cluster_by: split_key_list(&get(2)),
             requires_partition_filter: false,
             row_estimate: get(3).parse().ok(),
+            size_bytes: get(5).parse().ok(),
             notes: if engine.is_empty() { vec![] } else { vec![format!("ENGINE = {engine}")] },
         })
     }
@@ -680,7 +713,14 @@ mod tests {
         assert_eq!(col_type("Decimal(18, 4)"), ColType::Utf8);
         assert_eq!(cell(ColType::UInt64, Some("18446744073709551615".into())), Value::UInt(u64::MAX));
         assert_eq!(cell(ColType::Int64, None), Value::Null);
-        let c = column_info(&[Some("a".into()), Some("Nullable(Int32)".into()), Some("MATERIALIZED".into()), Some("b + 1".into()), Some("".into()), Some("0".into())]);
+        let c = column_info(&[
+            Some("a".into()),
+            Some("Nullable(Int32)".into()),
+            Some("MATERIALIZED".into()),
+            Some("b + 1".into()),
+            Some("".into()),
+            Some("0".into()),
+        ]);
         assert!(c.nullable);
         assert_eq!(c.default.as_deref(), Some("MATERIALIZED b + 1"));
         assert!(!column_info(&[Some("a".into()), Some("Int32".into())]).nullable);
@@ -690,7 +730,11 @@ mod tests {
     fn errors() {
         let e = server_error(Some(60), 404, "Code: 60. DB::Exception: Table default.x does not exist. (UNKNOWN_TABLE) (version 24.3.2.23 (official build))\n");
         assert_eq!((e.kind, e.message.as_str(), e.code.as_deref()), (ErrorKind::Query, "Table default.x does not exist.", Some("60 (UNKNOWN_TABLE)")));
-        let e = server_error(None, 400, "Code: 62. DB::Exception: Syntax error: failed at position 8 ('fro'): fro x. Expected one of: ... (SYNTAX_ERROR) (version 24.3)");
+        let e = server_error(
+            None,
+            400,
+            "Code: 62. DB::Exception: Syntax error: failed at position 8 ('fro'): fro x. Expected one of: ... (SYNTAX_ERROR) (version 24.3)",
+        );
         assert_eq!((e.position, e.code.as_deref()), (Some(8), Some("62 (SYNTAX_ERROR)")));
         assert_eq!(server_error(Some(516), 403, "Code: 516. DB::Exception: default: Authentication failed. (AUTHENTICATION_FAILED)").kind, ErrorKind::Auth);
         assert_eq!(server_error(Some(394), 500, "Code: 394. DB::Exception: Query was cancelled. (QUERY_WAS_CANCELLED)").kind, ErrorKind::Cancelled);
@@ -729,7 +773,10 @@ mod tests {
         run("CREATE OR REPLACE TABLE t (id UInt64, name Nullable(String), d Date, ts DateTime64(3), amt Decimal(18, 4)) ENGINE = MergeTree PARTITION BY toYYYYMM(d) ORDER BY id")
             .await
             .unwrap();
-        let ins = run("INSERT INTO t VALUES (1, 'a\\tb', '2024-01-02', '2024-01-02 03:04:05.678', 1.5), (18446744073709551615, NULL, '2024-02-01', now64(), 2)").await.unwrap();
+        let ins =
+            run("INSERT INTO t VALUES (1, 'a\\tb', '2024-01-02', '2024-01-02 03:04:05.678', 1.5), (18446744073709551615, NULL, '2024-02-01', now64(), 2)")
+                .await
+                .unwrap();
         assert_eq!(ins.summary.rows_affected, Some(2));
         let r = run("SELECT * FROM t ORDER BY id").await.unwrap();
         assert_eq!(r.num_rows(), 2);
@@ -751,6 +798,8 @@ mod tests {
         assert!(d.columns[0].is_primary_key && d.columns[1].nullable && d.ddl.unwrap().contains("MergeTree"));
         let l = s.table_layout("databrain_t", "t").await.unwrap();
         assert_eq!((l.indexes[0].columns.clone(), l.partition_by.clone()), (vec!["id".to_string()], vec!["toYYYYMM(d)".to_string()]));
+        assert_eq!(l.row_estimate, Some(2), "{l:?}");
+        assert!(l.size_bytes.is_some_and(|b| b > 0), "{l:?}");
         assert_eq!(s.schema_columns("databrain_t").await.unwrap()[0].columns.len(), 5);
         // A read-only connection: the server refuses writes.
         let mut ro = cfg.clone();
@@ -764,7 +813,10 @@ mod tests {
         assert_eq!(r.execute("SELECT count() FROM databrain_t.t", ExecOptions::default()).await.unwrap().collect().await.unwrap().num_rows(), 1);
         // Cancel a long query.
         let cancel = databrain_connector_core::CancellationToken::new();
-        let stream = s.execute("SELECT sleepEachRow(1) FROM numbers(30) SETTINGS max_block_size = 1", ExecOptions { cancel: cancel.clone(), ..Default::default() }).await.unwrap();
+        let stream = s
+            .execute("SELECT sleepEachRow(1) FROM numbers(30) SETTINGS max_block_size = 1", ExecOptions { cancel: cancel.clone(), ..Default::default() })
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         cancel.cancel();
         assert_eq!(stream.collect().await.unwrap_err().kind, ErrorKind::Cancelled);

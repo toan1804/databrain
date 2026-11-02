@@ -29,12 +29,7 @@ pub struct ConnectorError {
 
 impl ConnectorError {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-            code: None,
-            position: None,
-        }
+        Self { kind, message: message.into(), code: None, position: None }
     }
     pub fn query(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Query, message)

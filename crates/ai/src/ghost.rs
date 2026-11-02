@@ -113,10 +113,8 @@ pub async fn complete(ws: &Workspace, secrets: Arc<dyn SecretStore>, req: &Ghost
          Finish the current clause or statement (at most 6 lines); stop at the end of the statement. \
          Use only tables and columns from the schema or the SQL itself. If no continuation is clear, reply with nothing."
     );
-    let user = format!(
-        "{}SQL (cursor at <CURSOR>):\n{prefix}<CURSOR>{suffix}",
-        if schema.is_empty() { String::new() } else { format!("Schema:\n{schema}\n\n") }
-    );
+    let user =
+        format!("{}SQL (cursor at <CURSOR>):\n{prefix}<CURSOR>{suffix}", if schema.is_empty() { String::new() } else { format!("Schema:\n{schema}\n\n") });
     let chat = ChatRequest { model, system, messages: vec![Message::user(user)], tools: vec![], temperature: Some(0.0), max_tokens: Some(160) };
 
     let run = async {

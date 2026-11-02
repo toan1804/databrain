@@ -70,6 +70,8 @@ import type { ResultLink } from "./bindings/ResultLink";
 import type { LoadCheck } from "./bindings/LoadCheck";
 import type { LoadDryRun } from "./bindings/LoadDryRun";
 import type { LoadReport } from "./bindings/LoadReport";
+import type { ParamSet } from "./bindings/ParamSet";
+import type { RunParams } from "./bindings/RunParams";
 import type { LoadTarget } from "./bindings/LoadTarget";
 import type { PlanNode } from "./bindings/PlanNode";
 import type { QueryPlan } from "./bindings/QueryPlan";
@@ -227,6 +229,8 @@ export type {
   LoadCheck,
   LoadDryRun,
   LoadReport,
+  ParamSet,
+  RunParams,
   LoadTarget,
   PlanNode,
   QueryPlan,

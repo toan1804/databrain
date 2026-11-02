@@ -229,11 +229,7 @@ impl ResultSet {
         if let Some(c) = &self.combined {
             return Ok(c.clone());
         }
-        let c = if self.batches.len() == 1 {
-            self.batches[0].clone()
-        } else {
-            wide::concat_wide(&self.schema, &self.batches, self.wide_limit)?
-        };
+        let c = if self.batches.len() == 1 { self.batches[0].clone() } else { wide::concat_wide(&self.schema, &self.batches, self.wide_limit)? };
         // Once complete, keep only the combined copy to halve memory use.
         if self.complete {
             self.batches = vec![c.clone()];
@@ -254,11 +250,7 @@ impl ResultSet {
         }
         let batch = self.combined()?;
         let idx = Arc::new(view::compute_view(&batch, spec, &mut self.display_cache)?);
-        self.view_cache = Some(ViewCache {
-            spec: spec.clone(),
-            rows: self.total_rows,
-            indices: idx.clone(),
-        });
+        self.view_cache = Some(ViewCache { spec: spec.clone(), rows: self.total_rows, indices: idx.clone() });
         Ok(Some(idx))
     }
 
@@ -273,7 +265,8 @@ impl ResultSet {
     /// `columns` (empty = all). Numbers (also exact decimals) are summed.
     pub fn summarize(&mut self, spec: &ViewSpec, columns: &[usize], offset: usize, limit: usize) -> Result<SelectionSummary> {
         let (batch, _) = self.view_slice(spec, offset, limit)?;
-        let cols: Vec<usize> = if columns.is_empty() { (0..batch.num_columns()).collect() } else { columns.iter().copied().filter(|&c| c < batch.num_columns()).collect() };
+        let cols: Vec<usize> =
+            if columns.is_empty() { (0..batch.num_columns()).collect() } else { columns.iter().copied().filter(|&c| c < batch.num_columns()).collect() };
         let opts = display::format_options();
         let mut s = SelectionSummary::default();
         let mut distinct = std::collections::HashSet::new();
@@ -317,12 +310,7 @@ impl ResultSet {
     }
 
     /// Rows `[offset, offset+limit)` of the view as a batch plus original ids.
-    pub fn view_slice(
-        &mut self,
-        spec: &ViewSpec,
-        offset: usize,
-        limit: usize,
-    ) -> Result<(RecordBatch, Vec<u32>)> {
+    pub fn view_slice(&mut self, spec: &ViewSpec, offset: usize, limit: usize) -> Result<(RecordBatch, Vec<u32>)> {
         let batch = self.combined()?;
         let (b, ids) = match self.view_indices(spec)? {
             None => {
@@ -351,27 +339,9 @@ impl ResultSet {
         let view_rows = self.view_len(spec)?;
         let (batch, row_ids) = self.view_slice(spec, offset, limit)?;
         let opts = display::format_options();
-        let formatters: Vec<ArrayFormatter<'_>> = batch
-            .columns()
-            .iter()
-            .map(|c| ArrayFormatter::try_new(c.as_ref(), &opts))
-            .collect::<Result<_, _>>()?;
-        let rows = (0..batch.num_rows())
-            .map(|r| {
-                formatters
-                    .iter()
-                    .zip(batch.columns())
-                    .map(|(f, a)| display::cell(f, a, r))
-                    .collect()
-            })
-            .collect();
-        Ok(Page {
-            view_rows,
-            total_rows: self.total_rows,
-            offset,
-            row_ids,
-            rows,
-        })
+        let formatters: Vec<ArrayFormatter<'_>> = batch.columns().iter().map(|c| ArrayFormatter::try_new(c.as_ref(), &opts)).collect::<Result<_, _>>()?;
+        let rows = (0..batch.num_rows()).map(|r| formatters.iter().zip(batch.columns()).map(|(f, a)| display::cell(f, a, r)).collect()).collect();
+        Ok(Page { view_rows, total_rows: self.total_rows, offset, row_ids, rows })
     }
 
     /// Find cells containing `query` (case-insensitive) within the view.
@@ -390,10 +360,7 @@ impl ResultSet {
     pub fn find_with(&mut self, spec: &ViewSpec, query: &str, columns: Option<&[usize]>, limit: usize, whole_word: bool) -> Result<FindResult> {
         let mut matches = Vec::new();
         if query.is_empty() || self.total_rows == 0 {
-            return Ok(FindResult {
-                matches,
-                truncated: false,
-            });
+            return Ok(FindResult { matches, truncated: false });
         }
         let batch = self.combined()?;
         let idx = self.view_indices(spec)?;
@@ -429,22 +396,13 @@ impl ResultSet {
             for c in 0..batch.num_columns() {
                 if hit(row, c) {
                     if matches.len() >= limit {
-                        return Ok(FindResult {
-                            matches,
-                            truncated: true,
-                        });
+                        return Ok(FindResult { matches, truncated: true });
                     }
-                    matches.push(CellMatch {
-                        row: vr as u32,
-                        col: c as u32,
-                    });
+                    matches.push(CellMatch { row: vr as u32, col: c as u32 });
                 }
             }
         }
-        Ok(FindResult {
-            matches,
-            truncated: false,
-        })
+        Ok(FindResult { matches, truncated: false })
     }
 
     /// Statistics of one column over the current view.
@@ -459,28 +417,13 @@ impl ResultSet {
         let nulls = col.null_count() as u64;
 
         // min / max via sort (works for every orderable type).
-        let sortable = if display::is_decimal_text(&field) {
-            compute::cast(&col, &databrain_connector_core::arrow::datatypes::DataType::Float64)?
-        } else {
-            col.clone()
-        };
+        let sortable =
+            if display::is_decimal_text(&field) { compute::cast(&col, &databrain_connector_core::arrow::datatypes::DataType::Float64)? } else { col.clone() };
         let (mut min, mut max) = (None, None);
         if col.len() > nulls as usize {
-            if let Ok(order) = compute::sort_to_indices(
-                sortable.as_ref(),
-                Some(compute::SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                }),
-                None,
-            ) {
+            if let Ok(order) = compute::sort_to_indices(sortable.as_ref(), Some(compute::SortOptions { descending: false, nulls_first: false }), None) {
                 let text = display::to_display(col.as_ref())?;
-                let non_null: Vec<u32> = order
-                    .values()
-                    .iter()
-                    .copied()
-                    .filter(|i| !sortable.is_null(*i as usize))
-                    .collect();
+                let non_null: Vec<u32> = order.values().iter().copied().filter(|i| !sortable.is_null(*i as usize)).collect();
                 if let (Some(first), Some(last)) = (non_null.first(), non_null.last()) {
                     min = Some(text.value(*first as usize).to_string());
                     max = Some(text.value(*last as usize).to_string());
@@ -491,34 +434,15 @@ impl ResultSet {
         let text = display::to_display(col.as_ref())?;
         let mut counts: HashMap<Option<&str>, u64> = HashMap::new();
         for i in 0..text.len() {
-            let k = if text.is_null(i) {
-                None
-            } else {
-                Some(text.value(i))
-            };
+            let k = if text.is_null(i) { None } else { Some(text.value(i)) };
             *counts.entry(k).or_default() += 1;
         }
         let distinct = counts.keys().filter(|k| k.is_some()).count() as u64;
         let mut top: Vec<(Option<&str>, u64)> = counts.into_iter().collect();
         top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let top = top
-            .into_iter()
-            .take(10)
-            .map(|(v, count)| TopValue {
-                value: v.map(|s| s.to_string()),
-                count,
-            })
-            .collect();
+        let top = top.into_iter().take(10).map(|(v, count)| TopValue { value: v.map(|s| s.to_string()), count }).collect();
 
-        Ok(ColumnStats {
-            column,
-            count: col.len() as u64,
-            nulls,
-            distinct,
-            min,
-            max,
-            top,
-        })
+        Ok(ColumnStats { column, count: col.len() as u64, nulls, distinct, min, max, top })
     }
 
     /// The view as a sequence of batches (for export, outputs), at most
@@ -595,11 +519,7 @@ impl ResultStore {
     }
 
     pub fn get(&self, id: &str) -> Result<Arc<Mutex<ResultSet>>> {
-        self.results
-            .lock()
-            .get(id)
-            .cloned()
-            .ok_or_else(|| Error::NotFound(id.to_string()))
+        self.results.lock().get(id).cloned().ok_or_else(|| Error::NotFound(id.to_string()))
     }
 
     pub fn remove(&self, id: &str) -> bool {
@@ -607,11 +527,7 @@ impl ResultStore {
     }
 
     pub fn total_bytes(&self) -> usize {
-        self.results
-            .lock()
-            .values()
-            .map(|r| r.lock().memory_bytes())
-            .sum()
+        self.results.lock().values().map(|r| r.lock().memory_bytes()).sum()
     }
 }
 
@@ -677,16 +593,8 @@ mod tests {
         let mut rs = sample();
         let spec = ViewSpec {
             filters: vec![
-                ColumnFilter {
-                    column: 1,
-                    op: FilterOp::Contains,
-                    value: "ALI".into(),
-                },
-                ColumnFilter {
-                    column: 2,
-                    op: FilterOp::Gte,
-                    value: "8".into(),
-                },
+                ColumnFilter { column: 1, op: FilterOp::Contains, value: "ALI".into() },
+                ColumnFilter { column: 2, op: FilterOp::Gte, value: "8".into() },
             ],
             ..Default::default()
         };
@@ -694,14 +602,7 @@ mod tests {
         assert_eq!(ids(&p), vec!["1", "4"]);
         assert_eq!(p.view_rows, 2);
 
-        let bad = ViewSpec {
-            filters: vec![ColumnFilter {
-                column: 0,
-                op: FilterOp::Gt,
-                value: "abc".into(),
-            }],
-            ..Default::default()
-        };
+        let bad = ViewSpec { filters: vec![ColumnFilter { column: 0, op: FilterOp::Gt, value: "abc".into() }], ..Default::default() };
         assert!(matches!(rs.page(&bad, 0, 10), Err(Error::InvalidFilterValue(_))));
     }
 
@@ -726,7 +627,9 @@ mod tests {
         let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec![Some("paid"), Some("ID 7"), None, Some("my id")]))]).unwrap();
         let mut rs = ResultSet::new("w", schema);
         rs.push(b);
-        let rows = |rs: &mut ResultSet, w: bool| -> Vec<u32> { rs.find_with(&ViewSpec::default(), "id", None, 10, w).unwrap().matches.iter().map(|m| m.row).collect() };
+        let rows = |rs: &mut ResultSet, w: bool| -> Vec<u32> {
+            rs.find_with(&ViewSpec::default(), "id", None, 10, w).unwrap().matches.iter().map(|m| m.row).collect()
+        };
         assert_eq!(rows(&mut rs, false), vec![0, 1, 3]);
         assert_eq!(rows(&mut rs, true), vec![1, 3]);
     }
@@ -734,28 +637,10 @@ mod tests {
     #[test]
     fn sort_multi_and_decimal_text() {
         let mut rs = sample();
-        let spec = ViewSpec {
-            sort: vec![
-                SortKey {
-                    column: 2,
-                    descending: true,
-                },
-                SortKey {
-                    column: 0,
-                    descending: false,
-                },
-            ],
-            ..Default::default()
-        };
+        let spec = ViewSpec { sort: vec![SortKey { column: 2, descending: true }, SortKey { column: 0, descending: false }], ..Default::default() };
         // nulls last
         assert_eq!(ids(&rs.page(&spec, 0, 10).unwrap()), vec!["1", "5", "4", "3", "2"]);
-        let spec = ViewSpec {
-            sort: vec![SortKey {
-                column: 3,
-                descending: false,
-            }],
-            ..Default::default()
-        };
+        let spec = ViewSpec { sort: vec![SortKey { column: 3, descending: false }], ..Default::default() };
         // numeric order, not lexicographic
         assert_eq!(ids(&rs.page(&spec, 0, 10).unwrap()), vec!["4", "2", "5", "1", "3"]);
     }
@@ -763,10 +648,7 @@ mod tests {
     #[test]
     fn quick_filter_and_find() {
         let mut rs = sample();
-        let spec = ViewSpec {
-            quick_filter: Some("9.5".into()),
-            ..Default::default()
-        };
+        let spec = ViewSpec { quick_filter: Some("9.5".into()), ..Default::default() };
         assert_eq!(ids(&rs.page(&spec, 0, 10).unwrap()), vec!["1", "5"]);
         let f = rs.find(&ViewSpec::default(), "ali", 100).unwrap();
         assert_eq!(f.matches.len(), 2);
@@ -885,10 +767,7 @@ mod tests {
 
     #[test]
     fn view_spec_json() {
-        let s: ViewSpec = serde_json::from_str(
-            r#"{"filters":[{"column":1,"op":"is_null"}],"sort":[{"column":0}]}"#,
-        )
-        .unwrap();
+        let s: ViewSpec = serde_json::from_str(r#"{"filters":[{"column":1,"op":"is_null"}],"sort":[{"column":0}]}"#).unwrap();
         assert_eq!(s.filters[0].op, FilterOp::IsNull);
         assert!(!s.sort[0].descending);
     }

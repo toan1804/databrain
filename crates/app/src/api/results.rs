@@ -9,13 +9,7 @@ pub fn result_info(state: &AppState, result_id: &str) -> Result<ResultInfo> {
     Ok(state.results().get(result_id)?.lock().info())
 }
 
-pub async fn fetch_page(
-    state: &AppState,
-    result_id: String,
-    view: ViewSpec,
-    offset: usize,
-    limit: usize,
-) -> Result<Page> {
+pub async fn fetch_page(state: &AppState, result_id: String, view: ViewSpec, offset: usize, limit: usize) -> Result<Page> {
     let rs = state.results().get(&result_id)?;
     blocking(move || Ok(rs.lock().page(&view, offset, limit.min(MAX_PAGE))?)).await
 }
@@ -46,24 +40,13 @@ pub async fn summarize_selection(
     blocking(move || Ok(rs.lock().summarize(&view, &columns, offset, limit.min(MAX_COPY_ROWS))?)).await
 }
 
-pub async fn column_stats(
-    state: &AppState,
-    result_id: String,
-    view: ViewSpec,
-    column: usize,
-) -> Result<ColumnStats> {
+pub async fn column_stats(state: &AppState, result_id: String, view: ViewSpec, column: usize) -> Result<ColumnStats> {
     let rs = state.results().get(&result_id)?;
     blocking(move || Ok(rs.lock().column_stats(&view, column)?)).await
 }
 
 /// Export the view to a user-chosen file. Returns rows written.
-pub async fn export_result(
-    state: &AppState,
-    result_id: String,
-    view: ViewSpec,
-    options: ExportOptions,
-    path: String,
-) -> Result<u64> {
+pub async fn export_result(state: &AppState, result_id: String, view: ViewSpec, options: ExportOptions, path: String) -> Result<u64> {
     let path = PathBuf::from(path);
     if !path.is_absolute() {
         return Err(invalid("Export path must be absolute"));
@@ -110,10 +93,7 @@ fn write_export(
     let io = |e: std::io::Error| EngineError::new("internal", format!("{}: {e}", path.display()));
     // Write to a temp file in the same directory, then rename, so a failed
     // export never leaves a half-written file under the chosen name.
-    let tmp = path.with_extension(format!(
-        "{}.partial",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
-    ));
+    let tmp = path.with_extension(format!("{}.partial", path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")));
     match export_file(&tmp, schema, batches, options) {
         Ok(rows) => {
             std::fs::rename(&tmp, path).map_err(io)?;
@@ -128,14 +108,7 @@ fn write_export(
 
 /// Serialize rows `[offset, offset+limit)` of the view (optionally a subset of
 /// columns) for the clipboard.
-pub async fn copy_rows(
-    state: &AppState,
-    result_id: String,
-    view: ViewSpec,
-    offset: usize,
-    limit: usize,
-    options: ExportOptions,
-) -> Result<String> {
+pub async fn copy_rows(state: &AppState, result_id: String, view: ViewSpec, offset: usize, limit: usize, options: ExportOptions) -> Result<String> {
     let rs = state.results().get(&result_id)?;
     blocking(move || {
         let (schema, batch) = {
@@ -143,8 +116,7 @@ pub async fn copy_rows(
             let (b, _) = g.view_slice(&view, offset, limit.min(MAX_COPY_ROWS))?;
             (g.schema(), b)
         };
-        export_to_string(schema, [&batch], options)
-            .map_err(|e| EngineError::new("internal", e.to_string()))
+        export_to_string(schema, [&batch], options).map_err(|e| EngineError::new("internal", e.to_string()))
     })
     .await
 }
@@ -176,13 +148,22 @@ pub fn result_source(state: &AppState, result_id: &str) -> Result<Option<databra
 }
 
 /// The SQL the pending changes run (built here, not taken from the UI).
-pub fn edit_preview(state: &AppState, result_id: &str, target: &databrain_query_engine::edit::EditTarget, changes: &[databrain_query_engine::edit::RowChange]) -> Result<Vec<databrain_query_engine::edit::EditStatement>> {
+pub fn edit_preview(
+    state: &AppState,
+    result_id: &str,
+    target: &databrain_query_engine::edit::EditTarget,
+    changes: &[databrain_query_engine::edit::RowChange],
+) -> Result<Vec<databrain_query_engine::edit::EditStatement>> {
     let (_, schema) = edit_source(state, result_id)?;
     state.engine.edit_statements(target, &schema, changes)
 }
 
 /// Save the pending changes on the session the result came from.
-pub async fn apply_edits(state: &AppState, result_id: &str, changes: Vec<databrain_query_engine::edit::RowChange>) -> Result<databrain_query_engine::edit::ApplyReport> {
+pub async fn apply_edits(
+    state: &AppState,
+    result_id: &str,
+    changes: Vec<databrain_query_engine::edit::RowChange>,
+) -> Result<databrain_query_engine::edit::ApplyReport> {
     let (o, schema) = edit_source(state, result_id)?;
     // The target again (not the UI's copy), read from the database: the key
     // and columns it allows now.
@@ -224,14 +205,21 @@ fn default_true() -> bool {
 
 impl LoadResultArgs {
     fn spec(&self) -> databrain_query_engine::LoadSpec {
-        databrain_query_engine::LoadSpec { table: self.table.trim().to_string(), mode: self.mode, key_columns: self.key_columns.clone(), create_table: self.create_table, ..Default::default() }
+        databrain_query_engine::LoadSpec {
+            table: self.table.trim().to_string(),
+            mode: self.mode,
+            key_columns: self.key_columns.clone(),
+            create_table: self.create_table,
+            ..Default::default()
+        }
     }
 }
 
 /// UI event channel of loads from the grid (`{load_id, done, total}`).
 pub const LOAD_EVENT: &str = "load-progress";
 
-static LOADS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, databrain_connector_core::CancellationToken>>> = std::sync::LazyLock::new(Default::default);
+static LOADS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, databrain_connector_core::CancellationToken>>> =
+    std::sync::LazyLock::new(Default::default);
 
 struct LoadProgress {
     ui: Arc<dyn crate::ai_api::UiBridge>,

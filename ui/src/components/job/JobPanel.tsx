@@ -1,8 +1,9 @@
 // Side panel with no step selected: the job's schedule and its runs.
 import { useEffect, useState } from "react";
-import { Info, CalendarClock, RotateCcw } from "lucide-react";
+import { Info, CalendarClock, Play, RotateCcw, Variable } from "lucide-react";
 import { api } from "../../lib/api";
-import type { Job, JobRun, JobSchedule } from "../../lib/types";
+import type { ConnectorKind, Job, JobRun, JobSchedule, ParamValue, RunParams } from "../../lib/types";
+import { useStore } from "../../store";
 import { formatDuration, relativeTime } from "../../lib/util";
 import { useJobs } from "../../jobsStore";
 import { RunLog } from "./RunLog";
@@ -29,11 +30,117 @@ function runCounts(r: JobRun): string {
     .join(" · ");
 }
 
+/** `:name` parameters the job's SQL uses (step SQL, load before/after SQL), in order. */
+function useJobParamNames(job: Job): string[] {
+  const connections = useStore((s) => s.connections);
+  const [names, setNames] = useState<string[]>([]);
+  useEffect(() => {
+    let alive = true;
+    const kindOf = (id: string | null | undefined): ConnectorKind => (connections.find((c) => c.id === id)?.config.kind ?? "duckdb") as ConnectorKind;
+    const texts: [ConnectorKind, string][] = [];
+    for (const n of job.nodes) {
+      texts.push([n.kind === "query" ? kindOf(n.connection_id) : "duckdb", n.sql]);
+      for (const extra of [n.load_before_sql, n.load_after_sql]) if (extra) texts.push([kindOf(n.target_connection_id), extra]);
+    }
+    const t = setTimeout(() => {
+      Promise.all(texts.filter(([, sql]) => sql.includes(":") || sql.includes("&")).map(([k, sql]) => api.sqlParameters(k, sql).catch(() => [])))
+        .then((all) => alive && setNames([...new Set(all.flat().map((p) => p.name))]))
+        .catch(() => {});
+    }, 300);
+    return () => {
+      alive = false;
+      clearTimeout(t);
+    };
+  }, [job.nodes, connections]);
+  return names;
+}
+
+/** The job's `:name` values: a saved set, values of its own over it, and "Run with" another set. */
+function JobParams({ job, onChange, onRunWith }: { job: Job; onChange: (patch: Partial<Job>) => void; onRunWith: (p: RunParams) => void }) {
+  const names = useJobParamNames(job);
+  const sets = useStore((s) => s.paramSets);
+  useEffect(() => {
+    void useStore.getState().loadParamSets();
+  }, []);
+  const own = job.params ?? {};
+  const set = sets.find((s) => s.id === job.param_set);
+  const missingSet = !!job.param_set && !set && sets.length > 0;
+  const setValue = (n: string, value: string) => {
+    const next: Record<string, ParamValue> = Object.fromEntries(Object.entries(own).filter((e): e is [string, ParamValue] => !!e[1]));
+    if (value.trim()) next[n] = { ...next[n], value };
+    else delete next[n];
+    onChange({ params: next });
+  };
+  if (!names.length && !Object.keys(own).length && !job.param_set) return null;
+  return (
+    <section className="space-y-2">
+      <div className={`${label} flex items-center gap-1`}>
+        <Variable size={11} /> Parameters
+      </div>
+      <div className="flex items-center gap-2">
+        <select
+          className={`${field} min-w-0 flex-1`}
+          aria-label="Parameter set of the job"
+          value={job.param_set ?? ""}
+          onChange={(e) => onChange({ param_set: e.target.value || undefined })}
+        >
+          <option value="">No parameter set</option>
+          {sets.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </select>
+        {sets.length > 0 && (
+          <select
+            className={`${field} w-auto`}
+            aria-label="Run with another parameter set"
+            value=""
+            onChange={(e) => e.target.value && onRunWith({ set: e.target.value })}
+            title="Run now with another set's values (the job keeps its own)"
+          >
+            <option value="">Run with…</option>
+            {sets.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
+      {missingSet && <div className="text-[11.5px] text-danger">The job's parameter set was deleted: choose another, or runs fail.</div>}
+      {names.map((n) => {
+        const fromSet = set?.values[n]?.value;
+        const mine = own[n]?.value ?? "";
+        return (
+          <div key={n} className="flex items-center gap-2">
+            <label className="w-28 shrink-0 truncate font-mono text-[12px] text-accent" htmlFor={`jp-${n}`}>
+              :{n}
+            </label>
+            <input
+              id={`jp-${n}`}
+              className={`${field} font-mono ${!mine && !fromSet ? "border-dashed border-warning" : ""}`}
+              placeholder={fromSet ? `${fromSet} (from ${set!.name})` : "needs a value"}
+              value={mine}
+              onChange={(e) => setValue(n, e.target.value)}
+            />
+          </div>
+        );
+      })}
+      <div className="flex items-start gap-1 text-[11.5px] text-muted">
+        <Play size={11} className="mt-0.5 shrink-0" />
+        Every run fills the steps' :name with these values (a value here wins over the set's), on the schedule too. From a terminal: databrain-jobs run "{job.name}" --set NAME --param name=value.
+      </div>
+    </section>
+  );
+}
+
 export function JobPanel({
   job,
   run,
   canResume,
   onResume,
+  onRunWith,
   onChange,
   onSelect,
 }: {
@@ -42,6 +149,8 @@ export function JobPanel({
   /** The newest run can be resumed (it failed or was stopped). */
   canResume: boolean;
   onResume: () => void;
+  /** Run now with other parameter values. */
+  onRunWith: (params: RunParams) => void;
   onChange: (patch: Partial<Job>) => void;
   onSelect: (id: string) => void;
 }) {
@@ -65,6 +174,7 @@ export function JobPanel({
 
   return (
     <div className="space-y-4 p-3">
+      <JobParams job={job} onChange={onChange} onRunWith={onRunWith} />
       <section className="space-y-2">
         <div className="flex items-center justify-between">
           <div className={label}>Schedule</div>

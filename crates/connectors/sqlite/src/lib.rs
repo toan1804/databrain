@@ -7,9 +7,8 @@ use async_trait::async_trait;
 use databrain_auth::{AuthMethodKind, CredentialSource};
 use databrain_connector_core::value::Column;
 use databrain_connector_core::{
-    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError,
-    ConnectorInfo, ConnectorKind, DbObject, ErrorKind, ExecOptions, ExecSummary, FieldSpec, ForeignKey, ObjectDetail,
-    ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender, Value,
+    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind,
+    ExecOptions, ExecSummary, FieldSpec, ForeignKey, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender, Value,
     quote_ident,
 };
 use rusqlite::types::ValueRef;
@@ -41,55 +40,30 @@ impl Connector for SqliteConnector {
             default_port: None,
             uses_file: true,
             auth_methods: vec![AuthMethodKind::None],
-            capabilities: Capabilities {
-                transactions: true,
-                cancel: true,
-                schemas: true,
-                read_only_sessions: true,
-                ssh: false,
-            },
+            capabilities: Capabilities { transactions: true, cancel: true, schemas: true, read_only_sessions: true, ssh: false },
             fields: vec![FieldSpec::new("file_path", "Database file").required().placeholder("/path/to/database.db")],
             note: None,
         }
     }
 
-    async fn connect(
-        &self,
-        cfg: &ConnectionConfig,
-        _creds: Arc<dyn CredentialSource>,
-    ) -> Result<Box<dyn Session>> {
-        let path = cfg
-            .file_path
-            .clone()
-            .filter(|p| !p.trim().is_empty())
-            .ok_or_else(|| ConnectorError::config("SQLite connection needs a database file path"))?;
+    async fn connect(&self, cfg: &ConnectionConfig, _creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>> {
+        let path =
+            cfg.file_path.clone().filter(|p| !p.trim().is_empty()).ok_or_else(|| ConnectorError::config("SQLite connection needs a database file path"))?;
         let read_only = cfg.read_only;
-        let conn = tokio::task::spawn_blocking(move || open(&path, read_only))
-            .await
-            .map_err(|e| ConnectorError::internal(e.to_string()))??;
-        Ok(Box::new(SqliteSession {
-            interrupt: Arc::new(conn.get_interrupt_handle()),
-            conn: Arc::new(Mutex::new(conn)),
-        }))
+        let conn = tokio::task::spawn_blocking(move || open(&path, read_only)).await.map_err(|e| ConnectorError::internal(e.to_string()))??;
+        Ok(Box::new(SqliteSession { interrupt: Arc::new(conn.get_interrupt_handle()), conn: Arc::new(Mutex::new(conn)) }))
     }
 }
 
 fn open(path: &str, read_only: bool) -> Result<rusqlite::Connection> {
     let is_memory = path == ":memory:";
     if !is_memory && read_only && !Path::new(path).exists() {
-        return Err(ConnectorError::connection(format!(
-            "database file not found: {path}"
-        )));
+        return Err(ConnectorError::connection(format!("database file not found: {path}")));
     }
     let mut flags = OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    flags |= if read_only {
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-    } else {
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
-    };
+    flags |= if read_only { OpenFlags::SQLITE_OPEN_READ_ONLY } else { OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE };
     let conn = rusqlite::Connection::open_with_flags(path, flags).map_err(map_err)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(map_err)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(map_err)?;
     Ok(conn)
 }
 
@@ -102,11 +76,9 @@ fn map_err(e: rusqlite::Error) -> ConnectorError {
             let text = msg.clone().unwrap_or_else(|| fe.to_string());
             ConnectorError::query(text).with_code(fe.extended_code.to_string())
         }
-        rusqlite::Error::SqlInputError {
-            error, msg, offset, ..
-        } => ConnectorError::query(msg.clone())
-            .with_code(error.extended_code.to_string())
-            .with_position(u32::try_from(*offset + 1).ok()),
+        rusqlite::Error::SqlInputError { error, msg, offset, .. } => {
+            ConnectorError::query(msg.clone()).with_code(error.extended_code.to_string()).with_position(u32::try_from(*offset + 1).ok())
+        }
         _ => ConnectorError::query(e.to_string()),
     }
 }
@@ -124,9 +96,7 @@ impl SqliteSession {
     {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let guard = conn
-                .lock()
-                .map_err(|_| ConnectorError::internal("connection lock poisoned"))?;
+            let guard = conn.lock().map_err(|_| ConnectorError::internal("connection lock poisoned"))?;
             f(&guard)
         })
         .await
@@ -189,36 +159,22 @@ fn to_value(v: ValueRef<'_>) -> (Value, ValueKind) {
         ValueRef::Null => (Value::Null, ValueKind::Null),
         ValueRef::Integer(i) => (Value::Int(i), ValueKind::Int),
         ValueRef::Real(f) => (Value::Float(f), ValueKind::Real),
-        ValueRef::Text(t) => (
-            Value::Text(String::from_utf8_lossy(t).into_owned()),
-            ValueKind::Text,
-        ),
+        ValueRef::Text(t) => (Value::Text(String::from_utf8_lossy(t).into_owned()), ValueKind::Text),
         ValueRef::Blob(b) => (Value::Bytes(b.to_vec()), ValueKind::Blob),
     }
 }
 
 /// Runs on a blocking thread; streams rows through `tx`.
-fn run_query(
-    conn: &rusqlite::Connection,
-    sql: &str,
-    opts: &ExecOptions,
-    tx: &StreamSender,
-) -> Result<()> {
+fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
     let mut stmt = conn.prepare(sql).map_err(map_err)?;
     let ncols = stmt.column_count();
     if ncols == 0 {
         let n = stmt.raw_execute().map_err(map_err)?;
-        tx.blocking_send(Ok(StreamEvent::Done(ExecSummary {
-            rows_affected: Some(n as u64),
-        })));
+        tx.blocking_send(Ok(StreamEvent::Done(ExecSummary { rows_affected: Some(n as u64) })));
         return Ok(());
     }
 
-    let meta: Vec<(String, String)> = stmt
-        .columns()
-        .iter()
-        .map(|c| (c.name().to_string(), c.decl_type().unwrap_or("").to_string()))
-        .collect();
+    let meta: Vec<(String, String)> = stmt.columns().iter().map(|c| (c.name().to_string(), c.decl_type().unwrap_or("").to_string())).collect();
 
     let batch_size = opts.batch_size.max(1);
     let mut rows = stmt.raw_query();
@@ -290,10 +246,7 @@ fn run_query(
         return Ok(());
     }
     if builder.coercion_failures() > 0 {
-        tx.blocking_send(Ok(StreamEvent::Notice(format!(
-            "{} value(s) did not match the column type and are shown as NULL",
-            builder.coercion_failures()
-        ))));
+        tx.blocking_send(Ok(StreamEvent::Notice(format!("{} value(s) did not match the column type and are shown as NULL", builder.coercion_failures()))));
     }
     tx.blocking_send(Ok(StreamEvent::Done(ExecSummary::default())));
     Ok(())
@@ -315,11 +268,7 @@ impl Session for SqliteSession {
     }
 
     async fn ping(&self) -> Result<()> {
-        self.with_conn(|c| {
-            c.query_row("select 1", [], |_| Ok(()))
-                .map_err(map_err)
-        })
-        .await
+        self.with_conn(|c| c.query_row("select 1", [], |_| Ok(())).map_err(map_err)).await
     }
 
     async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
@@ -349,11 +298,7 @@ impl Session for SqliteSession {
                 }
             };
             if let Err(e) = run_query(&guard, &sql, &opts, &tx) {
-                let e = if opts.cancel.is_cancelled() && e.kind != ErrorKind::Cancelled {
-                    ConnectorError::cancelled()
-                } else {
-                    e
-                };
+                let e = if opts.cancel.is_cancelled() && e.kind != ErrorKind::Cancelled { ConnectorError::cancelled() } else { e };
                 tx.blocking_send(Err(e));
             }
         });
@@ -363,20 +308,8 @@ impl Session for SqliteSession {
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>> {
         self.with_conn(|c| {
             let mut stmt = c.prepare("PRAGMA database_list").map_err(map_err)?;
-            let names = stmt
-                .query_map([], |r| r.get::<_, String>(1))
-                .map_err(map_err)?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(map_err)?;
-            Ok(names
-                .into_iter()
-                .filter(|n| n != "temp")
-                .map(|name| SchemaInfo {
-                    is_default: name == "main",
-                    name,
-                    catalog: None,
-                })
-                .collect())
+            let names = stmt.query_map([], |r| r.get::<_, String>(1)).map_err(map_err)?.collect::<std::result::Result<Vec<_>, _>>().map_err(map_err)?;
+            Ok(names.into_iter().filter(|n| n != "temp").map(|name| SchemaInfo { is_default: name == "main", name, catalog: None }).collect())
         })
         .await
     }
@@ -388,7 +321,8 @@ impl Session for SqliteSession {
         self.with_conn(move |c| {
             let mut out = std::collections::HashMap::new();
             for s in schemas {
-                let v: i64 = c.query_row(&format!("PRAGMA {}.schema_version", quote_ident(ConnectorKind::Sqlite, &s.name)), [], |r| r.get(0)).map_err(map_err)?;
+                let v: i64 =
+                    c.query_row(&format!("PRAGMA {}.schema_version", quote_ident(ConnectorKind::Sqlite, &s.name)), [], |r| r.get(0)).map_err(map_err)?;
                 out.insert(s.name, v.to_string());
             }
             Ok(Some(out))
@@ -415,11 +349,7 @@ impl Session for SqliteSession {
                 .map(|(name, t)| DbObject {
                     schema: schema.clone(),
                     name,
-                    kind: if t == "view" {
-                        ObjectKind::View
-                    } else {
-                        ObjectKind::Table
-                    },
+                    kind: if t == "view" { ObjectKind::View } else { ObjectKind::Table },
                     comment: None,
                     row_estimate: None,
                 })
@@ -429,7 +359,7 @@ impl Session for SqliteSession {
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
-        use databrain_connector_core::{group_indexes, query_text, quote_literal, truthy, TableLayout};
+        use databrain_connector_core::{TableLayout, group_indexes, query_text, quote_literal, truthy};
         let (s, t) = (quote_literal(schema), quote_literal(name));
         let idx = query_text(
             self,
@@ -440,13 +370,37 @@ impl Session for SqliteSession {
             ),
         )
         .await?;
-        let mut indexes = group_indexes(idx.into_iter().map(|r| (r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default(), truthy(&r[2]), truthy(&r[3]), None)));
+        let mut indexes =
+            group_indexes(idx.into_iter().map(|r| (r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default(), truthy(&r[2]), truthy(&r[3]), None)));
         // INTEGER PRIMARY KEY is the rowid: no entry in index_list.
         if !indexes.iter().any(|i| i.primary) {
             let pk = TableLayout::from_columns(&self.describe(schema, name).await?.columns).indexes;
             indexes.splice(0..0, pk);
         }
-        Ok(TableLayout { indexes, ..Default::default() })
+        let mut l = TableLayout { indexes, ..Default::default() };
+        // Rows: ANALYZE's statistics when there are some (the first number of
+        // any of the table's rows there), else a count (a local file).
+        let stat = query_text(
+            self,
+            &format!(
+                "SELECT stat FROM {}.sqlite_stat1 WHERE tbl = {t} ORDER BY idx IS NULL DESC LIMIT 1",
+                databrain_connector_core::quote_ident(ConnectorKind::Sqlite, schema)
+            ),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.first().and_then(|r| r[0].clone()))
+        .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()));
+        l.row_estimate = match stat {
+            Some(n) => Some(n),
+            None => {
+                query_text(self, &format!("SELECT count(*) FROM {}", databrain_connector_core::quote_path(ConnectorKind::Sqlite, &format!("{schema}.{name}"))))
+                    .await
+                    .ok()
+                    .and_then(|r| r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok()))
+            }
+        };
+        Ok(l)
     }
 
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
@@ -454,23 +408,12 @@ impl Session for SqliteSession {
         self.with_conn(move |c| {
             let q_schema = quote_ident(ConnectorKind::Sqlite, &schema);
             let (kind, ddl): (String, Option<String>) = c
-                .query_row(
-                    &format!("SELECT type, sql FROM {q_schema}.sqlite_master WHERE name = ?1"),
-                    [&name],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
+                .query_row(&format!("SELECT type, sql FROM {q_schema}.sqlite_master WHERE name = ?1"), [&name], |r| Ok((r.get(0)?, r.get(1)?)))
                 .map_err(|e| match e {
-                    rusqlite::Error::QueryReturnedNoRows => {
-                        ConnectorError::query(format!("object not found: {schema}.{name}"))
-                    }
+                    rusqlite::Error::QueryReturnedNoRows => ConnectorError::query(format!("object not found: {schema}.{name}")),
                     e => map_err(e),
                 })?;
-            let mut stmt = c
-                .prepare(&format!(
-                    "PRAGMA {q_schema}.table_info({})",
-                    quote_ident(ConnectorKind::Sqlite, &name)
-                ))
-                .map_err(map_err)?;
+            let mut stmt = c.prepare(&format!("PRAGMA {q_schema}.table_info({})", quote_ident(ConnectorKind::Sqlite, &name))).map_err(map_err)?;
             let columns = stmt
                 .query_map([], |r| {
                     Ok(ColumnInfo {
@@ -487,17 +430,7 @@ impl Session for SqliteSession {
                 .map_err(map_err)?;
             let foreign_keys = sqlite_fks(c, &q_schema, &schema, &name)?;
             Ok(ObjectDetail {
-                object: DbObject {
-                    schema,
-                    name,
-                    kind: if kind == "view" {
-                        ObjectKind::View
-                    } else {
-                        ObjectKind::Table
-                    },
-                    comment: None,
-                    row_estimate: None,
-                },
+                object: DbObject { schema, name, kind: if kind == "view" { ObjectKind::View } else { ObjectKind::Table }, comment: None, row_estimate: None },
                 columns,
                 ddl,
                 foreign_keys,
@@ -508,13 +441,9 @@ impl Session for SqliteSession {
 }
 
 fn sqlite_fks(c: &rusqlite::Connection, q_schema: &str, schema: &str, table: &str) -> Result<Vec<ForeignKey>> {
-    let mut stmt = c
-        .prepare(&format!("PRAGMA {q_schema}.foreign_key_list({})", quote_ident(ConnectorKind::Sqlite, table)))
-        .map_err(map_err)?;
+    let mut stmt = c.prepare(&format!("PRAGMA {q_schema}.foreign_key_list({})", quote_ident(ConnectorKind::Sqlite, table))).map_err(map_err)?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, Option<String>>(4)?))
-        })
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, Option<String>>(4)?)))
         .map_err(map_err)?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(map_err)?;
@@ -525,10 +454,7 @@ fn sqlite_fks(c: &rusqlite::Connection, q_schema: &str, schema: &str, table: &st
                 fk.columns.push(from);
                 fk.ref_columns.push(to.unwrap_or_default());
             }
-            None => out.push((
-                id,
-                ForeignKey { columns: vec![from], ref_schema: schema.to_string(), ref_table, ref_columns: vec![to.unwrap_or_default()] },
-            )),
+            None => out.push((id, ForeignKey { columns: vec![from], ref_schema: schema.to_string(), ref_table, ref_columns: vec![to.unwrap_or_default()] })),
         }
     }
     Ok(out.into_iter().map(|(_, f)| f).collect())
@@ -538,9 +464,9 @@ fn sqlite_fks(c: &rusqlite::Connection, q_schema: &str, schema: &str, table: &st
 mod tests {
     use super::*;
     use databrain_auth::{AuthMethod, InlineCredentialSource};
+    use databrain_connector_core::CancellationToken;
     use databrain_connector_core::arrow::array::AsArray;
     use databrain_connector_core::arrow::datatypes::{DataType, Int64Type};
-    use databrain_connector_core::CancellationToken;
 
     fn cfg(path: &str) -> ConnectionConfig {
         let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
@@ -554,12 +480,7 @@ mod tests {
     }
 
     async fn exec(s: &dyn Session, sql: &str) -> databrain_connector_core::Collected {
-        s.execute(sql, ExecOptions::default())
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap()
+        s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap()
     }
 
     #[tokio::test]
@@ -577,16 +498,8 @@ mod tests {
     #[tokio::test]
     async fn query_types_and_batches() {
         let s = session().await;
-        exec(
-            s.as_ref(),
-            "create table t(id integer primary key, name text, score real, data blob, d)",
-        )
-        .await;
-        let r = exec(
-            s.as_ref(),
-            "insert into t(name, score, data, d) values ('a', 1.5, x'00ff', 1), ('b', null, null, 2.5)",
-        )
-        .await;
+        exec(s.as_ref(), "create table t(id integer primary key, name text, score real, data blob, d)").await;
+        let r = exec(s.as_ref(), "insert into t(name, score, data, d) values ('a', 1.5, x'00ff', 1), ('b', null, null, 2.5)").await;
         assert_eq!(r.summary.rows_affected, Some(2));
 
         let r = exec(s.as_ref(), "select * from t order by id").await;
@@ -602,16 +515,9 @@ mod tests {
     #[tokio::test]
     async fn batching_respects_batch_size() {
         let s = session().await;
-        let opts = ExecOptions {
-            batch_size: 100,
-            cancel: CancellationToken::new(),
-            ..Default::default()
-        };
+        let opts = ExecOptions { batch_size: 100, cancel: CancellationToken::new(), ..Default::default() };
         let r = s
-            .execute(
-                "with recursive c(x) as (select 1 union all select x+1 from c where x < 1050) select x from c",
-                opts,
-            )
+            .execute("with recursive c(x) as (select 1 union all select x+1 from c where x < 1050) select x from c", opts)
             .await
             .unwrap()
             .collect()
@@ -627,24 +533,11 @@ mod tests {
     async fn cancel_interrupts_long_query() {
         let s = session().await;
         let cancel = CancellationToken::new();
-        let opts = ExecOptions {
-            batch_size: 1000,
-            cancel: cancel.clone(),
-            ..Default::default()
-        };
-        let stream = s
-            .execute(
-                "with recursive c(x) as (select 1 union all select x+1 from c) select count(*) from c",
-                opts,
-            )
-            .await
-            .unwrap();
+        let opts = ExecOptions { batch_size: 1000, cancel: cancel.clone(), ..Default::default() };
+        let stream = s.execute("with recursive c(x) as (select 1 union all select x+1 from c) select count(*) from c", opts).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         cancel.cancel();
-        let err = tokio::time::timeout(std::time::Duration::from_secs(5), stream.collect())
-            .await
-            .expect("cancel should finish quickly")
-            .unwrap_err();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), stream.collect()).await.expect("cancel should finish quickly").unwrap_err();
         assert!(err.is_cancelled(), "{err:?}");
         // Session is still usable afterwards.
         assert_eq!(exec(s.as_ref(), "select 1").await.num_rows(), 1);
@@ -653,13 +546,7 @@ mod tests {
     #[tokio::test]
     async fn syntax_error_has_message() {
         let s = session().await;
-        let err = s
-            .execute("selec 1", ExecOptions::default())
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap_err();
+        let err = s.execute("selec 1", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
         assert_eq!(err.kind, ErrorKind::Query);
         assert!(err.message.contains("syntax error"), "{}", err.message);
     }
@@ -703,13 +590,7 @@ mod tests {
         c.read_only = true;
         let creds = Arc::new(InlineCredentialSource::new(AuthMethod::None, None));
         let s = SqliteConnector.connect(&c, creds).await.unwrap();
-        let err = s
-            .execute("insert into t values (1)", ExecOptions::default())
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap_err();
+        let err = s.execute("insert into t values (1)", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
         assert!(err.message.to_lowercase().contains("readonly"), "{}", err.message);
         let _ = std::fs::remove_file(&path);
     }
@@ -728,5 +609,11 @@ mod tests {
         let em = l.indexes.iter().find(|i| i.name == "o_email").unwrap();
         assert!(em.unique);
         assert_eq!(em.columns, vec!["(expression)"]);
+        assert_eq!(l.row_estimate, Some(0), "counted without statistics");
+        exec(&*s, "INSERT INTO o (cust) VALUES ('a'), ('b'), ('c')").await;
+        assert_eq!(s.table_layout("main", "o").await.unwrap().row_estimate, Some(3));
+        exec(&*s, "ANALYZE").await;
+        exec(&*s, "INSERT INTO o (cust) VALUES ('d')").await;
+        assert_eq!(s.table_layout("main", "o").await.unwrap().row_estimate, Some(3), "ANALYZE's statistics when there are some");
     }
 }

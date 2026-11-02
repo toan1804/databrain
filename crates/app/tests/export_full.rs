@@ -34,7 +34,22 @@ impl databrain_app::ai_api::UiBridge for Ui {
 async fn run(st: &AppState, conn: &str, sql: &str, limit: Option<usize>) -> databrain_query_engine::StatementOutcomeView {
     let out = st
         .engine
-        .run_and_wait(&st.hub, RunRequest { connection_id: conn.into(), tab_id: "t".into(), sql: sql.into(), base_offset: 0, row_limit: limit, confirmed: true, origin: Default::default(), session_key: None, output_name: None, params: Default::default() }, None)
+        .run_and_wait(
+            &st.hub,
+            RunRequest {
+                connection_id: conn.into(),
+                tab_id: "t".into(),
+                sql: sql.into(),
+                base_offset: 0,
+                row_limit: limit,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+            },
+            None,
+        )
         .await
         .unwrap();
     out.into_iter().next_back().unwrap()
@@ -64,7 +79,9 @@ async fn exports_all_rows_past_the_row_limit() {
     assert!(w.error.is_none());
     let ins = run(&st, &duck, "insert into t values (2) returning a", None).await;
     if let Some(res) = ins.result {
-        let e = api::export_full_result(&st, &res.id, ExportOptions::new(ExportFormat::Csv), dir.path().join("x.csv").to_string_lossy().into_owned(), "x2").await.unwrap_err();
+        let e = api::export_full_result(&st, &res.id, ExportOptions::new(ExportFormat::Csv), dir.path().join("x.csv").to_string_lossy().into_owned(), "x2")
+            .await
+            .unwrap_err();
         assert!(e.message.contains("Only queries that read data"), "{}", e.message);
     }
 }

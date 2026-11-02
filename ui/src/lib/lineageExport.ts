@@ -31,7 +31,8 @@ export const LIGHT: DiagramColors = {
 const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 
 export function kindLabel(n: LineageNode): string {
-  if (n.kind === "table") return n.temporary ? "temporary table (written)" : n.written ? "written" : n.columns_known ? "table" : "table · columns not cached";
+  if (n.kind === "table")
+    return n.temporary ? "temporary table (written)" : n.written ? "written" : n.view ? "view · definition traced" : n.columns_known ? "table" : "table · columns not cached";
   return { cte: "CTE", subquery: "subquery", set_op: "set operation", result: "result" }[n.kind];
 }
 

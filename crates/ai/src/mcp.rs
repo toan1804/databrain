@@ -72,6 +72,9 @@ struct Peer {
     unanswered: AtomicBool,
     /// The input ended: nobody will answer.
     closed: AtomicBool,
+    /// Tool calls in progress by request id (JSON text): the client's
+    /// `notifications/cancelled` stops them.
+    calls: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
 }
 
 impl Peer {
@@ -97,6 +100,14 @@ impl Peer {
         }
     }
 
+    /// The client gave up on request `id`: stop its tool call (its query,
+    /// or the question it waits on).
+    fn cancel_call(&self, id: &Value) {
+        if let Some(t) = self.calls.lock().get(&id.to_string()) {
+            t.cancel();
+        }
+    }
+
     /// Send a notification to the client (nothing to wait for).
     fn notify(&self, method: &str, params: Value) {
         if let Some(out) = &self.out {
@@ -118,6 +129,8 @@ struct McpHost {
     /// The call's `_meta.progressToken`: while the question waits, the client
     /// is told so (`notifications/progress`) instead of showing a bare spinner.
     progress: Option<Value>,
+    /// Fires when the client cancels the call: a question it waits on ends.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 #[async_trait::async_trait]
@@ -164,10 +177,18 @@ impl ToolHost for McpHost {
                 "required": ["approve"],
             },
         });
-        let answer = match self.peer.request("elicitation/create", params).await {
+        let asked = tokio::select! {
+            a = self.peer.request("elicitation/create", params) => a,
+            _ = self.cancel.cancelled() => return None,
+        };
+        let answer = match asked {
             Ok(a) => a,
             Err(NoAnswer::Timeout) => {
-                tracing::warn!(tool, secs = elicit_timeout().as_secs(), "no answer to the elicitation: the client may not show prompts; not asking again this session");
+                tracing::warn!(
+                    tool,
+                    secs = elicit_timeout().as_secs(),
+                    "no answer to the elicitation: the client may not show prompts; not asking again this session"
+                );
                 return None;
             }
             Err(NoAnswer::Gone) => return None,
@@ -188,8 +209,18 @@ pub struct McpServer {
 /// the user's own connections and DataBrain workspace.
 fn annotations(name: &str) -> Value {
     let (read_only, destructive, idempotent) = match name {
-        "list_connections" | "search_schema" | "describe_table" | "list_tables" | "get_sample_rows" | "query_result" | "result_summary"
-        | "list_outputs" | "query_outputs" | "list_knowledge_notes" | "list_jobs" | "get_job" => (true, false, true),
+        "list_connections"
+        | "search_schema"
+        | "describe_table"
+        | "list_tables"
+        | "get_sample_rows"
+        | "query_result"
+        | "result_summary"
+        | "list_outputs"
+        | "query_outputs"
+        | "list_knowledge_notes"
+        | "list_jobs"
+        | "get_job" => (true, false, true),
         // Refreshes DataBrain's own index of table descriptions.
         "index_tables" => (false, false, true),
         "add_knowledge_note" | "save_query" | "create_job" => (false, false, false),
@@ -223,16 +254,17 @@ fn tool_list() -> Vec<Value> {
 
 impl McpServer {
     fn connections(&self) -> Vec<databrain_workspace::ConnectionProfile> {
-        self.engine
-            .workspace()
-            .list_connections()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| c.ai_policy.mcp_enabled && c.ai_policy.ai_enabled)
-            .collect()
+        self.engine.workspace().list_connections().unwrap_or_default().into_iter().filter(|c| c.ai_policy.mcp_enabled && c.ai_policy.ai_enabled).collect()
     }
 
-    async fn call_tool(&self, name: &str, args: &Value, peer: &Arc<Peer>, progress: Option<Value>) -> (String, bool) {
+    async fn call_tool(
+        &self,
+        name: &str,
+        args: &Value,
+        peer: &Arc<Peer>,
+        progress: Option<Value>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> (String, bool) {
         if name == "list_connections" {
             let list: Vec<Value> = self
                 .connections()
@@ -257,8 +289,8 @@ impl McpServer {
             profile,
             session_id: None,
             caller: Caller::Mcp,
-            host: Arc::new(McpHost { peer: peer.clone(), progress }),
-            cancel: Default::default(),
+            host: Arc::new(McpHost { peer: peer.clone(), progress, cancel: cancel.clone() }),
+            cancel,
             results: parking_lot::Mutex::new(vec![]),
         };
         let o = ctx.call(name, args).await;
@@ -292,8 +324,26 @@ impl McpServer {
                 let name = msg.pointer("/params/name").and_then(|n| n.as_str()).unwrap_or("");
                 let args = msg.pointer("/params/arguments").cloned().unwrap_or(json!({}));
                 let progress = msg.pointer("/params/_meta/progressToken").cloned().filter(|t| !t.is_null());
-                let (text, is_error) = self.call_tool(name, &args, peer, progress).await;
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let key = id.as_ref().map(Value::to_string);
+                if let Some(k) = &key {
+                    peer.calls.lock().insert(k.clone(), cancel.clone());
+                }
+                let (text, is_error) = self.call_tool(name, &args, peer, progress, cancel.clone()).await;
+                if let Some(k) = &key {
+                    peer.calls.lock().remove(k);
+                }
+                // Cancelled by the client: it ignores any answer, so none is sent.
+                if cancel.is_cancelled() {
+                    return None;
+                }
                 Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
+            }
+            "notifications/cancelled" => {
+                if let Some(rid) = msg.pointer("/params/requestId") {
+                    peer.cancel_call(rid);
+                }
+                return None;
             }
             m if m.starts_with("notifications/") => return None,
             _ => Err((-32601, format!("method not found: {method}"))),

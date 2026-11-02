@@ -22,13 +22,7 @@ impl QueryEngine {
         }
         let connector = self.registry.get(profile.config.kind)?;
         let config = profile.config.normalized();
-        let src = credential_source(
-            &config.auth,
-            &profile.id,
-            self.secrets.clone(),
-            self.interaction(),
-            connector.auth_context(&config),
-        )?;
+        let src = credential_source(&config.auth, &profile.id, self.secrets.clone(), self.interaction(), connector.auth_context(&config))?;
         self.creds.lock().insert(profile.id.clone(), src.clone());
         Ok(src)
     }
@@ -58,7 +52,12 @@ impl QueryEngine {
 
     /// Open the SSH tunnel for a config (if configured) and return the
     /// config rewritten to go through it.
-    pub(crate) async fn tunnel(&self, cfg: &ConnectionConfig, owner_id: Option<&str>, secret_override: Option<&str>) -> Result<(ConnectionConfig, Option<Arc<Tunnel>>)> {
+    pub(crate) async fn tunnel(
+        &self,
+        cfg: &ConnectionConfig,
+        owner_id: Option<&str>,
+        secret_override: Option<&str>,
+    ) -> Result<(ConnectionConfig, Option<Arc<Tunnel>>)> {
         let Some(ssh) = cfg.ssh.clone() else { return Ok((cfg.clone(), None)) };
         let stored = match owner_id {
             Some(id) => self.secrets.get(&SecretRef::slot(id, "ssh"))?.map(|s| s.expose_secret().to_string()),
@@ -111,13 +110,21 @@ impl QueryEngine {
         Duration::from_secs(secs.clamp(3, 600))
     }
 
+    /// [`Self::connect_timeout`] for `cfg`: its own option when set.
+    pub fn connect_timeout_for(&self, cfg: &ConnectionConfig) -> Duration {
+        match cfg.opt(databrain_connector_core::CONNECT_TIMEOUT_OPTION).and_then(|v| v.trim().parse::<u64>().ok()) {
+            Some(secs) => Duration::from_secs(secs.clamp(3, 600)),
+            None => self.connect_timeout(),
+        }
+    }
+
     /// DNS + TCP check of the first network hop, so an unreachable server
     /// fails within seconds with a clear reason instead of the driver's own
     /// (long, sometimes retried) timeout.
     pub(crate) async fn preflight(&self, cfg: &ConnectionConfig) -> Result<()> {
         let default_port = self.registry.get(cfg.kind)?.info().default_port;
         let Some((host, port)) = probe::target(cfg, default_port) else { return Ok(()) };
-        probe::reach(&host, port, self.connect_timeout().min(Duration::from_secs(8))).await
+        probe::reach(&host, port, self.connect_timeout_for(cfg).min(Duration::from_secs(8))).await
     }
 
     /// Test a configuration without saving it. `secret` overrides the stored
@@ -138,7 +145,22 @@ impl QueryEngine {
                 old.cancel();
             }
         }
-        let limit = (!cfg.auth.is_interactive()).then(|| self.connect_timeout());
+        let limit = (!cfg.auth.is_interactive()).then(|| self.connect_timeout_for(cfg));
+        // One-time setup (a driver download) first, outside the time limit.
+        let prepared = async {
+            let connector = self.registry.get(cfg.kind)?;
+            connector.prepare(&cfg.normalized()).await.map_err(EngineError::from)
+        };
+        let prepared = tokio::select! {
+            r = prepared => r,
+            _ = token.cancelled() => Err(EngineError::new("cancelled", "Test cancelled")),
+        };
+        if let Err(e) = prepared {
+            if let Some(id) = test_id.filter(|_| !token.is_cancelled()) {
+                self.tests.lock().remove(id);
+            }
+            return Err(e);
+        }
         let work = self.test_connection_inner(cfg, secret, connection_id, ssh_secret);
         let r = tokio::select! {
             r = work => r,
@@ -179,20 +201,10 @@ impl QueryEngine {
         let connector = self.registry.get(cfg.kind)?;
         let creds: Arc<dyn CredentialSource> = match (secret, connection_id) {
             (Some(s), _) => Arc::new(InlineCredentialSource::new(cfg.auth.clone(), Some(SecretString::from(s)))),
-            (None, Some(id)) => credential_source(
-                &cfg.auth,
-                id,
-                self.secrets.clone(),
-                self.interaction(),
-                connector.auth_context(cfg),
-            )?,
-            (None, None) if cfg.auth.is_interactive() => credential_source(
-                &cfg.auth,
-                "__test__",
-                Arc::new(databrain_auth::MemoryStore::default()),
-                self.interaction(),
-                connector.auth_context(cfg),
-            )?,
+            (None, Some(id)) => credential_source(&cfg.auth, id, self.secrets.clone(), self.interaction(), connector.auth_context(cfg))?,
+            (None, None) if cfg.auth.is_interactive() => {
+                credential_source(&cfg.auth, "__test__", Arc::new(databrain_auth::MemoryStore::default()), self.interaction(), connector.auth_context(cfg))?
+            }
             (None, None) => Arc::new(InlineCredentialSource::new(cfg.auth.clone(), None)),
         };
         let start = Instant::now();
@@ -200,9 +212,6 @@ impl QueryEngine {
         let (cfg, _tunnel) = self.tunnel(cfg, connection_id, ssh_secret.as_deref()).await?;
         let session = connector.connect(&cfg, creds).await?;
         let server_version = session.server_version().await?;
-        Ok(TestResult {
-            server_version,
-            latency_ms: start.elapsed().as_millis() as u64,
-        })
+        Ok(TestResult { server_version, latency_ms: start.elapsed().as_millis() as u64 })
     }
 }

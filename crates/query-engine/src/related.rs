@@ -91,7 +91,11 @@ impl QueryEngine {
         if link.columns.is_empty() || link.columns.len() != link.target_columns.len() {
             return Err(bad("The link has no columns".into()));
         }
-        let fields = link.columns.iter().map(|&i| schema.fields().get(i).cloned().ok_or_else(|| bad(format!("Column {i} is not in the result")))).collect::<Result<Vec<_>>>()?;
+        let fields = link
+            .columns
+            .iter()
+            .map(|&i| schema.fields().get(i).cloned().ok_or_else(|| bad(format!("Column {i} is not in the result"))))
+            .collect::<Result<Vec<_>>>()?;
         let cols: Vec<String> = link.target_columns.iter().map(|c| quote_ident(kind, c)).collect();
         let mut tuples: Vec<Vec<String>> = Vec::new();
         for r in rows.iter().take(MAX_RELATED_ROWS) {
@@ -134,7 +138,18 @@ mod tests {
         let mut cfg = databrain_connector_core::ConnectionConfig::new(databrain_connector_core::ConnectorKind::Postgres, databrain_auth::AuthMethod::None);
         cfg.host = Some("h".into());
         let p = ws
-            .save_connection(databrain_workspace::ConnectionProfile { id: String::new(), name: "pg".into(), config: cfg, color: None, env: Default::default(), folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 })
+            .save_connection(databrain_workspace::ConnectionProfile {
+                id: String::new(),
+                name: "pg".into(),
+                config: cfg,
+                color: None,
+                env: Default::default(),
+                folder_id: None,
+                has_secret: false,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            })
             .unwrap();
         let engine = QueryEngine::new(
             databrain_connector_core::ConnectorRegistry::new(),
@@ -144,7 +159,13 @@ mod tests {
             Arc::new(crate::CollectingSink::default()),
         );
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("customer_id", DataType::Int64, true), Field::new("code", DataType::Utf8, true)]));
-        let one = ResultLink { direction: LinkDirection::Parent, schema: "public".into(), table: "customers".into(), columns: vec![0], target_columns: vec!["id".into()] };
+        let one = ResultLink {
+            direction: LinkDirection::Parent,
+            schema: "public".into(),
+            table: "customers".into(),
+            columns: vec![0],
+            target_columns: vec!["id".into()],
+        };
         let rows = vec![vec![Some("7".into())], vec![Some("7".into())], vec![None], vec![Some("9".into())]];
         assert_eq!(engine.related_rows_sql(&p.id, &schema, &one, &rows).unwrap(), "SELECT *\nFROM \"public\".\"customers\"\nWHERE \"id\" IN (7, 9)");
         assert!(engine.related_rows_sql(&p.id, &schema, &one, &[vec![Some("x; drop".into())]]).is_err(), "numbers are checked");

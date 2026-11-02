@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { AlertCircle, Ban, CheckCircle2, Sparkles, History, Loader2, Plug, Trash2, Workflow } from "lucide-react";
+import { AlertCircle, Ban, CheckCircle2, Sparkles, History, Loader2, Play, Plug, SquarePen, Trash2, Workflow } from "lucide-react";
 import { api, toError } from "../../lib/api";
-import type { HistoryClear, HistoryEntry } from "../../lib/types";
+import type { HistoryClear, HistoryEntry, RunStatus } from "../../lib/types";
 import { formatCount, formatDuration, relativeTime, sqlPreview } from "../../lib/util";
 import { openOutput } from "../../outputs";
 import { useStore } from "../../store";
-import { Modal } from "../ui";
+import { MenuItem, MenuSeparator, Modal, Popover } from "../ui";
 import { PanelHeader, SearchBox } from "./primitives";
 
 // ------------------------------------------------------------------ history
@@ -29,11 +29,23 @@ function HistoryOutput({ handle }: { handle: string }) {
   );
 }
 
+/** Open `sql` in a new tab on `connectionId` and run it (all statements). */
+function runAgain(sql: string, connectionId: string | null) {
+  const st = useStore.getState();
+  const id = st.newTab({ sql, connection_id: connectionId ?? undefined });
+  void st.runTab(id, "all", { doc: sql, selFrom: 0, selTo: 0, cursor: 0 });
+}
+
 export function HistoryPanel() {
   const version = useStore((s) => s.historyVersion);
   const newTab = useStore((s) => s.newTab);
   const toast = useStore((s) => s.toast);
+  const connections = useStore((s) => s.connections);
   const [search, setSearch] = useState("");
+  // Filters: one connection, how the run ended. Remembered for the session.
+  const [connFilter, setConnFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState<RunStatus | "">("");
+  const [menu, setMenu] = useState<{ x: number; y: number; entry: HistoryEntry } | null>(null);
   const [items, setItems] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(false);
   // AI queries (assistant, MCP) are hidden unless asked for; remembered.
@@ -48,7 +60,11 @@ export function HistoryPanel() {
   const [more, setMore] = useState(true);
   const [clearing, setClearing] = useState(false);
   const busy = useRef(false);
-  const query = useCallback((before: number | null) => api.listHistory({ search: search || null, limit: HISTORY_PAGE, before, exclude_ai: !showAi }), [search, showAi]);
+  const query = useCallback(
+    (before: number | null) =>
+      api.listHistory({ search: search || null, limit: HISTORY_PAGE, before, exclude_ai: !showAi, connection_id: connFilter || null, status: statusFilter || undefined }),
+    [search, showAi, connFilter, statusFilter],
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -103,7 +119,59 @@ export function HistoryPanel() {
           <Trash2 size={14} />
         </button>
       </PanelHeader>
-      <SearchBox value={search} onChange={setSearch} placeholder="Search history" />
+      <SearchBox value={search} onChange={setSearch} placeholder="Search SQL, errors, connections" />
+      <div className="flex gap-1 px-2 pb-1.5">
+        <select className="field h-7 min-w-0 flex-1 py-0 text-[11.5px]" aria-label="Connection" value={connFilter} onChange={(e) => setConnFilter(e.target.value)}>
+          <option value="">All connections</option>
+          {connections.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+        <select className="field h-7 w-[92px] py-0 text-[11.5px]" aria-label="Status" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as RunStatus | "")}>
+          <option value="">Any status</option>
+          <option value="success">Succeeded</option>
+          <option value="error">Failed</option>
+          <option value="cancelled">Stopped</option>
+        </select>
+      </div>
+      {menu && (
+        <Popover x={menu.x} y={menu.y} onClose={() => setMenu(null)} className="max-h-[60vh] overflow-auto">
+          <MenuItem
+            icon={<SquarePen size={13} />}
+            label="Open in a new tab"
+            onClick={() => {
+              setMenu(null);
+              newTab({ sql: menu.entry.sql, connection_id: menu.entry.connection_id ?? undefined });
+            }}
+          />
+          <MenuItem
+            icon={<Play size={13} />}
+            label="Run again"
+            disabled={!menu.entry.connection_id || !connections.some((c) => c.id === menu.entry.connection_id)}
+            onClick={() => {
+              setMenu(null);
+              runAgain(menu.entry.sql, menu.entry.connection_id);
+            }}
+          />
+          <MenuSeparator />
+          <div className="px-2 pb-0.5 pt-1 text-[11px] text-muted">Run on another connection</div>
+          {connections
+            .filter((c) => c.id !== menu.entry.connection_id)
+            .map((c) => (
+              <MenuItem
+                key={c.id}
+                icon={<Plug size={12} />}
+                label={c.name}
+                onClick={() => {
+                  setMenu(null);
+                  runAgain(menu.entry.sql, c.id);
+                }}
+              />
+            ))}
+        </Popover>
+      )}
       {clearing && (
         <ClearHistoryDialog
           onClose={() => setClearing(false)}
@@ -125,7 +193,7 @@ export function HistoryPanel() {
         {items.length === 0 && !loading && (
           <div className="px-3 py-8 text-center text-[12.5px] text-muted">
             <History size={26} className="mx-auto mb-3 opacity-50" />
-            {search ? "No matches" : "Queries you run appear here."}
+            {search || connFilter || statusFilter ? "No matches" : "Queries you run appear here."}
             {!showAi && (
               <div className="mt-1 text-[11px]">
                 AI queries are hidden ·{" "}
@@ -144,6 +212,10 @@ export function HistoryPanel() {
             title={h.error ?? h.sql}
             onClick={() => newTab({ sql: h.sql, connection_id: h.connection_id ?? undefined })}
             onKeyDown={(e) => e.key === "Enter" && newTab({ sql: h.sql, connection_id: h.connection_id ?? undefined })}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setMenu({ x: e.clientX, y: e.clientY, entry: h });
+            }}
             className="group mb-0.5 cursor-pointer rounded-md px-2 py-1.5 hover:bg-hover"
           >
             <div className="flex items-start gap-1.5">
@@ -155,6 +227,21 @@ export function HistoryPanel() {
                 <Ban size={12} className="mt-0.5 shrink-0 text-muted" />
               )}
               <span className="line-clamp-2 min-w-0 flex-1 break-all font-mono text-[11.5px]">{sqlPreview(h.sql, 140)}</span>
+              {h.connection_id && connections.some((c) => c.id === h.connection_id) && (
+                <button
+                  type="button"
+                  className="icon-btn -my-0.5 h-5 w-5 shrink-0 opacity-0 hover:text-accent focus:opacity-100 group-hover:opacity-100"
+                  aria-label="Run again"
+                  title="Run again in a new tab (right-click: run on another connection)"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    runAgain(h.sql, h.connection_id);
+                  }}
+                  onKeyDown={(e) => e.stopPropagation()}
+                >
+                  <Play size={11} />
+                </button>
+              )}
               <button
                 type="button"
                 className="icon-btn -my-0.5 h-5 w-5 shrink-0 opacity-0 hover:text-danger focus:opacity-100 group-hover:opacity-100"

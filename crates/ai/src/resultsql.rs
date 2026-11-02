@@ -23,10 +23,7 @@ pub fn query(schema_names: &[String], batches: &[RecordBatch], sql: &str, max_ro
     }
     let conn = rusqlite::Connection::open_in_memory().map_err(|e| AiError::Internal(e.to_string()))?;
     let cols: Vec<String> = dedupe(schema_names);
-    let ddl = format!(
-        "CREATE TABLE result ({})",
-        cols.iter().map(|c| format!("\"{}\"", c.replace('"', "\"\""))).collect::<Vec<_>>().join(", ")
-    );
+    let ddl = format!("CREATE TABLE result ({})", cols.iter().map(|c| format!("\"{}\"", c.replace('"', "\"\""))).collect::<Vec<_>>().join(", "));
     conn.execute(&ddl, []).map_err(|e| AiError::Internal(e.to_string()))?;
     {
         let tx = conn.unchecked_transaction().map_err(|e| AiError::Internal(e.to_string()))?;
@@ -55,7 +52,9 @@ pub fn query(schema_names: &[String], batches: &[RecordBatch], sql: &str, max_ro
                         let numeric = field.data_type().is_numeric() || is_decimal_text(field);
                         match field.data_type() {
                             DataType::Boolean => SqlValue::Integer((s == "true") as i64),
-                            _ if numeric => s.parse::<i64>().map(SqlValue::Integer).or_else(|_| s.parse::<f64>().map(SqlValue::Real)).unwrap_or(SqlValue::Text(s)),
+                            _ if numeric => {
+                                s.parse::<i64>().map(SqlValue::Integer).or_else(|_| s.parse::<f64>().map(SqlValue::Real)).unwrap_or(SqlValue::Text(s))
+                            }
                             _ => SqlValue::Text(s),
                         }
                     })

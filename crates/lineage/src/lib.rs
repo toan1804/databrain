@@ -22,8 +22,8 @@ use databrain_connector_core::sql::{dialect_for, split_statements};
 use serde::Serialize;
 use sqlparser::ast::{
     AlterTableOperation, Assignment, AssignmentTarget, Delete, Expr, FromTable, Ident, Join, JoinConstraint, JoinOperator, Merge, MergeAction, MergeInsertKind,
-    MergeUpdateKind, ObjectName, ObjectNamePart, ObjectType, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias,
-    TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind, Visit, Visitor,
+    MergeUpdateKind, ObjectName, ObjectNamePart, ObjectType, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement,
+    TableAlias, TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind, Visit, Visitor,
 };
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Location, Span, Token, Tokenizer};
@@ -86,6 +86,11 @@ pub struct Node {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[ts(as = "Option<bool>", optional)]
     pub temporary: bool,
+    /// A database view whose definition was traced: its columns come from
+    /// the tables it reads.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub view: bool,
     /// Statement that defines it (tables: none).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -208,11 +213,14 @@ pub struct Lineage {
 }
 
 /// A table as the catalog knows it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CatalogTable {
     /// Qualified display name (`sales.orders`).
     pub name: String,
     pub columns: Vec<String>,
+    /// A view's definition: its `CREATE VIEW … AS …` DDL or the query alone.
+    /// A view the SQL reads is expanded into the tables it reads.
+    pub view_sql: Option<String>,
 }
 
 /// Table columns (explorer cache). `parts` = the name as written
@@ -240,7 +248,19 @@ impl<F: Fn(&[String]) -> Option<CatalogTable>> Catalog for F {
 
 /// Lineage of every statement of `sql`.
 pub fn analyze(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> Lineage {
-    let mut b = Builder { g: Lineage::default(), cat: catalog, kind, tables: HashMap::new(), created: Default::default(), text: "", base: 0, lines: vec![], stmt: 0 };
+    let mut b = Builder {
+        g: Lineage::default(),
+        cat: catalog,
+        kind,
+        tables: HashMap::new(),
+        created: Default::default(),
+        expanded: Default::default(),
+        in_view: 0,
+        text: "",
+        base: 0,
+        lines: vec![],
+        stmt: 0,
+    };
     let spans = split_statements(sql, kind);
     let many = spans.len() > 1;
     for (i, s) in spans.iter().enumerate() {
@@ -257,7 +277,7 @@ pub fn analyze(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> Lineage
             }
             Err(e) => {
                 b.g.partial = true;
-                b.g.statements.push(StatementInfo { index: i, kind: "error".into(), range, query: None, result: None, error: Some(e.to_string()), });
+                b.g.statements.push(StatementInfo { index: i, kind: "error".into(), range, query: None, result: None, error: Some(e.to_string()) });
                 b.tables_by_tokens();
             }
         }
@@ -265,7 +285,12 @@ pub fn analyze(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> Lineage
     // Tables the script defines have known columns; one it only inserts
     // into, updates or deletes from is still a database table to describe.
     let mut unknown: Vec<String> =
-        b.g.nodes.iter().enumerate().filter(|(i, n)| n.kind == NodeKind::Table && !n.columns_known && !b.created.contains(i)).map(|(_, n)| n.name.clone()).collect();
+        b.g.nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| n.kind == NodeKind::Table && !n.columns_known && !b.created.contains(i))
+            .map(|(_, n)| n.name.clone())
+            .collect();
     unknown.sort();
     unknown.dedup();
     b.g.unknown_tables = unknown;
@@ -299,7 +324,13 @@ fn combine(path: Option<EdgeKind>, e: EdgeKind) -> EdgeKind {
         None => e,
         Some(p) if is_rows(p) => p,
         Some(_) if is_rows(e) => e,
-        Some(p) => if strength(e) > strength(p) { e } else { p },
+        Some(p) => {
+            if strength(e) > strength(p) {
+                e
+            } else {
+                p
+            }
+        }
     }
 }
 
@@ -397,6 +428,11 @@ struct Builder<'a> {
     tables: HashMap<String, usize>,
     /// Table nodes the script creates (not database tables to describe).
     created: std::collections::HashSet<usize>,
+    /// View nodes whose definition was traced (or is being traced).
+    expanded: std::collections::HashSet<usize>,
+    /// Depth of view definitions being traced: their SQL is not the
+    /// editor's, so nothing in them gets a span.
+    in_view: usize,
     text: &'a str,
     base: usize,
     lines: Vec<usize>,
@@ -437,16 +473,69 @@ struct Refs {
 }
 
 const AGGREGATES: &[&str] = &[
-    "count", "sum", "avg", "min", "max", "array_agg", "string_agg", "listagg", "group_concat", "stddev", "stddev_pop", "stddev_samp", "variance",
-    "var_pop", "var_samp", "median", "mode", "percentile_cont", "percentile_disc", "approx_count_distinct", "count_if", "bool_and", "bool_or",
-    "every", "any_value", "collect_list", "collect_set", "json_agg", "jsonb_agg", "json_object_agg", "first", "last", "arbitrary", "approx_distinct",
-    "countif", "logical_and", "logical_or", "bit_and", "bit_or", "corr", "covar_pop", "covar_samp",
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "array_agg",
+    "string_agg",
+    "listagg",
+    "group_concat",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "variance",
+    "var_pop",
+    "var_samp",
+    "median",
+    "mode",
+    "percentile_cont",
+    "percentile_disc",
+    "approx_count_distinct",
+    "count_if",
+    "bool_and",
+    "bool_or",
+    "every",
+    "any_value",
+    "collect_list",
+    "collect_set",
+    "json_agg",
+    "jsonb_agg",
+    "json_object_agg",
+    "first",
+    "last",
+    "arbitrary",
+    "approx_distinct",
+    "countif",
+    "logical_and",
+    "logical_or",
+    "bit_and",
+    "bit_or",
+    "corr",
+    "covar_pop",
+    "covar_samp",
 ];
 
 /// Bare words that are values, not columns.
 const PSEUDO: &[&str] = &[
-    "sysdate", "systimestamp", "current_date", "current_timestamp", "current_time", "current_user", "session_user", "user", "rownum", "rowid",
-    "level", "localtimestamp", "localtime", "true", "false", "null", "default",
+    "sysdate",
+    "systimestamp",
+    "current_date",
+    "current_timestamp",
+    "current_time",
+    "current_user",
+    "session_user",
+    "user",
+    "rownum",
+    "rowid",
+    "level",
+    "localtimestamp",
+    "localtime",
+    "true",
+    "false",
+    "null",
+    "default",
 ];
 
 impl Visitor for Refs {
@@ -508,6 +597,54 @@ fn name_parts(n: &ObjectName) -> Vec<String> {
 }
 
 /// Alias of a table in a statement (lower case), else its last name part.
+/// Name a `SELECT` gives an unnamed item (see `Builder::select`).
+fn item_name(e: &Expr) -> String {
+    match e {
+        Expr::Identifier(i) => i.value.clone(),
+        Expr::CompoundIdentifier(v) => v.last().map(|i| i.value.clone()).unwrap_or_default(),
+        other => short(other.to_string()),
+    }
+}
+
+/// Output names of a query's first `SELECT`: the anchor of a recursive CTE,
+/// whose names the whole CTE takes. `*` items are left out (unknown here).
+fn anchor_names(q: &Query) -> Vec<String> {
+    let mut body = &*q.body;
+    loop {
+        match body {
+            SetExpr::SetOperation { left, .. } => body = left,
+            SetExpr::Query(inner) => body = &inner.body,
+            SetExpr::Select(sel) => {
+                return sel
+                    .projection
+                    .iter()
+                    .flat_map(|item| match item {
+                        SelectItem::UnnamedExpr(e) => vec![item_name(e)],
+                        SelectItem::ExprWithAlias { alias, .. } => vec![alias.value.clone()],
+                        SelectItem::ExprWithAliases { aliases, .. } => aliases.iter().map(|a| a.value.clone()).collect(),
+                        _ => vec![],
+                    })
+                    .collect();
+            }
+            _ => return vec![],
+        }
+    }
+}
+
+/// Whether `q` reads a relation named `name` (one part, lower case): a CTE
+/// that reads itself is recursive, with or without the RECURSIVE keyword.
+fn reads_itself(q: &Query, name: &str) -> bool {
+    let mut found = false;
+    let _ = sqlparser::ast::visit_relations(q, |r| {
+        if r.0.len() == 1 && name_parts(r).first().is_some_and(|p| p.to_lowercase() == name) {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
 fn alias_or_name(alias: &Option<TableAlias>, name: &ObjectName) -> String {
     alias.as_ref().map(|a| a.name.value.to_lowercase()).unwrap_or_else(|| name_parts(name).last().cloned().unwrap_or_default().to_lowercase())
 }
@@ -568,6 +705,9 @@ impl<'a> Builder<'a> {
     }
 
     fn range(&self, s: Span) -> Option<Range> {
+        if self.in_view > 0 {
+            return None;
+        }
         let (a, b) = (self.offset(s.start)?, self.offset(s.end)?);
         (b >= a).then_some(Range { start: a, end: b })
     }
@@ -590,6 +730,7 @@ impl<'a> Builder<'a> {
             columns_known: kind != NodeKind::Table,
             written: false,
             temporary: false,
+            view: false,
             statement: (kind != NodeKind::Table).then_some(self.stmt),
             span,
         });
@@ -712,24 +853,48 @@ impl<'a> Builder<'a> {
     fn statement(&mut self, st: &Statement, range: Range, many: bool) {
         let qrange = |b: &Self, q: &Query| b.range(q.span());
         let index = self.stmt;
-        let info = move |kind: &str, query: Option<Range>, result: Option<String>| StatementInfo {
-            index,
-            kind: kind.into(),
-            range,
-            query,
-            result,
-            error: None,
-        };
+        let info =
+            move |kind: &str, query: Option<Range>, result: Option<String>| StatementInfo { index, kind: kind.into(), range, query, result, error: None };
         match st {
             Statement::Query(q) if select_into(q).is_some() => {
                 let target = select_into(q).unwrap();
-                let id = self.write_into(&target.0, q, &[], true);
+                let id = self.write_into(&target.0, q, &[], true, &Env::default());
                 if target.1 {
                     if let Some(t) = self.g.nodes.iter().position(|n| n.id == id) {
                         self.g.nodes[t].temporary = true;
                     }
                 }
                 self.g.statements.push(info("select_into", Some(range), Some(id)));
+            }
+            Statement::Query(q) if matches!(*q.body, SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_)) => {
+                // `WITH … INSERT/UPDATE/DELETE/MERGE`: the statement reads the CTEs.
+                let env = self.with_ctes(q, &Env::default());
+                match &*q.body {
+                    SetExpr::Insert(Statement::Insert(ins)) if ins.source.is_some() => {
+                        let src = ins.source.as_ref().unwrap();
+                        let TableObject::TableName(name) = &ins.table else {
+                            self.other(st, range);
+                            return;
+                        };
+                        let names: Vec<String> = ins.columns.iter().map(|c| name_parts(c).last().cloned().unwrap_or_default()).collect();
+                        let id = self.write_into(name, src, &names, false, &env);
+                        let qr = qrange(self, src);
+                        self.g.statements.push(info("insert", qr, Some(id)));
+                    }
+                    SetExpr::Update(Statement::Update(u)) => {
+                        let id = self.update(u, &env);
+                        self.g.statements.push(info("update", None, id));
+                    }
+                    SetExpr::Delete(Statement::Delete(d)) => {
+                        let id = self.delete(d, &env);
+                        self.g.statements.push(info("delete", None, id));
+                    }
+                    SetExpr::Merge(Statement::Merge(m)) => {
+                        let id = self.merge(m, &env);
+                        self.g.statements.push(info("merge", None, id));
+                    }
+                    _ => self.other(st, range),
+                }
             }
             Statement::Query(q) => {
                 let r = self.query(q, &Env::default());
@@ -743,7 +908,7 @@ impl<'a> Builder<'a> {
                 let q = ct.query.as_ref().unwrap();
                 let names: Vec<String> = ct.columns.iter().map(|c| c.name.value.clone()).collect();
                 let defines = !self.exists_already(&ct.name, ct.if_not_exists);
-                let id = self.write_into(&ct.name, q, &names, defines);
+                let id = self.write_into(&ct.name, q, &names, defines, &Env::default());
                 if ct.temporary {
                     if let Some(t) = self.g.nodes.iter().position(|n| n.id == id) {
                         self.g.nodes[t].temporary = true;
@@ -779,7 +944,7 @@ impl<'a> Builder<'a> {
             }
             Statement::CreateView(v) => {
                 let names: Vec<String> = v.columns.iter().map(|c| c.name.value.clone()).collect();
-                let id = self.write_into(&v.name, &v.query, &names, true);
+                let id = self.write_into(&v.name, &v.query, &names, true, &Env::default());
                 let qr = qrange(self, &v.query);
                 self.g.statements.push(info("create_view", qr, Some(id)));
             }
@@ -790,20 +955,20 @@ impl<'a> Builder<'a> {
                     return;
                 };
                 let names: Vec<String> = ins.columns.iter().map(|c| name_parts(c).last().cloned().unwrap_or_default()).collect();
-                let id = self.write_into(name, q, &names, false);
+                let id = self.write_into(name, q, &names, false, &Env::default());
                 let qr = qrange(self, q);
                 self.g.statements.push(info("insert", qr, Some(id)));
             }
             Statement::Update(u) => {
-                let id = self.update(u);
+                let id = self.update(u, &Env::default());
                 self.g.statements.push(info("update", None, id));
             }
             Statement::Delete(d) => {
-                let id = self.delete(d);
+                let id = self.delete(d, &Env::default());
                 self.g.statements.push(info("delete", None, id));
             }
             Statement::Merge(m) => {
-                let id = self.merge(m);
+                let id = self.merge(m, &Env::default());
                 self.g.statements.push(info("merge", None, id));
             }
             Statement::Drop { object_type: ObjectType::Table | ObjectType::View | ObjectType::MaterializedView, .. } => {
@@ -855,8 +1020,8 @@ impl<'a> Builder<'a> {
 
     /// `CREATE TABLE/VIEW … AS q` / `INSERT INTO t (cols) q`: q's columns feed t's.
     /// `defines`: the statement creates the table, so its columns are exactly these.
-    fn write_into(&mut self, name: &ObjectName, q: &Query, names: &[String], defines: bool) -> String {
-        let r = self.query(q, &Env::default());
+    fn write_into(&mut self, name: &ObjectName, q: &Query, names: &[String], defines: bool, env: &Env) -> String {
+        let r = self.query(q, env);
         let t = self.table_node(name);
         self.g.nodes[t].written = true;
         let outs: Vec<String> = self.g.nodes[r].columns.iter().map(|c| c.name.clone()).collect();
@@ -879,8 +1044,8 @@ impl<'a> Builder<'a> {
 
     /// `UPDATE t SET c = e … [FROM …] [WHERE …]`: what `e` reads feeds `t.c`;
     /// the `FROM` tables' join and `WHERE` columns decide which rows change.
-    fn update(&mut self, u: &Update) -> Option<String> {
-        let env = Env::default();
+    fn update(&mut self, u: &Update, env: &Env) -> Option<String> {
+        let env = env.clone();
         let TableFactor::Table { name, alias, .. } = &u.table.relation else {
             self.warn("UPDATE of something other than a table is not traced".into(), self.range(u.table.span()));
             return None;
@@ -959,8 +1124,8 @@ impl<'a> Builder<'a> {
 
     /// `DELETE FROM t [USING …] WHERE …`: the other tables' columns in the
     /// join and `WHERE` decide which rows of `t` go.
-    fn delete(&mut self, d: &Delete) -> Option<String> {
-        let env = Env::default();
+    fn delete(&mut self, d: &Delete, env: &Env) -> Option<String> {
+        let env = env.clone();
         let from = match &d.from {
             FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
         };
@@ -980,7 +1145,8 @@ impl<'a> Builder<'a> {
                 _ => n.clone(),
             }
         };
-        let targets: Vec<ObjectName> = if d.tables.is_empty() { named.first().map(|(_, n)| n.clone()).into_iter().collect() } else { d.tables.iter().map(resolve).collect() };
+        let targets: Vec<ObjectName> =
+            if d.tables.is_empty() { named.first().map(|(_, n)| n.clone()).into_iter().collect() } else { d.tables.iter().map(resolve).collect() };
         let Some(target) = targets.first().cloned() else {
             self.warn("DELETE from something other than a table is not traced".into(), self.range(d.delete_token.0.span));
             return None;
@@ -1011,8 +1177,8 @@ impl<'a> Builder<'a> {
     /// `MERGE INTO t USING s ON … WHEN MATCHED THEN UPDATE SET … WHEN NOT
     /// MATCHED THEN INSERT (…) VALUES (…)`: the source's columns feed the
     /// target's; the `ON` columns join, `WHEN … AND` conditions filter.
-    fn merge(&mut self, m: &Merge) -> Option<String> {
-        let env = Env::default();
+    fn merge(&mut self, m: &Merge, env: &Env) -> Option<String> {
+        let env = env.clone();
         let TableFactor::Table { name, alias, .. } = &m.table else {
             self.warn("MERGE into something other than a table is not traced".into(), self.range(m.table.span()));
             return None;
@@ -1049,7 +1215,10 @@ impl<'a> Builder<'a> {
                                 let col = ins.columns.get(i).and_then(|c| name_parts(c).last().cloned()).or_else(|| known.get(i).cloned());
                                 match col {
                                     Some(col) => self.value_into(t, &col, e, &sources, &scope),
-                                    None => self.warn(format!("MERGE … INSERT: value {} has no column (list them, or cache {})", i + 1, self.g.nodes[t].name), self.range(e.span())),
+                                    None => self.warn(
+                                        format!("MERGE … INSERT: value {} has no column (list them, or cache {})", i + 1, self.g.nodes[t].name),
+                                        self.range(e.span()),
+                                    ),
                                 }
                             }
                         }
@@ -1090,16 +1259,27 @@ impl<'a> Builder<'a> {
     // ---- queries
 
     fn query(&mut self, q: &Query, env: &Env) -> usize {
+        let env = self.with_ctes(q, env);
+        self.set_expr(&q.body, &env)
+    }
+
+    /// `env` plus the CTEs of `q`'s `WITH` (each analyzed in turn).
+    fn with_ctes(&mut self, q: &Query, env: &Env) -> Env {
         let mut env = env.clone();
         if let Some(with) = &q.with {
             for cte in &with.cte_tables {
                 let name = cte.alias.name.value.clone();
                 let key = name.to_lowercase();
                 // Recursive CTE: it may read itself; a placeholder stands in until it's known.
-                let placeholder = with.recursive.then(|| {
+                // SQL Server and Oracle write it without RECURSIVE: a CTE that reads its own
+                // name is one. Without a column list, its columns are the anchor's.
+                let recursive = with.recursive || reads_itself(&cte.query, &key);
+                let placeholder = recursive.then(|| {
                     let p = self.node(NodeKind::Cte, name.clone(), None);
-                    for c in &cte.alias.columns {
-                        self.g.nodes[p].columns.push(Column { name: c.name.value.clone(), span: None, expr: None });
+                    let names: Vec<String> =
+                        if cte.alias.columns.is_empty() { anchor_names(&cte.query) } else { cte.alias.columns.iter().map(|c| c.name.value.clone()).collect() };
+                    for c in names {
+                        self.g.nodes[p].columns.push(Column { name: c, span: None, expr: None });
                     }
                     p
                 });
@@ -1129,7 +1309,44 @@ impl<'a> Builder<'a> {
                 env.ctes.push((key, n));
             }
         }
-        self.set_expr(&q.body, &env)
+        env
+    }
+
+    /// A database view read here: trace its definition (from the catalog)
+    /// into the view's columns, once per view, at most 5 views deep. A view
+    /// the script writes is its own definition, not the database's.
+    fn expand_view(&mut self, node: usize, parts: &[String]) {
+        const MAX_DEPTH: usize = 5;
+        if self.expanded.contains(&node) || self.g.nodes[node].written || self.created.contains(&node) || self.in_view >= MAX_DEPTH {
+            return;
+        }
+        let Some(sql) = self.cat.table(parts).and_then(|t| t.view_sql) else { return };
+        self.expanded.insert(node);
+        let name = self.g.nodes[node].name.clone();
+        let parsed = Parser::parse_sql(&*dialect_for(self.kind), &sql).ok().and_then(|stmts| {
+            stmts.into_iter().find_map(|st| match st {
+                Statement::CreateView(v) => Some((v.query, v.columns.iter().map(|c| c.name.value.clone()).collect::<Vec<_>>())),
+                Statement::Query(q) => Some((q, vec![])),
+                _ => None,
+            })
+        });
+        let Some((q, names)) = parsed else {
+            self.warn(format!("The definition of view {name} could not be read; it is shown as a table"), None);
+            return;
+        };
+        self.in_view += 1;
+        let r = self.query(&q, &Env::default());
+        self.in_view -= 1;
+        if !matches!(self.g.nodes[r].kind, NodeKind::Table | NodeKind::Cte) {
+            self.g.nodes[r].name = format!("{name} definition");
+        }
+        let outs: Vec<String> = self.g.nodes[r].columns.iter().map(|c| c.name.clone()).collect();
+        for (i, o) in outs.iter().enumerate() {
+            let target = names.get(i).cloned().unwrap_or_else(|| o.clone());
+            let vc = self.ensure_col(node, &target);
+            self.edge(r, Some(o.clone()), node, Some(vc), EdgeKind::Direct, None);
+        }
+        self.g.nodes[node].view = true;
     }
 
     /// Point `from`'s edges at `to` and empty `from` (recursive CTE placeholder).
@@ -1178,10 +1395,10 @@ impl<'a> Builder<'a> {
                 n
             }
             SetExpr::Table(t) => {
-                let name = ObjectName::from(
-                    t.schema_name.iter().chain(t.table_name.iter()).map(|s| Ident::new(s.clone())).collect::<Vec<_>>(),
-                );
-                self.table_node(&name)
+                let name = ObjectName::from(t.schema_name.iter().chain(t.table_name.iter()).map(|s| Ident::new(s.clone())).collect::<Vec<_>>());
+                let n = self.table_node(&name);
+                self.expand_view(n, &name_parts(&name));
+                n
             }
             other => {
                 let n = self.node(NodeKind::Subquery, "…".into(), None);
@@ -1203,11 +1420,7 @@ impl<'a> Builder<'a> {
         for item in &sel.projection {
             match item {
                 SelectItem::UnnamedExpr(e) => {
-                    let name = match e {
-                        Expr::Identifier(i) => i.value.clone(),
-                        Expr::CompoundIdentifier(v) => v.last().map(|i| i.value.clone()).unwrap_or_default(),
-                        other => short(other.to_string()),
-                    };
+                    let name = item_name(e);
                     self.projected(n, name, e, None, &sources, &scope_env);
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
@@ -1391,7 +1604,9 @@ impl<'a> Builder<'a> {
                 } else if let Some(c) = (parts.len() == 1).then(|| env.cte(&parts[0].to_lowercase())).flatten() {
                     c
                 } else {
-                    self.table_node(name)
+                    let t = self.table_node(name);
+                    self.expand_view(t, &parts);
+                    t
                 };
                 let a = alias_of(alias).unwrap_or_else(|| parts.last().cloned().unwrap_or_default().to_lowercase());
                 sources.push(Source { alias: a, node });
@@ -1403,7 +1618,9 @@ impl<'a> Builder<'a> {
                     env.clone()
                 };
                 let m = self.query(subquery, &inner);
-                let m = if matches!(self.g.nodes[m].kind, NodeKind::Table | NodeKind::Cte) { m } else {
+                let m = if matches!(self.g.nodes[m].kind, NodeKind::Table | NodeKind::Cte) {
+                    m
+                } else {
                     self.g.nodes[m].name = alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_else(|| "subquery".into());
                     if let Some(a) = alias {
                         self.g.nodes[m].span = self.range(a.name.span);
@@ -1448,10 +1665,12 @@ impl<'a> Builder<'a> {
         sources
             .iter()
             .find(|s| s.alias == q)
-            .or_else(|| sources.iter().find(|s| {
-                let name = self.g.nodes[s.node].name.to_lowercase();
-                name == full || name.ends_with(&format!(".{full}"))
-            }))
+            .or_else(|| {
+                sources.iter().find(|s| {
+                    let name = self.g.nodes[s.node].name.to_lowercase();
+                    name == full || name.ends_with(&format!(".{full}"))
+                })
+            })
             .cloned()
     }
 
@@ -1536,7 +1755,8 @@ impl<'a> Builder<'a> {
                 }
                 i += 2;
             }
-            let keyword = parts.len() == 1 && parts[0].quote_style.is_none() && ["SELECT", "LATERAL", "ONLY", "IF"].contains(&parts[0].value.to_uppercase().as_str());
+            let keyword =
+                parts.len() == 1 && parts[0].quote_style.is_none() && ["SELECT", "LATERAL", "ONLY", "IF"].contains(&parts[0].value.to_uppercase().as_str());
             if !parts.is_empty() && !keyword {
                 self.table_node(&ObjectName::from(parts));
             }

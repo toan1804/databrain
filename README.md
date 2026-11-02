@@ -63,6 +63,7 @@ npm run app:build:no-duckdb   # bundle that uses the computer's DuckDB
 ## Test
 
 ```sh
+cargo fmt --all -- --check                        # rustfmt.toml: 160 columns
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo deny check                                  # advisories, licenses, sources (deny.toml)

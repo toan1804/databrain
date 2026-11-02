@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use databrain_auth::{CredentialSource, ExposeSecret, SecretRef, SecretStore};
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -184,13 +184,7 @@ pub fn build(kind: ProviderKind, cfg: &ProviderConfig, key: KeySource) -> Result
     if kind == ProviderKind::Kiro {
         return Ok(Arc::new(crate::kiro::KiroProvider::new(cfg, key)?));
     }
-    let base = cfg
-        .base_url
-        .clone()
-        .filter(|u| !u.trim().is_empty())
-        .unwrap_or_else(|| kind.default_base_url().to_string())
-        .trim_end_matches('/')
-        .to_string();
+    let base = cfg.base_url.clone().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| kind.default_base_url().to_string()).trim_end_matches('/').to_string();
     if base.is_empty() {
         return Err(AiError::Config("this provider needs a base URL".into()));
     }
@@ -202,8 +196,7 @@ pub fn build(kind: ProviderKind, cfg: &ProviderConfig, key: KeySource) -> Result
             base,
             key,
             http: http(),
-            azure_api_version: (kind == ProviderKind::AzureOpenai)
-                .then(|| cfg.api_version.clone().unwrap_or_else(|| "2024-10-21".into())),
+            azure_api_version: (kind == ProviderKind::AzureOpenai).then(|| cfg.api_version.clone().unwrap_or_else(|| "2024-10-21".into())),
             azure_bearer: cfg.auth == ProviderAuth::AzureCli,
             headers: cfg.extra_headers.clone(),
         }),
@@ -319,9 +312,7 @@ impl LlmProvider for OpenAi {
             .or(v["models"].as_array())
             .map(|a| {
                 a.iter()
-                    .filter_map(|m| {
-                        Some(ModelInfo { id: m["id"].as_str().or(m["name"].as_str())?.to_string(), name: m["name"].as_str().map(str::to_string) })
-                    })
+                    .filter_map(|m| Some(ModelInfo { id: m["id"].as_str().or(m["name"].as_str())?.to_string(), name: m["name"].as_str().map(str::to_string) }))
                     .collect()
             })
             .unwrap_or_default();
@@ -335,10 +326,21 @@ impl LlmProvider for OpenAi {
         }
         // DeepSeek (OpenAI-compatible) has a balance endpoint.
         if self.base.contains("api.deepseek.com") {
-            let v: Value = check(self.req(reqwest::Method::GET, "/user/balance").await?.send().await.map_err(net)?, "balance").await?.json().await.map_err(net)?;
+            let v: Value =
+                check(self.req(reqwest::Method::GET, "/user/balance").await?.send().await.map_err(net)?, "balance").await?.json().await.map_err(net)?;
             let meters = v["balance_infos"]
                 .as_array()
-                .map(|a| a.iter().map(|b| BudgetMeter { label: "Balance".into(), used: None, limit: None, remaining: num(&b["total_balance"]), unit: b["currency"].as_str().unwrap_or("").into() }).collect())
+                .map(|a| {
+                    a.iter()
+                        .map(|b| BudgetMeter {
+                            label: "Balance".into(),
+                            used: None,
+                            limit: None,
+                            remaining: num(&b["total_balance"]),
+                            unit: b["currency"].as_str().unwrap_or("").into(),
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             return Ok(Some(Budget { plan: None, meters, resets_on: None, manage_url: Some("https://platform.deepseek.com/usage".into()) }));
         }
@@ -386,7 +388,8 @@ pub fn openai_stream(bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>) -
                 // Stream ended: flush tool calls.
                 finished = true;
                 if !calls.is_empty() {
-                    let out: Vec<Result<ChatEvent>> = std::mem::take(&mut calls).into_values().map(|(id, name, args)| Ok(ChatEvent::ToolCall(parse_call(id, name, &args)))).collect();
+                    let out: Vec<Result<ChatEvent>> =
+                        std::mem::take(&mut calls).into_values().map(|(id, name, args)| Ok(ChatEvent::ToolCall(parse_call(id, name, &args)))).collect();
                     return Some((futures::stream::iter(out).boxed(), (ev, (calls, finished))));
                 }
                 return Some((futures::stream::iter(vec![Ok(ChatEvent::Done { stop_reason: "end".into() })]).boxed(), (ev, (calls, finished))));
@@ -397,7 +400,8 @@ pub fn openai_stream(bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>) -
             };
             if e.data.trim() == "[DONE]" {
                 finished = true;
-                let mut out: Vec<Result<ChatEvent>> = std::mem::take(&mut calls).into_values().map(|(id, name, args)| Ok(ChatEvent::ToolCall(parse_call(id, name, &args)))).collect();
+                let mut out: Vec<Result<ChatEvent>> =
+                    std::mem::take(&mut calls).into_values().map(|(id, name, args)| Ok(ChatEvent::ToolCall(parse_call(id, name, &args)))).collect();
                 out.push(Ok(ChatEvent::Done { stop_reason: "stop".into() }));
                 return Some((futures::stream::iter(out).boxed(), (ev, (calls, finished))));
             }
@@ -670,7 +674,9 @@ impl LlmProvider for Gemini {
             .map(|a| {
                 a.iter()
                     .filter(|m| m["supportedGenerationMethods"].as_array().is_some_and(|x| x.iter().any(|s| s == "generateContent")))
-                    .filter_map(|m| Some(ModelInfo { id: m["name"].as_str()?.trim_start_matches("models/").into(), name: m["displayName"].as_str().map(str::to_string) }))
+                    .filter_map(|m| {
+                        Some(ModelInfo { id: m["name"].as_str()?.trim_start_matches("models/").into(), name: m["displayName"].as_str().map(str::to_string) })
+                    })
                     .collect()
             })
             .unwrap_or_default())
@@ -745,11 +751,7 @@ pub async fn openrouter_sign_in(interaction: &dyn databrain_auth::Interaction) -
     };
     let callback = lb.redirect_uri();
     let p = databrain_auth::oauth::pkce();
-    let url = format!(
-        "https://openrouter.ai/auth?callback_url={}&code_challenge={}&code_challenge_method=S256",
-        urlencode(&callback),
-        p.challenge
-    );
+    let url = format!("https://openrouter.ai/auth?callback_url={}&code_challenge={}&code_challenge_method=S256", urlencode(&callback), p.challenge);
     interaction.open_url(&url).await?;
     let params = lb.wait(None, &interaction.cancel_token(), Duration::from_secs(300)).await;
     interaction.finished().await;
@@ -803,10 +805,7 @@ mod tests {
         ]));
         let evs: Vec<ChatEvent> = s.map(|e| e.unwrap()).collect().await;
         assert_eq!(evs[0], ChatEvent::TextDelta("Hel".into()));
-        assert_eq!(
-            evs[2],
-            ChatEvent::ToolCall(ToolCall { id: "c1".into(), name: "run_query".into(), arguments: json!({"sql": "select 1"}) })
-        );
+        assert_eq!(evs[2], ChatEvent::ToolCall(ToolCall { id: "c1".into(), name: "run_query".into(), arguments: json!({"sql": "select 1"}) }));
         assert_eq!(evs[3], ChatEvent::Usage { input: 10, output: 5 });
         assert!(matches!(evs.last(), Some(ChatEvent::Done { .. })));
     }

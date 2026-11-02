@@ -54,10 +54,7 @@ fn state() -> (AppState, Arc<CollectingSink>, tempfile::TempDir) {
 async fn finished_results(sink: &CollectingSink, job: &str) -> Vec<ResultInfo> {
     for _ in 0..500 {
         let evs = sink.0.lock().clone();
-        if evs
-            .iter()
-            .any(|e| matches!(e, JobEvent::JobFinished { job_id, .. } if job_id == job))
-        {
+        if evs.iter().any(|e| matches!(e, JobEvent::JobFinished { job_id, .. } if job_id == job)) {
             return evs
                 .into_iter()
                 .filter_map(|e| match e {
@@ -132,9 +129,7 @@ async fn end_to_end_sqlite() {
         },
     )
     .unwrap();
-    let RunResponse::Started { job_id, statements } = resp else {
-        panic!("expected start")
-    };
+    let RunResponse::Started { job_id, statements } = resp else { panic!("expected start") };
     assert_eq!(statements.len(), 3);
     assert_eq!(statements[0].start, 5);
     let results = finished_results(&sink, &job_id).await;
@@ -143,59 +138,28 @@ async fn end_to_end_sqlite() {
     assert_eq!(results[0].total_rows, 4);
 
     let view = ViewSpec {
-        filters: vec![ColumnFilter {
-            column: 2,
-            op: FilterOp::Equals,
-            value: "Hanoi".into(),
-        }],
+        filters: vec![ColumnFilter { column: 2, op: FilterOp::Equals, value: "Hanoi".into() }],
         quick_filter: None,
-        sort: vec![SortKey {
-            column: 3,
-            descending: true,
-        }],
+        sort: vec![SortKey { column: 3, descending: true }],
     };
     let page = fetch_page(&st, rid.clone(), view.clone(), 0, 100).await.unwrap();
     assert_eq!(page.view_rows, 2);
     assert_eq!(page.rows[0][1].as_deref(), Some("Chi"));
 
-    let f = find_in_result(&st, rid.clone(), ViewSpec::default(), "han".into(), None, 100, false)
-        .await
-        .unwrap();
+    let f = find_in_result(&st, rid.clone(), ViewSpec::default(), "han".into(), None, 100, false).await.unwrap();
     assert_eq!(f.matches.len(), 2);
 
     let stats = column_stats(&st, rid.clone(), ViewSpec::default(), 2).await.unwrap();
     assert_eq!((stats.nulls, stats.distinct), (1, 2));
 
-    let tsv = copy_rows(
-        &st,
-        rid.clone(),
-        view.clone(),
-        0,
-        1,
-        ExportOptions::new(ExportFormat::Tsv),
-    )
-    .await
-    .unwrap();
+    let tsv = copy_rows(&st, rid.clone(), view.clone(), 0, 1, ExportOptions::new(ExportFormat::Tsv)).await.unwrap();
     assert_eq!(tsv, "id\tname\tcity\tage\n3\tChi\tHanoi\t42\n");
 
     let out = dir.path().join("hanoi.csv");
-    let n = export_result(
-        &st,
-        rid.clone(),
-        view,
-        ExportOptions::new(ExportFormat::Csv),
-        out.to_string_lossy().into(),
-    )
-    .await
-    .unwrap();
+    let n = export_result(&st, rid.clone(), view, ExportOptions::new(ExportFormat::Csv), out.to_string_lossy().into()).await.unwrap();
     assert_eq!(n, 2);
-    assert_eq!(
-        std::fs::read_to_string(&out).unwrap(),
-        "id,name,city,age\n3,Chi,Hanoi,42\n1,Ann,Hanoi,31\n"
-    );
-    assert!(export_result(&st, rid.clone(), ViewSpec::default(), ExportOptions::new(ExportFormat::Csv), "rel.csv".into())
-        .await
-        .is_err());
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "id,name,city,age\n3,Chi,Hanoi,42\n1,Ann,Hanoi,31\n");
+    assert!(export_result(&st, rid.clone(), ViewSpec::default(), ExportOptions::new(ExportFormat::Csv), "rel.csv".into()).await.is_err());
 
     // Explorer
     let objs = list_objects(&st, &profile.id, "main").await.unwrap();
@@ -259,9 +223,15 @@ async fn credential_store_switch_moves_secrets() {
     let keychain = Arc::new(MemoryStore::default());
     struct Shared(Arc<MemoryStore>);
     impl SecretStore for Shared {
-        fn get(&self, r: &SecretRef) -> std::result::Result<Option<secrecy::SecretString>, databrain_auth::AuthError> { self.0.get(r) }
-        fn set(&self, r: &SecretRef, v: &secrecy::SecretString) -> std::result::Result<(), databrain_auth::AuthError> { self.0.set(r, v) }
-        fn delete(&self, r: &SecretRef) -> std::result::Result<(), databrain_auth::AuthError> { self.0.delete(r) }
+        fn get(&self, r: &SecretRef) -> std::result::Result<Option<secrecy::SecretString>, databrain_auth::AuthError> {
+            self.0.get(r)
+        }
+        fn set(&self, r: &SecretRef, v: &secrecy::SecretString) -> std::result::Result<(), databrain_auth::AuthError> {
+            self.0.set(r, v)
+        }
+        fn delete(&self, r: &SecretRef) -> std::result::Result<(), databrain_auth::AuthError> {
+            self.0.delete(r)
+        }
     }
     let store = Arc::new(SwitchableStore::with_stores(StoreKind::Keychain, Box::new(Shared(keychain.clone())), Box::new(VaultStore::new(dir.path()))));
     let st = AppState::new(ws.clone(), store.clone(), Arc::new(CollectingSink::default()), Arc::new(TestUi::default()));
@@ -272,7 +242,18 @@ async fn credential_store_switch_moves_secrets() {
     let saved = save_connection(
         &st,
         SaveConnectionArgs {
-            profile: ConnectionProfile { id: String::new(), name: "PG".into(), config: cfg, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            profile: ConnectionProfile {
+                id: String::new(),
+                name: "PG".into(),
+                config: cfg,
+                color: None,
+                env: EnvTag::None,
+                folder_id: None,
+                has_secret: false,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
             secret: Some("hunter2".into()),
             clear_secret: false,
             extra_secrets: [("ssh".to_string(), "sshpw".to_string())].into_iter().collect(),
@@ -317,7 +298,18 @@ fn delete_connection_cleans_up() {
     let saved = save_connection(
         &st,
         SaveConnectionArgs {
-            profile: ConnectionProfile { id: String::new(), name: "PG".into(), config: cfg, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            profile: ConnectionProfile {
+                id: String::new(),
+                name: "PG".into(),
+                config: cfg,
+                color: None,
+                env: EnvTag::None,
+                folder_id: None,
+                has_secret: false,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
             secret: Some("pw".into()),
             clear_secret: false,
             extra_secrets: [("ssh".to_string(), "sshpw".to_string()), ("client_secret".to_string(), "cs".to_string())].into_iter().collect(),
@@ -327,9 +319,33 @@ fn delete_connection_cleans_up() {
     let id = saved.id.clone();
     st.secrets.set(&SecretRef::slot(&id, "oauth"), &"tokens".to_string().into()).unwrap();
     st.workspace
-        .kn_save_note(databrain_workspace::KnNote { id: String::new(), connection_id: id.clone(), target: None, body: "rule".into(), author: "user".into(), status: databrain_workspace::NoteStatus::Approved, created_at: 0, replaces: None })
+        .kn_save_note(databrain_workspace::KnNote {
+            id: String::new(),
+            connection_id: id.clone(),
+            target: None,
+            body: "rule".into(),
+            author: "user".into(),
+            status: databrain_workspace::NoteStatus::Approved,
+            created_at: 0,
+            replaces: None,
+        })
         .unwrap();
-    let q = save_query(&st, SavedQuery { id: String::new(), name: "q".into(), sql: "select 1".into(), connection_id: Some(id.clone()), folder_id: None, description: None, tags: vec![], ai_example: false, created_at: 0, updated_at: 0 }).unwrap();
+    let q = save_query(
+        &st,
+        SavedQuery {
+            id: String::new(),
+            name: "q".into(),
+            sql: "select 1".into(),
+            connection_id: Some(id.clone()),
+            folder_id: None,
+            description: None,
+            tags: vec![],
+            ai_example: false,
+            created_at: 0,
+            updated_at: 0,
+        },
+    )
+    .unwrap();
 
     delete_connection(&st, &id).unwrap();
     assert!(list_connections(&st).unwrap().is_empty());
@@ -399,7 +415,11 @@ fn secrets_are_stored_in_secret_store_only() {
     p.has_secret = false;
     let kept = save_connection(&st, SaveConnectionArgs { profile: p.clone(), secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
     assert!(kept.has_secret);
-    let cleared = save_connection(&st, SaveConnectionArgs { profile: p, secret: None, clear_secret: true, extra_secrets: [("ssh".to_string(), String::new())].into_iter().collect() }).unwrap();
+    let cleared = save_connection(
+        &st,
+        SaveConnectionArgs { profile: p, secret: None, clear_secret: true, extra_secrets: [("ssh".to_string(), String::new())].into_iter().collect() },
+    )
+    .unwrap();
     assert!(!cleared.has_secret);
     assert!(st.secrets.get(&r).unwrap().is_none());
     assert!(st.secrets.get(&SecretRef::slot(&saved.id, "ssh")).unwrap().is_none());
@@ -774,6 +794,12 @@ async fn ai_job_runs_are_sandboxed() {
     let saved = save_job(&st, edited).unwrap();
     assert!(saved.nodes.iter().find(|n| n.id == "s3").unwrap().ai_sql, "unchanged: still the AI's");
     assert!(!saved.nodes.iter().find(|n| n.id == "s1").unwrap().ai_sql, "a user save can't mark a step as the AI's");
+    // "Trust this SQL": the user clears the mark on purpose.
+    let mut trusted = saved.clone();
+    trusted.nodes.iter_mut().find(|n| n.id == "s3").unwrap().ai_sql = false;
+    let after = save_job(&st, trusted).unwrap();
+    assert!(!after.nodes.iter().find(|n| n.id == "s3").unwrap().ai_sql);
+    st.workspace.save_job(saved.clone()).unwrap();
     // The user changes the SQL: the step is theirs, and reads files again.
     let mut edited = saved;
     edited.nodes.iter_mut().find(|n| n.id == "s3").unwrap().sql = format!("select a from read_csv('{}')", csv.display());
@@ -832,9 +858,25 @@ fn uri_passwords_go_to_the_secret_store() {
     let profile = |name: &str, uri: &str| {
         let mut config = ConnectionConfig::new(ConnectorKind::Mongodb, AuthMethod::None);
         config.options.insert(crate::conn_io::URI_OPTION.into(), uri.into());
-        ConnectionProfile { id: String::new(), name: name.into(), config, color: None, env: EnvTag::Dev, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 }
+        ConnectionProfile {
+            id: String::new(),
+            name: name.into(),
+            config,
+            color: None,
+            env: EnvTag::Dev,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        }
     };
-    let args = |p: ConnectionProfile, secret: Option<&str>| SaveConnectionArgs { profile: p, secret: secret.map(Into::into), clear_secret: false, extra_secrets: Default::default() };
+    let args = |p: ConnectionProfile, secret: Option<&str>| SaveConnectionArgs {
+        profile: p,
+        secret: secret.map(Into::into),
+        clear_secret: false,
+        extra_secrets: Default::default(),
+    };
     let stored = |id: &str| st.secrets.get(&SecretRef::for_connection(id)).unwrap().map(|s| s.expose_secret().to_string());
 
     let saved = save_connection(&st, args(profile("m", "mongodb://ann:p%40ss@h/db"), None)).unwrap();
@@ -904,9 +946,7 @@ async fn mcp_two_connections_ask_through_elicitation() {
     async fn write(w: &mut tokio::io::DuplexStream, v: serde_json::Value) {
         w.write_all(format!("{v}\n").as_bytes()).await.unwrap();
     }
-    let call = |name: &str, conn: &str, sql: &str, id: u64| {
-        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": {"connection": conn, "sql": sql, "purpose": "test"}}})
-    };
+    let call = |name: &str, conn: &str, sql: &str, id: u64| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": {"connection": conn, "sql": sql, "purpose": "test"}}});
     write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}}, "clientInfo": {"name": "t", "version": "0"}}})).await;
     let init = next(&mut lines).await;
     assert_eq!(init["id"], 1, "{init}");
@@ -995,9 +1035,7 @@ async fn mcp_unanswered_question_ends_the_call_and_is_not_asked_again() {
     }
     write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}}, "clientInfo": {"name": "t", "version": "0"}}})).await;
     assert_eq!(next(&mut lines).await["id"], 1);
-    let call = |id: u64| {
-        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"_meta": {"progressToken": "p1"}, "name": "run_query", "arguments": {"connection": "quiet", "sql": "select 1", "purpose": "t"}}})
-    };
+    let call = |id: u64| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"_meta": {"progressToken": "p1"}, "name": "run_query", "arguments": {"connection": "quiet", "sql": "select 1", "purpose": "t"}}});
     let started = std::time::Instant::now();
     write(&mut client_tx, call(2)).await;
     let progress = next(&mut lines).await;
@@ -1030,6 +1068,151 @@ async fn mcp_unanswered_question_ends_the_call_and_is_not_asked_again() {
     tokio::time::timeout(Duration::from_secs(10), srv).await.expect("server stops at EOF").unwrap().unwrap();
     let audit = st.workspace.list_audit(50).unwrap();
     // One "no answer"; nothing approved. (Each refused call is also audited as blocked by the tool wrapper.)
-    assert_eq!(audit.iter().filter(|a| a.tool == "run_query" && a.decision == "denied").map(|a| a.summary.as_deref()).collect::<Vec<_>>(), vec![Some("no answer")], "{audit:?}");
+    assert_eq!(
+        audit.iter().filter(|a| a.tool == "run_query" && a.decision == "denied").map(|a| a.summary.as_deref()).collect::<Vec<_>>(),
+        vec![Some("no answer")],
+        "{audit:?}"
+    );
     assert!(audit.iter().all(|a| a.decision != "approved"), "{audit:?}");
+}
+
+/// A server that accepts the socket and never answers: opening a session
+/// (explorer, a tab) fails within the connect time limit with a message,
+/// as "Test connection" does, instead of waiting for ever.
+#[tokio::test(flavor = "multi_thread")]
+async fn silent_server_fails_within_the_connect_limit() {
+    let (st, _sink, _dir) = state();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            held.push(s);
+        }
+    });
+    st.workspace.set_setting("connect_timeout_secs", &serde_json::json!(3)).unwrap();
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Postgres,
+        host: Some("127.0.0.1".into()),
+        port: Some(port),
+        database: Some("db".into()),
+        file_path: None,
+        auth: AuthMethod::Password { user: "u".into() },
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let p = save_profile(&st, "silent", cfg, Some("pw"));
+    let started = std::time::Instant::now();
+    let e = list_schemas(&st, &p.id).await.unwrap_err();
+    assert!(e.message.contains("No connection to \"silent\" after 3 s"), "{}", e.message);
+    assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+    assert!(st.engine.connected_ids().is_empty());
+}
+
+/// The client cancels a tool call (`notifications/cancelled`) while
+/// DataBrain's question waits: the call ends at once with no response
+/// (the client ignores one), and the server keeps serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_cancelled_call_stops_waiting() {
+    use databrain_ai::mcp::McpServer;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (st, _sink, dir) = state();
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(dir.path().join("c.db").to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let mut p = save_profile(&st, "asks", cfg, None);
+    p.ai_policy.mcp_enabled = true;
+    save_profile_update(&st, p);
+    let server = Arc::new(McpServer { engine: st.engine.clone(), hub: st.hub.clone() });
+    let (client_rx, server_tx) = tokio::io::duplex(1 << 16);
+    let (server_rx, mut client_tx) = tokio::io::duplex(1 << 16);
+    let srv = tokio::spawn(async move { server.serve(BufReader::new(server_rx), server_tx).await });
+    let mut lines = BufReader::new(client_rx).lines();
+    async fn next(lines: &mut tokio::io::Lines<BufReader<tokio::io::DuplexStream>>) -> serde_json::Value {
+        let l = tokio::time::timeout(Duration::from_secs(10), lines.next_line()).await.expect("server answered in time").unwrap().expect("server still open");
+        serde_json::from_str::<serde_json::Value>(&l).unwrap()
+    }
+    async fn write(w: &mut tokio::io::DuplexStream, v: serde_json::Value) {
+        w.write_all(format!("{v}\n").as_bytes()).await.unwrap();
+    }
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}}, "clientInfo": {"name": "t", "version": "0"}}})).await;
+    assert_eq!(next(&mut lines).await["id"], 1);
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": "call-2", "method": "tools/call", "params": {"name": "run_query", "arguments": {"connection": "asks", "sql": "select 1", "purpose": "t"}}})).await;
+    let ask = next(&mut lines).await;
+    assert_eq!(ask["method"], "elicitation/create", "{ask}");
+    write(
+        &mut client_tx,
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "call-2", "reason": "user stopped"}}),
+    )
+    .await;
+    // The next line is the ping's answer: the cancelled call sent nothing.
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "ping"})).await;
+    let r = next(&mut lines).await;
+    assert_eq!(r["id"], 3, "{r}");
+    // The call ended now, not when the question would have timed out.
+    let mut ended = false;
+    for _ in 0..100 {
+        if st.workspace.list_audit(20).unwrap().iter().any(|a| a.tool == "run_query" && a.decision == "denied") {
+            ended = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ended, "the cancelled call stopped waiting");
+    // Questions still work afterwards (a cancel is not "no answer").
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "run_query", "arguments": {"connection": "asks", "sql": "select 2", "purpose": "t"}}})).await;
+    let ask = next(&mut lines).await;
+    assert_eq!(ask["method"], "elicitation/create", "{ask}");
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": ask["id"].clone(), "result": {"action": "accept", "content": {"approve": true}}})).await;
+    let r = next(&mut lines).await;
+    assert_eq!((r["id"].as_u64(), r["result"]["isError"].as_bool()), (Some(4), Some(false)), "{r}");
+    drop(client_tx);
+    tokio::time::timeout(Duration::from_secs(10), srv).await.expect("server stops at EOF").unwrap().unwrap();
+    while let Ok(Some(l)) = lines.next_line().await {
+        assert!(!l.contains("call-2"), "no answer for the cancelled call: {l}");
+    }
+}
+
+/// "Check with database" reads the definitions of the views the SQL reads
+/// (and of the views those read) and traces them into their tables.
+#[tokio::test]
+async fn lineage_expands_views_with_the_database() {
+    let (st, _sink, dir) = state();
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(dir.path().join("v.db").to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let p = save_profile(&st, "views", cfg, None);
+    exec(&st, &p.id, "create table orders (id int, amount int); create view big as select id, amount * 2 as doubled from orders; create view top as select doubled as d from big where doubled > 10").await;
+    let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select d from top", Default::default(), true).await.unwrap();
+    let g = &v.graph;
+    let by_id = |id: &str| g.nodes.iter().find(|n| n.id == id).unwrap().name.clone();
+    let flows: Vec<String> = g.flows.iter().map(|f| format!("{} -> {}", by_id(&f.from), by_id(&f.to))).collect();
+    assert!(flows.contains(&"main.orders -> main.big".to_string()), "{flows:?} {:?}", g.warnings);
+    assert!(flows.contains(&"main.big -> main.top".to_string()), "{flows:?}");
+    assert_eq!(g.nodes.iter().filter(|n| n.view).count(), 2, "{:?}", g.nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+    let amount = g.edges.iter().find(|e| by_id(&e.from) == "main.orders" && e.from_column.as_deref() == Some("amount")).expect("orders.amount is traced");
+    assert_eq!(amount.to_column.as_deref(), Some("doubled"));
+    // Without the check: views stay boxes (nothing is read from the server).
+    let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select d from top", Default::default(), false).await.unwrap();
+    assert!(v.graph.nodes.iter().all(|n| !n.view));
 }

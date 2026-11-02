@@ -5,7 +5,7 @@
 //! it), so it is only the last resort. The ALL_* views show every object the
 //! user can access, with a few small queries filtered by owner and name.
 
-use databrain_connector_core::{quote_ident, quote_literal, ConnectorKind};
+use databrain_connector_core::{ConnectorKind, quote_ident, quote_literal};
 
 /// Rows as text, as returned by the session's catalog queries.
 pub type Rows = Vec<Vec<Option<String>>>;
@@ -420,14 +420,8 @@ pub fn source_ddl(lines: &Rows) -> Option<String> {
 pub fn sequence_ddl(owner: &str, name: &str, rows: &Rows) -> Option<String> {
     let r = rows.first()?;
     let v = |i| get(r, i).unwrap_or("");
-    let mut s = format!(
-        "CREATE SEQUENCE {}\n    START WITH {}\n    INCREMENT BY {}\n    MINVALUE {}\n    MAXVALUE {}",
-        full(owner, name),
-        v(6),
-        v(2),
-        v(0),
-        v(1)
-    );
+    let mut s =
+        format!("CREATE SEQUENCE {}\n    START WITH {}\n    INCREMENT BY {}\n    MINVALUE {}\n    MAXVALUE {}", full(owner, name), v(6), v(2), v(0), v(1));
     match v(5) {
         "0" | "" => s.push_str("\n    NOCACHE"),
         n => s.push_str(&format!("\n    CACHE {n}")),
@@ -458,13 +452,63 @@ mod tests {
             ],
             table: vec![row(&[Some("N"), n, n, Some("NO"), Some("Orders")])],
             constraints: vec![
-                row(&[Some("PK_O"), Some("P"), n, n, Some("ENABLED"), Some("USER NAME"), Some("PK_O"), Some("ID"), n, n, n, Some("NOT DEFERRABLE"), Some("IMMEDIATE")]),
-                row(&[Some("FK_C"), Some("R"), n, Some("CASCADE"), Some("ENABLED"), Some("USER NAME"), n, Some("CUST_ID"), Some("APP"), Some("CUSTOMERS"), Some("ID"), n, n]),
-                row(&[Some("SYS_C001"), Some("C"), Some("\"AMOUNT\" IS NOT NULL"), n, Some("ENABLED"), Some("GENERATED NAME"), n, Some("AMOUNT"), n, n, n, n, n]),
+                row(&[
+                    Some("PK_O"),
+                    Some("P"),
+                    n,
+                    n,
+                    Some("ENABLED"),
+                    Some("USER NAME"),
+                    Some("PK_O"),
+                    Some("ID"),
+                    n,
+                    n,
+                    n,
+                    Some("NOT DEFERRABLE"),
+                    Some("IMMEDIATE"),
+                ]),
+                row(&[
+                    Some("FK_C"),
+                    Some("R"),
+                    n,
+                    Some("CASCADE"),
+                    Some("ENABLED"),
+                    Some("USER NAME"),
+                    n,
+                    Some("CUST_ID"),
+                    Some("APP"),
+                    Some("CUSTOMERS"),
+                    Some("ID"),
+                    n,
+                    n,
+                ]),
+                row(&[
+                    Some("SYS_C001"),
+                    Some("C"),
+                    Some("\"AMOUNT\" IS NOT NULL"),
+                    n,
+                    Some("ENABLED"),
+                    Some("GENERATED NAME"),
+                    n,
+                    Some("AMOUNT"),
+                    n,
+                    n,
+                    n,
+                    n,
+                    n,
+                ]),
                 row(&[Some("CK_AMT"), Some("C"), Some("amount >= 0"), n, Some("ENABLED"), Some("USER NAME"), n, Some("AMOUNT"), n, n, n, n, n]),
             ],
             indexes: vec![
-                row(&[Some("APP"), Some("IX_NAME"), Some("FUNCTION-BASED NORMAL"), Some("NONUNIQUE"), Some("SYS_NC00005$"), Some("ASC"), Some("UPPER(\"NAME\")")]),
+                row(&[
+                    Some("APP"),
+                    Some("IX_NAME"),
+                    Some("FUNCTION-BASED NORMAL"),
+                    Some("NONUNIQUE"),
+                    Some("SYS_NC00005$"),
+                    Some("ASC"),
+                    Some("UPPER(\"NAME\")"),
+                ]),
                 row(&[Some("APP"), Some("IX_NAME"), Some("FUNCTION-BASED NORMAL"), Some("NONUNIQUE"), Some("AMOUNT"), Some("ASC"), n]),
                 row(&[Some("APP"), Some("PK_O"), Some("NORMAL"), Some("UNIQUE"), Some("ID"), Some("ASC"), n]),
                 row(&[Some("APP"), Some("UX_CUST"), Some("NORMAL"), Some("UNIQUE"), Some("CUST_ID"), Some("ASC"), n]),
@@ -509,7 +553,23 @@ COMMENT ON COLUMN "APP"."ORDERS"."NAME" IS 'it''s the name';"#;
         assert!(s.starts_with("CREATE SEQUENCE \"APP\".\"S\"\n    START WITH 41") && s.contains("CACHE 20") && s.ends_with("NOORDER;"));
         let m = mview_ddl("APP", "M", &vec![row(&[Some("select 1 x from dual"), Some("COMPLETE"), Some("DEMAND"), Some("IMMEDIATE"), None])], &vec![]).unwrap();
         assert_eq!(m, "CREATE MATERIALIZED VIEW \"APP\".\"M\"\nBUILD IMMEDIATE\nREFRESH COMPLETE ON DEMAND\nAS\nselect 1 x from dual;");
-        assert!(table_ddl("APP", "NONE", &TableParts { columns: vec![], table: vec![], constraints: vec![], indexes: vec![], col_comments: vec![], part: vec![], part_keys: vec![], partitions: vec![] }).is_none());
+        assert!(
+            table_ddl(
+                "APP",
+                "NONE",
+                &TableParts {
+                    columns: vec![],
+                    table: vec![],
+                    constraints: vec![],
+                    indexes: vec![],
+                    col_comments: vec![],
+                    part: vec![],
+                    part_keys: vec![],
+                    partitions: vec![]
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]

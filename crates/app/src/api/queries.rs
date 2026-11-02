@@ -18,19 +18,12 @@ pub struct Span {
 pub fn statement_at_cursor(kind: ConnectorKind, text: &str, cursor: usize) -> Option<Span> {
     let spans = split_statements(text, kind);
     let byte = utf16_to_byte(text, cursor);
-    statement_at(&spans, byte).map(|s| Span {
-        start: byte_to_utf16(text, s.start),
-        end: byte_to_utf16(text, s.end),
-        sql: s.sql.clone(),
-    })
+    statement_at(&spans, byte).map(|s| Span { start: byte_to_utf16(text, s.start), end: byte_to_utf16(text, s.end), sql: s.sql.clone() })
 }
 
 /// Every statement of `text` (UTF-16 offsets).
 pub fn statement_spans(kind: ConnectorKind, text: &str) -> Vec<Span> {
-    split_statements(text, kind)
-        .into_iter()
-        .map(|s| Span { start: byte_to_utf16(text, s.start), end: byte_to_utf16(text, s.end), sql: s.sql })
-        .collect()
+    split_statements(text, kind).into_iter().map(|s| Span { start: byte_to_utf16(text, s.start), end: byte_to_utf16(text, s.end), sql: s.sql }).collect()
 }
 
 /// Write a text file chosen in a save dialog (diagram exports).
@@ -114,8 +107,16 @@ pub async fn end_transaction(state: &AppState, connection_id: &str, session_key:
 }
 
 /// The query plan of one statement, on the tab's session (`analyze` runs it: reads only).
-pub async fn explain_plan(state: &AppState, connection_id: &str, session_key: &str, sql: &str, analyze: bool, params: &std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>) -> Result<databrain_query_engine::plan::QueryPlan> {
+pub async fn explain_plan(
+    state: &AppState,
+    connection_id: &str,
+    session_key: &str,
+    sql: &str,
+    analyze: bool,
+    params: &std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>,
+) -> Result<databrain_query_engine::plan::QueryPlan> {
     let kind = state.workspace.get_connection(connection_id)?.config.kind;
-    let sql = databrain_connector_core::sql::substitute_parameters(sql, kind, params).map_err(|names| invalid(format!("Enter a value for {}", names.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", "))))?;
+    let sql = databrain_connector_core::sql::substitute_parameters(sql, kind, params)
+        .map_err(|names| invalid(format!("Enter a value for {}", names.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", "))))?;
     state.engine.explain(connection_id, session_key, &sql, analyze).await
 }

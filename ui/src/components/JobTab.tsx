@@ -6,7 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as
 import { AlertTriangle, FileDown, ArrowDownToLine, CalendarClock, Copy, Database, Eye, Loader2, Maximize2, Play, PlayCircle, Plus, RotateCcw, Square, Trash2 } from "lucide-react";
 import { api, toError } from "../lib/api";
 import { kbd, modalOpen } from "../lib/platform";
-import type { Job, JobEdge, JobNode } from "../lib/types";
+import type { RunParams, Job, JobEdge, JobNode } from "../lib/types";
 import { NODE_H, NODE_W, addDownstream, addEdge, ancestors, descendants, edgeProblem, missingLinks, newNode, nodeStatus, readSql, removeEdge, removeNode, scheduleText, updateStep, upstreamOf } from "../lib/jobGraph";
 import { isQueryTab, useStore } from "../store";
 import { useJobs } from "../jobsStore";
@@ -131,9 +131,9 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
     setJob(next);
   }, [run]);
 
-  const start = async (nodes?: string[]) => {
+  const start = async (nodes?: string[], params?: RunParams) => {
     if (!(await persist())) return toast("Fix the job first: " + (save.message ?? "it could not be saved"), "error");
-    await useJobs.getState().run(jobId, nodes);
+    await useJobs.getState().run(jobId, nodes, params);
   };
   const resume = async () => {
     if (!(await persist())) return toast("Fix the job first: " + (save.message ?? "it could not be saved"), "error");
@@ -532,7 +532,15 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
               onDelete={() => deleteNode(selected.id)}
             />
           ) : (
-            <JobPanel job={job} run={run} canResume={canResume} onResume={() => void resume()} onChange={(patch) => update((j) => ({ ...j, ...patch }))} onSelect={(id) => setSel({ node: id })} />
+            <JobPanel
+              job={job}
+              run={run}
+              canResume={canResume}
+              onResume={() => void resume()}
+              onRunWith={(params) => void start(undefined, params)}
+              onChange={(patch) => update((j) => ({ ...j, ...patch }))}
+              onSelect={(id) => setSel({ node: id })}
+            />
           )}
         </aside>
       </div>

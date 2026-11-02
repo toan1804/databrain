@@ -20,8 +20,15 @@ use crate::types::*;
 #[ts(export)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
-    Started { session_id: String, run_id: String },
-    TextDelta { session_id: String, run_id: String, text: String },
+    Started {
+        session_id: String,
+        run_id: String,
+    },
+    TextDelta {
+        session_id: String,
+        run_id: String,
+        text: String,
+    },
     ToolStarted {
         session_id: String,
         run_id: String,
@@ -30,12 +37,37 @@ pub enum AgentEvent {
         #[ts(type = "Record<string, unknown>")]
         args: Value,
     },
-    ToolFinished { session_id: String, run_id: String, call_id: String, tool: String, content: String, display: Value },
-    Usage { session_id: String, run_id: String, input: u32, output: u32 },
+    ToolFinished {
+        session_id: String,
+        run_id: String,
+        call_id: String,
+        tool: String,
+        content: String,
+        display: Value,
+    },
+    Usage {
+        session_id: String,
+        run_id: String,
+        input: u32,
+        output: u32,
+    },
     /// Kiro: credits a turn spent and how full the context is.
-    Metering { session_id: String, run_id: String, credits: f64, context_percent: Option<f64> },
-    Finished { session_id: String, run_id: String, text: String },
-    Failed { session_id: String, run_id: String, error: AiError },
+    Metering {
+        session_id: String,
+        run_id: String,
+        credits: f64,
+        context_percent: Option<f64>,
+    },
+    Finished {
+        session_id: String,
+        run_id: String,
+        text: String,
+    },
+    Failed {
+        session_id: String,
+        run_id: String,
+        error: AiError,
+    },
 }
 
 pub trait AgentSink: Send + Sync {
@@ -132,7 +164,10 @@ pub fn provider_for(rec: &AiProviderRecord, secrets: Arc<dyn SecretStore>) -> Re
             &format!("ai:{}", rec.id),
             secrets,
             Arc::new(databrain_auth::NonInteractive),
-            databrain_auth::AuthContext { cli: Some(databrain_auth::CliKind::Azure { resource: "https://cognitiveservices.azure.com".into() }), ..Default::default() },
+            databrain_auth::AuthContext {
+                cli: Some(databrain_auth::CliKind::Azure { resource: "https://cognitiveservices.azure.com".into() }),
+                ..Default::default()
+            },
         )?),
         ProviderAuth::GoogleAdc => KeySource::Credential(databrain_auth::credential_source(
             &databrain_auth::AuthMethod::CloudCli { profile: None },
@@ -161,12 +196,14 @@ fn language_rules(kind: databrain_connector_core::ConnectorKind) -> String {
             countDocuments, distinct, insertOne/insertMany, updateOne/updateMany, deleteOne/deleteMany, or a JSON database command \
             ({\"find\": \"orders\"}); `use <database>` on the first line picks the database. Always name the database (getSiblingDB or use) \
             unless the connection has a default one. Nested fields come back as JSON text columns. Put commands in ```javascript blocks. \
-            To join with other sources, run each side and combine the outputs with query_outputs (DuckDB SQL over results.<handle>).\n".into(),
+            To join with other sources, run each side and combine the outputs with query_outputs (DuckDB SQL over results.<handle>).\n"
+            .into(),
         L::Cypher => "\nThis connection is Neo4j, not SQL: write Cypher. The schema lists node labels (schema Nodes) and relationship types \
             (schema Relationships) as tables with their properties as columns. Return properties rather than whole nodes when you can \
             (`MATCH (p:Person)-[:ACTED_IN]->(m:Movie) RETURN p.name AS actor, m.title AS movie LIMIT 25`); always add LIMIT. \
             A returned node or relationship becomes columns of its properties. Put queries in ```cypher blocks. \
-            To join with other sources, combine outputs with query_outputs (DuckDB SQL over results.<handle>).\n".into(),
+            To join with other sources, combine outputs with query_outputs (DuckDB SQL over results.<handle>).\n"
+            .into(),
         L::Cql => format!("\nThis connection is {}: write CQL (no joins; filter on the partition key; always add LIMIT).\n", t.name),
     }
 }
@@ -226,7 +263,8 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
     // Table access rules: say them up front so the model doesn't try denied tables.
     let pol = &profile.ai_policy;
     if crate::access::has_rules(pol) {
-        let l = |v: &[String]| v.iter().map(|p| p.trim()).filter(|p| !p.is_empty()).map(|p| format!("'{}'", p.trim_matches('\''))).collect::<Vec<_>>().join(", ");
+        let l =
+            |v: &[String]| v.iter().map(|p| p.trim()).filter(|p| !p.is_empty()).map(|p| format!("'{}'", p.trim_matches('\''))).collect::<Vec<_>>().join(", ");
         s.push_str("\nTable access on this connection (enforced; other tables are refused): ");
         let mut parts = Vec::new();
         if !l(&pol.read_allow).is_empty() {
@@ -403,11 +441,7 @@ impl Agent {
         sink.emit(AgentEvent::Started { session_id: sid.clone(), run_id: run_id.clone() });
 
         // History.
-        let mut messages: Vec<Message> = ws
-            .list_ai_messages(&sid)?
-            .into_iter()
-            .filter_map(|m| serde_json::from_value::<Message>(m.content).ok())
-            .collect();
+        let mut messages: Vec<Message> = ws.list_ai_messages(&sid)?.into_iter().filter_map(|m| serde_json::from_value::<Message>(m.content).ok()).collect();
         // Keep the context bounded: last ~30 messages, starting at a user turn.
         if messages.len() > 30 {
             let mut start = messages.len() - 30;
@@ -424,7 +458,8 @@ impl Agent {
             match self.engine.outputs().resolve(m) {
                 Some(o) => {
                     mentioned_ids.push(o.result_id.clone());
-                    let cols: Vec<String> = o.columns.iter().take(40).map(|c| format!("{} {}", c.name, c.db_type.clone().unwrap_or_else(|| c.data_type.clone()))).collect();
+                    let cols: Vec<String> =
+                        o.columns.iter().take(40).map(|c| format!("{} {}", c.name, c.db_type.clone().unwrap_or_else(|| c.data_type.clone()))).collect();
                     lines.push(format!(
                         "- @{m} = {} ({}): {} rows{} from \"{}\"; columns: {}\n  SQL: {}",
                         o.reference(),
@@ -440,10 +475,7 @@ impl Agent {
             }
         }
         if !lines.is_empty() {
-            turn_text.push_str(&format!(
-                "\n\n[Mentioned outputs — {OUTPUTS_RULE}]\n{}",
-                lines.join("\n")
-            ));
+            turn_text.push_str(&format!("\n\n[Mentioned outputs — {OUTPUTS_RULE}]\n{}", lines.join("\n")));
         }
         // Other connections chosen for this question (AI-enabled only).
         let mut others: Vec<ConnectionProfile> = Vec::new();
@@ -479,7 +511,13 @@ impl Agent {
         for p in &others {
             if let Ok(r) = knowledge::retrieve(&ws, &p.id, &retrieval_q, 5, per) {
                 if !r.text.is_empty() {
-                    retrieved.text.push_str(&format!("\n\n[Connection \"{}\" ({}): pass connection=\"{}\"]\n{}", p.name, p.config.kind.dialect_name(), p.name, r.text));
+                    retrieved.text.push_str(&format!(
+                        "\n\n[Connection \"{}\" ({}): pass connection=\"{}\"]\n{}",
+                        p.name,
+                        p.config.kind.dialect_name(),
+                        p.name,
+                        r.text
+                    ));
                 }
                 retrieved.notes.extend(r.notes.into_iter().map(|n| format!("[{}] {n}", p.name)));
             }
@@ -532,7 +570,14 @@ impl Agent {
 
         let mut final_text = String::new();
         for _step in 0..self.max_steps {
-            let chat = ChatRequest { model: model.clone(), system: system.clone(), messages: messages.clone(), tools: tools.clone(), temperature: Some(0.2), max_tokens: cfg.max_output_tokens };
+            let chat = ChatRequest {
+                model: model.clone(),
+                system: system.clone(),
+                messages: messages.clone(),
+                tools: tools.clone(),
+                temperature: Some(0.2),
+                max_tokens: cfg.max_output_tokens,
+            };
             let mut stream = tokio::select! {
                 s = provider.chat_stream(chat) => s?,
                 _ = cancel.cancelled() => return Err(AiError::Cancelled),
@@ -573,11 +618,28 @@ impl Agent {
                 if cancel.is_cancelled() {
                     return Err(AiError::Cancelled);
                 }
-                sink.emit(AgentEvent::ToolStarted { session_id: sid.clone(), run_id: run_id.clone(), call_id: c.id.clone(), tool: c.name.clone(), args: c.arguments.clone() });
+                sink.emit(AgentEvent::ToolStarted {
+                    session_id: sid.clone(),
+                    run_id: run_id.clone(),
+                    call_id: c.id.clone(),
+                    tool: c.name.clone(),
+                    args: c.arguments.clone(),
+                });
                 let o = ctx.call(&c.name, &c.arguments).await;
                 // Keep tool results bounded in the context window.
-                let content: String = if o.content.len() > 16_000 { format!("{}…(truncated)", &o.content[..o.content.char_indices().take_while(|(i, _)| *i < 16_000).last().map(|(i, _)| i).unwrap_or(0)]) } else { o.content };
-                sink.emit(AgentEvent::ToolFinished { session_id: sid.clone(), run_id: run_id.clone(), call_id: c.id.clone(), tool: c.name.clone(), content: content.clone(), display: o.display.clone() });
+                let content: String = if o.content.len() > 16_000 {
+                    format!("{}…(truncated)", &o.content[..o.content.char_indices().take_while(|(i, _)| *i < 16_000).last().map(|(i, _)| i).unwrap_or(0)])
+                } else {
+                    o.content
+                };
+                sink.emit(AgentEvent::ToolFinished {
+                    session_id: sid.clone(),
+                    run_id: run_id.clone(),
+                    call_id: c.id.clone(),
+                    tool: c.name.clone(),
+                    content: content.clone(),
+                    display: o.display.clone(),
+                });
                 let tm = Message::tool(&c, content);
                 ws.add_ai_message(&sid, "tool", &json!({"message": tm, "display": o.display}).get("message").cloned().unwrap_or_default(), (None, None))?;
                 messages.push(tm);

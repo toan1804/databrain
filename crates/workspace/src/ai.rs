@@ -97,10 +97,7 @@ impl Workspace {
     }
 
     pub fn get_ai_provider(&self, id: &str) -> Result<AiProviderRecord> {
-        self.list_ai_providers()?
-            .into_iter()
-            .find(|p| p.id == id)
-            .ok_or_else(|| Error::NotFound(format!("AI provider {id}")))
+        self.list_ai_providers()?.into_iter().find(|p| p.id == id).ok_or_else(|| Error::NotFound(format!("AI provider {id}")))
     }
 
     pub fn save_ai_provider(&self, mut p: AiProviderRecord) -> Result<AiProviderRecord> {
@@ -132,21 +129,15 @@ impl Workspace {
             "SELECT id, title, connection_id, provider_id, model, created_at, updated_at FROM ai_sessions \
              WHERE (?1 IS NULL OR connection_id = ?1) ORDER BY updated_at DESC LIMIT ?2",
         )?;
-        let rows = stmt
-            .query_map(params![connection_id, limit as i64], session_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt.query_map(params![connection_id, limit as i64], session_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
     pub fn get_ai_session(&self, id: &str) -> Result<AiSessionRecord> {
         let c = self.conn.lock();
-        c.query_row(
-            "SELECT id, title, connection_id, provider_id, model, created_at, updated_at FROM ai_sessions WHERE id = ?1",
-            [id],
-            session_row,
-        )
-        .optional()?
-        .ok_or_else(|| Error::NotFound(format!("AI session {id}")))
+        c.query_row("SELECT id, title, connection_id, provider_id, model, created_at, updated_at FROM ai_sessions WHERE id = ?1", [id], session_row)
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("AI session {id}")))
     }
 
     pub fn save_ai_session(&self, mut s: AiSessionRecord) -> Result<AiSessionRecord> {
@@ -203,13 +194,7 @@ impl Workspace {
     /// assistant ran or proposed, a connection string in a question, a tool
     /// result quoting them) are replaced by `***` first, as in the audit log:
     /// the kept transcript is also what the next turn sends the model.
-    pub fn add_ai_message(
-        &self,
-        session_id: &str,
-        role: &str,
-        content: &serde_json::Value,
-        tokens: (Option<i64>, Option<i64>),
-    ) -> Result<i64> {
+    pub fn add_ai_message(&self, session_id: &str, role: &str, content: &serde_json::Value, tokens: (Option<i64>, Option<i64>)) -> Result<i64> {
         let c = self.conn.lock();
         let now = now_ms();
         c.execute(
@@ -235,9 +220,8 @@ impl Workspace {
 
     pub fn list_ai_messages(&self, session_id: &str) -> Result<Vec<AiMessageRecord>> {
         let c = self.conn.lock();
-        let mut stmt = c.prepare(
-            "SELECT id, session_id, role, content_json, tokens_in, tokens_out, created_at FROM ai_messages WHERE session_id = ?1 ORDER BY id",
-        )?;
+        let mut stmt =
+            c.prepare("SELECT id, session_id, role, content_json, tokens_in, tokens_out, created_at FROM ai_messages WHERE session_id = ?1 ORDER BY id")?;
         let rows = stmt
             .query_map([session_id], |r| {
                 Ok(AiMessageRecord {
@@ -273,9 +257,8 @@ impl Workspace {
 
     pub fn list_audit(&self, limit: u32) -> Result<Vec<AuditEntry>> {
         let c = self.conn.lock();
-        let mut stmt = c.prepare(
-            "SELECT id, session_id, connection_id, tool, args_json, decision, summary, created_at FROM ai_audit ORDER BY id DESC LIMIT ?1",
-        )?;
+        let mut stmt =
+            c.prepare("SELECT id, session_id, connection_id, tool, args_json, decision, summary, created_at FROM ai_audit ORDER BY id DESC LIMIT ?1")?;
         let rows = stmt
             .query_map([limit as i64], |r| {
                 Ok(AuditEntry {
@@ -323,7 +306,18 @@ mod tests {
     #[test]
     fn totals_tokens_per_provider() {
         let ws = Workspace::open_in_memory().unwrap();
-        let s = |p: &str| ws.save_ai_session(AiSessionRecord { id: String::new(), title: "t".into(), connection_id: None, provider_id: Some(p.into()), model: None, created_at: 0, updated_at: 0 }).unwrap();
+        let s = |p: &str| {
+            ws.save_ai_session(AiSessionRecord {
+                id: String::new(),
+                title: "t".into(),
+                connection_id: None,
+                provider_id: Some(p.into()),
+                model: None,
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap()
+        };
         let (a, b) = (s("p1"), s("p2"));
         ws.add_ai_message(&a.id, "assistant", &serde_json::json!({}), (Some(100), Some(20))).unwrap();
         ws.add_ai_message(&a.id, "user", &serde_json::json!({}), (None, None)).unwrap();
@@ -346,7 +340,17 @@ mod tests {
     #[test]
     fn transcripts_are_redacted() {
         let ws = Workspace::open_in_memory().unwrap();
-        let s = ws.save_ai_session(AiSessionRecord { id: String::new(), title: "use postgres://ann:hunter2@db/app".into(), connection_id: None, provider_id: None, model: None, created_at: 0, updated_at: 0 }).unwrap();
+        let s = ws
+            .save_ai_session(AiSessionRecord {
+                id: String::new(),
+                title: "use postgres://ann:hunter2@db/app".into(),
+                connection_id: None,
+                provider_id: None,
+                model: None,
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
         assert_eq!(ws.get_ai_session(&s.id).unwrap().title, "use postgres://ann:***@db/app");
         let user = serde_json::json!({"role": "user", "text": "Connect with postgres://ann:hunter2@db/app and run create user bob identified by 'pw1'"});
         let assistant = serde_json::json!({"role": "assistant", "text": "", "tool_calls": [{"id": "c1", "name": "run_query", "arguments": {"sql": "ALTER ROLE r PASSWORD 'pw2'", "n": 3}}]});
@@ -362,7 +366,8 @@ mod tests {
         assert_eq!(kept[0]["text"], "Connect with postgres://ann:***@db/app and run create user bob identified by '***'");
         assert_eq!(kept[1]["tool_calls"][0]["arguments"], serde_json::json!({"sql": "ALTER ROLE r PASSWORD '***'", "n": 3}), "structure and other values kept");
         assert_eq!(kept[2]["tool_call_id"], "c1");
-        ws.add_audit(Some(&s.id), None, "run_query", &serde_json::json!({"sql": "attach 'mysql://root:pw4@h/db'"}), "approved", Some("password 'pw5'")).unwrap();
+        ws.add_audit(Some(&s.id), None, "run_query", &serde_json::json!({"sql": "attach 'mysql://root:pw4@h/db'"}), "approved", Some("password 'pw5'"))
+            .unwrap();
         let a = &ws.list_audit(1).unwrap()[0];
         assert_eq!(a.args["sql"], "attach 'mysql://root:***@h/db'");
         assert_eq!(a.summary.as_deref(), Some("password '***'"));
@@ -376,7 +381,17 @@ mod tests {
         let path = dir.join("ws.db");
         let id = {
             let ws = Workspace::open(&path).unwrap();
-            let s = ws.save_ai_session(AiSessionRecord { id: String::new(), title: "t".into(), connection_id: None, provider_id: None, model: None, created_at: 0, updated_at: 0 }).unwrap();
+            let s = ws
+                .save_ai_session(AiSessionRecord {
+                    id: String::new(),
+                    title: "t".into(),
+                    connection_id: None,
+                    provider_id: None,
+                    model: None,
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .unwrap();
             let c = ws.conn.lock();
             // As an older version kept them.
             c.execute("UPDATE ai_sessions SET title = 'about mongodb://u:old1@h' WHERE id = ?1", [&s.id]).unwrap();
@@ -385,14 +400,27 @@ mod tests {
                 rusqlite::params![s.id, serde_json::json!({"role": "user", "text": "create user u identified by old2"}).to_string()],
             )
             .unwrap();
-            c.execute("INSERT INTO ai_messages (session_id, role, content_json, created_at) VALUES (?1, 'tool', 'not json: password ''old3''', 0)", [&s.id]).unwrap();
-            c.execute("INSERT INTO ai_audit (tool, args_json, decision, summary, created_at) VALUES ('run_query', ?1, 'approved', 'mysql://r:old4@h', 0)", [serde_json::json!({"sql": "attach 'pg://a:old5@h'"}).to_string()]).unwrap();
+            c.execute("INSERT INTO ai_messages (session_id, role, content_json, created_at) VALUES (?1, 'tool', 'not json: password ''old3''', 0)", [&s.id])
+                .unwrap();
+            c.execute(
+                "INSERT INTO ai_audit (tool, args_json, decision, summary, created_at) VALUES ('run_query', ?1, 'approved', 'mysql://r:old4@h', 0)",
+                [serde_json::json!({"sql": "attach 'pg://a:old5@h'"}).to_string()],
+            )
+            .unwrap();
             c.execute("DELETE FROM maintenance WHERE name = 'transcripts_redacted_v1'", []).unwrap();
             s.id
         };
         let ws = Workspace::open(&path).unwrap();
         assert_eq!(ws.get_ai_session(&id).unwrap().title, "about mongodb://u:***@h");
-        let raw: Vec<String> = ws.conn.lock().prepare("SELECT content_json FROM ai_messages ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let raw: Vec<String> = ws
+            .conn
+            .lock()
+            .prepare("SELECT content_json FROM ai_messages ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
         assert!(raw[0].contains("identified by ***") && !raw[0].contains("old2"), "{}", raw[0]);
         assert_eq!(raw[1], "not json: password '***'");
         let a = &ws.list_audit(1).unwrap()[0];

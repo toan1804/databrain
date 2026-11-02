@@ -14,11 +14,11 @@
 
 use databrain_connector_core::arrow::datatypes::SchemaRef;
 use databrain_connector_core::sql::dialect_for;
+use databrain_connector_core::sqlparser::ast::{Expr, GroupByExpr, Ident, ObjectNamePart, SelectItem, SetExpr, Statement, TableFactor};
+use databrain_connector_core::sqlparser::parser::Parser;
 use databrain_connector_core::{ConnectorKind, DbObject, ExecOptions, ObjectDetail, ObjectKind, quote_ident, quote_path};
 use databrain_export::load::edit_literal;
 use serde::{Deserialize, Serialize};
-use databrain_connector_core::sqlparser::ast::{Expr, GroupByExpr, Ident, ObjectNamePart, SelectItem, SetExpr, Statement, TableFactor};
-use databrain_connector_core::sqlparser::parser::Parser;
 
 use crate::{EngineError, OutputInfo, QueryEngine, Result};
 
@@ -122,10 +122,14 @@ pub fn source_table(sql: &str, kind: ConnectorKind) -> Option<SourceTable> {
         _ => return None,
     }
     let TableFactor::Table { name, alias, args: None, .. } = &s.from[0].relation else { return None };
-    let parts: Vec<String> = name.0.iter().map(|p| match p {
-        ObjectNamePart::Identifier(i) => Some(fold(kind, &i.value, i.quote_style.is_some())),
-        _ => None,
-    }).collect::<Option<_>>()?;
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .map(|p| match p {
+            ObjectNamePart::Identifier(i) => Some(fold(kind, &i.value, i.quote_style.is_some())),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
     let (schema, table) = match parts.as_slice() {
         [t] => (None, t.clone()),
         [s, t] => (Some(s.clone()), t.clone()),
@@ -337,7 +341,10 @@ impl QueryEngine {
         let bad = |m: String| EngineError::new("invalid", m);
         let table = quote_path(kind, &format!("{}.{}", t.schema, t.table));
         let col = |i: usize| -> Result<(String, &databrain_connector_core::arrow::datatypes::Field)> {
-            let name = t.columns.get(i).cloned().flatten().ok_or_else(|| bad(format!("Column {} is not a column of {}", schema.fields().get(i).map(|f| f.name().as_str()).unwrap_or("?"), t.table)))?;
+            let name =
+                t.columns.get(i).cloned().flatten().ok_or_else(|| {
+                    bad(format!("Column {} is not a column of {}", schema.fields().get(i).map(|f| f.name().as_str()).unwrap_or("?"), t.table))
+                })?;
             Ok((quote_ident(kind, &name), schema.field(i)))
         };
         let lit = |i: usize, v: Option<&str>| -> Result<String> { edit_literal(schema.field(i), v, kind).map_err(bad) };
@@ -366,7 +373,8 @@ impl QueryEngine {
                     if values.is_empty() {
                         continue;
                     }
-                    let sets = values.iter().map(|v| Ok(format!("{} = {}", col(v.column)?.0, lit(v.column, v.value.as_deref())?))).collect::<Result<Vec<_>>>()?;
+                    let sets =
+                        values.iter().map(|v| Ok(format!("{} = {}", col(v.column)?.0, lit(v.column, v.value.as_deref())?))).collect::<Result<Vec<_>>>()?;
                     out.push(EditStatement { sql: format!("UPDATE {table} SET {} WHERE {}", sets.join(", "), key_where(key)?), expect_rows: Some(1) });
                 }
                 RowChange::Insert { values } => {
@@ -477,7 +485,10 @@ mod tests {
     #[test]
     fn finds_the_single_source_table() {
         assert_eq!(src("select * from public.orders where id > 3 order by id limit 10", Postgres), t(Some("public"), "orders", vec![None]));
-        assert_eq!(src("select o.id, o.amount * 2, name as n from orders o", Postgres), t(None, "orders", vec![Some(Some("id")), Some(None), Some(Some("name"))]));
+        assert_eq!(
+            src("select o.id, o.amount * 2, name as n from orders o", Postgres),
+            t(None, "orders", vec![Some(Some("id")), Some(None), Some(Some("name"))])
+        );
         assert_eq!(src("select id from emp", Oracle).unwrap().table, "EMP", "Oracle folds unquoted names up");
         assert_eq!(src("select \"Id\" from \"Mixed\"", Postgres).unwrap().table, "Mixed");
         for not in [

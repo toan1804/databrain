@@ -118,6 +118,22 @@ export function NodePanel({
         </button>
       </div>
 
+      {node.ai_sql && (
+        <div className="flex items-start gap-1.5 rounded-md border border-line px-2 py-1.5 text-[11.5px] text-muted">
+          <Info size={12} className="mt-0.5 shrink-0" />
+          <span className="min-w-0 flex-1">
+            The AI wrote this step's SQL, so on DuckDB it runs in the AI's sandbox (no files, network or extensions) whoever runs the job. Changing the SQL makes it yours.
+          </span>
+          <button
+            className="btn-ghost shrink-0 py-0.5 text-[11.5px]"
+            title="Run this SQL as yours from now on: it can read files and the network on DuckDB"
+            onClick={() => onChange({ ai_sql: false })}
+          >
+            Trust this SQL
+          </button>
+        </div>
+      )}
+
       {/* Outcome first: what happened is what you look for after a run. */}
       <div className={`rounded-md border px-2 py-1.5 ${status?.status === "error" ? "border-danger/50 bg-danger/5" : status?.status === "success" ? "border-success/40" : "border-line"}`}>
         <div className="flex items-center gap-1.5">

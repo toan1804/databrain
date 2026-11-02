@@ -25,11 +25,7 @@ fn fixture(env: EnvTag) -> Fixture {
 }
 
 fn fixture_with_store(env: EnvTag, secrets: Arc<dyn SecretStore>) -> Fixture {
-    let path = std::env::temp_dir().join(format!(
-        "databrain-qe-{}-{}.db",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
+    let path = std::env::temp_dir().join(format!("databrain-qe-{}-{}.db", std::process::id(), uuid::Uuid::new_v4()));
     let mut reg = ConnectorRegistry::new();
     reg.register(Arc::new(SqliteConnector));
     let ws = Arc::new(Workspace::open_in_memory().unwrap());
@@ -53,13 +49,7 @@ fn fixture_with_store(env: EnvTag, secrets: Arc<dyn SecretStore>) -> Fixture {
         .unwrap();
     let sink = Arc::new(CollectingSink::default());
     let engine = QueryEngine::new(reg, ws.clone(), secrets, Arc::new(ResultStore::new()), sink.clone());
-    Fixture {
-        engine,
-        sink,
-        ws,
-        conn_id: profile.id,
-        _dir: TempFile(path),
-    }
+    Fixture { engine, sink, ws, conn_id: profile.id, _dir: TempFile(path) }
 }
 
 fn req(f: &Fixture, sql: &str) -> RunRequest {
@@ -82,10 +72,7 @@ async fn wait_job(f: &Fixture, job_id: &str) -> Vec<JobEvent> {
         if !f.engine.is_running(job_id) {
             let evs = f.sink.0.lock().clone();
             if evs.iter().any(|e| matches!(e, JobEvent::JobFinished { job_id: j, .. } if j == job_id)) {
-                return evs
-                    .into_iter()
-                    .filter(|e| e.job_id() == job_id)
-                    .collect();
+                return evs.into_iter().filter(|e| e.job_id() == job_id).collect();
             }
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -115,7 +102,13 @@ async fn parameters_are_bound_before_running() {
     assert_eq!(statements[0].sql, "select '2026-09-09' as d, 2000 as n, typeof(2000) as t, ':d' as lit");
     assert_eq!((statements[0].start, statements[0].end), (0, sql.len()), "spans of the editor text");
     let evs = wait_job(&f, &job_id).await;
-    let rid = evs.iter().find_map(|e| match e { JobEvent::StatementFinished { result: Some(r), .. } => Some(r.id.clone()), _ => None }).expect("result");
+    let rid = evs
+        .iter()
+        .find_map(|e| match e {
+            JobEvent::StatementFinished { result: Some(r), .. } => Some(r.id.clone()),
+            _ => None,
+        })
+        .expect("result");
     let page = f.engine.results().get(&rid).unwrap().lock().page(&Default::default(), 0, 1).unwrap();
     let row = format!("{:?}", page.rows[0]);
     assert!(row.contains("2026-09-09") && row.contains("integer"), "{row}");
@@ -153,21 +146,13 @@ async fn cells_share_session_but_keep_results() {
 #[tokio::test]
 async fn runs_script_and_records_history() {
     let f = fixture(EnvTag::Dev);
-    let job = started(
-        f.engine
-            .run(req(
-                &f,
-                "create table t(id integer, name text);\ninsert into t values (1,'a'),(2,'b');\nselect * from t order by id;",
-            ))
-            .unwrap(),
-    );
+    let job =
+        started(f.engine.run(req(&f, "create table t(id integer, name text);\ninsert into t values (1,'a'),(2,'b');\nselect * from t order by id;")).unwrap());
     let evs = wait_job(&f, &job).await;
     let finished: Vec<_> = evs
         .iter()
         .filter_map(|e| match e {
-            JobEvent::StatementFinished { result, rows_affected, .. } => {
-                Some((result.clone(), *rows_affected))
-            }
+            JobEvent::StatementFinished { result, rows_affected, .. } => Some((result.clone(), *rows_affected)),
             _ => None,
         })
         .collect();
@@ -187,10 +172,7 @@ async fn runs_script_and_records_history() {
 #[tokio::test]
 async fn row_limit_truncates() {
     let f = fixture(EnvTag::None);
-    let mut r = req(
-        &f,
-        "with recursive c(x) as (select 1 union all select x+1 from c where x < 5000) select x from c",
-    );
+    let mut r = req(&f, "with recursive c(x) as (select 1 union all select x+1 from c where x < 5000) select x from c");
     r.row_limit = Some(250);
     let job = started(f.engine.run(r).unwrap());
     let evs = wait_job(&f, &job).await;
@@ -255,6 +237,40 @@ async fn manual_commit_opens_a_transaction_until_commit_or_rollback() {
     assert!(!f.engine.in_transaction(&f.conn_id, "tab1"));
 }
 
+/// A connection's own idle time and connect timeout win over the global
+/// settings; `0` minutes keeps its sessions open.
+#[tokio::test]
+async fn per_connection_idle_time_and_connect_timeout() {
+    let f = fixture(EnvTag::None);
+    let set = |k: &str, v: Option<&str>| {
+        let mut p = f.ws.get_connection(&f.conn_id).unwrap();
+        match v {
+            Some(v) => p.config.options.insert(k.into(), v.into()),
+            None => p.config.options.remove(k),
+        };
+        f.ws.save_connection(p).unwrap();
+    };
+    let open = |f: &Fixture| {
+        let (e, id) = (f.engine.clone(), f.conn_id.clone());
+        async move { e.session_for_tests(&id).await.unwrap() }
+    };
+    drop(open(&f).await);
+    set(databrain_connector_core::IDLE_DISCONNECT_OPTION, Some("0"));
+    assert_eq!(f.engine.close_idle_with(Some(Duration::ZERO)), 0, "0 = never for this connection");
+    set(databrain_connector_core::IDLE_DISCONNECT_OPTION, Some("30"));
+    assert_eq!(f.engine.close_idle_with(Some(Duration::ZERO)), 0, "its own 30 minutes, not the global zero");
+    set(databrain_connector_core::IDLE_DISCONNECT_OPTION, None);
+    assert_eq!(f.engine.close_idle_with(None), 0, "global: never");
+    assert_eq!(f.engine.close_idle_with(Some(Duration::ZERO)), 1, "global applies without its own");
+
+    let mut cfg = f.ws.get_connection(&f.conn_id).unwrap().config;
+    assert_eq!(f.engine.connect_timeout_for(&cfg), f.engine.connect_timeout());
+    cfg.options.insert(databrain_connector_core::CONNECT_TIMEOUT_OPTION.into(), "90".into());
+    assert_eq!(f.engine.connect_timeout_for(&cfg), Duration::from_secs(90));
+    cfg.options.insert(databrain_connector_core::CONNECT_TIMEOUT_OPTION.into(), "1".into());
+    assert_eq!(f.engine.connect_timeout_for(&cfg), Duration::from_secs(3), "kept within 3–600");
+}
+
 #[tokio::test]
 async fn idle_sessions_close_but_not_mid_transaction() {
     let f = fixture(EnvTag::None);
@@ -287,9 +303,7 @@ async fn error_stops_script_with_offset() {
     let failed = evs
         .iter()
         .find_map(|e| match e {
-            JobEvent::StatementFailed { index, statement_start, error, .. } => {
-                Some((*index, *statement_start, error.kind.clone()))
-            }
+            JobEvent::StatementFailed { index, statement_start, error, .. } => Some((*index, *statement_start, error.kind.clone())),
             _ => None,
         })
         .unwrap();
@@ -301,14 +315,7 @@ async fn error_stops_script_with_offset() {
 #[tokio::test]
 async fn cancel_long_query() {
     let f = fixture(EnvTag::None);
-    let job = started(
-        f.engine
-            .run(req(
-                &f,
-                "with recursive c(x) as (select 1 union all select x+1 from c) select count(*) from c",
-            ))
-            .unwrap(),
-    );
+    let job = started(f.engine.run(req(&f, "with recursive c(x) as (select 1 union all select x+1 from c) select count(*) from c")).unwrap());
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(f.engine.cancel(&job));
     let evs = wait_job(&f, &job).await;

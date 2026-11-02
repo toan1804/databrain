@@ -10,7 +10,7 @@ use databrain_connector_core::arrow::datatypes::DataType;
 use serde::{Deserialize, Serialize};
 
 use crate::display::{self, TypeFamily};
-use crate::{Error, ResultSet, Result, ViewSpec};
+use crate::{Error, Result, ResultSet, ViewSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ts_rs::TS)]
 #[ts(export)]
@@ -126,7 +126,10 @@ impl ResultSet {
             .iter()
             .map(|&c| {
                 let col = batch.column(c);
-                let as_f = if display::is_decimal_text(schema.field(c)) || col.data_type().is_numeric() || matches!(col.data_type(), DataType::Boolean | DataType::Utf8 | DataType::LargeUtf8) {
+                let as_f = if display::is_decimal_text(schema.field(c))
+                    || col.data_type().is_numeric()
+                    || matches!(col.data_type(), DataType::Boolean | DataType::Utf8 | DataType::LargeUtf8)
+                {
                     cast(col, &DataType::Float64).or_else(|_| cast(&cast(col, &DataType::Utf8)?, &DataType::Float64))
                 } else {
                     cast(col, &DataType::Float64)

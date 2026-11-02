@@ -19,15 +19,7 @@ pub struct ConnectionView {
 
 pub fn list_connections(state: &AppState) -> Result<Vec<ConnectionView>> {
     let connected = state.engine.connected_ids();
-    Ok(state
-        .workspace
-        .list_connections()?
-        .into_iter()
-        .map(|p| ConnectionView {
-            connected: connected.contains(&p.id),
-            profile: p,
-        })
-        .collect())
+    Ok(state.workspace.list_connections()?.into_iter().map(|p| ConnectionView { connected: connected.contains(&p.id), profile: p }).collect())
 }
 
 /// Secondary secret slots a connection may use.
@@ -161,10 +153,7 @@ pub async fn test_connection(
     test_id: Option<String>,
 ) -> Result<TestResult> {
     validate_config(state, &config)?;
-    state
-        .engine
-        .test_connection(&config, secret, connection_id.as_deref(), ssh_secret, test_id.as_deref())
-        .await
+    state.engine.test_connection(&config, secret, connection_id.as_deref(), ssh_secret, test_id.as_deref()).await
 }
 
 /// Stop a running connection test (dialog "Cancel").

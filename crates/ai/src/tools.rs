@@ -102,11 +102,7 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
             "List the user's connections the assistant may use (name, engine, environment, read-only, connected), including the Results (DuckDB) connection that combines outputs. Pass a name as `connection` to run_query, list_tables, search_schema and describe_table to work on it; use it to answer across databases and to plan jobs.",
             json!({"type": "object", "properties": {}}),
         ),
-        s(
-            "list_jobs",
-            "List the user's jobs (steps, schedule, last run status).",
-            json!({"type": "object", "properties": {"filter": {"type": "string"}}}),
-        ),
+        s("list_jobs", "List the user's jobs (steps, schedule, last run status).", json!({"type": "object", "properties": {"filter": {"type": "string"}}})),
         s(
             "get_job",
             "Show one job in full: each step's action, connection, SQL, links (runs after), load/export settings, last run outcome and the errors of its latest run (with the failing SQL), plus its spec as JSON to edit with update_job.",
@@ -326,7 +322,11 @@ impl ToolContext {
                 if p.config.read_only { " · read-only" } else { "" },
                 if connected.contains(&p.id) { " · connected" } else { "" },
                 if p.id == self.profile.id { " · current" } else { "" },
-                if is_results { " · Results: DuckDB over outputs (results.<name>), use it to combine connections in a job".to_string() } else { format!(" · {indexed} tables indexed") },
+                if is_results {
+                    " · Results: DuckDB over outputs (results.<name>), use it to combine connections in a job".to_string()
+                } else {
+                    format!(" · {indexed} tables indexed")
+                },
             ));
             shown.push(json!({"id": p.id, "name": p.name, "kind": p.config.kind}));
         }
@@ -379,7 +379,10 @@ impl ToolContext {
                 }
             }
         }
-        text.push_str(&format!("\nSpec (edit and send to update_job):\n{}\n", serde_json::to_string_pretty(&crate::jobs::spec_of(&job, &refs)).unwrap_or_default()));
+        text.push_str(&format!(
+            "\nSpec (edit and send to update_job):\n{}\n",
+            serde_json::to_string_pretty(&crate::jobs::spec_of(&job, &refs)).unwrap_or_default()
+        ));
         self.audit("get_job", args, "allowed", None);
         Ok(out(text, json!({"job_id": job.id, "name": job.name})))
     }
@@ -456,10 +459,18 @@ impl ToolContext {
     async fn run_job(&self, args: &Value) -> Result<ToolOutput> {
         let job = self.find_job(arg(args, "job")?)?;
         let refs = self.conn_refs()?;
-        let want: Vec<String> = args.get("steps").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).collect()).unwrap_or_default();
+        let want: Vec<String> = args
+            .get("steps")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).collect())
+            .unwrap_or_default();
         let mut only_ids = Vec::new();
         for w in &want {
-            let n = job.nodes.iter().find(|n| n.name.eq_ignore_ascii_case(w) || n.id == *w).ok_or_else(|| AiError::Policy(format!("job \"{}\" has no step \"{w}\"", job.name)))?;
+            let n = job
+                .nodes
+                .iter()
+                .find(|n| n.name.eq_ignore_ascii_case(w) || n.id == *w)
+                .ok_or_else(|| AiError::Policy(format!("job \"{}\" has no step \"{w}\"", job.name)))?;
             only_ids.push(n.id.clone());
         }
         let scope = if want.is_empty() { "all steps".to_string() } else { format!("steps {}", want.join(", ")) };
@@ -481,8 +492,7 @@ impl ToolContext {
             if writes.is_empty() { " It only reads data.".to_string() } else { format!(" It changes data: {}.", writes.join("; ")) },
             crate::jobs::describe(&job, &refs)
         );
-        self.gate("run_job", decision, &format!("\"{}\" ({scope})", job.name), &json!({"preview": preview, "name": job.name}))
-            .await?;
+        self.gate("run_job", decision, &format!("\"{}\" ({scope})", job.name), &json!({"preview": preview, "name": job.name})).await?;
         let run_id = self.host.start_job(&job.id, (!only_ids.is_empty()).then_some(only_ids)).await.map_err(AiError::Policy)?;
         let wait = args.get("wait_seconds").and_then(|v| v.as_u64()).unwrap_or(300).clamp(10, 1800);
         let ws = self.engine.workspace();
@@ -515,7 +525,11 @@ impl ToolContext {
                 st.status,
                 st.rows.map(|r| format!(", {r} rows")).unwrap_or_default(),
                 st.error.as_deref().map(|e| format!(", error: {}", trunc(e, 600))).unwrap_or_default(),
-                if st.status == "success" && self.engine.outputs().resolve(&n.name).is_some() { format!(" → output results.{}", n.name) } else { String::new() },
+                if st.status == "success" && self.engine.outputs().resolve(&n.name).is_some() {
+                    format!(" → output results.{}", n.name)
+                } else {
+                    String::new()
+                },
             ));
         }
         if run.status != "success" {
@@ -536,9 +550,12 @@ impl ToolContext {
         if changes.is_empty() {
             return Ok(out("Nothing changes: the job is already like that.", json!({"job_id": old.id, "name": old.name})));
         }
-        let preview = format!("Changes:\n{}\n\nAfter the change:\n{}", changes.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"), crate::jobs::describe(&job, &refs));
-        self.gate("update_job", decision, &format!("\"{}\": {}", old.name, changes.join("; ")), &json!({"preview": preview, "name": old.name}))
-            .await?;
+        let preview = format!(
+            "Changes:\n{}\n\nAfter the change:\n{}",
+            changes.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"),
+            crate::jobs::describe(&job, &refs)
+        );
+        self.gate("update_job", decision, &format!("\"{}\": {}", old.name, changes.join("; ")), &json!({"preview": preview, "name": old.name})).await?;
         let saved = ws.save_job(job)?;
         let mut text = format!("Updated job \"{}\". It is not run; the user runs it (Run) or its schedule does.\n{preview}", saved.name);
         for n in notes {
@@ -555,10 +572,12 @@ impl ToolContext {
         crate::jobs::mark_ai_sql(&mut job, None);
         let decision = self.review_job(&job, &[], "Create a job")?;
         let preview = crate::jobs::describe(&job, &refs);
-        self.gate("create_job", decision, &format!("\"{}\" with {} steps", job.name, job.nodes.len()), &json!({"preview": preview, "name": job.name}))
-            .await?;
+        self.gate("create_job", decision, &format!("\"{}\" with {} steps", job.name, job.nodes.len()), &json!({"preview": preview, "name": job.name})).await?;
         let saved = ws.save_job(job)?;
-        let mut text = format!("Created job \"{}\" (id {}). It is not run yet; the user runs it from its tab (Run) or the schedule does.\n{preview}", saved.name, saved.id);
+        let mut text = format!(
+            "Created job \"{}\" (id {}). It is not run yet; the user runs it from its tab (Run) or the schedule does.\n{preview}",
+            saved.name, saved.id
+        );
         for n in notes {
             text.push_str(&format!("Note: {n}\n"));
         }
@@ -635,7 +654,9 @@ impl ToolContext {
             return Err(AiError::Policy("missing argument `tables`".into()));
         }
         if tables.len() > 20 {
-            return Err(AiError::Policy("index at most 20 tables at a time; for whole schemas, ask the user to index the connection (AI panel → Knowledge)".into()));
+            return Err(AiError::Policy(
+                "index at most 20 tables at a time; for whole schemas, ask the user to index the connection (AI panel → Knowledge)".into(),
+            ));
         }
         let reason = args.get("reason").and_then(|r| r.as_str()).unwrap_or("").trim();
         let summary = format!(
@@ -706,7 +727,10 @@ impl ToolContext {
                         return Ok(detail.clone());
                     }
                     self.audit(tool, detail, "blocked", Some(&reason));
-                    return Err(AiError::Policy(format!("{reason}. DataBrain asks the user before this, and {}. {MCP_ASK_HELP}", self.host.cannot_ask_reason())));
+                    return Err(AiError::Policy(format!(
+                        "{reason}. DataBrain asks the user before this, and {}. {MCP_ASK_HELP}",
+                        self.host.cannot_ask_reason()
+                    )));
                 }
                 match self.host.approve(tool, &format!("{reason}. {summary}"), detail).await {
                     Some(v) => {
@@ -717,7 +741,10 @@ impl ToolContext {
                     // didn't show it, or went away): say so, not "declined".
                     None if self.caller == Caller::Mcp && !self.host.can_ask() => {
                         self.audit(tool, detail, "denied", Some("no answer"));
-                        Err(AiError::Policy(format!("{reason}. DataBrain asked the user through this MCP client, but {}. {MCP_ASK_HELP}", self.host.cannot_ask_reason())))
+                        Err(AiError::Policy(format!(
+                            "{reason}. DataBrain asked the user through this MCP client, but {}. {MCP_ASK_HELP}",
+                            self.host.cannot_ask_reason()
+                        )))
                     }
                     None => {
                         self.audit(tool, detail, "denied", None);
@@ -741,7 +768,12 @@ impl ToolContext {
         let review = policy::review_sql(&target, &sql);
         let on = if target.id == self.profile.id { String::new() } else { format!(" (on \"{}\")", target.name) };
         let approved = self
-            .gate("run_query", review.decision.clone(), &format!("{purpose}{on}"), &json!({"sql": sql, "purpose": purpose, "kind": review.kind, "connection": target.name}))
+            .gate(
+                "run_query",
+                review.decision.clone(),
+                &format!("{purpose}{on}"),
+                &json!({"sql": sql, "purpose": purpose, "kind": review.kind, "connection": target.name}),
+            )
             .await?;
         let sql = approved.get("sql").and_then(|s| s.as_str()).unwrap_or(&sql).to_string();
         // Re-review edited SQL.
@@ -781,8 +813,16 @@ impl ToolContext {
             match &o.result {
                 Some(r) => {
                     self.results.lock().push(r.id.clone());
-                    let handle = self.engine.outputs().by_result(&r.id).map(|o| format!(" Output {} (query it as {}).", o.handle, o.reference())).unwrap_or_default();
-                    text.push_str(&format!("Statement {} returned {} rows{} in {} ms. result_id={}{handle}\n", o.index + 1, r.total_rows, if r.truncated { " (capped)" } else { "" }, o.duration_ms, r.id));
+                    let handle =
+                        self.engine.outputs().by_result(&r.id).map(|o| format!(" Output {} (query it as {}).", o.handle, o.reference())).unwrap_or_default();
+                    text.push_str(&format!(
+                        "Statement {} returned {} rows{} in {} ms. result_id={}{handle}\n",
+                        o.index + 1,
+                        r.total_rows,
+                        if r.truncated { " (capped)" } else { "" },
+                        o.duration_ms,
+                        r.id
+                    ));
                     text.push_str(&self.summarize(&r.id)?);
                     display.push(json!({"index": o.index, "result": r, "duration_ms": o.duration_ms}));
                 }
@@ -793,7 +833,10 @@ impl ToolContext {
             }
         }
         self.audit("run_query", &json!({"sql": sql, "connection": target.name}), "executed", Some(text.lines().next().unwrap_or("")));
-        Ok(out(format!("{}{text}", if on.is_empty() { String::new() } else { format!("Ran{on}.\n") }), json!({"sql": sql, "statements": display, "connection_id": target.id})))
+        Ok(out(
+            format!("{}{text}", if on.is_empty() { String::new() } else { format!("Ran{on}.\n") }),
+            json!({"sql": sql, "statements": display, "connection_id": target.id}),
+        ))
     }
 
     /// Schema + stats + (optionally) first rows, masked per policy.
@@ -807,7 +850,11 @@ impl ToolContext {
         if o.connection_id == self.profile.id {
             return Ok(self.policy().clone());
         }
-        let src = self.engine.workspace().get_connection(&o.connection_id).map_err(|_| AiError::Policy(format!("source connection of {} no longer exists", o.handle)))?;
+        let src = self
+            .engine
+            .workspace()
+            .get_connection(&o.connection_id)
+            .map_err(|_| AiError::Policy(format!("source connection of {} no longer exists", o.handle)))?;
         if !src.ai_policy.ai_enabled {
             return Err(AiError::Policy(format!("{} comes from \"{}\", where AI is disabled", o.handle, src.name)));
         }
@@ -820,7 +867,14 @@ impl ToolContext {
     /// The output's SQL reads only tables its connection lets the AI read;
     /// outputs combined on DuckDB (`results.<x>`) are checked through their inputs.
     fn check_output_tables(&self, o: &databrain_query_engine::outputs::OutputInfo, depth: usize) -> Result<()> {
-        let src = if o.connection_id == self.profile.id { self.profile.clone() } else { self.engine.workspace().get_connection(&o.connection_id).map_err(|_| AiError::Policy(format!("source connection of {} no longer exists", o.handle)))? };
+        let src = if o.connection_id == self.profile.id {
+            self.profile.clone()
+        } else {
+            self.engine
+                .workspace()
+                .get_connection(&o.connection_id)
+                .map_err(|_| AiError::Policy(format!("source connection of {} no longer exists", o.handle)))?
+        };
         if let Err(r) = crate::access::check_sql(&src, &o.sql) {
             return Err(AiError::Policy(format!("{} can't be shared with the assistant: {r}", o.handle)));
         }
@@ -854,7 +908,8 @@ impl ToolContext {
         let src = if o.connection_id == self.profile.id { Ok(self.profile.clone()) } else { self.engine.workspace().get_connection(&o.connection_id) };
         let Ok(src) = src else { return vec![true; columns.len()] };
         let pol = &src.ai_policy;
-        let mut rule_columns: Vec<String> = pol.pii_columns.iter().map(|p| p.trim().rsplit('.').next().unwrap_or("").to_ascii_lowercase()).filter(|c| !c.is_empty()).collect();
+        let mut rule_columns: Vec<String> =
+            pol.pii_columns.iter().map(|p| p.trim().rsplit('.').next().unwrap_or("").to_ascii_lowercase()).filter(|c| !c.is_empty()).collect();
         // Inputs (`results.<x>`): their masked columns, by every name the SQL may use.
         let mut inputs: std::collections::HashMap<String, Vec<String>> = Default::default();
         if depth < 5 {
@@ -863,7 +918,8 @@ impl ToolContext {
                     continue;
                 }
                 let names: Vec<String> = input.columns.iter().map(|c| c.name.clone()).collect();
-                let masked: Vec<String> = names.iter().zip(self.pii_mask(&input.result_id, &names, depth + 1)).filter(|(_, m)| *m).map(|(n, _)| n.to_ascii_lowercase()).collect();
+                let masked: Vec<String> =
+                    names.iter().zip(self.pii_mask(&input.result_id, &names, depth + 1)).filter(|(_, m)| *m).map(|(n, _)| n.to_ascii_lowercase()).collect();
                 if masked.is_empty() {
                     continue;
                 }
@@ -986,7 +1042,16 @@ impl ToolContext {
         let mut text = t.columns.join("\t");
         text.push('\n');
         for r in &t.rows {
-            text.push_str(&r.iter().map(|v| match v { Value::String(s) => trunc(s, 80), Value::Null => "NULL".into(), o => o.to_string() }).collect::<Vec<_>>().join("\t"));
+            text.push_str(
+                &r.iter()
+                    .map(|v| match v {
+                        Value::String(s) => trunc(s, 80),
+                        Value::Null => "NULL".into(),
+                        o => o.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t"),
+            );
             text.push('\n');
         }
         if t.truncated {
@@ -1008,7 +1073,8 @@ impl ToolContext {
             if !filter.is_empty() && !hay.contains(&filter) {
                 continue;
             }
-            let cols: Vec<String> = o.columns.iter().take(30).map(|c| format!("{} {}", c.name, c.db_type.clone().unwrap_or_else(|| c.data_type.clone()))).collect();
+            let cols: Vec<String> =
+                o.columns.iter().take(30).map(|c| format!("{} {}", c.name, c.db_type.clone().unwrap_or_else(|| c.data_type.clone()))).collect();
             lines.push(format!(
                 "- {} ({}){} — {} rows{} from \"{}\"\n  columns: {}\n  sql: {}",
                 o.reference(),
@@ -1039,7 +1105,10 @@ impl ToolContext {
         for o in &refs {
             let pol = self.source_policy(&o.result_id)?;
             if !pol.share_result_rows && !self.allowed_result(&o.result_id) {
-                return Err(AiError::Policy(format!("{} is from \"{}\", which does not share result rows with the assistant; mention it with @ to allow it", o.handle, o.connection_name)));
+                return Err(AiError::Policy(format!(
+                    "{} is from \"{}\", which does not share result rows with the assistant; mention it with @ to allow it",
+                    o.handle, o.connection_name
+                )));
             }
             let names: Vec<String> = o.columns.iter().map(|c| c.name.clone()).collect();
             if names.iter().zip(self.pii_mask(&o.result_id, &names, 0)).any(|(n, m)| m && sql.to_ascii_lowercase().contains(&n.to_ascii_lowercase())) {
@@ -1093,7 +1162,13 @@ impl ToolContext {
                 text.push_str(&names.join("\t"));
                 text.push('\n');
                 for row in page.rows {
-                    text.push_str(&row.iter().zip(&mask).map(|(v, m)| if *m { "***".into() } else { v.as_deref().map(|s| trunc(s, 80)).unwrap_or_else(|| "NULL".into()) }).collect::<Vec<_>>().join("\t"));
+                    text.push_str(
+                        &row.iter()
+                            .zip(&mask)
+                            .map(|(v, m)| if *m { "***".into() } else { v.as_deref().map(|s| trunc(s, 80)).unwrap_or_else(|| "NULL".into()) })
+                            .collect::<Vec<_>>()
+                            .join("\t"),
+                    );
                     text.push('\n');
                 }
                 if r.total_rows > 200 {
@@ -1111,11 +1186,7 @@ impl ToolContext {
             return Err(AiError::Policy("sharing sample data is disabled for this connection".into()));
         }
         let t = arg(args, "table")?;
-        let o = self
-            .engine
-            .workspace()
-            .kn_get(&self.profile.id, t)?
-            .ok_or_else(|| AiError::Policy(format!("table `{t}` not found")))?;
+        let o = self.engine.workspace().kn_get(&self.profile.id, t)?.ok_or_else(|| AiError::Policy(format!("table `{t}` not found")))?;
         let n = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(5).clamp(1, 20) as usize;
         let kind = self.profile.config.kind;
         let full = o.full_name();
@@ -1155,7 +1226,11 @@ impl ToolContext {
             text.push_str(
                 &row.iter()
                     .zip(&r.columns)
-                    .map(|(v, c)| if is_pii(&pol, Some(&full), &c.name) { "***".into() } else { v.as_deref().map(|x| trunc(x, 60)).unwrap_or_else(|| "NULL".into()) })
+                    .map(
+                        |(v, c)| {
+                            if is_pii(&pol, Some(&full), &c.name) { "***".into() } else { v.as_deref().map(|x| trunc(x, 60)).unwrap_or_else(|| "NULL".into()) }
+                        },
+                    )
                     .collect::<Vec<_>>()
                     .join("\t"),
             );
@@ -1182,10 +1257,9 @@ impl ToolContext {
     async fn checked_target(&self, target: Option<&str>) -> Result<Option<String>> {
         match target.map(str::trim).filter(|t| !t.is_empty()) {
             None => Ok(None),
-            Some(t) => knowledge::check_note_target(&self.engine, &self.profile.id, t)
-                .await
-                .map(Some)
-                .map_err(|e| AiError::Policy(format!("invalid target `{t}`: {e}. Use real tables (schema.table, several joined with &), or omit target for a glossary note"))),
+            Some(t) => knowledge::check_note_target(&self.engine, &self.profile.id, t).await.map(Some).map_err(|e| {
+                AiError::Policy(format!("invalid target `{t}`: {e}. Use real tables (schema.table, several joined with &), or omit target for a glossary note"))
+            }),
         }
     }
 

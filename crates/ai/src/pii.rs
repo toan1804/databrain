@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use databrain_connector_core::ConnectorKind;
-use databrain_lineage::{EdgeKind, Lineage, NodeKind, NoCatalog, analyze};
+use databrain_lineage::{EdgeKind, Lineage, NoCatalog, NodeKind, analyze};
 
 /// Whether `column` of `table` (a table as the SQL names it, `None` when
 /// unknown) is sensitive.
@@ -66,7 +66,9 @@ fn sources(g: &Lineage, id: &str, column: &str) -> Vec<(String, String)> {
             }
             let from_col = e.from_column.clone().map(|c| c.to_ascii_lowercase()).filter(|c| !c.ends_with('*')).unwrap_or_else(|| col.clone());
             match nodes.get(e.from.as_str()) {
-                Some(n) if n.kind == NodeKind::Table => out.push((n.name.clone(), if e.from_column.as_deref().is_none_or(|c| c.ends_with('*')) { "*".into() } else { from_col })),
+                Some(n) if n.kind == NodeKind::Table => {
+                    out.push((n.name.clone(), if e.from_column.as_deref().is_none_or(|c| c.ends_with('*')) { "*".into() } else { from_col }))
+                }
                 Some(_) => todo.push((e.from.clone(), from_col)),
                 None => {}
             }

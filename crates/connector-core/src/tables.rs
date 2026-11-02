@@ -57,7 +57,8 @@ fn parts(name: &ObjectName) -> TableName {
 }
 
 /// Statements that run code the parser can't see into.
-const OPAQUE_KEYWORDS: &[&str] = &["CALL", "EXEC", "EXECUTE", "DO", "BEGIN", "DECLARE", "PREPARE", "IMPORT", "EXPORT", "LOAD", "ATTACH", "DETACH", "PRAGMA", "INSTALL"];
+const OPAQUE_KEYWORDS: &[&str] =
+    &["CALL", "EXEC", "EXECUTE", "DO", "BEGIN", "DECLARE", "PREPARE", "IMPORT", "EXPORT", "LOAD", "ATTACH", "DETACH", "PRAGMA", "INSTALL"];
 
 /// Read and written tables of `sql` (a script) in this connection's language.
 pub fn table_refs(sql: &str, kind: ConnectorKind) -> TableRefs {
@@ -102,7 +103,10 @@ fn changes_default(text: &str) -> bool {
     let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
     match w(0) {
         "use" => true,
-        "set" => matches!(w(1), "search_path" | "schema" | "catalog" | "database" | "current_schema" | "dataset") || (w(1) == "session" && matches!(w(2), "search_path" | "schema" | "catalog" | "database")),
+        "set" => {
+            matches!(w(1), "search_path" | "schema" | "catalog" | "database" | "current_schema" | "dataset")
+                || (w(1) == "session" && matches!(w(2), "search_path" | "schema" | "catalog" | "database"))
+        }
         "alter" => w(1) == "session" && w(2) == "set" && matches!(w(3), "current_schema" | "container"),
         _ => false,
     }

@@ -3,13 +3,10 @@
 
 use std::sync::Arc;
 
-use databrain_connector_core::arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, LargeStringArray, RecordBatch, Scalar, StringArray, UInt32Array,
-};
+use databrain_connector_core::arrow::array::{Array, ArrayRef, BooleanArray, BooleanBuilder, LargeStringArray, RecordBatch, Scalar, StringArray, UInt32Array};
 use databrain_connector_core::arrow::compute::kernels::cmp;
 use databrain_connector_core::arrow::compute::{
-    self, CastOptions, SortColumn, SortOptions, and_kleene, cast_with_options, is_not_null,
-    is_null, lexsort_to_indices, or_kleene,
+    self, CastOptions, SortColumn, SortOptions, and_kleene, cast_with_options, is_not_null, is_null, lexsort_to_indices, or_kleene,
 };
 use databrain_connector_core::arrow::datatypes::DataType;
 use serde::{Deserialize, Serialize};
@@ -71,9 +68,7 @@ pub struct ViewSpec {
 
 impl ViewSpec {
     pub fn is_identity(&self) -> bool {
-        self.filters.is_empty()
-            && self.sort.is_empty()
-            && self.quick_filter.as_deref().is_none_or(|q| q.is_empty())
+        self.filters.is_empty() && self.sort.is_empty() && self.quick_filter.as_deref().is_none_or(|q| q.is_empty())
     }
 }
 
@@ -89,16 +84,11 @@ pub(crate) fn like_escape(s: &str) -> String {
     out
 }
 
-
 /// Column as it should be compared: decimals-as-text become Float64.
 fn comparable(batch: &RecordBatch, col: usize) -> Result<ArrayRef> {
     let field = batch.schema().field(col).clone();
     let a = batch.column(col).clone();
-    if is_decimal_text(&field) {
-        Ok(cast_with_options(&a, &DataType::Float64, &CastOptions::default())?)
-    } else {
-        Ok(a)
-    }
+    if is_decimal_text(&field) { Ok(cast_with_options(&a, &DataType::Float64, &CastOptions::default())?) } else { Ok(a) }
 }
 
 fn display_col(cache: &mut DisplayCache, batch: &RecordBatch, col: usize) -> Result<Arc<DisplayText>> {
@@ -127,11 +117,7 @@ impl DisplayCache {
     }
 }
 
-fn filter_mask(
-    batch: &RecordBatch,
-    f: &ColumnFilter,
-    cache: &mut DisplayCache,
-) -> Result<BooleanArray> {
+fn filter_mask(batch: &RecordBatch, f: &ColumnFilter, cache: &mut DisplayCache) -> Result<BooleanArray> {
     if f.column >= batch.num_columns() {
         return Err(Error::InvalidColumn(f.column));
     }
@@ -160,16 +146,9 @@ fn filter_mask(
     } else if matches!(col.data_type(), DataType::LargeUtf8) {
         Arc::new(LargeStringArray::from(vec![f.value.clone()])) as ArrayRef
     } else {
-        let opts = CastOptions {
-            safe: false,
-            ..Default::default()
-        };
+        let opts = CastOptions { safe: false, ..Default::default() };
         cast_with_options(&lit, col.data_type(), &opts).map_err(|_| {
-            Error::InvalidFilterValue(format!(
-                "'{}' is not a valid {} value",
-                f.value,
-                display::family(batch.schema().field(f.column)).as_str()
-            ))
+            Error::InvalidFilterValue(format!("'{}' is not a valid {} value", f.value, display::family(batch.schema().field(f.column)).as_str()))
         })?
     };
     let s = Scalar::new(typed);
@@ -186,11 +165,7 @@ fn filter_mask(
 }
 
 /// Mask of rows where any column contains `q` (case-insensitive).
-pub(crate) fn any_contains(
-    batch: &RecordBatch,
-    q: &str,
-    cache: &mut DisplayCache,
-) -> Result<BooleanArray> {
+pub(crate) fn any_contains(batch: &RecordBatch, q: &str, cache: &mut DisplayCache) -> Result<BooleanArray> {
     let pat = format!("%{}%", like_escape(q));
     let mut acc: Option<BooleanArray> = None;
     for c in 0..batch.num_columns() {
@@ -219,11 +194,7 @@ fn true_indices(mask: &BooleanArray) -> UInt32Array {
 }
 
 /// Compute the row indices (into `batch`) that make up the view.
-pub fn compute_view(
-    batch: &RecordBatch,
-    spec: &ViewSpec,
-    cache: &mut DisplayCache,
-) -> Result<UInt32Array> {
+pub fn compute_view(batch: &RecordBatch, spec: &ViewSpec, cache: &mut DisplayCache) -> Result<UInt32Array> {
     let n = batch.num_rows();
     let mut mask: Option<BooleanArray> = None;
     for f in &spec.filters {
@@ -254,26 +225,12 @@ pub fn compute_view(
             return Err(Error::InvalidColumn(k.column));
         }
         let col = comparable(batch, k.column)?;
-        let values = if mask.is_some() {
-            compute::take(col.as_ref(), &idx, None)?
-        } else {
-            col
-        };
-        sort_cols.push(SortColumn {
-            values,
-            options: Some(SortOptions {
-                descending: k.descending,
-                nulls_first: false,
-            }),
-        });
+        let values = if mask.is_some() { compute::take(col.as_ref(), &idx, None)? } else { col };
+        sort_cols.push(SortColumn { values, options: Some(SortOptions { descending: k.descending, nulls_first: false }) });
     }
     let perm = lexsort_to_indices(&sort_cols, None)?;
     let sorted = compute::take(&idx, &perm, None)?;
-    Ok(sorted
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .expect("take on UInt32Array returns UInt32Array")
-        .clone())
+    Ok(sorted.as_any().downcast_ref::<UInt32Array>().expect("take on UInt32Array returns UInt32Array").clone())
 }
 
 impl display::TypeFamily {

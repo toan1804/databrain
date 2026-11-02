@@ -8,9 +8,8 @@ use async_trait::async_trait;
 use databrain_auth::{AuthMethodKind, Credential, CredentialSource};
 use databrain_connector_core::value::{Column, parse_date, parse_datetime};
 use databrain_connector_core::{
-    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnState, ConnectionConfig, Connector, ConnectorError,
-    ConnectorInfo, ConnectorKind, DbObject, ErrorKind, ExecOptions, ExecSummary, FieldSpec, ForeignKey,
-    ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, SslMode, StreamEvent, StreamSender,
+    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnState, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind,
+    ExecOptions, ExecSummary, FieldSpec, ForeignKey, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, SslMode, StreamEvent, StreamSender,
     TableColumns, Value, quote_ident,
 };
 use mysql_async::consts::{ColumnFlags, ColumnType, StatusFlags};
@@ -51,11 +50,7 @@ fn build_opts(cfg: &ConnectionConfig, user: String, password: String, ssl: Optio
 fn ssl_opts(mode: SslMode) -> Option<SslOpts> {
     match mode {
         SslMode::Disable => None,
-        SslMode::Prefer | SslMode::Require => Some(
-            SslOpts::default()
-                .with_danger_accept_invalid_certs(true)
-                .with_danger_skip_domain_validation(true),
-        ),
+        SslMode::Prefer | SslMode::Require => Some(SslOpts::default().with_danger_accept_invalid_certs(true).with_danger_skip_domain_validation(true)),
         SslMode::VerifyFull => Some(SslOpts::default()),
     }
 }
@@ -83,13 +78,7 @@ impl Connector for MysqlConnector {
             default_port: Some(3306),
             uses_file: false,
             auth_methods: vec![AuthMethodKind::Password],
-            capabilities: Capabilities {
-                transactions: true,
-                cancel: true,
-                schemas: true,
-                read_only_sessions: true,
-                ssh: true,
-            },
+            capabilities: Capabilities { transactions: true, cancel: true, schemas: true, read_only_sessions: true, ssh: true },
             fields: vec![
                 FieldSpec::new("host", "Host").required().placeholder("localhost"),
                 FieldSpec::new("port", "Port").placeholder("3306"),
@@ -99,11 +88,7 @@ impl Connector for MysqlConnector {
         }
     }
 
-    async fn connect(
-        &self,
-        cfg: &ConnectionConfig,
-        creds: Arc<dyn CredentialSource>,
-    ) -> Result<Box<dyn Session>> {
+    async fn connect(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>> {
         let (user, password) = match creds.get().await? {
             Credential::Password { user, password } => (user, password.expose_secret().to_string()),
             _ => return Err(ConnectorError::config("MySQL requires user/password authentication")),
@@ -160,18 +145,20 @@ fn col_type(c: &mysql_async::Column) -> ColType {
     let binary = c.character_set() == BINARY_CHARSET;
     use ColumnType::*;
     match c.column_type() {
-        MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_LONG | MYSQL_TYPE_INT24 | MYSQL_TYPE_YEAR => {
-            ColType::Int64
-        }
+        MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_LONG | MYSQL_TYPE_INT24 | MYSQL_TYPE_YEAR => ColType::Int64,
         MYSQL_TYPE_LONGLONG if unsigned => ColType::UInt64,
         MYSQL_TYPE_LONGLONG => ColType::Int64,
         MYSQL_TYPE_FLOAT | MYSQL_TYPE_DOUBLE => ColType::Float64,
         MYSQL_TYPE_DATE | MYSQL_TYPE_NEWDATE => ColType::Date,
-        MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_DATETIME2
-        | MYSQL_TYPE_TIMESTAMP2 => ColType::Timestamp,
+        MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_DATETIME2 | MYSQL_TYPE_TIMESTAMP2 => ColType::Timestamp,
         MYSQL_TYPE_BIT => ColType::Binary,
-        MYSQL_TYPE_TINY_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_BLOB
-        | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING | MYSQL_TYPE_VARCHAR
+        MYSQL_TYPE_TINY_BLOB
+        | MYSQL_TYPE_MEDIUM_BLOB
+        | MYSQL_TYPE_LONG_BLOB
+        | MYSQL_TYPE_BLOB
+        | MYSQL_TYPE_VAR_STRING
+        | MYSQL_TYPE_STRING
+        | MYSQL_TYPE_VARCHAR
         | MYSQL_TYPE_GEOMETRY
             if binary =>
         {
@@ -238,7 +225,18 @@ fn sql_type_name(t: ColumnType, len: u32, decimals: u8, unsigned: bool, binary: 
         }
         other => format!("{other:?}").trim_start_matches("MYSQL_TYPE_").to_ascii_lowercase(),
     };
-    let int = matches!(t, MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG | MYSQL_TYPE_LONGLONG | MYSQL_TYPE_FLOAT | MYSQL_TYPE_DOUBLE | MYSQL_TYPE_DECIMAL | MYSQL_TYPE_NEWDECIMAL);
+    let int = matches!(
+        t,
+        MYSQL_TYPE_TINY
+            | MYSQL_TYPE_SHORT
+            | MYSQL_TYPE_INT24
+            | MYSQL_TYPE_LONG
+            | MYSQL_TYPE_LONGLONG
+            | MYSQL_TYPE_FLOAT
+            | MYSQL_TYPE_DOUBLE
+            | MYSQL_TYPE_DECIMAL
+            | MYSQL_TYPE_NEWDECIMAL
+    );
     if unsigned && int { format!("{name} unsigned") } else { name }
 }
 
@@ -253,13 +251,10 @@ fn convert(t: ColType, v: mysql_async::Value) -> Value {
         M::Bytes(b) => match t {
             ColType::Binary => Value::Bytes(b),
             _ => {
-                let s = String::from_utf8(b)
-                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                let s = String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                 match t {
                     ColType::Date => parse_date(&s).map(Value::Date).unwrap_or(Value::Text(s)),
-                    ColType::Timestamp => parse_datetime(&s)
-                        .map(Value::Timestamp)
-                        .unwrap_or(Value::Text(s)),
+                    ColType::Timestamp => parse_datetime(&s).map(Value::Timestamp).unwrap_or(Value::Text(s)),
                     _ => Value::Text(s),
                 }
             }
@@ -299,17 +294,11 @@ async fn run(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSender) -> Res
         let affected = result.affected_rows();
         result.drop_result().await.map_err(map_err)?;
         ctx.finished.store(true, Ordering::SeqCst);
-        tx.send(StreamEvent::Done(ExecSummary {
-            rows_affected: Some(affected),
-        }))
-        .await;
+        tx.send(StreamEvent::Done(ExecSummary { rows_affected: Some(affected) })).await;
         return Ok(());
     }
 
-    let cols: Vec<Column> = columns
-        .iter()
-        .map(|c| Column::new(c.name_str().into_owned(), col_type(c), type_name(c)))
-        .collect();
+    let cols: Vec<Column> = columns.iter().map(|c| Column::new(c.name_str().into_owned(), col_type(c), type_name(c))).collect();
     let types: Vec<ColType> = cols.iter().map(|c| c.col_type).collect();
     let batch_size = opts.batch_size.max(1);
     let mut builder = BatchBuilder::new(&cols, batch_size);
@@ -323,11 +312,7 @@ async fn run(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSender) -> Res
     let mut stopped = false;
     while let Some(row) = result.next().await.map_err(map_err)? {
         let vals = row.unwrap();
-        builder.push_row(
-            vals.into_iter()
-                .zip(types.iter())
-                .map(|(v, t)| convert(*t, v)),
-        );
+        builder.push_row(vals.into_iter().zip(types.iter()).map(|(v, t)| convert(*t, v)));
         rows += 1;
         if rows >= max {
             stopped = true;
@@ -364,11 +349,7 @@ async fn run(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSender) -> Res
         return Ok(());
     }
     if builder.coercion_failures() > 0 {
-        tx.send(StreamEvent::Notice(format!(
-            "{} value(s) could not be converted (e.g. zero dates) and are shown as NULL",
-            builder.coercion_failures()
-        )))
-        .await;
+        tx.send(StreamEvent::Notice(format!("{} value(s) could not be converted (e.g. zero dates) and are shown as NULL", builder.coercion_failures()))).await;
     }
     tx.send(StreamEvent::Done(ExecSummary::default())).await;
     Ok(())
@@ -417,11 +398,7 @@ impl MysqlSession {
         }
     }
 
-    async fn query_rows<T: FromRow + Send + 'static>(
-        &self,
-        sql: &str,
-        params: Vec<mysql_async::Value>,
-    ) -> Result<Vec<T>> {
+    async fn query_rows<T: FromRow + Send + 'static>(&self, sql: &str, params: Vec<mysql_async::Value>) -> Result<Vec<T>> {
         let mut c = self.conn.lock().await;
         c.exec(sql, params).await.map_err(map_err)
     }
@@ -493,20 +470,10 @@ impl Session for MysqlSession {
     }
 
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>> {
-        let rows: Vec<(String, Option<String>)> = self
-            .query_rows(
-                "select schema_name, database() from information_schema.schemata order by schema_name",
-                vec![],
-            )
-            .await?;
-        let mut out: Vec<SchemaInfo> = rows
-            .into_iter()
-            .map(|(name, cur)| SchemaInfo {
-                is_default: cur.as_deref() == Some(name.as_str()),
-                name,
-                catalog: None,
-            })
-            .collect();
+        let rows: Vec<(String, Option<String>)> =
+            self.query_rows("select schema_name, database() from information_schema.schemata order by schema_name", vec![]).await?;
+        let mut out: Vec<SchemaInfo> =
+            rows.into_iter().map(|(name, cur)| SchemaInfo { is_default: cur.as_deref() == Some(name.as_str()), name, catalog: None }).collect();
         out.sort_by_key(|s| !s.is_default);
         Ok(out)
     }
@@ -525,11 +492,7 @@ impl Session for MysqlSession {
             .map(|(name, t, comment, rows)| DbObject {
                 schema: schema.to_string(),
                 name,
-                kind: if t.contains("VIEW") {
-                    ObjectKind::View
-                } else {
-                    ObjectKind::Table
-                },
+                kind: if t.contains("VIEW") { ObjectKind::View } else { ObjectKind::Table },
                 comment: comment.filter(|c| !c.is_empty()),
                 row_estimate: rows.map(|r| r as i64),
             })
@@ -544,11 +507,7 @@ impl Session for MysqlSession {
         out.extend(routines.into_iter().map(|(name, t)| DbObject {
             schema: schema.to_string(),
             name,
-            kind: if t == "PROCEDURE" {
-                ObjectKind::Procedure
-            } else {
-                ObjectKind::Function
-            },
+            kind: if t == "PROCEDURE" { ObjectKind::Procedure } else { ObjectKind::Function },
             comment: None,
             row_estimate: None,
         }));
@@ -556,7 +515,7 @@ impl Session for MysqlSession {
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
-        use databrain_connector_core::{group_indexes, query_text, quote_literal, truthy, TableLayout};
+        use databrain_connector_core::{TableLayout, group_indexes, query_text, quote_literal, truthy};
         let (s, t) = (quote_literal(schema), quote_literal(name));
         let idx = query_text(
             self,
@@ -586,14 +545,23 @@ impl Session for MysqlSession {
         {
             if let Some(r) = p.first() {
                 l.partition_kind = r[0].as_deref().map(|m| m.to_ascii_lowercase());
-                l.partition_by = r[1].as_deref().map(|e| databrain_connector_core::split_key_list(e).into_iter().map(|x| databrain_connector_core::unquote_ident(&x)).collect()).unwrap_or_default();
+                l.partition_by = r[1]
+                    .as_deref()
+                    .map(|e| databrain_connector_core::split_key_list(e).into_iter().map(|x| databrain_connector_core::unquote_ident(&x)).collect())
+                    .unwrap_or_default();
                 if let Some(n) = &r[2] {
                     l.notes.push(format!("{n} partitions"));
                 }
             }
         }
-        if let Ok(r) = query_text(self, &format!("select table_rows from information_schema.tables where table_schema = {s} and table_name = {t}")).await {
+        if let Ok(r) = query_text(
+            self,
+            &format!("select table_rows, data_length + index_length from information_schema.tables where table_schema = {s} and table_name = {t}"),
+        )
+        .await
+        {
             l.row_estimate = r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok());
+            l.size_bytes = r.first().and_then(|r| r.get(1).cloned().flatten()).and_then(|x| x.parse().ok());
         }
         Ok(l)
     }
@@ -621,10 +589,7 @@ impl Session for MysqlSession {
                 vec![schema.into(), name.into()],
             )
             .await?;
-        let (ttype, comment, rows) = meta
-            .into_iter()
-            .next()
-            .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
+        let (ttype, comment, rows) = meta.into_iter().next().ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
         let is_view = ttype.contains("VIEW");
 
         #[allow(clippy::type_complexity)]
@@ -666,11 +631,7 @@ impl Session for MysqlSession {
             object: DbObject {
                 schema: schema.to_string(),
                 name: name.to_string(),
-                kind: if is_view {
-                    ObjectKind::View
-                } else {
-                    ObjectKind::Table
-                },
+                kind: if is_view { ObjectKind::View } else { ObjectKind::Table },
                 comment: comment.filter(|c| !c.is_empty()),
                 row_estimate: rows.map(|r| r as i64),
             },
@@ -820,7 +781,18 @@ impl MysqlSession {
         let columns = cols
             .into_iter()
             .map(|(schema, table, name, t, nullable, key, comment)| {
-                (schema, table, ColumnInfo { name, data_type: t, nullable: nullable == "YES", is_primary_key: key == "PRI", default: None, comment: comment.filter(|c| !c.is_empty()) })
+                (
+                    schema,
+                    table,
+                    ColumnInfo {
+                        name,
+                        data_type: t,
+                        nullable: nullable == "YES",
+                        is_primary_key: key == "PRI",
+                        default: None,
+                        comment: comment.filter(|c| !c.is_empty()),
+                    },
+                )
             })
             .collect();
         #[allow(clippy::type_complexity)]
@@ -883,18 +855,9 @@ mod tests {
 
     #[test]
     fn converts_text_values() {
-        assert_eq!(
-            convert(ColType::Date, mysql_async::Value::Bytes(b"2024-01-02".to_vec())),
-            Value::Date(parse_date("2024-01-02").unwrap())
-        );
-        assert_eq!(
-            convert(ColType::Date, mysql_async::Value::Bytes(b"0000-00-00".to_vec())),
-            Value::Text("0000-00-00".into())
-        );
-        assert_eq!(
-            convert(ColType::Utf8, mysql_async::Value::Bytes(b"12.50".to_vec())),
-            Value::Text("12.50".into())
-        );
+        assert_eq!(convert(ColType::Date, mysql_async::Value::Bytes(b"2024-01-02".to_vec())), Value::Date(parse_date("2024-01-02").unwrap()));
+        assert_eq!(convert(ColType::Date, mysql_async::Value::Bytes(b"0000-00-00".to_vec())), Value::Text("0000-00-00".into()));
+        assert_eq!(convert(ColType::Utf8, mysql_async::Value::Bytes(b"12.50".to_vec())), Value::Text("12.50".into()));
     }
 
     /// Live: explorer fingerprints include routines; per-object versions.
@@ -909,7 +872,10 @@ mod tests {
         let mut cfg = ConnectionConfig::new(ConnectorKind::Mysql, AuthMethod::Password { user: user.clone() });
         cfg.host = Some(host);
         cfg.port = std::env::var("DATABRAIN_MYSQL_PORT").ok().and_then(|p| p.parse().ok());
-        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_MYSQL_PASSWORD").ok().map(secrecy::SecretString::from)));
+        let creds = Arc::new(InlineCredentialSource::new(
+            AuthMethod::Password { user },
+            std::env::var("DATABRAIN_MYSQL_PASSWORD").ok().map(secrecy::SecretString::from),
+        ));
         let s = MysqlConnector.connect(&cfg, creds).await.unwrap();
         let run = |sql: &'static str| {
             let s = &s;
@@ -954,7 +920,10 @@ mod tests {
         let mut cfg = ConnectionConfig::new(ConnectorKind::Mysql, AuthMethod::Password { user: user.clone() });
         cfg.host = Some(host);
         cfg.port = std::env::var("DATABRAIN_MYSQL_PORT").ok().and_then(|p| p.parse().ok());
-        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_MYSQL_PASSWORD").ok().map(secrecy::SecretString::from)));
+        let creds = Arc::new(InlineCredentialSource::new(
+            AuthMethod::Password { user },
+            std::env::var("DATABRAIN_MYSQL_PASSWORD").ok().map(secrecy::SecretString::from),
+        ));
         let s = MysqlConnector.connect(&cfg, creds).await.unwrap();
         // Show DDL: table, view, function, procedure.
         for stmt in [
@@ -990,7 +959,8 @@ mod tests {
              create table kb_b.orders (id int primary key, customer_id int, total decimal(10,2), \
                constraint fk_c foreign key (customer_id) references kb_a.customers(id)); \
              create view kb_b.big_orders as select * from kb_b.orders where total > 100; \
-             create table kb_c.untouched (x int)").await;
+             create table kb_c.untouched (x int)")
+        .await;
         let m = s.bulk_metadata(&["kb_a".into(), "kb_b".into()]).await.unwrap();
         assert_eq!(m[0].objects[0].comment.as_deref(), Some("People"));
         let cust = &m[0].columns[0];
@@ -1004,7 +974,9 @@ mod tests {
         let fps = || async { s.schema_fingerprints().await.unwrap().unwrap() };
         let f0 = fps().await;
         // Only this test's schemas: tests running alongside change theirs.
-        let ours = |f: &std::collections::HashMap<String, String>| f.iter().filter(|(k, _)| k.starts_with("kb_")).map(|(k, v)| (k.clone(), v.clone())).collect::<std::collections::BTreeMap<_, _>>();
+        let ours = |f: &std::collections::HashMap<String, String>| {
+            f.iter().filter(|(k, _)| k.starts_with("kb_")).map(|(k, v)| (k.clone(), v.clone())).collect::<std::collections::BTreeMap<_, _>>()
+        };
         assert_eq!(ours(&f0), ours(&fps().await), "stable");
         run("alter table kb_a.customers add column name text").await;
         let f1 = fps().await;
@@ -1039,26 +1011,10 @@ mod tests {
             std::env::var("DATABRAIN_MYSQL_PASSWORD").ok().map(secrecy::SecretString::from),
         ));
         let s = MysqlConnector.connect(&cfg, creds).await.unwrap();
-        let r = s
-            .execute("select 1 as a, 'x' as b, now() as c, 1.5 as d", ExecOptions::default())
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
+        let r = s.execute("select 1 as a, 'x' as b, now() as c, 1.5 as d", ExecOptions::default()).await.unwrap().collect().await.unwrap();
         assert_eq!(r.num_rows(), 1);
         let cancel = databrain_connector_core::CancellationToken::new();
-        let stream = s
-            .execute(
-                "select sleep(30)",
-                ExecOptions {
-                    batch_size: 10,
-                    cancel: cancel.clone(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        let stream = s.execute("select sleep(30)", ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         cancel.cancel();
         let _ = stream.collect().await;
@@ -1073,6 +1029,7 @@ mod tests {
             assert!(l.indexes[0].primary && l.indexes[0].columns == vec!["id", "day"], "{l:?}");
             assert_eq!(l.indexes[1].columns, vec!["cust", "day"]);
             assert_eq!(l.partition_by, vec!["day"], "{l:?}");
+            assert!(l.size_bytes.is_some_and(|b| b > 0), "InnoDB pages count even when empty: {l:?}");
         }
     }
 }

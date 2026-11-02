@@ -1,0 +1,3 @@
+# Lines up to 160 columns; short constructs stay on one line when they fit.
+max_width = 160
+use_small_heuristics = "Max"

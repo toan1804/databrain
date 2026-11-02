@@ -2,9 +2,18 @@
 import type { JobEdge } from "./JobEdge";
 import type { JobNode } from "./JobNode";
 import type { JobSchedule } from "./JobSchedule";
+import type { ParamValue } from "./ParamValue";
 
 export type Job = { id: string, name: string, nodes: Array<JobNode>, edges: Array<JobEdge>, schedule: JobSchedule, 
 /**
  * When the scheduler last started it (epoch ms).
  */
-last_scheduled_at?: number | null, created_at: number, updated_at: number, };
+last_scheduled_at?: number | null, 
+/**
+ * Values of the steps' `:name` parameters (over those of `param_set`).
+ */
+params?: { [key in string]?: ParamValue }, 
+/**
+ * Saved parameter set (id) whose values the steps get.
+ */
+param_set?: string, created_at: number, updated_at: number, };

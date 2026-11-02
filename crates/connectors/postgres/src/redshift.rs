@@ -297,15 +297,18 @@ impl PgSession {
         if interleaved {
             l.notes.push("INTERLEAVED SORTKEY".into());
         }
-        if let Some(r) = query_text(self, &format!("select diststyle::text, tbl_rows::bigint from svv_table_info where \"schema\" = {s} and \"table\" = {t}"))
-            .await
-            .ok()
-            .and_then(|v| v.into_iter().next())
+        if let Some(r) =
+            query_text(self, &format!("select diststyle::text, tbl_rows::bigint, size::bigint from svv_table_info where \"schema\" = {s} and \"table\" = {t}"))
+                .await
+                .ok()
+                .and_then(|v| v.into_iter().next())
         {
             if let Some(d) = r[0].clone().filter(|d| !d.is_empty() && !d.starts_with("KEY")) {
                 l.notes.push(format!("DISTSTYLE {d}"));
             }
             l.row_estimate = r[1].as_deref().and_then(|x| x.parse().ok());
+            // `size` counts 1 MB blocks.
+            l.size_bytes = r.get(2).and_then(|x| x.as_deref()).and_then(|x| x.parse::<i64>().ok()).map(|mb| mb * 1024 * 1024);
         }
         Ok(l)
     }
@@ -319,7 +322,10 @@ mod tests {
     fn parses_constraint_defs() {
         assert_eq!(parse_key_columns("PRIMARY KEY (id, \"Order No\")"), vec!["id", "Order No"]);
         let fk = parse_foreign_key("FOREIGN KEY (customer_id, region) REFERENCES sales.customers(id, region)", "public").unwrap();
-        assert_eq!((fk.columns, fk.ref_schema.as_str(), fk.ref_table.as_str(), fk.ref_columns), (vec!["customer_id".to_string(), "region".into()], "sales", "customers", vec!["id".to_string(), "region".into()]));
+        assert_eq!(
+            (fk.columns, fk.ref_schema.as_str(), fk.ref_table.as_str(), fk.ref_columns),
+            (vec!["customer_id".to_string(), "region".into()], "sales", "customers", vec!["id".to_string(), "region".into()])
+        );
         let fk = parse_foreign_key("FOREIGN KEY (c) REFERENCES \"Cust\"(id)", "public").unwrap();
         assert_eq!((fk.ref_schema.as_str(), fk.ref_table.as_str()), ("public", "Cust"));
         assert!(parse_foreign_key("CHECK (x > 0)", "public").is_none());

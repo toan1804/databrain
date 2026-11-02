@@ -110,7 +110,10 @@ impl OutputInfo {
 
 /// DuckDB identifier, quoted only when needed.
 pub fn q_min(s: &str) -> String {
-    const RESERVED: &[&str] = &["select", "from", "where", "group", "order", "by", "table", "join", "union", "all", "as", "on", "and", "or", "not", "null", "limit", "case", "when", "end", "desc", "asc"];
+    const RESERVED: &[&str] = &[
+        "select", "from", "where", "group", "order", "by", "table", "join", "union", "all", "as", "on", "and", "or", "not", "null", "limit", "case", "when",
+        "end", "desc", "asc",
+    ];
     let plain = s.chars().enumerate().all(|(i, c)| c == '_' || c.is_ascii_lowercase() || (i > 0 && c.is_ascii_digit())) && !s.is_empty();
     if plain && !RESERVED.contains(&s) { s.to_string() } else { quote_ident(ConnectorKind::Duckdb, s) }
 }
@@ -171,7 +174,13 @@ fn is_handle(s: &str) -> bool {
 impl OutputRegistry {
     pub fn new(results: Arc<ResultStore>, workspace: Arc<Workspace>) -> Arc<Self> {
         let seq = workspace.get_setting("outputs_seq").ok().flatten().and_then(|v| v.as_u64()).unwrap_or(0);
-        Arc::new(Self { inner: Mutex::new(Inner { seq, ..Default::default() }), results, workspace, snapshot_dir: Mutex::new(None), budget: Mutex::new(DEFAULT_BUDGET) })
+        Arc::new(Self {
+            inner: Mutex::new(Inner { seq, ..Default::default() }),
+            results,
+            workspace,
+            snapshot_dir: Mutex::new(None),
+            budget: Mutex::new(DEFAULT_BUDGET),
+        })
     }
 
     pub fn set_budget(&self, bytes: usize) {
@@ -377,12 +386,8 @@ impl OutputRegistry {
             let mut g = self.inner.lock();
             let mut total: usize = g.by_handle.values().filter(|o| o.state == OutputState::Live).map(|o| o.bytes).sum();
             if total > budget {
-                let mut cands: Vec<(i64, String)> = g
-                    .by_handle
-                    .values()
-                    .filter(|o| o.state == OutputState::Live && !o.pinned && !o.active)
-                    .map(|o| (o.last_used, o.handle.clone()))
-                    .collect();
+                let mut cands: Vec<(i64, String)> =
+                    g.by_handle.values().filter(|o| o.state == OutputState::Live && !o.pinned && !o.active).map(|o| (o.last_used, o.handle.clone())).collect();
                 cands.sort();
                 for (_, h) in cands {
                     if total <= budget {
@@ -407,7 +412,8 @@ impl OutputRegistry {
         if g.by_handle.len() <= MAX_ENTRIES {
             return;
         }
-        let mut evicted: Vec<(i64, String)> = g.by_handle.values().filter(|o| o.state == OutputState::Evicted).map(|o| (o.created_at, o.handle.clone())).collect();
+        let mut evicted: Vec<(i64, String)> =
+            g.by_handle.values().filter(|o| o.state == OutputState::Evicted).map(|o| (o.created_at, o.handle.clone())).collect();
         evicted.sort();
         let excess = g.by_handle.len() - MAX_ENTRIES;
         for (_, h) in evicted.into_iter().take(excess) {
@@ -656,7 +662,8 @@ impl OutputRegistry {
             }
             OutputState::OnDisk => {
                 let path = self.snapshot_path(&o.result_id).ok_or_else(|| EngineError::new("not_found", "snapshots are disabled"))?;
-                let (schema, batches) = databrain_export::read_snapshot(&path).map_err(|e| EngineError::new("internal", format!("cannot read snapshot of {}: {e}", o.handle)))?;
+                let (schema, batches) =
+                    databrain_export::read_snapshot(&path).map_err(|e| EngineError::new("internal", format!("cannot read snapshot of {}: {e}", o.handle)))?;
                 self.results.insert_complete(o.result_id.clone(), schema, batches, o.truncated);
                 self.update(&o.handle, |x| x.state = OutputState::Live);
             }
@@ -765,11 +772,22 @@ impl ExternalTables for OutputTables {
         let mut out = Vec::new();
         for name in self.0.table_names() {
             let Some(o) = self.0.resolve(&name) else { continue };
-            let what = if name == o.handle { "output".to_string() } else if o.name.as_deref() == Some(name.as_str()) { format!("output {}", o.handle) } else { format!("older version, {}", o.handle) };
+            let what = if name == o.handle {
+                "output".to_string()
+            } else if o.name.as_deref() == Some(name.as_str()) {
+                format!("output {}", o.handle)
+            } else {
+                format!("older version, {}", o.handle)
+            };
             out.push(databrain_connector_core::external::ExternalInfo {
                 columns: o.columns.iter().map(|c| (c.name.clone(), c.db_type.clone().unwrap_or_else(|| c.data_type.clone()))).collect(),
                 rows: Some(o.rows as i64),
-                comment: Some(format!("{what} · {} · {}{}", o.connection_name, crate::outputs::one_line(&o.sql, 120), if o.truncated { " · capped at the row limit" } else { "" })),
+                comment: Some(format!(
+                    "{what} · {} · {}{}",
+                    o.connection_name,
+                    crate::outputs::one_line(&o.sql, 120),
+                    if o.truncated { " · capped at the row limit" } else { "" }
+                )),
                 name,
             });
         }
@@ -784,14 +802,13 @@ pub(crate) fn one_line(s: &str, max: usize) -> String {
 
 /// Outputs as DuckDB reads them: decimals kept as text become DECIMAL
 /// (precision/scale from every value of every batch) or DOUBLE.
-pub fn sql_ready_all(schema: &SchemaRef, batches: &[RecordBatch]) -> std::result::Result<(SchemaRef, Vec<RecordBatch>), databrain_connector_core::arrow::error::ArrowError> {
+pub fn sql_ready_all(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+) -> std::result::Result<(SchemaRef, Vec<RecordBatch>), databrain_connector_core::arrow::error::ArrowError> {
     let mut fields = Vec::with_capacity(schema.fields().len());
     for (i, f) in schema.fields().iter().enumerate() {
-        let dt = if display::is_decimal_text(f) {
-            decimal_type(batches.iter().map(|b| b.column(i).as_ref()))
-        } else {
-            f.data_type().clone()
-        };
+        let dt = if display::is_decimal_text(f) { decimal_type(batches.iter().map(|b| b.column(i).as_ref())) } else { f.data_type().clone() };
         fields.push(Field::new(f.name(), dt, true));
     }
     let out_schema = Arc::new(Schema::new(fields));
@@ -935,10 +952,7 @@ pub fn diff_sql_with(before: &OutputInfo, after: &OutputInfo, keys: &[String], e
     let using = keys.iter().map(|k| q(k)).collect::<Vec<_>>().join(", ");
     let values: Vec<&str> = common.iter().copied().filter(|c| !keys.iter().any(|k| k == c)).collect();
     let key_list = keys.iter().map(|k| q(k)).collect::<Vec<_>>().join(", ");
-    let changed_cols = values
-        .iter()
-        .map(|c| format!("b.{0} AS {0}, a.{0} AS {1}", q(c), q(&format!("{c} (before)"))))
-        .collect::<Vec<_>>();
+    let changed_cols = values.iter().map(|c| format!("b.{0} AS {0}, a.{0} AS {1}", q(c), q(&format!("{c} (before)")))).collect::<Vec<_>>();
     let changed_where = if values.is_empty() {
         "false".to_string()
     } else {
@@ -1116,7 +1130,17 @@ mod tests {
     fn tab_outputs_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Arc::new(Workspace::open(dir.path().join("w.db")).unwrap());
-        let tab = |id: &str| databrain_workspace::TabState { id: id.into(), title: id.into(), sql: String::new(), connection_id: None, saved_query_id: None, notebook_id: None, output_ref: None, auto_commit: None, file_path: None };
+        let tab = |id: &str| databrain_workspace::TabState {
+            id: id.into(),
+            title: id.into(),
+            sql: String::new(),
+            connection_id: None,
+            saved_query_id: None,
+            notebook_id: None,
+            output_ref: None,
+            auto_commit: None,
+            file_path: None,
+        };
         ws.save_tabs(&[tab("t1"), tab("t2")]).unwrap();
         let snaps = dir.path().join("outputs");
         {

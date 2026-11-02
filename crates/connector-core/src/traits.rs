@@ -266,8 +266,20 @@ pub struct LoadTraits {
     pub probe_limit0: bool,
     pub stage: StageTable,
     pub merge: MergeStyle,
+    /// Update and Merge by key are possible (ClickHouse has no row-level
+    /// UPDATE/MERGE: only Insert, Delete then insert, Replace).
+    pub keyed: bool,
     /// `None` = statements commit one by one.
     pub transactions: Option<LoadTransactions>,
+    /// Written after a new table's column list (ClickHouse: its `ENGINE`).
+    pub create_suffix: &'static str,
+    /// Columns are NOT NULL unless written `NULL` (ClickHouse): a nullable
+    /// column says so, else a NULL would be stored as 0 or ''.
+    pub explicit_null: bool,
+    /// Empties the table for "Delete rows, then insert" (`{}` = the table).
+    pub delete_all: &'static str,
+    /// Written between an INSERT's column list and `VALUES`.
+    pub insert_settings: &'static str,
 }
 
 /// How "first rows of a table" is written (explorer preview, AI samples).
@@ -389,7 +401,12 @@ pub const STANDARD_LOAD: LoadTraits = LoadTraits {
     probe_limit0: false,
     stage: StageTable::Temp,
     merge: MergeStyle::UpdateFrom,
+    keyed: true,
     transactions: Some(LoadTransactions { begin: "BEGIN", commit: "COMMIT", rollback: "ROLLBACK", ddl_commits: false }),
+    create_suffix: "",
+    explicit_null: false,
+    delete_all: "DELETE FROM {}",
+    insert_settings: "",
 };
 
 /// Starting point for a new source: standard SQL, two name levels,
@@ -428,13 +445,7 @@ pub const SQLITE: SourceTraits = SourceTraits {
     explain: Some("EXPLAIN QUERY PLAN "),
     local: true,
     formatter: "sqlite",
-    syntax: SqlSyntax {
-        backtick: true,
-        brackets: true,
-        block_end: BlockEnd::EndWord,
-        block_objects: &["TRIGGER"],
-        ..STANDARD_SYNTAX
-    },
+    syntax: SqlSyntax { backtick: true, brackets: true, block_end: BlockEnd::EndWord, block_objects: &["TRIGGER"], ..STANDARD_SYNTAX },
     load: Some(LoadTraits {
         types: TypeNames { integer: "INTEGER", float: "REAL", ..STANDARD_TYPES },
         default_bytes: 1_000_000,
@@ -711,8 +722,41 @@ pub const MONGODB: SourceTraits = SourceTraits {
     ..STANDARD
 };
 
-/// ClickHouse: databases are the schemas (like MySQL); no transactions, so
-/// no load target yet (tables also need an ENGINE).
+/// ClickHouse: databases are the schemas (like MySQL). A load target
+/// without transactions or row-level updates: new tables are MergeTree,
+/// nullable columns say `NULL`, Truncate uses `TRUNCATE TABLE`, and offsets
+/// in timestamps parse with `best_effort`.
+pub const CLICKHOUSE_LOAD: LoadTraits = LoadTraits {
+    types: TypeNames {
+        boolean: "Bool",
+        integer: "Int64",
+        float: "Float64",
+        decimal: "Decimal(38, 10)",
+        date: "Date32",
+        timestamp: "DateTime64(6)",
+        timestamp_tz: "DateTime64(6, 'UTC')",
+        time: "String",
+        binary: "String",
+        text: "String",
+    },
+    max_rows: 100_000,
+    rows_note: "ClickHouse parses VALUES as a stream; DataBrain's limit",
+    default_bytes: MB,
+    max_bytes: 16 * MB,
+    bytes_note: "DataBrain's limit for one HTTP request",
+    binary_literal: "unhex('{}')",
+    text_literal: TextLiteral::BackslashEscaped,
+    probe_limit0: true,
+    stage: StageTable::Regular,
+    keyed: false,
+    transactions: None,
+    create_suffix: " ENGINE = MergeTree ORDER BY tuple()",
+    explicit_null: true,
+    delete_all: "TRUNCATE TABLE {}",
+    insert_settings: " SETTINGS date_time_input_format = 'best_effort'",
+    ..STANDARD_LOAD
+};
+
 pub const CLICKHOUSE: SourceTraits = SourceTraits {
     parser: SqlParser::Clickhouse,
     name: "ClickHouse",
@@ -721,7 +765,7 @@ pub const CLICKHOUSE: SourceTraits = SourceTraits {
     explain: Some("EXPLAIN "),
     ssl_setting: true,
     syntax: SqlSyntax { backslash_escapes: true, backslash_in_double_quotes: true, backtick: true, hash_comment: true, ..STANDARD_SYNTAX },
-    load: None,
+    load: Some(CLICKHOUSE_LOAD),
     ..STANDARD
 };
 
@@ -815,7 +859,10 @@ mod tests {
         // Compared as JSON: key order depends on serde_json features the
         // workspace enables (`preserve_order`), not on the content.
         let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_default()).unwrap_or_default();
-        assert!(on_disk == serde_json::Value::Object(map), "ui/src/lib/sourceTraits.json is out of date: run UPDATE_SOURCE_TRAITS=1 cargo test -p databrain-connector-core traits");
+        assert!(
+            on_disk == serde_json::Value::Object(map),
+            "ui/src/lib/sourceTraits.json is out of date: run UPDATE_SOURCE_TRAITS=1 cargo test -p databrain-connector-core traits"
+        );
     }
 
     #[test]

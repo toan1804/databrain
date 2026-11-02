@@ -8,7 +8,7 @@ use databrain_app::api::{self, AppState, SaveConnectionArgs};
 use databrain_auth::{AuthMethod, MemoryStore};
 use databrain_connector_core::{ConnectionConfig, ConnectorKind};
 use databrain_query_engine::{EventSink, JobEvent, RunRequest};
-use databrain_workspace::{FileFormat, ConnectionProfile, EnvTag, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, LoadMode, Workspace};
+use databrain_workspace::{ConnectionProfile, EnvTag, FileFormat, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, LoadMode, Workspace};
 
 struct Quiet;
 impl EventSink for Quiet {
@@ -34,7 +34,18 @@ fn sqlite(st: &AppState, name: &str, path: &std::path::Path, read_only: bool) ->
     api::save_connection(
         st,
         SaveConnectionArgs {
-            profile: ConnectionProfile { id: String::new(), name: name.into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            profile: ConnectionProfile {
+                id: String::new(),
+                name: name.into(),
+                config: c,
+                color: None,
+                env: EnvTag::None,
+                folder_id: None,
+                has_secret: false,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
             secret: None,
             clear_secret: false,
             extra_secrets: Default::default(),
@@ -85,7 +96,22 @@ async fn finished(st: &AppState, job: &str) -> JobRun {
 async fn rows(st: &AppState, conn: &str, sql: &str) -> Vec<Vec<String>> {
     let out = st
         .engine
-        .run_and_wait(&st.hub, RunRequest { connection_id: conn.into(), tab_id: format!("t-{}", uuid::Uuid::new_v4()), sql: sql.into(), base_offset: 0, row_limit: None, confirmed: true, origin: Default::default(), session_key: None, output_name: None, params: Default::default() }, None)
+        .run_and_wait(
+            &st.hub,
+            RunRequest {
+                connection_id: conn.into(),
+                tab_id: format!("t-{}", uuid::Uuid::new_v4()),
+                sql: sql.into(),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+            },
+            None,
+        )
         .await
         .unwrap();
     if let Some(e) = out.iter().find_map(|o| o.error.as_ref()) {
@@ -102,7 +128,12 @@ async fn query_duckdb_and_load_steps() {
     let st = state();
     let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
     let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
-    rows(&st, &src, "create table orders (id integer, region text, amount real); insert into orders values (1, 'eu', 10.5), (2, 'eu', 4.5), (3, 'us', 7); select 1").await;
+    rows(
+        &st,
+        &src,
+        "create table orders (id integer, region text, amount real); insert into orders values (1, 'eu', 10.5), (2, 'eu', 4.5), (3, 'us', 7); select 1",
+    )
+    .await;
 
     let mut load = node("c", "totals", JobNodeKind::Load, None, "");
     load.target_connection_id = Some(dst.clone());
@@ -115,12 +146,20 @@ async fn query_duckdb_and_load_steps() {
             name: "Nightly".into(),
             nodes: vec![
                 node("a", "orders", JobNodeKind::Query, Some(&src), "select region, amount from orders"),
-                node("b", "by_region", JobNodeKind::Query, None, "select region, sum(amount) as total, count(*) as n from results.orders group by region order by region"),
+                node(
+                    "b",
+                    "by_region",
+                    JobNodeKind::Query,
+                    None,
+                    "select region, sum(amount) as total, count(*) as n from results.orders group by region order by region",
+                ),
                 load,
             ],
             edges: vec![JobEdge { from: "a".into(), to: "b".into() }, JobEdge { from: "b".into(), to: "c".into() }],
             schedule: JobSchedule { enabled: true, minutes: 60, ..Default::default() },
             last_scheduled_at: None,
+            params: Default::default(),
+            param_set: None,
             created_at: 0,
             updated_at: 0,
         })
@@ -172,6 +211,8 @@ async fn failures_skip_downstream_and_read_only_is_refused() {
             edges: vec![JobEdge { from: "a".into(), to: "b".into() }],
             schedule: Default::default(),
             last_scheduled_at: None,
+            params: Default::default(),
+            param_set: None,
             created_at: 0,
             updated_at: 0,
         })
@@ -201,7 +242,18 @@ async fn load_into_server_databases() {
         let id = api::save_connection(
             &st,
             SaveConnectionArgs {
-                profile: ConnectionProfile { id: String::new(), name: "db".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: true, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+                profile: ConnectionProfile {
+                    id: String::new(),
+                    name: "db".into(),
+                    config: c,
+                    color: None,
+                    env: EnvTag::None,
+                    folder_id: None,
+                    has_secret: true,
+                    ai_policy: Default::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
                 secret: std::env::var(format!("{env}_PASSWORD")).ok(),
                 clear_secret: false,
                 extra_secrets: Default::default(),
@@ -224,6 +276,8 @@ async fn load_into_server_databases() {
                 edges: vec![JobEdge { from: "a".into(), to: "b".into() }],
                 schedule: Default::default(),
                 last_scheduled_at: None,
+                params: Default::default(),
+                param_set: None,
                 created_at: 0,
                 updated_at: 0,
             })
@@ -251,7 +305,9 @@ async fn export_steps_write_files_with_duckdb() {
     let st = state();
     let mut nodes = vec![node("a", "src_rows", JobNodeKind::Query, None, "select 1 as id, 'it''s, quoted' as name union all select 2, 'b'")];
     let mut edges = vec![];
-    for (i, (fmt, file)) in [(FileFormat::Csv, Some("report {step}")), (FileFormat::Parquet, None), (FileFormat::Json, Some("rows.json"))].into_iter().enumerate() {
+    for (i, (fmt, file)) in
+        [(FileFormat::Csv, Some("report {step}")), (FileFormat::Parquet, None), (FileFormat::Json, Some("rows.json"))].into_iter().enumerate()
+    {
         let id = format!("e{i}");
         let mut e = node(&id, &format!("out_{i}"), JobNodeKind::Export, None, "");
         e.export_folder = Some(dir.path().to_string_lossy().into_owned());
@@ -265,7 +321,18 @@ async fn export_steps_write_files_with_duckdb() {
     nodes.push(missing);
     let job = st
         .workspace
-        .save_job(Job { id: String::new(), name: "Export".into(), nodes, edges, schedule: Default::default(), last_scheduled_at: None, created_at: 0, updated_at: 0 })
+        .save_job(Job {
+            id: String::new(),
+            name: "Export".into(),
+            nodes,
+            edges,
+            schedule: Default::default(),
+            last_scheduled_at: None,
+            params: Default::default(),
+            param_set: None,
+            created_at: 0,
+            updated_at: 0,
+        })
         .unwrap();
     api::run_job(&st, &job.id, None).unwrap();
     let run = finished(&st, &job.id).await;
@@ -285,7 +352,18 @@ async fn export_steps_write_files_with_duckdb() {
 }
 
 fn plain_job(name: &str, nodes: Vec<JobNode>) -> Job {
-    Job { id: String::new(), name: name.into(), nodes, edges: vec![], schedule: Default::default(), last_scheduled_at: None, created_at: 0, updated_at: 0 }
+    Job {
+        id: String::new(),
+        name: name.into(),
+        nodes,
+        edges: vec![],
+        schedule: Default::default(),
+        last_scheduled_at: None,
+        params: Default::default(),
+        param_set: None,
+        created_at: 0,
+        updated_at: 0,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -295,7 +373,22 @@ async fn step_names_own_their_output_names() {
     // A query tab already produced `revenue`: a step can't take that name.
     let out = st
         .engine
-        .run_and_wait(&st.hub, RunRequest { connection_id: duck.clone(), tab_id: "tab1".into(), sql: "select 1 as x".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Default::default(), session_key: None, output_name: Some("revenue".into()), params: Default::default() }, None)
+        .run_and_wait(
+            &st.hub,
+            RunRequest {
+                connection_id: duck.clone(),
+                tab_id: "tab1".into(),
+                sql: "select 1 as x".into(),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: Some("revenue".into()),
+                params: Default::default(),
+            },
+            None,
+        )
         .await
         .unwrap();
     assert!(out[0].error.is_none());
@@ -306,7 +399,18 @@ async fn step_names_own_their_output_names() {
     let job = api::save_job(&st, plain_job("Nightly", vec![node("a", "sales", JobNodeKind::Query, None, "select 2 as y")])).unwrap();
     let err = api::save_job(&st, plain_job("B", vec![node("b", "SALES", JobNodeKind::Query, None, "select 1")])).unwrap_err().message;
     assert!(err.contains("job \"Nightly\""), "{err}");
-    let run = |tab: &str| RunRequest { connection_id: duck.clone(), tab_id: tab.into(), sql: "select 3".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Default::default(), session_key: None, output_name: Some("sales".into()), params: Default::default() };
+    let run = |tab: &str| RunRequest {
+        connection_id: duck.clone(),
+        tab_id: tab.into(),
+        sql: "select 3".into(),
+        base_offset: 0,
+        row_limit: None,
+        confirmed: true,
+        origin: Default::default(),
+        session_key: None,
+        output_name: Some("sales".into()),
+        params: Default::default(),
+    };
     let err = st.engine.run(run("tab2")).unwrap_err().message;
     assert!(err.contains("only that step can produce it"), "{err}");
     let handle = st.engine.outputs().resolve("revenue").unwrap().handle;
@@ -331,7 +435,18 @@ fn duckdb(st: &AppState, name: &str, path: &std::path::Path) -> String {
     api::save_connection(
         st,
         SaveConnectionArgs {
-            profile: ConnectionProfile { id: String::new(), name: name.into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            profile: ConnectionProfile {
+                id: String::new(),
+                name: name.into(),
+                config: c,
+                color: None,
+                env: EnvTag::None,
+                folder_id: None,
+                has_secret: false,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
             secret: None,
             clear_secret: false,
             extra_secrets: Default::default(),
@@ -359,6 +474,8 @@ fn load_job(st: &AppState, target: &str, table: &str, src: &str, edit: impl FnOn
             edges: vec![JobEdge { from: "a".into(), to: "b".into() }],
             schedule: Default::default(),
             last_scheduled_at: None,
+            params: Default::default(),
+            param_set: None,
             created_at: 0,
             updated_at: 0,
         })
@@ -437,10 +554,7 @@ async fn update_and_merge_by_key_columns() {
         let run = run_all(&st, &job).await;
         assert_eq!(run.status, "success", "{dst}: {run:?}");
         assert_eq!(step(&run, "loaded").rows, Some(1), "{dst}: rows updated");
-        assert_eq!(
-            rows(&st, &dst, "select id, name, qty, note from items order by id").await,
-            vec![vec!["1", "a", "1", "n1"], vec!["2", "B", "20", "n2"]]
-        );
+        assert_eq!(rows(&st, &dst, "select id, name, qty, note from items order by id").await, vec![vec!["1", "a", "1", "n1"], vec!["2", "B", "20", "n2"]]);
         // Merge: id 2 updated again, id 3 inserted.
         let job = load_job(&st, &dst, "items", "select 2 as id, 'bb' as name, 22 as qty union all select 3, 'c', 30", |n| {
             n.load_mode = LoadMode::Merge;
@@ -449,7 +563,10 @@ async fn update_and_merge_by_key_columns() {
         let run = run_all(&st, &job).await;
         assert_eq!(run.status, "success", "{dst}: {run:?}");
         assert_eq!(step(&run, "loaded").rows, Some(2));
-        assert_eq!(rows(&st, &dst, "select id, name, qty from items order by id").await, vec![vec!["1", "a", "1"], vec!["2", "bb", "22"], vec!["3", "c", "30"]]);
+        assert_eq!(
+            rows(&st, &dst, "select id, name, qty from items order by id").await,
+            vec![vec!["1", "a", "1"], vec!["2", "bb", "22"], vec!["3", "c", "30"]]
+        );
 
         // Update/Merge need the table and the keys.
         let job = load_job(&st, &dst, "nope", src, |n| {
@@ -561,7 +678,14 @@ async fn runs_log_each_statement_and_report_insert_progress() {
     let progress: Vec<(u64, u64)> = events
         .iter()
         .filter(|(e, _)| e == "job-run")
-        .filter_map(|(_, p)| p["run"]["nodes"].as_array()?.iter().find(|n| n["name"] == "loaded")?.get("progress").map(|g| (g["done"].as_u64().unwrap(), g["total"].as_u64().unwrap())))
+        .filter_map(|(_, p)| {
+            p["run"]["nodes"]
+                .as_array()?
+                .iter()
+                .find(|n| n["name"] == "loaded")?
+                .get("progress")
+                .map(|g| (g["done"].as_u64().unwrap(), g["total"].as_u64().unwrap()))
+        })
         .collect();
     assert_eq!(progress.last(), Some(&(1200, 1200)), "{progress:?}");
 
@@ -616,6 +740,8 @@ async fn stop_cancels_the_running_step() {
         created_at: 0,
         updated_at: 0,
         last_scheduled_at: None,
+        params: Default::default(),
+        param_set: None,
     };
     let job = st.workspace.save_job(job).unwrap();
     for only in [None, Some(vec!["n1".to_string()])] {
@@ -653,6 +779,8 @@ async fn stop_one_step() {
             created_at: 0,
             updated_at: 0,
             last_scheduled_at: None,
+            params: Default::default(),
+            param_set: None,
         })
         .unwrap();
     api::run_job(&st, &job.id, None).unwrap();
@@ -674,7 +802,18 @@ async fn unreachable_connection_fails_each_run() {
     let bad = api::save_connection(
         &st,
         SaveConnectionArgs {
-            profile: ConnectionProfile { id: String::new(), name: "Bad".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            profile: ConnectionProfile {
+                id: String::new(),
+                name: "Bad".into(),
+                config: c,
+                color: None,
+                env: EnvTag::None,
+                folder_id: None,
+                has_secret: false,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
             secret: None,
             clear_secret: false,
             extra_secrets: Default::default(),
@@ -693,6 +832,8 @@ async fn unreachable_connection_fails_each_run() {
             created_at: 0,
             updated_at: 0,
             last_scheduled_at: None,
+            params: Default::default(),
+            param_set: None,
         })
         .unwrap();
     for i in 0..8 {
@@ -708,7 +849,6 @@ async fn unreachable_connection_fails_each_run() {
         assert_eq!(step(&run, "bad_one").status, "error");
     }
 }
-
 
 /// The app and the background runner (two processes on one workspace): a due
 /// job runs once, a job running in one can't start in the other, and the
@@ -757,4 +897,78 @@ async fn app_and_background_runner_share_jobs_safely() {
     let live = cli.workspace.start_job_run(&job.id, "background").unwrap();
     cli.workspace.touch_job_run(live.id, &cli.jobs.owner).unwrap();
     assert_eq!(app.workspace.close_stale_job_runs().unwrap(), 0);
+}
+
+/// Job parameters: the steps' `:name` values come from the job's set, then
+/// its own values, then the run's; the log names them and the run records
+/// them; a resume runs with the same; a deleted set fails the run's steps.
+#[tokio::test(flavor = "multi_thread")]
+async fn job_steps_get_parameter_values() {
+    use databrain_app::jobs::RunParams;
+    use databrain_connector_core::sql::ParamValue;
+    let st = state();
+    let v = |s: &str| ParamValue { value: s.into(), raw: false };
+    let daily = st
+        .workspace
+        .save_param_set(databrain_workspace::ParamSet {
+            id: String::new(),
+            name: "Daily".into(),
+            values: [("day".to_string(), v("2026-11-01")), ("tenant".to_string(), v("acme"))].into(),
+            updated_at: 0,
+        })
+        .unwrap();
+    let mut job = Job {
+        id: String::new(),
+        name: "Params".into(),
+        nodes: vec![node("p", "picked", JobNodeKind::Query, None, "select :day as day, :tenant as tenant, cast(:n as integer) as n")],
+        edges: vec![],
+        schedule: JobSchedule::default(),
+        last_scheduled_at: None,
+        params: [("tenant".to_string(), v("globex")), ("n".to_string(), v("5"))].into(),
+        param_set: Some(daily.id.clone()),
+        created_at: 0,
+        updated_at: 0,
+    };
+    job = st.workspace.save_job(job).unwrap();
+    let duck = st.engine.results_connection().unwrap().id;
+
+    api::run_job(&st, &job.id, None).unwrap();
+    let run = finished(&st, &job.id).await;
+    assert_eq!(run.status, "success", "{run:?}");
+    assert_eq!(
+        rows(&st, &duck, "select day, tenant, n from results.picked").await,
+        vec![vec!["2026-11-01", "globex", "5"]],
+        "the job's own values over its set's"
+    );
+    assert_eq!(run.params["tenant"].value, "globex");
+    let log = st.workspace.job_run_log(&job.id, run.id).unwrap();
+    assert!(log.iter().any(|l| l.message.contains("Parameters (set \"Daily\")") && l.message.contains(":day = 2026-11-01")), "{log:?}");
+
+    // This run only: another value over the job's.
+    let over = RunParams { set: None, values: [("day".to_string(), v("2026-12-24"))].into() };
+    api::run_job_with(&st, &job.id, None, Some(over)).unwrap();
+    assert_eq!(finished(&st, &job.id).await.status, "success");
+    assert_eq!(rows(&st, &duck, "select day, tenant, n from results.picked").await, vec![vec!["2026-12-24", "globex", "5"]]);
+    // A value that fails the step; Resume runs again with the same values.
+    let bad = RunParams { set: None, values: [("n".to_string(), v("oops"))].into() };
+    api::run_job_with(&st, &job.id, None, Some(bad)).unwrap();
+    assert_eq!(finished(&st, &job.id).await.status, "error");
+    api::resume_job(&st, &job.id).unwrap();
+    let resumed = finished(&st, &job.id).await;
+    assert_eq!((resumed.trigger.as_str(), resumed.status.as_str(), resumed.params["n"].value.as_str()), ("resume", "error", "oops"), "{resumed:?}");
+
+    // The set is gone: the step fails and says so.
+    st.workspace.delete_param_set(&daily.id).unwrap();
+    api::run_job(&st, &job.id, None).unwrap();
+    let run = finished(&st, &job.id).await;
+    assert_eq!(run.status, "error");
+    assert!(run.nodes[0].summary.error.as_deref().is_some_and(|e| e.contains("parameter set")), "{run:?}");
+
+    // No set and no value for :day: the step says which one is missing.
+    job.param_set = None;
+    job.params.remove("tenant");
+    st.workspace.save_job(job.clone()).unwrap();
+    api::run_job(&st, &job.id, None).unwrap();
+    let run = finished(&st, &job.id).await;
+    assert!(run.nodes[0].summary.error.as_deref().is_some_and(|e| e.contains(":day") && e.contains(":tenant")), "{run:?}");
 }

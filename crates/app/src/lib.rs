@@ -4,10 +4,10 @@ pub mod ai_api;
 pub mod api;
 pub mod background;
 mod commands;
+pub mod conn_io;
 pub mod jobs;
 pub mod logging;
 pub mod meta_writer;
-pub mod conn_io;
 pub mod sql_files;
 pub mod updates;
 
@@ -15,18 +15,11 @@ use std::sync::Arc;
 
 use api::{AppState, ConnectionView, SaveConnectionArgs, Span};
 use databrain_auth::SwitchableStore;
-use databrain_connector_core::{
-    ConnectionConfig, ConnectorInfo, ConnectorKind, DbObject, ObjectDetail, SchemaInfo,
-};
+use databrain_connector_core::{ConnectionConfig, ConnectorInfo, ConnectorKind, DbObject, ObjectDetail, SchemaInfo};
 use databrain_export::ExportOptions;
-use databrain_query_engine::{
-    EngineError, EventSink, JobEvent, RunRequest, RunResponse, TestResult,
-};
+use databrain_query_engine::{EngineError, EventSink, JobEvent, RunRequest, RunResponse, TestResult};
 use databrain_result_store::{ColumnStats, FindResult, Page, ResultInfo, ViewSpec};
-use databrain_workspace::{
-    ConnectionProfile, Folder, FolderKind, HistoryEntry, HistoryQuery, SavedQuery, TabState,
-    Workspace,
-};
+use databrain_workspace::{ConnectionProfile, Folder, FolderKind, HistoryEntry, HistoryQuery, SavedQuery, TabState, Workspace};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Name of the event carrying [`JobEvent`] payloads.
@@ -109,12 +102,7 @@ fn macos_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
             &P::select_all(app, None)?,
         ],
     )?;
-    let window = Submenu::with_items(
-        app,
-        "Window",
-        true,
-        &[&P::minimize(app, None)?, &P::maximize(app, None)?, &P::fullscreen(app, None)?],
-    )?;
+    let window = Submenu::with_items(app, "Window", true, &[&P::minimize(app, None)?, &P::maximize(app, None)?, &P::fullscreen(app, None)?])?;
     Menu::with_items(app, &[&app_menu, &edit, &window])
 }
 
@@ -171,9 +159,8 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                        if let Some(idle) = engine.idle_disconnect() {
-                            engine.close_idle(idle);
-                        }
+                        // Each connection after its own idle time when it has one.
+                        engine.close_idle_with(engine.idle_disconnect());
                     }
                 });
             }
@@ -281,6 +268,9 @@ pub fn run() {
             commands::jobs::get_job,
             commands::jobs::save_job,
             commands::jobs::delete_job,
+            commands::jobs::list_param_sets,
+            commands::jobs::save_param_set,
+            commands::jobs::delete_param_set,
             commands::jobs::run_job,
             commands::jobs::resume_job,
             commands::system::reveal_logs,
