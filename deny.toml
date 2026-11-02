@@ -18,6 +18,7 @@ ignore = [
   { id = "RUSTSEC-2026-0367", reason = "zip extract() in libduckdb-sys's build script and the updater (signed archives only); DataBrain's own use is zip 9" },
   { id = "RUSTSEC-2026-0368", reason = "zip extract() in libduckdb-sys's build script and the updater (signed archives only); DataBrain's own use is zip 9" },
   { id = "RUSTSEC-2026-0369", reason = "zip extract() in libduckdb-sys's build script and the updater (signed archives only); DataBrain's own use is zip 9" },
+  { id = "RUSTSEC-2026-0429", reason = "zip extract() aborts on a huge declared symlink size: libduckdb-sys's build script (its own sources) and the updater (archives whose signature checked); DataBrain's own use is zip 9" },
 
   # --- Upstream has no fix in a version DataBrain can take yet.
 
