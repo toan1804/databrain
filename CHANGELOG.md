@@ -4,6 +4,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.3.0 - 2026-11-03
+
 ### Security
 
 - query_outputs (and run_query on DuckDB) mask an output's sensitive columns as DuckDB loads `results.<name>`, as query_result already did. They only refused SQL that named a sensitive column, so `SELECT *` under a CTE column list could rename one, and a failing cast quoted its value in the error sent to the model. Now the session only sees `***`, the SQL may name the column, and an output that wasn't checked is refused. In a DuckDB file other sessions share, outputs with sensitive columns are refused (use query_outputs).
