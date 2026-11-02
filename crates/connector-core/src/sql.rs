@@ -451,7 +451,7 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
         Ok(stmts) if !stmts.is_empty() => {
             let mut out = Classification { kind: StatementKind::Read, missing_where: false, keyword: keyword.clone() };
             for s in &stmts {
-                let (k, mw) = classify_ast(s, &keyword);
+                let (k, mw) = classify_ast(s);
                 out.kind = out.kind.max(k);
                 out.missing_where |= mw;
             }
@@ -463,15 +463,17 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
                 k = StatementKind::Dml;
             }
             if k == StatementKind::Read {
-                // Unparseable but looks like a read; don't claim certainty.
-                k = if keyword == "SELECT" && !contains_dml_word(sql) { StatementKind::Read } else { StatementKind::Unknown };
+                // Unparseable but looks like a read: a read only when no word
+                // in it can act (T-SQL runs `SELECT 1 EXEC xp_cmdshell …` as
+                // two statements without a separator).
+                k = if keyword == "SELECT" && !contains_dml_word(sql) && !contains_action_word(sql) { StatementKind::Read } else { StatementKind::Unknown };
             }
             Classification { kind: k, missing_where: false, keyword }
         }
     }
 }
 
-fn classify_ast(s: &Statement, keyword: &str) -> (StatementKind, bool) {
+fn classify_ast(s: &Statement) -> (StatementKind, bool) {
     use StatementKind as K;
     match s {
         Statement::Query(q) => (query_kind(q), false),
@@ -484,11 +486,12 @@ fn classify_ast(s: &Statement, keyword: &str) -> (StatementKind, bool) {
         // which EXPLAIN forms run the statement. A plain EXPLAIN of a write
         // counts as that write too: being stricter costs a confirmation.
         Statement::Explain { statement, .. } => {
-            let (inner, missing_where) = classify_ast(statement, &leading_keyword(&statement.to_string()));
+            let (inner, missing_where) = classify_ast(statement);
             (K::Read.max(inner), missing_where)
         }
         Statement::ExplainTable { .. } => (K::Read, false),
-        _ => (keyword_kind(keyword), false),
+        // The statement's own keyword: in `select 1; exec p`, EXEC's is EXEC.
+        _ => (keyword_kind(&leading_keyword(&s.to_string())), false),
     }
 }
 
@@ -525,6 +528,62 @@ pub(crate) fn keyword_kind(kw: &str) -> StatementKind {
         "" => K::Unknown,
         _ => K::Other,
     }
+}
+
+/// Words that act (run code, change state or permissions, reach files)
+/// besides INSERT/UPDATE/DELETE…: unparsed SQL with one isn't a read.
+fn contains_action_word(sql: &str) -> bool {
+    const ACTION: &[&str] = &[
+        "EXEC",
+        "EXECUTE",
+        "CALL",
+        "DO",
+        "GRANT",
+        "REVOKE",
+        "DECLARE",
+        "BEGIN",
+        "WAITFOR",
+        "KILL",
+        "SHUTDOWN",
+        "BACKUP",
+        "RESTORE",
+        "DBCC",
+        "BULK",
+        "OPENROWSET",
+        "OPENQUERY",
+        "OPENDATASOURCE",
+        "SET",
+        "USE",
+        "COPY",
+        "LOAD",
+        "ATTACH",
+        "DETACH",
+        "PRAGMA",
+        "VACUUM",
+        "REPLACE",
+        "UPSERT",
+        "RENAME",
+        "COMMENT",
+        "HANDLER",
+        "LOCK",
+        "UNLOCK",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT",
+        "RESET",
+        "DISCARD",
+        "REFRESH",
+        "IMPORT",
+        "EXPORT",
+        "UNLOAD",
+        "PUT",
+        "REMOVE",
+        "CHECKPOINT",
+        "CLUSTER",
+        "REINDEX",
+        "SYSTEM",
+    ];
+    words(sql).any(|w| ACTION.iter().any(|k| w.eq_ignore_ascii_case(k)))
 }
 
 fn contains_dml_word(sql: &str) -> bool {

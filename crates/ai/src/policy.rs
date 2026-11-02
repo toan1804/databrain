@@ -35,10 +35,21 @@ pub fn review_sql(profile: &ConnectionProfile, sql: &str) -> SqlReview {
     let mut decision = decide(profile, policy, &stmts, worst);
     if profile.config.read_only && !matches!(decision, Decision::Deny(_)) {
         decision = read_only_decision(profile, &pieces, &stmts).unwrap_or(decision);
-    } else if !policy.allow_write && !matches!(decision, Decision::Deny(_)) {
-        // Not read-only, but the AI may not write: a "read" calling a user
-        // function can still write through it.
-        decision = function_writes(profile, &pieces, "the AI may not write on this connection").unwrap_or(decision);
+    } else if !matches!(decision, Decision::Deny(_)) {
+        match write_denied(profile) {
+            // The AI may not write here (writes off, production…): a "read"
+            // calling a user function can still write through it.
+            Some(why) => decision = function_writes(profile, &pieces, &why).unwrap_or(decision),
+            // It may: writes always ask, so a "read" that could write
+            // (unknown functions, SQL that can't be parsed) asks too.
+            None if decision == Decision::Allow => {
+                let fns = could_write(profile, &pieces);
+                if !fns.is_empty() {
+                    decision = Decision::Ask(format!("This query calls {}, which could write", fns.join(", ")));
+                }
+            }
+            None => {}
+        }
     }
     // Tables the AI may read / write (checked after the connection-wide rules,
     // so their reasons come first).
@@ -142,6 +153,18 @@ const OUTSIDE_READ_ONLY: &[&str] = &[
     "lo_unlink",
 ];
 
+/// Functions `pieces` call that are not known built-ins (each once), or a
+/// note that the SQL can't be parsed.
+fn could_write(profile: &ConnectionProfile, pieces: &[databrain_connector_core::sql::StatementSpan]) -> Vec<String> {
+    let mut fns: Vec<String> = Vec::new();
+    for f in pieces.iter().flat_map(|p| databrain_connector_core::sql::unknown_functions(&p.sql, profile.config.kind)) {
+        if !fns.contains(&f) {
+            fns.push(f);
+        }
+    }
+    fns
+}
+
 fn outside_read_only(f: &str) -> bool {
     let last = f.rsplit('.').next().unwrap_or(f).trim_matches(['"', '`', '[', ']']).to_ascii_lowercase();
     last.starts_with("dblink") || OUTSIDE_READ_ONLY.contains(&last.as_str())
@@ -157,17 +180,14 @@ fn outside_read_only(f: &str) -> bool {
 /// read-only: elsewhere the session can write, so every unknown function
 /// counts. Functions acting outside that mode count even then.
 fn function_writes(profile: &ConnectionProfile, pieces: &[databrain_connector_core::sql::StatementSpan], why: &str) -> Option<Decision> {
-    use databrain_connector_core::sql::unknown_functions;
     let kind = profile.config.kind;
     let session_read_only = profile.config.read_only && kind.server_read_only();
     let mut fns: Vec<String> = Vec::new();
-    for f in pieces.iter().flat_map(|p| unknown_functions(&p.sql, kind)) {
+    for f in could_write(profile, pieces) {
         if session_read_only && !outside_read_only(&f) {
             continue;
         }
-        if !fns.contains(&f) {
-            fns.push(f);
-        }
+        fns.push(f);
     }
     (!fns.is_empty()).then(|| {
         let reason = if session_read_only {
@@ -285,6 +305,30 @@ mod tests {
         assert_eq!(review_sql(&prod(auto_read()), "explain (analyze, buffers) select * from t").decision, Decision::Allow);
     }
 
+    /// "Allow write statements" doesn't lift production's refusal or the
+    /// function check: on Prod a call that could write needs the user, T-SQL
+    /// written without separators is not a read, and where the AI may write
+    /// such SQL asks instead of running.
+    #[test]
+    fn writes_allowed_keeps_prod_and_function_checks() {
+        use ConnectorKind::*;
+        let writer = AiPolicy { allow_write: true, ..auto_read() };
+        let mut prod = on(Mssql, false, writer.clone());
+        prod.env = EnvTag::Prod;
+        for sql in ["SELECT 1 EXEC xp_cmdshell 'whoami'", "select 1; exec xp_cmdshell 'whoami'", "SELECT 1 WAITFOR DELAY '00:00:05'"] {
+            assert!(matches!(review_sql(&prod, sql).decision, Decision::Deny(_) | Decision::Confirm(_)), "prod: {sql}: {:?}", review_sql(&prod, sql).decision);
+            assert_ne!(review_sql(&on(Mssql, false, writer.clone()), sql).decision, Decision::Allow, "dev, writes allowed: {sql}");
+        }
+        assert!(matches!(review_sql(&prod, "select dbo.write_fn()").decision, Decision::Confirm(r) if r.contains("production")));
+        let mut pg_prod = on(Postgres, false, writer);
+        pg_prod.env = EnvTag::Prod;
+        assert!(matches!(review_sql(&pg_prod, "select dblink_exec('x', 'delete from t')").decision, Decision::Confirm(_)));
+        assert_eq!(review_sql(&pg_prod, "select count(*) from t").decision, Decision::Allow);
+        // Classification: each statement by its own keyword; unparsed T-SQL with EXEC isn't a read.
+        assert_eq!(databrain_connector_core::sql::classify("select 1; exec p", Mssql).kind, StatementKind::Dml);
+        assert_eq!(databrain_connector_core::sql::classify("SELECT 1 EXEC xp_cmdshell 'whoami'", Mssql).kind, StatementKind::Unknown);
+    }
+
     fn on(kind: ConnectorKind, read_only: bool, policy: AiPolicy) -> ConnectionProfile {
         let mut p = profile(EnvTag::Dev, policy);
         p.config.kind = kind;
@@ -318,9 +362,9 @@ mod tests {
             }
             // Built-ins only: an ordinary read.
             assert_eq!(review_sql(&on(kind, false, auto_read()), "select count(*), lower(name) from t").decision, Decision::Allow, "{kind:?}");
-            // The AI may write here: writes are its to make (with approval when they look like writes).
+            // The AI may write here: writes always ask, so a call that could write asks too.
             let writer = on(kind, false, AiPolicy { allow_write: true, ..auto_read() });
-            assert_eq!(review_sql(&writer, sql).decision, Decision::Allow, "{kind:?}");
+            assert!(matches!(review_sql(&writer, sql).decision, Decision::Ask(r) if r.contains(f)), "{kind:?}");
         }
         // A table function counts too; each function is named once.
         match review_sql(&on(Mssql, false, auto_read()), "select * from dbo.tvf(1) a join dbo.tvf(2) b on 1=1").decision {
@@ -364,8 +408,11 @@ mod tests {
                 d => panic!("read-only {sql}: {d:?}"),
             }
         }
-        // The AI may write here: as before, its calls are its to make.
-        assert_eq!(review_sql(&on(Postgres, false, AiPolicy { allow_write: true, ..auto_read() }), "select public.write_fn()").decision, Decision::Allow);
+        // The AI may write here: writes always ask, so a call that could write asks.
+        assert!(matches!(
+            review_sql(&on(Postgres, false, AiPolicy { allow_write: true, ..auto_read() }), "select public.write_fn()").decision,
+            Decision::Ask(_)
+        ));
         assert_eq!(review_sql(&on(Postgres, false, auto_read()), "select count(*), lower(name) from t").decision, Decision::Allow);
     }
 
