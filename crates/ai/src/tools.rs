@@ -529,7 +529,8 @@ impl ToolContext {
         let ws = self.engine.workspace();
         let taken: std::collections::HashSet<String> = ws.job_step_names()?.into_iter().filter(|(_, o)| o.job_id != old.id).map(|(n, _)| n).collect();
         let refs = self.conn_refs()?;
-        let (job, notes) = crate::jobs::merge_job(&old, args, &refs, &taken)?;
+        let (mut job, notes) = crate::jobs::merge_job(&old, args, &refs, &taken)?;
+        crate::jobs::mark_ai_sql(&mut job, Some(&old));
         let decision = self.review_job(&job, &[], "Change a job")?;
         let changes = crate::jobs::changes(&old, &job);
         if changes.is_empty() {
@@ -550,7 +551,8 @@ impl ToolContext {
         let ws = self.engine.workspace();
         let taken: std::collections::HashSet<String> = ws.job_step_names()?.into_iter().map(|(n, _)| n).collect();
         let refs = self.conn_refs()?;
-        let (job, notes) = crate::jobs::build_job(args, &refs, &taken)?;
+        let (mut job, notes) = crate::jobs::build_job(args, &refs, &taken)?;
+        crate::jobs::mark_ai_sql(&mut job, None);
         let decision = self.review_job(&job, &[], "Create a job")?;
         let preview = crate::jobs::describe(&job, &refs);
         self.gate("create_job", decision, &format!("\"{}\" with {} steps", job.name, job.nodes.len()), &json!({"preview": preview, "name": job.name}))

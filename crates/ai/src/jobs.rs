@@ -541,6 +541,18 @@ pub fn changes(old: &Job, new: &Job) -> Vec<String> {
 /// Apply `update_job` arguments to `old`: steps whose name is kept (or
 /// renamed via `rename`) keep their id, place and history; `taken` = other
 /// jobs' output names. Returns the new job and notes for the model.
+/// Mark the steps whose SQL the AI wrote (`JobNode::ai_sql`): every step of
+/// a new job; in a changed job, the steps that are new or whose SQL moved
+/// or changed against `old`. A step the AI left as it was keeps its mark.
+pub fn mark_ai_sql(job: &mut Job, old: Option<&Job>) {
+    for n in &mut job.nodes {
+        n.ai_sql = match old.and_then(|o| o.nodes.iter().find(|x| x.id == n.id)) {
+            Some(before) if before.same_sql(n) => before.ai_sql,
+            _ => true,
+        };
+    }
+}
+
 pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Result<(Job, Vec<String>)> {
     let rename: Vec<(String, String)> = args
         .get("rename")
@@ -725,5 +737,40 @@ mod tests {
     #[test]
     fn finds_results_references() {
         assert_eq!(results_refs("select * from results.a join RESULTS.\"b\" x, myresults.c, results.a"), vec!["a", "b"]);
+    }
+}
+
+#[cfg(test)]
+mod ai_sql_tests {
+    use super::*;
+
+    fn job(nodes: serde_json::Value) -> Job {
+        serde_json::from_value(serde_json::json!({"name": "j", "nodes": nodes})).unwrap()
+    }
+
+    /// New steps and changed SQL are the AI's; a step left as the user had
+    /// it stays the user's; the AI's own unchanged steps stay marked.
+    #[test]
+    fn marks_the_sql_the_ai_wrote() {
+        let mut created = job(serde_json::json!([{"id": "a", "name": "a", "sql": "select 1"}]));
+        mark_ai_sql(&mut created, None);
+        assert!(created.nodes[0].ai_sql);
+        let old = job(serde_json::json!([
+            {"id": "u", "name": "u", "sql": "select 1"},
+            {"id": "m", "name": "m", "sql": "select 2", "ai_sql": true},
+            {"id": "c", "name": "c", "sql": "select 3"}
+        ]));
+        let mut merged = job(serde_json::json!([
+            {"id": "u", "name": "u", "sql": " select 1 "},
+            {"id": "m", "name": "m", "sql": "select 2"},
+            {"id": "c", "name": "c", "sql": "select 3", "connection_id": "other"},
+            {"id": "n", "name": "n", "sql": "select 4"}
+        ]));
+        mark_ai_sql(&mut merged, Some(&old));
+        let by = |id: &str| merged.nodes.iter().find(|n| n.id == id).unwrap().ai_sql;
+        assert!(!by("u"), "the user's, unchanged (whitespace aside)");
+        assert!(by("m"), "the AI's, unchanged");
+        assert!(by("c"), "moved to another connection by the AI");
+        assert!(by("n"), "new");
     }
 }

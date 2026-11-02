@@ -755,6 +755,32 @@ async fn ai_job_runs_are_sandboxed() {
     let by_hand = run("manual").await;
     assert_eq!(by_hand.status, "success", "{by_hand:?}");
     assert_eq!(step(&by_hand, "secret").rows, Some(1));
+
+    // SQL the AI wrote stays sandboxed whoever starts the run: on the
+    // schedule, by hand, from the background runner.
+    let mut ai_wrote = st.workspace.get_job(&job.id).unwrap();
+    ai_wrote.nodes.iter_mut().find(|n| n.id == "s3").unwrap().ai_sql = true;
+    st.workspace.save_job(ai_wrote).unwrap();
+    for trigger in ["schedule", "manual", "background"] {
+        let r = run(trigger).await;
+        assert_eq!(step(&r, "nums").status, "success", "{trigger}: the user's step runs as before: {r:?}");
+        let secret = step(&r, "secret");
+        assert!(secret.status == "error" && secret.error.as_deref().is_some_and(|e| e.contains("sandbox")), "{trigger}: {secret:?}");
+    }
+    // A user save keeps the mark while the SQL is as the AI left it, and
+    // can't set it on a step of its own.
+    let mut edited: databrain_workspace::Job = st.workspace.get_job(&job.id).unwrap();
+    edited.nodes.iter_mut().find(|n| n.id == "s1").unwrap().ai_sql = true;
+    let saved = save_job(&st, edited).unwrap();
+    assert!(saved.nodes.iter().find(|n| n.id == "s3").unwrap().ai_sql, "unchanged: still the AI's");
+    assert!(!saved.nodes.iter().find(|n| n.id == "s1").unwrap().ai_sql, "a user save can't mark a step as the AI's");
+    // The user changes the SQL: the step is theirs, and reads files again.
+    let mut edited = saved;
+    edited.nodes.iter_mut().find(|n| n.id == "s3").unwrap().sql = format!("select a from read_csv('{}')", csv.display());
+    let saved = save_job(&st, edited).unwrap();
+    assert!(!saved.nodes.iter().find(|n| n.id == "s3").unwrap().ai_sql);
+    let by_hand = run("schedule").await;
+    assert_eq!(step(&by_hand, "secret").rows, Some(1), "{by_hand:?}");
 }
 
 /// The saved Instant Client folder is checked at launch like the thin

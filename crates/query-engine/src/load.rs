@@ -50,6 +50,9 @@ pub struct LoadSpec {
     /// Rows / KB per INSERT (`None` = the dialect's default).
     pub batch_rows: Option<u32>,
     pub batch_kb: Option<u32>,
+    /// Whose SQL the before/after statements are (`Ai`: the DuckDB sandbox
+    /// applies to the target session).
+    pub origin: databrain_workspace::Origin,
 }
 
 /// Outcome of a load.
@@ -647,7 +650,7 @@ impl QueryEngine {
         if spec.mode.needs_keys() && keys_in.is_empty() {
             return Err(EngineError::new("invalid", "Choose the key columns that identify a row (Update and Merge match rows by them)"));
         }
-        let session = self.session(connection_id, tab).await?;
+        let session = self.session_for(connection_id, tab, spec.origin).await?;
 
         // Does the table exist, and with which columns?
         let mut table = table;

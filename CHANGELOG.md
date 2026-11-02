@@ -6,7 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Security
 
-- SQL from the AI, MCP and AI-run jobs runs on DuckDB in a sandbox (no file, network or extension access unless the connection allows it). Files attached to a DuckDB connection stay readable in it.
+- SQL from the AI, MCP and AI-run jobs runs on DuckDB in a sandbox (no file, network or extension access unless the connection allows it). Files attached to a DuckDB connection stay readable in it. Job steps whose SQL the AI wrote stay sandboxed when the job runs by hand, on its schedule or in the background, not only when the AI starts the run; a step you change yourself becomes yours.
 - Jobs the assistant creates, changes or runs follow the connection's AI policy, including load steps and their before/after SQL.
 - Functions that could write (e.g. `SELECT dbo.write_fn()`) need the user's confirmation wherever the AI may not write, not only on read-only connections.
 - Read-only connections are enforced beyond the write classifier.

@@ -15,8 +15,9 @@
 //!
 //! Runs don't prompt (the job was set up by hand, or approved when the AI
 //! assistant built or ran it: the assistant's policy is checked then);
-//! read-only connections are still refused. A run the assistant starts
-//! runs the steps' SQL as its own queries (the DuckDB sandbox applies).
+//! read-only connections are still refused. SQL the assistant wrote
+//! (`JobNode::ai_sql`), and every step of a run the assistant starts, runs
+//! as its own queries (the DuckDB sandbox applies), whoever starts the run.
 
 use futures::FutureExt;
 use std::collections::{HashMap, HashSet};
@@ -188,13 +189,15 @@ impl Tracer {
         self.live.lock().run.job_id.clone()
     }
 
-    /// Who the steps' own SQL runs for: a run the AI assistant started runs
-    /// it like the assistant's queries (`Origin::Ai`: in the DuckDB sandbox
-    /// unless the connection lets the AI read files and the network).
-    /// SQL DataBrain writes for a step (`COPY … TO` an export file) is not
-    /// the AI's and runs as the job's.
-    fn step_origin(&self) -> Origin {
-        if self.live.lock().run.trigger == "ai" { Origin::Ai } else { Origin::Job }
+    /// Who a step's own SQL runs for: SQL the AI assistant wrote
+    /// (`JobNode::ai_sql`), and every step of a run the assistant started,
+    /// runs like the assistant's queries (`Origin::Ai`: in the DuckDB
+    /// sandbox unless the connection lets the AI read files and the
+    /// network), also on the schedule or by hand. SQL DataBrain writes for
+    /// a step (`COPY … TO` an export file) is not the AI's and runs as the
+    /// job's.
+    fn step_origin(&self, node: &JobNode) -> Origin {
+        if node.ai_sql || self.live.lock().run.trigger == "ai" { Origin::Ai } else { Origin::Job }
     }
 
     /// Set this step's progress; the run is sent at most every [`PROGRESS_EVERY`]
@@ -673,7 +676,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     // Checked before the query runs, so a missing folder fails fast.
     let folder = if node.kind == JobNodeKind::Export { Some(export_folder(node)?) } else { None };
     let duck_id = connection_id.clone();
-    let outcomes = run_sql(ctx, connection_id, tab.clone(), sql, Some(node.name.clone()), t.step_origin(), cancel, t).await?;
+    let outcomes = run_sql(ctx, connection_id, tab.clone(), sql, Some(node.name.clone()), t.step_origin(node), cancel, t).await?;
     let last = outcomes.last();
     let rows = last.and_then(|o| o.result.as_ref().map(|r| r.total_rows as i64).or(o.rows_affected.map(|r| r as i64))).unwrap_or(0);
     if node.kind == JobNodeKind::Query {
@@ -713,7 +716,14 @@ pub fn load_spec(node: &JobNode) -> LoadSpec {
         after_sql: text(&node.load_after_sql),
         batch_rows: node.batch_rows,
         batch_kb: node.batch_kb,
+        origin: sql_origin(node),
     }
+}
+
+/// Whose SQL a step's is outside a run (dry runs, loads): the AI's when it
+/// wrote it, else the job's.
+fn sql_origin(node: &JobNode) -> Origin {
+    if node.ai_sql { Origin::Ai } else { Origin::Job }
 }
 
 /// Rows a dry run selects to try the load with.
@@ -738,7 +748,7 @@ pub async fn dry_run(ctx: &JobCtx, job: &Job, node_id: &str) -> Result<LoadDryRu
         None => (None, Some("Write the SQL that selects the rows to load, or connect an upstream step".to_string())),
         Some(sql) => {
             let duck = ctx.engine.results_connection()?.id;
-            let req = RunRequest { connection_id: duck, tab_id: tab.clone(), sql, base_offset: 0, row_limit: Some(DRY_RUN_ROWS), confirmed: true, origin: Origin::Job, session_key: None, output_name: None, params: HashMap::new() };
+            let req = RunRequest { connection_id: duck, tab_id: tab.clone(), sql, base_offset: 0, row_limit: Some(DRY_RUN_ROWS), confirmed: true, origin: sql_origin(node), session_key: None, output_name: None, params: HashMap::new() };
             match ctx.engine.run_and_wait(&ctx.hub, req, Some(cancel.clone())).await {
                 Err(e) => (None, Some(e.message)),
                 Ok(outcomes) => match outcomes.iter().find_map(|o| o.error.as_ref()) {

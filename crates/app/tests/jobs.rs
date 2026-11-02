@@ -65,6 +65,7 @@ fn node(id: &str, name: &str, kind: JobNodeKind, conn: Option<&str>, sql: &str) 
         export_folder: None,
         export_file: None,
         export_format: FileFormat::Csv,
+        ai_sql: false,
         last_run: None,
     }
 }

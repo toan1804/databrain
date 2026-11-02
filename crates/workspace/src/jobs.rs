@@ -238,11 +238,30 @@ pub struct JobNode {
     #[serde(default)]
     #[ts(as = "Option<FileFormat>", optional)]
     pub export_format: FileFormat,
+    /// The step's SQL (and a load's before/after SQL) was written by the AI
+    /// assistant or an MCP client. Such a step runs as the AI's SQL whoever
+    /// starts the run (by hand, on the schedule, from the command line): on
+    /// DuckDB the AI sandbox applies. Set when the AI creates or changes the
+    /// step; a step the user changes becomes the user's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub ai_sql: bool,
     #[serde(default)]
     pub last_run: Option<NodeRunSummary>,
 }
 
 impl JobNode {
+    /// Whether `other` runs the same SQL in the same place (what decides
+    /// who the SQL belongs to, see [`JobNode::ai_sql`]).
+    pub fn same_sql(&self, other: &JobNode) -> bool {
+        self.kind == other.kind
+            && self.sql.trim() == other.sql.trim()
+            && self.connection_id == other.connection_id
+            && self.target_connection_id == other.target_connection_id
+            && self.load_before_sql.as_deref().map(str::trim) == other.load_before_sql.as_deref().map(str::trim)
+            && self.load_after_sql.as_deref().map(str::trim) == other.load_after_sql.as_deref().map(str::trim)
+    }
+
     /// A step does one thing: drop the settings of the other actions, so a
     /// query step can't also carry a load target or a file name.
     pub fn keep_own_settings(&mut self) {
@@ -832,6 +851,7 @@ mod tests {
             export_folder: None,
             export_file: None,
             export_format: FileFormat::Csv,
+            ai_sql: false,
             last_run: None,
         }
     }

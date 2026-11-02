@@ -47,4 +47,12 @@ export_folder?: string | null,
  * Export: file name, `{step}`, `{job}`, `{date}`, `{time}` replaced
  * (empty = `{step}_{date}_{time}`); the extension is added when missing.
  */
-export_file?: string | null, export_format?: FileFormat, last_run?: NodeRunSummary | null, };
+export_file?: string | null, export_format?: FileFormat, 
+/**
+ * The step's SQL (and a load's before/after SQL) was written by the AI
+ * assistant or an MCP client. Such a step runs as the AI's SQL whoever
+ * starts the run (by hand, on the schedule, from the command line): on
+ * DuckDB the AI sandbox applies. Set when the AI creates or changes the
+ * step; a step the user changes becomes the user's.
+ */
+ai_sql?: boolean, last_run?: NodeRunSummary | null, };

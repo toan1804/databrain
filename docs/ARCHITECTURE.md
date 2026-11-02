@@ -280,6 +280,8 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 
 A job is a graph of steps stored in the `jobs` table. Each step runs a query, loads its upstream rows into a connection, or saves them to a file through DuckDB `COPY`. `crates/app/src/jobs.rs` runs the graph: independent branches run at the same time, a failure skips the steps after it, and each run keeps a log of up to 5,000 lines. Step results are outputs named after the step (`results.<step>`).
 
+Steps whose SQL the AI assistant or an MCP client wrote carry `JobNode::ai_sql` (set by `create_job` and `update_job`; a user save keeps it only while the SQL is unchanged). Such steps, and every step of a run the assistant starts, run with `Origin::Ai`, so the DuckDB sandbox applies on the schedule and by hand too, not only when the assistant started the run. Load steps pass the origin in `LoadSpec`, so AI-written before/after SQL on a DuckDB target is sandboxed as well.
+
 The in-app scheduler runs due jobs while the app is open. With background jobs on, `crates/app/src/background.rs` installs an OS timer that starts `databrain-jobs tick` every minute. A lease in the workspace makes sure a job runs in only one process.
 
 ---

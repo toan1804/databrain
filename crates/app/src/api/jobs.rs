@@ -27,9 +27,17 @@ pub fn get_job(state: &AppState, id: &str) -> Result<databrain_workspace::Job> {
     Ok(state.workspace.get_job(id)?)
 }
 
-pub fn save_job(state: &AppState, job: databrain_workspace::Job) -> Result<databrain_workspace::Job> {
+/// Save a job edited by the user (the AI's tools save through the
+/// workspace). A step keeps the AI's mark (`ai_sql`) only while its SQL is
+/// as the AI saved it; a step the user wrote or changed is the user's, and
+/// a user save can't mark a step as the AI's.
+pub fn save_job(state: &AppState, mut job: databrain_workspace::Job) -> Result<databrain_workspace::Job> {
+    let old = if job.id.is_empty() { None } else { state.workspace.get_job(&job.id).ok() };
+    for n in &mut job.nodes {
+        n.ai_sql = old.as_ref().and_then(|o| o.nodes.iter().find(|x| x.id == n.id)).is_some_and(|o| o.ai_sql && o.same_sql(n));
+    }
     // Names the job doesn't own yet must not be taken by other outputs.
-    let owned: Vec<String> = if job.id.is_empty() { vec![] } else { state.workspace.get_job(&job.id).map(|j| j.nodes.iter().map(|n| n.name.to_ascii_lowercase()).collect()).unwrap_or_default() };
+    let owned: Vec<String> = old.as_ref().map(|j| j.nodes.iter().map(|n| n.name.to_ascii_lowercase()).collect()).unwrap_or_default();
     for n in &job.nodes {
         if owned.contains(&n.name.to_ascii_lowercase()) {
             continue;
