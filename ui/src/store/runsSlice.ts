@@ -1,5 +1,5 @@
 import type { StateCreator } from "zustand";
-import { api, isTauri, toError } from "../lib/api";
+import { announceSshHostKey, api, isTauri, toError } from "../lib/api";
 import { computeRunTips, slowStatements } from "../queryTips";
 import type { JobEvent, OutputInfo, ParamValue } from "../lib/types";
 import { errorRange } from "../lib/util";
@@ -374,6 +374,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
         case "statement_failed": {
           const cancelled = e.error.kind === "cancelled";
           if (e.error.code === "oracle_client_missing") setTimeout(() => set({ oracleClientPrompt: true }), 0);
+          announceSshHostKey(e.error);
           upd(e.index, {
             status: cancelled ? "cancelled" : "error",
             error: e.error,

@@ -174,3 +174,8 @@ pub fn disconnect(state: &AppState, id: &str) {
 pub fn reconnect(state: &AppState, id: &str) -> usize {
     state.engine.reconnect(id)
 }
+
+/// The user checked an SSH server's key fingerprint and trusts it.
+pub fn trust_ssh_host_key(state: &AppState, host: &str, port: u16, fingerprint: &str) -> Result<usize> {
+    state.engine.trust_ssh_host_key(host, port, fingerprint)
+}

@@ -71,6 +71,15 @@ export function useConnectionForm(initial: ConnectionProfile | null, folderId: s
   const [ssh, setSsh] = useState<SshConfig>(
     initial?.config.ssh ?? { host: "", port: 22, user: "", auth: { method: "agent" }, host_key_fingerprint: null },
   );
+  // A key the user trusted for this form's SSH server (an unsaved connection being tested).
+  useEffect(() => {
+    const on = (e: Event) => {
+      const p = (e as CustomEvent<{ host: string; port: number; fingerprint: string }>).detail;
+      setSsh((s) => (!s.host_key_fingerprint && s.host.trim().toLowerCase() === p.host.toLowerCase() && s.port === p.port ? { ...s, host_key_fingerprint: p.fingerprint } : s));
+    };
+    window.addEventListener("db:ssh-host-key-trusted", on);
+    return () => window.removeEventListener("db:ssh-host-key-trusted", on);
+  }, []);
   const [sshSecret, setSshSecret] = useState("");
 
   const [ssl, setSsl] = useState<SslMode>(initial?.config.ssl_mode ?? "prefer");

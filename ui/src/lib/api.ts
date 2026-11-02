@@ -123,6 +123,25 @@ export function toError(e: unknown): EngineError {
   return { kind: "internal", message: String(e) };
 }
 
+/** An SSH server whose key is not trusted yet, from the error that refused it. */
+export interface SshHostKeyPrompt {
+  host: string;
+  port: number;
+  fingerprint: string;
+}
+
+export function sshHostKeyPrompt(err: EngineError): SshHostKeyPrompt | null {
+  if (err.code !== "ssh_host_key_unknown") return null;
+  const m = /server (\S+):(\d+) is not trusted yet\. Its host key fingerprint is (SHA256:[A-Za-z0-9+/=]+)/.exec(err.message);
+  return m ? { host: m[1], port: Number(m[2]), fingerprint: m[3] } : null;
+}
+
+/** Any command can hit an SSH server not trusted yet: the app asks the user. */
+export function announceSshHostKey(err: EngineError) {
+  const p = sshHostKeyPrompt(err);
+  if (p && typeof window !== "undefined") window.dispatchEvent(new CustomEvent("db:ssh-host-key", { detail: p }));
+}
+
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   try {
     return await invoke<T>(cmd, args);
@@ -130,6 +149,7 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
     const err = toError(e);
     // Any command can hit a missing Oracle client (connect, explorer, test).
     if (err.code === "oracle_client_missing" && typeof window !== "undefined") window.dispatchEvent(new CustomEvent("db:oracle-client-missing"));
+    announceSshHostKey(err);
     throw err;
   }
 }
@@ -165,6 +185,8 @@ export const api = {
   disconnect: (id: string) => call<void>("disconnect", { id }),
   /** Sign in again on the next call (metadata session and idle tabs), so rights granted since the login apply. */
   reconnect: (id: string) => call<number>("reconnect", { id }),
+  /** Pin a checked SSH host key on the saved connections through `host:port` that have none. */
+  trustSshHostKey: (host: string, port: number, fingerprint: string) => call<number>("trust_ssh_host_key", { host, port, fingerprint }),
 
   listSchemas: (id: string) => call<SchemaInfo[]>("list_schemas", { id }),
   listObjects: (id: string, schema: string) => call<DbObject[]>("list_objects", { id, schema }),

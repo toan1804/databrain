@@ -178,6 +178,7 @@ pub fn run() {
             commands::connections::connect,
             commands::connections::disconnect,
             commands::connections::reconnect,
+            commands::connections::trust_ssh_host_key,
             commands::explorer::list_schemas,
             commands::explorer::list_objects,
             commands::explorer::list_catalogs,

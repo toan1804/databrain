@@ -1,6 +1,6 @@
 import type { StateCreator } from "zustand";
 import { DEFAULT_APPEARANCE, applyAppearance, parseAppearance, type Appearance } from "../lib/appearance";
-import { api, isTauri } from "../lib/api";
+import { api, isTauri, type SshHostKeyPrompt } from "../lib/api";
 import { DEFAULT_SLOW_QUERY_SECONDS } from "../queryTips";
 import { uid } from "../lib/util";
 import { parseSnippets, type Snippet } from "../lib/snippets";
@@ -39,6 +39,8 @@ export interface UiSlice {
   paletteOpen: boolean;
   /** Show the Oracle Instant Client install prompt. */
   oracleClientPrompt: boolean;
+  /** An SSH server whose key the user is asked to check and trust. */
+  sshHostKey: SshHostKeyPrompt | null;
   toast: (message: string, kind?: Toast["kind"]) => void;
   dismissToast: (id: string) => void;
   setTheme: (t: Theme) => void;
@@ -61,6 +63,7 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   quickFilters: {},
   sidebarPanel: "connections",
   oracleClientPrompt: false,
+  sshHostKey: null,
   toasts: [],
   confirm: null,
   paletteOpen: false,
