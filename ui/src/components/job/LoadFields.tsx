@@ -120,14 +120,24 @@ export const LOAD_MODES: { mode: LoadMode; text: string; hint: string }[] = [
   { mode: "replace", text: "Replace table", hint: "Drop the table if it exists and create it again from the rows' columns, then insert." },
   { mode: "update", text: "Update by key", hint: "The table must exist. Rows whose key columns match are updated; the others are ignored." },
   { mode: "merge", text: "Merge (upsert) by key", hint: "The table must exist. Rows whose key columns match are updated, the others inserted." },
+  {
+    mode: "sync",
+    text: "Sync (mirror) by key",
+    hint: "The table must exist. Like Merge, then the table's rows whose key isn't among the rows are deleted: it ends up holding exactly these rows. A step without rows is refused.",
+  },
 ];
+
+/** Modes that match rows by key columns. */
+export function isKeyedMode(mode: LoadMode | undefined | null): boolean {
+  return mode === "update" || mode === "merge" || mode === "sync";
+}
 
 /** Modes a target of `kind` can do; `current` stays listed (marked) so a
  * step saved with it shows what it has. */
 export function loadModesFor(kind: string | undefined, current?: LoadMode): { mode: LoadMode; text: string; hint: string }[] {
   const keyed = traitsOf(kind).load?.keyed !== false;
   return LOAD_MODES.flatMap((m) => {
-    const ok = keyed || (m.mode !== "update" && m.mode !== "merge");
+    const ok = keyed || !isKeyedMode(m.mode);
     if (ok) return [m];
     if (m.mode !== current) return [];
     return [{ ...m, text: `${m.text} (not on ${traitsOf(kind).name})`, hint: `${traitsOf(kind).name} can't update rows by key: choose another mode.` }];
@@ -140,7 +150,7 @@ export function LoadFields({ job, node, onChange }: { job: Job; node: JobNode; o
   const target = connections.find((c) => c.id === node.target_connection_id);
   const modes = loadModesFor(target?.config.kind, node.load_mode);
   const mode = modes.find((m) => m.mode === node.load_mode) ?? LOAD_MODES[0];
-  const keyed = node.load_mode === "update" || node.load_mode === "merge";
+  const keyed = isKeyedMode(node.load_mode);
   const [keys, setKeys] = useState((node.key_columns ?? []).join(", "));
   // Reset the text for another step (not while this one is being edited).
   const savedKeys = useEvent(() => (node.key_columns ?? []).join(", "));
@@ -387,13 +397,15 @@ export function LoadTargetCheck({
       ? "exists: it is dropped and created again from the rows' columns"
       : mode === "truncate"
         ? "exists: its rows are deleted, then the rows inserted"
-        : mode === "update" || mode === "merge"
-          ? "exists: rows are matched by the key columns"
+        : isKeyedMode(mode)
+          ? mode === "sync"
+            ? "exists: rows are matched by the key columns, and its rows missing from them are deleted"
+            : "exists: rows are matched by the key columns"
           : "exists: the rows are added to it"
     : missing
       ? creates
         ? "doesn't exist yet: it is created from the rows' columns"
-        : `doesn't exist: create it first${mode === "append" || mode === "truncate" ? ', or turn on "Create the table"' : ` (${mode === "update" ? "Update" : "Merge"} doesn't create tables)`}`
+        : `doesn't exist: create it first${mode === "append" || mode === "truncate" ? ', or turn on "Create the table"' : ` (${mode === "update" ? "Update" : mode === "sync" ? "Sync" : "Merge"} doesn't create tables)`}`
       : "";
   return (
     <div className="space-y-0.5 text-[11.5px]" role="status">

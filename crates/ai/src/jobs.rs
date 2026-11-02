@@ -47,7 +47,7 @@ pub fn create_job_schema() -> Value {
                         "after": {"type": "array", "items": {"type": "string"}, "description": "Step names this step runs after (its inputs)"},
                         "target_connection": {"type": "string", "description": "load: connection to write into"},
                         "target_table": {"type": "string", "description": "load: schema.table to write into"},
-                        "load_mode": {"type": "string", "enum": ["append", "truncate", "replace", "update", "merge"], "description": "load: append (default; creates a missing table), truncate (delete rows, then insert), replace (drop and create), update / merge (by key_columns; the table must exist)"},
+                        "load_mode": {"type": "string", "enum": ["append", "truncate", "replace", "update", "merge", "sync"], "description": "load: append (default; creates a missing table), truncate (delete rows, then insert), replace (drop and create), update / merge (by key_columns; the table must exist), sync (merge by key_columns, then delete the table's rows whose key isn't among the rows: the table ends up holding exactly these rows; use it to keep a copy in step)"},
                         "key_columns": {"type": "array", "items": {"type": "string"}, "description": "load update/merge: columns that identify a row"},
                         "create_table": {"type": "boolean", "description": "load append/truncate: create the table when missing (default true)"},
                         "before_sql": {"type": "string", "description": "load: SQL run on the target before writing (e.g. delete a day's rows)"},
@@ -251,6 +251,7 @@ pub fn build_job(args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Re
                     "replace" => LoadMode::Replace,
                     "update" => LoadMode::Update,
                     "merge" | "upsert" => LoadMode::Merge,
+                    "sync" | "mirror" => LoadMode::Sync,
                     other => return Err(AiError::Policy(format!("step \"{n}\": unknown load_mode \"{other}\""))),
                 };
                 let keys = strings(st, "key_columns");
@@ -440,6 +441,7 @@ pub fn spec_of(job: &Job, conns: &[ConnRef]) -> Value {
                         LoadMode::Replace => "replace",
                         LoadMode::Update => "update",
                         LoadMode::Merge => "merge",
+                        LoadMode::Sync => "sync",
                     });
                     if !n.key_columns.is_empty() {
                         v["key_columns"] = json!(n.key_columns);

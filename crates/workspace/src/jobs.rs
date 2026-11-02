@@ -69,12 +69,15 @@ pub enum LoadMode {
     /// Update rows whose `key_columns` match and insert the others (upsert);
     /// the table must exist.
     Merge,
+    /// Make the table hold exactly the rows by key: Merge, then delete the
+    /// table's rows whose key isn't among the rows. The table must exist.
+    Sync,
 }
 
 impl LoadMode {
     /// Modes matching rows by `key_columns`.
     pub fn needs_keys(self) -> bool {
-        matches!(self, LoadMode::Update | LoadMode::Merge)
+        matches!(self, LoadMode::Update | LoadMode::Merge | LoadMode::Sync)
     }
     /// Modes writing into a table that must already exist.
     pub fn needs_table(self) -> bool {

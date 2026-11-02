@@ -290,3 +290,63 @@ async fn clickhouse_refuses_keyed_loads_up_front() {
     }
     assert!(st.engine.connected_ids().iter().all(|c| c != &target), "refused before connecting");
 }
+
+/// Sync by key: the table ends up holding exactly the rows (changed ones
+/// updated, new ones inserted, the others deleted) and the report counts
+/// the deletions; a step without rows is refused rather than emptying it.
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_mirrors_the_rows_by_key() {
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    let duck = st.engine.results_connection().unwrap().id;
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
+    c.file_path = Some(dir.path().join("sync.db").to_string_lossy().into_owned());
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "copy".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    let target =
+        api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    let args = |mode: LoadMode| LoadResultArgs {
+        target_connection_id: target.clone(),
+        table: "people".into(),
+        mode,
+        key_columns: vec!["id".into()],
+        create_table: true,
+    };
+
+    let first = run(&st, &duck, "select i as id, 'name ' || i as name from range(25) t(i)").await.result.unwrap();
+    api::load_result(&st, &first.id, args(LoadMode::Append), "s1").await.unwrap();
+    // Source now: ids 0..19 (id 3 renamed) and 30..32; ids 20..24 are gone.
+    let second = run(
+        &st,
+        &duck,
+        "select i as id, case when i = 3 then 'renamed' else 'name ' || i end as name from range(20) t(i) \
+         union all select i, 'new ' || i from range(30, 33) t(i)",
+    )
+    .await
+    .result
+    .unwrap();
+    let rep = api::load_result(&st, &second.id, args(LoadMode::Sync), "s2").await.unwrap();
+    assert_eq!(rep.deleted, 5, "{rep:?}");
+    assert!(rep.notices.iter().any(|n| n.contains("5 deleted")), "{:?}", rep.notices);
+    let check = run(&st, &target, "select count(*) as n, sum(id) as ids, max(case when id = 3 then name end) as three from people").await.result.unwrap();
+    let page = api::fetch_page(&st, check.id, Default::default(), 0, 1).await.unwrap();
+    let ids: i64 = (0..20).sum::<i64>() + 30 + 31 + 32;
+    assert_eq!(page.rows[0], vec![Some("23".to_string()), Some(ids.to_string()), Some("renamed".to_string())]);
+
+    // No rows: refused, nothing deleted.
+    let empty = run(&st, &duck, "select 1 as id, 'x' as name where false").await.result.unwrap();
+    let e = api::load_result(&st, &empty.id, args(LoadMode::Sync), "s3").await.unwrap_err();
+    assert!(e.message.contains("Sync would delete every row"), "{}", e.message);
+    let n = run(&st, &target, "select count(*) from people").await.result.unwrap();
+    assert_eq!(api::fetch_page(&st, n.id, Default::default(), 0, 1).await.unwrap().rows[0][0].as_deref(), Some("23"));
+}

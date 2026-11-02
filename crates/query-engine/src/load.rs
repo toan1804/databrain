@@ -63,6 +63,9 @@ pub struct LoadReport {
     /// database reports them (the staged rows when it doesn't).
     #[ts(as = "f64")]
     pub rows: u64,
+    /// Sync: rows of the table deleted because their key isn't among the rows.
+    #[ts(as = "f64")]
+    pub deleted: u64,
     pub created_table: bool,
     pub transaction: bool,
     pub notices: Vec<String>,
@@ -185,6 +188,8 @@ enum ActKind {
     Stage,
     /// Update/merge from the staging table: its affected rows are the step's rows.
     Write,
+    /// Sync's delete of the rows missing from the step's rows (counted apart).
+    Remove,
     /// Other DML (delete all rows).
     Dml,
 }
@@ -224,6 +229,7 @@ fn mode_text(m: LoadMode) -> &'static str {
         LoadMode::Replace => "replace table",
         LoadMode::Update => "update by key",
         LoadMode::Merge => "merge by key",
+        LoadMode::Sync => "sync by key (merge, then delete rows missing from the step's rows)",
     }
 }
 
@@ -387,18 +393,23 @@ impl QueryEngine {
             if let Some(tx) = &p.tx {
                 timed(&p.session, "Commit", tx.commit, cancel, obs).await.map_err(|e| labelled("Commit", e))?;
             }
-            Ok::<u64, EngineError>(n)
+            Ok::<(u64, u64), EngineError>(n)
         }
         .await;
         match result {
-            Ok(n) => {
+            Ok((n, deleted)) => {
                 let mut notices = p.notices.clone();
                 if p.creates {
                     let c = created_notice(&p, rows);
                     obs.event(LoadEvent::Info(c.clone()));
                     notices.push(c);
                 }
-                Ok(LoadReport { rows: n, created_table: p.creates, transaction: p.tx.is_some(), notices })
+                if p.plan.iter().any(|a| matches!(a, Act::Sql { kind: ActKind::Remove, .. })) {
+                    let d = format!("Sync: {n} rows written, {deleted} deleted (their key isn't among the step's rows)");
+                    obs.event(LoadEvent::Info(d.clone()));
+                    notices.push(d);
+                }
+                Ok(LoadReport { rows: n, deleted, created_table: p.creates, transaction: p.tx.is_some(), notices })
             }
             Err(e) => {
                 if p.tx.is_some() && e.kind != "cancelled" {
@@ -842,8 +853,21 @@ impl QueryEngine {
                     None => plan.push(no_rows("Create table and insert rows")),
                 }
             }
-            LoadMode::Update | LoadMode::Merge => {
-                let what = if spec.mode == LoadMode::Update { "Update" } else { "Merge" };
+            LoadMode::Update | LoadMode::Merge | LoadMode::Sync => {
+                let what = match spec.mode {
+                    LoadMode::Update => "Update",
+                    LoadMode::Merge => "Merge",
+                    _ => "Sync",
+                };
+                // No rows would delete the whole table: almost always an upstream mistake.
+                if spec.mode == LoadMode::Sync && rows.is_some_and(|r| r.count() == 0) {
+                    return Err(EngineError::new(
+                        "invalid",
+                        format!(
+                            "The step has no rows: Sync would delete every row of {table} in {conn}. Use \"Delete rows, then insert\" to empty it on purpose."
+                        ),
+                    ));
+                }
                 if !exists {
                     if before.is_empty() {
                         return Err(EngineError::new("invalid", format!("{what} needs an existing table: {table} doesn't exist in {conn}{}.", reason())));
@@ -872,6 +896,7 @@ impl QueryEngine {
                             sqlgen::merge_from_stage_sql(dialect, &table, &stage, cols, &keys)
                         };
                         let n = writes.len();
+                        let sync = spec.mode == LoadMode::Sync;
                         for (i, sql) in writes.into_iter().enumerate() {
                             let label = match (spec.mode, n, i) {
                                 (LoadMode::Update, _, _) => "Update matching rows".to_string(),
@@ -880,6 +905,13 @@ impl QueryEngine {
                                 _ => "Insert new rows".to_string(),
                             };
                             plan.push(Act::Sql { label, sql, kind: ActKind::Write });
+                        }
+                        if sync {
+                            plan.push(Act::Sql {
+                                label: "Delete rows missing from the step's rows".into(),
+                                sql: sqlgen::delete_missing_sql(dialect, &table, &stage, &keys),
+                                kind: ActKind::Remove,
+                            });
                         }
                         plan.push(Act::Sql { label: "Drop staging table".into(), sql: sqlgen::drop_stage_sql(dialect, &stage), kind: ActKind::Stage });
                     }
@@ -920,8 +952,16 @@ fn created_notice(p: &Prepared, rows: &LoadRows) -> String {
 
 /// Run the plan; rows written. With `record`, each step is recorded and the
 /// run stops at the first error (dry run).
-async fn run_plan(p: &Prepared, rows: &LoadRows, cancel: &CancellationToken, mut record: Option<&mut Vec<LoadCheck>>, obs: &dyn LoadObserver) -> Result<u64> {
+/// Run the plan; returns the rows written and the rows Sync deleted.
+async fn run_plan(
+    p: &Prepared,
+    rows: &LoadRows,
+    cancel: &CancellationToken,
+    mut record: Option<&mut Vec<LoadCheck>>,
+    obs: &dyn LoadObserver,
+) -> Result<(u64, u64)> {
     let mut inserted = 0u64;
+    let mut removed = 0u64;
     let mut staged = 0u64;
     let mut affected: Option<u64> = None;
     let push = |record: &mut Option<&mut Vec<LoadCheck>>, label: &str, sql: &str, r: &Result<()>, note: Option<String>| {
@@ -941,8 +981,10 @@ async fn run_plan(p: &Prepared, rows: &LoadRows, cancel: &CancellationToken, mut
         match act {
             Act::Sql { label, sql, kind } => {
                 let r = timed(&p.session, label, sql, cancel, obs).await;
-                if let (Ok(Some(n)), ActKind::Write) = (&r, kind) {
-                    affected = Some(affected.unwrap_or(0) + n);
+                match (&r, kind) {
+                    (Ok(Some(n)), ActKind::Write) => affected = Some(affected.unwrap_or(0) + n),
+                    (Ok(Some(n)), ActKind::Remove) => removed += n,
+                    _ => {}
                 }
                 let r = r.map(|_| ());
                 push(&mut record, label, sql, &r, None);
@@ -1008,7 +1050,8 @@ async fn run_plan(p: &Prepared, rows: &LoadRows, cancel: &CancellationToken, mut
             }
         }
     }
-    Ok(if staged > 0 || p.plan.iter().any(|a| matches!(a, Act::Insert { target: false, .. })) { affected.unwrap_or(staged) } else { inserted })
+    let written = if staged > 0 || p.plan.iter().any(|a| matches!(a, Act::Insert { target: false, .. })) { affected.unwrap_or(staged) } else { inserted };
+    Ok((written, removed))
 }
 
 /// Dry run without a transaction: `EXPLAIN` each statement the engine can

@@ -8,4 +8,8 @@ export type LoadReport = {
  * Rows inserted (Append/Truncate/Replace), or updated/merged as the
  * database reports them (the staged rows when it doesn't).
  */
-rows: number, created_table: boolean, transaction: boolean, notices: Array<string>, };
+rows: number, 
+/**
+ * Sync: rows of the table deleted because their key isn't among the rows.
+ */
+deleted: number, created_table: boolean, transaction: boolean, notices: Array<string>, };

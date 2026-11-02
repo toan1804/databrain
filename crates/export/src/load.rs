@@ -231,6 +231,28 @@ pub fn drop_stage_sql(dialect: ConnectorKind, stage: &str) -> String {
     }
 }
 
+/// Delete the rows of `target` whose `keys` match no row of `stage` (Sync).
+/// A target row with a NULL key matches nothing, so it is deleted too.
+pub fn delete_missing_sql(dialect: ConnectorKind, target: &str, stage: &str, keys: &[String]) -> String {
+    let q = |c: &str| quote_ident(dialect, c);
+    let (t, s) = (quote_path(dialect, target), quote_path(dialect, stage));
+    match lt(dialect).merge {
+        // SQL Server: the alias form; BigQuery: `DELETE t alias`.
+        MergeStyle::MergeSemicolon | MergeStyle::MergeNoInto => {
+            let on = keys.iter().map(|k| format!("src.{} = tg.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
+            let head = if lt(dialect).merge == MergeStyle::MergeSemicolon { format!("DELETE tg FROM {t} AS tg") } else { format!("DELETE {t} tg") };
+            format!("{head} WHERE NOT EXISTS (SELECT 1 FROM {s} AS src WHERE {on})")
+        }
+        // Elsewhere the subquery names the target by its table name (no
+        // schema or catalog: four-part column names aren't accepted everywhere).
+        _ => {
+            let name = databrain_connector_core::split_path(dialect, target).pop().map(|n| quote_ident(dialect, &n)).unwrap_or_else(|| t.clone());
+            let on = keys.iter().map(|k| format!("src.{} = {name}.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
+            format!("DELETE FROM {t} WHERE NOT EXISTS (SELECT 1 FROM {s} src WHERE {on})")
+        }
+    }
+}
+
 /// Engines that update/merge with a native `MERGE`; the others use
 /// `UPDATE … FROM` / `UPDATE … JOIN` and `INSERT … WHERE NOT EXISTS`.
 fn native_merge(dialect: ConnectorKind) -> bool {
@@ -542,6 +564,29 @@ mod tests {
         assert!(is_load_target(K::Clickhouse));
         assert!(!keyed_loads(K::Clickhouse));
         assert!(keyed_loads(K::Postgres));
+    }
+
+    /// Sync's delete of the rows missing from the stage, per dialect.
+    #[test]
+    fn delete_missing_per_dialect() {
+        use ConnectorKind as K;
+        let keys = vec!["id".to_string(), "day".to_string()];
+        assert_eq!(
+            delete_missing_sql(K::Postgres, "app.t", "s", &keys),
+            r#"DELETE FROM "app"."t" WHERE NOT EXISTS (SELECT 1 FROM "s" src WHERE src."id" = "t"."id" AND src."day" = "t"."day")"#
+        );
+        assert_eq!(
+            delete_missing_sql(K::Mssql, "dbo.t", "#s", &keys[..1]),
+            "DELETE tg FROM [dbo].[t] AS tg WHERE NOT EXISTS (SELECT 1 FROM [#s] AS src WHERE src.[id] = tg.[id])"
+        );
+        assert_eq!(
+            delete_missing_sql(K::Bigquery, "ds.t", "ds.s", &keys[..1]),
+            "DELETE `ds`.`t` tg WHERE NOT EXISTS (SELECT 1 FROM `ds`.`s` AS src WHERE src.`id` = tg.`id`)"
+        );
+        assert!(
+            delete_missing_sql(K::Mysql, "t", "s", &keys[..1])
+                .starts_with("DELETE FROM `t` WHERE NOT EXISTS (SELECT 1 FROM `s` src WHERE src.`id` = `t`.`id`)")
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ import { api, onLoadProgress, toError } from "../lib/api";
 import type { LoadDryRun, LoadMode, LoadReport, ResultInfo } from "../lib/types";
 import { formatCount, uid } from "../lib/util";
 import { useStore } from "../store";
-import { DryRunReport, LoadTargetCheck, loadModesFor, loadTargetBlocked, useLoadTarget } from "./job/LoadFields";
+import { DryRunReport, LoadTargetCheck, isKeyedMode, loadModesFor, loadTargetBlocked, useLoadTarget } from "./job/LoadFields";
 import { Modal } from "./ui";
 
 /** A table name to suggest: the output's name, else the table the SQL reads. */
@@ -40,7 +40,7 @@ export function LoadIntoDialog({ info, sql, outputName, onClose }: { info: Resul
   useEffect(() => {
     if (!modes.some((m) => m.mode === mode)) setMode("append");
   }, [modes, mode]);
-  const keyed = mode === "update" || mode === "merge";
+  const keyed = isKeyedMode(mode);
   const hint = modes.find((m) => m.mode === mode)?.hint;
   const args = { target_connection_id: target, table, mode, key_columns: keyed ? keys : [], create_table: create };
   const targetCheck = useLoadTarget(target, table);
@@ -116,6 +116,7 @@ export function LoadIntoDialog({ info, sql, outputName, onClose }: { info: Resul
           <p>
             {formatCount(report.rows)} rows written into <span className="font-mono">{table}</span> on {targetName}
             {report.created_table ? " (table created)" : ""}
+            {report.deleted > 0 ? `, ${formatCount(report.deleted)} deleted` : ""}
             {report.transaction ? ", in one transaction" : ""}.
           </p>
           {report.notices.map((n, i) => (
