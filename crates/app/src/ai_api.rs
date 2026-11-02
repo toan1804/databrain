@@ -50,13 +50,19 @@ impl AiState {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(id.clone(), tx);
+        // Removed however this ends: answered, timed out, or dropped (Stop).
+        struct Forget<'a>(&'a Mutex<std::collections::HashMap<String, oneshot::Sender<Value>>>, String);
+        impl Drop for Forget<'_> {
+            fn drop(&mut self) {
+                self.0.lock().remove(&self.1);
+            }
+        }
+        let _forget = Forget(&self.pending, id.clone());
         let mut p = payload;
         p["type"] = kind.into();
         p["request_id"] = id.clone().into();
         ui.emit(AI_EVENT, p);
-        let r = tokio::time::timeout(timeout, rx).await.ok().and_then(|r| r.ok());
-        self.pending.lock().remove(&id);
-        r
+        tokio::time::timeout(timeout, rx).await.ok().and_then(|r| r.ok())
     }
 }
 

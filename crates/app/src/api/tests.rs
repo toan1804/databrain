@@ -1330,3 +1330,56 @@ async fn run_query_on_duckdb_checks_output_sources() {
     let o = ctx.call("run_query", &serde_json::json!({"sql": "select * from results.open"})).await;
     assert!(!o.content.starts_with("ERROR"), "{}", o.content);
 }
+
+/// Stop ends the wait for an approval at once (it waited up to ten
+/// minutes), for a question the user never answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_ends_the_approval_wait() {
+    use databrain_ai::{Caller, ToolContext, ToolHost};
+    struct Never;
+    #[async_trait::async_trait]
+    impl ToolHost for Never {
+        async fn approve(&self, _: &str, _: &str, _: &serde_json::Value) -> Option<serde_json::Value> {
+            std::future::pending().await
+        }
+        async fn propose_edit(&self, _: &serde_json::Value) -> bool {
+            std::future::pending().await
+        }
+    }
+    let (st, _sink, dir) = state();
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(dir.path().join("w.db").to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let p = save_profile(&st, "asks", cfg, None);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let ctx = ToolContext {
+        engine: st.engine.clone(),
+        hub: st.hub.clone(),
+        profile: st.workspace.get_connection(&p.id).unwrap(),
+        session_id: Some("s".into()),
+        caller: Caller::Agent,
+        host: std::sync::Arc::new(Never),
+        cancel: cancel.clone(),
+        results: parking_lot::Mutex::new(vec![]),
+    };
+    let stop = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.cancel();
+    });
+    let started = std::time::Instant::now();
+    let o = tokio::time::timeout(Duration::from_secs(5), ctx.call("run_query", &serde_json::json!({"sql": "select 1"}))).await.expect("Stop ends the wait");
+    assert!(o.content.starts_with("ERROR"), "{}", o.content);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let o = tokio::time::timeout(Duration::from_secs(5), ctx.call("write_editor", &serde_json::json!({"sql": "select 2"}))).await.expect("already stopped");
+    assert!(o.content.starts_with("ERROR"), "{}", o.content);
+}
