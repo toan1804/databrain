@@ -774,6 +774,12 @@ async fn ai_job_runs_are_sandboxed() {
     let saved = save_job(&st, edited).unwrap();
     assert!(saved.nodes.iter().find(|n| n.id == "s3").unwrap().ai_sql, "unchanged: still the AI's");
     assert!(!saved.nodes.iter().find(|n| n.id == "s1").unwrap().ai_sql, "a user save can't mark a step as the AI's");
+    // "Trust this SQL": the user clears the mark on purpose.
+    let mut trusted = saved.clone();
+    trusted.nodes.iter_mut().find(|n| n.id == "s3").unwrap().ai_sql = false;
+    let after = save_job(&st, trusted).unwrap();
+    assert!(!after.nodes.iter().find(|n| n.id == "s3").unwrap().ai_sql);
+    st.workspace.save_job(saved.clone()).unwrap();
     // The user changes the SQL: the step is theirs, and reads files again.
     let mut edited = saved;
     edited.nodes.iter_mut().find(|n| n.id == "s3").unwrap().sql = format!("select a from read_csv('{}')", csv.display());

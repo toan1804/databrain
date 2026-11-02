@@ -729,7 +729,53 @@ impl Workspace {
         // Best effort: a failure must not keep the workspace from opening.
         let _ = ws.redact_kept_sql();
         let _ = ws.redact_kept_transcripts();
+        let _ = ws.mark_ai_written_jobs();
         Ok(ws)
+    }
+
+    /// Once: jobs saved before steps carried `JobNode::ai_sql` lost who
+    /// wrote their SQL. Every step of a job the AI assistant (or an MCP
+    /// client) created or changed, as the audit log records it by job name,
+    /// is marked as the AI's, so its DuckDB SQL runs in the sandbox on the
+    /// schedule too. Marking only restricts: a step wrongly marked (a job of
+    /// yours with the same name) is cleared in its step panel. Returns the
+    /// names of the jobs marked.
+    fn mark_ai_written_jobs(&self) -> Result<Vec<String>> {
+        const DONE: &str = "ai_jobs_marked_v1";
+        let done: bool = self.conn.lock().query_row("SELECT count(*) > 0 FROM maintenance WHERE name = ?1", [DONE], |r| r.get(0))?;
+        if done {
+            return Ok(vec![]);
+        }
+        let names: std::collections::HashSet<String> = {
+            let c = self.conn.lock();
+            let mut st = c.prepare(
+                "SELECT args_json FROM ai_audit WHERE tool IN ('create_job', 'update_job') AND decision IN ('approved', 'approved by MCP client', 'allowed')",
+            )?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.iter()
+                .filter_map(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+                .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(|n| n.trim().to_lowercase()))
+                .filter(|n| !n.is_empty())
+                .collect()
+        };
+        let mut marked = Vec::new();
+        if !names.is_empty() {
+            let ids: Vec<(String, String)> = {
+                let c = self.conn.lock();
+                let mut st = c.prepare("SELECT id, name FROM jobs")?;
+                st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+            };
+            for (id, _) in ids.into_iter().filter(|(_, n)| names.contains(&n.trim().to_lowercase())) {
+                let job = self.get_job(&id)?;
+                if job.nodes.iter().all(|n| n.ai_sql) {
+                    continue;
+                }
+                self.set_ai_sql_all(&job)?;
+                marked.push(job.name);
+            }
+        }
+        self.conn.lock().execute("INSERT OR IGNORE INTO maintenance (name, done_at) VALUES (?1, ?2)", params![DONE, now_ms()])?;
+        Ok(marked)
     }
 
     /// Once: remove passwords and keys from AI conversations kept before

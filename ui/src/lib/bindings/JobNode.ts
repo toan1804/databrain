@@ -53,6 +53,7 @@ export_file?: string | null, export_format?: FileFormat,
  * assistant or an MCP client. Such a step runs as the AI's SQL whoever
  * starts the run (by hand, on the schedule, from the command line): on
  * DuckDB the AI sandbox applies. Set when the AI creates or changes the
- * step; a step the user changes becomes the user's.
+ * step; a step the user changes becomes the user's, and the user can
+ * clear it ("Trust this SQL"), never set it.
  */
 ai_sql?: boolean, last_run?: NodeRunSummary | null, };

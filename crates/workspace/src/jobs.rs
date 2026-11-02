@@ -242,7 +242,8 @@ pub struct JobNode {
     /// assistant or an MCP client. Such a step runs as the AI's SQL whoever
     /// starts the run (by hand, on the schedule, from the command line): on
     /// DuckDB the AI sandbox applies. Set when the AI creates or changes the
-    /// step; a step the user changes becomes the user's.
+    /// step; a step the user changes becomes the user's, and the user can
+    /// clear it ("Trust this SQL"), never set it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[ts(as = "Option<bool>", optional)]
     pub ai_sql: bool,
@@ -616,6 +617,18 @@ impl Workspace {
         Ok(self.job_step_names()?.into_iter().find(|(n, _)| *n == key).map(|(_, o)| o))
     }
 
+    /// Mark every step of `job` as the AI's SQL, keeping the rest of the
+    /// job and its edit time (the schedule counts from it).
+    pub(crate) fn set_ai_sql_all(&self, job: &Job) -> Result<()> {
+        let mut nodes = job.nodes.clone();
+        for n in &mut nodes {
+            n.ai_sql = true;
+        }
+        let spec = serde_json::to_string(&Spec { nodes, edges: job.edges.clone(), schedule: job.schedule.clone() }).map_err(|e| Error::Invalid(e.to_string()))?;
+        self.conn.lock().execute("UPDATE jobs SET spec_json = ?2 WHERE id = ?1", params![job.id, spec])?;
+        Ok(())
+    }
+
     pub fn get_job(&self, id: &str) -> Result<Job> {
         let c = self.conn.lock();
         c.query_row("SELECT id, name, spec_json, last_scheduled_at, created_at, updated_at FROM jobs WHERE id = ?1", [id], |r| {
@@ -854,6 +867,42 @@ mod tests {
             ai_sql: false,
             last_run: None,
         }
+    }
+
+    /// Jobs saved before steps recorded who wrote their SQL: those the
+    /// audit log shows the AI created or changed (approved) are marked once,
+    /// keeping their edit time; others, and denied proposals, are not.
+    #[test]
+    fn marks_jobs_the_ai_wrote_before_steps_recorded_it() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let mut ai = job(vec![node("a1"), node("a2")], vec![(0, 1)]);
+        ai.name = "Nightly compare".into();
+        let ai = ws.save_job(ai).unwrap();
+        let mut mine = job(vec![node("m1")], vec![]);
+        mine.name = "Mine".into();
+        let mine = ws.save_job(mine).unwrap();
+        let mut denied = job(vec![node("d1")], vec![]);
+        denied.name = "Proposed".into();
+        let denied = ws.save_job(denied).unwrap();
+        let args = |n: &str| serde_json::json!({"name": n, "preview": "…"});
+        ws.add_audit(None, None, "create_job", &args(" nightly COMPARE "), "approved", None).unwrap();
+        ws.add_audit(None, None, "update_job", &args("Proposed"), "denied", None).unwrap();
+        ws.add_audit(None, None, "run_job", &args("Mine"), "approved", None).unwrap();
+        ws.conn.lock().execute("DELETE FROM maintenance WHERE name = 'ai_jobs_marked_v1'", []).unwrap();
+
+        assert_eq!(ws.mark_ai_written_jobs().unwrap(), vec!["Nightly compare".to_string()]);
+        let after = ws.get_job(&ai.id).unwrap();
+        assert!(after.nodes.iter().all(|n| n.ai_sql));
+        assert_eq!(after.updated_at, ai.updated_at, "the schedule's base is kept");
+        assert_eq!(after.edges, ai.edges);
+        assert!(ws.get_job(&mine.id).unwrap().nodes.iter().all(|n| !n.ai_sql), "a run approval isn't authorship");
+        assert!(ws.get_job(&denied.id).unwrap().nodes.iter().all(|n| !n.ai_sql));
+        // Once.
+        let mut cleared = ws.get_job(&ai.id).unwrap();
+        cleared.nodes[0].ai_sql = false;
+        ws.save_job(cleared).unwrap();
+        assert!(ws.mark_ai_written_jobs().unwrap().is_empty());
+        assert!(!ws.get_job(&ai.id).unwrap().nodes[0].ai_sql, "a step the user trusted stays trusted");
     }
 
     fn job(nodes: Vec<JobNode>, edges: Vec<(usize, usize)>) -> Job {
