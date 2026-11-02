@@ -462,6 +462,17 @@ pub fn quote_path(kind: ConnectorKind, path: &str) -> String {
     split_path(kind, path).iter().map(|p| quote_ident(kind, p)).collect::<Vec<_>>().join(".")
 }
 
+/// `schema.name` for an object from the catalog: `schema` may hold several
+/// parts (`catalog.schema` stored as one string) and is split like
+/// [`quote_path`], but `name` is one identifier as the database reported it,
+/// so a table named `a.b` stays one name. Empty `schema`: just the name.
+pub fn quote_object(kind: ConnectorKind, schema: &str, name: &str) -> String {
+    if schema.trim().is_empty() {
+        return quote_ident(kind, name);
+    }
+    format!("{}.{}", quote_path(kind, schema), quote_ident(kind, name))
+}
+
 /// The parts of a qualified name as typed: dots outside quotes split it, a
 /// part may be quoted (`"My Schema".t`, `[dbo].[t]`, `` `a`.b ``, doubled
 /// quotes inside), quotes are removed. BigQuery's whole-path backticks
@@ -555,6 +566,10 @@ mod tests {
         // Typed quotes are not quoted twice.
         assert_eq!(quote_path(pg, r#""My Schema".t"#), r#""My Schema"."t""#);
         assert_eq!(quote_path(pg, "main.app.t"), r#""main"."app"."t""#);
+        // A catalog name is one identifier, dots and quotes included.
+        assert_eq!(quote_object(pg, "public", "a.b"), r#""public"."a.b""#);
+        assert_eq!(quote_object(pg, "db.sch", r#"x"y"#), r#""db"."sch"."x""y""#);
+        assert_eq!(quote_object(pg, "", "t.1"), r#""t.1""#);
     }
 
     #[test]

@@ -393,12 +393,17 @@ impl Session for SqliteSession {
         .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()));
         l.row_estimate = match stat {
             Some(n) => Some(n),
-            None => {
-                query_text(self, &format!("SELECT count(*) FROM {}", databrain_connector_core::quote_path(ConnectorKind::Sqlite, &format!("{schema}.{name}"))))
-                    .await
-                    .ok()
-                    .and_then(|r| r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok()))
-            }
+            None => query_text(
+                self,
+                &format!(
+                    "SELECT count(*) FROM {}.{}",
+                    databrain_connector_core::quote_ident(ConnectorKind::Sqlite, schema),
+                    databrain_connector_core::quote_ident(ConnectorKind::Sqlite, name)
+                ),
+            )
+            .await
+            .ok()
+            .and_then(|r| r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok())),
         };
         Ok(l)
     }
@@ -615,5 +620,9 @@ mod tests {
         exec(&*s, "ANALYZE").await;
         exec(&*s, "INSERT INTO o (cust) VALUES ('d')").await;
         assert_eq!(s.table_layout("main", "o").await.unwrap().row_estimate, Some(3), "ANALYZE's statistics when there are some");
+        // A dot in the table's name is part of the name.
+        exec(&*s, r#"CREATE TABLE "x.y" (a)"#).await;
+        exec(&*s, r#"INSERT INTO "x.y" VALUES (1), (2)"#).await;
+        assert_eq!(s.table_layout("main", "x.y").await.unwrap().row_estimate, Some(2));
     }
 }

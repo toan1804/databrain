@@ -57,6 +57,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- A table whose name contains a dot (`"x.y"`) is quoted as one name when editing rows, opening related rows and counting rows on SQLite; it was split into two parts.
 - The per-tab lock used while connecting is removed once nobody waits on it; one was kept for every tab and job step ever opened.
 - A very large idle-disconnect time (minutes) no longer overflows when turned into seconds; it means practically never.
 - Two runs started at the same moment in one tab (or on one session) could both start; checking for a running query and claiming the tab now happen together.
