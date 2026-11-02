@@ -1143,3 +1143,36 @@ async fn mcp_cancelled_call_stops_waiting() {
         assert!(!l.contains("call-2"), "no answer for the cancelled call: {l}");
     }
 }
+
+/// "Check with database" reads the definitions of the views the SQL reads
+/// (and of the views those read) and traces them into their tables.
+#[tokio::test]
+async fn lineage_expands_views_with_the_database() {
+    let (st, _sink, dir) = state();
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(dir.path().join("v.db").to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let p = save_profile(&st, "views", cfg, None);
+    exec(&st, &p.id, "create table orders (id int, amount int); create view big as select id, amount * 2 as doubled from orders; create view top as select doubled as d from big where doubled > 10").await;
+    let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select d from top", Default::default(), true).await.unwrap();
+    let g = &v.graph;
+    let by_id = |id: &str| g.nodes.iter().find(|n| n.id == id).unwrap().name.clone();
+    let flows: Vec<String> = g.flows.iter().map(|f| format!("{} -> {}", by_id(&f.from), by_id(&f.to))).collect();
+    assert!(flows.contains(&"main.orders -> main.big".to_string()), "{flows:?} {:?}", g.warnings);
+    assert!(flows.contains(&"main.big -> main.top".to_string()), "{flows:?}");
+    assert_eq!(g.nodes.iter().filter(|n| n.view).count(), 2, "{:?}", g.nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+    let amount = g.edges.iter().find(|e| by_id(&e.from) == "main.orders" && e.from_column.as_deref() == Some("amount")).expect("orders.amount is traced");
+    assert_eq!(amount.to_column.as_deref(), Some("doubled"));
+    // Without the check: views stay boxes (nothing is read from the server).
+    let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select d from top", Default::default(), false).await.unwrap();
+    assert!(v.graph.nodes.iter().all(|n| !n.view));
+}

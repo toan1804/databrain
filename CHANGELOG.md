@@ -18,6 +18,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Lineage: with "Check with database", views the SQL reads are traced through their definitions into the tables they read (views of views too).
 - Amazon Redshift through the Postgres connector, with IAM sign-in through the AWS CLI.
 - ClickHouse over its HTTP interface.
 - ER diagram per schema.

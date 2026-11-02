@@ -272,7 +272,7 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 
 ## 11. Lineage
 
-`crates/lineage` parses SQL with `sqlparser` in the connection's dialect and traces columns through CTEs, subqueries, joins, set operations and multi-statement scripts (`CREATE TABLE AS`, `INSERT ... SELECT`, `UPDATE ... FROM`, `MERGE`, ...). Table columns come from the explorer cache or a describe. Names it can't place become warnings instead of guesses. The UI lays out the diagram and its exports itself (`ui/src/lib/lineageLayout.ts`, `lineageExport.ts`).
+`crates/lineage` parses SQL with `sqlparser` in the connection's dialect and traces columns through CTEs, subqueries, joins, set operations and multi-statement scripts (`CREATE TABLE AS`, `INSERT ... SELECT`, `UPDATE ... FROM`, `MERGE`, ...). Table columns come from the explorer cache or a describe. With "Check with database", the app also reads the DDL of views the SQL reads (`CatalogTable::view_sql`), in rounds so views of views follow, and the crate traces a view's definition into the view's columns; that SQL gets no editor spans. Names it can't place become warnings instead of guesses. The UI lays out the diagram and its exports itself (`ui/src/lib/lineageLayout.ts`, `lineageExport.ts`).
 
 ---
 

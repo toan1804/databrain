@@ -18,6 +18,11 @@ written: boolean,
  */
 temporary?: boolean, 
 /**
+ * A database view whose definition was traced: its columns come from
+ * the tables it reads.
+ */
+view?: boolean, 
+/**
  * Statement that defines it (tables: none).
  */
 statement?: number, span?: LineageRange, };

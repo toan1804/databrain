@@ -74,49 +74,99 @@ pub async fn lineage(
     }
     let ws = state.engine.workspace().clone();
     let masked = mask_parameters(sql, kind);
-    let cat = |id: Option<String>| {
+    // View definitions read from the server for this view (lower-case
+    // `schema.name` → DDL; empty = asked, none to trace).
+    let mut views: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let cat = |id: Option<String>, views: &std::collections::HashMap<String, String>| {
         let ws = ws.clone();
+        let views = views.clone();
         move |parts: &[String]| -> Option<databrain_lineage::CatalogTable> {
             let id = id.as_deref()?;
             let (schema, name) = ws.meta_get(id, &parts.join(".")).ok().flatten()?;
             let columns = ws.kn_column_names(id, &schema, &name).ok().flatten()?;
-            Some(databrain_lineage::CatalogTable { name: format!("{schema}.{name}"), columns })
+            let view_sql = views.get(&format!("{schema}.{name}").to_lowercase()).filter(|d| !d.trim().is_empty()).cloned();
+            Some(databrain_lineage::CatalogTable { name: format!("{schema}.{name}"), columns, view_sql })
         }
     };
     let conn = connection_id.map(str::to_string);
-    let mut graph = databrain_lineage::analyze(&masked, kind, &cat(conn.clone()));
+    let mut graph = databrain_lineage::analyze(&masked, kind, &cat(conn.clone(), &views));
     let mut described = Vec::new();
     if let (Some(id), true) = (connection_id, check) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
-        for t in graph.unknown_tables.iter().take(20) {
-            let (schema, name) = match ws.meta_get(id, t).ok().flatten() {
-                Some(x) => x,
-                None => match t.rsplit_once('.') {
-                    Some((s, n)) => (s.to_string(), n.to_string()),
-                    // Bare name not seen yet: find it (cached for next time).
-                    None => match tokio::time::timeout_at(deadline, search_objects(state, id, t, Some(20))).await {
-                        Ok(Ok(hits)) => match hits.into_iter().find(|o| o.name.eq_ignore_ascii_case(t)) {
-                            Some(o) => (o.schema, o.name),
-                            None => continue,
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Rounds: describe the tables whose columns aren't known, then read the
+        // definitions of the views among them; a view's definition names more
+        // tables (and views), traced in the next round.
+        'rounds: for _ in 0..4 {
+            let mut changed = false;
+            for t in graph.unknown_tables.iter().filter(|t| !tried.contains(&t.to_lowercase())).take(20).cloned().collect::<Vec<_>>() {
+                tried.insert(t.to_lowercase());
+                let (schema, name) = match ws.meta_get(id, &t).ok().flatten() {
+                    Some(x) => x,
+                    None => match t.rsplit_once('.') {
+                        Some((s, n)) => (s.to_string(), n.to_string()),
+                        // Bare name not seen yet: find it (cached for next time).
+                        None => match tokio::time::timeout_at(deadline, search_objects(state, id, &t, Some(20))).await {
+                            Ok(Ok(hits)) => match hits.into_iter().find(|o| o.name.eq_ignore_ascii_case(&t)) {
+                                Some(o) => (o.schema, o.name),
+                                None => continue,
+                            },
+                            Err(_) => break 'rounds,
+                            _ => continue,
                         },
-                        _ => continue,
                     },
-                },
-            };
-            match tokio::time::timeout_at(deadline, describe(state, id, &schema, &name)).await {
-                Ok(Ok(d)) if !d.columns.is_empty() => {
-                    // Known now, also to later lookups by this name.
-                    let _ = ws.meta_add_objects(id, &[DbObject { schema: schema.clone(), name: name.clone(), kind: databrain_connector_core::ObjectKind::Table, comment: None, row_estimate: None }]);
-                    described.push(format!("{schema}.{name}"));
+                };
+                match tokio::time::timeout_at(deadline, describe(state, id, &schema, &name)).await {
+                    Ok(Ok(d)) if !d.columns.is_empty() => {
+                        // Known now, also to later lookups by this name, with its kind.
+                        let mut obj = d.object.clone();
+                        (obj.schema, obj.name) = (schema.clone(), name.clone());
+                        if !matches!(obj.kind, databrain_connector_core::ObjectKind::View | databrain_connector_core::ObjectKind::MaterializedView) {
+                            obj.kind = databrain_connector_core::ObjectKind::Table;
+                        }
+                        let _ = ws.meta_add_objects(id, &[obj]);
+                        described.push(format!("{schema}.{name}"));
+                        changed = true;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break 'rounds,
                 }
-                Ok(_) => {}
-                Err(_) => break,
             }
-        }
-        if !described.is_empty() {
-            // The described columns are read back from the cache.
-            state.meta.flush().await;
-            graph = databrain_lineage::analyze(&masked, kind, &cat(conn.clone()));
+            if changed {
+                // The described columns are read back from the cache.
+                state.meta.flush().await;
+                graph = databrain_lineage::analyze(&masked, kind, &cat(conn.clone(), &views));
+            }
+            // Views the SQL (or a view's definition) reads: their definitions.
+            let mut names: Vec<String> = graph.nodes.iter().filter(|n| n.kind == databrain_lineage::NodeKind::Table && !n.written && !n.view).map(|n| n.name.clone()).collect();
+            names.sort();
+            names.dedup();
+            let mut read_views = false;
+            for t in names.into_iter().take(20) {
+                let Some((schema, name)) = ws.meta_get(id, &t).ok().flatten() else { continue };
+                let key = format!("{schema}.{name}").to_lowercase();
+                if views.contains_key(&key) {
+                    continue;
+                }
+                let Some(obj) = ws.meta_object(id, &schema, &name).ok().flatten() else { continue };
+                if !matches!(obj.kind, databrain_connector_core::ObjectKind::View | databrain_connector_core::ObjectKind::MaterializedView) {
+                    continue;
+                }
+                match tokio::time::timeout_at(deadline, object_ddl(state, id, &schema, &name, obj.kind)).await {
+                    Ok(r) => {
+                        let ddl = r.ok().flatten().unwrap_or_default();
+                        read_views |= !ddl.trim().is_empty();
+                        views.insert(key, ddl);
+                    }
+                    Err(_) => break 'rounds,
+                }
+            }
+            if read_views {
+                graph = databrain_lineage::analyze(&masked, kind, &cat(conn.clone(), &views));
+            }
+            if !changed && !read_views {
+                break;
+            }
         }
     }
 

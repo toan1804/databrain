@@ -12,7 +12,7 @@ fn cat(parts: &[String]) -> Option<CatalogTable> {
         "customers" => &["id", "name", "country"],
         _ => return None,
     };
-    Some(CatalogTable { name: format!("sales.{name}"), columns: cols.iter().map(|c| c.to_string()).collect() })
+    Some(CatalogTable { name: format!("sales.{name}"), columns: cols.iter().map(|c| c.to_string()).collect(), view_sql: None })
 }
 
 fn run(sql: &str) -> Lineage {
@@ -367,4 +367,54 @@ fn recursive_cte_without_column_list_or_keyword() {
     assert!(e.contains(&"sales.orders.customer_id -direct-> SELECT.parent".to_string()), "{e:#?}");
     assert_eq!(g.nodes.iter().filter(|n| n.name.eq_ignore_ascii_case("tree")).count(), 1, "not a database table");
     assert!(g.unknown_tables.is_empty(), "{:?}", g.unknown_tables);
+}
+
+fn cat_with_views(parts: &[String]) -> Option<CatalogTable> {
+    let name = parts.last()?.to_lowercase();
+    let view = |cols: &[&str], sql: &str| CatalogTable { name: format!("sales.{name}"), columns: cols.iter().map(|c| c.to_string()).collect(), view_sql: Some(sql.into()) };
+    match name.as_str() {
+        "v_big" => Some(view(
+            &["id", "doubled", "name"],
+            "CREATE OR REPLACE VIEW sales.v_big AS SELECT o.id, o.amount * 2 AS doubled, c.name FROM orders o JOIN customers c ON c.id = o.customer_id",
+        )),
+        "v_top" => Some(view(&["who", "doubled"], "create view sales.v_top (who, doubled) as select name, doubled from v_big where doubled > 10")),
+        "v_bad" => Some(view(&["x"], "this is not sql")),
+        _ => cat(parts),
+    }
+}
+
+/// A view the SQL reads is traced through its definition into the tables
+/// it reads, views of views too; its SQL gets no spans in the editor.
+#[test]
+fn views_are_expanded() {
+    let sql = "select who, doubled from v_top";
+    let g = analyze(sql, K::Postgres, &cat_with_views);
+    let e = edges(&g);
+    for want in [
+        "sales.orders.amount -transform-> sales.v_big definition.doubled",
+        "sales.v_big definition.doubled -direct-> sales.v_big.doubled",
+        "sales.customers.name -direct-> sales.v_big definition.name",
+        "sales.v_top definition.name -direct-> sales.v_top.who",
+        "sales.v_top.who -direct-> Result.who",
+    ] {
+        assert!(e.contains(&want.to_string()), "{want}: {e:#?}");
+    }
+    // The chain goes table → view → view → result.
+    assert_eq!(
+        flows_of(&g),
+        vec!["sales.customers -direct-> sales.v_big [0]", "sales.orders -transform-> sales.v_big [0]", "sales.v_big -direct-> sales.v_top [0]", "sales.v_top -direct-> Result [0]"]
+    );
+    assert!(g.nodes.iter().filter(|n| n.view).count() == 2);
+    for n in &g.nodes {
+        if let Some(r) = n.span {
+            assert!(r.end <= sql.len(), "{} has a span outside the editor's SQL", n.name);
+        }
+    }
+    // A definition that can't be parsed: a plain table with a warning.
+    let g = analyze("select x from v_bad", K::Postgres, &cat_with_views);
+    assert!(g.warnings.iter().any(|w| w.message.contains("v_bad")), "{:?}", g.warnings);
+    assert_eq!(edges(&g), vec!["sales.v_bad.x -direct-> Result.x"]);
+    // A view the script writes is its own definition, not the database's.
+    let g = analyze("create or replace view v_big as select id from customers; select id from v_big", K::Postgres, &cat_with_views);
+    assert!(!edges(&g).iter().any(|e| e.contains("orders")), "{:#?}", edges(&g));
 }

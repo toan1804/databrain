@@ -86,6 +86,11 @@ pub struct Node {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[ts(as = "Option<bool>", optional)]
     pub temporary: bool,
+    /// A database view whose definition was traced: its columns come from
+    /// the tables it reads.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub view: bool,
     /// Statement that defines it (tables: none).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -208,11 +213,14 @@ pub struct Lineage {
 }
 
 /// A table as the catalog knows it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CatalogTable {
     /// Qualified display name (`sales.orders`).
     pub name: String,
     pub columns: Vec<String>,
+    /// A view's definition: its `CREATE VIEW … AS …` DDL or the query alone.
+    /// A view the SQL reads is expanded into the tables it reads.
+    pub view_sql: Option<String>,
 }
 
 /// Table columns (explorer cache). `parts` = the name as written
@@ -240,7 +248,19 @@ impl<F: Fn(&[String]) -> Option<CatalogTable>> Catalog for F {
 
 /// Lineage of every statement of `sql`.
 pub fn analyze(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> Lineage {
-    let mut b = Builder { g: Lineage::default(), cat: catalog, kind, tables: HashMap::new(), created: Default::default(), text: "", base: 0, lines: vec![], stmt: 0 };
+    let mut b = Builder {
+        g: Lineage::default(),
+        cat: catalog,
+        kind,
+        tables: HashMap::new(),
+        created: Default::default(),
+        expanded: Default::default(),
+        in_view: 0,
+        text: "",
+        base: 0,
+        lines: vec![],
+        stmt: 0,
+    };
     let spans = split_statements(sql, kind);
     let many = spans.len() > 1;
     for (i, s) in spans.iter().enumerate() {
@@ -397,6 +417,11 @@ struct Builder<'a> {
     tables: HashMap<String, usize>,
     /// Table nodes the script creates (not database tables to describe).
     created: std::collections::HashSet<usize>,
+    /// View nodes whose definition was traced (or is being traced).
+    expanded: std::collections::HashSet<usize>,
+    /// Depth of view definitions being traced: their SQL is not the
+    /// editor's, so nothing in them gets a span.
+    in_view: usize,
     text: &'a str,
     base: usize,
     lines: Vec<usize>,
@@ -616,6 +641,9 @@ impl<'a> Builder<'a> {
     }
 
     fn range(&self, s: Span) -> Option<Range> {
+        if self.in_view > 0 {
+            return None;
+        }
         let (a, b) = (self.offset(s.start)?, self.offset(s.end)?);
         (b >= a).then_some(Range { start: a, end: b })
     }
@@ -638,6 +666,7 @@ impl<'a> Builder<'a> {
             columns_known: kind != NodeKind::Table,
             written: false,
             temporary: false,
+            view: false,
             statement: (kind != NodeKind::Table).then_some(self.stmt),
             span,
         });
@@ -1221,6 +1250,43 @@ impl<'a> Builder<'a> {
         env
     }
 
+    /// A database view read here: trace its definition (from the catalog)
+    /// into the view's columns, once per view, at most 5 views deep. A view
+    /// the script writes is its own definition, not the database's.
+    fn expand_view(&mut self, node: usize, parts: &[String]) {
+        const MAX_DEPTH: usize = 5;
+        if self.expanded.contains(&node) || self.g.nodes[node].written || self.created.contains(&node) || self.in_view >= MAX_DEPTH {
+            return;
+        }
+        let Some(sql) = self.cat.table(parts).and_then(|t| t.view_sql) else { return };
+        self.expanded.insert(node);
+        let name = self.g.nodes[node].name.clone();
+        let parsed = Parser::parse_sql(&*dialect_for(self.kind), &sql).ok().and_then(|stmts| {
+            stmts.into_iter().find_map(|st| match st {
+                Statement::CreateView(v) => Some((v.query, v.columns.iter().map(|c| c.name.value.clone()).collect::<Vec<_>>())),
+                Statement::Query(q) => Some((q, vec![])),
+                _ => None,
+            })
+        });
+        let Some((q, names)) = parsed else {
+            self.warn(format!("The definition of view {name} could not be read; it is shown as a table"), None);
+            return;
+        };
+        self.in_view += 1;
+        let r = self.query(&q, &Env::default());
+        self.in_view -= 1;
+        if !matches!(self.g.nodes[r].kind, NodeKind::Table | NodeKind::Cte) {
+            self.g.nodes[r].name = format!("{name} definition");
+        }
+        let outs: Vec<String> = self.g.nodes[r].columns.iter().map(|c| c.name.clone()).collect();
+        for (i, o) in outs.iter().enumerate() {
+            let target = names.get(i).cloned().unwrap_or_else(|| o.clone());
+            let vc = self.ensure_col(node, &target);
+            self.edge(r, Some(o.clone()), node, Some(vc), EdgeKind::Direct, None);
+        }
+        self.g.nodes[node].view = true;
+    }
+
     /// Point `from`'s edges at `to` and empty `from` (recursive CTE placeholder).
     fn merge_into(&mut self, from: usize, to: usize) {
         let (fid, tid) = (self.g.nodes[from].id.clone(), self.g.nodes[to].id.clone());
@@ -1270,7 +1336,9 @@ impl<'a> Builder<'a> {
                 let name = ObjectName::from(
                     t.schema_name.iter().chain(t.table_name.iter()).map(|s| Ident::new(s.clone())).collect::<Vec<_>>(),
                 );
-                self.table_node(&name)
+                let n = self.table_node(&name);
+                self.expand_view(n, &name_parts(&name));
+                n
             }
             other => {
                 let n = self.node(NodeKind::Subquery, "…".into(), None);
@@ -1476,7 +1544,9 @@ impl<'a> Builder<'a> {
                 } else if let Some(c) = (parts.len() == 1).then(|| env.cte(&parts[0].to_lowercase())).flatten() {
                     c
                 } else {
-                    self.table_node(name)
+                    let t = self.table_node(name);
+                    self.expand_view(t, &parts);
+                    t
                 };
                 let a = alias_of(alias).unwrap_or_else(|| parts.last().cloned().unwrap_or_default().to_lowercase());
                 sources.push(Source { alias: a, node });
