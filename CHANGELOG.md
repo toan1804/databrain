@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Security
 
+- Oracle Instant Client is loaded only from a folder you chose, the one saved for connections, or the one DataBrain installed. A copy found in Downloads, the home folder or the library search path is shown with "Use the one found", not loaded and trusted on its own.
 - run_query on a DuckDB connection (the Results connection too) checks every `results.<name>` it reads like query_outputs does: outputs from a connection with AI off, not shared with MCP, or not sharing result rows were readable there.
 - query_result masks sensitive columns' values before the local query runs: a CTE column list (or any rename) returned them in clear.
 - A query calling a non-built-in function needs the user's confirmation wherever the AI may not write, also on Postgres, MySQL, SQLite, DuckDB and ClickHouse when the connection isn't read-only (`select public.write_fn()`, `dblink_exec(…)` and `set_config('search_path', …)` ran unasked). On read-only connections, functions that act outside the read-only session (`dblink*`, `set_config`, server and file functions) still need it.

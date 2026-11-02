@@ -84,7 +84,9 @@ export function OracleClientPanel({ libDir, onUseDir, compact }: { libDir?: stri
           <div className="font-medium">Oracle Instant Client is required</div>
           {!compact && (
             <div className="text-[12px] text-muted">
-              Oracle connections use Oracle's client library. It was not found on this computer{st.lib_dir ? ` (checked ${st.lib_dir})` : ""}.
+              {st.found
+                ? `Oracle connections use Oracle's client library. One is in ${st.found}; DataBrain loads it only if you choose it (its code runs inside the app).`
+                : `Oracle connections use Oracle's client library. It was not found on this computer${st.lib_dir ? ` (checked ${st.lib_dir})` : ""}.`}
             </div>
           )}
         </div>
@@ -94,6 +96,11 @@ export function OracleClientPanel({ libDir, onUseDir, compact }: { libDir?: stri
       </div>
       {busy === "install" && <InstallProgressBar p={prog} onCancel={() => void api.oracleCancelInstall()} />}
       <div className={`flex flex-wrap items-center gap-1.5 ${busy === "install" ? "hidden" : ""}`}>
+        {st.found && onUseDir && (
+          <button className="btn-ghost border border-line py-1" onClick={() => onUseDir(st.found!)} disabled={!!busy} title={st.found}>
+            <FolderOpen size={12} /> Use the one found
+          </button>
+        )}
         {st.platform.auto_install && (
           <button className="btn-primary py-1" onClick={() => void install()} disabled={!!busy}>
             {busy === "install" ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
