@@ -361,10 +361,10 @@ pub(crate) fn literal(cell: Option<&str>, kind: Lit, dialect: ConnectorKind) -> 
         // Oracle doesn't read text as a date without NLS settings: typed literals.
         Lit::Date if l.typed_datetime_literals => format!("DATE {}", quote_literal(s)),
         Lit::Timestamp if l.typed_datetime_literals => format!("TIMESTAMP {}", quote_literal(s)),
+        // The same text escaper as parameters (connector-core).
         _ => match l.text_literal {
-            TextLiteral::NPrefix => format!("N{}", quote_literal(s)),
-            TextLiteral::BackslashEscaped => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")),
-            TextLiteral::Plain => quote_literal(s),
+            TextLiteral::NPrefix => format!("N{}", databrain_connector_core::sql::quote_string(s, dialect)),
+            TextLiteral::BackslashEscaped | TextLiteral::Plain => databrain_connector_core::sql::quote_string(s, dialect),
         },
     }
 }
@@ -561,6 +561,10 @@ mod tests {
         );
         assert_eq!(literal(Some("a\\b"), Lit::Text, K::Clickhouse), "'a\\\\b'", "backslashes are escaped");
         assert_eq!(literal(Some("0aff"), Lit::Binary, K::Clickhouse), "unhex('0aff')");
+        // One text escaper with parameters: a trailing backslash can't close the quote.
+        assert_eq!(literal(Some("a\\"), Lit::Text, K::Snowflake), "'a\\\\'");
+        assert_eq!(literal(Some("it's"), Lit::Text, K::Bigquery), "'it\\'s'");
+        assert_eq!(literal(Some("it's"), Lit::Text, K::Mssql), "N'it''s'");
         assert!(is_load_target(K::Clickhouse));
         assert!(!keyed_loads(K::Clickhouse));
         assert!(keyed_loads(K::Postgres));
