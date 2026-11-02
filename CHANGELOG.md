@@ -52,6 +52,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Oracle: loading timestamps with a time zone works; they were sent as text, which Oracle rejected, and are now `TIMESTAMP '… +02:00'` literals.
 - Jobs: a scheduled run that fails to start no longer uses up its slot; it is tried again on the next check instead of waiting for the next period.
 - Workspace: an older DataBrain refuses a workspace saved by a newer one (it could drop fields it doesn't know when saving) and says why; before updating an existing workspace, DataBrain keeps a copy beside it (`workspace.db.bak-before-v<N>`).
 - Assistant: streamed answers no longer show � when a character (Vietnamese text, emoji) is split across network chunks, and tool-call arguments are no longer corrupted that way.
