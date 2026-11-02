@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Security
 
+- Credential vault: on Windows, `vault.json` and `vault.key` get an explicit access list (your account and SYSTEM, nothing inherited) before anything is written to them. The key, the decrypted file and the cached passwords are wiped from memory when no longer used, and encryption happens in place so no copy of the plaintext is left behind in freed memory.
 - Exports write to a new temporary file created beside the chosen file (never an existing file or link of that name, which was truncated or written through before) and rename it when done. A failed or cancelled export leaves the previous file whole.
 - MCP server: a message from the client is limited to 8 MiB. A longer line is answered with an error and skipped as it arrives, instead of being collected in memory without limit.
 - Job export steps no longer overwrite files they didn't write. If the file name is taken by another file (or a link), the rows are saved as `name (2)`, `name (3)`… and the run says so; a file an earlier run of the same job wrote is still updated. The file is written next to its destination and moved into place, so a failed or cancelled export leaves the previous file whole.
