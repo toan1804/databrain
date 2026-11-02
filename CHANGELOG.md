@@ -52,6 +52,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Assistant: streamed answers no longer show � when a character (Vietnamese text, emoji) is split across network chunks, and tool-call arguments are no longer corrupted that way.
 - Jobs no longer run twice when the computer sleeps past a run's lease: a run that lost its lease to another runner (the background runner) stops before its next step, and the lease renewal stops it too.
 - Assistant: stopping it during a batch of tool calls no longer breaks the conversation (every later question failed at the provider). Calls that didn't run get a "not run" result, and conversations already affected are repaired when they continue.
 - Lineage: recursive CTEs without a column list resolve the recursive step's columns (the anchor's names are used), and CTEs that read themselves without `RECURSIVE` (SQL Server, Oracle) are recognised instead of shown as database tables.
