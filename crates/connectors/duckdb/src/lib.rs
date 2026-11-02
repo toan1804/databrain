@@ -494,11 +494,11 @@ impl Connector for DuckdbConnector {
         .map_err(|e| ConnectorError::internal(e.to_string()))??;
         Ok(Box::new(DuckSession {
             interrupt: conn.interrupt_handle(),
-            conn: Arc::new(Mutex::new(conn)),
+            shared: db.is_some(),
             outputs: self.outputs.clone(),
             loaded: db.as_ref().map(|d| d.loaded.clone()).unwrap_or_default(),
             sandboxed: sandbox,
-            _db: db,
+            conn: Arc::new(Mutex::new(FileConn { conn, _db: db })),
         }))
     }
 }
@@ -592,16 +592,36 @@ fn attach_files(conn: &duckdb::Connection, files: &[String], all_sheets: bool) -
 }
 
 pub struct DuckSession {
-    conn: Arc<Mutex<duckdb::Connection>>,
+    conn: Arc<Mutex<FileConn>>,
     interrupt: Arc<duckdb::InterruptHandle>,
     outputs: Option<Arc<ExternalTablesSlot>>,
     /// Output tables loaded in the database: lowercase name → version key.
     loaded: Arc<Loaded>,
     /// Runs in a sealed instance (see [`seal`]).
     sandboxed: bool,
-    /// The file database this session's connection belongs to (dropped
-    /// after `conn`, so the file closes when its last session ends).
+    /// The session's connection is to a database file other sessions share.
+    shared: bool,
+}
+
+/// A connection, with the file database it belongs to: whatever still holds
+/// the connection (a running query's task too) keeps the file open, and the
+/// file closes after its last connection.
+struct FileConn {
+    conn: duckdb::Connection,
     _db: Option<Arc<FileDb>>,
+}
+
+impl std::ops::Deref for FileConn {
+    type Target = duckdb::Connection;
+    fn deref(&self) -> &duckdb::Connection {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for FileConn {
+    fn deref_mut(&mut self) -> &mut duckdb::Connection {
+        &mut self.conn
+    }
 }
 
 type Loaded = Mutex<std::collections::HashMap<String, String>>;
@@ -1030,7 +1050,7 @@ impl Session for DuckSession {
         let (cancel, interrupt) = (opts.cancel.clone(), self.interrupt.clone());
         let (outputs, loaded) = (self.outputs.clone(), self.loaded.clone());
         let sandboxed = self.sandboxed;
-        let shared = self._db.is_some();
+        let shared = self.shared;
         let done = tokio_util::sync::CancellationToken::new();
         let done_guard = done.clone();
         // duckdb-rs disconnects *before* clearing the interrupt handle's
