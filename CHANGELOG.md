@@ -34,6 +34,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Refresh on a connection signs in again before listing, so rights granted since the login show in the explorer (Oracle applies roles to new sessions only). Tabs running a statement or in a transaction keep their session.
 - ⌘↵ in a text field (dialogs, AI prompt, cell editor) no longer runs the active tab's SQL.
 - Find in results: a slow answer for an older search no longer replaces the current one.
 - Dialogs keep Tab inside, give focus back on close, and are named by their title; the first field gets focus instead of the Close button.

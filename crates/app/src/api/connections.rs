@@ -179,3 +179,9 @@ pub async fn connect(state: &AppState, id: &str) -> Result<String> {
 pub fn disconnect(state: &AppState, id: &str) {
     state.engine.disconnect(id);
 }
+
+/// Sign in again on the next call, so rights granted since the login
+/// apply (see [`QueryEngine::reconnect`](databrain_query_engine::QueryEngine::reconnect)).
+pub fn reconnect(state: &AppState, id: &str) -> usize {
+    state.engine.reconnect(id)
+}

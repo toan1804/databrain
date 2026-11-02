@@ -137,6 +137,9 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
     const conn = get().connections.find((c) => c.id === connId);
     if (!conn) return;
     const three = isThreeLevel(conn.config);
+    // Refresh: sign in again first, so rights granted since the login (Oracle roles,
+    // grants on another schema) show. Tabs mid-statement or mid-transaction are kept.
+    if (force) await api.reconnect(connId).catch(() => {});
     // 1. The cache, at once (no network).
     const cache = force ? null : await api.cachedExplorer(connId).catch(() => null);
     const fromCache = !!cache && (three ? !!cache.catalogs : !!cache.schemas);

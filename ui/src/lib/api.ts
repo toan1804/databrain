@@ -161,6 +161,8 @@ export const api = {
   cancelSignIn: () => call<void>("cancel_sign_in"),
   connect: (id: string) => call<string>("connect", { id }),
   disconnect: (id: string) => call<void>("disconnect", { id }),
+  /** Sign in again on the next call (metadata session and idle tabs), so rights granted since the login apply. */
+  reconnect: (id: string) => call<number>("reconnect", { id }),
 
   listSchemas: (id: string) => call<SchemaInfo[]>("list_schemas", { id }),
   listObjects: (id: string, schema: string) => call<DbObject[]>("list_objects", { id, schema }),

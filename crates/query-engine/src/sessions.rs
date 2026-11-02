@@ -130,6 +130,30 @@ impl QueryEngine {
         self.sessions.lock().retain(|(c, _), _| c != connection_id);
     }
 
+    /// Sign in again on the next call (the explorer's Refresh): closes the
+    /// connection's metadata and indexing sessions, and its tab sessions
+    /// that have no running statement, no open transaction and are not in
+    /// use elsewhere (their next statement reconnects, as after an idle
+    /// disconnect). Needed for rights the server applies to new sessions
+    /// only, such as Oracle roles granted since the login. Returns how many
+    /// sessions were closed.
+    pub fn reconnect(&self, connection_id: &str) -> usize {
+        let busy: Vec<String> = self.jobs.lock().values().map(|j| j.session_key.clone()).collect();
+        let mut g = self.sessions.lock();
+        let before = g.len();
+        g.retain(|(c, key), live| {
+            if c != connection_id {
+                return true;
+            }
+            // A catalog call still running keeps its handle; the map forgets it.
+            if key == META_TAB {
+                return false;
+            }
+            busy.contains(key) || Arc::strong_count(&live.session) > 1 || live.session.in_transaction()
+        });
+        before - g.len()
+    }
+
     /// A session on a separate tab, for tests that set up data.
     #[doc(hidden)]
     pub async fn session_for_tests(&self, connection_id: &str) -> Result<Arc<dyn Session>> {

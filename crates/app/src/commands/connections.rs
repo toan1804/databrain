@@ -61,6 +61,11 @@ pub(crate) async fn disconnect(state: State<'_, AppState>, id: String) -> R<()> 
 }
 
 #[tauri::command]
+pub(crate) async fn reconnect(state: State<'_, AppState>, id: String) -> R<usize> {
+    Ok(api::reconnect(&state, &id))
+}
+
+#[tauri::command]
 pub(crate) fn export_connections(state: State<'_, AppState>, ids: Option<Vec<String>>, path: String) -> R<usize> {
     conn_io::export_connections(&state, ids, &path)
 }

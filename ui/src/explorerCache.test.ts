@@ -29,6 +29,7 @@ vi.mock("./lib/api", () => ({
     listCatalogs: () => live("listCatalogs", [{ name: "main", is_default: true }, { name: "dev", is_default: false }]),
     listCatalogSchemas: (_id: string, c: string) => live(`listCatalogSchemas:${c}`, c === "main" ? [sch("main", "sales", true), sch("main", "hr")] : [sch("dev", "x")]),
     listSchemas: () => live("listSchemas", [{ name: "public", is_default: true }]),
+    reconnect: () => live("reconnect", 1),
     listObjects: (_id: string, s: string) => live(`listObjects:${s}`, [t(s, "fresh")]),
     refreshSchema: (_id: string, s: string) => live(`refreshSchema:${s}`, { schema: s, mode: "incremental", added: 1, changed: 0, removed: 0, objects: [t(s, "orders"), t(s, "new_one")] }),
     revalidateExplorer: (_id: string, open: string[]) =>
@@ -67,6 +68,20 @@ describe("explorer cache", () => {
     expect(calls).toContain("listObjects:main.hr");
     expect(useStore.getState().objects["c|main.sales"]).toBeDefined();
     expect(useStore.getState().schemas.c.map((s) => s.name)).toEqual(["main.sales", "main.hr"]);
+  });
+
+  it("Refresh signs in again before listing, so rights granted since the login show; opening does not", async () => {
+    await useStore.getState().openExplorer("c");
+    await settle();
+    expect(calls).not.toContain("reconnect");
+    // The fake backend lists no connections: put it back after the background refresh.
+    useStore.setState({ connections: [conn as never] });
+    calls.length = 0;
+    await useStore.getState().openExplorer("c", true);
+    expect(calls.indexOf("reconnect")).toBe(0);
+    expect(calls.indexOf("listCatalogs")).toBeGreaterThan(0);
+    await settle();
+    expect(calls).toContain("revalidate:");
   });
 
   it("shows the cache at once, then applies only the changes", async () => {

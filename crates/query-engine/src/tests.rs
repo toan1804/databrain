@@ -340,6 +340,35 @@ async fn safety_confirmation() {
     assert!(matches!(evs.last(), Some(JobEvent::JobFinished { status: RunStatus::Success, .. })));
 }
 
+/// Refresh signs in again: the metadata session and idle tabs close, a
+/// tab mid-transaction (or with a running statement) keeps its session.
+#[tokio::test]
+async fn reconnect_closes_metadata_and_idle_tabs_only() {
+    let f = fixture(EnvTag::None);
+    f.engine.list_schemas(&f.conn_id).await.unwrap();
+    let job = started(f.engine.run(req(&f, "select 1")).unwrap());
+    wait_job(&f, &job).await;
+    let keys = |f: &Fixture| {
+        let mut v: Vec<String> = f.engine.sessions.lock().keys().map(|(_, t)| t.clone()).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(keys(&f), vec![META_TAB.to_string(), "tab1".to_string()]);
+    assert_eq!(f.engine.reconnect(&f.conn_id), 2);
+    assert!(f.engine.connected_ids().is_empty());
+    // The next catalog call reconnects on its own.
+    f.engine.list_schemas(&f.conn_id).await.unwrap();
+    let job = started(f.engine.run(req(&f, "begin")).unwrap());
+    wait_job(&f, &job).await;
+    assert_eq!(f.engine.reconnect(&f.conn_id), 1, "only the metadata session");
+    assert_eq!(keys(&f), vec!["tab1".to_string()]);
+    assert!(f.engine.in_transaction(&f.conn_id, "tab1"));
+    let job = started(f.engine.run(req(&f, "rollback")).unwrap());
+    wait_job(&f, &job).await;
+    assert_eq!(f.engine.reconnect("other-connection"), 0);
+    assert_eq!(f.engine.reconnect(&f.conn_id), 1);
+}
+
 #[tokio::test]
 async fn metadata_and_close_tab() {
     let f = fixture(EnvTag::None);

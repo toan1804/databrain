@@ -190,6 +190,7 @@ pub fn run() {
             commands::connections::cancel_test_connection,
             commands::connections::connect,
             commands::connections::disconnect,
+            commands::connections::reconnect,
             commands::explorer::list_schemas,
             commands::explorer::list_objects,
             commands::explorer::list_catalogs,
