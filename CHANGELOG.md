@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Security
 
+- Sign-in redirects: the local listener only answers requests addressed to itself (a page on another name resolving to 127.0.0.1 is refused) and only pages of origins the sign-in allows (Snowflake's SSO page); it no longer sends `Access-Control-Allow-Origin: *`. OpenRouter sign-in uses a free port and a random callback path instead of port 3000 without a state.
 - With "Allow write statements" on, production still refuses and confirms: a query calling a function that could write needs the user's confirmation on Prod, and elsewhere asks instead of running automatically. T-SQL like `SELECT 1 EXEC xp_cmdshell 'whoami'` (no separator) no longer counts as a read, and each statement of a script is classified by its own keyword.
 - Kiro: kiro-cli runs in a private folder of the user's (owner-only, under the user's cache folder) instead of a fixed folder in the shared temp directory, which another user could create first on a multi-user computer.
 - `:name` values, load INSERTs and SQL export share one text escaper. On MySQL a value used `\'`, which `NO_BACKSLASH_ESCAPES` reads as a backslash and the end of the string; quotes are now doubled and backslashes doubled. Snowflake loads now escape backslashes, and BigQuery/Databricks loads use `\'` (they read `''` as two strings). A typed literal containing a backslash is quoted as a value instead of kept.

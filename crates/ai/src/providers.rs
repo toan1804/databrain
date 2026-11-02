@@ -744,11 +744,11 @@ impl LlmProvider for Gemini {
 /// OpenRouter PKCE sign-in: opens the browser, receives a code on a loopback
 /// redirect and exchanges it for a user-controlled API key.
 pub async fn openrouter_sign_in(interaction: &dyn databrain_auth::Interaction) -> Result<String> {
-    // OpenRouter accepts any localhost callback; prefer the documented port.
-    let lb = match databrain_auth::loopback::Loopback::bind("localhost", 3000, "/callback").await {
-        Ok(lb) => lb,
-        Err(_) => databrain_auth::loopback::Loopback::bind("localhost", 0, "/callback").await?,
-    };
+    // OpenRouter accepts any localhost callback: a free port, and a random
+    // path standing in for `state` (OpenRouter doesn't send one back), so
+    // only the redirect of this sign-in is taken.
+    let nonce = databrain_auth::oauth::random_token(24);
+    let lb = databrain_auth::loopback::Loopback::bind("localhost", 0, &format!("/callback/{nonce}")).await?;
     let callback = lb.redirect_uri();
     let p = databrain_auth::oauth::pkce();
     let url = format!("https://openrouter.ai/auth?callback_url={}&code_challenge={}&code_challenge_method=S256", urlencode(&callback), p.challenge);

@@ -17,6 +17,10 @@ pub struct Loopback {
     /// Host name used in the redirect URI (`127.0.0.1` or `localhost`).
     host: String,
     path: String,
+    /// Web origins that may call the listener from a page (CORS): exact
+    /// (`https://x.example.com`) or a domain suffix (`.snowflakecomputing.com`,
+    /// https only). Empty: only plain browser redirects (no `Origin`).
+    origins: Vec<String>,
 }
 
 impl Loopback {
@@ -25,7 +29,13 @@ impl Loopback {
         let listener = TcpListener::bind(("127.0.0.1", port))
             .await
             .map_err(|e| AuthError::Flow(format!("cannot listen on 127.0.0.1:{port} for the sign-in redirect: {e}")))?;
-        Ok(Self { listener, host: host.to_string(), path: if path.starts_with('/') { path.to_string() } else { format!("/{path}") } })
+        Ok(Self { listener, host: host.to_string(), path: if path.starts_with('/') { path.to_string() } else { format!("/{path}") }, origins: vec![] })
+    }
+
+    /// Let pages of these origins call the listener (see `origins`).
+    pub fn allow_origins(mut self, origins: &[&str]) -> Self {
+        self.origins = origins.iter().map(|o| o.to_string()).collect();
+        self
     }
 
     pub fn port(&self) -> u16 {
@@ -51,7 +61,8 @@ impl Loopback {
                 }
             };
             let Ok((stream, _)) = accept else { continue };
-            match handle(stream, &self.path, expected_state).await {
+            let port = self.port();
+            match handle(stream, &self.path, expected_state, port, &self.origins).await {
                 Some(params) => return Ok(params),
                 None => continue,
             }
@@ -59,7 +70,29 @@ impl Loopback {
     }
 }
 
-async fn handle(mut stream: TcpStream, path: &str, expected_state: Option<&str>) -> Option<HashMap<String, String>> {
+/// `Host` names this listener (a page on another name that resolves to
+/// 127.0.0.1, DNS rebinding, is refused).
+fn host_ok(host: Option<&str>, port: u16) -> bool {
+    host.is_some_and(|h| [format!("127.0.0.1:{port}"), format!("localhost:{port}"), format!("[::1]:{port}")].iter().any(|ok| h.eq_ignore_ascii_case(ok)))
+}
+
+/// The `Origin` a page called from, when the flow allows it.
+fn allowed_origin<'a>(origin: &'a str, allowed: &[String]) -> Option<&'a str> {
+    allowed
+        .iter()
+        .any(|a| {
+            if let Some(suffix) = a.strip_prefix('.') {
+                origin
+                    .strip_prefix("https://")
+                    .is_some_and(|h| h.len() > suffix.len() && h.to_ascii_lowercase().ends_with(&format!(".{}", suffix.to_ascii_lowercase())))
+            } else {
+                origin.eq_ignore_ascii_case(a)
+            }
+        })
+        .then_some(origin)
+}
+
+async fn handle(mut stream: TcpStream, path: &str, expected_state: Option<&str>, port: u16, origins: &[String]) -> Option<HashMap<String, String>> {
     let mut buf = Vec::with_capacity(2048);
     let mut tmp = [0u8; 2048];
     let header_end = loop {
@@ -81,23 +114,36 @@ async fn handle(mut stream: TcpStream, path: &str, expected_state: Option<&str>)
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_ascii_uppercase();
     let target = parts.next()?;
-    let content_length: usize = lines
-        .filter_map(|l| l.split_once(':'))
-        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.trim().parse().ok())
-        .unwrap_or(0)
-        .min(MAX_REQUEST);
+    let headers: Vec<(String, String)> = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
+    let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+    let content_length: usize = header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0).min(MAX_REQUEST);
 
+    // Only this listener's own name, and pages of the origins the flow allows.
+    if !host_ok(header("host"), port) {
+        respond(&mut stream, 403, "Forbidden", None).await;
+        return None;
+    }
+    let cors = match header("origin") {
+        None => None,
+        Some(o) => match allowed_origin(o, origins) {
+            Some(o) => Some(o.to_string()),
+            None => {
+                respond(&mut stream, 403, "Forbidden", None).await;
+                return None;
+            }
+        },
+    };
     let (req_path, query) = target.split_once('?').unwrap_or((target, ""));
     if method == "OPTIONS" {
-        // CORS preflight (Snowflake SSO page may POST via fetch).
+        // CORS preflight from an allowed page (Snowflake's SSO page).
+        let allow = cors.as_deref().map(|o| format!("Access-Control-Allow-Origin: {o}\r\nVary: Origin\r\n")).unwrap_or_default();
         let _ = stream
-            .write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\n\r\n")
+            .write_all(format!("HTTP/1.1 204 No Content\r\n{allow}Access-Control-Allow-Methods: GET, POST\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\n\r\n").as_bytes())
             .await;
         return None;
     }
     if req_path != path {
-        respond(&mut stream, 404, "Not found").await;
+        respond(&mut stream, 404, "Not found", cors.as_deref()).await;
         return None;
     }
     let mut params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
@@ -115,15 +161,15 @@ async fn handle(mut stream: TcpStream, path: &str, expected_state: Option<&str>)
     }
     if let Some(expected) = expected_state {
         if params.get("state").map(String::as_str) != Some(expected) {
-            respond(&mut stream, 400, "Invalid sign-in response (state mismatch).").await;
+            respond(&mut stream, 400, "Invalid sign-in response (state mismatch).", cors.as_deref()).await;
             return None;
         }
     }
     if params.contains_key("error") {
         let msg = params.get("error_description").or(params.get("error")).cloned().unwrap_or_default();
-        respond(&mut stream, 400, &format!("Sign-in failed: {msg}")).await;
+        respond(&mut stream, 400, &format!("Sign-in failed: {msg}"), cors.as_deref()).await;
     } else {
-        respond(&mut stream, 200, "You're signed in to DataBrain. You can close this tab and return to the app.").await;
+        respond(&mut stream, 200, "You're signed in to DataBrain. You can close this tab and return to the app.", cors.as_deref()).await;
     }
     Some(params)
 }
@@ -132,12 +178,15 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-async fn respond(stream: &mut TcpStream, status: u16, message: &str) {
+/// `cors`: the allowed page origin to name in the response (never `*`).
+async fn respond(stream: &mut TcpStream, status: u16, message: &str, cors: Option<&str>) {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         _ => "Not Found",
     };
+    let allow = cors.map(|o| format!("Access-Control-Allow-Origin: {o}\r\nVary: Origin\r\n")).unwrap_or_default();
     let body = format!(
         "<!doctype html><html><head><meta charset=utf-8><title>DataBrain</title>\
          <style>body{{font-family:system-ui,sans-serif;background:#0e0f13;color:#e6e7eb;display:flex;\
@@ -147,7 +196,7 @@ async fn respond(stream: &mut TcpStream, status: u16, message: &str) {
     );
     let resp = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",
+         {allow}Connection: close\r\nCache-Control: no-store\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(resp.as_bytes()).await;
@@ -162,12 +211,54 @@ fn html_escape(s: &str) -> String {
 mod tests {
     use super::*;
 
-    async fn get(port: u16, target: &str) -> String {
+    async fn send(port: u16, method: &str, target: &str, headers: &str) -> String {
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        s.write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).await.unwrap();
+        s.write_all(format!("{method} {target} HTTP/1.1\r\n{headers}\r\n").as_bytes()).await.unwrap();
         let mut out = String::new();
         s.read_to_string(&mut out).await.unwrap();
         out
+    }
+
+    async fn get(port: u16, target: &str) -> String {
+        send(port, "GET", target, &format!("Host: 127.0.0.1:{port}\r\n")).await
+    }
+
+    /// Only this listener's own Host; pages only from allowed origins, named
+    /// in CORS (never `*`).
+    #[tokio::test]
+    async fn checks_host_and_origin() {
+        let lb = Loopback::bind("localhost", 0, "/").await.unwrap().allow_origins(&[".snowflakecomputing.com"]);
+        let port = lb.port();
+        let cancel = CancellationToken::new();
+        let waiter = tokio::spawn(async move { lb.wait(None, &cancel, Duration::from_secs(5)).await });
+        // DNS rebinding: another name pointing at 127.0.0.1.
+        assert!(send(port, "GET", "/?token=evil", &format!("Host: evil.example:{port}\r\n")).await.starts_with("HTTP/1.1 403"));
+        assert!(send(port, "GET", "/?token=evil", "").await.starts_with("HTTP/1.1 403"), "no Host");
+        // A page of another site.
+        let r = send(port, "OPTIONS", "/", &format!("Host: localhost:{port}\r\nOrigin: https://evil.example\r\n")).await;
+        assert!(r.starts_with("HTTP/1.1 403") && !r.contains("Access-Control-Allow-Origin"), "{r}");
+        let r = send(port, "OPTIONS", "/", &format!("Host: localhost:{port}\r\nOrigin: https://snowflakecomputing.com.evil.example\r\n")).await;
+        assert!(r.starts_with("HTTP/1.1 403"), "suffix tricks: {r}");
+        // Snowflake's page: preflight and call, its origin named.
+        let ok = "https://acme.eu-west-1.snowflakecomputing.com";
+        let r = send(port, "OPTIONS", "/", &format!("Host: localhost:{port}\r\nOrigin: {ok}\r\n")).await;
+        assert!(r.starts_with("HTTP/1.1 204") && r.contains(&format!("Access-Control-Allow-Origin: {ok}")) && !r.contains("Origin: *"), "{r}");
+        let r = send(port, "GET", "/?token=t1", &format!("Host: localhost:{port}\r\nOrigin: {ok}\r\n")).await;
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains(&format!("Access-Control-Allow-Origin: {ok}")), "{r}");
+        assert_eq!(waiter.await.unwrap().unwrap()["token"], "t1");
+    }
+
+    /// A flow without allowed origins takes only plain browser redirects.
+    #[tokio::test]
+    async fn no_origin_allowed_by_default() {
+        let lb = Loopback::bind("127.0.0.1", 0, "/cb").await.unwrap();
+        let port = lb.port();
+        let cancel = CancellationToken::new();
+        let waiter = tokio::spawn(async move { lb.wait(Some("s"), &cancel, Duration::from_secs(5)).await });
+        let r = send(port, "GET", "/cb?code=x&state=s", &format!("Host: 127.0.0.1:{port}\r\nOrigin: https://any.example\r\n")).await;
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        assert!(!get(port, "/cb?code=c&state=s").await.contains("Access-Control-Allow-Origin"));
+        assert_eq!(waiter.await.unwrap().unwrap()["code"], "c");
     }
 
     #[tokio::test]
