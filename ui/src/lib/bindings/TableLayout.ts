@@ -23,6 +23,11 @@ cluster_by: Array<string>,
  */
 requires_partition_filter: boolean, row_estimate?: number | null, 
 /**
+ * Space the table takes on the server (data, and indexes where the
+ * engine counts them together), from its statistics.
+ */
+size_bytes?: number, 
+/**
  * Extra facts worth showing (e.g. "ZORDER BY (a, b)", "heap: no clustered index").
  */
 notes: Array<string>, };

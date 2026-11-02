@@ -842,8 +842,10 @@ impl Session for OracleSession {
                 l.notes.push(format!("{n} partitions"));
             }
         }
-        if let Ok(r) = query_text(self, &format!("select num_rows from all_tables where owner = {s} and table_name = {t}")).await {
+        // From the optimizer statistics (no DBA views needed): rows × average row length.
+        if let Ok(r) = query_text(self, &format!("select num_rows, num_rows * avg_row_len from all_tables where owner = {s} and table_name = {t}")).await {
             l.row_estimate = r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok());
+            l.size_bytes = r.first().and_then(|r| r.get(1).cloned().flatten()).and_then(|x| x.parse().ok());
         }
         Ok(l)
     }

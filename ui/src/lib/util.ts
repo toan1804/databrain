@@ -52,7 +52,7 @@ export function comboMatches(options: string[], value: string): string[] {
 
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
-  const units = ["KB", "MB", "GB"];
+  const units = ["KB", "MB", "GB", "TB"];
   let v = n / 1024;
   let i = 0;
   while (v >= 1024 && i < units.length - 1) {

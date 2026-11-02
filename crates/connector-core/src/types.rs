@@ -533,6 +533,11 @@ pub struct TableLayout {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(as = "Option<f64>")]
     pub row_estimate: Option<i64>,
+    /// Space the table takes on the server (data, and indexes where the
+    /// engine counts them together), from its statistics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>", optional)]
+    pub size_bytes: Option<i64>,
     /// Extra facts worth showing (e.g. "ZORDER BY (a, b)", "heap: no clustered index").
     #[serde(default)]
     pub notes: Vec<String>,

@@ -554,8 +554,14 @@ impl Session for MysqlSession {
                 }
             }
         }
-        if let Ok(r) = query_text(self, &format!("select table_rows from information_schema.tables where table_schema = {s} and table_name = {t}")).await {
+        if let Ok(r) = query_text(
+            self,
+            &format!("select table_rows, data_length + index_length from information_schema.tables where table_schema = {s} and table_name = {t}"),
+        )
+        .await
+        {
             l.row_estimate = r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok());
+            l.size_bytes = r.first().and_then(|r| r.get(1).cloned().flatten()).and_then(|x| x.parse().ok());
         }
         Ok(l)
     }
@@ -1023,6 +1029,7 @@ mod tests {
             assert!(l.indexes[0].primary && l.indexes[0].columns == vec!["id", "day"], "{l:?}");
             assert_eq!(l.indexes[1].columns, vec!["cust", "day"]);
             assert_eq!(l.partition_by, vec!["day"], "{l:?}");
+            assert!(l.size_bytes.is_some_and(|b| b > 0), "InnoDB pages count even when empty: {l:?}");
         }
     }
 }

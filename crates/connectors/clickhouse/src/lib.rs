@@ -639,7 +639,12 @@ impl Session for ChSession {
         let (s, n) = (lit(schema), lit(name));
         let t = self
             .0
-            .rows(&format!("SELECT primary_key, partition_key, sorting_key, total_rows, engine FROM system.tables WHERE database = {s} AND name = {n}"), false)
+            .rows(
+                &format!(
+                    "SELECT primary_key, partition_key, sorting_key, total_rows, engine, total_bytes FROM system.tables WHERE database = {s} AND name = {n}"
+                ),
+                false,
+            )
             .await?;
         let Some(t) = t.into_iter().next() else { return Ok(TableLayout::default()) };
         let get = |i: usize| t.get(i).cloned().flatten().unwrap_or_default();
@@ -669,6 +674,7 @@ impl Session for ChSession {
             cluster_by: split_key_list(&get(2)),
             requires_partition_filter: false,
             row_estimate: get(3).parse().ok(),
+            size_bytes: get(5).parse().ok(),
             notes: if engine.is_empty() { vec![] } else { vec![format!("ENGINE = {engine}")] },
         })
     }
@@ -792,6 +798,8 @@ mod tests {
         assert!(d.columns[0].is_primary_key && d.columns[1].nullable && d.ddl.unwrap().contains("MergeTree"));
         let l = s.table_layout("databrain_t", "t").await.unwrap();
         assert_eq!((l.indexes[0].columns.clone(), l.partition_by.clone()), (vec!["id".to_string()], vec!["toYYYYMM(d)".to_string()]));
+        assert_eq!(l.row_estimate, Some(2), "{l:?}");
+        assert!(l.size_bytes.is_some_and(|b| b > 0), "{l:?}");
         assert_eq!(s.schema_columns("databrain_t").await.unwrap()[0].columns.len(), 5);
         // A read-only connection: the server refuses writes.
         let mut ro = cfg.clone();

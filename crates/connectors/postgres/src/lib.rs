@@ -906,7 +906,8 @@ impl Session for PgSession {
             self,
             &format!(
                 "select case when c.relkind = 'p' then pg_catalog.pg_get_partkeydef(c.oid) end, c.reltuples::bigint, \
-                        (select count(*) from pg_catalog.pg_inherits h where h.inhparent = c.oid) \
+                        (select count(*) from pg_catalog.pg_inherits h where h.inhparent = c.oid), \
+                        pg_catalog.pg_total_relation_size(c.oid) \
                  from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
                  where n.nspname = {s} and c.relname = {t}"
             ),
@@ -922,6 +923,7 @@ impl Session for PgSession {
                 }
             }
             l.row_estimate = r[1].as_deref().and_then(|x| x.parse().ok()).filter(|n: &i64| *n >= 0);
+            l.size_bytes = r.get(3).and_then(|x| x.as_deref()).and_then(|x| x.parse().ok()).filter(|n: &i64| *n > 0);
         }
         Ok(l)
     }

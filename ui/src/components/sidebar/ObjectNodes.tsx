@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ClipboardCopy, Columns3, Eye, FunctionSquare, KeyRound, ListOrdered, Play, Table2, TextCursorInput } from "lucide-react";
-import { toError } from "../../lib/api";
+import { api, toError } from "../../lib/api";
 import type { ConnectionView, DbObject } from "../../lib/types";
 import {
   GROUP_PAGE,
@@ -15,7 +15,7 @@ import {
 } from "../../lib/catalog";
 import { selectTop } from "../CatalogSearch";
 import { ColumnMenu, ObjectMenu, copyText, insertColumns, insertText } from "../CatalogMenus";
-import { formatCount, quoteIdent } from "../../lib/util";
+import { formatBytes, formatCount, quoteIdent } from "../../lib/util";
 import { useStore } from "../../store";
 import { editorBridge } from "../../editorBridge";
 import { Row, useTreeOpen } from "./primitives";
@@ -93,6 +93,21 @@ function groupIcon(name: ObjectGroupName): ReactNode {
   }
 }
 
+/** Rows and size of tables read on hover (key `conn|schema|name`), kept 10 minutes. */
+const tableStats = new Map<string, { rows: number | null; bytes: number | null; at: number }>();
+const STATS_FRESH_MS = 10 * 60_000;
+
+/** Rows and size as the row shows them (`1.2M · 340 MB`) and its tooltip line. */
+export function statsText(rows: number | null | undefined, bytes: number | null | undefined): { short?: string; long?: string } {
+  const r = rows != null && rows >= 0 ? rows : null;
+  const b = bytes != null && bytes > 0 ? bytes : null;
+  if (r == null && b == null) return {};
+  const compact = (n: number) => (n < 10_000 ? formatCount(n) : new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(n));
+  const parts = [r != null ? compact(r) : null, b != null ? formatBytes(b) : null].filter(Boolean);
+  const long = [r != null ? `≈ ${formatCount(r)} rows` : null, b != null ? formatBytes(b) : null].filter(Boolean).join(" · ");
+  return { short: parts.join(" · "), long: `${long} (from the database's statistics)` };
+}
+
 export function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: ConnectionView; depth: number }) {
   const columns = useStore((s) => s.columns[`${conn.id}|${obj.schema}|${obj.name}`]);
   const loadColumns = useStore((s) => s.loadColumns);
@@ -107,6 +122,32 @@ export function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: Connecti
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const [colMenu, setColMenu] = useState<{ x: number; y: number; column: string } | null>(null);
   const isRelation = isRelationKind(obj.kind);
+  // Rows and size: read when the pointer rests on a table of an open connection.
+  const statsKey = `${conn.id}|${obj.schema}|${obj.name}`;
+  const [stats, setStats] = useState(() => tableStats.get(statsKey) ?? null);
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sized = isRelation && obj.kind !== "view";
+  const onHover = () => {
+    if (!sized || !conn.connected || hoverTimer.current) return;
+    const have = tableStats.get(statsKey);
+    if (have && Date.now() - have.at < STATS_FRESH_MS) return setStats(have);
+    hoverTimer.current = setTimeout(() => {
+      api
+        .tableLayout(conn.id, obj.schema, obj.name)
+        .then((l) => {
+          const s = { rows: l.row_estimate ?? null, bytes: l.size_bytes ?? null, at: Date.now() };
+          tableStats.set(statsKey, s);
+          setStats(s);
+        })
+        .catch(() => {});
+    }, 400);
+  };
+  const onLeave = () => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current);
+    hoverTimer.current = null;
+  };
+  useEffect(() => onLeave, []);
+  const shown = statsText(stats?.rows ?? obj.row_estimate, stats?.bytes);
 
   // Revealed from search: scroll into view, highlight briefly.
   useEffect(() => {
@@ -148,16 +189,16 @@ export function ObjectNode({ obj, conn, depth }: { obj: DbObject; conn: Connecti
     );
 
   return (
-    <div ref={ref} className={focused ? "rounded-md ring-1 ring-accent/60" : undefined}>
+    <div ref={ref} className={focused ? "rounded-md ring-1 ring-accent/60" : undefined} onMouseEnter={onHover} onMouseLeave={onLeave}>
       <Row
         depth={depth}
         expanded={isRelation ? expanded : undefined}
         loading={loading}
         icon={icon}
         label={obj.name}
-        title={obj.comment}
+        title={[obj.comment, shown.long].filter(Boolean).join("\n") || undefined}
         active={focused}
-        meta={obj.row_estimate != null && obj.row_estimate > 0 ? formatCount(obj.row_estimate) : undefined}
+        meta={shown.short}
         onClick={toggle}
         onDoubleClick={() => editorBridge.insert(activeTab(), quoteIdent(conn.config.kind, obj.name))}
         onContextMenu={(e) => {

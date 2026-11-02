@@ -402,6 +402,18 @@ impl Session for MongoSession {
     async fn table_layout(&self, schema: &str, name: &str) -> Result<TableLayout> {
         let coll = self.client.database(schema).collection::<Document>(name);
         let mut l = TableLayout { row_estimate: coll.estimated_document_count().await.ok().map(|n| n as i64), ..Default::default() };
+        // Storage of the documents and indexes (collStats; views have none).
+        if let Ok(st) = self.client.database(schema).run_command(doc! { "collStats": name }).await {
+            let num = |k: &str| {
+                st.get(k).and_then(|v| match v {
+                    Bson::Int32(n) => Some(*n as i64),
+                    Bson::Int64(n) => Some(*n),
+                    Bson::Double(n) => Some(*n as i64),
+                    _ => None,
+                })
+            };
+            l.size_bytes = num("totalSize").or_else(|| num("storageSize").map(|s| s + num("totalIndexSize").unwrap_or(0)));
+        }
         let mut ix = coll.list_indexes().await.map_err(err)?;
         while let Some(i) = ix.next().await {
             let i = i.map_err(err)?;

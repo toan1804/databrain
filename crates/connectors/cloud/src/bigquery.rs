@@ -509,9 +509,7 @@ impl Session for BqSession {
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
             .unwrap_or_default();
         l.row_estimate = t["numRows"].as_str().and_then(|n| n.parse().ok());
-        if let Some(b) = t["numBytes"].as_str().and_then(|n| n.parse::<f64>().ok()) {
-            l.notes.push(format!("{:.1} GB", b / 1e9));
-        }
+        l.size_bytes = t["numBytes"].as_str().and_then(|n| n.parse().ok());
         Ok(l)
     }
 

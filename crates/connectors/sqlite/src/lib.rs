@@ -377,7 +377,30 @@ impl Session for SqliteSession {
             let pk = TableLayout::from_columns(&self.describe(schema, name).await?.columns).indexes;
             indexes.splice(0..0, pk);
         }
-        Ok(TableLayout { indexes, ..Default::default() })
+        let mut l = TableLayout { indexes, ..Default::default() };
+        // Rows: ANALYZE's statistics when there are some (the first number of
+        // any of the table's rows there), else a count (a local file).
+        let stat = query_text(
+            self,
+            &format!(
+                "SELECT stat FROM {}.sqlite_stat1 WHERE tbl = {t} ORDER BY idx IS NULL DESC LIMIT 1",
+                databrain_connector_core::quote_ident(ConnectorKind::Sqlite, schema)
+            ),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.first().and_then(|r| r[0].clone()))
+        .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()));
+        l.row_estimate = match stat {
+            Some(n) => Some(n),
+            None => {
+                query_text(self, &format!("SELECT count(*) FROM {}", databrain_connector_core::quote_path(ConnectorKind::Sqlite, &format!("{schema}.{name}"))))
+                    .await
+                    .ok()
+                    .and_then(|r| r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok()))
+            }
+        };
+        Ok(l)
     }
 
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
@@ -586,5 +609,11 @@ mod tests {
         let em = l.indexes.iter().find(|i| i.name == "o_email").unwrap();
         assert!(em.unique);
         assert_eq!(em.columns, vec!["(expression)"]);
+        assert_eq!(l.row_estimate, Some(0), "counted without statistics");
+        exec(&*s, "INSERT INTO o (cust) VALUES ('a'), ('b'), ('c')").await;
+        assert_eq!(s.table_layout("main", "o").await.unwrap().row_estimate, Some(3));
+        exec(&*s, "ANALYZE").await;
+        exec(&*s, "INSERT INTO o (cust) VALUES ('d')").await;
+        assert_eq!(s.table_layout("main", "o").await.unwrap().row_estimate, Some(3), "ANALYZE's statistics when there are some");
     }
 }

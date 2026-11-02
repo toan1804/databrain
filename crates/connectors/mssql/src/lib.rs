@@ -964,6 +964,16 @@ impl Session for MssqlSession {
         {
             l.row_estimate = r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok());
         }
+        // Pages in use (8 KB), data and indexes; catalog views, no extra permission.
+        if let Ok(r) = self
+            .query_text_in(
+                db,
+                &format!("select sum(a.used_pages) * 8192 from sys.partitions p join sys.allocation_units a on a.container_id = p.partition_id where p.object_id = object_id({obj})"),
+            )
+            .await
+        {
+            l.size_bytes = r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok());
+        }
         Ok(l)
     }
 

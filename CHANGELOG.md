@@ -18,6 +18,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Explorer: rows and size of a table on hover, from the database's statistics, on every engine (size where the engine keeps it).
 - Load mode "Sync (mirror) by key" for job load steps and "Load into…": merge by key, then delete the table's rows that are no longer among the rows; the report counts the deletions, and a step without rows is refused. The assistant can use it in jobs.
 - History: search by several words in any order across SQL, errors and connection names; filter by connection and status; run an entry again, or on another connection.
 - Per-connection connect timeout and idle disconnect (General section), overriding Settings → Queries for that connection.

@@ -1010,6 +1010,15 @@ impl Session for DbxSession {
         if let (Some(files), Some(bytes)) = (get("numFiles"), get("sizeInBytes").and_then(|b| b.parse::<f64>().ok())) {
             l.notes.push(format!("{} · {files} files · {:.1} GB", get("format").unwrap_or_else(|| "delta".into()), bytes / 1e9));
         }
+        l.size_bytes = get("sizeInBytes").and_then(|b| b.parse().ok());
+        // Rows: only from statistics (ANALYZE TABLE … COMPUTE STATISTICS), never a scan.
+        if let Ok((names, rows)) = query_table(self, &format!("DESCRIBE TABLE EXTENDED {full}")).await {
+            let col = |n: &str| names.iter().position(|x| x.eq_ignore_ascii_case(n));
+            if let (Some(k), Some(v)) = (col("col_name"), col("data_type")) {
+                let stats = rows.iter().find(|r| r.get(k).cloned().flatten().as_deref() == Some("Statistics")).and_then(|r| r.get(v).cloned().flatten());
+                l.row_estimate = stats.as_deref().and_then(databricks_stat_rows);
+            }
+        }
         Ok(l)
     }
 
@@ -1172,9 +1181,20 @@ impl Inner {
     }
 }
 
+/// Rows from a `Statistics` line of DESCRIBE TABLE EXTENDED (`1234 bytes, 56 rows`).
+fn databricks_stat_rows(stats: &str) -> Option<i64> {
+    stats.split(',').map(str::trim).find_map(|part| part.strip_suffix(" rows")).and_then(|n| n.trim().parse().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_rows_from_statistics() {
+        assert_eq!(databricks_stat_rows("123456 bytes, 789 rows"), Some(789));
+        assert_eq!(databricks_stat_rows("123456 bytes"), None);
+    }
 
     #[test]
     fn parses_warehouse_id() {

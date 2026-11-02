@@ -763,7 +763,7 @@ impl Session for SfSession {
         let rows = query_text(
             self,
             &format!(
-                "select clustering_key, row_count, auto_clustering_on from {}.information_schema.tables where table_schema = {} and table_name = {}",
+                "select clustering_key, row_count, auto_clustering_on, bytes from {}.information_schema.tables where table_schema = {} and table_name = {}",
                 quote_ident(ConnectorKind::Snowflake, db),
                 quote_literal(sch),
                 quote_literal(name)
@@ -778,6 +778,7 @@ impl Session for SfSession {
                 }
             }
             l.row_estimate = r[1].as_deref().and_then(|x| x.parse().ok());
+            l.size_bytes = r.get(3).and_then(|x| x.as_deref()).and_then(|x| x.parse().ok());
         }
         Ok(l)
     }

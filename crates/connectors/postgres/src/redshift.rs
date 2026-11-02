@@ -297,15 +297,18 @@ impl PgSession {
         if interleaved {
             l.notes.push("INTERLEAVED SORTKEY".into());
         }
-        if let Some(r) = query_text(self, &format!("select diststyle::text, tbl_rows::bigint from svv_table_info where \"schema\" = {s} and \"table\" = {t}"))
-            .await
-            .ok()
-            .and_then(|v| v.into_iter().next())
+        if let Some(r) =
+            query_text(self, &format!("select diststyle::text, tbl_rows::bigint, size::bigint from svv_table_info where \"schema\" = {s} and \"table\" = {t}"))
+                .await
+                .ok()
+                .and_then(|v| v.into_iter().next())
         {
             if let Some(d) = r[0].clone().filter(|d| !d.is_empty() && !d.starts_with("KEY")) {
                 l.notes.push(format!("DISTSTYLE {d}"));
             }
             l.row_estimate = r[1].as_deref().and_then(|x| x.parse().ok());
+            // `size` counts 1 MB blocks.
+            l.size_bytes = r.get(2).and_then(|x| x.as_deref()).and_then(|x| x.parse::<i64>().ok()).map(|mb| mb * 1024 * 1024);
         }
         Ok(l)
     }
