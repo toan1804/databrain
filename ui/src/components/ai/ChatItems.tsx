@@ -194,7 +194,7 @@ function ApprovalCard({
         {item.tool === "run_query" ? "Run this query?" : item.tool === "create_job" ? "Create this job?" : item.tool === "update_job" ? "Change this job?" : item.tool === "run_job" ? "Run this job?" : item.tool === "index_tables" ? "Index these tables?" : `Allow ${item.tool}?`}
         {!pending && (
           <span className={`ml-auto text-[11px] ${item.state === "approved" ? "text-success" : "text-muted"}`}>
-            {item.state === "approved" ? (item.auto ? "Auto-approved" : "Approved") : "Declined"}
+            {item.state === "approved" ? (item.auto ? "Auto-approved" : "Approved") : item.state === "expired" ? "No longer waiting (stopped or timed out)" : "Declined"}
           </span>
         )}
       </div>
@@ -218,11 +218,11 @@ function ApprovalCard({
       )}
       {pending && (
         <div className="mt-2 flex justify-end gap-1.5">
-          <button className="btn-ghost py-1" onClick={() => onRespond(item.id, false)}>
+          <button className="btn-ghost py-1" onClick={() => onRespond(item.id, false)} disabled={item.sending}>
             Deny
           </button>
-          <button className="btn-primary py-1" onClick={() => onRespond(item.id, true, initialSql !== undefined ? sql : undefined)}>
-            <Play size={12} /> {item.tool === "run_query" ? "Run" : "Allow"}
+          <button className="btn-primary py-1" onClick={() => onRespond(item.id, true, initialSql !== undefined ? sql : undefined)} disabled={item.sending}>
+            <Play size={12} /> {item.sending ? "Sending…" : item.tool === "run_query" ? "Run" : "Allow"}
           </button>
         </div>
       )}
@@ -249,7 +249,7 @@ function EditCard({ item, onRespond }: { item: Extract<ChatItem, { kind: "edit" 
         <span className="text-[11px] font-normal text-muted">→ {target}</span>
         {!pending && (
           <span className={`ml-auto text-[11px] ${item.state === "accepted" ? "text-success" : "text-muted"}`}>
-            {item.state === "accepted" ? (item.auto ? "Auto-applied" : "Applied") : "Rejected"}
+            {item.state === "accepted" ? (item.auto ? "Auto-applied" : "Applied") : item.state === "expired" ? "No longer waiting" : "Rejected"}
           </span>
         )}
       </div>

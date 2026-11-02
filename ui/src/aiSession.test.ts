@@ -10,6 +10,8 @@ const responses: { request_id: string; body: unknown }[] = [];
 const cancelled: string[] = [];
 /** When set, ai_send only returns the run id; the test sends the events. */
 let manual = false;
+/** What ai_respond answers: delivered (true), nothing waits (false), or a failure. */
+let respond: boolean | Error = true;
 
 vi.mock("./lib/api", () => ({
   isTauri: () => true,
@@ -30,7 +32,9 @@ vi.mock("./lib/api", () => ({
     aiSessions: async () => [],
     aiSessionMessages: async () => [],
     aiRespond: async (request_id: string, body: unknown) => {
+      if (respond instanceof Error) throw respond;
       responses.push({ request_id, body });
+      return respond;
     },
     setSetting: async () => {},
     aiListProviders: async () => [{ id: "p", name: "P", kind: "openai", config: {}, has_key: true }],
@@ -89,6 +93,7 @@ describe("auto-approve", () => {
     ask("q2");
     await Promise.resolve();
     expect(responses.filter((r) => ["q1", "q2"].includes(r.request_id)).map((r) => (r.body as { approved: boolean }).approved)).toEqual([true, true]);
+    await new Promise((r) => setTimeout(r, 0));
     expect(useAi.getState().items.filter((i) => i.kind === "approval").every((i) => i.kind === "approval" && i.state === "approved" && i.auto)).toBe(true);
     // A new conversation asks again.
     useAi.getState().newChat();
@@ -166,5 +171,40 @@ describe("several conversations", () => {
     await useAi.getState().loadSession("sA");
     expect(useAi.getState().activeChatId).toBe(open.id);
     expect(useAi.getState().chats.length).toBeLessThanOrEqual(n + 1);
+  });
+});
+
+describe("approval answers", () => {
+  it("show the outcome only once the backend took it, and say when nothing waits any more", async () => {
+    const { useStore } = await import("./store");
+    const { useAi } = await import("./aiStore");
+    const toasts: string[] = [];
+    useStore.setState({ toast: (m: string) => void toasts.push(m) });
+    const shown = (patch: Record<string, unknown>) => {
+      const s = useAi.getState();
+      useAi.setState({ chats: s.chats.map((c) => (c.id === s.activeChatId ? { ...c, ...patch } : c)), ...patch });
+    };
+    useAi.getState().newChat();
+    shown({ runId: "rz", running: true, items: [], autoApprove: false });
+    const ask = (id: string) => handler?.({ type: "approval_request", run_id: "rz", request_id: id, tool: "run_query", summary: "", detail: { sql: "select 1" } } as unknown as AgentEvent);
+    const item = (rid: string) => useAi.getState().items.find((i) => i.kind === "approval" && i.requestId === rid) as { id: string; state: string; sending?: boolean };
+
+    // The run stopped meanwhile: not "Approved".
+    respond = false;
+    ask("e1");
+    await useAi.getState().respondApproval(item("e1").id, true);
+    expect(item("e1").state).toBe("expired");
+
+    // Sending failed: still pending (try again), and the user is told.
+    respond = new Error("backend gone");
+    ask("e2");
+    await useAi.getState().respondApproval(item("e2").id, true);
+    expect([item("e2").state, item("e2").sending]).toEqual(["pending", false]);
+    expect(toasts.some((t) => t.includes("not sent") && t.includes("backend gone"))).toBe(true);
+
+    // Delivered: approved.
+    respond = true;
+    await useAi.getState().respondApproval(item("e2").id, true);
+    expect(item("e2").state).toBe("approved");
   });
 });

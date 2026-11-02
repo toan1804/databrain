@@ -2,6 +2,13 @@ import { useEffect, useState } from "react";
 import { Download, Loader2, X } from "lucide-react";
 import { api, isTauri, onUpdateEvent, toError } from "../lib/api";
 import type { UpdateInfo } from "../lib/types";
+import { readStored } from "../lib/storage";
+
+/** A cached check result as this version shows it. */
+function isUpdateInfo(v: unknown): v is UpdateInfo {
+  const o = v as Partial<UpdateInfo> | null;
+  return !!o && typeof o === "object" && typeof o.current === "string" && typeof o.latest === "string" && typeof o.newer === "boolean" && typeof o.url === "string";
+}
 import { useStore } from "../store";
 
 const LAST_CHECK = "db.update.lastCheck";
@@ -54,8 +61,8 @@ export function UpdateBanner() {
     if (!isTauri()) return;
     const last = Number(localStorage.getItem(LAST_CHECK) ?? 0);
     if (Date.now() - last < EVERY_MS) {
-      const cached = localStorage.getItem("db.update.info");
-      if (cached) setInfo(JSON.parse(cached) as UpdateInfo);
+      const cached = readStored<UpdateInfo | null>("db.update.info", null, isUpdateInfo);
+      if (cached) setInfo(cached);
       return;
     }
     void checkEnabled().then(async (on) => {

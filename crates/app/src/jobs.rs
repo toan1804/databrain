@@ -61,6 +61,14 @@ pub struct JobLogEvent {
 /// Progress events are sent at most this often per run.
 const PROGRESS_EVERY: Duration = Duration::from_millis(200);
 
+/// Logged when another runner holds the job now.
+const LEASE_LOST: &str = "Stopped: another runner took this job (its lease ran out, e.g. while the computer slept); it runs there, not twice";
+
+/// This process still holds `job_id`'s lease (renewed now).
+fn holds_lease(ctx: &JobCtx, job_id: &str) -> bool {
+    ctx.workspace.claim_job(job_id, &ctx.jobs.owner, now_ms() + LEASE_MS).unwrap_or(false)
+}
+
 /// How long a job's lease lasts; renewed every [`LEASE_RENEW`] while it runs.
 const LEASE_MS: i64 = 90_000;
 const LEASE_RENEW: Duration = Duration::from_secs(20);
@@ -447,11 +455,17 @@ pub fn start_with(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<St
         let run_id = r.id;
         // Keep the lease and tell other processes the run is alive.
         let beat = {
-            let (ws, id, owner) = (c.workspace.clone(), id.clone(), c.jobs.owner.clone());
+            let (ws, id, owner, stop) = (c.workspace.clone(), id.clone(), c.jobs.owner.clone(), cancel.clone());
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(LEASE_RENEW).await;
-                    let _ = ws.claim_job(&id, &owner, now_ms() + LEASE_MS);
+                    // Lost (another runner took it after the lease ran out, e.g.
+                    // while the computer slept): stop, so it doesn't run twice.
+                    if !ws.claim_job(&id, &owner, now_ms() + LEASE_MS).unwrap_or(false) {
+                        tracing::warn!(job = %id, run = run_id, "job lease lost to another runner: stopping this run");
+                        stop.cancel();
+                        break;
+                    }
                     let _ = ws.touch_job_run(run_id, &owner);
                 }
             })
@@ -547,6 +561,12 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
                 }
                 let ups: Vec<String> = upstream(&n.id).into_iter().filter(|u| selected.contains(u)).collect();
                 let t = tracer.for_node(n);
+                // The lease is checked (and renewed) before each step: after the
+                // computer slept past it, another runner may have taken the job.
+                if !cancel.is_cancelled() && ups.iter().all(|u| status.get(u) == Some(&"success")) && !holds_lease(ctx, &job.id) {
+                    tracer.log("error", LEASE_LOST, None, None, None);
+                    cancel.cancel();
+                }
                 // Stopped: what hasn't run is cancelled, not skipped as if a step failed.
                 let stopped = cancel.is_cancelled() || ups.iter().any(|u| status.get(u) == Some(&"cancelled"));
                 if stopped {
@@ -967,15 +987,22 @@ pub fn tick_as(ctx: &JobCtx, trigger: &str) -> Vec<String> {
         if !ctx.workspace.claim_job(&j.id, &owner, now_ms() + LEASE_MS).unwrap_or(false) {
             continue;
         }
-        let due = ctx.workspace.get_job(&j.id).ok().and_then(|f| f.schedule.next_after(f.schedule_base())).is_some_and(|t| t <= now);
+        let fresh = ctx.workspace.get_job(&j.id).ok();
+        let due = fresh.as_ref().and_then(|f| f.schedule.next_after(f.schedule_base())).is_some_and(|t| t <= now);
         if !due {
             let _ = ctx.workspace.release_job(&j.id, &owner);
             continue;
         }
+        // Marked while the lease is held (a fast run could otherwise end and
+        // release it before the mark, and another runner start it again)…
+        let before = fresh.and_then(|f| f.last_scheduled_at);
         let _ = ctx.workspace.mark_job_scheduled(&j.id, now);
         match start(ctx, &j.id, trigger, None) {
             Ok(_) => started.push(j.id),
-            Err(_) => {
+            // …and given back when the run didn't start: the slot isn't used up.
+            Err(e) => {
+                tracing::warn!(job = %j.id, error = %e.message, "scheduled job did not start; it is tried again on the next tick");
+                let _ = ctx.workspace.set_job_last_scheduled(&j.id, before);
                 let _ = ctx.workspace.release_job(&j.id, &owner);
             }
         }

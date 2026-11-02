@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight, Folder as FolderIcon, FolderOpen, FolderPlus
 import { api, toError } from "../lib/api";
 import type { Folder, FolderKind } from "../lib/types";
 import { useStore } from "../store";
+import { isStringList, readStored } from "../lib/storage";
 import { MenuItem, Popover } from "./ui";
 
 const DRAG_MIME = "application/x-databrain-item";
@@ -21,7 +22,7 @@ export function dragProps(kind: FolderKind, id: string) {
 
 function useExpanded(kind: FolderKind) {
   const storageKey = `db.folders.${kind}`;
-  const [open, setOpen] = useState<Set<string>>(() => new Set(JSON.parse(localStorage.getItem(storageKey) ?? "[]")));
+  const [open, setOpen] = useState<Set<string>>(() => new Set(readStored(storageKey, [], isStringList)));
   const toggle = (id: string, force?: boolean) =>
     setOpen((s) => {
       const n = new Set(s);

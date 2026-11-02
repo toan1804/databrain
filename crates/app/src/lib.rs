@@ -116,7 +116,25 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             logging::init("databrain", Some(&dir), cfg!(debug_assertions));
-            let workspace = Arc::new(Workspace::open(dir.join("workspace.db"))?);
+            let workspace = match Workspace::open(dir.join("workspace.db")) {
+                Ok(w) => Arc::new(w),
+                Err(e) => {
+                    // Say why before quitting (a workspace from a newer DataBrain,
+                    // a failed backup…), instead of closing without a word.
+                    tracing::error!(error = %e, "cannot open the workspace");
+                    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.hide();
+                    }
+                    let handle = app.handle().clone();
+                    app.dialog()
+                        .message(format!("DataBrain can't open its workspace ({}):\n\n{e}", dir.join("workspace.db").display()))
+                        .title("DataBrain")
+                        .kind(MessageDialogKind::Error)
+                        .show(move |_| handle.exit(1));
+                    return Ok(());
+                }
+            };
             let sink = Arc::new(TauriSink(app.handle().clone()));
             let ui = Arc::new(TauriUi(app.handle().clone()));
             // Passwords/tokens: OS keychain or the local encrypted vault (Settings → Security).
@@ -147,6 +165,9 @@ pub fn run() {
                         // AI conversations, with their own retention setting.
                         let w = ws.clone();
                         let _ = tokio::task::spawn_blocking(move || w.prune_ai_history()).await;
+                        // Job run logs: each job's latest runs, within the history retention.
+                        let w = ws.clone();
+                        let _ = tokio::task::spawn_blocking(move || w.prune_job_run_logs(w.history_retention_days())).await;
                         tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
                     }
                 });

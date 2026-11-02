@@ -329,6 +329,41 @@ with the line: -- Runs locally on DuckDB (Results connection): outputs are resul
 
 /// Earlier turns as plain text (newest kept, about 12k characters), for
 /// providers that only get the latest prompt. Tool calls are summarised.
+/// The result recorded for a tool call that didn't run (the user stopped
+/// the assistant, or an older version didn't write one).
+pub const STOPPED_RESULT: &str = "Not run: the user stopped the assistant before this call.";
+
+/// Every assistant tool call followed by exactly one result, as providers
+/// require: a missing result gets [`STOPPED_RESULT`] right after the
+/// results there are, and a result answering no preceding call is dropped.
+pub fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    let mut it = messages.into_iter().peekable();
+    while let Some(m) = it.next() {
+        match m.role {
+            Role::Tool => {} // not right after its call: dropped
+            Role::Assistant if !m.tool_calls.is_empty() => {
+                let calls = m.tool_calls.clone();
+                out.push(m);
+                let mut answered: Vec<String> = Vec::new();
+                while it.peek().is_some_and(|n| n.role == Role::Tool) {
+                    let r = it.next().expect("peeked");
+                    let id = r.tool_call_id.clone().unwrap_or_default();
+                    if calls.iter().any(|c| c.id == id) && !answered.contains(&id) {
+                        answered.push(id);
+                        out.push(r);
+                    }
+                }
+                for c in calls.iter().filter(|c| !answered.contains(&c.id)) {
+                    out.push(Message::tool(c, STOPPED_RESULT));
+                }
+            }
+            _ => out.push(m),
+        }
+    }
+    out
+}
+
 fn history_text(messages: &[Message]) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut size = 0;
@@ -441,7 +476,10 @@ impl Agent {
         sink.emit(AgentEvent::Started { session_id: sid.clone(), run_id: run_id.clone() });
 
         // History.
-        let mut messages: Vec<Message> = ws.list_ai_messages(&sid)?.into_iter().filter_map(|m| serde_json::from_value::<Message>(m.content).ok()).collect();
+        let messages: Vec<Message> = ws.list_ai_messages(&sid)?.into_iter().filter_map(|m| serde_json::from_value::<Message>(m.content).ok()).collect();
+        // A conversation stopped mid tool batch before results were written
+        // (older versions) would make every later turn fail at the provider.
+        let mut messages = repair_tool_pairs(messages);
         // Keep the context bounded: last ~30 messages, starting at a user turn.
         if messages.len() > 30 {
             let mut start = messages.len() - 30;
@@ -614,8 +652,13 @@ impl Agent {
                 sink.emit(AgentEvent::Finished { session_id: sid.clone(), run_id: run_id.clone(), text: final_text.clone() });
                 return Ok(final_text);
             }
-            for c in calls {
+            for (i, c) in calls.iter().cloned().enumerate() {
                 if cancel.is_cancelled() {
+                    // Every call gets a result, or the next turn is refused by the provider.
+                    for c in &calls[i..] {
+                        let tm = Message::tool(c, STOPPED_RESULT);
+                        ws.add_ai_message(&sid, "tool", &serde_json::to_value(&tm).unwrap_or_default(), (None, None))?;
+                    }
                     return Err(AiError::Cancelled);
                 }
                 sink.emit(AgentEvent::ToolStarted {
@@ -654,6 +697,33 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A conversation stopped mid tool batch: the unanswered calls get a
+    /// result, results without their call are dropped, duplicates removed.
+    #[test]
+    fn repairs_unanswered_tool_calls() {
+        let call = |id: &str| ToolCall { id: id.into(), name: "run_query".into(), arguments: json!({}) };
+        let msgs = vec![
+            Message::user("q"),
+            Message::assistant("", vec![call("a"), call("b"), call("c")]),
+            Message::tool(&call("a"), "ok"),
+            Message::tool(&call("a"), "dup"),
+            Message::tool(&call("zz"), "stray"),
+            Message::user("next question"),
+            Message::tool(&call("x"), "orphan"),
+            Message::assistant("done", vec![]),
+        ];
+        let r = repair_tool_pairs(msgs);
+        let shape: Vec<String> = r
+            .iter()
+            .map(|m| format!("{:?}:{}{}", m.role, m.tool_call_id.clone().unwrap_or_default(), if m.text == STOPPED_RESULT { "(stopped)" } else { "" }))
+            .collect();
+        assert_eq!(shape, ["User:", "Assistant:", "Tool:a", "Tool:b(stopped)", "Tool:c(stopped)", "User:", "Assistant:"]);
+        assert_eq!(r[2].text, "ok");
+        // A complete history is unchanged.
+        let fine = vec![Message::user("q"), Message::assistant("", vec![call("a")]), Message::tool(&call("a"), "ok"), Message::assistant("a", vec![])];
+        assert_eq!(repair_tool_pairs(fine.clone()).len(), fine.len());
+    }
 
     #[test]
     fn user_turn_includes_context() {

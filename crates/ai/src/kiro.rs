@@ -689,12 +689,13 @@ impl Acp {
             let buf = stderr.clone();
             tokio::spawn(async move {
                 let mut chunk = [0u8; 4096];
+                let mut carry = Vec::new();
                 while let Ok(n) = e.read(&mut chunk).await {
                     if n == 0 {
                         break;
                     }
                     let mut b = buf.lock();
-                    b.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                    crate::sse::push_utf8(&mut carry, &chunk[..n], &mut b);
                     if b.len() > 8000 {
                         let cut = b.len() - 4000;
                         let cut = (cut..b.len()).find(|i| b.is_char_boundary(*i)).unwrap_or(b.len());

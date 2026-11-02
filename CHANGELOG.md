@@ -52,6 +52,16 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Jobs: run logs are pruned. Each job keeps the full log of its latest 20 runs, within the history retention (Settings → Queries); older runs keep their summary.
+- The window no longer goes blank on an unexpected error or a bad value kept in the window's storage: values are checked (and dropped when they don't fit), and an error shows what happened with Reload and "Reset window layout and reload".
+- Assistant: an approval shows Approved or Declined only once DataBrain took the answer; if the assistant had already stopped waiting it says so, and a failed answer shows an error and can be sent again.
+- Assistant: Stop takes effect while it waits for your approval (or for an editor change), instead of after the ten-minute wait.
+- Oracle: loading timestamps with a time zone works; they were sent as text, which Oracle rejected, and are now `TIMESTAMP '… +02:00'` literals.
+- Jobs: a scheduled run that fails to start no longer uses up its slot; it is tried again on the next check instead of waiting for the next period.
+- Workspace: an older DataBrain refuses a workspace saved by a newer one (it could drop fields it doesn't know when saving) and says why; before updating an existing workspace, DataBrain keeps a copy beside it (`workspace.db.bak-before-v<N>`).
+- Assistant: streamed answers no longer show � when a character (Vietnamese text, emoji) is split across network chunks, and tool-call arguments are no longer corrupted that way.
+- Jobs no longer run twice when the computer sleeps past a run's lease: a run that lost its lease to another runner (the background runner) stops before its next step, and the lease renewal stops it too.
+- Assistant: stopping it during a batch of tool calls no longer breaks the conversation (every later question failed at the provider). Calls that didn't run get a "not run" result, and conversations already affected are repaired when they continue.
 - Lineage: recursive CTEs without a column list resolve the recursive step's columns (the anchor's names are used), and CTEs that read themselves without `RECURSIVE` (SQL Server, Oracle) are recognised instead of shown as database tables.
 - Lineage: `WITH … UPDATE`, `WITH … DELETE`, `WITH … INSERT` and `WITH … MERGE` are traced through their CTEs instead of shown as not traced.
 - MCP: a call the client cancels (`notifications/cancelled`) stops at once: DataBrain no longer keeps waiting for the user's answer or running its query.

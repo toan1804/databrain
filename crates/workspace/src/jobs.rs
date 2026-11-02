@@ -14,6 +14,8 @@ use crate::{Error, Result, Workspace, new_id, now_ms};
 
 /// Run history kept per job.
 pub const RUNS_KEPT: i64 = 200;
+/// Runs per job that keep their full log (the rest keep their summary).
+pub const RUN_LOGS_KEPT: i64 = 20;
 /// A run whose runner hasn't reported for this long is taken as stopped.
 pub const STALE_RUN_MS: i64 = 120_000;
 
@@ -727,6 +729,24 @@ impl Workspace {
         self.get_job(&job.id)
     }
 
+    /// Drop the logs of runs that are not among each job's latest
+    /// [`RUN_LOGS_KEPT`], and of runs older than `older_than_days` (the
+    /// history retention; `None` = by count only). Runs keep their summary
+    /// (status, steps, rows, errors). Returns how many logs were dropped.
+    pub fn prune_job_run_logs(&self, older_than_days: Option<u32>) -> Result<usize> {
+        let c = self.conn.lock();
+        let mut n = c.execute(
+            "UPDATE job_runs SET log_json = NULL WHERE log_json IS NOT NULL AND status <> 'running' AND id NOT IN \
+               (SELECT id FROM (SELECT id, row_number() OVER (PARTITION BY job_id ORDER BY id DESC) AS k FROM job_runs) WHERE k <= ?1)",
+            params![RUN_LOGS_KEPT],
+        )?;
+        if let Some(days) = older_than_days {
+            let cutoff = now_ms() - days as i64 * 86_400_000;
+            n += c.execute("UPDATE job_runs SET log_json = NULL WHERE log_json IS NOT NULL AND status <> 'running' AND started_at < ?1", params![cutoff])?;
+        }
+        Ok(n)
+    }
+
     pub fn delete_job(&self, id: &str) -> Result<()> {
         let c = self.conn.lock();
         c.execute("DELETE FROM job_runs WHERE job_id = ?1", [id])?;
@@ -735,6 +755,12 @@ impl Workspace {
     }
 
     /// Record that the scheduler started the job at `at` (not a user edit).
+    /// Put back when the scheduler last started the job (a start that failed).
+    pub fn set_job_last_scheduled(&self, id: &str, at: Option<i64>) -> Result<()> {
+        self.conn.lock().execute("UPDATE jobs SET last_scheduled_at = ?2 WHERE id = ?1", params![id, at])?;
+        Ok(())
+    }
+
     pub fn mark_job_scheduled(&self, id: &str, at: i64) -> Result<()> {
         self.conn.lock().execute("UPDATE jobs SET last_scheduled_at = ?2 WHERE id = ?1", params![id, at])?;
         Ok(())
@@ -742,6 +768,13 @@ impl Workspace {
 
     /// Make a job look saved and last scheduled at `at` (tests of schedules).
     #[doc(hidden)]
+    /// Make the job's lease run out now (tests: a computer that slept).
+    #[doc(hidden)]
+    pub fn expire_job_lease_for_tests(&self, id: &str) -> Result<()> {
+        self.conn.lock().execute("UPDATE jobs SET lease_until = 0 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn backdate_job_for_tests(&self, id: &str, at: i64) -> Result<()> {
         self.conn.lock().execute("UPDATE jobs SET last_scheduled_at = ?2, updated_at = ?2 WHERE id = ?1", params![id, at])?;
         Ok(())
@@ -931,6 +964,42 @@ mod tests {
     /// Jobs saved before steps recorded who wrote their SQL: those the
     /// audit log shows the AI created or changed (approved) are marked once,
     /// keeping their edit time; others, and denied proposals, are not.
+    /// Logs are kept for each job's latest runs, within the retention;
+    /// older runs keep their summary; a running run is never touched.
+    #[test]
+    fn prunes_run_logs() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let a = ws.save_job(job(vec![node("a1")], vec![])).unwrap();
+        let mut j2 = job(vec![node("b1")], vec![]);
+        j2.name = "Other".into();
+        let b = ws.save_job(j2).unwrap();
+        let entry =
+            || RunLogEntry { seq: 1, at: 0, node_id: None, step: None, level: "info".into(), message: "m".into(), sql: None, rows: None, duration_ms: None };
+        let mut runs = Vec::new();
+        for i in 0..(RUN_LOGS_KEPT + 5) {
+            let mut r = ws.start_job_run(&a.id, "manual").unwrap();
+            r.status = if i == 0 { "running".into() } else { "success".into() };
+            ws.update_job_run(&r).unwrap();
+            ws.set_job_run_log(r.id, &[entry()]).unwrap();
+            runs.push(r.id);
+        }
+        let mut other = ws.start_job_run(&b.id, "manual").unwrap();
+        other.status = "success".into();
+        ws.update_job_run(&other).unwrap();
+        ws.set_job_run_log(other.id, &[entry()]).unwrap();
+        let has_log = |job: &str, id: i64| !ws.job_run_log(job, id).unwrap().is_empty();
+
+        assert_eq!(ws.prune_job_run_logs(None).unwrap(), 4, "beyond the latest 20, except the one still running");
+        assert!(has_log(&a.id, runs[0]), "a running run keeps its log");
+        assert!(!has_log(&a.id, runs[1]) && has_log(&a.id, *runs.last().unwrap()));
+        assert!(has_log(&b.id, other.id), "counted per job");
+        assert_eq!(ws.job_runs(&a.id, 100).unwrap().len(), runs.len(), "summaries stay");
+        // By age: older than the retention.
+        ws.conn.lock().execute("UPDATE job_runs SET started_at = 0 WHERE id = ?1", [other.id]).unwrap();
+        assert_eq!(ws.prune_job_run_logs(Some(30)).unwrap(), 1);
+        assert!(!has_log(&b.id, other.id));
+    }
+
     #[test]
     fn marks_jobs_the_ai_wrote_before_steps_recorded_it() {
         let ws = Workspace::open_in_memory().unwrap();

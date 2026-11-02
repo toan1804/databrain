@@ -732,7 +732,16 @@ impl ToolContext {
                         self.host.cannot_ask_reason()
                     )));
                 }
-                match self.host.approve(tool, &format!("{reason}. {summary}"), detail).await {
+                // Stop ends the wait for the user's answer at once.
+                let question = format!("{reason}. {summary}");
+                let answer = tokio::select! {
+                    a = self.host.approve(tool, &question, detail) => a,
+                    _ = self.cancel.cancelled() => {
+                        self.audit(tool, detail, "denied", Some("stopped"));
+                        return Err(AiError::Cancelled);
+                    }
+                };
+                match answer {
                     Some(v) => {
                         self.audit(tool, &v, "approved", None);
                         Ok(v)
@@ -1391,7 +1400,10 @@ impl ToolContext {
         let sql = arg(args, "sql")?;
         let mode = args.get("mode").and_then(|m| m.as_str()).unwrap_or("replace_selection");
         let proposal = json!({"sql": sql, "mode": mode, "title": args.get("title")});
-        let accepted = self.host.propose_edit(&proposal).await;
+        let accepted = tokio::select! {
+            a = self.host.propose_edit(&proposal) => a,
+            _ = self.cancel.cancelled() => return Err(AiError::Cancelled),
+        };
         self.audit("write_editor", &proposal, if accepted { "approved" } else { "denied" }, None);
         Ok(out(
             if accepted { "The user applied the SQL in the editor." } else { "The user did not apply the change." },

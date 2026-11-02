@@ -97,6 +97,8 @@ pub(crate) enum Lit {
     Binary,
     Date,
     Timestamp,
+    /// With a time zone (`… +02:00`).
+    TimestampTz,
     Text,
 }
 
@@ -107,6 +109,7 @@ fn lit_kind(f: &Field) -> Lit {
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => Lit::Binary,
         DataType::Date32 | DataType::Date64 => Lit::Date,
         DataType::Timestamp(_, None) => Lit::Timestamp,
+        DataType::Timestamp(_, Some(_)) => Lit::TimestampTz,
         _ if is_decimal_text(f) => Lit::Number,
         _ => Lit::Text,
     }
@@ -344,6 +347,15 @@ pub fn drop_table_sql(dialect: ConnectorKind, table: &str) -> String {
     }
 }
 
+/// `2026-01-02 03:04:05.6+02:00` → `2026-01-02 03:04:05.6 +02:00`.
+fn spaced_offset(s: &str) -> String {
+    // The offset's sign comes after the time (past the date's dashes).
+    match s.get(11..).and_then(|t| t.rfind(['+', '-'])).map(|i| i + 11) {
+        Some(i) if !s[..i].ends_with(' ') => format!("{} {}", &s[..i], &s[i..]),
+        _ => s.to_string(),
+    }
+}
+
 pub(crate) fn literal(cell: Option<&str>, kind: Lit, dialect: ConnectorKind) -> String {
     let l = lt(dialect);
     let Some(s) = cell else { return "NULL".into() };
@@ -361,6 +373,9 @@ pub(crate) fn literal(cell: Option<&str>, kind: Lit, dialect: ConnectorKind) -> 
         // Oracle doesn't read text as a date without NLS settings: typed literals.
         Lit::Date if l.typed_datetime_literals => format!("DATE {}", quote_literal(s)),
         Lit::Timestamp if l.typed_datetime_literals => format!("TIMESTAMP {}", quote_literal(s)),
+        // Oracle reads text as a timestamp only with NLS settings, and its
+        // literal wants a space before the offset: `TIMESTAMP '… +02:00'`.
+        Lit::TimestampTz if l.typed_datetime_literals => format!("TIMESTAMP {}", quote_literal(&spaced_offset(s))),
         // The same text escaper as parameters (connector-core).
         _ => match l.text_literal {
             TextLiteral::NPrefix => format!("N{}", databrain_connector_core::sql::quote_string(s, dialect)),
@@ -591,6 +606,19 @@ mod tests {
             delete_missing_sql(K::Mysql, "t", "s", &keys[..1])
                 .starts_with("DELETE FROM `t` WHERE NOT EXISTS (SELECT 1 FROM `s` src WHERE src.`id` = `t`.`id`)")
         );
+    }
+
+    /// Timestamps with a time zone load into Oracle as typed literals (text
+    /// was rejected); other databases take the text.
+    #[test]
+    fn timestamptz_literals() {
+        use ConnectorKind as K;
+        assert_eq!(literal(Some("2026-01-02 03:04:05.678+02:00"), Lit::TimestampTz, K::Oracle), "TIMESTAMP '2026-01-02 03:04:05.678 +02:00'");
+        assert_eq!(literal(Some("2026-01-02 03:04:05-08:00"), Lit::TimestampTz, K::Oracle), "TIMESTAMP '2026-01-02 03:04:05 -08:00'");
+        assert_eq!(literal(Some("2026-01-02 03:04:05.678+02:00"), Lit::TimestampTz, K::Postgres), "'2026-01-02 03:04:05.678+02:00'");
+        let f = Field::new("at", DataType::Timestamp(databrain_connector_core::arrow::datatypes::TimeUnit::Microsecond, Some("+02:00".into())), true);
+        assert!(matches!(lit_kind(&f), Lit::TimestampTz));
+        assert_eq!(column_type(K::Oracle, &f), "TIMESTAMP WITH TIME ZONE");
     }
 
     #[test]

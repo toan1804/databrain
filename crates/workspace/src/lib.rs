@@ -46,6 +46,20 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// The workspace's schema version, refused when a newer DataBrain wrote it:
+/// this one would not know its tables and could drop what it doesn't read
+/// when saving. Nothing is changed then.
+fn check_schema_version(conn: &Connection) -> Result<i64> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version as usize > MIGRATIONS.len() {
+        return Err(Error::Invalid(format!(
+            "This workspace was saved by a newer DataBrain (schema version {version}; this version knows up to {}). Update DataBrain to open it; nothing was changed.",
+            MIGRATIONS.len()
+        )));
+    }
+    Ok(version)
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
@@ -743,8 +757,18 @@ impl Workspace {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::Invalid(format!("cannot create {}: {e}", parent.display())))?;
         }
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(&path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        let version = check_schema_version(&conn)?;
+        // Before changing an existing workspace's schema, a copy as it was
+        // (`workspace.db.bak-before-v<new>`), kept beside it.
+        if version > 0 && (version as usize) < MIGRATIONS.len() {
+            let backup = std::path::PathBuf::from(format!("{}.bak-before-v{}", path.as_ref().display(), MIGRATIONS.len()));
+            if !backup.exists() {
+                conn.execute_batch(&format!("VACUUM INTO '{}'", backup.to_string_lossy().replace('\'', "''")))
+                    .map_err(|e| Error::Invalid(format!("cannot back up the workspace before updating it ({}): {e}", backup.display())))?;
+            }
+        }
         Self::init(conn)
     }
 
@@ -752,13 +776,16 @@ impl Workspace {
         Self::init(Connection::open_in_memory()?)
     }
 
+    /// The schema version this DataBrain knows (applied migrations).
+    pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
+
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Deleted or overwritten content (old SQL, connection settings) is
         // zeroed, not left in free pages of the file.
         conn.pragma_update(None, "secure_delete", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let version = check_schema_version(&conn)?;
         for (i, m) in MIGRATIONS.iter().enumerate().skip(version as usize) {
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(m)?;
@@ -1486,6 +1513,40 @@ mod tests {
     /// History search: every word, in any order, in the SQL, the error or
     /// the connection name; `"…"` is one phrase; filters by connection and
     /// by how the run ended.
+    /// A workspace from a newer DataBrain is refused, untouched; one from an
+    /// older version is backed up before its schema changes.
+    #[test]
+    fn schema_version_guard_and_backup() {
+        let dir = std::env::temp_dir().join(format!("dbtest-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workspace.db");
+        drop(Workspace::open(&path).unwrap());
+        // Newer: refused, version unchanged.
+        {
+            let c = Connection::open(&path).unwrap();
+            c.pragma_update(None, "user_version", (MIGRATIONS.len() + 3) as i64).unwrap();
+        }
+        let e = Workspace::open(&path).err().expect("refused");
+        assert!(e.to_string().contains("newer DataBrain"), "{e}");
+        let v: i64 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v as usize, MIGRATIONS.len() + 3);
+        // Older (one migration behind): backed up as it was, then updated.
+        {
+            let c = Connection::open(&path).unwrap();
+            c.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64).unwrap();
+            // Undo the last migration, as an older version left it.
+            c.execute_batch("DROP TABLE param_sets; ALTER TABLE job_runs DROP COLUMN params_json").unwrap();
+        }
+        let ws = Workspace::open(&path).unwrap();
+        assert!(ws.list_param_sets().unwrap().is_empty(), "migrated");
+        let backup = dir.join(format!("workspace.db.bak-before-v{}", MIGRATIONS.len()));
+        let b = Connection::open(&backup).unwrap();
+        let bv: i64 = b.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(bv as usize, MIGRATIONS.len() - 1, "the backup is the workspace before the update");
+        drop((ws, b));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn history_search_words_and_filters() {
         let ws = Workspace::open_in_memory().unwrap();
