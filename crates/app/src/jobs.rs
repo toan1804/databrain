@@ -987,15 +987,22 @@ pub fn tick_as(ctx: &JobCtx, trigger: &str) -> Vec<String> {
         if !ctx.workspace.claim_job(&j.id, &owner, now_ms() + LEASE_MS).unwrap_or(false) {
             continue;
         }
-        let due = ctx.workspace.get_job(&j.id).ok().and_then(|f| f.schedule.next_after(f.schedule_base())).is_some_and(|t| t <= now);
+        let fresh = ctx.workspace.get_job(&j.id).ok();
+        let due = fresh.as_ref().and_then(|f| f.schedule.next_after(f.schedule_base())).is_some_and(|t| t <= now);
         if !due {
             let _ = ctx.workspace.release_job(&j.id, &owner);
             continue;
         }
+        // Marked while the lease is held (a fast run could otherwise end and
+        // release it before the mark, and another runner start it again)…
+        let before = fresh.and_then(|f| f.last_scheduled_at);
         let _ = ctx.workspace.mark_job_scheduled(&j.id, now);
         match start(ctx, &j.id, trigger, None) {
             Ok(_) => started.push(j.id),
-            Err(_) => {
+            // …and given back when the run didn't start: the slot isn't used up.
+            Err(e) => {
+                tracing::warn!(job = %j.id, error = %e.message, "scheduled job did not start; it is tried again on the next tick");
+                let _ = ctx.workspace.set_job_last_scheduled(&j.id, before);
                 let _ = ctx.workspace.release_job(&j.id, &owner);
             }
         }

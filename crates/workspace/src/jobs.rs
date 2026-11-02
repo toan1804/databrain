@@ -735,6 +735,12 @@ impl Workspace {
     }
 
     /// Record that the scheduler started the job at `at` (not a user edit).
+    /// Put back when the scheduler last started the job (a start that failed).
+    pub fn set_job_last_scheduled(&self, id: &str, at: Option<i64>) -> Result<()> {
+        self.conn.lock().execute("UPDATE jobs SET last_scheduled_at = ?2 WHERE id = ?1", params![id, at])?;
+        Ok(())
+    }
+
     pub fn mark_job_scheduled(&self, id: &str, at: i64) -> Result<()> {
         self.conn.lock().execute("UPDATE jobs SET last_scheduled_at = ?2 WHERE id = ?1", params![id, at])?;
         Ok(())

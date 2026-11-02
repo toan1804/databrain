@@ -1009,3 +1009,23 @@ async fn lost_lease_stops_the_run() {
     assert!(log.iter().any(|l| l.message.contains("another runner took this job")), "{log:?}");
     assert_eq!(st.workspace.job_lease(&job.id).unwrap().map(|(o, _)| o).as_deref(), Some("cli:other"), "its lease isn't released by this run");
 }
+
+/// A scheduled job whose start fails keeps its slot: it is still due on
+/// the next tick, instead of waiting for the next period.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_scheduled_start_keeps_its_slot() {
+    let st = state();
+    let mut job = plain_job("Empty", vec![]);
+    job.schedule = JobSchedule { enabled: true, minutes: 60, ..Default::default() };
+    let job = st.workspace.save_job(job).unwrap();
+    let before = databrain_workspace::now_ms() - 7_200_000;
+    st.workspace.backdate_job_for_tests(&job.id, before).unwrap();
+    assert!(databrain_app::jobs::tick(&st.job_ctx()).is_empty(), "a job without steps doesn't start");
+    let after = st.workspace.get_job(&job.id).unwrap();
+    assert_eq!(after.last_scheduled_at, Some(before), "the slot is given back");
+    assert!(
+        st.workspace.list_jobs().unwrap().iter().find(|j| j.id == job.id).unwrap().next_run_at.is_some_and(|t| t <= databrain_workspace::now_ms()),
+        "still due"
+    );
+    assert!(st.workspace.job_lease(&job.id).unwrap().is_none(), "the lease is released");
+}
