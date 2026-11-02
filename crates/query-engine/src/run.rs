@@ -97,13 +97,17 @@ impl QueryEngine {
             outputs::validate_name(n)?;
             self.outputs.check_owner(n, &req.tab_id)?;
         }
-        if self.jobs.lock().values().any(|j| j.tab_id == req.tab_id || j.session_key == req.session_key()) {
-            return Err(EngineError::new("busy", "A query is already running in this tab"));
-        }
-
         let job_id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
-        self.jobs.lock().insert(job_id.clone(), JobHandle { tab_id: req.tab_id.clone(), session_key: req.session_key().to_string(), cancel: cancel.clone() });
+        {
+            // Checked and claimed under one lock: two runs started at once
+            // on the same tab or session can't both pass the check.
+            let mut jobs = self.jobs.lock();
+            if jobs.values().any(|j| j.tab_id == req.tab_id || j.session_key == req.session_key()) {
+                return Err(EngineError::new("busy", "A query is already running in this tab"));
+            }
+            jobs.insert(job_id.clone(), JobHandle { tab_id: req.tab_id.clone(), session_key: req.session_key().to_string(), cancel: cancel.clone() });
+        }
         // Previous outputs of this tab become "recent" (evictable).
         self.outputs.begin_run(&req.tab_id);
 

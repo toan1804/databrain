@@ -746,6 +746,46 @@ pub fn export_folder(node: &JobNode) -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
+/// Files the export steps of `job_id` wrote in its kept runs.
+fn files_written_by(ws: &Workspace, job_id: &str) -> HashSet<String> {
+    let runs = ws.job_runs(job_id, databrain_workspace::jobs::RUNS_KEPT).unwrap_or_default();
+    runs.into_iter().flat_map(|r| r.nodes.into_iter().filter_map(|n| n.summary.file)).collect()
+}
+
+/// Where an export of `name` into `folder` goes, and whether it may replace
+/// the file there: only a file an earlier run of the same job wrote (a fixed
+/// name like `report.csv` is updated each run). Any other file, or a link,
+/// is kept and the export is saved as `name (2)`, `name (3)`…
+pub fn export_target(folder: &std::path::Path, name: &str, written: &HashSet<String>) -> Result<(std::path::PathBuf, bool)> {
+    let p = std::path::Path::new(name);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let ext = p.extension().and_then(|e| e.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    let candidates = std::iter::once(folder.join(name)).chain((2..1000).map(|i| folder.join(format!("{stem} ({i}){ext}"))));
+    for c in candidates {
+        match std::fs::symlink_metadata(&c) {
+            Err(_) => return Ok((c, false)),
+            Ok(m) if m.is_file() && written.contains(&*c.to_string_lossy()) => return Ok((c, true)),
+            Ok(_) => {}
+        }
+    }
+    Err(EngineError::new("invalid", format!("{name} and its numbered copies already exist in {}", folder.display())))
+}
+
+/// Move the finished export `tmp` to `dest`. Without `replace` a file that
+/// appeared at `dest` meanwhile is kept (the export fails instead).
+fn finish_export(tmp: &std::path::Path, dest: &std::path::Path, replace: bool) -> std::io::Result<()> {
+    if replace {
+        return std::fs::rename(tmp, dest);
+    }
+    match std::fs::hard_link(tmp, dest) {
+        Ok(()) => std::fs::remove_file(tmp),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        // Folders without hard links (some network and FAT drives).
+        Err(_) if std::fs::symlink_metadata(dest).is_err() => std::fs::rename(tmp, dest),
+        Err(e) => Err(e),
+    }
+}
+
 /// DuckDB statement writing `select` to `path`.
 pub fn copy_sql(select: &str, path: &std::path::Path, format: FileFormat) -> String {
     let opts = match format {
@@ -871,12 +911,25 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
         .ok_or_else(|| EngineError::new("invalid", "The SQL returned no rows (it must end with a SELECT)"))?;
     if let Some(folder) = folder {
         let name = databrain_workspace::jobs::export_file_name(node.export_file.as_deref(), &node.name, job_name, node.export_format, now_ms());
-        let path = folder.join(name);
+        let written = files_written_by(&ctx.workspace, job_id);
+        let (path, replace) = export_target(&folder, &name, &written)?;
+        let mut notices = vec![];
+        if path.file_name().and_then(|n| n.to_str()) != Some(name.as_str()) {
+            notices.push(format!("{name} already exists and wasn't written by this job: saved as {}", path.display()));
+        }
+        // Written next to the file, then moved into place: a failed or
+        // cancelled export leaves the old file whole.
+        let tmp = folder.join(format!(".{name}.{}.part", uuid::Uuid::new_v4().simple()));
         // By handle: exactly this run's rows, even if another step has the same name.
         let select = format!("select * from results.{}", output.handle);
         t.log("info", format!("Writing {} rows to {}", output.rows, path.display()), None, None, None);
-        run_sql(ctx, duck_id, format!("{tab}:export"), copy_sql(&select, &path, node.export_format), None, Origin::Job, cancel, t).await?;
-        return Ok(NodeOut { rows: output.rows as i64, file: Some(path.to_string_lossy().into_owned()), notices: vec![] });
+        let r = run_sql(ctx, duck_id, format!("{tab}:export"), copy_sql(&select, &tmp, node.export_format), None, Origin::Job, cancel, t).await;
+        if let Err(e) = r.and_then(|_| finish_export(&tmp, &path, replace).map_err(|e| EngineError::new("io", format!("cannot save {}: {e}", path.display()))))
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        return Ok(NodeOut { rows: output.rows as i64, file: Some(path.to_string_lossy().into_owned()), notices });
     }
     let target =
         node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;

@@ -8,7 +8,7 @@
 //!   (every indexed schema); otherwise the table's own schema is read.
 
 use databrain_connector_core::arrow::datatypes::SchemaRef;
-use databrain_connector_core::{quote_ident, quote_path};
+use databrain_connector_core::{quote_ident, quote_object};
 use databrain_export::load::edit_literal;
 use serde::{Deserialize, Serialize};
 
@@ -120,7 +120,7 @@ impl QueryEngine {
                 .collect::<Vec<_>>()
                 .join("\n   OR ")
         };
-        let table = quote_path(kind, &format!("{}.{}", link.schema, link.table));
+        let table = quote_object(kind, &link.schema, &link.table);
         Ok(format!("SELECT *\nFROM {table}\nWHERE {cond}"))
     }
 }

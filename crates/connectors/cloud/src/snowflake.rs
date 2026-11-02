@@ -244,7 +244,8 @@ async fn external_browser(http: &reqwest::Client, base: &str, acct: &str, user: 
     if !ui.interactive() {
         return Err(ConnectorError::new(ErrorKind::Auth, "sign-in required"));
     }
-    let lb = databrain_auth::loopback::Loopback::bind("localhost", 0, "/").await?;
+    // Snowflake's SSO page hands the token over from its own origin.
+    let lb = databrain_auth::loopback::Loopback::bind("localhost", 0, "/").await?.allow_origins(&[".snowflakecomputing.com", ".snowflakecomputing.cn"]);
     let port = lb.port();
     let resp = http
         .post(format!("{base}/session/authenticator-request"))

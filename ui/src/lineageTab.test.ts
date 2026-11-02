@@ -13,7 +13,8 @@ vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({ writeText: async () => 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ save: async () => null, open: async () => null }));
 
 const { useStore, isQueryTab } = await import("./store");
-const { openLineage, openColumnLineage } = await import("./components/LineageTab");
+const { openColumnLineage } = await import("./components/LineageTab");
+const { openLineage } = await import("./components/openTabs");
 
 beforeEach(() => {
   calls.length = 0;

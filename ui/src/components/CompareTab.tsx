@@ -9,12 +9,6 @@ import { copyText } from "./CatalogMenus";
 
 type Side = NonNullable<CompareRef["source"]>;
 
-/** Open a schema compare tab (`source` filled in when started from a schema). */
-export function openCompare(source?: Side) {
-  const st = useStore.getState();
-  st.newTab({ title: "Compare schemas", sql: "", compare: { source: source ?? null, target: null }, connection_id: source?.connection_id ?? null });
-}
-
 const STATUS: Record<DiffStatus, { label: string; cls: string; icon: React.ReactNode }> = {
   only_source: { label: "Only in source", cls: "text-success", icon: <Plus size={12} /> },
   only_target: { label: "Only in target", cls: "text-danger", icon: <Minus size={12} /> },

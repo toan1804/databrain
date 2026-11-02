@@ -13,6 +13,10 @@
 #   repository variable TAURI_UPDATER_PUBKEY, and latest.json on the release.
 #   Builds without it show a download link instead of "Install".
 # Windows builds are not code-signed (SmartScreen warns once).
+#
+# Every installer gets a build provenance attestation (verify with
+# `gh attestation verify <file> --repo <owner>/<repo>`), and the release a
+# SHA256SUMS file listing all its files.
 name: Release
 
 on:
@@ -55,6 +59,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             script: app:build
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      # Build provenance attestations (signed with the workflow's OIDC token).
+      id-token: write
+      attestations: write
     env:
       CARGO_TERM_COLOR: always
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
@@ -163,6 +172,20 @@ jobs:
           cp "$b"/appimage/*.AppImage.sig updater/ 2>/dev/null || true
           ls -l updater
 
+      # Signed statement that these files were built by this workflow from
+      # this commit, recorded in the repository's attestations.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            target/${{ matrix.target }}/release/bundle/msi/*.msi
+            target/${{ matrix.target }}/release/bundle/deb/*.deb
+            target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+            target/${{ matrix.target }}/release/bundle/rpm/*.rpm
+            updater/*
+
       - name: Attach installers to the draft release
         uses: softprops/action-gh-release@v2
         with:
@@ -202,3 +225,31 @@ jobs:
           node scripts/updater-manifest.mjs sigs "$TAG" "$GITHUB_REPOSITORY" > latest.json
           cat latest.json
           gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber
+
+  # SHA256SUMS of every file on the release (installers, updater bundles,
+  # latest.json), attested like the installers.
+  checksums:
+    name: Checksums
+    needs: [build, updater-manifest]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Write SHA256SUMS
+        run: |
+          mkdir assets && cd assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY"
+          rm -f SHA256SUMS
+          sha256sum -- * > ../SHA256SUMS
+          cat ../SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: SHA256SUMS
+      - name: Attach SHA256SUMS
+        run: gh release upload "$TAG" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber

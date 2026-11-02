@@ -113,13 +113,13 @@ pub(crate) async fn column_stats(state: State<'_, AppState>, result_id: String, 
 
 #[tauri::command]
 pub(crate) async fn export_result(state: State<'_, AppState>, result_id: String, view: ViewSpec, options: ExportOptions, path: String) -> R<u64> {
-    api::export_result(&state, result_id, view, options, path).await
+    api::export_result(&state, result_id, view, options, paths::checked_str(&path, paths::Purpose::Export)?).await
 }
 
 /// Export every row of a result's query (run again without the row limit).
 #[tauri::command]
 pub(crate) async fn export_full_result(state: State<'_, AppState>, result_id: String, options: ExportOptions, path: String, export_id: String) -> R<u64> {
-    api::export_full_result(&state, &result_id, options, path, &export_id).await
+    api::export_full_result(&state, &result_id, options, paths::checked_str(&path, paths::Purpose::Export)?, &export_id).await
 }
 
 #[tauri::command]

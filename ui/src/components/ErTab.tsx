@@ -13,14 +13,6 @@ import { copyText } from "./CatalogMenus";
 import { svgToPng, themeColors } from "./LineageTab";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
 
-/** Open (or show the open) ER diagram of a schema. */
-export function openErDiagram(connectionId: string, schema: string, label: string) {
-  const st = useStore.getState();
-  const open = st.tabs.find((t) => t.er && t.connection_id === connectionId && t.er.schema === schema);
-  if (open) return st.setActiveTab(open.id);
-  st.newTab({ title: `ER · ${label}`, sql: "", connection_id: connectionId, er: { schema, label } });
-}
-
 type Load = { status: "loading" } | { status: "ready"; tables: TableColumns[] } | { status: "error"; message: string };
 
 const DIR_KEY = "db.er.dir";

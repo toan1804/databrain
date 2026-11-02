@@ -6,6 +6,12 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Security
 
+- Exports write to a new temporary file created beside the chosen file (never an existing file or link of that name, which was truncated or written through before) and rename it when done. A failed or cancelled export leaves the previous file whole.
+- MCP server: a message from the client is limited to 8 MiB. A longer line is answered with an error and skipped as it arrives, instead of being collected in memory without limit.
+- Job export steps no longer overwrite files they didn't write. If the file name is taken by another file (or a link), the rows are saved as `name (2)`, `name (3)`… and the run says so; a file an earlier run of the same job wrote is still updated. The file is written next to its destination and moved into place, so a failed or cancelled export leaves the previous file whole.
+- Oracle: the downloaded thin driver is checked against its SHA-256 every time DataBrain starts it, not only when it was installed. A file changed afterwards (or a link put in its place) is not run, and is downloaded again.
+- Paths sent by the app window are checked before a file is read or written: absolute paths only, no hidden files or folders (except for importing from `.pgpass`), no writing through a symbolic link, and each command accepts only its own file types (an export writes `.csv`, `.parquet`…, a query tab never saves a `.command` or `.dylib`). Loading a DuckDB library needs a file named like one (`libduckdb.dylib`, `libduckdb.so`, `duckdb.dll`) and a confirmation in a native dialog, and the saved library path and Oracle driver URL can no longer be changed through the generic settings command.
+- Sign-in redirects: the local listener only answers requests addressed to itself (a page on another name resolving to 127.0.0.1 is refused) and only pages of origins the sign-in allows (Snowflake's SSO page); it no longer sends `Access-Control-Allow-Origin: *`. OpenRouter sign-in uses a free port and a random callback path instead of port 3000 without a state.
 - With "Allow write statements" on, production still refuses and confirms: a query calling a function that could write needs the user's confirmation on Prod, and elsewhere asks instead of running automatically. T-SQL like `SELECT 1 EXEC xp_cmdshell 'whoami'` (no separator) no longer counts as a read, and each statement of a script is classified by its own keyword.
 - Kiro: kiro-cli runs in a private folder of the user's (owner-only, under the user's cache folder) instead of a fixed folder in the shared temp directory, which another user could create first on a multi-user computer.
 - `:name` values, load INSERTs and SQL export share one text escaper. On MySQL a value used `\'`, which `NO_BACKSLASH_ESCAPES` reads as a backslash and the end of the string; quotes are now doubled and backslashes doubled. Snowflake loads now escape backslashes, and BigQuery/Databricks loads use `\'` (they read `''` as two strings). A typed literal containing a backslash is quoted as a value instead of kept.
@@ -29,6 +35,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Releases include a `SHA256SUMS` file for every file attached, and each installer has a GitHub build provenance attestation (`gh attestation verify <file> --repo toan1804/databrain`).
+- SECURITY.md (how to report a vulnerability privately), CONTRIBUTING.md and a Dependabot configuration for Rust, npm, GitHub Actions and the Oracle helper's Go modules.
 - Parameter sets: save `:name` values under a name and apply them in any tab or notebook; jobs take parameters (a set and values of their own) that fill their steps on every run, can run once with another set, and take `--set`/`--param` from `databrain-jobs run`.
 - Explorer: rows and size of a table on hover, from the database's statistics, on every engine (size where the engine keeps it).
 - Load mode "Sync (mirror) by key" for job load steps and "Load into…": merge by key, then delete the table's rows that are no longer among the rows; the report counts the deletions, and a step without rows is refused. The assistant can use it in jobs.
@@ -52,6 +60,12 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- The app's code is no longer one 1.9 MB file: React, the editor and the grid are separate files, and the DDL, job, lineage, schema compare and ER diagram tabs (with the SQL formatter) load when first opened. Code read at startup is about 1.6 MB, and the build warns again above 800 kB per file.
+- Job logs shown live in the app keep each run's latest 5,000 lines and the latest 10 runs; they grew for as long as the app stayed open.
+- A table whose name contains a dot (`"x.y"`) is quoted as one name when editing rows, opening related rows and counting rows on SQLite; it was split into two parts.
+- The per-tab lock used while connecting is removed once nobody waits on it; one was kept for every tab and job step ever opened.
+- A very large idle-disconnect time (minutes) no longer overflows when turned into seconds; it means practically never.
+- Two runs started at the same moment in one tab (or on one session) could both start; checking for a running query and claiming the tab now happen together.
 - Jobs: run logs are pruned. Each job keeps the full log of its latest 20 runs, within the history retention (Settings → Queries); older runs keep their summary.
 - The window no longer goes blank on an unexpected error or a bad value kept in the window's storage: values are checked (and dropped when they don't fit), and an error shows what happened with Reload and "Reset window layout and reload".
 - Assistant: an approval shows Approved or Declined only once DataBrain took the answer; if the assistant had already stopped waiting it says so, and a failed answer shows an error and can be sent again.

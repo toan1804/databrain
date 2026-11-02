@@ -1,0 +1,38 @@
+# Dependency updates, grouped weekly so they arrive as a few pull requests.
+# Security updates also need "Dependabot security updates" turned on in the
+# repository settings.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      rust-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /ui
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      ui-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # The Oracle driver helper: its binaries are pinned by agent/SHA256SUMS, so
+  # an update needs a new helper release (docs/RELEASING.md) before merging.
+  - package-ecosystem: gomod
+    directory: /crates/connectors/oracle/agent
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2

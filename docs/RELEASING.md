@@ -12,6 +12,17 @@
 
 Push a tag `vX.Y.Z` (matching `version` in `crates/app/tauri.conf.json`): the Release workflow (`.github/workflows/release.yml`) builds the installers for macOS (Apple Silicon, with and without DuckDB, and Intel), Windows and Linux and attaches them to a draft release. Publish the draft; running apps then see it in their update check (and, with an updater key, `latest.json` for in-app updates). The CI workflow builds and tests every push and pull request on macOS, Linux and Windows.
 
+## Checksums and provenance
+
+Each installer and updater bundle gets a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations) from the Release workflow, and the release gets a `SHA256SUMS` file listing every file on it (also attested). To check a download:
+
+```sh
+shasum -a 256 -c SHA256SUMS --ignore-missing          # the file matches the release
+gh attestation verify DataBrain_0.3.0_aarch64.dmg --repo toan1804/databrain   # built by this repository's workflow
+```
+
+`SHA256SUMS` is written after the builds and `latest.json`; a file attached to the draft by hand afterwards is not in it (run the workflow again, or the checksums job, before publishing).
+
 ## Signing and in-app updates
 
 Each part turns on when its secrets are set (Settings → Secrets and variables → Actions) and is skipped otherwise, so unsigned builds keep working.

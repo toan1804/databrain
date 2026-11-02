@@ -37,8 +37,8 @@ impl QueryEngine {
                 None => {}
             }
         }
-        let gate = self.connecting.lock().entry(key.clone()).or_default().clone();
-        let _g = gate.lock().await;
+        let gate = ConnectGate::enter(&self.connecting, &key);
+        let _g = gate.gate.lock().await;
         if let Some(s) = self.sessions.lock().get(&key).filter(|s| s.sandboxed || !sandbox) {
             return Ok(s.session.clone());
         }
@@ -168,7 +168,7 @@ impl QueryEngine {
                     .and_then(|p| p.config.opt(databrain_connector_core::IDLE_DISCONNECT_OPTION).and_then(|v| v.trim().parse::<u64>().ok()));
                 let limit = match own {
                     Some(0) => None,
-                    Some(m) => Some(Duration::from_secs(m * 60)),
+                    Some(m) => Some(minutes(m)),
                     None => default,
                 };
                 (c, limit)
@@ -187,7 +187,7 @@ impl QueryEngine {
     /// The idle time after which sessions close ([`IDLE_DISCONNECT_SETTING`]); `None` = never.
     pub fn idle_disconnect(&self) -> Option<Duration> {
         let minutes = self.workspace.get_setting(IDLE_DISCONNECT_SETTING).ok().flatten().and_then(|v| v.as_u64()).unwrap_or(IDLE_DISCONNECT_DEFAULT_MINUTES);
-        (minutes > 0).then(|| Duration::from_secs(minutes * 60))
+        (minutes > 0).then(|| self::minutes(minutes))
     }
 
     /// Close every session of a connection (after editing or deleting it).
@@ -354,5 +354,69 @@ impl QueryEngine {
     /// Close the database sessions of a run key (keeps its outputs).
     pub fn release_sessions(&self, tab: &str) {
         self.sessions.lock().retain(|(_, t), _| t != tab);
+    }
+}
+
+/// `m` minutes; a huge setting means "practically never", not an overflow.
+fn minutes(m: u64) -> Duration {
+    Duration::from_secs(m.saturating_mul(60))
+}
+
+/// One connection attempt per session key at a time. The entry is removed
+/// when the last caller using it is done, so the map doesn't keep one per
+/// tab or job step ever opened.
+struct ConnectGate<'a> {
+    map: &'a Mutex<HashMap<SessionKey, Arc<tokio::sync::Mutex<()>>>>,
+    key: SessionKey,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> ConnectGate<'a> {
+    fn enter(map: &'a Mutex<HashMap<SessionKey, Arc<tokio::sync::Mutex<()>>>>, key: &SessionKey) -> Self {
+        let gate = map.lock().entry(key.clone()).or_default().clone();
+        Self { map, key: key.clone(), gate }
+    }
+}
+
+impl Drop for ConnectGate<'_> {
+    fn drop(&mut self) {
+        let mut m = self.map.lock();
+        // Clones are taken under this lock: 2 = the map's and ours, nobody waiting.
+        if Arc::strong_count(&self.gate) == 2 && m.get(&self.key).is_some_and(|g| Arc::ptr_eq(g, &self.gate)) {
+            m.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod minutes_tests {
+    use super::*;
+
+    #[test]
+    fn huge_idle_minutes_dont_overflow() {
+        assert_eq!(minutes(2), Duration::from_secs(120));
+        assert_eq!(minutes(u64::MAX), Duration::from_secs(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn gates_are_removed_when_done() {
+        let map = Mutex::new(HashMap::new());
+        let key: SessionKey = ("c".into(), "t".into());
+        {
+            let a = ConnectGate::enter(&map, &key);
+            let held = a.gate.lock().await;
+            let b = ConnectGate::enter(&map, &key);
+            assert!(Arc::ptr_eq(&a.gate, &b.gate), "one gate per key");
+            drop(held);
+            drop(a);
+            assert_eq!(map.lock().len(), 1, "kept while another caller uses it");
+            drop(b);
+        }
+        assert!(map.lock().is_empty());
     }
 }

@@ -4,12 +4,12 @@ use super::*;
 
 #[tauri::command]
 pub(crate) fn save_text_file(path: String, contents: String) -> R<()> {
-    api::save_text_file(&path, &contents)
+    api::save_text_file(&paths::checked_str(&path, paths::Purpose::SaveText)?, &contents)
 }
 
 #[tauri::command]
 pub(crate) fn save_base64_file(path: String, data: String) -> R<()> {
-    api::save_base64_file(&path, &data)
+    api::save_base64_file(&paths::checked_str(&path, paths::Purpose::SaveImage)?, &data)
 }
 
 #[tauri::command]
@@ -66,6 +66,7 @@ pub(crate) async fn close_tab(state: State<'_, AppState>, tab_id: String) -> R<(
 
 #[tauri::command]
 pub(crate) async fn read_sql_file(path: String) -> R<sql_files::SqlFile> {
+    let path = paths::checked_str(&path, paths::Purpose::Read)?;
     tauri::async_runtime::spawn_blocking(move || sql_files::read_sql_file(&path))
         .await
         .map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?
@@ -73,6 +74,7 @@ pub(crate) async fn read_sql_file(path: String) -> R<sql_files::SqlFile> {
 
 #[tauri::command]
 pub(crate) async fn write_sql_file(path: String, text: String, expected_mtime: Option<i64>) -> R<i64> {
+    let path = paths::checked_str(&path, paths::Purpose::WriteSql)?;
     tauri::async_runtime::spawn_blocking(move || sql_files::write_sql_file(&path, &text, expected_mtime))
         .await
         .map_err(|e| databrain_query_engine::EngineError::new("internal", e.to_string()))?

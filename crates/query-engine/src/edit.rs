@@ -16,7 +16,7 @@ use databrain_connector_core::arrow::datatypes::SchemaRef;
 use databrain_connector_core::sql::dialect_for;
 use databrain_connector_core::sqlparser::ast::{Expr, GroupByExpr, Ident, ObjectNamePart, SelectItem, SetExpr, Statement, TableFactor};
 use databrain_connector_core::sqlparser::parser::Parser;
-use databrain_connector_core::{ConnectorKind, DbObject, ExecOptions, ObjectDetail, ObjectKind, quote_ident, quote_path};
+use databrain_connector_core::{ConnectorKind, DbObject, ExecOptions, ObjectDetail, ObjectKind, quote_ident, quote_object};
 use databrain_export::load::edit_literal;
 use serde::{Deserialize, Serialize};
 
@@ -339,7 +339,7 @@ impl QueryEngine {
     pub fn edit_statements(&self, t: &EditTarget, schema: &SchemaRef, changes: &[RowChange]) -> Result<Vec<EditStatement>> {
         let kind = self.workspace().get_connection(&t.connection_id)?.config.kind;
         let bad = |m: String| EngineError::new("invalid", m);
-        let table = quote_path(kind, &format!("{}.{}", t.schema, t.table));
+        let table = quote_object(kind, &t.schema, &t.table);
         let col = |i: usize| -> Result<(String, &databrain_connector_core::arrow::datatypes::Field)> {
             let name =
                 t.columns.get(i).cloned().flatten().ok_or_else(|| {

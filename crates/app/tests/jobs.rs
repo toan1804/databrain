@@ -351,6 +351,36 @@ async fn export_steps_write_files_with_duckdb() {
     assert!(json.contains("\"name\":\"b\""), "{json}");
 }
 
+/// An export never replaces a file it didn't write: the user's file is kept
+/// and the rows go to `name (2)`; the job's own file is replaced next run.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_steps_keep_files_they_did_not_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state();
+    std::fs::write(dir.path().join("report.csv"), "the user's file").unwrap();
+    let mut e = node("e", "out", JobNodeKind::Export, None, "select 1 as id");
+    e.export_folder = Some(dir.path().to_string_lossy().into_owned());
+    e.export_file = Some("report".into());
+    let mut job = st.workspace.save_job(plain_job("Keep", vec![e])).unwrap();
+    api::run_job(&st, &job.id, None).unwrap();
+    let run = finished(&st, &job.id).await;
+    let rec = run.nodes[0].summary.clone();
+    assert_eq!(run.status, "success", "{:?}", rec.error);
+    assert_eq!(std::fs::read_to_string(dir.path().join("report.csv")).unwrap(), "the user's file");
+    let file = rec.file.unwrap();
+    assert!(file.ends_with("report (2).csv"), "{file}");
+    assert!(rec.notices.iter().any(|n| n.contains("already exists")), "{:?}", rec.notices);
+    // Next run: report (2).csv is this job's, so it is updated in place.
+    job.nodes[0].sql = "select 2 as id".into();
+    let job = st.workspace.save_job(job).unwrap();
+    api::run_job(&st, &job.id, None).unwrap();
+    let run = finished(&st, &job.id).await;
+    assert_eq!(run.nodes[0].summary.file.as_deref(), Some(file.as_str()));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "id\n2\n");
+    let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(names.len(), 2, "no temporary files left: {names:?}");
+}
+
 fn plain_job(name: &str, nodes: Vec<JobNode>) -> Job {
     Job {
         id: String::new(),

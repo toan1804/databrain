@@ -8,6 +8,7 @@ pub mod conn_io;
 pub mod jobs;
 pub mod logging;
 pub mod meta_writer;
+pub mod paths;
 pub mod sql_files;
 pub mod updates;
 
