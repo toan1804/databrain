@@ -35,6 +35,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Releases include a `SHA256SUMS` file for every file attached, and each installer has a GitHub build provenance attestation (`gh attestation verify <file> --repo toan1804/databrain`).
 - SECURITY.md (how to report a vulnerability privately), CONTRIBUTING.md and a Dependabot configuration for Rust, npm, GitHub Actions and the Oracle helper's Go modules.
 - Parameter sets: save `:name` values under a name and apply them in any tab or notebook; jobs take parameters (a set and values of their own) that fill their steps on every run, can run once with another set, and take `--set`/`--param` from `databrain-jobs run`.
 - Explorer: rows and size of a table on hover, from the database's statistics, on every engine (size where the engine keeps it).
