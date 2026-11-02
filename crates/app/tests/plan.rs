@@ -55,6 +55,7 @@ async fn run(st: &AppState, conn: &str, sql: &str) {
                 session_key: None,
                 output_name: None,
                 params: Default::default(),
+                output_masks: None,
             },
             None,
         )

@@ -18,11 +18,14 @@ pub struct ExecOptions {
     /// A hint: connectors whose server can limit the result (Databricks
     /// `row_limit`) pass it on so less data is produced and transferred.
     pub max_rows: Option<usize>,
+    /// Output columns to mask when `results.<name>` tables are loaded
+    /// (DuckDB; see [`crate::external::OutputMasks`]).
+    pub output_masks: Option<std::sync::Arc<crate::external::OutputMasks>>,
 }
 
 impl Default for ExecOptions {
     fn default() -> Self {
-        Self { batch_size: 1000, cancel: CancellationToken::new(), max_rows: None }
+        Self { batch_size: 1000, cancel: CancellationToken::new(), max_rows: None, output_masks: None }
     }
 }
 

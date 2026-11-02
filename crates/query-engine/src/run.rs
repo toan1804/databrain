@@ -345,6 +345,7 @@ impl QueryEngine {
                     cancel: cancel.clone(),
                     // One row past the cap tells us the result was truncated.
                     max_rows: limit.map(|l| l.saturating_add(1)),
+                    output_masks: req.output_masks.clone(),
                 },
             )
             .await?;

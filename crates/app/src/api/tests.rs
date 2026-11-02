@@ -126,6 +126,7 @@ async fn end_to_end_sqlite() {
             session_key: None,
             output_name: None,
             params: Default::default(),
+            output_masks: None,
         },
     )
     .unwrap();
@@ -198,6 +199,7 @@ async fn end_to_end_sqlite() {
         session_key: None,
         output_name: None,
         params: Default::default(),
+        output_masks: None,
     };
     let RunResponse::Started { job_id, .. } = run_query(&st, again("select count(*) from people")).unwrap() else { panic!() };
     let latest = finished_results(&sink, &job_id).await[0].id.clone();
@@ -1304,6 +1306,7 @@ async fn run_query_on_duckdb_checks_output_sources() {
                     session_key: None,
                     output_name: Some(name.into()),
                     params: Default::default(),
+                    output_masks: None,
                 },
                 None,
             )

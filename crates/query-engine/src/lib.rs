@@ -77,6 +77,11 @@ pub struct RunRequest {
     /// Values of `:name` parameters in `sql` (editor parameter boxes).
     #[serde(default)]
     pub params: HashMap<String, databrain_connector_core::sql::ParamValue>,
+    /// Output columns the statement must not see (the assistant's runs that
+    /// read `results.<name>`); not sent by the UI.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub output_masks: Option<std::sync::Arc<databrain_connector_core::external::OutputMasks>>,
 }
 
 impl RunRequest {

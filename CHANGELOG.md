@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Security
 
+- query_outputs (and run_query on DuckDB) mask an output's sensitive columns as DuckDB loads `results.<name>`, as query_result already did. They only refused SQL that named a sensitive column, so `SELECT *` under a CTE column list could rename one, and a failing cast quoted its value in the error sent to the model. Now the session only sees `***`, the SQL may name the column, and an output that wasn't checked is refused. In a DuckDB file other sessions share, outputs with sensitive columns are refused (use query_outputs).
 - async-executor 1.14.0 (through zbus) was yanked: updated to 1.14.1. RUSTSEC-2026-0429 (zip `extract()` aborting on a huge declared size) only reaches zip copies used on trusted archives (DuckDB's build script, signed updates), so it is listed with the other zip exceptions.
 - Rust 1.88 is now the minimum (was 1.87), which lets in tiberius 0.13 (SQL Server TLS on rustls 0.23 and rustls-webpki 0.103), time 0.3.55, and zip 9 through rust_xlsxwriter 0.102. Seven advisory exceptions are gone from `deny.toml`; the three zip ones remain for zip copies DataBrain doesn't choose (DuckDB's build script, the updater). CI checks the workspace still builds on 1.88.
 - Lineage and ER diagrams only use appearance colours that are plain CSS colours (hex, `rgb()`/`hsl()`, a colour name). A custom colour containing quotes or markup went into the SVG unescaped; it now falls back to the default colour.

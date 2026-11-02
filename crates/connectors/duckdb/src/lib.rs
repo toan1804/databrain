@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use databrain_auth::{AuthMethodKind, CredentialSource};
 use databrain_connector_core::arrow::ipc::reader::StreamReader;
-use databrain_connector_core::external::{ExternalTablesSlot, RESULTS_SCHEMA, referenced_results};
+use databrain_connector_core::external::{ExternalTablesSlot, OutputMasks, RESULTS_SCHEMA, referenced_results};
 use databrain_connector_core::{
     Capabilities, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind, ExecOptions, ExecSummary,
     FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender, TableColumns, quote_ident, quote_literal,
@@ -693,7 +693,19 @@ impl DuckSession {
 
 /// Load (or refresh) the outputs `sql` references into the in-memory
 /// `results` catalog of this session. Returns notices to show the user.
-fn load_outputs(conn: &duckdb::Connection, sql: &str, slot: Option<&ExternalTablesSlot>, loaded: &Loaded) -> Result<Vec<String>> {
+///
+/// With `masks` (the assistant's runs), each output is loaded with its
+/// sensitive columns masked. A database file's instance is shared with the
+/// user's sessions (`shared`), whose `results` tables a masked load would
+/// replace, so masked outputs are refused there.
+fn load_outputs(
+    conn: &duckdb::Connection,
+    sql: &str,
+    slot: Option<&ExternalTablesSlot>,
+    loaded: &Loaded,
+    masks: Option<&OutputMasks>,
+    shared: bool,
+) -> Result<Vec<String>> {
     let names = referenced_results(sql);
     if names.is_empty() {
         return Ok(vec![]);
@@ -713,6 +725,17 @@ fn load_outputs(conn: &duckdb::Connection, sql: &str, slot: Option<&ExternalTabl
                     format!("Available: {}", known.iter().take(15).map(|n| format!("results.{n}")).collect::<Vec<_>>().join(", "))
                 };
                 return Err(ConnectorError::query(format!("results.{name}: {e}. {hint}")));
+            }
+        };
+        let t = match masks {
+            None => t,
+            Some(m) => {
+                if shared && m.0.get(&t.version_key).is_some_and(|c| !c.is_empty()) {
+                    return Err(ConnectorError::query(format!(
+                        "results.{name} has sensitive columns, which can't be masked in a database file other sessions use; query it with query_outputs (the Results connection) instead"
+                    )));
+                }
+                m.apply(t).map_err(ConnectorError::query)?
             }
         };
         if let Some(n) = &t.notice {
@@ -854,8 +877,16 @@ fn convert_batch(b: &arrow58::record_batch::RecordBatch) -> Result<databrain_con
     r.next().ok_or_else(|| ConnectorError::internal("empty IPC stream"))?.map_err(Into::into)
 }
 
-fn run(conn: &duckdb::Connection, sql: &str, opts: &ExecOptions, tx: &StreamSender, outputs: Option<&ExternalTablesSlot>, loaded: &Loaded) -> Result<()> {
-    for n in load_outputs(conn, sql, outputs, loaded)? {
+fn run(
+    conn: &duckdb::Connection,
+    sql: &str,
+    opts: &ExecOptions,
+    tx: &StreamSender,
+    outputs: Option<&ExternalTablesSlot>,
+    loaded: &Loaded,
+    shared: bool,
+) -> Result<()> {
+    for n in load_outputs(conn, sql, outputs, loaded, opts.output_masks.as_deref(), shared)? {
         tx.blocking_send(Ok(StreamEvent::Notice(n)));
     }
     // Load the extension a query needs (bundled copy first).
@@ -966,6 +997,7 @@ impl Session for DuckSession {
         let (cancel, interrupt) = (opts.cancel.clone(), self.interrupt.clone());
         let (outputs, loaded) = (self.outputs.clone(), self.loaded.clone());
         let sandboxed = self.sandboxed;
+        let shared = self._db.is_some();
         let done = tokio_util::sync::CancellationToken::new();
         let done_guard = done.clone();
         // duckdb-rs disconnects *before* clearing the interrupt handle's
@@ -988,7 +1020,7 @@ impl Session for DuckSession {
                 tx.blocking_send(Err(ConnectorError::internal("lock poisoned")));
                 return;
             };
-            if let Err(e) = run(&g, &sql, &opts, &tx, outputs.as_deref(), &loaded) {
+            if let Err(e) = run(&g, &sql, &opts, &tx, outputs.as_deref(), &loaded, shared) {
                 let e = if opts.cancel.is_cancelled() {
                     ConnectorError::cancelled()
                 } else if sandboxed {
@@ -1426,6 +1458,41 @@ mod tests {
                 comment: Some("output r1".into()),
             }]
         }
+    }
+
+    /// The assistant's runs load outputs with their sensitive columns masked,
+    /// refuse outputs that weren't checked, and refuse masking in a database
+    /// file shared with other sessions.
+    #[tokio::test]
+    async fn masks_output_columns_for_the_assistant() {
+        use databrain_connector_core::external::OutputMasks;
+        let slot = ExternalTablesSlot::new();
+        slot.set(Arc::new(FakeOutputs(std::sync::Mutex::new(("v1".into(), 4)))));
+        let conn = DuckdbConnector::with_outputs(slot);
+        let creds = || Arc::new(InlineCredentialSource::new(AuthMethod::None, None));
+        let opts = |m: OutputMasks| ExecOptions { output_masks: Some(Arc::new(m)), ..Default::default() };
+        let masked = || OutputMasks([("v1".to_string(), vec!["region".to_string()])].into());
+        let mem = conn.connect(&ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None), creds()).await.unwrap();
+        // Renamed through a CTE column list: still the mask.
+        let sql = "with c(a, b) as (select * from results.sales) select string_agg(distinct a, ',') from c";
+        let r = mem.execute(sql, opts(masked())).await.unwrap().collect().await.unwrap();
+        assert_eq!(r.batches[0].column(0).as_string::<i32>().value(0), "***");
+        // The same session without masks (the user's run) gets the values back.
+        let r = q(mem.as_ref(), "select string_agg(distinct region, ',' order by region) from results.sales").await;
+        assert_eq!(r.batches[0].column(0).as_string::<i32>().value(0), "EU,US");
+        // An output the caller didn't check is refused.
+        let e = mem.execute("select * from results.sales", opts(OutputMasks::default())).await.unwrap().collect().await.unwrap_err();
+        assert!(e.message.contains("not checked"), "{}", e.message);
+        // A database file is shared with other sessions: no masked loads there.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+        cfg.file_path = Some(dir.path().join("m.duckdb").to_string_lossy().into_owned());
+        let file = conn.connect(&cfg, creds()).await.unwrap();
+        let e = file.execute("select * from results.sales", opts(masked())).await.unwrap().collect().await.unwrap_err();
+        assert!(e.message.contains("sensitive columns"), "{}", e.message);
+        // Nothing to mask: fine there too.
+        let none = OutputMasks([("v1".to_string(), vec![])].into());
+        assert_eq!(file.execute("select * from results.sales", opts(none)).await.unwrap().collect().await.unwrap().batches[0].num_rows(), 4);
     }
 
     #[tokio::test]
