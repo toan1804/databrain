@@ -159,9 +159,8 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                        if let Some(idle) = engine.idle_disconnect() {
-                            engine.close_idle(idle);
-                        }
+                        // Each connection after its own idle time when it has one.
+                        engine.close_idle_with(engine.idle_disconnect());
                     }
                 });
             }

@@ -66,7 +66,7 @@ impl QueryEngine {
         // connection": a server that accepts the socket and never finishes
         // the handshake fails with a message instead of a spinner. Not for
         // browser sign-in (the user may take a while) or local files.
-        let limit = (!profile.config.auth.is_interactive() && !kind.traits().local).then(|| self.connect_timeout());
+        let limit = (!profile.config.auth.is_interactive() && !kind.traits().local).then(|| self.connect_timeout_for(&profile.config));
         let reach = async {
             let (cfg, tunnel) = self.tunnel(&profile.config, Some(&profile.id), None).await?;
             self.read_stored_secret(&profile, creds.as_ref()).await?;
@@ -125,7 +125,7 @@ impl QueryEngine {
         if !matches!(profile.config.auth, A::Password { .. } | A::ApiToken { .. } | A::KeyPair { .. }) {
             return Ok(());
         }
-        let limit = self.connect_timeout();
+        let limit = self.connect_timeout_for(&profile.config);
         if tokio::time::timeout(limit, creds.get()).await.is_err() {
             return Err(EngineError::new(
                 "timeout",
@@ -148,11 +148,36 @@ impl QueryEngine {
     /// statement, an open transaction, or still referenced elsewhere (an
     /// export or catalog call in progress). Returns how many were closed.
     pub fn close_idle(&self, idle: Duration) -> usize {
+        self.close_idle_with(Some(idle))
+    }
+
+    /// Close idle sessions, each connection after its own idle time (its
+    /// `idle_disconnect_minutes` option; `0` = never), else after `default`
+    /// (`None` = never). Returns how many were closed.
+    pub fn close_idle_with(&self, default: Option<Duration>) -> usize {
         let busy: Vec<String> = self.jobs.lock().values().map(|j| j.session_key.clone()).collect();
         let now = Instant::now();
+        let ids: std::collections::HashSet<String> = self.sessions.lock().keys().map(|(c, _)| c.clone()).collect();
+        let limits: HashMap<String, Option<Duration>> = ids
+            .into_iter()
+            .map(|c| {
+                let own = self
+                    .workspace
+                    .get_connection(&c)
+                    .ok()
+                    .and_then(|p| p.config.opt(databrain_connector_core::IDLE_DISCONNECT_OPTION).and_then(|v| v.trim().parse::<u64>().ok()));
+                let limit = match own {
+                    Some(0) => None,
+                    Some(m) => Some(Duration::from_secs(m * 60)),
+                    None => default,
+                };
+                (c, limit)
+            })
+            .collect();
         let mut g = self.sessions.lock();
         let before = g.len();
-        g.retain(|(_, key), live| {
+        g.retain(|(c, key), live| {
+            let Some(idle) = limits.get(c).copied().flatten() else { return true };
             let in_use = busy.contains(key) || Arc::strong_count(&live.session) > 1;
             in_use || live.session.in_transaction() || now.duration_since(*live.last_used.lock()) < idle
         });

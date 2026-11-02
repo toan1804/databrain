@@ -237,6 +237,40 @@ async fn manual_commit_opens_a_transaction_until_commit_or_rollback() {
     assert!(!f.engine.in_transaction(&f.conn_id, "tab1"));
 }
 
+/// A connection's own idle time and connect timeout win over the global
+/// settings; `0` minutes keeps its sessions open.
+#[tokio::test]
+async fn per_connection_idle_time_and_connect_timeout() {
+    let f = fixture(EnvTag::None);
+    let set = |k: &str, v: Option<&str>| {
+        let mut p = f.ws.get_connection(&f.conn_id).unwrap();
+        match v {
+            Some(v) => p.config.options.insert(k.into(), v.into()),
+            None => p.config.options.remove(k),
+        };
+        f.ws.save_connection(p).unwrap();
+    };
+    let open = |f: &Fixture| {
+        let (e, id) = (f.engine.clone(), f.conn_id.clone());
+        async move { e.session_for_tests(&id).await.unwrap() }
+    };
+    drop(open(&f).await);
+    set(databrain_connector_core::IDLE_DISCONNECT_OPTION, Some("0"));
+    assert_eq!(f.engine.close_idle_with(Some(Duration::ZERO)), 0, "0 = never for this connection");
+    set(databrain_connector_core::IDLE_DISCONNECT_OPTION, Some("30"));
+    assert_eq!(f.engine.close_idle_with(Some(Duration::ZERO)), 0, "its own 30 minutes, not the global zero");
+    set(databrain_connector_core::IDLE_DISCONNECT_OPTION, None);
+    assert_eq!(f.engine.close_idle_with(None), 0, "global: never");
+    assert_eq!(f.engine.close_idle_with(Some(Duration::ZERO)), 1, "global applies without its own");
+
+    let mut cfg = f.ws.get_connection(&f.conn_id).unwrap().config;
+    assert_eq!(f.engine.connect_timeout_for(&cfg), f.engine.connect_timeout());
+    cfg.options.insert(databrain_connector_core::CONNECT_TIMEOUT_OPTION.into(), "90".into());
+    assert_eq!(f.engine.connect_timeout_for(&cfg), Duration::from_secs(90));
+    cfg.options.insert(databrain_connector_core::CONNECT_TIMEOUT_OPTION.into(), "1".into());
+    assert_eq!(f.engine.connect_timeout_for(&cfg), Duration::from_secs(3), "kept within 3–600");
+}
+
 #[tokio::test]
 async fn idle_sessions_close_but_not_mid_transaction() {
     let f = fixture(EnvTag::None);

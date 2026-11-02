@@ -110,13 +110,21 @@ impl QueryEngine {
         Duration::from_secs(secs.clamp(3, 600))
     }
 
+    /// [`Self::connect_timeout`] for `cfg`: its own option when set.
+    pub fn connect_timeout_for(&self, cfg: &ConnectionConfig) -> Duration {
+        match cfg.opt(databrain_connector_core::CONNECT_TIMEOUT_OPTION).and_then(|v| v.trim().parse::<u64>().ok()) {
+            Some(secs) => Duration::from_secs(secs.clamp(3, 600)),
+            None => self.connect_timeout(),
+        }
+    }
+
     /// DNS + TCP check of the first network hop, so an unreachable server
     /// fails within seconds with a clear reason instead of the driver's own
     /// (long, sometimes retried) timeout.
     pub(crate) async fn preflight(&self, cfg: &ConnectionConfig) -> Result<()> {
         let default_port = self.registry.get(cfg.kind)?.info().default_port;
         let Some((host, port)) = probe::target(cfg, default_port) else { return Ok(()) };
-        probe::reach(&host, port, self.connect_timeout().min(Duration::from_secs(8))).await
+        probe::reach(&host, port, self.connect_timeout_for(cfg).min(Duration::from_secs(8))).await
     }
 
     /// Test a configuration without saving it. `secret` overrides the stored
@@ -137,7 +145,7 @@ impl QueryEngine {
                 old.cancel();
             }
         }
-        let limit = (!cfg.auth.is_interactive()).then(|| self.connect_timeout());
+        let limit = (!cfg.auth.is_interactive()).then(|| self.connect_timeout_for(cfg));
         // One-time setup (a driver download) first, outside the time limit.
         let prepared = async {
             let connector = self.registry.get(cfg.kind)?;

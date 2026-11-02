@@ -64,9 +64,12 @@ pub struct ExplorerCacheState {
 /// Which server a connection points at (kind, address, database, user,
 /// options, SSH hop). A change makes the cached explorer meaningless.
 fn identity(cfg: &ConnectionConfig) -> String {
+    // Session handling (timeouts) doesn't change what the connection points at.
+    let options: std::collections::BTreeMap<&String, &String> =
+        cfg.options.iter().filter(|(k, _)| !databrain_connector_core::SESSION_OPTIONS.contains(&k.as_str())).collect();
     let mut v = serde_json::json!({
         "kind": cfg.kind, "host": cfg.host, "port": cfg.port, "database": cfg.database,
-        "file": cfg.file_path, "auth": cfg.auth, "options": cfg.options,
+        "file": cfg.file_path, "auth": cfg.auth, "options": options,
     });
     if let Some(ssh) = &cfg.ssh {
         v["ssh"] = serde_json::json!([ssh.host, ssh.port, ssh.user]);
@@ -743,6 +746,10 @@ mod tests {
         cfg.read_only = true;
         ws.meta_check_identity("c", &cfg).unwrap();
         assert!(ws.meta_listing("c", "s").unwrap().is_some(), "same server");
+        cfg.options.insert("connect_timeout_secs".into(), "90".into());
+        cfg.options.insert("idle_disconnect_minutes".into(), "0".into());
+        ws.meta_check_identity("c", &cfg).unwrap();
+        assert!(ws.meta_listing("c", "s").unwrap().is_some(), "session settings don't change the server");
         cfg.host = Some("db2".into());
         ws.meta_check_identity("c", &cfg).unwrap();
         assert!(ws.meta_listing("c", "s").unwrap().is_none());

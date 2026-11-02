@@ -36,6 +36,16 @@ pub use value::{BatchBuilder, ColType, Column, Value};
 /// that can (DuckDB) denies it file and network access and locks settings.
 pub const SANDBOX_OPTION: &str = "databrain_sandbox";
 
+/// Connection option: seconds opening a session may take, overriding the
+/// global setting (a VPN database may need more, a local one less).
+pub const CONNECT_TIMEOUT_OPTION: &str = "connect_timeout_secs";
+/// Connection option: minutes after which its unused sessions close,
+/// overriding the global setting (`0` = never).
+pub const IDLE_DISCONNECT_OPTION: &str = "idle_disconnect_minutes";
+/// Options about DataBrain's own session handling: not sent to the
+/// server, and not part of what the connection points at.
+pub const SESSION_OPTIONS: [&str; 2] = [CONNECT_TIMEOUT_OPTION, IDLE_DISCONNECT_OPTION];
+
 #[async_trait]
 pub trait Connector: Send + Sync {
     fn info(&self) -> ConnectorInfo;

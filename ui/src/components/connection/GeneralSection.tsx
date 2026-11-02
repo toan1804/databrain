@@ -212,6 +212,32 @@ export function GeneralSection({ f }: { f: ConnectionFormState }) {
           />
         </div>
       </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <Label htmlFor="c-timeout">Connect timeout (seconds)</Label>
+          <input
+            id="c-timeout"
+            className="field"
+            inputMode="numeric"
+            placeholder="Settings default"
+            value={values.connect_timeout_secs ?? ""}
+            onChange={(e) => setValue("connect_timeout_secs", e.target.value.replace(/\D/g, ""))}
+          />
+          <p className="mt-1 text-[11.5px] text-muted">For this connection only, 3–600 (e.g. more over a VPN). Empty: Settings → Queries.</p>
+        </div>
+        <div>
+          <Label htmlFor="c-idle">Close idle sessions after (minutes)</Label>
+          <input
+            id="c-idle"
+            className="field"
+            inputMode="numeric"
+            placeholder="Settings default"
+            value={values.idle_disconnect_minutes ?? ""}
+            onChange={(e) => setValue("idle_disconnect_minutes", e.target.value.replace(/\D/g, ""))}
+          />
+          <p className="mt-1 text-[11.5px] text-muted">0 keeps them open (e.g. a warehouse that is slow to reconnect). Empty: Settings → Queries.</p>
+        </div>
+      </div>
     </>
   );
 }
