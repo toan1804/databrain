@@ -123,29 +123,61 @@ fn read_only_decision(profile: &ConnectionProfile, pieces: &[databrain_connector
     function_writes(profile, pieces, "the connection is read-only")
 }
 
-/// `Confirm` when the database has no read-only session mode and the SQL
-/// calls functions that are not known built-ins (`SELECT dbo.write_fn()`
-/// is a read to the parser, but the function may write): the AI may not
-/// write here (`why`), so only the user in DataBrain may approve it, never
-/// automatically or by an MCP client.
+/// Functions that act outside the session's read-only mode: `dblink*` opens
+/// its own (writable) connection, `set_config` changes settings such as
+/// `search_path` (which table rules rely on), and server-admin and file
+/// functions reach beyond the database. Lower case, without schema.
+const OUTSIDE_READ_ONLY: &[&str] = &[
+    "set_config",
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_ls_dir",
+    "pg_file_write",
+    "lo_import",
+    "lo_export",
+    "lo_unlink",
+];
+
+fn outside_read_only(f: &str) -> bool {
+    let last = f.rsplit('.').next().unwrap_or(f).trim_matches(['"', '`', '[', ']']).to_ascii_lowercase();
+    last.starts_with("dblink") || OUTSIDE_READ_ONLY.contains(&last.as_str())
+}
+
+/// `Confirm` when the SQL calls functions that are not known built-ins
+/// (`SELECT dbo.write_fn()` is a read to the parser, but the function may
+/// write): the AI may not write here (`why`), so only the user in DataBrain
+/// may approve it, never automatically or by an MCP client.
+///
+/// A read-only session on the server (Postgres, MySQL, SQLite, DuckDB,
+/// ClickHouse) stops writes in functions, but only on a connection set to
+/// read-only: elsewhere the session can write, so every unknown function
+/// counts. Functions acting outside that mode count even then.
 fn function_writes(profile: &ConnectionProfile, pieces: &[databrain_connector_core::sql::StatementSpan], why: &str) -> Option<Decision> {
     use databrain_connector_core::sql::unknown_functions;
     let kind = profile.config.kind;
-    if kind.server_read_only() {
-        return None;
-    }
+    let session_read_only = profile.config.read_only && kind.server_read_only();
     let mut fns: Vec<String> = Vec::new();
     for f in pieces.iter().flat_map(|p| unknown_functions(&p.sql, kind)) {
+        if session_read_only && !outside_read_only(&f) {
+            continue;
+        }
         if !fns.contains(&f) {
             fns.push(f);
         }
     }
     (!fns.is_empty()).then(|| {
-        Decision::Confirm(format!(
-            "{} has no read-only mode on the server, and this query calls {}, which could write ({why})",
-            kind.traits().name,
-            fns.join(", ")
-        ))
+        let reason = if session_read_only {
+            format!("this query calls {}, which acts outside {}'s read-only session ({why})", fns.join(", "), kind.traits().name)
+        } else if kind.server_read_only() {
+            format!("this query calls {}, which could write: the connection isn't read-only ({why})", fns.join(", "))
+        } else {
+            format!("{} has no read-only mode on the server, and this query calls {}, which could write ({why})", kind.traits().name, fns.join(", "))
+        };
+        Decision::Confirm(reason)
     })
 }
 
@@ -299,6 +331,42 @@ mod tests {
         assert!(matches!(review_sql(&on(Mssql, false, auto_read()), "select dbo.f( from").decision, Decision::Confirm(_) | Decision::Deny(_)));
         // A read-only session on the server stops writes in functions.
         assert_eq!(review_sql(&on(Postgres, true, auto_read()), "select public.write_fn()").decision, Decision::Allow);
+    }
+
+    /// Engines with a read-only session mode: it only protects connections
+    /// set to read-only. Elsewhere a function call needs the user while the
+    /// AI may not write; some functions act outside the mode and always do.
+    #[test]
+    fn functions_on_engines_with_a_read_only_mode() {
+        use ConnectorKind::*;
+        let sqls = ["select public.write_fn()", "select dblink_exec('dbname=x', 'delete from t')", "select set_config('search_path', 'hr', false)"];
+        for kind in [Postgres, Mysql, Sqlite, Duckdb, Clickhouse] {
+            for sql in sqls {
+                for p in [on(kind, false, AiPolicy::default()), on(kind, false, auto_read())] {
+                    match review_sql(&p, sql).decision {
+                        Decision::Confirm(r) => assert!(r.contains("could write") && r.contains("isn't read-only"), "{kind:?} {sql}: {r}"),
+                        d => panic!("{kind:?} not read-only, writes off: {sql}: {d:?}"),
+                    }
+                }
+            }
+        }
+        // A read-only Postgres session: ordinary functions are stopped by it…
+        assert_eq!(review_sql(&on(Postgres, true, auto_read()), "select public.write_fn()").decision, Decision::Allow);
+        // …but not these.
+        for sql in [
+            "select dblink_exec('dbname=x', 'delete from t')",
+            "select public.dblink('x', 'select 1')",
+            "select set_config('search_path', 'hr', false)",
+            "select pg_terminate_backend(42)",
+        ] {
+            match review_sql(&on(Postgres, true, auto_read()), sql).decision {
+                Decision::Confirm(r) => assert!(r.contains("outside") && r.contains("read-only session"), "{sql}: {r}"),
+                d => panic!("read-only {sql}: {d:?}"),
+            }
+        }
+        // The AI may write here: as before, its calls are its to make.
+        assert_eq!(review_sql(&on(Postgres, false, AiPolicy { allow_write: true, ..auto_read() }), "select public.write_fn()").decision, Decision::Allow);
+        assert_eq!(review_sql(&on(Postgres, false, auto_read()), "select count(*), lower(name) from t").decision, Decision::Allow);
     }
 
     #[test]

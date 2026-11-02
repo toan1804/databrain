@@ -6,7 +6,10 @@
 //! and arrays as JSON text (`databrain_connector_core::documents`).
 //! Describe samples documents to list fields and their types.
 
+pub mod analyze;
 pub mod shell;
+
+pub use analyze::analyze;
 
 use std::sync::Arc;
 use std::time::Duration;

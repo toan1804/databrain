@@ -9,6 +9,37 @@ use rusqlite::types::Value as SqlValue;
 
 use crate::types::{AiError, Result};
 
+/// `batches` with the columns where `mask` is true replaced by `***` (NULL
+/// stays NULL), so no query over them can read the values, whatever it
+/// renames them to.
+pub fn mask_columns(batches: &[RecordBatch], mask: &[bool]) -> Result<Vec<RecordBatch>> {
+    use databrain_connector_core::arrow::array::{ArrayRef, StringArray};
+    use databrain_connector_core::arrow::datatypes::{Field, Schema};
+    use std::sync::Arc;
+    if !mask.iter().any(|m| *m) {
+        return Ok(batches.to_vec());
+    }
+    batches
+        .iter()
+        .map(|b| {
+            let schema = b.schema();
+            let mut fields: Vec<Field> = Vec::with_capacity(b.num_columns());
+            let mut cols: Vec<ArrayRef> = Vec::with_capacity(b.num_columns());
+            for (i, (f, a)) in schema.fields().iter().zip(b.columns()).enumerate() {
+                if mask.get(i).copied().unwrap_or(false) {
+                    let masked: StringArray = (0..a.len()).map(|r| (!a.is_null(r)).then_some("***")).collect();
+                    fields.push(Field::new(f.name(), DataType::Utf8, true));
+                    cols.push(Arc::new(masked));
+                } else {
+                    fields.push(f.as_ref().clone());
+                    cols.push(a.clone());
+                }
+            }
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).map_err(|e| AiError::Internal(e.to_string()))
+        })
+        .collect()
+}
+
 pub struct LocalTable {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
@@ -111,6 +142,30 @@ fn dedupe(names: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Masked before loading: renaming the column (a CTE column list, an
+    /// alias, `*`) never shows the values; NULLs stay NULL.
+    #[test]
+    fn masked_columns_stay_masked_under_any_name() {
+        use databrain_connector_core::arrow::array::{Int64Array, StringArray};
+        use databrain_connector_core::arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), Field::new("email", DataType::Utf8, true)]));
+        let b = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(StringArray::from(vec![Some("a@x.io"), None]))]).unwrap();
+        let names = vec!["id".to_string(), "email".to_string()];
+        let masked = mask_columns(&[b], &[false, true]).unwrap();
+        for sql in [
+            "with x(i, a) as (select * from result) select a from x order by i",
+            "select email as e from result order by id",
+            "select upper(substr(email, 1, 3)) as p from result order by id",
+        ] {
+            let t = query(&names, &masked, sql, 10).unwrap();
+            let shown: Vec<String> = t.rows.iter().map(|r| r[0].to_string()).collect();
+            assert!(shown.iter().all(|v| !v.contains('@')), "{sql}: {shown:?}");
+        }
+        let t = query(&names, &masked, "select count(email), count(*) from result", 10).unwrap();
+        assert_eq!(t.rows[0][0], serde_json::json!(1), "NULL stays NULL");
+    }
     use databrain_connector_core::arrow::array::{Float64Array, Int64Array, StringArray};
     use databrain_connector_core::arrow::datatypes::{Field, Schema};
     use std::sync::Arc;

@@ -6,6 +6,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Security
 
+- run_query on a DuckDB connection (the Results connection too) checks every `results.<name>` it reads like query_outputs does: outputs from a connection with AI off, not shared with MCP, or not sharing result rows were readable there.
+- query_result masks sensitive columns' values before the local query runs: a CTE column list (or any rename) returned them in clear.
+- A query calling a non-built-in function needs the user's confirmation wherever the AI may not write, also on Postgres, MySQL, SQLite, DuckDB and ClickHouse when the connection isn't read-only (`select public.write_fn()`, `dblink_exec(…)` and `set_config('search_path', …)` ran unasked). On read-only connections, functions that act outside the read-only session (`dblink*`, `set_config`, server and file functions) still need it.
+- MongoDB: commands are classified, and their collections found for table rules, with the shell parser that runs them. A `$out` or `$merge` stage written as `{ $out : 'copy' }` passed as a read and could replace a collection.
 - `EXPLAIN` is classified by the statement it explains: `EXPLAIN (ANALYZE) DELETE …` and other option lists counted as a read, so the AI could run them (also on a production connection with auto-read), and so could the Plan tab's Analyze. A plain `EXPLAIN` of a write now counts as that write too.
 - SQL from the AI, MCP and AI-run jobs runs on DuckDB in a sandbox (no file, network or extension access unless the connection allows it). Files attached to a DuckDB connection stay readable in it. Job steps whose SQL the AI wrote stay sandboxed when the job runs by hand, on its schedule or in the background, not only when the AI starts the run; a step you change yourself, or mark with "Trust this SQL", becomes yours. Jobs the AI made before this are found in the audit log and marked once.
 - Jobs the assistant creates, changes or runs follow the connection's AI policy, including load steps and their before/after SQL.

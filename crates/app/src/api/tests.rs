@@ -1216,3 +1216,117 @@ async fn lineage_expands_views_with_the_database() {
     let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select d from top", Default::default(), false).await.unwrap();
     assert!(v.graph.nodes.iter().all(|n| !n.view));
 }
+
+/// MongoDB commands are classified by the parser that runs them: a `$out`
+/// stage written with spaces is a write, refused on a read-only connection
+/// and asked about where the AI may write.
+#[test]
+fn mongo_writing_stage_is_a_write_for_the_ai() {
+    use databrain_ai::policy::{Decision, review_sql};
+    use databrain_workspace::{AiPolicy, RunQueryPolicy};
+    let (st, _sink, _dir) = state();
+    let _ = &st; // the app's registry registers the MongoDB parser
+    let mut cfg = ConnectionConfig::new(ConnectorKind::Mongodb, AuthMethod::None);
+    cfg.host = Some("localhost".into());
+    let mut p = ConnectionProfile {
+        id: "m".into(),
+        name: "mongo".into(),
+        config: cfg,
+        color: None,
+        env: EnvTag::Dev,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: AiPolicy { run_query: RunQueryPolicy::AutoRead, ..Default::default() },
+        created_at: 0,
+        updated_at: 0,
+    };
+    for cmd in ["db.orders.aggregate([{ $out : 'copy' }])", "db.orders.aggregate([{$merge: {into: 'copy'}}])"] {
+        assert!(matches!(review_sql(&p, cmd).decision, Decision::Deny(_)), "writes not allowed: {cmd}");
+        p.config.read_only = true;
+        p.ai_policy.allow_write = true;
+        assert!(matches!(review_sql(&p, cmd).decision, Decision::Deny(_)), "read-only: {cmd}");
+        p.config.read_only = false;
+        assert!(matches!(review_sql(&p, cmd).decision, Decision::Ask(_)), "asks: {cmd}");
+        p.ai_policy.allow_write = false;
+    }
+    assert_eq!(review_sql(&p, "db.orders.aggregate([{$match: {}}])").decision, Decision::Allow);
+    let refs = databrain_connector_core::tables::table_refs("db.orders.aggregate([{ $out : {db: 'x', coll: 'copy'} }])", ConnectorKind::Mongodb);
+    assert_eq!(refs.writes, vec![vec!["x".to_string(), "copy".to_string()]]);
+}
+
+/// run_query on a DuckDB target (the Results connection too) reads outputs
+/// as results.<name>: the same per-source checks as query_outputs apply,
+/// so an output from a connection with AI off stays unreadable.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_query_on_duckdb_checks_output_sources() {
+    use databrain_ai::{Caller, ToolContext, ToolHost};
+    struct Yes;
+    #[async_trait::async_trait]
+    impl ToolHost for Yes {
+        async fn approve(&self, _: &str, _: &str, detail: &serde_json::Value) -> Option<serde_json::Value> {
+            Some(detail.clone())
+        }
+    }
+    let (st, _sink, dir) = state();
+    let cfg = |file: &str| ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(dir.path().join(file).to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let mut secret = save_profile(&st, "secret", cfg("s.db"), None);
+    secret.ai_policy.ai_enabled = false;
+    secret.ai_policy.share_result_rows = true;
+    save_profile_update(&st, secret.clone());
+    let mut shared = save_profile(&st, "shared", cfg("o.db"), None);
+    shared.ai_policy.share_result_rows = true;
+    save_profile_update(&st, shared.clone());
+    // The user's own queries make named outputs.
+    for (conn, name) in [(&secret.id, "salaries"), (&shared.id, "open")] {
+        let out = st
+            .engine
+            .run_and_wait(
+                &st.hub,
+                databrain_query_engine::RunRequest {
+                    connection_id: conn.clone(),
+                    tab_id: format!("t-{name}"),
+                    sql: "select 1 as id, 99000 as amount".into(),
+                    base_offset: 0,
+                    row_limit: None,
+                    confirmed: true,
+                    origin: Default::default(),
+                    session_key: None,
+                    output_name: Some(name.into()),
+                    params: Default::default(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(out[0].error.is_none(), "{:?}", out[0].error);
+    }
+    let mut results = st.engine.results_connection().unwrap();
+    results.ai_policy.run_query = databrain_workspace::RunQueryPolicy::AutoRead;
+    let ctx = ToolContext {
+        engine: st.engine.clone(),
+        hub: st.hub.clone(),
+        profile: results,
+        session_id: Some("s".into()),
+        caller: Caller::Agent,
+        host: std::sync::Arc::new(Yes),
+        cancel: Default::default(),
+        results: parking_lot::Mutex::new(vec![]),
+    };
+    let o = ctx.call("run_query", &serde_json::json!({"sql": "select * from results.salaries"})).await;
+    assert!(o.content.starts_with("ERROR") && o.content.contains("AI is disabled"), "{}", o.content);
+    let o = ctx.call("run_query", &serde_json::json!({"sql": "select * from results.open o join results.salaries s using (id)"})).await;
+    assert!(o.content.starts_with("ERROR") && o.content.contains("AI is disabled"), "every output is checked: {}", o.content);
+    let o = ctx.call("run_query", &serde_json::json!({"sql": "select * from results.open"})).await;
+    assert!(!o.content.starts_with("ERROR"), "{}", o.content);
+}

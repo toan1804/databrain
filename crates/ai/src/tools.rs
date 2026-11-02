@@ -761,8 +761,14 @@ impl ToolContext {
         let target = self.schema_target(args)?;
         // results.<output> only exists on the Results (DuckDB) connection:
         // such SQL runs there, never on the current connection.
-        if target.config.kind != databrain_connector_core::ConnectorKind::Duckdb && !self.engine.outputs().referenced(&sql).is_empty() {
+        let duckdb = target.config.kind == databrain_connector_core::ConnectorKind::Duckdb;
+        if !duckdb && !self.engine.outputs().referenced(&sql).is_empty() {
             return self.query_outputs(args).await;
+        }
+        // Any DuckDB session (the Results connection too) can read outputs
+        // as results.<name>: the same checks as query_outputs.
+        if duckdb {
+            self.check_output_sources(&sql)?;
         }
         let purpose = args.get("purpose").and_then(|p| p.as_str()).unwrap_or("");
         let review = policy::review_sql(&target, &sql);
@@ -776,9 +782,12 @@ impl ToolContext {
             )
             .await?;
         let sql = approved.get("sql").and_then(|s| s.as_str()).unwrap_or(&sql).to_string();
-        // Re-review edited SQL.
+        // Re-review edited SQL (and the outputs it reads).
         if let Decision::Deny(r) = policy::review_sql(&target, &sql).decision {
             return Err(AiError::Policy(r));
+        }
+        if duckdb {
+            self.check_output_sources(&sql)?;
         }
         let cap = 1000usize;
         let run_sql = if review.kind.is_read() { policy::cap_rows(target.config.kind, &sql, cap) } else { sql.clone() };
@@ -1028,6 +1037,10 @@ impl ToolContext {
         if masked.iter().any(|n| sql.to_ascii_lowercase().contains(n.as_str())) {
             return Err(AiError::Policy("the query references a PII column".into()));
         }
+        // The values themselves are masked before the query sees them: a
+        // CTE column list, `SELECT *` under another name or any expression
+        // can rename a column, never unmask it.
+        let batches = resultsql::mask_columns(&batches, &mask)?;
         let mut t = resultsql::query(&names, &batches, sql, 200)?;
         // `SELECT *` and the like return them under their own names.
         for (i, c) in t.columns.iter().enumerate() {
@@ -1096,13 +1109,14 @@ impl ToolContext {
         Ok(out(text, json!({"outputs": shown})))
     }
 
-    async fn query_outputs(&self, args: &Value) -> Result<ToolOutput> {
-        let sql = arg(args, "sql")?.to_string();
-        let refs = self.engine.outputs().referenced(&sql);
-        if refs.is_empty() {
-            return Err(AiError::Policy("reference outputs as results.<handle or name> (see list_outputs)".into()));
-        }
-        for o in &refs {
+    /// Every output `sql` reads as `results.<name>` must be one the assistant
+    /// may read: its source connection has AI on (and MCP for an MCP
+    /// client), its tables pass the table rules, it shares result rows (or
+    /// the user mentioned it), and the SQL names none of its sensitive
+    /// columns. DuckDB loads exactly these outputs into the session, so an
+    /// output that isn't checked here is never readable.
+    fn check_output_sources(&self, sql: &str) -> Result<()> {
+        for o in &self.engine.outputs().referenced(sql) {
             let pol = self.source_policy(&o.result_id)?;
             if !pol.share_result_rows && !self.allowed_result(&o.result_id) {
                 return Err(AiError::Policy(format!(
@@ -1115,6 +1129,16 @@ impl ToolContext {
                 return Err(AiError::Policy(format!("the query references a sensitive column of {}", o.handle)));
             }
         }
+        Ok(())
+    }
+
+    async fn query_outputs(&self, args: &Value) -> Result<ToolOutput> {
+        let sql = arg(args, "sql")?.to_string();
+        let refs = self.engine.outputs().referenced(&sql);
+        if refs.is_empty() {
+            return Err(AiError::Policy("reference outputs as results.<handle or name> (see list_outputs)".into()));
+        }
+        self.check_output_sources(&sql)?;
         // Local DuckDB, but still reads only.
         let results_conn = self.engine.results_connection().map_err(|e| AiError::Internal(e.message))?;
         if !policy::review_sql(&results_conn, &sql).kind.is_read() {
