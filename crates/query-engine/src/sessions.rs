@@ -64,19 +64,45 @@ impl QueryEngine {
         }
         let connector = self.registry.get(profile.config.kind)?;
         let creds = self.credentials(&profile)?;
+        connector.prepare(&profile.config).await?;
         self.preflight(&profile.config).await?;
-        let (cfg, tunnel) = self.tunnel(&profile.config, Some(&profile.id), None).await?;
-        self.read_stored_secret(&profile, creds.as_ref()).await?;
-        let started = Instant::now();
         let kind = profile.config.kind;
-        let connected = match connector.connect(&cfg, creds.clone()).await {
-            Err(e) if e.kind == ErrorKind::Auth => {
-                // Expired/revoked token: refresh once and retry.
-                tracing::info!(connection = connection_id, ?kind, "sign-in refused, refreshing credentials once");
-                creds.invalidate().await;
-                connector.connect(&cfg, creds).await
-            }
-            r => r,
+        // Reaching and signing in to the server is bounded like "Test
+        // connection": a server that accepts the socket and never finishes
+        // the handshake fails with a message instead of a spinner. Not for
+        // browser sign-in (the user may take a while) or local files.
+        let limit = (!profile.config.auth.is_interactive() && !kind.traits().local).then(|| self.connect_timeout());
+        let reach = async {
+            let (cfg, tunnel) = self.tunnel(&profile.config, Some(&profile.id), None).await?;
+            self.read_stored_secret(&profile, creds.as_ref()).await?;
+            let connected = match connector.connect(&cfg, creds.clone()).await {
+                Err(e) if e.kind == ErrorKind::Auth => {
+                    // Expired/revoked token: refresh once and retry.
+                    tracing::info!(connection = connection_id, ?kind, "sign-in refused, refreshing credentials once");
+                    creds.invalidate().await;
+                    connector.connect(&cfg, creds.clone()).await
+                }
+                r => r,
+            };
+            Ok::<_, EngineError>((connected, tunnel))
+        };
+        let started = Instant::now();
+        let (connected, tunnel) = match limit {
+            None => reach.await?,
+            Some(d) => match tokio::time::timeout(d, reach).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    tracing::warn!(connection = connection_id, ?kind, tab = tab_id, secs = d.as_secs(), "connect timed out");
+                    return Err(EngineError::new(
+                        "connection",
+                        format!(
+                            "No connection to \"{}\" after {} s: the server did not finish the handshake/sign-in (check host, port, SSL and firewall; Settings → Queries → Connecting sets the limit)",
+                            profile.name,
+                            d.as_secs()
+                        ),
+                    ));
+                }
+            },
         };
         let session: Arc<dyn Session> = match connected {
             Ok(s) => {

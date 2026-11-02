@@ -154,6 +154,15 @@ impl Connector for OracleConnector {
         }
     }
 
+    /// The thin driver's helper is downloaded on first use (5 MB): not part
+    /// of the connect time limit.
+    async fn prepare(&self, cfg: &ConnectionConfig) -> Result<()> {
+        if !uses_instant_client(cfg) {
+            agent::ensure().await?;
+        }
+        Ok(())
+    }
+
     async fn connect(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>> {
         Ok(Box::new(open(cfg, creds).await?))
     }

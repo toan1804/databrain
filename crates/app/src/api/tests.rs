@@ -1039,3 +1039,38 @@ async fn mcp_unanswered_question_ends_the_call_and_is_not_asked_again() {
     assert_eq!(audit.iter().filter(|a| a.tool == "run_query" && a.decision == "denied").map(|a| a.summary.as_deref()).collect::<Vec<_>>(), vec![Some("no answer")], "{audit:?}");
     assert!(audit.iter().all(|a| a.decision != "approved"), "{audit:?}");
 }
+
+/// A server that accepts the socket and never answers: opening a session
+/// (explorer, a tab) fails within the connect time limit with a message,
+/// as "Test connection" does, instead of waiting for ever.
+#[tokio::test(flavor = "multi_thread")]
+async fn silent_server_fails_within_the_connect_limit() {
+    let (st, _sink, _dir) = state();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            held.push(s);
+        }
+    });
+    st.workspace.set_setting("connect_timeout_secs", &serde_json::json!(3)).unwrap();
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Postgres,
+        host: Some("127.0.0.1".into()),
+        port: Some(port),
+        database: Some("db".into()),
+        file_path: None,
+        auth: AuthMethod::Password { user: "u".into() },
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let p = save_profile(&st, "silent", cfg, Some("pw"));
+    let started = std::time::Instant::now();
+    let e = list_schemas(&st, &p.id).await.unwrap_err();
+    assert!(e.message.contains("No connection to \"silent\" after 3 s"), "{}", e.message);
+    assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+    assert!(st.engine.connected_ids().is_empty());
+}

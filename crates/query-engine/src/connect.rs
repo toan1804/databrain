@@ -139,6 +139,21 @@ impl QueryEngine {
             }
         }
         let limit = (!cfg.auth.is_interactive()).then(|| self.connect_timeout());
+        // One-time setup (a driver download) first, outside the time limit.
+        let prepared = async {
+            let connector = self.registry.get(cfg.kind)?;
+            connector.prepare(&cfg.normalized()).await.map_err(EngineError::from)
+        };
+        let prepared = tokio::select! {
+            r = prepared => r,
+            _ = token.cancelled() => Err(EngineError::new("cancelled", "Test cancelled")),
+        };
+        if let Err(e) = prepared {
+            if let Some(id) = test_id.filter(|_| !token.is_cancelled()) {
+                self.tests.lock().remove(id);
+            }
+            return Err(e);
+        }
         let work = self.test_connection_inner(cfg, secret, connection_id, ssh_secret);
         let r = tokio::select! {
             r = work => r,

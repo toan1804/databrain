@@ -56,6 +56,13 @@ pub trait Connector: Send + Sync {
         AuthContext::default()
     }
 
+    /// One-time local setup before the first connect, such as downloading a
+    /// driver helper. It is not counted in the connect time limit, which
+    /// only covers reaching and signing in to the server.
+    async fn prepare(&self, _cfg: &ConnectionConfig) -> Result<()> {
+        Ok(())
+    }
+
     /// Open a new session. Credentials are fetched from `creds` right before
     /// connecting and are not retained by the connector.
     async fn connect(

@@ -222,7 +222,7 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 ```
 
 - `RunRequest` names the connection, tab, SQL, row limit, origin (`user`, `ai`, `mcp`, `job`), an optional output name and an optional `session_key`. Notebook cells use `session_key = nb:{notebook}`, so all cells share one database session and temp tables carry across cells.
-- Sessions are per tab (`sessions.rs`). They support manual commit with Commit and Rollback, are closed after an idle timeout, and are reopened on demand. AI and MCP use their own sessions; DuckDB sessions for AI and MCP run sandboxed (`enable_external_access = false`, `lock_configuration = true`) unless the connection allows external access.
+- Sessions are per tab (`sessions.rs`). They support manual commit with Commit and Rollback, are closed after an idle timeout, and are reopened on demand. Opening one is bounded by the connect timeout (tunnel, credential read and handshake; not for browser sign-in or local files). `Connector::prepare` does one-time local setup first, outside that limit (the Oracle thin driver's download). AI and MCP use their own sessions; DuckDB sessions for AI and MCP run sandboxed (`enable_external_access = false`, `lock_configuration = true`) unless the connection allows external access.
 - `run_and_wait` is the same run for the AI, MCP and job steps. Its outcome comes on a channel of its own, so a lagging event subscriber can't lose the end of a run.
 - `connect.rs` resolves credentials, opens the SSH tunnel and applies the connect timeout. `probe.rs` does a DNS and TCP check first so a test tells "unknown host", "refused" and "no answer" apart.
 - Every run is written to `query_history` with its origin.
