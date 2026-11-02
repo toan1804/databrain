@@ -34,6 +34,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Lineage: recursive CTEs without a column list resolve the recursive step's columns (the anchor's names are used), and CTEs that read themselves without `RECURSIVE` (SQL Server, Oracle) are recognised instead of shown as database tables.
 - Lineage: `WITH … UPDATE`, `WITH … DELETE`, `WITH … INSERT` and `WITH … MERGE` are traced through their CTEs instead of shown as not traced.
 - MCP: a call the client cancels (`notifications/cancelled`) stops at once: DataBrain no longer keeps waiting for the user's answer or running its query.
 - Opening a session on a server (a tab, the explorer, the assistant, a job) gives up after the connect timeout with a message, as "Test connection" does, instead of waiting for ever on a server that never finishes the handshake. The Oracle thin driver's first download is not counted.

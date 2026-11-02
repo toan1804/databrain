@@ -508,6 +508,54 @@ fn name_parts(n: &ObjectName) -> Vec<String> {
 }
 
 /// Alias of a table in a statement (lower case), else its last name part.
+/// Name a `SELECT` gives an unnamed item (see `Builder::select`).
+fn item_name(e: &Expr) -> String {
+    match e {
+        Expr::Identifier(i) => i.value.clone(),
+        Expr::CompoundIdentifier(v) => v.last().map(|i| i.value.clone()).unwrap_or_default(),
+        other => short(other.to_string()),
+    }
+}
+
+/// Output names of a query's first `SELECT`: the anchor of a recursive CTE,
+/// whose names the whole CTE takes. `*` items are left out (unknown here).
+fn anchor_names(q: &Query) -> Vec<String> {
+    let mut body = &*q.body;
+    loop {
+        match body {
+            SetExpr::SetOperation { left, .. } => body = left,
+            SetExpr::Query(inner) => body = &inner.body,
+            SetExpr::Select(sel) => {
+                return sel
+                    .projection
+                    .iter()
+                    .flat_map(|item| match item {
+                        SelectItem::UnnamedExpr(e) => vec![item_name(e)],
+                        SelectItem::ExprWithAlias { alias, .. } => vec![alias.value.clone()],
+                        SelectItem::ExprWithAliases { aliases, .. } => aliases.iter().map(|a| a.value.clone()).collect(),
+                        _ => vec![],
+                    })
+                    .collect();
+            }
+            _ => return vec![],
+        }
+    }
+}
+
+/// Whether `q` reads a relation named `name` (one part, lower case): a CTE
+/// that reads itself is recursive, with or without the RECURSIVE keyword.
+fn reads_itself(q: &Query, name: &str) -> bool {
+    let mut found = false;
+    let _ = sqlparser::ast::visit_relations(q, |r| {
+        if r.0.len() == 1 && name_parts(r).first().is_some_and(|p| p.to_lowercase() == name) {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
 fn alias_or_name(alias: &Option<TableAlias>, name: &ObjectName) -> String {
     alias.as_ref().map(|a| a.name.value.to_lowercase()).unwrap_or_else(|| name_parts(name).last().cloned().unwrap_or_default().to_lowercase())
 }
@@ -1132,10 +1180,15 @@ impl<'a> Builder<'a> {
                 let name = cte.alias.name.value.clone();
                 let key = name.to_lowercase();
                 // Recursive CTE: it may read itself; a placeholder stands in until it's known.
-                let placeholder = with.recursive.then(|| {
+                // SQL Server and Oracle write it without RECURSIVE: a CTE that reads its own
+                // name is one. Without a column list, its columns are the anchor's.
+                let recursive = with.recursive || reads_itself(&cte.query, &key);
+                let placeholder = recursive.then(|| {
                     let p = self.node(NodeKind::Cte, name.clone(), None);
-                    for c in &cte.alias.columns {
-                        self.g.nodes[p].columns.push(Column { name: c.name.value.clone(), span: None, expr: None });
+                    let names: Vec<String> =
+                        if cte.alias.columns.is_empty() { anchor_names(&cte.query) } else { cte.alias.columns.iter().map(|c| c.name.value.clone()).collect() };
+                    for c in names {
+                        self.g.nodes[p].columns.push(Column { name: c, span: None, expr: None });
                     }
                     p
                 });
@@ -1239,11 +1292,7 @@ impl<'a> Builder<'a> {
         for item in &sel.projection {
             match item {
                 SelectItem::UnnamedExpr(e) => {
-                    let name = match e {
-                        Expr::Identifier(i) => i.value.clone(),
-                        Expr::CompoundIdentifier(v) => v.last().map(|i| i.value.clone()).unwrap_or_default(),
-                        other => short(other.to_string()),
-                    };
+                    let name = item_name(e);
                     self.projected(n, name, e, None, &sources, &scope_env);
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {

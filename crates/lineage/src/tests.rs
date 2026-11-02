@@ -344,3 +344,27 @@ fn with_feeds_update_delete_insert() {
     assert_eq!(g.statements[0].kind, "insert");
     assert!(flows_of(&g).iter().any(|f| f.starts_with("sales.orders -direct-> archive")), "{:#?}", flows_of(&g));
 }
+
+/// A recursive CTE without a column list takes its anchor's names, so the
+/// recursive step's columns resolve; SQL Server/Oracle write it without
+/// RECURSIVE, and a CTE that reads itself is recognised as one.
+#[test]
+fn recursive_cte_without_column_list_or_keyword() {
+    let g = run("with recursive t as (select 1 as n union all select n + 1 from t where n < 5) select n from t");
+    let e = edges(&g);
+    assert!(e.contains(&"t.n -transform-> SELECT.n + 1".to_string()), "the recursive step reads t.n: {e:#?}");
+    assert!(e.contains(&"t.n -direct-> Result.n".to_string()), "{e:#?}");
+    assert_eq!(g.nodes.iter().filter(|n| n.name == "t").count(), 1, "placeholder merged");
+
+    let g = analyze(
+        "with tree as (select id, customer_id as parent from orders \
+         union all select o.id, t.parent from orders o join tree t on o.customer_id = t.id) select parent from tree",
+        K::Mssql,
+        &cat,
+    );
+    let e = edges(&g);
+    assert!(e.contains(&"tree.parent -direct-> SELECT.parent".to_string()), "the recursive step reads the CTE: {e:#?}");
+    assert!(e.contains(&"sales.orders.customer_id -direct-> SELECT.parent".to_string()), "{e:#?}");
+    assert_eq!(g.nodes.iter().filter(|n| n.name.eq_ignore_ascii_case("tree")).count(), 1, "not a database table");
+    assert!(g.unknown_tables.is_empty(), "{:?}", g.unknown_tables);
+}
