@@ -11,29 +11,13 @@ version = 2
 yanked = "deny"
 unmaintained = "workspace"
 ignore = [
-  # --- Fixed in releases that need Rust 1.88+ (the workspace's rust-version
-  # is 1.87). Raising it lets tiberius 0.13, time 0.3.47 and zip 9 in; then
-  # remove these entries.
-
-  # rustls 0.21 / rustls-webpki 0.101, through tiberius 0.12 (SQL Server TLS;
-  # rustls, not the OS's TLS, because macOS's broke off handshakes with some
-  # servers). tiberius 0.13 uses rustls 0.23 but needs Rust 1.88.
-  { id = "RUSTSEC-2026-0346", reason = "rustls 0.21 via tiberius 0.12: secrets only leak through Debug output, and DataBrain doesn't Debug-format TLS sessions; fixed by tiberius 0.13 (Rust 1.88)" },
-  { id = "RUSTSEC-2026-0349", reason = "rustls 0.21 via tiberius 0.12 (0.21 has no post-quantum key exchange to downgrade from); 0.23 is updated; fixed by tiberius 0.13 (Rust 1.88)" },
-  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101 via tiberius 0.12 (SQL Server certificates); fixed by tiberius 0.13 (Rust 1.88)" },
-  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101 via tiberius 0.12 (SQL Server certificates); fixed by tiberius 0.13 (Rust 1.88)" },
-  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101 via tiberius 0.12: DataBrain doesn't check CRLs; fixed by tiberius 0.13 (Rust 1.88)" },
-  { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101 via tiberius 0.12 (0.103 is updated); fixed by tiberius 0.13 (Rust 1.88)" },
-  # time 0.3.45 (bson, cookie, tauri): stack exhaustion on hostile format
-  # descriptions; time 0.3.47 needs Rust 1.88.
-  { id = "RUSTSEC-2026-0009", reason = "time 0.3.45: DataBrain parses no untrusted format descriptions; 0.3.47 needs Rust 1.88" },
-  # zip: the advisories are about extract(). DataBrain's own xlsx reader
-  # opens entries by name and never extracts; libduckdb-sys uses zip in its
-  # build script on its own sources; tauri-plugin-updater extracts only
-  # updates whose signature checked. zip 9 needs Rust 1.88.
-  { id = "RUSTSEC-2026-0367", reason = "zip extract(): not used on untrusted archives (see above); zip 9 needs Rust 1.88" },
-  { id = "RUSTSEC-2026-0368", reason = "zip extract(): not used on untrusted archives (see above); zip 9 needs Rust 1.88" },
-  { id = "RUSTSEC-2026-0369", reason = "zip extract(): not used on untrusted archives (see above); zip 9 needs Rust 1.88" },
+  # --- zip below 9, which DataBrain doesn't choose: libduckdb-sys (zip 6,
+  # build script only, on its own bundled sources) and tauri-plugin-updater
+  # (zip 4, extracts only updates whose signature checked). The advisories
+  # are about extract(); DataBrain's own xlsx reader uses zip 9.
+  { id = "RUSTSEC-2026-0367", reason = "zip extract() in libduckdb-sys's build script and the updater (signed archives only); DataBrain's own use is zip 9" },
+  { id = "RUSTSEC-2026-0368", reason = "zip extract() in libduckdb-sys's build script and the updater (signed archives only); DataBrain's own use is zip 9" },
+  { id = "RUSTSEC-2026-0369", reason = "zip extract() in libduckdb-sys's build script and the updater (signed archives only); DataBrain's own use is zip 9" },
 
   # --- Upstream has no fix in a version DataBrain can take yet.
 

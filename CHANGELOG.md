@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Security
 
+- Rust 1.88 is now the minimum (was 1.87), which lets in tiberius 0.13 (SQL Server TLS on rustls 0.23 and rustls-webpki 0.103), time 0.3.55, and zip 9 through rust_xlsxwriter 0.102. Seven advisory exceptions are gone from `deny.toml`; the three zip ones remain for zip copies DataBrain doesn't choose (DuckDB's build script, the updater). CI checks the workspace still builds on 1.88.
 - Lineage and ER diagrams only use appearance colours that are plain CSS colours (hex, `rgb()`/`hsl()`, a colour name). A custom colour containing quotes or markup went into the SVG unescaped; it now falls back to the default colour.
 - Sign-in and Kiro terminal launchers are written to a private folder in your cache folder, with a new name each time and never over an existing file. They had fixed names in the shared temp folder, where another user could plant a script of that name first. Old launcher scripts are removed after a day.
 - Credential vault: on Windows, `vault.json` and `vault.key` get an explicit access list (your account and SYSTEM, nothing inherited) before anything is written to them. The key, the decrypted file and the cached passwords are wiped from memory when no longer used, and encryption happens in place so no copy of the plaintext is left behind in freed memory.

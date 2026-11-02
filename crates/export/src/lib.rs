@@ -578,7 +578,7 @@ fn write_xlsx(file: std::fs::File, schema: &SchemaRef, batches: &[RecordBatch], 
         return Err(ExportError::Unsupported(format!("Excel supports at most {} rows; this export has {total}. Use CSV or Parquet.", XLSX_MAX_ROWS - 1)));
     }
     let mut wb = Workbook::new();
-    let ws = wb.add_worksheet_with_constant_memory();
+    let ws = wb.add_worksheet_with_constant_memory()?;
     ws.set_name(opts.table_name.as_deref().filter(|n| !n.is_empty()).unwrap_or("Result").chars().take(31).collect::<String>())?;
     let bold = Format::new().set_bold();
     let kinds: Vec<Kind> = cols.iter().map(|c| kind_of(schema.field(*c))).collect();

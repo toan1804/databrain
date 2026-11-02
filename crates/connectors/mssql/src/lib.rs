@@ -1053,7 +1053,7 @@ impl Session for MssqlSession {
                 rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect(),
             ));
         }
-        let sql = format!("select db_name() + '.' + x.n, x.f from ({}) x(n, f)", EXPLORER_FINGERPRINTS_SQL);
+        let sql = format!("select db_name() + '.' + x.n, x.f from ({EXPLORER_FINGERPRINTS_SQL}) x(n, f)");
         let rows = self.rows_all(each_db(&self.db_names().await?, &sql)).await?;
         Ok(Some(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect()))
     }
@@ -1094,7 +1094,7 @@ impl Session for MssqlSession {
                 rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect(),
             ));
         }
-        let sql = format!("select db_name() + '.' + x.n, x.f from ({}) x(n, f)", SCHEMA_FINGERPRINTS_SQL);
+        let sql = format!("select db_name() + '.' + x.n, x.f from ({SCHEMA_FINGERPRINTS_SQL}) x(n, f)");
         let rows = self.rows_all(each_db(&self.db_names().await?, &sql)).await?;
         Ok(Some(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect()))
     }
