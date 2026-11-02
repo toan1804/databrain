@@ -129,3 +129,80 @@ async fn checks_the_target_path_before_loading() {
     let dry = api::dry_run_result_load(&st, &info.id, args).await.unwrap();
     assert!(!dry.ok && dry.checks[0].message.as_deref().unwrap_or("").contains("doesn't exist"), "{dry:?}");
 }
+
+/// Live: rows (with NULLs, a timestamp with an offset, text with quotes and
+/// backslashes) load into ClickHouse: a new MergeTree table, Delete rows
+/// then insert, Replace; Update/Merge by key are refused before anything
+/// runs. Set DATABRAIN_CLICKHOUSE_HOST (+ _PORT, _USER, _PASSWORD).
+#[ignore = "live: needs DATABRAIN_CLICKHOUSE_HOST (cargo test -- --ignored)"]
+#[tokio::test(flavor = "multi_thread")]
+async fn loads_into_clickhouse_live() {
+    let Ok(host) = std::env::var("DATABRAIN_CLICKHOUSE_HOST") else {
+        panic!("live test: DATABRAIN_CLICKHOUSE_HOST not set (run with --ignored)");
+    };
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    let duck = st.engine.results_connection().unwrap().id;
+    let user = std::env::var("DATABRAIN_CLICKHOUSE_USER").unwrap_or_else(|_| "default".into());
+    let mut c = ConnectionConfig::new(ConnectorKind::Clickhouse, AuthMethod::Password { user });
+    c.host = Some(host);
+    c.port = std::env::var("DATABRAIN_CLICKHOUSE_PORT").ok().and_then(|p| p.parse().ok());
+    let profile = ConnectionProfile { id: String::new(), name: "ch".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
+    let secret = std::env::var("DATABRAIN_CLICKHOUSE_PASSWORD").ok();
+    let target = api::save_connection(&st, api::SaveConnectionArgs { profile, secret, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    run(&st, &target, "CREATE DATABASE IF NOT EXISTS databrain_load").await;
+    run(&st, &target, "DROP TABLE IF EXISTS databrain_load.people").await;
+
+    let r = run(
+        &st,
+        &duck,
+        "select i as id, case when i % 3 = 0 then null else 'it''s \\ ' || i end as name, \
+         timestamptz '2026-01-02 03:04:05+02' + i * interval 1 hour as at, i % 2 = 0 as even from range(10) t(i)",
+    )
+    .await;
+    let info = r.result.unwrap();
+    let args = |mode: LoadMode| LoadResultArgs { target_connection_id: target.clone(), table: "databrain_load.people".into(), mode, key_columns: vec!["id".into()], create_table: true };
+    async fn count(st: &AppState, target: &str) -> (String, String) {
+        let r = run(st, target, "select count() as n, countIf(name is null) as nulls from databrain_load.people").await.result.unwrap();
+        let p = api::fetch_page(st, r.id, Default::default(), 0, 1).await.unwrap();
+        (p.rows[0][0].clone().unwrap(), p.rows[0][1].clone().unwrap())
+    }
+
+    let rep = api::load_result(&st, &info.id, args(LoadMode::Append), "c1").await.unwrap();
+    assert_eq!(rep.rows, 10);
+    assert!(rep.created_table);
+    assert_eq!(count(&st, &target).await, ("10".to_string(), "4".to_string()), "NULLs stay NULL, not ''");
+    let ddl = run(&st, &target, "show create table databrain_load.people").await.result.unwrap();
+    let p = api::fetch_page(&st, ddl.id, Default::default(), 0, 1).await.unwrap();
+    assert!(p.rows[0][0].as_deref().unwrap().contains("MergeTree"), "{:?}", p.rows);
+
+    api::load_result(&st, &info.id, args(LoadMode::Truncate), "c2").await.unwrap();
+    assert_eq!(count(&st, &target).await.0, "10", "emptied first");
+    api::load_result(&st, &info.id, args(LoadMode::Replace), "c3").await.unwrap();
+    assert_eq!(count(&st, &target).await.0, "10");
+
+    for mode in [LoadMode::Update, LoadMode::Merge] {
+        let e = api::load_result(&st, &info.id, args(mode), "c4").await.unwrap_err();
+        assert!(e.message.contains("can't update rows by key"), "{}", e.message);
+    }
+    run(&st, &target, "DROP TABLE IF EXISTS databrain_load.people").await;
+}
+
+/// ClickHouse has no row-level UPDATE/MERGE: Update and Merge by key are
+/// refused before connecting, naming the modes that work.
+#[tokio::test(flavor = "multi_thread")]
+async fn clickhouse_refuses_keyed_loads_up_front() {
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    let duck = st.engine.results_connection().unwrap().id;
+    let mut c = ConnectionConfig::new(ConnectorKind::Clickhouse, AuthMethod::Password { user: "default".into() });
+    c.host = Some("127.0.0.1".into());
+    c.port = Some(1);
+    let profile = ConnectionProfile { id: String::new(), name: "ch".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
+    let target = api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    let info = run(&st, &duck, "select 1 as id").await.result.unwrap();
+    for mode in [LoadMode::Update, LoadMode::Merge] {
+        let args = LoadResultArgs { target_connection_id: target.clone(), table: "db.t".into(), mode, key_columns: vec!["id".into()], create_table: true };
+        let e = api::load_result(&st, &info.id, args, "k").await.unwrap_err();
+        assert!(e.message.contains("ClickHouse can't update rows by key") && e.message.contains("Replace table"), "{}", e.message);
+    }
+    assert!(st.engine.connected_ids().iter().all(|c| c != &target), "refused before connecting");
+}

@@ -8,6 +8,7 @@ import type { BatchLimits, Job, JobNode, LoadDryRun, LoadMode, LoadTarget } from
 import { copyText } from "../CatalogMenus";
 import { parseKeyColumns, batchValue } from "../../lib/jobGraph";
 import { formatCount } from "../../lib/util";
+import { traitsOf } from "../../lib/sourceTraits";
 import { useStore } from "../../store";
 import { CellEditor } from "../Notebook";
 import { EDITOR_KEY, field, label } from "./shared";
@@ -121,11 +122,24 @@ export const LOAD_MODES: { mode: LoadMode; text: string; hint: string }[] = [
   { mode: "merge", text: "Merge (upsert) by key", hint: "The table must exist. Rows whose key columns match are updated, the others inserted." },
 ];
 
+/** Modes a target of `kind` can do; `current` stays listed (marked) so a
+ * step saved with it shows what it has. */
+export function loadModesFor(kind: string | undefined, current?: LoadMode): { mode: LoadMode; text: string; hint: string }[] {
+  const keyed = traitsOf(kind).load?.keyed !== false;
+  return LOAD_MODES.flatMap((m) => {
+    const ok = keyed || (m.mode !== "update" && m.mode !== "merge");
+    if (ok) return [m];
+    if (m.mode !== current) return [];
+    return [{ ...m, text: `${m.text} (not on ${traitsOf(kind).name})`, hint: `${traitsOf(kind).name} can't update rows by key: choose another mode.` }];
+  });
+}
+
 /** Target, mode, key columns, before/after SQL and dry run of a load step. */
 export function LoadFields({ job, node, onChange }: { job: Job; node: JobNode; onChange: (patch: Partial<JobNode>) => void }) {
   const connections = useStore((s) => s.connections);
   const target = connections.find((c) => c.id === node.target_connection_id);
-  const mode = LOAD_MODES.find((m) => m.mode === node.load_mode) ?? LOAD_MODES[0];
+  const modes = loadModesFor(target?.config.kind, node.load_mode);
+  const mode = modes.find((m) => m.mode === node.load_mode) ?? LOAD_MODES[0];
   const keyed = node.load_mode === "update" || node.load_mode === "merge";
   const [keys, setKeys] = useState((node.key_columns ?? []).join(", "));
   // Reset the text for another step (not while this one is being edited).
@@ -200,7 +214,7 @@ export function LoadFields({ job, node, onChange }: { job: Job; node: JobNode; o
           Mode
         </label>
         <select id={`mode-${node.id}`} className={field} value={mode.mode} onChange={(e) => onChange({ load_mode: e.target.value as LoadMode })}>
-          {LOAD_MODES.map((m) => (
+          {modes.map((m) => (
             <option key={m.mode} value={m.mode}>
               {m.text}
             </option>

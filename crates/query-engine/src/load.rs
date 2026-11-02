@@ -647,6 +647,12 @@ impl QueryEngine {
             return Err(EngineError::new("invalid", format!("Rows can't be loaded into {} connections (\"{}\"); save them to a file instead.", engine_name(dialect), profile.name)));
         }
         let keys_in: Vec<String> = spec.key_columns.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
+        if spec.mode.needs_keys() && !sqlgen::keyed_loads(dialect) {
+            return Err(EngineError::new(
+                "invalid",
+                format!("{} can't update rows by key (\"{}\"): choose Insert, Delete rows then insert, or Replace table.", engine_name(dialect), profile.name),
+            ));
+        }
         if spec.mode.needs_keys() && keys_in.is_empty() {
             return Err(EngineError::new("invalid", "Choose the key columns that identify a row (Update and Merge match rows by them)"));
         }

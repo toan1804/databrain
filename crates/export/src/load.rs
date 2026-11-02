@@ -137,9 +137,16 @@ pub fn create_table_sql(dialect: ConnectorKind, table: &str, schema: &SchemaRef)
     let cols: Vec<String> = schema
         .fields()
         .iter()
-        .map(|f| format!("{} {}{}", quote_ident(dialect, f.name()), column_type(dialect, f), if f.is_nullable() { "" } else { " NOT NULL" }))
+        .map(|f| {
+            let null = match (f.is_nullable(), lt(dialect).explicit_null) {
+                (false, _) => " NOT NULL",
+                (true, true) => " NULL",
+                (true, false) => "",
+            };
+            format!("{} {}{null}", quote_ident(dialect, f.name()), column_type(dialect, f))
+        })
         .collect();
-    format!("CREATE TABLE {} ({})", quote_path(dialect, table), cols.join(", "))
+    format!("CREATE TABLE {} ({}){}", quote_path(dialect, table), cols.join(", "), lt(dialect).create_suffix)
 }
 
 /// [`create_table_sql`] that does nothing when the table already exists
@@ -160,9 +167,15 @@ pub fn probe_sql(dialect: ConnectorKind, table: &str) -> String {
     if lt(dialect).probe_limit0 { format!("SELECT * FROM {t} LIMIT 0") } else { format!("SELECT * FROM {t} WHERE 1 = 0") }
 }
 
-/// `DELETE FROM table` (Truncate mode: transactional everywhere, unlike `TRUNCATE`).
+/// `DELETE FROM table` (Truncate mode: transactional everywhere, unlike
+/// `TRUNCATE`); `TRUNCATE TABLE` where DELETE needs a WHERE (ClickHouse).
 pub fn delete_all_sql(dialect: ConnectorKind, table: &str) -> String {
-    format!("DELETE FROM {}", quote_path(dialect, table))
+    lt(dialect).delete_all.replace("{}", &quote_path(dialect, table))
+}
+
+/// Whether Update and Merge by key can write into `dialect`.
+pub fn keyed_loads(dialect: ConnectorKind) -> bool {
+    dialect.traits().load.is_some_and(|l| l.keyed)
 }
 
 /// Engines where the staging table of Update/Merge is a session temporary
@@ -365,8 +378,8 @@ impl InsertSql {
         match lt(self.dialect).insert_all {
             // `INSERT ALL INTO t (cols) VALUES (…) … SELECT 1 FROM DUAL`
             true => ("INSERT ALL".len() + " SELECT 1 FROM DUAL".len(), format!(" INTO {t} ({cols}) VALUES ").len()),
-            // `INSERT INTO t (cols) VALUES (…), (…)`
-            false => (format!("INSERT INTO {t} ({cols}) VALUES ").len(), 2),
+            // `INSERT INTO t (cols) [SETTINGS …] VALUES (…), (…)`
+            false => (format!("INSERT INTO {t} ({cols}){} VALUES ", lt(self.dialect).insert_settings).len(), 2),
         }
     }
 
@@ -402,7 +415,7 @@ impl InsertSql {
         let (t, cols) = (&self.table, &self.cols);
         let sql = match lt(self.dialect).insert_all {
             true => format!("INSERT ALL {} SELECT 1 FROM DUAL", rows.iter().map(|r| format!("INTO {t} ({cols}) VALUES {r}")).collect::<Vec<_>>().join(" ")),
-            false => format!("INSERT INTO {t} ({cols}) VALUES {}", rows.join(", ")),
+            false => format!("INSERT INTO {t} ({cols}){} VALUES {}", lt(self.dialect).insert_settings, rows.join(", ")),
         };
         Ok(Some((sql, n)))
     }
@@ -467,6 +480,31 @@ mod tests {
         assert!(create_table_if_missing_sql(ConnectorKind::Sqlite, "t", &schema).starts_with(r#"CREATE TABLE IF NOT EXISTS "t" ("id" INTEGER NOT NULL"#));
         assert!(create_table_if_missing_sql(ConnectorKind::Mssql, "dbo.t", &schema).starts_with("IF OBJECT_ID(N'[dbo].[t]', N'U') IS NULL CREATE TABLE [dbo].[t]"));
         assert!(create_table_if_missing_sql(ConnectorKind::Oracle, "t", &schema).contains("-955"));
+    }
+
+    /// ClickHouse: MergeTree tables with explicit NULL columns, TRUNCATE for
+    /// "Delete rows, then insert", timestamps with offsets parsed best-effort,
+    /// and no Update/Merge by key.
+    #[test]
+    fn clickhouse_load_sql() {
+        use ConnectorKind as K;
+        let (schema, batches) = rows(2);
+        assert_eq!(
+            create_table_sql(K::Clickhouse, "db.t", &schema),
+            "CREATE TABLE `db`.`t` (`id` Int64 NOT NULL, `name` String NULL, `ok` Bool NULL, `at` DateTime64(6) NULL) ENGINE = MergeTree ORDER BY tuple()"
+        );
+        assert!(create_table_if_missing_sql(K::Clickhouse, "t", &schema).starts_with("CREATE TABLE IF NOT EXISTS `t` ("));
+        assert_eq!(delete_all_sql(K::Clickhouse, "db.t"), "TRUNCATE TABLE `db`.`t`");
+        assert_eq!(delete_all_sql(K::Postgres, "t"), r#"DELETE FROM "t""#);
+        assert_eq!(
+            insert_statements(K::Clickhouse, "t", &schema, &batches).unwrap(),
+            vec!["INSERT INTO `t` (`id`, `name`, `ok`, `at`) SETTINGS date_time_input_format = 'best_effort' VALUES (0, 'it''s 0', TRUE, '2026-01-01 00:00:00'), (1, NULL, FALSE, '2026-01-01 00:00:00')"]
+        );
+        assert_eq!(literal(Some("a\\b"), Lit::Text, K::Clickhouse), "'a\\\\b'", "backslashes are escaped");
+        assert_eq!(literal(Some("0aff"), Lit::Binary, K::Clickhouse), "unhex('0aff')");
+        assert!(is_load_target(K::Clickhouse));
+        assert!(!keyed_loads(K::Clickhouse));
+        assert!(keyed_loads(K::Postgres));
     }
 
     #[test]
