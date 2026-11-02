@@ -165,6 +165,9 @@ pub fn run() {
                         // AI conversations, with their own retention setting.
                         let w = ws.clone();
                         let _ = tokio::task::spawn_blocking(move || w.prune_ai_history()).await;
+                        // Job run logs: each job's latest runs, within the history retention.
+                        let w = ws.clone();
+                        let _ = tokio::task::spawn_blocking(move || w.prune_job_run_logs(w.history_retention_days())).await;
                         tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
                     }
                 });

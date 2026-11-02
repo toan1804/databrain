@@ -91,7 +91,7 @@ export function RunLog({ job, run, step, onSelect }: { job: Job; run: JobRun | u
         }}
       >
         {loading && <div className="text-muted">Loading…</div>}
-        {!loading && !shown.length && <div className="text-muted">{entries.length ? "Nothing matches." : run.status === "running" ? "Starting…" : "No log for this run (runs before logs were kept have none)."}</div>}
+        {!loading && !shown.length && <div className="text-muted">{entries.length ? "Nothing matches." : run.status === "running" ? "Starting…" : "No log for this run: logs are kept for each job's latest 20 runs, within the history retention (Settings → Queries)."}</div>}
         {shown.map((e) => (
           <div key={e.seq} className="py-px">
             <div className="flex items-baseline gap-1.5">
