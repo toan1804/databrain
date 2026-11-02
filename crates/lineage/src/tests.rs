@@ -317,3 +317,30 @@ fn chain_review_cases() {
     let g = run("drop table if exists old_stuff");
     assert!(g.nodes.is_empty() && g.unknown_tables.is_empty());
 }
+
+/// `WITH … UPDATE/DELETE/INSERT`: the statement reads its CTEs, which are
+/// traced like those of a SELECT (no "not traced" warning).
+#[test]
+fn with_feeds_update_delete_insert() {
+    let g = run(
+        "with recent as (select customer_id, sum(amount) as total from orders group by customer_id) \
+         update customers c set name = r.total from recent r where r.customer_id = c.id",
+    );
+    assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    assert_eq!(g.statements[0].kind, "update");
+    let e = edges(&g);
+    for want in ["sales.orders.amount -aggregate-> recent.total", "recent.total -direct-> sales.customers.name", "recent.customer_id -filter-> sales.customers"] {
+        assert!(e.contains(&want.to_string()), "{want}: {e:#?}");
+    }
+    assert!(flows_of(&g).iter().any(|f| f.starts_with("sales.orders -aggregate-> sales.customers")), "{:#?}", flows_of(&g));
+
+    let g = run("with gone as (select customer_id from orders where status = 'x') delete from customers where id in (select customer_id from gone)");
+    assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    assert_eq!(g.statements[0].kind, "delete");
+    assert!(edges(&g).contains(&"sales.orders.customer_id -direct-> gone.customer_id".to_string()), "{:#?}", edges(&g));
+    assert!(flows_of(&g).iter().any(|f| f.starts_with("sales.orders -filter-> sales.customers")), "{:#?}", flows_of(&g));
+
+    let g = run("with x as (select id, amount from orders) insert into archive (id, amount) select id, amount from x");
+    assert_eq!(g.statements[0].kind, "insert");
+    assert!(flows_of(&g).iter().any(|f| f.starts_with("sales.orders -direct-> archive")), "{:#?}", flows_of(&g));
+}

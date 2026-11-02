@@ -723,13 +723,43 @@ impl<'a> Builder<'a> {
         match st {
             Statement::Query(q) if select_into(q).is_some() => {
                 let target = select_into(q).unwrap();
-                let id = self.write_into(&target.0, q, &[], true);
+                let id = self.write_into(&target.0, q, &[], true, &Env::default());
                 if target.1 {
                     if let Some(t) = self.g.nodes.iter().position(|n| n.id == id) {
                         self.g.nodes[t].temporary = true;
                     }
                 }
                 self.g.statements.push(info("select_into", Some(range), Some(id)));
+            }
+            Statement::Query(q) if matches!(*q.body, SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_)) => {
+                // `WITH … INSERT/UPDATE/DELETE/MERGE`: the statement reads the CTEs.
+                let env = self.with_ctes(q, &Env::default());
+                match &*q.body {
+                    SetExpr::Insert(Statement::Insert(ins)) if ins.source.is_some() => {
+                        let src = ins.source.as_ref().unwrap();
+                        let TableObject::TableName(name) = &ins.table else {
+                            self.other(st, range);
+                            return;
+                        };
+                        let names: Vec<String> = ins.columns.iter().map(|c| name_parts(c).last().cloned().unwrap_or_default()).collect();
+                        let id = self.write_into(name, src, &names, false, &env);
+                        let qr = qrange(self, src);
+                        self.g.statements.push(info("insert", qr, Some(id)));
+                    }
+                    SetExpr::Update(Statement::Update(u)) => {
+                        let id = self.update(u, &env);
+                        self.g.statements.push(info("update", None, id));
+                    }
+                    SetExpr::Delete(Statement::Delete(d)) => {
+                        let id = self.delete(d, &env);
+                        self.g.statements.push(info("delete", None, id));
+                    }
+                    SetExpr::Merge(Statement::Merge(m)) => {
+                        let id = self.merge(m, &env);
+                        self.g.statements.push(info("merge", None, id));
+                    }
+                    _ => self.other(st, range),
+                }
             }
             Statement::Query(q) => {
                 let r = self.query(q, &Env::default());
@@ -743,7 +773,7 @@ impl<'a> Builder<'a> {
                 let q = ct.query.as_ref().unwrap();
                 let names: Vec<String> = ct.columns.iter().map(|c| c.name.value.clone()).collect();
                 let defines = !self.exists_already(&ct.name, ct.if_not_exists);
-                let id = self.write_into(&ct.name, q, &names, defines);
+                let id = self.write_into(&ct.name, q, &names, defines, &Env::default());
                 if ct.temporary {
                     if let Some(t) = self.g.nodes.iter().position(|n| n.id == id) {
                         self.g.nodes[t].temporary = true;
@@ -779,7 +809,7 @@ impl<'a> Builder<'a> {
             }
             Statement::CreateView(v) => {
                 let names: Vec<String> = v.columns.iter().map(|c| c.name.value.clone()).collect();
-                let id = self.write_into(&v.name, &v.query, &names, true);
+                let id = self.write_into(&v.name, &v.query, &names, true, &Env::default());
                 let qr = qrange(self, &v.query);
                 self.g.statements.push(info("create_view", qr, Some(id)));
             }
@@ -790,20 +820,20 @@ impl<'a> Builder<'a> {
                     return;
                 };
                 let names: Vec<String> = ins.columns.iter().map(|c| name_parts(c).last().cloned().unwrap_or_default()).collect();
-                let id = self.write_into(name, q, &names, false);
+                let id = self.write_into(name, q, &names, false, &Env::default());
                 let qr = qrange(self, q);
                 self.g.statements.push(info("insert", qr, Some(id)));
             }
             Statement::Update(u) => {
-                let id = self.update(u);
+                let id = self.update(u, &Env::default());
                 self.g.statements.push(info("update", None, id));
             }
             Statement::Delete(d) => {
-                let id = self.delete(d);
+                let id = self.delete(d, &Env::default());
                 self.g.statements.push(info("delete", None, id));
             }
             Statement::Merge(m) => {
-                let id = self.merge(m);
+                let id = self.merge(m, &Env::default());
                 self.g.statements.push(info("merge", None, id));
             }
             Statement::Drop { object_type: ObjectType::Table | ObjectType::View | ObjectType::MaterializedView, .. } => {
@@ -855,8 +885,8 @@ impl<'a> Builder<'a> {
 
     /// `CREATE TABLE/VIEW … AS q` / `INSERT INTO t (cols) q`: q's columns feed t's.
     /// `defines`: the statement creates the table, so its columns are exactly these.
-    fn write_into(&mut self, name: &ObjectName, q: &Query, names: &[String], defines: bool) -> String {
-        let r = self.query(q, &Env::default());
+    fn write_into(&mut self, name: &ObjectName, q: &Query, names: &[String], defines: bool, env: &Env) -> String {
+        let r = self.query(q, env);
         let t = self.table_node(name);
         self.g.nodes[t].written = true;
         let outs: Vec<String> = self.g.nodes[r].columns.iter().map(|c| c.name.clone()).collect();
@@ -879,8 +909,8 @@ impl<'a> Builder<'a> {
 
     /// `UPDATE t SET c = e … [FROM …] [WHERE …]`: what `e` reads feeds `t.c`;
     /// the `FROM` tables' join and `WHERE` columns decide which rows change.
-    fn update(&mut self, u: &Update) -> Option<String> {
-        let env = Env::default();
+    fn update(&mut self, u: &Update, env: &Env) -> Option<String> {
+        let env = env.clone();
         let TableFactor::Table { name, alias, .. } = &u.table.relation else {
             self.warn("UPDATE of something other than a table is not traced".into(), self.range(u.table.span()));
             return None;
@@ -959,8 +989,8 @@ impl<'a> Builder<'a> {
 
     /// `DELETE FROM t [USING …] WHERE …`: the other tables' columns in the
     /// join and `WHERE` decide which rows of `t` go.
-    fn delete(&mut self, d: &Delete) -> Option<String> {
-        let env = Env::default();
+    fn delete(&mut self, d: &Delete, env: &Env) -> Option<String> {
+        let env = env.clone();
         let from = match &d.from {
             FromTable::WithFromKeyword(v) | FromTable::WithoutKeyword(v) => v,
         };
@@ -1011,8 +1041,8 @@ impl<'a> Builder<'a> {
     /// `MERGE INTO t USING s ON … WHEN MATCHED THEN UPDATE SET … WHEN NOT
     /// MATCHED THEN INSERT (…) VALUES (…)`: the source's columns feed the
     /// target's; the `ON` columns join, `WHEN … AND` conditions filter.
-    fn merge(&mut self, m: &Merge) -> Option<String> {
-        let env = Env::default();
+    fn merge(&mut self, m: &Merge, env: &Env) -> Option<String> {
+        let env = env.clone();
         let TableFactor::Table { name, alias, .. } = &m.table else {
             self.warn("MERGE into something other than a table is not traced".into(), self.range(m.table.span()));
             return None;
@@ -1090,6 +1120,12 @@ impl<'a> Builder<'a> {
     // ---- queries
 
     fn query(&mut self, q: &Query, env: &Env) -> usize {
+        let env = self.with_ctes(q, env);
+        self.set_expr(&q.body, &env)
+    }
+
+    /// `env` plus the CTEs of `q`'s `WITH` (each analyzed in turn).
+    fn with_ctes(&mut self, q: &Query, env: &Env) -> Env {
         let mut env = env.clone();
         if let Some(with) = &q.with {
             for cte in &with.cte_tables {
@@ -1129,7 +1165,7 @@ impl<'a> Builder<'a> {
                 env.ctes.push((key, n));
             }
         }
-        self.set_expr(&q.body, &env)
+        env
     }
 
     /// Point `from`'s edges at `to` and empty `from` (recursive CTE placeholder).
