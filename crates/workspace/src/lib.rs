@@ -356,6 +356,31 @@ pub struct HistoryQuery {
     #[serde(default)]
     #[ts(as = "Option<bool>", optional)]
     pub exclude_ai: bool,
+    /// Only entries that ended like this.
+    #[serde(default)]
+    #[ts(optional)]
+    pub status: Option<RunStatus>,
+}
+
+/// Search words of a history search: whitespace-separated, `"…"` keeps a
+/// phrase together; at most 8.
+pub fn history_terms(search: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = search.trim();
+    while !rest.is_empty() && out.len() < 8 {
+        if let Some(q) = rest.strip_prefix('"') {
+            let (phrase, after) = q.split_once('"').unwrap_or((q, ""));
+            if !phrase.trim().is_empty() {
+                out.push(phrase.to_string());
+            }
+            rest = after.trim_start();
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            out.push(rest[..end].to_string());
+            rest = rest[end..].trim_start();
+        }
+    }
+    out
 }
 
 /// What "Clear history" deletes.
@@ -1139,23 +1164,31 @@ impl Workspace {
     pub fn list_history(&self, q: &HistoryQuery) -> Result<Vec<HistoryEntry>> {
         let c = self.conn.lock();
         let limit = q.limit.unwrap_or(200).min(1000) as i64;
-        let search = q
-            .search
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| format!("%{}%", s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")));
-        let mut stmt = c.prepare(
+        // Every word must appear, in any order, in the SQL, the error or the
+        // connection's name (not case-sensitive for ASCII).
+        let terms: Vec<String> = history_terms(q.search.as_deref().unwrap_or(""))
+            .into_iter()
+            .map(|s| format!("%{}%", s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")))
+            .collect();
+        let mut sql = String::from(
             "SELECT h.id, h.connection_id, c.name, h.sql, h.started_at, h.duration_ms, h.rows, h.status, h.error, h.origin, h.output_handle, h.result_id \
              FROM query_history h LEFT JOIN connections c ON c.id = h.connection_id \
-             WHERE (?1 IS NULL OR h.sql LIKE ?1 ESCAPE '\\') \
-               AND (?2 IS NULL OR h.connection_id = ?2) \
-               AND (?3 IS NULL OR h.id < ?3) \
-               AND (?5 = 0 OR h.origin NOT IN ('ai', 'mcp')) \
-             ORDER BY h.id DESC LIMIT ?4",
-        )?;
+             WHERE (?1 IS NULL OR h.connection_id = ?1) \
+               AND (?2 IS NULL OR h.id < ?2) \
+               AND (?4 = 0 OR h.origin NOT IN ('ai', 'mcp')) \
+               AND (?5 IS NULL OR h.status = ?5)",
+        );
+        for i in 0..terms.len() {
+            let n = i + 6;
+            sql.push_str(&format!(" AND (h.sql LIKE ?{n} ESCAPE '\\' OR h.error LIKE ?{n} ESCAPE '\\' OR c.name LIKE ?{n} ESCAPE '\\')"));
+        }
+        sql.push_str(" ORDER BY h.id DESC LIMIT ?3");
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(q.connection_id.clone()), Box::new(q.before), Box::new(limit), Box::new(q.exclude_ai), Box::new(q.status.map(RunStatus::as_str))];
+        values.extend(terms.into_iter().map(|t| Box::new(t) as Box<dyn rusqlite::ToSql>));
+        let mut stmt = c.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![search, q.connection_id, q.before, limit, q.exclude_ai], |r| {
+            .query_map(rusqlite::params_from_iter(values.iter().map(|v| v.as_ref())), |r| {
                 Ok(HistoryEntry {
                     origin: Origin::parse(&r.get::<_, String>(9)?),
                     id: r.get(0)?,
@@ -1435,6 +1468,49 @@ mod tests {
         assert_eq!(ws.get_saved_query(&q.id).unwrap().folder_id, None);
         ws.delete_saved_query(&q.id).unwrap();
         assert!(ws.list_saved_queries(None).unwrap().is_empty());
+    }
+
+    /// History search: every word, in any order, in the SQL, the error or
+    /// the connection name; `"…"` is one phrase; filters by connection and
+    /// by how the run ended.
+    #[test]
+    fn history_search_words_and_filters() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let sales = ws.save_connection(profile("Sales warehouse")).unwrap();
+        let crm = ws.save_connection(profile("CRM")).unwrap();
+        let add = |conn: &str, sql: &str, error: Option<&str>| {
+            ws.add_history(NewHistory {
+                origin: Origin::User,
+                connection_id: Some(conn.into()),
+                sql: sql.into(),
+                started_at: now_ms(),
+                duration_ms: 1,
+                rows: None,
+                status: Some(if error.is_some() { RunStatus::Error } else { RunStatus::Success }),
+                error: error.map(str::to_string),
+                output_handle: None,
+                result_id: None,
+            })
+            .unwrap();
+        };
+        add(&sales.id, "select status, sum(amount) from orders where created_at >= '2026-01-01' group by status", None);
+        add(&sales.id, "select * from order_items", Some("relation \"order_items\" does not exist"));
+        add(&crm.id, "select name from customers where country = 'VN'", None);
+        let find = |search: &str, f: &dyn Fn(&mut HistoryQuery)| {
+            let mut q = HistoryQuery { search: Some(search.into()), ..Default::default() };
+            f(&mut q);
+            ws.list_history(&q).unwrap().into_iter().map(|h| h.sql.split_whitespace().last().unwrap().to_string()).collect::<Vec<_>>()
+        };
+        let none = |_: &mut HistoryQuery| {};
+        assert_eq!(find("2026 SUM orders", &none), ["status"], "any order, any case");
+        assert_eq!(find("orders customers", &none), Vec::<String>::new(), "every word must match");
+        assert_eq!(find("does not exist", &none), ["order_items"], "the error text");
+        assert_eq!(find("warehouse", &none).len(), 2, "the connection name");
+        assert_eq!(find("\"from orders\"", &none), ["status"], "a phrase");
+        assert_eq!(find("100%", &none), Vec::<String>::new(), "% is a character, not a wildcard");
+        assert_eq!(find("select", &|q| q.connection_id = Some(crm.id.clone())), ["'VN'"]);
+        assert_eq!(find("", &|q| q.status = Some(RunStatus::Error)), ["order_items"]);
+        assert_eq!(history_terms(r#"  a "b c"  d "#), ["a", "b c", "d"]);
     }
 
     #[test]

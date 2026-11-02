@@ -18,6 +18,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- History: search by several words in any order across SQL, errors and connection names; filter by connection and status; run an entry again, or on another connection.
 - Per-connection connect timeout and idle disconnect (General section), overriding Settings → Queries for that connection.
 - ClickHouse is a load target for job load steps and "Load into…": new MergeTree tables with `Nullable` columns, Insert, Delete rows then insert (`TRUNCATE`), and Replace. Update and Merge by key are not offered there.
 - Lineage: with "Check with database", views the SQL reads are traced through their definitions into the tables they read (views of views too).
