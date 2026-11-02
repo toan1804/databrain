@@ -972,3 +972,40 @@ async fn job_steps_get_parameter_values() {
     let run = finished(&st, &job.id).await;
     assert!(run.nodes[0].summary.error.as_deref().is_some_and(|e| e.contains(":day") && e.contains(":tenant")), "{run:?}");
 }
+
+/// The lease ran out while the first step ran (the computer slept) and
+/// another runner took the job: this run stops before its next step, so
+/// the job doesn't run twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_lease_stops_the_run() {
+    let st = state();
+    let mut job = Job {
+        id: String::new(),
+        name: "Lease".into(),
+        nodes: vec![
+            node("a", "slow", JobNodeKind::Query, None, "select sum(hash(i)) as h from range(300000000) t(i)"),
+            node("b", "after", JobNodeKind::Query, None, "select 1 as x"),
+        ],
+        edges: vec![JobEdge { from: "a".into(), to: "b".into() }],
+        schedule: JobSchedule::default(),
+        last_scheduled_at: None,
+        params: Default::default(),
+        param_set: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    job = st.workspace.save_job(job).unwrap();
+    let started = std::time::Instant::now();
+    api::run_job(&st, &job.id, None).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    st.workspace.expire_job_lease_for_tests(&job.id).unwrap();
+    assert!(st.workspace.claim_job(&job.id, "cli:other", databrain_workspace::now_ms() + 90_000).unwrap(), "the other runner takes it");
+    let run = finished(&st, &job.id).await;
+    assert!(started.elapsed() > Duration::from_millis(150), "the first step must still be running when the lease is taken");
+    assert_eq!(run.status, "cancelled", "{run:?}");
+    let b = run.nodes.iter().find(|n| n.node_id == "b").unwrap();
+    assert_eq!(b.summary.status, "cancelled", "the next step didn't start: {run:?}");
+    let log = st.workspace.job_run_log(&job.id, run.id).unwrap();
+    assert!(log.iter().any(|l| l.message.contains("another runner took this job")), "{log:?}");
+    assert_eq!(st.workspace.job_lease(&job.id).unwrap().map(|(o, _)| o).as_deref(), Some("cli:other"), "its lease isn't released by this run");
+}

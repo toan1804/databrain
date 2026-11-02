@@ -742,6 +742,13 @@ impl Workspace {
 
     /// Make a job look saved and last scheduled at `at` (tests of schedules).
     #[doc(hidden)]
+    /// Make the job's lease run out now (tests: a computer that slept).
+    #[doc(hidden)]
+    pub fn expire_job_lease_for_tests(&self, id: &str) -> Result<()> {
+        self.conn.lock().execute("UPDATE jobs SET lease_until = 0 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn backdate_job_for_tests(&self, id: &str, at: i64) -> Result<()> {
         self.conn.lock().execute("UPDATE jobs SET last_scheduled_at = ?2, updated_at = ?2 WHERE id = ?1", params![id, at])?;
         Ok(())

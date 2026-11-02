@@ -61,6 +61,14 @@ pub struct JobLogEvent {
 /// Progress events are sent at most this often per run.
 const PROGRESS_EVERY: Duration = Duration::from_millis(200);
 
+/// Logged when another runner holds the job now.
+const LEASE_LOST: &str = "Stopped: another runner took this job (its lease ran out, e.g. while the computer slept); it runs there, not twice";
+
+/// This process still holds `job_id`'s lease (renewed now).
+fn holds_lease(ctx: &JobCtx, job_id: &str) -> bool {
+    ctx.workspace.claim_job(job_id, &ctx.jobs.owner, now_ms() + LEASE_MS).unwrap_or(false)
+}
+
 /// How long a job's lease lasts; renewed every [`LEASE_RENEW`] while it runs.
 const LEASE_MS: i64 = 90_000;
 const LEASE_RENEW: Duration = Duration::from_secs(20);
@@ -447,11 +455,17 @@ pub fn start_with(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<St
         let run_id = r.id;
         // Keep the lease and tell other processes the run is alive.
         let beat = {
-            let (ws, id, owner) = (c.workspace.clone(), id.clone(), c.jobs.owner.clone());
+            let (ws, id, owner, stop) = (c.workspace.clone(), id.clone(), c.jobs.owner.clone(), cancel.clone());
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(LEASE_RENEW).await;
-                    let _ = ws.claim_job(&id, &owner, now_ms() + LEASE_MS);
+                    // Lost (another runner took it after the lease ran out, e.g.
+                    // while the computer slept): stop, so it doesn't run twice.
+                    if !ws.claim_job(&id, &owner, now_ms() + LEASE_MS).unwrap_or(false) {
+                        tracing::warn!(job = %id, run = run_id, "job lease lost to another runner: stopping this run");
+                        stop.cancel();
+                        break;
+                    }
                     let _ = ws.touch_job_run(run_id, &owner);
                 }
             })
@@ -547,6 +561,12 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
                 }
                 let ups: Vec<String> = upstream(&n.id).into_iter().filter(|u| selected.contains(u)).collect();
                 let t = tracer.for_node(n);
+                // The lease is checked (and renewed) before each step: after the
+                // computer slept past it, another runner may have taken the job.
+                if !cancel.is_cancelled() && ups.iter().all(|u| status.get(u) == Some(&"success")) && !holds_lease(ctx, &job.id) {
+                    tracer.log("error", LEASE_LOST, None, None, None);
+                    cancel.cancel();
+                }
                 // Stopped: what hasn't run is cancelled, not skipped as if a step failed.
                 let stopped = cancel.is_cancelled() || ups.iter().any(|u| status.get(u) == Some(&"cancelled"));
                 if stopped {
