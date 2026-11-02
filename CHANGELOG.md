@@ -57,6 +57,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- A very large idle-disconnect time (minutes) no longer overflows when turned into seconds; it means practically never.
 - Two runs started at the same moment in one tab (or on one session) could both start; checking for a running query and claiming the tab now happen together.
 - Jobs: run logs are pruned. Each job keeps the full log of its latest 20 runs, within the history retention (Settings → Queries); older runs keep their summary.
 - The window no longer goes blank on an unexpected error or a bad value kept in the window's storage: values are checked (and dropped when they don't fit), and an error shows what happened with Reload and "Reset window layout and reload".
