@@ -34,6 +34,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- MCP: a call the client cancels (`notifications/cancelled`) stops at once: DataBrain no longer keeps waiting for the user's answer or running its query.
 - Opening a session on a server (a tab, the explorer, the assistant, a job) gives up after the connect timeout with a message, as "Test connection" does, instead of waiting for ever on a server that never finishes the handshake. The Oracle thin driver's first download is not counted.
 - MCP: a query the client never answers no longer looks like a hang. DataBrain's question waits 2 minutes instead of 5, tells the client it is waiting (progress), then ends the call with a message naming the fixes (auto-read, or "Accept the MCP client's approval"), and asks no further question in that session. The connection's AI settings explain this when MCP is on with "Ask me every time".
 - A password or key read from the OS keychain that waits on a permission prompt (another binary, such as databrain-mcp, reading an item the app saved) no longer blocks the app or the MCP server: the read runs off the async runtime and gives up after the connect time limit with a message that says what to allow.

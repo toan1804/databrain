@@ -1074,3 +1074,72 @@ async fn silent_server_fails_within_the_connect_limit() {
     assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
     assert!(st.engine.connected_ids().is_empty());
 }
+
+/// The client cancels a tool call (`notifications/cancelled`) while
+/// DataBrain's question waits: the call ends at once with no response
+/// (the client ignores one), and the server keeps serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_cancelled_call_stops_waiting() {
+    use databrain_ai::mcp::McpServer;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (st, _sink, dir) = state();
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(dir.path().join("c.db").to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let mut p = save_profile(&st, "asks", cfg, None);
+    p.ai_policy.mcp_enabled = true;
+    save_profile_update(&st, p);
+    let server = Arc::new(McpServer { engine: st.engine.clone(), hub: st.hub.clone() });
+    let (client_rx, server_tx) = tokio::io::duplex(1 << 16);
+    let (server_rx, mut client_tx) = tokio::io::duplex(1 << 16);
+    let srv = tokio::spawn(async move { server.serve(BufReader::new(server_rx), server_tx).await });
+    let mut lines = BufReader::new(client_rx).lines();
+    async fn next(lines: &mut tokio::io::Lines<BufReader<tokio::io::DuplexStream>>) -> serde_json::Value {
+        let l = tokio::time::timeout(Duration::from_secs(10), lines.next_line()).await.expect("server answered in time").unwrap().expect("server still open");
+        serde_json::from_str::<serde_json::Value>(&l).unwrap()
+    }
+    async fn write(w: &mut tokio::io::DuplexStream, v: serde_json::Value) {
+        w.write_all(format!("{v}\n").as_bytes()).await.unwrap();
+    }
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}}, "clientInfo": {"name": "t", "version": "0"}}})).await;
+    assert_eq!(next(&mut lines).await["id"], 1);
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": "call-2", "method": "tools/call", "params": {"name": "run_query", "arguments": {"connection": "asks", "sql": "select 1", "purpose": "t"}}})).await;
+    let ask = next(&mut lines).await;
+    assert_eq!(ask["method"], "elicitation/create", "{ask}");
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "call-2", "reason": "user stopped"}})).await;
+    // The next line is the ping's answer: the cancelled call sent nothing.
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "ping"})).await;
+    let r = next(&mut lines).await;
+    assert_eq!(r["id"], 3, "{r}");
+    // The call ended now, not when the question would have timed out.
+    let mut ended = false;
+    for _ in 0..100 {
+        if st.workspace.list_audit(20).unwrap().iter().any(|a| a.tool == "run_query" && a.decision == "denied") {
+            ended = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ended, "the cancelled call stopped waiting");
+    // Questions still work afterwards (a cancel is not "no answer").
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "run_query", "arguments": {"connection": "asks", "sql": "select 2", "purpose": "t"}}})).await;
+    let ask = next(&mut lines).await;
+    assert_eq!(ask["method"], "elicitation/create", "{ask}");
+    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": ask["id"].clone(), "result": {"action": "accept", "content": {"approve": true}}})).await;
+    let r = next(&mut lines).await;
+    assert_eq!((r["id"].as_u64(), r["result"]["isError"].as_bool()), (Some(4), Some(false)), "{r}");
+    drop(client_tx);
+    tokio::time::timeout(Duration::from_secs(10), srv).await.expect("server stops at EOF").unwrap().unwrap();
+    while let Ok(Some(l)) = lines.next_line().await {
+        assert!(!l.contains("call-2"), "no answer for the cancelled call: {l}");
+    }
+}
