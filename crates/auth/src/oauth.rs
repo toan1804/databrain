@@ -2,10 +2,10 @@
 
 use std::time::Duration;
 
+use aws_lc_rs::digest::{SHA256, digest};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngCore;
-use aws_lc_rs::digest::{SHA256, digest};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -118,10 +118,7 @@ pub struct Pkce {
 pub fn pkce() -> Pkce {
     let verifier = random_token(48);
     let challenge = URL_SAFE_NO_PAD.encode(digest(&SHA256, verifier.as_bytes()));
-    Pkce {
-        verifier,
-        challenge,
-    }
+    Pkce { verifier, challenge }
 }
 
 fn identity_from(resp: &TokenResponse) -> Option<String> {
@@ -129,9 +126,7 @@ fn identity_from(resp: &TokenResponse) -> Option<String> {
         return Some(u.clone());
     }
     let claims = crate::jwt::decode_payload(resp.id_token.as_deref()?)?;
-    ["email", "preferred_username", "upn", "name", "sub"]
-        .iter()
-        .find_map(|k| claims.get(*k).and_then(|v| v.as_str()).map(str::to_string))
+    ["email", "preferred_username", "upn", "name", "sub"].iter().find_map(|k| claims.get(*k).and_then(|v| v.as_str()).map(str::to_string))
 }
 
 fn expires_at(v: &Option<serde_json::Value>) -> Option<u64> {
@@ -143,13 +138,8 @@ fn expires_at(v: &Option<serde_json::Value>) -> Option<u64> {
     Some(now_secs() + secs)
 }
 
-async fn token_request(
-    cfg: &OAuthConfig,
-    mut form: Vec<(&'static str, String)>,
-) -> Result<TokenResponse, TokenError> {
-    let mut req = http()
-        .post(&cfg.token_url)
-        .header("Accept", "application/json");
+async fn token_request(cfg: &OAuthConfig, mut form: Vec<(&'static str, String)>) -> Result<TokenResponse, TokenError> {
+    let mut req = http().post(&cfg.token_url).header("Accept", "application/json");
     match (cfg.client_auth, &cfg.client_secret) {
         (ClientAuthStyle::Basic, Some(secret)) => {
             req = req.basic_auth(&cfg.client_id, Some(secret.expose_secret()));
@@ -162,32 +152,14 @@ async fn token_request(
             }
         }
     }
-    let resp = req
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| TokenError::Other(AuthError::Network(e.to_string())))?;
+    let resp = req.form(&form).send().await.map_err(|e| TokenError::Other(AuthError::Network(e.to_string())))?;
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| TokenError::Other(AuthError::Network(e.to_string())))?;
+    let body = resp.text().await.map_err(|e| TokenError::Other(AuthError::Network(e.to_string())))?;
     if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| {
-            TokenError::Other(AuthError::Flow(format!(
-                "unexpected token response from {}: {e}",
-                cfg.provider
-            )))
-        });
+        return serde_json::from_str(&body).map_err(|e| TokenError::Other(AuthError::Flow(format!("unexpected token response from {}: {e}", cfg.provider))));
     }
     match serde_json::from_str::<ErrorResponse>(&body) {
-        Ok(er) => Err(TokenError::OAuth {
-            description: er
-                .error_description
-                .clone()
-                .unwrap_or_else(|| er.error.clone()),
-            error: er.error,
-        }),
+        Ok(er) => Err(TokenError::OAuth { description: er.error_description.clone().unwrap_or_else(|| er.error.clone()), error: er.error }),
         Err(_) => Err(TokenError::Other(AuthError::Flow(format!(
             "{} token endpoint returned HTTP {status}: {}",
             cfg.provider,
@@ -208,9 +180,7 @@ impl From<TokenError> for AuthError {
                 let _ = description;
                 AuthError::ReauthRequired
             }
-            TokenError::OAuth { error, description } => {
-                AuthError::Flow(format!("{error}: {description}"))
-            }
+            TokenError::OAuth { error, description } => AuthError::Flow(format!("{error}: {description}")),
             TokenError::Other(e) => e,
         }
     }
@@ -218,23 +188,12 @@ impl From<TokenError> for AuthError {
 
 fn to_set(r: TokenResponse, previous_refresh: Option<String>) -> TokenSet {
     let identity = identity_from(&r);
-    TokenSet {
-        expires_at: expires_at(&r.expires_in),
-        access_token: r.access_token,
-        refresh_token: r.refresh_token.or(previous_refresh),
-        identity,
-    }
+    TokenSet { expires_at: expires_at(&r.expires_in), access_token: r.access_token, refresh_token: r.refresh_token.or(previous_refresh), identity }
 }
 
 /// Build the authorization URL (exposed for tests).
-pub fn authorize_url(
-    cfg: &OAuthConfig,
-    redirect_uri: &str,
-    state: &str,
-    challenge: &str,
-) -> Result<String, AuthError> {
-    let mut url = url::Url::parse(&cfg.authorize_url)
-        .map_err(|e| AuthError::Invalid(format!("invalid authorize URL: {e}")))?;
+pub fn authorize_url(cfg: &OAuthConfig, redirect_uri: &str, state: &str, challenge: &str) -> Result<String, AuthError> {
+    let mut url = url::Url::parse(&cfg.authorize_url).map_err(|e| AuthError::Invalid(format!("invalid authorize URL: {e}")))?;
     {
         let mut q = url.query_pairs_mut();
         q.append_pair("response_type", "code")
@@ -254,48 +213,27 @@ pub fn authorize_url(
 }
 
 /// Authorization Code + PKCE via the system browser and a loopback redirect.
-pub async fn browser_flow(
-    cfg: &OAuthConfig,
-    interaction: &dyn Interaction,
-) -> Result<TokenSet, AuthError> {
+pub async fn browser_flow(cfg: &OAuthConfig, interaction: &dyn Interaction) -> Result<TokenSet, AuthError> {
     if !interaction.interactive() {
         return Err(AuthError::ReauthRequired);
     }
-    let lb = Loopback::bind(
-        &cfg.redirect_host,
-        cfg.redirect_port.unwrap_or(0),
-        &cfg.redirect_path,
-    )
-    .await?;
+    let lb = Loopback::bind(&cfg.redirect_host, cfg.redirect_port.unwrap_or(0), &cfg.redirect_path).await?;
     let redirect_uri = lb.redirect_uri();
     let state = random_token(24);
     let p = pkce();
     let url = authorize_url(cfg, &redirect_uri, &state, &p.challenge)?;
     interaction.open_url(&url).await?;
     let cancel = interaction.cancel_token();
-    let params = lb
-        .wait(Some(&state), &cancel, Duration::from_secs(300))
-        .await;
+    let params = lb.wait(Some(&state), &cancel, Duration::from_secs(300)).await;
     interaction.finished().await;
     let params = params?;
     if let Some(err) = params.get("error") {
-        return Err(AuthError::Flow(format!(
-            "{} sign-in failed: {}",
-            cfg.provider,
-            params.get("error_description").unwrap_or(err)
-        )));
+        return Err(AuthError::Flow(format!("{} sign-in failed: {}", cfg.provider, params.get("error_description").unwrap_or(err))));
     }
-    let code = params.get("code").ok_or_else(|| {
-        AuthError::Flow("the redirect did not include an authorization code".into())
-    })?;
+    let code = params.get("code").ok_or_else(|| AuthError::Flow("the redirect did not include an authorization code".into()))?;
     let r = token_request(
         cfg,
-        vec![
-            ("grant_type", "authorization_code".into()),
-            ("code", code.clone()),
-            ("redirect_uri", redirect_uri),
-            ("code_verifier", p.verifier),
-        ],
+        vec![("grant_type", "authorization_code".into()), ("code", code.clone()), ("redirect_uri", redirect_uri), ("code_verifier", p.verifier)],
     )
     .await?;
     Ok(to_set(r, None))
@@ -318,40 +256,23 @@ struct DeviceResponse {
 }
 
 /// Device Authorization Grant (RFC 8628).
-pub async fn device_flow(
-    cfg: &OAuthConfig,
-    interaction: &dyn Interaction,
-) -> Result<TokenSet, AuthError> {
+pub async fn device_flow(cfg: &OAuthConfig, interaction: &dyn Interaction) -> Result<TokenSet, AuthError> {
     if !interaction.interactive() {
         return Err(AuthError::ReauthRequired);
     }
-    let device_url = cfg.device_url.as_deref().ok_or_else(|| {
-        AuthError::Invalid(format!(
-            "{} does not support device code sign-in",
-            cfg.provider
-        ))
-    })?;
+    let device_url = cfg.device_url.as_deref().ok_or_else(|| AuthError::Invalid(format!("{} does not support device code sign-in", cfg.provider)))?;
     let resp = http()
         .post(device_url)
         .header("Accept", "application/json")
-        .form(&[
-            ("client_id", cfg.client_id.as_str()),
-            ("scope", &cfg.scopes.join(" ")),
-        ])
+        .form(&[("client_id", cfg.client_id.as_str()), ("scope", &cfg.scopes.join(" "))])
         .send()
         .await
         .map_err(|e| AuthError::Network(e.to_string()))?;
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(AuthError::Flow(format!(
-            "device authorization failed: {}",
-            body.chars().take(300).collect::<String>()
-        )));
+        return Err(AuthError::Flow(format!("device authorization failed: {}", body.chars().take(300).collect::<String>())));
     }
-    let d: DeviceResponse = resp
-        .json()
-        .await
-        .map_err(|e| AuthError::Flow(e.to_string()))?;
+    let d: DeviceResponse = resp.json().await.map_err(|e| AuthError::Flow(e.to_string()))?;
     interaction
         .device_code(&DeviceCodePrompt {
             provider: cfg.provider.clone(),
@@ -372,18 +293,7 @@ pub async fn device_flow(
         if tokio::time::Instant::now() > deadline {
             break Err(AuthError::Flow("the device code expired".into()));
         }
-        match token_request(
-            cfg,
-            vec![
-                (
-                    "grant_type",
-                    "urn:ietf:params:oauth:grant-type:device_code".into(),
-                ),
-                ("device_code", d.device_code.clone()),
-            ],
-        )
-        .await
-        {
+        match token_request(cfg, vec![("grant_type", "urn:ietf:params:oauth:grant-type:device_code".into()), ("device_code", d.device_code.clone())]).await {
             Ok(r) => break Ok(to_set(r, None)),
             Err(TokenError::OAuth { error, .. }) if error == "authorization_pending" => continue,
             Err(TokenError::OAuth { error, .. }) if error == "slow_down" => interval += 5,
@@ -395,10 +305,7 @@ pub async fn device_flow(
 }
 
 pub async fn refresh(cfg: &OAuthConfig, refresh_token: &str) -> Result<TokenSet, AuthError> {
-    let mut form = vec![
-        ("grant_type", "refresh_token".to_string()),
-        ("refresh_token", refresh_token.to_string()),
-    ];
+    let mut form = vec![("grant_type", "refresh_token".to_string()), ("refresh_token", refresh_token.to_string())];
     if !cfg.scopes.is_empty() {
         form.push(("scope", cfg.scopes.join(" ")));
     }
@@ -418,11 +325,7 @@ pub async fn client_credentials(cfg: &OAuthConfig) -> Result<TokenSet, AuthError
 /// Best-effort token revocation (RFC 7009).
 pub async fn revoke(cfg: &OAuthConfig, token: &str) {
     if let Some(url) = &cfg.revoke_url {
-        let _ = http()
-            .post(url)
-            .form(&[("token", token), ("client_id", cfg.client_id.as_str())])
-            .send()
-            .await;
+        let _ = http().post(url).form(&[("token", token), ("client_id", cfg.client_id.as_str())]).send().await;
     }
 }
 
@@ -465,20 +368,12 @@ mod tests {
     fn pkce_challenge_is_s256() {
         let p = pkce();
         assert!(p.verifier.len() >= 43);
-        assert_eq!(
-            p.challenge,
-            URL_SAFE_NO_PAD.encode(digest(&SHA256, p.verifier.as_bytes()))
-        );
+        assert_eq!(p.challenge, URL_SAFE_NO_PAD.encode(digest(&SHA256, p.verifier.as_bytes())));
     }
 
     #[test]
     fn token_freshness() {
-        let t = TokenSet {
-            access_token: "a".into(),
-            refresh_token: None,
-            expires_at: Some(now_secs() + 30),
-            identity: None,
-        };
+        let t = TokenSet { access_token: "a".into(), refresh_token: None, expires_at: Some(now_secs() + 30), identity: None };
         assert!(t.fresh(10));
         assert!(!t.fresh(60));
     }

@@ -101,9 +101,8 @@ pub struct NotebookSummary {
 impl Workspace {
     pub fn list_notebooks(&self) -> Result<Vec<NotebookSummary>> {
         let c = self.conn.lock();
-        let mut stmt = c.prepare(
-            "SELECT id, name, connection_id, folder_id, json_array_length(cells_json), updated_at FROM notebooks ORDER BY name COLLATE NOCASE",
-        )?;
+        let mut stmt =
+            c.prepare("SELECT id, name, connection_id, folder_id, json_array_length(cells_json), updated_at FROM notebooks ORDER BY name COLLATE NOCASE")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(NotebookSummary {
@@ -121,21 +120,17 @@ impl Workspace {
 
     pub fn get_notebook(&self, id: &str) -> Result<Notebook> {
         let c = self.conn.lock();
-        c.query_row(
-            "SELECT id, name, connection_id, folder_id, cells_json, created_at, updated_at FROM notebooks WHERE id = ?1",
-            [id],
-            |r| {
-                Ok(Notebook {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    connection_id: r.get(2)?,
-                    folder_id: r.get(3)?,
-                    cells: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
-                    created_at: r.get(5)?,
-                    updated_at: r.get(6)?,
-                })
-            },
-        )
+        c.query_row("SELECT id, name, connection_id, folder_id, cells_json, created_at, updated_at FROM notebooks WHERE id = ?1", [id], |r| {
+            Ok(Notebook {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                connection_id: r.get(2)?,
+                folder_id: r.get(3)?,
+                cells: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })
         .optional()?
         .ok_or_else(|| Error::NotFound(format!("notebook {id}")))
     }
@@ -193,8 +188,28 @@ mod tests {
                 connection_id: None,
                 folder_id: None,
                 cells: vec![
-                    NotebookCell { id: String::new(), kind: CellKind::Markdown, source: "# Revenue".into(), output_name: None, connection_id: None, collapsed: false, editor_height: None, output_height: None, last_run: None },
-                    NotebookCell { id: String::new(), kind: CellKind::Sql, source: "select 1".into(), output_name: Some("one".into()), connection_id: None, collapsed: false, editor_height: Some(240), output_height: Some(500), last_run: None },
+                    NotebookCell {
+                        id: String::new(),
+                        kind: CellKind::Markdown,
+                        source: "# Revenue".into(),
+                        output_name: None,
+                        connection_id: None,
+                        collapsed: false,
+                        editor_height: None,
+                        output_height: None,
+                        last_run: None,
+                    },
+                    NotebookCell {
+                        id: String::new(),
+                        kind: CellKind::Sql,
+                        source: "select 1".into(),
+                        output_name: Some("one".into()),
+                        connection_id: None,
+                        collapsed: false,
+                        editor_height: Some(240),
+                        output_height: Some(500),
+                        last_run: None,
+                    },
                 ],
                 created_at: 0,
                 updated_at: 0,
@@ -222,9 +237,7 @@ mod tests {
         assert_eq!(saved.folder_id.as_deref(), Some(f0.id.as_str()));
         ws.move_to_folder(FolderKind::Notebooks, &nb.id, None).unwrap();
 
-        let f = ws
-            .save_folder(crate::Folder { id: String::new(), parent_id: None, name: "Analyses".into(), kind: FolderKind::Notebooks })
-            .unwrap();
+        let f = ws.save_folder(crate::Folder { id: String::new(), parent_id: None, name: "Analyses".into(), kind: FolderKind::Notebooks }).unwrap();
         ws.move_to_folder(FolderKind::Notebooks, &nb.id, Some(&f.id)).unwrap();
         assert_eq!(ws.get_notebook(&nb.id).unwrap().folder_id, Some(f.id.clone()));
         ws.delete_folder(&f.id).unwrap();

@@ -120,11 +120,19 @@ pub fn column_type(dialect: ConnectorKind, f: &Field) -> &'static str {
     }
     match f.data_type() {
         DataType::Boolean => t.boolean,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => t.integer,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            t.integer
+        }
         DataType::Float16 | DataType::Float32 | DataType::Float64 => t.float,
         DataType::Decimal128(..) | DataType::Decimal256(..) => t.decimal,
         DataType::Date32 | DataType::Date64 => t.date,
-        DataType::Timestamp(_, tz) => if tz.is_some() { t.timestamp_tz } else { t.timestamp },
+        DataType::Timestamp(_, tz) => {
+            if tz.is_some() {
+                t.timestamp_tz
+            } else {
+                t.timestamp
+            }
+        }
         DataType::Time32(_) | DataType::Time64(_) => t.time,
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => t.binary,
         _ => t.text,
@@ -154,7 +162,9 @@ pub fn create_table_sql(dialect: ConnectorKind, table: &str, schema: &SchemaRef)
 pub fn create_table_if_missing_sql(dialect: ConnectorKind, table: &str, schema: &SchemaRef) -> String {
     let create = create_table_sql(dialect, table, schema);
     match lt(dialect).create_if_missing {
-        CreateIfMissing::PlsqlBlock => format!("BEGIN EXECUTE IMMEDIATE '{}'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;", create.replace('\'', "''")),
+        CreateIfMissing::PlsqlBlock => {
+            format!("BEGIN EXECUTE IMMEDIATE '{}'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;", create.replace('\'', "''"))
+        }
         CreateIfMissing::ObjectIdCheck => format!("IF OBJECT_ID(N'{}', N'U') IS NULL {create}", quote_path(dialect, table).replace('\'', "''")),
         CreateIfMissing::IfNotExists => create.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),
     }
@@ -264,8 +274,12 @@ fn update_join_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[St
         return None;
     }
     Some(match lt(dialect).merge {
-        MergeStyle::UpdateJoin => format!("UPDATE {t} AS tg JOIN {s} AS src ON {on} SET {}", set.iter().map(|c| format!("tg.{} = src.{}", q(c), q(c))).collect::<Vec<_>>().join(", ")),
-        _ => format!("UPDATE {t} AS tg SET {} FROM {s} AS src WHERE {on}", set.iter().map(|c| format!("{} = src.{}", q(c), q(c))).collect::<Vec<_>>().join(", ")),
+        MergeStyle::UpdateJoin => {
+            format!("UPDATE {t} AS tg JOIN {s} AS src ON {on} SET {}", set.iter().map(|c| format!("tg.{} = src.{}", q(c), q(c))).collect::<Vec<_>>().join(", "))
+        }
+        _ => {
+            format!("UPDATE {t} AS tg SET {} FROM {s} AS src WHERE {on}", set.iter().map(|c| format!("{} = src.{}", q(c), q(c))).collect::<Vec<_>>().join(", "))
+        }
     })
 }
 
@@ -301,7 +315,9 @@ pub fn merge_from_stage_sql(dialect: ConnectorKind, target: &str, stage: &str, c
 pub fn drop_table_sql(dialect: ConnectorKind, table: &str) -> String {
     let t = quote_path(dialect, table);
     match lt(dialect).drop_in_plsql_block {
-        true => format!("BEGIN EXECUTE IMMEDIATE 'DROP TABLE {}'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;", t.replace('\'', "''")),
+        true => {
+            format!("BEGIN EXECUTE IMMEDIATE 'DROP TABLE {}'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;", t.replace('\'', "''"))
+        }
         false => format!("DROP TABLE IF EXISTS {t}"),
     }
 }
@@ -312,7 +328,13 @@ pub(crate) fn literal(cell: Option<&str>, kind: Lit, dialect: ConnectorKind) -> 
     match kind {
         Lit::Number if s.parse::<f64>().is_ok_and(|f| f.is_finite()) => s.to_string(),
         Lit::Bool if l.bool_words => s.to_uppercase(),
-        Lit::Bool => if s == "true" { "1".into() } else { "0".into() },
+        Lit::Bool => {
+            if s == "true" {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         Lit::Binary => l.binary_literal.replace("{}", s),
         // Oracle doesn't read text as a date without NLS settings: typed literals.
         Lit::Date if l.typed_datetime_literals => format!("DATE {}", quote_literal(s)),
@@ -390,7 +412,8 @@ impl InsertSql {
             return Ok(None);
         }
         let fopts = format_options();
-        let fmts: Vec<ArrayFormatter<'_>> = batch.columns().iter().map(|a| ArrayFormatter::try_new(a.as_ref(), &fopts)).collect::<std::result::Result<_, _>>()?;
+        let fmts: Vec<ArrayFormatter<'_>> =
+            batch.columns().iter().map(|a| ArrayFormatter::try_new(a.as_ref(), &fopts)).collect::<std::result::Result<_, _>>()?;
         let limit = max_rows.unwrap_or(usize::MAX).min(self.size.rows).max(1);
         let (fixed, per_row) = self.overhead();
         let mut rows: Vec<String> = Vec::new();
@@ -466,19 +489,31 @@ mod tests {
     #[test]
     fn create_and_insert_per_dialect() {
         let (schema, batches) = rows(2);
-        assert_eq!(create_table_sql(ConnectorKind::Postgres, "app.t", &schema), r#"CREATE TABLE "app"."t" ("id" BIGINT NOT NULL, "name" TEXT, "ok" BOOLEAN, "at" TIMESTAMP)"#);
-        assert_eq!(create_table_sql(ConnectorKind::Mssql, "t", &schema), "CREATE TABLE [t] ([id] BIGINT NOT NULL, [name] NVARCHAR(MAX), [ok] BIT, [at] DATETIME2)");
+        assert_eq!(
+            create_table_sql(ConnectorKind::Postgres, "app.t", &schema),
+            r#"CREATE TABLE "app"."t" ("id" BIGINT NOT NULL, "name" TEXT, "ok" BOOLEAN, "at" TIMESTAMP)"#
+        );
+        assert_eq!(
+            create_table_sql(ConnectorKind::Mssql, "t", &schema),
+            "CREATE TABLE [t] ([id] BIGINT NOT NULL, [name] NVARCHAR(MAX), [ok] BIT, [at] DATETIME2)"
+        );
         assert_eq!(
             insert_statements(ConnectorKind::Postgres, "t", &schema, &batches).unwrap(),
             vec![r#"INSERT INTO "t" ("id", "name", "ok", "at") VALUES (0, 'it''s 0', TRUE, '2026-01-01 00:00:00'), (1, NULL, FALSE, '2026-01-01 00:00:00')"#]
         );
         let ora = insert_statements(ConnectorKind::Oracle, "t", &schema, &batches).unwrap();
-        assert!(ora[0].starts_with(r#"INSERT ALL INTO "t" ("id", "name", "ok", "at") VALUES (0, 'it''s 0', 1, TIMESTAMP '2026-01-01 00:00:00') INTO"#), "{}", ora[0]);
+        assert!(
+            ora[0].starts_with(r#"INSERT ALL INTO "t" ("id", "name", "ok", "at") VALUES (0, 'it''s 0', 1, TIMESTAMP '2026-01-01 00:00:00') INTO"#),
+            "{}",
+            ora[0]
+        );
         assert!(ora[0].ends_with("SELECT 1 FROM DUAL"));
         assert!(insert_statements(ConnectorKind::Mssql, "t", &schema, &batches).unwrap()[0].contains("N'it''s 0', 1,"));
         assert!(drop_table_sql(ConnectorKind::Oracle, "t").contains("-942"));
         assert!(create_table_if_missing_sql(ConnectorKind::Sqlite, "t", &schema).starts_with(r#"CREATE TABLE IF NOT EXISTS "t" ("id" INTEGER NOT NULL"#));
-        assert!(create_table_if_missing_sql(ConnectorKind::Mssql, "dbo.t", &schema).starts_with("IF OBJECT_ID(N'[dbo].[t]', N'U') IS NULL CREATE TABLE [dbo].[t]"));
+        assert!(
+            create_table_if_missing_sql(ConnectorKind::Mssql, "dbo.t", &schema).starts_with("IF OBJECT_ID(N'[dbo].[t]', N'U') IS NULL CREATE TABLE [dbo].[t]")
+        );
         assert!(create_table_if_missing_sql(ConnectorKind::Oracle, "t", &schema).contains("-955"));
     }
 
@@ -498,7 +533,9 @@ mod tests {
         assert_eq!(delete_all_sql(K::Postgres, "t"), r#"DELETE FROM "t""#);
         assert_eq!(
             insert_statements(K::Clickhouse, "t", &schema, &batches).unwrap(),
-            vec!["INSERT INTO `t` (`id`, `name`, `ok`, `at`) SETTINGS date_time_input_format = 'best_effort' VALUES (0, 'it''s 0', TRUE, '2026-01-01 00:00:00'), (1, NULL, FALSE, '2026-01-01 00:00:00')"]
+            vec![
+                "INSERT INTO `t` (`id`, `name`, `ok`, `at`) SETTINGS date_time_input_format = 'best_effort' VALUES (0, 'it''s 0', TRUE, '2026-01-01 00:00:00'), (1, NULL, FALSE, '2026-01-01 00:00:00')"
+            ]
         );
         assert_eq!(literal(Some("a\\b"), Lit::Text, K::Clickhouse), "'a\\\\b'", "backslashes are escaped");
         assert_eq!(literal(Some("0aff"), Lit::Binary, K::Clickhouse), "unhex('0aff')");
@@ -540,7 +577,11 @@ mod tests {
 
         // Rows and bytes of whole statements stay within the size (Oracle's INTO per row included).
         let (schema, batches) = rows(300);
-        for (k, size) in [(K::Postgres, BatchSize { rows: 100, bytes: MB }), (K::Postgres, BatchSize { rows: 10_000, bytes: 4 * KB }), (K::Oracle, BatchSize { rows: 1000, bytes: 4 * KB })] {
+        for (k, size) in [
+            (K::Postgres, BatchSize { rows: 100, bytes: MB }),
+            (K::Postgres, BatchSize { rows: 10_000, bytes: 4 * KB }),
+            (K::Oracle, BatchSize { rows: 1000, bytes: 4 * KB }),
+        ] {
             let b = InsertSql::new(k, "t", &schema, size);
             let mut at = 0;
             let mut n = 0;
@@ -572,18 +613,26 @@ mod tests {
             update_from_stage_sql(K::Postgres, "app.t", "s", &cols, &keys),
             vec![r#"UPDATE "app"."t" AS tg SET "name" = src."name", "qty" = src."qty" FROM "s" AS src WHERE tg."id" = src."id""#]
         );
-        assert_eq!(update_from_stage_sql(K::Mysql, "t", "s", &cols, &keys), vec!["UPDATE `t` AS tg JOIN `s` AS src ON tg.`id` = src.`id` SET tg.`name` = src.`name`, tg.`qty` = src.`qty`"]);
+        assert_eq!(
+            update_from_stage_sql(K::Mysql, "t", "s", &cols, &keys),
+            vec!["UPDATE `t` AS tg JOIN `s` AS src ON tg.`id` = src.`id` SET tg.`name` = src.`name`, tg.`qty` = src.`qty`"]
+        );
         assert!(update_from_stage_sql(K::Postgres, "t", "s", &keys, &keys).is_empty(), "only keys: nothing to update");
 
         let pg = merge_from_stage_sql(K::Postgres, "t", "s", &cols, &keys);
         assert_eq!(pg.len(), 2);
-        assert_eq!(pg[1], r#"INSERT INTO "t" ("id", "name", "qty") SELECT src."id", src."name", src."qty" FROM "s" AS src WHERE NOT EXISTS (SELECT 1 FROM "t" AS tg WHERE tg."id" = src."id")"#);
+        assert_eq!(
+            pg[1],
+            r#"INSERT INTO "t" ("id", "name", "qty") SELECT src."id", src."name", src."qty" FROM "s" AS src WHERE NOT EXISTS (SELECT 1 FROM "t" AS tg WHERE tg."id" = src."id")"#
+        );
         assert_eq!(merge_from_stage_sql(K::Sqlite, "t", "s", &keys, &keys).len(), 1, "only keys: insert the missing ones");
 
         let ms = merge_from_stage_sql(K::Mssql, "dbo.t", "#s", &cols, &keys);
         assert_eq!(
             ms,
-            vec!["MERGE INTO [dbo].[t] AS tg USING [#s] AS src ON tg.[id] = src.[id] WHEN MATCHED THEN UPDATE SET tg.[name] = src.[name], tg.[qty] = src.[qty] WHEN NOT MATCHED THEN INSERT ([id], [name], [qty]) VALUES (src.[id], src.[name], src.[qty]);"]
+            vec![
+                "MERGE INTO [dbo].[t] AS tg USING [#s] AS src ON tg.[id] = src.[id] WHEN MATCHED THEN UPDATE SET tg.[name] = src.[name], tg.[qty] = src.[qty] WHEN NOT MATCHED THEN INSERT ([id], [name], [qty]) VALUES (src.[id], src.[name], src.[qty]);"
+            ]
         );
         let ora = &update_from_stage_sql(K::Oracle, "APP.T", "APP.S", &cols, &keys)[0];
         assert!(ora.starts_with(r#"MERGE INTO "APP"."T" tg USING "APP"."S" src ON (tg."id" = src."id") WHEN MATCHED"#), "{ora}");

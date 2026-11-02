@@ -13,11 +13,17 @@ pub mod notebooks;
 pub mod outputs;
 
 pub use ai::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry};
-pub use outputs::OutputRecord;
+pub use jobs::{
+    FileFormat, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, JobSummary, LoadMode, NodeRunRecord, NodeRunSummary, RunLogEntry, ScheduleMode,
+    StepOwner, StepProgress,
+};
+pub use knowledge::{
+    ImportAction, ImportItem, ImportKind, IndexDelta, KnHit, KnNote, KnObject, KnState, NoteEntry, NoteStatus, NotesFile, NotesSource, join_target,
+    split_target, target_mentions,
+};
 pub use meta_cache::{CachedColumns, CachedListing, ExplorerCacheState};
-pub use jobs::{FileFormat, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, JobSummary, LoadMode, NodeRunRecord, NodeRunSummary, RunLogEntry, ScheduleMode, StepOwner, StepProgress};
 pub use notebooks::{CellKind, CellRunSummary, Notebook, NotebookCell, NotebookSummary};
-pub use knowledge::{join_target, split_target, target_mentions, ImportAction, ImportItem, ImportKind, IndexDelta, KnHit, KnNote, KnObject, KnState, NoteEntry, NoteStatus, NotesFile, NotesSource};
+pub use outputs::OutputRecord;
 
 use databrain_connector_core::ConnectionConfig;
 use parking_lot::Mutex;
@@ -39,10 +45,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 pub fn new_id() -> String {
@@ -700,8 +703,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::Invalid(format!("cannot create {}: {e}", parent.display())))?;
+            std::fs::create_dir_all(parent).map_err(|e| Error::Invalid(format!("cannot create {}: {e}", parent.display())))?;
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -793,21 +795,26 @@ impl Workspace {
         {
             let c = self.conn.lock();
             let tx = c.unchecked_transaction()?;
-            let rows: Vec<(i64, String)> = tx.prepare("SELECT id, content_json FROM ai_messages")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            let rows: Vec<(i64, String)> =
+                tx.prepare("SELECT id, content_json FROM ai_messages")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
             for (id, content) in rows {
                 let c2 = json_text(&content);
                 if c2 != content {
                     tx.execute("UPDATE ai_messages SET content_json = ?2 WHERE id = ?1", params![id, c2])?;
                 }
             }
-            let rows: Vec<(String, String)> = tx.prepare("SELECT id, title FROM ai_sessions")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            let rows: Vec<(String, String)> =
+                tx.prepare("SELECT id, title FROM ai_sessions")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
             for (id, title) in rows {
                 let t2 = redact_text(&title);
                 if t2 != title {
                     tx.execute("UPDATE ai_sessions SET title = ?2 WHERE id = ?1", params![id, t2])?;
                 }
             }
-            let rows: Vec<(i64, String, Option<String>)> = tx.prepare("SELECT id, args_json, summary FROM ai_audit")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+            let rows: Vec<(i64, String, Option<String>)> = tx
+                .prepare("SELECT id, args_json, summary FROM ai_audit")?
+                .query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
             for (id, args, summary) in rows {
                 let (a2, s2) = (json_text(&args), summary.as_deref().map(redact_text));
                 if a2 != args || s2 != summary {
@@ -842,14 +849,20 @@ impl Workspace {
         {
             let c = self.conn.lock();
             let tx = c.unchecked_transaction()?;
-            let rows: Vec<(i64, String, Option<String>)> = tx.prepare("SELECT id, sql, error FROM query_history")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+            let rows: Vec<(i64, String, Option<String>)> = tx
+                .prepare("SELECT id, sql, error FROM query_history")?
+                .query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
             for (id, sql, error) in rows {
                 let (s2, e2) = (r(&sql), text(error.clone()));
                 if s2 != sql || e2 != error {
                     tx.execute("UPDATE query_history SET sql = ?2, error = ?3 WHERE id = ?1", params![id, s2, e2])?;
                 }
             }
-            let rows: Vec<(i64, String, Option<String>)> = tx.prepare("SELECT id, args_json, summary FROM ai_audit")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+            let rows: Vec<(i64, String, Option<String>)> = tx
+                .prepare("SELECT id, args_json, summary FROM ai_audit")?
+                .query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
             for (id, args, summary) in rows {
                 let (a2, s2) = (json_text(Some(args.clone())), text(summary.clone()));
                 if a2.as_deref() != Some(args.as_str()) || s2 != summary {
@@ -857,8 +870,10 @@ impl Workspace {
                 }
             }
             type Run = (i64, Option<String>, Option<String>, Option<String>);
-            let rows: Vec<Run> =
-                tx.prepare("SELECT id, nodes_json, error, log_json FROM job_runs")?.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+            let rows: Vec<Run> = tx
+                .prepare("SELECT id, nodes_json, error, log_json FROM job_runs")?
+                .query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)))?
+                .collect::<rusqlite::Result<_>>()?;
             for (id, nodes, error, log) in rows {
                 let (n2, e2, l2) = (json_text(nodes.clone()), text(error.clone()), json_text(log.clone()));
                 if n2 != nodes || e2 != error || l2 != log {
@@ -879,9 +894,7 @@ impl Workspace {
             "SELECT id, name, config_json, color, env, folder_id, has_secret, created_at, updated_at, ai_policy_json \
              FROM connections ORDER BY sort_order, name COLLATE NOCASE",
         )?;
-        let rows = stmt
-            .query_map([], connection_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt.query_map([], connection_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         rows.into_iter().collect()
     }
 
@@ -967,17 +980,10 @@ impl Workspace {
 
     pub fn list_folders(&self, kind: FolderKind) -> Result<Vec<Folder>> {
         let c = self.conn.lock();
-        let mut stmt = c.prepare(
-            "SELECT id, parent_id, name, kind FROM folders WHERE kind = ?1 ORDER BY name COLLATE NOCASE",
-        )?;
+        let mut stmt = c.prepare("SELECT id, parent_id, name, kind FROM folders WHERE kind = ?1 ORDER BY name COLLATE NOCASE")?;
         let rows = stmt
             .query_map([kind.as_str()], |r| {
-                Ok(Folder {
-                    id: r.get(0)?,
-                    parent_id: r.get(1)?,
-                    name: r.get(2)?,
-                    kind: FolderKind::parse(&r.get::<_, String>(3)?),
-                })
+                Ok(Folder { id: r.get(0)?, parent_id: r.get(1)?, name: r.get(2)?, kind: FolderKind::parse(&r.get::<_, String>(3)?) })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -1038,13 +1044,11 @@ impl Workspace {
                      OR description LIKE ?1 ESCAPE '\\' OR tags_json LIKE ?1 ESCAPE '\\' \
                      ORDER BY updated_at DESC"
                 ))?;
-                stmt.query_map([pat], saved_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
+                stmt.query_map([pat], saved_row)?.collect::<rusqlite::Result<Vec<_>>>()?
             }
             None => {
                 let mut stmt = c.prepare(&format!("{base} ORDER BY name COLLATE NOCASE"))?;
-                stmt.query_map([], saved_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
+                stmt.query_map([], saved_row)?.collect::<rusqlite::Result<Vec<_>>>()?
             }
         };
         Ok(rows)
@@ -1073,12 +1077,7 @@ impl Workspace {
         }
         q.updated_at = now;
         q.name = q.name.trim().to_string();
-        q.tags = q
-            .tags
-            .into_iter()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect();
+        q.tags = q.tags.into_iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
         let c = self.conn.lock();
         c.execute(
             "INSERT INTO saved_queries (id, name, sql, connection_id, folder_id, description, tags_json, created_at, updated_at, ai_example) \
@@ -1105,9 +1104,7 @@ impl Workspace {
     }
 
     pub fn delete_saved_query(&self, id: &str) -> Result<()> {
-        self.conn
-            .lock()
-            .execute("DELETE FROM saved_queries WHERE id = ?1", [id])?;
+        self.conn.lock().execute("DELETE FROM saved_queries WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -1135,10 +1132,7 @@ impl Workspace {
             ],
         )?;
         let id = c.last_insert_rowid();
-        c.execute(
-            "DELETE FROM query_history WHERE id <= ?1 - ?2",
-            params![id, HISTORY_LIMIT],
-        )?;
+        c.execute("DELETE FROM query_history WHERE id <= ?1 - ?2", params![id, HISTORY_LIMIT])?;
         Ok(id)
     }
 
@@ -1241,9 +1235,8 @@ impl Workspace {
 
     pub fn list_tabs(&self) -> Result<Vec<TabState>> {
         let c = self.conn.lock();
-        let mut stmt = c.prepare(
-            "SELECT id, title, sql, connection_id, saved_query_id, notebook_id, output_ref, auto_commit, file_path FROM tabs ORDER BY order_idx",
-        )?;
+        let mut stmt =
+            c.prepare("SELECT id, title, sql, connection_id, saved_query_id, notebook_id, output_ref, auto_commit, file_path FROM tabs ORDER BY order_idx")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(TabState {
@@ -1272,7 +1265,18 @@ impl Workspace {
                 "INSERT INTO tabs (id, title, sql, connection_id, saved_query_id, order_idx, notebook_id, output_ref, auto_commit, file_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for (i, t) in tabs.iter().enumerate() {
-                stmt.execute(params![t.id, t.title, t.sql, t.connection_id, t.saved_query_id, i as i64, t.notebook_id, t.output_ref, t.auto_commit, t.file_path])?;
+                stmt.execute(params![
+                    t.id,
+                    t.title,
+                    t.sql,
+                    t.connection_id,
+                    t.saved_query_id,
+                    i as i64,
+                    t.notebook_id,
+                    t.output_ref,
+                    t.auto_commit,
+                    t.file_path
+                ])?;
             }
         }
         tx.commit()?;
@@ -1283,9 +1287,7 @@ impl Workspace {
 
     pub fn get_setting(&self, key: &str) -> Result<Option<serde_json::Value>> {
         let c = self.conn.lock();
-        let v: Option<String> = c
-            .query_row("SELECT value_json FROM settings WHERE key = ?1", [key], |r| r.get(0))
-            .optional()?;
+        let v: Option<String> = c.query_row("SELECT value_json FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional()?;
         Ok(match v {
             Some(s) => Some(serde_json::from_str(&s)?),
             None => None,
@@ -1406,14 +1408,7 @@ mod tests {
     #[test]
     fn saved_queries_and_folders() {
         let ws = Workspace::open_in_memory().unwrap();
-        let f = ws
-            .save_folder(Folder {
-                id: String::new(),
-                parent_id: None,
-                name: "Reports".into(),
-                kind: FolderKind::Queries,
-            })
-            .unwrap();
+        let f = ws.save_folder(Folder { id: String::new(), parent_id: None, name: "Reports".into(), kind: FolderKind::Queries }).unwrap();
         let q = ws
             .save_query(SavedQuery {
                 id: String::new(),
@@ -1470,19 +1465,9 @@ mod tests {
         assert_eq!(h[1].origin, Origin::Ai);
         let mine = ws.list_history(&HistoryQuery { exclude_ai: true, ..Default::default() }).unwrap();
         assert_eq!(mine.iter().map(|e| e.sql.as_str()).collect::<Vec<_>>(), ["select 2", "select 0"]);
-        let h = ws
-            .list_history(&HistoryQuery {
-                search: Some("1".into()),
-                ..Default::default()
-            })
-            .unwrap();
+        let h = ws.list_history(&HistoryQuery { search: Some("1".into()), ..Default::default() }).unwrap();
         assert_eq!(h.len(), 1);
-        let page = ws
-            .list_history(&HistoryQuery {
-                before: Some(h[0].id),
-                ..Default::default()
-            })
-            .unwrap();
+        let page = ws.list_history(&HistoryQuery { before: Some(h[0].id), ..Default::default() }).unwrap();
         assert_eq!(page.len(), 1);
         // Clearing: AI only, then by age (retention), keeping recent entries.
         {
@@ -1613,9 +1598,26 @@ mod tests {
     fn approving_an_update_replaces_the_note() {
         let ws = Workspace::open_in_memory().unwrap();
         let a = ws.save_connection(profile("A")).unwrap();
-        let base = KnNote { id: String::new(), connection_id: a.id.clone(), target: None, body: "status 2 = closed".into(), author: "user".into(), status: NoteStatus::Approved, created_at: 0, replaces: None };
+        let base = KnNote {
+            id: String::new(),
+            connection_id: a.id.clone(),
+            target: None,
+            body: "status 2 = closed".into(),
+            author: "user".into(),
+            status: NoteStatus::Approved,
+            created_at: 0,
+            replaces: None,
+        };
         let old = ws.kn_save_note(base.clone()).unwrap();
-        let upd = ws.kn_save_note(KnNote { body: "status 2 = closed, 3 = archived".into(), author: "ai".into(), status: NoteStatus::Proposed, replaces: Some(old.id.clone()), ..base }).unwrap();
+        let upd = ws
+            .kn_save_note(KnNote {
+                body: "status 2 = closed, 3 = archived".into(),
+                author: "ai".into(),
+                status: NoteStatus::Proposed,
+                replaces: Some(old.id.clone()),
+                ..base
+            })
+            .unwrap();
         assert_eq!(ws.kn_notes(&a.id).unwrap().len(), 2, "old note kept while the update is pending");
         assert_eq!(ws.kn_notes(&a.id).unwrap().iter().find(|n| n.id == upd.id).unwrap().replaces.as_deref(), Some(old.id.as_str()));
         ws.kn_save_note(KnNote { status: NoteStatus::Approved, ..upd }).unwrap();

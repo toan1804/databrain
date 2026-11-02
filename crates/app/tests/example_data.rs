@@ -199,13 +199,7 @@ async fn sqlite_explorer_and_queries() {
         quick_filter: None,
         sort: vec![SortKey { column: 1, descending: false }],
     };
-    let (_, header, rows) = query_view(
-        &st,
-        &id,
-        "SELECT 1; SELECT country, city, count(*) AS n FROM customers GROUP BY 1, 2",
-        view,
-    )
-    .await;
+    let (_, header, rows) = query_view(&st, &id, "SELECT 1; SELECT country, city, count(*) AS n FROM customers GROUP BY 1, 2", view).await;
     assert_eq!(header, vec!["country", "city", "n"]);
     assert_eq!(rows.iter().map(|r| r[1].clone().unwrap()).collect::<Vec<_>>(), vec!["Hà Nội", "Hồ Chí Minh", "Đà Nẵng"]);
 
@@ -235,10 +229,7 @@ async fn duckdb_attached_csv_and_parquet_files() {
     let schemas = api::list_schemas(&st, &id).await.unwrap();
     let files = schemas.iter().find(|s| s.name.ends_with(".files")).expect("files schema").name.clone();
     let objects = api::list_objects(&st, &id, &files).await.unwrap();
-    assert_eq!(
-        objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
-        vec!["customers", "order_items", "orders", "orders_by_year", "products"]
-    );
+    assert_eq!(objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["customers", "order_items", "orders", "orders_by_year", "products"]);
     assert!(objects.iter().all(|o| o.kind == ObjectKind::View));
 
     // Types inferred from CSV and read from Parquet metadata.
@@ -393,7 +384,14 @@ async fn export_sqlite_result_and_read_back_with_duckdb() {
 
 // ------------------------------------------------------------------ outputs (handles, results.*, diff, chart, pin)
 
-async fn run_named(st: &AppState, conn: &str, tab: &str, sql: &str, limit: Option<usize>, name: Option<&str>) -> Vec<databrain_query_engine::StatementOutcomeView> {
+async fn run_named(
+    st: &AppState,
+    conn: &str,
+    tab: &str,
+    sql: &str,
+    limit: Option<usize>,
+    name: Option<&str>,
+) -> Vec<databrain_query_engine::StatementOutcomeView> {
     let out = st
         .engine
         .run_and_wait(
@@ -447,7 +445,15 @@ async fn outputs_handles_cross_source_queries_diff_chart_and_pins() {
     assert!(num(vn[1].as_deref().unwrap()) > 0.0);
 
     // 4) Re-run tab 1 with a filter → new version; old one is revenue__1.
-    run_named(&st, &sq, "t1", "SELECT c.country, round(sum(o.total_amount), 2) AS revenue FROM orders o JOIN customers c USING (customer_id) WHERE o.status = 'delivered' GROUP BY 1", None, Some("revenue")).await;
+    run_named(
+        &st,
+        &sq,
+        "t1",
+        "SELECT c.country, round(sum(o.total_amount), 2) AS revenue FROM orders o JOIN customers c USING (customer_id) WHERE o.status = 'delivered' GROUP BY 1",
+        None,
+        Some("revenue"),
+    )
+    .await;
     assert_eq!(api::get_output(&st, "revenue").unwrap().handle, "r4");
     assert_eq!(api::get_output(&st, "revenue__1").unwrap().handle, "r1");
     // r3 was the Results-connection join; handles count every output.
@@ -473,7 +479,15 @@ async fn outputs_handles_cross_source_queries_diff_chart_and_pins() {
     assert_eq!(query(&st, &res, &mapped).await.len(), 0, "same data under other names: no differences\n{mapped}");
     assert!(api::output_diff_sql(&st, "renamed", "revenue", vec![], vec![("nope".into(), "revenue".into())], false).is_err());
     // Exact mapping: every pair given, COUNTRY ↔ country and total ↔ revenue together.
-    let exact = api::output_diff_sql(&st, "renamed", "revenue", vec!["country".into()], vec![("COUNTRY".into(), "country".into()), ("total".into(), "revenue".into())], true).unwrap();
+    let exact = api::output_diff_sql(
+        &st,
+        "renamed",
+        "revenue",
+        vec!["country".into()],
+        vec![("COUNTRY".into(), "country".into()), ("total".into(), "revenue".into())],
+        true,
+    )
+    .unwrap();
     assert!(exact.contains("COUNTRY → country, total → revenue"), "{exact}");
     assert_eq!(query(&st, &res, &exact).await.len(), 0, "{exact}");
 

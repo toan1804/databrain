@@ -8,7 +8,7 @@ use databrain_app::api::{self, AppState, SaveConnectionArgs};
 use databrain_auth::{AuthMethod, MemoryStore};
 use databrain_connector_core::{ConnectionConfig, ConnectorKind};
 use databrain_query_engine::{EventSink, JobEvent, RunRequest};
-use databrain_workspace::{FileFormat, ConnectionProfile, EnvTag, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, LoadMode, Workspace};
+use databrain_workspace::{ConnectionProfile, EnvTag, FileFormat, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, LoadMode, Workspace};
 
 struct Quiet;
 impl EventSink for Quiet {
@@ -34,7 +34,18 @@ fn sqlite(st: &AppState, name: &str, path: &std::path::Path, read_only: bool) ->
     api::save_connection(
         st,
         SaveConnectionArgs {
-            profile: ConnectionProfile { id: String::new(), name: name.into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            profile: ConnectionProfile {
+                id: String::new(),
+                name: name.into(),
+                config: c,
+                color: None,
+                env: EnvTag::None,
+                folder_id: None,
+                has_secret: false,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
             secret: None,
             clear_secret: false,
             extra_secrets: Default::default(),
@@ -85,7 +96,22 @@ async fn finished(st: &AppState, job: &str) -> JobRun {
 async fn rows(st: &AppState, conn: &str, sql: &str) -> Vec<Vec<String>> {
     let out = st
         .engine
-        .run_and_wait(&st.hub, RunRequest { connection_id: conn.into(), tab_id: format!("t-{}", uuid::Uuid::new_v4()), sql: sql.into(), base_offset: 0, row_limit: None, confirmed: true, origin: Default::default(), session_key: None, output_name: None, params: Default::default() }, None)
+        .run_and_wait(
+            &st.hub,
+            RunRequest {
+                connection_id: conn.into(),
+                tab_id: format!("t-{}", uuid::Uuid::new_v4()),
+                sql: sql.into(),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+            },
+            None,
+        )
         .await
         .unwrap();
     if let Some(e) = out.iter().find_map(|o| o.error.as_ref()) {
@@ -102,7 +128,12 @@ async fn query_duckdb_and_load_steps() {
     let st = state();
     let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
     let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
-    rows(&st, &src, "create table orders (id integer, region text, amount real); insert into orders values (1, 'eu', 10.5), (2, 'eu', 4.5), (3, 'us', 7); select 1").await;
+    rows(
+        &st,
+        &src,
+        "create table orders (id integer, region text, amount real); insert into orders values (1, 'eu', 10.5), (2, 'eu', 4.5), (3, 'us', 7); select 1",
+    )
+    .await;
 
     let mut load = node("c", "totals", JobNodeKind::Load, None, "");
     load.target_connection_id = Some(dst.clone());
@@ -115,7 +146,13 @@ async fn query_duckdb_and_load_steps() {
             name: "Nightly".into(),
             nodes: vec![
                 node("a", "orders", JobNodeKind::Query, Some(&src), "select region, amount from orders"),
-                node("b", "by_region", JobNodeKind::Query, None, "select region, sum(amount) as total, count(*) as n from results.orders group by region order by region"),
+                node(
+                    "b",
+                    "by_region",
+                    JobNodeKind::Query,
+                    None,
+                    "select region, sum(amount) as total, count(*) as n from results.orders group by region order by region",
+                ),
                 load,
             ],
             edges: vec![JobEdge { from: "a".into(), to: "b".into() }, JobEdge { from: "b".into(), to: "c".into() }],
@@ -201,7 +238,18 @@ async fn load_into_server_databases() {
         let id = api::save_connection(
             &st,
             SaveConnectionArgs {
-                profile: ConnectionProfile { id: String::new(), name: "db".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: true, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+                profile: ConnectionProfile {
+                    id: String::new(),
+                    name: "db".into(),
+                    config: c,
+                    color: None,
+                    env: EnvTag::None,
+                    folder_id: None,
+                    has_secret: true,
+                    ai_policy: Default::default(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
                 secret: std::env::var(format!("{env}_PASSWORD")).ok(),
                 clear_secret: false,
                 extra_secrets: Default::default(),
@@ -251,7 +299,9 @@ async fn export_steps_write_files_with_duckdb() {
     let st = state();
     let mut nodes = vec![node("a", "src_rows", JobNodeKind::Query, None, "select 1 as id, 'it''s, quoted' as name union all select 2, 'b'")];
     let mut edges = vec![];
-    for (i, (fmt, file)) in [(FileFormat::Csv, Some("report {step}")), (FileFormat::Parquet, None), (FileFormat::Json, Some("rows.json"))].into_iter().enumerate() {
+    for (i, (fmt, file)) in
+        [(FileFormat::Csv, Some("report {step}")), (FileFormat::Parquet, None), (FileFormat::Json, Some("rows.json"))].into_iter().enumerate()
+    {
         let id = format!("e{i}");
         let mut e = node(&id, &format!("out_{i}"), JobNodeKind::Export, None, "");
         e.export_folder = Some(dir.path().to_string_lossy().into_owned());
@@ -265,7 +315,16 @@ async fn export_steps_write_files_with_duckdb() {
     nodes.push(missing);
     let job = st
         .workspace
-        .save_job(Job { id: String::new(), name: "Export".into(), nodes, edges, schedule: Default::default(), last_scheduled_at: None, created_at: 0, updated_at: 0 })
+        .save_job(Job {
+            id: String::new(),
+            name: "Export".into(),
+            nodes,
+            edges,
+            schedule: Default::default(),
+            last_scheduled_at: None,
+            created_at: 0,
+            updated_at: 0,
+        })
         .unwrap();
     api::run_job(&st, &job.id, None).unwrap();
     let run = finished(&st, &job.id).await;
@@ -295,7 +354,22 @@ async fn step_names_own_their_output_names() {
     // A query tab already produced `revenue`: a step can't take that name.
     let out = st
         .engine
-        .run_and_wait(&st.hub, RunRequest { connection_id: duck.clone(), tab_id: "tab1".into(), sql: "select 1 as x".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Default::default(), session_key: None, output_name: Some("revenue".into()), params: Default::default() }, None)
+        .run_and_wait(
+            &st.hub,
+            RunRequest {
+                connection_id: duck.clone(),
+                tab_id: "tab1".into(),
+                sql: "select 1 as x".into(),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: Some("revenue".into()),
+                params: Default::default(),
+            },
+            None,
+        )
         .await
         .unwrap();
     assert!(out[0].error.is_none());
@@ -306,7 +380,18 @@ async fn step_names_own_their_output_names() {
     let job = api::save_job(&st, plain_job("Nightly", vec![node("a", "sales", JobNodeKind::Query, None, "select 2 as y")])).unwrap();
     let err = api::save_job(&st, plain_job("B", vec![node("b", "SALES", JobNodeKind::Query, None, "select 1")])).unwrap_err().message;
     assert!(err.contains("job \"Nightly\""), "{err}");
-    let run = |tab: &str| RunRequest { connection_id: duck.clone(), tab_id: tab.into(), sql: "select 3".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Default::default(), session_key: None, output_name: Some("sales".into()), params: Default::default() };
+    let run = |tab: &str| RunRequest {
+        connection_id: duck.clone(),
+        tab_id: tab.into(),
+        sql: "select 3".into(),
+        base_offset: 0,
+        row_limit: None,
+        confirmed: true,
+        origin: Default::default(),
+        session_key: None,
+        output_name: Some("sales".into()),
+        params: Default::default(),
+    };
     let err = st.engine.run(run("tab2")).unwrap_err().message;
     assert!(err.contains("only that step can produce it"), "{err}");
     let handle = st.engine.outputs().resolve("revenue").unwrap().handle;
@@ -331,7 +416,18 @@ fn duckdb(st: &AppState, name: &str, path: &std::path::Path) -> String {
     api::save_connection(
         st,
         SaveConnectionArgs {
-            profile: ConnectionProfile { id: String::new(), name: name.into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            profile: ConnectionProfile {
+                id: String::new(),
+                name: name.into(),
+                config: c,
+                color: None,
+                env: EnvTag::None,
+                folder_id: None,
+                has_secret: false,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
             secret: None,
             clear_secret: false,
             extra_secrets: Default::default(),
@@ -437,10 +533,7 @@ async fn update_and_merge_by_key_columns() {
         let run = run_all(&st, &job).await;
         assert_eq!(run.status, "success", "{dst}: {run:?}");
         assert_eq!(step(&run, "loaded").rows, Some(1), "{dst}: rows updated");
-        assert_eq!(
-            rows(&st, &dst, "select id, name, qty, note from items order by id").await,
-            vec![vec!["1", "a", "1", "n1"], vec!["2", "B", "20", "n2"]]
-        );
+        assert_eq!(rows(&st, &dst, "select id, name, qty, note from items order by id").await, vec![vec!["1", "a", "1", "n1"], vec!["2", "B", "20", "n2"]]);
         // Merge: id 2 updated again, id 3 inserted.
         let job = load_job(&st, &dst, "items", "select 2 as id, 'bb' as name, 22 as qty union all select 3, 'c', 30", |n| {
             n.load_mode = LoadMode::Merge;
@@ -449,7 +542,10 @@ async fn update_and_merge_by_key_columns() {
         let run = run_all(&st, &job).await;
         assert_eq!(run.status, "success", "{dst}: {run:?}");
         assert_eq!(step(&run, "loaded").rows, Some(2));
-        assert_eq!(rows(&st, &dst, "select id, name, qty from items order by id").await, vec![vec!["1", "a", "1"], vec!["2", "bb", "22"], vec!["3", "c", "30"]]);
+        assert_eq!(
+            rows(&st, &dst, "select id, name, qty from items order by id").await,
+            vec![vec!["1", "a", "1"], vec!["2", "bb", "22"], vec!["3", "c", "30"]]
+        );
 
         // Update/Merge need the table and the keys.
         let job = load_job(&st, &dst, "nope", src, |n| {
@@ -561,7 +657,14 @@ async fn runs_log_each_statement_and_report_insert_progress() {
     let progress: Vec<(u64, u64)> = events
         .iter()
         .filter(|(e, _)| e == "job-run")
-        .filter_map(|(_, p)| p["run"]["nodes"].as_array()?.iter().find(|n| n["name"] == "loaded")?.get("progress").map(|g| (g["done"].as_u64().unwrap(), g["total"].as_u64().unwrap())))
+        .filter_map(|(_, p)| {
+            p["run"]["nodes"]
+                .as_array()?
+                .iter()
+                .find(|n| n["name"] == "loaded")?
+                .get("progress")
+                .map(|g| (g["done"].as_u64().unwrap(), g["total"].as_u64().unwrap()))
+        })
         .collect();
     assert_eq!(progress.last(), Some(&(1200, 1200)), "{progress:?}");
 
@@ -674,7 +777,18 @@ async fn unreachable_connection_fails_each_run() {
     let bad = api::save_connection(
         &st,
         SaveConnectionArgs {
-            profile: ConnectionProfile { id: String::new(), name: "Bad".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            profile: ConnectionProfile {
+                id: String::new(),
+                name: "Bad".into(),
+                config: c,
+                color: None,
+                env: EnvTag::None,
+                folder_id: None,
+                has_secret: false,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
             secret: None,
             clear_secret: false,
             extra_secrets: Default::default(),
@@ -708,7 +822,6 @@ async fn unreachable_connection_fails_each_run() {
         assert_eq!(step(&run, "bad_one").status, "error");
     }
 }
-
 
 /// The app and the background runner (two processes on one workspace): a due
 /// job runs once, a job running in one can't start in the other, and the

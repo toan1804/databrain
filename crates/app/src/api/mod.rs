@@ -9,19 +9,11 @@ use std::sync::Arc;
 
 use databrain_auth::{SecretRef, SecretStore};
 use databrain_connector_core::sql::{split_statements, statement_at};
-use databrain_connector_core::{
-    ConnectionConfig, ConnectorInfo, ConnectorKind, ConnectorRegistry, DbObject, ObjectDetail,
-    SchemaInfo,
-};
+use databrain_connector_core::{ConnectionConfig, ConnectorInfo, ConnectorKind, ConnectorRegistry, DbObject, ObjectDetail, SchemaInfo};
 use databrain_export::{ExportOptions, export_file, export_to_string};
-use databrain_query_engine::{
-    EngineError, EventHub, EventSink, QueryEngine, Result, RunRequest, RunResponse, TestResult,
-};
+use databrain_query_engine::{EngineError, EventHub, EventSink, QueryEngine, Result, RunRequest, RunResponse, TestResult};
 use databrain_result_store::{ColumnStats, FindResult, Page, ResultInfo, ResultStore, ViewSpec};
-use databrain_workspace::{
-    ConnectionProfile, Folder, FolderKind, HistoryEntry, HistoryQuery, SavedQuery, TabState,
-    Workspace,
-};
+use databrain_workspace::{ConnectionProfile, Folder, FolderKind, HistoryEntry, HistoryQuery, SavedQuery, TabState, Workspace};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
@@ -108,7 +100,8 @@ pub fn credential_store(state: &AppState) -> CredentialStoreView {
 /// Reading from the keychain can show one macOS prompt per saved secret
 /// (once); afterwards the vault needs no prompts.
 pub async fn set_credential_store(state: &AppState, kind: databrain_auth::StoreKind) -> Result<databrain_auth::MigrationReport> {
-    let store = state.credential_store.lock().as_ref().map(|(s, _)| s.clone()).ok_or_else(|| invalid("the credential store cannot be changed in this build"))?;
+    let store =
+        state.credential_store.lock().as_ref().map(|(s, _)| s.clone()).ok_or_else(|| invalid("the credential store cannot be changed in this build"))?;
     let refs = all_secret_refs(state)?;
     let report = blocking(move || store.switch(kind, &refs).map_err(EngineError::from)).await?;
     state.workspace.set_setting(CREDENTIAL_STORE_SETTING, &serde_json::to_value(kind).unwrap_or_default())?;
@@ -120,9 +113,7 @@ pub fn default_registry() -> ConnectorRegistry {
 }
 
 /// Registry whose DuckDB connector can query outputs (`results.<name>`).
-pub fn registry_with_outputs(
-    #[allow(unused_variables)] outputs: Option<Arc<databrain_connector_core::external::ExternalTablesSlot>>,
-) -> ConnectorRegistry {
+pub fn registry_with_outputs(#[allow(unused_variables)] outputs: Option<Arc<databrain_connector_core::external::ExternalTablesSlot>>) -> ConnectorRegistry {
     #[allow(unused_mut)]
     let mut r = ConnectorRegistry::new();
     #[cfg(feature = "sqlite")]
@@ -156,21 +147,10 @@ pub fn registry_with_outputs(
 }
 
 impl AppState {
-    pub fn new(
-        workspace: Arc<Workspace>,
-        secrets: Arc<dyn SecretStore>,
-        events: Arc<dyn EventSink>,
-        ui: Arc<dyn crate::ai_api::UiBridge>,
-    ) -> Self {
+    pub fn new(workspace: Arc<Workspace>, secrets: Arc<dyn SecretStore>, events: Arc<dyn EventSink>, ui: Arc<dyn crate::ai_api::UiBridge>) -> Self {
         let hub = EventHub::new(events);
         let slot = databrain_connector_core::external::ExternalTablesSlot::new();
-        let engine = QueryEngine::new(
-            registry_with_outputs(Some(slot.clone())),
-            workspace.clone(),
-            secrets.clone(),
-            Arc::new(ResultStore::new()),
-            hub.clone(),
-        );
+        let engine = QueryEngine::new(registry_with_outputs(Some(slot.clone())), workspace.clone(), secrets.clone(), Arc::new(ResultStore::new()), hub.clone());
         slot.set(engine.external_tables());
         // Tabs left in manual-commit mode.
         for t in workspace.list_tabs().unwrap_or_default() {
@@ -235,9 +215,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| EngineError::new("internal", e.to_string()))?
+    tokio::task::spawn_blocking(f).await.map_err(|e| EngineError::new("internal", e.to_string()))?
 }
 
 // ------------------------------------------------------------ offsets

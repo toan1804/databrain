@@ -34,10 +34,8 @@ pub type Progress<'a> = &'a (dyn Fn(&str, usize, usize) + Send + Sync);
 fn system_schema(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     let last = n.rsplit('.').next().unwrap_or(&n);
-    matches!(
-        last,
-        "information_schema" | "pg_catalog" | "pg_toast" | "sys" | "mysql" | "performance_schema" | "sysibm" | "ctxsys" | "mdsys" | "xdb" | "outln"
-    ) || last.starts_with("pg_temp")
+    matches!(last, "information_schema" | "pg_catalog" | "pg_toast" | "sys" | "mysql" | "performance_schema" | "sysibm" | "ctxsys" | "mdsys" | "xdb" | "outln")
+        || last.starts_with("pg_temp")
 }
 
 /// Does a schema id match an index scope entry? Entries are schema ids
@@ -217,7 +215,14 @@ pub async fn index_connection_with(
             let items: Vec<KnObject> = m
                 .objects
                 .into_iter()
-                .filter(|o| !matches!(o.kind, databrain_connector_core::ObjectKind::Function | databrain_connector_core::ObjectKind::Procedure | databrain_connector_core::ObjectKind::Sequence))
+                .filter(|o| {
+                    !matches!(
+                        o.kind,
+                        databrain_connector_core::ObjectKind::Function
+                            | databrain_connector_core::ObjectKind::Procedure
+                            | databrain_connector_core::ObjectKind::Sequence
+                    )
+                })
                 .map(|o| {
                     let tc = m.columns.iter().find(|t| t.table == o.name);
                     KnObject {
@@ -318,7 +323,13 @@ pub async fn index_tables(
     if !fresh.is_empty() {
         ws.kn_upsert_objects(connection_id, &fresh)?;
         let objects = ws.kn_count(connection_id)?;
-        let st = ws.kn_state(connection_id)?.unwrap_or(KnState { connection_id: connection_id.to_string(), indexed_at: 0, objects: 0, schemas: vec![], error: None });
+        let st = ws.kn_state(connection_id)?.unwrap_or(KnState {
+            connection_id: connection_id.to_string(),
+            indexed_at: 0,
+            objects: 0,
+            schemas: vec![],
+            error: None,
+        });
         ws.kn_set_state(&KnState { objects, indexed_at: if st.indexed_at == 0 { now_ms() } else { st.indexed_at }, ..st })?;
     }
     Ok(out)
@@ -495,7 +506,13 @@ pub async fn check_note_target(engine: &QueryEngine, connection_id: &str, target
     let mut offline: Option<String> = None;
     for (sep, path) in parts {
         if let Ok(Some((o, col))) = ws.kn_resolve_path(connection_id, &path) {
-            out.push((sep, match col { Some(c) => format!("{}.{c}", o.full_name()), None => o.full_name() }));
+            out.push((
+                sep,
+                match col {
+                    Some(c) => format!("{}.{c}", o.full_name()),
+                    None => o.full_name(),
+                },
+            ));
             continue;
         }
         // Tables seen in the explorer / ⌘P / completion (works while indexing).
@@ -607,9 +624,21 @@ mod tests {
             row_estimate: Some(1200),
             columns: vec![
                 ColumnInfo { name: "id".into(), data_type: "int".into(), nullable: false, is_primary_key: true, default: None, comment: None },
-                ColumnInfo { name: "email".into(), data_type: "text".into(), nullable: true, is_primary_key: false, default: None, comment: Some("buyer".into()) },
+                ColumnInfo {
+                    name: "email".into(),
+                    data_type: "text".into(),
+                    nullable: true,
+                    is_primary_key: false,
+                    default: None,
+                    comment: Some("buyer".into()),
+                },
             ],
-            foreign_keys: vec![ForeignKey { columns: vec!["user_id".into()], ref_schema: "public".into(), ref_table: "users".into(), ref_columns: vec!["id".into()] }],
+            foreign_keys: vec![ForeignKey {
+                columns: vec!["user_id".into()],
+                ref_schema: "public".into(),
+                ref_table: "users".into(),
+                ref_columns: vec!["id".into()],
+            }],
         };
         let s = render_object(&o, &|c| c == "email", &["Cancelled orders have status = 'X'".into()]);
         assert!(s.contains("-- table public.orders (~1200 rows): Web orders"));

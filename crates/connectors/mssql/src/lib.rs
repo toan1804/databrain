@@ -12,14 +12,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use databrain_auth::{
-    AuthContext, AuthMethodKind, CliKind, ClientAuthStyle, Credential, CredentialSource, OAuthConfig,
-};
+use databrain_auth::{AuthContext, AuthMethodKind, CliKind, ClientAuthStyle, Credential, CredentialSource, OAuthConfig};
 use databrain_connector_core::value::{Column, MICROS_PER_DAY};
 use databrain_connector_core::{
-    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError,
-    ConnectorInfo, ConnectorKind, DbObject, ExecOptions, ExecSummary, FieldSpec, ForeignKey, ObjectDetail,
-    ObjectKind, QueryStream, Result, SchemaInfo, Session, SslMode, StreamEvent, StreamSender, TableColumns,
+    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ExecOptions,
+    ExecSummary, FieldSpec, ForeignKey, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, SslMode, StreamEvent, StreamSender, TableColumns,
     Value, quote_ident, sql::leading_keyword,
 };
 use futures::StreamExt;
@@ -77,11 +74,8 @@ impl Connector for MssqlConnector {
         let p = cfg.auth.oauth_params().cloned().unwrap_or_default();
         let tenant = p.tenant.clone().or(cfg.opt("tenant").map(str::to_string)).unwrap_or_else(|| "organizations".into());
         let base = format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0");
-        let mut scopes: Vec<String> = p
-            .scopes
-            .as_deref()
-            .map(|s| s.split_whitespace().map(str::to_string).collect())
-            .unwrap_or_else(|| vec![ENTRA_SCOPE.into()]);
+        let mut scopes: Vec<String> =
+            p.scopes.as_deref().map(|s| s.split_whitespace().map(str::to_string).collect()).unwrap_or_else(|| vec![ENTRA_SCOPE.into()]);
         if !matches!(cfg.auth, databrain_auth::AuthMethod::ClientCredentials(_)) && !scopes.iter().any(|s| s == "offline_access") {
             scopes.push("offline_access".into());
         }
@@ -166,7 +160,14 @@ impl Connector for MssqlConnector {
         } else {
             open(&c, use_browser).await?
         };
-        Ok(Box::new(MssqlSession { config: c, use_browser, conn: Arc::new(Mutex::new(Some(conn))), state: Default::default(), user_rowcount: Default::default(), all_dbs }))
+        Ok(Box::new(MssqlSession {
+            config: c,
+            use_browser,
+            conn: Arc::new(Mutex::new(Some(conn))),
+            state: Default::default(),
+            user_rowcount: Default::default(),
+            all_dbs,
+        }))
     }
 }
 
@@ -184,20 +185,14 @@ async fn open(c: &Config, use_browser: bool) -> Result<Conn> {
             e
         })
     };
-    tokio::time::timeout(Duration::from_secs(20), fut)
-        .await
-        .map_err(|_| ConnectorError::connection("connection timed out"))?
+    tokio::time::timeout(Duration::from_secs(20), fut).await.map_err(|_| ConnectorError::connection("connection timed out"))?
 }
 
 fn map_err(e: tiberius::error::Error) -> ConnectorError {
     match e {
-        tiberius::error::Error::Server(t) => {
-            ConnectorError::query(t.message().to_string()).with_code(format!("{} (line {})", t.code(), t.line()))
-        }
+        tiberius::error::Error::Server(t) => ConnectorError::query(t.message().to_string()).with_code(format!("{} (line {})", t.code(), t.line())),
         tiberius::error::Error::Io { message, .. } => ConnectorError::connection(message),
-        tiberius::error::Error::Routing { host, port } => {
-            ConnectorError::connection(format!("server redirected to {host}:{port}; connect to that address"))
-        }
+        tiberius::error::Error::Routing { host, port } => ConnectorError::connection(format!("server redirected to {host}:{port}; connect to that address")),
         tiberius::error::Error::Tls(m) => ConnectorError::connection(tls_hint(&m)),
         other => ConnectorError::query(other.to_string()),
     }
@@ -318,16 +313,12 @@ fn convert(v: ColumnData<'static>) -> Value {
                 Value::Timestamp((DAYS_1900 + d.days() as i64) * MICROS_PER_DAY + micros)
             })
             .unwrap_or(Value::Null),
-        D::SmallDateTime(x) => x
-            .map(|d| {
-                Value::Timestamp((DAYS_1900 + d.days() as i64) * MICROS_PER_DAY + d.seconds_fragments() as i64 * 60_000_000)
-            })
-            .unwrap_or(Value::Null),
+        D::SmallDateTime(x) => {
+            x.map(|d| Value::Timestamp((DAYS_1900 + d.days() as i64) * MICROS_PER_DAY + d.seconds_fragments() as i64 * 60_000_000)).unwrap_or(Value::Null)
+        }
         D::Time(x) => x.map(|t| Value::Time(time_micros(t))).unwrap_or(Value::Null),
         D::Date(x) => x.map(|d| Value::Date((DAYS_0001 + d.days() as i64) as i32)).unwrap_or(Value::Null),
-        D::DateTime2(x) => x
-            .map(|d| Value::Timestamp((DAYS_0001 + d.date().days() as i64) * MICROS_PER_DAY + time_micros(d.time())))
-            .unwrap_or(Value::Null),
+        D::DateTime2(x) => x.map(|d| Value::Timestamp((DAYS_0001 + d.date().days() as i64) * MICROS_PER_DAY + time_micros(d.time()))).unwrap_or(Value::Null),
         D::DateTimeOffset(x) => x
             .map(|d| {
                 // Stored as UTC plus an offset.
@@ -347,10 +338,7 @@ fn is_dml(sql: &str) -> bool {
         // (sp_executesql) call is not.
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE" | "GRANT" | "REVOKE"
     );
-    writes
-        && !sql
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|w| w.eq_ignore_ascii_case("OUTPUT"))
+    writes && !sql.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w.eq_ignore_ascii_case("OUTPUT"))
 }
 
 /// How `run` ended.
@@ -374,9 +362,7 @@ async fn run(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &StreamSender, 
         tx.send(StreamEvent::Done(ExecSummary { rows_affected: Some(r.rows_affected().iter().sum()) })).await;
         return Ok(Ended::Complete);
     }
-    let server_cap = opts
-        .max_rows
-        .filter(|_| !user_rowcount && databrain_connector_core::sql::classify(sql, ConnectorKind::Mssql).kind.is_read());
+    let server_cap = opts.max_rows.filter(|_| !user_rowcount && databrain_connector_core::sql::classify(sql, ConnectorKind::Mssql).kind.is_read());
     let Some(n) = server_cap else {
         return read(conn, sql, opts, tx, replaceable).await;
     };
@@ -568,13 +554,16 @@ impl MssqlSession {
         let s = |r: &tiberius::Row, i: usize| r.get::<&str, _>(i).map(str::to_string);
         let id = |r: &tiberius::Row, i: usize| self.id(db, &s(r, i).unwrap_or_default());
         let objects = self
-            .rows_dyn_in(db, format!(
-                "select schema_name(o.schema_id), o.name, rtrim(o.type), cast(ep.value as nvarchar(4000)), \
+            .rows_dyn_in(
+                db,
+                format!(
+                    "select schema_name(o.schema_id), o.name, rtrim(o.type), cast(ep.value as nvarchar(4000)), \
                    (select sum(p.rows) from sys.partitions p where p.object_id = o.object_id and p.index_id in (0,1)) \
                  from sys.objects o \
                  left join sys.extended_properties ep on ep.class = 1 and ep.major_id = o.object_id and ep.minor_id = 0 and ep.name = 'MS_Description' \
                  where schema_name(o.schema_id) in ({list}) and o.type in ('U','V') and o.is_ms_shipped = 0 order by 1, 2"
-            ))
+                ),
+            )
             .await?
             .iter()
             .map(|r| DbObject {
@@ -609,8 +598,10 @@ impl MssqlSession {
             })
             .collect();
         let fk_rows = self
-            .rows_dyn_in(db, format!(
-                "select schema_name(fk.schema_id), object_name(fk.parent_object_id), fk.name, pc.name, rs.name, rt.name, rc.name \
+            .rows_dyn_in(
+                db,
+                format!(
+                    "select schema_name(fk.schema_id), object_name(fk.parent_object_id), fk.name, pc.name, rs.name, rt.name, rc.name \
                  from sys.foreign_keys fk \
                  join sys.foreign_key_columns fkc on fkc.constraint_object_id = fk.object_id \
                  join sys.columns pc on pc.object_id = fkc.parent_object_id and pc.column_id = fkc.parent_column_id \
@@ -619,7 +610,8 @@ impl MssqlSession {
                  join sys.columns rc on rc.object_id = fkc.referenced_object_id and rc.column_id = fkc.referenced_column_id \
                  where schema_name(fk.schema_id) in ({list}) \
                  order by 1, 2, 3, fkc.constraint_column_id"
-            ))
+                ),
+            )
             .await?;
         let mut fks: Vec<(String, String, ForeignKey)> = Vec::new();
         let mut last: Option<(String, String, String)> = None;
@@ -632,7 +624,11 @@ impl MssqlSession {
                     fk.ref_columns.push(g(6));
                 }
             } else {
-                fks.push((key.0.clone(), key.1.clone(), ForeignKey { columns: vec![g(3)], ref_schema: self.id(db, &g(4)), ref_table: g(5), ref_columns: vec![g(6)] }));
+                fks.push((
+                    key.0.clone(),
+                    key.1.clone(),
+                    ForeignKey { columns: vec![g(3)], ref_schema: self.id(db, &g(4)), ref_table: g(5), ref_columns: vec![g(6)] },
+                ));
                 last = Some(key);
             }
         }
@@ -730,10 +726,7 @@ impl Session for MssqlSession {
 
     async fn server_version(&self) -> Result<String> {
         let r = self.rows("select @@version", vec![]).await?;
-        Ok(r.first()
-            .and_then(|r| r.get::<&str, _>(0))
-            .map(|s| s.lines().next().unwrap_or(s).trim().to_string())
-            .unwrap_or_default())
+        Ok(r.first().and_then(|r| r.get::<&str, _>(0)).map(|s| s.lines().next().unwrap_or(s).trim().to_string()).unwrap_or_default())
     }
 
     fn in_transaction(&self) -> bool {
@@ -817,7 +810,11 @@ impl Session for MssqlSession {
             let rows = self.rows(SCHEMAS_SQL, vec![]).await?;
             return Ok(rows
                 .iter()
-                .map(|r| SchemaInfo { name: r.get::<&str, _>(0).unwrap_or_default().to_string(), is_default: r.get::<bool, _>(1).unwrap_or(false), catalog: None })
+                .map(|r| SchemaInfo {
+                    name: r.get::<&str, _>(0).unwrap_or_default().to_string(),
+                    is_default: r.get::<bool, _>(1).unwrap_or(false),
+                    catalog: None,
+                })
                 .collect());
         }
         // Every database's schemas in one batch.
@@ -919,21 +916,22 @@ impl Session for MssqlSession {
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
-        use databrain_connector_core::{group_indexes, quote_literal, truthy, TableLayout};
+        use databrain_connector_core::{TableLayout, group_indexes, quote_literal, truthy};
         let (db, schema) = self.split(schema);
         let obj = format!("N{}", quote_literal(&format!("{}.{}", quote_ident(ConnectorKind::Mssql, schema), quote_ident(ConnectorKind::Mssql, name))));
-        let idx = self.query_text_in(
-            db,
-            &format!(
-                "select i.name, c.name, cast(i.is_unique as int), cast(i.is_primary_key as int), lower(i.type_desc) \
+        let idx = self
+            .query_text_in(
+                db,
+                &format!(
+                    "select i.name, c.name, cast(i.is_unique as int), cast(i.is_primary_key as int), lower(i.type_desc) \
                  from sys.indexes i \
                  join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id \
                  join sys.columns c on c.object_id = ic.object_id and c.column_id = ic.column_id \
                  where i.object_id = object_id({obj}) and ic.is_included_column = 0 and ic.key_ordinal > 0 \
                  order by i.is_primary_key desc, i.name, ic.key_ordinal"
-            ),
-        )
-        .await?;
+                ),
+            )
+            .await?;
         let mut l = TableLayout {
             indexes: group_indexes(idx.into_iter().map(|r| {
                 let m = r[4].clone().filter(|m| m != "nonclustered");
@@ -945,23 +943,25 @@ impl Session for MssqlSession {
         if heap.as_ref().and_then(|r| r.first()).and_then(|r| r[0].as_deref()) == Some("1") {
             l.notes.push("heap: no clustered index".into());
         }
-        if let Ok(p) = self.query_text_in(
-            db,
-            &format!(
-                "select c.name, lower(pf.type_desc) from sys.indexes i \
+        if let Ok(p) = self
+            .query_text_in(
+                db,
+                &format!(
+                    "select c.name, lower(pf.type_desc) from sys.indexes i \
                  join sys.partition_schemes ps on ps.data_space_id = i.data_space_id \
                  join sys.partition_functions pf on pf.function_id = ps.function_id \
                  join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id and ic.partition_ordinal > 0 \
                  join sys.columns c on c.object_id = ic.object_id and c.column_id = ic.column_id \
                  where i.object_id = object_id({obj}) and i.index_id in (0, 1) order by ic.partition_ordinal"
-            ),
-        )
-        .await
+                ),
+            )
+            .await
         {
             l.partition_by = p.iter().filter_map(|r| r[0].clone()).collect();
             l.partition_kind = p.first().and_then(|r| r[1].clone());
         }
-        if let Ok(r) = self.query_text_in(db, &format!("select sum(rows) from sys.partitions where object_id = object_id({obj}) and index_id in (0, 1)")).await {
+        if let Ok(r) = self.query_text_in(db, &format!("select sum(rows) from sys.partitions where object_id = object_id({obj}) and index_id in (0, 1)")).await
+        {
             l.row_estimate = r.first().and_then(|r| r[0].as_deref()).and_then(|x| x.parse().ok());
         }
         Ok(l)
@@ -1017,12 +1017,7 @@ impl Session for MssqlSession {
             .min_by_key(|o| !o.kind.is_relation())
             .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
         let (db, sch) = self.split(schema);
-        let columns: Vec<ColumnInfo> = self
-            .rows_in(db, COLUMNS_SQL, vec![sch.into(), name.into()])
-            .await?
-            .iter()
-            .map(|r| column_from(r).1)
-            .collect();
+        let columns: Vec<ColumnInfo> = self.rows_in(db, COLUMNS_SQL, vec![sch.into(), name.into()]).await?.iter().map(|r| column_from(r).1).collect();
         let full = format!("{}.{}", quote_ident(ConnectorKind::Mssql, sch), quote_ident(ConnectorKind::Mssql, name));
         let ddl = match object.kind {
             ObjectKind::Table => Some(table_ddl(&full, &columns)),
@@ -1044,7 +1039,9 @@ impl Session for MssqlSession {
     async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         if !self.all_dbs {
             let rows = self.rows(EXPLORER_FINGERPRINTS_SQL, vec![]).await?;
-            return Ok(Some(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect()));
+            return Ok(Some(
+                rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect(),
+            ));
         }
         let sql = format!("select db_name() + '.' + x.n, x.f from ({}) x(n, f)", EXPLORER_FINGERPRINTS_SQL);
         let rows = self.rows_all(each_db(&self.db_names().await?, &sql)).await?;
@@ -1083,7 +1080,9 @@ impl Session for MssqlSession {
     async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         if !self.all_dbs {
             let rows = self.rows(SCHEMA_FINGERPRINTS_SQL, vec![]).await?;
-            return Ok(Some(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect()));
+            return Ok(Some(
+                rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect(),
+            ));
         }
         let sql = format!("select db_name() + '.' + x.n, x.f from ({}) x(n, f)", SCHEMA_FINGERPRINTS_SQL);
         let rows = self.rows_all(each_db(&self.db_names().await?, &sql)).await?;
@@ -1186,11 +1185,21 @@ mod tests {
     #[test]
     fn catalog_queries_run_in_the_schemas_database() {
         assert_eq!(in_db(None, "select 1", 0), "select 1");
-        assert_eq!(in_db(Some("Sales]DB"), "select N'x' where a = @P1", 1), "exec [Sales]]DB].sys.sp_executesql N'select N''x'' where a = @P1', N'@P1 nvarchar(max)', @P1 = @P1");
+        assert_eq!(
+            in_db(Some("Sales]DB"), "select N'x' where a = @P1", 1),
+            "exec [Sales]]DB].sys.sp_executesql N'select N''x'' where a = @P1', N'@P1 nvarchar(max)', @P1 = @P1"
+        );
         let b = each_db(&["a".into(), "b".into()], "select db_name()");
         assert_eq!(b.matches("begin try exec").count(), 2);
         assert!(b.contains("[b].sys.sp_executesql"));
-        let s = MssqlSession { config: Config::new(), use_browser: false, conn: Arc::new(Mutex::new(None)), state: Default::default(), user_rowcount: Default::default(), all_dbs: true };
+        let s = MssqlSession {
+            config: Config::new(),
+            use_browser: false,
+            conn: Arc::new(Mutex::new(None)),
+            state: Default::default(),
+            user_rowcount: Default::default(),
+            all_dbs: true,
+        };
         assert_eq!(s.split("shop.dbo"), (Some("shop"), "dbo"));
         assert_eq!(s.id(Some("shop"), "dbo"), "shop.dbo");
         let two = MssqlSession { all_dbs: false, ..s };
@@ -1258,10 +1267,7 @@ mod tests {
         assert_eq!(r.num_rows(), 1);
         assert!(!s.list_schemas().await.unwrap().is_empty());
         let cancel = databrain_connector_core::CancellationToken::new();
-        let st = s
-            .execute("waitfor delay '00:00:30'", ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() })
-            .await
-            .unwrap();
+        let st = s.execute("waitfor delay '00:00:30'", ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         cancel.cancel();
         assert!(st.collect().await.unwrap_err().is_cancelled());
@@ -1294,7 +1300,9 @@ mod tests {
         ] {
             assert!(ddl.contains(part), "missing {part:?} in\n{ddl}");
         }
-        assert!(s.object_ddl("dbo", "kb_customers", ObjectKind::Table).await.unwrap().unwrap().contains("CONSTRAINT [uq_kb_email] UNIQUE NONCLUSTERED ([email])"));
+        assert!(
+            s.object_ddl("dbo", "kb_customers", ObjectKind::Table).await.unwrap().unwrap().contains("CONSTRAINT [uq_kb_email] UNIQUE NONCLUSTERED ([email])")
+        );
         run("drop table dbo.kb_orders".into()).await;
         for stmt in ddl.split(";\n").map(str::trim).filter(|x| !x.is_empty()) {
             run(stmt.trim_end_matches(';').to_string()).await;

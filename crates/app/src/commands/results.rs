@@ -23,7 +23,11 @@ pub(crate) fn edit_preview(
 }
 
 #[tauri::command]
-pub(crate) async fn apply_edits(state: State<'_, AppState>, result_id: String, changes: Vec<databrain_query_engine::edit::RowChange>) -> R<databrain_query_engine::edit::ApplyReport> {
+pub(crate) async fn apply_edits(
+    state: State<'_, AppState>,
+    result_id: String,
+    changes: Vec<databrain_query_engine::edit::RowChange>,
+) -> R<databrain_query_engine::edit::ApplyReport> {
     api::apply_edits(&state, &result_id, changes).await
 }
 
@@ -33,12 +37,22 @@ pub(crate) async fn result_links(state: State<'_, AppState>, result_id: String) 
 }
 
 #[tauri::command]
-pub(crate) fn related_rows_sql(state: State<'_, AppState>, result_id: String, link: databrain_query_engine::related::ResultLink, rows: Vec<Vec<Option<String>>>) -> R<String> {
+pub(crate) fn related_rows_sql(
+    state: State<'_, AppState>,
+    result_id: String,
+    link: databrain_query_engine::related::ResultLink,
+    rows: Vec<Vec<Option<String>>>,
+) -> R<String> {
     api::related_rows_sql(&state, &result_id, &link, &rows)
 }
 
 #[tauri::command]
-pub(crate) async fn load_result(state: State<'_, AppState>, result_id: String, args: api::LoadResultArgs, load_id: String) -> R<databrain_query_engine::LoadReport> {
+pub(crate) async fn load_result(
+    state: State<'_, AppState>,
+    result_id: String,
+    args: api::LoadResultArgs,
+    load_id: String,
+) -> R<databrain_query_engine::LoadReport> {
     api::load_result(&state, &result_id, args, &load_id).await
 }
 
@@ -75,13 +89,7 @@ pub(crate) async fn result_info(state: State<'_, AppState>, result_id: String) -
 }
 
 #[tauri::command]
-pub(crate) async fn fetch_page(
-    state: State<'_, AppState>,
-    result_id: String,
-    view: ViewSpec,
-    offset: usize,
-    limit: usize,
-) -> R<Page> {
+pub(crate) async fn fetch_page(state: State<'_, AppState>, result_id: String, view: ViewSpec, offset: usize, limit: usize) -> R<Page> {
     api::fetch_page(&state, result_id, view, offset, limit).await
 }
 
@@ -99,23 +107,12 @@ pub(crate) async fn find_in_result(
 }
 
 #[tauri::command]
-pub(crate) async fn column_stats(
-    state: State<'_, AppState>,
-    result_id: String,
-    view: ViewSpec,
-    column: usize,
-) -> R<ColumnStats> {
+pub(crate) async fn column_stats(state: State<'_, AppState>, result_id: String, view: ViewSpec, column: usize) -> R<ColumnStats> {
     api::column_stats(&state, result_id, view, column).await
 }
 
 #[tauri::command]
-pub(crate) async fn export_result(
-    state: State<'_, AppState>,
-    result_id: String,
-    view: ViewSpec,
-    options: ExportOptions,
-    path: String,
-) -> R<u64> {
+pub(crate) async fn export_result(state: State<'_, AppState>, result_id: String, view: ViewSpec, options: ExportOptions, path: String) -> R<u64> {
     api::export_result(&state, result_id, view, options, path).await
 }
 
@@ -126,14 +123,7 @@ pub(crate) async fn export_full_result(state: State<'_, AppState>, result_id: St
 }
 
 #[tauri::command]
-pub(crate) async fn copy_rows(
-    state: State<'_, AppState>,
-    result_id: String,
-    view: ViewSpec,
-    offset: usize,
-    limit: usize,
-    options: ExportOptions,
-) -> R<String> {
+pub(crate) async fn copy_rows(state: State<'_, AppState>, result_id: String, view: ViewSpec, offset: usize, limit: usize, options: ExportOptions) -> R<String> {
     api::copy_rows(&state, result_id, view, offset, limit, options).await
 }
 

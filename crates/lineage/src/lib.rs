@@ -22,8 +22,8 @@ use databrain_connector_core::sql::{dialect_for, split_statements};
 use serde::Serialize;
 use sqlparser::ast::{
     AlterTableOperation, Assignment, AssignmentTarget, Delete, Expr, FromTable, Ident, Join, JoinConstraint, JoinOperator, Merge, MergeAction, MergeInsertKind,
-    MergeUpdateKind, ObjectName, ObjectNamePart, ObjectType, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement, TableAlias,
-    TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind, Visit, Visitor,
+    MergeUpdateKind, ObjectName, ObjectNamePart, ObjectType, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Spanned, Statement,
+    TableAlias, TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind, Visit, Visitor,
 };
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Location, Span, Token, Tokenizer};
@@ -277,7 +277,7 @@ pub fn analyze(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> Lineage
             }
             Err(e) => {
                 b.g.partial = true;
-                b.g.statements.push(StatementInfo { index: i, kind: "error".into(), range, query: None, result: None, error: Some(e.to_string()), });
+                b.g.statements.push(StatementInfo { index: i, kind: "error".into(), range, query: None, result: None, error: Some(e.to_string()) });
                 b.tables_by_tokens();
             }
         }
@@ -285,7 +285,12 @@ pub fn analyze(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> Lineage
     // Tables the script defines have known columns; one it only inserts
     // into, updates or deletes from is still a database table to describe.
     let mut unknown: Vec<String> =
-        b.g.nodes.iter().enumerate().filter(|(i, n)| n.kind == NodeKind::Table && !n.columns_known && !b.created.contains(i)).map(|(_, n)| n.name.clone()).collect();
+        b.g.nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| n.kind == NodeKind::Table && !n.columns_known && !b.created.contains(i))
+            .map(|(_, n)| n.name.clone())
+            .collect();
     unknown.sort();
     unknown.dedup();
     b.g.unknown_tables = unknown;
@@ -319,7 +324,13 @@ fn combine(path: Option<EdgeKind>, e: EdgeKind) -> EdgeKind {
         None => e,
         Some(p) if is_rows(p) => p,
         Some(_) if is_rows(e) => e,
-        Some(p) => if strength(e) > strength(p) { e } else { p },
+        Some(p) => {
+            if strength(e) > strength(p) {
+                e
+            } else {
+                p
+            }
+        }
     }
 }
 
@@ -462,16 +473,69 @@ struct Refs {
 }
 
 const AGGREGATES: &[&str] = &[
-    "count", "sum", "avg", "min", "max", "array_agg", "string_agg", "listagg", "group_concat", "stddev", "stddev_pop", "stddev_samp", "variance",
-    "var_pop", "var_samp", "median", "mode", "percentile_cont", "percentile_disc", "approx_count_distinct", "count_if", "bool_and", "bool_or",
-    "every", "any_value", "collect_list", "collect_set", "json_agg", "jsonb_agg", "json_object_agg", "first", "last", "arbitrary", "approx_distinct",
-    "countif", "logical_and", "logical_or", "bit_and", "bit_or", "corr", "covar_pop", "covar_samp",
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "array_agg",
+    "string_agg",
+    "listagg",
+    "group_concat",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "variance",
+    "var_pop",
+    "var_samp",
+    "median",
+    "mode",
+    "percentile_cont",
+    "percentile_disc",
+    "approx_count_distinct",
+    "count_if",
+    "bool_and",
+    "bool_or",
+    "every",
+    "any_value",
+    "collect_list",
+    "collect_set",
+    "json_agg",
+    "jsonb_agg",
+    "json_object_agg",
+    "first",
+    "last",
+    "arbitrary",
+    "approx_distinct",
+    "countif",
+    "logical_and",
+    "logical_or",
+    "bit_and",
+    "bit_or",
+    "corr",
+    "covar_pop",
+    "covar_samp",
 ];
 
 /// Bare words that are values, not columns.
 const PSEUDO: &[&str] = &[
-    "sysdate", "systimestamp", "current_date", "current_timestamp", "current_time", "current_user", "session_user", "user", "rownum", "rowid",
-    "level", "localtimestamp", "localtime", "true", "false", "null", "default",
+    "sysdate",
+    "systimestamp",
+    "current_date",
+    "current_timestamp",
+    "current_time",
+    "current_user",
+    "session_user",
+    "user",
+    "rownum",
+    "rowid",
+    "level",
+    "localtimestamp",
+    "localtime",
+    "true",
+    "false",
+    "null",
+    "default",
 ];
 
 impl Visitor for Refs {
@@ -789,14 +853,8 @@ impl<'a> Builder<'a> {
     fn statement(&mut self, st: &Statement, range: Range, many: bool) {
         let qrange = |b: &Self, q: &Query| b.range(q.span());
         let index = self.stmt;
-        let info = move |kind: &str, query: Option<Range>, result: Option<String>| StatementInfo {
-            index,
-            kind: kind.into(),
-            range,
-            query,
-            result,
-            error: None,
-        };
+        let info =
+            move |kind: &str, query: Option<Range>, result: Option<String>| StatementInfo { index, kind: kind.into(), range, query, result, error: None };
         match st {
             Statement::Query(q) if select_into(q).is_some() => {
                 let target = select_into(q).unwrap();
@@ -1087,7 +1145,8 @@ impl<'a> Builder<'a> {
                 _ => n.clone(),
             }
         };
-        let targets: Vec<ObjectName> = if d.tables.is_empty() { named.first().map(|(_, n)| n.clone()).into_iter().collect() } else { d.tables.iter().map(resolve).collect() };
+        let targets: Vec<ObjectName> =
+            if d.tables.is_empty() { named.first().map(|(_, n)| n.clone()).into_iter().collect() } else { d.tables.iter().map(resolve).collect() };
         let Some(target) = targets.first().cloned() else {
             self.warn("DELETE from something other than a table is not traced".into(), self.range(d.delete_token.0.span));
             return None;
@@ -1156,7 +1215,10 @@ impl<'a> Builder<'a> {
                                 let col = ins.columns.get(i).and_then(|c| name_parts(c).last().cloned()).or_else(|| known.get(i).cloned());
                                 match col {
                                     Some(col) => self.value_into(t, &col, e, &sources, &scope),
-                                    None => self.warn(format!("MERGE … INSERT: value {} has no column (list them, or cache {})", i + 1, self.g.nodes[t].name), self.range(e.span())),
+                                    None => self.warn(
+                                        format!("MERGE … INSERT: value {} has no column (list them, or cache {})", i + 1, self.g.nodes[t].name),
+                                        self.range(e.span()),
+                                    ),
                                 }
                             }
                         }
@@ -1333,9 +1395,7 @@ impl<'a> Builder<'a> {
                 n
             }
             SetExpr::Table(t) => {
-                let name = ObjectName::from(
-                    t.schema_name.iter().chain(t.table_name.iter()).map(|s| Ident::new(s.clone())).collect::<Vec<_>>(),
-                );
+                let name = ObjectName::from(t.schema_name.iter().chain(t.table_name.iter()).map(|s| Ident::new(s.clone())).collect::<Vec<_>>());
                 let n = self.table_node(&name);
                 self.expand_view(n, &name_parts(&name));
                 n
@@ -1558,7 +1618,9 @@ impl<'a> Builder<'a> {
                     env.clone()
                 };
                 let m = self.query(subquery, &inner);
-                let m = if matches!(self.g.nodes[m].kind, NodeKind::Table | NodeKind::Cte) { m } else {
+                let m = if matches!(self.g.nodes[m].kind, NodeKind::Table | NodeKind::Cte) {
+                    m
+                } else {
                     self.g.nodes[m].name = alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_else(|| "subquery".into());
                     if let Some(a) = alias {
                         self.g.nodes[m].span = self.range(a.name.span);
@@ -1603,10 +1665,12 @@ impl<'a> Builder<'a> {
         sources
             .iter()
             .find(|s| s.alias == q)
-            .or_else(|| sources.iter().find(|s| {
-                let name = self.g.nodes[s.node].name.to_lowercase();
-                name == full || name.ends_with(&format!(".{full}"))
-            }))
+            .or_else(|| {
+                sources.iter().find(|s| {
+                    let name = self.g.nodes[s.node].name.to_lowercase();
+                    name == full || name.ends_with(&format!(".{full}"))
+                })
+            })
             .cloned()
     }
 
@@ -1691,7 +1755,8 @@ impl<'a> Builder<'a> {
                 }
                 i += 2;
             }
-            let keyword = parts.len() == 1 && parts[0].quote_style.is_none() && ["SELECT", "LATERAL", "ONLY", "IF"].contains(&parts[0].value.to_uppercase().as_str());
+            let keyword =
+                parts.len() == 1 && parts[0].quote_style.is_none() && ["SELECT", "LATERAL", "ONLY", "IF"].contains(&parts[0].value.to_uppercase().as_str());
             if !parts.is_empty() && !keyword {
                 self.table_node(&ObjectName::from(parts));
             }

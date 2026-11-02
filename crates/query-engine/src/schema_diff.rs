@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use databrain_connector_core::{quote_ident, ColumnInfo, ConnectorKind, ForeignKey, ObjectKind, SchemaMetadata, TableColumns};
+use databrain_connector_core::{ColumnInfo, ConnectorKind, ForeignKey, ObjectKind, SchemaMetadata, TableColumns, quote_ident};
 use serde::{Deserialize, Serialize};
 
 use crate::{EngineError, QueryEngine, Result};
@@ -91,7 +91,12 @@ pub fn table_changes(src: &TableColumns, dst: &TableColumns) -> Vec<ColumnChange
             None => out.push(ColumnChange { column: Some(c.name.clone()), what: "added".into(), source: Some(c.data_type.clone()), target: None }),
             Some(d) => {
                 if norm_type(&c.data_type) != norm_type(&d.data_type) {
-                    out.push(ColumnChange { column: Some(c.name.clone()), what: "type".into(), source: Some(c.data_type.clone()), target: Some(d.data_type.clone()) });
+                    out.push(ColumnChange {
+                        column: Some(c.name.clone()),
+                        what: "type".into(),
+                        source: Some(c.data_type.clone()),
+                        target: Some(d.data_type.clone()),
+                    });
                 }
                 if c.nullable != d.nullable {
                     let t = |n: bool| Some(if n { "NULL" } else { "NOT NULL" }.to_string());
@@ -110,7 +115,9 @@ pub fn table_changes(src: &TableColumns, dst: &TableColumns) -> Vec<ColumnChange
     }
     let pk = |t: &TableColumns| t.columns.iter().filter(|c| c.is_primary_key).map(|c| key(&c.name)).collect::<Vec<_>>();
     if pk(src) != pk(dst) {
-        let show = |t: &TableColumns| Some(t.columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect::<Vec<_>>().join(", ")).filter(|s| !s.is_empty());
+        let show = |t: &TableColumns| {
+            Some(t.columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect::<Vec<_>>().join(", ")).filter(|s| !s.is_empty())
+        };
         out.push(ColumnChange { column: None, what: "primary_key".into(), source: show(src), target: show(dst) });
     }
     for fk in &src.foreign_keys {
@@ -168,7 +175,14 @@ fn col_def(kind: ConnectorKind, c: &ColumnInfo) -> String {
 }
 
 /// The script that makes the target schema like the source (target dialect).
-pub fn migration_script(kind: ConnectorKind, target_schema: &str, source_schema: &str, src: &SchemaMetadata, diffs: &[ObjectDiff], cross_engine: bool) -> String {
+pub fn migration_script(
+    kind: ConnectorKind,
+    target_schema: &str,
+    source_schema: &str,
+    src: &SchemaMetadata,
+    diffs: &[ObjectDiff],
+    cross_engine: bool,
+) -> String {
     use ConnectorKind::*;
     let table = |n: &str| format!("{}.{}", target_schema.split('.').map(|p| quote_ident(kind, p)).collect::<Vec<_>>().join("."), quote_ident(kind, n));
     // SQLite doesn't take a schema in REFERENCES (it is the table's own).
@@ -196,7 +210,9 @@ pub fn migration_script(kind: ConnectorKind, target_schema: &str, source_schema:
                 }
                 out.push(format!("\nCREATE TABLE {t} (\n{}\n);", lines.join(",\n")));
             }
-            DiffStatus::OnlySource => out.push(format!("\n-- {} {} exists only in the source: copy its DDL (Show DDL on it).", d.kind.as_str().replace('_', " "), d.name)),
+            DiffStatus::OnlySource => {
+                out.push(format!("\n-- {} {} exists only in the source: copy its DDL (Show DDL on it).", d.kind.as_str().replace('_', " "), d.name))
+            }
             DiffStatus::OnlyTarget => {
                 if d.kind == ObjectKind::Table {
                     out.push(format!("\n-- {} is not in the source (drops its data):\n-- DROP TABLE {t};", d.name));
@@ -234,7 +250,9 @@ pub fn migration_script(kind: ConnectorKind, target_schema: &str, source_schema:
                             let null = if info.nullable { "NULL" } else { "NOT NULL" };
                             out.push(match kind {
                                 Postgres if ch.what == "type" => format!("ALTER TABLE {t} ALTER COLUMN {c} TYPE {ty};"),
-                                Postgres | Duckdb | Snowflake if ch.what == "nullable" => format!("ALTER TABLE {t} ALTER COLUMN {c} {} NOT NULL;", if info.nullable { "DROP" } else { "SET" }),
+                                Postgres | Duckdb | Snowflake if ch.what == "nullable" => {
+                                    format!("ALTER TABLE {t} ALTER COLUMN {c} {} NOT NULL;", if info.nullable { "DROP" } else { "SET" })
+                                }
                                 Duckdb => format!("ALTER TABLE {t} ALTER {c} TYPE {ty};"),
                                 Snowflake => format!("ALTER TABLE {t} ALTER COLUMN {c} SET DATA TYPE {ty};"),
                                 Mysql => format!("ALTER TABLE {t} MODIFY COLUMN {};", col_def(kind, info)),
@@ -243,18 +261,30 @@ pub fn migration_script(kind: ConnectorKind, target_schema: &str, source_schema:
                                 Oracle => format!("ALTER TABLE {t} MODIFY ({c} {null});"),
                                 Databricks if ch.what == "type" => format!("ALTER TABLE {t} ALTER COLUMN {c} TYPE {ty};"),
                                 Databricks => format!("ALTER TABLE {t} ALTER COLUMN {c} {} NOT NULL;", if info.nullable { "DROP" } else { "SET" }),
-                                _ => format!("-- {col}: {} → {}: this database can't change a column in place (rebuild the table).", ch.target.clone().unwrap_or_default(), ch.source.clone().unwrap_or_default()),
+                                _ => format!(
+                                    "-- {col}: {} → {}: this database can't change a column in place (rebuild the table).",
+                                    ch.target.clone().unwrap_or_default(),
+                                    ch.source.clone().unwrap_or_default()
+                                ),
                             });
                         }
                         ("default", Some(info)) => out.push(match (kind, &info.default) {
                             (Mysql, _) => format!("ALTER TABLE {t} MODIFY COLUMN {};", col_def(kind, info)),
-                            (Mssql | Sqlite, _) => format!("-- {col}: default {} → {} (change the default constraint by hand)", ch.target.clone().unwrap_or("none".into()), ch.source.clone().unwrap_or("none".into())),
+                            (Mssql | Sqlite, _) => format!(
+                                "-- {col}: default {} → {} (change the default constraint by hand)",
+                                ch.target.clone().unwrap_or("none".into()),
+                                ch.source.clone().unwrap_or("none".into())
+                            ),
                             (Oracle, Some(d)) => format!("ALTER TABLE {t} MODIFY ({c} DEFAULT {d});"),
                             (Oracle, None) => format!("ALTER TABLE {t} MODIFY ({c} DEFAULT NULL);"),
                             (_, Some(d)) => format!("ALTER TABLE {t} ALTER COLUMN {c} SET DEFAULT {d};"),
                             (_, None) => format!("ALTER TABLE {t} ALTER COLUMN {c} DROP DEFAULT;"),
                         }),
-                        ("primary_key", _) => out.push(format!("-- primary key: target ({}) → source ({})", ch.target.clone().unwrap_or("none".into()), ch.source.clone().unwrap_or("none".into()))),
+                        ("primary_key", _) => out.push(format!(
+                            "-- primary key: target ({}) → source ({})",
+                            ch.target.clone().unwrap_or("none".into()),
+                            ch.source.clone().unwrap_or("none".into())
+                        )),
                         ("foreign_key", _) if ch.source.is_some() => {
                             let fk = tc.and_then(|tc| tc.foreign_keys.iter().find(|f| Some(fk_text(f)) == ch.source));
                             match (fk, kind) {
@@ -284,7 +314,10 @@ impl QueryEngine {
     pub async fn schema_diff(&self, source: &SchemaSide, target: &SchemaSide) -> Result<SchemaDiff> {
         let sk = self.workspace().get_connection(&source.connection_id)?.config.kind;
         let tk = self.workspace().get_connection(&target.connection_id)?.config.kind;
-        let (a, b) = tokio::join!(self.bulk_metadata(&source.connection_id, std::slice::from_ref(&source.schema)), self.bulk_metadata(&target.connection_id, std::slice::from_ref(&target.schema)));
+        let (a, b) = tokio::join!(
+            self.bulk_metadata(&source.connection_id, std::slice::from_ref(&source.schema)),
+            self.bulk_metadata(&target.connection_id, std::slice::from_ref(&target.schema))
+        );
         let one = |r: Result<Vec<SchemaMetadata>>, side: &SchemaSide| -> Result<SchemaMetadata> {
             let m = r?.into_iter().next().ok_or_else(|| EngineError::new("not_found", format!("Schema {} not found", side.schema)))?;
             if let Some(e) = &m.error {
@@ -310,7 +343,10 @@ mod tests {
     fn meta(tables: Vec<(&str, Vec<ColumnInfo>)>) -> SchemaMetadata {
         SchemaMetadata {
             schema: "s".into(),
-            objects: tables.iter().map(|(n, _)| DbObject { schema: "s".into(), name: (*n).into(), kind: ObjectKind::Table, comment: None, row_estimate: None }).collect(),
+            objects: tables
+                .iter()
+                .map(|(n, _)| DbObject { schema: "s".into(), name: (*n).into(), kind: ObjectKind::Table, comment: None, row_estimate: None })
+                .collect(),
             columns: tables.into_iter().map(|(n, c)| TableColumns { table: n.into(), columns: c, foreign_keys: vec![] }).collect(),
             error: None,
         }
@@ -318,8 +354,14 @@ mod tests {
 
     #[test]
     fn finds_differences_and_writes_the_script() {
-        let src = meta(vec![("orders", vec![col("id", "integer", false, true), col("amount", "numeric(12,2)", false, false), col("note", "text", true, false)]), ("customers", vec![col("id", "integer", false, true)])]);
-        let dst = meta(vec![("ORDERS", vec![col("id", "integer", false, true), col("amount", "numeric(10,2)", true, false), col("legacy", "text", true, false)]), ("old_log", vec![col("x", "text", true, false)])]);
+        let src = meta(vec![
+            ("orders", vec![col("id", "integer", false, true), col("amount", "numeric(12,2)", false, false), col("note", "text", true, false)]),
+            ("customers", vec![col("id", "integer", false, true)]),
+        ]);
+        let dst = meta(vec![
+            ("ORDERS", vec![col("id", "integer", false, true), col("amount", "numeric(10,2)", true, false), col("legacy", "text", true, false)]),
+            ("old_log", vec![col("x", "text", true, false)]),
+        ]);
         let d = diff_metadata(&src, &dst);
         let by = |n: &str| d.iter().find(|x| x.name.eq_ignore_ascii_case(n)).unwrap();
         assert_eq!(by("customers").status, DiffStatus::OnlySource);
@@ -338,6 +380,10 @@ mod tests {
         assert!(s.contains("-- DROP TABLE \"public\".\"old_log\";"), "{s}");
 
         let m = migration_script(ConnectorKind::Mssql, "dbo", "dev", &src, &d, false);
-        assert!(m.contains("ALTER TABLE \"dbo\".\"orders\" ALTER COLUMN \"amount\" numeric(12,2) NOT NULL;") || m.contains("ALTER TABLE [dbo].[orders] ALTER COLUMN [amount] numeric(12,2) NOT NULL;"), "{m}");
+        assert!(
+            m.contains("ALTER TABLE \"dbo\".\"orders\" ALTER COLUMN \"amount\" numeric(12,2) NOT NULL;")
+                || m.contains("ALTER TABLE [dbo].[orders] ALTER COLUMN [amount] numeric(12,2) NOT NULL;"),
+            "{m}"
+        );
     }
 }

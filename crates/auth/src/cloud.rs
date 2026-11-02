@@ -23,13 +23,9 @@ struct ServiceAccountKey {
 
 /// Exchange a Google service-account JSON key for an access token.
 pub async fn google_service_account(json: &str, scopes: &[String]) -> Result<TokenSet, AuthError> {
-    let key: ServiceAccountKey = serde_json::from_str(json)
-        .map_err(|e| AuthError::Invalid(format!("invalid service account JSON: {e}")))?;
+    let key: ServiceAccountKey = serde_json::from_str(json).map_err(|e| AuthError::Invalid(format!("invalid service account JSON: {e}")))?;
     let rsa = crate::jwt::parse_private_key(&key.private_key, None)?;
-    let token_uri = key
-        .token_uri
-        .clone()
-        .unwrap_or_else(|| GOOGLE_TOKEN_URL.into());
+    let token_uri = key.token_uri.clone().unwrap_or_else(|| GOOGLE_TOKEN_URL.into());
     let iat = now_secs();
     let mut header = serde_json::json!({"alg": "RS256", "typ": "JWT"});
     if let Some(kid) = &key.private_key_id {
@@ -45,31 +41,17 @@ pub async fn google_service_account(json: &str, scopes: &[String]) -> Result<Tok
     let assertion = crate::jwt::sign_rs256(&rsa, &header, &claims)?;
     let resp = oauth::http()
         .post(&token_uri)
-        .form(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-            ("assertion", assertion.as_str()),
-        ])
+        .form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", assertion.as_str())])
         .send()
         .await
         .map_err(|e| AuthError::Network(e.to_string()))?;
     let status = resp.status();
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| AuthError::Network(e.to_string()))?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| AuthError::Network(e.to_string()))?;
     if !status.is_success() {
-        return Err(AuthError::Flow(format!(
-            "Google token exchange failed: {}",
-            body.get("error_description")
-                .or(body.get("error"))
-                .unwrap_or(&body)
-        )));
+        return Err(AuthError::Flow(format!("Google token exchange failed: {}", body.get("error_description").or(body.get("error")).unwrap_or(&body))));
     }
     Ok(TokenSet {
-        access_token: body["access_token"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
+        access_token: body["access_token"].as_str().unwrap_or_default().to_string(),
         refresh_token: None,
         expires_at: body["expires_in"].as_u64().map(|s| now_secs() + s),
         identity: Some(key.client_email),
@@ -84,25 +66,14 @@ fn adc_path() -> Option<PathBuf> {
     let base = std::env::var("APPDATA").ok().map(PathBuf::from);
     #[cfg(not(windows))]
     let base = dirs::home_dir().map(|h| h.join(".config"));
-    Some(
-        base?
-            .join("gcloud")
-            .join("application_default_credentials.json"),
-    )
+    Some(base?.join("gcloud").join("application_default_credentials.json"))
 }
 
 /// Google Application Default Credentials (`gcloud auth application-default login`).
 pub async fn google_adc(scopes: &[String]) -> Result<TokenSet, AuthError> {
-    let path = adc_path()
-        .ok_or_else(|| AuthError::NotFound("gcloud application default credentials".into()))?;
-    let text = std::fs::read_to_string(&path).map_err(|_| {
-        AuthError::NotFound(format!(
-            "{} (run `gcloud auth application-default login`)",
-            path.display()
-        ))
-    })?;
-    let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| AuthError::Invalid(e.to_string()))?;
+    let path = adc_path().ok_or_else(|| AuthError::NotFound("gcloud application default credentials".into()))?;
+    let text = std::fs::read_to_string(&path).map_err(|_| AuthError::NotFound(format!("{} (run `gcloud auth application-default login`)", path.display())))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| AuthError::Invalid(e.to_string()))?;
     match v["type"].as_str() {
         Some("service_account") => google_service_account(&text, scopes).await,
         Some("authorized_user") => {
@@ -122,19 +93,12 @@ pub async fn google_adc(scopes: &[String]) -> Result<TokenSet, AuthError> {
                 extra_authorize_params: vec![],
                 client_auth: ClientAuthStyle::Body,
             };
-            let rt = v["refresh_token"]
-                .as_str()
-                .ok_or_else(|| AuthError::Invalid("ADC file has no refresh_token".into()))?;
+            let rt = v["refresh_token"].as_str().ok_or_else(|| AuthError::Invalid("ADC file has no refresh_token".into()))?;
             let mut t = oauth::refresh(&cfg, rt).await?;
-            t.identity = v["account"]
-                .as_str()
-                .map(str::to_string)
-                .or(Some("gcloud ADC".into()));
+            t.identity = v["account"].as_str().map(str::to_string).or(Some("gcloud ADC".into()));
             Ok(t)
         }
-        other => Err(AuthError::Invalid(format!(
-            "unsupported ADC credential type {other:?}"
-        ))),
+        other => Err(AuthError::Invalid(format!("unsupported ADC credential type {other:?}"))),
     }
 }
 
@@ -155,10 +119,7 @@ pub fn parse_databrickscfg(text: &str) -> Vec<DatabricksProfile> {
             continue;
         }
         if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            out.push(DatabricksProfile {
-                name: name.trim().to_string(),
-                ..Default::default()
-            });
+            out.push(DatabricksProfile { name: name.trim().to_string(), ..Default::default() });
             continue;
         }
         let Some((k, v)) = line.split_once('=') else {
@@ -177,40 +138,22 @@ pub fn parse_databrickscfg(text: &str) -> Vec<DatabricksProfile> {
 }
 
 fn normalize_host(h: &str) -> String {
-    h.trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
+    h.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_ascii_lowercase()
 }
 
 /// Credentials from the Databricks CLI: a PAT from `~/.databrickscfg`, or an
 /// OAuth token from `databricks auth token` (after `databricks auth login`).
 pub async fn databricks_cli(profile: Option<&str>, host: &str) -> Result<TokenSet, AuthError> {
-    let path = std::env::var("DATABRICKS_CONFIG_FILE")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".databrickscfg")));
-    let profiles = path
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| parse_databrickscfg(&t))
-        .unwrap_or_default();
+    let path = std::env::var("DATABRICKS_CONFIG_FILE").map(PathBuf::from).ok().or_else(|| dirs::home_dir().map(|h| h.join(".databrickscfg")));
+    let profiles = path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).map(|t| parse_databrickscfg(&t)).unwrap_or_default();
     let want = normalize_host(host);
     let chosen = match profile.filter(|p| !p.is_empty()) {
         Some(name) => profiles.iter().find(|p| p.name == name),
-        None => profiles
-            .iter()
-            .find(|p| p.host.as_deref().map(normalize_host) == Some(want.clone())),
+        None => profiles.iter().find(|p| p.host.as_deref().map(normalize_host) == Some(want.clone())),
     };
     if let Some(p) = chosen {
         if let Some(t) = &p.token {
-            return Ok(TokenSet {
-                access_token: t.clone(),
-                refresh_token: None,
-                expires_at: None,
-                identity: Some(format!("databricks profile {}", p.name)),
-            });
+            return Ok(TokenSet { access_token: t.clone(), refresh_token: None, expires_at: None, identity: Some(format!("databricks profile {}", p.name)) });
         }
     }
     let mut cmd = tokio::process::Command::new("databricks");
@@ -223,19 +166,11 @@ pub async fn databricks_cli(profile: Option<&str>, host: &str) -> Result<TokenSe
             cmd.args(["--host", &format!("https://{want}")]);
         }
     }
-    let out = cmd.output().await.map_err(|e| {
-        AuthError::NotFound(format!(
-            "Databricks CLI not available ({e}); install it and run `databricks auth login`"
-        ))
-    })?;
+    let out = cmd.output().await.map_err(|e| AuthError::NotFound(format!("Databricks CLI not available ({e}); install it and run `databricks auth login`")))?;
     if !out.status.success() {
-        return Err(AuthError::Flow(format!(
-            "`databricks auth token` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        return Err(AuthError::Flow(format!("`databricks auth token` failed: {}", String::from_utf8_lossy(&out.stderr).trim())));
     }
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| AuthError::Flow(e.to_string()))?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| AuthError::Flow(e.to_string()))?;
     Ok(TokenSet {
         access_token: v["access_token"].as_str().unwrap_or_default().to_string(),
         refresh_token: None,
@@ -402,29 +337,14 @@ pub async fn redshift_cli(profile: Option<&str>, target: &RedshiftTarget) -> Res
 /// Access token from `az account get-access-token`.
 pub async fn azure_cli(resource: &str) -> Result<TokenSet, AuthError> {
     let out = tokio::process::Command::new("az")
-        .args([
-            "account",
-            "get-access-token",
-            "--resource",
-            resource,
-            "--output",
-            "json",
-        ])
+        .args(["account", "get-access-token", "--resource", resource, "--output", "json"])
         .output()
         .await
-        .map_err(|e| {
-            AuthError::NotFound(format!(
-                "Azure CLI not available ({e}); install it and run `az login`"
-            ))
-        })?;
+        .map_err(|e| AuthError::NotFound(format!("Azure CLI not available ({e}); install it and run `az login`")))?;
     if !out.status.success() {
-        return Err(AuthError::Flow(format!(
-            "`az account get-access-token` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+        return Err(AuthError::Flow(format!("`az account get-access-token` failed: {}", String::from_utf8_lossy(&out.stderr).trim())));
     }
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| AuthError::Flow(e.to_string()))?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| AuthError::Flow(e.to_string()))?;
     Ok(TokenSet {
         access_token: v["accessToken"].as_str().unwrap_or_default().to_string(),
         refresh_token: None,
@@ -454,7 +374,10 @@ mod tests {
         assert!(redshift_args(None, &s).unwrap().join(" ").starts_with("redshift-serverless get-credentials --workgroup-name wg1 --db-name dev"));
         assert!(matches!(redshift_args(None, &RedshiftTarget::default()), Err(AuthError::Invalid(_))));
 
-        let t = parse_redshift_credentials(br#"{"DbUser": "IAM:alice", "DbPassword": "pw", "Expiration": "2026-11-01T12:00:00+00:00", "NextRefreshTime": "2026-11-01T23:00:00+00:00"}"#).unwrap();
+        let t = parse_redshift_credentials(
+            br#"{"DbUser": "IAM:alice", "DbPassword": "pw", "Expiration": "2026-11-01T12:00:00+00:00", "NextRefreshTime": "2026-11-01T23:00:00+00:00"}"#,
+        )
+        .unwrap();
         assert_eq!((t.access_token.as_str(), t.identity.as_deref(), t.expires_at), ("pw", Some("IAM:alice"), Some(1_793_534_400)));
         let s = parse_redshift_credentials(br#"{"dbUser": "IAMR:role", "dbPassword": "pw2", "expiration": "2026-11-01T13:30:00.5-01:30"}"#).unwrap();
         assert_eq!((s.identity.as_deref(), s.expires_at), (Some("IAMR:role"), Some(1_793_534_400 + 3 * 3600)));
@@ -469,9 +392,6 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].token.as_deref(), Some("dapi123"));
         assert_eq!(p[1].auth_type.as_deref(), Some("databricks-cli"));
-        assert_eq!(
-            normalize_host(p[0].host.as_deref().unwrap()),
-            "adb-1.azuredatabricks.net"
-        );
+        assert_eq!(normalize_host(p[0].host.as_deref().unwrap()), "adb-1.azuredatabricks.net");
     }
 }

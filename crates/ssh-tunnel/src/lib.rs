@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 pub enum TunnelError {
     #[error("SSH connection to {0} failed: {1}")]
     Connect(String, String),
-    #[error("SSH host key mismatch for {host}: expected {expected}, got {actual}. The server key changed; if this is expected, clear the saved fingerprint in the connection's SSH settings.")]
+    #[error(
+        "SSH host key mismatch for {host}: expected {expected}, got {actual}. The server key changed; if this is expected, clear the saved fingerprint in the connection's SSH settings."
+    )]
     HostKeyMismatch { host: String, expected: String, actual: String },
     #[error("SSH authentication failed for {0}")]
     AuthFailed(String),
@@ -82,16 +84,9 @@ impl Tunnel {
 
     pub async fn open(spec: TunnelSpec<'_>) -> Result<Tunnel, TunnelError> {
         let addr = format!("{}:{}", spec.ssh_host, spec.ssh_port);
-        let config = Arc::new(client::Config {
-            inactivity_timeout: None,
-            keepalive_interval: Some(Duration::from_secs(30)),
-            ..Default::default()
-        });
+        let config = Arc::new(client::Config { inactivity_timeout: None, keepalive_interval: Some(Duration::from_secs(30)), ..Default::default() });
         let seen = Arc::new(Mutex::new(None));
-        let handler = Verifier {
-            expected: spec.expected_fingerprint.map(str::to_string),
-            seen: seen.clone(),
-        };
+        let handler = Verifier { expected: spec.expected_fingerprint.map(str::to_string), seen: seen.clone() };
         let connect = client::connect(config, (spec.ssh_host, spec.ssh_port), handler);
         let mut session = match tokio::time::timeout(Duration::from_secs(20), connect).await {
             Err(_) => return Err(TunnelError::Connect(addr, "timed out".into())),
@@ -109,11 +104,9 @@ impl Tunnel {
         let fingerprint = seen.lock().expect("poisoned").clone().unwrap_or_default();
 
         let ok = match (spec.auth, &spec.secret) {
-            (SshAuth::Password, SshSecret::Password(p)) => session
-                .authenticate_password(spec.user, p.clone())
-                .await
-                .map_err(|e| TunnelError::Other(e.to_string()))?
-                .success(),
+            (SshAuth::Password, SshSecret::Password(p)) => {
+                session.authenticate_password(spec.user, p.clone()).await.map_err(|e| TunnelError::Other(e.to_string()))?.success()
+            }
             (SshAuth::Password, _) => {
                 return Err(TunnelError::Other("SSH password is not set".into()));
             }
@@ -123,13 +116,8 @@ impl Tunnel {
                     _ => None,
                 };
                 let path = expand_home(path);
-                let key = russh::keys::load_secret_key(&path, pass)
-                    .map_err(|e| TunnelError::Other(format!("cannot load SSH key {path}: {e}")))?;
-                let hash = session
-                    .best_supported_rsa_hash()
-                    .await
-                    .map_err(|e| TunnelError::Other(e.to_string()))?
-                    .flatten();
+                let key = russh::keys::load_secret_key(&path, pass).map_err(|e| TunnelError::Other(format!("cannot load SSH key {path}: {e}")))?;
+                let hash = session.best_supported_rsa_hash().await.map_err(|e| TunnelError::Other(e.to_string()))?.flatten();
                 session
                     .authenticate_publickey(spec.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
                     .await
@@ -142,9 +130,7 @@ impl Tunnel {
             return Err(TunnelError::AuthFailed(format!("{}@{}", spec.user, addr)));
         }
 
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .map_err(|e| TunnelError::Other(format!("cannot open local tunnel port: {e}")))?;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.map_err(|e| TunnelError::Other(format!("cannot open local tunnel port: {e}")))?;
         let local_port = listener.local_addr().map_err(|e| TunnelError::Other(e.to_string()))?.port();
         let session = Arc::new(session);
         let cancel = CancellationToken::new();
@@ -161,10 +147,7 @@ impl Tunnel {
                 let (h, p) = (target_host.clone(), target_port);
                 let c = c.clone();
                 tokio::spawn(async move {
-                    let ch = match s
-                        .channel_open_direct_tcpip(h, p as u32, peer.ip().to_string(), peer.port() as u32)
-                        .await
-                    {
+                    let ch = match s.channel_open_direct_tcpip(h, p as u32, peer.ip().to_string(), peer.port() as u32).await {
                         Ok(ch) => ch,
                         Err(_) => return,
                     };
@@ -217,15 +200,8 @@ async fn connect_agent() -> Result<DynAgent, TunnelError> {
 
 async fn agent_auth(session: &mut Handle<Verifier>, user: &str) -> Result<bool, TunnelError> {
     let mut agent = connect_agent().await?;
-    let ids = agent
-        .request_identities()
-        .await
-        .map_err(|e| TunnelError::Other(e.to_string()))?;
-    let hash = session
-        .best_supported_rsa_hash()
-        .await
-        .map_err(|e| TunnelError::Other(e.to_string()))?
-        .flatten();
+    let ids = agent.request_identities().await.map_err(|e| TunnelError::Other(e.to_string()))?;
+    let hash = session.best_supported_rsa_hash().await.map_err(|e| TunnelError::Other(e.to_string()))?.flatten();
     for id in ids {
         let key = id.public_key().into_owned();
         if let Ok(r) = session.authenticate_publickey_with(user, key, hash, &mut agent).await {
@@ -390,11 +366,8 @@ mod tests {
     #[ignore = "live: needs DATABRAIN_SSH_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_tunnel() {
-        let (Ok(host), Ok(user), Ok(pw)) = (
-            std::env::var("DATABRAIN_SSH_HOST"),
-            std::env::var("DATABRAIN_SSH_USER"),
-            std::env::var("DATABRAIN_SSH_PASSWORD"),
-        ) else {
+        let (Ok(host), Ok(user), Ok(pw)) = (std::env::var("DATABRAIN_SSH_HOST"), std::env::var("DATABRAIN_SSH_USER"), std::env::var("DATABRAIN_SSH_PASSWORD"))
+        else {
             panic!("live test: DATABRAIN_SSH_* not set (run with --ignored)");
         };
         let t = Tunnel::open(TunnelSpec {

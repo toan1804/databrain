@@ -14,9 +14,9 @@ use databrain_connector_core::arrow::array::{Array, RecordBatch};
 use databrain_connector_core::arrow::datatypes::SchemaRef;
 use databrain_connector_core::value::Column;
 use databrain_connector_core::{
-    Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind,
-    DbObject, ExecOptions, ExecSummary, FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result,
-    SchemaInfo, SchemaMetadata, Session, StreamEvent, StreamSender, TableColumns, quote_ident, quote_literal,
+    Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ExecOptions, ExecSummary,
+    FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, SchemaMetadata, Session, StreamEvent, StreamSender, TableColumns, quote_ident,
+    quote_literal,
 };
 use secrecy::ExposeSecret;
 use serde_json::json;
@@ -41,15 +41,8 @@ fn warehouse_id(cfg: &ConnectionConfig) -> Result<String> {
     if let Some(id) = cfg.opt("warehouse_id") {
         return Ok(id.to_string());
     }
-    let path = cfg
-        .opt("http_path")
-        .ok_or_else(|| ConnectorError::config("Databricks needs the SQL warehouse HTTP path (e.g. /sql/1.0/warehouses/abc123)"))?;
-    path.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| ConnectorError::config("invalid HTTP path"))
+    let path = cfg.opt("http_path").ok_or_else(|| ConnectorError::config("Databricks needs the SQL warehouse HTTP path (e.g. /sql/1.0/warehouses/abc123)"))?;
+    path.trim_end_matches('/').rsplit('/').next().filter(|s| !s.is_empty()).map(str::to_string).ok_or_else(|| ConnectorError::config("invalid HTTP path"))
 }
 
 #[async_trait]
@@ -279,10 +272,7 @@ impl Inner {
 
     /// Next chunk after `chunk`, if any (EXTERNAL_LINKS puts the link on the link entry).
     async fn next_chunk(&self, chunk: &serde_json::Value) -> Result<Option<serde_json::Value>> {
-        let next = chunk
-            .get("next_chunk_internal_link")
-            .or_else(|| chunk.pointer("/external_links/0/next_chunk_internal_link"))
-            .and_then(|l| l.as_str());
+        let next = chunk.get("next_chunk_internal_link").or_else(|| chunk.pointer("/external_links/0/next_chunk_internal_link")).and_then(|l| l.as_str());
         match next {
             Some(link) => Ok(Some(self.request(reqwest::Method::GET, format!("{}{link}", self.origin), None).await?)),
             None => Ok(None),
@@ -353,10 +343,7 @@ impl Inner {
                 known.insert(link.chunk_index, link);
             }
         }
-        let total = resp
-            .pointer("/manifest/total_chunk_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or_else(|| known.keys().max().map(|m| m + 1).unwrap_or(0));
+        let total = resp.pointer("/manifest/total_chunk_count").and_then(|v| v.as_u64()).unwrap_or_else(|| known.keys().max().map(|m| m + 1).unwrap_or(0));
         if total == 0 {
             // No rows: schema only.
             if tx.send(StreamEvent::Schema(schema)).await {
@@ -370,9 +357,7 @@ impl Inner {
             async move {
                 let link = known.get(&i).cloned();
                 let bytes = self.chunk_bytes(&id, i, link).await?;
-                tokio::task::spawn_blocking(move || decode_arrow(&bytes, &schema))
-                    .await
-                    .map_err(|e| ConnectorError::internal(e.to_string()))?
+                tokio::task::spawn_blocking(move || decode_arrow(&bytes, &schema)).await.map_err(|e| ConnectorError::internal(e.to_string()))?
             }
         };
         // First chunk before the schema: a blocked link can still fall back.
@@ -447,10 +432,7 @@ impl Inner {
                 }
             }
         }
-        Err(ConnectorError::connection(format!(
-            "result chunk {i} download failed after retries: {}",
-            last.unwrap_or_else(|| "unknown error".into())
-        )))
+        Err(ConnectorError::connection(format!("result chunk {i} download failed after retries: {}", last.unwrap_or_else(|| "unknown error".into()))))
     }
 
     /// Fresh download link for chunk `i` from the statement API.
@@ -461,11 +443,7 @@ impl Inner {
 
     /// One GET of a presigned URL (no Authorization header; the URL is never logged).
     async fn get_bytes(&self, url: &str) -> std::result::Result<Vec<u8>, FetchFail> {
-        let net = |e: reqwest::Error| FetchFail {
-            class: Retry::Transient,
-            retry_after: None,
-            message: redact_url(&crate::common::error_chain(&e)),
-        };
+        let net = |e: reqwest::Error| FetchFail { class: Retry::Transient, retry_after: None, message: redact_url(&crate::common::error_chain(&e)) };
         let resp = self.storage.get(url).send().await.map_err(net)?;
         let status = resp.status();
         if !status.is_success() {
@@ -710,7 +688,13 @@ fn redact_url(s: &str) -> String {
 fn links_notice(resp: &serde_json::Value) -> Option<String> {
     let m = |p: &str| resp.pointer(p).and_then(|v| v.as_u64());
     let link = resp.pointer("/result/external_links/0/external_link").and_then(|v| v.as_str());
-    crate::common::large_result_notice("Databricks", m("/manifest/total_byte_count"), m("/manifest/total_row_count"), m("/manifest/total_chunk_count").unwrap_or(1), link)
+    crate::common::large_result_notice(
+        "Databricks",
+        m("/manifest/total_byte_count"),
+        m("/manifest/total_row_count"),
+        m("/manifest/total_chunk_count").unwrap_or(1),
+        link,
+    )
 }
 
 /// Result columns from the statement manifest.
@@ -762,7 +746,11 @@ fn decode_arrow(bytes: &[u8], schema: &SchemaRef) -> Result<Vec<RecordBatch>> {
                 if col.data_type() == f.data_type() {
                     return Ok(col.clone());
                 }
-                let direct = if col.data_type().is_nested() { None } else { cast_with_options(col, f.data_type(), &CastOptions { safe: true, ..Default::default() }).ok() };
+                let direct = if col.data_type().is_nested() {
+                    None
+                } else {
+                    cast_with_options(col, f.data_type(), &CastOptions { safe: true, ..Default::default() }).ok()
+                };
                 match direct {
                     Some(a) if a.null_count() == col.null_count() => Ok(a),
                     // Nested values or casts that lose data: their text form.
@@ -909,7 +897,11 @@ impl Session for DbxSession {
                 Some(DbObject {
                     schema: format!("{}.{}", cell(r, 0)?, cell(r, 1)?),
                     name: cell(r, 2)?,
-                    kind: if t.contains("VIEW") { if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else { ObjectKind::Table },
+                    kind: if t.contains("VIEW") {
+                        if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View }
+                    } else {
+                        ObjectKind::Table
+                    },
                     comment: cell(r, 4),
                     row_estimate: None,
                 })
@@ -942,7 +934,11 @@ impl Session for DbxSession {
                 Some(DbObject {
                     schema: schema.to_string(),
                     name,
-                    kind: if t.contains("VIEW") { if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else { ObjectKind::Table },
+                    kind: if t.contains("VIEW") {
+                        if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View }
+                    } else {
+                        ObjectKind::Table
+                    },
                     comment: cell(r, 2),
                     row_estimate: None,
                 })
@@ -955,7 +951,9 @@ impl Session for DbxSession {
             quote_literal(sch)
         );
         if let Ok(rows) = self.0.run_small(&q).await {
-            out.extend(rows.iter().filter_map(|r| Some(DbObject { schema: schema.to_string(), name: cell(r, 0)?, kind: ObjectKind::Function, comment: cell(r, 1), row_estimate: None })));
+            out.extend(rows.iter().filter_map(|r| {
+                Some(DbObject { schema: schema.to_string(), name: cell(r, 0)?, kind: ObjectKind::Function, comment: cell(r, 1), row_estimate: None })
+            }));
         }
         Ok(out)
     }
@@ -982,7 +980,11 @@ impl Session for DbxSession {
                 Some(DbObject {
                     schema: schema.to_string(),
                     name: cell(r, 0)?,
-                    kind: if t.contains("VIEW") { if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else { ObjectKind::Table },
+                    kind: if t.contains("VIEW") {
+                        if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View }
+                    } else {
+                        ObjectKind::Table
+                    },
                     comment: cell(r, 2),
                     row_estimate: None,
                 })
@@ -993,7 +995,7 @@ impl Session for DbxSession {
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
-        use databrain_connector_core::{parse_list_text, query_table, TableLayout};
+        use databrain_connector_core::{TableLayout, parse_list_text, query_table};
         let full = format!("{}.{}", databrain_connector_core::quote_path(ConnectorKind::Databricks, schema), quote_ident(ConnectorKind::Databricks, name));
         let mut l = TableLayout::default();
         // Views and non-Delta tables have no detail: no hints, not an error.
@@ -1022,12 +1024,7 @@ impl Session for DbxSession {
         let cols = self.0.schema_columns_filtered(schema, Some(name)).await?;
         let columns = cols.into_iter().next().map(|t| t.columns).unwrap_or_default();
         let full = format!("{}.{}", databrain_connector_core::quote_path(ConnectorKind::Databricks, schema), quote_ident(ConnectorKind::Databricks, name));
-        let ddl = self
-            .0
-            .run_small(&format!("SHOW CREATE TABLE {full}"))
-            .await
-            .ok()
-            .and_then(|r| r.first().and_then(|r| cell(r, 0)));
+        let ddl = self.0.run_small(&format!("SHOW CREATE TABLE {full}")).await.ok().and_then(|r| r.first().and_then(|r| cell(r, 0)));
         Ok(ObjectDetail { object, columns, ddl, foreign_keys: vec![] })
     }
 
@@ -1082,19 +1079,11 @@ impl Session for DbxSession {
     }
 
     async fn schema_object_counts(&self) -> Result<Option<std::collections::HashMap<String, usize>>> {
-        let rows = match self
-            .0
-            .run_small("SELECT table_catalog, table_schema, count(*) FROM system.information_schema.tables GROUP BY 1, 2")
-            .await
-        {
+        let rows = match self.0.run_small("SELECT table_catalog, table_schema, count(*) FROM system.information_schema.tables GROUP BY 1, 2").await {
             Ok(r) => r,
             Err(_) => return Ok(None),
         };
-        Ok(Some(
-            rows.iter()
-                .filter_map(|r| Some((format!("{}.{}", cell(r, 0)?, cell(r, 1)?), cell(r, 2)?.parse().ok()?)))
-                .collect(),
-        ))
+        Ok(Some(rows.iter().filter_map(|r| Some((format!("{}.{}", cell(r, 0)?, cell(r, 1)?), cell(r, 2)?.parse().ok()?))).collect()))
     }
 }
 
@@ -1103,9 +1092,7 @@ impl Inner {
         let list = schemas.iter().map(|s| quote_literal(s)).collect::<Vec<_>>().join(", ");
         let cq = quote_ident(ConnectorKind::Databricks, cat);
         let tables = self
-            .run_small(&format!(
-                "SELECT table_schema, table_name, table_type, comment FROM {cq}.information_schema.tables WHERE table_schema IN ({list})"
-            ))
+            .run_small(&format!("SELECT table_schema, table_name, table_type, comment FROM {cq}.information_schema.tables WHERE table_schema IN ({list})"))
             .await?;
         let cols = self
             .run_small(&format!(
@@ -1113,10 +1100,8 @@ impl Inner {
                  WHERE table_schema IN ({list}) ORDER BY table_schema, table_name, ordinal_position"
             ))
             .await?;
-        let mut out: Vec<SchemaMetadata> = schemas
-            .iter()
-            .map(|s| SchemaMetadata { schema: format!("{cat}.{s}"), objects: vec![], columns: vec![], error: None })
-            .collect();
+        let mut out: Vec<SchemaMetadata> =
+            schemas.iter().map(|s| SchemaMetadata { schema: format!("{cat}.{s}"), objects: vec![], columns: vec![], error: None }).collect();
         let idx = |s: &str| schemas.iter().position(|x| x == s);
         for r in &tables {
             let (Some(s), Some(name)) = (cell(r, 0), cell(r, 1)) else { continue };
@@ -1126,7 +1111,11 @@ impl Inner {
             out[i].objects.push(DbObject {
                 schema,
                 name,
-                kind: if t.contains("VIEW") { if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View } } else { ObjectKind::Table },
+                kind: if t.contains("VIEW") {
+                    if t.contains("MATERIALIZED") { ObjectKind::MaterializedView } else { ObjectKind::View }
+                } else {
+                    ObjectKind::Table
+                },
                 comment: cell(r, 3),
                 row_estimate: None,
             });
@@ -1217,11 +1206,9 @@ mod tests {
     #[ignore = "live: needs DATABRAIN_DBX_HOST (cargo test -- --ignored)"]
     #[tokio::test]
     async fn live_roundtrip() {
-        let (Ok(host), Ok(path), Ok(token)) = (
-            std::env::var("DATABRAIN_DBX_HOST"),
-            std::env::var("DATABRAIN_DBX_HTTP_PATH"),
-            std::env::var("DATABRAIN_DBX_TOKEN"),
-        ) else {
+        let (Ok(host), Ok(path), Ok(token)) =
+            (std::env::var("DATABRAIN_DBX_HOST"), std::env::var("DATABRAIN_DBX_HTTP_PATH"), std::env::var("DATABRAIN_DBX_TOKEN"))
+        else {
             panic!("live test: DATABRAIN_DBX_* not set (run with --ignored)");
         };
         use databrain_auth::InlineCredentialSource;
@@ -1285,7 +1272,10 @@ mod tests {
             let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true), Field::new("s", DataType::Utf8, true)]));
             let b = RecordBatch::try_new(
                 schema.clone(),
-                vec![Arc::new(Int32Array::from(vec![(i * 2) as i32, (i * 2 + 1) as i32])), Arc::new(StringArray::from(vec![Some(format!("r{}", i * 2)), None]))],
+                vec![
+                    Arc::new(Int32Array::from(vec![(i * 2) as i32, (i * 2 + 1) as i32])),
+                    Arc::new(StringArray::from(vec![Some(format!("r{}", i * 2)), None])),
+                ],
             )
             .unwrap();
             let mut buf = Vec::new();
@@ -1319,7 +1309,10 @@ mod tests {
                             buf.extend_from_slice(&tmp[..n]);
                             if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                                 let head = String::from_utf8_lossy(&buf[..i]).to_string();
-                                let len = head.lines().find_map(|h| h.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                                let len = head
+                                    .lines()
+                                    .find_map(|h| h.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                                    .unwrap_or(0);
                                 while buf.len() < i + 4 + len {
                                     let n = sock.read(&mut tmp).await.unwrap_or(0);
                                     if n == 0 {
@@ -1338,7 +1331,11 @@ mod tests {
                         // Arrow results: CHUNKS chunks (links via the chunk API); JSON: 2 chunks.
                         // "stale_links": the statement response carries already-expired links.
                         let link_at = |i: u32, next: bool, fmt: &str, fresh: bool| {
-                            let (sig, exp) = if fresh { ("secret", chrono::Utc::now() + chrono::Duration::minutes(10)) } else { ("old", chrono::Utc::now() - chrono::Duration::minutes(1)) };
+                            let (sig, exp) = if fresh {
+                                ("secret", chrono::Utc::now() + chrono::Duration::minutes(10))
+                            } else {
+                                ("old", chrono::Utc::now() - chrono::Duration::minutes(1))
+                            };
                             let mut e = json!({"chunk_index": i, "external_link": format!("{o}/blob/{fmt}/{i}?sig={sig}"), "row_count": 2, "expiration": exp.to_rfc3339()});
                             if next {
                                 e["next_chunk_internal_link"] = json!(format!("/api/2.0/sql/statements/st1/result/chunks/{}", i + 1));
@@ -1352,14 +1349,23 @@ mod tests {
                         let (status, out) = if method == "POST" && path == "/api/2.0/sql/statements" {
                             let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
                             if v["disposition"] == "INLINE" {
-                                (200, json!({"statement_id": "st2", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols}, "result": {"data_array": [["7", "inline"]]}}))
+                                (
+                                    200,
+                                    json!({"statement_id": "st2", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols}, "result": {"data_array": [["7", "inline"]]}}),
+                                )
                             } else if v["format"] == "ARROW_STREAM" && blob_mode == "no_arrow" {
                                 (400, json!({"message": "ARROW_STREAM format is not supported for this warehouse"}))
                             } else if v["format"] == "ARROW_STREAM" {
                                 *lg.lock().unwrap().arrow_posts.get_or_insert(0) += 1;
-                                (200, json!({"statement_id": "st1", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols, "total_chunk_count": CHUNKS}, "result": first("arrow", false)}))
+                                (
+                                    200,
+                                    json!({"statement_id": "st1", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols, "total_chunk_count": CHUNKS}, "result": first("arrow", false)}),
+                                )
                             } else {
-                                (200, json!({"statement_id": "st1", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols}, "result": first("json", true)}))
+                                (
+                                    200,
+                                    json!({"statement_id": "st1", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols}, "result": first("json", true)}),
+                                )
                             }
                         } else if let Some(i) = path.strip_prefix("/api/2.0/sql/statements/st1/result/chunks/") {
                             let i: u32 = i.parse().unwrap();
@@ -1403,7 +1409,10 @@ mod tests {
                             (404, json!({"message": "not found"}))
                         };
                         let body = raw.unwrap_or_else(|| out.to_string().into_bytes());
-                        let head = format!("HTTP/1.1 {status} X\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                        let head = format!(
+                            "HTTP/1.1 {status} X\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            body.len()
+                        );
                         let _ = sock.write_all(head.as_bytes()).await;
                         let _ = sock.write_all(&body).await;
                     });

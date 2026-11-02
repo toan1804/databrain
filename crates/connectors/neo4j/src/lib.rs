@@ -15,9 +15,8 @@ use databrain_connector_core::documents::{Cell, Row, RowBatcher};
 use databrain_connector_core::traits::{NEO4J_NODES, NEO4J_RELATIONSHIPS};
 use databrain_connector_core::value::days_from_civil;
 use databrain_connector_core::{
-    Capabilities, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind,
-    ExecOptions, ExecSummary, FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, Value,
-    quote_ident,
+    Capabilities, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind, ExecOptions, ExecSummary,
+    FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, Value, quote_ident,
 };
 use neo4rs::{BoltMap, BoltType, ConfigBuilder, Graph, query};
 use secrecy::ExposeSecret;
@@ -474,16 +473,29 @@ impl Session for Neo4jSession {
             _ => None,
         });
         let mut ddl: Vec<String> = Vec::new();
-        for show in ["SHOW CONSTRAINTS YIELD labelsOrTypes, createStatement WHERE $l IN labelsOrTypes RETURN createStatement", "SHOW INDEXES YIELD labelsOrTypes, owningConstraint, createStatement WHERE $l IN labelsOrTypes AND owningConstraint IS NULL RETURN createStatement"] {
+        for show in [
+            "SHOW CONSTRAINTS YIELD labelsOrTypes, createStatement WHERE $l IN labelsOrTypes RETURN createStatement",
+            "SHOW INDEXES YIELD labelsOrTypes, owningConstraint, createStatement WHERE $l IN labelsOrTypes AND owningConstraint IS NULL RETURN createStatement",
+        ] {
             if let Ok(s) = self.strings(query(show).param("l", name), "createStatement").await {
                 ddl.extend(s.into_iter().map(|x| format!("{x};")));
             }
         }
-        let object = DbObject { schema: schema.to_string(), name: name.to_string(), kind: if rel { ObjectKind::View } else { ObjectKind::Table }, comment: None, row_estimate };
+        let object = DbObject {
+            schema: schema.to_string(),
+            name: name.to_string(),
+            kind: if rel { ObjectKind::View } else { ObjectKind::Table },
+            comment: None,
+            row_estimate,
+        };
         Ok(ObjectDetail {
             object,
             columns,
-            ddl: Some(if ddl.is_empty() { format!("// No constraints or indexes on {}{q}", if rel { "relationship type " } else { ":" }) } else { ddl.join("\n") }),
+            ddl: Some(if ddl.is_empty() {
+                format!("// No constraints or indexes on {}{q}", if rel { "relationship type " } else { ":" })
+            } else {
+                ddl.join("\n")
+            }),
             foreign_keys: vec![],
         })
     }

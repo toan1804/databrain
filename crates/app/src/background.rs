@@ -56,7 +56,9 @@ impl crate::ai_api::UiBridge for NoUi {
 /// The app's state without a window, as `kind` (`cli`): same workspace,
 /// passwords, DuckDB extensions and Oracle driver as the desktop app.
 pub fn headless_state(dir: &Path) -> Result<AppState> {
-    let workspace = Arc::new(Workspace::open(dir.join("workspace.db")).map_err(|e| EngineError::new("internal", format!("cannot open the workspace in {}: {e}", dir.display())))?);
+    let workspace = Arc::new(
+        Workspace::open(dir.join("workspace.db")).map_err(|e| EngineError::new("internal", format!("cannot open the workspace in {}: {e}", dir.display())))?,
+    );
     let store = Arc::new(SwitchableStore::new(api::saved_store_kind(&workspace), dir));
     let mut state = AppState::new(workspace, store.clone(), Arc::new(Quiet), Arc::new(NoUi));
     state.jobs = Arc::new(crate::jobs::JobsState::new("cli"));

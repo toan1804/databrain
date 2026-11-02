@@ -154,13 +154,16 @@ pub fn install_from_file(path: &Path) -> Result<PathBuf> {
 
 fn install_file_into(root: &Path, path: &Path) -> Result<PathBuf> {
     let file = file_name();
-    let want = expected_sha256(&file).ok_or_else(|| ConnectorError::config(format!("No Oracle driver build for this computer ({file}). Use the Instant Client driver instead.")))?;
+    let want = expected_sha256(&file)
+        .ok_or_else(|| ConnectorError::config(format!("No Oracle driver build for this computer ({file}). Use the Instant Client driver instead.")))?;
     let dir = root.join(RELEASE);
     let raw = std::fs::read(path).map_err(|e| ConnectorError::config(format!("cannot read {}: {e}", path.display())))?;
     let bin = if raw.starts_with(&[0x1f, 0x8b]) {
         use std::io::Read;
         let mut out = Vec::new();
-        flate2::read::GzDecoder::new(&raw[..]).read_to_end(&mut out).map_err(|e| ConnectorError::config(format!("{} is not a valid .gz file: {e}", path.display())))?;
+        flate2::read::GzDecoder::new(&raw[..])
+            .read_to_end(&mut out)
+            .map_err(|e| ConnectorError::config(format!("{} is not a valid .gz file: {e}", path.display())))?;
         out
     } else {
         raw
@@ -210,7 +213,8 @@ async fn download_into(root: &Path, base: &str) -> Result<PathBuf> {
     let dir = root.join(RELEASE);
     let file = file_name();
     let want = expected_sha256(&file).ok_or_else(|| {
-        ConnectorError::config(format!("No Oracle driver build for this computer ({file}). Use the Instant Client driver instead.")).with_code("oracle_agent_missing")
+        ConnectorError::config(format!("No Oracle driver build for this computer ({file}). Use the Instant Client driver instead."))
+            .with_code("oracle_agent_missing")
     })?;
     let url = format!("{}/v{RELEASE}/{file}.gz", base.trim_end_matches('/'));
     let hook = PROGRESS.read().unwrap().clone();
@@ -235,12 +239,15 @@ async fn install(dir: &Path, file: &str, want: &str, url: &str, hook: Option<&Pr
     let bin = {
         use std::io::Read;
         let mut out = Vec::new();
-        flate2::read::GzDecoder::new(&gz[..]).read_to_end(&mut out).map_err(|e| ConnectorError::connection(format!("Oracle driver download is corrupt: {e}")))?;
+        flate2::read::GzDecoder::new(&gz[..])
+            .read_to_end(&mut out)
+            .map_err(|e| ConnectorError::connection(format!("Oracle driver download is corrupt: {e}")))?;
         out
     };
     let got = sha256_hex(&bin);
     if got != want {
-        return Err(ConnectorError::connection(format!("Oracle driver checksum mismatch (expected {want}, got {got}); not installed")).with_code("oracle_agent_download"));
+        return Err(ConnectorError::connection(format!("Oracle driver checksum mismatch (expected {want}, got {got}); not installed"))
+            .with_code("oracle_agent_download"));
     }
     write_helper(dir, file, &bin)
 }
@@ -311,7 +318,8 @@ pub fn reply_error(j: &Json) -> ConnectorError {
         return ConnectorError::cancelled();
     }
     let n: u32 = code.strip_prefix("ORA-").and_then(|n| n.parse().ok()).unwrap_or(0);
-    let network = msg.contains("connection refused") || msg.contains("i/o timeout") || msg.contains("broken pipe") || msg.contains("no such host") || msg.contains("EOF");
+    let network =
+        msg.contains("connection refused") || msg.contains("i/o timeout") || msg.contains("broken pipe") || msg.contains("no such host") || msg.contains("EOF");
     let kind = if matches!(n, 1017 | 12154 | 12505 | 12514 | 12541 | 12545 | 12170 | 3113 | 3114 | 3135 | 28000 | 28001) || (n == 0 && network) {
         ErrorKind::Connection
     } else {
@@ -329,13 +337,10 @@ pub fn reply_error(j: &Json) -> ConnectorError {
 
 impl Agent {
     pub async fn spawn(path: &Path) -> Result<Arc<Agent>> {
-        let mut child = Command::new(path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| ConnectorError::connection(format!("cannot start the Oracle driver ({}): {e}", path.display())).with_code("oracle_agent_missing"))?;
+        let mut child =
+            Command::new(path).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn().map_err(|e| {
+                ConnectorError::connection(format!("cannot start the Oracle driver ({}): {e}", path.display())).with_code("oracle_agent_missing")
+            })?;
         let stdin = child.stdin.take().ok_or_else(|| dead("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| dead("no stdout"))?;
         let a = Arc::new(Agent {
@@ -346,7 +351,8 @@ impl Agent {
         });
         let hello = a.call(json!({"op": "hello"})).await?;
         if hello["version"].as_str() != Some(PROTOCOL) {
-            return Err(ConnectorError::connection(format!("Oracle driver speaks protocol {:?}, DataBrain needs {PROTOCOL}", hello["version"])).with_code("oracle_agent_missing"));
+            return Err(ConnectorError::connection(format!("Oracle driver speaks protocol {:?}, DataBrain needs {PROTOCOL}", hello["version"]))
+                .with_code("oracle_agent_missing"));
         }
         Ok(a)
     }

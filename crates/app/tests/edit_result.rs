@@ -25,7 +25,22 @@ impl databrain_app::ai_api::UiBridge for NoUi {
 async fn run(st: &AppState, conn: &str, sql: &str) -> databrain_query_engine::StatementOutcomeView {
     let out = st
         .engine
-        .run_and_wait(&st.hub, RunRequest { connection_id: conn.into(), tab_id: "t".into(), sql: sql.into(), base_offset: 0, row_limit: None, confirmed: true, origin: Default::default(), session_key: None, output_name: None, params: Default::default() }, None)
+        .run_and_wait(
+            &st.hub,
+            RunRequest {
+                connection_id: conn.into(),
+                tab_id: "t".into(),
+                sql: sql.into(),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+            },
+            None,
+        )
         .await
         .unwrap();
     out.into_iter().next_back().unwrap()
@@ -47,7 +62,18 @@ async fn edits_rows_of_a_single_table_result() {
     let dir = tempfile::tempdir().unwrap();
     let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
     c.file_path = Some(dir.path().join("e.db").to_string_lossy().into_owned());
-    let profile = ConnectionProfile { id: String::new(), name: "e".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "e".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
     let conn = api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
     run(&st, &conn, "create table people (id integer primary key, name text, age integer, active boolean)").await;
     run(&st, &conn, "insert into people values (1, 'Ann', 30, 1), (2, 'Bob', 40, 0), (3, 'Cy', 50, 1)").await;
@@ -75,7 +101,10 @@ async fn edits_rows_of_a_single_table_result() {
     // Typed text never becomes SQL: a "number" that isn't one is refused.
     let bad = vec![RowChange::Update { key: vec![Some("1".into())], values: vec![v(3, Some("1; drop table people"))] }];
     assert!(api::edit_preview(&st, &info.id, &t, &bad).unwrap_err().message.contains("not a number"));
-    assert!(api::edit_preview(&st, &info.id, &t, &[RowChange::Update { key: vec![Some("1".into())], values: vec![v(2, Some("9"))] }]).is_err(), "read-only column");
+    assert!(
+        api::edit_preview(&st, &info.id, &t, &[RowChange::Update { key: vec![Some("1".into())], values: vec![v(2, Some("9"))] }]).is_err(),
+        "read-only column"
+    );
 
     let rep = api::apply_edits(&st, &info.id, changes).await.unwrap();
     assert_eq!((rep.statements, rep.rows, rep.in_open_transaction), (3, 3, false));
@@ -134,7 +163,18 @@ async fn follows_foreign_keys_both_ways() {
     let dir = tempfile::tempdir().unwrap();
     let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
     c.file_path = Some(dir.path().join("fk.db").to_string_lossy().into_owned());
-    let profile = ConnectionProfile { id: String::new(), name: "fk".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "fk".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
     let conn = api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
     run(&st, &conn, "create table customers (id integer primary key, name text)").await;
     run(&st, &conn, "create table orders (id integer primary key, customer_id integer references customers(id), amount real)").await;

@@ -15,10 +15,7 @@ pub(crate) async fn list_connections(state: State<'_, AppState>) -> R<Vec<Connec
 }
 
 #[tauri::command]
-pub(crate) async fn save_connection(
-    state: State<'_, AppState>,
-    args: SaveConnectionArgs,
-) -> R<ConnectionProfile> {
+pub(crate) async fn save_connection(state: State<'_, AppState>, args: SaveConnectionArgs) -> R<ConnectionProfile> {
     api::save_connection(&state, args)
 }
 
@@ -76,6 +73,11 @@ pub(crate) fn import_connections_preview(state: State<'_, AppState>, source: con
 }
 
 #[tauri::command]
-pub(crate) fn import_connections(state: State<'_, AppState>, source: conn_io::ImportSource, path: Option<String>, picks: Vec<usize>) -> R<conn_io::ImportReport> {
+pub(crate) fn import_connections(
+    state: State<'_, AppState>,
+    source: conn_io::ImportSource,
+    path: Option<String>,
+    picks: Vec<usize>,
+) -> R<conn_io::ImportReport> {
     conn_io::import_apply(&state, source, path, &picks)
 }

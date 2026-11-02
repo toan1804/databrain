@@ -124,7 +124,8 @@ impl KiroProvider {
                 message: Some(not_installed().to_string()),
             };
         };
-        let base = KiroStatus { installed: true, cli_path: Some(path.to_string_lossy().into()), signed_in: false, account_type: None, identity: None, message: None };
+        let base =
+            KiroStatus { installed: true, cli_path: Some(path.to_string_lossy().into()), signed_in: false, account_type: None, identity: None, message: None };
         let mut cmd = match self.command().await {
             Ok(c) => c,
             Err(e) => return KiroStatus { message: Some(e.to_string()), ..base },
@@ -151,13 +152,8 @@ impl KiroProvider {
     /// Completes when `whoami` reports a session.
     pub async fn sign_in_browser(&self, cancel: CancellationToken, terminal: &TerminalSetting, on_started: impl FnOnce(&Launch)) -> Result<KiroStatus> {
         let program = self.cli_path().ok_or_else(not_installed)?;
-        let browser_only = KiroProvider {
-            cli_override: Some(program.to_string_lossy().into()),
-            agents_dir: None,
-            env: self.env.clone(),
-            key: KeySource::None,
-            browser: true,
-        };
+        let browser_only =
+            KiroProvider { cli_override: Some(program.to_string_lossy().into()), agents_dir: None, env: self.env.clone(), key: KeySource::None, browser: true };
         let st = browser_only.status().await;
         if st.signed_in {
             return Ok(st);
@@ -184,7 +180,8 @@ impl KiroProvider {
     /// `kiro-cli logout` (ends the CLI's browser session on this computer).
     pub async fn sign_out(&self) -> Result<()> {
         let program = self.cli_path().ok_or_else(not_installed)?;
-        let out = Command::new(program).arg("logout").env_remove("KIRO_API_KEY").stdin(Stdio::null()).output().await.map_err(|e| AiError::Provider(e.to_string()))?;
+        let out =
+            Command::new(program).arg("logout").env_remove("KIRO_API_KEY").stdin(Stdio::null()).output().await.map_err(|e| AiError::Provider(e.to_string()))?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             if !err.to_lowercase().contains("not logged in") {
@@ -235,10 +232,7 @@ impl KiroProvider {
     pub(crate) async fn run_turn(&self, t: KiroTurn) -> Result<String> {
         let st = self.status().await;
         if !st.signed_in {
-            return Err(AiError::Auth(format!(
-                "Kiro: {}",
-                st.message.unwrap_or_else(|| "not signed in".into())
-            )));
+            return Err(AiError::Auth(format!("Kiro: {}", st.message.unwrap_or_else(|| "not signed in".into()))));
         }
         let mcp = McpHttp::start(t.ctx.clone(), t.sink.clone(), t.session_id.clone(), t.run_id.clone()).await?;
         let (acp, mut incoming) = self.spawn_acp(t.model.as_deref()).await?;
@@ -289,7 +283,9 @@ impl KiroProvider {
                         sink.emit(AgentEvent::TextDelta { session_id: sid.clone(), run_id: rid.clone(), text: chunk });
                     }
                 }
-                Some("tool_call") | Some("tool_call_chunk") if is_databrain_tool(u) || u.get("sessionUpdate").and_then(|k| k.as_str()) == Some("tool_call_chunk") => {
+                Some("tool_call") | Some("tool_call_chunk")
+                    if is_databrain_tool(u) || u.get("sessionUpdate").and_then(|k| k.as_str()) == Some("tool_call_chunk") =>
+                {
                     need_break.store(true, Ordering::Relaxed);
                 }
                 Some("tool_call") => {
@@ -298,10 +294,20 @@ impl KiroProvider {
                     let id = u.get("toolCallId").and_then(|s| s.as_str()).unwrap_or_default().to_string();
                     let title = u.get("title").and_then(|s| s.as_str()).unwrap_or("Kiro tool").to_string();
                     foreign.lock().insert(id.clone(), title.clone());
-                    sink.emit(AgentEvent::ToolStarted { session_id: sid.clone(), run_id: rid.clone(), call_id: id, tool: title, args: u.get("rawInput").cloned().unwrap_or_default() });
+                    sink.emit(AgentEvent::ToolStarted {
+                        session_id: sid.clone(),
+                        run_id: rid.clone(),
+                        call_id: id,
+                        tool: title,
+                        args: u.get("rawInput").cloned().unwrap_or_default(),
+                    });
                 }
                 Some("_kiro_metadata") => {
-                    let credits: f64 = u.get("meteringUsage").and_then(|m| m.as_array()).map(|a| a.iter().filter(|m| m["unit"].as_str() == Some("credit")).filter_map(|m| m["value"].as_f64()).sum()).unwrap_or(0.0);
+                    let credits: f64 = u
+                        .get("meteringUsage")
+                        .and_then(|m| m.as_array())
+                        .map(|a| a.iter().filter(|m| m["unit"].as_str() == Some("credit")).filter_map(|m| m["value"].as_f64()).sum())
+                        .unwrap_or(0.0);
                     let context = u.get("contextUsagePercentage").and_then(|c| c.as_f64());
                     if credits > 0.0 || context.is_some() {
                         sink.emit(AgentEvent::Metering { session_id: sid.clone(), run_id: rid.clone(), credits, context_percent: context });
@@ -313,7 +319,14 @@ impl KiroProvider {
                     let title = if done { foreign.lock().remove(id) } else { None };
                     if let Some(title) = title {
                         let content = u.get("rawOutput").map(|v| trunc(&v.to_string(), 4000)).unwrap_or_default();
-                        sink.emit(AgentEvent::ToolFinished { session_id: sid.clone(), run_id: rid.clone(), call_id: id.to_string(), tool: title, content, display: Value::Null });
+                        sink.emit(AgentEvent::ToolFinished {
+                            session_id: sid.clone(),
+                            run_id: rid.clone(),
+                            call_id: id.to_string(),
+                            tool: title,
+                            content,
+                            display: Value::Null,
+                        });
                     }
                 }
                 _ => {}
@@ -378,7 +391,9 @@ impl LlmProvider for KiroProvider {
             .and_then(|m| m.as_array())
             .map(|a| {
                 a.iter()
-                    .filter_map(|m| Some(ModelInfo { id: m.get("modelId")?.as_str()?.to_string(), name: m.get("description").and_then(|d| d.as_str()).map(str::to_string) }))
+                    .filter_map(|m| {
+                        Some(ModelInfo { id: m.get("modelId")?.as_str()?.to_string(), name: m.get("description").and_then(|d| d.as_str()).map(str::to_string) })
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -415,7 +430,8 @@ impl LlmProvider for KiroProvider {
 pub(crate) fn kiro_budget(d: &Value) -> Budget {
     let mut meters = Vec::new();
     for b in d["usageBreakdowns"].as_array().into_iter().flatten() {
-        let unit = if b["resourceType"].as_str() == Some("CREDIT") { "credits".to_string() } else { b["displayName"].as_str().unwrap_or("units").to_lowercase() };
+        let unit =
+            if b["resourceType"].as_str() == Some("CREDIT") { "credits".to_string() } else { b["displayName"].as_str().unwrap_or("units").to_lowercase() };
         let (used, limit) = (num(&b["used"]), num(&b["limit"]).filter(|_| b["hasLimit"].as_bool() != Some(false)));
         meters.push(BudgetMeter {
             label: b["displayName"].as_str().unwrap_or("Credits").to_string(),
@@ -431,7 +447,13 @@ pub(crate) fn kiro_budget(d: &Value) -> Budget {
     for (key, label) in [("bonusCredits", "Bonus credits"), ("addOnCredits", "Add-on credits")] {
         for b in d[key].as_array().into_iter().flatten() {
             let (used, limit) = (num(&b["used"]).or(num(&b["usedCredits"])), num(&b["limit"]).or(num(&b["totalCredits"])).or(num(&b["amount"])));
-            meters.push(BudgetMeter { label: label.into(), used, limit, remaining: num(&b["remaining"]).or(used.zip(limit).map(|(u, l)| (l - u).max(0.0))), unit: "credits".into() });
+            meters.push(BudgetMeter {
+                label: label.into(),
+                used,
+                limit,
+                remaining: num(&b["remaining"]).or(used.zip(limit).map(|(u, l)| (l - u).max(0.0))),
+                unit: "credits".into(),
+            });
         }
     }
     Budget {
@@ -477,7 +499,10 @@ fn find_cli() -> Option<PathBuf> {
 pub enum Whoami {
     /// `{"account": null}`: no session and no API key in the environment.
     NoAccount,
-    Account { account_type: Option<String>, identity: Option<String> },
+    Account {
+        account_type: Option<String>,
+        identity: Option<String>,
+    },
     /// No JSON object in the output (crash, update notice, unknown format).
     Unreadable(String),
 }
@@ -746,7 +771,10 @@ impl Acp {
                 let allow = is_databrain_tool(&tool);
                 let options = params.get("options").and_then(|o| o.as_array()).cloned().unwrap_or_default();
                 let pick = |prefix: &str| {
-                    options.iter().find(|o| o.get("kind").and_then(|k| k.as_str()).is_some_and(|k| k.starts_with(prefix))).and_then(|o| o.get("optionId").cloned())
+                    options
+                        .iter()
+                        .find(|o| o.get("kind").and_then(|k| k.as_str()).is_some_and(|k| k.starts_with(prefix)))
+                        .and_then(|o| o.get("optionId").cloned())
                 };
                 // DataBrain tools enforce their own approvals; anything else is refused.
                 let outcome = match pick(if allow { "allow" } else { "reject" }) {
@@ -890,7 +918,11 @@ async fn serve_conn(mut sock: tokio::net::TcpStream, sh: Arc<McpShared>) {
                                 out.push(r);
                             }
                         }
-                        if out.is_empty() { http_response("202 Accepted", None, b"") } else { http_response("200 OK", Some("application/json"), &serde_json::to_vec(&out).unwrap_or_default()) }
+                        if out.is_empty() {
+                            http_response("202 Accepted", None, b"")
+                        } else {
+                            http_response("200 OK", Some("application/json"), &serde_json::to_vec(&out).unwrap_or_default())
+                        }
                     }
                     Ok(m) => match handle_mcp(&sh, &m).await {
                         Some(r) => http_response("200 OK", Some("application/json"), &serde_json::to_vec(&r).unwrap_or_default()),
@@ -935,15 +967,30 @@ async fn handle_mcp(sh: &McpShared, msg: &Value) -> Option<Value> {
             "instructions": "DataBrain database tools for the current connection. Tools that run SQL or write to the editor ask the user in DataBrain."
         })),
         "ping" => ok(json!({})),
-        "tools/list" => ok(json!({"tools": specs(true).into_iter().map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.parameters})).collect::<Vec<_>>()})),
+        "tools/list" => ok(
+            json!({"tools": specs(true).into_iter().map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.parameters})).collect::<Vec<_>>()}),
+        ),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
             let args = params.get("arguments").cloned().filter(|a| a.is_object()).unwrap_or_else(|| json!({}));
             let call_id = uuid::Uuid::new_v4().to_string();
-            sh.sink.emit(AgentEvent::ToolStarted { session_id: sh.session_id.clone(), run_id: sh.run_id.clone(), call_id: call_id.clone(), tool: name.clone(), args: args.clone() });
+            sh.sink.emit(AgentEvent::ToolStarted {
+                session_id: sh.session_id.clone(),
+                run_id: sh.run_id.clone(),
+                call_id: call_id.clone(),
+                tool: name.clone(),
+                args: args.clone(),
+            });
             let o = sh.ctx.call(&name, &args).await;
             let content = trunc(&o.content, MAX_TOOL_CONTENT);
-            sh.sink.emit(AgentEvent::ToolFinished { session_id: sh.session_id.clone(), run_id: sh.run_id.clone(), call_id, tool: name, content: content.clone(), display: o.display });
+            sh.sink.emit(AgentEvent::ToolFinished {
+                session_id: sh.session_id.clone(),
+                run_id: sh.run_id.clone(),
+                call_id,
+                tool: name,
+                content: content.clone(),
+                display: o.display,
+            });
             let is_error = content.starts_with("ERROR");
             ok(json!({"content": [{"type": "text", "text": content}], "isError": is_error}))
         }
@@ -960,7 +1007,10 @@ mod tests {
         let d = json!({"planName": "KIRO POWER", "billingCycleReset": "2026-11-01", "usageBreakdowns": [{"resourceType": "CREDIT", "displayName": "Credits", "used": 6368.25, "limit": 10000.0, "currentOverages": 0.0, "hasLimit": true}], "bonusCredits": [], "addOnCredits": []});
         let b = kiro_budget(&d);
         assert_eq!((b.plan.as_deref(), b.resets_on.as_deref()), (Some("KIRO POWER"), Some("2026-11-01")));
-        assert_eq!(b.meters, vec![BudgetMeter { label: "Credits".into(), used: Some(6368.25), limit: Some(10000.0), remaining: Some(3631.75), unit: "credits".into() }]);
+        assert_eq!(
+            b.meters,
+            vec![BudgetMeter { label: "Credits".into(), used: Some(6368.25), limit: Some(10000.0), remaining: Some(3631.75), unit: "credits".into() }]
+        );
     }
 
     #[test]
@@ -993,7 +1043,8 @@ mod tests {
     #[test]
     fn normalizes_pasted_keys() {
         let k = "ksk_AbC123_def-456";
-        for raw in [k.to_string(), format!("  {k}\n"), format!("\"{k}\""), format!("“{k}”"), format!("export KIRO_API_KEY={k}"), format!("KIRO_API_KEY='{k}'")] {
+        for raw in [k.to_string(), format!("  {k}\n"), format!("\"{k}\""), format!("“{k}”"), format!("export KIRO_API_KEY={k}"), format!("KIRO_API_KEY='{k}'")]
+        {
             assert_eq!(normalize_api_key(&raw).unwrap(), k, "{raw:?}");
         }
         assert!(normalize_api_key("sk-openai-key").is_err());

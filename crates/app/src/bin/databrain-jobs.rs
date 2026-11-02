@@ -89,7 +89,12 @@ async fn main() -> ExitCode {
             match jobs::run_and_wait(&ctx, &job.id, "cli").await {
                 Ok(run) => {
                     for n in &run.nodes {
-                        println!("  {:<24} {:<10} {}", n.name, n.summary.status, n.summary.rows.map(|r| format!("{r} rows")).or(n.summary.error.clone()).unwrap_or_default());
+                        println!(
+                            "  {:<24} {:<10} {}",
+                            n.name,
+                            n.summary.status,
+                            n.summary.rows.map(|r| format!("{r} rows")).or(n.summary.error.clone()).unwrap_or_default()
+                        );
                     }
                     println!("{}: {}", job.name, run.status);
                     if run.status == "success" { ExitCode::SUCCESS } else { ExitCode::from(1) }

@@ -75,7 +75,13 @@ pub async fn json_body(resp: reqwest::Response, service: &str) -> Result<serde_j
         .and_then(|m| m.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| truncate(&text, 300));
-    let kind = if status.as_u16() == 401 || status.as_u16() == 403 { ErrorKind::Auth } else if status.is_server_error() { ErrorKind::Connection } else { ErrorKind::Query };
+    let kind = if status.as_u16() == 401 || status.as_u16() == 403 {
+        ErrorKind::Auth
+    } else if status.is_server_error() {
+        ErrorKind::Connection
+    } else {
+        ErrorKind::Query
+    };
     Err(ConnectorError::new(kind, format!("{service} ({status}): {message}")))
 }
 
@@ -159,12 +165,7 @@ impl<'a> RowSink<'a> {
             return Ok(());
         }
         if self.builder.coercion_failures() > 0 {
-            self.tx
-                .send(StreamEvent::Notice(format!(
-                    "{} value(s) could not be converted and are shown as NULL",
-                    self.builder.coercion_failures()
-                )))
-                .await;
+            self.tx.send(StreamEvent::Notice(format!("{} value(s) could not be converted and are shown as NULL", self.builder.coercion_failures()))).await;
         }
         Ok(())
     }
@@ -199,7 +200,13 @@ pub fn human_bytes(b: u64) -> String {
         v /= 1000.0;
         i += 1;
     }
-    if i == 0 { format!("{b} B") } else if v < 10.0 { format!("{v:.1} {}", U[i]) } else { format!("{v:.0} {}", U[i]) }
+    if i == 0 {
+        format!("{b} B")
+    } else if v < 10.0 {
+        format!("{v:.1} {}", U[i])
+    } else {
+        format!("{v:.0} {}", U[i])
+    }
 }
 
 /// A presigned link without its query string (the signature): safe to show.
@@ -244,7 +251,8 @@ mod notice_tests {
         assert_eq!(human_bytes(820_000_000), "820 MB");
         assert_eq!(large_result_notice("Databricks", Some(1000), Some(3), 1, None), None);
         assert_eq!(large_result_notice("Databricks", None, None, 1, None), None);
-        let n = large_result_notice("Databricks", Some(1_400_000_000), Some(3_200_000), 52, Some("https://st.blob.core.windows.net/r/0?sig=SECRET&se=1")).unwrap();
+        let n =
+            large_result_notice("Databricks", Some(1_400_000_000), Some(3_200_000), 52, Some("https://st.blob.core.windows.net/r/0?sig=SECRET&se=1")).unwrap();
         assert!(n.starts_with("The data is large (1.4 GB, 3200000 rows in 52 chunks), so it is downloaded from Databricks's external links: https://st.blob.core.windows.net/r/0?…."), "{n}");
         assert!(!n.contains("SECRET"));
         assert!(large_result_notice("Snowflake", None, None, 4, None).unwrap().contains("(4 chunks)"));

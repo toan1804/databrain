@@ -12,9 +12,8 @@ use async_trait::async_trait;
 use databrain_auth::{AuthContext, AuthMethodKind, CliKind, ClientAuthStyle, Credential, CredentialSource, OAuthConfig};
 use databrain_connector_core::value::Column;
 use databrain_connector_core::{
-    Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind,
-    DbObject, ExecOptions, ExecSummary, FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo,
-    Session, StreamEvent, StreamSender, TableColumns, Value,
+    Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ExecOptions, ExecSummary,
+    FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender, TableColumns, Value,
 };
 use secrecy::ExposeSecret;
 use serde_json::json;
@@ -64,11 +63,8 @@ impl Connector for BigQueryConnector {
 
     fn auth_context(&self, cfg: &ConnectionConfig) -> AuthContext {
         let p = cfg.auth.oauth_params().cloned().unwrap_or_default();
-        let scopes: Vec<String> = p
-            .scopes
-            .as_deref()
-            .map(|s| s.split_whitespace().map(str::to_string).collect())
-            .unwrap_or_else(|| SCOPES.iter().map(|s| s.to_string()).collect());
+        let scopes: Vec<String> =
+            p.scopes.as_deref().map(|s| s.split_whitespace().map(str::to_string).collect()).unwrap_or_else(|| SCOPES.iter().map(|s| s.to_string()).collect());
         let mut extra = vec![("access_type".to_string(), "offline".to_string()), ("prompt".to_string(), "consent".to_string())];
         if let Some(u) = p.user.clone() {
             extra.push(("login_hint".into(), u));
@@ -175,11 +171,7 @@ fn plain_json(field: &serde_json::Value, v: &serde_json::Value) -> serde_json::V
             f["mode"] = json!("NULLABLE");
             f
         };
-        return J::Array(
-            v.as_array()
-                .map(|a| a.iter().map(|x| plain_json(&elem_field, x.get("v").unwrap_or(x))).collect())
-                .unwrap_or_default(),
-        );
+        return J::Array(v.as_array().map(|a| a.iter().map(|x| plain_json(&elem_field, x.get("v").unwrap_or(x))).collect()).unwrap_or_default());
     }
     if matches!(field["type"].as_str(), Some("RECORD") | Some("STRUCT")) {
         let mut obj = serde_json::Map::new();
@@ -525,10 +517,7 @@ impl Session for BqSession {
 
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let (project, dataset) = split_dataset(schema)?;
-        let t = self
-            .0
-            .call(reqwest::Method::GET, format!("{API}/projects/{project}/datasets/{dataset}/tables/{name}"), None)
-            .await?;
+        let t = self.0.call(reqwest::Method::GET, format!("{API}/projects/{project}/datasets/{dataset}/tables/{name}"), None).await?;
         let kind = match t["type"].as_str().unwrap_or("TABLE") {
             "VIEW" => ObjectKind::View,
             "MATERIALIZED_VIEW" => ObjectKind::MaterializedView,
@@ -536,14 +525,10 @@ impl Session for BqSession {
             _ => ObjectKind::Table,
         };
         let columns = fields_to_columns(t.pointer("/schema/fields").and_then(|f| f.as_array()).map(|v| v.as_slice()).unwrap_or(&[]));
-        let ddl = t
-            .pointer("/view/query")
-            .and_then(|q| q.as_str())
-            .map(|q| format!("CREATE VIEW `{schema}.{name}` AS\n{q}"))
-            .or_else(|| {
-                let cols: Vec<String> = columns.iter().map(|c| format!("  `{}` {}{}", c.name, c.data_type, if c.nullable { "" } else { " NOT NULL" })).collect();
-                Some(format!("CREATE TABLE `{schema}.{name}` (\n{}\n);", cols.join(",\n")))
-            });
+        let ddl = t.pointer("/view/query").and_then(|q| q.as_str()).map(|q| format!("CREATE VIEW `{schema}.{name}` AS\n{q}")).or_else(|| {
+            let cols: Vec<String> = columns.iter().map(|c| format!("  `{}` {}{}", c.name, c.data_type, if c.nullable { "" } else { " NOT NULL" })).collect();
+            Some(format!("CREATE TABLE `{schema}.{name}` (\n{}\n);", cols.join(",\n")))
+        });
         Ok(ObjectDetail {
             object: DbObject {
                 schema: schema.to_string(),
@@ -582,10 +567,8 @@ fn fields_to_columns(fields: &[serde_json::Value]) -> Vec<ColumnInfo> {
     fn ty(f: &serde_json::Value) -> String {
         let base = f["type"].as_str().unwrap_or("STRING");
         let t = if matches!(base, "RECORD" | "STRUCT") {
-            let subs: Vec<String> = f["fields"]
-                .as_array()
-                .map(|a| a.iter().map(|s| format!("{} {}", s["name"].as_str().unwrap_or(""), ty(s))).collect())
-                .unwrap_or_default();
+            let subs: Vec<String> =
+                f["fields"].as_array().map(|a| a.iter().map(|s| format!("{} {}", s["name"].as_str().unwrap_or(""), ty(s))).collect()).unwrap_or_default();
             format!("STRUCT<{}>", subs.join(", "))
         } else {
             base.to_string()
@@ -620,7 +603,8 @@ mod tests {
 
     #[test]
     fn column_types() {
-        let cols = fields_to_columns(&[json!({"name": "tags", "type": "STRING", "mode": "REPEATED"}), json!({"name": "id", "type": "INTEGER", "mode": "REQUIRED"})]);
+        let cols =
+            fields_to_columns(&[json!({"name": "tags", "type": "STRING", "mode": "REPEATED"}), json!({"name": "id", "type": "INTEGER", "mode": "REQUIRED"})]);
         assert_eq!(cols[0].data_type, "ARRAY<STRING>");
         assert!(!cols[1].nullable);
         assert_eq!(urlencode("a b/c"), "a%20b%2Fc");

@@ -94,7 +94,14 @@ pub fn candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
     }
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
     let dirs: Vec<PathBuf> = if cfg!(target_os = "macos") {
-        vec!["/opt/homebrew/lib".into(), "/opt/homebrew/opt/duckdb/lib".into(), "/usr/local/lib".into(), "/usr/local/opt/duckdb/lib".into(), home.join(".duckdb/lib"), home.join("lib")]
+        vec![
+            "/opt/homebrew/lib".into(),
+            "/opt/homebrew/opt/duckdb/lib".into(),
+            "/usr/local/lib".into(),
+            "/usr/local/opt/duckdb/lib".into(),
+            home.join(".duckdb/lib"),
+            home.join("lib"),
+        ]
     } else if cfg!(windows) {
         let pf = std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
         let mut v = vec![pf.join("DuckDB"), pf.join("duckdb"), home.join(".duckdb").join("lib")];
@@ -104,7 +111,16 @@ pub fn candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
         }
         v
     } else {
-        vec!["/usr/local/lib".into(), "/usr/lib".into(), "/usr/lib64".into(), "/usr/lib/x86_64-linux-gnu".into(), "/usr/lib/aarch64-linux-gnu".into(), "/home/linuxbrew/.linuxbrew/lib".into(), home.join(".duckdb/lib"), home.join(".local/lib")]
+        vec![
+            "/usr/local/lib".into(),
+            "/usr/lib".into(),
+            "/usr/lib64".into(),
+            "/usr/lib/x86_64-linux-gnu".into(),
+            "/usr/lib/aarch64-linux-gnu".into(),
+            "/home/linuxbrew/.linuxbrew/lib".into(),
+            home.join(".duckdb/lib"),
+            home.join(".local/lib"),
+        ]
     };
     for d in dirs {
         push(d.join(name));

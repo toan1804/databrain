@@ -230,7 +230,13 @@ impl Tracer {
             l.last_emit = Instant::now();
             let mut log = l.log.clone();
             if l.dropped > 0 {
-                log.push(RunLogEntry { seq: log.len() as u64 + 1, at: now_ms(), level: "warning".into(), message: format!("{} more lines were not kept (the log keeps {LOG_KEPT})", l.dropped), ..Default::default() });
+                log.push(RunLogEntry {
+                    seq: log.len() as u64 + 1,
+                    at: now_ms(),
+                    level: "warning".into(),
+                    message: format!("{} more lines were not kept (the log keeps {LOG_KEPT})", l.dropped),
+                    ..Default::default()
+                });
             }
             (l.run.clone(), log)
         };
@@ -245,15 +251,29 @@ impl LoadObserver for Tracer {
         match e {
             LoadEvent::Info(m) => self.log("info", m, None, None, None),
             LoadEvent::Statement { label, sql, rows, duration_ms, error } => match error {
-                None => self.log("info", format!("{label}: done{}", rows.map(|r| format!(", {r} rows affected")).unwrap_or_default()), Some(&sql), rows.map(|r| r as i64), Some(duration_ms as i64)),
+                None => self.log(
+                    "info",
+                    format!("{label}: done{}", rows.map(|r| format!(", {r} rows affected")).unwrap_or_default()),
+                    Some(&sql),
+                    rows.map(|r| r as i64),
+                    Some(duration_ms as i64),
+                ),
                 Some(e) => self.log("error", format!("{label} failed: {e}"), Some(&sql), None, Some(duration_ms as i64)),
             },
             LoadEvent::Progress { phase, done, total } => self.progress(StepProgress { phase, done, total }),
             LoadEvent::Inserted { label, table, rows, statements, sql, duration_ms, error } => {
                 let batches = format!("{statements} batch{}", if statements == 1 { "" } else { "es" });
                 match error {
-                    None => self.log("info", format!("{label}: {rows} rows into {table} in {batches}"), (!sql.is_empty()).then_some(sql.as_str()), Some(rows as i64), Some(duration_ms as i64)),
-                    Some(e) => self.log("error", format!("{label} failed after {rows} rows ({batches}): {e}"), Some(&sql), Some(rows as i64), Some(duration_ms as i64)),
+                    None => self.log(
+                        "info",
+                        format!("{label}: {rows} rows into {table} in {batches}"),
+                        (!sql.is_empty()).then_some(sql.as_str()),
+                        Some(rows as i64),
+                        Some(duration_ms as i64),
+                    ),
+                    Some(e) => {
+                        self.log("error", format!("{label} failed after {rows} rows ({batches}): {e}"), Some(&sql), Some(rows as i64), Some(duration_ms as i64))
+                    }
                 }
             }
         }
@@ -493,7 +513,13 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
         let rec = match out {
             Ok(out) => {
                 status.insert(node.id.clone(), "success");
-                t.log("success", format!("Succeeded: {} rows{}", out.rows, out.file.as_ref().map(|f| format!(", file {f}")).unwrap_or_default()), None, Some(out.rows), Some(took));
+                t.log(
+                    "success",
+                    format!("Succeeded: {} rows{}", out.rows, out.file.as_ref().map(|f| format!(", file {f}")).unwrap_or_default()),
+                    None,
+                    Some(out.rows),
+                    Some(took),
+                );
                 let mut r = record(&node, "success", Some(started), Some(out.rows), None);
                 r.summary.file = out.file;
                 r.summary.notices = out.notices;
@@ -577,7 +603,9 @@ pub fn default_load_sql(upstreams: &[String]) -> Option<String> {
 pub fn export_folder(node: &JobNode) -> Result<std::path::PathBuf> {
     let dir = match node.export_folder.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
         Some(f) => std::path::PathBuf::from(f),
-        None => dirs::download_dir().or_else(|| dirs::home_dir().map(|h| h.join("Downloads"))).ok_or_else(|| EngineError::new("invalid", "Choose the folder to save the file in"))?,
+        None => dirs::download_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+            .ok_or_else(|| EngineError::new("invalid", "Choose the folder to save the file in"))?,
     };
     if !dir.is_absolute() {
         return Err(EngineError::new("invalid", format!("The folder must be a full path: {}", dir.display())));
@@ -601,14 +629,34 @@ pub fn copy_sql(select: &str, path: &std::path::Path, format: FileFormat) -> Str
 /// One SQL run on a run key (no prompt); fails with the first error. Each
 /// statement's outcome goes to the log.
 #[allow(clippy::too_many_arguments)]
-async fn run_sql(ctx: &JobCtx, connection_id: String, tab: String, sql: String, output_name: Option<String>, origin: Origin, cancel: &CancellationToken, t: &Tracer) -> Result<Vec<databrain_query_engine::StatementOutcomeView>> {
+async fn run_sql(
+    ctx: &JobCtx,
+    connection_id: String,
+    tab: String,
+    sql: String,
+    output_name: Option<String>,
+    origin: Origin,
+    cancel: &CancellationToken,
+    t: &Tracer,
+) -> Result<Vec<databrain_query_engine::StatementOutcomeView>> {
     let conn = ctx.workspace.get_connection(&connection_id).map(|p| p.name).unwrap_or_else(|_| connection_id.clone());
     t.log("info", format!("Running SQL on {conn}"), None, None, None);
     let outcomes = ctx
         .engine
         .run_and_wait(
             &ctx.hub,
-            RunRequest { connection_id, tab_id: tab, sql, base_offset: 0, row_limit: None, confirmed: true, origin, session_key: None, output_name, params: HashMap::new() },
+            RunRequest {
+                connection_id,
+                tab_id: tab,
+                sql,
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin,
+                session_key: None,
+                output_name,
+                params: HashMap::new(),
+            },
             Some(cancel.clone()),
         )
         .await?;
@@ -627,7 +675,13 @@ async fn run_sql(ctx: &JobCtx, connection_id: String, tab: String, sql: String, 
                 Some(r.total_rows as i64),
                 Some(o.duration_ms as i64),
             ),
-            (None, None, rows) => t.log("info", format!("{which}: done{}", rows.map(|r| format!(", {r} rows affected")).unwrap_or_default()), Some(&o.sql), rows.map(|r| r as i64), Some(o.duration_ms as i64)),
+            (None, None, rows) => t.log(
+                "info",
+                format!("{which}: done{}", rows.map(|r| format!(", {r} rows affected")).unwrap_or_default()),
+                Some(&o.sql),
+                rows.map(|r| r as i64),
+                Some(o.duration_ms as i64),
+            ),
         }
     }
     if let Some((i, e)) = outcomes.iter().enumerate().find_map(|(i, o)| o.error.as_ref().map(|e| (i, e))) {
@@ -657,13 +711,17 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     let tab = node_tab(job_id, &node.id);
     let duck = || ctx.engine.results_connection().map(|c| c.id);
     let (connection_id, sql) = match node.kind {
-        JobNodeKind::Query => (match &node.connection_id {
-            Some(c) if !c.is_empty() => c.clone(),
-            _ => duck()?,
-        }, node.sql.clone()),
+        JobNodeKind::Query => (
+            match &node.connection_id {
+                Some(c) if !c.is_empty() => c.clone(),
+                _ => duck()?,
+            },
+            node.sql.clone(),
+        ),
         JobNodeKind::Load | JobNodeKind::Export => {
             let sql = if node.sql.trim().is_empty() {
-                default_load_sql(upstreams).ok_or_else(|| EngineError::new("invalid", "Write the SQL that selects the rows to load, or connect an upstream step"))?
+                default_load_sql(upstreams)
+                    .ok_or_else(|| EngineError::new("invalid", "Write the SQL that selects the rows to load, or connect an upstream step"))?
             } else {
                 node.sql.clone()
             };
@@ -699,7 +757,8 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
         run_sql(ctx, duck_id, format!("{tab}:export"), copy_sql(&select, &path, node.export_format), None, Origin::Job, cancel, t).await?;
         return Ok(NodeOut { rows: output.rows as i64, file: Some(path.to_string_lossy().into_owned()), notices: vec![] });
     }
-    let target = node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;
+    let target =
+        node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;
     let report = ctx.engine.write_output(&output.handle, target, &format!("{tab}:load"), &load_spec(node), cancel, t).await?;
     Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices })
 }
@@ -738,8 +797,10 @@ pub async fn dry_run(ctx: &JobCtx, job: &Job, node_id: &str) -> Result<LoadDryRu
     if node.kind != JobNodeKind::Load {
         return Err(EngineError::new("invalid", "Only load steps have a dry run"));
     }
-    let target = node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;
-    let ups: Vec<String> = job.edges.iter().filter(|e| e.to == node.id).filter_map(|e| job.nodes.iter().find(|n| n.id == e.from).map(|n| n.name.clone())).collect();
+    let target =
+        node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;
+    let ups: Vec<String> =
+        job.edges.iter().filter(|e| e.to == node.id).filter_map(|e| job.nodes.iter().find(|n| n.id == e.from).map(|n| n.name.clone())).collect();
     let sql = if node.sql.trim().is_empty() { default_load_sql(&ups) } else { Some(node.sql.clone()) };
     // Not a `job:` tab: its result is not the step's output.
     let tab = format!("dryrun:{}:{}", job.id, node.id);
@@ -748,11 +809,24 @@ pub async fn dry_run(ctx: &JobCtx, job: &Job, node_id: &str) -> Result<LoadDryRu
         None => (None, Some("Write the SQL that selects the rows to load, or connect an upstream step".to_string())),
         Some(sql) => {
             let duck = ctx.engine.results_connection()?.id;
-            let req = RunRequest { connection_id: duck, tab_id: tab.clone(), sql, base_offset: 0, row_limit: Some(DRY_RUN_ROWS), confirmed: true, origin: sql_origin(node), session_key: None, output_name: None, params: HashMap::new() };
+            let req = RunRequest {
+                connection_id: duck,
+                tab_id: tab.clone(),
+                sql,
+                base_offset: 0,
+                row_limit: Some(DRY_RUN_ROWS),
+                confirmed: true,
+                origin: sql_origin(node),
+                session_key: None,
+                output_name: None,
+                params: HashMap::new(),
+            };
             match ctx.engine.run_and_wait(&ctx.hub, req, Some(cancel.clone())).await {
                 Err(e) => (None, Some(e.message)),
                 Ok(outcomes) => match outcomes.iter().find_map(|o| o.error.as_ref()) {
-                    Some(e) => (None, Some(format!("{}{}", e.message, if ups.is_empty() { "" } else { " (run the upstream steps first so their outputs exist)" }))),
+                    Some(e) => {
+                        (None, Some(format!("{}{}", e.message, if ups.is_empty() { "" } else { " (run the upstream steps first so their outputs exist)" })))
+                    }
                     None => match outcomes.last().and_then(|o| o.result.as_ref()) {
                         None => (None, Some("The SQL returned no rows (it must end with a SELECT)".to_string())),
                         Some(r) => match ctx.engine.result_rows(&r.id) {

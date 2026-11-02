@@ -142,7 +142,8 @@ async fn refresh_schema_at(state: &AppState, id: &str, schema: &str, fingerprint
     // Compare against the listings saved so far, not ones still queued.
     state.meta.flush().await;
     let ws = state.engine.workspace();
-    let full = |objects: Vec<DbObject>, n: usize| SchemaRefresh { schema: schema.to_string(), mode: RefreshMode::Full, added: n, changed: 0, removed: 0, objects };
+    let full =
+        |objects: Vec<DbObject>, n: usize| SchemaRefresh { schema: schema.to_string(), mode: RefreshMode::Full, added: n, changed: 0, removed: 0, objects };
     if !cacheable(state, id, schema) {
         let objs = state.engine.list_objects(id, schema).await?;
         let n = objs.len();
@@ -159,8 +160,7 @@ async fn refresh_schema_at(state: &AppState, id: &str, schema: &str, fingerprint
         return Ok(full(objs, n));
     };
     // Objects listed but without a version (added by a search) count as changed.
-    let cached_keys: std::collections::HashSet<String> =
-        listed.objects.iter().map(|o| databrain_connector_core::version_key(o.kind, &o.name)).collect();
+    let cached_keys: std::collections::HashSet<String> = listed.objects.iter().map(|o| databrain_connector_core::version_key(o.kind, &o.name)).collect();
     let removed: Vec<String> = cached_keys.iter().filter(|k| !new.contains_key(*k)).cloned().collect();
     let mut added = 0;
     let mut touched: Vec<String> = Vec::new();
@@ -302,7 +302,8 @@ pub fn complete_tables_local(state: &AppState, id: &str, schema: Option<&str>, q
     Ok(rows
         .into_iter()
         .filter_map(|(schema, name, kind, comment)| {
-            let kind: databrain_connector_core::ObjectKind = serde_json::from_value(serde_json::Value::String(kind)).unwrap_or(databrain_connector_core::ObjectKind::Table);
+            let kind: databrain_connector_core::ObjectKind =
+                serde_json::from_value(serde_json::Value::String(kind)).unwrap_or(databrain_connector_core::ObjectKind::Table);
             kind.is_relation().then_some(DbObject { schema, name, kind, comment, row_estimate: None })
         })
         .collect())
@@ -347,12 +348,7 @@ pub fn complete_columns_local(state: &AppState, id: &str, schema: &str, name: &s
     Ok(state.engine.workspace().kn_column_names(id, schema, name)?)
 }
 
-pub async fn describe(
-    state: &AppState,
-    id: &str,
-    schema: &str,
-    name: &str,
-) -> Result<ObjectDetail> {
+pub async fn describe(state: &AppState, id: &str, schema: &str, name: &str) -> Result<ObjectDetail> {
     let d = state.engine.describe(id, schema, name).await?;
     if !d.columns.is_empty() {
         let (ws, id2, s2, n2, cols) = (state.workspace.clone(), id.to_string(), schema.to_string(), name.to_string(), d.columns.clone());
@@ -373,7 +369,11 @@ pub async fn table_layout(state: &AppState, id: &str, schema: &str, name: &str) 
 }
 
 /// Compare two schemas; the script makes `target` like `source` (not run).
-pub async fn schema_diff(state: &AppState, source: &databrain_query_engine::schema_diff::SchemaSide, target: &databrain_query_engine::schema_diff::SchemaSide) -> Result<databrain_query_engine::schema_diff::SchemaDiff> {
+pub async fn schema_diff(
+    state: &AppState,
+    source: &databrain_query_engine::schema_diff::SchemaSide,
+    target: &databrain_query_engine::schema_diff::SchemaSide,
+) -> Result<databrain_query_engine::schema_diff::SchemaDiff> {
     state.engine.schema_diff(source, target).await
 }
 

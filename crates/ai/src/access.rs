@@ -172,10 +172,15 @@ pub fn check_sql(profile: &ConnectionProfile, sql: &str) -> Result<(), String> {
     }
     let r = table_refs(sql, profile.config.kind);
     if r.changes_default {
-        return Err("changing the default database or schema (USE, SET search_path…) isn't allowed while table access rules are set; qualify the table names instead".into());
+        return Err(
+            "changing the default database or schema (USE, SET search_path…) isn't allowed while table access rules are set; qualify the table names instead"
+                .into(),
+        );
     }
     if let Some(k) = r.opaque.first() {
-        return Err(format!("table access rules are set on this connection, and the tables a {k} statement uses can't be checked; use plain SELECT/INSERT/UPDATE/DELETE statements that name their tables"));
+        return Err(format!(
+            "table access rules are set on this connection, and the tables a {k} statement uses can't be checked; use plain SELECT/INSERT/UPDATE/DELETE statements that name their tables"
+        ));
     }
     for t in &r.reads {
         allowed(profile, t, false)?;
@@ -191,7 +196,8 @@ pub fn check_write_table(profile: &ConnectionProfile, table: &str) -> Result<(),
     if !has_rules(&profile.ai_policy) {
         return Ok(());
     }
-    let name: TableName = table.split('.').map(|p| p.trim().trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']').to_string()).filter(|p| !p.is_empty()).collect();
+    let name: TableName =
+        table.split('.').map(|p| p.trim().trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']').to_string()).filter(|p| !p.is_empty()).collect();
     allowed(profile, &name, true)
 }
 
@@ -214,7 +220,18 @@ mod tests {
     fn profile(kind: ConnectorKind, db: Option<&str>, policy: AiPolicy) -> ConnectionProfile {
         let mut config = ConnectionConfig::new(kind, AuthMethod::Password { user: "app".into() });
         config.database = db.map(String::from);
-        ConnectionProfile { id: "c".into(), name: "c".into(), config, color: None, env: EnvTag::Dev, folder_id: None, has_secret: false, ai_policy: policy, created_at: 0, updated_at: 0 }
+        ConnectionProfile {
+            id: "c".into(),
+            name: "c".into(),
+            config,
+            color: None,
+            env: EnvTag::Dev,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: policy,
+            created_at: 0,
+            updated_at: 0,
+        }
     }
 
     #[test]
@@ -230,14 +247,17 @@ mod tests {
 
     #[test]
     fn read_rules() {
-        let pol = AiPolicy { read_allow: parse_patterns("'catalog_read%', '%schema_can_read%'"), read_deny: parse_patterns("'%secret%'"), ..Default::default() };
+        let pol =
+            AiPolicy { read_allow: parse_patterns("'catalog_read%', '%schema_can_read%'"), read_deny: parse_patterns("'%secret%'"), ..Default::default() };
         let p = profile(ConnectorKind::Databricks, None, pol.clone());
         assert!(check_sql(&p, "select * from catalog_read_1.sales.orders").is_ok());
         assert!(check_sql(&p, "select * from other.my_schema_can_read.t").is_ok());
         let e = check_sql(&p, "select * from other.sales.orders").unwrap_err();
         assert!(e.contains("only read tables matching") && e.contains("other.sales.orders"), "{e}");
         // Deny wins over allow, also in a subquery or a join.
-        assert!(check_sql(&p, "select * from catalog_read_1.sales.orders where id in (select id from catalog_read_1.hr.secret_pay)").unwrap_err().contains("deny"));
+        assert!(
+            check_sql(&p, "select * from catalog_read_1.sales.orders where id in (select id from catalog_read_1.hr.secret_pay)").unwrap_err().contains("deny")
+        );
         // Writes are checked against the write rules (none here), reads still apply.
         assert!(check_sql(&p, "insert into anywhere.s.t select * from catalog_read_1.s.x").is_ok());
         assert!(check_sql(&p, "insert into anywhere.s.t select * from nope.s.x").is_err());

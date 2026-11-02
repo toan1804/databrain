@@ -445,13 +445,7 @@ pub const SQLITE: SourceTraits = SourceTraits {
     explain: Some("EXPLAIN QUERY PLAN "),
     local: true,
     formatter: "sqlite",
-    syntax: SqlSyntax {
-        backtick: true,
-        brackets: true,
-        block_end: BlockEnd::EndWord,
-        block_objects: &["TRIGGER"],
-        ..STANDARD_SYNTAX
-    },
+    syntax: SqlSyntax { backtick: true, brackets: true, block_end: BlockEnd::EndWord, block_objects: &["TRIGGER"], ..STANDARD_SYNTAX },
     load: Some(LoadTraits {
         types: TypeNames { integer: "INTEGER", float: "REAL", ..STANDARD_TYPES },
         default_bytes: 1_000_000,
@@ -865,7 +859,10 @@ mod tests {
         // Compared as JSON: key order depends on serde_json features the
         // workspace enables (`preserve_order`), not on the content.
         let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_default()).unwrap_or_default();
-        assert!(on_disk == serde_json::Value::Object(map), "ui/src/lib/sourceTraits.json is out of date: run UPDATE_SOURCE_TRAITS=1 cargo test -p databrain-connector-core traits");
+        assert!(
+            on_disk == serde_json::Value::Object(map),
+            "ui/src/lib/sourceTraits.json is out of date: run UPDATE_SOURCE_TRAITS=1 cargo test -p databrain-connector-core traits"
+        );
     }
 
     #[test]

@@ -35,8 +35,20 @@ fn export_then_import_keeps_folders_and_drops_secrets() {
     c.host = Some("pg.eu".into());
     c.database = Some("orders".into());
     c.options.insert("application_name".into(), "x".into());
-    let profile = ConnectionProfile { id: String::new(), name: "Orders EU".into(), config: c, color: Some("#f00".into()), env: EnvTag::Prod, folder_id: Some(eu.id), has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
-    api::save_connection(&a, api::SaveConnectionArgs { profile, secret: Some("hunter2".into()), clear_secret: false, extra_secrets: Default::default() }).unwrap();
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "Orders EU".into(),
+        config: c,
+        color: Some("#f00".into()),
+        env: EnvTag::Prod,
+        folder_id: Some(eu.id),
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    api::save_connection(&a, api::SaveConnectionArgs { profile, secret: Some("hunter2".into()), clear_secret: false, extra_secrets: Default::default() })
+        .unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("c.databrain-connections.json").to_string_lossy().into_owned();
@@ -93,9 +105,13 @@ fn imports_incomplete_dbeaver_and_datagrip_connections() {
     assert_eq!((r.imported, r.errors.clone()), (1, vec![]), "no 'User name is required'");
 
     let grip = dir.path().join("dataSources.xml");
-    std::fs::write(&grip, r#"<project version="4"><component name="DataSourceManagerImpl" format="xml" multifile-model="true">
+    std::fs::write(
+        &grip,
+        r#"<project version="4"><component name="DataSourceManagerImpl" format="xml" multifile-model="true">
         <data-source source="LOCAL" name="mysql@db" uuid="x"><driver-ref>mysql.8</driver-ref><jdbc-url>jdbc:mysql://db:3306/app</jdbc-url></data-source>
-      </component></project>"#).unwrap();
+      </component></project>"#,
+    )
+    .unwrap();
     std::fs::write(dir.path().join("dataSources.local.xml"), r#"<project version="4"><component name="dataSourceStorageLocal"><data-source name="mysql@db" uuid="x"><user-name>root</user-name></data-source></component></project>"#).unwrap();
     let path = Some(grip.to_string_lossy().into_owned());
     let p = conn_io::import_preview(&a, ImportSource::Datagrip, path.clone()).unwrap();

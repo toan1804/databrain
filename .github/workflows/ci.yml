@@ -43,9 +43,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Rust format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
 
       - name: UI dependencies
         working-directory: ui

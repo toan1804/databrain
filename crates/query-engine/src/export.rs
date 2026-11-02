@@ -36,9 +36,7 @@ impl QueryEngine {
         let cancel = CancellationToken::new();
         self.exports.lock().insert(export_id.to_string(), cancel.clone());
         // The original session, when its transaction holds rows others can't see.
-        let shared = session_key.filter(|k| {
-            self.sessions.lock().get(&(connection_id.to_string(), k.to_string())).is_some_and(|s| s.session.in_transaction())
-        });
+        let shared = session_key.filter(|k| self.sessions.lock().get(&(connection_id.to_string(), k.to_string())).is_some_and(|s| s.session.in_transaction()));
         let tab = match shared {
             Some(k) => {
                 if self.jobs.lock().values().any(|j| j.session_key == k) {

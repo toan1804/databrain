@@ -102,7 +102,10 @@ impl RowBatcher {
         }
         let failures = b.builder.coercion_failures();
         if failures > 0 {
-            out.push(StreamEvent::Notice(format!("{failures} values didn't match their column's type (inferred from the first {} rows) and are shown as NULL", self.infer_rows)));
+            out.push(StreamEvent::Notice(format!(
+                "{failures} values didn't match their column's type (inferred from the first {} rows) and are shown as NULL",
+                self.infer_rows
+            )));
         }
         if !self.dropped.is_empty() {
             let names: Vec<&str> = self.dropped.iter().take(20).map(String::as_str).collect();
@@ -224,9 +227,15 @@ mod tests {
         let mut b = RowBatcher::with_inference(2, 3);
         let int = |i| Cell::new(Value::Int(i), "int");
         let mut ev = vec![];
-        ev.extend(b.push(row(&[("_id", Cell::new(Value::Text("a1".into()), "objectId")), ("n", int(1)), ("tags", Cell::json(&serde_json::json!(["x"]), "array"))])).unwrap());
+        ev.extend(
+            b.push(row(&[("_id", Cell::new(Value::Text("a1".into()), "objectId")), ("n", int(1)), ("tags", Cell::json(&serde_json::json!(["x"]), "array"))]))
+                .unwrap(),
+        );
         ev.extend(b.push(row(&[("_id", Cell::new(Value::Text("a2".into()), "objectId")), ("n", Cell::new(Value::Float(2.5), "double"))])).unwrap());
-        ev.extend(b.push(row(&[("_id", Cell::new(Value::Text("a3".into()), "objectId")), ("n", Cell::new(Value::Text("x".into()), "string")), ("late", int(1))])).unwrap());
+        ev.extend(
+            b.push(row(&[("_id", Cell::new(Value::Text("a3".into()), "objectId")), ("n", Cell::new(Value::Text("x".into()), "string")), ("late", int(1))]))
+                .unwrap(),
+        );
         // Built after 3 rows: schema + one full batch of 2.
         let StreamEvent::Schema(s) = &ev[0] else { panic!("{ev:?}") };
         let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();

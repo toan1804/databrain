@@ -22,13 +22,7 @@ impl QueryEngine {
         }
         let connector = self.registry.get(profile.config.kind)?;
         let config = profile.config.normalized();
-        let src = credential_source(
-            &config.auth,
-            &profile.id,
-            self.secrets.clone(),
-            self.interaction(),
-            connector.auth_context(&config),
-        )?;
+        let src = credential_source(&config.auth, &profile.id, self.secrets.clone(), self.interaction(), connector.auth_context(&config))?;
         self.creds.lock().insert(profile.id.clone(), src.clone());
         Ok(src)
     }
@@ -58,7 +52,12 @@ impl QueryEngine {
 
     /// Open the SSH tunnel for a config (if configured) and return the
     /// config rewritten to go through it.
-    pub(crate) async fn tunnel(&self, cfg: &ConnectionConfig, owner_id: Option<&str>, secret_override: Option<&str>) -> Result<(ConnectionConfig, Option<Arc<Tunnel>>)> {
+    pub(crate) async fn tunnel(
+        &self,
+        cfg: &ConnectionConfig,
+        owner_id: Option<&str>,
+        secret_override: Option<&str>,
+    ) -> Result<(ConnectionConfig, Option<Arc<Tunnel>>)> {
         let Some(ssh) = cfg.ssh.clone() else { return Ok((cfg.clone(), None)) };
         let stored = match owner_id {
             Some(id) => self.secrets.get(&SecretRef::slot(id, "ssh"))?.map(|s| s.expose_secret().to_string()),
@@ -194,20 +193,10 @@ impl QueryEngine {
         let connector = self.registry.get(cfg.kind)?;
         let creds: Arc<dyn CredentialSource> = match (secret, connection_id) {
             (Some(s), _) => Arc::new(InlineCredentialSource::new(cfg.auth.clone(), Some(SecretString::from(s)))),
-            (None, Some(id)) => credential_source(
-                &cfg.auth,
-                id,
-                self.secrets.clone(),
-                self.interaction(),
-                connector.auth_context(cfg),
-            )?,
-            (None, None) if cfg.auth.is_interactive() => credential_source(
-                &cfg.auth,
-                "__test__",
-                Arc::new(databrain_auth::MemoryStore::default()),
-                self.interaction(),
-                connector.auth_context(cfg),
-            )?,
+            (None, Some(id)) => credential_source(&cfg.auth, id, self.secrets.clone(), self.interaction(), connector.auth_context(cfg))?,
+            (None, None) if cfg.auth.is_interactive() => {
+                credential_source(&cfg.auth, "__test__", Arc::new(databrain_auth::MemoryStore::default()), self.interaction(), connector.auth_context(cfg))?
+            }
             (None, None) => Arc::new(InlineCredentialSource::new(cfg.auth.clone(), None)),
         };
         let start = Instant::now();
@@ -215,9 +204,6 @@ impl QueryEngine {
         let (cfg, _tunnel) = self.tunnel(cfg, connection_id, ssh_secret.as_deref()).await?;
         let session = connector.connect(&cfg, creds).await?;
         let server_version = session.server_version().await?;
-        Ok(TestResult {
-            server_version,
-            latency_ms: start.elapsed().as_millis() as u64,
-        })
+        Ok(TestResult { server_version, latency_ms: start.elapsed().as_millis() as u64 })
     }
 }

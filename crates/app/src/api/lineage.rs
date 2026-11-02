@@ -138,7 +138,8 @@ pub async fn lineage(
                 graph = databrain_lineage::analyze(&masked, kind, &cat(conn.clone(), &views));
             }
             // Views the SQL (or a view's definition) reads: their definitions.
-            let mut names: Vec<String> = graph.nodes.iter().filter(|n| n.kind == databrain_lineage::NodeKind::Table && !n.written && !n.view).map(|n| n.name.clone()).collect();
+            let mut names: Vec<String> =
+                graph.nodes.iter().filter(|n| n.kind == databrain_lineage::NodeKind::Table && !n.written && !n.view).map(|n| n.name.clone()).collect();
             names.sort();
             names.dedup();
             let mut read_views = false;
@@ -186,7 +187,8 @@ pub async fn lineage(
                 if !read {
                     c.status = "skipped".into();
                 } else {
-                    let bound = databrain_connector_core::sql::substitute_parameters(text, kind, &params).unwrap_or_else(|_| masked[q.start..q.end].to_string());
+                    let bound =
+                        databrain_connector_core::sql::substitute_parameters(text, kind, &params).unwrap_or_else(|_| masked[q.start..q.end].to_string());
                     let same = bound == text;
                     match state.engine.check_sql(id, &bound).await {
                         Ok(true) => c.status = "ok".into(),

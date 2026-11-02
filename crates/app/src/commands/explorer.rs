@@ -90,7 +90,13 @@ pub(crate) async fn complete_routines(state: State<'_, AppState>, id: String, sc
 }
 
 #[tauri::command]
-pub(crate) async fn object_ddl(state: State<'_, AppState>, id: String, schema: String, name: String, kind: databrain_connector_core::ObjectKind) -> R<Option<String>> {
+pub(crate) async fn object_ddl(
+    state: State<'_, AppState>,
+    id: String,
+    schema: String,
+    name: String,
+    kind: databrain_connector_core::ObjectKind,
+) -> R<Option<String>> {
     api::object_ddl(&state, &id, &schema, &name, kind).await
 }
 
@@ -110,12 +116,7 @@ pub(crate) async fn search_objects(state: State<'_, AppState>, id: String, query
 }
 
 #[tauri::command]
-pub(crate) async fn describe_object(
-    state: State<'_, AppState>,
-    id: String,
-    schema: String,
-    name: String,
-) -> R<ObjectDetail> {
+pub(crate) async fn describe_object(state: State<'_, AppState>, id: String, schema: String, name: String) -> R<ObjectDetail> {
     api::describe(&state, &id, &schema, &name).await
 }
 
@@ -130,6 +131,10 @@ pub(crate) async fn table_layout(state: State<'_, AppState>, id: String, schema:
 }
 
 #[tauri::command]
-pub(crate) async fn schema_diff(state: State<'_, AppState>, source: databrain_query_engine::schema_diff::SchemaSide, target: databrain_query_engine::schema_diff::SchemaSide) -> R<databrain_query_engine::schema_diff::SchemaDiff> {
+pub(crate) async fn schema_diff(
+    state: State<'_, AppState>,
+    source: databrain_query_engine::schema_diff::SchemaSide,
+    target: databrain_query_engine::schema_diff::SchemaSide,
+) -> R<databrain_query_engine::schema_diff::SchemaDiff> {
     api::schema_diff(&state, &source, &target).await
 }

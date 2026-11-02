@@ -29,7 +29,14 @@ pub(crate) async fn pin_output(state: State<'_, AppState>, handle: String, pinne
 }
 
 #[tauri::command]
-pub(crate) async fn output_diff_sql(state: State<'_, AppState>, before: String, after: String, keys: Vec<String>, mapping: Option<Vec<(String, String)>>, exact: Option<bool>) -> R<String> {
+pub(crate) async fn output_diff_sql(
+    state: State<'_, AppState>,
+    before: String,
+    after: String,
+    keys: Vec<String>,
+    mapping: Option<Vec<(String, String)>>,
+    exact: Option<bool>,
+) -> R<String> {
     api::output_diff_sql(&state, &before, &after, keys, mapping.unwrap_or_default(), exact.unwrap_or(false))
 }
 

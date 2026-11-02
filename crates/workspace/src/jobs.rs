@@ -522,11 +522,7 @@ pub fn topo_order(job: &Job) -> std::result::Result<Vec<String>, Vec<String>> {
             }
         }
     }
-    if out.len() == ids.len() {
-        Ok(out)
-    } else {
-        Err(ids.iter().filter(|i| !out.iter().any(|o| o == *i)).map(|s| s.to_string()).collect())
-    }
+    if out.len() == ids.len() { Ok(out) } else { Err(ids.iter().filter(|i| !out.iter().any(|o| o == *i)).map(|s| s.to_string()).collect()) }
 }
 
 fn validate(job: &Job) -> Result<()> {
@@ -605,7 +601,10 @@ impl Workspace {
         for id in ids {
             let Ok(j) = self.get_job(&id) else { continue };
             for n in &j.nodes {
-                out.push((n.name.to_ascii_lowercase(), StepOwner { job_id: j.id.clone(), job_name: j.name.clone(), node_id: n.id.clone(), step: n.name.clone() }));
+                out.push((
+                    n.name.to_ascii_lowercase(),
+                    StepOwner { job_id: j.id.clone(), job_name: j.name.clone(), node_id: n.id.clone(), step: n.name.clone() },
+                ));
             }
         }
         Ok(out)
@@ -624,7 +623,8 @@ impl Workspace {
         for n in &mut nodes {
             n.ai_sql = true;
         }
-        let spec = serde_json::to_string(&Spec { nodes, edges: job.edges.clone(), schedule: job.schedule.clone() }).map_err(|e| Error::Invalid(e.to_string()))?;
+        let spec =
+            serde_json::to_string(&Spec { nodes, edges: job.edges.clone(), schedule: job.schedule.clone() }).map_err(|e| Error::Invalid(e.to_string()))?;
         self.conn.lock().execute("UPDATE jobs SET spec_json = ?2 WHERE id = ?1", params![job.id, spec])?;
         Ok(())
     }
@@ -738,7 +738,16 @@ impl Workspace {
             "DELETE FROM job_runs WHERE job_id = ?1 AND id NOT IN (SELECT id FROM job_runs WHERE job_id = ?1 ORDER BY id DESC LIMIT ?2)",
             params![job_id, RUNS_KEPT],
         )?;
-        Ok(JobRun { id, job_id: job_id.into(), trigger: trigger.into(), started_at: now, finished_at: None, status: "running".into(), nodes: vec![], error: None })
+        Ok(JobRun {
+            id,
+            job_id: job_id.into(),
+            trigger: trigger.into(),
+            started_at: now,
+            finished_at: None,
+            status: "running".into(),
+            nodes: vec![],
+            error: None,
+        })
     }
 
     pub fn update_job_run(&self, run: &JobRun) -> Result<()> {
@@ -759,7 +768,14 @@ impl Workspace {
     /// Save the whole log of a run (replaces what was saved before).
     pub fn set_job_run_log(&self, run_id: i64, log: &[RunLogEntry]) -> Result<()> {
         // Statements and messages (which can quote one) without passwords and keys.
-        let log: Vec<RunLogEntry> = log.iter().map(|e| RunLogEntry { message: databrain_connector_core::sql::redact_secrets(&e.message), sql: e.sql.as_deref().map(databrain_connector_core::sql::redact_secrets), ..e.clone() }).collect();
+        let log: Vec<RunLogEntry> = log
+            .iter()
+            .map(|e| RunLogEntry {
+                message: databrain_connector_core::sql::redact_secrets(&e.message),
+                sql: e.sql.as_deref().map(databrain_connector_core::sql::redact_secrets),
+                ..e.clone()
+            })
+            .collect();
         let json = serde_json::to_string(&log).map_err(|e| Error::Invalid(e.to_string()))?;
         self.conn.lock().execute("UPDATE job_runs SET log_json = ?2 WHERE id = ?1", params![run_id, json])?;
         Ok(())
@@ -817,7 +833,8 @@ impl Workspace {
 
     /// Who holds the job now (owner, until), if anyone.
     pub fn job_lease(&self, job_id: &str) -> Result<Option<(String, i64)>> {
-        let r: Option<(Option<String>, Option<i64>)> = self.conn.lock().query_row("SELECT lease_owner, lease_until FROM jobs WHERE id = ?1", [job_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let r: Option<(Option<String>, Option<i64>)> =
+            self.conn.lock().query_row("SELECT lease_owner, lease_until FROM jobs WHERE id = ?1", [job_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         Ok(match r {
             Some((Some(o), Some(u))) if u >= now_ms() => Some((o, u)),
             _ => None,
@@ -947,7 +964,11 @@ mod tests {
         let mut run = ws.start_job_run(&j.id, "manual").unwrap();
         run.status = "success".into();
         run.finished_at = Some(run.started_at + 5);
-        run.nodes = vec![NodeRunRecord { node_id: "n1".into(), name: "orders".into(), summary: NodeRunSummary { status: "success".into(), rows: Some(3), ..Default::default() } }];
+        run.nodes = vec![NodeRunRecord {
+            node_id: "n1".into(),
+            name: "orders".into(),
+            summary: NodeRunSummary { status: "success".into(), rows: Some(3), ..Default::default() },
+        }];
         ws.update_job_run(&run).unwrap();
         ws.set_job_node_results(&j.id, &run.nodes).unwrap();
         let back = ws.get_job(&j.id).unwrap();
@@ -958,7 +979,17 @@ mod tests {
 
         // Run log: saved whole, read back per run of its job.
         assert!(ws.job_run_log(&j.id, run.id).unwrap().is_empty());
-        let line = RunLogEntry { seq: 1, at: 5, node_id: Some("n1".into()), step: Some("orders".into()), level: "info".into(), message: "Ran".into(), sql: Some("select 1".into()), rows: Some(1), duration_ms: Some(2) };
+        let line = RunLogEntry {
+            seq: 1,
+            at: 5,
+            node_id: Some("n1".into()),
+            step: Some("orders".into()),
+            level: "info".into(),
+            message: "Ran".into(),
+            sql: Some("select 1".into()),
+            rows: Some(1),
+            duration_ms: Some(2),
+        };
         ws.set_job_run_log(run.id, std::slice::from_ref(&line)).unwrap();
         assert_eq!(ws.job_run_log(&j.id, run.id).unwrap(), vec![line]);
         assert!(ws.job_run_log("other", run.id).is_err());
@@ -1042,7 +1073,8 @@ pub fn export_file_name(template: Option<&str>, step: &str, job: &str, format: F
         .replace("{job}", job)
         .replace("{date}", &at.format("%Y-%m-%d").to_string())
         .replace("{time}", &at.format("%H%M%S").to_string());
-    let mut clean: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() { '_' } else { c }).collect();
+    let mut clean: String =
+        name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() { '_' } else { c }).collect();
     clean = clean.trim().trim_start_matches('.').to_string();
     if clean.is_empty() {
         clean = step.to_string();

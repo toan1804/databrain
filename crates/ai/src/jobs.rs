@@ -157,7 +157,11 @@ fn parse_schedule(v: Option<&Value>) -> Result<JobSchedule> {
         sch.enabled = true;
         sch.mode = ScheduleMode::Daily;
         sch.at = at.to_string();
-        sch.weekdays = v.get("weekdays").and_then(|w| w.as_array()).map(|a| a.iter().filter_map(|d| d.as_u64()).filter(|d| *d <= 6).map(|d| d as u8).collect()).unwrap_or_default();
+        sch.weekdays = v
+            .get("weekdays")
+            .and_then(|w| w.as_array())
+            .map(|a| a.iter().filter_map(|d| d.as_u64()).filter(|d| *d <= 6).map(|d| d as u8).collect())
+            .unwrap_or_default();
     }
     Ok(sch)
 }
@@ -166,7 +170,8 @@ fn parse_schedule(v: Option<&Value>) -> Result<JobSchedule> {
 /// jobs' steps (lowercase). Returns the job (not saved) and notes for the model.
 pub fn build_job(args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Result<(Job, Vec<String>)> {
     let name = s(args, "name").ok_or_else(|| AiError::Policy("missing argument `name`".into()))?.to_string();
-    let steps = args.get("steps").and_then(|x| x.as_array()).filter(|a| !a.is_empty()).ok_or_else(|| AiError::Policy("a job needs at least one step".into()))?;
+    let steps =
+        args.get("steps").and_then(|x| x.as_array()).filter(|a| !a.is_empty()).ok_or_else(|| AiError::Policy("a job needs at least one step".into()))?;
     let mut notes = Vec::new();
     // Names first: links and results.<step> refer to them.
     let mut ids: HashMap<String, String> = HashMap::new();
@@ -234,7 +239,8 @@ pub fn build_job(args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Re
                 node["connection_id"] = json!(c.id);
             }
             JobNodeKind::Load => {
-                let t = resolve_conn(conns, s(st, "target_connection").ok_or_else(|| AiError::Policy(format!("load step \"{n}\" needs a target_connection")))?)?;
+                let t =
+                    resolve_conn(conns, s(st, "target_connection").ok_or_else(|| AiError::Policy(format!("load step \"{n}\" needs a target_connection")))?)?;
                 if t.read_only {
                     return Err(AiError::Policy(format!("\"{}\" is read-only; a load step can't write into it", t.name)));
                 }
@@ -252,7 +258,9 @@ pub fn build_job(args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Re
                     return Err(AiError::Policy(format!("load step \"{n}\" ({}) needs key_columns", s(st, "load_mode").unwrap_or_default())));
                 }
                 if ups.is_empty() && sql.is_empty() {
-                    return Err(AiError::Policy(format!("load step \"{n}\" needs an input: run it after a step (after) or give DuckDB SQL over results.<step>")));
+                    return Err(AiError::Policy(format!(
+                        "load step \"{n}\" needs an input: run it after a step (after) or give DuckDB SQL over results.<step>"
+                    )));
                 }
                 node["target_connection_id"] = json!(t.id);
                 node["target_table"] = json!(table);
@@ -264,7 +272,9 @@ pub fn build_job(args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Re
             }
             JobNodeKind::Export => {
                 if ups.is_empty() && sql.is_empty() {
-                    return Err(AiError::Policy(format!("export step \"{n}\" needs an input: run it after a step (after) or give DuckDB SQL over results.<step>")));
+                    return Err(AiError::Policy(format!(
+                        "export step \"{n}\" needs an input: run it after a step (after) or give DuckDB SQL over results.<step>"
+                    )));
                 }
                 let fmt = match s(st, "format").unwrap_or("csv").to_ascii_lowercase().as_str() {
                     "parquet" => "parquet",
@@ -334,7 +344,11 @@ pub fn describe(job: &Job, conns: &[ConnRef]) -> String {
     if job.schedule.enabled {
         t.push_str(&match job.schedule.mode {
             ScheduleMode::Interval => format!(" · every {} min", job.schedule.minutes),
-            ScheduleMode::Daily => format!(" · daily at {}{}", job.schedule.at, if job.schedule.weekdays.is_empty() { String::new() } else { format!(" on days {:?}", job.schedule.weekdays) }),
+            ScheduleMode::Daily => format!(
+                " · daily at {}{}",
+                job.schedule.at,
+                if job.schedule.weekdays.is_empty() { String::new() } else { format!(" on days {:?}", job.schedule.weekdays) }
+            ),
         });
     }
     t.push('\n');
@@ -350,7 +364,11 @@ pub fn describe(job: &Job, conns: &[ConnRef]) -> String {
                 n.target_table.as_deref().unwrap_or("?"),
                 n.load_mode,
                 if n.key_columns.is_empty() { String::new() } else { format!(", keys {}", n.key_columns.join(", ")) },
-                if n.load_mode == LoadMode::Append || n.load_mode == LoadMode::Truncate { if n.create_table { ", creates a missing table" } else { "" } } else { "" },
+                if n.load_mode == LoadMode::Append || n.load_mode == LoadMode::Truncate {
+                    if n.create_table { ", creates a missing table" } else { "" }
+                } else {
+                    ""
+                },
             )),
             JobNodeKind::Export => t.push_str(&format!(
                 "- {} = save to a {} file in {}{after}\n",
@@ -386,8 +404,11 @@ pub fn update_job_schema() -> Value {
     let mut v = create_job_schema();
     v["properties"]["job"] = json!({"type": "string", "description": "Name or id of the job to change"});
     v["properties"]["name"]["description"] = json!("New job name (omit to keep it)");
-    v["properties"]["steps"]["description"] = json!("The COMPLETE list of steps after the change (start from get_job's spec). Steps keep their place, history and output when their name is kept; a step left out is removed; renaming a step also renames results.<old> in the other steps' SQL");
-    v["properties"]["rename"] = json!({"type": "object", "additionalProperties": {"type": "string"}, "description": "Steps renamed: {\"old_name\": \"new_name\"}"});
+    v["properties"]["steps"]["description"] = json!(
+        "The COMPLETE list of steps after the change (start from get_job's spec). Steps keep their place, history and output when their name is kept; a step left out is removed; renaming a step also renames results.<old> in the other steps' SQL"
+    );
+    v["properties"]["rename"] =
+        json!({"type": "object", "additionalProperties": {"type": "string"}, "description": "Steps renamed: {\"old_name\": \"new_name\"}"});
     v["required"] = json!(["job", "steps"]);
     v
 }
@@ -596,7 +617,8 @@ pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<Str
         }
     }
     let max_x = old.nodes.iter().map(|n| n.x).fold(f64::MIN, f64::max);
-    let new_ids: HashMap<String, String> = job.nodes.iter().filter(|n| !map.contains_key(&n.id)).map(|n| (n.id.clone(), databrain_workspace::new_id())).collect();
+    let new_ids: HashMap<String, String> =
+        job.nodes.iter().filter(|n| !map.contains_key(&n.id)).map(|n| (n.id.clone(), databrain_workspace::new_id())).collect();
     let fresh = |id: &str| new_ids.get(id).cloned().unwrap_or_default();
     for n in &mut job.nodes {
         match map.get(&n.id).and_then(|oid| old.nodes.iter().find(|o| &o.id == oid)) {
@@ -677,14 +699,22 @@ mod tests {
     fn refuses_what_would_not_run() {
         let c = conns();
         let bad = |steps: Value| build_job(&json!({"name": "j", "steps": steps}), &c, &HashSet::new()).unwrap_err().to_string();
-        assert!(bad(json!([{"name": "a", "connection": "Sales PG", "sql": "select 1"}, {"name": "b", "connection": "Sales PG", "sql": "select * from results.a"}])).contains("Results (DuckDB)"));
+        assert!(
+            bad(json!([{"name": "a", "connection": "Sales PG", "sql": "select 1"}, {"name": "b", "connection": "Sales PG", "sql": "select * from results.a"}]))
+                .contains("Results (DuckDB)")
+        );
         assert!(bad(json!([{"name": "a", "connection": "Nope", "sql": "select 1"}])).contains("no connection"));
         assert!(bad(json!([{"name": "a", "connection": "Secret", "sql": "select 1"}])).contains("AI is disabled"));
         assert!(bad(json!([{"name": "a", "connection": "Results", "sql": "select 1"}, {"name": "w", "action": "load", "after": ["a"], "target_connection": "Reporting", "target_table": "t"}])).contains("read-only"));
         assert!(bad(json!([{"name": "a", "connection": "Results", "sql": "select 1", "after": ["b"]}, {"name": "b", "connection": "Results", "sql": "select 2", "after": ["a"]}])).contains("circle"));
         assert!(bad(json!([{"name": "bad name", "connection": "Results", "sql": "select 1"}])).contains("identifier"));
         let taken: HashSet<String> = ["orders".to_string()].into();
-        assert!(build_job(&json!({"name": "j", "steps": [{"name": "Orders", "connection": "Results", "sql": "select 1"}]}), &c, &taken).unwrap_err().to_string().contains("already"));
+        assert!(
+            build_job(&json!({"name": "j", "steps": [{"name": "Orders", "connection": "Results", "sql": "select 1"}]}), &c, &taken)
+                .unwrap_err()
+                .to_string()
+                .contains("already")
+        );
     }
 
     #[test]
@@ -719,7 +749,12 @@ mod tests {
         assert!(new.nodes[2].id.len() > 5 && new.nodes[2].x > 500.0);
         assert!(new.edges.iter().any(|e| e.from == "n1" && e.to == new.nodes[2].id));
         let ch = changes(&old, &new);
-        assert!(ch.contains(&"renames step orders to orders_2026".to_string()) && ch.contains(&"adds step daily_file".to_string()) && ch.contains(&"turns the schedule off".to_string()), "{ch:?}");
+        assert!(
+            ch.contains(&"renames step orders to orders_2026".to_string())
+                && ch.contains(&"adds step daily_file".to_string())
+                && ch.contains(&"turns the schedule off".to_string()),
+            "{ch:?}"
+        );
         // Leaving a step out removes it.
         let (fewer, _) = merge_job(&old, &json!({"job": "j", "steps": [old_step(&spec)]}), &c, &HashSet::new()).unwrap();
         assert!(changes(&old, &fewer).iter().any(|x| x == "removes step daily"));
@@ -731,7 +766,10 @@ mod tests {
 
     #[test]
     fn renames_results_references() {
-        assert_eq!(rename_results("select * from results.a join RESULTS.\"a\" x join results.ab", "a", "b"), "select * from results.b join RESULTS.\"b\" x join results.ab");
+        assert_eq!(
+            rename_results("select * from results.a join RESULTS.\"a\" x join results.ab", "a", "b"),
+            "select * from results.b join RESULTS.\"b\" x join results.ab"
+        );
     }
 
     #[test]

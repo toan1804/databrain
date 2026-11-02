@@ -152,8 +152,10 @@ pub fn apply_oracle_client_setting(state: &AppState) {
     #[cfg(feature = "oracle")]
     {
         use databrain_connector_oracle::client;
-        let dir = state.workspace.get_setting(ORACLE_CLIENT_SETTING).ok().flatten().and_then(|v| v.as_str().map(str::to_string)).filter(|d| !d.trim().is_empty());
-        let saved: Option<ClientManifest> = state.workspace.get_setting(ORACLE_CLIENT_MANIFEST_SETTING).ok().flatten().and_then(|v| serde_json::from_value(v).ok());
+        let dir =
+            state.workspace.get_setting(ORACLE_CLIENT_SETTING).ok().flatten().and_then(|v| v.as_str().map(str::to_string)).filter(|d| !d.trim().is_empty());
+        let saved: Option<ClientManifest> =
+            state.workspace.get_setting(ORACLE_CLIENT_MANIFEST_SETTING).ok().flatten().and_then(|v| serde_json::from_value(v).ok());
         client::set_default_dir(dir.clone());
         match (dir, saved) {
             (Some(d), Some(m)) if m.dir == d => client::set_trusted(Some((d, m.files))),
@@ -175,7 +177,11 @@ pub fn apply_oracle_client_setting(state: &AppState) {
 
 /// Is Oracle Instant Client available? (`lib_dir`: a folder to check first.)
 #[cfg(feature = "oracle")]
-pub async fn oracle_client_status(state: &AppState, lib_dir: Option<String>, app_dir: Option<PathBuf>) -> Result<databrain_connector_oracle::client::ClientStatus> {
+pub async fn oracle_client_status(
+    state: &AppState,
+    lib_dir: Option<String>,
+    app_dir: Option<PathBuf>,
+) -> Result<databrain_connector_oracle::client::ClientStatus> {
     let extra: Vec<PathBuf> = app_dir.into_iter().map(|d| d.join("oracle")).collect();
     let st = blocking(move || Ok(databrain_connector_oracle::client::status(lib_dir.as_deref(), &extra))).await?;
     if st.installed {
@@ -214,9 +220,8 @@ pub async fn oracle_install_client(state: &AppState, app_dir: PathBuf) -> Result
     ORACLE_INSTALL_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
     let dir = blocking(move || {
         let progress = |p: databrain_connector_oracle::client::InstallProgress| ui.emit(ORACLE_INSTALL_EVENT, serde_json::to_value(&p).unwrap_or_default());
-        databrain_connector_oracle::client::install(&dest, &progress, &ORACLE_INSTALL_CANCEL).map_err(|e| {
-            if e == "cancelled" { EngineError::new("cancelled", "download cancelled") } else { EngineError::new("install", e) }
-        })
+        databrain_connector_oracle::client::install(&dest, &progress, &ORACLE_INSTALL_CANCEL)
+            .map_err(|e| if e == "cancelled" { EngineError::new("cancelled", "download cancelled") } else { EngineError::new("install", e) })
     })
     .await?;
     let d = dir.to_string_lossy().into_owned();

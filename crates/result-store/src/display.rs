@@ -113,11 +113,7 @@ fn to_large(array: &dyn Array, f: &ArrayFormatter<'_>) -> Result<DisplayText, Ar
 
 /// Format a single cell (`None` for SQL NULL).
 pub fn cell(formatter: &ArrayFormatter<'_>, array: &ArrayRef, row: usize) -> Option<String> {
-    if array.is_null(row) {
-        None
-    } else {
-        Some(formatter.value(row).to_string())
-    }
+    if array.is_null(row) { None } else { Some(formatter.value(row).to_string()) }
 }
 
 /// Coarse type family, used by the UI for alignment/icons and by filters.
@@ -147,17 +143,14 @@ pub fn family(field: &Field) -> TypeFamily {
         }
         DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => TypeFamily::Date,
         DataType::Time32(_) | DataType::Time64(_) => TypeFamily::Time,
-        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
-            TypeFamily::Binary
-        }
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => TypeFamily::Binary,
         _ => TypeFamily::Other,
     }
 }
 
 /// Exact decimals are transported as text; treat them as numbers for sort/filter.
 pub fn is_decimal_text(field: &Field) -> bool {
-    matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-        && field.metadata().get(META_DB_TYPE).is_some_and(|t| is_decimal_type(t))
+    matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) && field.metadata().get(META_DB_TYPE).is_some_and(|t| is_decimal_type(t))
 }
 
 /// Database type names of exact decimals: `numeric(12,2)`, `decimal`,

@@ -1,9 +1,9 @@
 //! Cloud data warehouse connectors over HTTPS APIs: Snowflake, Databricks
 //! SQL and Google BigQuery.
 
-mod common;
 #[cfg(feature = "bigquery")]
 pub mod bigquery;
+mod common;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 #[cfg(feature = "snowflake")]

@@ -278,7 +278,14 @@ mod tests {
     fn read_only_connections() {
         use ConnectorKind::*;
         let ro = on(Postgres, true, AiPolicy { allow_write: true, ..auto_read() });
-        for sql in ["delete from t where id = 1", "create table x (a int)", "set default_transaction_read_only = off", "begin read write", "commit", "select 1; update t set a = 1"] {
+        for sql in [
+            "delete from t where id = 1",
+            "create table x (a int)",
+            "set default_transaction_read_only = off",
+            "begin read write",
+            "commit",
+            "select 1; update t set a = 1",
+        ] {
             assert!(matches!(review_sql(&ro, sql).decision, Decision::Deny(_)), "{sql}");
         }
         assert_eq!(review_sql(&ro, "select * from t").decision, Decision::Allow);

@@ -95,9 +95,7 @@ impl VaultStore {
         let nonce_raw = B64.decode(&f.nonce).map_err(|_| Self::err("vault.json is damaged"))?;
         let nonce = Nonce::try_from(nonce_raw.as_slice()).map_err(|_| Self::err("vault.json is damaged"))?;
         let data = B64.decode(&f.data).map_err(|_| Self::err("vault.json is damaged"))?;
-        let plain = Aes256Gcm::new(&key)
-            .decrypt(&nonce, data.as_slice())
-            .map_err(|_| Self::err("cannot decrypt (vault.key does not match vault.json)"))?;
+        let plain = Aes256Gcm::new(&key).decrypt(&nonce, data.as_slice()).map_err(|_| Self::err("cannot decrypt (vault.key does not match vault.json)"))?;
         serde_json::from_slice(&plain).map_err(|_| Self::err("vault.json is damaged"))
     }
 

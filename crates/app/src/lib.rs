@@ -4,10 +4,10 @@ pub mod ai_api;
 pub mod api;
 pub mod background;
 mod commands;
+pub mod conn_io;
 pub mod jobs;
 pub mod logging;
 pub mod meta_writer;
-pub mod conn_io;
 pub mod sql_files;
 pub mod updates;
 
@@ -15,18 +15,11 @@ use std::sync::Arc;
 
 use api::{AppState, ConnectionView, SaveConnectionArgs, Span};
 use databrain_auth::SwitchableStore;
-use databrain_connector_core::{
-    ConnectionConfig, ConnectorInfo, ConnectorKind, DbObject, ObjectDetail, SchemaInfo,
-};
+use databrain_connector_core::{ConnectionConfig, ConnectorInfo, ConnectorKind, DbObject, ObjectDetail, SchemaInfo};
 use databrain_export::ExportOptions;
-use databrain_query_engine::{
-    EngineError, EventSink, JobEvent, RunRequest, RunResponse, TestResult,
-};
+use databrain_query_engine::{EngineError, EventSink, JobEvent, RunRequest, RunResponse, TestResult};
 use databrain_result_store::{ColumnStats, FindResult, Page, ResultInfo, ViewSpec};
-use databrain_workspace::{
-    ConnectionProfile, Folder, FolderKind, HistoryEntry, HistoryQuery, SavedQuery, TabState,
-    Workspace,
-};
+use databrain_workspace::{ConnectionProfile, Folder, FolderKind, HistoryEntry, HistoryQuery, SavedQuery, TabState, Workspace};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Name of the event carrying [`JobEvent`] payloads.
@@ -109,12 +102,7 @@ fn macos_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
             &P::select_all(app, None)?,
         ],
     )?;
-    let window = Submenu::with_items(
-        app,
-        "Window",
-        true,
-        &[&P::minimize(app, None)?, &P::maximize(app, None)?, &P::fullscreen(app, None)?],
-    )?;
+    let window = Submenu::with_items(app, "Window", true, &[&P::minimize(app, None)?, &P::maximize(app, None)?, &P::fullscreen(app, None)?])?;
     Menu::with_items(app, &[&app_menu, &edit, &window])
 }
 

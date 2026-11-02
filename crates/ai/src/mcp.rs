@@ -184,7 +184,11 @@ impl ToolHost for McpHost {
         let answer = match asked {
             Ok(a) => a,
             Err(NoAnswer::Timeout) => {
-                tracing::warn!(tool, secs = elicit_timeout().as_secs(), "no answer to the elicitation: the client may not show prompts; not asking again this session");
+                tracing::warn!(
+                    tool,
+                    secs = elicit_timeout().as_secs(),
+                    "no answer to the elicitation: the client may not show prompts; not asking again this session"
+                );
                 return None;
             }
             Err(NoAnswer::Gone) => return None,
@@ -205,8 +209,18 @@ pub struct McpServer {
 /// the user's own connections and DataBrain workspace.
 fn annotations(name: &str) -> Value {
     let (read_only, destructive, idempotent) = match name {
-        "list_connections" | "search_schema" | "describe_table" | "list_tables" | "get_sample_rows" | "query_result" | "result_summary"
-        | "list_outputs" | "query_outputs" | "list_knowledge_notes" | "list_jobs" | "get_job" => (true, false, true),
+        "list_connections"
+        | "search_schema"
+        | "describe_table"
+        | "list_tables"
+        | "get_sample_rows"
+        | "query_result"
+        | "result_summary"
+        | "list_outputs"
+        | "query_outputs"
+        | "list_knowledge_notes"
+        | "list_jobs"
+        | "get_job" => (true, false, true),
         // Refreshes DataBrain's own index of table descriptions.
         "index_tables" => (false, false, true),
         "add_knowledge_note" | "save_query" | "create_job" => (false, false, false),
@@ -240,16 +254,17 @@ fn tool_list() -> Vec<Value> {
 
 impl McpServer {
     fn connections(&self) -> Vec<databrain_workspace::ConnectionProfile> {
-        self.engine
-            .workspace()
-            .list_connections()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| c.ai_policy.mcp_enabled && c.ai_policy.ai_enabled)
-            .collect()
+        self.engine.workspace().list_connections().unwrap_or_default().into_iter().filter(|c| c.ai_policy.mcp_enabled && c.ai_policy.ai_enabled).collect()
     }
 
-    async fn call_tool(&self, name: &str, args: &Value, peer: &Arc<Peer>, progress: Option<Value>, cancel: tokio_util::sync::CancellationToken) -> (String, bool) {
+    async fn call_tool(
+        &self,
+        name: &str,
+        args: &Value,
+        peer: &Arc<Peer>,
+        progress: Option<Value>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> (String, bool) {
         if name == "list_connections" {
             let list: Vec<Value> = self
                 .connections()

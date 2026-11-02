@@ -54,10 +54,7 @@ fn state() -> (AppState, Arc<CollectingSink>, tempfile::TempDir) {
 async fn finished_results(sink: &CollectingSink, job: &str) -> Vec<ResultInfo> {
     for _ in 0..500 {
         let evs = sink.0.lock().clone();
-        if evs
-            .iter()
-            .any(|e| matches!(e, JobEvent::JobFinished { job_id, .. } if job_id == job))
-        {
+        if evs.iter().any(|e| matches!(e, JobEvent::JobFinished { job_id, .. } if job_id == job)) {
             return evs
                 .into_iter()
                 .filter_map(|e| match e {
@@ -132,9 +129,7 @@ async fn end_to_end_sqlite() {
         },
     )
     .unwrap();
-    let RunResponse::Started { job_id, statements } = resp else {
-        panic!("expected start")
-    };
+    let RunResponse::Started { job_id, statements } = resp else { panic!("expected start") };
     assert_eq!(statements.len(), 3);
     assert_eq!(statements[0].start, 5);
     let results = finished_results(&sink, &job_id).await;
@@ -143,59 +138,28 @@ async fn end_to_end_sqlite() {
     assert_eq!(results[0].total_rows, 4);
 
     let view = ViewSpec {
-        filters: vec![ColumnFilter {
-            column: 2,
-            op: FilterOp::Equals,
-            value: "Hanoi".into(),
-        }],
+        filters: vec![ColumnFilter { column: 2, op: FilterOp::Equals, value: "Hanoi".into() }],
         quick_filter: None,
-        sort: vec![SortKey {
-            column: 3,
-            descending: true,
-        }],
+        sort: vec![SortKey { column: 3, descending: true }],
     };
     let page = fetch_page(&st, rid.clone(), view.clone(), 0, 100).await.unwrap();
     assert_eq!(page.view_rows, 2);
     assert_eq!(page.rows[0][1].as_deref(), Some("Chi"));
 
-    let f = find_in_result(&st, rid.clone(), ViewSpec::default(), "han".into(), None, 100, false)
-        .await
-        .unwrap();
+    let f = find_in_result(&st, rid.clone(), ViewSpec::default(), "han".into(), None, 100, false).await.unwrap();
     assert_eq!(f.matches.len(), 2);
 
     let stats = column_stats(&st, rid.clone(), ViewSpec::default(), 2).await.unwrap();
     assert_eq!((stats.nulls, stats.distinct), (1, 2));
 
-    let tsv = copy_rows(
-        &st,
-        rid.clone(),
-        view.clone(),
-        0,
-        1,
-        ExportOptions::new(ExportFormat::Tsv),
-    )
-    .await
-    .unwrap();
+    let tsv = copy_rows(&st, rid.clone(), view.clone(), 0, 1, ExportOptions::new(ExportFormat::Tsv)).await.unwrap();
     assert_eq!(tsv, "id\tname\tcity\tage\n3\tChi\tHanoi\t42\n");
 
     let out = dir.path().join("hanoi.csv");
-    let n = export_result(
-        &st,
-        rid.clone(),
-        view,
-        ExportOptions::new(ExportFormat::Csv),
-        out.to_string_lossy().into(),
-    )
-    .await
-    .unwrap();
+    let n = export_result(&st, rid.clone(), view, ExportOptions::new(ExportFormat::Csv), out.to_string_lossy().into()).await.unwrap();
     assert_eq!(n, 2);
-    assert_eq!(
-        std::fs::read_to_string(&out).unwrap(),
-        "id,name,city,age\n3,Chi,Hanoi,42\n1,Ann,Hanoi,31\n"
-    );
-    assert!(export_result(&st, rid.clone(), ViewSpec::default(), ExportOptions::new(ExportFormat::Csv), "rel.csv".into())
-        .await
-        .is_err());
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "id,name,city,age\n3,Chi,Hanoi,42\n1,Ann,Hanoi,31\n");
+    assert!(export_result(&st, rid.clone(), ViewSpec::default(), ExportOptions::new(ExportFormat::Csv), "rel.csv".into()).await.is_err());
 
     // Explorer
     let objs = list_objects(&st, &profile.id, "main").await.unwrap();
@@ -259,9 +223,15 @@ async fn credential_store_switch_moves_secrets() {
     let keychain = Arc::new(MemoryStore::default());
     struct Shared(Arc<MemoryStore>);
     impl SecretStore for Shared {
-        fn get(&self, r: &SecretRef) -> std::result::Result<Option<secrecy::SecretString>, databrain_auth::AuthError> { self.0.get(r) }
-        fn set(&self, r: &SecretRef, v: &secrecy::SecretString) -> std::result::Result<(), databrain_auth::AuthError> { self.0.set(r, v) }
-        fn delete(&self, r: &SecretRef) -> std::result::Result<(), databrain_auth::AuthError> { self.0.delete(r) }
+        fn get(&self, r: &SecretRef) -> std::result::Result<Option<secrecy::SecretString>, databrain_auth::AuthError> {
+            self.0.get(r)
+        }
+        fn set(&self, r: &SecretRef, v: &secrecy::SecretString) -> std::result::Result<(), databrain_auth::AuthError> {
+            self.0.set(r, v)
+        }
+        fn delete(&self, r: &SecretRef) -> std::result::Result<(), databrain_auth::AuthError> {
+            self.0.delete(r)
+        }
     }
     let store = Arc::new(SwitchableStore::with_stores(StoreKind::Keychain, Box::new(Shared(keychain.clone())), Box::new(VaultStore::new(dir.path()))));
     let st = AppState::new(ws.clone(), store.clone(), Arc::new(CollectingSink::default()), Arc::new(TestUi::default()));
@@ -272,7 +242,18 @@ async fn credential_store_switch_moves_secrets() {
     let saved = save_connection(
         &st,
         SaveConnectionArgs {
-            profile: ConnectionProfile { id: String::new(), name: "PG".into(), config: cfg, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            profile: ConnectionProfile {
+                id: String::new(),
+                name: "PG".into(),
+                config: cfg,
+                color: None,
+                env: EnvTag::None,
+                folder_id: None,
+                has_secret: false,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
             secret: Some("hunter2".into()),
             clear_secret: false,
             extra_secrets: [("ssh".to_string(), "sshpw".to_string())].into_iter().collect(),
@@ -317,7 +298,18 @@ fn delete_connection_cleans_up() {
     let saved = save_connection(
         &st,
         SaveConnectionArgs {
-            profile: ConnectionProfile { id: String::new(), name: "PG".into(), config: cfg, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 },
+            profile: ConnectionProfile {
+                id: String::new(),
+                name: "PG".into(),
+                config: cfg,
+                color: None,
+                env: EnvTag::None,
+                folder_id: None,
+                has_secret: false,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
             secret: Some("pw".into()),
             clear_secret: false,
             extra_secrets: [("ssh".to_string(), "sshpw".to_string()), ("client_secret".to_string(), "cs".to_string())].into_iter().collect(),
@@ -327,9 +319,33 @@ fn delete_connection_cleans_up() {
     let id = saved.id.clone();
     st.secrets.set(&SecretRef::slot(&id, "oauth"), &"tokens".to_string().into()).unwrap();
     st.workspace
-        .kn_save_note(databrain_workspace::KnNote { id: String::new(), connection_id: id.clone(), target: None, body: "rule".into(), author: "user".into(), status: databrain_workspace::NoteStatus::Approved, created_at: 0, replaces: None })
+        .kn_save_note(databrain_workspace::KnNote {
+            id: String::new(),
+            connection_id: id.clone(),
+            target: None,
+            body: "rule".into(),
+            author: "user".into(),
+            status: databrain_workspace::NoteStatus::Approved,
+            created_at: 0,
+            replaces: None,
+        })
         .unwrap();
-    let q = save_query(&st, SavedQuery { id: String::new(), name: "q".into(), sql: "select 1".into(), connection_id: Some(id.clone()), folder_id: None, description: None, tags: vec![], ai_example: false, created_at: 0, updated_at: 0 }).unwrap();
+    let q = save_query(
+        &st,
+        SavedQuery {
+            id: String::new(),
+            name: "q".into(),
+            sql: "select 1".into(),
+            connection_id: Some(id.clone()),
+            folder_id: None,
+            description: None,
+            tags: vec![],
+            ai_example: false,
+            created_at: 0,
+            updated_at: 0,
+        },
+    )
+    .unwrap();
 
     delete_connection(&st, &id).unwrap();
     assert!(list_connections(&st).unwrap().is_empty());
@@ -399,7 +415,11 @@ fn secrets_are_stored_in_secret_store_only() {
     p.has_secret = false;
     let kept = save_connection(&st, SaveConnectionArgs { profile: p.clone(), secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
     assert!(kept.has_secret);
-    let cleared = save_connection(&st, SaveConnectionArgs { profile: p, secret: None, clear_secret: true, extra_secrets: [("ssh".to_string(), String::new())].into_iter().collect() }).unwrap();
+    let cleared = save_connection(
+        &st,
+        SaveConnectionArgs { profile: p, secret: None, clear_secret: true, extra_secrets: [("ssh".to_string(), String::new())].into_iter().collect() },
+    )
+    .unwrap();
     assert!(!cleared.has_secret);
     assert!(st.secrets.get(&r).unwrap().is_none());
     assert!(st.secrets.get(&SecretRef::slot(&saved.id, "ssh")).unwrap().is_none());
@@ -838,9 +858,25 @@ fn uri_passwords_go_to_the_secret_store() {
     let profile = |name: &str, uri: &str| {
         let mut config = ConnectionConfig::new(ConnectorKind::Mongodb, AuthMethod::None);
         config.options.insert(crate::conn_io::URI_OPTION.into(), uri.into());
-        ConnectionProfile { id: String::new(), name: name.into(), config, color: None, env: EnvTag::Dev, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 }
+        ConnectionProfile {
+            id: String::new(),
+            name: name.into(),
+            config,
+            color: None,
+            env: EnvTag::Dev,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        }
     };
-    let args = |p: ConnectionProfile, secret: Option<&str>| SaveConnectionArgs { profile: p, secret: secret.map(Into::into), clear_secret: false, extra_secrets: Default::default() };
+    let args = |p: ConnectionProfile, secret: Option<&str>| SaveConnectionArgs {
+        profile: p,
+        secret: secret.map(Into::into),
+        clear_secret: false,
+        extra_secrets: Default::default(),
+    };
     let stored = |id: &str| st.secrets.get(&SecretRef::for_connection(id)).unwrap().map(|s| s.expose_secret().to_string());
 
     let saved = save_connection(&st, args(profile("m", "mongodb://ann:p%40ss@h/db"), None)).unwrap();
@@ -910,9 +946,7 @@ async fn mcp_two_connections_ask_through_elicitation() {
     async fn write(w: &mut tokio::io::DuplexStream, v: serde_json::Value) {
         w.write_all(format!("{v}\n").as_bytes()).await.unwrap();
     }
-    let call = |name: &str, conn: &str, sql: &str, id: u64| {
-        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": {"connection": conn, "sql": sql, "purpose": "test"}}})
-    };
+    let call = |name: &str, conn: &str, sql: &str, id: u64| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": {"connection": conn, "sql": sql, "purpose": "test"}}});
     write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}}, "clientInfo": {"name": "t", "version": "0"}}})).await;
     let init = next(&mut lines).await;
     assert_eq!(init["id"], 1, "{init}");
@@ -1001,9 +1035,7 @@ async fn mcp_unanswered_question_ends_the_call_and_is_not_asked_again() {
     }
     write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}}, "clientInfo": {"name": "t", "version": "0"}}})).await;
     assert_eq!(next(&mut lines).await["id"], 1);
-    let call = |id: u64| {
-        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"_meta": {"progressToken": "p1"}, "name": "run_query", "arguments": {"connection": "quiet", "sql": "select 1", "purpose": "t"}}})
-    };
+    let call = |id: u64| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"_meta": {"progressToken": "p1"}, "name": "run_query", "arguments": {"connection": "quiet", "sql": "select 1", "purpose": "t"}}});
     let started = std::time::Instant::now();
     write(&mut client_tx, call(2)).await;
     let progress = next(&mut lines).await;
@@ -1036,7 +1068,11 @@ async fn mcp_unanswered_question_ends_the_call_and_is_not_asked_again() {
     tokio::time::timeout(Duration::from_secs(10), srv).await.expect("server stops at EOF").unwrap().unwrap();
     let audit = st.workspace.list_audit(50).unwrap();
     // One "no answer"; nothing approved. (Each refused call is also audited as blocked by the tool wrapper.)
-    assert_eq!(audit.iter().filter(|a| a.tool == "run_query" && a.decision == "denied").map(|a| a.summary.as_deref()).collect::<Vec<_>>(), vec![Some("no answer")], "{audit:?}");
+    assert_eq!(
+        audit.iter().filter(|a| a.tool == "run_query" && a.decision == "denied").map(|a| a.summary.as_deref()).collect::<Vec<_>>(),
+        vec![Some("no answer")],
+        "{audit:?}"
+    );
     assert!(audit.iter().all(|a| a.decision != "approved"), "{audit:?}");
 }
 
@@ -1115,7 +1151,11 @@ async fn mcp_cancelled_call_stops_waiting() {
     write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": "call-2", "method": "tools/call", "params": {"name": "run_query", "arguments": {"connection": "asks", "sql": "select 1", "purpose": "t"}}})).await;
     let ask = next(&mut lines).await;
     assert_eq!(ask["method"], "elicitation/create", "{ask}");
-    write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "call-2", "reason": "user stopped"}})).await;
+    write(
+        &mut client_tx,
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "call-2", "reason": "user stopped"}}),
+    )
+    .await;
     // The next line is the ping's answer: the cancelled call sent nothing.
     write(&mut client_tx, serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "ping"})).await;
     let r = next(&mut lines).await;

@@ -24,7 +24,22 @@ impl databrain_app::ai_api::UiBridge for NoUi {
 async fn run(st: &AppState, conn: &str, sql: &str) -> databrain_query_engine::StatementOutcomeView {
     let out = st
         .engine
-        .run_and_wait(&st.hub, RunRequest { connection_id: conn.into(), tab_id: "t".into(), sql: sql.into(), base_offset: 0, row_limit: None, confirmed: true, origin: Default::default(), session_key: None, output_name: None, params: Default::default() }, None)
+        .run_and_wait(
+            &st.hub,
+            RunRequest {
+                connection_id: conn.into(),
+                tab_id: "t".into(),
+                sql: sql.into(),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+            },
+            None,
+        )
         .await
         .unwrap();
     out.into_iter().next_back().unwrap()
@@ -37,12 +52,30 @@ async fn loads_a_result_into_another_connection() {
     let dir = tempfile::tempdir().unwrap();
     let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
     c.file_path = Some(dir.path().join("target.db").to_string_lossy().into_owned());
-    let profile = ConnectionProfile { id: String::new(), name: "target".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
-    let target = api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "target".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    let target =
+        api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
 
     let r = run(&st, &duck, "select i as id, 'name ' || i as name from range(25) t(i)").await;
     let info = r.result.unwrap();
-    let args = |mode: LoadMode| LoadResultArgs { target_connection_id: target.clone(), table: "people".into(), mode, key_columns: vec!["id".into()], create_table: true };
+    let args = |mode: LoadMode| LoadResultArgs {
+        target_connection_id: target.clone(),
+        table: "people".into(),
+        mode,
+        key_columns: vec!["id".into()],
+        create_table: true,
+    };
 
     // Dry run keeps nothing.
     let dry = api::dry_run_result_load(&st, &info.id, args(LoadMode::Append)).await.unwrap();
@@ -78,7 +111,18 @@ async fn checks_the_target_path_before_loading() {
     let dir = tempfile::tempdir().unwrap();
     let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
     c.file_path = Some(dir.path().join("t.db").to_string_lossy().into_owned());
-    let profile = ConnectionProfile { id: String::new(), name: "lite".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "lite".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
     let lite = api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
     run(&st, &lite, "create table people (id integer primary key, name text)").await;
     run(&st, &lite, "create view adults as select * from people").await;
@@ -116,7 +160,18 @@ async fn checks_the_target_path_before_loading() {
     // A DuckDB file: its database and main schema are the defaults.
     let mut c = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
     c.file_path = Some(dir.path().join("dst.duckdb").to_string_lossy().into_owned());
-    let profile = ConnectionProfile { id: String::new(), name: "dk".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "dk".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
     let dk = api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
     let t = api::check_load_target(&st, &dk, "items").await.unwrap();
     assert_eq!((t.resolved.as_str(), t.table_exists), ("dst.main.items", Some(false)), "{t:?}");
@@ -146,7 +201,18 @@ async fn loads_into_clickhouse_live() {
     let mut c = ConnectionConfig::new(ConnectorKind::Clickhouse, AuthMethod::Password { user });
     c.host = Some(host);
     c.port = std::env::var("DATABRAIN_CLICKHOUSE_PORT").ok().and_then(|p| p.parse().ok());
-    let profile = ConnectionProfile { id: String::new(), name: "ch".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "ch".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
     let secret = std::env::var("DATABRAIN_CLICKHOUSE_PASSWORD").ok();
     let target = api::save_connection(&st, api::SaveConnectionArgs { profile, secret, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
     run(&st, &target, "CREATE DATABASE IF NOT EXISTS databrain_load").await;
@@ -160,7 +226,13 @@ async fn loads_into_clickhouse_live() {
     )
     .await;
     let info = r.result.unwrap();
-    let args = |mode: LoadMode| LoadResultArgs { target_connection_id: target.clone(), table: "databrain_load.people".into(), mode, key_columns: vec!["id".into()], create_table: true };
+    let args = |mode: LoadMode| LoadResultArgs {
+        target_connection_id: target.clone(),
+        table: "databrain_load.people".into(),
+        mode,
+        key_columns: vec!["id".into()],
+        create_table: true,
+    };
     async fn count(st: &AppState, target: &str) -> (String, String) {
         let r = run(st, target, "select count() as n, countIf(name is null) as nulls from databrain_load.people").await.result.unwrap();
         let p = api::fetch_page(st, r.id, Default::default(), 0, 1).await.unwrap();
@@ -196,8 +268,20 @@ async fn clickhouse_refuses_keyed_loads_up_front() {
     let mut c = ConnectionConfig::new(ConnectorKind::Clickhouse, AuthMethod::Password { user: "default".into() });
     c.host = Some("127.0.0.1".into());
     c.port = Some(1);
-    let profile = ConnectionProfile { id: String::new(), name: "ch".into(), config: c, color: None, env: EnvTag::None, folder_id: None, has_secret: false, ai_policy: Default::default(), created_at: 0, updated_at: 0 };
-    let target = api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "ch".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    let target =
+        api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
     let info = run(&st, &duck, "select 1 as id").await.result.unwrap();
     for mode in [LoadMode::Update, LoadMode::Merge] {
         let args = LoadResultArgs { target_connection_id: target.clone(), table: "db.t".into(), mode, key_columns: vec!["id".into()], create_table: true };

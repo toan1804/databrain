@@ -43,13 +43,7 @@ impl Message {
         Self { role: Role::Assistant, text: text.into(), tool_calls, tool_call_id: None, tool_name: None }
     }
     pub fn tool(call: &ToolCall, content: impl Into<String>) -> Self {
-        Self {
-            role: Role::Tool,
-            text: content.into(),
-            tool_calls: vec![],
-            tool_call_id: Some(call.id.clone()),
-            tool_name: Some(call.name.clone()),
-        }
+        Self { role: Role::Tool, text: content.into(), tool_calls: vec![], tool_call_id: Some(call.id.clone()), tool_name: Some(call.name.clone()) }
     }
 }
 
@@ -76,8 +70,13 @@ pub enum ChatEvent {
     TextDelta(String),
     /// A complete tool call (adapters assemble streamed argument deltas).
     ToolCall(ToolCall),
-    Usage { input: u32, output: u32 },
-    Done { stop_reason: String },
+    Usage {
+        input: u32,
+        output: u32,
+    },
+    Done {
+        stop_reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]

@@ -51,7 +51,9 @@ fn sse(chunks: &[Value]) -> String {
 }
 
 fn tool_call(id: &str, name: &str, args: Value) -> String {
-    sse(&[json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": id, "function": {"name": name, "arguments": args.to_string()}}]}, "finish_reason": "tool_calls"}]})])
+    sse(&[
+        json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": id, "function": {"name": name, "arguments": args.to_string()}}]}, "finish_reason": "tool_calls"}]}),
+    ])
 }
 
 /// Mock server: responds based on how many tool results the request contains.
@@ -92,7 +94,11 @@ async fn mock_openai(requests: Arc<Mutex<Vec<Value>>>) -> u16 {
                     2 => {
                         let last = tool_results[1]["content"].as_str().unwrap_or("");
                         let rid = last.split("result_id=").nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or("").to_string();
-                        tool_call("c3", "query_result", json!({"result_id": rid, "sql": "select country, sum(amount) total from result group by 1 order by 2 desc"}))
+                        tool_call(
+                            "c3",
+                            "query_result",
+                            json!({"result_id": rid, "sql": "select country, sum(amount) total from result group by 1 order by 2 desc"}),
+                        )
                     }
                     _ => sse(&[
                         json!({"choices": [{"delta": {"content": "Vietnam leads "}}]}),
@@ -168,7 +174,12 @@ async fn fixture(port: u16, policy: AiPolicy) -> Fixture {
             id: String::new(),
             kind: "openai_compatible".into(),
             name: "Mock".into(),
-            config: serde_json::to_value(ProviderConfig { base_url: Some(format!("http://127.0.0.1:{port}/v1")), default_model: Some("mock-1".into()), ..Default::default() }).unwrap(),
+            config: serde_json::to_value(ProviderConfig {
+                base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+                default_model: Some("mock-1".into()),
+                ..Default::default()
+            })
+            .unwrap(),
             created_at: 0,
             updated_at: 0,
         })
@@ -253,7 +264,22 @@ async fn denied_approval_and_blocked_writes() {
     // Nothing was deleted.
     let out = f
         .engine
-        .run_and_wait(&f.hub, RunRequest { connection_id: f.conn.clone(), tab_id: "t".into(), sql: "select count(*) from orders".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None, params: Default::default() }, None)
+        .run_and_wait(
+            &f.hub,
+            RunRequest {
+                connection_id: f.conn.clone(),
+                tab_id: "t".into(),
+                sql: "select count(*) from orders".into(),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Origin::User,
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+            },
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(out[0].result.as_ref().unwrap().total_rows, 1);
@@ -376,7 +402,11 @@ async fn mcp_asks_the_user_through_elicitation() {
 
     // Accepting the form without ticking "approve", or declining, doesn't run it.
     for answer in [json!({"action": "accept", "content": {"approve": false}}), json!({"action": "decline"})] {
-        send(&mut client_w, json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "run_query", "arguments": {"connection": "shop", "sql": "select 1"}}})).await;
+        send(
+            &mut client_w,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "run_query", "arguments": {"connection": "shop", "sql": "select 1"}}}),
+        )
+        .await;
         let ask: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(ask["method"], "elicitation/create");
         send(&mut client_w, json!({"jsonrpc": "2.0", "id": ask["id"], "result": answer})).await;
@@ -386,7 +416,11 @@ async fn mcp_asks_the_user_through_elicitation() {
     }
 
     // The client closes while DataBrain waits for the user: declined, and the server stops.
-    send(&mut client_w, json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "run_query", "arguments": {"connection": "shop", "sql": "select 2"}}})).await;
+    send(
+        &mut client_w,
+        json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "run_query", "arguments": {"connection": "shop", "sql": "select 2"}}}),
+    )
+    .await;
     let ask: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
     assert_eq!(ask["method"], "elicitation/create");
     client_w.shutdown().await.unwrap();
@@ -411,9 +445,8 @@ async fn kiro_provider_drives_databrain_tools_over_acp_and_mcp() {
     let f = fixture(1, AiPolicy::default()).await;
     let agents = f._dir.0.join("kiro-agents");
     let log = f._dir.0.join("fake-kiro.log");
-    let rec = f
-        .ws
-        .save_ai_provider(AiProviderRecord {
+    let rec =
+        f.ws.save_ai_provider(AiProviderRecord {
             id: String::new(),
             kind: "kiro".into(),
             name: "Kiro".into(),
@@ -465,7 +498,13 @@ async fn kiro_provider_drives_databrain_tools_over_acp_and_mcp() {
     let evs = events.0.lock().clone();
     assert!(evs.iter().any(|e| matches!(e, AgentEvent::ToolFinished { tool, .. } if tool == "list_tables")));
     assert!(evs.iter().any(|e| matches!(e, AgentEvent::TextDelta { .. })));
-    let sid = evs.iter().find_map(|e| match e { AgentEvent::Finished { session_id, .. } => Some(session_id.clone()), _ => None }).unwrap();
+    let sid = evs
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Finished { session_id, .. } => Some(session_id.clone()),
+            _ => None,
+        })
+        .unwrap();
     let msgs = f.ws.list_ai_messages(&sid).unwrap();
     assert_eq!(msgs.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(), vec!["user", "assistant"]);
     assert_eq!(f.ws.get_setting(&format!("kiro_session:{sid}")).unwrap(), Some(json!("kiro-sess-1")));
@@ -476,7 +515,6 @@ async fn kiro_provider_drives_databrain_tools_over_acp_and_mcp() {
     assert_eq!(models, vec!["auto", "claude-sonnet-4.5"]);
 }
 
-
 /// Live: `KIRO_API_KEY=ksk_… cargo test -p databrain-ai --test agent_e2e kiro_live -- --ignored --nocapture`
 /// Uses the real kiro-cli and consumes a few Kiro credits.
 #[ignore = "live: needs kiro-cli and KIRO_API_KEY, uses Kiro credits (cargo test -- --ignored)"]
@@ -484,9 +522,8 @@ async fn kiro_provider_drives_databrain_tools_over_acp_and_mcp() {
 async fn kiro_live() {
     let key = std::env::var("KIRO_API_KEY").expect("KIRO_API_KEY");
     let f = fixture(1, AiPolicy { run_query: RunQueryPolicy::AutoRead, ..Default::default() }).await;
-    let rec = f
-        .ws
-        .save_ai_provider(AiProviderRecord {
+    let rec =
+        f.ws.save_ai_provider(AiProviderRecord {
             id: String::new(),
             kind: "kiro".into(),
             name: "Kiro".into(),
@@ -503,7 +540,15 @@ async fn kiro_live() {
     r.provider_id = Some(rec.id);
     r.message = "Using run_query, compute total order amount per country. Answer with the top country and its total.".into();
     let text = agent.run(r, "live".into(), host, events.clone(), Default::default()).await.unwrap();
-    let tools: Vec<String> = events.0.lock().iter().filter_map(|e| match e { AgentEvent::ToolFinished { tool, .. } => Some(tool.clone()), _ => None }).collect();
+    let tools: Vec<String> = events
+        .0
+        .lock()
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolFinished { tool, .. } => Some(tool.clone()),
+            _ => None,
+        })
+        .collect();
     eprintln!("tools: {tools:?}\nanswer: {text}");
     assert!(tools.iter().any(|t| t == "run_query"), "{tools:?}");
     assert!(text.contains("Vietnam") && text.contains("300"), "{text}");
@@ -537,7 +582,18 @@ async fn ai_tools_use_output_handles_with_source_policies() {
     let run = |conn: String, sql: &'static str, name: Option<&'static str>| {
         let (engine, hub) = (engine.clone(), f.hub.clone());
         async move {
-            let r = RunRequest { connection_id: conn, tab_id: uuid::Uuid::new_v4().to_string(), sql: sql.into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: name.map(Into::into), params: Default::default() };
+            let r = RunRequest {
+                connection_id: conn,
+                tab_id: uuid::Uuid::new_v4().to_string(),
+                sql: sql.into(),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Origin::User,
+                session_key: None,
+                output_name: name.map(Into::into),
+                params: Default::default(),
+            };
             engine.run_and_wait(&hub, r, None).await.unwrap()
         }
     };
@@ -567,7 +623,9 @@ async fn ai_tools_use_output_handles_with_source_policies() {
     let o = ctx.call("query_outputs", &json!({"sql": "select * from results.by_country a join results.secret b using (country)"})).await;
     assert!(o.content.contains("AI is disabled"), "{}", o.content);
     // DuckDB over outputs (a self-join stands in for two sources).
-    let o = ctx.call("query_outputs", &json!({"sql": "select a.country, a.total from results.by_country a join results.r1 b using (country) order by 2 desc"})).await;
+    let o = ctx
+        .call("query_outputs", &json!({"sql": "select a.country, a.total from results.by_country a join results.r1 b using (country) order by 2 desc"}))
+        .await;
     assert!(o.content.contains("2 rows") && o.content.contains("Vietnam\t300"), "{}", o.content);
     let o = ctx.call("query_outputs", &json!({"sql": "create table x as select 1"})).await;
     assert!(o.content.starts_with("ERROR"), "{}", o.content);
@@ -620,7 +678,11 @@ async fn table_access_rules() {
     };
     let o = ctx.call("run_query", &json!({"sql": "select country, sum(amount) from orders group by 1"})).await;
     assert!(o.content.contains("returned 2 rows"), "{}", o.content);
-    for sql in ["select * from customers", "select o.* from orders o join main.customers c on c.id = o.customer_id", "select * from orders where customer_id in (select id from customers)"] {
+    for sql in [
+        "select * from customers",
+        "select o.* from orders o join main.customers c on c.id = o.customer_id",
+        "select * from orders where customer_id in (select id from customers)",
+    ] {
         let o = ctx.call("run_query", &json!({"sql": sql})).await;
         assert!(o.content.starts_with("ERROR") && o.content.contains("main.customers"), "{sql}: {}", o.content);
     }
@@ -632,7 +694,16 @@ async fn table_access_rules() {
     // sample_rows and MCP.
     let o = ctx.call("get_sample_rows", &json!({"table": "main.customers"})).await;
     assert!(o.content.starts_with("ERROR") && o.content.contains("deny"), "{}", o.content);
-    let mcp = databrain_ai::ToolContext { caller: databrain_ai::Caller::Mcp, profile: ctx.profile.clone(), engine: engine.clone(), hub: f.hub.clone(), session_id: Some("m".into()), host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }), cancel: Default::default(), results: Mutex::new(vec![]) };
+    let mcp = databrain_ai::ToolContext {
+        caller: databrain_ai::Caller::Mcp,
+        profile: ctx.profile.clone(),
+        engine: engine.clone(),
+        hub: f.hub.clone(),
+        session_id: Some("m".into()),
+        host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+    };
     assert!(mcp.call("run_query", &json!({"sql": "select email from customers"})).await.content.starts_with("ERROR"));
 
     // The user queried customers in a tab: the AI can't read that output, nor
@@ -640,7 +711,18 @@ async fn table_access_rules() {
     let run = |conn: String, sql: &'static str, name: &'static str| {
         let (engine, hub) = (engine.clone(), f.hub.clone());
         async move {
-            let r = RunRequest { connection_id: conn, tab_id: uuid::Uuid::new_v4().to_string(), sql: sql.into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: Some(name.into()), params: Default::default() };
+            let r = RunRequest {
+                connection_id: conn,
+                tab_id: uuid::Uuid::new_v4().to_string(),
+                sql: sql.into(),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Origin::User,
+                session_key: None,
+                output_name: Some(name.into()),
+                params: Default::default(),
+            };
             let o = engine.run_and_wait(&hub, r, None).await.unwrap();
             assert!(o.iter().all(|x| x.error.is_none()), "{:?}", o[0].error);
         }
@@ -712,7 +794,18 @@ async fn knowledge_index_plan_scope_and_cancel() {
     for i in 0..60 {
         ddl.push_str(&format!("create schema s{i:02}; create table s{i:02}.t{i:02}(id integer, name varchar);"));
     }
-    let r = RunRequest { connection_id: conn.clone(), tab_id: "setup".into(), sql: ddl, base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None, params: Default::default() };
+    let r = RunRequest {
+        connection_id: conn.clone(),
+        tab_id: "setup".into(),
+        sql: ddl,
+        base_offset: 0,
+        row_limit: None,
+        confirmed: true,
+        origin: Origin::User,
+        session_key: None,
+        output_name: None,
+        params: Default::default(),
+    };
     engine.run_and_wait(&f.hub, r, None).await.unwrap();
     // The setup tab's session holds the file; Windows lets one session open it.
     engine.disconnect(&conn);
@@ -752,18 +845,49 @@ async fn knowledge_index_plan_scope_and_cancel() {
     p.ai_policy.index_batch = 100;
     f.ws.save_connection(p).unwrap();
     let calls = AtomicUsize::new(0);
-    let r = index_connection(&engine, &conn, Some(&all), &|_, _, _| { calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }, &Default::default()).await.unwrap();
+    let r = index_connection(
+        &engine,
+        &conn,
+        Some(&all),
+        &|_, _, _| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        },
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!((r.objects, r.cancelled), (60, false));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "one batch + final");
     assert_eq!(plan(&engine, &conn).await.unwrap().batch, 100);
 
     // Incremental: nothing changed → no schema is re-read.
     let calls = AtomicUsize::new(0);
-    let r = index_connection(&engine, &conn, Some(&all), &|_, _, _| { calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }, &Default::default()).await.unwrap();
+    let r = index_connection(
+        &engine,
+        &conn,
+        Some(&all),
+        &|_, _, _| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        },
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!((r.objects, r.skipped, r.changed), (60, 61, 0), "60 schemas and the empty main, all unchanged");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "no batch, final only");
     // One table altered → only its schema is re-read.
-    let alter = RunRequest { connection_id: conn.clone(), tab_id: "setup".into(), sql: "alter table s07.t07 add column email varchar".into(), base_offset: 0, row_limit: None, confirmed: true, origin: Origin::User, session_key: None, output_name: None, params: Default::default() };
+    let alter = RunRequest {
+        connection_id: conn.clone(),
+        tab_id: "setup".into(),
+        sql: "alter table s07.t07 add column email varchar".into(),
+        base_offset: 0,
+        row_limit: None,
+        confirmed: true,
+        origin: Origin::User,
+        session_key: None,
+        output_name: None,
+        params: Default::default(),
+    };
     // Each DuckDB session opens the file on its own (one writer at a time).
     engine.disconnect(&conn);
     engine.run_and_wait(&f.hub, alter, None).await.unwrap();
@@ -805,9 +929,8 @@ async fn knowledge_note_tools_add_list_update() {
     let o = ctx.call("add_knowledge_note", &json!({"note": "STATUS 2 =  shipped"})).await;
     assert!(o.content.contains("identical note already exists"), "no duplicates: {}", o.content);
     // A user note the AI later corrects.
-    let user = f
-        .ws
-        .kn_save_note(databrain_workspace::KnNote {
+    let user =
+        f.ws.kn_save_note(databrain_workspace::KnNote {
             id: String::new(),
             connection_id: f.conn.clone(),
             target: None,
@@ -853,8 +976,18 @@ async fn note_targets_must_be_real_tables() {
     // Tables seen in the explorer / completion count without asking the
     // database (`cached_only` only exists in that cache, so the database can't have answered).
     use databrain_connector_core::{ColumnInfo, DbObject, ObjectKind};
-    f.ws.meta_add_objects(&f.conn, &[DbObject { schema: "main".into(), name: "cached_only".into(), kind: ObjectKind::Table, comment: None, row_estimate: None }]).unwrap();
-    f.ws.meta_put_columns(&f.conn, "main", "cached_only", &[ColumnInfo { name: "Code".into(), data_type: "text".into(), nullable: true, is_primary_key: false, default: None, comment: None }]).unwrap();
+    f.ws.meta_add_objects(
+        &f.conn,
+        &[DbObject { schema: "main".into(), name: "cached_only".into(), kind: ObjectKind::Table, comment: None, row_estimate: None }],
+    )
+    .unwrap();
+    f.ws.meta_put_columns(
+        &f.conn,
+        "main",
+        "cached_only",
+        &[ColumnInfo { name: "Code".into(), data_type: "text".into(), nullable: true, is_primary_key: false, default: None, comment: None }],
+    )
+    .unwrap();
     assert_eq!(check_note_target(&f.engine, &f.conn, "CACHED_ONLY & main.cached_only.code").await.unwrap(), "main.cached_only & main.cached_only.Code");
     let ctx = databrain_ai::ToolContext {
         engine: f.engine.clone(),
@@ -897,7 +1030,12 @@ async fn creates_a_job_across_connections() {
     let d = c.call("describe_table", &json!({"table": "orders", "connection": profile.name})).await.content;
     assert!(!d.starts_with("ERROR"), "{d}");
     // run_query on another connection, in its dialect.
-    let other = |name: &str, ai: bool| ConnectionProfile { id: String::new(), name: name.into(), ai_policy: AiPolicy { ai_enabled: ai, ..AiPolicy::default() }, ..profile.clone() };
+    let other = |name: &str, ai: bool| ConnectionProfile {
+        id: String::new(),
+        name: name.into(),
+        ai_policy: AiPolicy { ai_enabled: ai, ..AiPolicy::default() },
+        ..profile.clone()
+    };
     f.ws.save_connection(other("Shop copy", true)).unwrap();
     f.ws.save_connection(other("Secret", false)).unwrap();
     let q = c.call("run_query", &json!({"sql": "select count(*) n from customers", "connection": "shop copy"})).await.content;
@@ -941,7 +1079,11 @@ async fn creates_a_job_across_connections() {
     assert!(ctx(false).call("update_job", &fix).await.content.contains("declined"));
     assert_eq!(f.ws.get_job(&j.id).unwrap().nodes.len(), 3, "unchanged when declined");
     let o = c.call("update_job", &fix).await;
-    assert!(o.content.starts_with("Updated job") && o.content.contains("changes step ai_orders") && o.content.contains("removes step ai_file"), "{}", o.content);
+    assert!(
+        o.content.starts_with("Updated job") && o.content.contains("changes step ai_orders") && o.content.contains("removes step ai_file"),
+        "{}",
+        o.content
+    );
     let after = f.ws.get_job(&j.id).unwrap();
     assert_eq!(after.nodes.len(), 2);
     assert_eq!(after.nodes[0].id, j.nodes[0].id, "the step kept its id");
@@ -974,7 +1116,9 @@ async fn jobs_follow_the_ai_policy() {
         cancel: Default::default(),
         results: Mutex::new(vec![]),
     };
-    let save = |name: &str, policy: AiPolicy, env: EnvTag| f.ws.save_connection(ConnectionProfile { id: String::new(), name: name.into(), ai_policy: policy, env, ..profile.clone() }).unwrap();
+    let save = |name: &str, policy: AiPolicy, env: EnvTag| {
+        f.ws.save_connection(ConnectionProfile { id: String::new(), name: name.into(), ai_policy: policy, env, ..profile.clone() }).unwrap()
+    };
     let writer = AiPolicy { allow_write: true, ..AiPolicy::default() };
     save("Writer", writer.clone(), EnvTag::Dev);
     save("Prod writer", writer, EnvTag::Prod);
@@ -988,10 +1132,16 @@ async fn jobs_follow_the_ai_policy() {
     let o = c.call("create_job", &create(json!([{"name": "w2", "connection": "Results", "sql": "create table x as select 1"}]))).await.content;
     assert!(refused(&o, "step w2") && o.contains("not allowed"), "{o}");
     // The SQL of load and export steps runs there and may only read.
-    let o = c.call("create_job", &create(json!([
-        {"name": "w3", "connection": "Shop", "sql": "select * from orders"},
-        {"name": "w4", "action": "export", "after": ["w3"], "sql": "copy (select 1) to '/tmp/x.csv'"}
-    ]))).await.content;
+    let o = c
+        .call(
+            "create_job",
+            &create(json!([
+                {"name": "w3", "connection": "Shop", "sql": "select * from orders"},
+                {"name": "w4", "action": "export", "after": ["w3"], "sql": "copy (select 1) to '/tmp/x.csv'"}
+            ])),
+        )
+        .await
+        .content;
     assert!(refused(&o, "may only read"), "{o}");
     // A load writes: the target must let the AI write, never production.
     let load = |target: &str, before: Option<&str>| {
@@ -1023,7 +1173,11 @@ async fn jobs_follow_the_ai_policy() {
         {"name": "dst", "action": "load", "after": ["src"], "target_connection": "Writer", "target_table": "orders_copy", "after_sql": "select 1; delete from customers"}
     ]})).await.content;
     assert!(!o.starts_with("ERROR"), "{o}");
-    f.ws.save_connection(ConnectionProfile { ai_policy: AiPolicy::default(), ..f.ws.list_connections().unwrap().into_iter().find(|p| p.name == "Writer").unwrap() }).unwrap();
+    f.ws.save_connection(ConnectionProfile {
+        ai_policy: AiPolicy::default(),
+        ..f.ws.list_connections().unwrap().into_iter().find(|p| p.name == "Writer").unwrap()
+    })
+    .unwrap();
     let o = c.call("run_job", &json!({"job": "J", "steps": ["dst"]})).await.content;
     assert!(refused(&o, "step dst"), "the target no longer allows writes: {o}");
 }

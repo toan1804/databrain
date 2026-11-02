@@ -20,19 +20,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 pub use oauth::{ClientAuthStyle, OAuthConfig, TokenSet};
-pub use vault::{MigrationReport, StoreKind, SwitchableStore, VaultStore};
 pub use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 pub use tokio_util::sync::CancellationToken;
+pub use vault::{MigrationReport, StoreKind, SwitchableStore, VaultStore};
 
 /// Keychain service name used for every DataBrain secret.
 pub const KEYCHAIN_SERVICE: &str = "dev.databrain.app";
 
 pub fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -105,9 +102,7 @@ impl SecretStore for KeychainStore {
         }
     }
     fn set(&self, r: &SecretRef, value: &SecretString) -> Result<(), AuthError> {
-        Self::entry(r)?
-            .set_password(value.expose_secret())
-            .map_err(|e| AuthError::Store(e.to_string()))
+        Self::entry(r)?.set_password(value.expose_secret()).map_err(|e| AuthError::Store(e.to_string()))
     }
     fn delete(&self, r: &SecretRef) -> Result<(), AuthError> {
         match Self::entry(r)?.delete_credential() {
@@ -128,10 +123,7 @@ impl SecretStore for MemoryStore {
         Ok(self.inner.lock().expect("poisoned").get(r).cloned())
     }
     fn set(&self, r: &SecretRef, value: &SecretString) -> Result<(), AuthError> {
-        self.inner
-            .lock()
-            .expect("poisoned")
-            .insert(r.clone(), value.clone());
+        self.inner.lock().expect("poisoned").insert(r.clone(), value.clone());
         Ok(())
     }
     fn delete(&self, r: &SecretRef) -> Result<(), AuthError> {
@@ -221,19 +213,12 @@ impl AuthMethod {
 
     /// Methods that sign in through the browser or a device code.
     pub fn is_interactive(&self) -> bool {
-        matches!(
-            self,
-            AuthMethod::OauthBrowser(_)
-                | AuthMethod::DeviceCode(_)
-                | AuthMethod::ExternalBrowser { .. }
-        )
+        matches!(self, AuthMethod::OauthBrowser(_) | AuthMethod::DeviceCode(_) | AuthMethod::ExternalBrowser { .. })
     }
 
     pub fn user(&self) -> Option<&str> {
         match self {
-            AuthMethod::Password { user }
-            | AuthMethod::KeyPair { user }
-            | AuthMethod::ExternalBrowser { user } => Some(user),
+            AuthMethod::Password { user } | AuthMethod::KeyPair { user } | AuthMethod::ExternalBrowser { user } => Some(user),
             AuthMethod::ApiToken { user } => user.as_deref(),
             AuthMethod::OauthBrowser(p) | AuthMethod::DeviceCode(p) => p.user.as_deref(),
             _ => None,
@@ -242,9 +227,7 @@ impl AuthMethod {
 
     pub fn oauth_params(&self) -> Option<&OAuthParams> {
         match self {
-            AuthMethod::OauthBrowser(p)
-            | AuthMethod::DeviceCode(p)
-            | AuthMethod::ClientCredentials(p) => Some(p),
+            AuthMethod::OauthBrowser(p) | AuthMethod::DeviceCode(p) | AuthMethod::ClientCredentials(p) => Some(p),
             _ => None,
         }
     }
@@ -342,10 +325,7 @@ impl fmt::Debug for Credential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Credential::None => f.write_str("Credential::None"),
-            Credential::Password { user, .. } => write!(
-                f,
-                "Credential::Password {{ user: {user:?}, password: *** }}"
-            ),
+            Credential::Password { user, .. } => write!(f, "Credential::Password {{ user: {user:?}, password: *** }}"),
             Credential::Bearer { user, .. } => {
                 write!(f, "Credential::Bearer {{ user: {user:?}, token: *** }}")
             }
@@ -407,12 +387,7 @@ pub struct StoredCredentialSource {
 
 impl StoredCredentialSource {
     pub fn new(method: AuthMethod, secret_ref: SecretRef, store: Arc<dyn SecretStore>) -> Self {
-        Self {
-            method,
-            secret_ref,
-            passphrase_ref: None,
-            store,
-        }
+        Self { method, secret_ref, passphrase_ref: None, store }
     }
     pub fn with_passphrase(mut self, r: SecretRef) -> Self {
         self.passphrase_ref = Some(r);
@@ -421,7 +396,12 @@ impl StoredCredentialSource {
 }
 
 /// The stored secret(s) of `method` as a credential (blocking reads).
-fn stored_credential(method: &AuthMethod, store: &dyn SecretStore, secret_ref: &SecretRef, passphrase_ref: Option<&SecretRef>) -> Result<Credential, AuthError> {
+fn stored_credential(
+    method: &AuthMethod,
+    store: &dyn SecretStore,
+    secret_ref: &SecretRef,
+    passphrase_ref: Option<&SecretRef>,
+) -> Result<Credential, AuthError> {
     let secret = || read_secret(store, secret_ref);
     let required = || -> Result<SecretString, AuthError> { secret()?.ok_or_else(|| AuthError::NotFound(secret_ref.0.clone())) };
     match method {
@@ -457,16 +437,8 @@ impl CredentialSource for StoredCredentialSource {
             .map_err(|e| AuthError::Store(format!("credential read failed: {e}")))?
     }
     fn status(&self) -> AuthStatus {
-        let has = matches!(self.method, AuthMethod::None)
-            || read_secret(self.store.as_ref(), &self.secret_ref)
-                .ok()
-                .flatten()
-                .is_some();
-        AuthStatus {
-            signed_in: has,
-            identity: self.method.user().map(str::to_string),
-            expires_at: None,
-        }
+        let has = matches!(self.method, AuthMethod::None) || read_secret(self.store.as_ref(), &self.secret_ref).ok().flatten().is_some();
+        AuthStatus { signed_in: has, identity: self.method.user().map(str::to_string), expires_at: None }
     }
 }
 
@@ -485,40 +457,19 @@ impl InlineCredentialSource {
 #[async_trait]
 impl CredentialSource for InlineCredentialSource {
     async fn get(&self) -> Result<Credential, AuthError> {
-        let secret = || {
-            self.secret
-                .clone()
-                .unwrap_or_else(|| SecretString::from(String::new()))
-        };
+        let secret = || self.secret.clone().unwrap_or_else(|| SecretString::from(String::new()));
         Ok(match &self.method {
             AuthMethod::None => Credential::None,
-            AuthMethod::Password { user } => Credential::Password {
-                user: user.clone(),
-                password: secret(),
-            },
-            AuthMethod::ApiToken { user } => Credential::Bearer {
-                token: secret(),
-                user: user.clone(),
-            },
-            AuthMethod::KeyPair { user } => Credential::KeyPair {
-                user: user.clone(),
-                private_key_pem: secret(),
-                passphrase: None,
-            },
+            AuthMethod::Password { user } => Credential::Password { user: user.clone(), password: secret() },
+            AuthMethod::ApiToken { user } => Credential::Bearer { token: secret(), user: user.clone() },
+            AuthMethod::KeyPair { user } => Credential::KeyPair { user: user.clone(), private_key_pem: secret(), passphrase: None },
             other => {
-                return Err(AuthError::Invalid(format!(
-                    "{:?} cannot be tested before the connection is saved",
-                    other.kind()
-                )));
+                return Err(AuthError::Invalid(format!("{:?} cannot be tested before the connection is saved", other.kind())));
             }
         })
     }
     fn status(&self) -> AuthStatus {
-        AuthStatus {
-            signed_in: true,
-            identity: self.method.user().map(str::to_string),
-            expires_at: None,
-        }
+        AuthStatus { signed_in: true, identity: self.method.user().map(str::to_string), expires_at: None }
     }
 }
 
@@ -535,9 +486,15 @@ enum TokenMode {
 /// Existing CLI login to reuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliKind {
-    GoogleAdc { scopes: Vec<String> },
-    Databricks { host: String },
-    Azure { resource: String },
+    GoogleAdc {
+        scopes: Vec<String>,
+    },
+    Databricks {
+        host: String,
+    },
+    Azure {
+        resource: String,
+    },
     /// Amazon Redshift: temporary database credentials from the AWS CLI.
     Redshift(cloud::RedshiftTarget),
 }
@@ -567,10 +524,7 @@ impl TokenSource {
         *self.state.lock().expect("poisoned") = Some(t.clone());
         if t.refresh_token.is_some() {
             // Persist without the short-lived access token.
-            let persisted = TokenSet {
-                access_token: String::new(),
-                ..t.clone()
-            };
+            let persisted = TokenSet { access_token: String::new(), ..t.clone() };
             if let Ok(json) = serde_json::to_string(&persisted) {
                 let _ = self.store.set(&self.cache_ref, &SecretString::from(json));
             }
@@ -584,10 +538,7 @@ impl TokenSource {
 
     async fn obtain(&self, interactive_ok: bool) -> Result<TokenSet, AuthError> {
         // 1. refresh token (memory or keychain)
-        let refresh = self
-            .cached()
-            .and_then(|t| t.refresh_token)
-            .or_else(|| self.persisted().and_then(|t| t.refresh_token));
+        let refresh = self.cached().and_then(|t| t.refresh_token).or_else(|| self.persisted().and_then(|t| t.refresh_token));
         let oauth_cfg = match &self.mode {
             TokenMode::Browser(c) | TokenMode::Device(c) => Some(c),
             _ => None,
@@ -622,24 +573,18 @@ impl TokenSource {
             TokenMode::ClientCredentials(cfg) => {
                 let mut cfg = cfg.clone();
                 if cfg.client_secret.is_none() {
-                    cfg.client_secret = Some(
-                        read_secret(self.store.as_ref(), &self.primary_ref)?
-                            .ok_or_else(|| AuthError::NotFound("client secret".into()))?,
-                    );
+                    cfg.client_secret = Some(read_secret(self.store.as_ref(), &self.primary_ref)?.ok_or_else(|| AuthError::NotFound("client secret".into()))?);
                 }
                 let mut t = oauth::client_credentials(&cfg).await?;
                 t.identity = Some(cfg.client_id.clone());
                 Ok(t)
             }
             TokenMode::GoogleServiceAccount { scopes } => {
-                let json = read_secret(self.store.as_ref(), &self.primary_ref)?
-                    .ok_or_else(|| AuthError::NotFound("service account JSON key".into()))?;
+                let json = read_secret(self.store.as_ref(), &self.primary_ref)?.ok_or_else(|| AuthError::NotFound("service account JSON key".into()))?;
                 cloud::google_service_account(json.expose_secret(), scopes).await
             }
             TokenMode::Cli(CliKind::GoogleAdc { scopes }) => cloud::google_adc(scopes).await,
-            TokenMode::Cli(CliKind::Databricks { host }) => {
-                cloud::databricks_cli(self.cli_profile.as_deref(), host).await
-            }
+            TokenMode::Cli(CliKind::Databricks { host }) => cloud::databricks_cli(self.cli_profile.as_deref(), host).await,
             TokenMode::Cli(CliKind::Azure { resource }) => cloud::azure_cli(resource).await,
             TokenMode::Cli(CliKind::Redshift(target)) => cloud::redshift_cli(self.cli_profile.as_deref(), target).await,
         }
@@ -647,19 +592,13 @@ impl TokenSource {
 
     async fn token(&self, interactive_ok: bool, force: bool) -> Result<TokenSet, AuthError> {
         if !force {
-            if let Some(t) = self
-                .cached()
-                .filter(|t| !t.access_token.is_empty() && t.fresh(120))
-            {
+            if let Some(t) = self.cached().filter(|t| !t.access_token.is_empty() && t.fresh(120)) {
                 return Ok(t);
             }
         }
         let _g = self.flight.lock().await;
         if !force {
-            if let Some(t) = self
-                .cached()
-                .filter(|t| !t.access_token.is_empty() && t.fresh(120))
-            {
+            if let Some(t) = self.cached().filter(|t| !t.access_token.is_empty() && t.fresh(120)) {
                 return Ok(t);
             }
         }
@@ -673,10 +612,7 @@ impl TokenSource {
 impl CredentialSource for TokenSource {
     async fn get(&self) -> Result<Credential, AuthError> {
         let t = self.token(true, false).await?;
-        Ok(Credential::Bearer {
-            token: SecretString::from(t.access_token),
-            user: self.user.clone().or(t.identity),
-        })
+        Ok(Credential::Bearer { token: SecretString::from(t.access_token), user: self.user.clone().or(t.identity) })
     }
 
     async fn invalidate(&self) {
@@ -690,12 +626,8 @@ impl CredentialSource for TokenSource {
         if force_interactive {
             let _g = self.flight.lock().await;
             let t = match &self.mode {
-                TokenMode::Browser(cfg) => {
-                    oauth::browser_flow(cfg, self.interaction.as_ref()).await?
-                }
-                TokenMode::Device(cfg) => {
-                    oauth::device_flow(cfg, self.interaction.as_ref()).await?
-                }
+                TokenMode::Browser(cfg) => oauth::browser_flow(cfg, self.interaction.as_ref()).await?,
+                TokenMode::Device(cfg) => oauth::device_flow(cfg, self.interaction.as_ref()).await?,
                 _ => unreachable!(),
             };
             self.store_tokens(&t);
@@ -719,22 +651,10 @@ impl CredentialSource for TokenSource {
 
     fn status(&self) -> AuthStatus {
         match self.cached().filter(|t| !t.access_token.is_empty()) {
-            Some(t) => AuthStatus {
-                signed_in: true,
-                identity: t.identity.or(self.user.clone()),
-                expires_at: t.expires_at,
-            },
+            Some(t) => AuthStatus { signed_in: true, identity: t.identity.or(self.user.clone()), expires_at: t.expires_at },
             None => match self.persisted() {
-                Some(p) => AuthStatus {
-                    signed_in: p.refresh_token.is_some(),
-                    identity: p.identity,
-                    expires_at: None,
-                },
-                None => AuthStatus {
-                    signed_in: false,
-                    identity: self.user.clone(),
-                    expires_at: None,
-                },
+                Some(p) => AuthStatus { signed_in: p.refresh_token.is_some(), identity: p.identity, expires_at: None },
+                None => AuthStatus { signed_in: false, identity: self.user.clone(), expires_at: None },
             },
         }
     }
@@ -749,17 +669,10 @@ struct ExternalBrowserSource {
 #[async_trait]
 impl CredentialSource for ExternalBrowserSource {
     async fn get(&self) -> Result<Credential, AuthError> {
-        Ok(Credential::ExternalBrowser {
-            user: self.user.clone(),
-            interaction: self.interaction.clone(),
-        })
+        Ok(Credential::ExternalBrowser { user: self.user.clone(), interaction: self.interaction.clone() })
     }
     fn status(&self) -> AuthStatus {
-        AuthStatus {
-            signed_in: false,
-            identity: Some(self.user.clone()),
-            expires_at: None,
-        }
+        AuthStatus { signed_in: false, identity: Some(self.user.clone()), expires_at: None }
     }
 }
 
@@ -801,52 +714,34 @@ pub fn credential_source(
         })
     };
     let oauth_cfg = || -> Result<OAuthConfig, AuthError> {
-        let mut cfg = ctx.oauth.clone().ok_or_else(|| {
-            AuthError::Invalid("this connection type does not support OAuth sign-in".into())
-        })?;
+        let mut cfg = ctx.oauth.clone().ok_or_else(|| AuthError::Invalid("this connection type does not support OAuth sign-in".into()))?;
         if cfg.client_id.trim().is_empty() {
-            return Err(AuthError::Invalid(format!(
-                "{} OAuth needs a client ID (Advanced → OAuth client ID)",
-                cfg.provider
-            )));
+            return Err(AuthError::Invalid(format!("{} OAuth needs a client ID (Advanced → OAuth client ID)", cfg.provider)));
         }
         if cfg.client_secret.is_none() {
-            cfg.client_secret =
-                read_secret(store.as_ref(), &SecretRef::slot(owner_id, "client_secret"))?;
+            cfg.client_secret = read_secret(store.as_ref(), &SecretRef::slot(owner_id, "client_secret"))?;
         }
         Ok(cfg)
     };
     Ok(match method {
-        AuthMethod::None | AuthMethod::Password { .. } | AuthMethod::ApiToken { .. } => Arc::new(
-            StoredCredentialSource::new(method.clone(), primary, store.clone()),
-        ),
-        AuthMethod::KeyPair { .. } => Arc::new(
-            StoredCredentialSource::new(method.clone(), primary, store.clone())
-                .with_passphrase(SecretRef::slot(owner_id, "passphrase")),
-        ),
+        AuthMethod::None | AuthMethod::Password { .. } | AuthMethod::ApiToken { .. } => {
+            Arc::new(StoredCredentialSource::new(method.clone(), primary, store.clone()))
+        }
+        AuthMethod::KeyPair { .. } => {
+            Arc::new(StoredCredentialSource::new(method.clone(), primary, store.clone()).with_passphrase(SecretRef::slot(owner_id, "passphrase")))
+        }
         AuthMethod::OauthBrowser(_) => token_source(TokenMode::Browser(oauth_cfg()?)),
         AuthMethod::DeviceCode(_) => token_source(TokenMode::Device(oauth_cfg()?)),
         AuthMethod::ClientCredentials(_) => {
-            let mut cfg = ctx.oauth.clone().ok_or_else(|| {
-                AuthError::Invalid(
-                    "this connection type does not support client credentials".into(),
-                )
-            })?;
+            let mut cfg = ctx.oauth.clone().ok_or_else(|| AuthError::Invalid("this connection type does not support client credentials".into()))?;
             cfg.client_secret = None; // primary secret
             token_source(TokenMode::ClientCredentials(cfg))
         }
-        AuthMethod::ExternalBrowser { user } => Arc::new(ExternalBrowserSource {
-            user: user.clone(),
-            interaction: interaction.clone(),
-        }),
+        AuthMethod::ExternalBrowser { user } => Arc::new(ExternalBrowserSource { user: user.clone(), interaction: interaction.clone() }),
         AuthMethod::CloudCli { .. } => {
-            token_source(TokenMode::Cli(ctx.cli.clone().ok_or_else(|| {
-                AuthError::Invalid("this connection type has no CLI login to reuse".into())
-            })?))
+            token_source(TokenMode::Cli(ctx.cli.clone().ok_or_else(|| AuthError::Invalid("this connection type has no CLI login to reuse".into()))?))
         }
-        AuthMethod::ServiceAccount => token_source(TokenMode::GoogleServiceAccount {
-            scopes: ctx.google_scopes.clone(),
-        }),
+        AuthMethod::ServiceAccount => token_source(TokenMode::GoogleServiceAccount { scopes: ctx.google_scopes.clone() }),
     })
 }
 
@@ -859,16 +754,8 @@ mod tests {
         let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
         let r = SecretRef::for_connection("c1");
         store.set(&r, &SecretString::from("s3cret")).unwrap();
-        let src = credential_source(
-            &AuthMethod::Password {
-                user: "alice".into(),
-            },
-            "c1",
-            store.clone(),
-            Arc::new(NonInteractive),
-            AuthContext::default(),
-        )
-        .unwrap();
+        let src =
+            credential_source(&AuthMethod::Password { user: "alice".into() }, "c1", store.clone(), Arc::new(NonInteractive), AuthContext::default()).unwrap();
         match src.get().await.unwrap() {
             Credential::Password { user, password } => {
                 assert_eq!(user, "alice");
@@ -882,11 +769,7 @@ mod tests {
     #[tokio::test]
     async fn missing_token_is_error() {
         let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
-        let src = StoredCredentialSource::new(
-            AuthMethod::ApiToken { user: None },
-            SecretRef::for_connection("x"),
-            store,
-        );
+        let src = StoredCredentialSource::new(AuthMethod::ApiToken { user: None }, SecretRef::for_connection("x"), store);
         assert!(matches!(src.get().await, Err(AuthError::NotFound(_))));
     }
 
@@ -911,24 +794,14 @@ mod tests {
             }),
             ..Default::default()
         };
-        let src = credential_source(
-            &AuthMethod::OauthBrowser(OAuthParams::default()),
-            "c",
-            store,
-            Arc::new(NonInteractive),
-            ctx,
-        )
-        .unwrap();
+        let src = credential_source(&AuthMethod::OauthBrowser(OAuthParams::default()), "c", store, Arc::new(NonInteractive), ctx).unwrap();
         assert!(matches!(src.get().await, Err(AuthError::ReauthRequired)));
         assert!(!src.status().signed_in);
     }
 
     #[test]
     fn debug_redacts_secrets() {
-        let c = Credential::Password {
-            user: "u".into(),
-            password: SecretString::from("topsecret"),
-        };
+        let c = Credential::Password { user: "u".into(), password: SecretString::from("topsecret") };
         assert!(!format!("{c:?}").contains("topsecret"));
     }
 
@@ -939,12 +812,8 @@ mod tests {
         assert_eq!(s, r#"{"method":"password","user":"bob"}"#);
         assert_eq!(serde_json::from_str::<AuthMethod>(&s).unwrap(), m);
         // v1 token config still parses
-        assert_eq!(
-            serde_json::from_str::<AuthMethod>(r#"{"method":"api_token"}"#).unwrap(),
-            AuthMethod::ApiToken { user: None }
-        );
-        let o: AuthMethod =
-            serde_json::from_str(r#"{"method":"oauth_browser","client_id":"x"}"#).unwrap();
+        assert_eq!(serde_json::from_str::<AuthMethod>(r#"{"method":"api_token"}"#).unwrap(), AuthMethod::ApiToken { user: None });
+        let o: AuthMethod = serde_json::from_str(r#"{"method":"oauth_browser","client_id":"x"}"#).unwrap();
         assert_eq!(o.oauth_params().unwrap().client_id.as_deref(), Some("x"));
     }
 }

@@ -240,13 +240,18 @@ fn coll_method(
 /// `{a: 1, b: -1}` → `a_1_b_-1` (MongoDB's default index name).
 fn index_name(key: &Document) -> String {
     key.iter()
-        .map(|(k, v)| format!("{k}_{}", match v {
-            Bson::Int32(i) => i.to_string(),
-            Bson::Int64(i) => i.to_string(),
-            Bson::Double(f) => f.to_string(),
-            Bson::String(s) => s.clone(),
-            _ => "1".into(),
-        }))
+        .map(|(k, v)| {
+            format!(
+                "{k}_{}",
+                match v {
+                    Bson::Int32(i) => i.to_string(),
+                    Bson::Int64(i) => i.to_string(),
+                    Bson::Double(f) => f.to_string(),
+                    Bson::String(s) => s.clone(),
+                    _ => "1".into(),
+                }
+            )
+        })
         .collect::<Vec<_>>()
         .join("_")
 }
@@ -350,7 +355,8 @@ fn args(text: &str) -> Result<Vec<serde_json::Value>, String> {
 
 /// Relaxed JSON with shell helpers → JSON (extended JSON for helpers).
 fn value(text: &str) -> Result<serde_json::Value, String> {
-    let v: serde_json::Value = json5::from_str(&helpers(text)).map_err(|e| format!("Could not read the arguments: {}", e.to_string().lines().next().unwrap_or_default()))?;
+    let v: serde_json::Value =
+        json5::from_str(&helpers(text)).map_err(|e| format!("Could not read the arguments: {}", e.to_string().lines().next().unwrap_or_default()))?;
     Ok(integers(v))
 }
 
@@ -493,7 +499,10 @@ mod tests {
         assert!(u.get_bool("multi").unwrap() && u.get_bool("upsert").unwrap());
         let p = parse("db.orders.deleteOne({_id: 1})", None).unwrap();
         assert_eq!(p.command.get_array("deletes").unwrap()[0].as_document().unwrap().get_i32("limit").unwrap(), 1);
-        assert_eq!(parse("db.t.createIndex({a: 1, b: -1})", None).unwrap().command.get_array("indexes").unwrap()[0].as_document().unwrap().get_str("name").unwrap(), "a_1_b_-1");
+        assert_eq!(
+            parse("db.t.createIndex({a: 1, b: -1})", None).unwrap().command.get_array("indexes").unwrap()[0].as_document().unwrap().get_str("name").unwrap(),
+            "a_1_b_-1"
+        );
         let p = parse(r#"{"find": "orders", "filter": {"a": {"$gt": 1}}}"#, None).unwrap();
         assert_eq!(p.output, Output::Cursor);
         assert_eq!(parse("db.runCommand({ping: 1})", None).unwrap().output, Output::Document);

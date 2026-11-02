@@ -6,7 +6,13 @@ use super::*;
 
 impl AppState {
     pub fn job_ctx(&self) -> crate::jobs::JobCtx {
-        crate::jobs::JobCtx { engine: self.engine.clone(), workspace: self.workspace.clone(), hub: self.hub.clone(), ui: self.ui.clone(), jobs: self.jobs.clone() }
+        crate::jobs::JobCtx {
+            engine: self.engine.clone(),
+            workspace: self.workspace.clone(),
+            hub: self.hub.clone(),
+            ui: self.ui.clone(),
+            jobs: self.jobs.clone(),
+        }
     }
 }
 
@@ -20,7 +26,11 @@ pub struct JobListing {
 }
 
 pub fn list_jobs(state: &AppState) -> Result<JobListing> {
-    Ok(JobListing { jobs: state.workspace.list_jobs()?, running: state.jobs.running_ids(), elsewhere: state.workspace.jobs_leased_elsewhere(&state.jobs.owner)? })
+    Ok(JobListing {
+        jobs: state.workspace.list_jobs()?,
+        running: state.jobs.running_ids(),
+        elsewhere: state.workspace.jobs_leased_elsewhere(&state.jobs.owner)?,
+    })
 }
 
 pub fn get_job(state: &AppState, id: &str) -> Result<databrain_workspace::Job> {

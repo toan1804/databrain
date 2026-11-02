@@ -3,11 +3,11 @@
 //! Each connector turns native driver results into Arrow record batches sent
 //! over a [`QueryStream`], so the grid, filtering and export are engine-agnostic.
 
-pub mod documents;
 pub mod conn_state;
+pub mod documents;
 pub mod error;
-pub mod language;
 pub mod external;
+pub mod language;
 pub mod sql;
 pub mod stream;
 pub mod tables;
@@ -22,9 +22,9 @@ use async_trait::async_trait;
 use databrain_auth::{AuthContext, CredentialSource};
 
 pub use arrow;
-pub use sqlparser;
 pub use conn_state::ConnState;
 pub use error::{ConnectorError, ErrorKind, Result};
+pub use sqlparser;
 pub use stream::{Collected, ExecOptions, ExecSummary, QueryStream, StreamEvent, StreamSender};
 pub use tokio_util::sync::CancellationToken;
 pub use traits::{QueryLanguage, SourceTraits};
@@ -65,11 +65,7 @@ pub trait Connector: Send + Sync {
 
     /// Open a new session. Credentials are fetched from `creds` right before
     /// connecting and are not retained by the connector.
-    async fn connect(
-        &self,
-        cfg: &ConnectionConfig,
-        creds: Arc<dyn CredentialSource>,
-    ) -> Result<Box<dyn Session>>;
+    async fn connect(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>>;
 }
 
 /// A live database session. Sessions are shared behind `Arc`, so methods take
@@ -221,18 +217,11 @@ pub trait Session: Send + Sync {
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
         let mut out = Vec::new();
         for o in self.list_objects(schema).await? {
-            if matches!(
-                o.kind,
-                ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Sequence
-            ) {
+            if matches!(o.kind, ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Sequence) {
                 continue;
             }
             if let Ok(d) = self.describe(schema, &o.name).await {
-                out.push(TableColumns {
-                    table: o.name,
-                    columns: d.columns,
-                    foreign_keys: d.foreign_keys,
-                });
+                out.push(TableColumns { table: o.name, columns: d.columns, foreign_keys: d.foreign_keys });
             }
         }
         Ok(out)
@@ -377,12 +366,8 @@ pub async fn default_bulk_metadata<S: Session + ?Sized>(s: &S, schemas: &[String
 /// [`Session::search_schema`] by listing the schema and filtering.
 pub async fn search_schema_by_listing<S: Session + ?Sized>(s: &S, schema: &str, query: &str, limit: usize) -> Result<Vec<DbObject>> {
     let q = query.trim().to_lowercase();
-    let mut hits: Vec<DbObject> = s
-        .list_objects(schema)
-        .await?
-        .into_iter()
-        .filter(|o| o.kind.is_relation() && (q.is_empty() || o.name.to_lowercase().contains(&q)))
-        .collect();
+    let mut hits: Vec<DbObject> =
+        s.list_objects(schema).await?.into_iter().filter(|o| o.kind.is_relation() && (q.is_empty() || o.name.to_lowercase().contains(&q))).collect();
     rank_matches(query, &mut hits, limit);
     Ok(hits)
 }
@@ -400,12 +385,8 @@ pub async fn search_routines_by_listing<S: Session + ?Sized>(s: &S, schema: Opti
         }
     };
     let q = query.trim().to_lowercase();
-    let mut hits: Vec<DbObject> = s
-        .list_objects(&schema)
-        .await?
-        .into_iter()
-        .filter(|o| o.kind.is_routine() && (q.is_empty() || o.name.to_lowercase().contains(&q)))
-        .collect();
+    let mut hits: Vec<DbObject> =
+        s.list_objects(&schema).await?.into_iter().filter(|o| o.kind.is_routine() && (q.is_empty() || o.name.to_lowercase().contains(&q))).collect();
     rank_matches(query, &mut hits, limit);
     Ok(hits)
 }
@@ -443,12 +424,7 @@ impl ConnectorRegistry {
     }
 
     pub fn get(&self, kind: ConnectorKind) -> Result<Arc<dyn Connector>> {
-        self.map.get(&kind).cloned().ok_or_else(|| {
-            ConnectorError::unsupported(format!(
-                "connector '{}' is not enabled in this build",
-                kind.as_str()
-            ))
-        })
+        self.map.get(&kind).cloned().ok_or_else(|| ConnectorError::unsupported(format!("connector '{}' is not enabled in this build", kind.as_str())))
     }
 
     pub fn infos(&self) -> Vec<ConnectorInfo> {
@@ -472,11 +448,7 @@ pub fn quote_ident(kind: ConnectorKind, ident: &str) -> String {
 /// Quote a possibly qualified name (`catalog.schema` stored as one string,
 /// or a path as typed: parts already quoted are not quoted twice).
 pub fn quote_path(kind: ConnectorKind, path: &str) -> String {
-    split_path(kind, path)
-        .iter()
-        .map(|p| quote_ident(kind, p))
-        .collect::<Vec<_>>()
-        .join(".")
+    split_path(kind, path).iter().map(|p| quote_ident(kind, p)).collect::<Vec<_>>().join(".")
 }
 
 /// The parts of a qualified name as typed: dots outside quotes split it, a
@@ -564,11 +536,20 @@ mod tests {
         let m = assemble_metadata(
             &["a".into(), "b".into(), "empty".into()],
             vec![obj("a", "t"), obj("b", "u"), obj("zz", "ignored")],
-            vec![("a".into(), "t".into(), col("id")), ("b".into(), "u".into(), col("x")), ("a".into(), "t".into(), col("name")), ("b".into(), "u".into(), col("a_id"))],
+            vec![
+                ("a".into(), "t".into(), col("id")),
+                ("b".into(), "u".into(), col("x")),
+                ("a".into(), "t".into(), col("name")),
+                ("b".into(), "u".into(), col("a_id")),
+            ],
             vec![("b".into(), "u".into(), fk.clone()), ("b".into(), "missing".into(), fk.clone())],
         );
         assert_eq!(m.iter().map(|s| s.schema.as_str()).collect::<Vec<_>>(), vec!["a", "b", "empty"]);
-        assert_eq!(m[0].columns[0].columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["id", "name"], "non-adjacent rows still grouped, in order");
+        assert_eq!(
+            m[0].columns[0].columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["id", "name"],
+            "non-adjacent rows still grouped, in order"
+        );
         assert_eq!(m[1].columns[0].foreign_keys, vec![fk]);
         assert!(m[2].objects.is_empty() && m[2].columns.is_empty() && m[2].error.is_none());
     }

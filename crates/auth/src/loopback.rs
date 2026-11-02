@@ -22,20 +22,10 @@ pub struct Loopback {
 impl Loopback {
     /// Bind to `127.0.0.1:port` (`port = 0` picks a free port).
     pub async fn bind(host: &str, port: u16, path: &str) -> Result<Self, AuthError> {
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.map_err(|e| {
-            AuthError::Flow(format!(
-                "cannot listen on 127.0.0.1:{port} for the sign-in redirect: {e}"
-            ))
-        })?;
-        Ok(Self {
-            listener,
-            host: host.to_string(),
-            path: if path.starts_with('/') {
-                path.to_string()
-            } else {
-                format!("/{path}")
-            },
-        })
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .await
+            .map_err(|e| AuthError::Flow(format!("cannot listen on 127.0.0.1:{port} for the sign-in redirect: {e}")))?;
+        Ok(Self { listener, host: host.to_string(), path: if path.starts_with('/') { path.to_string() } else { format!("/{path}") } })
     }
 
     pub fn port(&self) -> u16 {
@@ -43,23 +33,14 @@ impl Loopback {
     }
 
     pub fn redirect_uri(&self) -> String {
-        let path = if self.path == "/" {
-            ""
-        } else {
-            self.path.as_str()
-        };
+        let path = if self.path == "/" { "" } else { self.path.as_str() };
         format!("http://{}:{}{}", self.host, self.port(), path)
     }
 
     /// Wait for the browser to hit the redirect path. Returns query (GET) or
     /// form body (POST) parameters. Requests with a wrong `state` are rejected
     /// and ignored so a stray/malicious request cannot abort the flow.
-    pub async fn wait(
-        self,
-        expected_state: Option<&str>,
-        cancel: &CancellationToken,
-        timeout: Duration,
-    ) -> Result<HashMap<String, String>, AuthError> {
+    pub async fn wait(self, expected_state: Option<&str>, cancel: &CancellationToken, timeout: Duration) -> Result<HashMap<String, String>, AuthError> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let accept = tokio::select! {
@@ -78,18 +59,11 @@ impl Loopback {
     }
 }
 
-async fn handle(
-    mut stream: TcpStream,
-    path: &str,
-    expected_state: Option<&str>,
-) -> Option<HashMap<String, String>> {
+async fn handle(mut stream: TcpStream, path: &str, expected_state: Option<&str>) -> Option<HashMap<String, String>> {
     let mut buf = Vec::with_capacity(2048);
     let mut tmp = [0u8; 2048];
     let header_end = loop {
-        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut tmp))
-            .await
-            .ok()?
-            .ok()?;
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut tmp)).await.ok()?.ok()?;
         if n == 0 {
             return None;
         }
@@ -126,16 +100,11 @@ async fn handle(
         respond(&mut stream, 404, "Not found").await;
         return None;
     }
-    let mut params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
-        .into_owned()
-        .collect();
+    let mut params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
     if method == "POST" && content_length > 0 {
         let mut body = buf[header_end + 4..].to_vec();
         while body.len() < content_length {
-            let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut tmp))
-                .await
-                .ok()?
-                .ok()?;
+            let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut tmp)).await.ok()?.ok()?;
             if n == 0 {
                 break;
             }
@@ -146,29 +115,15 @@ async fn handle(
     }
     if let Some(expected) = expected_state {
         if params.get("state").map(String::as_str) != Some(expected) {
-            respond(
-                &mut stream,
-                400,
-                "Invalid sign-in response (state mismatch).",
-            )
-            .await;
+            respond(&mut stream, 400, "Invalid sign-in response (state mismatch).").await;
             return None;
         }
     }
     if params.contains_key("error") {
-        let msg = params
-            .get("error_description")
-            .or(params.get("error"))
-            .cloned()
-            .unwrap_or_default();
+        let msg = params.get("error_description").or(params.get("error")).cloned().unwrap_or_default();
         respond(&mut stream, 400, &format!("Sign-in failed: {msg}")).await;
     } else {
-        respond(
-            &mut stream,
-            200,
-            "You're signed in to DataBrain. You can close this tab and return to the app.",
-        )
-        .await;
+        respond(&mut stream, 200, "You're signed in to DataBrain. You can close this tab and return to the app.").await;
     }
     Some(params)
 }
@@ -200,10 +155,7 @@ async fn respond(stream: &mut TcpStream, status: u16, message: &str) {
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 #[cfg(test)]
@@ -212,9 +164,7 @@ mod tests {
 
     async fn get(port: u16, target: &str) -> String {
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        s.write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
-            .await
-            .unwrap();
+        s.write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).await.unwrap();
         let mut out = String::new();
         s.read_to_string(&mut out).await.unwrap();
         out
@@ -224,24 +174,12 @@ mod tests {
     async fn receives_code_and_rejects_bad_state() {
         let lb = Loopback::bind("127.0.0.1", 0, "/callback").await.unwrap();
         let port = lb.port();
-        assert_eq!(
-            lb.redirect_uri(),
-            format!("http://127.0.0.1:{port}/callback")
-        );
+        assert_eq!(lb.redirect_uri(), format!("http://127.0.0.1:{port}/callback"));
         let cancel = CancellationToken::new();
-        let waiter =
-            tokio::spawn(async move { lb.wait(Some("s1"), &cancel, Duration::from_secs(5)).await });
+        let waiter = tokio::spawn(async move { lb.wait(Some("s1"), &cancel, Duration::from_secs(5)).await });
         assert!(get(port, "/other").await.starts_with("HTTP/1.1 404"));
-        assert!(
-            get(port, "/callback?code=x&state=evil")
-                .await
-                .starts_with("HTTP/1.1 400")
-        );
-        assert!(
-            get(port, "/callback?code=abc&state=s1")
-                .await
-                .starts_with("HTTP/1.1 200")
-        );
+        assert!(get(port, "/callback?code=x&state=evil").await.starts_with("HTTP/1.1 400"));
+        assert!(get(port, "/callback?code=abc&state=s1").await.starts_with("HTTP/1.1 200"));
         let params = waiter.await.unwrap().unwrap();
         assert_eq!(params["code"], "abc");
     }

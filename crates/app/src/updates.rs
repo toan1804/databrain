@@ -97,7 +97,10 @@ fn pick_asset<'a>(assets: &'a [Asset], os: &str, arch: &str, no_duckdb: bool) ->
 }
 
 fn latest_of(releases: Vec<Release>) -> Option<Release> {
-    releases.into_iter().filter(|r| !r.draft && !r.prerelease && parse_version(&r.tag_name).is_some() && r.tag_name.starts_with('v')).max_by_key(|r| parse_version(&r.tag_name))
+    releases
+        .into_iter()
+        .filter(|r| !r.draft && !r.prerelease && parse_version(&r.tag_name).is_some() && r.tag_name.starts_with('v'))
+        .max_by_key(|r| parse_version(&r.tag_name))
 }
 
 fn info_for(current: &str, releases: Vec<Release>, os: &str, arch: &str, no_duckdb: bool) -> Option<UpdateInfo> {
@@ -156,7 +159,14 @@ mod tests {
 
     #[test]
     fn picks_the_newest_app_release_and_this_computers_installer() {
-        let assets = ["DataBrain_0.3.0_aarch64.dmg", "DataBrain-no-duckdb_0.3.0_aarch64.dmg", "DataBrain_0.3.0_x64-setup.exe", "DataBrain_0.3.0_x64_en-US.msi", "DataBrain_0.3.0_amd64.AppImage", "DataBrain_0.3.0_amd64.deb"];
+        let assets = [
+            "DataBrain_0.3.0_aarch64.dmg",
+            "DataBrain-no-duckdb_0.3.0_aarch64.dmg",
+            "DataBrain_0.3.0_x64-setup.exe",
+            "DataBrain_0.3.0_x64_en-US.msi",
+            "DataBrain_0.3.0_amd64.AppImage",
+            "DataBrain_0.3.0_amd64.deb",
+        ];
         let list = || vec![rel("oracle-agent/v0.9.0", &[]), rel("v0.3.0", &assets), rel("v0.2.0", &[]), Release { draft: true, ..rel("v0.4.0", &[]) }];
         let i = info_for("0.2.0", list(), "macos", "aarch64", false).unwrap();
         assert_eq!((i.latest.as_str(), i.newer, i.download_name.as_deref()), ("0.3.0", true, Some("DataBrain_0.3.0_aarch64.dmg")));

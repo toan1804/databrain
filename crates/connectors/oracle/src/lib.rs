@@ -20,9 +20,9 @@ use async_trait::async_trait;
 use databrain_auth::{AuthMethodKind, Credential, CredentialSource};
 use databrain_connector_core::value::{Column, MICROS_PER_DAY, days_from_civil};
 use databrain_connector_core::{
-    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError,
-    ConnectorInfo, ConnectorKind, DbObject, ErrorKind, ExecOptions, ExecSummary, FieldSpec, ForeignKey, ObjectDetail,
-    ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender, TableColumns, Value, quote_ident,
+    BatchBuilder, Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind,
+    ExecOptions, ExecSummary, FieldSpec, ForeignKey, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender,
+    TableColumns, Value, quote_ident,
 };
 use oracle::sql_type::{OracleType, Timestamp, ToSql};
 use oracle::{Connection, SqlValue};
@@ -55,11 +55,7 @@ fn map_err(e: oracle::Error) -> ConnectorError {
             // ORA-01013: user requested cancel of current operation
             return ConnectorError::cancelled();
         }
-        let kind = if matches!(code, 1017 | 12154 | 12514 | 12541 | 12545 | 12170 | 3113 | 3114 | 3135) {
-            ErrorKind::Connection
-        } else {
-            ErrorKind::Query
-        };
+        let kind = if matches!(code, 1017 | 12154 | 12514 | 12541 | 12545 | 12170 | 3113 | 3114 | 3135) { ErrorKind::Connection } else { ErrorKind::Query };
         let offset = db.offset();
         let mut ce = ConnectorError::new(kind, db.message().to_string()).with_code(format!("ORA-{code:05}"));
         if offset > 0 {
@@ -82,10 +78,7 @@ fn connect_string(cfg: &ConnectionConfig) -> String {
     if let Some(cs) = cfg.opt("connect_string") {
         return cs.to_string();
     }
-    let service = cfg
-        .opt("service_name")
-        .or(cfg.database.as_deref().filter(|d| !d.is_empty()))
-        .unwrap_or("FREEPDB1");
+    let service = cfg.opt("service_name").or(cfg.database.as_deref().filter(|d| !d.is_empty())).unwrap_or("FREEPDB1");
     format!("{}:{}/{}", cfg.host_or_default(), cfg.port.unwrap_or(1521), service)
 }
 
@@ -142,8 +135,7 @@ impl Connector for OracleConnector {
                 FieldSpec::new("host", "Host").required().placeholder("localhost"),
                 FieldSpec::new("port", "Port").placeholder("1521"),
                 FieldSpec::new("service_name", "Service name").required().placeholder("FREEPDB1 / ORCLPDB1"),
-                FieldSpec::new("connect_string", "Connect string").placeholder("(optional) TNS alias or full descriptor")
-                    .help("Overrides host/port/service"),
+                FieldSpec::new("connect_string", "Connect string").placeholder("(optional) TNS alias or full descriptor").help("Overrides host/port/service"),
                 FieldSpec::new("driver", "Driver").help("Thin needs no Oracle software; Instant Client is for OS authentication and other thick-only features"),
                 FieldSpec::new("driver_options", "Driver options")
                     .placeholder("SSL=true; WALLET=/path/to/wallet; ENCRYPTION=REQUIRED")
@@ -177,10 +169,8 @@ async fn open(cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Resul
         if !uses_instant_client(cfg) {
             let path = agent::ensure().await?;
             let a = agent::Agent::spawn(&path).await?;
-            let options: serde_json::Map<String, serde_json::Value> = parse_driver_options(cfg.opt("driver_options").unwrap_or(""))
-                .into_iter()
-                .map(|(k, v)| (k, serde_json::Value::String(v)))
-                .collect();
+            let options: serde_json::Map<String, serde_json::Value> =
+                parse_driver_options(cfg.opt("driver_options").unwrap_or("")).into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect();
             a.call(serde_json::json!({
                 "op": "connect",
                 "user": user,
@@ -294,10 +284,9 @@ fn convert(t: ColType, v: &SqlValue) -> Value {
         ColType::Bool => v.get::<bool>().map(Value::Bool).unwrap_or_else(|_| text()),
         ColType::Binary => v.get::<Vec<u8>>().map(Value::Bytes).unwrap_or_else(|_| text()),
         ColType::Timestamp => v.get::<Timestamp>().map(|ts| Value::Timestamp(ts_micros(&ts))).unwrap_or_else(|_| text()),
-        ColType::TimestampTz => v
-            .get::<Timestamp>()
-            .map(|ts| Value::TimestampTz(ts_micros(&ts) - ts.tz_offset() as i64 * 1_000_000))
-            .unwrap_or_else(|_| text()),
+        ColType::TimestampTz => {
+            v.get::<Timestamp>().map(|ts| Value::TimestampTz(ts_micros(&ts) - ts.tz_offset() as i64 * 1_000_000)).unwrap_or_else(|_| text())
+        }
         _ => text(),
     }
 }
@@ -306,12 +295,7 @@ fn run(conn: &Connection, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> R
     // Oracle rejects a trailing semicolon in SQL (but PL/SQL blocks need theirs).
     let (sql, _) = prepare_sql(sql);
     let batch = opts.batch_size.clamp(1, 10_000);
-    let mut stmt = conn
-        .statement(sql)
-        .fetch_array_size(batch as u32)
-        .prefetch_rows(batch as u32 + 1)
-        .build()
-        .map_err(map_err)?;
+    let mut stmt = conn.statement(sql).fetch_array_size(batch as u32).prefetch_rows(batch as u32 + 1).build().map_err(map_err)?;
     if !stmt.is_query() {
         stmt.execute(&[]).map_err(map_err)?;
         let n = stmt.row_count().ok();
@@ -319,11 +303,7 @@ fn run(conn: &Connection, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> R
         return Ok(());
     }
     let rows = stmt.query(&[]).map_err(map_err)?;
-    let cols: Vec<Column> = rows
-        .column_info()
-        .iter()
-        .map(|c| Column::new(c.name(), col_type(c.oracle_type()), db_type(c.oracle_type())))
-        .collect();
+    let cols: Vec<Column> = rows.column_info().iter().map(|c| Column::new(c.name(), col_type(c.oracle_type()), db_type(c.oracle_type()))).collect();
     let types: Vec<ColType> = cols.iter().map(|c| c.col_type).collect();
     let mut b = BatchBuilder::new(&cols, batch);
     if !tx.blocking_send(Ok(StreamEvent::Schema(b.schema()))) {
@@ -485,12 +465,7 @@ impl OracleSession {
             let mut out = Vec::new();
             for r in rs {
                 let r = r.map_err(map_err)?;
-                out.push(
-                    r.sql_values()
-                        .iter()
-                        .map(|v| if v.is_null().unwrap_or(true) { None } else { v.get::<String>().ok() })
-                        .collect(),
-                );
+                out.push(r.sql_values().iter().map(|v| if v.is_null().unwrap_or(true) { None } else { v.get::<String>().ok() }).collect());
             }
             Ok(out)
         })
@@ -829,7 +804,7 @@ impl Session for OracleSession {
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
-        use databrain_connector_core::{group_indexes, query_text, quote_literal, truthy, TableLayout};
+        use databrain_connector_core::{TableLayout, group_indexes, query_text, quote_literal, truthy};
         let (s, t) = (quote_literal(schema), quote_literal(name));
         let idx = query_text(
             self,
@@ -1220,7 +1195,10 @@ mod tests {
         cfg.options.insert("service_name".into(), std::env::var("DATABRAIN_ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".into()));
         cfg.options.insert("driver".into(), driver.into());
         cfg.read_only = read_only;
-        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, std::env::var("DATABRAIN_ORACLE_PASSWORD").ok().map(secrecy::SecretString::from)));
+        let creds = Arc::new(InlineCredentialSource::new(
+            AuthMethod::Password { user },
+            std::env::var("DATABRAIN_ORACLE_PASSWORD").ok().map(secrecy::SecretString::from),
+        ));
         Some(open(&cfg, creds).await.unwrap())
     }
 
@@ -1270,8 +1248,12 @@ mod tests {
         let m: Vec<(&str, ObjectKind)> = m.iter().map(|o| (o.name.as_str(), o.kind)).collect();
         assert_eq!(m, vec![("NET", ObjectKind::Function), ("REFRESH", ObjectKind::Procedure)], "{driver}: overloads once");
         // Show DDL: package (spec + body), function, procedure.
-        run(&s, "create or replace package body db_pkg_sales as function net(x number) return number is begin return x; end; \
-                 function net(x number, y number) return number is begin return x - y; end; procedure refresh is begin null; end; end;").await;
+        run(
+            &s,
+            "create or replace package body db_pkg_sales as function net(x number) return number is begin return x; end; \
+                 function net(x number, y number) return number is begin return x - y; end; procedure refresh is begin null; end; end;",
+        )
+        .await;
         let p = s.object_ddl(&me, "DB_PKG_SALES", ObjectKind::Package).await.unwrap().unwrap();
         let up = p.to_uppercase();
         assert!(up.contains("CREATE OR REPLACE PACKAGE DB_PKG_SALES") && up.contains("CREATE OR REPLACE PACKAGE BODY DB_PKG_SALES"), "{driver}: {p}");
@@ -1314,9 +1296,13 @@ mod tests {
         // Types: same mapping as the Instant Client driver.
         let r = run("select 1 as a, 'x' as b, date '2024-01-02' as c, 1.5 as d, cast(null as date) as e, \
                      timestamp '2024-01-02 03:04:05.123456 +02:00' as f, hextoraw('ff00') as g, to_clob('long text') as h, \
-                     12345678901234567890 as i, cast(2.5 as binary_double) as j, cast(42 as number(10)) as k from dual").await.unwrap();
+                     12345678901234567890 as i, cast(2.5 as binary_double) as j, cast(42 as number(10)) as k from dual")
+        .await
+        .unwrap();
         let b = &r.batches[0];
-        let f = |i: usize| databrain_connector_core::arrow::util::display::ArrayFormatter::try_new(b.column(i).as_ref(), &Default::default()).unwrap().value(0).to_string();
+        let f = |i: usize| {
+            databrain_connector_core::arrow::util::display::ArrayFormatter::try_new(b.column(i).as_ref(), &Default::default()).unwrap().value(0).to_string()
+        };
         let types: Vec<String> = b.schema().fields().iter().map(|f| f.data_type().to_string()).collect();
         assert_eq!(f(1), "x");
         assert_eq!(f(2), "2024-01-02T00:00:00");
@@ -1341,7 +1327,8 @@ mod tests {
         run("comment on table kb_thin is 'thin test'").await.unwrap();
         let ins = run("insert into kb_thin select level, 'n' || level, null from dual connect by level <= 25000").await.unwrap();
         assert_eq!(ins.summary.rows_affected, Some(25000));
-        let all = s.execute("select * from kb_thin order by id", ExecOptions { batch_size: 1000, ..Default::default() }).await.unwrap().collect().await.unwrap();
+        let all =
+            s.execute("select * from kb_thin order by id", ExecOptions { batch_size: 1000, ..Default::default() }).await.unwrap().collect().await.unwrap();
         assert_eq!((all.num_rows(), all.batches.len()), (25000, 25));
         let me = s.list_schemas().await.unwrap().into_iter().find(|x| x.is_default).unwrap().name;
         let m = s.bulk_metadata(std::slice::from_ref(&me)).await.unwrap();
@@ -1412,13 +1399,7 @@ mod tests {
         let Some(s) = live(&std::env::var("DATABRAIN_ORACLE_DRIVER").unwrap_or_else(|_| "thin".into())).await else {
             panic!("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
         };
-        let r = s
-            .execute("select 1 as a, 'x' as b, sysdate as c, 1.5 as d from dual;", ExecOptions::default())
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
+        let r = s.execute("select 1 as a, 'x' as b, sysdate as c, 1.5 as d from dual;", ExecOptions::default()).await.unwrap().collect().await.unwrap();
         assert_eq!(r.num_rows(), 1);
         assert!(!s.list_schemas().await.unwrap().is_empty());
     }

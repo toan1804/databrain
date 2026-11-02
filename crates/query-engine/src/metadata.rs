@@ -5,13 +5,11 @@ use super::*;
 impl QueryEngine {
     /// Connect (if needed) and return the server version.
     pub async fn connect(&self, connection_id: &str) -> Result<String> {
-        self.with_meta(connection_id, |s| async move { s.server_version().await })
-            .await
+        self.with_meta(connection_id, |s| async move { s.server_version().await }).await
     }
 
     pub async fn list_schemas(&self, connection_id: &str) -> Result<Vec<SchemaInfo>> {
-        self.with_meta(connection_id, |s| async move { s.list_schemas().await })
-            .await
+        self.with_meta(connection_id, |s| async move { s.list_schemas().await }).await
     }
 
     pub async fn list_objects(&self, connection_id: &str, schema: &str) -> Result<Vec<DbObject>> {
@@ -155,12 +153,7 @@ impl QueryEngine {
         .await
     }
 
-    pub async fn describe(
-        &self,
-        connection_id: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<ObjectDetail> {
+    pub async fn describe(&self, connection_id: &str, schema: &str, name: &str) -> Result<ObjectDetail> {
         let (schema, name) = (schema.to_string(), name.to_string());
         self.with_meta(connection_id, |s| {
             let (schema, name) = (schema.clone(), name.clone());

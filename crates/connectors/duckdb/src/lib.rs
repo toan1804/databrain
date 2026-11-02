@@ -17,9 +17,8 @@ use databrain_auth::{AuthMethodKind, CredentialSource};
 use databrain_connector_core::arrow::ipc::reader::StreamReader;
 use databrain_connector_core::external::{ExternalTablesSlot, RESULTS_SCHEMA, referenced_results};
 use databrain_connector_core::{
-    Capabilities, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject,
-    ErrorKind, ExecOptions, ExecSummary, FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session,
-    StreamEvent, StreamSender, TableColumns, quote_ident, quote_literal,
+    Capabilities, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind, ExecOptions, ExecSummary,
+    FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender, TableColumns, quote_ident, quote_literal,
 };
 
 #[derive(Default)]
@@ -210,9 +209,10 @@ pub fn excel_scan(conn: &duckdb::Connection, path: &str, sheet: Option<&xlsx::Sh
     let all_null = typed.iter().map(|(n, _)| format!("({0} IS NULL OR trim({0}) = '')", qi(n))).collect::<Vec<_>>().join(" AND ");
     let mut aggs: Vec<String> = checks.iter().map(|(_, w)| format!("count(*) FILTER (WHERE {w})")).collect();
     aggs.push(format!("count(*) FILTER (WHERE {all_null})"));
-    let counts: Vec<i64> = match conn.prepare(&format!("SELECT {} FROM {text}", aggs.join(", "))).and_then(|mut st| {
-        st.query_row([], |r| (0..aggs.len()).map(|i| r.get::<_, i64>(i)).collect::<std::result::Result<Vec<_>, _>>())
-    }) {
+    let counts: Vec<i64> = match conn
+        .prepare(&format!("SELECT {} FROM {text}", aggs.join(", ")))
+        .and_then(|mut st| st.query_row([], |r| (0..aggs.len()).map(|i| r.get::<_, i64>(i)).collect::<std::result::Result<Vec<_>, _>>()))
+    {
         Ok(b) => b,
         Err(_) => return plain,
     };
@@ -227,7 +227,8 @@ pub fn excel_scan(conn: &duckdb::Connection, path: &str, sheet: Option<&xlsx::Sh
     let skip_empty = |src: &str| if empty_rows { format!("{src} WHERE NOT ({all_null})") } else { src.to_string() };
     if !to_text.contains(&true) {
         // Types fit: only rename / drop empty rows.
-        let cols = typed.iter().zip(&out_names).map(|((n, _), o)| if n == o { qi(n) } else { format!("{} AS {}", qi(n), qi(o)) }).collect::<Vec<_>>().join(", ");
+        let cols =
+            typed.iter().zip(&out_names).map(|((n, _), o)| if n == o { qi(n) } else { format!("{} AS {}", qi(n), qi(o)) }).collect::<Vec<_>>().join(", ");
         return format!("(SELECT {cols} FROM {})", skip_empty(&plain));
     }
     // Read everything as text once and convert the columns that fit.
@@ -333,7 +334,13 @@ fn engine() -> Result<()> {
         "DuckDB engine not found. This DataBrain build uses the DuckDB installed on your computer, and {} was not found. \
          Install DuckDB (macOS: brew install duckdb; or download libduckdb for your system from https://duckdb.org/docs/installation), \
          then choose the library in Settings → DuckDB engine, or install the DataBrain download that includes DuckDB.",
-        if cfg!(target_os = "macos") { "libduckdb.dylib" } else if cfg!(windows) { "duckdb.dll" } else { "libduckdb.so" }
+        if cfg!(target_os = "macos") {
+            "libduckdb.dylib"
+        } else if cfg!(windows) {
+            "duckdb.dll"
+        } else {
+            "libduckdb.so"
+        }
     )))
 }
 
@@ -380,10 +387,7 @@ fn required_extension(f: FileFormat) -> Option<&'static str> {
 
 /// View name for an attached file: file stem, sanitized, de-duplicated.
 pub fn view_name(path: &str, taken: &[String]) -> String {
-    let stem = std::path::Path::new(path.trim_end_matches(['/', '\\']))
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".into());
+    let stem = std::path::Path::new(path.trim_end_matches(['/', '\\'])).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
     let stem = stem.split('.').next().unwrap_or(&stem).to_string();
     let mut base: String = stem.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
     if base.is_empty() || base.starts_with(|c: char| c.is_ascii_digit()) {
@@ -409,7 +413,11 @@ fn map_err(e: duckdb::Error) -> ConnectorError {
 /// What a sealed session refused, and how the user allows it.
 fn sandbox_hint(mut e: ConnectorError) -> ConnectorError {
     let m = e.message.to_ascii_lowercase();
-    if m.contains("disabled through configuration") || m.contains("permission error") || m.contains("lock_configuration") || m.contains("configuration has been locked") {
+    if m.contains("disabled through configuration")
+        || m.contains("permission error")
+        || m.contains("lock_configuration")
+        || m.contains("configuration has been locked")
+    {
         e.message = format!(
             "{} (SQL from the assistant runs in a DuckDB sandbox without file or network access and can't change settings; allow it in the connection's AI settings)",
             e.message
@@ -435,7 +443,8 @@ impl Connector for DuckdbConnector {
             capabilities: Capabilities { transactions: true, cancel: true, schemas: true, read_only_sessions: true, ssh: false },
             fields: vec![
                 FieldSpec::new("file_path", "Database file").placeholder(":memory: (or /path/to/db.duckdb)"),
-                FieldSpec::new("files", "Attached files").placeholder("One path per line: .csv .parquet .json .xlsx, Delta/Iceberg folders")
+                FieldSpec::new("files", "Attached files")
+                    .placeholder("One path per line: .csv .parquet .json .xlsx, Delta/Iceberg folders")
                     .help("Each file becomes a view in the `files` schema"),
                 // "first" (default) or "all": one view per sheet, <file>_<sheet>.
                 FieldSpec::new("excel_sheets", "Excel sheets").placeholder("first"),
@@ -714,9 +723,8 @@ fn load_outputs(conn: &duckdb::Connection, sql: &str, slot: Option<&ExternalTabl
         if current.as_deref() == Some(t.version_key.as_str()) {
             continue;
         }
-        let attached: bool = conn
-            .query_row("SELECT count(*) > 0 FROM duckdb_databases() WHERE database_name = 'results'", [], |r| r.get(0))
-            .map_err(map_err)?;
+        let attached: bool =
+            conn.query_row("SELECT count(*) > 0 FROM duckdb_databases() WHERE database_name = 'results'", [], |r| r.get(0)).map_err(map_err)?;
         if !attached {
             conn.execute_batch(&format!("ATTACH ':memory:' AS {RESULTS_SCHEMA}")).map_err(map_err)?;
         }
@@ -750,7 +758,20 @@ use databrain_connector_core::arrow::datatypes::{DataType as Dt, Field as Field5
 /// Column type DuckDB's appender handles natively, or `None` → cast to text.
 fn native(dt: &Dt) -> Option<Dt> {
     Some(match dt {
-        Dt::Boolean | Dt::Int8 | Dt::Int16 | Dt::Int32 | Dt::Int64 | Dt::UInt8 | Dt::UInt16 | Dt::UInt32 | Dt::UInt64 | Dt::Float32 | Dt::Float64 | Dt::Utf8 | Dt::Binary | Dt::Date32 => dt.clone(),
+        Dt::Boolean
+        | Dt::Int8
+        | Dt::Int16
+        | Dt::Int32
+        | Dt::Int64
+        | Dt::UInt8
+        | Dt::UInt16
+        | Dt::UInt32
+        | Dt::UInt64
+        | Dt::Float32
+        | Dt::Float64
+        | Dt::Utf8
+        | Dt::Binary
+        | Dt::Date32 => dt.clone(),
         Dt::Float16 => Dt::Float32,
         Dt::LargeUtf8 | Dt::Utf8View => Dt::Utf8,
         Dt::LargeBinary | Dt::BinaryView | Dt::FixedSizeBinary(_) => Dt::Binary,
@@ -812,7 +833,8 @@ fn duck_type(dt: &Dt) -> String {
 fn to_arrow58(b: &Batch59) -> Result<arrow58::record_batch::RecordBatch> {
     let mut buf = Vec::new();
     {
-        let mut w = databrain_connector_core::arrow::ipc::writer::StreamWriter::try_new(&mut buf, &b.schema()).map_err(|e| ConnectorError::internal(e.to_string()))?;
+        let mut w =
+            databrain_connector_core::arrow::ipc::writer::StreamWriter::try_new(&mut buf, &b.schema()).map_err(|e| ConnectorError::internal(e.to_string()))?;
         w.write(b).map_err(|e| ConnectorError::internal(e.to_string()))?;
         w.finish().map_err(|e| ConnectorError::internal(e.to_string()))?;
     }
@@ -967,7 +989,13 @@ impl Session for DuckSession {
                 return;
             };
             if let Err(e) = run(&g, &sql, &opts, &tx, outputs.as_deref(), &loaded) {
-                let e = if opts.cancel.is_cancelled() { ConnectorError::cancelled() } else if sandboxed { sandbox_hint(e) } else { e };
+                let e = if opts.cancel.is_cancelled() {
+                    ConnectorError::cancelled()
+                } else if sandboxed {
+                    sandbox_hint(e)
+                } else {
+                    e
+                };
                 tx.blocking_send(Err(e));
             }
         });
@@ -1129,21 +1157,32 @@ impl Session for DuckSession {
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
-        use databrain_connector_core::{parse_list_text, query_text, truthy, IndexInfo, TableLayout};
+        use databrain_connector_core::{IndexInfo, TableLayout, parse_list_text, query_text, truthy};
         if schema == RESULTS_SCHEMA_ID {
             return Ok(TableLayout::default());
         }
         let (db, sch) = schema.split_once('.').unwrap_or((schema, "main"));
         let w = format!("database_name = {} AND schema_name = {} AND table_name = {}", quote_literal(db), quote_literal(sch), quote_literal(name));
         let mut l = TableLayout::default();
-        for r in query_text(self, &format!("SELECT constraint_type, constraint_column_names FROM duckdb_constraints() WHERE {w} AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')")).await? {
+        for r in query_text(
+            self,
+            &format!("SELECT constraint_type, constraint_column_names FROM duckdb_constraints() WHERE {w} AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')"),
+        )
+        .await?
+        {
             let primary = r[0].as_deref() == Some("PRIMARY KEY");
             let columns = r[1].as_deref().map(parse_list_text).unwrap_or_default();
             l.indexes.push(IndexInfo { name: r[0].clone().unwrap_or_default(), columns, unique: true, primary, method: None });
         }
         for r in query_text(self, &format!("SELECT index_name, expressions, is_unique, is_primary FROM duckdb_indexes() WHERE {w}")).await? {
             let columns = r[1].as_deref().map(parse_list_text).unwrap_or_default();
-            l.indexes.push(IndexInfo { name: r[0].clone().unwrap_or_default(), columns, unique: truthy(&r[2]), primary: truthy(&r[3]), method: Some("art".into()) });
+            l.indexes.push(IndexInfo {
+                name: r[0].clone().unwrap_or_default(),
+                columns,
+                unique: truthy(&r[2]),
+                primary: truthy(&r[3]),
+                method: Some("art".into()),
+            });
         }
         l.indexes.sort_by_key(|i| !i.primary);
         if let Ok(r) = query_text(self, &format!("SELECT estimated_size FROM duckdb_tables() WHERE {w}")).await {
@@ -1337,13 +1376,7 @@ mod tests {
     #[tokio::test]
     async fn batches_and_cancel() {
         let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
-        let r = s
-            .execute("select * from range(5000)", ExecOptions { batch_size: 1000, ..Default::default() })
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
+        let r = s.execute("select * from range(5000)", ExecOptions { batch_size: 1000, ..Default::default() }).await.unwrap().collect().await.unwrap();
         assert_eq!(r.num_rows(), 5000);
         assert!(r.batches.iter().all(|b| b.num_rows() <= 1000));
         let cancel = databrain_connector_core::CancellationToken::new();
@@ -1455,7 +1488,8 @@ mod tests {
         let c = duckdb::Connection::open_in_memory().unwrap();
         for d in [&parts, &near] {
             std::fs::create_dir_all(d).unwrap();
-            c.execute_batch(&format!("COPY (SELECT range AS id FROM range(3)) TO {} (FORMAT parquet)", quote_literal(&d.join("p0.parquet").to_string_lossy()))).unwrap();
+            c.execute_batch(&format!("COPY (SELECT range AS id FROM range(3)) TO {} (FORMAT parquet)", quote_literal(&d.join("p0.parquet").to_string_lossy())))
+                .unwrap();
         }
         (csv, parts)
     }
@@ -1489,7 +1523,9 @@ mod tests {
         assert!(!out.exists());
         q_err(&*s, &format!("attach {} as other", quote_literal(&dir.path().join("x.duckdb").to_string_lossy()))).await;
         q_err(&*s, "select * from read_csv('https://example.com/a.csv')").await;
-        for set in ["SET enable_external_access = true", "SET allowed_directories = ['/']", "SET allowed_paths = ['/etc/passwd']", "SET lock_configuration = false"] {
+        for set in
+            ["SET enable_external_access = true", "SET allowed_directories = ['/']", "SET allowed_paths = ['/etc/passwd']", "SET lock_configuration = false"]
+        {
             let e = q_err(&*s, set).await;
             assert!(e.message.contains("sandbox"), "{set}: {}", e.message);
         }
@@ -1545,9 +1581,7 @@ mod bundled_extensions {
         let c = duckdb::Connection::open_in_memory().unwrap();
         c.execute_batch(&format!("SET extension_directory = {}; SET autoinstall_known_extensions = false;", quote_literal(&dir.to_string_lossy()))).unwrap();
         load_extension(&c, "excel");
-        let path: String = c
-            .query_row("select install_path from duckdb_extensions() where extension_name = 'excel' and loaded", [], |r| r.get(0))
-            .unwrap();
+        let path: String = c.query_row("select install_path from duckdb_extensions() where extension_name = 'excel' and loaded", [], |r| r.get(0)).unwrap();
         // DuckDB writes the path with the system's separators (`\` on Windows).
         let norm = |s: &str| s.replace('\\', "/");
         assert!(norm(&path).starts_with(&norm(&dir.to_string_lossy())), "{path}");
@@ -1610,13 +1644,8 @@ mod excel_types {
         let plain = c.prepare(&format!("SELECT * FROM read_xlsx({})", quote_literal(&path))).and_then(|mut s| s.query_arrow([]).map(|r| r.count()));
         assert!(plain.is_err(), "expected read_xlsx to fail on mixed columns");
         let src = excel_sources_with(&c, &path, false).unwrap().remove(0).1;
-        let types: Vec<(String, String)> = c
-            .prepare(&format!("DESCRIBE SELECT * FROM {src}"))
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
+        let types: Vec<(String, String)> =
+            c.prepare(&format!("DESCRIBE SELECT * FROM {src}")).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect();
         let ty = |n: &str| types.iter().find(|t| t.0 == n).map(|t| t.1.as_str()).unwrap();
         assert_eq!(ty("id"), "DOUBLE", "{src}");
         assert_eq!(ty("code"), "VARCHAR");
@@ -1642,8 +1671,11 @@ mod excel_types {
         let Some(c) = conn() else { return };
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("ok.xlsx");
-        c.execute_batch(&format!("COPY (SELECT range AS n, 'x' || range AS s FROM range(5)) TO {} (FORMAT xlsx, HEADER true)", quote_literal(&p.to_string_lossy())))
-            .unwrap();
+        c.execute_batch(&format!(
+            "COPY (SELECT range AS n, 'x' || range AS s FROM range(5)) TO {} (FORMAT xlsx, HEADER true)",
+            quote_literal(&p.to_string_lossy())
+        ))
+        .unwrap();
         let src = excel_sources_with(&c, &p.to_string_lossy(), false).unwrap().remove(0).1;
         assert!(src.starts_with("read_xlsx("), "no wrapper needed: {src}");
         assert!(src.contains("range = 'A1:B6'"), "{src}");
@@ -1705,7 +1737,10 @@ mod excel_types {
         ragged_book(&p);
         let path = p.to_string_lossy().to_string();
         let sheets = xlsx::sheets(&path).unwrap();
-        assert_eq!(sheets.iter().map(|s| (s.name.as_str(), s.range.as_deref())).collect::<Vec<_>>(), vec![("Sales", Some("A1:D6")), ("Q2 & plan", Some("A1:A2")), ("Empty", None)]);
+        assert_eq!(
+            sheets.iter().map(|s| (s.name.as_str(), s.range.as_deref())).collect::<Vec<_>>(),
+            vec![("Sales", Some("A1:D6")), ("Q2 & plan", Some("A1:A2")), ("Empty", None)]
+        );
         let all = excel_sources_with(&c, &path, true).unwrap();
         assert_eq!(all.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(), vec!["Sales", "Q2 & plan"], "empty sheets skipped");
         assert_eq!(rows(&c, &format!("SELECT CAST(k AS VARCHAR) FROM {}", all[1].1)), vec![vec![Some("7.0".into())]]);

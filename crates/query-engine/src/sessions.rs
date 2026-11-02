@@ -37,12 +37,7 @@ impl QueryEngine {
                 None => {}
             }
         }
-        let gate = self
-            .connecting
-            .lock()
-            .entry(key.clone())
-            .or_default()
-            .clone();
+        let gate = self.connecting.lock().entry(key.clone()).or_default().clone();
         let _g = gate.lock().await;
         if let Some(s) = self.sessions.lock().get(&key).filter(|s| s.sandboxed || !sandbox) {
             return Ok(s.session.clone());
@@ -114,7 +109,9 @@ impl QueryEngine {
                 return Err(e.into());
             }
         };
-        self.sessions.lock().insert(key, Live { session: session.clone(), _tunnel: tunnel, sandboxed: sandbox, last_used: parking_lot::Mutex::new(Instant::now()) });
+        self.sessions
+            .lock()
+            .insert(key, Live { session: session.clone(), _tunnel: tunnel, sandboxed: sandbox, last_used: parking_lot::Mutex::new(Instant::now()) });
         Ok(session)
     }
 
@@ -143,9 +140,7 @@ impl QueryEngine {
     }
 
     pub(crate) fn drop_session(&self, connection_id: &str, tab_id: &str) {
-        self.sessions
-            .lock()
-            .remove(&(connection_id.to_string(), tab_id.to_string()));
+        self.sessions.lock().remove(&(connection_id.to_string(), tab_id.to_string()));
     }
 
     /// Close sessions unused for `idle` (their connections go back to the
@@ -166,13 +161,7 @@ impl QueryEngine {
 
     /// The idle time after which sessions close ([`IDLE_DISCONNECT_SETTING`]); `None` = never.
     pub fn idle_disconnect(&self) -> Option<Duration> {
-        let minutes = self
-            .workspace
-            .get_setting(IDLE_DISCONNECT_SETTING)
-            .ok()
-            .flatten()
-            .and_then(|v| v.as_u64())
-            .unwrap_or(IDLE_DISCONNECT_DEFAULT_MINUTES);
+        let minutes = self.workspace.get_setting(IDLE_DISCONNECT_SETTING).ok().flatten().and_then(|v| v.as_u64()).unwrap_or(IDLE_DISCONNECT_DEFAULT_MINUTES);
         (minutes > 0).then(|| Duration::from_secs(minutes * 60))
     }
 
@@ -221,13 +210,7 @@ impl QueryEngine {
 
     /// Release the session and results that belong to a closed tab.
     pub fn close_tab(&self, tab_id: &str) {
-        let running: Vec<String> = self
-            .jobs
-            .lock()
-            .iter()
-            .filter(|(_, j)| j.tab_id == tab_id || j.session_key == tab_id)
-            .map(|(id, _)| id.clone())
-            .collect();
+        let running: Vec<String> = self.jobs.lock().iter().filter(|(_, j)| j.tab_id == tab_id || j.session_key == tab_id).map(|(id, _)| id.clone()).collect();
         for id in running {
             self.cancel(&id);
         }
@@ -255,10 +238,7 @@ impl QueryEngine {
     /// The session `session_key` of a connection has an open transaction
     /// (false when it isn't connected).
     pub fn in_transaction(&self, connection_id: &str, session_key: &str) -> bool {
-        self.sessions
-            .lock()
-            .get(&(connection_id.to_string(), session_key.to_string()))
-            .is_some_and(|l| l.session.in_transaction())
+        self.sessions.lock().get(&(connection_id.to_string(), session_key.to_string())).is_some_and(|l| l.session.in_transaction())
     }
 
     /// COMMIT or ROLLBACK the session's transaction. Returns whether one is

@@ -241,10 +241,17 @@ impl Workspace {
             .optional()?
             .flatten();
         let Some(listed_at) = listed_at else { return Ok(None) };
-        let mut st = c.prepare_cached("SELECT name, kind, comment, row_estimate FROM meta_objects WHERE connection_id = ?1 AND schema_name = ?2 ORDER BY name")?;
+        let mut st =
+            c.prepare_cached("SELECT name, kind, comment, row_estimate FROM meta_objects WHERE connection_id = ?1 AND schema_name = ?2 ORDER BY name")?;
         let objects = st
             .query_map(params![connection_id, schema], |r| {
-                Ok(DbObject { schema: schema.to_string(), name: r.get(0)?, kind: parse_kind(&r.get::<_, String>(1)?), comment: r.get(2)?, row_estimate: r.get(3)? })
+                Ok(DbObject {
+                    schema: schema.to_string(),
+                    name: r.get(0)?,
+                    kind: parse_kind(&r.get::<_, String>(1)?),
+                    comment: r.get(2)?,
+                    row_estimate: r.get(3)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(Some(CachedListing { objects, listed_at }))
@@ -253,7 +260,8 @@ impl Workspace {
     /// Listed schemas and the fingerprint each was listed at (if known).
     pub fn meta_listed_schemas(&self, connection_id: &str) -> Result<Vec<(String, Option<String>)>> {
         let c = self.conn.lock();
-        let mut st = c.prepare_cached("SELECT schema_name, listed_fp FROM meta_schemas WHERE connection_id = ?1 AND listed_at IS NOT NULL ORDER BY pos, schema_name")?;
+        let mut st =
+            c.prepare_cached("SELECT schema_name, listed_fp FROM meta_schemas WHERE connection_id = ?1 AND listed_at IS NOT NULL ORDER BY pos, schema_name")?;
         let rows = st.query_map([connection_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -288,10 +296,8 @@ impl Workspace {
     /// Cached catalogs (three-level engines), `None` if never listed.
     pub fn meta_catalogs(&self, connection_id: &str) -> Result<Option<Vec<CatalogInfo>>> {
         let c = self.conn.lock();
-        let at: Option<i64> = c
-            .query_row("SELECT catalogs_at FROM meta_conn_state WHERE connection_id = ?1", [connection_id], |r| r.get(0))
-            .optional()?
-            .flatten();
+        let at: Option<i64> =
+            c.query_row("SELECT catalogs_at FROM meta_conn_state WHERE connection_id = ?1", [connection_id], |r| r.get(0)).optional()?.flatten();
         if at.is_none() {
             return Ok(None);
         }
@@ -366,7 +372,8 @@ impl Workspace {
         let tx = c.transaction()?;
         let keep: HashSet<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
         let old: Vec<String> = {
-            let mut st = tx.prepare_cached("SELECT schema_name FROM meta_schemas WHERE connection_id = ?1 AND pos < 1000000000 AND (?2 IS NULL OR catalog = ?2)")?;
+            let mut st =
+                tx.prepare_cached("SELECT schema_name FROM meta_schemas WHERE connection_id = ?1 AND pos < 1000000000 AND (?2 IS NULL OR catalog = ?2)")?;
             st.query_map(params![connection_id, catalog], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
         };
         for gone in old.iter().filter(|n| !keep.contains(n.as_str())) {
@@ -413,7 +420,9 @@ impl Workspace {
 
     fn state_set(tx: &rusqlite::Transaction<'_>, connection_id: &str, column: &str) -> Result<()> {
         tx.execute(
-            &format!("INSERT INTO meta_conn_state (connection_id, {column}) VALUES (?1, ?2) ON CONFLICT (connection_id) DO UPDATE SET {column} = excluded.{column}"),
+            &format!(
+                "INSERT INTO meta_conn_state (connection_id, {column}) VALUES (?1, ?2) ON CONFLICT (connection_id) DO UPDATE SET {column} = excluded.{column}"
+            ),
             params![connection_id, now_ms()],
         )?;
         Ok(())
@@ -436,18 +445,16 @@ impl Workspace {
             })
             .optional()?
             .unwrap_or_default();
-        s.listed_schemas = c.query_row("SELECT count(*) FROM meta_schemas WHERE connection_id = ?1 AND listed_at IS NOT NULL", [connection_id], |r| r.get(0))?;
+        s.listed_schemas =
+            c.query_row("SELECT count(*) FROM meta_schemas WHERE connection_id = ?1 AND listed_at IS NOT NULL", [connection_id], |r| r.get(0))?;
         Ok(s)
     }
 
     /// Clear the cache when the connection now points at another server/user.
     pub fn meta_check_identity(&self, connection_id: &str, cfg: &ConnectionConfig) -> Result<()> {
         let id = identity(cfg);
-        let old: Option<Option<String>> = self
-            .conn
-            .lock()
-            .query_row("SELECT identity FROM meta_conn_state WHERE connection_id = ?1", [connection_id], |r| r.get(0))
-            .optional()?;
+        let old: Option<Option<String>> =
+            self.conn.lock().query_row("SELECT identity FROM meta_conn_state WHERE connection_id = ?1", [connection_id], |r| r.get(0)).optional()?;
         match old.flatten() {
             Some(o) if o == id => return Ok(()),
             // Cached before identities were recorded: assume it is the same server.
@@ -635,7 +642,10 @@ mod tests {
     }
 
     fn cols(names: &[&str]) -> Vec<ColumnInfo> {
-        names.iter().map(|n| ColumnInfo { name: (*n).into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None }).collect()
+        names
+            .iter()
+            .map(|n| ColumnInfo { name: (*n).into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None })
+            .collect()
     }
 
     #[test]
@@ -700,7 +710,14 @@ mod tests {
 
         // A full listing with versions: only changed objects go stale; gone ones lose columns.
         ws.meta_put_columns("c", "s", "n", &cols(&["v"])).unwrap();
-        ws.meta_put_listing("c", "s", &[o("s", "b", ObjectKind::Table), o("s", "n", ObjectKind::View)], Some(&v(&[("table:b", "2"), ("view:n", "9")])), Some("fp3")).unwrap();
+        ws.meta_put_listing(
+            "c",
+            "s",
+            &[o("s", "b", ObjectKind::Table), o("s", "n", ObjectKind::View)],
+            Some(&v(&[("table:b", "2"), ("view:n", "9")])),
+            Some("fp3"),
+        )
+        .unwrap();
         assert!(!ws.meta_columns("c", "s", "b").unwrap().unwrap().stale);
         assert!(ws.meta_columns("c", "s", "n").unwrap().unwrap().stale);
         assert!(ws.meta_columns("c", "s", "a").unwrap().is_none(), "no object `a` any more");

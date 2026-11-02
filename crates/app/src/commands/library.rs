@@ -23,10 +23,7 @@ pub(crate) async fn delete_notebook(state: State<'_, AppState>, id: String) -> R
 }
 
 #[tauri::command]
-pub(crate) async fn list_saved_queries(
-    state: State<'_, AppState>,
-    search: Option<String>,
-) -> R<Vec<SavedQuery>> {
+pub(crate) async fn list_saved_queries(state: State<'_, AppState>, search: Option<String>) -> R<Vec<SavedQuery>> {
     api::list_saved_queries(&state, search)
 }
 

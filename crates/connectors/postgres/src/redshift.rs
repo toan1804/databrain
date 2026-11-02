@@ -319,7 +319,10 @@ mod tests {
     fn parses_constraint_defs() {
         assert_eq!(parse_key_columns("PRIMARY KEY (id, \"Order No\")"), vec!["id", "Order No"]);
         let fk = parse_foreign_key("FOREIGN KEY (customer_id, region) REFERENCES sales.customers(id, region)", "public").unwrap();
-        assert_eq!((fk.columns, fk.ref_schema.as_str(), fk.ref_table.as_str(), fk.ref_columns), (vec!["customer_id".to_string(), "region".into()], "sales", "customers", vec!["id".to_string(), "region".into()]));
+        assert_eq!(
+            (fk.columns, fk.ref_schema.as_str(), fk.ref_table.as_str(), fk.ref_columns),
+            (vec!["customer_id".to_string(), "region".into()], "sales", "customers", vec!["id".to_string(), "region".into()])
+        );
         let fk = parse_foreign_key("FOREIGN KEY (c) REFERENCES \"Cust\"(id)", "public").unwrap();
         assert_eq!((fk.ref_schema.as_str(), fk.ref_table.as_str()), ("public", "Cust"));
         assert!(parse_foreign_key("CHECK (x > 0)", "public").is_none());
