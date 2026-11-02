@@ -84,6 +84,10 @@ impl Connector for ClickhouseConnector {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .pool_idle_timeout(Duration::from_secs(50))
+            // No HTTP compression: ClickHouse (25.x compresses whenever asked)
+            // writes an error that comes after the first rows into its gzip
+            // stream without flushing it, and the error would be lost.
+            .no_gzip()
             .danger_accept_invalid_certs(accept_invalid)
             .user_agent(concat!("DataBrain/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -684,6 +688,61 @@ impl Session for ChSession {
 mod tests {
     use super::*;
     use databrain_auth::AuthMethod;
+
+    /// A fake server: answers the sign-in check, then streams rows and fails
+    /// the way ClickHouse 24.11+ does once the result has started: an
+    /// exception block, then the connection closed without the last chunk.
+    fn broken_stream_server() -> u16 {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                // The whole request: headers, then Content-Length bytes of SQL.
+                let mut req = Vec::new();
+                let mut b = [0u8; 4096];
+                loop {
+                    let n = c.read(&mut b).unwrap();
+                    req.extend_from_slice(&b[..n]);
+                    let text = String::from_utf8_lossy(&req).to_lowercase();
+                    let Some(end) = text.find("\r\n\r\n") else { continue };
+                    let len = text.lines().find_map(|l| l.strip_prefix("content-length:")).map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                    if n == 0 || req.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&req);
+                assert!(!req.to_lowercase().contains("accept-encoding: gzip"), "{req}");
+                if req.contains("currentDatabase()") {
+                    let body = "currentDatabase()\nString\ndefault\n";
+                    let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    continue;
+                }
+                let tag = "abcdefghijklmnop";
+                let chunk = |c: &mut std::net::TcpStream, s: &str| write!(c, "{:x}\r\n{s}\r\n", s.len()).unwrap();
+                write!(c, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nX-ClickHouse-Exception-Tag: {tag}\r\n\r\n").unwrap();
+                chunk(&mut c, "x\nUInt8\n0\n0\n");
+                let msg = "Code: 395. DB::Exception: Value passed to 'throwIf' function is non-zero: boom. (FUNCTION_THROW_IF_VALUE_IS_NON_ZERO) (version 25.8.1.1)\n";
+                chunk(&mut c, &format!("\r\n__exception__\r\n{tag}\r\n{msg}{} {tag}\r\n__exception__\r\n", msg.len()));
+                c.flush().unwrap();
+                // No terminating chunk: the response is broken on purpose.
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn reports_errors_sent_after_the_result_started() {
+        use databrain_auth::InlineCredentialSource;
+        let port = broken_stream_server();
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Clickhouse, AuthMethod::Password { user: "default".into() });
+        cfg.host = Some("127.0.0.1".into());
+        cfg.port = Some(port);
+        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user: "default".into() }, Some(secrecy::SecretString::from("pw"))));
+        let s = ClickhouseConnector.connect(&cfg, creds).await.unwrap();
+        let e = s.execute("SELECT throwIf(number = 100)", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
+        assert!(e.message.contains("boom") && !e.message.contains("abcdefghijklmnop"), "{e:?}");
+    }
 
     #[test]
     fn endpoints() {
