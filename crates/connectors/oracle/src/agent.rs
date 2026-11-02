@@ -112,10 +112,29 @@ pub fn installed() -> Option<PathBuf> {
     if let Some(p) = built_from_source() {
         return Some(p);
     }
-    let file = file_name();
     let d = DIR.read().unwrap().clone()?;
-    let p = d.join(RELEASE).join(&file);
-    p.is_file().then_some(p)
+    installed_in(&d)
+}
+
+/// The helper in the download folder `root`, checked against SHA256SUMS
+/// each time it is looked up (so before every launch), not only when it was
+/// installed: a file changed since, or a link put in its place, is not
+/// started, and [`ensure`] downloads it again.
+fn installed_in(root: &Path) -> Option<PathBuf> {
+    let file = file_name();
+    let p = root.join(RELEASE).join(&file);
+    let meta = std::fs::symlink_metadata(&p).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let want = expected_sha256(&file)?;
+    match std::fs::read(&p) {
+        Ok(bin) if sha256_hex(&bin) == want => Some(p),
+        _ => {
+            tracing::warn!(path = %p.display(), "the installed Oracle driver doesn't match its SHA-256; not starting it");
+            None
+        }
+    }
 }
 
 /// What the user needs to install the helper by hand (blocked networks).
@@ -543,6 +562,18 @@ mod tests {
         let p = download_into(&tmp, &serve(gz).await).await.unwrap();
         assert_eq!(p, tmp.join(RELEASE).join(file_name()));
         drop(Agent::spawn(&p).await.unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A helper changed after it was installed is not used.
+    #[test]
+    fn checks_the_installed_helper_each_time() {
+        let tmp = std::env::temp_dir().join(format!("dboa-tamper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(installed_in(&tmp), None);
+        std::fs::create_dir_all(tmp.join(RELEASE)).unwrap();
+        std::fs::write(tmp.join(RELEASE).join(file_name()), b"#!/bin/sh\necho changed\n").unwrap();
+        assert_eq!(installed_in(&tmp), None, "a file that doesn't match SHA256SUMS");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
