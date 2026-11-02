@@ -6,7 +6,7 @@ import { useJobs } from "../jobsStore";
 import { openOutput, openResultsQuery, outputLabel, outputRef } from "../outputs";
 import { queryLocalFile } from "./Sidebar";
 import { exportConnections } from "./ConnectionsIoDialog";
-import { openCompare } from "./CompareTab";
+import { openCompare } from "./openTabs";
 import { fuzzyMatch, relativeTime, sqlPreview } from "../lib/util";
 import { baseName, isQueryTab, useStore } from "../store";
 import { ConnDot } from "./ui";

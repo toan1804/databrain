@@ -5,7 +5,7 @@ import { EditorView } from "@codemirror/view";
 import { useStore } from "../store";
 import { editorBridge } from "../editorBridge";
 import { SqlContextMenu } from "./SqlContextMenu";
-import { openLineage } from "./LineageTab";
+import { openLineage } from "./openTabs";
 import { paramNames, textualNames } from "./paramsExt";
 import { api, isTauri } from "../lib/api";
 import { statementTarget } from "../lib/statementNav";

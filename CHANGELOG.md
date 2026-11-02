@@ -58,6 +58,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- The app's code is no longer one 1.9 MB file: React, the editor and the grid are separate files, and the DDL, job, lineage, schema compare and ER diagram tabs (with the SQL formatter) load when first opened. Code read at startup is about 1.6 MB, and the build warns again above 800 kB per file.
 - Job logs shown live in the app keep each run's latest 5,000 lines and the latest 10 runs; they grew for as long as the app stayed open.
 - A table whose name contains a dot (`"x.y"`) is quoted as one name when editing rows, opening related rows and counting rows on SQLite; it was split into two parts.
 - The per-tab lock used while connecting is removed once nobody waits on it; one was kept for every tab and job step ever opened.

@@ -9,8 +9,7 @@ import { quoteIdent } from "../lib/util";
 import { editorBridge } from "../editorBridge";
 import { useStore } from "../store";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
-import { openCompare } from "./CompareTab";
-import { openErDiagram } from "./ErTab";
+import { openCompare, openErDiagram } from "./openTabs";
 
 export async function copyText(text: string, what: string) {
   try {

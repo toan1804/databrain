@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEvent } from "../lib/hooks";
-import { traitsOf } from "../lib/sourceTraits";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { AlertCircle, AlertTriangle, ArrowDown, ArrowRight, Minus, Plus, CheckCircle2, Columns3, ExternalLink, Rows3, Workflow, ChevronDown, ClipboardCopy, Download, Loader2, Maximize2, Network, RefreshCw, TextCursorInput, WifiOff, X } from "lucide-react";
 import { api, isTauri, toError } from "../lib/api";
@@ -14,33 +13,6 @@ import { editorBridge } from "../editorBridge";
 import { copyText } from "./CatalogMenus";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
 import { SplitHandle } from "./SplitHandle";
-
-/**
- * Open (or refresh) the lineage tab of an editor: its selection, else the
- * whole script. `editorKey` is a query tab id or a notebook cell key.
- */
-export function openLineage(editorKey: string, connectionId?: string | null) {
-  const st = useStore.getState();
-  const view = editorBridge.get(editorKey);
-  const srcTab = st.tabs.find((t) => t.id === editorKey);
-  const nbTab = editorKey.startsWith("nb:") ? st.tabs.find((t) => t.notebook_id && editorKey.startsWith(`nb:${t.notebook_id}:`)) : undefined;
-  const doc = view?.state.doc.toString() ?? srcTab?.sql ?? "";
-  const sel = view?.state.selection.main;
-  const whole = !sel || sel.empty;
-  const sql = whole ? doc : doc.slice(sel.from, sel.to);
-  if (!sql.trim()) return st.toast("Nothing to trace: write a query first", "info");
-  const conn = connectionId !== undefined ? connectionId : (srcTab?.connection_id ?? nbTab?.connection_id ?? null);
-  const kind = st.connections.find((c) => c.id === conn)?.config.kind;
-  if (kind && traitsOf(kind).language !== "sql") return st.toast(`Lineage traces SQL; ${traitsOf(kind).name} queries aren't supported`, "info");
-  const lineage = { source: editorKey, base: whole ? 0 : sel.from, whole };
-  const existing = st.tabs.find((t) => t.lineage?.source === editorKey && !t.lineage.column);
-  if (existing) {
-    st.updateTab(existing.id, { sql, lineage, connection_id: conn });
-    return st.setActiveTab(existing.id);
-  }
-  const title = `Lineage · ${(srcTab ?? nbTab)?.title ?? "SQL"}`;
-  st.newTab({ title, sql, connection_id: conn, lineage });
-}
 
 /** Open one column's flow in a tab of its own (from a lineage tab). */
 export function openColumnLineage(from: Tab, node: string, column?: string) {

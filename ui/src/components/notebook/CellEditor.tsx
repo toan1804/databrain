@@ -5,7 +5,7 @@ import { useStore } from "../../store";
 import { editorBridge } from "../../editorBridge";
 import { setError, sqlEditorExtensions, useDialect, useParamSpans } from "../sqlEditorSetup";
 import { SqlContextMenu } from "../SqlContextMenu";
-import { openLineage } from "../LineageTab";
+import { openLineage } from "../openTabs";
 import { ResizeHandle } from "../ResizeHandle";
 import { EDITOR_MAX, EDITOR_MIN } from "../../lib/resize";
 import { kbd } from "../../lib/platform";

@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { lazy, memo, Suspense, useEffect, useRef, useState } from "react";
 import { ChevronsDownUp, FileCode2, FileText, GitCompare, GitFork, LayoutDashboard, Network, Share2, Table2, Lightbulb, Loader2, MoreHorizontal, Play, PlayCircle, Plus, Save, Sparkles, Square, X, Workflow } from "lucide-react";
 import { isQueryTab, useActiveTab, useStore, type Tab } from "../store";
 import { editorBridge } from "../editorBridge";
@@ -7,14 +7,10 @@ import { ResultsPanel } from "./ResultsPanel";
 import { ConnDot, EnvBadge, MenuItem, Popover } from "./ui";
 import { NotebookView } from "./Notebook";
 import { OutputTab } from "./OutputTab";
-import { DdlTab } from "./DdlTab";
 import { ParamBar } from "./ParamBar";
-import { JobTab } from "./JobTab";
 import { TabErrorBoundary } from "./TabErrorBoundary";
-import { LineageTab, openLineage } from "./LineageTab";
+import { openLineage } from "./openTabs";
 import { PlanTab, openPlan } from "./PlanTab";
-import { CompareTab } from "./CompareTab";
-import { ErTab } from "./ErTab";
 import { DashboardTab } from "./DashboardTab";
 import { useAi } from "../aiStore";
 import type { ConnectionView } from "../lib/types";
@@ -139,6 +135,14 @@ export function EditorPane() {
   );
 }
 
+// Tabs opened now and then are loaded on first use, keeping them out of the
+// bundle read at startup.
+const DdlTab = lazy(() => import("./DdlTab").then((m) => ({ default: m.DdlTab })));
+const JobTab = lazy(() => import("./JobTab").then((m) => ({ default: m.JobTab })));
+const LineageTab = lazy(() => import("./LineageTab").then((m) => ({ default: m.LineageTab })));
+const CompareTab = lazy(() => import("./CompareTab").then((m) => ({ default: m.CompareTab })));
+const ErTab = lazy(() => import("./ErTab").then((m) => ({ default: m.ErTab })));
+
 /**
  * A tab other than a query editor (notebook, output, DDL, job, lineage,
  * dashboard, compare, plan), shown or hidden. Memoized: hidden tabs don't
@@ -167,7 +171,9 @@ const TabSlot = memo(function TabSlot({ tab: t, active }: { tab: Tab; active: bo
   if (!body) return null;
   return (
     <div className={active ? "min-h-0 flex-1" : "hidden"}>
-      <TabErrorBoundary label={label!}>{body}</TabErrorBoundary>
+      <TabErrorBoundary label={label!}>
+        <Suspense fallback={<div className="flex h-full items-center justify-center text-muted"><Loader2 size={16} className="animate-spin" /></div>}>{body}</Suspense>
+      </TabErrorBoundary>
     </div>
   );
 });
