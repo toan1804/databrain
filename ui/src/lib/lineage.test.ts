@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { layout, trace, colKey, anchor, withPositions, normalize, shownEdges, chainGraph } from "./lineageLayout";
-import { exportText, toDrawio, toMermaid, toDot, toSvg } from "./lineageExport";
+import { LIGHT, cssColor, exportText, toDrawio, toMermaid, toDot, toSvg } from "./lineageExport";
 import type { LineageGraph } from "./types";
 
 // What the backend returns for:
@@ -210,5 +210,18 @@ describe("chain view", () => {
     expect(toSvg(c, l)).toContain("statement 2");
     // Old graphs without flows: tables only, no edges.
     expect(chainGraph({ ...script, flows: undefined }).edges).toEqual([]);
+  });
+});
+
+describe("diagram colours", () => {
+  it("keeps plain CSS colours and drops anything that could leave the attribute", () => {
+    for (const ok of ["#0b0f17", "#ABC", "rgb(1, 2, 3)", "rgba(1,2,3,0.5)", "hsl(210 40% 50% / 0.8)", "white", "transparent"]) expect(cssColor(ok, "#fff")).toBe(ok);
+    for (const bad of ['red" onload="alert(1)', "#fff'/><script>x</script>", "url(javascript:x)", "rgb(1,2,3)\"", ""]) expect(cssColor(bad, "#fff")).toBe("#fff");
+  });
+  it("a custom appearance colour can't add markup to the SVG", () => {
+    const svg = toSvg(g, layout(g), { colors: { ...LIGHT, bg: '#000"/><script>alert(1)</script><rect fill="', text: "red' onclick='x" } });
+    expect(svg).not.toContain("<script");
+    expect(svg).not.toContain("onclick");
+    expect(svg).toContain(`fill="${LIGHT.bg}"`);
   });
 });
