@@ -62,6 +62,29 @@ export function announceScheduled(jobs: JobSummary[], run: JobRun) {
 }
 let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
+/** Live log lines kept per run (the app keeps the same number). */
+export const LIVE_LOG_MAX = 5000;
+/** Runs whose live log is kept; a finished run's log is read from the app. */
+export const LIVE_LOG_RUNS = 10;
+
+/** `logs` with `entries` added to run `runId` (lines already there skipped),
+ * keeping each run's latest {@link LIVE_LOG_MAX} lines and the latest
+ * {@link LIVE_LOG_RUNS} runs. Returns `logs` itself when nothing is new. */
+export function appendRunLog(logs: Record<number, RunLogEntry[]>, runId: number, entries: RunLogEntry[]): Record<number, RunLogEntry[]> {
+  const cur = logs[runId] ?? [];
+  const last = cur.length ? cur[cur.length - 1].seq : 0;
+  const fresh = entries.filter((e) => e.seq > last);
+  if (!fresh.length) return logs;
+  const merged = cur.concat(fresh);
+  const next = { ...logs, [runId]: merged.length > LIVE_LOG_MAX ? merged.slice(merged.length - LIVE_LOG_MAX) : merged };
+  const ids = Object.keys(next).map(Number);
+  if (ids.length > LIVE_LOG_RUNS) {
+    // Run ids grow: the smallest are the oldest runs.
+    for (const id of ids.sort((a, b) => a - b).slice(0, ids.length - LIVE_LOG_RUNS)) if (id !== runId) delete next[id];
+  }
+  return next;
+}
+
 export const useJobs = create<JobsState>((set, get) => ({
   jobs: [],
   runs: {},
@@ -99,10 +122,8 @@ export const useJobs = create<JobsState>((set, get) => ({
     started = true;
     await onJobRunLog(({ run_id, entries }) =>
       set((s) => {
-        const cur = s.logs[run_id] ?? [];
-        const last = cur.length ? cur[cur.length - 1].seq : 0;
-        const fresh = entries.filter((e) => e.seq > last);
-        return fresh.length ? { logs: { ...s.logs, [run_id]: [...cur, ...fresh] } } : {};
+        const logs = appendRunLog(s.logs, run_id, entries);
+        return logs === s.logs ? {} : { logs };
       }),
     );
     await onJobRun(({ job_id, run }) => {

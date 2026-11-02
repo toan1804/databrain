@@ -24,7 +24,7 @@ vi.mock("./lib/api", () => ({
 }));
 
 const { useStore, isQueryTab } = await import("./store");
-const { useJobs } = await import("./jobsStore");
+const { useJobs, appendRunLog, LIVE_LOG_MAX, LIVE_LOG_RUNS } = await import("./jobsStore");
 
 beforeEach(() => {
   saved.length = 0;
@@ -93,5 +93,24 @@ describe("scheduled runs", () => {
     announceScheduled(jobs, { ...run, id: 9, status: "success" });
     expect(toasts).toEqual(['Starting scheduled job "Nightly"…']);
     useStore.setState({ toast: orig });
+  });
+});
+
+describe("live run logs", () => {
+  const entry = (seq: number) => ({ seq, at: 0, level: "info" as const, message: `line ${seq}` });
+  it("skips lines already there and returns the same object when nothing is new", () => {
+    const a = appendRunLog({}, 1, [entry(1), entry(2)]);
+    const b = appendRunLog(a, 1, [entry(2), entry(3)]);
+    expect(b[1].map((e) => e.seq)).toEqual([1, 2, 3]);
+    expect(appendRunLog(b, 1, [entry(3)])).toBe(b);
+  });
+  it("keeps each run's latest lines and the latest runs", () => {
+    let logs = appendRunLog({}, 1, Array.from({ length: LIVE_LOG_MAX + 10 }, (_, i) => entry(i + 1)));
+    expect(logs[1]).toHaveLength(LIVE_LOG_MAX);
+    expect(logs[1][0].seq).toBe(11);
+    for (let id = 2; id <= LIVE_LOG_RUNS + 3; id++) logs = appendRunLog(logs, id, [entry(1)]);
+    const ids = Object.keys(logs).map(Number);
+    expect(ids).toHaveLength(LIVE_LOG_RUNS);
+    expect(Math.min(...ids)).toBe(4);
   });
 });
