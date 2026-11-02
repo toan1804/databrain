@@ -64,9 +64,20 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(200);
 /// Logged when another runner holds the job now.
 const LEASE_LOST: &str = "Stopped: another runner took this job (its lease ran out, e.g. while the computer slept); it runs there, not twice";
 
-/// This process still holds `job_id`'s lease (renewed now).
-fn holds_lease(ctx: &JobCtx, job_id: &str) -> bool {
-    ctx.workspace.claim_job(job_id, &ctx.jobs.owner, now_ms() + LEASE_MS).unwrap_or(false)
+/// Renew `owner`'s lease of `job_id`: `Some(true)` held, `Some(false)`
+/// another runner holds it, `None` the workspace kept failing (a few
+/// tries; a busy or locked database is not a lost lease).
+async fn renew_lease(ws: &Workspace, job_id: &str, owner: &str) -> Option<bool> {
+    for attempt in 0..3 {
+        match ws.claim_job(job_id, owner, now_ms() + LEASE_MS) {
+            Ok(held) => return Some(held),
+            Err(e) => {
+                tracing::warn!(job = job_id, attempt, error = %e, "job lease not renewed (workspace error), trying again");
+                tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
+            }
+        }
+    }
+    None
 }
 
 /// How long a job's lease lasts; renewed every [`LEASE_RENEW`] while it runs.
@@ -457,14 +468,26 @@ pub fn start_with(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<St
         let beat = {
             let (ws, id, owner, stop) = (c.workspace.clone(), id.clone(), c.jobs.owner.clone(), cancel.clone());
             tokio::spawn(async move {
+                let mut renewed = Instant::now();
                 loop {
                     tokio::time::sleep(LEASE_RENEW).await;
-                    // Lost (another runner took it after the lease ran out, e.g.
-                    // while the computer slept): stop, so it doesn't run twice.
-                    if !ws.claim_job(&id, &owner, now_ms() + LEASE_MS).unwrap_or(false) {
-                        tracing::warn!(job = %id, run = run_id, "job lease lost to another runner: stopping this run");
-                        stop.cancel();
-                        break;
+                    match renew_lease(&ws, &id, &owner).await {
+                        Some(true) => renewed = Instant::now(),
+                        // Lost (another runner took it after the lease ran out, e.g.
+                        // while the computer slept): stop, so it doesn't run twice.
+                        Some(false) => {
+                            tracing::warn!(job = %id, run = run_id, "job lease lost to another runner: stopping this run");
+                            stop.cancel();
+                            break;
+                        }
+                        // The workspace keeps failing: keep running while the lease
+                        // still holds, stop before another runner could take it.
+                        None if renewed.elapsed() + LEASE_RENEW >= Duration::from_millis(LEASE_MS as u64) => {
+                            tracing::warn!(job = %id, run = run_id, "job lease could not be renewed before it runs out: stopping this run");
+                            stop.cancel();
+                            break;
+                        }
+                        None => {}
                     }
                     let _ = ws.touch_job_run(run_id, &owner);
                 }
@@ -563,7 +586,12 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
                 let t = tracer.for_node(n);
                 // The lease is checked (and renewed) before each step: after the
                 // computer slept past it, another runner may have taken the job.
-                if !cancel.is_cancelled() && ups.iter().all(|u| status.get(u) == Some(&"success")) && !holds_lease(ctx, &job.id) {
+                // (Only "another runner holds it" stops here; a workspace error
+                // is left to the heartbeat, which stops before the lease could expire.)
+                if !cancel.is_cancelled()
+                    && ups.iter().all(|u| status.get(u) == Some(&"success"))
+                    && renew_lease(&ctx.workspace, &job.id, &ctx.jobs.owner).await == Some(false)
+                {
                     tracer.log("error", LEASE_LOST, None, None, None);
                     cancel.cancel();
                 }
