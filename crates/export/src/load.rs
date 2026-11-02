@@ -347,13 +347,26 @@ pub fn drop_table_sql(dialect: ConnectorKind, table: &str) -> String {
     }
 }
 
-/// `2026-01-02 03:04:05.6+02:00` → `2026-01-02 03:04:05.6 +02:00`.
+/// The timestamp with its offset as Oracle's literal wants it, after a
+/// space and as `±HH:MM`: `…05.6+02:00`, `…05.6+0200`, `…05.6+02` →
+/// `…05.6 +02:00`; a trailing `Z` (UTC) → ` +00:00`. Without an offset it
+/// is returned as it is.
 fn spaced_offset(s: &str) -> String {
-    // The offset's sign comes after the time (past the date's dashes).
-    match s.get(11..).and_then(|t| t.rfind(['+', '-'])).map(|i| i + 11) {
-        Some(i) if !s[..i].ends_with(' ') => format!("{} {}", &s[..i], &s[i..]),
-        _ => s.to_string(),
+    let s = s.trim();
+    if let Some(t) = s.strip_suffix(['Z', 'z']) {
+        return format!("{} +00:00", t.trim_end());
     }
+    // The offset's sign comes after the time (past the date's dashes).
+    let Some(i) = s.get(11..).and_then(|t| t.rfind(['+', '-'])).map(|i| i + 11) else { return s.to_string() };
+    let (time, off) = (s[..i].trim_end(), &s[i..]);
+    let (sign, digits) = off.split_at(1);
+    let hm: String = digits.chars().filter(|c| *c != ':').collect();
+    let off = match hm.len() {
+        2 if hm.chars().all(|c| c.is_ascii_digit()) => format!("{sign}{hm}:00"),
+        4 if hm.chars().all(|c| c.is_ascii_digit()) => format!("{sign}{}:{}", &hm[..2], &hm[2..]),
+        _ => off.to_string(),
+    };
+    format!("{time} {off}")
 }
 
 pub(crate) fn literal(cell: Option<&str>, kind: Lit, dialect: ConnectorKind) -> String {
@@ -615,6 +628,17 @@ mod tests {
         use ConnectorKind as K;
         assert_eq!(literal(Some("2026-01-02 03:04:05.678+02:00"), Lit::TimestampTz, K::Oracle), "TIMESTAMP '2026-01-02 03:04:05.678 +02:00'");
         assert_eq!(literal(Some("2026-01-02 03:04:05-08:00"), Lit::TimestampTz, K::Oracle), "TIMESTAMP '2026-01-02 03:04:05 -08:00'");
+        // Other spellings of the offset: UTC as Z, no colon, hours only, already spaced.
+        for (v, want) in [
+            ("2026-01-02 03:04:05.678Z", "2026-01-02 03:04:05.678 +00:00"),
+            ("2026-01-02T03:04:05z", "2026-01-02T03:04:05 +00:00"),
+            ("2026-01-02 03:04:05+0530", "2026-01-02 03:04:05 +05:30"),
+            ("2026-01-02 03:04:05-03", "2026-01-02 03:04:05 -03:00"),
+            ("2026-01-02 03:04:05 +02:00", "2026-01-02 03:04:05 +02:00"),
+            ("2026-01-02 03:04:05", "2026-01-02 03:04:05"),
+        ] {
+            assert_eq!(spaced_offset(v), want, "{v}");
+        }
         assert_eq!(literal(Some("2026-01-02 03:04:05.678+02:00"), Lit::TimestampTz, K::Postgres), "'2026-01-02 03:04:05.678+02:00'");
         let f = Field::new("at", DataType::Timestamp(databrain_connector_core::arrow::datatypes::TimeUnit::Microsecond, Some("+02:00".into())), true);
         assert!(matches!(lit_kind(&f), Lit::TimestampTz));

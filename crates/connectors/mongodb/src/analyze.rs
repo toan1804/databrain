@@ -100,8 +100,15 @@ fn command_kind(cmd: &Document, a: &mut Acc, depth: usize) -> StatementKind {
     }
 }
 
+/// Pipelines nested this deep ($lookup in $facet in $unionWith…) are not
+/// walked further: counted as writing, the safe side.
+const MAX_PIPELINE_DEPTH: usize = 8;
+
 /// Walk a pipeline; true when a stage writes (`$out`, `$merge`).
 fn pipeline(stages: &[Bson], a: &mut Acc, depth: usize) -> bool {
+    if depth >= MAX_PIPELINE_DEPTH {
+        return true;
+    }
     let mut writes = false;
     for st in stages {
         let Bson::Document(st) = st else { continue };
@@ -204,6 +211,13 @@ mod tests {
         assert_eq!(kind("db.runCommand({ping: 1})"), StatementKind::Unknown);
         assert_eq!(kind("db.runCommand({explain: {aggregate: 'orders', pipeline: [{$out: 'x'}], cursor: {}}})"), StatementKind::Dml);
         assert!(analyze("this is not a command").is_none());
+        // Nested past the walk's limit: counted as writing.
+        let mut deep = "{$match: {}}".to_string();
+        for _ in 0..MAX_PIPELINE_DEPTH {
+            deep = format!("{{$facet: {{x: [{deep}]}}}}");
+        }
+        assert_eq!(kind(&format!("db.orders.aggregate([{deep}])")), StatementKind::Dml, "too deep to check");
+        assert_eq!(kind("db.orders.aggregate([{$facet: {x: [{$facet: {y: [{$match: {}}]}}]}}])"), StatementKind::Read);
         let i = analyze("db.getSiblingDB('hr').getCollection('pay').deleteMany({})").unwrap();
         assert_eq!(names(&i.writes), ["hr.pay"]);
     }
