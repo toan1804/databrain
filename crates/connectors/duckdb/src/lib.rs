@@ -611,9 +611,25 @@ type Loaded = Mutex<std::collections::HashMap<String, String>>;
 /// (on Windows even within a process: a second open fails with "File is
 /// already open"); sessions are connections to that one instance.
 struct FileDb {
-    root: Mutex<duckdb::Connection>,
+    /// The instance's last connection (sessions' connections close first).
+    root: Mutex<Option<duckdb::Connection>>,
     /// The `results` catalog is per instance, so is what was loaded into it.
     loaded: Arc<Loaded>,
+    key: FileKey,
+}
+
+impl Drop for FileDb {
+    /// Closes the file (checkpoint, WAL removed), then leaves the registry.
+    /// Until then a session opening the file waits (see [`connect_file`])
+    /// instead of opening a second instance on a file that is still closing.
+    fn drop(&mut self) {
+        drop(self.root.get_mut().ok().and_then(Option::take));
+        if let Ok(mut dbs) = FILE_DBS.lock() {
+            if dbs.get(&self.key).is_some_and(|w| w.strong_count() == 0) {
+                dbs.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// (resolved path, read-only, sandboxed).
@@ -635,11 +651,28 @@ fn connect_file(path: &str, read_only: bool, sandbox: bool, init: &dyn Fn(&duckd
         _ => p.to_path_buf(),
     };
     let key = (resolved, read_only, sandbox);
-    let mut dbs = FILE_DBS.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?;
-    dbs.retain(|_, w| w.strong_count() > 0);
+    let closing_since = std::time::Instant::now();
+    let mut dbs = loop {
+        let dbs = FILE_DBS.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?;
+        // An instance whose last session ended is still closing the file.
+        let closing = dbs.iter().any(|(k, w)| k.0 == key.0 && w.strong_count() == 0);
+        if !closing {
+            break dbs;
+        }
+        drop(dbs);
+        if closing_since.elapsed() > std::time::Duration::from_secs(30) {
+            return Err(ConnectorError::connection(format!("{path} is still being closed; try again in a moment.")));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     if let Some(db) = dbs.get(&key).and_then(std::sync::Weak::upgrade) {
-        let conn = db.root.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?.try_clone().map_err(|e| ConnectorError::connection(e.to_string()))?;
-        return Ok((conn, db));
+        let conn = match db.root.lock().as_deref() {
+            Ok(Some(root)) => root.try_clone().map_err(|e| ConnectorError::connection(e.to_string())),
+            _ => Err(ConnectorError::internal("the database is closing")),
+        };
+        // `db` may be the last reference: it closes (and takes the registry) after the guard is released.
+        drop(dbs);
+        return conn.map(|c| (c, db));
     }
     if dbs.keys().any(|k| k.0 == key.0 && k.2 != sandbox) {
         return Err(ConnectorError::config(if sandbox {
@@ -654,7 +687,7 @@ fn connect_file(path: &str, read_only: bool, sandbox: bool, init: &dyn Fn(&duckd
     let root = duckdb::Connection::open_with_flags(path, c).map_err(|e| ConnectorError::connection(e.to_string()))?;
     init(&root)?;
     let conn = root.try_clone().map_err(|e| ConnectorError::connection(e.to_string()))?;
-    let db = Arc::new(FileDb { root: Mutex::new(root), loaded: Arc::default() });
+    let db = Arc::new(FileDb { root: Mutex::new(Some(root)), loaded: Arc::default(), key: key.clone() });
     dbs.insert(key, Arc::downgrade(&db));
     Ok((conn, db))
 }
@@ -1616,6 +1649,22 @@ mod tests {
         assert_eq!(q(&*s2, "select * from files.sales").await.num_rows(), 2);
         let e = q_err(&*s2, &format!("select * from read_csv({})", quote_literal(&dir.path().join("secret.csv").to_string_lossy()))).await;
         assert!(e.message.contains("sandbox"), "{}", e.message);
+    }
+
+    /// A session opening a file that another thread is closing waits for it
+    /// to close instead of opening a second instance on it (WAL errors).
+    #[tokio::test]
+    async fn reopens_a_file_while_it_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+        cfg.file_path = Some(dir.path().join("lake.duckdb").to_string_lossy().into_owned());
+        for i in 0..30 {
+            let s = session(cfg.clone()).await;
+            q(&*s, &format!("create table t{i} as select range as x from range(5000)")).await;
+            std::thread::spawn(move || drop(s));
+            let s2 = session(cfg.clone()).await;
+            assert_eq!(q(&*s2, &format!("select count(*) from t{i}")).await.num_rows(), 1);
+        }
     }
 
     #[test]
