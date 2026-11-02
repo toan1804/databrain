@@ -1028,6 +1028,10 @@ impl ToolContext {
         if masked.iter().any(|n| sql.to_ascii_lowercase().contains(n.as_str())) {
             return Err(AiError::Policy("the query references a PII column".into()));
         }
+        // The values themselves are masked before the query sees them: a
+        // CTE column list, `SELECT *` under another name or any expression
+        // can rename a column, never unmask it.
+        let batches = resultsql::mask_columns(&batches, &mask)?;
         let mut t = resultsql::query(&names, &batches, sql, 200)?;
         // `SELECT *` and the like return them under their own names.
         for (i, c) in t.columns.iter().enumerate() {
