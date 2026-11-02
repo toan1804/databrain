@@ -223,10 +223,10 @@ async fn loads_into_clickhouse_live() {
         &st,
         &duck,
         "select i as id, case when i % 3 = 0 then null else 'it''s \\ ' || i end as name, \
-         timestamptz '2026-01-02 03:04:05+02' + i * interval 1 hour as at, i % 2 = 0 as even from range(10) t(i)",
+         (timestamp '2026-01-02 01:04:05' + i * interval 1 hour)::timestamptz as at, i % 2 = 0 as even from range(10) t(i)",
     )
     .await;
-    let info = r.result.unwrap();
+    let info = r.result.unwrap_or_else(|| panic!("{:?}", r.error));
     let args = |mode: LoadMode| LoadResultArgs {
         target_connection_id: target.clone(),
         table: "databrain_load.people".into(),

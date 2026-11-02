@@ -206,5 +206,6 @@ jobs:
         working-directory: ui
         run: npm ci && npm run build
 
-      - name: Live tests (Postgres, MySQL, MongoDB)
-        run: cargo test -p databrain-connector-postgres -p databrain-connector-mysql -p databrain-connector-mongodb -p databrain-connector-clickhouse -p databrain-app --no-fail-fast -- --ignored
+      # Redshift needs an AWS cluster (DATABRAIN_REDSHIFT_HOST): not here.
+      - name: Live tests (Postgres, MySQL, MongoDB, ClickHouse)
+        run: cargo test -p databrain-connector-postgres -p databrain-connector-mysql -p databrain-connector-mongodb -p databrain-connector-clickhouse -p databrain-app --no-fail-fast -- --ignored --skip live_redshift
