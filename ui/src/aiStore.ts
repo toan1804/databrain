@@ -4,6 +4,7 @@
 
 import { create } from "zustand";
 import { api, isTauri, onAiEvent, onKnowledgeEvent, toError } from "./lib/api";
+import { isListRecord, readStored } from "./lib/storage";
 import type {
   IndexPlan,
   AgentEvent,
@@ -319,12 +320,7 @@ export function needsProviderSettings(e: { kind: string; message: string }): boo
 
 const MODELS_KEY = "db.ai.models";
 function savedModels(): Record<string, string[]> {
-  try {
-    const v = JSON.parse(localStorage.getItem(MODELS_KEY) ?? "{}");
-    return v && typeof v === "object" ? v : {};
-  } catch {
-    return {};
-  }
+  return readStored(MODELS_KEY, {}, isListRecord);
 }
 const modelLoads = new Map<string, Promise<string[]>>();
 
