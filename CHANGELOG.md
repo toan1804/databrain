@@ -40,6 +40,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Fuzzing and coverage: cargo-fuzz targets for the statement splitter and classifier and for identifier quoting (`fuzz/`), checking that spans cover the text in order, that a comment or whitespace never turns a write into a read, and that a quoted name always reads back as one name. A seeded test runs the same checks on generated input in every `cargo test`. A weekly workflow (also manual) fuzzes each target and measures Rust and UI test coverage (cargo-llvm-cov, Vitest v8).
 - Releases include a `SHA256SUMS` file for every file attached, and each installer has a GitHub build provenance attestation (`gh attestation verify <file> --repo toan1804/databrain`).
 - SECURITY.md (how to report a vulnerability privately), CONTRIBUTING.md and a Dependabot configuration for Rust, npm, GitHub Actions and the Oracle helper's Go modules.
 - Parameter sets: save `:name` values under a name and apply them in any tab or notebook; jobs take parameters (a set and values of their own) that fill their steps on every run, can run once with another set, and take `--set`/`--param` from `databrain-jobs run`.

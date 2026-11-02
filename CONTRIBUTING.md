@@ -25,6 +25,10 @@ CI runs the same checks, plus `cargo deny check`, the UI smoke tests and the dat
 - Tests that need a database server are `#[ignore]`d. Run the ones your change touches with `--ignored` and the `DATABRAIN_*` variables listed in the README.
 - The Oracle driver helper (`crates/connectors/oracle/agent`, Go) is pinned by `agent/SHA256SUMS`. Changing it, or its Go dependencies, needs a new helper release; see [docs/RELEASING.md](docs/RELEASING.md).
 
+## Fuzzing and coverage
+
+The splitter, classifier and identifier quoting have cargo-fuzz targets in `fuzz/` (nightly Rust): `cargo +nightly fuzz run split_classify` from `fuzz/`. A failing input is a bug in a safety check: add it to a test before fixing. The properties are in `connector-core/src/invariants.rs`. The "Fuzz and coverage" workflow runs the targets and measures coverage weekly; run it by hand from the Actions tab.
+
 ## Pull requests
 
 - One change per commit, with a message like `fix(jobs): …`, `feat(ui): …` or `perf(engine): …`.
