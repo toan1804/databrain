@@ -11,6 +11,7 @@ pub mod knowledge;
 pub mod meta_cache;
 pub mod notebooks;
 pub mod outputs;
+pub mod params;
 
 pub use ai::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry};
 pub use jobs::{
@@ -24,6 +25,7 @@ pub use knowledge::{
 pub use meta_cache::{CachedColumns, CachedListing, ExplorerCacheState};
 pub use notebooks::{CellKind, CellRunSummary, Notebook, NotebookCell, NotebookSummary};
 pub use outputs::OutputRecord;
+pub use params::ParamSet;
 
 use databrain_connector_core::ConnectionConfig;
 use parking_lot::Mutex;
@@ -715,6 +717,17 @@ const MIGRATIONS: &[&str] = &[
     // One-time data fixes that ran (by name).
     r#"
     CREATE TABLE maintenance (name TEXT PRIMARY KEY, done_at INTEGER NOT NULL);
+    "#,
+    // Named sets of `:name` parameter values (tabs, notebooks, jobs).
+    r#"
+    CREATE TABLE param_sets (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        values_json TEXT NOT NULL,
+        updated_at  INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX param_sets_name ON param_sets(lower(name));
+    ALTER TABLE job_runs ADD COLUMN params_json TEXT;
     "#,
 ];
 

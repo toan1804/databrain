@@ -99,7 +99,26 @@ pub fn delete_job(state: &AppState, id: &str) -> Result<()> {
 
 /// Run a job now (`nodes`: only these steps).
 pub fn run_job(state: &AppState, id: &str, nodes: Option<Vec<String>>) -> Result<databrain_workspace::JobRun> {
-    crate::jobs::start(&state.job_ctx(), id, "manual", nodes)
+    run_job_with(state, id, nodes, None)
+}
+
+/// [`run_job`] with `:name` values for this run (another set, values over it).
+pub fn run_job_with(state: &AppState, id: &str, nodes: Option<Vec<String>>, params: Option<crate::jobs::RunParams>) -> Result<databrain_workspace::JobRun> {
+    crate::jobs::start_with(&state.job_ctx(), id, "manual", nodes, params)
+}
+
+// ------------------------------------------------------------ parameter sets
+
+pub fn list_param_sets(state: &AppState) -> Result<Vec<databrain_workspace::ParamSet>> {
+    Ok(state.workspace.list_param_sets()?)
+}
+
+pub fn save_param_set(state: &AppState, set: databrain_workspace::ParamSet) -> Result<databrain_workspace::ParamSet> {
+    Ok(state.workspace.save_param_set(set)?)
+}
+
+pub fn delete_param_set(state: &AppState, id: &str) -> Result<()> {
+    Ok(state.workspace.delete_param_set(id)?)
 }
 
 /// Run again the steps that did not succeed last time (and what follows them).

@@ -20,7 +20,9 @@
 //! as its own queries (the DuckDB sandbox applies), whoever starts the run.
 
 use futures::FutureExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use databrain_connector_core::sql::ParamValue;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -142,17 +144,64 @@ struct Live {
     last_emit: Instant,
 }
 
+/// `:name` values for one run instead of the job's own: a saved set (id
+/// or name) and values over it (command line, "Run with…", a resume).
+#[derive(Debug, Clone, Default, serde::Deserialize, ts_rs::TS)]
+#[ts(export)]
+pub struct RunParams {
+    #[serde(default)]
+    #[ts(optional)]
+    pub set: Option<String>,
+    #[serde(default)]
+    #[ts(as = "Option<std::collections::BTreeMap<String, ParamValue>>", optional)]
+    pub values: BTreeMap<String, ParamValue>,
+}
+
+/// The values a run's steps get: the set's (the run's, else the job's),
+/// then the job's own, then the run's. Also says where they came from.
+pub fn effective_params(ws: &Workspace, job: &Job, over: Option<&RunParams>) -> std::result::Result<(BTreeMap<String, ParamValue>, Option<String>), String> {
+    let mut out = BTreeMap::new();
+    let mut set_name = None;
+    let set = over.and_then(|o| o.set.clone()).filter(|s| !s.trim().is_empty()).or_else(|| job.param_set.clone());
+    if let Some(s) = set {
+        match ws.find_param_set(&s).map_err(|e| e.to_string())? {
+            Some(found) => {
+                out.extend(found.values);
+                set_name = Some(found.name);
+            }
+            None => return Err(format!("The parameter set this run uses doesn't exist any more ({s}): choose another in the job's parameters")),
+        }
+    }
+    out.extend(job.params.clone());
+    if let Some(o) = over {
+        out.extend(o.values.clone());
+    }
+    Ok((out, set_name))
+}
+
 /// Writes a run's log and progress; cloned into each step (with its node).
 #[derive(Clone)]
 pub struct Tracer {
     ctx: JobCtx,
     live: Arc<Mutex<Live>>,
     node: Option<(String, String)>,
+    /// `:name` values of the run (or why there are none: its steps fail with it).
+    params: Arc<std::result::Result<HashMap<String, ParamValue>, String>>,
 }
 
 impl Tracer {
     fn new(ctx: &JobCtx, run: JobRun) -> Self {
-        Tracer { ctx: ctx.clone(), live: Arc::new(Mutex::new(Live { run, log: Vec::new(), dropped: 0, last_emit: Instant::now() })), node: None }
+        Tracer {
+            ctx: ctx.clone(),
+            live: Arc::new(Mutex::new(Live { run, log: Vec::new(), dropped: 0, last_emit: Instant::now() })),
+            node: None,
+            params: Arc::new(Ok(HashMap::new())),
+        }
+    }
+
+    /// The run's `:name` values for a step's SQL.
+    fn params(&self) -> Result<HashMap<String, ParamValue>> {
+        self.params.as_ref().clone().map_err(|e| EngineError::new("invalid", e))
     }
 
     fn for_node(&self, node: &JobNode) -> Self {
@@ -330,12 +379,19 @@ pub fn resume(ctx: &JobCtx, job_id: &str) -> Result<JobRun> {
     if steps.is_empty() {
         return Err(EngineError::new("invalid", "Nothing to resume: every step succeeded last time"));
     }
-    start(ctx, job_id, "resume", Some(steps))
+    // With the values the resumed run had.
+    let last = ctx.workspace.job_runs(job_id, 1)?.into_iter().next().map(|r| r.params).unwrap_or_default();
+    start_with(ctx, job_id, "resume", Some(steps), (!last.is_empty()).then_some(RunParams { set: None, values: last }))
 }
 
 /// Start a run in the background. `only`: run just these steps (their
 /// upstream outputs must already exist); `None` runs the whole job.
 pub fn start(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>>) -> Result<JobRun> {
+    start_with(ctx, job_id, trigger, only, None)
+}
+
+/// [`start`] with `:name` values for this run (see [`effective_params`]).
+pub fn start_with(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>>, over: Option<RunParams>) -> Result<JobRun> {
     let job = ctx.workspace.get_job(job_id)?;
     if job.nodes.is_empty() {
         return Err(EngineError::new("invalid", "This job has no steps"));
@@ -374,6 +430,14 @@ pub fn start(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>
         }
     };
     let _ = ctx.workspace.touch_job_run(run.id, &owner);
+    // A missing set doesn't stop the start: the run's steps fail with why,
+    // so a scheduled run reports it like any failure.
+    let params = effective_params(&ctx.workspace, &job, over.as_ref());
+    let mut run = run;
+    if let Ok((p, _)) = &params {
+        let _ = ctx.workspace.set_job_run_params(run.id, p);
+        run.params = p.clone();
+    }
     tracing::info!(job = job_id, run = run.id, trigger, steps = only.as_ref().map_or(job.nodes.len(), Vec::len), "job run started");
     emit(ctx, &run);
     let c = ctx.clone();
@@ -392,7 +456,7 @@ pub fn start(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>
                 }
             })
         };
-        execute(&c, job, r, only, cancel).await;
+        execute(&c, job, r, only, cancel, params).await;
         beat.abort();
         let _ = c.workspace.release_job(&id, &c.jobs.owner);
         c.jobs.running.lock().remove(&id);
@@ -425,12 +489,27 @@ fn action_text(node: &JobNode) -> &'static str {
     }
 }
 
-async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>, cancel: CancellationToken) {
+type Params = std::result::Result<(BTreeMap<String, ParamValue>, Option<String>), String>;
+
+async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>, cancel: CancellationToken, params: Params) {
     let selected: HashSet<String> = match &only {
         Some(ids) => ids.iter().cloned().collect(),
         None => job.nodes.iter().map(|n| n.id.clone()).collect(),
     };
-    let tracer = Tracer::new(ctx, run.clone());
+    let mut tracer = Tracer::new(ctx, run.clone());
+    let params_line = match &params {
+        Ok((p, _)) if p.is_empty() => None,
+        Ok((p, set)) => Some((
+            "info",
+            format!(
+                "Parameters{}: {}",
+                set.as_ref().map(|s| format!(" (set \"{s}\")")).unwrap_or_default(),
+                p.iter().map(|(k, v)| format!(":{k} = {}{}", v.value, if v.raw { " (SQL)" } else { "" })).collect::<Vec<_>>().join(", ")
+            ),
+        )),
+        Err(e) => Some(("error", e.clone())),
+    };
+    tracer.params = Arc::new(params.map(|(p, _)| p.into_iter().collect()));
     let trigger = match run.trigger.as_str() {
         "schedule" => "on its schedule",
         "ai" => "by the AI assistant (approved)",
@@ -449,6 +528,9 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
         None,
         None,
     );
+    if let Some((level, line)) = params_line {
+        tracer.log(level, line, None, None, None);
+    }
     let upstream = |id: &str| -> Vec<String> { job.edges.iter().filter(|e| e.to == id).map(|e| e.from.clone()).collect() };
     // Status per selected step: pending → running → success/error/skipped/cancelled.
     let mut status: HashMap<String, &'static str> = selected.iter().map(|id| (id.clone(), "pending")).collect();
@@ -640,23 +722,14 @@ async fn run_sql(
     t: &Tracer,
 ) -> Result<Vec<databrain_query_engine::StatementOutcomeView>> {
     let conn = ctx.workspace.get_connection(&connection_id).map(|p| p.name).unwrap_or_else(|_| connection_id.clone());
+    // The run's `:name` values (job parameters); a missing one fails the step.
+    let params = t.params()?;
     t.log("info", format!("Running SQL on {conn}"), None, None, None);
     let outcomes = ctx
         .engine
         .run_and_wait(
             &ctx.hub,
-            RunRequest {
-                connection_id,
-                tab_id: tab,
-                sql,
-                base_offset: 0,
-                row_limit: None,
-                confirmed: true,
-                origin,
-                session_key: None,
-                output_name,
-                params: HashMap::new(),
-            },
+            RunRequest { connection_id, tab_id: tab, sql, base_offset: 0, row_limit: None, confirmed: true, origin, session_key: None, output_name, params },
             Some(cancel.clone()),
         )
         .await?;
@@ -759,7 +832,22 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     }
     let target =
         node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;
-    let report = ctx.engine.write_output(&output.handle, target, &format!("{tab}:load"), &load_spec(node), cancel, t).await?;
+    // Before/after SQL get the run's `:name` values too.
+    let mut spec = load_spec(node);
+    let kind = ctx.workspace.get_connection(target)?.config.kind;
+    let params = t.params()?;
+    for sql in [&mut spec.before_sql, &mut spec.after_sql].into_iter().flatten() {
+        *sql = databrain_connector_core::sql::substitute_parameters(sql, kind, &params).map_err(|missing| {
+            EngineError::new(
+                "invalid",
+                format!(
+                    "Enter a value for {} in the job's parameters (before/after SQL)",
+                    missing.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", ")
+                ),
+            )
+        })?;
+    }
+    let report = ctx.engine.write_output(&output.handle, target, &format!("{tab}:load"), &spec, cancel, t).await?;
     Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices })
 }
 
@@ -897,7 +985,12 @@ pub fn tick_as(ctx: &JobCtx, trigger: &str) -> Vec<String> {
 
 /// Start a run and wait for it to end (command line). Returns the run as saved.
 pub async fn run_and_wait(ctx: &JobCtx, job_id: &str, trigger: &str) -> Result<JobRun> {
-    let run = start(ctx, job_id, trigger, None)?;
+    run_and_wait_with(ctx, job_id, trigger, None).await
+}
+
+/// [`run_and_wait`] with `:name` values for this run.
+pub async fn run_and_wait_with(ctx: &JobCtx, job_id: &str, trigger: &str, params: Option<RunParams>) -> Result<JobRun> {
+    let run = start_with(ctx, job_id, trigger, None, params)?;
     wait_for(ctx, &[job_id.to_string()]).await;
     Ok(ctx.workspace.job_runs(job_id, 5)?.into_iter().find(|r| r.id == run.id).unwrap_or(run))
 }

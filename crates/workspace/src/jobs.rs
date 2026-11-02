@@ -8,6 +8,8 @@ use chrono::{Datelike, Duration, Local, NaiveTime, TimeZone};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
+
 use crate::{Error, Result, Workspace, new_id, now_ms};
 
 /// Run history kept per job.
@@ -398,6 +400,14 @@ pub struct Job {
     #[serde(default)]
     #[ts(as = "Option<f64>")]
     pub last_scheduled_at: Option<i64>,
+    /// Values of the steps' `:name` parameters (over those of `param_set`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[ts(as = "Option<BTreeMap<String, databrain_connector_core::sql::ParamValue>>", optional)]
+    pub params: BTreeMap<String, databrain_connector_core::sql::ParamValue>,
+    /// Saved parameter set (id) whose values the steps get.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub param_set: Option<String>,
     #[serde(default)]
     #[ts(as = "f64")]
     pub created_at: i64,
@@ -459,6 +469,10 @@ pub struct JobRun {
     pub status: String,
     pub nodes: Vec<NodeRunRecord>,
     pub error: Option<String>,
+    /// `:name` values the steps got (a resume runs with the same).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[ts(as = "Option<BTreeMap<String, databrain_connector_core::sql::ParamValue>>", optional)]
+    pub params: BTreeMap<String, databrain_connector_core::sql::ParamValue>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -469,6 +483,22 @@ struct Spec {
     edges: Vec<JobEdge>,
     #[serde(default)]
     schedule: JobSchedule,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    params: BTreeMap<String, databrain_connector_core::sql::ParamValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    param_set: Option<String>,
+}
+
+impl Spec {
+    fn of(job: &Job) -> Self {
+        Spec {
+            nodes: job.nodes.clone(),
+            edges: job.edges.clone(),
+            schedule: job.schedule.clone(),
+            params: job.params.clone(),
+            param_set: job.param_set.clone(),
+        }
+    }
 }
 
 /// Output names are SQL identifiers (`results.<name>`), same rules as
@@ -561,10 +591,11 @@ fn run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobRun> {
         status: r.get(5)?,
         nodes: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
         error: r.get(7)?,
+        params: r.get::<_, Option<String>>(8)?.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default(),
     })
 }
 
-const RUN_COLS: &str = "id, job_id, trigger, started_at, finished_at, status, nodes_json, error";
+const RUN_COLS: &str = "id, job_id, trigger, started_at, finished_at, status, nodes_json, error, params_json";
 
 impl Workspace {
     pub fn list_jobs(&self) -> Result<Vec<JobSummary>> {
@@ -622,12 +653,11 @@ impl Workspace {
     /// Mark every step of `job` as the AI's SQL, keeping the rest of the
     /// job and its edit time (the schedule counts from it).
     pub(crate) fn set_ai_sql_all(&self, job: &Job) -> Result<()> {
-        let mut nodes = job.nodes.clone();
-        for n in &mut nodes {
+        let mut spec = Spec::of(job);
+        for n in &mut spec.nodes {
             n.ai_sql = true;
         }
-        let spec =
-            serde_json::to_string(&Spec { nodes, edges: job.edges.clone(), schedule: job.schedule.clone() }).map_err(|e| Error::Invalid(e.to_string()))?;
+        let spec = serde_json::to_string(&spec).map_err(|e| Error::Invalid(e.to_string()))?;
         self.conn.lock().execute("UPDATE jobs SET spec_json = ?2 WHERE id = ?1", params![job.id, spec])?;
         Ok(())
     }
@@ -642,6 +672,8 @@ impl Workspace {
                 nodes: spec.nodes,
                 edges: spec.edges,
                 schedule: spec.schedule,
+                params: spec.params,
+                param_set: spec.param_set,
                 last_scheduled_at: r.get(3)?,
                 created_at: r.get(4)?,
                 updated_at: r.get(5)?,
@@ -684,8 +716,7 @@ impl Workspace {
             job.created_at = now;
         }
         job.updated_at = now;
-        let spec = serde_json::to_string(&Spec { nodes: job.nodes.clone(), edges: job.edges.clone(), schedule: job.schedule.clone() })
-            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let spec = serde_json::to_string(&Spec::of(&job)).map_err(|e| Error::Invalid(e.to_string()))?;
         let c = self.conn.lock();
         c.execute(
             "INSERT INTO jobs (id, name, spec_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -724,7 +755,7 @@ impl Workspace {
                 n.last_run = Some(r.summary.clone());
             }
         }
-        let spec = serde_json::to_string(&Spec { nodes: job.nodes, edges: job.edges, schedule: job.schedule }).map_err(|e| Error::Invalid(e.to_string()))?;
+        let spec = serde_json::to_string(&Spec::of(&job)).map_err(|e| Error::Invalid(e.to_string()))?;
         self.conn.lock().execute("UPDATE jobs SET spec_json = ?2 WHERE id = ?1", params![id, spec])?;
         Ok(())
     }
@@ -750,7 +781,15 @@ impl Workspace {
             status: "running".into(),
             nodes: vec![],
             error: None,
+            params: Default::default(),
         })
+    }
+
+    /// Record the `:name` values a run's steps get.
+    pub fn set_job_run_params(&self, run_id: i64, params: &BTreeMap<String, databrain_connector_core::sql::ParamValue>) -> Result<()> {
+        let json = (!params.is_empty()).then(|| serde_json::to_string(params).unwrap_or_default());
+        self.conn.lock().execute("UPDATE job_runs SET params_json = ?2 WHERE id = ?1", params![run_id, json])?;
+        Ok(())
     }
 
     pub fn update_job_run(&self, run: &JobRun) -> Result<()> {
@@ -937,6 +976,8 @@ mod tests {
             nodes,
             schedule: JobSchedule::default(),
             last_scheduled_at: None,
+            params: Default::default(),
+            param_set: None,
             created_at: 0,
             updated_at: 0,
         }

@@ -1,6 +1,6 @@
 import type { StateCreator } from "zustand";
-import { api } from "../lib/api";
-import type { ConnectorKind, ParamValue } from "../lib/types";
+import { api, toError } from "../lib/api";
+import type { ConnectorKind, ParamSet, ParamValue } from "../lib/types";
 import { persistParams } from "./helpers";
 import type { State } from "./types";
 
@@ -20,6 +20,14 @@ export interface ParamsSlice {
    * (with a toast and the first empty box focused) when one has no value.
    */
   paramsFor: (tabId: string, kind: ConnectorKind, sql: string) => Promise<Record<string, ParamValue> | null>;
+  /** Saved parameter sets (tabs, notebooks and jobs share them). */
+  paramSets: ParamSet[];
+  loadParamSets: () => Promise<void>;
+  /** Save (new when `id` is empty); returns it, or null after a toast. */
+  saveParamSet: (set: ParamSet) => Promise<ParamSet | null>;
+  deleteParamSet: (id: string) => Promise<void>;
+  /** Fill tab/notebook `tabId`'s boxes with the set's values (for the names it has). */
+  applyParamSet: (tabId: string, set: ParamSet) => void;
 }
 
 export const createParamsSlice: StateCreator<State, [], [], ParamsSlice> = (set, get) => ({
@@ -27,6 +35,31 @@ export const createParamsSlice: StateCreator<State, [], [], ParamsSlice> = (set,
   paramNames: {},
   paramTextual: {},
   paramFocus: null,
+  paramSets: [],
+  loadParamSets: async () => {
+    const sets = await api.listParamSets().catch(() => null);
+    if (sets) set({ paramSets: sets });
+  },
+  saveParamSet: async (ps) => {
+    try {
+      const saved = await api.saveParamSet(ps);
+      await get().loadParamSets();
+      return saved;
+    } catch (e) {
+      get().toast(toError(e).message, "error");
+      return null;
+    }
+  },
+  deleteParamSet: async (id) => {
+    await api.deleteParamSet(id).catch((e) => get().toast(toError(e).message, "error"));
+    await get().loadParamSets();
+  },
+  applyParamSet: (tabId, ps) => {
+    const values = Object.fromEntries(Object.entries(ps.values).filter((e): e is [string, ParamValue] => !!e[1]));
+    const params = { ...get().params, [tabId]: { ...get().params[tabId], ...values } };
+    set({ params });
+    persistParams(params);
+  },
   setParam: (tabId, name, patch) => {
     const cur = get().params[tabId]?.[name] ?? { value: "" };
     const params = { ...get().params, [tabId]: { ...get().params[tabId], [name]: { ...cur, ...patch } } };

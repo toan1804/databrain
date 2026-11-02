@@ -435,7 +435,7 @@ export function NotebookView({
           disabled={!nb.cells.some((c) => c.kind === "sql" && c.source.trim())}
           title="Create a job with one step per SQL cell, each running after the cell above"
           aria-label="Create job"
-          onClick={() => latest.current && void useJobs.getState().createFromNotebook(latest.current)}
+          onClick={() => latest.current && void useJobs.getState().createFromNotebook(latest.current, tabId)}
         >
           <Workflow size={13} /> <span className="@max-[640px]:hidden">Create job</span>
         </button>

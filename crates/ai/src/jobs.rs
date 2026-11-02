@@ -301,6 +301,8 @@ pub fn build_job(args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Re
         edges: edges.into_iter().map(|(from, to)| databrain_workspace::JobEdge { from, to }).collect(),
         schedule: parse_schedule(args.get("schedule"))?,
         last_scheduled_at: None,
+        params: Default::default(),
+        param_set: None,
         created_at: 0,
         updated_at: 0,
     };
@@ -647,6 +649,9 @@ pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<Str
     job.id = old.id.clone();
     job.created_at = old.created_at;
     job.last_scheduled_at = old.last_scheduled_at;
+    // The job's parameter values and set are the user's: kept.
+    job.params = old.params.clone();
+    job.param_set = old.param_set.clone();
     if args.get("schedule").is_none() {
         job.schedule = old.schedule.clone();
     }
@@ -777,6 +782,34 @@ mod tests {
     #[test]
     fn finds_results_references() {
         assert_eq!(results_refs("select * from results.a join RESULTS.\"b\" x, myresults.c, results.a"), vec!["a", "b"]);
+    }
+}
+
+#[cfg(test)]
+mod params_tests {
+    use super::*;
+
+    /// Changing a job keeps its parameter values and set.
+    #[test]
+    fn merge_keeps_parameters() {
+        let refs = vec![ConnRef {
+            id: "r".into(),
+            name: "Results".into(),
+            kind: databrain_connector_core::ConnectorKind::Duckdb,
+            results: true,
+            ai_enabled: true,
+            read_only: false,
+        }];
+        let (mut old, _) =
+            build_job(&serde_json::json!({"name": "j", "steps": [{"name": "a", "connection": "Results", "sql": "select :day"}]}), &refs, &Default::default())
+                .unwrap();
+        old.params.insert("day".into(), databrain_connector_core::sql::ParamValue { value: "2026-11-01".into(), raw: false });
+        old.param_set = Some("set1".into());
+        let (merged, _) =
+            merge_job(&old, &serde_json::json!({"steps": [{"name": "a", "connection": "Results", "sql": "select :day, 1"}]}), &refs, &Default::default())
+                .unwrap();
+        assert_eq!(merged.params["day"].value, "2026-11-01");
+        assert_eq!(merged.param_set.as_deref(), Some("set1"));
     }
 }
 

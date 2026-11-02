@@ -22,7 +22,7 @@ use databrain_app::background;
 use databrain_app::jobs;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: databrain-jobs tick [--force] | run <job name or id> | list");
+    eprintln!("usage: databrain-jobs tick [--force] | run <job name or id> [--set <parameter set>] [--param name=value]... | list");
     ExitCode::from(2)
 }
 
@@ -85,8 +85,33 @@ async fn main() -> ExitCode {
                 eprintln!("databrain-jobs: no job named {which:?} (databrain-jobs list shows them)");
                 return ExitCode::from(2);
             };
+            // `--set NAME` and `--param name=value` (repeatable) for this run.
+            let mut over = jobs::RunParams::default();
+            let mut rest = args[2..].iter();
+            while let Some(a) = rest.next() {
+                match a.as_str() {
+                    "--set" => over.set = rest.next().cloned(),
+                    "--param" => match rest.next().and_then(|p| p.split_once('=')) {
+                        Some((k, v)) => {
+                            over.values.insert(
+                                k.trim().trim_start_matches(':').to_string(),
+                                databrain_connector_core::sql::ParamValue { value: v.to_string(), raw: false },
+                            );
+                        }
+                        None => {
+                            eprintln!("databrain-jobs: --param takes name=value");
+                            return ExitCode::from(2);
+                        }
+                    },
+                    other => {
+                        eprintln!("databrain-jobs: unknown option {other:?}");
+                        return usage();
+                    }
+                }
+            }
+            let over = (over.set.is_some() || !over.values.is_empty()).then_some(over);
             println!("Running {}…", job.name);
-            match jobs::run_and_wait(&ctx, &job.id, "cli").await {
+            match jobs::run_and_wait_with(&ctx, &job.id, "cli", over).await {
                 Ok(run) => {
                     for n in &run.nodes {
                         println!(

@@ -282,6 +282,8 @@ A job is a graph of steps stored in the `jobs` table. Each step runs a query, lo
 
 Steps whose SQL the AI assistant or an MCP client wrote carry `JobNode::ai_sql` (set by `create_job` and `update_job`; a user save keeps it only while the SQL is unchanged, and may clear it but never set it). Jobs saved before the flag existed are marked once at workspace open (maintenance `ai_jobs_marked_v1`): every step of a job whose name an approved `create_job` or `update_job` audit entry records. Such steps, and every step of a run the assistant starts, run with `Origin::Ai`, so the DuckDB sandbox applies on the schedule and by hand too, not only when the assistant started the run. Load steps pass the origin in `LoadSpec`, so AI-written before/after SQL on a DuckDB target is sandboxed as well.
 
+Parameter sets (`param_sets` table, `crates/workspace/src/params.rs`) are named `:name` values shared by tabs, notebooks and jobs. A job keeps `params` and `param_set` in its spec; `jobs::effective_params` merges the set's values, the job's, then a run's `RunParams` (UI "Run with…", `databrain-jobs run --set/--param`, a resume replaying the resumed run's), records them on the run (`job_runs.params_json`) and passes them in every step's `RunRequest.params`; load before/after SQL is substituted the same way.
+
 The in-app scheduler runs due jobs while the app is open. With background jobs on, `crates/app/src/background.rs` installs an OS timer that starts `databrain-jobs tick` every minute. A lease in the workspace makes sure a job runs in only one process.
 
 ---
