@@ -51,11 +51,46 @@ pub fn classify(text: &str, language: QueryLanguage) -> Classification {
     Classification { kind, missing_where: false, keyword }
 }
 
+/// What a MongoDB command does, from the shell parser the MongoDB connector
+/// runs it with (its database command, pipeline stages included).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MongoInfo {
+    pub kind: StatementKind,
+    /// Collections read and written, `[db, coll]` or `[coll]`.
+    pub reads: Vec<Vec<String>>,
+    pub writes: Vec<Vec<String>>,
+}
+
+/// Parses a command the way the MongoDB connector runs it; `None` when it
+/// isn't one the connector accepts.
+pub type MongoAnalyzer = fn(&str) -> Option<MongoInfo>;
+
+static MONGO_ANALYZER: std::sync::OnceLock<MongoAnalyzer> = std::sync::OnceLock::new();
+
+/// Set by the app with the MongoDB connector's parser (once per process).
+pub fn set_mongo_analyzer(f: MongoAnalyzer) {
+    let _ = MONGO_ANALYZER.set(f);
+}
+
+/// The connector's view of `text`: `Some(None)` = it doesn't parse (it
+/// won't run either); `None` = no analyzer in this process.
+fn mongo_info(text: &str) -> Option<Option<MongoInfo>> {
+    MONGO_ANALYZER.get().map(|f| f(text))
+}
+
 /// `{"find": "orders", …}`, `db.orders.find({…})` or `db.orders.insertOne(…)`.
 fn mongo_kind(text: &str) -> StatementKind {
+    match mongo_info(text) {
+        Some(Some(info)) => return info.kind,
+        Some(None) => return StatementKind::Unknown,
+        None => {}
+    }
+    // No parser here (a crate without the MongoDB connector): by the text,
+    // and any `$out` / `$merge` token makes an aggregate a write, however it
+    // is quoted or spaced.
     let t = text.to_ascii_lowercase();
     let op = mongo_op(&t);
-    let writes_out = t.contains("\"$out\"") || t.contains("\"$merge\"") || t.contains("$out:") || t.contains("$merge:");
+    let writes_out = t.contains("$out") || t.contains("$merge");
     match op.as_deref() {
         Some("find" | "findone" | "count" | "countdocuments" | "estimateddocumentcount" | "distinct" | "listcollections" | "listindexes" | "explain") => {
             StatementKind::Read
@@ -113,6 +148,22 @@ fn mongo_op(t: &str) -> Option<String> {
 pub fn mongo_table_refs(text: &str) -> crate::tables::TableRefs {
     use crate::tables::TableRefs;
     let mut out = TableRefs::default();
+    match mongo_info(text) {
+        Some(Some(info)) => {
+            out.reads = info.reads;
+            out.writes = info.writes;
+            out.changes_default = false;
+            if out.reads.is_empty() && out.writes.is_empty() {
+                out.opaque.push(leading_keyword(text));
+            }
+            return out;
+        }
+        Some(None) => {
+            out.opaque.push(leading_keyword(text));
+            return out;
+        }
+        None => {}
+    }
     let mut db: Option<String> = None;
     let mut body = Vec::new();
     for line in text.lines() {
@@ -201,7 +252,7 @@ pub fn mongo_table_refs(text: &str) -> crate::tables::TableRefs {
         }
     };
     scan(&["from", "coll", "$unionwith"], false);
-    scan(&["$out", "into"], true);
+    scan(&["$out", "$merge", "into"], true);
     out
 }
 
@@ -234,6 +285,9 @@ mod tests {
         assert_eq!(k("db.orders.find({status: 'A'})", L::MongoJson), S::Read);
         assert_eq!(k(r#"{"aggregate": "orders", "pipeline": [{"$match": {}}]}"#, L::MongoJson), S::Read);
         assert_eq!(k(r#"{"aggregate": "orders", "pipeline": [{"$out": "copy"}]}"#, L::MongoJson), S::Dml);
+        // Without the connector's parser: any $out / $merge token, however spaced or quoted.
+        assert_eq!(k("db.orders.aggregate([{ $out : 'copy' }])", L::MongoJson), S::Dml);
+        assert_eq!(k("db.orders.aggregate([{ '$merge' : 'copy' }])", L::MongoJson), S::Dml);
         assert_eq!(k("db.orders.deleteMany({})", L::MongoJson), S::Dml);
         assert_eq!(k("db.orders.drop()", L::MongoJson), S::Ddl);
         assert_eq!(k("what is this", L::MongoJson), S::Unknown);

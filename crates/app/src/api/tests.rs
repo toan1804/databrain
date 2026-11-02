@@ -1216,3 +1216,40 @@ async fn lineage_expands_views_with_the_database() {
     let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select d from top", Default::default(), false).await.unwrap();
     assert!(v.graph.nodes.iter().all(|n| !n.view));
 }
+
+/// MongoDB commands are classified by the parser that runs them: a `$out`
+/// stage written with spaces is a write, refused on a read-only connection
+/// and asked about where the AI may write.
+#[test]
+fn mongo_writing_stage_is_a_write_for_the_ai() {
+    use databrain_ai::policy::{Decision, review_sql};
+    use databrain_workspace::{AiPolicy, RunQueryPolicy};
+    let (st, _sink, _dir) = state();
+    let _ = &st; // the app's registry registers the MongoDB parser
+    let mut cfg = ConnectionConfig::new(ConnectorKind::Mongodb, AuthMethod::None);
+    cfg.host = Some("localhost".into());
+    let mut p = ConnectionProfile {
+        id: "m".into(),
+        name: "mongo".into(),
+        config: cfg,
+        color: None,
+        env: EnvTag::Dev,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: AiPolicy { run_query: RunQueryPolicy::AutoRead, ..Default::default() },
+        created_at: 0,
+        updated_at: 0,
+    };
+    for cmd in ["db.orders.aggregate([{ $out : 'copy' }])", "db.orders.aggregate([{$merge: {into: 'copy'}}])"] {
+        assert!(matches!(review_sql(&p, cmd).decision, Decision::Deny(_)), "writes not allowed: {cmd}");
+        p.config.read_only = true;
+        p.ai_policy.allow_write = true;
+        assert!(matches!(review_sql(&p, cmd).decision, Decision::Deny(_)), "read-only: {cmd}");
+        p.config.read_only = false;
+        assert!(matches!(review_sql(&p, cmd).decision, Decision::Ask(_)), "asks: {cmd}");
+        p.ai_policy.allow_write = false;
+    }
+    assert_eq!(review_sql(&p, "db.orders.aggregate([{$match: {}}])").decision, Decision::Allow);
+    let refs = databrain_connector_core::tables::table_refs("db.orders.aggregate([{ $out : {db: 'x', coll: 'copy'} }])", ConnectorKind::Mongodb);
+    assert_eq!(refs.writes, vec![vec!["x".to_string(), "copy".to_string()]]);
+}

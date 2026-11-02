@@ -134,6 +134,9 @@ pub fn registry_with_outputs(#[allow(unused_variables)] outputs: Option<Arc<data
     r.register(Arc::new(databrain_connector_cloud::BigQueryConnector::new()));
     #[cfg(feature = "mongodb")]
     r.register(Arc::new(databrain_connector_mongodb::MongoConnector));
+    // Classification and table rules read MongoDB commands with the parser that runs them.
+    #[cfg(feature = "mongodb")]
+    databrain_connector_core::language::set_mongo_analyzer(databrain_connector_mongodb::analyze);
     #[cfg(feature = "neo4j")]
     r.register(Arc::new(databrain_connector_neo4j::Neo4jConnector));
     #[cfg(feature = "clickhouse")]
