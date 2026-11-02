@@ -41,9 +41,12 @@ export type ChatItem =
       tool: string;
       summary: string;
       detail: Record<string, unknown>;
-      state: "pending" | "approved" | "denied";
+      /** `expired`: answered after the assistant stopped waiting (Stop, timeout). */
+      state: "pending" | "approved" | "denied" | "expired";
       /** Approved by "Auto-approve" rather than by hand. */
       auto?: boolean;
+      /** The answer is being sent; shown as decided once the backend took it. */
+      sending?: boolean;
     }
   | {
       id: string;
@@ -52,7 +55,7 @@ export type ChatItem =
       targetKey: string | null;
       proposal: EditProposal;
       before: string;
-      state: "pending" | "accepted" | "rejected";
+      state: "pending" | "accepted" | "rejected" | "expired";
       /** Applied by "Auto-approve" rather than by hand. */
       auto?: boolean;
     }
@@ -965,10 +968,17 @@ export const useAi = create<AiState>((set, get) => {
     respondApproval: async (itemId, approved, editedSql, auto) => {
       const c = chatOfItem(itemId);
       const item = c?.items.find((i) => i.id === itemId);
-      if (!c || !item || item.kind !== "approval" || item.state !== "pending") return;
+      if (!c || !item || item.kind !== "approval" || item.state !== "pending" || item.sending) return;
       const detail = editedSql !== undefined ? { ...item.detail, sql: editedSql } : item.detail;
-      patchItem(c.id, itemId, { state: approved ? "approved" : "denied", detail, auto: !!auto } as Partial<ChatItem>);
-      await api.aiRespond(item.requestId, { approved, detail });
+      patchItem(c.id, itemId, { sending: true } as Partial<ChatItem>);
+      try {
+        // Shown as decided only once the backend took the answer; false = nothing waits any more.
+        const delivered = await api.aiRespond(item.requestId, { approved, detail });
+        patchItem(c.id, itemId, { state: delivered ? (approved ? "approved" : "denied") : "expired", detail, auto: delivered && !!auto, sending: false } as Partial<ChatItem>);
+      } catch (e) {
+        patchItem(c.id, itemId, { sending: false } as Partial<ChatItem>);
+        useStore.getState().toast(`The answer was not sent: ${toError(e).message}`, "error");
+      }
     },
 
     respondEdit: async (itemId, accepted, auto) => {
@@ -1008,8 +1018,15 @@ export const useAi = create<AiState>((set, get) => {
           st.toast("The inserted SQL reads outputs (results.<name>); run it on the Results (DuckDB) connection", "info");
         }
       }
-      patchItem(c.id, itemId, { state: ok ? "accepted" : "rejected", auto: ok && !!auto } as Partial<ChatItem>);
-      await api.aiRespond(item.requestId, { accepted: ok });
+      // The editor change (if any) is done; tell the assistant, and say so when it stopped waiting.
+      try {
+        const delivered = await api.aiRespond(item.requestId, { accepted: ok });
+        patchItem(c.id, itemId, { state: ok ? "accepted" : delivered ? "rejected" : "expired", auto: ok && !!auto } as Partial<ChatItem>);
+        if (ok && !delivered) useStore.getState().toast("Applied in the editor; the assistant had already stopped waiting", "info");
+      } catch (e) {
+        patchItem(c.id, itemId, { state: ok ? "accepted" : "rejected", auto: ok && !!auto } as Partial<ChatItem>);
+        useStore.getState().toast(`The assistant was not told: ${toError(e).message}`, "error");
+      }
     },
 
     indexKnowledge: async (connectionId, opts = {}) => {
