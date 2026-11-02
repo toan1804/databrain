@@ -226,6 +226,33 @@ mod tests {
         assert!(matches!(review_sql(&rules, "select * from hr.pay").decision, Decision::Deny(r) if r.contains("hr.pay")));
     }
 
+    /// EXPLAIN of a write is that write, in every form: on a production
+    /// connection with auto-read it is refused, never run as a read.
+    #[test]
+    fn explain_of_a_write_is_a_write() {
+        let prod = |policy: AiPolicy| {
+            let mut p = on(ConnectorKind::Postgres, false, policy);
+            p.env = EnvTag::Prod;
+            p
+        };
+        for sql in [
+            "EXPLAIN (ANALYZE) DELETE FROM t",
+            "explain (analyze true, buffers) update t set a = 1",
+            "explain analyze insert into t values (1)",
+            "explain delete from t where id = 1",
+        ] {
+            assert!(matches!(review_sql(&prod(auto_read()), sql).decision, Decision::Deny(_)), "prod, auto-read: {sql}");
+            assert!(matches!(review_sql(&prod(AiPolicy { allow_write: true, ..auto_read() }), sql).decision, Decision::Deny(_)), "prod: {sql}");
+            assert!(matches!(review_sql(&on(ConnectorKind::Postgres, true, auto_read()), sql).decision, Decision::Deny(_)), "read-only: {sql}");
+            assert!(matches!(review_sql(&on(ConnectorKind::Postgres, false, auto_read()), sql).decision, Decision::Deny(_)), "writes not allowed: {sql}");
+            assert!(
+                matches!(review_sql(&on(ConnectorKind::Postgres, false, AiPolicy { allow_write: true, ..auto_read() }), sql).decision, Decision::Ask(_)),
+                "dev, writes allowed: asks: {sql}"
+            );
+        }
+        assert_eq!(review_sql(&prod(auto_read()), "explain (analyze, buffers) select * from t").decision, Decision::Allow);
+    }
+
     fn on(kind: ConnectorKind, read_only: bool, policy: AiPolicy) -> ConnectionProfile {
         let mut p = profile(EnvTag::Dev, policy);
         p.config.kind = kind;

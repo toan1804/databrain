@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Security
 
+- `EXPLAIN` is classified by the statement it explains: `EXPLAIN (ANALYZE) DELETE …` and other option lists counted as a read, so the AI could run them (also on a production connection with auto-read), and so could the Plan tab's Analyze. A plain `EXPLAIN` of a write now counts as that write too.
 - SQL from the AI, MCP and AI-run jobs runs on DuckDB in a sandbox (no file, network or extension access unless the connection allows it). Files attached to a DuckDB connection stay readable in it. Job steps whose SQL the AI wrote stay sandboxed when the job runs by hand, on its schedule or in the background, not only when the AI starts the run; a step you change yourself, or mark with "Trust this SQL", becomes yours. Jobs the AI made before this are found in the audit log and marked once.
 - Jobs the assistant creates, changes or runs follow the connection's AI policy, including load steps and their before/after SQL.
 - Functions that could write (e.g. `SELECT dbo.write_fn()`) need the user's confirmation wherever the AI may not write, not only on read-only connections.

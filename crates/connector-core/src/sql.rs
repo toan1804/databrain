@@ -478,12 +478,14 @@ fn classify_ast(s: &Statement, keyword: &str) -> (StatementKind, bool) {
         Statement::Insert(_) | Statement::Merge(_) => (K::Dml, false),
         Statement::Update(u) => (K::Dml, u.selection.is_none()),
         Statement::Delete(d) => (K::Dml, d.selection.is_none()),
-        Statement::Explain { analyze, statement, .. } => {
-            if *analyze {
-                classify_ast(statement, &leading_keyword(&statement.to_string()))
-            } else {
-                (K::Read, false)
-            }
+        // The inner statement decides, ANALYZE or not: `EXPLAIN (ANALYZE) …`,
+        // `EXPLAIN (ANALYZE true, BUFFERS) …` and other option lists leave
+        // `analyze` false and put it in `options`, and engines differ on
+        // which EXPLAIN forms run the statement. A plain EXPLAIN of a write
+        // counts as that write too: being stricter costs a confirmation.
+        Statement::Explain { statement, .. } => {
+            let (inner, missing_where) = classify_ast(statement, &leading_keyword(&statement.to_string()));
+            (K::Read.max(inner), missing_where)
         }
         Statement::ExplainTable { .. } => (K::Read, false),
         _ => (keyword_kind(keyword), false),
@@ -994,6 +996,20 @@ mod tests {
         assert_eq!(c("begin"), StatementKind::Transaction);
         assert_eq!(c("explain select 1"), StatementKind::Read);
         assert_eq!(c("explain analyze delete from t"), StatementKind::Dml);
+        // Postgres option lists: sqlparser leaves `analyze` false and puts it in `options`.
+        assert_eq!(c("EXPLAIN (ANALYZE) DELETE FROM t"), StatementKind::Dml);
+        assert_eq!(c("explain (analyze true, buffers) update t set a = 1 where id = 2"), StatementKind::Dml);
+        assert_eq!(c("explain (analyze, format json) insert into t select * from s"), StatementKind::Dml);
+        assert_eq!(c("explain (analyze) create table t2 as select 1"), StatementKind::Ddl);
+        assert!(classify("EXPLAIN (ANALYZE) DELETE FROM t", Postgres).missing_where);
+        // Without ANALYZE too: the statement explained decides.
+        assert_eq!(c("explain delete from t"), StatementKind::Dml);
+        assert_eq!(c("explain (format json) select 1"), StatementKind::Read);
+        assert_eq!(c("explain (analyze) select * from t"), StatementKind::Read);
+        assert_eq!(c("explain (analyze) with d as (delete from t returning *) select * from d"), StatementKind::Dml);
+        for (k, sql) in [(Mysql, "EXPLAIN ANALYZE DELETE FROM t"), (Duckdb, "EXPLAIN ANALYZE DELETE FROM t"), (Snowflake, "EXPLAIN DELETE FROM t")] {
+            assert_eq!(classify(sql, k).kind, StatementKind::Dml, "{k:?}: {sql}");
+        }
         assert!(classify("delete from t", Postgres).missing_where);
         assert!(!classify("update t set a=1 where id=2", Postgres).missing_where);
         assert_eq!(classify("show tables", Mysql).kind, StatementKind::Read);
