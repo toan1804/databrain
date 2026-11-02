@@ -361,7 +361,7 @@ impl McpServer {
     pub async fn serve<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(&self, reader: R, mut writer: W) -> std::io::Result<()> {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
         let peer = Arc::new(Peer { out: Some(out_tx), ..Default::default() });
-        let mut lines = reader.lines();
+        let mut lines = BoundedLines::new(reader, MAX_LINE_BYTES);
         let mut running = FuturesUnordered::new();
         let mut eof = false;
         while !(eof && running.is_empty()) {
@@ -373,6 +373,13 @@ impl McpServer {
                         peer.closed.store(true, Ordering::SeqCst);
                         peer.pending.lock().clear();
                         continue;
+                    };
+                    let line = match line {
+                        Ok(l) => l,
+                        Err(why) => {
+                            write_line(&mut writer, &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": why}})).await?;
+                            continue;
+                        }
                     };
                     if line.trim().is_empty() {
                         continue;
@@ -416,8 +423,99 @@ impl McpServer {
     }
 }
 
+/// Longest message accepted from the client; a longer line is skipped
+/// (answered with an error) without being kept in memory.
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Newline-separated messages of at most `max` bytes. `next` is cancel-safe
+/// (it only waits in `fill_buf`), so it can be used in `select!`.
+struct BoundedLines<R> {
+    reader: R,
+    max: usize,
+    buf: Vec<u8>,
+    /// In a line that went over `max`: drop bytes until its end.
+    skipping: bool,
+    eof: bool,
+}
+
+impl<R: AsyncBufRead + Unpin> BoundedLines<R> {
+    fn new(reader: R, max: usize) -> Self {
+        Self { reader, max, buf: Vec::new(), skipping: false, eof: false }
+    }
+
+    /// The next line (without `\n` / `\r\n`), `Err(reason)` for one that is
+    /// too long or not UTF-8, `None` at the end.
+    async fn next_line(&mut self) -> std::io::Result<Option<Result<String, String>>> {
+        loop {
+            if self.eof {
+                return Ok(None);
+            }
+            let avail = self.reader.fill_buf().await?;
+            let (chunk, end, used) = match avail.iter().position(|&b| b == b'\n') {
+                Some(i) => (&avail[..i], true, i + 1),
+                None if avail.is_empty() => {
+                    self.eof = true;
+                    if self.buf.is_empty() && !self.skipping {
+                        return Ok(None);
+                    }
+                    (&avail[..0], true, 0)
+                }
+                None => (avail, false, avail.len()),
+            };
+            if !self.skipping {
+                if self.buf.len() + chunk.len() > self.max {
+                    self.skipping = true;
+                    self.buf = Vec::new();
+                } else {
+                    self.buf.extend_from_slice(chunk);
+                }
+            }
+            self.reader.consume(used);
+            if end {
+                if std::mem::take(&mut self.skipping) {
+                    return Ok(Some(Err(format!("message longer than {} bytes", self.max))));
+                }
+                let mut line = std::mem::take(&mut self.buf);
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Ok(Some(String::from_utf8(line).map_err(|_| "message is not UTF-8".to_string())));
+            }
+        }
+    }
+}
+
 async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, v: &Value) -> std::io::Result<()> {
     writer.write_all(serde_json::to_string(v).unwrap_or_default().as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+
+    async fn all(input: &[u8], max: usize, cap: usize) -> Vec<Result<String, String>> {
+        let mut l = BoundedLines::new(tokio::io::BufReader::with_capacity(cap, input), max);
+        let mut out = vec![];
+        while let Some(x) = l.next_line().await.unwrap() {
+            out.push(x);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn caps_line_length() {
+        for cap in [1, 3, 64] {
+            let got = all(b"ab\r\n0123456789xyz\n\nlast", 8, cap).await;
+            assert_eq!(got.len(), 4, "cap {cap}: {got:?}");
+            assert_eq!(got[0], Ok("ab".into()));
+            assert!(got[1].as_ref().unwrap_err().contains("longer than 8"), "cap {cap}");
+            assert_eq!(got[2], Ok(String::new()));
+            assert_eq!(got[3], Ok("last".into()), "a last line without newline");
+        }
+        assert!(all(b"0123456789", 8, 4).await[0].is_err(), "too long up to the end");
+        assert!(all(b"\xff\xfe\n", 8, 4).await[0].as_ref().unwrap_err().contains("UTF-8"));
+        assert!(all(b"", 8, 4).await.is_empty());
+    }
 }

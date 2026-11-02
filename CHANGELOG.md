@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Security
 
+- MCP server: a message from the client is limited to 8 MiB. A longer line is answered with an error and skipped as it arrives, instead of being collected in memory without limit.
 - Job export steps no longer overwrite files they didn't write. If the file name is taken by another file (or a link), the rows are saved as `name (2)`, `name (3)`… and the run says so; a file an earlier run of the same job wrote is still updated. The file is written next to its destination and moved into place, so a failed or cancelled export leaves the previous file whole.
 - Oracle: the downloaded thin driver is checked against its SHA-256 every time DataBrain starts it, not only when it was installed. A file changed afterwards (or a link put in its place) is not run, and is downloaded again.
 - Paths sent by the app window are checked before a file is read or written: absolute paths only, no hidden files or folders (except for importing from `.pgpass`), no writing through a symbolic link, and each command accepts only its own file types (an export writes `.csv`, `.parquet`…, a query tab never saves a `.command` or `.dylib`). Loading a DuckDB library needs a file named like one (`libduckdb.dylib`, `libduckdb.so`, `duckdb.dll`) and a confirmation in a native dialog, and the saved library path and Oracle driver URL can no longer be changed through the generic settings command.
