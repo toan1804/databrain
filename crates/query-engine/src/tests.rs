@@ -326,6 +326,34 @@ async fn cancel_long_query() {
     assert!(matches!(evs.last(), Some(JobEvent::JobFinished { status: RunStatus::Success, .. })));
 }
 
+/// Runs started at the same moment on one tab: exactly one starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_run_per_tab_even_when_started_at_once() {
+    let f = fixture(EnvTag::None);
+    let slow = "with recursive c(x) as (select 1 union all select x+1 from c where x < 3000000) select count(*) from c";
+    for _ in 0..5 {
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let (engine, r, b) = (f.engine.clone(), req(&f, slow), barrier.clone());
+                tokio::task::spawn_blocking(move || {
+                    b.wait();
+                    engine.run(r)
+                })
+            })
+            .collect();
+        let mut ids = vec![];
+        for t in tasks {
+            if let Ok(RunResponse::Started { job_id, .. }) = t.await.unwrap() {
+                ids.push(job_id);
+            }
+        }
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        f.engine.cancel(&ids[0]);
+        wait_job(&f, &ids[0]).await;
+    }
+}
+
 #[tokio::test]
 async fn safety_confirmation() {
     let f = fixture(EnvTag::Prod);
