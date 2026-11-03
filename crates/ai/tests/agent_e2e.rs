@@ -277,6 +277,7 @@ async fn denied_approval_and_blocked_writes() {
                 session_key: None,
                 output_name: None,
                 params: Default::default(),
+                output_masks: None,
             },
             None,
         )
@@ -593,6 +594,7 @@ async fn ai_tools_use_output_handles_with_source_policies() {
                 session_key: None,
                 output_name: name.map(Into::into),
                 params: Default::default(),
+                output_masks: None,
             };
             engine.run_and_wait(&hub, r, None).await.unwrap()
         }
@@ -642,6 +644,73 @@ async fn ai_tools_use_output_handles_with_source_policies() {
     let mcp = databrain_ai::ToolContext { caller: databrain_ai::Caller::Mcp, profile: shared, ..ctx };
     let o = mcp.call("query_outputs", &json!({"sql": "select * from results.by_country"})).await;
     assert!(o.content.contains("not shared with MCP"), "{}", o.content);
+}
+
+/// Sensitive columns of an output stay masked in query_outputs and run_query
+/// on DuckDB whatever the SQL does with them: a CTE column list renaming
+/// them, `SELECT *`, a cast whose error would quote the value.
+#[tokio::test]
+async fn output_columns_stay_masked_in_duckdb() {
+    use databrain_connector_core::external::ExternalTablesSlot;
+    let f = fixture(1, AiPolicy::default()).await;
+    let slot = ExternalTablesSlot::new();
+    let mut reg = ConnectorRegistry::new();
+    reg.register(Arc::new(databrain_connector_sqlite::SqliteConnector));
+    reg.register(Arc::new(databrain_connector_duckdb::DuckdbConnector::with_outputs(slot.clone())));
+    let engine = QueryEngine::new(reg, f.ws.clone(), f.secrets.clone(), Arc::new(ResultStore::new()), f.hub.clone());
+    slot.set(engine.external_tables());
+    let mut conn = f.ws.get_connection(&f.conn).unwrap();
+    conn.ai_policy.share_result_rows = true;
+    conn.ai_policy.pii_columns = vec!["customers.email".into()];
+    let conn = f.ws.save_connection(conn).unwrap();
+    let r = RunRequest {
+        connection_id: conn.id.clone(),
+        tab_id: "user".into(),
+        sql: "select id, name, email from customers order by id".into(),
+        base_offset: 0,
+        row_limit: None,
+        confirmed: true,
+        origin: Origin::User,
+        session_key: None,
+        output_name: Some("people".into()),
+        params: Default::default(),
+        output_masks: None,
+    };
+    engine.run_and_wait(&f.hub, r, None).await.unwrap();
+    let ctx = databrain_ai::ToolContext {
+        engine: engine.clone(),
+        hub: f.hub.clone(),
+        profile: conn.clone(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+    };
+    for sql in [
+        "with c(a, b, x) as (select * from results.people) select x from c order by a",
+        "select * from results.people order by id",
+        "select email as contact, upper(email) u from results.people order by id",
+        "select string_agg(t::varchar, ';') from results.people t",
+    ] {
+        let o = ctx.call("query_outputs", &json!({"sql": sql})).await;
+        assert!(!o.content.contains("@x.io") && !o.content.contains("@X.IO"), "{sql}: {}", o.content);
+        assert!(o.content.contains("***"), "{sql}: {}", o.content);
+        let o = ctx.call("run_query", &json!({"sql": sql})).await;
+        assert!(!o.content.contains("@x.io") && !o.content.contains("@X.IO"), "run_query {sql}: {}", o.content);
+    }
+    // An error message can't quote a value either.
+    let o = ctx.call("query_outputs", &json!({"sql": "with c(a, b, x) as (select * from results.people) select cast(x as integer) from c"})).await;
+    assert!(!o.content.contains("@x.io"), "{}", o.content);
+    // Other columns still work (a value computed from the masked one is
+    // masked again when the rows are shown).
+    let o = ctx.call("query_outputs", &json!({"sql": "select max(id) n, max(name) m from results.people"})).await;
+    assert!(o.content.contains("3\tChi"), "{}", o.content);
+    // The user's own grid keeps the real values.
+    let user = engine.outputs().resolve("people").unwrap();
+    let rs = engine.results().get(&user.result_id).unwrap();
+    let page = rs.lock().page(&Default::default(), 0, 5).unwrap();
+    assert_eq!(page.rows[0][2].as_deref(), Some("a@x.io"));
 }
 
 /// Table access rules: run_query, sample_rows, outputs the user made from a
@@ -722,6 +791,7 @@ async fn table_access_rules() {
                 session_key: None,
                 output_name: Some(name.into()),
                 params: Default::default(),
+                output_masks: None,
             };
             let o = engine.run_and_wait(&hub, r, None).await.unwrap();
             assert!(o.iter().all(|x| x.error.is_none()), "{:?}", o[0].error);
@@ -805,6 +875,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
         session_key: None,
         output_name: None,
         params: Default::default(),
+        output_masks: None,
     };
     engine.run_and_wait(&f.hub, r, None).await.unwrap();
     // The setup tab's session holds the file; Windows lets one session open it.
@@ -887,6 +958,7 @@ async fn knowledge_index_plan_scope_and_cancel() {
         session_key: None,
         output_name: None,
         params: Default::default(),
+        output_masks: None,
     };
     // Each DuckDB session opens the file on its own (one writer at a time).
     engine.disconnect(&conn);

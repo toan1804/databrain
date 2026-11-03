@@ -10,11 +10,14 @@ A desktop SQL client for many databases, with column lineage, scheduled jobs and
 
 | Platform | Installer |
 |---|---|
-| macOS (Apple Silicon) | [DataBrain_0.2.1_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.2.1/DataBrain_0.2.1_aarch64.dmg) |
-| macOS (Apple Silicon), without DuckDB | [DataBrain-no-duckdb_0.2.1_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.2.1/DataBrain-no-duckdb_0.2.1_aarch64.dmg) |
-| macOS (Intel), Windows, Linux | Built by the Release workflow from the next release on |
+| macOS (Apple Silicon) | [DataBrain_0.3.0_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.3.0/DataBrain_0.3.0_aarch64.dmg) |
+| macOS (Apple Silicon), without DuckDB | [DataBrain-no-duckdb_0.3.0_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.3.0/DataBrain-no-duckdb_0.3.0_aarch64.dmg) |
+| macOS (Intel) | [DataBrain_0.3.0_x64.dmg](https://github.com/toan1804/databrain/releases/download/v0.3.0/DataBrain_0.3.0_x64.dmg) |
+| Windows | [DataBrain_0.3.0_x64-setup.exe](https://github.com/toan1804/databrain/releases/download/v0.3.0/DataBrain_0.3.0_x64-setup.exe) |
+| Linux (AppImage) | [DataBrain_0.3.0_amd64.AppImage](https://github.com/toan1804/databrain/releases/download/v0.3.0/DataBrain_0.3.0_amd64.AppImage) |
+| Linux (Debian, Ubuntu) | [DataBrain_0.3.0_amd64.deb](https://github.com/toan1804/databrain/releases/download/v0.3.0/DataBrain_0.3.0_amd64.deb) |
 
-All versions are on the [Releases](https://github.com/toan1804/databrain/releases) page. The app checks for updates once a day; signed releases install from its banner when you click Install (others link to the download).
+All versions are on the [Releases](https://github.com/toan1804/databrain/releases) page, with a `SHA256SUMS` file to check downloads ([how](docs/RELEASING.md#checksums-and-provenance)). The app checks for updates once a day; signed releases install from its banner when you click Install (others link to the download).
 
 > [!NOTE]
 > Until a release is signed with a Developer ID (see [Signing](docs/RELEASING.md#signing-and-in-app-updates)), move DataBrain.app to Applications, then right-click it → **Open** the first time.
@@ -49,7 +52,7 @@ See [docs/FEATURES.md](docs/FEATURES.md) for the full reference.
 
 Requirements:
 
-- Rust 1.87+ and Node 22.22+ (Go 1.27+ only to build the Oracle driver helper)
+- Rust 1.88+ and Node 22.22+ (Go 1.27+ only to build the Oracle driver helper)
 - macOS: Xcode Command Line Tools · Linux: [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) · Windows: WebView2 and MSVC build tools
 
 ```sh

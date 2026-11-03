@@ -1,0 +1,2 @@
+SELECT 1 EXEC xp_cmdshell 'x'
+GO

@@ -1559,7 +1559,9 @@ mod tests {
 
         let fp = |m: &std::collections::HashMap<String, String>, k: &str| m.get(k).cloned().unwrap();
         let f0 = s.schema_fingerprints().await.unwrap().unwrap();
-        assert_eq!(f0, s.schema_fingerprints().await.unwrap().unwrap(), "stable without changes");
+        // This test's schemas only: other live tests change theirs meanwhile.
+        let mine = |m: &std::collections::HashMap<String, String>| ["kb_a", "kb_b", "kb_c"].map(|k| fp(m, k));
+        assert_eq!(mine(&f0), mine(&s.schema_fingerprints().await.unwrap().unwrap()), "stable without changes");
         run("alter table kb_a.customers add column name text").await;
         let f1 = s.schema_fingerprints().await.unwrap().unwrap();
         assert_ne!(fp(&f0, "kb_a"), fp(&f1, "kb_a"), "new column");

@@ -7,6 +7,8 @@ pub mod conn_state;
 pub mod documents;
 pub mod error;
 pub mod external;
+#[doc(hidden)]
+pub mod invariants;
 pub mod language;
 pub mod sql;
 pub mod stream;

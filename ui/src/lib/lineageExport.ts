@@ -28,6 +28,22 @@ export const LIGHT: DiagramColors = {
   font: "ui-monospace, Menlo, Consolas, monospace",
 };
 
+/** A CSS colour safe to put in an attribute: hex, rgb()/hsl() with plain
+ * numbers, or a colour name. Anything else (a custom appearance colour with
+ * quotes or markup) is replaced by `fallback`. */
+export function cssColor(v: string, fallback: string): string {
+  const t = v.trim();
+  return /^#[0-9a-f]{3,8}$/i.test(t) || /^(rgb|rgba|hsl|hsla)\([0-9.,%\s/deg+-]*\)$/i.test(t) || /^[a-z]{3,30}$/i.test(t) ? t : fallback;
+}
+
+/** `c` with every colour checked by {@link cssColor} (the font is escaped where used). */
+export function safeColors(c: DiagramColors): DiagramColors {
+  const keys = ["bg", "panel", "header", "border", "text", "muted", "accent", "warning"] as const;
+  const out = { ...c };
+  for (const k of keys) out[k] = cssColor(String(c[k] ?? ""), LIGHT[k]);
+  return out;
+}
+
 const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 
 export function kindLabel(n: LineageNode): string {
@@ -84,7 +100,7 @@ export interface SvgOptions {
 
 /** The diagram. Columns carry `data-node` / `data-col` for clicks. */
 export function toSvg(g: LineageGraph, l: Layout = layout(g), opts: SvgOptions = {}): string {
-  const c = opts.colors ?? LIGHT;
+  const c = safeColors(opts.colors ?? LIGHT);
   const f = opts.focus;
   const dim = (on: boolean) => (f && !on ? ' opacity="0.18"' : "");
   const out: string[] = [];

@@ -4,8 +4,16 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.3.0 - 2026-11-03
+
 ### Security
 
+- query_outputs (and run_query on DuckDB) mask an output's sensitive columns as DuckDB loads `results.<name>`, as query_result already did. They only refused SQL that named a sensitive column, so `SELECT *` under a CTE column list could rename one, and a failing cast quoted its value in the error sent to the model. Now the session only sees `***`, the SQL may name the column, and an output that wasn't checked is refused. In a DuckDB file other sessions share, outputs with sensitive columns are refused (use query_outputs).
+- async-executor 1.14.0 (through zbus) was yanked: updated to 1.14.1. RUSTSEC-2026-0429 (zip `extract()` aborting on a huge declared size) only reaches zip copies used on trusted archives (DuckDB's build script, signed updates), so it is listed with the other zip exceptions.
+- Rust 1.88 is now the minimum (was 1.87), which lets in tiberius 0.13 (SQL Server TLS on rustls 0.23 and rustls-webpki 0.103), time 0.3.55, and zip 9 through rust_xlsxwriter 0.102. Seven advisory exceptions are gone from `deny.toml`; the three zip ones remain for zip copies DataBrain doesn't choose (DuckDB's build script, the updater). CI checks the workspace still builds on 1.88.
+- Lineage and ER diagrams only use appearance colours that are plain CSS colours (hex, `rgb()`/`hsl()`, a colour name). A custom colour containing quotes or markup went into the SVG unescaped; it now falls back to the default colour.
+- Sign-in and Kiro terminal launchers are written to a private folder in your cache folder, with a new name each time and never over an existing file. They had fixed names in the shared temp folder, where another user could plant a script of that name first. Old launcher scripts are removed after a day.
+- Credential vault: on Windows, `vault.json` and `vault.key` get an explicit access list (your account and SYSTEM, nothing inherited) before anything is written to them. The key, the decrypted file and the cached passwords are wiped from memory when no longer used, and encryption happens in place so no copy of the plaintext is left behind in freed memory.
 - Exports write to a new temporary file created beside the chosen file (never an existing file or link of that name, which was truncated or written through before) and rename it when done. A failed or cancelled export leaves the previous file whole.
 - MCP server: a message from the client is limited to 8 MiB. A longer line is answered with an error and skipped as it arrives, instead of being collected in memory without limit.
 - Job export steps no longer overwrite files they didn't write. If the file name is taken by another file (or a link), the rows are saved as `name (2)`, `name (3)`… and the run says so; a file an earlier run of the same job wrote is still updated. The file is written next to its destination and moved into place, so a failed or cancelled export leaves the previous file whole.
@@ -35,6 +43,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Fuzzing and coverage: cargo-fuzz targets for the statement splitter and classifier and for identifier quoting (`fuzz/`), checking that spans cover the text in order, that a comment or whitespace never turns a write into a read, and that a quoted name always reads back as one name. A seeded test runs the same checks on generated input in every `cargo test`. A weekly workflow (also manual) fuzzes each target and measures Rust and UI test coverage (cargo-llvm-cov, Vitest v8).
 - Releases include a `SHA256SUMS` file for every file attached, and each installer has a GitHub build provenance attestation (`gh attestation verify <file> --repo toan1804/databrain`).
 - SECURITY.md (how to report a vulnerability privately), CONTRIBUTING.md and a Dependabot configuration for Rust, npm, GitHub Actions and the Oracle helper's Go modules.
 - Parameter sets: save `:name` values under a name and apply them in any tab or notebook; jobs take parameters (a set and values of their own) that fill their steps on every run, can run once with another set, and take `--set`/`--param` from `databrain-jobs run`.
@@ -60,6 +69,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- ClickHouse: when a result breaks off partway (ClickHouse 25.x does that when the query fails after sending rows, sometimes without the error message), the error says so, with how many rows arrived and the query_id to look up in `system.query_log`, instead of only "error decoding response body".
+- DuckDB: opening a database file right after its last session closed (a reconnect, closing a tab and reopening it) could fail with "Cannot open file …wal": the new session opened a second instance while the old one was still closing the file (on Windows: "File is already open"). A query's task finishing after its session ended could also keep the file open past its close. The file now closes after its last connection, and a new session waits for that.
 - The app's code is no longer one 1.9 MB file: React, the editor and the grid are separate files, and the DDL, job, lineage, schema compare and ER diagram tabs (with the SQL formatter) load when first opened. Code read at startup is about 1.6 MB, and the build warns again above 800 kB per file.
 - Job logs shown live in the app keep each run's latest 5,000 lines and the latest 10 runs; they grew for as long as the app stayed open.
 - A table whose name contains a dot (`"x.y"`) is quoted as one name when editing rows, opening related rows and counting rows on SQLite; it was split into two parts.

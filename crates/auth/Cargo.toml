@@ -10,7 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-aes-gcm = "0.11.1"
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
 async-trait = "0.1.92"
 # RSA signing (key-pair JWT) and SHA-256: constant-time, already built for rustls/russh.
 aws-lc-rs = "1.18.1"
@@ -29,6 +29,7 @@ tokio-util = "0.7.19"
 ts-rs = { version = "11.1", features = ["serde-json-impl", "no-serde-warnings"] }
 url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v4"] }
+zeroize = "1.9.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

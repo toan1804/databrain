@@ -537,14 +537,21 @@ mod tests {
         assert_eq!(p.download_url.is_some(), p.sha256.is_some_and(|h| h.len() == 64), "every download has its checksum");
     }
 
+    /// The file the main library links to on Unix (`oci.dll` is the file itself).
+    fn versioned() -> Option<String> {
+        cfg!(unix).then(|| format!("{}.23.1", library_name()))
+    }
+
     /// A folder like an installed Instant Client: the main library (a link
     /// to the versioned file, as installed on macOS), another library, a tool.
     fn fake_client(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
-        let versioned = format!("{}.23.1", library_name());
-        std::fs::write(dir.join(&versioned), b"oci").unwrap();
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&versioned, dir.join(library_name())).unwrap();
+        {
+            let versioned = versioned().unwrap();
+            std::fs::write(dir.join(&versioned), b"oci").unwrap();
+            std::os::unix::fs::symlink(&versioned, dir.join(library_name())).unwrap();
+        }
         #[cfg(not(unix))]
         std::fs::write(dir.join(library_name()), b"oci").unwrap();
         std::fs::write(dir.join(if cfg!(windows) { "orannzsbb.dll" } else { "libnnz.so" }), b"nnz").unwrap();
@@ -559,9 +566,12 @@ mod tests {
         let m = manifest(&dir).unwrap();
         let mut names: Vec<&str> = m.keys().map(String::as_str).collect();
         names.sort_unstable();
-        assert!(m.contains_key(library_name()) && m.contains_key(&format!("{}.23.1", library_name())), "{names:?}");
+        assert!(m.contains_key(library_name()), "{names:?}");
+        if let Some(v) = versioned() {
+            assert!(m.contains_key(&v), "{names:?}");
+            assert_eq!(m[library_name()], m[&v], "a link is hashed through");
+        }
         assert!(!m.contains_key("BASIC_README"), "only libraries");
-        assert_eq!(m[library_name()], m[&format!("{}.23.1", library_name())], "a link is hashed through");
         assert!(manifest(&dir.join("missing")).is_err());
         assert!(manifest(&std::env::temp_dir()).is_err_and(|e| e.contains(library_name())), "a folder without the library");
 
@@ -584,7 +594,7 @@ mod tests {
         // init_client refuses the checked folder once it changed (before
         // anything is loaded) and says why; other folders are not checked.
         set_trusted(Some((dir.to_string_lossy().into_owned(), m.clone())));
-        std::fs::write(dir.join(format!("{}.23.1", library_name())), b"replaced").unwrap();
+        std::fs::write(dir.join(versioned().unwrap_or_else(|| library_name().into())), b"replaced").unwrap();
         match init_client(Some(&dir.to_string_lossy()), &[]) {
             Err(InitError::Changed(e)) => assert!(e.contains(library_name()), "{e}"),
             other => panic!("{other:?}"),

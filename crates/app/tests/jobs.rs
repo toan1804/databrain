@@ -109,6 +109,7 @@ async fn rows(st: &AppState, conn: &str, sql: &str) -> Vec<Vec<String>> {
                 session_key: None,
                 output_name: None,
                 params: Default::default(),
+                output_masks: None,
             },
             None,
         )
@@ -416,6 +417,7 @@ async fn step_names_own_their_output_names() {
                 session_key: None,
                 output_name: Some("revenue".into()),
                 params: Default::default(),
+                output_masks: None,
             },
             None,
         )
@@ -440,6 +442,7 @@ async fn step_names_own_their_output_names() {
         session_key: None,
         output_name: Some("sales".into()),
         params: Default::default(),
+        output_masks: None,
     };
     let err = st.engine.run(run("tab2")).unwrap_err().message;
     assert!(err.contains("only that step can produce it"), "{err}");

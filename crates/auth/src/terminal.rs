@@ -357,23 +357,22 @@ struct Scripts {
 
 impl Scripts {
     fn write(job: &TerminalJob<'_>) -> std::io::Result<Self> {
-        let tmp = std::env::temp_dir();
-        let base = format!("databrain-{}", job.name);
-        let marker = tmp.join(format!("{base}.started"));
-        let _ = std::fs::remove_file(&marker);
-        let sh = tmp.join(format!("{base}.{}", if cfg!(target_os = "macos") { "command" } else { "sh" }));
-        let cmd = tmp.join(format!("{base}.cmd"));
-        let ps1 = tmp.join(format!("{base}.ps1"));
-        std::fs::write(&sh, sh_script(job, &marker))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o700))?;
-        }
+        Self::write_in(&script_dir()?, job)
+    }
+
+    /// Scripts with names of their own in `dir`, each created new (an
+    /// existing file or link of that name is an error, never overwritten).
+    fn write_in(dir: &Path, job: &TerminalJob<'_>) -> std::io::Result<Self> {
+        let base = format!("databrain-{}-{}", job.name, uuid::Uuid::new_v4().simple());
+        let marker = dir.join(format!("{base}.started"));
+        let sh = dir.join(format!("{base}.{}", if cfg!(target_os = "macos") { "command" } else { "sh" }));
+        let cmd = dir.join(format!("{base}.cmd"));
+        let ps1 = dir.join(format!("{base}.ps1"));
+        create_new(&sh, sh_script(job, &marker).as_bytes(), true)?;
         let ps_code = ps_script(job, &marker);
         if cfg!(windows) {
-            std::fs::write(&cmd, cmd_script(job, &marker))?;
-            std::fs::write(&ps1, &ps_code)?;
+            create_new(&cmd, cmd_script(job, &marker).as_bytes(), false)?;
+            create_new(&ps1, ps_code.as_bytes(), false)?;
         }
         Ok(Self { sh, cmd, ps1, ps_code, marker })
     }
@@ -389,6 +388,62 @@ impl Scripts {
         }
         false
     }
+}
+
+/// Folder for launcher scripts: `databrain/terminal` in the user's cache
+/// folder (owner-only), not the shared temp folder where another user could
+/// plant or read them. Scripts older than a day are removed (their terminal
+/// has long read them). Falls back to a new private folder in the temp dir.
+fn script_dir() -> std::io::Result<PathBuf> {
+    if let Some(dir) = dirs::cache_dir().filter(|c| c.is_absolute()).map(|c| c.join("databrain").join("terminal")) {
+        if std::fs::create_dir_all(&dir).is_ok() && owner_only_dir(&dir).is_ok() {
+            prune_scripts(&dir, Duration::from_secs(24 * 3600));
+            return Ok(dir);
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("databrain-terminal-{}", uuid::Uuid::new_v4().simple()));
+    // `create_dir`, not `_all`: fails if anything is already there.
+    std::fs::create_dir(&dir)?;
+    owner_only_dir(&dir)?;
+    Ok(dir)
+}
+
+/// A real folder (not a link), owner-only on Unix.
+fn owner_only_dir(dir: &Path) -> std::io::Result<()> {
+    if !std::fs::symlink_metadata(dir)?.is_dir() {
+        return Err(std::io::Error::other(format!("{} is not a folder", dir.display())));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn prune_scripts(dir: &Path, older_than: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > older_than);
+        if old && e.file_name().to_string_lossy().starts_with("databrain-") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Write a new file (fails if `path` exists), owner-only on Unix.
+fn create_new(path: &Path, bytes: &[u8], executable: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(if executable { 0o700 } else { 0o600 });
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+    opts.open(path)?.write_all(bytes)
 }
 
 fn sh_quote(s: &str) -> String {
@@ -649,6 +704,32 @@ mod tests {
         // UTF-16LE base64 of "a" = "YQA=".
         assert_eq!(ps_encoded("a"), "YQA=");
         assert_eq!(command_line(&job()), "\"C:\\Program Files\\Kiro's\\kiro-cli.exe\" login");
+    }
+
+    /// Scripts get names of their own in a private folder and are never
+    /// written over an existing file.
+    #[test]
+    fn scripts_are_new_private_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Scripts::write_in(dir.path(), &job()).unwrap();
+        let b = Scripts::write_in(dir.path(), &job()).unwrap();
+        assert_ne!(a.sh, b.sh);
+        assert!(a.sh.starts_with(dir.path()) && a.marker.starts_with(dir.path()));
+        assert!(!a.marker.exists());
+        assert!(create_new(&a.sh, b"other", true).is_err(), "an existing file is not overwritten");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&a.sh).unwrap().permissions().mode() & 0o777, 0o700);
+            let d = script_dir().unwrap();
+            assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700, "{}", d.display());
+            assert!(!d.starts_with(std::env::temp_dir()) || d.file_name().unwrap().to_string_lossy().starts_with("databrain-terminal-"));
+        }
+        // Old scripts are removed, other files kept.
+        std::fs::write(dir.path().join("keep.txt"), "x").unwrap();
+        prune_scripts(dir.path(), Duration::ZERO);
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("keep.txt")]);
     }
 
     #[tokio::test]

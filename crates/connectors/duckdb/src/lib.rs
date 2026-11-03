@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use databrain_auth::{AuthMethodKind, CredentialSource};
 use databrain_connector_core::arrow::ipc::reader::StreamReader;
-use databrain_connector_core::external::{ExternalTablesSlot, RESULTS_SCHEMA, referenced_results};
+use databrain_connector_core::external::{ExternalTablesSlot, OutputMasks, RESULTS_SCHEMA, referenced_results};
 use databrain_connector_core::{
     Capabilities, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind, ExecOptions, ExecSummary,
     FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender, TableColumns, quote_ident, quote_literal,
@@ -494,11 +494,11 @@ impl Connector for DuckdbConnector {
         .map_err(|e| ConnectorError::internal(e.to_string()))??;
         Ok(Box::new(DuckSession {
             interrupt: conn.interrupt_handle(),
-            conn: Arc::new(Mutex::new(conn)),
+            shared: db.is_some(),
             outputs: self.outputs.clone(),
             loaded: db.as_ref().map(|d| d.loaded.clone()).unwrap_or_default(),
             sandboxed: sandbox,
-            _db: db,
+            conn: Arc::new(Mutex::new(FileConn { conn, _db: db })),
         }))
     }
 }
@@ -592,16 +592,36 @@ fn attach_files(conn: &duckdb::Connection, files: &[String], all_sheets: bool) -
 }
 
 pub struct DuckSession {
-    conn: Arc<Mutex<duckdb::Connection>>,
+    conn: Arc<Mutex<FileConn>>,
     interrupt: Arc<duckdb::InterruptHandle>,
     outputs: Option<Arc<ExternalTablesSlot>>,
     /// Output tables loaded in the database: lowercase name → version key.
     loaded: Arc<Loaded>,
     /// Runs in a sealed instance (see [`seal`]).
     sandboxed: bool,
-    /// The file database this session's connection belongs to (dropped
-    /// after `conn`, so the file closes when its last session ends).
+    /// The session's connection is to a database file other sessions share.
+    shared: bool,
+}
+
+/// A connection, with the file database it belongs to: whatever still holds
+/// the connection (a running query's task too) keeps the file open, and the
+/// file closes after its last connection.
+struct FileConn {
+    conn: duckdb::Connection,
     _db: Option<Arc<FileDb>>,
+}
+
+impl std::ops::Deref for FileConn {
+    type Target = duckdb::Connection;
+    fn deref(&self) -> &duckdb::Connection {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for FileConn {
+    fn deref_mut(&mut self) -> &mut duckdb::Connection {
+        &mut self.conn
+    }
 }
 
 type Loaded = Mutex<std::collections::HashMap<String, String>>;
@@ -611,9 +631,33 @@ type Loaded = Mutex<std::collections::HashMap<String, String>>;
 /// (on Windows even within a process: a second open fails with "File is
 /// already open"); sessions are connections to that one instance.
 struct FileDb {
-    root: Mutex<duckdb::Connection>,
+    /// The instance's last connection (sessions' connections close first).
+    root: Mutex<Option<duckdb::Connection>>,
     /// The `results` catalog is per instance, so is what was loaded into it.
     loaded: Arc<Loaded>,
+    key: FileKey,
+}
+
+impl Drop for FileDb {
+    /// Closes the file (checkpoint, WAL removed), then leaves the registry.
+    /// Until then a session opening the file waits (see [`connect_file`])
+    /// instead of opening a second instance on a file that is still closing.
+    fn drop(&mut self) {
+        if let Some(root) = self.root.get_mut().ok().and_then(Option::take) {
+            // The WAL is written into the file now: DuckDB may finish closing
+            // on a thread of its own, and a new instance would otherwise read
+            // a WAL that one deletes.
+            if !self.key.1 {
+                let _ = root.execute_batch("CHECKPOINT");
+            }
+            drop(root);
+        }
+        if let Ok(mut dbs) = FILE_DBS.lock() {
+            if dbs.get(&self.key).is_some_and(|w| w.strong_count() == 0) {
+                dbs.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// (resolved path, read-only, sandboxed).
@@ -635,11 +679,28 @@ fn connect_file(path: &str, read_only: bool, sandbox: bool, init: &dyn Fn(&duckd
         _ => p.to_path_buf(),
     };
     let key = (resolved, read_only, sandbox);
-    let mut dbs = FILE_DBS.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?;
-    dbs.retain(|_, w| w.strong_count() > 0);
+    let closing_since = std::time::Instant::now();
+    let mut dbs = loop {
+        let dbs = FILE_DBS.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?;
+        // An instance whose last session ended is still closing the file.
+        let closing = dbs.iter().any(|(k, w)| k.0 == key.0 && w.strong_count() == 0);
+        if !closing {
+            break dbs;
+        }
+        drop(dbs);
+        if closing_since.elapsed() > std::time::Duration::from_secs(30) {
+            return Err(ConnectorError::connection(format!("{path} is still being closed; try again in a moment.")));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     if let Some(db) = dbs.get(&key).and_then(std::sync::Weak::upgrade) {
-        let conn = db.root.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?.try_clone().map_err(|e| ConnectorError::connection(e.to_string()))?;
-        return Ok((conn, db));
+        let conn = match db.root.lock().as_deref() {
+            Ok(Some(root)) => root.try_clone().map_err(|e| ConnectorError::connection(e.to_string())),
+            _ => Err(ConnectorError::internal("the database is closing")),
+        };
+        // `db` may be the last reference: it closes (and takes the registry) after the guard is released.
+        drop(dbs);
+        return conn.map(|c| (c, db));
     }
     if dbs.keys().any(|k| k.0 == key.0 && k.2 != sandbox) {
         return Err(ConnectorError::config(if sandbox {
@@ -650,13 +711,32 @@ fn connect_file(path: &str, read_only: bool, sandbox: bool, init: &dyn Fn(&duckd
             format!("The assistant is using {path} right now; try again when it finishes.")
         }));
     }
-    let c = duckdb::Config::default().access_mode(if read_only { duckdb::AccessMode::ReadOnly } else { duckdb::AccessMode::ReadWrite }).map_err(map_err)?;
-    let root = duckdb::Connection::open_with_flags(path, c).map_err(|e| ConnectorError::connection(e.to_string()))?;
+    let root = open_file(path, read_only)?;
     init(&root)?;
     let conn = root.try_clone().map_err(|e| ConnectorError::connection(e.to_string()))?;
-    let db = Arc::new(FileDb { root: Mutex::new(root), loaded: Arc::default() });
+    let db = Arc::new(FileDb { root: Mutex::new(Some(root)), loaded: Arc::default(), key: key.clone() });
     dbs.insert(key, Arc::downgrade(&db));
     Ok((conn, db))
+}
+
+/// Open `path`, retrying for a moment while an instance that just closed it
+/// (in DuckDB's own threads) still has it open or is removing its WAL.
+fn open_file(path: &str, read_only: bool) -> Result<duckdb::Connection> {
+    let start = std::time::Instant::now();
+    loop {
+        let c = duckdb::Config::default().access_mode(if read_only { duckdb::AccessMode::ReadOnly } else { duckdb::AccessMode::ReadWrite }).map_err(map_err)?;
+        match duckdb::Connection::open_with_flags(path, c) {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                let msg = e.to_string();
+                let closing = msg.contains(".wal") || msg.contains("already open");
+                if !closing || start.elapsed() > std::time::Duration::from_secs(2) {
+                    return Err(ConnectorError::connection(msg));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 /// Explorer schema id for DataBrain outputs (`results.<name>` in SQL).
@@ -693,7 +773,19 @@ impl DuckSession {
 
 /// Load (or refresh) the outputs `sql` references into the in-memory
 /// `results` catalog of this session. Returns notices to show the user.
-fn load_outputs(conn: &duckdb::Connection, sql: &str, slot: Option<&ExternalTablesSlot>, loaded: &Loaded) -> Result<Vec<String>> {
+///
+/// With `masks` (the assistant's runs), each output is loaded with its
+/// sensitive columns masked. A database file's instance is shared with the
+/// user's sessions (`shared`), whose `results` tables a masked load would
+/// replace, so masked outputs are refused there.
+fn load_outputs(
+    conn: &duckdb::Connection,
+    sql: &str,
+    slot: Option<&ExternalTablesSlot>,
+    loaded: &Loaded,
+    masks: Option<&OutputMasks>,
+    shared: bool,
+) -> Result<Vec<String>> {
     let names = referenced_results(sql);
     if names.is_empty() {
         return Ok(vec![]);
@@ -713,6 +805,17 @@ fn load_outputs(conn: &duckdb::Connection, sql: &str, slot: Option<&ExternalTabl
                     format!("Available: {}", known.iter().take(15).map(|n| format!("results.{n}")).collect::<Vec<_>>().join(", "))
                 };
                 return Err(ConnectorError::query(format!("results.{name}: {e}. {hint}")));
+            }
+        };
+        let t = match masks {
+            None => t,
+            Some(m) => {
+                if shared && m.0.get(&t.version_key).is_some_and(|c| !c.is_empty()) {
+                    return Err(ConnectorError::query(format!(
+                        "results.{name} has sensitive columns, which can't be masked in a database file other sessions use; query it with query_outputs (the Results connection) instead"
+                    )));
+                }
+                m.apply(t).map_err(ConnectorError::query)?
             }
         };
         if let Some(n) = &t.notice {
@@ -854,8 +957,16 @@ fn convert_batch(b: &arrow58::record_batch::RecordBatch) -> Result<databrain_con
     r.next().ok_or_else(|| ConnectorError::internal("empty IPC stream"))?.map_err(Into::into)
 }
 
-fn run(conn: &duckdb::Connection, sql: &str, opts: &ExecOptions, tx: &StreamSender, outputs: Option<&ExternalTablesSlot>, loaded: &Loaded) -> Result<()> {
-    for n in load_outputs(conn, sql, outputs, loaded)? {
+fn run(
+    conn: &duckdb::Connection,
+    sql: &str,
+    opts: &ExecOptions,
+    tx: &StreamSender,
+    outputs: Option<&ExternalTablesSlot>,
+    loaded: &Loaded,
+    shared: bool,
+) -> Result<()> {
+    for n in load_outputs(conn, sql, outputs, loaded, opts.output_masks.as_deref(), shared)? {
         tx.blocking_send(Ok(StreamEvent::Notice(n)));
     }
     // Load the extension a query needs (bundled copy first).
@@ -966,6 +1077,7 @@ impl Session for DuckSession {
         let (cancel, interrupt) = (opts.cancel.clone(), self.interrupt.clone());
         let (outputs, loaded) = (self.outputs.clone(), self.loaded.clone());
         let sandboxed = self.sandboxed;
+        let shared = self.shared;
         let done = tokio_util::sync::CancellationToken::new();
         let done_guard = done.clone();
         // duckdb-rs disconnects *before* clearing the interrupt handle's
@@ -988,7 +1100,7 @@ impl Session for DuckSession {
                 tx.blocking_send(Err(ConnectorError::internal("lock poisoned")));
                 return;
             };
-            if let Err(e) = run(&g, &sql, &opts, &tx, outputs.as_deref(), &loaded) {
+            if let Err(e) = run(&g, &sql, &opts, &tx, outputs.as_deref(), &loaded, shared) {
                 let e = if opts.cancel.is_cancelled() {
                     ConnectorError::cancelled()
                 } else if sandboxed {
@@ -1428,6 +1540,41 @@ mod tests {
         }
     }
 
+    /// The assistant's runs load outputs with their sensitive columns masked,
+    /// refuse outputs that weren't checked, and refuse masking in a database
+    /// file shared with other sessions.
+    #[tokio::test]
+    async fn masks_output_columns_for_the_assistant() {
+        use databrain_connector_core::external::OutputMasks;
+        let slot = ExternalTablesSlot::new();
+        slot.set(Arc::new(FakeOutputs(std::sync::Mutex::new(("v1".into(), 4)))));
+        let conn = DuckdbConnector::with_outputs(slot);
+        let creds = || Arc::new(InlineCredentialSource::new(AuthMethod::None, None));
+        let opts = |m: OutputMasks| ExecOptions { output_masks: Some(Arc::new(m)), ..Default::default() };
+        let masked = || OutputMasks([("v1".to_string(), vec!["region".to_string()])].into());
+        let mem = conn.connect(&ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None), creds()).await.unwrap();
+        // Renamed through a CTE column list: still the mask.
+        let sql = "with c(a, b) as (select * from results.sales) select string_agg(distinct a, ',') from c";
+        let r = mem.execute(sql, opts(masked())).await.unwrap().collect().await.unwrap();
+        assert_eq!(r.batches[0].column(0).as_string::<i32>().value(0), "***");
+        // The same session without masks (the user's run) gets the values back.
+        let r = q(mem.as_ref(), "select string_agg(distinct region, ',' order by region) from results.sales").await;
+        assert_eq!(r.batches[0].column(0).as_string::<i32>().value(0), "EU,US");
+        // An output the caller didn't check is refused.
+        let e = mem.execute("select * from results.sales", opts(OutputMasks::default())).await.unwrap().collect().await.unwrap_err();
+        assert!(e.message.contains("not checked"), "{}", e.message);
+        // A database file is shared with other sessions: no masked loads there.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+        cfg.file_path = Some(dir.path().join("m.duckdb").to_string_lossy().into_owned());
+        let file = conn.connect(&cfg, creds()).await.unwrap();
+        let e = file.execute("select * from results.sales", opts(masked())).await.unwrap().collect().await.unwrap_err();
+        assert!(e.message.contains("sensitive columns"), "{}", e.message);
+        // Nothing to mask: fine there too.
+        let none = OutputMasks([("v1".to_string(), vec![])].into());
+        assert_eq!(file.execute("select * from results.sales", opts(none)).await.unwrap().collect().await.unwrap().batches[0].num_rows(), 4);
+    }
+
     #[tokio::test]
     async fn queries_outputs_as_results_tables() {
         let slot = ExternalTablesSlot::new();
@@ -1549,6 +1696,22 @@ mod tests {
         assert_eq!(q(&*s2, "select * from files.sales").await.num_rows(), 2);
         let e = q_err(&*s2, &format!("select * from read_csv({})", quote_literal(&dir.path().join("secret.csv").to_string_lossy()))).await;
         assert!(e.message.contains("sandbox"), "{}", e.message);
+    }
+
+    /// A session opening a file that another thread is closing waits for it
+    /// to close instead of opening a second instance on it (WAL errors).
+    #[tokio::test]
+    async fn reopens_a_file_while_it_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+        cfg.file_path = Some(dir.path().join("lake.duckdb").to_string_lossy().into_owned());
+        for i in 0..30 {
+            let s = session(cfg.clone()).await;
+            q(&*s, &format!("create table t{i} as select range as x from range(5000)")).await;
+            std::thread::spawn(move || drop(s));
+            let s2 = session(cfg.clone()).await;
+            assert_eq!(q(&*s2, &format!("select count(*) from t{i}")).await.num_rows(), 1);
+        }
     }
 
     #[test]

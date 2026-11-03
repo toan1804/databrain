@@ -608,7 +608,7 @@ impl QueryEngine {
         } else {
             let d = schemas.iter().find(|s| s.is_default).map(|s| short(&s.name));
             if let Some(d) = &d {
-                t.notes.push(format!("No schema given: {} is used ({conn}'s default)", d));
+                t.notes.push(format!("No schema given: {d} is used ({conn}'s default)"));
             }
             d
         };

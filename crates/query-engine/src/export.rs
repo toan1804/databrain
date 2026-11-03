@@ -83,7 +83,7 @@ impl QueryEngine {
             _ = cancel.cancelled() => return Err(ConnectorError::cancelled().into()),
         };
         report(ExportPhase::Running, 0, None);
-        let mut stream = session.execute(sql, ExecOptions { batch_size: 10_000, cancel: cancel.clone(), max_rows: None }).await?;
+        let mut stream = session.execute(sql, ExecOptions { batch_size: 10_000, cancel: cancel.clone(), max_rows: None, output_masks: None }).await?;
         let mut writer: Option<databrain_export::FileWriter> = None;
         let fail = |e: databrain_export::ExportError| EngineError::new("invalid", e.to_string());
         let mut rows = 0u64;

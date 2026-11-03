@@ -1,0 +1,38 @@
+# Fuzz targets for the statement splitter, classifier and identifier quoting
+# (cargo-fuzz, nightly Rust). Not part of the main workspace:
+#   cargo +nightly fuzz run split_classify -- -max_total_time=300
+# The properties checked are in connector-core's `invariants` module, which
+# a seeded test also runs on every `cargo test`.
+[package]
+name = "databrain-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+databrain-connector-core = { path = "../crates/connector-core" }
+
+# Its own workspace: kept out of the main one.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "split_classify"
+path = "fuzz_targets/split_classify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quoting"
+path = "fuzz_targets/quoting.rs"
+test = false
+doc = false
+bench = false

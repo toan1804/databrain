@@ -1,6 +1,7 @@
 //! Tools the AI can call. Each tool is described by a JSON Schema (sent to
 //! the model and exposed over MCP) and executed here with policy checks.
 
+use databrain_connector_core::external::OutputMasks;
 use std::sync::Arc;
 
 use databrain_query_engine::{EventHub, QueryEngine, RunRequest};
@@ -808,6 +809,8 @@ impl ToolContext {
                 RunRequest {
                     connection_id: target.id.clone(),
                     tab_id: tab,
+                    // DuckDB loads results.<name> masked; other databases have none.
+                    output_masks: duckdb.then(|| self.output_masks(&sql)),
                     sql: run_sql,
                     base_offset: 0,
                     row_limit: Some(cap),
@@ -1121,9 +1124,8 @@ impl ToolContext {
     /// Every output `sql` reads as `results.<name>` must be one the assistant
     /// may read: its source connection has AI on (and MCP for an MCP
     /// client), its tables pass the table rules, it shares result rows (or
-    /// the user mentioned it), and the SQL names none of its sensitive
-    /// columns. DuckDB loads exactly these outputs into the session, so an
-    /// output that isn't checked here is never readable.
+    /// the user mentioned it). Its sensitive columns are masked as it loads
+    /// ([`Self::output_masks`]), so the SQL may name them.
     fn check_output_sources(&self, sql: &str) -> Result<()> {
         for o in &self.engine.outputs().referenced(sql) {
             let pol = self.source_policy(&o.result_id)?;
@@ -1133,12 +1135,21 @@ impl ToolContext {
                     o.handle, o.connection_name
                 )));
             }
-            let names: Vec<String> = o.columns.iter().map(|c| c.name.clone()).collect();
-            if names.iter().zip(self.pii_mask(&o.result_id, &names, 0)).any(|(n, m)| m && sql.to_ascii_lowercase().contains(&n.to_ascii_lowercase())) {
-                return Err(AiError::Policy(format!("the query references a sensitive column of {}", o.handle)));
-            }
         }
         Ok(())
+    }
+
+    /// The sensitive columns of every output `sql` reads, for DuckDB to load
+    /// as `***` ([`OutputMasks`]): renaming, casting or any expression over
+    /// them gets the mask, not the values, and so do error messages.
+    fn output_masks(&self, sql: &str) -> std::sync::Arc<OutputMasks> {
+        let mut masks = std::collections::HashMap::new();
+        for o in self.engine.outputs().referenced(sql) {
+            let names: Vec<String> = o.columns.iter().map(|c| c.name.clone()).collect();
+            let masked = names.iter().zip(self.pii_mask(&o.result_id, &names, 0)).filter(|(_, m)| *m).map(|(n, _)| n.clone()).collect();
+            masks.insert(o.result_id.clone(), masked);
+        }
+        std::sync::Arc::new(OutputMasks(masks))
     }
 
     async fn query_outputs(&self, args: &Value) -> Result<ToolOutput> {
@@ -1160,6 +1171,7 @@ impl ToolContext {
                 RunRequest {
                     connection_id: results_conn.id.clone(),
                     tab_id: format!("ai-outputs:{}", self.session_id.clone().unwrap_or_else(|| "mcp".into())),
+                    output_masks: Some(self.output_masks(&sql)),
                     sql: policy::cap_rows(databrain_connector_core::ConnectorKind::Duckdb, &sql, 1000),
                     base_offset: 0,
                     row_limit: Some(1000),
@@ -1241,6 +1253,7 @@ impl ToolContext {
                     session_key: None,
                     output_name: None,
                     params: Default::default(),
+                    output_masks: None,
                 },
                 Some(self.cancel.clone()),
             )

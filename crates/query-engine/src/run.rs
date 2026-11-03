@@ -345,6 +345,7 @@ impl QueryEngine {
                     cancel: cancel.clone(),
                     // One row past the cap tells us the result was truncated.
                     max_rows: limit.map(|l| l.saturating_add(1)),
+                    output_masks: req.output_masks.clone(),
                 },
             )
             .await?;
@@ -429,7 +430,7 @@ impl QueryEngine {
             g.finish(true);
             g.info()
         });
-        notices.push(format!("Showing the first {} rows. Increase the row limit to fetch more.", rows));
+        notices.push(format!("Showing the first {rows} rows. Increase the row limit to fetch more."));
         // Wait for the connector to finish cancelling before the session is
         // reused; otherwise a server-side cancel could hit the next statement.
         let _ = tokio::time::timeout(Duration::from_secs(15), async { while stream.next().await.is_some() {} }).await;

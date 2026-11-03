@@ -592,9 +592,9 @@ dependencies = [
 
 [[package]]
 name = "async-executor"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
+checksum = "f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37"
 dependencies = [
  "async-task",
  "concurrent-queue",
@@ -699,9 +699,9 @@ dependencies = [
 
 [[package]]
 name = "asynchronous-codec"
-version = "0.6.2"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4057f2c32adbb2fc158e22fb38433c8e9bbf76b75a4732c7c0cbaf695fb65568"
+checksum = "a860072022177f903e59730004fb5dc13db9275b79bb2aef7ba8ce831956c233"
 dependencies = [
  "bytes",
  "futures-sink",
@@ -797,6 +797,15 @@ name = "base16ct"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd307490d624467aa6f74b0eabb77633d1f758a7b25f12bceb0b22e08d9726f6"
+
+[[package]]
+name = "base64"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b25d992356d2eb0ed82172f5248873db5560c4721f564b13cb5193bda5e668e"
+dependencies = [
+ "byteorder",
+]
 
 [[package]]
 name = "base64"
@@ -1773,7 +1782,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "databrain-ai"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1803,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-app"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "aes 0.8.4",
  "async-trait",
@@ -1858,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-auth"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1879,11 +1888,12 @@ dependencies = [
  "ts-rs",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
 name = "databrain-connector-clickhouse"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -1897,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-cloud"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1916,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arrow 59.3.0",
  "async-trait",
@@ -1934,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-duckdb"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arrow 58.4.0",
  "async-trait",
@@ -1947,12 +1957,12 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "zip 7.2.0",
+ "zip 9.2.2",
 ]
 
 [[package]]
 name = "databrain-connector-mongodb"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -1967,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-mssql"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -1981,7 +1991,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-mysql"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -1995,7 +2005,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-neo4j"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2009,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-oracle"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -2029,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-postgres"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -2045,7 +2055,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-sqlite"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "databrain-auth",
@@ -2058,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-duckdb-dynload"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libduckdb-sys",
  "libloading",
@@ -2066,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-export"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "databrain-connector-core",
  "databrain-result-store",
@@ -2081,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-lineage"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "databrain-connector-core",
  "serde",
@@ -2091,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-query-engine"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "databrain-auth",
  "databrain-connector-core",
@@ -2114,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-result-store"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "databrain-connector-core",
  "parking_lot",
@@ -2126,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-ssh-tunnel"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "databrain-connector-core",
  "rand 0.10.3",
@@ -2138,7 +2148,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-workspace"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "databrain-auth",
@@ -2242,7 +2252,6 @@ version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
- "powerfmt",
  "serde_core",
 ]
 
@@ -2971,6 +2980,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
 
 [[package]]
+name = "futures-timer"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
+
+[[package]]
 name = "futures-util"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3616,9 +3631,9 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "rustls 0.23.46",
+ "rustls",
  "tokio",
- "tokio-rustls 0.26.6",
+ "tokio-rustls",
  "tower-service",
 ]
 
@@ -4605,7 +4620,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.9.5",
  "rustc_version_runtime",
- "rustls 0.23.46",
+ "rustls",
  "rustversion",
  "serde",
  "serde_bytes",
@@ -4618,7 +4633,7 @@ dependencies = [
  "take_mut",
  "thiserror 2.0.21",
  "tokio",
- "tokio-rustls 0.26.6",
+ "tokio-rustls",
  "tokio-util",
  "typed-builder",
  "uuid",
@@ -4784,11 +4799,11 @@ dependencies = [
  "paste",
  "pin-project-lite",
  "rustls-native-certs 0.7.3",
- "rustls-pemfile 2.2.0",
+ "rustls-pemfile",
  "serde",
  "thiserror 1.0.69",
  "tokio",
- "tokio-rustls 0.26.6",
+ "tokio-rustls",
  "url",
  "webpki-roots 0.26.11",
 ]
@@ -4884,9 +4899,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.1.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51d515d32fb182ee37cda2ccdcb92950d6a3c2893aa280e540671c2cd0f3b1d9"
+checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "num-integer"
@@ -5973,9 +5988,9 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
 name = "pretty-hex"
-version = "0.3.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6fa0831dd7cc608c38a5e323422a0077678fa5744aa2be4ad91c4ece8eec8d5"
+checksum = "9a65843dfefbafd3c879c683306959a6de478443ffe9c9adf02f5976432402d7"
 
 [[package]]
 name = "primefield"
@@ -6357,7 +6372,7 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
- "rustls 0.23.46",
+ "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
@@ -6366,7 +6381,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
- "tokio-rustls 0.26.6",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tower-http",
@@ -6580,12 +6595,12 @@ dependencies = [
 
 [[package]]
 name = "rust_xlsxwriter"
-version = "0.96.0"
+version = "0.102.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd1746025420e17b5d62528b930e550e016e857038794d74e169018126ef3d14"
+checksum = "6ca3d0e879a578c1313c2800ab0c6c029d38eed18098675e50341a30d32372ed"
 dependencies = [
  "tempfile",
- "zip 7.2.0",
+ "zip 9.2.2",
 ]
 
 [[package]]
@@ -6641,41 +6656,18 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.21.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f56a14d1f48b391359b22f731fd4bd7e43c97f3c50eee276f3aa09c94784d3e"
-dependencies = [
- "log",
- "ring",
- "rustls-webpki 0.101.7",
- "sct",
-]
-
-[[package]]
-name = "rustls"
 version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
+ "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.16",
+ "rustls-webpki",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "rustls-native-certs"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9aace74cb666635c918e9c12bc0d348266037aa8eb599b5cba565709a8dff00"
-dependencies = [
- "openssl-probe 0.1.6",
- "rustls-pemfile 1.0.4",
- "schannel",
- "security-framework 2.11.1",
 ]
 
 [[package]]
@@ -6685,7 +6677,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5bfb394eeed242e909609f56089eecfe5fda225042e8b171791b9c95f5931e5"
 dependencies = [
  "openssl-probe 0.1.6",
- "rustls-pemfile 2.2.0",
+ "rustls-pemfile",
  "rustls-pki-types",
  "schannel",
  "security-framework 2.11.1",
@@ -6701,15 +6693,6 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework 3.7.0",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c74cae0a4cf6ccbbf5f359f08efdf8ee7e1dc532573bf0db71968cb56b1448c"
-dependencies = [
- "base64 0.21.7",
 ]
 
 [[package]]
@@ -6741,10 +6724,10 @@ dependencies = [
  "jni 0.22.4",
  "log",
  "once_cell",
- "rustls 0.23.46",
+ "rustls",
  "rustls-native-certs 0.8.5",
  "rustls-platform-verifier-android",
- "rustls-webpki 0.103.16",
+ "rustls-webpki",
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
@@ -6759,20 +6742,11 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.101.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
-dependencies = [
- "ring",
- "untrusted 0.9.0",
-]
-
-[[package]]
-name = "rustls-webpki"
 version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
+ "aws-lc-rs",
  "ring",
  "rustls-pki-types",
  "untrusted 0.9.0",
@@ -6911,16 +6885,6 @@ dependencies = [
  "pbkdf2 0.13.0",
  "salsa20 0.11.0",
  "sha2 0.11.0",
-]
-
-[[package]]
-name = "sct"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da046153aa2352493d6cb7da4b6e5c0c057d8a1d0a9aa8560baffdd945acd414"
-dependencies = [
- "ring",
- "untrusted 0.9.0",
 ]
 
 [[package]]
@@ -8047,7 +8011,7 @@ dependencies = [
  "osakit",
  "percent-encoding",
  "reqwest",
- "rustls 0.23.46",
+ "rustls",
  "semver",
  "serde",
  "serde_json",
@@ -8245,9 +8209,9 @@ dependencies = [
 
 [[package]]
 name = "tiberius"
-version = "0.12.3"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1446cb4198848d1562301a3340424b4f425ef79f35ef9ee034769a9dd92c10d"
+checksum = "e07324791de2bdaed058af4aa433a0b5ec5c0beac407a9797419c19805df2415"
 dependencies = [
  "async-trait",
  "asynchronous-codec",
@@ -8256,20 +8220,37 @@ dependencies = [
  "connection-string",
  "encoding_rs",
  "enumflags2",
+ "futures-timer",
  "futures-util",
+ "libc",
  "num-traits",
  "once_cell",
  "pin-project-lite",
  "pretty-hex",
- "rustls-native-certs 0.6.3",
- "rustls-pemfile 1.0.4",
- "thiserror 1.0.69",
+ "rustls-native-certs 0.8.5",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "secrecy",
+ "thiserror 2.0.21",
+ "tiberius-macros",
  "tokio",
- "tokio-rustls 0.24.1",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "uuid",
  "winauth",
+ "zeroize",
+]
+
+[[package]]
+name = "tiberius-macros"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "907fed5ea55695d902cc3359fffa4a35021dfa9b95ab4eb9c8376d42ffb9eec8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -8288,12 +8269,11 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.45"
+version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd"
+checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
  "deranged",
- "itoa",
  "num-conv",
  "powerfmt",
  "serde_core",
@@ -8303,15 +8283,15 @@ dependencies = [
 
 [[package]]
 name = "time-core"
-version = "0.1.7"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b36ee98fd31ec7426d599183e8fe26932a8dc1fb76ddb6214d05493377d34ca"
+checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "time-macros"
-version = "0.2.25"
+version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71e552d1249bf61ac2a52db88179fd0673def1e1ad8243a00d9ec9ed71fee3dd"
+checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
 dependencies = [
  "num-conv",
  "time-core",
@@ -8408,21 +8388,11 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c28327cf380ac148141087fbfb9de9d7bd4e84ab5d2c28fbc911d753de8a7081"
-dependencies = [
- "rustls 0.21.12",
- "tokio",
-]
-
-[[package]]
-name = "tokio-rustls"
 version = "0.26.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
- "rustls 0.23.46",
+ "rustls",
  "tokio",
 ]
 
@@ -8776,9 +8746,9 @@ dependencies = [
 
 [[package]]
 name = "typed-path"
-version = "0.12.3"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
 
 [[package]]
 name = "typeid"
@@ -8926,7 +8896,7 @@ dependencies = [
  "base64 0.23.1",
  "log",
  "percent-encoding",
- "rustls 0.23.46",
+ "rustls",
  "rustls-pki-types",
  "ureq-proto",
  "utf8-zero",
@@ -9422,10 +9392,11 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "winauth"
-version = "0.0.4"
+version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f820cd208ce9c6b050812dc2d724ba98c6c1e9db5ce9b3f58d925ae5723a5e6"
+checksum = "0e03c9d0fde636447315ff38695b14c85c6ccc738ade05a400a3ce568a557021"
 dependencies = [
+ "base64 0.10.1",
  "bitflags 1.3.2",
  "byteorder",
  "md5 0.6.1",
@@ -10290,15 +10261,19 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "7.2.0"
+version = "9.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
+checksum = "e408c6cc4699dd017d53dc080cd51c2cea2b5354af57a1479bd265ed42911487"
 dependencies = [
  "crc32fast",
  "flate2",
+ "getrandom 0.4.3",
  "indexmap 2.14.2",
+ "libc",
  "memchr",
+ "nix",
  "typed-path",
+ "windows-sys 0.61.2",
  "zopfli",
 ]
 

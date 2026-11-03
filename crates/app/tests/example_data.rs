@@ -94,6 +94,7 @@ async fn query_view(st: &AppState, conn: &str, sql: &str, view: ViewSpec) -> (St
                 session_key: None,
                 output_name: None,
                 params: Default::default(),
+                output_masks: None,
             },
             None,
         )
@@ -215,6 +216,7 @@ async fn sqlite_explorer_and_queries() {
         session_key: None,
         output_name: None,
         params: Default::default(),
+        output_masks: None,
     });
     assert!(blocked.is_err(), "write on a read-only connection must be rejected");
 }
@@ -407,6 +409,7 @@ async fn run_named(
                 session_key: None,
                 output_name: name.map(str::to_string),
                 params: Default::default(),
+                output_masks: None,
             },
             None,
         )

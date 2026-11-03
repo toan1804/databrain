@@ -224,7 +224,7 @@ impl Inner {
         let mut rows = 0usize;
         'read: loop {
             let chunk = tokio::select! {
-                c = resp.chunk() => c.map_err(net_err)?,
+                c = resp.chunk() => c.map_err(|e| ended_early(e, &query_id, rows))?,
                 _ = opts.cancel.cancelled() => {
                     drop(resp);
                     self.kill(&query_id).await;
@@ -315,6 +315,17 @@ impl Inner {
         tx.send(StreamEvent::Done(ExecSummary { rows_affected: written })).await;
         Ok(())
     }
+}
+
+/// The result broke off after it started: ClickHouse does that when the
+/// query fails midway, and its message doesn't always come with it.
+fn ended_early(e: reqwest::Error, query_id: &str, rows: usize) -> ConnectorError {
+    let mut err = net_err(e);
+    err.message = format!(
+        "ClickHouse stopped sending the result after {rows} rows, usually because the query failed on the server; its error is in system.query_log (query_id = '{query_id}'). ({})",
+        err.message
+    );
+    err
 }
 
 fn net_err(e: reqwest::Error) -> ConnectorError {
@@ -685,6 +696,69 @@ mod tests {
     use super::*;
     use databrain_auth::AuthMethod;
 
+    /// A fake server: answers the sign-in check, then streams rows and fails
+    /// the way ClickHouse 24.11+ does once the result has started: an
+    /// exception block, then the connection closed without the last chunk.
+    fn broken_stream_server(with_error: bool) -> u16 {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                // The whole request: headers, then Content-Length bytes of SQL.
+                let mut req = Vec::new();
+                let mut b = [0u8; 4096];
+                loop {
+                    let n = c.read(&mut b).unwrap();
+                    req.extend_from_slice(&b[..n]);
+                    let text = String::from_utf8_lossy(&req).to_lowercase();
+                    let Some(end) = text.find("\r\n\r\n") else { continue };
+                    let len = text.lines().find_map(|l| l.strip_prefix("content-length:")).map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                    if n == 0 || req.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&req);
+                if req.contains("currentDatabase()") {
+                    let body = "currentDatabase()\nString\ndefault\n";
+                    let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    continue;
+                }
+                let tag = "abcdefghijklmnop";
+                let chunk = |c: &mut std::net::TcpStream, s: &str| write!(c, "{:x}\r\n{s}\r\n", s.len()).unwrap();
+                write!(c, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nX-ClickHouse-Exception-Tag: {tag}\r\n\r\n").unwrap();
+                chunk(&mut c, "x\nUInt8\n0\n0\n");
+                let msg = "Code: 395. DB::Exception: Value passed to 'throwIf' function is non-zero: boom. (FUNCTION_THROW_IF_VALUE_IS_NON_ZERO) (version 25.8.1.1)\n";
+                if with_error {
+                    chunk(&mut c, &format!("\r\n__exception__\r\n{tag}\r\n{msg}{} {tag}\r\n__exception__\r\n", msg.len()));
+                }
+                c.flush().unwrap();
+                // No terminating chunk: the response is broken on purpose.
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn reports_errors_sent_after_the_result_started() {
+        use databrain_auth::InlineCredentialSource;
+        for with_error in [true, false] {
+            let port = broken_stream_server(with_error);
+            let mut cfg = ConnectionConfig::new(ConnectorKind::Clickhouse, AuthMethod::Password { user: "default".into() });
+            cfg.host = Some("127.0.0.1".into());
+            cfg.port = Some(port);
+            let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user: "default".into() }, Some(secrecy::SecretString::from("pw"))));
+            let s = ClickhouseConnector.connect(&cfg, creds).await.unwrap();
+            let e = s.execute("SELECT throwIf(number = 100)", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
+            if with_error {
+                assert!(e.message.contains("boom") && !e.message.contains("abcdefghijklmnop"), "{e:?}");
+            } else {
+                // Without the message: says what happened and where to find it.
+                assert!(e.message.contains("after 2 rows") && e.message.contains("system.query_log (query_id = '"), "{e:?}");
+            }
+        }
+    }
+
     #[test]
     fn endpoints() {
         let mut c = ConnectionConfig::new(ConnectorKind::Clickhouse, AuthMethod::Password { user: "u".into() });
@@ -785,7 +859,8 @@ mod tests {
         assert_eq!((t[1][0].as_deref(), t[1][1].as_deref()), (Some("18446744073709551615"), None));
         // An error after the first rows were sent (HTTP 200 already).
         let e = run("SELECT throwIf(number = 50000, 'boom') FROM numbers(100000) SETTINGS max_block_size = 100").await.unwrap_err();
-        assert!(e.message.contains("boom"), "{e:?}");
+        // ClickHouse 25.8 may break the response off without the message.
+        assert!(e.message.contains("boom") || e.message.contains("system.query_log"), "{e:?}");
         // Session state: a temporary table survives to the next statement.
         run("CREATE TEMPORARY TABLE tmp (x Int32)").await.unwrap();
         run("INSERT INTO tmp VALUES (7)").await.unwrap();

@@ -64,6 +64,7 @@ fn req(f: &Fixture, sql: &str) -> RunRequest {
         session_key: None,
         output_name: None,
         params: Default::default(),
+        output_masks: None,
     }
 }
 

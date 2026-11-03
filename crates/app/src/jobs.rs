@@ -817,7 +817,19 @@ async fn run_sql(
         .engine
         .run_and_wait(
             &ctx.hub,
-            RunRequest { connection_id, tab_id: tab, sql, base_offset: 0, row_limit: None, confirmed: true, origin, session_key: None, output_name, params },
+            RunRequest {
+                connection_id,
+                tab_id: tab,
+                sql,
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin,
+                session_key: None,
+                output_name,
+                params,
+                output_masks: None,
+            },
             Some(cancel.clone()),
         )
         .await?;
@@ -1009,6 +1021,7 @@ pub async fn dry_run(ctx: &JobCtx, job: &Job, node_id: &str) -> Result<LoadDryRu
                 session_key: None,
                 output_name: None,
                 params: HashMap::new(),
+                output_masks: None,
             };
             match ctx.engine.run_and_wait(&ctx.hub, req, Some(cancel.clone())).await {
                 Err(e) => (None, Some(e.message)),
