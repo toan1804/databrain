@@ -84,7 +84,8 @@ fn node(id: &str, name: &str, kind: JobNodeKind, conn: Option<&str>, sql: &str) 
 async fn finished(st: &AppState, job: &str) -> JobRun {
     for _ in 0..400 {
         let run = st.workspace.job_runs(job, 1).unwrap().remove(0);
-        if run.status != "running" {
+        // The run is recorded before the job lets go of its slot.
+        if run.status != "running" && !st.jobs.is_running(job) {
             return run;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
