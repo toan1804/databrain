@@ -643,7 +643,15 @@ impl Drop for FileDb {
     /// Until then a session opening the file waits (see [`connect_file`])
     /// instead of opening a second instance on a file that is still closing.
     fn drop(&mut self) {
-        drop(self.root.get_mut().ok().and_then(Option::take));
+        if let Some(root) = self.root.get_mut().ok().and_then(Option::take) {
+            // The WAL is written into the file now: DuckDB may finish closing
+            // on a thread of its own, and a new instance would otherwise read
+            // a WAL that one deletes.
+            if !self.key.1 {
+                let _ = root.execute_batch("CHECKPOINT");
+            }
+            drop(root);
+        }
         if let Ok(mut dbs) = FILE_DBS.lock() {
             if dbs.get(&self.key).is_some_and(|w| w.strong_count() == 0) {
                 dbs.remove(&self.key);
@@ -703,13 +711,32 @@ fn connect_file(path: &str, read_only: bool, sandbox: bool, init: &dyn Fn(&duckd
             format!("The assistant is using {path} right now; try again when it finishes.")
         }));
     }
-    let c = duckdb::Config::default().access_mode(if read_only { duckdb::AccessMode::ReadOnly } else { duckdb::AccessMode::ReadWrite }).map_err(map_err)?;
-    let root = duckdb::Connection::open_with_flags(path, c).map_err(|e| ConnectorError::connection(e.to_string()))?;
+    let root = open_file(path, read_only)?;
     init(&root)?;
     let conn = root.try_clone().map_err(|e| ConnectorError::connection(e.to_string()))?;
     let db = Arc::new(FileDb { root: Mutex::new(Some(root)), loaded: Arc::default(), key: key.clone() });
     dbs.insert(key, Arc::downgrade(&db));
     Ok((conn, db))
+}
+
+/// Open `path`, retrying for a moment while an instance that just closed it
+/// (in DuckDB's own threads) still has it open or is removing its WAL.
+fn open_file(path: &str, read_only: bool) -> Result<duckdb::Connection> {
+    let start = std::time::Instant::now();
+    loop {
+        let c = duckdb::Config::default().access_mode(if read_only { duckdb::AccessMode::ReadOnly } else { duckdb::AccessMode::ReadWrite }).map_err(map_err)?;
+        match duckdb::Connection::open_with_flags(path, c) {
+            Ok(conn) => return Ok(conn),
+            Err(e) => {
+                let msg = e.to_string();
+                let closing = msg.contains(".wal") || msg.contains("already open");
+                if !closing || start.elapsed() > std::time::Duration::from_secs(2) {
+                    return Err(ConnectorError::connection(msg));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 /// Explorer schema id for DataBrain outputs (`results.<name>` in SQL).
