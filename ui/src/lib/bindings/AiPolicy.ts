@@ -43,9 +43,11 @@ index_batch: number,
  */
 mcp_enabled: boolean, 
 /**
- * MCP: what DataBrain would ask the user about runs when the MCP client
- * can't show DataBrain's question (no elicitation), on the strength of
- * the client's own tool approval. Off: such calls are refused.
+ * MCP: what DataBrain would ask the user about (per "AI may run queries"
+ * and the write rules) runs on the strength of the MCP client's own tool
+ * approval, without DataBrain's question. Off: it is asked through the
+ * client (elicitation) or, when the client can't, refused. What needs
+ * the user's confirmation in the app is never approved over MCP.
  */
 mcp_client_approves: boolean, 
 /**
