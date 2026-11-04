@@ -83,9 +83,11 @@ pub struct AiPolicy {
     pub index_batch: u32,
     /// Expose this connection to external agents through the MCP server.
     pub mcp_enabled: bool,
-    /// MCP: what DataBrain would ask the user about runs when the MCP client
-    /// can't show DataBrain's question (no elicitation), on the strength of
-    /// the client's own tool approval. Off: such calls are refused.
+    /// MCP: what DataBrain would ask the user about (per "AI may run queries"
+    /// and the write rules) runs on the strength of the MCP client's own tool
+    /// approval, without DataBrain's question. Off: it is asked through the
+    /// client (elicitation) or, when the client can't, refused. What needs
+    /// the user's confirmation in the app is never approved over MCP.
     pub mcp_client_approves: bool,
     /// Notes the AI adds or updates are saved directly instead of waiting
     /// for review in Knowledge.

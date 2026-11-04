@@ -350,7 +350,7 @@ Defined once in `specs()` in `crates/ai/src/tools.rs`, with hand-written JSON Sc
 | `result_summary` | Columns, row count, column stats; rows (up to `max_rows_to_model`) only with `share_result_rows` | |
 | `list_knowledge_notes`, `add_knowledge_note`, `update_knowledge_note` | Notes and glossary | saved as proposed unless `auto_approve_notes` |
 | `list_connections` | Connections the assistant may use, plus Results (DuckDB) | |
-| `list_jobs`, `get_job`, `create_job`, `update_job`, `run_job` | Read, create, change and run jobs | approval with a summary of what changes |
+| `list_jobs`, `get_job`, `create_job`, `update_job`, `run_job` | Read, create, change and run jobs (over MCP only `list_jobs` and `get_job`) | approval with a summary of what changes |
 | `save_query` | Save to saved queries | approval |
 | `get_editor`, `write_editor` | Read the editor; propose SQL as a diff (insert, replace selection, replace all, new tab) | the user accepts or rejects the diff |
 
@@ -414,10 +414,12 @@ Auth is the `kiro-cli login` browser session (run in the user's terminal and det
 
 - Only connections with `mcp_enabled` (and AI on) are visible. Every tool takes a required `connection` argument, and tools carry MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`).
 - Requests are handled concurrently, so a tool call waiting for the user doesn't block the client's other messages, including the answer. `notifications/cancelled` stops the call it names: a question it waits on ends, a running query is cancelled on the server, and no response is sent for it.
-- When the policy says `Ask`, the server asks the user through the client with `elicitation/create` (the question and the SQL). Only an explicit accept with `approve = true` runs it. A call that carries `_meta.progressToken` gets a `notifications/progress` saying the question is waiting.
-- The wait is 2 minutes (`DATABRAIN_MCP_ELICIT_SECS`, 5 s to 1 h). A timeout ends the call with a message naming the fixes (auto-read, or `mcp_client_approves`) and marks the peer `unanswered`: later `Ask` decisions in that session are refused at once instead of waiting, since a client can declare elicitation and still not show prompts in its current mode.
-- A client without elicitation support gets a refusal, unless the connection sets `mcp_client_approves`; then the call runs and is audited as "approved by MCP client".
+- When the policy says `Ask` and the connection sets `mcp_client_approves`, the call runs on the client's own tool approval, without a question, and is audited as "approved by MCP client". This holds with any `run_query` setting, not only auto-read.
+- Otherwise, when the policy says `Ask`, the server asks the user through the client with `elicitation/create` (the question and the SQL). Only an explicit accept with `approve = true` runs it. A call that carries `_meta.progressToken` gets a `notifications/progress` saying the question is waiting.
+- The wait is 2 minutes (`DATABRAIN_MCP_ELICIT_SECS`, 5 s to 1 h). A timeout ends the call with a guide the agent passes on to the user (Edit connection → AI → "Accept the MCP client's approval") and marks the peer `unanswered`: later `Ask` decisions in that session are refused at once instead of waiting, since a client can declare elicitation and still not show prompts in its current mode.
+- A client without elicitation support gets a refusal with the same guide.
 - `Confirm` decisions are never approved over MCP.
+- `create_job`, `update_job` and `run_job` are not offered over MCP (`tools::APP_ONLY_TOOLS`) and are refused if called: jobs are created, changed and run in DataBrain's assistant.
 - Settings → MCP shows the client config (`ai_api::mcp_config`), which points at the `databrain-mcp` binary next to the app.
 
 ---

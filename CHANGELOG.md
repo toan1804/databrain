@@ -4,6 +4,12 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Changed
+
+- MCP: with "Accept the MCP client's approval" on, the client's own tool approval is enough for what DataBrain would ask about, with any "AI may run queries" setting. Before, it only counted for clients without elicitation, so a client that declared elicitation was still asked (or refused when it didn't show the question), and reads needed "Automatically for read-only queries".
+- MCP: a call refused for want of the user's approval tells the agent how the user allows it (Edit connection → AI → "Accept the MCP client's approval").
+- MCP: `create_job`, `update_job` and `run_job` are no longer offered to MCP clients. Jobs are created, changed and run in DataBrain's assistant; `list_jobs` and `get_job` still work over MCP.
+
 ## 0.3.0 - 2026-11-03
 
 ### Security

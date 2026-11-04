@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use super::{Caller, MCP_ASK_HELP, ToolContext};
+use super::{Caller, ToolContext, mcp_ask_help};
 use crate::policy::Decision;
 use crate::types::{AiError, Result};
 
@@ -17,19 +17,22 @@ impl ToolContext {
                 Err(AiError::Policy(format!("{reason}. Only the user can approve this, in DataBrain's assistant; an MCP client can't")))
             }
             Decision::Ask(reason) | Decision::Confirm(reason) => {
-                if self.caller == Caller::Mcp && !self.host.can_ask() {
-                    // The client can't show DataBrain's question. Its own tool
-                    // approval is not the same thing (many clients auto-approve
-                    // tools), so it counts only where the connection says so.
+                if self.caller == Caller::Mcp {
+                    // The connection accepts the client's own tool approval:
+                    // the call already went through it, so DataBrain doesn't
+                    // ask again (whatever "AI may run queries" says).
                     if self.profile.ai_policy.mcp_client_approves {
                         self.audit(tool, detail, "approved by MCP client", Some(&reason));
                         return Ok(detail.clone());
                     }
-                    self.audit(tool, detail, "blocked", Some(&reason));
-                    return Err(AiError::Policy(format!(
-                        "{reason}. DataBrain asks the user before this, and {}. {MCP_ASK_HELP}",
-                        self.host.cannot_ask_reason()
-                    )));
+                    if !self.host.can_ask() {
+                        self.audit(tool, detail, "blocked", Some(&reason));
+                        return Err(AiError::Policy(format!(
+                            "{reason}. DataBrain asks the user before this, and {}. {}",
+                            self.host.cannot_ask_reason(),
+                            mcp_ask_help(&self.profile.name)
+                        )));
+                    }
                 }
                 // Stop ends the wait for the user's answer at once.
                 let question = format!("{reason}. {summary}");
@@ -50,8 +53,9 @@ impl ToolContext {
                     None if self.caller == Caller::Mcp && !self.host.can_ask() => {
                         self.audit(tool, detail, "denied", Some("no answer"));
                         Err(AiError::Policy(format!(
-                            "{reason}. DataBrain asked the user through this MCP client, but {}. {MCP_ASK_HELP}",
-                            self.host.cannot_ask_reason()
+                            "{reason}. DataBrain asked the user through this MCP client, but {}. {}",
+                            self.host.cannot_ask_reason(),
+                            mcp_ask_help(&self.profile.name)
                         )))
                     }
                     None => {

@@ -1051,7 +1051,7 @@ async fn mcp_unanswered_question_ends_the_call_and_is_not_asked_again() {
     assert_eq!(r["id"], 2, "{r}");
     assert_eq!(r["result"]["isError"], true, "{r}");
     let text = r["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("didn't answer") && text.contains("Accept the MCP client's approval") && text.contains("read-only"), "{text}");
+    assert!(text.contains("didn't answer") && text.contains("Accept the MCP client's approval") && text.contains("Edit connection"), "{text}");
     assert!(!text.contains("declined"), "{text}");
     let waited = started.elapsed();
     assert!(waited >= Duration::from_secs(5) && waited < Duration::from_secs(15), "{waited:?}");

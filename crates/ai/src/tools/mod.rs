@@ -24,15 +24,28 @@ use crate::types::{AiError, Result};
 pub enum Caller {
     /// In-app agent: `Ask` decisions go to the approval UI.
     Agent,
-    /// External MCP client: `Ask` decisions are denied unless auto-approved.
+    /// External MCP client: `Ask` decisions run on the client's approval
+    /// where the connection accepts it, else are asked through the client.
     Mcp,
     /// In-app agent answering without the database (a connection-settings
     /// question): no tool may connect, so nothing signs in.
     AgentNoDatabase,
 }
 
-/// What to do when an MCP client can't carry DataBrain's question.
-const MCP_ASK_HELP: &str = "Run it from DataBrain's assistant, set \"AI may run queries\" to automatic for read-only queries, or turn on \"Accept the MCP client's approval\" in the connection's AI settings";
+/// What to do when an MCP client can't carry DataBrain's question: a guide
+/// for the agent to pass on to the user.
+pub(crate) fn mcp_ask_help(connection: &str) -> String {
+    format!(
+        "Tell the user how to allow it: in DataBrain, right-click the connection \"{connection}\" → Edit connection → AI, tick \"Accept the MCP client's approval\" \
+         (under \"Allow external agents (MCP)\"), save, then try again. With it on, this client's own tool approval counts and DataBrain doesn't ask again. \
+         Or run it from DataBrain's assistant"
+    )
+}
+
+/// Tools only DataBrain's assistant has: what they do (save or run a job,
+/// with load steps that write into tables) needs the user's approval in the
+/// app, and an MCP client's tool approval doesn't stand in for it.
+pub(crate) const APP_ONLY_TOOLS: [&str; 3] = ["create_job", "update_job", "run_job"];
 
 /// Hooks into the host for tools that need the UI.
 #[async_trait::async_trait]
@@ -42,7 +55,8 @@ pub trait ToolHost: Send + Sync {
     async fn approve(&self, tool: &str, summary: &str, detail: &Value) -> Option<Value>;
     /// Whether `approve` can reach the user. The MCP server can only when the
     /// client supports elicitation (and answered so far); otherwise an Ask is
-    /// refused unless the connection accepts the client's own tool approval.
+    /// refused (a connection that accepts the client's own tool approval
+    /// doesn't ask at all).
     fn can_ask(&self) -> bool {
         true
     }
@@ -108,6 +122,11 @@ impl ToolContext {
     pub async fn call(&self, name: &str, args: &Value) -> ToolOutput {
         if self.caller == Caller::AgentNoDatabase {
             return out("ERROR: tools are off for this question (it is about connection settings, not data): answer from the text you were given", Value::Null);
+        }
+        if self.caller == Caller::Mcp && APP_ONLY_TOOLS.contains(&name) {
+            let e = format!("{name} is only available in DataBrain's assistant, not over MCP: jobs are created, changed and run there");
+            self.audit(name, args, "blocked", Some(&e));
+            return out(format!("ERROR: {e}"), json!({"error": e}));
         }
         let r = match name {
             "search_schema" => self.search_schema(args),

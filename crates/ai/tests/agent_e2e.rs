@@ -300,17 +300,37 @@ async fn denied_approval_and_blocked_writes() {
     let mcp = databrain_ai::ToolContext { caller: databrain_ai::Caller::Mcp, host: Arc::new(NoElicitation), ..ctx };
     let o = mcp.call("run_query", &json!({"sql": "select 1"})).await;
     assert!(o.content.starts_with("ERROR") && o.content.contains("elicitation"), "{}", o.content);
+    // The refusal tells the agent what the user can change.
+    assert!(o.content.contains("Edit connection") && o.content.contains("Accept the MCP client's approval"), "{}", o.content);
     assert!(f.ws.list_audit(50).unwrap().iter().any(|a| a.tool == "run_query" && a.decision == "blocked"));
     // …unless the connection accepts the client's approval.
     let mut trusting = f.ws.get_connection(&f.conn).unwrap();
     trusting.ai_policy.mcp_client_approves = true;
-    let mcp = databrain_ai::ToolContext { profile: trusting, ..mcp };
+    let mcp = databrain_ai::ToolContext { profile: trusting.clone(), ..mcp };
     let o = mcp.call("run_query", &json!({"sql": "select 1"})).await;
     assert!(o.content.contains("returned 1 row"), "{}", o.content);
     // What the policy forbids is refused either way.
     let o = mcp.call("run_query", &json!({"sql": "delete from orders"})).await;
     assert!(o.content.starts_with("ERROR") && o.content.contains("not allowed"), "{}", o.content);
     assert!(f.ws.list_audit(50).unwrap().iter().any(|a| a.tool == "run_query" && a.decision == "approved by MCP client"));
+    // A client that could ask isn't asked either: with "Ask me every time"
+    // (not auto-read), the client's approval is enough.
+    struct MustNotAsk;
+    #[async_trait::async_trait]
+    impl ToolHost for MustNotAsk {
+        async fn approve(&self, _: &str, _: &str, _: &Value) -> Option<Value> {
+            panic!("the connection accepts the client's approval: DataBrain doesn't ask")
+        }
+    }
+    assert_eq!(trusting.ai_policy.run_query, RunQueryPolicy::Ask);
+    let mcp = databrain_ai::ToolContext { host: Arc::new(MustNotAsk), ..mcp };
+    let o = mcp.call("run_query", &json!({"sql": "select country from orders"})).await;
+    assert!(o.content.contains("returned 3 rows"), "{}", o.content);
+    // Jobs: only in DataBrain's assistant.
+    for tool in ["create_job", "update_job", "run_job"] {
+        let o = mcp.call(tool, &json!({"name": "x", "job": "x", "nodes": []})).await;
+        assert!(o.content.starts_with("ERROR") && o.content.contains("only available in DataBrain's assistant"), "{tool}: {}", o.content);
+    }
     // Auto-read policy runs without prompts.
     let mut p = f.ws.get_connection(&f.conn).unwrap();
     p.ai_policy.run_query = RunQueryPolicy::AutoRead;
@@ -352,6 +372,11 @@ async fn mcp_server_lists_and_calls_tools() {
     let tools = resps[1]["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|t| t["name"] == "search_schema" && t["inputSchema"]["required"][0] == "connection"));
     assert!(!tools.iter().any(|t| t["name"] == "write_editor"));
+    // Jobs are read over MCP but created, changed and run only in the app.
+    assert!(tools.iter().any(|t| t["name"] == "list_jobs") && tools.iter().any(|t| t["name"] == "get_job"));
+    for app_only in ["create_job", "update_job", "run_job"] {
+        assert!(!tools.iter().any(|t| t["name"] == app_only), "{app_only} is not offered over MCP");
+    }
     // Annotations: read tools can be auto-approved, run_query can't.
     let ann = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap()["annotations"].clone();
     assert_eq!((ann("search_schema")["readOnlyHint"].clone(), ann("search_schema")["destructiveHint"].clone()), (json!(true), json!(false)));
@@ -1288,10 +1313,14 @@ async fn functions_that_could_write_need_the_user() {
     let o = agent.call("run_query", &call).await.content;
     assert!(o.contains("declined"), "{o}");
     assert_eq!(declines.approvals.load(Ordering::SeqCst), 1, "asked although reads run automatically");
-    // A job step calling it needs the user too.
+    // A job step calling it needs the user too (in the app; MCP can't create jobs at all).
     let job = json!({"name": "Fn", "steps": [{"name": "fn_step", "connection": "Warehouse", "sql": "select dbo.write_fn()"}]});
     let o = mcp.call("create_job", &job).await.content;
-    assert!(o.contains("step fn_step") && o.contains("an MCP client can't"), "{o}");
+    assert!(o.contains("only available in DataBrain's assistant"), "{o}");
+    let asked = declines.approvals.load(Ordering::SeqCst);
+    let o = agent.call("create_job", &job).await.content;
+    assert!(o.contains("declined"), "{o}");
+    assert_eq!(declines.approvals.load(Ordering::SeqCst), asked + 1, "the user was asked");
     assert!(f.ws.list_jobs().unwrap().is_empty());
 }
 
