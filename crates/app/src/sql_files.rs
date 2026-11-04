@@ -63,16 +63,16 @@ pub fn read_sql_file(path: &str) -> Result<SqlFile> {
 /// means another program changed it, and nothing is written.
 pub fn write_sql_file(path: &str, text: &str, expected_mtime: Option<i64>) -> Result<i64> {
     let p = Path::new(path);
-    if let (Some(want), Ok(now)) = (expected_mtime, mtime(p)) {
-        if want != now {
-            return Err(EngineError::new(
-                "conflict",
-                format!(
-                    "{} was changed by another program since it was opened",
-                    p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.into())
-                ),
-            ));
-        }
+    if let (Some(want), Ok(now)) = (expected_mtime, mtime(p))
+        && want != now
+    {
+        return Err(EngineError::new(
+            "conflict",
+            format!(
+                "{} was changed by another program since it was opened",
+                p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.into())
+            ),
+        ));
     }
     let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| "file.sql".into());

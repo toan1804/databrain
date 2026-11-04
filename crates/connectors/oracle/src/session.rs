@@ -117,10 +117,10 @@ impl Session for OracleSession {
     async fn server_version(&self) -> Result<String> {
         if let Backend::Thin(a) = &self.backend {
             for sql in ["select banner from v$version where rownum = 1", "select 'Oracle ' || version from product_component_version where rownum = 1"] {
-                if let Ok(rows) = a.text(sql, &[]).await {
-                    if let Some(v) = rows.into_iter().next().and_then(|r| r.into_iter().next().flatten()) {
-                        return Ok(v);
-                    }
+                if let Ok(rows) = a.text(sql, &[]).await
+                    && let Some(v) = rows.into_iter().next().and_then(|r| r.into_iter().next().flatten())
+                {
+                    return Ok(v);
                 }
             }
             return Ok("Oracle".into());

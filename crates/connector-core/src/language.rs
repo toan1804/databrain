@@ -185,10 +185,10 @@ pub fn mongo_table_refs(text: &str) -> crate::tables::TableRefs {
         Some(rest[..rest.find(q)?].to_string())
     };
     // `db.getSiblingDB("x")` picks the database.
-    if let Some(i) = lower.find("getsiblingdb(") {
-        if let Some(n) = quoted(&t[i + "getsiblingdb(".len()..]) {
-            db = Some(n);
-        }
+    if let Some(i) = lower.find("getsiblingdb(")
+        && let Some(n) = quoted(&t[i + "getsiblingdb(".len()..])
+    {
+        db = Some(n);
     }
     let name = |coll: String| match &db {
         Some(d) => vec![d.clone(), coll],

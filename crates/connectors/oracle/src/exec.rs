@@ -168,10 +168,10 @@ pub(crate) async fn thin_run(a: &agent::Agent, sql: &str, is_query: bool, opts: 
                     if cancelled {
                         return Err(ConnectorError::cancelled());
                     }
-                    if let Some((b, _)) = builder.as_mut() {
-                        if !b.is_empty() {
-                            tx.send(StreamEvent::Batch(b.finish()?)).await;
-                        }
+                    if let Some((b, _)) = builder.as_mut()
+                        && !b.is_empty()
+                    {
+                        tx.send(StreamEvent::Batch(b.finish()?)).await;
                     }
                     let rows_affected = j["rows_affected"].as_u64();
                     tx.send(StreamEvent::Done(ExecSummary { rows_affected })).await;
@@ -188,7 +188,7 @@ pub(crate) async fn thin_run(a: &agent::Agent, sql: &str, is_query: bool, opts: 
                 if *n != ncols {
                     return Err(ConnectorError::internal("Oracle driver sent a batch with the wrong column count"));
                 }
-                agent::decode_rows(&data, ncols, nrows, |row| b.push_row(row.into_iter()))?;
+                agent::decode_rows(&data, ncols, nrows, |row| b.push_row(row))?;
                 if b.is_full() && !tx.send(StreamEvent::Batch(b.finish()?)).await {
                     cancelled = true;
                     a.cancel(id).await;

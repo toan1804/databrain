@@ -185,10 +185,10 @@ pub async fn databricks_cli(profile: Option<&str>, host: &str) -> Result<TokenSe
 async fn databricks_cli_from(profiles: &[DatabricksProfile], profile: Option<&str>, host: &str) -> Result<TokenSet, AuthError> {
     let want = normalize_host(host);
     let chosen = choose_profile(profiles, profile, host)?;
-    if let Some(p) = chosen {
-        if let Some(t) = &p.token {
-            return Ok(TokenSet { access_token: t.clone(), refresh_token: None, expires_at: None, identity: Some(format!("databricks profile {}", p.name)) });
-        }
+    if let Some(p) = chosen
+        && let Some(t) = &p.token
+    {
+        return Ok(TokenSet { access_token: t.clone(), refresh_token: None, expires_at: None, identity: Some(format!("databricks profile {}", p.name)) });
     }
     let mut cmd = tokio::process::Command::new("databricks");
     cmd.args(["auth", "token"]);

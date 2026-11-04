@@ -53,10 +53,10 @@ impl Drop for FileDb {
             }
             drop(root);
         }
-        if let Ok(mut dbs) = FILE_DBS.lock() {
-            if dbs.get(&self.key).is_some_and(|w| w.strong_count() == 0) {
-                dbs.remove(&self.key);
-            }
+        if let Ok(mut dbs) = FILE_DBS.lock()
+            && dbs.get(&self.key).is_some_and(|w| w.strong_count() == 0)
+        {
+            dbs.remove(&self.key);
         }
     }
 }

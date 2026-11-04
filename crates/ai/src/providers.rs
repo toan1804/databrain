@@ -721,13 +721,13 @@ impl LlmProvider for Gemini {
                         })));
                     }
                 }
-                if let Some(u) = v.get("usageMetadata") {
-                    if v.pointer("/candidates/0/finishReason").is_some() {
-                        out.push(Ok(ChatEvent::Usage {
-                            input: u["promptTokenCount"].as_u64().unwrap_or(0) as u32,
-                            output: u["candidatesTokenCount"].as_u64().unwrap_or(0) as u32,
-                        }));
-                    }
+                if let Some(u) = v.get("usageMetadata")
+                    && v.pointer("/candidates/0/finishReason").is_some()
+                {
+                    out.push(Ok(ChatEvent::Usage {
+                        input: u["promptTokenCount"].as_u64().unwrap_or(0) as u32,
+                        output: u["candidatesTokenCount"].as_u64().unwrap_or(0) as u32,
+                    }));
                 }
                 if let Some(r) = v.pointer("/candidates/0/finishReason").and_then(|r| r.as_str()) {
                     out.push(Ok(ChatEvent::Done { stop_reason: r.to_lowercase() }));

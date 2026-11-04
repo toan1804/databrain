@@ -538,10 +538,10 @@ pub fn topo_order(job: &Job) -> std::result::Result<Vec<String>, Vec<String>> {
     let ids: Vec<&str> = job.nodes.iter().map(|n| n.id.as_str()).collect();
     let mut indeg: std::collections::HashMap<&str, usize> = ids.iter().map(|i| (*i, 0)).collect();
     for e in &job.edges {
-        if let Some(d) = indeg.get_mut(e.to.as_str()) {
-            if ids.contains(&e.from.as_str()) {
-                *d += 1;
-            }
+        if let Some(d) = indeg.get_mut(e.to.as_str())
+            && ids.contains(&e.from.as_str())
+        {
+            *d += 1;
         }
     }
     let mut ready: Vec<&str> = ids.iter().copied().filter(|i| indeg[i] == 0).collect();

@@ -197,10 +197,10 @@ impl Session for MssqlSession {
                         *g = None;
                     }
                     drop(g);
-                    if let Some(b) = last {
-                        if !tx.send(StreamEvent::Batch(b)).await {
-                            return;
-                        }
+                    if let Some(b) = last
+                        && !tx.send(StreamEvent::Batch(b)).await
+                    {
+                        return;
                     }
                     tx.send(StreamEvent::Done(ExecSummary::default())).await;
                 }

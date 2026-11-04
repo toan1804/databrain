@@ -290,11 +290,11 @@ fn arrow_tree(raw: &str) -> Vec<PlanNode> {
         let indent = line.len() - line.trim_start().len();
         let Some(body) = line.trim_start().strip_prefix("-> ") else {
             // Continuation of the previous step's text.
-            if let Some((_, n)) = stack.last_mut() {
-                if !line.trim().is_empty() {
-                    n.op.push(' ');
-                    n.op.push_str(line.trim());
-                }
+            if let Some((_, n)) = stack.last_mut()
+                && !line.trim().is_empty()
+            {
+                n.op.push(' ');
+                n.op.push_str(line.trim());
             }
             continue;
         };

@@ -122,10 +122,10 @@ impl Visitor for Refs {
             Expr::Function(f) => {
                 if f.over.is_some() {
                     self.window = true;
-                } else if let Some(ObjectNamePart::Identifier(n)) = f.name.0.last() {
-                    if AGGREGATES.contains(&n.value.to_lowercase().as_str()) {
-                        self.aggregate = true;
-                    }
+                } else if let Some(ObjectNamePart::Identifier(n)) = f.name.0.last()
+                    && AGGREGATES.contains(&n.value.to_lowercase().as_str())
+                {
+                    self.aggregate = true;
                 }
             }
             _ => {}

@@ -395,11 +395,12 @@ impl Scripts {
 /// plant or read them. Scripts older than a day are removed (their terminal
 /// has long read them). Falls back to a new private folder in the temp dir.
 fn script_dir() -> std::io::Result<PathBuf> {
-    if let Some(dir) = dirs::cache_dir().filter(|c| c.is_absolute()).map(|c| c.join("databrain").join("terminal")) {
-        if std::fs::create_dir_all(&dir).is_ok() && owner_only_dir(&dir).is_ok() {
-            prune_scripts(&dir, Duration::from_secs(24 * 3600));
-            return Ok(dir);
-        }
+    if let Some(dir) = dirs::cache_dir().filter(|c| c.is_absolute()).map(|c| c.join("databrain").join("terminal"))
+        && std::fs::create_dir_all(&dir).is_ok()
+        && owner_only_dir(&dir).is_ok()
+    {
+        prune_scripts(&dir, Duration::from_secs(24 * 3600));
+        return Ok(dir);
     }
     let dir = std::env::temp_dir().join(format!("databrain-terminal-{}", uuid::Uuid::new_v4().simple()));
     // `create_dir`, not `_all`: fails if anything is already there.

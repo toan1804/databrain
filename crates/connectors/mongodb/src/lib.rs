@@ -225,15 +225,15 @@ async fn run(s: &MongoSession, text: &str, opts: &ExecOptions, tx: &StreamSender
         Output::Document => {
             let mut d = db.run_command(plan.command).await.map_err(err)?;
             // Results of commands that return a cursor's first batch inline.
-            if let Ok(c) = d.get_document("cursor") {
-                if let Ok(batch) = c.get_array("firstBatch") {
-                    for b in batch.clone() {
-                        if let Bson::Document(x) = b {
-                            emit(tx, rows.push(row_of(x))?).await;
-                        }
+            if let Ok(c) = d.get_document("cursor")
+                && let Ok(batch) = c.get_array("firstBatch")
+            {
+                for b in batch.clone() {
+                    if let Bson::Document(x) = b {
+                        emit(tx, rows.push(row_of(x))?).await;
                     }
-                    return finish(rows, tx).await;
                 }
+                return finish(rows, tx).await;
             }
             d.remove("$clusterTime");
             d.remove("operationTime");

@@ -478,12 +478,12 @@ impl Inner {
         // Download the first external chunk before announcing the schema, so a
         // blocked link can still fall back to INLINE cleanly.
         let mut pending: Option<Vec<serde_json::Value>> = None;
-        if let Some(c) = &chunk {
-            if let Some(link) = first_link(c) {
-                match self.download(&statement_id, &link).await {
-                    Ok(rows) => pending = Some(rows),
-                    Err(e) => return Err(StreamFail::Links(e)),
-                }
+        if let Some(c) = &chunk
+            && let Some(link) = first_link(c)
+        {
+            match self.download(&statement_id, &link).await {
+                Ok(rows) => pending = Some(rows),
+                Err(e) => return Err(StreamFail::Links(e)),
             }
         }
         let Some(mut sink) = RowSink::start(&columns, opts.batch_size, tx).await else { return Ok(()) };

@@ -520,10 +520,12 @@ impl Agent {
         let all = if req.context.connections.is_empty() { vec![] } else { ws.list_connections()? };
         for want in &req.context.connections {
             let w = want.trim();
-            if let Some(p) = all.iter().find(|&p| p.id == w || p.name.eq_ignore_ascii_case(w)).cloned() {
-                if p.id != profile.id && p.ai_policy.ai_enabled && !others.iter().any(|o| o.id == p.id) {
-                    others.push(p);
-                }
+            if let Some(p) = all.iter().find(|&p| p.id == w || p.name.eq_ignore_ascii_case(w)).cloned()
+                && p.id != profile.id
+                && p.ai_policy.ai_enabled
+                && !others.iter().any(|o| o.id == p.id)
+            {
+                others.push(p);
             }
         }
         if !others.is_empty() {
@@ -769,7 +771,7 @@ mod tests {
 
     #[test]
     fn history_keeps_earlier_turns_in_order() {
-        let msgs = vec![Message::user("top 5 customers?"), Message::assistant("Here they are: …", vec![]), Message::user("and by month?")];
+        let msgs = [Message::user("top 5 customers?"), Message::assistant("Here they are: …", vec![]), Message::user("and by month?")];
         let h = history_text(&msgs[..2]);
         assert_eq!(h, "User: top 5 customers?\n\nAssistant: Here they are: …");
         assert!(history_text(&[]).is_empty());

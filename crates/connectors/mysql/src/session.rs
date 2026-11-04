@@ -195,16 +195,15 @@ impl Session for MysqlSession {
             ),
         )
         .await
+            && let Some(r) = p.first()
         {
-            if let Some(r) = p.first() {
-                l.partition_kind = r[0].as_deref().map(|m| m.to_ascii_lowercase());
-                l.partition_by = r[1]
-                    .as_deref()
-                    .map(|e| databrain_connector_core::split_key_list(e).into_iter().map(|x| databrain_connector_core::unquote_ident(&x)).collect())
-                    .unwrap_or_default();
-                if let Some(n) = &r[2] {
-                    l.notes.push(format!("{n} partitions"));
-                }
+            l.partition_kind = r[0].as_deref().map(|m| m.to_ascii_lowercase());
+            l.partition_by = r[1]
+                .as_deref()
+                .map(|e| databrain_connector_core::split_key_list(e).into_iter().map(|x| databrain_connector_core::unquote_ident(&x)).collect())
+                .unwrap_or_default();
+            if let Some(n) = &r[2] {
+                l.notes.push(format!("{n} partitions"));
             }
         }
         if let Ok(r) = query_text(

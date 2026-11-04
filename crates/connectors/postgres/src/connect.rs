@@ -45,11 +45,11 @@ pub(crate) async fn open_link(
     let task = tokio::spawn(async move {
         let _ = connection.await;
     });
-    if let Some(sql) = init {
-        if let Err(e) = client.batch_execute(sql).await {
-            task.abort();
-            return Err(map_err(&e));
-        }
+    if let Some(sql) = init
+        && let Err(e) = client.batch_execute(sql).await
+    {
+        task.abort();
+        return Err(map_err(&e));
     }
     Ok((client, task.abort_handle()))
 }

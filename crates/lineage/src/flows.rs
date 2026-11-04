@@ -59,10 +59,10 @@ pub(crate) fn flows(g: &Lineage) -> Vec<TableFlow> {
     let at: HashMap<&str, usize> = g.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
     let mut into: HashMap<usize, Vec<&Edge>> = HashMap::new();
     for e in &g.edges {
-        if let (Some(&f), Some(&t)) = (at.get(e.from.as_str()), at.get(e.to.as_str())) {
-            if f != t {
-                into.entry(t).or_default().push(e);
-            }
+        if let (Some(&f), Some(&t)) = (at.get(e.from.as_str()), at.get(e.to.as_str()))
+            && f != t
+        {
+            into.entry(t).or_default().push(e);
         }
     }
     let mut out: Vec<TableFlow> = Vec::new();

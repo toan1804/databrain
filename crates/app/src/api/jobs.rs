@@ -65,18 +65,18 @@ pub fn save_job(state: &AppState, mut job: databrain_workspace::Job) -> Result<d
 /// job's step, a named output of a query tab or notebook, or a notebook
 /// cell's output name. `None` when it's free.
 pub fn output_name_user(state: &AppState, name: &str, job_id: &str) -> Result<Option<String>> {
-    if let Some(o) = state.workspace.job_step_owner(name)? {
-        if o.job_id != job_id {
-            return Ok(Some(o.describe()));
-        }
+    if let Some(o) = state.workspace.job_step_owner(name)?
+        && o.job_id != job_id
+    {
+        return Ok(Some(o.describe()));
     }
     // Outputs of job steps don't count: step names decide (a renamed or
     // deleted step's old outputs don't keep its name taken).
-    if let Some(o) = state.engine.outputs().resolve(name).filter(|o| o.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name))) {
-        if !o.tab_id.starts_with("job:") {
-            let from = if o.tab_id.starts_with("nb:") { "a notebook cell" } else { "a query tab" };
-            return Ok(Some(format!("output {} (from {from}); rename or remove it first", o.handle)));
-        }
+    if let Some(o) = state.engine.outputs().resolve(name).filter(|o| o.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+        && !o.tab_id.starts_with("job:")
+    {
+        let from = if o.tab_id.starts_with("nb:") { "a notebook cell" } else { "a query tab" };
+        return Ok(Some(format!("output {} (from {from}); rename or remove it first", o.handle)));
     }
     for nb in state.workspace.list_notebooks()? {
         let Ok(nb) = state.workspace.get_notebook(&nb.id) else { continue };

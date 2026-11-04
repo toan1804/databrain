@@ -62,7 +62,7 @@ mod tests {
         let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec![Some("1.50"), None]))]).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.parquet");
-        assert_eq!(write_snapshot(&p, schema.clone(), &[b.clone()]).unwrap(), 2);
+        assert_eq!(write_snapshot(&p, schema.clone(), std::slice::from_ref(&b)).unwrap(), 2);
         let (s2, bs) = read_snapshot(&p).unwrap();
         assert_eq!(s2.field(0).metadata(), schema.field(0).metadata());
         assert_eq!(bs[0], b);

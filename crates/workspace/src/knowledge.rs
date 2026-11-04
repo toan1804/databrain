@@ -732,10 +732,10 @@ impl Workspace {
             return Ok(Some((o, None)));
         }
         let Some((table, col)) = path.rsplit_once('.') else { return Ok(None) };
-        if let Some(o) = self.kn_get(connection_id, table)? {
-            if let Some(c) = o.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)).map(|c| c.name.clone()) {
-                return Ok(Some((o, Some(c))));
-            }
+        if let Some(o) = self.kn_get(connection_id, table)?
+            && let Some(c) = o.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)).map(|c| c.name.clone())
+        {
+            return Ok(Some((o, Some(c))));
         }
         Ok(None)
     }
@@ -773,13 +773,12 @@ impl Workspace {
         n.target = n.target.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
         let c = self.conn.lock();
         // Approving an update: the new text takes the old note's place.
-        if n.status == NoteStatus::Approved {
-            if let Some(old) = n.replaces.take() {
-                if old != n.id {
-                    c.execute("DELETE FROM kn_notes WHERE id = ?1 AND connection_id = ?2", params![old, n.connection_id])?;
-                    c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [&old])?;
-                }
-            }
+        if n.status == NoteStatus::Approved
+            && let Some(old) = n.replaces.take()
+            && old != n.id
+        {
+            c.execute("DELETE FROM kn_notes WHERE id = ?1 AND connection_id = ?2", params![old, n.connection_id])?;
+            c.execute("DELETE FROM kn_fts WHERE source = 'note' AND ref = ?1", [&old])?;
         }
         c.execute(
             "INSERT INTO kn_notes (id, connection_id, target, body, author, status, created_at, replaces) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \

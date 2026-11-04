@@ -146,11 +146,11 @@ impl Visitor for Collector<'_> {
             self.writes_at.push(self.depth);
         }
         // DROP's names are not visited as relations.
-        if let Statement::Drop { object_type, names, .. } = s {
-            if matches!(object_type, ObjectType::Table | ObjectType::View | ObjectType::MaterializedView) {
-                for n in names {
-                    self.writes.push(parts(n));
-                }
+        if let Statement::Drop { object_type, names, .. } = s
+            && matches!(object_type, ObjectType::Table | ObjectType::View | ObjectType::MaterializedView)
+        {
+            for n in names {
+                self.writes.push(parts(n));
             }
         }
         ControlFlow::Continue(())

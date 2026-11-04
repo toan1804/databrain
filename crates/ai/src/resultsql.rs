@@ -187,10 +187,10 @@ mod tests {
         )
         .unwrap();
         let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let t = query(&names, &[b.clone()], "select region, sum(amount) s from result group by 1 order by 1", 10).unwrap();
+        let t = query(&names, std::slice::from_ref(&b), "select region, sum(amount) s from result group by 1 order by 1", 10).unwrap();
         assert_eq!(t.columns, vec!["region", "s"]);
         assert_eq!(t.rows[0], vec![serde_json::json!("EU"), serde_json::json!(12.5)]);
-        assert!(query(&names, &[b.clone()], "delete from result", 10).is_err());
+        assert!(query(&names, std::slice::from_ref(&b), "delete from result", 10).is_err());
         assert!(query(&names, &[b], "select * from result", 1).unwrap().truncated);
     }
 }

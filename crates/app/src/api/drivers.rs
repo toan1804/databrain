@@ -184,15 +184,15 @@ pub async fn oracle_client_status(
 ) -> Result<databrain_connector_oracle::client::ClientStatus> {
     let extra: Vec<PathBuf> = app_dir.into_iter().map(|d| d.join("oracle")).collect();
     let st = blocking(move || Ok(databrain_connector_oracle::client::status(lib_dir.as_deref(), &extra))).await?;
-    if st.installed {
-        if let Some(d) = &st.lib_dir {
-            // Remember the folder for connections that don't set one.
-            if databrain_connector_oracle::client::default_dir().is_none() {
-                let (ws, dir) = (state.workspace.clone(), d.clone());
-                blocking(move || trust_oracle_client(&ws, &dir)).await?;
-                databrain_connector_oracle::client::set_default_dir(Some(d.clone()));
-                state.workspace.set_setting(ORACLE_CLIENT_SETTING, &serde_json::json!(d))?;
-            }
+    if st.installed
+        && let Some(d) = &st.lib_dir
+    {
+        // Remember the folder for connections that don't set one.
+        if databrain_connector_oracle::client::default_dir().is_none() {
+            let (ws, dir) = (state.workspace.clone(), d.clone());
+            blocking(move || trust_oracle_client(&ws, &dir)).await?;
+            databrain_connector_oracle::client::set_default_dir(Some(d.clone()));
+            state.workspace.set_setting(ORACLE_CLIENT_SETTING, &serde_json::json!(d))?;
         }
     }
     Ok(st)

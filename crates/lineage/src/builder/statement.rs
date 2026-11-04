@@ -20,10 +20,10 @@ impl<'a> Builder<'a> {
             Statement::Query(q) if select_into(q).is_some() => {
                 let target = select_into(q).unwrap();
                 let id = self.write_into(&target.0, q, &[], true, &Env::default());
-                if target.1 {
-                    if let Some(t) = self.g.nodes.iter().position(|n| n.id == id) {
-                        self.g.nodes[t].temporary = true;
-                    }
+                if target.1
+                    && let Some(t) = self.g.nodes.iter().position(|n| n.id == id)
+                {
+                    self.g.nodes[t].temporary = true;
                 }
                 self.g.statements.push(info("select_into", Some(range), Some(id)));
             }
@@ -70,10 +70,10 @@ impl<'a> Builder<'a> {
                 let names: Vec<String> = ct.columns.iter().map(|c| c.name.value.clone()).collect();
                 let defines = !self.exists_already(&ct.name, ct.if_not_exists);
                 let id = self.write_into(&ct.name, q, &names, defines, &Env::default());
-                if ct.temporary {
-                    if let Some(t) = self.g.nodes.iter().position(|n| n.id == id) {
-                        self.g.nodes[t].temporary = true;
-                    }
+                if ct.temporary
+                    && let Some(t) = self.g.nodes.iter().position(|n| n.id == id)
+                {
+                    self.g.nodes[t].temporary = true;
                 }
                 let qr = qrange(self, q);
                 self.g.statements.push(info("create_table_as", qr, Some(id)));

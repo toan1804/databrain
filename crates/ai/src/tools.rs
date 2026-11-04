@@ -979,10 +979,10 @@ impl ToolContext {
             if !pii && info.total_rows > 0 {
                 if let Ok(st) = g.column_stats(&view, i) {
                     s.push_str(&format!(" nulls={} distinct={}", st.nulls, st.distinct));
-                    if pol.share_sample_values || pol.share_result_rows {
-                        if let (Some(mn), Some(mx)) = (&st.min, &st.max) {
-                            s.push_str(&format!(" min={} max={}", trunc(mn, 40), trunc(mx, 40)));
-                        }
+                    if (pol.share_sample_values || pol.share_result_rows)
+                        && let (Some(mn), Some(mx)) = (&st.min, &st.max)
+                    {
+                        s.push_str(&format!(" min={} max={}", trunc(mn, 40), trunc(mx, 40)));
                     }
                 }
             } else if pii {

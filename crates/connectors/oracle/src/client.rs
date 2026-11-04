@@ -153,11 +153,11 @@ pub fn candidate_dirs(extra: &[PathBuf]) -> Vec<PathBuf> {
             consider(s);
         }
         // /usr/lib/oracle/<ver>/client64/lib (Linux RPM layout)
-        if root.ends_with("oracle") {
-            if let Ok(rd) = std::fs::read_dir(&root) {
-                for e in rd.filter_map(|e| e.ok()) {
-                    consider(e.path().join("client64").join("lib"));
-                }
+        if root.ends_with("oracle")
+            && let Ok(rd) = std::fs::read_dir(&root)
+        {
+            for e in rd.filter_map(|e| e.ok()) {
+                consider(e.path().join("client64").join("lib"));
             }
         }
     }
@@ -508,8 +508,8 @@ mod tests {
         std::fs::write(ic.join(library_name()), b"").unwrap();
         set_default_dir(None);
         assert_eq!(chosen_dir(None, &[]), None, "nothing chosen: nothing found elsewhere is used");
-        assert_eq!(chosen_dir(None, &[own.clone()]).map(PathBuf::from), Some(ic.clone()), "DataBrain's own install folder");
-        assert_eq!(chosen_dir(Some("/x/chosen"), &[own.clone()]).as_deref(), Some("/x/chosen"), "the connection's choice first");
+        assert_eq!(chosen_dir(None, std::slice::from_ref(&own)).map(PathBuf::from), Some(ic.clone()), "DataBrain's own install folder");
+        assert_eq!(chosen_dir(Some("/x/chosen"), std::slice::from_ref(&own)).as_deref(), Some("/x/chosen"), "the connection's choice first");
         assert!(matches!(init_client(None, &[]), Err(InitError::Load(_)) | Ok(())), "never loads an unchosen folder");
         let _ = std::fs::remove_dir_all(&own);
     }
@@ -524,7 +524,7 @@ mod tests {
             std::fs::write(d.join(library_name()), b"").unwrap();
         }
         std::fs::create_dir_all(dir.join("instantclient_empty")).unwrap();
-        let found = candidate_dirs(&[dir.clone()]);
+        let found = candidate_dirs(std::slice::from_ref(&dir));
         assert_eq!(&found[..2], &[new.clone(), old.clone()]);
         assert!(!found.contains(&dir.join("instantclient_empty")));
         let _ = std::fs::remove_dir_all(&dir);

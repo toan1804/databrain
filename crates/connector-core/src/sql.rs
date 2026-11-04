@@ -1546,10 +1546,10 @@ pub fn redact_secrets(sql: &str) -> String {
                         j = skip_ws(e2);
                         if let Some((_, e3)) = word_at(j).or_else(|| (j < n && matches!(b[j], b'\'' | b'"' | b'`')).then(|| (j, literal_end(j)))) {
                             j = skip_ws(e3);
-                            if let Some((s4, e4)) = word_at(j) {
-                                if matches!(lower(s4, e4).as_str(), "by" | "as") {
-                                    value_at = Some(skip_ws(e4));
-                                }
+                            if let Some((s4, e4)) = word_at(j)
+                                && matches!(lower(s4, e4).as_str(), "by" | "as")
+                            {
+                                value_at = Some(skip_ws(e4));
                             }
                         }
                     }
@@ -1578,12 +1578,10 @@ pub fn redact_secrets(sql: &str) -> String {
                 i = end;
                 continue;
             }
-            if bare_ok {
-                if let Some((s2, e2)) = word_at(v) {
-                    cut.push((s2, e2, None));
-                    i = e2;
-                    continue;
-                }
+            if bare_ok && let Some((s2, e2)) = word_at(v) {
+                cut.push((s2, e2, None));
+                i = e2;
+                continue;
             }
         }
         i = e;
@@ -1621,13 +1619,13 @@ pub fn redact_url_passwords(text: &str) -> String {
         rest = &rest[start..];
         // The authority: up to the path, query, fragment or the end of the URL in the text.
         let end = rest.find(|c: char| matches!(c, '/' | '?' | '#' | '\'' | '"' | '`' | '<' | '>' | '(' | ')') || c.is_whitespace()).unwrap_or(rest.len());
-        if let Some(at) = rest[..end].rfind('@') {
-            if let Some(colon) = rest[..at].find(':') {
-                out.push_str(&rest[..colon + 1]);
-                out.push_str("***");
-                rest = &rest[at..];
-                continue;
-            }
+        if let Some(at) = rest[..end].rfind('@')
+            && let Some(colon) = rest[..at].find(':')
+        {
+            out.push_str(&rest[..colon + 1]);
+            out.push_str("***");
+            rest = &rest[at..];
+            continue;
         }
     }
     out.push_str(rest);

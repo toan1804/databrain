@@ -207,10 +207,10 @@ fn coll_method(
                 return Err(format!("{method}: the update must be a document or a pipeline"));
             }
             let mut one = doc! {"q": q, "u": u, "multi": method == "updateMany"};
-            if let Some(o) = opt_doc(2)? {
-                if let Some(up) = o.get("upsert") {
-                    one.insert("upsert", up.clone());
-                }
+            if let Some(o) = opt_doc(2)?
+                && let Some(up) = o.get("upsert")
+            {
+                one.insert("upsert", up.clone());
             }
             plan(doc! {"update": coll, "updates": [one]}, Output::Write)
         }
@@ -397,25 +397,23 @@ fn helpers(text: &str) -> String {
             continue;
         }
         let prev_word = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$');
-        if !prev_word {
-            if let Some(h) = H.iter().find(|h| text[i..].starts_with(*h) && text[i + h.len()..].trim_start().starts_with('(')) {
-                let open = i + h.len() + (text[i + h.len()..].len() - text[i + h.len()..].trim_start().len());
-                if let Some(close) = matching(b, open) {
-                    let inner = text[open + 1..close].trim();
-                    let unq = inner.trim_matches(|c| c == '"' || c == '\'');
-                    let rep = match *h {
-                        "ObjectId" => format!("{{\"$oid\": \"{unq}\"}}"),
-                        "ISODate" | "new Date" | "Date" if inner.is_empty() => format!("{{\"$date\": {{\"$numberLong\": \"{}\"}}}}", now_ms()),
-                        "ISODate" | "new Date" | "Date" => format!("{{\"$date\": \"{}\"}}", iso(unq)),
-                        "NumberLong" => format!("{{\"$numberLong\": \"{unq}\"}}"),
-                        "NumberInt" => unq.to_string(),
-                        "NumberDecimal" => format!("{{\"$numberDecimal\": \"{unq}\"}}"),
-                        _ => format!("{{\"$uuid\": \"{unq}\"}}"),
-                    };
-                    out.push_str(&rep);
-                    i = close + 1;
-                    continue;
-                }
+        if !prev_word && let Some(h) = H.iter().find(|h| text[i..].starts_with(*h) && text[i + h.len()..].trim_start().starts_with('(')) {
+            let open = i + h.len() + (text[i + h.len()..].len() - text[i + h.len()..].trim_start().len());
+            if let Some(close) = matching(b, open) {
+                let inner = text[open + 1..close].trim();
+                let unq = inner.trim_matches(|c| c == '"' || c == '\'');
+                let rep = match *h {
+                    "ObjectId" => format!("{{\"$oid\": \"{unq}\"}}"),
+                    "ISODate" | "new Date" | "Date" if inner.is_empty() => format!("{{\"$date\": {{\"$numberLong\": \"{}\"}}}}", now_ms()),
+                    "ISODate" | "new Date" | "Date" => format!("{{\"$date\": \"{}\"}}", iso(unq)),
+                    "NumberLong" => format!("{{\"$numberLong\": \"{unq}\"}}"),
+                    "NumberInt" => unq.to_string(),
+                    "NumberDecimal" => format!("{{\"$numberDecimal\": \"{unq}\"}}"),
+                    _ => format!("{{\"$uuid\": \"{unq}\"}}"),
+                };
+                out.push_str(&rep);
+                i = close + 1;
+                continue;
             }
         }
         out.push(c as char);

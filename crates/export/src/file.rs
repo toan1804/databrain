@@ -161,7 +161,7 @@ mod tests {
         let p = dir.path().join("x.parquet");
         let mut o = ExportOptions::new(ExportFormat::Parquet);
         o.columns = vec![0, 1];
-        assert_eq!(export_file(&p, b.schema(), &[b.clone()], o).unwrap(), 2);
+        assert_eq!(export_file(&p, b.schema(), std::slice::from_ref(&b), o).unwrap(), 2);
         let r = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&p).unwrap()).unwrap().build().unwrap();
         let got: Vec<RecordBatch> = r.collect::<std::result::Result<_, _>>().unwrap();
         assert_eq!(got[0].num_columns(), 2);
@@ -174,7 +174,7 @@ mod tests {
         let b = batch();
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("x.xlsx");
-        assert_eq!(export_file(&p, b.schema(), &[b.clone()], ExportOptions::new(ExportFormat::Xlsx)).unwrap(), 2);
+        assert_eq!(export_file(&p, b.schema(), std::slice::from_ref(&b), ExportOptions::new(ExportFormat::Xlsx)).unwrap(), 2);
         let bytes = std::fs::read(&p).unwrap();
         assert_eq!(&bytes[..2], b"PK");
         assert!(export_to_string(b.schema(), [&b], ExportOptions::new(ExportFormat::Xlsx)).is_err());
@@ -210,7 +210,7 @@ mod tests {
             std::fs::write(&target, "keep").unwrap();
             let link = dir.path().join("link.csv");
             std::os::unix::fs::symlink(&target, &link).unwrap();
-            assert_eq!(export_file(&link, b.schema(), &[b.clone()], ExportOptions::new(ExportFormat::Csv)).unwrap(), 2);
+            assert_eq!(export_file(&link, b.schema(), std::slice::from_ref(&b), ExportOptions::new(ExportFormat::Csv)).unwrap(), 2);
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep", "not written through the link");
             assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         }

@@ -583,10 +583,10 @@ async fn explorer_cache_sqlite() {
     assert!(!cached_columns(&st, &p.id, &main, "a").unwrap().unwrap().stale);
     assert!(st.engine.connected_ids().is_empty(), "cache reads never connect");
 
-    let r = revalidate_explorer(&st, &p.id, &[main.clone()], true).await.unwrap();
+    let r = revalidate_explorer(&st, &p.id, std::slice::from_ref(&main), true).await.unwrap();
     assert!(r.fingerprints);
     // First check records the fingerprint (one listing), then nothing.
-    let r = revalidate_explorer(&st, &p.id, &[main.clone()], true).await.unwrap();
+    let r = revalidate_explorer(&st, &p.id, std::slice::from_ref(&main), true).await.unwrap();
     assert_eq!((r.refreshed.len(), r.unchanged), (0, 1), "{r:?}");
     assert!(revalidate_explorer(&st, &p.id, &[], false).await.unwrap().skipped, "checked moments ago");
 

@@ -167,12 +167,13 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
@@ -771,10 +772,8 @@ fn parse_dbeaver(text: &str, creds: &HashMap<String, (Option<String>, Option<Str
         }
         if kind == ConnectorKind::Oracle {
             let service = conf.get("provider-properties").and_then(|p| s(p, "@dbeaver-sid-service@")).is_some_and(|t| t.eq_ignore_ascii_case("SERVICE"));
-            if service {
-                if let Some(db) = cfg.database.take() {
-                    cfg.options.insert("service_name".into(), db);
-                }
+            if service && let Some(db) = cfg.database.take() {
+                cfg.options.insert("service_name".into(), db);
             }
         }
         if let Some(ssh) = conf.get("handlers").and_then(|h| h.get("ssh_tunnel")).filter(|h| h.get("enabled").and_then(Value::as_bool) == Some(true)) {

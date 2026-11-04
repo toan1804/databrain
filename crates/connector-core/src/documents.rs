@@ -130,10 +130,10 @@ impl RowBatcher {
                     seen.push(Vec::new());
                     names.len() - 1
                 });
-                if let Some(t) = col_type(&c.value) {
-                    if !seen[i].contains(&(t, c.db_type)) {
-                        seen[i].push((t, c.db_type));
-                    }
+                if let Some(t) = col_type(&c.value)
+                    && !seen[i].contains(&(t, c.db_type))
+                {
+                    seen[i].push((t, c.db_type));
                 }
             }
         }

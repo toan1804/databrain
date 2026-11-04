@@ -6,7 +6,7 @@
 /// EWKT of a hex (E)WKB value; `None` when it isn't one (or is a curve type
 /// this doesn't decode), so the caller keeps the original text.
 pub fn hex_ewkb_to_ewkt(hex: &str) -> Option<String> {
-    if hex.len() < 10 || hex.len() % 2 != 0 {
+    if hex.len() < 10 || !hex.len().is_multiple_of(2) {
         return None;
     }
     let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect::<Option<_>>()?;

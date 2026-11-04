@@ -160,10 +160,10 @@ impl QueryEngine {
         test_id: Option<&str>,
     ) -> Result<TestResult> {
         let token = CancellationToken::new();
-        if let Some(id) = test_id {
-            if let Some(old) = self.tests.lock().insert(id.to_string(), token.clone()) {
-                old.cancel();
-            }
+        if let Some(id) = test_id
+            && let Some(old) = self.tests.lock().insert(id.to_string(), token.clone())
+        {
+            old.cancel();
         }
         let limit = (!cfg.auth.is_interactive()).then(|| self.connect_timeout_for(cfg));
         // One-time setup (a driver download) first, outside the time limit.

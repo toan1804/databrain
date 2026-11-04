@@ -117,10 +117,11 @@ pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &St
             }
         }
     }
-    if let Some(b) = builder.as_mut() {
-        if !b.is_empty() && !tx.send(StreamEvent::Batch(b.finish()?)).await {
-            return Ok(Ended::Complete);
-        }
+    if let Some(b) = builder.as_mut()
+        && !b.is_empty()
+        && !tx.send(StreamEvent::Batch(b.finish()?)).await
+    {
+        return Ok(Ended::Complete);
     }
     if extra_sets > 0 {
         tx.send(StreamEvent::Notice(format!("{extra_sets} additional result set(s) not shown"))).await;
