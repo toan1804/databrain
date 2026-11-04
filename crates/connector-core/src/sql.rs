@@ -1635,13 +1635,191 @@ pub fn redact_url_passwords(text: &str) -> String {
 }
 
 /// What DataBrain keeps of text that may quote SQL or connection strings
-/// (AI transcripts and audit): [`redact_secrets`] and [`redact_url_passwords`].
+/// (query history, job logs, AI transcripts and audit): [`redact_secrets`],
+/// [`redact_url_passwords`] and [`redact_key_values`].
 /// Text in double quotes is redacted too: error messages quote the SQL they
 /// failed on that way (`syntax error at or near "PASSWORD 'pw'"`).
 pub fn redact_text(text: &str) -> String {
     let sql = redact_secrets(text);
     let quoted = sql.split('"').enumerate().map(|(i, part)| if i % 2 == 1 { redact_secrets(part) } else { part.to_string() }).collect::<Vec<_>>().join("\"");
-    redact_url_passwords(&quoted)
+    redact_key_values(&redact_url_passwords(&quoted))
+}
+
+/// Is `name` (lower case, without a leading `@`) the name of a secret?
+/// `password`, `pwd`, `master_password`, `rmtpassword`, `client_secret`,
+/// `api_key`… A suffix is enough: drivers and procedures prefix them.
+fn secret_name(name: &str) -> bool {
+    const ENDS: &[&str] = &["password", "passwd", "pwd", "secret", "secret_key", "secretkey", "access_key", "accesskey", "api_key", "apikey", "_token", "passphrase"];
+    SECRET_WORDS.contains(&name) || ENDS.iter().any(|e| name.ends_with(e))
+}
+
+/// `text` with the value of every `name = value` / `name: value` whose name
+/// is a secret's ([`secret_name`]) replaced by `***`:
+/// `MASTER_PASSWORD='pw'`, `@rmtpassword = N'pw'`, `{user: "u", pwd: "pw"}`,
+/// `"password": "pw"`, and inside strings, where connection strings put
+/// bare values: `'Driver=…;UID=u;PWD=pw;'`, `'host=h password=pw'`,
+/// `'jdbc:…;password=pw'`, `?user=u&password=pw`. Outside strings and
+/// comments only quoted values change, so `where password = hash` stays.
+pub fn redact_key_values(text: &str) -> String {
+    let b = text.as_bytes();
+    let n = b.len();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let skip_ws = |mut i: usize| {
+        while i < n && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        i
+    };
+    // End (exclusive, after the closing quote) of a quoted value at `i`.
+    let quoted_end = |i: usize| -> usize {
+        let q = b[i];
+        let mut j = i + 1;
+        while j < n {
+            if b[j] == q {
+                if j + 1 < n && b[j + 1] == q {
+                    j += 2;
+                    continue;
+                }
+                return j + 1;
+            }
+            if b[j] == b'\\' && j + 1 < n {
+                j += 2;
+                continue;
+            }
+            j += 1;
+        }
+        n
+    };
+    let mut cut: Vec<(usize, usize)> = Vec::new();
+    // The quote of the SQL string we are in, or b'-' / b'*' in a comment.
+    let mut inside: Option<u8> = None;
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        match inside {
+            None if c == b'-' && i + 1 < n && b[i + 1] == b'-' => {
+                inside = Some(b'-');
+                i += 2;
+                continue;
+            }
+            None if c == b'/' && i + 1 < n && b[i + 1] == b'*' => {
+                inside = Some(b'*');
+                i += 2;
+                continue;
+            }
+            None if c == b'\'' => {
+                inside = Some(c);
+                i += 1;
+                continue;
+            }
+            Some(b'-') if c == b'\n' => inside = None,
+            Some(b'*') if c == b'*' && i + 1 < n && b[i + 1] == b'/' => {
+                inside = None;
+                i += 2;
+                continue;
+            }
+            Some(q) if q == c && !matches!(q, b'-' | b'*') => {
+                if i + 1 < n && b[i + 1] == q {
+                    i += 2;
+                    continue;
+                }
+                inside = None;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        // A name: letters after a non-identifier character (`@` allowed in front).
+        if !(c.is_ascii_alphabetic() || c == b'_') || (i > 0 && ident(b[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let mut e = i;
+        while e < n && ident(b[e]) {
+            e += 1;
+        }
+        let name = text[i..e].to_ascii_lowercase();
+        if !secret_name(&name) {
+            i = e;
+            continue;
+        }
+        // `"password": …` / `'pwd': …`: the name's own closing quote.
+        let mut j = e;
+        let mut name_quote = None;
+        if j < n && matches!(b[j], b'"' | b'\'') && i > 0 && b[i - 1] == b[j] {
+            name_quote = Some(b[j]);
+            j += 1;
+        }
+        j = skip_ws(j);
+        // `=`, `:`, `:=` or `=>` (named arguments), not `==` or `::` (a cast).
+        let sep = j < n && match b[j] {
+            b'=' => !(j + 1 < n && b[j + 1] == b'='),
+            b':' => !(j + 1 < n && b[j + 1] == b':'),
+            _ => false,
+        };
+        if !sep {
+            i = e;
+            continue;
+        }
+        j += if j + 1 < n && matches!((b[j], b[j + 1]), (b':', b'=') | (b'=', b'>')) { 2 } else { 1 };
+        j = skip_ws(j);
+        // N'…' (SQL Server), E'…' (Postgres).
+        if j + 1 < n && matches!(b[j], b'N' | b'n' | b'E' | b'e') && b[j + 1] == b'\'' {
+            j += 1;
+        }
+        if j >= n {
+            break;
+        }
+        // The quote that closes the string we're in ends a bare value there.
+        let in_string = match inside {
+            Some(q) if name_quote == Some(q) => None,
+            other => other,
+        };
+        if matches!(b[j], b'\'' | b'"' | b'`') && Some(b[j]) != in_string {
+            let end = quoted_end(j);
+            // Unterminated: to the end.
+            let close = if end == n && (end == j + 1 || b[n - 1] != b[j]) { n } else { end - 1 };
+            if close > j + 1 {
+                cut.push((j + 1, close));
+            }
+            i = end;
+            continue;
+        }
+        if in_string.is_none() {
+            i = e;
+            continue;
+        }
+        // A bare value in a string or comment: to the next separator (`{…}` whole).
+        let closing = in_string.filter(|q| !matches!(q, b'-' | b'*'));
+        let end = if b[j] == b'{' {
+            text[j..].find('}').map(|k| j + k + 1).unwrap_or(n)
+        } else {
+            let mut k = j;
+            while k < n && !matches!(b[k], b';' | b',' | b'&' | b')' | b'}' | b' ' | b'\t' | b'\r' | b'\n') && Some(b[k]) != closing {
+                k += 1;
+            }
+            k
+        };
+        if end > j && &text[j..end] != "***" {
+            cut.push((j, end));
+        }
+        i = end;
+    }
+    if cut.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (s, e) in cut {
+        if s < last {
+            continue;
+        }
+        out.push_str(&text[last..s]);
+        out.push_str("***");
+        last = e;
+    }
+    out.push_str(&text[last..]);
+    out
 }
 
 #[cfg(test)]
@@ -1675,6 +1853,43 @@ mod redaction_tests {
         assert_eq!(redact_secrets("pw = 'x'"), "pw = 'x'");
         // Unterminated literal: redacted to the end.
         assert_eq!(redact_secrets("alter role r password 'unfinished"), "alter role r password '***'");
+    }
+
+    /// What query history and job logs keep goes through [`redact_text`]: the
+    /// forms the SQL-only pass missed.
+    #[test]
+    fn redacts_key_value_passwords() {
+        for (text, want) in [
+            ("ATTACH 'postgres://u:pw@h/db' AS p (TYPE postgres)", "ATTACH 'postgres://u:***@h/db' AS p (TYPE postgres)"),
+            ("CHANGE MASTER TO MASTER_HOST='h', MASTER_USER='r', MASTER_PASSWORD='pw'", "CHANGE MASTER TO MASTER_HOST='h', MASTER_USER='r', MASTER_PASSWORD='***'"),
+            ("CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD = 'pw'", "CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD = '***'"),
+            ("db.createUser({user: \"app\", pwd: \"pw\", roles: []})", "db.createUser({user: \"app\", pwd: \"***\", roles: []})"),
+            ("EXEC sp_addlinkedsrvlogin @rmtsrvname = 'S', @useself = 'false', @rmtuser = 'u', @rmtpassword = N'pw'", "EXEC sp_addlinkedsrvlogin @rmtsrvname = 'S', @useself = 'false', @rmtuser = 'u', @rmtpassword = N'***'"),
+            ("select * from openrowset('MSDASQL', 'Driver={SQL Server};Server=h;UID=u;PWD=pw;', 'select 1')", "select * from openrowset('MSDASQL', 'Driver={SQL Server};Server=h;UID=u;PWD=***;', 'select 1')"),
+            ("select dblink_connect('host=h user=u password=pw dbname=d')", "select dblink_connect('host=h user=u password=*** dbname=d')"),
+            ("ATTACH 'host=h password=pw' AS pg (TYPE postgres)", "ATTACH 'host=h password=***' AS pg (TYPE postgres)"),
+            ("select * from t where u = 'jdbc:sqlserver://h;user=u;password=pw'", "select * from t where u = 'jdbc:sqlserver://h;user=u;password=***'"),
+            ("load 'https://h/x?user=u&password=pw&x=1'", "load 'https://h/x?user=u&password=***&x=1'"),
+            ("select '{\"password\": \"pw\", \"user\": \"u\"}'::json", "select '{\"password\": \"***\", \"user\": \"u\"}'::json"),
+            ("select connect(password => 'pw')", "select connect(password => '***')"),
+            ("-- api_key=abc123 for staging\nselect 1", "-- api_key=*** for staging\nselect 1"),
+            ("CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS (client_secret 'k')", "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS (client_secret '***')"),
+        ] {
+            assert_eq!(redact_text(text), want, "{text}");
+        }
+        // Not secrets: columns compared to columns, casts, other names and values.
+        for keep in [
+            "select * from users where password = password_hash",
+            "select password::text from t",
+            "select 'host=h user=u dbname=d'",
+            "select password_hash, passwordless from t where pwd_changed = true",
+            "select 'a' == 'b'",
+        ] {
+            assert_eq!(redact_text(keep), keep);
+        }
+        // Idempotent.
+        let once = redact_text("ATTACH 'host=h password=pw' AS pg; CHANGE MASTER TO MASTER_PASSWORD='x'");
+        assert_eq!(redact_text(&once), once);
     }
 
     #[test]

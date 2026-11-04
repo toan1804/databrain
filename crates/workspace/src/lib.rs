@@ -894,13 +894,15 @@ impl Workspace {
 
     /// Once: remove passwords and keys from what was kept before they were
     /// redacted on the way in (history, job runs and their logs, AI audit).
+    /// v2: with [`redact_text`](databrain_connector_core::sql::redact_text)
+    /// (connection strings, `name=value` secrets); v1 used the SQL-only pass.
     fn redact_kept_sql(&self) -> Result<()> {
-        const DONE: &str = "secrets_redacted_v1";
+        const DONE: &str = "secrets_redacted_v2";
         let done: bool = self.conn.lock().query_row("SELECT count(*) > 0 FROM maintenance WHERE name = ?1", [DONE], |r| r.get(0))?;
         if done {
             return Ok(());
         }
-        use databrain_connector_core::sql::redact_secrets as r;
+        use databrain_connector_core::sql::redact_text as r;
         fn json(v: &serde_json::Value) -> serde_json::Value {
             match v {
                 serde_json::Value::String(s) => serde_json::Value::String(r(s)),
@@ -1177,8 +1179,10 @@ impl Workspace {
 
     pub fn add_history(&self, mut h: NewHistory) -> Result<i64> {
         // Passwords and keys in the SQL (`CREATE USER … IDENTIFIED BY …`) are not kept.
-        h.sql = databrain_connector_core::sql::redact_secrets(&h.sql);
-        h.error = h.error.map(|e| databrain_connector_core::sql::redact_secrets(&e));
+        // The same redaction as the AI audit log: connection strings and
+        // `name=value` secrets too (`ATTACH 'host=h password=…'`, `MASTER_PASSWORD=…`).
+        h.sql = databrain_connector_core::sql::redact_text(&h.sql);
+        h.error = h.error.map(|e| databrain_connector_core::sql::redact_text(&e));
         let c = self.conn.lock();
         c.execute(
             "INSERT INTO query_history (connection_id, sql, started_at, duration_ms, rows, status, error, origin, output_handle, result_id) \
@@ -1456,6 +1460,60 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    /// Password forms the SQL-only redaction kept in clear: what history and
+    /// job logs store now matches the AI audit log, and older rows are
+    /// cleaned once.
+    const SECRET_FORMS: [&str; 7] = [
+        "ATTACH 'postgres://u:pw1@h/db' AS p (TYPE postgres)",
+        "CHANGE MASTER TO MASTER_USER='r', MASTER_PASSWORD='pw2'",
+        "db.createUser({user: \"app\", pwd: \"pw3\", roles: []})",
+        "EXEC sp_addlinkedsrvlogin @rmtsrvname = 'S', @rmtuser = 'u', @rmtpassword = 'pw4'",
+        "select dblink_connect('host=h user=u password=pw5')",
+        "select * from openrowset('MSDASQL', 'Driver={SQL Server};UID=u;PWD=pw6;', 'select 1')",
+        "load 'https://h/x?user=u&password=pw7'",
+    ];
+
+    fn clear(text: &str) -> bool {
+        (1..=7).any(|i| text.contains(&format!("pw{i}")))
+    }
+
+    #[test]
+    fn history_and_job_logs_redact_like_the_audit_log() {
+        let ws = Workspace::open_in_memory().unwrap();
+        for sql in SECRET_FORMS {
+            ws.add_history(NewHistory { sql: sql.into(), error: Some(format!("failed: {sql}")), ..Default::default() }).unwrap();
+            assert!(!clear(&crate::jobs::log_sql(sql)), "job log: {sql}");
+        }
+        let kept = ws.list_history(&HistoryQuery { limit: Some(50), ..Default::default() }).unwrap();
+        assert_eq!(kept.len(), 7);
+        for h in kept {
+            assert!(!clear(&h.sql) && !h.error.as_deref().is_some_and(clear), "{} / {:?}", h.sql, h.error);
+            assert!(h.sql.contains("***"), "{}", h.sql);
+        }
+    }
+
+    #[test]
+    fn redacts_kept_history_again_with_the_full_redaction() {
+        let dir = std::env::temp_dir().join(format!("databrain-ws-redact-sql-{}", crate::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ws.db");
+        {
+            let ws = Workspace::open(&path).unwrap();
+            let c = ws.conn.lock();
+            // As the v1 pass left them.
+            for sql in SECRET_FORMS {
+                c.execute("INSERT INTO query_history (sql, started_at, duration_ms, status) VALUES (?1, 0, 0, 'success')", [sql]).unwrap();
+            }
+            c.execute("DELETE FROM maintenance WHERE name = 'secrets_redacted_v2'", []).unwrap();
+        }
+        let ws = Workspace::open(&path).unwrap();
+        let kept: Vec<String> = ws.conn.lock().prepare("SELECT sql FROM query_history").unwrap().query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(kept.len(), 7);
+        assert!(kept.iter().all(|s| !clear(s)), "{kept:?}");
+        drop(ws);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

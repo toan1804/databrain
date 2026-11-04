@@ -177,7 +177,7 @@ pub const LOG_SQL_CHARS: usize = 8000;
 /// `sql` cut to [`LOG_SQL_CHARS`].
 pub fn log_sql(sql: &str) -> String {
     // Passwords and keys (`IDENTIFIED BY …`) are not kept.
-    let redacted = databrain_connector_core::sql::redact_secrets(sql);
+    let redacted = databrain_connector_core::sql::redact_text(sql);
     let sql = redacted.as_str();
     if sql.len() <= LOG_SQL_CHARS {
         return sql.to_string();
@@ -826,16 +826,16 @@ impl Workspace {
     }
 
     pub fn update_job_run(&self, run: &JobRun) -> Result<()> {
-        use databrain_connector_core::sql::redact_secrets;
+        use databrain_connector_core::sql::redact_text;
         // Errors can quote the statement (and the password in it).
         let mut nodes = run.nodes.clone();
         for n in &mut nodes {
-            n.summary.error = n.summary.error.as_deref().map(redact_secrets);
+            n.summary.error = n.summary.error.as_deref().map(redact_text);
         }
         let nodes = serde_json::to_string(&nodes).map_err(|e| Error::Invalid(e.to_string()))?;
         self.conn.lock().execute(
             "UPDATE job_runs SET finished_at = ?2, status = ?3, nodes_json = ?4, error = ?5 WHERE id = ?1",
-            params![run.id, run.finished_at, run.status, nodes, run.error.as_deref().map(redact_secrets)],
+            params![run.id, run.finished_at, run.status, nodes, run.error.as_deref().map(redact_text)],
         )?;
         Ok(())
     }
@@ -846,8 +846,8 @@ impl Workspace {
         let log: Vec<RunLogEntry> = log
             .iter()
             .map(|e| RunLogEntry {
-                message: databrain_connector_core::sql::redact_secrets(&e.message),
-                sql: e.sql.as_deref().map(databrain_connector_core::sql::redact_secrets),
+                message: databrain_connector_core::sql::redact_text(&e.message),
+                sql: e.sql.as_deref().map(databrain_connector_core::sql::redact_text),
                 ..e.clone()
             })
             .collect();
