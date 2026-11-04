@@ -181,6 +181,8 @@ Notes that apply across engines:
 
 ### 5.4 Adding a database type
 
+The full checklist, feature by feature, with the current support matrix, is in [ADDING_A_CONNECTOR.md](ADDING_A_CONNECTOR.md). In short:
+
 1. Add the variant to `ConnectorKind` (`types.rs`: enum, `ALL`, `as_str`) and its `SourceTraits` in `traits.rs`, starting from `traits::STANDARD` and overriding what differs. A non-SQL source sets `language` and `load: None`: lineage, Format, SQL completion and "load into" turn off for it on their own. A new query language also needs a `classify` arm in `language.rs` (what reads and what writes).
 2. Write the connector crate under `crates/connectors/<name>`: `impl Connector` (`info()` with the form fields and auth methods, `validate()` for required settings, `connect()`) and `impl Session` (`execute` returning Arrow batches, `list_schemas`, `list_objects`, `describe`; `list_catalogs` for three-level sources; the rest have defaults). Results are Arrow, so the grid, outputs, DuckDB joins over `results.<name>`, export, charts and the AI's result tools work unchanged; nested values go in as JSON text columns.
 3. Register it in the app: add it to `registry_with_outputs` in `crates/app/src/api/mod.rs` behind a new Cargo feature in `crates/app/Cargo.toml`, and add the crate to the workspace members.
