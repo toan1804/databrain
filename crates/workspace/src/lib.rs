@@ -1509,7 +1509,8 @@ mod tests {
             c.execute("DELETE FROM maintenance WHERE name = 'secrets_redacted_v2'", []).unwrap();
         }
         let ws = Workspace::open(&path).unwrap();
-        let kept: Vec<String> = ws.conn.lock().prepare("SELECT sql FROM query_history").unwrap().query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        let kept: Vec<String> =
+            ws.conn.lock().prepare("SELECT sql FROM query_history").unwrap().query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(kept.len(), 7);
         assert!(kept.iter().all(|s| !clear(s)), "{kept:?}");
         drop(ws);

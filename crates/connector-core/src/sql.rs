@@ -1649,7 +1649,8 @@ pub fn redact_text(text: &str) -> String {
 /// `password`, `pwd`, `master_password`, `rmtpassword`, `client_secret`,
 /// `api_key`… A suffix is enough: drivers and procedures prefix them.
 fn secret_name(name: &str) -> bool {
-    const ENDS: &[&str] = &["password", "passwd", "pwd", "secret", "secret_key", "secretkey", "access_key", "accesskey", "api_key", "apikey", "_token", "passphrase"];
+    const ENDS: &[&str] =
+        &["password", "passwd", "pwd", "secret", "secret_key", "secretkey", "access_key", "accesskey", "api_key", "apikey", "_token", "passphrase"];
     SECRET_WORDS.contains(&name) || ENDS.iter().any(|e| name.ends_with(e))
 }
 
@@ -1752,11 +1753,12 @@ pub fn redact_key_values(text: &str) -> String {
         }
         j = skip_ws(j);
         // `=`, `:`, `:=` or `=>` (named arguments), not `==` or `::` (a cast).
-        let sep = j < n && match b[j] {
-            b'=' => !(j + 1 < n && b[j + 1] == b'='),
-            b':' => !(j + 1 < n && b[j + 1] == b':'),
-            _ => false,
-        };
+        let sep = j < n
+            && match b[j] {
+                b'=' => !(j + 1 < n && b[j + 1] == b'='),
+                b':' => !(j + 1 < n && b[j + 1] == b':'),
+                _ => false,
+            };
         if !sep {
             i = e;
             continue;
@@ -1861,11 +1863,20 @@ mod redaction_tests {
     fn redacts_key_value_passwords() {
         for (text, want) in [
             ("ATTACH 'postgres://u:pw@h/db' AS p (TYPE postgres)", "ATTACH 'postgres://u:***@h/db' AS p (TYPE postgres)"),
-            ("CHANGE MASTER TO MASTER_HOST='h', MASTER_USER='r', MASTER_PASSWORD='pw'", "CHANGE MASTER TO MASTER_HOST='h', MASTER_USER='r', MASTER_PASSWORD='***'"),
+            (
+                "CHANGE MASTER TO MASTER_HOST='h', MASTER_USER='r', MASTER_PASSWORD='pw'",
+                "CHANGE MASTER TO MASTER_HOST='h', MASTER_USER='r', MASTER_PASSWORD='***'",
+            ),
             ("CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD = 'pw'", "CHANGE REPLICATION SOURCE TO SOURCE_PASSWORD = '***'"),
             ("db.createUser({user: \"app\", pwd: \"pw\", roles: []})", "db.createUser({user: \"app\", pwd: \"***\", roles: []})"),
-            ("EXEC sp_addlinkedsrvlogin @rmtsrvname = 'S', @useself = 'false', @rmtuser = 'u', @rmtpassword = N'pw'", "EXEC sp_addlinkedsrvlogin @rmtsrvname = 'S', @useself = 'false', @rmtuser = 'u', @rmtpassword = N'***'"),
-            ("select * from openrowset('MSDASQL', 'Driver={SQL Server};Server=h;UID=u;PWD=pw;', 'select 1')", "select * from openrowset('MSDASQL', 'Driver={SQL Server};Server=h;UID=u;PWD=***;', 'select 1')"),
+            (
+                "EXEC sp_addlinkedsrvlogin @rmtsrvname = 'S', @useself = 'false', @rmtuser = 'u', @rmtpassword = N'pw'",
+                "EXEC sp_addlinkedsrvlogin @rmtsrvname = 'S', @useself = 'false', @rmtuser = 'u', @rmtpassword = N'***'",
+            ),
+            (
+                "select * from openrowset('MSDASQL', 'Driver={SQL Server};Server=h;UID=u;PWD=pw;', 'select 1')",
+                "select * from openrowset('MSDASQL', 'Driver={SQL Server};Server=h;UID=u;PWD=***;', 'select 1')",
+            ),
             ("select dblink_connect('host=h user=u password=pw dbname=d')", "select dblink_connect('host=h user=u password=*** dbname=d')"),
             ("ATTACH 'host=h password=pw' AS pg (TYPE postgres)", "ATTACH 'host=h password=***' AS pg (TYPE postgres)"),
             ("select * from t where u = 'jdbc:sqlserver://h;user=u;password=pw'", "select * from t where u = 'jdbc:sqlserver://h;user=u;password=***'"),
@@ -1873,7 +1884,10 @@ mod redaction_tests {
             ("select '{\"password\": \"pw\", \"user\": \"u\"}'::json", "select '{\"password\": \"***\", \"user\": \"u\"}'::json"),
             ("select connect(password => 'pw')", "select connect(password => '***')"),
             ("-- api_key=abc123 for staging\nselect 1", "-- api_key=*** for staging\nselect 1"),
-            ("CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS (client_secret 'k')", "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS (client_secret '***')"),
+            (
+                "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS (client_secret 'k')",
+                "CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS (client_secret '***')",
+            ),
         ] {
             assert_eq!(redact_text(text), want, "{text}");
         }
