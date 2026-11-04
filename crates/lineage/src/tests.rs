@@ -1,5 +1,5 @@
 use super::*;
-use ConnectorKind as K;
+use databrain_connector_core::ConnectorKind as K;
 
 fn cat(parts: &[String]) -> Option<CatalogTable> {
     // Like the explorer cache: a schema, when given, must match.
