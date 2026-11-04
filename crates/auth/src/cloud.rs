@@ -137,8 +137,40 @@ pub fn parse_databrickscfg(text: &str) -> Vec<DatabricksProfile> {
     out
 }
 
+/// The host name of a Databricks workspace URL or host: no scheme, path,
+/// query or trailing dot; lower case (`https://Adb-1.azuredatabricks.net/?o=1`
+/// → `adb-1.azuredatabricks.net`). A port stays.
 fn normalize_host(h: &str) -> String {
-    h.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_ascii_lowercase()
+    let h = h.trim();
+    let h = h.strip_prefix("https://").or_else(|| h.strip_prefix("http://")).unwrap_or(h);
+    let h = h.split(['/', '?', '#']).next().unwrap_or_default();
+    h.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The `~/.databrickscfg` profile for a connection to `host`.
+///
+/// A named profile is used only when its host is the connection's host: its
+/// token belongs to that workspace, and a connection (e.g. from a shared
+/// connections file) could otherwise pair the user's profile with another
+/// host and receive the token there. No name: the profile whose host matches.
+fn choose_profile<'a>(profiles: &'a [DatabricksProfile], profile: Option<&str>, host: &str) -> Result<Option<&'a DatabricksProfile>, AuthError> {
+    let want = normalize_host(host);
+    if want.is_empty() {
+        return Err(AuthError::Invalid("the Databricks connection has no host".into()));
+    }
+    let Some(name) = profile.map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(profiles.iter().find(|p| p.host.as_deref().map(normalize_host).as_deref() == Some(want.as_str())));
+    };
+    let Some(p) = profiles.iter().find(|p| p.name == name) else {
+        return Err(AuthError::NotFound(format!("no Databricks CLI profile \"{name}\" in ~/.databrickscfg")));
+    };
+    match p.host.as_deref().map(normalize_host) {
+        Some(h) if h == want => Ok(Some(p)),
+        Some(h) => Err(AuthError::Invalid(format!(
+            "the Databricks CLI profile \"{name}\" is for {h}, not {want}: DataBrain doesn't send a profile's token to another host. Use that profile's host, or another profile"
+        ))),
+        None => Err(AuthError::Invalid(format!("the Databricks CLI profile \"{name}\" has no host, so DataBrain can't check it belongs to {want}"))),
+    }
 }
 
 /// Credentials from the Databricks CLI: a PAT from `~/.databrickscfg`, or an
@@ -146,11 +178,13 @@ fn normalize_host(h: &str) -> String {
 pub async fn databricks_cli(profile: Option<&str>, host: &str) -> Result<TokenSet, AuthError> {
     let path = std::env::var("DATABRICKS_CONFIG_FILE").map(PathBuf::from).ok().or_else(|| dirs::home_dir().map(|h| h.join(".databrickscfg")));
     let profiles = path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).map(|t| parse_databrickscfg(&t)).unwrap_or_default();
+    databricks_cli_from(&profiles, profile, host).await
+}
+
+/// `databricks_cli` with the profiles already read.
+async fn databricks_cli_from(profiles: &[DatabricksProfile], profile: Option<&str>, host: &str) -> Result<TokenSet, AuthError> {
     let want = normalize_host(host);
-    let chosen = match profile.filter(|p| !p.is_empty()) {
-        Some(name) => profiles.iter().find(|p| p.name == name),
-        None => profiles.iter().find(|p| p.host.as_deref().map(normalize_host) == Some(want.clone())),
-    };
+    let chosen = choose_profile(profiles, profile, host)?;
     if let Some(p) = chosen {
         if let Some(t) = &p.token {
             return Ok(TokenSet { access_token: t.clone(), refresh_token: None, expires_at: None, identity: Some(format!("databricks profile {}", p.name)) });
@@ -356,6 +390,28 @@ pub async fn azure_cli(resource: &str) -> Result<TokenSet, AuthError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connection that names the user's profile but another host (e.g. a
+    /// lookalike, from a shared connections file) gets an error, not the token.
+    #[tokio::test]
+    async fn databricks_profile_token_only_goes_to_its_host() {
+        let profiles = parse_databrickscfg("[DEFAULT]\nhost = https://adb-123.4.azuredatabricks.net/\ntoken = dapi-secret\n\n[nohost]\ntoken = dapi-other\n");
+        let token = |profile: Option<&'static str>, host: &'static str| {
+            let profiles = profiles.clone();
+            async move { databricks_cli_from(&profiles, profile, host).await.map(|t| t.access_token).map_err(|e| e.to_string()) }
+        };
+        for evil in ["adb-123.4.azuredatabricks.net.evil.com", "https://adb-123-4-azuredatabricks.net", "evil.example.com"] {
+            let e = token(Some("DEFAULT"), evil).await.unwrap_err();
+            assert!(e.contains("doesn't send a profile's token") && !e.contains("dapi-secret"), "{evil}: {e}");
+        }
+        assert!(token(Some("nohost"), "adb-123.4.azuredatabricks.net").await.unwrap_err().contains("has no host"));
+        assert!(token(Some("missing"), "adb-123.4.azuredatabricks.net").await.unwrap_err().contains("no Databricks CLI profile"));
+        // Its own host, however it is written; with no profile named it is picked by host.
+        for ok in ["adb-123.4.azuredatabricks.net", "https://ADB-123.4.azuredatabricks.net/?o=4", "adb-123.4.azuredatabricks.net/sql/1.0/warehouses/abc"] {
+            assert_eq!(token(Some("DEFAULT"), ok).await.unwrap(), "dapi-secret", "{ok}");
+            assert_eq!(token(None, ok).await.unwrap(), "dapi-secret", "{ok}");
+        }
+    }
 
     #[test]
     fn redshift_cli_args_and_output() {
