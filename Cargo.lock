@@ -1876,7 +1876,7 @@ dependencies = [
  "dirs 7.0.0",
  "keyring",
  "pkcs8 0.10.2",
- "rand 0.8.8",
+ "rand 0.10.3",
  "reqwest",
  "secrecy",
  "serde",
