@@ -1817,7 +1817,7 @@ dependencies = [
  "aes 0.8.4",
  "async-trait",
  "base64 0.23.1",
- "cbc 0.1.2",
+ "cbc 0.2.1",
  "chrono",
  "databrain-ai",
  "databrain-auth",
