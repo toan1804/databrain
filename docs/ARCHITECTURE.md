@@ -265,7 +265,7 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 | Core | `connections`, `folders`, `saved_queries`, `query_history`, `tabs`, `settings`, `maintenance` |
 | Explorer cache | `meta_catalogs`, `meta_schemas`, `meta_objects`, `meta_columns`, `meta_conn_state` |
 | AI | `ai_providers`, `ai_sessions`, `ai_messages`, `ai_audit` |
-| Knowledge | `kn_objects`, `kn_notes`, `kn_state`, `kn_schema_state`, FTS5 `kn_fts` |
+| Knowledge | `kn_objects`, `kn_notes`, `kn_state`, `kn_schema_state`, FTS5 `kn_fts`; learned from history: `kn_joins`, `kn_join_seen`, `kn_table_seen`, `kn_learn_state` |
 | Notebooks, jobs, outputs | `notebooks`, `jobs`, `job_runs` (with run logs and leases), `outputs` |
 
 `connections.config_json` holds settings, and `has_secret` says whether the secret store has a password for it. Passwords inside connection strings are moved to the secret store, and passwords and keys are redacted from kept SQL, job logs, AI transcripts and the audit log.
@@ -275,6 +275,8 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 ## 11. Lineage
 
 `crates/lineage` parses SQL with `sqlparser` in the connection's dialect and traces columns through CTEs, subqueries, joins, set operations and multi-statement scripts (`CREATE TABLE AS`, `INSERT ... SELECT`, `UPDATE ... FROM`, `MERGE`, ...). Table columns come from the explorer cache or a describe. With "Check with database", the app also reads the DDL of views the SQL reads (`CatalogTable::view_sql`), in rounds so views of views follow, and the crate traces a view's definition into the view's columns; that SQL gets no editor spans. Names it can't place become warnings instead of guesses. The UI lays out the diagram and its exports itself (`ui/src/lib/lineageLayout.ts`, `lineageExport.ts`).
+
+`join_pairs` uses the same builder to list the equi-join keys between database tables (`ON`, `USING`, `WHERE` links, `UPDATE … FROM`, `DELETE … USING`, `MERGE … ON`), tracing each side through CTEs and subqueries along `Direct` edges only; computed, ambiguous or unknown columns, `OR` and non-equi conditions and tables the script creates are left out. `fingerprint` hashes a query's shape (literals as `?`, FNV-1a) to tell a repeated query from a different one. Both feed learning from history (13.5).
 
 ---
 
@@ -344,6 +346,7 @@ Defined once in `specs()` in `crates/ai/src/tools.rs`, with hand-written JSON Sc
 | Tool | Purpose | Gate |
 |---|---|---|
 | `search_schema`, `describe_table`, `list_tables` | Knowledge index lookups, optionally on another connection | table access rules |
+| `find_join_path` | Shortest chains of joins between two tables over declared foreign keys and learned joins | `share_metadata`; tables the AI may not read are never on a path |
 | `index_tables` | Add tables the index is missing (structure only) | approval |
 | `get_sample_rows` | A few rows of a table | `share_sample_values` or `share_result_rows` |
 | `run_query` | Run SQL on the current or another connection; reads capped at 1,000 rows | `review_sql` (13.4) |
@@ -391,8 +394,9 @@ Then `access::check_sql` finds every table the SQL reads and writes (joins, subq
 The knowledge index lives in the workspace (`kn_objects` with columns, keys and a content hash; `kn_notes`; the FTS5 table `kn_fts` with title weighted 5x). `knowledge.rs`:
 
 - **Indexing** reads metadata through `Session::bulk_metadata`. It compares `schema_fingerprints()` with the stored ones and skips unchanged schemas; "Rebuild" ignores them. Objects whose content hash is unchanged are not rewritten. `index_schemas` limits the scope.
-- **Retrieval** runs BM25 over `kn_fts`, adds tables named by matching notes, then follows foreign keys one hop from the top tables, and renders the result as compact DDL within a character budget. Only approved notes are used. There are no embeddings.
+- **Retrieval** runs BM25 over `kn_fts`, adds tables named by matching notes, then follows foreign keys and learned joins one hop from the top tables, and renders the result as compact DDL within a character budget. Only approved notes are used. There are no embeddings.
 - **Notes** target one or more existing tables or columns, or none (glossary). Targets are checked against the index, the explorer cache and the live connection. Notes are exported and imported as `.databrain-notes.json`.
+- **Learned from history** (`learn.rs`, `AiPolicy.learn_from_history`, on by default). The app checks every minute (`ai_api::learn_loop`) for connections with history after their cursor and runs passes of 500 entries. Each successful entry gives join keys (`databrain_lineage::join_pairs`, or MongoDB `$lookup` through the connector's analyzer) and the tables it reads; table names are resolved strictly (a bare name in several schemas only in the connection's default one, unknown names dropped). Sightings are stored per join (or table), query fingerprint and UTC day, so counts are distinct queries and days and a scheduled job counts once a day. Runs by the assistant itself (`ai`, `mcp` origin) are kept apart and never count; SQL the user runs from the editor counts whoever wrote it. A join reaches the AI when confirmed, or seen in 2 queries or on 2 days, and not when rejected, a declared FK, stale (a column gone from the index) or touching a table the AI may not read (`usable_joins`); then it is rendered as `JOIN (cols) = table(cols)  -- learned …` lines, used for one-hop expansion after foreign keys, and by `find_join_path`. Table usage scales BM25 scores by `1 + 0.2·ln(1 + queries)`. After an index run the connection's kept history is read again (idempotent). Knowledge → "Learned from query history" lists joins with why each is or isn't given to the AI, and confirms, rejects, shows the source queries, makes a note or forgets.
 
 ### 13.6 Inline completion
 

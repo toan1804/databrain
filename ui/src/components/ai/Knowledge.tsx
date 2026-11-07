@@ -9,6 +9,7 @@ import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialo
 import { exportFileName } from "../../lib/notesImport";
 import { ImportNotesDialog } from "../ImportNotesDialog";
 import { NoteTargetInput, type TargetState } from "../NoteTargetInput";
+import { LearnedSection } from "./LearnedSection";
 
 /** Indexed tables shown at first and added by each "Show more". */
 const OBJECT_PAGE = 25;
@@ -286,6 +287,8 @@ export function Knowledge() {
           </div>
         ))}
       </div>
+
+      {connId && <LearnedSection connId={connId} version={version} onMakeNote={(target, body) => saveNote({ target, body })} />}
 
       {objects && (objects.total > 0 || filter) && (
         <div>

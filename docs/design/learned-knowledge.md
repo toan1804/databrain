@@ -1,6 +1,6 @@
 # Design: knowledge learned from query history
 
-Status: draft, for review. No code yet.
+Status: phase 1 implemented on branch `feat/learned-joins` (steps 1–5).
 
 ## 1. Problem
 
@@ -364,18 +364,25 @@ committed alongside.
   hidden, confirmed shown, usage ranking, multi-hop paths, hop limit, denied
   table on or at the end of a path, declared keys without learning.
 
-**Step 5: `feat(app): background learner and Learned tab`**
-- `crates/app/src/ai_api.rs`: 60 s learner tick + start-up and post-index
-  passes, progress on `knowledge-event`; commands `learned_joins`,
-  `set_learned_join_status`, `forget_learned`, `learn_now`.
-- `ui/src/components/ai/Knowledge.tsx`: Learned tab (joins, counts, kinds,
-  last seen, Confirm / Reject / Show queries / Make note, most used tables,
-  Forget all, "not available for this database type").
-- Connection AI-policy form: "Learn from query history" toggle.
-- History "Clear" dialog: "Also forget what the AI learned".
-- Notes export/import: confirmed joins included.
-- `docs/ARCHITECTURE.md` §10 and §13.5, `docs/FEATURES.md`, and
-  `CHANGELOG.md` under Unreleased.
+**Step 5: `feat(app): background learner and Learned section`**
+- `crates/app/src/ai_api.rs`: `learn_loop` (every minute, from start-up),
+  `learn_new_history` (connections with new history, up to 20 passes each),
+  `relearn` after an index run and for "Learn now" (reads all kept history
+  again; idempotent), one learner at a time. Commands `kn_learned`,
+  `kn_set_join_status`, `kn_join_evidence`, `kn_learn_now`,
+  `kn_forget_learned`; `clear_history` takes `forget_learned`.
+  `knowledge-event` gains `{"type": "learned"}` (refreshes, no toast).
+- `LearnedView` says per join whether the AI is given it and, if not, why
+  (learning off, sharing off, rejected, declared FK, seen once, AI-only,
+  denied table, stale column).
+- UI: Knowledge panel section "Learned from query history"
+  (`LearnedSection.tsx`: Confirm / Reject / Reset / Queries / Make note,
+  Learn now, Forget…, most used tables); AI policy toggle; history Clear
+  dialog option. The Knowledge panel is one scrolling page, so this is a
+  section, not a tab.
+- Confirmed joins are shared by "Make note" (notes already export and
+  import) instead of changing the `.databrain-notes.json` format.
+- `docs/ARCHITECTURE.md`, `docs/FEATURES.md`, `CHANGELOG.md`.
 
 ## 10b. Later phases
 

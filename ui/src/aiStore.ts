@@ -712,6 +712,10 @@ export const useAi = create<AiState>((set, get) => {
         else handleAgent(e);
       });
       await onKnowledgeEvent((e) => {
+        if (e.type === "learned") {
+          set((s) => ({ knowledgeVersion: s.knowledgeVersion + 1 }));
+          return;
+        }
         if (e.type === "progress") {
           set((s) => ({ knowledgeProgress: { ...s.knowledgeProgress, [e.connection_id]: { schema: e.schema, done: e.done, total: e.total } } }));
           return;

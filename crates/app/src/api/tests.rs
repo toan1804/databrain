@@ -204,7 +204,7 @@ async fn end_to_end_sqlite() {
     let RunResponse::Started { job_id, .. } = run_query(&st, again("select count(*) from people")).unwrap() else { panic!() };
     let latest = finished_results(&sink, &job_id).await[0].id.clone();
     assert!(result_info(&st, &rid).is_ok());
-    assert_eq!(clear_history(&st, Some(databrain_workspace::HistoryClear::All)).unwrap(), 4);
+    assert_eq!(clear_history(&st, Some(databrain_workspace::HistoryClear::All), false).unwrap(), 4);
     assert!(result_info(&st, &rid).is_err(), "the older result went with its history entry");
     assert!(result_info(&st, &latest).is_ok(), "the tab's current result stays");
 
@@ -1385,4 +1385,90 @@ async fn stop_ends_the_approval_wait() {
     assert!(started.elapsed() < Duration::from_secs(2));
     let o = tokio::time::timeout(Duration::from_secs(5), ctx.call("write_editor", &serde_json::json!({"sql": "select 2"}))).await.expect("already stopped");
     assert!(o.content.starts_with("ERROR"), "{}", o.content);
+}
+
+/// The background learner, the Learned view's reasons, and clearing
+/// history with and without forgetting what was learned.
+#[test]
+fn learned_view_reasons_and_forgetting() {
+    use databrain_workspace::{AiPolicy, ConnectionProfile, JoinStatus, KnObject, NewHistory, Origin};
+    let (st, _, _dir) = state();
+    let ws = &st.workspace;
+    let p = ws
+        .save_connection(ConnectionProfile {
+            id: String::new(),
+            name: "pg".into(),
+            config: databrain_connector_core::ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "me".into() }),
+            color: None,
+            env: EnvTag::Dev,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: AiPolicy { read_deny: vec!["hr.%".into()], ..Default::default() },
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    let obj = |schema: &str, name: &str, cols: &[&str]| KnObject {
+        schema: schema.into(),
+        name: name.into(),
+        kind: "table".into(),
+        comment: None,
+        row_estimate: None,
+        columns: cols
+            .iter()
+            .map(|c| databrain_connector_core::ColumnInfo {
+                name: c.to_string(),
+                data_type: "int".into(),
+                nullable: true,
+                is_primary_key: false,
+                default: None,
+                comment: None,
+            })
+            .collect(),
+        foreign_keys: vec![],
+    };
+    ws.kn_upsert_objects(&p.id, &[obj("sales", "orders", &["id", "cust"]), obj("sales", "customers", &["id"]), obj("hr", "staff", &["id", "cust"])]).unwrap();
+    let run = |sql: &str, origin: Origin| {
+        ws.add_history(NewHistory {
+            origin,
+            connection_id: Some(p.id.clone()),
+            sql: sql.into(),
+            started_at: databrain_workspace::now_ms(),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    run("select * from sales.orders o join sales.customers c on c.id = o.cust", Origin::User);
+    run("select count(*) from sales.orders o join sales.customers c on o.cust = c.id where o.id > 3", Origin::User);
+    run("select * from sales.orders o join hr.staff s on s.cust = o.cust", Origin::User);
+    run("select * from sales.orders o join hr.staff s on s.cust = o.cust where s.id = 1", Origin::User);
+    run("select * from sales.customers c join hr.staff s on s.id = c.id", Origin::Ai);
+
+    let learned_now = crate::ai_api::learn_new_history(ws);
+    assert_eq!(learned_now.len(), 1);
+    assert!(ws.connections_to_learn().unwrap().is_empty(), "the check caught up");
+    let v = crate::ai_api::learned(&st, &p.id).unwrap();
+    assert!(v.supported && v.enabled);
+    let find = |a: &str, b: &str| v.joins.iter().find(|j| [&j.join.left_table, &j.join.right_table] == [a, b]).unwrap();
+    let shown = find("sales.customers", "sales.orders");
+    assert!(shown.shown && shown.hidden_reason.is_none());
+    assert!(find("hr.staff", "sales.orders").hidden_reason.as_deref().unwrap().contains("may not read"));
+    assert!(find("hr.staff", "sales.customers").hidden_reason.as_deref().unwrap().contains("Only the AI"));
+    assert_eq!(v.tables.first().map(|t| t.table.as_str()), Some("sales.orders"));
+
+    crate::ai_api::set_join_status(&st, shown.join.id, JoinStatus::Rejected).unwrap();
+    assert_eq!(
+        crate::ai_api::learned(&st, &p.id).unwrap().joins.iter().find(|j| j.join.id == shown.join.id).unwrap().hidden_reason.as_deref(),
+        Some("Rejected")
+    );
+    assert_eq!(crate::ai_api::join_evidence(&st, shown.join.id).unwrap().len(), 2);
+
+    // Clearing history alone keeps what was learned; with the option it goes.
+    clear_history(&st, Some(databrain_workspace::HistoryClear::All), false).unwrap();
+    assert_eq!(crate::ai_api::learned(&st, &p.id).unwrap().joins.len(), 3);
+    run("select 1", Origin::User);
+    clear_history(&st, Some(databrain_workspace::HistoryClear::Ai), true).unwrap();
+    let v = crate::ai_api::learned(&st, &p.id).unwrap();
+    assert!(v.joins.is_empty() && v.tables.is_empty());
+    assert!(ws.connections_to_learn().unwrap().is_empty(), "the remaining history is not learned again");
 }

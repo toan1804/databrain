@@ -32,7 +32,8 @@ pub const SURFACE_DAYS: i64 = 2;
 /// Sightings older than this are dropped.
 pub const KEEP_DAYS: u32 = 365;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct LearnReport {
     /// History entries read.
     pub entries: usize,
@@ -40,6 +41,7 @@ pub struct LearnReport {
     pub joins: usize,
     pub tables: usize,
     /// The cursor after the pass.
+    #[ts(as = "f64")]
     pub last_history_id: i64,
     /// No more history to read.
     pub done: bool,
@@ -109,6 +111,14 @@ pub fn learn_pass(ws: &Workspace, connection_id: &str, limit: u32) -> Result<Lea
         ws.prune_learned(KEEP_DAYS)?;
     }
     Ok(report)
+}
+
+/// Learn again from all the history kept, from the start: after indexing,
+/// tables that couldn't be placed before may be known now. Sightings are
+/// per query and day, so nothing is counted twice; statuses are kept.
+pub fn relearn(ws: &Workspace, connection_id: &str) -> Result<LearnReport> {
+    ws.set_learn_state(connection_id, 0, None)?;
+    learn_all(ws, connection_id)
 }
 
 /// Learn until the connection's history is used up, `PASS_LIMIT` entries at

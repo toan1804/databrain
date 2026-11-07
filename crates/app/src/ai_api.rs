@@ -11,10 +11,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use databrain_ai::learn::{self, LearnReport};
 use databrain_ai::{Agent, AgentEvent, AgentRequest, AgentSink, ModelInfo, ProviderAuth, ProviderConfig, ProviderKind, ToolHost};
 use databrain_auth::{AuthError, AuthStatus, CancellationToken, DeviceCodePrompt, Interaction, SecretRef, SecretString};
 use databrain_query_engine::{EngineError, Result};
-use databrain_workspace::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry, KnNote, KnObject, KnState};
+use databrain_workspace::{
+    AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry, JoinStatus, KnNote, KnObject, KnState, LearnState, LearnedJoin, TableUsage,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -524,6 +527,20 @@ pub fn index_knowledge(state: &AppState, connection_id: &str, scope: Option<Vec<
                 m.remove(&cid);
             }
         }
+        // Tables known now may place joins that couldn't be placed before.
+        let relearn = r.is_ok() && engine.workspace().get_connection(&cid).is_ok_and(|p| p.ai_policy.learn_from_history && learn::supported(p.config.kind));
+        if relearn {
+            let ws = engine.workspace().clone();
+            let id = cid.clone();
+            let learned = tokio::task::spawn_blocking(move || {
+                let _one = LEARNING.lock();
+                learn::relearn(&ws, &id)
+            })
+            .await;
+            if let Ok(Ok(report)) = learned {
+                ui.emit(KNOWLEDGE_EVENT, json!({"type": "learned", "connection_id": cid, "report": report}));
+            }
+        }
         ui.emit(
             KNOWLEDGE_EVENT,
             match r {
@@ -662,6 +679,166 @@ pub async fn import_notes(state: &AppState, connection_id: &str, mut actions: Ve
         return Err(EngineError::new("invalid", format!("some notes are about tables this connection does not have: {}", bad.join("; "))));
     }
     Ok(state.workspace.kn_import_apply(connection_id, &actions)?)
+}
+
+// ------------------------------------------------- learned from query history
+
+/// One learner at a time (the periodic check, "learn now", after indexing):
+/// two would read the same history entries.
+static LEARNING: Mutex<()> = parking_lot::const_mutex(());
+
+/// Passes per connection in one periodic check (500 entries each).
+const LEARN_PASSES_PER_CHECK: usize = 20;
+
+/// Learn from new history on every connection that has some and learns
+/// (blocking; run off the async runtime). Returns what changed.
+pub fn learn_new_history(ws: &databrain_workspace::Workspace) -> Vec<(String, LearnReport)> {
+    let _one = LEARNING.lock();
+    let mut out = Vec::new();
+    for id in ws.connections_to_learn().unwrap_or_default() {
+        if !ws.get_connection(&id).is_ok_and(|p| p.ai_policy.learn_from_history) {
+            continue;
+        }
+        let mut total = LearnReport::default();
+        for _ in 0..LEARN_PASSES_PER_CHECK {
+            match learn::learn_pass(ws, &id, learn::PASS_LIMIT) {
+                Ok(r) => {
+                    total.entries += r.entries;
+                    total.joins += r.joins;
+                    total.tables += r.tables;
+                    total.last_history_id = r.last_history_id;
+                    total.done = r.done;
+                    if r.done {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let at = ws.learn_state(&id).ok().flatten().map(|s| s.last_history_id).unwrap_or(0);
+                    let _ = ws.set_learn_state(&id, at, Some(&e.to_string()));
+                    break;
+                }
+            }
+        }
+        out.push((id, total));
+    }
+    out
+}
+
+/// Every minute (and at start): learn from new history; tell the UI when
+/// something was learned.
+pub async fn learn_loop(ws: Arc<databrain_workspace::Workspace>, ui: Arc<dyn UiBridge>) {
+    loop {
+        let w = ws.clone();
+        if let Ok(reports) = tokio::task::spawn_blocking(move || learn_new_history(&w)).await {
+            for (id, r) in reports.into_iter().filter(|(_, r)| r.joins > 0 || r.tables > 0) {
+                ui.emit(KNOWLEDGE_EVENT, json!({"type": "learned", "connection_id": id, "report": r}));
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+/// Learn again from all kept history of a connection (after indexing, or
+/// "Learn now").
+pub async fn relearn(state: &AppState, connection_id: &str) -> Result<LearnReport> {
+    let ws = state.workspace.clone();
+    let id = connection_id.to_string();
+    let p = ws.get_connection(&id)?;
+    if !learn::supported(p.config.kind) {
+        return Err(EngineError::new("invalid", format!("{} queries can't be learned from", p.config.kind.traits().name)));
+    }
+    if !p.ai_policy.learn_from_history {
+        return Err(EngineError::new("invalid", "learning from query history is off for this connection (Edit connection → AI)"));
+    }
+    let r = tokio::task::spawn_blocking(move || {
+        let _one = LEARNING.lock();
+        learn::relearn(&ws, &id)
+    })
+    .await
+    .map_err(|e| EngineError::new("internal", e.to_string()))?
+    .map_err(ai_err)?;
+    state.ui.emit(KNOWLEDGE_EVENT, json!({"type": "learned", "connection_id": connection_id, "report": r}));
+    Ok(r)
+}
+
+/// A learned join and whether the AI is given it now.
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct LearnedJoinView {
+    #[serde(flatten)]
+    pub join: LearnedJoin,
+    /// In the AI's schema context now.
+    pub shown: bool,
+    /// Why not, when it isn't.
+    pub hidden_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct LearnedView {
+    /// History of this kind of database can be learned from.
+    pub supported: bool,
+    /// The connection's "Learn from query history" setting.
+    pub enabled: bool,
+    pub state: Option<LearnState>,
+    pub joins: Vec<LearnedJoinView>,
+    /// Most used tables (top 20).
+    pub tables: Vec<TableUsage>,
+}
+
+pub fn learned(state: &AppState, connection_id: &str) -> Result<LearnedView> {
+    let ws = &state.workspace;
+    let p = ws.get_connection(connection_id)?;
+    let pol = &p.ai_policy;
+    let usable: std::collections::HashSet<i64> = databrain_ai::knowledge::usable_joins(ws, &p).map_err(ai_err)?.into_iter().map(|j| j.id).collect();
+    let readable = |t: &str| databrain_ai::access::check_read_table(&p, t).is_ok();
+    let joins = ws
+        .learned_joins(connection_id)?
+        .into_iter()
+        .map(|j| {
+            let shown = usable.contains(&j.id);
+            let hidden_reason = (!shown).then(|| {
+                if !pol.learn_from_history {
+                    "Learning from query history is off for this connection".to_string()
+                } else if !pol.share_metadata {
+                    "Schema metadata isn't shared with the AI on this connection".into()
+                } else if j.status == JoinStatus::Rejected {
+                    "Rejected".into()
+                } else if j.declared {
+                    "A declared foreign key: the AI sees it as FK".into()
+                } else if !learn::surfaced(&j) {
+                    if j.queries == 0 {
+                        "Only the AI's own queries used it: run it yourself or confirm it".into()
+                    } else {
+                        "Seen in one query on one day: shown after another query or another day, or confirm it".into()
+                    }
+                } else if !readable(&j.left_table) || !readable(&j.right_table) {
+                    "Joins a table the AI may not read (table access rules)".into()
+                } else {
+                    "A column it uses no longer exists in the indexed table".into()
+                }
+            });
+            LearnedJoinView { join: j, shown, hidden_reason }
+        })
+        .collect();
+    let mut tables = ws.table_usage(connection_id)?;
+    tables.truncate(20);
+    Ok(LearnedView { supported: learn::supported(p.config.kind), enabled: pol.learn_from_history, state: ws.learn_state(connection_id)?, joins, tables })
+}
+
+pub fn set_join_status(state: &AppState, id: i64, status: JoinStatus) -> Result<()> {
+    Ok(state.workspace.set_join_status(id, status)?)
+}
+
+/// History entries a learned join was seen in (still kept), latest first.
+pub fn join_evidence(state: &AppState, join_id: i64) -> Result<Vec<databrain_workspace::HistoryEntry>> {
+    Ok(state.workspace.join_evidence(join_id, 10)?)
+}
+
+/// Forget what was learned on a connection; the history already there is
+/// not learned from again.
+pub fn forget_learned(state: &AppState, connection_id: &str) -> Result<()> {
+    Ok(state.workspace.forget_learned(Some(connection_id))?)
 }
 
 pub fn clear_knowledge(state: &AppState, connection_id: &str) -> Result<()> {

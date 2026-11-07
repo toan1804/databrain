@@ -186,6 +186,12 @@ pub fn run() {
                     }
                 });
             }
+            // Learn how tables join from query history (every minute).
+            {
+                let st = app.state::<AppState>();
+                let (ws, ui) = (st.workspace.clone(), st.ui.clone());
+                tauri::async_runtime::spawn(crate::ai_api::learn_loop(ws, ui));
+            }
             #[cfg(target_os = "macos")]
             app.set_menu(macos_menu(app.handle())?)?;
             Ok(())
@@ -359,6 +365,11 @@ pub fn run() {
             commands::outputs::drop_unpinned_outputs,
             commands::ai::kn_cancel,
             commands::ai::kn_save_note,
+            commands::ai::kn_learned,
+            commands::ai::kn_set_join_status,
+            commands::ai::kn_join_evidence,
+            commands::ai::kn_learn_now,
+            commands::ai::kn_forget_learned,
             commands::ai::kn_delete_note,
             commands::ai::kn_export_notes,
             commands::ai::kn_check_target,

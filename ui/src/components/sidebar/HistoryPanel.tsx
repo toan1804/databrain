@@ -303,6 +303,7 @@ const HISTORY_PAGE = 50;
 function ClearHistoryDialog({ onClose, onDone }: { onClose: () => void; onDone: (deleted: number) => void }) {
   const [kind, setKind] = useState<"ai" | "older_than_days" | "all">("ai");
   const [days, setDays] = useState("7");
+  const [forget, setForget] = useState(false);
   const [busy, setBusy] = useState(false);
   const toast = useStore((s) => s.toast);
   const n = Number(days);
@@ -311,7 +312,7 @@ function ClearHistoryDialog({ onClose, onDone }: { onClose: () => void; onDone: 
     setBusy(true);
     try {
       const what: HistoryClear = kind === "older_than_days" ? { kind, days: n } : { kind };
-      onDone(await api.clearHistory(what));
+      onDone(await api.clearHistory(what, forget));
     } catch (e) {
       toast(toError(e).message, "error");
       setBusy(false);
@@ -363,6 +364,13 @@ function ClearHistoryDialog({ onClose, onDone }: { onClose: () => void; onDone: 
         )}
         {opt("all", "All queries", "Every history entry.")}
         <p className="pt-1 text-[11px] text-muted">The results these queries produced are deleted too, except pinned outputs and results still shown in a tab.</p>
+        <label className="flex cursor-pointer items-start gap-2 pt-1 text-[12px]">
+          <input type="checkbox" className="mt-0.5" checked={forget} onChange={(e) => setForget(e.target.checked)} />
+          <span>
+            Also forget what the AI learned from history
+            <span className="block text-[11px] text-muted">Learned joins and table usage on every connection. Otherwise they stay, without the deleted queries as examples.</span>
+          </span>
+        </label>
       </div>
     </Modal>
   );

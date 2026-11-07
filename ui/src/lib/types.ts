@@ -122,6 +122,13 @@ import type { ProviderConfig } from "./bindings/ProviderConfig";
 import type { ProviderKind } from "./bindings/ProviderKind";
 import type { UiContext } from "./bindings/UiContext";
 import type { IndexPlan } from "./bindings/IndexPlan";
+import type { JoinStatus } from "./bindings/JoinStatus";
+import type { LearnedJoin } from "./bindings/LearnedJoin";
+import type { LearnedJoinView } from "./bindings/LearnedJoinView";
+import type { LearnedView } from "./bindings/LearnedView";
+import type { LearnReport } from "./bindings/LearnReport";
+import type { LearnState } from "./bindings/LearnState";
+import type { TableUsage } from "./bindings/TableUsage";
 import type { PlanSchema } from "./bindings/PlanSchema";
 import type { LineageRange } from "./bindings/LineageRange";
 import type { LineageNodeKind } from "./bindings/LineageNodeKind";
@@ -280,6 +287,13 @@ export type {
   ProviderKind,
   UiContext,
   IndexPlan,
+  JoinStatus,
+  LearnedJoin,
+  LearnedJoinView,
+  LearnedView,
+  LearnReport,
+  LearnState,
+  TableUsage,
   PlanSchema,
   LineageRange,
   LineageNodeKind,
@@ -481,7 +495,9 @@ export type KnowledgeEvent =
       report: { schemas: number; objects: number; changed: number; removed: number; errors: string[]; cancelled: boolean; skipped?: number };
     }
   | { type: "cancelled"; connection_id: string }
-  | { type: "failed"; connection_id: string; error: string };
+  | { type: "failed"; connection_id: string; error: string }
+  /** Joins or table usage learned from query history (no toast). */
+  | { type: "learned"; connection_id: string; report: LearnReport };
 
 export interface OracleClientStatus {
   installed: boolean;

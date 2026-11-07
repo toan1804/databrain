@@ -32,9 +32,14 @@ pub fn list_history(state: &AppState, query: HistoryQuery) -> Result<Vec<History
     Ok(state.workspace.list_history(&query)?)
 }
 
-pub fn clear_history(state: &AppState, what: Option<databrain_workspace::HistoryClear>) -> Result<usize> {
+/// Delete history; with `forget_learned`, also what the AI learned from it
+/// (on every connection).
+pub fn clear_history(state: &AppState, what: Option<databrain_workspace::HistoryClear>, forget_learned: bool) -> Result<usize> {
     let (n, ids) = state.workspace.clear_history_results(what.unwrap_or(databrain_workspace::HistoryClear::All))?;
     drop_history_results(&state.engine, &ids);
+    if forget_learned {
+        state.workspace.forget_learned(None)?;
+    }
     Ok(n)
 }
 

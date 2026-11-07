@@ -104,6 +104,9 @@ import type {
   ViewSpec,
   ProviderUsage,
   HistoryClear,
+  JoinStatus,
+  LearnedView,
+  LearnReport,
   DuckdbEngineStatus,
   TerminalLaunch,
   TerminalOption,
@@ -415,6 +418,11 @@ export const api = {
   knClear: (connectionId: string) => call<void>("kn_clear", { connectionId }),
   knSaveNote: (note: KnNote) => call<KnNote>("kn_save_note", { note }),
   knDeleteNote: (id: string) => call<void>("kn_delete_note", { id }),
+  knLearned: (connectionId: string) => call<LearnedView>("kn_learned", { connectionId }),
+  knSetJoinStatus: (id: number, status: JoinStatus) => call<void>("kn_set_join_status", { id, status }),
+  knJoinEvidence: (joinId: number) => call<HistoryEntry[]>("kn_join_evidence", { joinId }),
+  knLearnNow: (connectionId: string) => call<LearnReport>("kn_learn_now", { connectionId }),
+  knForgetLearned: (connectionId: string) => call<void>("kn_forget_learned", { connectionId }),
   hintLayouts: (connectionId: string, tables: string[]) =>
     call<{ written: string; schema?: string | null; name?: string | null; layout?: TableLayout | null; error?: string | null }[]>("hint_layouts", { connectionId, tables }),
   knCheckTarget: (connectionId: string, target: string) =>
@@ -426,7 +434,7 @@ export const api = {
   listHistory: (query: HistoryQuery) => call<HistoryEntry[]>("list_history", { query }),
   /** Deletes the entries and the results they produced (not pinned or on-screen ones). Returns how many went. */
   deleteHistoryEntry: (id: number) => call<void>("delete_history_entry", { id }),
-  clearHistory: (what: HistoryClear) => call<number>("clear_history", { what }),
+  clearHistory: (what: HistoryClear, forgetLearned = false) => call<number>("clear_history", { what, forgetLearned }),
 
   loadTabs: () => call<TabState[]>("load_tabs"),
   saveTabs: (tabs: TabState[]) => call<void>("save_tabs", { tabs }),
