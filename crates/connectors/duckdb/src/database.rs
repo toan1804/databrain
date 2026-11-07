@@ -87,9 +87,24 @@ pub(crate) fn connect_file(
     };
     let key = (resolved, read_only, sandbox);
     let closing_since = std::time::Instant::now();
+    // One decision per look at the registry, made from what `upgrade` sees:
+    // the last session can drop its reference at any moment (that needs no
+    // lock), so a strong count read earlier says nothing about an upgrade
+    // now. An entry that can't be upgraded is an instance closing the file;
+    // opening a second one then would read the file while it is written
+    // (Linux lets one process open a file twice).
     let mut dbs = loop {
         let dbs = FILE_DBS.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?;
-        // An instance whose last session ended is still closing the file.
+        if let Some(db) = dbs.get(&key).and_then(std::sync::Weak::upgrade) {
+            let conn = match db.root.lock().as_deref() {
+                Ok(Some(root)) => root.try_clone().map_err(|e| ConnectorError::connection(e.to_string())),
+                _ => Err(ConnectorError::internal("the database is closing")),
+            };
+            // `db` may be the last reference: it closes (and takes the registry) after the guard is released.
+            drop(dbs);
+            return conn.map(|c| (c, db));
+        }
+        // An instance of this file (any access mode) whose last session ended.
         let closing = dbs.iter().any(|(k, w)| k.0 == key.0 && w.strong_count() == 0);
         if !closing {
             break dbs;
@@ -100,15 +115,6 @@ pub(crate) fn connect_file(
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    if let Some(db) = dbs.get(&key).and_then(std::sync::Weak::upgrade) {
-        let conn = match db.root.lock().as_deref() {
-            Ok(Some(root)) => root.try_clone().map_err(|e| ConnectorError::connection(e.to_string())),
-            _ => Err(ConnectorError::internal("the database is closing")),
-        };
-        // `db` may be the last reference: it closes (and takes the registry) after the guard is released.
-        drop(dbs);
-        return conn.map(|c| (c, db));
-    }
     if dbs.keys().any(|k| k.0 == key.0 && k.2 != sandbox) {
         return Err(ConnectorError::config(if sandbox {
             format!(
@@ -153,6 +159,30 @@ mod tests {
     use databrain_auth::AuthMethod;
 
     use databrain_connector_core::{ConnectionConfig, ConnectorKind};
+
+    /// An instance that can no longer be shared (its last session let go)
+    /// is closing: a session opening the file waits for it to leave the
+    /// registry instead of opening a second instance on the file.
+    #[test]
+    fn waits_for_an_instance_that_cannot_be_shared_any_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lake.duckdb");
+        let key: super::FileKey = (std::fs::canonicalize(dir.path()).unwrap().join("lake.duckdb"), false, false);
+        // A registry entry whose instance is closing: it can't be upgraded.
+        super::FILE_DBS.lock().unwrap().insert(key.clone(), std::sync::Weak::new());
+        let k2 = key.clone();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            super::FILE_DBS.lock().unwrap().remove(&k2);
+        });
+        let start = std::time::Instant::now();
+        let (conn, db) = super::connect_file(path.to_str().unwrap(), false, false, &|_| Ok(())).unwrap();
+        assert!(start.elapsed() >= std::time::Duration::from_millis(200), "opened while the other instance was closing");
+        closer.join().unwrap();
+        conn.execute_batch("create table t as select 1 as x").unwrap();
+        drop((conn, db));
+        assert!(!super::FILE_DBS.lock().unwrap().contains_key(&key), "closed and left the registry");
+    }
 
     /// A session opening a file that another thread is closing waits for it
     /// to close instead of opening a second instance on it (WAL errors).
