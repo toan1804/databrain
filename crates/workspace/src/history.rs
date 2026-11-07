@@ -137,6 +137,28 @@ pub const AI_HISTORY_RETENTION_SETTING: &str = "ai_history_retention_days";
 /// Maximum history rows kept; older rows are pruned on insert.
 pub const HISTORY_LIMIT: i64 = 5000;
 
+/// Columns a history row is read from, for [`history_row`]; `h` is
+/// `query_history`, `c` the `connections` it is LEFT JOINed with.
+pub(crate) const HISTORY_COLUMNS: &str =
+    "h.id, h.connection_id, c.name, h.sql, h.started_at, h.duration_ms, h.rows, h.status, h.error, h.origin, h.output_handle, h.result_id";
+
+pub(crate) fn history_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
+    Ok(HistoryEntry {
+        origin: Origin::parse(&r.get::<_, String>(9)?),
+        id: r.get(0)?,
+        connection_id: r.get(1)?,
+        connection_name: r.get(2)?,
+        sql: r.get(3)?,
+        started_at: r.get(4)?,
+        duration_ms: r.get(5)?,
+        rows: r.get(6)?,
+        status: RunStatus::parse(&r.get::<_, String>(7)?),
+        error: r.get(8)?,
+        output_handle: r.get(10)?,
+        result_id: r.get(11)?,
+    })
+}
+
 impl Workspace {
     // ---------------------------------------------------------------- history
 
@@ -177,8 +199,8 @@ impl Workspace {
             .into_iter()
             .map(|s| format!("%{}%", s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")))
             .collect();
-        let mut sql = String::from(
-            "SELECT h.id, h.connection_id, c.name, h.sql, h.started_at, h.duration_ms, h.rows, h.status, h.error, h.origin, h.output_handle, h.result_id \
+        let mut sql = format!(
+            "SELECT {HISTORY_COLUMNS} \
              FROM query_history h LEFT JOIN connections c ON c.id = h.connection_id \
              WHERE (?1 IS NULL OR h.connection_id = ?1) \
                AND (?2 IS NULL OR h.id < ?2) \
@@ -194,24 +216,7 @@ impl Workspace {
             vec![Box::new(q.connection_id.clone()), Box::new(q.before), Box::new(limit), Box::new(q.exclude_ai), Box::new(q.status.map(RunStatus::as_str))];
         values.extend(terms.into_iter().map(|t| Box::new(t) as Box<dyn rusqlite::ToSql>));
         let mut stmt = c.prepare(&sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(values.iter().map(|v| v.as_ref())), |r| {
-                Ok(HistoryEntry {
-                    origin: Origin::parse(&r.get::<_, String>(9)?),
-                    id: r.get(0)?,
-                    connection_id: r.get(1)?,
-                    connection_name: r.get(2)?,
-                    sql: r.get(3)?,
-                    started_at: r.get(4)?,
-                    duration_ms: r.get(5)?,
-                    rows: r.get(6)?,
-                    status: RunStatus::parse(&r.get::<_, String>(7)?),
-                    error: r.get(8)?,
-                    output_handle: r.get(10)?,
-                    result_id: r.get(11)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values.iter().map(|v| v.as_ref())), history_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 

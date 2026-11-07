@@ -49,7 +49,7 @@ databrain-lineage::join_pairs(sql, dialect, catalog)   ← new, pure function
    ▼
 resolve tables against kn_objects / explorer cache (drop unresolved)
    ▼
-upsert kn_joins, kn_table_usage; advance kn_learn_state.cursor
+record sightings in kn_joins / kn_join_seen / kn_table_seen; advance kn_learn_state
    ▼
 retrieval / describe_table / find_join_path / editor completion read them
 ```
@@ -131,51 +131,54 @@ An edge is stored once regardless of direction: order the two sides by
 (`{"inner":12,"left":5}`), which also hints optionality (mostly `LEFT` → the
 right side may be missing).
 
-## 4. Storage (workspace migration v15)
+## 4. Storage (workspace migration v16)
+
+Rows are **sightings**: one per join (or table), query fingerprint and day.
+Counts are computed when read, so they are always distinct queries and
+distinct days, and a job running every 5 minutes is one sighting a day.
 
 ```sql
-CREATE TABLE kn_joins (
+CREATE TABLE kn_joins (            -- one row per join, canonical side order
     id            INTEGER PRIMARY KEY,
     connection_id TEXT NOT NULL,
-    left_table    TEXT NOT NULL,   -- schema.table, canonical
+    left_table    TEXT NOT NULL,   -- schema.table
     left_cols     TEXT NOT NULL,   -- JSON array, ordered
     right_table   TEXT NOT NULL,
     right_cols    TEXT NOT NULL,
-    kinds_json    TEXT NOT NULL,   -- {"inner": n, "left": n, …}
-    queries       INTEGER NOT NULL, -- distinct fingerprints, weighted origins
-    days          INTEGER NOT NULL, -- distinct days seen
-    ai_queries    INTEGER NOT NULL, -- from ai/mcp, not scored
+    status        TEXT NOT NULL DEFAULT 'learned', -- learned | confirmed | rejected
+    declared      INTEGER NOT NULL DEFAULT 0,      -- matches a declared FK
     first_seen    INTEGER NOT NULL,
-    last_seen     INTEGER NOT NULL,
-    status        TEXT NOT NULL,   -- learned | confirmed | rejected
-    declared      INTEGER NOT NULL DEFAULT 0, -- matches a declared FK
     UNIQUE (connection_id, left_table, left_cols, right_table, right_cols)
 );
-CREATE TABLE kn_join_evidence (   -- last 5 example history ids per edge
-    join_id    INTEGER NOT NULL REFERENCES kn_joins(id) ON DELETE CASCADE,
-    history_id INTEGER NOT NULL,
+CREATE TABLE kn_join_seen (
+    join_id     INTEGER NOT NULL REFERENCES kn_joins(id) ON DELETE CASCADE,
     fingerprint TEXT NOT NULL,
-    PRIMARY KEY (join_id, fingerprint)
+    day         INTEGER NOT NULL,  -- UTC day number
+    ai          INTEGER NOT NULL,  -- run by the assistant itself: shown, not counted
+    kind        TEXT NOT NULL,     -- inner | left | right | full | semi | anti | where
+    history_id  INTEGER NOT NULL,  -- latest run: the evidence
+    at          INTEGER NOT NULL,
+    PRIMARY KEY (join_id, fingerprint, day, ai)
 );
-CREATE TABLE kn_table_usage (
-    connection_id TEXT NOT NULL,
-    table_name    TEXT NOT NULL,
-    queries       INTEGER NOT NULL,
-    last_seen     INTEGER NOT NULL,
-    PRIMARY KEY (connection_id, table_name)
+CREATE TABLE kn_table_seen (       -- user and job runs only
+    connection_id TEXT NOT NULL, table_name TEXT NOT NULL,
+    fingerprint TEXT NOT NULL, day INTEGER NOT NULL, at INTEGER NOT NULL,
+    PRIMARY KEY (connection_id, table_name, fingerprint, day)
 );
 CREATE TABLE kn_learn_state (
-    connection_id   TEXT PRIMARY KEY,
-    last_history_id INTEGER NOT NULL,
-    learned_at      INTEGER NOT NULL,
-    error           TEXT
+    connection_id TEXT PRIMARY KEY, last_history_id INTEGER NOT NULL,
+    learned_at INTEGER NOT NULL, error TEXT
 );
 ```
 
-- Evidence holds history **ids**, not SQL copies. When history is pruned by
-  retention, evidence links go stale and are cleaned up; the aggregate counts
-  stay.
-- Deleting a connection deletes its rows (same as `kn_*` today).
+- Evidence is the `history_id` of sightings, never a copy of the SQL. When
+  history is cleared or pruned, the evidence disappears and the counts stay.
+- Sightings older than a year are pruned; a `learned` join left with none is
+  deleted (confirmed and rejected ones are kept).
+- "Forget" deletes a connection's joins and usage (rejections included) and
+  moves its cursor to the end of the existing history, so that history is
+  not learned again.
+- Deleting a connection deletes all of it.
 - Learned joins are **not** put in `kn_fts`; they are reached through the
   tables BM25 already found.
 
@@ -304,18 +307,20 @@ committed alongside.
 - `fingerprint(sql, kind)` (literals → `?`, normalized) lives here too.
 
 **Step 2: `feat(workspace): store learned joins and table usage`**
-- `migrations.rs`: v15 with the four tables in §4.
-- `crates/workspace/src/learned.rs` (new): `kn_learn_cursor`,
-  `history_since(id, limit)`, `upsert_join`, `add_evidence` (cap 5),
-  `bump_table_usage`, `learned_joins(conn, filter)`, `set_join_status`,
-  `forget_learned(conn)`, `max_history_id`.
+- `migrations.rs`: v16 with the four tables in §4.
+- `crates/workspace/src/learned.rs` (new): `record_join`, `record_table_use`,
+  `learned_joins`, `set_join_status`, `join_evidence`, `table_usage`,
+  `learn_state` / `set_learn_state`, `history_since`, `connections_to_learn`,
+  `forget_learned`, `prune_learned`.
 - `connections.rs`: delete learned rows with the connection;
   `AiPolicy.learn_from_history` (serde default `true`, so existing profiles
-  turn on).
-- `history.rs`: `HistoryClear` gains `forget_learned: bool`; stale evidence
-  rows removed when history is pruned.
-- Tests: migration, canonical upsert (A↔B = B↔A), evidence cap, rejected
-  stays rejected, cascade, clear with and without forgetting.
+  turn on). The UI's `DEFAULT_POLICY` gets the field too.
+- History clearing is unchanged: evidence is read through `query_history`,
+  so cleared entries simply stop showing. "Also forget what the AI learned"
+  (step 5) calls `forget_learned`.
+- Tests: canonical order (A↔B = B↔A, kind flipped), distinct queries/days,
+  assistant runs not counted, rejected stays rejected, evidence after
+  clearing history, cursor, forget, prune, cascade, policy default.
 
 **Step 3: `feat(ai): learn joins from query history`**
 - `crates/ai/src/learn.rs` (new): `learn_pass(ws, conn, limit) -> LearnReport`.

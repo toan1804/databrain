@@ -70,6 +70,7 @@ export const DEFAULT_POLICY: AiPolicy = {
   mcp_enabled: false,
   mcp_client_approves: false,
   auto_approve_notes: false,
+  learn_from_history: true,
   read_allow: [],
   read_deny: [],
   write_allow: [],
