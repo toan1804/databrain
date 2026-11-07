@@ -583,10 +583,10 @@ async fn explorer_cache_sqlite() {
     assert!(!cached_columns(&st, &p.id, &main, "a").unwrap().unwrap().stale);
     assert!(st.engine.connected_ids().is_empty(), "cache reads never connect");
 
-    let r = revalidate_explorer(&st, &p.id, &[main.clone()], true).await.unwrap();
+    let r = revalidate_explorer(&st, &p.id, std::slice::from_ref(&main), true).await.unwrap();
     assert!(r.fingerprints);
     // First check records the fingerprint (one listing), then nothing.
-    let r = revalidate_explorer(&st, &p.id, &[main.clone()], true).await.unwrap();
+    let r = revalidate_explorer(&st, &p.id, std::slice::from_ref(&main), true).await.unwrap();
     assert_eq!((r.refreshed.len(), r.unchanged), (0, 1), "{r:?}");
     assert!(revalidate_explorer(&st, &p.id, &[], false).await.unwrap().skipped, "checked moments ago");
 
@@ -1051,7 +1051,7 @@ async fn mcp_unanswered_question_ends_the_call_and_is_not_asked_again() {
     assert_eq!(r["id"], 2, "{r}");
     assert_eq!(r["result"]["isError"], true, "{r}");
     let text = r["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("didn't answer") && text.contains("Accept the MCP client's approval") && text.contains("read-only"), "{text}");
+    assert!(text.contains("didn't answer") && text.contains("Accept the MCP client's approval") && text.contains("Edit connection"), "{text}");
     assert!(!text.contains("declined"), "{text}");
     let waited = started.elapsed();
     assert!(waited >= Duration::from_secs(5) && waited < Duration::from_secs(15), "{waited:?}");

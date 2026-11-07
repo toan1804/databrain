@@ -216,10 +216,10 @@ impl QueryEngine {
             Err(e) if unreachable(&e) => return Err(EngineError { message: format!("Can't read {schema_id}.{table}: {}", e.message), ..e }),
             Err(e) => e,
         };
-        if table.to_uppercase() != table {
-            if let Ok(d) = self.describe(cid, schema_id, &table.to_uppercase()).await {
-                return Ok(d);
-            }
+        if table.to_uppercase() != table
+            && let Ok(d) = self.describe(cid, schema_id, &table.to_uppercase()).await
+        {
+            return Ok(d);
         }
         let names = [table.to_string(), table.to_uppercase(), table.to_lowercase()];
         let found = self.list_objects_named(cid, schema_id, &names).await.ok().and_then(|objs| objs.into_iter().find(|x| x.name.eq_ignore_ascii_case(table)));

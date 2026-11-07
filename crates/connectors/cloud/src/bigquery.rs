@@ -244,10 +244,8 @@ impl Inner {
             }
         }
         let resp = self.call(reqwest::Method::POST, format!("{API}/projects/{}/queries", self.project), Some(body)).await?;
-        if in_session {
-            if let Some(id) = resp.pointer("/sessionInfo/sessionId").and_then(|s| s.as_str()) {
-                *self.session_id.lock().await = Some(id.to_string());
-            }
+        if in_session && let Some(id) = resp.pointer("/sessionInfo/sessionId").and_then(|s| s.as_str()) {
+            *self.session_id.lock().await = Some(id.to_string());
         }
         Ok(resp)
     }

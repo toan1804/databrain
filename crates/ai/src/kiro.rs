@@ -480,10 +480,11 @@ fn private_work_dir() -> Result<PathBuf> {
     } else {
         std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).filter(|p| p.is_absolute()).or_else(|| home().map(|h| h.join(".cache")))
     };
-    if let Some(dir) = cache.map(|c| c.join("databrain").join("kiro")) {
-        if std::fs::create_dir_all(&dir).is_ok() && owner_only(&dir).is_ok() {
-            return Ok(dir);
-        }
+    if let Some(dir) = cache.map(|c| c.join("databrain").join("kiro"))
+        && std::fs::create_dir_all(&dir).is_ok()
+        && owner_only(&dir).is_ok()
+    {
+        return Ok(dir);
     }
     let dir = std::env::temp_dir().join(format!("databrain-kiro-{}", uuid::Uuid::new_v4().simple()));
     // `create_dir`, not `_all`: fails if anything is already there.

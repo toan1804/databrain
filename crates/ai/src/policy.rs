@@ -53,10 +53,10 @@ pub fn review_sql(profile: &ConnectionProfile, sql: &str) -> SqlReview {
     }
     // Tables the AI may read / write (checked after the connection-wide rules,
     // so their reasons come first).
-    if !matches!(decision, Decision::Deny(_)) {
-        if let Err(reason) = crate::access::check_sql(profile, sql) {
-            decision = Decision::Deny(reason);
-        }
+    if !matches!(decision, Decision::Deny(_))
+        && let Err(reason) = crate::access::check_sql(profile, sql)
+    {
+        decision = Decision::Deny(reason);
     }
     SqlReview { decision, statements: stmts, kind: worst }
 }

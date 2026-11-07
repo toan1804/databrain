@@ -517,13 +517,12 @@ impl OutputRegistry {
                     list.first().cloned()
                 });
                 // Dropping the current version: the previous one becomes current.
-                if o.name.is_some() {
-                    if let Some(Some(h)) = &next {
-                        if let Some(x) = g.by_handle.get_mut(h) {
-                            x.name = Some(base.clone());
-                            x.version_of = None;
-                        }
-                    }
+                if o.name.is_some()
+                    && let Some(Some(h)) = &next
+                    && let Some(x) = g.by_handle.get_mut(h)
+                {
+                    x.name = Some(base.clone());
+                    x.version_of = None;
                 }
                 if g.names.get(&key).is_some_and(Vec::is_empty) {
                     g.names.remove(&key);
@@ -539,10 +538,10 @@ impl OutputRegistry {
             let _ = std::fs::remove_file(p);
         }
         // The promoted version's saved metadata (if pinned) follows.
-        if let Some(n) = &o.name {
-            if let Some(cur) = self.resolve(n) {
-                self.persist_meta(&cur);
-            }
+        if let Some(n) = &o.name
+            && let Some(cur) = self.resolve(n)
+        {
+            self.persist_meta(&cur);
         }
         Ok(o)
     }
@@ -600,12 +599,12 @@ impl OutputRegistry {
         if !info.pinned {
             return;
         }
-        if let Ok(list) = self.workspace.list_outputs() {
-            if let Some(mut rec) = list.into_iter().find(|r| r.result_id == info.result_id) {
-                rec.name = info.name.clone();
-                rec.meta = serde_json::to_value(info).unwrap_or_default();
-                let _ = self.workspace.save_output(&rec);
-            }
+        if let Ok(list) = self.workspace.list_outputs()
+            && let Some(mut rec) = list.into_iter().find(|r| r.result_id == info.result_id)
+        {
+            rec.name = info.name.clone();
+            rec.meta = serde_json::to_value(info).unwrap_or_default();
+            let _ = self.workspace.save_output(&rec);
         }
     }
 

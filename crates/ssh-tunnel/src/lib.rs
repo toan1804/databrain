@@ -214,20 +214,20 @@ async fn agent_auth(session: &mut Handle<Verifier>, user: &str) -> Result<bool, 
     let hash = session.best_supported_rsa_hash().await.map_err(|e| TunnelError::Other(e.to_string()))?.flatten();
     for id in ids {
         let key = id.public_key().into_owned();
-        if let Ok(r) = session.authenticate_publickey_with(user, key, hash, &mut agent).await {
-            if r.success() {
-                return Ok(true);
-            }
+        if let Ok(r) = session.authenticate_publickey_with(user, key, hash, &mut agent).await
+            && r.success()
+        {
+            return Ok(true);
         }
     }
     Ok(false)
 }
 
 fn expand_home(p: &str) -> String {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            return format!("{}/{rest}", home.to_string_lossy());
-        }
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    {
+        return format!("{}/{rest}", home.to_string_lossy());
     }
     p.to_string()
 }

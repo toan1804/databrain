@@ -342,10 +342,10 @@ const INDEX_TABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// described directly (no catalog search); otherwise, or when that fails
 /// (different case, a name only the search knows), it is looked up first.
 async fn describe_named(engine: &QueryEngine, connection_id: &str, want: &str) -> std::result::Result<databrain_connector_core::ObjectDetail, String> {
-    if let Some((schema, name)) = want.rsplit_once('.').filter(|(s, n)| !s.is_empty() && !n.is_empty()) {
-        if let Ok(d) = engine.describe(connection_id, schema, name).await {
-            return Ok(d);
-        }
+    if let Some((schema, name)) = want.rsplit_once('.').filter(|(s, n)| !s.is_empty() && !n.is_empty())
+        && let Ok(d) = engine.describe(connection_id, schema, name).await
+    {
+        return Ok(d);
     }
     let (schema, name) = resolve_table(engine, connection_id, want).await?.ok_or_else(|| format!("no table or view named `{want}` on this connection"))?;
     engine.describe(connection_id, &schema, &name).await.map_err(|e| e.message)
@@ -423,10 +423,10 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
                 } else {
                     // Every table the note is about (`a & b`, `a or b`).
                     for (_, p) in split_target(n.target.as_deref().unwrap_or("")) {
-                        if let Some((o, _)) = ws.kn_resolve_path(connection_id, &p)? {
-                            if seen.insert(o.full_name()) {
-                                chosen.push(o);
-                            }
+                        if let Some((o, _)) = ws.kn_resolve_path(connection_id, &p)?
+                            && seen.insert(o.full_name())
+                        {
+                            chosen.push(o);
                         }
                     }
                 }
@@ -436,10 +436,10 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
         if chosen.len() >= max_tables {
             break;
         }
-        if let Some(o) = ws.kn_get(connection_id, &h.reference)? {
-            if seen.insert(o.full_name()) {
-                chosen.push(o);
-            }
+        if let Some(o) = ws.kn_get(connection_id, &h.reference)?
+            && seen.insert(o.full_name())
+        {
+            chosen.push(o);
         }
     }
     // Small databases: include everything when nothing matched.
@@ -457,10 +457,10 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
             if chosen.len() >= max_tables + 3 {
                 break;
             }
-            if let Some(r) = ws.kn_get(connection_id, &format!("{}.{}", fk.ref_schema, fk.ref_table))? {
-                if seen.insert(r.full_name()) {
-                    chosen.push(r);
-                }
+            if let Some(r) = ws.kn_get(connection_id, &format!("{}.{}", fk.ref_schema, fk.ref_table))?
+                && seen.insert(r.full_name())
+            {
+                chosen.push(r);
             }
         }
     }

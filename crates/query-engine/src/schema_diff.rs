@@ -150,12 +150,13 @@ pub fn diff_metadata(src: &SchemaMetadata, dst: &SchemaMetadata) -> Vec<ObjectDi
             _ => DiffStatus::Same,
         };
         let mut diff = ObjectDiff { name, kind, status, changes: vec![] };
-        if status == DiffStatus::Same && kind.is_relation() {
-            if let (Some(a), Some(b)) = (sc.get(k), dc.get(k)) {
-                diff.changes = table_changes(a, b);
-                if !diff.changes.is_empty() {
-                    diff.status = DiffStatus::Changed;
-                }
+        if status == DiffStatus::Same
+            && kind.is_relation()
+            && let (Some(a), Some(b)) = (sc.get(k), dc.get(k))
+        {
+            diff.changes = table_changes(a, b);
+            if !diff.changes.is_empty() {
+                diff.status = DiffStatus::Changed;
             }
         }
         out.push(diff);

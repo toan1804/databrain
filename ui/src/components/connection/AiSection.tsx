@@ -80,10 +80,10 @@ export function AiSection({ f }: { f: ConnectionFormState }) {
           label="Allow external agents (MCP)"
           help="Kiro CLI, Claude Code etc. can use this connection via the local databrain-mcp server, under the rules above. What DataBrain would ask you about, it asks through the agent (MCP elicitation); what the rules forbid is refused."
         />
-        {policy.mcp_enabled && policy.run_query === "ask" && (
+        {policy.mcp_enabled && policy.run_query === "ask" && !policy.mcp_client_approves && (
           <p className="pl-6 text-[11.5px] text-muted">
             With "Ask me every time", the agent shows you DataBrain's question before each query and the call waits for your answer (2 minutes). An agent that can't show it
-            is refused unless the box below is on. For reads without a question, choose "Automatically for read-only queries".
+            is refused unless the box below is on.
           </p>
         )}
         {policy.mcp_enabled && (
@@ -91,7 +91,7 @@ export function AiSection({ f }: { f: ConnectionFormState }) {
             checked={policy.mcp_client_approves}
             onChange={(v) => setPolicy({ ...policy, mcp_client_approves: v })}
             label="Accept the MCP client's approval"
-            help="For agents that can't show DataBrain's question: their own tool approval counts instead. Only turn this on if the agent asks you before every tool call (many approve tools on their own)."
+            help="What DataBrain would ask you about runs once the agent's own tool approval allows it, without DataBrain's question. The rules above still apply, and job changes stay in DataBrain's assistant. Only turn this on if the agent asks you before every tool call (many approve tools on their own)."
           />
         )}
       </fieldset>

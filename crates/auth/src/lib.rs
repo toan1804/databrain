@@ -591,16 +591,12 @@ impl TokenSource {
     }
 
     async fn token(&self, interactive_ok: bool, force: bool) -> Result<TokenSet, AuthError> {
-        if !force {
-            if let Some(t) = self.cached().filter(|t| !t.access_token.is_empty() && t.fresh(120)) {
-                return Ok(t);
-            }
+        if !force && let Some(t) = self.cached().filter(|t| !t.access_token.is_empty() && t.fresh(120)) {
+            return Ok(t);
         }
         let _g = self.flight.lock().await;
-        if !force {
-            if let Some(t) = self.cached().filter(|t| !t.access_token.is_empty() && t.fresh(120)) {
-                return Ok(t);
-            }
+        if !force && let Some(t) = self.cached().filter(|t| !t.access_token.is_empty() && t.fresh(120)) {
+            return Ok(t);
         }
         let t = self.obtain(interactive_ok).await?;
         self.store_tokens(&t);
@@ -641,10 +637,10 @@ impl CredentialSource for TokenSource {
         let t = self.cached().or_else(|| self.persisted());
         *self.state.lock().expect("poisoned") = None;
         self.store.delete(&self.cache_ref)?;
-        if let (TokenMode::Browser(cfg) | TokenMode::Device(cfg), Some(t)) = (&self.mode, t) {
-            if let Some(rt) = t.refresh_token {
-                oauth::revoke(cfg, &rt).await;
-            }
+        if let (TokenMode::Browser(cfg) | TokenMode::Device(cfg), Some(t)) = (&self.mode, t)
+            && let Some(rt) = t.refresh_token
+        {
+            oauth::revoke(cfg, &rt).await;
         }
         Ok(())
     }

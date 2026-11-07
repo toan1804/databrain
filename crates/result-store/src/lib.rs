@@ -243,10 +243,11 @@ impl ResultSet {
         if spec.is_identity() {
             return Ok(None);
         }
-        if let Some(c) = &self.view_cache {
-            if &c.spec == spec && c.rows == self.total_rows {
-                return Ok(Some(c.indices.clone()));
-            }
+        if let Some(c) = &self.view_cache
+            && &c.spec == spec
+            && c.rows == self.total_rows
+        {
+            return Ok(Some(c.indices.clone()));
         }
         let batch = self.combined()?;
         let idx = Arc::new(view::compute_view(&batch, spec, &mut self.display_cache)?);
@@ -282,15 +283,14 @@ impl ResultSet {
                 }
                 s.non_null += 1;
                 let text = f.value(r).to_string();
-                if numeric {
-                    if let Ok(v) = text.parse::<f64>() {
-                        if v.is_finite() {
-                            s.numbers += 1;
-                            sum += v;
-                            min = min.min(v);
-                            max = max.max(v);
-                        }
-                    }
+                if numeric
+                    && let Ok(v) = text.parse::<f64>()
+                    && v.is_finite()
+                {
+                    s.numbers += 1;
+                    sum += v;
+                    min = min.min(v);
+                    max = max.max(v);
                 }
                 if distinct.len() < MAX_DISTINCT {
                     distinct.insert(text);
@@ -420,14 +420,14 @@ impl ResultSet {
         let sortable =
             if display::is_decimal_text(&field) { compute::cast(&col, &databrain_connector_core::arrow::datatypes::DataType::Float64)? } else { col.clone() };
         let (mut min, mut max) = (None, None);
-        if col.len() > nulls as usize {
-            if let Ok(order) = compute::sort_to_indices(sortable.as_ref(), Some(compute::SortOptions { descending: false, nulls_first: false }), None) {
-                let text = display::to_display(col.as_ref())?;
-                let non_null: Vec<u32> = order.values().iter().copied().filter(|i| !sortable.is_null(*i as usize)).collect();
-                if let (Some(first), Some(last)) = (non_null.first(), non_null.last()) {
-                    min = Some(text.value(*first as usize).to_string());
-                    max = Some(text.value(*last as usize).to_string());
-                }
+        if col.len() > nulls as usize
+            && let Ok(order) = compute::sort_to_indices(sortable.as_ref(), Some(compute::SortOptions { descending: false, nulls_first: false }), None)
+        {
+            let text = display::to_display(col.as_ref())?;
+            let non_null: Vec<u32> = order.values().iter().copied().filter(|i| !sortable.is_null(*i as usize)).collect();
+            if let (Some(first), Some(last)) = (non_null.first(), non_null.last()) {
+                min = Some(text.value(*first as usize).to_string());
+                max = Some(text.value(*last as usize).to_string());
             }
         }
 

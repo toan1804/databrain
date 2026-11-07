@@ -720,21 +720,19 @@ impl QueryEngine {
         // (`account` → `ACCOUNT`), or why when the catalog or schema is
         // missing, before any CREATE TABLE fails on it (before SQL may
         // create them).
-        if !exists {
-            if let Ok(t) = self.check_load_target(connection_id, &table).await {
-                let missing = t.catalog_exists == Some(false) || t.schema_exists == Some(false);
-                if missing && before.is_empty() {
-                    let mut m = t.problems.join(" ");
-                    if let Some(sql) = &t.create_sql {
-                        m.push_str(&format!(" ({sql})"));
-                    }
-                    return Err(EngineError::new("invalid", m));
+        if !exists && let Ok(t) = self.check_load_target(connection_id, &table).await {
+            let missing = t.catalog_exists == Some(false) || t.schema_exists == Some(false);
+            if missing && before.is_empty() {
+                let mut m = t.problems.join(" ");
+                if let Some(sql) = &t.create_sql {
+                    m.push_str(&format!(" ({sql})"));
                 }
-                if !missing && t.problems.is_empty() && t.respelled {
-                    table = t.resolved.clone();
-                    if t.table_exists == Some(true) {
-                        (exists, target_cols, missing_reason) = probe(&session, dialect, &table).await?;
-                    }
+                return Err(EngineError::new("invalid", m));
+            }
+            if !missing && t.problems.is_empty() && t.respelled {
+                table = t.resolved.clone();
+                if t.table_exists == Some(true) {
+                    (exists, target_cols, missing_reason) = probe(&session, dialect, &table).await?;
                 }
             }
         }
@@ -1180,11 +1178,11 @@ mod tests {
         let user_ddl = Act::Sql { label: String::new(), sql: "alter table t add b int".into(), kind: ActKind::User };
         let stage = Act::Sql { label: String::new(), sql: "CREATE TEMPORARY TABLE s AS SELECT * FROM t WHERE 1 = 0".into(), kind: ActKind::Stage };
         assert!(transaction(ConnectorKind::Postgres, &[ddl.clone(), ins.clone()]).is_some());
-        assert!(transaction(ConnectorKind::Mssql, &[ddl.clone()]).is_some());
+        assert!(transaction(ConnectorKind::Mssql, std::slice::from_ref(&ddl)).is_some());
         assert!(transaction(ConnectorKind::Mysql, &[stage, ins.clone()]).is_some(), "temporary tables don't commit");
         assert!(transaction(ConnectorKind::Mysql, &[ddl, ins.clone()]).is_none());
         assert!(transaction(ConnectorKind::Mysql, &[user_ddl]).is_none());
-        assert!(transaction(ConnectorKind::Oracle, &[ins.clone()]).is_none());
+        assert!(transaction(ConnectorKind::Oracle, std::slice::from_ref(&ins)).is_none());
         assert!(transaction(ConnectorKind::Snowflake, &[ins]).is_none());
     }
 

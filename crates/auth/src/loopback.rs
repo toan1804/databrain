@@ -159,11 +159,11 @@ async fn handle(mut stream: TcpStream, path: &str, expected_state: Option<&str>,
         body.truncate(content_length);
         params.extend(url::form_urlencoded::parse(&body).into_owned());
     }
-    if let Some(expected) = expected_state {
-        if params.get("state").map(String::as_str) != Some(expected) {
-            respond(&mut stream, 400, "Invalid sign-in response (state mismatch).", cors.as_deref()).await;
-            return None;
-        }
+    if let Some(expected) = expected_state
+        && params.get("state").map(String::as_str) != Some(expected)
+    {
+        respond(&mut stream, 400, "Invalid sign-in response (state mismatch).", cors.as_deref()).await;
+        return None;
     }
     if params.contains_key("error") {
         let msg = params.get("error_description").or(params.get("error")).cloned().unwrap_or_default();

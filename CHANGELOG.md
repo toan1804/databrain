@@ -4,6 +4,28 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Fixed
+
+- DuckDB: a tab or notebook opening a database file just as the last session on it closed could open a second instance on the file and miss tables written just before ("Table … does not exist") or fail with "No more data remaining in MetadataReader" (Linux). It now waits for the closing instance.
+
+## 0.3.1 - 2026-11-04
+
+### Changed
+
+- MCP: with "Accept the MCP client's approval" on, the client's own tool approval is enough for what DataBrain would ask about, with any "AI may run queries" setting. Before, it only counted for clients without elicitation, so a client that declared elicitation was still asked (or refused when it didn't show the question), and reads needed "Automatically for read-only queries".
+- MCP: a call refused for want of the user's approval tells the agent how the user allows it (Edit connection → AI → "Accept the MCP client's approval").
+- MCP: `create_job`, `update_job` and `run_job` are no longer offered to MCP clients. Jobs are created, changed and run in DataBrain's assistant; `list_jobs` and `get_job` still work over MCP.
+- Large source files are split into modules (connector `lib.rs` files, `tools`, `jobs`, `sql`, `databricks`, the DuckDB trampolines) with no change in behaviour, and all clippy warnings are fixed.
+
+### Added
+
+- `docs/ADDING_A_CONNECTOR.md`: a guide for developers and AI agents on adding a database type so that every feature works for it or says why not, with a support matrix of the current connectors. `AGENTS.md` and a Kiro steering file point to it.
+
+### Security
+
+- A Databricks CLI profile's token is sent only to the profile's own host; a connection to another host no longer uses it.
+- Query history, job logs and job run errors redact secrets like the AI audit log does (seven common password forms: `PASSWORD =`, `ATTACH 'postgres://u:pw@h'`, `MASTER_PASSWORD=`, `pwd:`, `@rmtpassword=` and others), including what was stored before.
+
 ## 0.3.0 - 2026-11-03
 
 ### Security

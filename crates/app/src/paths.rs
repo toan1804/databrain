@@ -70,14 +70,12 @@ pub fn checked(path: &str, purpose: Purpose) -> Result<PathBuf> {
         return Err(invalid(format!("DataBrain doesn't read or write hidden files and folders from here: {path}")));
     }
     let writes = matches!(purpose, Purpose::Export | Purpose::SaveText | Purpose::SaveImage | Purpose::WriteJson | Purpose::WriteSql);
-    if writes {
-        if let Ok(m) = std::fs::symlink_metadata(&p) {
-            if m.file_type().is_symlink() {
-                return Err(invalid(format!("won't write through a symbolic link: {path}")));
-            }
-            if m.is_dir() {
-                return Err(invalid(format!("is a folder: {path}")));
-            }
+    if writes && let Ok(m) = std::fs::symlink_metadata(&p) {
+        if m.file_type().is_symlink() {
+            return Err(invalid(format!("won't write through a symbolic link: {path}")));
+        }
+        if m.is_dir() {
+            return Err(invalid(format!("is a folder: {path}")));
         }
     }
     let ext = ext_of(&p);
@@ -88,10 +86,10 @@ pub fn checked(path: &str, purpose: Purpose) -> Result<PathBuf> {
         Purpose::WriteJson | Purpose::ReadJson => Some(JSON),
         Purpose::WriteSql | Purpose::Read | Purpose::Import => None,
     };
-    if let Some(list) = allowed {
-        if !list.contains(&ext.as_str()) {
-            return Err(invalid(format!("unexpected file type '.{ext}' (expected {})", list.iter().map(|e| format!(".{e}")).collect::<Vec<_>>().join(", "))));
-        }
+    if let Some(list) = allowed
+        && !list.contains(&ext.as_str())
+    {
+        return Err(invalid(format!("unexpected file type '.{ext}' (expected {})", list.iter().map(|e| format!(".{e}")).collect::<Vec<_>>().join(", "))));
     }
     if purpose == Purpose::WriteSql && NOT_SQL.contains(&ext.as_str()) {
         return Err(invalid(format!("won't save a query as a '.{ext}' file")));

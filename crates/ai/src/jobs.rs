@@ -215,11 +215,12 @@ pub fn build_job(args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Re
         let sql = s(st, "sql").unwrap_or_default().to_string();
         // results.<step> of this job: the step reads it, so it runs after it.
         for r in results_refs(&sql) {
-            if let Some(from) = id_of(&r) {
-                if from != id && !ups.contains(&from) {
-                    ups.push(from);
-                    notes.push(format!("\"{n}\" reads results.{r}, so it runs after \"{r}\""));
-                }
+            if let Some(from) = id_of(&r)
+                && from != id
+                && !ups.contains(&from)
+            {
+                ups.push(from);
+                notes.push(format!("\"{n}\" reads results.{r}, so it runs after \"{r}\""));
             }
         }
         let mut node = json!({"id": id, "name": n, "kind": kind, "sql": sql});
@@ -589,24 +590,24 @@ pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<Str
         a["name"] = json!(old.name);
     }
     // Renamed outputs: the other steps' SQL follows.
-    if !rename.is_empty() {
-        if let Some(steps) = a.get_mut("steps").and_then(|x| x.as_array_mut()) {
-            for st in steps {
-                if let Some(after) = st.get_mut("after").and_then(|x| x.as_array_mut()) {
-                    for a in after.iter_mut() {
-                        if let Some((_, n)) = a.as_str().and_then(|v| rename.iter().find(|(o, _)| o.eq_ignore_ascii_case(v.trim()))) {
-                            *a = json!(n);
-                        }
+    if !rename.is_empty()
+        && let Some(steps) = a.get_mut("steps").and_then(|x| x.as_array_mut())
+    {
+        for st in steps {
+            if let Some(after) = st.get_mut("after").and_then(|x| x.as_array_mut()) {
+                for a in after.iter_mut() {
+                    if let Some((_, n)) = a.as_str().and_then(|v| rename.iter().find(|(o, _)| o.eq_ignore_ascii_case(v.trim()))) {
+                        *a = json!(n);
                     }
                 }
-                if let Some(sql) = st.get("sql").and_then(|x| x.as_str()).map(str::to_string) {
-                    let mut sql2 = sql.clone();
-                    for (o, n) in &rename {
-                        sql2 = rename_results(&sql2, o, n);
-                    }
-                    if sql2 != sql {
-                        st["sql"] = json!(sql2);
-                    }
+            }
+            if let Some(sql) = st.get("sql").and_then(|x| x.as_str()).map(str::to_string) {
+                let mut sql2 = sql.clone();
+                for (o, n) in &rename {
+                    sql2 = rename_results(&sql2, o, n);
+                }
+                if sql2 != sql {
+                    st["sql"] = json!(sql2);
                 }
             }
         }

@@ -8,7 +8,8 @@ use databrain_connector_core::{
     ColumnInfo, DbObject, ForeignKey, ObjectDetail, ObjectKind, Result, TableColumns, TableLayout, query_text, quote_literal, split_key_list,
 };
 
-use super::{PgSession, quote};
+use crate::ddl::quote;
+use crate::session::PgSession;
 
 /// `PRIMARY KEY (a, "b c")` / `FOREIGN KEY (a) REFERENCES s.t(b)` → the column lists (and target).
 pub(crate) fn parse_key_columns(def: &str) -> Vec<String> {
@@ -221,7 +222,7 @@ impl PgSession {
         let columns: Vec<ColumnInfo> = self.rs_columns(schema, Some(name)).await?.into_iter().map(|(_, c)| c).collect();
         let ddl = match self.rs_show(obj.kind, schema, name).await {
             Some(d) => Some(d),
-            None if obj.kind == ObjectKind::Table => Some(super::table_ddl(schema, name, &columns)),
+            None if obj.kind == ObjectKind::Table => Some(crate::ddl::table_ddl(schema, name, &columns)),
             None => None,
         };
         let foreign_keys = self.rs_foreign_keys(schema, Some(name)).await?.into_iter().map(|(_, f)| f).collect();

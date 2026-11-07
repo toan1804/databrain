@@ -31,10 +31,10 @@ pub fn data_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("DATABRAIN_DATA_DIR") {
         return d.into();
     }
-    if let Some(ws) = std::env::var_os("DATABRAIN_WORKSPACE") {
-        if let Some(p) = Path::new(&ws).parent() {
-            return p.to_path_buf();
-        }
+    if let Some(ws) = std::env::var_os("DATABRAIN_WORKSPACE")
+        && let Some(p) = Path::new(&ws).parent()
+    {
+        return p.to_path_buf();
     }
     dirs::data_dir().unwrap_or_else(|| ".".into()).join("dev.databrain.app")
 }

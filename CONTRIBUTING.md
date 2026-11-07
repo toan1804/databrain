@@ -6,7 +6,7 @@ Thanks for helping. Bug reports, fixes and new database types are welcome. For a
 
 - For a bug, open an issue with the version, platform, database type and steps to reproduce.
 - For a feature or a larger change, open an issue first so we can agree on the approach.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how the crates fit together; §5.4 covers adding a database type.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how the crates fit together. To add a database type, follow [docs/ADDING_A_CONNECTOR.md](docs/ADDING_A_CONNECTOR.md).
 
 ## Building and testing
 

@@ -168,10 +168,10 @@ fn constraints(rows: &Rows) -> Vec<Constraint<'_>> {
             });
         }
         let c = out.last_mut().unwrap();
-        if let Some(col) = get(r, 7) {
-            if !c.cols.contains(&col) {
-                c.cols.push(col);
-            }
+        if let Some(col) = get(r, 7)
+            && !c.cols.contains(&col)
+        {
+            c.cols.push(col);
         }
         if let Some(rc) = get(r, 10) {
             c.r_cols.push(rc);

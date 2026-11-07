@@ -2,13 +2,16 @@
 //! stdio). Lets external agents such as Kiro CLI or Claude Code use
 //! DataBrain's tools on connections that opted in (`ai_policy.mcp_enabled`).
 //! The same policy engine applies. What the connection's policy forbids is
-//! refused. What DataBrain would ask the user about is asked through the
-//! client (MCP elicitation) when the client supports it; otherwise it is
-//! refused, unless the connection accepts the client's own tool approval
-//! (`ai_policy.mcp_client_approves`): many clients approve tools on their own.
+//! refused. What DataBrain would ask the user about runs on the client's own
+//! tool approval where the connection accepts it
+//! (`ai_policy.mcp_client_approves`); otherwise it is asked through the
+//! client (MCP elicitation) when the client supports it, and refused when it
+//! doesn't, with a guide for the user to turn that setting on.
 //! A question the client never answers (it declared elicitation but doesn't
 //! show prompts in its mode) times out with a message that says what to
-//! change, and no further question is asked in that session.
+//! change, and no further question is asked in that session. Jobs are
+//! created, changed and run only in DataBrain's assistant
+//! (`tools::APP_ONLY_TOOLS`); MCP clients can list and read them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,7 +26,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::tools::{Caller, ToolContext, ToolHost, specs};
+use crate::tools::{APP_ONLY_TOOLS, Caller, ToolContext, ToolHost, specs};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -223,11 +226,10 @@ fn annotations(name: &str) -> Value {
         | "get_job" => (true, false, true),
         // Refreshes DataBrain's own index of table descriptions.
         "index_tables" => (false, false, true),
-        "add_knowledge_note" | "save_query" | "create_job" => (false, false, false),
-        // Replaces a note / a job's steps.
-        "update_knowledge_note" | "update_job" => (false, true, true),
-        // SQL (writes where the connection's AI policy allows them) and jobs
-        // (load steps write into tables).
+        "add_knowledge_note" | "save_query" => (false, false, false),
+        // Replaces a note's text.
+        "update_knowledge_note" => (false, true, true),
+        // SQL (writes where the connection's AI policy allows them).
         _ => (false, true, false),
     };
     json!({"readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": false})
@@ -240,7 +242,8 @@ fn tool_list() -> Vec<Value> {
         "inputSchema": {"type": "object", "properties": {}},
         "annotations": annotations("list_connections"),
     })];
-    for t in specs(false) {
+    // Creating, changing and running jobs stays in DataBrain's assistant.
+    for t in specs(false).into_iter().filter(|t| !APP_ONLY_TOOLS.contains(&t.name.as_str())) {
         // `save_query` and notes are allowed; every tool gets a `connection` argument.
         let mut schema = t.parameters.clone();
         schema["properties"]["connection"] = json!({"type": "string", "description": "Connection name or id (see list_connections)"});
@@ -315,7 +318,7 @@ impl McpServer {
                 "protocolVersion": msg.pointer("/params/protocolVersion").and_then(|v| v.as_str()).unwrap_or(PROTOCOL_VERSION),
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {"name": "databrain", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "Use list_connections first. search_schema/describe_table explain the database; run_query executes read-only SQL where the connection allows it; query_result aggregates results locally.",
+                "instructions": "Use list_connections first. search_schema/describe_table explain the database; run_query executes SQL where the connection allows it; query_result aggregates results locally. list_jobs/get_job read jobs; creating, changing and running jobs is only available in DataBrain's own assistant. When a call is refused because DataBrain needs the user's approval, pass the error's guide on to the user.",
                 }))
             }
             "ping" => Ok(json!({})),
