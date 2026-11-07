@@ -59,6 +59,20 @@ pub struct MongoInfo {
     /// Collections read and written, `[db, coll]` or `[coll]`.
     pub reads: Vec<Vec<String>>,
     pub writes: Vec<Vec<String>>,
+    /// `$lookup` equalities between the aggregated collection's fields and
+    /// another collection's (only where the field still is the collection's:
+    /// see the connector's analyzer).
+    pub joins: Vec<MongoJoin>,
+}
+
+/// `local.local_field = from.foreign_field`, from a `$lookup` stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MongoJoin {
+    /// `[db, coll]` or `[coll]`.
+    pub local: Vec<String>,
+    pub local_field: String,
+    pub from: Vec<String>,
+    pub foreign_field: String,
 }
 
 /// Parses a command the way the MongoDB connector runs it; `None` when it
@@ -76,6 +90,12 @@ pub fn set_mongo_analyzer(f: MongoAnalyzer) {
 /// won't run either); `None` = no analyzer in this process.
 fn mongo_info(text: &str) -> Option<Option<MongoInfo>> {
     MONGO_ANALYZER.get().map(|f| f(text))
+}
+
+/// `$lookup` joins of a MongoDB command: `None` when no analyzer is set
+/// in this process or the command doesn't parse.
+pub fn mongo_joins(text: &str) -> Option<Vec<MongoJoin>> {
+    mongo_info(text).flatten().map(|i| i.joins)
 }
 
 /// `{"find": "orders", …}`, `db.orders.find({…})` or `db.orders.insertOne(…)`.

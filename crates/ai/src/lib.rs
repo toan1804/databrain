@@ -7,6 +7,7 @@ pub mod ghost;
 pub mod jobs;
 pub mod kiro;
 pub mod knowledge;
+pub mod learn;
 pub mod mcp;
 pub mod pii;
 pub mod policy;

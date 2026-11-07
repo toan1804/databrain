@@ -325,6 +325,26 @@ impl Workspace {
         Ok(())
     }
 
+    /// Every `(schema, name)` of a table or view called `name` (any case)
+    /// in the knowledge index or the explorer cache, one per schema.
+    pub fn tables_named(&self, connection_id: &str, name: &str) -> Result<Vec<(String, String)>> {
+        let c = self.conn.lock();
+        let mut stmt = c.prepare(
+            "SELECT schema_name, name FROM kn_objects WHERE connection_id = ?1 AND lower(name) = lower(?2) \
+             UNION ALL \
+             SELECT schema_name, name FROM meta_objects WHERE connection_id = ?1 AND lower(name) = lower(?2) \
+               AND kind NOT IN ('function', 'procedure', 'package', 'sequence', 'other')",
+        )?;
+        let mut out: Vec<(String, String)> = Vec::new();
+        for r in stmt.query_map(params![connection_id, name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (schema, n) = r?;
+            if !out.iter().any(|(s, _)| s.eq_ignore_ascii_case(&schema)) {
+                out.push((schema, n));
+            }
+        }
+        Ok(out)
+    }
+
     /// Drop sightings older than `days` (scores decay; very old ones no longer matter).
     pub fn prune_learned(&self, days: u32) -> Result<()> {
         let cutoff = (now_ms() - i64::from(days) * DAY_MS).div_euclid(DAY_MS);

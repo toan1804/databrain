@@ -323,17 +323,26 @@ committed alongside.
   clearing history, cursor, forget, prune, cascade, policy default.
 
 **Step 3: `feat(ai): learn joins from query history`**
-- `crates/ai/src/learn.rs` (new): `learn_pass(ws, conn, limit) -> LearnReport`.
-  Origin rules (§3.2), job dedupe per fingerprint per day, table resolution
-  via `kn_resolve_path` then explorer cache, declared-FK matching, skips SQL
-  over 200 KB, non-SQL engines except MongoDB `$lookup` (parsed like
-  `access.rs` does).
-- `surfaced(join)`: confirmed, or learned with `queries ≥ 2 || days ≥ 2`,
-  columns still in `kn_objects`, not rejected.
+- `crates/ai/src/learn.rs` (new): `learn_pass(ws, conn, limit) -> LearnReport`
+  and `learn_all`; `surfaced(join)` (confirmed, or learned with
+  `queries ≥ 2 || days ≥ 2`; rejected never). Column staleness is checked
+  where joins are used (step 4).
+- Tables are resolved strictly (`Workspace::tables_named` over the knowledge
+  index and explorer cache): a qualified name must match one schema; a bare
+  name must exist in one schema, or one of its schemas must be the
+  connection's default (`access::defaults`). Otherwise nothing is learned.
+- MongoDB: the connector's analyzer now returns `MongoInfo.joins` from
+  `$lookup` `localField`/`foreignField`, only when the field is still the
+  aggregated collection's (only `$match`, `$sort`, `$limit`, `$skip`,
+  `$sample`, `$unwind`, `$lookup` before it, and not inside an earlier
+  lookup's `as`). Learned as kind `left`.
+- With learning off nothing is read and the cursor stays (turning it on
+  learns the backlog); kinds that can't be learned move the cursor to the end.
 - Tests: user run counts, AI-panel/MCP run does not, AI SQL run from the
-  editor (origin `user`) counts, job dedupe, cursor resume, unresolved
-  dropped, threshold edges (1 query 1 day → hidden; 2 queries → shown;
-  1 query 2 days → shown).
+  editor (origin `user`) counts, job dedupe, other literal values are the same
+  query, cursor resume, failed/huge SQL skipped, unresolved and ambiguous
+  names dropped, default schema wins, declared FK marked, usage, learning
+  off then on, unsupported engine, threshold edges.
 
 **Step 4: `feat(ai): use learned joins in retrieval, prompts and tools`**
 - `knowledge.rs`: usage boost in ranking, learned-edge expansion next to FK
