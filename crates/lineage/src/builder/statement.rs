@@ -226,6 +226,7 @@ impl<'a> Builder<'a> {
             self.assign(t, a, &sources, &scope);
         }
         if let Some(w) = &u.selection {
+            self.equi_joins(w, JoinKind::Where, &sources, &env.outer);
             let at = self.g.edges.len();
             self.rows(t, w, EdgeKind::Filter, &sources, &scope);
             self.detail_since(at, format!("UPDATE … WHERE {w}"));
@@ -327,6 +328,7 @@ impl<'a> Builder<'a> {
         }
         let scope = Env { ctes: env.ctes.clone(), outer: sources.clone() };
         if let Some(w) = &d.selection {
+            self.equi_joins(w, JoinKind::Where, &sources, &env.outer);
             let at = self.g.edges.len();
             self.rows(t, w, EdgeKind::Filter, &sources, &scope);
             self.detail_since(at, format!("DELETE … WHERE {w}"));
@@ -351,6 +353,7 @@ impl<'a> Builder<'a> {
         self.factor(&m.source, &env, &mut sources, t);
         let scope = Env { ctes: env.ctes.clone(), outer: sources.clone() };
         let e = self.g.edges.len();
+        self.equi_joins(&m.on, JoinKind::Inner, &sources, &env.outer);
         self.rows(t, &m.on, EdgeKind::Join, &sources, &scope);
         self.detail_since(e, format!("MERGE … USING {} ON {}", m.source, m.on));
         for c in &m.clauses {

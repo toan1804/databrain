@@ -213,3 +213,59 @@ impl<F: Fn(&[String]) -> Option<CatalogTable>> Catalog for F {
         self(parts)
     }
 }
+
+/// How two tables were joined, as written: `Left` keeps every row of the
+/// left side (the right side may be missing), `Right` the opposite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Semi,
+    Anti,
+    /// An equality in `WHERE` between two tables of the `FROM` (`FROM a, b
+    /// WHERE a.id = b.a_id`) or with an outer query (correlated subquery).
+    Where,
+}
+
+impl JoinKind {
+    /// The same join seen from the other side.
+    pub fn flipped(self) -> Self {
+        match self {
+            JoinKind::Left => JoinKind::Right,
+            JoinKind::Right => JoinKind::Left,
+            k => k,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JoinKind::Inner => "inner",
+            JoinKind::Left => "left",
+            JoinKind::Right => "right",
+            JoinKind::Full => "full",
+            JoinKind::Semi => "semi",
+            JoinKind::Anti => "anti",
+            JoinKind::Where => "where",
+        }
+    }
+}
+
+/// Database tables joined on equal columns: `left.left_columns[i] =
+/// right.right_columns[i]` for every `i` (several for a composite key). Only
+/// columns that are plain columns of database tables or views (through any
+/// CTEs and subqueries that pass them on unchanged) are reported; anything
+/// computed, unresolved or ambiguous is left out.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct JoinPair {
+    /// Qualified name as the catalog knows it (`sales.orders`), else as written.
+    pub left: String,
+    pub left_columns: Vec<String>,
+    pub right: String,
+    pub right_columns: Vec<String>,
+    pub kind: JoinKind,
+    /// Statement (index) of the script.
+    pub statement: usize,
+}

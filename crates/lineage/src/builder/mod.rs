@@ -7,6 +7,7 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Location, Span, Token, Tokenizer};
 
 mod from;
+mod joins;
 mod query;
 mod resolve;
 mod statement;
@@ -17,6 +18,17 @@ use crate::*;
 
 /// Lineage of every statement of `sql`.
 pub fn analyze(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> Lineage {
+    build(sql, kind, catalog).0
+}
+
+/// Database tables joined on equal columns in `sql` (see [`JoinPair`]), for
+/// learning how tables join from query history. Statements that don't parse
+/// contribute nothing.
+pub fn join_pairs(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> Vec<JoinPair> {
+    build(sql, kind, catalog).1
+}
+
+fn build(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> (Lineage, Vec<JoinPair>) {
     let mut b = Builder {
         g: Lineage::default(),
         cat: catalog,
@@ -29,6 +41,8 @@ pub fn analyze(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> Lineage
         base: 0,
         lines: vec![],
         stmt: 0,
+        joins: vec![],
+        clause: 0,
     };
     let spans = split_statements(sql, kind);
     let many = spans.len() > 1;
@@ -64,7 +78,8 @@ pub fn analyze(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> Lineage
     unknown.dedup();
     b.g.unknown_tables = unknown;
     b.g.flows = flows(&b.g);
-    b.g
+    let joins = b.join_pairs();
+    (b.g, joins)
 }
 
 // ------------------------------------------------------------------ builder
@@ -86,6 +101,10 @@ struct Builder<'a> {
     base: usize,
     lines: Vec<usize>,
     stmt: usize,
+    /// Equalities between sources, for [`join_pairs`].
+    joins: Vec<joins::RawJoin>,
+    /// Counter of conditions seen (groups composite keys).
+    clause: usize,
 }
 
 impl<'a> Builder<'a> {

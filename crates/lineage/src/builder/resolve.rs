@@ -22,6 +22,11 @@ impl<'a> Builder<'a> {
 
     /// The source column a reference means: (node, column name).
     pub(super) fn resolve(&mut self, sources: &[Source], outer: &[Source], parts: &[Ident]) -> Option<(usize, String)> {
+        self.resolve_source(sources, outer, parts).map(|(_, n, c)| (n, c))
+    }
+
+    /// [`Self::resolve`], also returning the source (alias) the column was found in.
+    pub(super) fn resolve_source(&mut self, sources: &[Source], outer: &[Source], parts: &[Ident]) -> Option<(Source, usize, String)> {
         let span = self.range(Span::union_iter(parts.iter().map(|i| i.span)));
         let written = parts.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join(".");
         let col = parts.last()?.value.clone();
@@ -29,11 +34,11 @@ impl<'a> Builder<'a> {
             let qual: Vec<String> = parts[..parts.len() - 1].iter().map(|i| i.value.clone()).collect();
             for scope in [sources, outer] {
                 if let Some(s) = self.find_source(scope, &qual) {
-                    return self.column_of(&s, &col, &written, span);
+                    return self.column_of(&s, &col, &written, span).map(|(n, c)| (s, n, c));
                 }
             }
             // `col.field` (struct / JSON access) on an unqualified column.
-            if let Some(r) = self.resolve(sources, outer, &parts[..1]) {
+            if let Some(r) = self.resolve_source(sources, outer, &parts[..1]) {
                 return Some(r);
             }
             self.warn(format!("Unknown table or alias in {written}"), span);
@@ -47,13 +52,13 @@ impl<'a> Builder<'a> {
             }
             if let Some(s) = with.first() {
                 let s = (*s).clone();
-                return self.column_of(&s, &col, &written, span);
+                return self.column_of(&s, &col, &written, span).map(|(n, c)| (s, n, c));
             }
             // Only tables with unknown columns could have it.
             let unknown: Vec<&Source> = scope.iter().filter(|s| self.g.nodes[s.node].kind == NodeKind::Table && !self.g.nodes[s.node].columns_known).collect();
             if unknown.len() == 1 {
                 let s = unknown[0].clone();
-                return self.column_of(&s, &col, &written, span);
+                return self.column_of(&s, &col, &written, span).map(|(n, c)| (s, n, c));
             }
             if unknown.len() > 1 {
                 self.warn(format!("Can't tell which table {col} belongs to (columns not cached); qualify it as alias.{col}"), span);

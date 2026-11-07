@@ -41,6 +41,17 @@ impl<'a> Builder<'a> {
                 _ => String::new(),
             };
             let detail = format!("{op} {}{cond}", j.relation);
+            if let Some(kind) = joins::join_kind(&j.join_operator) {
+                match constraint {
+                    Some(JoinConstraint::On(e)) => self.equi_joins(e, kind, sources, &env.outer),
+                    Some(JoinConstraint::Using(cols)) => {
+                        let idents: Vec<Vec<Ident>> = cols.iter().map(|c| vec![Ident::new(name_parts(c).last().cloned().unwrap_or_default())]).collect();
+                        let (l, r) = sources.split_at(left);
+                        self.using_joins(&idents, kind, l, r, &env.outer);
+                    }
+                    _ => {}
+                }
+            }
             match constraint {
                 Some(JoinConstraint::On(e)) => self.rows(n, e, EdgeKind::Join, sources, &scope),
                 Some(JoinConstraint::Using(cols)) => {

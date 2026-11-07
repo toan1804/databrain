@@ -208,6 +208,9 @@ impl<'a> Builder<'a> {
         }
         for (kw, f) in [("WHERE", &sel.selection), ("HAVING", &sel.having), ("QUALIFY", &sel.qualify), ("PREWHERE", &sel.prewhere)] {
             if let Some(f) = f {
+                if kw == "WHERE" {
+                    self.equi_joins(f, JoinKind::Where, &sources, &env.outer);
+                }
                 let at = self.g.edges.len();
                 self.rows(n, f, EdgeKind::Filter, &sources, &scope_env);
                 self.detail_since(at, format!("{kw} {f}"));
