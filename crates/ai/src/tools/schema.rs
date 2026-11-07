@@ -62,8 +62,46 @@ impl ToolContext {
         if !refs.is_empty() {
             text.push_str(&format!("\nReferenced by: {}", refs.join(", ")));
         }
+        for l in knowledge::join_lines(&full, &knowledge::usable_joins(ws, &target)?) {
+            text.push('\n');
+            text.push_str(&l);
+        }
         self.audit("describe_table", args, "allowed", None);
         Ok(out(text, json!({"table": full})))
+    }
+
+    pub(super) fn find_join_path(&self, args: &Value) -> Result<ToolOutput> {
+        let target = self.schema_target(args)?;
+        if !target.ai_policy.share_metadata {
+            return Err(AiError::Policy("sharing table metadata is disabled for this connection".into()));
+        }
+        let (from, to) = (arg(args, "from")?, arg(args, "to")?);
+        let hops = args.get("max_hops").and_then(|h| h.as_u64()).unwrap_or(3).clamp(1, 4) as usize;
+        let paths = match knowledge::join_paths(self.engine.workspace(), &target, from, to, hops) {
+            Ok(p) => p,
+            Err(e) => {
+                self.audit("find_join_path", args, "refused", Some(&e.to_string()));
+                return Err(e);
+            }
+        };
+        self.audit("find_join_path", args, "allowed", Some(&format!("{} paths", paths.len())));
+        if paths.is_empty() {
+            return Ok(out(
+                format!(
+                    "No way to join {from} to {to} in at most {hops} joins over declared foreign keys and learned joins. Check describe_table for both, or ask the user."
+                ),
+                json!({"paths": []}),
+            ));
+        }
+        let mut text = String::new();
+        for (i, p) in paths.iter().enumerate() {
+            text.push_str(&format!("Path {} ({} join{}):\n", i + 1, p.len(), if p.len() == 1 { "" } else { "s" }));
+            for s in p {
+                let on: Vec<String> = s.from_columns.iter().zip(&s.to_columns).map(|(a, b)| format!("{}.{a} = {}.{b}", s.from, s.to)).collect();
+                text.push_str(&format!("  JOIN {} ON {}  -- {}\n", s.to, on.join(" AND "), s.source));
+            }
+        }
+        Ok(out(text.trim_end().to_string(), json!({"paths": paths})))
     }
 
     pub(super) async fn index_tables(&self, args: &Value) -> Result<ToolOutput> {

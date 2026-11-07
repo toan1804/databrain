@@ -345,16 +345,24 @@ committed alongside.
   off then on, unsupported engine, threshold edges.
 
 **Step 4: `feat(ai): use learned joins in retrieval, prompts and tools`**
-- `knowledge.rs`: usage boost in ranking, learned-edge expansion next to FK
-  expansion, `JOIN … -- learned` lines in `render_object`, all gated by
-  `learn_from_history` and `share_metadata`, filtered by table access rules.
-- `agent.rs`: one system-prompt line explaining learned joins.
-- `tools/schema.rs` + `tools/specs.rs`: learned joins in `describe_table`;
-  new `find_join_path` (BFS, ≤ 3 hops, access-checked, audited like
-  `describe_table`). `mcp.rs`: list it as read-only.
-- Tests (allowed and refused): shown with sharing on; hidden with sharing
-  off, with learning off, when either table is denied, when a column went
-  stale; path blocked by a denied table.
+- `knowledge.rs`: `usable_joins` (surfaced, not declared, both tables
+  readable under the access rules, columns still present; empty without
+  `share_metadata` or with learning off), `join_lines` (rendered from the
+  table's side, the usual kind flipped to match), `join_paths` (BFS over
+  declared FKs + usable joins, ≤ `max_hops`, up to 3 shortest paths, declared
+  keys first; denied tables never on a path, naming one is refused).
+- `retrieve`: BM25 scores scaled by `1 + 0.2·ln(1 + queries)` of table usage;
+  learned partners of the top 4 tables added after FK expansion within the
+  same cap; `JOIN` lines appended to each table; `Retrieved.learned_joins`.
+- Unlike the rest of the schema context, learned joins are filtered by the
+  table access rules (the rules otherwise only apply when SQL runs).
+- `agent.rs`: a prompt line when learned joins are shown. `describe_table`
+  lists them. New read-only tool `find_join_path` (agent and MCP, audited,
+  refused without `share_metadata`).
+- Tests (allowed and refused): rendering from both sides, retrieval partners,
+  sharing off, learning off, deny and allow lists, rejected / stale / declared
+  hidden, confirmed shown, usage ranking, multi-hop paths, hop limit, denied
+  table on or at the end of a path, declared keys without learning.
 
 **Step 5: `feat(app): background learner and Learned tab`**
 - `crates/app/src/ai_api.rs`: 60 s learner tick + start-up and post-index

@@ -215,6 +215,7 @@ fn annotations(name: &str) -> Value {
         "list_connections"
         | "search_schema"
         | "describe_table"
+        | "find_join_path"
         | "list_tables"
         | "get_sample_rows"
         | "query_result"
