@@ -58,8 +58,8 @@ pub(crate) async fn list_history(state: State<'_, AppState>, query: HistoryQuery
 }
 
 #[tauri::command]
-pub(crate) async fn clear_history(state: State<'_, AppState>, what: Option<databrain_workspace::HistoryClear>) -> R<usize> {
-    api::clear_history(&state, what)
+pub(crate) async fn clear_history(state: State<'_, AppState>, what: Option<databrain_workspace::HistoryClear>, forget_learned: Option<bool>) -> R<usize> {
+    api::clear_history(&state, what, forget_learned.unwrap_or(false))
 }
 
 #[tauri::command]

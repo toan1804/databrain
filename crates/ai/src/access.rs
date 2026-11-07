@@ -64,7 +64,7 @@ pub fn like(pattern: &str, text: &str) -> bool {
 
 /// Levels of names on this engine (table included) and the defaults that
 /// complete an unqualified name, outermost first (`None` = not known).
-fn defaults(profile: &ConnectionProfile) -> Vec<Option<String>> {
+pub(crate) fn defaults(profile: &ConnectionProfile) -> Vec<Option<String>> {
     let c = &profile.config;
     let opt = |k: &str| c.opt(k).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
     let db = c.database.clone().filter(|d| !d.trim().is_empty());

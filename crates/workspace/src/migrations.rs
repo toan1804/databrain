@@ -317,6 +317,45 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX param_sets_name ON param_sets(lower(name));
     ALTER TABLE job_runs ADD COLUMN params_json TEXT;
     "#,
+    // v16: knowledge learned from query history (joins, table usage)
+    r#"
+    CREATE TABLE kn_joins (
+        id            INTEGER PRIMARY KEY,
+        connection_id TEXT NOT NULL,
+        left_table    TEXT NOT NULL,
+        left_cols     TEXT NOT NULL,
+        right_table   TEXT NOT NULL,
+        right_cols    TEXT NOT NULL,
+        status        TEXT NOT NULL DEFAULT 'learned',
+        declared      INTEGER NOT NULL DEFAULT 0,
+        first_seen    INTEGER NOT NULL,
+        UNIQUE (connection_id, left_table, left_cols, right_table, right_cols)
+    );
+    CREATE TABLE kn_join_seen (
+        join_id     INTEGER NOT NULL REFERENCES kn_joins(id) ON DELETE CASCADE,
+        fingerprint TEXT NOT NULL,
+        day         INTEGER NOT NULL,
+        ai          INTEGER NOT NULL,
+        kind        TEXT NOT NULL,
+        history_id  INTEGER NOT NULL,
+        at          INTEGER NOT NULL,
+        PRIMARY KEY (join_id, fingerprint, day, ai)
+    );
+    CREATE TABLE kn_table_seen (
+        connection_id TEXT NOT NULL,
+        table_name    TEXT NOT NULL,
+        fingerprint   TEXT NOT NULL,
+        day           INTEGER NOT NULL,
+        at            INTEGER NOT NULL,
+        PRIMARY KEY (connection_id, table_name, fingerprint, day)
+    );
+    CREATE TABLE kn_learn_state (
+        connection_id   TEXT PRIMARY KEY,
+        last_history_id INTEGER NOT NULL,
+        learned_at      INTEGER NOT NULL,
+        error           TEXT
+    );
+    "#,
 ];
 
 impl Workspace {

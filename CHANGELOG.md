@@ -4,6 +4,12 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Added
+
+- The AI learns how tables join from query history (Edit connection → AI → "Learn from query history", on by default): join keys from queries you and your jobs ran, including tables without declared foreign keys, and which tables are used most. A join is given to the AI after 2 different queries or 2 days of use, or when you confirm it; the AI's own queries never count. Review, confirm, reject or forget them in Knowledge → "Learned from query history".
+- `find_join_path` tool (assistant and MCP): the shortest chains of joins between two tables over declared foreign keys and learned joins.
+- Clear history → "Also forget what the AI learned from history".
+
 ### Fixed
 
 - DuckDB: a tab or notebook opening a database file just as the last session on it closed could open a second instance on the file and miss tables written just before ("Table … does not exist") or fail with "No more data remaining in MetadataReader" (Linux). It now waits for the closing instance.

@@ -24,6 +24,12 @@ export function AiSection({ f }: { f: ConnectionFormState }) {
             label="Save AI notes directly"
             help="Notes the AI adds or updates while exploring skip review in Knowledge"
           />
+          <Check
+            checked={policy.learn_from_history}
+            onChange={(v) => setPolicy({ ...policy, learn_from_history: v })}
+            label="Learn from query history"
+            help="How tables join, from queries you and jobs ran; review in Knowledge"
+          />
           {kind === "duckdb" && (
             <Check
               checked={!!policy.external_access}

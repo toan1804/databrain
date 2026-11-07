@@ -131,6 +131,7 @@ impl ToolContext {
         let r = match name {
             "search_schema" => self.search_schema(args),
             "describe_table" => self.describe_table(args),
+            "find_join_path" => self.find_join_path(args),
             "index_tables" => self.index_tables(args).await,
             "list_tables" => self.list_tables(args),
             "get_sample_rows" => self.sample_rows(args).await,

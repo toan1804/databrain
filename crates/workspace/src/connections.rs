@@ -92,6 +92,9 @@ pub struct AiPolicy {
     /// Notes the AI adds or updates are saved directly instead of waiting
     /// for review in Knowledge.
     pub auto_approve_notes: bool,
+    /// Learn how tables join (and which are used most) from this
+    /// connection's query history, and give that to the AI with the schema.
+    pub learn_from_history: bool,
     /// Tables the AI may read: LIKE patterns (`%`, `_`; case-insensitive)
     /// matched against `catalog.schema.table`, `schema.table` and `table`.
     /// Empty = every table.
@@ -125,6 +128,7 @@ impl Default for AiPolicy {
             mcp_enabled: false,
             mcp_client_approves: false,
             auto_approve_notes: false,
+            learn_from_history: true,
             read_allow: vec![],
             read_deny: vec![],
             write_allow: vec![],
@@ -200,7 +204,7 @@ impl Workspace {
     }
 
     /// Delete a connection and the data that only belongs to it (AI
-    /// knowledge: indexed metadata, notes, index state). Saved queries,
+    /// knowledge: indexed metadata, notes, index state, what was learned from history). Saved queries,
     /// history, notebooks and AI conversations are kept (their connection
     /// becomes unset). Secrets are removed by the caller (secret store).
     pub fn delete_connection(&self, id: &str) -> Result<()> {
@@ -216,6 +220,9 @@ impl Workspace {
         tx.execute("DELETE FROM kn_state WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM meta_objects WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM kn_schema_state WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM kn_joins WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM kn_table_seen WHERE connection_id = ?1", [id])?;
+        tx.execute("DELETE FROM kn_learn_state WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM meta_schemas WHERE connection_id = ?1", [id])?;
         tx.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [id])?;

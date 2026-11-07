@@ -303,6 +303,12 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
         s.push_str("\nRelevant schema (from the knowledge index):\n```sql\n");
         s.push_str(&retrieved.text);
         s.push_str("\n```\n");
+        if retrieved.learned_joins > 0 {
+            s.push_str(
+                "`JOIN (…) = table(…)` lines are join keys learned from this workspace's past queries (or confirmed by the user), not declared \
+                 constraints: prefer them over guessing keys from column names, and say when you rely on one. find_join_path finds how two tables connect.\n",
+            );
+        }
     } else {
         s.push_str("\nNo schema context matched. Use search_schema / list_tables to discover tables.\n");
     }
@@ -544,7 +550,7 @@ impl Agent {
         let retrieval_q = format!("{} {}", req.message, req.context.selection.clone().or(req.context.editor_sql.clone()).unwrap_or_default());
         let budget = if others.is_empty() { 14_000 } else { 8_000 };
         let offline = req.context.no_database;
-        let empty = || knowledge::Retrieved { tables: vec![], text: String::new(), notes: vec![] };
+        let empty = || knowledge::Retrieved { tables: vec![], text: String::new(), notes: vec![], learned_joins: 0 };
         let mut retrieved = if offline { empty() } else { knowledge::retrieve(&ws, &profile.id, &retrieval_q, 8, budget).unwrap_or_else(|_| empty()) };
         // The chosen connections' relevant tables too, labelled by connection.
         let per = 12_000 / others.len().max(1);
@@ -560,6 +566,7 @@ impl Agent {
                     ));
                 }
                 retrieved.notes.extend(r.notes.into_iter().map(|n| format!("[{}] {n}", p.name)));
+                retrieved.learned_joins += r.learned_joins;
             }
         }
         let (system, tools) = if offline {

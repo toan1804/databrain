@@ -6,11 +6,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use databrain_query_engine::QueryEngine;
-use databrain_workspace::{KnObject, KnState, NoteStatus, Workspace, join_target, now_ms, split_target, target_mentions};
+use databrain_workspace::{ConnectionProfile, KnObject, KnState, LearnedJoin, NoteStatus, Workspace, join_target, now_ms, split_target, target_mentions};
 use serde::Serialize;
 
 use crate::policy::is_pii;
 use crate::types::{AiError, Result};
+use crate::{access, learn};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize)]
@@ -404,6 +405,8 @@ pub struct Retrieved {
     pub tables: Vec<String>,
     pub text: String,
     pub notes: Vec<String>,
+    /// Learned `JOIN` lines in `text`.
+    pub learned_joins: usize,
 }
 
 /// Retrieve relevant schema context for `question` within ~`budget_chars`.
@@ -411,7 +414,20 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
     let profile = ws.get_connection(connection_id)?;
     let policy = profile.ai_policy.clone();
     let notes_all = ws.kn_notes(connection_id)?.into_iter().filter(|n| n.status == NoteStatus::Approved).collect::<Vec<_>>();
-    let hits = ws.kn_search(connection_id, question, 40)?;
+    let mut hits = ws.kn_search(connection_id, question, 40)?;
+    // Tables the user's queries use often rank a little higher (BM25
+    // scores are negative: lower is better).
+    if policy.learn_from_history {
+        let usage: HashMap<String, i64> = ws.table_usage(connection_id)?.into_iter().map(|u| (u.table.to_lowercase(), u.queries)).collect();
+        if !usage.is_empty() {
+            let adj = |h: &databrain_workspace::KnHit| {
+                let q = if h.source == "note" { 0 } else { usage.get(&h.reference.to_lowercase()).copied().unwrap_or(0) };
+                h.score * (1.0 + 0.2 * (1.0 + q as f64).ln())
+            };
+            hits.sort_by(|a, b| adj(a).total_cmp(&adj(b)));
+        }
+    }
+    let learned = usable_joins(ws, &profile)?;
     let mut chosen: Vec<KnObject> = Vec::new();
     let mut seen = HashSet::new();
     let mut glossary: Vec<String> = Vec::new();
@@ -464,8 +480,24 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
             }
         }
     }
+    // Learned joins: the most used partners of the top tables (one hop).
+    let top: Vec<String> = chosen.iter().take(4).map(|o| o.full_name()).collect();
+    for t in &top {
+        for j in &learned {
+            if chosen.len() >= max_tables + 3 {
+                break;
+            }
+            let Some(sd) = side(j, t) else { continue };
+            if let Some(r) = ws.kn_get(connection_id, sd.other)?
+                && seen.insert(r.full_name())
+            {
+                chosen.push(r);
+            }
+        }
+    }
     let mut text = String::new();
     let mut tables = Vec::new();
+    let mut learned_joins = 0;
     for o in &chosen {
         let full = o.full_name();
         let table_notes: Vec<String> = notes_all
@@ -477,15 +509,206 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
             })
             .collect();
         let pii = |c: &str| is_pii(&policy, Some(&full), c);
-        let block = if policy.share_metadata { render_object(o, &pii, &table_notes) } else { format!("-- {} {} (metadata sharing disabled)", o.kind, full) };
+        let mut block =
+            if policy.share_metadata { render_object(o, &pii, &table_notes) } else { format!("-- {} {} (metadata sharing disabled)", o.kind, full) };
+        let lines = join_lines(&full, &learned);
+        for l in &lines {
+            block.push('\n');
+            block.push_str(l);
+        }
         if !text.is_empty() && text.len() + block.len() > budget_chars {
             break;
         }
         text.push_str(&block);
         text.push_str("\n\n");
         tables.push(full);
+        learned_joins += lines.len();
     }
-    Ok(Retrieved { tables, text: text.trim_end().to_string(), notes: glossary })
+    Ok(Retrieved { tables, text: text.trim_end().to_string(), notes: glossary, learned_joins })
+}
+
+// ------------------------------------------------------------ learned joins
+
+/// Learned joins the AI may see on this connection: learning on and
+/// metadata shared; seen often enough or confirmed ([`learn::surfaced`]);
+/// not a declared foreign key (shown as `FK` already); both tables readable
+/// under the table access rules; and every column still in its table, when
+/// the table's columns are known.
+pub fn usable_joins(ws: &Workspace, profile: &ConnectionProfile) -> Result<Vec<LearnedJoin>> {
+    let p = &profile.ai_policy;
+    if !p.learn_from_history || !p.share_metadata {
+        return Ok(vec![]);
+    }
+    let mut known: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    let mut has = |table: &str, cols: &[String]| -> bool {
+        let k = known.entry(table.to_lowercase()).or_insert_with(|| {
+            let (schema, name) = table.rsplit_once('.')?;
+            ws.kn_column_names(&profile.id, schema, name).ok().flatten()
+        });
+        k.as_ref().is_none_or(|k| cols.iter().all(|c| k.iter().any(|x| x.eq_ignore_ascii_case(c))))
+    };
+    let readable = |t: &str| access::check_read_table(profile, t).is_ok();
+    Ok(ws
+        .learned_joins(&profile.id)?
+        .into_iter()
+        .filter(|j| learn::surfaced(j) && !j.declared && readable(&j.left_table) && readable(&j.right_table))
+        .filter(|j| has(&j.left_table, &j.left_columns) && has(&j.right_table, &j.right_columns))
+        .collect())
+}
+
+/// A learned join as seen from one of its tables.
+struct Side<'j> {
+    columns: &'j [String],
+    other: &'j str,
+    other_columns: &'j [String],
+    /// Join kind → distinct queries, as seen from this table.
+    kinds: Vec<(String, i64)>,
+}
+
+/// `table`'s side of a learned join.
+fn side<'j>(j: &'j LearnedJoin, table: &str) -> Option<Side<'j>> {
+    let kinds = |flip: bool| -> Vec<(String, i64)> {
+        j.kinds
+            .iter()
+            .map(|(k, n)| {
+                let k = match (flip, k.as_str()) {
+                    (true, "left") => "right".to_string(),
+                    (true, "right") => "left".to_string(),
+                    _ => k.clone(),
+                };
+                (k, *n)
+            })
+            .collect()
+    };
+    if j.left_table.eq_ignore_ascii_case(table) {
+        Some(Side { columns: &j.left_columns, other: &j.right_table, other_columns: &j.right_columns, kinds: kinds(false) })
+    } else if j.right_table.eq_ignore_ascii_case(table) {
+        Some(Side { columns: &j.right_columns, other: &j.left_table, other_columns: &j.left_columns, kinds: kinds(true) })
+    } else {
+        None
+    }
+}
+
+/// How often a learned join was used, for prompts.
+fn evidence(j: &LearnedJoin) -> String {
+    match j.status {
+        databrain_workspace::JoinStatus::Confirmed => "confirmed by the user".into(),
+        _ if j.queries >= 2 => format!("learned from {} past queries", j.queries),
+        _ => format!("learned from a past query run on {} days", j.days),
+    }
+}
+
+/// `JOIN (cols) = other(cols)  -- learned …` lines for `table`.
+pub fn join_lines(table: &str, joins: &[LearnedJoin]) -> Vec<String> {
+    joins
+        .iter()
+        .filter_map(|j| {
+            let sd = side(j, table)?;
+            let usual = sd.kinds.iter().max_by_key(|(_, n)| *n).map(|(k, _)| k.as_str());
+            let usual = match usual {
+                Some(k @ ("left" | "right" | "full")) => format!(", usually {} JOIN", k.to_uppercase()),
+                _ => String::new(),
+            };
+            Some(format!("  JOIN ({}) = {}({})  -- {}{usual}", sd.columns.join(", "), sd.other, sd.other_columns.join(", "), evidence(j)))
+        })
+        .collect()
+}
+
+/// One step of a join path: `from(from_columns) = to(to_columns)`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PathStep {
+    pub from: String,
+    pub from_columns: Vec<String>,
+    pub to: String,
+    pub to_columns: Vec<String>,
+    /// `foreign key`, `confirmed by the user` or `learned from …`.
+    pub source: String,
+}
+
+/// Most expansions a path search makes (wide schemas stay bounded).
+const PATH_SEARCH_LIMIT: usize = 50_000;
+
+/// The shortest ways (up to 3, at most `max_hops` joins) to join `from` to
+/// `to`, over declared foreign keys and [`usable_joins`]. Tables the AI may
+/// not read are never part of a path; naming one is refused.
+pub fn join_paths(ws: &Workspace, profile: &ConnectionProfile, from: &str, to: &str, max_hops: usize) -> Result<Vec<Vec<PathStep>>> {
+    let find = |t: &str| -> Result<String> {
+        let o = ws
+            .kn_get(&profile.id, t)?
+            .ok_or_else(|| AiError::Policy(format!("table `{t}` is not in the knowledge index; search_schema or index_tables first")))?;
+        let full = o.full_name();
+        access::check_read_table(profile, &full).map_err(AiError::Policy)?;
+        Ok(full)
+    };
+    let (from, to) = (find(from)?, find(to)?);
+    if from.eq_ignore_ascii_case(&to) {
+        return Err(AiError::Policy("`from` and `to` are the same table".into()));
+    }
+    let readable = |t: &str| access::check_read_table(profile, t).is_ok();
+    // Undirected edges, each step as seen from the table it leaves.
+    let mut adj: HashMap<String, Vec<PathStep>> = HashMap::new();
+    let mut add = |a: &str, ac: &[String], b: &str, bc: &[String], source: &str| {
+        if !readable(a) || !readable(b) {
+            return;
+        }
+        for (x, xc, y, yc) in [(a, ac, b, bc), (b, bc, a, ac)] {
+            adj.entry(x.to_lowercase()).or_default().push(PathStep {
+                from: x.to_string(),
+                from_columns: xc.to_vec(),
+                to: y.to_string(),
+                to_columns: yc.to_vec(),
+                source: source.to_string(),
+            });
+        }
+    };
+    for o in ws.kn_objects(&profile.id)? {
+        for fk in &o.foreign_keys {
+            let target = ws.kn_get(&profile.id, &format!("{}.{}", fk.ref_schema, fk.ref_table))?.map(|r| r.full_name());
+            if let Some(t) = target {
+                add(&o.full_name(), &fk.columns, &t, &fk.ref_columns, "foreign key");
+            }
+        }
+    }
+    for j in usable_joins(ws, profile)? {
+        add(&j.left_table, &j.left_columns, &j.right_table, &j.right_columns, &evidence(&j));
+    }
+    // Breadth first over paths: every shortest path, without revisiting a table.
+    let goal = to.to_lowercase();
+    let mut level: Vec<(String, Vec<PathStep>)> = vec![(from.to_lowercase(), vec![])];
+    let mut found: Vec<Vec<PathStep>> = Vec::new();
+    let mut expansions = 0;
+    for _ in 0..max_hops {
+        let mut next = Vec::new();
+        for (node, path) in &level {
+            for step in adj.get(node).into_iter().flatten() {
+                expansions += 1;
+                let t = step.to.to_lowercase();
+                if t == from.to_lowercase() || path.iter().any(|s| s.to.eq_ignore_ascii_case(&t)) {
+                    continue;
+                }
+                let mut p = path.clone();
+                p.push(step.clone());
+                if t == goal {
+                    if !found.contains(&p) {
+                        found.push(p);
+                    }
+                } else {
+                    next.push((t, p));
+                }
+            }
+            if expansions > PATH_SEARCH_LIMIT {
+                break;
+            }
+        }
+        if !found.is_empty() || next.is_empty() || expansions > PATH_SEARCH_LIMIT {
+            break;
+        }
+        level = next;
+    }
+    // Declared keys first, then the most used.
+    found.sort_by_key(|p| p.iter().filter(|s| s.source != "foreign key").count());
+    found.truncate(3);
+    Ok(found)
 }
 
 /// Check a note target against the connection: every table (and column)
@@ -647,5 +870,230 @@ mod tests {
         assert!(s.contains("FK (user_id) -> public.users(id)"));
         assert!(s.contains("NOTE: Cancelled orders"));
         assert!(system_schema("information_schema") && system_schema("main.INFORMATION_SCHEMA") && !system_schema("public"));
+    }
+
+    // ------------------------------------------------------ learned joins
+
+    mod learned {
+        use super::super::*;
+        use databrain_auth::AuthMethod;
+        use databrain_connector_core::{ColumnInfo, ConnectionConfig, ConnectorKind, ForeignKey};
+        use databrain_workspace::{AiPolicy, EnvTag, JoinSighting, JoinStatus, Origin};
+
+        const DAY: i64 = 86_400_000;
+
+        fn obj(schema: &str, name: &str, cols: &[&str], fks: Vec<ForeignKey>) -> KnObject {
+            KnObject {
+                schema: schema.into(),
+                name: name.into(),
+                kind: "table".into(),
+                comment: None,
+                row_estimate: None,
+                columns: cols
+                    .iter()
+                    .map(|c| ColumnInfo { name: c.to_string(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None })
+                    .collect(),
+                foreign_keys: fks,
+            }
+        }
+
+        /// orders(customer_ref) ~ customers(cust_no) learned; order_items
+        /// has a declared FK to orders; regions ~ customers learned once.
+        fn setup(policy: AiPolicy) -> (Workspace, ConnectionProfile) {
+            let ws = Workspace::open_in_memory().unwrap();
+            let p = ws
+                .save_connection(ConnectionProfile {
+                    id: String::new(),
+                    name: "db".into(),
+                    config: ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "me".into() }),
+                    color: None,
+                    env: EnvTag::Dev,
+                    folder_id: None,
+                    has_secret: false,
+                    ai_policy: policy,
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .unwrap();
+            let fk = ForeignKey { columns: vec!["order_id".into()], ref_schema: "sales".into(), ref_table: "orders".into(), ref_columns: vec!["id".into()] };
+            ws.kn_upsert_objects(
+                &p.id,
+                &[
+                    obj("sales", "orders", &["id", "customer_ref", "status"], vec![]),
+                    obj("sales", "customers", &["id", "cust_no", "region_code", "name"], vec![]),
+                    obj("sales", "order_items", &["order_id", "sku"], vec![fk]),
+                    obj("ref", "regions", &["code", "label"], vec![]),
+                    obj("hr", "salaries", &["cust_no", "amount"], vec![]),
+                ],
+            )
+            .unwrap();
+            let now = now_ms();
+            let see = |l: (&str, &str), r: (&str, &str), kind: &str, fp: &str, at: i64| {
+                ws.record_join(
+                    &p.id,
+                    &JoinSighting {
+                        left_table: l.0.into(),
+                        left_columns: vec![l.1.into()],
+                        right_table: r.0.into(),
+                        right_columns: vec![r.1.into()],
+                        kind: kind.into(),
+                        declared: false,
+                        fingerprint: fp.into(),
+                        history_id: 1,
+                        at,
+                        origin: Origin::User,
+                    },
+                )
+                .unwrap()
+            };
+            // Two queries: surfaced. Mostly `orders LEFT JOIN customers`.
+            see(("sales.orders", "customer_ref"), ("sales.customers", "cust_no"), "left", "q1", now);
+            see(("sales.orders", "customer_ref"), ("sales.customers", "cust_no"), "left", "q2", now);
+            see(("sales.orders", "customer_ref"), ("sales.customers", "cust_no"), "inner", "q3", now - DAY);
+            // Two queries: surfaced.
+            see(("sales.customers", "region_code"), ("ref.regions", "code"), "inner", "q4", now);
+            see(("sales.customers", "region_code"), ("ref.regions", "code"), "inner", "q5", now);
+            // Once: not surfaced.
+            see(("sales.customers", "cust_no"), ("hr.salaries", "cust_no"), "inner", "q6", now);
+            ws.record_table_use(&p.id, "sales.orders", "q1", now, Origin::User).unwrap();
+            (ws, p)
+        }
+
+        fn lines(ws: &Workspace, p: &ConnectionProfile, table: &str) -> Vec<String> {
+            join_lines(table, &usable_joins(ws, p).unwrap())
+        }
+
+        #[test]
+        fn learned_joins_render_from_each_side() {
+            let (ws, p) = setup(AiPolicy::default());
+            assert_eq!(lines(&ws, &p, "sales.orders"), ["  JOIN (customer_ref) = sales.customers(cust_no)  -- learned from 3 past queries, usually LEFT JOIN"]);
+            let c = lines(&ws, &p, "sales.customers");
+            assert!(c.contains(&"  JOIN (cust_no) = sales.orders(customer_ref)  -- learned from 3 past queries, usually RIGHT JOIN".to_string()), "{c:?}");
+            assert!(c.contains(&"  JOIN (region_code) = ref.regions(code)  -- learned from 2 past queries".to_string()), "{c:?}");
+            // Seen once: not given to the AI.
+            assert!(!c.iter().any(|l| l.contains("hr.salaries")), "{c:?}");
+        }
+
+        #[test]
+        fn retrieval_adds_learned_partners_and_lines() {
+            let (ws, p) = setup(AiPolicy::default());
+            let r = retrieve(&ws, &p.id, "orders status", 1, 20_000).unwrap();
+            assert_eq!(r.tables[0], "sales.orders");
+            assert!(r.tables.contains(&"sales.customers".to_string()), "{:?}", r.tables);
+            assert!(r.text.contains("JOIN (customer_ref) = sales.customers(cust_no)"), "{}", r.text);
+            assert!(r.learned_joins >= 2);
+        }
+
+        #[test]
+        fn nothing_learned_is_shown_without_metadata_sharing_or_with_learning_off() {
+            for policy in [AiPolicy { share_metadata: false, ..Default::default() }, AiPolicy { learn_from_history: false, ..Default::default() }] {
+                let (ws, p) = setup(policy);
+                assert!(usable_joins(&ws, &p).unwrap().is_empty());
+                let r = retrieve(&ws, &p.id, "orders status", 1, 20_000).unwrap();
+                assert!(!r.text.contains("JOIN ("), "{}", r.text);
+                assert_eq!(r.learned_joins, 0);
+                assert!(!r.tables.contains(&"sales.customers".to_string()), "{:?}", r.tables);
+            }
+        }
+
+        #[test]
+        fn joins_touching_a_table_the_ai_may_not_read_are_hidden() {
+            let (ws, p) = setup(AiPolicy { read_deny: vec!["sales.customers".into()], ..Default::default() });
+            assert!(usable_joins(&ws, &p).unwrap().is_empty());
+            let r = retrieve(&ws, &p.id, "orders status", 1, 20_000).unwrap();
+            assert!(!r.text.contains("JOIN ("), "{}", r.text);
+            let (ws, p) = setup(AiPolicy { read_allow: vec!["sales.%".into()], ..Default::default() });
+            let u = usable_joins(&ws, &p).unwrap();
+            assert_eq!(u.len(), 1, "regions is outside the allow list");
+            assert_eq!(u[0].right_table, "sales.orders");
+        }
+
+        #[test]
+        fn rejected_stale_and_declared_joins_are_hidden_and_confirmed_ones_shown() {
+            let (ws, p) = setup(AiPolicy::default());
+            let all = ws.learned_joins(&p.id).unwrap();
+            let id = |t: &str| all.iter().find(|j| j.left_table == t || j.right_table == t).unwrap().id;
+            ws.set_join_status(id("ref.regions"), JoinStatus::Rejected).unwrap();
+            ws.set_join_status(id("hr.salaries"), JoinStatus::Confirmed).unwrap();
+            let c = lines(&ws, &p, "sales.customers");
+            assert!(!c.iter().any(|l| l.contains("ref.regions")), "{c:?}");
+            assert!(c.iter().any(|l| l.contains("hr.salaries(cust_no)  -- confirmed by the user")), "{c:?}");
+            // A column that no longer exists after re-indexing.
+            ws.kn_upsert_objects(&p.id, &[obj("sales", "orders", &["id", "status"], vec![])]).unwrap();
+            assert!(lines(&ws, &p, "sales.orders").is_empty());
+            // Declared: shown as FK, not again as a learned join.
+            let mut s = ws.learned_joins(&p.id).unwrap()[0].clone();
+            s.declared = true;
+            ws.record_join(
+                &p.id,
+                &JoinSighting {
+                    left_table: s.left_table.clone(),
+                    left_columns: s.left_columns.clone(),
+                    right_table: s.right_table.clone(),
+                    right_columns: s.right_columns.clone(),
+                    kind: "inner".into(),
+                    declared: true,
+                    fingerprint: "q9".into(),
+                    history_id: 2,
+                    at: now_ms(),
+                    origin: Origin::User,
+                },
+            )
+            .unwrap();
+            assert!(!usable_joins(&ws, &p).unwrap().iter().any(|j| j.id == s.id));
+        }
+
+        #[test]
+        fn used_tables_rank_higher() {
+            let (ws, p) = setup(AiPolicy::default());
+            ws.kn_upsert_objects(&p.id, &[obj("sales", "orders_2019", &["id", "status"], vec![])]).unwrap();
+            for i in 0..5 {
+                ws.record_table_use(&p.id, "sales.orders_2019", &format!("f{i}"), now_ms(), Origin::User).unwrap();
+            }
+            let r = retrieve(&ws, &p.id, "status", 2, 20_000).unwrap();
+            assert_eq!(r.tables[0], "sales.orders_2019", "{:?}", r.tables);
+        }
+
+        fn path_text(paths: &[Vec<PathStep>]) -> Vec<String> {
+            paths
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .map(|s| format!("{}({}) = {}({}) [{}]", s.from, s.from_columns.join(","), s.to, s.to_columns.join(","), s.source))
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                })
+                .collect()
+        }
+
+        #[test]
+        fn join_paths_over_foreign_keys_and_learned_joins() {
+            let (ws, p) = setup(AiPolicy::default());
+            let paths = join_paths(&ws, &p, "order_items", "regions", 3).unwrap();
+            assert_eq!(
+                path_text(&paths),
+                [
+                    "sales.order_items(order_id) = sales.orders(id) [foreign key] / sales.orders(customer_ref) = sales.customers(cust_no) [learned from 3 past queries] / sales.customers(region_code) = ref.regions(code) [learned from 2 past queries]"
+                ]
+            );
+            // Too far for two joins.
+            assert!(join_paths(&ws, &p, "order_items", "regions", 2).unwrap().is_empty());
+            // Not surfaced: no path to salaries.
+            assert!(join_paths(&ws, &p, "customers", "hr.salaries", 3).unwrap().is_empty());
+            assert!(join_paths(&ws, &p, "orders", "orders", 3).is_err());
+            assert!(join_paths(&ws, &p, "orders", "nope", 3).is_err());
+        }
+
+        #[test]
+        fn join_paths_never_go_through_or_to_a_denied_table() {
+            let (ws, p) = setup(AiPolicy { read_deny: vec!["sales.customers".into()], ..Default::default() });
+            assert!(join_paths(&ws, &p, "order_items", "regions", 4).unwrap().is_empty());
+            let e = join_paths(&ws, &p, "orders", "customers", 3).unwrap_err().to_string();
+            assert!(e.contains("may not read"), "{e}");
+            // Without learning, declared keys still connect.
+            let (ws, p) = setup(AiPolicy { learn_from_history: false, ..Default::default() });
+            assert_eq!(join_paths(&ws, &p, "order_items", "orders", 3).unwrap().len(), 1);
+            assert!(join_paths(&ws, &p, "order_items", "customers", 3).unwrap().is_empty());
+        }
     }
 }

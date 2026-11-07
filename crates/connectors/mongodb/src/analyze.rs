@@ -4,7 +4,7 @@
 //! `$unionWith` read). Classification and table access rules use this
 //! instead of reading the text, so no spelling of a stage escapes them.
 
-use databrain_connector_core::language::MongoInfo;
+use databrain_connector_core::language::{MongoInfo, MongoJoin};
 use databrain_connector_core::sql::StatementKind;
 use mongodb::bson::{Bson, Document};
 
@@ -16,7 +16,49 @@ pub fn analyze(text: &str) -> Option<MongoInfo> {
     let plan = shell::parse(text, None).ok()?;
     let mut a = Acc { db: plan.db.clone(), reads: vec![], writes: vec![] };
     let kind = command_kind(&plan.command, &mut a, 0);
-    Some(MongoInfo { kind, reads: a.reads, writes: a.writes })
+    let joins = lookups(&plan.command, plan.db.as_deref());
+    Some(MongoInfo { kind, reads: a.reads, writes: a.writes, joins })
+}
+
+/// Equality `$lookup`s (`localField` / `foreignField`) at the top of an
+/// aggregate's pipeline whose `localField` is still a field of the
+/// aggregated collection: only stages that keep documents as they are
+/// (`$match`, `$sort`, `$limit`, `$skip`, `$sample`, `$lookup`, `$unwind`)
+/// may come before it, and the field must not be inside an earlier
+/// lookup's `as`. Anything else (`$project`, `$group`, `$addFields`,
+/// pipeline lookups, other databases) is not learned.
+fn lookups(cmd: &Document, db: Option<&str>) -> Vec<MongoJoin> {
+    let mut out = Vec::new();
+    if !command_name(cmd).is_some_and(|n| n.eq_ignore_ascii_case("aggregate")) {
+        return out;
+    }
+    let (Ok(main), Ok(stages)) = (cmd.get_str("aggregate"), cmd.get_array("pipeline")) else { return out };
+    let name = |coll: &str| match db {
+        Some(d) => vec![d.to_string(), coll.to_string()],
+        None => vec![coll.to_string()],
+    };
+    let mut added: Vec<String> = Vec::new();
+    for st in stages {
+        let Bson::Document(st) = st else { return out };
+        let Some((op, v)) = st.iter().next().filter(|_| st.len() == 1) else { return out };
+        match (op.as_str(), v) {
+            ("$match" | "$sort" | "$limit" | "$skip" | "$sample" | "$unwind", _) => {}
+            ("$lookup", Bson::Document(d)) => {
+                if let (Ok(from), Ok(local), Ok(foreign)) = (d.get_str("from"), d.get_str("localField"), d.get_str("foreignField"))
+                    && !local.is_empty()
+                    && !foreign.is_empty()
+                    && !added.iter().any(|a| local == a || local.starts_with(&format!("{a}.")))
+                {
+                    out.push(MongoJoin { local: name(main), local_field: local.to_string(), from: name(from), foreign_field: foreign.to_string() });
+                }
+                if let Ok(as_) = d.get_str("as") {
+                    added.push(as_.to_string());
+                }
+            }
+            _ => return out,
+        }
+    }
+    out
 }
 
 struct Acc {
@@ -170,6 +212,41 @@ fn pipeline(stages: &[Bson], a: &mut Acc, depth: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn joins(t: &str) -> Vec<String> {
+        analyze(t).unwrap().joins.into_iter().map(|j| format!("{}.{} = {}.{}", j.local.join("."), j.local_field, j.from.join("."), j.foreign_field)).collect()
+    }
+
+    #[test]
+    fn lookup_equalities_are_joins() {
+        assert_eq!(
+            joins(
+                "use shop\ndb.orders.aggregate([{$match: {s: 1}}, {$lookup: {from: 'customers', localField: 'cust', foreignField: '_id', as: 'c'}}, {$unwind: '$c'}, {$lookup: {from: 'items', localField: '_id', foreignField: 'order_id', as: 'i'}}])"
+            ),
+            ["shop.orders.cust = shop.customers._id", "shop.orders._id = shop.items.order_id"]
+        );
+        // A field of an earlier lookup's result is not the collection's.
+        assert_eq!(
+            joins(
+                "db.orders.aggregate([{$lookup: {from: 'customers', localField: 'cust', foreignField: '_id', as: 'c'}}, {$lookup: {from: 'regions', localField: 'c.region', foreignField: '_id', as: 'r'}}])"
+            ),
+            ["orders.cust = customers._id"]
+        );
+    }
+
+    #[test]
+    fn lookups_after_reshaping_or_without_fields_are_not_joins() {
+        assert!(
+            joins("db.orders.aggregate([{$project: {cust: '$x'}}, {$lookup: {from: 'customers', localField: 'cust', foreignField: '_id', as: 'c'}}])")
+                .is_empty()
+        );
+        assert!(
+            joins("db.orders.aggregate([{$group: {_id: '$cust'}}, {$lookup: {from: 'customers', localField: '_id', foreignField: '_id', as: 'c'}}])")
+                .is_empty()
+        );
+        assert!(joins("db.orders.aggregate([{$lookup: {from: 'customers', as: 'c', pipeline: [{$match: {}}]}}])").is_empty());
+        assert!(joins("db.orders.find({})").is_empty());
+    }
 
     fn kind(t: &str) -> StatementKind {
         analyze(t).map(|i| i.kind).unwrap_or(StatementKind::Unknown)

@@ -15,14 +15,18 @@
 //! range of the SQL it came from, so the UI can highlight it.
 
 mod builder;
+mod fingerprint;
 mod flows;
 mod model;
 mod refs;
 
 #[cfg(test)]
+mod join_tests;
+#[cfg(test)]
 mod tests;
 
-pub use builder::analyze;
+pub use builder::{analyze, join_pairs};
+pub use fingerprint::fingerprint;
 pub(crate) use flows::flows;
 pub use model::*;
 pub(crate) use refs::*;

@@ -19,6 +19,16 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
             json!({"type": "object", "properties": {"table": {"type": "string", "description": "schema.table or table"}, "connection": {"type": "string", "description": "Another connection (name from list_connections); default: the current one"}}, "required": ["table"]}),
         ),
         s(
+            "find_join_path",
+            "Find how to join two tables: the shortest chains of joins (at most max_hops) over declared foreign keys and join keys learned from past queries, with the key columns and where each came from. Use it when the tables have no direct foreign key.",
+            json!({"type": "object", "properties": {
+                "from": {"type": "string", "description": "schema.table or table"},
+                "to": {"type": "string", "description": "schema.table or table"},
+                "max_hops": {"type": "integer", "minimum": 1, "maximum": 4, "description": "Most joins in a path (default 3)"},
+                "connection": {"type": "string", "description": "Another connection (name from list_connections); default: the current one"}
+            }, "required": ["from", "to"]}),
+        ),
+        s(
             "index_tables",
             "Add tables or views missing from the knowledge index: reads their columns, keys and comments from the database (after the user approves) and returns them. Use it when search_schema/describe_table can't find a table the user names, instead of asking the user for its structure.",
             json!({"type": "object", "properties": {

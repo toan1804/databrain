@@ -56,6 +56,11 @@ mcp_client_approves: boolean,
  */
 auto_approve_notes: boolean, 
 /**
+ * Learn how tables join (and which are used most) from this
+ * connection's query history, and give that to the AI with the schema.
+ */
+learn_from_history: boolean, 
+/**
  * Tables the AI may read: LIKE patterns (`%`, `_`; case-insensitive)
  * matched against `catalog.schema.table`, `schema.table` and `table`.
  * Empty = every table.

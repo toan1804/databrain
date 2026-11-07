@@ -143,6 +143,31 @@ pub(crate) async fn kn_cancel(state: State<'_, AppState>, connection_id: String)
 }
 
 #[tauri::command]
+pub(crate) async fn kn_learned(state: State<'_, AppState>, connection_id: String) -> R<ai_api::LearnedView> {
+    ai_api::learned(&state, &connection_id)
+}
+
+#[tauri::command]
+pub(crate) async fn kn_set_join_status(state: State<'_, AppState>, id: i64, status: databrain_workspace::JoinStatus) -> R<()> {
+    ai_api::set_join_status(&state, id, status)
+}
+
+#[tauri::command]
+pub(crate) async fn kn_join_evidence(state: State<'_, AppState>, join_id: i64) -> R<Vec<databrain_workspace::HistoryEntry>> {
+    ai_api::join_evidence(&state, join_id)
+}
+
+#[tauri::command]
+pub(crate) async fn kn_learn_now(state: State<'_, AppState>, connection_id: String) -> R<databrain_ai::learn::LearnReport> {
+    ai_api::relearn(&state, &connection_id).await
+}
+
+#[tauri::command]
+pub(crate) async fn kn_forget_learned(state: State<'_, AppState>, connection_id: String) -> R<()> {
+    ai_api::forget_learned(&state, &connection_id)
+}
+
+#[tauri::command]
 pub(crate) async fn kn_save_note(state: State<'_, AppState>, note: databrain_workspace::KnNote) -> R<databrain_workspace::KnNote> {
     ai_api::save_note(&state, note).await
 }
