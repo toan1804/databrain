@@ -28,6 +28,10 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    # Its ref is the Rust toolchain (`@stable`, `@nightly`, `@1.88` = the
+    # MSRV), not a version of the action: never "update" it.
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
 
   # The Oracle driver helper: its binaries are pinned by agent/SHA256SUMS, so
   # an update needs a new helper release (docs/RELEASING.md) before merging.
