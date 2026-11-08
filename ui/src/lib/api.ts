@@ -435,6 +435,7 @@ export const api = {
   knDeleteNote: (id: string) => call<void>("kn_delete_note", { id }),
   knLearned: (connectionId: string) => call<LearnedView>("kn_learned", { connectionId }),
   knSetJoinStatus: (id: number, status: JoinStatus) => call<void>("kn_set_join_status", { id, status }),
+  knReviewJoin: (id: number, approve: boolean) => call<void>("kn_review_join", { id, approve }),
   knJoinEvidence: (joinId: number) => call<HistoryEntry[]>("kn_join_evidence", { joinId }),
   knLearnNow: (connectionId: string) => call<LearnReport>("kn_learn_now", { connectionId }),
   knForgetLearned: (connectionId: string) => call<void>("kn_forget_learned", { connectionId }),

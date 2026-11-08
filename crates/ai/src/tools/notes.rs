@@ -2,8 +2,8 @@ use databrain_workspace::{KnNote, NoteStatus};
 use serde_json::{Value, json};
 
 use super::{ToolContext, ToolOutput, arg, out, trunc};
-use crate::knowledge;
 use crate::types::{AiError, Result};
+use crate::{access, knowledge};
 
 impl ToolContext {
     pub(super) fn ai_note_status(&self) -> NoteStatus {
@@ -82,6 +82,69 @@ impl ToolContext {
         };
         self.audit("update_knowledge_note", args, status.as_str(), None);
         Ok(out(self.note_saved_text(saved.status, "updated"), json!({"note": saved, "previous": old})))
+    }
+
+    /// A join written down somewhere (a document, the user), checked against
+    /// the knowledge index: real tables the AI may read, real columns.
+    pub(super) fn add_join(&self, args: &Value) -> Result<ToolOutput> {
+        let ws = self.engine.workspace();
+        let id = &self.profile.id;
+        let source = arg(args, "source")?.trim();
+        if source.is_empty() {
+            return Err(AiError::Policy("say where the join is written (source), e.g. a document's name or 'the user'".into()));
+        }
+        let side = |t: &str, c: &str| -> Result<(String, Vec<String>)> {
+            let table = arg(args, t)?;
+            let o = ws
+                .kn_get(id, table)?
+                .ok_or_else(|| AiError::Policy(format!("table `{table}` is not in the knowledge index; search_schema or index_tables first")))?;
+            let full = o.full_name();
+            access::check_read_table(&self.profile, &full).map_err(AiError::Policy)?;
+            let names: Vec<&str> = args.get(c).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+            if names.is_empty() {
+                return Err(AiError::Policy(format!("{c} must list the join columns of {full}")));
+            }
+            let cols = names
+                .iter()
+                .map(|n| {
+                    o.columns.iter().find(|x| x.name.eq_ignore_ascii_case(n.trim())).map(|x| x.name.clone()).ok_or_else(|| {
+                        AiError::Policy(format!(
+                            "{full} has no column `{n}` (columns: {})",
+                            o.columns.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(", ")
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((full, cols))
+        };
+        let (lt, lc) = side("left_table", "left_columns")?;
+        let (rt, rc) = side("right_table", "right_columns")?;
+        if lc.len() != rc.len() {
+            return Err(AiError::Policy("left_columns and right_columns must have the same number of columns, in matching order".into()));
+        }
+        if lt.eq_ignore_ascii_case(&rt) && lc == rc {
+            return Err(AiError::Policy("a table joined to itself on the same columns is not a join".into()));
+        }
+        let approved = self.ai_note_status() == NoteStatus::Approved;
+        let by = if self.caller == super::Caller::Mcp { "mcp" } else { "ai" };
+        let (join_id, what) = ws.document_join(id, &lt, &lc, &rt, &rc, source, by, approved)?;
+        let on: Vec<String> = lc.iter().zip(&rc).map(|(a, b)| format!("{lt}.{a} = {rt}.{b}")).collect();
+        let on = on.join(" AND ");
+        let text = match what {
+            databrain_workspace::Documented::Rejected => {
+                self.audit("add_knowledge_join", args, "refused", Some("rejected by the user"));
+                return Ok(out(format!("The user rejected the join {on}; it was not recorded. Don't use it."), json!({"id": join_id, "rejected": true})));
+            }
+            databrain_workspace::Documented::Updated => format!("The join {on} was already recorded; its source is now: {source}."),
+            databrain_workspace::Documented::Added if approved => {
+                format!("Recorded the join {on} (from {source}); find_join_path and describe_table use it now.")
+            }
+            databrain_workspace::Documented::Added => {
+                format!("Recorded the join {on} (from {source}); the user will review it in Knowledge before it is used.")
+            }
+        };
+        self.audit("add_knowledge_join", args, if approved { "approved" } else { "proposed" }, None);
+        Ok(out(text, json!({"id": join_id, "join": on, "approved": approved})))
     }
 
     pub(super) fn list_notes(&self, args: &Value) -> Result<ToolOutput> {

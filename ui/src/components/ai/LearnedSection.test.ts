@@ -18,6 +18,7 @@ const base: LearnedJoinView = {
   last_seen: null,
   shown: true,
   hidden_reason: null,
+  documented: null,
 };
 
 describe("learned joins", () => {
@@ -37,6 +38,11 @@ describe("learned joins", () => {
     const waiting = { ...base, id: 2, shown: false, hidden_reason: "Used in 1 query" };
     const rejected = { ...base, id: 3, status: "rejected" as const, shown: false, left_table: "sales.customers", left_columns: ["id"], right_table: "sales.orders", right_columns: ["customer_id"] };
     expect([base, waiting, rejected].map(joinState)).toEqual(["given", "waiting", "rejected"]);
+    // Recorded by the AI from a document: to review until approved.
+    const doc = (state: "proposed" | "approved") => ({ source: "spec", by: "ai", state, at: 0 });
+    expect(joinState({ ...waiting, documented: doc("proposed") })).toBe("review");
+    expect(joinState({ ...base, documented: doc("approved") })).toBe("given");
+    expect(joinState({ ...rejected, documented: doc("proposed") })).toBe("rejected");
     expect(filterJoins([base, waiting, rejected], "", "waiting").map((j) => j.id)).toEqual([2]);
     // Every word must match a table or column, in any case.
     expect(filterJoins([base, waiting, rejected], "ORDERS line_no", "all").map((j) => j.id)).toEqual([1, 2]);

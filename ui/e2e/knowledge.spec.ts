@@ -115,3 +115,46 @@ test("Knowledge remembers the last tab", async ({ page }) => {
   }
   await expect(page.getByRole("tablist", { name: "Knowledge" }).getByRole("tab", { name: /Learned/ })).toHaveAttribute("aria-selected", "true");
 });
+
+test("joins recorded from a document: to review, approved or discarded, and marked", async ({ page }) => {
+  const doc = (state: string, by = "ai") => ({ source: "Sales data dictionary", by, state, at: Date.now() - 60_000 });
+  const proposed = join(101, "orders", "regions", "region_code", "code", { queries: 0, days: 0, last_seen: null, shown: false, hidden_reason: "Recorded by the AI from a document: approve it to give it to the AI", documented: doc("proposed") });
+  const approved = join(102, "customers", "segments", "segment_id", "id", { queries: 0, days: 0, last_seen: null, documented: doc("approved", "mcp") });
+  await openApp(
+    page,
+    backend({
+      kn_get: { state: null, notes: [] },
+      kn_objects: { objects: [], total: 0 },
+      kn_learned: { supported: true, enabled: true, state: null, joins: [JOINS[0], proposed, approved], tables: [] },
+      kn_join_evidence: [],
+    }),
+  );
+  await page.getByRole("button", { name: "AI assistant" }).first().click();
+  await page.getByRole("tab", { name: /Knowledge/ }).click();
+  // The Learned tab says one join waits for review.
+  const learned = page.getByRole("tablist", { name: "Knowledge" }).getByRole("tab", { name: /Learned\s*3\s*1/ });
+  await learned.click();
+  await expect(page.getByRole("button", { name: /To review\s*1/ })).toBeVisible();
+
+  const list = page.getByRole("list", { name: "Learned joins" });
+  const row = list.getByRole("listitem").filter({ hasText: "region_code" });
+  // Approve / discard are on the line without hovering; marked as documented, not counted as used.
+  await expect(row.getByRole("button", { name: "Approve" })).toBeVisible();
+  await expect(row.getByLabel("Documented in Sales data dictionary")).toBeVisible();
+  await expect(row).toContainText("doc");
+  await row.getByRole("button", { name: /regions/ }).first().click();
+  await expect(row.getByText("Sales data dictionary", { exact: true }).last()).toBeVisible();
+  await expect(row.getByText(/recorded by the AI/).last()).toBeVisible();
+  await expect(row.getByText("Not seen in queries yet")).toBeVisible();
+  await page.screenshot({ path: "test-results/knowledge-documented.png" });
+  await row.getByRole("button", { name: "Approve" }).first().click();
+  await expect.poll(async () => (await calls(page, "kn_review_join")).at(-1)).toMatchObject({ id: 101, approve: true });
+  await row.getByRole("button", { name: "Discard" }).first().click();
+  await expect.poll(async () => (await calls(page, "kn_review_join")).at(-1)).toMatchObject({ id: 101, approve: false });
+
+  // An approved one, recorded over MCP: given, with its source.
+  const ok = list.getByRole("listitem").filter({ hasText: "segment_id" });
+  await ok.getByRole("button", { name: /segments/ }).first().click();
+  await expect(ok.getByText(/recorded by an MCP client/).last()).toBeVisible();
+  await expect(ok.getByText("Given to the AI")).toBeVisible();
+});

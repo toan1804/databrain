@@ -44,6 +44,52 @@ impl JoinStatus {
     }
 }
 
+/// Whether a documented join may be given to the AI yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum DocState {
+    /// Recorded by the assistant; waits for the user (unless the
+    /// connection saves AI notes directly).
+    Proposed,
+    /// Recorded by the user, approved by them, or saved directly.
+    Approved,
+}
+
+impl DocState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DocState::Proposed => "proposed",
+            DocState::Approved => "approved",
+        }
+    }
+}
+
+/// Where a join is written down: a data dictionary, a spec, the user saying
+/// so. A documented join doesn't need to be seen in queries.
+#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct JoinDoc {
+    /// Where it is written, e.g. `orders spec §3` or `the user`.
+    pub source: String,
+    /// `user`, `ai` (DataBrain's assistant) or `mcp` (an MCP client).
+    pub by: String,
+    pub state: DocState,
+    #[ts(as = "f64")]
+    pub at: i64,
+}
+
+/// What [`Workspace::document_join`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Documented {
+    /// A new join, or one known only from history, is now documented.
+    Added,
+    /// It was documented already; its source is updated.
+    Updated,
+    /// The user rejected it; nothing changed.
+    Rejected,
+}
+
 /// A join seen in history: `left_table.left_columns[i] =
 /// right_table.right_columns[i]`. Stored once per pair of sides, in a
 /// canonical order; `kinds` are as seen from the left side.
@@ -77,6 +123,8 @@ pub struct LearnedJoin {
     /// Last use by the user or a job; `None` when only the assistant used it.
     #[ts(as = "Option<f64>")]
     pub last_seen: Option<i64>,
+    /// Written down somewhere (not only learned from queries).
+    pub documented: Option<JoinDoc>,
 }
 
 /// One join found in one history entry.
@@ -133,17 +181,22 @@ fn flip(kind: &str) -> &str {
     }
 }
 
+/// The two sides in canonical order (`a ⋈ b` and `b ⋈ a` are one join);
+/// `true` when they were swapped.
+type JoinSide<'a> = (&'a str, &'a [String]);
+
+fn canonical<'a>(l: JoinSide<'a>, r: JoinSide<'a>) -> (JoinSide<'a>, JoinSide<'a>, bool) {
+    if (r.0, r.1) < (l.0, l.1) { (r, l, true) } else { (l, r, false) }
+}
+
 impl Workspace {
     /// Record a join seen in a history entry. The two sides are put in a
     /// canonical order (so `a ⋈ b` and `b ⋈ a` are one join, the kind
     /// flipped to match). Returns the join's id. A rejected join keeps
     /// counting (the UI shows it is still used) but stays rejected.
     pub fn record_join(&self, connection_id: &str, s: &JoinSighting) -> Result<i64> {
-        let (lt, lc, rt, rc, kind) = {
-            let l = (s.left_table.as_str(), &s.left_columns);
-            let r = (s.right_table.as_str(), &s.right_columns);
-            if r < l { (r.0, r.1, l.0, l.1, flip(&s.kind)) } else { (l.0, l.1, r.0, r.1, s.kind.as_str()) }
-        };
+        let ((lt, lc), (rt, rc), swapped) = canonical((&s.left_table, &s.left_columns), (&s.right_table, &s.right_columns));
+        let kind = if swapped { flip(&s.kind) } else { s.kind.as_str() };
         let (lc, rc) = (serde_json::to_string(lc)?, serde_json::to_string(rc)?);
         let c = self.conn.lock();
         c.execute(
@@ -168,6 +221,81 @@ impl Workspace {
         Ok(id)
     }
 
+    /// Record a join that is written down (`source`): by the user, the
+    /// assistant (`ai`) or an MCP client (`mcp`). `approved` false leaves it
+    /// for the user to review. A join the user rejected stays rejected.
+    #[allow(clippy::too_many_arguments)]
+    pub fn document_join(
+        &self,
+        connection_id: &str,
+        left_table: &str,
+        left_columns: &[String],
+        right_table: &str,
+        right_columns: &[String],
+        source: &str,
+        by: &str,
+        approved: bool,
+    ) -> Result<(i64, Documented)> {
+        if left_columns.is_empty() || left_columns.len() != right_columns.len() {
+            return Err(crate::Error::Invalid("a join needs the same number of columns on both sides".into()));
+        }
+        let ((lt, lc), (rt, rc), _) = canonical((left_table, left_columns), (right_table, right_columns));
+        let (lc, rc) = (serde_json::to_string(lc)?, serde_json::to_string(rc)?);
+        let state = if approved { DocState::Approved } else { DocState::Proposed };
+        let c = self.conn.lock();
+        let found: Option<(i64, String, Option<String>, Option<String>)> = c
+            .query_row(
+                "SELECT id, status, doc_source, doc_state FROM kn_joins WHERE connection_id = ?1 AND left_table = ?2 AND left_cols = ?3 AND right_table = ?4 AND right_cols = ?5",
+                params![connection_id, lt, lc, rt, rc],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let now = now_ms();
+        match found {
+            Some((id, status, ..)) if JoinStatus::parse(&status) == JoinStatus::Rejected => Ok((id, Documented::Rejected)),
+            Some((id, _, old, old_state)) => {
+                // Approved stays approved when the assistant documents it again.
+                let keep = old_state.as_deref() == Some("approved") && !approved;
+                c.execute(
+                    "UPDATE kn_joins SET doc_source = ?2, doc_by = ?3, doc_state = ?4, doc_at = ?5 WHERE id = ?1",
+                    params![id, source, by, if keep { "approved" } else { state.as_str() }, now],
+                )?;
+                Ok((id, if old.is_some() { Documented::Updated } else { Documented::Added }))
+            }
+            None => {
+                c.execute(
+                    "INSERT INTO kn_joins (connection_id, left_table, left_cols, right_table, right_cols, first_seen, doc_source, doc_by, doc_state, doc_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?6)",
+                    params![connection_id, lt, lc, rt, rc, now, source, by, state.as_str()],
+                )?;
+                Ok((c.last_insert_rowid(), Documented::Added))
+            }
+        }
+    }
+
+    /// The user's answer to a documented join the assistant proposed:
+    /// approve it, or drop what was documented (a join also seen in
+    /// queries stays, learned from them).
+    pub fn review_documented_join(&self, id: i64, approve: bool) -> Result<()> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let n = if approve {
+            tx.execute("UPDATE kn_joins SET doc_state = 'approved' WHERE id = ?1 AND doc_source IS NOT NULL", [id])?
+        } else {
+            let seen: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM kn_join_seen WHERE join_id = ?1)", [id], |r| r.get(0))?;
+            if seen {
+                tx.execute("UPDATE kn_joins SET doc_source = NULL, doc_by = NULL, doc_state = NULL, doc_at = NULL WHERE id = ?1", [id])?
+            } else {
+                tx.execute("DELETE FROM kn_joins WHERE id = ?1", [id])?
+            }
+        };
+        tx.commit()?;
+        if n == 0 {
+            return Err(crate::Error::NotFound(format!("documented join {id}")));
+        }
+        Ok(())
+    }
+
     /// Record that a query read `table`. Only the user's and jobs' queries
     /// count; the assistant's are ignored.
     pub fn record_table_use(&self, connection_id: &str, table: &str, fingerprint: &str, at: i64, origin: Origin) -> Result<()> {
@@ -190,7 +318,8 @@ impl Workspace {
                (SELECT count(DISTINCT fingerprint) FROM kn_join_seen s WHERE s.join_id = j.id AND s.ai = 0), \
                (SELECT count(DISTINCT day) FROM kn_join_seen s WHERE s.join_id = j.id AND s.ai = 0), \
                (SELECT count(DISTINCT fingerprint) FROM kn_join_seen s WHERE s.join_id = j.id AND s.ai = 1), \
-               (SELECT max(at) FROM kn_join_seen s WHERE s.join_id = j.id AND s.ai = 0) \
+               (SELECT max(at) FROM kn_join_seen s WHERE s.join_id = j.id AND s.ai = 0), \
+               j.doc_source, j.doc_by, j.doc_state, j.doc_at \
              FROM kn_joins j WHERE j.connection_id = ?1",
         )?;
         let mut joins: Vec<LearnedJoin> = stmt
@@ -210,6 +339,15 @@ impl Workspace {
                     ai_queries: r.get(10)?,
                     last_seen: r.get(11)?,
                     kinds: BTreeMap::new(),
+                    documented: match r.get::<_, Option<String>>(12)? {
+                        Some(source) => Some(JoinDoc {
+                            source,
+                            by: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                            state: if r.get::<_, Option<String>>(14)?.as_deref() == Some("approved") { DocState::Approved } else { DocState::Proposed },
+                            at: r.get::<_, Option<i64>>(15)?.unwrap_or_default(),
+                        }),
+                        None => None,
+                    },
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -306,12 +444,15 @@ impl Workspace {
 
     /// Forget everything learned for a connection (or every connection),
     /// rejections included. The history already there is not learned from
-    /// again; new runs are.
+    /// again; new runs are. Documented joins stay (what was learned about
+    /// their use goes).
     pub fn forget_learned(&self, connection_id: Option<&str>) -> Result<()> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         let cond = if connection_id.is_some() { "connection_id = ?1" } else { "?1 IS NULL" };
-        tx.execute(&format!("DELETE FROM kn_joins WHERE {cond}"), [connection_id])?;
+        tx.execute(&format!("DELETE FROM kn_joins WHERE ({cond}) AND doc_source IS NULL"), [connection_id])?;
+        tx.execute(&format!("DELETE FROM kn_join_seen WHERE join_id IN (SELECT id FROM kn_joins WHERE {cond})"), [connection_id])?;
+        tx.execute(&format!("UPDATE kn_joins SET status = 'learned' WHERE {cond}"), [connection_id])?;
         tx.execute(&format!("DELETE FROM kn_table_seen WHERE {cond}"), [connection_id])?;
         tx.execute(
             &format!(
@@ -351,8 +492,11 @@ impl Workspace {
         let c = self.conn.lock();
         c.execute("DELETE FROM kn_join_seen WHERE day < ?1", [cutoff])?;
         c.execute("DELETE FROM kn_table_seen WHERE day < ?1", [cutoff])?;
-        // A join nobody has used since (not one the user decided on).
-        c.execute("DELETE FROM kn_joins WHERE status = 'learned' AND NOT EXISTS (SELECT 1 FROM kn_join_seen s WHERE s.join_id = kn_joins.id)", [])?;
+        // A join nobody has used since (not one the user decided on, nor a documented one).
+        c.execute(
+            "DELETE FROM kn_joins WHERE status = 'learned' AND doc_source IS NULL AND NOT EXISTS (SELECT 1 FROM kn_join_seen s WHERE s.join_id = kn_joins.id)",
+            [],
+        )?;
         Ok(())
     }
 }
@@ -526,6 +670,55 @@ mod tests {
         ws.record_join(&c, &seen(ORD, CUS, "inner", "f1", h, 1, Origin::User)).unwrap();
         ws.forget_learned(None).unwrap();
         assert!(ws.learned_joins(&c).unwrap().is_empty());
+    }
+
+    #[test]
+    fn documented_joins_need_no_queries_and_survive_forget_and_prune() {
+        let (ws, c) = setup();
+        let cols = |c: &str| vec![c.to_string()];
+        // Recorded from the other side: one join, in canonical order.
+        let (id, what) = ws.document_join(&c, CUS.0, &cols(CUS.1), ORD.0, &cols(ORD.1), "orders spec §3", "ai", false).unwrap();
+        assert_eq!(what, Documented::Added);
+        let j = &ws.learned_joins(&c).unwrap()[0];
+        assert_eq!((j.left_table.as_str(), j.right_table.as_str(), j.queries), ("sales.customers", "sales.orders", 0));
+        let doc = j.documented.as_ref().unwrap();
+        assert_eq!((doc.source.as_str(), doc.by.as_str(), doc.state), ("orders spec §3", "ai", DocState::Proposed));
+        // Seen in a query too: still one join, now with use.
+        let h = run(&ws, &c, "select 1", Origin::User);
+        assert_eq!(ws.record_join(&c, &seen(ORD, CUS, "inner", "f1", h, 1, Origin::User)).unwrap(), id);
+        let j = &ws.learned_joins(&c).unwrap()[0];
+        assert_eq!((j.queries, j.documented.as_ref().map(|d| d.state)), (1, Some(DocState::Proposed)));
+        // Approved; documenting it again (proposed) keeps it approved.
+        ws.review_documented_join(id, true).unwrap();
+        assert_eq!(ws.document_join(&c, ORD.0, &cols(ORD.1), CUS.0, &cols(CUS.1), "data dictionary", "mcp", false).unwrap(), (id, Documented::Updated));
+        let doc = ws.learned_joins(&c).unwrap()[0].documented.clone().unwrap();
+        assert_eq!((doc.source.as_str(), doc.state), ("data dictionary", DocState::Approved));
+        // Forget and prune keep it (without its use).
+        ws.forget_learned(Some(&c)).unwrap();
+        ws.prune_learned(0).unwrap();
+        let j = &ws.learned_joins(&c).unwrap()[0];
+        assert_eq!((j.id, j.queries), (id, 0));
+        // Rejected stays rejected.
+        ws.set_join_status(id, JoinStatus::Rejected).unwrap();
+        assert_eq!(ws.document_join(&c, ORD.0, &cols(ORD.1), CUS.0, &cols(CUS.1), "again", "ai", true).unwrap(), (id, Documented::Rejected));
+        // Bad shape.
+        assert!(ws.document_join(&c, ORD.0, &[], CUS.0, &[], "x", "ai", true).is_err());
+    }
+
+    #[test]
+    fn discarding_a_proposed_join_keeps_what_queries_taught() {
+        let (ws, c) = setup();
+        let cols = |c: &str| vec![c.to_string()];
+        let (only_doc, _) = ws.document_join(&c, "a.x", &cols("k"), "a.y", &cols("k"), "spec", "ai", false).unwrap();
+        let h = run(&ws, &c, "select 1", Origin::User);
+        let used = ws.record_join(&c, &seen(ORD, CUS, "inner", "f1", h, 1, Origin::User)).unwrap();
+        ws.document_join(&c, ORD.0, &cols(ORD.1), CUS.0, &cols(CUS.1), "spec", "ai", false).unwrap();
+        ws.review_documented_join(only_doc, false).unwrap();
+        ws.review_documented_join(used, false).unwrap();
+        let joins = ws.learned_joins(&c).unwrap();
+        assert_eq!(joins.len(), 1);
+        assert_eq!((joins[0].id, joins[0].documented.is_none()), (used, true));
+        assert!(ws.review_documented_join(only_doc, true).is_err());
     }
 
     #[test]

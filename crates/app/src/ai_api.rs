@@ -797,13 +797,16 @@ pub fn learned(state: &AppState, connection_id: &str) -> Result<LearnedView> {
         .into_iter()
         .map(|j| {
             let shown = usable.contains(&j.id);
+            let proposed = j.documented.as_ref().is_some_and(|d| d.state == databrain_workspace::DocState::Proposed);
             let hidden_reason = (!shown).then(|| {
-                if !pol.learn_from_history {
-                    "Learning from query history is off for this connection".to_string()
-                } else if !pol.share_metadata {
-                    "Schema metadata isn't shared with the AI on this connection".into()
+                if !pol.share_metadata {
+                    "Schema metadata isn't shared with the AI on this connection".to_string()
                 } else if j.status == JoinStatus::Rejected {
                     "Rejected".into()
+                } else if proposed {
+                    "Recorded by the AI from a document: approve it to give it to the AI".into()
+                } else if !pol.learn_from_history && !learn::documented(&j) {
+                    "Learning from query history is off for this connection".into()
                 } else if j.declared {
                     "A declared foreign key: the AI sees it as FK".into()
                 } else if !learn::surfaced(&j) {
@@ -828,6 +831,12 @@ pub fn learned(state: &AppState, connection_id: &str) -> Result<LearnedView> {
 
 pub fn set_join_status(state: &AppState, id: i64, status: JoinStatus) -> Result<()> {
     Ok(state.workspace.set_join_status(id, status)?)
+}
+
+/// Approve a join the AI recorded from a document, or discard it (what
+/// queries taught about it stays).
+pub fn review_join(state: &AppState, id: i64, approve: bool) -> Result<()> {
+    Ok(state.workspace.review_documented_join(id, approve)?)
 }
 
 /// History entries a learned join was seen in (still kept), latest first.

@@ -88,6 +88,17 @@ pub fn specs(include_editor: bool) -> Vec<ToolSpec> {
             json!({"type": "object", "properties": {"id": {"type": "string"}, "note": {"type": "string", "description": "Complete new text"}, "target": {"type": "string"}}, "required": ["id", "note"]}),
         ),
         s(
+            "add_knowledge_join",
+            "Record how two tables join, as written in a document, a data dictionary or by the user (not a join you guessed or only tried): the key columns on both sides, in order, and where it is written. It is then used by find_join_path and shown by describe_table, without having to be seen in past queries. Tables must be in the knowledge index (index_tables first).",
+            json!({"type": "object", "properties": {
+                "left_table": {"type": "string", "description": "schema.table"},
+                "left_columns": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "right_table": {"type": "string", "description": "schema.table"},
+                "right_columns": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Same order as left_columns"},
+                "source": {"type": "string", "description": "Where it is written, e.g. 'Orders data dictionary §3' or 'the user'"}
+            }, "required": ["left_table", "left_columns", "right_table", "right_columns", "source"]}),
+        ),
+        s(
             "list_connections",
             "List the user's connections the assistant may use (name, engine, environment, read-only, connected), including the Results (DuckDB) connection that combines outputs. Pass a name as `connection` to run_query, list_tables, search_schema and describe_table to work on it; use it to answer across databases and to plan jobs.",
             json!({"type": "object", "properties": {}}),

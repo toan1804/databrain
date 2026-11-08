@@ -142,6 +142,7 @@ impl ToolContext {
             "query_outputs" => self.query_outputs(args).await,
             "add_knowledge_note" => self.add_note(args).await,
             "update_knowledge_note" => self.update_note(args).await,
+            "add_knowledge_join" => self.add_join(args),
             "list_knowledge_notes" => self.list_notes(args),
             "save_query" => self.save_query(args).await,
             "list_connections" => self.list_connections(),

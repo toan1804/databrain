@@ -57,8 +57,14 @@ pub fn surfaced(j: &LearnedJoin) -> bool {
     match j.status {
         JoinStatus::Confirmed => true,
         JoinStatus::Rejected => false,
-        JoinStatus::Learned => j.queries >= SURFACE_QUERIES || j.days >= SURFACE_DAYS,
+        JoinStatus::Learned => documented(j) || j.queries >= SURFACE_QUERIES || j.days >= SURFACE_DAYS,
     }
+}
+
+/// Written down (a document, the user) and approved: given to the AI
+/// without being seen in queries.
+pub fn documented(j: &LearnedJoin) -> bool {
+    j.documented.as_ref().is_some_and(|d| d.state == databrain_workspace::DocState::Approved)
 }
 
 /// Learn from up to `limit` history entries after the connection's cursor.
@@ -553,11 +559,17 @@ mod tests {
             kinds: Default::default(),
             first_seen: 0,
             last_seen: None,
+            documented: None,
         };
         assert!(!surfaced(&base));
         assert!(surfaced(&LearnedJoin { queries: 2, ..base.clone() }));
         assert!(surfaced(&LearnedJoin { days: 2, ..base.clone() }));
         assert!(surfaced(&LearnedJoin { status: JoinStatus::Confirmed, queries: 0, days: 0, ..base.clone() }));
-        assert!(!surfaced(&LearnedJoin { status: JoinStatus::Rejected, queries: 50, days: 50, ..base }));
+        assert!(!surfaced(&LearnedJoin { status: JoinStatus::Rejected, queries: 50, days: 50, ..base.clone() }));
+        // Documented: given without use once approved, never when rejected.
+        let doc = |state| Some(databrain_workspace::JoinDoc { source: "spec".into(), by: "ai".into(), state, at: 0 });
+        assert!(surfaced(&LearnedJoin { queries: 0, days: 0, documented: doc(databrain_workspace::DocState::Approved), ..base.clone() }));
+        assert!(!surfaced(&LearnedJoin { queries: 0, days: 0, documented: doc(databrain_workspace::DocState::Proposed), ..base.clone() }));
+        assert!(!surfaced(&LearnedJoin { status: JoinStatus::Rejected, documented: doc(databrain_workspace::DocState::Approved), ..base }));
     }
 }
