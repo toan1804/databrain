@@ -3,6 +3,7 @@
 // before → after. Counts are exact (a summary query); rows are paged from
 // the diff result, filtered on the backend.
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { charDiff, differsUnseen, type TextChar } from "../lib/textDiff";
 import { AlertTriangle, ArrowLeftRight, FileCode2, Loader2, RefreshCw, Settings2, Table2 } from "lucide-react";
 import { api, toError } from "../lib/api";
 import { changedIn, diffLayout, diffView, KIND_LABEL, shortType, type DiffFilter } from "../lib/compare";
@@ -36,6 +37,8 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
   const [filter, setFilter] = useState<DiffFilter>("all");
   const [column, setColumn] = useState<string | null>(null);
   const [onlyDiffering, setOnlyDiffering] = useState(true);
+  /** Changed cells character by character, with spaces, tabs and invisible characters drawn. */
+  const [showHidden, setShowHidden] = useState(false);
   const [rows, setRows] = useState<(string | null)[][]>([]);
   const [viewRows, setViewRows] = useState(0);
   const [editing, setEditing] = useState(false);
@@ -198,6 +201,9 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
               <label className="ml-auto flex items-center gap-1 text-muted">
                 <input type="checkbox" checked={onlyDiffering} onChange={(e) => setOnlyDiffering(e.target.checked)} /> Only columns that differ
               </label>
+              <label className="flex items-center gap-1 text-muted" title="Show changed cells character by character: spaces (·), tabs (→), new lines (↵), no-break (⍽) and zero-width spaces, accents written apart (◌́), badly decoded characters (�)">
+                <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden(e.target.checked)} /> Show hidden characters
+              </label>
             </div>
           )}
 
@@ -247,7 +253,9 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
                           const differs = diffs.has(c);
                           return (
                             <td key={c} className={`border-b border-line/50 px-2 py-0.5 font-mono ${differs ? "bg-warning/10" : "text-muted/70"}`}>
-                              {differs ? (
+                              {differs && showHidden && r[layout.before[c]] != null && after != null ? (
+                                <TextDiff before={r[layout.before[c]] as string} after={after} />
+                              ) : differs ? (
                                 <span>
                                   <span className="rounded-sm bg-danger/10 px-0.5 text-danger line-through decoration-danger/50">
                                     <Cell v={r[layout.before[c]]} />
@@ -256,6 +264,15 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
                                   <span className="rounded-sm bg-success/10 px-0.5 font-medium text-success">
                                     <Cell v={after} />
                                   </span>
+                                  {differsUnseen(r[layout.before[c]], after) && (
+                                    <button
+                                      className="ml-1.5 rounded border border-warning/50 px-1 font-sans text-[10px] text-warning hover:bg-warning/10"
+                                      title="These look the same but differ in characters you can't see (spaces, tabs, invisible or differently encoded characters). Click to show them."
+                                      onClick={() => setShowHidden(true)}
+                                    >
+                                      unseen
+                                    </button>
+                                  )}
                                 </span>
                               ) : (
                                 <Cell v={after} />
@@ -344,6 +361,41 @@ function Count({ label, n, cls, active, onClick }: { label: string; n: number; c
     >
       {body}
     </button>
+  );
+}
+
+/** Before → after, character by character: what differs is marked, hidden characters are drawn. */
+function TextDiff({ before, after }: { before: string; after: string }) {
+  const d = useMemo(() => charDiff(before, after), [before, after]);
+  return (
+    <span className="whitespace-pre">
+      <Chars chars={d.before} tone="danger" />
+      <span className="px-1 text-muted">→</span>
+      <Chars chars={d.after} tone="success" />
+    </span>
+  );
+}
+
+function Chars({ chars, tone }: { chars: TextChar[]; tone: "danger" | "success" }) {
+  if (chars.length === 0) return <span className="font-sans text-[10.5px] italic text-muted">(empty)</span>;
+  const changed = tone === "danger" ? "bg-danger/30 text-danger" : "bg-success/30 text-success";
+  return (
+    <span className={`rounded-sm px-0.5 ${tone === "danger" ? "bg-danger/10" : "bg-success/10"}`} data-chars={tone === "danger" ? "before" : "after"}>
+      {chars.map((c, i) => {
+        const drawn = c.kind === "space" || c.kind === "hidden" || (c.kind === "other" && c.shown !== c.ch);
+        const cls = [
+          c.changed ? `${changed} rounded-[2px] font-semibold` : "",
+          // Drawn spaces are faint unless they are what changed.
+          drawn ? (c.kind === "hidden" ? "mx-px rounded-[2px] border border-current px-0.5 font-sans text-[9px]" : c.changed ? "px-px" : "opacity-50") : "",
+          !drawn && c.kind === "other" ? "underline decoration-dotted underline-offset-2" : "",
+        ].join(" ");
+        return (
+          <span key={i} className={cls} title={c.name} data-changed={c.changed || undefined}>
+            {drawn ? c.shown : c.ch}
+          </span>
+        );
+      })}
+    </span>
   );
 }
 

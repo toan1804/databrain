@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Compare tab: "Show hidden characters" shows changed cells character by character, so a no-break space, a tab, a zero-width space, a BOM, an accent written apart or a badly decoded `�` can be seen; the characters that differ are highlighted and named on hover. Values that only differ in such characters are flagged "unseen".
 - Compare outputs: one column can be compared with several (`debit_amt = debit_amt`, `credit_amt = credit_amt` and `debit_amt = credit_amt`); pairs typed under the columns are added next to the matched ones instead of replacing them, each with its own result column (`debit_amt → credit_amt`). Each compared pair has a ✕ to leave it out.
 - Compare tab: the Before card is red and the After card green, the same colours as the old → new values in changed cells, which now have a light red or green background.
 - Compare outputs: time-zone timestamps (Databricks, Snowflake, BigQuery…) compare and show in UTC, as the grid shows them, so `2026-11-04 00:00:00+00:00` equals an Oracle `2026-11-04 00:00:00` instead of becoming your computer's local time. Text with an offset (`…+07:00`, `…Z`) is read the same way.

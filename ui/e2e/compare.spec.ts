@@ -247,3 +247,57 @@ test("add debit_amt = credit_amt next to the matched columns, and drop a column"
     },
   });
 });
+
+
+test("text that differs only in characters you can't see", async ({ page }) => {
+  const cols = [meta("id", "Int32", "number"), meta("name", "Utf8", "text"), meta("note", "Utf8", "text")];
+  const before = output("r1", "cust_ora", "Oracle prod", 3, cols);
+  const after = output("r2", "cust_dbx", "Databricks", 3, cols);
+  await openApp(page, backend({ list_outputs: [after, before] }));
+  const pairs = ["id", "name", "note"].map((c) => ({ before: c, after: c, label: c, before_type: "Utf8", after_type: "Utf8", auto_kind: "text", kind: "text" }));
+  await answer(page, "output_compare_pairs", pairs);
+  await answer(page, "compare_outputs", {
+    summary: { before_rows: 3, after_rows: 3, same: 1, changed: 2, added: 0, removed: 0, before_duplicate_keys: 0, after_duplicate_keys: 0, columns: [{ column: "name", changed: 1 }, { column: "note", changed: 1 }] },
+    result: { id: "diff-4", columns: ["_change", "id", "name", "note", "name (before)", "note (before)", "_changed"].map((n) => meta(n, "Utf8", "text")), total_rows: 2, complete: true, truncated: false, bytes: 100 },
+    sql: "SELECT 1;",
+    pairs,
+    keys: ["id"],
+    before,
+    after,
+  });
+  // A no-break space; a tab for two spaces plus a zero-width space.
+  await answer(page, "fetch_page", {
+    view_rows: 2,
+    total_rows: 2,
+    offset: 0,
+    row_ids: [0, 1],
+    rows: [
+      ["changed", "1", "ACME Corp", "x", "ACME Corp", "x", "name"],
+      ["changed", "2", "Bob", "a\tb​", "Bob", "a  b", "note"],
+    ],
+  });
+
+  await page.getByRole("button", { name: "Outputs", exact: true }).click();
+  await page.getByRole("button", { name: "Compare outputs" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByText("id", { exact: true }).first().click(); // key
+  await dialog.getByRole("button", { name: "Show differences" }).click();
+
+  const table = page.locator("table").last();
+  // They look the same, so each is flagged; the flag shows the characters.
+  await expect(table.getByRole("button", { name: "unseen" })).toHaveCount(2);
+  await table.getByRole("button", { name: "unseen" }).first().click();
+  await expect(page.getByLabel("Show hidden characters")).toBeChecked();
+  const row1 = table.locator("tr", { hasText: "ACME" });
+  await expect(row1.locator('[data-chars="before"] [data-changed]')).toHaveAttribute("title", "U+0020 SPACE");
+  await expect(row1.locator('[data-chars="after"] [data-changed]')).toHaveAttribute("title", "U+00A0 NO-BREAK SPACE");
+  const row2 = table.locator("tr", { hasText: "Bob" });
+  await expect(row2.locator('[data-chars="after"] [data-changed]')).toHaveCount(2);
+  await expect(row2.locator('[data-chars="after"] [data-changed]').nth(0)).toHaveAttribute("title", "U+0009 TAB");
+  await expect(row2.locator('[data-chars="after"] [data-changed]').nth(1)).toHaveText("ZWSP");
+  await expect(row2.locator('[data-chars="before"] [data-changed]')).toHaveCount(2);
+  await page.screenshot({ path: "test-results/compare-hidden-chars.png" });
+  // Off again: the usual before → after.
+  await page.getByLabel("Show hidden characters").uncheck();
+  await expect(table.locator("[data-chars]")).toHaveCount(0);
+});
