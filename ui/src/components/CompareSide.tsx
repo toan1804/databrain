@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { FileUp, Loader2, Table2 } from "lucide-react";
 import { api, toError } from "../lib/api";
+import { useEvent } from "../lib/hooks";
 import { traitsOf } from "../lib/sourceTraits";
 import type { CompareSource, DbObject, ExcelSheet, OutputInfo, SchemaInfo } from "../lib/types";
 import { formatCount } from "../lib/util";
@@ -32,6 +33,8 @@ export function CompareSide({
   source,
   outputs,
   onPick,
+  readNow = 0,
+  onDraft,
 }: {
   label: string;
   side: "before" | "after";
@@ -41,12 +44,17 @@ export function CompareSide({
   source: CompareSource | null;
   outputs: OutputInfo[];
   onPick: (handle: string, source: CompareSource | null) => void;
+  /** Bumped by the dialog's "Read tables": read the table filled in here. */
+  readNow?: number;
+  /** Whether a table is filled in here but not read yet. */
+  onDraft?: (ready: boolean) => void;
 }) {
   const connections = useStore((s) => s.connections);
   const toast = useStore((s) => s.toast);
   const sqlConns = useMemo(() => connections.filter((c) => traitsOf(c.config.kind).language === "sql"), [connections]);
-  // A table without a connection yet (from the explorer: the same table elsewhere) opens the table form.
-  const [mode, setMode] = useState<"output" | "table" | "file">(source?.kind === "table" && !source.connection_id && !value ? "table" : "output");
+  // A table from the explorer opens the table form, filled in: nothing is read
+  // until the user says so (a table may be slow, fail, or not be ready yet).
+  const [mode, setMode] = useState<"output" | "table" | "file">(source?.kind === "table" && !value ? "table" : "output");
   /** A table or file the dialog is reading for this side (from the explorer). */
   const reading = !value && mode === "output" && !!source && source.kind !== "output";
   const [busy, setBusy] = useState(false);
@@ -111,9 +119,18 @@ export function CompareSide({
     await read({ kind: "file", path, sheet: null });
   };
 
+  const tableOk = conn && schema && table.trim();
+  const ready = mode === "table" && !!tableOk;
+  useEffect(() => onDraft?.(ready), [ready, onDraft]);
+  const readTable = useEvent(() => {
+    if (ready && !busy) void read({ kind: "table", connection_id: conn, schema, table: table.trim() });
+  });
+  useEffect(() => {
+    if (readNow) readTable();
+  }, [readNow, readTable]);
+
   const connName = (id: string) => connections.find((c) => c.id === id)?.name;
   const from = sourceLabel(source, connName);
-  const tableOk = conn && schema && table.trim();
   return (
     <div>
       <span className="mb-1 block text-[11.5px] font-medium text-muted">{label}</span>
@@ -173,14 +190,14 @@ export function CompareSide({
             list={`compare-${side}-tables`}
             value={table}
             onChange={(e) => setTable(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && tableOk && void read({ kind: "table", connection_id: conn, schema, table: table.trim() })}
+            onKeyDown={(e) => e.key === "Enter" && readTable()}
           />
           <datalist id={`compare-${side}-tables`}>
             {objects.map((o) => (
               <option key={o.name} value={o.name} />
             ))}
           </datalist>
-          <button className="btn-primary h-7 py-0" disabled={!tableOk || busy} onClick={() => void read({ kind: "table", connection_id: conn, schema, table: table.trim() })}>
+          <button className="btn-primary h-7 py-0" disabled={!tableOk || busy} onClick={readTable}>
             Read
           </button>
         </div>

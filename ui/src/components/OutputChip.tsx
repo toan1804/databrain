@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { compareOptions, DEFAULT_COMPARE_FORM, formFromOptions, KIND_HELP, KIND_LABEL, addPair, changePair, pairColumns, parseMapping, parseTolerance, removePair, shortType, type ColumnPair, type CompareForm, type PairEdits } from "../lib/compare";
 import {
   AlertTriangle,
@@ -11,6 +11,7 @@ import {
   Pencil,
   Pin,
   PinOff,
+  Table2,
   TerminalSquare,
   Trash2,
   X,
@@ -269,15 +270,16 @@ export function CompareDialog({
   );
   const [sources, setSources] = useState<Sources>(() => ({ before: initialSources?.before ?? null, after: initialSources?.after ?? null }));
   const toast = useStore((s) => s.toast);
-  // A complete table or file side (from the explorer) is read right away.
+  // A file side (from the explorer) is read right away. A table side opens
+  // filled in and is read only on "Read tables" (or its own Read button): a
+  // table may be slow, fail, or the user may not be ready to compare yet.
   const autoRead = useRef(false);
   useEffect(() => {
     if (autoRead.current || initialSpec) return;
     autoRead.current = true;
     for (const side of ["before", "after"] as const) {
       const src = initialSources?.[side];
-      const complete = src && (src.kind === "file" || (src.kind === "table" && src.connection_id));
-      if (!complete) continue;
+      if (src?.kind !== "file") continue;
       void api
         .compareLoadSource(src, "dialog", side)
         .then(async (o) => {
@@ -289,6 +291,13 @@ export function CompareDialog({
   }, [initialSources, initialSpec, toast]);
   const b = outputs.find((o) => o.handle === before);
   const a = outputs.find((o) => o.handle === after);
+  // Tables filled in but not read yet, and a signal to read them.
+  const [drafts, setDrafts] = useState({ before: false, after: false });
+  const draftBefore = useCallback((ready: boolean) => setDrafts((d) => (d.before === ready ? d : { ...d, before: ready })), []);
+  const draftAfter = useCallback((ready: boolean) => setDrafts((d) => (d.after === ready ? d : { ...d, after: ready })), []);
+  const [readNow, setReadNow] = useState(0);
+  const toReadNow = (!b && drafts.before) || (!a && drafts.after);
+  const canReadNow = toReadNow && (!!b || drafts.before) && (!!a || drafts.after);
   // Columns matched by name (any case), less the ones left out, plus pairs the user adds.
   const [edits, setEdits] = useState<PairEdits>(() => {
     if (!initialSpec) return { manual: [], excluded: [] };
@@ -411,13 +420,24 @@ export function CompareDialog({
           <button className="btn-ghost" onClick={onClose}>
             Cancel
           </button>
-          <button
-            className="btn-primary"
-            disabled={!a || !b || a.handle === b.handle || common.length === 0 || !toleranceOk}
-            onClick={run}
-          >
-            <GitCompare size={14} /> {onApply ? "Compare" : "Show differences"}
-          </button>
+          {toReadNow ? (
+            <button
+              className="btn-primary"
+              disabled={!canReadNow}
+              title={canReadNow ? "Read the tables, then choose the keys and columns" : "Fill in both sides first"}
+              onClick={() => setReadNow((n) => n + 1)}
+            >
+              <Table2 size={14} /> Read tables
+            </button>
+          ) : (
+            <button
+              className="btn-primary"
+              disabled={!a || !b || a.handle === b.handle || common.length === 0 || !toleranceOk}
+              onClick={run}
+            >
+              <GitCompare size={14} /> {onApply ? "Compare" : "Show differences"}
+            </button>
+          )}
         </>
       }
     >
@@ -429,6 +449,8 @@ export function CompareDialog({
           source={sources.before ?? null}
           outputs={outputs}
           onPick={(h, src) => (setBefore(h), setSources((x) => ({ ...x, before: src })))}
+          readNow={readNow}
+          onDraft={draftBefore}
         />
         <CompareSide
           label="After"
@@ -437,6 +459,8 @@ export function CompareDialog({
           source={sources.after ?? null}
           outputs={outputs}
           onPick={(h, src) => (setAfter(h), setSources((x) => ({ ...x, after: src })))}
+          readNow={readNow}
+          onDraft={draftAfter}
         />
         <div>
           <div className="mb-1 text-[11.5px] font-medium text-muted">
