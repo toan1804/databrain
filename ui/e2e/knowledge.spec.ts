@@ -15,9 +15,9 @@ const join = (id: number, l: string, r: string, lc: string, rc: string, over: Re
   ai_queries: 0,
   kinds: { inner: 2 },
   first_seen: Date.now() - 86_400_000 * 5,
-  last_seen: Date.now() - 3_600_000,
+  last_seen: Date.now() - 3_600_000 as number | null,
   shown: true,
-  hidden_reason: null,
+  hidden_reason: null as string | null,
   ...over,
 });
 // Many joins: given, waiting (used once) and rejected ones.
