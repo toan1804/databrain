@@ -8,6 +8,7 @@ import { parseViews, rememberQuickFilter, type QuickFilterEntry, type SavedView 
 import { applyTheme, persistQuickFilters } from "./helpers";
 import type { ConfirmState, SidebarPanel, State, Theme, Toast } from "./types";
 import type { CompareSource, OutputInfo } from "../lib/types";
+import type { InlineAiProvider } from "../lib/inlineAi";
 
 let appearanceSave: ReturnType<typeof setTimeout> | undefined;
 
@@ -24,6 +25,9 @@ export interface UiSlice {
   /** Inline AI suggestions while typing (off by default: it sends the SQL around the cursor to the AI provider). */
   inlineAiCompletion: boolean;
   setInlineAiCompletion: (on: boolean) => void;
+  /** Provider (and model) for inline completion; null = the AI panel's. */
+  inlineAiProvider: InlineAiProvider | null;
+  setInlineAiProvider: (p: InlineAiProvider | null) => void;
   /** The user's SQL snippets (built-in ones are added by the editor). */
   sqlSnippets: Snippet[];
   setSqlSnippets: (s: Snippet[]) => void;
@@ -69,6 +73,7 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   rowLimit: 1000,
   slowQuerySeconds: DEFAULT_SLOW_QUERY_SECONDS,
   inlineAiCompletion: false,
+  inlineAiProvider: null,
   sqlSnippets: [],
   gridViews: [],
   quickFilters: {},
@@ -112,6 +117,10 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   setInlineAiCompletion: (inlineAiCompletion) => {
     set({ inlineAiCompletion });
     if (isTauri()) api.setSetting("inline_ai_completion", inlineAiCompletion).catch(() => {});
+  },
+  setInlineAiProvider: (inlineAiProvider) => {
+    set({ inlineAiProvider });
+    if (isTauri()) api.setSetting("inline_ai_provider", inlineAiProvider).catch(() => {});
   },
   setSqlSnippets: (s) => {
     const sqlSnippets = parseSnippets(s);

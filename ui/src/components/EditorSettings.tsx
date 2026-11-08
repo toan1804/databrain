@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useAi } from "../aiStore";
+import { inlineCapable } from "../lib/inlineAi";
 import { Plus, Trash2 } from "lucide-react";
 import { kbd } from "../lib/platform";
 import { BUILTIN_SNIPPETS, snippetPreview, type Snippet } from "../lib/snippets";
@@ -8,6 +10,30 @@ import { useStore } from "../store";
 export function EditorSettings() {
   const inline = useStore((s) => s.inlineAiCompletion);
   const setInline = useStore((s) => s.setInlineAiCompletion);
+  const choice = useStore((s) => s.inlineAiProvider);
+  const setChoice = useStore((s) => s.setInlineAiProvider);
+  const providers = useAi((s) => s.providers);
+  const panelId = useAi((s) => s.providerId);
+  const loadModels = useAi((s) => s.loadModels);
+  const capable = inlineCapable(providers);
+  // A chosen provider that was removed: the AI panel's is used.
+  const chosen = choice && capable.some((p) => p.id === choice.provider_id) ? choice : null;
+  const panel = providers.find((p) => p.id === panelId) ?? providers[0];
+  const [models, setModels] = useState<string[]>([]);
+  const chosenId = chosen?.provider_id ?? null;
+  useEffect(() => {
+    setModels([]);
+    if (!chosenId) return;
+    let alive = true;
+    loadModels(chosenId)
+      .then((m) => alive && setModels(m))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [chosenId, loadModels]);
+  const chosenView = chosen ? capable.find((p) => p.id === chosen.provider_id) : undefined;
+  const defaultModel = chosenView?.config.fast_model || chosenView?.config.default_model || "";
   const snippets = useStore((s) => s.sqlSnippets);
   const setSnippets = useStore((s) => s.setSqlSnippets);
   const [draft, setDraft] = useState<Snippet>({ prefix: "", body: "", description: "" });
@@ -26,11 +52,58 @@ export function EditorSettings() {
         <input type="checkbox" checked={inline} onChange={(e) => setInline(e.target.checked)} /> Suggest how the SQL goes on while I type
       </label>
       <p className="text-[11.5px] text-muted">
-        After a short pause, the AI panel's provider (its fast model when set) suggests the rest of the statement in grey at the cursor. {kbd("Tab")} accepts it,{" "}
+        After a short pause, the provider below suggests the rest of the statement in grey at the cursor. {kbd("Tab")} accepts it,{" "}
         {kbd("⌘→")} accepts the next word, {kbd("Esc")} dismisses it, and {kbd("⌥\\")} asks right away (also with this turned off). The SQL around the
         cursor and a few relevant tables from the connection's knowledge index are sent to the provider; connections with AI turned off, or providers
-        the connection doesn't allow, get no suggestions. Kiro can't be used for this.
+        the connection doesn't allow, get no suggestions.
       </p>
+      <div className="grid grid-cols-[auto_1fr] items-center gap-x-2 gap-y-1.5 text-[12px]">
+        <label htmlFor="inline-provider" className="text-muted">
+          Provider
+        </label>
+        <select
+          id="inline-provider"
+          className="field h-7 py-0"
+          value={chosen?.provider_id ?? ""}
+          onChange={(e) => setChoice(e.target.value ? { provider_id: e.target.value, model: "" } : null)}
+        >
+          <option value="">Same as the AI panel{panel ? ` (${panel.name})` : ""}</option>
+          {capable.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+        {chosen && (
+          <>
+            <label htmlFor="inline-model" className="text-muted">
+              Model
+            </label>
+            <input
+              id="inline-model"
+              className="field h-7 py-0 font-mono text-[11.5px]"
+              list="inline-models"
+              placeholder={defaultModel ? `${defaultModel} (the provider's ${chosenView?.config.fast_model ? "fast" : "default"} model)` : "Model"}
+              value={chosen.model}
+              onChange={(e) => setChoice({ ...chosen, model: e.target.value })}
+            />
+            <datalist id="inline-models">
+              {models.map((m) => (
+                <option key={m} value={m} />
+              ))}
+            </datalist>
+          </>
+        )}
+      </div>
+      {!chosen && panel?.kind === "kiro" && (
+        <p className="text-[11.5px] text-warning">
+          The AI panel uses Kiro, which runs as an agent and can't complete inline: choose another provider here (a local model in Ollama or LM Studio
+          works well and keeps the SQL on this computer).
+        </p>
+      )}
+      {capable.length === 0 && providers.length > 0 && (
+        <p className="text-[11.5px] text-muted">Add a model provider (OpenAI, Anthropic, Gemini, Ollama, …) in Settings → AI providers to get suggestions.</p>
+      )}
 
       <h3 className="pt-3 text-[13px] font-medium">SQL snippets</h3>
       <p className="text-[11.5px] text-muted">

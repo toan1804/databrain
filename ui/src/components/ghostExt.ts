@@ -3,6 +3,7 @@
 // it shows greyed at the cursor. Tab accepts it, ⌘→ accepts a word, Esc
 // dismisses it, typing what it says keeps the rest. ⌥\ asks right away.
 import { hasNextSnippetField } from "@codemirror/autocomplete";
+import { inlineTarget } from "../lib/inlineAi";
 import { Prec, StateEffect, StateField, type EditorState, type Extension } from "@codemirror/state";
 import { Decoration, EditorView, ViewPlugin, WidgetType, keymap, type ViewUpdate } from "@codemirror/view";
 import { api, isTauri, toError } from "../lib/api";
@@ -127,7 +128,8 @@ function ghostPlugin(getConnId: () => string | null | undefined) {
         const my = ++this.seq;
         this.request = id;
         try {
-          const raw = await api.aiGhost(id, { connection_id: conn.id, provider_id: ai.providerId, model: ai.model, prefix, suffix });
+          const target = inlineTarget(st.inlineAiProvider, ai.providers, ai);
+          const raw = await api.aiGhost(id, { connection_id: conn.id, ...target, prefix, suffix });
           if (my !== this.seq || view.state.doc.toString() !== doc || view.state.selection.main.head !== pos) return;
           const text = fitGhost(raw, prefix, suffix);
           if (text) view.dispatch({ effects: setGhost.of({ pos, text }) });
