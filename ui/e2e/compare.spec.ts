@@ -171,15 +171,22 @@ test("compare a table with the same table on another connection, from the explor
   await page.getByRole("treeitem").filter({ hasText: /^customers/ }).click({ button: "right" });
   await page.getByText("Compare data with…").click();
   const dialog = page.getByRole("dialog");
-  // Before: read right away. After: the same table, on a connection to pick.
-  await expect.poll(async () => (await calls(page, "compare_load_source")).length).toBe(1);
-  expect((await calls(page, "compare_load_source"))[0]).toMatchObject({ source: { kind: "table", connection_id: "conn-shop", schema: "public", table: "customers" }, side: "before" });
+  // Both sides open filled in (before: this table; after: the same table on a
+  // connection to pick), and nothing is read until the user says so.
+  await expect(dialog.getByLabel("Before connection")).toHaveValue("conn-shop");
+  await expect(dialog.getByLabel("Before table")).toHaveValue("customers");
   await expect(dialog.getByLabel("After table")).toHaveValue("customers");
+  const readTables = dialog.getByRole("button", { name: "Read tables" });
+  await expect(readTables).toBeDisabled();
   await dialog.getByLabel("After connection").selectOption("conn-dwh");
   await expect(dialog.getByLabel("After schema")).toHaveValue("public");
   await page.screenshot({ path: "test-results/compare-dialog.png" });
-  await dialog.getByRole("button", { name: "Read" }).click();
+  expect(await calls(page, "compare_load_source")).toHaveLength(0);
+  await readTables.click();
   await expect.poll(async () => (await calls(page, "compare_load_source")).length).toBe(2);
+  const read = await calls(page, "compare_load_source");
+  expect(read.find((c) => c.side === "before")).toMatchObject({ source: { kind: "table", connection_id: "conn-shop", schema: "public", table: "customers" } });
+  expect(read.find((c) => c.side === "after")).toMatchObject({ source: { kind: "table", connection_id: "conn-dwh", schema: "public", table: "customers" } });
   // The table's primary key is suggested as the key.
   await expect(dialog.getByText(/Suggested: the table's primary key/)).toBeVisible();
   await dialog.getByRole("button", { name: "Show differences" }).click();

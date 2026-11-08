@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useEvent } from "../lib/hooks";
+import { useEvent, useWidth } from "../lib/hooks";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { AlertCircle, AlertTriangle, ArrowDown, ArrowRight, Minus, Plus, CheckCircle2, Columns3, ExternalLink, Rows3, Workflow, ChevronDown, ClipboardCopy, Download, Loader2, Maximize2, Network, RefreshCw, TextCursorInput, WifiOff, X } from "lucide-react";
 import { api, isTauri, toError } from "../lib/api";
@@ -93,6 +93,9 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
   const [focus, setFocus] = useState<{ node: string; column?: string } | null>(null);
   const [view, setView] = useState({ x: 0, y: 0, k: 1 });
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  // Narrow tab (AI panel open): buttons drop their labels, like the editor's.
+  const [barRef, barWidth] = useWidth<HTMLDivElement>();
+  const iconOnly = barWidth < 900;
   const [showWarnings, setShowWarnings] = useState(false);
   const [dir, setDirState] = useState<Direction>(() => (localStorage.getItem("db.lineage.dir") === "tb" ? "tb" : "lr"));
   /** Nodes the user dragged (view only: the SQL is not changed). */
@@ -279,10 +282,10 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
   const focusCol = focusNode && focus?.column !== undefined ? focusNode.columns.find((c) => c.name === focus.column) : undefined;
   return (
     <div className="h-full min-h-0 flex-col" style={{ display: visible ? "flex" : "none" }}>
-      <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3 text-[12.5px]">
+      <div ref={barRef} className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3 text-[12.5px]">
         <Network size={14} className="shrink-0 text-muted" />
         <span className="min-w-0 truncate font-medium">{tab.title}</span>
-        {graph && (
+        {graph && !iconOnly && (
           <span className="shrink-0 text-muted">
             · {graph.statements.length} statement{graph.statements.length === 1 ? "" : "s"} ·{" "}
             {isChain ? `${shown?.nodes.length ?? 0} tables and results` : `${graph.nodes.filter((n) => n.name).length} nodes`}
@@ -305,7 +308,7 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
         )}
         <div className="ml-auto flex shrink-0 items-center gap-1">
           <label className="flex items-center gap-1 text-[11.5px] text-muted" title="Describe uncached tables and check each query with EXPLAIN (never runs it)">
-            <input type="checkbox" checked={check} disabled={!conn} onChange={(e) => setCheck(e.target.checked)} /> Check with database
+            <input type="checkbox" checked={check} disabled={!conn} onChange={(e) => setCheck(e.target.checked)} /> {iconOnly ? "Check" : "Check with database"}
           </label>
           {!columnTab && (
             <>
@@ -321,13 +324,14 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
                 className={`flex h-6 items-center gap-1 px-1.5 text-[11.5px] ${isChain === c ? "bg-hover text-fg" : "text-muted hover:text-fg"}`}
                 aria-pressed={isChain === c}
                 title={title}
+                aria-label={text}
                 onClick={() => {
                   setChain(c);
                   setFocus(null);
                   setPos({});
                 }}
               >
-                {icon} {text}
+                {icon} {!iconOnly && text}
               </button>
             ))}
           </div>
@@ -337,26 +341,27 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
             disabled={!graph}
             onClick={() => setExpanded((e) => (e === "all" ? new Set() : "all"))}
             title={expanded === "all" ? "Show tables only (click a table to list its columns)" : "List the columns of every table"}
+            aria-label={expanded === "all" ? "Tables only" : "All columns"}
           >
-            {expanded === "all" ? <Rows3 size={13} /> : <Columns3 size={13} />} {expanded === "all" ? "Tables only" : "All columns"}
+            {expanded === "all" ? <Rows3 size={13} /> : <Columns3 size={13} />} {!iconOnly && (expanded === "all" ? "Tables only" : "All columns")}
           </button>
           )}
           {Object.keys(pos).length > 0 && (
             <button className="btn-ghost py-1" onClick={() => setPos({})} title="Put moved tables back where the layout puts them">
-              Reset layout
+              {iconOnly ? "Reset" : "Reset layout"}
             </button>
           )}
-          <button className="btn-ghost py-1" onClick={fit} disabled={!lay} title="Fit the diagram to the window">
-            <Maximize2 size={13} /> Fit
+          <button className="btn-ghost py-1" onClick={fit} disabled={!lay} title="Fit the diagram to the window" aria-label="Fit">
+            <Maximize2 size={13} /> {!iconOnly && "Fit"}
           </button>
             </>
           )}
-          <button className="btn-ghost py-1" onClick={refresh} disabled={load.status === "loading"} title="Trace the editor's current SQL again">
-            <RefreshCw size={13} className={load.status === "loading" ? "animate-spin" : ""} /> Refresh
+          <button className="btn-ghost py-1" onClick={refresh} disabled={load.status === "loading"} title="Trace the editor's current SQL again" aria-label="Refresh">
+            <RefreshCw size={13} className={load.status === "loading" ? "animate-spin" : ""} /> {!iconOnly && "Refresh"}
           </button>
           {!columnTab && (
-          <button className="btn-ghost py-1" disabled={!graph} onClick={(e) => setMenu({ x: e.clientX, y: e.clientY + 8 })} aria-haspopup="menu">
-            <Download size={13} /> Export <ChevronDown size={11} />
+          <button className="btn-ghost py-1" disabled={!graph} onClick={(e) => setMenu({ x: e.clientX, y: e.clientY + 8 })} aria-haspopup="menu" title="Export the diagram" aria-label="Export">
+            <Download size={13} /> {!iconOnly && "Export"} <ChevronDown size={11} />
           </button>
           )}
         </div>

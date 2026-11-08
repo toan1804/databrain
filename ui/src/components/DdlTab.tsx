@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useEvent } from "../lib/hooks";
+import { useEvent, useWidth } from "../lib/hooks";
 import { EditorState } from "@codemirror/state";
 import { EditorView, lineNumbers } from "@codemirror/view";
 import { syntaxHighlighting } from "@codemirror/language";
@@ -48,6 +48,9 @@ export function DdlTab({ tabId, reference, visible }: { tabId: string; reference
   const raw = state.status === "ready" ? state.ddl : null;
   // Format: the DDL as DataBrain formats SQL (connection's dialect); off = as the server returned it.
   const [formatted, setFormatted] = useState(() => localStorage.getItem("db.ddl.format") === "1");
+  // Narrow tab (AI panel open): buttons drop their labels, like the editor's.
+  const [barRef, barWidth] = useWidth<HTMLDivElement>();
+  const iconOnly = barWidth < 760;
   const pretty = useMemo(() => {
     if (!raw || !formatted) return null;
     try {
@@ -73,38 +76,39 @@ export function DdlTab({ tabId, reference, visible }: { tabId: string; reference
 
   return (
     <div className="h-full min-h-0 flex-col" style={{ display: visible ? "flex" : "none" }}>
-      <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3 text-[12.5px]">
+      <div ref={barRef} className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3 text-[12.5px]">
         <FileCode2 size={14} className="shrink-0 text-muted" />
         <span className="min-w-0 truncate font-mono" title={path}>
           {path}
         </span>
-        <span className="shrink-0 text-muted">· {reference.kind.replace("_", " ")}</span>
-        {conn && (
+        {!iconOnly && <span className="shrink-0 text-muted">· {reference.kind.replace("_", " ")}</span>}
+        {conn && !iconOnly && (
           <span className="flex shrink-0 items-center gap-1 text-muted">
             · <ConnDot color={conn.color} connected={conn.connected} /> {conn.name}
           </span>
         )}
         <span className="flex shrink-0 items-center gap-1 rounded bg-panel-2 px-1.5 py-0.5 text-[11px] text-muted" title="This tab only shows the DDL; it can't be edited or run">
-          <Lock size={10} /> read-only
+          <Lock size={10} /> {iconOnly ? "RO" : "read-only"}
         </span>
-        <div className="ml-auto flex items-center gap-1">
+        <div className="ml-auto flex shrink-0 items-center gap-1">
           <button
             className={`btn-ghost py-1 ${formatted ? "bg-hover text-fg" : ""}`}
             onClick={toggleFormat}
             disabled={!raw}
             aria-pressed={formatted}
             title={formatted ? "Formatted in the connection's dialect: click to show the DDL as the server returned it" : "Format the DDL in the connection's dialect"}
+            aria-label="Format"
           >
-            <AlignLeft size={13} /> {formatted ? "Formatted" : "Format"}
+            <AlignLeft size={13} /> {!iconOnly && (formatted ? "Formatted" : "Format")}
           </button>
-          <button className="btn-ghost py-1" onClick={() => ddl && void copyText(ddl, "DDL")} disabled={!ddl} title="Copy the DDL as shown">
-            <ClipboardCopy size={13} /> Copy
+          <button className="btn-ghost py-1" onClick={() => ddl && void copyText(ddl, "DDL")} disabled={!ddl} title="Copy the DDL as shown" aria-label="Copy">
+            <ClipboardCopy size={13} /> {!iconOnly && "Copy"}
           </button>
-          <button className="btn-ghost py-1" onClick={openInEditor} disabled={!ddl} title="Open a copy in an editable query tab">
-            <FileCode2 size={13} /> Open in editor
+          <button className="btn-ghost py-1" onClick={openInEditor} disabled={!ddl} title="Open a copy in an editable query tab" aria-label="Open in editor">
+            <FileCode2 size={13} /> {!iconOnly && "Open in editor"}
           </button>
-          <button className="btn-ghost py-1" onClick={() => void load()} disabled={state.status === "loading"} title="Load the DDL again from the server">
-            <RefreshCw size={13} className={state.status === "loading" ? "animate-spin" : ""} /> Reload
+          <button className="btn-ghost py-1" onClick={() => void load()} disabled={state.status === "loading"} title="Load the DDL again from the server" aria-label="Reload">
+            <RefreshCw size={13} className={state.status === "loading" ? "animate-spin" : ""} /> {!iconOnly && "Reload"}
           </button>
         </div>
       </div>

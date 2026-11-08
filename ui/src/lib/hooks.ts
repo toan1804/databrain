@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useRef, type RefObject } from "react";
+import { useCallback, useLayoutEffect, useRef, useState, type RefObject } from "react";
 
 /**
  * A stable function that always calls the latest `fn` (React's planned
@@ -39,4 +39,27 @@ export function useStickToBottom(ref: RefObject<HTMLElement | null>, content: un
     if (el && pinned.current) el.scrollTo({ top: el.scrollHeight });
   }, [ref, content]);
   return { pin, onScroll };
+}
+
+/**
+ * The width of an element, kept up to date with a ResizeObserver. Toolbars
+ * use it to drop button labels when the AI panel or a wide sidebar narrows
+ * the tab (the buttons keep their tooltip and aria-label). Infinity until the
+ * element is measured, so the first paint shows the full labels.
+ */
+export function useWidth<T extends HTMLElement>(): [(el: T | null) => void, number] {
+  const [width, setWidth] = useState(Infinity);
+  const ro = useRef<ResizeObserver | null>(null);
+  const ref = useCallback((el: T | null) => {
+    ro.current?.disconnect();
+    ro.current = null;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const obs = new ResizeObserver(([e]) => {
+      // A hidden tab (display: none) measures 0: keep the last real width.
+      if (e.contentRect.width > 0) setWidth(e.contentRect.width);
+    });
+    obs.observe(el);
+    ro.current = obs;
+  }, []);
+  return [ref, width];
 }
