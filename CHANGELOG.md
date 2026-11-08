@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Compare outputs opens a compare tab instead of a raw SQL query: counts of rows that are the same, changed, only before and only after (each one a filter), changed rows per column, changed cells shown as before → after, "Only columns that differ", a warning for duplicate keys, and Keys & columns, Compare again, Open SQL and As output.
 - Compare outputs: options "Ignore spaces at the ends", "Ignore case", "Empty text = NULL" and a number tolerance, and a "Compare as" choice per column (date/time, date only, number, text, boolean, exact) showing both columns' types.
 - The AI learns how tables join from query history (Edit connection → AI → "Learn from query history", on by default): join keys from queries you and your jobs ran, including tables without declared foreign keys, and which tables are used most. A join is given to the AI after 2 different queries or 2 days of use, or when you confirm it; the AI's own queries never count. Review, confirm, reject or forget them in Knowledge → "Learned from query history".
 - `find_join_path` tool (assistant and MCP): the shortest chains of joins between two tables over declared foreign keys and learned joins.

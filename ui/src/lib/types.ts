@@ -63,6 +63,10 @@ import type { OutputInfo } from "./bindings/OutputInfo";
 import type { CompareKind } from "./bindings/CompareKind";
 import type { CompareOptions } from "./bindings/CompareOptions";
 import type { ComparePair } from "./bindings/ComparePair";
+import type { CompareRun } from "./bindings/CompareRun";
+import type { CompareSpec } from "./bindings/CompareSpec";
+import type { CompareSummary } from "./bindings/CompareSummary";
+import type { ColumnChanges } from "./bindings/ColumnChanges";
 import type { OutputState } from "./bindings/OutputState";
 import type { RunStatus } from "./bindings/RunStatus";
 import type { EditTarget } from "./bindings/EditTarget";
@@ -232,6 +236,10 @@ export type {
   CompareKind,
   CompareOptions,
   ComparePair,
+  CompareRun,
+  CompareSpec,
+  CompareSummary,
+  ColumnChanges,
   OutputState,
   RunStatus,
   EditTarget,

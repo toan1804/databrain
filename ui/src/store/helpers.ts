@@ -76,7 +76,7 @@ export function persistTabs(tabs: Tab[]) {
     api
       .saveTabs(
         // DDL views are reloaded from the server on demand, not restored.
-        tabs.filter((t) => !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare && !t.er && !t.dashboard_id).map((t) => ({
+        tabs.filter((t) => !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare && !t.diff && !t.er && !t.dashboard_id).map((t) => ({
           id: t.id,
           title: t.title,
           sql: t.sql,

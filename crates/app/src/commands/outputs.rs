@@ -77,3 +77,8 @@ pub(crate) async fn drop_output(state: State<'_, AppState>, reference: String) -
 pub(crate) async fn drop_unpinned_outputs(state: State<'_, AppState>) -> R<usize> {
     api::drop_unpinned_outputs(&state).await
 }
+
+#[tauri::command]
+pub(crate) async fn compare_outputs(state: State<'_, AppState>, spec: api::CompareSpec, tab_id: String) -> R<api::CompareRun> {
+    api::compare_outputs(&state, spec, &tab_id).await
+}

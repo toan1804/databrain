@@ -88,6 +88,99 @@ pub fn output_compare_pairs(
     databrain_query_engine::outputs::compare_pairs(&b, &a, &mapping, !exact, options)
 }
 
+/// What a compare tab compares (the dialog's choices).
+#[derive(Debug, Clone, Deserialize, ts_rs::TS)]
+#[ts(export)]
+pub struct CompareSpec {
+    pub before: String,
+    pub after: String,
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// (before column, after column) pairs.
+    #[serde(default)]
+    pub mapping: Vec<(String, String)>,
+    /// `mapping` is every pair (no automatic matching).
+    #[serde(default)]
+    pub exact: bool,
+    #[serde(default)]
+    pub options: databrain_query_engine::outputs::CompareOptions,
+}
+
+/// A compare's counts and its rows (a result to page through).
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct CompareRun {
+    pub summary: databrain_query_engine::outputs::CompareSummary,
+    /// `_change` (`added`, `removed`, `changed`), the after output's columns,
+    /// `<col> (before)` and `_changed` for changed rows.
+    pub result: databrain_result_store::ResultInfo,
+    /// The diff SQL (DuckDB, on the Results connection).
+    pub sql: String,
+    pub pairs: Vec<databrain_query_engine::outputs::ComparePair>,
+    /// Key columns (after-side names).
+    pub keys: Vec<String>,
+    pub before: OutputInfo,
+    pub after: OutputInfo,
+}
+
+/// Rows of differences kept for the compare view (counts are always exact).
+pub const COMPARE_ROW_LIMIT: usize = 100_000;
+
+/// Compare two outputs: the counts (one summary query) and the differing
+/// rows, both run on the Results connection. `tab_id` groups the runs.
+pub async fn compare_outputs(state: &AppState, spec: CompareSpec, tab_id: &str) -> Result<CompareRun> {
+    use databrain_query_engine::outputs as o;
+    let before = load_output(state, spec.before.clone()).await?;
+    let after = load_output(state, spec.after.clone()).await?;
+    if before.handle == after.handle {
+        return Err(EngineError::new("invalid", "choose two different outputs"));
+    }
+    let auto = !spec.exact;
+    let pairs = o::compare_pairs(&before, &after, &spec.mapping, auto, &spec.options)?;
+    let keys = o::compare_keys(&before, &after, &spec.keys, &spec.mapping, auto, &spec.options)?;
+    let (summary_sql, columns) = o::compare_summary_sql(&before, &after, &spec.keys, &spec.mapping, auto, &spec.options)?;
+    let sql = o::diff_sql_opts(&before, &after, &spec.keys, &spec.mapping, auto, &spec.options)?;
+    let conn = results_connection(state)?;
+    let run = |sql: String, limit: Option<usize>| {
+        let st = state.engine.clone();
+        let hub = state.hub.clone();
+        let req = RunRequest {
+            connection_id: conn.clone(),
+            tab_id: format!("compare:{tab_id}"),
+            sql,
+            base_offset: 0,
+            row_limit: limit,
+            confirmed: true,
+            origin: Default::default(),
+            session_key: None,
+            output_name: None,
+            params: Default::default(),
+            output_masks: None,
+        };
+        async move {
+            let out = st.run_and_wait(&hub, req, None).await?;
+            let first = out.into_iter().next().ok_or_else(|| EngineError::new("internal", "the compare ran no statement"))?;
+            if let Some(e) = first.error {
+                return Err(e);
+            }
+            first.result.ok_or_else(|| EngineError::new("internal", "the compare returned no rows"))
+        }
+    };
+    let s = run(summary_sql, Some(1)).await?;
+    let row = {
+        let rs = state.engine.results().get(&s.id).map_err(|e| EngineError::new("internal", e.to_string()))?;
+        let page = rs.lock().page(&ViewSpec::default(), 0, 1).map_err(|e| EngineError::new("internal", e.to_string()))?;
+        page.rows.into_iter().next().unwrap_or_default()
+    };
+    // The one-row summary is not an output anyone wants in the list.
+    if let Some(h) = state.engine.outputs().by_result(&s.id).map(|x| x.handle) {
+        let _ = drop_output(state, h).await;
+    }
+    let summary = o::CompareSummary::from_row(&row, &columns)?;
+    let result = run(sql.clone(), Some(COMPARE_ROW_LIMIT)).await?;
+    Ok(CompareRun { summary, result, sql, pairs, keys, before, after })
+}
+
 /// Id of the local DuckDB connection for `results.*` queries.
 pub fn results_connection(state: &AppState) -> Result<String> {
     Ok(state.engine.results_connection()?.id)

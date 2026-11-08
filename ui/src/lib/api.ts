@@ -52,6 +52,8 @@ import type {
   OutputInfo,
   CompareOptions,
   ComparePair,
+  CompareRun,
+  CompareSpec,
   ColumnStats,
   ConnectionConfig,
   ConnectionProfile,
@@ -362,6 +364,8 @@ export const api = {
   /** `exact`: `mapping` is every pair to compare (no automatic matching). */
   outputDiffSql: (before: string, after: string, keys: string[], mapping: [string, string][] = [], exact = false, options: CompareOptions | null = null) =>
     call<string>("output_diff_sql", { before, after, keys, mapping, exact, options }),
+  /** Compare two outputs: exact counts and the differing rows (a result to page). */
+  compareOutputs: (spec: CompareSpec, tabId: string) => call<CompareRun>("compare_outputs", { spec, tabId }),
   /** The pairs a compare would use, with their types and how each compares. */
   outputComparePairs: (before: string, after: string, mapping: [string, string][], exact = true, options: CompareOptions | null = null) =>
     call<ComparePair[]>("output_compare_pairs", { before, after, mapping, exact, options }),

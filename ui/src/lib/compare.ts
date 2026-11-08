@@ -1,4 +1,4 @@
-import type { CompareKind, CompareOptions } from "./types";
+import type { CompareKind, CompareOptions, ViewSpec } from "./types";
 
 // Column matching for "Compare outputs" (same rules as the backend's
 // `column_pairs`): user pairs first, then equal names, then names equal
@@ -125,6 +125,17 @@ export interface CompareForm {
 
 export const DEFAULT_COMPARE_FORM: CompareForm = { trim: true, ignoreCase: false, emptyIsNull: false, tolerance: "", kinds: {} };
 
+/** The form for saved options (a compare tab being edited). */
+export function formFromOptions(o: CompareOptions): CompareForm {
+  return {
+    trim: o.trim,
+    ignoreCase: o.ignore_case,
+    emptyIsNull: o.empty_is_null,
+    tolerance: o.tolerance == null ? "" : String(o.tolerance),
+    kinds: Object.fromEntries(o.kinds),
+  };
+}
+
 /** The tolerance typed: `null` when empty, `NaN` when not a positive number. */
 export function parseTolerance(text: string): number | null {
   const t = text.trim().replace(",", ".");
@@ -143,4 +154,48 @@ export function compareOptions(f: CompareForm, compared: string[]): CompareOptio
     tolerance: tol === null || Number.isNaN(tol) ? null : tol,
     kinds: Object.entries(f.kinds).filter(([c]) => compared.includes(c)),
   };
+}
+
+// ------------------------------------------------------ the compare view
+
+/** The columns named in a changed row's `_changed` cell (`amt, code`), out of `columns`. */
+export function changedIn(cell: string | null | undefined, columns: string[]): Set<string> {
+  const out = new Set<string>();
+  if (!cell) return out;
+  const padded = `, ${cell}, `;
+  for (const c of columns) if (padded.includes(`, ${c}, `)) out.add(c);
+  return out;
+}
+
+/** Where things are in a diff result's columns. */
+export interface DiffLayout {
+  change: number;
+  /** `_changed` (changed rows only), or -1. */
+  changed: number;
+  /** After-side value of each column, and its `(before)` value in changed rows (or -1). */
+  value: Record<string, number>;
+  before: Record<string, number>;
+}
+
+export function diffLayout(resultColumns: string[], compared: string[]): DiffLayout {
+  const at = (n: string) => resultColumns.indexOf(n);
+  const value: Record<string, number> = {};
+  const before: Record<string, number> = {};
+  for (const c of compared) {
+    value[c] = at(c);
+    before[c] = at(`${c} (before)`);
+  }
+  return { change: at("_change"), changed: at("_changed"), value, before };
+}
+
+/** Which rows of a compare to list. */
+export type DiffFilter = "changed" | "added" | "removed" | "all";
+
+/** The backend view for a filter and, optionally, one changed column. */
+export function diffView(layout: DiffLayout, filter: DiffFilter, column: string | null): ViewSpec {
+  const filters: ViewSpec["filters"] = [];
+  if (filter !== "all" && layout.change >= 0) filters.push({ column: layout.change, op: "equals", value: filter });
+  // Over-includes only when a name is part of another's ("amt" in "amt_total"); the cells say exactly.
+  if (column && layout.changed >= 0) filters.push({ column: layout.changed, op: "contains", value: column });
+  return { filters, sort: [] };
 }

@@ -1,5 +1,5 @@
-import { createContext, useContext, useEffect, useMemo, useState } from "react";
-import { compareOptions, DEFAULT_COMPARE_FORM, KIND_HELP, KIND_LABEL, pairColumns, parseMapping, parseTolerance, setPair, shortType, type CompareForm } from "../lib/compare";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { compareOptions, DEFAULT_COMPARE_FORM, formFromOptions, KIND_HELP, KIND_LABEL, pairColumns, parseMapping, parseTolerance, setPair, shortType, type CompareForm } from "../lib/compare";
 import {
   AlertTriangle,
   AtSign,
@@ -14,8 +14,9 @@ import {
   TerminalSquare,
   Trash2,
 } from "lucide-react";
-import { api, toError } from "../lib/api";
-import type { CompareKind, ComparePair, OutputInfo } from "../lib/types";
+import { api } from "../lib/api";
+import type { CompareKind, ComparePair, CompareSpec, OutputInfo } from "../lib/types";
+import { openOutputCompare } from "./openTabs";
 import { formatBytes, formatCount, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
 import {
@@ -24,7 +25,6 @@ import {
   formatAge,
   mentionInAi,
   openOutput,
-  openResultsQuery,
   outputLabel,
   outputRef,
   outputQuerySql,
@@ -204,9 +204,15 @@ export function OutputChip({
 /** Pick two outputs + key columns, open a diff query on the Results connection. */
 export function CompareDialog({
   initial,
+  initialSpec,
+  onApply,
   onClose,
 }: {
   initial?: OutputInfo;
+  /** Edit an open compare: its outputs, keys, pairs and options. */
+  initialSpec?: CompareSpec;
+  /** With `initialSpec`: called with the new choices (else a compare tab opens). */
+  onApply?: (spec: CompareSpec) => void;
   onClose: () => void;
 }) {
   // Select the stored array and derive in a memo: a selector returning a new
@@ -216,7 +222,6 @@ export function CompareDialog({
     () => all.filter((o) => o.state !== "evicted"),
     [all],
   );
-  const toast = useStore((s) => s.toast);
   const defaultBefore = useMemo(() => {
     if (!initial) return outputs[1]?.handle ?? "";
     // Previous version of the same name, else the previous output of the same tab.
@@ -239,16 +244,21 @@ export function CompareDialog({
       )?.handle ?? ""
     );
   }, [initial, outputs]);
-  const [before, setBefore] = useState(defaultBefore);
+  const handleOf = (r: string) => outputs.find((o) => o.handle === r || o.name === r)?.handle ?? r;
+  const [before, setBefore] = useState(initialSpec ? handleOf(initialSpec.before) : defaultBefore);
   const [after, setAfter] = useState(
-    initial?.handle ?? outputs[0]?.handle ?? "",
+    initialSpec ? handleOf(initialSpec.after) : (initial?.handle ?? outputs[0]?.handle ?? ""),
   );
   const b = outputs.find((o) => o.handle === before);
   const a = outputs.find((o) => o.handle === after);
   // Columns matched by name (any case) plus pairs the user adds.
-  const [manual, setManual] = useState<[string, string][]>([]);
+  const [manual, setManual] = useState<[string, string][]>(() => initialSpec?.mapping ?? []);
   /** After-side columns left out of the comparison. */
-  const [excluded, setExcluded] = useState<string[]>([]);
+  const [excluded, setExcluded] = useState<string[]>(() => {
+    if (!initialSpec?.exact) return [];
+    const cols = outputs.find((o) => o.handle === handleOf(initialSpec.after))?.columns.map((c) => c.name) ?? [];
+    return cols.filter((c) => !initialSpec.mapping.some(([, x]) => x === c));
+  });
   const [typed, setTyped] = useState("");
   const [typedErrors, setTypedErrors] = useState<string[]>([]);
   const beforeCols = useMemo(() => b?.columns.map((c) => c.name) ?? [], [b]);
@@ -269,7 +279,12 @@ export function CompareDialog({
     if (!r.errors.length) setTyped("");
   };
   const common = useMemo(() => match.pairs.map((p) => p.after), [match]);
+  // Other outputs: start over (but not when the dialog opens on a compare).
+  const sides = useRef(`${before}\u0000${after}`);
   useEffect(() => {
+    const now = `${before}\u0000${after}`;
+    if (sides.current === now) return;
+    sides.current = now;
     setManual([]);
     setExcluded([]);
     setTyped("");
@@ -277,7 +292,7 @@ export function CompareDialog({
     setForm((f) => ({ ...f, kinds: {} }));
   }, [before, after]);
   // How values compare: options for all columns, a kind per column.
-  const [form, setForm] = useState<CompareForm>(DEFAULT_COMPARE_FORM);
+  const [form, setForm] = useState<CompareForm>(() => (initialSpec ? formFromOptions(initialSpec.options) : DEFAULT_COMPARE_FORM));
   const tolerance = parseTolerance(form.tolerance);
   const toleranceOk = !Number.isNaN(tolerance);
   const options = useMemo(() => compareOptions(form, common), [form, common]);
@@ -302,29 +317,27 @@ export function CompareDialog({
       return { ...f, kinds };
     });
   const [keys, setKeys] = useState<string[]>(() => {
+    if (initialSpec) return initialSpec.keys;
     const first = initial?.columns[0]?.name;
     return first && /(^id$|_id$|^key$|^code$|name$|country|date)/i.test(first)
       ? [first]
       : [];
   });
 
-  const run = async () => {
+  const run = () => {
     if (!a || !b) return;
-    try {
-      const sql = await api.outputDiffSql(
-        b.handle,
-        a.handle,
-        keys.filter((k) => common.includes(k)),
-        // Every pair as shown (the user may have left some out).
-        match.pairs.map((p) => [p.before, p.after] as [string, string]),
-        true,
-        options,
-      );
-      await openResultsQuery(sql, `Diff ${outputLabel(b)} → ${outputLabel(a)}`);
-      onClose();
-    } catch (e) {
-      toast(toError(e).message, "error");
-    }
+    const spec: CompareSpec = {
+      before: b.handle,
+      after: a.handle,
+      keys: keys.filter((k) => common.includes(k)),
+      // Every pair as shown (the user may have left some out).
+      mapping: match.pairs.map((p) => [p.before, p.after] as [string, string]),
+      exact: true,
+      options,
+    };
+    if (onApply) onApply(spec);
+    else openOutputCompare(spec, `Compare ${outputLabel(b)} → ${outputLabel(a)}`);
+    onClose();
   };
 
   const pick = (value: string, set: (v: string) => void, label: string) => (
@@ -360,9 +373,9 @@ export function CompareDialog({
           <button
             className="btn-primary"
             disabled={!a || !b || a.handle === b.handle || common.length === 0 || !toleranceOk}
-            onClick={() => void run()}
+            onClick={run}
           >
-            <GitCompare size={14} /> Show differences
+            <GitCompare size={14} /> {onApply ? "Compare" : "Show differences"}
           </button>
         </>
       }

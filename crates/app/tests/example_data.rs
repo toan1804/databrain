@@ -590,6 +590,40 @@ async fn compare_outputs_ignores_how_each_database_types_values() {
     let sql = diff(&["id"], &exact);
     assert_eq!(changes(&query(&st, &res, &sql).await), ["added 4", "changed 1", "changed 3"], "{sql}");
 
+    // The compare view: exact counts, per-column counts, and the rows.
+    let spec = |keys: &[&str], options: CompareOptions| api::CompareSpec {
+        before: "typed".into(),
+        after: "text".into(),
+        keys: keys.iter().map(|k| k.to_string()).collect(),
+        mapping: vec![],
+        exact: false,
+        options,
+    };
+    let outputs_before = api::list_outputs(&st).len();
+    let run = api::compare_outputs(&st, spec(&["id"], CompareOptions::default()), "cmp1").await.unwrap();
+    let s = &run.summary;
+    assert_eq!((s.before_rows, s.after_rows, s.same, s.changed, s.added, s.removed), (3, 4, 2, 1, 1, 0), "{s:?}");
+    assert_eq!((s.before_duplicate_keys, s.after_duplicate_keys), (0, 0));
+    let per: Vec<(&str, i64)> = s.columns.iter().map(|c| (c.column.as_str(), c.changed)).collect();
+    assert_eq!(per, [("d", 0), ("amt", 1), ("code", 1), ("ok", 0)]);
+    assert_eq!(run.keys, ["id"]);
+    assert_eq!(run.result.total_rows, 2);
+    // Only the diff rows became an output; the summary was dropped.
+    assert_eq!(api::list_outputs(&st).len(), outputs_before + 1);
+    let rows = query(&st, &res, &format!("SELECT _change, id, _changed FROM ({}) ORDER BY 1", run.sql.trim_end_matches(';'))).await;
+    assert_eq!(rows[1][0].as_deref(), Some("changed"));
+    assert_eq!(rows[1][2].as_deref(), Some("amt, code"), "{rows:?}");
+    // Duplicate keys are counted per side.
+    run_named(&st, &sq, "dup", "SELECT '1' AS id, 'x' AS code UNION ALL SELECT '1', 'y' UNION ALL SELECT '2', 'z'", None, Some("dup")).await;
+    let dup = api::compare_outputs(&st, api::CompareSpec { after: "dup".into(), ..spec(&["id"], CompareOptions::default()) }, "cmp2").await.unwrap();
+    assert_eq!((dup.summary.before_duplicate_keys, dup.summary.after_duplicate_keys), (0, 1), "{:?}", dup.summary);
+    // Without keys: whole rows; 2 equal, 1 removed, 2 added.
+    let nokey = api::compare_outputs(&st, spec(&[], CompareOptions::default()), "cmp3").await.unwrap();
+    let s = &nokey.summary;
+    assert_eq!((s.same, s.changed, s.added, s.removed), (2, 0, 2, 1), "{s:?}");
+    assert!(s.columns.is_empty());
+    assert!(api::compare_outputs(&st, spec(&["nope"], CompareOptions::default()), "cmp4").await.is_err());
+
     // The dialog sees the pairs with their types and kinds.
     let pairs = api::output_compare_pairs(&st, "typed", "text", vec![], false, &CompareOptions::default()).unwrap();
     let d = pairs.iter().find(|p| p.after == "d").unwrap();

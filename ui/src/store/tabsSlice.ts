@@ -173,6 +173,7 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
       job_id: init?.job_id ?? null,
       plan: init?.plan ?? null,
       compare: init?.compare ?? null,
+      diff: init?.diff ?? null,
       er: init?.er ?? null,
       dashboard_id: init?.dashboard_id ?? null,
     };

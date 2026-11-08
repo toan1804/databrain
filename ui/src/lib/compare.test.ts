@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { pairColumns, parseMapping, setPair, compareOptions, DEFAULT_COMPARE_FORM, parseTolerance, shortType } from "./compare";
+import { pairColumns, parseMapping, setPair, compareOptions, DEFAULT_COMPARE_FORM, parseTolerance, shortType, changedIn, diffLayout, diffView } from "./compare";
 
 describe("compare: column matching", () => {
   it("matches equal names, then names that differ only in case", () => {
@@ -80,5 +80,26 @@ describe("how values are compared", () => {
     const f = { ...DEFAULT_COMPARE_FORM, ignoreCase: true, tolerance: "0.01", kinds: { d: "date" as const, gone: "exact" as const } };
     expect(compareOptions(f, ["d", "amt"])).toEqual({ trim: true, ignore_case: true, empty_is_null: false, tolerance: 0.01, kinds: [["d", "date"]] });
     expect(compareOptions({ ...DEFAULT_COMPARE_FORM, tolerance: "x" }, []).tolerance).toBeNull();
+  });
+});
+
+describe("the compare view", () => {
+  it("reads which columns changed, only for known names", () => {
+    expect([...changedIn("amt, code", ["amt", "code", "id"])].sort()).toEqual(["amt", "code"]);
+    expect([...changedIn("amt_total", ["amt", "amt_total"])]).toEqual(["amt_total"]);
+    expect(changedIn(null, ["amt"]).size).toBe(0);
+  });
+
+  it("finds a diff result's columns and filters it", () => {
+    const l = diffLayout(["_change", "id", "amt", "amt (before)", "code", "code (before)", "_changed"], ["amt", "code"]);
+    expect(l).toEqual({ change: 0, changed: 6, value: { amt: 2, code: 4 }, before: { amt: 3, code: 5 } });
+    expect(diffView(l, "changed", "amt").filters).toEqual([
+      { column: 0, op: "equals", value: "changed" },
+      { column: 6, op: "contains", value: "amt" },
+    ]);
+    expect(diffView(l, "all", null).filters).toEqual([]);
+    // Without keys there is no _changed column.
+    const k = diffLayout(["_change", "id", "amt"], ["id", "amt"]);
+    expect(diffView(k, "added", "amt").filters).toEqual([{ column: 0, op: "equals", value: "added" }]);
   });
 });

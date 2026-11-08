@@ -1088,14 +1088,252 @@ fn canonical(col: &str, fam: display::TypeFamily, kind: CompareKind, opts: &Comp
     }
 }
 
+/// What a compare's SQL is built from: the matched pairs, the key pairs, the
+/// two sides with their canonical columns (`__cmp_<i>`, see [`canonical`])
+/// and the header. Diff and summary use the same plan, so their counts agree.
+struct DiffPlan<'o> {
+    before: &'o OutputInfo,
+    after: &'o OutputInfo,
+    pairs: Vec<ComparePair>,
+    key_idx: Vec<usize>,
+    tol: Option<String>,
+    header: String,
+    with: String,
+}
+
+fn sql_text(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+impl<'o> DiffPlan<'o> {
+    fn new(before: &'o OutputInfo, after: &'o OutputInfo, keys: &[String], extra: &[(String, String)], auto: bool, opts: &CompareOptions) -> Result<Self> {
+        let q = |s: &str| q_min(s);
+        let pairs = compare_pairs(before, after, extra, auto, opts)?;
+        if pairs.is_empty() {
+            return Err(EngineError::new("invalid", format!("{} and {} have no matching columns; match some columns by hand", before.handle, after.handle)));
+        }
+        let mut key_idx: Vec<usize> = Vec::new();
+        for k in keys {
+            let hit = pairs
+                .iter()
+                .position(|p| p.after == *k || p.before == *k)
+                .or_else(|| pairs.iter().position(|p| p.after.eq_ignore_ascii_case(k) || p.before.eq_ignore_ascii_case(k)));
+            match hit {
+                Some(i) if !key_idx.contains(&i) => key_idx.push(i),
+                Some(_) => {}
+                None => return Err(EngineError::new("invalid", format!("key column {k} is not matched in both outputs"))),
+            }
+        }
+        let tol = opts.tolerance.map(tolerance_literal).transpose()?;
+        // Without keys a tolerance rounds numbers (rows are compared whole).
+        let round_to = if key_idx.is_empty() { tol.as_deref() } else { None };
+        let side = |o: &OutputInfo, before_side: bool| -> String {
+            let mut cols: Vec<String> = Vec::new();
+            for p in &pairs {
+                let n = if before_side { &p.before } else { &p.after };
+                cols.push(if n == &p.after { q(&p.after) } else { format!("{} AS {}", q(n), q(&p.after)) });
+            }
+            for (i, p) in pairs.iter().enumerate() {
+                let n = if before_side { &p.before } else { &p.after };
+                cols.push(format!("{} AS __cmp_{i}", canonical(&q(n), family_of(o, n), p.kind, opts, round_to)));
+            }
+            cols.join(", ")
+        };
+        let with =
+            format!("WITH a AS (SELECT {} FROM {}), b AS (SELECT {} FROM {})", side(before, true), before.reference(), side(after, false), after.reference());
+
+        let mut header = format!("-- Differences from {} (before) to {} (after)\n", before.handle, after.handle);
+        let renamed: Vec<String> = pairs.iter().filter(|p| p.before != p.after).map(|p| format!("{} → {}", p.before, p.after)).collect();
+        if !renamed.is_empty() {
+            header.push_str(&format!("-- Matched columns: {}\n", renamed.join(", ")));
+        }
+        let kinds: Vec<String> = pairs.iter().filter(|p| p.kind != CompareKind::Text).map(|p| format!("{} as {}", p.after, p.kind.label())).collect();
+        if !kinds.is_empty() {
+            header.push_str(&format!("-- Compared as: {}\n", kinds.join(", ")));
+        }
+        let mut flags = Vec::new();
+        if !opts.trim {
+            flags.push("spaces count".to_string());
+        }
+        if opts.ignore_case {
+            flags.push("case ignored".to_string());
+        }
+        if opts.empty_is_null {
+            flags.push("empty text = NULL".to_string());
+        }
+        if let Some(t) = opts.tolerance {
+            flags.push(format!("numbers within {t} are equal"));
+        }
+        if !flags.is_empty() {
+            header.push_str(&format!("-- Options: {}\n", flags.join(", ")));
+        }
+        Ok(Self { before, after, pairs, key_idx, tol, header, with })
+    }
+
+    fn keyed(&self) -> bool {
+        !self.key_idx.is_empty()
+    }
+
+    /// Indexes of the compared (non-key) pairs.
+    fn values(&self) -> Vec<usize> {
+        (0..self.pairs.len()).filter(|i| !self.key_idx.contains(i)).collect()
+    }
+
+    /// `x.__cmp_k = y.__cmp_k AND …` over the keys.
+    fn on(&self, x: &str, y: &str) -> String {
+        self.key_idx.iter().map(|i| format!("{x}.__cmp_{i} = {y}.__cmp_{i}")).collect::<Vec<_>>().join(" AND ")
+    }
+
+    /// Without keys: the whole canonical row and its duplicate number match.
+    fn same_row(&self, x: &str, y: &str) -> String {
+        let mut v: Vec<String> = (0..self.pairs.len()).map(|i| format!("{x}.__cmp_{i} IS NOT DISTINCT FROM {y}.__cmp_{i}")).collect();
+        v.push(format!("{x}.__n = {y}.__n"));
+        v.join(" AND ")
+    }
+
+    /// Numbered sides for the keyless compare.
+    fn numbered(&self) -> String {
+        let all = (0..self.pairs.len()).map(|i| format!("__cmp_{i}")).collect::<Vec<_>>().join(", ");
+        format!(
+            "{},\n\
+             an AS (SELECT *, row_number() OVER (PARTITION BY {all}) AS __n FROM a),\n\
+             bn AS (SELECT *, row_number() OVER (PARTITION BY {all}) AS __n FROM b)",
+            self.with
+        )
+    }
+
+    /// Pair `i` differs between `b` (after) and `a` (before) of one key.
+    fn differs(&self, i: usize) -> String {
+        let q = |s: &str| q_min(s);
+        let p = &self.pairs[i];
+        let base = format!("b.__cmp_{i} IS DISTINCT FROM a.__cmp_{i}");
+        match (&self.tol, p.kind) {
+            // Close numbers are equal; anything that isn't a number compares as above.
+            (Some(t), CompareKind::Number) => {
+                let num = |side: &str, fam: display::TypeFamily| {
+                    if fam == display::TypeFamily::Number {
+                        format!("try_cast({side}.{} AS DECIMAL(38,10))", q(&p.after))
+                    } else {
+                        format!("try_cast(trim(CAST({side}.{} AS VARCHAR)) AS DECIMAL(38,10))", q(&p.after))
+                    }
+                };
+                let (bn, an) = (num("b", family_of(self.after, &p.after)), num("a", family_of(self.before, &p.before)));
+                format!("({base} AND NOT coalesce(abs({bn} - {an}) <= {t}, false))")
+            }
+            _ => base,
+        }
+    }
+
+    fn shown(&self, t: &str) -> String {
+        self.pairs.iter().map(|p| format!("{t}.{}", q_min(&p.after))).collect::<Vec<_>>().join(", ")
+    }
+
+    fn diff_sql(&self) -> String {
+        let q = |s: &str| q_min(s);
+        let header = &self.header;
+        if !self.keyed() {
+            return format!(
+                "{header}{}\n\
+                 SELECT 'removed' AS _change, {} FROM an ANTI JOIN bn ON {}\n\
+                 UNION ALL BY NAME\n\
+                 SELECT 'added' AS _change, {} FROM bn ANTI JOIN an ON {}\n\
+                 ORDER BY ALL;",
+                self.numbered(),
+                self.shown("an"),
+                self.same_row("an", "bn"),
+                self.shown("bn"),
+                self.same_row("bn", "an"),
+            );
+        }
+        let key_list = self.key_idx.iter().map(|i| q(&self.pairs[*i].after)).collect::<Vec<_>>().join(", ");
+        let values = self.values();
+        let mut changed_cols: Vec<String> = self.key_idx.iter().map(|i| format!("b.{}", q(&self.pairs[*i].after))).collect();
+        for i in &values {
+            let n = &self.pairs[*i].after;
+            changed_cols.push(format!("b.{0} AS {0}, a.{0} AS {1}", q(n), q(&format!("{n} (before)"))));
+        }
+        // Which columns changed in the row (names as the after output has them).
+        if !values.is_empty() {
+            let names =
+                values.iter().map(|i| format!("CASE WHEN {} THEN {} END", self.differs(*i), sql_text(&self.pairs[*i].after))).collect::<Vec<_>>().join(", ");
+            changed_cols.push(format!("concat_ws(', ', {names}) AS _changed"));
+        }
+        let changed_where = if values.is_empty() { "false".to_string() } else { values.iter().map(|i| self.differs(*i)).collect::<Vec<_>>().join("\n   OR ") };
+        format!(
+            "{header}{}\n\
+             SELECT 'added' AS _change, {} FROM b ANTI JOIN a ON {}\n\
+             UNION ALL BY NAME\n\
+             SELECT 'removed' AS _change, {} FROM a ANTI JOIN b ON {}\n\
+             UNION ALL BY NAME\n\
+             SELECT 'changed' AS _change, {}\n\
+             FROM b JOIN a ON {}\n\
+             WHERE {changed_where}\n\
+             ORDER BY _change, {key_list};",
+            self.with,
+            self.shown("b"),
+            self.on("b", "a"),
+            self.shown("a"),
+            self.on("a", "b"),
+            changed_cols.join(", "),
+            self.on("b", "a"),
+        )
+    }
+
+    /// One row: [`SUMMARY_COLUMNS`], then the changed count of each compared column ([`Self::values`]).
+    fn summary_sql(&self) -> String {
+        let header = self.header.replacen("-- Differences from", "-- Summary of the differences from", 1);
+        if !self.keyed() {
+            return format!(
+                "{header}{}\n\
+                 SELECT (SELECT count(*) FROM a) AS before_rows, (SELECT count(*) FROM b) AS after_rows,\n\
+                 (SELECT count(*) FROM an SEMI JOIN bn ON {}) AS same, 0 AS changed,\n\
+                 (SELECT count(*) FROM bn ANTI JOIN an ON {}) AS added,\n\
+                 (SELECT count(*) FROM an ANTI JOIN bn ON {}) AS removed,\n\
+                 0 AS before_duplicate_keys, 0 AS after_duplicate_keys;",
+                self.numbered(),
+                self.same_row("an", "bn"),
+                self.same_row("bn", "an"),
+                self.same_row("an", "bn"),
+            );
+        }
+        let values = self.values();
+        let flags = values.iter().map(|i| format!("({}) AS __d_{i}", self.differs(*i))).collect::<Vec<_>>();
+        let any = if values.is_empty() { "false".to_string() } else { values.iter().map(|i| format!("__d_{i}")).collect::<Vec<_>>().join(" OR ") };
+        let keys = self.key_idx.iter().map(|i| format!("__cmp_{i}")).collect::<Vec<_>>().join(", ");
+        let per_col = values
+            .iter()
+            .map(|i| format!(",\n(SELECT count(*) FROM j WHERE __d_{i}) AS {}", q_min(&format!("col:{}", self.pairs[*i].after))))
+            .collect::<String>();
+        format!(
+            "{header}{},\n\
+             j AS (SELECT true AS __m{} FROM b JOIN a ON {})\n\
+             SELECT (SELECT count(*) FROM a) AS before_rows, (SELECT count(*) FROM b) AS after_rows,\n\
+             (SELECT count(*) FROM j WHERE NOT ({any})) AS same,\n\
+             (SELECT count(*) FROM j WHERE {any}) AS changed,\n\
+             (SELECT count(*) FROM b ANTI JOIN a ON {}) AS added,\n\
+             (SELECT count(*) FROM a ANTI JOIN b ON {}) AS removed,\n\
+             (SELECT count(*) FROM (SELECT 1 FROM a GROUP BY {keys} HAVING count(*) > 1)) AS before_duplicate_keys,\n\
+             (SELECT count(*) FROM (SELECT 1 FROM b GROUP BY {keys} HAVING count(*) > 1)) AS after_duplicate_keys{per_col};",
+            self.with,
+            flags.iter().map(|f| format!(", {f}")).collect::<String>(),
+            self.on("b", "a"),
+            self.on("b", "a"),
+            self.on("a", "b"),
+        )
+    }
+}
+
+fn family_of(o: &OutputInfo, n: &str) -> display::TypeFamily {
+    o.columns.iter().find(|c| c.name == n).map(|c| c.family).unwrap_or(display::TypeFamily::Text)
+}
+
 /// [`diff_sql_with`] with compare options. Each matched column gets a hidden
-/// canonical column (`__cmp_<i>`, see [`canonical`]) on both sides; keys
-/// join on them and changes are found on them, while the result shows the
-/// values as each output holds them.
+/// canonical column on both sides; keys join on them and changes are found
+/// on them, while the result shows the values as each output holds them.
 ///
-/// With keys: rows `added`, `removed` and `changed` (with `<col> (before)`).
-/// Without keys: rows that differ as a multiset (duplicates count), as
-/// `removed` and `added`.
+/// With keys: rows `added`, `removed` and `changed` (with `<col> (before)`
+/// and `_changed`, the columns that differ). Without keys: rows that differ
+/// as a multiset (duplicates count), as `removed` and `added`.
 pub fn diff_sql_opts(
     before: &OutputInfo,
     after: &OutputInfo,
@@ -1104,135 +1342,102 @@ pub fn diff_sql_opts(
     auto: bool,
     opts: &CompareOptions,
 ) -> Result<String> {
-    let q = |s: &str| q_min(s);
-    let pairs = compare_pairs(before, after, extra, auto, opts)?;
-    if pairs.is_empty() {
-        return Err(EngineError::new("invalid", format!("{} and {} have no matching columns; match some columns by hand", before.handle, after.handle)));
-    }
-    let mut key_idx: Vec<usize> = Vec::new();
-    for k in keys {
-        let hit = pairs
-            .iter()
-            .position(|p| p.after == *k || p.before == *k)
-            .or_else(|| pairs.iter().position(|p| p.after.eq_ignore_ascii_case(k) || p.before.eq_ignore_ascii_case(k)));
-        match hit {
-            Some(i) if !key_idx.contains(&i) => key_idx.push(i),
-            Some(_) => {}
-            None => return Err(EngineError::new("invalid", format!("key column {k} is not matched in both outputs"))),
-        }
-    }
-    let tol = opts.tolerance.map(tolerance_literal).transpose()?;
-    let fam = |o: &OutputInfo, n: &str| o.columns.iter().find(|c| c.name == n).map(|c| c.family).unwrap_or(display::TypeFamily::Text);
-    let c = |i: usize| format!("__cmp_{i}");
-    let keyed = !key_idx.is_empty();
-    // Without keys a tolerance rounds numbers (rows are compared whole).
-    let round_to = if keyed { None } else { tol.as_deref() };
-    let side = |o: &OutputInfo, before_side: bool| -> String {
-        let mut cols: Vec<String> = Vec::new();
-        for p in &pairs {
-            let n = if before_side { &p.before } else { &p.after };
-            cols.push(if n == &p.after { q(&p.after) } else { format!("{} AS {}", q(n), q(&p.after)) });
-        }
-        for (i, p) in pairs.iter().enumerate() {
-            let n = if before_side { &p.before } else { &p.after };
-            cols.push(format!("{} AS {}", canonical(&q(n), fam(o, n), p.kind, opts, round_to), c(i)));
-        }
-        cols.join(", ")
-    };
-    let (a_ref, b_ref) = (before.reference(), after.reference());
-    let (a_cols, b_cols) = (side(before, true), side(after, false));
-    let shown = |t: &str| pairs.iter().map(|p| format!("{t}.{}", q(&p.after))).collect::<Vec<_>>().join(", ");
+    Ok(DiffPlan::new(before, after, keys, extra, auto, opts)?.diff_sql())
+}
 
-    let mut header = format!("-- Differences from {} (before) to {} (after)\n", before.handle, after.handle);
-    let renamed: Vec<String> = pairs.iter().filter(|p| p.before != p.after).map(|p| format!("{} → {}", p.before, p.after)).collect();
-    if !renamed.is_empty() {
-        header.push_str(&format!("-- Matched columns: {}\n", renamed.join(", ")));
-    }
-    let kinds: Vec<String> = pairs.iter().filter(|p| p.kind != CompareKind::Text).map(|p| format!("{} as {}", p.after, p.kind.label())).collect();
-    if !kinds.is_empty() {
-        header.push_str(&format!("-- Compared as: {}\n", kinds.join(", ")));
-    }
-    let mut flags = Vec::new();
-    if !opts.trim {
-        flags.push("spaces count".to_string());
-    }
-    if opts.ignore_case {
-        flags.push("case ignored".to_string());
-    }
-    if opts.empty_is_null {
-        flags.push("empty text = NULL".to_string());
-    }
-    if let Some(t) = opts.tolerance {
-        flags.push(format!("numbers within {t} are equal"));
-    }
-    if !flags.is_empty() {
-        header.push_str(&format!("-- Options: {}\n", flags.join(", ")));
-    }
+/// The first columns of [`compare_summary_sql`]'s one row.
+pub const SUMMARY_COLUMNS: [&str; 8] = ["before_rows", "after_rows", "same", "changed", "added", "removed", "before_duplicate_keys", "after_duplicate_keys"];
 
-    let with = format!("WITH a AS (SELECT {a_cols} FROM {a_ref}), b AS (SELECT {b_cols} FROM {b_ref})");
-    if !keyed {
-        let all = (0..pairs.len()).map(c).collect::<Vec<_>>().join(", ");
-        let same = |x: &str, y: &str| {
-            let mut v: Vec<String> = (0..pairs.len()).map(|i| format!("{x}.{0} IS NOT DISTINCT FROM {y}.{0}", c(i))).collect();
-            v.push(format!("{x}.__n = {y}.__n"));
-            v.join(" AND ")
+/// SQL for the counts of a compare (one row: [`SUMMARY_COLUMNS`], then one
+/// count per compared column, named `col:<column>`), and those columns'
+/// names. Same plan as [`diff_sql_opts`], so the counts match its rows.
+pub fn compare_summary_sql(
+    before: &OutputInfo,
+    after: &OutputInfo,
+    keys: &[String],
+    extra: &[(String, String)],
+    auto: bool,
+    opts: &CompareOptions,
+) -> Result<(String, Vec<String>)> {
+    let plan = DiffPlan::new(before, after, keys, extra, auto, opts)?;
+    let cols = if plan.keyed() { plan.values().iter().map(|i| plan.pairs[*i].after.clone()).collect() } else { vec![] };
+    Ok((plan.summary_sql(), cols))
+}
+
+/// The key columns as the diff names them (after-side names).
+pub fn compare_keys(
+    before: &OutputInfo,
+    after: &OutputInfo,
+    keys: &[String],
+    extra: &[(String, String)],
+    auto: bool,
+    opts: &CompareOptions,
+) -> Result<Vec<String>> {
+    let plan = DiffPlan::new(before, after, keys, extra, auto, opts)?;
+    Ok(plan.key_idx.iter().map(|i| plan.pairs[*i].after.clone()).collect())
+}
+
+/// Counts of a compare.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct CompareSummary {
+    #[ts(as = "f64")]
+    pub before_rows: i64,
+    #[ts(as = "f64")]
+    pub after_rows: i64,
+    /// Rows equal on both sides (by key, or whole rows without keys).
+    #[ts(as = "f64")]
+    pub same: i64,
+    #[ts(as = "f64")]
+    pub changed: i64,
+    /// Only in the after output.
+    #[ts(as = "f64")]
+    pub added: i64,
+    /// Only in the before output.
+    #[ts(as = "f64")]
+    pub removed: i64,
+    /// Key values found more than once on that side (they make "changed" unreliable).
+    #[ts(as = "f64")]
+    pub before_duplicate_keys: i64,
+    #[ts(as = "f64")]
+    pub after_duplicate_keys: i64,
+    /// Changed rows per compared column, in column order.
+    pub columns: Vec<ColumnChanges>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct ColumnChanges {
+    pub column: String,
+    #[ts(as = "f64")]
+    pub changed: i64,
+}
+
+impl CompareSummary {
+    /// From the summary query's one row (as display strings).
+    pub fn from_row(row: &[Option<String>], columns: &[String]) -> Result<Self> {
+        let n = |i: usize| -> Result<i64> {
+            row.get(i)
+                .and_then(|v| v.as_deref())
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .ok_or_else(|| EngineError::new("internal", format!("the compare summary has no count in column {}", i + 1)))
         };
-        return Ok(format!(
-            "{header}{with},\n\
-             an AS (SELECT *, row_number() OVER (PARTITION BY {all}) AS __n FROM a),\n\
-             bn AS (SELECT *, row_number() OVER (PARTITION BY {all}) AS __n FROM b)\n\
-             SELECT 'removed' AS _change, {} FROM an ANTI JOIN bn ON {}\n\
-             UNION ALL BY NAME\n\
-             SELECT 'added' AS _change, {} FROM bn ANTI JOIN an ON {}\n\
-             ORDER BY ALL;",
-            shown("an"),
-            same("an", "bn"),
-            shown("bn"),
-            same("bn", "an"),
-        ));
+        Ok(Self {
+            before_rows: n(0)?,
+            after_rows: n(1)?,
+            same: n(2)?,
+            changed: n(3)?,
+            added: n(4)?,
+            removed: n(5)?,
+            before_duplicate_keys: n(6)?,
+            after_duplicate_keys: n(7)?,
+            columns: columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| Ok(ColumnChanges { column: c.clone(), changed: n(SUMMARY_COLUMNS.len() + i)? }))
+                .collect::<Result<_>>()?,
+        })
     }
-    let on = key_idx.iter().map(|i| format!("b.{0} = a.{0}", c(*i))).collect::<Vec<_>>().join(" AND ");
-    let on_a = key_idx.iter().map(|i| format!("a.{0} = b.{0}", c(*i))).collect::<Vec<_>>().join(" AND ");
-    let key_list = key_idx.iter().map(|i| q(&pairs[*i].after)).collect::<Vec<_>>().join(", ");
-    let values: Vec<usize> = (0..pairs.len()).filter(|i| !key_idx.contains(i)).collect();
-    let mut changed_cols: Vec<String> = key_idx.iter().map(|i| format!("b.{}", q(&pairs[*i].after))).collect();
-    for i in &values {
-        let n = &pairs[*i].after;
-        changed_cols.push(format!("b.{0} AS {0}, a.{0} AS {1}", q(n), q(&format!("{n} (before)"))));
-    }
-    let differs = |i: usize| -> String {
-        let base = format!("b.{0} IS DISTINCT FROM a.{0}", c(i));
-        match (&tol, pairs[i].kind) {
-            // Close numbers are equal; anything that isn't a number compares as above.
-            (Some(t), CompareKind::Number) => {
-                let num = |side: &str, o: &OutputInfo, n: &str| {
-                    if fam(o, n) == display::TypeFamily::Number {
-                        format!("try_cast({side}.{} AS DECIMAL(38,10))", q(&pairs[i].after))
-                    } else {
-                        format!("try_cast(trim(CAST({side}.{} AS VARCHAR)) AS DECIMAL(38,10))", q(&pairs[i].after))
-                    }
-                };
-                let (bn, an) = (num("b", after, &pairs[i].after), num("a", before, &pairs[i].before));
-                format!("({base} AND NOT coalesce(abs({bn} - {an}) <= {t}, false))")
-            }
-            _ => base,
-        }
-    };
-    let changed_where = if values.is_empty() { "false".to_string() } else { values.iter().map(|i| differs(*i)).collect::<Vec<_>>().join("\n   OR ") };
-    Ok(format!(
-        "{header}{with}\n\
-         SELECT 'added' AS _change, {} FROM b ANTI JOIN a ON {on}\n\
-         UNION ALL BY NAME\n\
-         SELECT 'removed' AS _change, {} FROM a ANTI JOIN b ON {on_a}\n\
-         UNION ALL BY NAME\n\
-         SELECT 'changed' AS _change, {}\n\
-         FROM b JOIN a ON {on}\n\
-         WHERE {changed_where}\n\
-         ORDER BY _change, {key_list};",
-        shown("b"),
-        shown("a"),
-        changed_cols.join(", "),
-    ))
 }
 
 #[cfg(test)]
