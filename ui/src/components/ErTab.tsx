@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useEvent } from "../lib/hooks";
+import { useEvent, useWidth } from "../lib/hooks";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { ArrowDown, ArrowRight, ChevronDown, ClipboardCopy, Columns3, Download, Loader2, Maximize2, Minus, Plus, RefreshCw, Rows3, Search, Share2 } from "lucide-react";
 import { api, isTauri, toError } from "../lib/api";
@@ -26,6 +26,9 @@ export function ErTab({ tabId, visible }: { tabId: string; visible: boolean }) {
   const [load, setLoad] = useState<Load>({ status: "loading" });
   const [view, setView] = useState({ x: 0, y: 0, k: 1 });
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  // Narrow tab (AI panel open): buttons drop their labels, like the editor's.
+  const [barRef, barWidth] = useWidth<HTMLDivElement>();
+  const iconOnly = barWidth < 860;
   const [dir, setDirState] = useState<Direction>(() => (localStorage.getItem(DIR_KEY) === "tb" ? "tb" : "lr"));
   const [pos, setPos] = useState<Positions>({});
   /** Columns listed: all by default (key and foreign key columns of wide tables). */
@@ -164,10 +167,10 @@ export function ErTab({ tabId, visible }: { tabId: string; visible: boolean }) {
   const tableCount = er ? er.graph.nodes.length - er.external.length : 0;
   return (
     <div className="h-full min-h-0 flex-col" style={{ display: visible ? "flex" : "none" }}>
-      <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3 text-[12.5px]">
+      <div ref={barRef} className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3 text-[12.5px]">
         <Share2 size={14} className="shrink-0 text-muted" />
         <span className="min-w-0 truncate font-medium">{tab.title}</span>
-        {er && (
+        {er && !iconOnly && (
           <span className="shrink-0 text-muted">
             · {tableCount} table{tableCount === 1 ? "" : "s"} · {er.foreignKeys} foreign key{er.foreignKeys === 1 ? "" : "s"}
             {er.external.length > 0 ? ` · ${er.external.length} in other schemas` : ""}
@@ -176,32 +179,33 @@ export function ErTab({ tabId, visible }: { tabId: string; visible: boolean }) {
         <div className="ml-auto flex shrink-0 items-center gap-1">
           <label className="flex h-6 items-center gap-1 rounded-md border border-line px-1.5 text-muted">
             <Search size={12} />
-            <input className="w-32 bg-transparent text-[11.5px] text-fg outline-none" placeholder="Filter tables" value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Filter tables" />
+            <input className={`${iconOnly ? "w-20" : "w-32"} bg-transparent text-[11.5px] text-fg outline-none`} placeholder={iconOnly ? "Filter" : "Filter tables"} value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Filter tables" />
           </label>
           <label className="flex items-center gap-1 text-[11.5px] text-muted" title="Hide tables without foreign keys">
-            <input type="checkbox" checked={linkedOnly} onChange={(e) => setLinkedOnly(e.target.checked)} /> Linked only
+            <input type="checkbox" checked={linkedOnly} onChange={(e) => setLinkedOnly(e.target.checked)} /> {iconOnly ? "Linked" : "Linked only"}
           </label>
           <button
             className="btn-ghost py-1"
             disabled={!shown}
             onClick={() => setExpanded((e) => (e === "all" ? new Set() : "all"))}
             title={expanded === "all" ? "Show tables only (click a table to list its columns)" : "List the columns of every table"}
+            aria-label={expanded === "all" ? "Tables only" : "All columns"}
           >
-            {expanded === "all" ? <Rows3 size={13} /> : <Columns3 size={13} />} {expanded === "all" ? "Tables only" : "All columns"}
+            {expanded === "all" ? <Rows3 size={13} /> : <Columns3 size={13} />} {!iconOnly && (expanded === "all" ? "Tables only" : "All columns")}
           </button>
           {Object.keys(pos).length > 0 && (
             <button className="btn-ghost py-1" onClick={() => setPos({})} title="Put moved tables back where the layout puts them">
-              Reset layout
+              {iconOnly ? "Reset" : "Reset layout"}
             </button>
           )}
-          <button className="btn-ghost py-1" onClick={fit} disabled={!lay} title="Fit the diagram to the window">
-            <Maximize2 size={13} /> Fit
+          <button className="btn-ghost py-1" onClick={fit} disabled={!lay} title="Fit the diagram to the window" aria-label="Fit">
+            <Maximize2 size={13} /> {!iconOnly && "Fit"}
           </button>
-          <button className="btn-ghost py-1" onClick={() => void run()} disabled={load.status === "loading"} title="Read the schema again">
-            <RefreshCw size={13} className={load.status === "loading" ? "animate-spin" : ""} /> Refresh
+          <button className="btn-ghost py-1" onClick={() => void run()} disabled={load.status === "loading"} title="Read the schema again" aria-label="Refresh">
+            <RefreshCw size={13} className={load.status === "loading" ? "animate-spin" : ""} /> {!iconOnly && "Refresh"}
           </button>
-          <button className="btn-ghost py-1" disabled={!shown} onClick={(e) => setMenu({ x: e.clientX, y: e.clientY + 8 })} aria-haspopup="menu">
-            <Download size={13} /> Export <ChevronDown size={11} />
+          <button className="btn-ghost py-1" disabled={!shown} onClick={(e) => setMenu({ x: e.clientX, y: e.clientY + 8 })} aria-haspopup="menu" title="Export the diagram" aria-label="Export">
+            <Download size={13} /> {!iconOnly && "Export"} <ChevronDown size={11} />
           </button>
         </div>
       </div>

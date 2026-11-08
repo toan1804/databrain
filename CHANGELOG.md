@@ -26,6 +26,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Lineage, ER diagram and DDL tabs: with the AI panel open, the toolbar buttons (Fit, Refresh, Export, Open in editor…) no longer run off the edge; like the editor's, they show only their icons when the tab is narrow (the name stays in the tooltip).
 - Compare outputs reported equal values as different when the two databases typed them differently: an Oracle `DATE` (`2026-11-11 00:00:00`) against `'2026-11-11'` as text, `10.50` against `'10.5'`, padded `CHAR` against `VARCHAR`, `1` against `'1'` as a key. Without keys every such row showed as removed and added; with keys, as changed on every column. Values now compare by meaning.
 - DuckDB: a tab or notebook opening a database file just as the last session on it closed could open a second instance on the file and miss tables written just before ("Table … does not exist") or fail with "No more data remaining in MetadataReader" (Linux). It now waits for the closing instance.
 
