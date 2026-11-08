@@ -20,17 +20,18 @@ export function EditorSettings() {
   const chosen = choice && capable.some((p) => p.id === choice.provider_id) ? choice : null;
   const panel = providers.find((p) => p.id === panelId) ?? providers[0];
   const [models, setModels] = useState<string[]>([]);
+  const chosenId = chosen?.provider_id ?? null;
   useEffect(() => {
     setModels([]);
-    if (!chosen) return;
+    if (!chosenId) return;
     let alive = true;
-    loadModels(chosen.provider_id)
+    loadModels(chosenId)
       .then((m) => alive && setModels(m))
       .catch(() => {});
     return () => {
       alive = false;
     };
-  }, [chosen?.provider_id, loadModels]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [chosenId, loadModels]);
   const chosenView = chosen ? capable.find((p) => p.id === chosen.provider_id) : undefined;
   const defaultModel = chosenView?.config.fast_model || chosenView?.config.default_model || "";
   const snippets = useStore((s) => s.sqlSnippets);
