@@ -26,6 +26,11 @@ pub struct GhostRequest {
     pub provider_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// `model` was chosen for inline completion (Settings → Editor): used
+    /// over the provider's fast model. Otherwise it is the AI panel's model,
+    /// and the fast model comes first.
+    #[serde(default)]
+    pub exact_model: bool,
     /// Text before the cursor (the editor sends the last few thousand characters).
     pub prefix: String,
     /// Text after the cursor.
@@ -59,6 +64,15 @@ fn head(s: &str, n: usize) -> &str {
     &s[..i]
 }
 
+/// A model chosen for inline completion (`exact`) first; otherwise the
+/// provider's fast model before the AI panel's; then the default model.
+fn pick_model(requested: Option<&str>, exact: bool, fast: Option<&str>, default: Option<&str>) -> Option<String> {
+    let some = |m: Option<&str>| m.map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
+    let (requested, fast) = (some(requested), some(fast));
+    let first = if exact { requested.or(fast) } else { fast.or(requested) };
+    first.or(some(default))
+}
+
 /// The model's answer without code fences or a leading "<CURSOR>" echo.
 pub fn clean(raw: &str) -> String {
     let mut t = raw.trim_end().to_string();
@@ -86,15 +100,11 @@ pub async fn complete(ws: &Workspace, secrets: Arc<dyn SecretStore>, req: &Ghost
     }
     let (provider, cfg, _) = provider_for(&rec, secrets)?;
     if provider.as_kiro().is_some() {
-        return Err(AiError::Config("inline completion needs a model provider; Kiro runs as an agent (choose another provider in the AI panel)".into()));
+        return Err(AiError::Config(
+            "inline completion needs a model provider, and Kiro runs as an agent: choose a provider for inline completion in Settings → Editor".into(),
+        ));
     }
-    // The fast model when the provider has one.
-    let model = cfg
-        .fast_model
-        .clone()
-        .filter(|m| !m.trim().is_empty())
-        .or(req.model.clone().filter(|m| !m.trim().is_empty()))
-        .or(cfg.default_model.clone())
+    let model = pick_model(req.model.as_deref(), req.exact_model, cfg.fast_model.as_deref(), cfg.default_model.as_deref())
         .ok_or_else(|| AiError::Config(format!("choose a model for \"{}\"", rec.name)))?;
 
     let prefix = tail(&req.prefix, MAX_PREFIX);
@@ -144,6 +154,15 @@ pub async fn complete(ws: &Workspace, secrets: Arc<dyn SecretStore>, req: &Ghost
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_chosen_for_inline_completion_wins_over_the_fast_model() {
+        assert_eq!(pick_model(Some("gpt-big"), false, Some("gpt-mini"), Some("gpt-x")).as_deref(), Some("gpt-mini"));
+        assert_eq!(pick_model(Some("gpt-big"), true, Some("gpt-mini"), Some("gpt-x")).as_deref(), Some("gpt-big"));
+        assert_eq!(pick_model(None, true, Some("gpt-mini"), Some("gpt-x")).as_deref(), Some("gpt-mini"));
+        assert_eq!(pick_model(Some(" "), true, None, Some("gpt-x")).as_deref(), Some("gpt-x"));
+        assert_eq!(pick_model(None, false, None, None), None);
+    }
 
     #[test]
     fn cleans_answers() {

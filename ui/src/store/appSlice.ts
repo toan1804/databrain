@@ -6,6 +6,7 @@ import { DEFAULT_SLOW_QUERY_SECONDS } from "../queryTips";
 import { uid } from "../lib/util";
 import type { Dashboard } from "../lib/charts";
 import { parseSnippets } from "../lib/snippets";
+import { parseInlineAiProvider } from "../lib/inlineAi";
 import { parseQuickFilters, parseViews } from "../lib/gridViews";
 import { applyTheme, nextSignIn, parseParams, parseSchemaFilter } from "./helpers";
 import type { State, Tab } from "./types";
@@ -76,6 +77,7 @@ export const createAppSlice: StateCreator<State, [], [], AppSlice> = (set, get) 
         rowLimit,
         slowQuerySeconds,
         inlineAiCompletion: settings.inline_ai_completion === true,
+        inlineAiProvider: parseInlineAiProvider(settings.inline_ai_provider),
         sqlSnippets: parseSnippets(settings.sql_snippets),
         gridViews: parseViews(settings.grid_views),
         quickFilters: parseQuickFilters(settings.grid_quick_filters),

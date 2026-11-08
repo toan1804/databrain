@@ -5,6 +5,12 @@
  */
 export type GhostRequest = { connection_id: string, provider_id?: string | null, model?: string | null, 
 /**
+ * `model` was chosen for inline completion (Settings → Editor): used
+ * over the provider's fast model. Otherwise it is the AI panel's model,
+ * and the fast model comes first.
+ */
+exact_model: boolean, 
+/**
  * Text before the cursor (the editor sends the last few thousand characters).
  */
 prefix: string, 
