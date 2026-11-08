@@ -20,7 +20,7 @@ const join = (id: number, l: string, r: string, lc: string, rc: string, over: Re
   hidden_reason: null,
   ...over,
 });
-// Many joins: given, waiting (used once), confirmed and rejected ones.
+// Many joins: given, waiting (used once) and rejected ones.
 const JOINS = TABLES.flatMap((l, i) =>
   TABLES.slice(i + 1).map((r, k) => {
     const id = i * 10 + k + 1;
@@ -28,7 +28,6 @@ const JOINS = TABLES.flatMap((l, i) =>
     return join(id, l, r, `${r.replace(/s$/, "")}_id`, "id", waiting ? { queries: 1, days: 1, shown: false, hidden_reason: "Used in 1 query on 1 day (needs 2)" } : {});
   }),
 );
-JOINS[1] = { ...JOINS[1], status: "confirmed" };
 JOINS[4] = { ...JOINS[4], status: "rejected", shown: false, hidden_reason: "Rejected" };
 
 test("Knowledge: index, notes and learned joins each have a tab; joins are one line each", async ({ page }) => {
@@ -74,9 +73,10 @@ test("Knowledge: index, notes and learned joins each have a tab; joins are one l
   await page.getByLabel("Filter learned").fill("customers orders");
   await expect(list.getByRole("listitem")).toHaveCount(1);
 
-  // Confirm from the line itself; open it for the queries it came from.
+  // Nothing to confirm (the AI gets a join from use); a wrong one is rejected from the line.
   const item = list.getByRole("listitem").first();
   await item.hover();
+  await expect(item.getByRole("button", { name: /Confirm/ })).toHaveCount(0);
   await item.getByRole("button", { name: "Reject" }).click();
   await expect.poll(async () => (await calls(page, "kn_set_join_status")).at(-1)).toMatchObject({ id: JOINS[0].id, status: "rejected" });
   await item.getByRole("button", { name: /customers/ }).first().click();
@@ -85,6 +85,13 @@ test("Knowledge: index, notes and learned joins each have a tab; joins are one l
   // One schema for all: said once, full names when opened.
   await expect(item.getByText("sales.customers.order_id = sales.orders.id")).toBeVisible();
   await expect(item.getByRole("button", { name: "Make note" })).toBeVisible();
+  await expect(item.getByRole("button", { name: /Confirm/ })).toHaveCount(0);
+  // A rejected join can be undone.
+  const rejected = list.getByRole("listitem").filter({ hasText: "shipment_id" });
+  await page.getByLabel("Filter learned").fill("shipment_id customers");
+  await rejected.hover();
+  await rejected.getByRole("button", { name: "Undo reject" }).click();
+  await expect.poll(async () => (await calls(page, "kn_set_join_status")).at(-1)).toMatchObject({ id: JOINS[4].id, status: "learned" });
   await page.screenshot({ path: "test-results/knowledge-learned-open.png" });
 
   // Most used tables.

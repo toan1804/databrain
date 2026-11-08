@@ -1,9 +1,10 @@
 // Knowledge → Learned: how tables join (from queries the user and jobs ran)
 // and which tables are used most. One line per join, filtered by table and
 // by status; a join opens to show its use, the queries it came from, and
-// to keep it as a note. Confirm / reject / reset sit on the line itself.
+// to keep it as a note. Whether the AI gets a join is measured from use;
+// the only choice left to the user is to reject a wrong one (and undo it).
 import { useEffect, useMemo, useState } from "react";
-import { Check, ChevronRight, History, Info, Loader2, NotebookPen, RefreshCw, RotateCcw, Search, Trash2, X } from "lucide-react";
+import { ChevronRight, History, Info, Loader2, NotebookPen, RefreshCw, RotateCcw, Search, Trash2, X } from "lucide-react";
 import { api, toError } from "../../lib/api";
 import type { HistoryEntry, JoinStatus, LearnedJoinView, LearnedView } from "../../lib/types";
 import { formatCount, relativeTime } from "../../lib/util";
@@ -36,8 +37,8 @@ export function joinState(j: Pick<LearnedJoinView, "shown" | "status">): JoinSta
 }
 
 const STATES: { key: JoinState; label: string; dot: string; help: string }[] = [
-  { key: "given", label: "Given to AI", dot: "bg-success", help: "The AI gets these joins (used in 2 queries or on 2 days, or confirmed)" },
-  { key: "waiting", label: "Waiting", dot: "bg-muted/60", help: "Not used enough yet; confirm one to give it to the AI now" },
+  { key: "given", label: "Given to AI", dot: "bg-success", help: "The AI gets these joins: used in 2 different queries or on 2 different days" },
+  { key: "waiting", label: "Waiting", dot: "bg-muted/60", help: "Not used enough yet: given to the AI once used in another query or on another day" },
   { key: "rejected", label: "Rejected", dot: "bg-danger", help: "Never given to the AI" },
 ];
 
@@ -147,7 +148,7 @@ export function LearnedSection({
     askConfirm({
       title: "Forget what was learned on this connection?",
       reasons: [
-        "Learned joins (confirmed and rejected ones too) and table usage are deleted.",
+        "Learned joins (rejected ones too) and table usage are deleted.",
         "The query history itself stays; only queries run from now on are learned from.",
       ],
       confirmLabel: "Forget",
@@ -189,7 +190,7 @@ export function LearnedSection({
   if (!view.enabled) return <p className="text-[11.5px] text-muted">Off for this connection. Turn on “Learn from query history” in Edit connection → AI.</p>;
 
   const about =
-    "Join keys from queries you and your jobs ran. The AI gets a join once it is in 2 different queries or used on 2 days, or when you confirm it; its own queries never count. Most used tables rank higher when the AI looks for tables.";
+    "Join keys from queries you and your jobs ran. The AI gets a join once it is in 2 different queries or used on 2 days; its own queries never count. Reject a join that is wrong to keep it from the AI. Most used tables rank higher when the AI looks for tables.";
   return (
     <div className="flex min-h-0 flex-col gap-2">
       <div className="flex flex-wrap items-center gap-1.5">
@@ -278,32 +279,25 @@ export function LearnedSection({
                         className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
                         onClick={() => toggle(j)}
                         aria-expanded={isOpen}
-                        title={`${joinCondition(j)}\n${joinUsage(j)}\n${j.shown ? (j.status === "confirmed" ? "Confirmed · given to the AI" : "Given to the AI") : (j.hidden_reason ?? meta.label)}`}
+                        title={`${joinCondition(j)}\n${joinUsage(j)}\n${j.shown ? "Given to the AI" : (j.hidden_reason ?? meta.label)}`}
                       >
                         <ChevronRight size={11} className={`shrink-0 text-muted transition-transform ${isOpen ? "rotate-90" : ""}`} />
                         <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${meta.dot}`} aria-label={meta.label} />
                         <span className="min-w-0 truncate">
                           <JoinLine j={j} hide={schema} />
                         </span>
-                        {j.status === "confirmed" && <Check size={11} className="shrink-0 text-success" aria-label="Confirmed" />}
                       </button>
                       <span className="shrink-0 text-[10.5px] tabular-nums text-muted" title={joinUsage(j)}>
                         {formatCount(j.queries)}×
                       </span>
                       <div className="hidden shrink-0 items-center group-focus-within:flex group-hover:flex">
-                        {j.status !== "confirmed" && (
-                          <button className="icon-btn h-5 w-5" onClick={() => void setStatus(j, "confirmed")} title="Confirm: give it to the AI however often it was used" aria-label="Confirm">
-                            <Check size={12} />
-                          </button>
-                        )}
-                        {j.status !== "rejected" && (
-                          <button className="icon-btn h-5 w-5" onClick={() => void setStatus(j, "rejected")} title="Reject: never give it to the AI" aria-label="Reject">
-                            <X size={12} />
-                          </button>
-                        )}
-                        {j.status !== "learned" && (
-                          <button className="icon-btn h-5 w-5" onClick={() => void setStatus(j, "learned")} title="Reset: decide by how often it is used" aria-label="Reset">
+                        {j.status === "rejected" ? (
+                          <button className="icon-btn h-5 w-5" onClick={() => void setStatus(j, "learned")} title="Undo reject: decide by how often it is used" aria-label="Undo reject">
                             <RotateCcw size={11} />
+                          </button>
+                        ) : (
+                          <button className="icon-btn h-5 w-5" onClick={() => void setStatus(j, "rejected")} title="Reject: a wrong join, never give it to the AI" aria-label="Reject">
+                            <X size={12} />
                           </button>
                         )}
                       </div>
@@ -314,25 +308,21 @@ export function LearnedSection({
                         <div className="text-muted">{joinUsage(j)}</div>
                         <div>
                           {j.shown ? (
-                            <span className="rounded bg-success/10 px-1 text-success">{j.status === "confirmed" ? "Confirmed · given to the AI" : "Given to the AI"}</span>
+                            <span className="rounded bg-success/10 px-1 text-success">Given to the AI</span>
                           ) : (
                             <span className="rounded bg-panel px-1 text-muted">{j.hidden_reason ?? meta.label}</span>
                           )}
                         </div>
                         <div className="flex flex-wrap gap-1">
-                          {j.status !== "confirmed" && (
-                            <button className="btn-ghost border border-line py-0 text-[11px]" onClick={() => void setStatus(j, "confirmed")}>
-                              <Check size={11} /> Confirm
-                            </button>
-                          )}
                           {j.status !== "rejected" && (
-                            <button className="btn-ghost border border-line py-0 text-[11px]" onClick={() => void setStatus(j, "rejected")}>
+                            <button className="btn-ghost border border-line py-0 text-[11px]" onClick={() => void setStatus(j, "rejected")} title="A wrong join: never give it to the AI">
                               <X size={11} /> Reject
                             </button>
                           )}
+                          {/* Confirmed by hand in an earlier version: back to measuring. */}
                           {j.status !== "learned" && (
-                            <button className="btn-ghost border border-line py-0 text-[11px]" onClick={() => void setStatus(j, "learned")}>
-                              <RotateCcw size={11} /> Reset
+                            <button className="btn-ghost border border-line py-0 text-[11px]" onClick={() => void setStatus(j, "learned")} title="Decide by how often it is used">
+                              <RotateCcw size={11} /> {j.status === "rejected" ? "Undo reject" : "Measure from use"}
                             </button>
                           )}
                           <button className="btn-ghost border border-line py-0 text-[11px]" onClick={() => void makeNote(j)} title="Keep it as a note (notes can be exported and shared)">
