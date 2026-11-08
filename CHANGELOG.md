@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Compare outputs: one column can be compared with several (`debit_amt = debit_amt`, `credit_amt = credit_amt` and `debit_amt = credit_amt`); pairs typed under the columns are added next to the matched ones instead of replacing them, each with its own result column (`debit_amt → credit_amt`). Each compared pair has a ✕ to leave it out.
 - Compare tab: the Before card is red and the After card green, the same colours as the old → new values in changed cells, which now have a light red or green background.
 - Compare outputs: time-zone timestamps (Databricks, Snowflake, BigQuery…) compare and show in UTC, as the grid shows them, so `2026-11-04 00:00:00+00:00` equals an Oracle `2026-11-04 00:00:00` instead of becoming your computer's local time. Text with an offset (`…+07:00`, `…Z`) is read the same way.
 - Compare data without writing queries: a side of a compare can be a table on any SQL connection or a CSV, TSV, Parquet, JSON or Excel file, read when you pick it and again on "Compare again". Right-click a table → "Compare data with…" (the same table on another connection), or "Compare with…" in a result's toolbar. Key columns are suggested (the table's primary key, else columns unique on both sides).

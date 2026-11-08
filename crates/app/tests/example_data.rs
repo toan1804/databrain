@@ -632,6 +632,33 @@ async fn compare_outputs_ignores_how_each_database_types_values() {
 }
 
 /// Compare a table straight from its database with a file: the SQLite
+/// One column compared with several: debit = debit, credit = credit and
+/// debit = credit, each with its own result column and count.
+#[tokio::test]
+async fn compare_one_column_with_several() {
+    let st = state();
+    let res = api::results_connection(&st).unwrap();
+    run_named(&st, &res, "ledger_a", "SELECT * FROM (VALUES (1, 10, 5), (2, 7, 7)) t(id, debit_amt, credit_amt)", None, Some("ledger_a")).await;
+    run_named(&st, &res, "ledger_b", "SELECT * FROM (VALUES (1, 10, 10), (2, 7, 7)) t(id, debit_amt, credit_amt)", None, Some("ledger_b")).await;
+    let pair = |b: &str, a: &str| (b.to_string(), a.to_string());
+    let spec = api::CompareSpec {
+        before: "ledger_a".into(),
+        after: "ledger_b".into(),
+        keys: vec!["id".into()],
+        mapping: vec![pair("id", "id"), pair("debit_amt", "debit_amt"), pair("credit_amt", "credit_amt"), pair("debit_amt", "credit_amt")],
+        exact: true,
+        options: Default::default(),
+    };
+    let run = api::compare_outputs(&st, spec, "cmp-several").await.unwrap();
+    let s = &run.summary;
+    assert_eq!((s.same, s.changed, s.added, s.removed), (1, 1, 0, 0), "{s:?}\n{}", run.sql);
+    let per: Vec<(&str, i64)> = s.columns.iter().map(|c| (c.column.as_str(), c.changed)).collect();
+    // Row 1: credit 5 → 10; debit (10) = credit (10) after.
+    assert_eq!(per, [("debit_amt", 0), ("credit_amt", 1), ("debit_amt → credit_amt", 0)], "{}", run.sql);
+    let names: Vec<&str> = run.result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"debit_amt → credit_amt") && names.contains(&"credit_amt (before)"), "{names:?}");
+}
+
 /// A time-zone timestamp (Databricks, Snowflake…: an instant in UTC) is the
 /// same as a plain one (Oracle) holding its UTC time, whatever the
 /// computer's time zone: DuckDB's own casts would use that zone instead.

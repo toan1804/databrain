@@ -6,6 +6,12 @@ import type { CompareKind } from "./CompareKind";
  */
 export type ComparePair = { before: string, after: string, 
 /**
+ * The pair's column in the compare result: the after name, or
+ * `before → after` when that after column is in another pair too.
+ * Kinds, keys and changed columns use it.
+ */
+label: string, 
+/**
  * Types as the outputs hold them (Arrow), e.g. `Timestamp(µs)`, `Utf8`.
  */
 before_type: string, after_type: string, 

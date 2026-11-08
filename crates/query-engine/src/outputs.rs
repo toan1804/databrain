@@ -878,8 +878,10 @@ pub fn column_pairs_with(before: &OutputInfo, after: &OutputInfo, extra: &[(Stri
         if !anames.contains(&ac.as_str()) {
             return Err(EngineError::new("invalid", format!("column {ac} is not in {}", after.handle)));
         }
-        if used_b.contains(bc) || used_a.contains(ac) {
-            return Err(EngineError::new("invalid", format!("column {bc} or {ac} is matched twice")));
+        // A column may be compared with several others (debit = debit,
+        // debit = credit); the same pair twice is a mistake.
+        if pairs.iter().any(|(b, a)| b == bc && a == ac) {
+            return Err(EngineError::new("invalid", format!("{bc} = {ac} is matched twice")));
         }
         used_b.insert(bc.clone());
         used_a.insert(ac.clone());
@@ -985,6 +987,10 @@ impl Default for CompareOptions {
 pub struct ComparePair {
     pub before: String,
     pub after: String,
+    /// The pair's column in the compare result: the after name, or
+    /// `before → after` when that after column is in another pair too.
+    /// Kinds, keys and changed columns use it.
+    pub label: String,
     /// Types as the outputs hold them (Arrow), e.g. `Timestamp(µs)`, `Utf8`.
     pub before_type: String,
     pub after_type: String,
@@ -1017,17 +1023,33 @@ pub fn auto_kind(before: &ColumnMeta, after: &ColumnMeta) -> CompareKind {
 /// The pairs a compare uses, with their types and kinds.
 pub fn compare_pairs(before: &OutputInfo, after: &OutputInfo, extra: &[(String, String)], auto: bool, opts: &CompareOptions) -> Result<Vec<ComparePair>> {
     let meta = |o: &OutputInfo, n: &str| o.columns.iter().find(|c| c.name == n).cloned();
-    column_pairs_with(before, after, extra, auto)?
+    let pairs = column_pairs_with(before, after, extra, auto)?;
+    let labels = pair_labels(&pairs);
+    pairs
         .into_iter()
-        .map(|(bc, ac)| {
+        .zip(labels)
+        .map(|((bc, ac), label)| {
             let (Some(bm), Some(am)) = (meta(before, &bc), meta(after, &ac)) else {
                 return Err(EngineError::new("internal", format!("column {bc} or {ac} not found")));
             };
             let auto_kind = auto_kind(&bm, &am);
-            let kind = opts.kinds.iter().find(|(c, _)| *c == ac).map(|(_, k)| *k).unwrap_or(auto_kind);
-            Ok(ComparePair { before: bc, after: ac, before_type: bm.data_type, after_type: am.data_type, auto_kind, kind })
+            let kind = opts.kinds.iter().find(|(c, _)| *c == label).map(|(_, k)| *k).unwrap_or(auto_kind);
+            Ok(ComparePair { before: bc, after: ac, label, before_type: bm.data_type, after_type: am.data_type, auto_kind, kind })
         })
         .collect()
+}
+
+/// Each pair's result column (see [`ComparePair::label`]). Of the pairs on
+/// one after column, the one with the same name (else the first) keeps it.
+pub fn pair_labels(pairs: &[(String, String)]) -> Vec<String> {
+    let keeper = |a: &str| {
+        pairs
+            .iter()
+            .position(|(b, x)| x == a && b == a)
+            .or_else(|| pairs.iter().position(|(b, x)| x == a && b.eq_ignore_ascii_case(a)))
+            .or_else(|| pairs.iter().position(|(_, x)| x == a))
+    };
+    pairs.iter().enumerate().map(|(i, (b, a))| if keeper(a) == Some(i) { a.clone() } else { format!("{b} → {a}") }).collect()
 }
 
 /// A tolerance as a SQL literal (positive, finite).
@@ -1135,7 +1157,8 @@ impl<'o> DiffPlan<'o> {
         for k in keys {
             let hit = pairs
                 .iter()
-                .position(|p| p.after == *k || p.before == *k)
+                .position(|p| p.label == *k)
+                .or_else(|| pairs.iter().position(|p| p.after == *k || p.before == *k))
                 .or_else(|| pairs.iter().position(|p| p.after.eq_ignore_ascii_case(k) || p.before.eq_ignore_ascii_case(k)));
             match hit {
                 Some(i) if !key_idx.contains(&i) => key_idx.push(i),
@@ -1152,11 +1175,11 @@ impl<'o> DiffPlan<'o> {
                 let n = if before_side { &p.before } else { &p.after };
                 cols.push(if zoned_of(o, n) {
                     // Shown in UTC, as the grid shows it (not in the computer's zone).
-                    format!("make_timestamp(epoch_us({})) AS {}", q(n), q(&p.after))
-                } else if n == &p.after {
-                    q(&p.after)
+                    format!("make_timestamp(epoch_us({})) AS {}", q(n), q(&p.label))
+                } else if n == &p.label {
+                    q(&p.label)
                 } else {
-                    format!("{} AS {}", q(n), q(&p.after))
+                    format!("{} AS {}", q(n), q(&p.label))
                 });
             }
             for (i, p) in pairs.iter().enumerate() {
@@ -1173,7 +1196,7 @@ impl<'o> DiffPlan<'o> {
         if !renamed.is_empty() {
             header.push_str(&format!("-- Matched columns: {}\n", renamed.join(", ")));
         }
-        let kinds: Vec<String> = pairs.iter().filter(|p| p.kind != CompareKind::Text).map(|p| format!("{} as {}", p.after, p.kind.label())).collect();
+        let kinds: Vec<String> = pairs.iter().filter(|p| p.kind != CompareKind::Text).map(|p| format!("{} as {}", p.label, p.kind.label())).collect();
         if !kinds.is_empty() {
             header.push_str(&format!("-- Compared as: {}\n", kinds.join(", ")));
         }
@@ -1238,9 +1261,9 @@ impl<'o> DiffPlan<'o> {
             (Some(t), CompareKind::Number) => {
                 let num = |side: &str, fam: display::TypeFamily| {
                     if fam == display::TypeFamily::Number {
-                        format!("try_cast({side}.{} AS DECIMAL(38,10))", q(&p.after))
+                        format!("try_cast({side}.{} AS DECIMAL(38,10))", q(&p.label))
                     } else {
-                        format!("try_cast(trim(CAST({side}.{} AS VARCHAR)) AS DECIMAL(38,10))", q(&p.after))
+                        format!("try_cast(trim(CAST({side}.{} AS VARCHAR)) AS DECIMAL(38,10))", q(&p.label))
                     }
                 };
                 let (bn, an) = (num("b", family_of(self.after, &p.after)), num("a", family_of(self.before, &p.before)));
@@ -1251,7 +1274,7 @@ impl<'o> DiffPlan<'o> {
     }
 
     fn shown(&self, t: &str) -> String {
-        self.pairs.iter().map(|p| format!("{t}.{}", q_min(&p.after))).collect::<Vec<_>>().join(", ")
+        self.pairs.iter().map(|p| format!("{t}.{}", q_min(&p.label))).collect::<Vec<_>>().join(", ")
     }
 
     fn diff_sql(&self) -> String {
@@ -1271,17 +1294,17 @@ impl<'o> DiffPlan<'o> {
                 self.same_row("bn", "an"),
             );
         }
-        let key_list = self.key_idx.iter().map(|i| q(&self.pairs[*i].after)).collect::<Vec<_>>().join(", ");
+        let key_list = self.key_idx.iter().map(|i| q(&self.pairs[*i].label)).collect::<Vec<_>>().join(", ");
         let values = self.values();
-        let mut changed_cols: Vec<String> = self.key_idx.iter().map(|i| format!("b.{}", q(&self.pairs[*i].after))).collect();
+        let mut changed_cols: Vec<String> = self.key_idx.iter().map(|i| format!("b.{}", q(&self.pairs[*i].label))).collect();
         for i in &values {
-            let n = &self.pairs[*i].after;
+            let n = &self.pairs[*i].label;
             changed_cols.push(format!("b.{0} AS {0}, a.{0} AS {1}", q(n), q(&format!("{n} (before)"))));
         }
         // Which columns changed in the row (names as the after output has them).
         if !values.is_empty() {
             let names =
-                values.iter().map(|i| format!("CASE WHEN {} THEN {} END", self.differs(*i), sql_text(&self.pairs[*i].after))).collect::<Vec<_>>().join(", ");
+                values.iter().map(|i| format!("CASE WHEN {} THEN {} END", self.differs(*i), sql_text(&self.pairs[*i].label))).collect::<Vec<_>>().join(", ");
             changed_cols.push(format!("concat_ws(', ', {names}) AS _changed"));
         }
         let changed_where = if values.is_empty() { "false".to_string() } else { values.iter().map(|i| self.differs(*i)).collect::<Vec<_>>().join("\n   OR ") };
@@ -1328,7 +1351,7 @@ impl<'o> DiffPlan<'o> {
         let keys = self.key_idx.iter().map(|i| format!("__cmp_{i}")).collect::<Vec<_>>().join(", ");
         let per_col = values
             .iter()
-            .map(|i| format!(",\n(SELECT count(*) FROM j WHERE __d_{i}) AS {}", q_min(&format!("col:{}", self.pairs[*i].after))))
+            .map(|i| format!(",\n(SELECT count(*) FROM j WHERE __d_{i}) AS {}", q_min(&format!("col:{}", self.pairs[*i].label))))
             .collect::<String>();
         format!(
             "{header}{},\n\
@@ -1395,7 +1418,7 @@ pub fn compare_summary_sql(
     opts: &CompareOptions,
 ) -> Result<(String, Vec<String>)> {
     let plan = DiffPlan::new(before, after, keys, extra, auto, opts)?;
-    let cols = if plan.keyed() { plan.values().iter().map(|i| plan.pairs[*i].after.clone()).collect() } else { vec![] };
+    let cols = if plan.keyed() { plan.values().iter().map(|i| plan.pairs[*i].label.clone()).collect() } else { vec![] };
     Ok((plan.summary_sql(), cols))
 }
 
@@ -1409,7 +1432,7 @@ pub fn compare_keys(
     opts: &CompareOptions,
 ) -> Result<Vec<String>> {
     let plan = DiffPlan::new(before, after, keys, extra, auto, opts)?;
-    Ok(plan.key_idx.iter().map(|i| plan.pairs[*i].after.clone()).collect())
+    Ok(plan.key_idx.iter().map(|i| plan.pairs[*i].label.clone()).collect())
 }
 
 /// Columns that could be keys, as after-side names: id-like names first
@@ -1812,6 +1835,30 @@ mod tests {
         let o = CompareOptions { kinds: vec![("d".into(), CompareKind::Date)], ..Default::default() };
         let d = &compare_pairs(&b, &a, &[], true, &o).unwrap()[1];
         assert_eq!((d.kind, d.auto_kind), (CompareKind::Date, CompareKind::DateTime));
+    }
+
+    #[test]
+    fn a_column_can_be_compared_with_several_others() {
+        let r = reg();
+        let (b, a) = typed_pair(&r);
+        let m = |v: &[(&str, &str)]| v.iter().map(|(x, y)| (x.to_string(), y.to_string())).collect::<Vec<_>>();
+        // amt = amt and code = code stay; amt = code is added, not swapped in.
+        let map = m(&[("id", "id"), ("amt", "amt"), ("code", "code"), ("amt", "code")]);
+        let p = compare_pairs(&b, &a, &map, false, &CompareOptions::default()).unwrap();
+        let labels: Vec<&str> = p.iter().map(|x| x.label.as_str()).collect();
+        assert_eq!(labels, ["id", "amt", "code", "amt → code"]);
+        let sql = diff_sql_opts(&b, &a, &["id".into()], &map, false, &CompareOptions::default()).unwrap();
+        assert!(sql.contains("amt AS \"amt → code\"") && sql.contains("code AS \"amt → code\""), "{sql}");
+        assert!(sql.contains("a.\"amt → code\" AS \"amt → code (before)\""), "{sql}");
+        assert!(sql.contains("THEN 'amt → code'"), "{sql}");
+        // The same pair twice is refused.
+        let err = compare_pairs(&b, &a, &m(&[("amt", "code"), ("amt", "code")]), false, &CompareOptions::default()).unwrap_err();
+        assert!(err.to_string().contains("matched twice"), "{err}");
+        // A kind is set per pair, by its label.
+        let o = CompareOptions { kinds: vec![("amt → code".into(), CompareKind::Text)], ..Default::default() };
+        let p = compare_pairs(&b, &a, &map, false, &o).unwrap();
+        assert_eq!((p[2].kind, p[3].kind), (CompareKind::Text, CompareKind::Text));
+        assert_eq!(p[1].kind, CompareKind::Number);
     }
 
     #[test]

@@ -1,29 +1,43 @@
 import type { CompareKind, CompareOptions, ViewSpec } from "./types";
 
-// Column matching for "Compare outputs" (same rules as the backend's
-// `column_pairs`): user pairs first, then equal names, then names equal
-// ignoring case. Each column is used once.
+// Column matching for "Compare outputs": equal names, then names equal
+// ignoring case (each column once), plus pairs the user adds. A pair the
+// user adds never replaces another: debit = debit, credit = credit and
+// debit = credit can all be compared.
 
 export interface ColumnPair {
   before: string;
   after: string;
+  /** The pair's column in the result (as the backend's `pair_labels`). */
+  label: string;
   how: "manual" | "same" | "case";
 }
 
+/** What the user changed: pairs added, after columns not matched automatically. */
+export interface PairEdits {
+  manual: [string, string][];
+  excluded: string[];
+}
+
 /**
- * `excluded`: after-side columns the user left out (not matched
- * automatically).
+ * Each pair's result column: the after name, or `before → after` when that
+ * after column is in another pair too (the one with the same name, else
+ * the first, keeps the plain name). Same rule as the backend.
  */
+export function pairLabels(pairs: [string, string][]): string[] {
+  const keeper = (a: string) => {
+    const same = pairs.findIndex(([b, x]) => x === a && b === a);
+    if (same >= 0) return same;
+    const cased = pairs.findIndex(([b, x]) => x === a && b.toLowerCase() === a.toLowerCase());
+    return cased >= 0 ? cased : pairs.findIndex(([, x]) => x === a);
+  };
+  return pairs.map(([b, a], i) => (keeper(a) === i ? a : `${b} → ${a}`));
+}
+
 export function pairColumns(before: string[], after: string[], manual: [string, string][], excluded: string[] = []): { pairs: ColumnPair[]; onlyBefore: string[]; onlyAfter: string[] } {
   const usedB = new Set<string>();
-  const usedA = new Set<string>(excluded.filter((e) => !manual.some(([, a]) => a === e)));
-  const pairs: ColumnPair[] = [];
-  for (const [b, a] of manual) {
-    if (!before.includes(b) || !after.includes(a) || usedB.has(b) || usedA.has(a)) continue;
-    usedB.add(b);
-    usedA.add(a);
-    pairs.push({ before: b, after: a, how: "manual" });
-  }
+  const usedA = new Set<string>(excluded);
+  const found: Omit<ColumnPair, "label">[] = [];
   for (const exact of [true, false]) {
     for (const a of after) {
       if (usedA.has(a)) continue;
@@ -31,19 +45,37 @@ export function pairColumns(before: string[], after: string[], manual: [string, 
       if (b === undefined) continue;
       usedB.add(b);
       usedA.add(a);
-      pairs.push({ before: b, after: a, how: exact ? "same" : "case" });
+      found.push({ before: b, after: a, how: exact ? "same" : "case" });
     }
   }
-  pairs.sort((x, y) => after.indexOf(x.after) - after.indexOf(y.after));
-  const paired = new Set(pairs.map((p) => p.after));
-  return { pairs, onlyBefore: before.filter((b) => !usedB.has(b)), onlyAfter: after.filter((a) => !paired.has(a)) };
+  for (const [b, a] of manual) {
+    if (!before.includes(b) || !after.includes(a) || found.some((p) => p.before === b && p.after === a)) continue;
+    found.push({ before: b, after: a, how: "manual" });
+  }
+  // The after output's column order; pairs on one column in the order they came.
+  const sorted = found.map((p, i) => ({ p, i })).sort((x, y) => after.indexOf(x.p.after) - after.indexOf(y.p.after) || x.i - y.i).map((x) => x.p);
+  const labels = pairLabels(sorted.map((p) => [p.before, p.after]));
+  const pairs = sorted.map((p, i) => ({ ...p, label: labels[i] }));
+  const pairedA = new Set(pairs.map((p) => p.after));
+  const pairedB = new Set(pairs.map((p) => p.before));
+  return { pairs, onlyBefore: before.filter((b) => !pairedB.has(b)), onlyAfter: after.filter((a) => !pairedA.has(a)) };
 }
 
-/** Set (or clear, with `b` = null) the before column of after column `a`; a before column used elsewhere moves here. */
-export function setPair(manual: [string, string][], excluded: string[], a: string, b: string | null): { manual: [string, string][]; excluded: string[] } {
-  const m = manual.filter(([x, y]) => y !== a && x !== b);
-  const ex = excluded.filter((e) => e !== a);
-  return b === null ? { manual: m, excluded: [...ex, a] } : { manual: [...m, [b, a]], excluded: ex };
+/** Add `b = a` to the compared pairs (the pairs already there stay). */
+export function addPair(st: PairEdits, b: string, a: string): PairEdits {
+  if (st.manual.some(([x, y]) => x === b && y === a)) return st;
+  return { ...st, manual: [...st.manual, [b, a]] };
+}
+
+/** Stop comparing a pair: one the user added goes; a matched one is left out. */
+export function removePair(st: PairEdits, p: Pick<ColumnPair, "before" | "after" | "how">): PairEdits {
+  if (p.how === "manual") return { ...st, manual: st.manual.filter(([x, y]) => !(x === p.before && y === p.after)) };
+  return { ...st, excluded: st.excluded.includes(p.after) ? st.excluded : [...st.excluded, p.after] };
+}
+
+/** Compare `p.after` with another before column instead (`b`). */
+export function changePair(st: PairEdits, p: Pick<ColumnPair, "before" | "after" | "how">, b: string): PairEdits {
+  return b === p.before ? st : addPair(removePair(st, p), b, p.after);
 }
 
 /**

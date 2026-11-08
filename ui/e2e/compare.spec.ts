@@ -29,7 +29,7 @@ const output = (handle: string, name: string, connection_name: string, rows: num
 
 const BEFORE = output("r1", "orders_ora", "Oracle prod", 3, [meta("id", "Int32", "number"), meta("d", "Timestamp(µs)", "date"), meta("amt", "Decimal128(10, 3)", "number"), meta("code", "Utf8", "text")]);
 const AFTER = output("r2", "orders_pg", "Postgres DWH", 4, [meta("id", "Utf8", "text"), meta("d", "Utf8", "text"), meta("amt", "Utf8", "text"), meta("code", "Utf8", "text")]);
-const pair = (c: string, bt: string, kind: string) => ({ before: c, after: c, before_type: bt, after_type: "Utf8", auto_kind: kind, kind });
+const pair = (c: string, bt: string, kind: string) => ({ before: c, after: c, label: c, before_type: bt, after_type: "Utf8", auto_kind: kind, kind });
 const PAIRS = [pair("id", "Int32", "number"), pair("d", "Timestamp(µs)", "date_time"), pair("amt", "Decimal128(10, 3)", "number"), pair("code", "Utf8", "text")];
 const RESULT_COLS = ["_change", "id", "d", "amt", "code", "d (before)", "amt (before)", "code (before)", "_changed"];
 const ROWS = [
@@ -155,7 +155,7 @@ test("compare a table with the same table on another connection, from the explor
       return o;
     };
   }, cols);
-  await answer(page, "output_compare_pairs", ["id", "name", "email"].map((c) => ({ before: c, after: c, before_type: "Int32", after_type: "Int32", auto_kind: "text", kind: "text" })));
+  await answer(page, "output_compare_pairs", ["id", "name", "email"].map((c) => ({ before: c, after: c, label: c, before_type: "Int32", after_type: "Int32", auto_kind: "text", kind: "text" })));
   await answer(page, "compare_outputs", {
     summary: { before_rows: 1200, after_rows: 1200, same: 1200, changed: 0, added: 0, removed: 0, before_duplicate_keys: 0, after_duplicate_keys: 0, columns: [] },
     result: { id: "diff-2", columns: ["_change", "id", "name", "email"].map((n) => meta(n, "Utf8", "text")), total_rows: 0, complete: true, truncated: false, bytes: 0 },
@@ -196,4 +196,54 @@ test("compare a table with the same table on another connection, from the explor
   expect(again.map((c) => c.side)).toEqual(["before", "after"]);
   expect(again.every((c) => c.tabId !== "dialog")).toBe(true);
   await expect(page.getByText(/Cannot read|failed/i)).toHaveCount(0);
+});
+
+test("add debit_amt = credit_amt next to the matched columns, and drop a column", async ({ page }) => {
+  const cols = [meta("id", "Int32", "number"), meta("debit_amt", "Decimal128(10, 2)", "number"), meta("credit_amt", "Decimal128(10, 2)", "number"), meta("note", "Utf8", "text")];
+  const before = output("r1", "ledger_ora", "Oracle prod", 3, cols);
+  const after = output("r2", "ledger_dbx", "Databricks", 3, cols);
+  await openApp(page, backend({ list_outputs: [after, before] }));
+  await answer(page, "output_compare_pairs", []);
+  await answer(page, "compare_outputs", {
+    summary: { before_rows: 3, after_rows: 3, same: 3, changed: 0, added: 0, removed: 0, before_duplicate_keys: 0, after_duplicate_keys: 0, columns: [] },
+    result: { id: "diff-3", columns: ["_change", "id"].map((n) => meta(n, "Utf8", "text")), total_rows: 0, complete: true, truncated: false, bytes: 0 },
+    sql: "SELECT 1;",
+    pairs: [],
+    keys: ["id"],
+    before,
+    after,
+  });
+  await answer(page, "fetch_page", { view_rows: 0, total_rows: 0, offset: 0, row_ids: [], rows: [] });
+
+  await page.getByRole("button", { name: "Outputs", exact: true }).click();
+  await page.getByRole("button", { name: "Compare outputs" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByText("Compared columns (4)")).toBeVisible();
+  // Added, not swapped in: debit_amt = debit_amt and credit_amt = credit_amt stay.
+  await dialog.getByLabel("Column pairs (before = after)").fill("debit_amt = credit_amt");
+  await dialog.getByRole("button", { name: "Add", exact: true }).click();
+  await expect(dialog.getByText("Compared columns (5)")).toBeVisible();
+  await expect(dialog.getByLabel("Before column matched to debit_amt", { exact: true })).toHaveValue("debit_amt");
+  await expect(dialog.getByLabel("Before column matched to credit_amt", { exact: true })).toHaveValue("credit_amt");
+  await expect(dialog.getByLabel("Before column matched to debit_amt → credit_amt")).toHaveValue("debit_amt");
+  // A column the user doesn't need is dropped.
+  await dialog.getByRole("button", { name: "Don't compare note = note" }).click();
+  await expect(dialog.getByText("Compared columns (4)")).toBeVisible();
+  await expect(dialog.getByLabel("Before column matched to note")).toHaveValue("");
+  await page.screenshot({ path: "test-results/compare-pairs.png" });
+  await dialog.getByText("id", { exact: true }).first().click(); // key
+  await dialog.getByRole("button", { name: "Show differences" }).click();
+
+  await expect.poll(async () => (await calls(page, "compare_outputs")).length).toBeGreaterThan(0);
+  expect((await calls(page, "compare_outputs")).at(-1)).toMatchObject({
+    spec: {
+      keys: ["id"],
+      mapping: [
+        ["id", "id"],
+        ["debit_amt", "debit_amt"],
+        ["credit_amt", "credit_amt"],
+        ["debit_amt", "credit_amt"],
+      ],
+    },
+  });
 });
