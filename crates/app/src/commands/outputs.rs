@@ -36,8 +36,21 @@ pub(crate) async fn output_diff_sql(
     keys: Vec<String>,
     mapping: Option<Vec<(String, String)>>,
     exact: Option<bool>,
+    options: Option<databrain_query_engine::outputs::CompareOptions>,
 ) -> R<String> {
-    api::output_diff_sql(&state, &before, &after, keys, mapping.unwrap_or_default(), exact.unwrap_or(false))
+    api::output_diff_sql(&state, &before, &after, keys, mapping.unwrap_or_default(), exact.unwrap_or(false), &options.unwrap_or_default())
+}
+
+#[tauri::command]
+pub(crate) async fn output_compare_pairs(
+    state: State<'_, AppState>,
+    before: String,
+    after: String,
+    mapping: Option<Vec<(String, String)>>,
+    exact: Option<bool>,
+    options: Option<databrain_query_engine::outputs::CompareOptions>,
+) -> R<Vec<databrain_query_engine::outputs::ComparePair>> {
+    api::output_compare_pairs(&state, &before, &after, mapping.unwrap_or_default(), exact.unwrap_or(false), &options.unwrap_or_default())
 }
 
 #[tauri::command]

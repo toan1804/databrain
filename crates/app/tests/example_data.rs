@@ -463,24 +463,25 @@ async fn outputs_handles_cross_source_queries_diff_chart_and_pins() {
     assert_eq!(api::get_output(&st, "r3").unwrap().connection_name, "Results (DuckDB)");
 
     // 5) Diff the two versions by country: every country's revenue changed.
-    let diff = api::output_diff_sql(&st, "revenue__1", "revenue", vec!["country".into()], vec![], false).unwrap();
+    let diff = api::output_diff_sql(&st, "revenue__1", "revenue", vec!["country".into()], vec![], false, &Default::default()).unwrap();
     let rows = query(&st, &res, &diff).await;
     assert_eq!(rows.len(), 7, "{diff}");
     assert!(rows.iter().all(|r| r[0].as_deref() == Some("changed")));
-    let keyless = api::output_diff_sql(&st, "revenue__1", "revenue", vec![], vec![], false).unwrap();
+    let keyless = api::output_diff_sql(&st, "revenue__1", "revenue", vec![], vec![], false, &Default::default()).unwrap();
     assert_eq!(query(&st, &res, &keyless).await.len(), 14); // 7 removed + 7 added
 
     // 5b) Different column names: COUNTRY matches country (case), and the
     //     user pairs total ↔ revenue by hand.
     run_named(&st, &sq, "t5", "SELECT c.country AS COUNTRY, round(sum(o.total_amount), 2) AS total FROM orders o JOIN customers c USING (customer_id) WHERE o.status = 'delivered' GROUP BY 1", None, Some("renamed")).await;
-    let r = api::output_diff_sql(&st, "renamed", "revenue", vec!["country".into()], vec![], false).unwrap();
+    let r = api::output_diff_sql(&st, "renamed", "revenue", vec!["country".into()], vec![], false, &Default::default()).unwrap();
     assert!(r.contains("COUNTRY AS country") || r.contains("\"COUNTRY\" AS country"), "{r}");
     let rows = query(&st, &res, &r).await;
     assert!(rows.iter().all(|x| x[0].as_deref() != Some("changed")), "revenue is unmatched, so only keys compare: {r}");
-    let mapped = api::output_diff_sql(&st, "renamed", "revenue", vec!["country".into()], vec![("total".into(), "revenue".into())], false).unwrap();
+    let mapped =
+        api::output_diff_sql(&st, "renamed", "revenue", vec!["country".into()], vec![("total".into(), "revenue".into())], false, &Default::default()).unwrap();
     assert!(mapped.contains("total → revenue"), "{mapped}");
     assert_eq!(query(&st, &res, &mapped).await.len(), 0, "same data under other names: no differences\n{mapped}");
-    assert!(api::output_diff_sql(&st, "renamed", "revenue", vec![], vec![("nope".into(), "revenue".into())], false).is_err());
+    assert!(api::output_diff_sql(&st, "renamed", "revenue", vec![], vec![("nope".into(), "revenue".into())], false, &Default::default()).is_err());
     // Exact mapping: every pair given, COUNTRY ↔ country and total ↔ revenue together.
     let exact = api::output_diff_sql(
         &st,
@@ -489,6 +490,7 @@ async fn outputs_handles_cross_source_queries_diff_chart_and_pins() {
         vec!["country".into()],
         vec![("COUNTRY".into(), "country".into()), ("total".into(), "revenue".into())],
         true,
+        &Default::default(),
     )
     .unwrap();
     assert!(exact.contains("COUNTRY → country, total → revenue"), "{exact}");
@@ -529,4 +531,68 @@ async fn outputs_handles_cross_source_queries_diff_chart_and_pins() {
     let handles: Vec<u64> = api::list_outputs(&st2).iter().map(|o| o.handle[1..].parse().unwrap()).collect();
     assert_eq!(handles.iter().filter(|h| **h == 4).count(), 1, "{handles:?}");
     assert!(handles[0] > 8, "{handles:?}");
+}
+
+/// Compare outputs by meaning: a typed side (timestamps, decimals, padded
+/// text, booleans) against a side that has them all as text (SQLite) only
+/// reports real differences.
+#[tokio::test]
+async fn compare_outputs_ignores_how_each_database_types_values() {
+    use databrain_query_engine::outputs::{CompareKind, CompareOptions};
+    let st = state();
+    let res = api::results_connection(&st).unwrap();
+    let sq = sqlite_conn(&st);
+    run_named(
+        &st,
+        &res,
+        "typed",
+        "SELECT * FROM (VALUES \
+           (1, TIMESTAMP '2026-11-11 00:00:00', 10.50::DECIMAL(10,3), 'ABC  ', true), \
+           (2, TIMESTAMP '2026-11-12 08:30:00', 3.00::DECIMAL(10,3), 'x', false), \
+           (3, TIMESTAMP '2026-11-13 00:00:00', 5.004::DECIMAL(10,3), 'Zed', true)) t(id, d, amt, code, ok)",
+        None,
+        Some("typed"),
+    )
+    .await;
+    run_named(
+        &st,
+        &sq,
+        "text",
+        "SELECT '1' AS id, '2026-11-11' AS d, '10.5' AS amt, 'ABC' AS code, 'Y' AS ok \
+         UNION ALL SELECT '2', '2026-11-12 08:30:00', '3', 'x', '0' \
+         UNION ALL SELECT '3', ' 2026-11-13 ', '5.01', 'zed', '1' \
+         UNION ALL SELECT '4', 'n/a', 'abc', 'new', 'maybe'",
+        None,
+        Some("text"),
+    )
+    .await;
+    let diff =
+        |keys: &[&str], o: &CompareOptions| api::output_diff_sql(&st, "typed", "text", keys.iter().map(|k| k.to_string()).collect(), vec![], false, o).unwrap();
+    let changes = |rows: &[Vec<Option<String>>]| {
+        let mut v: Vec<String> = rows.iter().map(|r| format!("{} {}", r[0].as_deref().unwrap_or(""), r[1].as_deref().unwrap_or(""))).collect();
+        v.sort();
+        v
+    };
+
+    // By key: 1 and 2 are the same data; 3 really changed (amount, case); 4 is new.
+    let sql = diff(&["id"], &CompareOptions::default());
+    assert_eq!(changes(&query(&st, &res, &sql).await), ["added 4", "changed 3"], "{sql}");
+    // Without keys: only row 3 (both versions) and row 4 differ.
+    let sql = diff(&[], &CompareOptions::default());
+    assert_eq!(changes(&query(&st, &res, &sql).await), ["added 3", "added 4", "removed 3"], "{sql}");
+    // Ignoring case and a 0.01 tolerance: row 3 is the same too.
+    let loose = CompareOptions { ignore_case: true, tolerance: Some(0.01), ..Default::default() };
+    let sql = diff(&["id"], &loose);
+    assert_eq!(changes(&query(&st, &res, &sql).await), ["added 4"], "{sql}");
+    // Exact (as before): the date compares as text, so `2026-11-11 00:00:00`
+    // differs from `2026-11-11`; row 2's text happens to be written the same.
+    let exact = CompareOptions { kinds: vec![("d".into(), CompareKind::Exact)], ..Default::default() };
+    let sql = diff(&["id"], &exact);
+    assert_eq!(changes(&query(&st, &res, &sql).await), ["added 4", "changed 1", "changed 3"], "{sql}");
+
+    // The dialog sees the pairs with their types and kinds.
+    let pairs = api::output_compare_pairs(&st, "typed", "text", vec![], false, &CompareOptions::default()).unwrap();
+    let d = pairs.iter().find(|p| p.after == "d").unwrap();
+    assert_eq!(d.kind, CompareKind::DateTime);
+    assert!(d.before_type.starts_with("Timestamp") && d.after_type == "Utf8", "{d:?}");
 }

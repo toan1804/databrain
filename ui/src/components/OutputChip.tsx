@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
-import { pairColumns, parseMapping, setPair } from "../lib/compare";
+import { compareOptions, DEFAULT_COMPARE_FORM, KIND_HELP, KIND_LABEL, pairColumns, parseMapping, parseTolerance, setPair, shortType, type CompareForm } from "../lib/compare";
 import {
   AlertTriangle,
   AtSign,
@@ -15,7 +15,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { api, toError } from "../lib/api";
-import type { OutputInfo } from "../lib/types";
+import type { CompareKind, ComparePair, OutputInfo } from "../lib/types";
 import { formatBytes, formatCount, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
 import {
@@ -274,7 +274,33 @@ export function CompareDialog({
     setExcluded([]);
     setTyped("");
     setTypedErrors([]);
+    setForm((f) => ({ ...f, kinds: {} }));
   }, [before, after]);
+  // How values compare: options for all columns, a kind per column.
+  const [form, setForm] = useState<CompareForm>(DEFAULT_COMPARE_FORM);
+  const tolerance = parseTolerance(form.tolerance);
+  const toleranceOk = !Number.isNaN(tolerance);
+  const options = useMemo(() => compareOptions(form, common), [form, common]);
+  /** Types and detected kinds of the matched pairs (from the backend). */
+  const [info, setInfo] = useState<ComparePair[]>([]);
+  useEffect(() => {
+    if (!a || !b || match.pairs.length === 0) return setInfo([]);
+    let alive = true;
+    api
+      .outputComparePairs(b.handle, a.handle, match.pairs.map((p) => [p.before, p.after] as [string, string]), true)
+      .then((p) => alive && setInfo(p))
+      .catch(() => alive && setInfo([]));
+    return () => {
+      alive = false;
+    };
+  }, [a, b, match]);
+  const setKind = (col: string, kind: CompareKind | "") =>
+    setForm((f) => {
+      const kinds = { ...f.kinds };
+      if (kind) kinds[col] = kind;
+      else delete kinds[col];
+      return { ...f, kinds };
+    });
   const [keys, setKeys] = useState<string[]>(() => {
     const first = initial?.columns[0]?.name;
     return first && /(^id$|_id$|^key$|^code$|name$|country|date)/i.test(first)
@@ -292,6 +318,7 @@ export function CompareDialog({
         // Every pair as shown (the user may have left some out).
         match.pairs.map((p) => [p.before, p.after] as [string, string]),
         true,
+        options,
       );
       await openResultsQuery(sql, `Diff ${outputLabel(b)} → ${outputLabel(a)}`);
       onClose();
@@ -324,7 +351,7 @@ export function CompareDialog({
     <Modal
       title="Compare outputs"
       onClose={onClose}
-      width={560}
+      width={680}
       footer={
         <>
           <button className="btn-ghost" onClick={onClose}>
@@ -332,7 +359,7 @@ export function CompareDialog({
           </button>
           <button
             className="btn-primary"
-            disabled={!a || !b || a.handle === b.handle || common.length === 0}
+            disabled={!a || !b || a.handle === b.handle || common.length === 0 || !toleranceOk}
             onClick={() => void run()}
           >
             <GitCompare size={14} /> Show differences
@@ -382,6 +409,36 @@ export function CompareDialog({
         </div>
 
         <div>
+          <div className="mb-1 text-[11.5px] font-medium text-muted">Values are equal when they mean the same</div>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[12px]">
+            <label className="flex items-center gap-1.5" title="CHAR padding and trailing spaces: 'ABC  ' = 'ABC'">
+              <input type="checkbox" checked={form.trim} onChange={(e) => setForm({ ...form, trim: e.target.checked })} /> Ignore spaces at the ends
+            </label>
+            <label className="flex items-center gap-1.5" title="'ABC' = 'abc'">
+              <input type="checkbox" checked={form.ignoreCase} onChange={(e) => setForm({ ...form, ignoreCase: e.target.checked })} /> Ignore case
+            </label>
+            <label className="flex items-center gap-1.5" title="An empty text equals NULL">
+              <input type="checkbox" checked={form.emptyIsNull} onChange={(e) => setForm({ ...form, emptyIsNull: e.target.checked })} /> Empty text = NULL
+            </label>
+            <label className="flex items-center gap-1.5" title={keys.length ? "Numbers this close are equal" : "Without keys, numbers are rounded to steps of this"}>
+              Number tolerance
+              <input
+                className={`field h-6 w-20 py-0 text-[11.5px] ${toleranceOk ? "" : "border-danger"}`}
+                inputMode="decimal"
+                placeholder="exact"
+                aria-label="Number tolerance"
+                value={form.tolerance}
+                onChange={(e) => setForm({ ...form, tolerance: e.target.value })}
+              />
+            </label>
+          </div>
+          {!toleranceOk && <p className="mt-1 text-[11.5px] text-danger">The tolerance must be a positive number, e.g. 0.01.</p>}
+          <p className="mt-1 text-[11.5px] text-muted">
+            Dates, numbers and booleans compare by value whatever type each database gave them (2026-11-11 00:00:00 = '2026-11-11', 10.50 = '10.5'). Change it per column below.
+          </p>
+        </div>
+
+        <div>
           <div className="mb-1 flex items-center text-[11.5px] font-medium text-muted">
             <span>
               Matched columns ({match.pairs.length} of {afterCols.length})
@@ -402,12 +459,16 @@ export function CompareDialog({
                   <th className="px-2 py-1 text-left font-medium">After ({a ? outputLabel(a) : "…"})</th>
                   <th className="w-4" />
                   <th className="px-2 py-1 text-left font-medium">Before ({b ? outputLabel(b) : "…"})</th>
+                  <th className="px-2 py-1 text-left font-medium">Compare as</th>
                   <th className="px-2 py-1 text-right font-medium">How</th>
                 </tr>
               </thead>
               <tbody>
                 {afterCols.map((ac) => {
                   const p = match.pairs.find((x) => x.after === ac);
+                  const pi = p ? info.find((x) => x.after === ac && x.before === p.before) : undefined;
+                  const types = pi && shortType(pi.before_type) !== shortType(pi.after_type) ? `${shortType(pi.before_type)} → ${shortType(pi.after_type)}` : null;
+                  const chosen = form.kinds[ac];
                   return (
                     <tr key={ac} className="border-t border-line/60">
                       <td className="max-w-0 truncate px-2 py-0.5" title={ac}>
@@ -432,6 +493,31 @@ export function CompareDialog({
                             );
                           })}
                         </select>
+                      </td>
+                      <td className="px-1 py-0.5 font-sans">
+                        {p && pi && (
+                          <>
+                            <select
+                              className="field h-6 w-full py-0 text-[11.5px]"
+                              aria-label={`Compare ${ac} as`}
+                              title={KIND_HELP[chosen ?? pi.auto_kind]}
+                              value={chosen ?? ""}
+                              onChange={(e) => setKind(ac, e.target.value as CompareKind | "")}
+                            >
+                              <option value="">Auto · {KIND_LABEL[pi.auto_kind]}</option>
+                              {(Object.keys(KIND_LABEL) as CompareKind[]).map((k) => (
+                                <option key={k} value={k}>
+                                  {KIND_LABEL[k]}
+                                </option>
+                              ))}
+                            </select>
+                            {types && (
+                              <div className="truncate text-[10.5px] text-muted" title={`${pi.before_type} → ${pi.after_type}`}>
+                                {types}
+                              </div>
+                            )}
+                          </>
+                        )}
                       </td>
                       <td className="whitespace-nowrap px-2 py-0.5 text-right font-sans text-[10.5px] text-muted">
                         {!p ? "" : p.how === "same" ? "same name" : p.how === "case" ? "other case" : "by you"}

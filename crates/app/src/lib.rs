@@ -290,6 +290,7 @@ pub fn run() {
             commands::outputs::rename_output,
             commands::outputs::pin_output,
             commands::outputs::output_diff_sql,
+            commands::outputs::output_compare_pairs,
             commands::outputs::results_connection,
             commands::outputs::chart_data,
             commands::library::list_notebooks,

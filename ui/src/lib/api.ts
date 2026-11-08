@@ -50,6 +50,8 @@ import type {
   ChartData,
   ChartSpec,
   OutputInfo,
+  CompareOptions,
+  ComparePair,
   ColumnStats,
   ConnectionConfig,
   ConnectionProfile,
@@ -358,8 +360,11 @@ export const api = {
   renameOutput: (handle: string, name: string | null) => call<OutputInfo>("rename_output", { handle, name }),
   pinOutput: (handle: string, pinned: boolean) => call<OutputInfo>("pin_output", { handle, pinned }),
   /** `exact`: `mapping` is every pair to compare (no automatic matching). */
-  outputDiffSql: (before: string, after: string, keys: string[], mapping: [string, string][] = [], exact = false) =>
-    call<string>("output_diff_sql", { before, after, keys, mapping, exact }),
+  outputDiffSql: (before: string, after: string, keys: string[], mapping: [string, string][] = [], exact = false, options: CompareOptions | null = null) =>
+    call<string>("output_diff_sql", { before, after, keys, mapping, exact, options }),
+  /** The pairs a compare would use, with their types and how each compares. */
+  outputComparePairs: (before: string, after: string, mapping: [string, string][], exact = true, options: CompareOptions | null = null) =>
+    call<ComparePair[]>("output_compare_pairs", { before, after, mapping, exact, options }),
   resultsConnection: () => call<string>("results_connection"),
   chartData: (resultId: string, view: ViewSpec, spec: ChartSpec) => call<ChartData>("chart_data", { resultId, view, spec }),
 

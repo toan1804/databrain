@@ -1,3 +1,5 @@
+import type { CompareKind, CompareOptions } from "./types";
+
 // Column matching for "Compare outputs" (same rules as the backend's
 // `column_pairs`): user pairs first, then equal names, then names equal
 // ignoring case. Each column is used once.
@@ -70,4 +72,75 @@ export function parseMapping(text: string, before: string[], after: string[]): {
     else pairs.push([b, a]);
   }
   return { pairs, errors };
+}
+
+// ------------------------------------------------- how values are compared
+
+
+export const KIND_LABEL: Record<CompareKind, string> = {
+  date_time: "date/time",
+  date: "date only",
+  number: "number",
+  text: "text",
+  bool: "boolean",
+  exact: "exact",
+};
+
+/** What each kind means, for the "Compare as" list. */
+export const KIND_HELP: Record<CompareKind, string> = {
+  date_time: "2026-11-11 00:00:00 = 2026-11-11",
+  date: "Ignore the time of day",
+  number: "10.50 = 10.5 = '10.5'",
+  text: "As text (spaces at the ends ignored unless you turn that off)",
+  bool: "true = 1 = Y = yes",
+  exact: "As the database gave it, as text",
+};
+
+/** Arrow type names as people read them: `Timestamp(µs)` → `timestamp`, `Utf8` → `text`. */
+export function shortType(t: string): string {
+  const s = t.trim();
+  const dec = /^Decimal(?:128|256)\((\d+),\s*(-?\d+)\)$/.exec(s);
+  if (dec) return `decimal(${dec[1]},${dec[2]})`;
+  if (/^(Large)?Utf8(View)?$/.test(s)) return "text";
+  if (/^Timestamp/.test(s)) return /,\s*Some/.test(s) ? "timestamptz" : "timestamp";
+  if (/^Date(32|64)$/.test(s)) return "date";
+  if (/^Time(32|64)/.test(s)) return "time";
+  if (/^U?Int(8|16|32|64)$/.test(s)) return s.toLowerCase();
+  if (/^Float(16|32|64)$/.test(s)) return s === "Float32" ? "float" : "double";
+  if (s === "Boolean") return "boolean";
+  if (/Binary/.test(s)) return "binary";
+  return s.toLowerCase();
+}
+
+/** The options as the dialog edits them. */
+export interface CompareForm {
+  trim: boolean;
+  ignoreCase: boolean;
+  emptyIsNull: boolean;
+  /** As typed; empty = exact. */
+  tolerance: string;
+  /** After column → kind chosen by the user. */
+  kinds: Record<string, CompareKind>;
+}
+
+export const DEFAULT_COMPARE_FORM: CompareForm = { trim: true, ignoreCase: false, emptyIsNull: false, tolerance: "", kinds: {} };
+
+/** The tolerance typed: `null` when empty, `NaN` when not a positive number. */
+export function parseTolerance(text: string): number | null {
+  const t = text.trim().replace(",", ".");
+  if (!t) return null;
+  const n = Number(t);
+  return Number.isFinite(n) && n > 0 ? n : NaN;
+}
+
+/** Backend options from the form (`kinds` only for compared columns). */
+export function compareOptions(f: CompareForm, compared: string[]): CompareOptions {
+  const tol = parseTolerance(f.tolerance);
+  return {
+    trim: f.trim,
+    ignore_case: f.ignoreCase,
+    empty_is_null: f.emptyIsNull,
+    tolerance: tol === null || Number.isNaN(tol) ? null : tol,
+    kinds: Object.entries(f.kinds).filter(([c]) => compared.includes(c)),
+  };
 }

@@ -60,6 +60,9 @@ import type { EngineError } from "./bindings/EngineError";
 import type { JobEvent } from "./bindings/JobEvent";
 import type { TestResult } from "./bindings/TestResult";
 import type { OutputInfo } from "./bindings/OutputInfo";
+import type { CompareKind } from "./bindings/CompareKind";
+import type { CompareOptions } from "./bindings/CompareOptions";
+import type { ComparePair } from "./bindings/ComparePair";
 import type { OutputState } from "./bindings/OutputState";
 import type { RunStatus } from "./bindings/RunStatus";
 import type { EditTarget } from "./bindings/EditTarget";
@@ -226,6 +229,9 @@ export type {
   JobEvent,
   TestResult,
   OutputInfo,
+  CompareKind,
+  CompareOptions,
+  ComparePair,
   OutputState,
   RunStatus,
   EditTarget,

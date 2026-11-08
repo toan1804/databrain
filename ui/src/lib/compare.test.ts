@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { pairColumns, parseMapping, setPair } from "./compare";
+import { pairColumns, parseMapping, setPair, compareOptions, DEFAULT_COMPARE_FORM, parseTolerance, shortType } from "./compare";
 
 describe("compare: column matching", () => {
   it("matches equal names, then names that differ only in case", () => {
@@ -51,5 +51,34 @@ describe("compare: column matching", () => {
     const r = parseMapping("r1.a = r2.a1, B -> b2\nc→nope; x", ["a", "b", "c"], ["a1", "b2"]);
     expect(r.pairs).toEqual([["a", "a1"], ["b", "b2"]]);
     expect(r.errors).toEqual(["nope is not a column of the after output", '"x": write it as before = after']);
+  });
+});
+
+describe("how values are compared", () => {
+  it("names Arrow types the way people read them", () => {
+    expect(shortType("Timestamp(µs)")).toBe("timestamp");
+    expect(shortType('Timestamp(Microsecond, Some("UTC"))')).toBe("timestamptz");
+    expect(shortType("Utf8")).toBe("text");
+    expect(shortType("LargeUtf8")).toBe("text");
+    expect(shortType("Decimal128(10, 2)")).toBe("decimal(10,2)");
+    expect(shortType("Int32")).toBe("int32");
+    expect(shortType("Float64")).toBe("double");
+    expect(shortType("Date32")).toBe("date");
+    expect(shortType("Boolean")).toBe("boolean");
+  });
+
+  it("reads the tolerance as typed", () => {
+    expect(parseTolerance("")).toBeNull();
+    expect(parseTolerance(" 0.01 ")).toBe(0.01);
+    expect(parseTolerance("0,5")).toBe(0.5);
+    expect(parseTolerance("0")).toBeNaN();
+    expect(parseTolerance("-1")).toBeNaN();
+    expect(parseTolerance("abc")).toBeNaN();
+  });
+
+  it("sends options and only the kinds of compared columns", () => {
+    const f = { ...DEFAULT_COMPARE_FORM, ignoreCase: true, tolerance: "0.01", kinds: { d: "date" as const, gone: "exact" as const } };
+    expect(compareOptions(f, ["d", "amt"])).toEqual({ trim: true, ignore_case: true, empty_is_null: false, tolerance: 0.01, kinds: [["d", "date"]] });
+    expect(compareOptions({ ...DEFAULT_COMPARE_FORM, tolerance: "x" }, []).tolerance).toBeNull();
   });
 });

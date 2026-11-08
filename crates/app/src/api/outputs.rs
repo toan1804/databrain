@@ -57,10 +57,35 @@ pub async fn pin_output(state: &AppState, handle: String, pinned: bool) -> Resul
 /// `mapping`: extra (before column, after column) pairs chosen by the user;
 /// equal names and names equal ignoring case are matched automatically.
 /// `exact`: `mapping` is the complete list of pairs (no automatic matching).
-pub fn output_diff_sql(state: &AppState, before: &str, after: &str, keys: Vec<String>, mapping: Vec<(String, String)>, exact: bool) -> Result<String> {
+/// `options`: how values compare (types normalized by default, see
+/// [`CompareOptions`](databrain_query_engine::outputs::CompareOptions)).
+pub fn output_diff_sql(
+    state: &AppState,
+    before: &str,
+    after: &str,
+    keys: Vec<String>,
+    mapping: Vec<(String, String)>,
+    exact: bool,
+    options: &databrain_query_engine::outputs::CompareOptions,
+) -> Result<String> {
     let b = get_output(state, before)?;
     let a = get_output(state, after)?;
-    databrain_query_engine::outputs::diff_sql_with(&b, &a, &keys, &mapping, !exact)
+    databrain_query_engine::outputs::diff_sql_opts(&b, &a, &keys, &mapping, !exact, options)
+}
+
+/// The column pairs a compare would use, with their types and how each is
+/// compared (for the compare dialog).
+pub fn output_compare_pairs(
+    state: &AppState,
+    before: &str,
+    after: &str,
+    mapping: Vec<(String, String)>,
+    exact: bool,
+    options: &databrain_query_engine::outputs::CompareOptions,
+) -> Result<Vec<databrain_query_engine::outputs::ComparePair>> {
+    let b = get_output(state, before)?;
+    let a = get_output(state, after)?;
+    databrain_query_engine::outputs::compare_pairs(&b, &a, &mapping, !exact, options)
 }
 
 /// Id of the local DuckDB connection for `results.*` queries.

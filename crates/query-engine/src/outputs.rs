@@ -914,60 +914,324 @@ pub fn diff_sql_mapped(before: &OutputInfo, after: &OutputInfo, keys: &[String],
     diff_sql_with(before, after, keys, extra, true)
 }
 
-/// [`diff_sql_mapped`]; `auto` false: compare only the given pairs.
+/// [`diff_sql_mapped`]; `auto` false: compare only the given pairs. Values
+/// are compared by meaning with the default [`CompareOptions`].
 pub fn diff_sql_with(before: &OutputInfo, after: &OutputInfo, keys: &[String], extra: &[(String, String)], auto: bool) -> Result<String> {
+    diff_sql_opts(before, after, keys, extra, auto, &CompareOptions::default())
+}
+
+/// How the values of a column pair are compared: both sides are turned into
+/// one canonical text first, so the database types don't matter
+/// (`TIMESTAMP 2026-11-11 00:00:00` = `'2026-11-11'`, `10.50` = `'10.5'`).
+/// A value that doesn't parse as the kind is compared as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum CompareKind {
+    /// Date and time; a time of 00:00:00 equals a plain date.
+    DateTime,
+    /// The date part only (the time is ignored).
+    Date,
+    /// Numeric value: `10.50` = `10.5` = `'10.5'`; with a tolerance, close values are equal.
+    Number,
+    /// Text, trimmed (and lower-cased, with "ignore case").
+    Text,
+    /// `true`/`false`; `1`/`0`, `y`/`n`, `yes`/`no`, `t`/`f` accepted.
+    Bool,
+    /// The value as the database gave it, as text (no trimming).
+    Exact,
+}
+
+impl CompareKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            CompareKind::DateTime => "date/time",
+            CompareKind::Date => "date only",
+            CompareKind::Number => "number",
+            CompareKind::Text => "text",
+            CompareKind::Bool => "boolean",
+            CompareKind::Exact => "exact",
+        }
+    }
+}
+
+/// Options of a compare. The defaults compare by meaning: trimmed text,
+/// case matters, empty text is not NULL, numbers exact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[serde(default)]
+pub struct CompareOptions {
+    /// Ignore leading and trailing spaces (CHAR padding).
+    pub trim: bool,
+    pub ignore_case: bool,
+    /// Empty text counts as NULL.
+    pub empty_is_null: bool,
+    /// Numbers this close are equal (with keys; without keys, numbers are
+    /// rounded to steps of it).
+    pub tolerance: Option<f64>,
+    /// After-side column → kind, overriding the automatic one.
+    pub kinds: Vec<(String, CompareKind)>,
+}
+
+impl Default for CompareOptions {
+    fn default() -> Self {
+        Self { trim: true, ignore_case: false, empty_is_null: false, tolerance: None, kinds: vec![] }
+    }
+}
+
+/// A matched column pair as the compare treats it.
+#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct ComparePair {
+    pub before: String,
+    pub after: String,
+    /// Types as the outputs hold them (Arrow), e.g. `Timestamp(µs)`, `Utf8`.
+    pub before_type: String,
+    pub after_type: String,
+    /// What the types suggest.
+    pub auto_kind: CompareKind,
+    /// What is used: `auto_kind` unless the options override it.
+    pub kind: CompareKind,
+}
+
+/// The kind two columns' types suggest: a date on either side compares
+/// dates, a number numbers, a boolean booleans; otherwise text.
+pub fn auto_kind(before: &ColumnMeta, after: &ColumnMeta) -> CompareKind {
+    use display::TypeFamily as F;
+    let fam = [before.family, after.family];
+    let any = |f: F| fam.contains(&f);
+    let other = |f: F| fam.iter().all(|x| *x == f || matches!(x, F::Text | F::Number | F::Bool | F::Date));
+    if any(F::Binary) || any(F::Other) {
+        CompareKind::Exact
+    } else if any(F::Date) && other(F::Date) {
+        CompareKind::DateTime
+    } else if any(F::Bool) {
+        CompareKind::Bool
+    } else if any(F::Number) {
+        CompareKind::Number
+    } else {
+        CompareKind::Text
+    }
+}
+
+/// The pairs a compare uses, with their types and kinds.
+pub fn compare_pairs(before: &OutputInfo, after: &OutputInfo, extra: &[(String, String)], auto: bool, opts: &CompareOptions) -> Result<Vec<ComparePair>> {
+    let meta = |o: &OutputInfo, n: &str| o.columns.iter().find(|c| c.name == n).cloned();
+    column_pairs_with(before, after, extra, auto)?
+        .into_iter()
+        .map(|(bc, ac)| {
+            let (Some(bm), Some(am)) = (meta(before, &bc), meta(after, &ac)) else {
+                return Err(EngineError::new("internal", format!("column {bc} or {ac} not found")));
+            };
+            let auto_kind = auto_kind(&bm, &am);
+            let kind = opts.kinds.iter().find(|(c, _)| *c == ac).map(|(_, k)| *k).unwrap_or(auto_kind);
+            Ok(ComparePair { before: bc, after: ac, before_type: bm.data_type, after_type: am.data_type, auto_kind, kind })
+        })
+        .collect()
+}
+
+/// A tolerance as a SQL literal (positive, finite).
+fn tolerance_literal(t: f64) -> Result<String> {
+    if !t.is_finite() || t <= 0.0 {
+        return Err(EngineError::new("invalid", "the number tolerance must be a positive number"));
+    }
+    Ok(format!("CAST({t:?} AS DECIMAL(38,10))"))
+}
+
+/// DuckDB expression: the canonical text of column `col` (already quoted)
+/// whose type family is `fam`, compared as `kind`. NULL stays NULL.
+fn canonical(col: &str, fam: display::TypeFamily, kind: CompareKind, opts: &CompareOptions, round_to: Option<&str>) -> String {
+    use display::TypeFamily as F;
+    let raw = format!("CAST({col} AS VARCHAR)");
+    let text = {
+        let mut t = raw.clone();
+        if opts.trim {
+            t = format!("trim({t})");
+        }
+        if opts.ignore_case {
+            t = format!("lower({t})");
+        }
+        if opts.empty_is_null {
+            t = format!("nullif({t}, '')");
+        }
+        t
+    };
+    // Text is trimmed before parsing it as a date or number.
+    let parse = |ty: &str, native: bool| if native { format!("try_cast({col} AS {ty})") } else { format!("try_cast(trim({raw}) AS {ty})") };
+    match kind {
+        CompareKind::Exact => raw,
+        CompareKind::Text => text,
+        CompareKind::DateTime => {
+            let ts = parse("TIMESTAMP", fam == F::Date);
+            format!(
+                "coalesce(CASE WHEN {ts} = date_trunc('day', {ts}) THEN strftime({ts}, '%Y-%m-%d') ELSE strftime({ts}, '%Y-%m-%d %H:%M:%S.%f') END, {text})"
+            )
+        }
+        CompareKind::Date => {
+            let ts = parse("TIMESTAMP", fam == F::Date);
+            format!("coalesce(strftime({ts}, '%Y-%m-%d'), {text})")
+        }
+        CompareKind::Number => {
+            let dec = parse("DECIMAL(38,10)", fam == F::Number);
+            let dec = match round_to {
+                Some(t) => format!("CAST(round({dec} / {t}) * {t} AS DECIMAL(38,10))"),
+                None => dec,
+            };
+            // 10.5000000000 → 10.5, 3.0000000000 → 3; beyond DECIMAL(38,10), as a double.
+            let dbl = parse("DOUBLE", fam == F::Number);
+            format!("coalesce(regexp_replace(CAST({dec} AS VARCHAR), '(\\.[0-9]*[1-9])0+$|\\.0+$', '\\1'), CAST({dbl} AS VARCHAR), {text})")
+        }
+        CompareKind::Bool => {
+            let l = format!("lower(trim({raw}))");
+            format!("CASE WHEN {l} IN ('true', 't', '1', 'y', 'yes') THEN 'true' WHEN {l} IN ('false', 'f', '0', 'n', 'no') THEN 'false' ELSE {text} END")
+        }
+    }
+}
+
+/// [`diff_sql_with`] with compare options. Each matched column gets a hidden
+/// canonical column (`__cmp_<i>`, see [`canonical`]) on both sides; keys
+/// join on them and changes are found on them, while the result shows the
+/// values as each output holds them.
+///
+/// With keys: rows `added`, `removed` and `changed` (with `<col> (before)`).
+/// Without keys: rows that differ as a multiset (duplicates count), as
+/// `removed` and `added`.
+pub fn diff_sql_opts(
+    before: &OutputInfo,
+    after: &OutputInfo,
+    keys: &[String],
+    extra: &[(String, String)],
+    auto: bool,
+    opts: &CompareOptions,
+) -> Result<String> {
     let q = |s: &str| q_min(s);
-    let pairs = column_pairs_with(before, after, extra, auto)?;
+    let pairs = compare_pairs(before, after, extra, auto, opts)?;
     if pairs.is_empty() {
         return Err(EngineError::new("invalid", format!("{} and {} have no matching columns; match some columns by hand", before.handle, after.handle)));
     }
-    let common: Vec<&str> = pairs.iter().map(|(_, a)| a.as_str()).collect();
-    let mut key_names: Vec<String> = Vec::new();
+    let mut key_idx: Vec<usize> = Vec::new();
     for k in keys {
-        let hit = pairs.iter().find(|(b, a)| a == k || b == k).or_else(|| pairs.iter().find(|(b, a)| a.eq_ignore_ascii_case(k) || b.eq_ignore_ascii_case(k)));
+        let hit = pairs
+            .iter()
+            .position(|p| p.after == *k || p.before == *k)
+            .or_else(|| pairs.iter().position(|p| p.after.eq_ignore_ascii_case(k) || p.before.eq_ignore_ascii_case(k)));
         match hit {
-            Some((_, a)) => key_names.push(a.clone()),
+            Some(i) if !key_idx.contains(&i) => key_idx.push(i),
+            Some(_) => {}
             None => return Err(EngineError::new("invalid", format!("key column {k} is not matched in both outputs"))),
         }
     }
-    let keys = &key_names;
-    let (a, b) = (before.reference(), after.reference());
-    let cols = common.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
-    let a_cols = pairs.iter().map(|(bc, ac)| if bc == ac { q(ac) } else { format!("{} AS {}", q(bc), q(ac)) }).collect::<Vec<_>>().join(", ");
-    let renamed: Vec<String> = pairs.iter().filter(|(bc, ac)| bc != ac).map(|(bc, ac)| format!("{bc} → {ac}")).collect();
+    let tol = opts.tolerance.map(tolerance_literal).transpose()?;
+    let fam = |o: &OutputInfo, n: &str| o.columns.iter().find(|c| c.name == n).map(|c| c.family).unwrap_or(display::TypeFamily::Text);
+    let c = |i: usize| format!("__cmp_{i}");
+    let keyed = !key_idx.is_empty();
+    // Without keys a tolerance rounds numbers (rows are compared whole).
+    let round_to = if keyed { None } else { tol.as_deref() };
+    let side = |o: &OutputInfo, before_side: bool| -> String {
+        let mut cols: Vec<String> = Vec::new();
+        for p in &pairs {
+            let n = if before_side { &p.before } else { &p.after };
+            cols.push(if n == &p.after { q(&p.after) } else { format!("{} AS {}", q(n), q(&p.after)) });
+        }
+        for (i, p) in pairs.iter().enumerate() {
+            let n = if before_side { &p.before } else { &p.after };
+            cols.push(format!("{} AS {}", canonical(&q(n), fam(o, n), p.kind, opts, round_to), c(i)));
+        }
+        cols.join(", ")
+    };
+    let (a_ref, b_ref) = (before.reference(), after.reference());
+    let (a_cols, b_cols) = (side(before, true), side(after, false));
+    let shown = |t: &str| pairs.iter().map(|p| format!("{t}.{}", q(&p.after))).collect::<Vec<_>>().join(", ");
+
     let mut header = format!("-- Differences from {} (before) to {} (after)\n", before.handle, after.handle);
+    let renamed: Vec<String> = pairs.iter().filter(|p| p.before != p.after).map(|p| format!("{} → {}", p.before, p.after)).collect();
     if !renamed.is_empty() {
         header.push_str(&format!("-- Matched columns: {}\n", renamed.join(", ")));
     }
-    if keys.is_empty() {
+    let kinds: Vec<String> = pairs.iter().filter(|p| p.kind != CompareKind::Text).map(|p| format!("{} as {}", p.after, p.kind.label())).collect();
+    if !kinds.is_empty() {
+        header.push_str(&format!("-- Compared as: {}\n", kinds.join(", ")));
+    }
+    let mut flags = Vec::new();
+    if !opts.trim {
+        flags.push("spaces count".to_string());
+    }
+    if opts.ignore_case {
+        flags.push("case ignored".to_string());
+    }
+    if opts.empty_is_null {
+        flags.push("empty text = NULL".to_string());
+    }
+    if let Some(t) = opts.tolerance {
+        flags.push(format!("numbers within {t} are equal"));
+    }
+    if !flags.is_empty() {
+        header.push_str(&format!("-- Options: {}\n", flags.join(", ")));
+    }
+
+    let with = format!("WITH a AS (SELECT {a_cols} FROM {a_ref}), b AS (SELECT {b_cols} FROM {b_ref})");
+    if !keyed {
+        let all = (0..pairs.len()).map(c).collect::<Vec<_>>().join(", ");
+        let same = |x: &str, y: &str| {
+            let mut v: Vec<String> = (0..pairs.len()).map(|i| format!("{x}.{0} IS NOT DISTINCT FROM {y}.{0}", c(i))).collect();
+            v.push(format!("{x}.__n = {y}.__n"));
+            v.join(" AND ")
+        };
         return Ok(format!(
-            "{header}WITH a AS (SELECT {a_cols} FROM {a}), b AS (SELECT {cols} FROM {b})\n\
-             SELECT 'removed' AS _change, * FROM (SELECT * FROM a EXCEPT ALL SELECT * FROM b)\n\
-             UNION ALL\n\
-             SELECT 'added' AS _change, * FROM (SELECT * FROM b EXCEPT ALL SELECT * FROM a)\n\
-             ORDER BY ALL;"
+            "{header}{with},\n\
+             an AS (SELECT *, row_number() OVER (PARTITION BY {all}) AS __n FROM a),\n\
+             bn AS (SELECT *, row_number() OVER (PARTITION BY {all}) AS __n FROM b)\n\
+             SELECT 'removed' AS _change, {} FROM an ANTI JOIN bn ON {}\n\
+             UNION ALL BY NAME\n\
+             SELECT 'added' AS _change, {} FROM bn ANTI JOIN an ON {}\n\
+             ORDER BY ALL;",
+            shown("an"),
+            same("an", "bn"),
+            shown("bn"),
+            same("bn", "an"),
         ));
     }
-    let using = keys.iter().map(|k| q(k)).collect::<Vec<_>>().join(", ");
-    let values: Vec<&str> = common.iter().copied().filter(|c| !keys.iter().any(|k| k == c)).collect();
-    let key_list = keys.iter().map(|k| q(k)).collect::<Vec<_>>().join(", ");
-    let changed_cols = values.iter().map(|c| format!("b.{0} AS {0}, a.{0} AS {1}", q(c), q(&format!("{c} (before)")))).collect::<Vec<_>>();
-    let changed_where = if values.is_empty() {
-        "false".to_string()
-    } else {
-        values.iter().map(|c| format!("b.{0} IS DISTINCT FROM a.{0}", q(c))).collect::<Vec<_>>().join("\n   OR ")
+    let on = key_idx.iter().map(|i| format!("b.{0} = a.{0}", c(*i))).collect::<Vec<_>>().join(" AND ");
+    let on_a = key_idx.iter().map(|i| format!("a.{0} = b.{0}", c(*i))).collect::<Vec<_>>().join(" AND ");
+    let key_list = key_idx.iter().map(|i| q(&pairs[*i].after)).collect::<Vec<_>>().join(", ");
+    let values: Vec<usize> = (0..pairs.len()).filter(|i| !key_idx.contains(i)).collect();
+    let mut changed_cols: Vec<String> = key_idx.iter().map(|i| format!("b.{}", q(&pairs[*i].after))).collect();
+    for i in &values {
+        let n = &pairs[*i].after;
+        changed_cols.push(format!("b.{0} AS {0}, a.{0} AS {1}", q(n), q(&format!("{n} (before)"))));
+    }
+    let differs = |i: usize| -> String {
+        let base = format!("b.{0} IS DISTINCT FROM a.{0}", c(i));
+        match (&tol, pairs[i].kind) {
+            // Close numbers are equal; anything that isn't a number compares as above.
+            (Some(t), CompareKind::Number) => {
+                let num = |side: &str, o: &OutputInfo, n: &str| {
+                    if fam(o, n) == display::TypeFamily::Number {
+                        format!("try_cast({side}.{} AS DECIMAL(38,10))", q(&pairs[i].after))
+                    } else {
+                        format!("try_cast(trim(CAST({side}.{} AS VARCHAR)) AS DECIMAL(38,10))", q(&pairs[i].after))
+                    }
+                };
+                let (bn, an) = (num("b", after, &pairs[i].after), num("a", before, &pairs[i].before));
+                format!("({base} AND NOT coalesce(abs({bn} - {an}) <= {t}, false))")
+            }
+            _ => base,
+        }
     };
-    let changed_select = if changed_cols.is_empty() { key_list.clone() } else { format!("{key_list}, {}", changed_cols.join(", ")) };
+    let changed_where = if values.is_empty() { "false".to_string() } else { values.iter().map(|i| differs(*i)).collect::<Vec<_>>().join("\n   OR ") };
     Ok(format!(
-        "{header}WITH a AS (SELECT {a_cols} FROM {a}), b AS (SELECT {cols} FROM {b})\n\
-         SELECT 'added' AS _change, * FROM b ANTI JOIN a USING ({using})\n\
+        "{header}{with}\n\
+         SELECT 'added' AS _change, {} FROM b ANTI JOIN a ON {on}\n\
          UNION ALL BY NAME\n\
-         SELECT 'removed' AS _change, * FROM a ANTI JOIN b USING ({using})\n\
+         SELECT 'removed' AS _change, {} FROM a ANTI JOIN b ON {on_a}\n\
          UNION ALL BY NAME\n\
-         SELECT 'changed' AS _change, {changed_select}\n\
-         FROM b JOIN a USING ({using})\n\
+         SELECT 'changed' AS _change, {}\n\
+         FROM b JOIN a ON {on}\n\
          WHERE {changed_where}\n\
-         ORDER BY _change, {key_list};"
+         ORDER BY _change, {key_list};",
+        shown("b"),
+        shown("a"),
+        changed_cols.join(", "),
     ))
 }
 
@@ -1195,5 +1459,90 @@ mod tests {
         let (s, bs) = sql_ready_all(&schema, &[b1, b2]).unwrap();
         assert_eq!(s.field(0).data_type(), &DataType::Decimal128(8, 3));
         assert!(bs.iter().all(|b| b.schema() == s));
+    }
+
+    /// Oracle-like before (typed) vs text after.
+    fn typed_pair(r: &OutputRegistry) -> (OutputInfo, OutputInfo) {
+        use databrain_result_store::display::TypeFamily as F;
+        let mut b = add(r, "t1", 1);
+        let mut a = add(r, "t2", 1);
+        let col = |n: &str, t: &str, f: F| ColumnMeta { name: n.into(), data_type: t.into(), db_type: None, family: f };
+        b.columns = vec![
+            col("id", "Int32", F::Number),
+            col("d", "Timestamp(µs)", F::Date),
+            col("amt", "Decimal128(10, 2)", F::Number),
+            col("code", "Utf8", F::Text),
+            col("ok", "Boolean", F::Bool),
+            col("raw", "Binary", F::Binary),
+        ];
+        a.columns = ["id", "d", "amt", "code", "ok", "raw"].iter().map(|n| col(n, "Utf8", F::Text)).collect();
+        (b, a)
+    }
+
+    #[test]
+    fn compare_kinds_follow_either_sides_type() {
+        let r = reg();
+        let (b, a) = typed_pair(&r);
+        let p = compare_pairs(&b, &a, &[], true, &CompareOptions::default()).unwrap();
+        let kinds: Vec<(&str, CompareKind)> = p.iter().map(|x| (x.after.as_str(), x.kind)).collect();
+        assert_eq!(
+            kinds,
+            [
+                ("id", CompareKind::Number),
+                ("d", CompareKind::DateTime),
+                ("amt", CompareKind::Number),
+                ("code", CompareKind::Text),
+                ("ok", CompareKind::Bool),
+                ("raw", CompareKind::Exact)
+            ]
+        );
+        assert_eq!((p[1].before_type.as_str(), p[1].after_type.as_str()), ("Timestamp(µs)", "Utf8"));
+        // An override wins; the automatic kind is still reported.
+        let o = CompareOptions { kinds: vec![("d".into(), CompareKind::Date)], ..Default::default() };
+        let d = &compare_pairs(&b, &a, &[], true, &o).unwrap()[1];
+        assert_eq!((d.kind, d.auto_kind), (CompareKind::Date, CompareKind::DateTime));
+    }
+
+    #[test]
+    fn compare_sql_joins_and_compares_canonical_values_but_shows_the_originals() {
+        let r = reg();
+        let (b, a) = typed_pair(&r);
+        let sql = diff_sql_with(&b, &a, &["id".into()], &[], true).unwrap();
+        assert!(sql.contains("-- Compared as: id as number, d as date/time, amt as number, ok as boolean, raw as exact"), "{sql}");
+        // Keys join on the canonical value, changes compare canonical values.
+        assert!(sql.contains("ANTI JOIN a ON b.__cmp_0 = a.__cmp_0"), "{sql}");
+        assert!(sql.contains("b.__cmp_1 IS DISTINCT FROM a.__cmp_1"), "{sql}");
+        // A typed date parses natively, text is trimmed first; padding is trimmed.
+        assert!(sql.contains("try_cast(d AS TIMESTAMP)") && sql.contains("try_cast(trim(CAST(d AS VARCHAR)) AS TIMESTAMP)"), "{sql}");
+        assert!(sql.contains("trim(CAST(code AS VARCHAR)) AS __cmp_3"), "{sql}");
+        // Shown columns are the outputs' own, never the canonical helpers.
+        assert!(sql.contains("SELECT 'added' AS _change, b.id, b.d, b.amt, b.code, b.ok, b.raw FROM b"), "{sql}");
+        assert!(sql.contains("a.d AS \"d (before)\""), "{sql}");
+        // Without keys: a numbered multiset compare on the canonical values.
+        let nokey = diff_sql_with(&b, &a, &[], &[], true).unwrap();
+        assert!(nokey.contains("row_number() OVER (PARTITION BY __cmp_0, __cmp_1, __cmp_2, __cmp_3, __cmp_4, __cmp_5)"), "{nokey}");
+        assert!(nokey.contains("an.__cmp_1 IS NOT DISTINCT FROM bn.__cmp_1") && nokey.contains("an.__n = bn.__n"), "{nokey}");
+        assert!(!nokey.contains("EXCEPT"), "{nokey}");
+    }
+
+    #[test]
+    fn compare_options_change_the_sql_and_say_so() {
+        let r = reg();
+        let (b, a) = typed_pair(&r);
+        let o = CompareOptions { trim: false, ignore_case: true, empty_is_null: true, tolerance: Some(0.01), kinds: vec![] };
+        let sql = diff_sql_opts(&b, &a, &["id".into()], &[], true, &o).unwrap();
+        assert!(sql.contains("-- Options: spaces count, case ignored, empty text = NULL, numbers within 0.01 are equal"), "{sql}");
+        assert!(sql.contains("nullif(lower(CAST(code AS VARCHAR)), '')"), "{sql}");
+        assert!(sql.contains("abs(") && sql.contains("<= CAST(0.01 AS DECIMAL(38,10))"), "{sql}");
+        // Without keys a tolerance rounds instead.
+        let nokey = diff_sql_opts(&b, &a, &[], &[], true, &o).unwrap();
+        assert!(nokey.contains("round(") && !nokey.contains("abs("), "{nokey}");
+        for bad in [0.0, -1.0, f64::NAN] {
+            let o = CompareOptions { tolerance: Some(bad), ..Default::default() };
+            assert!(diff_sql_opts(&b, &a, &["id".into()], &[], true, &o).is_err(), "{bad}");
+        }
+        // Exact compares the values as given (no trimming).
+        let o = CompareOptions { kinds: vec![("code".into(), CompareKind::Exact)], ..Default::default() };
+        assert!(diff_sql_opts(&b, &a, &["id".into()], &[], true, &o).unwrap().contains("CAST(code AS VARCHAR) AS __cmp_3"));
     }
 }
