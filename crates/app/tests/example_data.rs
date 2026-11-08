@@ -463,24 +463,25 @@ async fn outputs_handles_cross_source_queries_diff_chart_and_pins() {
     assert_eq!(api::get_output(&st, "r3").unwrap().connection_name, "Results (DuckDB)");
 
     // 5) Diff the two versions by country: every country's revenue changed.
-    let diff = api::output_diff_sql(&st, "revenue__1", "revenue", vec!["country".into()], vec![], false).unwrap();
+    let diff = api::output_diff_sql(&st, "revenue__1", "revenue", vec!["country".into()], vec![], false, &Default::default()).unwrap();
     let rows = query(&st, &res, &diff).await;
     assert_eq!(rows.len(), 7, "{diff}");
     assert!(rows.iter().all(|r| r[0].as_deref() == Some("changed")));
-    let keyless = api::output_diff_sql(&st, "revenue__1", "revenue", vec![], vec![], false).unwrap();
+    let keyless = api::output_diff_sql(&st, "revenue__1", "revenue", vec![], vec![], false, &Default::default()).unwrap();
     assert_eq!(query(&st, &res, &keyless).await.len(), 14); // 7 removed + 7 added
 
     // 5b) Different column names: COUNTRY matches country (case), and the
     //     user pairs total ↔ revenue by hand.
     run_named(&st, &sq, "t5", "SELECT c.country AS COUNTRY, round(sum(o.total_amount), 2) AS total FROM orders o JOIN customers c USING (customer_id) WHERE o.status = 'delivered' GROUP BY 1", None, Some("renamed")).await;
-    let r = api::output_diff_sql(&st, "renamed", "revenue", vec!["country".into()], vec![], false).unwrap();
+    let r = api::output_diff_sql(&st, "renamed", "revenue", vec!["country".into()], vec![], false, &Default::default()).unwrap();
     assert!(r.contains("COUNTRY AS country") || r.contains("\"COUNTRY\" AS country"), "{r}");
     let rows = query(&st, &res, &r).await;
     assert!(rows.iter().all(|x| x[0].as_deref() != Some("changed")), "revenue is unmatched, so only keys compare: {r}");
-    let mapped = api::output_diff_sql(&st, "renamed", "revenue", vec!["country".into()], vec![("total".into(), "revenue".into())], false).unwrap();
+    let mapped =
+        api::output_diff_sql(&st, "renamed", "revenue", vec!["country".into()], vec![("total".into(), "revenue".into())], false, &Default::default()).unwrap();
     assert!(mapped.contains("total → revenue"), "{mapped}");
     assert_eq!(query(&st, &res, &mapped).await.len(), 0, "same data under other names: no differences\n{mapped}");
-    assert!(api::output_diff_sql(&st, "renamed", "revenue", vec![], vec![("nope".into(), "revenue".into())], false).is_err());
+    assert!(api::output_diff_sql(&st, "renamed", "revenue", vec![], vec![("nope".into(), "revenue".into())], false, &Default::default()).is_err());
     // Exact mapping: every pair given, COUNTRY ↔ country and total ↔ revenue together.
     let exact = api::output_diff_sql(
         &st,
@@ -489,6 +490,7 @@ async fn outputs_handles_cross_source_queries_diff_chart_and_pins() {
         vec!["country".into()],
         vec![("COUNTRY".into(), "country".into()), ("total".into(), "revenue".into())],
         true,
+        &Default::default(),
     )
     .unwrap();
     assert!(exact.contains("COUNTRY → country, total → revenue"), "{exact}");
@@ -529,4 +531,219 @@ async fn outputs_handles_cross_source_queries_diff_chart_and_pins() {
     let handles: Vec<u64> = api::list_outputs(&st2).iter().map(|o| o.handle[1..].parse().unwrap()).collect();
     assert_eq!(handles.iter().filter(|h| **h == 4).count(), 1, "{handles:?}");
     assert!(handles[0] > 8, "{handles:?}");
+}
+
+/// Compare outputs by meaning: a typed side (timestamps, decimals, padded
+/// text, booleans) against a side that has them all as text (SQLite) only
+/// reports real differences.
+#[tokio::test]
+async fn compare_outputs_ignores_how_each_database_types_values() {
+    use databrain_query_engine::outputs::{CompareKind, CompareOptions};
+    let st = state();
+    let res = api::results_connection(&st).unwrap();
+    let sq = sqlite_conn(&st);
+    run_named(
+        &st,
+        &res,
+        "typed",
+        "SELECT * FROM (VALUES \
+           (1, TIMESTAMP '2026-11-11 00:00:00', 10.50::DECIMAL(10,3), 'ABC  ', true), \
+           (2, TIMESTAMP '2026-11-12 08:30:00', 3.00::DECIMAL(10,3), 'x', false), \
+           (3, TIMESTAMP '2026-11-13 00:00:00', 5.004::DECIMAL(10,3), 'Zed', true)) t(id, d, amt, code, ok)",
+        None,
+        Some("typed"),
+    )
+    .await;
+    run_named(
+        &st,
+        &sq,
+        "text",
+        "SELECT '1' AS id, '2026-11-11' AS d, '10.5' AS amt, 'ABC' AS code, 'Y' AS ok \
+         UNION ALL SELECT '2', '2026-11-12 08:30:00', '3', 'x', '0' \
+         UNION ALL SELECT '3', ' 2026-11-13 ', '5.01', 'zed', '1' \
+         UNION ALL SELECT '4', 'n/a', 'abc', 'new', 'maybe'",
+        None,
+        Some("text"),
+    )
+    .await;
+    let diff =
+        |keys: &[&str], o: &CompareOptions| api::output_diff_sql(&st, "typed", "text", keys.iter().map(|k| k.to_string()).collect(), vec![], false, o).unwrap();
+    let changes = |rows: &[Vec<Option<String>>]| {
+        let mut v: Vec<String> = rows.iter().map(|r| format!("{} {}", r[0].as_deref().unwrap_or(""), r[1].as_deref().unwrap_or(""))).collect();
+        v.sort();
+        v
+    };
+
+    // By key: 1 and 2 are the same data; 3 really changed (amount, case); 4 is new.
+    let sql = diff(&["id"], &CompareOptions::default());
+    assert_eq!(changes(&query(&st, &res, &sql).await), ["added 4", "changed 3"], "{sql}");
+    // Without keys: only row 3 (both versions) and row 4 differ.
+    let sql = diff(&[], &CompareOptions::default());
+    assert_eq!(changes(&query(&st, &res, &sql).await), ["added 3", "added 4", "removed 3"], "{sql}");
+    // Ignoring case and a 0.01 tolerance: row 3 is the same too.
+    let loose = CompareOptions { ignore_case: true, tolerance: Some(0.01), ..Default::default() };
+    let sql = diff(&["id"], &loose);
+    assert_eq!(changes(&query(&st, &res, &sql).await), ["added 4"], "{sql}");
+    // Exact (as before): the date compares as text, so `2026-11-11 00:00:00`
+    // differs from `2026-11-11`; row 2's text happens to be written the same.
+    let exact = CompareOptions { kinds: vec![("d".into(), CompareKind::Exact)], ..Default::default() };
+    let sql = diff(&["id"], &exact);
+    assert_eq!(changes(&query(&st, &res, &sql).await), ["added 4", "changed 1", "changed 3"], "{sql}");
+
+    // The compare view: exact counts, per-column counts, and the rows.
+    let spec = |keys: &[&str], options: CompareOptions| api::CompareSpec {
+        before: "typed".into(),
+        after: "text".into(),
+        keys: keys.iter().map(|k| k.to_string()).collect(),
+        mapping: vec![],
+        exact: false,
+        options,
+    };
+    let outputs_before = api::list_outputs(&st).len();
+    let run = api::compare_outputs(&st, spec(&["id"], CompareOptions::default()), "cmp1").await.unwrap();
+    let s = &run.summary;
+    assert_eq!((s.before_rows, s.after_rows, s.same, s.changed, s.added, s.removed), (3, 4, 2, 1, 1, 0), "{s:?}");
+    assert_eq!((s.before_duplicate_keys, s.after_duplicate_keys), (0, 0));
+    let per: Vec<(&str, i64)> = s.columns.iter().map(|c| (c.column.as_str(), c.changed)).collect();
+    assert_eq!(per, [("d", 0), ("amt", 1), ("code", 1), ("ok", 0)]);
+    assert_eq!(run.keys, ["id"]);
+    assert_eq!(run.result.total_rows, 2);
+    // Only the diff rows became an output; the summary was dropped.
+    assert_eq!(api::list_outputs(&st).len(), outputs_before + 1);
+    let rows = query(&st, &res, &format!("SELECT _change, id, _changed FROM ({}) ORDER BY 1", run.sql.trim_end_matches(';'))).await;
+    assert_eq!(rows[1][0].as_deref(), Some("changed"));
+    assert_eq!(rows[1][2].as_deref(), Some("amt, code"), "{rows:?}");
+    // Duplicate keys are counted per side.
+    run_named(&st, &sq, "dup", "SELECT '1' AS id, 'x' AS code UNION ALL SELECT '1', 'y' UNION ALL SELECT '2', 'z'", None, Some("dup")).await;
+    let dup = api::compare_outputs(&st, api::CompareSpec { after: "dup".into(), ..spec(&["id"], CompareOptions::default()) }, "cmp2").await.unwrap();
+    assert_eq!((dup.summary.before_duplicate_keys, dup.summary.after_duplicate_keys), (0, 1), "{:?}", dup.summary);
+    // Without keys: whole rows; 2 equal, 1 removed, 2 added.
+    let nokey = api::compare_outputs(&st, spec(&[], CompareOptions::default()), "cmp3").await.unwrap();
+    let s = &nokey.summary;
+    assert_eq!((s.same, s.changed, s.added, s.removed), (2, 0, 2, 1), "{s:?}");
+    assert!(s.columns.is_empty());
+    assert!(api::compare_outputs(&st, spec(&["nope"], CompareOptions::default()), "cmp4").await.is_err());
+
+    // The dialog sees the pairs with their types and kinds.
+    let pairs = api::output_compare_pairs(&st, "typed", "text", vec![], false, &CompareOptions::default()).unwrap();
+    let d = pairs.iter().find(|p| p.after == "d").unwrap();
+    assert_eq!(d.kind, CompareKind::DateTime);
+    assert!(d.before_type.starts_with("Timestamp") && d.after_type == "Utf8", "{d:?}");
+}
+
+/// Compare a table straight from its database with a file: the SQLite
+/// One column compared with several: debit = debit, credit = credit and
+/// debit = credit, each with its own result column and count.
+#[tokio::test]
+async fn compare_one_column_with_several() {
+    let st = state();
+    let res = api::results_connection(&st).unwrap();
+    run_named(&st, &res, "ledger_a", "SELECT * FROM (VALUES (1, 10, 5), (2, 7, 7)) t(id, debit_amt, credit_amt)", None, Some("ledger_a")).await;
+    run_named(&st, &res, "ledger_b", "SELECT * FROM (VALUES (1, 10, 10), (2, 7, 7)) t(id, debit_amt, credit_amt)", None, Some("ledger_b")).await;
+    let pair = |b: &str, a: &str| (b.to_string(), a.to_string());
+    let spec = api::CompareSpec {
+        before: "ledger_a".into(),
+        after: "ledger_b".into(),
+        keys: vec!["id".into()],
+        mapping: vec![pair("id", "id"), pair("debit_amt", "debit_amt"), pair("credit_amt", "credit_amt"), pair("debit_amt", "credit_amt")],
+        exact: true,
+        options: Default::default(),
+    };
+    let run = api::compare_outputs(&st, spec, "cmp-several").await.unwrap();
+    let s = &run.summary;
+    assert_eq!((s.same, s.changed, s.added, s.removed), (1, 1, 0, 0), "{s:?}\n{}", run.sql);
+    let per: Vec<(&str, i64)> = s.columns.iter().map(|c| (c.column.as_str(), c.changed)).collect();
+    // Row 1: credit 5 → 10; debit (10) = credit (10) after.
+    assert_eq!(per, [("debit_amt", 0), ("credit_amt", 1), ("debit_amt → credit_amt", 0)], "{}", run.sql);
+    let names: Vec<&str> = run.result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"debit_amt → credit_amt") && names.contains(&"credit_amt (before)"), "{names:?}");
+}
+
+/// A time-zone timestamp (Databricks, Snowflake…: an instant in UTC) is the
+/// same as a plain one (Oracle) holding its UTC time, whatever the
+/// computer's time zone: DuckDB's own casts would use that zone instead.
+#[tokio::test]
+async fn compare_reads_time_zone_values_in_utc() {
+    let st = state();
+    let res = api::results_connection(&st).unwrap();
+    // As on a computer at +07:00 (needs ICU; without it DuckDB is always UTC).
+    let _ = st
+        .engine
+        .run_and_wait(
+            &st.hub,
+            RunRequest {
+                connection_id: res.clone(),
+                tab_id: "tz".into(),
+                sql: "SET TimeZone = 'Asia/Ho_Chi_Minh'".into(),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+                output_masks: None,
+            },
+            None,
+        )
+        .await;
+    run_named(&st, &res, "naive", "SELECT 1 AS id, TIMESTAMP '2026-11-04 00:00:00' AS d, TIMESTAMP '2026-11-04 10:00:00' AS t", None, Some("naive")).await;
+    run_named(&st, &res, "zoned", "SELECT '1' AS id, TIMESTAMPTZ '2026-11-04 00:00:00+00' AS d, '2026-11-04 17:00:00+07:00' AS t", None, Some("zoned")).await;
+    let zoned = api::list_outputs(&st).into_iter().find(|o| o.name.as_deref() == Some("zoned")).unwrap();
+    assert!(zoned.columns[1].data_type.starts_with("Timestamp("), "{:?}", zoned.columns[1]);
+    let sql = api::output_diff_sql(&st, "naive", "zoned", vec!["id".into()], vec![], false, &Default::default()).unwrap();
+    assert_eq!(query(&st, &res, &sql).await, Vec::<Vec<Option<String>>>::new(), "{sql}");
+    // A real change shows both values in UTC.
+    run_named(&st, &res, "later", "SELECT 1 AS id, TIMESTAMPTZ '2026-11-04 01:00:00+00' AS d, '2026-11-04 17:00:00+07:00' AS t", None, Some("later")).await;
+    let sql = api::output_diff_sql(&st, "naive", "later", vec!["id".into()], vec![], false, &Default::default()).unwrap();
+    let rows = query(&st, &res, &sql).await;
+    assert_eq!(rows.len(), 1, "{sql}");
+    let row: Vec<&str> = rows[0].iter().map(|c| c.as_deref().unwrap_or("NULL")).collect();
+    assert!(row.contains(&"changed") && row.iter().any(|c| c.starts_with("2026-11-04 01:00:00")) && row.contains(&"d"), "{row:?}");
+    assert!(!row.iter().any(|c| c.contains("08:00:00")), "{row:?}");
+}
+
+/// `customers` table and `customers.csv` hold the same rows, typed
+/// differently (dates and booleans as text in SQLite), so nothing differs.
+#[tokio::test]
+async fn compare_a_table_with_a_file_without_writing_queries() {
+    use databrain_query_engine::outputs::CompareOptions;
+    let st = state();
+    let sq = sqlite_conn(&st);
+    let table = api::CompareSource::Table { connection_id: sq.clone(), schema: "main".into(), table: "customers".into() };
+    let file = api::CompareSource::File { path: data("customers.csv"), sheet: None };
+    let before = api::compare_load_source(&st, table.clone(), "t", "before").await.unwrap();
+    let after = api::compare_load_source(&st, file, "t", "after").await.unwrap();
+    assert_eq!(before.connection_name, "shop.db");
+    assert_eq!(after.connection_name, "Results (DuckDB)");
+    assert_eq!(before.rows, after.rows);
+    assert!(before.rows > 0 && !before.truncated);
+
+    // The key: customer_id is unique and not NULL on both sides.
+    let keys = api::compare_suggest_keys(&st, &before.handle, &after.handle, vec![], false).await.unwrap();
+    assert_eq!(keys, ["customer_id"]);
+    let spec = api::CompareSpec {
+        before: before.handle.clone(),
+        after: after.handle.clone(),
+        keys,
+        mapping: vec![],
+        exact: false,
+        options: CompareOptions::default(),
+    };
+    let run = api::compare_outputs(&st, spec, "t").await.unwrap();
+    let s = &run.summary;
+    assert_eq!((s.changed, s.added, s.removed), (0, 0, 0), "{s:?}\n{}", run.sql);
+    assert_eq!(s.same, before.rows as i64);
+    assert!(run.sql.contains("signup_date as date/time") && run.sql.contains("is_vip as boolean"), "{}", run.sql);
+
+    // Reading a side again replaces the earlier read of that side.
+    let again = api::compare_load_source(&st, table, "t", "before").await.unwrap();
+    assert_ne!(again.handle, before.handle);
+    // Not SQL, a missing table and an unknown file type are refused.
+    assert!(
+        api::compare_load_source(&st, api::CompareSource::Table { connection_id: sq.clone(), schema: "main".into(), table: "nope".into() }, "t", "x")
+            .await
+            .is_err()
+    );
+    assert!(api::compare_load_source(&st, api::CompareSource::File { path: data("generate.sh"), sheet: None }, "t", "x").await.is_err());
 }

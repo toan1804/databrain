@@ -36,8 +36,21 @@ pub(crate) async fn output_diff_sql(
     keys: Vec<String>,
     mapping: Option<Vec<(String, String)>>,
     exact: Option<bool>,
+    options: Option<databrain_query_engine::outputs::CompareOptions>,
 ) -> R<String> {
-    api::output_diff_sql(&state, &before, &after, keys, mapping.unwrap_or_default(), exact.unwrap_or(false))
+    api::output_diff_sql(&state, &before, &after, keys, mapping.unwrap_or_default(), exact.unwrap_or(false), &options.unwrap_or_default())
+}
+
+#[tauri::command]
+pub(crate) async fn output_compare_pairs(
+    state: State<'_, AppState>,
+    before: String,
+    after: String,
+    mapping: Option<Vec<(String, String)>>,
+    exact: Option<bool>,
+    options: Option<databrain_query_engine::outputs::CompareOptions>,
+) -> R<Vec<databrain_query_engine::outputs::ComparePair>> {
+    api::output_compare_pairs(&state, &before, &after, mapping.unwrap_or_default(), exact.unwrap_or(false), &options.unwrap_or_default())
 }
 
 #[tauri::command]
@@ -63,4 +76,29 @@ pub(crate) async fn drop_output(state: State<'_, AppState>, reference: String) -
 #[tauri::command]
 pub(crate) async fn drop_unpinned_outputs(state: State<'_, AppState>) -> R<usize> {
     api::drop_unpinned_outputs(&state).await
+}
+
+#[tauri::command]
+pub(crate) async fn compare_outputs(state: State<'_, AppState>, spec: api::CompareSpec, tab_id: String) -> R<api::CompareRun> {
+    api::compare_outputs(&state, spec, &tab_id).await
+}
+
+#[tauri::command]
+pub(crate) async fn compare_load_source(state: State<'_, AppState>, source: api::CompareSource, tab_id: String, side: String) -> R<api::OutputInfo> {
+    let source = match source {
+        api::CompareSource::File { path, sheet } => api::CompareSource::File { path: paths::checked_str(&path, paths::Purpose::Read)?, sheet },
+        other => other,
+    };
+    api::compare_load_source(&state, source, &tab_id, &side).await
+}
+
+#[tauri::command]
+pub(crate) async fn compare_suggest_keys(
+    state: State<'_, AppState>,
+    before: String,
+    after: String,
+    mapping: Option<Vec<(String, String)>>,
+    exact: Option<bool>,
+) -> R<Vec<String>> {
+    api::compare_suggest_keys(&state, &before, &after, mapping.unwrap_or_default(), exact.unwrap_or(false)).await
 }

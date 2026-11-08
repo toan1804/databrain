@@ -15,6 +15,7 @@ export {
 } from "./store/index";
 export type {
   CompareRef,
+  DiffRef,
   ConfirmState,
   DdlRef,
   ErRef,

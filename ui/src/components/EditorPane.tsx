@@ -141,6 +141,7 @@ const DdlTab = lazy(() => import("./DdlTab").then((m) => ({ default: m.DdlTab })
 const JobTab = lazy(() => import("./JobTab").then((m) => ({ default: m.JobTab })));
 const LineageTab = lazy(() => import("./LineageTab").then((m) => ({ default: m.LineageTab })));
 const CompareTab = lazy(() => import("./CompareTab").then((m) => ({ default: m.CompareTab })));
+const OutputCompareTab = lazy(() => import("./OutputCompareTab").then((m) => ({ default: m.OutputCompareTab })));
 const ErTab = lazy(() => import("./ErTab").then((m) => ({ default: m.ErTab })));
 
 /**
@@ -163,6 +164,8 @@ const TabSlot = memo(function TabSlot({ tab: t, active }: { tab: Tab; active: bo
               ? ["dashboard", <DashboardTab tabId={t.id} visible={active} />]
               : t.compare
                 ? ["schema compare", <CompareTab tabId={t.id} visible={active} />]
+                : t.diff
+                  ? ["output compare", <OutputCompareTab tabId={t.id} visible={active} />]
                 : t.er
                   ? ["ER diagram", <ErTab tabId={t.id} visible={active} />]
                 : t.plan
@@ -279,7 +282,7 @@ function TabBar() {
               <Network size={12} className="shrink-0 text-muted" />
             ) : t.plan ? (
               <GitFork size={12} className="shrink-0 rotate-90 text-muted" />
-            ) : t.compare ? (
+            ) : t.compare || t.diff ? (
               <GitCompare size={12} className="shrink-0 text-muted" />
             ) : t.er ? (
               <Share2 size={12} className="shrink-0 text-muted" />

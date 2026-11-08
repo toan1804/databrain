@@ -1,4 +1,4 @@
-import type { AuthEvent, EngineError, ObjectKind, OutputInfo, ParamValue, PlannedStatement, ResultInfo, RunStatus, TabState } from "../lib/types";
+import type { AuthEvent, CompareSource, CompareSpec, EngineError, ObjectKind, OutputInfo, ParamValue, PlannedStatement, ResultInfo, RunStatus, TabState } from "../lib/types";
 import type { RunTips } from "../queryTips";
 import type { AppSlice } from "./appSlice";
 import type { ConnectionsSlice } from "./connectionsSlice";
@@ -25,6 +25,8 @@ export interface Tab extends TabState {
   plan?: PlanRef | null;
   /** Schema compare; not saved across restarts. */
   compare?: CompareRef | null;
+  /** Compare of two outputs (the data); not saved across restarts. */
+  diff?: DiffRef | null;
   /** ER diagram of a schema (on the tab's connection); not saved across restarts. */
   er?: ErRef | null;
   /** Dashboard of pinned charts (the dashboard is saved in settings). */
@@ -41,6 +43,13 @@ export interface ErRef {
 export interface CompareRef {
   source: { connection_id: string; schema: string } | null;
   target: { connection_id: string; schema: string } | null;
+}
+
+/** What an output compare tab compares (outputs, keys, columns, options). */
+export interface DiffRef {
+  spec: CompareSpec;
+  /** Sides read from a table or file: "Compare again" reads them again. */
+  sources?: { before?: CompareSource | null; after?: CompareSource | null };
 }
 
 /** Where a plan tab's statement came from. */
@@ -72,7 +81,7 @@ export interface DdlRef {
 }
 
 /** Tabs that hold an editable SQL editor (not notebooks, outputs or DDL views). */
-export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare && !t.er && !t.dashboard_id;
+export const isQueryTab = (t: Tab | undefined): t is Tab => !!t && !t.notebook_id && !t.output_ref && !t.ddl && !t.lineage && !t.job_id && !t.plan && !t.compare && !t.diff && !t.er && !t.dashboard_id;
 
 export type StatementStatus = "pending" | "running" | "done" | "error" | "cancelled";
 

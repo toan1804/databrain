@@ -1,5 +1,5 @@
-import { createContext, useContext, useEffect, useMemo, useState } from "react";
-import { pairColumns, parseMapping, setPair } from "../lib/compare";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { compareOptions, DEFAULT_COMPARE_FORM, formFromOptions, KIND_HELP, KIND_LABEL, addPair, changePair, pairColumns, parseMapping, parseTolerance, removePair, shortType, type ColumnPair, type CompareForm, type PairEdits } from "../lib/compare";
 import {
   AlertTriangle,
   AtSign,
@@ -13,9 +13,12 @@ import {
   PinOff,
   TerminalSquare,
   Trash2,
+  X,
 } from "lucide-react";
 import { api, toError } from "../lib/api";
-import type { OutputInfo } from "../lib/types";
+import type { CompareKind, ComparePair, CompareSource, CompareSpec, OutputInfo } from "../lib/types";
+import { CompareSide } from "./CompareSide";
+import { openOutputCompare } from "./openTabs";
 import { formatBytes, formatCount, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
 import {
@@ -24,7 +27,6 @@ import {
   formatAge,
   mentionInAi,
   openOutput,
-  openResultsQuery,
   outputLabel,
   outputRef,
   outputQuerySql,
@@ -201,12 +203,32 @@ export function OutputChip({
   );
 }
 
+/** Where each side was read from (a table or file), when not an output. */
+export type Sources = { before?: CompareSource | null; after?: CompareSource | null };
+
+/** The compare dialog opened from anywhere (explorer, result toolbar). */
+export function CompareDialogHost() {
+  const req = useStore((s) => s.compareDialog);
+  const close = useStore((s) => s.openCompareDialog);
+  if (!req) return null;
+  return <CompareDialog initial={req.initial} initialSources={{ before: req.before, after: req.after }} onClose={() => close(null)} />;
+}
+
 /** Pick two outputs + key columns, open a diff query on the Results connection. */
 export function CompareDialog({
   initial,
+  initialSpec,
+  initialSources,
+  onApply,
   onClose,
 }: {
   initial?: OutputInfo;
+  /** Edit an open compare: its outputs, keys, pairs and options. */
+  initialSpec?: CompareSpec;
+  /** Sides to read (a table, a file), or where the sides of `initialSpec` came from. */
+  initialSources?: Sources;
+  /** With `initialSpec`: called with the new choices (else a compare tab opens). */
+  onApply?: (spec: CompareSpec, sources: Sources) => void;
   onClose: () => void;
 }) {
   // Select the stored array and derive in a memo: a selector returning a new
@@ -216,7 +238,6 @@ export function CompareDialog({
     () => all.filter((o) => o.state !== "evicted"),
     [all],
   );
-  const toast = useStore((s) => s.toast);
   const defaultBefore = useMemo(() => {
     if (!initial) return outputs[1]?.handle ?? "";
     // Previous version of the same name, else the previous output of the same tab.
@@ -239,92 +260,152 @@ export function CompareDialog({
       )?.handle ?? ""
     );
   }, [initial, outputs]);
-  const [before, setBefore] = useState(defaultBefore);
+  const handleOf = (r: string) => outputs.find((o) => o.handle === r || o.name === r)?.handle ?? r;
+  // Sides still to be read (a table or file) start empty.
+  const toRead = (src?: CompareSource | null) => !!src && src.kind !== "output" && !initialSpec;
+  const [before, setBefore] = useState(initialSpec ? handleOf(initialSpec.before) : toRead(initialSources?.before) ? "" : defaultBefore);
   const [after, setAfter] = useState(
-    initial?.handle ?? outputs[0]?.handle ?? "",
+    initialSpec ? handleOf(initialSpec.after) : toRead(initialSources?.after) ? "" : (initial?.handle ?? outputs[0]?.handle ?? ""),
   );
+  const [sources, setSources] = useState<Sources>(() => ({ before: initialSources?.before ?? null, after: initialSources?.after ?? null }));
+  const toast = useStore((s) => s.toast);
+  // A complete table or file side (from the explorer) is read right away.
+  const autoRead = useRef(false);
+  useEffect(() => {
+    if (autoRead.current || initialSpec) return;
+    autoRead.current = true;
+    for (const side of ["before", "after"] as const) {
+      const src = initialSources?.[side];
+      const complete = src && (src.kind === "file" || (src.kind === "table" && src.connection_id));
+      if (!complete) continue;
+      void api
+        .compareLoadSource(src, "dialog", side)
+        .then(async (o) => {
+          await useStore.getState().refreshOutputs();
+          (side === "before" ? setBefore : setAfter)(o.handle);
+        })
+        .catch((e) => toast(toError(e).message, "error"));
+    }
+  }, [initialSources, initialSpec, toast]);
   const b = outputs.find((o) => o.handle === before);
   const a = outputs.find((o) => o.handle === after);
-  // Columns matched by name (any case) plus pairs the user adds.
-  const [manual, setManual] = useState<[string, string][]>([]);
-  /** After-side columns left out of the comparison. */
-  const [excluded, setExcluded] = useState<string[]>([]);
+  // Columns matched by name (any case), less the ones left out, plus pairs the user adds.
+  const [edits, setEdits] = useState<PairEdits>(() => {
+    if (!initialSpec) return { manual: [], excluded: [] };
+    // A compare being edited: exactly its pairs.
+    const cols = initialSpec.exact ? (outputs.find((o) => o.handle === handleOf(initialSpec.after))?.columns.map((c) => c.name) ?? []) : [];
+    return { manual: initialSpec.mapping, excluded: cols };
+  });
   const [typed, setTyped] = useState("");
   const [typedErrors, setTypedErrors] = useState<string[]>([]);
   const beforeCols = useMemo(() => b?.columns.map((c) => c.name) ?? [], [b]);
   const afterCols = useMemo(() => a?.columns.map((c) => c.name) ?? [], [a]);
-  const match = useMemo(() => pairColumns(beforeCols, afterCols, manual, excluded), [beforeCols, afterCols, manual, excluded]);
-  const choose = (after: string, before: string | null) => {
-    const next = setPair(manual, excluded, after, before);
-    setManual(next.manual);
-    setExcluded(next.excluded);
+  const match = useMemo(() => pairColumns(beforeCols, afterCols, edits.manual, edits.excluded), [beforeCols, afterCols, edits]);
+  const dropPair = (p: ColumnPair) => {
+    setEdits((st) => removePair(st, p));
+    setKeys((k) => k.filter((x) => x !== p.label));
   };
   const applyTyped = () => {
     const r = parseMapping(typed, beforeCols, afterCols);
-    let st = { manual, excluded };
-    for (const [bc, ac] of r.pairs) st = setPair(st.manual, st.excluded, ac, bc);
-    setManual(st.manual);
-    setExcluded(st.excluded);
+    // Added to the pairs already compared, never in place of them.
+    setEdits((st) => r.pairs.reduce((acc, [bc, ac]) => addPair(acc, bc, ac), st));
     setTypedErrors(r.errors);
     if (!r.errors.length) setTyped("");
   };
-  const common = useMemo(() => match.pairs.map((p) => p.after), [match]);
+  /** The pairs' result columns (keys and kinds are set on these). */
+  const common = useMemo(() => match.pairs.map((p) => p.label), [match]);
+  // Other outputs: start over (but not when the dialog opens on a compare).
+  const sides = useRef(`${before}\u0000${after}`);
   useEffect(() => {
-    setManual([]);
-    setExcluded([]);
+    const now = `${before}\u0000${after}`;
+    if (sides.current === now) return;
+    sides.current = now;
+    setEdits({ manual: [], excluded: [] });
     setTyped("");
     setTypedErrors([]);
+    setForm((f) => ({ ...f, kinds: {} }));
   }, [before, after]);
-  const [keys, setKeys] = useState<string[]>(() => {
-    const first = initial?.columns[0]?.name;
-    return first && /(^id$|_id$|^key$|^code$|name$|country|date)/i.test(first)
-      ? [first]
-      : [];
-  });
+  // How values compare: options for all columns, a kind per column.
+  const [form, setForm] = useState<CompareForm>(() => (initialSpec ? formFromOptions(initialSpec.options) : DEFAULT_COMPARE_FORM));
+  const tolerance = parseTolerance(form.tolerance);
+  const toleranceOk = !Number.isNaN(tolerance);
+  const options = useMemo(() => compareOptions(form, common), [form, common]);
+  /** Types and detected kinds of the matched pairs (from the backend). */
+  const [info, setInfo] = useState<ComparePair[]>([]);
+  useEffect(() => {
+    if (!a || !b || match.pairs.length === 0) return setInfo([]);
+    let alive = true;
+    api
+      .outputComparePairs(b.handle, a.handle, match.pairs.map((p) => [p.before, p.after] as [string, string]), true)
+      .then((p) => alive && setInfo(p))
+      .catch(() => alive && setInfo([]));
+    return () => {
+      alive = false;
+    };
+  }, [a, b, match]);
+  const setKind = (col: string, kind: CompareKind | "") =>
+    setForm((f) => {
+      const kinds = { ...f.kinds };
+      if (kind) kinds[col] = kind;
+      else delete kinds[col];
+      return { ...f, kinds };
+    });
+  const [keys, setKeys] = useState<string[]>(() => initialSpec?.keys ?? []);
+  /** Keys were suggested (not chosen by the user) for these two outputs. */
+  const [suggested, setSuggested] = useState<string | null>(null);
+  const keysTouched = useRef(!!initialSpec);
+  // Suggest keys for each new pair of outputs, until the user picks some:
+  // a table side's primary key, else columns unique on both sides.
+  useEffect(() => {
+    if (keysTouched.current || !a || !b || a.handle === b.handle || match.pairs.length === 0) return;
+    let alive = true;
+    const pairs = match.pairs.map((p) => [p.before, p.after] as [string, string]);
+    const viaPk = async (): Promise<string[]> => {
+      for (const side of ["before", "after"] as const) {
+        const src = sources[side];
+        if (src?.kind !== "table") continue;
+        const d = await api.describeObject(src.connection_id, src.schema, src.table).catch(() => null);
+        const pk = d?.columns.filter((c) => c.is_primary_key).map((c) => c.name) ?? [];
+        // As after-side names (the before side's PK maps through the pairs).
+        const names = pk.map((c) => match.pairs.find((p) => (side === "before" ? p.before : p.after) === c)?.label);
+        if (pk.length && names.every(Boolean)) return names as string[];
+      }
+      return [];
+    };
+    void (async () => {
+      const pk = await viaPk();
+      const found = pk.length ? pk : await api.compareSuggestKeys(b.handle, a.handle, pairs).catch(() => [] as string[]);
+      const k = Array.isArray(found) ? found : [];
+      if (!alive || keysTouched.current) return;
+      setKeys(k);
+      setSuggested(k.length ? (pk.length ? "the table's primary key" : "unique on both sides") : null);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [a, b, match, sources]);
 
-  const run = async () => {
+  const run = () => {
     if (!a || !b) return;
-    try {
-      const sql = await api.outputDiffSql(
-        b.handle,
-        a.handle,
-        keys.filter((k) => common.includes(k)),
-        // Every pair as shown (the user may have left some out).
-        match.pairs.map((p) => [p.before, p.after] as [string, string]),
-        true,
-      );
-      await openResultsQuery(sql, `Diff ${outputLabel(b)} → ${outputLabel(a)}`);
-      onClose();
-    } catch (e) {
-      toast(toError(e).message, "error");
-    }
+    const spec: CompareSpec = {
+      before: b.handle,
+      after: a.handle,
+      keys: keys.filter((k) => common.includes(k)),
+      // Every pair as shown (the user may have left some out).
+      mapping: match.pairs.map((p) => [p.before, p.after] as [string, string]),
+      exact: true,
+      options,
+    };
+    if (onApply) onApply(spec, sources);
+    else openOutputCompare(spec, `Compare ${outputLabel(b)} → ${outputLabel(a)}`, sources);
+    onClose();
   };
-
-  const pick = (value: string, set: (v: string) => void, label: string) => (
-    <label className="block">
-      <span className="mb-1 block text-[11.5px] font-medium text-muted">
-        {label}
-      </span>
-      <select
-        className="field"
-        value={value}
-        onChange={(e) => set(e.target.value)}
-      >
-        {outputs.map((o) => (
-          <option key={o.handle} value={o.handle}>
-            {outputLabel(o)} ({o.handle}) — {o.connection_name},{" "}
-            {formatCount(o.rows)} rows, {formatAge(o.created_at)}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
 
   return (
     <Modal
       title="Compare outputs"
       onClose={onClose}
-      width={560}
+      width={680}
       footer={
         <>
           <button className="btn-ghost" onClick={onClose}>
@@ -332,22 +413,38 @@ export function CompareDialog({
           </button>
           <button
             className="btn-primary"
-            disabled={!a || !b || a.handle === b.handle || common.length === 0}
-            onClick={() => void run()}
+            disabled={!a || !b || a.handle === b.handle || common.length === 0 || !toleranceOk}
+            onClick={run}
           >
-            <GitCompare size={14} /> Show differences
+            <GitCompare size={14} /> {onApply ? "Compare" : "Show differences"}
           </button>
         </>
       }
     >
       <div className="space-y-3 text-[12.5px]">
-        {pick(before, setBefore, "Before")}
-        {pick(after, setAfter, "After")}
+        <CompareSide
+          label="Before"
+          side="before"
+          value={before}
+          source={sources.before ?? null}
+          outputs={outputs}
+          onPick={(h, src) => (setBefore(h), setSources((x) => ({ ...x, before: src })))}
+        />
+        <CompareSide
+          label="After"
+          side="after"
+          value={after}
+          source={sources.after ?? null}
+          outputs={outputs}
+          onPick={(h, src) => (setAfter(h), setSources((x) => ({ ...x, after: src })))}
+        />
         <div>
           <div className="mb-1 text-[11.5px] font-medium text-muted">
             Key columns (match rows by)
           </div>
-          {common.length === 0 ? (
+          {!a || !b ? (
+            <p className="text-muted">Choose or read both sides to see their columns.</p>
+          ) : common.length === 0 ? (
             <p className="text-danger">
               No columns match by name. Match columns below to compare them.
             </p>
@@ -362,19 +459,22 @@ export function CompareDialog({
                     type="checkbox"
                     className="hidden"
                     checked={keys.includes(c)}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      keysTouched.current = true;
+                      setSuggested(null);
                       setKeys(
                         e.target.checked
                           ? [...keys, c]
                           : keys.filter((k) => k !== c),
-                      )
-                    }
+                      );
+                    }}
                   />
                   {c}
                 </label>
               ))}
             </div>
           )}
+          {suggested && keys.length > 0 && <p className="mt-1 text-[11.5px] text-accent">Suggested: {suggested}. Change it if rows match by something else.</p>}
           <p className="mt-1.5 text-[11.5px] text-muted">
             With keys: rows added, removed and changed (with before values).
             Without keys: whole rows that differ. Runs locally in DuckDB.
@@ -382,14 +482,44 @@ export function CompareDialog({
         </div>
 
         <div>
+          <div className="mb-1 text-[11.5px] font-medium text-muted">Values are equal when they mean the same</div>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[12px]">
+            <label className="flex items-center gap-1.5" title="CHAR padding and trailing spaces: 'ABC  ' = 'ABC'">
+              <input type="checkbox" checked={form.trim} onChange={(e) => setForm({ ...form, trim: e.target.checked })} /> Ignore spaces at the ends
+            </label>
+            <label className="flex items-center gap-1.5" title="'ABC' = 'abc'">
+              <input type="checkbox" checked={form.ignoreCase} onChange={(e) => setForm({ ...form, ignoreCase: e.target.checked })} /> Ignore case
+            </label>
+            <label className="flex items-center gap-1.5" title="An empty text equals NULL">
+              <input type="checkbox" checked={form.emptyIsNull} onChange={(e) => setForm({ ...form, emptyIsNull: e.target.checked })} /> Empty text = NULL
+            </label>
+            <label className="flex items-center gap-1.5" title={keys.length ? "Numbers this close are equal" : "Without keys, numbers are rounded to steps of this"}>
+              Number tolerance
+              <input
+                className={`field h-6 w-20 py-0 text-[11.5px] ${toleranceOk ? "" : "border-danger"}`}
+                inputMode="decimal"
+                placeholder="exact"
+                aria-label="Number tolerance"
+                value={form.tolerance}
+                onChange={(e) => setForm({ ...form, tolerance: e.target.value })}
+              />
+            </label>
+          </div>
+          {!toleranceOk && <p className="mt-1 text-[11.5px] text-danger">The tolerance must be a positive number, e.g. 0.01.</p>}
+          <p className="mt-1 text-[11.5px] text-muted">
+            Dates, numbers and booleans compare by value whatever type each database gave them (2026-11-11 00:00:00 = '2026-11-11', 10.50 = '10.5'). Change it per column below.
+          </p>
+        </div>
+
+        <div>
           <div className="mb-1 flex items-center text-[11.5px] font-medium text-muted">
             <span>
-              Matched columns ({match.pairs.length} of {afterCols.length})
+              Compared columns ({match.pairs.length})
             </span>
-            {(manual.length > 0 || excluded.length > 0) && (
+            {(edits.manual.length > 0 || edits.excluded.length > 0) && (
               <button
                 className="ml-auto text-[11px] font-normal text-accent hover:underline"
-                onClick={() => (setManual([]), setExcluded([]))}
+                onClick={() => setEdits({ manual: [], excluded: [] })}
               >
                 Reset to automatic
               </button>
@@ -402,44 +532,105 @@ export function CompareDialog({
                   <th className="px-2 py-1 text-left font-medium">After ({a ? outputLabel(a) : "…"})</th>
                   <th className="w-4" />
                   <th className="px-2 py-1 text-left font-medium">Before ({b ? outputLabel(b) : "…"})</th>
+                  <th className="px-2 py-1 text-left font-medium">Compare as</th>
                   <th className="px-2 py-1 text-right font-medium">How</th>
+                  <th className="w-6" />
                 </tr>
               </thead>
               <tbody>
-                {afterCols.map((ac) => {
-                  const p = match.pairs.find((x) => x.after === ac);
+                {match.pairs.map((p) => {
+                  const pi = info.find((x) => x.after === p.after && x.before === p.before);
+                  const types = pi && shortType(pi.before_type) !== shortType(pi.after_type) ? `${shortType(pi.before_type)} → ${shortType(pi.after_type)}` : null;
+                  const chosen = form.kinds[p.label];
                   return (
-                    <tr key={ac} className="border-t border-line/60">
-                      <td className="max-w-0 truncate px-2 py-0.5" title={ac}>
-                        {ac}
+                    <tr key={`${p.before}\u0000${p.after}`} className="border-t border-line/60">
+                      <td className="max-w-0 truncate px-2 py-0.5" title={p.label === p.after ? p.after : `${p.after} · shown as ${p.label}`}>
+                        {p.after}
                       </td>
                       <td className="text-center text-muted">←</td>
                       <td className="px-1 py-0.5">
                         <select
-                          className={`field h-6 w-full py-0 font-mono text-[11.5px] ${p ? "" : "text-muted"}`}
-                          aria-label={`Before column matched to ${ac}`}
-                          value={p?.before ?? ""}
-                          onChange={(e) => choose(ac, e.target.value || null)}
+                          className="field h-6 w-full py-0 font-mono text-[11.5px]"
+                          aria-label={`Before column matched to ${p.label}`}
+                          value={p.before}
+                          onChange={(e) => setEdits((st) => changePair(st, p, e.target.value))}
                         >
-                          <option value="">— not compared —</option>
-                          {beforeCols.map((bc) => {
-                            const other = match.pairs.find((x) => x.before === bc && x.after !== ac);
-                            return (
-                              <option key={bc} value={bc}>
-                                {bc}
-                                {other ? `  (now ↔ ${other.after})` : ""}
-                              </option>
-                            );
-                          })}
+                          {beforeCols.map((bc) => (
+                            <option key={bc} value={bc}>
+                              {bc}
+                            </option>
+                          ))}
                         </select>
                       </td>
+                      <td className="px-1 py-0.5 font-sans">
+                        {pi && (
+                          <>
+                            <select
+                              className="field h-6 w-full py-0 text-[11.5px]"
+                              aria-label={`Compare ${p.label} as`}
+                              title={KIND_HELP[chosen ?? pi.auto_kind]}
+                              value={chosen ?? ""}
+                              onChange={(e) => setKind(p.label, e.target.value as CompareKind | "")}
+                            >
+                              <option value="">Auto · {KIND_LABEL[pi.auto_kind]}</option>
+                              {(Object.keys(KIND_LABEL) as CompareKind[]).map((k) => (
+                                <option key={k} value={k}>
+                                  {KIND_LABEL[k]}
+                                </option>
+                              ))}
+                            </select>
+                            {types && (
+                              <div className="truncate text-[10.5px] text-muted" title={`${pi.before_type} → ${pi.after_type}`}>
+                                {types}
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </td>
                       <td className="whitespace-nowrap px-2 py-0.5 text-right font-sans text-[10.5px] text-muted">
-                        {!p ? "" : p.how === "same" ? "same name" : p.how === "case" ? "other case" : "by you"}
+                        {p.how === "same" ? "same name" : p.how === "case" ? "other case" : "by you"}
+                      </td>
+                      <td className="w-6 pr-1 text-right">
+                        <button
+                          className="rounded p-0.5 text-muted hover:bg-danger/10 hover:text-danger"
+                          aria-label={`Don't compare ${p.before} = ${p.after}`}
+                          title="Don't compare these columns"
+                          onClick={() => dropPair(p)}
+                        >
+                          <X size={12} />
+                        </button>
                       </td>
                     </tr>
                   );
                 })}
-              </tbody>
+                {match.onlyAfter.map((ac) => (
+                  <tr key={`only\u0000${ac}`} className="border-t border-line/60 text-muted">
+                    <td className="max-w-0 truncate px-2 py-0.5" title={ac}>
+                      {ac}
+                    </td>
+                    <td className="text-center">←</td>
+                    <td className="px-1 py-0.5">
+                      <select
+                        className="field h-6 w-full py-0 font-mono text-[11.5px] text-muted"
+                        aria-label={`Before column matched to ${ac}`}
+                        value=""
+                        onChange={(e) => e.target.value && setEdits((st) => addPair({ ...st, excluded: st.excluded.filter((x) => x !== ac) }, e.target.value, ac))}
+                      >
+                        <option value="">— not compared —</option>
+                        {beforeCols.map((bc) => (
+                          <option key={bc} value={bc}>
+                            {bc}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td />
+                    <td />
+                    <td />
+                  </tr>
+                ))}
+              
+</tbody>
             </table>
           </div>
           {match.onlyBefore.length > 0 && (
@@ -450,14 +641,14 @@ export function CompareDialog({
           <div className="mt-2 flex items-center gap-1.5">
             <input
               className="field h-7 min-w-0 flex-1 py-0 font-mono text-[11.5px]"
-              placeholder="Match several at once: a = a1, b = b2"
+              placeholder="Add pairs (before = after): debit_amt = credit_amt, b = b2"
               aria-label="Column pairs (before = after)"
               value={typed}
               onChange={(e) => setTyped(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && typed.trim() && applyTyped()}
             />
             <button className="btn-ghost shrink-0 border border-line py-1" disabled={!typed.trim()} onClick={applyTyped}>
-              Match
+              Add
             </button>
           </div>
           {typedErrors.length > 0 && (

@@ -2,7 +2,8 @@
 // ER diagram): kept apart from their components so that menus and editors
 // can open them without loading the components up front.
 import { traitsOf } from "../lib/sourceTraits";
-import { useStore, type CompareRef } from "../store";
+import type { CompareSpec } from "../lib/types";
+import { useStore, type CompareRef, type DiffRef } from "../store";
 import { editorBridge } from "../editorBridge";
 
 /**
@@ -38,6 +39,11 @@ type Side = NonNullable<CompareRef["source"]>;
 export function openCompare(source?: Side) {
   const st = useStore.getState();
   st.newTab({ title: "Compare schemas", sql: "", compare: { source: source ?? null, target: null }, connection_id: source?.connection_id ?? null });
+}
+
+/** Open a tab comparing the data of two outputs. */
+export function openOutputCompare(spec: CompareSpec, title: string, sources?: DiffRef["sources"]) {
+  useStore.getState().newTab({ title, sql: "", connection_id: null, diff: { spec, sources } });
 }
 
 /** Open (or show the open) ER diagram of a schema. */

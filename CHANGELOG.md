@@ -6,12 +6,20 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Compare tab: "Show hidden characters" shows changed cells character by character, so a no-break space, a tab, a zero-width space, a BOM, an accent written apart or a badly decoded `�` can be seen; the characters that differ are highlighted and named on hover. Values that only differ in such characters are flagged "unseen".
+- Compare outputs: one column can be compared with several (`debit_amt = debit_amt`, `credit_amt = credit_amt` and `debit_amt = credit_amt`); pairs typed under the columns are added next to the matched ones instead of replacing them, each with its own result column (`debit_amt → credit_amt`). Each compared pair has a ✕ to leave it out.
+- Compare tab: the Before card is red and the After card green, the same colours as the old → new values in changed cells, which now have a light red or green background.
+- Compare outputs: time-zone timestamps (Databricks, Snowflake, BigQuery…) compare and show in UTC, as the grid shows them, so `2026-11-04 00:00:00+00:00` equals an Oracle `2026-11-04 00:00:00` instead of becoming your computer's local time. Text with an offset (`…+07:00`, `…Z`) is read the same way.
+- Compare data without writing queries: a side of a compare can be a table on any SQL connection or a CSV, TSV, Parquet, JSON or Excel file, read when you pick it and again on "Compare again". Right-click a table → "Compare data with…" (the same table on another connection), or "Compare with…" in a result's toolbar. Key columns are suggested (the table's primary key, else columns unique on both sides).
+- Compare outputs opens a compare tab instead of a raw SQL query: counts of rows that are the same, changed, only before and only after (each one a filter), changed rows per column, changed cells shown as before → after, "Only columns that differ", a warning for duplicate keys, and Keys & columns, Compare again, Open SQL and As output.
+- Compare outputs: options "Ignore spaces at the ends", "Ignore case", "Empty text = NULL" and a number tolerance, and a "Compare as" choice per column (date/time, date only, number, text, boolean, exact) showing both columns' types.
 - The AI learns how tables join from query history (Edit connection → AI → "Learn from query history", on by default): join keys from queries you and your jobs ran, including tables without declared foreign keys, and which tables are used most. A join is given to the AI after 2 different queries or 2 days of use, or when you confirm it; the AI's own queries never count. Review, confirm, reject or forget them in Knowledge → "Learned from query history".
 - `find_join_path` tool (assistant and MCP): the shortest chains of joins between two tables over declared foreign keys and learned joins.
 - Clear history → "Also forget what the AI learned from history".
 
 ### Fixed
 
+- Compare outputs reported equal values as different when the two databases typed them differently: an Oracle `DATE` (`2026-11-11 00:00:00`) against `'2026-11-11'` as text, `10.50` against `'10.5'`, padded `CHAR` against `VARCHAR`, `1` against `'1'` as a key. Without keys every such row showed as removed and added; with keys, as changed on every column. Values now compare by meaning.
 - DuckDB: a tab or notebook opening a database file just as the last session on it closed could open a second instance on the file and miss tables written just before ("Table … does not exist") or fail with "No more data remaining in MetadataReader" (Linux). It now waits for the closing instance.
 
 ## 0.3.1 - 2026-11-04
