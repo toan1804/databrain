@@ -10,12 +10,12 @@ A desktop SQL client for many databases, with column lineage, scheduled jobs and
 
 | Platform | Installer |
 |---|---|
-| macOS (Apple Silicon) | [DataBrain_0.3.1_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.3.1/DataBrain_0.3.1_aarch64.dmg) |
-| macOS (Apple Silicon), without DuckDB | [DataBrain-no-duckdb_0.3.1_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.3.1/DataBrain-no-duckdb_0.3.1_aarch64.dmg) |
-| macOS (Intel) | [DataBrain_0.3.1_x64.dmg](https://github.com/toan1804/databrain/releases/download/v0.3.1/DataBrain_0.3.1_x64.dmg) |
-| Windows | [DataBrain_0.3.1_x64-setup.exe](https://github.com/toan1804/databrain/releases/download/v0.3.1/DataBrain_0.3.1_x64-setup.exe) |
-| Linux (AppImage) | [DataBrain_0.3.1_amd64.AppImage](https://github.com/toan1804/databrain/releases/download/v0.3.1/DataBrain_0.3.1_amd64.AppImage) |
-| Linux (Debian, Ubuntu) | [DataBrain_0.3.1_amd64.deb](https://github.com/toan1804/databrain/releases/download/v0.3.1/DataBrain_0.3.1_amd64.deb) |
+| macOS (Apple Silicon) | [DataBrain_0.3.2_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.3.2/DataBrain_0.3.2_aarch64.dmg) |
+| macOS (Apple Silicon), without DuckDB | [DataBrain-no-duckdb_0.3.2_aarch64.dmg](https://github.com/toan1804/databrain/releases/download/v0.3.2/DataBrain-no-duckdb_0.3.2_aarch64.dmg) |
+| macOS (Intel) | [DataBrain_0.3.2_x64.dmg](https://github.com/toan1804/databrain/releases/download/v0.3.2/DataBrain_0.3.2_x64.dmg) |
+| Windows | [DataBrain_0.3.2_x64-setup.exe](https://github.com/toan1804/databrain/releases/download/v0.3.2/DataBrain_0.3.2_x64-setup.exe) |
+| Linux (AppImage) | [DataBrain_0.3.2_amd64.AppImage](https://github.com/toan1804/databrain/releases/download/v0.3.2/DataBrain_0.3.2_amd64.AppImage) |
+| Linux (Debian, Ubuntu) | [DataBrain_0.3.2_amd64.deb](https://github.com/toan1804/databrain/releases/download/v0.3.2/DataBrain_0.3.2_amd64.deb) |
 
 All versions are on the [Releases](https://github.com/toan1804/databrain/releases) page, with a `SHA256SUMS` file to check downloads ([how](docs/RELEASING.md#checksums-and-provenance)). The app checks for updates once a day; signed releases install from its banner when you click Install (others link to the download).
 

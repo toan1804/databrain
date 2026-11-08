@@ -4,6 +4,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.3.2 - 2026-11-09
+
 ### Added
 
 - Settings → Editor: inline AI completion can use its own provider and model instead of the AI panel's, e.g. a local Ollama model while the assistant uses Kiro (which can't complete inline). A model chosen there is used over the provider's fast model.

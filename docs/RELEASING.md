@@ -18,7 +18,7 @@ Each installer and updater bundle gets a [build provenance attestation](https://
 
 ```sh
 shasum -a 256 -c SHA256SUMS --ignore-missing          # the file matches the release
-gh attestation verify DataBrain_0.3.1_aarch64.dmg --repo toan1804/databrain   # built by this repository's workflow
+gh attestation verify DataBrain_0.3.2_aarch64.dmg --repo toan1804/databrain   # built by this repository's workflow
 ```
 
 `SHA256SUMS` is written after the builds and `latest.json`; a file attached to the draft by hand afterwards is not in it (run the workflow again, or the checksums job, before publishing).
