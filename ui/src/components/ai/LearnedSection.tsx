@@ -4,7 +4,7 @@
 // to keep it as a note. Whether the AI gets a join is measured from use;
 // the only choice left to the user is to reject a wrong one (and undo it).
 import { useEffect, useMemo, useState } from "react";
-import { ChevronRight, History, Info, Loader2, NotebookPen, RefreshCw, RotateCcw, Search, Trash2, X } from "lucide-react";
+import { Check, ChevronRight, FileText, History, Info, Loader2, NotebookPen, RefreshCw, RotateCcw, Search, Trash2, X } from "lucide-react";
 import { api, toError } from "../../lib/api";
 import type { HistoryEntry, JoinStatus, LearnedJoinView, LearnedView } from "../../lib/types";
 import { formatCount, relativeTime } from "../../lib/util";
@@ -30,14 +30,22 @@ export function joinUsage(j: LearnedJoinView, now = Date.now()): string {
 }
 
 /** Where a join stands for the AI. */
-export type JoinState = "given" | "waiting" | "rejected";
+export type JoinState = "given" | "review" | "waiting" | "rejected";
 
-export function joinState(j: Pick<LearnedJoinView, "shown" | "status">): JoinState {
-  return j.status === "rejected" ? "rejected" : j.shown ? "given" : "waiting";
+export function joinState(j: Pick<LearnedJoinView, "shown" | "status" | "documented">): JoinState {
+  if (j.status === "rejected") return "rejected";
+  if (j.documented?.state === "proposed") return "review";
+  return j.shown ? "given" : "waiting";
+}
+
+/** "the AI", "an MCP client", "you" */
+export function documentedBy(by: string): string {
+  return by === "ai" ? "the AI" : by === "mcp" ? "an MCP client" : "you";
 }
 
 const STATES: { key: JoinState; label: string; dot: string; help: string }[] = [
   { key: "given", label: "Given to AI", dot: "bg-success", help: "The AI gets these joins: used in 2 different queries or on 2 different days" },
+  { key: "review", label: "To review", dot: "bg-warning", help: "Recorded by the AI from a document or what you said: approve or discard" },
   { key: "waiting", label: "Waiting", dot: "bg-muted/60", help: "Not used enough yet: given to the AI once used in another query or on another day" },
   { key: "rejected", label: "Rejected", dot: "bg-danger", help: "Never given to the AI" },
 ];
@@ -120,7 +128,7 @@ export function LearnedSection({
 
   const joins = useMemo(() => view?.joins ?? [], [view]);
   const counts = useMemo(() => {
-    const c: Record<JoinState, number> = { given: 0, waiting: 0, rejected: 0 };
+    const c: Record<JoinState, number> = { given: 0, review: 0, waiting: 0, rejected: 0 };
     for (const j of joins) c[joinState(j)] += 1;
     return c;
   }, [joins]);
@@ -169,6 +177,14 @@ export function LearnedSection({
       toast(toError(e).message, "error");
     }
   };
+  const review = async (j: LearnedJoinView, approve: boolean) => {
+    try {
+      await api.knReviewJoin(j.id, approve);
+      reload();
+    } catch (e) {
+      toast(toError(e).message, "error");
+    }
+  };
   const toggle = (j: LearnedJoinView) => {
     if (open === j.id) return setOpen(null);
     setOpen(j.id);
@@ -187,7 +203,10 @@ export function LearnedSection({
   if (!view.supported) {
     return <p className="text-[11.5px] text-muted">Not available for this type of database: its queries aren't SQL or MongoDB aggregations, so joins can't be read from them.</p>;
   }
-  if (!view.enabled) return <p className="text-[11.5px] text-muted">Off for this connection. Turn on “Learn from query history” in Edit connection → AI.</p>;
+  // Learning off: documented joins are still used.
+  if (!view.enabled && !joins.some((j) => j.documented)) {
+    return <p className="text-[11.5px] text-muted">Off for this connection. Turn on “Learn from query history” in Edit connection → AI.</p>;
+  }
 
   const about =
     "Join keys from queries you and your jobs ran. The AI gets a join once it is in 2 different queries or used on 2 days; its own queries never count. Reject a join that is wrong to keep it from the AI. Most used tables rank higher when the AI looks for tables.";
@@ -230,6 +249,7 @@ export function LearnedSection({
         </div>
       </div>
       {view.state?.error && <div className="text-[11.5px] text-danger">{view.state.error}</div>}
+      {!view.enabled && <p className="text-[11px] text-muted">Learning from query history is off for this connection: only documented joins are given to the AI.</p>}
 
       <div className="relative">
         <Search size={12} className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-muted" />
@@ -286,12 +306,26 @@ export function LearnedSection({
                         <span className="min-w-0 truncate">
                           <JoinLine j={j} hide={schema} />
                         </span>
+                        {j.documented && (
+                          <FileText size={11} className="shrink-0 text-accent" aria-label={`Documented in ${j.documented.source}`}>
+                            <title>{`Documented in ${j.documented.source} (recorded by ${documentedBy(j.documented.by)})`}</title>
+                          </FileText>
+                        )}
                       </button>
                       <span className="shrink-0 text-[10.5px] tabular-nums text-muted" title={joinUsage(j)}>
-                        {formatCount(j.queries)}×
+                        {j.queries > 0 || !j.documented ? `${formatCount(j.queries)}×` : "doc"}
                       </span>
-                      <div className="hidden shrink-0 items-center group-focus-within:flex group-hover:flex">
-                        {j.status === "rejected" ? (
+                      <div className={`${st === "review" ? "flex" : "hidden group-focus-within:flex group-hover:flex"} shrink-0 items-center`}>
+                        {st === "review" ? (
+                          <>
+                            <button className="icon-btn h-5 w-5 text-success" onClick={() => void review(j, true)} title="Approve: give it to the AI" aria-label="Approve">
+                              <Check size={12} />
+                            </button>
+                            <button className="icon-btn h-5 w-5" onClick={() => void review(j, false)} title="Discard what the AI recorded" aria-label="Discard">
+                              <X size={12} />
+                            </button>
+                          </>
+                        ) : j.status === "rejected" ? (
                           <button className="icon-btn h-5 w-5" onClick={() => void setStatus(j, "learned")} title="Undo reject: decide by how often it is used" aria-label="Undo reject">
                             <RotateCcw size={11} />
                           </button>
@@ -305,7 +339,19 @@ export function LearnedSection({
                     {isOpen && (
                       <div className="space-y-1.5 bg-panel-2/60 px-2 pb-2 pl-6 pt-1 text-[11px]">
                         <div className="break-all font-mono text-[11px]">{joinCondition(j)}</div>
-                        <div className="text-muted">{joinUsage(j)}</div>
+                        {j.documented && (
+                          <div className="flex items-start gap-1">
+                            <FileText size={11} className="mt-0.5 shrink-0 text-accent" />
+                            <span>
+                              Documented in <span className="font-medium">{j.documented.source}</span>
+                              <span className="text-muted">
+                                {" "}
+                                · recorded by {documentedBy(j.documented.by)} {relativeTime(j.documented.at)}
+                              </span>
+                            </span>
+                          </div>
+                        )}
+                        <div className="text-muted">{j.queries > 0 || !j.documented ? joinUsage(j) : "Not seen in queries yet"}</div>
                         <div>
                           {j.shown ? (
                             <span className="rounded bg-success/10 px-1 text-success">Given to the AI</span>
@@ -314,7 +360,17 @@ export function LearnedSection({
                           )}
                         </div>
                         <div className="flex flex-wrap gap-1">
-                          {j.status !== "rejected" && (
+                          {st === "review" && (
+                            <>
+                              <button className="btn-primary py-0 text-[11px]" onClick={() => void review(j, true)}>
+                                <Check size={11} /> Approve
+                              </button>
+                              <button className="btn-ghost border border-line py-0 text-[11px]" onClick={() => void review(j, false)} title="Discard what the AI recorded; what queries taught stays">
+                                <X size={11} /> Discard
+                              </button>
+                            </>
+                          )}
+                          {st !== "review" && j.status !== "rejected" && (
                             <button className="btn-ghost border border-line py-0 text-[11px]" onClick={() => void setStatus(j, "rejected")} title="A wrong join: never give it to the AI">
                               <X size={11} /> Reject
                             </button>
@@ -329,6 +385,7 @@ export function LearnedSection({
                             <NotebookPen size={11} /> Make note
                           </button>
                         </div>
+                        {(j.queries > 0 || j.ai_queries > 0 || !j.documented) && (
                         <div>
                           <div className="mb-0.5 flex items-center gap-1 text-muted">
                             <History size={11} /> Queries it came from
@@ -351,6 +408,7 @@ export function LearnedSection({
                             </div>
                           )}
                         </div>
+                        )}
                       </div>
                     )}
                   </div>

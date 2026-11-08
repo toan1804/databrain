@@ -40,7 +40,7 @@ pub use history::{
     AI_HISTORY_RETENTION_SETTING, HISTORY_LIMIT, HISTORY_RETENTION_DEFAULT_DAYS, HISTORY_RETENTION_SETTING, HistoryClear, HistoryEntry, HistoryQuery,
     NewHistory, RunStatus, history_terms,
 };
-pub use learned::{JoinSighting, JoinStatus, LearnState, LearnedJoin, TableUsage};
+pub use learned::{DocState, Documented, JoinDoc, JoinSighting, JoinStatus, LearnState, LearnedJoin, TableUsage};
 pub use library::{Folder, FolderKind, Origin, SavedQuery};
 pub use tabs_settings::TabState;
 

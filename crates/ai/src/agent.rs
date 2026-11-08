@@ -232,6 +232,9 @@ pub fn system_prompt(profile: &ConnectionProfile, server: Option<&str>, mode: Mo
          - When exploring teaches you something durable (what a code or status means, a business rule, the right join \
            path, a data caveat), record it with add_knowledge_note, or fix an outdated note with update_knowledge_note \
            (check list_knowledge_notes first). Keep notes short and factual; never store result values or personal data.\n\
+         - When the user tells you, or a document or data dictionary they give you says, which columns two tables join on, \
+           record it with add_knowledge_join (it is then used by find_join_path and describe_table) instead of a note. Never \
+           record a join you only guessed or tried yourself: joins used in real queries are learned from history.\n\
          - Be concise. Put SQL in ```sql fenced blocks.\n\n\
          Jobs (sidebar → Jobs): a job is a graph of steps run in order, by hand or on a schedule. Each step does one thing and its \
          result is an output named after the step: a query step runs SQL on one connection; a step on the \"Results\" (DuckDB) \

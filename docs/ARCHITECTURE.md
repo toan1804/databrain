@@ -354,6 +354,7 @@ Defined once in `specs()` in `crates/ai/src/tools.rs`, with hand-written JSON Sc
 | `list_outputs`, `query_outputs` | List outputs; DuckDB SQL over `results.<name>` | the source connection's policy |
 | `result_summary` | Columns, row count, column stats; rows (up to `max_rows_to_model`) only with `share_result_rows` | |
 | `list_knowledge_notes`, `add_knowledge_note`, `update_knowledge_note` | Notes and glossary | saved as proposed unless `auto_approve_notes` |
+| `add_knowledge_join` | A join written in a document or said by the user (tables and columns checked against the index, with its source); used by `find_join_path` and `describe_table` without being seen in queries | saved as proposed unless `auto_approve_notes`; a join the user rejected is not recorded |
 | `list_connections` | Connections the assistant may use, plus Results (DuckDB) | |
 | `list_jobs`, `get_job`, `create_job`, `update_job`, `run_job` | Read, create, change and run jobs (over MCP only `list_jobs` and `get_job`) | approval with a summary of what changes |
 | `save_query` | Save to saved queries | approval |

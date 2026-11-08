@@ -536,9 +536,11 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
 /// the table's columns are known.
 pub fn usable_joins(ws: &Workspace, profile: &ConnectionProfile) -> Result<Vec<LearnedJoin>> {
     let p = &profile.ai_policy;
-    if !p.learn_from_history || !p.share_metadata {
+    if !p.share_metadata {
         return Ok(vec![]);
     }
+    // With learning from history off, only documented joins.
+    let learning = p.learn_from_history;
     let mut known: HashMap<String, Option<Vec<String>>> = HashMap::new();
     let mut has = |table: &str, cols: &[String]| -> bool {
         let k = known.entry(table.to_lowercase()).or_insert_with(|| {
@@ -551,7 +553,8 @@ pub fn usable_joins(ws: &Workspace, profile: &ConnectionProfile) -> Result<Vec<L
     Ok(ws
         .learned_joins(&profile.id)?
         .into_iter()
-        .filter(|j| learn::surfaced(j) && !j.declared && readable(&j.left_table) && readable(&j.right_table))
+        .filter(|j| if learning { learn::surfaced(j) } else { j.status != databrain_workspace::JoinStatus::Rejected && learn::documented(j) })
+        .filter(|j| !j.declared && readable(&j.left_table) && readable(&j.right_table))
         .filter(|j| has(&j.left_table, &j.left_columns) && has(&j.right_table, &j.right_columns))
         .collect())
 }
@@ -591,8 +594,14 @@ fn side<'j>(j: &'j LearnedJoin, table: &str) -> Option<Side<'j>> {
 
 /// How often a learned join was used, for prompts.
 fn evidence(j: &LearnedJoin) -> String {
-    match j.status {
-        databrain_workspace::JoinStatus::Confirmed => "confirmed by the user".into(),
+    let used = match j.queries {
+        0 => String::new(),
+        1 => ", used in 1 past query".into(),
+        n => format!(", used in {n} past queries"),
+    };
+    match (&j.documented, j.status) {
+        (Some(d), _) if learn::documented(j) => format!("documented ({}){used}", d.source),
+        (_, databrain_workspace::JoinStatus::Confirmed) => "confirmed by the user".into(),
         _ if j.queries >= 2 => format!("learned from {} past queries", j.queries),
         _ => format!("learned from a past query run on {} days", j.days),
     }

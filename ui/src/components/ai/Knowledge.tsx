@@ -182,7 +182,12 @@ export function Knowledge() {
         <div className="flex border-b border-line" role="tablist" aria-label="Knowledge">
           {partTab("index", "Index", data?.state ? data.state.objects : null)}
           {partTab("notes", "Notes", approved.length, proposed.length)}
-          {partTab("learned", "Learned", learned?.enabled && learned.supported ? learned.joins.length : null)}
+          {partTab(
+            "learned",
+            "Learned",
+            learned?.supported && (learned.enabled || learned.joins.length > 0) ? learned.joins.length : null,
+            learned?.joins.filter((j) => j.status !== "rejected" && j.documented?.state === "proposed").length,
+          )}
         </div>
       </div>
       <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">

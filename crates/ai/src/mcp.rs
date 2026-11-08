@@ -228,6 +228,8 @@ fn annotations(name: &str) -> Value {
         // Refreshes DataBrain's own index of table descriptions.
         "index_tables" => (false, false, true),
         "add_knowledge_note" | "save_query" => (false, false, false),
+        // Recording the same join again changes nothing but its source.
+        "add_knowledge_join" => (false, false, true),
         // Replaces a note's text.
         "update_knowledge_note" => (false, true, true),
         // SQL (writes where the connection's AI policy allows them).

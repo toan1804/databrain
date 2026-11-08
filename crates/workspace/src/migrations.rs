@@ -356,6 +356,14 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         error           TEXT
     );
     "#,
+    // v17: joins documented by the user or the assistant (a data dictionary,
+    // a spec, the user saying so), not only learned from history
+    r#"
+    ALTER TABLE kn_joins ADD COLUMN doc_source TEXT;
+    ALTER TABLE kn_joins ADD COLUMN doc_by TEXT;
+    ALTER TABLE kn_joins ADD COLUMN doc_state TEXT;
+    ALTER TABLE kn_joins ADD COLUMN doc_at INTEGER;
+    "#,
 ];
 
 impl Workspace {

@@ -371,6 +371,7 @@ pub fn run() {
             commands::ai::kn_save_note,
             commands::ai::kn_learned,
             commands::ai::kn_set_join_status,
+            commands::ai::kn_review_join,
             commands::ai::kn_join_evidence,
             commands::ai::kn_learn_now,
             commands::ai::kn_forget_learned,

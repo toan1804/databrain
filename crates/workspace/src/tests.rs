@@ -157,7 +157,11 @@ fn schema_version_guard_and_backup() {
         let c = Connection::open(&path).unwrap();
         c.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64).unwrap();
         // Undo the last migration, as an older version left it.
-        c.execute_batch("DROP TABLE kn_join_seen; DROP TABLE kn_joins; DROP TABLE kn_table_seen; DROP TABLE kn_learn_state").unwrap();
+        c.execute_batch(
+            "ALTER TABLE kn_joins DROP COLUMN doc_source; ALTER TABLE kn_joins DROP COLUMN doc_by; \
+             ALTER TABLE kn_joins DROP COLUMN doc_state; ALTER TABLE kn_joins DROP COLUMN doc_at",
+        )
+        .unwrap();
     }
     let ws = Workspace::open(&path).unwrap();
     assert!(ws.learned_joins("any").unwrap().is_empty(), "migrated");

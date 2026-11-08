@@ -1389,3 +1389,64 @@ async fn index_tables_adds_missing_tables_after_approval() {
     assert_eq!(f.ws.kn_count(&f.conn).unwrap(), 2);
     assert!(f.ws.kn_state(&f.conn).unwrap().is_some_and(|s| s.objects == 2));
 }
+
+/// Joins written down in a document (or said by the user) are recorded
+/// against the knowledge index: real tables, real columns. The assistant's
+/// wait for review unless notes are saved directly; an MCP client's are
+/// marked as such; a join the user rejected is not recorded again.
+#[tokio::test]
+async fn documented_joins_are_checked_reviewed_and_used() {
+    let f = fixture(1, AiPolicy::default()).await;
+    let ctx = databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: f.ws.get_connection(&f.conn).unwrap(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+    };
+    let join = |left: &str, lc: &[&str], right: &str, rc: &[&str], source: &str| json!({"left_table": left, "left_columns": lc, "right_table": right, "right_columns": rc, "source": source});
+    // Checked: tables in the index, columns that exist, a source, matching sides.
+    let o = ctx.call("add_knowledge_join", &join("orders", &["nope"], "customers", &["id"], "spec")).await;
+    assert!(o.content.contains("has no column `nope`") && o.content.contains("customer_id"), "{}", o.content);
+    let o = ctx.call("add_knowledge_join", &join("invoices", &["id"], "customers", &["id"], "spec")).await;
+    assert!(o.content.contains("not in the knowledge index"), "{}", o.content);
+    let o = ctx.call("add_knowledge_join", &join("orders", &["country"], "customers", &["name"], " ")).await;
+    assert!(o.content.contains("source"), "{}", o.content);
+    let o = ctx.call("add_knowledge_join", &join("orders", &["country", "id"], "customers", &["name"], "spec")).await;
+    assert!(o.content.contains("same number of columns"), "{}", o.content);
+
+    // Recorded (columns in any case), waiting for the user.
+    let o = ctx.call("add_knowledge_join", &join("orders", &["COUNTRY"], "customers", &["Name"], "Shop data dictionary")).await;
+    assert!(o.content.contains("main.orders.country = main.customers.name") && o.content.contains("review"), "{}", o.content);
+    let o = ctx.call("describe_table", &json!({"table": "customers"})).await;
+    assert!(!o.content.contains("documented"), "not given before review: {}", o.content);
+    let j = f.ws.learned_joins(&f.conn).unwrap().into_iter().find(|j| j.documented.is_some()).unwrap();
+    let doc = j.documented.clone().unwrap();
+    assert_eq!((doc.by.as_str(), doc.state), ("ai", databrain_workspace::DocState::Proposed));
+    // Approved: describe_table and find_join_path use it, with its source, with no query seen.
+    f.ws.review_documented_join(j.id, true).unwrap();
+    let o = ctx.call("describe_table", &json!({"table": "customers"})).await;
+    assert!(o.content.contains("documented (Shop data dictionary)"), "{}", o.content);
+    let o = ctx.call("find_join_path", &json!({"from": "orders", "to": "customers"})).await;
+    assert!(o.content.contains("main.orders.country = main.customers.name  -- documented (Shop data dictionary)"), "{}", o.content);
+
+    // Rejected by the user: not recorded again.
+    f.ws.set_join_status(j.id, databrain_workspace::JoinStatus::Rejected).unwrap();
+    let o = ctx.call("add_knowledge_join", &join("customers", &["name"], "orders", &["country"], "another doc")).await;
+    assert!(o.content.contains("rejected"), "{}", o.content);
+
+    // An MCP client on a connection that saves AI notes directly.
+    let mut p = f.ws.get_connection(&f.conn).unwrap();
+    p.ai_policy.auto_approve_notes = true;
+    p.ai_policy.mcp_enabled = true;
+    let p = f.ws.save_connection(p).unwrap();
+    let mcp = databrain_ai::ToolContext { caller: databrain_ai::Caller::Mcp, profile: p, ..ctx };
+    let o = mcp.call("add_knowledge_join", &join("orders", &["id"], "customers", &["id"], "the user")).await;
+    assert!(o.content.contains("use it now"), "{}", o.content);
+    let j = f.ws.learned_joins(&f.conn).unwrap().into_iter().find(|j| j.left_columns == ["id"]).unwrap();
+    let doc = j.documented.unwrap();
+    assert_eq!((doc.by.as_str(), doc.state, doc.source.as_str()), ("mcp", databrain_workspace::DocState::Approved, "the user"));
+}
