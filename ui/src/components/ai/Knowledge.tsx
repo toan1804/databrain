@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Check, Database, FileDown, FileUp, ListChecks, Loader2, RefreshCw, Trash2, X } from "lucide-react";
 import { api, toError } from "../../lib/api";
-import type { KnNote, KnObject, KnowledgeView, NotesImportPreview } from "../../lib/types";
+import type { KnNote, KnObject, KnowledgeView, LearnedView, NotesImportPreview } from "../../lib/types";
 import { formatCount, relativeTime } from "../../lib/util";
 import { useStore } from "../../store";
 import { useAi } from "../../aiStore";
@@ -13,6 +13,18 @@ import { LearnedSection } from "./LearnedSection";
 
 /** Indexed tables shown at first and added by each "Show more". */
 const OBJECT_PAGE = 25;
+
+type Part = "index" | "notes" | "learned";
+const PART_KEY = "databrain.knowledge.part";
+
+function savedPart(): Part {
+  try {
+    const v = localStorage.getItem(PART_KEY);
+    return v === "notes" || v === "learned" ? v : "index";
+  } catch {
+    return "index";
+  }
+}
 
 export function Knowledge() {
   const connections = useStore((s) => s.connections);
@@ -30,6 +42,16 @@ export function Knowledge() {
   const [targetState, setTargetState] = useState<TargetState>({ status: "empty" });
   const targetOk = targetState.status === "empty" || targetState.status === "ok";
   const [importing, setImporting] = useState<NotesImportPreview | null>(null);
+  const [part, setPartState] = useState<Part>(savedPart);
+  const setPart = (p: Part) => {
+    setPartState(p);
+    try {
+      localStorage.setItem(PART_KEY, p);
+    } catch {
+      // Remembering the tab is a convenience only.
+    }
+  };
+  const [learned, setLearned] = useState<LearnedView | null>(null);
   const prog = connId ? progress[connId] : undefined;
   const connName = connections.find((c) => c.id === connId)?.name ?? "notes";
 
@@ -64,6 +86,15 @@ export function Knowledge() {
   }, [connId, toast]);
   // `version` bumps when knowledge changes elsewhere.
   useEffect(load, [load, version]);
+  const loadLearned = useCallback(() => {
+    if (!connId) return setLearned(null);
+    api
+      .knLearned(connId)
+      .then(setLearned)
+      .catch((e) => toast(toError(e).message, "error"));
+  }, [connId, toast]);
+  useEffect(() => setLearned(null), [connId]);
+  useEffect(loadLearned, [loadLearned, version]);
 
   // Indexed objects: one page at a time, filtered in the workspace DB (an
   // index can hold 10k+ tables; never load them all into the view).
@@ -117,19 +148,45 @@ export function Knowledge() {
   const proposed = data?.notes.filter((n) => n.status === "proposed") ?? [];
   const approved = data?.notes.filter((n) => n.status === "approved") ?? [];
 
-  return (
-    <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3 text-[12.5px]">
-      <div className="flex items-center gap-2">
-        <Database size={13} className="text-muted" />
-        <select className="field h-7 py-0" aria-label="Connection" value={connId ?? ""} onChange={(e) => setConnId(e.target.value || null)}>
-          {connections.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name}
-            </option>
-          ))}
-        </select>
-      </div>
+  const partTab = (p: Part, label: string, count: number | null, badge?: number) => (
+    <button
+      key={p}
+      role="tab"
+      aria-selected={part === p}
+      className={`-mb-px flex items-center gap-1 border-b-2 px-2 py-1.5 text-[12px] ${part === p ? "border-accent font-medium text-fg" : "border-transparent text-muted hover:text-fg"}`}
+      onClick={() => setPart(p)}
+    >
+      {label}
+      {count != null && <span className="text-[11px] tabular-nums text-muted">{formatCount(count)}</span>}
+      {!!badge && (
+        <span className="rounded-full bg-warning/20 px-1.5 text-[10px] font-semibold text-warning" title={`${badge} proposed by the AI to review`}>
+          {badge}
+        </span>
+      )}
+    </button>
+  );
 
+  return (
+    <div className="flex min-h-0 flex-1 flex-col text-[12.5px]">
+      <div className="shrink-0 space-y-2 px-3 pt-3">
+        <div className="flex items-center gap-2">
+          <Database size={13} className="text-muted" />
+          <select className="field h-7 min-w-0 flex-1 py-0" aria-label="Connection" value={connId ?? ""} onChange={(e) => setConnId(e.target.value || null)}>
+            {connections.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="flex border-b border-line" role="tablist" aria-label="Knowledge">
+          {partTab("index", "Index", data?.state ? data.state.objects : null)}
+          {partTab("notes", "Notes", approved.length, proposed.length)}
+          {partTab("learned", "Learned", learned?.enabled && learned.supported ? learned.joins.length : null)}
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
+      {part === "index" && (
       <div className="rounded-lg border border-line p-2.5">
         <div className="flex flex-wrap items-center gap-2">
           <div className="min-w-[9rem] flex-1">
@@ -195,8 +252,9 @@ export function Knowledge() {
           (Edit connection → AI).
         </p>
       </div>
+      )}
 
-      {proposed.length > 0 && (
+      {part === "notes" && proposed.length > 0 && (
         <div>
           <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted">Proposed by AI · review</div>
           {proposed.map((n) => {
@@ -223,6 +281,7 @@ export function Knowledge() {
         </div>
       )}
 
+      {part === "notes" && (
       <div>
         <div className="mb-1 flex flex-wrap items-center gap-1">
           <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">Notes & glossary</span>
@@ -288,9 +347,11 @@ export function Knowledge() {
         ))}
       </div>
 
-      {connId && <LearnedSection connId={connId} version={version} onMakeNote={(target, body) => saveNote({ target, body })} />}
+      )}
 
-      {objects && (objects.total > 0 || filter) && (
+      {part === "learned" && connId && <LearnedSection connId={connId} view={learned} reload={loadLearned} onMakeNote={(target, body) => saveNote({ target, body })} />}
+
+      {part === "index" && objects && (objects.total > 0 || filter) && (
         <div>
           <div className="mb-1 flex flex-wrap items-center gap-2">
             <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">Indexed objects</span>
@@ -318,6 +379,7 @@ export function Knowledge() {
           </div>
         </div>
       )}
+      </div>
     </div>
   );
 }

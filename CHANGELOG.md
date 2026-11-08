@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Knowledge tab: Index, Notes and Learned are separate tabs (Notes shows a badge for notes the AI proposed). Learned lists one join per line with a status dot, a filter by table or column and by status (given to the AI, waiting, rejected), confirm / reject / reset on the line, and the details, queries and "Make note" when you open it; a schema shared by every table is said once. Most used tables have their own list.
 - Compare tab: "Show hidden characters" shows changed cells character by character, so a no-break space, a tab, a zero-width space, a BOM, an accent written apart or a badly decoded `�` can be seen; the characters that differ are highlighted and named on hover. Values that only differ in such characters are flagged "unseen".
 - Compare outputs: one column can be compared with several (`debit_amt = debit_amt`, `credit_amt = credit_amt` and `debit_amt = credit_amt`); pairs typed under the columns are added next to the matched ones instead of replacing them, each with its own result column (`debit_amt → credit_amt`). Each compared pair has a ✕ to leave it out.
 - Compare tab: the Before card is red and the After card green, the same colours as the old → new values in changed cells, which now have a light red or green background.
