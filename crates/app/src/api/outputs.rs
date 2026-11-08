@@ -181,6 +181,151 @@ pub async fn compare_outputs(state: &AppState, spec: CompareSpec, tab_id: &str) 
     Ok(CompareRun { summary, result, sql, pairs, keys, before, after })
 }
 
+/// One side of a compare before it is an output: an output already there,
+/// a table read from its connection, or a file read by DuckDB.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompareSource {
+    Output {
+        reference: String,
+    },
+    /// `schema` is the explorer's schema id (`catalog.schema` on three-level engines).
+    Table {
+        connection_id: String,
+        schema: String,
+        table: String,
+    },
+    /// CSV, TSV, Parquet, JSON or Excel (`sheet`, else the first sheet with data).
+    File {
+        path: String,
+        sheet: Option<String>,
+    },
+}
+
+/// Rows read from a table or file for a compare.
+pub const COMPARE_SOURCE_ROW_LIMIT: usize = 1_000_000;
+
+/// The output a compare side stands for: an output as it is; a table or
+/// file read now (at most [`COMPARE_SOURCE_ROW_LIMIT`] rows, `truncated`
+/// when there were more). `side` (`before`/`after`) and `tab_id` group the
+/// runs, so reading again replaces the previous read.
+pub async fn compare_load_source(state: &AppState, source: CompareSource, tab_id: &str, side: &str) -> Result<OutputInfo> {
+    let (connection_id, sql) = match &source {
+        CompareSource::Output { reference } => return load_output(state, reference.clone()).await,
+        CompareSource::Table { connection_id, schema, table } => {
+            let kind = state.workspace.get_connection(connection_id)?.config.kind;
+            if !kind.traits().language.is_sql() {
+                return Err(EngineError::new("invalid", format!("comparing tables reads them with SQL; {} isn't a SQL database", kind.traits().name)));
+            }
+            (connection_id.clone(), databrain_connector_core::traits::preview_query(kind, schema, table, COMPARE_SOURCE_ROW_LIMIT))
+        }
+        CompareSource::File { path, sheet } => {
+            let scan = file_scan(path, sheet.as_deref())?;
+            (results_connection(state)?, format!("SELECT * FROM {scan} LIMIT {COMPARE_SOURCE_ROW_LIMIT}"))
+        }
+    };
+    let out = state
+        .engine
+        .run_and_wait(
+            &state.hub,
+            RunRequest {
+                connection_id,
+                tab_id: format!("compare:{tab_id}:{side}"),
+                sql,
+                base_offset: 0,
+                row_limit: Some(COMPARE_SOURCE_ROW_LIMIT),
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+                output_masks: None,
+            },
+            None,
+        )
+        .await?;
+    let first = out.into_iter().next().ok_or_else(|| EngineError::new("internal", "nothing was read"))?;
+    if let Some(e) = first.error {
+        return Err(e);
+    }
+    let r = first.result.ok_or_else(|| EngineError::new("internal", "the read returned no rows"))?;
+    state.engine.outputs().by_result(&r.id).ok_or_else(|| EngineError::new("internal", "the read made no output"))
+}
+
+/// DuckDB expression that reads a data file (an Excel sheet: `sheet`, else
+/// the first with data).
+#[cfg(feature = "duckdb-engine")]
+fn file_scan(path: &str, sheet: Option<&str>) -> Result<String> {
+    use databrain_connector_duckdb::{FileFormat, detect_format, excel_sources, file_scan_expr};
+    let fmt = detect_format(path)
+        .ok_or_else(|| EngineError::new("invalid", "unsupported file type (use .csv/.tsv/.parquet/.json/.ndjson/.xlsx or a Delta/Iceberg folder)"))?;
+    if fmt != FileFormat::Excel {
+        return Ok(file_scan_expr(path, fmt));
+    }
+    let sheets = excel_sources(path, true).map_err(|e| EngineError::new("invalid", e.to_string()))?;
+    let pick = match sheet {
+        Some(want) => sheets.into_iter().find(|(n, _)| n == want).ok_or_else(|| EngineError::new("invalid", format!("the workbook has no sheet {want}")))?,
+        None => sheets.into_iter().next().ok_or_else(|| EngineError::new("invalid", "every sheet in this workbook is empty"))?,
+    };
+    Ok(pick.1)
+}
+
+#[cfg(not(feature = "duckdb-engine"))]
+fn file_scan(path: &str, _sheet: Option<&str>) -> Result<String> {
+    Err(EngineError::new("invalid", format!("DuckDB support is not built in ({path})")))
+}
+
+/// Key columns to suggest for comparing two outputs: the first matched
+/// column (id-like names first), else the first pair of them, whose values
+/// are unique and not NULL on both sides. Empty when none is.
+pub async fn compare_suggest_keys(state: &AppState, before: &str, after: &str, mapping: Vec<(String, String)>, exact: bool) -> Result<Vec<String>> {
+    use databrain_query_engine::outputs as o;
+    let b = load_output(state, before.to_string()).await?;
+    let a = load_output(state, after.to_string()).await?;
+    let pairs = o::column_pairs_with(&b, &a, &mapping, !exact)?;
+    let cands = o::key_candidates(&pairs);
+    if cands.is_empty() {
+        return Ok(vec![]);
+    }
+    let sql = o::unique_check_sql(&b, &a, &pairs, &cands);
+    let conn = results_connection(state)?;
+    let out = state
+        .engine
+        .run_and_wait(
+            &state.hub,
+            RunRequest {
+                connection_id: conn,
+                tab_id: "compare:keys".into(),
+                sql,
+                base_offset: 0,
+                row_limit: Some(1),
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+                output_masks: None,
+            },
+            None,
+        )
+        .await?;
+    let first = out.into_iter().next().ok_or_else(|| EngineError::new("internal", "no answer"))?;
+    if let Some(e) = first.error {
+        return Err(e);
+    }
+    let r = first.result.ok_or_else(|| EngineError::new("internal", "no answer"))?;
+    let row = {
+        let rs = state.engine.results().get(&r.id).map_err(|e| EngineError::new("internal", e.to_string()))?;
+        let page = rs.lock().page(&ViewSpec::default(), 0, 1).map_err(|e| EngineError::new("internal", e.to_string()))?;
+        page.rows.into_iter().next().unwrap_or_default()
+    };
+    if let Some(h) = state.engine.outputs().by_result(&r.id).map(|x| x.handle) {
+        let _ = drop_output(state, h).await;
+    }
+    Ok(o::pick_key(&cands, &row))
+}
+
 /// Id of the local DuckDB connection for `results.*` queries.
 pub fn results_connection(state: &AppState) -> Result<String> {
     Ok(state.engine.results_connection()?.id)

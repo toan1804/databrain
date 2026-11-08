@@ -7,6 +7,7 @@ import { parseSnippets, type Snippet } from "../lib/snippets";
 import { parseViews, rememberQuickFilter, type QuickFilterEntry, type SavedView } from "../lib/gridViews";
 import { applyTheme, persistQuickFilters } from "./helpers";
 import type { ConfirmState, SidebarPanel, State, Theme, Toast } from "./types";
+import type { CompareSource, OutputInfo } from "../lib/types";
 
 let appearanceSave: ReturnType<typeof setTimeout> | undefined;
 
@@ -49,6 +50,16 @@ export interface UiSlice {
   setSettingsOpen: (open: boolean) => void;
   setPaletteOpen: (open: boolean) => void;
   askConfirm: (c: ConfirmState | null) => void;
+  /** The compare-outputs dialog, opened from anywhere (explorer, result toolbar). */
+  compareDialog: CompareRequest | null;
+  openCompareDialog: (r: CompareRequest | null) => void;
+}
+
+/** What the compare dialog starts with: an output, or table/file sides to read. */
+export interface CompareRequest {
+  initial?: OutputInfo;
+  before?: CompareSource;
+  after?: CompareSource;
 }
 
 export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) => ({
@@ -66,6 +77,7 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   sshHostKey: null,
   toasts: [],
   confirm: null,
+  compareDialog: null,
   paletteOpen: false,
   toast: (message, kind = "info") => {
     const id = uid();
@@ -127,4 +139,5 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
   setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
   askConfirm: (confirm) => set({ confirm }),
+  openCompareDialog: (compareDialog) => set({ compareDialog }),
 });

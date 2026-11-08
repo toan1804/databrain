@@ -1,5 +1,5 @@
 import type { Dispatch, SetStateAction } from "react";
-import { BarChart3, Braces, Download, Filter, ListFilter, Loader2, Pencil, Search, Sparkles, Table2, Upload, X } from "lucide-react";
+import { BarChart3, Braces, Download, Filter, GitCompare, ListFilter, Loader2, Pencil, Search, Sparkles, Table2, Upload, X } from "lucide-react";
 import type { SendInput } from "../../aiStore";
 import { OutputChip } from "../OutputChip";
 import { GridViewsMenu } from "../GridViewsMenu";
@@ -7,7 +7,7 @@ import { tableLabel } from "../../lib/gridViews";
 import { mentionInAi, outputLabel } from "../../outputs";
 import type { EditTarget, ResultInfo, ViewSpec } from "../../lib/types";
 import { filterLabel } from "../../lib/util";
-import type { StatementRun } from "../../store";
+import { useStore, type StatementRun } from "../../store";
 import { kbd } from "../../lib/platform";
 
 /** The result's toolbar: view mode, row filters, sort, find, value panel, AI, edit, load and export. */
@@ -177,6 +177,16 @@ export function ResultToolbar({
       >
         <Upload size={13} /> <span className="hidden @3xl:inline">Load into…</span>
       </button>
+      {stmt.output && (
+        <button
+          className="btn-ghost shrink-0 whitespace-nowrap border border-line py-1"
+          aria-label="Compare with…"
+          title="Compare this result with another result, a table or a file"
+          onClick={() => stmt.output && useStore.getState().openCompareDialog({ initial: stmt.output })}
+        >
+          <GitCompare size={13} /> <span className="hidden @3xl:inline">Compare with…</span>
+        </button>
+      )}
       <button
         className="btn-ghost shrink-0 whitespace-nowrap border border-line py-1"
         aria-label="Export"

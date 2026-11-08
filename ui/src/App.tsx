@@ -10,6 +10,7 @@ import { SaveQueryDialog } from "./components/SaveQueryDialog";
 import { ImportConnectionsDialog } from "./components/ConnectionsIoDialog";
 import { CommandPalette } from "./components/CommandPalette";
 import { ConfirmDialog, Toasts } from "./components/ui";
+import { CompareDialogHost } from "./components/OutputChip";
 import { AiPanel } from "./components/AiPanel";
 import { ExcelSheetDialog } from "./components/ExcelSheetDialog";
 import { SchemaPickerDialog } from "./components/SchemaPickerDialog";
@@ -229,6 +230,7 @@ export default function App() {
       <SshHostKeyDialog />
       <InlineAi />
       <ConfirmDialog />
+      <CompareDialogHost />
       <ExcelSheetDialog />
       <SchemaPickerDialog />
       <Toasts />

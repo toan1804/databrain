@@ -1377,6 +1377,77 @@ pub fn compare_keys(
     Ok(plan.key_idx.iter().map(|i| plan.pairs[*i].after.clone()).collect())
 }
 
+/// Columns that could be keys, as after-side names: id-like names first
+/// (`id`, `*_id`, `key`, `code`, `*_no`, `*number`), then the rest; at most 8.
+pub fn key_candidates(pairs: &[(String, String)]) -> Vec<String> {
+    let score = |n: &str| -> usize {
+        let l = n.to_ascii_lowercase();
+        if l == "id" {
+            0
+        } else if l.ends_with("_id") || (n.len() > 2 && n.ends_with("Id")) {
+            1
+        } else if matches!(l.as_str(), "key" | "code" | "uuid" | "guid")
+            || l.ends_with("_key")
+            || l.ends_with("_code")
+            || l.ends_with("_no")
+            || l.ends_with("number")
+        {
+            2
+        } else {
+            3
+        }
+    };
+    let mut v: Vec<(usize, usize, String)> = pairs.iter().enumerate().map(|(i, (_, a))| (score(a), i, a.clone())).collect();
+    v.sort();
+    v.into_iter().take(8).map(|(_, _, n)| n).collect()
+}
+
+/// One row: for each candidate, then each pair of the first four, `true`
+/// when it is unique and not NULL in both outputs.
+pub fn unique_check_sql(before: &OutputInfo, after: &OutputInfo, pairs: &[(String, String)], cands: &[String]) -> String {
+    let q = |s: &str| q_min(s);
+    let before_name = |a: &str| pairs.iter().find(|(_, x)| x == a).map(|(b, _)| b.clone()).unwrap_or_else(|| a.to_string());
+    let test = |cols: &[&String]| -> String {
+        let side = |names: Vec<String>, r: &str| {
+            let list = names.iter().map(|n| q(n)).collect::<Vec<_>>().join(", ");
+            let not_null = names.iter().map(|n| format!("{} IS NOT NULL", q(n))).collect::<Vec<_>>().join(" AND ");
+            format!("(SELECT count(*) = count(DISTINCT ({list})) AND bool_and({not_null}) FROM {r})")
+        };
+        format!(
+            "coalesce({} AND {}, false)",
+            side(cols.iter().map(|c| before_name(c)).collect(), &before.reference()),
+            side(cols.iter().map(|c| c.to_string()).collect(), &after.reference())
+        )
+    };
+    let mut exprs: Vec<String> = cands.iter().map(|c| test(&[c])).collect();
+    let head: Vec<&String> = cands.iter().take(4).collect();
+    for i in 0..head.len() {
+        for j in i + 1..head.len() {
+            exprs.push(test(&[head[i], head[j]]));
+        }
+    }
+    format!("SELECT {}", exprs.join(",\n  "))
+}
+
+/// The key [`unique_check_sql`]'s row says to use (`true`/`false` cells).
+pub fn pick_key(cands: &[String], row: &[Option<String>]) -> Vec<String> {
+    let yes = |i: usize| row.get(i).and_then(|v| v.as_deref()).is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    if let Some(i) = (0..cands.len()).find(|i| yes(*i)) {
+        return vec![cands[i].clone()];
+    }
+    let head = cands.len().min(4);
+    let mut k = cands.len();
+    for i in 0..head {
+        for j in i + 1..head {
+            if yes(k) {
+                return vec![cands[i].clone(), cands[j].clone()];
+            }
+            k += 1;
+        }
+    }
+    vec![]
+}
+
 /// Counts of a compare.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, ts_rs::TS)]
 #[ts(export)]
@@ -1749,5 +1820,30 @@ mod tests {
         // Exact compares the values as given (no trimming).
         let o = CompareOptions { kinds: vec![("code".into(), CompareKind::Exact)], ..Default::default() };
         assert!(diff_sql_opts(&b, &a, &["id".into()], &[], true, &o).unwrap().contains("CAST(code AS VARCHAR) AS __cmp_3"));
+    }
+
+    #[test]
+    fn key_candidates_put_id_like_names_first_and_the_check_picks_the_first_unique() {
+        let p = |v: &[&str]| v.iter().map(|n| (n.to_string(), n.to_string())).collect::<Vec<_>>();
+        let c = key_candidates(&p(&["name", "amount", "customerId", "order_no", "id", "region_code"]));
+        assert_eq!(c, ["id", "customerId", "order_no", "region_code", "name", "amount"]);
+        assert_eq!(key_candidates(&p(&["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"])).len(), 8);
+        let cands: Vec<String> = ["id", "order_no", "line"].iter().map(|s| s.to_string()).collect();
+        let t = |v: &[&str]| v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>();
+        // Singles first (id is not unique, order_no is).
+        assert_eq!(pick_key(&cands, &t(&["false", "true", "false", "true", "true", "true"])), ["order_no"]);
+        // No single: the first unique pair (id+order_no, id+line, order_no+line).
+        assert_eq!(pick_key(&cands, &t(&["false", "false", "false", "false", "true", "true"])), ["id", "line"]);
+        assert!(pick_key(&cands, &t(&["false"; 6])).is_empty());
+    }
+
+    #[test]
+    fn unique_check_reads_each_side_by_its_own_column_names() {
+        let r = reg();
+        let (b, a) = typed_pair(&r);
+        let pairs = vec![("id".to_string(), "ID".to_string()), ("code".to_string(), "code".to_string())];
+        let sql = unique_check_sql(&b, &a, &pairs, &["ID".to_string(), "code".to_string()]);
+        assert!(sql.contains("count(DISTINCT (id))") && sql.contains("count(DISTINCT (\"ID\"))"), "{sql}");
+        assert!(sql.contains("count(DISTINCT (id, code))"), "{sql}");
     }
 }

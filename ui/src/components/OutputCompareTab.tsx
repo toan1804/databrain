@@ -11,6 +11,7 @@ import { formatCount } from "../lib/util";
 import { openOutput, openResultsQuery, outputLabel } from "../outputs";
 import { useStore } from "../store";
 import { CompareDialog } from "./OutputChip";
+import { sourceLabel } from "./CompareSide";
 
 /** Rows fetched at first and per "Show more". */
 const PAGE = 200;
@@ -26,6 +27,8 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
   const updateTab = useStore((s) => s.updateTab);
   const toast = useStore((s) => s.toast);
   const outputs = useStore((s) => s.outputs);
+  const connections = useStore((s) => s.connections);
+  const connName = (id: string) => connections.find((c) => c.id === id)?.name;
   const spec = tab?.diff?.spec;
   const [run, setRun] = useState<CompareRun | null>(null);
   const [busy, setBusy] = useState(false);
@@ -37,6 +40,7 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
   const [viewRows, setViewRows] = useState(0);
   const [editing, setEditing] = useState(false);
 
+  const sources = tab?.diff?.sources;
   const compare = useCallback(async () => {
     if (!spec) return;
     setBusy(true);
@@ -90,13 +94,36 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
 
   if (!tab || !spec) return null;
   const s = run?.summary;
+  /** Compare again: tables and files are read again first. */
+  const again = async () => {
+    let next = spec;
+    setBusy(true);
+    try {
+      for (const side of ["before", "after"] as const) {
+        const src = sources?.[side];
+        if (!src || src.kind === "output") continue;
+        const o = await api.compareLoadSource(src, tabId, side);
+        next = { ...next, [side]: o.handle };
+      }
+    } catch (e) {
+      setBusy(false);
+      return setError(toError(e).message);
+    }
+    setBusy(false);
+    if (next === spec) void compare();
+    else updateTab(tab.id, { diff: { spec: next, sources } });
+  };
   const keyed = !!run?.keys.length;
-  const setSpec = (next: CompareSpec) => {
-    updateTab(tab.id, { diff: { spec: next } });
+  const setSpec = (next: CompareSpec, nextSources = sources) => {
+    updateTab(tab.id, { diff: { spec: next, sources: nextSources } });
     setFilter("all");
     setColumn(null);
   };
-  const swap = () => setSpec({ ...spec, before: spec.after, after: spec.before, mapping: spec.mapping.map(([b, a]) => [a, b] as [string, string]) });
+  const swap = () =>
+    setSpec(
+      { ...spec, before: spec.after, after: spec.before, mapping: spec.mapping.map(([b, a]) => [a, b] as [string, string]) },
+      { before: sources?.after ?? null, after: sources?.before ?? null },
+    );
   const resultOutput = run ? outputs.find((o) => o.result_id === run.result.id) : undefined;
   const pick = (f: DiffFilter, c: string | null = null) => {
     setFilter(f);
@@ -106,16 +133,16 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
   return (
     <div className="flex h-full min-h-0 flex-col text-[12.5px]" style={{ display: visible ? "flex" : "none" }}>
       <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-line px-3 py-2">
-        <Side label="Before" o={run?.before} fallback={spec.before} rows={s?.before_rows} />
+        <Side label="Before" o={run?.before} fallback={spec.before} rows={s?.before_rows} from={sourceLabel(sources?.before, connName)} />
         <button className="icon-btn" title="Swap before and after" aria-label="Swap before and after" onClick={swap}>
           <ArrowLeftRight size={14} />
         </button>
-        <Side label="After" o={run?.after} fallback={spec.after} rows={s?.after_rows} />
+        <Side label="After" o={run?.after} fallback={spec.after} rows={s?.after_rows} from={sourceLabel(sources?.after, connName)} />
         <div className="ml-auto flex flex-wrap gap-1.5">
           <button className="btn-ghost border border-line py-1" onClick={() => setEditing(true)} title="Keys, matched columns and how values compare">
             <Settings2 size={13} /> Keys & columns
           </button>
-          <button className="btn-ghost border border-line py-1" disabled={busy} onClick={() => void compare()} title="Compare the outputs again">
+          <button className="btn-ghost border border-line py-1" disabled={busy} onClick={() => void again()} title={sources?.before || sources?.after ? "Read the tables and files again, then compare" : "Compare the outputs again"}>
             {busy ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />} Compare again
           </button>
           {run && (
@@ -265,9 +292,10 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
       {editing && (
         <CompareDialog
           initialSpec={spec}
-          onApply={(next) => {
+          initialSources={sources}
+          onApply={(next, nextSources) => {
             setEditing(false);
-            setSpec(next);
+            setSpec(next, nextSources);
           }}
           onClose={() => setEditing(false)}
         />
@@ -276,12 +304,12 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
   );
 }
 
-function Side({ label, o, fallback, rows }: { label: string; o?: CompareRun["before"]; fallback: string; rows?: number }) {
+function Side({ label, o, fallback, rows, from }: { label: string; o?: CompareRun["before"]; fallback: string; rows?: number; from: string | null }) {
   return (
     <div className="min-w-0 rounded-md border border-line px-2 py-1">
       <div className="text-[10.5px] uppercase tracking-wide text-muted">{label}</div>
       <div className="truncate font-medium" title={o?.sql}>
-        {o ? `${outputLabel(o)} (${o.handle})` : fallback}
+        {from ?? (o ? `${outputLabel(o)} (${o.handle})` : fallback)}
       </div>
       <div className="text-[11px] text-muted">
         {o ? o.connection_name : ""}

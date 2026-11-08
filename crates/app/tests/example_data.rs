@@ -630,3 +630,49 @@ async fn compare_outputs_ignores_how_each_database_types_values() {
     assert_eq!(d.kind, CompareKind::DateTime);
     assert!(d.before_type.starts_with("Timestamp") && d.after_type == "Utf8", "{d:?}");
 }
+
+/// Compare a table straight from its database with a file: the SQLite
+/// `customers` table and `customers.csv` hold the same rows, typed
+/// differently (dates and booleans as text in SQLite), so nothing differs.
+#[tokio::test]
+async fn compare_a_table_with_a_file_without_writing_queries() {
+    use databrain_query_engine::outputs::CompareOptions;
+    let st = state();
+    let sq = sqlite_conn(&st);
+    let table = api::CompareSource::Table { connection_id: sq.clone(), schema: "main".into(), table: "customers".into() };
+    let file = api::CompareSource::File { path: data("customers.csv"), sheet: None };
+    let before = api::compare_load_source(&st, table.clone(), "t", "before").await.unwrap();
+    let after = api::compare_load_source(&st, file, "t", "after").await.unwrap();
+    assert_eq!(before.connection_name, "shop.db");
+    assert_eq!(after.connection_name, "Results (DuckDB)");
+    assert_eq!(before.rows, after.rows);
+    assert!(before.rows > 0 && !before.truncated);
+
+    // The key: customer_id is unique and not NULL on both sides.
+    let keys = api::compare_suggest_keys(&st, &before.handle, &after.handle, vec![], false).await.unwrap();
+    assert_eq!(keys, ["customer_id"]);
+    let spec = api::CompareSpec {
+        before: before.handle.clone(),
+        after: after.handle.clone(),
+        keys,
+        mapping: vec![],
+        exact: false,
+        options: CompareOptions::default(),
+    };
+    let run = api::compare_outputs(&st, spec, "t").await.unwrap();
+    let s = &run.summary;
+    assert_eq!((s.changed, s.added, s.removed), (0, 0, 0), "{s:?}\n{}", run.sql);
+    assert_eq!(s.same, before.rows as i64);
+    assert!(run.sql.contains("signup_date as date/time") && run.sql.contains("is_vip as boolean"), "{}", run.sql);
+
+    // Reading a side again replaces the earlier read of that side.
+    let again = api::compare_load_source(&st, table, "t", "before").await.unwrap();
+    assert_ne!(again.handle, before.handle);
+    // Not SQL, a missing table and an unknown file type are refused.
+    assert!(
+        api::compare_load_source(&st, api::CompareSource::Table { connection_id: sq.clone(), schema: "main".into(), table: "nope".into() }, "t", "x")
+            .await
+            .is_err()
+    );
+    assert!(api::compare_load_source(&st, api::CompareSource::File { path: data("generate.sh"), sheet: None }, "t", "x").await.is_err());
+}

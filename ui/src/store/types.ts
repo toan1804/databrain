@@ -1,4 +1,4 @@
-import type { AuthEvent, CompareSpec, EngineError, ObjectKind, OutputInfo, ParamValue, PlannedStatement, ResultInfo, RunStatus, TabState } from "../lib/types";
+import type { AuthEvent, CompareSource, CompareSpec, EngineError, ObjectKind, OutputInfo, ParamValue, PlannedStatement, ResultInfo, RunStatus, TabState } from "../lib/types";
 import type { RunTips } from "../queryTips";
 import type { AppSlice } from "./appSlice";
 import type { ConnectionsSlice } from "./connectionsSlice";
@@ -48,6 +48,8 @@ export interface CompareRef {
 /** What an output compare tab compares (outputs, keys, columns, options). */
 export interface DiffRef {
   spec: CompareSpec;
+  /** Sides read from a table or file: "Compare again" reads them again. */
+  sources?: { before?: CompareSource | null; after?: CompareSource | null };
 }
 
 /** Where a plan tab's statement came from. */

@@ -14,8 +14,9 @@ import {
   TerminalSquare,
   Trash2,
 } from "lucide-react";
-import { api } from "../lib/api";
-import type { CompareKind, ComparePair, CompareSpec, OutputInfo } from "../lib/types";
+import { api, toError } from "../lib/api";
+import type { CompareKind, ComparePair, CompareSource, CompareSpec, OutputInfo } from "../lib/types";
+import { CompareSide } from "./CompareSide";
 import { openOutputCompare } from "./openTabs";
 import { formatBytes, formatCount, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
@@ -201,18 +202,32 @@ export function OutputChip({
   );
 }
 
+/** Where each side was read from (a table or file), when not an output. */
+export type Sources = { before?: CompareSource | null; after?: CompareSource | null };
+
+/** The compare dialog opened from anywhere (explorer, result toolbar). */
+export function CompareDialogHost() {
+  const req = useStore((s) => s.compareDialog);
+  const close = useStore((s) => s.openCompareDialog);
+  if (!req) return null;
+  return <CompareDialog initial={req.initial} initialSources={{ before: req.before, after: req.after }} onClose={() => close(null)} />;
+}
+
 /** Pick two outputs + key columns, open a diff query on the Results connection. */
 export function CompareDialog({
   initial,
   initialSpec,
+  initialSources,
   onApply,
   onClose,
 }: {
   initial?: OutputInfo;
   /** Edit an open compare: its outputs, keys, pairs and options. */
   initialSpec?: CompareSpec;
+  /** Sides to read (a table, a file), or where the sides of `initialSpec` came from. */
+  initialSources?: Sources;
   /** With `initialSpec`: called with the new choices (else a compare tab opens). */
-  onApply?: (spec: CompareSpec) => void;
+  onApply?: (spec: CompareSpec, sources: Sources) => void;
   onClose: () => void;
 }) {
   // Select the stored array and derive in a memo: a selector returning a new
@@ -245,10 +260,32 @@ export function CompareDialog({
     );
   }, [initial, outputs]);
   const handleOf = (r: string) => outputs.find((o) => o.handle === r || o.name === r)?.handle ?? r;
-  const [before, setBefore] = useState(initialSpec ? handleOf(initialSpec.before) : defaultBefore);
+  // Sides still to be read (a table or file) start empty.
+  const toRead = (src?: CompareSource | null) => !!src && src.kind !== "output" && !initialSpec;
+  const [before, setBefore] = useState(initialSpec ? handleOf(initialSpec.before) : toRead(initialSources?.before) ? "" : defaultBefore);
   const [after, setAfter] = useState(
-    initialSpec ? handleOf(initialSpec.after) : (initial?.handle ?? outputs[0]?.handle ?? ""),
+    initialSpec ? handleOf(initialSpec.after) : toRead(initialSources?.after) ? "" : (initial?.handle ?? outputs[0]?.handle ?? ""),
   );
+  const [sources, setSources] = useState<Sources>(() => ({ before: initialSources?.before ?? null, after: initialSources?.after ?? null }));
+  const toast = useStore((s) => s.toast);
+  // A complete table or file side (from the explorer) is read right away.
+  const autoRead = useRef(false);
+  useEffect(() => {
+    if (autoRead.current || initialSpec) return;
+    autoRead.current = true;
+    for (const side of ["before", "after"] as const) {
+      const src = initialSources?.[side];
+      const complete = src && (src.kind === "file" || (src.kind === "table" && src.connection_id));
+      if (!complete) continue;
+      void api
+        .compareLoadSource(src, "dialog", side)
+        .then(async (o) => {
+          await useStore.getState().refreshOutputs();
+          (side === "before" ? setBefore : setAfter)(o.handle);
+        })
+        .catch((e) => toast(toError(e).message, "error"));
+    }
+  }, [initialSources, initialSpec, toast]);
   const b = outputs.find((o) => o.handle === before);
   const a = outputs.find((o) => o.handle === after);
   // Columns matched by name (any case) plus pairs the user adds.
@@ -316,13 +353,40 @@ export function CompareDialog({
       else delete kinds[col];
       return { ...f, kinds };
     });
-  const [keys, setKeys] = useState<string[]>(() => {
-    if (initialSpec) return initialSpec.keys;
-    const first = initial?.columns[0]?.name;
-    return first && /(^id$|_id$|^key$|^code$|name$|country|date)/i.test(first)
-      ? [first]
-      : [];
-  });
+  const [keys, setKeys] = useState<string[]>(() => initialSpec?.keys ?? []);
+  /** Keys were suggested (not chosen by the user) for these two outputs. */
+  const [suggested, setSuggested] = useState<string | null>(null);
+  const keysTouched = useRef(!!initialSpec);
+  // Suggest keys for each new pair of outputs, until the user picks some:
+  // a table side's primary key, else columns unique on both sides.
+  useEffect(() => {
+    if (keysTouched.current || !a || !b || a.handle === b.handle || match.pairs.length === 0) return;
+    let alive = true;
+    const pairs = match.pairs.map((p) => [p.before, p.after] as [string, string]);
+    const viaPk = async (): Promise<string[]> => {
+      for (const side of ["before", "after"] as const) {
+        const src = sources[side];
+        if (src?.kind !== "table") continue;
+        const d = await api.describeObject(src.connection_id, src.schema, src.table).catch(() => null);
+        const pk = d?.columns.filter((c) => c.is_primary_key).map((c) => c.name) ?? [];
+        // As after-side names (the before side's PK maps through the pairs).
+        const names = pk.map((c) => match.pairs.find((p) => (side === "before" ? p.before : p.after) === c)?.after);
+        if (pk.length && names.every(Boolean)) return names as string[];
+      }
+      return [];
+    };
+    void (async () => {
+      const pk = await viaPk();
+      const found = pk.length ? pk : await api.compareSuggestKeys(b.handle, a.handle, pairs).catch(() => [] as string[]);
+      const k = Array.isArray(found) ? found : [];
+      if (!alive || keysTouched.current) return;
+      setKeys(k);
+      setSuggested(k.length ? (pk.length ? "the table's primary key" : "unique on both sides") : null);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [a, b, match, sources]);
 
   const run = () => {
     if (!a || !b) return;
@@ -335,30 +399,10 @@ export function CompareDialog({
       exact: true,
       options,
     };
-    if (onApply) onApply(spec);
-    else openOutputCompare(spec, `Compare ${outputLabel(b)} → ${outputLabel(a)}`);
+    if (onApply) onApply(spec, sources);
+    else openOutputCompare(spec, `Compare ${outputLabel(b)} → ${outputLabel(a)}`, sources);
     onClose();
   };
-
-  const pick = (value: string, set: (v: string) => void, label: string) => (
-    <label className="block">
-      <span className="mb-1 block text-[11.5px] font-medium text-muted">
-        {label}
-      </span>
-      <select
-        className="field"
-        value={value}
-        onChange={(e) => set(e.target.value)}
-      >
-        {outputs.map((o) => (
-          <option key={o.handle} value={o.handle}>
-            {outputLabel(o)} ({o.handle}) — {o.connection_name},{" "}
-            {formatCount(o.rows)} rows, {formatAge(o.created_at)}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
 
   return (
     <Modal
@@ -381,13 +425,29 @@ export function CompareDialog({
       }
     >
       <div className="space-y-3 text-[12.5px]">
-        {pick(before, setBefore, "Before")}
-        {pick(after, setAfter, "After")}
+        <CompareSide
+          label="Before"
+          side="before"
+          value={before}
+          source={sources.before ?? null}
+          outputs={outputs}
+          onPick={(h, src) => (setBefore(h), setSources((x) => ({ ...x, before: src })))}
+        />
+        <CompareSide
+          label="After"
+          side="after"
+          value={after}
+          source={sources.after ?? null}
+          outputs={outputs}
+          onPick={(h, src) => (setAfter(h), setSources((x) => ({ ...x, after: src })))}
+        />
         <div>
           <div className="mb-1 text-[11.5px] font-medium text-muted">
             Key columns (match rows by)
           </div>
-          {common.length === 0 ? (
+          {!a || !b ? (
+            <p className="text-muted">Choose or read both sides to see their columns.</p>
+          ) : common.length === 0 ? (
             <p className="text-danger">
               No columns match by name. Match columns below to compare them.
             </p>
@@ -402,19 +462,22 @@ export function CompareDialog({
                     type="checkbox"
                     className="hidden"
                     checked={keys.includes(c)}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      keysTouched.current = true;
+                      setSuggested(null);
                       setKeys(
                         e.target.checked
                           ? [...keys, c]
                           : keys.filter((k) => k !== c),
-                      )
-                    }
+                      );
+                    }}
                   />
                   {c}
                 </label>
               ))}
             </div>
           )}
+          {suggested && keys.length > 0 && <p className="mt-1 text-[11.5px] text-accent">Suggested: {suggested}. Change it if rows match by something else.</p>}
           <p className="mt-1.5 text-[11.5px] text-muted">
             With keys: rows added, removed and changed (with before values).
             Without keys: whole rows that differ. Runs locally in DuckDB.

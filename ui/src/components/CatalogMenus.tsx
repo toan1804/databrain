@@ -165,6 +165,20 @@ export function ObjectMenu({
       <MenuItem icon={<TextCursorInput size={13} />} label="Insert table path" onClick={run(() => insertText(path))} />
       {isRelation && <MenuItem icon={<Columns3 size={13} />} label="Insert column names" onClick={run(() => void insertColumns(conn, obj))} />}
       {isRelation && onSelectTop && <MenuItem icon={<Play size={13} />} label="Select top 100 rows" onClick={run(onSelectTop)} />}
+      {isRelation && traitsOf(kind).language === "sql" && (
+        <MenuItem
+          icon={<GitCompare size={13} />}
+          label="Compare data with…"
+          hint="another table or file"
+          onClick={run(() =>
+            useStore.getState().openCompareDialog({
+              before: { kind: "table", connection_id: conn.id, schema: obj.schema, table: obj.name },
+              // The same table on a connection you pick (a copy, another environment).
+              after: { kind: "table", connection_id: "", schema: obj.schema, table: obj.name },
+            }),
+          )}
+        />
+      )}
       {obj.kind !== "other" && (
         <>
           <MenuSeparator />

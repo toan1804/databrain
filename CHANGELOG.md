@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Compare data without writing queries: a side of a compare can be a table on any SQL connection or a CSV, TSV, Parquet, JSON or Excel file, read when you pick it and again on "Compare again". Right-click a table → "Compare data with…" (the same table on another connection), or "Compare with…" in a result's toolbar. Key columns are suggested (the table's primary key, else columns unique on both sides).
 - Compare outputs opens a compare tab instead of a raw SQL query: counts of rows that are the same, changed, only before and only after (each one a filter), changed rows per column, changed cells shown as before → after, "Only columns that differ", a warning for duplicate keys, and Keys & columns, Compare again, Open SQL and As output.
 - Compare outputs: options "Ignore spaces at the ends", "Ignore case", "Empty text = NULL" and a number tolerance, and a "Compare as" choice per column (date/time, date only, number, text, boolean, exact) showing both columns' types.
 - The AI learns how tables join from query history (Edit connection → AI → "Learn from query history", on by default): join keys from queries you and your jobs ran, including tables without declared foreign keys, and which tables are used most. A join is given to the AI after 2 different queries or 2 days of use, or when you confirm it; the AI's own queries never count. Review, confirm, reject or forget them in Knowledge → "Learned from query history".

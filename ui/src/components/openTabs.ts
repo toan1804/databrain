@@ -3,7 +3,7 @@
 // can open them without loading the components up front.
 import { traitsOf } from "../lib/sourceTraits";
 import type { CompareSpec } from "../lib/types";
-import { useStore, type CompareRef } from "../store";
+import { useStore, type CompareRef, type DiffRef } from "../store";
 import { editorBridge } from "../editorBridge";
 
 /**
@@ -42,8 +42,8 @@ export function openCompare(source?: Side) {
 }
 
 /** Open a tab comparing the data of two outputs. */
-export function openOutputCompare(spec: CompareSpec, title: string) {
-  useStore.getState().newTab({ title, sql: "", connection_id: null, diff: { spec } });
+export function openOutputCompare(spec: CompareSpec, title: string, sources?: DiffRef["sources"]) {
+  useStore.getState().newTab({ title, sql: "", connection_id: null, diff: { spec, sources } });
 }
 
 /** Open (or show the open) ER diagram of a schema. */

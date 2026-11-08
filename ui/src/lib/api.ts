@@ -54,6 +54,7 @@ import type {
   ComparePair,
   CompareRun,
   CompareSpec,
+  CompareSource,
   ColumnStats,
   ConnectionConfig,
   ConnectionProfile,
@@ -366,6 +367,11 @@ export const api = {
     call<string>("output_diff_sql", { before, after, keys, mapping, exact, options }),
   /** Compare two outputs: exact counts and the differing rows (a result to page). */
   compareOutputs: (spec: CompareSpec, tabId: string) => call<CompareRun>("compare_outputs", { spec, tabId }),
+  /** The output a compare side stands for (a table or file is read now). */
+  compareLoadSource: (source: CompareSource, tabId: string, side: "before" | "after") => call<OutputInfo>("compare_load_source", { source, tabId, side }),
+  /** Key columns unique and not NULL on both sides (empty when none). */
+  compareSuggestKeys: (before: string, after: string, mapping: [string, string][], exact = true) =>
+    call<string[]>("compare_suggest_keys", { before, after, mapping, exact }),
   /** The pairs a compare would use, with their types and how each compares. */
   outputComparePairs: (before: string, after: string, mapping: [string, string][], exact = true, options: CompareOptions | null = null) =>
     call<ComparePair[]>("output_compare_pairs", { before, after, mapping, exact, options }),
