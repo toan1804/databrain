@@ -632,6 +632,50 @@ async fn compare_outputs_ignores_how_each_database_types_values() {
 }
 
 /// Compare a table straight from its database with a file: the SQLite
+/// A time-zone timestamp (Databricks, Snowflake…: an instant in UTC) is the
+/// same as a plain one (Oracle) holding its UTC time, whatever the
+/// computer's time zone: DuckDB's own casts would use that zone instead.
+#[tokio::test]
+async fn compare_reads_time_zone_values_in_utc() {
+    let st = state();
+    let res = api::results_connection(&st).unwrap();
+    // As on a computer at +07:00 (needs ICU; without it DuckDB is always UTC).
+    let _ = st
+        .engine
+        .run_and_wait(
+            &st.hub,
+            RunRequest {
+                connection_id: res.clone(),
+                tab_id: "tz".into(),
+                sql: "SET TimeZone = 'Asia/Ho_Chi_Minh'".into(),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+                output_masks: None,
+            },
+            None,
+        )
+        .await;
+    run_named(&st, &res, "naive", "SELECT 1 AS id, TIMESTAMP '2026-11-04 00:00:00' AS d, TIMESTAMP '2026-11-04 10:00:00' AS t", None, Some("naive")).await;
+    run_named(&st, &res, "zoned", "SELECT '1' AS id, TIMESTAMPTZ '2026-11-04 00:00:00+00' AS d, '2026-11-04 17:00:00+07:00' AS t", None, Some("zoned")).await;
+    let zoned = api::list_outputs(&st).into_iter().find(|o| o.name.as_deref() == Some("zoned")).unwrap();
+    assert!(zoned.columns[1].data_type.starts_with("Timestamp("), "{:?}", zoned.columns[1]);
+    let sql = api::output_diff_sql(&st, "naive", "zoned", vec!["id".into()], vec![], false, &Default::default()).unwrap();
+    assert_eq!(query(&st, &res, &sql).await, Vec::<Vec<Option<String>>>::new(), "{sql}");
+    // A real change shows both values in UTC.
+    run_named(&st, &res, "later", "SELECT 1 AS id, TIMESTAMPTZ '2026-11-04 01:00:00+00' AS d, '2026-11-04 17:00:00+07:00' AS t", None, Some("later")).await;
+    let sql = api::output_diff_sql(&st, "naive", "later", vec!["id".into()], vec![], false, &Default::default()).unwrap();
+    let rows = query(&st, &res, &sql).await;
+    assert_eq!(rows.len(), 1, "{sql}");
+    let row: Vec<&str> = rows[0].iter().map(|c| c.as_deref().unwrap_or("NULL")).collect();
+    assert!(row.contains(&"changed") && row.iter().any(|c| c.starts_with("2026-11-04 01:00:00")) && row.contains(&"d"), "{row:?}");
+    assert!(!row.iter().any(|c| c.contains("08:00:00")), "{row:?}");
+}
+
 /// `customers` table and `customers.csv` hold the same rows, typed
 /// differently (dates and booleans as text in SQLite), so nothing differs.
 #[tokio::test]

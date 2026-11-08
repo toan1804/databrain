@@ -1040,7 +1040,7 @@ fn tolerance_literal(t: f64) -> Result<String> {
 
 /// DuckDB expression: the canonical text of column `col` (already quoted)
 /// whose type family is `fam`, compared as `kind`. NULL stays NULL.
-fn canonical(col: &str, fam: display::TypeFamily, kind: CompareKind, opts: &CompareOptions, round_to: Option<&str>) -> String {
+fn canonical(col: &str, fam: display::TypeFamily, zoned: bool, kind: CompareKind, opts: &CompareOptions, round_to: Option<&str>) -> String {
     use display::TypeFamily as F;
     let raw = format!("CAST({col} AS VARCHAR)");
     let text = {
@@ -1058,17 +1058,36 @@ fn canonical(col: &str, fam: display::TypeFamily, kind: CompareKind, opts: &Comp
     };
     // Text is trimmed before parsing it as a date or number.
     let parse = |ty: &str, native: bool| if native { format!("try_cast({col} AS {ty})") } else { format!("try_cast(trim({raw}) AS {ty})") };
+    // A date/time as a plain timestamp. Time-zone values become their UTC
+    // time (as the grid shows them), whatever the session's time zone is:
+    // DuckDB's own casts would use the computer's zone. Text with an offset
+    // (`…07:00:00+07:00`, `…Z`) is read the same way.
+    let utc = |e: String| format!("make_timestamp(epoch_us({e}))");
+    let timestamp = || {
+        if zoned {
+            utc(col.to_string())
+        } else if fam == F::Date {
+            parse("TIMESTAMP", true)
+        } else {
+            let t = format!("trim({raw})");
+            format!(
+                "CASE WHEN regexp_matches({t}, '\\d:\\d{{2}}(:\\d{{2}}(\\.\\d+)?)?\\s*([+-]\\d{{2}}(:?\\d{{2}})?|Z)$') THEN {} ELSE {} END",
+                utc(format!("try_cast({t} AS TIMESTAMPTZ)")),
+                parse("TIMESTAMP", false)
+            )
+        }
+    };
     match kind {
         CompareKind::Exact => raw,
         CompareKind::Text => text,
         CompareKind::DateTime => {
-            let ts = parse("TIMESTAMP", fam == F::Date);
+            let ts = timestamp();
             format!(
                 "coalesce(CASE WHEN {ts} = date_trunc('day', {ts}) THEN strftime({ts}, '%Y-%m-%d') ELSE strftime({ts}, '%Y-%m-%d %H:%M:%S.%f') END, {text})"
             )
         }
         CompareKind::Date => {
-            let ts = parse("TIMESTAMP", fam == F::Date);
+            let ts = timestamp();
             format!("coalesce(strftime({ts}, '%Y-%m-%d'), {text})")
         }
         CompareKind::Number => {
@@ -1131,11 +1150,18 @@ impl<'o> DiffPlan<'o> {
             let mut cols: Vec<String> = Vec::new();
             for p in &pairs {
                 let n = if before_side { &p.before } else { &p.after };
-                cols.push(if n == &p.after { q(&p.after) } else { format!("{} AS {}", q(n), q(&p.after)) });
+                cols.push(if zoned_of(o, n) {
+                    // Shown in UTC, as the grid shows it (not in the computer's zone).
+                    format!("make_timestamp(epoch_us({})) AS {}", q(n), q(&p.after))
+                } else if n == &p.after {
+                    q(&p.after)
+                } else {
+                    format!("{} AS {}", q(n), q(&p.after))
+                });
             }
             for (i, p) in pairs.iter().enumerate() {
                 let n = if before_side { &p.before } else { &p.after };
-                cols.push(format!("{} AS __cmp_{i}", canonical(&q(n), family_of(o, n), p.kind, opts, round_to)));
+                cols.push(format!("{} AS __cmp_{i}", canonical(&q(n), family_of(o, n), zoned_of(o, n), p.kind, opts, round_to)));
             }
             cols.join(", ")
         };
@@ -1321,6 +1347,15 @@ impl<'o> DiffPlan<'o> {
             self.on("a", "b"),
         )
     }
+}
+
+/// A timestamp with a time zone (`Timestamp(µs, "UTC")`): an instant, stored in UTC.
+fn zoned_of(o: &OutputInfo, n: &str) -> bool {
+    o.columns.iter().find(|c| c.name == n).is_some_and(|c| is_zoned(&c.data_type))
+}
+
+fn is_zoned(data_type: &str) -> bool {
+    data_type.starts_with("Timestamp(") && (data_type.contains("Some(") || (data_type.contains(',') && !data_type.contains("None")))
 }
 
 fn family_of(o: &OutputInfo, n: &str) -> display::TypeFamily {
@@ -1777,6 +1812,24 @@ mod tests {
         let o = CompareOptions { kinds: vec![("d".into(), CompareKind::Date)], ..Default::default() };
         let d = &compare_pairs(&b, &a, &[], true, &o).unwrap()[1];
         assert_eq!((d.kind, d.auto_kind), (CompareKind::Date, CompareKind::DateTime));
+    }
+
+    #[test]
+    fn time_zone_values_compare_and_show_in_utc() {
+        use databrain_result_store::display::TypeFamily as F;
+        assert!(is_zoned(r#"Timestamp(µs, "UTC")"#) && is_zoned(r#"Timestamp(Microsecond, Some("UTC"))"#));
+        assert!(!is_zoned("Timestamp(µs)") && !is_zoned("Timestamp(Microsecond, None)") && !is_zoned("Utf8"));
+        let r = reg();
+        let (b, mut a) = typed_pair(&r);
+        a.columns[1] = ColumnMeta { name: "d".into(), data_type: r#"Timestamp(µs, "UTC")"#.into(), db_type: None, family: F::Date };
+        let sql = diff_sql_with(&b, &a, &["id".into()], &[], true).unwrap();
+        // Not DuckDB's casts, which use the computer's time zone.
+        assert!(sql.contains("make_timestamp(epoch_us(d)) AS d"), "{sql}");
+        assert!(sql.contains("strftime(make_timestamp(epoch_us(d)), '%Y-%m-%d')"), "{sql}");
+        // Text with an offset is read as an instant too.
+        let (b, a) = typed_pair(&r);
+        let sql = diff_sql_with(&a, &b, &["id".into()], &[], true).unwrap();
+        assert!(sql.contains("THEN make_timestamp(epoch_us(try_cast(trim(CAST(d AS VARCHAR)) AS TIMESTAMPTZ)))"), "{sql}");
     }
 
     #[test]

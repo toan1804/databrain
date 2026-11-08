@@ -58,6 +58,8 @@ describe("how values are compared", () => {
   it("names Arrow types the way people read them", () => {
     expect(shortType("Timestamp(µs)")).toBe("timestamp");
     expect(shortType('Timestamp(Microsecond, Some("UTC"))')).toBe("timestamptz");
+    expect(shortType('Timestamp(µs, "UTC")')).toBe("timestamptz");
+    expect(shortType("Timestamp(µs)")).toBe("timestamp");
     expect(shortType("Utf8")).toBe("text");
     expect(shortType("LargeUtf8")).toBe("text");
     expect(shortType("Decimal128(10, 2)")).toBe("decimal(10,2)");

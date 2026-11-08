@@ -102,7 +102,8 @@ export function shortType(t: string): string {
   const dec = /^Decimal(?:128|256)\((\d+),\s*(-?\d+)\)$/.exec(s);
   if (dec) return `decimal(${dec[1]},${dec[2]})`;
   if (/^(Large)?Utf8(View)?$/.test(s)) return "text";
-  if (/^Timestamp/.test(s)) return /,\s*Some/.test(s) ? "timestamptz" : "timestamp";
+  // `Timestamp(µs, "UTC")` or `Timestamp(Microsecond, Some("UTC"))` has a time zone.
+  if (/^Timestamp/.test(s)) return /,\s*(Some|")/.test(s) ? "timestamptz" : "timestamp";
   if (/^Date(32|64)$/.test(s)) return "date";
   if (/^Time(32|64)/.test(s)) return "time";
   if (/^U?Int(8|16|32|64)$/.test(s)) return s.toLowerCase();
