@@ -19,6 +19,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 - `find_join_path` tool (assistant and MCP): the shortest chains of joins between two tables over declared foreign keys and learned joins.
 - Clear history → "Also forget what the AI learned from history".
 
+### Changed
+
+- Settings → "MCP / Kiro" is now "MCP": the MCP server works with any agent that supports MCP (Claude Code, Cursor, Claude Desktop, Windsurf, Kiro CLI, …); the page says where common agents keep their MCP settings and gives the command for agents with another format.
+
 ### Fixed
 
 - Compare outputs reported equal values as different when the two databases typed them differently: an Oracle `DATE` (`2026-11-11 00:00:00`) against `'2026-11-11'` as text, `10.50` against `'10.5'`, padded `CHAR` against `VARCHAR`, `1` against `'1'` as a key. Without keys every such row showed as removed and added; with keys, as changed on every column. Values now compare by meaning.

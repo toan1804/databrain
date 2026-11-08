@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useEvent } from "../lib/hooks";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { AlertCircle, Bot, Braces, Database, Check, Copy, Download, Globe, KeyRound, Loader2, LogOut, Plug, Plus, RefreshCw, ScrollText, Server, ShieldCheck, Terminal, Trash2, Timer, Palette, Workflow } from "lucide-react";
@@ -95,7 +95,7 @@ export function SettingsDialog() {
           {item("duckdb", <Database size={14} />, "DuckDB engine")}
           {item("terminal", <Terminal size={14} />, "Terminal")}
           {item("security", <ShieldCheck size={14} />, "Passwords")}
-          {item("mcp", <Plug size={14} />, "MCP / Kiro")}
+          {item("mcp", <Plug size={14} />, "MCP")}
           {item("audit", <ScrollText size={14} />, "AI audit log")}
           {item("updates", <Download size={14} />, "Updates")}
         </div>
@@ -846,15 +846,22 @@ function Mcp() {
       .catch(() => {});
   }, []);
   const enabled = connections.filter((c) => c.ai_policy?.mcp_enabled);
+  const command = useMemo(() => {
+    try {
+      return (JSON.parse(cfg) as { mcpServers: { databrain: { command: string } } }).mcpServers.databrain.command;
+    } catch {
+      return "";
+    }
+  }, [cfg]);
   return (
     <div className="space-y-3 text-[12.5px]">
       <p>
-        DataBrain includes an MCP server (<span className="font-mono">databrain-mcp</span>) so external agents such as{" "}
-        <strong>Kiro CLI</strong>, Claude Code or Cursor can search your schema and run read-only queries through DataBrain's
-        policies. It runs over stdio on your machine only — it opens no network port.
+        DataBrain includes an MCP server (<span className="font-mono">databrain-mcp</span>), so any AI agent that supports the Model Context Protocol
+        (Claude Code, Cursor, Claude Desktop, Windsurf, Kiro CLI, …) can search your schema, read and add knowledge, and run queries through
+        DataBrain's policies. It runs over stdio on your machine only — it opens no network port.
       </p>
       <div>
-        <div className="mb-1 text-[11.5px] font-medium text-muted">MCP client config (e.g. ~/.kiro/settings/mcp.json)</div>
+        <div className="mb-1 text-[11.5px] font-medium text-muted">MCP client config</div>
         <div className="relative">
           <pre className="overflow-auto rounded-lg bg-panel-2 p-2.5 font-mono text-[11.5px] select-text">{cfg || "…"}</pre>
           <button
@@ -865,6 +872,19 @@ function Mcp() {
             <Copy size={13} />
           </button>
         </div>
+        <p className="mt-1 text-[11.5px] text-muted">
+          Add it to your agent's MCP settings, e.g. <span className="font-mono">.mcp.json</span> in a project (Claude Code),{" "}
+          <span className="font-mono">~/.cursor/mcp.json</span> (Cursor), <span className="font-mono">claude_desktop_config.json</span> (Claude Desktop) or{" "}
+          <span className="font-mono">~/.kiro/settings/mcp.json</span> (Kiro). Agents with another format: add a local (stdio) server that runs
+          {command ? (
+            <>
+              {" "}
+              <span className="font-mono select-text">{command}</span> with no arguments.
+            </>
+          ) : (
+            " databrain-mcp with no arguments."
+          )}
+        </p>
       </div>
       <div>
         <div className="mb-1 text-[11.5px] font-medium text-muted">Connections exposed to MCP</div>
