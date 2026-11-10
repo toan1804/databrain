@@ -200,8 +200,9 @@ fn expands(e: &Expr) -> bool {
 ///
 /// - Only plain items (no `*`): one result column each, by position.
 /// - One `*`: the items before and after it by position; the columns of
-///   the `*` (what is left between them) by name, and only when they are
-///   table columns in table order (else the alignment is not trusted).
+///   the `*` (what is left between them) by name, and only when the table
+///   columns among them are in table order (else the alignment is not
+///   trusted); a name the table description lacks is read-only.
 /// - Anything else (`*, *`, a count that doesn't add up): all read-only.
 ///
 /// A table column shown twice is editable only in its first result column.
@@ -219,10 +220,12 @@ pub(crate) fn map_columns(src: &SourceTable, names: &[String], table: &[String])
             let (before, after) = (&src.items[..*star], &src.items[star + 1..]);
             let n = names.len() + 1 - src.items.len();
             let mid: Vec<Option<usize>> = names[before.len()..before.len() + n].iter().map(|c| find(c)).collect();
-            // In table order, each a table column: what a `*` (maybe with
-            // EXCLUDE / EXCEPT / ILIKE) shows.
+            // In table order: what a `*` (maybe with EXCLUDE / EXCEPT /
+            // ILIKE) shows. A column the description leaves out (SQLite's
+            // generated columns) stays read-only; the `*`'s span is counted
+            // exactly, so it is the table's own column, not a computed one.
             let ordered = mid.iter().try_fold(None::<usize>, |prev, c| match (prev, c) {
-                (_, None) => Err(()),
+                (_, None) => Ok(prev),
                 (Some(p), Some(c)) if *c <= p => Err(()),
                 (_, Some(c)) => Ok(Some(*c)),
             });
@@ -651,6 +654,13 @@ mod tests {
         // Names that don't line up with the table's columns in order (an
         // item expanded to several columns): not trusted.
         assert_eq!(map("select *, 1 from products", Postgres, &["name", "id", "price", "?column?"], &table), vec![None; 4]);
+        // A column of the `*` the description leaves out (SQLite's `table_info`
+        // skips generated columns): only it is read-only.
+        assert_eq!(map("select * from products", Sqlite, &["id", "name", "total", "price"], &table), some(&[Some("id"), Some("name"), None, Some("price")]));
+        assert_eq!(
+            map("select *, 0 as price from products", Sqlite, &["id", "total", "name", "price", "price"], &table),
+            some(&[Some("id"), None, Some("name"), Some("price"), None])
+        );
     }
 
     #[test]
