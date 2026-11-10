@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{AeadInOut, Generate, KeyInit, Tag};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -60,6 +61,8 @@ struct VaultFile {
 pub struct VaultStore {
     path: PathBuf,
     key_path: PathBuf,
+    /// Held while a process reads, changes and writes `vault.json`.
+    lock_path: PathBuf,
     /// Decrypted entries and the file's modification time when loaded
     /// (reloaded when another process, e.g. databrain-mcp, changed it).
     cache: Mutex<Cached>,
@@ -69,14 +72,36 @@ impl VaultStore {
     /// Vault files in `dir` (created on first write).
     pub fn new(dir: impl AsRef<Path>) -> Self {
         let dir = dir.as_ref();
-        Self { path: dir.join("vault.json"), key_path: dir.join("vault.key"), cache: Mutex::new(None) }
+        Self { path: dir.join("vault.json"), key_path: dir.join("vault.key"), lock_path: dir.join("vault.lock"), cache: Mutex::new(None) }
     }
 
     fn err(msg: impl std::fmt::Display) -> AuthError {
         AuthError::Store(format!("credential vault: {msg}"))
     }
 
+    /// The vault key; with `create`, made when there is none. It is created
+    /// exclusively: when another process made it first, that one is used,
+    /// so two first writers never end up with different keys.
     fn key(&self, create: bool) -> Result<Option<RawKey>, AuthError> {
+        if let Some(key) = self.read_key()? {
+            return Ok(Some(key));
+        }
+        if !create {
+            return Ok(None);
+        }
+        let mut key = RawKey::default();
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, key.as_mut_slice());
+        let text = Zeroizing::new(B64.encode(key.as_slice()));
+        match write_private(&self.key_path, text.as_bytes()) {
+            Ok(()) => Ok(Some(key)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.read_key()?.ok_or_else(|| Self::err("vault.key disappeared while it was being created")).map(Some)
+            }
+            Err(e) => Err(Self::err(format!("cannot create the key file: {e}"))),
+        }
+    }
+
+    fn read_key(&self) -> Result<Option<RawKey>, AuthError> {
         match std::fs::read_to_string(&self.key_path).map(Zeroizing::new) {
             Ok(s) => {
                 let raw = Zeroizing::new(B64.decode(s.trim()).map_err(|_| Self::err("vault.key is damaged"))?);
@@ -87,16 +112,7 @@ impl VaultStore {
                 key.copy_from_slice(&raw);
                 Ok(Some(key))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if !create {
-                    return Ok(None);
-                }
-                let mut key = RawKey::default();
-                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, key.as_mut_slice());
-                let text = Zeroizing::new(B64.encode(key.as_slice()));
-                write_private(&self.key_path, text.as_bytes()).map_err(|e| Self::err(format!("cannot create the key file: {e}")))?;
-                Ok(Some(key))
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Self::err(format!("cannot read the key file: {e}"))),
         }
     }
@@ -140,10 +156,13 @@ impl VaultStore {
         buf.extend_from_slice(&tag);
         let f = VaultFile { v: 1, nonce: B64.encode(nonce.as_slice()), data: B64.encode(&*buf) };
         let json = serde_json::to_vec(&f).map_err(Self::err)?;
-        // Atomic replace: write a temp file, then rename.
-        let tmp = self.path.with_extension("json.tmp");
-        write_private(&tmp, &json).map_err(|e| Self::err(format!("cannot write: {e}")))?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| Self::err(format!("cannot write: {e}")))
+        // Atomic replace: write a temp file of this write's own, then rename.
+        let tmp = unique_sibling(&self.path, "tmp");
+        let written = write_private(&tmp, &json).and_then(|()| std::fs::rename(&tmp, &self.path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written.map_err(|e| Self::err(format!("cannot write: {e}")))
     }
 
     fn mtime(&self) -> Option<std::time::SystemTime> {
@@ -164,12 +183,19 @@ impl VaultStore {
         Ok(f(self.current(&mut g)?))
     }
 
+    /// Apply one change. Other processes (the app, databrain-mcp,
+    /// databrain-jobs) write the same file, so the change is made under the
+    /// vault lock to the file as it is now, never to a cached copy.
     fn update(&self, f: impl FnOnce(&mut Entries) -> bool) -> Result<(), AuthError> {
         let mut g = self.cache.lock();
-        let mut map = self.current(&mut g)?.clone();
+        let _lock = FileLock::acquire(&self.lock_path).map_err(|e| Self::err(format!("cannot lock vault.lock: {e}")))?;
+        let mtime = self.mtime();
+        let mut map = self.load()?;
         if f(&mut map) {
             self.save(&map)?;
             *g = Some((self.mtime(), map));
+        } else {
+            *g = Some((mtime, map));
         }
         Ok(())
     }
@@ -199,26 +225,104 @@ impl SecretStore for VaultStore {
     }
 }
 
-/// Create/overwrite a file readable only by the current user: mode 0600 on
-/// Unix; on Windows an explicit access list (the user and SYSTEM, nothing
-/// inherited) set before the contents are written.
+/// A lock file left this long is taken to belong to a process that died
+/// while writing (a write takes milliseconds).
+const STALE_LOCK: Duration = Duration::from_secs(10);
+/// How long to wait for another process's write before giving up.
+const LOCK_WAIT: Duration = Duration::from_secs(20);
+
+/// Cross-process lock: a file created exclusively, removed when dropped.
+/// Portable (no OS lock calls), so it works the same on Unix and Windows.
+struct FileLock(PathBuf);
+
+impl FileLock {
+    fn acquire(path: &Path) -> std::io::Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let started = Instant::now();
+        let mut pause = Duration::from_millis(1);
+        loop {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let busy = match opts.open(path) {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", std::process::id());
+                    return Ok(Self(path.to_path_buf()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
+                // Windows refuses to open a file that is being deleted.
+                Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => false,
+                Err(e) => return Err(e),
+            };
+            if busy {
+                let age = std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+                if age.is_some_and(|a| a > STALE_LOCK) {
+                    // Left behind: moved aside (only one waiter can) and removed.
+                    let gone = unique_sibling(path, "stale");
+                    if std::fs::rename(path, &gone).is_ok() {
+                        let _ = std::fs::remove_file(&gone);
+                    }
+                    continue;
+                }
+            }
+            if started.elapsed() > LOCK_WAIT {
+                return Err(std::io::Error::other("another DataBrain process is still writing the vault"));
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(25));
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// `<file>.<pid>.<random>.<suffix>` next to `path`: unique to one write.
+fn unique_sibling(path: &Path, suffix: &str) -> PathBuf {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    path.with_file_name(format!("{name}.{}.{:016x}.{suffix}", std::process::id(), rand::random::<u64>()))
+}
+
+/// Create a new file readable only by the current user: mode 0600 on Unix;
+/// on Windows an explicit access list (the user and SYSTEM, nothing
+/// inherited) set before the contents are written. Fails with
+/// `AlreadyExists` when the file exists; a partial file is removed on error.
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
+    let f = opts.open(path)?;
+    let written = fill_private(path, f, bytes);
+    if written.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    written
+}
+
+fn fill_private(path: &Path, mut f: std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut f = opts.open(path)?;
     #[cfg(windows)]
     windows_acl::owner_only(path)?;
     f.write_all(bytes)?;
     f.sync_all()?;
+    drop(f);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -460,6 +564,103 @@ mod tests {
         std::fs::write(dir.path().join("vault.json"), serde_json::to_vec(&VaultFile { v: 1, nonce: f.nonce.clone(), data: B64.encode([1u8; 4]) }).unwrap())
             .unwrap();
         assert!(VaultStore::new(dir.path()).get(&r("a")).unwrap_err().to_string().contains("damaged"));
+    }
+
+    /// Separate instances stand in for the app, databrain-mcp and
+    /// databrain-jobs (each with its own cache): writing at the same time,
+    /// starting with no vault at all, none of their changes is lost and the
+    /// vault stays readable (one key).
+    #[test]
+    fn concurrent_writers_keep_every_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (writers, each) = (6, 15);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(writers));
+        let handles: Vec<_> = (0..writers)
+            .map(|w| {
+                let (path, start) = (dir.path().to_path_buf(), start.clone());
+                std::thread::spawn(move || {
+                    let v = VaultStore::new(&path);
+                    start.wait();
+                    for i in 0..each {
+                        v.set(&r(&format!("w{w}:{i}")), &SecretString::from(format!("v{w}.{i}"))).unwrap();
+                    }
+                    // A delete applies only to its own entry.
+                    v.delete(&r(&format!("w{w}:0"))).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let v = VaultStore::new(dir.path());
+        assert_eq!(v.len().unwrap(), writers * (each - 1));
+        for w in 0..writers {
+            assert!(v.get(&r(&format!("w{w}:0"))).unwrap().is_none());
+            for i in 1..each {
+                assert_eq!(v.get(&r(&format!("w{w}:{i}"))).unwrap().unwrap().expose_secret(), format!("v{w}.{i}"));
+            }
+        }
+        // No temp or lock files left behind.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["vault.json", "vault.key"]);
+    }
+
+    /// An instance that cached the map before another one wrote does not
+    /// write its stale copy back.
+    #[test]
+    fn a_stale_cache_does_not_undo_other_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (VaultStore::new(dir.path()), VaultStore::new(dir.path()));
+        a.set(&r("a"), &SecretString::from("1".to_string())).unwrap();
+        assert!(b.get(&r("a")).unwrap().is_some());
+        // Same modification time (coarse clocks): `b` cannot tell it changed.
+        let t = std::fs::metadata(dir.path().join("vault.json")).unwrap().modified().unwrap();
+        a.set(&r("from_a"), &SecretString::from("2".to_string())).unwrap();
+        std::fs::File::options().write(true).open(dir.path().join("vault.json")).unwrap().set_modified(t).unwrap();
+        b.set(&r("from_b"), &SecretString::from("3".to_string())).unwrap();
+        let fresh = VaultStore::new(dir.path());
+        assert!(fresh.get(&r("from_a")).unwrap().is_some(), "a's write survived b's");
+        assert!(fresh.get(&r("from_b")).unwrap().is_some());
+    }
+
+    /// A lock left by a process that died while writing is taken over; a
+    /// live one is waited for.
+    #[test]
+    fn waits_for_the_lock_and_takes_over_a_stale_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("vault.lock");
+        std::fs::write(&lock, "999999").unwrap();
+        let old = std::time::SystemTime::now() - STALE_LOCK - Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&lock).unwrap().set_modified(old).unwrap();
+        let v = VaultStore::new(dir.path());
+        v.set(&r("a"), &SecretString::from("1".to_string())).unwrap();
+        assert!(!lock.exists(), "released after the write");
+        // Held by someone else: the write waits until it is released.
+        let held = FileLock::acquire(&lock).unwrap();
+        let path = dir.path().to_path_buf();
+        let t = std::thread::spawn(move || VaultStore::new(&path).set(&r("b"), &SecretString::from("2".to_string())).unwrap());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!t.is_finished(), "waits for the lock");
+        assert!(v.get(&r("b")).unwrap().is_none());
+        drop(held);
+        t.join().unwrap();
+        assert_eq!(v.get(&r("b")).unwrap().unwrap().expose_secret(), "2");
+    }
+
+    /// The key file is created exclusively: an existing one is used, never
+    /// replaced.
+    #[test]
+    fn an_existing_key_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = VaultStore::new(dir.path());
+        assert!(v.key(false).unwrap().is_none());
+        std::fs::write(dir.path().join("vault.key"), B64.encode([3u8; 32])).unwrap();
+        assert_eq!(*v.key(true).unwrap().unwrap(), [3u8; 32]);
+        std::fs::remove_file(dir.path().join("vault.key")).unwrap();
+        let made = v.key(true).unwrap().unwrap();
+        assert_eq!(*v.key(true).unwrap().unwrap(), *made);
+        assert!(write_private(&dir.path().join("vault.key"), b"x").unwrap_err().kind() == std::io::ErrorKind::AlreadyExists);
     }
 
     #[cfg(windows)]
