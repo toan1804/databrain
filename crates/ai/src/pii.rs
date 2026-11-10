@@ -113,6 +113,13 @@ fn non_sql_masks(sql: &str, kind: ConnectorKind, columns: &[String], rule_column
     let refs = databrain_connector_core::tables::table_refs(sql, kind);
     let tables: Vec<String> = refs.reads.iter().chain(&refs.writes).map(|t| t.join(".")).collect();
     let known = refs.opaque.is_empty() && !tables.is_empty();
+    // Whole documents under a new name (`$lookup … as: 'u'`, `{x: '$$ROOT'}`,
+    // `$push: '$$ROOT'`) come back as one JSON cell that matches no rule by
+    // name: when a collection read has a rule, every column is masked.
+    let whole_doc = ["$$ROOT", "$$CURRENT", "$lookup", "$graphLookup"].iter().any(|op| sql.contains(op));
+    if whole_doc && (!known || tables.iter().any(|t| rule_columns.iter().any(|r| is_pii(Some(t), r)))) {
+        return vec![true; columns.len()];
+    }
     columns
         .iter()
         .map(|c| {
@@ -260,5 +267,31 @@ mod tests {
         assert_eq!(masked(ConnectorKind::Mongodb, users, "db.users.aggregate([{$match: {}}])", &["email"]), [true]);
         // Collections that can't be told: masked by the rule's column name (fail closed).
         assert_eq!(masked(ConnectorKind::Mongodb, users, "db.runCommand({ping: 1})", &["email", "ok"]), [true, false]);
+    }
+
+    #[test]
+    fn whole_documents_of_mongodb_collections_with_rules_are_masked() {
+        databrain_connector_core::language::set_mongo_analyzer(databrain_connector_mongodb::analyze);
+        let users = &["users.email"];
+        // A document of `users` under another name: one JSON cell holding `email`.
+        for cmd in [
+            "db.orders.aggregate([{$lookup: {from: 'users', localField: 'uid', foreignField: '_id', as: 'u'}}])",
+            "db.users.aggregate([{$project: {x: '$$ROOT'}}])",
+            "db.users.aggregate([{$group: {_id: null, all: {$push: '$$ROOT'}}}])",
+            "db.orders.aggregate([{$graphLookup: {from: 'users', startWith: '$uid', connectFromField: 'ref', connectToField: '_id', as: 'u'}}])",
+        ] {
+            assert_eq!(masked(ConnectorKind::Mongodb, users, cmd, &["_id", "u"]), [true, true], "{cmd}");
+        }
+        // Collections without rules keep their columns.
+        assert_eq!(masked(ConnectorKind::Mongodb, users, "db.orders.aggregate([{$project: {x: '$$ROOT'}}])", &["_id", "x"]), [false, false]);
+        assert_eq!(
+            masked(
+                ConnectorKind::Mongodb,
+                users,
+                "db.orders.aggregate([{$lookup: {from: 'items', localField: 'iid', foreignField: '_id', as: 'i'}}])",
+                &["_id", "i"]
+            ),
+            [false, false]
+        );
     }
 }
