@@ -4,6 +4,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.3.3 - 2026-11-11
+
 ### Added
 
 - Plan comparison for rewrites: "Compare plans" on the assistant's proposed edit (pairs with "Improve with AI") shows the original and rewritten statement's plans side by side, with the change in estimated cost, rows, steps, full scans and (with Analyze) time, the steps only in one plan, and on BigQuery, Snowflake and Databricks the bytes each would scan.
