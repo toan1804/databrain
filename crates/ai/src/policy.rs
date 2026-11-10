@@ -225,16 +225,37 @@ pub fn cap_rows(kind: ConnectorKind, sql: &str, limit: usize) -> String {
     }
 }
 
-/// Whether a column name must be masked for this connection.
+/// Whether a column name must be masked for this connection. A rule is
+/// `column` (any table) or `[catalog.][schema.]table.column`. Table names
+/// are compared part by part from the right, as far as both go: the rule
+/// `public.users.email` matches SQL that writes `users` (it may be that
+/// table: fail closed) or `public.users`, but not `sales.users`; the rule
+/// `users.email` matches `crm.public.users`, not `superusers`.
 pub fn is_pii(policy: &AiPolicy, table: Option<&str>, column: &str) -> bool {
+    let c = unquote(column);
     policy.pii_columns.iter().any(|p| {
-        let p = p.trim().to_ascii_lowercase();
-        let c = column.to_ascii_lowercase();
-        match p.rsplit_once('.') {
-            Some((t, col)) => col == c && table.is_some_and(|tb| tb.to_ascii_lowercase().ends_with(t)),
-            None => p == c,
+        let parts = name_parts(p);
+        let Some((col, rule_table)) = parts.split_last() else { return false };
+        if *col != c {
+            return false;
         }
+        rule_table.is_empty() || table.is_some_and(|t| same_table(rule_table, &name_parts(t)))
     })
+}
+
+/// The parts of a dotted name, unquoted and lower-cased (`"Public".users` → `public`, `users`).
+pub fn name_parts(name: &str) -> Vec<String> {
+    name.split('.').map(unquote).filter(|p| !p.is_empty()).collect()
+}
+
+fn unquote(s: &str) -> String {
+    s.trim().trim_matches(|c| matches!(c, '"' | '`' | '[' | ']')).to_ascii_lowercase()
+}
+
+/// The same table when the parts both names have (counted from the right) agree.
+pub fn same_table(a: &[String], b: &[String]) -> bool {
+    let n = a.len().min(b.len());
+    n > 0 && a[a.len() - n..] == b[b.len() - n..]
 }
 
 #[cfg(test)]
@@ -466,5 +487,25 @@ mod tests {
         assert!(is_pii(&p, Some("public.users"), "EMAIL"));
         assert!(!is_pii(&p, Some("orders"), "email"));
         assert!(is_pii(&p, None, "ssn"));
+    }
+
+    #[test]
+    fn pii_rules_with_a_schema_match_unqualified_sql() {
+        let p = AiPolicy { pii_columns: vec!["public.users.email".into(), "crm.public.leads.phone".into()], ..Default::default() };
+        // Unqualified or partly qualified: may be the rule's table, so masked.
+        assert!(is_pii(&p, Some("users"), "email"));
+        assert!(is_pii(&p, Some("public.users"), "email"));
+        assert!(is_pii(&p, Some("\"Public\".\"Users\""), "EMAIL"));
+        assert!(is_pii(&p, Some("leads"), "phone"));
+        assert!(is_pii(&p, Some("public.leads"), "phone"));
+        assert!(is_pii(&p, Some("crm.public.leads"), "phone"));
+        // Another schema or table: not that rule's table.
+        assert!(!is_pii(&p, Some("sales.users"), "email"));
+        assert!(!is_pii(&p, Some("other.public.leads"), "phone"));
+        assert!(!is_pii(&p, Some("superusers"), "email"));
+        assert!(!is_pii(&p, None, "email"));
+        // A table-less rule still matches anywhere.
+        let any = AiPolicy { pii_columns: vec!["ssn".into(), "users.email".into()], ..Default::default() };
+        assert!(is_pii(&any, Some("x.y.z"), "SSN") && is_pii(&any, Some("crm.public.users"), "email"));
     }
 }

@@ -148,6 +148,10 @@ mod tests {
         assert_eq!(pg(users, "select id from users where email like '%@x.io'", &["id"]), [false]);
         // A rule for one table does not mask the same name elsewhere.
         assert_eq!(pg(users, "select email from leads", &["email"]), [false]);
+        // A rule with a schema masks SQL that leaves the schema out.
+        assert_eq!(pg(&["public.users.email"], "select email, name from users", &["email", "name"]), [true, false]);
+        assert_eq!(pg(&["public.users.email"], "select u.email e from public.users u", &["e"]), [true]);
+        assert_eq!(pg(&["public.users.email"], "select email from sales.users", &["email"]), [false]);
         // A rule without a table masks the column anywhere.
         assert_eq!(pg(&["ssn"], "select ssn as s, id from people", &["s", "id"]), [true, false]);
         // No rules: nothing masked.

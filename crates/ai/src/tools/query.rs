@@ -174,8 +174,7 @@ impl ToolContext {
         let src = if o.connection_id == self.profile.id { Ok(self.profile.clone()) } else { self.engine.workspace().get_connection(&o.connection_id) };
         let Ok(src) = src else { return vec![true; columns.len()] };
         let pol = &src.ai_policy;
-        let mut rule_columns: Vec<String> =
-            pol.pii_columns.iter().map(|p| p.trim().rsplit('.').next().unwrap_or("").to_ascii_lowercase()).filter(|c| !c.is_empty()).collect();
+        let mut rule_columns: Vec<String> = pol.pii_columns.iter().filter_map(|p| crate::policy::name_parts(p).pop()).collect();
         // Inputs (`results.<x>`): their masked columns, by every name the SQL may use.
         let mut inputs: std::collections::HashMap<String, Vec<String>> = Default::default();
         if depth < 5 {
