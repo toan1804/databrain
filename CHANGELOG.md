@@ -23,6 +23,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- TSV files (`.tsv`, `.tsv.gz`) are read by tab: DuckDB guessed the delimiter and took `,` when values contained commas (`Smith, John`), splitting the columns wrong. `.psv` files are read by `|`.
 - Results of a script with many statements (15 results in a tab) no longer run off the edge of the result bar: the bar scrolls sideways (wheel, the ‹ › arrows, ←/→/Home/End on a result), keeps the result shown in view, and "All results" lists every result to find one by its number, SQL or output name.
 
 ## 0.3.2 - 2026-11-09

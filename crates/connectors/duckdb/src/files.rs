@@ -39,6 +39,18 @@ pub fn detect_format(path: &str) -> Option<FileFormat> {
     })
 }
 
+/// The delimiter a file's extension promises (`.tsv`: tab, `.psv`: `|`,
+/// also gzipped), as DuckDB's `delim` option spells it; `None` to sniff.
+fn delimiter_of(path: &str) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    let lower = lower.trim_end_matches(".gz").trim_end_matches(".zst");
+    match lower.rsplit('.').next()? {
+        "tsv" => Some("\\t"),
+        "psv" => Some("|"),
+        _ => None,
+    }
+}
+
 /// SQL expression that reads the file (used in views and suggestions).
 pub fn scan_expr(path: &str, format: FileFormat) -> String {
     let lit = quote_literal(path);
@@ -47,7 +59,12 @@ pub fn scan_expr(path: &str, format: FileFormat) -> String {
         quote_literal(&format!("{base}/**/*.parquet"))
     };
     match format {
-        FileFormat::Csv => format!("read_csv({lit})"),
+        // DuckDB's sniffer guesses the delimiter, and picks `,` for a TSV
+        // whose values contain commas: the extension says which it is.
+        FileFormat::Csv => match delimiter_of(path) {
+            Some(d) => format!("read_csv({lit}, delim = '{d}')"),
+            None => format!("read_csv({lit})"),
+        },
         FileFormat::Parquet if std::path::Path::new(path).is_dir() => format!("read_parquet({}, hive_partitioning = true)", dir_glob()),
         FileFormat::Parquet => format!("read_parquet({lit})"),
         FileFormat::Json => format!("read_json_auto({lit})"),
@@ -151,6 +168,10 @@ mod tests {
         assert_eq!(view_name("/x/2024 Sales.csv", &[]), "f_2024_sales");
         assert_eq!(view_name("/x/sales.csv", &["sales".into()]), "sales_2");
         assert_eq!(scan_expr("/x/it's.csv", FileFormat::Csv), "read_csv('/x/it''s.csv')");
+        assert_eq!(scan_expr("/x/a.TSV", FileFormat::Csv), "read_csv('/x/a.TSV', delim = '\\t')");
+        assert_eq!(scan_expr("/x/a.tsv.gz", FileFormat::Csv), "read_csv('/x/a.tsv.gz', delim = '\\t')");
+        assert_eq!(scan_expr("/x/a.psv", FileFormat::Csv), "read_csv('/x/a.psv', delim = '|')");
+        assert_eq!(scan_expr("/x/a.txt", FileFormat::Csv), "read_csv('/x/a.txt')");
     }
 
     #[tokio::test]
@@ -199,6 +220,27 @@ mod tests {
         // Empty result still has a schema.
         let r = q(s.as_ref(), "select * from t where false").await;
         assert_eq!(r.schema.unwrap().fields().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reads_tsv_files_by_tab_even_with_commas_in_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+        let s = DuckdbConnector::new().connect(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::None, None))).await.unwrap();
+        for (name, body, cols, rows) in [
+            ("names.tsv", "name, full\tnote, text\nSmith, John\tlikes a, b\nDoe, Jane\tx, y\n", vec!["name, full", "note, text"], 2),
+            ("cities.tsv", "id\tcity\n1\tHanoi, VN\n2\tParis, FR\n", vec!["id", "city"], 2),
+            ("one.tsv", "only\nx\ny\n", vec!["only"], 2),
+            ("pipes.psv", "a|b\n1, 2|3\n", vec!["a", "b"], 1),
+            ("plain.csv", "a,b\n1,2\n", vec!["a", "b"], 1),
+        ] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            let r = q(s.as_ref(), &format!("select * from {}", scan_expr(&p.to_string_lossy(), FileFormat::Csv))).await;
+            let names: Vec<String> = r.schema.clone().unwrap().fields().iter().map(|f| f.name().clone()).collect();
+            assert_eq!(names, cols, "{name}");
+            assert_eq!(r.num_rows(), rows, "{name}");
+        }
     }
 
     #[tokio::test]
