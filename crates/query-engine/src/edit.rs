@@ -654,7 +654,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs edit_literal (crates/export/src/load.rs) to keep trailing newlines"]
     fn values_keep_trailing_newlines() {
         use databrain_connector_core::arrow::datatypes::{DataType, Field};
         let text = Field::new("k", DataType::Utf8, true);

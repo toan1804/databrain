@@ -2,10 +2,30 @@ use std::io::Write;
 
 use crate::Result;
 
-/// Text a spreadsheet would run as a formula. A number (`-12.5`, `+3`,
-/// `-1e5`) is not: it opens as the number either way.
+/// Text a spreadsheet would run as a formula: starting with `=`, `@`, a tab
+/// or a CR, or with `+`/`-` unless it is a plain number (`-12.5`, `+3`,
+/// `-1e5` open as the number either way). Words Rust reads as floats
+/// (`-inf`, `+NaN`) are no numbers to a spreadsheet: they count as formulas.
 pub(crate) fn is_formula_like(s: &str) -> bool {
-    s.starts_with(['=', '+', '-', '@', '\t', '\r']) && s.trim().parse::<f64>().is_err()
+    match s.as_bytes().first() {
+        Some(b'=' | b'@' | b'\t' | b'\r') => true,
+        Some(b'+' | b'-') => !is_plain_number(&s[1..]),
+        _ => false,
+    }
+}
+
+/// Digits with an optional decimal point and exponent (`12`, `.5`, `5.`, `1e-5`), no sign.
+fn is_plain_number(s: &str) -> bool {
+    let (mantissa, exp) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let mantissa_ok = match mantissa.split_once('.') {
+        Some((a, b)) => (digits(a) || a.is_empty()) && (digits(b) || b.is_empty()) && !(a.is_empty() && b.is_empty()),
+        None => digits(mantissa),
+    };
+    mantissa_ok && exp.is_none_or(|e| digits(e.strip_prefix(['+', '-']).unwrap_or(e)))
 }
 
 pub(crate) fn write_delimited<'a, W: Write>(out: &mut W, cells: impl Iterator<Item = Option<&'a str>>, delim: u8) -> Result<()> {
@@ -34,6 +54,7 @@ pub(crate) fn write_delimited<'a, W: Write>(out: &mut W, cells: impl Iterator<It
 
 #[cfg(test)]
 mod tests {
+    use super::is_formula_like;
     use crate::test_util::*;
     use crate::*;
 
@@ -55,5 +76,37 @@ mod tests {
         assert_eq!(export_to_string(schema.clone(), [&b], o).unwrap(), "t,n\n'=1+2,-1\n-12.5,-2\n'@sum(A1),3\n'+x,4\nplain,5\n");
         let plain = export_to_string(schema, [&b], ExportOptions::new(ExportFormat::Csv)).unwrap();
         assert!(plain.contains("\n=1+2,-1\n"), "off by default: data stays as it is");
+    }
+
+    /// Which text opens as a formula: = + - @ and a leading tab or CR, unless
+    /// the text is a plain number. Words a parser reads as a float (`-inf`,
+    /// `+NaN`) are not numbers to a spreadsheet, so they are escaped.
+    #[test]
+    fn formula_like_text() {
+        for s in ["=1+2", "@sum(A1)", "+x", "-x", "-inf", "+inf", "-Infinity", "+NaN", "-nan", "\t1", "\r=1", "-1+2", "- 1", "-1,000", "-0x10", "=", "-", "+"] {
+            assert!(is_formula_like(s), "{s:?}");
+        }
+        for s in ["-1.5", "+3", "-1e5", "-1E+05", "-.5", "-5.", "12", "plain", "NaN", "inf", "", "1-2", "a=b"] {
+            assert!(!is_formula_like(s), "{s:?}");
+        }
+    }
+
+    /// Excel safe escapes the header row too, and number columns' -inf.
+    #[test]
+    fn excel_safe_header_and_non_finite_numbers() {
+        use databrain_connector_core::arrow::array::Float64Array;
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("=cmd()", DataType::Utf8, true), Field::new("-x", DataType::Float64, true)]));
+        let b = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["a", "b", "c"])), Arc::new(Float64Array::from(vec![f64::NEG_INFINITY, -1.5, f64::NAN]))],
+        )
+        .unwrap();
+        for (format, d) in [(ExportFormat::Csv, ','), (ExportFormat::Tsv, '\t')] {
+            let mut o = ExportOptions::new(format);
+            o.excel_safe = true;
+            assert_eq!(export_to_string(schema.clone(), [&b], o).unwrap(), format!("'=cmd(){d}'-x\na{d}'-inf\nb{d}-1.5\nc{d}NaN\n"), "{format:?}");
+            let plain = export_to_string(schema.clone(), [&b], ExportOptions::new(format)).unwrap();
+            assert!(plain.starts_with(&format!("=cmd(){d}-x\n")), "off: the header stays as it is");
+        }
     }
 }

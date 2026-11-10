@@ -53,9 +53,9 @@ pub struct ExportOptions {
     #[serde(default)]
     #[ts(as = "Option<Vec<usize>>", optional)]
     pub columns: Vec<usize>,
-    /// CSV/TSV for spreadsheets: text starting with `=`, `+`, `-`, `@`
-    /// (a formula when opened in Excel) gets a leading `'`. Numbers, also
-    /// negative ones, are left alone.
+    /// CSV/TSV for spreadsheets: cells and header names starting with `=`,
+    /// `+`, `-`, `@`, a tab or a CR (a formula when opened in Excel) get a
+    /// leading `'`. Plain numbers, also negative ones, are left alone.
     #[serde(default)]
     #[ts(as = "Option<bool>", optional)]
     pub excel_safe: bool,

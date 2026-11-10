@@ -263,7 +263,6 @@ async fn inserts_keep_explicit_nulls_and_all_default_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs edit_literal (crates/export/src/load.rs) to keep trailing newlines"]
 async fn a_key_ending_in_a_newline_matches_its_row() {
     let (st, conn, _dir) = sqlite_state("n.db").await;
     run(&st, &conn, "create table notes (k text primary key, body text)").await;

@@ -93,6 +93,8 @@ impl BatchLimits {
 #[derive(Clone, Copy)]
 pub(crate) enum Lit {
     Number,
+    /// A float column (NaN and ±inf are values of its type).
+    Float,
     Bool,
     Binary,
     Date,
@@ -102,9 +104,10 @@ pub(crate) enum Lit {
     Text,
 }
 
-fn lit_kind(f: &Field) -> Lit {
+pub(crate) fn lit_kind(f: &Field) -> Lit {
     match f.data_type() {
         DataType::Boolean => Lit::Bool,
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => Lit::Float,
         t if t.is_numeric() => Lit::Number,
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => Lit::Binary,
         DataType::Date32 | DataType::Date64 => Lit::Date,
@@ -234,15 +237,61 @@ pub fn drop_stage_sql(dialect: ConnectorKind, stage: &str) -> String {
     }
 }
 
+/// `a` equals `b`, NULL equal to NULL: key columns of Update/Merge/Sync
+/// may hold NULLs, and `NULL = NULL` is never true (a Merge inserted those
+/// rows again on every run).
+fn key_eq(dialect: ConnectorKind, a: &str, b: &str) -> String {
+    use ConnectorKind as K;
+    match dialect {
+        K::Postgres | K::Duckdb | K::Snowflake | K::Databricks | K::Bigquery => format!("{a} IS NOT DISTINCT FROM {b}"),
+        K::Mysql => format!("{a} <=> {b}"),
+        K::Sqlite => format!("{a} IS {b}"),
+        // SQL Server before 2022 and Oracle have no null-safe operator.
+        _ => format!("({a} = {b} OR ({a} IS NULL AND {b} IS NULL))"),
+    }
+}
+
+/// The key columns of an Update/Merge/Sync, and those of them the target
+/// table may hold NULL in (matched null-safely; the others with `=`, which
+/// can use an index or a hash join).
+#[derive(Debug, Clone, Copy)]
+pub struct Keys<'a> {
+    pub all: &'a [String],
+    pub nullable: &'a [String],
+}
+
+impl<'a> Keys<'a> {
+    /// Every key may be NULL (the table's columns aren't known).
+    pub fn nullable(all: &'a [String]) -> Self {
+        Keys { all, nullable: all }
+    }
+    fn contains(&self, c: &String) -> bool {
+        self.all.contains(c)
+    }
+}
+
+/// Every key of `left` (an alias or table) matching the same key of `right`
+/// (null-safely for keys that may be NULL).
+fn keys_match(dialect: ConnectorKind, keys: Keys, left: &str, right: &str) -> String {
+    keys.all
+        .iter()
+        .map(|k| {
+            let q = quote_ident(dialect, k);
+            let (a, b) = (format!("{left}.{q}"), format!("{right}.{q}"));
+            if keys.nullable.iter().any(|n| n == k) { key_eq(dialect, &a, &b) } else { format!("{a} = {b}") }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
 /// Delete the rows of `target` whose `keys` match no row of `stage` (Sync).
-/// A target row with a NULL key matches nothing, so it is deleted too.
-pub fn delete_missing_sql(dialect: ConnectorKind, target: &str, stage: &str, keys: &[String]) -> String {
-    let q = |c: &str| quote_ident(dialect, c);
+/// Keys match null-safely, as in the merge before it.
+pub fn delete_missing_sql(dialect: ConnectorKind, target: &str, stage: &str, keys: Keys) -> String {
     let (t, s) = (quote_path(dialect, target), quote_path(dialect, stage));
     match lt(dialect).merge {
         // SQL Server: the alias form; BigQuery: `DELETE t alias`.
         MergeStyle::MergeSemicolon | MergeStyle::MergeNoInto => {
-            let on = keys.iter().map(|k| format!("src.{} = tg.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
+            let on = keys_match(dialect, keys, "src", "tg");
             let head = if lt(dialect).merge == MergeStyle::MergeSemicolon { format!("DELETE tg FROM {t} AS tg") } else { format!("DELETE {t} tg") };
             format!("{head} WHERE NOT EXISTS (SELECT 1 FROM {s} AS src WHERE {on})")
         }
@@ -250,7 +299,7 @@ pub fn delete_missing_sql(dialect: ConnectorKind, target: &str, stage: &str, key
         // schema or catalog: four-part column names aren't accepted everywhere).
         _ => {
             let name = databrain_connector_core::split_path(dialect, target).pop().map(|n| quote_ident(dialect, &n)).unwrap_or_else(|| t.clone());
-            let on = keys.iter().map(|k| format!("src.{} = {name}.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
+            let on = keys_match(dialect, keys, "src", &name);
             format!("DELETE FROM {t} WHERE NOT EXISTS (SELECT 1 FROM {s} src WHERE {on})")
         }
     }
@@ -262,11 +311,11 @@ fn native_merge(dialect: ConnectorKind) -> bool {
     !matches!(lt(dialect).merge, MergeStyle::UpdateFrom | MergeStyle::UpdateJoin)
 }
 
-fn merge_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[String], keys: &[String], insert: bool) -> String {
+fn merge_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[String], keys: Keys, insert: bool) -> String {
     let style = lt(dialect).merge;
     let q = |c: &str| quote_ident(dialect, c);
     let (t, s) = (quote_path(dialect, target), quote_path(dialect, stage));
-    let on = keys.iter().map(|k| format!("tg.{} = src.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
+    let on = keys_match(dialect, keys, "tg", "src");
     let set_target = |c: &str| if style == MergeStyle::MergeNoInto { q(c) } else { format!("tg.{}", q(c)) };
     let sets: Vec<String> = cols.iter().filter(|c| !keys.contains(c)).map(|c| format!("{} = src.{}", set_target(c), q(c))).collect();
     let (head, on) = match style {
@@ -290,10 +339,10 @@ fn merge_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[String],
     sql
 }
 
-fn update_join_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[String], keys: &[String]) -> Option<String> {
+fn update_join_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[String], keys: Keys) -> Option<String> {
     let q = |c: &str| quote_ident(dialect, c);
     let (t, s) = (quote_path(dialect, target), quote_path(dialect, stage));
-    let on = keys.iter().map(|k| format!("tg.{} = src.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
+    let on = keys_match(dialect, keys, "tg", "src");
     let set: Vec<&String> = cols.iter().filter(|c| !keys.contains(c)).collect();
     if set.is_empty() {
         return None;
@@ -310,7 +359,7 @@ fn update_join_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[St
 
 /// Update rows of `target` from `stage` where `keys` match (`cols` = every
 /// staged column, keys included). Empty when only key columns are given.
-pub fn update_from_stage_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[String], keys: &[String]) -> Vec<String> {
+pub fn update_from_stage_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[String], keys: Keys) -> Vec<String> {
     if !cols.iter().any(|c| !keys.contains(c)) {
         return vec![];
     }
@@ -321,13 +370,13 @@ pub fn update_from_stage_sql(dialect: ConnectorKind, target: &str, stage: &str, 
 }
 
 /// Upsert `stage` into `target`: update rows whose `keys` match, insert the others.
-pub fn merge_from_stage_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[String], keys: &[String]) -> Vec<String> {
+pub fn merge_from_stage_sql(dialect: ConnectorKind, target: &str, stage: &str, cols: &[String], keys: Keys) -> Vec<String> {
     if native_merge(dialect) {
         return vec![merge_sql(dialect, target, stage, cols, keys, true)];
     }
     let q = |c: &str| quote_ident(dialect, c);
     let (t, s) = (quote_path(dialect, target), quote_path(dialect, stage));
-    let on = keys.iter().map(|k| format!("tg.{} = src.{}", q(k), q(k))).collect::<Vec<_>>().join(" AND ");
+    let on = keys_match(dialect, keys, "tg", "src");
     let list = cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
     let vals = cols.iter().map(|c| format!("src.{}", q(c))).collect::<Vec<_>>().join(", ");
     // Update first, so the rows inserted next are not updated again.
@@ -369,11 +418,53 @@ fn spaced_offset(s: &str) -> String {
     format!("{time} {off}")
 }
 
+/// NaN or ±inf when `s` is one of their words (`NaN`, `inf`, `-Infinity`, …);
+/// not for a number too large for an f64 (a decimal stays a number).
+fn non_finite(s: &str) -> Option<f64> {
+    let w = s.trim();
+    let word = w.strip_prefix(['+', '-']).unwrap_or(w).to_ascii_lowercase();
+    matches!(word.as_str(), "nan" | "inf" | "infinity").then(|| w.parse::<f64>().ok()).flatten()
+}
+
+/// NaN or ±inf as a value: Postgres and DuckDB float columns have them
+/// (`'NaN'::float8`), ClickHouse's too (`nan`, `-inf`); a decimal or integer column, and other databases,
+/// get NULL. Never quoted text: SQL Server and MySQL (strict) refuse it
+/// in a numeric column and SQLite would store the text.
+fn non_finite_literal(v: f64, kind: Lit, dialect: ConnectorKind) -> String {
+    let word = if v.is_nan() {
+        "NaN"
+    } else if v > 0.0 {
+        "Infinity"
+    } else {
+        "-Infinity"
+    };
+    match (kind, dialect) {
+        (Lit::Float, ConnectorKind::Postgres) => format!("'{word}'::float8"),
+        (Lit::Float, ConnectorKind::Duckdb) => format!("'{word}'::DOUBLE"),
+        (Lit::Float, ConnectorKind::Clickhouse) => (if v.is_nan() {
+            "nan"
+        } else if v > 0.0 {
+            "inf"
+        } else {
+            "-inf"
+        })
+        .into(),
+        _ => "NULL".into(),
+    }
+}
+
 pub(crate) fn literal(cell: Option<&str>, kind: Lit, dialect: ConnectorKind) -> String {
     let l = lt(dialect);
     let Some(s) = cell else { return "NULL".into() };
     match kind {
-        Lit::Number if s.parse::<f64>().is_ok_and(|f| f.is_finite()) => s.to_string(),
+        Lit::Number | Lit::Float => match non_finite(s) {
+            Some(v) => return non_finite_literal(v, kind, dialect),
+            None if s.parse::<f64>().is_ok() => return s.to_string(),
+            None => {}
+        },
+        _ => {}
+    }
+    match kind {
         Lit::Bool if l.bool_words => s.to_uppercase(),
         Lit::Bool => {
             if s == "true" {
@@ -384,6 +475,8 @@ pub(crate) fn literal(cell: Option<&str>, kind: Lit, dialect: ConnectorKind) -> 
         }
         Lit::Binary => l.binary_literal.replace("{}", s),
         // Oracle doesn't read text as a date without NLS settings: typed literals.
+        // A Date64 shows its time (`… 00:00:00`): a TIMESTAMP literal (Oracle's DATE holds it).
+        Lit::Date if l.typed_datetime_literals && s.trim().len() > 10 => format!("TIMESTAMP {}", quote_literal(s)),
         Lit::Date if l.typed_datetime_literals => format!("DATE {}", quote_literal(s)),
         Lit::Timestamp if l.typed_datetime_literals => format!("TIMESTAMP {}", quote_literal(s)),
         // Oracle reads text as a timestamp only with NLS settings, and its
@@ -417,8 +510,14 @@ pub fn edit_literal(f: &Field, value: Option<&str>, dialect: ConnectorKind) -> s
                 Err(format!("{}: binary values are typed as hex (00ff…)", f.name()))
             }
         }
-        Lit::Number if v.trim().parse::<f64>().is_err() => Err(format!("{}: “{v}” is not a number", f.name())),
-        k => Ok(literal(Some(v.trim_end_matches('\n')).map(|s| if matches!(k, Lit::Number) { s.trim() } else { s }), k, dialect)),
+        Lit::Number | Lit::Float if v.trim().parse::<f64>().is_err() => Err(format!("{}: “{v}” is not a number", f.name())),
+        // Typed NaN/inf where the column can't hold it: refused, not written as NULL.
+        k @ (Lit::Number | Lit::Float) if non_finite(v).is_some_and(|x| non_finite_literal(x, k, dialect) == "NULL") => {
+            Err(format!("{}: “{}” can't be stored in this column (leave it empty for NULL)", f.name(), v.trim()))
+        }
+        // Only numbers are trimmed: text keeps its whitespace (a key `a\n`
+        // must not match the row of `a`).
+        k => Ok(literal(Some(if matches!(k, Lit::Number | Lit::Float) { v.trim() } else { v }), k, dialect)),
     }
 }
 
@@ -604,20 +703,20 @@ mod tests {
         use ConnectorKind as K;
         let keys = vec!["id".to_string(), "day".to_string()];
         assert_eq!(
-            delete_missing_sql(K::Postgres, "app.t", "s", &keys),
-            r#"DELETE FROM "app"."t" WHERE NOT EXISTS (SELECT 1 FROM "s" src WHERE src."id" = "t"."id" AND src."day" = "t"."day")"#
+            delete_missing_sql(K::Postgres, "app.t", "s", Keys::nullable(&keys)),
+            r#"DELETE FROM "app"."t" WHERE NOT EXISTS (SELECT 1 FROM "s" src WHERE src."id" IS NOT DISTINCT FROM "t"."id" AND src."day" IS NOT DISTINCT FROM "t"."day")"#
         );
         assert_eq!(
-            delete_missing_sql(K::Mssql, "dbo.t", "#s", &keys[..1]),
-            "DELETE tg FROM [dbo].[t] AS tg WHERE NOT EXISTS (SELECT 1 FROM [#s] AS src WHERE src.[id] = tg.[id])"
+            delete_missing_sql(K::Mssql, "dbo.t", "#s", Keys::nullable(&keys[..1])),
+            "DELETE tg FROM [dbo].[t] AS tg WHERE NOT EXISTS (SELECT 1 FROM [#s] AS src WHERE (src.[id] = tg.[id] OR (src.[id] IS NULL AND tg.[id] IS NULL)))"
         );
         assert_eq!(
-            delete_missing_sql(K::Bigquery, "ds.t", "ds.s", &keys[..1]),
-            "DELETE `ds`.`t` tg WHERE NOT EXISTS (SELECT 1 FROM `ds`.`s` AS src WHERE src.`id` = tg.`id`)"
+            delete_missing_sql(K::Bigquery, "ds.t", "ds.s", Keys::nullable(&keys[..1])),
+            "DELETE `ds`.`t` tg WHERE NOT EXISTS (SELECT 1 FROM `ds`.`s` AS src WHERE src.`id` IS NOT DISTINCT FROM tg.`id`)"
         );
         assert!(
-            delete_missing_sql(K::Mysql, "t", "s", &keys[..1])
-                .starts_with("DELETE FROM `t` WHERE NOT EXISTS (SELECT 1 FROM `s` src WHERE src.`id` = `t`.`id`)")
+            delete_missing_sql(K::Mysql, "t", "s", Keys::nullable(&keys[..1]))
+                .starts_with("DELETE FROM `t` WHERE NOT EXISTS (SELECT 1 FROM `s` src WHERE src.`id` <=> `t`.`id`)")
         );
     }
 
@@ -643,6 +742,108 @@ mod tests {
         let f = Field::new("at", DataType::Timestamp(databrain_connector_core::arrow::datatypes::TimeUnit::Microsecond, Some("+02:00".into())), true);
         assert!(matches!(lit_kind(&f), Lit::TimestampTz));
         assert_eq!(column_type(K::Oracle, &f), "TIMESTAMP WITH TIME ZONE");
+    }
+
+    /// NaN and ±inf: never quoted text into a numeric column (SQL Server and
+    /// MySQL refuse it, SQLite stores the text). Postgres, DuckDB and
+    /// ClickHouse float columns keep them as their own float values;
+    /// elsewhere NULL. Typed into a grid cell, they are refused where they
+    /// would become NULL.
+    #[test]
+    fn non_finite_floats() {
+        use ConnectorKind as K;
+        use databrain_connector_core::arrow::array::Float64Array;
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)]));
+        let b = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Float64Array::from(vec![Some(f64::NAN), Some(f64::INFINITY), Some(f64::NEG_INFINITY), Some(-1.5), None]))],
+        )
+        .unwrap();
+        for k in [K::Mssql, K::Mysql, K::Sqlite, K::Oracle, K::Snowflake, K::Bigquery, K::Databricks] {
+            let sql = insert_statements(k, "t", &schema, std::slice::from_ref(&b)).unwrap().join(" ");
+            assert!(!sql.contains('\''), "{k:?}: no quoted text: {sql}");
+            assert_eq!(sql.matches("NULL").count(), 4, "{k:?}: {sql}");
+            assert!(sql.contains("-1.5"), "{k:?}: {sql}");
+        }
+        assert_eq!(
+            insert_statements(K::Postgres, "t", &schema, std::slice::from_ref(&b)).unwrap(),
+            vec![r#"INSERT INTO "t" ("x") VALUES ('NaN'::float8), ('Infinity'::float8), ('-Infinity'::float8), (-1.5), (NULL)"#]
+        );
+        assert!(insert_statements(K::Clickhouse, "t", &schema, &[b]).unwrap()[0].ends_with("VALUES (nan), (inf), (-inf), (-1.5), (NULL)"));
+        assert_eq!(literal(Some("NaN"), Lit::Float, K::Duckdb), "'NaN'::DOUBLE");
+        assert_eq!(literal(Some("-inf"), Lit::Float, K::Duckdb), "'-Infinity'::DOUBLE");
+        // A decimal or integer column has no NaN of its own type: NULL.
+        assert_eq!(literal(Some("NaN"), Lit::Number, K::Postgres), "NULL");
+        assert_eq!(literal(Some("+Infinity"), Lit::Number, K::Mssql), "NULL");
+        // Numbers stay numbers, also ones too large for an f64 (decimals).
+        assert_eq!(literal(Some("1e400"), Lit::Number, K::Mssql), "1e400");
+        assert_eq!(literal(Some("-0.0"), Lit::Float, K::Postgres), "-0.0");
+        assert_eq!(literal(Some("12345678901234567890.123"), Lit::Number, K::Mysql), "12345678901234567890.123");
+        let f = Field::new("x", DataType::Float64, true);
+        assert!(edit_literal(&f, Some("NaN"), K::Mssql).unwrap_err().contains("can't be stored"));
+        assert_eq!(edit_literal(&f, Some(" -inf "), K::Postgres).unwrap(), "'-Infinity'::float8");
+        assert_eq!(edit_literal(&f, Some(" 2.5 "), K::Mssql).unwrap(), "2.5");
+        assert!(edit_literal(&Field::new("n", DataType::Int64, true), Some("inf"), K::Postgres).is_err());
+    }
+
+    /// Dates: Oracle gets typed literals (DATE for a date, TIMESTAMP when the
+    /// value has a time, as a Date64 does); other databases take the text.
+    #[test]
+    fn date_literals() {
+        use ConnectorKind as K;
+        assert_eq!(literal(Some("2026-01-02"), Lit::Date, K::Oracle), "DATE '2026-01-02'");
+        assert_eq!(literal(Some("2026-01-02 00:00:00"), Lit::Date, K::Oracle), "TIMESTAMP '2026-01-02 00:00:00'");
+        assert_eq!(literal(Some("2026-01-02"), Lit::Date, K::Postgres), "'2026-01-02'");
+        assert_eq!(literal(Some("2026-01-02"), Lit::Date, K::Mssql), "N'2026-01-02'");
+    }
+
+    /// Update/Merge/Sync match NULL keys too (`NULL = NULL` is never true, so
+    /// a Merge inserted those rows again on every run), per dialect.
+    #[test]
+    fn null_safe_key_match() {
+        use ConnectorKind as K;
+        let cols: Vec<String> = ["id", "name"].map(String::from).to_vec();
+        let keys = vec!["id".to_string()];
+        let pg = merge_from_stage_sql(K::Postgres, "t", "s", &cols, Keys::nullable(&keys));
+        assert!(pg[0].ends_with(r#"WHERE tg."id" IS NOT DISTINCT FROM src."id""#), "{}", pg[0]);
+        assert!(pg[1].ends_with(r#"(SELECT 1 FROM "t" AS tg WHERE tg."id" IS NOT DISTINCT FROM src."id")"#), "{}", pg[1]);
+        let my = merge_from_stage_sql(K::Mysql, "t", "s", &cols, Keys::nullable(&keys));
+        assert!(my[0].contains("ON tg.`id` <=> src.`id` SET"), "{}", my[0]);
+        assert!(my[1].ends_with("WHERE tg.`id` <=> src.`id`)"), "{}", my[1]);
+        let lite = merge_from_stage_sql(K::Sqlite, "t", "s", &cols, Keys::nullable(&keys));
+        assert!(lite[1].ends_with(r#"WHERE tg."id" IS src."id")"#), "{}", lite[1]);
+        let ms = &merge_from_stage_sql(K::Mssql, "t", "#s", &cols, Keys::nullable(&keys))[0];
+        assert!(ms.contains("ON (tg.[id] = src.[id] OR (tg.[id] IS NULL AND src.[id] IS NULL)) WHEN MATCHED"), "{ms}");
+        let ora = &update_from_stage_sql(K::Oracle, "T", "S", &cols, Keys::nullable(&keys))[0];
+        assert!(ora.contains(r#"ON ((tg."id" = src."id" OR (tg."id" IS NULL AND src."id" IS NULL)))"#), "{ora}");
+        for k in [K::Snowflake, K::Databricks, K::Bigquery, K::Duckdb] {
+            let sql = merge_from_stage_sql(k, "a.t", "a.s", &cols, Keys::nullable(&keys)).join(" ");
+            assert!(sql.contains(" IS NOT DISTINCT FROM src."), "{k:?}: {sql}");
+        }
+        // Two keys: each matched null-safely, joined by AND.
+        let two = vec!["id".to_string(), "name".to_string()];
+        assert!(
+            merge_from_stage_sql(K::Postgres, "t", "s", &cols, Keys::nullable(&two))[0]
+                .ends_with(r#"WHERE tg."id" IS NOT DISTINCT FROM src."id" AND tg."name" IS NOT DISTINCT FROM src."name")"#)
+        );
+        // NOT NULL keys (primary keys) keep `=`, which can use an index or a hash join.
+        let id_not_null = Keys { all: &two, nullable: &two[1..] };
+        assert!(
+            merge_from_stage_sql(K::Postgres, "t", "s", &cols, id_not_null)[0]
+                .ends_with(r#"WHERE tg."id" = src."id" AND tg."name" IS NOT DISTINCT FROM src."name")"#)
+        );
+        assert_eq!(
+            delete_missing_sql(K::Postgres, "t", "s", Keys { all: &keys, nullable: &[] }),
+            r#"DELETE FROM "t" WHERE NOT EXISTS (SELECT 1 FROM "s" src WHERE src."id" = "t"."id")"#
+        );
+        // Sync keeps a target row whose NULL key is among the staged rows.
+        assert_eq!(
+            delete_missing_sql(K::Postgres, "t", "s", Keys::nullable(&keys)),
+            r#"DELETE FROM "t" WHERE NOT EXISTS (SELECT 1 FROM "s" src WHERE src."id" IS NOT DISTINCT FROM "t"."id")"#
+        );
+        assert!(
+            delete_missing_sql(K::Mssql, "t", "#s", Keys::nullable(&keys)).ends_with("WHERE (src.[id] = tg.[id] OR (src.[id] IS NULL AND tg.[id] IS NULL)))")
+        );
     }
 
     #[test]
@@ -711,34 +912,42 @@ mod tests {
         assert_eq!(drop_stage_sql(K::Mysql, "s"), "DROP TEMPORARY TABLE IF EXISTS `s`");
 
         assert_eq!(
-            update_from_stage_sql(K::Postgres, "app.t", "s", &cols, &keys),
-            vec![r#"UPDATE "app"."t" AS tg SET "name" = src."name", "qty" = src."qty" FROM "s" AS src WHERE tg."id" = src."id""#]
+            update_from_stage_sql(K::Postgres, "app.t", "s", &cols, Keys::nullable(&keys)),
+            vec![r#"UPDATE "app"."t" AS tg SET "name" = src."name", "qty" = src."qty" FROM "s" AS src WHERE tg."id" IS NOT DISTINCT FROM src."id""#]
         );
         assert_eq!(
-            update_from_stage_sql(K::Mysql, "t", "s", &cols, &keys),
-            vec!["UPDATE `t` AS tg JOIN `s` AS src ON tg.`id` = src.`id` SET tg.`name` = src.`name`, tg.`qty` = src.`qty`"]
+            update_from_stage_sql(K::Mysql, "t", "s", &cols, Keys::nullable(&keys)),
+            vec!["UPDATE `t` AS tg JOIN `s` AS src ON tg.`id` <=> src.`id` SET tg.`name` = src.`name`, tg.`qty` = src.`qty`"]
         );
-        assert!(update_from_stage_sql(K::Postgres, "t", "s", &keys, &keys).is_empty(), "only keys: nothing to update");
+        assert!(update_from_stage_sql(K::Postgres, "t", "s", &keys, Keys::nullable(&keys)).is_empty(), "only keys: nothing to update");
 
-        let pg = merge_from_stage_sql(K::Postgres, "t", "s", &cols, &keys);
+        let pg = merge_from_stage_sql(K::Postgres, "t", "s", &cols, Keys::nullable(&keys));
         assert_eq!(pg.len(), 2);
         assert_eq!(
             pg[1],
-            r#"INSERT INTO "t" ("id", "name", "qty") SELECT src."id", src."name", src."qty" FROM "s" AS src WHERE NOT EXISTS (SELECT 1 FROM "t" AS tg WHERE tg."id" = src."id")"#
+            r#"INSERT INTO "t" ("id", "name", "qty") SELECT src."id", src."name", src."qty" FROM "s" AS src WHERE NOT EXISTS (SELECT 1 FROM "t" AS tg WHERE tg."id" IS NOT DISTINCT FROM src."id")"#
         );
-        assert_eq!(merge_from_stage_sql(K::Sqlite, "t", "s", &keys, &keys).len(), 1, "only keys: insert the missing ones");
+        assert_eq!(merge_from_stage_sql(K::Sqlite, "t", "s", &keys, Keys::nullable(&keys)).len(), 1, "only keys: insert the missing ones");
 
-        let ms = merge_from_stage_sql(K::Mssql, "dbo.t", "#s", &cols, &keys);
+        let ms = merge_from_stage_sql(K::Mssql, "dbo.t", "#s", &cols, Keys::nullable(&keys));
         assert_eq!(
             ms,
             vec![
-                "MERGE INTO [dbo].[t] AS tg USING [#s] AS src ON tg.[id] = src.[id] WHEN MATCHED THEN UPDATE SET tg.[name] = src.[name], tg.[qty] = src.[qty] WHEN NOT MATCHED THEN INSERT ([id], [name], [qty]) VALUES (src.[id], src.[name], src.[qty]);"
+                "MERGE INTO [dbo].[t] AS tg USING [#s] AS src ON (tg.[id] = src.[id] OR (tg.[id] IS NULL AND src.[id] IS NULL)) WHEN MATCHED THEN UPDATE SET tg.[name] = src.[name], tg.[qty] = src.[qty] WHEN NOT MATCHED THEN INSERT ([id], [name], [qty]) VALUES (src.[id], src.[name], src.[qty]);"
             ]
         );
-        let ora = &update_from_stage_sql(K::Oracle, "APP.T", "APP.S", &cols, &keys)[0];
-        assert!(ora.starts_with(r#"MERGE INTO "APP"."T" tg USING "APP"."S" src ON (tg."id" = src."id") WHEN MATCHED"#), "{ora}");
+        let ora = &update_from_stage_sql(K::Oracle, "APP.T", "APP.S", &cols, Keys::nullable(&keys))[0];
+        assert!(
+            ora.starts_with(r#"MERGE INTO "APP"."T" tg USING "APP"."S" src ON ((tg."id" = src."id" OR (tg."id" IS NULL AND src."id" IS NULL))) WHEN MATCHED"#),
+            "{ora}"
+        );
         assert!(!ora.contains("NOT MATCHED"));
-        let bq = &merge_from_stage_sql(K::Bigquery, "ds.t", "ds.s", &cols, &keys)[0];
-        assert!(bq.starts_with("MERGE `ds`.`t` AS tg USING `ds`.`s` AS src ON tg.`id` = src.`id` WHEN MATCHED THEN UPDATE SET `name` = src.`name`"), "{bq}");
+        let bq = &merge_from_stage_sql(K::Bigquery, "ds.t", "ds.s", &cols, Keys::nullable(&keys))[0];
+        assert!(
+            bq.starts_with(
+                "MERGE `ds`.`t` AS tg USING `ds`.`s` AS src ON tg.`id` IS NOT DISTINCT FROM src.`id` WHEN MATCHED THEN UPDATE SET `name` = src.`name`"
+            ),
+            "{bq}"
+        );
     }
 }

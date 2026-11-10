@@ -23,6 +23,11 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Loads and SQL exports write NaN and infinity as NULL instead of the text 'NaN', which SQL Server and MySQL refused and SQLite stored as text; Postgres, DuckDB and ClickHouse float columns keep them as NaN/Infinity.
+- SQL INSERT exports write dates and timestamps as typed literals where the database needs them (Oracle: `DATE '…'`, `TIMESTAMP '…'`), as loads do, instead of text Oracle refused with ORA-01861.
+- "Excel safe" CSV/TSV exports also escape the header row, and escape values like `-inf` and `+NaN` that spreadsheets would read as formulas.
+- Update, Merge and Sync by key match rows whose key is NULL, so a Merge no longer inserts those rows again on every run; keys the table declares NOT NULL still match with `=`, so indexes are used.
+- Editing a grid row whose key ends in a newline updates that row instead of the row keyed without the newline; text values keep trailing newlines as typed.
 - Credentials vault: the app, databrain-mcp and databrain-jobs saving passwords at the same time no longer lose each other's changes, and two of them creating the vault at once can no longer leave it unreadable.
 - AI: a reply the provider blocked or returned empty (for example a Gemini safety stop) no longer breaks the conversation with errors on every later turn; DataBrain now says why nothing came back, and conversations already affected work again.
 - Result grid: adding a row with no values typed now works on MySQL and Oracle (and Snowflake, BigQuery, Databricks, ClickHouse), and a cell set to NULL in a new row is inserted as NULL instead of the column default.

@@ -102,6 +102,11 @@ pub struct LoadTarget {
     /// A part was typed in another case than the database's: `resolved`
     /// has the database's spelling, and the load uses it.
     pub respelled: bool,
+    /// The schema as the explorer names it (`catalog.schema` on
+    /// three-level engines), to describe the table.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub schema_id: Option<String>,
 }
 
 /// One statement (or group of INSERTs) of a dry run.
@@ -646,6 +651,7 @@ impl QueryEngine {
         let schema_id = schemas.iter().find(|s| short(&s.name) == schema).map(|s| s.name.clone()).unwrap_or_else(|| schema.clone());
         t.schema = Some(schema.clone());
         t.schema_exists = Some(true);
+        t.schema_id = Some(schema_id.clone());
 
         // Table.
         let typed = t.table.clone();
@@ -680,6 +686,24 @@ impl QueryEngine {
             None => t.table_exists = Some(false),
         }
         Ok(t)
+    }
+
+    /// The key columns of `table` that may hold NULL: they need a null-safe
+    /// match, which keeps Postgres and others from using an index or a hash
+    /// join, so NOT NULL keys (every primary key) match with `=`. All keys
+    /// when the table can't be described.
+    async fn nullable_keys(&self, connection_id: &str, table: &str, keys: &[String]) -> Vec<String> {
+        let described = async {
+            let t = self.check_load_target(connection_id, table).await.ok()?;
+            if t.table_exists != Some(true) {
+                return None;
+            }
+            self.describe(connection_id, t.schema_id.as_deref()?, &t.table).await.ok()
+        };
+        match described.await {
+            Some(d) => keys.iter().filter(|k| d.columns.iter().find(|c| c.name.eq_ignore_ascii_case(k)).is_none_or(|c| c.nullable)).cloned().collect(),
+            None => keys.to_vec(),
+        }
     }
 
     /// Validate the spec, probe the table and build the statements.
@@ -888,10 +912,12 @@ impl QueryEngine {
                             kind: ActKind::Stage,
                         });
                         plan.push(Act::Insert { label: "Stage rows".into(), table: stage.clone(), target: false });
+                        let nullable = if exists { self.nullable_keys(connection_id, &table, &keys).await } else { keys.clone() };
+                        let keys = sqlgen::Keys { all: &keys, nullable: &nullable };
                         let writes = if spec.mode == LoadMode::Update {
-                            sqlgen::update_from_stage_sql(dialect, &table, &stage, cols, &keys)
+                            sqlgen::update_from_stage_sql(dialect, &table, &stage, cols, keys)
                         } else {
-                            sqlgen::merge_from_stage_sql(dialect, &table, &stage, cols, &keys)
+                            sqlgen::merge_from_stage_sql(dialect, &table, &stage, cols, keys)
                         };
                         let n = writes.len();
                         let sync = spec.mode == LoadMode::Sync;
@@ -907,7 +933,7 @@ impl QueryEngine {
                         if sync {
                             plan.push(Act::Sql {
                                 label: "Delete rows missing from the step's rows".into(),
-                                sql: sqlgen::delete_missing_sql(dialect, &table, &stage, &keys),
+                                sql: sqlgen::delete_missing_sql(dialect, &table, &stage, keys),
                                 kind: ActKind::Remove,
                             });
                         }

@@ -3,8 +3,8 @@ use std::io::Write;
 use crate::delimited::{is_formula_like, write_delimited};
 use crate::json::json_value;
 use crate::kind::{Kind, kind_of};
+use crate::load::{Lit, lit_kind, literal};
 use crate::markdown::md_escape;
-use crate::sql::sql_value;
 use crate::{ExportError, ExportFormat, ExportOptions, Result};
 
 use databrain_connector_core::arrow::array::{Array, RecordBatch};
@@ -21,6 +21,8 @@ pub struct Exporter<W: Write> {
     schema: SchemaRef,
     cols: Vec<usize>,
     kinds: Vec<Kind>,
+    /// How each column is written in SQL INSERTs (same as loads).
+    lits: Vec<Lit>,
     rows_written: u64,
     started: bool,
 }
@@ -33,7 +35,8 @@ impl<W: Write> Exporter<W> {
             opts.columns.iter().copied().filter(|c| *c < schema.fields().len()).collect()
         };
         let kinds = cols.iter().map(|c| kind_of(schema.field(*c))).collect();
-        Self { out, opts, schema, cols, kinds, rows_written: 0, started: false }
+        let lits = cols.iter().map(|c| lit_kind(schema.field(*c))).collect();
+        Self { out, opts, schema, cols, kinds, lits, rows_written: 0, started: false }
     }
 
     fn names(&self) -> Vec<String> {
@@ -45,7 +48,10 @@ impl<W: Write> Exporter<W> {
             return Ok(());
         }
         self.started = true;
-        let names = self.names();
+        let mut names = self.names();
+        if self.opts.excel_safe && matches!(self.opts.format, ExportFormat::Csv | ExportFormat::Tsv) {
+            names.iter_mut().for_each(excel_escape);
+        }
         match self.opts.format {
             ExportFormat::Csv if self.opts.header => write_delimited(&mut self.out, names.iter().map(|s| Some(s.as_str())), b',')?,
             ExportFormat::Tsv if self.opts.header => write_delimited(&mut self.out, names.iter().map(|s| Some(s.as_str())), b'\t')?,
@@ -84,11 +90,8 @@ impl<W: Write> Exporter<W> {
             match self.opts.format {
                 ExportFormat::Csv | ExportFormat::Tsv => {
                     if self.opts.excel_safe {
-                        for (c, k) in cells.iter_mut().zip(&self.kinds) {
-                            if let Some(s) = c.as_mut().filter(|s| *k != Kind::Number && is_formula_like(s)) {
-                                s.insert(0, '\'');
-                            }
-                        }
+                        // Also number columns: a plain number is no formula, but `-inf` is.
+                        cells.iter_mut().flatten().for_each(excel_escape);
                     }
                     let delim = if self.opts.format == ExportFormat::Csv { b',' } else { b'\t' };
                     write_delimited(&mut self.out, cells.iter().map(|c| c.as_deref()), delim)?
@@ -117,7 +120,7 @@ impl<W: Write> Exporter<W> {
                     return Err(ExportError::Unsupported(format!("{:?} is a binary format; use export_file", self.opts.format)));
                 }
                 ExportFormat::SqlInsert => {
-                    let vals: Vec<String> = cells.iter().zip(&self.kinds).map(|(c, k)| sql_value(c.as_deref(), *k, dialect)).collect();
+                    let vals: Vec<String> = cells.iter().zip(&self.lits).map(|(c, k)| literal(c.as_deref(), *k, dialect)).collect();
                     writeln!(self.out, "{insert_head}{});", vals.join(", "))?;
                 }
             }
@@ -133,6 +136,13 @@ impl<W: Write> Exporter<W> {
         }
         self.out.flush()?;
         Ok(self.rows_written)
+    }
+}
+
+/// A leading `'` on text a spreadsheet would run as a formula (Excel safe).
+fn excel_escape(s: &mut String) {
+    if is_formula_like(s) {
+        s.insert(0, '\'');
     }
 }
 
