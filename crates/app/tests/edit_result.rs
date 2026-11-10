@@ -203,3 +203,79 @@ async fn follows_foreign_keys_both_ways() {
     let j = run(&st, &conn, "select count(*) from orders").await.result.unwrap();
     assert!(api::result_links(&st, &j.id).await.unwrap().is_empty());
 }
+
+async fn sqlite_state(file: &str) -> (AppState, String, tempfile::TempDir) {
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
+    c.file_path = Some(dir.path().join(file).to_string_lossy().into_owned());
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: file.into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    let conn = api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    (st, conn, dir)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_computed_column_named_like_a_table_column_is_read_only() {
+    let (st, conn, _dir) = sqlite_state("c.db").await;
+    run(&st, &conn, "create table products (id integer primary key, name text, price integer)").await;
+    run(&st, &conn, "insert into products values (1, 'Pen', 5)").await;
+    let r = run(&st, &conn, "select *, 0 as price from products").await.result.unwrap();
+    let t = api::edit_target(&st, &r.id).await.unwrap();
+    assert_eq!(t.columns, vec![Some("id".into()), Some("name".into()), Some("price".into()), None]);
+    let wrong = vec![RowChange::Update { key: vec![Some("1".into())], values: vec![v(3, Some("9"))] }];
+    assert!(api::edit_preview(&st, &r.id, &t, &wrong).is_err(), "the computed price writes nowhere");
+    // The real price column is still editable.
+    let right = vec![RowChange::Update { key: vec![Some("1".into())], values: vec![v(2, Some("9"))] }];
+    api::apply_edits(&st, &r.id, right).await.unwrap();
+    assert_eq!(rows(&st, &conn, "select price from products").await, vec![vec![Some("9".into())]]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inserts_keep_explicit_nulls_and_all_default_rows() {
+    let (st, conn, _dir) = sqlite_state("i.db").await;
+    run(&st, &conn, "create table items (id integer primary key, name text default 'unnamed', qty integer default 1)").await;
+    let r = run(&st, &conn, "select id, name, qty from items").await.result.unwrap();
+    let t = api::edit_target(&st, &r.id).await.unwrap();
+    let changes = vec![
+        // name set to NULL: NULL, not its default; qty not given: its default.
+        RowChange::Insert { values: vec![v(0, Some("1")), v(1, None)] },
+        // Nothing given: every column at its default.
+        RowChange::Insert { values: vec![] },
+    ];
+    let sql: Vec<String> = api::edit_preview(&st, &r.id, &t, &changes).unwrap().into_iter().map(|s| s.sql).collect();
+    assert_eq!(sql, vec![r#"INSERT INTO "main"."items" ("id", "name") VALUES (1, NULL)"#, r#"INSERT INTO "main"."items" DEFAULT VALUES"#]);
+    api::apply_edits(&st, &r.id, changes).await.unwrap();
+    assert_eq!(
+        rows(&st, &conn, "select id, name, qty from items order by id").await,
+        vec![vec![Some("1".into()), None, Some("1".into())], vec![Some("2".into()), Some("unnamed".into()), Some("1".into())]]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs edit_literal (crates/export/src/load.rs) to keep trailing newlines"]
+async fn a_key_ending_in_a_newline_matches_its_row() {
+    let (st, conn, _dir) = sqlite_state("n.db").await;
+    run(&st, &conn, "create table notes (k text primary key, body text)").await;
+    run(&st, &conn, "insert into notes values ('a' || char(10), 'x'), ('a', 'y')").await;
+    let r = run(&st, &conn, "select k, body from notes order by body").await.result.unwrap();
+    let key = rows(&st, &conn, "select k from notes order by body").await[0][0].clone();
+    assert_eq!(key.as_deref(), Some("a\n"));
+    let changes = vec![RowChange::Update { key: vec![key], values: vec![v(1, Some("two lines\n"))] }];
+    api::apply_edits(&st, &r.id, changes).await.unwrap();
+    assert_eq!(
+        rows(&st, &conn, "select k, body from notes order by k").await,
+        vec![vec![Some("a".into()), Some("y".into())], vec![Some("a\n".into()), Some("two lines\n".into())]],
+        "the row keyed 'a\\n' changed, with its value as typed; 'a' did not"
+    );
+}

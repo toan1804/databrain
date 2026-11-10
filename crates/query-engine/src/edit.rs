@@ -14,7 +14,9 @@
 
 use databrain_connector_core::arrow::datatypes::SchemaRef;
 use databrain_connector_core::sql::dialect_for;
-use databrain_connector_core::sqlparser::ast::{Expr, GroupByExpr, Ident, ObjectNamePart, SelectItem, SetExpr, Statement, TableFactor};
+use databrain_connector_core::sqlparser::ast::{
+    Expr, GroupByExpr, Ident, ObjectNamePart, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
+};
 use databrain_connector_core::sqlparser::parser::Parser;
 use databrain_connector_core::{ConnectorKind, DbObject, ExecOptions, ObjectDetail, ObjectKind, quote_ident, quote_object};
 use databrain_export::load::edit_literal;
@@ -78,13 +80,18 @@ pub struct ApplyReport {
 }
 
 /// The single table a query reads, and per projection item the column it
-/// shows (`Some(None)` for `*`). `None` when the query is not that simple.
+/// shows (`None` for `*`). `None` when the query is not that simple.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceTable {
     pub schema: Option<String>,
     pub table: String,
     /// `None` item: `*`; `Some(Some(c))`: column `c`; `Some(None)`: an expression.
     pub items: Vec<Option<Option<String>>>,
+    /// Which result column shows which table column can't be told from the
+    /// items: a `*` that replaces or renames columns (`* REPLACE (…)`,
+    /// `* RENAME (…)`), `(expr).*`, or an item that may expand to several
+    /// columns (DuckDB `COLUMNS(…)`, `UNPACK(…)`). Every column is read-only.
+    pub opaque: bool,
 }
 
 /// The one table a result's query reads, by name as written (`schema`:
@@ -145,16 +152,106 @@ pub fn source_table(sql: &str, kind: ConnectorKind) -> Option<SourceTable> {
             _ => None,
         }
     };
+    let mut opaque = false;
+    // A `*` that changes what its columns show, or is not this table's.
+    let mut wildcard = |o: &WildcardAdditionalOptions, ours: bool| {
+        opaque |= !ours || o.opt_replace.is_some() || o.opt_rename.is_some() || o.opt_alias.is_some();
+        None
+    };
     let items = s
         .projection
         .iter()
         .map(|it| match it {
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => None,
+            SelectItem::Wildcard(o) => wildcard(o, true),
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(n), o) => {
+                let ours = match n.0.as_slice() {
+                    [ObjectNamePart::Identifier(i)] => own(std::slice::from_ref(i)),
+                    _ => false,
+                };
+                wildcard(o, ours)
+            }
+            SelectItem::QualifiedWildcard(_, o) => wildcard(o, false),
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(column(e)),
             SelectItem::ExprWithAliases { .. } => Some(None),
         })
         .collect();
-    Some(SourceTable { schema, table, items })
+    opaque |= s.projection.iter().any(|it| match it {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } | SelectItem::ExprWithAliases { expr: e, .. } => expands(e),
+        _ => false,
+    });
+    Some(SourceTable { schema, table, items, opaque })
+}
+
+/// An expression that may show several columns (DuckDB `COLUMNS(…)`, `UNPACK(…)`, `COLUMNS(*)`).
+fn expands(e: &Expr) -> bool {
+    match e {
+        Expr::Function(f) => f.name.0.last().is_some_and(|p| match p {
+            ObjectNamePart::Identifier(i) => i.value.eq_ignore_ascii_case("columns") || i.value.eq_ignore_ascii_case("unpack"),
+            _ => true,
+        }),
+        Expr::Nested(e) => expands(e),
+        _ => false,
+    }
+}
+
+/// Per result column (`names`), the table column (of `table`) it shows, or
+/// `None`: an expression, or not known for sure (then read-only: an edit
+/// must never write to a column the cell doesn't show).
+///
+/// - Only plain items (no `*`): one result column each, by position.
+/// - One `*`: the items before and after it by position; the columns of
+///   the `*` (what is left between them) by name, and only when they are
+///   table columns in table order (else the alignment is not trusted).
+/// - Anything else (`*, *`, a count that doesn't add up): all read-only.
+///
+/// A table column shown twice is editable only in its first result column.
+pub(crate) fn map_columns(src: &SourceTable, names: &[String], table: &[String]) -> Vec<Option<String>> {
+    let none = vec![None; names.len()];
+    if src.opaque {
+        return none;
+    }
+    let find = |n: &str| table.iter().position(|c| c == n).or_else(|| table.iter().position(|c| c.eq_ignore_ascii_case(n)));
+    let item = |it: &Option<Option<String>>| it.clone().flatten().and_then(|c| find(&c));
+    let stars: Vec<usize> = src.items.iter().enumerate().filter(|(_, it)| it.is_none()).map(|(i, _)| i).collect();
+    let mut idx: Vec<Option<usize>> = match stars.as_slice() {
+        [] if src.items.len() == names.len() => src.items.iter().map(item).collect(),
+        [star] if names.len() + 1 >= src.items.len() => {
+            let (before, after) = (&src.items[..*star], &src.items[star + 1..]);
+            let n = names.len() + 1 - src.items.len();
+            let mid: Vec<Option<usize>> = names[before.len()..before.len() + n].iter().map(|c| find(c)).collect();
+            // In table order, each a table column: what a `*` (maybe with
+            // EXCLUDE / EXCEPT / ILIKE) shows.
+            let ordered = mid.iter().try_fold(None::<usize>, |prev, c| match (prev, c) {
+                (_, None) => Err(()),
+                (Some(p), Some(c)) if *c <= p => Err(()),
+                (_, Some(c)) => Ok(Some(*c)),
+            });
+            if ordered.is_err() {
+                return none;
+            }
+            before.iter().map(item).chain(mid).chain(after.iter().map(item)).collect()
+        }
+        _ => return none,
+    };
+    let mut seen = std::collections::HashSet::new();
+    for c in idx.iter_mut() {
+        if c.is_some_and(|i| !seen.insert(i)) {
+            *c = None;
+        }
+    }
+    idx.into_iter().map(|c| c.map(|i| table[i].clone())).collect()
+}
+
+/// `INSERT` of a row with every column at its default. `DEFAULT VALUES`
+/// where the database has it; MySQL takes an empty column list; Oracle,
+/// Snowflake, BigQuery, Databricks and ClickHouse take the `DEFAULT`
+/// keyword for one column (the others get their defaults as well).
+pub(crate) fn insert_defaults(kind: ConnectorKind, table: &str, column: &str) -> String {
+    match kind {
+        ConnectorKind::Postgres | ConnectorKind::Sqlite | ConnectorKind::Mssql | ConnectorKind::Duckdb => format!("INSERT INTO {table} DEFAULT VALUES"),
+        ConnectorKind::Mysql => format!("INSERT INTO {table} () VALUES ()"),
+        _ => format!("INSERT INTO {table} ({column}) VALUES (DEFAULT)"),
+    }
 }
 
 /// How the database stores an unquoted name (Oracle/Snowflake upper,
@@ -285,16 +382,9 @@ impl QueryEngine {
                 d
             }
         };
-        let cols = &detail.columns;
-        let find = |n: &str| cols.iter().find(|c| c.name.eq_ignore_ascii_case(n)).map(|c| c.name.clone());
+        let table: Vec<String> = detail.columns.iter().map(|c| c.name.clone()).collect();
         let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let explicit = !src.items.is_empty() && src.items.iter().all(Option::is_some);
-        let columns: Vec<Option<String>> = if explicit && src.items.len() == names.len() {
-            src.items.iter().map(|it| it.clone().flatten().and_then(|c| find(&c))).collect()
-        } else {
-            // `*` (maybe with more items): by name.
-            names.iter().map(|n| find(n)).collect()
-        };
+        let columns = map_columns(&src, &names, &table);
         Ok(ResolvedSource { kind, schema: schema_id, detail, columns })
     }
 
@@ -378,9 +468,14 @@ impl QueryEngine {
                     out.push(EditStatement { sql: format!("UPDATE {table} SET {} WHERE {}", sets.join(", "), key_where(key)?), expect_rows: Some(1) });
                 }
                 RowChange::Insert { values } => {
-                    let vals: Vec<&CellValue> = values.iter().filter(|v| v.value.is_some()).collect();
+                    // Cells not given get the column's default; a cell set
+                    // to NULL is inserted as NULL.
+                    let vals: Vec<&CellValue> = values.iter().collect();
                     if vals.is_empty() {
-                        out.push(EditStatement { sql: format!("INSERT INTO {table} DEFAULT VALUES"), expect_rows: Some(1) });
+                        let Some(first) = t.columns.iter().flatten().next() else {
+                            return Err(bad(format!("No column of {} is in the result", t.table)));
+                        };
+                        out.push(EditStatement { sql: insert_defaults(kind, &table, &quote_ident(kind, first)), expect_rows: Some(1) });
                         continue;
                     }
                     let names = vals.iter().map(|v| Ok(col(v.column)?.0)).collect::<Result<Vec<_>>>()?;
@@ -479,7 +574,12 @@ mod tests {
         source_table(sql, k)
     }
     fn t(schema: Option<&str>, table: &str, items: Vec<Option<Option<&str>>>) -> Option<SourceTable> {
-        Some(SourceTable { schema: schema.map(Into::into), table: table.into(), items: items.into_iter().map(|i| i.map(|c| c.map(Into::into))).collect() })
+        Some(SourceTable {
+            schema: schema.map(Into::into),
+            table: table.into(),
+            items: items.into_iter().map(|i| i.map(|c| c.map(Into::into))).collect(),
+            opaque: false,
+        })
     }
 
     #[test]
@@ -501,6 +601,79 @@ mod tests {
             "select 1",
         ] {
             assert!(source_table(not, Postgres).is_none(), "{not}");
+        }
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+    fn map(sql: &str, k: ConnectorKind, names: &[&str], table: &[&str]) -> Vec<Option<String>> {
+        map_columns(&source_table(sql, k).unwrap(), &strs(names), &strs(table))
+    }
+    fn some(v: &[Option<&str>]) -> Vec<Option<String>> {
+        v.iter().map(|c| c.map(Into::into)).collect()
+    }
+
+    #[test]
+    fn a_computed_column_named_like_a_table_column_stays_read_only() {
+        let table = ["id", "name", "price"];
+        // The computed `price` after `*` is not the table's price; the real one stays editable.
+        assert_eq!(
+            map("select *, 0 as price from products", Postgres, &["id", "name", "price", "price"], &table),
+            some(&[Some("id"), Some("name"), Some("price"), None])
+        );
+        assert_eq!(
+            map("select 0 as price, * from products", Postgres, &["price", "id", "name", "price"], &table),
+            some(&[None, Some("id"), Some("name"), Some("price")])
+        );
+        assert_eq!(map("select p.*, 0 as price from products p", Postgres, &["id", "name", "price", "price"], &table)[3], None);
+        // Explicit items: by position (an alias shows the column it reads).
+        assert_eq!(
+            map("select id, 0 as price, name as label from products", Postgres, &["id", "price", "label"], &table),
+            some(&[Some("id"), None, Some("name")])
+        );
+        // Still editable: plain `*`, plain columns, `* EXCLUDE` plus a computed column.
+        assert_eq!(map("select * from products", Postgres, &table, &table), some(&[Some("id"), Some("name"), Some("price")]));
+        assert_eq!(map("select id, price from products", Postgres, &["id", "price"], &table), some(&[Some("id"), Some("price")]));
+        assert_eq!(
+            map("select * exclude (price), 0 as price from products", Duckdb, &["id", "name", "price"], &table),
+            some(&[Some("id"), Some("name"), None])
+        );
+        // A column shown twice: only its first result column is editable.
+        assert_eq!(map("select id, price, price from products", Postgres, &["id", "price", "price"], &table), some(&[Some("id"), Some("price"), None]));
+        // Unsure: everything read-only.
+        let none = vec![None; 3];
+        assert_eq!(map("select * replace (0 as price) from products", Duckdb, &table, &table), none, "* REPLACE");
+        assert_eq!(map("select * rename (name as price) from products", Snowflake, &["ID", "price", "PRICE"], &["ID", "NAME", "PRICE"]), none);
+        assert_eq!(map("select *, * from products", Postgres, &["id", "name", "price", "id", "name", "price"], &table), vec![None; 6]);
+        assert_eq!(map("select columns('id|name'), * from products", Duckdb, &["id", "name", "id", "name", "price"], &table), vec![None; 5]);
+        assert_eq!(map("select x.* from products", Postgres, &table, &table), none, "another table's *");
+        // Names that don't line up with the table's columns in order (an
+        // item expanded to several columns): not trusted.
+        assert_eq!(map("select *, 1 from products", Postgres, &["name", "id", "price", "?column?"], &table), vec![None; 4]);
+    }
+
+    #[test]
+    #[ignore = "needs edit_literal (crates/export/src/load.rs) to keep trailing newlines"]
+    fn values_keep_trailing_newlines() {
+        use databrain_connector_core::arrow::datatypes::{DataType, Field};
+        let text = Field::new("k", DataType::Utf8, true);
+        assert_eq!(edit_literal(&text, Some("a\n"), Postgres).unwrap(), "'a\n'");
+        assert_eq!(edit_literal(&text, Some("a\n\n"), Sqlite).unwrap(), "'a\n\n'");
+        assert_eq!(edit_literal(&text, Some("plain"), Postgres).unwrap(), "'plain'");
+        let num = Field::new("n", DataType::Int64, true);
+        assert_eq!(edit_literal(&num, Some(" 42\n"), Postgres).unwrap(), "42", "numbers are still trimmed");
+    }
+
+    #[test]
+    fn all_default_rows_use_each_database_s_syntax() {
+        let d = |k| insert_defaults(k, "t", "c");
+        for k in [Postgres, Sqlite, Mssql, Duckdb] {
+            assert_eq!(d(k), "INSERT INTO t DEFAULT VALUES", "{k:?}");
+        }
+        assert_eq!(d(Mysql), "INSERT INTO t () VALUES ()");
+        for k in [Oracle, Snowflake, Bigquery, Databricks, Clickhouse] {
+            assert_eq!(d(k), "INSERT INTO t (c) VALUES (DEFAULT)", "{k:?}");
         }
     }
 }

@@ -23,6 +23,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Result grid: adding a row with no values typed now works on MySQL and Oracle (and Snowflake, BigQuery, Databricks, ClickHouse), and a cell set to NULL in a new row is inserted as NULL instead of the column default.
+- Result grid: a computed column named like a table column (`SELECT *, 0 AS price`) is read-only instead of writing to the real column; when it isn't certain which column a result column shows, it stays read-only.
 - ⌘W / Ctrl+W asks before closing a tab with unsaved changes, like the tab's close button.
 - Notebook cells no longer keep their run state in memory after the cell is deleted or the notebook is closed.
 - Query results no longer stay in memory when a result stream ends early or a tab is closed while its query runs.
