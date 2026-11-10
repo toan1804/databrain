@@ -140,6 +140,13 @@ pub fn redact_secrets(sql: &str) -> String {
                 i = end;
                 continue;
             }
+            // `$$secret$$` / `$tag$secret$tag$` (Postgres dollar quotes): the
+            // text between the tags; unterminated: to the end.
+            if let Some((tag_end, body_end, end)) = dollar_literal(sql, v) {
+                cut.push((tag_end, body_end, None));
+                i = end;
+                continue;
+            }
             if bare_ok && let Some((s2, e2)) = word_at(v) {
                 cut.push((s2, e2, None));
                 i = e2;
@@ -169,9 +176,36 @@ pub fn redact_secrets(sql: &str) -> String {
     out
 }
 
+/// A dollar-quoted literal at `i` (`$$…$$`, `$tag$…$tag$`): the end of the
+/// opening tag, the start of the closing tag (the end of the text when it
+/// is missing) and the end of the literal.
+fn dollar_literal(sql: &str, i: usize) -> Option<(usize, usize, usize)> {
+    let b = sql.as_bytes();
+    if b.get(i) != Some(&b'$') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+        j += 1;
+    }
+    // `$1` is a parameter, not a tag.
+    if b.get(j) != Some(&b'$') || b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let tag = &sql[i..=j];
+    let body = j + 1;
+    Some(match sql[body..].find(tag) {
+        Some(k) => (body, body + k, body + k + tag.len()),
+        None => (body, b.len(), b.len()),
+    })
+}
+
 /// `text` with the password of every `scheme://user:password@host` in it
 /// replaced by `***` (connection strings pasted into a question, `ATTACH
 /// 'postgres://u:pw@h'`). The user stays; a URL without a password is kept.
+/// The password runs to the last `@` of the URL, so one with `/`, `?` or
+/// `#` in it (`postgres://u:pa/ss@h/db`) is hidden whole; `host:port/…`
+/// (digits after the colon) is not mistaken for a user and password.
 pub fn redact_url_passwords(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -179,15 +213,19 @@ pub fn redact_url_passwords(text: &str) -> String {
         let start = i + 3;
         out.push_str(&rest[..start]);
         rest = &rest[start..];
-        // The authority: up to the path, query, fragment or the end of the URL in the text.
-        let end = rest.find(|c: char| matches!(c, '/' | '?' | '#' | '\'' | '"' | '`' | '<' | '>' | '(' | ')') || c.is_whitespace()).unwrap_or(rest.len());
-        if let Some(at) = rest[..end].rfind('@')
-            && let Some(colon) = rest[..at].find(':')
-        {
+        // The URL as written in the text: up to a space, a quote or a bracket.
+        let token = rest.find(|c: char| matches!(c, '\'' | '"' | '`' | '<' | '>' | '(' | ')') || c.is_whitespace()).unwrap_or(rest.len());
+        // The authority as a parser reads it: up to the path, query or fragment.
+        let authority = rest[..token].find(['/', '?', '#']).unwrap_or(token);
+        let Some(colon) = rest[..token].find(':') else { continue };
+        // A colon in the authority followed by digits only is a port, not a password.
+        let port = colon < authority && rest[colon + 1..authority].bytes().all(|b| b.is_ascii_digit());
+        let user_ok = !rest[..colon].contains(['/', '?', '#', '@']);
+        let at = if port || !user_ok { rest[..authority].rfind('@').filter(|a| *a > colon) } else { rest[..token].rfind('@').filter(|a| *a > colon) };
+        if let Some(at) = at {
             out.push_str(&rest[..colon + 1]);
             out.push_str("***");
             rest = &rest[at..];
-            continue;
         }
     }
     out.push_str(rest);
@@ -415,6 +453,17 @@ mod redaction_tests {
         assert_eq!(redact_secrets("pw = 'x'"), "pw = 'x'");
         // Unterminated literal: redacted to the end.
         assert_eq!(redact_secrets("alter role r password 'unfinished"), "alter role r password '***'");
+        // Dollar quotes (Postgres).
+        for (sql, want) in [
+            ("ALTER ROLE r PASSWORD $$secret$$", "ALTER ROLE r PASSWORD $$***$$"),
+            ("alter role r with password $pw$it's $$ here$pw$ valid until 'x'", "alter role r with password $pw$***$pw$ valid until 'x'"),
+            ("create user u identified by $$pw$$", "create user u identified by $$***$$"),
+            ("alter role r password $$unfinished", "alter role r password $$***"),
+        ] {
+            assert_eq!(redact_secrets(sql), want, "{sql}");
+            assert_eq!(redact_secrets(want), want, "idempotent: {want}");
+        }
+        assert_eq!(redact_secrets("select $1 from t where password = $1"), "select $1 from t where password = $1", "a parameter, not a tag");
     }
 
     /// What query history and job logs keep goes through [`redact_text`]: the
@@ -477,12 +526,23 @@ mod redaction_tests {
             ("ATTACH 'mysql://root:pw@localhost/shop' AS m", "ATTACH 'mysql://root:***@localhost/shop' AS m"),
             ("two: a://x:1@h and b://y:2@k", "two: a://x:***@h and b://y:***@k"),
             ("user:p@ss with @ in it: s://u:p@ss@host/db", "user:p@ss with @ in it: s://u:***@host/db"),
+            // `/`, `?` and `#` in the password: hidden whole, up to the last `@`.
+            ("postgres://u:pa/ss@h/db", "postgres://u:***@h/db"),
+            ("ATTACH 'postgres://u:a/b?c#d@h:5432/db' AS p", "ATTACH 'postgres://u:***@h:5432/db' AS p"),
+            ("mysql://root:x/y@localhost", "mysql://root:***@localhost"),
         ] {
             assert_eq!(redact_url_passwords(text), want, "{text}");
         }
-        for keep in ["https://example.com:8443/a@b", "s3://bucket/key", "neo4j://user@host", "no url here: a:b@c", "x://"] {
+        for keep in
+            ["https://example.com:8443/a@b", "s3://bucket/key", "neo4j://user@host", "no url here: a:b@c", "x://", "https://h/a:b@c", "http://h:80/?q=a@b"]
+        {
             assert_eq!(redact_url_passwords(keep), keep);
         }
+        // What history, job logs and the audit log keep.
+        assert_eq!(
+            redact_text("ATTACH 'postgres://u:pa/ss@h/db' AS p; ALTER ROLE r PASSWORD $$s$$"),
+            "ATTACH 'postgres://u:***@h/db' AS p; ALTER ROLE r PASSWORD $$***$$"
+        );
         assert_eq!(redact_text("create user u identified by 'pw'; -- from postgres://a:b@h"), "create user u identified by '***'; -- from postgres://a:***@h");
         assert_eq!(redact_text("syntax error at or near \"PASSWORD 'pw'\""), "syntax error at or near \"PASSWORD '***'\"");
         assert_eq!(redact_text("alter role r password \"pw\""), "alter role r password \"***\"");
