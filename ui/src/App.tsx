@@ -64,7 +64,8 @@ function useGlobalShortcuts() {
         st.newTab();
       } else if (key === "w") {
         e.preventDefault();
-        if (st.activeTabId) st.closeTab(st.activeTabId);
+        // Asks first when the tab has unsaved edits, as its close button does.
+        if (st.activeTabId) st.requestCloseTab(st.activeTabId);
       } else if (key === ".") {
         e.preventDefault();
         if (st.activeTabId) void st.cancelTab(st.activeTabId);

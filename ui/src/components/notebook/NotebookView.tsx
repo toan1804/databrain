@@ -100,6 +100,8 @@ export function NotebookView({
       void api.closeTab(`nb:${notebookId}`).catch(() => {});
       for (const c of latest.current?.cells ?? [])
         void api.closeTab(cellKey(notebookId, c.id)).catch(() => {});
+      // Their results are gone with the sessions: so are the cells' runs.
+      useStore.getState().forgetRuns([], `nb:${notebookId}:`);
     },
     [flush, notebookId],
   );
@@ -307,6 +309,7 @@ export function NotebookView({
 
   const removeCell = (id: string) => {
     void api.closeTab(cellKey(notebookId, id)).catch(() => {});
+    useStore.getState().forgetRuns([cellKey(notebookId, id)]);
     update((n) => ({ ...n, cells: n.cells.filter((c) => c.id !== id) }));
   };
 

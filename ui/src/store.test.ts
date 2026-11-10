@@ -214,3 +214,49 @@ describe("reopen closed tabs", () => {
     expect(st().reopenClosedTab()).toBe(false);
   });
 });
+
+describe("closing a tab with unsaved edits", () => {
+  it("asks first (close button and Cmd/Ctrl+W), and closes a clean tab at once", () => {
+    useStore.setState({
+      tabs: [
+        { id: "a", title: "A", sql: "select 1", connection_id: "c1", dirty: true, file_path: "/q/a.sql" },
+        { id: "b", title: "B", sql: "select 2", connection_id: "c1" },
+      ],
+      activeTabId: "a",
+      closedTabs: [],
+      confirm: null,
+    });
+    const st = () => useStore.getState();
+    st().requestCloseTab("a");
+    expect(st().tabs.map((t) => t.id)).toEqual(["a", "b"]);
+    expect(st().confirm?.reasons[0]).toMatch(/not saved to \/q\/a\.sql/);
+    st().confirm!.onConfirm();
+    expect(st().tabs.map((t) => t.id)).toEqual(["b"]);
+    useStore.setState({ confirm: null });
+    st().requestCloseTab("b");
+    expect(st().confirm).toBeNull();
+    expect(st().tabs.map((t) => t.id)).not.toContain("b");
+  });
+});
+
+describe("notebook cell runs", () => {
+  const run = { jobId: "j", running: false, startedAt: 0, statements: [], activeIndex: null };
+  it("are dropped with their cell and with their notebook's tab", () => {
+    useStore.setState({
+      tabs: [
+        { id: "t", title: "Q", sql: "", connection_id: "c1" },
+        { id: "nbtab", title: "NB", sql: "", connection_id: "c1", notebook_id: "n1" },
+      ],
+      activeTabId: "t",
+      closedTabs: [],
+      runs: { t: run, "nb:n1:c1": run, "nb:n1:c2": run, "nb:n10:c1": run, "nb:n2:c1": run },
+    });
+    const st = () => useStore.getState();
+    st().forgetRuns(["nb:n2:c1"]);
+    expect(Object.keys(st().runs).sort()).toEqual(["nb:n10:c1", "nb:n1:c1", "nb:n1:c2", "t"]);
+    st().closeTab("nbtab");
+    expect(Object.keys(st().runs).sort()).toEqual(["nb:n10:c1", "t"]);
+    st().forgetRuns([], "nb:n10:");
+    expect(Object.keys(st().runs)).toEqual(["t"]);
+  });
+});

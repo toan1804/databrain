@@ -36,6 +36,8 @@ export interface TabsSlice {
   checkFiles: () => Promise<void>;
   newTab: (init?: Partial<Tab>) => string;
   closeTab: (id: string) => void;
+  /** Close a tab as the user asked to (close button, ⌘W): asks first when it has unsaved edits. */
+  requestCloseTab: (id: string) => void;
   /** Tabs whose next result opens "Load into…" (importing a file). */
   loadIntoOnResult: Record<string, boolean>;
   setLoadIntoOnResult: (tabId: string, on: boolean) => void;
@@ -205,6 +207,9 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
     if (activeTabId === id) activeTabId = tabs[Math.min(idx, tabs.length - 1)].id;
     const runs = { ...s.runs };
     delete runs[id];
+    // A notebook's cells run under keys of their own (`nb:{notebook}:{cell}`).
+    const nb = s.tabs[idx].notebook_id;
+    if (nb) for (const k of Object.keys(runs)) if (k.startsWith(`nb:${nb}:`)) delete runs[k];
     const txOpen = { ...s.txOpen };
     delete txOpen[id];
     const params = { ...s.params };
@@ -217,6 +222,17 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
     set({ tabs, activeTabId, runs, params, closedTabs, txOpen });
     persistParams(params);
     persistTabs(tabs);
+  },
+  requestCloseTab: (id) => {
+    const t = get().tabs.find((x) => x.id === id);
+    if (!t) return;
+    if (!t.dirty) return get().closeTab(id);
+    get().askConfirm({
+      title: `Close "${t.title}"?`,
+      reasons: [t.file_path ? `This tab has changes not saved to ${t.file_path}.` : "This tab has unsaved changes to its saved query."],
+      confirmLabel: "Close without saving",
+      onConfirm: () => get().closeTab(id),
+    });
   },
   reopenClosedTab: () => {
     flushDrafts();

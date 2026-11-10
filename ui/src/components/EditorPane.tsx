@@ -192,7 +192,7 @@ function TabBar() {
   const runs = useStore((s) => s.runs);
   const connections = useStore((s) => s.connections);
   const setActive = useStore((s) => s.setActiveTab);
-  const closeTab = useStore((s) => s.closeTab);
+  const requestCloseTab = useStore((s) => s.requestCloseTab);
   const newTab = useStore((s) => s.newTab);
   const moveTab = useStore((s) => s.moveTab);
   const updateTab = useStore((s) => s.updateTab);
@@ -232,16 +232,7 @@ function TabBar() {
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
-  const close = (t: Tab) => {
-    if (t.dirty) {
-      useStore.getState().askConfirm({
-        title: `Close "${t.title}"?`,
-        reasons: [t.file_path ? `This tab has changes not saved to ${t.file_path}.` : "This tab has unsaved changes to its saved query."],
-        confirmLabel: "Close without saving",
-        onConfirm: () => closeTab(t.id),
-      });
-    } else closeTab(t.id);
-  };
+  const close = (t: Tab) => requestCloseTab(t.id);
 
   return (
     <div

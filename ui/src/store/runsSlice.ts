@@ -39,6 +39,8 @@ export interface RunsSlice {
   /** Forget dropped outputs in runs, output tabs and the list. */
   forgetOutputs: (handles: string[]) => void;
   runs: Record<string, TabRun>;
+  /** Drop the runs of closed run keys (notebook cells removed or closed); `prefix` drops every key starting with it. */
+  forgetRuns: (keys: string[], prefix?: string) => void;
   /** Tabs whose session has an open transaction → the connection it is on. */
   txOpen: Record<string, string>;
   /** Re-read whether the tab's session has an open transaction. */
@@ -145,6 +147,15 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       return { runs, outputs: s.outputs.map((x) => (x.handle === o.handle ? o : x)) };
     }),
   runs: {},
+  forgetRuns: (keys, prefix) => {
+    const gone = Object.keys(get().runs).filter((k) => keys.includes(k) || (prefix !== undefined && k.startsWith(prefix)));
+    if (!gone.length) return;
+    set((s) => {
+      const runs = { ...s.runs };
+      for (const k of gone) delete runs[k];
+      return { runs };
+    });
+  },
   txOpen: {},
   refreshTxState: async (tabId, connectionId) => {
     if (!isTauri()) return;
