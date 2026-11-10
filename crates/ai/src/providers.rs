@@ -272,13 +272,22 @@ pub(crate) fn openrouter_budget(key: &Value, credits: Option<Value>) -> Budget {
     Budget { plan, meters, resets_on: None, manage_url: Some("https://openrouter.ai/settings/credits".into()) }
 }
 
+/// An assistant turn with no text and no tool calls (a reply the provider
+/// blocked or cut off). Anthropic and Gemini refuse an empty turn, so it is
+/// never sent.
+pub fn is_empty_turn(m: &Message) -> bool {
+    m.role == Role::Assistant && m.tool_calls.is_empty() && m.text.trim().is_empty()
+}
+
 pub fn openai_messages(system: &str, messages: &[Message]) -> Vec<Value> {
     let mut out = vec![json!({"role": "system", "content": system})];
     for m in messages {
         match m.role {
             Role::User => out.push(json!({"role": "user", "content": m.text})),
+            // Nothing said and no calls (e.g. a blocked reply): not a turn.
+            Role::Assistant if is_empty_turn(m) => {}
             Role::Assistant => {
-                let mut v = json!({"role": "assistant", "content": if m.text.is_empty() { Value::Null } else { Value::String(m.text.clone()) }});
+                let mut v = json!({"role": "assistant", "content": if m.text.trim().is_empty() { Value::Null } else { Value::String(m.text.clone()) }});
                 if !m.tool_calls.is_empty() {
                     v["tool_calls"] = m
                         .tool_calls
@@ -434,8 +443,10 @@ pub fn openai_stream(bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>) -
                         entry.2.push_str(a);
                     }
                 }
-                if choice["finish_reason"].is_string() && !calls.is_empty() {
+                if let Some(reason) = choice["finish_reason"].as_str() {
                     out.extend(std::mem::take(&mut calls).into_values().map(|(id, name, args)| Ok(ChatEvent::ToolCall(parse_call(id, name, &args)))));
+                    // Why it stopped ("content_filter", "length"…); [DONE] follows.
+                    out.push(Ok(ChatEvent::Done { stop_reason: reason.to_string() }));
                 }
             }
             if !out.is_empty() {
@@ -467,8 +478,12 @@ pub fn anthropic_messages(messages: &[Message]) -> Vec<Value> {
         let (role, block) = match m.role {
             Role::User => ("user", vec![json!({"type": "text", "text": m.text})]),
             Role::Assistant => {
+                if is_empty_turn(m) {
+                    continue;
+                }
                 let mut b = Vec::new();
-                if !m.text.is_empty() {
+                // Anthropic refuses blank text blocks.
+                if !m.text.trim().is_empty() {
                     b.push(json!({"type": "text", "text": m.text}));
                 }
                 for c in &m.tool_calls {
@@ -584,6 +599,10 @@ pub fn anthropic_stream(bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>
                     }
                 }
                 "message_delta" => {
+                    // Why it stopped ("refusal", "max_tokens"…); message_stop follows.
+                    if let Some(r) = v.pointer("/delta/stop_reason").and_then(|r| r.as_str()) {
+                        out.push(Ok(ChatEvent::Done { stop_reason: r.to_string() }));
+                    }
                     if let Some(o) = v.pointer("/usage/output_tokens").and_then(|t| t.as_u64()) {
                         out.push(Ok(ChatEvent::Usage { input: input_tokens, output: o as u32 }));
                     }
@@ -630,8 +649,11 @@ pub fn gemini_contents(messages: &[Message]) -> Vec<Value> {
         let (role, parts) = match m.role {
             Role::User => ("user", vec![json!({"text": m.text})]),
             Role::Assistant => {
+                if is_empty_turn(m) {
+                    continue;
+                }
                 let mut p = Vec::new();
-                if !m.text.is_empty() {
+                if !m.text.trim().is_empty() {
                     p.push(json!({"text": m.text}));
                 }
                 for c in &m.tool_calls {
@@ -806,7 +828,8 @@ mod tests {
         let evs: Vec<ChatEvent> = s.map(|e| e.unwrap()).collect().await;
         assert_eq!(evs[0], ChatEvent::TextDelta("Hel".into()));
         assert_eq!(evs[2], ChatEvent::ToolCall(ToolCall { id: "c1".into(), name: "run_query".into(), arguments: json!({"sql": "select 1"}) }));
-        assert_eq!(evs[3], ChatEvent::Usage { input: 10, output: 5 });
+        assert_eq!(evs[3], ChatEvent::Done { stop_reason: "tool_calls".into() });
+        assert_eq!(evs[4], ChatEvent::Usage { input: 10, output: 5 });
         assert!(matches!(evs.last(), Some(ChatEvent::Done { .. })));
     }
 
@@ -839,5 +862,48 @@ mod tests {
         assert_eq!(g[1]["role"], "model");
         assert_eq!(g[2]["parts"].as_array().unwrap().len(), 2);
         assert_eq!(gemini_schema(&json!({"type":"object","additionalProperties":false})), json!({"type":"object"}));
+    }
+
+    /// An empty assistant turn (no text, no tool calls: e.g. a reply the
+    /// provider blocked) saved by an older version must not become an empty
+    /// `content`/`parts` list, which Anthropic and Gemini refuse with a 400.
+    #[test]
+    fn empty_assistant_turns_are_not_sent() {
+        let call = ToolCall { id: "c".into(), name: "f".into(), arguments: json!({}) };
+        let msgs = vec![
+            Message::user("q"),
+            Message::assistant("", vec![]),
+            Message::user("again"),
+            Message::assistant(" \n", vec![call.clone()]),
+            Message::tool(&call, "r"),
+        ];
+        let a = anthropic_messages(&msgs);
+        assert_eq!(a.iter().map(|m| m["role"].as_str().unwrap()).collect::<Vec<_>>(), ["user", "assistant", "user"]);
+        assert!(a.iter().all(|m| !m["content"].as_array().unwrap().is_empty()), "{a:?}");
+        assert!(a.iter().flat_map(|m| m["content"].as_array().unwrap()).all(|b| b["type"] != "text" || !b["text"].as_str().unwrap().trim().is_empty()));
+        assert_eq!(a[0]["content"].as_array().unwrap().len(), 2, "the two user turns are merged");
+        let g = gemini_contents(&msgs);
+        assert_eq!(g.iter().map(|m| m["role"].as_str().unwrap()).collect::<Vec<_>>(), ["user", "model", "user"]);
+        assert!(g.iter().all(|m| !m["parts"].as_array().unwrap().is_empty()), "{g:?}");
+        assert_eq!(g[1]["parts"].as_array().unwrap().len(), 1, "no blank text part");
+        let o = openai_messages("sys", &msgs);
+        assert_eq!(o.iter().map(|m| m["role"].as_str().unwrap()).collect::<Vec<_>>(), ["system", "user", "user", "assistant", "tool"]);
+        assert!(o[3]["content"].is_null());
+    }
+
+    /// Why a reply stopped reaches the agent: the specific reason comes first.
+    #[tokio::test]
+    async fn streams_report_why_a_reply_stopped() {
+        let s = anthropic_stream(bytes_stream(vec![
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":0}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+        ]));
+        let evs: Vec<ChatEvent> = s.map(|e| e.unwrap()).collect().await;
+        let first = evs.iter().find_map(|e| if let ChatEvent::Done { stop_reason } = e { Some(stop_reason.as_str()) } else { None });
+        assert_eq!(first, Some("refusal"), "{evs:?}");
+        let s = openai_stream(bytes_stream(vec!["data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n"]));
+        let evs: Vec<ChatEvent> = s.map(|e| e.unwrap()).collect().await;
+        let first = evs.iter().find_map(|e| if let ChatEvent::Done { stop_reason } = e { Some(stop_reason.as_str()) } else { None });
+        assert_eq!(first, Some("content_filter"), "{evs:?}");
     }
 }

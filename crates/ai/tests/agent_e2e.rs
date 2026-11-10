@@ -58,12 +58,37 @@ fn tool_call(id: &str, name: &str, args: Value) -> String {
 
 /// Mock server: responds based on how many tool results the request contains.
 async fn mock_openai(requests: Arc<Mutex<Vec<Value>>>) -> u16 {
+    mock_server(requests, |req| {
+        let msgs = req["messages"].as_array().cloned().unwrap_or_default();
+        let tool_results: Vec<&Value> = msgs.iter().filter(|m| m["role"] == "tool").collect();
+        match tool_results.len() {
+            0 => tool_call("c1", "search_schema", json!({"query": "orders revenue by country"})),
+            1 => tool_call("c2", "run_query", json!({"sql": "select country, amount from orders", "purpose": "Get order amounts"})),
+            2 => {
+                let last = tool_results[1]["content"].as_str().unwrap_or("");
+                let rid = last.split("result_id=").nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or("").to_string();
+                tool_call("c3", "query_result", json!({"result_id": rid, "sql": "select country, sum(amount) total from result group by 1 order by 2 desc"}))
+            }
+            _ => sse(&[
+                json!({"choices": [{"delta": {"content": "Vietnam leads "}}]}),
+                json!({"choices": [{"delta": {"content": "with 300."}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 8}}),
+            ]),
+        }
+    })
+    .await
+}
+
+/// Mock OpenAI-compatible server: records each request body and answers
+/// with the SSE body `respond` returns for it.
+async fn mock_server(requests: Arc<Mutex<Vec<Value>>>, respond: impl Fn(&Value) -> String + Send + Sync + 'static) -> u16 {
+    let respond = Arc::new(respond);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = l.local_addr().unwrap().port();
     tokio::spawn(async move {
         loop {
             let (mut s, _) = l.accept().await.unwrap();
-            let requests = requests.clone();
+            let (requests, respond) = (requests.clone(), respond.clone());
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 8192];
@@ -86,26 +111,7 @@ async fn mock_openai(requests: Arc<Mutex<Vec<Value>>>) -> u16 {
                 };
                 let req: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                 requests.lock().push(req.clone());
-                let msgs = req["messages"].as_array().cloned().unwrap_or_default();
-                let tool_results: Vec<&Value> = msgs.iter().filter(|m| m["role"] == "tool").collect();
-                let out = match tool_results.len() {
-                    0 => tool_call("c1", "search_schema", json!({"query": "orders revenue by country"})),
-                    1 => tool_call("c2", "run_query", json!({"sql": "select country, amount from orders", "purpose": "Get order amounts"})),
-                    2 => {
-                        let last = tool_results[1]["content"].as_str().unwrap_or("");
-                        let rid = last.split("result_id=").nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or("").to_string();
-                        tool_call(
-                            "c3",
-                            "query_result",
-                            json!({"result_id": rid, "sql": "select country, sum(amount) total from result group by 1 order by 2 desc"}),
-                        )
-                    }
-                    _ => sse(&[
-                        json!({"choices": [{"delta": {"content": "Vietnam leads "}}]}),
-                        json!({"choices": [{"delta": {"content": "with 300."}, "finish_reason": "stop"}]}),
-                        json!({"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 8}}),
-                    ]),
-                };
+                let out = respond(&req);
                 let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}", out.len());
                 let _ = s.write_all(resp.as_bytes()).await;
             });
@@ -1449,4 +1455,42 @@ async fn documented_joins_are_checked_reviewed_and_used() {
     let j = f.ws.learned_joins(&f.conn).unwrap().into_iter().find(|j| j.left_columns == ["id"]).unwrap();
     let doc = j.documented.unwrap();
     assert_eq!((doc.by.as_str(), doc.state, doc.source.as_str()), ("mcp", databrain_workspace::DocState::Approved, "the user"));
+}
+
+/// A reply with no text and no tool calls (a provider blocking it) is not
+/// saved, the user is told why, and the conversation goes on. An empty turn
+/// saved by an older version is left out of what is sent.
+#[tokio::test]
+async fn an_empty_reply_does_not_break_the_conversation() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = mock_server(requests.clone(), |req| {
+        let msgs = req["messages"].as_array().cloned().unwrap_or_default();
+        let last = msgs.last().and_then(|m| m["content"].as_str()).unwrap_or("").to_string();
+        if last.starts_with("blocked") {
+            sse(&[json!({"choices": [{"delta": {}, "finish_reason": "content_filter"}]})])
+        } else {
+            sse(&[json!({"choices": [{"delta": {"content": "Fine."}, "finish_reason": "stop"}]})])
+        }
+    })
+    .await;
+    let f = fixture(port, AiPolicy::default()).await;
+    let agent = Agent { engine: f.engine.clone(), hub: f.hub.clone(), secrets: f.secrets.clone(), max_steps: 8 };
+    let host = Arc::new(Host { approvals: AtomicUsize::new(0), approve: true });
+    let mut r = req(&f);
+    r.message = "blocked question".into();
+    let events = Arc::new(Events::default());
+    let e = agent.run(r.clone(), "r1".into(), host.clone(), events.clone(), Default::default()).await.unwrap_err();
+    assert!(e.to_string().contains("content_filter"), "{e}");
+    let sid = f.ws.list_ai_sessions(Some(&f.conn), 10).unwrap()[0].id.clone();
+    let saved = f.ws.list_ai_messages(&sid).unwrap();
+    assert_eq!(saved.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(), ["user"], "the empty reply was not saved");
+    // An empty turn an older version saved.
+    f.ws.add_ai_message(&sid, "assistant", &json!({"role": "assistant", "text": ""}), (None, None)).unwrap();
+    r.session_id = Some(sid.clone());
+    r.message = "next question".into();
+    let text = agent.run(r, "r2".into(), host, events, Default::default()).await.unwrap();
+    assert_eq!(text, "Fine.");
+    let sent = requests.lock().last().cloned().unwrap();
+    let roles: Vec<&str> = sent["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["system", "user", "user"], "{sent}");
 }

@@ -23,6 +23,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- AI: a reply the provider blocked or returned empty (for example a Gemini safety stop) no longer breaks the conversation with errors on every later turn; DataBrain now says why nothing came back, and conversations already affected work again.
 - Result grid: adding a row with no values typed now works on MySQL and Oracle (and Snowflake, BigQuery, Databricks, ClickHouse), and a cell set to NULL in a new row is inserted as NULL instead of the column default.
 - Result grid: a computed column named like a table column (`SELECT *, 0 AS price`) is read-only instead of writing to the real column; when it isn't certain which column a result column shows, it stays read-only.
 - ⌘W / Ctrl+W asks before closing a tab with unsaved changes, like the tab's close button.

@@ -345,12 +345,16 @@ pub const STOPPED_RESULT: &str = "Not run: the user stopped the assistant before
 /// Every assistant tool call followed by exactly one result, as providers
 /// require: a missing result gets [`STOPPED_RESULT`] right after the
 /// results there are, and a result answering no preceding call is dropped.
+/// Empty assistant turns (no text, no calls), which older versions saved
+/// when a reply was blocked, are dropped too: Anthropic and Gemini refuse
+/// every later turn while one is in the history.
 pub fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     let mut it = messages.into_iter().peekable();
     while let Some(m) = it.next() {
         match m.role {
             Role::Tool => {} // not right after its call: dropped
+            Role::Assistant if providers::is_empty_turn(&m) => {}
             Role::Assistant if !m.tool_calls.is_empty() => {
                 let calls = m.tool_calls.clone();
                 out.push(m);
@@ -371,6 +375,28 @@ pub fn repair_tool_pairs(messages: Vec<Message>) -> Vec<Message> {
         }
     }
     out
+}
+
+/// The error shown when the model's reply has no text and no tool calls,
+/// saying why it stopped when the provider said so.
+fn empty_reply_error(stop_reason: Option<&str>) -> AiError {
+    let r = stop_reason.map(str::trim).filter(|r| !r.is_empty());
+    let msg = match r.map(str::to_ascii_lowercase).as_deref() {
+        Some("safety" | "refusal" | "content_filter" | "recitation" | "blocklist" | "prohibited_content" | "spii" | "image_safety" | "language") => {
+            format!("The model sent no answer: the provider stopped the reply ({}). Rephrase the question and try again.", r.unwrap_or_default())
+        }
+        Some("max_tokens" | "length") => {
+            "The model ran out of output tokens before answering. Raise the provider's max output tokens or ask for less.".to_string()
+        }
+        Some("stop" | "end" | "end_turn" | "stop_sequence") | None => "The model sent an empty reply. Try again or rephrase the question.".to_string(),
+        Some(_) => format!("The model sent an empty reply (stopped: {}). Try again or rephrase the question.", r.unwrap_or_default()),
+    };
+    AiError::Provider(msg)
+}
+
+/// The model ended normally (nothing blocked or cut off).
+fn empty_reply_is_normal(stop_reason: Option<&str>) -> bool {
+    matches!(stop_reason.map(str::to_ascii_lowercase).as_deref(), None | Some("stop" | "end" | "end_turn" | "stop_sequence"))
 }
 
 fn history_text(messages: &[Message]) -> String {
@@ -613,7 +639,10 @@ impl Agent {
                 })
                 .await?;
             let assistant = Message::assistant(text.clone(), vec![]);
-            ws.add_ai_message(&sid, "assistant", &serde_json::to_value(&assistant).unwrap_or_default(), (None, None))?;
+            // An empty turn would break the conversation on other providers.
+            if !providers::is_empty_turn(&assistant) {
+                ws.add_ai_message(&sid, "assistant", &serde_json::to_value(&assistant).unwrap_or_default(), (None, None))?;
+            }
             sink.emit(AgentEvent::Finished { session_id: sid, run_id, text: text.clone() });
             return Ok(text);
         }
@@ -635,6 +664,8 @@ impl Agent {
             let mut text = String::new();
             let mut calls: Vec<ToolCall> = Vec::new();
             let mut usage = (None, None);
+            // The first reason given is the specific one (the stream's own end follows).
+            let mut stop_reason: Option<String> = None;
             loop {
                 let ev = tokio::select! {
                     ev = stream.next() => ev,
@@ -651,10 +682,22 @@ impl Agent {
                         usage = (Some(input as i64), Some(output as i64));
                         sink.emit(AgentEvent::Usage { session_id: sid.clone(), run_id: run_id.clone(), input, output });
                     }
-                    ChatEvent::Done { .. } => {}
+                    ChatEvent::Done { stop_reason: r } => {
+                        stop_reason.get_or_insert(r);
+                    }
                 }
             }
             let assistant = Message::assistant(text.clone(), calls.clone());
+            if providers::is_empty_turn(&assistant) {
+                // Not saved: Anthropic and Gemini refuse every later turn
+                // after an empty one. After tools have run, the answer so far
+                // stands; otherwise the user is told why nothing came back.
+                if !final_text.trim().is_empty() && empty_reply_is_normal(stop_reason.as_deref()) {
+                    sink.emit(AgentEvent::Finished { session_id: sid.clone(), run_id: run_id.clone(), text: final_text.clone() });
+                    return Ok(final_text);
+                }
+                return Err(empty_reply_error(stop_reason.as_deref()));
+            }
             ws.add_ai_message(&sid, "assistant", &serde_json::to_value(&assistant).unwrap_or_default(), usage)?;
             messages.push(assistant);
             if !text.is_empty() {
@@ -735,6 +778,41 @@ mod tests {
         // A complete history is unchanged.
         let fine = vec![Message::user("q"), Message::assistant("", vec![call("a")]), Message::tool(&call("a"), "ok"), Message::assistant("a", vec![])];
         assert_eq!(repair_tool_pairs(fine.clone()).len(), fine.len());
+    }
+
+    /// Empty assistant turns saved by older versions (a blocked reply) are
+    /// dropped from the history; one with tool calls or text is kept.
+    #[test]
+    fn drops_empty_assistant_turns() {
+        let call = ToolCall { id: "a".into(), name: "run_query".into(), arguments: json!({}) };
+        let msgs = vec![
+            Message::user("q"),
+            Message::assistant("", vec![]),
+            Message::user("again"),
+            Message::assistant("  \n", vec![]),
+            Message::user("and again"),
+            Message::assistant("", vec![call.clone()]),
+            Message::tool(&call, "ok"),
+            Message::assistant("answer", vec![]),
+        ];
+        let r = repair_tool_pairs(msgs);
+        let shape: Vec<String> = r.iter().map(|m| format!("{:?}", m.role)).collect();
+        assert_eq!(shape, ["User", "User", "User", "Assistant", "Tool", "Assistant"]);
+    }
+
+    #[test]
+    fn empty_replies_say_why() {
+        let msg = |r: Option<&str>| empty_reply_error(r).to_string();
+        assert!(msg(Some("safety")).contains("provider stopped the reply (safety)"), "{}", msg(Some("safety")));
+        assert!(msg(Some("refusal")).contains("(refusal)"));
+        assert!(msg(Some("content_filter")).contains("(content_filter)"));
+        assert!(msg(Some("max_tokens")).contains("ran out of output tokens"));
+        assert!(msg(Some("length")).contains("ran out of output tokens"));
+        assert_eq!(msg(Some("stop")), msg(None));
+        assert!(msg(Some("malformed_function_call")).contains("(stopped: malformed_function_call)"));
+        assert!(matches!(empty_reply_error(None), AiError::Provider(_)));
+        assert!(empty_reply_is_normal(None) && empty_reply_is_normal(Some("end_turn")) && empty_reply_is_normal(Some("STOP")));
+        assert!(!empty_reply_is_normal(Some("safety")) && !empty_reply_is_normal(Some("max_tokens")));
     }
 
     #[test]
