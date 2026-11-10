@@ -3,9 +3,14 @@
 //! expression (`lower(email)`, `max(email)`) and through `SELECT *`.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 
 use databrain_connector_core::ConnectorKind;
+use databrain_connector_core::sqlparser::ast::{Expr, ObjectNamePart, TableFactor, Visit, Visitor};
+use databrain_connector_core::sqlparser::parser::Parser;
 use databrain_lineage::{EdgeKind, Lineage, NoCatalog, NodeKind, analyze};
+
+use crate::policy::{name_parts, same_table};
 
 /// Whether `column` of `table` (a table as the SQL names it, `None` when
 /// unknown) is sensitive.
@@ -25,6 +30,21 @@ pub fn masked_columns(sql: &str, kind: ConnectorKind, columns: &[String], rule_c
     let g = analyze(sql, kind, &NoCatalog);
     let tables: Vec<&str> = g.nodes.iter().filter(|n| n.kind == NodeKind::Table).map(|n| n.name.as_str()).collect();
     let result = g.nodes.iter().rev().find(|n| n.kind == NodeKind::Result);
+    let names = names_in(sql, kind);
+    // `row_to_json(u)`, `to_jsonb(users)`, `u::text`, `SELECT u FROM users u`:
+    // lineage reads the row name as a column; it holds every column of the
+    // table, so it is masked when any rule applies to that table.
+    let ruled = |t: &str| rule_columns.iter().any(|rc| is_pii(Some(t), rc));
+    let row_names = |t: &str| {
+        let parts = name_parts(t);
+        let mut out: Vec<String> = parts.last().cloned().into_iter().collect();
+        out.extend(names.aliases.iter().filter(|(_, table)| same_table(table, &parts)).map(|(a, _)| a.clone()));
+        out
+    };
+    let whole_row = |t: &str, col: &str| ruled(t) && row_names(t).iter().any(|n| n == col);
+    // A row of a ruled table used as a value somewhere lineage can't place
+    // (an ambiguous `c` in a join): untraced columns are masked.
+    let row_used = tables.iter().any(|t| ruled(t) && row_names(t).iter().any(|n| names.idents.contains(n)));
     columns
         .iter()
         .map(|c| {
@@ -32,16 +52,55 @@ pub fn masked_columns(sql: &str, kind: ConnectorKind, columns: &[String], rule_c
             if is_pii(None, c) || tables.iter().any(|t| is_pii(Some(t), c)) {
                 return true;
             }
-            let Some(r) = result.filter(|_| !g.partial) else { return mentions };
+            let Some(r) = result.filter(|_| !g.partial) else { return mentions || row_used };
             let sources = sources(&g, &r.id, c);
             if sources.is_empty() {
                 // Not traced (an expression the lineage can't place): masked
-                // when the SQL names a sensitive column at all.
-                return mentions;
+                // when the SQL names a sensitive column, or a ruled table's
+                // whole row, at all.
+                return mentions || row_used;
             }
-            sources.iter().any(|(t, col)| if col == "*" { is_pii(Some(t), c) } else { is_pii(Some(t), col) || is_pii(None, col) })
+            sources.iter().any(|(t, col)| if col == "*" { is_pii(Some(t), c) } else { is_pii(Some(t), col) || is_pii(None, col) || whole_row(t, col) })
         })
         .collect()
+}
+
+/// What the SQL names, from its syntax tree (lower-cased): `(alias, table
+/// parts)` of every aliased table (`FROM users u`, `JOIN public.orders AS
+/// o`), and every bare identifier used as a value (`row_to_json(u)`,
+/// `u::text`; not `u.email`). Empty when the SQL doesn't parse (the
+/// lineage then fails closed on its own).
+struct Names {
+    aliases: Vec<(String, Vec<String>)>,
+    idents: HashSet<String>,
+}
+
+impl Visitor for Names {
+    type Break = ();
+    fn pre_visit_table_factor(&mut self, f: &TableFactor) -> ControlFlow<()> {
+        if let TableFactor::Table { name, alias: Some(a), .. } = f {
+            let parts = name.0.iter().filter_map(|p| if let ObjectNamePart::Identifier(i) = p { Some(i.value.to_ascii_lowercase()) } else { None }).collect();
+            self.aliases.push((a.name.value.to_ascii_lowercase(), parts));
+        }
+        ControlFlow::Continue(())
+    }
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        if let Expr::Identifier(i) = e {
+            self.idents.insert(i.value.to_ascii_lowercase());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn names_in(sql: &str, kind: ConnectorKind) -> Names {
+    let mut v = Names { aliases: Vec::new(), idents: HashSet::new() };
+    let dialect = databrain_connector_core::sql::dialect_for(kind);
+    if let Ok(stmts) = Parser::parse_sql(dialect.as_ref(), sql) {
+        for s in &stmts {
+            let _ = s.visit(&mut v);
+        }
+    }
+    v
 }
 
 /// MongoDB and other non-SQL queries: no lineage, so a column is masked by
@@ -148,6 +207,23 @@ mod tests {
         assert_eq!(pg(users, "select id from users where email like '%@x.io'", &["id"]), [false]);
         // A rule for one table does not mask the same name elsewhere.
         assert_eq!(pg(users, "select email from leads", &["email"]), [false]);
+        // Whole rows: every column of the table in one value.
+        for sql in [
+            "select row_to_json(u) j from users u",
+            "select to_jsonb(users) j from users",
+            "select u::text j from users u",
+            "select u j from users u",
+            "select json_agg(x) j from public.users as x",
+            "select row_to_json(u.*) j from users u",
+            "select row_to_json(s) j from (select email from users) s",
+            "select o.id, row_to_json(c) j from orders o join users c on c.id = o.user_id",
+        ] {
+            assert_eq!(pg(users, sql, &["j"]), [true], "{sql}");
+        }
+        assert_eq!(pg(users, "select o.id, row_to_json(c) j from orders o join users c on c.id = o.user_id", &["id", "j"]), [false, true]);
+        // A whole row of a table without rules stays visible.
+        assert_eq!(pg(users, "select row_to_json(o) j from orders o", &["j"]), [false]);
+        assert_eq!(pg(&["ssn"], "select row_to_json(p) j from people p", &["j"]), [true], "a table-less rule may be in any row");
         // A rule with a schema masks SQL that leaves the schema out.
         assert_eq!(pg(&["public.users.email"], "select email, name from users", &["email", "name"]), [true, false]);
         assert_eq!(pg(&["public.users.email"], "select u.email e from public.users u", &["e"]), [true]);
