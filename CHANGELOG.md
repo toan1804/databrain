@@ -13,6 +13,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 ### Security
 
 - A production connection asks before admin and server-wide statements too, not only data and schema changes: `KILL`, `SHUTDOWN`, `RESTORE`, `VACUUM FULL`, `REFRESH MATERIALIZED VIEW`, `FLUSH TABLES WITH READ LOCK`, `CHECKPOINT` and `SET GLOBAL …` ran without the confirmation. Reads, `BEGIN`/`COMMIT` and the harmless `USE`/`SET` a read-only connection allows still run at once. The assistant already treated these as writes.
+- PII rules that name a table (`users.email`) now mask MongoDB results: `db.users.find({})` returned `email` in clear because the rule was checked without the collection. The collections a command reads are used, nested fields match by their last part (`contact.email`), and when the collections can't be told a column named like any rule's column is masked.
 
 ### Fixed
 

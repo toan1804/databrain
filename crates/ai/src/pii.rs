@@ -20,7 +20,7 @@ pub fn masked_columns(sql: &str, kind: ConnectorKind, columns: &[String], rule_c
     }
     let mentions = mentions_any(sql, rule_columns);
     if !kind.traits().language.is_sql() {
-        return columns.iter().map(|c| is_pii(None, c) || mentions).collect();
+        return non_sql_masks(sql, kind, columns, rule_columns, is_pii, mentions);
     }
     let g = analyze(sql, kind, &NoCatalog);
     let tables: Vec<&str> = g.nodes.iter().filter(|n| n.kind == NodeKind::Table).map(|n| n.name.as_str()).collect();
@@ -40,6 +40,33 @@ pub fn masked_columns(sql: &str, kind: ConnectorKind, columns: &[String], rule_c
                 return mentions;
             }
             sources.iter().any(|(t, col)| if col == "*" { is_pii(Some(t), c) } else { is_pii(Some(t), col) || is_pii(None, col) })
+        })
+        .collect()
+}
+
+/// MongoDB and other non-SQL queries: no lineage, so a column is masked by
+/// name, against the collections the query reads or writes (a rule
+/// `users.email` masks `email` of `db.users.find({})`). When the
+/// collections can't be told, a column named like any rule's column is
+/// masked (fail closed). Dotted names (`profile.email`) match by their last
+/// part too.
+fn non_sql_masks(sql: &str, kind: ConnectorKind, columns: &[String], rule_columns: &[String], is_pii: &IsPii, mentions: bool) -> Vec<bool> {
+    let refs = databrain_connector_core::tables::table_refs(sql, kind);
+    let tables: Vec<String> = refs.reads.iter().chain(&refs.writes).map(|t| t.join(".")).collect();
+    let known = refs.opaque.is_empty() && !tables.is_empty();
+    columns
+        .iter()
+        .map(|c| {
+            let col = c.to_ascii_lowercase();
+            let leaf = col.rsplit('.').next().unwrap_or(&col).to_string();
+            if mentions || is_pii(None, &col) || is_pii(None, &leaf) {
+                return true;
+            }
+            if known {
+                tables.iter().any(|t| is_pii(Some(t), &col) || is_pii(Some(t), &leaf))
+            } else {
+                rule_columns.iter().any(|r| r.eq_ignore_ascii_case(&col) || r.eq_ignore_ascii_case(&leaf))
+            }
         })
         .collect()
 }
@@ -136,5 +163,22 @@ mod tests {
         // Not SQL (MongoDB): by name, or masked when the query mentions a sensitive column.
         assert_eq!(masked(ConnectorKind::Mongodb, users, "db.users.find({}, {email: 1})", &["_id", "email"]), [true, true]);
         assert_eq!(masked(ConnectorKind::Mongodb, &["ssn"], "db.people.find({})", &["_id", "ssn"]), [false, true]);
+    }
+
+    #[test]
+    fn table_rules_mask_mongodb_results() {
+        // As in the app: the MongoDB shell parser tells which collections a command uses.
+        databrain_connector_core::language::set_mongo_analyzer(databrain_connector_mongodb::analyze);
+        let users = &["users.email"];
+        // The rule names a collection: its column is masked without being named in the query.
+        assert_eq!(masked(ConnectorKind::Mongodb, users, "db.users.find({})", &["_id", "email", "name"]), [false, true, false]);
+        assert_eq!(masked(ConnectorKind::Mongodb, users, "db.getSiblingDB('crm').getCollection('users').find({})", &["email"]), [true]);
+        assert_eq!(masked(ConnectorKind::Mongodb, users, r#"{"find": "users", "filter": {}}"#, &["email"]), [true]);
+        assert_eq!(masked(ConnectorKind::Mongodb, users, "db.users.find({})", &["contact.email"]), [true], "nested field");
+        // Another collection's column of the same name is not masked.
+        assert_eq!(masked(ConnectorKind::Mongodb, users, "db.leads.find({})", &["email"]), [false]);
+        assert_eq!(masked(ConnectorKind::Mongodb, users, "db.users.aggregate([{$match: {}}])", &["email"]), [true]);
+        // Collections that can't be told: masked by the rule's column name (fail closed).
+        assert_eq!(masked(ConnectorKind::Mongodb, users, "db.runCommand({ping: 1})", &["email", "ok"]), [true, false]);
     }
 }
