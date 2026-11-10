@@ -22,6 +22,7 @@ pub mod related;
 mod run;
 pub mod schema_diff;
 mod sessions;
+pub mod testdata;
 
 pub use error::*;
 pub use events::*;

@@ -1,7 +1,7 @@
 // Copy / insert actions for catalog objects (explorer tree and catalog search).
 import { traitsOf } from "../lib/sourceTraits";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { ClipboardCopy, Columns3, FileCode2, GitCompare, Play, RefreshCw, Share2, TextCursorInput } from "lucide-react";
+import { ClipboardCopy, Columns3, FileCode2, GitCompare, Play, Shuffle, RefreshCw, Share2, TextCursorInput } from "lucide-react";
 import { toError } from "../lib/api";
 import { isRelationKind, columnList, schemaLabel, schemaPath, splitSchema, tablePath } from "../lib/catalog";
 import type { ConnectionView, DbObject, SchemaInfo } from "../lib/types";
@@ -177,6 +177,14 @@ export function ObjectMenu({
               after: { kind: "table", connection_id: "", schema: obj.schema, table: obj.name },
             }),
           )}
+        />
+      )}
+      {obj.kind === "table" && traitsOf(kind).load && (
+        <MenuItem
+          icon={<Shuffle size={13} />}
+          label="Generate test data…"
+          hint="from its column types"
+          onClick={run(() => useStore.getState().openTestDataDialog({ connection_id: conn.id, schema: obj.schema, table: obj.name }))}
         />
       )}
       {obj.kind !== "other" && (

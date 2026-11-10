@@ -323,7 +323,7 @@ export function ResultView({
       {pinning && stmt.output && connId && (
         <PinChartDialog info={info} spec={pinning.spec} kind={pinning.kind} sql={stmt.output.sql} connectionId={stmt.output.connection_id || connId} defaultTitle={title ?? tab?.title ?? "Chart"} onClose={() => setPinning(null)} />
       )}
-      {loadOpen && <LoadIntoDialog info={info} sql={stmt.output?.sql ?? ""} outputName={stmt.output?.name} onClose={() => setLoadOpen(false)} />}
+      {loadOpen && <LoadIntoDialog info={info} sql={stmt.output?.sql ?? ""} outputName={stmt.output?.name} connectionId={stmt.output?.connection_id} onClose={() => setLoadOpen(false)} />}
       {preview && <EditPreviewModal preview={preview} setPreview={setPreview} target={target} saving={saving} saveEdits={saveEdits} />}
 
       {headerMenu && (

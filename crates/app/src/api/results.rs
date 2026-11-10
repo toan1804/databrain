@@ -272,3 +272,58 @@ pub async fn dry_run_result_load(state: &AppState, result_id: &str, args: LoadRe
 pub async fn check_load_target(state: &AppState, connection_id: &str, table: &str) -> Result<databrain_query_engine::LoadTarget> {
     state.engine.check_load_target(connection_id, table).await
 }
+
+// ------------------------------------------------------------ test data
+
+/// Columns of a table and what generated test data would put in each.
+pub async fn test_data_plan(state: &AppState, connection_id: &str, schema: &str, name: &str) -> Result<databrain_query_engine::testdata::TestDataPlan> {
+    state.engine.test_data_plan(connection_id, schema, name).await
+}
+
+/// Generated rows, stored as an output (grid preview, "Load into…").
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct TestDataOutput {
+    pub output: databrain_query_engine::OutputInfo,
+    /// The seed used: the same seed makes the same rows again.
+    #[ts(as = "f64")]
+    pub seed: u64,
+    pub notes: Vec<String>,
+    /// The table, quoted as the database needs it (the load target).
+    pub table: String,
+}
+
+/// Make up rows for a table from its column types. Nothing is written: the
+/// rows become an output, which the existing load path ("Load into…",
+/// [`load_result`]) writes into the table when the user asks. A new
+/// generation for the same table frees the previous one.
+pub async fn generate_test_data(
+    state: &AppState,
+    connection_id: &str,
+    schema: &str,
+    name: &str,
+    spec: databrain_query_engine::testdata::TestDataSpec,
+) -> Result<TestDataOutput> {
+    let profile = state.workspace.get_connection(connection_id)?;
+    let data = state.engine.generate_test_data(connection_id, schema, name, &spec).await?;
+    let tab = format!("__testdata__:{connection_id}:{schema}.{name}");
+    let outputs = state.engine.outputs();
+    outputs.close_tab(&tab);
+    let id = uuid::Uuid::new_v4().to_string();
+    let rs = state.results().insert_complete(id, data.rows.schema.clone(), data.rows.batches, false);
+    let info = rs.lock().info();
+    let output = outputs.add(databrain_query_engine::NewOutput {
+        result: info,
+        connection_id: connection_id.to_string(),
+        connection_name: profile.name,
+        kind: profile.config.kind,
+        sql: format!("-- Test data for {} ({} rows, seed {})", data.table, spec.rows, data.seed),
+        tab_id: tab,
+        statement_index: 0,
+        row_limit: None,
+        origin: databrain_workspace::Origin::User,
+        session_key: String::new(),
+    });
+    state.engine.outputs_changed();
+    Ok(TestDataOutput { output, seed: data.seed, notes: data.notes, table: data.table })
+}

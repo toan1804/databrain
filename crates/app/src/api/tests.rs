@@ -608,6 +608,79 @@ fn save_profile_update(st: &AppState, p: ConnectionProfile) {
     save_connection(st, SaveConnectionArgs { profile: p, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
 }
 
+/// Test data: generated from the column types, foreign keys take the
+/// parent's keys, keys count past the table's maximum, and the rows go in
+/// through the load path. A read-only connection refuses the load.
+#[tokio::test]
+async fn test_data_generates_and_loads_sqlite() {
+    let (st, _sink, dir) = state();
+    let db = dir.path().join("t.db");
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(db.to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let p = save_profile(&st, "t", cfg.clone(), None);
+    exec(
+        &st,
+        &p.id,
+        "create table customers (id integer primary key, email varchar(60) not null); \
+         insert into customers values (10, 'a@x'); insert into customers values (20, 'b@x'); \
+         create table orders (id integer primary key, customer_id integer not null references customers(id), \
+           amount numeric(8,2), placed date, note text, shape integer[]); \
+         insert into orders (id, customer_id) values (5, 10)",
+    )
+    .await;
+    let main = list_schemas(&st, &p.id).await.unwrap()[0].name.clone();
+    let plan = test_data_plan(&st, &p.id, &main, "orders").await.unwrap();
+    assert_eq!(plan.foreign_keys.len(), 1);
+    assert!(plan.warnings[0].contains("foreign key"), "{:?}", plan.warnings);
+    let cid = plan.columns.iter().find(|c| c.name == "customer_id").unwrap();
+    assert!(cid.parent.as_deref().is_some_and(|x| x.contains("customers")), "{cid:?}");
+
+    let spec = |rows| databrain_query_engine::testdata::TestDataSpec { rows, null_percent: 20, seed: Some(3), skip: vec![], fill: vec![], parent_keys: true };
+    let made = generate_test_data(&st, &p.id, &main, "orders", spec(50)).await.unwrap();
+    assert_eq!(made.output.rows, 50);
+    assert!(made.notes.iter().any(|n| n.contains("2 existing keys")), "{:?}", made.notes);
+    let args =
+        LoadResultArgs { target_connection_id: p.id.clone(), table: made.table.clone(), mode: Default::default(), key_columns: vec![], create_table: false };
+    let dry = dry_run_result_load(&st, &made.output.result_id, args.clone()).await.unwrap();
+    assert!(dry.ok, "{dry:?}");
+    let r = load_result(&st, &made.output.result_id, args, "l1").await.unwrap();
+    assert_eq!(r.rows, 50);
+    let s = st.engine.session_for_tests(&p.id).await.unwrap();
+    let (_, rows) = databrain_connector_core::query_table(
+        &*s,
+        "select count(*), min(id), sum(customer_id not in (10, 20)), sum(shape is not null) from orders where id <> 5",
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows[0], vec![Some("50".into()), Some("6".into()), Some("0".into()), Some("0".into())], "keys after the max, parents' keys, geometry left out");
+
+    // Same seed, same rows; the previous generation is freed.
+    let again = generate_test_data(&st, &p.id, &main, "orders", spec(50)).await.unwrap();
+    assert!(st.results().get(&made.output.result_id).is_err(), "previous rows freed");
+    assert_eq!(again.seed, 3);
+    assert!(generate_test_data(&st, &p.id, &main, "orders", spec(0)).await.is_err());
+
+    // Read-only: rows can be made and previewed, not loaded.
+    let mut ro = cfg.clone();
+    ro.read_only = true;
+    let q = save_profile(&st, "ro", ro, None);
+    let made = generate_test_data(&st, &q.id, &main, "customers", spec(5)).await.unwrap();
+    let args =
+        LoadResultArgs { target_connection_id: q.id.clone(), table: made.table.clone(), mode: Default::default(), key_columns: vec![], create_table: false };
+    let e = load_result(&st, &made.output.result_id, args, "l2").await.unwrap_err();
+    assert!(e.message.contains("read-only"), "{}", e.message);
+}
+
 /// Live Postgres (object versions): after a change only the changed and
 /// new tables are fetched; untouched tables keep fresh columns.
 #[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]

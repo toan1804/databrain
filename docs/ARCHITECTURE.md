@@ -254,6 +254,8 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 
 `crates/export/src/load.rs` builds `CREATE TABLE` from Arrow types and batched `INSERT` statements from the `load` part of `SourceTraits`. `crates/query-engine/src/load.rs` runs load steps: insert, delete then insert, replace, and update or merge by key through a staging table (`MERGE` where the engine has it, otherwise `UPDATE ... FROM` plus `INSERT ... WHERE NOT EXISTS`), in one transaction where the engine allows it, plus dry runs.
 
+`crates/query-engine/src/testdata.rs` makes up rows for a table ("Generate test data…"): each column's database type picks a generator, foreign key columns take keys read from the parent tables on the metadata session, and the first primary key column counts up from the table's `MAX`. It writes nothing: `api::generate_test_data` stores the rows as an output, and the existing `load_result` / `dry_run_result_load` load them.
+
 ---
 
 ## 10. Workspace store

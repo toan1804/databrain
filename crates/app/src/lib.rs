@@ -243,6 +243,8 @@ pub fn run() {
             commands::results::cancel_load,
             commands::results::dry_run_result_load,
             commands::results::check_load_target,
+            commands::results::test_data_plan,
+            commands::results::generate_test_data,
             commands::queries::sql_parameters,
             commands::lineage::sql_lineage,
             commands::queries::save_text_file,

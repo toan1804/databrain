@@ -12,8 +12,16 @@ import { useStore } from "../store";
 import { DryRunReport, LoadTargetCheck, isKeyedMode, loadModesFor, loadTargetBlocked, useLoadTarget } from "./job/LoadFields";
 import { Modal } from "./ui";
 
+/** The table generated test data was made for (its output's SQL is `-- Test data for <table> (…)`). */
+export function testDataTable(sql: string): string | null {
+  const m = /^-- Test data for (.+) \(\d+ rows, seed \d+\)$/.exec(sql.trim());
+  return m ? m[1] : null;
+}
+
 /** A table name to suggest: the output's name, else the table the SQL reads. */
 export function suggestTable(sql: string, outputName?: string | null): string {
+  const generated = testDataTable(sql);
+  if (generated) return generated;
   if (outputName) return outputName;
   const m = /\bfrom\s+((?:[\w$]+\.)?[\w$]+)/i.exec(sql);
   // Reading a file (read_csv('…'), 'file.csv'): its base name.
@@ -22,15 +30,29 @@ export function suggestTable(sql: string, outputName?: string | null): string {
   return m ? m[1].split(".").pop()! : "imported";
 }
 
-export function LoadIntoDialog({ info, sql, outputName, onClose }: { info: ResultInfo; sql: string; outputName?: string | null; onClose: () => void }) {
+export function LoadIntoDialog({
+  info,
+  sql,
+  outputName,
+  connectionId,
+  onClose,
+}: {
+  info: ResultInfo;
+  sql: string;
+  outputName?: string | null;
+  /** Connection the rows came from: the default target for generated test data. */
+  connectionId?: string;
+  onClose: () => void;
+}) {
   const toast = useStore((s) => s.toast);
   const connections = useStore((s) => s.connections);
   const writable = useMemo(() => connections.filter((c) => !c.config.read_only), [connections]);
-  const [target, setTarget] = useState(writable[0]?.id ?? "");
+  const generated = testDataTable(sql) !== null;
+  const [target, setTarget] = useState((generated && writable.find((c) => c.id === connectionId)?.id) || (writable[0]?.id ?? ""));
   const [table, setTable] = useState(() => suggestTable(sql, outputName));
   const [mode, setMode] = useState<LoadMode>("append");
   const [keys, setKeys] = useState<string[]>([]);
-  const [create, setCreate] = useState(true);
+  const [create, setCreate] = useState(!generated);
   const [dry, setDry] = useState<{ busy: boolean; report?: LoadDryRun }>({ busy: false });
   const [run, setRun] = useState<{ id: string; done: number; total: number } | null>(null);
   const [report, setReport] = useState<LoadReport | null>(null);

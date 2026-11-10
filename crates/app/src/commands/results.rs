@@ -72,6 +72,27 @@ pub(crate) async fn check_load_target(state: State<'_, AppState>, connection_id:
 }
 
 #[tauri::command]
+pub(crate) async fn test_data_plan(
+    state: State<'_, AppState>,
+    connection_id: String,
+    schema: String,
+    name: String,
+) -> R<databrain_query_engine::testdata::TestDataPlan> {
+    api::test_data_plan(&state, &connection_id, &schema, &name).await
+}
+
+#[tauri::command]
+pub(crate) async fn generate_test_data(
+    state: State<'_, AppState>,
+    connection_id: String,
+    schema: String,
+    name: String,
+    spec: databrain_query_engine::testdata::TestDataSpec,
+) -> R<api::TestDataOutput> {
+    api::generate_test_data(&state, &connection_id, &schema, &name, spec).await
+}
+
+#[tauri::command]
 pub(crate) async fn summarize_selection(
     state: State<'_, AppState>,
     result_id: String,

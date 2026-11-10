@@ -57,6 +57,16 @@ export interface UiSlice {
   /** The compare-outputs dialog, opened from anywhere (explorer, result toolbar). */
   compareDialog: CompareRequest | null;
   openCompareDialog: (r: CompareRequest | null) => void;
+  /** "Generate test data…" for a table (explorer). */
+  testDataDialog: TestDataRequest | null;
+  openTestDataDialog: (r: TestDataRequest | null) => void;
+}
+
+/** The table test data is made for. */
+export interface TestDataRequest {
+  connection_id: string;
+  schema: string;
+  table: string;
 }
 
 /** What the compare dialog starts with: an output, or table/file sides to read. */
@@ -83,6 +93,7 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   toasts: [],
   confirm: null,
   compareDialog: null,
+  testDataDialog: null,
   paletteOpen: false,
   toast: (message, kind = "info") => {
     const id = uid();
@@ -149,4 +160,5 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
   askConfirm: (confirm) => set({ confirm }),
   openCompareDialog: (compareDialog) => set({ compareDialog }),
+  openTestDataDialog: (testDataDialog) => set({ testDataDialog }),
 });

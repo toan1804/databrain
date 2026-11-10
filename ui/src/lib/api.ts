@@ -107,6 +107,9 @@ import type {
   TabState,
   TestResult,
   ViewSpec,
+  TestDataOutput,
+  TestDataPlan,
+  TestDataSpec,
   ProviderUsage,
   HistoryClear,
   JoinStatus,
@@ -289,6 +292,11 @@ export const api = {
   cancelLoad: (loadId: string) => call<boolean>("cancel_load", { loadId }),
   dryRunResultLoad: (resultId: string, args: LoadResultArgs) => call<LoadDryRun>("dry_run_result_load", { resultId, args }),
   checkLoadTarget: (connectionId: string, table: string) => call<LoadTarget>("check_load_target", { connectionId, table }),
+  /** Columns of a table and what generated test data would put in each. */
+  testDataPlan: (connectionId: string, schema: string, name: string) => call<TestDataPlan>("test_data_plan", { connectionId, schema, name }),
+  /** Make up rows for a table (nothing is written): an output to preview or load. */
+  generateTestData: (connectionId: string, schema: string, name: string, spec: TestDataSpec) =>
+    call<TestDataOutput>("generate_test_data", { connectionId, schema, name, spec }),
   summarizeSelection: (resultId: string, view: ViewSpec, columns: number[], offset: number, limit: number) =>
     call<SelectionSummary>("summarize_selection", { resultId, view, columns, offset, limit }),
   columnStats: (resultId: string, view: ViewSpec, column: number) =>

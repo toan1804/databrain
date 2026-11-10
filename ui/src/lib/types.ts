@@ -156,6 +156,11 @@ import type { SchemaRefresh } from "./bindings/SchemaRefresh";
 import type { LineageCheck } from "./bindings/LineageCheck";
 import type { LineageView } from "./bindings/LineageView";
 import type { LoadResultArgs } from "./bindings/LoadResultArgs";
+import type { TestDataColumn } from "./bindings/TestDataColumn";
+import type { TestDataForeignKey } from "./bindings/TestDataForeignKey";
+import type { TestDataOutput } from "./bindings/TestDataOutput";
+import type { TestDataPlan } from "./bindings/TestDataPlan";
+import type { TestDataSpec } from "./bindings/TestDataSpec";
 import type { Span } from "./bindings/Span";
 import type { ImportCandidate } from "./bindings/ImportCandidate";
 import type { ImportPreview } from "./bindings/ImportPreview";
@@ -329,6 +334,11 @@ export type {
   LineageCheck,
   LineageView,
   LoadResultArgs,
+  TestDataColumn,
+  TestDataForeignKey,
+  TestDataOutput,
+  TestDataPlan,
+  TestDataSpec,
   Span,
   ImportCandidate,
   ImportPreview,

@@ -11,6 +11,7 @@ import { ImportConnectionsDialog } from "./components/ConnectionsIoDialog";
 import { CommandPalette } from "./components/CommandPalette";
 import { ConfirmDialog, Toasts } from "./components/ui";
 import { CompareDialogHost } from "./components/OutputChip";
+import { TestDataDialogHost } from "./components/TestDataDialog";
 import { AiPanel } from "./components/AiPanel";
 import { ExcelSheetDialog } from "./components/ExcelSheetDialog";
 import { SchemaPickerDialog } from "./components/SchemaPickerDialog";
@@ -231,6 +232,7 @@ export default function App() {
       <InlineAi />
       <ConfirmDialog />
       <CompareDialogHost />
+      <TestDataDialogHost />
       <ExcelSheetDialog />
       <SchemaPickerDialog />
       <Toasts />
