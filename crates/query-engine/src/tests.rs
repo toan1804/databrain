@@ -540,3 +540,104 @@ async fn read_only_connections_refuse_everything_but_reads() {
     let evs = wait_job(&f, &id).await;
     assert!(evs.iter().any(|e| matches!(e, JobEvent::StatementFinished { result: Some(r), .. } if r.total_rows == 1)), "{evs:?}");
 }
+
+/// A statement's stored result is kept only when it finished: an error, a
+/// stream that ends without `Done` and an abandoned read all remove it.
+#[tokio::test]
+async fn unfinished_statement_results_are_removed_from_the_store() {
+    use databrain_connector_core::arrow::array::{Int64Array, RecordBatch};
+    use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
+    use databrain_connector_core::{ExecSummary, QueryStream, StreamEvent};
+    let f = fixture(EnvTag::Dev);
+    let r = req(&f, "select 1");
+    let profile = f.ws.get_connection(&f.conn_id).unwrap();
+    let stmt = f.engine.plan(&profile, "select 1").remove(0);
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+    // `end`: how the stream ends after a schema and a batch.
+    let run = |job: &'static str, end: Option<std::result::Result<StreamEvent, ConnectorError>>| {
+        let (tx, stream) = QueryStream::channel(8);
+        let (schema, batch) = (schema.clone(), batch.clone());
+        tokio::spawn(async move {
+            tx.send(StreamEvent::Schema(schema)).await;
+            tx.send(StreamEvent::Batch(batch)).await;
+            match end {
+                Some(Ok(ev)) => {
+                    tx.send(ev).await;
+                }
+                Some(Err(e)) => {
+                    tx.send_err(e).await;
+                }
+                None => {} // dropped: the stream ends without Done
+            }
+        });
+        let (engine, r, stmt) = (f.engine.clone(), r.clone(), stmt.clone());
+        async move { engine.collect_stream(job, &r, &stmt, None, CancellationToken::new(), stream, Instant::now()).await }
+    };
+
+    let ok = run("done", Some(Ok(StreamEvent::Done(ExecSummary::default())))).await.unwrap();
+    assert_eq!(ok.result.unwrap().total_rows, 2);
+    assert!(f.engine.results().contains("done:0"), "a finished result stays");
+
+    let e = run("early", None).await.err().unwrap();
+    assert_eq!(e.kind, "internal");
+    assert!(!f.engine.results().contains("early:0"), "a stream that ends without Done leaves nothing");
+
+    assert!(run("failed", Some(Err(ConnectorError::internal("boom")))).await.is_err());
+    assert!(!f.engine.results().contains("failed:0"), "an error leaves nothing");
+
+    // Read stops half way (the future is dropped).
+    let (tx, stream) = QueryStream::channel(8);
+    tx.send(StreamEvent::Schema(schema.clone())).await;
+    let engine = f.engine.clone();
+    let (r2, s2) = (r.clone(), stmt.clone());
+    let reading = tokio::spawn(async move { engine.collect_stream("dropped", &r2, &s2, None, CancellationToken::new(), stream, Instant::now()).await });
+    for _ in 0..100 {
+        if f.engine.results().contains("dropped:0") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(f.engine.results().contains("dropped:0"));
+    reading.abort();
+    let _ = reading.await;
+    assert!(!f.engine.results().contains("dropped:0"), "an abandoned read leaves nothing");
+    drop(tx);
+}
+
+/// A run whose tab closed while it ran (its statement finished before it
+/// saw the cancel) doesn't leave an active output behind; a run of an open
+/// tab keeps its output.
+#[tokio::test]
+async fn outputs_of_a_run_whose_tab_closed_are_freed() {
+    let f = fixture(EnvTag::Dev);
+    let profile = f.ws.get_connection(&f.conn_id).unwrap();
+    let run = |tab: &str, close: bool| {
+        let r = RunRequest { tab_id: tab.into(), ..req(&f, "select 1 as a") };
+        let plan = f.engine.plan(&profile, &r.sql);
+        let job = format!("job-{tab}");
+        f.engine
+            .jobs
+            .lock()
+            .insert(job.clone(), JobHandle { tab_id: tab.into(), session_key: tab.into(), cancel: CancellationToken::new(), tab_closed: false });
+        if close {
+            f.engine.close_tab(tab);
+            let jobs = f.engine.jobs.lock();
+            let j = &jobs[&job];
+            assert!(j.tab_closed && j.cancel.is_cancelled());
+        }
+        // The statement runs as if the cancel came too late.
+        f.engine.clone().run_job(job, r, plan, CancellationToken::new(), None)
+    };
+
+    run("open", false).await;
+    let open = f.engine.outputs().for_tab("open");
+    assert_eq!(open.len(), 1);
+    assert!(open[0].active && f.engine.results().contains(&open[0].result_id));
+
+    run("closed", true).await;
+    assert!(f.engine.outputs().for_tab("closed").is_empty(), "no active output for a closed tab");
+    let freed = f.engine.outputs().list().into_iter().find(|o| o.tab_id == "closed").unwrap();
+    assert_eq!(freed.state, OutputState::Evicted);
+    assert!(!freed.active && !f.engine.results().contains(&freed.result_id));
+}

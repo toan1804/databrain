@@ -23,6 +23,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Query results no longer stay in memory when a result stream ends early or a tab is closed while its query runs.
 - Result grid: exact decimals (e.g. Oracle `NUMBER(38)` ids past 2^53) sort, filter and summarize exactly instead of as floating point, so `= 9007199254740993` no longer matches 9007199254740992; `1.50` and `1.5` count as one value, and `-0.000` equals `0`.
 - TSV files (`.tsv`, `.tsv.gz`) are read by tab: DuckDB guessed the delimiter and took `,` when values contained commas (`Smith, John`), splitting the columns wrong. `.psv` files are read by `|`.
 - Results of a script with many statements (15 results in a tab) no longer run off the edge of the result bar: the bar scrolls sideways (wheel, the ‹ › arrows, ←/→/Home/End on a result), keeps the result shown in view, and "All results" lists every result to find one by its number, SQL or output name.

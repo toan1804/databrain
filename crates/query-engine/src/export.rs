@@ -44,7 +44,10 @@ impl QueryEngine {
                     return Err(EngineError::new("busy", "A query is running in this tab: wait for it, or commit, to export everything"));
                 }
                 // Busy like a running query until the export ends.
-                self.jobs.lock().insert(format!("export:{export_id}"), JobHandle { tab_id: k.to_string(), session_key: k.to_string(), cancel: cancel.clone() });
+                self.jobs.lock().insert(
+                    format!("export:{export_id}"),
+                    JobHandle { tab_id: k.to_string(), session_key: k.to_string(), cancel: cancel.clone(), tab_closed: false },
+                );
                 k.to_string()
             }
             None => format!("__export__:{export_id}"),

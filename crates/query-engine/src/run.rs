@@ -121,7 +121,10 @@ impl QueryEngine {
             if jobs.values().any(|j| j.tab_id == req.tab_id || j.session_key == req.session_key()) {
                 return Err(EngineError::new("busy", "A query is already running in this tab"));
             }
-            jobs.insert(job_id.clone(), JobHandle { tab_id: req.tab_id.clone(), session_key: req.session_key().to_string(), cancel: cancel.clone() });
+            jobs.insert(
+                job_id.clone(),
+                JobHandle { tab_id: req.tab_id.clone(), session_key: req.session_key().to_string(), cancel: cancel.clone(), tab_closed: false },
+            );
         }
         // Previous outputs of this tab become "recent" (evictable).
         self.outputs.begin_run(&req.tab_id);
@@ -329,7 +332,15 @@ impl QueryEngine {
         if let (Some(name), Some(h)) = (req.output_name.as_deref().filter(|n| !n.is_empty()), &last_output) {
             let _ = self.outputs.set_name(h, Some(name));
         }
-        self.jobs.lock().remove(&job_id);
+        // Removed under the jobs lock `close_tab` marks it under: a tab
+        // closed before this point is seen here, one closed after it has
+        // every output of this run to free.
+        let tab_closed = self.jobs.lock().remove(&job_id).is_some_and(|j| j.tab_closed);
+        if tab_closed {
+            // Outputs added after the tab closed would stay active (never
+            // evicted) for a tab that no longer exists.
+            self.outputs.close_tab(&req.tab_id);
+        }
         self.outputs_changed();
         let in_transaction = self.in_transaction(&req.connection_id, req.session_key());
         // What ran and how it ended; never the SQL itself.
@@ -346,13 +357,12 @@ impl QueryEngine {
         cancel: CancellationToken,
     ) -> Result<StatementOutcome> {
         let started = Instant::now();
-        let mut server_ms = None;
         let session = tokio::select! {
             s = self.session_for(&req.connection_id, req.session_key(), req.origin) => s?,
             _ = cancel.cancelled() => return Err(ConnectorError::cancelled().into()),
         };
         let batch_size = limit.map(|l| l.clamp(1, 2000)).unwrap_or(2000);
-        let mut stream = session
+        let stream = session
             .execute(
                 &stmt.sql,
                 ExecOptions {
@@ -364,8 +374,27 @@ impl QueryEngine {
                 },
             )
             .await?;
+        self.collect_stream(job_id, req, stmt, limit, cancel, stream, started).await
+    }
 
+    /// Reads a statement's result stream into the result store. Every way
+    /// out except a finished result (`Done`, or stopped at the row cap)
+    /// removes what was stored: an error, a stream that ends without `Done`,
+    /// and this future being dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn collect_stream(
+        &self,
+        job_id: &str,
+        req: &RunRequest,
+        stmt: &PlannedStatement,
+        limit: Option<usize>,
+        cancel: CancellationToken,
+        mut stream: databrain_connector_core::QueryStream,
+        started: Instant,
+    ) -> Result<StatementOutcome> {
+        let mut server_ms = None;
         let result_id = format!("{job_id}:{}", stmt.index);
+        let mut unfinished = Unfinished { results: &self.results, id: &result_id, armed: true };
         let mut result = None;
         let mut notices = Vec::new();
         let mut truncated = false;
@@ -430,12 +459,10 @@ impl QueryEngine {
                         g.finish(false);
                         g.info()
                     });
+                    unfinished.armed = false;
                     return Ok(StatementOutcome { result: info, rows_affected: summary.rows_affected, notices, server_ms });
                 }
-                Err(e) => {
-                    self.results.remove(&result_id);
-                    return Err(e.into());
-                }
+                Err(e) => return Err(e.into()),
             }
         }
 
@@ -445,10 +472,27 @@ impl QueryEngine {
             g.finish(true);
             g.info()
         });
+        unfinished.armed = false;
         notices.push(format!("Showing the first {rows} rows. Increase the row limit to fetch more."));
         // Wait for the connector to finish cancelling before the session is
         // reused; otherwise a server-side cancel could hit the next statement.
         let _ = tokio::time::timeout(Duration::from_secs(15), async { while stream.next().await.is_some() {} }).await;
         Ok(StatementOutcome { result: info, rows_affected: None, notices, server_ms })
+    }
+}
+
+/// Removes a statement's stored result unless it finished (see
+/// [`QueryEngine::collect_stream`]).
+struct Unfinished<'a> {
+    results: &'a ResultStore,
+    id: &'a str,
+    armed: bool,
+}
+
+impl Drop for Unfinished<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.results.remove(self.id);
+        }
     }
 }

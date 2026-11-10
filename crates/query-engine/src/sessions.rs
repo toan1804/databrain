@@ -235,9 +235,13 @@ impl QueryEngine {
 
     /// Release the session and results that belong to a closed tab.
     pub fn close_tab(&self, tab_id: &str) {
-        let running: Vec<String> = self.jobs.lock().iter().filter(|(_, j)| j.tab_id == tab_id || j.session_key == tab_id).map(|(id, _)| id.clone()).collect();
-        for id in running {
-            self.cancel(&id);
+        {
+            let mut jobs = self.jobs.lock();
+            for j in jobs.values_mut().filter(|j| j.tab_id == tab_id || j.session_key == tab_id) {
+                j.cancel.cancel();
+                // Its own tab: what it still outputs is freed when it ends.
+                j.tab_closed |= j.tab_id == tab_id;
+            }
         }
         self.sessions.lock().retain(|(_, t), _| t != tab_id);
         self.outputs.close_tab(tab_id);

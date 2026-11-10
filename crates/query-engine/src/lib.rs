@@ -130,6 +130,9 @@ struct JobHandle {
     tab_id: String,
     session_key: String,
     cancel: CancellationToken,
+    /// Its tab was closed while it ran: outputs it still adds are freed
+    /// when it ends.
+    tab_closed: bool,
 }
 
 /// Gets one run's outcome events (see [`QueryEngine::run_and_wait`]).
