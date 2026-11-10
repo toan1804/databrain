@@ -69,7 +69,14 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
                 // two statements without a separator).
                 k = if keyword == "SELECT" && !contains_dml_word(sql) && !contains_action_word(sql) { StatementKind::Read } else { StatementKind::Unknown };
             }
-            k = check_control(k, &keyword, sql);
+            // Unparseable session or transaction control: what follows the
+            // first word can't be told (a T-SQL batch without `;` runs
+            // `USE sales` then `DISABLE TRIGGER …`, `DENY …`,
+            // `RECONFIGURE`), and a list of words that act always misses
+            // some, so it isn't trusted as control.
+            if k == StatementKind::Session || (k == StatementKind::Transaction && !transaction_grammar(sql)) {
+                k = StatementKind::Unknown;
+            }
             Classification { kind: k, missing_where: false, keyword }
         }
     }
@@ -163,6 +170,59 @@ fn check_control(kind: StatementKind, keyword: &str, sql: &str) -> StatementKind
         .iter()
         .any(|w| !CONTROL.iter().any(|c| w.eq_ignore_ascii_case(c)) && (contains_dml_word(w) || contains_action_word(w) || w.eq_ignore_ascii_case("END")));
     if !transaction_form || acts { StatementKind::Unknown } else { kind }
+}
+
+/// Unparsed transaction control that is only that: every word after the
+/// first is transaction grammar (`START TRANSACTION WITH CONSISTENT
+/// SNAPSHOT`, `BEGIN DISTRIBUTED TRANSACTION`), except a transaction name as
+/// the last word after `TRAN`/`TRANSACTION` (`begin tran t1`) that isn't a
+/// statement of its own (`begin tran` then `shutdown`).
+fn transaction_grammar(sql: &str) -> bool {
+    const GRAMMAR: &[&str] = &[
+        "TRAN",
+        "TRANSACTION",
+        "WORK",
+        "ISOLATION",
+        "LEVEL",
+        "READ",
+        "WRITE",
+        "ONLY",
+        "COMMITTED",
+        "UNCOMMITTED",
+        "REPEATABLE",
+        "SERIALIZABLE",
+        "SNAPSHOT",
+        "WITH",
+        "CONSISTENT",
+        "DEFERRABLE",
+        "NOT",
+        "DEFERRED",
+        "IMMEDIATE",
+        "EXCLUSIVE",
+        "DISTRIBUTED",
+        "AND",
+        "NO",
+        "CHAIN",
+        "RELEASE",
+        "TO",
+        "SAVEPOINT",
+        "MARK",
+        "DELAYED_DURABILITY",
+        "ON",
+        "OFF",
+    ];
+    const STATEMENTS: &[&str] = &["SHUTDOWN", "RECONFIGURE", "CHECKPOINT", "BEGIN", "COMMIT", "ROLLBACK", "END", "RETURN", "BREAK", "CONTINUE", "GO"];
+    let w: Vec<String> = words(super::splitter::strip_leading_comments(sql)).skip(1).map(|w| w.to_ascii_uppercase()).collect();
+    let is = |w: &str, list: &[&str]| list.contains(&w);
+    w.iter().enumerate().all(|(i, x)| {
+        is(x, GRAMMAR)
+            || (i + 1 == w.len()
+                && i > 0
+                && matches!(w[i - 1].as_str(), "TRAN" | "TRANSACTION")
+                && !is(x, STATEMENTS)
+                && !contains_action_word(x)
+                && !contains_dml_word(x))
+    })
 }
 
 /// Words that act (run code, change state or permissions, reach files)
@@ -270,6 +330,16 @@ mod tests {
             (Mssql, "use master\nshutdown"),
             (Mssql, "set nocount on\ndelete from t"),
             (Mssql, "set nocount on\nkill 52"),
+            (Mssql, "USE sales\nDISABLE TRIGGER audit_orders ON orders"),
+            (Mssql, "USE sales\nDENY SELECT ON orders TO public"),
+            (Mssql, "set nocount on\nRECONFIGURE WITH OVERRIDE"),
+            (Mssql, "USE sales\nRECEIVE TOP(1) * FROM q"),
+            (Mssql, "USE sales WRITETEXT t.c @ptr 'x'"),
+            (Mssql, "use sales\nset nocount on"),
+            (Mssql, "begin tran\nshutdown"),
+            (Mssql, "begin tran t1\nDENY SELECT ON t TO public"),
+            (Mssql, "commit transaction\nreconfigure"),
+            (Sqlite, "pragma foreign_keys = on"),
             (Mssql, "begin tran\ndrop table t"),
             (Mssql, "commit\ndrop table t"),
             (Mssql, "BEGIN DELETE FROM t END"),
@@ -306,17 +376,13 @@ mod tests {
             (Mssql, "begin tran"),
             (Mssql, "BEGIN DISTRIBUTED TRANSACTION"),
             (Mssql, "commit tran"),
+            (Mssql, "begin tran t1"),
+            (Mssql, "commit transaction t1"),
             (Sqlite, "begin immediate"),
         ] {
             assert_eq!(classify(sql, k).kind, StatementKind::Transaction, "{k:?}: {sql}");
         }
-        for (k, sql) in [
-            (Mssql, "use sales"),
-            (Mssql, "set nocount on"),
-            (Mssql, "use sales\nset nocount on"),
-            (Postgres, "set search_path = a, b"),
-            (Mysql, "SET SESSION time_zone = '+00:00'"),
-        ] {
+        for (k, sql) in [(Mssql, "use sales"), (Mssql, "set nocount on"), (Postgres, "set search_path = a, b"), (Mysql, "SET SESSION time_zone = '+00:00'")] {
             let c = classify(sql, k);
             assert_eq!(c.kind, StatementKind::Session, "{k:?}: {sql}");
             assert!(crate::sql::read_only_allows(sql, &c), "{k:?}: {sql}");
