@@ -374,6 +374,70 @@ async fn safety_confirmation() {
     assert!(matches!(evs.last(), Some(JobEvent::JobFinished { status: RunStatus::Success, .. })));
 }
 
+/// Production asks before admin and server-wide statements too, not only
+/// DML and DDL; reads, transaction control and harmless USE/SET don't ask.
+#[test]
+fn prod_confirmation_covers_admin_statements() {
+    use ConnectorKind::*;
+    let profile = |kind| {
+        let mut c = ConnectionConfig::new(kind, AuthMethod::None);
+        c.host = Some("h".into());
+        ConnectionProfile {
+            id: "c".into(),
+            name: "Prod".into(),
+            config: c,
+            color: None,
+            env: EnvTag::Prod,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    };
+    let asks = |kind, sql: &str| {
+        let p = profile(kind);
+        let plan: Vec<PlannedStatement> = databrain_connector_core::sql::split_statements(sql, kind)
+            .into_iter()
+            .enumerate()
+            .map(|(index, s)| PlannedStatement {
+                index,
+                classification: databrain_connector_core::sql::classify(&s.sql, kind),
+                sql: s.sql,
+                start: s.start,
+                end: s.end,
+            })
+            .collect();
+        !QueryEngine::safety_reasons(&p, &plan).is_empty()
+    };
+    for (kind, sql) in [
+        (Mysql, "KILL 42"),
+        (Mysql, "SHUTDOWN"),
+        (Mysql, "FLUSH TABLES WITH READ LOCK"),
+        (Mysql, "SET GLOBAL max_connections = 1"),
+        (Mysql, "SET @@global.read_only = 0"),
+        (Mssql, "RESTORE DATABASE d FROM DISK = 'x.bak'"),
+        (Mssql, "SHUTDOWN WITH NOWAIT"),
+        (Postgres, "VACUUM FULL orders"),
+        (Postgres, "REFRESH MATERIALIZED VIEW mv"),
+        (Postgres, "SET default_transaction_read_only = off"),
+        (Postgres, "select 1; CHECKPOINT"),
+        (Postgres, "delete from t where id = 1"),
+        (Postgres, "frobnicate"),
+    ] {
+        assert!(asks(kind, sql), "{kind:?}: {sql} must ask on production");
+    }
+    for (kind, sql) in [
+        (Postgres, "select * from t"),
+        (Postgres, "begin; select 1; commit"),
+        (Postgres, "set search_path = app"),
+        (Mysql, "use shop"),
+        (Mysql, "set time_zone = '+00:00'"),
+    ] {
+        assert!(!asks(kind, sql), "{kind:?}: {sql} should run without asking");
+    }
+}
+
 /// Refresh signs in again: the metadata session and idle tabs close, a
 /// tab mid-transaction (or with a running statement) keeps its session.
 #[tokio::test]

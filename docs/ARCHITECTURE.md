@@ -214,7 +214,8 @@ UI (api.ts: run_query) ─▶ app command ─▶ QueryEngine::run(RunRequest)
    ├─ plan: split statements and classify them (connector-core sql.rs, per dialect)
    ├─ bind :name parameters
    ├─ read-only connection: only reads and harmless USE/SET
-   ├─ safety_reasons: write without WHERE, writes on a prod connection
+   ├─ safety_reasons: write without WHERE; on a prod connection anything but reads,
+   │    transaction control and harmless USE/SET (admin statements included)
    │    └─ not confirmed → RunResponse::NeedsConfirmation (UI asks, runs again confirmed)
    ├─ one run per tab (or session_key) at a time
    └─ spawn: session.execute → batches → ResultStore + OutputRegistry

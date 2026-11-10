@@ -3,6 +3,21 @@
 
 use super::*;
 
+/// A statement that asks before it runs on a production connection: every
+/// statement except reads, transaction control (`BEGIN`, `COMMIT`) and the
+/// harmless `USE`/`SET` a read-only connection allows. So admin statements
+/// classified `Other` (`KILL`, `SHUTDOWN`, `RESTORE`, `VACUUM FULL`,
+/// `REFRESH MATERIALIZED VIEW`, `FLUSH TABLES WITH READ LOCK`) and session
+/// statements with effects beyond the session (`SET GLOBAL …`) ask too, as
+/// they do for the AI.
+pub(crate) fn prod_needs_confirmation(p: &PlannedStatement) -> bool {
+    match p.classification.kind {
+        StatementKind::Read | StatementKind::Transaction => false,
+        StatementKind::Session => !databrain_connector_core::sql::read_only_allows(&p.sql, &p.classification),
+        StatementKind::Dml | StatementKind::Ddl | StatementKind::Other | StatementKind::Unknown => true,
+    }
+}
+
 impl QueryEngine {
     // -------------------------------------------------------------- jobs
 
@@ -50,9 +65,9 @@ impl QueryEngine {
             }
         }
         if profile.env == EnvTag::Prod {
-            let writes = plan.iter().filter(|p| p.classification.kind.is_write() || p.classification.kind == StatementKind::Unknown).count();
+            let writes = plan.iter().filter(|p| prod_needs_confirmation(p)).count();
             if writes > 0 {
-                reasons.push(format!("{writes} statement(s) may modify data or schema on the production connection \"{}\".", profile.name));
+                reasons.push(format!("{writes} statement(s) may modify data, schema or server state on the production connection \"{}\".", profile.name));
             }
         }
         reasons
