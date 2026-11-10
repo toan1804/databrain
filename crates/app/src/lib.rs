@@ -239,6 +239,7 @@ pub fn run() {
             commands::results::result_links,
             commands::explorer::schema_diff,
             commands::queries::explain_plan,
+            commands::queries::estimate_cost,
             commands::results::related_rows_sql,
             commands::results::cancel_load,
             commands::results::dry_run_result_load,

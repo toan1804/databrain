@@ -15,9 +15,9 @@ use async_trait::async_trait;
 use databrain_auth::{AuthContext, AuthMethodKind, ClientAuthStyle, Credential, CredentialSource, Interaction, OAuthConfig, now_secs};
 use databrain_connector_core::value::Column;
 use databrain_connector_core::{
-    Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ErrorKind, ExecOptions,
-    ExecSummary, FieldSpec, ForeignKey, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender, TableColumns, Value,
-    quote_ident, quote_literal,
+    Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, CostEstimate, DbObject, ErrorKind,
+    ExecOptions, ExecSummary, FieldSpec, ForeignKey, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender,
+    TableColumns, Value, quote_ident, quote_literal,
 };
 use secrecy::ExposeSecret;
 use serde_json::json;
@@ -754,6 +754,15 @@ impl Session for SfSession {
         Ok(out)
     }
 
+    /// `EXPLAIN USING JSON`: Snowflake compiles the statement (pruning
+    /// included) without running it, and `GlobalStats` says how many
+    /// micro-partitions and bytes it would scan. Uses cloud services only.
+    async fn estimate_cost(&self, sql: &str) -> Result<Option<CostEstimate>> {
+        let rows = databrain_connector_core::query_text(self, &format!("EXPLAIN USING JSON {sql}")).await?;
+        let raw = rows.first().and_then(|r| r.first().cloned().flatten()).unwrap_or_default();
+        Ok(Some(explain_global_stats(&raw)))
+    }
+
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
         use databrain_connector_core::{TableLayout, parse_call_list, query_text, quote_literal};
         let (db, sch) = schema.split_once('.').ok_or_else(|| ConnectorError::query("expected database.schema"))?;
@@ -994,9 +1003,46 @@ fn chunks_notice(data: &serde_json::Value) -> Option<String> {
     crate::common::large_result_notice("Snowflake", (bytes > 0).then_some(bytes), rows, chunks.len() as u64 + 1, link)
 }
 
+/// The estimate in `EXPLAIN USING JSON` output (`GlobalStats`).
+fn explain_global_stats(raw: &str) -> CostEstimate {
+    let v: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
+    let g = &v["GlobalStats"];
+    let n = |k: &str| g[k].as_u64().or_else(|| g[k].as_str().and_then(|s| s.parse().ok()));
+    let (assigned, total) = (n("partitionsAssigned"), n("partitionsTotal"));
+    let mut notes = Vec::new();
+    if g.is_null() {
+        notes.push("Snowflake gave no scan statistics for this statement.".into());
+    } else if let (Some(a), Some(t)) = (assigned, total)
+        && t > 0
+        && a == t
+        && t > 1
+    {
+        notes.push("Every micro-partition would be scanned: no filter prunes the tables.".into());
+    }
+    notes.push("Partitions and bytes are what pruning at compile time leaves; pruning at run time (joins, subqueries) can scan less.".into());
+    CostEstimate {
+        method: "EXPLAIN USING JSON".into(),
+        bytes: n("bytesAssigned"),
+        partitions_assigned: assigned,
+        partitions_total: total,
+        notes,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_explain_global_stats() {
+        let e = explain_global_stats(r#"{"GlobalStats":{"partitionsTotal":40,"partitionsAssigned":3,"bytesAssigned":1048576},"Operations":[[]]}"#);
+        assert_eq!((e.bytes, e.partitions_assigned, e.partitions_total), (Some(1_048_576), Some(3), Some(40)));
+        assert_eq!(e.method, "EXPLAIN USING JSON");
+        let full = explain_global_stats(r#"{"GlobalStats":{"partitionsTotal":"8","partitionsAssigned":"8","bytesAssigned":"10"}}"#);
+        assert!(full.notes[0].contains("Every micro-partition"), "{:?}", full.notes);
+        assert!(explain_global_stats("not json").bytes.is_none());
+    }
     use databrain_auth::AuthMethod;
 
     #[test]

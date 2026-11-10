@@ -543,6 +543,44 @@ pub struct TableLayout {
     pub notes: Vec<String>,
 }
 
+/// What a statement would scan, as the database estimates it before it
+/// runs (the editor's cost preview).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, ts_rs::TS)]
+#[ts(export)]
+#[ts(optional_fields = nullable)]
+pub struct CostEstimate {
+    /// How it was asked: `dry run`, `EXPLAIN USING JSON`, `EXPLAIN COST`.
+    pub method: String,
+    /// Bytes the statement would read (BigQuery: billed bytes before any
+    /// minimum; Snowflake: bytes of the partitions it would scan;
+    /// Databricks: the size of the tables it reads, from table statistics).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>")]
+    pub bytes: Option<u64>,
+    /// Rows of the result, when the engine estimates them (Databricks statistics).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>")]
+    pub rows: Option<u64>,
+    /// Micro-partitions it would scan, of the tables' total (Snowflake).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>")]
+    pub partitions_assigned: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>")]
+    pub partitions_total: Option<u64>,
+    /// The result would come from the cache (BigQuery: no bytes billed).
+    #[serde(default)]
+    pub cache_hit: bool,
+    /// The connection's byte cap, when the estimate is over it (BigQuery
+    /// `maximum_bytes_billed`: the run would fail).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(as = "Option<f64>")]
+    pub over_limit: Option<u64>,
+    /// What to know about the estimate.
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
 impl TableLayout {
     /// Layout with only the primary key, from column metadata.
     pub fn from_columns(columns: &[ColumnInfo]) -> Self {

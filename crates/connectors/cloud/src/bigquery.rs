@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use databrain_auth::{AuthContext, AuthMethodKind, CliKind, ClientAuthStyle, Credential, CredentialSource, OAuthConfig};
 use databrain_connector_core::value::Column;
 use databrain_connector_core::{
-    Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, DbObject, ExecOptions, ExecSummary,
-    FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender, TableColumns, Value,
+    Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, CostEstimate, DbObject, ExecOptions,
+    ExecSummary, FieldSpec, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender, TableColumns, Value,
 };
 use secrecy::ExposeSecret;
 use serde_json::json;
@@ -250,6 +250,24 @@ impl Inner {
         Ok(resp)
     }
 
+    /// Dry run (`dryRun: true`): BigQuery plans the query and reports the
+    /// bytes it would process; nothing runs and nothing is billed. On this
+    /// tab's BigQuery session when it has one, so its temp tables resolve.
+    async fn dry_run(&self, sql: &str) -> Result<CostEstimate> {
+        let mut body = json!({ "query": sql, "useLegacySql": false, "dryRun": true });
+        if let Some(l) = &self.location {
+            body["location"] = l.clone().into();
+        }
+        if let Some(d) = &self.dataset {
+            body["defaultDataset"] = json!({ "projectId": self.project, "datasetId": d });
+        }
+        if let Some(id) = self.session_id.lock().await.clone() {
+            body["connectionProperties"] = json!([{ "key": "session_id", "value": id }]);
+        }
+        let resp = self.call(reqwest::Method::POST, format!("{API}/projects/{}/queries", self.project), Some(body)).await?;
+        Ok(dry_run_estimate(&resp, self.max_bytes.as_deref()))
+    }
+
     async fn page(&self, job_id: &str, token: Option<&str>, max: u32) -> Result<serde_json::Value> {
         let mut url = format!(
             "{API}/projects/{}/queries/{job_id}?maxResults={max}&timeoutMs=10000&formatOptions.useInt64Timestamp=true{}",
@@ -355,6 +373,27 @@ impl Inner {
         tx.send(StreamEvent::Done(ExecSummary::default())).await;
         Ok(())
     }
+}
+
+/// The estimate in a `jobs.query` dry-run response: `totalBytesProcessed`
+/// (a string), `cacheHit`, and whether it is over `maximum_bytes_billed`.
+fn dry_run_estimate(resp: &serde_json::Value, max_bytes: Option<&str>) -> CostEstimate {
+    let num = |v: &serde_json::Value| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64());
+    let bytes = num(&resp["totalBytesProcessed"]);
+    let cache_hit = resp["cacheHit"].as_bool().unwrap_or(false);
+    let cap = max_bytes.and_then(|m| m.trim().parse::<u64>().ok());
+    let mut notes = Vec::new();
+    if cache_hit {
+        notes.push("The result would come from the cache: no bytes billed.".into());
+    }
+    let over_limit = match (bytes, cap) {
+        (Some(b), Some(c)) if b > c => {
+            notes.push(format!("Over this connection's maximum bytes billed ({}): the query would fail.", human_bytes(c)));
+            Some(c)
+        }
+        _ => None,
+    };
+    CostEstimate { method: "dry run".into(), bytes, cache_hit, over_limit, notes, ..Default::default() }
 }
 
 fn human_bytes(b: u64) -> String {
@@ -487,6 +526,10 @@ impl Session for BqSession {
         Ok(out)
     }
 
+    async fn estimate_cost(&self, sql: &str) -> Result<Option<CostEstimate>> {
+        self.0.dry_run(sql).await.map(Some)
+    }
+
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
         use databrain_connector_core::TableLayout;
         let (project, dataset) = split_dataset(schema)?;
@@ -587,6 +630,18 @@ fn fields_to_columns(fields: &[serde_json::Value]) -> Vec<ColumnInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_dry_run_estimates() {
+        let r = json!({"totalBytesProcessed": "1073741824", "cacheHit": false, "jobComplete": true});
+        let e = dry_run_estimate(&r, None);
+        assert_eq!((e.method.as_str(), e.bytes, e.cache_hit, e.over_limit), ("dry run", Some(1 << 30), false, None));
+        let e = dry_run_estimate(&r, Some("1000000"));
+        assert_eq!(e.over_limit, Some(1_000_000));
+        assert!(e.notes[0].contains("would fail"), "{:?}", e.notes);
+        let e = dry_run_estimate(&json!({"totalBytesProcessed": "0", "cacheHit": true}), Some("10"));
+        assert!(e.cache_hit && e.over_limit.is_none());
+    }
 
     #[test]
     fn converts_cells() {

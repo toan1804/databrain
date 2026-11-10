@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Added
 
+- Cost preview before a query runs, next to the slow-query tips: "Cost" in the editor toolbar shows what the statement would scan without running it: bytes from a BigQuery dry run (also checked as you type, with a warning when over the connection's maximum bytes billed), micro-partitions and bytes from Snowflake `EXPLAIN USING JSON`, and the tables' size from Databricks `EXPLAIN COST`.
 - Generate test data for a table (right-click a table → "Generate test data…"): up to 100,000 rows made up from its column types and names, with a seed to repeat them. Foreign key columns take existing keys of the parent tables, the primary key counts up past the table's maximum, and columns the database fills are left out. Preview the rows as an output, or dry-run and load them into the table through the load code.
 
 ### Fixed

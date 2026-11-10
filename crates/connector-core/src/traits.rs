@@ -334,6 +334,9 @@ pub struct SourceTraits {
     pub preview: Preview,
     /// Prefix that checks a query without running it; `None` = no check.
     pub explain: Option<&'static str>,
+    /// Estimates what a query scans before it runs ([`crate::Session::estimate_cost`]:
+    /// BigQuery dry run, Snowflake and Databricks EXPLAIN): the editor's cost preview.
+    pub cost_preview: bool,
     /// Reached over HTTPS APIs (no SSH tunnel).
     pub cloud: bool,
     /// A local file or in-process engine (no SSH, no network check).
@@ -428,6 +431,7 @@ pub const STANDARD: SourceTraits = SourceTraits {
     row_limit: RowLimit::Limit,
     preview: Preview::Sql,
     explain: None,
+    cost_preview: false,
     cloud: false,
     local: false,
     network: NetworkTarget::HostPort,
@@ -594,6 +598,7 @@ pub const ORACLE: SourceTraits = SourceTraits {
 };
 
 pub const SNOWFLAKE: SourceTraits = SourceTraits {
+    cost_preview: true,
     parser: SqlParser::Snowflake,
     network: NetworkTarget::Unknown,
     name: "Snowflake",
@@ -619,6 +624,7 @@ pub const SNOWFLAKE: SourceTraits = SourceTraits {
 };
 
 pub const DATABRICKS: SourceTraits = SourceTraits {
+    cost_preview: true,
     parser: SqlParser::Databricks,
     network: NetworkTarget::HttpsHost,
     name: "Databricks",
@@ -644,6 +650,7 @@ pub const DATABRICKS: SourceTraits = SourceTraits {
 };
 
 pub const BIGQUERY: SourceTraits = SourceTraits {
+    cost_preview: true,
     parser: SqlParser::Bigquery,
     whole_path_quotes: true,
     always_qualify_catalog: true,

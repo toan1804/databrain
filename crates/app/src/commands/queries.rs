@@ -38,6 +38,17 @@ pub(crate) async fn explain_plan(
 }
 
 #[tauri::command]
+pub(crate) async fn estimate_cost(
+    state: State<'_, AppState>,
+    connection_id: String,
+    session_key: String,
+    sql: String,
+    params: Option<std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>>,
+) -> R<databrain_connector_core::CostEstimate> {
+    api::estimate_cost(&state, &connection_id, &session_key, &sql, &params.unwrap_or_default()).await
+}
+
+#[tauri::command]
 pub(crate) async fn statement_at_cursor(kind: ConnectorKind, text: String, cursor: usize) -> R<Option<Span>> {
     Ok(api::statement_at_cursor(kind, &text, cursor))
 }

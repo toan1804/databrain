@@ -38,6 +38,7 @@ import type { TableColumns } from "./bindings/TableColumns";
 import type { ObjectKind } from "./bindings/ObjectKind";
 import type { SchemaInfo } from "./bindings/SchemaInfo";
 import type { TableLayout } from "./bindings/TableLayout";
+import type { CostEstimate } from "./bindings/CostEstimate";
 import type { ParamValue } from "./bindings/ParamValue";
 import type { StatementKind } from "./bindings/StatementKind";
 import type { ColumnMeta } from "./bindings/ColumnMeta";
@@ -217,6 +218,7 @@ export type {
   ObjectKind,
   SchemaInfo,
   TableLayout,
+  CostEstimate,
   ParamValue,
   StatementKind,
   ColumnMeta,

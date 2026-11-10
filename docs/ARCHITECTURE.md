@@ -148,6 +148,7 @@ Everything the rest of the app needs to know about a database type is declared o
 | `quote`, `upper_folding`, `levels`, `whole_path_quotes`, `always_qualify_catalog`, `catalog_noun`, `table_folder`, `view_folder` | identifier quoting and qualified names (Rust `quote_ident`, UI `quoteIdent`/`qualifiedName`), explorer levels and wording, completion |
 | `row_limit`, `preview` | AI row caps, "Select top 100 rows" |
 | `explain` | EXPLAIN checks (`Session::check_sql`, lineage "Check with database"); `None` = no check |
+| `cost_preview` | the editor's cost preview (`Session::estimate_cost`: BigQuery dry run, Snowflake and Databricks EXPLAIN) |
 | `syntax` (quotes, comments, `$$`, `DELIMITER`, block ends like `/` or `GO`) | statement splitting and `:name` parameters |
 | `load` (`None` = not a load target): types, batch limits, literals, staging, merge style, transactions | job load steps and SQL INSERT export (`crates/export/src/load.rs`) |
 | `cloud`, `local`, `network`, `ssl_setting`, `dialect_name`, `name`, `formatter` | SSH rules, the quick network check, the connection form, AI prompts, messages |

@@ -1545,3 +1545,27 @@ fn learned_view_reasons_and_forgetting() {
     assert!(v.joins.is_empty() && v.tables.is_empty());
     assert!(ws.connections_to_learn().unwrap().is_empty(), "the remaining history is not learned again");
 }
+
+/// The cost preview is refused with a message on engines without an
+/// estimate (here SQLite); BigQuery, Snowflake and Databricks need a live
+/// service (their parsers are tested in the connector crate).
+#[tokio::test]
+async fn cost_preview_is_refused_without_an_estimate() {
+    let (st, _sink, dir) = state();
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(dir.path().join("c.db").to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let p = save_profile(&st, "c", cfg, None);
+    let e = estimate_cost(&st, &p.id, "tab", "select 1", &Default::default()).await.unwrap_err();
+    assert_eq!(e.kind, "unsupported", "{}", e.message);
+    assert!(e.message.contains("SQLite"), "{}", e.message);
+}

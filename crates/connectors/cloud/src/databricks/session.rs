@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use databrain_connector_core::{
-    ConnectorError, ConnectorKind, DbObject, ExecOptions, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, SchemaMetadata, Session, TableColumns,
-    quote_ident, quote_literal,
+    ConnectorError, ConnectorKind, CostEstimate, DbObject, ExecOptions, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, SchemaMetadata, Session,
+    TableColumns, quote_ident, quote_literal,
 };
 
 use super::client::DbxSession;
@@ -219,6 +219,15 @@ impl Session for DbxSession {
         Ok(hits)
     }
 
+    /// `EXPLAIN COST`: the optimized plan with Spark's size and row
+    /// estimates from table statistics. Nothing runs, but the warehouse
+    /// must be up to answer (a stopped one starts).
+    async fn estimate_cost(&self, sql: &str) -> Result<Option<CostEstimate>> {
+        let rows = databrain_connector_core::query_text(self, &format!("EXPLAIN COST {sql}")).await?;
+        let text = rows.iter().filter_map(|r| r.first().cloned().flatten()).collect::<Vec<_>>().join("\n");
+        explain_cost_estimate(&text).map(Some)
+    }
+
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
         use databrain_connector_core::{TableLayout, parse_list_text, query_table};
         let full = format!("{}.{}", databrain_connector_core::quote_path(ConnectorKind::Databricks, schema), quote_ident(ConnectorKind::Databricks, name));
@@ -318,5 +327,105 @@ impl Session for DbxSession {
             Err(_) => return Ok(None),
         };
         Ok(Some(rows.iter().filter_map(|r| Some((format!("{}.{}", cell(r, 0)?, cell(r, 1)?), cell(r, 2)?.parse().ok()?))).collect()))
+    }
+}
+
+/// `8.0 EiB`, `1.2 MiB`, `16.0 B` → bytes.
+fn spark_size(s: &str) -> Option<u64> {
+    let (n, unit) = s.trim().split_once(' ').unwrap_or((s.trim(), "B"));
+    let n: f64 = n.parse().ok()?;
+    let k: f64 = match unit.trim() {
+        "B" => 1.0,
+        "KiB" => 1024.0,
+        "MiB" => 1024f64.powi(2),
+        "GiB" => 1024f64.powi(3),
+        "TiB" => 1024f64.powi(4),
+        "PiB" => 1024f64.powi(5),
+        "EiB" => 1024f64.powi(6),
+        _ => return None,
+    };
+    Some((n * k) as u64)
+}
+
+/// `Statistics(sizeInBytes=1.2 MiB, rowCount=5.00E+4)` on a plan line.
+fn line_stats(line: &str) -> Option<(Option<u64>, Option<u64>)> {
+    let s = &line[line.find("Statistics(")? + "Statistics(".len()..];
+    let s = &s[..s.find(')')?];
+    let mut size = None;
+    let mut rows = None;
+    for part in s.split(", ") {
+        match part.split_once('=') {
+            Some(("sizeInBytes", v)) => size = spark_size(v),
+            Some(("rowCount", v)) => rows = v.trim().parse::<f64>().ok().map(|r| r as u64),
+            _ => {}
+        }
+    }
+    Some((size, rows))
+}
+
+/// Spark's "don't know" size (`Long.MaxValue`, printed as 8.0 EiB).
+const UNKNOWN_SIZE: u64 = 9_000_000_000_000_000_000;
+
+/// The estimate in `EXPLAIN COST` output: bytes = the sizes of the plan's
+/// leaves (the tables it reads), rows = the root's row count. A planning
+/// error comes back as the plan text and is returned as the error.
+fn explain_cost_estimate(text: &str) -> Result<CostEstimate> {
+    if let Some(i) = text.find("Error occurred during query planning") {
+        return Err(ConnectorError::query(text[i..].lines().take(6).collect::<Vec<_>>().join("\n")));
+    }
+    let section = text.split("== Optimized Logical Plan ==").nth(1).unwrap_or(text);
+    let section = section.split("\n== ").next().unwrap_or(section);
+    let lines: Vec<(usize, &str)> = section.lines().filter(|l| !l.trim().is_empty()).map(|l| (l.find(|c: char| c.is_alphanumeric()).unwrap_or(0), l)).collect();
+    let mut est = CostEstimate { method: "EXPLAIN COST".into(), ..Default::default() };
+    est.rows = lines.first().and_then(|(_, l)| line_stats(l)).and_then(|s| s.1);
+    let mut bytes = 0u64;
+    let mut unknown = false;
+    let mut leaves = 0;
+    for (i, (depth, l)) in lines.iter().enumerate() {
+        let leaf = lines.get(i + 1).is_none_or(|(d, _)| d <= depth);
+        if !leaf {
+            continue;
+        }
+        match line_stats(l).and_then(|s| s.0) {
+            Some(b) if b < UNKNOWN_SIZE => {
+                bytes = bytes.saturating_add(b);
+                leaves += 1;
+            }
+            _ => unknown = true,
+        }
+    }
+    if leaves > 0 && !unknown {
+        est.bytes = Some(bytes);
+    }
+    if unknown {
+        est.notes.push("Some tables have no statistics, so Databricks can't size what it would read: run ANALYZE TABLE … COMPUTE STATISTICS on them.".into());
+    }
+    est.notes.push("From table statistics (EXPLAIN COST): a planner estimate, not the bytes a run reads after file pruning.".into());
+    Ok(est)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_explain_cost() {
+        let text = r"== Optimized Logical Plan ==
+Aggregate [region#1], [region#1, count(1) AS n#5L], Statistics(sizeInBytes=48.0 B, rowCount=2)
++- Join Inner, (id#2 = cid#3), Statistics(sizeInBytes=3.0 MiB)
+   :- Relation main.s.orders[id#2,region#1] parquet, Statistics(sizeInBytes=2.0 MiB, rowCount=5.00E+4)
+   +- Relation main.s.customers[cid#3] parquet, Statistics(sizeInBytes=1.0 MiB, rowCount=1000)
+
+== Physical Plan ==
+* HashAggregate (5)
+";
+        let e = explain_cost_estimate(text).unwrap();
+        assert_eq!((e.bytes, e.rows), (Some(3 * 1024 * 1024), Some(2)));
+        let unknown =
+            "== Optimized Logical Plan ==\nProject [a#1], Statistics(sizeInBytes=8.0 EiB)\n+- Relation t[a#1] json, Statistics(sizeInBytes=8.0 EiB)\n";
+        let e = explain_cost_estimate(unknown).unwrap();
+        assert!(e.bytes.is_none() && e.notes[0].contains("ANALYZE TABLE"), "{e:?}");
+        let err = explain_cost_estimate("Error occurred during query planning: \n[TABLE_OR_VIEW_NOT_FOUND] nope").unwrap_err();
+        assert!(err.message.contains("TABLE_OR_VIEW_NOT_FOUND"), "{}", err.message);
     }
 }

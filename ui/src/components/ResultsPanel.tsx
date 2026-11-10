@@ -4,6 +4,7 @@ import { useStore } from "../store";
 import { kbd } from "../lib/platform";
 import { DoneView, ErrorView, Messages, RunningView, RunSummary } from "./results/RunStatus";
 import { ResultTabs } from "./results/ResultTabs";
+import { CostBar } from "./results/CostBar";
 import { TipsBar } from "./results/TipsBar";
 import { ResultView } from "./results/ResultView";
 
@@ -27,19 +28,22 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
   if (!run) {
     if (compact) return null;
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-2 text-[12.5px] text-muted">
-        <Table2 size={26} className="opacity-40" />
-        <div>Run a query to see results</div>
-        <div className="flex gap-3 text-[11.5px]">
-          <span>
-            <span className="kbd">{kbd("⌘")}</span> <span className="kbd">↵</span> run statement
-          </span>
-          <span>
-            <span className="kbd">{kbd("⇧")}</span> <span className="kbd">{kbd("⌘")}</span> <span className="kbd">↵</span> run all
-          </span>
-          <span>
-            <span className="kbd">{kbd("⌘")}</span> <span className="kbd">{kbd("⌥")}</span> <span className="kbd">↑</span>/<span className="kbd">↓</span> previous / next statement
-          </span>
+      <div className="flex h-full min-h-0 flex-col">
+        <CostBar tabId={tabId} />
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-[12.5px] text-muted">
+          <Table2 size={26} className="opacity-40" />
+          <div>Run a query to see results</div>
+          <div className="flex gap-3 text-[11.5px]">
+            <span>
+              <span className="kbd">{kbd("⌘")}</span> <span className="kbd">↵</span> run statement
+            </span>
+            <span>
+              <span className="kbd">{kbd("⇧")}</span> <span className="kbd">{kbd("⌘")}</span> <span className="kbd">↵</span> run all
+            </span>
+            <span>
+              <span className="kbd">{kbd("⌘")}</span> <span className="kbd">{kbd("⌥")}</span> <span className="kbd">↑</span>/<span className="kbd">↓</span> previous / next statement
+            </span>
+          </div>
         </div>
       </div>
     );
@@ -71,6 +75,7 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
           <RunSummary run={run} />
         </div>
       </div>
+      {!showMessages && <CostBar tabId={tabId} />}
       {!showMessages && <TipsBar run={run} tabId={tabId} />}
       <div className="min-h-0 flex-1">
         {showMessages ? (

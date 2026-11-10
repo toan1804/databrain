@@ -224,6 +224,14 @@ pub trait Session: Send + Sync {
         Ok(TableLayout::from_columns(&self.describe(schema, name).await?.columns))
     }
 
+    /// What a statement would scan, asked of the database without running
+    /// it (BigQuery dry run, Snowflake and Databricks `EXPLAIN`): the
+    /// editor's cost preview. `Ok(None)` = this engine has no estimate
+    /// (`SourceTraits::cost_preview` is false).
+    async fn estimate_cost(&self, _sql: &str) -> Result<Option<CostEstimate>> {
+        Ok(None)
+    }
+
     //// Columns of every table/view in a schema (bulk, for the AI knowledge
     /// index). The default describes objects one by one.
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {

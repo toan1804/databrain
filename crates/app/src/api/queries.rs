@@ -120,3 +120,18 @@ pub async fn explain_plan(
         .map_err(|names| invalid(format!("Enter a value for {}", names.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", "))))?;
     state.engine.explain(connection_id, session_key, &sql, analyze).await
 }
+
+/// What one statement would scan, asked of the database without running it
+/// (BigQuery dry run, Snowflake and Databricks EXPLAIN): the cost preview.
+pub async fn estimate_cost(
+    state: &AppState,
+    connection_id: &str,
+    session_key: &str,
+    sql: &str,
+    params: &std::collections::HashMap<String, databrain_connector_core::sql::ParamValue>,
+) -> Result<databrain_connector_core::CostEstimate> {
+    let kind = state.workspace.get_connection(connection_id)?.config.kind;
+    let sql = databrain_connector_core::sql::substitute_parameters(sql, kind, params)
+        .map_err(|names| invalid(format!("Enter a value for {}", names.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", "))))?;
+    state.engine.estimate_cost(connection_id, session_key, &sql).await
+}

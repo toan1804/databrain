@@ -1,5 +1,5 @@
 import { lazy, memo, Suspense, useEffect, useRef, useState } from "react";
-import { ChevronsDownUp, FileCode2, FileText, GitCompare, GitFork, LayoutDashboard, Network, Share2, Table2, Lightbulb, Loader2, MoreHorizontal, Play, PlayCircle, Plus, Save, Sparkles, Square, X, Workflow } from "lucide-react";
+import { ChevronsDownUp, FileCode2, FileText, Gauge, GitCompare, GitFork, LayoutDashboard, Network, Share2, Table2, Lightbulb, Loader2, MoreHorizontal, Play, PlayCircle, Plus, Save, Sparkles, Square, X, Workflow } from "lucide-react";
 import { isQueryTab, useActiveTab, useStore, type Tab } from "../store";
 import { editorBridge } from "../editorBridge";
 import { SqlEditor } from "./SqlEditor";
@@ -13,6 +13,8 @@ import { openLineage } from "./openTabs";
 import { PlanTab, openPlan } from "./PlanTab";
 import { DashboardTab } from "./DashboardTab";
 import { useAi } from "../aiStore";
+import { AUTO_COST_KINDS, estimateCost } from "../costPreview";
+import { traitsOf } from "../lib/sourceTraits";
 import type { ConnectionView } from "../lib/types";
 import { kbd } from "../lib/platform";
 
@@ -369,9 +371,24 @@ function Toolbar() {
     ro.observe(el);
     return () => ro.disconnect();
   }, [hasTab]);
+  // BigQuery: a dry run (free) of the statement a moment after the editor stops changing.
+  const autoCost = !!conn && AUTO_COST_KINDS.has(conn.config.kind) && !run?.running;
+  const tabId = tab?.id;
+  const tabSql = tab?.sql;
+  useEffect(() => {
+    if (!autoCost || !tabId || !tabSql?.trim()) return;
+    const t = setTimeout(() => void estimateCost(tabId, true), 1500);
+    return () => clearTimeout(t);
+  }, [autoCost, tabId, tabSql]);
+
   const [more, setMore] = useState<{ x: number; y: number } | null>(null);
 
   if (!tab) return null;
+  const canCost = !!conn && traitsOf(conn.config.kind).cost_preview;
+  const costTitle =
+    conn && AUTO_COST_KINDS.has(conn.config.kind)
+      ? "What the statement would scan (BigQuery dry run: free, nothing runs). Also checked as you type"
+      : "What the statement would scan, from EXPLAIN (nothing runs; uses the warehouse)";
 
   const iconOnly = width < 860;
   const overflow = width < 640;
@@ -505,6 +522,11 @@ function Toolbar() {
             >
               <GitFork size={13} className="rotate-90" /> {!iconOnly && "Plan"}
             </button>
+            {canCost && (
+              <button className="btn-ghost py-1" title={costTitle} aria-label="Cost" onClick={() => void estimateCost(tab.id)}>
+                <Gauge size={13} /> {!iconOnly && "Cost"}
+              </button>
+            )}
             <button className="btn-ghost py-1" disabled={!conn} title="Explain this query with AI" aria-label="Explain" onClick={explain}>
               <Lightbulb size={13} /> {!iconOnly && "Explain"}
             </button>
@@ -527,6 +549,7 @@ function Toolbar() {
           {conn?.config.read_only && <div className="px-2 pb-1 text-[11px] text-muted">Read-only connection</div>}
           <MenuItem icon={<Network size={13} />} label="Lineage" onClick={() => (setMore(null), openLineage(tab.id))} />
           <MenuItem icon={<GitFork size={13} className="rotate-90" />} label="Query plan" disabled={!conn} onClick={() => (setMore(null), void openPlan(tab.id))} />
+          {canCost && <MenuItem icon={<Gauge size={13} />} label="Cost preview" onClick={() => (setMore(null), void estimateCost(tab.id))} />}
           <MenuItem icon={<Lightbulb size={13} />} label="Explain" disabled={!conn} onClick={() => (setMore(null), explain())} />
           <MenuItem icon={<Sparkles size={13} />} label="Edit with AI" hint={kbd("⌘I")} onClick={() => (setMore(null), editWithAi())} />
           <MenuItem icon={<Save size={13} />} label={saveLabel} hint={kbd("⌘S")} onClick={() => (setMore(null), save())} />

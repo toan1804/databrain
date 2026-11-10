@@ -28,6 +28,8 @@ export interface SourceTraits {
   preview: "sql" | "mongo_find" | "cypher";
   row_limit: "limit" | "top" | "fetch_first";
   explain: string | null;
+  /** Estimates what a query scans before it runs (BigQuery, Snowflake, Databricks). */
+  cost_preview: boolean;
   cloud: boolean;
   local: boolean;
   network: "host_port" | "https_host" | "unknown";
@@ -60,6 +62,7 @@ const FALLBACK: SourceTraits = {
   preview: "sql",
   row_limit: "limit",
   explain: null,
+  cost_preview: false,
   cloud: false,
   local: false,
   network: "unknown",

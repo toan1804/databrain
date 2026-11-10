@@ -112,6 +112,55 @@ impl QueryEngine {
 
 type Rows = (Vec<String>, Vec<Vec<Option<String>>>);
 
+// ------------------------------------------------------------ cost preview
+
+/// The statement a cost preview may estimate, or why not. Only one query
+/// or data change (read or DML): DDL, session statements and anything the
+/// classifier can't place are refused, so a preview never looks like a
+/// check that a schema change or unknown statement is fine. (BigQuery's dry
+/// run and Snowflake's and Databricks' EXPLAIN never run the statement.)
+pub fn cost_statement(kind: ConnectorKind, sql: &str) -> Result<String> {
+    if !kind.traits().cost_preview {
+        return Err(EngineError::new(
+            "unsupported",
+            format!("{} gives no cost estimate before a run (BigQuery, Snowflake and Databricks do); use Plan for its query plan", kind.traits().name),
+        ));
+    }
+    let sql = sql.trim().trim_end_matches(';').trim();
+    if sql.is_empty() {
+        return Err(EngineError::new("invalid", "Nothing to estimate: put the cursor in a statement"));
+    }
+    if databrain_connector_core::sql::split_statements(sql, kind).len() > 1 {
+        return Err(EngineError::new("invalid", "Estimate one statement at a time: select it, or put the cursor in it"));
+    }
+    match classify(sql, kind).kind {
+        StatementKind::Read | StatementKind::Dml => Ok(sql.to_string()),
+        _ => {
+            Err(EngineError::new("invalid", "The cost preview estimates queries and data changes (SELECT, INSERT, UPDATE, DELETE, MERGE), not this statement"))
+        }
+    }
+}
+
+impl QueryEngine {
+    /// What one statement would scan, asked of the database without running
+    /// it, on the tab's session (its temp tables and BigQuery session are
+    /// seen), or on the metadata session while a query runs in the tab.
+    pub async fn estimate_cost(&self, connection_id: &str, session_key: &str, sql: &str) -> Result<databrain_connector_core::CostEstimate> {
+        let kind = self.workspace().get_connection(connection_id)?.config.kind;
+        let sql = cost_statement(kind, sql)?;
+        let busy = self.jobs.lock().values().any(|j| j.session_key == session_key);
+        let tab = if busy || session_key.is_empty() { crate::META_TAB } else { session_key };
+        let run = self.with_tab(connection_id, tab, |s| {
+            let sql = sql.clone();
+            async move { s.estimate_cost(&sql).await }
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(60), run).await {
+            Ok(r) => r?.ok_or_else(|| EngineError::new("unsupported", format!("{} gives no cost estimate before a run", kind.traits().name))),
+            Err(_) => Err(EngineError::new("timeout", "The database took more than 60 s to estimate the query")),
+        }
+    }
+}
+
 async fn explain_on(s: &dyn Session, kind: ConnectorKind, sql: &str, analyze: bool) -> databrain_connector_core::Result<QueryPlan> {
     use ConnectorKind::*;
     let first_cell = |r: &Rows| r.1.iter().filter_map(|row| row.first().cloned().flatten()).collect::<Vec<_>>().join("\n");
@@ -520,6 +569,31 @@ fn rows_text(r: &Rows) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_preview_takes_one_query_or_data_change() {
+        use ConnectorKind::*;
+        // Allowed: reads and DML, on the engines that estimate.
+        for k in [Bigquery, Snowflake, Databricks] {
+            assert_eq!(cost_statement(k, "  SELECT * FROM t WHERE d > 1;  ").unwrap(), "SELECT * FROM t WHERE d > 1");
+            assert!(cost_statement(k, "INSERT INTO t SELECT * FROM s").is_ok(), "{k:?}");
+            assert!(cost_statement(k, "WITH x AS (SELECT 1 a) SELECT a FROM x").is_ok(), "{k:?}");
+        }
+        assert!(cost_statement(Bigquery, "DELETE FROM `p.d.t` WHERE id = 1").is_ok());
+        // Refused: DDL, session state, unknown statements, several at once.
+        let refused = |k, sql: &str| cost_statement(k, sql).unwrap_err();
+        assert_eq!(refused(Bigquery, "DROP TABLE t").kind, "invalid");
+        assert_eq!(refused(Snowflake, "CREATE TABLE t (a int)").kind, "invalid");
+        assert_eq!(refused(Snowflake, "USE WAREHOUSE big").kind, "invalid");
+        assert_eq!(refused(Databricks, "GRANT SELECT ON t TO u").kind, "invalid");
+        assert_eq!(refused(Bigquery, "frobnicate the table").kind, "invalid");
+        assert!(refused(Bigquery, "SELECT 1; DROP TABLE t").message.contains("one statement"));
+        assert_eq!(refused(Bigquery, "  ;  ").kind, "invalid");
+        // Other engines have no estimate.
+        for k in [Postgres, Mysql, Sqlite, Duckdb, Oracle, Mssql, Clickhouse] {
+            assert_eq!(refused(k, "SELECT 1").kind, "unsupported", "{k:?}");
+        }
+    }
 
     #[test]
     fn reads_postgres_json() {
