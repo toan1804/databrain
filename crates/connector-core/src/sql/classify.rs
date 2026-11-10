@@ -55,6 +55,7 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
                 out.kind = out.kind.max(k);
                 out.missing_where |= mw;
             }
+            out.kind = check_control(out.kind, &keyword, sql);
             out
         }
         _ => {
@@ -68,6 +69,7 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
                 // two statements without a separator).
                 k = if keyword == "SELECT" && !contains_dml_word(sql) && !contains_action_word(sql) { StatementKind::Read } else { StatementKind::Unknown };
             }
+            k = check_control(k, &keyword, sql);
             Classification { kind: k, missing_where: false, keyword }
         }
     }
@@ -128,6 +130,39 @@ pub(crate) fn keyword_kind(kw: &str) -> StatementKind {
         "" => K::Unknown,
         _ => K::Other,
     }
+}
+
+/// Session and transaction control is trusted (no production prompt, and some
+/// `USE`/`SET` pass a read-only connection), so it must be only that:
+/// - A T-SQL batch without `;` (`USE master\nDROP DATABASE prod`,
+///   `set nocount on\nkill 52`) takes its first word's kind, so any later
+///   word that acts makes it `Unknown`. Other control words (`SET`, `USE`,
+///   `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RESET`) may follow.
+/// - `BEGIN`, `START` and `END` also open and close blocks or start
+///   replication (`BEGIN DELETE FROM t END`, Oracle `BEGIN pkg.proc; END;`,
+///   MySQL `START REPLICA`): they are transaction control only in their
+///   transaction forms.
+fn check_control(kind: StatementKind, keyword: &str, sql: &str) -> StatementKind {
+    if !matches!(kind, StatementKind::Session | StatementKind::Transaction) {
+        return kind;
+    }
+    let rest: Vec<&str> = words(super::splitter::strip_leading_comments(sql)).skip(1).collect();
+    let second = rest.first().map(|w| w.to_ascii_uppercase());
+    let second = second.as_deref();
+    let transaction_form = match keyword {
+        "BEGIN" => matches!(
+            second,
+            None | Some("TRAN" | "TRANSACTION" | "WORK" | "ISOLATION" | "READ" | "NOT" | "DEFERRABLE" | "DEFERRED" | "IMMEDIATE" | "EXCLUSIVE" | "DISTRIBUTED")
+        ),
+        "START" => second == Some("TRANSACTION"),
+        "END" => matches!(second, None | Some("TRANSACTION" | "WORK")),
+        _ => true,
+    };
+    const CONTROL: &[&str] = &["SET", "USE", "RESET", "COMMIT", "ROLLBACK", "SAVEPOINT"];
+    let acts = rest
+        .iter()
+        .any(|w| !CONTROL.iter().any(|c| w.eq_ignore_ascii_case(c)) && (contains_dml_word(w) || contains_action_word(w) || w.eq_ignore_ascii_case("END")));
+    if !transaction_form || acts { StatementKind::Unknown } else { kind }
 }
 
 /// Words that act (run code, change state or permissions, reach files)
@@ -225,5 +260,66 @@ mod tests {
         assert!(!classify("update t set a=1 where id=2", Postgres).missing_where);
         assert_eq!(classify("show tables", Mysql).kind, StatementKind::Read);
         assert_eq!(c("totally not sql ;;"), StatementKind::Other);
+    }
+
+    #[test]
+    fn control_statements_that_act_are_unknown() {
+        // T-SQL batches without `;`, blocks, and BEGIN/START/END that aren't transactions.
+        for (k, sql) in [
+            (Mssql, "USE master\nDROP DATABASE prod"),
+            (Mssql, "use master\nshutdown"),
+            (Mssql, "set nocount on\ndelete from t"),
+            (Mssql, "set nocount on\nkill 52"),
+            (Mssql, "begin tran\ndrop table t"),
+            (Mssql, "commit\ndrop table t"),
+            (Mssql, "BEGIN DELETE FROM t END"),
+            (Mssql, "begin try\nexec p\nend try"),
+            (Oracle, "BEGIN DELETE FROM t; END;"),
+            (Oracle, "BEGIN EXECUTE IMMEDIATE 'DROP TABLE t'; END;"),
+            (Oracle, "BEGIN pkg.purge_all; END;"),
+            (Oracle, "begin null; end;"),
+            (Mysql, "START SLAVE"),
+            (Mysql, "START REPLICA"),
+            (Mysql, "START GROUP_REPLICATION"),
+            (Postgres, "end if"),
+        ] {
+            let c = classify(sql, k);
+            assert_eq!(c.kind, StatementKind::Unknown, "{k:?}: {sql}");
+            assert!(!crate::sql::read_only_allows(sql, &c), "{k:?}: {sql}");
+        }
+    }
+
+    #[test]
+    fn plain_control_statements_keep_their_kind() {
+        for (k, sql) in [
+            (Postgres, "begin"),
+            (Postgres, "BEGIN ISOLATION LEVEL SERIALIZABLE"),
+            (Postgres, "begin transaction read only"),
+            (Postgres, "start transaction"),
+            (Postgres, "end"),
+            (Postgres, "commit"),
+            (Postgres, "rollback to savepoint a"),
+            (Postgres, "savepoint a"),
+            (Postgres, "release savepoint a"),
+            (Mysql, "START TRANSACTION WITH CONSISTENT SNAPSHOT"),
+            (Mysql, "begin work"),
+            (Mssql, "begin tran"),
+            (Mssql, "BEGIN DISTRIBUTED TRANSACTION"),
+            (Mssql, "commit tran"),
+            (Sqlite, "begin immediate"),
+        ] {
+            assert_eq!(classify(sql, k).kind, StatementKind::Transaction, "{k:?}: {sql}");
+        }
+        for (k, sql) in [
+            (Mssql, "use sales"),
+            (Mssql, "set nocount on"),
+            (Mssql, "use sales\nset nocount on"),
+            (Postgres, "set search_path = a, b"),
+            (Mysql, "SET SESSION time_zone = '+00:00'"),
+        ] {
+            let c = classify(sql, k);
+            assert_eq!(c.kind, StatementKind::Session, "{k:?}: {sql}");
+            assert!(crate::sql::read_only_allows(sql, &c), "{k:?}: {sql}");
+        }
     }
 }

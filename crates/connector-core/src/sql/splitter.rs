@@ -354,7 +354,7 @@ pub(crate) fn words(s: &str) -> impl Iterator<Item = &str> {
     s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty())
 }
 
-fn strip_leading_comments(mut s: &str) -> &str {
+pub(crate) fn strip_leading_comments(mut s: &str) -> &str {
     loop {
         s = s.trim_start_matches(|c: char| c.is_whitespace() || c == '(');
         if let Some(rest) = s.strip_prefix("--") {
