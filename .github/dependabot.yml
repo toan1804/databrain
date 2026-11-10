@@ -28,7 +28,7 @@ updates:
     groups:
       actions:
         patterns: ["*"]
-    # Its ref is the Rust toolchain (`@stable`, `@nightly`, `@1.88` = the
+    # Its ref is the Rust toolchain (`@stable`, `@nightly`, `@1.89` = the
     # MSRV), not a version of the action: never "update" it.
     ignore:
       - dependency-name: dtolnay/rust-toolchain

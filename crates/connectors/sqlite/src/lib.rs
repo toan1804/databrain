@@ -174,7 +174,7 @@ fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &St
         return Ok(());
     }
 
-    let meta: Vec<(String, String)> = stmt.columns().iter().map(|c| (c.name().to_string(), c.decl_type().unwrap_or("").to_string())).collect();
+    let meta: Vec<(String, String)> = stmt.columns().map(|c| (c.name().to_string(), c.decl_type().unwrap_or("").to_string())).collect();
 
     let batch_size = opts.batch_size.max(1);
     let mut rows = stmt.raw_query();

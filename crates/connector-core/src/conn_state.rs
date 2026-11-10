@@ -51,7 +51,7 @@ impl ConnState {
             // ROLLBACK TO SAVEPOINT keeps the transaction.
             "ROLLBACK" if has(&["TO"]) => {}
             "COMMIT" | "END" if mssql => {
-                // `try_update` is the new name but needs Rust 1.95; the MSRV is 1.88.
+                // `try_update` is the new name but needs Rust 1.95; the MSRV is 1.89.
                 #[allow(deprecated)]
                 let _ = self.tx_depth.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |d| Some(d.saturating_sub(1)));
             }

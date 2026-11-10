@@ -75,7 +75,7 @@ pub fn query(schema_names: &[String], batches: &[RecordBatch], sql: &str, max_ro
     if !(lower.starts_with("select") || lower.starts_with("with")) {
         return Err(AiError::Policy("only SELECT queries are allowed on results".into()));
     }
-    let conn = rusqlite::Connection::open_in_memory().map_err(|e| AiError::Internal(e.to_string()))?;
+    let mut conn = rusqlite::Connection::open_in_memory().map_err(|e| AiError::Internal(e.to_string()))?;
     {
         let l = limits.clone();
         conn.progress_handler(1000, Some(move || l.stop.load(Ordering::Relaxed) || Instant::now() >= l.deadline))
@@ -142,7 +142,7 @@ pub fn query(schema_names: &[String], batches: &[RecordBatch], sql: &str, max_ro
     if !stmt.readonly() {
         return Err(AiError::Policy("only read-only queries are allowed on results".into()));
     }
-    let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+    let columns: Vec<String> = stmt.column_names().map(|c| c.to_string()).collect();
     let n = columns.len();
     let mut rows_iter = stmt.query([]).map_err(|e| stopped(e, AiError::Policy))?;
     let mut rows = Vec::new();

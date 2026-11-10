@@ -52,7 +52,7 @@ See [docs/FEATURES.md](docs/FEATURES.md) for the full reference.
 
 Requirements:
 
-- Rust 1.88+ and Node 22.22+ (Go 1.27+ only to build the Oracle driver helper)
+- Rust 1.89+ and Node 22.22+ (Go 1.27+ only to build the Oracle driver helper)
 - macOS: Xcode Command Line Tools · Linux: [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) · Windows: WebView2 and MSVC build tools
 
 ```sh

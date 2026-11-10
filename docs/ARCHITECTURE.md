@@ -52,7 +52,7 @@ DataBrain is a desktop SQL client written in Rust on Tauri 2, with a React UI an
 | Rust to TypeScript types | `ts-rs` | Generated into `ui/src/lib/bindings` |
 | Logging | `tracing`, `tracing-appender` | Daily rolling file in app data |
 
-The workspace sets `rust-version = "1.88"` and `edition = "2024"` in `Cargo.toml`. `unsafe_code` is denied in every crate; the one exception is the Windows console attach in `databrain-jobs`.
+The workspace sets `rust-version = "1.89"` and `edition = "2024"` in `Cargo.toml`. `unsafe_code` is denied in every crate; the one exception is the Windows console attach in `databrain-jobs`.
 
 ---
 

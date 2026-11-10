@@ -210,7 +210,7 @@ Sources: `ui/src/lib/sourceTraits.json` (language, levels, explain, formatter, l
 - **Unit tests** in the crate: type mapping, config and URL building, error mapping (with a TLS or auth error case), catalog query building.
 - **Live tests** in `session.rs`, `#[ignore = "live: needs DATABRAIN_<X>_HOST (cargo test -- --ignored)"]`, reading `DATABRAIN_<X>_*` variables. Cover connect, execute with types, list schemas and objects, describe, cancel, read-only refusing a write, and a load if it is a load target. List the variables in the README's Test section. If a Docker image exists, add a service container to the `live` job in `.github/workflows/ci.yml` and the crate to its `cargo test -p …` line.
 - **Shared tests:** add the kind's cases to the classifier and splitter tests (`crates/connector-core/src/sql/`), `quote_ident`/`split_path` tests (`crates/connector-core/src/lib.rs`), `preview_queries` (traits.rs), `insert_statements` (`crates/export/src/load.rs`), and an AI policy test with both the allowed and the refused case (`crates/ai/src/policy.rs`).
-- **Checks** before committing: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets` (no warnings), `cargo +1.88 check --workspace --all-targets` (the MSRV), `cargo test --workspace`, and `cd ui && npm run lint && npx tsc -b && npx vitest run`.
+- **Checks** before committing: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets` (no warnings), `cargo +1.89 check --workspace --all-targets` (the MSRV), `cargo test --workspace`, and `cd ui && npm run lint && npx tsc -b && npx vitest run`.
 
 ## 7. Docs
 
