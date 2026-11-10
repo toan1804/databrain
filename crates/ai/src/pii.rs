@@ -114,9 +114,10 @@ fn non_sql_masks(sql: &str, kind: ConnectorKind, columns: &[String], rule_column
     let tables: Vec<String> = refs.reads.iter().chain(&refs.writes).map(|t| t.join(".")).collect();
     let known = refs.opaque.is_empty() && !tables.is_empty();
     // Whole documents under a new name (`$lookup … as: 'u'`, `{x: '$$ROOT'}`,
-    // `$push: '$$ROOT'`) come back as one JSON cell that matches no rule by
-    // name: when a collection read has a rule, every column is masked.
-    let whole_doc = ["$$ROOT", "$$CURRENT", "$lookup", "$graphLookup"].iter().any(|op| sql.contains(op));
+    // `$push: '$$ROOT'`, `$facet: {all: []}`) come back as one JSON cell that
+    // matches no rule by name: when a collection read has a rule, every
+    // column is masked.
+    let whole_doc = ["$$ROOT", "$$CURRENT", "$lookup", "$graphLookup", "$facet"].iter().any(|op| sql.contains(op));
     if whole_doc && (!known || tables.iter().any(|t| rule_columns.iter().any(|r| is_pii(Some(t), r)))) {
         return vec![true; columns.len()];
     }
@@ -278,6 +279,7 @@ mod tests {
             "db.orders.aggregate([{$lookup: {from: 'users', localField: 'uid', foreignField: '_id', as: 'u'}}])",
             "db.users.aggregate([{$project: {x: '$$ROOT'}}])",
             "db.users.aggregate([{$group: {_id: null, all: {$push: '$$ROOT'}}}])",
+            "db.users.aggregate([{$facet: {all: []}}])",
             "db.orders.aggregate([{$graphLookup: {from: 'users', startWith: '$uid', connectFromField: 'ref', connectToField: '_id', as: 'u'}}])",
         ] {
             assert_eq!(masked(ConnectorKind::Mongodb, users, cmd, &["_id", "u"]), [true, true], "{cmd}");
