@@ -11,7 +11,7 @@ import { copyText } from "./CatalogMenus";
 import { ConnDot } from "./ui";
 
 /** Engines with EXPLAIN (and ANALYZE) DataBrain reads; mirrors the backend's plan_support. */
-const PLAN_KINDS: Record<string, { analyze: boolean }> = {
+export const PLAN_KINDS: Record<string, { analyze: boolean }> = {
   postgres: { analyze: true },
   mysql: { analyze: true },
   duckdb: { analyze: true },
@@ -46,7 +46,7 @@ export async function openPlan(tabId: string, analyze = false) {
   const params = await st.paramsFor(tabId, conn.config.kind, sql);
   if (!params) return;
   const plan: PlanRef = { source: tabId, analyze: analyze && support.analyze, params };
-  const existing = st.tabs.find((t) => t.plan?.source === tabId);
+  const existing = st.tabs.find((t) => t.plan?.source === tabId && !t.plan.compare);
   if (existing) {
     st.updateTab(existing.id, { sql, plan, connection_id: conn.id });
     return st.setActiveTab(existing.id);

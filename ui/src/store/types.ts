@@ -59,6 +59,8 @@ export interface PlanRef {
   analyze: boolean;
   /** `:name` values the statement uses. */
   params?: Record<string, ParamValue>;
+  /** Before/after plans of a rewrite ("Compare plans" on an AI edit): `sql` of the tab is `after`. */
+  compare?: { before: string; after: string } | null;
 }
 
 /** Where a lineage tab's SQL came from. */

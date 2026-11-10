@@ -11,6 +11,7 @@ import { ParamBar } from "./ParamBar";
 import { TabErrorBoundary } from "./TabErrorBoundary";
 import { openLineage } from "./openTabs";
 import { PlanTab, openPlan } from "./PlanTab";
+import { PlanCompareTab } from "./PlanCompareTab";
 import { DashboardTab } from "./DashboardTab";
 import { useAi } from "../aiStore";
 import { AUTO_COST_KINDS, estimateCost } from "../costPreview";
@@ -170,6 +171,8 @@ const TabSlot = memo(function TabSlot({ tab: t, active }: { tab: Tab; active: bo
                   ? ["output compare", <OutputCompareTab tabId={t.id} visible={active} />]
                 : t.er
                   ? ["ER diagram", <ErTab tabId={t.id} visible={active} />]
+                : t.plan?.compare
+                  ? ["plan comparison", <PlanCompareTab tabId={t.id} visible={active} />]
                 : t.plan
                   ? ["query plan", <PlanTab tabId={t.id} visible={active} />]
                   : [null, null];

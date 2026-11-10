@@ -79,3 +79,118 @@ export function fmtMs(ms: number): string {
   if (ms >= 10) return `${ms.toFixed(0)} ms`;
   return `${ms.toFixed(2)} ms`;
 }
+
+// ------------------------------------------------------------- comparing
+
+/** Numbers that sum up a plan, for before/after. */
+export interface PlanMetrics {
+  /** Total estimated cost (the roots' costs, in the engine's units). */
+  cost?: number;
+  /** Estimated rows of the result (first root). */
+  rows?: number;
+  /** Measured time (ANALYZE): execution, else the roots' time. */
+  timeMs?: number;
+  steps: number;
+  /** Full scans, as "op object" (one per step). */
+  fullScans: string[];
+  warnings: number;
+}
+
+export function planMetrics(roots: PlanNode[], executionMs?: number): PlanMetrics {
+  const rows = flattenPlan(roots);
+  const costs = roots.map((r) => r.cost).filter((c): c is number => c !== undefined);
+  const times = roots.map(totalMs).filter((t): t is number => t !== undefined);
+  return {
+    cost: costs.length ? costs.reduce((a, b) => a + b, 0) : undefined,
+    rows: roots[0]?.rows,
+    timeMs: executionMs ?? (times.length ? times.reduce((a, b) => a + b, 0) : undefined),
+    steps: rows.length,
+    fullScans: rows.filter((r) => r.warnings.some((w) => w.startsWith("Full scan"))).map((r) => `${r.node.op}${r.node.object ? ` ${r.node.object}` : ""}`),
+    warnings: rows.reduce((n, r) => n + r.warnings.length, 0),
+  };
+}
+
+/** A before → after change: the share it moved, and whether lower is better here. */
+export interface Delta {
+  before?: number;
+  after?: number;
+  /** after / before − 1 (undefined when either is missing or before is 0). */
+  ratio?: number;
+  /** true = improved, false = got worse, null = same or not comparable. */
+  better: boolean | null;
+}
+
+export function delta(before: number | undefined, after: number | undefined, lowerIsBetter = true): Delta {
+  if (before === undefined || after === undefined) return { before, after, better: null };
+  const ratio = before !== 0 ? after / before - 1 : undefined;
+  // Changes under 1% are noise in estimates.
+  const same = before === after || (ratio !== undefined && Math.abs(ratio) < 0.01);
+  return { before, after, ratio, better: same ? null : lowerIsBetter ? after < before : after > before };
+}
+
+/** "−42%", "+3.1×", "same". */
+export function fmtDelta(d: Delta): string {
+  if (d.better === null && (d.ratio === undefined || Math.abs(d.ratio) < 0.01)) return d.before === undefined || d.after === undefined ? "" : "same";
+  if (d.ratio === undefined) return d.after! > d.before! ? "up from 0" : "";
+  if (d.ratio >= 1) return `${(d.ratio + 1).toFixed(1)}×`;
+  return `${d.ratio > 0 ? "+" : "−"}${Math.round(Math.abs(d.ratio) * 100)}%`;
+}
+
+/** What a step does and on what: steps with the same key are "the same step". */
+const stepKey = (n: PlanNode) => `${n.op}|${n.object ?? ""}`;
+
+export interface PlanComparison {
+  before: PlanMetrics;
+  after: PlanMetrics;
+  cost: Delta;
+  time: Delta;
+  steps: Delta;
+  scans: Delta;
+  /** Full scans the rewrite removed, and the ones it added. */
+  scansRemoved: string[];
+  scansAdded: string[];
+  /** Row ids (flattenPlan) only in one plan: steps the rewrite dropped or added. */
+  gone: Set<string>;
+  added: Set<string>;
+}
+
+/** Compare two plans of the same engine (costs are only comparable within one engine). */
+export function comparePlans(before: { roots: PlanNode[]; execution_ms?: number }, after: { roots: PlanNode[]; execution_ms?: number }): PlanComparison {
+  const b = planMetrics(before.roots, before.execution_ms);
+  const a = planMetrics(after.roots, after.execution_ms);
+  const minus = (xs: string[], ys: string[]) => {
+    const left = [...ys];
+    return xs.filter((x) => {
+      const i = left.indexOf(x);
+      if (i < 0) return true;
+      left.splice(i, 1);
+      return false;
+    });
+  };
+  const onlyIn = (rows: PlanRow[], other: PlanRow[]) => {
+    const counts = new Map<string, number>();
+    for (const r of other) counts.set(stepKey(r.node), (counts.get(stepKey(r.node)) ?? 0) + 1);
+    const out = new Set<string>();
+    for (const r of rows) {
+      const k = stepKey(r.node);
+      const n = counts.get(k) ?? 0;
+      if (n > 0) counts.set(k, n - 1);
+      else out.add(r.id);
+    }
+    return out;
+  };
+  const br = flattenPlan(before.roots);
+  const ar = flattenPlan(after.roots);
+  return {
+    before: b,
+    after: a,
+    cost: delta(b.cost, a.cost),
+    time: delta(b.timeMs, a.timeMs),
+    steps: delta(b.steps, a.steps),
+    scans: delta(b.fullScans.length, a.fullScans.length),
+    scansRemoved: minus(b.fullScans, a.fullScans),
+    scansAdded: minus(a.fullScans, b.fullScans),
+    gone: onlyIn(br, ar),
+    added: onlyIn(ar, br),
+  };
+}

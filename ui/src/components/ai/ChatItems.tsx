@@ -1,9 +1,10 @@
 import { memo, useMemo, useState } from "react";
-import { AlertCircle, Check, ChevronDown, ChevronRight, Copy, FileCode2, Loader2, Play, RefreshCw, Settings2, ShieldAlert } from "lucide-react";
+import { AlertCircle, Check, ChevronDown, ChevronRight, Copy, FileCode2, GitFork, Loader2, Play, RefreshCw, Settings2, ShieldAlert } from "lucide-react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type { ResultInfo } from "../../lib/types";
 import { emptyView, lineDiff, sqlPreview } from "../../lib/util";
 import { useStore } from "../../store";
+import { canComparePlans, openPlanCompare } from "../PlanCompareTab";
 import { useAi, type ChatItem } from "../../aiStore";
 import { editorBridge } from "../../editorBridge";
 import { Markdown, type CodeRenderer } from "../Markdown";
@@ -232,6 +233,9 @@ function ApprovalCard({
 
 function EditCard({ item, onRespond }: { item: Extract<ChatItem, { kind: "edit" }>; onRespond: (id: string, ok: boolean) => void }) {
   const diff = useMemo(() => lineDiff(item.before, item.proposal.sql), [item.before, item.proposal.sql]);
+  // A rewrite of SQL in a query tab whose database has plans (or a cost estimate): compare them.
+  const kind = useStore((s) => s.connections.find((c) => c.id === s.tabs.find((t) => t.id === item.targetKey)?.connection_id)?.config.kind);
+  const comparable = !!item.targetKey && !!item.before.trim() && item.proposal.mode !== "insert_at_cursor" && item.before.trim() !== item.proposal.sql.trim() && canComparePlans(kind);
   const pending = item.state === "pending";
   const target =
     item.proposal.mode === "new_tab" || !item.targetKey
@@ -264,14 +268,27 @@ function EditCard({ item, onRespond }: { item: Extract<ChatItem, { kind: "edit" 
           </div>
         ))}
       </div>
-      {pending && (
+      {(pending || comparable) && (
         <div className="flex justify-end gap-1.5 border-t border-line p-1.5">
-          <button className="btn-ghost py-1" onClick={() => onRespond(item.id, false)}>
-            Reject
-          </button>
-          <button className="btn-primary py-1" onClick={() => onRespond(item.id, true)}>
-            <Check size={12} /> Accept
-          </button>
+          {comparable && (
+            <button
+              className={`btn-ghost py-1 ${pending ? "mr-auto" : ""}`}
+              title="Query plans (and on BigQuery, Snowflake and Databricks the bytes scanned) of the original and the rewrite, side by side. Nothing runs unless you choose Analyze"
+              onClick={() => item.targetKey && void openPlanCompare(item.targetKey, item.before, item.proposal.sql)}
+            >
+              <GitFork size={12} className="rotate-90" /> Compare plans
+            </button>
+          )}
+          {pending && (
+            <>
+              <button className="btn-ghost py-1" onClick={() => onRespond(item.id, false)}>
+                Reject
+              </button>
+              <button className="btn-primary py-1" onClick={() => onRespond(item.id, true)}>
+                <Check size={12} /> Accept
+              </button>
+            </>
+          )}
         </div>
       )}
     </div>
