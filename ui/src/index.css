@@ -170,6 +170,14 @@ select optgroup {
   @apply rounded border border-line bg-panel-2 px-1 py-px font-mono text-[10px] text-muted;
 }
 
+/* A strip that scrolls sideways with arrows or the wheel instead of a scroll bar. */
+@utility no-scrollbar {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
 /* CodeMirror */
 .cm-editor {
   height: 100%;

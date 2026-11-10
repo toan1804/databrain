@@ -1,10 +1,9 @@
 import { useEffect, useState } from "react";
 import { MessageSquareText, Table2 } from "lucide-react";
-import { outputLabel } from "../outputs";
-import { formatCount } from "../lib/util";
 import { useStore } from "../store";
 import { kbd } from "../lib/platform";
-import { DoneView, ErrorView, Messages, RunningView, RunSummary, StatusIcon } from "./results/RunStatus";
+import { DoneView, ErrorView, Messages, RunningView, RunSummary } from "./results/RunStatus";
+import { ResultTabs } from "./results/ResultTabs";
 import { TipsBar } from "./results/TipsBar";
 import { ResultView } from "./results/ResultView";
 
@@ -52,39 +51,23 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex h-9 shrink-0 items-center gap-0.5 border-b border-line px-2">
-        {withOutput.map((s) => {
-          const isActive = !showMessages && run.activeIndex === s.plan.index;
-          return (
-            <button
-              key={s.plan.index}
-              onClick={() => {
-                setShowMessages(false);
-                setActive(tabId, s.plan.index);
-              }}
-              title={s.plan.sql}
-              className={`flex h-7 max-w-[220px] items-center gap-1.5 rounded-md px-2 text-[12px] ${
-                isActive ? "bg-hover text-fg" : "text-muted hover:text-fg"
-              }`}
-            >
-              <StatusIcon s={s} />
-              <span className="truncate">
-                {withOutput.length > 1 ? `${s.plan.index + 1}. ` : ""}
-                {s.result ? "Result" : s.error ? (s.status === "cancelled" ? "Cancelled" : "Error") : "Running"}
-              </span>
-              {s.result && <span className="text-[11px] text-muted">{formatCount(s.result.total_rows)}</span>}
-              {s.output && <span className="font-mono text-[10.5px] text-muted">{outputLabel(s.output)}</span>}
-            </button>
-          );
-        })}
+        <ResultTabs
+          statements={withOutput}
+          active={showMessages ? null : run.activeIndex}
+          onSelect={(index) => {
+            setShowMessages(false);
+            setActive(tabId, index);
+          }}
+        />
         <button
           onClick={() => setShowMessages(true)}
-          className={`flex h-7 items-center gap-1.5 rounded-md px-2 text-[12px] ${
+          className={`flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-[12px] ${
             showMessages ? "bg-hover text-fg" : "text-muted hover:text-fg"
           }`}
         >
           <MessageSquareText size={13} /> Messages
         </button>
-        <div className="ml-auto flex items-center gap-2 pr-1 text-[11.5px] text-muted">
+        <div className="ml-1 flex shrink-0 items-center gap-2 pr-1 text-[11.5px] text-muted">
           <RunSummary run={run} />
         </div>
       </div>
