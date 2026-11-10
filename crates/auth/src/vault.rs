@@ -265,11 +265,13 @@ impl FileLock {
                 let age = std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
                 if age.is_some_and(|a| a > STALE_LOCK) {
                     // Left behind: moved aside (only one waiter can) and removed.
+                    // When it can't be moved (Windows: still open somewhere),
+                    // wait like for a live lock instead of spinning.
                     let gone = unique_sibling(path, "stale");
                     if std::fs::rename(path, &gone).is_ok() {
                         let _ = std::fs::remove_file(&gone);
+                        continue;
                     }
-                    continue;
                 }
             }
             if started.elapsed() > LOCK_WAIT {
