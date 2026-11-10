@@ -2,6 +2,7 @@
 //! (filter, quick filter, sort, find, column stats) and paging for the grid.
 
 pub mod chart;
+mod decimal;
 pub mod display;
 pub mod view;
 mod wide;
@@ -9,9 +10,9 @@ mod wide;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use databrain_connector_core::arrow::array::{Array, RecordBatch, UInt32Array};
+use databrain_connector_core::arrow::array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt32Array};
 use databrain_connector_core::arrow::compute;
-use databrain_connector_core::arrow::datatypes::SchemaRef;
+use databrain_connector_core::arrow::datatypes::{DataType, SchemaRef};
 use databrain_connector_core::arrow::error::ArrowError;
 use databrain_connector_core::arrow::util::display::ArrayFormatter;
 use parking_lot::Mutex;
@@ -271,10 +272,13 @@ impl ResultSet {
         let opts = display::format_options();
         let mut s = SelectionSummary::default();
         let mut distinct = std::collections::HashSet::new();
+        // Floats are summed as f64; exact numbers (decimals, integers) exactly.
         let (mut sum, mut min, mut max) = (0f64, f64::INFINITY, f64::NEG_INFINITY);
+        let (mut exact_sum, mut exact_range) = (decimal::ExactSum::default(), decimal::ExactRange::default());
         for &c in &cols {
             let a = batch.column(c);
             let numeric = display::family(batch.schema().field(c)) == display::TypeFamily::Number;
+            let float = matches!(a.data_type(), DataType::Float16 | DataType::Float32 | DataType::Float64);
             let f = ArrayFormatter::try_new(a.as_ref(), &opts)?;
             for r in 0..batch.num_rows() {
                 s.cells += 1;
@@ -283,17 +287,28 @@ impl ResultSet {
                 }
                 s.non_null += 1;
                 let text = f.value(r).to_string();
-                if numeric
-                    && let Ok(v) = text.parse::<f64>()
-                    && v.is_finite()
-                {
-                    s.numbers += 1;
-                    sum += v;
-                    min = min.min(v);
-                    max = max.max(v);
+                // Distinct by value for exact numbers (1.50 = 1.5), by text otherwise.
+                let mut key = None;
+                if numeric && float {
+                    if let Ok(v) = text.parse::<f64>()
+                        && v.is_finite()
+                    {
+                        s.numbers += 1;
+                        sum += v;
+                        min = min.min(v);
+                        max = max.max(v);
+                    }
+                } else if numeric && let Some(n) = decimal::Num::parse(&text) {
+                    if n.is_finite() {
+                        s.numbers += 1;
+                        exact_sum.add(&n);
+                        exact_range.add(&n);
+                    }
+                    key = Some([b"n".as_slice(), &n.key()].concat());
                 }
+                let key = key.unwrap_or_else(|| [b"t".as_slice(), text.as_bytes()].concat());
                 if distinct.len() < MAX_DISTINCT {
-                    distinct.insert(text);
+                    distinct.insert(key);
                 } else {
                     s.distinct_capped = true;
                 }
@@ -301,6 +316,11 @@ impl ResultSet {
         }
         s.distinct = distinct.len();
         if s.numbers > 0 {
+            if let (Some((_, lo)), Some((_, hi))) = (&exact_range.min, &exact_range.max) {
+                sum += exact_sum.to_f64();
+                min = min.min(lo.to_f64());
+                max = max.max(hi.to_f64());
+            }
             s.sum = Some(sum);
             s.min = Some(min);
             s.max = Some(max);
@@ -416,14 +436,14 @@ impl ResultSet {
         let field = self.schema.field(column).clone();
         let nulls = col.null_count() as u64;
 
-        // min / max via sort (works for every orderable type).
-        let sortable =
-            if display::is_decimal_text(&field) { compute::cast(&col, &databrain_connector_core::arrow::datatypes::DataType::Float64)? } else { col.clone() };
+        // min / max via sort (works for every orderable type; exact decimals by key).
+        let decimal_text = display::is_decimal_text(&field);
+        let sortable = if decimal_text { Arc::new(decimal::keys(col.as_ref())?) as ArrayRef } else { col.clone() };
+        let text = display::to_display(col.as_ref())?;
         let (mut min, mut max) = (None, None);
         if col.len() > nulls as usize
             && let Ok(order) = compute::sort_to_indices(sortable.as_ref(), Some(compute::SortOptions { descending: false, nulls_first: false }), None)
         {
-            let text = display::to_display(col.as_ref())?;
             let non_null: Vec<u32> = order.values().iter().copied().filter(|i| !sortable.is_null(*i as usize)).collect();
             if let (Some(first), Some(last)) = (non_null.first(), non_null.last()) {
                 min = Some(text.value(*first as usize).to_string());
@@ -431,14 +451,23 @@ impl ResultSet {
             }
         }
 
-        let text = display::to_display(col.as_ref())?;
-        let mut counts: HashMap<Option<&str>, u64> = HashMap::new();
+        // Grouped by value for exact decimals (1.50 = 1.5; shown as first seen), by text otherwise.
+        let keys = decimal_text.then(|| sortable.as_any().downcast_ref::<BinaryArray>().cloned()).flatten();
+        let mut counts: HashMap<Option<&[u8]>, (usize, u64)> = HashMap::new();
         for i in 0..text.len() {
-            let k = if text.is_null(i) { None } else { Some(text.value(i)) };
-            *counts.entry(k).or_default() += 1;
+            let k = if text.is_null(i) {
+                None
+            } else {
+                match &keys {
+                    Some(k) if k.is_valid(i) => Some(k.value(i)),
+                    _ => Some(text.value(i).as_bytes()),
+                }
+            };
+            counts.entry(k).or_insert((i, 0)).1 += 1;
         }
         let distinct = counts.keys().filter(|k| k.is_some()).count() as u64;
-        let mut top: Vec<(Option<&str>, u64)> = counts.into_iter().collect();
+        let value = |i: usize| (!text.is_null(i)).then(|| text.value(i));
+        let mut top: Vec<(Option<&str>, u64)> = counts.into_values().map(|(i, n)| (value(i), n)).collect();
         top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let top = top.into_iter().take(10).map(|(v, count)| TopValue { value: v.map(|s| s.to_string()), count }).collect();
 
@@ -763,6 +792,111 @@ mod tests {
         assert!(chunks.len() >= 2, "{}", chunks.len());
         assert_eq!(chunks.iter().map(|b| b.num_rows()).sum::<usize>(), 2304);
         assert!(chunks.iter().all(|b| b.schema() == schema));
+    }
+
+    /// One column of Oracle-style `NUMBER(38)` text plus a row id.
+    fn decimals(db_type: &str, vals: &[Option<&str>]) -> ResultSet {
+        let mut md = HashMap::new();
+        md.insert(META_DB_TYPE.to_string(), db_type.to_string());
+        let schema = Arc::new(Schema::new(vec![Field::new("row", DataType::Int64, false), Field::new("n", DataType::Utf8, true).with_metadata(md)]));
+        let mut rs = ResultSet::new("d", schema.clone());
+        let rows = Int64Array::from((0..vals.len() as i64).collect::<Vec<_>>());
+        rs.push(RecordBatch::try_new(schema, vec![Arc::new(rows), Arc::new(StringArray::from(vals.to_vec()))]).unwrap());
+        rs.finish(false);
+        rs
+    }
+
+    fn view_rows(rs: &mut ResultSet, spec: &ViewSpec) -> Vec<u32> {
+        rs.page(spec, 0, 100).unwrap().row_ids
+    }
+
+    fn filter(op: FilterOp, v: &str) -> ViewSpec {
+        ViewSpec { filters: vec![ColumnFilter { column: 1, op, value: v.into() }], ..Default::default() }
+    }
+
+    /// Ids past 2^53 differ in the last digit only; as f64 they were equal.
+    #[test]
+    fn large_decimals_compare_exactly() {
+        let big = ["9007199254740993", "9007199254740992", "9007199254740994", "-9007199254740993", "-9007199254740992"];
+        let mut rs = decimals("NUMBER(38)", &big.map(Some));
+        let asc = ViewSpec { sort: vec![SortKey { column: 1, descending: false }], ..Default::default() };
+        assert_eq!(view_rows(&mut rs, &asc), vec![3, 4, 1, 0, 2]);
+        let desc = ViewSpec { sort: vec![SortKey { column: 1, descending: true }], ..Default::default() };
+        assert_eq!(view_rows(&mut rs, &desc), vec![2, 0, 1, 4, 3]);
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Equals, "9007199254740993")), vec![0]);
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::NotEquals, "9007199254740993")), vec![1, 2, 3, 4]);
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Gt, "9007199254740992")), vec![0, 2]);
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Gte, "9007199254740993")), vec![0, 2]);
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Lt, "-9007199254740992")), vec![3]);
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Lte, "-9007199254740992")), vec![3, 4]);
+        // 38 digits: beyond i64 and f64.
+        let mut rs = decimals("NUMBER(38)", &[Some("99999999999999999999999999999999999999"), Some("99999999999999999999999999999999999998")]);
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Equals, "99999999999999999999999999999999999998")), vec![1]);
+        assert_eq!(view_rows(&mut rs, &asc), vec![1, 0]);
+
+        let mut rs = decimals("NUMBER(38)", &big.map(Some));
+        let stats = rs.column_stats(&ViewSpec::default(), 1).unwrap();
+        assert_eq!(stats.distinct, 5);
+        assert_eq!((stats.min.as_deref(), stats.max.as_deref()), (Some("-9007199254740993"), Some("9007199254740994")));
+        let s = rs.summarize(&ViewSpec::default(), &[1], 0, 100).unwrap();
+        assert_eq!((s.numbers, s.distinct), (5, 5));
+        // Exact sum: 9007199254740994 (one rounding at the end, to the f64 field).
+        assert_eq!(s.sum, Some(9007199254740994.0));
+        assert_eq!((s.min, s.max), (Some(-9007199254740993.0), Some(9007199254740994.0)));
+        // Exact sum where adding as f64 drifts: 2^53 + 1 + 1 = 2^53 + 2.
+        let mut rs = decimals("numeric", &[Some("9007199254740992"), Some("1"), Some("1")]);
+        assert_eq!(rs.summarize(&ViewSpec::default(), &[1], 0, 100).unwrap().sum, Some(9007199254740994.0));
+        // 0.1 + 0.2 is 0.3 exactly.
+        let mut rs = decimals("numeric(3,1)", &[Some("0.1"), Some("0.2")]);
+        assert_eq!(rs.summarize(&ViewSpec::default(), &[1], 0, 100).unwrap().sum, Some(0.3));
+    }
+
+    /// Ordinary decimals: scale differences, negatives, zero forms and NULLs.
+    #[test]
+    fn decimal_text_scale_sign_and_nulls() {
+        let vals = [Some("1.50"), Some("-2.5"), None, Some("1.5"), Some("-0.000"), Some("10"), Some("0.05"), Some("-10.25"), Some("1.500001")];
+        let mut rs = decimals("numeric(12,6)", &vals);
+        let asc = ViewSpec { sort: vec![SortKey { column: 1, descending: false }, SortKey { column: 0, descending: false }], ..Default::default() };
+        assert_eq!(view_rows(&mut rs, &asc), vec![7, 1, 4, 6, 0, 3, 8, 5, 2], "nulls last");
+        let desc = ViewSpec { sort: vec![SortKey { column: 1, descending: true }, SortKey { column: 0, descending: false }], ..Default::default() };
+        assert_eq!(view_rows(&mut rs, &desc), vec![5, 8, 0, 3, 6, 4, 1, 7, 2], "nulls last");
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Equals, "1.5")), vec![0, 3]);
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Equals, " 1.5000 ")), vec![0, 3]);
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Equals, "0")), vec![4], "-0.000 is zero");
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::NotEquals, "1.5")), vec![1, 4, 5, 6, 7, 8], "NULL is neither equal nor unequal");
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Lt, "0")), vec![1, 7]);
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Gt, "1.5")), vec![5, 8]);
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Gte, "-2.50")), vec![0, 1, 3, 4, 5, 6, 8]);
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::Equals, "1e1")), vec![5], "exponent form");
+        assert_eq!(view_rows(&mut rs, &filter(FilterOp::IsNull, "")), vec![2]);
+        assert!(matches!(rs.page(&filter(FilterOp::Gt, "abc"), 0, 10), Err(Error::InvalidFilterValue(_))));
+
+        let stats = rs.column_stats(&ViewSpec::default(), 1).unwrap();
+        assert_eq!((stats.count, stats.nulls, stats.distinct), (9, 1, 7), "1.50 and 1.5 are one value");
+        assert_eq!((stats.min.as_deref(), stats.max.as_deref()), (Some("-10.25"), Some("10")));
+        assert_eq!((stats.top[0].value.as_deref(), stats.top[0].count), (Some("1.50"), 2));
+
+        let s = rs.summarize(&ViewSpec::default(), &[1], 0, 100).unwrap();
+        assert_eq!((s.cells, s.non_null, s.numbers, s.distinct), (9, 8, 8, 7));
+        assert_eq!(s.sum, Some(1.800001));
+        assert_eq!((s.min, s.max), (Some(-10.25), Some(10.0)));
+        assert_eq!(s.avg, Some(1.800001 / 8.0));
+        let none = decimals("numeric", &[None, None]).summarize(&ViewSpec::default(), &[1], 0, 100).unwrap();
+        assert_eq!((none.numbers, none.sum, none.min, none.distinct), (0, None, None, 0));
+    }
+
+    /// Floats keep their f64 behaviour, also next to decimals in one selection.
+    #[test]
+    fn floats_unchanged_next_to_decimals() {
+        let mut rs = sample();
+        let s = rs.summarize(&ViewSpec::default(), &[2, 3], 0, 100).unwrap();
+        assert_eq!(s.numbers, 9);
+        assert_eq!(s.sum, Some(9.5 + 7.0 + 8.0 + 9.5 + 10.5 + 9.0 + 100.0 + 2.0 + 10.25));
+        assert_eq!((s.min, s.max), (Some(2.0), Some(100.0)));
+        let spec = ViewSpec { filters: vec![ColumnFilter { column: 2, op: FilterOp::Equals, value: "9.5".into() }], ..Default::default() };
+        assert_eq!(ids(&rs.page(&spec, 0, 10).unwrap()), vec!["1", "5"]);
+        let spec = ViewSpec { filters: vec![ColumnFilter { column: 3, op: FilterOp::Equals, value: "10.50".into() }], ..Default::default() };
+        assert_eq!(ids(&rs.page(&spec, 0, 10).unwrap()), vec!["1"]);
     }
 
     #[test]

@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use databrain_connector_core::arrow::array::{Array, ArrayRef, BooleanArray, BooleanBuilder, LargeStringArray, RecordBatch, Scalar, StringArray, UInt32Array};
+use databrain_connector_core::arrow::array::{
+    Array, ArrayRef, BinaryArray, BooleanArray, BooleanBuilder, LargeStringArray, RecordBatch, Scalar, StringArray, UInt32Array,
+};
 use databrain_connector_core::arrow::compute::kernels::cmp;
 use databrain_connector_core::arrow::compute::{
     self, CastOptions, SortColumn, SortOptions, and_kleene, cast_with_options, is_not_null, is_null, lexsort_to_indices, or_kleene,
@@ -11,6 +13,7 @@ use databrain_connector_core::arrow::compute::{
 use databrain_connector_core::arrow::datatypes::DataType;
 use serde::{Deserialize, Serialize};
 
+use crate::decimal::{self, Num};
 use crate::display::{self, DisplayText, is_decimal_text};
 use crate::{Error, Result};
 
@@ -84,11 +87,11 @@ pub(crate) fn like_escape(s: &str) -> String {
     out
 }
 
-/// Column as it should be compared: decimals-as-text become Float64.
+/// Column as it should be compared: decimals-as-text become exact
+/// order-preserving byte keys (not f64, which merges ids past 2^53).
 fn comparable(batch: &RecordBatch, col: usize) -> Result<ArrayRef> {
-    let field = batch.schema().field(col).clone();
     let a = batch.column(col).clone();
-    if is_decimal_text(&field) { Ok(cast_with_options(&a, &DataType::Float64, &CastOptions::default())?) } else { Ok(a) }
+    if is_decimal_text(batch.schema().field(col)) { Ok(Arc::new(decimal::keys(a.as_ref())?)) } else { Ok(a) }
 }
 
 fn display_col(cache: &mut DisplayCache, batch: &RecordBatch, col: usize) -> Result<Arc<DisplayText>> {
@@ -141,7 +144,10 @@ fn filter_mask(batch: &RecordBatch, f: &ColumnFilter, cache: &mut DisplayCache) 
     let col = comparable(batch, f.column)?;
     // Parse the user's value into the column's type.
     let lit = StringArray::from(vec![f.value.trim().to_string()]);
-    let typed = if matches!(col.data_type(), DataType::Utf8) {
+    let typed = if is_decimal_text(batch.schema().field(f.column)) {
+        let n = Num::parse(&f.value).ok_or_else(|| Error::InvalidFilterValue(format!("'{}' is not a valid number value", f.value)))?;
+        Arc::new(BinaryArray::from_vec(vec![&n.key()])) as ArrayRef
+    } else if matches!(col.data_type(), DataType::Utf8) {
         Arc::new(StringArray::from(vec![f.value.clone()])) as ArrayRef
     } else if matches!(col.data_type(), DataType::LargeUtf8) {
         Arc::new(LargeStringArray::from(vec![f.value.clone()])) as ArrayRef
