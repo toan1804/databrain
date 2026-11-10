@@ -272,7 +272,7 @@ impl ToolContext {
         self.results.lock().iter().any(|r| r == id) || self.host.current_result().as_deref() == Some(id)
     }
 
-    pub(super) fn query_result(&self, args: &Value) -> Result<ToolOutput> {
+    pub(super) async fn query_result(&self, args: &Value) -> Result<ToolOutput> {
         let id = self.resolve_result(arg(args, "result_id")?)?;
         let id = id.as_str();
         let sql = arg(args, "sql")?;
@@ -297,7 +297,19 @@ impl ToolContext {
         // CTE column list, `SELECT *` under another name or any expression
         // can rename a column, never unmask it.
         let batches = resultsql::mask_columns(&batches, &mask)?;
-        let mut t = resultsql::query(&names, &batches, sql, 200)?;
+        // SQLite blocks: on a blocking thread, within the time limit, and
+        // stopped at once when the turn is (Stop).
+        let limits = resultsql::Limits::new(resultsql::QUERY_TIMEOUT);
+        let stop = limits.stop.clone();
+        let (q_names, q_sql) = (names.clone(), sql.to_string());
+        let task = tokio::task::spawn_blocking(move || resultsql::query(&q_names, &batches, &q_sql, 200, &limits));
+        let mut t = tokio::select! {
+            r = task => r.map_err(|e| AiError::Internal(e.to_string()))??,
+            _ = self.cancel.cancelled() => {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(AiError::Cancelled);
+            }
+        };
         // `SELECT *` and the like return them under their own names.
         for (i, c) in t.columns.iter().enumerate() {
             if masked.contains(&c.to_ascii_lowercase()) {

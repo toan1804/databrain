@@ -1,6 +1,10 @@
 //! Run SQL against a stored query result locally (in-memory SQLite), so the
 //! AI can compute aggregates without receiving raw rows.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
 use databrain_connector_core::arrow::array::{Array, RecordBatch};
 use databrain_connector_core::arrow::datatypes::DataType;
 use databrain_connector_core::arrow::util::display::ArrayFormatter;
@@ -15,7 +19,6 @@ use crate::types::{AiError, Result};
 pub fn mask_columns(batches: &[RecordBatch], mask: &[bool]) -> Result<Vec<RecordBatch>> {
     use databrain_connector_core::arrow::array::{ArrayRef, StringArray};
     use databrain_connector_core::arrow::datatypes::{Field, Schema};
-    use std::sync::Arc;
     if !mask.iter().any(|m| *m) {
         return Ok(batches.to_vec());
     }
@@ -46,13 +49,51 @@ pub struct LocalTable {
     pub truncated: bool,
 }
 
-/// Load `batches` as table `result` and run a single read-only statement.
-pub fn query(schema_names: &[String], batches: &[RecordBatch], sql: &str, max_rows: usize) -> Result<LocalTable> {
+/// How long a [`query`] may take, loading included.
+pub const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// When a [`query`] must stop: past `deadline`, or once `stop` is set (the
+/// user pressed Stop). SQLite checks them every thousand steps, so a
+/// runaway query (a recursive CTE, a self-join of a large result) ends
+/// within milliseconds of either.
+#[derive(Clone)]
+pub struct Limits {
+    pub deadline: Instant,
+    pub stop: Arc<AtomicBool>,
+}
+
+impl Limits {
+    pub fn new(timeout: Duration) -> Self {
+        Self { deadline: Instant::now() + timeout, stop: Arc::new(AtomicBool::new(false)) }
+    }
+}
+
+/// Load `batches` as table `result` and run a single read-only statement,
+/// within `limits`. Blocking: call it from a blocking thread.
+pub fn query(schema_names: &[String], batches: &[RecordBatch], sql: &str, max_rows: usize, limits: &Limits) -> Result<LocalTable> {
     let lower = sql.trim().to_ascii_lowercase();
     if !(lower.starts_with("select") || lower.starts_with("with")) {
         return Err(AiError::Policy("only SELECT queries are allowed on results".into()));
     }
     let conn = rusqlite::Connection::open_in_memory().map_err(|e| AiError::Internal(e.to_string()))?;
+    {
+        let l = limits.clone();
+        conn.progress_handler(1000, Some(move || l.stop.load(Ordering::Relaxed) || Instant::now() >= l.deadline))
+            .map_err(|e| AiError::Internal(e.to_string()))?;
+    }
+    // An interrupted step: Stop, or the time limit.
+    let stopped = |e: rusqlite::Error, other: fn(String) -> AiError| -> AiError {
+        if e.sqlite_error_code() != Some(rusqlite::ErrorCode::OperationInterrupted) {
+            return other(e.to_string());
+        }
+        if limits.stop.load(Ordering::Relaxed) {
+            return AiError::Cancelled;
+        }
+        AiError::Policy(format!(
+            "the query on the result took more than {} s and was stopped; aggregate over fewer rows, or avoid recursive CTEs and self-joins",
+            QUERY_TIMEOUT.as_secs()
+        ))
+    };
     let cols: Vec<String> = dedupe(schema_names);
     let ddl = format!("CREATE TABLE result ({})", cols.iter().map(|c| format!("\"{}\"", c.replace('"', "\"\""))).collect::<Vec<_>>().join(", "));
     conn.execute(&ddl, []).map_err(|e| AiError::Internal(e.to_string()))?;
@@ -90,7 +131,7 @@ pub fn query(schema_names: &[String], batches: &[RecordBatch], sql: &str, max_ro
                         }
                     })
                     .collect();
-                ins.execute(rusqlite::params_from_iter(vals)).map_err(|e| AiError::Internal(e.to_string()))?;
+                ins.execute(rusqlite::params_from_iter(vals)).map_err(|e| stopped(e, AiError::Internal))?;
             }
         }
         drop(ins);
@@ -103,10 +144,10 @@ pub fn query(schema_names: &[String], batches: &[RecordBatch], sql: &str, max_ro
     }
     let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
     let n = columns.len();
-    let mut rows_iter = stmt.query([]).map_err(|e| AiError::Policy(e.to_string()))?;
+    let mut rows_iter = stmt.query([]).map_err(|e| stopped(e, AiError::Policy))?;
     let mut rows = Vec::new();
     let mut truncated = false;
-    while let Some(r) = rows_iter.next().map_err(|e| AiError::Policy(e.to_string()))? {
+    while let Some(r) = rows_iter.next().map_err(|e| stopped(e, AiError::Policy))? {
         if rows.len() >= max_rows {
             truncated = true;
             break;
@@ -149,7 +190,6 @@ mod tests {
     fn masked_columns_stay_masked_under_any_name() {
         use databrain_connector_core::arrow::array::{Int64Array, StringArray};
         use databrain_connector_core::arrow::datatypes::{Field, Schema};
-        use std::sync::Arc;
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), Field::new("email", DataType::Utf8, true)]));
         let b = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(StringArray::from(vec![Some("a@x.io"), None]))]).unwrap();
         let names = vec!["id".to_string(), "email".to_string()];
@@ -159,16 +199,15 @@ mod tests {
             "select email as e from result order by id",
             "select upper(substr(email, 1, 3)) as p from result order by id",
         ] {
-            let t = query(&names, &masked, sql, 10).unwrap();
+            let t = query(&names, &masked, sql, 10, &lim()).unwrap();
             let shown: Vec<String> = t.rows.iter().map(|r| r[0].to_string()).collect();
             assert!(shown.iter().all(|v| !v.contains('@')), "{sql}: {shown:?}");
         }
-        let t = query(&names, &masked, "select count(email), count(*) from result", 10).unwrap();
+        let t = query(&names, &masked, "select count(email), count(*) from result", 10, &lim()).unwrap();
         assert_eq!(t.rows[0][0], serde_json::json!(1), "NULL stays NULL");
     }
     use databrain_connector_core::arrow::array::{Float64Array, Int64Array, StringArray};
     use databrain_connector_core::arrow::datatypes::{Field, Schema};
-    use std::sync::Arc;
 
     #[test]
     fn aggregates_locally() {
@@ -187,10 +226,53 @@ mod tests {
         )
         .unwrap();
         let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let t = query(&names, std::slice::from_ref(&b), "select region, sum(amount) s from result group by 1 order by 1", 10).unwrap();
+        let t = query(&names, std::slice::from_ref(&b), "select region, sum(amount) s from result group by 1 order by 1", 10, &lim()).unwrap();
         assert_eq!(t.columns, vec!["region", "s"]);
         assert_eq!(t.rows[0], vec![serde_json::json!("EU"), serde_json::json!(12.5)]);
-        assert!(query(&names, std::slice::from_ref(&b), "delete from result", 10).is_err());
-        assert!(query(&names, &[b], "select * from result", 1).unwrap().truncated);
+        assert!(query(&names, std::slice::from_ref(&b), "delete from result", 10, &lim()).is_err());
+        assert!(query(&names, &[b], "select * from result", 1, &lim()).unwrap().truncated);
+    }
+
+    fn lim() -> Limits {
+        Limits::new(QUERY_TIMEOUT)
+    }
+
+    fn numbers(n: i64) -> (Vec<String>, Vec<RecordBatch>) {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let b = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from((0..n).collect::<Vec<_>>()))]).unwrap();
+        (vec!["n".into()], vec![b])
+    }
+
+    /// A runaway query ends at the time limit with a message, not a hang.
+    #[test]
+    fn stops_at_the_time_limit() {
+        let (names, b) = numbers(2000);
+        let start = Instant::now();
+        let runaway = "with recursive r(x) as (select 1 union all select x + 1 from r) select count(*) from r";
+        match query(&names, &b, runaway, 10, &Limits::new(Duration::from_millis(200))) {
+            Err(AiError::Policy(m)) => assert!(m.contains("was stopped"), "{m}"),
+            other => panic!("{:?}", other.map(|t| t.rows)),
+        }
+        let join = "select count(*) from result a, result b, result c";
+        assert!(matches!(query(&names, &b, join, 10, &Limits::new(Duration::from_millis(200))), Err(AiError::Policy(_))));
+        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+        // A normal query is unaffected.
+        assert_eq!(query(&names, &b, "select count(*) from result", 10, &lim()).unwrap().rows[0][0], serde_json::json!(2000));
+    }
+
+    /// Stop ends a running query at once.
+    #[test]
+    fn stop_interrupts_a_running_query() {
+        let (names, b) = numbers(10);
+        let limits = lim();
+        let stop = limits.stop.clone();
+        let t = std::thread::spawn(move || {
+            query(&names, &b, "with recursive r(x) as (select 1 union all select x + 1 from r) select count(*) from r", 10, &limits)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let at = Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        assert!(matches!(t.join().unwrap(), Err(AiError::Cancelled)));
+        assert!(at.elapsed() < Duration::from_secs(2));
     }
 }

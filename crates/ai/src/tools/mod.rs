@@ -136,7 +136,7 @@ impl ToolContext {
             "list_tables" => self.list_tables(args),
             "get_sample_rows" => self.sample_rows(args).await,
             "run_query" => self.run_query(args).await,
-            "query_result" => self.query_result(args),
+            "query_result" => self.query_result(args).await,
             "result_summary" => self.result_summary(args),
             "list_outputs" => self.list_outputs(args),
             "query_outputs" => self.query_outputs(args).await,
