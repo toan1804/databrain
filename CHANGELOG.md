@@ -9,6 +9,15 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 - More passwords are hidden from query history, job logs and the assistant's transcripts and audit log: a connection URL password that starts with `/`, `?` or `#` (`postgres://u:/pw@h/db`, or digits then one of them, `u:12/ab@h`, which read as a port), a password after an email address as the user name (`postgres://me@x.com:pa/ss@h/db`), a password with a space in it (`postgres://u:pa ss@h/db`), and Postgres escape strings (`ALTER ROLE r PASSWORD E'sec\'ret'`) were kept in clear. When a URL is ambiguous the text is hidden: `https://h:8443/a@b` keeps only `https://h:***@b`.
 - A `SELECT` that calls a function that acts is no longer a read: `select pg_terminate_backend(…)` (PostgreSQL's `KILL`), `pg_cancel_backend`, `pg_reload_conf`, `setval`/`nextval`, `set_config`, `lo_export`, `dblink_exec`, replication-slot functions and Snowflake `system$cancel_query`/`system$abort_session` ran on read-only connections and on production without the confirmation.
 
+### Fixed
+
+- Generate test data on SQL Server leaves identity, computed and `timestamp`/`rowversion` columns to the database: they were filled, so the load failed (error 544). SQL Server's table DDL now shows `IDENTITY(…)` and computed `AS (…)` columns.
+- Generate test data: the seed shown after generating makes the same rows again. It was larger than a JavaScript number keeps exactly, so entering it made other rows; a seed above 9007199254740991 is now refused.
+- Generate test data on SQLite fills a foreign key written without columns (`REFERENCES customers`) with the parent's primary key values; it was left NULL. Foreign keys of such tables also show the parent's key columns elsewhere.
+- Generate test data and Load into… write BigQuery NUMERIC and BIGNUMERIC values as `NUMERIC '…'`/`BIGNUMERIC '…'`, which BigQuery accepts.
+- Generate test data no longer repeats primary keys: numbers past 2^53 are read exactly (and a key at the 64-bit limit is refused with a message); text keys fit the column's length and continue after the rows already there, or the dialog says the column is too short; date, date-time, time, float and byte keys count up instead of being random.
+- Generate test data fills PostgreSQL `bit(1)` columns with `'0'`/`'1'`; `TRUE` failed.
+
 ## 0.3.3 - 2026-11-11
 
 ### Added

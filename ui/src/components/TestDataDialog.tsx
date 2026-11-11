@@ -15,6 +15,16 @@ import { DryRunReport } from "./job/LoadFields";
 import { Modal } from "./ui";
 
 export const MAX_TEST_ROWS = 100_000;
+/** Largest seed: seeds travel as JavaScript numbers, exact up to 2^53 - 1. */
+export const MAX_SEED = Number.MAX_SAFE_INTEGER;
+
+/** Why a typed seed can't be used (null: it can, or none was typed). */
+export function seedProblem(seed: string): string | null {
+  const s = seed.trim();
+  if (!s) return null;
+  if (!/^\d+$/.test(s)) return "A seed is a whole number";
+  return BigInt(s) > BigInt(MAX_SEED) ? `Choose a seed up to ${MAX_SEED}` : null;
+}
 
 /** Columns ticked at first: what DataBrain can fill and the database doesn't. */
 export function defaultColumns(cols: TestDataColumn[]): Set<string> {
@@ -27,7 +37,8 @@ export function specFor(cols: TestDataColumn[], ticked: Set<string>, rows: numbe
   return {
     rows: Math.max(1, Math.min(MAX_TEST_ROWS, Math.floor(rows) || 1)),
     null_percent: Math.max(0, Math.min(100, Math.floor(nullPercent) || 0)),
-    seed: s && /^\d+$/.test(s) ? Number(s) : null,
+    // Only seeds that survive a JavaScript number (else the rows wouldn't repeat).
+    seed: s && seedProblem(s) === null ? Number(s) : null,
     skip: cols.filter((c) => c.supported && !c.database_fills && !ticked.has(c.name)).map((c) => c.name),
     fill: cols.filter((c) => c.supported && c.database_fills && ticked.has(c.name)).map((c) => c.name),
     parent_keys: parentKeys,
@@ -108,7 +119,8 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   const p = plan.plan;
   const readOnly = !!conn?.config.read_only;
   const key = `${req.connection_id}|${p.table}`;
-  const nothing = ticked.size === 0;
+  const badSeed = seedProblem(seed);
+  const nothing = ticked.size === 0 || !!badSeed;
 
   /** Rows for the current settings (made once, reused by preview, dry run and load). */
   const generate = async (): Promise<TestDataOutput> => {
@@ -265,7 +277,20 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
             </label>
             <label className="space-y-1">
               <span className="block text-[11.5px] font-medium text-muted">Seed (same seed, same rows)</span>
-              <input className="field font-mono" placeholder="random" value={seed} onChange={(e) => setSeed(e.target.value.replace(/\D/g, ""))} />
+              <input
+                className="field font-mono"
+                placeholder="random"
+                inputMode="numeric"
+                maxLength={16}
+                aria-invalid={!!badSeed}
+                value={seed}
+                onChange={(e) => setSeed(e.target.value.replace(/\D/g, ""))}
+              />
+              {badSeed && (
+                <span className="block text-[11px] text-danger" role="alert">
+                  {badSeed}
+                </span>
+              )}
             </label>
           </div>
           <div className="max-h-72 overflow-auto rounded-md border border-line">

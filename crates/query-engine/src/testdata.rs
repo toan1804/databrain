@@ -10,7 +10,9 @@
 //!   Types DataBrain can't make up (arrays, geometry, user types) are left
 //!   out and reported.
 //! - The first primary key column counts up from the table's current
-//!   maximum, so the rows don't collide with what is there.
+//!   maximum (numbers, dates, date-times, times) or row count (text,
+//!   bytes, IP addresses), so the rows don't collide with what is there.
+//!   When the column can't hold that many new keys, nothing is made.
 //! - Foreign key columns take values read from the parent table (up to
 //!   1,000 distinct keys), so the rows satisfy the constraint. The user is
 //!   told when a table has foreign keys, and when a parent has no rows.
@@ -31,6 +33,9 @@ use crate::{EngineError, LoadRows, QueryEngine, Result};
 
 /// Most rows one request makes.
 pub const MAX_TEST_ROWS: u32 = 100_000;
+/// Largest seed: the UI shows and sends seeds as JavaScript numbers, exact
+/// up to 2^53 - 1 (`Number.MAX_SAFE_INTEGER`).
+pub const MAX_SEED: u64 = (1 << 53) - 1;
 /// Distinct parent keys read per foreign key.
 const PARENT_KEYS: usize = 1000;
 const BATCH: usize = 8192;
@@ -93,7 +98,7 @@ pub struct TestDataSpec {
     /// Share of NULLs in nullable columns (0–100). Keys are never NULL.
     #[serde(default)]
     pub null_percent: u8,
-    /// Same seed, same rows. `None`: a new seed each time.
+    /// Same seed, same rows (0 to 2^53 - 1). `None`: a new seed each time.
     #[serde(default)]
     #[ts(as = "Option<f64>")]
     pub seed: Option<u64>,
@@ -137,6 +142,9 @@ impl QueryEngine {
         if spec.rows == 0 || spec.rows > MAX_TEST_ROWS {
             return Err(EngineError::new("invalid", format!("Choose between 1 and {MAX_TEST_ROWS} rows")));
         }
+        if spec.seed.is_some_and(|s| s > MAX_SEED) {
+            return Err(EngineError::new("invalid", format!("Choose a seed between 0 and {MAX_SEED}")));
+        }
         let kind = self.test_data_kind(connection_id)?;
         let detail = self.describe(connection_id, schema, name).await?;
         let ddl = self.object_ddl(connection_id, schema, name, ObjectKind::Table).await.ok().flatten();
@@ -154,35 +162,35 @@ impl QueryEngine {
             return Err(EngineError::new("invalid", "No column to fill: every column is left to the database or has a type DataBrain can't make up"));
         }
         let mut notes = plan.warnings.clone();
-        let seed = spec.seed.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1));
+        let seed = spec.seed.unwrap_or_else(new_seed);
         let mut rng = Rng(seed);
 
         // Sources per chosen column: random, a counting key, or parent keys.
         let mut sources: Vec<Source> = chosen.iter().map(|&i| Source::Random(gens[i].clone().expect("supported"))).collect();
         let pos = |col: &str| chosen.iter().position(|&i| plan.columns[i].name.eq_ignore_ascii_case(col));
 
-        // The first primary key column counts up past the current maximum.
+        // The first primary key column counts up past the current maximum
+        // (or row count): unique within the rows and against the table.
         if let Some(k) = chosen.iter().position(|&i| plan.columns[i].primary_key) {
             let col = &plan.columns[chosen[k]];
             let maker = gens[chosen[k]].clone().expect("supported");
-            let start = match maker {
-                Gen::Int { .. } | Gen::Decimal { .. } => {
-                    let sql = format!("SELECT MAX({}) FROM {}", quote_ident(kind, &col.name), plan.table);
-                    match self.meta_rows(connection_id, &sql).await {
-                        Ok(r) => r
-                            .first()
-                            .and_then(|row| row.first().cloned().flatten())
-                            .and_then(|v| v.trim().parse::<f64>().ok())
-                            .map(|m| m.floor() as i64 + 1)
-                            .unwrap_or(1),
-                        Err(e) => {
-                            notes.push(format!("Couldn't read the largest {} ({}): keys start at 1 and may collide with existing rows.", col.name, e.message));
-                            1
-                        }
-                    }
-                }
-                _ => 1,
+            let q = quote_ident(kind, &col.name);
+            let read = match key_read(&maker) {
+                KeyRead::Max => Some((format!("SELECT MAX({q}) FROM {}", plan.table), "largest")),
+                KeyRead::Count => Some((format!("SELECT COUNT(*) FROM {}", plan.table), "row count of")),
+                KeyRead::Nothing => None,
             };
+            let found = match read {
+                Some((sql, what)) => match self.meta_rows(connection_id, &sql).await {
+                    Ok(r) => r.first().and_then(|row| row.first().cloned().flatten()),
+                    Err(e) => {
+                        notes.push(format!("Couldn't read the {what} {} ({}): its new keys may collide with existing rows.", col.name, e.message));
+                        None
+                    }
+                },
+                None => None,
+            };
+            let start = key_start(&maker, found.as_deref(), spec.rows, &col.name, &col.data_type).map_err(|m| EngineError::new("invalid", m))?;
             let tag: String = (0..4).map(|_| (b'a' + rng.below(26) as u8) as char).collect();
             sources[k] = Source::Key { maker, start, tag };
         }
@@ -285,6 +293,149 @@ fn parent_keys_sql(kind: ConnectorKind, parent: &str, cols: &[&str], n: usize) -
     }
 }
 
+/// A new seed from the clock, at most [`MAX_SEED`] so the UI shows it
+/// exactly (nanoseconds since 1970 are past 2^60).
+fn new_seed() -> u64 {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(1);
+    // Mix the high bits in so seeds made close together still differ widely.
+    let mut r = Rng(nanos as u64 ^ (nanos >> 64) as u64);
+    r.next() & MAX_SEED
+}
+
+// ------------------------------------------------------------- keys
+
+/// What the table is asked before its first key column counts up.
+#[derive(Debug, PartialEq)]
+enum KeyRead {
+    /// `MAX(column)`: keys continue after it.
+    Max,
+    /// `COUNT(*)`: keys continue after the number of rows (text, bytes and
+    /// addresses have no "largest" that orders like the counter).
+    Count,
+    Nothing,
+}
+
+fn key_read(g: &Gen) -> KeyRead {
+    match g {
+        Gen::Int { .. } | Gen::Decimal { .. } | Gen::Float | Gen::Date | Gen::Timestamp | Gen::TimestampTz | Gen::Time => KeyRead::Max,
+        Gen::Text { .. } | Gen::Binary { .. } | Gen::Inet => KeyRead::Count,
+        Gen::Bool | Gen::Choice(_) | Gen::Uuid | Gen::Json => KeyRead::Nothing,
+    }
+}
+
+/// Floats are exact integers up to 2^53.
+const FLOAT_EXACT: i64 = 1 << 53;
+const SECONDS_PER_DAY: i64 = 86_400;
+
+/// The integer after `text` (the largest key, any size): exact for
+/// integers and decimals of any length, `None` when it isn't a number.
+/// `Err` when the next one is past a 64-bit integer.
+fn after_number(text: &str) -> std::result::Result<Option<i64>, ()> {
+    let t = text.trim();
+    let neg = t.starts_with('-');
+    let digits = t.trim_start_matches(['+', '-']);
+    if !digits.contains(['e', 'E']) {
+        let (ip, fp) = digits.split_once('.').unwrap_or((digits, ""));
+        if (!ip.is_empty() || !fp.is_empty()) && ip.bytes().all(|b| b.is_ascii_digit()) && fp.bytes().all(|b| b.is_ascii_digit()) {
+            let ip = ip.trim_start_matches('0');
+            if ip.len() > 30 {
+                return Err(());
+            }
+            let whole: i128 = if ip.is_empty() { 0 } else { ip.parse().map_err(|_| ())? };
+            let fraction = fp.bytes().any(|b| b != b'0');
+            let floor = if neg { -whole - i128::from(fraction) } else { whole };
+            return i64::try_from(floor + 1).map(Some).map_err(|_| ());
+        }
+    }
+    match t.parse::<f64>() {
+        Ok(f) if f.is_finite() && f.abs() < 9.0e18 => Ok(Some(f.floor() as i64 + 1)),
+        Ok(f) if f.is_finite() => Err(()),
+        _ => Ok(None),
+    }
+}
+
+/// Microseconds since 1970 of a date-time as databases print it.
+fn parse_ts(s: &str) -> Option<i64> {
+    let s = s.trim().trim_end_matches('Z');
+    let s = s.strip_suffix("+00:00").or_else(|| s.strip_suffix(" UTC")).unwrap_or(s);
+    parse_datetime(s)
+}
+
+fn base36(mut n: u64) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    loop {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+        if n == 0 {
+            break;
+        }
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// Text key `n`: `tag-n`, or `n` in base 36 (lowercase, so case-insensitive
+/// collations keep them apart) when that doesn't fit the column. The two
+/// forms never meet: only the first has a `-`.
+fn text_key(tag: &str, n: i64, max: Option<usize>) -> String {
+    let s = format!("{tag}-{n}");
+    match max {
+        Some(m) if s.chars().count() > m => base36(n.max(0) as u64),
+        _ => s,
+    }
+}
+
+/// Bytes of a binary key: big-endian, all the same length so that
+/// fixed-length columns (padded with zeros) keep them apart.
+fn binary_key_len(max: Option<usize>) -> usize {
+    max.unwrap_or(8).clamp(1, 8)
+}
+
+/// Where the counting key starts (see [`key_value`] for what the number
+/// means per type), from what [`key_read`] read: `None` when the table is
+/// empty or it couldn't be read. `Err`: the column can't hold `rows` new
+/// unique keys.
+fn key_start(g: &Gen, found: Option<&str>, rows: u32, col: &str, data_type: &str) -> std::result::Result<i64, String> {
+    let rows = i64::from(rows.max(1));
+    let full = |what: &str| format!("{col} ({data_type}) has no room for {rows} more unique keys: {what}. Choose fewer rows, or leave {col} to the database.");
+    let day0 = days_from_civil(2020, 1, 1);
+    let last_day = days_from_civil(9999, 12, 31);
+    let after_count = || found.and_then(|c| c.trim().parse::<i64>().ok()).map_or(1, |c| c.saturating_add(1));
+    let start = match g {
+        Gen::Int { .. } | Gen::Decimal { .. } | Gen::Float => match found.map(after_number) {
+            Some(Err(())) => return Err(full(&format!("its largest value is {}", found.unwrap_or_default().trim()))),
+            Some(Ok(Some(n))) => n,
+            _ => 1,
+        },
+        Gen::Date => {
+            found.and_then(|s| parse_date(s.trim()).map(i64::from).or_else(|| parse_ts(s).map(|m| m.div_euclid(MICROS_PER_DAY)))).map_or(day0, |d| d + 1)
+        }
+        Gen::Timestamp | Gen::TimestampTz => found.and_then(parse_ts).map_or(day0 * SECONDS_PER_DAY, |m| m.div_euclid(1_000_000) + 1),
+        Gen::Time => found.and_then(|s| parse_time(s.trim())).map_or(0, |m| m.div_euclid(1_000_000) + 1),
+        Gen::Text { .. } | Gen::Binary { .. } | Gen::Inet => after_count(),
+        Gen::Bool | Gen::Choice(_) => 0,
+        Gen::Uuid | Gen::Json => 1,
+    };
+    let last = start.checked_add(rows - 1).ok_or_else(|| full("the next key is past the largest 64-bit integer"))?;
+    match g {
+        Gen::Float if last > FLOAT_EXACT => Err(full("floats stop being exact past 2^53")),
+        Gen::Date if last > last_day => Err(full("the dates would pass 9999-12-31")),
+        Gen::Timestamp | Gen::TimestampTz if last >= (last_day + 1) * SECONDS_PER_DAY => Err(full("the date-times would pass 9999-12-31")),
+        Gen::Time if last >= SECONDS_PER_DAY => Err(full("a day has 86,400 seconds")),
+        Gen::Text { max: Some(m), .. } if text_key("abcd", last, Some(*m)).chars().count() > *m => {
+            Err(full(&format!("{m} characters hold {} keys", 36u128.checked_pow(*m as u32).map_or("many".into(), |n| (n - 1).to_string()))))
+        }
+        Gen::Binary { max } if binary_key_len(*max) < 8 && last >= 1i64 << (8 * binary_key_len(*max)) => {
+            Err(full(&format!("{} bytes hold {} keys", binary_key_len(*max), (1i64 << (8 * binary_key_len(*max))) - 1)))
+        }
+        Gen::Inet if last >= 1 << 24 => Err(full("the addresses 10.0.0.0/8 hold 16,777,216")),
+        Gen::Bool if rows > 2 => Err(full("it has two values")),
+        Gen::Choice(v) if rows > v.len() as i64 => Err(full(&format!("it has {} values", v.len()))),
+        _ => Ok(start),
+    }
+}
+
 // ------------------------------------------------------------------ plan
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,6 +535,21 @@ impl Gen {
             Gen::Binary { .. } => "random bytes".into(),
         }
     }
+
+    /// What a counting primary key gets.
+    fn key_describe(&self) -> String {
+        match self {
+            Gen::Int { .. } | Gen::Decimal { .. } | Gen::Float => "numbers counting up from the largest".into(),
+            Gen::Text { .. } => "unique codes, counting on from the row count".into(),
+            Gen::Date => "dates counting up a day at a time from the latest".into(),
+            Gen::Timestamp | Gen::TimestampTz => "date-times counting up a second at a time from the latest".into(),
+            Gen::Time => "times counting up a second at a time from the latest".into(),
+            Gen::Binary { .. } => "unique bytes, counting on from the row count".into(),
+            Gen::Inet => "unique IP addresses, counting on from the row count".into(),
+            Gen::Bool | Gen::Choice(_) => format!("{}, each once", self.describe()),
+            Gen::Uuid | Gen::Json => self.describe(),
+        }
+    }
 }
 
 /// Columns, their generators (`None`: not supported) and warnings.
@@ -400,7 +566,7 @@ fn plan_for(kind: ConnectorKind, schema: &str, name: &str, cols: &[ColumnInfo], 
     };
     for c in cols {
         let maker = parse_type(kind, &c.data_type, &c.name);
-        let fills = database_fills(c, ddl);
+        let fills = database_fills(kind, c, ddl);
         let parent = parent_of(&c.name);
         let note = match (&maker, fills) {
             (None, _) => Some(if !c.nullable && c.default.is_none() && !fills {
@@ -423,7 +589,7 @@ fn plan_for(kind: ConnectorKind, schema: &str, name: &str, cols: &[ColumnInfo], 
             database_fills: fills,
             generator: match (&parent, &maker) {
                 (Some(p), _) => format!("existing keys of {p}"),
-                (None, Some(g)) if c.is_primary_key => format!("{}, counting up", g.describe()),
+                (None, Some(g)) if c.is_primary_key => g.key_describe(),
                 (None, Some(g)) => g.describe(),
                 (None, None) => "left to the database".into(),
             },
@@ -456,7 +622,7 @@ fn parent_name(kind: ConnectorKind, schema: &str, fk: &ForeignKey) -> String {
 }
 
 /// Defaults and DDL words that mean the database makes the value.
-fn database_fills(c: &ColumnInfo, ddl: Option<&str>) -> bool {
+fn database_fills(kind: ConnectorKind, c: &ColumnInfo, ddl: Option<&str>) -> bool {
     const DEFAULTS: &[&str] =
         &["nextval", "identity", "autoincrement", "auto_increment", "generated", "newid(", "newsequentialid(", "gen_random_uuid", "uuid_generate", "uuid()"];
     const TYPES: &[&str] = &["serial", "identity", "autoincrement"];
@@ -467,6 +633,11 @@ fn database_fills(c: &ColumnInfo, ddl: Option<&str>) -> bool {
     }
     let t = c.data_type.to_ascii_lowercase();
     if TYPES.iter().any(|w| t.contains(w)) {
+        return true;
+    }
+    // SQL Server `timestamp` is `rowversion`: the database writes it, and an
+    // INSERT naming it fails.
+    if kind == ConnectorKind::Mssql && matches!(t.trim(), "timestamp" | "rowversion") {
         return true;
     }
     let Some(ddl) = ddl else { return false };
@@ -601,7 +772,11 @@ fn parse_type(kind: ConnectorKind, raw: &str, column: &str) -> Option<Gen> {
     let ch = kind == ConnectorKind::Clickhouse;
     let first = plain.split(' ').next().unwrap_or("");
     let maker = match plain.as_str() {
+        // SQL Server rowversion: the database writes it, nothing else can.
+        "timestamp" | "rowversion" if kind == ConnectorKind::Mssql => return None,
         "bool" | "boolean" => Gen::Bool,
+        // Postgres and DuckDB BIT is a bit string: TRUE doesn't go in, '1' does.
+        "bit" if a0.is_none_or(|n| n == 1) && matches!(kind, ConnectorKind::Postgres | ConnectorKind::Duckdb) => Gen::Choice(vec!["0".into(), "1".into()]),
         "bit" if a0.is_none_or(|n| n == 1) => Gen::Bool,
         "int8" if ch => int(0, 100),
         "int16" if ch => int(1, 30_000),
@@ -681,7 +856,7 @@ fn parse_type(kind: ConnectorKind, raw: &str, column: &str) -> Option<Gen> {
 
 enum Source {
     Random(Gen),
-    /// Unique per row: counts up from `start` (text keys: `tag-n`).
+    /// Unique per row: counts up from `start` (see [`key_value`]).
     Key {
         maker: Gen,
         start: i64,
@@ -800,27 +975,32 @@ fn random_value(g: &Gen, n: u64, rng: &mut Rng) -> Value {
     }
 }
 
+/// Key number `i` (from [`key_start`], counting up) as a value: numbers
+/// as they are, dates as days since 1970, date-times and times as
+/// seconds, text, bytes and addresses encoded from it.
 fn key_value(g: &Gen, i: i64, tag: &str, rng: &mut Rng) -> Value {
     match g {
         Gen::Int { .. } => Value::Int(i),
         Gen::Decimal { .. } => Value::Text(i.to_string()),
-        Gen::Text { max, .. } => {
-            let s = format!("{tag}-{i}");
-            Value::Text(if max.is_some_and(|m| s.len() > m) { truncate(i.to_string(), *max) } else { s })
-        }
+        Gen::Float => Value::Float(i as f64),
+        Gen::Text { max, .. } => Value::Text(text_key(tag, i, *max)),
+        Gen::Date => Value::Date(i as i32),
+        Gen::Timestamp => Value::Timestamp(i * 1_000_000),
+        Gen::TimestampTz => Value::TimestampTz(i * 1_000_000),
+        Gen::Time => Value::Time(i * 1_000_000),
+        Gen::Binary { max } => Value::Bytes(i.to_be_bytes()[8 - binary_key_len(*max)..].to_vec()),
+        Gen::Inet => Value::Text(format!("10.{}.{}.{}", (i >> 16) & 255, (i >> 8) & 255, i & 255)),
+        Gen::Bool => Value::Bool(i % 2 == 1),
+        Gen::Choice(v) => Value::Text(v[i.rem_euclid(v.len() as i64) as usize].clone()),
         Gen::Uuid => Value::Text(uuid(rng)),
-        other => random_value(other, i as u64, rng),
+        Gen::Json => random_value(g, i as u64, rng),
     }
 }
 
 /// A parent's key as text → a value of the column's type.
 fn cell_value(t: ColType, s: &str) -> Value {
     let s = s.trim();
-    let tz = |s: &str| {
-        let s = s.trim_end_matches('Z');
-        let s = s.strip_suffix("+00:00").or_else(|| s.strip_suffix(" UTC")).unwrap_or(s);
-        parse_datetime(s)
-    };
+    let tz = parse_ts;
     let v = match t {
         ColType::Bool => match s.to_ascii_lowercase().as_str() {
             "true" | "1" | "t" | "yes" => Some(Value::Bool(true)),
@@ -894,7 +1074,7 @@ fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use databrain_connector_core::arrow::array::{Array, Int64Array, StringArray};
+    use databrain_connector_core::arrow::array::{Array, Date32Array, Float64Array, Int64Array, StringArray};
 
     fn col(name: &str, t: &str, nullable: bool, pk: bool) -> ColumnInfo {
         ColumnInfo { name: name.into(), data_type: t.into(), nullable, is_primary_key: pk, default: None, comment: None }
@@ -916,6 +1096,8 @@ mod tests {
         assert_eq!(g(Mysql, "timestamp"), Some(Gen::Timestamp));
         assert_eq!(g(Bigquery, "TIMESTAMP"), Some(Gen::TimestampTz));
         assert_eq!(g(Mssql, "bit"), Some(Gen::Bool));
+        assert_eq!(g(Postgres, "bit(1)"), Some(Gen::Choice(vec!["0".into(), "1".into()])), "TRUE doesn't go into a bit string");
+        assert_eq!(g(Mssql, "timestamp"), None, "rowversion");
         assert_eq!(g(Mysql, "enum('a','b''c')"), Some(Gen::Choice(vec!["a".into(), "b'c".into()])));
         assert_eq!(g(Postgres, "jsonb"), Some(Gen::Json));
         assert_eq!(g(Snowflake, "VARIANT"), None, "text literals don't go into VARIANT");
@@ -927,14 +1109,114 @@ mod tests {
 
     #[test]
     fn database_filled_columns_are_found() {
+        use ConnectorKind::*;
         let mut c = col("id", "integer", false, true);
         c.default = Some("nextval('t_id_seq'::regclass)".into());
-        assert!(database_fills(&c, None));
+        assert!(database_fills(Postgres, &c, None));
         let c = col("id", "int", false, true);
-        assert!(database_fills(&c, Some("CREATE TABLE t (\n  `id` int NOT NULL AUTO_INCREMENT,\n  `name` text\n)")));
-        assert!(database_fills(&c, Some("CREATE TABLE t (\n    id bigint GENERATED ALWAYS AS IDENTITY NOT NULL\n)")));
-        assert!(!database_fills(&col("name", "text", true, false), Some("CREATE TABLE t (\n  `id` int NOT NULL AUTO_INCREMENT,\n  `name` text\n)")));
-        assert!(!database_fills(&col("idx", "int", true, false), Some("  id int IDENTITY(1,1)")));
+        assert!(database_fills(Mysql, &c, Some("CREATE TABLE t (\n  `id` int NOT NULL AUTO_INCREMENT,\n  `name` text\n)")));
+        assert!(database_fills(Postgres, &c, Some("CREATE TABLE t (\n    id bigint GENERATED ALWAYS AS IDENTITY NOT NULL\n)")));
+        assert!(!database_fills(Mysql, &col("name", "text", true, false), Some("CREATE TABLE t (\n  `id` int NOT NULL AUTO_INCREMENT,\n  `name` text\n)")));
+        assert!(!database_fills(Mssql, &col("idx", "int", true, false), Some("  id int IDENTITY(1,1)")));
+    }
+
+    #[test]
+    fn sql_server_identity_computed_and_rowversion_columns_are_left_out() {
+        // The DDL as the SQL Server connector writes it.
+        let ddl = "CREATE TABLE [dbo].[t] (\n    [id] int IDENTITY(1,1) NOT NULL,\n    [total] AS ([qty]*[price]) PERSISTED,\n    [qty] int NOT NULL,\n    [rv] timestamp NOT NULL\n);";
+        let cols = vec![
+            col("id", "int", false, true),
+            col("total", "decimal(12,2)", true, false),
+            col("qty", "int", false, false),
+            col("rv", "timestamp", false, false),
+        ];
+        let (p, _) = plan_for(ConnectorKind::Mssql, "dbo", "t", &cols, &[], Some(ddl));
+        let fills: Vec<bool> = p.columns.iter().map(|c| c.database_fills).collect();
+        assert_eq!(fills, [true, true, false, true]);
+        assert!(!p.columns[3].supported, "rowversion can't be written");
+        assert!(p.warnings.is_empty(), "the database fills rowversion: no 'inserts will fail' {:?}", p.warnings);
+        // Elsewhere TIMESTAMP is a date-time.
+        assert!(!database_fills(ConnectorKind::Mysql, &col("rv", "timestamp", false, false), None));
+    }
+
+    #[test]
+    fn default_seeds_survive_javascript_numbers() {
+        for _ in 0..100 {
+            assert!(new_seed() <= MAX_SEED);
+        }
+        assert_eq!(MAX_SEED, 9_007_199_254_740_991, "Number.MAX_SAFE_INTEGER");
+    }
+
+    #[test]
+    fn the_next_key_is_read_exactly() {
+        assert_eq!(after_number("9007199254740993"), Ok(Some(9_007_199_254_740_994)), "past 2^53, exact");
+        assert_eq!(after_number(" 41 "), Ok(Some(42)));
+        assert_eq!(after_number("12.50"), Ok(Some(13)));
+        assert_eq!(after_number("12.000"), Ok(Some(13)));
+        assert_eq!(after_number("-3.5"), Ok(Some(-3)));
+        assert_eq!(after_number("1e3"), Ok(Some(1001)));
+        assert_eq!(after_number("9223372036854775806"), Ok(Some(i64::MAX)));
+        assert_eq!(after_number("9223372036854775807"), Err(()));
+        assert_eq!(after_number("123456789012345678901234567890123456789"), Err(()));
+        assert_eq!(after_number("x"), Ok(None));
+        let int = Gen::Int { min: 1, max: 9 };
+        assert_eq!(key_start(&int, Some("9007199254740993"), 10, "id", "bigint"), Ok(9_007_199_254_740_994));
+        assert_eq!(key_start(&int, None, 10, "id", "bigint"), Ok(1));
+        let e = key_start(&int, Some("9223372036854775800"), 100, "id", "bigint").unwrap_err();
+        assert!(e.contains("no room for 100 more"), "{e}");
+        assert!(key_start(&int, Some("9223372036854775807"), 1, "id", "bigint").is_err());
+        assert!(key_start(&Gen::Float, Some("9007199254740990"), 10, "id", "float").is_err());
+    }
+
+    #[test]
+    fn short_text_keys_stay_unique_and_continue_after_existing_rows() {
+        let g = Gen::Text { max: Some(2), flavor: Flavor::Word };
+        assert_eq!(key_start(&g, Some("0"), 1000, "code", "varchar(2)"), Ok(1));
+        assert_eq!(key_start(&g, Some("100"), 10, "code", "varchar(2)"), Ok(101), "past the rows already there");
+        let e = key_start(&g, Some("0"), 1296, "code", "varchar(2)").unwrap_err();
+        assert!(e.contains("2 characters hold 1295 keys"), "{e}");
+        let mut rng = Rng(1);
+        let keys: Vec<Value> = (1..=1295).map(|i| key_value(&g, i, "abcd", &mut rng)).collect();
+        assert!(keys.iter().all(|k| matches!(k, Value::Text(t) if t.chars().count() <= 2)));
+        assert_eq!(keys.iter().map(|k| format!("{k:?}")).collect::<HashSet<_>>().len(), 1295);
+        // Room for the tag: `tag-n` until it doesn't fit, then base 36 (no `-`, no clash).
+        let g = Gen::Text { max: Some(6), flavor: Flavor::Word };
+        assert_eq!(key_value(&g, 9, "abcd", &mut rng), Value::Text("abcd-9".into()));
+        assert_eq!(key_value(&g, 10, "abcd", &mut rng), Value::Text("a".into()));
+    }
+
+    #[test]
+    fn date_float_time_and_byte_keys_are_unique() {
+        let mut rng = Rng(3);
+        let day = days_from_civil(2024, 2, 3);
+        assert_eq!(key_start(&Gen::Date, Some("2024-02-03"), 10, "d", "date"), Ok(day + 1));
+        assert_eq!(key_start(&Gen::Date, Some("2024-02-03 00:00:00"), 10, "d", "date"), Ok(day + 1), "Oracle DATE");
+        assert_eq!(key_start(&Gen::Date, None, 10, "d", "date"), Ok(days_from_civil(2020, 1, 1)));
+        let ts = key_start(&Gen::Timestamp, Some("2024-02-03 04:05:06.5"), 10, "t", "timestamp").unwrap();
+        assert_eq!(key_value(&Gen::Timestamp, ts, "", &mut rng), Value::Timestamp(parse_datetime("2024-02-03 04:05:07").unwrap()));
+        assert!(key_start(&Gen::Time, Some("23:59:00"), 60, "t", "time").is_err());
+        assert_eq!(key_start(&Gen::Time, Some("23:59:00"), 59, "t", "time"), Ok(86_341));
+        assert!(key_start(&Gen::Binary { max: Some(1) }, Some("200"), 56, "b", "binary(1)").is_err());
+        assert!(key_start(&Gen::Bool, None, 3, "b", "boolean").is_err());
+
+        let columns = vec![Column::new("d", ColType::Date, "date"), Column::new("f", ColType::Float64, "real")];
+        let sources = vec![Source::Key { maker: Gen::Date, start: day, tag: String::new() }, Source::Key { maker: Gen::Float, start: 7, tag: String::new() }];
+        let b = generate(&columns, &sources, &[false, false], &[], 5000, 0, &mut rng).unwrap();
+        let dates: HashSet<i32> = b.iter().flat_map(|x| x.column(0).as_any().downcast_ref::<Date32Array>().unwrap().values().to_vec()).collect();
+        assert_eq!(dates.len(), 5000);
+        assert!(dates.contains(&(day as i32)));
+        let floats: HashSet<u64> = b
+            .iter()
+            .flat_map(|x| x.column(1).as_any().downcast_ref::<Float64Array>().unwrap().values().iter().map(|f| f.to_bits()).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(floats.len(), 5000);
+        let bytes: HashSet<Vec<u8>> = (1..=255)
+            .map(|i| match key_value(&Gen::Binary { max: Some(1) }, i, "", &mut rng) {
+                Value::Bytes(b) => b,
+                v => panic!("{v:?}"),
+            })
+            .collect();
+        assert_eq!(bytes.len(), 255);
     }
 
     #[test]

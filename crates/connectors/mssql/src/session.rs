@@ -11,7 +11,9 @@ use crate::schema::MSSQL_TABLE_EXTRAS;
 use crate::schema::SCHEMA_FILTER;
 use crate::schema::SCHEMA_FINGERPRINTS_SQL;
 use crate::schema::SCHEMAS_SQL;
+use crate::schema::column_fill;
 use crate::schema::column_from;
+use crate::schema::column_line;
 use crate::schema::each_db;
 use crate::schema::in_db;
 use crate::schema::table_ddl;
@@ -131,6 +133,32 @@ impl MssqlSession {
 
     pub(crate) async fn rows_dyn_in(&self, db: Option<&str>, sql: String) -> Result<Vec<tiberius::Row>> {
         self.rows_dyn(in_db(db, &sql, 0)).await
+    }
+
+    /// `describe`, plus how the database fills each column (identity,
+    /// computed; see `column_fill`), in column order.
+    async fn describe_with_fills(&self, schema: &str, name: &str) -> Result<(ObjectDetail, Vec<Option<String>>)> {
+        let objs = self.list_objects(schema).await?;
+        let object = objs
+            .into_iter()
+            .filter(|o| o.name == name)
+            .min_by_key(|o| !o.kind.is_relation())
+            .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
+        let (db, sch) = self.split(schema);
+        let rows = self.rows_in(db, COLUMNS_SQL, vec![sch.into(), name.into()]).await?;
+        let columns: Vec<ColumnInfo> = rows.iter().map(|r| column_from(r).1).collect();
+        let fills: Vec<Option<String>> = rows.iter().map(column_fill).collect();
+        let full = format!("{}.{}", quote_ident(ConnectorKind::Mssql, sch), quote_ident(ConnectorKind::Mssql, name));
+        let ddl = match object.kind {
+            ObjectKind::Table => Some(table_ddl(&full, &columns, &fills)),
+            _ => self
+                .rows_in(db, "select object_definition(object_id(@P1))", vec![full.clone()])
+                .await?
+                .first()
+                .and_then(|r| r.get::<&str, _>(0).map(str::to_string)),
+        };
+        let foreign_keys = self.foreign_keys(schema, Some(name)).await?.into_iter().map(|(_, f)| f).collect();
+        Ok((ObjectDetail { object, columns, ddl, foreign_keys }, fills))
     }
 }
 
@@ -396,7 +424,7 @@ impl Session for MssqlSession {
     /// Tables: columns plus keys, foreign keys, checks and indexes. Views,
     /// procedures and functions: their definition.
     async fn object_ddl(&self, schema: &str, name: &str, _kind: ObjectKind) -> Result<Option<String>> {
-        let d = self.describe(schema, name).await?;
+        let (d, fills) = self.describe_with_fills(schema, name).await?;
         if d.object.kind != ObjectKind::Table {
             return Ok(d.ddl);
         }
@@ -411,21 +439,7 @@ impl Session for MssqlSession {
             let line = r.get::<&str, _>(1).unwrap_or_default().to_string();
             if r.get::<i32, _>(0) == Some(0) { inside.push(format!("    {line}")) } else { after.push(format!("{line};")) }
         }
-        let mut lines: Vec<String> = d
-            .columns
-            .iter()
-            .map(|c| {
-                let mut l = format!("    {} {}", quote_ident(ConnectorKind::Mssql, &c.name), c.data_type);
-                if !c.nullable {
-                    l.push_str(" NOT NULL");
-                }
-                if let Some(def) = &c.default {
-                    l.push_str(" DEFAULT ");
-                    l.push_str(def);
-                }
-                l
-            })
-            .collect();
+        let mut lines: Vec<String> = d.columns.iter().enumerate().map(|(i, c)| column_line(c, fills.get(i).and_then(|f| f.as_deref()))).collect();
         lines.extend(inside);
         let mut ddl = format!("CREATE TABLE {full} (\n{}\n);", lines.join(",\n"));
         for a in after {
@@ -436,25 +450,7 @@ impl Session for MssqlSession {
     }
 
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
-        let objs = self.list_objects(schema).await?;
-        let object = objs
-            .into_iter()
-            .filter(|o| o.name == name)
-            .min_by_key(|o| !o.kind.is_relation())
-            .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
-        let (db, sch) = self.split(schema);
-        let columns: Vec<ColumnInfo> = self.rows_in(db, COLUMNS_SQL, vec![sch.into(), name.into()]).await?.iter().map(|r| column_from(r).1).collect();
-        let full = format!("{}.{}", quote_ident(ConnectorKind::Mssql, sch), quote_ident(ConnectorKind::Mssql, name));
-        let ddl = match object.kind {
-            ObjectKind::Table => Some(table_ddl(&full, &columns)),
-            _ => self
-                .rows_in(db, "select object_definition(object_id(@P1))", vec![full.clone()])
-                .await?
-                .first()
-                .and_then(|r| r.get::<&str, _>(0).map(str::to_string)),
-        };
-        let foreign_keys = self.foreign_keys(schema, Some(name)).await?.into_iter().map(|(_, f)| f).collect();
-        Ok(ObjectDetail { object, columns, ddl, foreign_keys })
+        Ok(self.describe_with_fills(schema, name).await?.0)
     }
 
     /// Per schema: object count + last modify_date of tables, views and

@@ -453,12 +453,32 @@ fn non_finite_literal(v: f64, kind: Lit, dialect: ConnectorKind) -> String {
     }
 }
 
+/// An exact number for BigQuery: `12.5` alone is a FLOAT64 there, which a
+/// NUMERIC or BIGNUMERIC column refuses (and a quoted string too). Whole
+/// numbers that fit INT64 stay bare; other decimals become `NUMERIC '…'`
+/// (it widens to BIGNUMERIC and FLOAT64), or `BIGNUMERIC '…'` past NUMERIC's
+/// 29 digits before and 9 after the point.
+fn bigquery_number(s: &str) -> String {
+    let t = s.trim();
+    let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+    if digits.contains(['e', 'E']) {
+        return t.to_string();
+    }
+    if !digits.contains('.') && t.parse::<i64>().is_ok() {
+        return t.to_string();
+    }
+    let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    let ty = if int.trim_start_matches('0').len() <= 29 && frac.len() <= 9 { "NUMERIC" } else { "BIGNUMERIC" };
+    format!("{ty} '{t}'")
+}
+
 pub(crate) fn literal(cell: Option<&str>, kind: Lit, dialect: ConnectorKind) -> String {
     let l = lt(dialect);
     let Some(s) = cell else { return "NULL".into() };
     match kind {
         Lit::Number | Lit::Float => match non_finite(s) {
             Some(v) => return non_finite_literal(v, kind, dialect),
+            None if matches!(kind, Lit::Number) && dialect == ConnectorKind::Bigquery && s.parse::<f64>().is_ok() => return bigquery_number(s),
             None if s.parse::<f64>().is_ok() => return s.to_string(),
             None => {}
         },
@@ -691,6 +711,14 @@ mod tests {
         // One text escaper with parameters: a trailing backslash can't close the quote.
         assert_eq!(literal(Some("a\\"), Lit::Text, K::Snowflake), "'a\\\\'");
         assert_eq!(literal(Some("it's"), Lit::Text, K::Bigquery), "'it\\'s'");
+        // BigQuery: a bare 12.5 is FLOAT64 and '12.5' a STRING; NUMERIC columns take neither.
+        assert_eq!(literal(Some("12.50"), Lit::Number, K::Bigquery), "NUMERIC '12.50'");
+        assert_eq!(literal(Some("-7"), Lit::Number, K::Bigquery), "-7");
+        assert_eq!(literal(Some("123456789012345678901234567890.5"), Lit::Number, K::Bigquery), "BIGNUMERIC '123456789012345678901234567890.5'");
+        assert_eq!(literal(Some("1.0123456789"), Lit::Number, K::Bigquery), "BIGNUMERIC '1.0123456789'");
+        assert_eq!(literal(Some("99999999999999999999"), Lit::Number, K::Bigquery), "NUMERIC '99999999999999999999'", "past INT64");
+        assert_eq!(literal(Some("1.5"), Lit::Float, K::Bigquery), "1.5");
+        assert_eq!(literal(Some("12.50"), Lit::Number, K::Postgres), "12.50");
         assert_eq!(literal(Some("it's"), Lit::Text, K::Mssql), "N'it''s'");
         assert!(is_load_target(K::Clickhouse));
         assert!(!keyed_loads(K::Clickhouse));

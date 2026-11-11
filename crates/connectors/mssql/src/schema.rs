@@ -204,9 +204,14 @@ pub(crate) const COLUMNS_SQL: &str = "select o.name, c.name, \
     c.is_nullable, \
     cast(case when exists (select 1 from sys.index_columns ic join sys.indexes i on i.object_id = ic.object_id and i.index_id = ic.index_id \
          where i.is_primary_key = 1 and ic.object_id = c.object_id and ic.column_id = c.column_id) then 1 else 0 end as bit), \
-    object_definition(c.default_object_id), cast(ep.value as nvarchar(4000)) \
+    object_definition(c.default_object_id), cast(ep.value as nvarchar(4000)), \
+    case when c.is_identity = 1 then N'IDENTITY(' + cast(cast(idc.seed_value as decimal(38,0)) as nvarchar(40)) + N',' \
+                                      + cast(cast(idc.increment_value as decimal(38,0)) as nvarchar(40)) + N')' \
+         when c.is_computed = 1 then N'AS ' + cc.definition + case when cc.is_persisted = 1 then N' PERSISTED' else N'' end end \
   from sys.columns c join sys.objects o on o.object_id = c.object_id join sys.types t on t.user_type_id = c.user_type_id \
   left join sys.extended_properties ep on ep.major_id = c.object_id and ep.minor_id = c.column_id and ep.name = 'MS_Description' \
+  left join sys.identity_columns idc on idc.object_id = c.object_id and idc.column_id = c.column_id \
+  left join sys.computed_columns cc on cc.object_id = c.object_id and cc.column_id = c.column_id \
   where schema_name(o.schema_id) = @P1 and o.type in ('U','V') and (@P2 = '' or o.name = @P2) \
   order by o.name, c.column_id";
 
@@ -263,21 +268,36 @@ pub(crate) const MSSQL_TABLE_EXTRAS: &str = "\
   from sys.indexes i where i.object_id = object_id(@P1) and i.is_primary_key = 0 and i.is_unique_constraint = 0 and i.type in (1, 2) and i.is_hypothetical = 0 \
   order by 1, 3, 4";
 
-pub(crate) fn table_ddl(full: &str, columns: &[ColumnInfo]) -> String {
-    let mut lines: Vec<String> = columns
-        .iter()
-        .map(|c| {
-            let mut l = format!("    {} {}", quote_ident(ConnectorKind::Mssql, &c.name), c.data_type);
-            if !c.nullable {
-                l.push_str(" NOT NULL");
-            }
-            if let Some(d) = &c.default {
-                l.push_str(" DEFAULT ");
-                l.push_str(d);
-            }
-            l
-        })
-        .collect();
+/// How the database fills a column of a `COLUMNS_SQL` row: `IDENTITY(1,1)`
+/// or `AS (<expression>) [PERSISTED]` (computed); `None` for other columns.
+pub(crate) fn column_fill(r: &tiberius::Row) -> Option<String> {
+    r.try_get::<&str, _>(7).ok().flatten().map(str::to_string)
+}
+
+/// One column of CREATE TABLE. Identity and computed columns say so, so
+/// readers of the DDL (test data, schema compare) know the database fills them.
+pub(crate) fn column_line(c: &ColumnInfo, fill: Option<&str>) -> String {
+    let name = quote_ident(ConnectorKind::Mssql, &c.name);
+    if let Some(computed) = fill.filter(|f| f.starts_with("AS ")) {
+        return format!("    {name} {computed}");
+    }
+    let mut l = format!("    {name} {}", c.data_type);
+    if let Some(identity) = fill {
+        l.push(' ');
+        l.push_str(identity);
+    }
+    if !c.nullable {
+        l.push_str(" NOT NULL");
+    }
+    if let Some(d) = &c.default {
+        l.push_str(" DEFAULT ");
+        l.push_str(d);
+    }
+    l
+}
+
+pub(crate) fn table_ddl(full: &str, columns: &[ColumnInfo], fills: &[Option<String>]) -> String {
+    let mut lines: Vec<String> = columns.iter().enumerate().map(|(i, c)| column_line(c, fills.get(i).and_then(|f| f.as_deref()))).collect();
     let pk: Vec<String> = columns.iter().filter(|c| c.is_primary_key).map(|c| quote_ident(ConnectorKind::Mssql, &c.name)).collect();
     if !pk.is_empty() {
         lines.push(format!("    PRIMARY KEY ({})", pk.join(", ")));
@@ -315,5 +335,24 @@ mod tests {
         let two = MssqlSession { all_dbs: false, ..s };
         assert_eq!(two.split("dbo"), (None, "dbo"));
         assert_eq!(two.id(Some("shop"), "dbo"), "dbo");
+    }
+
+    #[test]
+    fn identity_and_computed_columns_show_in_the_ddl() {
+        let col = |name: &str, t: &str, nullable: bool, pk: bool| ColumnInfo {
+            name: name.into(),
+            data_type: t.into(),
+            nullable,
+            is_primary_key: pk,
+            default: None,
+            comment: None,
+        };
+        let cols = [col("id", "int", false, true), col("total", "decimal(12,2)", true, false), col("name", "nvarchar(40)", false, false)];
+        let fills = [Some("IDENTITY(1,1)".to_string()), Some("AS ([qty]*[price]) PERSISTED".to_string()), None];
+        let ddl = table_ddl("[dbo].[t]", &cols, &fills);
+        assert!(ddl.contains("    [id] int IDENTITY(1,1) NOT NULL,"), "{ddl}");
+        assert!(ddl.contains("    [total] AS ([qty]*[price]) PERSISTED,"), "{ddl}");
+        assert!(ddl.contains("    [name] nvarchar(40) NOT NULL,"), "{ddl}");
+        assert!(COLUMNS_SQL.contains("is_identity") && COLUMNS_SQL.contains("is_computed"));
     }
 }

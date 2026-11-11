@@ -9,7 +9,7 @@ export type TestDataSpec = { rows: number,
  */
 null_percent: number, 
 /**
- * Same seed, same rows. `None`: a new seed each time.
+ * Same seed, same rows (0 to 2^53 - 1). `None`: a new seed each time.
  */
 seed?: number | null, 
 /**

@@ -454,15 +454,39 @@ fn sqlite_fks(c: &rusqlite::Connection, q_schema: &str, schema: &str, table: &st
         .map_err(map_err)?;
     let mut out: Vec<(i64, ForeignKey)> = Vec::new();
     for (id, ref_table, from, to) in rows {
+        let to = to.unwrap_or_default();
         match out.iter_mut().find(|(i, _)| *i == id) {
             Some((_, fk)) => {
                 fk.columns.push(from);
-                fk.ref_columns.push(to.unwrap_or_default());
+                fk.ref_columns.push(to);
             }
-            None => out.push((id, ForeignKey { columns: vec![from], ref_schema: schema.to_string(), ref_table, ref_columns: vec![to.unwrap_or_default()] })),
+            None => out.push((id, ForeignKey { columns: vec![from], ref_schema: schema.to_string(), ref_table, ref_columns: vec![to] })),
+        }
+    }
+    // `REFERENCES parent` without a column list points at the parent's
+    // primary key: SQLite reports no column, so name the key's columns.
+    for (_, fk) in &mut out {
+        if fk.ref_columns.iter().any(|c| c.is_empty()) {
+            let pk = primary_key_columns(c, q_schema, &fk.ref_table)?;
+            if pk.len() == fk.ref_columns.len() {
+                fk.ref_columns = pk;
+            }
         }
     }
     Ok(out.into_iter().map(|(_, f)| f).collect())
+}
+
+/// A table's primary key columns, in key order (empty: none, or no such table).
+fn primary_key_columns(c: &rusqlite::Connection, q_schema: &str, table: &str) -> Result<Vec<String>> {
+    let mut stmt = c.prepare(&format!("PRAGMA {q_schema}.table_info({})", quote_ident(ConnectorKind::Sqlite, table))).map_err(map_err)?;
+    let mut cols = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(5)?, r.get::<_, String>(1)?)))
+        .map_err(map_err)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(map_err)?;
+    cols.retain(|(pk, _)| *pk > 0);
+    cols.sort_by_key(|(pk, _)| *pk);
+    Ok(cols.into_iter().map(|(_, n)| n).collect())
 }
 
 #[cfg(test)]
@@ -581,6 +605,20 @@ mod tests {
         assert!(d.columns[0].is_primary_key);
         assert!(!d.columns[1].nullable);
         assert!(d.ddl.unwrap().contains("CREATE TABLE users"));
+    }
+
+    #[tokio::test]
+    async fn foreign_keys_without_a_column_list_name_the_parent_key() {
+        let s = session().await;
+        exec(s.as_ref(), "create table customers(code text, region text, name text, primary key (region, code))").await;
+        exec(s.as_ref(), "create table plain(id integer primary key)").await;
+        exec(s.as_ref(), "create table orders(id integer primary key, r text, c text, p integer references plain, foreign key (r, c) references customers)")
+            .await;
+        let o = s.describe("main", "orders").await.unwrap();
+        let fk = |t: &str| o.foreign_keys.iter().find(|f| f.ref_table == t).unwrap().clone();
+        assert_eq!(fk("plain").ref_columns, vec!["id"]);
+        assert_eq!(fk("customers").columns, vec!["r", "c"]);
+        assert_eq!(fk("customers").ref_columns, vec!["region", "code"], "key order, not column order");
     }
 
     #[tokio::test]
