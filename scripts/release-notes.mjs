@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // The release notes of a version: its section of CHANGELOG.md, as Markdown.
 // The release workflow puts them on the GitHub release (which the app's
 // "What's new" opens) and in latest.json for the updater.
