@@ -51,7 +51,7 @@ interface Side {
   costError?: string;
 }
 
-type State = { status: "loading" } | { status: "ready"; before: Side; after: Side };
+type State = { status: "loading" } | { status: "error"; message: string } | { status: "ready"; before: Side; after: Side };
 
 export function PlanCompareTab({ tabId, visible }: { tabId: string; visible: boolean }) {
   const tab = useStore((s) => s.tabs.find((t) => t.id === tabId));
@@ -69,8 +69,9 @@ export function PlanCompareTab({ tabId, visible }: { tabId: string; visible: boo
   const hasCost = !!kind && traitsOf(kind).cost_preview;
 
   const load = useEvent(async () => {
-    if (!ref || !pair || !conn) return;
+    if (!ref || !pair) return;
     const my = ++seq.current;
+    if (!conn) return setState({ status: "error", message: "The connection of this tab no longer exists." });
     setState({ status: "loading" });
     // One after the other: both use the source tab's session.
     const side = async (sql: string): Promise<Side> => {
@@ -96,9 +97,12 @@ export function PlanCompareTab({ tabId, visible }: { tabId: string; visible: boo
     if (my === seq.current) setState({ status: "ready", before, after });
   });
 
+  // Reload when the statements, mode, parameters or connection change
+  // ("Compare plans" again with new :param values replaces ref.params).
+  const paramsKey = JSON.stringify(ref?.params ?? null);
   useEffect(() => {
     void load();
-  }, [pair?.before, pair?.after, ref?.analyze, conn?.id, load]);
+  }, [pair?.before, pair?.after, ref?.analyze, paramsKey, conn?.id, load]);
 
   const cmp = useMemo(() => {
     if (state.status !== "ready" || !state.before.plan || !state.after.plan) return null;
@@ -151,7 +155,11 @@ export function PlanCompareTab({ tabId, visible }: { tabId: string; visible: boo
         </button>
       </div>
 
-      {!ready ? (
+      {state.status === "error" ? (
+        <div className="p-4 text-[12.5px] text-danger" role="alert">
+          {state.message}
+        </div>
+      ) : !ready ? (
         <div className="flex flex-1 items-center justify-center gap-2 text-muted">
           <Loader2 size={16} className="animate-spin" /> {ref.analyze ? "Running both statements to measure them…" : "Asking the planner about both statements…"}
         </div>

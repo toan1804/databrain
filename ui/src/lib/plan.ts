@@ -31,16 +31,29 @@ export function selfMs(n: PlanNode): number | undefined {
 
 const FULL_SCAN = /\b(seq scan|table scan|full scan|tablescan|seq_scan|table access full|index full scan|clustered index scan)\b|^scan [a-z_"`]/i;
 
-/** Rows a step read in all: actual (× loops) when analyzed, else the estimate. */
+/** Does the step read a whole table (or index), whatever it keeps of it? */
+export function isFullScan(n: PlanNode): boolean {
+  return FULL_SCAN.test(n.op);
+}
+
+/**
+ * Rows a step went through, as far as the plan tells: actual rows (× loops)
+ * plus the ones its filter dropped when analyzed (PostgreSQL), else the
+ * estimate. A scan's estimate is the rows it keeps after its WHERE on most
+ * engines, not the rows it reads, so it under-counts for a filtered scan.
+ */
 function rowsOf(n: PlanNode): number | undefined {
-  if (n.actual_rows !== undefined) return n.actual_rows * Math.max(1, n.loops ?? 1);
+  if (n.actual_rows !== undefined) {
+    const removed = Number(n.extra.find(([k]) => k === "Rows Removed by Filter")?.[1]);
+    return (n.actual_rows + (Number.isFinite(removed) ? removed : 0)) * Math.max(1, n.loops ?? 1);
+  }
   return n.rows;
 }
 
 export function warningsOf(n: PlanNode): string[] {
   const out: string[] = [];
   const rows = rowsOf(n);
-  if (FULL_SCAN.test(n.op) && (rows === undefined || rows >= 1000)) out.push(`Full scan${rows !== undefined ? ` of ${fmtNum(rows)} rows` : ""}`);
+  if (isFullScan(n) && (rows === undefined || rows >= 1000)) out.push(`Full scan${rows !== undefined ? ` of ${fmtNum(rows)} rows` : ""}`);
   if (n.rows !== undefined && n.actual_rows !== undefined) {
     const est = Math.max(1, n.rows);
     const act = Math.max(1, n.actual_rows);
@@ -154,18 +167,49 @@ export interface PlanComparison {
   added: Set<string>;
 }
 
+/**
+ * The table a full scan reads: its object without the alias ("on public.orders o"
+ * → "public.orders"), else the step itself (SQLite's "SCAN orders").
+ */
+function scannedRelation(n: PlanNode): string {
+  const obj = n.object?.replace(/^on\s+/i, "").trim();
+  return (obj ? obj.split(/\s+/)[0] : n.op).toLowerCase();
+}
+
+const scanLabel = (n: PlanNode) => `${n.op}${n.object ? ` ${n.object}` : ""}`;
+
+/**
+ * Full scans of each plan, counted alike on both sides. A scan of few rows
+ * is not flagged on its own, but the row count of a scan is mostly the
+ * estimate after its WHERE, so a rewrite that only adds a selective filter
+ * would seem to drop the scan while the table is still read in full. So a
+ * full scan of a table the other plan flags is counted too: it is still there.
+ */
+function comparableScans(rows: PlanRow[], other: PlanRow[]): PlanRow[] {
+  const flagged = (r: PlanRow) => r.warnings.some((w) => w.startsWith("Full scan"));
+  const otherFlagged = new Set(other.filter(flagged).map((r) => scannedRelation(r.node)));
+  return rows.filter((r) => flagged(r) || (isFullScan(r.node) && otherFlagged.has(scannedRelation(r.node))));
+}
+
 /** Compare two plans of the same engine (costs are only comparable within one engine). */
 export function comparePlans(before: { roots: PlanNode[]; execution_ms?: number }, after: { roots: PlanNode[]; execution_ms?: number }): PlanComparison {
-  const b = planMetrics(before.roots, before.execution_ms);
-  const a = planMetrics(after.roots, after.execution_ms);
-  const minus = (xs: string[], ys: string[]) => {
-    const left = [...ys];
-    return xs.filter((x) => {
-      const i = left.indexOf(x);
-      if (i < 0) return true;
-      left.splice(i, 1);
-      return false;
-    });
+  const br = flattenPlan(before.roots);
+  const ar = flattenPlan(after.roots);
+  const bScans = comparableScans(br, ar);
+  const aScans = comparableScans(ar, br);
+  const b = { ...planMetrics(before.roots, before.execution_ms), fullScans: bScans.map((r) => scanLabel(r.node)) };
+  const a = { ...planMetrics(after.roots, after.execution_ms), fullScans: aScans.map((r) => scanLabel(r.node)) };
+  // Scans in `xs` with no scan of the same table left in `ys` (one for one).
+  const minus = (xs: PlanRow[], ys: PlanRow[]) => {
+    const left = ys.map((r) => scannedRelation(r.node));
+    return xs
+      .filter((x) => {
+        const i = left.indexOf(scannedRelation(x.node));
+        if (i < 0) return true;
+        left.splice(i, 1);
+        return false;
+      })
+      .map((r) => scanLabel(r.node));
   };
   const onlyIn = (rows: PlanRow[], other: PlanRow[]) => {
     const counts = new Map<string, number>();
@@ -179,8 +223,6 @@ export function comparePlans(before: { roots: PlanNode[]; execution_ms?: number 
     }
     return out;
   };
-  const br = flattenPlan(before.roots);
-  const ar = flattenPlan(after.roots);
   return {
     before: b,
     after: a,
@@ -188,8 +230,8 @@ export function comparePlans(before: { roots: PlanNode[]; execution_ms?: number 
     time: delta(b.timeMs, a.timeMs),
     steps: delta(b.steps, a.steps),
     scans: delta(b.fullScans.length, a.fullScans.length),
-    scansRemoved: minus(b.fullScans, a.fullScans),
-    scansAdded: minus(a.fullScans, b.fullScans),
+    scansRemoved: minus(bScans, aScans),
+    scansAdded: minus(aScans, bScans),
     gone: onlyIn(br, ar),
     added: onlyIn(ar, br),
   };

@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../lib/api";
 import type { ConnectionView, PlanNode, QueryPlan } from "../lib/types";
@@ -53,6 +53,27 @@ describe("plan comparison tab", () => {
     const row = (await screen.findByText("Bytes scanned")).closest("tr")!;
     await waitFor(() => expect(row).toHaveTextContent("−75%"));
     expect(row).toHaveTextContent("4.0 GiB");
+    expect(explain).not.toHaveBeenCalled();
+  });
+
+  it("explains again with the new parameters when compared again", async () => {
+    setup("postgres");
+    const explain = vi.spyOn(api, "explainPlan").mockResolvedValue(plan([n("Seq Scan", { object: "on orders", rows: 90_000 })]));
+    render(<PlanCompareTab tabId="p1" visible />);
+    await screen.findByRole("table", { name: "What changed" });
+    expect(explain).toHaveBeenCalledTimes(2);
+    const ref = useStore.getState().tabs[0].plan!;
+    act(() => useStore.getState().updateTab("p1", { plan: { ...ref, params: { day: { value: "2026-02-01" } } } }));
+    await waitFor(() => expect(explain).toHaveBeenCalledTimes(4));
+    expect(explain).toHaveBeenLastCalledWith("c1", "q1", AFTER, false, { day: { value: "2026-02-01" } });
+  });
+
+  it("says so when the tab's connection is gone instead of spinning", async () => {
+    setup("postgres");
+    useStore.setState({ connections: [] });
+    const explain = vi.spyOn(api, "explainPlan");
+    render(<PlanCompareTab tabId="p1" visible />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("The connection of this tab no longer exists.");
     expect(explain).not.toHaveBeenCalled();
   });
 });

@@ -367,13 +367,16 @@ function Toolbar() {
   }, [hasTab]);
   // BigQuery: a dry run (free) of the statement a moment after the editor stops changing.
   const autoCost = !!conn && AUTO_COST_KINDS.has(conn.config.kind) && !run?.running;
+  // Asked again when the tab moves to another connection: an estimate is of
+  // one connection (costPreview drops the old one as soon as the tab moves).
   const tabId = tab?.id;
   const tabSql = tab?.sql;
+  const connId = conn?.id;
   useEffect(() => {
-    if (!autoCost || !tabId || !tabSql?.trim()) return;
+    if (!autoCost || !tabId || !connId || !tabSql?.trim()) return;
     const t = setTimeout(() => void estimateCost(tabId, true), 1500);
     return () => clearTimeout(t);
-  }, [autoCost, tabId, tabSql]);
+  }, [autoCost, tabId, connId, tabSql]);
 
   const [more, setMore] = useState<{ x: number; y: number } | null>(null);
 

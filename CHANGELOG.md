@@ -11,6 +11,9 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Cost preview follows the tab's connection: switching a tab to another connection without editing (BigQuery dev → prod) kept the old connection's bytes and maximum-bytes-billed warning, a reply still on its way for the old connection showed as current, and a connection without cost preview (PostgreSQL) kept the old bar. An estimate is now of one connection, statement and set of parameters; the bar clears when the tab moves, and BigQuery checks again on the new connection.
+- Compare plans no longer reports a full scan that is still there as removed: a rewrite that adds a selective `WHERE` (a PostgreSQL Seq Scan estimated at 50,000 rows, then 200) showed "No longer: Seq Scan orders" and "Full scans 1 → 0" in green, because the scan's row estimate is the rows after its filter. A full scan of a table that the other plan scans in full now counts on both sides, and with Analyze the rows a filter dropped count as read.
+- Compare plans explains both statements again when compared again with new parameter values, and says the tab's connection no longer exists instead of spinning.
 - Generate test data on SQL Server leaves identity, computed and `timestamp`/`rowversion` columns to the database: they were filled, so the load failed (error 544). SQL Server's table DDL now shows `IDENTITY(…)` and computed `AS (…)` columns.
 - Generate test data: the seed shown after generating makes the same rows again. It was larger than a JavaScript number keeps exactly, so entering it made other rows; a seed above 9007199254740991 is now refused.
 - Generate test data on SQLite fills a foreign key written without columns (`REFERENCES customers`) with the parent's primary key values; it was left NULL. Foreign keys of such tables also show the parent's key columns elsewhere.

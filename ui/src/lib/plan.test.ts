@@ -51,4 +51,43 @@ describe("plan comparison", () => {
     expect(fmtDelta(delta(10, 13))).toBe("+30%");
     expect(delta(5, 9, false).better).toBe(true);
   });
+
+  it("keeps a full scan that a selective WHERE only made look small", () => {
+    // PostgreSQL: Plan Rows of a Seq Scan are the rows after its filter, not the rows read.
+    const before = [n("Seq Scan", { object: "on public.orders", rows: 50_000, cost: 900 })];
+    const after = [n("Seq Scan", { object: "on public.orders o", rows: 200, cost: 1025, extra: [["Filter", "(status = 'open'::text)"]] })];
+    const c = comparePlans({ roots: before }, { roots: after });
+    expect(c.scansRemoved).toEqual([]);
+    expect(c.scansAdded).toEqual([]);
+    expect(c.scans).toMatchObject({ before: 1, after: 1, better: null });
+    // And the other way round: a filter dropped is not a "new" scan either.
+    const back = comparePlans({ roots: after }, { roots: before });
+    expect(back.scansRemoved).toEqual([]);
+    expect(back.scansAdded).toEqual([]);
+    expect(back.scans.better).toBeNull();
+  });
+
+  it("counts a full scan the same whatever the engine calls it", () => {
+    // Parallel Seq Scan → Seq Scan of the same table: still there.
+    const par = comparePlans({ roots: [n("Gather", { children: [n("Parallel Seq Scan", { object: "on orders", rows: 40_000 })] })] }, { roots: [n("Seq Scan", { object: "on orders", rows: 300 })] });
+    expect(par.scansRemoved).toEqual([]);
+    expect(par.scans.better).toBeNull();
+    // Oracle and SQL Server: filtered estimates on full scans.
+    const ora = comparePlans({ roots: [n("TABLE ACCESS FULL", { object: "on APP.ORDERS", rows: 50_000 })] }, { roots: [n("TABLE ACCESS FULL", { object: "on APP.ORDERS", rows: 200 })] });
+    expect(ora.scansRemoved).toEqual([]);
+    expect(ora.scans).toMatchObject({ before: 1, after: 1 });
+    // A full scan that became an index lookup is gone.
+    const idx = comparePlans({ roots: [n("TABLE ACCESS FULL", { object: "on APP.ORDERS", rows: 50_000 })] }, { roots: [n("INDEX RANGE SCAN", { object: "on APP.ORDERS_STATUS", rows: 200 })] });
+    expect(idx.scansRemoved).toEqual(["TABLE ACCESS FULL on APP.ORDERS"]);
+    expect(idx.scans).toMatchObject({ before: 1, after: 0, better: true });
+    // Small scans on both sides stay out of it; a big new one is new.
+    const small = comparePlans({ roots: [n("Seq Scan", { object: "on flags", rows: 5 })] }, { roots: [n("Seq Scan", { object: "on flags", rows: 5 }), n("Seq Scan", { object: "on events", rows: 80_000 })] });
+    expect(small.scans).toMatchObject({ before: 0, after: 1, better: false });
+    expect(small.scansAdded).toEqual(["Seq Scan on events"]);
+  });
+
+  it("counts the rows a filter dropped as read when analyzed", () => {
+    const scan = n("Seq Scan", { object: "on orders", rows: 200, actual_rows: 180, loops: 1, extra: [["Rows Removed by Filter", "49820"]] });
+    expect(warningsOf(scan)[0]).toBe("Full scan of 50.0k rows");
+  });
 });

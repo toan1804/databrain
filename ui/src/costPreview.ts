@@ -9,13 +9,26 @@ import { create } from "zustand";
 import { editorBridge } from "./editorBridge";
 import { api, toError } from "./lib/api";
 import { traitsOf } from "./lib/sourceTraits";
-import type { ConnectorKind, CostEstimate } from "./lib/types";
+import type { ConnectorKind, CostEstimate, ParamValue } from "./lib/types";
 import { isQueryTab, useStore } from "./store";
 
+/**
+ * Each estimate is of one statement on one connection with one set of
+ * parameters (`key`): a tab switched to another connection, or a reply
+ * that comes back after the tab moved on, never shows a stale number.
+ */
+interface CostBase {
+  sql: string;
+  auto: boolean;
+  connectionId: string;
+  /** costKey(connectionId, sql, params) of the request. */
+  key: string;
+}
+
 export type CostState =
-  | { status: "loading"; sql: string; auto: boolean }
-  | { status: "ready"; sql: string; auto: boolean; estimate: CostEstimate; connectionId: string }
-  | { status: "error"; sql: string; auto: boolean; message: string };
+  | (CostBase & { status: "loading" })
+  | (CostBase & { status: "ready"; estimate: CostEstimate })
+  | (CostBase & { status: "error"; message: string });
 
 interface CostStore {
   byTab: Record<string, CostState | undefined>;
@@ -30,6 +43,32 @@ export const useCost = create<CostStore>((set) => ({
   set: (tabId, s) => set((st) => ({ byTab: { ...st.byTab, [tabId]: s } })),
   hide: (tabId, sql) => set((st) => ({ hidden: { ...st.hidden, [tabId]: sql } })),
 }));
+
+export function costKey(connectionId: string, sql: string, params: Record<string, ParamValue> = {}): string {
+  const sorted = Object.keys(params)
+    .sort()
+    .map((k) => [k, params[k]]);
+  return JSON.stringify([connectionId, sql, sorted]);
+}
+
+/** Drop the tab's estimate (and its "hidden" mark) unless it is of `connectionId`. */
+function clearUnlessOn(tabId: string, connectionId: string | null | undefined) {
+  const c = useCost.getState();
+  const cur = c.byTab[tabId];
+  if (!cur || cur.connectionId === connectionId) return;
+  useCost.setState({ byTab: { ...c.byTab, [tabId]: undefined }, hidden: { ...c.hidden, [tabId]: undefined } });
+}
+
+// A tab that changes connection (or closes) loses its estimate at once,
+// whether or not the new connection can estimate at all.
+useStore.subscribe((s, prev) => {
+  if (s.tabs === prev.tabs) return;
+  const byTab = useCost.getState().byTab;
+  for (const [tabId, cur] of Object.entries(byTab)) {
+    if (!cur) continue;
+    clearUnlessOn(tabId, s.tabs.find((t) => t.id === tabId)?.connection_id);
+  }
+});
 
 /** Engines asked on their own while typing (free, no warehouse). */
 export const AUTO_COST_KINDS = new Set(["bigquery"]);
@@ -57,6 +96,7 @@ export async function estimateCost(tabId: string, auto = false): Promise<void> {
   const tab = st.tabs.find((t) => t.id === tabId);
   if (!isQueryTab(tab)) return;
   const conn = st.connections.find((c) => c.id === tab.connection_id);
+  clearUnlessOn(tabId, conn?.id);
   if (!conn) {
     if (!auto) st.toast("Choose a connection for this tab first", "error");
     return;
@@ -71,15 +111,22 @@ export async function estimateCost(tabId: string, auto = false): Promise<void> {
     if (!auto) st.toast("Nothing to estimate: put the cursor in a statement", "info");
     return;
   }
-  const cur = useCost.getState().byTab[tabId];
-  if (auto && cur && cur.sql === sql && cur.status !== "error") return;
-  const params = auto ? (st.params[tabId] ?? {}) : await st.paramsFor(tabId, kind, sql);
+  const params = auto ? (useStore.getState().params[tabId] ?? {}) : await st.paramsFor(tabId, kind, sql);
   if (!params) return;
-  useCost.getState().set(tabId, { status: "loading", sql, auto });
+  const key = costKey(conn.id, sql, params);
+  const cur = useCost.getState().byTab[tabId];
+  if (auto && cur && cur.key === key && cur.status !== "error") return;
+  // The tab may have moved to another connection while we asked for the statement or parameters.
+  if (useStore.getState().tabs.find((t) => t.id === tabId)?.connection_id !== conn.id) return;
+  const base = { sql, auto, connectionId: conn.id, key };
+  const req: CostState = { ...base, status: "loading" };
+  useCost.getState().set(tabId, req);
+  // Only the latest request of the tab may land, and only while the tab is still on its connection.
+  const current = () => useCost.getState().byTab[tabId] === req && useStore.getState().tabs.find((t) => t.id === tabId)?.connection_id === conn.id;
   try {
     const estimate = await api.estimateCost(conn.id, tabId, sql, params);
-    if (useCost.getState().byTab[tabId]?.sql === sql) useCost.getState().set(tabId, { status: "ready", sql, auto, estimate, connectionId: conn.id });
+    if (current()) useCost.getState().set(tabId, { ...base, status: "ready", estimate });
   } catch (e) {
-    if (useCost.getState().byTab[tabId]?.sql === sql) useCost.getState().set(tabId, { status: "error", sql, auto, message: toError(e).message });
+    if (current()) useCost.getState().set(tabId, { ...base, status: "error", message: toError(e).message });
   }
 }
