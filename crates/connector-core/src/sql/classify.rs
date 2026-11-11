@@ -390,6 +390,20 @@ const SNOWFLAKE_READS: &[&str] = &[
     "system$get_privatelink_config",
     "system$is_listing_triggered",
     "system$get_snowflake_platform_info",
+    "system$estimate_query_acceleration",
+    "system$behavior_change_bundle_status",
+    "system$show_active_behavior_change_bundles",
+    "system$get_task_graph_config",
+    "system$task_runtime_info",
+    "system$get_service_status",
+    "system$get_service_logs",
+    "system$external_table_pipe_status",
+    "system$get_directory_table_status",
+    "system$client_version_info",
+    "system$wait",
+    "system$get_classification_result",
+    "system$get_login_failure_details",
+    "system$get_privatelink_authorized_endpoints",
 ];
 
 fn is_acting_function(name: &str) -> bool {
@@ -556,6 +570,8 @@ mod tests {
             (Snowflake, "select system$typeof(1)"),
             (Snowflake, "select system$pipe_status('db.s.p')"),
             (Snowflake, "SELECT SYSTEM$STREAM_HAS_DATA('s')"),
+            (Snowflake, "select system$estimate_query_acceleration('01a2')"),
+            (Snowflake, "select system$get_service_status('svc')"),
         ] {
             assert_eq!(classify(sql, kind).kind, StatementKind::Read, "{sql}");
         }

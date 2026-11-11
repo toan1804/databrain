@@ -20,6 +20,7 @@ Found in reviews and left for a later release on purpose. Each says what goes wr
 - Postgres `timestamptz` maxima or parent keys printed with an offset (`+07`) may fail `parse_ts`: keys would start at 2020-01-01 and a NOT NULL foreign key would get NULL (depends on how `query_text` formats them; unconfirmed).
 - A composite primary key whose first column is a foreign key: the second key column gets random values and composite keys aren't treated as unique groups, so rows can collide (a note says so).
 - A computed column the user ticks to fill always fails to load (SQL Server error 271); it should be refused in the dialog.
+- Decimal limits cap precision at 38 (`type_limits`): ClickHouse `Decimal256(40)`, BigQuery `BIGNUMERIC(50,20)` and Postgres `numeric(60,2)` refuse valid patterns and keys; Oracle `NUMBER(10,-2)` reads the negative scale as 0.
 - Oracle `s.nextval` and SQL Server `next value for s` stay reads in the classifier while Postgres `nextval()` is `Other` (low; affects the production prompt only).
 
 ## AI
@@ -31,6 +32,10 @@ Found in reviews and left for a later release on purpose. Each says what goes wr
 - An update while an MCP client is connected: the installer may end the MCP session (`databrain.exe mcp`), or hit "file in use" on the `databrain-mcp.exe` launcher.
 - If an MCP client kills `databrain-mcp.exe` without closing its stdin, the child `databrain.exe mcp` may keep running (no job object ties them).
 - `databrain-jobs run` / `list` output in a terminal goes through the GUI-subsystem launcher's console attach; check it prints in cmd and PowerShell.
+
+## Index hint
+
+- If loading the index state fails after the index changes, the hint stays hidden until the next change (`IndexHint.tsx`).
 
 ## Redaction
 

@@ -227,19 +227,32 @@ pub fn redact_url_passwords(text: &str) -> String {
         let token = rest.find(|c: char| stop(c) || c.is_whitespace()).unwrap_or(rest.len());
         let Some(colon) = userinfo_colon(&rest[..token]) else { continue };
         let after = &rest[colon + 1..token];
+        // JDBC URLs (`jdbc:sqlserver://host:1433;user=me@corp`) put `;key=value`
+        // parameters after the port.
+        let scheme = out[..out.len() - 3].rsplit(|c: char| c.is_whitespace() || stop(c)).next().unwrap_or("");
+        let jdbc = scheme.to_ascii_lowercase().starts_with("jdbc:");
         // `host:5432`, `host:5432/db`, `host:5432?x`, JDBC `host:1433;db=x`,
-        // or a port ending a sentence (`localhost:8080,`): shaped like a port.
+        // or a port ending a sentence (`localhost:8080, or …`) when the next
+        // word has no `@` (`u:12345, pass@h` is a password with a space).
         let digits = after.bytes().take_while(u8::is_ascii_digit).count();
         let tail = &after[digits..];
+        let next_word_has_at = || rest[token..].split_whitespace().next().is_some_and(|w| w.contains('@'));
         let port = digits > 0
-            && (tail.chars().next().is_none_or(|c| matches!(c, '/' | '?' | '#' | ';')) || tail.chars().all(|c| matches!(c, '.' | ',' | ':' | ';' | '!')));
+            && (tail.chars().next().is_none_or(|c| matches!(c, '/' | '?' | '#') || (jdbc && c == ';'))
+                || (!tail.is_empty() && tail.chars().all(|c| matches!(c, '.' | ',' | ':' | ';' | '!')) && !next_word_has_at()));
+        let params = if jdbc { &['?', ';'][..] } else { &['?'][..] };
         let at = match after.find('@') {
             // `host:5432/db?x=a@b`, `host:1433;user=me@corp`: the `@` is in a parameter.
-            Some(first) if port && after[..first].find(['?', ';']).is_some_and(|q| after[q..first].contains('=')) => None,
-            // The password ends at the last `@` before the query string:
-            // `u:pw@h/db?x=1@2` keeps its host.
+            Some(first) if port && after[..first].find(params).is_some_and(|q| after[q..first].contains('=')) => None,
+            // The password ends at the last `@`, except one in the query string
+            // after a host and path (`u:pw@h/db?x=1@2` keeps its host); when
+            // what follows isn't a host and path (`u:a@b?c@h`), the whole is hidden.
             Some(first) => {
-                let scope = after[first..].find('?').map_or(after, |q| &after[..first + q]);
+                let cut = after[first..].find('?').map(|q| first + q).filter(|&q| {
+                    let before = &after[..q];
+                    before.rfind('@').is_some_and(|a| before[a..].contains('/'))
+                });
+                let scope = cut.map_or(after, |q| &after[..q]);
                 scope.rfind('@').map(|a| colon + 1 + a)
             }
             // `u:pa ss@h`: a password with a space in it, up to the next `@`
@@ -592,6 +605,15 @@ mod redaction_tests {
             // An `@` in the query string isn't the end of the password.
             ("postgres://u:pw@h/db?x=1@2", "postgres://u:***@h/db?x=1@2"),
             ("postgres://u:pa/ss@h/db?mail=a@b", "postgres://u:***@h/db?mail=a@b"),
+            // …but a password with `@` then `?` is hidden whole.
+            ("postgres://u:a@b?c@h/db", "postgres://u:***@h/db"),
+            ("postgres://u:p@ss?w@h/db", "postgres://u:***@h/db"),
+            // `;` ends a port only in JDBC URLs; digits then punctuation then a
+            // word with `@` is a password with a space in it.
+            ("postgres://u:1234;x=1@host/db", "postgres://u:***@host/db"),
+            ("postgres://u:12345, pass@h", "postgres://u:***@h"),
+            ("postgres://u:1234. abc@h/db", "postgres://u:***@h/db"),
+            ("postgres://u:1234,@h", "postgres://u:***@h"),
             (
                 "connect to mongodb+srv://u:p%40ss@cluster0.x.net/?retryWrites=true please",
                 "connect to mongodb+srv://u:***@cluster0.x.net/?retryWrites=true please",

@@ -26,7 +26,9 @@ describe("index coverage", () => {
     };
     expect(explorerTables(objects, "c1")).toBe(3);
     expect(explorerTables(objects, "c1", ["public"])).toBe(2);
-    expect(explorerTables(objects, "c1", ["*"])).toBe(7);
+    // `*` alone leaves system schemas out, as the indexer does; naming one counts it.
+    expect(explorerTables(objects, "c1", ["*"])).toBe(3);
+    expect(explorerTables(objects, "c1", ["*", "pg_catalog"])).toBe(7);
     expect(systemSchema("PG_CATALOG") && systemSchema("main.sys") && systemSchema("pg_temp_3")).toBe(true);
     expect(systemSchema("sales")).toBe(false);
     expect(inScope(["main.*"], "main.sales")).toBe(true);

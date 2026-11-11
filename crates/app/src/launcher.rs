@@ -11,10 +11,20 @@ use std::process::{Command, ExitCode};
 /// macOS gives the link's own path as the current executable.
 fn program() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let exe = std::fs::canonicalize(&exe).map(plain).unwrap_or(exe);
     let dir = exe.parent()?.to_path_buf();
     let ext = if cfg!(windows) { ".exe" } else { "" };
     ["databrain", "DataBrain"].iter().map(|n| dir.join(format!("{n}{ext}"))).find(|p| p.is_file())
+}
+
+/// A canonical Windows path without its `\\?\` prefix (`\\?\C:\…` → `C:\…`), so the
+/// program sees an ordinary path as its own location; UNC paths keep theirs.
+fn plain(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => p,
+    }
 }
 
 /// Run `databrain <mode> <this launcher's arguments>` in place of this

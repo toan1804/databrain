@@ -38,6 +38,8 @@ export function inScope(scope: string[], schema: string): boolean {
  * when it has listed none yet.
  */
 export function explorerTables(objects: Record<string, DbObject[]>, connId: string, scope: string[] = []): number | null {
+  // `*` alone means every schema except system ones (as the indexer reads it).
+  if (scope.length && scope.every((w) => w.trim() === "*")) scope = [];
   let n = 0;
   let seen = false;
   for (const [key, list] of Object.entries(objects)) {
