@@ -1,7 +1,7 @@
 // A hint above the chat when the knowledge index doesn't cover the chat's
 // connection: nothing indexed, or far fewer tables than the explorer lists.
 // The assistant finds tables through the index, so it would guess.
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { BookOpen, Loader2, X } from "lucide-react";
 import { api } from "../../lib/api";
 import { explorerTables, indexCoverage } from "../../lib/indexCoverage";
@@ -22,11 +22,14 @@ function dismissed(key: string): boolean {
 
 export function IndexHint({ connId }: { connId: string | null }) {
   const conn = useStore((s) => s.connections.find((c) => c.id === connId));
-  const total = useStore((s) => (connId ? explorerTables(s.objects, connId) : null));
+  // Counted only when the explorer's objects change, not on every store update.
+  const objects = useStore((s) => s.objects);
+  const scope = conn?.ai_policy?.index_schemas;
+  const total = useMemo(() => (connId ? explorerTables(objects, connId, scope ?? []) : null), [objects, connId, scope]);
   const version = useAi((s) => s.knowledgeVersion);
   const progress = useAi((s) => (connId ? s.knowledgeProgress[connId] : undefined));
   const openKnowledge = useAi((s) => s.openKnowledge);
-  const [state, setState] = useState<{ conn: string; value: KnState | null } | null>(null);
+  const [state, setState] = useState<{ conn: string; version: number; value: KnState | null } | null>(null);
   const [, bump] = useState(0);
 
   useEffect(() => {
@@ -34,7 +37,7 @@ export function IndexHint({ connId }: { connId: string | null }) {
     let live = true;
     api
       .knGet(connId)
-      .then((v) => live && setState({ conn: connId, value: v.state }))
+      .then((v) => live && setState({ conn: connId, version, value: v.state }))
       .catch(() => {});
     return () => {
       live = false;
@@ -51,7 +54,8 @@ export function IndexHint({ connId }: { connId: string | null }) {
       </div>
     );
   }
-  if (!state || state.conn !== connId) return null;
+  // Loaded for an older index (one just finished): wait for the new one.
+  if (!state || state.conn !== connId || state.version !== version) return null;
   const cov = indexCoverage(state.value, total);
   if (!cov) return null;
   const key = `${connId}.${cov.kind}`;

@@ -6,9 +6,13 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 /// `databrain` next to this launcher (`DataBrain` too, in case a bundle
-/// names it after the product).
+/// names it after the product). A link to the launcher (`/usr/local/bin/
+/// databrain-jobs` → the app bundle) is followed to where it really is:
+/// macOS gives the link's own path as the current executable.
 fn program() -> Option<PathBuf> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let dir = exe.parent()?.to_path_buf();
     let ext = if cfg!(windows) { ".exe" } else { "" };
     ["databrain", "DataBrain"].iter().map(|n| dir.join(format!("{n}{ext}"))).find(|p| p.is_file())
 }

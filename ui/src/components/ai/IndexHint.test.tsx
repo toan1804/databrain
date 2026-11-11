@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../../lib/api";
 import type { ConnectionView, DbObject, KnState } from "../../lib/types";
@@ -55,6 +55,20 @@ describe("index hint", () => {
     render(<IndexHint connId="c1" />);
     await screen.findByText(/doesn't know/);
     fireEvent.click(screen.getByLabelText("Dismiss"));
+    expect(screen.queryByRole("note")).toBeNull();
+  });
+
+  it("doesn't flash the old message when indexing finishes", async () => {
+    useStore.setState({ connections: [conn()], objects: { "c1|public": tables(30) } });
+    let resolve: (v: { state: KnState; notes: [] }) => void = () => {};
+    const get = vi.spyOn(api, "knGet").mockResolvedValueOnce({ state: null, notes: [] });
+    render(<IndexHint connId="c1" />);
+    await screen.findByText(/doesn't know/);
+    get.mockImplementationOnce(() => new Promise((r) => (resolve = r)));
+    // Indexing done: progress cleared and the index changed in one update.
+    act(() => useAi.setState({ knowledgeProgress: {}, knowledgeVersion: 1 }));
+    expect(screen.queryByText(/doesn't know/)).toBeNull();
+    await act(async () => resolve({ state: state(30), notes: [] }));
     expect(screen.queryByRole("note")).toBeNull();
   });
 

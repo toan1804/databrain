@@ -47,6 +47,18 @@ fn databrain_mcp_serves_mcp_on_stdio() {
     assert!(text.contains(r#""id":1"#) && text.contains(r#""name":"databrain""#), "{text}");
 }
 
+/// A link to a launcher elsewhere (`ln -s …/databrain-jobs /usr/local/bin/`)
+/// still finds the program next to the real launcher.
+#[cfg(unix)]
+#[test]
+fn launchers_work_through_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let link = dir.path().join("databrain-jobs");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_databrain-jobs"), &link).unwrap();
+    let out = Command::new(&link).arg("list").env("DATABRAIN_DATA_DIR", dir.path()).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
 /// The launchers are small: they don't carry a copy of DataBrain.
 #[test]
 fn launchers_are_small() {

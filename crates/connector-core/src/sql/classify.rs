@@ -354,21 +354,49 @@ const ACTING_FUNCTIONS: &[&str] = &[
     "dblink",
     "dblink_exec",
     "dblink_send_query",
-    // Snowflake.
-    "system$cancel_query",
-    "system$cancel_all_queries",
-    "system$abort_session",
-    "system$abort_transaction",
-    "system$enable_behavior_change_bundle",
-    "system$disable_behavior_change_bundle",
-    "system$pipe_force_resume",
-    "system$user_task_cancel_ongoing_executions",
-    "system$task_dependents_enable",
-    "system$add_event",
+    "lowrite",
+];
+
+/// Snowflake `system$` functions that only read: every other `system$`
+/// call counts as acting (`system$cancel_query`, `system$send_email`,
+/// `system$disable_database_replication`, …). Snowflake has no read-only
+/// session mode, so this is the only guard there; a new or unknown one
+/// gets the production prompt and is refused on a read-only connection.
+const SNOWFLAKE_READS: &[&str] = &[
+    "system$clustering_information",
+    "system$clustering_depth",
+    "system$clustering_ratio",
+    "system$typeof",
+    "system$explain_plan_json",
+    "system$explain_json_to_text",
+    "system$get_tag",
+    "system$get_tag_allowed_values",
+    "system$get_tag_on_current_column",
+    "system$get_tag_on_current_table",
+    "system$pipe_status",
+    "system$stream_has_data",
+    "system$stream_get_table_timestamp",
+    "system$last_change_commit_time",
+    "system$current_user_task_name",
+    "system$get_predecessor_return_value",
+    "system$task_dependents",
+    "system$database_refresh_progress",
+    "system$database_refresh_progress_by_job",
+    "system$estimate_search_optimization_costs",
+    "system$whitelist",
+    "system$allowlist",
+    "system$whitelist_privatelink",
+    "system$allowlist_privatelink",
+    "system$get_privatelink_config",
+    "system$is_listing_triggered",
+    "system$get_snowflake_platform_info",
 ];
 
 fn is_acting_function(name: &str) -> bool {
     let name = name.trim_matches(['"', '`', '[', ']']).to_ascii_lowercase();
+    if name.starts_with("system$") {
+        return !SNOWFLAKE_READS.contains(&name.as_str());
+    }
     ACTING_FUNCTIONS.contains(&name.as_str())
 }
 
@@ -500,6 +528,12 @@ mod tests {
             (Postgres, "select set_config('default_transaction_read_only', 'off', false)"),
             (Snowflake, "select system$cancel_query('01a2')"),
             (Snowflake, "SELECT SYSTEM$ABORT_SESSION(123)"),
+            // Any system$ call that isn't a known read.
+            (Snowflake, "select system$send_email('int', 'a@b.com', 's', 'body')"),
+            (Snowflake, "select system$disable_database_replication('db')"),
+            (Snowflake, "select system$global_account_set_parameter('acct', 'ENABLE_X', 'true')"),
+            (Snowflake, "select system$some_function_added_next_year()"),
+            (Postgres, "select lowrite(lo_open(42, 131072), 'x')"),
         ] {
             let c = classify(sql, kind);
             assert_eq!(c.kind, StatementKind::Other, "{sql}");
@@ -520,6 +554,8 @@ mod tests {
             (Postgres, "select pg_terminate_backend from t"),
             (Snowflake, "select system$clustering_information('t')"),
             (Snowflake, "select system$typeof(1)"),
+            (Snowflake, "select system$pipe_status('db.s.p')"),
+            (Snowflake, "SELECT SYSTEM$STREAM_HAS_DATA('s')"),
         ] {
             assert_eq!(classify(sql, kind).kind, StatementKind::Read, "{sql}");
         }

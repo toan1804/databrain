@@ -227,13 +227,21 @@ pub fn redact_url_passwords(text: &str) -> String {
         let token = rest.find(|c: char| stop(c) || c.is_whitespace()).unwrap_or(rest.len());
         let Some(colon) = userinfo_colon(&rest[..token]) else { continue };
         let after = &rest[colon + 1..token];
-        // `host:5432`, `host:5432/db`, `host:5432?x`: shaped like a port.
+        // `host:5432`, `host:5432/db`, `host:5432?x`, JDBC `host:1433;db=x`,
+        // or a port ending a sentence (`localhost:8080,`): shaped like a port.
         let digits = after.bytes().take_while(u8::is_ascii_digit).count();
-        let port = digits > 0 && after[digits..].chars().next().is_none_or(|c| matches!(c, '/' | '?' | '#'));
+        let tail = &after[digits..];
+        let port = digits > 0
+            && (tail.chars().next().is_none_or(|c| matches!(c, '/' | '?' | '#' | ';')) || tail.chars().all(|c| matches!(c, '.' | ',' | ':' | ';' | '!')));
         let at = match after.find('@') {
-            // `host:5432/db?x=a@b`: the `@` is in a query parameter.
-            Some(first) if port && after[..first].find('?').is_some_and(|q| after[q..first].contains('=')) => None,
-            Some(_) => after.rfind('@').map(|a| colon + 1 + a),
+            // `host:5432/db?x=a@b`, `host:1433;user=me@corp`: the `@` is in a parameter.
+            Some(first) if port && after[..first].find(['?', ';']).is_some_and(|q| after[q..first].contains('=')) => None,
+            // The password ends at the last `@` before the query string:
+            // `u:pw@h/db?x=1@2` keeps its host.
+            Some(first) => {
+                let scope = after[first..].find('?').map_or(after, |q| &after[..first + q]);
+                scope.rfind('@').map(|a| colon + 1 + a)
+            }
             // `u:pa ss@h`: a password with a space in it, up to the next `@`
             // on the line (the last `@` of that word), not into another URL.
             None if !port => {
@@ -577,6 +585,13 @@ mod redaction_tests {
     fn redacts_url_passwords_in_text() {
         for (text, want) in [
             ("postgres://ann:s3cret@db.example.com:5432/app", "postgres://ann:***@db.example.com:5432/app"),
+            // Ordinary text around a URL with a port is kept.
+            ("see http://localhost:8080, or email me@x.com", "see http://localhost:8080, or email me@x.com"),
+            ("open http://localhost:8080. mail bob@corp.com", "open http://localhost:8080. mail bob@corp.com"),
+            ("jdbc:sqlserver://host:1433;databaseName=x;user=me@corp;password=pw", "jdbc:sqlserver://host:1433;databaseName=x;user=me@corp;password=pw"),
+            // An `@` in the query string isn't the end of the password.
+            ("postgres://u:pw@h/db?x=1@2", "postgres://u:***@h/db?x=1@2"),
+            ("postgres://u:pa/ss@h/db?mail=a@b", "postgres://u:***@h/db?mail=a@b"),
             (
                 "connect to mongodb+srv://u:p%40ss@cluster0.x.net/?retryWrites=true please",
                 "connect to mongodb+srv://u:***@cluster0.x.net/?retryWrites=true please",

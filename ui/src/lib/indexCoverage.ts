@@ -10,15 +10,40 @@ export const FEW_MIN_TABLES = 20;
 export const FEW_SHARE = 0.5;
 
 /**
- * Tables and views the explorer has listed for a connection (what the index
- * would hold: not functions, procedures or sequences); `null` when it has
- * listed none yet.
+ * Schemas the knowledge index leaves out unless chosen (as `system_schema`
+ * in crates/ai/src/knowledge.rs): catalog schemas such as
+ * `information_schema` and `pg_catalog`.
  */
-export function explorerTables(objects: Record<string, DbObject[]>, connId: string): number | null {
+export function systemSchema(name: string): boolean {
+  const last = name.toLowerCase().split(".").pop() ?? "";
+  return (
+    ["information_schema", "pg_catalog", "pg_toast", "sys", "mysql", "performance_schema", "sysibm", "ctxsys", "mdsys", "xdb", "outln"].includes(last) ||
+    last.startsWith("pg_temp")
+  );
+}
+
+/** A schema id in an index scope (as `scope_matches` in knowledge.rs): `*`, the id, or `catalog.*`. */
+export function inScope(scope: string[], schema: string): boolean {
+  const s = schema.toLowerCase();
+  return scope.some((w) => {
+    const e = w.trim().toLowerCase();
+    return e === "*" || e === s || (e.endsWith(".*") && s.startsWith(e.slice(0, -1)) && s.length > e.length - 1);
+  });
+}
+
+/**
+ * Tables and views the explorer has listed for a connection that the index
+ * would hold (not functions, procedures or sequences; not system schemas;
+ * only the chosen schemas when the connection's index scope is set); `null`
+ * when it has listed none yet.
+ */
+export function explorerTables(objects: Record<string, DbObject[]>, connId: string, scope: string[] = []): number | null {
   let n = 0;
   let seen = false;
   for (const [key, list] of Object.entries(objects)) {
     if (!key.startsWith(`${connId}|`)) continue;
+    const schema = key.slice(connId.length + 1);
+    if (scope.length ? !inScope(scope, schema) : systemSchema(schema)) continue;
     seen = true;
     n += list.filter((o) => !["function", "procedure", "sequence", "package"].includes(o.kind)).length;
   }
