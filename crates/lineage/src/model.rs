@@ -37,6 +37,20 @@ pub struct Column {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub expr: Option<String>,
+    /// Columns of tables and views: the SQL uses it (selects, computes,
+    /// joins, filters, groups or orders on it, writes or defines it, or
+    /// reaches it through a `*` whose columns are used further on). The
+    /// diagram lists only these; the others are known but not needed. Not
+    /// set on other nodes (all their columns are the query's own).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub used: bool,
+}
+
+impl Column {
+    pub(crate) fn named(name: impl Into<String>) -> Self {
+        Column { name: name.into(), span: None, expr: None, used: false }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]

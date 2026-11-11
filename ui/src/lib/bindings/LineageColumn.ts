@@ -9,4 +9,12 @@ span?: LineageRange,
 /**
  * The expression of a computed column (shortened).
  */
-expr?: string, };
+expr?: string, 
+/**
+ * Columns of tables and views: the SQL uses it (selects, computes,
+ * joins, filters, groups or orders on it, writes or defines it, or
+ * reaches it through a `*` whose columns are used further on). The
+ * diagram lists only these; the others are known but not needed. Not
+ * set on other nodes (all their columns are the query's own).
+ */
+used?: boolean, };

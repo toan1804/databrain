@@ -1,4 +1,4 @@
-use sqlparser::ast::Ident;
+use sqlparser::ast::{Expr, Ident};
 use sqlparser::tokenizer::Span;
 
 use super::*;
@@ -82,5 +82,41 @@ impl<'a> Builder<'a> {
         let name = node.name.clone();
         self.warn(format!("{written}: {name} has no column {col}"), span);
         None
+    }
+
+    /// Columns `e` names in a `GROUP BY` / `ORDER BY` of select `n`: they
+    /// are used (see [`Column::used`]) though no value flows from them. Names
+    /// of `n`'s own outputs (`order by total`) and columns that can't be
+    /// placed are skipped quietly (the clause draws nothing to warn about).
+    pub(super) fn mark_refs(&mut self, e: &Expr, n: usize, sources: &[Source]) {
+        for parts in refs(e).cols {
+            let Some(col) = parts.last().map(|i| i.value.clone()) else { continue };
+            if parts.len() == 1 && self.col_index(n, &col).is_some() {
+                continue;
+            }
+            let node = if parts.len() >= 2 {
+                let qual: Vec<String> = parts[..parts.len() - 1].iter().map(|i| i.value.clone()).collect();
+                self.find_source(sources, &qual).map(|s| s.node)
+            } else {
+                let with: Vec<usize> = sources.iter().filter(|s| self.col_index(s.node, &col).is_some()).map(|s| s.node).collect();
+                let unknown: Vec<usize> =
+                    sources.iter().filter(|s| self.g.nodes[s.node].kind == NodeKind::Table && !self.g.nodes[s.node].columns_known).map(|s| s.node).collect();
+                match (&with[..], &unknown[..]) {
+                    ([one], _) | ([], [one]) => Some(*one),
+                    _ => None,
+                }
+            };
+            let Some(node) = node else { continue };
+            match self.col_index(node, &col) {
+                Some(i) => {
+                    let name = self.g.nodes[node].columns[i].name.clone();
+                    self.uses.insert((node, name));
+                }
+                None if self.g.nodes[node].kind == NodeKind::Table && !self.g.nodes[node].columns_known => {
+                    self.ensure_col(node, &col);
+                }
+                None => {}
+            }
+        }
     }
 }

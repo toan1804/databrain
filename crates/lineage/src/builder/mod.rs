@@ -43,6 +43,7 @@ fn build(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> (Lineage, Vec
         stmt: 0,
         joins: vec![],
         clause: 0,
+        uses: Default::default(),
     };
     let spans = split_statements(sql, kind);
     let many = spans.len() > 1;
@@ -77,6 +78,7 @@ fn build(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> (Lineage, Vec
     unknown.sort();
     unknown.dedup();
     b.g.unknown_tables = unknown;
+    b.mark_used();
     b.g.flows = flows(&b.g);
     let joins = b.join_pairs();
     (b.g, joins)
@@ -105,6 +107,8 @@ struct Builder<'a> {
     joins: Vec<joins::RawJoin>,
     /// Counter of conditions seen (groups composite keys).
     clause: usize,
+    /// Columns the SQL names itself (node, column): where [`Builder::mark_used`] starts.
+    uses: std::collections::HashSet<(usize, String)>,
 }
 
 impl<'a> Builder<'a> {
@@ -193,7 +197,7 @@ impl<'a> Builder<'a> {
         let span = self.range(name.span());
         let i = self.node(NodeKind::Table, display, span);
         if let Some(t) = found {
-            self.g.nodes[i].columns = t.columns.into_iter().map(|c| Column { name: c, span: None, expr: None }).collect();
+            self.g.nodes[i].columns = t.columns.into_iter().map(Column::named).collect();
             self.g.nodes[i].columns_known = true;
         }
         self.tables.insert(key, i);
@@ -205,12 +209,23 @@ impl<'a> Builder<'a> {
         cols.iter().position(|c| c.name == name).or_else(|| cols.iter().position(|c| c.name.eq_ignore_ascii_case(name)))
     }
 
-    /// Column of a table node, added when only referenced (unknown columns).
+    /// Column of a table node the SQL uses, added when only referenced
+    /// (unknown columns). Inside a view's definition it counts as used only
+    /// when a column of the view that needs it is (see [`Self::mark_used`]).
     fn ensure_col(&mut self, node: usize, name: &str) -> String {
+        let c = self.col_or_add(node, name);
+        if self.in_view == 0 {
+            self.uses.insert((node, c.clone()));
+        }
+        c
+    }
+
+    /// [`Self::ensure_col`] without counting it as used.
+    fn col_or_add(&mut self, node: usize, name: &str) -> String {
         match self.col_index(node, name) {
             Some(i) => self.g.nodes[node].columns[i].name.clone(),
             None => {
-                self.g.nodes[node].columns.push(Column { name: name.to_string(), span: None, expr: None });
+                self.g.nodes[node].columns.push(Column::named(name));
                 name.to_string()
             }
         }
@@ -224,7 +239,7 @@ impl<'a> Builder<'a> {
             n = format!("{name}_{k}");
             k += 1;
         }
-        self.g.nodes[node].columns.push(Column { name: n.clone(), span, expr });
+        self.g.nodes[node].columns.push(Column { name: n.clone(), span, expr, used: false });
         n
     }
 
@@ -248,9 +263,54 @@ impl<'a> Builder<'a> {
     /// earlier version (a dropped and recreated table) to columns it no
     /// longer has stay, and are drawn to the table as a whole.
     fn define_columns(&mut self, t: usize, names: &[String]) {
-        self.g.nodes[t].columns = names.iter().map(|n| Column { name: n.clone(), span: None, expr: None }).collect();
+        self.g.nodes[t].columns = names.iter().map(|n| Column::named(n.clone())).collect();
         self.g.nodes[t].columns_known = true;
         self.created.insert(t);
+        self.uses.extend(names.iter().map(|n| (t, n.clone())));
+    }
+
+    /// Set [`Column::used`] on table and view columns: those the SQL names
+    /// (selected, computed, joined, filtered, grouped, ordered, written,
+    /// defined) plus, walking edges back from what the statements return or
+    /// write, every column that feeds them (so a `*` uses all of a table's
+    /// columns only when they are all used further on, and a view's
+    /// definition uses only what the columns read from the view need).
+    /// Join and filter inputs always count: they decide the rows.
+    fn mark_used(&mut self) {
+        use std::collections::HashSet;
+        let index: HashMap<&str, usize> = self.g.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
+        let mut into: HashMap<(usize, &str), Vec<(usize, &str)>> = HashMap::new();
+        let mut todo: Vec<(usize, String)> = self.uses.iter().cloned().collect();
+        for e in &self.g.edges {
+            let (Some(&f), Some(&t)) = (index.get(e.from.as_str()), index.get(e.to.as_str())) else { continue };
+            let Some(fc) = e.from_column.as_deref() else { continue };
+            match e.to_column.as_deref() {
+                Some(tc) => into.entry((t, tc)).or_default().push((f, fc)),
+                None => todo.push((f, fc.to_string())),
+            }
+        }
+        for (i, n) in self.g.nodes.iter().enumerate() {
+            if n.kind == NodeKind::Result {
+                todo.extend(n.columns.iter().map(|c| (i, c.name.clone())));
+            }
+        }
+        let mut seen: HashSet<(usize, String)> = HashSet::new();
+        while let Some(k) = todo.pop() {
+            if seen.contains(&k) {
+                continue;
+            }
+            if let Some(from) = into.get(&(k.0, k.1.as_str())) {
+                todo.extend(from.iter().map(|&(f, c)| (f, c.to_string())));
+            }
+            seen.insert(k);
+        }
+        for (i, n) in self.g.nodes.iter_mut().enumerate() {
+            if n.kind == NodeKind::Table {
+                for c in &mut n.columns {
+                    c.used = seen.contains(&(i, c.name.clone()));
+                }
+            }
+        }
     }
 
     /// `CREATE … IF NOT EXISTS` of a table the catalog knows: it stays as it is.

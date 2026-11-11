@@ -12,8 +12,6 @@ const GAP_Y = 28;
 const GAP_RANK_TB = 80;
 const GAP_CROSS_TB = 36;
 const MARGIN = 24;
-/** Database tables with more columns than this only list the columns an edge uses (+N more). */
-const MAX_TABLE_COLUMNS = 12;
 
 export interface LaidColumn {
   name: string;
@@ -33,16 +31,27 @@ export interface LaidNode {
   hidden: number;
   /** Table-level box: its columns are not listed (except traced ones). */
   collapsed: boolean;
+  /** A table listing all its columns, also those the SQL doesn't use (a row offers to hide them). */
+  full: boolean;
 }
 
 /**
  * What the diagram lists. `expanded`: nodes whose columns are shown ("all"
- * = every node). `show`: column keys always listed, also in collapsed nodes
- * (the traced column's path). Without it every node is expanded.
+ * = every node); a database table or view lists only the columns the SQL
+ * uses (`used`), unless it is in `full`. `show`: column keys always listed,
+ * also in collapsed nodes (the traced column's path). Without it every node
+ * is expanded.
  */
 export interface Display {
   expanded: Set<string> | "all";
   show?: Set<string> | null;
+  /** Tables listing every column, used or not. */
+  full?: Set<string>;
+}
+
+/** Columns of `node` the diagram lists when it is expanded: a table's used ones (all for other nodes). */
+export function usedColumns(node: LineageNode): LineageNode["columns"] {
+  return node.kind === "table" ? node.columns.filter((c) => c.used) : node.columns;
 }
 
 /** An edge as drawn: ends at a shown column or the node; parallel edges merged. */
@@ -105,27 +114,18 @@ export function layout(g: LineageGraph, direction: Direction = "lr", display: Di
     }
     if (!changed) break;
   }
-  // Columns used by an edge (database tables only show those).
-  const used = new Map<string, Set<string>>();
-  const mark = (n: string, c?: string) => {
-    if (c === undefined) return;
-    if (!used.has(n)) used.set(n, new Set());
-    used.get(n)!.add(c);
-  };
-  for (const e of edges) {
-    mark(e.from, e.from_column);
-    mark(e.to, e.to_column);
-  }
 
   const laid: LaidNode[] = nodes.map((node) => {
     const open = display.expanded === "all" || display.expanded.has(node.id);
     const shown = (c: string) => !!display.show?.has(colKey(node.id, c));
-    const fold = node.kind === "table" && node.columns.length > MAX_TABLE_COLUMNS;
-    const u = used.get(node.id);
-    const all = node.columns.map((c, index) => ({ name: c.name, index }));
-    const cols = open ? all.filter((c) => !fold || u?.has(c.name) || shown(c.name)) : all.filter((c) => shown(c.name));
+    // A table lists the columns the SQL uses; the others on request.
+    const table = node.kind === "table";
+    const unused = table ? node.columns.length - usedColumns(node).length : 0;
+    const full = open && unused > 0 && !!display.full?.has(node.id);
+    const all = node.columns.map((c, index) => ({ name: c.name, index, used: !table || !!c.used }));
+    const cols = (open ? all.filter((c) => full || c.used || shown(c.name)) : all.filter((c) => shown(c.name))).map(({ name, index }) => ({ name, index }));
     const hidden = node.columns.length - cols.length;
-    const rows = cols.length + (hidden > 0 ? 1 : 0);
+    const rows = cols.length + (hidden > 0 || full ? 1 : 0);
     return {
       node,
       x: 0,
@@ -136,6 +136,7 @@ export function layout(g: LineageGraph, direction: Direction = "lr", display: Di
       columns: cols.map((c) => ({ ...c, y: 0 })),
       hidden,
       collapsed: !open,
+      full,
     };
   });
   const byRank = new Map<number, LaidNode[]>();

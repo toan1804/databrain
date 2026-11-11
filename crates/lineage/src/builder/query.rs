@@ -1,5 +1,7 @@
 use databrain_connector_core::sql::dialect_for;
-use sqlparser::ast::{Expr, Ident, ObjectName, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement};
+use sqlparser::ast::{
+    Expr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
+};
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Span;
 
@@ -11,7 +13,11 @@ impl<'a> Builder<'a> {
 
     pub(super) fn query(&mut self, q: &Query, env: &Env) -> usize {
         let env = self.with_ctes(q, env);
-        self.set_expr(&q.body, &env)
+        match &*q.body {
+            // Its `ORDER BY` may name columns of the select's tables.
+            SetExpr::Select(sel) => self.select(sel, &env, q.order_by.as_ref()),
+            body => self.set_expr(body, &env),
+        }
     }
 
     /// `env` plus the CTEs of `q`'s `WITH` (each analyzed in turn).
@@ -30,7 +36,7 @@ impl<'a> Builder<'a> {
                     let names: Vec<String> =
                         if cte.alias.columns.is_empty() { anchor_names(&cte.query) } else { cte.alias.columns.iter().map(|c| c.name.value.clone()).collect() };
                     for c in names {
-                        self.g.nodes[p].columns.push(Column { name: c, span: None, expr: None });
+                        self.g.nodes[p].columns.push(Column::named(c));
                     }
                     p
                 });
@@ -94,7 +100,7 @@ impl<'a> Builder<'a> {
         let outs: Vec<String> = self.g.nodes[r].columns.iter().map(|c| c.name.clone()).collect();
         for (i, o) in outs.iter().enumerate() {
             let target = names.get(i).cloned().unwrap_or_else(|| o.clone());
-            let vc = self.ensure_col(node, &target);
+            let vc = self.col_or_add(node, &target);
             self.edge(r, Some(o.clone()), node, Some(vc), EdgeKind::Direct, None);
         }
         self.g.nodes[node].view = true;
@@ -117,7 +123,7 @@ impl<'a> Builder<'a> {
 
     pub(super) fn set_expr(&mut self, s: &SetExpr, env: &Env) -> usize {
         match s {
-            SetExpr::Select(sel) => self.select(sel, env),
+            SetExpr::Select(sel) => self.select(sel, env, None),
             SetExpr::Query(q) => self.query(q, env),
             SetExpr::SetOperation { left, op, set_quantifier, right } => {
                 let (l, r) = (self.set_expr(left, env), self.set_expr(right, env));
@@ -160,7 +166,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    pub(super) fn select(&mut self, sel: &Select, env: &Env) -> usize {
+    pub(super) fn select(&mut self, sel: &Select, env: &Env, order_by: Option<&OrderBy>) -> usize {
         let n = self.node(NodeKind::Subquery, "SELECT".into(), None);
         let mut sources: Vec<Source> = Vec::new();
         for twj in &sel.from {
@@ -214,6 +220,17 @@ impl<'a> Builder<'a> {
                 let at = self.g.edges.len();
                 self.rows(n, f, EdgeKind::Filter, &sources, &scope_env);
                 self.detail_since(at, format!("{kw} {f}"));
+            }
+        }
+        // Grouped or sorted by: used, though no value flows from it.
+        if let GroupByExpr::Expressions(exprs, _) = &sel.group_by {
+            for e in exprs {
+                self.mark_refs(e, n, &sources);
+            }
+        }
+        if let Some(OrderBy { kind: OrderByKind::Expressions(exprs), .. }) = order_by {
+            for o in exprs {
+                self.mark_refs(&o.expr, n, &sources);
             }
         }
         n

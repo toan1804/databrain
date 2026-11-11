@@ -418,3 +418,75 @@ fn views_are_expanded() {
     let g = analyze("create or replace view v_big as select id from customers; select id from v_big", K::Postgres, &cat_with_views);
     assert!(!edges(&g).iter().any(|e| e.contains("orders")), "{:#?}", edges(&g));
 }
+
+/// Columns of `table` the diagram lists (those the SQL uses).
+fn used(g: &Lineage, table: &str) -> Vec<String> {
+    let n = g.nodes.iter().find(|n| n.kind == NodeKind::Table && n.name == table).unwrap_or_else(|| panic!("no {table}"));
+    n.columns.iter().filter(|c| c.used).map(|c| c.name.clone()).collect()
+}
+
+#[test]
+fn only_the_columns_the_sql_uses_are_marked_used() {
+    // Selected, joined on, filtered, grouped and ordered by; the rest isn't.
+    let g = run("select c.name, sum(o.amount) total from orders o join customers c on c.id = o.customer_id \
+         where o.status = 'paid' group by c.name, c.country order by o.created_at");
+    assert_eq!(used(&g, "sales.orders"), vec!["customer_id", "amount", "status", "created_at"]);
+    assert_eq!(used(&g, "sales.customers"), vec!["id", "name", "country"]);
+    let g = run("select name from customers");
+    assert_eq!(used(&g, "sales.customers"), vec!["name"]);
+    // All columns are still known (for `*` and resolving names).
+    assert_eq!(g.nodes.iter().find(|n| n.name == "sales.customers").unwrap().columns.len(), 3);
+    // An output name in ORDER BY is not a table column.
+    let g = run("select upper(name) as shout from customers order by shout");
+    assert_eq!(used(&g, "sales.customers"), vec!["name"]);
+    // Only in a window or a WHERE subquery.
+    let g = run("select id, row_number() over (partition by country order by name) from customers \
+         where id in (select customer_id from orders where amount > 0)");
+    assert_eq!(used(&g, "sales.customers"), vec!["id", "name", "country"]);
+    assert_eq!(used(&g, "sales.orders"), vec!["customer_id", "amount"]);
+}
+
+#[test]
+fn star_uses_every_column_it_returns() {
+    let g = run("select * from customers");
+    assert_eq!(used(&g, "sales.customers"), vec!["id", "name", "country"]);
+    let g = run("select c.*, o.amount from customers c join orders o on o.customer_id = c.id");
+    assert_eq!(used(&g, "sales.customers"), vec!["id", "name", "country"]);
+    assert_eq!(used(&g, "sales.orders"), vec!["customer_id", "amount"]);
+    // A `*` in a CTE or subquery: only what is used further on.
+    let g = run("with c as (select * from customers) select name from c where c.country = 'VN'");
+    assert_eq!(used(&g, "sales.customers"), vec!["name", "country"]);
+    let g = run("select s.amount from (select * from orders) s order by s.created_at");
+    assert_eq!(used(&g, "sales.orders"), vec!["amount", "created_at"]);
+    // ... and everything when it is returned as is.
+    let g = run("with c as (select * from customers) select * from c");
+    assert_eq!(used(&g, "sales.customers"), vec!["id", "name", "country"]);
+}
+
+#[test]
+fn written_tables_and_views_mark_what_they_use() {
+    // INSERT … SELECT / CTAS: the target's written columns and what feeds them.
+    let g = run("insert into customers (name) select status from orders where amount > 0");
+    assert_eq!(used(&g, "sales.customers"), vec!["name"]);
+    assert_eq!(used(&g, "sales.orders"), vec!["amount", "status"]);
+    let g = run("create table snap as select * from customers");
+    assert_eq!(used(&g, "sales.customers"), vec!["id", "name", "country"]);
+    assert_eq!(used(&g, "snap"), vec!["id", "name", "country"]);
+    // UPDATE / MERGE targets: the columns set and matched on.
+    let g = run("update customers c set name = o.status from orders o where o.customer_id = c.id");
+    assert_eq!(used(&g, "sales.customers"), vec!["id", "name"]);
+    assert_eq!(used(&g, "sales.orders"), vec!["customer_id", "status"]);
+    let g = run("merge into customers c using orders o on o.customer_id = c.id when matched then update set country = o.status");
+    assert_eq!(used(&g, "sales.customers"), vec!["id", "country"]);
+    assert_eq!(used(&g, "sales.orders"), vec!["customer_id", "status"]);
+    // A view: the columns read from it, and in its definition only what they need
+    // (plus its joins and filters).
+    let g = analyze("select doubled from v_big", K::Postgres, &cat_with_views);
+    assert_eq!(used(&g, "sales.v_big"), vec!["doubled"]);
+    assert_eq!(used(&g, "sales.orders"), vec!["customer_id", "amount"]);
+    assert_eq!(used(&g, "sales.customers"), vec!["id"]);
+    let g = analyze("select * from v_big", K::Postgres, &cat_with_views);
+    assert_eq!(used(&g, "sales.v_big"), vec!["id", "doubled", "name"]);
+    assert_eq!(used(&g, "sales.orders"), vec!["id", "customer_id", "amount"]);
+    assert_eq!(used(&g, "sales.customers"), vec!["id", "name"]);
+}

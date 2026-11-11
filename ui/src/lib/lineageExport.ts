@@ -82,12 +82,15 @@ function path(a: { x: number; y: number }, b: { x: number; y: number }, tb = fal
 
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
-/** Text of the row under the listed columns ("" = none). */
-function moreLabel(n: LaidNode): string {
+/** Text of the row under the listed columns ("" = none). `inner`: in the tab (the row is a button). */
+export function moreLabel(n: LaidNode, inner = false): string {
+  if (n.full) return inner ? "hide unused columns" : "";
   if (n.hidden <= 0) return "";
   const s = n.hidden === 1 ? "" : "s";
-  if (!n.collapsed || n.columns.length) return `+${n.hidden} more column${s}`;
-  return `${n.hidden} column${s}`;
+  if (n.collapsed && !n.columns.length) return `${n.hidden} column${s}`;
+  // An expanded table: the columns the SQL doesn't use.
+  if (!n.collapsed && n.node.kind === "table") return `+${n.hidden} unused column${s}`;
+  return `+${n.hidden} more column${s}`;
 }
 
 export interface SvgOptions {
@@ -141,11 +144,14 @@ export function toSvg(g: LineageGraph, l: Layout = layout(g), opts: SvgOptions =
           `<title>${xml(col.name + (lc?.expr ? ` = ${lc.expr}` : ""))}</title></g>`,
       );
     }
-    const more = moreLabel(n);
+    const more = moreLabel(n, opts.inner);
     if (more) {
       const y = n.y + HEADER_H + n.columns.length * ROW_H + ROW_H / 2 + 7;
-      const hint = opts.inner && n.collapsed ? " · click to show" : "";
-      out.push(`<text data-head="1" x="${n.x + 10}" y="${y}" font-family="${xml(c.font)}" font-size="10.5" fill="${c.muted}">${xml(more + hint)}</text>`);
+      // Collapsed: click to list the columns. Expanded table: click to list
+      // the unused ones too, or to hide them again.
+      const hint = !opts.inner ? "" : n.collapsed ? " · click to show" : n.full ? "" : " · click to list";
+      const attr = n.collapsed ? 'data-head="1"' : 'data-more="1" style="cursor:pointer"';
+      out.push(`<text ${attr} x="${n.x + 10}" y="${y}" font-family="${xml(c.font)}" font-size="10.5" fill="${c.muted}">${xml(more + hint)}</text>`);
     }
     out.push("</g>");
   }

@@ -110,6 +110,15 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
       else next.add(id);
       return next.size === all.length && all.length > 0 ? "all" : next;
     });
+  /** Tables listing every column, also those the SQL doesn't use (by default only the used ones). */
+  const [full, setFull] = useState<Set<string>>(new Set<string>());
+  const toggleFull = (id: string) =>
+    setFull((f) => {
+      const next = new Set(f);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   const setDir = (d: Direction) => {
     localStorage.setItem("db.lineage.dir", d);
     setDirState(d);
@@ -146,6 +155,7 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
         setFocus(n ? { node: n.id, column: want!.column } : null);
         setPos({});
         setExpanded(new Set());
+        setFull(new Set());
       }
     } catch (e) {
       if (my === seq.current) setLoad({ status: "error", message: toError(e).message });
@@ -167,7 +177,7 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
   const traced = useMemo(() => (shown && focus ? trace(shown, focus.node, focus.column) : null), [shown, focus]);
   // Collapsed tables still list the traced column's path.
   // The chain is table level: its boxes don't list columns.
-  const base = useMemo(() => (shown ? layout(shown, dir, { expanded: isChain ? new Set<string>() : expanded, show: traced?.cols }) : null), [shown, dir, expanded, traced, isChain]);
+  const base = useMemo(() => (shown ? layout(shown, dir, { expanded: isChain ? new Set<string>() : expanded, show: traced?.cols, full }) : null), [shown, dir, expanded, traced, isChain, full]);
   const lay = useMemo(() => (base ? withPositions(base, pos) : null), [base, pos]);
   const appearance = useStore((s) => s.appearance);
   const colors = useMemo(themeColors, [theme, appearance]);
@@ -340,7 +350,7 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
             className="btn-ghost py-1"
             disabled={!graph}
             onClick={() => setExpanded((e) => (e === "all" ? new Set() : "all"))}
-            title={expanded === "all" ? "Show tables only (click a table to list its columns)" : "List the columns of every table"}
+            title={expanded === "all" ? "Show tables only (click a table to list its columns)" : "List the columns the SQL uses in every table"}
             aria-label={expanded === "all" ? "Tables only" : "All columns"}
           >
             {expanded === "all" ? <Rows3 size={13} /> : <Columns3 size={13} />} {!iconOnly && (expanded === "all" ? "Tables only" : "All columns")}
@@ -443,6 +453,8 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
             const column = target.closest("[data-col]")?.getAttribute("data-col") ?? undefined;
             // A column: trace it. The header (or "N columns"): show/hide the table's columns.
             if (column !== undefined) return setFocus((f) => (f && f.node === node && f.column === column ? null : { node, column }));
+            // "+N unused columns" / "hide unused columns": list a table's other columns, or hide them again.
+            if (target.closest("[data-more]")) return toggleFull(node);
             if (target.closest("[data-head]") || !hit.getAttribute("data-col")) toggleNode(node);
           }}
           onMouseLeave={() => (drag.current = null)}
@@ -500,7 +512,7 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
               <Legend color={colors.warning} label="filter" dash="5 4" />
               <Legend color={colors.warning} label="join" dash="2 3" />
               <span>
-                {isChain ? "· click a table for its column lineage" : "· click a table to list its columns, a column to trace it"} · drag a table to move it · {kbd("⌘")}+scroll to zoom
+                {isChain ? "· click a table for its column lineage" : "· click a table to list the columns the SQL uses, a column to trace it"} · drag a table to move it · {kbd("⌘")}+scroll to zoom
               </span>
             </div>
           )}

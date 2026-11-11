@@ -1,16 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { layout, trace, colKey, anchor, withPositions, normalize, shownEdges, chainGraph } from "./lineageLayout";
-import { LIGHT, cssColor, exportText, toDrawio, toMermaid, toDot, toSvg } from "./lineageExport";
+import { LIGHT, cssColor, exportText, moreLabel, toDrawio, toMermaid, toDot, toSvg } from "./lineageExport";
 import type { LineageGraph } from "./types";
 
 // What the backend returns for:
 //   with paid as (select * from orders where status = 'paid')
 //   select c.name, sum(p.amount) total from paid p join customers c on c.id = p.customer_id group by 1
+// (orders.id goes through the `*` but nothing uses it.)
 const g: LineageGraph = {
   nodes: [
-    { id: "n0", kind: "table", name: "sales.orders", columns: ["id", "customer_id", "amount", "status"].map((name) => ({ name })), columns_known: true, written: false },
+    { id: "n0", kind: "table", name: "sales.orders", columns: ["id", "customer_id", "amount", "status"].map((name) => ({ name, used: name !== "id" })), columns_known: true, written: false },
     { id: "n1", kind: "cte", name: "paid", columns: ["id", "customer_id", "amount", "status"].map((name) => ({ name })), columns_known: true, written: false, statement: 0 },
-    { id: "n2", kind: "table", name: 'sales."Customers" <&>', columns: [{ name: "id" }, { name: "name" }], columns_known: true, written: false },
+    { id: "n2", kind: "table", name: 'sales."Customers" <&>', columns: [{ name: "id", used: true }, { name: "name", used: true }], columns_known: true, written: false },
     { id: "n3", kind: "result", name: "Result", columns: [{ name: "name" }, { name: "total", expr: 'sum(p.amount) "x"' }], columns_known: true, written: false, statement: 0 },
   ],
   edges: [
@@ -40,15 +41,49 @@ describe("lineage layout", () => {
     expect(anchor(l, "n3", undefined, "in")!.y).toBeLessThan(anchor(l, "n3", "name", "in")!.y);
   });
 
-  it("folds unused columns of wide tables", () => {
+  it("a table lists only the columns the SQL uses; the others on request", () => {
+    const n = layout(g).byId.get("n0")!;
+    expect(n.columns.map((c) => c.name)).toEqual(["customer_id", "amount", "status"]);
+    expect(n.hidden).toBe(1);
+    expect(moreLabel(n)).toBe("+1 unused column");
+    const svg = toSvg(g, layout(g), { inner: true });
+    expect(svg).toContain('data-more="1"');
+    expect(svg).toContain("+1 unused column · click to list");
+    // Narrow or wide alike: 2 of 40 used.
     const wide: LineageGraph = {
       ...g,
-      nodes: [{ ...g.nodes[0], columns: Array.from({ length: 40 }, (_, i) => ({ name: i === 7 ? "amount" : `c${i}` })) }, g.nodes[3]],
+      nodes: [{ ...g.nodes[0], columns: Array.from({ length: 40 }, (_, i) => ({ name: i === 7 ? "amount" : `c${i}`, used: i === 7 || i === 3 })) }, g.nodes[3]],
       edges: [{ from: "n0", from_column: "amount", to: "n3", to_column: "total", kind: "aggregate" }],
     };
-    const n = layout(wide).byId.get("n0")!;
-    expect(n.columns.map((c) => c.name)).toEqual(["amount"]);
-    expect(n.hidden).toBe(39);
+    expect(layout(wide).byId.get("n0")!.columns.map((c) => c.name)).toEqual(["c3", "amount"]);
+    expect(layout(wide).byId.get("n0")!.hidden).toBe(38);
+    // "Show all" for one table: every column, and a row to hide them again.
+    const all = layout(g, "lr", { expanded: "all", full: new Set(["n0"]) }).byId.get("n0")!;
+    expect(all.columns.map((c) => c.name)).toEqual(["id", "customer_id", "amount", "status"]);
+    expect(all.full).toBe(true);
+    expect(moreLabel(all, true)).toBe("hide unused columns");
+    expect(moreLabel(all)).toBe("");
+    // CTEs, subqueries and results list all their columns; so does a table whose columns are all used.
+    expect(layout(g).byId.get("n1")!.columns).toHaveLength(4);
+    expect(layout(g, "lr", { expanded: "all", full: new Set(["n2"]) }).byId.get("n2")!.full).toBe(false);
+    // A traced column is listed even when unused (with the filter on its path).
+    const t = trace(g, "n1", "id");
+    expect(layout(g, "lr", { expanded: new Set(), show: t.cols }).byId.get("n0")!.columns.map((c) => c.name)).toEqual(["id", "status"]);
+  });
+
+  it("select *: every column of the table is used, so every column is listed", () => {
+    const star: LineageGraph = {
+      ...g,
+      nodes: [{ ...g.nodes[2], columns: g.nodes[2].columns.map((c) => ({ ...c, used: true })) }, g.nodes[3]],
+      edges: [
+        { from: "n2", from_column: "id", to: "n3", to_column: "name", kind: "direct" },
+        { from: "n2", from_column: "name", to: "n3", to_column: "total", kind: "direct" },
+      ],
+    };
+    const n = layout(star).byId.get("n2")!;
+    expect(n.columns.map((c) => c.name)).toEqual(["id", "name"]);
+    expect(n.hidden).toBe(0);
+    expect(moreLabel(n)).toBe("");
   });
 
   it("traces a column up to its sources and filters, and down", () => {
