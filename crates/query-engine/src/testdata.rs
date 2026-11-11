@@ -17,6 +17,13 @@
 //!   1,000 distinct keys), so the rows satisfy the constraint. The user is
 //!   told when a table has foreign keys, and when a parent has no rows.
 //! - A seed makes the rows repeatable.
+//! - "Generate with AI" ([`QueryEngine::test_data_ai_ask`], then
+//!   [`QueryEngine::generate_test_data_with`]): an AI model writes a few
+//!   hundred realistic rows for the text columns (or every column it can),
+//!   from the table's structure only. Each value is checked against its
+//!   column (type, length, allowed values, NOT NULL, uniqueness); one that
+//!   doesn't fit is made up as usual. Keys and foreign keys never come
+//!   from the AI.
 
 use std::collections::HashSet;
 
@@ -55,6 +62,12 @@ pub struct TestDataColumn {
     pub database_fills: bool,
     /// What goes in, in words ("emails", "numbers counting up").
     pub generator: String,
+    /// Free text (names, emails, descriptions): what "Generate with AI"
+    /// writes when it writes only text.
+    pub ai_text: bool,
+    /// The AI may write it when it writes every column it can: not keys,
+    /// foreign keys, UUIDs or bytes.
+    pub ai_ok: bool,
     /// The parent table its values come from (`schema.table.column`).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -123,6 +136,97 @@ pub struct TestData {
     pub table: String,
 }
 
+/// Most rows the AI writes for one generation; more rows reuse them.
+pub const MAX_AI_ROWS: u32 = 500;
+
+/// A column the AI writes, and what its values must respect.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiColumn {
+    pub name: String,
+    pub data_type: String,
+    pub nullable: bool,
+    pub unique: bool,
+    pub max_chars: Option<usize>,
+    /// Allowed values (enums, `bit(1)`); empty: any.
+    pub choices: Vec<String>,
+    /// What DataBrain would put in it otherwise ("emails (up to 80 characters)").
+    pub hint: String,
+}
+
+/// What to ask the AI for: the table's structure, never its rows.
+#[derive(Debug, Clone)]
+pub struct AiAsk {
+    pub schema: String,
+    pub name: String,
+    /// The table, quoted.
+    pub table: String,
+    pub dialect: String,
+    /// CHECK constraints of the table that name a column the AI writes
+    /// (the raw DDL isn't sent: defaults, index filters and comments
+    /// would go with it).
+    pub checks: Vec<AiCheck>,
+    pub columns: Vec<AiColumn>,
+    /// The table's other columns and what fills them, without naming
+    /// other tables.
+    pub others: Vec<String>,
+    /// Rows to write.
+    pub rows: usize,
+}
+
+/// A CHECK constraint, and the (lower-case) columns it names.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiCheck {
+    pub sql: String,
+    pub columns: Vec<String>,
+}
+
+/// Rows the AI wrote: `rows[r][c]` is `columns[c]`'s value (`None`: NULL).
+#[derive(Debug, Clone, Default)]
+pub struct AiSample {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+}
+
+/// A table's plan, generators and the columns a spec fills.
+struct Prepared {
+    kind: ConnectorKind,
+    plan: TestDataPlan,
+    gens: Vec<Option<Gen>>,
+    /// Indexes into `plan.columns`.
+    chosen: Vec<usize>,
+    /// Lower-case names of columns with a one-column UNIQUE constraint.
+    unique: HashSet<String>,
+    ddl: Option<String>,
+}
+
+/// What fills a column, in words for the AI (no other table named).
+fn fill_words(c: &TestDataColumn, chosen: bool) -> &'static str {
+    match (chosen, c.parent.is_some(), c.primary_key) {
+        (false, _, _) => "left to the database",
+        (true, true, _) => "existing keys of a parent table",
+        (true, false, true) => "the primary key, counting up",
+        (true, false, false) => "made up by DataBrain",
+    }
+}
+
+impl Prepared {
+    /// Position in `chosen` of the counting key column.
+    fn key(&self) -> Option<usize> {
+        self.chosen.iter().position(|&i| self.plan.columns[i].primary_key)
+    }
+
+    /// Positions in `chosen` the AI writes: text only, or every column it may.
+    fn ai_positions(&self, all_columns: bool) -> Vec<usize> {
+        let key = self.key();
+        (0..self.chosen.len())
+            .filter(|&k| {
+                let c = &self.plan.columns[self.chosen[k]];
+                Some(k) != key && c.parent.is_none() && if all_columns { c.ai_ok } else { c.ai_text }
+            })
+            .collect()
+    }
+}
+
 impl QueryEngine {
     /// Columns of a table and what each would get.
     pub async fn test_data_plan(&self, connection_id: &str, schema: &str, name: &str) -> Result<TestDataPlan> {
@@ -139,6 +243,69 @@ impl QueryEngine {
     /// and, for foreign keys, existing keys of the parent tables; writes
     /// nothing.
     pub async fn generate_test_data(&self, connection_id: &str, schema: &str, name: &str, spec: &TestDataSpec) -> Result<TestData> {
+        self.generate_test_data_with(connection_id, schema, name, spec, None).await
+    }
+
+    /// What to ask the AI for to fill `spec`'s text columns (or, with
+    /// `all_columns`, every column it may write): `None` when there is none.
+    pub async fn test_data_ai_ask(
+        &self,
+        connection_id: &str,
+        schema: &str,
+        name: &str,
+        spec: &TestDataSpec,
+        all_columns: bool,
+        ai_rows: u32,
+    ) -> Result<Option<AiAsk>> {
+        let p = self.prepare(connection_id, schema, name, spec).await?;
+        let positions = p.ai_positions(all_columns);
+        if positions.is_empty() {
+            return Ok(None);
+        }
+        let columns = positions
+            .iter()
+            .map(|&k| {
+                let i = p.chosen[k];
+                let c = &p.plan.columns[i];
+                let g = p.gens[i].as_ref().expect("supported");
+                AiColumn {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                    unique: p.unique.contains(&c.name.to_lowercase()),
+                    max_chars: match g {
+                        Gen::Text { max, .. } => *max,
+                        _ => None,
+                    },
+                    choices: match g {
+                        Gen::Choice(v) => v.clone(),
+                        _ => vec![],
+                    },
+                    hint: c.generator.clone(),
+                }
+            })
+            .collect();
+        let others = p
+            .plan
+            .columns
+            .iter()
+            .filter(|c| !positions.iter().any(|&k| p.plan.columns[p.chosen[k]].name == c.name))
+            .map(|c| format!("{} {} ({})", c.name, c.data_type, fill_words(c, p.chosen.iter().any(|&i| p.plan.columns[i].name == c.name))))
+            .collect();
+        let ai_names: Vec<String> = positions.iter().map(|&k| p.plan.columns[p.chosen[k]].name.to_lowercase()).collect();
+        Ok(Some(AiAsk {
+            schema: schema.to_string(),
+            name: name.to_string(),
+            table: p.plan.table.clone(),
+            dialect: p.kind.dialect_name().to_string(),
+            checks: check_constraints(p.ddl.as_deref(), &p.plan.columns).into_iter().filter(|c| c.columns.iter().any(|n| ai_names.contains(n))).collect(),
+            columns,
+            others,
+            rows: ai_rows.clamp(1, MAX_AI_ROWS).min(spec.rows) as usize,
+        }))
+    }
+
+    async fn prepare(&self, connection_id: &str, schema: &str, name: &str, spec: &TestDataSpec) -> Result<Prepared> {
         if spec.rows == 0 || spec.rows > MAX_TEST_ROWS {
             return Err(EngineError::new("invalid", format!("Choose between 1 and {MAX_TEST_ROWS} rows")));
         }
@@ -161,6 +328,35 @@ impl QueryEngine {
         if chosen.is_empty() {
             return Err(EngineError::new("invalid", "No column to fill: every column is left to the database or has a type DataBrain can't make up"));
         }
+        let mut unique = unique_columns(ddl.as_deref(), &detail.columns);
+        // Unique indexes as the server reports them (SQLite and DuckDB keep
+        // them out of the table's DDL).
+        if let Ok(layout) = self.table_layout(connection_id, schema, name).await {
+            for ix in layout.indexes.iter().filter(|ix| ix.unique && !ix.primary) {
+                if let [one] = ix.columns.as_slice()
+                    && let Some(c) = index_column(one)
+                    && detail.columns.iter().any(|x| x.name.to_lowercase() == c)
+                {
+                    unique.insert(c);
+                }
+            }
+        }
+        Ok(Prepared { kind, plan, gens, chosen, unique, ddl })
+    }
+
+    /// Rows for `spec`; with `sample`, the AI's values go into its columns
+    /// where they fit.
+    pub async fn generate_test_data_with(
+        &self,
+        connection_id: &str,
+        schema: &str,
+        name: &str,
+        spec: &TestDataSpec,
+        sample: Option<&AiSample>,
+    ) -> Result<TestData> {
+        let prepared = self.prepare(connection_id, schema, name, spec).await?;
+        let Prepared { kind, plan, gens, chosen, unique, .. } = &prepared;
+        let (kind, plan, gens, chosen) = (*kind, plan, gens, chosen);
         let mut notes = plan.warnings.clone();
         let seed = spec.seed.unwrap_or_else(new_seed);
         let mut rng = Rng(seed);
@@ -171,7 +367,7 @@ impl QueryEngine {
 
         // The first primary key column counts up past the current maximum
         // (or row count): unique within the rows and against the table.
-        if let Some(k) = chosen.iter().position(|&i| plan.columns[i].primary_key) {
+        if let Some(k) = prepared.key() {
             let col = &plan.columns[chosen[k]];
             let maker = gens[chosen[k]].clone().expect("supported");
             let q = quote_ident(kind, &col.name);
@@ -254,10 +450,41 @@ impl QueryEngine {
                 Column::new(&c.name, ty, &c.data_type)
             })
             .collect();
+        // The AI's values, in the columns still made up at random.
+        if let Some(sample) = sample.filter(|s| !s.rows.is_empty()) {
+            let mut used = Vec::new();
+            for (k, &i) in chosen.iter().enumerate() {
+                let c = &plan.columns[i];
+                let Some(col) = sample.columns.iter().position(|n| n.eq_ignore_ascii_case(&c.name)) else { continue };
+                if let Source::Random(g) = &sources[k] {
+                    sources[k] = Source::Sample { col, fallback: g.clone(), unique: c.primary_key || unique.contains(&c.name.to_lowercase()) };
+                    used.push(c.name.clone());
+                }
+            }
+            if !used.is_empty() {
+                let n = sample.rows.len();
+                let reuse = if (spec.rows as usize) > n { format!("; the other {} rows reuse them", spec.rows as usize - n) } else { String::new() };
+                notes.push(format!(
+                    "AI wrote {n} row{} for {}{reuse}. The seed repeats only the other columns.",
+                    if n == 1 { "" } else { "s" },
+                    used.join(", ")
+                ));
+            }
+        }
+
         let nullable: Vec<bool> = chosen.iter().map(|&i| plan.columns[i].nullable && !plan.columns[i].primary_key).collect();
-        let batches = generate(&columns, &sources, &nullable, &parents, spec.rows as usize, spec.null_percent.min(100), &mut rng)?;
+        let mut misfits = 0usize;
+        let batches = generate(&columns, &sources, &nullable, &parents, sample, spec.rows as usize, spec.null_percent.min(100), &mut rng, &mut misfits)?;
+        if misfits > 0 {
+            notes.push(format!(
+                "{misfits} AI value{} didn't fit {} column (type, length, allowed values, NOT NULL or uniqueness) and {} made up instead.",
+                if misfits == 1 { "" } else { "s" },
+                if misfits == 1 { "its" } else { "their" },
+                if misfits == 1 { "was" } else { "were" }
+            ));
+        }
         let schema = databrain_connector_core::value::schema_for(&columns);
-        Ok(TestData { rows: LoadRows { schema, batches }, seed, notes, table: plan.table })
+        Ok(TestData { rows: LoadRows { schema, batches }, seed, notes, table: plan.table.clone() })
     }
 
     fn test_data_kind(&self, connection_id: &str) -> Result<ConnectorKind> {
@@ -593,6 +820,8 @@ fn plan_for(kind: ConnectorKind, schema: &str, name: &str, cols: &[ColumnInfo], 
                 (None, Some(g)) => g.describe(),
                 (None, None) => "left to the database".into(),
             },
+            ai_text: parent.is_none() && !c.is_primary_key && matches!(maker, Some(Gen::Text { .. })),
+            ai_ok: parent.is_none() && !c.is_primary_key && matches!(&maker, Some(g) if !matches!(g, Gen::Uuid | Gen::Binary { .. })),
             parent,
             note,
         });
@@ -868,6 +1097,12 @@ enum Source {
         slot: usize,
         unique: bool,
     },
+    /// Column `col` of the AI's rows, checked; `fallback` when it doesn't fit.
+    Sample {
+        col: usize,
+        fallback: Gen,
+        unique: bool,
+    },
     Null,
 }
 
@@ -1020,17 +1255,235 @@ fn cell_value(t: ColType, s: &str) -> Value {
     v.unwrap_or(Value::Null)
 }
 
+/// An AI value as the column's value, or `None` when it doesn't fit (type,
+/// range, length, allowed values).
+fn sample_value(g: &Gen, raw: &str) -> Option<Value> {
+    let s = raw.trim();
+    match g {
+        // Bytes too: some types count bytes (Oracle VARCHAR2, SQL Server varchar).
+        Gen::Text { max, .. } => (!s.is_empty() && max.is_none_or(|m| s.len() <= m)).then(|| Value::Text(s.to_string())),
+        Gen::Choice(options) => options.iter().find(|o| o.eq_ignore_ascii_case(s)).map(|o| Value::Text(o.clone())),
+        Gen::Int { min, max } => {
+            // The generator's range: within the type, the sign and any CHECK it implies.
+            let v: i64 = s.parse().ok()?;
+            (*min..=*max).contains(&v).then_some(Value::Int(v))
+        }
+        Gen::Float => s.parse::<f64>().ok().filter(|f| f.is_finite()).map(Value::Float),
+        Gen::Decimal { int_digits, scale } => {
+            let body = s.strip_prefix('-').unwrap_or(s);
+            let (ip, fp) = body.split_once('.').unwrap_or((body, ""));
+            let digits = |t: &str| t.bytes().all(|b| b.is_ascii_digit());
+            let ip_len = ip.trim_start_matches('0').len();
+            (!ip.is_empty() && digits(ip) && digits(fp) && ip_len <= *int_digits as usize && fp.len() <= *scale as usize).then(|| Value::Text(s.to_string()))
+        }
+        Gen::Json => serde_json::from_str::<serde_json::Value>(s).ok().map(|_| Value::Text(s.to_string())),
+        Gen::Inet => s.parse::<std::net::IpAddr>().ok().map(|_| Value::Text(s.to_string())),
+        Gen::Date | Gen::Timestamp | Gen::TimestampTz if !real_date(s) => None,
+        // Years every engine's types hold (MySQL TIMESTAMP 1970–2038, SQL Server smalldatetime 1900–2079).
+        Gen::Date if !s.get(..4).and_then(|y| y.parse::<i32>().ok()).is_some_and(|y| (1901..=2078).contains(&y)) => None,
+        Gen::Timestamp | Gen::TimestampTz if !s.get(..4).and_then(|y| y.parse::<i32>().ok()).is_some_and(|y| (1971..=2037).contains(&y)) => None,
+        Gen::Bool | Gen::Date | Gen::Timestamp | Gen::TimestampTz | Gen::Time => match cell_value(g.col_type(), s) {
+            Value::Null => None,
+            v => Some(v),
+        },
+        Gen::Uuid | Gen::Binary { .. } => None,
+    }
+}
+
+/// `YYYY-MM-DD…` names a day of the calendar (the parser rolls 02-30 over).
+fn real_date(s: &str) -> bool {
+    let part = |r: std::ops::Range<usize>| s.get(r).and_then(|t| t.parse::<i64>().ok());
+    let (Some(y), Some(m), Some(d)) = (part(0..4), part(5..7), part(8..10)) else { return false };
+    if !(1..=12).contains(&m) || d < 1 {
+        return false;
+    }
+    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    d <= days_from_civil(ny, nm as u32, 1) - days_from_civil(y, m as u32, 1)
+}
+
+/// `t`, or a variant of it not given yet (`ann+2@x.com`, `Ann 2`) that
+/// still fits the column; `None` when there is none.
+fn distinct(seen: &mut HashSet<String>, t: String, g: &Gen) -> Option<Value> {
+    if seen.insert(t.clone()) {
+        return Some(Value::Text(t));
+    }
+    let max = match g {
+        Gen::Text { max, .. } => *max,
+        _ => return None,
+    };
+    for n in 2..1000 {
+        let v = match t.split_once('@') {
+            Some((local, domain)) => format!("{local}+{n}@{domain}"),
+            None => format!("{t} {n}"),
+        };
+        if max.is_some_and(|m| v.chars().count() > m) {
+            return None;
+        }
+        if seen.insert(v.clone()) {
+            return Some(Value::Text(v));
+        }
+    }
+    None
+}
+
+/// Lower-case names of columns with a one-column UNIQUE constraint or
+/// unique index in the DDL (`email text UNIQUE`, `UNIQUE (email)`,
+/// `UNIQUE KEY uq (email)`, `CREATE UNIQUE INDEX … ON t (email)`).
+fn unique_columns(ddl: Option<&str>, cols: &[ColumnInfo]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Some(ddl) = ddl else { return out };
+    let norm = |s: &str| s.trim().trim_matches(['"', '`', '[', ']']).to_lowercase();
+    let is_col = |n: &str| cols.iter().any(|c| c.name.to_lowercase() == n);
+    // The one column of a `(a)` list, when it is one of the table's.
+    let one = |list: &str| -> Option<String> {
+        match top_level(list, ',').as_slice() {
+            [n] => index_column(n).filter(|n| is_col(n)),
+            _ => None,
+        }
+    };
+    let parens = |t: &str| balanced(t).map(str::to_string);
+    for stmt in top_level(ddl, ';') {
+        let upper = stmt.to_ascii_uppercase();
+        let words: Vec<&str> = upper.split_whitespace().collect();
+        if words.first() == Some(&"CREATE") && words.contains(&"UNIQUE") && words.contains(&"INDEX") {
+            if let Some(on) = upper.find(" ON ")
+                && let Some(n) = parens(&stmt[on..]).and_then(|l| one(&l))
+            {
+                out.insert(n);
+            }
+            continue;
+        }
+        let Some(open) = stmt.find('(') else { continue };
+        let Some(close) = stmt.rfind(')') else { continue };
+        if close <= open {
+            continue;
+        }
+        for def in top_level(&stmt[open + 1..close], ',') {
+            let def = def.trim();
+            let du = def.to_ascii_uppercase();
+            let Some(at) = du.find("UNIQUE") else { continue };
+            let first = du.split_whitespace().next().unwrap_or("");
+            if matches!(first, "UNIQUE" | "CONSTRAINT" | "PRIMARY" | "KEY" | "INDEX") {
+                // A table constraint: its column list.
+                if let Some(n) = parens(&def[at..]).and_then(|l| one(&l)) {
+                    out.insert(n);
+                }
+            } else if let Some(name) = def.split_whitespace().next().map(norm)
+                && is_col(&name)
+            {
+                out.insert(name);
+            }
+        }
+    }
+    out
+}
+
+/// The text inside the first parentheses of `t`, nested ones included.
+fn balanced(t: &str) -> Option<&str> {
+    let open = t.find('(')?;
+    let mut depth = 0;
+    for (i, ch) in t[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&t[open + 1..open + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The column an index key part is on (lower case): `"email"`, `[email] DESC`,
+/// `` `email`(50) `` (MySQL prefix), `lower(email)`.
+fn index_column(part: &str) -> Option<String> {
+    let norm = |s: &str| s.trim().trim_matches(['"', '`', '[', ']']).to_lowercase();
+    let mut t = part.trim();
+    for suffix in [" DESC", " ASC", " desc", " asc"] {
+        t = t.strip_suffix(suffix).unwrap_or(t).trim_end();
+    }
+    let name = match t.find('(') {
+        Some(0) => return None,
+        // A function of one column: `lower(email)`.
+        Some(o) if t[..o].trim_end().chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => balanced(t)?,
+        // A prefix length: `email`(50).
+        Some(o) => &t[..o],
+        None => t,
+    };
+    let n = norm(name);
+    (!n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ' ' || c == '$')).then_some(n)
+}
+
+/// CHECK constraints in the DDL, with the table's columns each names.
+fn check_constraints(ddl: Option<&str>, cols: &[TestDataColumn]) -> Vec<AiCheck> {
+    let Some(ddl) = ddl else { return vec![] };
+    let upper = ddl.to_ascii_uppercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = upper[from..].find("CHECK") {
+        let at = from + at;
+        from = at + 5;
+        // The word, not part of one (`CHECKSUM`).
+        let before_ok = at == 0 || !upper.as_bytes()[at - 1].is_ascii_alphanumeric();
+        let rest = &ddl[at + 5..];
+        if !before_ok || !rest.trim_start().starts_with('(') {
+            continue;
+        }
+        let Some(body) = balanced(rest) else { continue };
+        let words: HashSet<String> = body.split(|c: char| !(c.is_alphanumeric() || c == '_')).map(str::to_lowercase).collect();
+        let columns: Vec<String> = cols.iter().map(|c| c.name.to_lowercase()).filter(|n| words.contains(n)).collect();
+        if !columns.is_empty() {
+            out.push(AiCheck { sql: format!("CHECK ({})", body.trim()), columns });
+        }
+    }
+    out
+}
+
+/// `s` split at `sep` outside parentheses and quotes.
+fn top_level(s: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut quote, mut start) = (0i32, None::<char>, 0);
+    for (i, ch) in s.char_indices() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"' | '`') => quote = Some(ch),
+            (None, '[') => quote = Some(']'),
+            (None, '(') => depth += 1,
+            (None, ')') => depth -= 1,
+            (None, c) if c == sep && depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+#[allow(clippy::too_many_arguments)]
 fn generate(
     columns: &[Column],
     sources: &[Source],
     nullable: &[bool],
     parents: &[Vec<Vec<Option<String>>>],
+    sample: Option<&AiSample>,
     rows: usize,
     null_percent: u8,
     rng: &mut Rng,
+    misfits: &mut usize,
 ) -> Result<Vec<RecordBatch>> {
     let mut b = BatchBuilder::new(columns, BATCH.min(rows));
     let mut out = Vec::new();
+    // Values given so far, per unique AI column.
+    let mut seen: Vec<HashSet<String>> = vec![HashSet::new(); sources.len()];
+    // The AI's columns draw from their own stream, so how many values of an
+    // answer fit doesn't change the other columns: the seed still repeats them.
+    let mut ai_rng = Rng(rng.0 ^ 0x5DEE_CE66_D1CE_4E5B);
     for i in 0..rows {
         // One parent tuple per foreign key per row, shared by its columns.
         let picks: Vec<usize> = parents
@@ -1056,6 +1509,38 @@ fn generate(
                         Value::Null
                     } else {
                         random_value(g, i as u64 + 1, rng)
+                    }
+                }
+                Source::Sample { col, fallback, unique } => {
+                    let rng = &mut ai_rng;
+                    // NULLs only as often as asked (the AI's NULLs are made up instead).
+                    if nullable[c] && null_percent > 0 && rng.below(100) < null_percent as u64 {
+                        return Value::Null;
+                    }
+                    // Row by row, so a row's AI values belong together (name and email).
+                    let rows_of = sample.map(|s| s.rows.as_slice()).unwrap_or_default();
+                    let raw = if rows_of.is_empty() { None } else { rows_of[i % rows_of.len()].get(*col).cloned().flatten() };
+                    let fit = raw.as_deref().and_then(|r| sample_value(fallback, r));
+                    let fit = match fit {
+                        Some(Value::Text(t)) if *unique => distinct(&mut seen[c], t, fallback),
+                        Some(v) if *unique && !matches!(v, Value::Null) => {
+                            let key = format!("{v:?}");
+                            seen[c].insert(key).then_some(v)
+                        }
+                        v => v,
+                    };
+                    match fit {
+                        Some(v) => v,
+                        None => {
+                            if raw.is_some() {
+                                *misfits += 1;
+                            }
+                            let v = random_value(fallback, i as u64 + 1, rng);
+                            if *unique && let Value::Text(t) = &v {
+                                seen[c].insert(t.clone());
+                            }
+                            v
+                        }
                     }
                 }
             })
@@ -1201,7 +1686,7 @@ mod tests {
 
         let columns = vec![Column::new("d", ColType::Date, "date"), Column::new("f", ColType::Float64, "real")];
         let sources = vec![Source::Key { maker: Gen::Date, start: day, tag: String::new() }, Source::Key { maker: Gen::Float, start: 7, tag: String::new() }];
-        let b = generate(&columns, &sources, &[false, false], &[], 5000, 0, &mut rng).unwrap();
+        let b = generate(&columns, &sources, &[false, false], &[], None, 5000, 0, &mut rng, &mut 0).unwrap();
         let dates: HashSet<i32> = b.iter().flat_map(|x| x.column(0).as_any().downcast_ref::<Date32Array>().unwrap().values().to_vec()).collect();
         assert_eq!(dates.len(), 5000);
         assert!(dates.contains(&(day as i32)));
@@ -1217,6 +1702,146 @@ mod tests {
             })
             .collect();
         assert_eq!(bytes.len(), 255);
+    }
+
+    #[test]
+    fn ai_values_must_fit_their_column() {
+        let text = Gen::Text { max: Some(10), flavor: Flavor::Word };
+        assert_eq!(sample_value(&text, " Hà Nội "), Some(Value::Text("Hà Nội".into())), "9 bytes");
+        assert_eq!(sample_value(&text, "much too long for ten"), None);
+        assert_eq!(sample_value(&text, "  "), None);
+        let status = Gen::Choice(vec!["new".into(), "paid".into()]);
+        assert_eq!(sample_value(&status, "PAID"), Some(Value::Text("paid".into())));
+        assert_eq!(sample_value(&status, "shipped"), None);
+        assert_eq!(sample_value(&Gen::Int { min: 0, max: 100 }, "42"), Some(Value::Int(42)));
+        assert_eq!(sample_value(&Gen::Int { min: 0, max: 100 }, "4200"), None);
+        assert_eq!(sample_value(&Gen::Int { min: 0, max: 100 }, "4.5"), None);
+        assert_eq!(sample_value(&Gen::Int { min: 0, max: 100 }, "-5"), None, "unsigned and tinyint columns");
+        assert_eq!(sample_value(&Gen::Int { min: 1990, max: 2030 }, "1500"), None, "MySQL YEAR");
+        // Bytes as well as characters: VARCHAR2(6) holds "Nguyen", not "Nguyễn".
+        let six = Gen::Text { max: Some(6), flavor: Flavor::LastName };
+        assert_eq!(sample_value(&six, "Nguyen"), Some(Value::Text("Nguyen".into())));
+        assert_eq!(sample_value(&six, "Nguyễn"), None);
+        // Years every engine's date and date-time types hold.
+        assert_eq!(sample_value(&Gen::Timestamp, "1965-03-04 10:00:00"), None, "MySQL TIMESTAMP starts in 1970");
+        assert_eq!(sample_value(&Gen::Date, "1850-01-01"), None);
+        assert!(sample_value(&Gen::Date, "1965-03-04").is_some());
+        let money = Gen::Decimal { int_digits: 4, scale: 2 };
+        assert_eq!(sample_value(&money, "1234.5"), Some(Value::Text("1234.5".into())));
+        assert_eq!(sample_value(&money, "-0012.25"), Some(Value::Text("-0012.25".into())));
+        assert_eq!(sample_value(&money, "12345"), None);
+        assert_eq!(sample_value(&money, "1.234"), None);
+        assert_eq!(sample_value(&money, "1e3"), None);
+        assert_eq!(sample_value(&Gen::Float, "NaN"), None);
+        assert_eq!(sample_value(&Gen::Date, "2024-02-30"), None);
+        assert!(matches!(sample_value(&Gen::Date, "2024-02-03"), Some(Value::Date(_))));
+        assert_eq!(sample_value(&Gen::Bool, "maybe"), None);
+        assert_eq!(sample_value(&Gen::Json, "{\"a\": 1}"), Some(Value::Text("{\"a\": 1}".into())));
+        assert_eq!(sample_value(&Gen::Json, "{a: 1}"), None);
+        assert_eq!(sample_value(&Gen::Inet, "10.0.0.300"), None);
+        assert_eq!(sample_value(&Gen::Uuid, "not for the AI"), None);
+    }
+
+    #[test]
+    fn unique_columns_are_read_from_the_ddl() {
+        let cols =
+            vec![col("id", "integer", false, true), col("email", "text", false, false), col("code", "text", false, false), col("a", "text", true, false)];
+        let ddl = "CREATE TABLE t (\n  id integer PRIMARY KEY,\n  \"email\" text NOT NULL UNIQUE,\n  code text,\n  a text,\n  UNIQUE (code),\n  CONSTRAINT two UNIQUE (a, code)\n);";
+        let u = unique_columns(Some(ddl), &cols);
+        assert_eq!(u, HashSet::from(["email".to_string(), "code".to_string()]), "a is only unique together with code");
+        let u = unique_columns(Some("CREATE TABLE t (id int, a text);\nCREATE UNIQUE INDEX ix ON t (a);"), &cols);
+        assert_eq!(u, HashSet::from(["a".to_string()]));
+        // Several columns on one line (SQLite keeps the CREATE as typed), types with commas.
+        let u =
+            unique_columns(Some("create table t (id integer primary key, code numeric(8,2) check (code in (1, 2)), email varchar(40) unique, a text)"), &cols);
+        assert_eq!(u, HashSet::from(["email".to_string()]));
+        let u = unique_columns(Some("CREATE TABLE `t` (\n  `id` int NOT NULL,\n  `a` varchar(9),\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `uq_a` (`a`)\n)"), &cols);
+        assert_eq!(u, HashSet::from(["a".to_string()]), "MySQL");
+        let u = unique_columns(Some("CREATE UNIQUE INDEX ux ON t (lower(email));"), &cols);
+        assert_eq!(u, HashSet::from(["email".to_string()]), "an expression of one column");
+        assert_eq!(index_column("`email`(50)").as_deref(), Some("email"));
+        assert_eq!(index_column("[email] DESC").as_deref(), Some("email"));
+        assert_eq!(index_column("\"Email\"").as_deref(), Some("email"));
+        assert_eq!(index_column("(a + b)"), None);
+        assert!(unique_columns(None, &cols).is_empty());
+    }
+
+    #[test]
+    fn check_constraints_are_found_with_their_columns() {
+        let mk = |n: &str| TestDataColumn {
+            name: n.into(),
+            data_type: "text".into(),
+            nullable: true,
+            primary_key: false,
+            supported: true,
+            database_fills: false,
+            generator: String::new(),
+            ai_text: true,
+            ai_ok: true,
+            parent: None,
+            note: None,
+        };
+        let cols = vec![mk("tier"), mk("qty"), mk("note")];
+        let ddl = "CREATE TABLE t (tier text CHECK (tier IN ('gold', 'silver')), qty int, note text DEFAULT 'ops@corp.com', CONSTRAINT c CHECK ((qty > 0)), checksum int)";
+        let c = check_constraints(Some(ddl), &cols);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0], AiCheck { sql: "CHECK (tier IN ('gold', 'silver'))".into(), columns: vec!["tier".into()] });
+        assert_eq!(c[1].columns, vec!["qty".to_string()]);
+        assert!(!c.iter().any(|c| c.sql.contains("ops@corp.com")), "defaults aren't sent");
+    }
+
+    #[test]
+    fn ai_rows_go_in_checked_and_unique() {
+        let columns = vec![
+            Column::new("name", ColType::Utf8, "varchar(12)"),
+            Column::new("email", ColType::Utf8, "varchar(40)"),
+            Column::new("n", ColType::Int64, "int"),
+        ];
+        let name = Gen::Text { max: Some(12), flavor: Flavor::FullName };
+        let email = Gen::Text { max: Some(40), flavor: Flavor::Email };
+        let sources = vec![
+            Source::Sample { col: 0, fallback: name, unique: false },
+            Source::Sample { col: 1, fallback: email, unique: true },
+            Source::Random(Gen::Int { min: 1, max: 9 }),
+        ];
+        let sample = AiSample {
+            columns: vec!["name".into(), "email".into()],
+            rows: vec![
+                vec![Some("Ann Lee".into()), Some("ann@x.com".into())],
+                vec![Some("A name far too long".into()), Some("bob@x.com".into())],
+                vec![None, None],
+            ],
+        };
+        let mut misfits = 0;
+        let b = generate(&columns, &sources, &[false, false, false], &[], Some(&sample), 6, 0, &mut Rng(1), &mut misfits).unwrap();
+        let text =
+            |c: usize| -> Vec<String> { b[0].column(c).as_any().downcast_ref::<StringArray>().unwrap().iter().map(|v| v.unwrap().to_string()).collect() };
+        let names = text(0);
+        let emails = text(1);
+        // Rows cycle through the AI's rows, so a row's values stay together.
+        assert_eq!((names[0].as_str(), emails[0].as_str()), ("Ann Lee", "ann@x.com"));
+        assert_eq!(names[3], "Ann Lee");
+        assert_eq!(emails[3], "ann+2@x.com", "unique: a repeat gets a variant");
+        assert_eq!(emails[4], "bob+2@x.com");
+        // Too long, and NULL in NOT NULL columns: made up instead, and counted.
+        assert_ne!(names[1], "A name far too long");
+        assert!(names[1].chars().count() <= 12);
+        assert!(!names[2].is_empty() && !emails[2].is_empty());
+        assert_eq!(misfits, 2, "the too-long name, twice (the AI's NULLs are made up, not counted)");
+        assert_eq!(emails.iter().collect::<HashSet<_>>().len(), 6);
+
+        // NULLs come from the NULL share only, not from the AI.
+        let mut misfits = 0;
+        let b = generate(&columns[..1], &sources[..1], &[true], &[], Some(&sample), 3, 0, &mut Rng(1), &mut misfits).unwrap();
+        assert_eq!(b[0].column(0).null_count(), 0);
+
+        // The same seed gives the same other columns, whatever the AI wrote.
+        let other = AiSample { columns: sample.columns.clone(), rows: vec![vec![Some("Way too long a name".into()), Some("x@y.z".into())]] };
+        let nums = |s: &AiSample| -> Vec<i64> {
+            let b = generate(&columns, &sources, &[false, false, false], &[], Some(s), 6, 0, &mut Rng(9), &mut 0).unwrap();
+            b[0].column(2).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()
+        };
+        assert_eq!(nums(&sample), nums(&other));
     }
 
     #[test]
@@ -1261,8 +1886,8 @@ mod tests {
         };
         let parents = vec![vec![vec![Some("7".to_string())], vec![Some("9".to_string())]]];
         let nullable = [false, false, false, true];
-        let a = generate(&columns, &mk(), &nullable, &parents, 10_000, 50, &mut Rng(7)).unwrap();
-        let b = generate(&columns, &mk(), &nullable, &parents, 10_000, 50, &mut Rng(7)).unwrap();
+        let a = generate(&columns, &mk(), &nullable, &parents, None, 10_000, 50, &mut Rng(7), &mut 0).unwrap();
+        let b = generate(&columns, &mk(), &nullable, &parents, None, 10_000, 50, &mut Rng(7), &mut 0).unwrap();
         assert_eq!(a.len(), 2, "8192 rows per batch");
         assert_eq!(a, b, "same seed, same rows");
         let ids: Vec<i64> = a.iter().flat_map(|x| x.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect();

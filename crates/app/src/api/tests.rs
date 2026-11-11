@@ -646,7 +646,7 @@ async fn test_data_generates_and_loads_sqlite() {
     assert!(cid.parent.as_deref().is_some_and(|x| x.contains("customers")), "{cid:?}");
 
     let spec = |rows| databrain_query_engine::testdata::TestDataSpec { rows, null_percent: 20, seed: Some(3), skip: vec![], fill: vec![], parent_keys: true };
-    let made = generate_test_data(&st, &p.id, &main, "orders", spec(50)).await.unwrap();
+    let made = generate_test_data(&st, &p.id, &main, "orders", spec(50), None, None).await.unwrap();
     assert_eq!(made.output.rows, 50);
     assert!(made.notes.iter().any(|n| n.contains("2 existing keys")), "{:?}", made.notes);
     let args =
@@ -665,20 +665,108 @@ async fn test_data_generates_and_loads_sqlite() {
     assert_eq!(rows[0], vec![Some("50".into()), Some("6".into()), Some("0".into()), Some("0".into())], "keys after the max, parents' keys, geometry left out");
 
     // Same seed, same rows; the previous generation is freed.
-    let again = generate_test_data(&st, &p.id, &main, "orders", spec(50)).await.unwrap();
+    let again = generate_test_data(&st, &p.id, &main, "orders", spec(50), None, None).await.unwrap();
     assert!(st.results().get(&made.output.result_id).is_err(), "previous rows freed");
     assert_eq!(again.seed, 3);
-    assert!(generate_test_data(&st, &p.id, &main, "orders", spec(0)).await.is_err());
+    assert!(generate_test_data(&st, &p.id, &main, "orders", spec(0), None, None).await.is_err());
 
     // Read-only: rows can be made and previewed, not loaded.
     let mut ro = cfg.clone();
     ro.read_only = true;
     let q = save_profile(&st, "ro", ro, None);
-    let made = generate_test_data(&st, &q.id, &main, "customers", spec(5)).await.unwrap();
+    let made = generate_test_data(&st, &q.id, &main, "customers", spec(5), None, None).await.unwrap();
     let args =
         LoadResultArgs { target_connection_id: q.id.clone(), table: made.table.clone(), mode: Default::default(), key_columns: vec![], create_table: false };
     let e = load_result(&st, &made.output.result_id, args, "l2").await.unwrap_err();
     assert!(e.message.contains("read-only"), "{}", e.message);
+}
+
+/// "Generate with AI": the AI is asked only for free-text columns (not the
+/// key or foreign keys), its values go in where they fit the column, and the
+/// rows load. Without a provider the request fails before anything is made.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_data_takes_ai_rows_for_text_columns() {
+    use databrain_query_engine::testdata::{AiSample, TestDataSpec};
+    let (st, _sink, dir) = state();
+    let db = dir.path().join("ai.db");
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(db.to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let p = save_profile(&st, "ai", cfg, None);
+    exec(
+        &st,
+        &p.id,
+        "create table teams (id integer primary key); insert into teams values (1); insert into teams values (2); \
+         create table people (id integer primary key, team_id integer not null references teams(id), \
+           full_name varchar(20) not null, email varchar(40), age integer); \
+         create unique index ux_people_email on people (email)",
+    )
+    .await;
+    let main = list_schemas(&st, &p.id).await.unwrap()[0].name.clone();
+    let spec = TestDataSpec { rows: 8, null_percent: 0, seed: Some(5), skip: vec![], fill: vec![], parent_keys: true };
+
+    let ask = st.engine.test_data_ai_ask(&p.id, &main, "people", &spec, false, 100).await.unwrap().expect("text columns");
+    let names: Vec<&str> = ask.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["full_name", "email"], "text only: not the key, the foreign key or numbers");
+    assert_eq!(ask.rows, 8, "never more AI rows than rows");
+    assert!(ask.columns[1].unique, "a unique index outside the CREATE TABLE");
+    assert_eq!(ask.columns[0].max_chars, Some(20));
+    assert!(ask.others.iter().any(|o| o.contains("team_id") && o.contains("existing keys of a parent table")), "{:?}", ask.others);
+    assert!(!ask.others.iter().any(|o| o.contains("teams")), "other tables aren't named: {:?}", ask.others);
+    let all = st.engine.test_data_ai_ask(&p.id, &main, "people", &spec, true, 100).await.unwrap().unwrap();
+    let names: Vec<&str> = all.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["full_name", "email", "age"], "every column: still not keys");
+
+    let sample = AiSample {
+        columns: vec!["full_name".into(), "email".into()],
+        rows: vec![
+            vec![Some("Linh Tran".into()), Some("linh@example.com".into())],
+            vec![Some("Name longer than twenty".into()), Some("minh@example.com".into())],
+        ],
+    };
+    let data = st.engine.generate_test_data_with(&p.id, &main, "people", &spec, Some(&sample)).await.unwrap();
+    assert!(data.notes.iter().any(|n| n.starts_with("AI wrote 2 rows for full_name, email")), "{:?}", data.notes);
+    assert!(data.notes.iter().any(|n| n.contains("didn't fit")), "{:?}", data.notes);
+    let made = super::results::store_test_data(&st, &p.id, &main, "people", spec.rows, data).unwrap();
+    let args =
+        LoadResultArgs { target_connection_id: p.id.clone(), table: made.table.clone(), mode: Default::default(), key_columns: vec![], create_table: false };
+    load_result(&st, &made.output.result_id, args, "ai-load").await.unwrap();
+    let s = st.engine.session_for_tests(&p.id).await.unwrap();
+    let rows = databrain_connector_core::query_text(
+        &*s,
+        "select count(*), sum(full_name = 'Linh Tran'), count(distinct email), sum(team_id not in (1, 2)), max(length(full_name)) from people",
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows[0][0].as_deref(), Some("8"));
+    assert_eq!(rows[0][1].as_deref(), Some("4"), "every other row");
+    assert_eq!(rows[0][2].as_deref(), Some("8"), "unique emails, AI repeats included");
+    assert_eq!(rows[0][3].as_deref(), Some("0"), "foreign keys from the parent");
+    assert!(rows[0][4].as_deref().unwrap().parse::<u32>().unwrap() <= 20);
+
+    // Refused before anything is sent: no AI provider, AI off for the
+    // connection, or table structure not shared with the AI.
+    let ai = databrain_ai::testdata::TestDataAi { provider_id: None, model: None, all_columns: false, rows: 50 };
+    let e = generate_test_data(&st, &p.id, &main, "people", spec.clone(), Some(ai.clone()), None).await.unwrap_err();
+    assert!(e.message.contains("add an AI provider"), "{}", e.message);
+    let mut off = st.workspace.get_connection(&p.id).unwrap();
+    off.ai_policy.share_metadata = false;
+    save_profile_update(&st, off.clone());
+    let e = generate_test_data(&st, &p.id, &main, "people", spec.clone(), Some(ai.clone()), None).await.unwrap_err();
+    assert!(e.message.contains("Share schema metadata"), "{}", e.message);
+    off.ai_policy.ai_enabled = false;
+    save_profile_update(&st, off);
+    let e = generate_test_data(&st, &p.id, &main, "people", spec.clone(), Some(ai), None).await.unwrap_err();
+    assert!(e.message.contains("AI is disabled"), "{}", e.message);
 }
 
 /// Live Postgres (object versions): after a change only the changed and

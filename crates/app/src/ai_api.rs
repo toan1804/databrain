@@ -412,6 +412,34 @@ pub async fn ai_ghost(state: &AppState, request_id: String, request: databrain_a
     r.map_err(ai_err)
 }
 
+/// Rows the AI writes for "Generate test data".
+pub async fn ai_test_data(
+    state: &AppState,
+    connection_id: &str,
+    ai: &databrain_ai::testdata::TestDataAi,
+    ask: &databrain_query_engine::testdata::AiAsk,
+    cancel: &CancellationToken,
+) -> Result<databrain_query_engine::testdata::AiSample> {
+    databrain_ai::testdata::sample(&state.workspace, state.secrets.clone(), connection_id, ai, ask, cancel).await.map_err(ai_err)
+}
+
+/// `cancel` runs under `id` for [`ai_cancel`] until the guard is dropped.
+pub fn track_run(state: &AppState, id: String, cancel: CancellationToken) -> RunGuard<'_> {
+    state.ai.runs.lock().insert(id.clone(), cancel);
+    RunGuard { state, id }
+}
+
+pub struct RunGuard<'a> {
+    state: &'a AppState,
+    id: String,
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.state.ai.runs.lock().remove(&self.id);
+    }
+}
+
 pub fn ai_cancel(state: &AppState, run_id: &str) -> bool {
     match state.ai.runs.lock().get(run_id) {
         Some(c) => {

@@ -18,6 +18,16 @@ database_fills: boolean,
  */
 generator: string, 
 /**
+ * Free text (names, emails, descriptions): what "Generate with AI"
+ * writes when it writes only text.
+ */
+ai_text: boolean, 
+/**
+ * The AI may write it when it writes every column it can: not keys,
+ * foreign keys, UUIDs or bytes.
+ */
+ai_ok: boolean, 
+/**
  * The parent table its values come from (`schema.table.column`).
  */
 parent?: string, 

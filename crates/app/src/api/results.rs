@@ -297,15 +297,55 @@ pub struct TestDataOutput {
 /// rows become an output, which the existing load path ("Load into…",
 /// [`load_result`]) writes into the table when the user asks. A new
 /// generation for the same table frees the previous one.
+///
+/// With `ai`, an AI model first writes rows for the text columns (or every
+/// column it may write) from the table's structure; `request_id` lets
+/// `ai_cancel` stop it.
 pub async fn generate_test_data(
     state: &AppState,
     connection_id: &str,
     schema: &str,
     name: &str,
     spec: databrain_query_engine::testdata::TestDataSpec,
+    ai: Option<databrain_ai::testdata::TestDataAi>,
+    request_id: Option<String>,
+) -> Result<TestDataOutput> {
+    // Stop (`ai_cancel(request_id)`) works from the start: reading the
+    // table, the AI's calls, and making the rows.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _run = request_id.map(|id| crate::ai_api::track_run(state, id, cancel.clone()));
+    let work = async {
+        let sample = match &ai {
+            Some(ai) => match state.engine.test_data_ai_ask(connection_id, schema, name, &spec, ai.all_columns, ai.rows).await? {
+                Some(ask) => Some(crate::ai_api::ai_test_data(state, connection_id, ai, &ask, &cancel).await?),
+                None => None,
+            },
+            None => None,
+        };
+        let mut data = state.engine.generate_test_data_with(connection_id, schema, name, &spec, sample.as_ref()).await?;
+        if ai.is_some() && sample.is_none() {
+            data.notes.push("No column for the AI to write: every value was made up as usual.".into());
+        }
+        Ok::<_, EngineError>(data)
+    };
+    let data = tokio::select! {
+        r = work => r?,
+        _ = cancel.cancelled() => return Err(EngineError::new("cancelled", "Stopped")),
+    };
+    store_test_data(state, connection_id, schema, name, spec.rows, data)
+}
+
+/// Generated rows as an output of the table's test data tab (freeing the
+/// previous one).
+pub(crate) fn store_test_data(
+    state: &AppState,
+    connection_id: &str,
+    schema: &str,
+    name: &str,
+    rows: u32,
+    data: databrain_query_engine::testdata::TestData,
 ) -> Result<TestDataOutput> {
     let profile = state.workspace.get_connection(connection_id)?;
-    let data = state.engine.generate_test_data(connection_id, schema, name, &spec).await?;
     let tab = format!("__testdata__:{connection_id}:{schema}.{name}");
     let outputs = state.engine.outputs();
     outputs.close_tab(&tab);
@@ -317,7 +357,7 @@ pub async fn generate_test_data(
         connection_id: connection_id.to_string(),
         connection_name: profile.name,
         kind: profile.config.kind,
-        sql: format!("-- Test data for {} ({} rows, seed {})", data.table, spec.rows, data.seed),
+        sql: format!("-- Test data for {} ({} rows, seed {})", data.table, rows, data.seed),
         tab_id: tab,
         statement_index: 0,
         row_limit: None,

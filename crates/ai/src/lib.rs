@@ -14,6 +14,7 @@ pub mod policy;
 pub mod providers;
 pub mod resultsql;
 pub mod sse;
+pub mod testdata;
 pub mod tools;
 pub mod types;
 

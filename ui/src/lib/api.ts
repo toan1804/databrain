@@ -110,6 +110,7 @@ import type {
   CostEstimate,
   TestDataOutput,
   TestDataPlan,
+  TestDataAi,
   TestDataSpec,
   ProviderUsage,
   HistoryClear,
@@ -299,8 +300,9 @@ export const api = {
   /** Columns of a table and what generated test data would put in each. */
   testDataPlan: (connectionId: string, schema: string, name: string) => call<TestDataPlan>("test_data_plan", { connectionId, schema, name }),
   /** Make up rows for a table (nothing is written): an output to preview or load. */
-  generateTestData: (connectionId: string, schema: string, name: string, spec: TestDataSpec) =>
-    call<TestDataOutput>("generate_test_data", { connectionId, schema, name, spec }),
+  /** With `ai`, an AI model writes the text columns first; cancel it with `aiCancel(requestId)`. */
+  generateTestData: (connectionId: string, schema: string, name: string, spec: TestDataSpec, ai: TestDataAi | null = null, requestId: string | null = null) =>
+    call<TestDataOutput>("generate_test_data", { connectionId, schema, name, spec, ai, requestId }),
   summarizeSelection: (resultId: string, view: ViewSpec, columns: number[], offset: number, limit: number) =>
     call<SelectionSummary>("summarize_selection", { resultId, view, columns, offset, limit }),
   columnStats: (resultId: string, view: ViewSpec, column: number) =>

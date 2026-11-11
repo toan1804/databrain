@@ -157,6 +157,7 @@ import type { SchemaRefresh } from "./bindings/SchemaRefresh";
 import type { LineageCheck } from "./bindings/LineageCheck";
 import type { LineageView } from "./bindings/LineageView";
 import type { LoadResultArgs } from "./bindings/LoadResultArgs";
+import type { TestDataAi } from "./bindings/TestDataAi";
 import type { TestDataColumn } from "./bindings/TestDataColumn";
 import type { TestDataForeignKey } from "./bindings/TestDataForeignKey";
 import type { TestDataOutput } from "./bindings/TestDataOutput";
@@ -336,6 +337,7 @@ export type {
   LineageCheck,
   LineageView,
   LoadResultArgs,
+  TestDataAi,
   TestDataColumn,
   TestDataForeignKey,
   TestDataOutput,

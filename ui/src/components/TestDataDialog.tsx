@@ -1,14 +1,17 @@
 // "Generate test data…" (explorer table menu): rows made up from the
 // table's column types, previewed as an output, and written into the table
 // through the load code when asked. Foreign key columns take keys read from
-// the parent tables.
+// the parent tables. "Generate values with AI" has an AI model write the
+// text columns (or every column it may), from the table's structure only.
 
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, Eye, Link2, Loader2, Square, Upload } from "lucide-react";
+import { AlertTriangle, Eye, Link2, Loader2, Sparkles, Square, Upload } from "lucide-react";
 import { api, onLoadProgress, toError } from "../lib/api";
 import type { LoadDryRun, LoadReport, TestDataColumn, TestDataOutput, TestDataPlan, TestDataSpec } from "../lib/types";
 import { formatCount, uid } from "../lib/util";
 import { openOutput } from "../outputs";
+import { useAi } from "../aiStore";
+import { AI_BATCH_ROWS, MAX_AI_ROWS, aiRequest, aiTarget, aiWrites, clampAiRows } from "../lib/testDataAi";
 import { useStore } from "../store";
 import type { TestDataRequest } from "../store/uiSlice";
 import { DryRunReport } from "./job/LoadFields";
@@ -72,6 +75,22 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   const [progress, setProgress] = useState<{ id: string; done: number; total: number } | null>(null);
   const [report, setReport] = useState<LoadReport | null>(null);
   const loadId = useRef<string | null>(null);
+  const aiSettings = useStore((s) => s.testDataAi);
+  const setAiSettings = useStore((s) => s.setTestDataAi);
+  const providers = useAi((s) => s.providers);
+  const panelProvider = useAi((s) => s.providerId);
+  const panelModel = useAi((s) => s.model);
+  const [aiRun, setAiRun] = useState<string | null>(null);
+  // The AI rows field as typed (committed on blur, so it can be cleared).
+  const [aiRowsText, setAiRowsText] = useState(String(aiSettings.rows));
+  const running = useRef<string | null>(null);
+  // Closing the dialog stops a request still running.
+  useEffect(
+    () => () => {
+      if (running.current) void api.aiCancel(running.current);
+    },
+    [],
+  );
 
   useEffect(() => {
     let live = true;
@@ -98,7 +117,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   useEffect(() => {
     setMade(null);
     setDry(null);
-  }, [rows, nulls, seed, parentKeys, tickedKey]);
+  }, [rows, nulls, seed, parentKeys, tickedKey, aiSettings, panelProvider, panelModel, conn?.ai_policy]);
 
   if (plan.status !== "ready") {
     return (
@@ -121,11 +140,39 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   const key = `${req.connection_id}|${p.table}`;
   const badSeed = seedProblem(seed);
   const nothing = ticked.size === 0 || !!badSeed;
+  // The AI: allowed on this connection, and a model provider set up.
+  const policy = conn?.ai_policy;
+  const target = aiTarget(providers, { providerId: panelProvider, model: panelModel }, policy?.allowed_providers ?? []);
+  const aiBlocked =
+    policy && !policy.ai_enabled
+      ? "AI is turned off for this connection (Connection → AI)."
+      : policy && !policy.share_metadata
+        ? "This connection doesn't share table structure with the AI (Connection → AI → Share schema metadata)."
+        : !target
+          ? policy?.allowed_providers.length
+            ? "None of the AI providers this connection allows is set up."
+            : "Add an AI provider in the AI panel to use this."
+          : null;
+  const ai = { ...aiSettings, enabled: aiSettings.enabled && !aiBlocked };
+  const aiColumns = p.columns.filter((c) => aiWrites(c, ticked, ai));
+  const aiRows = Math.min(clampAiRows(ai.rows), Math.max(1, Math.floor(rows) || 1));
+  const aiCalls = Math.ceil(aiRows / AI_BATCH_ROWS);
+  const providerName = providers.find((x) => x.id === target?.provider_id)?.name ?? "the AI";
 
   /** Rows for the current settings (made once, reused by preview, dry run and load). */
   const generate = async (): Promise<TestDataOutput> => {
     if (made) return made;
-    const out = await api.generateTestData(req.connection_id, req.schema, req.table, specFor(p.columns, ticked, rows, nulls, seed, parentKeys));
+    const askAi = aiRequest(ai, target, aiColumns.length);
+    const run = askAi ? uid() : null;
+    running.current = run;
+    setAiRun(run);
+    let out: TestDataOutput;
+    try {
+      out = await api.generateTestData(req.connection_id, req.schema, req.table, specFor(p.columns, ticked, rows, nulls, seed, parentKeys), askAi, run);
+    } finally {
+      running.current = null;
+      setAiRun(null);
+    }
     // The previous preview of this table was freed: close its tab.
     const old = previews.get(key);
     const st = useStore.getState();
@@ -134,6 +181,12 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
     previews.set(key, out.output.handle);
     setMade(out);
     return out;
+  };
+  /** An error toast, or a quiet note when the user stopped the AI. */
+  const failed = (e: unknown) => {
+    const err = toError(e);
+    if (err.kind === "cancelled") toast("Stopped generating test data", "info");
+    else toast(err.message, "error");
   };
   const args = (table: string) => ({ target_connection_id: req.connection_id, table, mode: "append" as const, key_columns: [], create_table: false });
 
@@ -144,7 +197,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
       await openOutput(out.output);
       onClose();
     } catch (e) {
-      toast(toError(e).message, "error");
+      failed(e);
     } finally {
       setBusy(null);
     }
@@ -155,7 +208,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
       const out = await generate();
       setDry(await api.dryRunResultLoad(out.output.result_id, args(out.table)));
     } catch (e) {
-      toast(toError(e).message, "error");
+      failed(e);
     } finally {
       setBusy(null);
     }
@@ -171,7 +224,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
       setReport(r);
       toast(`Loaded ${formatCount(r.rows)} test rows into ${req.table}`, "success");
     } catch (e) {
-      toast(toError(e).message, "error");
+      failed(e);
     } finally {
       setBusy(null);
       setProgress(null);
@@ -201,6 +254,15 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
           <button className="btn-ghost mr-auto" onClick={() => void api.cancelLoad(progress.id)}>
             <Square size={12} /> Stop
           </button>
+        ) : aiRun ? (
+          <>
+            <span className="mr-auto flex items-center gap-1.5 text-[12px] text-muted" role="status">
+              <Loader2 size={13} className="animate-spin" /> {providerName} is writing {formatCount(aiRows)} rows…
+            </span>
+            <button className="btn-ghost border border-line" onClick={() => void api.aiCancel(aiRun)}>
+              <Square size={12} /> Stop
+            </button>
+          </>
         ) : (
           <>
             <button
@@ -293,6 +355,57 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
               )}
             </label>
           </div>
+          <div className="space-y-1 rounded-md border border-line px-2 py-1.5 text-[11.5px]">
+            <label className="flex items-center gap-2 font-medium">
+              <input
+                type="checkbox"
+                checked={ai.enabled}
+                disabled={!!aiBlocked}
+                onChange={(e) => setAiSettings({ ...aiSettings, enabled: e.target.checked })}
+              />
+              <Sparkles size={12} className="text-accent" /> Generate values with AI
+            </label>
+            {aiBlocked ? (
+              <p className="pl-5 text-muted">{aiBlocked}</p>
+            ) : (
+              ai.enabled && (
+                <div className="space-y-1 pl-5">
+                  <label className="flex items-center gap-2">
+                    <input type="checkbox" checked={ai.textOnly} onChange={(e) => setAiSettings({ ...aiSettings, textOnly: e.target.checked })} /> Only text columns
+                    (cheaper; untick to have the AI write every column it can)
+                  </label>
+                  <label className="flex flex-wrap items-center gap-2">
+                    The AI writes
+                    <input
+                      className="field w-20"
+                      type="number"
+                      min={1}
+                      max={MAX_AI_ROWS}
+                      aria-label="Rows the AI writes"
+                      value={aiRowsText}
+                      onChange={(e) => setAiRowsText(e.target.value.replace(/\D/g, ""))}
+                      onBlur={() => {
+                        const n = clampAiRows(Number(aiRowsText));
+                        setAiRowsText(String(n));
+                        if (n !== aiSettings.rows) setAiSettings({ ...aiSettings, rows: n });
+                      }}
+                      onKeyDown={(e) => e.key === "Enter" && e.currentTarget.blur()}
+                    />
+                    rows; more rows reuse them.
+                    <span className="text-muted">
+                      {aiColumns.length === 0
+                        ? "No ticked column for the AI: everything is made up as usual."
+                        : `${aiCalls} call${aiCalls === 1 ? "" : "s"} to ${providerName} for ${aiColumns.length} column${aiColumns.length === 1 ? "" : "s"}.`}
+                    </span>
+                  </label>
+                  <p className="text-muted">
+                    Only the table's structure is sent, no rows. Keys and foreign keys never come from the AI, and a value that doesn't fit its column (type, length,
+                    allowed values, uniqueness) is made up instead. The seed repeats only the other columns.
+                  </p>
+                </div>
+              )
+            )}
+          </div>
           <div className="max-h-72 overflow-auto rounded-md border border-line">
             <table className="w-full border-collapse text-[12px]">
               <thead className="sticky top-0 bg-panel text-[11px] text-muted">
@@ -321,7 +434,17 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
                     </td>
                     <td className="px-2 py-1 font-mono text-[11.5px] text-muted">{c.data_type}</td>
                     <td className="px-2 py-1" title={c.note ?? undefined}>
-                      {ticked.has(c.name) ? c.generator : c.supported ? "left to the database" : c.generator}
+                      {aiWrites(c, ticked, ai) ? (
+                        <span className="inline-flex items-center gap-1">
+                          <Sparkles size={11} className="text-accent" aria-label="Written by AI" /> AI: {c.generator}
+                        </span>
+                      ) : ticked.has(c.name) ? (
+                        c.generator
+                      ) : c.supported ? (
+                        "left to the database"
+                      ) : (
+                        c.generator
+                      )}
                       {c.note && <div className="text-[11px] text-muted">{c.note}</div>}
                     </td>
                   </tr>

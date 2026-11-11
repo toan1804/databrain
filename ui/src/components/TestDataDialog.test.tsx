@@ -11,6 +11,8 @@ const col = (name: string, p: Partial<TestDataColumn> = {}): TestDataColumn => (
   supported: true,
   database_fills: false,
   generator: "",
+  ai_text: false,
+  ai_ok: false,
   ...p,
 });
 

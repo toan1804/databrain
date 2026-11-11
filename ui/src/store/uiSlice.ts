@@ -9,6 +9,7 @@ import { applyTheme, persistQuickFilters } from "./helpers";
 import type { ConfirmState, SidebarPanel, State, Theme, Toast } from "./types";
 import type { CompareSource, OutputInfo } from "../lib/types";
 import type { InlineAiProvider } from "../lib/inlineAi";
+import { DEFAULT_TEST_DATA_AI, type TestDataAiSettings } from "../lib/testDataAi";
 
 let appearanceSave: ReturnType<typeof setTimeout> | undefined;
 
@@ -28,6 +29,9 @@ export interface UiSlice {
   /** Provider (and model) for inline completion; null = the AI panel's. */
   inlineAiProvider: InlineAiProvider | null;
   setInlineAiProvider: (p: InlineAiProvider | null) => void;
+  /** Generate test data → "Generate with AI" (remembered). */
+  testDataAi: TestDataAiSettings;
+  setTestDataAi: (s: TestDataAiSettings) => void;
   /** The user's SQL snippets (built-in ones are added by the editor). */
   sqlSnippets: Snippet[];
   setSqlSnippets: (s: Snippet[]) => void;
@@ -84,6 +88,7 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   slowQuerySeconds: DEFAULT_SLOW_QUERY_SECONDS,
   inlineAiCompletion: false,
   inlineAiProvider: null,
+  testDataAi: DEFAULT_TEST_DATA_AI,
   sqlSnippets: [],
   gridViews: [],
   quickFilters: {},
@@ -132,6 +137,10 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   setInlineAiProvider: (inlineAiProvider) => {
     set({ inlineAiProvider });
     if (isTauri()) api.setSetting("inline_ai_provider", inlineAiProvider).catch(() => {});
+  },
+  setTestDataAi: (testDataAi) => {
+    set({ testDataAi });
+    if (isTauri()) api.setSetting("test_data_ai", testDataAi).catch(() => {});
   },
   setSqlSnippets: (s) => {
     const sqlSnippets = parseSnippets(s);

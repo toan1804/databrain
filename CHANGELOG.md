@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Added
+
+- Generate test data with AI: "Generate values with AI" in the Generate test data dialog has the AI panel's model write realistic values (names, emails, addresses, descriptions that belong together in a row) instead of random words. By default only text columns, which keeps the cost low; untick "Only text columns" to have it write every column it can. The AI writes up to 500 rows (100 by default) in batches of 25 and more rows reuse them, and only the table's structure is sent (column names, types, limits and their CHECK constraints), never its rows. Keys and foreign keys never come from the AI, and every value is checked against its column (type, range, length, allowed values, unique constraints and indexes) and made up as usual when it doesn't fit; the same seed still repeats the other columns. The choices are remembered; it is off when the connection doesn't allow AI or doesn't share schema metadata, and it uses only the providers the connection allows.
+
 ### Security
 
 - More passwords are hidden from query history, job logs and the assistant's transcripts and audit log: a connection URL password that starts with `/`, `?` or `#` (`postgres://u:/pw@h/db`, or digits then one of them, `u:12/ab@h`, which read as a port), a password after an email address as the user name (`postgres://me@x.com:pa/ss@h/db`), a password with a space in it (`postgres://u:pa ss@h/db`), and Postgres escape strings (`ALTER ROLE r PASSWORD E'sec\'ret'`) were kept in clear. When a URL is ambiguous the text is hidden: `https://h:8443/a@b` keeps only `https://h:***@b`.

@@ -88,8 +88,10 @@ pub(crate) async fn generate_test_data(
     schema: String,
     name: String,
     spec: databrain_query_engine::testdata::TestDataSpec,
+    ai: Option<databrain_ai::testdata::TestDataAi>,
+    request_id: Option<String>,
 ) -> R<api::TestDataOutput> {
-    api::generate_test_data(&state, &connection_id, &schema, &name, spec).await
+    api::generate_test_data(&state, &connection_id, &schema, &name, spec, ai, request_id).await
 }
 
 #[tauri::command]
