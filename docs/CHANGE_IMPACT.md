@@ -1,0 +1,23 @@
+# What else to check when you change a feature
+
+Several DataBrain features share code. A change made for one of them changes the others, and they are easy to forget: the lineage "used columns only" change hid every column of the ER diagram, because both draw through the same layout. Before you finish a change in one of the places below, check (and test) the features listed next to it.
+
+| You change | Also check |
+|---|---|
+| **Lineage layout and export** (`ui/src/lib/lineageLayout.ts`, `lineageExport.ts`) | Query lineage tab (`LineageTab.tsx`), **ER diagram** (`ErTab.tsx`, `erGraph.ts`), their SVG / draw.io / Mermaid / DOT exports, `lineageExplain.ts`. Options that only lineage wants (such as `usedOnly`) must be opt-in. |
+| **Lineage builder** (`crates/lineage`) | Lineage tab and its "Check with database", the AI's lineage tool, impact of a column change, views traced through definitions, the `used` flags the tab trims by. |
+| **Statement classification / read-only / production confirmation** (`crates/connector-core/src/sql/classify.rs`, `read_only.rs`) | Running SQL (`query-engine/src/run.rs`), plans (`plan.rs`), exports and loads (`export.rs`, `load.rs`), the AI policy (`crates/ai/src/policy.rs`: its decisions and tests change with every new kind), MCP (uses the same policy), SQL Server batch execution (`connectors/mssql/src/exec.rs`), lineage. Safety changes need allowed and refused tests (AGENTS.md); when unsure, `Unknown`. |
+| **Password redaction** (`crates/connector-core/src/sql/redact.rs`) | Query history, job logs and job specs, AI transcripts and the AI audit log (`crates/workspace`: `history.rs`, `jobs/`, `ai.rs`, and the one-time cleanup in `migrations.rs`). Over-redacting corrupts saved history text as surely as under-redacting leaks. |
+| **Load SQL generation** (`crates/export/src/load.rs`) | "Load into…", job load steps, grid edits (`query-engine/src/edit.rs`), related-rows queries (`related.rs`), test data (`testdata.rs`), importing files. A literal format change (e.g. BigQuery `NUMERIC '…'`) applies to all of them. |
+| **Parameters** (`connector-core/src/sql/params.rs`, `find_parameters`) | Running, the parameter bar (`paramsSlice.ts`, `sqlEditorSetup.ts`), Format (`SqlContextMenu.tsx`, `formatSql.ts`), plans, lineage, notebooks (`NotebookView.tsx`), job parameters (`JobPanel.tsx`, `databrain-jobs run --param`). |
+| **SQL formatter** (`ui/src/lib/formatSql.ts`) | Format in the editor and notebooks (`SqlContextMenu.tsx`), Show DDL formatting (`DdlTab.tsx`). |
+| **Knowledge index** (`crates/ai/src/knowledge.rs`, `crates/workspace/src/knowledge.rs`) | The assistant's schema tools (`tools/schema.rs`, `agent.rs`), inline completion context (`ghost.rs`), note targets, foreign-key navigation, the index hint above the chat (`IndexHint.tsx`, `indexCoverage.ts`: its system-schema list mirrors `system_schema`). |
+| **PII masking** (`crates/ai/src/pii.rs`) | The AI's query tool (`tools/query.rs`), results SQL (`resultsql.rs`), MCP results, test-data CHECK constraints sent to the AI. |
+| **Test data generation** (`crates/query-engine/src/testdata.rs`, `testdata_pattern.rs`) | The dialog (`TestDataDialog.tsx`, `testDataPatterns.ts`, `testDataAi.ts`), "Generate values with AI" (`crates/ai/src/testdata.rs`, its prompt states the pattern rules), the load path above, the pattern guide examples (`testDataPatterns.ts` `PATTERN_GUIDE`, kept parseable by a Rust test). |
+| **Plan parsing and comparison** (`ui/src/lib/plan.ts`) | Plan tab, plan comparison (`PlanCompareTab.tsx`), slow-query tips. |
+| **Cost preview** (`ui/src/costPreview.ts`) | The editor's auto-estimate (`EditorPane.tsx`), the cost bar (`results/CostBar.tsx`), plan comparison's bytes. |
+| **Command-line modes** (`crates/app/src/cli`, `launcher.rs`, `bin/`) | MCP client config shown in Settings (`ai_api::mcp_config`), the OS timer for background jobs (`background.rs`), the bundle (Tauri ships every `[[bin]]`), the launcher tests (`crates/app/tests/launchers.rs`), Windows console attach. |
+| **Workspace schema** (`crates/workspace/src/migrations.rs`) | The version guard and backup test (`tests.rs` `schema_version_guard_and_backup` undoes the newest migration by hand), every reader of the changed tables, MCP and the jobs runner (they open the same workspace). |
+| **Bindings** (any `#[derive(ts_rs::TS)]` type) | Regenerated `ui/src/lib/bindings/*.ts` (commit them), UI fixtures in tests that build those types, the e2e mock (`ui/e2e`). |
+
+When a change crosses one of these lines, say so in the commit body, and add the missing row here when you find a new one.
