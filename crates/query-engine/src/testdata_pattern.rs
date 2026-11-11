@@ -131,7 +131,8 @@ fn option_value(base: &Gen, limits: &Limits, s: &str) -> Option<Value> {
         },
         Gen::Date | Gen::Timestamp | Gen::TimestampTz if real_date(s) => match cell_value(base.col_type(), s) {
             v @ Value::Date(d) => limits.holds_moment(i64::from(d) * MICROS_PER_DAY).then_some(v),
-            v @ (Value::Timestamp(m) | Value::TimestampTz(m)) => limits.holds_moment(m).then_some(v),
+            Value::Timestamp(m) => limits.holds_moment(m).then_some(Value::Timestamp(m)),
+            Value::TimestampTz(m) => limits.holds_moment(m).then_some(Value::TimestampTz(m)),
             _ => None,
         },
         Gen::Date | Gen::Timestamp | Gen::TimestampTz => None,
@@ -317,7 +318,8 @@ impl Pattern {
             Pattern::DateTimes(lo, hi) => {
                 let t = base.col_type();
                 match (real_date(s), cell_value(t, s)) {
-                    (true, v @ (Value::Timestamp(m) | Value::TimestampTz(m))) if (*lo..=*hi).contains(&m) => Some(v),
+                    (true, Value::Timestamp(m)) if (*lo..=*hi).contains(&m) => Some(Value::Timestamp(m)),
+                    (true, Value::TimestampTz(m)) if (*lo..=*hi).contains(&m) => Some(Value::TimestampTz(m)),
                     _ => None,
                 }
             }
