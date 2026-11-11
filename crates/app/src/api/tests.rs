@@ -708,7 +708,8 @@ async fn test_data_takes_ai_rows_for_text_columns() {
         "create table teams (id integer primary key); insert into teams values (1); insert into teams values (2); \
          create table people (id integer primary key, team_id integer not null references teams(id), \
            full_name varchar(20) not null, email varchar(40), age integer); \
-         create unique index ux_people_email on people (email)",
+         create unique index ux_people_email on people (email); \
+         create unique index ux_people_name on people (full_name, team_id)",
     )
     .await;
     let main = list_schemas(&st, &p.id).await.unwrap()[0].name.clone();
@@ -743,15 +744,17 @@ async fn test_data_takes_ai_rows_for_text_columns() {
     let s = st.engine.session_for_tests(&p.id).await.unwrap();
     let rows = databrain_connector_core::query_text(
         &*s,
-        "select count(*), sum(full_name = 'Linh Tran'), count(distinct email), sum(team_id not in (1, 2)), max(length(full_name)) from people",
+        "select count(*), sum(full_name like 'Linh Tran%'), count(distinct email), sum(team_id not in (1, 2)), max(length(full_name)), \
+         count(distinct full_name || '|' || team_id) from people",
     )
     .await
     .unwrap();
     assert_eq!(rows[0][0].as_deref(), Some("8"));
-    assert_eq!(rows[0][1].as_deref(), Some("4"), "every other row");
+    assert_eq!(rows[0][1].as_deref(), Some("4"), "every other row (numbered where (full_name, team_id) would repeat)");
     assert_eq!(rows[0][2].as_deref(), Some("8"), "unique emails, AI repeats included");
     assert_eq!(rows[0][3].as_deref(), Some("0"), "foreign keys from the parent");
     assert!(rows[0][4].as_deref().unwrap().parse::<u32>().unwrap() <= 20);
+    assert_eq!(rows[0][5].as_deref(), Some("8"), "UNIQUE (full_name, team_id) holds with 2 parents and reused AI rows");
 
     // Refused before anything is sent: no AI provider, AI off for the
     // connection, or table structure not shared with the AI.

@@ -196,6 +196,8 @@ struct Prepared {
     chosen: Vec<usize>,
     /// Lower-case names of columns with a one-column UNIQUE constraint.
     unique: HashSet<String>,
+    /// UNIQUE constraints and indexes of several columns (lower case).
+    unique_groups: Vec<Vec<String>>,
     ddl: Option<String>,
 }
 
@@ -328,20 +330,21 @@ impl QueryEngine {
         if chosen.is_empty() {
             return Err(EngineError::new("invalid", "No column to fill: every column is left to the database or has a type DataBrain can't make up"));
         }
-        let mut unique = unique_columns(ddl.as_deref(), &detail.columns);
+        let mut keys = unique_keys(ddl.as_deref(), &detail.columns);
         // Unique indexes as the server reports them (SQLite and DuckDB keep
         // them out of the table's DDL).
         if let Ok(layout) = self.table_layout(connection_id, schema, name).await {
             for ix in layout.indexes.iter().filter(|ix| ix.unique && !ix.primary) {
-                if let [one] = ix.columns.as_slice()
-                    && let Some(c) = index_column(one)
-                    && detail.columns.iter().any(|x| x.name.to_lowercase() == c)
-                {
-                    unique.insert(c);
+                let key: Option<Vec<String>> =
+                    ix.columns.iter().map(|c| index_column(c).filter(|c| detail.columns.iter().any(|x| x.name.to_lowercase() == *c))).collect();
+                if let Some(key) = key.filter(|k| !k.is_empty() && !keys.contains(k)) {
+                    keys.push(key);
                 }
             }
         }
-        Ok(Prepared { kind, plan, gens, chosen, unique, ddl })
+        let unique = keys.iter().filter(|k| k.len() == 1).flatten().cloned().collect();
+        let unique_groups = keys.into_iter().filter(|k| k.len() > 1).collect();
+        Ok(Prepared { kind, plan, gens, chosen, unique, unique_groups, ddl })
     }
 
     /// Rows for `spec`; with `sample`, the AI's values go into its columns
@@ -355,7 +358,7 @@ impl QueryEngine {
         sample: Option<&AiSample>,
     ) -> Result<TestData> {
         let prepared = self.prepare(connection_id, schema, name, spec).await?;
-        let Prepared { kind, plan, gens, chosen, unique, .. } = &prepared;
+        let Prepared { kind, plan, gens, chosen, unique, unique_groups, .. } = &prepared;
         let (kind, plan, gens, chosen) = (*kind, plan, gens, chosen);
         let mut notes = plan.warnings.clone();
         let seed = spec.seed.unwrap_or_else(new_seed);
@@ -473,8 +476,16 @@ impl QueryEngine {
         }
 
         let nullable: Vec<bool> = chosen.iter().map(|&i| plan.columns[i].nullable && !plan.columns[i].primary_key).collect();
+        // Unique keys of several columns: positions in the row, when every
+        // column of the key is filled and the AI writes one of them.
+        let groups: Vec<Vec<usize>> = unique_groups
+            .iter()
+            .filter_map(|key| key.iter().map(|c| chosen.iter().position(|&i| plan.columns[i].name.to_lowercase() == *c)).collect::<Option<Vec<usize>>>())
+            .filter(|g| g.iter().any(|&k| matches!(sources[k], Source::Sample { .. })))
+            .collect();
         let mut misfits = 0usize;
-        let batches = generate(&columns, &sources, &nullable, &parents, sample, spec.rows as usize, spec.null_percent.min(100), &mut rng, &mut misfits)?;
+        let batches =
+            generate(&columns, &sources, &nullable, &parents, sample, &groups, spec.rows as usize, spec.null_percent.min(100), &mut rng, &mut misfits)?;
         if misfits > 0 {
             notes.push(format!(
                 "{misfits} AI value{} didn't fit {} column (type, length, allowed values, NOT NULL or uniqueness) and {} made up instead.",
@@ -1301,6 +1312,50 @@ fn real_date(s: &str) -> bool {
     d <= days_from_civil(ny, nm as u32, 1) - days_from_civil(y, m as u32, 1)
 }
 
+/// Make `row`'s values of a unique key of several columns a combination not
+/// given yet: reused AI rows repeat whole rows, so the AI text column of the
+/// key gets a numbered variant (`Ann Lee 2`, `ann+2@x.com`) that still fits.
+/// A key with a NULL can repeat (NULLs are distinct), so it is left alone.
+fn distinct_combination(row: &mut [Value], key: &[usize], sources: &[Source], seen: &mut HashSet<String>) {
+    let combo = |row: &[Value]| -> Option<String> {
+        let mut parts = Vec::with_capacity(key.len());
+        for &k in key {
+            match &row[k] {
+                Value::Null => return None,
+                v => parts.push(format!("{v:?}")),
+            }
+        }
+        Some(parts.join("\u{1}"))
+    };
+    let Some(first) = combo(row) else { return };
+    if seen.insert(first) {
+        return;
+    }
+    for &k in key {
+        let (Source::Sample { fallback: Gen::Text { max, .. }, .. }, Value::Text(t)) = (&sources[k], &row[k]) else { continue };
+        let base = t.clone();
+        for n in 2..10_000 {
+            let Some(v) = variant(&base, n, *max) else { break };
+            row[k] = Value::Text(v);
+            if let Some(c) = combo(row)
+                && seen.insert(c)
+            {
+                return;
+            }
+        }
+        row[k] = Value::Text(base);
+    }
+}
+
+/// `t` numbered `n` (`ann+2@x.com`, `Ann 2`), or `None` when it wouldn't fit.
+fn variant(t: &str, n: u32, max: Option<usize>) -> Option<String> {
+    let v = match t.split_once('@') {
+        Some((local, domain)) => format!("{local}+{n}@{domain}"),
+        None => format!("{t} {n}"),
+    };
+    max.is_none_or(|m| v.len() <= m).then_some(v)
+}
+
 /// `t`, or a variant of it not given yet (`ann+2@x.com`, `Ann 2`) that
 /// still fits the column; `None` when there is none.
 fn distinct(seen: &mut HashSet<String>, t: String, g: &Gen) -> Option<Value> {
@@ -1312,13 +1367,7 @@ fn distinct(seen: &mut HashSet<String>, t: String, g: &Gen) -> Option<Value> {
         _ => return None,
     };
     for n in 2..1000 {
-        let v = match t.split_once('@') {
-            Some((local, domain)) => format!("{local}+{n}@{domain}"),
-            None => format!("{t} {n}"),
-        };
-        if max.is_some_and(|m| v.chars().count() > m) {
-            return None;
-        }
+        let v = variant(&t, n, max)?;
         if seen.insert(v.clone()) {
             return Some(Value::Text(v));
         }
@@ -1329,27 +1378,33 @@ fn distinct(seen: &mut HashSet<String>, t: String, g: &Gen) -> Option<Value> {
 /// Lower-case names of columns with a one-column UNIQUE constraint or
 /// unique index in the DDL (`email text UNIQUE`, `UNIQUE (email)`,
 /// `UNIQUE KEY uq (email)`, `CREATE UNIQUE INDEX … ON t (email)`).
+#[cfg(test)]
 fn unique_columns(ddl: Option<&str>, cols: &[ColumnInfo]) -> HashSet<String> {
-    let mut out = HashSet::new();
+    unique_keys(ddl, cols).into_iter().filter(|k| k.len() == 1).flatten().collect()
+}
+
+/// The column lists (lower case) of the UNIQUE constraints and unique
+/// indexes in the DDL, one-column and several (`UNIQUE (first_name,
+/// last_name)`). A list with a part that isn't a column is left out.
+fn unique_keys(ddl: Option<&str>, cols: &[ColumnInfo]) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
     let Some(ddl) = ddl else { return out };
     let norm = |s: &str| s.trim().trim_matches(['"', '`', '[', ']']).to_lowercase();
     let is_col = |n: &str| cols.iter().any(|c| c.name.to_lowercase() == n);
-    // The one column of a `(a)` list, when it is one of the table's.
-    let one = |list: &str| -> Option<String> {
-        match top_level(list, ',').as_slice() {
-            [n] => index_column(n).filter(|n| is_col(n)),
-            _ => None,
+    let list = |l: &str| -> Option<Vec<String>> { top_level(l, ',').into_iter().map(|n| index_column(n).filter(|n| is_col(n))).collect() };
+    let mut add = |k: Vec<String>| {
+        if !k.is_empty() && !out.contains(&k) {
+            out.push(k);
         }
     };
-    let parens = |t: &str| balanced(t).map(str::to_string);
     for stmt in top_level(ddl, ';') {
         let upper = stmt.to_ascii_uppercase();
         let words: Vec<&str> = upper.split_whitespace().collect();
         if words.first() == Some(&"CREATE") && words.contains(&"UNIQUE") && words.contains(&"INDEX") {
             if let Some(on) = upper.find(" ON ")
-                && let Some(n) = parens(&stmt[on..]).and_then(|l| one(&l))
+                && let Some(k) = balanced(&stmt[on..]).and_then(list)
             {
-                out.insert(n);
+                add(k);
             }
             continue;
         }
@@ -1365,13 +1420,13 @@ fn unique_columns(ddl: Option<&str>, cols: &[ColumnInfo]) -> HashSet<String> {
             let first = du.split_whitespace().next().unwrap_or("");
             if matches!(first, "UNIQUE" | "CONSTRAINT" | "PRIMARY" | "KEY" | "INDEX") {
                 // A table constraint: its column list.
-                if let Some(n) = parens(&def[at..]).and_then(|l| one(&l)) {
-                    out.insert(n);
+                if let Some(k) = balanced(&def[at..]).and_then(list) {
+                    add(k);
                 }
             } else if let Some(name) = def.split_whitespace().next().map(norm)
                 && is_col(&name)
             {
-                out.insert(name);
+                add(vec![name]);
             }
         }
     }
@@ -1472,6 +1527,7 @@ fn generate(
     nullable: &[bool],
     parents: &[Vec<Vec<Option<String>>>],
     sample: Option<&AiSample>,
+    groups: &[Vec<usize>],
     rows: usize,
     null_percent: u8,
     rng: &mut Rng,
@@ -1484,6 +1540,8 @@ fn generate(
     // The AI's columns draw from their own stream, so how many values of an
     // answer fit doesn't change the other columns: the seed still repeats them.
     let mut ai_rng = Rng(rng.0 ^ 0x5DEE_CE66_D1CE_4E5B);
+    // Combinations given so far, per unique key of several columns.
+    let mut seen_groups: Vec<HashSet<String>> = vec![HashSet::new(); groups.len()];
     for i in 0..rows {
         // One parent tuple per foreign key per row, shared by its columns.
         let picks: Vec<usize> = parents
@@ -1545,6 +1603,10 @@ fn generate(
                 }
             })
             .collect();
+        let mut row = row;
+        for (g, key) in groups.iter().enumerate() {
+            distinct_combination(&mut row, key, sources, &mut seen_groups[g]);
+        }
         b.push_row(row);
         if b.is_full() {
             out.push(b.finish()?);
@@ -1686,7 +1748,7 @@ mod tests {
 
         let columns = vec![Column::new("d", ColType::Date, "date"), Column::new("f", ColType::Float64, "real")];
         let sources = vec![Source::Key { maker: Gen::Date, start: day, tag: String::new() }, Source::Key { maker: Gen::Float, start: 7, tag: String::new() }];
-        let b = generate(&columns, &sources, &[false, false], &[], None, 5000, 0, &mut rng, &mut 0).unwrap();
+        let b = generate(&columns, &sources, &[false, false], &[], None, &[], 5000, 0, &mut rng, &mut 0).unwrap();
         let dates: HashSet<i32> = b.iter().flat_map(|x| x.column(0).as_any().downcast_ref::<Date32Array>().unwrap().values().to_vec()).collect();
         assert_eq!(dates.len(), 5000);
         assert!(dates.contains(&(day as i32)));
@@ -1763,7 +1825,54 @@ mod tests {
         assert_eq!(index_column("[email] DESC").as_deref(), Some("email"));
         assert_eq!(index_column("\"Email\"").as_deref(), Some("email"));
         assert_eq!(index_column("(a + b)"), None);
+        // Keys of several columns.
+        let keys = unique_keys(
+            Some(
+                "CREATE TABLE t (id int, email text, code text, a text, UNIQUE (code, a), UNIQUE (a, lower(x)));\nCREATE UNIQUE INDEX ux ON t (\"email\", code);",
+            ),
+            &cols,
+        );
+        assert_eq!(keys, vec![vec!["code".to_string(), "a".to_string()], vec!["email".to_string(), "code".to_string()]], "x isn't a column");
         assert!(unique_columns(None, &cols).is_empty());
+    }
+
+    #[test]
+    fn reused_ai_rows_keep_unique_keys_of_several_columns_unique() {
+        let columns = vec![
+            Column::new("first", ColType::Utf8, "varchar(20)"),
+            Column::new("last", ColType::Utf8, "varchar(20)"),
+            Column::new("team", ColType::Int64, "int"),
+        ];
+        let text = Gen::Text { max: Some(20), flavor: Flavor::FirstName };
+        let sources = vec![
+            Source::Sample { col: 0, fallback: text.clone(), unique: false },
+            Source::Sample { col: 1, fallback: text, unique: false },
+            Source::Key { maker: Gen::Int { min: 1, max: 9 }, start: 1, tag: String::new() },
+        ];
+        let sample = AiSample {
+            columns: vec!["first".into(), "last".into()],
+            rows: vec![vec![Some("Ann".into()), Some("Lee".into())], vec![Some("Bo".into()), Some("Kim".into())]],
+        };
+        let strings = |b: &[RecordBatch], c: usize| -> Vec<String> {
+            b[0].column(c).as_any().downcast_ref::<StringArray>().unwrap().iter().map(|v| v.unwrap().to_string()).collect()
+        };
+        // UNIQUE (first, last): the 3rd row on reuses "Ann Lee", so a numbered variant.
+        let b = generate(&columns, &sources, &[false; 3], &[], Some(&sample), &[vec![0, 1]], 6, 0, &mut Rng(1), &mut 0).unwrap();
+        let (first, last) = (strings(&b, 0), strings(&b, 1));
+        assert_eq!(first, ["Ann", "Bo", "Ann 2", "Bo 2", "Ann 3", "Bo 3"]);
+        assert_eq!(last, ["Lee", "Kim", "Lee", "Kim", "Lee", "Kim"], "one column of the key changes, the other keeps the AI's value");
+        // UNIQUE (first, team): the counting key already makes each row distinct.
+        let b = generate(&columns, &sources, &[false; 3], &[], Some(&sample), &[vec![0, 2]], 6, 0, &mut Rng(1), &mut 0).unwrap();
+        assert_eq!(strings(&b, 0), ["Ann", "Bo", "Ann", "Bo", "Ann", "Bo"]);
+        // A variant that wouldn't fit the column isn't used: the next text column of the key changes.
+        let tight = vec![
+            Source::Sample { col: 0, fallback: Gen::Text { max: Some(3), flavor: Flavor::FirstName }, unique: false },
+            Source::Sample { col: 1, fallback: Gen::Text { max: Some(20), flavor: Flavor::LastName }, unique: false },
+            Source::Random(Gen::Int { min: 1, max: 1 }),
+        ];
+        let b = generate(&columns, &tight, &[false; 3], &[], Some(&sample), &[vec![0, 1]], 4, 0, &mut Rng(1), &mut 0).unwrap();
+        assert_eq!(strings(&b, 0), ["Ann", "Bo", "Ann", "Bo"]);
+        assert_eq!(strings(&b, 1), ["Lee", "Kim", "Lee 2", "Kim 2"]);
     }
 
     #[test]
@@ -1813,7 +1922,7 @@ mod tests {
             ],
         };
         let mut misfits = 0;
-        let b = generate(&columns, &sources, &[false, false, false], &[], Some(&sample), 6, 0, &mut Rng(1), &mut misfits).unwrap();
+        let b = generate(&columns, &sources, &[false, false, false], &[], Some(&sample), &[], 6, 0, &mut Rng(1), &mut misfits).unwrap();
         let text =
             |c: usize| -> Vec<String> { b[0].column(c).as_any().downcast_ref::<StringArray>().unwrap().iter().map(|v| v.unwrap().to_string()).collect() };
         let names = text(0);
@@ -1832,13 +1941,13 @@ mod tests {
 
         // NULLs come from the NULL share only, not from the AI.
         let mut misfits = 0;
-        let b = generate(&columns[..1], &sources[..1], &[true], &[], Some(&sample), 3, 0, &mut Rng(1), &mut misfits).unwrap();
+        let b = generate(&columns[..1], &sources[..1], &[true], &[], Some(&sample), &[], 3, 0, &mut Rng(1), &mut misfits).unwrap();
         assert_eq!(b[0].column(0).null_count(), 0);
 
         // The same seed gives the same other columns, whatever the AI wrote.
         let other = AiSample { columns: sample.columns.clone(), rows: vec![vec![Some("Way too long a name".into()), Some("x@y.z".into())]] };
         let nums = |s: &AiSample| -> Vec<i64> {
-            let b = generate(&columns, &sources, &[false, false, false], &[], Some(s), 6, 0, &mut Rng(9), &mut 0).unwrap();
+            let b = generate(&columns, &sources, &[false, false, false], &[], Some(s), &[], 6, 0, &mut Rng(9), &mut 0).unwrap();
             b[0].column(2).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()
         };
         assert_eq!(nums(&sample), nums(&other));
@@ -1886,8 +1995,8 @@ mod tests {
         };
         let parents = vec![vec![vec![Some("7".to_string())], vec![Some("9".to_string())]]];
         let nullable = [false, false, false, true];
-        let a = generate(&columns, &mk(), &nullable, &parents, None, 10_000, 50, &mut Rng(7), &mut 0).unwrap();
-        let b = generate(&columns, &mk(), &nullable, &parents, None, 10_000, 50, &mut Rng(7), &mut 0).unwrap();
+        let a = generate(&columns, &mk(), &nullable, &parents, None, &[], 10_000, 50, &mut Rng(7), &mut 0).unwrap();
+        let b = generate(&columns, &mk(), &nullable, &parents, None, &[], 10_000, 50, &mut Rng(7), &mut 0).unwrap();
         assert_eq!(a.len(), 2, "8192 rows per batch");
         assert_eq!(a, b, "same seed, same rows");
         let ids: Vec<i64> = a.iter().flat_map(|x| x.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect();
