@@ -11,6 +11,7 @@ import { drafts } from "./drafts";
 import { ChatItemView } from "./ChatItems";
 import { AutoApproveToggle, ConnectionPicker } from "./pickers";
 import { INPUT_H_DEFAULT, INPUT_H_KEY, InputResizeHandle, clampInputH } from "./InputResizeHandle";
+import { IndexHint } from "./IndexHint";
 
 const NO_MODELS: string[] = [];
 
@@ -143,6 +144,7 @@ export function Chat({ chatId }: { chatId: string }) {
 
   return (
     <>
+      {providers.length > 0 && <IndexHint connId={connId} />}
       <div ref={scroller} onScroll={stick.onScroll} className="min-h-0 flex-1 space-y-3 overflow-auto p-3">
         {providers.length === 0 && (
           <div className="rounded-lg border border-line bg-panel-2 p-3 text-[12.5px]">

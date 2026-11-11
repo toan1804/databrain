@@ -201,6 +201,10 @@ interface AiState extends Mirrored {
   init: () => Promise<void>;
   setOpen: (open: boolean, view?: AiView) => void;
   setView: (view: AiView) => void;
+  /** A connection the Knowledge tab should open on (then cleared by it). */
+  knowledgeFocus: string | null;
+  /** Show Knowledge → Index for a connection (the chat's index hint). */
+  openKnowledge: (connectionId: string) => void;
   refreshProviders: () => Promise<void>;
   setProvider: (id: string | null, model?: string | null) => void;
   /** Models of each provider (shared by the AI panel and Settings, kept across restarts). */
@@ -755,6 +759,8 @@ export const useAi = create<AiState>((set, get) => {
       set(view ? { open, view } : { open });
     },
     setView: (view) => set({ view }),
+    knowledgeFocus: null,
+    openKnowledge: (connectionId) => set({ view: "knowledge", knowledgeFocus: connectionId }),
 
     refreshProviders: async () => {
       const providers = await api.aiListProviders();

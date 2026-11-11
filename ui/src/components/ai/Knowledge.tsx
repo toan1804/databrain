@@ -34,7 +34,8 @@ export function Knowledge() {
   const version = useAi((s) => s.knowledgeVersion);
   const indexKnowledge = useAi((s) => s.indexKnowledge);
   const cancelIndex = useAi((s) => s.cancelIndex);
-  const [connId, setConnId] = useState<string | null>(activeConn ?? connections[0]?.id ?? null);
+  const focus = useAi((s) => s.knowledgeFocus);
+  const [connId, setConnId] = useState<string | null>(focus ?? activeConn ?? connections[0]?.id ?? null);
   const [data, setData] = useState<KnowledgeView | null>(null);
   const [filter, setFilter] = useState("");
   const [objects, setObjects] = useState<{ list: KnObject[]; total: number } | null>(null);
@@ -51,6 +52,13 @@ export function Knowledge() {
       // Remembering the tab is a convenience only.
     }
   };
+  // Opened for a connection (the chat's "Index in Knowledge"): that one, on Index.
+  useEffect(() => {
+    if (!focus) return;
+    setConnId(focus);
+    setPartState("index");
+    useAi.setState({ knowledgeFocus: null });
+  }, [focus]);
   const [learned, setLearned] = useState<LearnedView | null>(null);
   const prog = connId ? progress[connId] : undefined;
   const connName = connections.find((c) => c.id === connId)?.name ?? "notes";
