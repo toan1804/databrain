@@ -4,6 +4,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+
 ### Added
 
 - Column patterns in Generate test data: a Pattern column sets the rule each column's values follow: ranges for numbers, dates and times (`18..90`, `1950-01-01..2005-12-31`, `08:00..18:00`), `{a|b|c}` for one of a list, and templates for text (`%@gmail.com`, `INV-#####`, `+84 ### ### ###`, `%d/%m/%Y`, where `#` is a digit, `?` a letter and `%` a word that suits the column). Columns get sensible defaults from their names (`age` 18..90, `price` 1..1000, `rating` 1..5, `birth_date` 1950–2005, latitude and longitude), "Suggest patterns with AI" asks the AI for patterns from the table's structure, and AI-written values must follow them. Patterns are remembered per table, and "Pattern guide" in the dialog shows how to write them with examples to click. Unique columns and unique keys of several columns stay unique when a pattern or reused AI rows would repeat a value: a text column gets a numbered variant, a number or date another made-up value, and rows that still can't be unique are reported.
@@ -17,6 +18,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Format keeps `:name` parameters as written: it refused queries with parameters on most engines (MySQL, MariaDB, BigQuery, Snowflake, Databricks and generic SQL), and on SQL Server, DuckDB, ClickHouse and Trino turned `= :id` into `=: id`, which is no longer a parameter. Parameters are found as running finds them (not in strings, comments or `::` casts, Oracle `&name` too) and put back exactly.
 - Cost preview follows the tab's connection: switching a tab to another connection without editing (BigQuery dev → prod) kept the old connection's bytes and maximum-bytes-billed warning, a reply still on its way for the old connection showed as current, and a connection without cost preview (PostgreSQL) kept the old bar. An estimate is now of one connection, statement and set of parameters; the bar clears when the tab moves, and BigQuery checks again on the new connection.
 - Compare plans no longer reports a full scan that is still there as removed: a rewrite that adds a selective `WHERE` (a PostgreSQL Seq Scan estimated at 50,000 rows, then 200) showed "No longer: Seq Scan orders" and "Full scans 1 → 0" in green, because the scan's row estimate is the rows after its filter. A full scan of a table that the other plan scans in full now counts on both sides, and with Analyze the rows a filter dropped count as read.
 - Compare plans explains both statements again when compared again with new parameter values, and says the tab's connection no longer exists instead of spinning.

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { EditorView } from "@codemirror/view";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { ClipboardCopy, ClipboardPaste, Network, Scissors, TextSelect, WandSparkles } from "lucide-react";
-import { toError } from "../lib/api";
+import { api, isTauri, toError } from "../lib/api";
 import type { ConnectorKind } from "../lib/types";
 import { useStore } from "../store";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
@@ -22,7 +22,9 @@ export async function formatInView(view: EditorView, kind: ConnectorKind | undef
   try {
     // Loaded on first use (the formatter's dialect grammars are large).
     const { formatSql } = await import("../lib/formatSql");
-    out = formatSql(text, kind);
+    // `:name` parameters as the engine finds them (not in strings, comments or `::` casts): kept as written.
+    const params = kind && isTauri() ? await api.sqlParameters(kind, text).catch(() => []) : [];
+    out = formatSql(text, kind, { params });
   } catch (e) {
     useStore.getState().toast(`Could not format: ${toError(e).message}`, "error");
     return false;
