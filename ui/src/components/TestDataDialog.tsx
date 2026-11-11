@@ -55,7 +55,7 @@ export function specFor(
     skip: cols.filter((c) => c.supported && !c.database_fills && !ticked.has(c.name)).map((c) => c.name),
     fill: cols.filter((c) => c.supported && c.database_fills && ticked.has(c.name)).map((c) => c.name),
     parent_keys: parentKeys,
-    patterns: patternsFor(cols, patterns),
+    patterns: patternsFor(cols, patterns, ticked),
   };
 }
 
@@ -97,6 +97,9 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   const storedPatterns = useStore((s) => s.testDataPatterns[pKey]);
   const savePatterns = useStore((s) => s.setTestDataPatterns);
   const [patterns, setPatterns] = useState<Record<string, string>>(() => storedPatterns ?? {});
+  // The patterns as last rendered, for code that runs after an await.
+  const patternsNow = useRef(patterns);
+  patternsNow.current = patterns;
   const [suggesting, setSuggesting] = useState(false);
   const [guide, setGuide] = useState(false);
   // The pattern field last clicked: where the guide's examples go.
@@ -191,9 +194,9 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
     setSuggesting(true);
     try {
       const got = await api.suggestTestDataPatterns(req.connection_id, req.schema, req.table, spec(), { ...target, all_columns: true, rows: 1 }, run);
-      const next = { ...patterns, ...got };
-      setPatterns(next);
-      savePatterns(pKey, next);
+      // Over the patterns as they are now: edits typed while the AI ran stay.
+      setPatterns((cur) => ({ ...cur, ...got }));
+      savePatterns(pKey, { ...patternsNow.current, ...got });
       const n = Object.keys(got).length;
       toast(n ? `${providerName} suggested ${n} pattern${n === 1 ? "" : "s"}: check them in the Pattern column` : `${providerName} had no pattern to suggest`, "info");
     } catch (e) {

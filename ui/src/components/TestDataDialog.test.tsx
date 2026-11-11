@@ -1,7 +1,14 @@
-import { describe, expect, it } from "vitest";
-import type { TestDataColumn } from "../lib/types";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useAi } from "../aiStore";
+import { api } from "../lib/api";
+import type { ConnectionView, ProviderView, TestDataColumn, TestDataPlan } from "../lib/types";
+import { useStore } from "../store";
 import { suggestTable, testDataTable } from "./LoadIntoDialog";
-import { defaultColumns, MAX_SEED, seedProblem, specFor } from "./TestDataDialog";
+import { defaultColumns, MAX_SEED, seedProblem, specFor, TestDataDialogHost } from "./TestDataDialog";
+
+// No Tauri events in tests.
+vi.mock("../lib/api", async (importOriginal) => ({ ...(await importOriginal<typeof import("../lib/api")>()), onLoadProgress: () => Promise.resolve(() => {}) }));
 
 const col = (name: string, p: Partial<TestDataColumn> = {}): TestDataColumn => ({
   name,
@@ -40,6 +47,12 @@ describe("test data dialog", () => {
     expect(s.patterns).toEqual({ age: "18..90", email: "%@corp.vn", born: "" });
   });
 
+  it("sends patterns of ticked columns only, so one kept for a column left out doesn't block generating", () => {
+    const pcols = [col("age", { pattern: "18..90", pattern_hint: "18..90" }), col("code", { pattern_hint: "%@gmail.com" })];
+    const s = specFor(pcols, new Set(["age"]), 10, 0, "", true, { code: "INV-##### far too long {" });
+    expect(s.patterns).toEqual({ age: "18..90" });
+  });
+
   it("sends only seeds that a JavaScript number keeps exactly", () => {
     expect(specFor(cols, new Set(), 1, 0, String(MAX_SEED), true).seed).toBe(9007199254740991);
     expect(seedProblem("9007199254740991")).toBeNull();
@@ -54,5 +67,42 @@ describe("test data dialog", () => {
     expect(suggestTable(sql, null)).toBe('"public"."orders"');
     expect(testDataTable("select * from orders")).toBeNull();
     expect(suggestTable("select * from sales.orders")).toBe("orders");
+  });
+});
+
+describe("suggest patterns with AI", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("keeps pattern edits typed while the AI was suggesting", async () => {
+    const conn = {
+      id: "c1",
+      name: "Dev",
+      connected: true,
+      env: "dev",
+      has_secret: false,
+      created_at: 0,
+      updated_at: 0,
+      config: { kind: "postgres", auth: { kind: "none" }, ssl_mode: "prefer", read_only: false },
+      ai_policy: { ai_enabled: true, share_metadata: true, allowed_providers: [] },
+    } as unknown as ConnectionView;
+    const plan: TestDataPlan = {
+      table: '"public"."people"',
+      columns: [col("age", { pattern: "18..90", pattern_hint: "18..90" }), col("email", { data_type: "text", pattern_hint: "%@gmail.com" })],
+      foreign_keys: [],
+      warnings: [],
+    };
+    useStore.setState({ connections: [conn], testDataPatterns: {}, testDataDialog: { connection_id: "c1", schema: "public", table: "people" } });
+    useAi.setState({ providers: [{ id: "p1", name: "AI", kind: "anthropic" } as unknown as ProviderView], providerId: "p1", model: null });
+    vi.spyOn(api, "testDataPlan").mockResolvedValue(plan);
+    let answer: (v: Record<string, string>) => void = () => {};
+    vi.spyOn(api, "suggestTestDataPatterns").mockImplementation(() => new Promise((r) => (answer = r)));
+    render(<TestDataDialogHost />);
+    const email = await screen.findByLabelText("Pattern for email");
+    fireEvent.click(screen.getByText("Suggest patterns with AI"));
+    fireEvent.change(email, { target: { value: "%@corp.vn" } });
+    await act(async () => answer({ age: "20..60" }));
+    await waitFor(() => expect(screen.getByLabelText("Pattern for age")).toHaveValue("20..60"));
+    expect(screen.getByLabelText("Pattern for email")).toHaveValue("%@corp.vn");
+    expect(useStore.getState().testDataPatterns["c1|public.people"]).toEqual({ age: "20..60", email: "%@corp.vn" });
   });
 });

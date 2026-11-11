@@ -20,6 +20,9 @@
 //! - A column's pattern (`18..90`, `%@gmail.com`, `INV-####`; see
 //!   [`PATTERN_HELP`]) shapes its values: the user's, the AI's suggestion,
 //!   or a default from the column's name (`age`, `price`, `birth_date`).
+//!   Ranges must fit the column's type (`numeric(5,2)` holds up to 999.99,
+//!   MySQL TIMESTAMP 1970–2038). Keys, foreign keys and columns the
+//!   database fills take none.
 //! - "Generate with AI" ([`QueryEngine::test_data_ai_ask`], then
 //!   [`QueryEngine::generate_test_data_with`]): an AI model writes a few
 //!   hundred realistic rows for the text columns (or every column it can),
@@ -44,7 +47,7 @@ use crate::{EngineError, LoadRows, QueryEngine, Result};
 #[path = "testdata_pattern.rs"]
 mod pattern;
 pub use pattern::PATTERN_HELP;
-use pattern::Pattern;
+use pattern::{Limits, Pattern};
 
 /// Most rows one request makes.
 pub const MAX_TEST_ROWS: u32 = 100_000;
@@ -352,10 +355,11 @@ impl QueryEngine {
         Ok(suggested
             .into_iter()
             .filter(|(col, p)| {
-                plan.columns
-                    .iter()
-                    .zip(&gens)
-                    .any(|(c, g)| c.name.eq_ignore_ascii_case(col) && c.pattern_hint.is_some() && g.as_ref().is_some_and(|g| Pattern::parse(g, p).is_ok()))
+                plan.columns.iter().zip(&gens).any(|(c, g)| {
+                    c.name.eq_ignore_ascii_case(col)
+                        && c.pattern_hint.is_some()
+                        && g.as_ref().is_some_and(|g| Pattern::parse(g, &type_limits(kind, &c.data_type), p).is_ok())
+                })
             })
             .collect())
     }
@@ -371,23 +375,6 @@ impl QueryEngine {
         let detail = self.describe(connection_id, schema, name).await?;
         let ddl = self.object_ddl(connection_id, schema, name, ObjectKind::Table).await.ok().flatten();
         let (plan, mut gens) = plan_for(kind, schema, name, &detail.columns, &detail.foreign_keys, ddl.as_deref());
-        // Patterns: the spec's, else the default from the column's name.
-        for (i, c) in plan.columns.iter().enumerate() {
-            let given = spec.patterns.iter().find(|(k, _)| k.eq_ignore_ascii_case(&c.name)).map(|(_, v)| v.trim().to_string());
-            let text = match given {
-                Some(t) => t,
-                None => c.pattern.clone().unwrap_or_default(),
-            };
-            if text.is_empty() {
-                continue;
-            }
-            if c.pattern_hint.is_none() {
-                return Err(EngineError::new("invalid", format!("{}: keys, foreign keys and {} columns don't take a pattern", c.name, c.data_type)));
-            }
-            let Some(base) = gens[i].take() else { continue };
-            let pattern = Pattern::parse(&base, &text).map_err(|e| EngineError::new("invalid", format!("Pattern for {} ({text}): {e}", c.name)))?;
-            gens[i] = Some(Gen::Patterned { base: Box::new(base), pattern, text });
-        }
         let skip: HashSet<String> = spec.skip.iter().map(|s| s.to_lowercase()).collect();
         let fill: HashSet<String> = spec.fill.iter().map(|s| s.to_lowercase()).collect();
         let chosen: Vec<usize> = plan
@@ -400,6 +387,7 @@ impl QueryEngine {
         if chosen.is_empty() {
             return Err(EngineError::new("invalid", "No column to fill: every column is left to the database or has a type DataBrain can't make up"));
         }
+        apply_patterns(kind, &plan, &mut gens, &chosen, &spec.patterns)?;
         let mut keys = unique_keys(ddl.as_deref(), &detail.columns);
         // Unique indexes as the server reports them (SQLite and DuckDB keep
         // them out of the table's DDL).
@@ -459,7 +447,8 @@ impl QueryEngine {
                 },
                 None => None,
             };
-            let start = key_start(&maker, found.as_deref(), spec.rows, &col.name, &col.data_type).map_err(|m| EngineError::new("invalid", m))?;
+            let start = key_start(&maker, &type_limits(kind, &col.data_type), found.as_deref(), spec.rows, &col.name, &col.data_type)
+                .map_err(|m| EngineError::new("invalid", m))?;
             let tag: String = (0..4).map(|_| (b'a' + rng.below(26) as u8) as char).collect();
             sources[k] = Source::Key { maker, start, tag };
         }
@@ -610,6 +599,37 @@ impl QueryEngine {
     }
 }
 
+/// The patterns of the columns filled (`chosen`; a column left out keeps
+/// whatever was typed for it, valid or not): the spec's, else the default
+/// from the column's name. A pattern asked for a column that takes none
+/// (key, foreign key, filled by the database) is refused.
+fn apply_patterns(kind: ConnectorKind, plan: &TestDataPlan, gens: &mut [Option<Gen>], chosen: &[usize], patterns: &HashMap<String, String>) -> Result<()> {
+    for &i in chosen {
+        let c = &plan.columns[i];
+        let given = patterns.iter().find(|(k, _)| k.eq_ignore_ascii_case(&c.name)).map(|(_, v)| v.trim().to_string());
+        let text = match given {
+            Some(t) => t,
+            // Only a column that takes a pattern has a default.
+            None if c.pattern_hint.is_some() => c.pattern.clone().unwrap_or_default(),
+            None => String::new(),
+        };
+        if text.is_empty() {
+            continue;
+        }
+        if c.pattern_hint.is_none() {
+            return Err(EngineError::new(
+                "invalid",
+                format!("{}: keys, foreign keys, columns the database fills and {} columns don't take a pattern", c.name, c.data_type),
+            ));
+        }
+        let Some(base) = gens[i].take() else { continue };
+        let pattern = Pattern::parse(&base, &type_limits(kind, &c.data_type), &text)
+            .map_err(|e| EngineError::new("invalid", format!("Pattern for {} ({text}): {e}", c.name)))?;
+        gens[i] = Some(Gen::Patterned { base: Box::new(base), pattern, text });
+    }
+    Ok(())
+}
+
 /// `SELECT DISTINCT` of a parent's key columns, non-NULL, capped.
 fn parent_keys_sql(kind: ConnectorKind, parent: &str, cols: &[&str], n: usize) -> String {
     let list = cols.iter().map(|c| quote_ident(kind, c)).collect::<Vec<_>>().join(", ");
@@ -724,8 +744,8 @@ fn binary_key_len(max: Option<usize>) -> usize {
 /// Where the counting key starts (see [`key_value`] for what the number
 /// means per type), from what [`key_read`] read: `None` when the table is
 /// empty or it couldn't be read. `Err`: the column can't hold `rows` new
-/// unique keys.
-fn key_start(g: &Gen, found: Option<&str>, rows: u32, col: &str, data_type: &str) -> std::result::Result<i64, String> {
+/// unique keys (`limits`: what its type holds).
+fn key_start(g: &Gen, limits: &Limits, found: Option<&str>, rows: u32, col: &str, data_type: &str) -> std::result::Result<i64, String> {
     let g = g.base();
     let rows = i64::from(rows.max(1));
     let full = |what: &str| format!("{col} ({data_type}) has no room for {rows} more unique keys: {what}. Choose fewer rows, or leave {col} to the database.");
@@ -749,7 +769,21 @@ fn key_start(g: &Gen, found: Option<&str>, rows: u32, col: &str, data_type: &str
         Gen::Patterned { .. } => unreachable!("base() is never patterned"),
     };
     let last = start.checked_add(rows - 1).ok_or_else(|| full("the next key is past the largest 64-bit integer"))?;
+    let int_max = limits.int_range().map(|(_, hi)| hi);
+    // The last key as microseconds, for dates and date-times.
+    let last_moment = match g {
+        Gen::Date => Some(i128::from(last) * i128::from(MICROS_PER_DAY)),
+        Gen::Timestamp | Gen::TimestampTz => Some(i128::from(last) * 1_000_000),
+        _ => None,
+    };
+    let moment_max = limits.moments().map(|(_, hi)| i128::from(hi));
     match g {
+        Gen::Int { .. } | Gen::Decimal { .. } if int_max.is_some_and(|m| i128::from(last) > m) => {
+            Err(full(&format!("it holds up to {}", int_max.unwrap_or_default())))
+        }
+        Gen::Date | Gen::Timestamp | Gen::TimestampTz if last_moment.zip(moment_max).is_some_and(|(l, m)| l > m) => {
+            Err(full(&format!("it holds {}", limits.span())))
+        }
         Gen::Float if last > FLOAT_EXACT => Err(full("floats stop being exact past 2^53")),
         Gen::Date if last > last_day => Err(full("the dates would pass 9999-12-31")),
         Gen::Timestamp | Gen::TimestampTz if last >= (last_day + 1) * SECONDS_PER_DAY => Err(full("the date-times would pass 9999-12-31")),
@@ -930,6 +964,7 @@ fn plan_for(kind: ConnectorKind, schema: &str, name: &str, cols: &[ColumnInfo], 
     };
     for c in cols {
         let maker = parse_type(kind, &c.data_type, &c.name);
+        let limits = type_limits(kind, &c.data_type);
         let fills = database_fills(kind, c, ddl);
         let parent = parent_of(&c.name);
         let note = match (&maker, fills) {
@@ -939,6 +974,10 @@ fn plan_for(kind: ConnectorKind, schema: &str, name: &str, cols: &[ColumnInfo], 
                 format!("DataBrain can't make up {} values: left to the database", c.data_type)
             }),
             (Some(_), true) => Some("The database fills it (identity, sequence or computed): left out unless you turn it on".into()),
+            _ => None,
+        };
+        let hint = match &maker {
+            Some(g) if parent.is_none() && !c.is_primary_key && !fills => pattern_hint(g),
             _ => None,
         };
         if maker.is_none() && !c.nullable && c.default.is_none() && !fills {
@@ -959,14 +998,13 @@ fn plan_for(kind: ConnectorKind, schema: &str, name: &str, cols: &[ColumnInfo], 
             },
             ai_text: parent.is_none() && !c.is_primary_key && matches!(maker, Some(Gen::Text { .. })),
             ai_ok: parent.is_none() && !c.is_primary_key && matches!(&maker, Some(g) if !matches!(g, Gen::Uuid | Gen::Binary { .. })),
+            // Keys, foreign keys and columns the database fills (even when
+            // ticked) take no pattern, so no default either.
             pattern: match &maker {
-                Some(g) if parent.is_none() && !c.is_primary_key => pattern::default_pattern(g, &c.name),
+                Some(g) if hint.is_some() => pattern::default_pattern(g, &limits, &c.name),
                 _ => None,
             },
-            pattern_hint: match &maker {
-                Some(g) if parent.is_none() && !c.is_primary_key && !fills => pattern_hint(g),
-                _ => None,
-            },
+            pattern_hint: hint,
             parent,
             note,
         });
@@ -1114,10 +1152,10 @@ fn flavor_of(column: &str) -> Flavor {
     }
 }
 
-/// The generator for a database type, `None` when DataBrain can't make it up.
-fn parse_type(kind: ConnectorKind, raw: &str, column: &str) -> Option<Gen> {
+/// The type in lower case, without ClickHouse's `Nullable(…)` and
+/// `LowCardinality(…)`.
+fn unwrapped_type(raw: &str) -> String {
     let mut t = raw.trim().to_ascii_lowercase();
-    // ClickHouse wrappers.
     loop {
         let before = t.clone();
         for w in ["nullable(", "lowcardinality("] {
@@ -1126,9 +1164,103 @@ fn parse_type(kind: ConnectorKind, raw: &str, column: &str) -> Option<Gen> {
             }
         }
         if t == before {
-            break;
+            return t;
         }
     }
+}
+
+/// What a database type holds, for patterns and counting keys: integer
+/// sizes and signs, decimal precision and scale, and the dates of date and
+/// date-time types that hold fewer than years 1–9999.
+fn type_limits(kind: ConnectorKind, raw: &str) -> Limits {
+    use ConnectorKind::*;
+    let t = unwrapped_type(raw);
+    let (plain, args) = split_type(&t);
+    let unsigned = plain.contains(" unsigned");
+    let plain = plain.replace(" unsigned", "").replace(" zerofill", "");
+    let (a0, a1) = (args.first().copied().flatten(), args.get(1).copied().flatten());
+    let ch = kind == Clickhouse;
+    let bits = |b: u32, signed: bool| {
+        if b >= 128 {
+            Limits::Ints(if signed { i128::MIN } else { 0 }, i128::MAX)
+        } else if signed {
+            Limits::Ints(-(1i128 << (b - 1)), (1i128 << (b - 1)) - 1)
+        } else {
+            Limits::Ints(0, (1i128 << b) - 1)
+        }
+    };
+    let int = |b: u32| bits(b, !unsigned);
+    let digits = |p: u32, s: u32| {
+        let p = p.clamp(1, 38);
+        let s = s.min(p);
+        if s == 0 { Limits::Ints(-(10i128.pow(p) - 1), 10i128.pow(p) - 1) } else { Limits::Decimal { precision: p, scale: s } }
+    };
+    // First and last day, as moments (the last day's last second).
+    let days = |from: (i64, u32, u32), to: (i64, u32, u32)| {
+        Limits::Moments(days_from_civil(from.0, from.1, from.2) * MICROS_PER_DAY, (days_from_civil(to.0, to.1, to.2) + 1) * MICROS_PER_DAY - 1_000_000)
+    };
+    let any_day = days((1, 1, 1), (9999, 12, 31));
+    match plain.as_str() {
+        // Any integer type is 64-bit in SQLite.
+        p if kind == Sqlite && p.contains("int") => bits(64, true),
+        "int8" if ch => int(8),
+        "int16" if ch => int(16),
+        "int32" if ch => int(32),
+        "int64" if ch => int(64),
+        "int128" | "int256" if ch => int(128),
+        "uint8" | "utinyint" => bits(8, false),
+        "uint16" | "usmallint" => bits(16, false),
+        "uint32" | "uinteger" => bits(32, false),
+        "uint64" | "ubigint" => bits(64, false),
+        "uint128" | "uint256" | "uhugeint" => bits(128, false),
+        // SQL Server's tinyint is 0–255.
+        "tinyint" | "int1" => bits(8, !unsigned && kind != Mssql),
+        // Oracle's integer types are NUMBER(38).
+        "int" | "integer" | "smallint" if kind == Oracle => digits(38, 0),
+        "smallint" | "int2" | "smallserial" | "serial2" | "short" => int(16),
+        "mediumint" => int(24),
+        "int" | "integer" | "int4" | "serial" | "serial4" | "int32" => int(32),
+        "bigint" | "int8" | "int64" | "bigserial" | "serial8" => int(64),
+        "hugeint" | "int128" => int(128),
+        "year" if kind == Mysql => Limits::Ints(1901, 2155),
+        // ClickHouse Decimal32(S): the argument is the scale.
+        "decimal32" => digits(9, a0.unwrap_or(0)),
+        "decimal64" => digits(18, a0.unwrap_or(0)),
+        "decimal128" | "decimal256" => digits(38, a0.unwrap_or(0)),
+        "numeric" | "decimal" | "dec" | "number" | "bignumeric" | "bigdecimal" | "newdecimal" => match a0 {
+            Some(p) => digits(p, a1.unwrap_or(0)),
+            None => Limits::Any,
+        },
+        "date" if kind == Mysql => days((1000, 1, 1), (9999, 12, 31)),
+        "date" if ch => days((1970, 1, 1), (2149, 6, 6)),
+        "date32" | "datetime64" if ch => days((1900, 1, 1), (2299, 12, 31)),
+        // 1970-01-01 00:00:01 to 2038-01-19 03:14:07 UTC; a day inside, for
+        // any session time zone.
+        "timestamp" if kind == Mysql => days((1970, 1, 2), (2038, 1, 18)),
+        "datetime" if kind == Mysql => days((1000, 1, 1), (9999, 12, 31)),
+        "datetime" if kind == Mssql => days((1753, 1, 1), (9999, 12, 31)),
+        "datetime" if ch => days((1970, 1, 2), (2106, 2, 6)),
+        // Up to 2079-06-06 23:59: the last whole day before, as seconds round to minutes.
+        "smalldatetime" => days((1900, 1, 1), (2079, 6, 5)),
+        "date"
+        | "timestamp"
+        | "timestamptz"
+        | "datetime"
+        | "datetime2"
+        | "datetimeoffset"
+        | "timestamp with time zone"
+        | "timestamp without time zone"
+        | "timestamp with local time zone"
+        | "timestamp_tz"
+        | "timestamp_ltz"
+        | "timestamp_ntz" => any_day,
+        _ => Limits::Any,
+    }
+}
+
+/// The generator for a database type, `None` when DataBrain can't make it up.
+fn parse_type(kind: ConnectorKind, raw: &str, column: &str) -> Option<Gen> {
+    let t = unwrapped_type(raw);
     if t.ends_with("[]") || t.starts_with('_') || ["array", "map", "struct", "tuple", "row", "list", "union", "nested"].iter().any(|w| t.starts_with(w)) {
         return None;
     }
@@ -1440,8 +1572,10 @@ fn sample_value(g: &Gen, raw: &str) -> Option<Value> {
             v => Some(v),
         },
         Gen::Uuid | Gen::Binary { .. } => None,
-        // The pattern decides (a range may go past the generator's own);
-        // text also fits the column.
+        // The pattern decides (a range may go past the generator's own):
+        // its ranges and values were checked against what the column's type
+        // holds (`type_limits`: MySQL TIMESTAMP 1970–2038…), which stands in
+        // for the years every engine holds above. Text also fits the column.
         Gen::Patterned { base, pattern, .. } => match base.base() {
             Gen::Text { .. } => sample_value(base, s).and_then(|_| pattern.accept(base, s)),
             _ => pattern.accept(base, s),
@@ -1913,6 +2047,152 @@ mod tests {
         assert!(!database_fills(ConnectorKind::Mysql, &col("rv", "timestamp", false, false), None));
     }
 
+    /// Columns the database fills (computed, generated, identity), keys and
+    /// foreign keys get no default pattern, so a plan's defaults never stop
+    /// generation; only a pattern asked for such a column is refused.
+    #[test]
+    fn columns_without_a_pattern_get_no_default_one() {
+        let ddl = "CREATE TABLE [dbo].[t] (\n    [id] int IDENTITY(1,1) NOT NULL,\n    [total] AS ([qty]*[price]) PERSISTED,\n    [qty] int NOT NULL,\n    [price] decimal(8,2) NOT NULL,\n    [age] int NOT NULL,\n    [amount] int NOT NULL\n);";
+        let cols = vec![
+            col("id", "int", false, true),
+            col("total", "decimal(12,2)", true, false),
+            col("qty", "int", false, false),
+            col("price", "decimal(8,2)", false, false),
+            col("age", "int", false, false),
+            col("amount", "int", false, false),
+        ];
+        let fks = vec![ForeignKey { columns: vec!["amount".into()], ref_schema: String::new(), ref_table: "a".into(), ref_columns: vec!["id".into()] }];
+        let (plan, gens) = plan_for(ConnectorKind::Mssql, "dbo", "t", &cols, &fks, Some(ddl));
+        let by = |n: &str| plan.columns.iter().find(|c| c.name == n).unwrap();
+        assert!(by("total").database_fills);
+        for n in ["id", "total", "amount"] {
+            assert_eq!((by(n).pattern.as_deref(), by(n).pattern_hint.as_deref()), (None, None), "{n}");
+        }
+        assert_eq!(by("price").pattern.as_deref(), Some("1..1000"));
+        assert_eq!(by("age").pattern.as_deref(), Some("18..90"));
+        // Every column ticked, the computed one too (`fill`), no pattern sent: the defaults go through.
+        let all: Vec<usize> = (0..plan.columns.len()).collect();
+        let mut g = gens.clone();
+        apply_patterns(ConnectorKind::Mssql, &plan, &mut g, &all, &HashMap::new()).unwrap();
+        assert!(matches!(g[3], Some(Gen::Patterned { .. })) && matches!(g[4], Some(Gen::Patterned { .. })));
+        assert!(!matches!(g[1], Some(Gen::Patterned { .. })), "the computed column keeps its own values");
+        // A pattern asked for the computed column or a key is refused.
+        for n in ["total", "id"] {
+            let e = apply_patterns(ConnectorKind::Mssql, &plan, &mut gens.clone(), &all, &HashMap::from([(n.to_string(), "1..5".to_string())])).unwrap_err();
+            assert!(e.message.contains("don't take a pattern") && e.message.starts_with(n), "{}", e.message);
+        }
+        // Postgres and MySQL generated columns too.
+        let pg = "CREATE TABLE t (\n    year integer GENERATED ALWAYS AS (2000 + n) STORED,\n    n integer\n);";
+        let (p, _) = plan_for(ConnectorKind::Postgres, "public", "t", &[col("year", "integer", true, false), col("n", "integer", true, false)], &[], Some(pg));
+        assert!(p.columns[0].database_fills && p.columns[0].pattern.is_none());
+    }
+
+    /// Only the columns filled have their patterns read: a pattern saved for
+    /// a column left out doesn't stop generation, however wrong.
+    #[test]
+    fn patterns_of_columns_left_out_are_ignored() {
+        let cols = vec![col("age", "int", false, false), col("email", "varchar(5)", true, false)];
+        let (plan, gens) = plan_for(ConnectorKind::Postgres, "public", "t", &cols, &[], None);
+        let patterns = HashMap::from([("email".to_string(), "INV-#####".to_string()), ("age".to_string(), "30..40".to_string())]);
+        let mut g = gens.clone();
+        apply_patterns(ConnectorKind::Postgres, &plan, &mut g, &[0], &patterns).unwrap();
+        assert!(matches!(&g[0], Some(Gen::Patterned { text, .. }) if text == "30..40"));
+        assert!(matches!(g[1], Some(Gen::Text { .. })));
+        let e = apply_patterns(ConnectorKind::Postgres, &plan, &mut gens.clone(), &[0, 1], &patterns).unwrap_err();
+        assert!(e.message.contains("Pattern for email"), "{}", e.message);
+    }
+
+    #[test]
+    fn types_report_what_they_hold() {
+        use ConnectorKind::*;
+        let l = type_limits;
+        assert_eq!(l(Mysql, "tinyint unsigned"), Limits::Ints(0, 255));
+        assert_eq!(l(Mysql, "tinyint(4)"), Limits::Ints(-128, 127));
+        assert_eq!(l(Mssql, "tinyint"), Limits::Ints(0, 255));
+        assert_eq!(l(Postgres, "smallint"), Limits::Ints(-32_768, 32_767));
+        assert_eq!(l(Mysql, "mediumint unsigned"), Limits::Ints(0, 16_777_215));
+        assert_eq!(l(Mysql, "int unsigned"), Limits::Ints(0, 4_294_967_295));
+        assert_eq!(l(Postgres, "bigint"), Limits::Ints(i64::MIN.into(), i64::MAX.into()));
+        assert_eq!(l(Clickhouse, "Nullable(UInt8)"), Limits::Ints(0, 255));
+        assert_eq!(l(Clickhouse, "Int8"), Limits::Ints(-128, 127), "ClickHouse Int8 is 8 bits");
+        assert_eq!(l(Clickhouse, "Int16"), Limits::Ints(-32_768, 32_767));
+        assert_eq!(l(Duckdb, "UTINYINT"), Limits::Ints(0, 255));
+        assert_eq!(l(Sqlite, "SMALLINT"), Limits::Ints(i64::MIN.into(), i64::MAX.into()), "SQLite integers are 64-bit");
+        assert_eq!(l(Oracle, "NUMBER(2)"), Limits::Ints(-99, 99));
+        assert_eq!(l(Postgres, "numeric(5,2)"), Limits::Decimal { precision: 5, scale: 2 });
+        assert_eq!(l(Clickhouse, "Decimal32(4)"), Limits::Decimal { precision: 9, scale: 4 }, "the argument is the scale");
+        assert_eq!(l(Postgres, "numeric"), Limits::Any);
+        assert_eq!(l(Mysql, "year"), Limits::Ints(1901, 2155));
+        let day = |y, m, d| days_from_civil(y, m, d) * MICROS_PER_DAY;
+        assert_eq!(l(Mysql, "timestamp"), Limits::Moments(day(1970, 1, 2), day(2038, 1, 19) - 1_000_000));
+        assert_eq!(l(Mssql, "smalldatetime").moments().unwrap().0, day(1900, 1, 1));
+        assert_eq!(l(Mssql, "datetime").moments().unwrap().0, day(1753, 1, 1));
+        assert_eq!(l(Postgres, "timestamp without time zone").moments().unwrap().1, day(10_000, 1, 1) - 1_000_000);
+        assert_eq!(l(Postgres, "text"), Limits::Any);
+    }
+
+    /// Patterns, defaults and `{a|b}` values follow what the column's type
+    /// holds, not only what its generator makes.
+    #[test]
+    fn patterns_fit_the_column_type() {
+        use ConnectorKind::*;
+        let parse = |k, t: &str, p: &str| Pattern::parse(&parse_type(k, t, "x").unwrap(), &type_limits(k, t), p);
+        let e = parse(Postgres, "numeric(5,2)", "1..1000").unwrap_err();
+        assert!(e.contains("holds -999.99 to 999.99"), "{e}");
+        assert!(parse(Postgres, "numeric(5,2)", "1..999.99").is_ok());
+        assert!(parse(Postgres, "numeric(5,2)", "0..999.996").is_err(), "rounds to 1000.00");
+        assert!(parse(Oracle, "NUMBER(2)", "1..100").unwrap_err().contains("-99 to 99"));
+        assert!(parse(Oracle, "NUMBER(2)", "1..99").is_ok());
+        assert!(parse(Mysql, "tinyint unsigned", "-5..5").unwrap_err().contains("0 to 255"));
+        assert!(parse(Mysql, "tinyint", "-5..5").is_ok());
+        assert!(parse(Mysql, "smallint", "1..40000").is_err());
+        assert!(parse(Clickhouse, "UInt8", "0..255").is_ok(), "past the generator's 0..200");
+        // `{0|1}` on an int: 0 is outside the made-up values (1..), inside the type.
+        assert!(matches!(parse(Postgres, "integer", "{0|1}"), Ok(Pattern::OneOf(v)) if v[0].1 == Value::Int(0)));
+        assert!(parse(Mysql, "tinyint unsigned", "{-1|1}").unwrap_err().contains("\"-1\""));
+        assert!(parse(Postgres, "numeric(12,2)", "{1234567.5}").is_ok(), "the real precision, not the generator's 6 digits");
+        assert!(parse(Postgres, "numeric(5,2)", "{1234.5}").is_err());
+        // MySQL TIMESTAMP: 1970–2038.
+        let e = parse(Mysql, "timestamp", "1950..2005").unwrap_err();
+        assert!(e.contains("1970-01-02 to 2038-01-18"), "{e}");
+        assert!(parse(Mysql, "timestamp", "1980..2030").is_ok());
+        assert!(parse(Mysql, "timestamp", "{1965-01-01 10:00:00}").is_err());
+        assert!(parse(Mysql, "datetime", "1950..2005").is_ok());
+        assert!(parse(Mssql, "smalldatetime", "1890..1950").is_err());
+        assert!(parse(Mssql, "smalldatetime", "1900..2079-06-05").is_ok());
+        assert!(parse(Mssql, "datetime", "1700..1800").is_err());
+        assert!(parse(Mssql, "datetime2", "1700..1800").is_ok());
+        // The defaults from names fit the type.
+        let plan = |k, cols: &[(&str, &str)]| {
+            let cols: Vec<ColumnInfo> = cols.iter().map(|(n, t)| col(n, t, true, false)).collect();
+            plan_for(k, "s", "t", &cols, &[], None).0.columns.into_iter().map(|c| c.pattern).collect::<Vec<_>>()
+        };
+        let got =
+            plan(Mysql, &[("price", "decimal(5,2)"), ("fee", "decimal(2,2)"), ("age", "tinyint unsigned"), ("total", "tinyint"), ("birth_date", "timestamp")]);
+        assert_eq!(
+            got,
+            [Some("1..999.99".into()), None, Some("18..90".into()), Some("1..127".into()), Some("1970-01-02..2005-12-31".into())],
+            "a decimal(2,2) holds no 1"
+        );
+        assert_eq!(plan(Postgres, &[("birth_date", "timestamp")]), [Some("1950-01-01..2005-12-31".into())]);
+    }
+
+    /// A counting key stays within its type (smallint stops at 32,767).
+    #[test]
+    fn keys_stay_within_the_type() {
+        use ConnectorKind::*;
+        let key = |k, t: &str, found: Option<&str>, rows| key_start(&parse_type(k, t, "id").unwrap(), &type_limits(k, t), found, rows, "id", t);
+        let e = key(Postgres, "smallint", Some("32700"), 100).unwrap_err();
+        assert!(e.contains("no room for 100 more unique keys") && e.contains("32767"), "{e}");
+        assert_eq!(key(Postgres, "smallint", Some("32700"), 67), Ok(32_701));
+        assert!(key(Mysql, "tinyint unsigned", None, 256).is_err());
+        assert_eq!(key(Mysql, "tinyint unsigned", None, 255), Ok(1));
+        assert!(key(Oracle, "NUMBER(3)", Some("990"), 10).is_err());
+        assert!(key(Postgres, "numeric(4,2)", Some("90"), 10).is_err(), "numeric(4,2) holds up to 99.99");
+        assert!(key(Mysql, "timestamp", Some("2038-01-18 23:59:00"), 100).unwrap_err().contains("2038-01-18"));
+        assert!(key(Postgres, "timestamp", Some("2038-01-18 23:59:00"), 100).is_ok());
+    }
+
     #[test]
     fn default_seeds_survive_javascript_numbers() {
         for _ in 0..100 {
@@ -1934,20 +2214,20 @@ mod tests {
         assert_eq!(after_number("123456789012345678901234567890123456789"), Err(()));
         assert_eq!(after_number("x"), Ok(None));
         let int = Gen::Int { min: 1, max: 9 };
-        assert_eq!(key_start(&int, Some("9007199254740993"), 10, "id", "bigint"), Ok(9_007_199_254_740_994));
-        assert_eq!(key_start(&int, None, 10, "id", "bigint"), Ok(1));
-        let e = key_start(&int, Some("9223372036854775800"), 100, "id", "bigint").unwrap_err();
+        assert_eq!(key_start(&int, &Limits::Any, Some("9007199254740993"), 10, "id", "bigint"), Ok(9_007_199_254_740_994));
+        assert_eq!(key_start(&int, &Limits::Any, None, 10, "id", "bigint"), Ok(1));
+        let e = key_start(&int, &Limits::Any, Some("9223372036854775800"), 100, "id", "bigint").unwrap_err();
         assert!(e.contains("no room for 100 more"), "{e}");
-        assert!(key_start(&int, Some("9223372036854775807"), 1, "id", "bigint").is_err());
-        assert!(key_start(&Gen::Float, Some("9007199254740990"), 10, "id", "float").is_err());
+        assert!(key_start(&int, &Limits::Any, Some("9223372036854775807"), 1, "id", "bigint").is_err());
+        assert!(key_start(&Gen::Float, &Limits::Any, Some("9007199254740990"), 10, "id", "float").is_err());
     }
 
     #[test]
     fn short_text_keys_stay_unique_and_continue_after_existing_rows() {
         let g = Gen::Text { max: Some(2), flavor: Flavor::Word };
-        assert_eq!(key_start(&g, Some("0"), 1000, "code", "varchar(2)"), Ok(1));
-        assert_eq!(key_start(&g, Some("100"), 10, "code", "varchar(2)"), Ok(101), "past the rows already there");
-        let e = key_start(&g, Some("0"), 1296, "code", "varchar(2)").unwrap_err();
+        assert_eq!(key_start(&g, &Limits::Any, Some("0"), 1000, "code", "varchar(2)"), Ok(1));
+        assert_eq!(key_start(&g, &Limits::Any, Some("100"), 10, "code", "varchar(2)"), Ok(101), "past the rows already there");
+        let e = key_start(&g, &Limits::Any, Some("0"), 1296, "code", "varchar(2)").unwrap_err();
         assert!(e.contains("2 characters hold 1295 keys"), "{e}");
         let mut rng = Rng(1);
         let keys: Vec<Value> = (1..=1295).map(|i| key_value(&g, i, "abcd", &mut rng)).collect();
@@ -1963,15 +2243,15 @@ mod tests {
     fn date_float_time_and_byte_keys_are_unique() {
         let mut rng = Rng(3);
         let day = days_from_civil(2024, 2, 3);
-        assert_eq!(key_start(&Gen::Date, Some("2024-02-03"), 10, "d", "date"), Ok(day + 1));
-        assert_eq!(key_start(&Gen::Date, Some("2024-02-03 00:00:00"), 10, "d", "date"), Ok(day + 1), "Oracle DATE");
-        assert_eq!(key_start(&Gen::Date, None, 10, "d", "date"), Ok(days_from_civil(2020, 1, 1)));
-        let ts = key_start(&Gen::Timestamp, Some("2024-02-03 04:05:06.5"), 10, "t", "timestamp").unwrap();
+        assert_eq!(key_start(&Gen::Date, &Limits::Any, Some("2024-02-03"), 10, "d", "date"), Ok(day + 1));
+        assert_eq!(key_start(&Gen::Date, &Limits::Any, Some("2024-02-03 00:00:00"), 10, "d", "date"), Ok(day + 1), "Oracle DATE");
+        assert_eq!(key_start(&Gen::Date, &Limits::Any, None, 10, "d", "date"), Ok(days_from_civil(2020, 1, 1)));
+        let ts = key_start(&Gen::Timestamp, &Limits::Any, Some("2024-02-03 04:05:06.5"), 10, "t", "timestamp").unwrap();
         assert_eq!(key_value(&Gen::Timestamp, ts, "", &mut rng), Value::Timestamp(parse_datetime("2024-02-03 04:05:07").unwrap()));
-        assert!(key_start(&Gen::Time, Some("23:59:00"), 60, "t", "time").is_err());
-        assert_eq!(key_start(&Gen::Time, Some("23:59:00"), 59, "t", "time"), Ok(86_341));
-        assert!(key_start(&Gen::Binary { max: Some(1) }, Some("200"), 56, "b", "binary(1)").is_err());
-        assert!(key_start(&Gen::Bool, None, 3, "b", "boolean").is_err());
+        assert!(key_start(&Gen::Time, &Limits::Any, Some("23:59:00"), 60, "t", "time").is_err());
+        assert_eq!(key_start(&Gen::Time, &Limits::Any, Some("23:59:00"), 59, "t", "time"), Ok(86_341));
+        assert!(key_start(&Gen::Binary { max: Some(1) }, &Limits::Any, Some("200"), 56, "b", "binary(1)").is_err());
+        assert!(key_start(&Gen::Bool, &Limits::Any, None, 3, "b", "boolean").is_err());
 
         let columns = vec![Column::new("d", ColType::Date, "date"), Column::new("f", ColType::Float64, "real")];
         let sources = vec![Source::Key { maker: Gen::Date, start: day, tag: String::new() }, Source::Key { maker: Gen::Float, start: 7, tag: String::new() }];

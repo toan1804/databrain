@@ -87,7 +87,11 @@ export function patternOf(c: TestDataColumn, overrides: Record<string, string>):
   return overrides[c.name] ?? c.pattern ?? "";
 }
 
-/** The patterns sent: every column that takes one (`""`: none). */
-export function patternsFor(cols: TestDataColumn[], overrides: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(cols.filter((c) => c.pattern_hint).map((c) => [c.name, patternOf(c, overrides).trim()]));
+/**
+ * The patterns sent: every ticked column that takes one (`""`: none). A
+ * column left out isn't filled, so a pattern kept for it (even one that
+ * doesn't parse) doesn't stop generating.
+ */
+export function patternsFor(cols: TestDataColumn[], overrides: Record<string, string>, ticked: Set<string>): Record<string, string> {
+  return Object.fromEntries(cols.filter((c) => c.pattern_hint && ticked.has(c.name)).map((c) => [c.name, patternOf(c, overrides).trim()]));
 }
