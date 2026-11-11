@@ -64,7 +64,7 @@ export function BackgroundJobsSettings() {
       <ul className="list-disc space-y-1 pl-4 text-[11.5px] text-muted">
         <li>Nothing runs while the computer sleeps; a run missed then runs at the next check.</li>
         <li>Connections that sign in through the browser (SSO) can't sign in again by themselves: once their sign-in expires, background runs fail until you sign in in the app.</li>
-        <li>macOS may ask once whether “databrain-jobs” may use your keychain passwords. Settings → Passwords → local vault avoids the prompt.</li>
+        <li>macOS may ask once whether DataBrain may use your keychain passwords for background runs. Settings → Passwords → local vault avoids the prompt.</li>
         <li>
           From a terminal: <span className="font-mono">databrain-jobs run &lt;job&gt;</span> runs a job now, <span className="font-mono">databrain-jobs list</span> shows them (next to the DataBrain app).
         </li>

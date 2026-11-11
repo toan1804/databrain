@@ -93,7 +93,7 @@ The variables are `DATABRAIN_PG_*`, `DATABRAIN_MYSQL_*`, `DATABRAIN_MSSQL_*`, `D
 
 ```
 crates/
-  app/             Tauri host and the databrain-mcp and databrain-jobs binaries
+  app/             Tauri host (also `databrain mcp` / `databrain jobs`) and the databrain-mcp and databrain-jobs launchers
   query-engine/    sessions, query runs, cancel, safety checks, outputs, loads
   connectors/      one crate per database type
   connector-core/  connector traits, statement splitting and classification

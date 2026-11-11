@@ -18,9 +18,9 @@ DataBrain is a desktop SQL client written in Rust on Tauri 2, with a React UI an
 
 | Process | Source | Role |
 |---|---|---|
-| `databrain` | `crates/app/src/main.rs` | The Tauri app: native window with the React UI, all Rust crates in-process |
-| `databrain-mcp` | `crates/app/src/bin/databrain-mcp.rs` | MCP server over stdio for external agents (section 14). Opens the same workspace and secret store |
-| `databrain-jobs` | `crates/app/src/bin/databrain-jobs.rs` | `tick` runs due jobs and exits (started every minute by launchd, a systemd user timer or Task Scheduler when background jobs are on); `run <job>` and `list` for the terminal |
+| `databrain` | `crates/app/src/main.rs` | The Tauri app: native window with the React UI, all Rust crates in-process. Also the MCP server and the jobs runner: `databrain mcp` and `databrain jobs …` (`crates/app/src/cli/`), so the engine ships once, not three times |
+| `databrain-mcp` | `crates/app/src/bin/databrain-mcp.rs` | Launcher (std only, a few hundred KB): runs `databrain mcp`, the MCP server over stdio for external agents (section 14), which opens the same workspace and secret store. MCP clients are set up with this path |
+| `databrain-jobs` | `crates/app/src/bin/databrain-jobs.rs` | Launcher: runs `databrain jobs …`. `tick` runs due jobs and exits (started every minute by launchd, a systemd user timer or Task Scheduler when background jobs are on); `run <job>` and `list` for the terminal |
 | `databrain-oracle-agent` | `crates/connectors/oracle/agent` (Go) | Thin Oracle driver, one per Oracle session, spoken to over stdin/stdout (section 5.3) |
 | `kiro-cli acp` | installed by the user | Started per turn when the AI provider is Kiro (section 13.7) |
 
@@ -52,7 +52,7 @@ DataBrain is a desktop SQL client written in Rust on Tauri 2, with a React UI an
 | Rust to TypeScript types | `ts-rs` | Generated into `ui/src/lib/bindings` |
 | Logging | `tracing`, `tracing-appender` | Daily rolling file in app data |
 
-The workspace sets `rust-version = "1.89"` and `edition = "2024"` in `Cargo.toml`. `unsafe_code` is denied in every crate; the one exception is the Windows console attach in `databrain-jobs`.
+The workspace sets `rust-version = "1.89"` and `edition = "2024"` in `Cargo.toml`. `unsafe_code` is denied in every crate; the one exception is the Windows console attach for `databrain jobs` (`cli/jobs.rs` and the `databrain-jobs` launcher).
 
 ---
 

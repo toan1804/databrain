@@ -32,8 +32,8 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.lints.rust]
-# Denied everywhere; the one FFI call (databrain-jobs attaching to the
-# parent console on Windows) allows it where it is.
+# Denied everywhere; the one FFI call (`databrain jobs` and its launcher
+# attaching to the parent console on Windows) allows it where it is.
 unsafe_code = "deny"
 
 [workspace.lints.clippy]

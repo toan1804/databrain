@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Changed
+
+- Smaller download (about half): the app, the MCP server and the jobs runner are one program (`databrain`, also `databrain mcp` and `databrain jobs …`) instead of three that each carried a full copy of DataBrain. `databrain-mcp` and `databrain-jobs` stay, as small launchers of it, so MCP client settings, scheduled background jobs and scripts keep working unchanged.
+
 ### Added
 
 - The assistant says when the knowledge index doesn't cover the chat's connection: when none of its tables are indexed (so it can only guess table and column names), or when far fewer are indexed than the explorer lists (under half, of 20 or more). "Index in Knowledge" opens Knowledge → Index on that connection; the hint shows indexing progress while it runs, and can be dismissed per connection. It isn't shown where the connection doesn't use the index (AI off, or schema metadata not shared).

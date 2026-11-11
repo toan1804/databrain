@@ -3,6 +3,7 @@
 pub mod ai_api;
 pub mod api;
 pub mod background;
+pub mod cli;
 mod commands;
 pub mod conn_io;
 pub mod jobs;
