@@ -108,15 +108,16 @@ pub async fn sample(
         async move {
             let run = async {
                 let mut stream = provider.chat_stream(chat).await?;
-                let mut text = String::new();
+                let (mut text, mut usage) = (String::new(), (0u32, 0u32));
                 while let Some(ev) = stream.next().await {
                     match ev? {
                         ChatEvent::TextDelta(t) => text.push_str(&t),
-                        ChatEvent::Done { .. } => break,
+                        // Providers report usage after Done: read to the end.
+                        ChatEvent::Usage { input, output } => usage = (input, output),
                         _ => {}
                     }
                 }
-                Ok::<_, AiError>(text)
+                Ok::<_, AiError>((text, usage))
             };
             tokio::time::timeout(TIMEOUT, run).await.map_err(|_| AiError::Network("the model took too long".into()))?
         }
@@ -125,20 +126,35 @@ pub async fn sample(
     let mut stream = futures::stream::iter(calls).buffer_unordered(PARALLEL);
     let mut rows = Vec::new();
     let mut last_error = None;
+    // Tokens of the calls that came back, counted in the provider's usage
+    // (also when the rows are thrown away or the user stops).
+    let mut used = (0u32, 0u32);
+    let record = |used: (u32, u32)| {
+        if let Err(e) = ws.record_ai_usage(&rec.id, "test_data", used.0, used.1) {
+            tracing::warn!("couldn't record AI usage: {e}");
+        }
+    };
     loop {
         let next = tokio::select! {
             n = stream.next() => n,
-            _ = cancel.cancelled() => return Err(AiError::Cancelled),
+            _ = cancel.cancelled() => {
+                record(used);
+                return Err(AiError::Cancelled);
+            }
         };
         let Some(r) = next else { break };
+        if let Ok((_, (i, o))) = &r {
+            used = (used.0.saturating_add(*i), used.1.saturating_add(*o));
+        }
         match r {
-            Ok(text) => match parse_rows(&text, &columns) {
+            Ok((text, _)) => match parse_rows(&text, &columns) {
                 Some(mut r) => rows.append(&mut r),
                 None => last_error = Some(AiError::Provider("the model's answer wasn't the JSON rows asked for".into())),
             },
             Err(e) => last_error = Some(e),
         }
     }
+    record(used);
     if rows.is_empty() {
         return Err(last_error.unwrap_or_else(|| AiError::Provider("the model wrote no rows".into())));
     }

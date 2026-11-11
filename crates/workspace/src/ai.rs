@@ -206,16 +206,33 @@ impl Workspace {
         Ok(id)
     }
 
-    /// Tokens (input, output) reported for a provider's conversations since
-    /// `since_ms` (messages of deleted conversations are not counted).
+    /// Tokens (input, output) reported for a provider since `since_ms`: its
+    /// conversations (messages of deleted conversations are not counted) and
+    /// its calls outside them ([`Self::record_ai_usage`]).
     pub fn ai_token_totals(&self, provider_id: &str, since_ms: i64) -> Result<(i64, i64)> {
         let c = self.conn.lock();
         Ok(c.query_row(
-            "SELECT COALESCE(SUM(m.tokens_in), 0), COALESCE(SUM(m.tokens_out), 0) FROM ai_messages m JOIN ai_sessions s ON s.id = m.session_id \
-             WHERE s.provider_id = ?1 AND m.created_at >= ?2",
+            "SELECT COALESCE(SUM(i), 0), COALESCE(SUM(o), 0) FROM ( \
+               SELECT m.tokens_in AS i, m.tokens_out AS o FROM ai_messages m JOIN ai_sessions s ON s.id = m.session_id \
+               WHERE s.provider_id = ?1 AND m.created_at >= ?2 \
+               UNION ALL \
+               SELECT tokens_in, tokens_out FROM ai_usage WHERE provider_id = ?1 AND created_at >= ?2)",
             params![provider_id, since_ms],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?)
+    }
+
+    /// Tokens of an AI call outside a conversation (`feature`: `inline`,
+    /// `test_data`), so the provider's usage counts it.
+    pub fn record_ai_usage(&self, provider_id: &str, feature: &str, tokens_in: u32, tokens_out: u32) -> Result<()> {
+        if tokens_in == 0 && tokens_out == 0 {
+            return Ok(());
+        }
+        self.conn.lock().execute(
+            "INSERT INTO ai_usage (provider_id, feature, tokens_in, tokens_out, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![provider_id, feature, tokens_in, tokens_out, now_ms()],
+        )?;
+        Ok(())
     }
 
     pub fn list_ai_messages(&self, session_id: &str) -> Result<Vec<AiMessageRecord>> {
@@ -324,6 +341,15 @@ mod tests {
         ws.add_ai_message(&b.id, "assistant", &serde_json::json!({}), (Some(5), Some(5))).unwrap();
         assert_eq!(ws.ai_token_totals("p1", 0).unwrap(), (100, 20));
         assert_eq!(ws.ai_token_totals("p1", i64::MAX).unwrap(), (0, 0));
+        // Calls outside conversations (inline completion, test data) count too.
+        ws.record_ai_usage("p1", "test_data", 40, 900).unwrap();
+        ws.record_ai_usage("p1", "inline", 0, 0).unwrap();
+        ws.record_ai_usage("p3", "inline", 7, 1).unwrap();
+        assert_eq!(ws.ai_token_totals("p1", 0).unwrap(), (140, 920));
+        assert_eq!(ws.ai_token_totals("p3", 0).unwrap(), (7, 1), "a provider without conversations");
+        assert_eq!(ws.ai_token_totals("p1", i64::MAX).unwrap(), (0, 0));
+        let n: i64 = ws.conn.lock().query_row("SELECT COUNT(*) FROM ai_usage", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "nothing recorded for a call without tokens");
         // Retention: conversations idle for longer than the setting are deleted with their messages.
         assert_eq!(ws.ai_history_retention_days(), Some(30));
         ws.conn.lock().execute("UPDATE ai_sessions SET updated_at = ?1 WHERE id = ?2", rusqlite::params![crate::now_ms() - 31 * 86_400_000, a.id]).unwrap();

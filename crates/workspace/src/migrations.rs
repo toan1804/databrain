@@ -364,6 +364,19 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     ALTER TABLE kn_joins ADD COLUMN doc_state TEXT;
     ALTER TABLE kn_joins ADD COLUMN doc_at INTEGER;
     "#,
+    // v18: tokens of AI calls outside conversations (inline completion,
+    // test data), counted in the provider's usage with its conversations
+    r#"
+    CREATE TABLE ai_usage (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider_id TEXT NOT NULL,
+        feature     TEXT NOT NULL,
+        tokens_in   INTEGER NOT NULL,
+        tokens_out  INTEGER NOT NULL,
+        created_at  INTEGER NOT NULL
+    );
+    CREATE INDEX ai_usage_provider ON ai_usage (provider_id, created_at);
+    "#,
 ];
 
 impl Workspace {
