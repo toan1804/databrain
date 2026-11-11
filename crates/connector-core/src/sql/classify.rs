@@ -56,6 +56,10 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
                 out.missing_where |= mw;
             }
             out.kind = check_control(out.kind, &keyword, sql);
+            // `select pg_terminate_backend(…)` acts like `KILL`.
+            if out.kind < StatementKind::Dml && stmts.iter().any(calls_acting_function) {
+                out.kind = StatementKind::Other;
+            }
             out
         }
         _ => {
@@ -67,7 +71,11 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
                 // Unparseable but looks like a read: a read only when no word
                 // in it can act (T-SQL runs `SELECT 1 EXEC xp_cmdshell …` as
                 // two statements without a separator).
-                k = if keyword == "SELECT" && !contains_dml_word(sql) && !contains_action_word(sql) { StatementKind::Read } else { StatementKind::Unknown };
+                k = if keyword == "SELECT" && !contains_dml_word(sql) && !contains_action_word(sql) && !names_acting_function(sql) {
+                    StatementKind::Read
+                } else {
+                    StatementKind::Unknown
+                };
             }
             // Unparseable session or transaction control: what follows the
             // first word can't be told (a T-SQL batch without `;` runs
@@ -281,6 +289,123 @@ fn contains_action_word(sql: &str) -> bool {
     words(sql).any(|w| ACTION.iter().any(|k| w.eq_ignore_ascii_case(k)))
 }
 
+/// Built-in functions that change server state, end sessions, change data
+/// or write files, callable from a `SELECT` (`select pg_terminate_backend(42)`,
+/// `select setval('s', 1)`, Snowflake `select system$cancel_query('…')`).
+/// Such a statement isn't a read: it gets a production prompt and is refused
+/// on a read-only connection.
+const ACTING_FUNCTIONS: &[&str] = &[
+    // Postgres: sessions, server and replication.
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    "pg_promote",
+    "pg_switch_wal",
+    "pg_switch_xlog",
+    "pg_create_restore_point",
+    "pg_start_backup",
+    "pg_stop_backup",
+    "pg_backup_start",
+    "pg_backup_stop",
+    "pg_wal_replay_pause",
+    "pg_wal_replay_resume",
+    "pg_xlog_replay_pause",
+    "pg_xlog_replay_resume",
+    "pg_create_physical_replication_slot",
+    "pg_create_logical_replication_slot",
+    "pg_drop_replication_slot",
+    "pg_copy_physical_replication_slot",
+    "pg_copy_logical_replication_slot",
+    "pg_replication_slot_advance",
+    "pg_logical_slot_get_changes",
+    "pg_logical_slot_get_binary_changes",
+    "pg_logical_emit_message",
+    "pg_replication_origin_create",
+    "pg_replication_origin_drop",
+    "pg_replication_origin_advance",
+    "pg_replication_origin_session_setup",
+    "pg_log_backend_memory_contexts",
+    "pg_stat_reset",
+    "pg_stat_reset_shared",
+    "pg_stat_reset_single_table_counters",
+    "pg_stat_reset_single_function_counters",
+    "pg_stat_reset_slru",
+    "pg_stat_reset_replication_slot",
+    "pg_stat_statements_reset",
+    "pg_import_system_collations",
+    "pg_notify",
+    "set_config",
+    // Postgres: data, sequences, files and other databases.
+    "nextval",
+    "setval",
+    "lo_import",
+    "lo_export",
+    "lo_unlink",
+    "lo_create",
+    "lo_creat",
+    "lo_put",
+    "lo_from_bytea",
+    "lo_truncate",
+    "pg_file_write",
+    "pg_file_rename",
+    "pg_file_unlink",
+    "pg_file_sync",
+    "dblink",
+    "dblink_exec",
+    "dblink_send_query",
+    // Snowflake.
+    "system$cancel_query",
+    "system$cancel_all_queries",
+    "system$abort_session",
+    "system$abort_transaction",
+    "system$enable_behavior_change_bundle",
+    "system$disable_behavior_change_bundle",
+    "system$pipe_force_resume",
+    "system$user_task_cancel_ongoing_executions",
+    "system$task_dependents_enable",
+    "system$add_event",
+];
+
+fn is_acting_function(name: &str) -> bool {
+    let name = name.trim_matches(['"', '`', '[', ']']).to_ascii_lowercase();
+    ACTING_FUNCTIONS.contains(&name.as_str())
+}
+
+fn calls_acting_function(s: &Statement) -> bool {
+    use sqlparser::ast::{Expr, ObjectName, TableFactor, Visit, Visitor};
+    use std::ops::ControlFlow;
+    struct V;
+    fn acts(name: &ObjectName) -> ControlFlow<()> {
+        // The function's own name: `pg_catalog.pg_terminate_backend` too.
+        match name.0.last() {
+            Some(part) if is_acting_function(&part.to_string()) => ControlFlow::Break(()),
+            _ => ControlFlow::Continue(()),
+        }
+    }
+    impl Visitor for V {
+        type Break = ();
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            match e {
+                Expr::Function(f) => acts(&f.name),
+                _ => ControlFlow::Continue(()),
+            }
+        }
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            match t {
+                TableFactor::Table { name, args: Some(_), .. } | TableFactor::Function { name, .. } => acts(name),
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+    s.visit(&mut V).is_break()
+}
+
+/// Unparsed SQL naming an acting function (`$` kept for Snowflake's).
+fn names_acting_function(sql: &str) -> bool {
+    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).any(is_acting_function)
+}
+
 fn contains_dml_word(sql: &str) -> bool {
     words(sql).any(|w| ["INSERT", "UPDATE", "DELETE", "MERGE", "INTO", "DROP", "ALTER", "CREATE", "TRUNCATE"].iter().any(|k| w.eq_ignore_ascii_case(k)))
 }
@@ -356,6 +481,47 @@ mod tests {
             let c = classify(sql, k);
             assert_eq!(c.kind, StatementKind::Unknown, "{k:?}: {sql}");
             assert!(!crate::sql::read_only_allows(sql, &c), "{k:?}: {sql}");
+        }
+    }
+
+    #[test]
+    fn selects_calling_acting_functions_are_not_reads() {
+        for (kind, sql) in [
+            (Postgres, "select pg_terminate_backend(123)"),
+            (Postgres, "SELECT pg_catalog.pg_cancel_backend(pid) FROM pg_stat_activity WHERE usename = 'app'"),
+            (Postgres, "select \"pg_terminate_backend\"(42)"),
+            (Postgres, "select count(*) from (select pg_terminate_backend(pid) from pg_stat_activity) x"),
+            (Postgres, "with k as (select pg_reload_conf()) select * from k"),
+            (Postgres, "select setval('orders_id_seq', 1)"),
+            (Postgres, "select nextval('orders_id_seq')"),
+            (Postgres, "select lo_export(42, '/tmp/x')"),
+            (Postgres, "select * from pg_logical_slot_get_changes('s', null, null)"),
+            (Postgres, "select dblink_exec('host=x', 'delete from t')"),
+            (Postgres, "select set_config('default_transaction_read_only', 'off', false)"),
+            (Snowflake, "select system$cancel_query('01a2')"),
+            (Snowflake, "SELECT SYSTEM$ABORT_SESSION(123)"),
+        ] {
+            let c = classify(sql, kind);
+            assert_eq!(c.kind, StatementKind::Other, "{sql}");
+            assert!(!crate::sql::read_only_allows(sql, &c), "{sql}");
+        }
+        // Unparsed SQL naming one is asked about.
+        assert_eq!(classify("select pg_terminate_backend(1) ))) (((", Postgres).kind, StatementKind::Unknown);
+    }
+
+    #[test]
+    fn selects_calling_ordinary_functions_stay_reads() {
+        for (kind, sql) in [
+            (Postgres, "select count(*), lower(name) from users"),
+            (Postgres, "select pid, state from pg_stat_activity"),
+            (Postgres, "select * from pg_stat_statements"),
+            (Postgres, "select currval('orders_id_seq')"),
+            (Postgres, "select terminate from t"),
+            (Postgres, "select pg_terminate_backend from t"),
+            (Snowflake, "select system$clustering_information('t')"),
+            (Snowflake, "select system$typeof(1)"),
+        ] {
+            assert_eq!(classify(sql, kind).kind, StatementKind::Read, "{sql}");
         }
     }
 

@@ -343,7 +343,8 @@ mod tests {
         assert!(matches!(review_sql(&prod, "select dbo.write_fn()").decision, Decision::Confirm(r) if r.contains("production")));
         let mut pg_prod = on(Postgres, false, writer);
         pg_prod.env = EnvTag::Prod;
-        assert!(matches!(review_sql(&pg_prod, "select dblink_exec('x', 'delete from t')").decision, Decision::Confirm(_)));
+        // A call that acts is a write: the AI may not modify production.
+        assert!(matches!(review_sql(&pg_prod, "select dblink_exec('x', 'delete from t')").decision, Decision::Deny(r) if r.contains("production")));
         assert_eq!(review_sql(&pg_prod, "select count(*) from t").decision, Decision::Allow);
         // Classification: each statement by its own keyword; unparsed T-SQL with EXEC isn't a read.
         assert_eq!(databrain_connector_core::sql::classify("select 1; exec p", Mssql).kind, StatementKind::Dml);
@@ -404,12 +405,17 @@ mod tests {
     #[test]
     fn functions_on_engines_with_a_read_only_mode() {
         use ConnectorKind::*;
-        let sqls = ["select public.write_fn()", "select dblink_exec('dbname=x', 'delete from t')", "select set_config('search_path', 'hr', false)"];
         for kind in [Postgres, Mysql, Sqlite, Duckdb, Clickhouse] {
-            for sql in sqls {
-                for p in [on(kind, false, AiPolicy::default()), on(kind, false, auto_read())] {
+            for p in [on(kind, false, AiPolicy::default()), on(kind, false, auto_read())] {
+                let sql = "select public.write_fn()";
+                match review_sql(&p, sql).decision {
+                    Decision::Confirm(r) => assert!(r.contains("could write") && r.contains("isn't read-only"), "{kind:?} {sql}: {r}"),
+                    d => panic!("{kind:?} not read-only, writes off: {sql}: {d:?}"),
+                }
+                // Built-ins known to act are writes, refused while the AI may not write.
+                for sql in ["select dblink_exec('dbname=x', 'delete from t')", "select set_config('search_path', 'hr', false)"] {
                     match review_sql(&p, sql).decision {
-                        Decision::Confirm(r) => assert!(r.contains("could write") && r.contains("isn't read-only"), "{kind:?} {sql}: {r}"),
+                        Decision::Deny(r) => assert!(r.contains("not allowed for the AI"), "{kind:?} {sql}: {r}"),
                         d => panic!("{kind:?} not read-only, writes off: {sql}: {d:?}"),
                     }
                 }
@@ -417,7 +423,7 @@ mod tests {
         }
         // A read-only Postgres session: ordinary functions are stopped by it…
         assert_eq!(review_sql(&on(Postgres, true, auto_read()), "select public.write_fn()").decision, Decision::Allow);
-        // …but not these.
+        // …but these act outside it: refused, like any write on a read-only connection.
         for sql in [
             "select dblink_exec('dbname=x', 'delete from t')",
             "select public.dblink('x', 'select 1')",
@@ -425,9 +431,14 @@ mod tests {
             "select pg_terminate_backend(42)",
         ] {
             match review_sql(&on(Postgres, true, auto_read()), sql).decision {
-                Decision::Confirm(r) => assert!(r.contains("outside") && r.contains("read-only session"), "{sql}: {r}"),
+                Decision::Deny(r) => assert!(r.contains("read-only"), "{sql}: {r}"),
                 d => panic!("read-only {sql}: {d:?}"),
             }
+        }
+        // Reading server files is still a read, but outside the read-only session: the user decides.
+        match review_sql(&on(Postgres, true, auto_read()), "select pg_read_file('postgresql.conf')").decision {
+            Decision::Confirm(r) => assert!(r.contains("outside") && r.contains("read-only session"), "{r}"),
+            d => panic!("read-only pg_read_file: {d:?}"),
         }
         // The AI may write here: writes always ask, so a call that could write asks.
         assert!(matches!(

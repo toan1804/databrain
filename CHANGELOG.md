@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Security
+
+- A `SELECT` that calls a function that acts is no longer a read: `select pg_terminate_backend(…)` (PostgreSQL's `KILL`), `pg_cancel_backend`, `pg_reload_conf`, `setval`/`nextval`, `set_config`, `lo_export`, `dblink_exec`, replication-slot functions and Snowflake `system$cancel_query`/`system$abort_session` ran on read-only connections and on production without the confirmation.
+
 ## 0.3.3 - 2026-11-11
 
 ### Added
