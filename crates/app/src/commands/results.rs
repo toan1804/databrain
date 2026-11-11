@@ -95,6 +95,19 @@ pub(crate) async fn generate_test_data(
 }
 
 #[tauri::command]
+pub(crate) async fn suggest_test_data_patterns(
+    state: State<'_, AppState>,
+    connection_id: String,
+    schema: String,
+    name: String,
+    spec: databrain_query_engine::testdata::TestDataSpec,
+    ai: databrain_ai::testdata::TestDataAi,
+    request_id: Option<String>,
+) -> R<std::collections::HashMap<String, String>> {
+    api::suggest_test_data_patterns(&state, &connection_id, &schema, &name, spec, ai, request_id).await
+}
+
+#[tauri::command]
 pub(crate) async fn summarize_selection(
     state: State<'_, AppState>,
     result_id: String,

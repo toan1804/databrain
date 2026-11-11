@@ -645,7 +645,15 @@ async fn test_data_generates_and_loads_sqlite() {
     let cid = plan.columns.iter().find(|c| c.name == "customer_id").unwrap();
     assert!(cid.parent.as_deref().is_some_and(|x| x.contains("customers")), "{cid:?}");
 
-    let spec = |rows| databrain_query_engine::testdata::TestDataSpec { rows, null_percent: 20, seed: Some(3), skip: vec![], fill: vec![], parent_keys: true };
+    let spec = |rows| databrain_query_engine::testdata::TestDataSpec {
+        rows,
+        null_percent: 20,
+        seed: Some(3),
+        skip: vec![],
+        fill: vec![],
+        parent_keys: true,
+        patterns: Default::default(),
+    };
     let made = generate_test_data(&st, &p.id, &main, "orders", spec(50), None, None).await.unwrap();
     assert_eq!(made.output.rows, 50);
     assert!(made.notes.iter().any(|n| n.contains("2 existing keys")), "{:?}", made.notes);
@@ -713,7 +721,7 @@ async fn test_data_takes_ai_rows_for_text_columns() {
     )
     .await;
     let main = list_schemas(&st, &p.id).await.unwrap()[0].name.clone();
-    let spec = TestDataSpec { rows: 8, null_percent: 0, seed: Some(5), skip: vec![], fill: vec![], parent_keys: true };
+    let spec = TestDataSpec { rows: 8, null_percent: 0, seed: Some(5), skip: vec![], fill: vec![], parent_keys: true, patterns: Default::default() };
 
     let ask = st.engine.test_data_ai_ask(&p.id, &main, "people", &spec, false, 100).await.unwrap().expect("text columns");
     let names: Vec<&str> = ask.columns.iter().map(|c| c.name.as_str()).collect();
@@ -755,6 +763,60 @@ async fn test_data_takes_ai_rows_for_text_columns() {
     assert_eq!(rows[0][3].as_deref(), Some("0"), "foreign keys from the parent");
     assert!(rows[0][4].as_deref().unwrap().parse::<u32>().unwrap() <= 20);
     assert_eq!(rows[0][5].as_deref(), Some("8"), "UNIQUE (full_name, team_id) holds with 2 parents and reused AI rows");
+
+    // Patterns: a default from the column's name, the user's own, and AI
+    // suggestions kept only where they work for the column.
+    let plan = test_data_plan(&st, &p.id, &main, "people").await.unwrap();
+    let col = |n: &str| plan.columns.iter().find(|c| c.name == n).unwrap().clone();
+    assert_eq!(col("age").pattern.as_deref(), Some("18..90"));
+    assert!(col("id").pattern_hint.is_none() && col("team_id").pattern_hint.is_none(), "keys and foreign keys follow their own rule");
+    assert!(col("email").pattern_hint.is_some());
+    let mut patterned = spec.clone();
+    patterned.rows = 30;
+    patterned.patterns = [("email".to_string(), "%@gmail.com".to_string()), ("full_name".to_string(), "Mr. %".to_string())].into();
+    let ask = st.engine.test_data_ai_ask(&p.id, &main, "people", &patterned, true, 10).await.unwrap().unwrap();
+    assert_eq!(ask.columns.iter().find(|c| c.name == "email").unwrap().pattern.as_deref(), Some("%@gmail.com"));
+    assert_eq!(ask.columns.iter().find(|c| c.name == "age").unwrap().pattern.as_deref(), Some("18..90"), "the default");
+    let data = st.engine.generate_test_data(&p.id, &main, "people", &patterned).await.unwrap();
+    let made = super::results::store_test_data(&st, &p.id, &main, "people", patterned.rows, data).unwrap();
+    exec(&st, &p.id, "delete from people").await;
+    let args =
+        LoadResultArgs { target_connection_id: p.id.clone(), table: made.table.clone(), mode: Default::default(), key_columns: vec![], create_table: false };
+    load_result(&st, &made.output.result_id, args, "pattern-load").await.unwrap();
+    let rows = databrain_connector_core::query_text(
+        &*s,
+        "select count(*), sum(email like '%@gmail.com'), sum(full_name like 'Mr. %'), min(age), max(age) from people",
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows[0][..3], [Some("30".into()), Some("30".into()), Some("30".into())], "{rows:?}");
+    let (lo, hi): (i64, i64) = (rows[0][3].as_deref().unwrap().parse().unwrap(), rows[0][4].as_deref().unwrap().parse().unwrap());
+    assert!(lo >= 18 && hi <= 90, "age {lo}..{hi}");
+    let mut bad = spec.clone();
+    bad.patterns = [("age".to_string(), "90..18".to_string())].into();
+    let e = st.engine.generate_test_data(&p.id, &main, "people", &bad).await.err().unwrap();
+    assert!(e.message.contains("Pattern for age (90..18)"), "{}", e.message);
+    bad.patterns = [("id".to_string(), "1..5".to_string())].into();
+    let e = st.engine.generate_test_data(&p.id, &main, "people", &bad).await.err().unwrap();
+    assert!(e.message.contains("don't take a pattern"), "{}", e.message);
+    bad.patterns = [("age".to_string(), "".to_string())].into();
+    st.engine.generate_test_data(&p.id, &main, "people", &bad).await.unwrap();
+    let kept = st
+        .engine
+        .test_data_valid_patterns(
+            &p.id,
+            &main,
+            "people",
+            [("age", "20..60"), ("email", "%@corp.vn"), ("id", "1..9"), ("age2", "1..2"), ("full_name", "1950..2000x{")]
+                .into_iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+        )
+        .await
+        .unwrap();
+    let mut kept: Vec<_> = kept.into_iter().collect();
+    kept.sort();
+    assert_eq!(kept, [("age".to_string(), "20..60".to_string()), ("email".to_string(), "%@corp.vn".to_string())]);
 
     // Refused before anything is sent: no AI provider, AI off for the
     // connection, or table structure not shared with the AI.

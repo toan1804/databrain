@@ -423,6 +423,17 @@ pub async fn ai_test_data(
     databrain_ai::testdata::sample(&state.workspace, state.secrets.clone(), connection_id, ai, ask, cancel).await.map_err(ai_err)
 }
 
+/// Patterns the AI suggests for "Generate test data" (unchecked).
+pub async fn ai_test_data_patterns(
+    state: &AppState,
+    connection_id: &str,
+    ai: &databrain_ai::testdata::TestDataAi,
+    ask: &databrain_query_engine::testdata::AiAsk,
+    cancel: &CancellationToken,
+) -> Result<std::collections::HashMap<String, String>> {
+    databrain_ai::testdata::suggest_patterns(&state.workspace, state.secrets.clone(), connection_id, ai, ask, cancel).await.map_err(ai_err)
+}
+
 /// `cancel` runs under `id` for [`ai_cancel`] until the guard is dropped.
 pub fn track_run(state: &AppState, id: String, cancel: CancellationToken) -> RunGuard<'_> {
     state.ai.runs.lock().insert(id.clone(), cancel);

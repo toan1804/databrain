@@ -17,6 +17,9 @@
 //!   1,000 distinct keys), so the rows satisfy the constraint. The user is
 //!   told when a table has foreign keys, and when a parent has no rows.
 //! - A seed makes the rows repeatable.
+//! - A column's pattern (`18..90`, `%@gmail.com`, `INV-####`; see
+//!   [`PATTERN_HELP`]) shapes its values: the user's, the AI's suggestion,
+//!   or a default from the column's name (`age`, `price`, `birth_date`).
 //! - "Generate with AI" ([`QueryEngine::test_data_ai_ask`], then
 //!   [`QueryEngine::generate_test_data_with`]): an AI model writes a few
 //!   hundred realistic rows for the text columns (or every column it can),
@@ -25,7 +28,7 @@
 //!   doesn't fit is made up as usual. Keys and foreign keys never come
 //!   from the AI.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use databrain_connector_core::arrow::array::RecordBatch;
 use databrain_connector_core::traits::RowLimit;
@@ -37,6 +40,11 @@ use databrain_export::load as sqlgen;
 use serde::{Deserialize, Serialize};
 
 use crate::{EngineError, LoadRows, QueryEngine, Result};
+
+#[path = "testdata_pattern.rs"]
+mod pattern;
+pub use pattern::PATTERN_HELP;
+use pattern::Pattern;
 
 /// Most rows one request makes.
 pub const MAX_TEST_ROWS: u32 = 100_000;
@@ -68,6 +76,16 @@ pub struct TestDataColumn {
     /// The AI may write it when it writes every column it can: not keys,
     /// foreign keys, UUIDs or bytes.
     pub ai_ok: bool,
+    /// The pattern used unless the spec gives one: from the column's name
+    /// (`age` → `18..90`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pattern: Option<String>,
+    /// An example pattern for its type; `None`: no pattern (keys, foreign
+    /// keys, types without one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pattern_hint: Option<String>,
     /// The parent table its values come from (`schema.table.column`).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -125,6 +143,10 @@ pub struct TestDataSpec {
     /// made-up values that may break the constraint).
     #[serde(default = "yes")]
     pub parent_keys: bool,
+    /// Patterns by column (see [`PATTERN_HELP`]); a column not named here
+    /// takes its default ([`TestDataColumn::pattern`]), and `""` none.
+    #[serde(default)]
+    pub patterns: HashMap<String, String>,
 }
 
 /// Generated rows plus what the user should know about them.
@@ -151,6 +173,8 @@ pub struct AiColumn {
     pub choices: Vec<String>,
     /// What DataBrain would put in it otherwise ("emails (up to 80 characters)").
     pub hint: String,
+    /// The pattern its values must follow ([`PATTERN_HELP`]).
+    pub pattern: Option<String>,
 }
 
 /// What to ask the AI for: the table's structure, never its rows.
@@ -269,7 +293,11 @@ impl QueryEngine {
             .map(|&k| {
                 let i = p.chosen[k];
                 let c = &p.plan.columns[i];
-                let g = p.gens[i].as_ref().expect("supported");
+                let pattern = match p.gens[i].as_ref() {
+                    Some(Gen::Patterned { text, .. }) => Some(text.clone()),
+                    _ => None,
+                };
+                let g = p.gens[i].as_ref().expect("supported").base();
                 AiColumn {
                     name: c.name.clone(),
                     data_type: c.data_type.clone(),
@@ -284,6 +312,7 @@ impl QueryEngine {
                         _ => vec![],
                     },
                     hint: c.generator.clone(),
+                    pattern,
                 }
             })
             .collect();
@@ -307,6 +336,30 @@ impl QueryEngine {
         }))
     }
 
+    /// The patterns of `suggested` that work for their column (a column that
+    /// takes a pattern, and a pattern that parses for its type).
+    pub async fn test_data_valid_patterns(
+        &self,
+        connection_id: &str,
+        schema: &str,
+        name: &str,
+        suggested: HashMap<String, String>,
+    ) -> Result<HashMap<String, String>> {
+        let kind = self.test_data_kind(connection_id)?;
+        let detail = self.describe(connection_id, schema, name).await?;
+        let ddl = self.object_ddl(connection_id, schema, name, ObjectKind::Table).await.ok().flatten();
+        let (plan, gens) = plan_for(kind, schema, name, &detail.columns, &detail.foreign_keys, ddl.as_deref());
+        Ok(suggested
+            .into_iter()
+            .filter(|(col, p)| {
+                plan.columns
+                    .iter()
+                    .zip(&gens)
+                    .any(|(c, g)| c.name.eq_ignore_ascii_case(col) && c.pattern_hint.is_some() && g.as_ref().is_some_and(|g| Pattern::parse(g, p).is_ok()))
+            })
+            .collect())
+    }
+
     async fn prepare(&self, connection_id: &str, schema: &str, name: &str, spec: &TestDataSpec) -> Result<Prepared> {
         if spec.rows == 0 || spec.rows > MAX_TEST_ROWS {
             return Err(EngineError::new("invalid", format!("Choose between 1 and {MAX_TEST_ROWS} rows")));
@@ -317,7 +370,24 @@ impl QueryEngine {
         let kind = self.test_data_kind(connection_id)?;
         let detail = self.describe(connection_id, schema, name).await?;
         let ddl = self.object_ddl(connection_id, schema, name, ObjectKind::Table).await.ok().flatten();
-        let (plan, gens) = plan_for(kind, schema, name, &detail.columns, &detail.foreign_keys, ddl.as_deref());
+        let (plan, mut gens) = plan_for(kind, schema, name, &detail.columns, &detail.foreign_keys, ddl.as_deref());
+        // Patterns: the spec's, else the default from the column's name.
+        for (i, c) in plan.columns.iter().enumerate() {
+            let given = spec.patterns.iter().find(|(k, _)| k.eq_ignore_ascii_case(&c.name)).map(|(_, v)| v.trim().to_string());
+            let text = match given {
+                Some(t) => t,
+                None => c.pattern.clone().unwrap_or_default(),
+            };
+            if text.is_empty() {
+                continue;
+            }
+            if c.pattern_hint.is_none() {
+                return Err(EngineError::new("invalid", format!("{}: keys, foreign keys and {} columns don't take a pattern", c.name, c.data_type)));
+            }
+            let Some(base) = gens[i].take() else { continue };
+            let pattern = Pattern::parse(&base, &text).map_err(|e| EngineError::new("invalid", format!("Pattern for {} ({text}): {e}", c.name)))?;
+            gens[i] = Some(Gen::Patterned { base: Box::new(base), pattern, text });
+        }
         let skip: HashSet<String> = spec.skip.iter().map(|s| s.to_lowercase()).collect();
         let fill: HashSet<String> = spec.fill.iter().map(|s| s.to_lowercase()).collect();
         let chosen: Vec<usize> = plan
@@ -477,15 +547,35 @@ impl QueryEngine {
 
         let nullable: Vec<bool> = chosen.iter().map(|&i| plan.columns[i].nullable && !plan.columns[i].primary_key).collect();
         // Unique keys of several columns: positions in the row, when every
-        // column of the key is filled and the AI writes one of them.
+        // column of the key is filled and one of them is made up (random or AI).
         let groups: Vec<Vec<usize>> = unique_groups
             .iter()
             .filter_map(|key| key.iter().map(|c| chosen.iter().position(|&i| plan.columns[i].name.to_lowercase() == *c)).collect::<Option<Vec<usize>>>())
-            .filter(|g| g.iter().any(|&k| matches!(sources[k], Source::Sample { .. })))
+            .filter(|g| g.iter().any(|&k| made_up(&sources[k]).is_some()))
             .collect();
-        let mut misfits = 0usize;
-        let batches =
-            generate(&columns, &sources, &nullable, &parents, sample, &groups, spec.rows as usize, spec.null_percent.min(100), &mut rng, &mut misfits)?;
+        let unique_cols: Vec<bool> = chosen.iter().map(|&i| unique.contains(&plan.columns[i].name.to_lowercase())).collect();
+        let mut counts = Counts::default();
+        let batches = generate(
+            &columns,
+            &sources,
+            &nullable,
+            &parents,
+            sample,
+            &groups,
+            &unique_cols,
+            spec.rows as usize,
+            spec.null_percent.min(100),
+            &mut rng,
+            &mut counts,
+        )?;
+        if counts.repeats > 0 {
+            notes.push(format!(
+                "{} row{} still repeat a unique column or key of several columns ({RETRIES} made-up values in a row were taken): the load will refuse them. Make fewer rows, raise the AI rows, or widen the column's pattern.",
+                counts.repeats,
+                if counts.repeats == 1 { "" } else { "s" }
+            ));
+        }
+        let misfits = counts.misfits;
         if misfits > 0 {
             notes.push(format!(
                 "{misfits} AI value{} didn't fit {} column (type, length, allowed values, NOT NULL or uniqueness) and {} made up instead.",
@@ -554,10 +644,11 @@ enum KeyRead {
 }
 
 fn key_read(g: &Gen) -> KeyRead {
-    match g {
+    match g.base() {
         Gen::Int { .. } | Gen::Decimal { .. } | Gen::Float | Gen::Date | Gen::Timestamp | Gen::TimestampTz | Gen::Time => KeyRead::Max,
         Gen::Text { .. } | Gen::Binary { .. } | Gen::Inet => KeyRead::Count,
         Gen::Bool | Gen::Choice(_) | Gen::Uuid | Gen::Json => KeyRead::Nothing,
+        Gen::Patterned { .. } => unreachable!("base() is never patterned"),
     }
 }
 
@@ -635,6 +726,7 @@ fn binary_key_len(max: Option<usize>) -> usize {
 /// empty or it couldn't be read. `Err`: the column can't hold `rows` new
 /// unique keys.
 fn key_start(g: &Gen, found: Option<&str>, rows: u32, col: &str, data_type: &str) -> std::result::Result<i64, String> {
+    let g = g.base();
     let rows = i64::from(rows.max(1));
     let full = |what: &str| format!("{col} ({data_type}) has no room for {rows} more unique keys: {what}. Choose fewer rows, or leave {col} to the database.");
     let day0 = days_from_civil(2020, 1, 1);
@@ -654,6 +746,7 @@ fn key_start(g: &Gen, found: Option<&str>, rows: u32, col: &str, data_type: &str
         Gen::Text { .. } | Gen::Binary { .. } | Gen::Inet => after_count(),
         Gen::Bool | Gen::Choice(_) => 0,
         Gen::Uuid | Gen::Json => 1,
+        Gen::Patterned { .. } => unreachable!("base() is never patterned"),
     };
     let last = start.checked_add(rows - 1).ok_or_else(|| full("the next key is past the largest 64-bit integer"))?;
     match g {
@@ -720,9 +813,39 @@ enum Gen {
     Binary {
         max: Option<usize>,
     },
+    /// `base` values that follow a pattern.
+    Patterned {
+        base: Box<Gen>,
+        pattern: Pattern,
+        text: String,
+    },
+}
+
+/// An example pattern for a generator's type.
+fn pattern_hint(g: &Gen) -> Option<String> {
+    Some(
+        match g {
+            Gen::Int { .. } => "18..90",
+            Gen::Float | Gen::Decimal { .. } => "1..1000",
+            Gen::Date | Gen::Timestamp | Gen::TimestampTz => "1950-01-01..2005-12-31",
+            Gen::Time => "08:00..18:00",
+            Gen::Text { .. } => "%@gmail.com",
+            Gen::Choice(_) => "{a|b}",
+            Gen::Bool | Gen::Uuid | Gen::Json | Gen::Inet | Gen::Binary { .. } | Gen::Patterned { .. } => return None,
+        }
+        .to_string(),
+    )
 }
 
 impl Gen {
+    /// The generator under any pattern.
+    fn base(&self) -> &Gen {
+        match self {
+            Gen::Patterned { base, .. } => base.base(),
+            g => g,
+        }
+    }
+
     fn col_type(&self) -> ColType {
         match self {
             Gen::Bool => ColType::Bool,
@@ -734,6 +857,7 @@ impl Gen {
             Gen::Time => ColType::Time,
             Gen::Binary { .. } => ColType::Binary,
             Gen::Decimal { .. } | Gen::Text { .. } | Gen::Uuid | Gen::Json | Gen::Choice(_) | Gen::Inet => ColType::Utf8,
+            Gen::Patterned { base, .. } => base.col_type(),
         }
     }
 
@@ -771,6 +895,7 @@ impl Gen {
             Gen::Timestamp | Gen::TimestampTz => "date-times 2020–2025".into(),
             Gen::Time => "times of day".into(),
             Gen::Binary { .. } => "random bytes".into(),
+            Gen::Patterned { pattern, text, .. } => pattern.describe(text),
         }
     }
 
@@ -786,6 +911,7 @@ impl Gen {
             Gen::Inet => "unique IP addresses, counting on from the row count".into(),
             Gen::Bool | Gen::Choice(_) => format!("{}, each once", self.describe()),
             Gen::Uuid | Gen::Json => self.describe(),
+            Gen::Patterned { base, .. } => base.key_describe(),
         }
     }
 }
@@ -833,6 +959,14 @@ fn plan_for(kind: ConnectorKind, schema: &str, name: &str, cols: &[ColumnInfo], 
             },
             ai_text: parent.is_none() && !c.is_primary_key && matches!(maker, Some(Gen::Text { .. })),
             ai_ok: parent.is_none() && !c.is_primary_key && matches!(&maker, Some(g) if !matches!(g, Gen::Uuid | Gen::Binary { .. })),
+            pattern: match &maker {
+                Some(g) if parent.is_none() && !c.is_primary_key => pattern::default_pattern(g, &c.name),
+                _ => None,
+            },
+            pattern_hint: match &maker {
+                Some(g) if parent.is_none() && !c.is_primary_key && !fills => pattern_hint(g),
+                _ => None,
+            },
             parent,
             note,
         });
@@ -1218,6 +1352,13 @@ fn random_value(g: &Gen, n: u64, rng: &mut Rng) -> Value {
             let len = max.unwrap_or(16).clamp(1, 16);
             Value::Bytes((0..len).map(|_| rng.below(256) as u8).collect())
         }
+        Gen::Patterned { base, pattern, .. } => {
+            let (flavor, max) = match base.base() {
+                Gen::Text { max, flavor } => (*flavor, *max),
+                _ => (Flavor::Word, None),
+            };
+            pattern.generate(base, flavor, max, rng)
+        }
     }
 }
 
@@ -1225,7 +1366,7 @@ fn random_value(g: &Gen, n: u64, rng: &mut Rng) -> Value {
 /// as they are, dates as days since 1970, date-times and times as
 /// seconds, text, bytes and addresses encoded from it.
 fn key_value(g: &Gen, i: i64, tag: &str, rng: &mut Rng) -> Value {
-    match g {
+    match g.base() {
         Gen::Int { .. } => Value::Int(i),
         Gen::Decimal { .. } => Value::Text(i.to_string()),
         Gen::Float => Value::Float(i as f64),
@@ -1240,6 +1381,7 @@ fn key_value(g: &Gen, i: i64, tag: &str, rng: &mut Rng) -> Value {
         Gen::Choice(v) => Value::Text(v[i.rem_euclid(v.len() as i64) as usize].clone()),
         Gen::Uuid => Value::Text(uuid(rng)),
         Gen::Json => random_value(g, i as u64, rng),
+        Gen::Patterned { .. } => unreachable!("base() is never patterned"),
     }
 }
 
@@ -1298,6 +1440,12 @@ fn sample_value(g: &Gen, raw: &str) -> Option<Value> {
             v => Some(v),
         },
         Gen::Uuid | Gen::Binary { .. } => None,
+        // The pattern decides (a range may go past the generator's own);
+        // text also fits the column.
+        Gen::Patterned { base, pattern, .. } => match base.base() {
+            Gen::Text { .. } => sample_value(base, s).and_then(|_| pattern.accept(base, s)),
+            _ => pattern.accept(base, s),
+        },
     }
 }
 
@@ -1313,10 +1461,11 @@ fn real_date(s: &str) -> bool {
 }
 
 /// Make `row`'s values of a unique key of several columns a combination not
-/// given yet: reused AI rows repeat whole rows, so the AI text column of the
-/// key gets a numbered variant (`Ann Lee 2`, `ann+2@x.com`) that still fits.
+/// given yet (reused AI rows repeat whole rows; patterns and short lists
+/// repeat too): a made-up text column of the key gets a numbered variant
+/// (`Ann Lee 2`, `ann+2@x.com`) that still fits, else another made-up value.
 /// A key with a NULL can repeat (NULLs are distinct), so it is left alone.
-fn distinct_combination(row: &mut [Value], key: &[usize], sources: &[Source], seen: &mut HashSet<String>) {
+fn distinct_combination(row: &mut [Value], key: &[usize], sources: &[Source], seen: &mut HashSet<String>, n: u64, rng: &mut Rng) -> bool {
     let combo = |row: &[Value]| -> Option<String> {
         let mut parts = Vec::with_capacity(key.len());
         for &k in key {
@@ -1327,24 +1476,95 @@ fn distinct_combination(row: &mut [Value], key: &[usize], sources: &[Source], se
         }
         Some(parts.join("\u{1}"))
     };
-    let Some(first) = combo(row) else { return };
+    let Some(first) = combo(row) else { return true };
     if seen.insert(first) {
-        return;
+        return true;
     }
+    // A numbered variant of a made-up text column of the key…
     for &k in key {
-        let (Source::Sample { fallback: Gen::Text { max, .. }, .. }, Value::Text(t)) = (&sources[k], &row[k]) else { continue };
+        let (Some(fallback), Value::Text(t)) = (made_up(&sources[k]), &row[k]) else { continue };
+        let Gen::Text { max, .. } = fallback.base() else { continue };
         let base = t.clone();
         for n in 2..10_000 {
             let Some(v) = variant(&base, n, *max) else { break };
+            // Still following the column's pattern (`ann+2@gmail.com` does).
+            if let Gen::Patterned { pattern, base: b, .. } = fallback
+                && pattern.accept(b, &v).is_none()
+            {
+                break;
+            }
             row[k] = Value::Text(v);
             if let Some(c) = combo(row)
                 && seen.insert(c)
             {
-                return;
+                return true;
             }
         }
         row[k] = Value::Text(base);
     }
+    // …else another made-up value for one of its columns (numbers, dates).
+    for &k in key {
+        let Some(fallback) = made_up(&sources[k]) else { continue };
+        let before = row[k].clone();
+        for _ in 0..RETRIES {
+            row[k] = random_value(fallback, n, rng);
+            if let Some(c) = combo(row)
+                && seen.insert(c)
+            {
+                return true;
+            }
+        }
+        row[k] = before;
+    }
+    false
+}
+
+/// The generator of a made-up column (random or AI); `None` for keys,
+/// foreign keys and NULLs.
+fn made_up(s: &Source) -> Option<&Gen> {
+    match s {
+        Source::Random(g) | Source::Sample { fallback: g, .. } => Some(g),
+        _ => None,
+    }
+}
+
+/// Tries for a made-up value not given yet.
+const RETRIES: usize = 20;
+
+/// `v`, or for a value given already a numbered variant of it (text) or
+/// another made-up value; counted when none is found.
+fn not_given(seen: &mut HashSet<String>, v: Value, g: &Gen, n: u64, rng: &mut Rng, counts: &mut Counts) -> Value {
+    if seen.insert(seen_key(&v)) {
+        return v;
+    }
+    if let Value::Text(t) = &v
+        && let Some(d) = distinct(seen, t.clone(), g)
+    {
+        return d;
+    }
+    for _ in 0..RETRIES {
+        let w = random_value(g, n, rng);
+        if seen.insert(seen_key(&w)) {
+            return w;
+        }
+    }
+    counts.repeats += 1;
+    v
+}
+
+/// What a value of a unique column is compared by.
+fn seen_key(v: &Value) -> String {
+    match v {
+        Value::Text(t) => t.clone(),
+        v => format!("{v:?}"),
+    }
+}
+
+/// AI values made up instead, and rows that still repeat a unique key.
+#[derive(Debug, Default)]
+struct Counts {
+    misfits: usize,
+    repeats: usize,
 }
 
 /// `t` numbered `n` (`ann+2@x.com`, `Ann 2`), or `None` when it wouldn't fit.
@@ -1362,12 +1582,18 @@ fn distinct(seen: &mut HashSet<String>, t: String, g: &Gen) -> Option<Value> {
     if seen.insert(t.clone()) {
         return Some(Value::Text(t));
     }
-    let max = match g {
+    let max = match g.base() {
         Gen::Text { max, .. } => *max,
         _ => return None,
     };
     for n in 2..1000 {
         let v = variant(&t, n, max)?;
+        // A variant must still follow the column's pattern (`ann+2@gmail.com` does).
+        if let Gen::Patterned { pattern, base, .. } = g
+            && pattern.accept(base, &v).is_none()
+        {
+            return None;
+        }
         if seen.insert(v.clone()) {
             return Some(Value::Text(v));
         }
@@ -1528,10 +1754,11 @@ fn generate(
     parents: &[Vec<Vec<Option<String>>>],
     sample: Option<&AiSample>,
     groups: &[Vec<usize>],
+    unique: &[bool],
     rows: usize,
     null_percent: u8,
     rng: &mut Rng,
-    misfits: &mut usize,
+    counts: &mut Counts,
 ) -> Result<Vec<RecordBatch>> {
     let mut b = BatchBuilder::new(columns, BATCH.min(rows));
     let mut out = Vec::new();
@@ -1566,7 +1793,10 @@ fn generate(
                     if nullable[c] && null_percent > 0 && rng.below(100) < null_percent as u64 {
                         Value::Null
                     } else {
-                        random_value(g, i as u64 + 1, rng)
+                        let v = random_value(g, i as u64 + 1, rng);
+                        // A unique column: a value not given yet (a pattern
+                        // such as `%@gmail.com` has few of its own).
+                        if unique.get(c).copied().unwrap_or(false) { not_given(&mut seen[c], v, g, i as u64 + 1, rng, counts) } else { v }
                     }
                 }
                 Source::Sample { col, fallback, unique } => {
@@ -1581,23 +1811,18 @@ fn generate(
                     let fit = raw.as_deref().and_then(|r| sample_value(fallback, r));
                     let fit = match fit {
                         Some(Value::Text(t)) if *unique => distinct(&mut seen[c], t, fallback),
-                        Some(v) if *unique && !matches!(v, Value::Null) => {
-                            let key = format!("{v:?}");
-                            seen[c].insert(key).then_some(v)
-                        }
+                        Some(v) if *unique => seen[c].insert(seen_key(&v)).then_some(v),
                         v => v,
                     };
                     match fit {
                         Some(v) => v,
                         None => {
                             if raw.is_some() {
-                                *misfits += 1;
+                                counts.misfits += 1;
                             }
+                            // Made up instead; for a unique column, one not given yet.
                             let v = random_value(fallback, i as u64 + 1, rng);
-                            if *unique && let Value::Text(t) = &v {
-                                seen[c].insert(t.clone());
-                            }
-                            v
+                            if *unique { not_given(&mut seen[c], v, fallback, i as u64 + 1, rng, counts) } else { v }
                         }
                     }
                 }
@@ -1605,7 +1830,9 @@ fn generate(
             .collect();
         let mut row = row;
         for (g, key) in groups.iter().enumerate() {
-            distinct_combination(&mut row, key, sources, &mut seen_groups[g]);
+            if !distinct_combination(&mut row, key, sources, &mut seen_groups[g], i as u64 + 1, &mut ai_rng) {
+                counts.repeats += 1;
+            }
         }
         b.push_row(row);
         if b.is_full() {
@@ -1748,7 +1975,7 @@ mod tests {
 
         let columns = vec![Column::new("d", ColType::Date, "date"), Column::new("f", ColType::Float64, "real")];
         let sources = vec![Source::Key { maker: Gen::Date, start: day, tag: String::new() }, Source::Key { maker: Gen::Float, start: 7, tag: String::new() }];
-        let b = generate(&columns, &sources, &[false, false], &[], None, &[], 5000, 0, &mut rng, &mut 0).unwrap();
+        let b = generate(&columns, &sources, &[false, false], &[], None, &[], &[], 5000, 0, &mut rng, &mut Counts::default()).unwrap();
         let dates: HashSet<i32> = b.iter().flat_map(|x| x.column(0).as_any().downcast_ref::<Date32Array>().unwrap().values().to_vec()).collect();
         assert_eq!(dates.len(), 5000);
         assert!(dates.contains(&(day as i32)));
@@ -1857,12 +2084,12 @@ mod tests {
             b[0].column(c).as_any().downcast_ref::<StringArray>().unwrap().iter().map(|v| v.unwrap().to_string()).collect()
         };
         // UNIQUE (first, last): the 3rd row on reuses "Ann Lee", so a numbered variant.
-        let b = generate(&columns, &sources, &[false; 3], &[], Some(&sample), &[vec![0, 1]], 6, 0, &mut Rng(1), &mut 0).unwrap();
+        let b = generate(&columns, &sources, &[false; 3], &[], Some(&sample), &[vec![0, 1]], &[], 6, 0, &mut Rng(1), &mut Counts::default()).unwrap();
         let (first, last) = (strings(&b, 0), strings(&b, 1));
         assert_eq!(first, ["Ann", "Bo", "Ann 2", "Bo 2", "Ann 3", "Bo 3"]);
         assert_eq!(last, ["Lee", "Kim", "Lee", "Kim", "Lee", "Kim"], "one column of the key changes, the other keeps the AI's value");
         // UNIQUE (first, team): the counting key already makes each row distinct.
-        let b = generate(&columns, &sources, &[false; 3], &[], Some(&sample), &[vec![0, 2]], 6, 0, &mut Rng(1), &mut 0).unwrap();
+        let b = generate(&columns, &sources, &[false; 3], &[], Some(&sample), &[vec![0, 2]], &[], 6, 0, &mut Rng(1), &mut Counts::default()).unwrap();
         assert_eq!(strings(&b, 0), ["Ann", "Bo", "Ann", "Bo", "Ann", "Bo"]);
         // A variant that wouldn't fit the column isn't used: the next text column of the key changes.
         let tight = vec![
@@ -1870,9 +2097,35 @@ mod tests {
             Source::Sample { col: 1, fallback: Gen::Text { max: Some(20), flavor: Flavor::LastName }, unique: false },
             Source::Random(Gen::Int { min: 1, max: 1 }),
         ];
-        let b = generate(&columns, &tight, &[false; 3], &[], Some(&sample), &[vec![0, 1]], 4, 0, &mut Rng(1), &mut 0).unwrap();
+        let b = generate(&columns, &tight, &[false; 3], &[], Some(&sample), &[vec![0, 1]], &[], 4, 0, &mut Rng(1), &mut Counts::default()).unwrap();
         assert_eq!(strings(&b, 0), ["Ann", "Bo", "Ann", "Bo"]);
         assert_eq!(strings(&b, 1), ["Lee", "Kim", "Lee 2", "Kim 2"]);
+    }
+
+    #[test]
+    fn reused_ai_numbers_and_dates_keep_unique_keys_unique() {
+        let columns = vec![Column::new("age", ColType::Int64, "int"), Column::new("born", ColType::Date, "date")];
+        let age = Gen::Int { min: 18, max: 90 };
+        let sources = vec![Source::Sample { col: 0, fallback: age.clone(), unique: false }, Source::Sample { col: 1, fallback: Gen::Date, unique: false }];
+        let sample = AiSample { columns: vec!["age".into(), "born".into()], rows: vec![vec![Some("40".into()), Some("1985-02-03".into())]] };
+        let mut counts = Counts::default();
+        let b = generate(&columns, &sources, &[false; 2], &[], Some(&sample), &[vec![0, 1]], &[], 50, 0, &mut Rng(1), &mut counts).unwrap();
+        let ages = b[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec();
+        let days = b[0].column(1).as_any().downcast_ref::<Date32Array>().unwrap().values().to_vec();
+        let pairs: HashSet<(i64, i32)> = ages.iter().copied().zip(days.iter().copied()).collect();
+        assert_eq!(pairs.len(), 50, "UNIQUE (age, born) holds");
+        assert_eq!((ages[0], days[0]), (40, days_from_civil(1985, 2, 3) as i32), "the AI's row as it wrote it");
+        assert!(ages.iter().all(|a| (18..=90).contains(a)), "made-up values stay in the column's range");
+        assert_eq!(counts.repeats, 0);
+
+        // A unique column with fewer values than rows: the rows that can't be unique are counted.
+        let tiny = vec![Source::Sample { col: 0, fallback: Gen::Int { min: 1, max: 3 }, unique: true }];
+        let one = AiSample { columns: vec!["age".into()], rows: vec![vec![Some("2".into())]] };
+        let mut counts = Counts::default();
+        let b = generate(&columns[..1], &tiny, &[false], &[], Some(&one), &[], &[], 5, 0, &mut Rng(1), &mut counts).unwrap();
+        let v: HashSet<i64> = b[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().iter().copied().collect();
+        assert_eq!(v, HashSet::from([1, 2, 3]));
+        assert_eq!(counts.repeats, 2, "5 rows, 3 values");
     }
 
     #[test]
@@ -1887,6 +2140,8 @@ mod tests {
             generator: String::new(),
             ai_text: true,
             ai_ok: true,
+            pattern: None,
+            pattern_hint: None,
             parent: None,
             note: None,
         };
@@ -1921,8 +2176,8 @@ mod tests {
                 vec![None, None],
             ],
         };
-        let mut misfits = 0;
-        let b = generate(&columns, &sources, &[false, false, false], &[], Some(&sample), &[], 6, 0, &mut Rng(1), &mut misfits).unwrap();
+        let mut counts = Counts::default();
+        let b = generate(&columns, &sources, &[false, false, false], &[], Some(&sample), &[], &[], 6, 0, &mut Rng(1), &mut counts).unwrap();
         let text =
             |c: usize| -> Vec<String> { b[0].column(c).as_any().downcast_ref::<StringArray>().unwrap().iter().map(|v| v.unwrap().to_string()).collect() };
         let names = text(0);
@@ -1936,18 +2191,17 @@ mod tests {
         assert_ne!(names[1], "A name far too long");
         assert!(names[1].chars().count() <= 12);
         assert!(!names[2].is_empty() && !emails[2].is_empty());
-        assert_eq!(misfits, 2, "the too-long name, twice (the AI's NULLs are made up, not counted)");
+        assert_eq!(counts.misfits, 2, "the too-long name, twice (the AI's NULLs are made up, not counted)");
         assert_eq!(emails.iter().collect::<HashSet<_>>().len(), 6);
 
         // NULLs come from the NULL share only, not from the AI.
-        let mut misfits = 0;
-        let b = generate(&columns[..1], &sources[..1], &[true], &[], Some(&sample), &[], 3, 0, &mut Rng(1), &mut misfits).unwrap();
+        let b = generate(&columns[..1], &sources[..1], &[true], &[], Some(&sample), &[], &[], 3, 0, &mut Rng(1), &mut Counts::default()).unwrap();
         assert_eq!(b[0].column(0).null_count(), 0);
 
         // The same seed gives the same other columns, whatever the AI wrote.
         let other = AiSample { columns: sample.columns.clone(), rows: vec![vec![Some("Way too long a name".into()), Some("x@y.z".into())]] };
         let nums = |s: &AiSample| -> Vec<i64> {
-            let b = generate(&columns, &sources, &[false, false, false], &[], Some(s), &[], 6, 0, &mut Rng(9), &mut 0).unwrap();
+            let b = generate(&columns, &sources, &[false, false, false], &[], Some(s), &[], &[], 6, 0, &mut Rng(9), &mut Counts::default()).unwrap();
             b[0].column(2).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()
         };
         assert_eq!(nums(&sample), nums(&other));
@@ -1995,8 +2249,8 @@ mod tests {
         };
         let parents = vec![vec![vec![Some("7".to_string())], vec![Some("9".to_string())]]];
         let nullable = [false, false, false, true];
-        let a = generate(&columns, &mk(), &nullable, &parents, None, &[], 10_000, 50, &mut Rng(7), &mut 0).unwrap();
-        let b = generate(&columns, &mk(), &nullable, &parents, None, &[], 10_000, 50, &mut Rng(7), &mut 0).unwrap();
+        let a = generate(&columns, &mk(), &nullable, &parents, None, &[], &[], 10_000, 50, &mut Rng(7), &mut Counts::default()).unwrap();
+        let b = generate(&columns, &mk(), &nullable, &parents, None, &[], &[], 10_000, 50, &mut Rng(7), &mut Counts::default()).unwrap();
         assert_eq!(a.len(), 2, "8192 rows per batch");
         assert_eq!(a, b, "same seed, same rows");
         let ids: Vec<i64> = a.iter().flat_map(|x| x.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect();

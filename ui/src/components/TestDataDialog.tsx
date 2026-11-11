@@ -12,6 +12,7 @@ import { formatCount, uid } from "../lib/util";
 import { openOutput } from "../outputs";
 import { useAi } from "../aiStore";
 import { AI_BATCH_ROWS, MAX_AI_ROWS, aiRequest, aiTarget, aiWrites, clampAiRows } from "../lib/testDataAi";
+import { PATTERN_HELP, patternOf, patternsFor, patternsKey } from "../lib/testDataPatterns";
 import { useStore } from "../store";
 import type { TestDataRequest } from "../store/uiSlice";
 import { DryRunReport } from "./job/LoadFields";
@@ -35,7 +36,15 @@ export function defaultColumns(cols: TestDataColumn[]): Set<string> {
 }
 
 /** The spec sent for the ticked columns. */
-export function specFor(cols: TestDataColumn[], ticked: Set<string>, rows: number, nullPercent: number, seed: string, parentKeys: boolean): TestDataSpec {
+export function specFor(
+  cols: TestDataColumn[],
+  ticked: Set<string>,
+  rows: number,
+  nullPercent: number,
+  seed: string,
+  parentKeys: boolean,
+  patterns: Record<string, string> = {},
+): TestDataSpec {
   const s = seed.trim();
   return {
     rows: Math.max(1, Math.min(MAX_TEST_ROWS, Math.floor(rows) || 1)),
@@ -45,6 +54,7 @@ export function specFor(cols: TestDataColumn[], ticked: Set<string>, rows: numbe
     skip: cols.filter((c) => c.supported && !c.database_fills && !ticked.has(c.name)).map((c) => c.name),
     fill: cols.filter((c) => c.supported && c.database_fills && ticked.has(c.name)).map((c) => c.name),
     parent_keys: parentKeys,
+    patterns: patternsFor(cols, patterns),
   };
 }
 
@@ -81,6 +91,12 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   const panelProvider = useAi((s) => s.providerId);
   const panelModel = useAi((s) => s.model);
   const [aiRun, setAiRun] = useState<string | null>(null);
+  // Column patterns: the user's and the AI's, over each column's default.
+  const pKey = patternsKey(req.connection_id, req.schema, req.table);
+  const storedPatterns = useStore((s) => s.testDataPatterns[pKey]);
+  const savePatterns = useStore((s) => s.setTestDataPatterns);
+  const [patterns, setPatterns] = useState<Record<string, string>>(() => storedPatterns ?? {});
+  const [suggesting, setSuggesting] = useState(false);
   // The AI rows field as typed (committed on blur, so it can be cleared).
   const [aiRowsText, setAiRowsText] = useState(String(aiSettings.rows));
   const running = useRef<string | null>(null);
@@ -117,7 +133,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   useEffect(() => {
     setMade(null);
     setDry(null);
-  }, [rows, nulls, seed, parentKeys, tickedKey, aiSettings, panelProvider, panelModel, conn?.ai_policy]);
+  }, [rows, nulls, seed, parentKeys, tickedKey, aiSettings, panelProvider, panelModel, conn?.ai_policy, patterns]);
 
   if (plan.status !== "ready") {
     return (
@@ -159,6 +175,31 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   const aiCalls = Math.ceil(aiRows / AI_BATCH_ROWS);
   const providerName = providers.find((x) => x.id === target?.provider_id)?.name ?? "the AI";
 
+  const spec = () => specFor(p.columns, ticked, rows, nulls, seed, parentKeys, patterns);
+  const setPattern = (col: string, value: string) => setPatterns((m) => ({ ...m, [col]: value }));
+  const keepPatterns = () => savePatterns(pKey, patterns);
+  /** The AI's patterns for the ticked columns, over the current ones. */
+  const suggest = async () => {
+    if (!target) return;
+    const run = uid();
+    running.current = run;
+    setAiRun(run);
+    setSuggesting(true);
+    try {
+      const got = await api.suggestTestDataPatterns(req.connection_id, req.schema, req.table, spec(), { ...target, all_columns: true, rows: 1 }, run);
+      const next = { ...patterns, ...got };
+      setPatterns(next);
+      savePatterns(pKey, next);
+      const n = Object.keys(got).length;
+      toast(n ? `${providerName} suggested ${n} pattern${n === 1 ? "" : "s"}: check them in the Pattern column` : `${providerName} had no pattern to suggest`, "info");
+    } catch (e) {
+      failed(e);
+    } finally {
+      running.current = null;
+      setAiRun(null);
+      setSuggesting(false);
+    }
+  };
   /** Rows for the current settings (made once, reused by preview, dry run and load). */
   const generate = async (): Promise<TestDataOutput> => {
     if (made) return made;
@@ -168,7 +209,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
     setAiRun(run);
     let out: TestDataOutput;
     try {
-      out = await api.generateTestData(req.connection_id, req.schema, req.table, specFor(p.columns, ticked, rows, nulls, seed, parentKeys), askAi, run);
+      out = await api.generateTestData(req.connection_id, req.schema, req.table, spec(), askAi, run);
     } finally {
       running.current = null;
       setAiRun(null);
@@ -244,7 +285,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
     <Modal
       title={`Generate test data · ${req.table}`}
       onClose={() => !progress && onClose()}
-      width={680}
+      width={820}
       footer={
         report ? (
           <button className="btn-primary" onClick={onClose}>
@@ -257,7 +298,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
         ) : aiRun ? (
           <>
             <span className="mr-auto flex items-center gap-1.5 text-[12px] text-muted" role="status">
-              <Loader2 size={13} className="animate-spin" /> {providerName} is writing {formatCount(aiRows)} rows…
+              <Loader2 size={13} className="animate-spin" /> {suggesting ? `${providerName} is suggesting patterns…` : `${providerName} is writing ${formatCount(aiRows)} rows…`}
             </span>
             <button className="btn-ghost border border-line" onClick={() => void api.aiCancel(aiRun)}>
               <Square size={12} /> Stop
@@ -406,6 +447,19 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
               )
             )}
           </div>
+          <div className="flex items-center gap-2 text-[11.5px] text-muted">
+            <span className="mr-auto" title={PATTERN_HELP}>
+              A pattern shapes a column's values (18..90, %@gmail.com, INV-####): hover here for how to write one.
+            </span>
+            <button
+              className="btn-ghost border border-line py-0.5 text-[11.5px]"
+              disabled={!!aiBlocked || !!busy || !!aiRun || ticked.size === 0}
+              title={aiBlocked ?? "Ask the AI for patterns that make the ticked columns realistic (only the table's structure is sent)"}
+              onClick={() => void suggest()}
+            >
+              {suggesting ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} className="text-accent" />} Suggest patterns with AI
+            </button>
+          </div>
           <div className="max-h-72 overflow-auto rounded-md border border-line">
             <table className="w-full border-collapse text-[12px]">
               <thead className="sticky top-0 bg-panel text-[11px] text-muted">
@@ -414,6 +468,9 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
                   <th className="px-2 py-1 text-left font-normal">Column</th>
                   <th className="px-2 py-1 text-left font-normal">Type</th>
                   <th className="px-2 py-1 text-left font-normal">Gets</th>
+                  <th className="px-2 py-1 text-left font-normal" title={PATTERN_HELP}>
+                    Pattern
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -446,6 +503,20 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
                         c.generator
                       )}
                       {c.note && <div className="text-[11px] text-muted">{c.note}</div>}
+                    </td>
+                    <td className="px-2 py-1">
+                      {c.pattern_hint && (
+                        <input
+                          className="field w-36 py-0.5 font-mono text-[11.5px]"
+                          aria-label={`Pattern for ${c.name}`}
+                          placeholder={`e.g. ${c.pattern_hint}`}
+                          title={PATTERN_HELP}
+                          disabled={!ticked.has(c.name)}
+                          value={patternOf(c, patterns)}
+                          onChange={(e) => setPattern(c.name, e.target.value)}
+                          onBlur={keepPatterns}
+                        />
+                      )}
                     </td>
                   </tr>
                 ))}

@@ -246,6 +246,7 @@ pub fn run() {
             commands::results::check_load_target,
             commands::results::test_data_plan,
             commands::results::generate_test_data,
+            commands::results::suggest_test_data_patterns,
             commands::queries::sql_parameters,
             commands::lineage::sql_lineage,
             commands::queries::save_text_file,

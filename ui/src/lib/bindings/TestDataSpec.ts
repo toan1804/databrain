@@ -24,4 +24,9 @@ fill: Array<string>,
  * Foreign key columns take keys read from the parent tables (else
  * made-up values that may break the constraint).
  */
-parent_keys: boolean, };
+parent_keys: boolean, 
+/**
+ * Patterns by column (see [`PATTERN_HELP`]); a column not named here
+ * takes its default ([`TestDataColumn::pattern`]), and `""` none.
+ */
+patterns: { [key in string]?: string }, };

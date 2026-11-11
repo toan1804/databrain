@@ -28,6 +28,16 @@ ai_text: boolean,
  */
 ai_ok: boolean, 
 /**
+ * The pattern used unless the spec gives one: from the column's name
+ * (`age` → `18..90`).
+ */
+pattern?: string, 
+/**
+ * An example pattern for its type; `None`: no pattern (keys, foreign
+ * keys, types without one).
+ */
+pattern_hint?: string, 
+/**
  * The parent table its values come from (`schema.table.column`).
  */
 parent?: string, 

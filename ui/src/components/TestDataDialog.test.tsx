@@ -25,8 +25,19 @@ describe("test data dialog", () => {
 
   it("sends unticked columns as skip and ticked database-filled ones as fill", () => {
     const s = specFor(cols, new Set(["id", "name"]), 250_000, 140, " 42 ", false);
-    expect(s).toEqual({ rows: 100_000, null_percent: 100, seed: 42, skip: ["note"], fill: ["id"], parent_keys: false });
+    expect(s).toEqual({ rows: 100_000, null_percent: 100, seed: 42, skip: ["note"], fill: ["id"], parent_keys: false, patterns: {} });
     expect(specFor(cols, new Set(), 0, -5, "abc", true)).toMatchObject({ rows: 1, null_percent: 0, seed: null });
+  });
+
+  it("sends every column's pattern: the user's, else its default, empty for none", () => {
+    const pcols = [
+      col("id", { primary_key: true }),
+      col("age", { pattern: "18..90", pattern_hint: "18..90" }),
+      col("email", { pattern_hint: "%@gmail.com" }),
+      col("born", { pattern: "1950..2005", pattern_hint: "1950-01-01..2005-12-31" }),
+    ];
+    const s = specFor(pcols, new Set(["age", "email", "born"]), 10, 0, "", true, { email: " %@corp.vn ", born: "" });
+    expect(s.patterns).toEqual({ age: "18..90", email: "%@corp.vn", born: "" });
   });
 
   it("sends only seeds that a JavaScript number keeps exactly", () => {

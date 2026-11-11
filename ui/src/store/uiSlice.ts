@@ -32,6 +32,9 @@ export interface UiSlice {
   /** Generate test data → "Generate with AI" (remembered). */
   testDataAi: TestDataAiSettings;
   setTestDataAi: (s: TestDataAiSettings) => void;
+  /** Generate test data → column patterns by table (`patternsKey`), remembered. */
+  testDataPatterns: Record<string, Record<string, string>>;
+  setTestDataPatterns: (key: string, patterns: Record<string, string>) => void;
   /** The user's SQL snippets (built-in ones are added by the editor). */
   sqlSnippets: Snippet[];
   setSqlSnippets: (s: Snippet[]) => void;
@@ -89,6 +92,7 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   inlineAiCompletion: false,
   inlineAiProvider: null,
   testDataAi: DEFAULT_TEST_DATA_AI,
+  testDataPatterns: {},
   sqlSnippets: [],
   gridViews: [],
   quickFilters: {},
@@ -141,6 +145,11 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   setTestDataAi: (testDataAi) => {
     set({ testDataAi });
     if (isTauri()) api.setSetting("test_data_ai", testDataAi).catch(() => {});
+  },
+  setTestDataPatterns: (key, patterns) => {
+    const testDataPatterns = { ...get().testDataPatterns, [key]: patterns };
+    set({ testDataPatterns });
+    if (isTauri()) api.setSetting("test_data_patterns", testDataPatterns).catch(() => {});
   },
   setSqlSnippets: (s) => {
     const sqlSnippets = parseSnippets(s);

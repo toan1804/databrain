@@ -335,6 +335,33 @@ pub async fn generate_test_data(
     store_test_data(state, connection_id, schema, name, spec.rows, data)
 }
 
+/// Patterns the AI suggests for a table's columns ("Suggest with AI" in
+/// Generate test data), keeping only those that work for their column.
+/// `request_id` lets `ai_cancel` stop it.
+pub async fn suggest_test_data_patterns(
+    state: &AppState,
+    connection_id: &str,
+    schema: &str,
+    name: &str,
+    spec: databrain_query_engine::testdata::TestDataSpec,
+    ai: databrain_ai::testdata::TestDataAi,
+    request_id: Option<String>,
+) -> Result<std::collections::HashMap<String, String>> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _run = request_id.map(|id| crate::ai_api::track_run(state, id, cancel.clone()));
+    let work = async {
+        let Some(ask) = state.engine.test_data_ai_ask(connection_id, schema, name, &spec, true, 1).await? else {
+            return Ok(Default::default());
+        };
+        let suggested = crate::ai_api::ai_test_data_patterns(state, connection_id, &ai, &ask, &cancel).await?;
+        state.engine.test_data_valid_patterns(connection_id, schema, name, suggested).await
+    };
+    tokio::select! {
+        r = work => r,
+        _ = cancel.cancelled() => Err(EngineError::new("cancelled", "Stopped")),
+    }
+}
+
 /// Generated rows as an output of the table's test data tab (freeing the
 /// previous one).
 pub(crate) fn store_test_data(

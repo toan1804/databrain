@@ -303,6 +303,9 @@ export const api = {
   /** With `ai`, an AI model writes the text columns first; cancel it with `aiCancel(requestId)`. */
   generateTestData: (connectionId: string, schema: string, name: string, spec: TestDataSpec, ai: TestDataAi | null = null, requestId: string | null = null) =>
     call<TestDataOutput>("generate_test_data", { connectionId, schema, name, spec, ai, requestId }),
+  /** Patterns the AI suggests for the table's columns (only those that work); cancel with `aiCancel(requestId)`. */
+  suggestTestDataPatterns: (connectionId: string, schema: string, name: string, spec: TestDataSpec, ai: TestDataAi, requestId: string | null = null) =>
+    call<Record<string, string>>("suggest_test_data_patterns", { connectionId, schema, name, spec, ai, requestId }),
   summarizeSelection: (resultId: string, view: ViewSpec, columns: number[], offset: number, limit: number) =>
     call<SelectionSummary>("summarize_selection", { resultId, view, columns, offset, limit }),
   columnStats: (resultId: string, view: ViewSpec, column: number) =>

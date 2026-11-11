@@ -46,15 +46,16 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 /// Output tokens per call: within what common models allow.
 const MAX_TOKENS: usize = 8_000;
 
-/// Ask the model for `ask.rows` rows, in batches.
-pub async fn sample(
-    ws: &Workspace,
-    secrets: Arc<dyn SecretStore>,
-    connection_id: &str,
-    ai: &TestDataAi,
-    ask: &AiAsk,
-    cancel: &CancellationToken,
-) -> Result<AiSample> {
+/// The model to ask, after the connection's AI policy allowed it.
+struct Target {
+    provider: Arc<dyn crate::providers::LlmProvider>,
+    provider_id: String,
+    model: String,
+    /// The table's CHECK constraints that may be sent (none on PII columns).
+    checks: Vec<String>,
+}
+
+fn target(ws: &Workspace, secrets: Arc<dyn SecretStore>, connection_id: &str, ai: &TestDataAi, ask: &AiAsk) -> Result<Target> {
     let profile = ws.get_connection(connection_id)?;
     if !profile.ai_policy.ai_enabled {
         return Err(AiError::Policy("AI is disabled for this connection (Connection → AI settings)".into()));
@@ -91,7 +92,118 @@ pub async fn sample(
         .or_else(|| some(cfg.default_model.as_deref()))
         .or_else(|| some(cfg.fast_model.as_deref()))
         .ok_or_else(|| AiError::Config(format!("choose a model for \"{}\"", rec.name)))?;
+    Ok(Target { provider, provider_id: rec.id, model, checks })
+}
 
+/// One call: the answer's text and the tokens it took (read to the end of
+/// the stream: providers report usage after Done).
+async fn ask_model(provider: &Arc<dyn crate::providers::LlmProvider>, chat: ChatRequest) -> Result<(String, (u32, u32))> {
+    let run = async {
+        let mut stream = provider.chat_stream(chat).await?;
+        let (mut text, mut usage) = (String::new(), (0u32, 0u32));
+        while let Some(ev) = stream.next().await {
+            match ev? {
+                ChatEvent::TextDelta(t) => text.push_str(&t),
+                ChatEvent::Usage { input, output } => usage = (input, output),
+                _ => {}
+            }
+        }
+        Ok::<_, AiError>((text, usage))
+    };
+    tokio::time::timeout(TIMEOUT, run).await.map_err(|_| AiError::Network("the model took too long".into()))?
+}
+
+fn record(ws: &Workspace, provider_id: &str, used: (u32, u32)) {
+    if let Err(e) = ws.record_ai_usage(provider_id, "test_data", used.0, used.1) {
+        tracing::warn!("couldn't record AI usage: {e}");
+    }
+}
+
+/// Patterns the AI suggests for the columns of `ask` (see
+/// [`databrain_query_engine::testdata::PATTERN_HELP`]), by column name.
+/// Unchecked: the engine keeps the ones that parse.
+pub async fn suggest_patterns(
+    ws: &Workspace,
+    secrets: Arc<dyn SecretStore>,
+    connection_id: &str,
+    ai: &TestDataAi,
+    ask: &AiAsk,
+    cancel: &CancellationToken,
+) -> Result<std::collections::HashMap<String, String>> {
+    let t = target(ws, secrets, connection_id, ai, ask)?;
+    let (system, user) = suggest_prompt(ask, &t.checks);
+    let chat =
+        ChatRequest { model: t.model.clone(), system, messages: vec![Message::user(user)], tools: vec![], temperature: Some(0.2), max_tokens: Some(2_000) };
+    let r = tokio::select! {
+        r = ask_model(&t.provider, chat) => r,
+        _ = cancel.cancelled() => return Err(AiError::Cancelled),
+    };
+    let (text, used) = r?;
+    record(ws, &t.provider_id, used);
+    parse_patterns(&text, ask).ok_or_else(|| AiError::Provider("the model's answer wasn't the JSON object of patterns asked for".into()))
+}
+
+fn suggest_prompt(ask: &AiAsk, checks: &[String]) -> (String, String) {
+    let system = format!(
+        "You set rules for generating realistic test data for a database table. Reply with ONLY a JSON object mapping column names to patterns: \
+         no explanation, no code fences. Pattern syntax: {}",
+        databrain_query_engine::testdata::PATTERN_HELP
+    );
+    let mut u = format!("Table {} ({}).\n\nColumns:\n", ask.table, ask.dialect);
+    for c in &ask.columns {
+        let mut parts = vec![c.data_type.clone()];
+        if let Some(m) = c.max_chars {
+            parts.push(format!("at most {m} characters"));
+        }
+        if !c.choices.is_empty() {
+            parts.push(format!("one of: {}", c.choices.join(", ")));
+        }
+        parts.push(match &c.pattern {
+            Some(p) => format!("current pattern {p}"),
+            None => format!("now gets {}", c.hint),
+        });
+        u.push_str(&format!("- {}: {}\n", c.name, parts.join("; ")));
+    }
+    if !checks.is_empty() {
+        u.push_str("\nThe table's CHECK constraints (patterns must keep to them):\n");
+        for c in checks {
+            u.push_str(&format!("- {c}\n"));
+        }
+    }
+    u.push_str(
+        "\nGive a pattern for each column whose values would otherwise look wrong: ranges for ages, years, prices, quantities, ratings and \
+         dates of birth; templates for emails, phone numbers, codes and references, and dates kept as text. Keep a current pattern \
+         when it is right. Leave out columns that need none.",
+    );
+    (system, u)
+}
+
+/// The `{"column": "pattern"}` object in the model's answer, for columns of `ask`.
+fn parse_patterns(text: &str, ask: &AiAsk) -> Option<std::collections::HashMap<String, String>> {
+    let end = text.rfind('}')?;
+    let obj: serde_json::Map<String, serde_json::Value> =
+        text.match_indices('{').map(|(i, _)| i).filter(|&i| i < end).find_map(|i| serde_json::from_str(text.get(i..=end)?).ok())?;
+    Some(
+        obj.into_iter()
+            .filter_map(|(k, v)| {
+                let name = ask.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&k))?.name.clone();
+                let p = v.as_str()?.trim().to_string();
+                (!p.is_empty()).then_some((name, p))
+            })
+            .collect(),
+    )
+}
+
+/// Ask the model for `ask.rows` rows, in batches.
+pub async fn sample(
+    ws: &Workspace,
+    secrets: Arc<dyn SecretStore>,
+    connection_id: &str,
+    ai: &TestDataAi,
+    ask: &AiAsk,
+    cancel: &CancellationToken,
+) -> Result<AiSample> {
+    let Target { provider, provider_id, model, checks } = target(ws, secrets, connection_id, ai, ask)?;
     let batches = ask.rows.div_ceil(BATCH_ROWS).max(1);
     let calls = (0..batches).map(|b| {
         let n = BATCH_ROWS.min(ask.rows - b * BATCH_ROWS);
@@ -105,22 +217,7 @@ pub async fn sample(
             max_tokens: Some(max_tokens(ask, n)),
         };
         let provider = provider.clone();
-        async move {
-            let run = async {
-                let mut stream = provider.chat_stream(chat).await?;
-                let (mut text, mut usage) = (String::new(), (0u32, 0u32));
-                while let Some(ev) = stream.next().await {
-                    match ev? {
-                        ChatEvent::TextDelta(t) => text.push_str(&t),
-                        // Providers report usage after Done: read to the end.
-                        ChatEvent::Usage { input, output } => usage = (input, output),
-                        _ => {}
-                    }
-                }
-                Ok::<_, AiError>((text, usage))
-            };
-            tokio::time::timeout(TIMEOUT, run).await.map_err(|_| AiError::Network("the model took too long".into()))?
-        }
+        async move { ask_model(&provider, chat).await }
     });
     let columns: Vec<String> = ask.columns.iter().map(|c| c.name.clone()).collect();
     let mut stream = futures::stream::iter(calls).buffer_unordered(PARALLEL);
@@ -129,11 +226,7 @@ pub async fn sample(
     // Tokens of the calls that came back, counted in the provider's usage
     // (also when the rows are thrown away or the user stops).
     let mut used = (0u32, 0u32);
-    let record = |used: (u32, u32)| {
-        if let Err(e) = ws.record_ai_usage(&rec.id, "test_data", used.0, used.1) {
-            tracing::warn!("couldn't record AI usage: {e}");
-        }
-    };
+    let record = |used| record(ws, &provider_id, used);
     loop {
         let next = tokio::select! {
             n = stream.next() => n,
@@ -188,7 +281,14 @@ fn prompt(ask: &AiAsk, checks: &[String], batch: usize, batches: usize, n: usize
         if !c.choices.is_empty() {
             rules.push(format!("one of: {}", c.choices.join(", ")));
         }
-        u.push_str(&format!("- {}: {}; for example {}\n", c.name, rules.join("; "), c.hint));
+        match &c.pattern {
+            Some(p) => rules.push(format!("follows the pattern {p}")),
+            None => rules.push(format!("for example {}", c.hint)),
+        }
+        u.push_str(&format!("- {}: {}\n", c.name, rules.join("; ")));
+    }
+    if ask.columns.iter().any(|c| c.pattern.is_some()) {
+        u.push_str(&format!("Pattern syntax: {}\n", databrain_query_engine::testdata::PATTERN_HELP));
     }
     if !checks.is_empty() {
         u.push_str("\nEvery row must satisfy:\n");
@@ -261,6 +361,7 @@ mod tests {
                     max_chars: Some(40),
                     choices: vec![],
                     hint: "names (up to 40 characters)".into(),
+                    pattern: None,
                 },
                 AiColumn {
                     name: "email".into(),
@@ -270,6 +371,7 @@ mod tests {
                     max_chars: None,
                     choices: vec![],
                     hint: "emails".into(),
+                    pattern: Some("%@gmail.com".into()),
                 },
             ],
             others: vec!["id integer (numbers counting up from the largest)".into(), "country_id integer (existing keys of a parent table)".into()],
@@ -284,13 +386,28 @@ mod tests {
         assert!(system.contains("ONLY a JSON array"));
         assert!(user.contains("Every row must satisfy:\n- CHECK (tier IN"), "{user}");
         assert!(user.contains("- name: varchar(40); at most 40 characters"), "{user}");
-        assert!(user.contains("- email: text; unique: no value twice"), "{user}");
+        assert!(user.contains("- email: text; unique: no value twice; follows the pattern %@gmail.com"), "{user}");
+        assert!(user.contains("Pattern syntax:"), "{user}");
         assert!(user.contains("Never write null"), "{user}");
         assert!(user.contains("country_id integer (existing keys of a parent table)"), "{user}");
         assert!(user.contains("Write 25 rows (batch 2 of 3"), "{user}");
         let (_, one) = prompt(&AiAsk { rows: 10, ..ask() }, &[], 0, 1, 10);
         assert!(one.contains("Write 10 rows."), "{one}");
         assert!(!one.contains("Every row must satisfy"), "{one}");
+    }
+
+    #[test]
+    fn pattern_suggestions_are_asked_for_and_read() {
+        let (system, user) = suggest_prompt(&ask(), &["CHECK (tier IN ('gold','silver'))".into()]);
+        assert!(system.contains("ONLY a JSON object") && system.contains("18..90"), "{system}");
+        assert!(user.contains("- name: varchar(40); at most 40 characters; now gets names"), "{user}");
+        assert!(user.contains("- email: text; current pattern %@gmail.com"), "{user}");
+        assert!(user.contains("CHECK (tier IN"), "{user}");
+        let got = parse_patterns("Sure {x}:\n{\"NAME\": \"% %\", \"email\": \"%@corp.vn\", \"other\": \"1..2\", \"blank\": \"\"}", &ask()).unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got["name"], "% %", "the column's own spelling");
+        assert_eq!(got["email"], "%@corp.vn");
+        assert!(parse_patterns("no", &ask()).is_none());
     }
 
     #[test]

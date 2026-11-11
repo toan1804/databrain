@@ -8,6 +8,7 @@ import type { Dashboard } from "../lib/charts";
 import { parseSnippets } from "../lib/snippets";
 import { parseInlineAiProvider } from "../lib/inlineAi";
 import { parseTestDataAi } from "../lib/testDataAi";
+import { parseStoredPatterns } from "../lib/testDataPatterns";
 import { parseQuickFilters, parseViews } from "../lib/gridViews";
 import { applyTheme, nextSignIn, parseParams, parseSchemaFilter } from "./helpers";
 import type { State, Tab } from "./types";
@@ -80,6 +81,7 @@ export const createAppSlice: StateCreator<State, [], [], AppSlice> = (set, get) 
         inlineAiCompletion: settings.inline_ai_completion === true,
         inlineAiProvider: parseInlineAiProvider(settings.inline_ai_provider),
         testDataAi: parseTestDataAi(settings.test_data_ai),
+        testDataPatterns: parseStoredPatterns(settings.test_data_patterns),
         sqlSnippets: parseSnippets(settings.sql_snippets),
         gridViews: parseViews(settings.grid_views),
         quickFilters: parseQuickFilters(settings.grid_quick_filters),
