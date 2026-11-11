@@ -544,6 +544,36 @@ mod tests {
         }
     }
 
+    /// The examples of the dialog's Pattern guide (ui/src/lib/testDataPatterns.ts)
+    /// work for their column types.
+    #[test]
+    fn the_pattern_guide_examples_parse() {
+        let int = Gen::Int { min: 0, max: 1_000_000 };
+        let money = Gen::Decimal { int_digits: 6, scale: 2 };
+        let txt = text(Some(60), Flavor::FullName);
+        for (g, p) in [
+            (&int, "18..90"),
+            (&int, "1..5"),
+            (&money, "0.5..99.99"),
+            (&Gen::Date, "1950-01-01..2005-12-31"),
+            (&Gen::Date, "2024..2025"),
+            (&Gen::Time, "08:00..18:00"),
+            (&txt, "{gold|silver|bronze}"),
+            (&txt, "%@gmail.com"),
+            (&txt, "INV-#####"),
+            (&txt, "+84 ### ### ###"),
+            (&txt, "??-####"),
+            (&txt, "%d/%m/%Y"),
+            (&txt, "{Mr.|Ms.} %"),
+        ] {
+            let pat = Pattern::parse(g, p).unwrap_or_else(|e| panic!("{p}: {e}"));
+            let v = pat.generate(g, Flavor::FullName, Some(60), &mut Rng(1));
+            if let (Pattern::Template(_), Value::Text(t)) = (&pat, &v) {
+                assert!(pat.accept(g, t).is_some(), "{p} made {t}");
+            }
+        }
+    }
+
     #[test]
     fn civil_dates_round_trip() {
         for (y, m, d) in [(1970, 1, 1), (2000, 2, 29), (2024, 12, 31), (1950, 6, 15)] {

@@ -5,7 +5,7 @@
 // text columns (or every column it may), from the table's structure only.
 
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, Eye, Link2, Loader2, Sparkles, Square, Upload } from "lucide-react";
+import { AlertTriangle, BookOpen, Eye, Link2, Loader2, Sparkles, Square, Upload } from "lucide-react";
 import { api, onLoadProgress, toError } from "../lib/api";
 import type { LoadDryRun, LoadReport, TestDataColumn, TestDataOutput, TestDataPlan, TestDataSpec } from "../lib/types";
 import { formatCount, uid } from "../lib/util";
@@ -16,6 +16,7 @@ import { PATTERN_HELP, patternOf, patternsFor, patternsKey } from "../lib/testDa
 import { useStore } from "../store";
 import type { TestDataRequest } from "../store/uiSlice";
 import { DryRunReport } from "./job/LoadFields";
+import { PatternGuide } from "./PatternGuide";
 import { Modal } from "./ui";
 
 export const MAX_TEST_ROWS = 100_000;
@@ -97,6 +98,9 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   const savePatterns = useStore((s) => s.setTestDataPatterns);
   const [patterns, setPatterns] = useState<Record<string, string>>(() => storedPatterns ?? {});
   const [suggesting, setSuggesting] = useState(false);
+  const [guide, setGuide] = useState(false);
+  // The pattern field last clicked: where the guide's examples go.
+  const [patternField, setPatternField] = useState<string | null>(null);
   // The AI rows field as typed (committed on blur, so it can be cleared).
   const [aiRowsText, setAiRowsText] = useState(String(aiSettings.rows));
   const running = useRef<string | null>(null);
@@ -448,9 +452,10 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
             )}
           </div>
           <div className="flex items-center gap-2 text-[11.5px] text-muted">
-            <span className="mr-auto" title={PATTERN_HELP}>
-              A pattern shapes a column's values (18..90, %@gmail.com, INV-####): hover here for how to write one.
-            </span>
+            <span className="mr-auto">A pattern sets the rule a column's values follow, such as 18..90 for an age or %@gmail.com for an email.</span>
+            <button className="btn-ghost border border-line py-0.5 text-[11.5px]" aria-expanded={guide} onClick={() => setGuide((g) => !g)}>
+              <BookOpen size={12} /> {guide ? "Hide pattern guide" : "Pattern guide"}
+            </button>
             <button
               className="btn-ghost border border-line py-0.5 text-[11.5px]"
               disabled={!!aiBlocked || !!busy || !!aiRun || ticked.size === 0}
@@ -460,6 +465,17 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
               {suggesting ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} className="text-accent" />} Suggest patterns with AI
             </button>
           </div>
+          {guide && (
+            <PatternGuide
+              target={patternField}
+              onPick={(pattern) => {
+                if (!patternField) return;
+                const next = { ...patterns, [patternField]: pattern };
+                setPatterns(next);
+                savePatterns(pKey, next);
+              }}
+            />
+          )}
           <div className="max-h-72 overflow-auto rounded-md border border-line">
             <table className="w-full border-collapse text-[12px]">
               <thead className="sticky top-0 bg-panel text-[11px] text-muted">
@@ -514,6 +530,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
                           disabled={!ticked.has(c.name)}
                           value={patternOf(c, patterns)}
                           onChange={(e) => setPattern(c.name, e.target.value)}
+                          onFocus={() => setPatternField(c.name)}
                           onBlur={keepPatterns}
                         />
                       )}
