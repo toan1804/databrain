@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Security
 
+- More passwords are hidden from query history, job logs and the assistant's transcripts and audit log: a connection URL password that starts with `/`, `?` or `#` (`postgres://u:/pw@h/db`, or digits then one of them, `u:12/ab@h`, which read as a port), a password after an email address as the user name (`postgres://me@x.com:pa/ss@h/db`), a password with a space in it (`postgres://u:pa ss@h/db`), and Postgres escape strings (`ALTER ROLE r PASSWORD E'sec\'ret'`) were kept in clear. When a URL is ambiguous the text is hidden: `https://h:8443/a@b` keeps only `https://h:***@b`.
 - A `SELECT` that calls a function that acts is no longer a read: `select pg_terminate_backend(…)` (PostgreSQL's `KILL`), `pg_cancel_backend`, `pg_reload_conf`, `setval`/`nextval`, `set_config`, `lo_export`, `dblink_exec`, replication-slot functions and Snowflake `system$cancel_query`/`system$abort_session` ran on read-only connections and on production without the confirmation.
 
 ## 0.3.3 - 2026-11-11

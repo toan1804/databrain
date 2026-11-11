@@ -133,7 +133,12 @@ pub fn redact_secrets(sql: &str) -> String {
             }
             value_at = Some(j);
         }
-        if let Some(v) = value_at.filter(|v| *v < n) {
+        if let Some(mut v) = value_at.filter(|v| *v < n) {
+            // E'…' (Postgres, backslash escapes), N'…' (SQL Server): the
+            // literal after the prefix ([`literal_end`] skips `\'` and `''`).
+            if v + 1 < n && matches!(b[v], b'E' | b'e' | b'N' | b'n') && b[v + 1] == b'\'' {
+                v += 1;
+            }
             if matches!(b[v], b'\'' | b'"') {
                 let end = literal_end(v);
                 cut.push((v, end, Some(b[v])));
@@ -203,10 +208,15 @@ fn dollar_literal(sql: &str, i: usize) -> Option<(usize, usize, usize)> {
 /// `text` with the password of every `scheme://user:password@host` in it
 /// replaced by `***` (connection strings pasted into a question, `ATTACH
 /// 'postgres://u:pw@h'`). The user stays; a URL without a password is kept.
-/// The password runs to the last `@` of the URL, so one with `/`, `?` or
-/// `#` in it (`postgres://u:pa/ss@h/db`) is hidden whole; `host:port/…`
-/// (digits after the colon) is not mistaken for a user and password.
+/// The password runs from the first colon of the authority to the last `@`
+/// of the URL, so one with `/`, `?`, `#` or `@` in it (`postgres://u:pa/ss@h/db`,
+/// `u:/pw@h`), or a user name with `@` in it (`me@x.com:pw@h`), is hidden
+/// whole. `host:port` (digits after the colon) is a port only when no `@`
+/// follows it, or the `@` is in a query parameter (`h:5432/db?x=a@b`). A
+/// password with a space in it (`u:pa ss@h`) runs to the next `@` on the line.
+/// When in doubt the text is hidden: `https://h:8443/a@b` loses `8443/a`.
 pub fn redact_url_passwords(text: &str) -> String {
+    let stop = |c: char| matches!(c, '\'' | '"' | '`' | '<' | '>' | '(' | ')');
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(i) = rest.find("://") {
@@ -214,14 +224,28 @@ pub fn redact_url_passwords(text: &str) -> String {
         out.push_str(&rest[..start]);
         rest = &rest[start..];
         // The URL as written in the text: up to a space, a quote or a bracket.
-        let token = rest.find(|c: char| matches!(c, '\'' | '"' | '`' | '<' | '>' | '(' | ')') || c.is_whitespace()).unwrap_or(rest.len());
-        // The authority as a parser reads it: up to the path, query or fragment.
-        let authority = rest[..token].find(['/', '?', '#']).unwrap_or(token);
-        let Some(colon) = rest[..token].find(':') else { continue };
-        // A colon in the authority followed by digits only is a port, not a password.
-        let port = colon < authority && rest[colon + 1..authority].bytes().all(|b| b.is_ascii_digit());
-        let user_ok = !rest[..colon].contains(['/', '?', '#', '@']);
-        let at = if port || !user_ok { rest[..authority].rfind('@').filter(|a| *a > colon) } else { rest[..token].rfind('@').filter(|a| *a > colon) };
+        let token = rest.find(|c: char| stop(c) || c.is_whitespace()).unwrap_or(rest.len());
+        let Some(colon) = userinfo_colon(&rest[..token]) else { continue };
+        let after = &rest[colon + 1..token];
+        // `host:5432`, `host:5432/db`, `host:5432?x`: shaped like a port.
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        let port = digits > 0 && after[digits..].chars().next().is_none_or(|c| matches!(c, '/' | '?' | '#'));
+        let at = match after.find('@') {
+            // `host:5432/db?x=a@b`: the `@` is in a query parameter.
+            Some(first) if port && after[..first].find('?').is_some_and(|q| after[q..first].contains('=')) => None,
+            Some(_) => after.rfind('@').map(|a| colon + 1 + a),
+            // `u:pa ss@h`: a password with a space in it, up to the next `@`
+            // on the line (the last `@` of that word), not into another URL.
+            None if !port => {
+                let line = rest.find(|c: char| stop(c) || matches!(c, '\n' | '\r')).unwrap_or(rest.len());
+                let more = &rest[token..line];
+                more.find('@').filter(|a| !more[..*a].contains("://")).and_then(|a| {
+                    let word = more[a..].find(char::is_whitespace).map_or(more.len(), |w| a + w);
+                    more[..word].rfind('@').map(|a| token + a)
+                })
+            }
+            None => None,
+        };
         if let Some(at) = at {
             out.push_str(&rest[..colon + 1]);
             out.push_str("***");
@@ -230,6 +254,24 @@ pub fn redact_url_passwords(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The colon after the user name (or host) of a URL without its `scheme://`:
+/// the first colon outside `[…]` (an IPv6 host), before any `/`, `?` or `#`
+/// (`https://h/a:b@c` has its colon in the path). The user may contain `@`.
+fn userinfo_colon(url: &str) -> Option<usize> {
+    let mut chars = url.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            ':' => return Some(i),
+            '/' | '?' | '#' => return None,
+            '[' => {
+                chars.by_ref().find(|(_, c)| *c == ']')?;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// What DataBrain keeps of text that may quote SQL or connection strings
@@ -464,6 +506,22 @@ mod redaction_tests {
             assert_eq!(redact_secrets(want), want, "idempotent: {want}");
         }
         assert_eq!(redact_secrets("select $1 from t where password = $1"), "select $1 from t where password = $1", "a parameter, not a tag");
+        // Escape strings (Postgres E'…' with `\'`), N'…', and doubled quotes.
+        for (sql, want) in [
+            ("ALTER USER u PASSWORD E'sec\\'ret'", "ALTER USER u PASSWORD E'***'"),
+            ("CREATE ROLE r LOGIN PASSWORD e'a\\\\b\\'c' VALID UNTIL 'x'", "CREATE ROLE r LOGIN PASSWORD e'***' VALID UNTIL 'x'"),
+            ("create login l with password = N'pw'", "create login l with password = N'***'"),
+            ("ALTER ROLE r PASSWORD 'it''s' VALID UNTIL 'x'", "ALTER ROLE r PASSWORD '***' VALID UNTIL 'x'"),
+            ("alter role r password E'unfinished\\'", "alter role r password E'***'"),
+        ] {
+            assert_eq!(redact_secrets(sql), want, "{sql}");
+            assert_eq!(redact_text(sql), want, "{sql}");
+            assert_eq!(redact_secrets(want), want, "idempotent: {want}");
+        }
+        // Not a password: other E'…' literals and words starting with E.
+        for keep in ["select E'it\\'s' as password", "select password, e from t where e = E'x'", "ALTER ROLE r PASSWORD NULL"] {
+            assert_eq!(redact_secrets(keep), keep);
+        }
     }
 
     /// What query history and job logs keep goes through [`redact_text`]: the
@@ -530,14 +588,60 @@ mod redaction_tests {
             ("postgres://u:pa/ss@h/db", "postgres://u:***@h/db"),
             ("ATTACH 'postgres://u:a/b?c#d@h:5432/db' AS p", "ATTACH 'postgres://u:***@h:5432/db' AS p"),
             ("mysql://root:x/y@localhost", "mysql://root:***@localhost"),
+            // A password starting with `/`, `?` or `#`, or digits then one of
+            // them, is not a port.
+            ("postgres://u:/secret@h/db", "postgres://u:***@h/db"),
+            ("postgres://u:#secret@h/db", "postgres://u:***@h/db"),
+            ("postgres://u:?secret@h/db", "postgres://u:***@h/db"),
+            ("postgres://u:12/ab@h", "postgres://u:***@h"),
+            ("postgres://u:12?ab@h/db", "postgres://u:***@h/db"),
+            ("postgres://u:12#ab@h:5432/db", "postgres://u:***@h:5432/db"),
+            ("postgres://u:12@h/db", "postgres://u:***@h/db"),
+            // An email address as the user name.
+            ("postgres://me@x.com:pa/ss@h/db", "postgres://me@x.com:***@h/db"),
+            ("postgres://me@x.com:pw@h:5432/db", "postgres://me@x.com:***@h:5432/db"),
+            // A space in the password.
+            ("postgres://u:pa ss@h/db", "postgres://u:***@h/db"),
+            ("ATTACH 'postgres://u:a b c@h/db' AS p", "ATTACH 'postgres://u:***@h/db' AS p"),
+            ("postgres://u:pa ss@x@h/db then", "postgres://u:***@h/db then"),
+            // IPv6 hosts and non-ASCII passwords.
+            ("postgres://u:pw@[::1]:5432/db", "postgres://u:***@[::1]:5432/db"),
+            ("postgres://ü:pässwörd@h/db", "postgres://ü:***@h/db"),
+            ("postgres://u:mật khẩu@h/db", "postgres://u:***@h/db"),
+            ("postgres://u:密码/é@h", "postgres://u:***@h"),
+            // Ambiguous: a port then a path with `@` is hidden (it reads the
+            // same as `u:12/ab@h`).
+            ("https://example.com:8443/a@b", "https://example.com:***@b"),
         ] {
             assert_eq!(redact_url_passwords(text), want, "{text}");
+            assert_eq!(redact_url_passwords(want), want, "idempotent: {want}");
         }
-        for keep in
-            ["https://example.com:8443/a@b", "s3://bucket/key", "neo4j://user@host", "no url here: a:b@c", "x://", "https://h/a:b@c", "http://h:80/?q=a@b"]
-        {
+        for keep in [
+            "postgres://u:***@h:5432/db",
+            "postgres://u@h:5432/db",
+            "postgres://h:5432/db",
+            "postgres://h:5432/db?x=a@b",
+            "postgres://u@h:5432/db?x=a@b",
+            "postgres://[::1]:5432/db",
+            "postgres://u@[::1]:5432/db?x=a@b",
+            "postgres://[::1]/db",
+            "s3://bucket/key",
+            "neo4j://user@host",
+            "no url here: a:b@c",
+            "x://",
+            "x://u:",
+            "https://h/a:b@c",
+            "http://h:80/?q=a@b",
+            "see postgres://h:5432 or mail me@x.com",
+            "two: a://x@h:1 and b://y@k:2/d",
+            "x://h:é",
+            "x://[::1",
+        ] {
             assert_eq!(redact_url_passwords(keep), keep);
         }
+        assert_eq!(redact_url_passwords("postgres://u:secret@h:5432/db"), "postgres://u:***@h:5432/db");
+        // A space-separated password does not reach into the next URL.
+        assert_eq!(redact_url_passwords("a://u:x b://h/@c"), "a://u:x b://h/@c");
         // What history, job logs and the audit log keep.
         assert_eq!(
             redact_text("ATTACH 'postgres://u:pa/ss@h/db' AS p; ALTER ROLE r PASSWORD $$s$$"),
