@@ -11,8 +11,8 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
-databrain-auth = { version = "0.3.3", path = "../../auth" }
-databrain-connector-core = { version = "0.3.3", path = "../../connector-core" }
+databrain-auth = { version = "0.3.4", path = "../../auth" }
+databrain-connector-core = { version = "0.3.4", path = "../../connector-core" }
 futures = "0.3.34"
 rusqlite = { version = "0.41.1", features = ["bundled", "column_decltype"] }
 tokio = { version = "1.53.1", features = ["rt", "sync", "macros", "time"] }

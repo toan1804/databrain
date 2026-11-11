@@ -4,6 +4,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.3.4 - 2026-11-12
+
 ### Changed
 
 - Smaller download (about half): the app, the MCP server and the jobs runner are one program (`databrain`, also `databrain mcp` and `databrain jobs …`) instead of three that each carried a full copy of DataBrain. `databrain-mcp` and `databrain-jobs` stay, as small launchers of it, so MCP client settings, scheduled background jobs and scripts keep working unchanged (also through a link to them, e.g. in `/usr/local/bin`).
