@@ -10,7 +10,7 @@
 
 ## Releasing the app
 
-Push a tag `vX.Y.Z` (matching `version` in `crates/app/tauri.conf.json`): the Release workflow (`.github/workflows/release.yml`) builds the installers for macOS (Apple Silicon, with and without DuckDB, and Intel), Windows and Linux and attaches them to a draft release. Publish the draft; running apps then see it in their update check (and, with an updater key, `latest.json` for in-app updates). The CI workflow builds and tests every push and pull request on macOS, Linux and Windows.
+Push a tag `vX.Y.Z` (matching `version` in `crates/app/tauri.conf.json`): the Release workflow (`.github/workflows/release.yml`) builds the installers for macOS (Apple Silicon, with and without DuckDB, and Intel), Windows and Linux and attaches them to a draft release, whose description is the version's section of `CHANGELOG.md` (`scripts/release-notes.mjs`; the same text goes into `latest.json`). Add the `## X.Y.Z - date` heading over the Unreleased entries in the release commit, or the release has no description. Publish the draft; running apps then see it in their update check (and, with an updater key, `latest.json` for in-app updates). The CI workflow builds and tests every push and pull request on macOS, Linux and Windows.
 
 ## Checksums and provenance
 
@@ -18,7 +18,7 @@ Each installer and updater bundle gets a [build provenance attestation](https://
 
 ```sh
 shasum -a 256 -c SHA256SUMS --ignore-missing          # the file matches the release
-gh attestation verify DataBrain_0.3.3_aarch64.dmg --repo toan1804/databrain   # built by this repository's workflow
+gh attestation verify DataBrain_0.3.4_aarch64.dmg --repo toan1804/databrain   # built by this repository's workflow
 ```
 
 `SHA256SUMS` is written after the builds and `latest.json`; a file attached to the draft by hand afterwards is not in it (run the workflow again, or the checksums job, before publishing).

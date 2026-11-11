@@ -222,9 +222,32 @@ jobs:
         run: |
           mkdir -p sigs
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sig' --dir sigs
-          node scripts/updater-manifest.mjs sigs "$TAG" "$GITHUB_REPOSITORY" > latest.json
+          node scripts/release-notes.mjs "$TAG" > notes.md || : > notes.md
+          node scripts/updater-manifest.mjs sigs "$TAG" "$GITHUB_REPOSITORY" notes.md > latest.json
           cat latest.json
           gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber
+
+  # The release's description: the version's section of CHANGELOG.md
+  # (what the app's "What's new" opens). The draft stays a draft.
+  release-notes:
+    name: Release notes
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+      - name: Set the release description from CHANGELOG.md
+        run: |
+          if node scripts/release-notes.mjs "$TAG" > notes.md; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+          else
+            echo "::warning::CHANGELOG.md has no section for $TAG: the release has no description"
+          fi
 
   # SHA256SUMS of every file on the release (installers, updater bundles,
   # latest.json), attested like the installers.
