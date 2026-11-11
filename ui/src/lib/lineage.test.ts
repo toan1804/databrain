@@ -29,6 +29,8 @@ const g: LineageGraph = {
 };
 
 describe("lineage layout", () => {
+  // What the lineage tab asks for: tables list the columns the SQL uses.
+  const lin = { expanded: "all" as const, usedOnly: true };
   it("places sources left of what they feed, no overlaps", () => {
     const l = layout(g);
     const x = (id: string) => l.byId.get(id)!.x;
@@ -42,11 +44,11 @@ describe("lineage layout", () => {
   });
 
   it("a table lists only the columns the SQL uses; the others on request", () => {
-    const n = layout(g).byId.get("n0")!;
+    const n = layout(g, "lr", lin).byId.get("n0")!;
     expect(n.columns.map((c) => c.name)).toEqual(["customer_id", "amount", "status"]);
     expect(n.hidden).toBe(1);
     expect(moreLabel(n)).toBe("+1 unused column");
-    const svg = toSvg(g, layout(g), { inner: true });
+    const svg = toSvg(g, layout(g, "lr", lin), { inner: true });
     expect(svg).toContain('data-more="1"');
     expect(svg).toContain("+1 unused column · click to list");
     // Narrow or wide alike: 2 of 40 used.
@@ -55,17 +57,17 @@ describe("lineage layout", () => {
       nodes: [{ ...g.nodes[0], columns: Array.from({ length: 40 }, (_, i) => ({ name: i === 7 ? "amount" : `c${i}`, used: i === 7 || i === 3 })) }, g.nodes[3]],
       edges: [{ from: "n0", from_column: "amount", to: "n3", to_column: "total", kind: "aggregate" }],
     };
-    expect(layout(wide).byId.get("n0")!.columns.map((c) => c.name)).toEqual(["c3", "amount"]);
-    expect(layout(wide).byId.get("n0")!.hidden).toBe(38);
+    expect(layout(wide, "lr", lin).byId.get("n0")!.columns.map((c) => c.name)).toEqual(["c3", "amount"]);
+    expect(layout(wide, "lr", lin).byId.get("n0")!.hidden).toBe(38);
     // "Show all" for one table: every column, and a row to hide them again.
-    const all = layout(g, "lr", { expanded: "all", full: new Set(["n0"]) }).byId.get("n0")!;
+    const all = layout(g, "lr", { ...lin, full: new Set(["n0"]) }).byId.get("n0")!;
     expect(all.columns.map((c) => c.name)).toEqual(["id", "customer_id", "amount", "status"]);
     expect(all.full).toBe(true);
     expect(moreLabel(all, true)).toBe("hide unused columns");
     expect(moreLabel(all)).toBe("");
     // CTEs, subqueries and results list all their columns; so does a table whose columns are all used.
-    expect(layout(g).byId.get("n1")!.columns).toHaveLength(4);
-    expect(layout(g, "lr", { expanded: "all", full: new Set(["n2"]) }).byId.get("n2")!.full).toBe(false);
+    expect(layout(g, "lr", lin).byId.get("n1")!.columns).toHaveLength(4);
+    expect(layout(g, "lr", { ...lin, full: new Set(["n2"]) }).byId.get("n2")!.full).toBe(false);
     // A traced column is listed even when unused (with the filter on its path).
     const t = trace(g, "n1", "id");
     expect(layout(g, "lr", { expanded: new Set(), show: t.cols }).byId.get("n0")!.columns.map((c) => c.name)).toEqual(["id", "status"]);
@@ -80,7 +82,7 @@ describe("lineage layout", () => {
         { from: "n2", from_column: "name", to: "n3", to_column: "total", kind: "direct" },
       ],
     };
-    const n = layout(star).byId.get("n2")!;
+    const n = layout(star, "lr", lin).byId.get("n2")!;
     expect(n.columns.map((c) => c.name)).toEqual(["id", "name"]);
     expect(n.hidden).toBe(0);
     expect(moreLabel(n)).toBe("");

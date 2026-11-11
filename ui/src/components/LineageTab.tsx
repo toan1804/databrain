@@ -177,7 +177,7 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
   const traced = useMemo(() => (shown && focus ? trace(shown, focus.node, focus.column) : null), [shown, focus]);
   // Collapsed tables still list the traced column's path.
   // The chain is table level: its boxes don't list columns.
-  const base = useMemo(() => (shown ? layout(shown, dir, { expanded: isChain ? new Set<string>() : expanded, show: traced?.cols, full }) : null), [shown, dir, expanded, traced, isChain, full]);
+  const base = useMemo(() => (shown ? layout(shown, dir, { expanded: isChain ? new Set<string>() : expanded, show: traced?.cols, usedOnly: true, full }) : null), [shown, dir, expanded, traced, isChain, full]);
   const lay = useMemo(() => (base ? withPositions(base, pos) : null), [base, pos]);
   const appearance = useStore((s) => s.appearance);
   const colors = useMemo(themeColors, [theme, appearance]);

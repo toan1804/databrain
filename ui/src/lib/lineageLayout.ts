@@ -37,15 +37,18 @@ export interface LaidNode {
 
 /**
  * What the diagram lists. `expanded`: nodes whose columns are shown ("all"
- * = every node); a database table or view lists only the columns the SQL
- * uses (`used`), unless it is in `full`. `show`: column keys always listed,
- * also in collapsed nodes (the traced column's path). Without it every node
- * is expanded.
+ * = every node). With `usedOnly` (query lineage), a database table or view
+ * lists only the columns the SQL uses (`used`), unless it is in `full`;
+ * without it (ER diagram) every column is listed. `show`: column keys always
+ * listed, also in collapsed nodes (the traced column's path). Without it
+ * every node is expanded.
  */
 export interface Display {
   expanded: Set<string> | "all";
   show?: Set<string> | null;
-  /** Tables listing every column, used or not. */
+  /** Tables list only the columns the SQL uses (`used`); the rest behind "+N unused columns". */
+  usedOnly?: boolean;
+  /** With `usedOnly`: tables listing every column, used or not. */
   full?: Set<string>;
 }
 
@@ -118,8 +121,8 @@ export function layout(g: LineageGraph, direction: Direction = "lr", display: Di
   const laid: LaidNode[] = nodes.map((node) => {
     const open = display.expanded === "all" || display.expanded.has(node.id);
     const shown = (c: string) => !!display.show?.has(colKey(node.id, c));
-    // A table lists the columns the SQL uses; the others on request.
-    const table = node.kind === "table";
+    // In query lineage a table lists the columns the SQL uses; the others on request.
+    const table = !!display.usedOnly && node.kind === "table";
     const unused = table ? node.columns.length - usedColumns(node).length : 0;
     const full = open && unused > 0 && !!display.full?.has(node.id);
     const all = node.columns.map((c, index) => ({ name: c.name, index, used: !table || !!c.used }));
