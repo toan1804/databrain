@@ -68,7 +68,9 @@
       "colon_params": true,
       "delimiter_directive": false,
       "dollar": "none",
+      "escape_strings": false,
       "hash_comment": true,
+      "q_quotes": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": true
@@ -145,7 +147,9 @@
       "colon_params": true,
       "delimiter_directive": false,
       "dollar": "none",
+      "escape_strings": false,
       "hash_comment": true,
+      "q_quotes": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -222,7 +226,9 @@
       "colon_params": true,
       "delimiter_directive": false,
       "dollar": "none",
+      "escape_strings": false,
       "hash_comment": false,
+      "q_quotes": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -304,7 +310,9 @@
       "colon_params": true,
       "delimiter_directive": false,
       "dollar": "tagged",
+      "escape_strings": true,
       "hash_comment": false,
+      "q_quotes": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -346,7 +354,9 @@
       "colon_params": false,
       "delimiter_directive": false,
       "dollar": "none",
+      "escape_strings": false,
       "hash_comment": false,
+      "q_quotes": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -434,7 +444,9 @@
       "colon_params": true,
       "delimiter_directive": false,
       "dollar": "none",
+      "escape_strings": false,
       "hash_comment": false,
+      "q_quotes": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -521,7 +533,9 @@
       "colon_params": true,
       "delimiter_directive": true,
       "dollar": "none",
+      "escape_strings": false,
       "hash_comment": true,
+      "q_quotes": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -563,7 +577,9 @@
       "colon_params": false,
       "delimiter_directive": false,
       "dollar": "none",
+      "escape_strings": false,
       "hash_comment": false,
+      "q_quotes": false,
       "slash_comment": true,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -649,7 +665,9 @@
       "colon_params": true,
       "delimiter_directive": false,
       "dollar": "none",
+      "escape_strings": false,
       "hash_comment": false,
+      "q_quotes": true,
       "slash_comment": false,
       "trigger_row_binds": true,
       "triple_quotes": false
@@ -734,7 +752,9 @@
       "colon_params": true,
       "delimiter_directive": false,
       "dollar": "tagged",
+      "escape_strings": true,
       "hash_comment": false,
+      "q_quotes": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -803,15 +823,20 @@
       "backslash_escapes": true,
       "backslash_in_double_quotes": false,
       "backtick": false,
-      "block_end": "none",
+      "block_end": "end_word",
       "block_objects": [],
       "block_on_alter": false,
-      "block_starts": [],
+      "block_starts": [
+        "DECLARE",
+        "BEGIN"
+      ],
       "brackets": false,
       "colon_params": true,
       "delimiter_directive": false,
       "dollar": "plain",
+      "escape_strings": false,
       "hash_comment": false,
+      "q_quotes": false,
       "slash_comment": true,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -895,7 +920,9 @@
       "colon_params": true,
       "delimiter_directive": false,
       "dollar": "none",
+      "escape_strings": false,
       "hash_comment": false,
+      "q_quotes": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false

@@ -66,7 +66,6 @@ Paths are in `crates/connector-core/src/` unless given in full. From one reading
 
 ### Low
 
-- The splitter cuts valid SQL (safe, but the statement breaks): Postgres `E'it\'s; x'`, Oracle `q'[it's; x]'`, Snowflake `BEGIN … END;` blocks.
 - Structure: five hand-written lexers (splitter and params, two in redact, `referenced_results`, `changes_default`) beside the parser's; `QueryLanguage::Cql` has no connector; `lib.rs` mixes the traits with quoting and catalog helpers.
 
 ### Ways to fix them (ideas, in the order suggested)

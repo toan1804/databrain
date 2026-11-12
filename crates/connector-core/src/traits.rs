@@ -137,6 +137,13 @@ pub struct SqlSyntax {
     pub dollar: DollarQuotes,
     /// `'''…'''` / `"""…"""`.
     pub triple_quotes: bool,
+    /// `E'…'` strings, where `\'` escapes (Postgres, DuckDB). Only where the
+    /// server reads them so: elsewhere `E'a\'` is a name and a string that
+    /// ends at `\'`.
+    pub escape_strings: bool,
+    /// `q'[…]'` strings with their own delimiter (Oracle; `[]`, `{}`, `()`,
+    /// `<>` pair up, any other character closes itself).
+    pub q_quotes: bool,
     /// `DELIMITER //` lines change the delimiter (MySQL).
     pub delimiter_directive: bool,
     pub block_end: BlockEnd,
@@ -363,6 +370,8 @@ pub const STANDARD_SYNTAX: SqlSyntax = SqlSyntax {
     brackets: false,
     dollar: DollarQuotes::None,
     triple_quotes: false,
+    escape_strings: false,
+    q_quotes: false,
     delimiter_directive: false,
     block_end: BlockEnd::None,
     block_starts: &[],
@@ -469,7 +478,13 @@ pub const POSTGRES: SourceTraits = SourceTraits {
     explain: Some("EXPLAIN "),
     formatter: "postgresql",
     // SQL-standard bodies: CREATE FUNCTION … BEGIN ATOMIC …; END;
-    syntax: SqlSyntax { dollar: DollarQuotes::Tagged, block_end: BlockEnd::EndWord, block_objects: &["FUNCTION", "PROCEDURE"], ..STANDARD_SYNTAX },
+    syntax: SqlSyntax {
+        dollar: DollarQuotes::Tagged,
+        escape_strings: true,
+        block_end: BlockEnd::EndWord,
+        block_objects: &["FUNCTION", "PROCEDURE"],
+        ..STANDARD_SYNTAX
+    },
     load: Some(LoadTraits {
         types: TypeNames { float: "DOUBLE PRECISION", timestamp_tz: "TIMESTAMPTZ", binary: "BYTEA", ..STANDARD_TYPES },
         binary_literal: "'\\x{}'::bytea",
@@ -565,6 +580,7 @@ pub const ORACLE: SourceTraits = SourceTraits {
         block_end: BlockEnd::SlashLine,
         block_starts: &["DECLARE", "BEGIN"],
         block_objects: &["PROCEDURE", "FUNCTION", "PACKAGE", "TRIGGER", "TYPE"],
+        q_quotes: true,
         trigger_row_binds: true,
         ampersand_vars: true,
         ..STANDARD_SYNTAX
@@ -608,7 +624,16 @@ pub const SNOWFLAKE: SourceTraits = SourceTraits {
     explain: Some("EXPLAIN "),
     cloud: true,
     formatter: "snowflake",
-    syntax: SqlSyntax { backslash_escapes: true, slash_comment: true, dollar: DollarQuotes::Plain, ..STANDARD_SYNTAX },
+    // Snowflake Scripting blocks written without `$$`: BEGIN … END; and
+    // DECLARE … BEGIN … END; (BEGIN; and BEGIN TRANSACTION stay statements).
+    syntax: SqlSyntax {
+        backslash_escapes: true,
+        slash_comment: true,
+        dollar: DollarQuotes::Plain,
+        block_end: BlockEnd::EndWord,
+        block_starts: &["DECLARE", "BEGIN"],
+        ..STANDARD_SYNTAX
+    },
     load: Some(LoadTraits {
         types: TypeNames { decimal: "DECIMAL(38, 10)", timestamp_tz: "TIMESTAMP_TZ", binary: "BINARY", text: "VARCHAR", ..STANDARD_TYPES },
         default_bytes: 1_000_000,
@@ -707,7 +732,7 @@ pub const DUCKDB: SourceTraits = SourceTraits {
     explain: Some("EXPLAIN "),
     local: true,
     formatter: "duckdb",
-    syntax: SqlSyntax { dollar: DollarQuotes::Tagged, ..STANDARD_SYNTAX },
+    syntax: SqlSyntax { dollar: DollarQuotes::Tagged, escape_strings: true, ..STANDARD_SYNTAX },
     load: Some(LoadTraits { types: TypeNames { timestamp_tz: "TIMESTAMPTZ", ..STANDARD_TYPES }, ..STANDARD_LOAD }),
     ..STANDARD
 };

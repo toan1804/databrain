@@ -24,6 +24,8 @@ pub(super) struct Lex {
     /// Postgres `$tag$`; Snowflake `$$`.
     pub(super) dollar: bool,
     pub(super) triple_quotes: bool,
+    pub(super) escape_strings: bool,
+    pub(super) q_quotes: bool,
 }
 
 pub(super) fn lex(kind: ConnectorKind) -> Lex {
@@ -39,6 +41,8 @@ fn lex_of(x: &SqlSyntax) -> Lex {
         brackets: x.brackets,
         dollar: x.dollar != DollarQuotes::None,
         triple_quotes: x.triple_quotes,
+        escape_strings: x.escape_strings,
+        q_quotes: x.q_quotes,
     }
 }
 
@@ -144,6 +148,9 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
     let mut i = 0usize;
     // Open BEGIN/CASE … END blocks in the current statement (EndWord dialects).
     let mut depth = 0i32;
+    // A BEGIN opened in it: a statement led by DECLARE (Snowflake) keeps its
+    // `;`s until its block has opened and closed.
+    let mut opened = false;
     // A blank line ends a statement written without `;` when the next line
     // starts another one. Not in T-SQL batches with variables: each
     // statement runs on its own, so a DECLARE must stay with its uses.
@@ -184,6 +191,7 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
                 seg_start = i;
                 has_code = false;
                 depth = 0;
+                opened = false;
                 continue;
             }
             if line.is_empty() && has_code && blank_lines_split && delimiter == b";" && depth == 0 {
@@ -208,7 +216,7 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
                 && match block_kind(syntax, seg) {
                     Block::None => false,
                     Block::SlashLine | Block::GoLine => true,
-                    Block::EndWord => depth > 0,
+                    Block::EndWord => depth > 0 || (!opened && syntax.block_starts.contains(&"DECLARE") && leading_keyword(seg) == "DECLARE"),
                 };
             if keep {
                 i += 1;
@@ -219,6 +227,7 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
             seg_start = i;
             has_code = false;
             depth = 0;
+            opened = false;
             continue;
         }
 
@@ -285,12 +294,30 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
                 while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
                     j += 1;
                 }
+                let w = &text[i..j];
+                // Postgres/DuckDB E'…': backslashes escape inside.
+                if lx.escape_strings && w.eq_ignore_ascii_case("e") && b.get(j) == Some(&b'\'') {
+                    i = skip_quoted(b, j, b'\'', true);
+                    continue;
+                }
+                // Oracle q'[…]' / nq'{…}': up to the closing delimiter and quote.
+                if lx.q_quotes && (w.eq_ignore_ascii_case("q") || w.eq_ignore_ascii_case("nq")) && b.get(j) == Some(&b'\'') && j + 1 < n {
+                    let close = match b[j + 1] {
+                        b'[' => b']',
+                        b'{' => b'}',
+                        b'(' => b')',
+                        b'<' => b'>',
+                        c => c,
+                    };
+                    i = (j + 2..n.saturating_sub(1)).find(|&k| b[k] == close && b[k + 1] == b'\'').map_or(n, |k| k + 2);
+                    continue;
+                }
                 if syntax.block_end == BlockEnd::EndWord {
-                    let w = &text[i..j];
                     if w.eq_ignore_ascii_case("BEGIN") {
                         let next = next_word(text, j);
                         let opens = !BEGIN_NOT_BLOCK.contains(&next.as_str()) && !text[j..].trim_start().starts_with(';');
                         depth += opens as i32;
+                        opened |= opens;
                     } else if w.eq_ignore_ascii_case("CASE") {
                         depth += 1;
                     } else if w.eq_ignore_ascii_case("END") && !END_OF_UNCOUNTED.contains(&next_word(text, j).as_str()) {
@@ -406,6 +433,36 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert!(v[0].ends_with("plpgsql"));
         assert_eq!(v[1], "select $1");
+    }
+
+    #[test]
+    fn dialect_strings_and_blocks_stay_whole() {
+        let n = |sql: &str, k: ConnectorKind| split_statements(sql, k).into_iter().map(|s| s.sql).collect::<Vec<_>>();
+        // Postgres and DuckDB E'…' strings: \' doesn't end them.
+        for k in [ConnectorKind::Postgres, ConnectorKind::Duckdb] {
+            assert_eq!(n("select E'it\\'s; x'; select 2", k), vec!["select E'it\\'s; x'", "select 2"], "{k:?}");
+            assert_eq!(n("select e'a\\\\'; select 2", k).len(), 2, "{k:?}: an escaped backslash, then the end");
+        }
+        // Where E'…' isn't an escape string, \' ends the string: split as the server would.
+        assert_eq!(n("select E'a\\'; drop table t; --'", ConnectorKind::Mssql).len(), 2);
+        assert_eq!(n("select E'a\\'; drop table t; --'", ConnectorKind::Sqlite).len(), 2);
+        // A column named e followed by a string is not affected elsewhere.
+        assert_eq!(n("select e 'x'; select 2", ConnectorKind::Postgres).len(), 2);
+        // Oracle q-quotes.
+        assert_eq!(n("select q'[it's; x]' from dual;\nselect 2 from dual", ConnectorKind::Oracle), vec!["select q'[it's; x]' from dual", "select 2 from dual"]);
+        assert_eq!(n("select Q'{a;'b}' from dual; select 1 from dual", ConnectorKind::Oracle).len(), 2);
+        assert_eq!(n("select nq'!x;y!' from dual; select 1 from dual", ConnectorKind::Oracle).len(), 2);
+        assert_eq!(n("select q'<unterminated; x", ConnectorKind::Oracle).len(), 1);
+        // Snowflake Scripting blocks without $$.
+        let sf = ConnectorKind::Snowflake;
+        assert_eq!(n("BEGIN\n  LET x := 1;\n  RETURN x;\nEND;\nselect 2", sf), vec!["BEGIN\n  LET x := 1;\n  RETURN x;\nEND", "select 2"]);
+        assert_eq!(
+            n("DECLARE\n  c INT DEFAULT 0;\nBEGIN\n  c := 1;\n  RETURN c;\nEND;\nselect 3", sf),
+            vec!["DECLARE\n  c INT DEFAULT 0;\nBEGIN\n  c := 1;\n  RETURN c;\nEND", "select 3"]
+        );
+        assert_eq!(n("begin;\ninsert into t values (1);\ncommit;", sf).len(), 3, "a transaction, not a block");
+        assert_eq!(n("begin transaction;\ninsert into t values (1);\ncommit;", sf).len(), 3);
+        assert_eq!(n("select 1; select case when a then 1 end from t; select 3", sf).len(), 3);
     }
 
     #[test]
