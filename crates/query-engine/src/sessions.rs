@@ -280,7 +280,13 @@ impl QueryEngine {
         let Some(session) = self.sessions.lock().get(&(connection_id.to_string(), session_key.to_string())).map(|l| l.session.clone()) else {
             return Ok(false);
         };
-        let sql = if commit { "COMMIT" } else { "ROLLBACK" };
+        let tx = session.kind().traits().transactions;
+        let sql = match (tx, commit) {
+            (Some(t), true) => t.commit,
+            (Some(t), false) => t.rollback,
+            (None, true) => "COMMIT",
+            (None, false) => "ROLLBACK",
+        };
         // SQL Server nests BEGIN TRAN: each COMMIT ends one level.
         for _ in 0..32 {
             session.execute(sql, ExecOptions::default()).await?.collect().await?;

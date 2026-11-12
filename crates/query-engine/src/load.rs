@@ -326,11 +326,15 @@ fn user_statements(sql: Option<&str>, dialect: ConnectorKind) -> Vec<String> {
 
 /// Transaction statements when the whole plan can run in one.
 fn transaction(dialect: ConnectorKind, plan: &[Act]) -> Option<Tx> {
-    let t = dialect.traits().load.as_ref()?.transactions?;
-    if t.ddl_commits {
-        // DDL commits implicitly (MySQL; temporary tables don't).
+    use databrain_connector_core::traits::DdlCommits;
+    let t = dialect.traits().transactions?;
+    if t.ddl_commits != DdlCommits::No {
+        // DDL commits implicitly (MySQL: not temporary tables; Snowflake:
+        // those too, so a staging table ends the transaction).
+        let any = t.ddl_commits == DdlCommits::AnyDdl;
         let ddl = plan.iter().any(|a| match a {
             Act::Sql { kind: ActKind::Ddl, .. } => true,
+            Act::Sql { kind: ActKind::Stage, .. } => any,
             Act::Sql { kind: ActKind::User, sql, .. } => classify(sql, dialect).kind == StatementKind::Ddl,
             _ => false,
         });
@@ -985,7 +989,7 @@ impl QueryEngine {
         notices.extend(lowered);
         let tx = transaction(dialect, &plan);
         if tx.is_none() {
-            notices.push(match dialect.traits().load.and_then(|l| l.transactions) {
+            notices.push(match dialect.traits().transactions {
                 Some(_) => format!(
                     "{} commits DDL at once, so this step doesn't run in a transaction: if it fails partway, what ran before stays.",
                     engine_name(dialect)
@@ -1264,11 +1268,13 @@ mod tests {
         let stage = Act::Sql { label: String::new(), sql: "CREATE TEMPORARY TABLE s AS SELECT * FROM t WHERE 1 = 0".into(), kind: ActKind::Stage };
         assert!(transaction(ConnectorKind::Postgres, &[ddl.clone(), ins.clone()]).is_some());
         assert!(transaction(ConnectorKind::Mssql, std::slice::from_ref(&ddl)).is_some());
-        assert!(transaction(ConnectorKind::Mysql, &[stage, ins.clone()]).is_some(), "temporary tables don't commit");
+        assert!(transaction(ConnectorKind::Mysql, &[stage.clone(), ins.clone()]).is_some(), "temporary tables don't commit");
         assert!(transaction(ConnectorKind::Mysql, &[ddl, ins.clone()]).is_none());
         assert!(transaction(ConnectorKind::Mysql, &[user_ddl]).is_none());
         assert!(transaction(ConnectorKind::Oracle, std::slice::from_ref(&ins)).is_none());
-        assert!(transaction(ConnectorKind::Snowflake, &[ins]).is_none());
+        // Snowflake: an append runs in one; any DDL, a staging table too, commits.
+        assert!(transaction(ConnectorKind::Snowflake, std::slice::from_ref(&ins)).is_some());
+        assert!(transaction(ConnectorKind::Snowflake, &[stage, ins]).is_none());
     }
 
     #[test]

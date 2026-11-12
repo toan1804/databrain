@@ -30,7 +30,6 @@
       "rows_note": "DataBrain's limit per statement",
       "stage": "regular_limit0",
       "text_literal": "backslash_escaped",
-      "transactions": null,
       "typed_datetime_literals": false,
       "types": {
         "binary": "BYTES",
@@ -76,6 +75,7 @@
       "triple_quotes": true
     },
     "table_folder": "Tables",
+    "transactions": null,
     "upper_folding": false,
     "view_folder": "Views",
     "whole_path_quotes": true
@@ -111,7 +111,6 @@
       "rows_note": "ClickHouse parses VALUES as a stream; DataBrain's limit",
       "stage": "regular",
       "text_literal": "backslash_escaped",
-      "transactions": null,
       "typed_datetime_literals": false,
       "types": {
         "binary": "String",
@@ -155,6 +154,7 @@
       "triple_quotes": false
     },
     "table_folder": "Tables",
+    "transactions": null,
     "upper_folding": false,
     "view_folder": "Views",
     "whole_path_quotes": false
@@ -190,7 +190,6 @@
       "rows_note": "DataBrain's limit per statement",
       "stage": "regular",
       "text_literal": "backslash_escaped",
-      "transactions": null,
       "typed_datetime_literals": false,
       "types": {
         "binary": "BINARY",
@@ -234,6 +233,7 @@
       "triple_quotes": false
     },
     "table_folder": "Tables",
+    "transactions": null,
     "upper_folding": false,
     "view_folder": "Views",
     "whole_path_quotes": false
@@ -269,12 +269,6 @@
       "rows_note": "DataBrain's limit per statement",
       "stage": "temp",
       "text_literal": "plain",
-      "transactions": {
-        "begin": "BEGIN",
-        "commit": "COMMIT",
-        "ddl_commits": false,
-        "rollback": "ROLLBACK"
-      },
       "typed_datetime_literals": false,
       "types": {
         "binary": "BLOB",
@@ -318,6 +312,13 @@
       "triple_quotes": false
     },
     "table_folder": "Tables",
+    "transactions": {
+      "begin": "BEGIN",
+      "commit": "COMMIT",
+      "ddl_commits": "No",
+      "rollback": "ROLLBACK",
+      "savepoint": null
+    },
     "upper_folding": false,
     "view_folder": "Views",
     "whole_path_quotes": false
@@ -362,6 +363,7 @@
       "triple_quotes": false
     },
     "table_folder": "Collections",
+    "transactions": null,
     "upper_folding": false,
     "view_folder": "Views",
     "whole_path_quotes": false
@@ -397,12 +399,6 @@
       "rows_note": "SQL Server allows at most 1,000 rows in one VALUES list",
       "stage": "hash_select_into",
       "text_literal": "n_prefix",
-      "transactions": {
-        "begin": "BEGIN TRANSACTION",
-        "commit": "COMMIT TRANSACTION",
-        "ddl_commits": false,
-        "rollback": "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION"
-      },
       "typed_datetime_literals": false,
       "types": {
         "binary": "VARBINARY(MAX)",
@@ -452,6 +448,16 @@
       "triple_quotes": false
     },
     "table_folder": "Tables",
+    "transactions": {
+      "begin": "BEGIN TRANSACTION",
+      "commit": "COMMIT TRANSACTION",
+      "ddl_commits": "No",
+      "rollback": "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+      "savepoint": [
+        "SAVE TRANSACTION {}",
+        "ROLLBACK TRANSACTION {}"
+      ]
+    },
     "upper_folding": false,
     "view_folder": "Views",
     "whole_path_quotes": false
@@ -487,12 +493,6 @@
       "rows_note": "DataBrain's limit per statement",
       "stage": "temporary_drop_temporary",
       "text_literal": "backslash_escaped",
-      "transactions": {
-        "begin": "START TRANSACTION",
-        "commit": "COMMIT",
-        "ddl_commits": true,
-        "rollback": "ROLLBACK"
-      },
       "typed_datetime_literals": false,
       "types": {
         "binary": "BLOB",
@@ -541,6 +541,16 @@
       "triple_quotes": false
     },
     "table_folder": "Tables",
+    "transactions": {
+      "begin": "START TRANSACTION",
+      "commit": "COMMIT",
+      "ddl_commits": "Ddl",
+      "rollback": "ROLLBACK",
+      "savepoint": [
+        "SAVEPOINT {}",
+        "ROLLBACK TO SAVEPOINT {}"
+      ]
+    },
     "upper_folding": false,
     "view_folder": "Views",
     "whole_path_quotes": false
@@ -585,6 +595,7 @@
       "triple_quotes": false
     },
     "table_folder": "Labels",
+    "transactions": null,
     "upper_folding": false,
     "view_folder": "Relationship types",
     "whole_path_quotes": false
@@ -620,7 +631,6 @@
       "rows_note": "DataBrain's limit for Oracle INSERT ALL (parsing slows down with many rows)",
       "stage": "regular",
       "text_literal": "plain",
-      "transactions": null,
       "typed_datetime_literals": true,
       "types": {
         "binary": "BLOB",
@@ -673,6 +683,7 @@
       "triple_quotes": false
     },
     "table_folder": "Tables",
+    "transactions": null,
     "upper_folding": true,
     "view_folder": "Views",
     "whole_path_quotes": false
@@ -708,12 +719,6 @@
       "rows_note": "DataBrain's limit per statement",
       "stage": "temp",
       "text_literal": "plain",
-      "transactions": {
-        "begin": "BEGIN",
-        "commit": "COMMIT",
-        "ddl_commits": false,
-        "rollback": "ROLLBACK"
-      },
       "typed_datetime_literals": false,
       "types": {
         "binary": "BYTEA",
@@ -760,6 +765,16 @@
       "triple_quotes": false
     },
     "table_folder": "Tables",
+    "transactions": {
+      "begin": "BEGIN",
+      "commit": "COMMIT",
+      "ddl_commits": "No",
+      "rollback": "ROLLBACK",
+      "savepoint": [
+        "SAVEPOINT {}",
+        "ROLLBACK TO SAVEPOINT {}"
+      ]
+    },
     "upper_folding": false,
     "view_folder": "Views",
     "whole_path_quotes": false
@@ -795,7 +810,6 @@
       "rows_note": "DataBrain's limit per statement",
       "stage": "temporary",
       "text_literal": "plain",
-      "transactions": null,
       "typed_datetime_literals": false,
       "types": {
         "binary": "BINARY",
@@ -842,6 +856,13 @@
       "triple_quotes": false
     },
     "table_folder": "Tables",
+    "transactions": {
+      "begin": "BEGIN",
+      "commit": "COMMIT",
+      "ddl_commits": "AnyDdl",
+      "rollback": "ROLLBACK",
+      "savepoint": null
+    },
     "upper_folding": true,
     "view_folder": "Views",
     "whole_path_quotes": false
@@ -877,12 +898,6 @@
       "rows_note": "DataBrain's limit per statement",
       "stage": "temp",
       "text_literal": "plain",
-      "transactions": {
-        "begin": "BEGIN",
-        "commit": "COMMIT",
-        "ddl_commits": false,
-        "rollback": "ROLLBACK"
-      },
       "typed_datetime_literals": false,
       "types": {
         "binary": "BLOB",
@@ -928,6 +943,16 @@
       "triple_quotes": false
     },
     "table_folder": "Tables",
+    "transactions": {
+      "begin": "BEGIN",
+      "commit": "COMMIT",
+      "ddl_commits": "No",
+      "rollback": "ROLLBACK",
+      "savepoint": [
+        "SAVEPOINT {}",
+        "ROLLBACK TO SAVEPOINT {}"
+      ]
+    },
     "upper_folding": false,
     "view_folder": "Views",
     "whole_path_quotes": false

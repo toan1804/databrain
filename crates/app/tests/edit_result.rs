@@ -123,7 +123,7 @@ async fn edits_rows_of_a_single_table_result() {
         RowChange::Update { key: vec![Some("3".into())], values: vec![v(1, Some("Cyrus"))] },
         RowChange::Update { key: vec![Some("2".into())], values: vec![v(1, Some("Ghost"))] },
     ];
-    let e = api::apply_edits(&st, &info.id, stale).await.unwrap_err();
+    let e = api::apply_edits(&st, &info.id, stale.clone()).await.unwrap_err();
     assert!(e.message.contains("changed or deleted"), "{}", e.message);
     assert_eq!(rows(&st, &conn, "select name from people where id = 3").await[0][0].as_deref(), Some("Cy"), "rolled back");
 
@@ -133,6 +133,17 @@ async fn edits_rows_of_a_single_table_result() {
     assert!(rep.in_open_transaction);
     run(&st, &conn, "rollback").await;
     assert_eq!(rows(&st, &conn, "select name from people where id = 3").await[0][0].as_deref(), Some("Cy"));
+    // In an open transaction, a conflict undoes this apply only (a
+    // savepoint): the user's own change stays pending, and nothing of the
+    // apply is kept.
+    run(&st, &conn, "begin").await;
+    run(&st, &conn, "update people set age = 77 where id = 4").await;
+    let e = api::apply_edits(&st, &info.id, stale.clone()).await.unwrap_err();
+    assert!(e.message.contains("changed or deleted") && e.message.contains("nothing was saved"), "{}", e.message);
+    assert_eq!(rows(&st, &conn, "select name from people where id = 3").await[0][0].as_deref(), Some("Cy"), "the apply's first change undone");
+    assert_eq!(rows(&st, &conn, "select age from people where id = 4").await[0][0].as_deref(), Some("77"), "the user's change still pending");
+    run(&st, &conn, "rollback").await;
+    assert_eq!(rows(&st, &conn, "select age from people where id = 4").await[0][0].as_deref(), None);
 
     // Not editable: joins, no key in the result, no primary key.
     let j = run(&st, &conn, "select p.name from people p join people q on p.id = q.id").await.result.unwrap();

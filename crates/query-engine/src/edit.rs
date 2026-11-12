@@ -285,14 +285,10 @@ fn not_a_table(schema: &str, name: &str, kind: ObjectKind) -> String {
     format!("{schema}.{name} is {what}: only tables can be edited")
 }
 
-/// How changes are applied on a database (see [`EditTarget::apply`]).
+/// How changes are applied on a database (see [`EditTarget::apply`]): its
+/// transaction statements (`SourceTraits::transactions`).
 pub(crate) fn apply_style(kind: ConnectorKind) -> Option<(&'static str, &'static str, &'static str)> {
-    match kind {
-        ConnectorKind::Postgres | ConnectorKind::Sqlite | ConnectorKind::Duckdb | ConnectorKind::Snowflake => Some(("BEGIN", "COMMIT", "ROLLBACK")),
-        ConnectorKind::Mysql => Some(("START TRANSACTION", "COMMIT", "ROLLBACK")),
-        ConnectorKind::Mssql => Some(("BEGIN TRANSACTION", "COMMIT", "ROLLBACK")),
-        _ => None,
-    }
+    kind.traits().transactions.map(|t| (t.begin, t.commit, t.rollback))
 }
 
 /// A result's source table, described, with the table column of each result column.
@@ -542,6 +538,13 @@ impl QueryEngine {
         if let Some((begin, _, _)) = style {
             run(begin.to_string()).await?;
         }
+        // In the user's open transaction: a savepoint, so a conflict undoes
+        // this apply only (the user's own changes stay pending).
+        let savepoint = kind.traits().transactions.and_then(|t| t.savepoint).filter(|_| in_tx);
+        const SAVEPOINT: &str = "databrain_apply";
+        if let Some((set, _)) = savepoint {
+            run(set.replace("{}", SAVEPOINT)).await?;
+        }
         for (i, s) in stmts.iter().enumerate() {
             let r = match run(s.sql.clone()).await {
                 Ok(n) => check(i, s, n).map(|_| n),
@@ -553,9 +556,20 @@ impl QueryEngine {
                     if let Some((_, _, rollback)) = style {
                         let _ = run(rollback.to_string()).await;
                     }
+                    let mut rolled_back = savepoint.is_some();
+                    if let Some((_, back)) = savepoint {
+                        rolled_back = run(back.replace("{}", SAVEPOINT)).await.is_ok();
+                    }
                     let mut e = e;
                     if style.is_none() && !in_tx && i > 0 {
                         e.message.push_str(&format!(" (the {i} change(s) before it were saved: this database has no transactions)"));
+                    }
+                    // In an open transaction without a savepoint, the changes
+                    // before it stay pending: not "nothing was saved".
+                    if in_tx && !rolled_back && i > 0 {
+                        e.message = e.message.replace("; nothing was saved", "");
+                        e.message
+                            .push_str(&format!(" (the {i} change(s) before it are pending in your open transaction: Commit keeps them, Rollback undoes them)"));
                     }
                     return Err(e);
                 }

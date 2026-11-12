@@ -234,15 +234,38 @@ pub enum MergeStyle {
     UpdateJoin,
 }
 
-/// Transactions around a load step.
+/// When DDL ends a transaction by itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct LoadTransactions {
+pub enum DdlCommits {
+    /// DDL runs inside a transaction.
+    No,
+    /// DDL commits; temporary tables don't (MySQL).
+    Ddl,
+    /// Any DDL commits, temporary tables included (Snowflake).
+    AnyDdl,
+}
+
+/// How DataBrain opens and ends a transaction on this database: loads,
+/// grid edits, manual commit and the Commit/Rollback buttons all use this.
+/// `None` on [`SourceTraits::transactions`]: DataBrain doesn't open one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TxDialect {
     pub begin: &'static str,
     pub commit: &'static str,
     pub rollback: &'static str,
-    /// DDL commits at once, so a step with DDL runs without one (MySQL).
-    pub ddl_commits: bool,
+    /// A load step with DDL runs without a transaction when DDL commits.
+    pub ddl_commits: DdlCommits,
+    /// Set a savepoint and roll back to it, `{}` the name; `None` = none.
+    pub savepoint: Option<(&'static str, &'static str)>,
 }
+
+const STANDARD_TX: TxDialect = TxDialect {
+    begin: "BEGIN",
+    commit: "COMMIT",
+    rollback: "ROLLBACK",
+    ddl_commits: DdlCommits::No,
+    savepoint: Some(("SAVEPOINT {}", "ROLLBACK TO SAVEPOINT {}")),
+};
 
 /// How DataBrain writes rows into this database (job load steps, export as
 /// INSERTs). `None` on [`SourceTraits::load`] = not a load target.
@@ -274,8 +297,6 @@ pub struct LoadTraits {
     /// Update and Merge by key are possible (ClickHouse has no row-level
     /// UPDATE/MERGE: only Insert, Delete then insert, Replace).
     pub keyed: bool,
-    /// `None` = statements commit one by one.
-    pub transactions: Option<LoadTransactions>,
     /// Written after a new table's column list (ClickHouse: its `ENGINE`).
     pub create_suffix: &'static str,
     /// Columns are NOT NULL unless written `NULL` (ClickHouse): a nullable
@@ -352,6 +373,8 @@ pub struct SourceTraits {
     /// sql-formatter language used by the UI's Format.
     pub formatter: &'static str,
     pub syntax: SqlSyntax,
+    /// Transactions DataBrain opens (loads, grid edits, manual commit).
+    pub transactions: Option<TxDialect>,
     pub load: Option<LoadTraits>,
 }
 
@@ -412,7 +435,6 @@ pub const STANDARD_LOAD: LoadTraits = LoadTraits {
     stage: StageTable::Temp,
     merge: MergeStyle::UpdateFrom,
     keyed: true,
-    transactions: Some(LoadTransactions { begin: "BEGIN", commit: "COMMIT", rollback: "ROLLBACK", ddl_commits: false }),
     create_suffix: "",
     explicit_null: false,
     delete_all: "DELETE FROM {}",
@@ -445,6 +467,7 @@ pub const STANDARD: SourceTraits = SourceTraits {
     ssl_setting: false,
     formatter: "sql",
     syntax: STANDARD_SYNTAX,
+    transactions: None,
     load: Some(STANDARD_LOAD),
 };
 
@@ -465,6 +488,7 @@ pub const SQLITE: SourceTraits = SourceTraits {
         bool_words: false,
         ..STANDARD_LOAD
     }),
+    transactions: Some(STANDARD_TX),
     ..STANDARD
 };
 
@@ -488,6 +512,7 @@ pub const POSTGRES: SourceTraits = SourceTraits {
         binary_literal: "'\\x{}'::bytea",
         ..STANDARD_LOAD
     }),
+    transactions: Some(STANDARD_TX),
     ..STANDARD
 };
 
@@ -517,9 +542,9 @@ pub const MYSQL: SourceTraits = SourceTraits {
         text_literal: TextLiteral::BackslashEscaped,
         stage: StageTable::TemporaryDropTemporary,
         merge: MergeStyle::UpdateJoin,
-        transactions: Some(LoadTransactions { begin: "START TRANSACTION", commit: "COMMIT", rollback: "ROLLBACK", ddl_commits: true }),
         ..STANDARD_LOAD
     }),
+    transactions: Some(TxDialect { begin: "START TRANSACTION", ddl_commits: DdlCommits::Ddl, ..STANDARD_TX }),
     ..STANDARD
 };
 
@@ -556,13 +581,14 @@ pub const MSSQL: SourceTraits = SourceTraits {
         create_if_missing: CreateIfMissing::ObjectIdCheck,
         stage: StageTable::HashSelectInto,
         merge: MergeStyle::MergeSemicolon,
-        transactions: Some(LoadTransactions {
-            begin: "BEGIN TRANSACTION",
-            commit: "COMMIT TRANSACTION",
-            rollback: "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
-            ddl_commits: false,
-        }),
         ..STANDARD_LOAD
+    }),
+    transactions: Some(TxDialect {
+        begin: "BEGIN TRANSACTION",
+        commit: "COMMIT TRANSACTION",
+        rollback: "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
+        ddl_commits: DdlCommits::No,
+        savepoint: Some(("SAVE TRANSACTION {}", "ROLLBACK TRANSACTION {}")),
     }),
     ..STANDARD
 };
@@ -605,7 +631,6 @@ pub const ORACLE: SourceTraits = SourceTraits {
         drop_in_plsql_block: true,
         stage: StageTable::Regular,
         merge: MergeStyle::MergeNoAs,
-        transactions: None,
         ..STANDARD_LOAD
     }),
     ..STANDARD
@@ -640,9 +665,9 @@ pub const SNOWFLAKE: SourceTraits = SourceTraits {
         binary_literal: "TO_BINARY('{}', 'HEX')",
         stage: StageTable::Temporary,
         merge: MergeStyle::Merge,
-        transactions: None,
         ..STANDARD_LOAD
     }),
+    transactions: Some(TxDialect { ddl_commits: DdlCommits::AnyDdl, savepoint: None, ..STANDARD_TX }),
     ..STANDARD
 };
 
@@ -666,7 +691,6 @@ pub const DATABRICKS: SourceTraits = SourceTraits {
         text_literal: TextLiteral::BackslashEscaped,
         stage: StageTable::Regular,
         merge: MergeStyle::Merge,
-        transactions: None,
         ..STANDARD_LOAD
     }),
     ..STANDARD
@@ -715,7 +739,6 @@ pub const BIGQUERY: SourceTraits = SourceTraits {
         probe_limit0: true,
         stage: StageTable::RegularLimit0,
         merge: MergeStyle::MergeNoInto,
-        transactions: None,
         ..STANDARD_LOAD
     }),
     ..STANDARD
@@ -732,6 +755,7 @@ pub const DUCKDB: SourceTraits = SourceTraits {
     formatter: "duckdb",
     syntax: SqlSyntax { dollar: DollarQuotes::Tagged, escape_strings: true, ..STANDARD_SYNTAX },
     load: Some(LoadTraits { types: TypeNames { timestamp_tz: "TIMESTAMPTZ", ..STANDARD_TYPES }, ..STANDARD_LOAD }),
+    transactions: Some(TxDialect { savepoint: None, ..STANDARD_TX }),
     ..STANDARD
 };
 
@@ -779,7 +803,6 @@ pub const CLICKHOUSE_LOAD: LoadTraits = LoadTraits {
     probe_limit0: true,
     stage: StageTable::Regular,
     keyed: false,
-    transactions: None,
     create_suffix: " ENGINE = MergeTree ORDER BY tuple()",
     explicit_null: true,
     delete_all: "TRUNCATE TABLE {}",
