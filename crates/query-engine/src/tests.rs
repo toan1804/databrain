@@ -641,3 +641,46 @@ async fn outputs_of_a_run_whose_tab_closed_are_freed() {
     assert_eq!(freed.state, OutputState::Evicted);
     assert!(!freed.active && !f.engine.results().contains(&freed.result_id));
 }
+
+/// A load's before/after SQL can't control the transaction: a `COMMIT` in
+/// it would keep a dry run's sample rows (and their deletes, in Sync mode).
+/// Plain SQL runs inside the load's transaction, and a dry run keeps nothing.
+#[tokio::test]
+async fn load_sql_that_controls_the_transaction_is_refused() {
+    use databrain_connector_core::arrow::array::Int64Array;
+    use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
+    let f = fixture(EnvTag::Dev);
+    let s = f.engine.session_for_tests(&f.conn_id).await.unwrap();
+    s.execute("create table t (id integer)", Default::default()).await.unwrap().collect().await.unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let batch = databrain_connector_core::arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
+    let rows = crate::load::LoadRows { schema, batches: vec![batch] };
+    let spec = |before: Option<&str>, after: Option<&str>| crate::load::LoadSpec {
+        table: "t".into(),
+        before_sql: before.map(str::to_string),
+        after_sql: after.map(str::to_string),
+        ..Default::default()
+    };
+    let count = || async {
+        let s = f.engine.session_for_tests(&f.conn_id).await.unwrap();
+        databrain_connector_core::query_text(&*s, "select count(*) from t").await.unwrap()[0][0].clone().unwrap()
+    };
+    for (b, a) in [(None, Some("COMMIT")), (Some("begin"), None), (None, Some("select 1;\nrollback"))] {
+        let e = f.engine.load_rows(&rows, &f.conn_id, "l", &spec(b, a), &Default::default(), &crate::load::NoLoadObserver).await.unwrap_err();
+        assert!(e.message.contains("can't control the transaction"), "{b:?} {a:?}: {}", e.message);
+        let dry = f.engine.dry_run_load(Some(&rows), None, &f.conn_id, "d", &spec(b, a)).await;
+        assert!(!dry.ok && dry.checks.iter().any(|c| c.message.as_deref().is_some_and(|m| m.contains("can't control the transaction"))), "{dry:?}");
+    }
+    assert_eq!(count().await, "0", "nothing was written");
+    // Plain before/after SQL: the dry run runs it in a transaction and keeps nothing.
+    let dry = f.engine.dry_run_load(Some(&rows), None, &f.conn_id, "d", &spec(Some("select 1"), Some("update t set id = id"))).await;
+    assert!(dry.ok && dry.method == "transaction", "{dry:?}");
+    assert_eq!(count().await, "0", "the dry run rolled back");
+    let r = f
+        .engine
+        .load_rows(&rows, &f.conn_id, "l", &spec(None, Some("update t set id = id + 10")), &Default::default(), &crate::load::NoLoadObserver)
+        .await
+        .unwrap();
+    assert_eq!(r.rows, 3);
+    assert_eq!(count().await, "3");
+}

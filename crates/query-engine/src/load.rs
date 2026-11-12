@@ -273,6 +273,34 @@ struct Prepared {
     /// Staging table that is a real table (dropped after a failure too).
     permanent_stage: Option<String>,
     notices: Vec<String>,
+    /// Before/after SQL calls something that may commit on its own (a
+    /// procedure): a dry run doesn't run the plan, and a failure can't
+    /// promise that nothing was kept.
+    may_commit: bool,
+}
+
+/// The step's own before/after SQL, checked once: transaction control is
+/// refused (the load commits or rolls back its own work, and a dry run
+/// rolls back everything), and whether a statement may commit by itself.
+fn check_user_sql(stmts: &[String], dialect: ConnectorKind) -> Result<bool> {
+    let mut may_commit = false;
+    for s in stmts {
+        let c = classify(s, dialect);
+        let lower = s.to_ascii_lowercase();
+        let autocommit = c.kind == StatementKind::Session && (lower.contains("autocommit") || lower.contains("implicit_transactions"));
+        if c.kind == StatementKind::Transaction || autocommit {
+            return Err(EngineError::new(
+                "invalid",
+                format!(
+                    "Before/after SQL can't control the transaction ({}): the load commits or rolls back its own work. Remove it.",
+                    if autocommit { "autocommit".to_string() } else { c.keyword.clone() }
+                ),
+            ));
+        }
+        may_commit |= matches!(c.kind, StatementKind::Other | StatementKind::Unknown)
+            || matches!(c.keyword.as_str(), "CALL" | "EXEC" | "EXECUTE" | "DO" | "BEGIN" | "DECLARE");
+    }
+    Ok(may_commit)
 }
 
 /// Longest SQL text kept per dry run check.
@@ -422,6 +450,10 @@ impl QueryEngine {
                 }
                 self.abandon(&p, connection_id, tab).await;
                 Err(match &p.tx {
+                    Some(_) if e.kind != "cancelled" && p.may_commit => EngineError {
+                        message: format!("{} (rolled back; a procedure the before/after SQL calls may have committed its own changes)", e.message),
+                        ..e
+                    },
                     Some(_) if e.kind != "cancelled" => EngineError { message: format!("{} (rolled back: nothing was changed)", e.message), ..e },
                     Some(_) => e,
                     None => EngineError {
@@ -474,7 +506,9 @@ impl QueryEngine {
         let empty = LoadRows { schema: Arc::new(Schema::empty()), batches: vec![] };
         let data = rows.unwrap_or(&empty);
         let mut checks = Vec::new();
-        match &p.tx {
+        // A procedure in the before/after SQL could commit inside the
+        // transaction: then the dry run only checks, it runs nothing.
+        match p.tx.as_ref().filter(|_| !p.may_commit) {
             Some(tx) => {
                 report.method = "transaction".into();
                 match exec(&p.session, tx.begin, &cancel).await {
@@ -740,6 +774,7 @@ impl QueryEngine {
         let (mut exists, mut target_cols, mut missing_reason) = probe(&session, dialect, &table).await?;
         let before = user_statements(spec.before_sql.as_deref(), dialect);
         let after = user_statements(spec.after_sql.as_deref(), dialect);
+        let may_commit = check_user_sql(&before, dialect)? | check_user_sql(&after, dialect)?;
         // Not there as typed: the path as the database spells it
         // (`account` → `ACCOUNT`), or why when the catalog or schema is
         // missing, before any CREATE TABLE fails on it (before SQL may
@@ -958,7 +993,7 @@ impl QueryEngine {
                 None => format!("{} doesn't run this step in a transaction: if it fails partway, what ran before stays.", engine_name(dialect)),
             });
         }
-        Ok(Prepared { dialect, connection: conn, table, session, exists: Some(exists), creates, plan, schema, tx, batch, permanent_stage, notices })
+        Ok(Prepared { dialect, connection: conn, table, session, exists: Some(exists), creates, plan, schema, tx, batch, permanent_stage, notices, may_commit })
     }
 }
 
@@ -1196,6 +1231,30 @@ fn create_schema_sql(kind: ConnectorKind, path: &str, name: &str) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_sql_is_checked_for_transaction_control() {
+        use ConnectorKind::*;
+        let check = |sql: &str, k: ConnectorKind| check_user_sql(&[sql.to_string()], k);
+        for (sql, k) in [
+            ("COMMIT", Postgres),
+            ("rollback", Mysql),
+            ("BEGIN TRANSACTION", Mssql),
+            ("start transaction", Mysql),
+            ("SET autocommit = 1", Mysql),
+            ("set implicit_transactions on", Mssql),
+            ("savepoint a", Postgres),
+        ] {
+            assert!(check(sql, k).is_err(), "{k:?}: {sql}");
+        }
+        for (sql, k) in [("update t set a = 1 where id = 2", Postgres), ("create index i on t (a)", Postgres), ("select 1", Mssql)] {
+            assert_eq!(check(sql, k).unwrap(), false, "{k:?}: {sql}");
+        }
+        // A procedure may commit by itself.
+        for (sql, k) in [("call refresh_totals()", Postgres), ("exec dbo.rebuild", Mssql), ("BEGIN pkg.run; END;", Oracle)] {
+            assert!(check(sql, k).unwrap(), "{k:?}: {sql}");
+        }
+    }
 
     #[test]
     fn transactions_per_engine() {
