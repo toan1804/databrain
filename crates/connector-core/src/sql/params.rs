@@ -238,7 +238,17 @@ pub fn substitute_parameters(sql: &str, kind: ConnectorKind, values: &std::colle
         match lit {
             Some(lit) => {
                 out.push_str(&sql[at..s.start]);
+                // A value must not join the text around it into a comment
+                // marker: `1-:p` with `-1` is `1- -1`, not `1--1` (the rest
+                // of the line a comment, a WHERE losing its conditions).
+                let joins = |a: Option<char>, b: Option<char>| matches!((a, b), (Some('-'), Some('-')) | (Some('/'), Some('*')) | (Some('*'), Some('/')));
+                if joins(out.chars().last(), lit.chars().next()) {
+                    out.push(' ');
+                }
                 out.push_str(&lit);
+                if joins(lit.chars().last(), sql[s.end..].chars().next()) {
+                    out.push(' ');
+                }
                 at = s.end;
             }
             None if !missing.contains(&s.name) => missing.push(s.name.clone()),
@@ -257,6 +267,17 @@ mod param_tests {
     use super::*;
     use ConnectorKind as K;
     use std::collections::HashMap;
+
+    /// A value next to a `-` or `/` doesn't make a comment marker.
+    #[test]
+    fn values_dont_join_into_comments() {
+        let v = |s: &str| HashMap::from([("p".to_string(), ParamValue { value: s.into(), raw: false })]);
+        let out = substitute_parameters("delete from t where a = 1-:p and owner = 'me'", K::Postgres, &v("-1")).unwrap();
+        assert_eq!(out, "delete from t where a = 1- -1 and owner = 'me'");
+        let raw = HashMap::from([("p".to_string(), ParamValue { value: "*x".into(), raw: true })]);
+        assert_eq!(substitute_parameters("select 4/:p", K::Postgres, &raw).unwrap(), "select 4/ *x");
+        assert_eq!(substitute_parameters("select :p - 1", K::Postgres, &v("-1")).unwrap(), "select -1 - 1");
+    }
 
     /// A rendered value is one literal that ends at its last character
     /// whether or not the server reads backslashes as escapes (MySQL

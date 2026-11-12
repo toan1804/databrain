@@ -55,6 +55,7 @@
     "syntax": {
       "ampersand_vars": false,
       "backslash_escapes": true,
+      "backslash_in_backticks": true,
       "backslash_in_double_quotes": true,
       "backtick": true,
       "block_end": "end_word",
@@ -136,6 +137,7 @@
     "syntax": {
       "ampersand_vars": false,
       "backslash_escapes": true,
+      "backslash_in_backticks": true,
       "backslash_in_double_quotes": true,
       "backtick": true,
       "block_end": "none",
@@ -215,6 +217,7 @@
     "syntax": {
       "ampersand_vars": false,
       "backslash_escapes": true,
+      "backslash_in_backticks": false,
       "backslash_in_double_quotes": true,
       "backtick": true,
       "block_end": "none",
@@ -294,6 +297,7 @@
     "syntax": {
       "ampersand_vars": false,
       "backslash_escapes": false,
+      "backslash_in_backticks": false,
       "backslash_in_double_quotes": false,
       "backtick": false,
       "block_end": "none",
@@ -346,6 +350,7 @@
     "syntax": {
       "ampersand_vars": false,
       "backslash_escapes": false,
+      "backslash_in_backticks": false,
       "backslash_in_double_quotes": false,
       "backtick": false,
       "block_end": "none",
@@ -425,6 +430,7 @@
     "syntax": {
       "ampersand_vars": false,
       "backslash_escapes": false,
+      "backslash_in_backticks": false,
       "backslash_in_double_quotes": false,
       "backtick": false,
       "block_end": "go_line",
@@ -520,6 +526,7 @@
     "syntax": {
       "ampersand_vars": false,
       "backslash_escapes": true,
+      "backslash_in_backticks": false,
       "backslash_in_double_quotes": true,
       "backtick": true,
       "block_end": "end_word",
@@ -580,6 +587,7 @@
     "syntax": {
       "ampersand_vars": false,
       "backslash_escapes": false,
+      "backslash_in_backticks": false,
       "backslash_in_double_quotes": false,
       "backtick": true,
       "block_end": "none",
@@ -659,6 +667,7 @@
     "syntax": {
       "ampersand_vars": true,
       "backslash_escapes": false,
+      "backslash_in_backticks": false,
       "backslash_in_double_quotes": false,
       "backtick": false,
       "block_end": "slash_line",
@@ -747,6 +756,7 @@
     "syntax": {
       "ampersand_vars": false,
       "backslash_escapes": false,
+      "backslash_in_backticks": false,
       "backslash_in_double_quotes": false,
       "backtick": false,
       "block_end": "end_word",
@@ -839,6 +849,7 @@
     "syntax": {
       "ampersand_vars": false,
       "backslash_escapes": true,
+      "backslash_in_backticks": false,
       "backslash_in_double_quotes": false,
       "backtick": false,
       "block_end": "end_word",
@@ -928,6 +939,7 @@
     "syntax": {
       "ampersand_vars": false,
       "backslash_escapes": false,
+      "backslash_in_backticks": false,
       "backslash_in_double_quotes": false,
       "backtick": true,
       "block_end": "end_word",

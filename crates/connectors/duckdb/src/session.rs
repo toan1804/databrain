@@ -77,7 +77,7 @@ impl Session for DuckSession {
     /// Followed from the statements run (`BEGIN` … `COMMIT`/`ROLLBACK`):
     /// the driver's `is_autocommit()` is a stub that always says yes.
     fn transaction_state(&self) -> databrain_connector_core::TxState {
-        if self.state.in_transaction() { databrain_connector_core::TxState::Open } else { databrain_connector_core::TxState::None }
+        self.state.tx_state()
     }
 
     async fn server_version(&self) -> Result<String> {

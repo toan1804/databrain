@@ -126,6 +126,9 @@ pub struct SqlSyntax {
     pub backslash_in_double_quotes: bool,
     /// `` `…` `` is quoted text.
     pub backtick: bool,
+    /// …where `` \` `` escapes (BigQuery, ClickHouse: quoted names take
+    /// a string's escapes; ``a\`, `` is one name there).
+    pub backslash_in_backticks: bool,
     /// `# comment`.
     pub hash_comment: bool,
     /// `// comment`.
@@ -391,6 +394,7 @@ pub const STANDARD_SYNTAX: SqlSyntax = SqlSyntax {
     backslash_escapes: false,
     backslash_in_double_quotes: false,
     backtick: false,
+    backslash_in_backticks: false,
     hash_comment: false,
     slash_comment: false,
     brackets: false,
@@ -719,6 +723,7 @@ pub const BIGQUERY: SourceTraits = SourceTraits {
         backslash_escapes: true,
         backslash_in_double_quotes: true,
         backtick: true,
+        backslash_in_backticks: true,
         hash_comment: true,
         triple_quotes: true,
         block_end: BlockEnd::EndWord,
@@ -823,7 +828,14 @@ pub const CLICKHOUSE: SourceTraits = SourceTraits {
     quote: IdentQuote::BacktickBackslash,
     explain: Some("EXPLAIN "),
     ssl_setting: true,
-    syntax: SqlSyntax { backslash_escapes: true, backslash_in_double_quotes: true, backtick: true, hash_comment: true, ..STANDARD_SYNTAX },
+    syntax: SqlSyntax {
+        backslash_escapes: true,
+        backslash_in_double_quotes: true,
+        backtick: true,
+        backslash_in_backticks: true,
+        hash_comment: true,
+        ..STANDARD_SYNTAX
+    },
     load: Some(CLICKHOUSE_LOAD),
     ..STANDARD
 };

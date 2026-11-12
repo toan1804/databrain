@@ -567,7 +567,7 @@ impl Session for SfSession {
     /// session then counts as open until the next COMMIT or ROLLBACK (kept,
     /// never lost).
     fn transaction_state(&self) -> databrain_connector_core::TxState {
-        if self.0.state.in_transaction() { databrain_connector_core::TxState::Open } else { databrain_connector_core::TxState::None }
+        self.0.state.tx_state()
     }
 
     async fn server_version(&self) -> Result<String> {

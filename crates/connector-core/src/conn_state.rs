@@ -15,6 +15,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use crate::TxState;
 use crate::sql::{leading_keyword, words};
 use crate::types::ConnectorKind;
 
@@ -24,6 +25,10 @@ pub struct ConnState {
     settings: AtomicBool,
     /// Open transactions (nesting counted for SQL Server).
     tx_depth: AtomicU32,
+    /// Writes open a transaction by themselves (SQL Server
+    /// `IMPLICIT_TRANSACTIONS ON`, autocommit off): one may be open at any
+    /// time, which statement text can't follow.
+    implicit: AtomicBool,
 }
 
 impl ConnState {
@@ -33,52 +38,56 @@ impl ConnState {
 
     /// Note a statement about to run on the connection.
     pub fn observe(&self, sql: &str, kind: ConnectorKind) {
-        let mut kw = leading_keyword(sql);
         let has = |w: &[&str]| words(sql).any(|x| w.iter().any(|k| x.eq_ignore_ascii_case(k)));
         let mssql = kind == ConnectorKind::Mssql;
-        // SQL Server statements that name TRAN without beginning one: a
-        // guarded `IF @@TRANCOUNT > 0 ROLLBACK|COMMIT …` ends as the plain
-        // form does; `SAVE TRAN x` and `ROLLBACK TRAN x` (to a savepoint)
-        // leave the transaction as it is.
-        let mut keeps = false;
-        if mssql {
-            if kw == "IF" && has(&["ROLLBACK"]) {
-                kw = "ROLLBACK".into();
-            } else if kw == "IF" && has(&["COMMIT"]) {
-                kw = "COMMIT".into();
-            }
-            let rest: Vec<String> = words(crate::sql::strip_leading_comments(sql))
-                .map(str::to_ascii_uppercase)
-                .skip_while(|w| w != "ROLLBACK" && w != "SAVE")
-                .skip(1)
-                .skip_while(|w| matches!(w.as_str(), "TRAN" | "TRANSACTION" | "WORK"))
-                .collect();
-            keeps = kw == "SAVE" || (kw == "ROLLBACK" && !rest.is_empty());
+        // The statement's words without comments and string contents, upper
+        // case: `ROLLBACK -- undo` is a plain ROLLBACK, `[Transaction]` in a
+        // SELECT is a table name, not a BEGIN.
+        let code = code_words(sql, kind);
+        // The first word of code: after `//` or `#` comments too.
+        let mut kw = code.first().cloned().unwrap_or_else(|| leading_keyword(sql));
+        // SQL Server: a guarded `IF @@TRANCOUNT > 0 ROLLBACK|COMMIT …` ends
+        // as the plain form does; read from that word on.
+        let mut tail: &[String] = &code;
+        if mssql
+            && kw == "IF"
+            && let Some(i) = code.iter().position(|w| w == "ROLLBACK" || w == "COMMIT")
+        {
+            kw = code[i].clone();
+            tail = &code[i..];
         }
+        let at = |i: usize| tail.get(i).map(String::as_str);
+        let tran_word = |w: Option<&str>| matches!(w, Some("TRAN" | "TRANSACTION"));
+        // `ROLLBACK TO [SAVEPOINT] x`, `ROLLBACK WORK TO …`.
+        let to_savepoint = at(1) == Some("TO") || (matches!(at(1), Some("TRAN" | "TRANSACTION" | "WORK")) && at(2) == Some("TO"));
+        // SQL Server: `SAVE TRAN x` and `ROLLBACK TRAN x` (to a savepoint,
+        // the name right after TRAN; plain `ROLLBACK [WORK]` can't name one)
+        // leave the transaction as it is.
+        let keeps = mssql && (kw == "SAVE" || (kw == "ROLLBACK" && tran_word(at(1)) && at(2).is_some_and(|w| !STATEMENT_WORDS.contains(&w))));
+        // SQL Server: BEGIN TRAN / BEGIN DISTRIBUTED TRAN anywhere in the
+        // batch (`SET XACT_ABORT ON; BEGIN TRAN`, `IF … BEGIN TRANSACTION`).
+        let mssql_begin = || code.windows(2).any(|w| w[0] == "BEGIN" && matches!(w[1].as_str(), "TRAN" | "TRANSACTION" | "DISTRIBUTED"));
         // Transactions.
         let begins = match kw.as_str() {
             "START" => has(&["TRANSACTION"]),
-            // SQL Server: BEGIN TRAN; BEGIN … END / BEGIN TRY blocks only when they mention one.
-            "BEGIN" if mssql => has(&["TRAN", "TRANSACTION"]),
+            "BEGIN" if mssql => mssql_begin(),
             // Not a block (`BEGIN … END;`, Snowflake Scripting): only
             // `BEGIN`, `BEGIN;` and BEGIN followed by transaction words.
             "BEGIN" => {
-                let second = words(crate::sql::strip_leading_comments(sql)).nth(1).map(|w| w.to_ascii_uppercase());
                 matches!(
-                    second.as_deref(),
+                    code.get(1).map(String::as_str),
                     None | Some(
                         "TRANSACTION" | "TRAN" | "WORK" | "NAME" | "ISOLATION" | "READ" | "NOT" | "DEFERRABLE" | "DEFERRED" | "IMMEDIATE" | "EXCLUSIVE"
                     )
                 )
             }
-            _ => mssql && !keeps && has(&["TRAN", "TRANSACTION"]) && !matches!(kw.as_str(), "COMMIT" | "ROLLBACK"),
+            // Also after a COMMIT or ROLLBACK in the same batch (`commit
+            // begin tran`): counted after the end below.
+            _ => mssql && !keeps && mssql_begin(),
         };
-        if begins {
-            self.tx_depth.fetch_add(1, Ordering::SeqCst);
-        }
         match kw.as_str() {
             // ROLLBACK TO SAVEPOINT keeps the transaction.
-            "ROLLBACK" if has(&["TO"]) || keeps => {}
+            "ROLLBACK" if to_savepoint || keeps => {}
             "COMMIT" | "END" if mssql => {
                 // `try_update` is the new name but needs Rust 1.95; the MSRV is 1.89.
                 #[allow(deprecated)]
@@ -86,6 +95,27 @@ impl ConnState {
             }
             "COMMIT" | "ROLLBACK" | "END" | "ABORT" => self.tx_depth.store(0, Ordering::SeqCst),
             _ => {}
+        }
+        if begins {
+            self.tx_depth.fetch_add(1, Ordering::SeqCst);
+        }
+        // `COMMIT AND CHAIN` / `ROLLBACK AND CHAIN` start the next one at once.
+        if matches!(kw.as_str(), "COMMIT" | "ROLLBACK") && code.windows(2).any(|w| w[0] == "AND" && w[1] == "CHAIN") {
+            let _ = self.tx_depth.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        // Implicit transactions on or off.
+        for (i, w) in code.iter().enumerate() {
+            if w == "IMPLICIT_TRANSACTIONS" || w == "AUTOCOMMIT" {
+                match code.get(i + 1).map(String::as_str) {
+                    Some("ON" | "TRUE" | "1") => self.implicit.store(w == "IMPLICIT_TRANSACTIONS", Ordering::SeqCst),
+                    Some("OFF" | "FALSE" | "0") => self.implicit.store(w == "AUTOCOMMIT", Ordering::SeqCst),
+                    _ => {}
+                }
+            }
+        }
+        // Snowflake's session parameters (`ALTER SESSION SET …`).
+        if kw == "ALTER" && code.get(1).map(String::as_str) == Some("SESSION") {
+            self.settings.store(true, Ordering::SeqCst);
         }
         // Session state.
         let session_kw =
@@ -104,16 +134,67 @@ impl ConnState {
         self.tx_depth.load(Ordering::SeqCst) > 0
     }
 
+    /// What a session reports: `Unknown` while writes open transactions by
+    /// themselves and none is known to be open (the session is kept, as if
+    /// one were; Commit is offered once).
+    pub fn tx_state(&self) -> TxState {
+        if self.in_transaction() {
+            TxState::Open
+        } else if self.implicit.load(Ordering::SeqCst) {
+            TxState::Unknown
+        } else {
+            TxState::None
+        }
+    }
+
     /// The connection can be replaced without losing anything.
     pub fn replaceable(&self) -> bool {
-        !self.in_transaction() && !self.settings.load(Ordering::SeqCst)
+        self.tx_state() == TxState::None && !self.settings.load(Ordering::SeqCst)
     }
 
     /// A new connection replaced the old one: nothing is carried any more.
     pub fn reset(&self) {
         self.settings.store(false, Ordering::SeqCst);
         self.tx_depth.store(0, Ordering::SeqCst);
+        self.implicit.store(false, Ordering::SeqCst);
     }
+}
+
+/// Words that start a statement: after `ROLLBACK TRAN` one of them is the
+/// next statement of the batch, not a savepoint name.
+const STATEMENT_WORDS: &[&str] = &[
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "WITH",
+    "PRINT",
+    "IF",
+    "BEGIN",
+    "END",
+    "SET",
+    "EXEC",
+    "EXECUTE",
+    "DECLARE",
+    "COMMIT",
+    "ROLLBACK",
+    "SAVE",
+    "WHILE",
+    "RETURN",
+    "USE",
+    "CREATE",
+    "ALTER",
+    "DROP",
+    "TRUNCATE",
+    "RAISERROR",
+    "THROW",
+    "GO",
+];
+
+/// Upper-cased words of `sql` outside comments and quoted strings.
+fn code_words(sql: &str, kind: ConnectorKind) -> Vec<String> {
+    words(&crate::sql::code_text(sql, kind)).map(str::to_ascii_uppercase).collect()
 }
 
 #[cfg(test)]
@@ -171,8 +252,50 @@ mod tests {
         assert!(!after(Mssql, &["begin tran", "IF @@TRANCOUNT > 0 COMMIT"]).1);
         assert!(after(Mssql, &["begin tran", "rollback tran sp1"]).1);
         assert!(!after(Mssql, &["begin tran", "rollback tran"]).1);
+        // A comment or the next statement after ROLLBACK is not a savepoint.
+        for back in ["rollback -- undo it", "ROLLBACK TRANSACTION /* all */", "rollback\nselect @@trancount", "rollback tran\nprint 'done'"] {
+            assert!(!after(Mssql, &["begin tran", back]).1, "{back}");
+        }
+        assert!(!after(Postgres, &["begin", "rollback -- back to start"]).1);
+        assert!(after(Postgres, &["begin", "rollback work to savepoint a"]).1);
+        // Naming a table Transaction doesn't begin one; a batch that does, does.
+        assert!(!after(Mssql, &["select * from dbo.[Transaction]"]).1);
+        assert!(!after(Mssql, &["begin try select * from [Transaction] end try begin catch end catch"]).1);
+        assert!(!after(Mssql, &["select 'begin tran'"]).1);
+        assert!(after(Mssql, &["set xact_abort on; begin tran"]).1);
+        assert!(after(Mssql, &["begin distributed transaction"]).1);
+        // Chained: the next transaction starts at once.
+        assert!(after(Postgres, &["begin", "commit and chain", "insert into t values (1)"]).1);
+        assert!(after(Postgres, &["begin", "rollback and chain"]).1);
+        assert!(!after(Postgres, &["begin", "commit and no chain"]).1);
+        // A batch that ends one and begins the next.
+        assert!(after(Mssql, &["commit\nbegin tran"]).1);
+        assert!(after(Mssql, &["begin tran", "if @@trancount > 0 commit\nbegin tran"]).1);
+        assert!(!after(Mssql, &["select * into #tran from t"]).1, "a temp table named tran");
+        // Comments the dialect has before the first word.
+        assert!(after(Snowflake, &["// c\nbegin"]).1);
+        assert!(after(Mysql, &["# c\nbegin"]).1);
         assert!(after(Postgres, &["begin isolation level serializable"]).1);
         assert!(after(Sqlite, &["begin immediate"]).1);
+    }
+
+    /// Writes that open a transaction by themselves: one may be open at
+    /// any time, so the session says it can't tell (and is kept).
+    #[test]
+    fn implicit_transactions() {
+        let state = |kind, stmts: &[&str]| {
+            let s = ConnState::new();
+            for q in stmts {
+                s.observe(q, kind);
+            }
+            (s.tx_state(), s.replaceable())
+        };
+        assert_eq!(state(Mssql, &["set implicit_transactions on", "insert into t values (1)"]), (TxState::Unknown, false));
+        assert_eq!(state(Mssql, &["set implicit_transactions on", "set implicit_transactions off"]).0, TxState::None);
+        assert_eq!(state(Snowflake, &["alter session set autocommit = false", "insert into t values (1)"]), (TxState::Unknown, false));
+        assert_eq!(state(Snowflake, &["alter session set autocommit = false", "alter session set autocommit = true"]).0, TxState::None);
+        assert!(!state(Snowflake, &["alter session set timezone = 'UTC'"]).1, "a session parameter is session state");
+        assert_eq!(state(Mssql, &["set implicit_transactions on", "begin tran"]).0, TxState::Open);
     }
 
     #[test]

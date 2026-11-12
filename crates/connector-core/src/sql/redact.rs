@@ -62,6 +62,40 @@ const POSITIONAL_SECRETS: &[(&str, &[usize], usize)] = &[
 /// PASSWORD('pw')`, `CREATE SECRET (… SECRET 'k')`, `CREDENTIALS = (AWS_SECRET_KEY = 'k')`.
 /// Only string literals (and the bare word after `IDENTIFIED BY`) change.
 pub fn redact_secrets(sql: &str) -> String {
+    // A string ending in a backslash (`'C:\'`) ends there on most servers
+    // but runs on where `\'` escapes (MySQL): a secret after it is found
+    // by one reading only. Both are read, and what either finds is hidden.
+    let mut cut = secret_spans(sql, true);
+    cut.extend(secret_spans(sql, false));
+    if cut.is_empty() {
+        return sql.to_string();
+    }
+    cut.sort_by_key(|c| (c.0, std::cmp::Reverse(c.1)));
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0;
+    for (s, e, q) in cut {
+        // Found twice (a keyword and a position, or both readings): once.
+        if s < last {
+            continue;
+        }
+        out.push_str(&sql[last..s]);
+        match q {
+            Some(q) => {
+                out.push(q as char);
+                out.push_str("***");
+                out.push(q as char);
+            }
+            None => out.push_str("***"),
+        }
+        last = e;
+    }
+    out.push_str(&sql[last..]);
+    out
+}
+
+/// Spans (start, end, quote) of the secrets in `sql`, reading `\'` inside
+/// `'…'` as an escaped quote or not (`backslash`).
+fn secret_spans(sql: &str, backslash: bool) -> Vec<(usize, usize, Option<u8>)> {
     let b = sql.as_bytes();
     let n = b.len();
     let word_at = |i: usize| -> Option<(usize, usize)> {
@@ -74,18 +108,27 @@ pub fn redact_secrets(sql: &str) -> String {
         }
         Some((i, j))
     };
+    // Whitespace and comments (`identified by -- c\n 'pw'`).
     let skip_ws = |mut i: usize| {
-        while i < n && b[i].is_ascii_whitespace() {
-            i += 1;
+        loop {
+            while i < n && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i + 1 < n && b[i] == b'-' && b[i + 1] == b'-' {
+                i = sql[i..].find('\n').map_or(n, |k| i + k + 1);
+            } else if i + 1 < n && b[i] == b'/' && b[i + 1] == b'*' {
+                i = sql[i + 2..].find("*/").map_or(n, |k| i + 2 + k + 2);
+            } else {
+                return i;
+            }
         }
-        i
     };
     // End of the quoted literal starting at `i` (doubled quotes escape).
     let literal_end = |i: usize| -> usize {
         let q = b[i];
         let mut j = i + 1;
         while j < n {
-            if b[j] == b'\\' && q == b'\'' && j + 1 < n {
+            if backslash && b[j] == b'\\' && q == b'\'' && j + 1 < n {
                 j += 2;
                 continue;
             }
@@ -124,6 +167,11 @@ pub fn redact_secrets(sql: &str) -> String {
             }
             b'/' if i + 1 < n && b[i + 1] == b'*' => {
                 i = sql[i + 2..].find("*/").map(|k| i + 4 + k).unwrap_or(n);
+                continue;
+            }
+            // `$$Bob's table$$`: one literal, its quote is text.
+            b'$' if dollar_literal(sql, i).is_some() => {
+                i = dollar_literal(sql, i).map_or(n, |(_, _, end)| end);
                 continue;
             }
             _ => {}
@@ -239,30 +287,7 @@ pub fn redact_secrets(sql: &str) -> String {
         }
         i = e;
     }
-    if cut.is_empty() {
-        return sql.to_string();
-    }
-    cut.sort_by_key(|c| c.0);
-    let mut out = String::with_capacity(sql.len());
-    let mut last = 0;
-    for (s, e, q) in cut {
-        // Found twice (a keyword and a position): once.
-        if s < last {
-            continue;
-        }
-        out.push_str(&sql[last..s]);
-        match q {
-            Some(q) => {
-                out.push(q as char);
-                out.push_str("***");
-                out.push(q as char);
-            }
-            None => out.push_str("***"),
-        }
-        last = e;
-    }
-    out.push_str(&sql[last..]);
-    out
+    cut
 }
 
 /// Quoted arguments of calls in [`POSITIONAL_SECRETS`] that hold a secret:
@@ -552,7 +577,40 @@ fn userinfo_colon(url: &str) -> Option<usize> {
 pub fn redact_text(text: &str) -> String {
     let sql = redact_secrets(text);
     let quoted = sql.split('"').enumerate().map(|(i, part)| if i % 2 == 1 { redact_secrets(part) } else { part.to_string() }).collect::<Vec<_>>().join("\"");
-    redact_key_values(&redact_url_passwords(&quoted))
+    redact_bearer(&redact_key_values(&redact_url_passwords(&quoted)))
+}
+
+/// `Bearer <token>` as a header value (HTTP headers in DuckDB secrets,
+/// ClickHouse `url(…, headers(…))`): the token becomes `***`.
+fn redact_bearer(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut from = 0;
+    while let Some(p) = lower[from..].find("bearer ") {
+        let at = from + p;
+        from = at + 7;
+        // A header value: right after a quote, `:` or `=` (`'Bearer x'`,
+        // `Authorization: Bearer x`), not a column named bearer.
+        let before = text[..at].trim_end().bytes().last();
+        if !matches!(before, Some(b'\'' | b'"' | b':' | b'=')) {
+            continue;
+        }
+        let start = at + 7;
+        let mut end = start;
+        while end < b.len() && (b[end].is_ascii_alphanumeric() || matches!(b[end], b'-' | b'_' | b'.' | b'~' | b'+' | b'/' | b'=')) {
+            end += 1;
+        }
+        if end > start && &text[start..end] != "***" {
+            out.push_str(&text[last..start]);
+            out.push_str("***");
+            last = end;
+            from = end;
+        }
+    }
+    out.push_str(&text[last..]);
+    out
 }
 
 /// Is `name` (lower case, without a leading `@`) the name of a secret?
@@ -573,8 +631,13 @@ fn secret_name(name: &str) -> bool {
         "_token",
         "passphrase",
         "accountkey",
+        "privatekey",
+        "private_key",
+        "sharedaccesssignature",
+        "authorization",
     ];
-    SECRET_WORDS.contains(&name) || ENDS.iter().any(|e| name.ends_with(e))
+    // Azure SAS tokens (`…&sig=…`).
+    SECRET_WORDS.contains(&name) || name == "sig" || ENDS.iter().any(|e| name.ends_with(e))
 }
 
 /// `text` with the value of every `name = value` / `name: value` whose name
@@ -750,6 +813,31 @@ pub fn redact_key_values(text: &str) -> String {
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    /// Secrets the final review found kept: after a string ending in a
+    /// backslash, after an apostrophe in a dollar-quoted string, behind a
+    /// comment, in HTTP headers and SAS tokens.
+    #[test]
+    fn redacts_secrets_the_final_review_found() {
+        for (text, secret) in [
+            ("insert into t values ('C:\\'); alter role r with password 'pw1'", "pw1"),
+            ("select 'C:\\temp\\' as p; create user u identified by pw2", "pw2"),
+            ("SELECT 'a\\'; CREATE USER u IDENTIFIED BY pw39", "pw39"),
+            ("comment on table t is $$Bob's table$$; alter role r password 'pw4'", "pw4"),
+            ("create user u identified by -- c\n 'pw66'", "pw66"),
+            ("alter role r password /* c */ 'pw67'", "pw67"),
+            ("create secret h (type http, extra_http_headers map {'Authorization': 'Bearer tok5'})", "tok5"),
+            ("select * from url('http://x', headers('Authorization'='Bearer tok6'))", "tok6"),
+            ("'BlobEndpoint=https://a;SharedAccessSignature=sv=2022&sig=SIG8'", "SIG8"),
+            ("{\"privateKey\": \"pk9\"}", "pk9"),
+        ] {
+            let out = redact_text(text);
+            assert!(!out.contains(secret), "{text}\n→ {out}");
+        }
+        // Text that only looks like it stays.
+        assert_eq!(redact_text("select 'C:\\' as p, 1"), "select 'C:\\' as p, 1");
+        assert_eq!(redact_text("select bearer from t"), "select bearer from t");
+    }
 
     #[test]
     fn redacts_secrets_the_review_found_missed() {

@@ -50,7 +50,9 @@ pub fn read_only_allows(sql: &str, c: &Classification) -> bool {
         StatementKind::Session => {
             let mut w = words(sql).map(|w| w.to_ascii_lowercase());
             match w.next().as_deref() {
-                // Not `USE ROLE`: another role may write.
+                // Not `USE ROLE`: another role may write. A comment could
+                // stand where the next word is read (`use /*x*/ role …`).
+                Some("use") if has_comment(super::splitter::strip_leading_comments(sql)) => false,
                 Some("use") => !matches!(w.next().as_deref(), Some("role" | "secondary")),
                 // A comment inside could hide a quote and with it a second
                 // setting (`SET a='x' /* ' */, GLOBAL read_only = 0 /* ' */`):

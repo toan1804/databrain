@@ -48,7 +48,7 @@ pub(crate) fn skip_token(text: &str, i: usize, syntax: &SqlSyntax) -> Option<(us
         }
         b'\'' => return Some((skip_quoted(b, i, b'\'', syntax.backslash_escapes), Skipped::SingleQuoted { start: i })),
         b'"' => skip_quoted(b, i, b'"', syntax.backslash_in_double_quotes),
-        b'`' if syntax.backtick => skip_quoted(b, i, b'`', false),
+        b'`' if syntax.backtick => skip_quoted(b, i, b'`', syntax.backslash_in_backticks),
         b'[' if syntax.brackets => text[i..].find(']').map_or(n, |p| i + p + 1),
         b'$' if syntax.dollar != DollarQuotes::None => match dollar_tag(text, i) {
             Some(tag) if syntax.dollar == DollarQuotes::Tagged || tag == "$$" => {
@@ -380,6 +380,59 @@ pub fn leading_keyword(sql: &str) -> String {
 /// offset. If the cursor sits between statements, the preceding one wins.
 pub fn statement_at(spans: &[StatementSpan], cursor: usize) -> Option<&StatementSpan> {
     spans.iter().find(|s| cursor >= s.start && cursor <= s.end).or_else(|| spans.iter().rev().find(|s| s.end < cursor)).or_else(|| spans.first())
+}
+
+/// `sql` with comments (also `#` and `//` where `kind` has them) and the
+/// contents of `'…'` strings blanked out (each becomes a space): what is
+/// left is code.
+pub(crate) fn code_text(sql: &str, kind: crate::types::ConnectorKind) -> String {
+    let syntax = kind.traits().syntax;
+    let mut code = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        let line_comment = match c {
+            '-' => chars.peek() == Some(&'-'),
+            '/' => syntax.slash_comment && chars.peek() == Some(&'/'),
+            '#' => syntax.hash_comment,
+            _ => false,
+        };
+        match c {
+            _ if line_comment => {
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        break;
+                    }
+                }
+                code.push(' ');
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = ' ';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+                code.push(' ');
+            }
+            '\'' => {
+                // `''` inside is an escaped quote: the string goes on.
+                while let Some(n) = chars.next() {
+                    if n == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                code.push(' ');
+            }
+            _ => code.push(c),
+        }
+    }
+    code
 }
 
 #[cfg(test)]

@@ -74,3 +74,13 @@ mssql | select * from t rename
 mssql | select 1 copy
 mysql | select 'a\'; drop table t; select '
 mysql | select 'x\' union select user, authentication_string from mysql.user where 'a' = 'a'; -- '
+# MariaDB runs what is inside /*M! … */ (and MySQL /*! … */).
+mysql | select * from t /*M! into outfile '/tmp/x' */
+mysql | select 1 /*!50000 , sleep(1) */
+# BigQuery and ClickHouse names take backslash escapes: the DROP is outside them.
+bigquery | select 1 `a\`, `; drop table t; --`
+clickhouse | select 1 `a\`, `; drop table t; --`
+# Snowflake: a comment before ROLE, and a procedure called as a table function.
+snowflake | use /*x*/ role accountadmin
+snowflake | use -- c\n role accountadmin
+snowflake | select * from table(purge_all())

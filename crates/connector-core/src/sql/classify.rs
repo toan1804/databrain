@@ -46,6 +46,23 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
         return crate::language::classify(sql, language);
     }
     let c = classify_sql(sql, kind);
+    // MySQL and MariaDB run what is inside `/*! … */` and `/*M! … */`
+    // (MariaDB only), which the parser takes for a comment or reads only in
+    // part: `select * from t /*M! into outfile '/tmp/x' */` writes a file.
+    // What runs there can't be told, so it is asked about.
+    if kind == ConnectorKind::Mysql && (sql.contains("/*!") || sql.contains("/*M!") || sql.contains("/*m!")) {
+        return Classification { kind: c.kind.max(StatementKind::Unknown), ..c };
+    }
+    // BigQuery and ClickHouse read ``\` `` inside a quoted name as an
+    // escaped backtick; the parser ends the name there. The text as the
+    // server splits it decides: ``select 1 `a\`, `; drop table t`` is two.
+    if kind.traits().syntax.backslash_in_backticks && sql.contains("\\`") {
+        let pieces = super::split_statements(sql, kind);
+        if pieces.len() > 1 {
+            let worst = pieces.iter().map(|p| classify_sql(&p.sql, kind).kind).max().unwrap_or(StatementKind::Read);
+            return Classification { kind: c.kind.max(worst).max(StatementKind::Unknown), ..c };
+        }
+    }
     // MySQL reads `\'` inside a string as an escaped quote, unless the server
     // runs with `NO_BACKSLASH_ESCAPES` (a `sql_mode` DataBrain doesn't
     // know): then `select 'a\' into outfile ', 1 -- '` ends the string at
@@ -101,6 +118,11 @@ fn classify_sql(sql: &str, kind: ConnectorKind) -> Classification {
             // a T-SQL statement word read as an alias (`select 1 shutdown`:
             // T-SQL needs no separator), Snowflake's `->>` chaining a second
             // statement, or a function name hidden by Unicode escapes.
+            // A Snowflake procedure called as a table function: whatever
+            // else the text holds, it may write.
+            if snowflake_table_call(sql, kind) {
+                out.kind = out.kind.max(StatementKind::Unknown);
+            }
             if out.kind.is_read() && (hides_statement(&stmts, kind) || chains_statements(sql, kind) || escaped_identifier(sql)) {
                 out.kind = StatementKind::Unknown;
             }
@@ -284,6 +306,94 @@ fn chains_statements(sql: &str, kind: ConnectorKind) -> bool {
 /// (`U&"pg\005Fterminate\005Fbackend"(1)`), so the name lists above can't
 /// see it. Matched anywhere, strings included: being stricter costs a
 /// confirmation.
+/// Snowflake table functions DataBrain knows only read; any other name in
+/// `TABLE(name(…))` may be a stored procedure, which a SELECT can call that
+/// way (and which may write).
+const SNOWFLAKE_TABLE_FUNCTIONS: &[&str] = &[
+    "FLATTEN",
+    "RESULT_SCAN",
+    "GENERATOR",
+    "SPLIT_TO_TABLE",
+    "STRTOK_SPLIT_TO_TABLE",
+    "INFER_SCHEMA",
+    "VALIDATE",
+    "EXTERNAL_TABLE_FILES",
+    "EXTERNAL_TABLE_FILE_REGISTRATION_HISTORY",
+    "QUERY_HISTORY",
+    "QUERY_HISTORY_BY_SESSION",
+    "QUERY_HISTORY_BY_USER",
+    "QUERY_HISTORY_BY_WAREHOUSE",
+    "LOGIN_HISTORY",
+    "LOGIN_HISTORY_BY_USER",
+    "COPY_HISTORY",
+    "TASK_HISTORY",
+    "TASK_DEPENDENTS",
+    "WAREHOUSE_LOAD_HISTORY",
+    "WAREHOUSE_METERING_HISTORY",
+    "AUTOMATIC_CLUSTERING_HISTORY",
+    "DATABASE_STORAGE_USAGE_HISTORY",
+    "STAGE_STORAGE_USAGE_HISTORY",
+    "PIPE_USAGE_HISTORY",
+    "POLICY_REFERENCES",
+    "TAG_REFERENCES",
+    "TAG_REFERENCES_ALL_COLUMNS",
+    "REST_EVENT_HISTORY",
+    "STAGE_DIRECTORY_FILE_REGISTRATION_HISTORY",
+    "DATA_TRANSFER_HISTORY",
+    "SERVERLESS_TASK_HISTORY",
+    "MATERIALIZED_VIEW_REFRESH_HISTORY",
+    "SEARCH_OPTIMIZATION_HISTORY",
+    "REPLICATION_USAGE_HISTORY",
+    "DYNAMIC_TABLE_REFRESH_HISTORY",
+    "DYNAMIC_TABLE_GRAPH_HISTORY",
+    "DYNAMIC_TABLES",
+    "ALERT_HISTORY",
+    "GET_OBJECT_REFERENCES",
+];
+
+/// Snowflake: `TABLE(name(…))` with a name that isn't a known read-only
+/// table function or one from `INFORMATION_SCHEMA` / `SNOWFLAKE.`.
+fn snowflake_table_call(sql: &str, kind: ConnectorKind) -> bool {
+    if kind != ConnectorKind::Snowflake {
+        return false;
+    }
+    let code = super::code_text(sql, kind).to_ascii_uppercase();
+    let b = code.as_bytes();
+    let skip_ws = |mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let mut from = 0;
+    while let Some(p) = code[from..].find("TABLE") {
+        let at = from + p;
+        from = at + 5;
+        if at > 0 && (b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_' || b[at - 1] == b'.') {
+            continue;
+        }
+        let mut i = skip_ws(at + 5);
+        if b.get(i) != Some(&b'(') {
+            continue;
+        }
+        i = skip_ws(i + 1);
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'.' | b'"' | b'$')) {
+            i += 1;
+        }
+        let name = code[start..i].replace('"', "");
+        if name.is_empty() || b.get(skip_ws(i)) != Some(&b'(') {
+            continue;
+        }
+        let last = name.rsplit('.').next().unwrap_or("");
+        let system = name.contains("INFORMATION_SCHEMA.") || name.starts_with("SNOWFLAKE.");
+        if !system && !SNOWFLAKE_TABLE_FUNCTIONS.contains(&last) {
+            return true;
+        }
+    }
+    false
+}
+
 fn escaped_identifier(sql: &str) -> bool {
     sql.as_bytes().windows(3).any(|w| w[0].eq_ignore_ascii_case(&b'u') && w[1] == b'&' && w[2] == b'"')
 }
