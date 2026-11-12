@@ -1,6 +1,7 @@
 use databrain_connector_core::sql::dialect_for;
 use sqlparser::ast::{
-    Expr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
+    Distinct, Expr, GroupByExpr, Ident, NamedWindowDefinition, NamedWindowExpr, ObjectName, OrderBy, OrderByKind, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Statement,
 };
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Span;
@@ -222,15 +223,28 @@ impl<'a> Builder<'a> {
                 self.detail_since(at, format!("{kw} {f}"));
             }
         }
-        // Grouped or sorted by: used, though no value flows from it.
+        // Grouped, made distinct or sorted by: used, though no value flows from it.
         if let GroupByExpr::Expressions(exprs, _) = &sel.group_by {
             for e in exprs {
-                self.mark_refs(e, n, &sources);
+                self.mark_refs(e, n, &sources, true);
+            }
+        }
+        if let Some(Distinct::On(exprs)) = &sel.distinct {
+            for e in exprs {
+                self.mark_refs(e, n, &sources, true);
+            }
+        }
+        // `WINDOW w AS (PARTITION BY … ORDER BY …)`, used by `OVER w`.
+        for NamedWindowDefinition(_, w) in &sel.named_window {
+            if let NamedWindowExpr::WindowSpec(spec) = w {
+                for e in spec.partition_by.iter().chain(spec.order_by.iter().map(|o| &o.expr)) {
+                    self.mark_refs(e, n, &sources, false);
+                }
             }
         }
         if let Some(OrderBy { kind: OrderByKind::Expressions(exprs), .. }) = order_by {
             for o in exprs {
-                self.mark_refs(&o.expr, n, &sources);
+                self.mark_refs(&o.expr, n, &sources, false);
             }
         }
         n

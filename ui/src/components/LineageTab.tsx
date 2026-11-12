@@ -177,7 +177,12 @@ export function LineageTab({ tabId, visible }: { tabId: string; visible: boolean
   const traced = useMemo(() => (shown && focus ? trace(shown, focus.node, focus.column) : null), [shown, focus]);
   // Collapsed tables still list the traced column's path.
   // The chain is table level: its boxes don't list columns.
-  const base = useMemo(() => (shown ? layout(shown, dir, { expanded: isChain ? new Set<string>() : expanded, show: traced?.cols, usedOnly: true, full }) : null), [shown, dir, expanded, traced, isChain, full]);
+  // A column tab traces one statement's column: tables list what that statement uses.
+  const statement = columnTab && focus ? (shown?.nodes.find((n) => n.id === focus.node)?.statement ?? undefined) : undefined;
+  const base = useMemo(
+    () => (shown ? layout(shown, dir, { expanded: isChain ? new Set<string>() : expanded, show: traced?.cols, usedOnly: true, full, statement }) : null),
+    [shown, dir, expanded, traced, isChain, full, statement],
+  );
   const lay = useMemo(() => (base ? withPositions(base, pos) : null), [base, pos]);
   const appearance = useStore((s) => s.appearance);
   const colors = useMemo(themeColors, [theme, appearance]);

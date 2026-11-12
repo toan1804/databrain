@@ -84,11 +84,17 @@ impl<'a> Builder<'a> {
         None
     }
 
-    /// Columns `e` names in a `GROUP BY` / `ORDER BY` of select `n`: they
-    /// are used (see [`Column::used`]) though no value flows from them. Names
-    /// of `n`'s own outputs (`order by total`) and columns that can't be
-    /// placed are skipped quietly (the clause draws nothing to warn about).
-    pub(super) fn mark_refs(&mut self, e: &Expr, n: usize, sources: &[Source]) {
+    /// Columns `e` names in a `GROUP BY`, `ORDER BY`, `DISTINCT ON` or
+    /// window of select `n`: they are used (see [`Column::used`]) though no
+    /// value flows from them. Names of `n`'s own outputs (`order by total`)
+    /// and columns that can't be placed are skipped quietly (the clause
+    /// draws nothing to warn about). Inside a view's definition, only what
+    /// decides its rows (`decides_rows`: GROUP BY, DISTINCT ON) counts, as a
+    /// filter does; an ORDER BY there changes nothing the query sees.
+    pub(super) fn mark_refs(&mut self, e: &Expr, n: usize, sources: &[Source], decides_rows: bool) {
+        if self.in_view > 0 && !decides_rows {
+            return;
+        }
         for parts in refs(e).cols {
             let Some(col) = parts.last().map(|i| i.value.clone()) else { continue };
             if parts.len() == 1 && self.col_index(n, &col).is_some() {
@@ -110,10 +116,11 @@ impl<'a> Builder<'a> {
             match self.col_index(node, &col) {
                 Some(i) => {
                     let name = self.g.nodes[node].columns[i].name.clone();
-                    self.uses.insert((node, name));
+                    self.uses.insert((node, name, self.stmt));
                 }
                 None if self.g.nodes[node].kind == NodeKind::Table && !self.g.nodes[node].columns_known => {
-                    self.ensure_col(node, &col);
+                    let c = self.col_or_add(node, &col);
+                    self.uses.insert((node, c, self.stmt));
                 }
                 None => {}
             }

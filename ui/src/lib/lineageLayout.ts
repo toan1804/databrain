@@ -50,11 +50,18 @@ export interface Display {
   usedOnly?: boolean;
   /** With `usedOnly`: tables listing every column, used or not. */
   full?: Set<string>;
+  /** With `usedOnly`, in a script of several statements: only the columns this statement uses. */
+  statement?: number;
+}
+
+/** A column of a table is used (by `statement`, when given and the script has several). */
+function isUsed(c: LineageNode["columns"][number], statement?: number): boolean {
+  return !!c.used && (statement === undefined || !c.used_by?.length || c.used_by.includes(statement));
 }
 
 /** Columns of `node` the diagram lists when it is expanded: a table's used ones (all for other nodes). */
-export function usedColumns(node: LineageNode): LineageNode["columns"] {
-  return node.kind === "table" ? node.columns.filter((c) => c.used) : node.columns;
+export function usedColumns(node: LineageNode, statement?: number): LineageNode["columns"] {
+  return node.kind === "table" ? node.columns.filter((c) => isUsed(c, statement)) : node.columns;
 }
 
 /** An edge as drawn: ends at a shown column or the node; parallel edges merged. */
@@ -123,9 +130,9 @@ export function layout(g: LineageGraph, direction: Direction = "lr", display: Di
     const shown = (c: string) => !!display.show?.has(colKey(node.id, c));
     // In query lineage a table lists the columns the SQL uses; the others on request.
     const table = !!display.usedOnly && node.kind === "table";
-    const unused = table ? node.columns.length - usedColumns(node).length : 0;
+    const unused = table ? node.columns.length - usedColumns(node, display.statement).length : 0;
     const full = open && unused > 0 && !!display.full?.has(node.id);
-    const all = node.columns.map((c, index) => ({ name: c.name, index, used: !table || !!c.used }));
+    const all = node.columns.map((c, index) => ({ name: c.name, index, used: !table || isUsed(c, display.statement) }));
     const cols = (open ? all.filter((c) => full || c.used || shown(c.name)) : all.filter((c) => shown(c.name))).map(({ name, index }) => ({ name, index }));
     const hidden = node.columns.length - cols.length;
     const rows = cols.length + (hidden > 0 || full ? 1 : 0);

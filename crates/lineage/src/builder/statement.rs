@@ -1,6 +1,6 @@
 use sqlparser::ast::{
-    AlterTableOperation, Assignment, AssignmentTarget, Delete, Expr, FromTable, Merge, MergeAction, MergeInsertKind, MergeUpdateKind, ObjectName, ObjectType,
-    Query, SetExpr, Statement, TableFactor, TableObject, Update, UpdateTableFromKind,
+    AlterTableOperation, Assignment, AssignmentTarget, ConflictTarget, Delete, Expr, FromTable, Insert, Merge, MergeAction, MergeInsertKind, MergeUpdateKind,
+    ObjectName, ObjectType, OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject, Update, UpdateTableFromKind,
 };
 use sqlparser::tokenizer::Span;
 use std::ops::ControlFlow;
@@ -39,6 +39,7 @@ impl<'a> Builder<'a> {
                         };
                         let names: Vec<String> = ins.columns.iter().map(|c| name_parts(c).last().cloned().unwrap_or_default()).collect();
                         let id = self.write_into(name, src, &names, false, &env);
+                        self.insert_clauses(ins, name);
                         let qr = qrange(self, src);
                         self.g.statements.push(info("insert", qr, Some(id)));
                     }
@@ -117,6 +118,7 @@ impl<'a> Builder<'a> {
                 };
                 let names: Vec<String> = ins.columns.iter().map(|c| name_parts(c).last().cloned().unwrap_or_default()).collect();
                 let id = self.write_into(name, q, &names, false, &Env::default());
+                self.insert_clauses(ins, name);
                 let qr = qrange(self, q);
                 self.g.statements.push(info("insert", qr, Some(id)));
             }
@@ -231,8 +233,69 @@ impl<'a> Builder<'a> {
             self.rows(t, w, EdgeKind::Filter, &sources, &scope);
             self.detail_since(at, format!("UPDATE … WHERE {w}"));
         }
+        self.returning(t, u.returning.as_deref(), &sources);
         self.drop_self_edges(at);
         Some(self.g.nodes[t].id.clone())
+    }
+
+    /// `INSERT … ON CONFLICT … DO UPDATE SET … WHERE …` (`excluded.c` is the
+    /// row offered), MySQL `ON DUPLICATE KEY UPDATE`, and `RETURNING`: the
+    /// columns they name are used.
+    fn insert_clauses(&mut self, ins: &Insert, name: &ObjectName) {
+        let t = self.table_node(name);
+        let alias = ins
+            .table_alias
+            .as_ref()
+            .map(|a| a.alias.value.to_lowercase())
+            .unwrap_or_else(|| name_parts(name).last().cloned().unwrap_or_default().to_lowercase());
+        let sources = vec![Source { alias, node: t }, Source { alias: "excluded".into(), node: t }];
+        let at = self.g.edges.len();
+        let (assignments, selection, target) = match &ins.on {
+            Some(OnInsert::OnConflict(c)) => {
+                let target = match &c.conflict_target {
+                    Some(ConflictTarget::Columns(cols)) => cols.clone(),
+                    _ => vec![],
+                };
+                match &c.action {
+                    OnConflictAction::DoUpdate(u) => (&u.assignments[..], u.selection.as_ref(), target),
+                    _ => (&[][..], None, target),
+                }
+            }
+            Some(OnInsert::DuplicateKeyUpdate(a)) => (&a[..], None, vec![]),
+            _ => (&[][..], None, vec![]),
+        };
+        for c in &target {
+            self.ensure_col(t, &c.value);
+        }
+        let scope = Env { ctes: vec![], outer: sources.clone() };
+        for a in assignments {
+            self.assign(t, a, &sources, &scope);
+        }
+        if let Some(w) = selection {
+            let at = self.g.edges.len();
+            self.rows(t, w, EdgeKind::Filter, &sources, &scope);
+            self.detail_since(at, format!("ON CONFLICT … WHERE {w}"));
+        }
+        self.returning(t, ins.returning.as_deref(), &sources);
+        self.drop_self_edges(at);
+    }
+
+    /// The columns a `RETURNING` list names (all of them for `*`) are used.
+    fn returning(&mut self, t: usize, items: Option<&[SelectItem]>, sources: &[Source]) {
+        for item in items.unwrap_or_default() {
+            let e = match item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } | SelectItem::ExprWithAliases { expr: e, .. } => e,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                    for c in self.g.nodes[t].columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>() {
+                        self.ensure_col(t, &c);
+                    }
+                    continue;
+                }
+            };
+            for parts in refs(e).cols {
+                self.resolve(sources, &[], &parts);
+            }
+        }
     }
 
     /// `SET c = e` (or `(a, b) = (…)`) of an UPDATE or MERGE into `t`; a
@@ -333,6 +396,7 @@ impl<'a> Builder<'a> {
             self.rows(t, w, EdgeKind::Filter, &sources, &scope);
             self.detail_since(at, format!("DELETE … WHERE {w}"));
         }
+        self.returning(t, d.returning.as_deref(), &sources);
         self.drop_self_edges(at);
         Some(self.g.nodes[t].id.clone())
     }

@@ -108,7 +108,8 @@ struct Builder<'a> {
     /// Counter of conditions seen (groups composite keys).
     clause: usize,
     /// Columns the SQL names itself (node, column): where [`Builder::mark_used`] starts.
-    uses: std::collections::HashSet<(usize, String)>,
+    /// (node, column, statement).
+    uses: std::collections::HashSet<(usize, String, usize)>,
 }
 
 impl<'a> Builder<'a> {
@@ -215,7 +216,7 @@ impl<'a> Builder<'a> {
     fn ensure_col(&mut self, node: usize, name: &str) -> String {
         let c = self.col_or_add(node, name);
         if self.in_view == 0 {
-            self.uses.insert((node, c.clone()));
+            self.uses.insert((node, c.clone(), self.stmt));
         }
         c
     }
@@ -239,7 +240,7 @@ impl<'a> Builder<'a> {
             n = format!("{name}_{k}");
             k += 1;
         }
-        self.g.nodes[node].columns.push(Column { name: n.clone(), span, expr, used: false });
+        self.g.nodes[node].columns.push(Column { name: n.clone(), span, expr, used: false, used_by: vec![] });
         n
     }
 
@@ -266,7 +267,8 @@ impl<'a> Builder<'a> {
         self.g.nodes[t].columns = names.iter().map(|n| Column::named(n.clone())).collect();
         self.g.nodes[t].columns_known = true;
         self.created.insert(t);
-        self.uses.extend(names.iter().map(|n| (t, n.clone())));
+        let stmt = self.stmt;
+        self.uses.extend(names.iter().map(|n| (t, n.clone(), stmt)));
     }
 
     /// Set [`Column::used`] on table and view columns: those the SQL names
@@ -276,38 +278,47 @@ impl<'a> Builder<'a> {
     /// columns only when they are all used further on, and a view's
     /// definition uses only what the columns read from the view need).
     /// Join and filter inputs always count: they decide the rows.
+    /// Each column also lists the statements that use it ([`Column::used_by`]):
+    /// those naming it, and those whose results or writes it feeds.
     fn mark_used(&mut self) {
-        use std::collections::HashSet;
+        use std::collections::{BTreeSet, HashSet};
         let index: HashMap<&str, usize> = self.g.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
         let mut into: HashMap<(usize, &str), Vec<(usize, &str)>> = HashMap::new();
-        let mut todo: Vec<(usize, String)> = self.uses.iter().cloned().collect();
+        // (node, column, the statement it is used for).
+        let mut todo: Vec<(usize, String, usize)> = self.uses.iter().cloned().collect();
         for e in &self.g.edges {
             let (Some(&f), Some(&t)) = (index.get(e.from.as_str()), index.get(e.to.as_str())) else { continue };
             let Some(fc) = e.from_column.as_deref() else { continue };
             match e.to_column.as_deref() {
                 Some(tc) => into.entry((t, tc)).or_default().push((f, fc)),
-                None => todo.push((f, fc.to_string())),
+                None => todo.push((f, fc.to_string(), e.statement.unwrap_or(0))),
             }
         }
         for (i, n) in self.g.nodes.iter().enumerate() {
             if n.kind == NodeKind::Result {
-                todo.extend(n.columns.iter().map(|c| (i, c.name.clone())));
+                todo.extend(n.columns.iter().map(|c| (i, c.name.clone(), n.statement.unwrap_or(0))));
             }
         }
-        let mut seen: HashSet<(usize, String)> = HashSet::new();
+        let mut seen: HashSet<(usize, String, usize)> = HashSet::new();
+        let mut by: HashMap<(usize, String), BTreeSet<usize>> = HashMap::new();
         while let Some(k) = todo.pop() {
             if seen.contains(&k) {
                 continue;
             }
             if let Some(from) = into.get(&(k.0, k.1.as_str())) {
-                todo.extend(from.iter().map(|&(f, c)| (f, c.to_string())));
+                todo.extend(from.iter().map(|&(f, c)| (f, c.to_string(), k.2)));
             }
+            by.entry((k.0, k.1.clone())).or_default().insert(k.2);
             seen.insert(k);
         }
+        let several = self.g.statements.len() > 1;
         for (i, n) in self.g.nodes.iter_mut().enumerate() {
             if n.kind == NodeKind::Table {
                 for c in &mut n.columns {
-                    c.used = seen.contains(&(i, c.name.clone()));
+                    let stmts = by.get(&(i, c.name.clone()));
+                    c.used = stmts.is_some();
+                    // Only scripts of several statements need to tell them apart.
+                    c.used_by = if several { stmts.map(|s| s.iter().copied().collect()).unwrap_or_default() } else { vec![] };
                 }
             }
         }

@@ -73,6 +73,19 @@ describe("lineage layout", () => {
     expect(layout(g, "lr", { expanded: new Set(), show: t.cols }).byId.get("n0")!.columns.map((c) => c.name)).toEqual(["id", "status"]);
   });
 
+  it("with a statement, a table of a script lists only what that statement uses", () => {
+    const script: LineageGraph = {
+      ...g,
+      nodes: [{ ...g.nodes[0], columns: [{ name: "id", used: true, used_by: [1] }, { name: "amount", used: true, used_by: [0, 1] }, { name: "status", used: true, used_by: [0] }] }],
+      edges: [],
+    };
+    const cols = (statement?: number) => layout(script, "lr", { ...lin, statement }).byId.get("n0")!.columns.map((c) => c.name);
+    expect(cols()).toEqual(["id", "amount", "status"]);
+    expect(cols(0)).toEqual(["amount", "status"]);
+    expect(cols(1)).toEqual(["id", "amount"]);
+    expect(layout(script, "lr", { ...lin, statement: 0 }).byId.get("n0")!.hidden).toBe(1);
+  });
+
   it("select *: every column of the table is used, so every column is listed", () => {
     const star: LineageGraph = {
       ...g,

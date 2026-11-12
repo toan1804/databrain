@@ -17,4 +17,9 @@ expr?: string,
  * diagram lists only these; the others are known but not needed. Not
  * set on other nodes (all their columns are the query's own).
  */
-used?: boolean, };
+used?: boolean, 
+/**
+ * In a script of several statements: the statements (0-based) that use
+ * the column, so a diagram of one statement lists only its own.
+ */
+used_by?: Array<number>, };

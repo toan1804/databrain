@@ -45,11 +45,16 @@ pub struct Column {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[ts(as = "Option<bool>", optional)]
     pub used: bool,
+    /// In a script of several statements: the statements (0-based) that use
+    /// the column, so a diagram of one statement lists only its own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<usize>>", optional)]
+    pub used_by: Vec<usize>,
 }
 
 impl Column {
     pub(crate) fn named(name: impl Into<String>) -> Self {
-        Column { name: name.into(), span: None, expr: None, used: false }
+        Column { name: name.into(), span: None, expr: None, used: false, used_by: vec![] }
     }
 }
 

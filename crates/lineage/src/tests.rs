@@ -490,3 +490,64 @@ fn written_tables_and_views_mark_what_they_use() {
     assert_eq!(used(&g, "sales.orders"), vec!["id", "customer_id", "amount"]);
     assert_eq!(used(&g, "sales.customers"), vec!["id", "name"]);
 }
+
+#[test]
+fn clauses_that_name_columns_without_a_value_flowing_mark_them_used() {
+    // A named window.
+    let g = run("select sum(amount) over w from orders window w as (partition by status order by created_at)");
+    assert_eq!(used(&g, "sales.orders"), vec!["amount", "status", "created_at"]);
+    // DISTINCT ON a column not in ORDER BY.
+    let g = run("select distinct on (customer_id) amount from orders");
+    assert_eq!(used(&g, "sales.orders"), vec!["customer_id", "amount"]);
+    // RETURNING of UPDATE, DELETE and INSERT.
+    let g = run("update orders set amount = 0 where id = 1 returning customer_id");
+    assert_eq!(used(&g, "sales.orders"), vec!["id", "customer_id", "amount"]);
+    let g = run("delete from orders where id = 1 returning status");
+    assert_eq!(used(&g, "sales.orders"), vec!["id", "status"]);
+    let g = run("update orders set amount = 0 where id = 1 returning *");
+    assert_eq!(used(&g, "sales.orders"), vec!["id", "customer_id", "amount", "status", "created_at"]);
+    // INSERT … ON CONFLICT … DO UPDATE … WHERE, with `excluded`.
+    let g = run("insert into orders as o (id, amount) select id, 1 from customers \
+         on conflict (id) do update set status = excluded.status where o.created_at < now() returning customer_id");
+    assert_eq!(used(&g, "sales.orders"), vec!["id", "customer_id", "amount", "status", "created_at"]);
+    // A view's ORDER BY doesn't make a column used; its GROUP BY decides rows, so it does.
+    let views = |parts: &[String]| -> Option<CatalogTable> {
+        let name = parts.last()?.to_lowercase();
+        let v = |sql: &str, cols: &[&str]| CatalogTable {
+            name: format!("sales.{name}"),
+            columns: cols.iter().map(|c| c.to_string()).collect(),
+            view_sql: Some(sql.into()),
+        };
+        match name.as_str() {
+            "v_sorted" => Some(v("create view v_sorted as select id, name from customers order by country", &["id", "name"])),
+            "v_grouped" => Some(v(
+                "create view v_grouped as select country, count(*) n from orders o join customers c on c.id = o.customer_id group by status, country",
+                &["country", "n"],
+            )),
+            _ => cat(parts),
+        }
+    };
+    let g = analyze("select name from v_sorted", K::Postgres, &views);
+    assert_eq!(used(&g, "sales.customers"), vec!["name"]);
+    let g = analyze("select n from v_grouped", K::Postgres, &views);
+    assert_eq!(used(&g, "sales.orders"), vec!["customer_id", "status"]);
+}
+
+/// In a script of several statements, each column lists the statements
+/// that use it, so the diagram of one statement shows only its own.
+#[test]
+fn columns_list_the_statements_that_use_them() {
+    let g = run("select name from customers; select country from customers where id = 1");
+    let c = g.nodes.iter().find(|n| n.name == "sales.customers").unwrap();
+    let by = |col: &str| c.columns.iter().find(|x| x.name == col).unwrap().used_by.clone();
+    assert_eq!(by("name"), vec![0]);
+    assert_eq!(by("country"), vec![1]);
+    assert_eq!(by("id"), vec![1]);
+    // What a table written by one statement feeds into another counts for both.
+    let g = run("insert into customers (name) select status from orders; select name from customers");
+    let o = g.nodes.iter().find(|n| n.name == "sales.orders").unwrap();
+    assert_eq!(o.columns.iter().find(|x| x.name == "status").unwrap().used_by, vec![0, 1]);
+    // One statement: no list.
+    let g = run("select name from customers");
+    assert!(g.nodes.iter().flat_map(|n| &n.columns).all(|c| c.used_by.is_empty()));
+}
