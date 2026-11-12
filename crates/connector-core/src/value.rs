@@ -476,21 +476,19 @@ fn split_utc_offset(s: &str) -> Option<(&str, i64)> {
     // A sign after the time (past the date's own `-`s).
     let Some(at) = s.get(11..).and_then(|t| t.rfind(['+', '-'])).map(|i| i + 11) else { return Some((s, 0)) };
     let (dt, off) = (s[..at].trim_end(), &s[at + 1..]);
-    if !off.bytes().all(|c| c.is_ascii_digit() || c == b':') || off.is_empty() {
+    // Exactly hh, hhmm, hh:mm or hh:mm:ss (Postgres prints old local mean
+    // times with seconds: `+07:06:40`).
+    let shape: String = off.bytes().map(|b| if b.is_ascii_digit() { 'd' } else { b as char }).collect();
+    if !matches!(shape.as_str(), "dd" | "dddd" | "dd:dd" | "dd:dd:dd") {
         return None;
     }
-    let parts: Vec<&str> = if off.contains(':') {
-        off.split(':').collect()
-    } else if off.len() == 4 {
-        vec![&off[..2], &off[2..]]
-    } else {
-        vec![off]
-    };
-    if parts.len() > 3 || parts.iter().any(|p| p.is_empty() || p.len() > 2) {
+    let d: Vec<i64> = off.bytes().filter(u8::is_ascii_digit).map(|b| i64::from(b - b'0')).collect();
+    let two = |i: usize| d.get(i).zip(d.get(i + 1)).map_or(0, |(a, b)| a * 10 + b);
+    let (h, m, sec) = (two(0), two(2), two(4));
+    if h > 18 || m >= 60 || sec >= 60 {
         return None;
     }
-    let n = |i: usize| parts.get(i).map_or(Some(0), |p| p.parse::<i64>().ok());
-    let secs = (n(0)? * 60 + n(1)?) * 60 + n(2)?;
+    let secs = (h * 60 + m) * 60 + sec;
     let sign = if s.as_bytes()[at] == b'-' { -1 } else { 1 };
     Some((dt, sign * secs * 1_000_000))
 }
@@ -559,7 +557,16 @@ mod tests {
         assert_eq!(utc("2024-01-02 13:04:05+01:00:00"), utc("2024-01-02 12:04:05"));
         assert_eq!(utc("2024-01-02"), Some(days_from_civil(2024, 1, 2) * MICROS_PER_DAY));
         // Not read as something else.
-        for bad in ["2024-01-02 13:04:05.25xyz", "2024-01-02 13:04:05+2:x", "2024-01-02 13:04:05.", "2024-01-02 13:04:05+123:00"] {
+        for bad in [
+            "2024-01-02 13:04:05.25xyz",
+            "2024-01-02 13:04:05+2:x",
+            "2024-01-02 13:04:05.",
+            "2024-01-02 13:04:05+123:00",
+            "2024-01-02 13:04:05+0:7",
+            "2024-01-02 13:04:05+1:2:34",
+            "2024-01-02 13:04:05+19",
+            "2024-01-02 13:04:05+05:60",
+        ] {
             assert_eq!(utc(bad), None, "{bad}");
         }
         assert_eq!(parse_time("13:04:05.123456789"), parse_time("13:04:05.123456"), "nanoseconds are cut to micros");
