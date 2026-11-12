@@ -4,6 +4,19 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Fixed
+
+- Generate test data: unique values are compared ignoring case and trailing spaces, as case-insensitive unique indexes do (MySQL `_ci`, SQL Server), so `Ann@x.com` and `ann@x.com` no longer collide on load. Many rows from a few AI rows stay fast: numbered variants go on from the last one instead of trying 2, 3, 4… again (100,000 rows no longer block).
+- Generate test data: parent keys are read in key order, so the same seed picks the same foreign key values on another run; date-times printed with an offset (`2024-05-01 10:00:00+07`, Postgres `timestamptz`) are read correctly, so new keys continue after the largest and foreign keys get their parent's values.
+- Generate test data: a primary key of several columns whose first column is a foreign key (`order_id, line_no`) counts up the other column, so rows don't repeat a key; a key of foreign keys only says that rows may repeat.
+- Generate test data: computed columns (SQL Server `AS (…)`, `GENERATED ALWAYS AS (…)`, ClickHouse `MATERIALIZED` / `ALIAS`, `rowversion`) can't be ticked, since inserting into them always fails.
+- Generate test data: decimals wider than 38 digits (Postgres `numeric(60,2)`, BigQuery `BIGNUMERIC(50,20)`, ClickHouse `Decimal256`) take patterns and keys; ClickHouse `DecimalN(S)` columns get decimals with that scale; Oracle `NUMBER(10,-2)` keys are refused with the reason (the database rounds them together).
+- Reading the next value of an Oracle (`seq.nextval`) or SQL Server (`NEXT VALUE FOR seq`) sequence is no longer treated as a read: it asks first on production connections and is refused on read-only ones, as Postgres `nextval()` already was.
+- Passwords in connection URLs are now also hidden in history, logs and AI transcripts when they contain `)`, `(`, quotes or `<`, or are digits followed by `?` (`postgres://u:1234?a=b@h/db`).
+- AI usage counts inline completions cancelled by typing and test-data batches stopped half way (estimated from the text sent and received, as the provider bills them); they counted 0.
+- The knowledge index hint above the chat reads the index state again when reading it fails, instead of staying hidden until the index changes.
+- Lineage lists columns used only in a named `WINDOW`, `DISTINCT ON`, `RETURNING`, or `INSERT … ON CONFLICT … DO UPDATE … WHERE` as used, not under "+N unused columns"; a view's `ORDER BY` no longer counts its columns as used; and the lineage of one column of a script lists, in each table, the columns its own statement uses.
+
 ## 0.3.5 - 2026-11-12
 
 ### Added
