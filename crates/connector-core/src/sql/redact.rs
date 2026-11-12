@@ -213,7 +213,10 @@ fn dollar_literal(sql: &str, i: usize) -> Option<(usize, usize, usize)> {
 /// `u:/pw@h`), or a user name with `@` in it (`me@x.com:pw@h`), is hidden
 /// whole. `host:port` (digits after the colon) is a port only when no `@`
 /// follows it, or the `@` is in a query parameter (`h:5432/db?x=a@b`). A
-/// password with a space in it (`u:pa ss@h`) runs to the next `@` on the line.
+/// password with a space in it (`u:pa ss@h`) runs to the next `@` on the line;
+/// one with a quote or bracket in it (`u:pa)ss@h`) to the last `@` of the word.
+/// Digits then `?` are a password when a host and path follow the `@`
+/// (`u:1234?a=b@h/db`), a port and query otherwise (`h:5432?mail=a@b.com`).
 /// When in doubt the text is hidden: `https://h:8443/a@b` loses `8443/a`.
 pub fn redact_url_passwords(text: &str) -> String {
     let stop = |c: char| matches!(c, '\'' | '"' | '`' | '<' | '>' | '(' | ')');
@@ -243,7 +246,15 @@ pub fn redact_url_passwords(text: &str) -> String {
         let params = if jdbc { &['?', ';'][..] } else { &['?'][..] };
         let at = match after.find('@') {
             // `host:5432/db?x=a@b`, `host:1433;user=me@corp`: the `@` is in a parameter.
-            Some(first) if port && after[..first].find(params).is_some_and(|q| after[q..first].contains('=')) => None,
+            // But digits then `?` and a host and path after the `@`
+            // (`u:1234?a=b@h/db`) read as a password: hidden.
+            Some(first)
+                if port
+                    && after[..first].find(params).is_some_and(|q| after[q..first].contains('='))
+                    && !(tail.starts_with('?') && after[first..].contains('/')) =>
+            {
+                None
+            }
             // The password ends at the last `@`, except one in the query string
             // after a host and path (`u:pw@h/db?x=1@2` keeps its host); when
             // what follows isn't a host and path (`u:a@b?c@h`), the whole is hidden.
@@ -257,6 +268,16 @@ pub fn redact_url_passwords(text: &str) -> String {
             }
             // `u:pa ss@h`: a password with a space in it, up to the next `@`
             // on the line (the last `@` of that word), not into another URL.
+            // `u:pa)ss@h`, `'…://u:pa'ss@h/db'`: the URL stopped at a quote
+            // or bracket in the password; it runs to the last `@` of the word.
+            None if !port && rest[token..].starts_with(stop) && {
+                let word = rest[token..].find(char::is_whitespace).map_or(rest.len(), |w| token + w);
+                !rest[token..word].contains("://") && rest[token..word].contains('@')
+            } =>
+            {
+                let word = rest[token..].find(char::is_whitespace).map_or(rest.len(), |w| token + w);
+                rest[token..word].rfind('@').map(|a| token + a)
+            }
             None if !port => {
                 let line = rest.find(|c: char| stop(c) || matches!(c, '\n' | '\r')).unwrap_or(rest.len());
                 let more = &rest[token..line];
@@ -614,6 +635,14 @@ mod redaction_tests {
             ("postgres://u:12345, pass@h", "postgres://u:***@h"),
             ("postgres://u:1234. abc@h/db", "postgres://u:***@h/db"),
             ("postgres://u:1234,@h", "postgres://u:***@h"),
+            // Digits then `?` and a host and path after the `@`.
+            ("postgres://u:1234?a=b@h/db", "postgres://u:***@h/db"),
+            // A quote or bracket in the password.
+            ("postgres://u:pa)ss@h/db", "postgres://u:***@h/db"),
+            ("postgres://u:pa(ss@h/db", "postgres://u:***@h/db"),
+            ("ATTACH 'postgres://u:pa'ss@h/db' AS p", "ATTACH 'postgres://u:***@h/db' AS p"),
+            ("postgres://u:p\"w@h/db", "postgres://u:***@h/db"),
+            ("postgres://u:a<b>c@h/db", "postgres://u:***@h/db"),
             (
                 "connect to mongodb+srv://u:p%40ss@cluster0.x.net/?retryWrites=true please",
                 "connect to mongodb+srv://u:***@cluster0.x.net/?retryWrites=true please",
@@ -673,6 +702,9 @@ mod redaction_tests {
             "two: a://x@h:1 and b://y@k:2/d",
             "x://h:é",
             "x://[::1",
+            "postgres://h:5432?mail=a@b.com",
+            "f('x://u:a', 'b@c')",
+            "('x://u:a') then b://c@d",
         ] {
             assert_eq!(redact_url_passwords(keep), keep);
         }

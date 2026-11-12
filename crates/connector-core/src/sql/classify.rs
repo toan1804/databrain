@@ -57,7 +57,7 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
             }
             out.kind = check_control(out.kind, &keyword, sql);
             // `select pg_terminate_backend(…)` acts like `KILL`.
-            if out.kind < StatementKind::Dml && stmts.iter().any(calls_acting_function) {
+            if out.kind < StatementKind::Dml && (stmts.iter().any(calls_acting_function) || next_value_for(sql)) {
                 out.kind = StatementKind::Other;
             }
             out
@@ -430,6 +430,8 @@ fn calls_acting_function(s: &Statement) -> bool {
         fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
             match e {
                 Expr::Function(f) => acts(&f.name),
+                // Oracle `orders_seq.nextval` advances the sequence.
+                Expr::CompoundIdentifier(parts) if parts.last().is_some_and(|p| p.value.eq_ignore_ascii_case("nextval")) => ControlFlow::Break(()),
                 _ => ControlFlow::Continue(()),
             }
         }
@@ -445,7 +447,15 @@ fn calls_acting_function(s: &Statement) -> bool {
 
 /// Unparsed SQL naming an acting function (`$` kept for Snowflake's).
 fn names_acting_function(sql: &str) -> bool {
-    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).any(is_acting_function)
+    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).any(is_acting_function) || next_value_for(sql)
+}
+
+/// SQL Server / standard `NEXT VALUE FOR seq`, which advances the sequence
+/// (sqlparser reads it as columns and aliases). Also inside a string: a
+/// read is never claimed when unsure.
+fn next_value_for(sql: &str) -> bool {
+    let w: Vec<&str> = words(sql).collect();
+    w.windows(3).any(|w| w[0].eq_ignore_ascii_case("next") && w[1].eq_ignore_ascii_case("value") && w[2].eq_ignore_ascii_case("for"))
 }
 
 fn contains_dml_word(sql: &str) -> bool {
@@ -548,9 +558,18 @@ mod tests {
             (Snowflake, "select system$global_account_set_parameter('acct', 'ENABLE_X', 'true')"),
             (Snowflake, "select system$some_function_added_next_year()"),
             (Postgres, "select lowrite(lo_open(42, 131072), 'x')"),
+            // Sequences: reading the next value advances them.
+            (Oracle, "select orders_seq.nextval from dual"),
+            (Oracle, "SELECT app.orders_seq.NEXTVAL FROM dual"),
         ] {
             let c = classify(sql, kind);
             assert_eq!(c.kind, StatementKind::Other, "{sql}");
+            assert!(!crate::sql::read_only_allows(sql, &c), "{sql}");
+        }
+        // SQL Server's `NEXT VALUE FOR` (Other, or Unknown where it doesn't parse).
+        for sql in ["select next value for dbo.orders_seq", "SELECT NEXT VALUE FOR orders_seq AS id", "select next value for s, x from t"] {
+            let c = classify(sql, Mssql);
+            assert!(matches!(c.kind, StatementKind::Other | StatementKind::Unknown), "{sql}: {:?}", c.kind);
             assert!(!crate::sql::read_only_allows(sql, &c), "{sql}");
         }
         // Unparsed SQL naming one is asked about.
@@ -564,6 +583,9 @@ mod tests {
             (Postgres, "select pid, state from pg_stat_activity"),
             (Postgres, "select * from pg_stat_statements"),
             (Postgres, "select currval('orders_id_seq')"),
+            (Oracle, "select orders_seq.currval from dual"),
+            (Oracle, "select t.nextval_at from t"),
+            (Mssql, "select next_value, value from t"),
             (Postgres, "select terminate from t"),
             (Postgres, "select pg_terminate_backend from t"),
             (Snowflake, "select system$clustering_information('t')"),
