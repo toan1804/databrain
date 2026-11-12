@@ -21,7 +21,7 @@ pub use params::{ParamSpan, ParamValue, find_parameters, quote_string, render_pa
 pub use read_only::{read_only_allows, unknown_functions};
 pub use redact::{redact_key_values, redact_secrets, redact_text, redact_url_passwords};
 pub use splitter::{StatementSpan, leading_keyword, split_statements, split_with, statement_at};
-pub(crate) use splitter::{skip_token, words};
+pub(crate) use splitter::{skip_token, strip_leading_comments, words};
 
 pub fn dialect_for(kind: ConnectorKind) -> Box<dyn Dialect> {
     dialect_of(kind.traits().parser)

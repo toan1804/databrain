@@ -175,7 +175,9 @@ fn is_number(t: &str) -> bool {
 /// server reads backslashes as escapes (MySQL `NO_BACKSLASH_ESCAPES`), the
 /// typed text is quoted as a value instead.
 fn is_string_literal(t: &str, kind: ConnectorKind) -> bool {
-    if kind.traits().syntax.backslash_escapes && t.contains('\\') {
+    // Where `\'` may escape (MySQL, or a Postgres/DuckDB `E'…'`), where the
+    // literal ends depends on it: quoted as a value instead.
+    if t.contains('\\') && (kind.traits().syntax.backslash_escapes || t.starts_with(['E', 'e'])) {
         return false;
     }
     let b = t.as_bytes();
@@ -310,6 +312,15 @@ mod param_tests {
                 assert!(r.starts_with('\'') && r.ends_with('\''), "{k:?}: {v} → {r}");
             }
         }
+        // A Postgres/DuckDB E'…' value with a backslash: where it ends depends
+        // on the escape, so it is quoted, not kept as typed.
+        for k in [K::Postgres, K::Duckdb] {
+            let v = "E'\\'' or 1=1 --'";
+            let r = render_param(&ParamValue { value: v.into(), raw: false }, k).unwrap();
+            assert_ne!(r, v, "{k:?}");
+            assert_eq!(crate::sql::classify(&format!("select * from t where name = {r}"), k).kind, crate::sql::StatementKind::Read);
+        }
+        assert_eq!(render_param(&ParamValue { value: "E'tab'".into(), raw: false }, K::Postgres).as_deref(), Some("E'tab'"));
         // Complete ones are kept.
         assert_eq!(render_param(&ParamValue { value: "'it''s'".into(), raw: false }, K::Postgres).as_deref(), Some("'it''s'"));
         assert_eq!(render_param(&ParamValue { value: "''".into(), raw: false }, K::Postgres).as_deref(), Some("''"));

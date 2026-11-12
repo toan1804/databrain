@@ -41,7 +41,17 @@ impl ConnState {
             "START" => has(&["TRANSACTION"]),
             // SQL Server: BEGIN TRAN; BEGIN … END / BEGIN TRY blocks only when they mention one.
             "BEGIN" if mssql => has(&["TRAN", "TRANSACTION"]),
-            "BEGIN" => true,
+            // Not a block (`BEGIN … END;`, Snowflake Scripting): only
+            // `BEGIN`, `BEGIN;` and BEGIN followed by transaction words.
+            "BEGIN" => {
+                let second = words(crate::sql::strip_leading_comments(sql)).nth(1).map(|w| w.to_ascii_uppercase());
+                matches!(
+                    second.as_deref(),
+                    None | Some(
+                        "TRANSACTION" | "TRAN" | "WORK" | "NAME" | "ISOLATION" | "READ" | "NOT" | "DEFERRABLE" | "DEFERRED" | "IMMEDIATE" | "EXCLUSIVE"
+                    )
+                )
+            }
             _ => mssql && has(&["TRAN", "TRANSACTION"]) && !matches!(kw.as_str(), "COMMIT" | "ROLLBACK"),
         };
         if begins {
@@ -126,6 +136,11 @@ mod tests {
         assert!(after(Snowflake, &["begin transaction", "select 1"]).1);
         assert!(!after(Snowflake, &["begin", "commit"]).1);
         assert!(!after(Snowflake, &["start transaction", "rollback"]).1);
+        // A Snowflake Scripting block is not a transaction.
+        assert!(!after(Snowflake, &["BEGIN\n  LET x := 1;\n  RETURN x;\nEND"]).1);
+        assert!(!after(Snowflake, &["begin\n  insert into t values (1);\nend"]).1);
+        assert!(after(Postgres, &["begin isolation level serializable"]).1);
+        assert!(after(Sqlite, &["begin immediate"]).1);
     }
 
     #[test]

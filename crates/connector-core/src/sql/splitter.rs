@@ -36,7 +36,7 @@ pub(crate) fn skip_token(text: &str, i: usize, syntax: &SqlSyntax) -> Option<(us
     let n = b.len();
     let c = *b.get(i)?;
     let next = b.get(i + 1).copied();
-    let ident = |k: usize| k > 0 && (b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_' || b[k - 1] == b'$' || b[k - 1] == b'.');
+    let ident = |k: usize| k > 0 && (b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_' || b[k - 1] == b'$' || b[k - 1] == b'.' || b[k - 1] >= 0x80);
     let end = match c {
         b'-' if next == Some(b'-') => return Some((skip_line(b, i), Skipped::Comment)),
         b'#' if syntax.hash_comment => return Some((skip_line(b, i), Skipped::Comment)),
@@ -64,6 +64,13 @@ pub(crate) fn skip_token(text: &str, i: usize, syntax: &SqlSyntax) -> Option<(us
             let q = if matches!(c, b'N' | b'n') && matches!(next, Some(b'q' | b'Q')) { i + 1 } else { i };
             if !matches!(b[q], b'q' | b'Q') || b.get(q + 1) != Some(&b'\'') || q + 2 >= n {
                 return None;
+            }
+            // A multibyte delimiter: up to the same character and a quote.
+            if b[q + 2] >= 0x80 {
+                let d = text.get(q + 2..)?.chars().next()?;
+                let body = q + 2 + d.len_utf8();
+                let close = format!("{d}'");
+                return Some((text[body..].find(&close).map_or(n, |k| body + k + close.len()), Skipped::Quoted));
             }
             let close = match b[q + 2] {
                 b'[' => b']',
@@ -137,7 +144,7 @@ const END_OF_UNCOUNTED: &[&str] = &["IF", "LOOP", "WHILE", "REPEAT", "FOR"];
 /// The next word after byte `i` (skipping spaces), upper-cased; empty when
 /// something else (`;`, `(`) comes first.
 fn next_word(text: &str, i: usize) -> String {
-    let rest = text[i..].trim_start();
+    let rest = strip_leading_comments(&text[i..]);
     rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("").to_ascii_uppercase()
 }
 
@@ -285,7 +292,7 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
                 if syntax.block_end == BlockEnd::EndWord {
                     if w.eq_ignore_ascii_case("BEGIN") {
                         let next = next_word(text, j);
-                        let opens = !BEGIN_NOT_BLOCK.contains(&next.as_str()) && !text[j..].trim_start().starts_with(';');
+                        let opens = !BEGIN_NOT_BLOCK.contains(&next.as_str()) && !strip_leading_comments(&text[j..]).starts_with(';');
                         depth += opens as i32;
                         opened |= opens;
                     } else if w.eq_ignore_ascii_case("CASE") {
@@ -433,6 +440,9 @@ mod tests {
         assert_eq!(n("begin;\ninsert into t values (1);\ncommit;", sf).len(), 3, "a transaction, not a block");
         assert_eq!(n("begin transaction;\ninsert into t values (1);\ncommit;", sf).len(), 3);
         assert_eq!(n("select 1; select case when a then 1 end from t; select 3", sf).len(), 3);
+        assert_eq!(n("begin -- start\n;\ninsert into t values (1);\ncommit;", sf).len(), 3, "a comment after BEGIN");
+        assert_eq!(n("select q'é;xé' from dual; select 1 from dual", ConnectorKind::Oracle).len(), 2, "a multibyte delimiter");
+        assert_eq!(n("select éE'a\\'; select 2", ConnectorKind::Postgres).len(), 2, "E after a non-ASCII name character is not a prefix");
     }
 
     #[test]

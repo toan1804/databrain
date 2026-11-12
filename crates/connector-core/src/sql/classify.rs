@@ -45,10 +45,44 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
     if !language.is_sql() {
         return crate::language::classify(sql, language);
     }
-    let keyword = leading_keyword(sql);
-    if splits_without_backslash_escapes(sql, kind) {
-        return Classification { kind: StatementKind::Unknown, missing_where: false, keyword };
+    let c = classify_sql(sql, kind);
+    // MySQL reads `\'` inside a string as an escaped quote, unless the server
+    // runs with `NO_BACKSLASH_ESCAPES` (a `sql_mode` DataBrain doesn't
+    // know): then `select 'a\' into outfile ', 1 -- '` ends the string at
+    // `\'` and writes a file, and `select 'a\'; drop table t; -- '` runs a
+    // DROP. Such a server reads `'a\'` as the parser reads `'a\\'`, so the
+    // text is also classified with every backslash doubled, and the
+    // stricter reading wins.
+    if kind == ConnectorKind::Mysql && sql.contains('\\') {
+        // Each statement as DataBrain splits the text, read the other way.
+        let other = super::split_statements(sql, kind).iter().map(|p| no_backslash_kind(&p.sql, kind)).max().unwrap_or(StatementKind::Read);
+        return Classification { kind: c.kind.max(other), ..c };
     }
+    c
+}
+
+/// How a MySQL server with `NO_BACKSLASH_ESCAPES` reads one statement
+/// (`Read` when it would reject it and run nothing).
+fn no_backslash_kind(sql: &str, kind: ConnectorKind) -> StatementKind {
+    if !sql.contains('\\') {
+        return StatementKind::Read;
+    }
+    let doubled = sql.replace('\\', "\\\\");
+    // More than one statement that way: a server with multi-statements on
+    // runs them one after the other.
+    if super::split_statements(&doubled, kind).len() > 1 {
+        return StatementKind::Unknown;
+    }
+    // One statement whose string never ends that way (`'O\'Brien'`): the
+    // server rejects it and runs nothing.
+    if sqlparser::tokenizer::Tokenizer::new(dialect_for(kind).as_ref(), &doubled).tokenize().is_err() {
+        return StatementKind::Read;
+    }
+    classify_sql(&doubled, kind).kind
+}
+
+fn classify_sql(sql: &str, kind: ConnectorKind) -> Classification {
+    let keyword = leading_keyword(sql);
     let dialect = dialect_for(kind);
     match Parser::parse_sql(dialect.as_ref(), sql) {
         Ok(stmts) if !stmts.is_empty() => {
@@ -95,23 +129,6 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
             Classification { kind: k, missing_where: false, keyword }
         }
     }
-}
-
-/// MySQL reads `\'` inside a string as an escaped quote, unless the server
-/// runs with `NO_BACKSLASH_ESCAPES` (a `sql_mode` DataBrain doesn't know):
-/// then `select 'a\'; drop table t; -- '` ends the string at `\'` and the
-/// server, which accepts several statements per call, runs the DROP. Text
-/// that splits into more than one statement under either reading is
-/// `Unknown`.
-fn splits_without_backslash_escapes(sql: &str, kind: ConnectorKind) -> bool {
-    if kind != ConnectorKind::Mysql || !sql.contains('\\') {
-        return false;
-    }
-    let mut t = *kind.traits();
-    t.syntax.backslash_escapes = false;
-    t.syntax.backslash_in_double_quotes = false;
-    // Each statement as DataBrain splits the text, read the other way.
-    super::split_statements(sql, kind).iter().any(|s| super::split_with(&s.sql, &t).len() > 1)
 }
 
 /// T-SQL statements that a batch may start without `;` and that sqlparser
@@ -177,6 +194,8 @@ const TSQL_STATEMENTS: &[&str] = &[
     "LOAD",
     "GO",
     "ADD",
+    "RENAME",
+    "COPY",
 ];
 
 /// SQL Server: an unquoted alias that is a statement word. sqlparser reads

@@ -230,7 +230,7 @@ pub fn redact_secrets(sql: &str) -> String {
             }
             // A bare password runs to whitespace or the end of the statement
             // (Oracle allows `#` and `$` in one: `pw#1$x`).
-            if bare_ok && word_at(v).is_some() {
+            if bare_ok && (word_at(v).is_some() || b[v] >= 0x80) {
                 let e2 = bare_end(v);
                 cut.push((v, e2, None));
                 i = replaced(e2, &mut cut);
@@ -318,11 +318,11 @@ fn positional_secrets(sql: &str) -> Vec<(usize, usize, Option<u8>)> {
             continue;
         };
         let mut j = e;
-        while j < n && matches!(b[j], b' ' | b'\t') {
+        while j < n && b[j].is_ascii_whitespace() {
             j += 1;
         }
         // A function's arguments are in parentheses; a procedure's run to
-        // the end of the line or statement.
+        // the end of the line or statement (they may start on the next line).
         let parens = b.get(j) == Some(&b'(');
         if !parens && (j == e || !name.starts_with("sp_")) {
             i = e;
@@ -338,6 +338,15 @@ fn positional_secrets(sql: &str) -> Vec<(usize, usize, Option<u8>)> {
             match b[j] {
                 b'\'' | b'"' | b'`' => {
                     j = quoted_end(j);
+                    continue;
+                }
+                // Comments aren't arguments (`… 'pw' -- x=1` names nothing).
+                b'-' if b.get(j + 1) == Some(&b'-') => {
+                    j = sql[j..].find('\n').map_or(n, |k| j + k);
+                    continue;
+                }
+                b'/' if b.get(j + 1) == Some(&b'*') => {
+                    j = sql[j + 2..].find("*/").map_or(n, |k| j + 4 + k);
                     continue;
                 }
                 b'(' => depth += 1,
@@ -767,6 +776,9 @@ mod redaction_tests {
             ("exec sp_addlogin 'l', N'pw'", "exec sp_addlogin 'l', N'***'"),
             ("exec sp_password 'old', 'new', 'l'", "exec sp_password '***', '***', 'l'"),
             ("EXEC sp_setapprole 'r', 'pw'", "EXEC sp_setapprole 'r', '***'"),
+            ("exec sp_addlinkedsrvlogin 'S','false',NULL,'u','pw' -- x=1", "exec sp_addlinkedsrvlogin 'S','false',NULL,'u','***' -- x=1"),
+            ("exec sp_addlogin\n'l','pw'", "exec sp_addlogin\n'l','***'"),
+            ("create user u identified by é#x", "create user u identified by ***"),
         ] {
             assert_eq!(redact_text(sql), want, "{sql}");
         }

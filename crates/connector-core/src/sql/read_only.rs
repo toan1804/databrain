@@ -52,12 +52,22 @@ pub fn read_only_allows(sql: &str, c: &Classification) -> bool {
             match w.next().as_deref() {
                 // Not `USE ROLE`: another role may write.
                 Some("use") => !matches!(w.next().as_deref(), Some("role" | "secondary")),
+                // A comment inside could hide a quote and with it a second
+                // setting (`SET a='x' /* ' */, GLOBAL read_only = 0 /* ' */`):
+                // not trusted.
+                Some("set") if has_comment(super::splitter::strip_leading_comments(sql)) => false,
                 Some("set") => set_names(sql).is_some_and(|names| !names.is_empty() && names.iter().all(|n| harmless_setting(n))),
                 _ => false,
             }
         }
         _ => false,
     }
+}
+
+/// Comment markers anywhere (strings included: being stricter only costs a
+/// confirmation).
+fn has_comment(sql: &str) -> bool {
+    sql.contains("--") || sql.contains("/*") || sql.contains('#')
 }
 
 /// A setting `SET` may change on a read-only connection: `name` is as
@@ -468,6 +478,10 @@ mod read_only_tests {
             (Mssql, "SET NOCOUNT, IMPLICIT_TRANSACTIONS ON"),
             (Mssql, "set nocount on, xact_abort on"),
             (Postgres, "set search_path = 'a"),
+            // A comment hiding a quote, and with it a second setting.
+            (Mysql, "SET time_zone='+00:00' /* ' */, GLOBAL read_only = 0 /* ' */"),
+            (Mysql, "SET time_zone='+00:00' # '\n, transaction_read_only=0 # '\n"),
+            (Mysql, "set time_zone = '+00:00' -- ', global general_log = 1"),
         ] {
             assert!(!allows(sql, k), "{k:?}: {sql}");
         }

@@ -63,3 +63,14 @@ postgres | select 1; delete from t
 # the server runs what follows as more statements.
 mysql | select 'a\'; drop table t; -- '
 mysql | select "a\"; delete from t; -- "
+
+# MySQL with NO_BACKSLASH_ESCAPES: a write inside one statement.
+mysql | select 'a\' into outfile ', 1 -- '
+mysql | select 'a\' into dumpfile ', 1 -- '
+mysql | select "a\" into outfile ", 1 -- "
+
+# SQL Server (Synapse) statement words read as aliases.
+mssql | select * from t rename
+mssql | select 1 copy
+mysql | select 'a\'; drop table t; select '
+mysql | select 'x\' union select user, authentication_string from mysql.user where 'a' = 'a'; -- '
