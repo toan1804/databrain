@@ -58,3 +58,8 @@ postgres | explain analyze delete from t
 postgres | explain (analyze) delete from t
 mysql | explain analyze delete from t
 postgres | select 1; delete from t
+
+# MySQL with NO_BACKSLASH_ESCAPES on the server: the string ends at \' and
+# the server runs what follows as more statements.
+mysql | select 'a\'; drop table t; -- '
+mysql | select "a\"; delete from t; -- "

@@ -64,9 +64,6 @@ Paths are in `crates/connector-core/src/` unless given in full. From one reading
 
 ### Medium
 
-- **`execute` is "one statement" by convention only** (`lib.rs`). The MySQL driver allows several statements per call by default; with `NO_BACKSLASH_ESCAPES` on the server, `select 'a\'; drop table t; -- '` is one read to the splitter and classifier and two statements to the server. Turn the driver flag off.
-- **Lineage's check classifies before binding** (`crates/app/src/api/lineage.rs`, through `Session::check_sql`): a raw parameter value reaches `EXPLAIN …` unclassified. Classify the bound text.
-- **Cypher write words miss `INSERT` and `TERMINATE`** (`language.rs`); Neo4j syntax not verified.
 - **Redaction misses** (`sql/redact.rs`): `SET PASSWORD FOR … = '…'`; the old password in `ALTER USER … IDENTIFIED BY … REPLACE …`; Redshift `SECRET_ACCESS_KEY`, Snowflake `SECRET_STRING`, DuckDB `BEARER_TOKEN` and `ENCRYPTION_KEY`; `AccountKey=` in a connection string; `IDENTIFIED BY VALUES '<hash>'`; an unquoted password with `#` or `$` is cut short; secrets passed by position (`s3(url, key, secret)`, `MySQL(…)`, `sp_addlinkedsrvlogin`).
 - **`Session::in_transaction` defaults to `false`** (`lib.rs`): the contract behind the query-engine item on lost transactions. `Capabilities.transactions` is true for Oracle, Snowflake, BigQuery and DuckDB, which don't report an open one.
 - **Values that fail to convert show as NULL without a notice on SQL Server and Oracle**: `BatchBuilder` (`value.rs`) only counts them, and those connectors never read the count.

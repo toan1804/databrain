@@ -208,12 +208,15 @@ pub async fn lineage(
             (_, _, None) => c.status = "skipped".into(),
             (Some(id), true, Some(q)) => {
                 let text = &sql[q.start..q.end];
-                let read = databrain_connector_core::sql::classify(text, kind).kind == databrain_connector_core::sql::StatementKind::Read;
+                let bound = databrain_connector_core::sql::substitute_parameters(text, kind, &params).unwrap_or_else(|_| masked[q.start..q.end].to_string());
+                // What is sent is checked: a raw parameter value (`1; drop
+                // table t`) can change what the statement does.
+                let read = [text, bound.as_str()]
+                    .iter()
+                    .all(|t| databrain_connector_core::sql::classify(t, kind).kind == databrain_connector_core::sql::StatementKind::Read);
                 if !read {
                     c.status = "skipped".into();
                 } else {
-                    let bound =
-                        databrain_connector_core::sql::substitute_parameters(text, kind, &params).unwrap_or_else(|_| masked[q.start..q.end].to_string());
                     let same = bound == text;
                     match state.engine.check_sql(id, &bound).await {
                         Ok(true) => c.status = "ok".into(),

@@ -35,8 +35,12 @@ pub fn classify(text: &str, language: QueryLanguage) -> Classification {
         QueryLanguage::Cypher => {
             if has(&["CONSTRAINT", "INDEX"]) && has(&["CREATE", "DROP"]) {
                 StatementKind::Ddl
-            } else if has(&["CREATE", "MERGE", "SET", "DELETE", "DETACH", "REMOVE", "DROP", "LOAD", "FOREACH"]) {
+            } else if has(&["CREATE", "INSERT", "MERGE", "SET", "DELETE", "DETACH", "REMOVE", "DROP", "LOAD", "FOREACH"]) {
+                // INSERT: Neo4j 5's GQL spelling of CREATE.
                 StatementKind::Dml
+            } else if has(&["TERMINATE"]) {
+                // `SHOW TRANSACTIONS YIELD … TERMINATE TRANSACTIONS …` ends others' work.
+                StatementKind::Other
             } else if has(&["CALL"]) {
                 // Procedures may write.
                 StatementKind::Unknown
@@ -321,6 +325,13 @@ mod tests {
         assert_eq!(k("MATCH (p:Person {name: 'A'}) SET p.age = 3", L::Cypher), S::Dml);
         assert_eq!(k("CREATE INDEX FOR (p:Person) ON (p.name)", L::Cypher), S::Ddl);
         assert_eq!(k("CALL db.labels()", L::Cypher), S::Unknown);
+        assert_eq!(k("MATCH (a:P {id: 1}) INSERT (a)-[:R]->(:X {n: 2})", L::Cypher), S::Dml);
+        assert_eq!(k("INSERT (:P {name: 'A'})", L::Cypher), S::Dml);
+        assert_eq!(k("SHOW TRANSACTIONS YIELD transactionId AS id WHERE id <> 'x' TERMINATE TRANSACTIONS id", L::Cypher), S::Other);
+        assert_eq!(k("TERMINATE TRANSACTIONS 'neo4j-transaction-1'", L::Cypher), S::Other);
+        // Still reads: the words in a string or a property name aren't statements.
+        assert_eq!(k("SHOW TRANSACTIONS", L::Cypher), S::Read);
+        assert_eq!(k("MATCH (n) RETURN n.inserted_at", L::Cypher), S::Read);
     }
 
     #[test]

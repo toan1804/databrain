@@ -20,3 +20,5 @@ oracle | select * from dual
 sqlite | select * from t
 duckdb | select * from read_parquet('x.parquet')
 bigquery | select * from `p.d.t`
+mysql | select 'it\'s', "a\"b" from t
+mysql | select 'C:\\path' from t

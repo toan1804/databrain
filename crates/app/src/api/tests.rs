@@ -967,6 +967,18 @@ async fn lineage_describes_and_checks_sqlite() {
     // Without the check: the cached (now fresh) columns, nothing described.
     let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select * from orders", Default::default(), false).await.unwrap();
     assert!(v.described.is_empty());
+    // A raw parameter value that adds a statement: what would be sent isn't
+    // a read, so it isn't checked (EXPLAIN never sees it); a plain value is.
+    let raw = |v: &str| {
+        std::iter::once(("day".to_string(), databrain_connector_core::sql::ParamValue { value: v.into(), raw: true }))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+    let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select * from orders where id = :day", raw("1; drop table orders"), true).await.unwrap();
+    assert_eq!(v.checks[0].status, "skipped", "{:?}", v.checks);
+    let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select * from orders where id = :day", raw("1"), true).await.unwrap();
+    assert_eq!(v.checks[0].status, "ok", "{:?}", v.checks);
+    let s = st.engine.session_for_tests(&p.id).await.unwrap();
+    assert_eq!(databrain_connector_core::query_text(&*s, "select count(*) from orders").await.unwrap()[0][0].as_deref(), Some("1"));
     // Offline / no connection: lineage still works, nothing checked.
     let v = lineage(&st, None, ConnectorKind::Sqlite, "select a from t", Default::default(), true).await.unwrap();
     assert_eq!(v.checks[0].status, "skipped");
