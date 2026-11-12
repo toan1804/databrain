@@ -570,13 +570,18 @@ impl OutputRegistry {
         if pinned && info.pinned {
             return Ok(info); // already saved: nothing to write (or to undo)
         }
-        if !pinned && info.state == OutputState::OnDisk {
-            self.ensure_loaded(handle)?; // keep the data for this session
+        if info.state == OutputState::OnDisk {
+            // Unpinning: keep the data for this session. Pinning a restored
+            // result: its rows are on disk only; read them to save again.
+            self.ensure_loaded(handle)?;
         }
         self.update(handle, |o| o.pinned = pinned);
         let info = self.get(handle).unwrap_or(info);
         if pinned {
             if let Some(path) = self.snapshot_path(&info.result_id) {
+                // A file there before (a restored result's) is not ours to
+                // delete if the save fails.
+                let existed = path.exists();
                 let save = || -> Result<()> {
                     let rs = self.results.get(&info.result_id).map_err(|e| EngineError::new("not_found", e.to_string()))?;
                     let (schema, batches) = {
@@ -600,7 +605,9 @@ impl OutputRegistry {
                 // while the list says it's kept).
                 if let Err(e) = save() {
                     self.update(handle, |o| o.pinned = false);
-                    let _ = std::fs::remove_file(&path);
+                    if !existed {
+                        let _ = std::fs::remove_file(&path);
+                    }
                     return Err(e);
                 }
             }
@@ -1804,6 +1811,10 @@ mod tests {
         assert_eq!(t1.iter().map(|o| (o.handle.as_str(), o.state, o.active, o.pinned)).collect::<Vec<_>>(), vec![("r2", OutputState::OnDisk, true, false)]);
         assert!(r.for_tab("t2").is_empty());
         assert!(r.get("r4").unwrap().pinned, "pinned output kept although its tab is gone");
+        // Pinning a restored result before it is read: read, then saved.
+        let pinned = r.set_pinned("r2", true).unwrap();
+        assert!(pinned.pinned && r.snapshot_path(&pinned.result_id).unwrap().exists(), "{pinned:?}");
+        r.set_pinned("r2", false).unwrap();
         assert_eq!(r.ensure_loaded("r2").unwrap().rows, 5);
         // New run of t1, quit: the old snapshot is dropped.
         r.begin_run("t1");

@@ -914,19 +914,18 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     let outcomes = run_sql(ctx, connection_id, tab.clone(), sql, Some(node.name.clone()), t.step_origin(node), cancel, t).await?;
     let last = outcomes.last();
     let rows = last.and_then(|o| o.result.as_ref().map(|r| r.total_rows as i64).or(o.rows_affected.map(|r| r as i64))).unwrap_or(0);
-    if node.kind == JobNodeKind::Query {
-        return Ok(NodeOut { rows, file: None, notices: vec![] });
-    }
-    let output = ctx
-        .engine
-        .outputs()
-        .for_tab(&tab)
-        .into_iter()
-        .rev()
-        .find(|o| o.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&node.name)))
-        .ok_or_else(|| EngineError::new("invalid", "The SQL returned no rows (it must end with a SELECT)"))?;
-    if let Some(o) = capped_input.as_ref().or(output.truncated.then_some(&output)) {
-        let what = if node.kind == JobNodeKind::Export { "exported" } else { "loaded" };
+    // This step's result (a statement that returns rows ends with one).
+    let own = ctx.engine.outputs().for_tab(&tab).into_iter().rev().find(|o| o.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&node.name)));
+    // Job steps run without a row limit, so a capped result is one that
+    // filled the memory a result may keep; one it reads may be a tab's
+    // row-limited result. Any step fails then, so a later step can't work
+    // on part of the rows through a complete-looking copy.
+    if let Some(o) = capped_input.as_ref().or(own.as_ref().filter(|o| o.truncated)) {
+        let what = match node.kind {
+            JobNodeKind::Export => "exported",
+            JobNodeKind::Load => "loaded",
+            _ => "passed on",
+        };
         return Err(EngineError::new(
             "invalid",
             format!(
@@ -936,6 +935,10 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
             ),
         ));
     }
+    if node.kind == JobNodeKind::Query {
+        return Ok(NodeOut { rows, file: None, notices: vec![] });
+    }
+    let output = own.ok_or_else(|| EngineError::new("invalid", "The SQL returned no rows (it must end with a SELECT)"))?;
     if let Some(folder) = folder {
         let name = databrain_workspace::jobs::export_file_name(node.export_file.as_deref(), &node.name, job_name, node.export_format, now_ms());
         let written = files_written_by(&ctx.workspace, job_id);
@@ -1020,8 +1023,9 @@ pub async fn dry_run(ctx: &JobCtx, job: &Job, node_id: &str) -> Result<LoadDryRu
     let ups: Vec<String> =
         job.edges.iter().filter(|e| e.to == node.id).filter_map(|e| job.nodes.iter().find(|n| n.id == e.from).map(|n| n.name.clone())).collect();
     let sql = if node.sql.trim().is_empty() { default_load_sql(&ups) } else { Some(node.sql.clone()) };
-    // Not a `job:` tab: its result is not the step's output.
-    let tab = format!("dryrun:{}:{}", job.id, node.id);
+    // Not a `job:` tab: its result is not the step's output. One per dry
+    // run: two at once on one session would share (and end) a transaction.
+    let tab = format!("dryrun:{}:{}:{}", job.id, node.id, uuid::Uuid::new_v4().simple());
     let cancel = CancellationToken::new();
     let (rows, rows_error) = match sql {
         None => (None, Some("Write the SQL that selects the rows to load, or connect an upstream step".to_string())),

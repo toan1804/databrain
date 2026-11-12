@@ -154,8 +154,8 @@ export function LoadIntoDialog({
         <div className="space-y-3 text-[12.5px]">
           {info.truncated && (
             <p className="rounded-md bg-warning/10 px-2 py-1.5 text-[11.5px] text-warning">
-              The result was limited to {formatCount(info.total_rows)} rows: only those are loaded. Raise the row limit and run again, or use a job to load
-              everything.
+              The result stopped at {formatCount(info.total_rows)} rows (the row limit, or the memory a result may keep): only those are loaded. Raise the
+              row limit and run again, select fewer columns, or use a job, which loads every row when they fit.
             </p>
           )}
           <div className="grid grid-cols-2 gap-2">

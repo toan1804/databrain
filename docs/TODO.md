@@ -18,15 +18,41 @@ The review's findings are fixed (loads can't control their transaction and ask o
 - **Typed session roles.** `enum SessionRole { Tab, Notebook, Meta, Index, Ai, JobStep, Load, Export }` instead of string keys (`__meta__`, `ai:…`), with idle close, reconnect, sandbox and cleanup decided per role.
 - `blocking()` (`lib.rs`) hands the worker thread over only on a multi-thread runtime; on a current-thread one the workspace and file writes still block it.
 
+Left from the final review (2026-11-13):
+
+- MySQL statements that commit by themselves without being transaction control (`SET PASSWORD`, `RESET …`, `LOAD INDEX INTO CACHE`) in a load's before/after SQL: a dry run on MySQL uses a transaction and would keep its sample rows after one. Use the transaction method on MySQL only when every user statement is a read or DML.
+- A grid edit that fails with an error that ends the whole transaction (SQL Server `XACT_ABORT`, a deadlock, DuckDB's aborted transaction): the savepoint rollback fails and the message says the earlier changes are pending when they are gone.
+- The cost preview only looks at the tab (it must not make Run busy): when it reconnects after a connection error while a script runs, the script's next statement lands on the new session.
+- The memory cap is per result: a script whose results are all active can hold several times the budget; `get_array_memory_size` counts buffers shared between batches once per batch.
+- `release_result` on a pinned output when no snapshot directory is set removes the output (only the AI's sample path calls it).
+- `loadResultAsking`: when the server asks (the UI didn't know the connection is production), progress and Stop already show during the prompt.
+
 ## Explorer and AI index (left from the review of 2026-11-12)
 
 - PostgreSQL row estimates are refreshed only when the schema changes: the explorer fingerprint leaves out `reltuples`, and since index runs use the same fingerprint (2026-11-13) they skip such schemas too, so the AI's row estimates go stale as well.
 - The ER diagram (`schema_tables`) is always read live and doesn't work offline.
 - `clear_explorer_cache` is a command the UI never calls.
 
+Left from the final review of the metadata store (2026-11-13):
+
+- A table's search text includes the names of the tables its foreign keys point at, so searching for a table outside the scope ranks allowed tables that reference it (the keys themselves are scrubbed).
+- Scope rules match names ignoring case: on Postgres, allowing `sales` also allows `"Sales"`.
+- The scope survives pointing a connection at another server (`meta_check_identity` keeps the rules): schemas allowed on the old server are allowed on the new one once browsed. Decide whether a server change should clear it.
+- `meta_clear` and `kn_clear` are not one transaction each. The v20 migration gives a schema whose last index run failed a rule too.
+- `user_version` is read outside the migration transaction: two processes upgrading at once (the app and `databrain-mcp`) can make one fail with "table already exists" (it opens on the next try).
+- The pre-check in `index_tables` and `describe_named` resolve a bare name with the explorer cache, not the AI's scope; the check after the describe is what decides.
+
 ## Connector core (review of 2026-11-12; see [CONNECTOR_CORE.md](CONNECTOR_CORE.md))
 
 Every finding of the review was fixed on 2026-11-13, with the never-read corpus and the whole-vs-pieces property (`crates/connector-core/tests/classify_corpus.rs`), tri-state `Session::transaction_state` with the unused `Capabilities` fields removed, keyword and positional secrets in redaction, and one scanner for strings and comments (`skip_token`). A `Session::supports(Feature)` enum wasn't added: the optional features already say "not supported" through their own return values (`object_versions` → `None`, `check_sql` → `false`). The redaction functions keep their own, dialect-free lexing on purpose: they scrub any text (history, logs, error messages) without knowing its database.
+
+Left from the final review (2026-11-13):
+
+- Databricks raw strings `r'…'` end at the first `'` on the server but are read with backslash escapes by the splitter (only matters if the API ever runs several statements).
+- DuckDB `select e'\''; drop …`: the whole text classifies as a read while its pieces don't (sqlparser's DuckDB dialect has no E-strings); runs classify the pieces.
+- Functions with side effects still read as reads: Postgres `brin_summarize_new_values`, `brin_summarize_range`, `gin_clean_pending_list`, `pg_stat_reset_subscription_stats`, `pg_sync_replication_slots`, `pg_replication_origin_session_reset`; DuckDB `sqlite_attach`; Databricks `http_request`; ClickHouse `url()`, `remote()`, `mysql()`, `s3()` (its server applies read-only itself). `SELECT … FOR UPDATE` is a read (locks; Oracle doesn't refuse it in read-only mode).
+- Transaction tracking: a failing `COMMIT` (or `commit prepared`) on Postgres resets the count while the transaction stays open (statements are observed before they run). SQL Server could ask the server for `@@TRANCOUNT` instead of following text.
+- Redaction keeps: connection strings and settings outside quotes in AI text (`Server=h;Password=pw;`, `PGPASSWORD=pw`), URL query tokens (`?access_token=…`), the part after `\"` in `identified by "p\"w"`, and positional `pgp_sym_encrypt(data, 'pw')` / `aes_encrypt(x, 'key')`.
 
 Ideas still open:
 
