@@ -19,6 +19,40 @@ const SECRET_WORDS: &[&str] = &[
     "private_key_passphrase",
     "connection_string",
     "token",
+    "secret_access_key",
+    "secret_string",
+    "bearer_token",
+    "encryption_key",
+];
+
+/// Functions and procedures that take a secret by position: the name
+/// (lower case), the 0-based arguments that are secrets, and how many
+/// arguments the call needs before they are (`s3(url)` and `s3(url,
+/// format)` have none). Only quoted arguments change; a call with a named
+/// argument (`@rmtpassword = …`) is left to [`redact_key_values`].
+const POSITIONAL_SECRETS: &[(&str, &[usize], usize)] = &[
+    // ClickHouse table functions: (url, key id, secret, …).
+    ("s3", &[2], 3),
+    ("gcs", &[2], 3),
+    ("oss", &[2], 3),
+    ("cosn", &[2], 3),
+    ("s3cluster", &[3], 4),
+    // (connection string, container, blob, account name, account key, …).
+    ("azureblobstorage", &[4], 5),
+    ("azureblobstoragecluster", &[5], 6),
+    // (host, db, table, user, password, …).
+    ("mysql", &[4], 5),
+    ("postgresql", &[4], 5),
+    ("mongodb", &[4], 5),
+    // (addresses, db.table, user, password) or (addresses, db, table, user,
+    // password): both places hidden when there are five.
+    ("remote", &[3, 4], 4),
+    ("remotesecure", &[3, 4], 4),
+    // SQL Server procedures.
+    ("sp_addlinkedsrvlogin", &[4], 5),
+    ("sp_addlogin", &[1], 2),
+    ("sp_password", &[0, 1], 2),
+    ("sp_setapprole", &[1], 2),
 ];
 
 /// `sql` with passwords and keys replaced by `***`, for what DataBrain keeps
@@ -67,8 +101,14 @@ pub fn redact_secrets(sql: &str) -> String {
         n
     };
     let lower = |s: usize, e: usize| sql[s..e].to_ascii_lowercase();
+    let bare_end = |mut j: usize| {
+        while j < n && !b[j].is_ascii_whitespace() && !matches!(b[j], b';' | b',' | b')' | b'\'' | b'"') {
+            j += 1;
+        }
+        j
+    };
     // Spans (start, end, quote) to replace.
-    let mut cut: Vec<(usize, usize, Option<u8>)> = Vec::new();
+    let mut cut: Vec<(usize, usize, Option<u8>)> = positional_secrets(sql);
     let mut i = 0;
     while i < n {
         match b[i] {
@@ -120,6 +160,16 @@ pub fn redact_secrets(sql: &str) -> String {
             }
         } else if SECRET_WORDS.contains(&w.as_str()) {
             let mut j = skip_ws(e);
+            // SET PASSWORD FOR 'bob'@'%' = 'x': the account, then `=`.
+            if let Some((s2, e2)) = word_at(j)
+                && lower(s2, e2) == "for"
+            {
+                let mut k = e2;
+                while k < n && !matches!(b[k], b'=' | b';' | b'\n') {
+                    k = if matches!(b[k], b'\'' | b'"' | b'`') { literal_end(k) } else { k + 1 };
+                }
+                j = k;
+            }
             if j < n && b[j] == b'=' {
                 j = skip_ws(j + 1);
             }
@@ -133,16 +183,42 @@ pub fn redact_secrets(sql: &str) -> String {
             }
             value_at = Some(j);
         }
+        // Oracle `IDENTIFIED BY VALUES 'hash'`: the hash, not the word.
+        if bare_ok
+            && let Some(v) = value_at
+            && let Some((s2, e2)) = word_at(v)
+            && lower(s2, e2) == "values"
+        {
+            value_at = Some(skip_ws(e2));
+            bare_ok = false;
+        }
         if let Some(mut v) = value_at.filter(|v| *v < n) {
             // E'…' (Postgres, backslash escapes), N'…' (SQL Server): the
             // literal after the prefix ([`literal_end`] skips `\'` and `''`).
             if v + 1 < n && matches!(b[v], b'E' | b'e' | b'N' | b'n') && b[v + 1] == b'\'' {
                 v += 1;
             }
+            // Oracle `IDENTIFIED BY new REPLACE old`: the old password too.
+            let replaced = |end: usize, cut: &mut Vec<(usize, usize, Option<u8>)>| -> usize {
+                let j = skip_ws(end);
+                let Some((_, e2)) = word_at(j).filter(|(s2, e2)| w == "identified" && lower(*s2, *e2) == "replace") else { return end };
+                let v = skip_ws(e2);
+                if v < n && matches!(b[v], b'\'' | b'"') {
+                    let e = literal_end(v);
+                    cut.push((v, e, Some(b[v])));
+                    return e;
+                }
+                let e = bare_end(v);
+                if e > v {
+                    cut.push((v, e, None));
+                    return e;
+                }
+                end
+            };
             if matches!(b[v], b'\'' | b'"') {
                 let end = literal_end(v);
                 cut.push((v, end, Some(b[v])));
-                i = end;
+                i = replaced(end, &mut cut);
                 continue;
             }
             // `$$secret$$` / `$tag$secret$tag$` (Postgres dollar quotes): the
@@ -152,9 +228,12 @@ pub fn redact_secrets(sql: &str) -> String {
                 i = end;
                 continue;
             }
-            if bare_ok && let Some((s2, e2)) = word_at(v) {
-                cut.push((s2, e2, None));
-                i = e2;
+            // A bare password runs to whitespace or the end of the statement
+            // (Oracle allows `#` and `$` in one: `pw#1$x`).
+            if bare_ok && word_at(v).is_some() {
+                let e2 = bare_end(v);
+                cut.push((v, e2, None));
+                i = replaced(e2, &mut cut);
                 continue;
             }
         }
@@ -163,9 +242,14 @@ pub fn redact_secrets(sql: &str) -> String {
     if cut.is_empty() {
         return sql.to_string();
     }
+    cut.sort_by_key(|c| c.0);
     let mut out = String::with_capacity(sql.len());
     let mut last = 0;
     for (s, e, q) in cut {
+        // Found twice (a keyword and a position): once.
+        if s < last {
+            continue;
+        }
         out.push_str(&sql[last..s]);
         match q {
             Some(q) => {
@@ -178,6 +262,116 @@ pub fn redact_secrets(sql: &str) -> String {
         last = e;
     }
     out.push_str(&sql[last..]);
+    out
+}
+
+/// Quoted arguments of calls in [`POSITIONAL_SECRETS`] that hold a secret:
+/// `s3(url, key, 'secret')`, `exec sp_addlinkedsrvlogin 'S', 'false', NULL,
+/// 'u', 'pw'`. Spans as in [`redact_secrets`] (inside the quotes).
+fn positional_secrets(sql: &str) -> Vec<(usize, usize, Option<u8>)> {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let quoted_end = |i: usize| -> usize {
+        let q = b[i];
+        let mut j = i + 1;
+        while j < n {
+            if b[j] == q {
+                if j + 1 < n && b[j + 1] == q {
+                    j += 2;
+                    continue;
+                }
+                return j + 1;
+            }
+            j += 1;
+        }
+        n
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        match b[i] {
+            b'\'' | b'"' | b'`' => {
+                i = quoted_end(i);
+                continue;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                i = sql[i..].find('\n').map_or(n, |k| i + k);
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i = sql[i + 2..].find("*/").map_or(n, |k| i + 4 + k);
+                continue;
+            }
+            c if (c.is_ascii_alphabetic() || c == b'_') && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) => {}
+            _ => {
+                i += 1;
+                continue;
+            }
+        }
+        let mut e = i;
+        while e < n && (b[e].is_ascii_alphanumeric() || b[e] == b'_') {
+            e += 1;
+        }
+        let name = sql[i..e].to_ascii_lowercase();
+        let Some((_, secret, min)) = POSITIONAL_SECRETS.iter().find(|(f, ..)| *f == name) else {
+            i = e;
+            continue;
+        };
+        let mut j = e;
+        while j < n && matches!(b[j], b' ' | b'\t') {
+            j += 1;
+        }
+        // A function's arguments are in parentheses; a procedure's run to
+        // the end of the line or statement.
+        let parens = b.get(j) == Some(&b'(');
+        if !parens && (j == e || !name.starts_with("sp_")) {
+            i = e;
+            continue;
+        }
+        if parens {
+            j += 1;
+        }
+        // Arguments: (start, end) of each, top-level commas between.
+        let mut args: Vec<(usize, usize)> = Vec::new();
+        let (mut start, mut depth, mut named) = (j, 0i32, false);
+        while j < n {
+            match b[j] {
+                b'\'' | b'"' | b'`' => {
+                    j = quoted_end(j);
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' if depth > 0 => depth -= 1,
+                b')' if parens => break,
+                b'\n' | b';' if !parens => break,
+                b',' if depth == 0 => {
+                    args.push((start, j));
+                    start = j + 1;
+                }
+                b'=' | b'@' if depth == 0 => named = true,
+                _ => {}
+            }
+            j += 1;
+        }
+        args.push((start, j.min(n)));
+        if !named && args.len() >= *min {
+            for &k in secret.iter() {
+                let Some(&(s, e)) = args.get(k) else { continue };
+                let mut s = s;
+                while s < e && b[s].is_ascii_whitespace() {
+                    s += 1;
+                }
+                if s + 1 < e && matches!(b[s], b'N' | b'n' | b'E' | b'e') && b[s + 1] == b'\'' {
+                    s += 1;
+                }
+                if s < e && matches!(b[s], b'\'' | b'"') {
+                    let end = quoted_end(s);
+                    out.push((s, end, Some(b[s])));
+                }
+            }
+        }
+        i = j;
+    }
     out
 }
 
@@ -356,8 +550,21 @@ pub fn redact_text(text: &str) -> String {
 /// `password`, `pwd`, `master_password`, `rmtpassword`, `client_secret`,
 /// `api_key`… A suffix is enough: drivers and procedures prefix them.
 fn secret_name(name: &str) -> bool {
-    const ENDS: &[&str] =
-        &["password", "passwd", "pwd", "secret", "secret_key", "secretkey", "access_key", "accesskey", "api_key", "apikey", "_token", "passphrase"];
+    const ENDS: &[&str] = &[
+        "password",
+        "passwd",
+        "pwd",
+        "secret",
+        "secret_key",
+        "secretkey",
+        "access_key",
+        "accesskey",
+        "api_key",
+        "apikey",
+        "_token",
+        "passphrase",
+        "accountkey",
+    ];
     SECRET_WORDS.contains(&name) || ENDS.iter().any(|e| name.ends_with(e))
 }
 
@@ -534,6 +741,46 @@ pub fn redact_key_values(text: &str) -> String {
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    #[test]
+    fn redacts_secrets_the_review_found_missed() {
+        for (sql, want) in [
+            ("SET PASSWORD FOR 'bob'@'%' = 'newpass'", "SET PASSWORD FOR 'bob'@'%' = '***'"),
+            ("set password for bob = password('np')", "set password for bob = password('***')"),
+            ("ALTER USER u IDENTIFIED BY 'new' REPLACE 'old'", "ALTER USER u IDENTIFIED BY '***' REPLACE '***'"),
+            ("ALTER USER u IDENTIFIED BY new_pw REPLACE old_pw", "ALTER USER u IDENTIFIED BY *** REPLACE ***"),
+            ("CREATE USER u IDENTIFIED BY VALUES 'S:ABCD;T:EF'", "CREATE USER u IDENTIFIED BY VALUES '***'"),
+            ("CREATE USER u IDENTIFIED BY pw#1$x;", "CREATE USER u IDENTIFIED BY ***;"),
+            ("COPY t FROM 's3://b/k' ACCESS_KEY_ID 'AKIA' SECRET_ACCESS_KEY 'sk'", "COPY t FROM 's3://b/k' ACCESS_KEY_ID 'AKIA' SECRET_ACCESS_KEY '***'"),
+            ("CREATE SECRET s TYPE = GENERIC_STRING SECRET_STRING = 'tok'", "CREATE SECRET s TYPE = GENERIC_STRING SECRET_STRING = '***'"),
+            ("CREATE SECRET h (TYPE http, BEARER_TOKEN 'tok')", "CREATE SECRET h (TYPE http, BEARER_TOKEN '***')"),
+            ("ATTACH 'x.db' AS x (ENCRYPTION_KEY 'pw')", "ATTACH 'x.db' AS x (ENCRYPTION_KEY '***')"),
+            (
+                "select * from azureBlobStorage('DefaultEndpointsProtocol=https;AccountName=a;AccountKey=k==;', 'c', 'b')",
+                "select * from azureBlobStorage('DefaultEndpointsProtocol=https;AccountName=a;AccountKey=***;', 'c', 'b')",
+            ),
+            ("select * from s3('https://b.s3/k.csv', 'AKIA', 'sk', 'CSV')", "select * from s3('https://b.s3/k.csv', 'AKIA', '***', 'CSV')"),
+            ("SELECT * FROM mysql('h:3306', 'db', 't', 'u', 'pw')", "SELECT * FROM mysql('h:3306', 'db', 't', 'u', '***')"),
+            ("select * from postgresql('h', 'db', 't', 'u', 'pw', 'public')", "select * from postgresql('h', 'db', 't', 'u', '***', 'public')"),
+            ("select * from remote('h', db.t, 'u', 'pw')", "select * from remote('h', db.t, 'u', '***')"),
+            ("EXEC sp_addlinkedsrvlogin 'S','false',NULL,'u','pw'", "EXEC sp_addlinkedsrvlogin 'S','false',NULL,'u','***'"),
+            ("exec sp_addlogin 'l', N'pw'", "exec sp_addlogin 'l', N'***'"),
+            ("exec sp_password 'old', 'new', 'l'", "exec sp_password '***', '***', 'l'"),
+            ("EXEC sp_setapprole 'r', 'pw'", "EXEC sp_setapprole 'r', '***'"),
+        ] {
+            assert_eq!(redact_text(sql), want, "{sql}");
+        }
+        // Still kept: the same names with nothing secret in that place.
+        for keep in [
+            "select * from s3('https://b.s3/k.csv')",
+            "select * from s3('https://b.s3/k.csv', 'CSV')",
+            "select * from mysql_table where password_changed_at > now()",
+            "select replace(name, 'a', 'b') from t",
+            "exec sp_addlinkedsrvlogin @rmtsrvname = 'S', @useself = 'true'",
+        ] {
+            assert_eq!(redact_text(keep), keep);
+        }
+    }
 
     #[test]
     fn redacts_passwords_and_keys_in_sql() {

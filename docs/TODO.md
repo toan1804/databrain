@@ -64,7 +64,6 @@ Paths are in `crates/connector-core/src/` unless given in full. From one reading
 
 ### Medium
 
-- **Redaction misses** (`sql/redact.rs`): `SET PASSWORD FOR … = '…'`; the old password in `ALTER USER … IDENTIFIED BY … REPLACE …`; Redshift `SECRET_ACCESS_KEY`, Snowflake `SECRET_STRING`, DuckDB `BEARER_TOKEN` and `ENCRYPTION_KEY`; `AccountKey=` in a connection string; `IDENTIFIED BY VALUES '<hash>'`; an unquoted password with `#` or `$` is cut short; secrets passed by position (`s3(url, key, secret)`, `MySQL(…)`, `sp_addlinkedsrvlogin`).
 - **`Session::in_transaction` defaults to `false`** (`lib.rs`): the contract behind the query-engine item on lost transactions. `Capabilities.transactions` is true for Oracle, Snowflake, BigQuery and DuckDB, which don't report an open one.
 - **Values that fail to convert show as NULL without a notice on SQL Server and Oracle**: `BatchBuilder` (`value.rs`) only counts them, and those connectors never read the count.
 
