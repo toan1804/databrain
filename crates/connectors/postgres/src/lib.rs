@@ -48,7 +48,7 @@ impl Connector for PostgresConnector {
             default_port: Some(5432),
             uses_file: false,
             auth_methods: vec![AuthMethodKind::Password, AuthMethodKind::CloudCli],
-            capabilities: Capabilities { transactions: true, cancel: true, schemas: true, read_only_sessions: true, ssh: true },
+            capabilities: Capabilities { ssh: true },
             fields: vec![
                 FieldSpec::new("flavor", "Database type"),
                 FieldSpec::new("host", "Host").required().placeholder("localhost"),

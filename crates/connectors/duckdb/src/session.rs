@@ -22,6 +22,9 @@ pub struct DuckSession {
     pub(crate) sandboxed: bool,
     /// The session's connection is to a database file other sessions share.
     pub(crate) shared: bool,
+    /// Transactions, followed from the statements run: the driver's
+    /// `is_autocommit()` always says yes.
+    pub(crate) state: Arc<databrain_connector_core::conn_state::ConnState>,
 }
 
 impl DuckSession {
@@ -71,6 +74,12 @@ impl Session for DuckSession {
         ConnectorKind::Duckdb
     }
 
+    /// Followed from the statements run (`BEGIN` … `COMMIT`/`ROLLBACK`):
+    /// the driver's `is_autocommit()` is a stub that always says yes.
+    fn transaction_state(&self) -> databrain_connector_core::TxState {
+        if self.state.in_transaction() { databrain_connector_core::TxState::Open } else { databrain_connector_core::TxState::None }
+    }
+
     async fn server_version(&self) -> Result<String> {
         let r = self.strings("select version()".into(), vec![]).await?;
         Ok(format!("DuckDB {}", r.first().and_then(|r| r[0].clone()).unwrap_or_default()))
@@ -81,6 +90,7 @@ impl Session for DuckSession {
     }
 
     async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+        self.state.observe(sql, ConnectorKind::Duckdb);
         let (tx, stream) = QueryStream::channel(4);
         let conn = self.conn.clone();
         let sql = sql.to_string();

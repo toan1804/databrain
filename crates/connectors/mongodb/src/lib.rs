@@ -53,7 +53,7 @@ impl Connector for MongoConnector {
             default_port: Some(27017),
             uses_file: false,
             auth_methods: vec![AuthMethodKind::Password, AuthMethodKind::None],
-            capabilities: Capabilities { transactions: false, cancel: true, schemas: true, read_only_sessions: false, ssh: true },
+            capabilities: Capabilities { ssh: true },
             fields: vec![
                 FieldSpec::new("uri", "Connection string")
                     .placeholder("mongodb+srv://cluster0.example.net/ (optional)")
@@ -282,6 +282,11 @@ async fn finish(rows: RowBatcher, tx: &StreamSender) -> Result<()> {
 impl Session for MongoSession {
     fn kind(&self) -> ConnectorKind {
         ConnectorKind::Mongodb
+    }
+
+    /// Each command runs on its own; no session transaction is kept open.
+    fn transaction_state(&self) -> databrain_connector_core::TxState {
+        databrain_connector_core::TxState::None
     }
 
     async fn server_version(&self) -> Result<String> {

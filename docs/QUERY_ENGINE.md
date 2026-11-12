@@ -32,7 +32,7 @@ Does not own:
 |---|---|
 | Talking to a database (`Session::execute`, catalog queries, server-side cancel) | `crates/connectors/*`, trait in `crates/connector-core/src/lib.rs` |
 | Splitting and classifying SQL, `read_only_allows`, parameters | `crates/connector-core/src/sql/` |
-| Whether a transaction is open (`Session::in_transaction`, a guess from the statements seen) | `crates/connector-core/src/conn_state.rs`; only Postgres, MySQL, SQL Server and SQLite report it |
+| Whether a transaction is open (`Session::transaction_state`: open, none, or unknown, which counts as open) | each connector; `crates/connector-core/src/conn_state.rs` follows the statements for most |
 | The rows of a result, views, paging | `crates/result-store` |
 | INSERT / MERGE / CREATE TABLE text, file writers | `crates/export` |
 | Saved connections, settings, history, the explorer cache | `crates/workspace` |
@@ -128,8 +128,8 @@ after the loop
 ## Transactions
 
 - **Auto-commit** is the default: the engine sends statements as written.
-- **Manual commit** (`set_manual_commit`, per session key; the UI offers it for Postgres, MySQL, SQL Server and SQLite, `TX_KINDS` in `EditorPane.tsx`): before DML (and DDL, except on MySQL) `begin_if_manual` sends the engine's BEGIN (`edit::apply_style`) when `in_transaction()` is false.
-- **State** is `Session::in_transaction()`: `QueryEngine::in_transaction`, and `JobFinished.in_transaction` for the UI badge. Connectors without it always say no.
+- **Manual commit** (`set_manual_commit`, per session key; the UI offers it for Postgres, MySQL, SQL Server, SQLite, DuckDB and Snowflake, `TX_KINDS` in `EditorPane.tsx`): before DML (and DDL, except on MySQL) `begin_if_manual` sends the engine's BEGIN (`edit::apply_style`) when `in_transaction()` is false.
+- **State** is `Session::transaction_state()`: the badge (`QueryEngine::in_transaction`, `JobFinished.in_transaction`) and Commit/Rollback use only a known open one; idle close and Refresh keep a session whose state is unknown.
 - **Commit / Rollback**: `end_transaction` refuses while a job uses the session, then sends `COMMIT` (repeated while a transaction is still open, for SQL Server's nesting; 32 at most) or `ROLLBACK`.
 - A session with an open transaction is never closed for being idle and survives `reconnect`. `disconnect` and `close_tab` drop it, which rolls back on the server.
 - Loads and grid edits open their own transaction (below). Three places name the statements: `edit::apply_style` (manual commit, edits), `traits().load.transactions` (loads), and `COMMIT` / `ROLLBACK` in `end_transaction`.

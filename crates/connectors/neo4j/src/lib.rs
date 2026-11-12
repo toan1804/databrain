@@ -44,7 +44,7 @@ impl Connector for Neo4jConnector {
             default_port: Some(7687),
             uses_file: false,
             auth_methods: vec![AuthMethodKind::Password],
-            capabilities: Capabilities { transactions: false, cancel: true, schemas: true, read_only_sessions: false, ssh: true },
+            capabilities: Capabilities { ssh: true },
             fields: vec![
                 FieldSpec::new("uri", "Connection URI")
                     .placeholder("neo4j+s://xxxx.databases.neo4j.io (optional)")
@@ -361,6 +361,11 @@ fn json(v: &BoltType) -> serde_json::Value {
 impl Session for Neo4jSession {
     fn kind(&self) -> ConnectorKind {
         ConnectorKind::Neo4j
+    }
+
+    /// Each query runs in its own auto-commit transaction.
+    fn transaction_state(&self) -> databrain_connector_core::TxState {
+        databrain_connector_core::TxState::None
     }
 
     async fn server_version(&self) -> Result<String> {

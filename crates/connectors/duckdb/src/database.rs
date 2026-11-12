@@ -184,6 +184,23 @@ mod tests {
         assert!(!super::FILE_DBS.lock().unwrap().contains_key(&key), "closed and left the registry");
     }
 
+    /// A transaction opened with BEGIN is reported, so the session isn't
+    /// idle-closed or replaced (losing it) and Commit/Rollback show.
+    #[tokio::test]
+    async fn reports_an_open_transaction() {
+        use databrain_connector_core::TxState;
+        let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        assert_eq!(s.transaction_state(), TxState::None);
+        q(&*s, "create table t (x int)").await;
+        q(&*s, "begin").await;
+        q(&*s, "insert into t values (1)").await;
+        assert_eq!(s.transaction_state(), TxState::Open);
+        assert!(s.in_transaction());
+        q(&*s, "rollback").await;
+        assert_eq!(s.transaction_state(), TxState::None);
+        assert!(!s.in_transaction());
+    }
+
     /// A session opening a file that another thread is closing waits for it
     /// to close instead of opening a second instance on it (WAL errors).
     #[tokio::test]

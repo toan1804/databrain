@@ -54,7 +54,7 @@ One per database type, registered in `ConnectorRegistry` by the app (`register`,
 | `prepare(cfg)` | no | nothing | One-time local setup (a driver download); outside the connect time limit |
 | `connect(cfg, creds)` | yes | | A new `Session`. Credentials are read from `creds` at that moment and not kept |
 
-Of `Capabilities`, only `ssh` is read today (the connection form). Whether the server itself keeps a read-only connection from writing is `ConnectorKind::server_read_only()` (`types.rs`), not `Capabilities::read_only_sessions`; whether a transaction is open is `Session::in_transaction`.
+`Capabilities` has only `ssh` (the connection form). Whether the server itself keeps a read-only connection from writing is `ConnectorKind::server_read_only()` (`types.rs`); other features are reported by the session method that provides them.
 
 ## `Session`
 
@@ -64,7 +64,7 @@ Required: `kind`, `server_version`, `ping`, `execute`, `list_schemas`, `list_obj
 
 | Defaulted method | Default | What the default means |
 |---|---|---|
-| `in_transaction()` | `false` | The session is never seen as holding a transaction: idle close and Refresh may drop it, there is no badge, and manual commit sends its own `BEGIN`. Overridden by Postgres, MySQL and SQL Server (through `ConnState`; MySQL also reads the driver's flag) and by SQLite |
+| `transaction_state()` | `TxState::Unknown` | Unknown counts as open: the session is kept (not idle-closed or replaced on Refresh), so a connector that doesn't implement it never loses work, but it also never gets the Commit/Rollback badge. Every connector implements it: Postgres, MySQL, SQL Server, DuckDB and Snowflake from the statements run (`ConnState`, MySQL also from the server's status flag), SQLite from the driver, and `None` for engines without transactions across statements (Oracle with autocommit, BigQuery, Databricks, ClickHouse, MongoDB, Neo4j). `in_transaction()` is "not `None`". |
 | `list_catalogs()` | `None` | A two-level engine: the explorer starts at schemas |
 | `list_catalog_schemas(catalog)` | filters `list_schemas()` | Every schema is listed to show one catalog |
 | `explorer_fingerprints()` | `schema_fingerprints()` | Right only when the explorer lists nothing but tables and columns |

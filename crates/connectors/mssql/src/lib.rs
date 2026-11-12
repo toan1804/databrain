@@ -70,7 +70,7 @@ impl Connector for MssqlConnector {
                 AuthMethodKind::ClientCredentials,
                 AuthMethodKind::CloudCli,
             ],
-            capabilities: Capabilities { transactions: true, cancel: true, schemas: true, read_only_sessions: false, ssh: true },
+            capabilities: Capabilities { ssh: true },
             fields: vec![
                 FieldSpec::new("host", "Host").required().placeholder("localhost or myserver.database.windows.net"),
                 FieldSpec::new("port", "Port").placeholder("1433"),

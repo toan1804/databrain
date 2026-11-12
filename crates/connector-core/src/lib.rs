@@ -80,6 +80,17 @@ pub trait Connector: Send + Sync {
     async fn connect(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>>;
 }
 
+/// Whether a session has an open transaction ([`Session::transaction_state`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxState {
+    /// None open: the session can be closed or replaced.
+    None,
+    /// One is open.
+    Open,
+    /// The connector can't tell (treated as open).
+    Unknown,
+}
+
 /// A live database session. Sessions are shared behind `Arc`, so methods take
 /// `&self`; implementations serialize access internally where the driver
 /// requires it.
@@ -91,10 +102,21 @@ pub trait Session: Send + Sync {
 
     async fn ping(&self) -> Result<()>;
 
-    /// A transaction is (probably) open on the session: statements on
-    /// another session would not see its uncommitted changes.
+    /// Whether a transaction is open on the session. Every connector should
+    /// say: [`TxState::None`] where the engine has no transactions spanning
+    /// statements, [`TxState::Open`]/[`TxState::None`] from the driver or
+    /// from [`conn_state::ConnState`] elsewhere. The default, `Unknown`, is
+    /// treated as open (the session is kept, not idle-closed or replaced),
+    /// so a connector that doesn't implement this never loses work.
+    fn transaction_state(&self) -> TxState {
+        TxState::Unknown
+    }
+
+    /// A transaction is (or may be) open on the session: statements on
+    /// another session would not see its uncommitted changes, and dropping
+    /// the session would lose them.
     fn in_transaction(&self) -> bool {
-        false
+        self.transaction_state() != TxState::None
     }
 
     /// Execute a single statement and stream its result.

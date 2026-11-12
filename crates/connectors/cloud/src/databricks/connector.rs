@@ -54,7 +54,7 @@ impl Connector for DatabricksConnector {
                 AuthMethodKind::ClientCredentials,
                 AuthMethodKind::CloudCli,
             ],
-            capabilities: Capabilities { transactions: false, cancel: true, schemas: true, read_only_sessions: false, ssh: false },
+            capabilities: Capabilities { ssh: false },
             fields: vec![
                 FieldSpec::new("host", "Workspace host").required().placeholder("adb-1234567890.12.azuredatabricks.net"),
                 FieldSpec::new("http_path", "SQL warehouse HTTP path").required().placeholder("/sql/1.0/warehouses/abc123def456"),

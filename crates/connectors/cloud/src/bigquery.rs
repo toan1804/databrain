@@ -50,7 +50,7 @@ impl Connector for BigQueryConnector {
             default_port: None,
             uses_file: false,
             auth_methods: vec![AuthMethodKind::OauthBrowser, AuthMethodKind::ServiceAccount, AuthMethodKind::CloudCli],
-            capabilities: Capabilities { transactions: true, cancel: true, schemas: true, read_only_sessions: false, ssh: false },
+            capabilities: Capabilities { ssh: false },
             fields: vec![
                 FieldSpec::new("project", "Billing project ID").required().placeholder("my-gcp-project"),
                 FieldSpec::new("location", "Location").placeholder("US / EU / asia-southeast1"),
@@ -424,6 +424,11 @@ fn split_dataset(path: &str) -> Result<(&str, &str)> {
 impl Session for BqSession {
     fn kind(&self) -> ConnectorKind {
         ConnectorKind::Bigquery
+    }
+
+    /// Every statement is its own job: a transaction can't span two of them.
+    fn transaction_state(&self) -> databrain_connector_core::TxState {
+        databrain_connector_core::TxState::None
     }
 
     async fn server_version(&self) -> Result<String> {

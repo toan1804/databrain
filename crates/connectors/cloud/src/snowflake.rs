@@ -82,7 +82,7 @@ impl Connector for SnowflakeConnector {
                 AuthMethodKind::KeyPair,
                 AuthMethodKind::Password,
             ],
-            capabilities: Capabilities { transactions: true, cancel: true, schemas: true, read_only_sessions: false, ssh: false },
+            capabilities: Capabilities { ssh: false },
             fields: vec![
                 FieldSpec::new("account", "Account identifier").required().placeholder("myorg-myaccount or xy12345.eu-west-1"),
                 FieldSpec::new("warehouse", "Warehouse").placeholder("COMPUTE_WH"),
@@ -134,7 +134,13 @@ impl Connector for SnowflakeConnector {
         let base = format!("https://{}", host(cfg, &acct));
         let http = http();
         let token = login(&http, &base, &acct, cfg, creds.as_ref()).await?;
-        let inner = Arc::new(Inner { base, http, token: Mutex::new(token), request_seq: std::sync::atomic::AtomicU64::new(1) });
+        let inner = Arc::new(Inner {
+            base,
+            http,
+            token: Mutex::new(token),
+            request_seq: std::sync::atomic::AtomicU64::new(1),
+            state: databrain_connector_core::conn_state::ConnState::new(),
+        });
         Ok(Box::new(SfSession(inner)))
     }
 }
@@ -281,6 +287,8 @@ struct Inner {
     http: reqwest::Client,
     token: Mutex<Tokens>,
     request_seq: std::sync::atomic::AtomicU64,
+    /// Transactions and settings, followed from the statements run.
+    state: databrain_connector_core::conn_state::ConnState,
 }
 
 fn col_type(rt: &serde_json::Value) -> (ColType, String) {
@@ -554,6 +562,14 @@ impl Session for SfSession {
         ConnectorKind::Snowflake
     }
 
+    /// Followed from the statements run (`BEGIN` … `COMMIT`): the REST API
+    /// doesn't report it. DDL commits implicitly, which isn't seen: the
+    /// session then counts as open until the next COMMIT or ROLLBACK (kept,
+    /// never lost).
+    fn transaction_state(&self) -> databrain_connector_core::TxState {
+        if self.0.state.in_transaction() { databrain_connector_core::TxState::Open } else { databrain_connector_core::TxState::None }
+    }
+
     async fn server_version(&self) -> Result<String> {
         let r = self.0.run_small("select current_version(), current_account(), current_warehouse(), current_role()").await?;
         let row = r.into_iter().next().unwrap_or_default();
@@ -566,6 +582,7 @@ impl Session for SfSession {
     }
 
     async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+        self.0.state.observe(sql, ConnectorKind::Snowflake);
         let (tx, stream) = QueryStream::channel(4);
         let inner = self.0.clone();
         let sql = sql.to_string();

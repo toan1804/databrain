@@ -86,7 +86,7 @@ Each part lists what drives the feature, what you implement or set, and how "not
 - **Format:** `traits.formatter` (sql-formatter language). `""` turns Format off; for a non-SQL language Format says it works on SQL only.
 - **Check before run:** `traits.explain` (a prefix such as `"EXPLAIN "`) lets `Session::check_sql` report unknown tables and columns without running. `None` turns it off.
 - **Cost preview:** `traits.cost_preview` shows the editor's Cost button and bar; implement `Session::estimate_cost` (returns a `CostEstimate`: bytes, rows, partitions, notes) without running the statement. `false` (the default) hides it; `QueryEngine::estimate_cost` refuses other kinds with "X gives no cost estimate before a run".
-- **Manual commit:** `TX_KINDS` in `ui/src/components/EditorPane.tsx` shows the auto/manual commit toggle and the Commit/Rollback badge. Add the kind only when `Session::in_transaction` reports an open transaction correctly. `begin_if_manual` in `crates/query-engine/src/sessions.rs` assumes DDL is transactional except on MySQL; check yours.
+- **Manual commit:** `TX_KINDS` in `ui/src/components/EditorPane.tsx` shows the auto/manual commit toggle and the Commit/Rollback badge. Add the kind only when `Session::transaction_state` reports an open transaction correctly (follow the statements with `ConnState` when the driver can't tell). `begin_if_manual` in `crates/query-engine/src/sessions.rs` assumes DDL is transactional except on MySQL; check yours.
 - **Cancel:** honour `ExecOptions.cancel` in `execute` and stop the query on the server, not only the stream. Set `capabilities.cancel` truthfully.
 
 ### 3.4 Result grid and editing

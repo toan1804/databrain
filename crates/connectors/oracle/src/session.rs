@@ -114,6 +114,12 @@ impl Session for OracleSession {
         ConnectorKind::Oracle
     }
 
+    /// Autocommit is on: each statement commits. A read-only connection keeps
+    /// one READ ONLY transaction, which holds nothing to lose.
+    fn transaction_state(&self) -> databrain_connector_core::TxState {
+        databrain_connector_core::TxState::None
+    }
+
     async fn server_version(&self) -> Result<String> {
         if let Backend::Thin(a) = &self.backend {
             for sql in ["select banner from v$version where rownum = 1", "select 'Oracle ' || version from product_component_version where rownum = 1"] {

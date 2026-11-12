@@ -40,8 +40,8 @@ impl Session for PgSession {
         Ok(row.get(0))
     }
 
-    fn in_transaction(&self) -> bool {
-        self.link.state.in_transaction()
+    fn transaction_state(&self) -> databrain_connector_core::TxState {
+        if self.link.state.in_transaction() { databrain_connector_core::TxState::Open } else { databrain_connector_core::TxState::None }
     }
 
     async fn ping(&self) -> Result<()> {

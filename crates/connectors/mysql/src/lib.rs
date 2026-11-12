@@ -51,7 +51,7 @@ impl Connector for MysqlConnector {
             default_port: Some(3306),
             uses_file: false,
             auth_methods: vec![AuthMethodKind::Password],
-            capabilities: Capabilities { transactions: true, cancel: true, schemas: true, read_only_sessions: true, ssh: true },
+            capabilities: Capabilities { ssh: true },
             fields: vec![
                 FieldSpec::new("host", "Host").required().placeholder("localhost"),
                 FieldSpec::new("port", "Port").placeholder("3306"),

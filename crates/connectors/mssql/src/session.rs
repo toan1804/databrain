@@ -173,8 +173,8 @@ impl Session for MssqlSession {
         Ok(r.first().and_then(|r| r.get::<&str, _>(0)).map(|s| s.lines().next().unwrap_or(s).trim().to_string()).unwrap_or_default())
     }
 
-    fn in_transaction(&self) -> bool {
-        self.state.in_transaction()
+    fn transaction_state(&self) -> databrain_connector_core::TxState {
+        if self.state.in_transaction() { databrain_connector_core::TxState::Open } else { databrain_connector_core::TxState::None }
     }
 
     async fn ping(&self) -> Result<()> {

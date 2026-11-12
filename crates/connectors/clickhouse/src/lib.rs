@@ -60,7 +60,7 @@ impl Connector for ClickhouseConnector {
             default_port: Some(HTTP_PORT),
             uses_file: false,
             auth_methods: vec![AuthMethodKind::Password],
-            capabilities: Capabilities { transactions: false, cancel: true, schemas: true, read_only_sessions: true, ssh: true },
+            capabilities: Capabilities { ssh: true },
             fields: vec![
                 FieldSpec::new("host", "Host").required().placeholder("localhost"),
                 FieldSpec::new("port", "HTTP port").placeholder("8123").help("The HTTP interface: 8123, or 8443 with TLS (ClickHouse Cloud)"),

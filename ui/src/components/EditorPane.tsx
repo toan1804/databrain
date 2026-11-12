@@ -22,7 +22,7 @@ import { kbd } from "../lib/platform";
 const ROW_LIMITS = [100, 500, 1000, 5000, 10000, 50000, 100000, 0];
 
 /** Databases whose open transactions the app can tell (manual commit works there). */
-const TX_KINDS = new Set(["postgres", "mysql", "mssql", "sqlite"]);
+const TX_KINDS = new Set(["postgres", "mysql", "mssql", "sqlite", "duckdb", "snowflake"]);
 
 /**
  * Auto/manual commit toggle and, while the tab's session has a transaction

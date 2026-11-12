@@ -40,7 +40,7 @@ impl Connector for SqliteConnector {
             default_port: None,
             uses_file: true,
             auth_methods: vec![AuthMethodKind::None],
-            capabilities: Capabilities { transactions: true, cancel: true, schemas: true, read_only_sessions: true, ssh: false },
+            capabilities: Capabilities { ssh: false },
             fields: vec![FieldSpec::new("file_path", "Database file").required().placeholder("/path/to/database.db")],
             note: None,
         }
@@ -262,9 +262,15 @@ impl Session for SqliteSession {
         Ok(format!("SQLite {}", rusqlite::version()))
     }
 
-    fn in_transaction(&self) -> bool {
-        // SQLite knows: autocommit is off between BEGIN and COMMIT.
-        self.conn.try_lock().is_ok_and(|c| !c.is_autocommit())
+    fn transaction_state(&self) -> databrain_connector_core::TxState {
+        use databrain_connector_core::TxState;
+        // SQLite knows: autocommit is off between BEGIN and COMMIT. Busy
+        // (a statement running): can't ask.
+        match self.conn.try_lock() {
+            Ok(c) if c.is_autocommit() => TxState::None,
+            Ok(_) => TxState::Open,
+            Err(_) => TxState::Unknown,
+        }
     }
 
     async fn ping(&self) -> Result<()> {

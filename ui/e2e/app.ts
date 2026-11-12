@@ -13,7 +13,7 @@ const connector = (kind: string, display_name: string, default_port: number | nu
   default_port,
   uses_file: kind === "sqlite" || kind === "duckdb",
   auth_methods: kind === "sqlite" ? ["none"] : ["password"],
-  capabilities: { transactions: true, cancel: true, schemas: true, read_only_sessions: true, ssh: kind !== "sqlite" },
+  capabilities: { ssh: kind !== "sqlite" },
   traits: traits[kind],
   fields: fields.map((f) => ({ required: false, ...f })),
 });

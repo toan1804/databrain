@@ -30,6 +30,11 @@ impl Session for ChSession {
         ConnectorKind::Clickhouse
     }
 
+    /// ClickHouse has no transactions across statements (HTTP, one query each).
+    fn transaction_state(&self) -> databrain_connector_core::TxState {
+        databrain_connector_core::TxState::None
+    }
+
     async fn server_version(&self) -> Result<String> {
         let r = self.0.rows("SELECT version()", false).await?;
         Ok(format!("ClickHouse {}", r.first().and_then(|r| r.first().cloned().flatten()).unwrap_or_default()))

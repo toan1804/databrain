@@ -2,6 +2,7 @@
 //! manual commit and transactions, the metadata and indexing sessions.
 
 use super::*;
+use databrain_connector_core::TxState;
 
 impl QueryEngine {
     pub(crate) async fn session(&self, connection_id: &str, tab_id: &str) -> Result<Arc<dyn Session>> {
@@ -265,9 +266,9 @@ impl QueryEngine {
     }
 
     /// The session `session_key` of a connection has an open transaction
-    /// (false when it isn't connected).
+    /// (false when it isn't connected or the connector can't tell).
     pub fn in_transaction(&self, connection_id: &str, session_key: &str) -> bool {
-        self.sessions.lock().get(&(connection_id.to_string(), session_key.to_string())).is_some_and(|l| l.session.in_transaction())
+        self.sessions.lock().get(&(connection_id.to_string(), session_key.to_string())).is_some_and(|l| l.session.transaction_state() == TxState::Open)
     }
 
     /// COMMIT or ROLLBACK the session's transaction. Returns whether one is
@@ -283,11 +284,12 @@ impl QueryEngine {
         // SQL Server nests BEGIN TRAN: each COMMIT ends one level.
         for _ in 0..32 {
             session.execute(sql, ExecOptions::default()).await?.collect().await?;
-            if !commit || !session.in_transaction() {
+            // Only a known open one: an unknown state would repeat COMMIT 32 times.
+            if !commit || session.transaction_state() != TxState::Open {
                 break;
             }
         }
-        Ok(session.in_transaction())
+        Ok(session.transaction_state() == TxState::Open)
     }
 
     /// Manual commit: open a transaction before a write when none is open.
@@ -304,7 +306,9 @@ impl QueryEngine {
         }
         let Some((begin, _, _)) = edit::apply_style(kind) else { return Ok(()) };
         let session = self.session_for(&req.connection_id, req.session_key(), req.origin).await?;
-        if !session.in_transaction() {
+        // Unknown: BEGIN anyway; "already in a transaction" from the server
+        // is better than a write that commits on its own in manual mode.
+        if session.transaction_state() != TxState::Open {
             session.execute(begin, ExecOptions::default()).await?.collect().await?;
         }
         Ok(())

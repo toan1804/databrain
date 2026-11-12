@@ -125,7 +125,7 @@ pub trait Session: Send + Sync {
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>>;
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>>;
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail>;
-    // With defaults: in_transaction, list_catalogs, list_catalog_schemas,
+    // With defaults: transaction_state, in_transaction, list_catalogs, list_catalog_schemas,
     // explorer_fingerprints, object_versions, list_objects_named, object_ddl,
     // search_objects, search_schema, search_routines, package_members,
     // bulk_metadata, schema_fingerprints, schema_object_counts, check_sql,

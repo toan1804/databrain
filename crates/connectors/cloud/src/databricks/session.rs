@@ -18,6 +18,11 @@ impl Session for DbxSession {
         ConnectorKind::Databricks
     }
 
+    /// Databricks SQL commits each statement; there are no multi-statement transactions.
+    fn transaction_state(&self) -> databrain_connector_core::TxState {
+        databrain_connector_core::TxState::None
+    }
+
     async fn server_version(&self) -> Result<String> {
         let r = self.0.run_small("SELECT current_version().dbsql_version").await.unwrap_or_default();
         let v = r.first().and_then(|r| cell(r, 0)).unwrap_or_default();

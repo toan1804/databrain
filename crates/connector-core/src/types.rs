@@ -239,11 +239,9 @@ impl ConnectionConfig {
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[ts(export)]
 pub struct Capabilities {
-    pub transactions: bool,
-    pub cancel: bool,
-    pub schemas: bool,
-    pub read_only_sessions: bool,
-    /// Supports an SSH tunnel.
+    /// Supports an SSH tunnel. (What else a connector supports is in its
+    /// `SourceTraits`, or reported by the `Session` method that does it:
+    /// `transaction_state`, `object_versions`, `check_sql`….)
     pub ssh: bool,
 }
 

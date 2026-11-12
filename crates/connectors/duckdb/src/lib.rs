@@ -68,7 +68,7 @@ impl Connector for DuckdbConnector {
             default_port: None,
             uses_file: true,
             auth_methods: vec![AuthMethodKind::None],
-            capabilities: Capabilities { transactions: true, cancel: true, schemas: true, read_only_sessions: true, ssh: false },
+            capabilities: Capabilities { ssh: false },
             fields: vec![
                 FieldSpec::new("file_path", "Database file").placeholder(":memory: (or /path/to/db.duckdb)"),
                 FieldSpec::new("files", "Attached files")
@@ -127,6 +127,7 @@ impl Connector for DuckdbConnector {
             loaded: db.as_ref().map(|d| d.loaded.clone()).unwrap_or_default(),
             sandboxed: sandbox,
             conn: Arc::new(Mutex::new(FileConn { conn, _db: db })),
+            state: Default::default(),
         }))
     }
 }

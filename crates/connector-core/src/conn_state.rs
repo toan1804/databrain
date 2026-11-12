@@ -121,6 +121,11 @@ mod tests {
         assert!(after(Mssql, &["begin tran", "begin transaction", "commit"]).1, "nested");
         assert_eq!(after(Mssql, &["begin tran", "begin transaction", "commit", "commit tran"]), (true, false));
         assert_eq!(after(Mssql, &["begin try select 1 end try begin catch end catch"]), (true, false));
+        // Snowflake follows its transactions this way (its API doesn't report them).
+        assert!(after(Snowflake, &["begin", "insert into t values (1)"]).1);
+        assert!(after(Snowflake, &["begin transaction", "select 1"]).1);
+        assert!(!after(Snowflake, &["begin", "commit"]).1);
+        assert!(!after(Snowflake, &["start transaction", "rollback"]).1);
     }
 
     #[test]
