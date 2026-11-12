@@ -5,7 +5,7 @@
 //!
 //! A new language: add its [`QueryLanguage`] variant and a `classify` arm.
 
-use crate::sql::{Classification, StatementKind, StatementSpan, keyword_kind, leading_keyword, words};
+use crate::sql::{Classification, StatementKind, StatementSpan, leading_keyword, words};
 use crate::traits::QueryLanguage;
 
 /// The whole (trimmed) text as one command (MongoDB JSON).
@@ -24,14 +24,6 @@ pub fn classify(text: &str, language: QueryLanguage) -> Classification {
     let has = |list: &[&str]| words(text).any(|w| list.iter().any(|k| w.eq_ignore_ascii_case(k)));
     let kind = match language {
         QueryLanguage::Sql => unreachable!("SQL is classified in sql::classify"),
-        // CQL keywords mean what they mean in SQL; BATCH groups writes.
-        QueryLanguage::Cql => match keyword.as_str() {
-            // `BEGIN [UNLOGGED|COUNTER] BATCH … APPLY BATCH` writes.
-            "BATCH" | "APPLY" => StatementKind::Dml,
-            "BEGIN" if has(&["BATCH"]) => StatementKind::Dml,
-            "SELECT" if has(&["INSERT", "UPDATE", "DELETE"]) => StatementKind::Unknown,
-            k => keyword_kind(k),
-        },
         QueryLanguage::Cypher => {
             if has(&["CONSTRAINT", "INDEX"]) && has(&["CREATE", "DROP"]) {
                 StatementKind::Ddl
@@ -287,7 +279,6 @@ mod tests {
     use crate::traits::{STANDARD, SourceTraits};
 
     const MONGO: SourceTraits = SourceTraits { language: QueryLanguage::MongoJson, ..STANDARD };
-    const CQL: SourceTraits = SourceTraits { language: QueryLanguage::Cql, ..STANDARD };
     const CYPHER: SourceTraits = SourceTraits { language: QueryLanguage::Cypher, ..STANDARD };
 
     #[test]
@@ -296,8 +287,6 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].sql, "db.orders.find({\"a\": \"x;y\"})");
         assert!(split_with("   ", &MONGO).is_empty());
-        let c: Vec<String> = split_with("SELECT * FROM ks.t; INSERT INTO ks.t (a) VALUES ('x;y');", &CQL).into_iter().map(|s| s.sql).collect();
-        assert_eq!(c, vec!["SELECT * FROM ks.t", "INSERT INTO ks.t (a) VALUES ('x;y')"]);
         assert_eq!(split_with("MATCH (n) RETURN n; MATCH (m) RETURN m", &CYPHER).len(), 2);
     }
 
@@ -318,9 +307,6 @@ mod tests {
         assert_eq!(k("use shop\ndb.getSiblingDB(\"x\").getCollection(\"o\").find({}).limit(5)", L::MongoJson), S::Read);
         assert_eq!(k("db.getCollection('o').insertOne({})", L::MongoJson), S::Dml);
         assert_eq!(k("db.runCommand({ping: 1})", L::MongoJson), S::Unknown);
-        assert_eq!(k("SELECT * FROM ks.users WHERE id = 1", L::Cql), S::Read);
-        assert_eq!(k("BEGIN BATCH INSERT INTO t (a) VALUES (1); APPLY BATCH", L::Cql), S::Dml);
-        assert_eq!(k("CREATE TABLE ks.t (id int PRIMARY KEY)", L::Cql), S::Ddl);
         assert_eq!(k("MATCH (p:Person) RETURN p.name LIMIT 5", L::Cypher), S::Read);
         assert_eq!(k("MATCH (p:Person {name: 'A'}) SET p.age = 3", L::Cypher), S::Dml);
         assert_eq!(k("CREATE INDEX FOR (p:Person) ON (p.name)", L::Cypher), S::Ddl);

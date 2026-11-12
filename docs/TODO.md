@@ -66,7 +66,7 @@ Paths are in `crates/connector-core/src/` unless given in full. From one reading
 
 ### Low
 
-- Structure: five hand-written lexers (splitter and params, two in redact, `referenced_results`, `changes_default`) beside the parser's; `QueryLanguage::Cql` has no connector; `lib.rs` mixes the traits with quoting and catalog helpers.
+- The redaction functions (`sql/redact.rs`) keep their own, dialect-free lexing on purpose: they scrub any text (history, logs, error messages) without knowing its database. Revisit only with idea 5.
 
 ### Ways to fix them (ideas, in the order suggested)
 

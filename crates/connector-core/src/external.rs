@@ -127,106 +127,78 @@ impl ExternalTablesSlot {
 }
 
 /// Names referenced as `results.<name>` / `results."<name>"` in `sql`
-/// (case-insensitive schema; strings and comments are skipped). Unique, in
+/// (case-insensitive schema; strings, comments and dollar-quoted text are
+/// skipped as DuckDB reads them, [`crate::sql::skip_token`]). Unique, in
 /// order of first appearance.
 pub fn referenced_results(sql: &str) -> Vec<String> {
-    let chars: Vec<char> = sql.chars().collect();
-    let n = chars.len();
-    let mut out: Vec<String> = Vec::new();
-    let mut i = 0;
-    let ident_char = |c: char| c.is_alphanumeric() || c == '_';
-    while i < n {
-        let c = chars[i];
-        // Skip string literals, comments and dollar quotes.
-        if c == '\'' {
-            i += 1;
-            while i < n {
-                if chars[i] == '\'' {
-                    if i + 1 < n && chars[i + 1] == '\'' {
-                        i += 2;
-                        continue;
-                    }
-                    break;
-                }
-                i += 1;
-            }
-            i += 1;
-            continue;
-        }
-        if c == '-' && i + 1 < n && chars[i + 1] == '-' {
-            while i < n && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && i + 1 < n && chars[i + 1] == '*' {
-            i += 2;
-            while i + 1 < n && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            i += 2;
-            continue;
-        }
-        // Candidate schema token: `results` or `"results"`, not part of a longer identifier.
-        let (schema_end, matched) = if c == '"' {
-            let word: String = chars[i + 1..].iter().take(8).collect();
-            if word.eq_ignore_ascii_case("results\"") { (i + 9, true) } else { (i + 1, false) }
-        } else if (i == 0 || !ident_char(chars[i - 1]) && chars[i - 1] != '.') && c.eq_ignore_ascii_case(&'r') {
-            let word: String = chars[i..].iter().take(7).collect();
-            let after = chars.get(i + 7).copied();
-            if word.eq_ignore_ascii_case("results") && after.is_none_or(|a| !ident_char(a)) { (i + 7, true) } else { (i + 1, false) }
-        } else {
-            (i + 1, false)
-        };
-        if !matched {
-            if c == '"' {
-                // Skip a quoted identifier entirely.
-                let mut j = i + 1;
-                while j < n && chars[j] != '"' {
-                    j += 1;
-                }
-                i = j + 1;
-            } else {
-                i = schema_end;
-            }
-            continue;
-        }
-        let mut j = schema_end;
-        while j < n && chars[j].is_whitespace() {
+    let syntax = &crate::traits::DUCKDB.syntax;
+    let b = sql.as_bytes();
+    let n = b.len();
+    // Identifier bytes: ASCII word characters and any UTF-8 byte.
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+    let ws = |mut j: usize| {
+        while j < n && b[j].is_ascii_whitespace() {
             j += 1;
         }
-        if j >= n || chars[j] != '.' {
+        j
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        // The schema: `results` or `"results"`, not part of a longer name.
+        let schema_end = if b[i] == b'"' && sql.get(i + 1..i + 9).is_some_and(|w| w.eq_ignore_ascii_case("results\"")) {
+            Some(i + 9)
+        } else if (i == 0 || !(ident(b[i - 1]) || b[i - 1] == b'.'))
+            && sql.get(i..i + 7).is_some_and(|w| w.eq_ignore_ascii_case("results"))
+            && b.get(i + 7).is_none_or(|a| !ident(*a))
+        {
+            Some(i + 7)
+        } else {
+            None
+        };
+        let Some(schema_end) = schema_end else {
+            i = match crate::sql::skip_token(sql, i, syntax) {
+                Some((end, _)) => end,
+                None if ident(b[i]) => (i..n).find(|&k| !ident(b[k])).unwrap_or(n),
+                None => i + 1,
+            };
+            continue;
+        };
+        let mut j = ws(schema_end);
+        if j >= n || b[j] != b'.' {
             i = schema_end;
             continue;
         }
-        j += 1;
-        while j < n && chars[j].is_whitespace() {
-            j += 1;
-        }
-        let name = if j < n && chars[j] == '"' {
-            let start = j + 1;
-            let mut k = start;
-            let mut s = String::new();
+        j = ws(j + 1);
+        let name = if j < n && b[j] == b'"' {
+            // `"…"` with `""` for a quote.
+            let mut name = String::new();
+            let mut k = j + 1;
+            let mut from = k;
             while k < n {
-                if chars[k] == '"' {
-                    if k + 1 < n && chars[k + 1] == '"' {
-                        s.push('"');
+                if b[k] == b'"' {
+                    name.push_str(&sql[from..k]);
+                    if b.get(k + 1) == Some(&b'"') {
+                        name.push('"');
                         k += 2;
+                        from = k;
                         continue;
                     }
                     break;
                 }
-                s.push(chars[k]);
                 k += 1;
             }
-            j = k + 1;
-            s
+            if k >= n {
+                name.push_str(&sql[from..n]);
+            }
+            j = (k + 1).min(n);
+            name
         } else {
             let start = j;
-            while j < n && ident_char(chars[j]) {
+            while j < n && ident(b[j]) {
                 j += 1;
             }
-            chars[start..j].iter().collect()
+            sql[start..j].to_string()
         };
         if !name.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&name)) {
             out.push(name);
@@ -249,6 +221,9 @@ mod tests {
         assert!(referenced_results("select 'it''s results.x'").is_empty());
         assert_eq!(referenced_results("SELECT * FROM results.revenue__2 r"), vec!["revenue__2"]);
         assert!(referenced_results("select results from t").is_empty());
+        // Dollar-quoted and E'…' text is skipped as DuckDB reads it.
+        assert!(referenced_results("select $$ results.a $$, E'it\\'s results.b'").is_empty());
+        assert_eq!(referenced_results("select * from results.ünï, results.\"a\"\"b\""), vec!["ünï", "a\"b"]);
     }
 }
 

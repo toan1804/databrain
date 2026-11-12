@@ -6,7 +6,9 @@ Main files (`crates/connector-core/src/`):
 
 | File | What it holds |
 |---|---|
-| `lib.rs` | `Connector`, `Session`, `ConnectorRegistry`, default catalog helpers (`search_by_listing`, `default_bulk_metadata`, `assemble_metadata`), `query_text` / `query_table`, `quote_ident`, `quote_path`, `quote_object`, `split_path`, the option names `SANDBOX_OPTION`, `CONNECT_TIMEOUT_OPTION`, `IDLE_DISCONNECT_OPTION` |
+| `lib.rs` | `Connector`, `Session`, `TxState`, `ConnectorRegistry`, the option names `SANDBOX_OPTION`, `CONNECT_TIMEOUT_OPTION`, `IDLE_DISCONNECT_OPTION` |
+| `catalog.rs` | Default catalog helpers (`search_by_listing`, `default_bulk_metadata`, `assemble_metadata`), `query_text` / `query_table`, index and list parsing |
+| `quote.rs` | `quote_ident`, `quote_path`, `quote_object`, `split_path`, `quote_literal` |
 | `types.rs` | `ConnectorKind`, `ConnectionConfig`, `ConnectorInfo`, `Capabilities`, `FieldSpec`, catalog types (`SchemaInfo`, `DbObject`, `ColumnInfo`, `ObjectDetail`, `TableLayout`, `CostEstimate`, `SchemaMetadata`), search ranking |
 | `traits.rs` | `SourceTraits` and one constant per kind, `SqlSyntax`, `LoadTraits`, `preview_query` |
 | `value.rs` | `Value`, `ColType`, `Column`, `BatchBuilder`, date and time parsing and formatting |
@@ -17,7 +19,7 @@ Main files (`crates/connector-core/src/`):
 | `sql/classify.rs` | `classify`, `StatementKind`, `Classification` |
 | `sql/read_only.rs` | `read_only_allows`, `unknown_functions` |
 | `sql/redact.rs` | `redact_text`, `redact_secrets`, `redact_url_passwords`, `redact_key_values` |
-| `language.rs` | Classification and table references for Cypher, CQL and MongoDB commands |
+| `language.rs` | Classification and table references for Cypher and MongoDB commands |
 | `documents.rs` | `RowBatcher`: rows of documents or records to Arrow |
 | `tables.rs` | `table_refs`: which tables a script reads and writes |
 | `conn_state.rs` | `ConnState`: what a connection carries besides single statements |
@@ -167,8 +169,8 @@ editor text
 
 | Stage | Guarantees | Assumes |
 |---|---|---|
-| Split | Spans are in order, don't overlap, and `text[start..end] == sql`. Comment-only pieces are dropped. Text inside quotes, comments and dollar quotes never ends a statement | The lexical rules in `SqlSyntax` match the server's. The splitter is hand-written and separate from sqlparser's tokenizer |
-| Parameters | A value is one number, `NULL` / `TRUE` / `FALSE`, one string literal as typed, or a quoted string (`quote_string`), unless `raw`. `:name` inside strings, quoted names and comments is left alone | The same lexical rules as the splitter (it shares `lex`, `skip_quoted`, `dollar_tag`). `raw` values and Oracle `&name` are inserted as typed |
+| Split | Spans are in order, don't overlap, and `text[start..end] == sql`. Comment-only pieces are dropped. Text inside quotes, comments and dollar quotes never ends a statement | The lexical rules in `SqlSyntax` match the server's. The splitter is hand-written and separate from sqlparser's tokenizer; its reading of comments and quoted text (`skip_token`, incl. `E'…'` and `q'[…]'` where the dialect has them) is shared with the parameter finder and `referenced_results` |
+| Parameters | A value is one number, `NULL` / `TRUE` / `FALSE`, one string literal as typed, or a quoted string (`quote_string`), unless `raw`. `:name` inside strings, quoted names and comments is left alone | The same lexical rules as the splitter (both use `skip_token`). `raw` values and Oracle `&name` are inserted as typed |
 | Classify | One `StatementKind` for the text; several parsed statements give the highest kind in the order `Read < Session < Transaction < Dml < Ddl < Other < Unknown` | The text is what the server will run (parameters already in). The sqlparser dialect reads it as the server does |
 | Read-only | `true` only for `Read`, `USE` (not `USE ROLE` / `USE SECONDARY`) and `SET` of a name in `READ_ONLY_SETTINGS` | The `Classification` is of this same text |
 | Redact | Only literal values (and the bare word after `IDENTIFIED BY`) are replaced by `***`; the statement keeps its shape | Text, not a parse: it works on SQL, error messages and connection strings alike |
@@ -233,7 +235,6 @@ A new secret syntax is added by word (`SECRET_WORDS`, `secret_name`) with a test
 |---|---|---|
 | Cypher (Neo4j) | at `;` with the standard lexer | Words anywhere in the text: constraint or index with `CREATE` / `DROP` → `Ddl`; a write clause word → `Dml`; `CALL` → `Unknown`; otherwise `Read` only when the first word is a read clause, else `Unknown` |
 | MongoDB commands | whole text | The connector's own parser, registered once per process with `set_mongo_analyzer` (`MongoInfo`: kind, collections read and written, `$lookup` joins). A command it can't parse is `Unknown`. Without an analyzer, text rules (`mongo_kind`); `$out` / `$merge` anywhere make an aggregate a write |
-| CQL | at `;` | `keyword_kind`, with `BATCH` as a write. No connector uses it yet |
 
 `mongo_table_refs` and `mongo_joins` feed `table_refs` and lineage. `unknown_functions` returns nothing for these languages.
 

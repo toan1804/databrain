@@ -19,8 +19,6 @@ use crate::types::ConnectorKind;
 #[serde(rename_all = "snake_case")]
 pub enum QueryLanguage {
     Sql,
-    /// Cassandra/ScyllaDB CQL (SQL-like, no joins).
-    Cql,
     /// Neo4j Cypher.
     Cypher,
     /// MongoDB shell-style JSON commands.

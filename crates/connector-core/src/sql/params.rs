@@ -1,7 +1,6 @@
 use serde::Serialize;
 
-use super::splitter::{dollar_tag, lex, skip_line, skip_quoted};
-use crate::traits::DollarQuotes;
+use super::splitter::{Skipped, skip_token};
 use crate::types::ConnectorKind;
 
 /// A parameter in a script (byte offsets of `:name` / `&name`).
@@ -69,12 +68,25 @@ pub fn find_parameters(text: &str, kind: ConnectorKind) -> Vec<ParamSpan> {
     let amp = kind.traits().syntax.ampersand_vars;
     let b = text.as_bytes();
     let n = b.len();
-    let lx = lex(kind);
+    let syntax = &kind.traits().syntax;
     let mut out = Vec::new();
     let mut i = 0usize;
     let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
     while i < n {
         let c = b[i];
+        // Comments and quoted text as the splitter reads them; `&name`
+        // substitution variables also work inside '…' (SQL*Plus).
+        if c != b'&'
+            && let Some((end, what)) = skip_token(text, i, syntax)
+        {
+            if let Skipped::SingleQuoted { start } = what
+                && amp
+            {
+                ampersand_vars(text, start + 1, end.saturating_sub(1).max(start + 1), &mut out);
+            }
+            i = end;
+            continue;
+        }
         match c {
             b'&' if amp => match ampersand_at(text, i, n) {
                 Some(p) => {
@@ -82,33 +94,6 @@ pub fn find_parameters(text: &str, kind: ConnectorKind) -> Vec<ParamSpan> {
                     out.push(p);
                 }
                 None => i += 1,
-            },
-            b'-' if i + 1 < n && b[i + 1] == b'-' => i = skip_line(b, i),
-            b'#' if lx.hash_comment => i = skip_line(b, i),
-            b'/' if lx.slash_comment && i + 1 < n && b[i + 1] == b'/' => i = skip_line(b, i),
-            b'/' if i + 1 < n && b[i + 1] == b'*' => {
-                i = text[i + 2..].find("*/").map_or(n, |p| i + 2 + p + 2);
-            }
-            b'\'' | b'"' if lx.triple_quotes && b[i..].starts_with(if c == b'"' { b"\"\"\"" } else { b"'''" }) => {
-                let q = &text[i..i + 3];
-                i = text[i + 3..].find(q).map_or(n, |p| i + 3 + p + 3);
-            }
-            b'\'' => {
-                let end = skip_quoted(b, i, b'\'', lx.backslash_escapes);
-                if amp {
-                    ampersand_vars(text, i + 1, end.saturating_sub(1).max(i + 1), &mut out);
-                }
-                i = end;
-            }
-            b'"' => i = skip_quoted(b, i, b'"', kind.traits().syntax.backslash_in_double_quotes),
-            b'`' if lx.backtick => i = skip_quoted(b, i, b'`', false),
-            b'[' if lx.brackets => i = text[i..].find(']').map_or(n, |p| i + p + 1),
-            b'$' if lx.dollar => match dollar_tag(text, i) {
-                Some(tag) if kind.traits().syntax.dollar == DollarQuotes::Tagged || tag == "$$" => {
-                    let body = i + tag.len();
-                    i = text[body..].find(tag).map_or(n, |p| body + p + tag.len());
-                }
-                _ => i += 1,
             },
             b':' => {
                 if i + 1 < n && b[i + 1] == b':' {
@@ -190,7 +175,7 @@ fn is_number(t: &str) -> bool {
 /// server reads backslashes as escapes (MySQL `NO_BACKSLASH_ESCAPES`), the
 /// typed text is quoted as a value instead.
 fn is_string_literal(t: &str, kind: ConnectorKind) -> bool {
-    if lex(kind).backslash_escapes && t.contains('\\') {
+    if kind.traits().syntax.backslash_escapes && t.contains('\\') {
         return false;
     }
     let b = t.as_bytes();
@@ -223,7 +208,7 @@ fn is_string_literal(t: &str, kind: ConnectorKind) -> bool {
 /// the same place whether or not the server reads backslashes as escapes
 /// (MySQL `NO_BACKSLASH_ESCAPES`); BigQuery and Databricks only accept `\'`.
 pub fn quote_string(t: &str, kind: ConnectorKind) -> String {
-    if !lex(kind).backslash_escapes {
+    if !kind.traits().syntax.backslash_escapes {
         return format!("'{}'", t.replace('\'', "''"));
     }
     let t = t.replace('\\', "\\\\");
@@ -275,7 +260,21 @@ mod param_tests {
     /// whether or not the server reads backslashes as escapes (MySQL
     /// `NO_BACKSLASH_ESCAPES`), for hostile values and typed literals alike.
     #[test]
+    fn parameters_inside_strings_are_text_for_every_string_form() {
+        let names = |sql: &str, k: K| find_parameters(sql, k).into_iter().map(|p| p.name).collect::<Vec<_>>();
+        // The splitter and the parameter finder read strings the same way.
+        assert_eq!(names("select E'it\\'s :x' , :y", K::Postgres), vec!["y"]);
+        assert_eq!(names("select e'a\\\\' || :z from t where id = :id", K::Duckdb), vec!["z", "id"], "an escaped backslash ends nothing");
+        assert!(names("select e'a\\' || :z", K::Duckdb).is_empty(), "\\' doesn't end it: still in the string");
+        assert_eq!(names("select q'[it's :x]' from dual where a = :a", K::Oracle), vec!["a"]);
+        assert_eq!(names("select nq'{:x}' from dual", K::Oracle), Vec::<String>::new());
+        // Not an escape string where E'…' isn't one: \' ends the string.
+        assert_eq!(names("select E'a\\' , :b", K::Mssql), vec!["b"]);
+    }
+
+    #[test]
     fn values_stay_inside_their_quotes() {
+        use super::super::splitter::skip_quoted;
         let ends_at_last = |lit: &str, backslash: bool| {
             let b = lit.as_bytes();
             let start = usize::from(b[0] != b'\'');
@@ -286,7 +285,7 @@ mod param_tests {
             for v in hostile {
                 let lit = render_param(&ParamValue { value: v.into(), raw: false }, kind).unwrap();
                 // Engines that may read backslashes are checked both ways.
-                let both = !lex(kind).backslash_escapes || ends_at_last(&lit, true);
+                let both = !kind.traits().syntax.backslash_escapes || ends_at_last(&lit, true);
                 assert!(both && ends_at_last(&lit, false), "{kind:?}: {v} → {lit}");
             }
         }

@@ -204,7 +204,6 @@ fn language_rules(kind: databrain_connector_core::ConnectorKind) -> String {
             A returned node or relationship becomes columns of its properties. Put queries in ```cypher blocks. \
             To join with other sources, combine outputs with query_outputs (DuckDB SQL over results.<handle>).\n"
             .into(),
-        L::Cql => format!("\nThis connection is {}: write CQL (no joins; filter on the partition key; always add LIMIT).\n", t.name),
     }
 }
 

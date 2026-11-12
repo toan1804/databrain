@@ -7,7 +7,7 @@
 import builtIn from "./sourceTraits.json";
 import type { ConnectorKind } from "./types";
 
-export type QueryLanguage = "sql" | "cql" | "cypher" | "mongo_json";
+export type QueryLanguage = "sql" | "cypher" | "mongo_json";
 
 export interface SourceTraits {
   name: string;

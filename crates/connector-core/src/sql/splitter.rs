@@ -14,36 +14,69 @@ pub struct StatementSpan {
     pub sql: String,
 }
 
-/// Lexical rules per dialect.
-pub(super) struct Lex {
-    pub(super) backslash_escapes: bool,
-    pub(super) backtick: bool,
-    pub(super) hash_comment: bool,
-    pub(super) slash_comment: bool,
-    pub(super) brackets: bool,
-    /// Postgres `$tag$`; Snowflake `$$`.
-    pub(super) dollar: bool,
-    pub(super) triple_quotes: bool,
-    pub(super) escape_strings: bool,
-    pub(super) q_quotes: bool,
+/// What [`skip_token`] skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Skipped {
+    Comment,
+    /// A `'…'` literal (`start` is its opening quote).
+    SingleQuoted {
+        start: usize,
+    },
+    /// Any other quoted text: `"…"`, `` `…` ``, `[…]`, `$tag$…$tag$`,
+    /// `'''…'''`, `E'…'`, `q'[…]'`.
+    Quoted,
 }
 
-pub(super) fn lex(kind: ConnectorKind) -> Lex {
-    lex_of(&kind.traits().syntax)
-}
-
-fn lex_of(x: &SqlSyntax) -> Lex {
-    Lex {
-        backslash_escapes: x.backslash_escapes,
-        backtick: x.backtick,
-        hash_comment: x.hash_comment,
-        slash_comment: x.slash_comment,
-        brackets: x.brackets,
-        dollar: x.dollar != DollarQuotes::None,
-        triple_quotes: x.triple_quotes,
-        escape_strings: x.escape_strings,
-        q_quotes: x.q_quotes,
-    }
+/// The one reading of a dialect's comments and quoted text, shared by the
+/// splitter and the parameter finder so they can't disagree about where a
+/// string ends: when one starts at byte `i`, where it ends and what it was.
+/// `None` when `i` starts neither.
+pub(crate) fn skip_token(text: &str, i: usize, syntax: &SqlSyntax) -> Option<(usize, Skipped)> {
+    let b = text.as_bytes();
+    let n = b.len();
+    let c = *b.get(i)?;
+    let next = b.get(i + 1).copied();
+    let ident = |k: usize| k > 0 && (b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_' || b[k - 1] == b'$' || b[k - 1] == b'.');
+    let end = match c {
+        b'-' if next == Some(b'-') => return Some((skip_line(b, i), Skipped::Comment)),
+        b'#' if syntax.hash_comment => return Some((skip_line(b, i), Skipped::Comment)),
+        b'/' if syntax.slash_comment && next == Some(b'/') => return Some((skip_line(b, i), Skipped::Comment)),
+        b'/' if next == Some(b'*') => return Some((text[i + 2..].find("*/").map_or(n, |p| i + 2 + p + 2), Skipped::Comment)),
+        b'\'' | b'"' if syntax.triple_quotes && b[i..].starts_with(if c == b'"' { b"\"\"\"" } else { b"'''" }) => {
+            let q = &text[i..i + 3];
+            text[i + 3..].find(q).map_or(n, |p| i + 3 + p + 3)
+        }
+        b'\'' => return Some((skip_quoted(b, i, b'\'', syntax.backslash_escapes), Skipped::SingleQuoted { start: i })),
+        b'"' => skip_quoted(b, i, b'"', syntax.backslash_in_double_quotes),
+        b'`' if syntax.backtick => skip_quoted(b, i, b'`', false),
+        b'[' if syntax.brackets => text[i..].find(']').map_or(n, |p| i + p + 1),
+        b'$' if syntax.dollar != DollarQuotes::None => match dollar_tag(text, i) {
+            Some(tag) if syntax.dollar == DollarQuotes::Tagged || tag == "$$" => {
+                let body = i + tag.len();
+                text[body..].find(tag).map_or(n, |p| body + p + tag.len())
+            }
+            _ => return None,
+        },
+        // Postgres/DuckDB E'…': backslashes escape inside.
+        b'E' | b'e' if syntax.escape_strings && next == Some(b'\'') && !ident(i) => skip_quoted(b, i + 1, b'\'', true),
+        // Oracle q'[…]' / nq'{…}': up to the closing delimiter and quote.
+        b'Q' | b'q' | b'N' | b'n' if syntax.q_quotes && !ident(i) => {
+            let q = if matches!(c, b'N' | b'n') && matches!(next, Some(b'q' | b'Q')) { i + 1 } else { i };
+            if !matches!(b[q], b'q' | b'Q') || b.get(q + 1) != Some(&b'\'') || q + 2 >= n {
+                return None;
+            }
+            let close = match b[q + 2] {
+                b'[' => b']',
+                b'{' => b'}',
+                b'(' => b')',
+                b'<' => b'>',
+                c => c,
+            };
+            (q + 3..n.saturating_sub(1)).find(|&k| b[k] == close && b[k + 1] == b'\'').map_or(n, |k| k + 2)
+        }
+        _ => return None,
+    };
+    Some((end, Skipped::Quoted))
 }
 
 /// How a procedural block that contains `;` ends.
@@ -139,7 +172,6 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
     let syntax = &t.syntax;
     let b = text.as_bytes();
     let n = b.len();
-    let lx = lex_of(syntax);
 
     let mut out = Vec::new();
     let mut delimiter: Vec<u8> = b";".to_vec();
@@ -232,61 +264,16 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
         }
 
         let c = b[i];
-        match c {
-            b'-' if i + 1 < n && b[i + 1] == b'-' => {
-                i = skip_line(b, i);
-                continue;
-            }
-            b'#' if lx.hash_comment => {
-                i = skip_line(b, i);
-                continue;
-            }
-            b'/' if lx.slash_comment && i + 1 < n && b[i + 1] == b'/' => {
-                i = skip_line(b, i);
-                continue;
-            }
-            b'/' if i + 1 < n && b[i + 1] == b'*' => {
-                i = match text[i + 2..].find("*/") {
-                    Some(p) => i + 2 + p + 2,
-                    None => n,
-                };
-                continue;
-            }
-            _ => {}
+        if let Some((end, what)) = skip_token(text, i, syntax) {
+            has_code |= what != Skipped::Comment;
+            i = end;
+            continue;
         }
-
         if !c.is_ascii_whitespace() {
             has_code = true;
         }
 
-        let triple: &[u8] = if c == b'"' { b"\"\"\"" } else { b"'''" };
         match c {
-            b'\'' | b'"' if lx.triple_quotes && b[i..].starts_with(triple) => {
-                let q = &text[i..i + 3];
-                i = match text[i + 3..].find(q) {
-                    Some(p) => i + 3 + p + 3,
-                    None => n,
-                };
-            }
-            b'\'' => i = skip_quoted(b, i, b'\'', lx.backslash_escapes),
-            b'"' => i = skip_quoted(b, i, b'"', syntax.backslash_in_double_quotes),
-            b'`' if lx.backtick => i = skip_quoted(b, i, b'`', false),
-            b'[' if lx.brackets => {
-                i = match text[i..].find(']') {
-                    Some(p) => i + p + 1,
-                    None => n,
-                }
-            }
-            b'$' if lx.dollar => match dollar_tag(text, i) {
-                Some(tag) if syntax.dollar == DollarQuotes::Tagged || tag == "$$" => {
-                    let body = i + tag.len();
-                    i = match text[body..].find(tag) {
-                        Some(p) => body + p + tag.len(),
-                        None => n,
-                    };
-                }
-                _ => i += 1,
-            },
             c if (c.is_ascii_alphabetic() || c == b'_')
                 && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$' || b[i - 1] == b'.')) =>
             {
@@ -295,23 +282,6 @@ pub fn split_with(text: &str, t: &SourceTraits) -> Vec<StatementSpan> {
                     j += 1;
                 }
                 let w = &text[i..j];
-                // Postgres/DuckDB E'…': backslashes escape inside.
-                if lx.escape_strings && w.eq_ignore_ascii_case("e") && b.get(j) == Some(&b'\'') {
-                    i = skip_quoted(b, j, b'\'', true);
-                    continue;
-                }
-                // Oracle q'[…]' / nq'{…}': up to the closing delimiter and quote.
-                if lx.q_quotes && (w.eq_ignore_ascii_case("q") || w.eq_ignore_ascii_case("nq")) && b.get(j) == Some(&b'\'') && j + 1 < n {
-                    let close = match b[j + 1] {
-                        b'[' => b']',
-                        b'{' => b'}',
-                        b'(' => b')',
-                        b'<' => b'>',
-                        c => c,
-                    };
-                    i = (j + 2..n.saturating_sub(1)).find(|&k| b[k] == close && b[k + 1] == b'\'').map_or(n, |k| k + 2);
-                    continue;
-                }
                 if syntax.block_end == BlockEnd::EndWord {
                     if w.eq_ignore_ascii_case("BEGIN") {
                         let next = next_word(text, j);

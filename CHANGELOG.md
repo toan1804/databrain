@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Query parameters: `:name` inside a Postgres `E'…'` or Oracle `q'[…]'` string is text, not a parameter (the parameter finder now reads strings exactly as the statement splitter does).
 - Scripts split where the database does: Postgres and DuckDB `E'…'` strings with `\'` inside, Oracle `q'[…]'` strings and Snowflake Scripting blocks (`BEGIN … END;`, `DECLARE … BEGIN … END;`) written without `$$` are no longer cut at their inner `;`.
 - Results: dates and times before year 1 (Postgres `BC`) show instead of NULL; date-times with a UTC offset after fractional seconds (`13:04:05.25+02:00`) are read at the right instant on the cloud connectors; integers too large for a floating-point column are kept rounded and the result says so. Parameters: a value typed as an unfinished string (`'abc''`) is quoted instead of kept as SQL.
 - SQL Server and Oracle: values that don't fit their column's type still show as NULL, but the result now says how many, as the other databases do.
