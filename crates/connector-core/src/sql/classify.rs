@@ -302,10 +302,6 @@ fn chains_statements(sql: &str, kind: ConnectorKind) -> bool {
     }
 }
 
-/// `U&"…"` identifiers spell a name with escapes
-/// (`U&"pg\005Fterminate\005Fbackend"(1)`), so the name lists above can't
-/// see it. Matched anywhere, strings included: being stricter costs a
-/// confirmation.
 /// Snowflake table functions DataBrain knows only read; any other name in
 /// `TABLE(name(…))` may be a stored procedure, which a SELECT can call that
 /// way (and which may write).
@@ -381,19 +377,32 @@ fn snowflake_table_call(sql: &str, kind: ConnectorKind) -> bool {
         while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'.' | b'"' | b'$')) {
             i += 1;
         }
-        let name = code[start..i].replace('"', "");
+        let name = &code[start..i];
         if name.is_empty() || b.get(skip_ws(i)) != Some(&b'(') {
             continue;
         }
-        let last = name.rsplit('.').next().unwrap_or("");
-        let system = name.contains("INFORMATION_SCHEMA.") || name.starts_with("SNOWFLAKE.");
-        if !system && !SNOWFLAKE_TABLE_FUNCTIONS.contains(&last) {
+        // Built-in table functions aren't qualified, except under
+        // INFORMATION_SCHEMA or SNOWFLAKE: `myschema.flatten` is the user's.
+        // A quoted name is never trusted.
+        let parts: Vec<&str> = name.split('.').map(str::trim).collect();
+        let quoted = parts.iter().any(|p| p.contains(super::splitter::QUOTED_WORD));
+        let trusted = match parts.as_slice() {
+            [f] => SNOWFLAKE_TABLE_FUNCTIONS.contains(f),
+            [first, ..] if *first == "SNOWFLAKE" => true,
+            [.., schema, _] => *schema == "INFORMATION_SCHEMA",
+            _ => false,
+        };
+        if quoted || !trusted {
             return true;
         }
     }
     false
 }
 
+/// `U&"…"` identifiers spell a name with escapes
+/// (`U&"pg\005Fterminate\005Fbackend"(1)`), so the name lists above can't
+/// see it. Matched anywhere, strings included: being stricter costs a
+/// confirmation.
 fn escaped_identifier(sql: &str) -> bool {
     sql.as_bytes().windows(3).any(|w| w[0].eq_ignore_ascii_case(&b'u') && w[1] == b'&' && w[2] == b'"')
 }

@@ -50,10 +50,9 @@ pub fn read_only_allows(sql: &str, c: &Classification) -> bool {
         StatementKind::Session => {
             let mut w = words(sql).map(|w| w.to_ascii_lowercase());
             match w.next().as_deref() {
-                // Not `USE ROLE`: another role may write. A comment could
-                // stand where the next word is read (`use /*x*/ role …`).
-                Some("use") if has_comment(super::splitter::strip_leading_comments(sql)) => false,
-                Some("use") => !matches!(w.next().as_deref(), Some("role" | "secondary")),
+                // Not `USE ROLE`: another role may write. The word after
+                // USE is read past comments (`use /*x*/ role …`).
+                Some("use") => !matches!(word_after_use(sql).as_deref(), Some("role" | "secondary") | None),
                 // A comment inside could hide a quote and with it a second
                 // setting (`SET a='x' /* ' */, GLOBAL read_only = 0 /* ' */`):
                 // not trusted.
@@ -64,6 +63,24 @@ pub fn read_only_allows(sql: &str, c: &Classification) -> bool {
         }
         _ => false,
     }
+}
+
+/// The word after the leading `USE`, lower case, past whitespace and any
+/// comment (`--`, `/* */`, `//`, `#`, whichever the dialect has).
+fn word_after_use(sql: &str) -> Option<String> {
+    let body = super::splitter::strip_leading_comments(sql);
+    let mut rest = body.get(body.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(body.len())..)?;
+    loop {
+        rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix("--").or_else(|| rest.strip_prefix("//")).or_else(|| rest.strip_prefix('#')) {
+            rest = r.split_once('\n').map_or("", |x| x.1);
+        } else if let Some(r) = rest.strip_prefix("/*") {
+            rest = r.split_once("*/").map_or("", |x| x.1);
+        } else {
+            break;
+        }
+    }
+    words(rest).next().map(|w| w.to_ascii_lowercase())
 }
 
 /// Comment markers anywhere (strings included: being stricter only costs a

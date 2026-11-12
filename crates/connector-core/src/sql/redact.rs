@@ -70,14 +70,19 @@ pub fn redact_secrets(sql: &str) -> String {
     if cut.is_empty() {
         return sql.to_string();
     }
+    // Overlapping spans (found twice, or by the two readings with
+    // different ends) become one that covers both.
     cut.sort_by_key(|c| (c.0, std::cmp::Reverse(c.1)));
+    let mut merged: Vec<(usize, usize, Option<u8>)> = Vec::with_capacity(cut.len());
+    for (s, e, q) in cut {
+        match merged.last_mut() {
+            Some(m) if s < m.1 => m.1 = m.1.max(e),
+            _ => merged.push((s, e, q)),
+        }
+    }
     let mut out = String::with_capacity(sql.len());
     let mut last = 0;
-    for (s, e, q) in cut {
-        // Found twice (a keyword and a position, or both readings): once.
-        if s < last {
-            continue;
-        }
+    for (s, e, q) in merged {
         out.push_str(&sql[last..s]);
         match q {
             Some(q) => {
@@ -830,6 +835,8 @@ mod redaction_tests {
             ("select * from url('http://x', headers('Authorization'='Bearer tok6'))", "tok6"),
             ("'BlobEndpoint=https://a;SharedAccessSignature=sv=2022&sig=SIG8'", "SIG8"),
             ("{\"privateKey\": \"pk9\"}", "pk9"),
+            ("alter role r password 'a\\' password 'SECRET1'", "SECRET1"),
+            ("create user u identified by 'x\\' ; alter user v identified by 'SECRET2'", "SECRET2"),
         ] {
             let out = redact_text(text);
             assert!(!out.contains(secret), "{text}\n→ {out}");

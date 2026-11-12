@@ -25,6 +25,8 @@ Left from the final review (2026-11-13):
 - The cost preview only looks at the tab (it must not make Run busy): when it reconnects after a connection error while a script runs, the script's next statement lands on the new session.
 - The memory cap is per result: a script whose results are all active can hold several times the budget; `get_array_memory_size` counts buffers shared between batches once per batch.
 - `release_result` on a pinned output when no snapshot directory is set removes the output (only the AI's sample path calls it).
+- Implicit transactions (SQL Server `IMPLICIT_TRANSACTIONS ON`, Snowflake `AUTOCOMMIT = FALSE`) keep the session (`TxState::Unknown`) but don't show Commit/Rollback or warn on closing the tab (`QueryEngine::in_transaction` counts `Open` only). Not followed: `SET ANSI_DEFAULTS ON`, `autocommit = 'false'` written as a string. A one-batch `begin tran … commit` on SQL Server stays "open" (conservative). With implicit transactions on, manual commit's own `BEGIN` may nest on SQL Server.
+- Job steps: a DuckDB Query step reading a tab's row-limited `results.x` on purpose now fails before it runs (it would pass part of the rows on); say so in the job editor.
 - `loadResultAsking`: when the server asks (the UI didn't know the connection is production), progress and Stop already show during the prompt.
 
 ## Explorer and AI index (left from the review of 2026-11-12)
@@ -40,6 +42,9 @@ Left from the final review of the metadata store (2026-11-13):
 - The scope survives pointing a connection at another server (`meta_check_identity` keeps the rules): schemas allowed on the old server are allowed on the new one once browsed. Decide whether a server change should clear it.
 - `meta_clear` and `kn_clear` are not one transaction each. The v20 migration gives a schema whose last index run failed a rule too.
 - `user_version` is read outside the migration transaction: two processes upgrading at once (the app and `databrain-mcp`) can make one fail with "table already exists" (it opens on the next try).
+- An index run's empty foreign key list never clears keys cached before (bulk metadata often has none): keys dropped on the server stay in the ER diagram and the AI's joins until the table is described again.
+- An AI note's target is stored as `schema.table` unquoted: a name with `.`, a space, `&` or `,` reads back differently.
+- `index_tables` answers "not available" for connection, sign-in and permission errors too (one answer for missing and refused tables), which hides why a read failed.
 - The pre-check in `index_tables` and `describe_named` resolve a bare name with the explorer cache, not the AI's scope; the check after the describe is what decides.
 
 ## Connector core (review of 2026-11-12; see [CONNECTOR_CORE.md](CONNECTOR_CORE.md))

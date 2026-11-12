@@ -354,8 +354,8 @@ async fn export_steps_write_files_with_duckdb() {
 }
 
 /// A step's result capped at the memory a result may keep holds part of
-/// the rows: the step fails, so no later step exports or loads that part
-/// (or a complete-looking copy of it) as if it were all.
+/// the rows: the steps that read it fail before running, so none exports
+/// or loads that part (or a complete-looking copy of it) as if it were all.
 #[tokio::test(flavor = "multi_thread")]
 async fn capped_results_are_not_exported_or_loaded() {
     let dir = tempfile::tempdir().unwrap();
@@ -396,10 +396,11 @@ async fn capped_results_are_not_exported_or_loaded() {
     api::run_job(&st, &job.id, None).unwrap();
     let run = finished(&st, &job.id).await;
     let rec = |n: &str| run.nodes.iter().find(|r| r.name == n).unwrap().summary.clone();
-    assert!(rec("big").error.unwrap_or_default().contains("holds only its first"), "the capped step itself fails");
-    // The steps after it don't run.
+    assert!(rec("big").error.is_none(), "a capped query step runs (it says so)");
+    // The steps that read it fail before they write anything.
     for n in ["big_file", "big_copy"] {
-        assert!(rec(n).rows.is_none(), "{n}: {:?}", rec(n));
+        let e = rec(n).error.unwrap_or_default();
+        assert!(e.contains("holds only its first"), "{n}: {e}");
     }
     assert!(std::fs::read_dir(dir.path()).unwrap().all(|f| !f.unwrap().file_name().to_string_lossy().starts_with("big_file")), "no file");
     assert_eq!(rows(&st, &dst, "select count(*) from sqlite_master where name = 'big'").await, vec![vec!["0"]], "no table");

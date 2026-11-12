@@ -23,3 +23,11 @@ bigquery | select * from `p.d.t`
 mysql | select 'it\'s', "a\"b" from t
 mysql | select 'C:\\path' from t
 mysql | select * from people where last_name = 'O\'Brien'
+# Snowflake's own table functions stay reads.
+snowflake | select * from table(flatten(input => parse_json('[1,2]')))
+snowflake | select * from table(result_scan(last_query_id()))
+snowflake | select * from table(information_schema.query_history())
+snowflake | select * from table(db.information_schema.query_history())
+snowflake | select f.value from t, lateral flatten(input => t.v) f
+snowflake | select * from table(generator(rowcount => 10))
+snowflake | select * from table(snowflake.core.get_lineage('t', 'table', 'downstream'))

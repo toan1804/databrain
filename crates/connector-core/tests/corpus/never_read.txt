@@ -84,3 +84,14 @@ clickhouse | select 1 `a\`, `; drop table t; --`
 snowflake | use /*x*/ role accountadmin
 snowflake | use -- c\n role accountadmin
 snowflake | select * from table(purge_all())
+# …with quoted text that would end a naive string or comment scan, a
+# backslash-escaped quote, or a qualified or quoted name.
+snowflake | select "--", * from table(evil_proc())
+snowflake | select "url//x", * from table(evil_proc())
+snowflake | select 1 as "'", * from table(evil_proc()) -- '
+snowflake | select 'a\'', * from table(evil_proc()) -- '
+snowflake | select $$'$$, * from table(evil_proc()) -- '
+snowflake | select * from table(myschema.flatten(input => 1))
+snowflake | select * from table(my_information_schema.evil())
+snowflake | select * from table("my proc"(1))
+snowflake | select * from table(a."evil"())

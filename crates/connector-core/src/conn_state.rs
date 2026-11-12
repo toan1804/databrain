@@ -135,8 +135,9 @@ impl ConnState {
     }
 
     /// What a session reports: `Unknown` while writes open transactions by
-    /// themselves and none is known to be open (the session is kept, as if
-    /// one were; Commit is offered once).
+    /// themselves and none is known to be open: the session is kept (idle
+    /// close, the row-limit replace), as if one were. The UI's Commit and
+    /// Rollback show for `Open` only.
     pub fn tx_state(&self) -> TxState {
         if self.in_transaction() {
             TxState::Open
@@ -272,6 +273,14 @@ mod tests {
         assert!(after(Mssql, &["commit\nbegin tran"]).1);
         assert!(after(Mssql, &["begin tran", "if @@trancount > 0 commit\nbegin tran"]).1);
         assert!(!after(Mssql, &["select * into #tran from t"]).1, "a temp table named tran");
+        // Quoted names with a quote or comment marker inside don't hide a BEGIN.
+        for batch in [
+            "select [O'Brien] from t\nbegin tran\nupdate t set a = 'x'",
+            "select [a--b] from t\nbegin tran\nupdate t set a = 1",
+            "select \"a--b\" from t; begin tran",
+        ] {
+            assert!(after(Mssql, &[batch]).1, "{batch}");
+        }
         // Comments the dialect has before the first word.
         assert!(after(Snowflake, &["// c\nbegin"]).1);
         assert!(after(Mysql, &["# c\nbegin"]).1);

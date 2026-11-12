@@ -382,55 +382,33 @@ pub fn statement_at(spans: &[StatementSpan], cursor: usize) -> Option<&Statement
     spans.iter().find(|s| cursor >= s.start && cursor <= s.end).or_else(|| spans.iter().rev().find(|s| s.end < cursor)).or_else(|| spans.first())
 }
 
-/// `sql` with comments (also `#` and `//` where `kind` has them) and the
-/// contents of `'…'` strings blanked out (each becomes a space): what is
-/// left is code.
+/// The word that stands for a quoted name (or other quoted text that isn't
+/// a string) in [`code_text`]: one opaque word, never a keyword.
+pub(crate) const QUOTED_WORD: &str = "QUOTED_TEXT_";
+
+/// `sql` as code: comments and `'…'` strings blanked out (each becomes a
+/// space), other quoted text (`"…"`, `[…]`, `` `…` ``, `$$…$$`) one
+/// [`QUOTED_WORD`]. Read with the dialect's own scanner ([`skip_token`]),
+/// so it ends strings and comments where the splitter does.
 pub(crate) fn code_text(sql: &str, kind: crate::types::ConnectorKind) -> String {
     let syntax = kind.traits().syntax;
     let mut code = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        let line_comment = match c {
-            '-' => chars.peek() == Some(&'-'),
-            '/' => syntax.slash_comment && chars.peek() == Some(&'/'),
-            '#' => syntax.hash_comment,
-            _ => false,
-        };
-        match c {
-            _ if line_comment => {
-                for n in chars.by_ref() {
-                    if n == '\n' {
-                        break;
-                    }
-                }
-                code.push(' ');
+    let (mut i, mut last) = (0, 0);
+    while i < sql.len() {
+        match skip_token(sql, i, &syntax) {
+            Some((end, what)) => {
+                code.push_str(&sql[last..i]);
+                // A quoted name stays part of a dotted path (`a."b"(` reads
+                // `a.QUOTED_TEXT_(`); everything else becomes a space.
+                code.push_str(if what == Skipped::Quoted { QUOTED_WORD } else { " " });
+                i = end.max(i + 1).min(sql.len());
+                last = i;
             }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut prev = ' ';
-                for n in chars.by_ref() {
-                    if prev == '*' && n == '/' {
-                        break;
-                    }
-                    prev = n;
-                }
-                code.push(' ');
-            }
-            '\'' => {
-                // `''` inside is an escaped quote: the string goes on.
-                while let Some(n) = chars.next() {
-                    if n == '\'' {
-                        if chars.peek() == Some(&'\'') {
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                code.push(' ');
-            }
-            _ => code.push(c),
+            None => i += 1,
         }
+    }
+    if let Some(rest) = sql.get(last..) {
+        code.push_str(rest);
     }
     code
 }

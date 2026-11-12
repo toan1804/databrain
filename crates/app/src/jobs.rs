@@ -908,37 +908,44 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     let folder = if node.kind == JobNodeKind::Export { Some(export_folder(node)?) } else { None };
     let duck_id = connection_id.clone();
     // Outputs it reads that were capped (a row limit, or the memory a
-    // result may keep): an export or load of them would write part of the
-    // rows as if it were all, and a Sync load would delete the rest.
-    let capped_input = ctx.engine.outputs().referenced(&sql).into_iter().find(|o| o.truncated);
-    let outcomes = run_sql(ctx, connection_id, tab.clone(), sql, Some(node.name.clone()), t.step_origin(node), cancel, t).await?;
-    let last = outcomes.last();
-    let rows = last.and_then(|o| o.result.as_ref().map(|r| r.total_rows as i64).or(o.rows_affected.map(|r| r as i64))).unwrap_or(0);
-    // This step's result (a statement that returns rows ends with one).
-    let own = ctx.engine.outputs().for_tab(&tab).into_iter().rev().find(|o| o.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&node.name)));
-    // Job steps run without a row limit, so a capped result is one that
-    // filled the memory a result may keep; one it reads may be a tab's
-    // row-limited result. Any step fails then, so a later step can't work
-    // on part of the rows through a complete-looking copy.
-    if let Some(o) = capped_input.as_ref().or(own.as_ref().filter(|o| o.truncated)) {
-        let what = match node.kind {
-            JobNodeKind::Export => "exported",
-            JobNodeKind::Load => "loaded",
-            _ => "passed on",
-        };
-        return Err(EngineError::new(
+    // result may keep): working on them would pass part of the rows on as
+    // if it were all (a Sync load would delete the rest). Checked before
+    // the step runs, so nothing of it is written.
+    let capped = |o: &databrain_query_engine::OutputInfo, what: &str| {
+        EngineError::new(
             "invalid",
             format!(
                 "{} holds only its first {} rows (capped by a row limit or by the memory a result may keep): nothing was {what}. Run it without a row limit, select fewer columns, or split the step.",
                 o.name.as_deref().unwrap_or(&o.handle),
                 o.rows
             ),
-        ));
+        )
+    };
+    // (A query on another database naming `results.x` reads its own table.)
+    if (node.kind != JobNodeKind::Query || connection_id == ctx.engine.results_connection()?.id)
+        && let Some(o) = ctx.engine.outputs().referenced(&sql).into_iter().find(|o| o.truncated)
+    {
+        return Err(capped(&o, "run"));
     }
+    let outcomes = run_sql(ctx, connection_id, tab.clone(), sql, Some(node.name.clone()), t.step_origin(node), cancel, t).await?;
+    let last = outcomes.last();
+    let rows = last.and_then(|o| o.result.as_ref().map(|r| r.total_rows as i64).or(o.rows_affected.map(|r| r as i64))).unwrap_or(0);
     if node.kind == JobNodeKind::Query {
+        // A capped result of its own fails the steps that read it (above).
         return Ok(NodeOut { rows, file: None, notices: vec![] });
     }
-    let output = own.ok_or_else(|| EngineError::new("invalid", "The SQL returned no rows (it must end with a SELECT)"))?;
+    // This step's result (a statement that returns rows ends with one).
+    let output = ctx
+        .engine
+        .outputs()
+        .for_tab(&tab)
+        .into_iter()
+        .rev()
+        .find(|o| o.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&node.name)))
+        .ok_or_else(|| EngineError::new("invalid", "The SQL returned no rows (it must end with a SELECT)"))?;
+    if output.truncated {
+        return Err(capped(&output, if node.kind == JobNodeKind::Export { "exported" } else { "loaded" }));
+    }
     if let Some(folder) = folder {
         let name = databrain_workspace::jobs::export_file_name(node.export_file.as_deref(), &node.name, job_name, node.export_format, now_ms());
         let written = files_written_by(&ctx.workspace, job_id);
