@@ -746,7 +746,9 @@ fn parse_ts(s: &str) -> Option<i64> {
 fn split_offset(s: &str) -> (&str, i64) {
     let Some(p) = s.get(10..).and_then(|t| t.rfind(['+', '-'])).map(|p| p + 10) else { return (s, 0) };
     let tail = &s[p + 1..];
-    if !tail.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+    // Exactly hh, hhmm, hh:mm or hh:mm:ss.
+    let shape: String = tail.bytes().map(|b| if b.is_ascii_digit() { 'd' } else { b as char }).collect();
+    if !matches!(shape.as_str(), "dd" | "dddd" | "dd:dd" | "dd:dd:dd") {
         return (s, 0);
     }
     let d: Vec<i64> = tail.bytes().filter(u8::is_ascii_digit).map(|b| i64::from(b - b'0')).collect();
@@ -2752,6 +2754,8 @@ mod tests {
         assert_eq!(parse_ts("2024-05-01 10:00:00.5+07"), Some(utc + 500_000));
         assert_eq!(parse_ts("2024-05-01"), parse_ts("2024-05-01 00:00:00"));
         assert_eq!(parse_ts("2024-05-01 10:00:00+7x"), None);
+        assert_eq!(parse_ts("2024-05-01 10:00:00+1:2:34"), None);
+        assert_eq!(parse_ts("2024-05-01 10:00:00+0:7"), None);
         // Not an offset, or not ASCII: read as is (no panic).
         for s in ["2024-05-01 10:00:00+1é1", "2024-05-01 10:00:00+é", "2024-05-01 10:00:00+12:3é", "2024-05-01 10:00:00-ééé"] {
             assert_eq!(parse_ts(s), None, "{s}");

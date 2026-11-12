@@ -57,7 +57,7 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
             }
             out.kind = check_control(out.kind, &keyword, sql);
             // `select pg_terminate_backend(…)` acts like `KILL`.
-            if out.kind < StatementKind::Dml && (stmts.iter().any(calls_acting_function) || next_value_for(sql)) {
+            if out.kind < StatementKind::Dml && (stmts.iter().any(calls_acting_function) || next_value_for(sql, dialect.as_ref())) {
                 out.kind = StatementKind::Other;
             }
             out
@@ -71,7 +71,7 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
                 // Unparseable but looks like a read: a read only when no word
                 // in it can act (T-SQL runs `SELECT 1 EXEC xp_cmdshell …` as
                 // two statements without a separator).
-                k = if keyword == "SELECT" && !contains_dml_word(sql) && !contains_action_word(sql) && !names_acting_function(sql) {
+                k = if keyword == "SELECT" && !contains_dml_word(sql) && !contains_action_word(sql) && !names_acting_function(sql, dialect.as_ref()) {
                     StatementKind::Read
                 } else {
                     StatementKind::Unknown
@@ -446,54 +446,43 @@ fn calls_acting_function(s: &Statement) -> bool {
 }
 
 /// Unparsed SQL naming an acting function (`$` kept for Snowflake's).
-fn names_acting_function(sql: &str) -> bool {
-    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).any(is_acting_function) || next_value_for(sql)
+fn names_acting_function(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> bool {
+    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).any(is_acting_function) || next_value_for(sql, dialect)
 }
 
 /// SQL Server / standard `NEXT VALUE FOR seq`, which advances the sequence
 /// (sqlparser reads it as columns and aliases). Also inside a string: a
 /// read is never claimed when unsure.
-fn next_value_for(sql: &str) -> bool {
-    // Comments between the words (`next /* c */ value for s`) don't split them.
-    let text = without_comments(sql);
-    let w: Vec<&str> = words(&text).collect();
-    w.windows(3).any(|w| w[0].eq_ignore_ascii_case("next") && w[1].eq_ignore_ascii_case("value") && w[2].eq_ignore_ascii_case("for"))
-}
-
-/// `sql` with `-- …` and `/* … */` comments (nested too) replaced by a space.
-/// Comment markers inside strings are taken as comments as well: this only
-/// looks for words that act, so taking out too much text is never needed.
-fn without_comments(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut rest = sql;
-    loop {
-        let next = [rest.find("--"), rest.find("/*")].into_iter().flatten().min();
-        let Some(i) = next else {
-            out.push_str(rest);
-            return out;
-        };
-        out.push_str(&rest[..i]);
-        out.push(' ');
-        if rest[i..].starts_with("--") {
-            rest = rest[i..].find('\n').map_or("", |n| &rest[i + n..]);
-        } else {
-            // Nested block comments (Postgres, SQL Server).
-            let (mut depth, mut j, b) = (0usize, i, rest.as_bytes());
-            while j + 1 < b.len() {
-                if &b[j..j + 2] == b"/*" {
-                    depth += 1;
-                    j += 2;
-                } else if &b[j..j + 2] == b"*/" {
-                    depth -= 1;
-                    j += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    j += 1;
-                }
-            }
-            rest = if depth == 0 { &rest[j..] } else { "" };
+fn next_value_for(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> bool {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let is = |w: &&str, k: &str| w.eq_ignore_ascii_case(k);
+    let three = |w: &[&str]| w.windows(3).any(|w| is(&w[0], "next") && is(&w[1], "value") && is(&w[2], "for"));
+    // The words as written, comments and strings included: never a miss
+    // where the words stand side by side.
+    if three(&words(sql).collect::<Vec<_>>()) {
+        return true;
+    }
+    // The dialect's tokens without whitespace and comments
+    // (`next /* c */ value for s`); strings and quoted names stay whole, and
+    // block comments nest only where the dialect's do.
+    match Tokenizer::new(dialect, sql).tokenize() {
+        Ok(tokens) => {
+            let w: Vec<&str> = tokens
+                .iter()
+                .filter(|t| !matches!(t, Token::Whitespace(_)))
+                .map(|t| match t {
+                    Token::Word(w) if w.quote_style.is_none() => w.value.as_str(),
+                    _ => "",
+                })
+                .collect();
+            three(&w)
+        }
+        // Not tokenizable: any comment could hide the gap, so the three words
+        // anywhere in order are enough.
+        Err(_) => {
+            let w: Vec<&str> = words(sql).collect();
+            let at = |k: &str, from: usize| w.iter().skip(from).position(|x| is(x, k)).map(|i| i + from + 1);
+            at("next", 0).and_then(|i| at("value", i)).and_then(|i| at("for", i)).is_some()
         }
     }
 }
@@ -614,8 +603,20 @@ mod tests {
             "select next -- c\n value for s",
             "select next /* c */ value /* d /* nested */ e */ for s",
             "select next\n\tvalue\r\nfor [dbo].[s]",
+            // Comment markers inside strings and quoted names.
+            "select '--' as a, next value for s",
+            "select [--x], next value for s from t",
+            "select '/*' as a, next value for s, '*/' as b",
+            "select '--', next /* c */ value for s",
+            "select 'it''s -- not', next /* c */ value for s",
         ] {
             let c = classify(sql, Mssql);
+            assert!(matches!(c.kind, StatementKind::Other | StatementKind::Unknown), "{sql}: {:?}", c.kind);
+            assert!(!crate::sql::read_only_allows(sql, &c), "{sql}");
+        }
+        // MariaDB has it too, and its block comments don't nest.
+        for sql in ["select /* /* */ next value for s", "select next /* x */ value for s"] {
+            let c = classify(sql, Mysql);
             assert!(matches!(c.kind, StatementKind::Other | StatementKind::Unknown), "{sql}: {:?}", c.kind);
             assert!(!crate::sql::read_only_allows(sql, &c), "{sql}");
         }

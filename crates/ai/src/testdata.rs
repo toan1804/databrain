@@ -105,8 +105,13 @@ async fn ask_model(provider: &Arc<dyn crate::providers::LlmProvider>, chat: Chat
         meter.sent(&chat);
         let mut text = String::new();
         while let Some(ev) = stream.next().await {
-            // An error from the provider ends the call: what it reported counts, no estimate.
-            let ev = ev.inspect_err(|_| meter.finished())?;
+            // An error the provider sends ends the call: what it reported
+            // counts, no estimate. A broken connection keeps the estimate.
+            let ev = ev.inspect_err(|e| {
+                if !matches!(e, AiError::Network(_)) {
+                    meter.finished()
+                }
+            })?;
             match ev {
                 ChatEvent::TextDelta(t) => {
                     meter.text(&t);

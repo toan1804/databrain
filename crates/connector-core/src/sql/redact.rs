@@ -292,7 +292,9 @@ pub fn redact_url_passwords(text: &str) -> String {
             None if tail.is_empty() && rest[token..].starts_with([' ', '\t']) => {
                 let w = word(rest[token..].trim_start_matches([' ', '\t']));
                 let start = rest.len() - rest[token..].trim_start_matches([' ', '\t']).len();
-                w.rfind('@').filter(|&a| !w.contains("://") && w[a..].contains('/')).map(|a| start + a)
+                // A host then a path (`h/db`), not `git@github.com:org/repo`.
+                let host_path = |rest: &str| rest.find('/').is_some_and(|sl| !rest[..sl].contains(':'));
+                w.rfind('@').filter(|&a| !w.contains("://") && host_path(&w[a..])).map(|a| start + a)
             }
             None => None,
         };
@@ -317,7 +319,8 @@ fn word(s: &str) -> &str {
 fn in_password(s: &str) -> bool {
     let mut c = s.chars();
     matches!(c.next(), Some('\'' | '"' | '`' | '<' | '>' | '(' | ')'))
-        && c.next().is_some_and(|n| !n.is_whitespace() && !matches!(n, ',' | ';' | ':' | '\'' | '"' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'))
+        && c.next()
+            .is_some_and(|n| !n.is_whitespace() && !matches!(n, ',' | ';' | ':' | '+' | '|' | '\'' | '"' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'))
 }
 
 /// The colon after the user name (or host) of a URL without its `scheme://`:
@@ -734,6 +737,8 @@ mod redaction_tests {
             "{\"url\":\"http://svc:abc\",\"owner\":\"me@x.com\"}",
             "('http://h:8080'),'me@x.com'",
             "see http://h:8080 bob@x.com",
+            "ssh://host:22 git@github.com:org/repo.git",
+            "\"http://svc:abc\"+\"me@x.com/a\"",
             "open http://localhost:3000 then mail me@x.com/notes",
             "('x://u:a') then b://c@d",
         ] {
