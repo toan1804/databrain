@@ -567,6 +567,9 @@ impl OutputRegistry {
         if pinned && info.state == OutputState::Evicted {
             return Err(EngineError::new("invalid", format!("{handle} was freed from memory; re-run its query to pin it")));
         }
+        if pinned && info.pinned {
+            return Ok(info); // already saved: nothing to write (or to undo)
+        }
         if !pinned && info.state == OutputState::OnDisk {
             self.ensure_loaded(handle)?; // keep the data for this session
         }
@@ -644,8 +647,14 @@ impl OutputRegistry {
     /// Free a result: its output too when it has one (so no output is
     /// listed whose rows are gone). Only this registry removes results that
     /// may have an output; other crates call this, not `ResultStore::remove`.
+    /// A pinned output keeps its saved copy: only its rows in memory go
+    /// (it loads again from disk on use).
     pub fn release_result(&self, result_id: &str) -> bool {
         match self.by_result(result_id) {
+            Some(o) if o.pinned && self.snapshot_path(result_id).is_some_and(|p| p.exists()) => {
+                self.update(&o.handle, |x| x.state = OutputState::OnDisk);
+                self.results.remove(result_id)
+            }
             Some(o) => self.remove(&o.handle).is_ok(),
             None => self.results.remove(result_id),
         }
@@ -1702,6 +1711,14 @@ mod tests {
         let o = r2.ensure_loaded("keep").unwrap();
         assert_eq!(o.state, OutputState::Live);
         assert_eq!(r2.results.get(&o.result_id).unwrap().lock().total_rows(), 10);
+        // Pinning again writes nothing and keeps the saved copy.
+        r2.set_pinned("r1", true).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        // Freeing a pinned result frees its memory only: it loads again.
+        assert!(r2.release_result(&o.result_id));
+        assert_eq!(r2.get("r1").unwrap().state, OutputState::OnDisk);
+        assert_eq!(r2.ensure_loaded("r1").unwrap().state, OutputState::Live);
+        assert_eq!(ws.list_outputs().unwrap().len(), 1);
         // Handles keep counting after a restart.
         assert_eq!(add(&r2, "t", 1).handle, "r2");
         r2.set_pinned("r1", false).unwrap();

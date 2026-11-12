@@ -748,7 +748,7 @@ async fn a_claimed_session_refuses_other_work() {
 #[tokio::test]
 async fn a_result_stops_at_the_memory_cap() {
     let f = fixture(EnvTag::Dev);
-    f.engine.outputs().set_budget(0); // the 16 MB floor
+    f.engine.outputs().set_budget(0); // the 16 MB floor: 8 MB per result
     let mut r = req(&f, "with recursive n(i) as (select 1 union all select i + 1 from n where i < 400) select i, randomblob(100000) as b from n");
     r.row_limit = None;
     let evs = wait_job(&f, &started(f.engine.run(r).unwrap())).await;
@@ -759,8 +759,8 @@ async fn a_result_stops_at_the_memory_cap() {
             _ => None,
         })
         .expect("finished");
-    assert!(info.truncated && info.total_rows < 400 && info.total_rows > 0 && info.bytes <= 16 << 20, "{info:?}");
-    assert!(notices.iter().any(|n| n.contains("16 MB a result may keep")), "{notices:?}");
+    assert!(info.truncated && info.total_rows < 400 && info.total_rows > 0 && info.bytes <= 8 << 20, "{info:?}");
+    assert!(notices.iter().any(|n| n.contains("8 MB a result may keep")), "{notices:?}");
 }
 
 /// Freeing a result that has an output drops the output too: no output
@@ -824,4 +824,17 @@ async fn a_run_that_dies_frees_its_tab() {
     );
     crate::run::JobGuard { engine: f.engine.clone(), job_id: "live".into(), tab_id: "t2".into(), waiter: None, done: false }.finish();
     assert_eq!(f.engine.jobs.lock().len(), 1);
+    // A waiter (AI, MCP, job steps) gets an error, not an empty success.
+    let view = |error: Option<&str>| StatementOutcomeView {
+        index: 0,
+        sql: "select 1".into(),
+        result: None,
+        rows_affected: None,
+        error: error.map(|e| EngineError::new("query", e)),
+        duration_ms: 0,
+        notices: vec![],
+    };
+    assert!(crate::run::finished(RunStatus::Error, vec![view(None)]).is_err(), "died");
+    assert!(crate::run::finished(RunStatus::Error, vec![view(Some("syntax"))]).is_ok(), "a statement's error is in its outcome");
+    assert!(crate::run::finished(RunStatus::Success, vec![view(None)]).is_ok());
 }

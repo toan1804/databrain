@@ -214,7 +214,7 @@ impl QueryEngine {
                         o.duration_ms = duration_ms;
                     }
                 }
-                JobEvent::JobFinished { .. } => return Ok(out),
+                JobEvent::JobFinished { status, .. } => return finished(status, out),
                 _ => {}
             }
         }
@@ -415,7 +415,9 @@ impl QueryEngine {
         let mut rows = 0usize;
         // Bytes kept: a row limit alone doesn't bound wide rows.
         let mut bytes = 0usize;
-        let max_bytes = self.outputs.budget();
+        // Half the outputs budget: one result can't take all of it from the
+        // other outputs (active ones are never freed).
+        let max_bytes = self.outputs.budget() / 2;
         let mut too_big = false;
         let t0 = Instant::now();
         let mut last_progress = Instant::now();
@@ -445,6 +447,8 @@ impl QueryEngine {
                     let size = batch.get_array_memory_size();
                     if bytes + size > max_bytes && batch.num_rows() > 0 {
                         let keep = ((max_bytes.saturating_sub(bytes) as u128 * batch.num_rows() as u128) / size as u128) as usize;
+                        // At least one row, so the result shows what it holds.
+                        let keep = if rows == 0 { keep.max(1) } else { keep };
                         let idx = databrain_connector_core::arrow::array::UInt32Array::from_iter_values(0..keep.min(batch.num_rows()) as u32);
                         batch = databrain_connector_core::arrow::compute::take_record_batch(&batch, &idx).unwrap_or_else(|_| batch.slice(0, idx.len()));
                         truncated = true;
@@ -516,6 +520,16 @@ impl QueryEngine {
         let _ = tokio::time::timeout(Duration::from_secs(15), async { while stream.next().await.is_some() {} }).await;
         Ok(StatementOutcome { result: info, rows_affected: None, notices, server_ms })
     }
+}
+
+/// What [`QueryEngine::run_and_wait`] returns when the run ends. Failed
+/// with no statement saying why: the run's task died (its guard reports
+/// it), which callers must not take for success.
+pub(crate) fn finished(status: RunStatus, out: Vec<StatementOutcomeView>) -> Result<Vec<StatementOutcomeView>> {
+    if status == RunStatus::Error && out.iter().all(|o| o.error.is_none()) {
+        return Err(EngineError::new("internal", "the query stopped unexpectedly"));
+    }
+    Ok(out)
 }
 
 /// The `jobs` entry of a run, released on any exit of its task: normally

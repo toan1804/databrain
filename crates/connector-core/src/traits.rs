@@ -257,6 +257,10 @@ pub struct TxDialect {
     pub ddl_commits: DdlCommits,
     /// Set a savepoint and roll back to it, `{}` the name; `None` = none.
     pub savepoint: Option<(&'static str, &'static str)>,
+    /// Let go of a savepoint once its work is kept (`None`: the database
+    /// has no such statement). Postgres keeps a subtransaction per
+    /// savepoint until then.
+    pub release_savepoint: Option<&'static str>,
 }
 
 const STANDARD_TX: TxDialect = TxDialect {
@@ -265,6 +269,7 @@ const STANDARD_TX: TxDialect = TxDialect {
     rollback: "ROLLBACK",
     ddl_commits: DdlCommits::No,
     savepoint: Some(("SAVEPOINT {}", "ROLLBACK TO SAVEPOINT {}")),
+    release_savepoint: Some("RELEASE SAVEPOINT {}"),
 };
 
 /// How DataBrain writes rows into this database (job load steps, export as
@@ -589,6 +594,7 @@ pub const MSSQL: SourceTraits = SourceTraits {
         rollback: "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
         ddl_commits: DdlCommits::No,
         savepoint: Some(("SAVE TRANSACTION {}", "ROLLBACK TRANSACTION {}")),
+        release_savepoint: None,
     }),
     ..STANDARD
 };

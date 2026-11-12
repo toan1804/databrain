@@ -291,13 +291,32 @@ fn check_user_sql(stmts: &[String], dialect: ConnectorKind) -> Result<bool> {
     for s in stmts {
         let c = classify(s, dialect);
         let lower = s.to_ascii_lowercase();
-        let autocommit = c.kind == StatementKind::Session && (lower.contains("autocommit") || lower.contains("implicit_transactions"));
-        if c.kind == StatementKind::Transaction || autocommit {
+        let kw = databrain_connector_core::sql::leading_keyword(s);
+        let words: Vec<String> = lower.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).filter(|w| !w.is_empty()).map(str::to_string).collect();
+        let word = |w: &str| words.iter().any(|x| x == w);
+        // Autocommit settings, also as Snowflake's `ALTER SESSION SET AUTOCOMMIT`.
+        let autocommit = (lower.contains("autocommit") || lower.contains("implicit_transactions"))
+            && (c.kind == StatementKind::Session || (kw == "ALTER" && word("session")));
+        // Transaction control the classifier doesn't call that: `XA …`,
+        // `PREPARE TRANSACTION`, MySQL's `LOCK TABLES` (it commits), and a
+        // COMMIT or ROLLBACK inside a statement it can't place
+        // (`IF @@TRANCOUNT > 0 COMMIT`, a block that commits).
+        let hidden = kw == "XA"
+            || (kw == "PREPARE" && word("transaction"))
+            || (kw == "LOCK" && dialect == ConnectorKind::Mysql)
+            || (matches!(c.kind, StatementKind::Other | StatementKind::Unknown) && (word("commit") || word("rollback")));
+        if c.kind == StatementKind::Transaction || autocommit || hidden {
             return Err(EngineError::new(
                 "invalid",
                 format!(
                     "Before/after SQL can't control the transaction ({}): the load commits or rolls back its own work. Remove it.",
-                    if autocommit { "autocommit".to_string() } else { c.keyword.clone() }
+                    if autocommit {
+                        "autocommit".to_string()
+                    } else if hidden {
+                        kw.clone()
+                    } else {
+                        c.keyword.clone()
+                    }
                 ),
             ));
         }
@@ -1259,10 +1278,24 @@ mod tests {
             ("SET autocommit = 1", Mysql),
             ("set implicit_transactions on", Mssql),
             ("savepoint a", Postgres),
+            ("ALTER SESSION SET AUTOCOMMIT = FALSE", Snowflake),
+            ("XA COMMIT 'x'", Mysql),
+            ("COMMIT\nINSERT INTO t VALUES (1)", Mssql),
+            ("IF @@TRANCOUNT > 0 COMMIT", Mssql),
+            ("LOCK TABLES t WRITE", Mysql),
+            ("PREPARE TRANSACTION 'x'", Postgres),
+            ("BEGIN pkg.run; COMMIT; END;", Oracle),
         ] {
             assert!(check(sql, k).is_err(), "{k:?}: {sql}");
         }
-        for (sql, k) in [("update t set a = 1 where id = 2", Postgres), ("create index i on t (a)", Postgres), ("select 1", Mssql)] {
+        for (sql, k) in [
+            ("update t set a = 1 where id = 2", Postgres),
+            ("create index i on t (a)", Postgres),
+            ("select 1", Mssql),
+            ("update settings set autocommit_mode = 1 where id = 2", Postgres),
+            ("ALTER SESSION SET TIMEZONE = 'UTC'", Snowflake),
+            ("insert into log (what) values ('commit')", Postgres),
+        ] {
             assert!(!check(sql, k).unwrap(), "{k:?}: {sql}");
         }
         // A procedure may commit by itself.

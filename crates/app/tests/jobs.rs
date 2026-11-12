@@ -353,6 +353,57 @@ async fn export_steps_write_files_with_duckdb() {
     assert!(json.contains("\"name\":\"b\""), "{json}");
 }
 
+/// A step's result capped at the memory a result may keep holds part of
+/// the rows: exporting or loading it (or a copy of it) would write that part
+/// as if it were all, so those steps fail and write nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn capped_results_are_not_exported_or_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state();
+    st.engine.outputs().set_budget(0); // 16 MB: 8 MB per result
+    let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
+    let dst = sqlite(&st, "dst", &dir.path().join("dst.db"), false);
+    let mut export = node("e", "big_file", JobNodeKind::Export, None, "");
+    export.export_folder = Some(dir.path().to_string_lossy().into_owned());
+    let mut load = node("l", "big_copy", JobNodeKind::Load, None, "");
+    load.target_connection_id = Some(dst.clone());
+    load.target_table = Some("big".into());
+    let job = st
+        .workspace
+        .save_job(Job {
+            id: String::new(),
+            name: "Capped".into(),
+            nodes: vec![
+                node(
+                    "a",
+                    "big",
+                    JobNodeKind::Query,
+                    Some(&src),
+                    "with recursive n(i) as (select 1 union all select i + 1 from n where i < 400) select i, randomblob(100000) as b from n",
+                ),
+                export,
+                load,
+            ],
+            edges: vec![JobEdge { from: "a".into(), to: "e".into() }, JobEdge { from: "a".into(), to: "l".into() }],
+            schedule: Default::default(),
+            last_scheduled_at: None,
+            params: Default::default(),
+            param_set: None,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    api::run_job(&st, &job.id, None).unwrap();
+    let run = finished(&st, &job.id).await;
+    let rec = |n: &str| run.nodes.iter().find(|r| r.name == n).unwrap().summary.clone();
+    for n in ["big_file", "big_copy"] {
+        let e = rec(n).error.unwrap_or_default();
+        assert!(e.contains("holds only its first"), "{n}: {e}");
+    }
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|f| !f.unwrap().file_name().to_string_lossy().starts_with("big_file")), "no file");
+    assert_eq!(rows(&st, &dst, "select count(*) from sqlite_master where name = 'big'").await, vec![vec!["0"]], "no table");
+}
+
 /// An export never replaces a file it didn't write: the user's file is kept
 /// and the rows go to `name (2)`; the job's own file is replaced next run.
 #[tokio::test(flavor = "multi_thread")]

@@ -478,8 +478,10 @@ pub fn session_messages(state: &AppState, session_id: &str) -> Result<Vec<AiMess
 }
 
 pub fn delete_session(state: &AppState, id: &str) -> Result<()> {
-    // The chat's query tab: its session and the outputs it kept active.
-    state.engine.close_tab(&format!("ai:{id}"));
+    // The chat's query tabs: their sessions and the outputs they kept active.
+    for tab in ["ai", "ai-outputs", "ai-sample"] {
+        state.engine.close_tab(&format!("{tab}:{id}"));
+    }
     Ok(state.workspace.delete_ai_session(id)?)
 }
 

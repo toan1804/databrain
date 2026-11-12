@@ -54,7 +54,7 @@ One `Arc<QueryEngine>` per process (`QueryEngine::new` in `lib.rs`). Every map i
 | `manual_commit` | set of session keys | `set_manual_commit(key, false)` (the app calls it on tab close) |
 | `outputs` | `Arc<OutputRegistry>` (own lock, see below) | |
 
-`jobs` is also the "busy" list: `start_run` checks and claims a tab and its session key under one lock. `explain`, `apply_edits`, `end_transaction` and an export on a tab's session take a `Claim` (`sessions.rs` `claim`): the same check and insert under one lock, removed when the claim drops, so nothing else starts on the session meanwhile. The cost preview takes one when it can and otherwise uses `__meta__`.
+`jobs` is also the "busy" list: `start_run` checks and claims a tab and its session key under one lock. `explain`, `apply_edits`, `end_transaction` and an export on a tab's session take a `Claim` (`sessions.rs` `claim`): the same check and insert under one lock, removed when the claim drops, so nothing else starts on the session meanwhile. The cost preview only looks (it runs while you type, and must not make Run find the tab busy): it uses `__meta__` when the tab is held.
 
 ## Sessions
 
@@ -116,14 +116,14 @@ after the loop
 | What | How |
 |---|---|
 | A run | `cancel(job_id)` cancels the job's token. Each statement runs with a child token passed to the connector in `ExecOptions::cancel`; the connector stops the server side and the stream ends with a `cancelled` error. The loop checks the token before each statement. Status `Cancelled`. |
-| Row limit reached | `collect_stream` cancels only that statement's child token, then reads the stream to its end (15 s at most) so the cancel can't hit the next statement. The same happens when the rows kept reach the outputs budget (1 GB by default): the batch is cut to what fits and copied, and the notice says so. A job load step refuses such a capped output. |
+| Row limit reached | `collect_stream` cancels only that statement's child token, then reads the stream to its end (15 s at most) so the cancel can't hit the next statement. The same happens when the rows kept reach half the outputs budget (512 MB by default): the batch is cut to what fits (at least one row) and copied, and the notice says so. A job export or load step refuses a capped output, its own or one it reads. |
 | Closing a tab | `close_tab` cancels its jobs, drops its sessions, frees its unnamed, unpinned outputs. |
 | `run_and_wait` | forwards the caller's token to `cancel` once. |
 | Export, connection test | `cancel_export`, `cancel_test`: own token maps. |
 | Load | the caller's token, checked before each statement and passed to it (`exec` in `load.rs`). |
 | Indexing | `end_index_session` drops `__index__`; closing the connection stops the statement. |
 
-`begin_if_manual`, `apply_edits`, `explain`, `end_transaction` and dry runs have no cancel.
+`apply_edits`, `explain`, `end_transaction` and dry runs have no cancel; `begin_if_manual` watches the run's token while it connects. `disconnect` cancels the connection's runs (it is called when a connection's settings or secrets change, on sign-in and on delete, not for a new name or color); load steps aren't in `jobs`, so it doesn't stop them.
 
 ## Transactions
 
@@ -146,7 +146,7 @@ after the loop
 | Full export runs one read statement | `export_query` | export |
 | Plans: one statement; `EXPLAIN ANALYZE` only for reads | `explain` | plans |
 | Production connection: a load asks (`needs_confirmation`); job load steps count as confirmed | `prepare_load` (`LoadSpec::confirmed`) | loads, not dry runs |
-| A result keeps at most the outputs budget in memory | `collect_stream` | runs |
+| A result keeps at most half the outputs budget in memory | `collect_stream` | runs |
 | Cost preview: one statement, read or DML | `cost_statement` | cost preview |
 | DuckDB sandbox for AI and MCP SQL | `sandboxed`, `session_for`; enforced in the DuckDB connector | runs and loads with `origin` Ai / Mcp |
 | Output columns the AI must not see | `RunRequest::output_masks` → `ExecOptions` | AI runs on DuckDB |
@@ -188,7 +188,7 @@ Modes (`LoadMode`): Append, Truncate (delete rows, insert), Replace (drop, creat
 
 ## Grid edits, plans, export, and the rest
 
-- **Grid edits** (`edit.rs`). `source_table` parses the result's SQL: one table, no join, grouping, DISTINCT or CTE. `resolve_source` describes it (explorer cache first when opening, live when saving) and `map_columns` says which result column shows which table column. `edit_target` needs a primary key in the result. `edit_statements` builds one UPDATE / INSERT / DELETE per change with `edit_literal`; `apply_edits` runs them on the result's session: in a transaction of its own, in one PL/SQL block on Oracle, inside the user's open transaction when there is one, else one by one. A statement that touches a number of rows other than 1 fails the apply (`conflict`).
+- **Grid edits** (`edit.rs`). `source_table` parses the result's SQL: one table, no join, grouping, DISTINCT or CTE. `resolve_source` describes it (explorer cache first when opening, live when saving) and `map_columns` says which result column shows which table column. `edit_target` needs a primary key in the result. `edit_statements` builds one UPDATE / INSERT / DELETE per change with `edit_literal`; `apply_edits` runs them on the result's session: in a transaction of its own, in one PL/SQL block on Oracle, inside the user's open transaction when there is one (behind a savepoint where the database has one, released when the apply succeeds, so a conflict undoes only this apply), else one by one. A statement that touches a number of rows other than 1 fails the apply (`conflict`).
 - **Plans** (`plan.rs`). `explain` runs the engine's EXPLAIN on the tab's session (so temp tables and the open transaction are seen) and parses it into `PlanNode`s (`postgres_plan`, `arrow_tree`, `duckdb_plan`, `mssql_rows`, `oracle_rows`, `snowflake_plan`). `plan_support` says who can plan and analyze. `estimate_cost` asks `Session::estimate_cost`, 60 s at most.
 - **Full export** (`export.rs`). `export_query` runs the output's SQL again without a limit and streams batches to a `FileWriter` (temp file, renamed at the end). Own session, except when the original session has an open transaction: then that one, and the tab is busy meanwhile.
 - **Schema compare** (`schema_diff.rs`). `schema_diff` reads both sides with `bulk_metadata`, `diff_metadata` compares, `migration_script` writes a script for the target. Nothing runs; DROPs are comments.

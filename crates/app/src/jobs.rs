@@ -907,6 +907,10 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     // Checked before the query runs, so a missing folder fails fast.
     let folder = if node.kind == JobNodeKind::Export { Some(export_folder(node)?) } else { None };
     let duck_id = connection_id.clone();
+    // Outputs it reads that were capped (a row limit, or the memory a
+    // result may keep): an export or load of them would write part of the
+    // rows as if it were all, and a Sync load would delete the rest.
+    let capped_input = ctx.engine.outputs().referenced(&sql).into_iter().find(|o| o.truncated);
     let outcomes = run_sql(ctx, connection_id, tab.clone(), sql, Some(node.name.clone()), t.step_origin(node), cancel, t).await?;
     let last = outcomes.last();
     let rows = last.and_then(|o| o.result.as_ref().map(|r| r.total_rows as i64).or(o.rows_affected.map(|r| r as i64))).unwrap_or(0);
@@ -921,6 +925,17 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
         .rev()
         .find(|o| o.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&node.name)))
         .ok_or_else(|| EngineError::new("invalid", "The SQL returned no rows (it must end with a SELECT)"))?;
+    if let Some(o) = capped_input.as_ref().or(output.truncated.then_some(&output)) {
+        let what = if node.kind == JobNodeKind::Export { "exported" } else { "loaded" };
+        return Err(EngineError::new(
+            "invalid",
+            format!(
+                "{} holds only its first {} rows (capped by a row limit or by the memory a result may keep): nothing was {what}. Run it without a row limit, select fewer columns, or split the step.",
+                o.name.as_deref().unwrap_or(&o.handle),
+                o.rows
+            ),
+        ));
+    }
     if let Some(folder) = folder {
         let name = databrain_workspace::jobs::export_file_name(node.export_file.as_deref(), &node.name, job_name, node.export_format, now_ms());
         let written = files_written_by(&ctx.workspace, job_id);
@@ -959,17 +974,6 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
                 ),
             )
         })?;
-    }
-    // A capped result (it filled the memory a result may keep) holds only
-    // part of the rows: a load would write that part as if it were all.
-    if output.truncated {
-        return Err(EngineError::new(
-            "invalid",
-            format!(
-                "The step's result was capped at {} rows (the memory a result may keep): nothing was loaded. Select fewer columns, or split the step.",
-                output.rows
-            ),
-        ));
     }
     let report = ctx.engine.write_output(&output.handle, target, &format!("{tab}:load"), &spec, cancel, t).await?;
     Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices })

@@ -58,6 +58,8 @@ pub(crate) fn store_connection(state: &AppState, mut args: SaveConnectionArgs) -
         }
     }
     let mut profile = args.profile;
+    let before = if profile.id.is_empty() { None } else { state.workspace.get_connection(&profile.id).ok() };
+    let new_secrets = args.secret.is_some() || args.clear_secret || !args.extra_secrets.is_empty();
     if args.secret.is_some() {
         profile.has_secret = true;
     } else if args.clear_secret {
@@ -91,9 +93,13 @@ pub(crate) fn store_connection(state: &AppState, mut args: SaveConnectionArgs) -
             state.secrets.set(&sr, &SecretString::from(value.clone()))?;
         }
     }
-    // Apply new settings (and auth method) on the next query.
-    state.engine.disconnect(&saved.id);
-    state.engine.forget_credentials(&saved.id);
+    // Apply new settings (and auth method) on the next query. A new name,
+    // color or folder changes nothing there: running queries go on.
+    let same = before.is_some_and(|b| b.config == saved.config && b.ai_policy == saved.ai_policy);
+    if !same || new_secrets {
+        state.engine.disconnect(&saved.id);
+        state.engine.forget_credentials(&saved.id);
+    }
     Ok(saved)
 }
 

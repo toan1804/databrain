@@ -316,6 +316,7 @@
       "begin": "BEGIN",
       "commit": "COMMIT",
       "ddl_commits": "No",
+      "release_savepoint": "RELEASE SAVEPOINT {}",
       "rollback": "ROLLBACK",
       "savepoint": null
     },
@@ -452,6 +453,7 @@
       "begin": "BEGIN TRANSACTION",
       "commit": "COMMIT TRANSACTION",
       "ddl_commits": "No",
+      "release_savepoint": null,
       "rollback": "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
       "savepoint": [
         "SAVE TRANSACTION {}",
@@ -545,6 +547,7 @@
       "begin": "START TRANSACTION",
       "commit": "COMMIT",
       "ddl_commits": "Ddl",
+      "release_savepoint": "RELEASE SAVEPOINT {}",
       "rollback": "ROLLBACK",
       "savepoint": [
         "SAVEPOINT {}",
@@ -769,6 +772,7 @@
       "begin": "BEGIN",
       "commit": "COMMIT",
       "ddl_commits": "No",
+      "release_savepoint": "RELEASE SAVEPOINT {}",
       "rollback": "ROLLBACK",
       "savepoint": [
         "SAVEPOINT {}",
@@ -860,6 +864,7 @@
       "begin": "BEGIN",
       "commit": "COMMIT",
       "ddl_commits": "AnyDdl",
+      "release_savepoint": "RELEASE SAVEPOINT {}",
       "rollback": "ROLLBACK",
       "savepoint": null
     },
@@ -947,6 +952,7 @@
       "begin": "BEGIN",
       "commit": "COMMIT",
       "ddl_commits": "No",
+      "release_savepoint": "RELEASE SAVEPOINT {}",
       "rollback": "ROLLBACK",
       "savepoint": [
         "SAVEPOINT {}",

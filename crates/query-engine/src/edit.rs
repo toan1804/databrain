@@ -543,7 +543,8 @@ impl QueryEngine {
         }
         // In the user's open transaction: a savepoint, so a conflict undoes
         // this apply only (the user's own changes stay pending).
-        let savepoint = kind.traits().transactions.and_then(|t| t.savepoint).filter(|_| in_tx);
+        let tx = kind.traits().transactions;
+        let savepoint = tx.and_then(|t| t.savepoint).filter(|_| in_tx);
         const SAVEPOINT: &str = "databrain_apply";
         if let Some((set, _)) = savepoint {
             run(set.replace("{}", SAVEPOINT)).await?;
@@ -580,6 +581,13 @@ impl QueryEngine {
         }
         if let Some((_, commit, _)) = style {
             run(commit.to_string()).await?;
+        }
+        // Kept: the savepoint isn't needed any more (best effort; the
+        // changes are already in the user's transaction).
+        if savepoint.is_some()
+            && let Some(release) = tx.and_then(|t| t.release_savepoint)
+        {
+            let _ = run(release.replace("{}", SAVEPOINT)).await;
         }
         Ok(report)
     }

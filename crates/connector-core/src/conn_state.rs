@@ -33,9 +33,28 @@ impl ConnState {
 
     /// Note a statement about to run on the connection.
     pub fn observe(&self, sql: &str, kind: ConnectorKind) {
-        let kw = leading_keyword(sql);
+        let mut kw = leading_keyword(sql);
         let has = |w: &[&str]| words(sql).any(|x| w.iter().any(|k| x.eq_ignore_ascii_case(k)));
         let mssql = kind == ConnectorKind::Mssql;
+        // SQL Server statements that name TRAN without beginning one: a
+        // guarded `IF @@TRANCOUNT > 0 ROLLBACK|COMMIT …` ends as the plain
+        // form does; `SAVE TRAN x` and `ROLLBACK TRAN x` (to a savepoint)
+        // leave the transaction as it is.
+        let mut keeps = false;
+        if mssql {
+            if kw == "IF" && has(&["ROLLBACK"]) {
+                kw = "ROLLBACK".into();
+            } else if kw == "IF" && has(&["COMMIT"]) {
+                kw = "COMMIT".into();
+            }
+            let rest: Vec<String> = words(crate::sql::strip_leading_comments(sql))
+                .map(str::to_ascii_uppercase)
+                .skip_while(|w| w != "ROLLBACK" && w != "SAVE")
+                .skip(1)
+                .skip_while(|w| matches!(w.as_str(), "TRAN" | "TRANSACTION" | "WORK"))
+                .collect();
+            keeps = kw == "SAVE" || (kw == "ROLLBACK" && !rest.is_empty());
+        }
         // Transactions.
         let begins = match kw.as_str() {
             "START" => has(&["TRANSACTION"]),
@@ -52,14 +71,14 @@ impl ConnState {
                     )
                 )
             }
-            _ => mssql && has(&["TRAN", "TRANSACTION"]) && !matches!(kw.as_str(), "COMMIT" | "ROLLBACK"),
+            _ => mssql && !keeps && has(&["TRAN", "TRANSACTION"]) && !matches!(kw.as_str(), "COMMIT" | "ROLLBACK"),
         };
         if begins {
             self.tx_depth.fetch_add(1, Ordering::SeqCst);
         }
         match kw.as_str() {
             // ROLLBACK TO SAVEPOINT keeps the transaction.
-            "ROLLBACK" if has(&["TO"]) => {}
+            "ROLLBACK" if has(&["TO"]) || keeps => {}
             "COMMIT" | "END" if mssql => {
                 // `try_update` is the new name but needs Rust 1.95; the MSRV is 1.89.
                 #[allow(deprecated)]
@@ -139,6 +158,19 @@ mod tests {
         // A Snowflake Scripting block is not a transaction.
         assert!(!after(Snowflake, &["BEGIN\n  LET x := 1;\n  RETURN x;\nEND"]).1);
         assert!(!after(Snowflake, &["begin\n  insert into t values (1);\nend"]).1);
+        // The statements DataBrain sends itself (TxDialect): the guarded
+        // rollback and savepoints follow the server's @@TRANCOUNT.
+        let tx = Mssql.traits().transactions.unwrap();
+        let (save, back) = tx.savepoint.unwrap();
+        let (save, back) = (save.replace("{}", "databrain_apply"), back.replace("{}", "databrain_apply"));
+        assert!(!after(Mssql, &[tx.rollback]).1, "a guarded rollback on no transaction opens none");
+        assert!(!after(Mssql, &[tx.begin, tx.rollback]).1);
+        assert!(!after(Mssql, &[tx.begin, &save, tx.commit]).1, "a savepoint isn't a level");
+        assert!(after(Mssql, &[tx.begin, &save, &back]).1, "back to the savepoint: still open");
+        assert!(!after(Mssql, &[tx.begin, &save, &back, tx.commit]).1);
+        assert!(!after(Mssql, &["begin tran", "IF @@TRANCOUNT > 0 COMMIT"]).1);
+        assert!(after(Mssql, &["begin tran", "rollback tran sp1"]).1);
+        assert!(!after(Mssql, &["begin tran", "rollback tran"]).1);
         assert!(after(Postgres, &["begin isolation level serializable"]).1);
         assert!(after(Sqlite, &["begin immediate"]).1);
     }

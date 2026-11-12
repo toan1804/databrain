@@ -161,10 +161,11 @@ impl QueryEngine {
     pub async fn estimate_cost(&self, connection_id: &str, session_key: &str, sql: &str) -> Result<databrain_connector_core::CostEstimate> {
         let kind = self.workspace().get_connection(connection_id)?.config.kind;
         let sql = cost_statement(kind, sql)?;
-        // The tab's session unless something holds it (then the metadata one).
-        let claim =
-            if session_key.is_empty() { None } else { self.claim(connection_id, session_key, databrain_connector_core::CancellationToken::new(), "").ok() };
-        let tab = if claim.is_none() { crate::META_TAB } else { session_key };
+        // The tab's session unless something holds it (then the metadata
+        // one). Looked at, not claimed: the editor asks for an estimate
+        // while you type, and Run must not find the tab busy because of it.
+        let busy = self.jobs.lock().values().any(|j| j.session_key == session_key || j.tab_id == session_key);
+        let tab = if busy || session_key.is_empty() { crate::META_TAB } else { session_key };
         let run = self.with_tab(connection_id, tab, |s| {
             let sql = sql.clone();
             async move { s.estimate_cost(&sql).await }

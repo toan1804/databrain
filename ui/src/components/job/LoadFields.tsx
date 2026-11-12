@@ -317,32 +317,46 @@ export function useLoadTarget(connectionId: string | null | undefined, table: st
   return state;
 }
 
+/** Ask before writing into a production connection; false when the user says no. */
+function confirmProdLoad(reason: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) =>
+    useStore.getState().askConfirm({
+      title: "Write into a production connection?",
+      reasons: [reason],
+      confirmLabel: "Load anyway",
+      onConfirm: () => resolve(true),
+      onCancel: () => resolve(false),
+    }),
+  );
+}
+
+/** Load a result. A production target asks first (and the server refuses
+ * an unconfirmed load there with code `needs_confirmation`, asked then
+ * too). `onStart` runs once the load really starts; `null` when the user
+ * said no. */
+export async function loadResultAsking(resultId: string, args: LoadResultArgs, loadId: string, onStart?: () => void): Promise<LoadReport | null> {
+  const conn = useStore.getState().connections.find((c) => c.id === args.target_connection_id);
+  let confirmed = false;
+  if (conn?.env === "prod") {
+    if (!(await confirmProdLoad(`"${conn.name}" is a production connection: confirm writing rows into ${args.table}.`))) return null;
+    confirmed = true;
+  }
+  onStart?.();
+  try {
+    return await api.loadResult(resultId, { ...args, confirmed }, loadId);
+  } catch (e) {
+    const err = toError(e);
+    if (confirmed || err.code !== "needs_confirmation") throw e;
+    if (!(await confirmProdLoad(err.message))) return null;
+    return api.loadResult(resultId, { ...args, confirmed: true }, loadId);
+  }
+}
+
 /**
  * Rows can't be loaded as set up: the catalog or schema is missing, the
  * target is a view, or the table is missing in a mode that doesn't create it
  * (not when before SQL runs first: it may create them).
  */
-/** Load a result; a production target asks first (code
- * `needs_confirmation`) and the load runs again once confirmed. `null` when
- * the user said no. */
-export async function loadResultAsking(resultId: string, args: LoadResultArgs, loadId: string): Promise<LoadReport | null> {
-  try {
-    return await api.loadResult(resultId, { ...args, confirmed: false }, loadId);
-  } catch (e) {
-    const err = toError(e);
-    if (err.code !== "needs_confirmation") throw e;
-    const ok = await new Promise<boolean>((resolve) =>
-      useStore.getState().askConfirm({
-        title: "Write into a production connection?",
-        reasons: [err.message],
-        confirmLabel: "Load anyway",
-        onConfirm: () => resolve(true),
-        onCancel: () => resolve(false),
-      }),
-    );
-    return ok ? api.loadResult(resultId, { ...args, confirmed: true }, loadId) : null;
-  }
-}
 
 export function loadTargetBlocked(c: TargetCheck, mode: LoadMode, create: boolean, beforeSql = false): boolean {
   if (c.status !== "ready" || beforeSql) return false;
