@@ -227,6 +227,39 @@ impl KiroProvider {
         Acp::spawn(cmd, cwd).await
     }
 
+    /// One prompt, one text answer, no tools (no MCP server is offered, and
+    /// the agent config DataBrain manages allows only `@databrain` tools):
+    /// test data asks Kiro this way. Each call starts `kiro-cli`, so it is
+    /// slower than a model API; dropping the future stops the child.
+    pub(crate) async fn complete(&self, prompt: String, model: Option<&str>) -> Result<String> {
+        let st = self.status().await;
+        if !st.signed_in {
+            return Err(AiError::Auth(format!("Kiro: {}", st.message.unwrap_or_else(|| "not signed in".into()))));
+        }
+        let (acp, mut incoming) = self.spawn_acp(model).await?;
+        let cancel = CancellationToken::new();
+        let init = json!({"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false}, "clientInfo": {"name": "databrain", "version": env!("CARGO_PKG_VERSION")}});
+        acp.call(&mut incoming, "initialize", init, &cancel, |_| {}).await?;
+        let r = acp.call(&mut incoming, "session/new", json!({"cwd": acp.cwd.to_string_lossy(), "mcpServers": []}), &cancel, |_| {}).await?;
+        let sid = r.get("sessionId").and_then(|s| s.as_str()).ok_or_else(|| AiError::Provider("Kiro did not return a session id".into()))?.to_string();
+        let text = Mutex::new(String::new());
+        let on_update = |u: &Value| {
+            if u.get("sessionUpdate").and_then(|k| k.as_str()) == Some("agent_message_chunk")
+                && let Some(s) = u.pointer("/content/text").and_then(|s| s.as_str())
+            {
+                text.lock().push_str(s);
+            }
+        };
+        let prompt = json!({"sessionId": sid, "prompt": [{"type": "text", "text": prompt}]});
+        let r = acp.call(&mut incoming, "session/prompt", prompt, &cancel, on_update).await?;
+        let text = text.into_inner();
+        match r.get("stopReason").and_then(|s| s.as_str()) {
+            Some("refusal") => Err(AiError::Provider("Kiro declined the request".into())),
+            Some("max_tokens") if text.is_empty() => Err(AiError::Provider("Kiro hit its output limit".into())),
+            _ => Ok(text),
+        }
+    }
+
     /// One agent turn. `prompt` already contains DataBrain's context block.
     pub(crate) async fn run_turn(&self, t: KiroTurn) -> Result<String> {
         let st = self.status().await;

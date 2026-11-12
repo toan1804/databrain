@@ -39,19 +39,20 @@ export function aiWrites(c: TestDataColumn, ticked: Set<string>, s: TestDataAiSe
 }
 
 /**
- * The provider asked: the AI panel's, unless it is Kiro (an agent, not a
- * model) or not allowed on the connection (`allowed`, empty: any), then the
- * first usable one. Null when there is none.
+ * The provider asked: the AI panel's when the connection allows it
+ * (`allowed`, empty: any), else the first allowed model provider, else Kiro
+ * (each batch starts kiro-cli, so it is slower). Null when there is none.
  */
 export function aiTarget(
   providers: ProviderView[],
   panel: { providerId: string | null; model: string | null },
   allowed: string[] = [],
 ): { provider_id: string; model: string | null } | null {
-  const usable = providers.filter((p) => p.kind !== "kiro" && (allowed.length === 0 || allowed.includes(p.id)));
+  const usable = providers.filter((p) => allowed.length === 0 || allowed.includes(p.id));
   const chosen = usable.find((p) => p.id === panel.providerId);
   if (chosen) return { provider_id: chosen.id, model: panel.model };
-  return usable[0] ? { provider_id: usable[0].id, model: null } : null;
+  const first = usable.find((p) => p.kind !== "kiro") ?? usable[0];
+  return first ? { provider_id: first.id, model: null } : null;
 }
 
 /** What the backend gets, or null when the AI isn't used. */

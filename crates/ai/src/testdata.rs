@@ -85,13 +85,12 @@ fn target(ws: &Workspace, secrets: Arc<dyn SecretStore>, connection_id: &str, ai
         return Err(AiError::Policy(format!("provider \"{}\" is not allowed for this connection", rec.name)));
     }
     let (provider, cfg, _) = provider_for(&rec, secrets)?;
-    if provider.as_kiro().is_some() {
-        return Err(AiError::Config("generating test data needs a model provider, and Kiro runs as an agent: choose another provider in the AI panel".into()));
-    }
     let some = |m: Option<&str>| m.map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
     let model = some(ai.model.as_deref())
         .or_else(|| some(cfg.default_model.as_deref()))
         .or_else(|| some(cfg.fast_model.as_deref()))
+        // Kiro picks its own model unless one is chosen.
+        .or_else(|| provider.as_kiro().map(|_| "auto".to_string()))
         .ok_or_else(|| AiError::Config(format!("choose a model for \"{}\"", rec.name)))?;
     Ok(Target { provider, provider_id: rec.id, model, checks })
 }
@@ -100,6 +99,14 @@ fn target(ws: &Workspace, secrets: Arc<dyn SecretStore>, connection_id: &str, ai
 /// to the end of the stream: providers report usage after Done), so a call
 /// stopped half way is counted too.
 async fn ask_model(provider: &Arc<dyn crate::providers::LlmProvider>, chat: ChatRequest, meter: &Meter) -> Result<String> {
+    // Kiro has no model API: one tool-less prompt through kiro-cli. It is
+    // billed in credits, which the provider page reads from Kiro itself, so
+    // no tokens are counted here.
+    if let Some(kiro) = provider.as_kiro() {
+        let prompt = format!("{}\n\n{}", chat.system, chat.messages.iter().map(|m| m.text.as_str()).collect::<Vec<_>>().join("\n\n"));
+        let model = Some(chat.model.as_str()).filter(|m| !m.is_empty());
+        return tokio::time::timeout(TIMEOUT, kiro.complete(prompt, model)).await.map_err(|_| AiError::Network("Kiro took too long".into()))?;
+    }
     let run = async {
         let mut stream = provider.chat_stream(chat.clone()).await?;
         meter.sent(&chat);

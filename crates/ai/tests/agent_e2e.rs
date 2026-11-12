@@ -547,6 +547,61 @@ async fn kiro_provider_drives_databrain_tools_over_acp_and_mcp() {
     assert_eq!(models, vec!["auto", "claude-sonnet-4.5"]);
 }
 
+/// Test data can use Kiro: one plain prompt per call, with no tools offered,
+/// and the answer read like a model's. Kiro may pick its own model.
+#[tokio::test]
+async fn kiro_writes_test_data_without_tools() {
+    use databrain_query_engine::testdata::{AiAsk, AiColumn};
+    let Some(cli) = fake_kiro() else { return eprintln!("skipped: needs python3") };
+    let f = fixture(1, AiPolicy::default()).await;
+    let log = f._dir.0.join("fake-kiro.log");
+    let env = [("FAKE_KIRO_LOG", log.to_string_lossy().into_owned()), ("FAKE_KIRO_REPLY", r#"Here: {"email": "%@corp.vn"}"#.into())];
+    let rec =
+        f.ws.save_ai_provider(AiProviderRecord {
+            id: String::new(),
+            kind: "kiro".into(),
+            name: "Kiro".into(),
+            config: serde_json::to_value(ProviderConfig {
+                base_url: Some(cli),
+                agents_dir: Some(f._dir.0.join("kiro-agents").to_string_lossy().into()),
+                cli_env: env.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+                ..Default::default()
+            })
+            .unwrap(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    f.secrets.set(&SecretRef::for_ai_provider(&rec.id), &"ksk_test".to_string().into()).unwrap();
+    let ask = AiAsk {
+        schema: "main".into(),
+        name: "customers".into(),
+        table: "\"main\".\"customers\"".into(),
+        dialect: "sqlite".into(),
+        checks: vec![],
+        columns: vec![AiColumn {
+            name: "email".into(),
+            data_type: "text".into(),
+            nullable: true,
+            unique: false,
+            max_chars: None,
+            choices: vec![],
+            hint: "email".into(),
+            pattern: None,
+        }],
+        others: vec![],
+        rows: 1,
+    };
+    let ai = databrain_ai::testdata::TestDataAi { provider_id: Some(rec.id.clone()), model: None, all_columns: true, rows: 1 };
+    let got = databrain_ai::testdata::suggest_patterns(&f.ws, f.secrets.clone(), &f.conn, &ai, &ask, &Default::default()).await.unwrap();
+    assert_eq!(got.get("email").map(String::as_str), Some("%@corp.vn"));
+    let lines: Vec<Value> = std::fs::read_to_string(&log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    // No --model: Kiro chose ("auto"); no tool server was offered.
+    assert_eq!(lines.iter().find(|l| l.get("argv").is_some()).unwrap()["argv"], json!(["acp", "--agent", "databrain-sql"]));
+    let plain = lines.iter().find(|l| l.get("plain").is_some()).expect("a plain prompt");
+    assert!(plain["prompt"].as_str().unwrap().contains("email"), "{plain}");
+}
+
 /// Live: `KIRO_API_KEY=ksk_… cargo test -p databrain-ai --test agent_e2e kiro_live -- --ignored --nocapture`
 /// Uses the real kiro-cli and consumes a few Kiro credits.
 #[ignore = "live: needs kiro-cli and KIRO_API_KEY, uses Kiro credits (cargo test -- --ignored)"]

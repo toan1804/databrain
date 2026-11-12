@@ -40,11 +40,13 @@ describe("generate test data with AI", () => {
     expect(aiWrites(name, ticked, { ...on, enabled: false })).toBe(false);
   });
 
-  it("asks the AI panel's provider, not Kiro", () => {
+  it("asks the AI panel's provider, else a model provider before Kiro", () => {
     const ps = [provider("kiro", "kiro"), provider("claude"), provider("gpt")];
     expect(aiTarget(ps, { providerId: "gpt", model: "m" })).toEqual({ provider_id: "gpt", model: "m" });
-    expect(aiTarget(ps, { providerId: "kiro", model: "k" })).toEqual({ provider_id: "claude", model: null });
-    expect(aiTarget([provider("kiro", "kiro")], { providerId: "kiro", model: null })).toBeNull();
+    expect(aiTarget(ps, { providerId: "kiro", model: "k" })).toEqual({ provider_id: "kiro", model: "k" });
+    expect(aiTarget(ps, { providerId: null, model: null })).toEqual({ provider_id: "claude", model: null });
+    // Only Kiro set up: Kiro writes the rows.
+    expect(aiTarget([provider("kiro", "kiro")], { providerId: null, model: null })).toEqual({ provider_id: "kiro", model: null });
     // The connection allows only some providers.
     expect(aiTarget(ps, { providerId: "claude", model: "m" }, ["gpt"])).toEqual({ provider_id: "gpt", model: null });
     expect(aiTarget(ps, { providerId: "claude", model: "m" }, ["other"])).toBeNull();
