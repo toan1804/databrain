@@ -95,7 +95,7 @@ export function Knowledge() {
       .catch((e) => toast(toError(e).message, "error"));
     api
       .aiScope(connId)
-      .then(setRules)
+      .then((r) => setRules(r ?? []))
       .catch(() => setRules([]));
   }, [connId, toast]);
   /** Exclude a table from what the AI may use, or take an exclusion back. */

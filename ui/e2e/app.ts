@@ -111,6 +111,7 @@ export function backend(over: Record<string, unknown> = {}): Record<string, unkn
     ai_list_providers: [PROVIDER],
     background_jobs_status: { installed: false, running: false, supported: false },
     revalidate_explorer: { refreshed: [], skipped: true, fingerprints: {}, deferred: [] },
+    ai_scope: [],
     ...over,
   };
 }
