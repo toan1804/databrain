@@ -1,7 +1,7 @@
 import type { StateCreator } from "zustand";
 import { isThreeLevel, mergeCatalogSchemas, prefetchSchemas, revealKeys, splitSchema, treeKey } from "../lib/catalog";
 import { api, toError } from "../lib/api";
-import type { CatalogInfo, ColumnInfo, DbObject, SchemaInfo } from "../lib/types";
+import type { CatalogInfo, ColumnInfo, DbObject, SchemaInfo, StatementKind } from "../lib/types";
 import { chosenSchemaIds } from "./helpers";
 import type { ExplorerStatus, State } from "./types";
 
@@ -72,7 +72,43 @@ export interface ExplorerSlice {
    * explorer shown offline from its cache checks it again.
    */
   markOnline: (connId: string) => void;
+  /**
+   * Which cached schemas changed on the server (one fingerprint query where
+   * the engine has one), and those re-listed table by table. `force` skips
+   * the "checked a minute ago" shortcut; `withDefault` also checks the
+   * default schema (where an unqualified CREATE goes) on engines without
+   * fingerprints, which otherwise check only expanded schemas. Never throws.
+   */
+  checkForChanges: (connId: string, force?: boolean, withDefault?: boolean) => Promise<void>;
+  /**
+   * DDL ran on the connection (CREATE, ALTER, DROP…): what it changed is
+   * shown without a Refresh click. Calls within a moment are merged.
+   */
+  schemaChanged: (connId: string, schemaList?: boolean) => void;
 }
+
+/** Schemas of `connId` the tree shows expanded. */
+function openSchemas(treeOpen: Record<string, boolean>, connId: string): string[] {
+  return Object.entries(treeOpen)
+    .filter(([k, v]) => v && k.startsWith(`s|${connId}|`))
+    .map(([k]) => k.slice(connId.length + 3));
+}
+
+/**
+ * Whether a statement that ran may have changed what the explorer shows, and
+ * whether it changed the list of schemas itself. Reads never do; DDL, and
+ * statements DataBrain can't classify (a procedure may create tables), may.
+ */
+export function ddlEffect(sql: string, kind: StatementKind): { tables: boolean; schemaList: boolean } {
+  if (kind !== "ddl" && kind !== "other" && kind !== "unknown") return { tables: false, schemaList: false };
+  const body = sql.replace(/^(\s|--[^\n]*\n|\/\*[\s\S]*?\*\/)*/, "");
+  return { tables: true, schemaList: /^(create|drop|alter)\s+(or\s+replace\s+)?(schema|database|catalog)\b/i.test(body) };
+}
+
+/** Pending DDL rechecks per connection (and whether the schema list changed too). */
+const ddlTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; schemaList: boolean }>();
+/** How long DDL rechecks wait for more statements of the same script. */
+export const DDL_RECHECK_MS = 400;
 
 export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (set, get) => ({
   schemas: {},
@@ -194,42 +230,8 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
       .catch(() => {});
     // 3. Background: which cached schemas changed (refreshed table by table), then prefetch.
     void (async () => {
-      const st = get();
-      const open = Object.entries(st.treeOpen)
-        .filter(([k, v]) => v && k.startsWith(`s|${connId}|`))
-        .map(([k]) => k.slice(connId.length + 3));
-      set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], checking: true } } }));
-      try {
-        const r = await api.revalidateExplorer(connId, open, force);
-        set((s) => {
-          const objects = { ...s.objects };
-          let columns = s.columns;
-          for (const x of r.refreshed) {
-            if (x.mode === "unchanged") continue;
-            objects[`${connId}|${x.schema}`] = x.objects;
-            // Columns re-read from the cache (changed tables are marked stale there).
-            const pre = `${connId}|${x.schema}|`;
-            columns = Object.fromEntries(Object.entries(columns).filter(([k]) => !k.startsWith(pre)));
-          }
-          const prev = s.explorer[connId];
-          return {
-            objects,
-            columns,
-            explorer: {
-              ...s.explorer,
-              [connId]: {
-                ...prev,
-                checking: false,
-                checkedAt: r.skipped ? prev?.checkedAt : Date.now(),
-                fingerprints: r.skipped ? prev?.fingerprints : r.fingerprints,
-                deferred: r.skipped ? prev?.deferred : r.deferred,
-              },
-            },
-          };
-        });
-      } catch {
-        set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], checking: false } } }));
-      }
+      const open = openSchemas(get().treeOpen, connId);
+      await get().checkForChanges(connId, force);
       // Default catalog's schemas, then tables of likely-clicked schemas.
       const cats = get().catalogs[connId];
       if (three && cats) {
@@ -347,6 +349,59 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
       return cached.columns;
     }
     return live();
+  },
+  checkForChanges: async (connId, force = false, withDefault = false) => {
+    const st = get();
+    if (st.explorer[connId]?.offline) return;
+    const open = openSchemas(st.treeOpen, connId);
+    const known = st.schemas[connId] ?? Object.entries(st.catalogSchemas).flatMap(([k, v]) => (k.startsWith(`${connId}|`) ? v : []));
+    const def = withDefault ? known.find((x) => x.is_default)?.name : undefined;
+    if (def && !open.includes(def)) open.push(def);
+    set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], checking: true } } }));
+    try {
+      const r = await api.revalidateExplorer(connId, open, force);
+      set((s) => {
+        const objects = { ...s.objects };
+        let columns = s.columns;
+        for (const x of r.refreshed) {
+          if (x.mode === "unchanged") continue;
+          objects[`${connId}|${x.schema}`] = x.objects;
+          // Columns re-read from the cache (changed tables are marked stale there).
+          const pre = `${connId}|${x.schema}|`;
+          columns = Object.fromEntries(Object.entries(columns).filter(([k]) => !k.startsWith(pre)));
+        }
+        const prev = s.explorer[connId];
+        return {
+          objects,
+          columns,
+          explorer: {
+            ...s.explorer,
+            [connId]: {
+              ...prev,
+              checking: false,
+              checkedAt: r.skipped ? prev?.checkedAt : Date.now(),
+              fingerprints: r.skipped ? prev?.fingerprints : r.fingerprints,
+              deferred: r.skipped ? prev?.deferred : r.deferred,
+            },
+          },
+        };
+      });
+    } catch {
+      set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], checking: false } } }));
+    }
+  },
+  schemaChanged: (connId, schemaList = false) => {
+    const was = ddlTimers.get(connId);
+    if (was) clearTimeout(was.timer);
+    const list = schemaList || !!was?.schemaList;
+    const timer = setTimeout(() => {
+      ddlTimers.delete(connId);
+      void (async () => {
+        if (list && get().schemas[connId]) await get().loadSchemas(connId, true).catch(() => {});
+        await get().checkForChanges(connId, true, true);
+      })();
+    }, DDL_RECHECK_MS);
+    ddlTimers.set(connId, { timer, schemaList: list });
   },
   markOnline: (connId) => {
     if (!get().explorer[connId]?.offline) return;

@@ -86,6 +86,7 @@ expand table ──► loadColumns
 - **Table gone** from a listing: its columns are dropped (`columns_changed`).
 - **Connection now points elsewhere** (kind, host, port, database, file, auth, options except session ones, SSH hop): `save_connection` → `meta_check_identity` → `meta_clear` and `kn_clear` (the AI index's objects; notes and learned joins stay). The connection form also drops the connection's keys from the UI store (`useConnectionForm.tsx` `persist`).
 - **Connection deleted:** `delete_connection` removes both the explorer cache and the knowledge index.
+- **DDL run in the editor:** when a statement classified `ddl`, `other` or `unknown` finishes (`runsSlice.ts` → `ddlEffect`), `schemaChanged` waits `DDL_RECHECK_MS` (400 ms, so a script's statements make one check) and runs `checkForChanges(conn, force, withDefault)`: `revalidate_explorer` with the expanded schemas plus the default one, so changed schemas are re-listed and their in-memory columns dropped (stale ones are described again when shown). `CREATE/ALTER/DROP SCHEMA|DATABASE|CATALOG` also reloads the schema list. Nothing is asked while the explorer is offline.
 - `clear_explorer_cache` exists as a command but the UI does not call it.
 
 ## Other readers of the explorer cache

@@ -40,6 +40,7 @@ vi.mock("./lib/api", () => ({
 }));
 
 const { useStore } = await import("./store");
+const { DDL_RECHECK_MS, ddlEffect } = await import("./store/explorerSlice");
 const conn = { id: "c", name: "dbx", connected: false, config: { kind: "databricks", auth: { method: "token" }, options: {} } };
 
 beforeEach(() => {
@@ -147,6 +148,42 @@ describe("explorer cache", () => {
     // Both ran: neither was handed the other's answer (a listing is an array, a refresh is not).
     expect([...calls].sort()).toEqual(["listObjects:main.hr", "refreshSchema:main.hr"]);
     expect(useStore.getState().objects["c|main.hr"]?.length).toBeGreaterThan(0);
+  });
+
+  it("tells which statements may change what the explorer shows", () => {
+    expect(ddlEffect("select 1", "read")).toEqual({ tables: false, schemaList: false });
+    expect(ddlEffect("insert into t values (1)", "dml").tables).toBe(false);
+    expect(ddlEffect("alter table t add c int", "ddl")).toEqual({ tables: true, schemaList: false });
+    expect(ddlEffect("call make_tables()", "other").tables).toBe(true);
+    expect(ddlEffect("-- new area\n/* x */ CREATE SCHEMA sales", "ddl")).toEqual({ tables: true, schemaList: true });
+    expect(ddlEffect("create or replace database d", "ddl").schemaList).toBe(true);
+    expect(ddlEffect("create table schema_log (id int)", "ddl").schemaList).toBe(false);
+  });
+
+  it("DDL in the editor updates the tree without a Refresh click, once per script", async () => {
+    cache = {
+      catalogs: [{ name: "main", is_default: true }],
+      schemas: null,
+      catalog_schemas: { main: [sch("main", "sales", true)] },
+      state: { checked_at: 1, catalogs_at: 1, schemas_at: null, listed_schemas: 1 },
+    };
+    cachedListings["main.sales"] = [t("main.sales", "orders")];
+    useStore.setState({ treeOpen: { "s|c|main.sales": true } });
+    await useStore.getState().openExplorer("c");
+    await settle();
+    useStore.setState({ objects: { "c|main.sales": [t("main.sales", "orders")] } });
+    calls.length = 0;
+    // Three statements of one script: one check, forced past the minute shortcut.
+    for (let i = 0; i < 3; i++) useStore.getState().schemaChanged("c");
+    await sleep(DDL_RECHECK_MS + 60);
+    expect(calls.filter((c) => c.startsWith("revalidate:"))).toEqual(["revalidate:main.sales"]);
+    expect(useStore.getState().objects["c|main.sales"].map((o) => o.name)).toEqual(["orders", "new_one"]);
+    // Offline: nothing is asked.
+    useStore.setState({ explorer: { c: { ...useStore.getState().explorer.c, offline: "down" } } });
+    calls.length = 0;
+    useStore.getState().schemaChanged("c");
+    await sleep(DDL_RECHECK_MS + 60);
+    expect(calls).toEqual([]);
   });
 
   it("throws when there is neither a cache nor a server", async () => {

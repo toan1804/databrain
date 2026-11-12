@@ -3,6 +3,7 @@ import { announceSshHostKey, api, isTauri, toError } from "../lib/api";
 import { computeRunTips, slowStatements } from "../queryTips";
 import type { JobEvent, OutputInfo, ParamValue } from "../lib/types";
 import { errorRange } from "../lib/util";
+import { ddlEffect } from "./explorerSlice";
 import { restoredRun } from "./helpers";
 import { isQueryTab, type RunInput, type State, type StatementRun, type TabRun } from "./types";
 
@@ -383,7 +384,12 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           if (e.result) next.activeIndex = e.index;
           if (run.connectionId) {
             const id = run.connectionId;
-            setTimeout(() => get().markOnline(id), 0);
+            const plan = statements[e.index]?.plan;
+            const effect = plan ? ddlEffect(plan.sql, plan.classification.kind) : null;
+            setTimeout(() => {
+              get().markOnline(id);
+              if (effect?.tables) get().schemaChanged(id, effect.schemaList);
+            }, 0);
           }
           break;
         case "statement_failed": {

@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Explorer: tables created, altered or dropped from the editor show in the tree (and in completion) without a Refresh click. One check runs after the script, with the schema fingerprint where the database has one; `CREATE SCHEMA` and similar also update the schema list.
 - Completion, lineage and the AI use the newer of the explorer's cached columns and the AI index (it used to prefer the index even when the explorer had read the table since). Foreign keys are now cached with a table's columns, so test data's instant column list has them. Lineage with "Check with database" reads tables whose schema changed since they were cached again before tracing.
 - Explorer: pointing a connection at another server (host, database, user…) now also forgets the AI's index of the old server's tables (your notes stay), so completion, lineage and the AI no longer offer tables that aren't there. Clicking a schema's Refresh while it is still loading no longer shows it empty. An explorer shown offline checks the server again as soon as a query on that connection succeeds, without a Refresh click.
 - Generate test data: "Generate values with AI" and "Suggest patterns with AI" work with Kiro. With only Kiro set up, the dialog said "Add an AI provider" although one was there. Each batch is one prompt to kiro-cli with no tools offered, so it is slower than a model provider.
