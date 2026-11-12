@@ -1,0 +1,22 @@
+# Reads that must stay reads (a stricter classifier must not ask about these).
+# Same format as never_read.txt.
+
+postgres | select * from t
+postgres | with x as (select 1) select * from x
+postgres | select count(*), lower(name) from users where id = 1
+postgres | select currval('s')
+postgres | explain select 1
+mysql | show tables
+mysql | select a, b from t order by a limit 10
+mssql | select top 10 * from dbo.orders o where o.id > 1
+mssql | select 1 as a, 2 b
+mssql | select open, close from prices
+mssql | select [shutdown] from t
+mssql | select o.id from orders o join customers c on c.id = o.cid
+snowflake | select system$typeof(1)
+snowflake | select v:a::string from t
+oracle | select orders_seq.currval from dual
+oracle | select * from dual
+sqlite | select * from t
+duckdb | select * from read_parquet('x.parquet')
+bigquery | select * from `p.d.t`

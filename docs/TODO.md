@@ -60,18 +60,7 @@ Paths are in `crates/query-engine/src/` unless given in full. Items 1, 2 and 5 w
 
 ## Connector core (review of 2026-11-12; see [CONNECTOR_CORE.md](CONNECTOR_CORE.md))
 
-Paths are in `crates/connector-core/src/` unless given in full. The high items and the Postgres escaped-name item were run against `classify` and `read_only_allows`; whether each server runs the hidden part was not tested. The others are from one reading: reproduce with a test before fixing.
-
-### High: statements that classify as a read (fix first)
-
-They pass a read-only connection, the production prompt and the AI's auto-read. SQL Server and Snowflake have no server-side read-only session to fall back on.
-
-1. **SQL Server: a second statement read as an alias** (`sql/classify.rs`). T-SQL needs no separator, so a statement keyword after a select item or table (`select 1 shutdown`, `… reconfigure`, `… revert`) parses as one SELECT with an alias. An implicit alias that is a T-SQL statement keyword should be `Unknown`.
-2. **A SELECT that doesn't parse is a read unless a deny-list word is found** (`sql/classify.rs`, the fallback and its word list). SQL Server `select 1 deny select on orders to public`, `… disable trigger …`, `… setuser …` are `Read`. Unparsed must be `Unknown`, as AGENTS.md says.
-3. **Snowflake `->>`** (`sql/classify.rs`). `select 1 ->> delete from t where id = 1` parses as the JSON operator, so the chained statement isn't classified. A `->>` outside strings on Snowflake should be `Unknown`, or each segment classified.
-4. **Table functions that run SQL elsewhere** are not in `ACTING_FUNCTIONS`: SQL Server `openquery`, `openrowset`; DuckDB `postgres_query` (and the like for other attached databases). The AI path asks through `unknown_functions`; read-only and the production prompt don't.
-5. **MySQL `SET` with several assignments** (`sql/read_only.rs`). Only the first name is checked: `SET time_zone = '+00:00', GLOBAL read_only = 0` is `Session` and allowed. Check every assignment, or refuse lists.
-6. **Postgres function names written with Unicode escapes** (`U&"pg\005Fterminate\005Fbackend"(1)`) miss the name lists and are `Read`. An escaped identifier used as a function name should be `Unknown`.
+Paths are in `crates/connector-core/src/` unless given in full. From one reading: reproduce with a test before fixing.
 
 ### Medium
 

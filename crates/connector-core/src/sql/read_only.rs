@@ -52,19 +52,90 @@ pub fn read_only_allows(sql: &str, c: &Classification) -> bool {
             match w.next().as_deref() {
                 // Not `USE ROLE`: another role may write.
                 Some("use") => !matches!(w.next().as_deref(), Some("role" | "secondary")),
-                Some("set") => {
-                    let mut name = w.next().unwrap_or_default();
-                    if matches!(name.as_str(), "session" | "local") {
-                        name = w.next().unwrap_or_default();
-                    }
-                    let name = name.trim_start_matches("@@").trim_start_matches("session.").trim_start_matches('@').to_string();
-                    READ_ONLY_SETTINGS.contains(&name.as_str())
-                }
+                Some("set") => set_names(sql).is_some_and(|names| !names.is_empty() && names.iter().all(|n| harmless_setting(n))),
                 _ => false,
             }
         }
         _ => false,
     }
+}
+
+/// A setting `SET` may change on a read-only connection: `name` is as
+/// written, lower-case, with its scope (`session time_zone`,
+/// `@@global.read_only`). Any scope other than the session's is refused.
+fn harmless_setting(name: &str) -> bool {
+    let mut parts = name.split_whitespace();
+    let mut first = parts.next().unwrap_or_default();
+    if matches!(first, "session" | "local") {
+        first = parts.next().unwrap_or_default();
+    }
+    if parts.next().is_some() {
+        return false;
+    }
+    let n = first.strip_prefix("@@").map(|n| n.strip_prefix("session.").unwrap_or(n)).unwrap_or(first);
+    let n = n.strip_prefix('@').unwrap_or(n);
+    !n.contains('.') && READ_ONLY_SETTINGS.contains(&n)
+}
+
+/// The settings a `SET` changes, lower-case with their scope words: one for
+/// `SET x = 1` / `SET x TO 1` / `SET nocount ON`, each of MySQL's
+/// `SET a = 1, GLOBAL b = 0`, and each of T-SQL's `SET nocount, ansi_nulls ON`.
+/// A comma inside a value (`SET search_path = a, b`) doesn't start one.
+/// `None` when it can't be told (an unclosed quote or bracket).
+fn set_names(sql: &str) -> Option<Vec<String>> {
+    let body = super::splitter::strip_leading_comments(sql).trim();
+    let body = body.get(3..)?.trim_end_matches(';');
+    // Top-level pieces between commas, quote- and bracket-aware.
+    let mut pieces = vec![String::new()];
+    let (mut quote, mut depth) = (None::<char>, 0i32);
+    for ch in body.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None => match ch {
+                '\'' | '"' | '`' => quote = Some(ch),
+                '[' => quote = Some(']'),
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    pieces.push(String::new());
+                    continue;
+                }
+                _ => {}
+            },
+        }
+        pieces.last_mut()?.push(ch);
+    }
+    if quote.is_some() || depth != 0 {
+        return None;
+    }
+    // Where the name of a piece ends: `=`, `:=`, or ` TO ` (Postgres).
+    let name_of = |p: &str| -> Option<String> {
+        let l = p.to_ascii_lowercase();
+        let end = l.find(":=").or_else(|| l.find('=')).or_else(|| l.find(" to "))?;
+        Some(l[..end].trim().to_string())
+    };
+    let first = &pieces[0];
+    Some(match name_of(first) {
+        // `SET a = 1, b = 2`: a later piece is another setting when it has
+        // its own `=`; otherwise it continues the value.
+        Some(n) => std::iter::once(n).chain(pieces[1..].iter().filter_map(|p| name_of(p))).collect(),
+        // T-SQL `SET nocount ON`, `SET nocount, xact_abort ON`, Postgres
+        // `SET TIME ZONE 'UTC'`, MySQL `SET NAMES x COLLATE y`: every piece
+        // starts with a name (after its scope word, if any).
+        None => pieces
+            .iter()
+            .map(|p| {
+                let l = p.to_ascii_lowercase();
+                let mut w = l.split_whitespace();
+                match w.next() {
+                    Some(s @ ("session" | "local" | "global" | "persist" | "persist_only")) => format!("{s} {}", w.next().unwrap_or_default()),
+                    Some(n) => n.to_string(),
+                    None => String::new(),
+                }
+            })
+            .collect(),
+    })
 }
 
 /// Built-in functions that never write (common to the SQL dialects).
@@ -366,6 +437,37 @@ mod read_only_tests {
             ("pragma query_only = 0", Sqlite),
             ("call p()", Postgres),
             ("exec dbo.p", Mssql),
+        ] {
+            assert!(!allows(sql, k), "{k:?}: {sql}");
+        }
+    }
+
+    #[test]
+    fn every_setting_of_a_set_is_checked() {
+        for (k, sql) in [
+            (Mysql, "SET time_zone = '+00:00', names = 'utf8mb4'"),
+            (Mysql, "set @@session.time_zone = '+00:00', session max_execution_time = 1000"),
+            (Mysql, "SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci"),
+            (Postgres, "set search_path = a, b"),
+            (Postgres, "set search_path to 'a,b', public"),
+            (Postgres, "SET TIME ZONE 'UTC'"),
+            (Postgres, "set application_name = 'x=1, y'"),
+            (Mssql, "set nocount on"),
+            (Mssql, "SET NOCOUNT, ANSI_NULLS ON"),
+        ] {
+            assert!(allows(sql, k), "{k:?}: {sql}");
+        }
+        for (k, sql) in [
+            (Mysql, "SET time_zone = '+00:00', GLOBAL read_only = 0"),
+            (Mysql, "set time_zone = '+00:00', @@global.read_only = 0"),
+            (Mysql, "set names = 'utf8', sql_log_bin = 0"),
+            (Mysql, "SET PERSIST max_connections = 10"),
+            (Mysql, "set global time_zone = '+00:00'"),
+            (Mysql, "set time_zone = '+00:00', session transaction_read_only = 0"),
+            (Postgres, "set search_path = a, b; set default_transaction_read_only = off"),
+            (Mssql, "SET NOCOUNT, IMPLICIT_TRANSACTIONS ON"),
+            (Mssql, "set nocount on, xact_abort on"),
+            (Postgres, "set search_path = 'a"),
         ] {
             assert!(!allows(sql, k), "{k:?}: {sql}");
         }

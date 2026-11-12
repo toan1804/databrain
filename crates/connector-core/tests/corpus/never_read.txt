@@ -1,0 +1,60 @@
+# Statements that must never classify as a read (they pass a read-only
+# connection, the production prompt and the AI's auto-read if they do).
+# One per line: `<connector kind> | <sql>`; `\n` is a newline.
+# Add a line with every classifier bug fixed, and never remove one.
+
+# T-SQL: a second statement without a separator, read as an alias.
+mssql | select 1 shutdown
+mssql | select * from sys.objects shutdown
+mssql | select 1 union select 2 shutdown
+mssql | select 1 reconfigure
+mssql | select 1 revert
+mssql | select 1 checkpoint
+mssql | select name from sys.databases d shutdown
+mssql | select 1 x\nshutdown
+mssql | select * from (select 1 a) t reconfigure
+
+# T-SQL: unparsed text that starts like a read.
+mssql | select 1 deny select on orders to public
+mssql | select 1 x disable trigger all on database
+mssql | select 1 x setuser 'bob'
+mssql | select 1 x writetext t.c @p 'x'
+mssql | select 1 x send on conversation @h ('x')
+mssql | SELECT 1 EXEC xp_cmdshell 'dir'
+mssql | USE master\nDROP DATABASE prod
+mssql | set nocount on\nkill 52
+mssql | begin tran\nshutdown
+
+# Snowflake: `->>` chains a second statement.
+snowflake | select 1 ->> delete from t where id = 1
+snowflake | show tables ->> select * from $1
+snowflake | select 1 ->> drop table t
+
+# Functions that run SQL elsewhere or act.
+mssql | select * from openquery(lnk, 'delete from t')
+mssql | select * from openrowset('SQLNCLI', 'Server=x;Trusted_Connection=yes;', 'exec p')
+mssql | select * from opendatasource('SQLNCLI', 'Data Source=x').db.dbo.t
+duckdb | select * from postgres_query('pg', 'delete from t')
+duckdb | call postgres_execute('pg', 'drop table t')
+duckdb | select * from mysql_query('my', 'delete from t')
+bigquery | select * from external_query('conn', 'delete from t')
+postgres | select pg_terminate_backend(123)
+postgres | select dblink_exec('host=x', 'delete from t')
+postgres | select nextval('s')
+postgres | select setval('s', 1)
+postgres | select set_config('default_transaction_read_only', 'off', false)
+snowflake | select system$cancel_query('01a2')
+oracle | select orders_seq.nextval from dual
+mssql | select next value for dbo.orders_seq
+
+# Names hidden by Unicode escapes.
+postgres | select U&"pg\005Fterminate\005Fbackend"(1)
+postgres | select u&"set\005Fconfig"('a', 'b', false)
+
+# Writes inside reads.
+postgres | with d as (delete from t returning *) select * from d
+postgres | select * into t2 from t
+postgres | explain analyze delete from t
+postgres | explain (analyze) delete from t
+mysql | explain analyze delete from t
+postgres | select 1; delete from t

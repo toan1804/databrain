@@ -60,6 +60,13 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
             if out.kind < StatementKind::Dml && (stmts.iter().any(calls_acting_function) || next_value_for(sql, dialect.as_ref())) {
                 out.kind = StatementKind::Other;
             }
+            // What the parser accepted may not be what the server runs:
+            // a T-SQL statement word read as an alias (`select 1 shutdown`:
+            // T-SQL needs no separator), Snowflake's `->>` chaining a second
+            // statement, or a function name hidden by Unicode escapes.
+            if out.kind.is_read() && (hides_statement(&stmts, kind) || chains_statements(sql, kind) || escaped_identifier(sql)) {
+                out.kind = StatementKind::Unknown;
+            }
             out
         }
         _ => {
@@ -67,15 +74,12 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
             if k == StatementKind::Read && keyword == "WITH" && contains_dml_word(sql) {
                 k = StatementKind::Dml;
             }
+            // Unparseable but looks like a read: the parser couldn't say what
+            // it does, so it isn't trusted as one (T-SQL runs `SELECT 1 DENY
+            // …` as two statements without a separator, and a list of words
+            // that act always misses some).
             if k == StatementKind::Read {
-                // Unparseable but looks like a read: a read only when no word
-                // in it can act (T-SQL runs `SELECT 1 EXEC xp_cmdshell …` as
-                // two statements without a separator).
-                k = if keyword == "SELECT" && !contains_dml_word(sql) && !contains_action_word(sql) && !names_acting_function(sql, dialect.as_ref()) {
-                    StatementKind::Read
-                } else {
-                    StatementKind::Unknown
-                };
+                k = StatementKind::Unknown;
             }
             // Unparseable session or transaction control: what follows the
             // first word can't be told (a T-SQL batch without `;` runs
@@ -88,6 +92,161 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
             Classification { kind: k, missing_where: false, keyword }
         }
     }
+}
+
+/// T-SQL statements that a batch may start without `;` and that sqlparser
+/// accepts as an alias after a select item or table (`select 1 shutdown`,
+/// `select * from t revert`).
+const TSQL_STATEMENTS: &[&str] = &[
+    "SHUTDOWN",
+    "RECONFIGURE",
+    "REVERT",
+    "CHECKPOINT",
+    "KILL",
+    "DENY",
+    "GRANT",
+    "REVOKE",
+    "EXEC",
+    "EXECUTE",
+    "DBCC",
+    "BACKUP",
+    "RESTORE",
+    "WAITFOR",
+    "USE",
+    "SET",
+    "DECLARE",
+    "PRINT",
+    "RAISERROR",
+    "THROW",
+    "RETURN",
+    "BREAK",
+    "CONTINUE",
+    "GOTO",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "SAVE",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "DROP",
+    "ALTER",
+    "CREATE",
+    "TRUNCATE",
+    "DISABLE",
+    "ENABLE",
+    "SETUSER",
+    "WRITETEXT",
+    "UPDATETEXT",
+    "READTEXT",
+    "SEND",
+    "RECEIVE",
+    "MOVE",
+    "GET",
+    "BULK",
+    "OPEN",
+    "CLOSE",
+    "FETCH",
+    "DEALLOCATE",
+    "IF",
+    "WHILE",
+    "ELSE",
+    "END",
+    "CALL",
+    "LOAD",
+    "GO",
+    "ADD",
+];
+
+/// SQL Server: an unquoted alias that is a statement word. sqlparser reads
+/// `select 1 shutdown` as one SELECT; the server runs a SELECT, then
+/// SHUTDOWN.
+fn hides_statement(stmts: &[Statement], kind: ConnectorKind) -> bool {
+    use sqlparser::ast::{Ident, Query, SelectItem, TableFactor, Visit, Visitor};
+    use std::ops::ControlFlow;
+    if kind != ConnectorKind::Mssql {
+        return false;
+    }
+    fn word(i: &Ident) -> ControlFlow<()> {
+        if i.quote_style.is_none() && TSQL_STATEMENTS.iter().any(|w| i.value.eq_ignore_ascii_case(w)) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+    fn items(e: &SetExpr) -> ControlFlow<()> {
+        match e {
+            SetExpr::Select(s) => {
+                for it in &s.projection {
+                    match it {
+                        SelectItem::ExprWithAlias { alias, .. } => word(alias)?,
+                        SelectItem::ExprWithAliases { aliases, .. } => aliases.iter().try_for_each(word)?,
+                        _ => {}
+                    }
+                }
+                ControlFlow::Continue(())
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                items(left)?;
+                items(right)
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    }
+    struct V;
+    impl Visitor for V {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            items(&q.body)
+        }
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            use TableFactor as T;
+            let alias = match t {
+                T::Table { alias, .. }
+                | T::Derived { alias, .. }
+                | T::TableFunction { alias, .. }
+                | T::Function { alias, .. }
+                | T::UNNEST { alias, .. }
+                | T::JsonTable { alias, .. }
+                | T::OpenJsonTable { alias, .. }
+                | T::NestedJoin { alias, .. }
+                | T::Pivot { alias, .. }
+                | T::Unpivot { alias, .. }
+                | T::MatchRecognize { alias, .. }
+                | T::XmlTable { alias, .. } => alias.as_ref(),
+                _ => None,
+            };
+            match alias {
+                Some(a) => word(&a.name),
+                None => ControlFlow::Continue(()),
+            }
+        }
+    }
+    stmts.iter().any(|s| s.visit(&mut V).is_break())
+}
+
+/// Snowflake's flow operator `->>` runs the statement after it on the
+/// result of the one before (`select 1 ->> delete from t`); sqlparser reads
+/// it as the JSON operator. Any `->>` token there means more than one
+/// statement.
+fn chains_statements(sql: &str, kind: ConnectorKind) -> bool {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    if kind != ConnectorKind::Snowflake {
+        return false;
+    }
+    match Tokenizer::new(dialect_for(kind).as_ref(), sql).tokenize() {
+        Ok(tokens) => tokens.iter().any(|t| matches!(t, Token::LongArrow)),
+        Err(_) => sql.contains("->>"),
+    }
+}
+
+/// `U&"…"` identifiers spell a name with escapes
+/// (`U&"pg\005Fterminate\005Fbackend"(1)`), so the name lists above can't
+/// see it. Matched anywhere, strings included: being stricter costs a
+/// confirmation.
+fn escaped_identifier(sql: &str) -> bool {
+    sql.as_bytes().windows(3).any(|w| w[0].eq_ignore_ascii_case(&b'u') && w[1] == b'&' && w[2] == b'"')
 }
 
 fn classify_ast(s: &Statement) -> (StatementKind, bool) {
@@ -336,6 +495,17 @@ const ACTING_FUNCTIONS: &[&str] = &[
     "pg_import_system_collations",
     "pg_notify",
     "set_config",
+    // SQL in another database or a linked server, which may write: SQL
+    // Server `openquery`/`openrowset`/`opendatasource`, DuckDB's attached
+    // Postgres and MySQL, BigQuery federated queries.
+    "openquery",
+    "openrowset",
+    "opendatasource",
+    "postgres_query",
+    "postgres_execute",
+    "mysql_query",
+    "mysql_execute",
+    "external_query",
     // Postgres: data, sequences, files and other databases.
     "nextval",
     "setval",
@@ -443,11 +613,6 @@ fn calls_acting_function(s: &Statement) -> bool {
         }
     }
     s.visit(&mut V).is_break()
-}
-
-/// Unparsed SQL naming an acting function (`$` kept for Snowflake's).
-fn names_acting_function(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> bool {
-    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).any(is_acting_function) || next_value_for(sql, dialect)
 }
 
 /// SQL Server / standard `NEXT VALUE FOR seq`, which advances the sequence
