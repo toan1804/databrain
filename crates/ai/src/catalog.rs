@@ -166,6 +166,25 @@ mod boundary {
             ".meta_column_names(",
             ".meta_object(",
             ".meta_listing(",
+            ".meta_get(",
+            ".meta_resolve_path(",
+            ".tables_named(",
+            ".meta_foreign_keys_to(",
+            ".kn_notes(",
+        ];
+        // Where they are used on purpose, each one checked against the AI's
+        // scope (`file:reader`): index_tables' refusal check, note tools
+        // that filter with `note_visible`, a note target checked first,
+        // learning joins.
+        const ALLOWED: &[(&str, &str)] = &[
+            ("knowledge.rs", ".meta_get("),
+            ("knowledge.rs", ".meta_resolve_path("),
+            ("knowledge.rs", ".kn_notes("),
+            ("notes.rs", ".kn_notes("),
+            ("schema.rs", ".kn_notes("),
+            // Joins learned from the user's own history; shown only when
+            // both tables pass AiTables (knowledge.rs).
+            ("learn.rs", ".tables_named("),
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut bad = vec![];
@@ -182,7 +201,8 @@ mod boundary {
                 }
                 let text = std::fs::read_to_string(&p).unwrap();
                 for (i, line) in text.lines().enumerate() {
-                    if let Some(f) = FORBIDDEN.iter().find(|f| line.contains(**f)) {
+                    let file = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if let Some(f) = FORBIDDEN.iter().find(|f| line.contains(**f) && !ALLOWED.contains(&(file, **f))) {
                         bad.push(format!("{}:{}: {f}", p.display(), i + 1));
                     }
                 }

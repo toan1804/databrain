@@ -425,9 +425,10 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         WHERE NOT EXISTS (SELECT 1 FROM meta_objects m WHERE m.connection_id = k.connection_id
             AND m.schema_name = k.schema_name AND m.name = k.name);
     INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json)
-        SELECT connection_id, schema_name, name, columns_json, indexed_at, fks_json FROM kn_objects WHERE true
+        SELECT connection_id, schema_name, name, columns_json, indexed_at, fks_json FROM kn_objects WHERE columns_json <> '[]'
         ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json,
-            seen_at = excluded.seen_at, fks_json = excluded.fks_json
+            seen_at = excluded.seen_at,
+            fks_json = CASE WHEN excluded.fks_json = '[]' THEN meta_columns.fks_json ELSE excluded.fks_json END
         WHERE excluded.seen_at > meta_columns.seen_at;
     -- Object search rows are rebuilt from ai_objects.
     DELETE FROM kn_fts WHERE source = 'object';

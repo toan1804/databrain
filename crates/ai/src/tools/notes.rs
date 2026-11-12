@@ -25,10 +25,17 @@ impl ToolContext {
                 // Only tables the AI may use: one answer for a table outside
                 // its scope and one that doesn't exist.
                 let tables = crate::catalog::AiTables::with_profile(self.engine.workspace(), &self.profile);
-                if let Some((_, p)) = databrain_workspace::split_target(t).into_iter().find(|(_, p)| tables.resolve_path(p).ok().flatten().is_none()) {
-                    return Err(AiError::Policy(format!("invalid target `{t}`: {}", knowledge::not_available(&p))));
+                let mut canonical = Vec::new();
+                for (sep, p) in databrain_workspace::split_target(t) {
+                    // Spelled out as the AI's scope resolved it: a bare
+                    // `orders` must not be saved against another schema's.
+                    let Some((o, col)) = tables.resolve_path(&p).ok().flatten() else {
+                        return Err(AiError::Policy(format!("invalid target `{t}`: {}", knowledge::not_available(&p))));
+                    };
+                    canonical.push((sep, col.map_or_else(|| o.full_name(), |c| format!("{}.{c}", o.full_name()))));
                 }
-                knowledge::check_note_target(&self.engine, &self.profile.id, t).await.map(Some).map_err(|e| {
+                let t = databrain_workspace::join_target(&canonical);
+                knowledge::check_note_target(&self.engine, &self.profile.id, &t).await.map(Some).map_err(|e| {
                     AiError::Policy(format!(
                         "invalid target `{t}`: {e}. Use real tables (schema.table, several joined with &), or omit target for a glossary note"
                     ))
@@ -43,7 +50,9 @@ impl ToolContext {
         let ws = self.engine.workspace();
         // Same text already there: nothing to add.
         let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-        if let Some(dup) = ws.kn_notes(&self.profile.id)?.into_iter().find(|n| norm(&n.body) == norm(note)) {
+        // Among the notes the AI may see: another one's id would name it.
+        let tables = crate::catalog::AiTables::with_profile(ws, &self.profile);
+        if let Some(dup) = ws.kn_notes(&self.profile.id)?.into_iter().find(|n| norm(&n.body) == norm(note) && tables.note_visible(n.target.as_deref())) {
             return Ok(out(format!("An identical note already exists (id {}).", dup.id), json!({"note": dup})));
         }
         let status = self.ai_note_status();
@@ -65,10 +74,11 @@ impl ToolContext {
         let id = arg(args, "id")?;
         let note = arg(args, "note")?;
         let ws = self.engine.workspace();
+        let tables = crate::catalog::AiTables::with_profile(ws, &self.profile);
         let old = ws
             .kn_notes(&self.profile.id)?
             .into_iter()
-            .find(|n| n.id == id)
+            .find(|n| n.id == id && tables.note_visible(n.target.as_deref()))
             .ok_or_else(|| AiError::Policy(format!("note {id} not found; use list_knowledge_notes")))?;
         let target = match args.get("target").and_then(|t| t.as_str()) {
             Some(t) => self.checked_target(Some(t)).await?,

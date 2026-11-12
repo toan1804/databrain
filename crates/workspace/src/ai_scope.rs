@@ -127,12 +127,12 @@ impl Workspace {
         Ok(())
     }
 
-    /// The schema-level rules (allow) are exactly `schemas` (the scope chosen
-    /// for indexing); per-table rules stay.
+    /// The schema-level allow rules are exactly `schemas` (the scope chosen
+    /// for indexing); per-table rules and exclusions stay.
     pub fn ai_set_schema_rules(&self, connection_id: &str, schemas: &[String]) -> Result<()> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
-        tx.execute("DELETE FROM ai_scope WHERE connection_id = ?1 AND table_name = ''", [connection_id])?;
+        tx.execute("DELETE FROM ai_scope WHERE connection_id = ?1 AND table_name = '' AND allow = 1", [connection_id])?;
         for s in schemas {
             Self::put_rule(&tx, connection_id, &ScopeRule { schema: s.clone(), table: String::new(), allow: true })?;
         }
@@ -158,8 +158,16 @@ impl Workspace {
     }
 
     /// [`Self::put_rule`] unless a rule for the same schema and table
-    /// exists (indexing never overrides what the user set).
+    /// exists, or a broader exclusion decides it (`main.*` excluded, then
+    /// `main.hr` indexed): indexing never overrides what the user set.
     pub(crate) fn put_rule_if_absent(tx: &Transaction<'_>, connection_id: &str, r: &ScopeRule) -> Result<()> {
+        if r.allow {
+            let rules = Self::scope_tx(tx, connection_id)?;
+            let (schema, table) = (r.schema.trim(), r.table.trim());
+            if rules.iter().any(|x| specificity(x, schema, table).is_some()) && !scope_allows(&rules, schema, table) {
+                return Ok(());
+            }
+        }
         tx.execute(
             "INSERT OR IGNORE INTO ai_scope (connection_id, schema_rule, table_name, allow) VALUES (?1, ?2, ?3, ?4)",
             params![connection_id, r.schema.trim(), r.table.trim(), r.allow],
@@ -565,6 +573,28 @@ mod tests {
         assert_eq!(names(), vec!["sales.orders"], "listed again: allowed again");
         // Other connections see nothing of it.
         assert!(ws.ai_catalog("other").objects().unwrap().is_empty());
+    }
+
+    /// Broader exclusions hold: choosing the schemas to index keeps them,
+    /// and indexing a schema a `catalog.*` exclusion covers adds no allow.
+    #[test]
+    fn index_runs_keep_broad_exclusions() {
+        let ws = Workspace::open_in_memory().unwrap();
+        ws.ai_put_rule("c", &rule("hr", "", false)).unwrap();
+        ws.ai_set_schema_rules("c", &["sales".to_string()]).unwrap();
+        assert!(ws.ai_excluded("c", "hr", "t").unwrap(), "hr stays excluded");
+        assert!(!ws.ai_excluded("c", "sales", "t").unwrap());
+        ws.ai_put_rule("c", &rule("main.*", "", false)).unwrap();
+        {
+            let mut c = ws.conn.lock();
+            let tx = c.transaction().unwrap();
+            Workspace::put_rule_if_absent(&tx, "c", &rule("main.hr", "", true)).unwrap();
+            Workspace::put_rule_if_absent(&tx, "c", &rule("dev.x", "", true)).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(ws.ai_excluded("c", "main.hr", "salaries").unwrap(), "main.* still decides");
+        assert!(!ws.ai_scope("c").unwrap().iter().any(|r| r.schema == "main.hr"));
+        assert!(ws.ai_scope("c").unwrap().iter().any(|r| r.schema == "dev.x" && r.allow), "nothing excludes dev.x");
     }
 
     #[test]

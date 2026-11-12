@@ -480,10 +480,17 @@ impl Workspace {
              row_estimate = coalesce(excluded.row_estimate, row_estimate), seen_at = excluded.seen_at",
         )?
         .execute(params![connection_id, o.schema, o.name, o.kind, o.comment, o.row_estimate, now])?;
+        // No columns: the run couldn't read them (a failed column query
+        // gives the object alone); what the explorer has is kept. No keys:
+        // many engines' bulk reads don't give them, so keys read before
+        // (a describe) are kept too.
+        if o.columns.is_empty() {
+            return Ok(());
+        }
         tx.prepare_cached(
             "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, \
-             seen_at = excluded.seen_at, fks_json = excluded.fks_json, stale = 0",
+             seen_at = excluded.seen_at, fks_json = CASE WHEN excluded.fks_json = '[]' THEN fks_json ELSE excluded.fks_json END, stale = 0",
         )?
         .execute(params![connection_id, o.schema, o.name, serde_json::to_string(&o.columns)?, now, serde_json::to_string(&o.foreign_keys)?])?;
         Ok(())
@@ -929,6 +936,23 @@ mod tests {
                 .collect(),
             foreign_keys: vec![],
         }
+    }
+
+    /// An index run that couldn't read a table's columns (or whose engine
+    /// gives no foreign keys in bulk) keeps what the explorer knows.
+    #[test]
+    fn index_runs_without_columns_keep_the_cached_ones() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let fk = ForeignKey { columns: vec!["cid".into()], ref_schema: "sales".into(), ref_table: "customers".into(), ref_columns: vec!["id".into()] };
+        let cols = obj("sales", "orders", &["id", "cid"], None).columns;
+        ws.meta_put_table("c", "sales", "orders", &cols, Some(std::slice::from_ref(&fk))).unwrap();
+        ws.kn_replace_schema("c", "sales", &[obj("sales", "orders", &[], None)]).unwrap();
+        let t = ws.meta_table("c", "sales", "orders").unwrap().unwrap();
+        assert_eq!((t.columns.len(), t.foreign_keys.as_deref()), (2, Some(&[fk.clone()][..])), "columns and keys kept");
+        // Columns read without keys: the columns are new, the keys kept.
+        ws.kn_replace_schema("c", "sales", &[obj("sales", "orders", &["id", "cid", "total"], None)]).unwrap();
+        let t = ws.meta_table("c", "sales", "orders").unwrap().unwrap();
+        assert_eq!((t.columns.len(), t.foreign_keys.map(|f| f.len())), (3, Some(1)));
     }
 
     #[test]

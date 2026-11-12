@@ -330,6 +330,10 @@ pub async fn index_tables(
             _ = cancel.cancelled() => return Err(AiError::Cancelled),
         };
         let r = r.and_then(|o| if refused(&o.schema, &o.name) { Err(not_available(want)) } else { Ok(o) });
+        // One answer for a table that isn't there and one that is refused,
+        // so the reply doesn't tell them apart; only a database that didn't
+        // answer is said as such.
+        let r = r.map_err(|e| if e.starts_with("no answer from the database") { e } else { not_available(want) });
         if let Ok(o) = &r {
             fresh.push(o.clone());
         }

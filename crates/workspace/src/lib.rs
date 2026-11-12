@@ -121,7 +121,12 @@ impl Workspace {
         let _ = ws.redact_kept_sql();
         let _ = ws.redact_kept_transcripts();
         let _ = ws.mark_ai_written_jobs();
-        ws.build_ai_tables()?;
+        // Also best effort, and failing closed: without it the AI's table
+        // list stays empty (it sees no table) and it is built again on the
+        // next start (its marker is written with it).
+        if let Err(e) = ws.build_ai_tables() {
+            tracing::warn!("building the AI's table list failed; retried on the next start: {e}");
+        }
         Ok(ws)
     }
 }
