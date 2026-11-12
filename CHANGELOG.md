@@ -4,6 +4,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.4.0 - 2026-11-13
+
 ### Changed
 
 - The AI uses only the tables you allow. Knowledge → Index now chooses what the AI may use (schemas, with single tables excluded or allowed), and "Read columns" reads their structure; a table outside that isn't searched, described, sampled, joined, or named by another table's foreign key or a note, and the AI can't re-allow one you excluded (the SQL it runs is still limited by the connection's table access rules). Existing connections keep exactly the tables their index had. Table metadata is now kept once, shared by the explorer, completion, lineage and the AI, so browsing a table also keeps what the AI knows of it current and a read for the AI makes the explorer instant. A table the access rules deny now reads as unavailable to the AI, like one that doesn't exist. The workspace moves to schema version 20.

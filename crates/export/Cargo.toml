@@ -10,8 +10,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-databrain-connector-core = { version = "0.3.5", path = "../connector-core" }
-databrain-result-store = { version = "0.3.5", path = "../result-store" }
+databrain-connector-core = { version = "0.4.0", path = "../connector-core" }
+databrain-result-store = { version = "0.4.0", path = "../result-store" }
 parquet = { version = "59.3.0", default-features = false, features = ["arrow", "snap", "zstd"] }
 rust_xlsxwriter = { version = "0.102.0", features = ["constant_memory"] }
 serde = { version = "1.0.229", features = ["derive"] }

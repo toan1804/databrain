@@ -11,8 +11,8 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
-databrain-auth = { version = "0.3.5", path = "../../auth" }
-databrain-connector-core = { version = "0.3.5", path = "../../connector-core" }
+databrain-auth = { version = "0.4.0", path = "../../auth" }
+databrain-connector-core = { version = "0.4.0", path = "../../connector-core" }
 futures = "0.3.34"
 json5 = "1.3.7"
 mongodb = "3.6.0"
