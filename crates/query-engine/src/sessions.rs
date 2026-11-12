@@ -49,10 +49,10 @@ impl QueryEngine {
             // One database instance per file: a sandboxed one and an open
             // one can't share it. Close the idle sessions of the other kind
             // that hold no state (the assistant's, or the explorer's).
-            self.sessions.lock().retain(|(c, t), live| {
+            self.drop_sessions(|(c, t), live| {
                 let other = c == connection_id && live.sandboxed != sandbox;
                 let stateless = !sandbox || t == META_TAB || t == INDEX_TAB;
-                !(other && stateless && Arc::strong_count(&live.session) == 1 && !live.session.in_transaction())
+                other && stateless && Arc::strong_count(&live.session) == 1 && !live.session.in_transaction()
             });
         }
         if sandbox {
@@ -141,7 +141,27 @@ impl QueryEngine {
     }
 
     pub(crate) fn drop_session(&self, connection_id: &str, tab_id: &str) {
-        self.sessions.lock().remove(&(connection_id.to_string(), tab_id.to_string()));
+        let gone = self.sessions.lock().remove(&(connection_id.to_string(), tab_id.to_string()));
+        drop(gone); // after the lock: a connector's drop may take a while
+    }
+
+    /// Drop the session of `tab` only if it is still `s` (not one another
+    /// caller opened since).
+    pub(crate) fn drop_session_if(&self, connection_id: &str, tab_id: &str, s: &Arc<dyn Session>) {
+        let gone = {
+            let mut g = self.sessions.lock();
+            let key = (connection_id.to_string(), tab_id.to_string());
+            if g.get(&key).is_some_and(|l| Arc::ptr_eq(&l.session, s)) { g.remove(&key) } else { None }
+        };
+        drop(gone);
+    }
+
+    /// Remove the sessions `drop` picks; they are dropped after the lock is
+    /// released (a connector's drop may block on the network). Returns how
+    /// many.
+    pub(crate) fn drop_sessions(&self, mut pick: impl FnMut(&SessionKey, &Live) -> bool) -> usize {
+        let gone: Vec<(SessionKey, Live)> = self.sessions.lock().extract_if(|k, l| pick(k, l)).collect();
+        gone.len()
     }
 
     /// Close sessions unused for `idle` (their connections go back to the
@@ -175,14 +195,11 @@ impl QueryEngine {
                 (c, limit)
             })
             .collect();
-        let mut g = self.sessions.lock();
-        let before = g.len();
-        g.retain(|(c, key), live| {
-            let Some(idle) = limits.get(c).copied().flatten() else { return true };
+        self.drop_sessions(|(c, key), live| {
+            let Some(idle) = limits.get(c).copied().flatten() else { return false };
             let in_use = busy.contains(key) || Arc::strong_count(&live.session) > 1;
-            in_use || live.session.in_transaction() || now.duration_since(*live.last_used.lock()) < idle
-        });
-        before - g.len()
+            !(in_use || live.session.in_transaction() || now.duration_since(*live.last_used.lock()) < idle)
+        })
     }
 
     /// The idle time after which sessions close ([`IDLE_DISCONNECT_SETTING`]); `None` = never.
@@ -192,8 +209,13 @@ impl QueryEngine {
     }
 
     /// Close every session of a connection (after editing or deleting it).
+    /// Running statements on it are stopped: a script's next statement
+    /// would otherwise reconnect and run outside the transaction it began.
     pub fn disconnect(&self, connection_id: &str) {
-        self.sessions.lock().retain(|(c, _), _| c != connection_id);
+        for j in self.jobs.lock().values().filter(|j| j.connection_id == connection_id) {
+            j.cancel.cancel();
+        }
+        self.drop_sessions(|(c, _), _| c == connection_id);
     }
 
     /// Sign in again on the next call (the explorer's Refresh): closes the
@@ -205,19 +227,16 @@ impl QueryEngine {
     /// sessions were closed.
     pub fn reconnect(&self, connection_id: &str) -> usize {
         let busy: Vec<String> = self.jobs.lock().values().map(|j| j.session_key.clone()).collect();
-        let mut g = self.sessions.lock();
-        let before = g.len();
-        g.retain(|(c, key), live| {
+        self.drop_sessions(|(c, key), live| {
             if c != connection_id {
-                return true;
+                return false;
             }
             // A catalog call still running keeps its handle; the map forgets it.
             if key == META_TAB {
-                return false;
+                return true;
             }
-            busy.contains(key) || Arc::strong_count(&live.session) > 1 || live.session.in_transaction()
-        });
-        before - g.len()
+            !(busy.contains(key) || Arc::strong_count(&live.session) > 1 || live.session.in_transaction())
+        })
     }
 
     /// A session on a separate tab, for tests that set up data.
@@ -244,9 +263,33 @@ impl QueryEngine {
                 j.tab_closed |= j.tab_id == tab_id;
             }
         }
-        self.sessions.lock().retain(|(_, t), _| t != tab_id);
+        self.drop_sessions(|(_, t), _| t == tab_id);
         self.outputs.close_tab(tab_id);
         self.outputs_changed();
+    }
+
+    /// Claim the session `session_key` like a running query until the
+    /// returned [`Claim`] drops: a run, edit, plan, Commit/Rollback or
+    /// export can't start on it meanwhile (checked and claimed under one
+    /// lock), and closing the tab cancels `cancel`. `busy` is the message
+    /// when something already holds it.
+    pub(crate) fn claim(&self, connection_id: &str, session_key: &str, cancel: CancellationToken, busy: &str) -> Result<Claim<'_>> {
+        let mut jobs = self.jobs.lock();
+        if jobs.values().any(|j| j.session_key == session_key || j.tab_id == session_key) {
+            return Err(EngineError::new("busy", busy));
+        }
+        let id = format!("claim:{}", uuid::Uuid::new_v4());
+        jobs.insert(
+            id.clone(),
+            JobHandle {
+                connection_id: connection_id.to_string(),
+                tab_id: session_key.to_string(),
+                session_key: session_key.to_string(),
+                cancel,
+                tab_closed: false,
+            },
+        );
+        Ok(Claim { engine: self, id })
     }
 
     // -------------------------------------------------------------- transactions
@@ -274,9 +317,7 @@ impl QueryEngine {
     /// COMMIT or ROLLBACK the session's transaction. Returns whether one is
     /// still open afterwards. Nothing happens without a session.
     pub async fn end_transaction(&self, connection_id: &str, session_key: &str, commit: bool) -> Result<bool> {
-        if self.jobs.lock().values().any(|j| j.session_key == session_key) {
-            return Err(EngineError::new("busy", "A query is running in this tab: wait for it or stop it first"));
-        }
+        let _claim = self.claim(connection_id, session_key, CancellationToken::new(), "A query is running in this tab: wait for it or stop it first")?;
         let Some(session) = self.sessions.lock().get(&(connection_id.to_string(), session_key.to_string())).map(|l| l.session.clone()) else {
             return Ok(false);
         };
@@ -299,7 +340,13 @@ impl QueryEngine {
     }
 
     /// Manual commit: open a transaction before a write when none is open.
-    pub(crate) async fn begin_if_manual(&self, req: &RunRequest, kind: databrain_connector_core::ConnectorKind, stmt: &PlannedStatement) -> Result<()> {
+    pub(crate) async fn begin_if_manual(
+        &self,
+        req: &RunRequest,
+        kind: databrain_connector_core::ConnectorKind,
+        stmt: &PlannedStatement,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
         use databrain_connector_core::sql::StatementKind as K;
         let write = match stmt.classification.kind {
             K::Dml => true,
@@ -311,7 +358,11 @@ impl QueryEngine {
             return Ok(());
         }
         let Some((begin, _, _)) = edit::apply_style(kind) else { return Ok(()) };
-        let session = self.session_for(&req.connection_id, req.session_key(), req.origin).await?;
+        // Stop is honored while connecting or signing in.
+        let session = tokio::select! {
+            s = self.session_for(&req.connection_id, req.session_key(), req.origin) => s?,
+            _ = cancel.cancelled() => return Err(databrain_connector_core::ConnectorError::cancelled().into()),
+        };
         // Unknown: BEGIN anyway; "already in a transaction" from the server
         // is better than a write that commits on its own in manual mode.
         if session.transaction_state() != TxState::Open {
@@ -336,11 +387,13 @@ impl QueryEngine {
         Fut: std::future::Future<Output = databrain_connector_core::Result<T>>,
     {
         let s = self.session(connection_id, tab).await?;
-        match f(s).await {
+        match f(s.clone()).await {
             Ok(v) => Ok(v),
             Err(e) if e.kind == ErrorKind::Connection => {
-                // Stale connection: reconnect once.
-                self.drop_session(connection_id, tab);
+                // Stale connection: reconnect once (dropping only this
+                // session: another caller may have reconnected already).
+                self.drop_session_if(connection_id, tab, &s);
+                drop(s);
                 let s = self.session(connection_id, tab).await?;
                 Ok(f(s).await?)
             }
@@ -367,7 +420,7 @@ impl QueryEngine {
 
     /// Close the database sessions of a run key (keeps its outputs).
     pub fn release_sessions(&self, tab: &str) {
-        self.sessions.lock().retain(|(_, t), _| t != tab);
+        self.drop_sessions(|(_, t), _| t == tab);
     }
 }
 
@@ -399,6 +452,19 @@ impl Drop for ConnectGate<'_> {
         if Arc::strong_count(&self.gate) == 2 && m.get(&self.key).is_some_and(|g| Arc::ptr_eq(g, &self.gate)) {
             m.remove(&self.key);
         }
+    }
+}
+
+/// A session key held busy (see [`QueryEngine::claim`]); dropping it frees
+/// the key, however the holder ends.
+pub(crate) struct Claim<'a> {
+    engine: &'a QueryEngine,
+    id: String,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.engine.jobs.lock().remove(&self.id);
     }
 }
 

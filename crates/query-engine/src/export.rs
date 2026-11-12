@@ -40,28 +40,24 @@ impl QueryEngine {
         self.exports.lock().insert(export_id.to_string(), cancel.clone());
         // The original session, when its transaction holds rows others can't see.
         let shared = session_key.filter(|k| self.sessions.lock().get(&(connection_id.to_string(), k.to_string())).is_some_and(|s| s.session.in_transaction()));
-        let tab = match shared {
-            Some(k) => {
-                if self.jobs.lock().values().any(|j| j.session_key == k) {
+        // Busy like a running query until the export ends.
+        let claim = match shared {
+            Some(k) => match self.claim(connection_id, k, cancel.clone(), "A query is running in this tab: wait for it, or commit, to export everything") {
+                Ok(c) => Some(c),
+                Err(e) => {
                     self.exports.lock().remove(export_id);
-                    return Err(EngineError::new("busy", "A query is running in this tab: wait for it, or commit, to export everything"));
+                    return Err(e);
                 }
-                // Busy like a running query until the export ends.
-                self.jobs.lock().insert(
-                    format!("export:{export_id}"),
-                    JobHandle { tab_id: k.to_string(), session_key: k.to_string(), cancel: cancel.clone(), tab_closed: false },
-                );
-                k.to_string()
-            }
-            None => format!("__export__:{export_id}"),
+            },
+            None => None,
         };
+        let tab = shared.map_or_else(|| format!("__export__:{export_id}"), str::to_string);
         let out = self.export_stream(connection_id, &tab, sql, path, opts, &cancel, progress).await;
         self.exports.lock().remove(export_id);
-        if shared.is_some() {
-            self.jobs.lock().remove(&format!("export:{export_id}"));
-        } else {
+        if claim.is_none() {
             self.drop_session(connection_id, &tab);
         }
+        drop(claim);
         let rows = out?;
         {
             let mut e = self.exported.lock();
@@ -116,10 +112,12 @@ impl QueryEngine {
             };
             match ev {
                 None => return Err(EngineError::new("internal", "result stream ended unexpectedly")),
-                Some(Ok(StreamEvent::Schema(schema))) => writer = Some(databrain_export::FileWriter::create(path, schema, opts.clone()).map_err(fail)?),
+                Some(Ok(StreamEvent::Schema(schema))) => {
+                    writer = Some(crate::blocking(|| databrain_export::FileWriter::create(path, schema, opts.clone())).map_err(fail)?)
+                }
                 Some(Ok(StreamEvent::Batch(b))) => {
                     if let Some(w) = writer.as_mut() {
-                        w.write(&b).map_err(fail)?;
+                        crate::blocking(|| w.write(&b)).map_err(fail)?;
                         rows += b.num_rows() as u64;
                         if phase != ExportPhase::Writing || last.elapsed() >= EXPORT_PROGRESS_EVERY {
                             phase = ExportPhase::Writing;
@@ -137,7 +135,7 @@ impl QueryEngine {
                     return match writer {
                         Some(w) => {
                             report(ExportPhase::Finishing, rows, Some(&w));
-                            w.finish().map_err(fail)
+                            crate::blocking(|| w.finish()).map_err(fail)
                         }
                         None => Err(EngineError::new("invalid", "The query returned no rows to export")),
                     };

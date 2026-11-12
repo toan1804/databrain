@@ -111,7 +111,11 @@ pub async fn copy_rows(state: &AppState, result_id: String, view: ViewSpec, offs
 }
 
 pub fn release_result(state: &AppState, result_id: &str) -> bool {
-    state.results().remove(result_id)
+    let freed = state.engine.outputs().release_result(result_id);
+    if freed {
+        state.engine.outputs_changed();
+    }
+    freed
 }
 
 // ------------------------------------------------------------ editing results
@@ -186,6 +190,9 @@ pub struct LoadResultArgs {
     pub key_columns: Vec<String>,
     #[serde(default = "default_true")]
     pub create_table: bool,
+    /// The user confirmed writing into a production connection.
+    #[serde(default)]
+    pub confirmed: bool,
 }
 
 fn default_true() -> bool {
@@ -199,6 +206,7 @@ impl LoadResultArgs {
             mode: self.mode,
             key_columns: self.key_columns.clone(),
             create_table: self.create_table,
+            confirmed: self.confirmed,
             ..Default::default()
         }
     }

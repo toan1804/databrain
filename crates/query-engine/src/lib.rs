@@ -126,7 +126,20 @@ pub struct TestResult {
 
 // ------------------------------------------------------------------ engine
 
+/// Run blocking work (file and workspace writes) from async code without
+/// stalling the other tasks of a worker thread: on a multi-thread runtime
+/// the thread is handed over while `f` runs; elsewhere (tests, no runtime)
+/// `f` just runs.
+pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 struct JobHandle {
+    /// The connection it runs on (`disconnect` stops it).
+    connection_id: String,
     tab_id: String,
     session_key: String,
     cancel: CancellationToken,

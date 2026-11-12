@@ -684,7 +684,7 @@ export function CompareDialog({
           )}
           {(a?.truncated || b?.truncated) && (
             <p className="mt-1 flex items-center gap-1 text-[11.5px] text-warning">
-              <AlertTriangle size={11} /> One side is capped at the row limit,
+              <AlertTriangle size={11} /> One side is capped (row limit or memory),
               so missing rows may be reported as removed or added.
             </p>
           )}

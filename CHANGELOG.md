@@ -11,6 +11,12 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Load into a table: on a production connection, "Load into…" and test data ask before writing (job load steps don't: the job was saved to do it). Before/after SQL that commits, rolls back or begins a transaction is refused, so a dry run can't keep its sample rows and a failed load can't claim nothing changed when something was committed.
+- Grid edits made inside an open transaction: a conflict on one change now undoes the earlier changes of that apply (a savepoint) instead of leaving them pending for your next Commit. Commit, Rollback, edits and loads use one set of transaction statements per database.
+- A tab can't be used by two things at once: Plan, applying grid edits, Commit/Rollback and an export from a tab with an open transaction now wait for each other and for a run, instead of one landing in the middle of another. Plan explains one statement at a time.
+- Stop works while a run is still connecting or signing in; disconnecting a connection stops what runs on it; a run that fails unexpectedly no longer leaves its tab "already running".
+- A result stops at the memory results may use (1 GB), even without a row limit, and says so: very wide rows no longer exhaust memory. A job's load step refuses such a capped result instead of loading part of it.
+- SQL Server: a Plan whose `SHOWPLAN` couldn't be turned off closes the tab's session (its later statements would not have run). Oracle: the plan table is cleaned up before the session is used again. Pinning a result that can't be saved to disk no longer shows it as pinned. The AI's sample rows and deleted chats free their results' entries in the outputs list.
 - Query parameters: `:name` inside a Postgres `E'…'` or Oracle `q'[…]'` string is text, not a parameter (the parameter finder now reads strings exactly as the statement splitter does).
 - Scripts split where the database does: Postgres and DuckDB `E'…'` strings with `\'` inside, Oracle `q'[…]'` strings and Snowflake Scripting blocks (`BEGIN … END;`, `DECLARE … BEGIN … END;`) written without `$$` are no longer cut at their inner `;`.
 - Results: dates and times before year 1 (Postgres `BC`) show instead of NULL; date-times with a UTC offset after fractional seconds (`13:04:05.25+02:00`) are read at the right instant on the cloud connectors; integers too large for a floating-point column are kept rounded and the result says so. Parameters: a value typed as an unfinished string (`'abc''`) is quoted instead of kept as SQL.

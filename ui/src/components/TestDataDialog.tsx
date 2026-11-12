@@ -15,7 +15,7 @@ import { AI_BATCH_ROWS, MAX_AI_ROWS, aiRequest, aiTarget, aiWrites, clampAiRows 
 import { PATTERN_HELP, patternOf, patternsFor, patternsKey } from "../lib/testDataPatterns";
 import { useStore } from "../store";
 import type { TestDataRequest } from "../store/uiSlice";
-import { DryRunReport } from "./job/LoadFields";
+import { DryRunReport, loadResultAsking } from "./job/LoadFields";
 import { PatternGuide } from "./PatternGuide";
 import { Modal } from "./ui";
 
@@ -273,7 +273,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
     if (err.kind === "cancelled") toast("Stopped generating test data", "info");
     else toast(err.message, "error");
   };
-  const args = (table: string) => ({ target_connection_id: req.connection_id, table, mode: "append" as const, key_columns: [], create_table: false });
+  const args = (table: string) => ({ target_connection_id: req.connection_id, table, mode: "append" as const, key_columns: [], create_table: false, confirmed: false });
 
   const preview = async () => {
     setBusy("preview");
@@ -305,7 +305,8 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
       const id = uid();
       loadId.current = id;
       setProgress({ id, done: 0, total: out.output.rows });
-      const r = await api.loadResult(out.output.result_id, args(out.table), id);
+      const r = await loadResultAsking(out.output.result_id, args(out.table), id);
+      if (!r) return;
       setReport(r);
       toast(`Loaded ${formatCount(r.rows)} test rows into ${req.table}`, "success");
     } catch (e) {

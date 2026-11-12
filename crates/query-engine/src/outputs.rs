@@ -183,6 +183,11 @@ impl OutputRegistry {
         })
     }
 
+    /// The memory outputs may use; one result never keeps more.
+    pub fn budget(&self) -> usize {
+        *self.budget.lock()
+    }
+
     pub fn set_budget(&self, bytes: usize) {
         *self.budget.lock() = bytes.max(16 * 1024 * 1024);
         self.enforce_budget();
@@ -347,7 +352,7 @@ impl OutputRegistry {
             g.by_handle.insert(handle, info.clone());
             let seq = g.seq;
             drop(g);
-            let _ = self.workspace.set_setting("outputs_seq", &serde_json::json!(seq));
+            let _ = crate::blocking(|| self.workspace.set_setting("outputs_seq", &serde_json::json!(seq)));
             info
         };
         self.enforce_budget();
@@ -569,21 +574,32 @@ impl OutputRegistry {
         let info = self.get(handle).unwrap_or(info);
         if pinned {
             if let Some(path) = self.snapshot_path(&info.result_id) {
-                let rs = self.results.get(&info.result_id).map_err(|e| EngineError::new("not_found", e.to_string()))?;
-                let (schema, batches) = {
-                    let mut g = rs.lock();
-                    (g.schema(), g.view_batches(&ViewSpec::default(), SNAPSHOT_CHUNK).map_err(|e| EngineError::new("internal", e.to_string()))?)
+                let save = || -> Result<()> {
+                    let rs = self.results.get(&info.result_id).map_err(|e| EngineError::new("not_found", e.to_string()))?;
+                    let (schema, batches) = {
+                        let mut g = rs.lock();
+                        (g.schema(), g.view_batches(&ViewSpec::default(), SNAPSHOT_CHUNK).map_err(|e| EngineError::new("internal", e.to_string()))?)
+                    };
+                    databrain_export::write_snapshot(&path, schema, &batches)
+                        .map_err(|e| EngineError::new("internal", format!("cannot save {handle}: {e}")))?;
+                    self.workspace.save_output(&OutputRecord {
+                        result_id: info.result_id.clone(),
+                        handle: info.handle.clone(),
+                        name: info.name.clone(),
+                        connection_id: Some(info.connection_id.clone()),
+                        meta: serde_json::to_value(&info).unwrap_or_default(),
+                        snapshot_path: Some(path.to_string_lossy().into_owned()),
+                        created_at: info.created_at,
+                    })?;
+                    Ok(())
                 };
-                databrain_export::write_snapshot(&path, schema, &batches).map_err(|e| EngineError::new("internal", format!("cannot save {handle}: {e}")))?;
-                self.workspace.save_output(&OutputRecord {
-                    result_id: info.result_id.clone(),
-                    handle: info.handle.clone(),
-                    name: info.name.clone(),
-                    connection_id: Some(info.connection_id.clone()),
-                    meta: serde_json::to_value(&info).unwrap_or_default(),
-                    snapshot_path: Some(path.to_string_lossy().into_owned()),
-                    created_at: info.created_at,
-                })?;
+                // Not saved: not pinned either (it would be lost on restart
+                // while the list says it's kept).
+                if let Err(e) = save() {
+                    self.update(handle, |o| o.pinned = false);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
             }
         } else {
             let _ = self.workspace.delete_output(&info.result_id);
@@ -623,6 +639,16 @@ impl OutputRegistry {
             o.bytes = self.results.bytes_of(&o.result_id);
         }
         Some(o)
+    }
+
+    /// Free a result: its output too when it has one (so no output is
+    /// listed whose rows are gone). Only this registry removes results that
+    /// may have an output; other crates call this, not `ResultStore::remove`.
+    pub fn release_result(&self, result_id: &str) -> bool {
+        match self.by_result(result_id) {
+            Some(o) => self.remove(&o.handle).is_ok(),
+            None => self.results.remove(result_id),
+        }
     }
 
     pub fn by_result(&self, result_id: &str) -> Option<OutputInfo> {
@@ -754,7 +780,7 @@ impl ExternalTables for OutputTables {
         let (schema, batches) = sql_ready_all(&schema, &chunks).map_err(|e| e.to_string())?;
         let notice = o.truncated.then(|| {
             format!(
-                "results.{name} ({}) holds only the first {} rows{} — totals over it may be incomplete. Re-run its query with a higher row limit for complete data.",
+                "results.{name} ({}) holds only the first {} rows{} — totals over it may be incomplete. Re-run its query with a higher row limit (or fewer columns, when memory capped it) for complete data.",
                 o.handle,
                 o.rows,
                 o.row_limit.map(|l| format!(" (row limit {l})")).unwrap_or_default()
@@ -785,7 +811,7 @@ impl ExternalTables for OutputTables {
                     "{what} · {} · {}{}",
                     o.connection_name,
                     crate::outputs::one_line(&o.sql, 120),
-                    if o.truncated { " · capped at the row limit" } else { "" }
+                    if o.truncated { " · capped (row limit or memory)" } else { "" }
                 )),
                 name,
             });

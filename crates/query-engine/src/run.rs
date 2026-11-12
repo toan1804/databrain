@@ -125,7 +125,13 @@ impl QueryEngine {
             }
             jobs.insert(
                 job_id.clone(),
-                JobHandle { tab_id: req.tab_id.clone(), session_key: req.session_key().to_string(), cancel: cancel.clone(), tab_closed: false },
+                JobHandle {
+                    connection_id: req.connection_id.clone(),
+                    tab_id: req.tab_id.clone(),
+                    session_key: req.session_key().to_string(),
+                    cancel: cancel.clone(),
+                    tab_closed: false,
+                },
             );
         }
         // Previous outputs of this tab become "recent" (evictable).
@@ -261,7 +267,7 @@ impl QueryEngine {
             self.events.emit(JobEvent::StatementStarted { job_id: job_id.clone(), tab_id: req.tab_id.clone(), index: stmt.index, sql: stmt.sql.clone() });
             let started_at = now_ms();
             let t0 = Instant::now();
-            let outcome = match self.begin_if_manual(&req, conn_kind, stmt).await {
+            let outcome = match self.begin_if_manual(&req, conn_kind, stmt, &cancel).await {
                 Ok(()) => self.run_statement(&job_id, &req, stmt, limit, cancel.child_token()).await,
                 Err(e) => Err(e),
             };
@@ -290,17 +296,19 @@ impl QueryEngine {
                 Err(e) if e.kind == "cancelled" => (RunStatus::Cancelled, None, None),
                 Err(e) => (RunStatus::Error, None, Some(e.message.clone())),
             };
-            let _ = self.workspace.add_history(NewHistory {
-                origin: req.origin,
-                connection_id: Some(req.connection_id.clone()),
-                sql: stmt.sql.clone(),
-                started_at,
-                duration_ms: duration_ms as i64,
-                rows,
-                status: Some(hist_status),
-                error,
-                output_handle: output.as_ref().map(|o| o.handle.clone()),
-                result_id: output.as_ref().map(|o| o.result_id.clone()),
+            let _ = crate::blocking(|| {
+                self.workspace.add_history(NewHistory {
+                    origin: req.origin,
+                    connection_id: Some(req.connection_id.clone()),
+                    sql: stmt.sql.clone(),
+                    started_at,
+                    duration_ms: duration_ms as i64,
+                    rows,
+                    status: Some(hist_status),
+                    error,
+                    output_handle: output.as_ref().map(|o| o.handle.clone()),
+                    result_id: output.as_ref().map(|o| o.result_id.clone()),
+                })
             });
 
             match outcome {
@@ -405,6 +413,10 @@ impl QueryEngine {
         let mut notices = Vec::new();
         let mut truncated = false;
         let mut rows = 0usize;
+        // Bytes kept: a row limit alone doesn't bound wide rows.
+        let mut bytes = 0usize;
+        let max_bytes = self.outputs.budget();
+        let mut too_big = false;
         let t0 = Instant::now();
         let mut last_progress = Instant::now();
 
@@ -427,7 +439,19 @@ impl QueryEngine {
                             batch = batch.slice(0, room);
                         }
                     }
+                    // Stop at the memory a result may keep, like the row
+                    // cap: the rows that fit, copied so the rest of the
+                    // batch's buffers are freed.
+                    let size = batch.get_array_memory_size();
+                    if bytes + size > max_bytes && batch.num_rows() > 0 {
+                        let keep = ((max_bytes.saturating_sub(bytes) as u128 * batch.num_rows() as u128) / size as u128) as usize;
+                        let idx = databrain_connector_core::arrow::array::UInt32Array::from_iter_values(0..keep.min(batch.num_rows()) as u32);
+                        batch = databrain_connector_core::arrow::compute::take_record_batch(&batch, &idx).unwrap_or_else(|_| batch.slice(0, idx.len()));
+                        truncated = true;
+                        too_big = true;
+                    }
                     rows += batch.num_rows();
+                    bytes += batch.get_array_memory_size();
                     rs.lock().push(batch);
                     if truncated {
                         cancel.cancel();
@@ -479,7 +503,14 @@ impl QueryEngine {
             g.info()
         });
         unfinished.armed = false;
-        notices.push(format!("Showing the first {rows} rows. Increase the row limit to fetch more."));
+        notices.push(if too_big {
+            format!(
+                "Showing the first {rows} rows: they fill the {} MB a result may keep in memory. Select fewer columns, or export the query to get every row.",
+                max_bytes / (1024 * 1024)
+            )
+        } else {
+            format!("Showing the first {rows} rows. Increase the row limit to fetch more.")
+        });
         // Wait for the connector to finish cancelling before the session is
         // reused; otherwise a server-side cancel could hit the next statement.
         let _ = tokio::time::timeout(Duration::from_secs(15), async { while stream.next().await.is_some() {} }).await;

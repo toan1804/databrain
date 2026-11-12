@@ -76,6 +76,7 @@ async fn loads_a_result_into_another_connection() {
         mode,
         key_columns: vec!["id".into()],
         create_table: true,
+        confirmed: false,
     };
 
     // Dry run keeps nothing.
@@ -179,7 +180,14 @@ async fn checks_the_target_path_before_loading() {
 
     // Loading into a missing schema stops before CREATE TABLE, and says why.
     let info = run(&st, &duck, "select 1 as id").await.result.unwrap();
-    let args = LoadResultArgs { target_connection_id: lite.clone(), table: "nosuch.t".into(), mode: LoadMode::Append, key_columns: vec![], create_table: true };
+    let args = LoadResultArgs {
+        target_connection_id: lite.clone(),
+        table: "nosuch.t".into(),
+        mode: LoadMode::Append,
+        key_columns: vec![],
+        create_table: true,
+        confirmed: false,
+    };
     let e = api::load_result(&st, &info.id, args.clone(), "x1").await.unwrap_err();
     assert!(e.message.contains("nosuch doesn't exist") && e.message.contains("ATTACH DATABASE"), "{}", e.message);
     let dry = api::dry_run_result_load(&st, &info.id, args).await.unwrap();
@@ -233,6 +241,7 @@ async fn loads_into_clickhouse_live() {
         mode,
         key_columns: vec!["id".into()],
         create_table: true,
+        confirmed: false,
     };
     async fn count(st: &AppState, target: &str) -> (String, String) {
         let r = run(st, target, "select count() as n, countIf(name is null) as nulls from databrain_load.people").await.result.unwrap();
@@ -285,7 +294,14 @@ async fn clickhouse_refuses_keyed_loads_up_front() {
         api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
     let info = run(&st, &duck, "select 1 as id").await.result.unwrap();
     for mode in [LoadMode::Update, LoadMode::Merge] {
-        let args = LoadResultArgs { target_connection_id: target.clone(), table: "db.t".into(), mode, key_columns: vec!["id".into()], create_table: true };
+        let args = LoadResultArgs {
+            target_connection_id: target.clone(),
+            table: "db.t".into(),
+            mode,
+            key_columns: vec!["id".into()],
+            create_table: true,
+            confirmed: false,
+        };
         let e = api::load_result(&st, &info.id, args, "k").await.unwrap_err();
         assert!(e.message.contains("ClickHouse can't update rows by key") && e.message.contains("Replace table"), "{}", e.message);
     }
@@ -322,6 +338,7 @@ async fn sync_mirrors_the_rows_by_key() {
         mode,
         key_columns: vec!["id".into()],
         create_table: true,
+        confirmed: false,
     };
 
     let first = run(&st, &duck, "select i as id, 'name ' || i as name from range(25) t(i)").await.result.unwrap();

@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use databrain_connector_core::sql::{StatementKind, classify};
+use databrain_connector_core::sql::{StatementKind, classify, split_statements};
 use databrain_connector_core::{ConnectorKind, Session, query_table};
 use serde::Serialize;
 use serde_json::Value;
@@ -96,17 +96,30 @@ impl QueryEngine {
         if sql.is_empty() {
             return Err(EngineError::new("invalid", "Nothing to explain"));
         }
+        // One statement: a driver that runs several would run the rest.
+        if split_statements(sql, kind).len() > 1 {
+            return Err(EngineError::new("invalid", "Explain one statement at a time: select it, or put the cursor in it"));
+        }
         if analyze && !can_analyze {
             return Err(EngineError::new("unsupported", format!("{} plans can't be analyzed here: use Explain for the estimated plan", kind.traits().name)));
         }
         if analyze && classify(sql, kind).kind != StatementKind::Read {
             return Err(EngineError::new("invalid", "ANALYZE runs the statement: it is only offered for read queries"));
         }
-        if self.jobs.lock().values().any(|j| j.session_key == session_key) {
-            return Err(EngineError::new("busy", "A query is running in this tab: wait for it or stop it first"));
-        }
+        let _claim = self.claim(
+            connection_id,
+            session_key,
+            databrain_connector_core::CancellationToken::new(),
+            "A query is running in this tab: wait for it or stop it first",
+        )?;
         let session = self.session(connection_id, session_key).await?;
-        Ok(explain_on(&*session, kind, sql, analyze).await?)
+        let stuck = std::sync::atomic::AtomicBool::new(false);
+        let r = explain_on(&*session, kind, sql, analyze, &stuck).await;
+        if stuck.load(std::sync::atomic::Ordering::Relaxed) {
+            // Still in plan-only mode: its next statements wouldn't run.
+            self.drop_session_if(connection_id, session_key, &session);
+        }
+        Ok(r?)
     }
 }
 
@@ -148,8 +161,10 @@ impl QueryEngine {
     pub async fn estimate_cost(&self, connection_id: &str, session_key: &str, sql: &str) -> Result<databrain_connector_core::CostEstimate> {
         let kind = self.workspace().get_connection(connection_id)?.config.kind;
         let sql = cost_statement(kind, sql)?;
-        let busy = self.jobs.lock().values().any(|j| j.session_key == session_key);
-        let tab = if busy || session_key.is_empty() { crate::META_TAB } else { session_key };
+        // The tab's session unless something holds it (then the metadata one).
+        let claim =
+            if session_key.is_empty() { None } else { self.claim(connection_id, session_key, databrain_connector_core::CancellationToken::new(), "").ok() };
+        let tab = if claim.is_none() { crate::META_TAB } else { session_key };
         let run = self.with_tab(connection_id, tab, |s| {
             let sql = sql.clone();
             async move { s.estimate_cost(&sql).await }
@@ -161,7 +176,15 @@ impl QueryEngine {
     }
 }
 
-async fn explain_on(s: &dyn Session, kind: ConnectorKind, sql: &str, analyze: bool) -> databrain_connector_core::Result<QueryPlan> {
+/// `stuck` is set when the session is left in a mode where statements don't
+/// run (SQL Server's showplan could not be turned off): the caller drops it.
+async fn explain_on(
+    s: &dyn Session,
+    kind: ConnectorKind,
+    sql: &str,
+    analyze: bool,
+    stuck: &std::sync::atomic::AtomicBool,
+) -> databrain_connector_core::Result<QueryPlan> {
     use ConnectorKind::*;
     let first_cell = |r: &Rows| r.1.iter().filter_map(|row| row.first().cloned().flatten()).collect::<Vec<_>>().join("\n");
     match kind {
@@ -207,7 +230,10 @@ async fn explain_on(s: &dyn Session, kind: ConnectorKind, sql: &str, analyze: bo
             let r = query_table(s, sql).await;
             // Always back off, also after an error.
             let off = async { s.execute("SET SHOWPLAN_ALL OFF", Default::default()).await?.collect().await };
-            off.await?;
+            if let Err(e) = off.await {
+                stuck.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(e);
+            }
             let r = r?;
             Ok(QueryPlan { roots: mssql_rows(&r), raw: rows_text(&r), ..Default::default() })
         }
@@ -222,7 +248,10 @@ async fn explain_on(s: &dyn Session, kind: ConnectorKind, sql: &str, analyze: bo
                 ),
             )
             .await;
-            let _ = s.execute(&format!("DELETE FROM plan_table WHERE statement_id = '{id}'"), Default::default()).await.map(|st| st.collect());
+            // Best effort, but run to the end before the session is reused.
+            if let Ok(st) = s.execute(&format!("DELETE FROM plan_table WHERE statement_id = '{id}'"), Default::default()).await {
+                let _ = st.collect().await;
+            }
             let r = r?;
             Ok(QueryPlan { roots: oracle_rows(&r), raw: rows_text(&r), ..Default::default() })
         }

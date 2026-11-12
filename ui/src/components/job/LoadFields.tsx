@@ -4,7 +4,7 @@ import { useEvent } from "../../lib/hooks";
 import { useEffect, useState } from "react";
 import { AlertTriangle, FlaskConical, Info, CheckCircle2, CircleDashed, Loader2, Plus, XCircle } from "lucide-react";
 import { api, toError } from "../../lib/api";
-import type { BatchLimits, Job, JobNode, LoadDryRun, LoadMode, LoadTarget } from "../../lib/types";
+import type { BatchLimits, Job, JobNode, LoadDryRun, LoadMode, LoadReport, LoadResultArgs, LoadTarget } from "../../lib/types";
 import { copyText } from "../CatalogMenus";
 import { parseKeyColumns, batchValue } from "../../lib/jobGraph";
 import { formatCount } from "../../lib/util";
@@ -322,6 +322,28 @@ export function useLoadTarget(connectionId: string | null | undefined, table: st
  * target is a view, or the table is missing in a mode that doesn't create it
  * (not when before SQL runs first: it may create them).
  */
+/** Load a result; a production target asks first (code
+ * `needs_confirmation`) and the load runs again once confirmed. `null` when
+ * the user said no. */
+export async function loadResultAsking(resultId: string, args: LoadResultArgs, loadId: string): Promise<LoadReport | null> {
+  try {
+    return await api.loadResult(resultId, { ...args, confirmed: false }, loadId);
+  } catch (e) {
+    const err = toError(e);
+    if (err.code !== "needs_confirmation") throw e;
+    const ok = await new Promise<boolean>((resolve) =>
+      useStore.getState().askConfirm({
+        title: "Write into a production connection?",
+        reasons: [err.message],
+        confirmLabel: "Load anyway",
+        onConfirm: () => resolve(true),
+        onCancel: () => resolve(false),
+      }),
+    );
+    return ok ? api.loadResult(resultId, { ...args, confirmed: true }, loadId) : null;
+  }
+}
+
 export function loadTargetBlocked(c: TargetCheck, mode: LoadMode, create: boolean, beforeSql = false): boolean {
   if (c.status !== "ready" || beforeSql) return false;
   const t = c.target;

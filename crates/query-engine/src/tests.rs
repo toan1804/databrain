@@ -616,10 +616,10 @@ async fn outputs_of_a_run_whose_tab_closed_are_freed() {
         let r = RunRequest { tab_id: tab.into(), ..req(&f, "select 1 as a") };
         let plan = f.engine.plan(&profile, &r.sql);
         let job = format!("job-{tab}");
-        f.engine
-            .jobs
-            .lock()
-            .insert(job.clone(), JobHandle { tab_id: tab.into(), session_key: tab.into(), cancel: CancellationToken::new(), tab_closed: false });
+        f.engine.jobs.lock().insert(
+            job.clone(),
+            JobHandle { connection_id: String::new(), tab_id: tab.into(), session_key: tab.into(), cancel: CancellationToken::new(), tab_closed: false },
+        );
         if close {
             f.engine.close_tab(tab);
             let jobs = f.engine.jobs.lock();
@@ -685,15 +685,127 @@ async fn load_sql_that_controls_the_transaction_is_refused() {
     assert_eq!(count().await, "3");
 }
 
+/// A load into a production connection asks first, like a run: unconfirmed
+/// it writes nothing (code `needs_confirmation`); a dry run doesn't ask;
+/// confirmed, it loads. A non-production connection doesn't ask.
+#[tokio::test]
+async fn load_into_production_needs_confirmation() {
+    use databrain_connector_core::arrow::array::Int64Array;
+    use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let batch = databrain_connector_core::arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+    let rows = crate::load::LoadRows { schema, batches: vec![batch] };
+    for env in [EnvTag::Prod, EnvTag::Dev] {
+        let f = fixture(env);
+        let s = f.engine.session_for_tests(&f.conn_id).await.unwrap();
+        s.execute("create table t (id integer)", Default::default()).await.unwrap().collect().await.unwrap();
+        let count = || async {
+            let s = f.engine.session_for_tests(&f.conn_id).await.unwrap();
+            databrain_connector_core::query_text(&*s, "select count(*) from t").await.unwrap()[0][0].clone().unwrap()
+        };
+        let mut spec = crate::load::LoadSpec { table: "t".into(), ..Default::default() };
+        let r = f.engine.load_rows(&rows, &f.conn_id, "l", &spec, &Default::default(), &crate::load::NoLoadObserver).await;
+        if env == EnvTag::Prod {
+            let e = r.unwrap_err();
+            assert_eq!(e.code.as_deref(), Some("needs_confirmation"), "{e:?}");
+            assert_eq!(count().await, "0", "nothing was written");
+            let dry = f.engine.dry_run_load(Some(&rows), None, &f.conn_id, "d", &spec).await;
+            assert!(dry.ok, "a dry run doesn't ask: {dry:?}");
+            spec.confirmed = true;
+            let r = f.engine.load_rows(&rows, &f.conn_id, "l", &spec, &Default::default(), &crate::load::NoLoadObserver).await.unwrap();
+            assert_eq!(r.rows, 2);
+        } else {
+            assert_eq!(r.unwrap().rows, 2);
+        }
+        assert_eq!(count().await, "2");
+    }
+}
+
+/// Plan, Commit/Rollback and runs on a tab wait for whatever holds its
+/// session (an edit being applied, an export): the claim is checked and
+/// taken under one lock, and freed when its holder ends.
+#[tokio::test]
+async fn a_claimed_session_refuses_other_work() {
+    let f = fixture(EnvTag::Dev);
+    let claim = f.engine.claim(&f.conn_id, "tab1", Default::default(), "held").unwrap();
+    assert_eq!(f.engine.claim(&f.conn_id, "tab1", Default::default(), "held twice").err().map(|e| e.message).as_deref(), Some("held twice"));
+    assert_eq!(f.engine.run(req(&f, "select 1")).err().map(|e| e.kind), Some("busy".to_string()));
+    assert_eq!(f.engine.explain(&f.conn_id, "tab1", "select 1", false).await.err().map(|e| e.kind), Some("busy".to_string()));
+    assert_eq!(f.engine.end_transaction(&f.conn_id, "tab1", true).await.err().map(|e| e.kind), Some("busy".to_string()));
+    assert!(f.engine.explain(&f.conn_id, "tab2", "select 1; select 2", false).await.unwrap_err().message.contains("one statement"));
+    // Another tab isn't held.
+    assert!(f.engine.explain(&f.conn_id, "tab2", "select 1", false).await.is_ok());
+    drop(claim);
+    assert!(f.engine.jobs.lock().is_empty(), "the claim is freed");
+    assert!(f.engine.explain(&f.conn_id, "tab1", "select 1", false).await.is_ok());
+    assert!(f.engine.jobs.lock().is_empty(), "explain freed its claim");
+    let job = started(f.engine.run(req(&f, "select 1")).unwrap());
+    wait_job(&f, &job).await;
+}
+
+/// A result stops at the memory a result may keep, even with no row
+/// limit: wide rows can't exhaust memory. It says so, and is marked capped.
+#[tokio::test]
+async fn a_result_stops_at_the_memory_cap() {
+    let f = fixture(EnvTag::Dev);
+    f.engine.outputs().set_budget(0); // the 16 MB floor
+    let mut r = req(&f, "with recursive n(i) as (select 1 union all select i + 1 from n where i < 400) select i, randomblob(100000) as b from n");
+    r.row_limit = None;
+    let evs = wait_job(&f, &started(f.engine.run(r).unwrap())).await;
+    let (info, notices) = evs
+        .iter()
+        .find_map(|e| match e {
+            JobEvent::StatementFinished { result: Some(r), notices, .. } => Some((r.clone(), notices.clone())),
+            _ => None,
+        })
+        .expect("finished");
+    assert!(info.truncated && info.total_rows < 400 && info.total_rows > 0 && info.bytes <= 16 << 20, "{info:?}");
+    assert!(notices.iter().any(|n| n.contains("16 MB a result may keep")), "{notices:?}");
+}
+
+/// Freeing a result that has an output drops the output too: no output
+/// stays listed (Live) whose rows are gone.
+#[tokio::test]
+async fn releasing_a_result_drops_its_output() {
+    let f = fixture(EnvTag::Dev);
+    let evs = wait_job(&f, &started(f.engine.run(req(&f, "select 1 as a")).unwrap())).await;
+    let id = evs
+        .iter()
+        .find_map(|e| match e {
+            JobEvent::StatementFinished { result: Some(r), .. } => Some(r.id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(f.engine.outputs().by_result(&id).is_some());
+    assert!(f.engine.outputs().release_result(&id));
+    assert!(f.engine.outputs().by_result(&id).is_none() && !f.engine.results().contains(&id));
+    assert!(!f.engine.outputs().release_result(&id), "nothing left to free");
+}
+
+/// Disconnecting stops the connection's running statements: a script's
+/// next statement doesn't reconnect and run outside its transaction.
+#[tokio::test]
+async fn disconnect_stops_running_statements() {
+    let f = fixture(EnvTag::Dev);
+    let mut r = req(&f, "with recursive n(i) as (select 1 union all select i + 1 from n) select count(*) from n; select 2");
+    r.row_limit = None;
+    let job = started(f.engine.run(r).unwrap());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    f.engine.disconnect(&f.conn_id);
+    let evs = tokio::time::timeout(Duration::from_secs(10), wait_job(&f, &job)).await.expect("the run stops");
+    assert!(matches!(evs.last(), Some(JobEvent::JobFinished { status: RunStatus::Cancelled, .. })), "{:?}", evs.last());
+    assert!(!evs.iter().any(|e| matches!(e, JobEvent::StatementStarted { index: 1, .. })), "the next statement didn't run");
+}
+
 /// A run whose task dies (a panic) frees its tab and says it ended, so the
 /// tab can run again and nothing waits for it forever.
 #[tokio::test]
 async fn a_run_that_dies_frees_its_tab() {
     let f = fixture(EnvTag::Dev);
-    f.engine
-        .jobs
-        .lock()
-        .insert("dead".into(), JobHandle { tab_id: "tab1".into(), session_key: "tab1".into(), cancel: CancellationToken::new(), tab_closed: false });
+    f.engine.jobs.lock().insert(
+        "dead".into(),
+        JobHandle { connection_id: String::new(), tab_id: "tab1".into(), session_key: "tab1".into(), cancel: CancellationToken::new(), tab_closed: false },
+    );
     assert!(f.engine.run(req(&f, "select 1")).is_err(), "busy while the job is listed");
     // What a panic in the task does: the guard drops without finishing.
     drop(crate::run::JobGuard { engine: f.engine.clone(), job_id: "dead".into(), tab_id: "tab1".into(), waiter: None, done: false });
@@ -706,10 +818,10 @@ async fn a_run_that_dies_frees_its_tab() {
     let RunResponse::Started { job_id, .. } = r else { panic!("{r:?}") };
     wait_job(&f, &job_id).await;
     // A guard that finished does nothing.
-    f.engine
-        .jobs
-        .lock()
-        .insert("live".into(), JobHandle { tab_id: "t2".into(), session_key: "t2".into(), cancel: CancellationToken::new(), tab_closed: false });
+    f.engine.jobs.lock().insert(
+        "live".into(),
+        JobHandle { connection_id: String::new(), tab_id: "t2".into(), session_key: "t2".into(), cancel: CancellationToken::new(), tab_closed: false },
+    );
     crate::run::JobGuard { engine: f.engine.clone(), job_id: "live".into(), tab_id: "t2".into(), waiter: None, done: false }.finish();
     assert_eq!(f.engine.jobs.lock().len(), 1);
 }

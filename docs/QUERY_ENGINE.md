@@ -47,14 +47,14 @@ One `Arc<QueryEngine>` per process (`QueryEngine::new` in `lib.rs`). Every map i
 |---|---|---|
 | `sessions` | `(connection_id, tab)` → `Live { session, _tunnel, sandboxed, last_used }` | idle close, `disconnect`, `reconnect`, `close_tab`, `release_sessions`, `drop_session` |
 | `connecting` | same key → a `tokio::sync::Mutex` (`ConnectGate`): one connection attempt per key | the last waiter drops its gate |
-| `jobs` | job id → `JobHandle { tab_id, session_key, cancel, tab_closed }` | `run_job` ends; an export on a shared session ends |
+| `jobs` | job id → `JobHandle { connection_id, tab_id, session_key, cancel, tab_closed }` | `run_job` ends (`JobGuard`, also after a panic); a `Claim` drops |
 | `creds` | connection id → `CredentialSource` (token caches survive reconnects) | `forget_credentials`, `set_interaction` |
 | `tests`, `exports` | id → `CancellationToken` | the test or export ends |
-| `exported` | export id → file written | never (process lifetime) |
+| `exported` | export id → file written | the oldest past the last 100 |
 | `manual_commit` | set of session keys | `set_manual_commit(key, false)` (the app calls it on tab close) |
 | `outputs` | `Arc<OutputRegistry>` (own lock, see below) | |
 
-`jobs` is also the "busy" list: `start_run` checks and claims a tab and its session key under one lock. `explain`, `apply_edits`, `end_transaction` and `export_query` only look at it.
+`jobs` is also the "busy" list: `start_run` checks and claims a tab and its session key under one lock. `explain`, `apply_edits`, `end_transaction` and an export on a tab's session take a `Claim` (`sessions.rs` `claim`): the same check and insert under one lock, removed when the claim drops, so nothing else starts on the session meanwhile. The cost preview takes one when it can and otherwise uses `__meta__`.
 
 ## Sessions
 
@@ -74,7 +74,7 @@ A session is one database connection, found by `(connection_id, tab)`. `session_
 Rules:
 
 - **Sandbox.** SQL from `Origin::Ai` or `Origin::Mcp` on DuckDB runs in a session opened with `SANDBOX_OPTION` unless the connection's AI policy allows external access (`sandboxed`). A session opened without the sandbox is never handed to such a run: it is replaced. A DuckDB file has one database instance, so opening one kind closes idle sessions of the other kind.
-- **In use.** A session is busy when a job names its key, when someone else holds its `Arc` (`Arc::strong_count > 1`: a catalog call, an export, a load) or when `in_transaction()` is true. `close_idle_with` and `reconnect` keep busy sessions; `disconnect`, `close_tab` and `release_sessions` drop the map entry regardless (a statement still running keeps its handle until it ends).
+- **In use.** A session is busy when a job names its key, when someone else holds its `Arc` (`Arc::strong_count > 1`: a catalog call, an export, a load) or when `in_transaction()` is true. `close_idle_with` and `reconnect` keep busy sessions; `disconnect`, `close_tab` and `release_sessions` drop the map entry regardless (a statement still running keeps its handle until it ends). `disconnect` and `close_tab` also cancel the jobs on it, so a script's next statement doesn't reconnect outside its transaction. Sessions are taken out of the map under the lock and dropped after it (`drop_sessions`); `with_tab`'s retry drops only the session that failed (`drop_session_if`).
 - **Idle close.** The app calls `close_idle_with(idle_disconnect())` every minute (`crates/app/src/lib.rs`). Limit: the connection's `idle_disconnect_minutes` option, else the setting (default 60, `0` = never).
 - **Reconnect.** `with_meta` / `with_tab` retry once on a connection error with a new session. Runs do not: a connection error fails the statement, `run_job` drops the session and the next run connects again. `reconnect(connection)` is the explorer's Refresh: closes `__meta__` and every session that is not busy.
 - **Concurrency.** One run per tab and per session key (`busy` error otherwise). Catalog calls share `__meta__` and may overlap; the connector serializes them.
@@ -116,7 +116,7 @@ after the loop
 | What | How |
 |---|---|
 | A run | `cancel(job_id)` cancels the job's token. Each statement runs with a child token passed to the connector in `ExecOptions::cancel`; the connector stops the server side and the stream ends with a `cancelled` error. The loop checks the token before each statement. Status `Cancelled`. |
-| Row limit reached | `collect_stream` cancels only that statement's child token, then reads the stream to its end (15 s at most) so the cancel can't hit the next statement. |
+| Row limit reached | `collect_stream` cancels only that statement's child token, then reads the stream to its end (15 s at most) so the cancel can't hit the next statement. The same happens when the rows kept reach the outputs budget (1 GB by default): the batch is cut to what fits and copied, and the notice says so. A job load step refuses such a capped output. |
 | Closing a tab | `close_tab` cancels its jobs, drops its sessions, frees its unnamed, unpinned outputs. |
 | `run_and_wait` | forwards the caller's token to `cancel` once. |
 | Export, connection test | `cancel_export`, `cancel_test`: own token maps. |
@@ -142,15 +142,17 @@ after the loop
 | Read-only connection: only reads and harmless `USE` / `SET` | `start_run` (`read_only_allows`); `prepare_load`; `edit_target`. Postgres also sets the transaction read-only in its connector | runs, loads, grid edits |
 | UPDATE / DELETE without WHERE asks | `safety_reasons` | runs with `confirmed: false` |
 | Production connection: all but reads, transaction control and harmless `USE` / `SET` ask | `prod_needs_confirmation`, `safety_reasons` | runs with `confirmed: false` |
-| One run per tab / session | `start_run` (`jobs`) | runs; others only look |
+| One run per tab / session | `start_run` (`jobs`), `claim` | runs, plans, grid edits, Commit/Rollback, exports on a tab's session |
 | Full export runs one read statement | `export_query` | export |
-| `EXPLAIN ANALYZE` only for reads | `explain` | plans |
+| Plans: one statement; `EXPLAIN ANALYZE` only for reads | `explain` | plans |
+| Production connection: a load asks (`needs_confirmation`); job load steps count as confirmed | `prepare_load` (`LoadSpec::confirmed`) | loads, not dry runs |
+| A result keeps at most the outputs budget in memory | `collect_stream` | runs |
 | Cost preview: one statement, read or DML | `cost_statement` | cost preview |
 | DuckDB sandbox for AI and MCP SQL | `sandboxed`, `session_for`; enforced in the DuckDB connector | runs and loads with `origin` Ai / Mcp |
 | Output columns the AI must not see | `RunRequest::output_masks` → `ExecOptions` | AI runs on DuckDB |
 | AI policy, table rules, approval, row cap, PII | `crates/ai/src/policy.rs`, `access.rs`, `pii.rs`, before `run_and_wait` | AI and MCP |
 
-Not asked by the engine: loads (`load_rows`), grid edits (`apply_edits`) and `end_transaction` do not go through `safety_reasons`. They check read-only only; a production target is not confirmed here. Before / after SQL of a load step runs as written. Grid edits show their statements in the UI first; the app builds them again on the server (`api/results.rs` `apply_edits`), so the UI can't send SQL of its own.
+Not asked by the engine: grid edits (`apply_edits`) and `end_transaction` do not go through `safety_reasons`; they check read-only only. A load asks on a production connection (above); its before / after SQL may not control the transaction (`check_user_sql`). Grid edits show their statements in the UI first; the app builds them again on the server (`api/results.rs` `apply_edits`), so the UI can't send SQL of its own.
 
 ## Outputs
 
@@ -164,7 +166,7 @@ Every result set of a run becomes an output (`OutputRegistry::add`): handle `rN`
 | `Evicted` | Rows gone, metadata kept; at most `MAX_ENTRIES` (400) entries in all, oldest evicted ones dropped first (`trim_entries`). |
 
 - **Names.** `set_name` moves a name to the newest output; older ones become `name__1` … (`KEEP_VERSIONS` = 5). A job step's name belongs to it (`check_owner`).
-- **Freed by:** `close_tab` (the tab's unnamed, unpinned outputs), `enforce_budget`, `remove` / `remove_unpinned`, a version past the fifth, an unfinished statement (`Unfinished` in `run.rs`).
+- **Freed by:** `close_tab` (the tab's unnamed, unpinned outputs; an AI chat's tab `ai:{session}` closes when the chat is deleted), `enforce_budget`, `remove` / `remove_unpinned`, `release_result` (the AI's sample rows, the UI's release: the output goes with its rows), a version past the fifth, an unfinished statement (`Unfinished` in `run.rs`). A pin whose snapshot can't be written is undone.
 - **On quit** `persist_active` saves each tab's latest outputs (64 MB each, 512 MB in all) and drops saved ones that are no longer current; `set_snapshot_dir` restores them for tabs that still exist.
 - **SQL over outputs.** `OutputTables` implements `ExternalTables`: DuckDB sessions read `results.<handle or name>` through `ensure_loaded` and `sql_ready_all` (decimal text becomes `DECIMAL`).
 - **Compare.** `diff_sql_opts`, `compare_summary_sql`, `key_candidates`, `unique_check_sql` build DuckDB SQL over two outputs; the app runs it on the "Results (DuckDB)" connection (`results_connection`).

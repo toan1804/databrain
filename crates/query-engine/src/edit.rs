@@ -494,9 +494,12 @@ impl QueryEngine {
             return Ok(ApplyReport::default());
         }
         let kind = self.workspace().get_connection(&t.connection_id)?.config.kind;
-        if self.jobs.lock().values().any(|j| j.session_key == session_key) {
-            return Err(EngineError::new("busy", "A query is running in this tab: wait for it to finish, then apply"));
-        }
+        let _claim = self.claim(
+            &t.connection_id,
+            session_key,
+            databrain_connector_core::CancellationToken::new(),
+            "A query is running in this tab: wait for it to finish, then apply",
+        )?;
         let session = self.session(&t.connection_id, session_key).await?;
         let run = |sql: String| {
             let s = session.clone();

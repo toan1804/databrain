@@ -537,7 +537,7 @@ impl Agent {
                         o.reference(),
                         o.handle,
                         o.rows,
-                        if o.truncated { " (capped at the row limit — incomplete)" } else { "" },
+                        if o.truncated { " (capped at the row limit or memory — incomplete)" } else { "" },
                         o.connection_name,
                         cols.join(", "),
                         o.sql.replace('\n', " ").chars().take(600).collect::<String>()

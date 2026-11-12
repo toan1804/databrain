@@ -960,6 +960,17 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
             )
         })?;
     }
+    // A capped result (it filled the memory a result may keep) holds only
+    // part of the rows: a load would write that part as if it were all.
+    if output.truncated {
+        return Err(EngineError::new(
+            "invalid",
+            format!(
+                "The step's result was capped at {} rows (the memory a result may keep): nothing was loaded. Select fewer columns, or split the step.",
+                output.rows
+            ),
+        ));
+    }
     let report = ctx.engine.write_output(&output.handle, target, &format!("{tab}:load"), &spec, cancel, t).await?;
     Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices })
 }
@@ -977,6 +988,8 @@ pub fn load_spec(node: &JobNode) -> LoadSpec {
         batch_rows: node.batch_rows,
         batch_kb: node.batch_kb,
         origin: sql_origin(node),
+        // The job was saved to write there; its runs don't ask.
+        confirmed: true,
     }
 }
 

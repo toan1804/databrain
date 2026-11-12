@@ -53,6 +53,10 @@ pub struct LoadSpec {
     /// Whose SQL the before/after statements are (`Ai`: the DuckDB sandbox
     /// applies to the target session).
     pub origin: databrain_workspace::Origin,
+    /// The user agreed to write into a production connection (a job's load
+    /// step counts as agreed: the job was saved to do it). Unset, a load
+    /// into a production connection fails with code `needs_confirmation`.
+    pub confirmed: bool,
 }
 
 /// Outcome of a load.
@@ -754,6 +758,13 @@ impl QueryEngine {
         if profile.config.read_only {
             return Err(EngineError::new("invalid", format!("Connection \"{}\" is read-only; nothing was written.", profile.name)));
         }
+        // A dry run keeps nothing, so it doesn't ask.
+        if !dry && profile.env == databrain_workspace::EnvTag::Prod && !spec.confirmed {
+            return Err(EngineError {
+                code: Some("needs_confirmation".into()),
+                ..EngineError::new("invalid", format!("\"{}\" is a production connection: confirm writing rows into {table}.", profile.name))
+            });
+        }
         let dialect = profile.config.kind;
         if !sqlgen::is_load_target(dialect) {
             return Err(EngineError::new(
@@ -1252,7 +1263,7 @@ mod tests {
             assert!(check(sql, k).is_err(), "{k:?}: {sql}");
         }
         for (sql, k) in [("update t set a = 1 where id = 2", Postgres), ("create index i on t (a)", Postgres), ("select 1", Mssql)] {
-            assert_eq!(check(sql, k).unwrap(), false, "{k:?}: {sql}");
+            assert!(!check(sql, k).unwrap(), "{k:?}: {sql}");
         }
         // A procedure may commit by itself.
         for (sql, k) in [("call refresh_totals()", Postgres), ("exec dbo.rebuild", Mssql), ("BEGIN pkg.run; END;", Oracle)] {

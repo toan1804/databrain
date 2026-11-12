@@ -685,8 +685,14 @@ async fn test_data_generates_and_loads_sqlite() {
     let made = generate_test_data(&st, &p.id, &main, "orders", spec(50), None, None).await.unwrap();
     assert_eq!(made.output.rows, 50);
     assert!(made.notes.iter().any(|n| n.contains("2 existing keys")), "{:?}", made.notes);
-    let args =
-        LoadResultArgs { target_connection_id: p.id.clone(), table: made.table.clone(), mode: Default::default(), key_columns: vec![], create_table: false };
+    let args = LoadResultArgs {
+        target_connection_id: p.id.clone(),
+        table: made.table.clone(),
+        mode: Default::default(),
+        key_columns: vec![],
+        create_table: false,
+        confirmed: false,
+    };
     let dry = dry_run_result_load(&st, &made.output.result_id, args.clone()).await.unwrap();
     assert!(dry.ok, "{dry:?}");
     let r = load_result(&st, &made.output.result_id, args, "l1").await.unwrap();
@@ -711,8 +717,14 @@ async fn test_data_generates_and_loads_sqlite() {
     ro.read_only = true;
     let q = save_profile(&st, "ro", ro, None);
     let made = generate_test_data(&st, &q.id, &main, "customers", spec(5), None, None).await.unwrap();
-    let args =
-        LoadResultArgs { target_connection_id: q.id.clone(), table: made.table.clone(), mode: Default::default(), key_columns: vec![], create_table: false };
+    let args = LoadResultArgs {
+        target_connection_id: q.id.clone(),
+        table: made.table.clone(),
+        mode: Default::default(),
+        key_columns: vec![],
+        create_table: false,
+        confirmed: false,
+    };
     let e = load_result(&st, &made.output.result_id, args, "l2").await.unwrap_err();
     assert!(e.message.contains("read-only"), "{}", e.message);
 }
@@ -774,8 +786,14 @@ async fn test_data_takes_ai_rows_for_text_columns() {
     assert!(data.notes.iter().any(|n| n.starts_with("AI wrote 2 rows for full_name, email")), "{:?}", data.notes);
     assert!(data.notes.iter().any(|n| n.contains("didn't fit")), "{:?}", data.notes);
     let made = super::results::store_test_data(&st, &p.id, &main, "people", spec.rows, data).unwrap();
-    let args =
-        LoadResultArgs { target_connection_id: p.id.clone(), table: made.table.clone(), mode: Default::default(), key_columns: vec![], create_table: false };
+    let args = LoadResultArgs {
+        target_connection_id: p.id.clone(),
+        table: made.table.clone(),
+        mode: Default::default(),
+        key_columns: vec![],
+        create_table: false,
+        confirmed: false,
+    };
     load_result(&st, &made.output.result_id, args, "ai-load").await.unwrap();
     let s = st.engine.session_for_tests(&p.id).await.unwrap();
     let rows = databrain_connector_core::query_text(
@@ -808,8 +826,14 @@ async fn test_data_takes_ai_rows_for_text_columns() {
     let data = st.engine.generate_test_data(&p.id, &main, "people", &patterned).await.unwrap();
     let made = super::results::store_test_data(&st, &p.id, &main, "people", patterned.rows, data).unwrap();
     exec(&st, &p.id, "delete from people").await;
-    let args =
-        LoadResultArgs { target_connection_id: p.id.clone(), table: made.table.clone(), mode: Default::default(), key_columns: vec![], create_table: false };
+    let args = LoadResultArgs {
+        target_connection_id: p.id.clone(),
+        table: made.table.clone(),
+        mode: Default::default(),
+        key_columns: vec![],
+        create_table: false,
+        confirmed: false,
+    };
     load_result(&st, &made.output.result_id, args, "pattern-load").await.unwrap();
     let rows = databrain_connector_core::query_text(
         &*s,

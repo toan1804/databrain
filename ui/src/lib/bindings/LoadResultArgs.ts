@@ -4,4 +4,8 @@ import type { LoadMode } from "./LoadMode";
 /**
  * Where and how to load a result's rows ("Load into…" on the grid).
  */
-export type LoadResultArgs = { target_connection_id: string, table: string, mode: LoadMode, key_columns: Array<string>, create_table: boolean, };
+export type LoadResultArgs = { target_connection_id: string, table: string, mode: LoadMode, key_columns: Array<string>, create_table: boolean, 
+/**
+ * The user confirmed writing into a production connection.
+ */
+confirmed: boolean, };

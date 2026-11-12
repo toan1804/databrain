@@ -362,7 +362,7 @@ impl ToolContext {
                 o.handle,
                 if self.allowed_result(&o.result_id) { " [in this conversation]" } else { "" },
                 o.rows,
-                if o.truncated { " (capped at the row limit — incomplete)" } else { "" },
+                if o.truncated { " (capped at the row limit or memory — incomplete)" } else { "" },
                 o.connection_name,
                 cols.join(", "),
                 trunc(&o.sql.replace('\n', " "), 300)
@@ -540,7 +540,9 @@ impl ToolContext {
             );
             text.push('\n');
         }
-        self.engine.results().remove(&r.id);
+        if self.engine.outputs().release_result(&r.id) {
+            self.engine.outputs_changed();
+        }
         self.audit("get_sample_rows", args, "allowed", None);
         Ok(out(text, json!({"table": t})))
     }

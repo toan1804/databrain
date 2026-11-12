@@ -9,7 +9,7 @@ import { api, onLoadProgress, toError } from "../lib/api";
 import type { LoadDryRun, LoadMode, LoadReport, ResultInfo } from "../lib/types";
 import { formatCount, uid } from "../lib/util";
 import { useStore } from "../store";
-import { DryRunReport, LoadTargetCheck, isKeyedMode, loadModesFor, loadTargetBlocked, useLoadTarget } from "./job/LoadFields";
+import { DryRunReport, LoadTargetCheck, isKeyedMode, loadModesFor, loadResultAsking, loadTargetBlocked, useLoadTarget } from "./job/LoadFields";
 import { Modal } from "./ui";
 
 /** The table generated test data was made for (its output's SQL is `-- Test data for <table> (…)`). */
@@ -64,7 +64,7 @@ export function LoadIntoDialog({
   }, [modes, mode]);
   const keyed = isKeyedMode(mode);
   const hint = modes.find((m) => m.mode === mode)?.hint;
-  const args = { target_connection_id: target, table, mode, key_columns: keyed ? keys : [], create_table: create };
+  const args = { target_connection_id: target, table, mode, key_columns: keyed ? keys : [], create_table: create, confirmed: false };
   const targetCheck = useLoadTarget(target, table);
   const blocked = loadTargetBlocked(targetCheck, mode, create);
   const ready = !!target && !!table.trim() && (!keyed || keys.length > 0) && !blocked;
@@ -92,7 +92,8 @@ export function LoadIntoDialog({
     runId.current = id;
     setRun({ id, done: 0, total: info.total_rows });
     try {
-      const r = await api.loadResult(info.id, args, id);
+      const r = await loadResultAsking(info.id, args, id);
+      if (!r) return;
       setReport(r);
       toast(`Loaded ${formatCount(r.rows)} rows into ${table}`, "success");
     } catch (e) {
