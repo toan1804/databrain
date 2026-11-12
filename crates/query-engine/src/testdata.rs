@@ -275,29 +275,21 @@ impl QueryEngine {
     }
 
     /// The plan from what DataBrain already knows of the table, without
-    /// asking the database: the AI index (columns and foreign keys), else the
-    /// explorer's cached columns. `None` when neither has it. The dialog shows
+    /// asking the database: the newer of the AI index and the explorer cache
+    /// ([`databrain_workspace::Workspace::meta_table`]). `None` when neither has it. The dialog shows
     /// this at once while [`Self::test_data_plan`] checks the table; computed
     /// columns are only known from the DDL, so they show after that check
     /// (generating reads the table again and refuses to fill them).
     pub fn cached_test_data_plan(&self, connection_id: &str, schema: &str, name: &str) -> Result<Option<TestDataPlan>> {
         let kind = self.test_data_kind(connection_id)?;
-        let ws = self.workspace();
-        let indexed = ws
-            .kn_get(connection_id, &format!("{schema}.{name}"))
-            .ok()
-            .flatten()
-            .filter(|o| o.schema.eq_ignore_ascii_case(schema) && o.name.eq_ignore_ascii_case(name) && !o.columns.is_empty());
-        let (columns, fks) = match indexed {
-            // A view or other object: the live check says why it can't be filled.
-            Some(o) if o.kind != "table" => return Ok(None),
-            Some(o) => (o.columns, o.foreign_keys),
-            None => match ws.meta_columns(connection_id, schema, name).ok().flatten() {
-                Some(c) if !c.columns.is_empty() => (c.columns, Vec::new()),
-                _ => return Ok(None),
-            },
+        let Some(t) = self.workspace().meta_table(connection_id, schema, name).ok().flatten() else {
+            return Ok(None);
         };
-        Ok(Some(plan_for(kind, schema, name, &columns, &fks, None).0))
+        // A view or other object, or no columns: the live check says why.
+        if t.columns.is_empty() || t.kind.as_deref().is_some_and(|k| k != "table") {
+            return Ok(None);
+        }
+        Ok(Some(plan_for(kind, schema, name, &t.columns, &t.foreign_keys.unwrap_or_default(), None).0))
     }
 
     /// Make up `spec.rows` rows for a table. Reads the table's largest key

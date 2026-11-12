@@ -377,6 +377,10 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX ai_usage_provider ON ai_usage (provider_id, created_at);
     "#,
+    // v19: foreign keys with a table's cached columns (NULL: not known)
+    r#"
+    ALTER TABLE meta_columns ADD COLUMN fks_json TEXT;
+    "#,
 ];
 
 impl Workspace {

@@ -351,8 +351,9 @@ pub fn complete_columns_local(state: &AppState, id: &str, schema: &str, name: &s
 pub async fn describe(state: &AppState, id: &str, schema: &str, name: &str) -> Result<ObjectDetail> {
     let d = state.engine.describe(id, schema, name).await?;
     if !d.columns.is_empty() {
-        let (ws, id2, s2, n2, cols) = (state.workspace.clone(), id.to_string(), schema.to_string(), name.to_string(), d.columns.clone());
-        state.meta.push_blocking(move || drop(ws.meta_put_columns(&id2, &s2, &n2, &cols)));
+        let (ws, id2, s2, n2, cols, fks) =
+            (state.workspace.clone(), id.to_string(), schema.to_string(), name.to_string(), d.columns.clone(), d.foreign_keys.clone());
+        state.meta.push_blocking(move || drop(ws.meta_put_table(&id2, &s2, &n2, &cols, Some(&fks))));
     }
     Ok(d)
 }

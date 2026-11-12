@@ -647,14 +647,17 @@ async fn test_data_generates_and_loads_sqlite() {
     let cid = plan.columns.iter().find(|c| c.name == "customer_id").unwrap();
     assert!(cid.parent.as_deref().is_some_and(|x| x.contains("customers")), "{cid:?}");
 
-    // Columns the explorer has seen: shown at once, without foreign keys.
+    // A table the explorer has described: shown at once, foreign keys included.
     let d = describe(&st, &p.id, &main, "orders").await.unwrap();
     st.meta.flush().await;
+    assert_eq!(cached_test_data_plan(&st, &p.id, &main, "orders").unwrap(), Some(plan.clone()));
+    // Columns cached without foreign keys (before they were kept): the columns, no keys.
+    st.engine.workspace().meta_put_columns(&p.id, &main, "orders", &d.columns).unwrap();
     let seen = cached_test_data_plan(&st, &p.id, &main, "orders").unwrap().expect("explorer cache");
     let names = |p: &databrain_query_engine::testdata::TestDataPlan| p.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
     assert_eq!(names(&seen), names(&plan));
     assert!(seen.foreign_keys.is_empty());
-    // The AI index has the foreign keys too: the same plan as the database's.
+    // The AI index, read later, has the foreign keys too: the same plan as the database's.
     let indexed = |kind: &str| databrain_workspace::KnObject {
         schema: main.clone(),
         name: "orders".into(),
@@ -945,6 +948,25 @@ async fn lineage_describes_and_checks_sqlite() {
     let r = v.graph.statements[0].range;
     let units: Vec<u16> = sql.encode_utf16().collect();
     assert_eq!(String::from_utf16(&units[r.start..r.end]).unwrap(), "-- é😀\nselect * from orders where d = :day");
+    // A column added since: the schema's refresh marks the cached columns
+    // stale, and the check reads the table again before tracing.
+    exec(&st, &p.id, "alter table orders add column note text").await;
+    let main = list_schemas(&st, &p.id).await.unwrap()[0].name.clone();
+    refresh_schema(&st, &p.id, &main).await.unwrap();
+    flush_explorer_cache(&st).await;
+    assert!(cached_columns(&st, &p.id, &main, "orders").unwrap().unwrap().stale);
+    let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select * from orders", Default::default(), true).await.unwrap();
+    assert_eq!(v.described, vec!["main.orders"], "stale table described again");
+    let res = v
+        .graph
+        .nodes
+        .iter()
+        .find(|n| n.name.starts_with("Result"))
+        .unwrap_or_else(|| panic!("{:?}", v.graph.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()));
+    assert_eq!(res.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["id", "amount", "d", "note"]);
+    // Without the check: the cached (now fresh) columns, nothing described.
+    let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select * from orders", Default::default(), false).await.unwrap();
+    assert!(v.described.is_empty());
     // Offline / no connection: lineage still works, nothing checked.
     let v = lineage(&st, None, ConnectorKind::Sqlite, "select a from t", Default::default(), true).await.unwrap();
     assert_eq!(v.checks[0].status, "skipped");

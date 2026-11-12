@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use databrain_connector_core::{CatalogInfo, ColumnInfo, ConnectionConfig, DbObject, ObjectKind, SchemaInfo, version_key};
+use databrain_connector_core::{CatalogInfo, ColumnInfo, ConnectionConfig, DbObject, ForeignKey, ObjectKind, SchemaInfo, version_key};
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
@@ -35,6 +35,20 @@ pub struct CachedListing {
     /// When it was listed (ms).
     #[ts(as = "f64")]
     pub listed_at: i64,
+}
+
+/// What DataBrain knows of a table without asking the database: the newer
+/// of the explorer cache and the AI index ([`Workspace::meta_table`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CachedTable {
+    /// `table`, `view`… when known (the index, or the explorer's listing).
+    pub kind: Option<String>,
+    pub columns: Vec<ColumnInfo>,
+    /// `None`: not known (cached before foreign keys were kept, or from a
+    /// source without them); `Some(empty)`: the table has none.
+    pub foreign_keys: Option<Vec<ForeignKey>>,
+    /// The table changed since (or may have): use it, but read it again.
+    pub stale: bool,
 }
 
 /// Cached columns of a table; `stale` = its definition changed since (or
@@ -478,13 +492,64 @@ impl Workspace {
 
     /// Columns of a table (from a describe).
     pub fn meta_put_columns(&self, connection_id: &str, schema: &str, table: &str, columns: &[ColumnInfo]) -> Result<()> {
+        self.meta_put_table(connection_id, schema, table, columns, None)
+    }
+
+    /// A table as described by the server: columns, and its foreign keys
+    /// when the caller has them (`None` records them as not known).
+    pub fn meta_put_table(&self, connection_id: &str, schema: &str, table: &str, columns: &[ColumnInfo], foreign_keys: Option<&[ForeignKey]>) -> Result<()> {
+        let fks = foreign_keys.map(|f| serde_json::to_string(f).unwrap_or_else(|_| "[]".into()));
         let c = self.conn.lock();
         c.execute(
-            "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at) VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, seen_at = excluded.seen_at, stale = 0",
-            params![connection_id, schema, table, serde_json::to_string(columns).unwrap_or_else(|_| "[]".into()), now_ms()],
+            "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, seen_at = excluded.seen_at, \
+             fks_json = excluded.fks_json, stale = 0",
+            params![connection_id, schema, table, serde_json::to_string(columns).unwrap_or_else(|_| "[]".into()), now_ms(), fks],
         )?;
         Ok(())
+    }
+
+    /// A table as DataBrain knows it without asking the server (exact schema
+    /// id, any-case name): the explorer's cached describe or the AI index,
+    /// whichever was read from the server last. Foreign keys the newer one
+    /// doesn't know come from the other. `stale` when the explorer saw the
+    /// table's schema change since (the index can't tell).
+    pub fn meta_table(&self, connection_id: &str, schema: &str, name: &str) -> Result<Option<CachedTable>> {
+        type Seen = (String, Option<String>, bool, i64, Option<String>);
+        let c = self.conn.lock();
+        let seen: Option<Seen> = c
+            .query_row(
+                "SELECT m.columns_json, m.fks_json, m.stale, m.seen_at, \
+                   (SELECT o.kind FROM meta_objects o WHERE o.connection_id = m.connection_id AND o.schema_name = m.schema_name \
+                      AND o.name = m.table_name ORDER BY o.kind = 'table' DESC LIMIT 1) \
+                 FROM meta_columns m WHERE m.connection_id = ?1 AND m.schema_name = ?2 AND lower(m.table_name) = lower(?3)",
+                params![connection_id, schema, name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let indexed: Option<(String, String, String, i64)> = c
+            .query_row(
+                "SELECT kind, columns_json, fks_json, indexed_at FROM kn_objects WHERE connection_id = ?1 AND schema_name = ?2 AND lower(name) = lower(?3)",
+                params![connection_id, schema, name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        drop(c);
+        let cols = |j: &str| serde_json::from_str::<Vec<ColumnInfo>>(j).unwrap_or_default();
+        let fks = |j: &str| serde_json::from_str::<Vec<ForeignKey>>(j).ok();
+        Ok(match (seen, indexed) {
+            (None, None) => None,
+            (Some((c, f, stale, _, kind)), None) => Some(CachedTable { kind, columns: cols(&c), foreign_keys: f.as_deref().and_then(fks), stale }),
+            (None, Some((kind, c, f, _))) => Some(CachedTable { kind: Some(kind), columns: cols(&c), foreign_keys: fks(&f), stale: false }),
+            (Some((mc, mf, stale, seen_at, mkind)), Some((kind, kc, kf, indexed_at))) => {
+                let (mine, theirs) = (mf.as_deref().and_then(fks), fks(&kf));
+                Some(if seen_at >= indexed_at {
+                    CachedTable { kind: mkind.or(Some(kind)), columns: cols(&mc), foreign_keys: mine.or(theirs), stale }
+                } else {
+                    CachedTable { kind: Some(kind), columns: cols(&kc), foreign_keys: theirs.or(mine), stale }
+                })
+            }
+        })
     }
 
     /// Cached columns of a table (exact schema and name).
@@ -737,6 +802,52 @@ mod tests {
         // Completion only offers relations.
         ws.meta_put_schema("c", "s", &[o("s", "b", ObjectKind::Table), o("s", "q", ObjectKind::Sequence)]).unwrap();
         assert_eq!(ws.kn_complete("c", None, "", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_table_is_known_from_the_newer_of_the_explorer_and_the_index() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let col = |n: &str| ColumnInfo { name: n.into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None };
+        let fk = ForeignKey { columns: vec!["cust".into()], ref_schema: "s".into(), ref_table: "customers".into(), ref_columns: vec!["id".into()] };
+        let age = |sql: &str| ws.conn.lock().execute(sql, []).unwrap();
+        assert!(ws.meta_table("c", "s", "orders").unwrap().is_none());
+
+        // The explorer described it, foreign keys included.
+        ws.meta_put_table("c", "s", "orders", &[col("id"), col("cust")], Some(std::slice::from_ref(&fk))).unwrap();
+        let t = ws.meta_table("c", "s", "ORDERS").unwrap().unwrap();
+        assert_eq!((t.columns.len(), t.foreign_keys.clone(), t.stale), (2, Some(vec![fk.clone()]), false));
+        // Columns cached without them: not known (not "none").
+        ws.meta_put_columns("c", "s", "orders", &[col("id"), col("cust")]).unwrap();
+        assert_eq!(ws.meta_table("c", "s", "orders").unwrap().unwrap().foreign_keys, None);
+
+        // An index run after it: the index's columns, and its foreign keys.
+        age("UPDATE meta_columns SET seen_at = 1");
+        let indexed = |cols: Vec<ColumnInfo>, fks: Vec<ForeignKey>| crate::KnObject {
+            schema: "s".into(),
+            name: "orders".into(),
+            kind: "table".into(),
+            comment: None,
+            row_estimate: None,
+            columns: cols,
+            foreign_keys: fks,
+        };
+        ws.kn_upsert_objects("c", &[indexed(vec![col("id"), col("cust"), col("added")], vec![fk.clone()])]).unwrap();
+        let t = ws.meta_table("c", "s", "orders").unwrap().unwrap();
+        assert_eq!(t.columns.len(), 3, "the newer read wins");
+        assert_eq!((t.kind.as_deref(), t.foreign_keys), (Some("table"), Some(vec![fk.clone()])));
+        assert_eq!(ws.kn_column_names("c", "s", "orders").unwrap().unwrap(), vec!["id", "cust", "added"]);
+
+        // The explorer described it after the index: its columns win again,
+        // and keys it doesn't know come from the index.
+        age("UPDATE kn_objects SET indexed_at = 1");
+        ws.meta_put_columns("c", "s", "orders", &[col("id")]).unwrap();
+        let t = ws.meta_table("c", "s", "orders").unwrap().unwrap();
+        assert_eq!((t.columns.len(), t.foreign_keys), (1, Some(vec![fk])));
+        assert_eq!(ws.kn_column_names("c", "s", "orders").unwrap().unwrap(), vec!["id"], "not the older index");
+
+        // The schema changed since: still shown, marked stale.
+        age("UPDATE meta_columns SET stale = 1");
+        assert!(ws.meta_table("c", "s", "orders").unwrap().unwrap().stale);
     }
 
     #[test]

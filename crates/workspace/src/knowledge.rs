@@ -685,24 +685,10 @@ impl Workspace {
         Ok(rows)
     }
 
-    /// Column names of a table (exact schema id): knowledge index, else the metadata cache.
+    /// Column names of a table (exact schema id): the newer of the knowledge
+    /// index and the explorer cache ([`Self::meta_table`]).
     pub fn kn_column_names(&self, connection_id: &str, schema: &str, name: &str) -> Result<Option<Vec<String>>> {
-        if let Some(cols) = self.kn_indexed_column_names(connection_id, schema, name)? {
-            return Ok(Some(cols));
-        }
-        self.meta_column_names(connection_id, schema, name)
-    }
-
-    fn kn_indexed_column_names(&self, connection_id: &str, schema: &str, name: &str) -> Result<Option<Vec<String>>> {
-        let c = self.conn.lock();
-        let json: Option<String> = c
-            .query_row(
-                "SELECT columns_json FROM kn_objects WHERE connection_id = ?1 AND schema_name = ?2 AND lower(name) = lower(?3)",
-                params![connection_id, schema, name],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(json.map(|j| serde_json::from_str::<Vec<ColumnInfo>>(&j).unwrap_or_default().into_iter().map(|c| c.name).collect()))
+        Ok(self.meta_table(connection_id, schema, name)?.map(|t| t.columns.into_iter().map(|c| c.name).collect()))
     }
 
     /// Look up an object by `schema.name` or bare `name` (case-insensitive).

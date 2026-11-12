@@ -94,6 +94,31 @@ pub async fn lineage(
     if let (Some(id), true) = (connection_id, check) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Tables whose cached columns may be out of date (their schema changed
+        // since): read again first. Without `check`, or if that fails, the
+        // cached columns are used as they are.
+        let mut tables: Vec<String> = graph.nodes.iter().filter(|n| n.kind == databrain_lineage::NodeKind::Table && !n.view).map(|n| n.name.clone()).collect();
+        tables.sort();
+        tables.dedup();
+        let mut refreshed = false;
+        for t in tables.into_iter().take(20) {
+            let Some((schema, name)) = ws.meta_get(id, &t).ok().flatten() else { continue };
+            if !ws.meta_table(id, &schema, &name).ok().flatten().is_some_and(|c| c.stale) {
+                continue;
+            }
+            match tokio::time::timeout_at(deadline, describe(state, id, &schema, &name)).await {
+                Ok(Ok(d)) if !d.columns.is_empty() => {
+                    described.push(format!("{schema}.{name}"));
+                    refreshed = true;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        if refreshed {
+            state.meta.flush().await;
+            graph = databrain_lineage::analyze(&masked, kind, &cat(conn.clone(), &views));
+        }
         // Rounds: describe the tables whose columns aren't known, then read the
         // definitions of the views among them; a view's definition names more
         // tables (and views), traced in the next round.

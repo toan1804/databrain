@@ -18,7 +18,7 @@ Main files:
    - `meta_catalogs`: catalogs of three-level engines, with `schemas_at` when that catalog's schema list is complete.
    - `meta_schemas`: schema list (`pos`; `pos = 1000000000` marks a schema seen only through a search hit), plus `listed_at` (a complete table listing exists) and `listed_fp` (the schema fingerprint it was listed at).
    - `meta_objects`: tables, views, routines, sequences per schema, with `version` (from `object_versions`) where the engine has one.
-   - `meta_columns`: `columns_json` per table and a `stale` flag. Only columns: no foreign keys, indexes or DDL.
+   - `meta_columns`: `columns_json` per table, `fks_json` (its foreign keys; NULL when not known, e.g. rows cached before v19 or written by `meta_put_columns`) and a `stale` flag. No indexes or DDL.
    - `meta_conn_state`: `checked_at`, `catalogs_at`, `schemas_at` and `identity` (which server the connection pointed at).
 2. **Zustand store** (`explorerSlice.ts`), for the session: `catalogs`, `catalogSchemas`, `schemas`, `objects` (`conn|schema`), `columns` (`conn|schema|table`) and `explorer[conn]` (`checkedAt`, `checking`, `offline`, `fingerprints`, `deferred`). Once a key is in the store, `loadObjects` and `loadColumns` return it without asking the backend again.
 
@@ -56,7 +56,7 @@ expand table ──► loadColumns
 - **Refresh on a schema** (`loadObjects(conn, schema, true)`): `refresh_schema`, always against the server. In-memory columns of that schema are dropped unless the result is `unchanged`.
 - **Search and completion hits** (`search_objects`, `complete_tables`, `complete_routines`) are added to `meta_objects` (`meta_add_objects`) but never make a schema "listed".
 - **DuckDB `results.main`** (query outputs) is never cached (`cacheable` in `api/explorer.rs`); `runsSlice.ts` reloads it when outputs change.
-- **Offline.** If step 2 fails and a cache exists, the tree stays and `ConnectionNode.tsx` shows the offline badge. While `offline` is set, prefetch, `exploreChosen` and stale-column re-describes are skipped. It is cleared only by the next successful `openExplorer`. Without a cache the error goes to the user.
+- **Offline.** If step 2 fails and a cache exists, the tree stays and `ConnectionNode.tsx` shows the offline badge. While `offline` is set, prefetch, `exploreChosen` and stale-column re-describes are skipped. It is cleared by the next successful `openExplorer`, and by `markOnline` when the server answers anything else: a statement finishes on that connection (`runsSlice.ts`), or a live listing, refresh or describe comes back. `markOnline` then re-runs `openExplorer` to check what changed meanwhile. Without a cache the error goes to the user.
 
 ## Detecting stale entries
 
@@ -84,7 +84,7 @@ expand table ──► loadColumns
 
 - **Schema or catalog gone** from a complete list: `meta_put_schemas` / `meta_put_catalogs` drop its objects and columns.
 - **Table gone** from a listing: its columns are dropped (`columns_changed`).
-- **Connection now points elsewhere** (kind, host, port, database, file, auth, options except session ones, SSH hop): `save_connection` → `meta_check_identity` → `meta_clear`. The connection form also drops the connection's keys from the UI store (`useConnectionForm.tsx` `persist`).
+- **Connection now points elsewhere** (kind, host, port, database, file, auth, options except session ones, SSH hop): `save_connection` → `meta_check_identity` → `meta_clear` and `kn_clear` (the AI index's objects; notes and learned joins stay). The connection form also drops the connection's keys from the UI store (`useConnectionForm.tsx` `persist`).
 - **Connection deleted:** `delete_connection` removes both the explorer cache and the knowledge index.
 - `clear_explorer_cache` exists as a command but the UI does not call it.
 
@@ -92,10 +92,10 @@ expand table ──► loadColumns
 
 | Feature | Reads |
 |---|---|
-| Editor completion (`ui/src/components/sqlAssist.ts`) | the store first; `complete_tables_local` (`kn_complete`: knowledge index UNION `meta_objects`); `complete_columns_local` (`kn_column_names`: index first, else `meta_columns`); `complete_routines_local` (`meta_objects`); then the server |
-| Lineage (`crates/app/src/api/lineage.rs`) | `meta_get` for table names, `kn_column_names` for columns; with "Check with database" it describes up to 20 unknown tables (writing the cache) |
+| Editor completion (`ui/src/components/sqlAssist.ts`) | the store first; `complete_tables_local` (`kn_complete`: knowledge index UNION `meta_objects`); `complete_columns_local` (`kn_column_names` → `meta_table`: the newer of the two); `complete_routines_local` (`meta_objects`); then the server |
+| Lineage (`crates/app/src/api/lineage.rs`) | `meta_get` for table names, `kn_column_names` for columns; with "Check with database" it first describes referenced tables whose cached columns are `stale`, then up to 20 unknown tables (writing the cache) |
 | Grid edits (`crates/query-engine/src/edit.rs`) | `meta_object` and non-stale `meta_columns`, else a describe that it writes back |
-| Test data (`crates/query-engine/src/testdata.rs`) | `cached_test_data_plan`: the index (columns and foreign keys), else `meta_columns` (no foreign keys), shown until the live `test_data_plan` answers |
+| Test data (`crates/query-engine/src/testdata.rs`) | `cached_test_data_plan` → `meta_table` (columns and foreign keys), shown until the live `test_data_plan` answers |
 | AI note targets, `resolve_table` (`crates/ai/src/knowledge.rs`) | `meta_resolve_path`, `meta_get` before the server |
 | ER diagram (`ErTab.tsx` → `schema_tables`) | nothing: always live (`Session::schema_columns`), not cached |
 
@@ -104,7 +104,7 @@ expand table ──► loadColumns
 The knowledge index (`kn_objects` with `columns_json` and `fks_json`, `kn_schema_state` with fingerprints, FTS5 `kn_fts`; `crates/workspace/src/knowledge.rs`, `crates/ai/src/knowledge.rs`) is a separate store with its own fetch path:
 
 - It is filled only when the user (or the AI, with approval) indexes: `index_connection` reads `list_schemas`, `schema_fingerprints` and `bulk_metadata` on its own session (`index_tab`: `__index__` for server databases, the metadata session for local files); `index_tables` describes single tables. Neither writes the explorer cache, and explorer listings and describes never write the index.
-- It has foreign keys; the explorer cache does not.
+- Both keep foreign keys (the explorer cache since v19, from `describe` and grid edits).
 - Its staleness is per schema (`kn_schema_state` fingerprint, checked at the next index run); there is no per-table `stale` flag, and nothing re-checks it between runs.
-- The two meet only in readers: `kn_complete` merges both, `kn_column_names` prefers the index, `cached_test_data_plan` prefers the index, lineage and note targets resolve names in the explorer cache. When both have a table they can disagree; the reader decides which wins.
-- A connection identity change clears the explorer cache but not the index (`meta_check_identity` only calls `meta_clear`).
+- Readers of one table go through `Workspace::meta_table`: the entry read from the server last (`meta_columns.seen_at` vs `kn_objects.indexed_at`) wins, foreign keys it doesn't know come from the other, and `stale` comes from the explorer cache (the index can't tell). `kn_column_names` (completion, lineage, the AI's joins) and `cached_test_data_plan` use it. `kn_complete` still merges both lists of names.
+- A connection identity change clears both.

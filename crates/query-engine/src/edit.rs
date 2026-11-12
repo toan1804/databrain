@@ -380,7 +380,7 @@ impl QueryEngine {
                 // check when saving) needs no round trip.
                 if !d.columns.is_empty() {
                     let _ = ws.meta_add_objects(cid, &[DbObject { schema: schema_id.clone(), ..d.object.clone() }]);
-                    let _ = ws.meta_put_columns(cid, &schema_id, &d.object.name, &d.columns);
+                    let _ = ws.meta_put_table(cid, &schema_id, &d.object.name, &d.columns, Some(&d.foreign_keys));
                 }
                 d
             }

@@ -157,10 +157,12 @@ fn schema_version_guard_and_backup() {
         let c = Connection::open(&path).unwrap();
         c.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64).unwrap();
         // Undo the last migration, as an older version left it.
-        c.execute_batch("DROP TABLE ai_usage").unwrap();
+        c.execute_batch("ALTER TABLE meta_columns DROP COLUMN fks_json").unwrap();
     }
     let ws = Workspace::open(&path).unwrap();
-    assert_eq!(ws.ai_token_totals("any", 0).unwrap(), (0, 0), "migrated");
+    assert!(ws.meta_table("any", "s", "t").unwrap().is_none(), "migrated");
+    ws.meta_put_columns("any", "s", "t", &[]).unwrap();
+    assert_eq!(ws.meta_table("any", "s", "t").unwrap().unwrap().foreign_keys, None, "rows from before: keys not known");
     let backup = dir.join(format!("workspace.db.bak-before-v{}", MIGRATIONS.len()));
     let b = Connection::open(&backup).unwrap();
     let bv: i64 = b.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();

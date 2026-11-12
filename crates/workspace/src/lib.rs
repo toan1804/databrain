@@ -30,7 +30,7 @@ pub use knowledge::{
     ImportAction, ImportItem, ImportKind, IndexDelta, KnHit, KnNote, KnObject, KnState, NoteEntry, NoteStatus, NotesFile, NotesSource, join_target,
     split_target, target_mentions,
 };
-pub use meta_cache::{CachedColumns, CachedListing, ExplorerCacheState};
+pub use meta_cache::{CachedColumns, CachedListing, CachedTable, ExplorerCacheState};
 pub use notebooks::{CellKind, CellRunSummary, Notebook, NotebookCell, NotebookSummary};
 pub use outputs::OutputRecord;
 pub use params::ParamSet;
