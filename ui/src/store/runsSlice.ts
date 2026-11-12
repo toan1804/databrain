@@ -381,6 +381,10 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
             serverMs: e.server_ms ?? statements[e.index]?.serverMs,
           });
           if (e.result) next.activeIndex = e.index;
+          if (run.connectionId) {
+            const id = run.connectionId;
+            setTimeout(() => get().markOnline(id), 0);
+          }
           break;
         case "statement_failed": {
           const cancelled = e.error.kind === "cancelled";

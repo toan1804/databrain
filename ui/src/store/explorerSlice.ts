@@ -5,7 +5,11 @@ import type { CatalogInfo, ColumnInfo, DbObject, SchemaInfo } from "../lib/types
 import { chosenSchemaIds } from "./helpers";
 import type { ExplorerStatus, State } from "./types";
 
-/** Schema loads in flight (dedupes clicks, prefetch and completion). */
+/**
+ * Schema loads in flight (dedupes clicks, prefetch and completion). Keys
+ * start with the operation (`list|`, `refresh|`…): calls that answer with
+ * different shapes never share one.
+ */
 const inflight = new Map<string, Promise<unknown>>();
 function once<T>(key: string, f: () => Promise<T>): Promise<T> {
   const have = inflight.get(key) as Promise<T> | undefined;
@@ -63,6 +67,11 @@ export interface ExplorerSlice {
    */
   exploreChosen: (connId: string) => Promise<void>;
   loadColumns: (connId: string, schema: string, name: string) => Promise<ColumnInfo[]>;
+  /**
+   * The server answered (a query finished, a live listing came back): an
+   * explorer shown offline from its cache checks it again.
+   */
+  markOnline: (connId: string) => void;
 }
 
 export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (set, get) => ({
@@ -298,7 +307,8 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
     const put = (objs: DbObject[]) => set((s) => ({ objects: { ...s.objects, [key]: objs } }));
     if (force) {
       // Refresh button: only changed tables are fetched when the engine has versions.
-      const r = await once(`obj|${key}`, () => api.refreshSchema(connId, schema));
+      const r = await once(`refresh|${key}`, () => api.refreshSchema(connId, schema));
+      get().markOnline(connId);
       put(r.objects);
       if (r.mode !== "unchanged") {
         const pre = `${key}|`;
@@ -312,12 +322,13 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
       const ex = get().explorer[connId];
       // Not covered by the fingerprint check (none on this engine, or deferred): check it now.
       if (ex && !ex.offline && (ex.fingerprints === false || ex.deferred?.includes(schema)))
-        void once(`obj|${key}`, () => api.refreshSchema(connId, schema))
+        void once(`refresh|${key}`, () => api.refreshSchema(connId, schema))
           .then((r) => r.mode !== "unchanged" && put(r.objects))
           .catch(() => {});
       return cached.objects;
     }
-    const objs = await once(`obj|${key}`, () => api.listObjects(connId, schema));
+    const objs = await once(`list|${key}`, () => api.listObjects(connId, schema));
+    get().markOnline(connId);
     put(objs);
     return objs;
   },
@@ -326,7 +337,8 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
     const have = get().columns[key];
     if (have) return have;
     const put = (cols: ColumnInfo[]) => set((s) => ({ columns: { ...s.columns, [key]: cols } }));
-    const live = () => once(`col|${key}`, () => api.describeObject(connId, schema, name)).then((d) => (put(d.columns), d.columns));
+    const live = () =>
+      once(`col|${key}`, () => api.describeObject(connId, schema, name)).then((d) => (get().markOnline(connId), put(d.columns), d.columns));
     const cached = await api.cachedColumns(connId, schema, name).catch(() => null);
     if (cached) {
       put(cached.columns);
@@ -335,5 +347,13 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
       return cached.columns;
     }
     return live();
+  },
+  markOnline: (connId) => {
+    if (!get().explorer[connId]?.offline) return;
+    set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], offline: null } } }));
+    // What changed while it was away: checked as on connect.
+    void get()
+      .openExplorer(connId)
+      .catch(() => {});
   },
 });

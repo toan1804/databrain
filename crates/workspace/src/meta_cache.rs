@@ -453,7 +453,9 @@ impl Workspace {
         Ok(s)
     }
 
-    /// Clear the cache when the connection now points at another server/user.
+    /// Clear the cache when the connection now points at another server/user,
+    /// and the AI's index of its objects with it (they describe the old
+    /// server; notes and learned joins are the user's and stay).
     pub fn meta_check_identity(&self, connection_id: &str, cfg: &ConnectionConfig) -> Result<()> {
         let id = identity(cfg);
         let old: Option<Option<String>> =
@@ -462,7 +464,10 @@ impl Workspace {
             Some(o) if o == id => return Ok(()),
             // Cached before identities were recorded: assume it is the same server.
             None => {}
-            Some(_) => self.meta_clear(connection_id)?,
+            Some(_) => {
+                self.meta_clear(connection_id)?;
+                self.kn_clear(connection_id)?;
+            }
         }
         self.conn.lock().execute(
             "INSERT INTO meta_conn_state (connection_id, identity) VALUES (?1, ?2) ON CONFLICT (connection_id) DO UPDATE SET identity = excluded.identity",
@@ -741,6 +746,27 @@ mod tests {
         let mut cfg = ConnectionConfig::new(databrain_connector_core::ConnectorKind::Postgres, AuthMethod::Password { user: "u".into() });
         cfg.host = Some("db1".into());
         ws.meta_check_identity("c", &cfg).unwrap();
+        let indexed = crate::KnObject {
+            schema: "s".into(),
+            name: "t".into(),
+            kind: "table".into(),
+            comment: None,
+            row_estimate: None,
+            columns: vec![],
+            foreign_keys: vec![],
+        };
+        ws.kn_upsert_objects("c", std::slice::from_ref(&indexed)).unwrap();
+        let note = crate::KnNote {
+            id: String::new(),
+            connection_id: "c".into(),
+            target: Some("s.t".into()),
+            body: "t holds test rows".into(),
+            author: "me".into(),
+            status: crate::NoteStatus::Approved,
+            created_at: 0,
+            replaces: None,
+        };
+        ws.kn_save_note(note).unwrap();
         ws.meta_put_schemas("c", None, &[sch("s", None)]).unwrap();
         ws.meta_put_schema("c", "s", &[o("s", "t", ObjectKind::Table)]).unwrap();
         cfg.read_only = true;
@@ -750,11 +776,16 @@ mod tests {
         cfg.options.insert("idle_disconnect_minutes".into(), "0".into());
         ws.meta_check_identity("c", &cfg).unwrap();
         assert!(ws.meta_listing("c", "s").unwrap().is_some(), "session settings don't change the server");
+        assert_eq!(ws.kn_count("c").unwrap(), 1, "the index stays for the same server");
         cfg.host = Some("db2".into());
         ws.meta_check_identity("c", &cfg).unwrap();
         assert!(ws.meta_listing("c", "s").unwrap().is_none());
         assert!(ws.meta_schemas("c", None).unwrap().is_none());
         assert_eq!(ws.meta_count("c").unwrap(), 0);
+        // The AI index described the old server too; the user's notes stay.
+        assert_eq!(ws.kn_count("c").unwrap(), 0);
+        assert!(ws.kn_get("c", "s.t").unwrap().is_none());
+        assert_eq!(ws.kn_notes("c").unwrap().len(), 1);
     }
 
     impl Workspace {

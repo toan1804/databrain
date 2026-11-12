@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Explorer: pointing a connection at another server (host, database, user…) now also forgets the AI's index of the old server's tables (your notes stay), so completion, lineage and the AI no longer offer tables that aren't there. Clicking a schema's Refresh while it is still loading no longer shows it empty. An explorer shown offline checks the server again as soon as a query on that connection succeeds, without a Refresh click.
 - Generate test data: "Generate values with AI" and "Suggest patterns with AI" work with Kiro. With only Kiro set up, the dialog said "Add an AI provider" although one was there. Each batch is one prompt to kiro-cli with no tools offered, so it is slower than a model provider.
 - Generate test data opens at once: the columns come from the AI index or the explorer's cache while the table is checked with the database in the background (it used to wait for the column read and the DDL, slow on big catalogs). Your ticks are kept when the check updates the list; if the database can't be reached, the dialog says the columns are as last known.
 - SSH tunnels: russh updated to 0.65.1 (RUSTSEC-2026-0495). The advisory is in russh's SSH agent server, which DataBrain doesn't use (it only talks to your agent as a client), so this is housekeeping that keeps the dependency audit green.

@@ -112,6 +112,43 @@ describe("explorer cache", () => {
     expect(useStore.getState().objects["c|main.sales"].map((o) => o.name)).toEqual(["orders", "new_one"]);
   });
 
+  it("an explorer shown offline checks again once the server answers a query", async () => {
+    cache = {
+      catalogs: [{ name: "main", is_default: true }],
+      schemas: null,
+      catalog_schemas: { main: [sch("main", "sales", true)] },
+      state: { checked_at: 1, catalogs_at: 1, schemas_at: null, listed_schemas: 1 },
+    };
+    cachedListings["main.sales"] = [t("main.sales", "orders")];
+    useStore.setState({ treeOpen: { "s|c|main.sales": true } });
+    online = false;
+    await useStore.getState().openExplorer("c");
+    expect(useStore.getState().explorer.c.offline).toMatch(/refused/);
+    // The network is back and a query finished: no Refresh click needed.
+    online = true;
+    calls.length = 0;
+    useStore.getState().markOnline("c");
+    expect(useStore.getState().explorer.c.offline).toBeNull();
+    await settle();
+    expect(calls).toContain("revalidate:main.sales");
+    expect(useStore.getState().objects["c|main.sales"].map((o) => o.name)).toEqual(["orders", "new_one"]);
+    // Online already: nothing more is asked.
+    calls.length = 0;
+    useStore.getState().markOnline("c");
+    await settle();
+    expect(calls).toEqual([]);
+  });
+
+  it("Refresh while a schema's first listing runs gets the refresh's answer, not the listing's", async () => {
+    const first = useStore.getState().loadObjects("c", "main.hr");
+    const refreshed = await useStore.getState().loadObjects("c", "main.hr", true);
+    await first;
+    expect(refreshed.map((o) => o.name)).toEqual(["orders", "new_one"]);
+    // Both ran: neither was handed the other's answer (a listing is an array, a refresh is not).
+    expect([...calls].sort()).toEqual(["listObjects:main.hr", "refreshSchema:main.hr"]);
+    expect(useStore.getState().objects["c|main.hr"]?.length).toBeGreaterThan(0);
+  });
+
   it("throws when there is neither a cache nor a server", async () => {
     online = false;
     await expect(useStore.getState().openExplorer("c")).rejects.toThrow(/refused/);
