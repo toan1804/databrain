@@ -146,6 +146,7 @@ impl Workspace {
         };
         Self::columns_changed(&tx, connection_id, schema, &changed, &names)?;
         Self::mark_listed(&tx, connection_id, schema, fingerprint)?;
+        Self::ai_refresh_tx(&tx, connection_id, Some(schema))?;
         tx.commit()?;
         Ok(())
     }
@@ -190,6 +191,7 @@ impl Workspace {
         let changed: Vec<&str> = upserts.iter().map(|o| o.name.as_str()).collect();
         Self::columns_changed(&tx, connection_id, schema, &changed, &names.iter().map(String::as_str).collect())?;
         Self::mark_listed(&tx, connection_id, schema, fingerprint)?;
+        Self::ai_refresh_tx(&tx, connection_id, Some(schema))?;
         tx.commit()?;
         Ok(())
     }
@@ -230,6 +232,10 @@ impl Workspace {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         Self::meta_insert(&tx, connection_id, objects, None)?;
+        let schemas: HashSet<&str> = objects.iter().map(|o| o.schema.as_str()).collect();
+        for s in schemas {
+            Self::ai_refresh_tx(&tx, connection_id, Some(s))?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -316,6 +322,8 @@ impl Workspace {
         for t in ["meta_objects", "meta_columns", "meta_schemas"] {
             tx.execute(&format!("DELETE FROM {t} WHERE connection_id = ?1 AND schema_name = ?2"), params![connection_id, schema])?;
         }
+        // Nothing left there for the AI either.
+        Self::ai_refresh_tx(tx, connection_id, Some(schema))?;
         Ok(())
     }
 
@@ -510,13 +518,17 @@ impl Workspace {
     /// when the caller has them (`None` records them as not known).
     pub fn meta_put_table(&self, connection_id: &str, schema: &str, table: &str, columns: &[ColumnInfo], foreign_keys: Option<&[ForeignKey]>) -> Result<()> {
         let fks = foreign_keys.map(|f| serde_json::to_string(f).unwrap_or_else(|_| "[]".into()));
-        let c = self.conn.lock();
-        c.execute(
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute(
             "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, seen_at = excluded.seen_at, \
              fks_json = excluded.fks_json, stale = 0",
             params![connection_id, schema, table, serde_json::to_string(columns).unwrap_or_else(|_| "[]".into()), now_ms(), fks],
         )?;
+        // The AI's search row of the table, when it may use it.
+        Self::ai_refresh_table_tx(&tx, connection_id, schema, table)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -681,6 +693,9 @@ impl Workspace {
         c.execute("DELETE FROM meta_schemas WHERE connection_id = ?1", [connection_id])?;
         c.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [connection_id])?;
         c.execute("UPDATE meta_conn_state SET catalogs_at = NULL, schemas_at = NULL, checked_at = NULL WHERE connection_id = ?1", [connection_id])?;
+        // The tables the AI could use are gone with them (its scope stays).
+        c.execute("DELETE FROM ai_tables WHERE connection_id = ?1", [connection_id])?;
+        c.execute("DELETE FROM kn_fts WHERE connection_id = ?1 AND source = 'object'", [connection_id])?;
         Ok(())
     }
 }

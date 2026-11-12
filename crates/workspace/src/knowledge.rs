@@ -45,7 +45,7 @@ impl KnObject {
     }
 
     /// Text indexed for search: names (also split on `_`), comments, columns.
-    fn search_body(&self) -> String {
+    pub(crate) fn search_body(&self) -> String {
         let mut out = String::new();
         let push_ident = |out: &mut String, s: &str| {
             out.push_str(s);
@@ -399,7 +399,9 @@ const STOPWORDS: &[&str] = &[
 
 impl Workspace {
     /// Replace the indexed objects of one schema. Unchanged objects (same
-    /// content hash) are skipped.
+    /// content hash) are skipped. The facts also go to the explorer cache,
+    /// the one store the AI reads (`ai_objects`); its search rows follow
+    /// from there.
     pub fn kn_replace_schema(&self, connection_id: &str, schema: &str, objects: &[KnObject]) -> Result<IndexDelta> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
@@ -410,28 +412,27 @@ impl Workspace {
         let now = now_ms();
         let mut delta = IndexDelta::default();
         let keep: HashSet<&str> = objects.iter().map(|o| o.name.as_str()).collect();
-        // Search rows to drop: removed and changed objects. Deleted in one
-        // statement at the end: a `ref = ?` delete scans the whole FTS table,
-        // so one per object made big schemas quadratic (and held the
-        // workspace lock, stalling the app).
-        let mut stale_refs: Vec<String> = Vec::new();
         for name in existing.keys().filter(|n| !keep.contains(n.as_str())) {
             tx.execute("DELETE FROM kn_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3", params![connection_id, schema, name])?;
-            stale_refs.push(format!("{schema}.{name}"));
+            // A re-read of the schema without it: it is gone from the server
+            // (an empty list only takes the schema out of the index).
+            if !objects.is_empty() {
+                tx.execute(
+                    "DELETE FROM meta_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3 \
+                       AND kind IN ('table', 'view', 'materialized_view', 'foreign_table')",
+                    params![connection_id, schema, name],
+                )?;
+                tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1 AND schema_name = ?2 AND table_name = ?3", params![connection_id, schema, name])?;
+            }
             delta.removed += 1;
         }
-        let mut fresh: Vec<&KnObject> = Vec::new();
         for o in objects {
+            Self::meta_put_known_tx(&tx, connection_id, o, now)?;
             let hash = o.hash();
-            match existing.get(&o.name) {
-                Some(h) if *h == hash => {
-                    delta.unchanged += 1;
-                    continue;
-                }
-                Some(_) => stale_refs.push(o.full_name()),
-                None => {}
+            if existing.get(&o.name).is_some_and(|h| *h == hash) {
+                delta.unchanged += 1;
+                continue;
             }
-            fresh.push(o);
             tx.prepare_cached(
                 "INSERT INTO kn_objects (connection_id, schema_name, name, kind, comment, row_estimate, columns_json, fks_json, content_hash, indexed_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
@@ -453,20 +454,32 @@ impl Workspace {
             ])?;
             delta.changed += 1;
         }
-        if !stale_refs.is_empty() {
-            tx.execute(
-                "DELETE FROM kn_fts WHERE rowid IN (SELECT rowid FROM kn_fts WHERE connection_id = ?1 AND source = 'object' AND ref IN (SELECT value FROM json_each(?2)))",
-                params![connection_id, serde_json::to_string(&stale_refs)?],
-            )?;
+        // Indexing a schema lets the AI use it (step 1 of the metadata
+        // store: the Knowledge page's scope controls replace this later).
+        if !objects.is_empty() {
+            Self::put_rule(&tx, connection_id, &crate::ScopeRule { schema: schema.to_string(), table: String::new(), allow: true })?;
         }
-        {
-            let mut ins = tx.prepare_cached("INSERT INTO kn_fts (connection_id, source, ref, title, body) VALUES (?1, 'object', ?2, ?3, ?4)")?;
-            for o in fresh {
-                ins.execute(params![connection_id, o.full_name(), o.name, o.search_body()])?;
-            }
-        }
+        Self::ai_refresh_tx(&tx, connection_id, Some(schema))?;
         tx.commit()?;
         Ok(delta)
+    }
+
+    /// An indexed object's facts into the explorer cache: the object, and
+    /// its columns and foreign keys as read now.
+    fn meta_put_known_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str, o: &KnObject, now: i64) -> Result<()> {
+        tx.prepare_cached(
+            "INSERT INTO meta_objects (connection_id, schema_name, name, kind, comment, row_estimate, seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT (connection_id, schema_name, kind, name) DO UPDATE SET comment = excluded.comment, \
+             row_estimate = coalesce(excluded.row_estimate, row_estimate), seen_at = excluded.seen_at",
+        )?
+        .execute(params![connection_id, o.schema, o.name, o.kind, o.comment, o.row_estimate, now])?;
+        tx.prepare_cached(
+            "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, \
+             seen_at = excluded.seen_at, fks_json = excluded.fks_json, stale = 0",
+        )?
+        .execute(params![connection_id, o.schema, o.name, serde_json::to_string(&o.columns)?, now, serde_json::to_string(&o.foreign_keys)?])?;
+        Ok(())
     }
 
     /// Indexed foreign keys that reference `table` (any schema of the
@@ -500,6 +513,7 @@ impl Workspace {
         let now = now_ms();
         let mut changed = 0;
         for o in objects {
+            Self::meta_put_known_tx(&tx, connection_id, o, now)?;
             let hash = o.hash();
             let old: Option<String> = tx
                 .query_row(
@@ -530,15 +544,15 @@ impl Workspace {
                     now
                 ],
             )?;
-            tx.execute(
-                "DELETE FROM kn_fts WHERE rowid IN (SELECT rowid FROM kn_fts WHERE connection_id = ?1 AND source = 'object' AND ref = ?2)",
-                params![connection_id, o.full_name()],
-            )?;
-            tx.execute(
-                "INSERT INTO kn_fts (connection_id, source, ref, title, body) VALUES (?1, 'object', ?2, ?3, ?4)",
-                params![connection_id, o.full_name(), o.name, o.search_body()],
-            )?;
             changed += 1;
+        }
+        // Indexing a table lets the AI use it.
+        for o in objects {
+            Self::put_rule(&tx, connection_id, &crate::ScopeRule { schema: o.schema.clone(), table: o.name.clone(), allow: true })?;
+        }
+        let schemas: HashSet<&str> = objects.iter().map(|o| o.schema.as_str()).collect();
+        for s in schemas {
+            Self::ai_refresh_tx(&tx, connection_id, Some(s))?;
         }
         tx.commit()?;
         Ok(changed)
@@ -574,8 +588,13 @@ impl Workspace {
             stmt.query_map([connection_id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut removed = 0;
-        for s in current.iter().filter(|s| !schemas.contains(s)) {
+        let gone: Vec<String> = current.iter().filter(|s| !schemas.contains(s)).cloned().collect();
+        for s in &gone {
             removed += self.kn_replace_schema(connection_id, s, &[])?.removed;
+        }
+        // Out of the index: out of the AI's scope.
+        if !gone.is_empty() {
+            self.ai_remove_schemas(connection_id, &gone)?;
         }
         self.conn.lock().execute(
             "DELETE FROM kn_schema_state WHERE connection_id = ?1 AND schema_name NOT IN (SELECT value FROM json_each(?2))",

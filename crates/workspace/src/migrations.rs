@@ -381,6 +381,52 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE meta_columns ADD COLUMN fks_json TEXT;
     "#,
+    // v20: one metadata store; the AI uses only what the user's scope allows
+    // (see docs/design/metadata-store.md). ai_tables is built after this
+    // (Workspace::build_ai_tables), from the rules and the explorer cache.
+    r#"
+    CREATE TABLE ai_scope (
+        connection_id TEXT NOT NULL,
+        schema_rule   TEXT NOT NULL,
+        table_name    TEXT NOT NULL DEFAULT '',
+        allow         INTEGER NOT NULL,
+        PRIMARY KEY (connection_id, schema_rule, table_name)
+    );
+    CREATE TABLE ai_tables (
+        connection_id TEXT NOT NULL,
+        schema_name   TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        PRIMARY KEY (connection_id, schema_name, name)
+    );
+    CREATE VIEW ai_objects AS
+        SELECT o.connection_id, o.schema_name, o.name, o.kind, o.comment, o.row_estimate,
+               c.columns_json, c.fks_json, c.seen_at AS described_at, c.stale
+        FROM ai_tables a
+        JOIN meta_objects o ON o.connection_id = a.connection_id AND o.schema_name = a.schema_name AND o.name = a.name
+            AND o.kind IN ('table', 'view', 'materialized_view', 'foreign_table')
+        LEFT JOIN meta_columns c ON c.connection_id = a.connection_id AND c.schema_name = a.schema_name AND c.table_name = a.name;
+    -- The scope: the schemas chosen for indexing, and every schema indexed
+    -- today, so the AI keeps seeing what it sees.
+    INSERT OR IGNORE INTO ai_scope (connection_id, schema_rule, table_name, allow)
+        SELECT c.id, trim(j.value), '', 1 FROM connections c,
+            json_each(coalesce(json_extract(c.ai_policy_json, '$.index_schemas'), '[]')) j
+        WHERE trim(j.value) <> '';
+    INSERT OR IGNORE INTO ai_scope (connection_id, schema_rule, table_name, allow)
+        SELECT DISTINCT connection_id, schema_name, '', 1 FROM kn_objects;
+    -- The facts: what the index knows that the explorer cache doesn't, or
+    -- knows from longer ago.
+    INSERT INTO meta_objects (connection_id, schema_name, name, kind, comment, row_estimate, seen_at)
+        SELECT k.connection_id, k.schema_name, k.name, k.kind, k.comment, k.row_estimate, k.indexed_at FROM kn_objects k
+        WHERE NOT EXISTS (SELECT 1 FROM meta_objects m WHERE m.connection_id = k.connection_id
+            AND m.schema_name = k.schema_name AND m.name = k.name);
+    INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json)
+        SELECT connection_id, schema_name, name, columns_json, indexed_at, fks_json FROM kn_objects WHERE true
+        ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json,
+            seen_at = excluded.seen_at, fks_json = excluded.fks_json
+        WHERE excluded.seen_at > meta_columns.seen_at;
+    -- Object search rows are rebuilt from ai_objects.
+    DELETE FROM kn_fts WHERE source = 'object';
+    "#,
 ];
 
 impl Workspace {

@@ -156,13 +156,20 @@ fn schema_version_guard_and_backup() {
     {
         let c = Connection::open(&path).unwrap();
         c.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64).unwrap();
-        // Undo the last migration, as an older version left it.
-        c.execute_batch("ALTER TABLE meta_columns DROP COLUMN fks_json").unwrap();
+        // Undo the last migration, as an older version left it, with a
+        // table indexed for the AI.
+        c.execute_batch(
+            "DROP VIEW ai_objects; DROP TABLE ai_scope; DROP TABLE ai_tables; DELETE FROM maintenance WHERE name = 'ai_tables_v20'; \
+             INSERT INTO kn_objects (connection_id, schema_name, name, kind, comment, row_estimate, columns_json, fks_json, content_hash, indexed_at) \
+             VALUES ('c', 's', 'orders', 'table', NULL, NULL, '[{\"name\":\"id\",\"data_type\":\"int\",\"nullable\":false,\"is_primary_key\":true}]', '[]', 'h', 1)",
+        )
+        .unwrap();
     }
     let ws = Workspace::open(&path).unwrap();
-    assert!(ws.meta_table("any", "s", "t").unwrap().is_none(), "migrated");
-    ws.meta_put_columns("any", "s", "t", &[]).unwrap();
-    assert_eq!(ws.meta_table("any", "s", "t").unwrap().unwrap().foreign_keys, None, "rows from before: keys not known");
+    // Migrated: the table is in the explorer cache, and the AI still sees it.
+    assert_eq!(ws.meta_table("c", "s", "orders").unwrap().unwrap().columns.len(), 1);
+    assert_eq!(ws.ai_catalog("c").get("s.orders").unwrap().map(|o| o.columns.len()), Some(1));
+    assert_eq!(ws.ai_catalog("c").search("orders", 5).unwrap().len(), 1);
     let backup = dir.join(format!("workspace.db.bak-before-v{}", MIGRATIONS.len()));
     let b = Connection::open(&backup).unwrap();
     let bv: i64 = b.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();

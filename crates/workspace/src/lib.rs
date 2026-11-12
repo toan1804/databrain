@@ -6,6 +6,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod ai;
+pub mod ai_scope;
 mod connections;
 mod history;
 pub mod jobs;
@@ -22,6 +23,7 @@ mod tabs_settings;
 mod tests;
 
 pub use ai::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry};
+pub use ai_scope::{AiCatalog, ScopeRule, scope_allows};
 pub use jobs::{
     FileFormat, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, JobSummary, LoadMode, NodeRunRecord, NodeRunSummary, RunLogEntry, ScheduleMode,
     StepOwner, StepProgress,
@@ -119,6 +121,7 @@ impl Workspace {
         let _ = ws.redact_kept_sql();
         let _ = ws.redact_kept_transcripts();
         let _ = ws.mark_ai_written_jobs();
+        ws.build_ai_tables()?;
         Ok(ws)
     }
 }
