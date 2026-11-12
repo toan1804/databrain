@@ -1359,14 +1359,14 @@ fn type_limits(kind: ConnectorKind, raw: &str) -> Limits {
         "decimal64" => digits(18, a0.unwrap_or(0)),
         "decimal128" => digits(38, a0.unwrap_or(0)),
         "decimal256" => digits(76, a0.unwrap_or(0)),
-        "numeric" | "decimal" | "dec" | "number" | "bignumeric" | "bigdecimal" | "newdecimal" => match a0 {
+        "numeric" | "decimal" | "dec" | "number" | "bignumeric" | "bigdecimal" | "newdecimal" => match (a0, negative_scale(&t)) {
             // Oracle NUMBER(10,-2): 10 digits, rounded to hundreds.
-            Some(p) if let Some(k) = negative_scale(&t) => {
+            (Some(p), Some(k)) => {
                 let m = 10i128.checked_pow(p.clamp(1, 1000)).zip(10i128.checked_pow(k)).and_then(|(a, b)| (a - 1).checked_mul(b)).unwrap_or(i128::MAX);
                 Limits::Ints(-m, m)
             }
-            Some(p) => digits(p, a1.unwrap_or(0)),
-            None => Limits::Any,
+            (Some(p), None) => digits(p, a1.unwrap_or(0)),
+            (None, _) => Limits::Any,
         },
         "date" if kind == Mysql => days((1000, 1, 1), (9999, 12, 31)),
         "date" if ch => days((1970, 1, 1), (2149, 6, 6)),
