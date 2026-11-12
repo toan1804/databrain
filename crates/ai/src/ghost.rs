@@ -136,7 +136,9 @@ pub async fn complete(ws: &Workspace, secrets: Arc<dyn SecretStore>, req: &Ghost
         let mut text = String::new();
         // Providers report usage after Done: read to the end.
         while let Some(ev) = stream.next().await {
-            match ev? {
+            // An error from the provider ends the call: what it reported counts, no estimate.
+            let ev = ev.inspect_err(|_| meter.finished())?;
+            match ev {
                 ChatEvent::TextDelta(t) => {
                     meter.text(&t);
                     if text.len() <= 2_000 {

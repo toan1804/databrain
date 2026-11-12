@@ -454,8 +454,48 @@ fn names_acting_function(sql: &str) -> bool {
 /// (sqlparser reads it as columns and aliases). Also inside a string: a
 /// read is never claimed when unsure.
 fn next_value_for(sql: &str) -> bool {
-    let w: Vec<&str> = words(sql).collect();
+    // Comments between the words (`next /* c */ value for s`) don't split them.
+    let text = without_comments(sql);
+    let w: Vec<&str> = words(&text).collect();
     w.windows(3).any(|w| w[0].eq_ignore_ascii_case("next") && w[1].eq_ignore_ascii_case("value") && w[2].eq_ignore_ascii_case("for"))
+}
+
+/// `sql` with `-- …` and `/* … */` comments (nested too) replaced by a space.
+/// Comment markers inside strings are taken as comments as well: this only
+/// looks for words that act, so taking out too much text is never needed.
+fn without_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    loop {
+        let next = [rest.find("--"), rest.find("/*")].into_iter().flatten().min();
+        let Some(i) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..i]);
+        out.push(' ');
+        if rest[i..].starts_with("--") {
+            rest = rest[i..].find('\n').map_or("", |n| &rest[i + n..]);
+        } else {
+            // Nested block comments (Postgres, SQL Server).
+            let (mut depth, mut j, b) = (0usize, i, rest.as_bytes());
+            while j + 1 < b.len() {
+                if &b[j..j + 2] == b"/*" {
+                    depth += 1;
+                    j += 2;
+                } else if &b[j..j + 2] == b"*/" {
+                    depth -= 1;
+                    j += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            rest = if depth == 0 { &rest[j..] } else { "" };
+        }
+    }
 }
 
 fn contains_dml_word(sql: &str) -> bool {
@@ -567,7 +607,14 @@ mod tests {
             assert!(!crate::sql::read_only_allows(sql, &c), "{sql}");
         }
         // SQL Server's `NEXT VALUE FOR` (Other, or Unknown where it doesn't parse).
-        for sql in ["select next value for dbo.orders_seq", "SELECT NEXT VALUE FOR orders_seq AS id", "select next value for s, x from t"] {
+        for sql in [
+            "select next value for dbo.orders_seq",
+            "SELECT NEXT VALUE FOR orders_seq AS id",
+            "select next value for s, x from t",
+            "select next -- c\n value for s",
+            "select next /* c */ value /* d /* nested */ e */ for s",
+            "select next\n\tvalue\r\nfor [dbo].[s]",
+        ] {
             let c = classify(sql, Mssql);
             assert!(matches!(c.kind, StatementKind::Other | StatementKind::Unknown), "{sql}: {:?}", c.kind);
             assert!(!crate::sql::read_only_allows(sql, &c), "{sql}");
@@ -586,6 +633,8 @@ mod tests {
             (Oracle, "select orders_seq.currval from dual"),
             (Oracle, "select t.nextval_at from t"),
             (Mssql, "select next_value, value from t"),
+            (Mssql, "select [next], [value] from t -- for now"),
+            (Mssql, "select next_value /* value for */ from t"),
             (Postgres, "select terminate from t"),
             (Postgres, "select pg_terminate_backend from t"),
             (Snowflake, "select system$clustering_information('t')"),

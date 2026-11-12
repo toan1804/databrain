@@ -52,7 +52,8 @@ impl Meter {
     }
 
     /// Input and output tokens: as reported, else (for a call cut off after
-    /// it was sent) estimated.
+    /// it was sent: cancelled or timed out, not one the provider ended with
+    /// an error) estimated.
     pub fn tokens(&self) -> (u32, u32) {
         let s = self.state();
         match s.reported {

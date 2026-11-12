@@ -741,21 +741,37 @@ fn parse_ts(s: &str) -> Option<i64> {
 }
 
 /// A date-time and its UTC offset in seconds (0 when it has none). The
-/// offset is a sign then `hh`, `hh:mm` or `hhmm` after the time.
+/// offset is a sign then `hh`, `hh:mm`, `hhmm` or `hh:mm:ss` (Postgres
+/// prints old local mean times so: `+07:06:40`) after the time.
 fn split_offset(s: &str) -> (&str, i64) {
     let Some(p) = s.get(10..).and_then(|t| t.rfind(['+', '-'])).map(|p| p + 10) else { return (s, 0) };
-    let digits: String = s[p + 1..].chars().filter(|c| *c != ':').collect();
-    let (h, m) = match digits.len() {
-        2 => (&digits[..], "0"),
-        4 => (&digits[..2], &digits[2..]),
+    let tail = &s[p + 1..];
+    if !tail.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+        return (s, 0);
+    }
+    let d: Vec<i64> = tail.bytes().filter(u8::is_ascii_digit).map(|b| i64::from(b - b'0')).collect();
+    let two = |i: usize| d[i] * 10 + d[i + 1];
+    let (h, m, sec) = match d.len() {
+        2 => (two(0), 0, 0),
+        4 => (two(0), two(2), 0),
+        6 => (two(0), two(2), two(4)),
         _ => return (s, 0),
     };
-    match (h.parse::<i64>(), m.parse::<i64>()) {
-        (Ok(h), Ok(m)) if digits.bytes().all(|b| b.is_ascii_digit()) && h <= 18 && m < 60 => {
-            let sign = if s.as_bytes()[p] == b'-' { -1 } else { 1 };
-            (&s[..p], sign * (h * 3600 + m * 60))
-        }
-        _ => (s, 0),
+    if h > 18 || m >= 60 || sec >= 60 {
+        return (s, 0);
+    }
+    let sign = if s.as_bytes()[p] == b'-' { -1 } else { 1 };
+    (&s[..p], sign * (h * 3600 + m * 60 + sec))
+}
+
+/// A date-time for a column without a time zone: as written, with no
+/// offset (or a zero one) only; one with another offset doesn't fit.
+fn parse_naive_ts(s: &str) -> Option<i64> {
+    let t = s.trim().trim_end_matches('Z');
+    let t = t.strip_suffix(" UTC").unwrap_or(t);
+    match split_offset(t) {
+        (local, 0) => parse_datetime(local.trim_end()),
+        _ => None,
     }
 }
 
@@ -1634,7 +1650,7 @@ fn cell_value(t: ColType, s: &str) -> Value {
         ColType::UInt64 => s.parse().ok().map(Value::UInt),
         ColType::Float64 => s.parse().ok().map(Value::Float),
         ColType::Date => parse_date(s).map(Value::Date),
-        ColType::Timestamp => tz(s).map(Value::Timestamp),
+        ColType::Timestamp => parse_naive_ts(s).map(Value::Timestamp),
         ColType::TimestampTz => tz(s).map(Value::TimestampTz),
         ColType::Time => parse_time(s).map(Value::Time),
         ColType::Binary => None,
@@ -2736,6 +2752,17 @@ mod tests {
         assert_eq!(parse_ts("2024-05-01 10:00:00.5+07"), Some(utc + 500_000));
         assert_eq!(parse_ts("2024-05-01"), parse_ts("2024-05-01 00:00:00"));
         assert_eq!(parse_ts("2024-05-01 10:00:00+7x"), None);
+        // Not an offset, or not ASCII: read as is (no panic).
+        for s in ["2024-05-01 10:00:00+1é1", "2024-05-01 10:00:00+é", "2024-05-01 10:00:00+12:3é", "2024-05-01 10:00:00-ééé"] {
+            assert_eq!(parse_ts(s), None, "{s}");
+            assert_eq!(cell_value(ColType::TimestampTz, s), Value::Null);
+        }
+        // Postgres local mean time: an offset with seconds.
+        assert_eq!(parse_ts("1890-01-01 00:00:00+07:06:40"), parse_ts("1889-12-31 16:53:20"));
+        // A column without a time zone takes no shifted value.
+        assert_eq!(cell_value(ColType::Timestamp, "2024-05-01 03:00:00"), Value::Timestamp(utc));
+        assert_eq!(cell_value(ColType::Timestamp, "2024-05-01 03:00:00+00:00"), Value::Timestamp(utc));
+        assert_eq!(cell_value(ColType::Timestamp, "2024-05-01 10:00:00+07"), Value::Null);
         // Keys continue after the largest, offset or not; a timestamptz
         // parent key keeps its moment.
         let g = Gen::TimestampTz;

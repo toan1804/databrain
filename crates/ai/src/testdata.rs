@@ -105,7 +105,9 @@ async fn ask_model(provider: &Arc<dyn crate::providers::LlmProvider>, chat: Chat
         meter.sent(&chat);
         let mut text = String::new();
         while let Some(ev) = stream.next().await {
-            match ev? {
+            // An error from the provider ends the call: what it reported counts, no estimate.
+            let ev = ev.inspect_err(|_| meter.finished())?;
+            match ev {
                 ChatEvent::TextDelta(t) => {
                     meter.text(&t);
                     text.push_str(&t);

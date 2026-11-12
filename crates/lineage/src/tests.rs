@@ -519,6 +519,7 @@ fn clauses_that_name_columns_without_a_value_flowing_mark_them_used() {
             view_sql: Some(sql.into()),
         };
         match name.as_str() {
+            "v_win" => Some(v("create view v_win as select name, rank() over w r from customers window w as (order by country)", &["name", "r"])),
             "v_sorted" => Some(v("create view v_sorted as select id, name from customers order by country", &["id", "name"])),
             "v_grouped" => Some(v(
                 "create view v_grouped as select country, count(*) n from orders o join customers c on c.id = o.customer_id group by status, country",
@@ -527,6 +528,8 @@ fn clauses_that_name_columns_without_a_value_flowing_mark_them_used() {
             _ => cat(parts),
         }
     };
+    let g = analyze("select name from v_win", K::Postgres, &views);
+    assert_eq!(used(&g, "sales.customers"), vec!["name"], "a window inside a view: only what the read column needs");
     let g = analyze("select name from v_sorted", K::Postgres, &views);
     assert_eq!(used(&g, "sales.customers"), vec!["name"]);
     let g = analyze("select n from v_grouped", K::Postgres, &views);
@@ -547,6 +550,11 @@ fn columns_list_the_statements_that_use_them() {
     let g = run("insert into customers (name) select status from orders; select name from customers");
     let o = g.nodes.iter().find(|n| n.name == "sales.orders").unwrap();
     assert_eq!(o.columns.iter().find(|x| x.name == "status").unwrap().used_by, vec![0, 1]);
+    // A view the script creates uses its tables' columns in its own statement.
+    let g = run("create view v as select name from customers where country = 'VN'; select id from orders");
+    let c = g.nodes.iter().find(|n| n.name == "sales.customers").unwrap();
+    assert_eq!(c.columns.iter().find(|x| x.name == "name").unwrap().used_by, vec![0]);
+    assert_eq!(c.columns.iter().find(|x| x.name == "country").unwrap().used_by, vec![0]);
     // One statement: no list.
     let g = run("select name from customers");
     assert!(g.nodes.iter().flat_map(|n| &n.columns).all(|c| c.used_by.is_empty()));

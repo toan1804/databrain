@@ -266,18 +266,19 @@ pub fn redact_url_passwords(text: &str) -> String {
                 let scope = cut.map_or(after, |q| &after[..q]);
                 scope.rfind('@').map(|a| colon + 1 + a)
             }
-            // `u:pa ss@h`: a password with a space in it, up to the next `@`
-            // on the line (the last `@` of that word), not into another URL.
-            // `u:pa)ss@h`, `'…://u:pa'ss@h/db'`: the URL stopped at a quote
-            // or bracket in the password; it runs to the last `@` of the word.
-            None if !port && rest[token..].starts_with(stop) && {
-                let word = rest[token..].find(char::is_whitespace).map_or(rest.len(), |w| token + w);
-                !rest[token..word].contains("://") && rest[token..word].contains('@')
+            // `u:pa)ss@h`, `'…://u:pa'ss@h/db'`, `u:1234)x@h`: the URL stopped
+            // at a quote or bracket inside the password (a letter or digit
+            // follows it, not a separator such as `','b@c'`); it runs to the
+            // last `@` of the word.
+            None if (!port || tail.is_empty()) && in_password(&rest[token..]) && {
+                let w = word(&rest[token..]);
+                !w.contains("://") && w.contains('@')
             } =>
             {
-                let word = rest[token..].find(char::is_whitespace).map_or(rest.len(), |w| token + w);
-                rest[token..word].rfind('@').map(|a| token + a)
+                word(&rest[token..]).rfind('@').map(|a| token + a)
             }
+            // `u:pa ss@h`: a password with a space in it, up to the next `@`
+            // on the line (the last `@` of that word), not into another URL.
             None if !port => {
                 let line = rest.find(|c: char| stop(c) || matches!(c, '\n' | '\r')).unwrap_or(rest.len());
                 let more = &rest[token..line];
@@ -285,6 +286,13 @@ pub fn redact_url_passwords(text: &str) -> String {
                     let word = more[a..].find(char::is_whitespace).map_or(more.len(), |w| a + w);
                     more[..word].rfind('@').map(|a| token + a)
                 })
+            }
+            // `u:12345 pass@h/db`: digits, a space, then a word with `@` and
+            // a host and path; `h:8080 bob@x.com` (no path) stays a port.
+            None if tail.is_empty() && rest[token..].starts_with([' ', '\t']) => {
+                let w = word(rest[token..].trim_start_matches([' ', '\t']));
+                let start = rest.len() - rest[token..].trim_start_matches([' ', '\t']).len();
+                w.rfind('@').filter(|&a| !w.contains("://") && w[a..].contains('/')).map(|a| start + a)
             }
             None => None,
         };
@@ -296,6 +304,20 @@ pub fn redact_url_passwords(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Text up to the next whitespace.
+fn word(s: &str) -> &str {
+    &s[..s.find(char::is_whitespace).unwrap_or(s.len())]
+}
+
+/// `s` starts with a quote or bracket that sits inside a password: a letter,
+/// digit or other password character follows it (not a separator, the end
+/// of the text, or another quote or bracket).
+fn in_password(s: &str) -> bool {
+    let mut c = s.chars();
+    matches!(c.next(), Some('\'' | '"' | '`' | '<' | '>' | '(' | ')'))
+        && c.next().is_some_and(|n| !n.is_whitespace() && !matches!(n, ',' | ';' | ':' | '\'' | '"' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'))
 }
 
 /// The colon after the user name (or host) of a URL without its `scheme://`:
@@ -643,6 +665,10 @@ mod redaction_tests {
             ("ATTACH 'postgres://u:pa'ss@h/db' AS p", "ATTACH 'postgres://u:***@h/db' AS p"),
             ("postgres://u:p\"w@h/db", "postgres://u:***@h/db"),
             ("postgres://u:a<b>c@h/db", "postgres://u:***@h/db"),
+            // …also after digits, and digits then a space then a word with a host and path.
+            ("postgres://u:1234)x@h/db", "postgres://u:***@h/db"),
+            ("postgres://u:1234'x@h/db", "postgres://u:***@h/db"),
+            ("postgres://u:12345 pass@h/db", "postgres://u:***@h/db"),
             (
                 "connect to mongodb+srv://u:p%40ss@cluster0.x.net/?retryWrites=true please",
                 "connect to mongodb+srv://u:***@cluster0.x.net/?retryWrites=true please",
@@ -704,6 +730,11 @@ mod redaction_tests {
             "x://[::1",
             "postgres://h:5432?mail=a@b.com",
             "f('x://u:a', 'b@c')",
+            "f('x://u:a','b@c')",
+            "{\"url\":\"http://svc:abc\",\"owner\":\"me@x.com\"}",
+            "('http://h:8080'),'me@x.com'",
+            "see http://h:8080 bob@x.com",
+            "open http://localhost:3000 then mail me@x.com/notes",
             "('x://u:a') then b://c@d",
         ] {
             assert_eq!(redact_url_passwords(keep), keep);
