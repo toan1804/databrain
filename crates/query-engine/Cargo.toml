@@ -10,12 +10,12 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-databrain-auth = { version = "0.3.4", path = "../auth" }
-databrain-connector-core = { version = "0.3.4", path = "../connector-core" }
-databrain-export = { version = "0.3.4", path = "../export" }
-databrain-result-store = { version = "0.3.4", path = "../result-store" }
-databrain-ssh-tunnel = { version = "0.3.4", path = "../ssh-tunnel" }
-databrain-workspace = { version = "0.3.4", path = "../workspace" }
+databrain-auth = { version = "0.3.5", path = "../auth" }
+databrain-connector-core = { version = "0.3.5", path = "../connector-core" }
+databrain-export = { version = "0.3.5", path = "../export" }
+databrain-result-store = { version = "0.3.5", path = "../result-store" }
+databrain-ssh-tunnel = { version = "0.3.5", path = "../ssh-tunnel" }
+databrain-workspace = { version = "0.3.5", path = "../workspace" }
 parking_lot = "0.12.5"
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -4,6 +4,12 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.3.5 - 2026-11-12
+
+### Added
+
+- In-app updates: from this version on, the update banner installs a new version and restarts DataBrain, instead of linking to the download page (macOS, Windows and the Linux AppImage; `.deb` and `.rpm` installs keep the link). Updates are checked against a signature before they install. Install 0.3.5 itself by hand once; later versions then update in place.
+
 ## 0.3.4 - 2026-11-12
 
 ### Changed
