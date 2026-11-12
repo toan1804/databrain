@@ -59,20 +59,11 @@ Paths are in `crates/query-engine/src/` unless given in full. Items 1, 2 and 5 w
 
 ## Connector core (review of 2026-11-12; see [CONNECTOR_CORE.md](CONNECTOR_CORE.md))
 
-Paths are in `crates/connector-core/src/` unless given in full. From one reading: reproduce with a test before fixing.
+Every finding of the review was fixed on 2026-11-13, with the never-read corpus and the whole-vs-pieces property (`crates/connector-core/tests/classify_corpus.rs`), tri-state `Session::transaction_state` with the unused `Capabilities` fields removed, keyword and positional secrets in redaction, and one scanner for strings and comments (`skip_token`). A `Session::supports(Feature)` enum wasn't added: the optional features already say "not supported" through their own return values (`object_versions` → `None`, `check_sql` → `false`). The redaction functions keep their own, dialect-free lexing on purpose: they scrub any text (history, logs, error messages) without knowing its database.
 
-### Medium
+Ideas still open:
 
-
-### Low
-
-- The redaction functions (`sql/redact.rs`) keep their own, dialect-free lexing on purpose: they scrub any text (history, logs, error messages) without knowing its database. Revisit only with idea 5.
-
-### Ways to fix them (ideas, in the order suggested)
-
-1. **A "must not be a read" corpus per dialect, and a property test** (small; do with the high fixes). One file of statements per kind that must never be `Read`, and a test that classifying a whole text is never weaker than classifying its split pieces. Keeps the fixes above from regressing.
-2. **Reads by allow-list** (fixes high 1–4 and 6 as a class; medium). `Read` only for a parsed query whose functions are all known built-ins; everything else is `Unknown`. Risk: more prompts until the built-in lists are complete per engine.
-3. **Typed execution request** (fixes the multi-statement and bind-before-classify gaps; medium). `execute` takes a statement that can only be built from classified, bound text; multi-statement is off in every driver. Load and plan paths need their own way through.
-4. **A feature enum instead of silent defaults** (small to medium; touches every connector). `Session::supports(Feature)`, a tri-state transaction status, and the unused `Capabilities` fields removed, so a missing implementation is visible instead of meaning "no".
-5. **Redaction by token stream** (medium). A secret keyword, then the next literal, plus a table of functions whose secrets are positional. Risk: over-hiding in saved history.
-6. **One `ParsedStatement`** (large). Span, tokens, AST or parse error, and kind, shared by split, parameters, classify, read-only and `table_refs`: no lexer drift, and binding before classifying can't be skipped. Risk: gaps in the parser's tokenizer become split failures.
+1. **Function allow-list for reads** (medium; a product decision). Unparsed text, hidden statements and the acting-function list are covered; left is treating a SELECT that calls a function outside the built-in list as `Unknown`. Only SQL Server (functions can run extended procedures) and Oracle (autonomous-transaction functions) need it, and there it would refuse many ordinary reads on read-only connections (`regexp_count`, `sys_context`, `dbms_lob.substr`, any user function) until the built-in lists are complete. The AI path already asks about such functions (`unknown_functions`).
+2. **Typed execution request** (medium to large). `Session::execute` taking a statement that can only be built from classified, bound text. Every path that runs user text already binds then classifies (`bind_parameters`; lineage since this change); the type would make that structural, but changes all 13 connectors and every caller, and generated SQL (loads, plans, metadata) needs a way through. `mysql_async` has no switch for multi-statement mode, so that part stays in the classifier (`splits_without_backslash_escapes`).
+3. **Redaction by token stream** (medium). The keyword-then-literal rules and the table of positional secrets cover the known misses; a tokenizer-based rewrite would make new forms easier to add. Risk: over-hiding in saved history.
+4. **One `ParsedStatement`** (large). Span, tokens, AST or parse error, and kind, shared by split, parameters, classify, read-only and `table_refs`. `skip_token` removed the drift between the splitter and the parameter finder; this would also remove the second tokenization by sqlparser. Risk: gaps in the parser's tokenizer become split failures.
