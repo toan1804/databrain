@@ -208,8 +208,8 @@ impl Inner {
             if !b.is_empty() && !tx.send(StreamEvent::Batch(b.finish()?)).await {
                 return Ok(());
             }
-            if b.coercion_failures() > 0 {
-                tx.send(StreamEvent::Notice(format!("{} value(s) could not be converted and are shown as NULL", b.coercion_failures()))).await;
+            for n in b.notices(None) {
+                tx.send(StreamEvent::Notice(n)).await;
             }
         } else if !header.is_empty() {
             return Err(ConnectorError::internal("ClickHouse: the result ended after its column names"));

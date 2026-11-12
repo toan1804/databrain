@@ -100,13 +100,8 @@ impl RowBatcher {
         if !b.builder.is_empty() {
             out.push(StreamEvent::Batch(b.builder.finish()?));
         }
-        let failures = b.builder.coercion_failures();
-        if failures > 0 {
-            out.push(StreamEvent::Notice(format!(
-                "{failures} values didn't match their column's type (inferred from the first {} rows) and are shown as NULL",
-                self.infer_rows
-            )));
-        }
+        let why = format!("types are inferred from the first {} rows", self.infer_rows);
+        out.extend(b.builder.notices(Some(&why)).into_iter().map(StreamEvent::Notice));
         if !self.dropped.is_empty() {
             let names: Vec<&str> = self.dropped.iter().take(20).map(String::as_str).collect();
             out.push(StreamEvent::Notice(format!(

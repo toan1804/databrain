@@ -104,9 +104,8 @@ pub(crate) async fn run(link: Arc<Link>, sql: String, opts: ExecOptions, tx: Str
     if !builder.is_empty() && !tx.send(StreamEvent::Batch(builder.finish()?)).await {
         return Ok(());
     }
-    if builder.coercion_failures() > 0 {
-        tx.send(StreamEvent::Notice(format!("{} value(s) could not be converted (e.g. infinity dates) and are shown as NULL", builder.coercion_failures())))
-            .await;
+    for n in builder.notices(Some("infinity dates")) {
+        tx.send(StreamEvent::Notice(n)).await;
     }
     tx.send(StreamEvent::Done(ExecSummary::default())).await;
     Ok(())

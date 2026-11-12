@@ -55,8 +55,8 @@ pub(crate) fn parse_text(t: ColType, s: &str) -> Value {
         ColType::Int64 => s.parse().map(Value::Int).unwrap_or_else(|_| Value::Text(s.into())),
         ColType::Float64 => s.parse().map(Value::Float).unwrap_or_else(|_| Value::Text(s.into())),
         ColType::Binary => decode_bytea(s).map(Value::Bytes).unwrap_or_else(|| Value::Text(s.into())),
-        ColType::Date => parse_date(s).filter(|_| !s.ends_with("BC")).map(Value::Date).unwrap_or_else(|| Value::Text(s.into())),
-        ColType::Timestamp => parse_datetime(s).filter(|_| !s.ends_with("BC")).map(Value::Timestamp).unwrap_or_else(|| Value::Text(s.into())),
+        ColType::Date => parse_date(s).map(Value::Date).unwrap_or_else(|| Value::Text(s.into())),
+        ColType::Timestamp => parse_datetime(s).map(Value::Timestamp).unwrap_or_else(|| Value::Text(s.into())),
         ColType::TimestampTz => parse_timestamptz(s).map(Value::TimestampTz).unwrap_or_else(|| Value::Text(s.into())),
         ColType::Time => parse_time(s).map(Value::Time).unwrap_or_else(|| Value::Text(s.into())),
         _ => Value::Text(s.to_string()),
@@ -71,21 +71,10 @@ pub(crate) fn decode_bytea(s: &str) -> Option<Vec<u8>> {
     (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect()
 }
 
-/// Parse `YYYY-MM-DD HH:MM:SS[.f]+HH[:MM[:SS]]` into UTC microseconds.
+/// Parse `YYYY-MM-DD HH:MM:SS[.f]+HH[:MM[:SS]][ BC]` into UTC microseconds
+/// ([`parse_datetime`] reads the offset and the era).
 pub(crate) fn parse_timestamptz(s: &str) -> Option<i64> {
-    if s.ends_with("BC") {
-        return None;
-    }
-    let idx = s.char_indices().skip(11).find(|(_, c)| *c == '+' || *c == '-').map(|(i, _)| i)?;
-    let (dt, off) = s.split_at(idx);
-    let local = parse_datetime(dt)?;
-    let sign = if off.starts_with('-') { -1 } else { 1 };
-    let mut parts = off[1..].split(':');
-    let h: i64 = parts.next()?.parse().ok()?;
-    let m: i64 = parts.next().unwrap_or("0").parse().ok()?;
-    let sec: i64 = parts.next().unwrap_or("0").parse().ok()?;
-    let offset_us = sign * ((h * 60 + m) * 60 + sec) * 1_000_000;
-    Some(local - offset_us)
+    parse_datetime(s)
 }
 
 #[cfg(test)]
@@ -98,6 +87,9 @@ mod tests {
         assert_eq!(parse_timestamptz("2024-03-05 13:04:05+07"), Some(base));
         assert_eq!(parse_timestamptz("2024-03-05 00:34:05-05:30"), Some(base));
         assert_eq!(parse_timestamptz("infinity"), None);
+        // Before year 1: read, not NULL.
+        assert_eq!(parse_timestamptz("0044-03-15 12:00:00+00 BC"), parse_datetime("0044-03-15 12:00:00 BC"));
+        assert!(parse_timestamptz("0044-03-15 12:00:00+00 BC").is_some());
     }
     #[test]
     fn parses_text_values() {
@@ -105,6 +97,11 @@ mod tests {
         assert_eq!(parse_text(ColType::Int64, "42"), Value::Int(42));
         assert_eq!(parse_text(ColType::Binary, "\\x00ff"), Value::Bytes(vec![0, 255]));
         assert_eq!(parse_text(ColType::Date, "infinity"), Value::Text("infinity".into()));
+        assert_eq!(
+            parse_text(ColType::Date, "0044-03-15 BC"),
+            Value::Date(i32::try_from(databrain_connector_core::value::days_from_civil(-43, 3, 15)).unwrap())
+        );
+        assert!(matches!(parse_text(ColType::Timestamp, "0044-03-15 12:00:00 BC"), Value::Timestamp(_)));
     }
 
     #[test]

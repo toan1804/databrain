@@ -66,9 +66,6 @@ Paths are in `crates/connector-core/src/` unless given in full. From one reading
 
 ### Low
 
-- `is_string_literal` (`sql/params.rs`) accepts an unterminated literal (`'''`, `'abc''`): the value swallows the SQL after it.
-- `parse_datetime` (`value.rs`) drops an offset after a fraction (`13:04:05.25+02:00`) but rejects one without; used for zoned columns in `crates/connectors/cloud/src/common.rs`.
-- Timestamp builders take `Timestamp` and `TimestampTz` alike; `infinity` and BC text become NULL; `Date → Timestamp` multiplies unchecked; `Int → Float64` is treated as lossless (`value.rs`).
 - The splitter cuts valid SQL (safe, but the statement breaks): Postgres `E'it\'s; x'`, Oracle `q'[it's; x]'`, Snowflake `BEGIN … END;` blocks.
 - Structure: five hand-written lexers (splitter and params, two in redact, `referenced_results`, `changes_default`) beside the parser's; `QueryLanguage::Cql` has no connector; `lib.rs` mixes the traits with quoting and catalog helpers.
 

@@ -112,8 +112,8 @@ pub(crate) async fn run(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSen
     if !builder.is_empty() && !tx.send(StreamEvent::Batch(builder.finish()?)).await {
         return Ok(());
     }
-    if builder.coercion_failures() > 0 {
-        tx.send(StreamEvent::Notice(format!("{} value(s) could not be converted (e.g. zero dates) and are shown as NULL", builder.coercion_failures()))).await;
+    for n in builder.notices(Some("zero dates")) {
+        tx.send(StreamEvent::Notice(n)).await;
     }
     tx.send(StreamEvent::Done(ExecSummary::default())).await;
     Ok(())

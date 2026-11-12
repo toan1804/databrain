@@ -94,8 +94,8 @@ pub(crate) fn run(conn: &Connection, sql: &str, opts: &ExecOptions, tx: &StreamS
     if !b.is_empty() && !tx.blocking_send(Ok(StreamEvent::Batch(b.finish()?))) {
         return Ok(());
     }
-    if b.coercion_failures() > 0 {
-        tx.blocking_send(Ok(StreamEvent::Notice(format!("{} value(s) did not match the column type and are shown as NULL", b.coercion_failures()))));
+    for n in b.notices(None) {
+        tx.blocking_send(Ok(StreamEvent::Notice(n)));
     }
     tx.blocking_send(Ok(StreamEvent::Done(ExecSummary::default())));
     Ok(())
@@ -176,10 +176,8 @@ pub(crate) async fn thin_run(a: &agent::Agent, sql: &str, is_query: bool, opts: 
                     {
                         tx.send(StreamEvent::Batch(b.finish()?)).await;
                     }
-                    if let Some((b, _)) = builder.as_ref()
-                        && b.coercion_failures() > 0
-                    {
-                        tx.send(StreamEvent::Notice(format!("{} value(s) did not match the column type and are shown as NULL", b.coercion_failures()))).await;
+                    for n in builder.as_ref().map(|(b, _)| b.notices(None)).unwrap_or_default() {
+                        tx.send(StreamEvent::Notice(n)).await;
                     }
                     let rows_affected = j["rows_affected"].as_u64();
                     tx.send(StreamEvent::Done(ExecSummary { rows_affected })).await;

@@ -199,7 +199,21 @@ fn is_string_literal(t: &str, kind: ConnectorKind) -> bool {
         Some(b'N' | b'n' | b'E' | b'e') if b.get(1) == Some(&b'\'') => 1,
         _ => return false,
     };
-    b.len() >= start + 2 && skip_quoted(b, start, b'\'', lex(kind).backslash_escapes) == b.len() && b[b.len() - 1] == b'\''
+    // Where the literal closes; never (`'''`, `'abc''`: a doubled quote is
+    // an escaped one) means a value to quote, or the text after the
+    // parameter would end up inside the string.
+    let mut j = start + 1;
+    while j < b.len() {
+        if b[j] == b'\'' {
+            if b.get(j + 1) == Some(&b'\'') {
+                j += 2;
+                continue;
+            }
+            return j + 1 == b.len();
+        }
+        j += 1;
+    }
+    false
 }
 
 /// `'text'` with the dialect's escaping: the one text escaper (parameters,
@@ -288,6 +302,18 @@ mod param_tests {
         // A typed literal is kept unless its end depends on the backslash mode.
         assert_eq!(render_param(&ParamValue { value: "'2026-09-09'".into(), raw: false }, K::Mysql).as_deref(), Some("'2026-09-09'"));
         assert_ne!(render_param(&ParamValue { value: "'x\\' or 1=1 --'".into(), raw: false }, K::Mysql).as_deref(), Some("'x\\' or 1=1 --'"));
+        // Unterminated literals are values to quote, not literals to keep:
+        // kept as typed, they would swallow the SQL after the parameter.
+        for v in ["'''", "'abc''", "'a'' or 1=1", "''''x"] {
+            for k in [K::Postgres, K::Mssql, K::Oracle] {
+                let r = render_param(&ParamValue { value: v.into(), raw: false }, k).unwrap();
+                assert_ne!(r, v, "{k:?}: {v}");
+                assert!(r.starts_with('\'') && r.ends_with('\''), "{k:?}: {v} → {r}");
+            }
+        }
+        // Complete ones are kept.
+        assert_eq!(render_param(&ParamValue { value: "'it''s'".into(), raw: false }, K::Postgres).as_deref(), Some("'it''s'"));
+        assert_eq!(render_param(&ParamValue { value: "''".into(), raw: false }, K::Postgres).as_deref(), Some("''"));
     }
 
     fn names(sql: &str, k: K) -> Vec<String> {

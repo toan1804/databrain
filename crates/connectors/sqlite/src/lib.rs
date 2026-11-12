@@ -245,8 +245,8 @@ fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &St
     if !builder.is_empty() && !tx.blocking_send(Ok(StreamEvent::Batch(builder.finish()?))) {
         return Ok(());
     }
-    if builder.coercion_failures() > 0 {
-        tx.blocking_send(Ok(StreamEvent::Notice(format!("{} value(s) did not match the column type and are shown as NULL", builder.coercion_failures()))));
+    for n in builder.notices(None) {
+        tx.blocking_send(Ok(StreamEvent::Notice(n)));
     }
     tx.blocking_send(Ok(StreamEvent::Done(ExecSummary::default())));
     Ok(())

@@ -164,8 +164,8 @@ impl<'a> RowSink<'a> {
         if !self.builder.is_empty() && !self.tx.send(StreamEvent::Batch(self.builder.finish()?)).await {
             return Ok(());
         }
-        if self.builder.coercion_failures() > 0 {
-            self.tx.send(StreamEvent::Notice(format!("{} value(s) could not be converted and are shown as NULL", self.builder.coercion_failures()))).await;
+        for n in self.builder.notices(None) {
+            self.tx.send(StreamEvent::Notice(n)).await;
         }
         Ok(())
     }
