@@ -103,6 +103,9 @@ pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &St
                 if rows >= max {
                     // The caller keeps no more rows.
                     let last = if b.is_empty() { None } else { Some(b.finish()?) };
+                    if b.coercion_failures() > 0 {
+                        tx.send(StreamEvent::Notice(format!("{} value(s) did not match the column type and are shown as NULL", b.coercion_failures()))).await;
+                    }
                     if replaceable {
                         return Ok(Ended::Stopped { last, unread: true });
                     }
@@ -122,6 +125,11 @@ pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &St
         && !tx.send(StreamEvent::Batch(b.finish()?)).await
     {
         return Ok(Ended::Complete);
+    }
+    if let Some(b) = builder.as_ref()
+        && b.coercion_failures() > 0
+    {
+        tx.send(StreamEvent::Notice(format!("{} value(s) did not match the column type and are shown as NULL", b.coercion_failures()))).await;
     }
     if extra_sets > 0 {
         tx.send(StreamEvent::Notice(format!("{extra_sets} additional result set(s) not shown"))).await;

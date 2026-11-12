@@ -63,7 +63,6 @@ Paths are in `crates/connector-core/src/` unless given in full. From one reading
 
 ### Medium
 
-- **Values that fail to convert show as NULL without a notice on SQL Server and Oracle**: `BatchBuilder` (`value.rs`) only counts them, and those connectors never read the count.
 
 ### Low
 

@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- SQL Server and Oracle: values that don't fit their column's type still show as NULL, but the result now says how many, as the other databases do.
 - Transactions on DuckDB and Snowflake: a transaction you open with `BEGIN` is now seen, so the session isn't closed when idle or on the explorer's Refresh (which lost the uncommitted work), the Commit/Rollback badge shows, and manual commit is offered on those connections.
 - Passwords and keys kept out of history, job logs and the AI audit in more places: `SET PASSWORD FOR …`, the old password in `ALTER USER … REPLACE`, `IDENTIFIED BY VALUES`, unquoted passwords with `#` or `$`, Redshift `SECRET_ACCESS_KEY`, Snowflake `SECRET_STRING`, DuckDB `BEARER_TOKEN` and `ENCRYPTION_KEY`, `AccountKey=` in connection strings, and secrets passed by position to ClickHouse `s3`, `mysql`, `postgresql`, `remote`, `azureBlobStorage` and SQL Server `sp_addlinkedsrvlogin`, `sp_addlogin`, `sp_password`, `sp_setapprole`.
 - Safety: MySQL text with a backslash before a quote that would split into more statements on a server running `NO_BACKSLASH_ESCAPES` is asked about instead of taken for a read. Lineage's "Check with database" checks the statement with its parameter values filled in, so a raw value can't add a statement to the EXPLAIN. Neo4j: `INSERT` counts as a write and `TERMINATE TRANSACTIONS` as an admin statement.
