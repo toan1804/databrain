@@ -223,7 +223,7 @@ Sources: `ui/src/lib/sourceTraits.json` (language, levels, explain, formatter, l
 
 When you add or change a connector:
 
-1. Read this file, then `crates/connector-core/src/traits.rs` and the connector closest to the new one.
+1. Read this file, then [CONNECTOR_CORE.md](CONNECTOR_CORE.md) (what each `Session` default and each SQL stage means), `crates/connector-core/src/traits.rs` and the connector closest to the new one.
 2. Make a plan that goes through every part of [section 3](#3-feature-by-feature) and every row of [section 4](#4-lists-kept-by-hand), and decide for each: supported, not supported (and how that shows), or partial. Show that plan to the user before writing code, with the features that won't be supported.
 3. Prefer a `SourceTraits` field over a new `match` on `ConnectorKind`.
 4. Never mark something a read to make a feature work. When unsure, the classifier returns `Unknown`.

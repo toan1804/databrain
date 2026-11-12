@@ -137,6 +137,7 @@ pub trait Session: Send + Sync {
 - `QueryStream` yields `StreamEvent`s: `Schema`, `Batch`, `Notice`, a "downloading" marker for warehouses that hand results out in chunks, and a summary.
 - Credentials are fetched from the `CredentialSource` right before connecting. Connectors don't keep them.
 - The optional methods let large catalogs stay fast: fingerprints tell which cached schemas changed, `object_versions` lets a schema refresh table by table, and the `search_*` methods filter on the server so completion never lists a whole schema.
+- Each trait method and its default, the value and stream contract and the SQL pipeline (split, parameters, classify, read-only, redact): [CONNECTOR_CORE.md](CONNECTOR_CORE.md).
 
 ### 5.2 Source traits: what a database type is like
 
