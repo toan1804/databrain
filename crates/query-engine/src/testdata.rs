@@ -71,6 +71,9 @@ pub struct TestDataColumn {
     /// The database fills it (identity, auto-increment, sequence or UUID
     /// default, computed column): left out unless asked for.
     pub database_fills: bool,
+    /// Computed by the database (an expression, `rowversion`): an INSERT
+    /// naming it fails, so it can't be filled at all.
+    pub computed: bool,
     /// What goes in, in words ("emails", "numbers counting up").
     pub generator: String,
     /// Free text (names, emails, descriptions): what "Generate with AI"
@@ -239,9 +242,12 @@ fn fill_words(c: &TestDataColumn, chosen: bool) -> &'static str {
 }
 
 impl Prepared {
-    /// Position in `chosen` of the counting key column.
+    /// Position in `chosen` of the counting key column: of a primary key of
+    /// several columns, the first that isn't a foreign key (`order_id,
+    /// line_no` counts `line_no`, so every row's key differs).
     fn key(&self) -> Option<usize> {
-        self.chosen.iter().position(|&i| self.plan.columns[i].primary_key)
+        let pk = |own: bool| self.chosen.iter().position(|&i| self.plan.columns[i].primary_key && (!own || self.plan.columns[i].parent.is_none()));
+        pk(true).or_else(|| pk(false))
     }
 
     /// Positions in `chosen` the AI writes: text only, or every column it may.
@@ -377,6 +383,9 @@ impl QueryEngine {
         let (plan, mut gens) = plan_for(kind, schema, name, &detail.columns, &detail.foreign_keys, ddl.as_deref());
         let skip: HashSet<String> = spec.skip.iter().map(|s| s.to_lowercase()).collect();
         let fill: HashSet<String> = spec.fill.iter().map(|s| s.to_lowercase()).collect();
+        if let Some(c) = plan.columns.iter().find(|c| c.computed && fill.contains(&c.name.to_lowercase())) {
+            return Err(EngineError::new("invalid", format!("{} is computed by the database: it can't be filled. Untick it.", c.name)));
+        }
         let chosen: Vec<usize> = plan
             .columns
             .iter()
@@ -399,6 +408,11 @@ impl QueryEngine {
                     keys.push(key);
                 }
             }
+        }
+        // A primary key of several columns is a unique key of several columns too.
+        let pk: Vec<String> = detail.columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.to_lowercase()).collect();
+        if pk.len() > 1 && !keys.contains(&pk) {
+            keys.push(pk);
         }
         let unique = keys.iter().filter(|k| k.len() == 1).flatten().cloned().collect();
         let unique_groups = keys.into_iter().filter(|k| k.len() > 1).collect();
@@ -519,7 +533,9 @@ impl QueryEngine {
                 let c = &plan.columns[i];
                 let Some(col) = sample.columns.iter().position(|n| n.eq_ignore_ascii_case(&c.name)) else { continue };
                 if let Source::Random(g) = &sources[k] {
-                    sources[k] = Source::Sample { col, fallback: g.clone(), unique: c.primary_key || unique.contains(&c.name.to_lowercase()) };
+                    // A column of a primary key of several columns needn't be unique alone.
+                    let own_key = c.primary_key && plan.columns.iter().filter(|c| c.primary_key).count() == 1;
+                    sources[k] = Source::Sample { col, fallback: g.clone(), unique: own_key || unique.contains(&c.name.to_lowercase()) };
                     used.push(c.name.clone());
                 }
             }
@@ -542,6 +558,16 @@ impl QueryEngine {
             .filter_map(|key| key.iter().map(|c| chosen.iter().position(|&i| plan.columns[i].name.to_lowercase() == *c)).collect::<Option<Vec<usize>>>())
             .filter(|g| g.iter().any(|&k| made_up(&sources[k]).is_some()))
             .collect();
+        // A primary key of foreign keys only (`user_id, role_id`): nothing
+        // made up can tell repeated pairs apart.
+        let pk: Vec<usize> = (0..chosen.len()).filter(|&k| plan.columns[chosen[k]].primary_key).collect();
+        if pk.len() > 1 && pk.iter().all(|&k| matches!(sources[k], Source::Parent { .. })) {
+            let names: Vec<&str> = pk.iter().map(|&k| plan.columns[chosen[k]].name.as_str()).collect();
+            notes.push(format!(
+                "The primary key ({}) is all foreign keys: rows may repeat a combination, and the load refuses repeats. Make fewer rows.",
+                names.join(", ")
+            ));
+        }
         let unique_cols: Vec<bool> = chosen.iter().map(|&i| unique.contains(&plan.columns[i].name.to_lowercase())).collect();
         let mut counts = Counts::default();
         let batches = generate(
@@ -630,14 +656,15 @@ fn apply_patterns(kind: ConnectorKind, plan: &TestDataPlan, gens: &mut [Option<G
     Ok(())
 }
 
-/// `SELECT DISTINCT` of a parent's key columns, non-NULL, capped.
+/// `SELECT DISTINCT` of a parent's key columns, non-NULL, capped, in key
+/// order so the same seed picks the same parents on another run.
 fn parent_keys_sql(kind: ConnectorKind, parent: &str, cols: &[&str], n: usize) -> String {
     let list = cols.iter().map(|c| quote_ident(kind, c)).collect::<Vec<_>>().join(", ");
     let filter = cols.iter().map(|c| format!("{} IS NOT NULL", quote_ident(kind, c))).collect::<Vec<_>>().join(" AND ");
     match kind.traits().row_limit {
-        RowLimit::Top => format!("SELECT DISTINCT TOP {n} {list} FROM {parent} WHERE {filter}"),
-        RowLimit::FetchFirst => format!("SELECT DISTINCT {list} FROM {parent} WHERE {filter} FETCH FIRST {n} ROWS ONLY"),
-        RowLimit::Limit => format!("SELECT DISTINCT {list} FROM {parent} WHERE {filter} LIMIT {n}"),
+        RowLimit::Top => format!("SELECT DISTINCT TOP {n} {list} FROM {parent} WHERE {filter} ORDER BY {list}"),
+        RowLimit::FetchFirst => format!("SELECT DISTINCT {list} FROM {parent} WHERE {filter} ORDER BY {list} FETCH FIRST {n} ROWS ONLY"),
+        RowLimit::Limit => format!("SELECT DISTINCT {list} FROM {parent} WHERE {filter} ORDER BY {list} LIMIT {n}"),
     }
 }
 
@@ -703,11 +730,33 @@ fn after_number(text: &str) -> std::result::Result<Option<i64>, ()> {
     }
 }
 
-/// Microseconds since 1970 of a date-time as databases print it.
+/// Microseconds since 1970 (UTC) of a date-time as databases print it,
+/// with or without an offset (`2024-05-01 10:00:00+07`, `…+05:30`, `…-0800`,
+/// `…Z`, `… UTC`).
 fn parse_ts(s: &str) -> Option<i64> {
     let s = s.trim().trim_end_matches('Z');
-    let s = s.strip_suffix("+00:00").or_else(|| s.strip_suffix(" UTC")).unwrap_or(s);
-    parse_datetime(s)
+    let s = s.strip_suffix(" UTC").unwrap_or(s);
+    let (local, offset) = split_offset(s);
+    parse_datetime(local.trim_end()).map(|m| m - offset * 1_000_000)
+}
+
+/// A date-time and its UTC offset in seconds (0 when it has none). The
+/// offset is a sign then `hh`, `hh:mm` or `hhmm` after the time.
+fn split_offset(s: &str) -> (&str, i64) {
+    let Some(p) = s.get(10..).and_then(|t| t.rfind(['+', '-'])).map(|p| p + 10) else { return (s, 0) };
+    let digits: String = s[p + 1..].chars().filter(|c| *c != ':').collect();
+    let (h, m) = match digits.len() {
+        2 => (&digits[..], "0"),
+        4 => (&digits[..2], &digits[2..]),
+        _ => return (s, 0),
+    };
+    match (h.parse::<i64>(), m.parse::<i64>()) {
+        (Ok(h), Ok(m)) if digits.bytes().all(|b| b.is_ascii_digit()) && h <= 18 && m < 60 => {
+            let sign = if s.as_bytes()[p] == b'-' { -1 } else { 1 };
+            (&s[..p], sign * (h * 3600 + m * 60))
+        }
+        _ => (s, 0),
+    }
 }
 
 fn base36(mut n: u64) -> String {
@@ -752,6 +801,14 @@ fn key_start(g: &Gen, limits: &Limits, found: Option<&str>, rows: u32, col: &str
     let day0 = days_from_civil(2020, 1, 1);
     let last_day = days_from_civil(9999, 12, 31);
     let after_count = || found.and_then(|c| c.trim().parse::<i64>().ok()).map_or(1, |c| c.saturating_add(1));
+    if matches!(g, Gen::Int { .. } | Gen::Decimal { .. })
+        && let Some(k) = negative_scale(&unwrapped_type(data_type))
+    {
+        return Err(format!(
+            "{col} ({data_type}) rounds numbers to multiples of 1{}, so counting keys 1, 2, 3… would repeat. Leave {col} to the database (a sequence or trigger).",
+            "0".repeat(k as usize)
+        ));
+    }
     let start = match g {
         Gen::Int { .. } | Gen::Decimal { .. } | Gen::Float => match found.map(after_number) {
             Some(Err(())) => return Err(full(&format!("its largest value is {}", found.unwrap_or_default().trim()))),
@@ -966,6 +1023,7 @@ fn plan_for(kind: ConnectorKind, schema: &str, name: &str, cols: &[ColumnInfo], 
         let maker = parse_type(kind, &c.data_type, &c.name);
         let limits = type_limits(kind, &c.data_type);
         let fills = database_fills(kind, c, ddl);
+        let computed = fills && computed(kind, c, ddl);
         let parent = parent_of(&c.name);
         let note = match (&maker, fills) {
             (None, _) => Some(if !c.nullable && c.default.is_none() && !fills {
@@ -973,7 +1031,8 @@ fn plan_for(kind: ConnectorKind, schema: &str, name: &str, cols: &[ColumnInfo], 
             } else {
                 format!("DataBrain can't make up {} values: left to the database", c.data_type)
             }),
-            (Some(_), true) => Some("The database fills it (identity, sequence or computed): left out unless you turn it on".into()),
+            (Some(_), true) if computed => Some("Computed by the database: it can't be filled".into()),
+            (Some(_), true) => Some("The database fills it (identity, sequence or default): left out unless you turn it on".into()),
             _ => None,
         };
         let hint = match &maker {
@@ -990,6 +1049,7 @@ fn plan_for(kind: ConnectorKind, schema: &str, name: &str, cols: &[ColumnInfo], 
             primary_key: c.is_primary_key,
             supported: maker.is_some(),
             database_fills: fills,
+            computed,
             generator: match (&parent, &maker) {
                 (Some(p), _) => format!("existing keys of {p}"),
                 (None, Some(g)) if c.is_primary_key => g.key_describe(),
@@ -1052,9 +1112,14 @@ fn database_fills(kind: ConnectorKind, c: &ColumnInfo, ddl: Option<&str>) -> boo
     if kind == ConnectorKind::Mssql && matches!(t.trim(), "timestamp" | "rowversion") {
         return true;
     }
-    let Some(ddl) = ddl else { return false };
+    column_ddl(c, ddl).any(|r| DDL.iter().any(|w| r.contains(w)))
+}
+
+/// What follows the column's name on each DDL line that starts with it, in
+/// lower case and padded with spaces (`" int identity(1,1) not null, "`).
+fn column_ddl<'a>(c: &ColumnInfo, ddl: Option<&'a str>) -> impl Iterator<Item = String> + 'a {
     let name = c.name.to_ascii_lowercase();
-    ddl.lines().any(|line| {
+    ddl.unwrap_or("").lines().filter_map(move |line| {
         let l = line.trim().to_ascii_lowercase();
         let rest = ["\"", "`", "["]
             .iter()
@@ -1063,11 +1128,25 @@ fn database_fills(kind: ConnectorKind, c: &ColumnInfo, ddl: Option<&str>) -> boo
                 l.strip_prefix(q).and_then(|r| r.strip_prefix(name.as_str())).and_then(|r| r.strip_prefix(close))
             })
             .or_else(|| l.strip_prefix(name.as_str()).filter(|r| r.starts_with(char::is_whitespace)));
-        rest.is_some_and(|r| {
-            let r = format!(" {r} ");
-            DDL.iter().any(|w| r.contains(w))
-        })
+        rest.map(|r| format!(" {r} "))
     })
+}
+
+/// A column the database computes from an expression (SQL Server `AS (…)`,
+/// `GENERATED ALWAYS AS (…)`, ClickHouse `MATERIALIZED` / `ALIAS`) or writes
+/// itself (SQL Server `rowversion`): an INSERT naming it fails, so it can't
+/// be filled (identity columns can, where the database allows it).
+fn computed(kind: ConnectorKind, c: &ColumnInfo, ddl: Option<&str>) -> bool {
+    if kind == ConnectorKind::Mssql && matches!(c.data_type.trim().to_ascii_lowercase().as_str(), "timestamp" | "rowversion") {
+        return true;
+    }
+    column_ddl(c, ddl).any(|r| [" as (", " as(", " materialized ", " alias "].iter().any(|w| r.contains(w)))
+}
+
+/// The `k` of a negative scale (Oracle `NUMBER(10,-2)` rounds to 10^k).
+fn negative_scale(t: &str) -> Option<u32> {
+    let args = t.split_once('(')?.1.split_once(')')?.0;
+    args.split(',').nth(1)?.trim().strip_prefix('-')?.trim().parse().ok().filter(|k| *k > 0)
 }
 
 /// The type name without its `(…)` parts, and the numbers inside the first one.
@@ -1190,10 +1269,18 @@ fn type_limits(kind: ConnectorKind, raw: &str) -> Limits {
         }
     };
     let int = |b: u32| bits(b, !unsigned);
+    // Precision past 38 (ClickHouse Decimal256, BigQuery BIGNUMERIC,
+    // Postgres numeric(60,2)) holds more whole numbers than DataBrain counts
+    // (i128): no limit is checked there.
     let digits = |p: u32, s: u32| {
-        let p = p.clamp(1, 38);
+        let p = p.clamp(1, 1000);
         let s = s.min(p);
-        if s == 0 { Limits::Ints(-(10i128.pow(p) - 1), 10i128.pow(p) - 1) } else { Limits::Decimal { precision: p, scale: s } }
+        if s == 0 {
+            let m = 10i128.checked_pow(p).map_or(i128::MAX, |n| n - 1);
+            Limits::Ints(-m, m)
+        } else {
+            Limits::Decimal { precision: p, scale: s }
+        }
     };
     // First and last day, as moments (the last day's last second).
     let days = |from: (i64, u32, u32), to: (i64, u32, u32)| {
@@ -1226,8 +1313,14 @@ fn type_limits(kind: ConnectorKind, raw: &str) -> Limits {
         // ClickHouse Decimal32(S): the argument is the scale.
         "decimal32" => digits(9, a0.unwrap_or(0)),
         "decimal64" => digits(18, a0.unwrap_or(0)),
-        "decimal128" | "decimal256" => digits(38, a0.unwrap_or(0)),
+        "decimal128" => digits(38, a0.unwrap_or(0)),
+        "decimal256" => digits(76, a0.unwrap_or(0)),
         "numeric" | "decimal" | "dec" | "number" | "bignumeric" | "bigdecimal" | "newdecimal" => match a0 {
+            // Oracle NUMBER(10,-2): 10 digits, rounded to hundreds.
+            Some(p) if let Some(k) = negative_scale(&t) => {
+                let m = 10i128.checked_pow(p.clamp(1, 1000)).zip(10i128.checked_pow(k)).and_then(|(a, b)| (a - 1).checked_mul(b)).unwrap_or(i128::MAX);
+                Limits::Ints(-m, m)
+            }
             Some(p) => digits(p, a1.unwrap_or(0)),
             None => Limits::Any,
         },
@@ -1302,6 +1395,16 @@ fn parse_type(kind: ConnectorKind, raw: &str, column: &str) -> Option<Gen> {
         }
         "numeric" | "decimal" | "dec" | "number" | "bignumeric" | "bigdecimal" | "newdecimal" | "decimal32" | "decimal64" | "decimal128" | "decimal256" => {
             let (p, s) = match (a0, a1) {
+                // ClickHouse Decimal32(S)…Decimal256(S): the argument is the scale.
+                (s, _) if plain.starts_with("decimal") && plain.len() > "decimal".len() => (
+                    match plain.as_str() {
+                        "decimal32" => 9,
+                        "decimal64" => 18,
+                        "decimal128" => 38,
+                        _ => 76,
+                    },
+                    s.unwrap_or(0),
+                ),
                 (Some(p), s) => (p, s.unwrap_or(0)),
                 // Oracle NUMBER, Postgres numeric: any size.
                 (None, _) if matches!(plain.as_str(), "number" | "numeric") => (8, 2),
@@ -1599,13 +1702,13 @@ fn real_date(s: &str) -> bool {
 /// repeat too): a made-up text column of the key gets a numbered variant
 /// (`Ann Lee 2`, `ann+2@x.com`) that still fits, else another made-up value.
 /// A key with a NULL can repeat (NULLs are distinct), so it is left alone.
-fn distinct_combination(row: &mut [Value], key: &[usize], sources: &[Source], seen: &mut HashSet<String>, n: u64, rng: &mut Rng) -> bool {
+fn distinct_combination(row: &mut [Value], key: &[usize], sources: &[Source], seen: &mut Seen, n: u64, rng: &mut Rng) -> bool {
     let combo = |row: &[Value]| -> Option<String> {
         let mut parts = Vec::with_capacity(key.len());
         for &k in key {
             match &row[k] {
                 Value::Null => return None,
-                v => parts.push(format!("{v:?}")),
+                v => parts.push(seen_key(v)),
             }
         }
         Some(parts.join("\u{1}"))
@@ -1619,7 +1722,12 @@ fn distinct_combination(row: &mut [Value], key: &[usize], sources: &[Source], se
         let (Some(fallback), Value::Text(t)) = (made_up(&sources[k]), &row[k]) else { continue };
         let Gen::Text { max, .. } = fallback.base() else { continue };
         let base = t.clone();
-        for n in 2..10_000 {
+        // Numbering goes on from the last variant of this value, so many
+        // repeats of a few AI rows don't each try 2, 3, 4… again.
+        let counter = format!("{k}\u{1}{}", fold(&base));
+        let from = seen.next_number(&counter);
+        for n in from..from.saturating_add(10_000) {
+            seen.numbered(&counter, n + 1);
             let Some(v) = variant(&base, n, *max) else { break };
             // Still following the column's pattern (`ann+2@gmail.com` does).
             if let Gen::Patterned { pattern, base: b, .. } = fallback
@@ -1667,7 +1775,7 @@ const RETRIES: usize = 20;
 
 /// `v`, or for a value given already a numbered variant of it (text) or
 /// another made-up value; counted when none is found.
-fn not_given(seen: &mut HashSet<String>, v: Value, g: &Gen, n: u64, rng: &mut Rng, counts: &mut Counts) -> Value {
+fn not_given(seen: &mut Seen, v: Value, g: &Gen, n: u64, rng: &mut Rng, counts: &mut Counts) -> Value {
     if seen.insert(seen_key(&v)) {
         return v;
     }
@@ -1686,11 +1794,37 @@ fn not_given(seen: &mut HashSet<String>, v: Value, g: &Gen, n: u64, rng: &mut Rn
     v
 }
 
-/// What a value of a unique column is compared by.
+/// What a value of a unique column is compared by: text ignoring case and
+/// trailing spaces, as case-insensitive collations do (MySQL `_ci`, SQL
+/// Server's default), so `Ann@x.com` and `ann@x.com ` are one value.
 fn seen_key(v: &Value) -> String {
     match v {
-        Value::Text(t) => t.clone(),
+        Value::Text(t) => fold(t),
         v => format!("{v:?}"),
+    }
+}
+
+fn fold(t: &str) -> String {
+    t.trim_end_matches(' ').to_lowercase()
+}
+
+/// Values (or combinations) of a unique column or key given so far, and the
+/// next number to try for each value made distinct (`Ann 2`, `Ann 3`…).
+#[derive(Default, Clone)]
+struct Seen {
+    given: HashSet<String>,
+    next: HashMap<String, u32>,
+}
+
+impl Seen {
+    fn insert(&mut self, key: String) -> bool {
+        self.given.insert(key)
+    }
+    fn next_number(&self, of: &str) -> u32 {
+        self.next.get(of).copied().unwrap_or(2)
+    }
+    fn numbered(&mut self, of: &str, next: u32) {
+        self.next.insert(of.to_string(), next);
     }
 }
 
@@ -1712,15 +1846,18 @@ fn variant(t: &str, n: u32, max: Option<usize>) -> Option<String> {
 
 /// `t`, or a variant of it not given yet (`ann+2@x.com`, `Ann 2`) that
 /// still fits the column; `None` when there is none.
-fn distinct(seen: &mut HashSet<String>, t: String, g: &Gen) -> Option<Value> {
-    if seen.insert(t.clone()) {
+fn distinct(seen: &mut Seen, t: String, g: &Gen) -> Option<Value> {
+    if seen.insert(fold(&t)) {
         return Some(Value::Text(t));
     }
     let max = match g.base() {
         Gen::Text { max, .. } => *max,
         _ => return None,
     };
-    for n in 2..1000 {
+    let counter = fold(&t);
+    let from = seen.next_number(&counter);
+    for n in from..from.saturating_add(1000) {
+        seen.numbered(&counter, n + 1);
         let v = variant(&t, n, max)?;
         // A variant must still follow the column's pattern (`ann+2@gmail.com` does).
         if let Gen::Patterned { pattern, base, .. } = g
@@ -1728,7 +1865,7 @@ fn distinct(seen: &mut HashSet<String>, t: String, g: &Gen) -> Option<Value> {
         {
             return None;
         }
-        if seen.insert(v.clone()) {
+        if seen.insert(fold(&v)) {
             return Some(Value::Text(v));
         }
     }
@@ -1897,12 +2034,12 @@ fn generate(
     let mut b = BatchBuilder::new(columns, BATCH.min(rows));
     let mut out = Vec::new();
     // Values given so far, per unique AI column.
-    let mut seen: Vec<HashSet<String>> = vec![HashSet::new(); sources.len()];
+    let mut seen: Vec<Seen> = vec![Seen::default(); sources.len()];
     // The AI's columns draw from their own stream, so how many values of an
     // answer fit doesn't change the other columns: the seed still repeats them.
     let mut ai_rng = Rng(rng.0 ^ 0x5DEE_CE66_D1CE_4E5B);
     // Combinations given so far, per unique key of several columns.
-    let mut seen_groups: Vec<HashSet<String>> = vec![HashSet::new(); groups.len()];
+    let mut seen_groups: Vec<Seen> = vec![Seen::default(); groups.len()];
     for i in 0..rows {
         // One parent tuple per foreign key per row, shared by its columns.
         let picks: Vec<usize> = parents
@@ -1996,6 +2133,9 @@ mod tests {
         assert_eq!(g(Postgres, "int8"), Some(Gen::Int { min: 1, max: 1_000_000_000 }));
         assert_eq!(g(Clickhouse, "Nullable(Int8)"), Some(Gen::Int { min: 0, max: 100 }));
         assert_eq!(g(Postgres, "numeric(12,2)"), Some(Gen::Decimal { int_digits: 6, scale: 2 }));
+        assert_eq!(g(Clickhouse, "Decimal32(4)"), Some(Gen::Decimal { int_digits: 5, scale: 4 }), "the argument is the scale");
+        assert_eq!(g(Clickhouse, "Decimal256(40)"), Some(Gen::Decimal { int_digits: 6, scale: 6 }));
+        assert_eq!(g(Clickhouse, "Decimal64(0)"), Some(Gen::Int { min: 1, max: 999_999 }));
         assert_eq!(g(Oracle, "NUMBER(5,0)"), Some(Gen::Int { min: 1, max: 99_999 }));
         assert_eq!(g(Postgres, "character varying(40)"), Some(Gen::Text { max: Some(40), flavor: Flavor::Word }));
         assert_eq!(g(Oracle, "VARCHAR2(50 BYTE)"), Some(Gen::Text { max: Some(50), flavor: Flavor::Word }));
@@ -2041,10 +2181,29 @@ mod tests {
         let (p, _) = plan_for(ConnectorKind::Mssql, "dbo", "t", &cols, &[], Some(ddl));
         let fills: Vec<bool> = p.columns.iter().map(|c| c.database_fills).collect();
         assert_eq!(fills, [true, true, false, true]);
+        // The computed column can't be ticked; the identity one can.
+        let computed: Vec<bool> = p.columns.iter().map(|c| c.computed).collect();
+        assert_eq!(computed, [false, true, false, true]);
+        assert!(p.columns[1].note.as_deref().unwrap().contains("can't be filled"));
         assert!(!p.columns[3].supported, "rowversion can't be written");
         assert!(p.warnings.is_empty(), "the database fills rowversion: no 'inserts will fail' {:?}", p.warnings);
         // Elsewhere TIMESTAMP is a date-time.
         assert!(!database_fills(ConnectorKind::Mysql, &col("rv", "timestamp", false, false), None));
+        // Generated columns elsewhere; identity columns aren't computed.
+        let pg = "CREATE TABLE t (\n  id integer GENERATED ALWAYS AS IDENTITY,\n  total numeric GENERATED ALWAYS AS (qty * price) STORED,\n  qty int\n);";
+        let (p, _) = plan_for(
+            ConnectorKind::Postgres,
+            "public",
+            "t",
+            &[col("id", "integer", false, true), col("total", "numeric", true, false), col("qty", "integer", true, false)],
+            &[],
+            Some(pg),
+        );
+        assert_eq!(p.columns.iter().map(|c| c.computed).collect::<Vec<_>>(), [false, true, false]);
+        let ch = "CREATE TABLE t\n(\n    `day` Date MATERIALIZED toDate(ts),\n    `ts` DateTime\n)";
+        let (p, _) =
+            plan_for(ConnectorKind::Clickhouse, "default", "t", &[col("day", "Date", false, false), col("ts", "DateTime", false, false)], &[], Some(ch));
+        assert_eq!(p.columns.iter().map(|c| c.computed).collect::<Vec<_>>(), [true, false]);
     }
 
     /// Columns the database fills (computed, generated, identity), keys and
@@ -2122,6 +2281,15 @@ mod tests {
         assert_eq!(l(Postgres, "numeric(5,2)"), Limits::Decimal { precision: 5, scale: 2 });
         assert_eq!(l(Clickhouse, "Decimal32(4)"), Limits::Decimal { precision: 9, scale: 4 }, "the argument is the scale");
         assert_eq!(l(Postgres, "numeric"), Limits::Any);
+        // Past 38 digits: no limit on the whole part, the scale still holds.
+        assert_eq!(l(Postgres, "numeric(60,2)"), Limits::Decimal { precision: 60, scale: 2 });
+        assert_eq!(l(Bigquery, "BIGNUMERIC(50,20)"), Limits::Decimal { precision: 50, scale: 20 });
+        assert_eq!(l(Clickhouse, "Decimal256(40)"), Limits::Decimal { precision: 76, scale: 40 });
+        assert_eq!(l(Postgres, "numeric(50)"), Limits::Ints(-i128::MAX, i128::MAX));
+        assert_eq!(l(Postgres, "numeric(60,2)").int_range(), Some((-i128::MAX, i128::MAX)));
+        // Oracle negative scale: 10 digits rounded to hundreds.
+        assert_eq!(l(Oracle, "NUMBER(10,-2)"), Limits::Ints(-999_999_999_900, 999_999_999_900));
+        assert_eq!(l(Oracle, "NUMBER(10, -2)"), Limits::Ints(-999_999_999_900, 999_999_999_900));
         assert_eq!(l(Mysql, "year"), Limits::Ints(1901, 2155));
         let day = |y, m, d| days_from_civil(y, m, d) * MICROS_PER_DAY;
         assert_eq!(l(Mysql, "timestamp"), Limits::Moments(day(1970, 1, 2), day(2038, 1, 19) - 1_000_000));
@@ -2152,6 +2320,11 @@ mod tests {
         assert!(parse(Mysql, "tinyint unsigned", "{-1|1}").unwrap_err().contains("\"-1\""));
         assert!(parse(Postgres, "numeric(12,2)", "{1234567.5}").is_ok(), "the real precision, not the generator's 6 digits");
         assert!(parse(Postgres, "numeric(5,2)", "{1234.5}").is_err());
+        // Wider than 38 digits: patterns are taken.
+        assert!(parse(Postgres, "numeric(60,2)", "1..99999999999999999999.99").is_ok());
+        assert!(parse(Bigquery, "BIGNUMERIC(50,20)", "0.5..1000000").is_ok());
+        assert!(parse(Clickhouse, "Decimal256(40)", "{12345678901234567890.123}").is_ok());
+        assert!(parse(Oracle, "NUMBER(10,-2)", "100..900").is_ok());
         // MySQL TIMESTAMP: 1970–2038.
         let e = parse(Mysql, "timestamp", "1950..2005").unwrap_err();
         assert!(e.contains("1970-01-02 to 2038-01-18"), "{e}");
@@ -2191,6 +2364,13 @@ mod tests {
         assert!(key(Postgres, "numeric(4,2)", Some("90"), 10).is_err(), "numeric(4,2) holds up to 99.99");
         assert!(key(Mysql, "timestamp", Some("2038-01-18 23:59:00"), 100).unwrap_err().contains("2038-01-18"));
         assert!(key(Postgres, "timestamp", Some("2038-01-18 23:59:00"), 100).is_ok());
+        // Past 38 digits, keys and patterns are allowed.
+        assert_eq!(key(Postgres, "numeric(60,2)", Some("1234567890123.45"), 10), Ok(1_234_567_890_124));
+        assert_eq!(key(Bigquery, "BIGNUMERIC(50,20)", None, 10), Ok(1));
+        assert_eq!(key(Clickhouse, "Decimal256(40)", None, 10), Ok(1));
+        // A negative scale rounds counted keys together: refused, with why.
+        let e = key(Oracle, "NUMBER(10,-2)", None, 10).unwrap_err();
+        assert!(e.contains("multiples of 100") && e.contains("Leave id to the database"), "{e}");
     }
 
     #[test]
@@ -2417,6 +2597,7 @@ mod tests {
             primary_key: false,
             supported: true,
             database_fills: false,
+            computed: false,
             generator: String::new(),
             ai_text: true,
             ai_ok: true,
@@ -2488,6 +2669,81 @@ mod tests {
     }
 
     #[test]
+    fn unique_values_ignore_case_and_trailing_spaces_and_numbering_goes_on() {
+        let columns = vec![Column::new("email", ColType::Utf8, "varchar(40)"), Column::new("name", ColType::Utf8, "varchar(40)")];
+        let email = Gen::Text { max: Some(40), flavor: Flavor::Email };
+        let name = Gen::Text { max: Some(40), flavor: Flavor::FullName };
+        let sources = vec![Source::Sample { col: 0, fallback: email, unique: true }, Source::Sample { col: 1, fallback: name, unique: false }];
+        // A case-insensitive unique index (MySQL `_ci`, SQL Server) sees these as one value.
+        let sample = AiSample {
+            columns: vec!["email".into(), "name".into()],
+            rows: vec![vec![Some("Ann@x.com".into()), Some("Ann".into())], vec![Some("ann@x.com ".into()), Some("ANN".into())]],
+        };
+        let strings = |b: &[RecordBatch], c: usize| -> Vec<String> {
+            b.iter()
+                .flat_map(|b| b.column(c).as_any().downcast_ref::<StringArray>().unwrap().iter().map(|v| v.unwrap().to_string()).collect::<Vec<_>>())
+                .collect()
+        };
+        let b = generate(&columns, &sources, &[false; 2], &[], Some(&sample), &[], &[], 4, 0, &mut Rng(1), &mut Counts::default()).unwrap();
+        let emails = strings(&b, 0);
+        assert_eq!(emails[0], "Ann@x.com");
+        assert_eq!(emails[1], "ann+2@x.com", "a repeat but for case (and a trailing space)");
+        assert_eq!(emails.iter().map(|e| e.trim_end().to_lowercase()).collect::<HashSet<_>>().len(), 4);
+        // A key of several columns compares the same way.
+        let b = generate(&columns, &sources, &[false; 2], &[], Some(&sample), &[vec![1]], &[], 2, 0, &mut Rng(1), &mut Counts::default()).unwrap();
+        assert_eq!(strings(&b, 1), ["Ann", "ANN 2"]);
+
+        // Many rows from a few AI rows: numbering goes on from the last
+        // variant instead of trying 2, 3, 4… again, so it stays fast.
+        let start = std::time::Instant::now();
+        let mut counts = Counts::default();
+        let rows = 100_000;
+        let b = generate(&columns, &sources, &[false; 2], &[], Some(&sample), &[vec![0, 1]], &[], rows, 0, &mut Rng(1), &mut counts).unwrap();
+        assert_eq!(counts.repeats, 0);
+        assert_eq!(strings(&b, 0).iter().map(|e| e.trim_end().to_lowercase()).collect::<HashSet<_>>().len(), rows);
+        assert!(start.elapsed() < std::time::Duration::from_secs(20), "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn a_primary_key_of_several_columns_counts_the_one_that_isnt_a_foreign_key() {
+        let cols = vec![col("order_id", "integer", false, true), col("line_no", "integer", false, true), col("qty", "integer", true, false)];
+        let fks = vec![ForeignKey { columns: vec!["order_id".into()], ref_schema: String::new(), ref_table: "orders".into(), ref_columns: vec!["id".into()] }];
+        let (plan, gens) = plan_for(ConnectorKind::Postgres, "public", "lines", &cols, &fks, None);
+        let p = Prepared { kind: ConnectorKind::Postgres, plan, gens, chosen: vec![0, 1, 2], unique: HashSet::new(), unique_groups: vec![], ddl: None };
+        assert_eq!(p.key(), Some(1), "line_no counts; order_id takes the parent's keys");
+        // A single-column key, or one of foreign keys only: the first.
+        let (plan, gens) = plan_for(ConnectorKind::Postgres, "public", "t", &cols[..1], &fks, None);
+        let p = Prepared { kind: ConnectorKind::Postgres, plan, gens, chosen: vec![0], unique: HashSet::new(), unique_groups: vec![], ddl: None };
+        assert_eq!(p.key(), Some(0));
+    }
+
+    #[test]
+    fn date_times_with_offsets_are_read_in_utc() {
+        let utc = parse_ts("2024-05-01 03:00:00").unwrap();
+        for s in [
+            "2024-05-01 10:00:00+07",
+            "2024-05-01 10:00:00+07:00",
+            "2024-05-01T10:00:00+0700",
+            "2024-05-01 10:00:00 +07:00",
+            "2024-05-01 03:00:00Z",
+            "2024-05-01 03:00:00+00:00",
+            "2024-05-01 03:00:00 UTC",
+            "2024-04-30 19:00:00-08",
+            "2024-05-01 08:30:00+05:30",
+        ] {
+            assert_eq!(parse_ts(s), Some(utc), "{s}");
+        }
+        assert_eq!(parse_ts("2024-05-01 10:00:00.5+07"), Some(utc + 500_000));
+        assert_eq!(parse_ts("2024-05-01"), parse_ts("2024-05-01 00:00:00"));
+        assert_eq!(parse_ts("2024-05-01 10:00:00+7x"), None);
+        // Keys continue after the largest, offset or not; a timestamptz
+        // parent key keeps its moment.
+        let g = Gen::TimestampTz;
+        assert_eq!(key_start(&g, &Limits::Any, Some("2024-05-01 10:00:00+07"), 1, "t", "timestamptz"), Ok(utc / 1_000_000 + 1));
+        assert_eq!(cell_value(ColType::TimestampTz, "2024-05-01 10:00:00+07"), Value::TimestampTz(utc));
+    }
+
+    #[test]
     fn plan_reports_foreign_keys_and_unsupported_columns() {
         let cols = vec![col("id", "integer", false, true), col("customer_id", "integer", false, false), col("shape", "geometry", false, false)];
         let fks =
@@ -2503,12 +2759,15 @@ mod tests {
 
     #[test]
     fn parent_key_queries_follow_the_row_limit_style() {
-        assert_eq!(parent_keys_sql(ConnectorKind::Postgres, "\"p\"", &["id"], 10), "SELECT DISTINCT \"id\" FROM \"p\" WHERE \"id\" IS NOT NULL LIMIT 10");
-        assert!(
-            parent_keys_sql(ConnectorKind::Mssql, "[p]", &["a", "b"], 10)
-                .starts_with("SELECT DISTINCT TOP 10 [a], [b] FROM [p] WHERE [a] IS NOT NULL AND [b] IS NOT NULL")
+        assert_eq!(
+            parent_keys_sql(ConnectorKind::Postgres, "\"p\"", &["id"], 10),
+            "SELECT DISTINCT \"id\" FROM \"p\" WHERE \"id\" IS NOT NULL ORDER BY \"id\" LIMIT 10"
         );
-        assert!(parent_keys_sql(ConnectorKind::Oracle, "\"P\"", &["ID"], 10).ends_with("FETCH FIRST 10 ROWS ONLY"));
+        assert_eq!(
+            parent_keys_sql(ConnectorKind::Mssql, "[p]", &["a", "b"], 10),
+            "SELECT DISTINCT TOP 10 [a], [b] FROM [p] WHERE [a] IS NOT NULL AND [b] IS NOT NULL ORDER BY [a], [b]"
+        );
+        assert!(parent_keys_sql(ConnectorKind::Oracle, "\"P\"", &["ID"], 10).ends_with("ORDER BY \"ID\" FETCH FIRST 10 ROWS ONLY"));
     }
 
     #[test]

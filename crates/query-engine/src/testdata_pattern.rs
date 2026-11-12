@@ -60,7 +60,7 @@ impl Limits {
         match self {
             Limits::Ints(lo, hi) => Some((*lo, *hi)),
             Limits::Decimal { precision, scale } => {
-                let m = 10i128.checked_pow(precision.saturating_sub(*scale).min(38)).map_or(i128::MAX, |p| p - 1);
+                let m = 10i128.checked_pow(precision.saturating_sub(*scale)).map_or(i128::MAX, |p| p - 1);
                 Some((-m, m))
             }
             _ => None,

@@ -9,6 +9,7 @@ const col = (name: string, p: Partial<TestDataColumn> = {}): TestDataColumn => (
   primary_key: false,
   supported: true,
   database_fills: false,
+  computed: false,
   generator: "",
   ai_text: false,
   ai_ok: false,

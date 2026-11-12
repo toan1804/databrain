@@ -17,6 +17,7 @@ const col = (name: string, p: Partial<TestDataColumn> = {}): TestDataColumn => (
   primary_key: false,
   supported: true,
   database_fills: false,
+  computed: false,
   generator: "",
   ai_text: false,
   ai_ok: false,
@@ -34,6 +35,11 @@ describe("test data dialog", () => {
     const s = specFor(cols, new Set(["id", "name"]), 250_000, 140, " 42 ", false);
     expect(s).toEqual({ rows: 100_000, null_percent: 100, seed: 42, skip: ["note"], fill: ["id"], parent_keys: false, patterns: {} });
     expect(specFor(cols, new Set(), 0, -5, "abc", true)).toMatchObject({ rows: 1, null_percent: 0, seed: null });
+  });
+
+  it("never sends a computed column to fill", () => {
+    const c = [col("total", { database_fills: true, computed: true }), col("name")];
+    expect(specFor(c, new Set(["total", "name"]), 10, 0, "", true)).toMatchObject({ skip: [], fill: [] });
   });
 
   it("sends every column's pattern: the user's, else its default, empty for none", () => {

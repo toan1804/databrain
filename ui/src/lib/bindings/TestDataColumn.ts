@@ -14,6 +14,11 @@ supported: boolean,
  */
 database_fills: boolean, 
 /**
+ * Computed by the database (an expression, `rowversion`): an INSERT
+ * naming it fails, so it can't be filled at all.
+ */
+computed: boolean, 
+/**
  * What goes in, in words ("emails", "numbers counting up").
  */
 generator: string, 

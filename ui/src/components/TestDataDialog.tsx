@@ -53,7 +53,7 @@ export function specFor(
     // Only seeds that survive a JavaScript number (else the rows wouldn't repeat).
     seed: s && seedProblem(s) === null ? Number(s) : null,
     skip: cols.filter((c) => c.supported && !c.database_fills && !ticked.has(c.name)).map((c) => c.name),
-    fill: cols.filter((c) => c.supported && c.database_fills && ticked.has(c.name)).map((c) => c.name),
+    fill: cols.filter((c) => c.supported && c.database_fills && !c.computed && ticked.has(c.name)).map((c) => c.name),
     parent_keys: parentKeys,
     patterns: patternsFor(cols, patterns, ticked),
   };
@@ -499,7 +499,8 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
                       <input
                         type="checkbox"
                         aria-label={`Fill ${c.name}`}
-                        disabled={!c.supported}
+                        disabled={!c.supported || c.computed}
+                        title={c.computed ? (c.note ?? "Computed by the database: it can't be filled") : undefined}
                         checked={ticked.has(c.name)}
                         onChange={(e) => toggle(c.name, e.target.checked)}
                       />
