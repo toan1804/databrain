@@ -65,7 +65,7 @@ A session is one database connection, found by `(connection_id, tab)`. `session_
 | the editor tab id | runs of the tab, its plans, grid edits, Commit / Rollback | `close_tab`, idle close |
 | `nb:{notebook}` (`RunRequest::session_key`) | every cell of a notebook; each cell keeps its own `tab_id` for results | `close_tab` from `api/library.rs` |
 | `__meta__` (`META_TAB`) | explorer, completion, `check_sql`, `describe`, test data's reads, cost preview while the tab is busy | `reconnect`, idle close |
-| `__index__` (`INDEX_TAB`) | `bulk_metadata`, `schema_fingerprints`: AI indexing, schema compare, related rows. Local files use `__meta__` (`index_tab`) | `end_index_session`, `reconnect` |
+| `__index__` (`INDEX_TAB`) | `bulk_metadata`: reading columns for the AI, schema compare, related rows. Local files use `__meta__` (`index_tab`) | `end_index_session`, `reconnect` |
 | `ai:{session}`, `ai-outputs:{session}`, `ai-sample:{session}` | AI and MCP tools (`crates/ai/src/tools/query.rs`) | idle close |
 | `job:{job}:{node}`, `…:load`, `…:export`, `dryrun:…` | job steps (`crates/app/src/jobs.rs`) | `release_sessions`, `close_tab` |
 | `__load__:{id}`, `__loadcheck__:{uuid}` | "Load into…" and its dry run (`api/results.rs`) | `close_tab` right after |

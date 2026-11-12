@@ -144,10 +144,11 @@ pub trait Session: Send + Sync {
     }
 
     /// Fingerprint per schema of everything the explorer lists (tables,
-    /// views, routines, sequences, columns, comments): unchanged = the cached
-    /// listing is still right. Defaults to [`Session::schema_fingerprints`].
+    /// views, routines, sequences, columns, comments), in one catalog query:
+    /// unchanged = the cached listing is still right, and an index run
+    /// skips the schema. `None` = not supported (every schema is re-read).
     async fn explorer_fingerprints(&self) -> Result<Option<HashMap<String, String>>> {
-        self.schema_fingerprints().await
+        Ok(None)
     }
 
     /// Opaque version of every object [`Session::list_objects`] returns, keyed
@@ -213,14 +214,6 @@ pub trait Session: Send + Sync {
     /// one schema are reported in its entry.
     async fn bulk_metadata(&self, schemas: &[String]) -> Result<Vec<SchemaMetadata>> {
         default_bulk_metadata(self, schemas).await
-    }
-
-    /// A cheap fingerprint of each schema's table/column definitions (schema
-    /// id → opaque text), computed in one catalog query. When a schema's
-    /// fingerprint is unchanged since the last index run its metadata is not
-    /// fetched again. `None` = not supported (every schema is re-read).
-    async fn schema_fingerprints(&self) -> Result<Option<HashMap<String, String>>> {
-        Ok(None)
     }
 
     /// Number of tables/views per schema id, when the engine can count them

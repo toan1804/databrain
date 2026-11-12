@@ -137,7 +137,7 @@ Outputs of any connection are Arrow and can be joined in the Results connection 
 - **Row caps:** `traits.row_limit` (`cap_rows` in `crates/ai/src/policy.rs`). Non-SQL queries aren't capped by DataBrain; the connector must honour `ExecOptions.max_rows`.
 - **Table access rules:** `defaults()` in `crates/ai/src/access.rs` gives the default catalog and schema that complete an unqualified name. Without an arm the rules can't resolve unqualified names, so they match less.
 - **PII masking:** `crates/ai/src/pii.rs` works on SQL. A non-SQL language needs its own handling (see MongoDB) or a note that masking applies only to result columns.
-- **Knowledge index:** `bulk_metadata`, `schema_fingerprints` and `schema_object_counts`. The defaults describe tables one by one, which is slow on large databases; override them with catalog queries. `BULK` in `ui/src/lib/indexScope.ts` marks kinds whose metadata comes in large batches.
+- **Knowledge (reading columns for the AI):** `bulk_metadata` and `schema_object_counts`; `explorer_fingerprints` must cover everything the explorer lists (tables, views, routines, sequences, columns, comments), as both the explorer and index runs use it. The defaults describe tables one by one, which is slow on large databases; override them with catalog queries. `BULK` in `ui/src/lib/indexScope.ts` marks kinds whose metadata comes in large batches.
 
 ### 3.11 MCP
 

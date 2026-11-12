@@ -43,6 +43,27 @@ pub struct MysqlSession {
 }
 
 impl MysqlSession {
+    /// Tables and columns per schema (the explorer's fingerprint adds routines).
+    async fn table_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for sql in [
+            "select table_schema, concat('t', count(*), ':', coalesce(sum(crc32(concat_ws(':', table_name, table_type, table_comment))), 0)) \
+             from information_schema.tables group by table_schema",
+            "select table_schema, concat('c', count(*), ':', coalesce(sum(crc32(concat_ws(':', table_name, column_name, ordinal_position, column_type, is_nullable, column_key, column_comment))), 0)) \
+             from information_schema.columns group by table_schema",
+            "select table_schema, concat('f', count(*), ':', coalesce(sum(crc32(concat_ws(':', table_name, constraint_name, column_name, referenced_table_schema, referenced_table_name, referenced_column_name))), 0)) \
+             from information_schema.key_column_usage where referenced_table_name is not null group by table_schema",
+        ] {
+            let rows: Vec<(String, String)> = self.query_rows(sql, vec![]).await?;
+            for (s, f) in rows {
+                let e = out.entry(s).or_default();
+                e.push('/');
+                e.push_str(&f);
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Kill the running query using a short-lived side connection.
     pub(crate) async fn kill_query(opts: Opts, id: u32) {
         if let Ok(Ok(mut c)) = tokio::time::timeout(Duration::from_secs(5), Conn::new(opts)).await {
@@ -301,9 +322,9 @@ impl Session for MysqlSession {
     /// Per-schema checksum of table names/types/comments, column definitions
     /// and foreign keys: three aggregate queries over information_schema.
     /// Row counts are left out, so data changes do not count.
-    /// [`Session::schema_fingerprints`] plus routines (the explorer lists them).
+    /// Tables and columns (`table_fingerprints`) plus routines.
     async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
-        let Some(mut out) = self.schema_fingerprints().await? else { return Ok(None) };
+        let Some(mut out) = self.table_fingerprints().await? else { return Ok(None) };
         let rows: Vec<(String, String)> = self
             .query_rows(
                 "select routine_schema, cast(concat('r', count(*), ':', sum(crc32(concat_ws(':', routine_name, routine_type, created, last_altered)))) as char) \
@@ -339,26 +360,6 @@ impl Session for MysqlSession {
             )
             .await?;
         Ok(Some(rows.into_iter().collect()))
-    }
-
-    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
-        let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        for sql in [
-            "select table_schema, concat('t', count(*), ':', coalesce(sum(crc32(concat_ws(':', table_name, table_type, table_comment))), 0)) \
-             from information_schema.tables group by table_schema",
-            "select table_schema, concat('c', count(*), ':', coalesce(sum(crc32(concat_ws(':', table_name, column_name, ordinal_position, column_type, is_nullable, column_key, column_comment))), 0)) \
-             from information_schema.columns group by table_schema",
-            "select table_schema, concat('f', count(*), ':', coalesce(sum(crc32(concat_ws(':', table_name, constraint_name, column_name, referenced_table_schema, referenced_table_name, referenced_column_name))), 0)) \
-             from information_schema.key_column_usage where referenced_table_name is not null group by table_schema",
-        ] {
-            let rows: Vec<(String, String)> = self.query_rows(sql, vec![]).await?;
-            for (s, f) in rows {
-                let e = out.entry(s).or_default();
-                e.push('/');
-                e.push_str(&f);
-            }
-        }
-        Ok(Some(out))
     }
 
     /// Three information_schema queries for the whole batch of schemas.

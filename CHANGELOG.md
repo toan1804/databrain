@@ -4,6 +4,11 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Changed
+
+- The AI uses only the tables you allow. Knowledge → Index now chooses what the AI may use (schemas, with single tables excluded or allowed), and "Read columns" reads their structure; a table outside that doesn't exist for the AI (not searched, described, sampled, joined, or named by another table's foreign key). Existing connections keep exactly the tables their index had. Table metadata is now kept once, shared by the explorer, completion, lineage and the AI, so browsing a table also keeps what the AI knows of it current and a read for the AI makes the explorer instant. A table the access rules deny now reads as unavailable to the AI, like one that doesn't exist. The workspace moves to schema version 20.
+- Snowflake, Databricks and DuckDB notice new functions, procedures, macros and sequences when the explorer checks for changes.
+
 ### Fixed
 
 - Query parameters: `:name` inside a Postgres `E'…'` or Oracle `q'[…]'` string is text, not a parameter (the parameter finder now reads strings exactly as the statement splitter does).

@@ -322,7 +322,8 @@ impl Session for SqliteSession {
 
     /// `PRAGMA schema_version` of each attached database: SQLite bumps it
     /// on every schema change.
-    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+    /// `PRAGMA schema_version` per attached database: it changes with any DDL.
+    async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         let schemas = self.list_schemas().await?;
         self.with_conn(move |c| {
             let mut out = std::collections::HashMap::new();
@@ -523,11 +524,11 @@ mod tests {
         let s = session().await;
         exec(s.as_ref(), "create table t(id integer primary key)").await;
         let f = |m: Option<std::collections::HashMap<String, String>>| m.unwrap()["main"].clone();
-        let a = f(s.schema_fingerprints().await.unwrap());
+        let a = f(s.explorer_fingerprints().await.unwrap());
         exec(s.as_ref(), "insert into t values (1)").await;
-        assert_eq!(a, f(s.schema_fingerprints().await.unwrap()), "data change");
+        assert_eq!(a, f(s.explorer_fingerprints().await.unwrap()), "data change");
         exec(s.as_ref(), "alter table t add column name text").await;
-        assert_ne!(a, f(s.schema_fingerprints().await.unwrap()), "schema change");
+        assert_ne!(a, f(s.explorer_fingerprints().await.unwrap()), "schema change");
     }
 
     #[tokio::test]

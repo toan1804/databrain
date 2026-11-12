@@ -170,7 +170,7 @@ pub async fn index_connection_with(
     // Incremental: one catalog query tells which schemas changed since the
     // last run; unchanged ones are not fetched again.
     let current: HashMap<String, String> = tokio::select! {
-        r = engine.schema_fingerprints(connection_id) => r.ok().flatten().unwrap_or_default(),
+        r = engine.explorer_fingerprints(connection_id) => r.ok().flatten().unwrap_or_default(),
         _ = cancel.cancelled() => return Err(AiError::Cancelled),
     };
     let stored = if full { HashMap::new() } else { ws.kn_fingerprints(connection_id)? };

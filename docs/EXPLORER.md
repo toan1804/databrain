@@ -64,7 +64,7 @@ expand table ──► loadColumns
 
 ## Detecting stale entries
 
-- **Fingerprints** (`Session::explorer_fingerprints`, default = `schema_fingerprints`): one catalog query, one opaque value per schema. Equal to `listed_fp` means the cached listing is right and nothing is read.
+- **Fingerprints** (`Session::explorer_fingerprints`, `None` when an engine has none): one catalog query, one opaque value per schema. Equal to `listed_fp` means the cached listing is right and nothing is read.
 - **Object versions** (`Session::object_versions`): one value per object (`kind:name`). `refresh_schema_at` compares them to `meta_objects.version`, fetches only new or changed objects with `list_objects_named` (500 names per call), deletes gone ones and marks the changed tables' columns stale (`meta_apply_changes`). Above 30 % changed and more than 20 objects (`FULL_RELIST_SHARE`) one full listing is cheaper.
 - **No versions:** a changed schema is listed again (`meta_put_listing`) and every table's columns become stale, unless the fingerprint is unchanged.
 - **`stale` on columns** means "show, but describe again when online". It is set only by the listing paths above (`columns_changed`), and cleared by any describe that writes the cache (`api::describe`, grid edits in `query-engine/src/edit.rs`).
@@ -75,12 +75,12 @@ expand table ──► loadColumns
 | Engine | Explorer fingerprint | Object versions | A changed schema is |
 |---|---|---|---|
 | PostgreSQL | own: relations, columns, constraints, comments, sequences, routines (`xmin`) | yes | refreshed per object |
-| MySQL / MariaDB | index fingerprint + routines | yes | refreshed per object |
+| MySQL / MariaDB | tables, columns + routines | yes | refreshed per object |
 | SQL Server | own: `modify_date` + `MS_Description` | yes | refreshed per object |
 | Oracle | own: `last_ddl_time` | yes | refreshed per object |
-| Snowflake | index fingerprint (tables and columns) | no | listed again |
-| Databricks | index fingerprint (Unity Catalog tables; none on Hive metastore) | no | listed again |
-| DuckDB | index fingerprint (columns) | no | listed again |
+| Snowflake | tables, columns, functions, procedures, sequences | no | listed again |
+| Databricks | tables + routines (Unity Catalog; none on Hive metastore) | no | listed again |
+| DuckDB | columns, macros, sequences | no | listed again |
 | SQLite | `PRAGMA schema_version` | no | listed again |
 | Redshift, BigQuery, ClickHouse, MongoDB, Neo4j | none | no | listed again when open at connect, otherwise when expanded |
 
@@ -104,12 +104,13 @@ expand table ──► loadColumns
 | AI note targets, `resolve_table` (`crates/ai/src/knowledge.rs`) | `meta_resolve_path`, `meta_get` before the server |
 | ER diagram (`ErTab.tsx` → `schema_tables`) | nothing: always live (`Session::schema_columns`), not cached |
 
-## The AI knowledge index
+## What the AI may use
 
-The knowledge index (`kn_objects` with `columns_json` and `fks_json`, `kn_schema_state` with fingerprints, FTS5 `kn_fts`; `crates/workspace/src/knowledge.rs`, `crates/ai/src/knowledge.rs`) is a separate store with its own fetch path:
+Server facts live once, in the explorer cache. The AI sees a subset, set by the user (`crates/workspace/src/ai_scope.rs`, design in `docs/design/metadata-store.md`):
 
-- It is filled only when the user (or the AI, with approval) indexes: `index_connection` reads `list_schemas`, `schema_fingerprints` and `bulk_metadata` on its own session (`index_tab`: `__index__` for server databases, the metadata session for local files); `index_tables` describes single tables. Neither writes the explorer cache, and explorer listings and describes never write the index.
-- Both keep foreign keys (the explorer cache since v19, from `describe` and grid edits).
-- Its staleness is per schema (`kn_schema_state` fingerprint, checked at the next index run); there is no per-table `stale` flag, and nothing re-checks it between runs.
-- Readers of one table go through `Workspace::meta_table`: the entry read from the server last (`meta_columns.seen_at` vs `kn_objects.indexed_at`) wins, foreign keys it doesn't know come from the other, and `stale` comes from the explorer cache (the index can't tell). `kn_column_names` (completion, lineage, the AI's joins) and `cached_test_data_plan` use it. `kn_complete` still merges both lists of names.
-- A connection identity change clears both.
+- `ai_scope`: the user's rules per connection: a schema id, `catalog.*` or `*`, with per-table allow or exclude. The most specific rule wins (a table rule, then a schema id, then `catalog.*`, then `*`); at one level an exclusion wins. No rule: the AI may not use it.
+- `ai_tables`: the rules applied to the tables, views and materialized views the explorer cache knows. The `ai_objects` view joins it to `meta_objects` and `meta_columns`; it is the only relation AI code reads facts from (through `Workspace::ai_catalog`, wrapped by `crates/ai/src/catalog.rs`, which also applies the access rules `read_allow`/`read_deny` and drops foreign keys to tables the AI may not use).
+- `ai_tables` and the object rows of `kn_fts` (full-text search) are recomputed in the same transaction as every write that can change them: `meta_put_listing`, `meta_apply_changes`, `meta_add_objects` (their schema), `meta_put_table` (one table's search row), dropped schemas, `meta_clear`, deleting a connection, and scope edits (`ai_set_scope`, `ai_put_rule`, `ai_delete_rule`, `ai_set_schema_rules`).
+- An index run (Knowledge → "Read columns") reads whole schemas with `bulk_metadata` on its own session (`__index__` for server databases) and writes the facts into the explorer cache; indexing a schema allows it, `index_tables` (the AI asked, the user approved) allows one table, and taking a schema out of the chosen scope removes its rules. It skips a schema whose `explorer_fingerprints` value is the one it was last read at (`kn_schema_state`). `kn_objects` is still written for one release so a downgrade keeps its index; nothing reads it.
+- User features (completion, lineage, note targets, "rows referencing this", test data) read the explorer cache directly and see every table DataBrain knows: the scope only limits the AI.
+- A connection identity change clears the facts (and so `ai_tables`); the scope rules stay.

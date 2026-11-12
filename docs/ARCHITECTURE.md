@@ -128,7 +128,7 @@ pub trait Session: Send + Sync {
     // With defaults: transaction_state, in_transaction, list_catalogs, list_catalog_schemas,
     // explorer_fingerprints, object_versions, list_objects_named, object_ddl,
     // search_objects, search_schema, search_routines, package_members,
-    // bulk_metadata, schema_fingerprints, schema_object_counts, check_sql,
+    // bulk_metadata, schema_object_counts, check_sql,
     // table_layout, schema_columns
 }
 ```
@@ -400,11 +400,11 @@ Then `access::check_sql` finds every table the SQL reads and writes (joins, subq
 
 ### 13.5 Knowledge
 
-The knowledge index lives in the workspace (`kn_objects` with columns, keys and a content hash; `kn_notes`; the FTS5 table `kn_fts` with title weighted 5x). `knowledge.rs`:
+Server facts live once, in the explorer cache (`meta_*`); what the AI may use is the user's scope over them (`ai_scope` → `ai_tables` → the `ai_objects` view, `crates/workspace/src/ai_scope.rs`; see [EXPLORER.md](EXPLORER.md#what-the-ai-may-use)). AI code reads table facts only through `crates/ai/src/catalog.rs` (`AiTables`), which adds the access rules; a test fails if it reads them another way. `kn_notes` and the FTS5 table `kn_fts` (title weighted 5x) stay. `knowledge.rs`:
 
-- **Indexing** reads metadata through `Session::bulk_metadata`. It compares `schema_fingerprints()` with the stored ones and skips unchanged schemas; "Rebuild" ignores them. Objects whose content hash is unchanged are not rewritten. `index_schemas` limits the scope.
+- **Reading columns** (an index run) reads metadata through `Session::bulk_metadata` into the explorer cache, and skips schemas whose `explorer_fingerprints()` value is unchanged since their last read; "Read all again" ignores them. Indexing a schema allows it for the AI.
 - **Retrieval** runs BM25 over `kn_fts`, adds tables named by matching notes, then follows foreign keys and learned joins one hop from the top tables, and renders the result as compact DDL within a character budget. Only approved notes are used. There are no embeddings.
-- **Notes** target one or more existing tables or columns, or none (glossary). Targets are checked against the index, the explorer cache and the live connection. Notes are exported and imported as `.databrain-notes.json`.
+- **Notes** target one or more existing tables or columns, or none (glossary). Targets you type are checked against the explorer cache and the live connection; the AI's are checked against what it may use. Notes are exported and imported as `.databrain-notes.json`.
 - **Learned from history** (`learn.rs`, `AiPolicy.learn_from_history`, on by default). The app checks every minute (`ai_api::learn_loop`) for connections with history after their cursor and runs passes of 500 entries. Each successful entry gives join keys (`databrain_lineage::join_pairs`, or MongoDB `$lookup` through the connector's analyzer) and the tables it reads; table names are resolved strictly (a bare name in several schemas only in the connection's default one, unknown names dropped). Sightings are stored per join (or table), query fingerprint and UTC day, so counts are distinct queries and days and a scheduled job counts once a day. Runs by the assistant itself (`ai`, `mcp` origin) are kept apart and never count; SQL the user runs from the editor counts whoever wrote it. A join reaches the AI when confirmed, or seen in 2 queries or on 2 days, and not when rejected, a declared FK, stale (a column gone from the index) or touching a table the AI may not read (`usable_joins`); then it is rendered as `JOIN (cols) = table(cols)  -- learned …` lines, used for one-hop expansion after foreign keys, and by `find_join_path`. Table usage scales BM25 scores by `1 + 0.2·ln(1 + queries)`. After an index run the connection's kept history is read again (idempotent). Knowledge → "Learned from query history" lists joins with why each is or isn't given to the AI, and confirms, rejects, shows the source queries, makes a note or forgets.
 
 ### 13.6 Inline completion

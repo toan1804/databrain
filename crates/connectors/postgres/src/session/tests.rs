@@ -228,24 +228,24 @@ async fn live_bulk_metadata_and_fingerprints() {
     assert_eq!(s.schema_columns("kb_b").await.unwrap().iter().find(|t| t.table == "orders").unwrap(), orders);
 
     let fp = |m: &std::collections::HashMap<String, String>, k: &str| m.get(k).cloned().unwrap();
-    let f0 = s.schema_fingerprints().await.unwrap().unwrap();
+    let f0 = s.explorer_fingerprints().await.unwrap().unwrap();
     // This test's schemas only: other live tests change theirs meanwhile.
     let mine = |m: &std::collections::HashMap<String, String>| ["kb_a", "kb_b", "kb_c"].map(|k| fp(m, k));
-    assert_eq!(mine(&f0), mine(&s.schema_fingerprints().await.unwrap().unwrap()), "stable without changes");
+    assert_eq!(mine(&f0), mine(&s.explorer_fingerprints().await.unwrap().unwrap()), "stable without changes");
     run("alter table kb_a.customers add column name text").await;
-    let f1 = s.schema_fingerprints().await.unwrap().unwrap();
+    let f1 = s.explorer_fingerprints().await.unwrap().unwrap();
     assert_ne!(fp(&f0, "kb_a"), fp(&f1, "kb_a"), "new column");
     assert_eq!(fp(&f0, "kb_c"), fp(&f1, "kb_c"), "other schemas unchanged");
     run("comment on column kb_b.orders.total is 'gross'").await;
-    let f2 = s.schema_fingerprints().await.unwrap().unwrap();
+    let f2 = s.explorer_fingerprints().await.unwrap().unwrap();
     assert_ne!(fp(&f1, "kb_b"), fp(&f2, "kb_b"), "comment");
     run("alter table kb_b.orders rename column total to amount").await;
-    let f3 = s.schema_fingerprints().await.unwrap().unwrap();
+    let f3 = s.explorer_fingerprints().await.unwrap().unwrap();
     assert_ne!(fp(&f2, "kb_b"), fp(&f3, "kb_b"), "renamed column");
     run("drop view kb_b.big_orders").await;
-    assert_ne!(fp(&f3, "kb_b"), fp(&s.schema_fingerprints().await.unwrap().unwrap(), "kb_b"), "dropped view");
+    assert_ne!(fp(&f3, "kb_b"), fp(&s.explorer_fingerprints().await.unwrap().unwrap(), "kb_b"), "dropped view");
     run("insert into kb_c.untouched values (1); analyze kb_c.untouched").await;
-    assert_eq!(fp(&f3, "kb_c"), fp(&s.schema_fingerprints().await.unwrap().unwrap(), "kb_c"), "data changes are not schema changes");
+    assert_eq!(fp(&f3, "kb_c"), fp(&s.explorer_fingerprints().await.unwrap().unwrap(), "kb_c"), "data changes are not schema changes");
     run("drop schema kb_a cascade; drop schema kb_b cascade; drop schema kb_c cascade").await;
 }
 

@@ -51,8 +51,6 @@ Paths are in `crates/query-engine/src/` unless given in full. Items 1, 2 and 5 w
 
 ## Explorer and AI index (left from the review of 2026-11-12)
 
-- **Snowflake, Databricks and DuckDB miss new routines on refresh.** Their explorer fingerprint is the index's (tables and columns), but their listings include functions, procedures, sequences and macros: a new one shows only after the schema's own Refresh. Fixed by the single fingerprint in the metadata-store design (step 3).
-- **Two stores for the same facts.** The explorer cache and the AI index are still filled separately (`meta_table` reconciles them per table). The chosen design makes `meta_*` the only copy, with an allow-list for what the AI may use; it is not built yet.
 - PostgreSQL row estimates are refreshed only when the schema changes (the explorer fingerprint leaves out `reltuples`).
 - The ER diagram (`schema_tables`) is always read live and doesn't work offline.
 - `clear_explorer_cache` is a command the UI never calls.

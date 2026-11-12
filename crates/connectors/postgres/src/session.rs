@@ -548,43 +548,6 @@ impl Session for PgSession {
         })
     }
 
-    /// One catalog aggregate for every schema: relations (oid, row version,
-    /// size class), columns, constraints and comments. Any DDL creates new
-    /// catalog row versions (xmin), so the value changes.
-    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
-        if self.redshift {
-            return Ok(None);
-        }
-        let rows = self
-            .client()
-            .query(
-                "with rel as ( \
-                   select c.relnamespace ns, count(*) n, \
-                          sum(hashtext(c.oid::text || ':' || c.xmin::text || ':' || c.relname || ':' || \
-                                       floor(log(greatest(c.reltuples, 1)::numeric))::text)) h \
-                   from pg_catalog.pg_class c where c.relkind in ('r','p','v','m','f') and not c.relispartition group by 1), \
-                 att as ( \
-                   select c.relnamespace ns, sum(hashtext(a.attrelid::text || ':' || a.attnum || ':' || a.xmin::text)) h \
-                   from pg_catalog.pg_attribute a join pg_catalog.pg_class c on c.oid = a.attrelid \
-                   where c.relkind in ('r','p','v','m','f') and not c.relispartition and a.attnum > 0 group by 1), \
-                 con as ( \
-                   select c.relnamespace ns, sum(hashtext(k.oid::text || ':' || k.xmin::text)) h \
-                   from pg_catalog.pg_constraint k join pg_catalog.pg_class c on c.oid = k.conrelid group by 1), \
-                 des as ( \
-                   select c.relnamespace ns, sum(hashtext(d.objoid::text || ':' || d.objsubid || ':' || md5(d.description))) h \
-                   from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid \
-                   where d.classoid = 'pg_catalog.pg_class'::regclass group by 1) \
-                 select n.nspname::text, concat_ws('/', coalesce(rel.n, 0), rel.h, att.h, con.h, des.h) \
-                 from pg_catalog.pg_namespace n \
-                 left join rel on rel.ns = n.oid left join att on att.ns = n.oid \
-                 left join con on con.ns = n.oid left join des on des.ns = n.oid",
-                &[],
-            )
-            .await
-            .map_err(|e| map_err(&e))?;
-        Ok(Some(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))).collect()))
-    }
-
     async fn bulk_metadata(&self, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
         if self.redshift {
             return databrain_connector_core::default_bulk_metadata(self, schemas).await;

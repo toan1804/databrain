@@ -837,7 +837,8 @@ impl Session for SfSession {
 
     /// HASH_AGG of table and column definitions per schema, one query per
     /// database (LAST_ALTERED is not used: data loads change it too).
-    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+    /// Tables, columns, functions, procedures and sequences per schema.
+    async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         let mut out = std::collections::HashMap::new();
         for db in self.databases().await? {
             let d = quote_ident(ConnectorKind::Snowflake, &db);
@@ -845,7 +846,13 @@ impl Session for SfSession {
                 "select table_schema, 't' || count(*) || ':' || hash_agg(table_name, table_type, comment) from {d}.information_schema.tables group by 1 \
                  union all \
                  select table_schema, 'c' || count(*) || ':' || hash_agg(table_name, column_name, ordinal_position, data_type, character_maximum_length, numeric_precision, numeric_scale, is_nullable, comment) \
-                 from {d}.information_schema.columns group by 1"
+                 from {d}.information_schema.columns group by 1 \
+                 union all \
+                 select function_schema, 'f' || count(*) || ':' || hash_agg(function_name, argument_signature, last_altered) from {d}.information_schema.functions group by 1 \
+                 union all \
+                 select procedure_schema, 'p' || count(*) || ':' || hash_agg(procedure_name, argument_signature, last_altered) from {d}.information_schema.procedures group by 1 \
+                 union all \
+                 select sequence_schema, 's' || count(*) || ':' || hash_agg(sequence_name, increment, last_altered) from {d}.information_schema.sequences group by 1"
             );
             let Ok(rows) = self.0.run_small(&sql).await else { continue };
             let mut parts: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();

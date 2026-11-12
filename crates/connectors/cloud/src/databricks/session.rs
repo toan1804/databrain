@@ -310,11 +310,12 @@ impl Session for DbxSession {
     /// Unity Catalog: per schema, relation count, latest `last_altered`
     /// (definition changes only, not data writes) and a hash of names,
     /// types and comments, in one query. Hive metastore: not supported.
-    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+    /// Tables and routines per schema (Unity Catalog; none on Hive metastore).
+    async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         let rows = match self
             .0
             .run_small(
-                "SELECT table_catalog, table_schema, concat(count(*), '/', cast(max(last_altered) AS STRING), '/', \
+                "SELECT table_catalog, table_schema, concat('t', count(*), '/', cast(max(last_altered) AS STRING), '/', \
                         cast(sum(hash(table_name, table_type, comment)) AS STRING)) \
                  FROM system.information_schema.tables WHERE table_schema <> 'information_schema' GROUP BY 1, 2",
             )
@@ -323,7 +324,28 @@ impl Session for DbxSession {
             Ok(r) => r,
             Err(_) => return Ok(None),
         };
-        Ok(Some(rows.iter().filter_map(|r| Some((format!("{}.{}", cell(r, 0)?, cell(r, 1)?), cell(r, 2).unwrap_or_default()))).collect()))
+        let mut out: std::collections::HashMap<String, String> =
+            rows.iter().filter_map(|r| Some((format!("{}.{}", cell(r, 0)?, cell(r, 1)?), cell(r, 2).unwrap_or_default()))).collect();
+        // Functions: a new one changes the schema too (best effort: older
+        // workspaces have no routines view).
+        if let Ok(rows) = self
+            .0
+            .run_small(
+                "SELECT specific_catalog, specific_schema, concat('r', count(*), '/', cast(max(last_altered) AS STRING), '/', \
+                        cast(sum(hash(routine_name, routine_type)) AS STRING)) \
+                 FROM system.information_schema.routines WHERE specific_schema <> 'information_schema' GROUP BY 1, 2",
+            )
+            .await
+        {
+            for r in &rows {
+                if let (Some(c), Some(s)) = (cell(r, 0), cell(r, 1)) {
+                    let e = out.entry(format!("{c}.{s}")).or_default();
+                    e.push('|');
+                    e.push_str(&cell(r, 2).unwrap_or_default());
+                }
+            }
+        }
+        Ok(Some(out))
     }
 
     async fn schema_object_counts(&self) -> Result<Option<std::collections::HashMap<String, usize>>> {

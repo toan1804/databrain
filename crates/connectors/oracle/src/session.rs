@@ -446,18 +446,6 @@ impl Session for OracleSession {
         Ok(Some(out))
     }
 
-    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
-        let rows = self
-            .query_named(
-                "select owner, count(*) || '/' || to_char(max(last_ddl_time), 'YYYYMMDDHH24MISS') \
-                 from all_objects where object_type in ('TABLE','VIEW','MATERIALIZED VIEW') and object_name not like 'BIN$%' \
-                 group by owner",
-                vec![],
-            )
-            .await?;
-        Ok(Some(rows.into_iter().filter_map(|r| Some((r.first().cloned().flatten()?, r.get(1).cloned().flatten().unwrap_or_default()))).collect()))
-    }
-
     async fn bulk_metadata(&self, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
         match self.bulk_metadata_batched(schemas).await {
             Ok(m) => Ok(m),
@@ -668,10 +656,10 @@ mod tests {
         let v = s.object_ddl(&me, "KB_THIN_V", ObjectKind::View).await.unwrap().unwrap();
         assert!(v.starts_with("CREATE OR REPLACE VIEW") && v.contains("where id > 10"), "{driver}: {v}");
         run("drop view kb_thin_v").await.unwrap();
-        let f0 = s.schema_fingerprints().await.unwrap().unwrap()[&me].clone();
+        let f0 = s.explorer_fingerprints().await.unwrap().unwrap()[&me].clone();
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         run("alter table kb_thin add (extra number)").await.unwrap();
-        assert_ne!(f0, s.schema_fingerprints().await.unwrap().unwrap()[&me]);
+        assert_ne!(f0, s.explorer_fingerprints().await.unwrap().unwrap()[&me]);
 
         // Cancel a long query; the session stays usable.
         let cancel = databrain_connector_core::CancellationToken::new();

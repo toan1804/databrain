@@ -9,7 +9,6 @@ use crate::schema::COLUMNS_SQL;
 use crate::schema::EXPLORER_FINGERPRINTS_SQL;
 use crate::schema::MSSQL_TABLE_EXTRAS;
 use crate::schema::SCHEMA_FILTER;
-use crate::schema::SCHEMA_FINGERPRINTS_SQL;
 use crate::schema::SCHEMAS_SQL;
 use crate::schema::column_fill;
 use crate::schema::column_from;
@@ -497,18 +496,6 @@ impl Session for MssqlSession {
                 })
                 .collect(),
         ))
-    }
-
-    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
-        if !self.all_dbs {
-            let rows = self.rows(SCHEMA_FINGERPRINTS_SQL, vec![]).await?;
-            return Ok(Some(
-                rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect(),
-            ));
-        }
-        let sql = format!("select db_name() + '.' + x.n, x.f from ({SCHEMA_FINGERPRINTS_SQL}) x(n, f)");
-        let rows = self.rows_all(each_db(&self.db_names().await?, &sql)).await?;
-        Ok(Some(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<&str, _>(1).unwrap_or_default().to_string()))).collect()))
     }
 
     /// Three catalog queries for the whole batch of schemas.

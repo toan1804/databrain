@@ -186,7 +186,7 @@ mod tests {
         assert!(m[1].objects.iter().any(|o| o.name == "big_orders" && o.kind == ObjectKind::View));
         assert_eq!(&s.schema_columns("kb_b").await.unwrap().into_iter().find(|t| t.table == "orders").unwrap(), orders, "same as per-schema path");
 
-        let fps = || async { s.schema_fingerprints().await.unwrap().unwrap() };
+        let fps = || async { s.explorer_fingerprints().await.unwrap().unwrap() };
         let f0 = fps().await;
         // Only this test's schemas: tests running alongside change theirs.
         let ours = |f: &std::collections::HashMap<String, String>| {

@@ -184,13 +184,6 @@ pub(crate) const EXPLORER_FINGERPRINTS_SQL: &str = "select s.name, concat( \
                       join sys.objects o on o.object_id = ep.major_id where ep.class = 1 and ep.name = 'MS_Description' and o.schema_id = s.schema_id)) \
                  from sys.schemas s";
 
-pub(crate) const SCHEMA_FINGERPRINTS_SQL: &str = "select s.name, concat( \
-                   (select count(*) from sys.objects o where o.schema_id = s.schema_id and o.type in ('U','V','F') and o.is_ms_shipped = 0), '/', \
-                   (select convert(varchar(30), max(o.modify_date), 126) from sys.objects o where o.schema_id = s.schema_id and o.type in ('U','V','F')), '/', \
-                   (select checksum_agg(checksum(ep.major_id, ep.minor_id, cast(ep.value as nvarchar(4000)))) from sys.extended_properties ep \
-                      join sys.objects o on o.object_id = ep.major_id where ep.class = 1 and ep.name = 'MS_Description' and o.schema_id = s.schema_id)) \
-                 from sys.schemas s";
-
 /// Schemas of the current database, `(name, is the user's default)`.
 pub(crate) const SCHEMAS_SQL: &str = "select s.name, cast(case when s.name = schema_name() then 1 else 0 end as bit) from sys.schemas s \
     where s.name not like 'db[_]%' and s.name not in ('sys','INFORMATION_SCHEMA','guest') \

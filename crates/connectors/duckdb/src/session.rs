@@ -172,7 +172,8 @@ impl Session for DuckSession {
 
     /// Hash of every column definition and comment per schema (local
     /// catalogs: cheap). `results` outputs are left out (always re-read).
-    async fn schema_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
+    /// Tables, columns, macros and sequences per schema.
+    async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         let rows = self
             .strings(
                 "select database_name || '.' || schema_name, \
@@ -183,6 +184,25 @@ impl Session for DuckSession {
             )
             .await?;
         let mut map: std::collections::HashMap<String, String> = rows.into_iter().filter_map(|r| Some((r[0].clone()?, r[1].clone()?))).collect();
+        let others = self
+            .strings(
+                "select database_name || '.' || schema_name, 'f' || md5(string_agg(function_name || ':' || coalesce(macro_definition, ''), ',' order by function_name)) \
+                 from duckdb_functions() where not internal and database_name <> 'results' group by 1 \
+                 union all \
+                 select database_name || '.' || schema_name, 's' || md5(string_agg(sequence_name || ':' || increment_by, ',' order by sequence_name)) \
+                 from duckdb_sequences() where not internal and database_name <> 'results' group by 1"
+                    .into(),
+                vec![],
+            )
+            .await
+            .unwrap_or_default();
+        for r in others {
+            if let (Some(s), Some(f)) = (r[0].clone(), r[1].clone()) {
+                let e = map.entry(s).or_default();
+                e.push('|');
+                e.push_str(&f);
+            }
+        }
         // Schemas without columns (an empty `main`) are unchanged too.
         for s in self.list_schemas().await? {
             if s.catalog.as_deref() != Some("results") {

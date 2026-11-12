@@ -69,8 +69,7 @@ Required: `kind`, `server_version`, `ping`, `execute`, `list_schemas`, `list_obj
 | `transaction_state()` | `TxState::Unknown` | Unknown counts as open: the session is kept (not idle-closed or replaced on Refresh), so a connector that doesn't implement it never loses work, but it also never gets the Commit/Rollback badge. Every connector implements it: Postgres, MySQL, SQL Server, DuckDB and Snowflake from the statements run (`ConnState`, MySQL also from the server's status flag), SQLite from the driver, and `None` for engines without transactions across statements (Oracle with autocommit, BigQuery, Databricks, ClickHouse, MongoDB, Neo4j). `in_transaction()` is "not `None`". |
 | `list_catalogs()` | `None` | A two-level engine: the explorer starts at schemas |
 | `list_catalog_schemas(catalog)` | filters `list_schemas()` | Every schema is listed to show one catalog |
-| `explorer_fingerprints()` | `schema_fingerprints()` | Right only when the explorer lists nothing but tables and columns |
-| `schema_fingerprints()` | `None` | Every schema is re-read on each index run and explorer check |
+| `explorer_fingerprints()` | `None` | Every schema is re-read on each explorer check and index run. It must cover everything the explorer lists (tables, views, routines, sequences, columns, comments) |
 | `object_versions(schema)` | `None` | A changed schema is re-listed whole, not table by table. When implemented it must cover exactly what `list_objects` returns, keyed by `version_key` |
 | `list_objects_named(schema, names)` | lists the schema, filters | |
 | `object_ddl(schema, name, kind)` | `describe().ddl` for relations, `None` otherwise | No DDL for routines; table DDL only as complete as `describe` makes it |

@@ -564,7 +564,7 @@ impl Workspace {
         Ok(changed)
     }
 
-    /// Fingerprints of the schemas as last indexed (see `Session::schema_fingerprints`).
+    /// Fingerprints of the schemas as last read in full (see `Session::explorer_fingerprints`).
     pub fn kn_fingerprints(&self, connection_id: &str) -> Result<std::collections::HashMap<String, String>> {
         let c = self.conn.lock();
         let mut stmt = c.prepare("SELECT schema_name, fingerprint FROM kn_schema_state WHERE connection_id = ?1")?;
