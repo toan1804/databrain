@@ -9,6 +9,7 @@ pub mod kiro;
 pub mod knowledge;
 pub mod learn;
 pub mod mcp;
+pub mod meter;
 pub mod pii;
 pub mod policy;
 pub mod providers;

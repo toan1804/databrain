@@ -127,26 +127,34 @@ pub async fn complete(ws: &Workspace, secrets: Arc<dyn SecretStore>, req: &Ghost
         format!("{}SQL (cursor at <CURSOR>):\n{prefix}<CURSOR>{suffix}", if schema.is_empty() { String::new() } else { format!("Schema:\n{schema}\n\n") });
     let chat = ChatRequest { model, system, messages: vec![Message::user(user)], tools: vec![], temperature: Some(0.0), max_tokens: Some(160) };
 
-    // Tokens the provider reports, counted in its usage.
-    let used = std::sync::Mutex::new((0u32, 0u32));
+    // Tokens counted in the provider's usage: as reported, or estimated
+    // when typing cancels the call before the report comes.
+    let meter = crate::meter::Meter::default();
     let run = async {
-        let mut stream = provider.chat_stream(chat).await?;
+        let mut stream = provider.chat_stream(chat.clone()).await?;
+        meter.sent(&chat);
         let mut text = String::new();
         // Providers report usage after Done: read to the end.
         while let Some(ev) = stream.next().await {
             match ev? {
-                ChatEvent::TextDelta(t) if text.len() <= 2_000 => text.push_str(&t),
-                ChatEvent::Usage { input, output } => *used.lock().unwrap_or_else(|e| e.into_inner()) = (input, output),
+                ChatEvent::TextDelta(t) => {
+                    meter.text(&t);
+                    if text.len() <= 2_000 {
+                        text.push_str(&t);
+                    }
+                }
+                ChatEvent::Usage { input, output } => meter.reported(input, output),
                 _ => {}
             }
         }
+        meter.finished();
         Ok::<_, AiError>(text)
     };
     let r = tokio::select! {
         r = tokio::time::timeout(TIMEOUT, run) => r.map_err(|_| AiError::Network("the model took too long".into())).and_then(|r| r),
         _ = cancel.cancelled() => Err(AiError::Cancelled),
     };
-    let (i, o) = *used.lock().unwrap_or_else(|e| e.into_inner());
+    let (i, o) = meter.tokens();
     if let Err(e) = ws.record_ai_usage(&rec.id, "inline", i, o) {
         tracing::warn!("couldn't record AI usage: {e}");
     }

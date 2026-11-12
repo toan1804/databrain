@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::access;
 use crate::agent::provider_for;
+use crate::meter::Meter;
 use crate::types::*;
 
 /// How "Generate test data" uses the AI (the dialog's settings).
@@ -95,20 +96,26 @@ fn target(ws: &Workspace, secrets: Arc<dyn SecretStore>, connection_id: &str, ai
     Ok(Target { provider, provider_id: rec.id, model, checks })
 }
 
-/// One call: the answer's text and the tokens it took (read to the end of
-/// the stream: providers report usage after Done).
-async fn ask_model(provider: &Arc<dyn crate::providers::LlmProvider>, chat: ChatRequest) -> Result<(String, (u32, u32))> {
+/// One call: the answer's text. Its tokens go to `meter` as they come (read
+/// to the end of the stream: providers report usage after Done), so a call
+/// stopped half way is counted too.
+async fn ask_model(provider: &Arc<dyn crate::providers::LlmProvider>, chat: ChatRequest, meter: &Meter) -> Result<String> {
     let run = async {
-        let mut stream = provider.chat_stream(chat).await?;
-        let (mut text, mut usage) = (String::new(), (0u32, 0u32));
+        let mut stream = provider.chat_stream(chat.clone()).await?;
+        meter.sent(&chat);
+        let mut text = String::new();
         while let Some(ev) = stream.next().await {
             match ev? {
-                ChatEvent::TextDelta(t) => text.push_str(&t),
-                ChatEvent::Usage { input, output } => usage = (input, output),
+                ChatEvent::TextDelta(t) => {
+                    meter.text(&t);
+                    text.push_str(&t);
+                }
+                ChatEvent::Usage { input, output } => meter.reported(input, output),
                 _ => {}
             }
         }
-        Ok::<_, AiError>((text, usage))
+        meter.finished();
+        Ok::<_, AiError>(text)
     };
     tokio::time::timeout(TIMEOUT, run).await.map_err(|_| AiError::Network("the model took too long".into()))?
 }
@@ -134,12 +141,13 @@ pub async fn suggest_patterns(
     let (system, user) = suggest_prompt(ask, &t.checks);
     let chat =
         ChatRequest { model: t.model.clone(), system, messages: vec![Message::user(user)], tools: vec![], temperature: Some(0.2), max_tokens: Some(2_000) };
+    let meter = Meter::default();
     let r = tokio::select! {
-        r = ask_model(&t.provider, chat) => r,
-        _ = cancel.cancelled() => return Err(AiError::Cancelled),
+        r = ask_model(&t.provider, chat, &meter) => r,
+        _ = cancel.cancelled() => Err(AiError::Cancelled),
     };
-    let (text, used) = r?;
-    record(ws, &t.provider_id, used);
+    record(ws, &t.provider_id, meter.tokens());
+    let text = r?;
     parse_patterns(&text, ask).ok_or_else(|| AiError::Provider("the model's answer wasn't the JSON object of patterns asked for".into()))
 }
 
@@ -205,49 +213,52 @@ pub async fn sample(
 ) -> Result<AiSample> {
     let Target { provider, provider_id, model, checks } = target(ws, secrets, connection_id, ai, ask)?;
     let batches = ask.rows.div_ceil(BATCH_ROWS).max(1);
-    let calls = (0..batches).map(|b| {
-        let n = BATCH_ROWS.min(ask.rows - b * BATCH_ROWS);
-        let (system, user) = prompt(ask, &checks, b, batches, n);
-        let chat = ChatRequest {
-            model: model.clone(),
-            system,
-            messages: vec![Message::user(user)],
-            tools: vec![],
-            temperature: Some(0.9),
-            max_tokens: Some(max_tokens(ask, n)),
-        };
-        let provider = provider.clone();
-        async move { ask_model(&provider, chat).await }
-    });
+    // Each call's tokens: those that came back, those cut off by Stop, and
+    // those that failed (counted in the provider's usage either way).
+    let mut meters: Vec<Meter> = Vec::new();
+    let calls: Vec<_> = (0..batches)
+        .map(|b| {
+            let n = BATCH_ROWS.min(ask.rows - b * BATCH_ROWS);
+            let (system, user) = prompt(ask, &checks, b, batches, n);
+            let chat = ChatRequest {
+                model: model.clone(),
+                system,
+                messages: vec![Message::user(user)],
+                tools: vec![],
+                temperature: Some(0.9),
+                max_tokens: Some(max_tokens(ask, n)),
+            };
+            let provider = provider.clone();
+            let meter = Meter::default();
+            meters.push(meter.clone());
+            async move { ask_model(&provider, chat, &meter).await }
+        })
+        .collect();
     let columns: Vec<String> = ask.columns.iter().map(|c| c.name.clone()).collect();
     let mut stream = futures::stream::iter(calls).buffer_unordered(PARALLEL);
     let mut rows = Vec::new();
     let mut last_error = None;
-    // Tokens of the calls that came back, counted in the provider's usage
-    // (also when the rows are thrown away or the user stops).
-    let mut used = (0u32, 0u32);
-    let record = |used| record(ws, &provider_id, used);
+    let record = || record(ws, &provider_id, crate::meter::total(&meters));
     loop {
         let next = tokio::select! {
             n = stream.next() => n,
             _ = cancel.cancelled() => {
-                record(used);
+                drop(stream);
+                record();
                 return Err(AiError::Cancelled);
             }
         };
         let Some(r) = next else { break };
-        if let Ok((_, (i, o))) = &r {
-            used = (used.0.saturating_add(*i), used.1.saturating_add(*o));
-        }
         match r {
-            Ok((text, _)) => match parse_rows(&text, &columns) {
+            Ok(text) => match parse_rows(&text, &columns) {
                 Some(mut r) => rows.append(&mut r),
                 None => last_error = Some(AiError::Provider("the model's answer wasn't the JSON rows asked for".into())),
             },
             Err(e) => last_error = Some(e),
         }
     }
-    record(used);
+    drop(stream);
+    record();
     if rows.is_empty() {
         return Err(last_error.unwrap_or_else(|| AiError::Provider("the model wrote no rows".into())));
     }
@@ -344,6 +355,45 @@ fn parse_rows(text: &str, columns: &[String]) -> Option<Vec<Vec<Option<String>>>
 mod tests {
     use super::*;
     use databrain_query_engine::testdata::AiColumn;
+
+    /// Writes some text, then (unless `ends`) never finishes; reports usage
+    /// only at the end, as providers do.
+    struct Slow {
+        ends: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for Slow {
+        fn kind(&self) -> crate::providers::ProviderKind {
+            crate::providers::ProviderKind::Openai
+        }
+        async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+            Ok(vec![])
+        }
+        async fn chat_stream(&self, _: ChatRequest) -> Result<futures::stream::BoxStream<'static, Result<ChatEvent>>> {
+            let head = futures::stream::iter(vec![Ok(ChatEvent::TextDelta("x".repeat(80)))]);
+            if self.ends {
+                Ok(head.chain(futures::stream::iter(vec![Ok(ChatEvent::Usage { input: 7, output: 3 })])).boxed())
+            } else {
+                Ok(head.chain(futures::stream::pending()).boxed())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_calls_are_counted_by_estimate() {
+        let chat = || ChatRequest { model: "m".into(), system: "s".repeat(400), messages: vec![], tools: vec![], temperature: None, max_tokens: None };
+        let stopped: Arc<dyn crate::providers::LlmProvider> = Arc::new(Slow { ends: false });
+        let meter = Meter::default();
+        let r = tokio::time::timeout(Duration::from_millis(50), ask_model(&stopped, chat(), &meter)).await;
+        assert!(r.is_err(), "still running when stopped");
+        assert_eq!(meter.tokens(), (100, 20), "400 prompt and 80 answer characters");
+        // A finished call counts what the provider reported.
+        let done: Arc<dyn crate::providers::LlmProvider> = Arc::new(Slow { ends: true });
+        let meter = Meter::default();
+        assert_eq!(ask_model(&done, chat(), &meter).await.unwrap().len(), 80);
+        assert_eq!(meter.tokens(), (7, 3));
+    }
 
     fn ask() -> AiAsk {
         AiAsk {
