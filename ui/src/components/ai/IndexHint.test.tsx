@@ -22,8 +22,8 @@ describe("index hint", () => {
     useStore.setState({ connections: [conn()], objects: {} });
     vi.spyOn(api, "knGet").mockResolvedValue({ state: null, notes: [] });
     render(<IndexHint connId="c1" />);
-    await screen.findByText(/doesn't know/);
-    fireEvent.click(screen.getByText("Index in Knowledge"));
+    await screen.findByText(/may not use any of/);
+    fireEvent.click(screen.getByText("Choose in Knowledge"));
     expect(useAi.getState().view).toBe("knowledge");
     expect(useAi.getState().knowledgeFocus).toBe("c1");
   });
@@ -37,7 +37,7 @@ describe("index hint", () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(RETRY_MS[0]);
       });
-      await screen.findByText(/doesn't know/);
+      await screen.findByText(/may not use any of/);
       expect(get).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
@@ -48,8 +48,8 @@ describe("index hint", () => {
     useStore.setState({ connections: [conn()], objects: { "c1|public": tables(120) } });
     vi.spyOn(api, "knGet").mockResolvedValue({ state: state(10), notes: [] });
     render(<IndexHint connId="c1" />);
-    await screen.findByText(/Only 10 of the 120 tables/);
-    expect(screen.getByText("Review the index in Knowledge")).toBeTruthy();
+    await screen.findByText(/may use 10 of the 120 tables/);
+    expect(screen.getByText("Review in Knowledge")).toBeTruthy();
   });
 
   it("stays away when the index covers the explorer, AI is off, or it was dismissed", async () => {
@@ -69,7 +69,7 @@ describe("index hint", () => {
 
     useStore.setState({ connections: [conn()] });
     render(<IndexHint connId="c1" />);
-    await screen.findByText(/doesn't know/);
+    await screen.findByText(/may not use any of/);
     fireEvent.click(screen.getByLabelText("Dismiss"));
     expect(screen.queryByRole("note")).toBeNull();
   });
@@ -79,11 +79,11 @@ describe("index hint", () => {
     let resolve: (v: { state: KnState; notes: [] }) => void = () => {};
     const get = vi.spyOn(api, "knGet").mockResolvedValueOnce({ state: null, notes: [] });
     render(<IndexHint connId="c1" />);
-    await screen.findByText(/doesn't know/);
+    await screen.findByText(/may not use any of/);
     get.mockImplementationOnce(() => new Promise((r) => (resolve = r)));
     // Indexing done: progress cleared and the index changed in one update.
     act(() => useAi.setState({ knowledgeProgress: {}, knowledgeVersion: 1 }));
-    expect(screen.queryByText(/doesn't know/)).toBeNull();
+    expect(screen.queryByText(/may not use any of/)).toBeNull();
     await act(async () => resolve({ state: state(30), notes: [] }));
     expect(screen.queryByRole("note")).toBeNull();
   });

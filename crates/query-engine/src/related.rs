@@ -55,7 +55,7 @@ impl QueryEngine {
             out.push(ResultLink { direction: LinkDirection::Parent, schema, table: fk.ref_table.clone(), columns, target_columns: fk.ref_columns.clone() });
         }
         let table = &src.detail.object.name;
-        let incoming = match self.workspace().kn_foreign_keys_to(&o.connection_id, table)? {
+        let incoming = match self.workspace().meta_foreign_keys_to(&o.connection_id, table)? {
             Some(v) => v,
             None => self
                 .bulk_metadata(&o.connection_id, std::slice::from_ref(&src.schema))

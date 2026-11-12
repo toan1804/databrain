@@ -127,6 +127,24 @@ pub(crate) async fn kn_objects(state: State<'_, AppState>, connection_id: String
     ai_api::knowledge_objects(&state, &connection_id, &filter, offset, limit)
 }
 
+/// The AI scope's rules (what the AI may use on the connection).
+#[tauri::command]
+pub(crate) fn ai_scope(state: State<'_, AppState>, connection_id: String) -> R<Vec<databrain_workspace::ScopeRule>> {
+    Ok(state.workspace.ai_scope(&connection_id)?)
+}
+
+/// Allow or exclude a schema or one table for the AI.
+#[tauri::command]
+pub(crate) fn ai_put_rule(state: State<'_, AppState>, connection_id: String, rule: databrain_workspace::ScopeRule) -> R<()> {
+    Ok(state.workspace.ai_put_rule(&connection_id, &rule)?)
+}
+
+/// Remove one rule (a table goes back to its schema's rule).
+#[tauri::command]
+pub(crate) fn ai_delete_rule(state: State<'_, AppState>, connection_id: String, schema: String, table: String) -> R<()> {
+    Ok(state.workspace.ai_delete_rule(&connection_id, &schema, &table)?)
+}
+
 #[tauri::command]
 pub(crate) async fn kn_index(state: State<'_, AppState>, connection_id: String, scope: Option<Vec<String>>, batch: Option<u32>, full: Option<bool>) -> R<()> {
     ai_api::index_knowledge(&state, &connection_id, scope, batch, full.unwrap_or(false))

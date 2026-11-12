@@ -848,7 +848,8 @@ async fn table_access_rules() {
     assert!(o.content.contains("may only write tables matching 'main.scratch%'"), "{}", o.content);
     // sample_rows and MCP.
     let o = ctx.call("get_sample_rows", &json!({"table": "main.customers"})).await;
-    assert!(o.content.starts_with("ERROR") && o.content.contains("deny"), "{}", o.content);
+    // Denied reads as missing (the same words as a table that isn't there).
+    assert!(o.content.starts_with("ERROR") && o.content.contains("not available to the AI"), "{}", o.content);
     let mcp = databrain_ai::ToolContext {
         caller: databrain_ai::Caller::Mcp,
         profile: ctx.profile.clone(),
@@ -1421,7 +1422,9 @@ async fn index_tables_adds_missing_tables_after_approval() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let port = mock_openai(requests.clone()).await;
     let f = fixture(port, AiPolicy::default()).await;
+    // The AI may use nothing on the connection.
     f.ws.kn_clear(&f.conn).unwrap();
+    f.ws.ai_set_scope(&f.conn, &[]).unwrap();
     let ctx = |approve: bool| databrain_ai::ToolContext {
         engine: f.engine.clone(),
         hub: f.hub.clone(),
@@ -1473,7 +1476,7 @@ async fn documented_joins_are_checked_reviewed_and_used() {
     let o = ctx.call("add_knowledge_join", &join("orders", &["nope"], "customers", &["id"], "spec")).await;
     assert!(o.content.contains("has no column `nope`") && o.content.contains("customer_id"), "{}", o.content);
     let o = ctx.call("add_knowledge_join", &join("invoices", &["id"], "customers", &["id"], "spec")).await;
-    assert!(o.content.contains("not in the knowledge index"), "{}", o.content);
+    assert!(o.content.contains("not available to the AI"), "{}", o.content);
     let o = ctx.call("add_knowledge_join", &join("orders", &["country"], "customers", &["name"], " ")).await;
     assert!(o.content.contains("source"), "{}", o.content);
     let o = ctx.call("add_knowledge_join", &join("orders", &["country", "id"], "customers", &["name"], "spec")).await;
@@ -1548,4 +1551,55 @@ async fn an_empty_reply_does_not_break_the_conversation() {
     let sent = requests.lock().last().cloned().unwrap();
     let roles: Vec<&str> = sent["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
     assert_eq!(roles, ["system", "user", "user"], "{sent}");
+}
+
+/// Every tool that reads table facts sees only what the AI scope allows: a
+/// table excluded by the user reads as missing, in the same words as one
+/// that doesn't exist; an allowed one answers.
+#[tokio::test]
+async fn ai_tools_see_only_the_tables_the_scope_allows() {
+    let f = fixture(1, AiPolicy { share_sample_values: true, ..Default::default() }).await;
+    f.ws.ai_put_rule(&f.conn, &databrain_workspace::ScopeRule { schema: "main".into(), table: "customers".into(), allow: false }).unwrap();
+    let ctx = databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: f.ws.get_connection(&f.conn).unwrap(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+    };
+    let missing = |c: &str| c.starts_with("ERROR") && c.contains("not available to the AI");
+    // describe_table
+    let o = ctx.call("describe_table", &json!({"table": "orders"})).await;
+    assert!(o.content.contains("customer_id") && !o.content.starts_with("ERROR"), "{}", o.content);
+    let o = ctx.call("describe_table", &json!({"table": "customers"})).await;
+    assert!(missing(&o.content), "{}", o.content);
+    let o = ctx.call("describe_table", &json!({"table": "no_such_table"})).await;
+    assert!(missing(&o.content), "{}", o.content);
+    // list_tables
+    let o = ctx.call("list_tables", &json!({})).await;
+    assert!(o.content.contains("main.orders") && !o.content.contains("customers"), "{}", o.content);
+    // search_schema
+    let o = ctx.call("search_schema", &json!({"query": "customers email name"})).await;
+    assert!(!o.content.contains("main.customers"), "{}", o.content);
+    let o = ctx.call("search_schema", &json!({"query": "orders amount country"})).await;
+    assert!(o.content.contains("main.orders"), "{}", o.content);
+    // get_sample_rows
+    let o = ctx.call("get_sample_rows", &json!({"table": "orders"})).await;
+    assert!(!o.content.starts_with("ERROR"), "{}", o.content);
+    let o = ctx.call("get_sample_rows", &json!({"table": "customers"})).await;
+    assert!(missing(&o.content), "{}", o.content);
+    // find_join_path
+    let o = ctx.call("find_join_path", &json!({"from": "orders", "to": "customers"})).await;
+    assert!(missing(&o.content), "{}", o.content);
+    // add_knowledge_join
+    let j = json!({"left_table": "orders", "left_columns": ["customer_id"], "right_table": "customers", "right_columns": ["id"], "source": "spec"});
+    let o = ctx.call("add_knowledge_join", &j).await;
+    assert!(missing(&o.content), "{}", o.content);
+    // Allowed again: answered.
+    f.ws.ai_delete_rule(&f.conn, "main", "customers").unwrap();
+    let o = ctx.call("describe_table", &json!({"table": "customers"})).await;
+    assert!(o.content.contains("email"), "{}", o.content);
 }

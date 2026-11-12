@@ -2,6 +2,7 @@ use databrain_workspace::NoteStatus;
 use serde_json::{Value, json};
 
 use super::{ToolContext, ToolOutput, arg, out};
+use crate::catalog::AiTables;
 use crate::knowledge;
 use crate::policy::{Decision, is_pii};
 use crate::types::{AiError, Result};
@@ -17,10 +18,10 @@ impl ToolContext {
         let r = knowledge::retrieve(self.engine.workspace(), &target.id, q, 8, 12_000)?;
         self.audit("search_schema", args, "allowed", Some(&format!("{} tables", r.tables.len())));
         if r.tables.is_empty() {
-            let hint = if self.engine.workspace().kn_count(&target.id)? == 0 {
-                "The knowledge index is empty. Use index_tables for the tables the question names (don't ask the user for their columns); for broad questions, suggest indexing the connection (AI panel → Knowledge → Index)."
+            let hint = if AiTables::with_profile(self.engine.workspace(), &target).count()? == 0 {
+                "No table is available to the AI on this connection yet. Use index_tables for the tables the question names (it asks the user to allow them; don't ask the user for their columns); for broad questions, suggest allowing schemas (AI panel → Knowledge → Index)."
             } else {
-                "No matching tables in the index. Try other keywords or list_tables; if the user named a table, index_tables reads it from the database."
+                "No matching tables among those available to the AI. Try other keywords or list_tables; if the user named a table, index_tables asks to allow it and reads it from the database."
             };
             return Ok(out(hint, json!({"tables": []})));
         }
@@ -34,11 +35,26 @@ impl ToolContext {
         Ok(out(text, json!({"tables": r.tables})))
     }
 
-    pub(super) fn describe_table(&self, args: &Value) -> Result<ToolOutput> {
+    pub(super) async fn describe_table(&self, args: &Value) -> Result<ToolOutput> {
         let t = arg(args, "table")?;
         let target = self.schema_target(args)?;
         let ws = self.engine.workspace();
-        let o = ws.kn_get(&target.id, t)?.ok_or_else(|| AiError::Policy(format!("table `{t}` is not in the knowledge index; search_schema with other words, or index_tables to read it from the database (don't ask the user for its columns)")))?;
+        let tables = AiTables::with_profile(ws, &target);
+        let mut o = tables.get(t)?.ok_or_else(|| AiError::Policy(knowledge::not_available(t)))?;
+        // Allowed but only listed (no columns yet), or changed since: read it
+        // now (metadata of a table the user allowed; cached for next time).
+        // Offline, what is cached is answered.
+        let stale = ws.meta_table_is_stale(&target.id, &o.schema, &o.name)?;
+        if target.ai_policy.share_metadata
+            && (o.columns.is_empty() || stale)
+            && let Ok(d) = self.engine.describe(&target.id, &o.schema, &o.name).await
+            && !d.columns.is_empty()
+        {
+            ws.meta_put_table(&target.id, &o.schema, &o.name, &d.columns, Some(&d.foreign_keys))?;
+            if let Some(fresh) = tables.get(&o.full_name())? {
+                o = fresh;
+            }
+        }
         let full = o.full_name();
         let notes: Vec<String> = ws
             .kn_notes(&target.id)?
@@ -52,8 +68,8 @@ impl ToolContext {
         let pol = target.ai_policy.clone();
         let mut text = knowledge::render_object(&o, &|c| is_pii(&pol, Some(&full), c), &notes);
         // Tables that reference this one.
-        let refs: Vec<String> = ws
-            .kn_objects(&target.id)?
+        let refs: Vec<String> = tables
+            .objects()?
             .into_iter()
             .filter(|x| x.foreign_keys.iter().any(|f| f.ref_table.eq_ignore_ascii_case(&o.name)))
             .map(|x| x.full_name())
@@ -154,16 +170,14 @@ impl ToolContext {
     pub(super) fn list_tables(&self, args: &Value) -> Result<ToolOutput> {
         let schema = args.get("schema").and_then(|s| s.as_str());
         let target = self.schema_target(args)?;
-        let names: Vec<String> = self
-            .engine
-            .workspace()
-            .kn_objects(&target.id)?
+        let names: Vec<String> = AiTables::with_profile(self.engine.workspace(), &target)
+            .objects()?
             .into_iter()
             .filter(|o| schema.is_none_or(|s| o.schema.eq_ignore_ascii_case(s)))
             .map(|o| o.full_name())
             .take(500)
             .collect();
         self.audit("list_tables", args, "allowed", Some(&format!("{} tables", names.len())));
-        Ok(out(if names.is_empty() { "No indexed tables.".into() } else { names.join("\n") }, json!({"count": names.len()})))
+        Ok(out(if names.is_empty() { "No tables are available to the AI on this connection.".into() } else { names.join("\n") }, json!({"count": names.len()})))
     }
 }

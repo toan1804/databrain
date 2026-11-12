@@ -9,9 +9,10 @@ use databrain_query_engine::QueryEngine;
 use databrain_workspace::{ConnectionProfile, KnObject, KnState, LearnedJoin, NoteStatus, Workspace, join_target, now_ms, split_target, target_mentions};
 use serde::Serialize;
 
+use crate::catalog::AiTables;
+use crate::learn;
 use crate::policy::is_pii;
 use crate::types::{AiError, Result};
-use crate::{access, learn};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,7 +187,7 @@ pub async fn index_connection_with(
         }
     }
     if report.skipped > 0 {
-        report.objects += ws.kn_objects_in(connection_id, &done)?;
+        report.objects += AiTables::new(&ws, connection_id)?.count_in(&done)?;
     }
     let batch_size = (profile.ai_policy.index_batch as usize).clamp(1, MAX_BATCH);
     for batch in todo.chunks(batch_size) {
@@ -273,7 +274,7 @@ pub async fn index_connection_with(
     ws.kn_set_state(&KnState {
         connection_id: connection_id.to_string(),
         indexed_at: now_ms(),
-        objects: ws.kn_count(connection_id)?,
+        objects: AiTables::new(&ws, connection_id)?.count()?,
         schemas: indexed,
         error: (!error.is_empty()).then(|| error.join("; ")),
     })?;
@@ -323,7 +324,7 @@ pub async fn index_tables(
     }
     if !fresh.is_empty() {
         ws.kn_upsert_objects(connection_id, &fresh)?;
-        let objects = ws.kn_count(connection_id)?;
+        let objects = AiTables::new(&ws, connection_id)?.count()?;
         let st = ws.kn_state(connection_id)?.unwrap_or(KnState {
             connection_id: connection_id.to_string(),
             indexed_at: 0,
@@ -413,8 +414,9 @@ pub struct Retrieved {
 pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables: usize, budget_chars: usize) -> Result<Retrieved> {
     let profile = ws.get_connection(connection_id)?;
     let policy = profile.ai_policy.clone();
+    let t = AiTables::with_profile(ws, &profile);
     let notes_all = ws.kn_notes(connection_id)?.into_iter().filter(|n| n.status == NoteStatus::Approved).collect::<Vec<_>>();
-    let mut hits = ws.kn_search(connection_id, question, 40)?;
+    let mut hits = t.search(question, 40)?;
     // Tables the user's queries use often rank a little higher (BM25
     // scores are negative: lower is better).
     if policy.learn_from_history {
@@ -439,7 +441,7 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
                 } else {
                     // Every table the note is about (`a & b`, `a or b`).
                     for (_, p) in split_target(n.target.as_deref().unwrap_or("")) {
-                        if let Some((o, _)) = ws.kn_resolve_path(connection_id, &p)?
+                        if let Some((o, _)) = t.resolve_path(&p)?
                             && seen.insert(o.full_name())
                         {
                             chosen.push(o);
@@ -452,15 +454,15 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
         if chosen.len() >= max_tables {
             break;
         }
-        if let Some(o) = ws.kn_get(connection_id, &h.reference)?
+        if let Some(o) = t.get(&h.reference)?
             && seen.insert(o.full_name())
         {
             chosen.push(o);
         }
     }
     // Small databases: include everything when nothing matched.
-    if chosen.is_empty() && ws.kn_count(connection_id)? <= max_tables as i64 {
-        for o in ws.kn_objects(connection_id)? {
+    if chosen.is_empty() && t.count()? <= max_tables as i64 {
+        for o in t.objects()? {
             if seen.insert(o.full_name()) {
                 chosen.push(o);
             }
@@ -473,7 +475,7 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
             if chosen.len() >= max_tables + 3 {
                 break;
             }
-            if let Some(r) = ws.kn_get(connection_id, &format!("{}.{}", fk.ref_schema, fk.ref_table))?
+            if let Some(r) = t.get(&format!("{}.{}", fk.ref_schema, fk.ref_table))?
                 && seen.insert(r.full_name())
             {
                 chosen.push(r);
@@ -482,13 +484,13 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
     }
     // Learned joins: the most used partners of the top tables (one hop).
     let top: Vec<String> = chosen.iter().take(4).map(|o| o.full_name()).collect();
-    for t in &top {
+    for name in &top {
         for j in &learned {
             if chosen.len() >= max_tables + 3 {
                 break;
             }
-            let Some(sd) = side(j, t) else { continue };
-            if let Some(r) = ws.kn_get(connection_id, sd.other)?
+            let Some(sd) = side(j, name) else { continue };
+            if let Some(r) = t.get(sd.other)?
                 && seen.insert(r.full_name())
             {
                 chosen.push(r);
@@ -541,15 +543,17 @@ pub fn usable_joins(ws: &Workspace, profile: &ConnectionProfile) -> Result<Vec<L
     }
     // With learning from history off, only documented joins.
     let learning = p.learn_from_history;
+    let t = AiTables::with_profile(ws, profile);
     let mut known: HashMap<String, Option<Vec<String>>> = HashMap::new();
     let mut has = |table: &str, cols: &[String]| -> bool {
         let k = known.entry(table.to_lowercase()).or_insert_with(|| {
             let (schema, name) = table.rsplit_once('.')?;
-            ws.kn_column_names(&profile.id, schema, name).ok().flatten()
+            t.column_names(schema, name).ok().flatten()
         });
         k.as_ref().is_none_or(|k| cols.iter().all(|c| k.iter().any(|x| x.eq_ignore_ascii_case(c))))
     };
-    let readable = |t: &str| access::check_read_table(profile, t).is_ok();
+    // Both tables must be ones the AI may use: a join names them.
+    let readable = |name: &str| t.get(name).ok().flatten().is_some();
     Ok(ws
         .learned_joins(&profile.id)?
         .into_iter()
@@ -634,6 +638,14 @@ pub struct PathStep {
     pub source: String,
 }
 
+/// Why a table the AI named can't be used: the same words whether it
+/// exists outside the AI's scope or not at all.
+pub fn not_available(t: &str) -> String {
+    format!(
+        "table `{t}` is not available to the AI on this connection; search_schema with other words, or index_tables to ask the user to allow it (don't ask for its columns)"
+    )
+}
+
 /// Most expansions a path search makes (wide schemas stay bounded).
 const PATH_SEARCH_LIMIT: usize = 50_000;
 
@@ -641,19 +653,16 @@ const PATH_SEARCH_LIMIT: usize = 50_000;
 /// `to`, over declared foreign keys and [`usable_joins`]. Tables the AI may
 /// not read are never part of a path; naming one is refused.
 pub fn join_paths(ws: &Workspace, profile: &ConnectionProfile, from: &str, to: &str, max_hops: usize) -> Result<Vec<Vec<PathStep>>> {
+    let tables = AiTables::with_profile(ws, profile);
     let find = |t: &str| -> Result<String> {
-        let o = ws
-            .kn_get(&profile.id, t)?
-            .ok_or_else(|| AiError::Policy(format!("table `{t}` is not in the knowledge index; search_schema or index_tables first")))?;
-        let full = o.full_name();
-        access::check_read_table(profile, &full).map_err(AiError::Policy)?;
-        Ok(full)
+        let o = tables.get(t)?.ok_or_else(|| AiError::Policy(not_available(t)))?;
+        Ok(o.full_name())
     };
     let (from, to) = (find(from)?, find(to)?);
     if from.eq_ignore_ascii_case(&to) {
         return Err(AiError::Policy("`from` and `to` are the same table".into()));
     }
-    let readable = |t: &str| access::check_read_table(profile, t).is_ok();
+    let readable = |t: &str| tables.readable(t);
     // Undirected edges, each step as seen from the table it leaves.
     let mut adj: HashMap<String, Vec<PathStep>> = HashMap::new();
     let mut add = |a: &str, ac: &[String], b: &str, bc: &[String], source: &str| {
@@ -670,9 +679,9 @@ pub fn join_paths(ws: &Workspace, profile: &ConnectionProfile, from: &str, to: &
             });
         }
     };
-    for o in ws.kn_objects(&profile.id)? {
+    for o in tables.objects()? {
         for fk in &o.foreign_keys {
-            let target = ws.kn_get(&profile.id, &format!("{}.{}", fk.ref_schema, fk.ref_table))?.map(|r| r.full_name());
+            let target = tables.get(&format!("{}.{}", fk.ref_schema, fk.ref_table))?.map(|r| r.full_name());
             if let Some(t) = target {
                 add(&o.full_name(), &fk.columns, &t, &fk.ref_columns, "foreign key");
             }
@@ -737,17 +746,7 @@ pub async fn check_note_target(engine: &QueryEngine, connection_id: &str, target
     let mut missing = Vec::new();
     let mut offline: Option<String> = None;
     for (sep, path) in parts {
-        if let Ok(Some((o, col))) = ws.kn_resolve_path(connection_id, &path) {
-            out.push((
-                sep,
-                match col {
-                    Some(c) => format!("{}.{c}", o.full_name()),
-                    None => o.full_name(),
-                },
-            ));
-            continue;
-        }
-        // Tables seen in the explorer / ⌘P / completion (works while indexing).
+        // Tables DataBrain knows (explorer, ⌘P, completion, index runs).
         if let Ok(Some(p)) = ws.meta_resolve_path(connection_id, &path) {
             out.push((sep, p));
             continue;
@@ -775,9 +774,6 @@ pub async fn check_note_target(engine: &QueryEngine, connection_id: &str, target
 /// `main.sales.orders`) to (schema id, table name): knowledge index first,
 /// then the live connection.
 pub async fn resolve_table(engine: &QueryEngine, connection_id: &str, path: &str) -> std::result::Result<Option<(String, String)>, String> {
-    if let Ok(Some(o)) = engine.workspace().kn_get(connection_id, path) {
-        return Ok(Some((o.schema, o.name)));
-    }
     if let Ok(Some(hit)) = engine.workspace().meta_get(connection_id, path) {
         return Ok(Some(hit));
     }
@@ -1098,7 +1094,9 @@ mod tests {
             let (ws, p) = setup(AiPolicy { read_deny: vec!["sales.customers".into()], ..Default::default() });
             assert!(join_paths(&ws, &p, "order_items", "regions", 4).unwrap().is_empty());
             let e = join_paths(&ws, &p, "orders", "customers", 3).unwrap_err().to_string();
-            assert!(e.contains("may not read"), "{e}");
+            // Denied reads as missing: the same words as a table that isn't there.
+            assert!(e.contains("not available to the AI"), "{e}");
+            assert_eq!(e.replace("customers", "x"), join_paths(&ws, &p, "orders", "x", 3).unwrap_err().to_string());
             // Without learning, declared keys still connect.
             let (ws, p) = setup(AiPolicy { learn_from_history: false, ..Default::default() });
             assert_eq!(join_paths(&ws, &p, "order_items", "orders", 3).unwrap().len(), 1);

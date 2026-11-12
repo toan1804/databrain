@@ -508,8 +508,10 @@ pub struct KnObjectPage {
     pub total: usize,
 }
 
+/// The tables the AI may use (Knowledge → Index), a page at a time.
 pub fn knowledge_objects(state: &AppState, connection_id: &str, filter: &str, offset: usize, limit: usize) -> Result<KnObjectPage> {
-    let (objects, total) = state.workspace.kn_list_objects(connection_id, filter, offset, limit.clamp(1, 1000))?;
+    let tables = databrain_ai::catalog::AiTables::new(&state.workspace, connection_id).map_err(ai_err)?;
+    let (objects, total) = tables.page(filter, offset, limit.clamp(1, 1000)).map_err(ai_err)?;
     Ok(KnObjectPage { objects, total })
 }
 
@@ -533,6 +535,10 @@ pub fn index_knowledge(state: &AppState, connection_id: &str, scope: Option<Vec<
                 return Err(EngineError::new("invalid", "choose at least one catalog or schema to index"));
             }
             p.ai_policy.index_schemas = if sc.iter().any(|s| s.trim() == "*") { vec!["*".into()] } else { sc.clone() };
+            // The scope is what the AI may use. `*` is carried by the rule
+            // each indexed schema gets (system schemas never are).
+            let named: Vec<String> = sc.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "*").collect();
+            state.workspace.ai_set_schema_rules(connection_id, &named).map_err(EngineError::from)?;
         }
         if let Some(b) = batch {
             p.ai_policy.index_batch = b.clamp(1, databrain_ai::knowledge::MAX_BATCH as u32);

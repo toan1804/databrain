@@ -130,7 +130,7 @@ impl ToolContext {
         }
         let r = match name {
             "search_schema" => self.search_schema(args),
-            "describe_table" => self.describe_table(args),
+            "describe_table" => self.describe_table(args).await,
             "find_join_path" => self.find_join_path(args),
             "index_tables" => self.index_tables(args).await,
             "list_tables" => self.list_tables(args),
@@ -217,7 +217,7 @@ impl ToolContext {
                 continue;
             }
             let env = serde_json::to_value(p.env).ok().and_then(|v| v.as_str().map(str::to_string)).filter(|e| e != "none");
-            let indexed = ws.kn_count(&p.id).unwrap_or(0);
+            let indexed = crate::catalog::AiTables::with_profile(ws, &p).count().unwrap_or(0);
             text.push_str(&format!(
                 "- \"{}\" · {}{}{}{}{}{}\n",
                 p.name,

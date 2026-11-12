@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { Check, Database, FileDown, FileUp, ListChecks, Loader2, RefreshCw, Trash2, X } from "lucide-react";
+import { Check, Database, Eye, EyeOff, FileDown, FileUp, ListChecks, Loader2, RefreshCw, Trash2, X } from "lucide-react";
 import { api, toError } from "../../lib/api";
-import type { KnNote, KnObject, KnowledgeView, LearnedView, NotesImportPreview } from "../../lib/types";
+import type { KnNote, KnObject, KnowledgeView, LearnedView, NotesImportPreview, ScopeRule } from "../../lib/types";
 import { formatCount, relativeTime } from "../../lib/util";
 import { useStore } from "../../store";
 import { useAi } from "../../aiStore";
@@ -11,7 +11,7 @@ import { ImportNotesDialog } from "../ImportNotesDialog";
 import { NoteTargetInput, type TargetState } from "../NoteTargetInput";
 import { LearnedSection } from "./LearnedSection";
 
-/** Indexed tables shown at first and added by each "Show more". */
+/** Tables the AI may use shown at first and added by each "Show more". */
 const OBJECT_PAGE = 25;
 
 type Part = "index" | "notes" | "learned";
@@ -37,6 +37,8 @@ export function Knowledge() {
   const focus = useAi((s) => s.knowledgeFocus);
   const [connId, setConnId] = useState<string | null>(focus ?? activeConn ?? connections[0]?.id ?? null);
   const [data, setData] = useState<KnowledgeView | null>(null);
+  // The AI scope's rules: excluded tables are listed to allow them again.
+  const [rules, setRules] = useState<ScopeRule[]>([]);
   const [filter, setFilter] = useState("");
   const [objects, setObjects] = useState<{ list: KnObject[]; total: number } | null>(null);
   const [note, setNote] = useState({ target: "", body: "" });
@@ -52,7 +54,7 @@ export function Knowledge() {
       // Remembering the tab is a convenience only.
     }
   };
-  // Opened for a connection (the chat's "Index in Knowledge"): that one, on Index.
+  // Opened for a connection (the chat hint): that one, on Index.
   useEffect(() => {
     if (!focus) return;
     setConnId(focus);
@@ -91,7 +93,23 @@ export function Knowledge() {
       .knGet(connId)
       .then(setData)
       .catch((e) => toast(toError(e).message, "error"));
+    api
+      .aiScope(connId)
+      .then(setRules)
+      .catch(() => setRules([]));
   }, [connId, toast]);
+  /** Exclude a table from what the AI may use, or take an exclusion back. */
+  const setTable = async (schema: string, table: string, allow: boolean) => {
+    if (!connId) return;
+    try {
+      if (allow) await api.aiDeleteRule(connId, schema, table);
+      else await api.aiPutRule(connId, { schema, table, allow: false });
+      useAi.setState((s) => ({ knowledgeVersion: s.knowledgeVersion + 1 }));
+    } catch (e) {
+      toast(toError(e).message, "error");
+    }
+  };
+  const excluded = rules.filter((r) => !r.allow && r.table);
   // `version` bumps when knowledge changes elsewhere.
   useEffect(load, [load, version]);
   const loadLearned = useCallback(() => {
@@ -104,7 +122,7 @@ export function Knowledge() {
   useEffect(() => setLearned(null), [connId]);
   useEffect(loadLearned, [loadLearned, version]);
 
-  // Indexed objects: one page at a time, filtered in the workspace DB (an
+  // Tables the AI may use: one page at a time, filtered in the workspace DB (an
   // index can hold 10k+ tables; never load them all into the view).
   useEffect(() => {
     if (!connId) return setObjects(null);
@@ -203,11 +221,11 @@ export function Knowledge() {
       <div className="rounded-lg border border-line p-2.5">
         <div className="flex flex-wrap items-center gap-2">
           <div className="min-w-[9rem] flex-1">
-            <div className="font-medium">Schema index</div>
+            <div className="font-medium">What the AI may use</div>
             <div className="text-[11.5px] text-muted">
               {data?.state
-                ? `${formatCount(data.state.objects)} objects · ${data.state.schemas.length} schemas · ${relativeTime(data.state.indexed_at)}`
-                : "Not indexed yet. The assistant uses this metadata to find relevant tables."}
+                ? `${formatCount(data.state.objects)} tables · ${data.state.schemas.length} schemas read · ${relativeTime(data.state.indexed_at)}`
+                : "Nothing yet. Choose the schemas the AI may use, then read their columns; until then it only guesses table names."}
             </div>
           </div>
           <div className="flex flex-wrap gap-1.5">
@@ -220,27 +238,31 @@ export function Knowledge() {
               <button
                 className="btn-ghost border border-line py-1"
                 disabled={!connId}
-                title="Choose catalogs and schemas to index"
+                title="Choose the catalogs and schemas the AI may use"
                 onClick={() => connId && void indexKnowledge(connId, { choose: true })}
               >
-                <ListChecks size={12} /> Scope…
+                <ListChecks size={12} /> AI may use…
               </button>
               <button
                 className="btn-ghost border border-line py-1"
                 disabled={!connId}
-                title={data?.state ? "Re-read schemas whose tables or columns changed since the last run" : "Index tables and columns for the AI"}
+                title={
+                  data?.state
+                    ? "Read the columns of schemas whose tables changed since the last run"
+                    : "Allow every schema and read its tables' columns, so the AI can find them"
+                }
                 onClick={() => connId && void indexKnowledge(connId)}
               >
-                <RefreshCw size={12} /> {data?.state ? "Update" : "Index"}
+                <RefreshCw size={12} /> {data?.state ? "Update" : "Read columns"}
               </button>
               {data?.state && (
                 <button
                   className="btn-ghost border border-line py-1"
                   disabled={!connId}
-                  title="Re-read every schema, changed or not"
+                  title="Read every allowed schema's columns again, changed or not"
                   onClick={() => connId && void indexKnowledge(connId, { full: true })}
                 >
-                  Rebuild
+                  Read all again
                 </button>
               )}
             </>
@@ -261,8 +283,8 @@ export function Knowledge() {
         )}
         {data?.state?.error && <div className="mt-1 text-[11.5px] text-danger">{data.state.error}</div>}
         <p className="mt-2 text-[11px] text-muted">
-          Only metadata (names, types, comments, keys) is indexed locally. What is sent to the model is controlled per connection
-          (Edit connection → AI).
+          The AI only knows the tables listed here: others don't exist for it. Only metadata (names, types, comments, keys) is kept, locally.
+          What is sent to the model is controlled per connection (Edit connection → AI).
         </p>
       </div>
       )}
@@ -364,22 +386,50 @@ export function Knowledge() {
 
       {part === "learned" && connId && <LearnedSection connId={connId} view={learned} reload={loadLearned} onMakeNote={(target, body) => saveNote({ target, body })} />}
 
+      {part === "index" && excluded.length > 0 && (
+        <div>
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted">Excluded tables</div>
+          {excluded.map((r) => (
+            <div key={`${r.schema}.${r.table}`} className="group flex items-center gap-1.5 rounded px-1.5 py-0.5 hover:bg-hover">
+              <span className="font-mono text-[11.5px] text-muted line-through">
+                {r.schema}.{r.table}
+              </span>
+              <button
+                className="btn-ghost ml-auto py-0 text-[11px]"
+                title="Let the AI use this table again (as its schema says)"
+                onClick={() => void setTable(r.schema, r.table, true)}
+              >
+                <Eye size={11} /> Allow
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {part === "index" && objects && (objects.total > 0 || filter) && (
         <div>
           <div className="mb-1 flex flex-wrap items-center gap-2">
-            <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">Indexed objects</span>
+            <span className="text-[11px] font-semibold uppercase tracking-wide text-muted">Tables the AI may use</span>
             <span className="text-[11px] text-muted">{formatCount(objects.total)}</span>
             <input className="field ml-auto h-6 w-36 min-w-0 py-0 text-[11.5px]" placeholder="Filter" aria-label="Filter objects" value={filter} onChange={(e) => setFilter(e.target.value)} />
           </div>
           <div className="space-y-0.5">
             {objects.list.map((o) => (
-              <div key={`${o.schema}.${o.name}`} className="rounded px-1.5 py-1 hover:bg-hover" title={o.columns.map((c) => `${c.name} ${c.data_type}`).join("\n")}>
+              <div key={`${o.schema}.${o.name}`} className="group rounded px-1.5 py-1 hover:bg-hover" title={o.columns.map((c) => `${c.name} ${c.data_type}`).join("\n")}>
                 <span className="font-mono text-[11.5px]">
                   {o.schema}.{o.name}
                 </span>
                 <span className="ml-1.5 text-[10.5px] text-muted">
-                  {o.kind} · {o.columns.length} cols
+                  {o.kind} · {o.columns.length > 0 ? `${o.columns.length} cols` : "columns not read yet"}
                 </span>
+                <button
+                  className="icon-btn float-right hidden h-5 w-5 group-hover:flex"
+                  title="Exclude: the AI won't see this table"
+                  aria-label={`Exclude ${o.schema}.${o.name} from the AI`}
+                  onClick={() => void setTable(o.schema, o.name, false)}
+                >
+                  <EyeOff size={11} />
+                </button>
                 {o.comment && <div className="truncate text-[11px] text-muted">{o.comment}</div>}
               </div>
             ))}

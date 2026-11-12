@@ -114,6 +114,33 @@ impl Workspace {
         Ok(())
     }
 
+    /// Remove one rule.
+    pub fn ai_delete_rule(&self, connection_id: &str, schema: &str, table: &str) -> Result<()> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute(
+            "DELETE FROM ai_scope WHERE connection_id = ?1 AND schema_rule = ?2 AND lower(table_name) = lower(?3)",
+            params![connection_id, schema.trim(), table.trim()],
+        )?;
+        Self::ai_refresh_tx(&tx, connection_id, None)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The schema-level rules (allow) are exactly `schemas` (the scope chosen
+    /// for indexing); per-table rules stay.
+    pub fn ai_set_schema_rules(&self, connection_id: &str, schemas: &[String]) -> Result<()> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM ai_scope WHERE connection_id = ?1 AND table_name = ''", [connection_id])?;
+        for s in schemas {
+            Self::put_rule(&tx, connection_id, &ScopeRule { schema: s.clone(), table: String::new(), allow: true })?;
+        }
+        Self::ai_refresh_tx(&tx, connection_id, None)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Remove the schema rules (and their table rules) of `schemas`.
     pub fn ai_remove_schemas(&self, connection_id: &str, schemas: &[String]) -> Result<()> {
         let mut c = self.conn.lock();

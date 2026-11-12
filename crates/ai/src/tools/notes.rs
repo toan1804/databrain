@@ -95,9 +95,8 @@ impl ToolContext {
         }
         let side = |t: &str, c: &str| -> Result<(String, Vec<String>)> {
             let table = arg(args, t)?;
-            let o = ws
-                .kn_get(id, table)?
-                .ok_or_else(|| AiError::Policy(format!("table `{table}` is not in the knowledge index; search_schema or index_tables first")))?;
+            let o =
+                crate::catalog::AiTables::with_profile(ws, &self.profile).get(table)?.ok_or_else(|| AiError::Policy(crate::knowledge::not_available(table)))?;
             let full = o.full_name();
             access::check_read_table(&self.profile, &full).map_err(AiError::Policy)?;
             let names: Vec<&str> = args.get(c).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();

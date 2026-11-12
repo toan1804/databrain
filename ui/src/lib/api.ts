@@ -40,6 +40,7 @@ import type {
   MigrationReport,
   KnowledgeEvent,
   KnObjectPage,
+  ScopeRule,
   ObjectKind,
   KnowledgeView,
   KiroStatus,
@@ -434,9 +435,13 @@ export const api = {
   mcpConfig: () => call<unknown>("mcp_config"),
 
   knGet: (connectionId: string) => call<KnowledgeView>("kn_get", { connectionId }),
-  /** Indexed objects matching `filter` (schema.name or comment), one page at a time. */
+  /** Tables the AI may use matching `filter` (schema.name or comment), one page at a time. */
   knObjects: (connectionId: string, filter: string, offset: number, limit: number) =>
     call<KnObjectPage>("kn_objects", { connectionId, filter, offset, limit }),
+  /** The AI scope: which schemas and tables the AI may use on a connection. */
+  aiScope: (connectionId: string) => call<ScopeRule[]>("ai_scope", { connectionId }),
+  aiPutRule: (connectionId: string, rule: ScopeRule) => call<void>("ai_put_rule", { connectionId, rule }),
+  aiDeleteRule: (connectionId: string, schema: string, table: string) => call<void>("ai_delete_rule", { connectionId, schema, table }),
   oracleClientStatus: (libDir?: string | null) => call<OracleClientStatus>("oracle_client_status", { libDir: libDir || null }),
   oracleAgentInfo: () => call<OracleAgentInfo>("oracle_agent_info"),
   oracleAgentInstallFile: (path: string) => call<OracleAgentInfo>("oracle_agent_install_file", { path }),

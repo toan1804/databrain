@@ -487,7 +487,9 @@ impl ToolContext {
             return Err(AiError::Policy("sharing sample data is disabled for this connection".into()));
         }
         let t = arg(args, "table")?;
-        let o = self.engine.workspace().kn_get(&self.profile.id, t)?.ok_or_else(|| AiError::Policy(format!("table `{t}` not found")))?;
+        let o = crate::catalog::AiTables::with_profile(self.engine.workspace(), &self.profile)
+            .get(t)?
+            .ok_or_else(|| AiError::Policy(crate::knowledge::not_available(t)))?;
         let n = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(5).clamp(1, 20) as usize;
         let kind = self.profile.config.kind;
         let full = o.full_name();

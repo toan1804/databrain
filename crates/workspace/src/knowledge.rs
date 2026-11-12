@@ -467,6 +467,12 @@ impl Workspace {
     /// An indexed object's facts into the explorer cache: the object, and
     /// its columns and foreign keys as read now.
     fn meta_put_known_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str, o: &KnObject, now: i64) -> Result<()> {
+        // One table-like object per name: a table that became a view isn't both.
+        tx.prepare_cached(
+            "DELETE FROM meta_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3 AND kind <> ?4 \
+               AND kind IN ('table', 'view', 'materialized_view', 'foreign_table')",
+        )?
+        .execute(params![connection_id, o.schema, o.name, o.kind])?;
         tx.prepare_cached(
             "INSERT INTO meta_objects (connection_id, schema_name, name, kind, comment, row_estimate, seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT (connection_id, schema_name, kind, name) DO UPDATE SET comment = excluded.comment, \
@@ -687,12 +693,10 @@ impl Workspace {
         let c = self.conn.lock();
         let q = query.trim().to_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let mut stmt = c.prepare_cached(
-            // The knowledge index and the metadata cache (tables seen while browsing).
-            "SELECT schema_name, name, max(kind), max(comment) FROM ( \
-                 SELECT schema_name, name, kind, comment FROM kn_objects WHERE connection_id = ?1 \
-                 UNION ALL SELECT schema_name, name, kind, comment FROM meta_objects WHERE connection_id = ?1 \
+            // The explorer cache: every table DataBrain knows (index runs write it too).
+            "SELECT schema_name, name, max(kind), max(comment) FROM meta_objects WHERE connection_id = ?1 \
                    AND kind IN ('table', 'view', 'materialized_view', 'foreign_table') \
-             ) WHERE (?2 IS NULL OR schema_name = ?2) \
+               AND (?2 IS NULL OR schema_name = ?2) \
                AND (lower(name) LIKE '%' || ?3 || '%' ESCAPE '\\' \
                     OR (length(?3) >= 3 AND lower(coalesce(comment, '')) LIKE '%' || ?3 || '%' ESCAPE '\\')) \
              GROUP BY schema_name, name \
@@ -704,8 +708,8 @@ impl Workspace {
         Ok(rows)
     }
 
-    /// Column names of a table (exact schema id): the newer of the knowledge
-    /// index and the explorer cache ([`Self::meta_table`]).
+    /// Column names of a table (exact schema id) from the explorer cache
+    /// ([`Self::meta_table`]): user features (completion, lineage), not the AI.
     pub fn kn_column_names(&self, connection_id: &str, schema: &str, name: &str) -> Result<Option<Vec<String>>> {
         Ok(self.meta_table(connection_id, schema, name)?.map(|t| t.columns.into_iter().map(|c| c.name).collect()))
     }

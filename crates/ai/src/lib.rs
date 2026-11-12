@@ -3,6 +3,7 @@
 
 pub mod access;
 pub mod agent;
+pub mod catalog;
 pub mod ghost;
 pub mod jobs;
 pub mod kiro;

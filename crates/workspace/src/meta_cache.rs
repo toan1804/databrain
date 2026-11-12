@@ -533,48 +533,60 @@ impl Workspace {
     }
 
     /// A table as DataBrain knows it without asking the server (exact schema
-    /// id, any-case name): the explorer's cached describe or the AI index,
-    /// whichever was read from the server last. Foreign keys the newer one
-    /// doesn't know come from the other. `stale` when the explorer saw the
-    /// table's schema change since (the index can't tell).
+    /// id, any-case name): its cached describe, from the explorer, a grid
+    /// edit, lineage or an index run. `stale` when its schema changed since
+    /// (or it is in a schema never listed and older than a day).
     pub fn meta_table(&self, connection_id: &str, schema: &str, name: &str) -> Result<Option<CachedTable>> {
-        type Seen = (String, Option<String>, bool, i64, Option<String>);
+        type Seen = (String, Option<String>, bool, Option<String>);
         let c = self.conn.lock();
         let seen: Option<Seen> = c
             .query_row(
                 &format!(
-                    "SELECT m.columns_json, m.fks_json, {STALE_SQL}, m.seen_at, \
+                    "SELECT m.columns_json, m.fks_json, {STALE_SQL}, \
                        (SELECT o.kind FROM meta_objects o WHERE o.connection_id = m.connection_id AND o.schema_name = m.schema_name \
                           AND o.name = m.table_name ORDER BY o.kind = 'table' DESC LIMIT 1) \
                      FROM meta_columns m WHERE m.connection_id = ?1 AND m.schema_name = ?2 AND lower(m.table_name) = lower(?3)"
                 ),
                 params![connection_id, schema, name, now_ms() - UNLISTED_COLUMNS_TTL_MS],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .optional()?;
-        let indexed: Option<(String, String, String, i64)> = c
-            .query_row(
-                "SELECT kind, columns_json, fks_json, indexed_at FROM kn_objects WHERE connection_id = ?1 AND schema_name = ?2 AND lower(name) = lower(?3)",
-                params![connection_id, schema, name],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        drop(c);
-        let cols = |j: &str| serde_json::from_str::<Vec<ColumnInfo>>(j).unwrap_or_default();
-        let fks = |j: &str| serde_json::from_str::<Vec<ForeignKey>>(j).ok();
-        Ok(match (seen, indexed) {
-            (None, None) => None,
-            (Some((c, f, stale, _, kind)), None) => Some(CachedTable { kind, columns: cols(&c), foreign_keys: f.as_deref().and_then(fks), stale }),
-            (None, Some((kind, c, f, _))) => Some(CachedTable { kind: Some(kind), columns: cols(&c), foreign_keys: fks(&f), stale: false }),
-            (Some((mc, mf, stale, seen_at, mkind)), Some((kind, kc, kf, indexed_at))) => {
-                let (mine, theirs) = (mf.as_deref().and_then(fks), fks(&kf));
-                Some(if seen_at >= indexed_at {
-                    CachedTable { kind: mkind.or(Some(kind)), columns: cols(&mc), foreign_keys: mine.or(theirs), stale }
-                } else {
-                    CachedTable { kind: Some(kind), columns: cols(&kc), foreign_keys: theirs.or(mine), stale }
-                })
+        Ok(seen.map(|(c, f, stale, kind)| CachedTable {
+            kind,
+            columns: serde_json::from_str(&c).unwrap_or_default(),
+            foreign_keys: f.as_deref().and_then(|j| serde_json::from_str(j).ok()),
+            stale,
+        }))
+    }
+
+    /// Whether a table's cached columns may be out of date (or missing):
+    /// read it again before relying on them.
+    pub fn meta_table_is_stale(&self, connection_id: &str, schema: &str, name: &str) -> Result<bool> {
+        Ok(self.meta_table(connection_id, schema, name)?.is_none_or(|t| t.stale))
+    }
+
+    /// Cached foreign keys that reference `table` (any schema), as (schema,
+    /// table, key): "rows referencing this". `None` when no table of the
+    /// connection has known foreign keys, so the cache can't tell.
+    pub fn meta_foreign_keys_to(&self, connection_id: &str, table: &str) -> Result<Option<Vec<(String, String, ForeignKey)>>> {
+        let c = self.conn.lock();
+        let any: bool =
+            c.query_row("SELECT count(*) > 0 FROM meta_columns WHERE connection_id = ?1 AND fks_json IS NOT NULL", [connection_id], |r| r.get(0))?;
+        if !any {
+            return Ok(None);
+        }
+        let mut st = c.prepare_cached("SELECT schema_name, table_name, fks_json FROM meta_columns WHERE connection_id = ?1 AND fks_json LIKE ?2")?;
+        let like = format!("%{}%", table.replace('%', "").replace('_', "%"));
+        let mut out = Vec::new();
+        for row in st.query_map(params![connection_id, like], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+            let (schema, name, json) = row?;
+            for fk in serde_json::from_str::<Vec<ForeignKey>>(&json).unwrap_or_default() {
+                if fk.ref_table.eq_ignore_ascii_case(table) {
+                    out.push((schema.clone(), name.clone(), fk));
+                }
             }
-        })
+        }
+        Ok(Some(out))
     }
 
     /// Cached columns of a table (exact schema and name).
@@ -833,11 +845,10 @@ mod tests {
     }
 
     #[test]
-    fn a_table_is_known_from_the_newer_of_the_explorer_and_the_index() {
+    fn a_table_is_known_from_its_latest_read() {
         let ws = Workspace::open_in_memory().unwrap();
         let col = |n: &str| ColumnInfo { name: n.into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None };
         let fk = ForeignKey { columns: vec!["cust".into()], ref_schema: "s".into(), ref_table: "customers".into(), ref_columns: vec!["id".into()] };
-        let age = |sql: &str| ws.conn.lock().execute(sql, []).unwrap();
         assert!(ws.meta_table("c", "s", "orders").unwrap().is_none());
 
         // The explorer described it, foreign keys included.
@@ -848,34 +859,38 @@ mod tests {
         ws.meta_put_columns("c", "s", "orders", &[col("id"), col("cust")]).unwrap();
         assert_eq!(ws.meta_table("c", "s", "orders").unwrap().unwrap().foreign_keys, None);
 
-        // An index run after it: the index's columns, and its foreign keys.
-        age("UPDATE meta_columns SET seen_at = 1");
-        let indexed = |cols: Vec<ColumnInfo>, fks: Vec<ForeignKey>| crate::KnObject {
+        // An index run writes the same store: its read is the latest.
+        let indexed = crate::KnObject {
             schema: "s".into(),
             name: "orders".into(),
             kind: "table".into(),
             comment: None,
             row_estimate: None,
-            columns: cols,
-            foreign_keys: fks,
+            columns: vec![col("id"), col("cust"), col("added")],
+            foreign_keys: vec![fk.clone()],
         };
-        ws.kn_upsert_objects("c", &[indexed(vec![col("id"), col("cust"), col("added")], vec![fk.clone()])]).unwrap();
+        ws.kn_upsert_objects("c", &[indexed]).unwrap();
         let t = ws.meta_table("c", "s", "orders").unwrap().unwrap();
-        assert_eq!(t.columns.len(), 3, "the newer read wins");
-        assert_eq!((t.kind.as_deref(), t.foreign_keys), (Some("table"), Some(vec![fk.clone()])));
+        assert_eq!((t.kind.as_deref(), t.columns.len(), t.foreign_keys), (Some("table"), 3, Some(vec![fk])));
         assert_eq!(ws.kn_column_names("c", "s", "orders").unwrap().unwrap(), vec!["id", "cust", "added"]);
-
-        // The explorer described it after the index: its columns win again,
-        // and keys it doesn't know come from the index.
-        age("UPDATE kn_objects SET indexed_at = 1");
+        // A describe after it wins again.
         ws.meta_put_columns("c", "s", "orders", &[col("id")]).unwrap();
-        let t = ws.meta_table("c", "s", "orders").unwrap().unwrap();
-        assert_eq!((t.columns.len(), t.foreign_keys), (1, Some(vec![fk])));
-        assert_eq!(ws.kn_column_names("c", "s", "orders").unwrap().unwrap(), vec!["id"], "not the older index");
+        assert_eq!(ws.kn_column_names("c", "s", "orders").unwrap().unwrap(), vec!["id"]);
 
         // The schema changed since: still shown, marked stale.
-        age("UPDATE meta_columns SET stale = 1");
+        ws.conn.lock().execute("UPDATE meta_columns SET stale = 1", []).unwrap();
         assert!(ws.meta_table("c", "s", "orders").unwrap().unwrap().stale);
+        // "Rows referencing this" reads the same store.
+        ws.meta_put_table(
+            "c",
+            "s",
+            "items",
+            &[col("cust")],
+            Some(&[ForeignKey { columns: vec!["cust".into()], ref_schema: "s".into(), ref_table: "orders".into(), ref_columns: vec!["id".into()] }]),
+        )
+        .unwrap();
+        assert_eq!(ws.meta_foreign_keys_to("c", "orders").unwrap().unwrap().len(), 1);
+        assert_eq!(ws.meta_foreign_keys_to("other", "orders").unwrap(), None, "nothing known: can't tell");
     }
 
     #[test]

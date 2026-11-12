@@ -256,7 +256,7 @@ impl<'a> Resolver<'a> {
         let columns = match cached {
             Some(c) => c,
             None => {
-                let c = self.ws.kn_column_names(&self.connection_id, &schema, &name).ok().flatten();
+                let c = crate::catalog::AiTables::new(self.ws, &self.connection_id).ok().and_then(|t| t.column_names(&schema, &name).ok().flatten());
                 self.columns.borrow_mut().insert(full.clone(), c.clone());
                 c
             }
@@ -266,7 +266,7 @@ impl<'a> Resolver<'a> {
 
     /// `table(cols)` has a declared foreign key to `ref_table(ref_cols)`.
     fn declared(&self, table: &str, cols: &[String], ref_table: &str, ref_cols: &[String]) -> bool {
-        let Ok(Some(o)) = self.ws.kn_get(&self.connection_id, table) else { return false };
+        let Some(o) = crate::catalog::AiTables::new(self.ws, &self.connection_id).ok().and_then(|t| t.get(table).ok().flatten()) else { return false };
         let same = |a: &[String], b: &[String]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y));
         o.foreign_keys.iter().any(|fk: &ForeignKey| {
             format!("{}.{}", fk.ref_schema, fk.ref_table).eq_ignore_ascii_case(ref_table) && same(&fk.columns, cols) && same(&fk.ref_columns, ref_cols)

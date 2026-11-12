@@ -85,17 +85,17 @@ export function IndexHint({ connId }: { connId: string | null }) {
       <div className="min-w-0 flex-1 space-y-1">
         {cov.kind === "none" ? (
           <p>
-            The assistant doesn't know <span className="font-medium">{conn.name}</span>'s tables yet: they aren't in the knowledge index, so it can only
-            guess table and column names. Index them to get SQL that fits your schema.
+            The assistant may not use any of <span className="font-medium">{conn.name}</span>'s tables yet, so it can only guess table and column
+            names. Choose the schemas it may use to get SQL that fits your schema.
           </p>
         ) : (
           <p>
-            Only {formatCount(cov.indexed)} of the {formatCount(cov.total)} tables in the explorer for <span className="font-medium">{conn.name}</span> are
-            indexed, so the assistant may not know the tables you ask about. Index the other schemas to fill the gaps.
+            The AI may use {formatCount(cov.indexed)} of the {formatCount(cov.total)} tables in the explorer for{" "}
+            <span className="font-medium">{conn.name}</span>, so it may not know the tables you ask about. Allow the other schemas to fill the gaps.
           </p>
         )}
         <button className="btn-ghost border border-line bg-panel py-0.5 text-[11.5px]" onClick={() => openKnowledge(connId)}>
-          <BookOpen size={12} /> {cov.kind === "none" ? "Index in Knowledge" : "Review the index in Knowledge"}
+          <BookOpen size={12} /> {cov.kind === "none" ? "Choose in Knowledge" : "Review in Knowledge"}
         </button>
       </div>
       <button className="icon-btn shrink-0" title="Don't show again for this connection" aria-label="Dismiss" onClick={dismiss}>

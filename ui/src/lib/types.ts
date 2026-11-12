@@ -171,6 +171,7 @@ import type { ImportSource } from "./bindings/ImportSource";
 import type { JobLogEvent } from "./bindings/JobLogEvent";
 import type { JobRunEvent } from "./bindings/JobRunEvent";
 import type { KnObjectPage } from "./bindings/KnObjectPage";
+import type { ScopeRule } from "./bindings/ScopeRule";
 import type { KnowledgeView } from "./bindings/KnowledgeView";
 import type { NotesImportPreview } from "./bindings/NotesImportPreview";
 import type { ProviderUsage } from "./bindings/ProviderUsage";
@@ -351,6 +352,7 @@ export type {
   JobLogEvent,
   JobRunEvent,
   KnObjectPage,
+  ScopeRule,
   KnowledgeView,
   NotesImportPreview,
   ProviderUsage,
