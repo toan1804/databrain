@@ -684,3 +684,32 @@ async fn load_sql_that_controls_the_transaction_is_refused() {
     assert_eq!(r.rows, 3);
     assert_eq!(count().await, "3");
 }
+
+/// A run whose task dies (a panic) frees its tab and says it ended, so the
+/// tab can run again and nothing waits for it forever.
+#[tokio::test]
+async fn a_run_that_dies_frees_its_tab() {
+    let f = fixture(EnvTag::Dev);
+    f.engine
+        .jobs
+        .lock()
+        .insert("dead".into(), JobHandle { tab_id: "tab1".into(), session_key: "tab1".into(), cancel: CancellationToken::new(), tab_closed: false });
+    assert!(f.engine.run(req(&f, "select 1")).is_err(), "busy while the job is listed");
+    // What a panic in the task does: the guard drops without finishing.
+    drop(crate::run::JobGuard { engine: f.engine.clone(), job_id: "dead".into(), tab_id: "tab1".into(), waiter: None, done: false });
+    assert!(f.engine.jobs.lock().is_empty());
+    assert!(
+        f.sink.0.lock().iter().any(|e| matches!(e, JobEvent::JobFinished { job_id, status: RunStatus::Error, .. } if job_id == "dead")),
+        "the UI hears it ended"
+    );
+    let r = f.engine.run(req(&f, "select 1")).unwrap();
+    let RunResponse::Started { job_id, .. } = r else { panic!("{r:?}") };
+    wait_job(&f, &job_id).await;
+    // A guard that finished does nothing.
+    f.engine
+        .jobs
+        .lock()
+        .insert("live".into(), JobHandle { tab_id: "t2".into(), session_key: "t2".into(), cancel: CancellationToken::new(), tab_closed: false });
+    crate::run::JobGuard { engine: f.engine.clone(), job_id: "live".into(), tab_id: "t2".into(), waiter: None, done: false }.finish();
+    assert_eq!(f.engine.jobs.lock().len(), 1);
+}

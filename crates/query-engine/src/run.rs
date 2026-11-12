@@ -135,7 +135,11 @@ impl QueryEngine {
         let jid = job_id.clone();
         let statements = plan.clone();
         tokio::spawn(async move {
+            // Ends the job however the task ends: a panic in it must not
+            // leave the tab "already running" for good.
+            let guard = JobGuard { engine: engine.clone(), job_id: jid.clone(), tab_id: req.tab_id.clone(), waiter: waiter.clone(), done: false };
             engine.run_job(jid, req, statements, cancel, waiter).await;
+            guard.finish();
         });
         Ok(RunResponse::Started { job_id, statements: plan })
     }
@@ -480,6 +484,40 @@ impl QueryEngine {
         // reused; otherwise a server-side cancel could hit the next statement.
         let _ = tokio::time::timeout(Duration::from_secs(15), async { while stream.next().await.is_some() {} }).await;
         Ok(StatementOutcome { result: info, rows_affected: None, notices, server_ms })
+    }
+}
+
+/// The `jobs` entry of a run, released on any exit of its task: normally
+/// `run_job` removes it and emits `JobFinished`; after a panic the guard
+/// does both (status Error), so the tab can run again and the UI and any
+/// waiter stop waiting.
+pub(crate) struct JobGuard {
+    pub(crate) engine: Arc<QueryEngine>,
+    pub(crate) job_id: String,
+    pub(crate) tab_id: String,
+    pub(crate) waiter: Option<Waiter>,
+    pub(crate) done: bool,
+}
+
+impl JobGuard {
+    pub(crate) fn finish(mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        if self.done || self.engine.jobs.lock().remove(&self.job_id).is_none() {
+            return;
+        }
+        tracing::error!(job = %self.job_id, "a run ended without finishing (panic); its tab is free again");
+        let ev =
+            JobEvent::JobFinished { job_id: self.job_id.clone(), tab_id: self.tab_id.clone(), status: RunStatus::Error, duration_ms: 0, in_transaction: false };
+        if let Some(w) = &self.waiter {
+            let _ = w.send(ev.clone());
+        }
+        self.engine.events.emit(ev);
+        self.engine.outputs_changed();
     }
 }
 

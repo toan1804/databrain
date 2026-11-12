@@ -182,7 +182,9 @@ pub struct QueryEngine {
     /// Running full exports (query re-run straight to a file), by id.
     exports: Mutex<HashMap<String, CancellationToken>>,
     /// Files written by finished full exports, by id.
-    exported: Mutex<HashMap<String, std::path::PathBuf>>,
+    /// Files of the latest exports (export id, path), newest last, at most
+    /// [`export::KEPT_EXPORTS`].
+    exported: Mutex<std::collections::VecDeque<(String, std::path::PathBuf)>>,
     outputs: Arc<OutputRegistry>,
     /// Session keys (tabs) in manual-commit mode: writes open a transaction
     /// the user ends with Commit or Rollback.
@@ -209,7 +211,7 @@ impl QueryEngine {
             jobs: Mutex::new(HashMap::new()),
             tests: Mutex::new(HashMap::new()),
             exports: Mutex::new(HashMap::new()),
-            exported: Mutex::new(HashMap::new()),
+            exported: Mutex::new(std::collections::VecDeque::new()),
             outputs: OutputRegistry::new(results.clone(), workspace.clone()),
             manual_commit: Mutex::new(Default::default()),
             results,

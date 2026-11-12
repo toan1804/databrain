@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// Exports whose files "Show file" can still find.
+pub(crate) const KEPT_EXPORTS: usize = 100;
+
 impl QueryEngine {
     /// Run one read statement again without a row limit and stream every
     /// row straight into `path` (nothing is kept in memory, except for XLSX).
@@ -60,7 +63,14 @@ impl QueryEngine {
             self.drop_session(connection_id, &tab);
         }
         let rows = out?;
-        self.exported.lock().insert(export_id.to_string(), path.to_path_buf());
+        {
+            let mut e = self.exported.lock();
+            e.retain(|(id, _)| id != export_id);
+            e.push_back((export_id.to_string(), path.to_path_buf()));
+            while e.len() > KEPT_EXPORTS {
+                e.pop_front();
+            }
+        }
         Ok(rows)
     }
 
@@ -95,7 +105,14 @@ impl QueryEngine {
         loop {
             let ev = tokio::select! {
                 ev = stream.next() => ev,
-                _ = cancel.cancelled() => return Err(ConnectorError::cancelled().into()),
+                _ = cancel.cancelled() => {
+                    // Wait for the connector to finish cancelling before the
+                    // session is used again (it may be the tab's own, in a
+                    // transaction): a late server cancel could hit the
+                    // tab's next statement. As `run_statement` does.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), async { while stream.next().await.is_some() {} }).await;
+                    return Err(ConnectorError::cancelled().into());
+                }
             };
             match ev {
                 None => return Err(EngineError::new("internal", "result stream ended unexpectedly")),
@@ -136,6 +153,6 @@ impl QueryEngine {
 
     /// File written by a finished full export (to show it in Finder/Explorer).
     pub fn exported_file(&self, export_id: &str) -> Option<std::path::PathBuf> {
-        self.exported.lock().get(export_id).cloned()
+        self.exported.lock().iter().find(|(id, _)| id == export_id).map(|(_, p)| p.clone())
     }
 }
