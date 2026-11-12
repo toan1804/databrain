@@ -57,3 +57,45 @@ Paths are in `crates/query-engine/src/` unless given in full. Items 1, 2 and 5 w
 - PostgreSQL row estimates are refreshed only when the schema changes (the explorer fingerprint leaves out `reltuples`).
 - The ER diagram (`schema_tables`) is always read live and doesn't work offline.
 - `clear_explorer_cache` is a command the UI never calls.
+
+## Connector core (review of 2026-11-12; see [CONNECTOR_CORE.md](CONNECTOR_CORE.md))
+
+Paths are in `crates/connector-core/src/` unless given in full. The high items and the Postgres escaped-name item were run against `classify` and `read_only_allows`; whether each server runs the hidden part was not tested. The others are from one reading: reproduce with a test before fixing.
+
+### High: statements that classify as a read (fix first)
+
+They pass a read-only connection, the production prompt and the AI's auto-read. SQL Server and Snowflake have no server-side read-only session to fall back on.
+
+1. **SQL Server: a second statement read as an alias** (`sql/classify.rs`). T-SQL needs no separator, so a statement keyword after a select item or table (`select 1 shutdown`, `… reconfigure`, `… revert`) parses as one SELECT with an alias. An implicit alias that is a T-SQL statement keyword should be `Unknown`.
+2. **A SELECT that doesn't parse is a read unless a deny-list word is found** (`sql/classify.rs`, the fallback and its word list). SQL Server `select 1 deny select on orders to public`, `… disable trigger …`, `… setuser …` are `Read`. Unparsed must be `Unknown`, as AGENTS.md says.
+3. **Snowflake `->>`** (`sql/classify.rs`). `select 1 ->> delete from t where id = 1` parses as the JSON operator, so the chained statement isn't classified. A `->>` outside strings on Snowflake should be `Unknown`, or each segment classified.
+4. **Table functions that run SQL elsewhere** are not in `ACTING_FUNCTIONS`: SQL Server `openquery`, `openrowset`; DuckDB `postgres_query` (and the like for other attached databases). The AI path asks through `unknown_functions`; read-only and the production prompt don't.
+5. **MySQL `SET` with several assignments** (`sql/read_only.rs`). Only the first name is checked: `SET time_zone = '+00:00', GLOBAL read_only = 0` is `Session` and allowed. Check every assignment, or refuse lists.
+6. **Postgres function names written with Unicode escapes** (`U&"pg\005Fterminate\005Fbackend"(1)`) miss the name lists and are `Read`. An escaped identifier used as a function name should be `Unknown`.
+
+### Medium
+
+- **`execute` is "one statement" by convention only** (`lib.rs`). The MySQL driver allows several statements per call by default; with `NO_BACKSLASH_ESCAPES` on the server, `select 'a\'; drop table t; -- '` is one read to the splitter and classifier and two statements to the server. Turn the driver flag off.
+- **Lineage's check classifies before binding** (`crates/app/src/api/lineage.rs`, through `Session::check_sql`): a raw parameter value reaches `EXPLAIN …` unclassified. Classify the bound text.
+- **Cypher write words miss `INSERT` and `TERMINATE`** (`language.rs`); Neo4j syntax not verified.
+- **Redaction misses** (`sql/redact.rs`): `SET PASSWORD FOR … = '…'`; the old password in `ALTER USER … IDENTIFIED BY … REPLACE …`; Redshift `SECRET_ACCESS_KEY`, Snowflake `SECRET_STRING`, DuckDB `BEARER_TOKEN` and `ENCRYPTION_KEY`; `AccountKey=` in a connection string; `IDENTIFIED BY VALUES '<hash>'`; an unquoted password with `#` or `$` is cut short; secrets passed by position (`s3(url, key, secret)`, `MySQL(…)`, `sp_addlinkedsrvlogin`).
+- **`Session::in_transaction` defaults to `false`** (`lib.rs`): the contract behind the query-engine item on lost transactions. `Capabilities.transactions` is true for Oracle, Snowflake, BigQuery and DuckDB, which don't report an open one.
+- **Values that fail to convert show as NULL without a notice on SQL Server and Oracle**: `BatchBuilder` (`value.rs`) only counts them, and those connectors never read the count.
+
+### Low
+
+- `Capabilities.transactions`, `cancel`, `schemas` and `read_only_sessions` are read nowhere (only `ssh` is); Oracle's `read_only_sessions: true` contradicts `server_read_only()` (`types.rs`).
+- `is_string_literal` (`sql/params.rs`) accepts an unterminated literal (`'''`, `'abc''`): the value swallows the SQL after it.
+- `parse_datetime` (`value.rs`) drops an offset after a fraction (`13:04:05.25+02:00`) but rejects one without; used for zoned columns in `crates/connectors/cloud/src/common.rs`.
+- Timestamp builders take `Timestamp` and `TimestampTz` alike; `infinity` and BC text become NULL; `Date → Timestamp` multiplies unchecked; `Int → Float64` is treated as lossless (`value.rs`).
+- The splitter cuts valid SQL (safe, but the statement breaks): Postgres `E'it\'s; x'`, Oracle `q'[it's; x]'`, Snowflake `BEGIN … END;` blocks.
+- Structure: five hand-written lexers (splitter and params, two in redact, `referenced_results`, `changes_default`) beside the parser's; `QueryLanguage::Cql` has no connector; `lib.rs` mixes the traits with quoting and catalog helpers.
+
+### Ways to fix them (ideas, in the order suggested)
+
+1. **A "must not be a read" corpus per dialect, and a property test** (small; do with the high fixes). One file of statements per kind that must never be `Read`, and a test that classifying a whole text is never weaker than classifying its split pieces. Keeps the fixes above from regressing.
+2. **Reads by allow-list** (fixes high 1–4 and 6 as a class; medium). `Read` only for a parsed query whose functions are all known built-ins; everything else is `Unknown`. Risk: more prompts until the built-in lists are complete per engine.
+3. **Typed execution request** (fixes the multi-statement and bind-before-classify gaps; medium). `execute` takes a statement that can only be built from classified, bound text; multi-statement is off in every driver. Load and plan paths need their own way through.
+4. **A feature enum instead of silent defaults** (small to medium; touches every connector). `Session::supports(Feature)`, a tri-state transaction status, and the unused `Capabilities` fields removed, so a missing implementation is visible instead of meaning "no".
+5. **Redaction by token stream** (medium). A secret keyword, then the next literal, plus a table of functions whose secrets are positional. Risk: over-hiding in saved history.
+6. **One `ParsedStatement`** (large). Span, tokens, AST or parse error, and kind, shared by split, parameters, classify, read-only and `table_refs`: no lexer drift, and binding before classifying can't be skipped. Risk: gaps in the parser's tokenizer become split failures.
