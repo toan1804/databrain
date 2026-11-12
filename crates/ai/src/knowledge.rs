@@ -10,9 +10,9 @@ use databrain_workspace::{ConnectionProfile, KnObject, KnState, LearnedJoin, Not
 use serde::Serialize;
 
 use crate::catalog::AiTables;
-use crate::learn;
 use crate::policy::is_pii;
 use crate::types::{AiError, Result};
+use crate::{access, learn};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,7 +170,7 @@ pub async fn index_connection_with(
     // Incremental: one catalog query tells which schemas changed since the
     // last run; unchanged ones are not fetched again.
     let current: HashMap<String, String> = tokio::select! {
-        r = engine.explorer_fingerprints(connection_id) => r.ok().flatten().unwrap_or_default(),
+        r = engine.index_fingerprints(connection_id) => r.ok().flatten().unwrap_or_default(),
         _ = cancel.cancelled() => return Err(AiError::Cancelled),
     };
     let stored = if full { HashMap::new() } else { ws.kn_fingerprints(connection_id)? };
@@ -292,9 +292,21 @@ pub async fn index_tables(
     cancel: &CancellationToken,
 ) -> Result<Vec<(String, std::result::Result<KnObject, String>)>> {
     let ws = engine.workspace().clone();
+    let profile = ws.get_connection(connection_id)?;
+    // Tables the user excluded, or the access rules deny, are never read for
+    // the AI: refused in the words used for a table that doesn't exist.
+    let refused = |schema: &str, name: &str| -> bool {
+        ws.ai_excluded(connection_id, schema, name).unwrap_or(true) || access::check_read_table(&profile, &format!("{schema}.{name}")).is_err()
+    };
     let mut out = Vec::new();
     let mut fresh = Vec::new();
     for want in names.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
+        if let Ok(Some((schema, name))) = ws.meta_get(connection_id, want)
+            && refused(&schema, &name)
+        {
+            out.push((want.to_string(), Err(not_available(want))));
+            continue;
+        }
         // The user approved this: wait as long as the database needs (a first
         // connect, a sign-in, a busy metadata session, a large catalog);
         // Stop cancels it. Only a stuck server gives up, after INDEX_TABLE_TIMEOUT.
@@ -317,6 +329,7 @@ pub async fn index_tables(
             r = tokio::time::timeout(INDEX_TABLE_TIMEOUT, work) => r.unwrap_or_else(|_| Err(format!("no answer from the database in {} s", INDEX_TABLE_TIMEOUT.as_secs()))),
             _ = cancel.cancelled() => return Err(AiError::Cancelled),
         };
+        let r = r.and_then(|o| if refused(&o.schema, &o.name) { Err(not_available(want)) } else { Ok(o) });
         if let Ok(o) = &r {
             fresh.push(o.clone());
         }
@@ -415,7 +428,8 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
     let profile = ws.get_connection(connection_id)?;
     let policy = profile.ai_policy.clone();
     let t = AiTables::with_profile(ws, &profile);
-    let notes_all = ws.kn_notes(connection_id)?.into_iter().filter(|n| n.status == NoteStatus::Approved).collect::<Vec<_>>();
+    let notes_all =
+        ws.kn_notes(connection_id)?.into_iter().filter(|n| n.status == NoteStatus::Approved && t.note_visible(n.target.as_deref())).collect::<Vec<_>>();
     let mut hits = t.search(question, 40)?;
     // Tables the user's queries use often rank a little higher (BM25
     // scores are negative: lower is better).

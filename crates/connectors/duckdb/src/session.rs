@@ -184,18 +184,19 @@ impl Session for DuckSession {
             )
             .await?;
         let mut map: std::collections::HashMap<String, String> = rows.into_iter().filter_map(|r| Some((r[0].clone()?, r[1].clone()?))).collect();
-        let others = self
-            .strings(
-                "select database_name || '.' || schema_name, 'f' || md5(string_agg(function_name || ':' || coalesce(macro_definition, ''), ',' order by function_name)) \
-                 from duckdb_functions() where not internal and database_name <> 'results' group by 1 \
-                 union all \
-                 select database_name || '.' || schema_name, 's' || md5(string_agg(sequence_name || ':' || increment_by, ',' order by sequence_name)) \
-                 from duckdb_sequences() where not internal and database_name <> 'results' group by 1"
-                    .into(),
-                vec![],
-            )
-            .await
-            .unwrap_or_default();
+        // Macros and sequences, each on its own: one failing doesn't hide the other.
+        let mut others = Vec::new();
+        for sql in [
+            "select database_name || '.' || schema_name, 'f' || md5(string_agg(function_name || ':' || coalesce(macro_definition, ''), ',' order by function_name)) \
+             from duckdb_functions() where not internal and database_name <> 'results' group by 1",
+            "select database_name || '.' || schema_name, 's' || md5(string_agg(sequence_name || ':' || cast(increment_by as varchar), ',' order by sequence_name)) \
+             from duckdb_sequences() where database_name <> 'results' group by 1",
+        ] {
+            // Missing on an older DuckDB: that part is left out.
+            if let Ok(rows) = self.strings(sql.into(), vec![]).await {
+                others.extend(rows);
+            }
+        }
         for r in others {
             if let (Some(s), Some(f)) = (r[0].clone(), r[1].clone()) {
                 let e = map.entry(s).or_default();

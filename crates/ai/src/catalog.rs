@@ -72,8 +72,17 @@ impl<'a> AiTables<'a> {
 
     pub fn objects(&self) -> Result<Vec<KnObject>> {
         let all: Vec<KnObject> = self.cat.objects()?.into_iter().filter(|o| self.readable(&o.full_name())).collect();
-        // One pass: keys kept only when their target is among these.
-        let names: std::collections::HashSet<String> = all.iter().map(|o| o.full_name().to_lowercase()).collect();
+        // One pass: keys kept only when their target is among these. A key
+        // may name the schema without its catalog (`sales.t` for
+        // `main.sales.t`), as `get` accepts: every shorter form counts.
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for o in &all {
+            let full = o.full_name().to_lowercase();
+            let parts: Vec<&str> = full.split('.').collect();
+            for i in 0..parts.len().saturating_sub(1) {
+                names.insert(parts[i..].join("."));
+            }
+        }
         Ok(all
             .into_iter()
             .map(|mut o| {
@@ -109,6 +118,16 @@ impl<'a> AiTables<'a> {
     pub fn search(&self, text: &str, limit: usize) -> Result<Vec<KnHit>> {
         let hits = self.cat.search(text, limit)?;
         Ok(if self.rules() { hits.into_iter().filter(|h| h.source != "object" || self.readable(&h.reference)).collect() } else { hits })
+    }
+
+    /// A note the AI may see: a glossary note, or one whose every target
+    /// table (and column) is one the AI may use. A note about a table
+    /// outside the scope would name it.
+    pub fn note_visible(&self, target: Option<&str>) -> bool {
+        match target.map(str::trim).filter(|t| !t.is_empty()) {
+            None => true,
+            Some(t) => databrain_workspace::split_target(t).iter().all(|(_, p)| self.resolve_path(p).ok().flatten().is_some()),
+        }
     }
 
     pub fn column_names(&self, schema: &str, name: &str) -> Result<Option<Vec<String>>> {

@@ -1598,6 +1598,31 @@ async fn ai_tools_see_only_the_tables_the_scope_allows() {
     let j = json!({"left_table": "orders", "left_columns": ["customer_id"], "right_table": "customers", "right_columns": ["id"], "source": "spec"});
     let o = ctx.call("add_knowledge_join", &j).await;
     assert!(missing(&o.content), "{}", o.content);
+    // Notes: one about an excluded table isn't listed, and the AI can't probe
+    // for one by targeting it.
+    f.ws.kn_save_note(databrain_workspace::KnNote {
+        id: String::new(),
+        connection_id: f.conn.clone(),
+        target: Some("main.orders & main.customers".into()),
+        body: "orders.customer_id joins customers.id".into(),
+        author: "user".into(),
+        status: databrain_workspace::NoteStatus::Approved,
+        created_at: 0,
+        replaces: None,
+    })
+    .unwrap();
+    let o = ctx.call("list_knowledge_notes", &json!({})).await;
+    assert!(!o.content.contains("customers"), "{}", o.content);
+    let o = ctx.call("add_knowledge_note", &json!({"note": "x", "target": "main.customers"})).await;
+    assert!(missing(&o.content), "{}", o.content);
+    let o = ctx.call("add_knowledge_note", &json!({"note": "x", "target": "main.no_such"})).await;
+    assert!(missing(&o.content), "{}", o.content);
+    // index_tables can't re-allow what the user excluded (approved or not).
+    let o = ctx.call("index_tables", &json!({"tables": ["main.customers"]})).await;
+    assert!(o.content.contains("not available to the AI") && o.content.contains("Indexed 0"), "{}", o.content);
+    assert!(f.ws.ai_excluded(&f.conn, "main", "customers").unwrap());
+    let o = ctx.call("describe_table", &json!({"table": "customers"})).await;
+    assert!(missing(&o.content), "{}", o.content);
     // Allowed again: answered.
     f.ws.ai_delete_rule(&f.conn, "main", "customers").unwrap();
     let o = ctx.call("describe_table", &json!({"table": "customers"})).await;

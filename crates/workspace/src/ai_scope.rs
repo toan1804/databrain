@@ -141,17 +141,39 @@ impl Workspace {
         Ok(())
     }
 
-    /// Remove the schema rules (and their table rules) of `schemas`.
+    /// Remove the schema-level allow rules of `schemas` (taken out of the
+    /// index scope). The user's exclusions and single tables allowed on
+    /// their own stay.
     pub fn ai_remove_schemas(&self, connection_id: &str, schemas: &[String]) -> Result<()> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         tx.execute(
-            "DELETE FROM ai_scope WHERE connection_id = ?1 AND lower(schema_rule) IN (SELECT lower(value) FROM json_each(?2))",
+            "DELETE FROM ai_scope WHERE connection_id = ?1 AND table_name = '' AND allow = 1 \
+               AND lower(schema_rule) IN (SELECT lower(value) FROM json_each(?2))",
             params![connection_id, serde_json::to_string(schemas)?],
         )?;
         Self::ai_refresh_tx(&tx, connection_id, None)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// [`Self::put_rule`] unless a rule for the same schema and table
+    /// exists (indexing never overrides what the user set).
+    pub(crate) fn put_rule_if_absent(tx: &Transaction<'_>, connection_id: &str, r: &ScopeRule) -> Result<()> {
+        tx.execute(
+            "INSERT OR IGNORE INTO ai_scope (connection_id, schema_rule, table_name, allow) VALUES (?1, ?2, ?3, ?4)",
+            params![connection_id, r.schema.trim(), r.table.trim(), r.allow],
+        )?;
+        Ok(())
+    }
+
+    /// The user excluded `schema`.`table` from the AI: the most specific
+    /// rule matching it says no. (No rule at all is not an exclusion: the
+    /// AI may ask to use such a table.)
+    pub fn ai_excluded(&self, connection_id: &str, schema: &str, table: &str) -> Result<bool> {
+        let rules = self.ai_scope(connection_id)?;
+        let matched = rules.iter().any(|r| specificity(r, schema, table).is_some());
+        Ok(matched && !scope_allows(&rules, schema, table))
     }
 
     pub(crate) fn put_rule(tx: &Transaction<'_>, connection_id: &str, r: &ScopeRule) -> Result<()> {
@@ -165,60 +187,104 @@ impl Workspace {
 
     /// Recompute what the AI may use of `schema` (every schema when `None`)
     /// and the search rows of those tables. Called inside the transaction of
-    /// the write that changed them.
+    /// the write that changed them. Search rows are kept by rowid in
+    /// `ai_tables` and rewritten only for tables whose search text changed,
+    /// so a recompute never scans the search table.
     pub(crate) fn ai_refresh_tx(tx: &Transaction<'_>, connection_id: &str, schema: Option<&str>) -> Result<()> {
         let rules = Self::scope_tx(tx, connection_id)?;
-        let candidates: Vec<(String, String)> = {
-            let mut st = tx.prepare_cached(&format!(
-                "SELECT DISTINCT schema_name, name FROM meta_objects WHERE connection_id = ?1 AND (?2 IS NULL OR schema_name = ?2) AND kind IN {RELATIONS}"
-            ))?;
-            st.query_map(params![connection_id, schema], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        type Old = std::collections::HashMap<(String, String), (Option<i64>, Option<String>)>;
+        let mut old: Old = {
+            let mut st = tx.prepare_cached(
+                "SELECT schema_name, name, fts_rowid, body_hash FROM ai_tables WHERE connection_id = ?1 AND (?2 IS NULL OR schema_name = ?2)",
+            )?;
+            st.query_map(params![connection_id, schema], |r| Ok(((r.get(0)?, r.get(1)?), (r.get(2)?, r.get(3)?))))?.collect::<rusqlite::Result<_>>()?
         };
-        tx.execute("DELETE FROM ai_tables WHERE connection_id = ?1 AND (?2 IS NULL OR schema_name = ?2)", params![connection_id, schema])?;
-        {
-            let mut ins = tx.prepare_cached("INSERT OR IGNORE INTO ai_tables (connection_id, schema_name, name) VALUES (?1, ?2, ?3)")?;
-            for (s, n) in candidates.iter().filter(|(s, n)| scope_allows(&rules, s, n)) {
-                ins.execute(params![connection_id, s, n])?;
-            }
+        // No scope and nothing allowed before: nothing to do (the usual case
+        // for connections the AI isn't used on).
+        if rules.is_empty() && old.is_empty() {
+            return Ok(());
         }
-        // Search rows: one per allowed table, from what is known of it now.
-        match schema {
-            Some(s) => tx.execute(
-                "DELETE FROM kn_fts WHERE rowid IN (SELECT rowid FROM kn_fts WHERE connection_id = ?1 AND source = 'object' \
-                   AND substr(ref, 1, length(?2) + 1) = ?2 || '.')",
-                params![connection_id, s],
-            )?,
-            None => tx.execute("DELETE FROM kn_fts WHERE connection_id = ?1 AND source = 'object'", [connection_id])?,
-        };
-        let objects = Self::ai_objects_tx(tx, connection_id, schema)?;
-        let mut ins = tx.prepare_cached("INSERT INTO kn_fts (connection_id, source, ref, title, body) VALUES (?1, 'object', ?2, ?3, ?4)")?;
-        for o in &objects {
-            ins.execute(params![connection_id, o.full_name(), o.name, o.search_body()])?;
+        let facts = Self::facts_tx(tx, connection_id, schema, None)?;
+        let mut seen = std::collections::HashSet::new();
+        for o in facts.into_iter().filter(|o| scope_allows(&rules, &o.schema, &o.name)) {
+            let key = (o.schema.clone(), o.name.clone());
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            Self::put_search_row(tx, connection_id, &o, old.remove(&key))?;
+        }
+        // No longer allowed (or gone): their rows go.
+        for ((s, n), (rowid, _)) in old {
+            if let Some(r) = rowid {
+                tx.execute("DELETE FROM kn_fts WHERE rowid = ?1", [r])?;
+            }
+            tx.execute("DELETE FROM ai_tables WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3", params![connection_id, s, n])?;
         }
         Ok(())
     }
 
-    /// The search row of one table after its columns changed (a describe).
-    pub(crate) fn ai_refresh_table_tx(tx: &Transaction<'_>, connection_id: &str, schema: &str, name: &str) -> Result<()> {
-        let allowed: bool = tx.query_row(
-            "SELECT count(*) > 0 FROM ai_tables WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3",
-            params![connection_id, schema, name],
-            |r| r.get(0),
-        )?;
-        if !allowed {
+    /// One allowed table's `ai_tables` row and search row: written when new,
+    /// rewritten when its search text changed, left alone otherwise.
+    fn put_search_row(tx: &Transaction<'_>, connection_id: &str, o: &KnObject, old: Option<(Option<i64>, Option<String>)>) -> Result<()> {
+        let hash = o.hash();
+        if let Some((Some(_), Some(h))) = &old
+            && *h == hash
+        {
             return Ok(());
         }
-        let full = format!("{schema}.{name}");
-        tx.execute(
-            "DELETE FROM kn_fts WHERE rowid IN (SELECT rowid FROM kn_fts WHERE connection_id = ?1 AND source = 'object' AND ref = ?2)",
-            params![connection_id, full],
-        )?;
-        if let Some(o) = Self::ai_object_tx(tx, connection_id, schema, name)? {
-            tx.execute(
-                "INSERT INTO kn_fts (connection_id, source, ref, title, body) VALUES (?1, 'object', ?2, ?3, ?4)",
-                params![connection_id, full, o.name, o.search_body()],
-            )?;
+        if let Some((Some(r), _)) = old {
+            tx.execute("DELETE FROM kn_fts WHERE rowid = ?1", [r])?;
         }
+        tx.prepare_cached("INSERT INTO kn_fts (connection_id, source, ref, title, body) VALUES (?1, 'object', ?2, ?3, ?4)")?.execute(params![
+            connection_id,
+            o.full_name(),
+            o.name,
+            o.search_body()
+        ])?;
+        let rowid = tx.last_insert_rowid();
+        tx.prepare_cached(
+            "INSERT INTO ai_tables (connection_id, schema_name, name, fts_rowid, body_hash) VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (connection_id, schema_name, name) DO UPDATE SET fts_rowid = excluded.fts_rowid, body_hash = excluded.body_hash",
+        )?
+        .execute(params![connection_id, o.schema, o.name, rowid, hash])?;
+        Ok(())
+    }
+
+    /// What the explorer cache knows of a schema's tables (or one table),
+    /// whether or not the AI may use them.
+    fn facts_tx(c: &rusqlite::Connection, connection_id: &str, schema: Option<&str>, name: Option<&str>) -> Result<Vec<KnObject>> {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT o.schema_name, o.name, o.kind, o.comment, o.row_estimate, m.columns_json, m.fks_json FROM meta_objects o \
+             LEFT JOIN meta_columns m ON m.connection_id = o.connection_id AND m.schema_name = o.schema_name AND m.table_name = o.name \
+             WHERE o.connection_id = ?1 AND (?2 IS NULL OR o.schema_name = ?2) AND (?3 IS NULL OR o.name = ?3) AND o.kind IN {RELATIONS} \
+             ORDER BY o.schema_name, o.name, o.kind = 'table' DESC"
+        ))?;
+        let rows = st.query_map(params![connection_id, schema, name], Self::ai_object_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The search row of one table after its columns changed (a describe).
+    pub(crate) fn ai_refresh_table_tx(tx: &Transaction<'_>, connection_id: &str, schema: &str, name: &str) -> Result<()> {
+        let old: Option<(Option<i64>, Option<String>)> = tx
+            .query_row(
+                "SELECT fts_rowid, body_hash FROM ai_tables WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3",
+                params![connection_id, schema, name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        // Not allowed: nothing to index.
+        let Some(old) = old else { return Ok(()) };
+        if let Some(o) = Self::facts_tx(tx, connection_id, Some(schema), Some(name))?.into_iter().next() {
+            Self::put_search_row(tx, connection_id, &o, Some(old))?;
+        }
+        Ok(())
+    }
+
+    /// Forget what the AI may use of a connection (its facts are gone); the
+    /// scope stays.
+    pub(crate) fn ai_forget_tx(c: &rusqlite::Connection, connection_id: &str) -> Result<()> {
+        c.execute("DELETE FROM kn_fts WHERE rowid IN (SELECT fts_rowid FROM ai_tables WHERE connection_id = ?1 AND fts_rowid IS NOT NULL)", [connection_id])?;
+        c.execute("DELETE FROM ai_tables WHERE connection_id = ?1", [connection_id])?;
         Ok(())
     }
 
@@ -243,15 +309,6 @@ impl Workspace {
         ))?;
         let rows = st.query_map(params![connection_id, schema], Self::ai_object_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
-    }
-
-    fn ai_object_tx(c: &rusqlite::Connection, connection_id: &str, schema: &str, name: &str) -> Result<Option<KnObject>> {
-        Ok(c.query_row(
-            &format!("SELECT {} FROM ai_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3", Self::AI_COLUMNS),
-            params![connection_id, schema, name],
-            Self::ai_object_row,
-        )
-        .optional()?)
     }
 
     /// Once, after the v20 migration: what each connection's AI may use.
@@ -533,5 +590,76 @@ mod tests {
         // Out of the index scope: out of the AI's.
         ws.kn_retain_schemas("c", &["hr".into()]).unwrap();
         assert_eq!(ai.objects().unwrap().iter().map(|o| o.full_name()).collect::<Vec<_>>(), vec!["hr.teams"]);
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use databrain_connector_core::{ColumnInfo, DbObject, ObjectKind};
+
+    fn k(schema: &str, name: &str) -> KnObject {
+        KnObject {
+            schema: schema.into(),
+            name: name.into(),
+            kind: "table".into(),
+            comment: None,
+            row_estimate: None,
+            columns: vec![ColumnInfo { name: "id".into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None }],
+            foreign_keys: vec![],
+        }
+    }
+
+    #[test]
+    fn an_exclusion_survives_indexing_and_scope_changes() {
+        let ws = Workspace::open_in_memory().unwrap();
+        ws.kn_replace_schema("c", "sales", &[k("sales", "orders"), k("sales", "salaries")]).unwrap();
+        ws.ai_put_rule("c", &ScopeRule { schema: "sales".into(), table: "salaries".into(), allow: false }).unwrap();
+        let ai = ws.ai_catalog("c");
+        let names = || ai.objects().unwrap().into_iter().map(|o| o.full_name()).collect::<Vec<_>>();
+        assert_eq!(names(), vec!["sales.orders"]);
+        assert!(ws.ai_excluded("c", "sales", "salaries").unwrap());
+        assert!(!ws.ai_excluded("c", "hr", "teams").unwrap(), "no rule is not an exclusion");
+        // index_tables (the AI asked, approved), a re-index: the exclusion stays.
+        ws.kn_upsert_objects("c", &[k("sales", "salaries")]).unwrap();
+        ws.kn_replace_schema("c", "sales", &[k("sales", "orders"), k("sales", "salaries")]).unwrap();
+        assert_eq!(names(), vec!["sales.orders"]);
+        // A table allowed on its own elsewhere, then the schema leaves the index scope:
+        // only its schema-level rule goes.
+        ws.kn_upsert_objects("c", &[k("hr", "teams")]).unwrap();
+        ws.kn_retain_schemas("c", &["hr".into()]).unwrap();
+        assert!(ws.ai_scope("c").unwrap().contains(&ScopeRule { schema: "sales".into(), table: "salaries".into(), allow: false }));
+        assert!(ws.ai_scope("c").unwrap().contains(&ScopeRule { schema: "hr".into(), table: "teams".into(), allow: true }));
+        assert_eq!(names(), vec!["hr.teams"]);
+        // A `catalog.*`-like broad rule later doesn't bring the excluded one back.
+        ws.ai_put_rule("c", &ScopeRule { schema: "*".into(), table: String::new(), allow: true }).unwrap();
+        ws.meta_put_schema(
+            "c",
+            "sales",
+            &[DbObject { schema: "sales".into(), name: "salaries".into(), kind: ObjectKind::Table, comment: None, row_estimate: None }],
+        )
+        .unwrap();
+        assert!(!names().contains(&"sales.salaries".to_string()));
+    }
+
+    #[test]
+    fn search_rows_follow_each_schema_even_when_names_share_a_prefix() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let o = |s: &str, n: &str| DbObject { schema: s.into(), name: n.into(), kind: ObjectKind::Table, comment: None, row_estimate: None };
+        ws.ai_set_scope("c", &[ScopeRule { schema: "*".into(), table: String::new(), allow: true }]).unwrap();
+        ws.meta_put_schema("c", "main.sales", &[o("main.sales", "invoices")]).unwrap();
+        ws.meta_put_schema("c", "main", &[o("main", "orders")]).unwrap();
+        // Listing `main` again leaves `main.sales` alone.
+        ws.meta_put_schema("c", "main", &[o("main", "orders")]).unwrap();
+        let ai = ws.ai_catalog("c");
+        assert_eq!(ai.search("invoices", 5).unwrap().len(), 1);
+        assert_eq!(ai.search("orders", 5).unwrap().len(), 1, "one row, not two");
+        // Unchanged tables keep their search row (no rewrite); gone ones lose it.
+        ws.meta_put_schema("c", "main", &[]).unwrap();
+        assert!(ai.search("orders", 5).unwrap().is_empty());
+        assert_eq!(ai.search("invoices", 5).unwrap().len(), 1);
+        // A connection with no scope does nothing (and has nothing).
+        ws.meta_put_schema("other", "main", &[o("main", "orders")]).unwrap();
+        assert!(ws.ai_catalog("other").search("orders", 5).unwrap().is_empty());
     }
 }

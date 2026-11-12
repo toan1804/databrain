@@ -846,15 +846,21 @@ impl Session for SfSession {
                 "select table_schema, 't' || count(*) || ':' || hash_agg(table_name, table_type, comment) from {d}.information_schema.tables group by 1 \
                  union all \
                  select table_schema, 'c' || count(*) || ':' || hash_agg(table_name, column_name, ordinal_position, data_type, character_maximum_length, numeric_precision, numeric_scale, is_nullable, comment) \
-                 from {d}.information_schema.columns group by 1 \
-                 union all \
-                 select function_schema, 'f' || count(*) || ':' || hash_agg(function_name, argument_signature, last_altered) from {d}.information_schema.functions group by 1 \
+                 from {d}.information_schema.columns group by 1"
+            );
+            let Ok(mut rows) = self.0.run_small(&sql).await else { continue };
+            // Routines and sequences, best effort: a role that can't read
+            // those views keeps the tables' fingerprint.
+            let routines = format!(
+                "select function_schema, 'f' || count(*) || ':' || hash_agg(function_name, argument_signature, last_altered) from {d}.information_schema.functions group by 1 \
                  union all \
                  select procedure_schema, 'p' || count(*) || ':' || hash_agg(procedure_name, argument_signature, last_altered) from {d}.information_schema.procedures group by 1 \
                  union all \
                  select sequence_schema, 's' || count(*) || ':' || hash_agg(sequence_name, increment, last_altered) from {d}.information_schema.sequences group by 1"
             );
-            let Ok(rows) = self.0.run_small(&sql).await else { continue };
+            if let Ok(more) = self.0.run_small(&routines).await {
+                rows.extend(more);
+            }
             let mut parts: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
             for r in rows {
                 if let (Some(s), Some(f)) = (r.first().cloned().flatten(), r.get(1).cloned().flatten()) {

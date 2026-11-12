@@ -21,9 +21,19 @@ impl ToolContext {
     pub(super) async fn checked_target(&self, target: Option<&str>) -> Result<Option<String>> {
         match target.map(str::trim).filter(|t| !t.is_empty()) {
             None => Ok(None),
-            Some(t) => knowledge::check_note_target(&self.engine, &self.profile.id, t).await.map(Some).map_err(|e| {
-                AiError::Policy(format!("invalid target `{t}`: {e}. Use real tables (schema.table, several joined with &), or omit target for a glossary note"))
-            }),
+            Some(t) => {
+                // Only tables the AI may use: one answer for a table outside
+                // its scope and one that doesn't exist.
+                let tables = crate::catalog::AiTables::with_profile(self.engine.workspace(), &self.profile);
+                if let Some((_, p)) = databrain_workspace::split_target(t).into_iter().find(|(_, p)| tables.resolve_path(p).ok().flatten().is_none()) {
+                    return Err(AiError::Policy(format!("invalid target `{t}`: {}", knowledge::not_available(&p))));
+                }
+                knowledge::check_note_target(&self.engine, &self.profile.id, t).await.map(Some).map_err(|e| {
+                    AiError::Policy(format!(
+                        "invalid target `{t}`: {e}. Use real tables (schema.table, several joined with &), or omit target for a glossary note"
+                    ))
+                })
+            }
         }
     }
 
@@ -149,11 +159,13 @@ impl ToolContext {
     pub(super) fn list_notes(&self, args: &Value) -> Result<ToolOutput> {
         let filter = args.get("filter").and_then(|f| f.as_str()).unwrap_or("").to_lowercase();
         let words: Vec<&str> = filter.split_whitespace().collect();
+        let tables = crate::catalog::AiTables::with_profile(self.engine.workspace(), &self.profile);
         let notes: Vec<KnNote> = self
             .engine
             .workspace()
             .kn_notes(&self.profile.id)?
             .into_iter()
+            .filter(|n| tables.note_visible(n.target.as_deref()))
             .filter(|n| {
                 let hay = format!("{} {}", n.target.as_deref().unwrap_or(""), n.body).to_lowercase();
                 words.iter().all(|w| hay.contains(w))

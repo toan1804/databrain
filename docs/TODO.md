@@ -51,7 +51,7 @@ Paths are in `crates/query-engine/src/` unless given in full. Items 1, 2 and 5 w
 
 ## Explorer and AI index (left from the review of 2026-11-12)
 
-- PostgreSQL row estimates are refreshed only when the schema changes (the explorer fingerprint leaves out `reltuples`).
+- PostgreSQL row estimates are refreshed only when the schema changes: the explorer fingerprint leaves out `reltuples`, and since index runs use the same fingerprint (2026-11-13) they skip such schemas too, so the AI's row estimates go stale as well.
 - The ER diagram (`schema_tables`) is always read live and doesn't work offline.
 - `clear_explorer_cache` is a command the UI never calls.
 

@@ -33,7 +33,7 @@ impl KnObject {
         format!("{}.{}", self.schema, self.name)
     }
 
-    fn hash(&self) -> String {
+    pub(crate) fn hash(&self) -> String {
         // FNV-1a over the serialized object: cheap change detection.
         let s = serde_json::to_string(self).unwrap_or_default();
         let mut h: u64 = 0xcbf29ce484222325;
@@ -456,8 +456,9 @@ impl Workspace {
         }
         // Indexing a schema lets the AI use it (step 1 of the metadata
         // store: the Knowledge page's scope controls replace this later).
+        // An existing rule (the user excluded the schema) is kept.
         if !objects.is_empty() {
-            Self::put_rule(&tx, connection_id, &crate::ScopeRule { schema: schema.to_string(), table: String::new(), allow: true })?;
+            Self::put_rule_if_absent(&tx, connection_id, &crate::ScopeRule { schema: schema.to_string(), table: String::new(), allow: true })?;
         }
         Self::ai_refresh_tx(&tx, connection_id, Some(schema))?;
         tx.commit()?;
@@ -553,8 +554,9 @@ impl Workspace {
             changed += 1;
         }
         // Indexing a table lets the AI use it.
+        // An existing rule (the user excluded the table) is kept.
         for o in objects {
-            Self::put_rule(&tx, connection_id, &crate::ScopeRule { schema: o.schema.clone(), table: o.name.clone(), allow: true })?;
+            Self::put_rule_if_absent(&tx, connection_id, &crate::ScopeRule { schema: o.schema.clone(), table: o.name.clone(), allow: true })?;
         }
         let schemas: HashSet<&str> = objects.iter().map(|o| o.schema.as_str()).collect();
         for s in schemas {
@@ -765,7 +767,8 @@ impl Workspace {
     pub fn kn_clear(&self, connection_id: &str) -> Result<()> {
         let c = self.conn.lock();
         c.execute("DELETE FROM kn_objects WHERE connection_id = ?1", [connection_id])?;
-        c.execute("DELETE FROM kn_fts WHERE connection_id = ?1 AND source = 'object'", [connection_id])?;
+        // Search rows go with `ai_tables` (kept in step); the scope stays.
+        Self::ai_forget_tx(&c, connection_id)?;
         c.execute("DELETE FROM kn_state WHERE connection_id = ?1", [connection_id])?;
         c.execute("DELETE FROM kn_schema_state WHERE connection_id = ?1", [connection_id])?;
         Ok(())

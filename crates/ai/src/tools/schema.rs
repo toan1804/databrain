@@ -60,6 +60,7 @@ impl ToolContext {
             .kn_notes(&target.id)?
             .into_iter()
             .filter(|n| n.status == NoteStatus::Approved && n.target.as_deref().is_some_and(|x| databrain_workspace::target_mentions(x, &full, &o.name)))
+            .filter(|n| tables.note_visible(n.target.as_deref()))
             .map(|n| match n.target.as_deref() {
                 Some(t) if !t.eq_ignore_ascii_case(&full) => format!("{t}: {}", n.body),
                 _ => n.body,
@@ -146,11 +147,17 @@ impl ToolContext {
         self.gate("index_tables", Decision::Ask("Index tables".into()), &summary, &detail).await?;
         let results = knowledge::index_tables(&self.engine, &target.id, &tables, &self.cancel).await?;
         let pol = target.ai_policy.clone();
+        let tables = AiTables::with_profile(self.engine.workspace(), &target);
         let mut text = String::new();
         let mut ok = Vec::new();
         let mut failed = Vec::new();
         for (want, r) in &results {
-            match r {
+            // Shown as the AI may see it (no keys to tables outside its scope).
+            let shown = match r {
+                Ok(o) => tables.get(&o.full_name())?.ok_or_else(|| knowledge::not_available(want)),
+                Err(e) => Err(e.clone()),
+            };
+            match &shown {
                 Ok(o) => {
                     let full = o.full_name();
                     text.push_str(&knowledge::render_object(o, &|c| is_pii(&pol, Some(&full), c), &[]));

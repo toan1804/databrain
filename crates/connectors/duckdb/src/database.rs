@@ -201,6 +201,25 @@ mod tests {
         assert!(!s.in_transaction());
     }
 
+    /// The explorer's fingerprint changes when a table, a macro or a
+    /// sequence is added, and not otherwise.
+    #[tokio::test]
+    async fn fingerprints_see_tables_macros_and_sequences() {
+        let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        let fp = || async { s.explorer_fingerprints().await.unwrap().unwrap().get("memory.main").cloned().unwrap_or_default() };
+        q(&*s, "create table t (a int)").await;
+        let f0 = fp().await;
+        assert_eq!(fp().await, f0, "stable");
+        q(&*s, "create macro twice(x) as x * 2").await;
+        let f1 = fp().await;
+        assert_ne!(f1, f0, "a macro");
+        q(&*s, "create sequence seq start 1").await;
+        let f2 = fp().await;
+        assert_ne!(f2, f1, "a sequence");
+        q(&*s, "create table u (b int)").await;
+        assert_ne!(fp().await, f2, "a table");
+    }
+
     /// A session opening a file that another thread is closing waits for it
     /// to close instead of opening a second instance on it (WAL errors).
     #[tokio::test]

@@ -471,9 +471,7 @@ impl Workspace {
     pub fn tables_named(&self, connection_id: &str, name: &str) -> Result<Vec<(String, String)>> {
         let c = self.conn.lock();
         let mut stmt = c.prepare(
-            "SELECT schema_name, name FROM kn_objects WHERE connection_id = ?1 AND lower(name) = lower(?2) \
-             UNION ALL \
-             SELECT schema_name, name FROM meta_objects WHERE connection_id = ?1 AND lower(name) = lower(?2) \
+            "SELECT schema_name, name FROM meta_objects WHERE connection_id = ?1 AND lower(name) = lower(?2) \
                AND kind NOT IN ('function', 'procedure', 'package', 'sequence', 'other')",
         )?;
         let mut out: Vec<(String, String)> = Vec::new();

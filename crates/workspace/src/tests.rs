@@ -156,20 +156,31 @@ fn schema_version_guard_and_backup() {
     {
         let c = Connection::open(&path).unwrap();
         c.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64).unwrap();
-        // Undo the last migration, as an older version left it, with a
-        // table indexed for the AI.
-        c.execute_batch(
-            "DROP VIEW ai_objects; DROP TABLE ai_scope; DROP TABLE ai_tables; DELETE FROM maintenance WHERE name = 'ai_tables_v20'; \
-             INSERT INTO kn_objects (connection_id, schema_name, name, kind, comment, row_estimate, columns_json, fks_json, content_hash, indexed_at) \
-             VALUES ('c', 's', 'orders', 'table', NULL, NULL, '[{\"name\":\"id\",\"data_type\":\"int\",\"nullable\":false,\"is_primary_key\":true}]', '[]', 'h', 1)",
-        )
-        .unwrap();
+        // Undo the last migration, as an older version left it: schema `s`
+        // indexed in full (index scope `*`), `hr.teams` indexed on its own,
+        // and `hr.salaries` only seen in the explorer.
+        let cols = r#"[{"name":"id","data_type":"int","nullable":false,"is_primary_key":true}]"#;
+        c.execute_batch("DROP VIEW ai_objects; DROP TABLE ai_scope; DROP TABLE ai_tables; DELETE FROM maintenance WHERE name = 'ai_tables_v20';").unwrap();
+        for (s, n) in [("s", "orders"), ("hr", "teams")] {
+            c.execute(
+                "INSERT INTO kn_objects (connection_id, schema_name, name, kind, comment, row_estimate, columns_json, fks_json, content_hash, indexed_at) \
+                 VALUES ('c', ?1, ?2, 'table', NULL, NULL, ?3, '[]', 'h', 1)",
+                rusqlite::params![s, n, cols],
+            )
+            .unwrap();
+        }
+        c.execute("INSERT INTO kn_state (connection_id, indexed_at, objects, schemas_json, error) VALUES ('c', 1, 2, '[\"s\"]', NULL)", []).unwrap();
+        c.execute("INSERT INTO meta_objects (connection_id, schema_name, name, kind, seen_at) VALUES ('c', 'hr', 'salaries', 'table', 1)", []).unwrap();
     }
     let ws = Workspace::open(&path).unwrap();
-    // Migrated: the table is in the explorer cache, and the AI still sees it.
+    // Migrated: the facts are in the explorer cache, and the AI sees exactly
+    // what it saw: `s` in full and `hr.teams`, not `hr.salaries`, no `*`.
     assert_eq!(ws.meta_table("c", "s", "orders").unwrap().unwrap().columns.len(), 1);
-    assert_eq!(ws.ai_catalog("c").get("s.orders").unwrap().map(|o| o.columns.len()), Some(1));
-    assert_eq!(ws.ai_catalog("c").search("orders", 5).unwrap().len(), 1);
+    let ai = ws.ai_catalog("c");
+    assert_eq!(ai.get("s.orders").unwrap().map(|o| o.columns.len()), Some(1));
+    assert_eq!(ai.search("orders", 5).unwrap().len(), 1);
+    assert_eq!(ai.objects().unwrap().into_iter().map(|o| o.full_name()).collect::<Vec<_>>(), vec!["hr.teams", "s.orders"]);
+    assert!(ws.ai_scope("c").unwrap().iter().all(|r| r.schema != "*"));
     let backup = dir.join(format!("workspace.db.bak-before-v{}", MIGRATIONS.len()));
     let b = Connection::open(&backup).unwrap();
     let bv: i64 = b.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();

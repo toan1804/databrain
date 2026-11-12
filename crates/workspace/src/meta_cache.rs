@@ -706,8 +706,7 @@ impl Workspace {
         c.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [connection_id])?;
         c.execute("UPDATE meta_conn_state SET catalogs_at = NULL, schemas_at = NULL, checked_at = NULL WHERE connection_id = ?1", [connection_id])?;
         // The tables the AI could use are gone with them (its scope stays).
-        c.execute("DELETE FROM ai_tables WHERE connection_id = ?1", [connection_id])?;
-        c.execute("DELETE FROM kn_fts WHERE connection_id = ?1 AND source = 'object'", [connection_id])?;
+        Self::ai_forget_tx(&c, connection_id)?;
         Ok(())
     }
 }

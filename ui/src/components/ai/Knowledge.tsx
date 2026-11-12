@@ -283,8 +283,8 @@ export function Knowledge() {
         )}
         {data?.state?.error && <div className="mt-1 text-[11.5px] text-danger">{data.state.error}</div>}
         <p className="mt-2 text-[11px] text-muted">
-          The AI only knows the tables listed here: others don't exist for it. Only metadata (names, types, comments, keys) is kept, locally.
-          What is sent to the model is controlled per connection (Edit connection → AI).
+          The AI searches, describes and samples only the tables listed here. What its SQL may read or change is set by the connection's table
+          rules, and what is sent to the model per connection (Edit connection → AI). Only metadata (names, types, comments, keys) is kept, locally.
         </p>
       </div>
       )}

@@ -56,6 +56,12 @@ impl QueryEngine {
         self.with_meta(connection_id, |s| async move { s.explorer_fingerprints().await }).await
     }
 
+    /// [`Self::explorer_fingerprints`] on the indexing session, so an index
+    /// run's catalog query doesn't hold up the explorer.
+    pub async fn index_fingerprints(&self, connection_id: &str) -> Result<Option<HashMap<String, String>>> {
+        self.with_tab(connection_id, self.index_tab(connection_id), |s| async move { s.explorer_fingerprints().await }).await
+    }
+
     pub async fn object_versions(&self, connection_id: &str, schema: &str) -> Result<Option<HashMap<String, String>>> {
         let schema = schema.to_string();
         self.with_meta(connection_id, |s| {

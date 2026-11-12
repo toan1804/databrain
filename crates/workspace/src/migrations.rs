@@ -396,6 +396,8 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         connection_id TEXT NOT NULL,
         schema_name   TEXT NOT NULL,
         name          TEXT NOT NULL,
+        fts_rowid     INTEGER,
+        body_hash     TEXT,
         PRIMARY KEY (connection_id, schema_name, name)
     );
     CREATE VIEW ai_objects AS
@@ -405,14 +407,17 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         JOIN meta_objects o ON o.connection_id = a.connection_id AND o.schema_name = a.schema_name AND o.name = a.name
             AND o.kind IN ('table', 'view', 'materialized_view', 'foreign_table')
         LEFT JOIN meta_columns c ON c.connection_id = a.connection_id AND c.schema_name = a.schema_name AND c.table_name = a.name;
-    -- The scope: the schemas chosen for indexing, and every schema indexed
-    -- today, so the AI keeps seeing what it sees.
+    -- The scope keeps exactly what the AI sees today: every schema an index
+    -- run read in full (kn_state.schemas; `*` in index_schemas is carried by
+    -- these, never as a rule that would also allow system schemas), and
+    -- each table indexed on its own (index_tables) as a table rule.
     INSERT OR IGNORE INTO ai_scope (connection_id, schema_rule, table_name, allow)
-        SELECT c.id, trim(j.value), '', 1 FROM connections c,
-            json_each(coalesce(json_extract(c.ai_policy_json, '$.index_schemas'), '[]')) j
+        SELECT s.connection_id, trim(j.value), '', 1 FROM kn_state s, json_each(s.schemas_json) j
         WHERE trim(j.value) <> '';
     INSERT OR IGNORE INTO ai_scope (connection_id, schema_rule, table_name, allow)
-        SELECT DISTINCT connection_id, schema_name, '', 1 FROM kn_objects;
+        SELECT k.connection_id, k.schema_name, k.name, 1 FROM kn_objects k
+        WHERE NOT EXISTS (SELECT 1 FROM ai_scope a WHERE a.connection_id = k.connection_id
+            AND a.table_name = '' AND lower(a.schema_rule) = lower(k.schema_name));
     -- The facts: what the index knows that the explorer cache doesn't, or
     -- knows from longer ago.
     INSERT INTO meta_objects (connection_id, schema_name, name, kind, comment, row_estimate, seen_at)

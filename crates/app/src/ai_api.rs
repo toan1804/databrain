@@ -497,7 +497,11 @@ pub struct KnowledgeView {
 /// Index state and notes. Objects are paged with [`knowledge_objects`]
 /// (an index can hold 10k+ tables).
 pub fn knowledge(state: &AppState, connection_id: &str) -> Result<KnowledgeView> {
-    Ok(KnowledgeView { state: state.workspace.kn_state(connection_id)?, notes: state.workspace.kn_notes(connection_id)? })
+    // The count is what the AI may use now (scope edits and listings change
+    // it between runs), not what the last run saw.
+    let objects = databrain_ai::catalog::AiTables::new(&state.workspace, connection_id).and_then(|t| t.count()).map_err(ai_err)?;
+    let st = state.workspace.kn_state(connection_id)?.map(|s| databrain_workspace::KnState { objects, ..s });
+    Ok(KnowledgeView { state: st, notes: state.workspace.kn_notes(connection_id)? })
 }
 
 #[derive(Serialize, ts_rs::TS)]
@@ -536,9 +540,13 @@ pub fn index_knowledge(state: &AppState, connection_id: &str, scope: Option<Vec<
             }
             p.ai_policy.index_schemas = if sc.iter().any(|s| s.trim() == "*") { vec!["*".into()] } else { sc.clone() };
             // The scope is what the AI may use. `*` is carried by the rule
-            // each indexed schema gets (system schemas never are).
-            let named: Vec<String> = sc.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "*").collect();
-            state.workspace.ai_set_schema_rules(connection_id, &named).map_err(EngineError::from)?;
+            // each indexed schema gets (system schemas never are): the rules
+            // there are kept until the run (re)allows each schema, so a
+            // cancelled or failed run takes nothing away.
+            if !sc.iter().any(|s| s.trim() == "*") {
+                let named: Vec<String> = sc.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                state.workspace.ai_set_schema_rules(connection_id, &named).map_err(EngineError::from)?;
+            }
         }
         if let Some(b) = batch {
             p.ai_policy.index_batch = b.clamp(1, databrain_ai::knowledge::MAX_BATCH as u32);
