@@ -4,7 +4,7 @@ import { api } from "../../lib/api";
 import type { ConnectionView, DbObject, KnState } from "../../lib/types";
 import { useAi } from "../../aiStore";
 import { useStore } from "../../store";
-import { IndexHint } from "./IndexHint";
+import { IndexHint, RETRY_MS } from "./IndexHint";
 
 const conn = (policy: Record<string, unknown> = {}): ConnectionView =>
   ({ id: "c1", name: "Warehouse", config: { kind: "postgres" }, ai_policy: { ai_enabled: true, share_metadata: true, ...policy } }) as unknown as ConnectionView;
@@ -26,6 +26,22 @@ describe("index hint", () => {
     fireEvent.click(screen.getByText("Index in Knowledge"));
     expect(useAi.getState().view).toBe("knowledge");
     expect(useAi.getState().knowledgeFocus).toBe("c1");
+  });
+
+  it("reads the index state again when a read fails", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      useStore.setState({ connections: [conn()], objects: {} });
+      const get = vi.spyOn(api, "knGet").mockRejectedValueOnce(new Error("busy")).mockResolvedValue({ state: null, notes: [] });
+      render(<IndexHint connId="c1" />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RETRY_MS[0]);
+      });
+      await screen.findByText(/doesn't know/);
+      expect(get).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("says how few tables are indexed compared with the explorer", async () => {

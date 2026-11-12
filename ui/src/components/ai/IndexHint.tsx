@@ -11,6 +11,8 @@ import { useAi } from "../../aiStore";
 import { useStore } from "../../store";
 
 const DISMISS_KEY = "db.ai.indexHint";
+/** Waits before reading the index state again after a failed read. */
+export const RETRY_MS = [1_000, 3_000, 10_000];
 
 function dismissed(key: string): boolean {
   try {
@@ -35,12 +37,21 @@ export function IndexHint({ connId }: { connId: string | null }) {
   useEffect(() => {
     if (!connId) return;
     let live = true;
-    api
-      .knGet(connId)
-      .then((v) => live && setState({ conn: connId, version, value: v.state }))
-      .catch(() => {});
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // A failed read is tried again a few times, so the hint doesn't stay
+    // hidden until the index changes next.
+    const load = (attempt: number) => {
+      api
+        .knGet(connId)
+        .then((v) => live && setState({ conn: connId, version, value: v.state }))
+        .catch(() => {
+          if (live && attempt < RETRY_MS.length) timer = setTimeout(() => load(attempt + 1), RETRY_MS[attempt]);
+        });
+    };
+    load(0);
     return () => {
       live = false;
+      clearTimeout(timer);
     };
   }, [connId, version]);
 
