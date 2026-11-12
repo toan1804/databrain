@@ -230,6 +230,7 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 - `run_and_wait` is the same run for the AI, MCP and job steps. Its outcome comes on a channel of its own, so a lagging event subscriber can't lose the end of a run.
 - `connect.rs` resolves credentials, opens the SSH tunnel and applies the connect timeout. `probe.rs` does a DNS and TCP check first so a test tells "unknown host", "refused" and "no answer" apart.
 - Every run is written to `query_history` with its origin.
+- Sessions, the run loop, cancellation, transactions, outputs and which safety check lives where: [QUERY_ENGINE.md](QUERY_ENGINE.md).
 
 ---
 
