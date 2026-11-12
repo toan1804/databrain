@@ -91,6 +91,17 @@ fn identity(cfg: &ConnectionConfig) -> String {
     v.to_string()
 }
 
+/// Columns cached in a schema the explorer never listed in full (seen by
+/// completion, lineage, grid edits or search) are never checked by a schema
+/// refresh: after this long they count as stale and are read again when
+/// shown online.
+pub const UNLISTED_COLUMNS_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// SQL: `m` (a `meta_columns` row) may be out of date.
+/// `?4` is the cut-off: `now_ms() - UNLISTED_COLUMNS_TTL_MS`.
+const STALE_SQL: &str = "(m.stale OR (m.seen_at < ?4 AND NOT EXISTS (SELECT 1 FROM meta_schemas s WHERE s.connection_id = m.connection_id \
+     AND s.schema_name = m.schema_name AND s.listed_at IS NOT NULL)))";
+
 impl Workspace {
     /// A complete listing of `schema` (explorer): replaces its cached objects.
     pub fn meta_put_schema(&self, connection_id: &str, schema: &str, objects: &[DbObject]) -> Result<()> {
@@ -519,11 +530,13 @@ impl Workspace {
         let c = self.conn.lock();
         let seen: Option<Seen> = c
             .query_row(
-                "SELECT m.columns_json, m.fks_json, m.stale, m.seen_at, \
-                   (SELECT o.kind FROM meta_objects o WHERE o.connection_id = m.connection_id AND o.schema_name = m.schema_name \
-                      AND o.name = m.table_name ORDER BY o.kind = 'table' DESC LIMIT 1) \
-                 FROM meta_columns m WHERE m.connection_id = ?1 AND m.schema_name = ?2 AND lower(m.table_name) = lower(?3)",
-                params![connection_id, schema, name],
+                &format!(
+                    "SELECT m.columns_json, m.fks_json, {STALE_SQL}, m.seen_at, \
+                       (SELECT o.kind FROM meta_objects o WHERE o.connection_id = m.connection_id AND o.schema_name = m.schema_name \
+                          AND o.name = m.table_name ORDER BY o.kind = 'table' DESC LIMIT 1) \
+                     FROM meta_columns m WHERE m.connection_id = ?1 AND m.schema_name = ?2 AND lower(m.table_name) = lower(?3)"
+                ),
+                params![connection_id, schema, name, now_ms() - UNLISTED_COLUMNS_TTL_MS],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
@@ -557,8 +570,8 @@ impl Workspace {
         let c = self.conn.lock();
         let row: Option<(String, bool)> = c
             .query_row(
-                "SELECT columns_json, stale FROM meta_columns WHERE connection_id = ?1 AND schema_name = ?2 AND table_name = ?3",
-                params![connection_id, schema, table],
+                &format!("SELECT m.columns_json, {STALE_SQL} FROM meta_columns m WHERE m.connection_id = ?1 AND m.schema_name = ?2 AND m.table_name = ?3"),
+                params![connection_id, schema, table, now_ms() - UNLISTED_COLUMNS_TTL_MS],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -848,6 +861,26 @@ mod tests {
         // The schema changed since: still shown, marked stale.
         age("UPDATE meta_columns SET stale = 1");
         assert!(ws.meta_table("c", "s", "orders").unwrap().unwrap().stale);
+    }
+
+    #[test]
+    fn columns_of_schemas_never_listed_go_stale_after_a_day() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let col = ColumnInfo { name: "id".into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None };
+        // `s` listed in full (refreshes check it); `t` only seen by completion.
+        ws.meta_put_schemas("c", None, &[sch("s", None), sch("t", None)]).unwrap();
+        ws.meta_put_schema("c", "s", &[o("s", "a", ObjectKind::Table)]).unwrap();
+        ws.meta_put_columns("c", "s", "a", std::slice::from_ref(&col)).unwrap();
+        ws.meta_put_columns("c", "t", "b", std::slice::from_ref(&col)).unwrap();
+        let stale = |s: &str, n: &str| (ws.meta_columns("c", s, n).unwrap().unwrap().stale, ws.meta_table("c", s, n).unwrap().unwrap().stale);
+        assert_eq!((stale("s", "a"), stale("t", "b")), ((false, false), (false, false)), "fresh");
+        let old = now_ms() - UNLISTED_COLUMNS_TTL_MS - 1000;
+        ws.conn.lock().execute("UPDATE meta_columns SET seen_at = ?1", [old]).unwrap();
+        assert_eq!(stale("s", "a"), (false, false), "a listed schema's refresh checks it");
+        assert_eq!(stale("t", "b"), (true, true), "nothing else would");
+        // Described again: fresh.
+        ws.meta_put_columns("c", "t", "b", &[col]).unwrap();
+        assert_eq!(stale("t", "b"), (false, false));
     }
 
     #[test]

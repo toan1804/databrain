@@ -20,7 +20,7 @@ Main files:
    - `meta_objects`: tables, views, routines, sequences per schema, with `version` (from `object_versions`) where the engine has one.
    - `meta_columns`: `columns_json` per table, `fks_json` (its foreign keys; NULL when not known, e.g. rows cached before v19 or written by `meta_put_columns`) and a `stale` flag. No indexes or DDL.
    - `meta_conn_state`: `checked_at`, `catalogs_at`, `schemas_at` and `identity` (which server the connection pointed at).
-2. **Zustand store** (`explorerSlice.ts`), for the session: `catalogs`, `catalogSchemas`, `schemas`, `objects` (`conn|schema`), `columns` (`conn|schema|table`) and `explorer[conn]` (`checkedAt`, `checking`, `offline`, `fingerprints`, `deferred`). Once a key is in the store, `loadObjects` and `loadColumns` return it without asking the backend again.
+2. **Zustand store** (`explorerSlice.ts`), for the session: `catalogs`, `catalogSchemas`, `schemas`, `objects` (`conn|schema`), `columns` (`conn|schema|table`) and `explorer[conn]` (`checkedAt`, `checking`, `offline`, `fingerprints`, `deferred`). Once a key is in the store, `loadObjects` and `loadColumns` return it without asking the backend again (a schema in `deferred` is refreshed once in the background when opened). `columns` keeps at most `MAX_COLUMN_TABLES` (3,000) tables; the ones loaded first are dropped and read back from the cache when needed.
 
 Writes after a live listing or describe go through `MetaWriter` (`state.meta.push` / `push_blocking`): one queue, run in order, so the UI gets the server's answer before the disk write. Code that reads the cache to compare against it calls `state.meta.flush()` first (`refresh_schema_at`, `revalidate_explorer`, `clear_explorer_cache`, lineage).
 
@@ -43,11 +43,15 @@ expand schema ──► loadObjects
    in store → done
    cached_objects hit → show; if engine has no fingerprints or schema was
                         deferred → refresh_schema in background
-   miss → list_objects (live); queued: object_versions + meta_put_listing
+   miss → list_objects (live); object_versions read in its own task; the
+          queued meta_put_listing waits for it ≤ 5 s (VERSIONS_WAIT), then
+          saves without versions
 
 expand table ──► loadColumns
    in store → done
    cached_columns hit → show; if stale and online → describe in background
+          (stale: the schema changed since, or the schema was never listed
+          in full and the columns are older than 24 h)
    miss → describe (live); meta_put_columns queued (clears stale)
 ```
 

@@ -105,6 +105,21 @@ export function ddlEffect(sql: string, kind: StatementKind): { tables: boolean; 
   return { tables: true, schemaList: /^(create|drop|alter)\s+(or\s+replace\s+)?(schema|database|catalog)\b/i.test(body) };
 }
 
+/**
+ * Tables whose columns the explorer keeps in memory. Past this the ones
+ * loaded first are dropped (they are read back from the local cache when
+ * needed), so a long session over a large catalog doesn't keep growing.
+ */
+export const MAX_COLUMN_TABLES = 3000;
+
+/** `columns` with `key` set, the oldest entries dropped past the cap. */
+export function withColumns<T>(columns: Record<string, T>, key: string, value: T, max = MAX_COLUMN_TABLES): Record<string, T> {
+  const { [key]: _, ...rest } = columns;
+  const keys = Object.keys(rest);
+  const keep = keys.length >= max ? keys.slice(keys.length - max + 1) : keys;
+  return { ...Object.fromEntries(keep.map((k) => [k, rest[k]])), [key]: value };
+}
+
 /** Pending DDL rechecks per connection (and whether the schema list changed too). */
 const ddlTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; schemaList: boolean }>();
 /** How long DDL rechecks wait for more statements of the same script. */
@@ -305,8 +320,19 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
   loadObjects: async (connId, schema, force = false) => {
     const key = `${connId}|${schema}`;
     const have = get().objects[key];
-    if (have && !force) return have;
     const put = (objs: DbObject[]) => set((s) => ({ objects: { ...s.objects, [key]: objs } }));
+    if (have && !force) {
+      // In memory, but its check was put off (no fingerprints, or past the
+      // per-check cap): check it now, once.
+      const ex = get().explorer[connId];
+      if (ex && !ex.offline && ex.deferred?.includes(schema)) {
+        set((s) => ({ explorer: { ...s.explorer, [connId]: { ...s.explorer[connId], deferred: s.explorer[connId]?.deferred?.filter((x) => x !== schema) } } }));
+        void once(`refresh|${key}`, () => api.refreshSchema(connId, schema))
+          .then((r) => r.mode !== "unchanged" && put(r.objects))
+          .catch(() => {});
+      }
+      return have;
+    }
     if (force) {
       // Refresh button: only changed tables are fetched when the engine has versions.
       const r = await once(`refresh|${key}`, () => api.refreshSchema(connId, schema));
@@ -338,7 +364,7 @@ export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (
     const key = `${connId}|${schema}|${name}`;
     const have = get().columns[key];
     if (have) return have;
-    const put = (cols: ColumnInfo[]) => set((s) => ({ columns: { ...s.columns, [key]: cols } }));
+    const put = (cols: ColumnInfo[]) => set((s) => ({ columns: withColumns(s.columns, key, cols) }));
     const live = () =>
       once(`col|${key}`, () => api.describeObject(connId, schema, name)).then((d) => (get().markOnline(connId), put(d.columns), d.columns));
     const cached = await api.cachedColumns(connId, schema, name).catch(() => null);

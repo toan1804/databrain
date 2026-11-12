@@ -40,7 +40,7 @@ vi.mock("./lib/api", () => ({
 }));
 
 const { useStore } = await import("./store");
-const { DDL_RECHECK_MS, ddlEffect } = await import("./store/explorerSlice");
+const { DDL_RECHECK_MS, ddlEffect, withColumns } = await import("./store/explorerSlice");
 const conn = { id: "c", name: "dbx", connected: false, config: { kind: "databricks", auth: { method: "token" }, options: {} } };
 
 beforeEach(() => {
@@ -183,6 +183,29 @@ describe("explorer cache", () => {
     calls.length = 0;
     useStore.getState().schemaChanged("c");
     await sleep(DDL_RECHECK_MS + 60);
+    expect(calls).toEqual([]);
+  });
+
+  it("keeps at most a set number of tables' columns in memory, newest last", () => {
+    let m: Record<string, number> = {};
+    for (const k of ["a", "b", "c"]) m = withColumns(m, k, 1, 3);
+    m = withColumns(m, "d", 1, 3);
+    expect(Object.keys(m)).toEqual(["b", "c", "d"]);
+    // Loaded again: moves to the end, nothing else dropped.
+    m = withColumns(m, "b", 2, 3);
+    expect(Object.keys(m)).toEqual(["c", "d", "b"]);
+    expect(m.b).toBe(2);
+  });
+
+  it("a schema already in memory whose check was put off is checked when opened, once", async () => {
+    useStore.setState({ objects: { "c|main.hr": [t("main.hr", "orders")] }, explorer: { c: { deferred: ["main.hr"] } as never } });
+    await useStore.getState().loadObjects("c", "main.hr");
+    await settle();
+    expect(calls).toEqual(["refreshSchema:main.hr"]);
+    expect(useStore.getState().objects["c|main.hr"].map((o) => o.name)).toEqual(["orders", "new_one"]);
+    calls.length = 0;
+    await useStore.getState().loadObjects("c", "main.hr");
+    await settle();
     expect(calls).toEqual([]);
   });
 

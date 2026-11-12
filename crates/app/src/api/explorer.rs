@@ -35,15 +35,29 @@ fn cacheable(state: &AppState, id: &str, schema: &str) -> bool {
     schema != "results.main" || state.engine.workspace().get_connection(id).map(|p| p.config.kind != ConnectorKind::Duckdb).unwrap_or(true)
 }
 
+/// How long a queued listing waits for its object versions before it is
+/// saved without them (the next refresh is then a full listing). The wait
+/// holds later cache writes back, so it is bounded.
+const VERSIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The listing goes to the explorer at once; the object versions (for the
-/// next incremental refresh) are read and everything is saved afterwards.
+/// next incremental refresh) are read meanwhile, outside the write queue,
+/// and everything is saved afterwards, in order with other cache writes.
 pub async fn list_objects(state: &AppState, id: &str, schema: &str) -> Result<Vec<DbObject>> {
     let objs = state.engine.list_objects(id, schema).await?;
     if cacheable(state, id, schema) {
-        let (engine, ws, id2, sc, o2) = (state.engine.clone(), state.workspace.clone(), id.to_string(), schema.to_string(), objs.clone());
+        let (engine, id3, sc3) = (state.engine.clone(), id.to_string(), schema.to_string());
+        let mut versions = tokio::spawn(async move { engine.object_versions(&id3, &sc3).await.ok().flatten() });
+        let (ws, id2, sc, o2) = (state.workspace.clone(), id.to_string(), schema.to_string(), objs.clone());
         state.meta.push(async move {
-            let versions = engine.object_versions(&id2, &sc).await.ok().flatten();
-            let _ = tokio::task::spawn_blocking(move || ws.meta_put_listing(&id2, &sc, &o2, versions.as_ref(), None)).await;
+            let got = match tokio::time::timeout(VERSIONS_WAIT, &mut versions).await {
+                Ok(r) => r.ok().flatten(),
+                Err(_) => {
+                    versions.abort();
+                    None
+                }
+            };
+            let _ = tokio::task::spawn_blocking(move || ws.meta_put_listing(&id2, &sc, &o2, got.as_ref(), None)).await;
         });
     }
     Ok(objs)
