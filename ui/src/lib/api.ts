@@ -299,6 +299,9 @@ export const api = {
   checkLoadTarget: (connectionId: string, table: string) => call<LoadTarget>("check_load_target", { connectionId, table }),
   /** Columns of a table and what generated test data would put in each. */
   testDataPlan: (connectionId: string, schema: string, name: string) => call<TestDataPlan>("test_data_plan", { connectionId, schema, name }),
+  /** The plan from the AI index or explorer cache (no database call); null when neither has the table. */
+  cachedTestDataPlan: (connectionId: string, schema: string, name: string) =>
+    call<TestDataPlan | null>("cached_test_data_plan", { connectionId, schema, name }),
   /** Make up rows for a table (nothing is written): an output to preview or load. */
   /** With `ai`, an AI model writes the text columns first; cancel it with `aiCancel(requestId)`. */
   generateTestData: (connectionId: string, schema: string, name: string, spec: TestDataSpec, ai: TestDataAi | null = null, requestId: string | null = null) =>

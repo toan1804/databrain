@@ -82,6 +82,16 @@ pub(crate) async fn test_data_plan(
 }
 
 #[tauri::command]
+pub(crate) fn cached_test_data_plan(
+    state: State<'_, AppState>,
+    connection_id: String,
+    schema: String,
+    name: String,
+) -> R<Option<databrain_query_engine::testdata::TestDataPlan>> {
+    api::cached_test_data_plan(&state, &connection_id, &schema, &name)
+}
+
+#[tauri::command]
 pub(crate) async fn generate_test_data(
     state: State<'_, AppState>,
     connection_id: String,

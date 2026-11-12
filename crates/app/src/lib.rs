@@ -246,6 +246,7 @@ pub fn run() {
             commands::results::dry_run_result_load,
             commands::results::check_load_target,
             commands::results::test_data_plan,
+            commands::results::cached_test_data_plan,
             commands::results::generate_test_data,
             commands::results::suggest_test_data_patterns,
             commands::queries::sql_parameters,

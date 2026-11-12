@@ -6,6 +6,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Generate test data opens at once: the columns come from the AI index or the explorer's cache while the table is checked with the database in the background (it used to wait for the column read and the DDL, slow on big catalogs). Your ticks are kept when the check updates the list; if the database can't be reached, the dialog says the columns are as last known.
 - SSH tunnels: russh updated to 0.65.1 (RUSTSEC-2026-0495). The advisory is in russh's SSH agent server, which DataBrain doesn't use (it only talks to your agent as a client), so this is housekeeping that keeps the dependency audit green.
 - Generate test data: unique values are compared ignoring case and trailing spaces, as case-insensitive unique indexes do (MySQL `_ci`, SQL Server), so `Ann@x.com` and `ann@x.com` no longer collide on load. Many rows from a few AI rows stay fast: numbered variants go on from the last one instead of trying 2, 3, 4… again (100,000 rows no longer block).
 - Generate test data: parent keys are read in key order, so the same seed picks the same foreign key values on another run; date-times printed with an offset (`2024-05-01 10:00:00+07`, Postgres `timestamptz`) are read correctly, so new keys continue after the largest and foreign keys get their parent's values.

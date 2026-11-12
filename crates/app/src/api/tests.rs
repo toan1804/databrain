@@ -639,11 +639,36 @@ async fn test_data_generates_and_loads_sqlite() {
     )
     .await;
     let main = list_schemas(&st, &p.id).await.unwrap()[0].name.clone();
+    // Nothing known yet: the dialog waits for the database.
+    assert!(cached_test_data_plan(&st, &p.id, &main, "orders").unwrap().is_none());
     let plan = test_data_plan(&st, &p.id, &main, "orders").await.unwrap();
     assert_eq!(plan.foreign_keys.len(), 1);
     assert!(plan.warnings[0].contains("foreign key"), "{:?}", plan.warnings);
     let cid = plan.columns.iter().find(|c| c.name == "customer_id").unwrap();
     assert!(cid.parent.as_deref().is_some_and(|x| x.contains("customers")), "{cid:?}");
+
+    // Columns the explorer has seen: shown at once, without foreign keys.
+    let d = describe(&st, &p.id, &main, "orders").await.unwrap();
+    st.meta.flush().await;
+    let seen = cached_test_data_plan(&st, &p.id, &main, "orders").unwrap().expect("explorer cache");
+    let names = |p: &databrain_query_engine::testdata::TestDataPlan| p.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&seen), names(&plan));
+    assert!(seen.foreign_keys.is_empty());
+    // The AI index has the foreign keys too: the same plan as the database's.
+    let indexed = |kind: &str| databrain_workspace::KnObject {
+        schema: main.clone(),
+        name: "orders".into(),
+        kind: kind.into(),
+        comment: None,
+        row_estimate: None,
+        columns: d.columns.clone(),
+        foreign_keys: d.foreign_keys.clone(),
+    };
+    st.engine.workspace().kn_upsert_objects(&p.id, &[indexed("table")]).unwrap();
+    assert_eq!(cached_test_data_plan(&st, &p.id, &main, "orders").unwrap(), Some(plan.clone()));
+    // Indexed as a view: the database is asked (and says why not).
+    st.engine.workspace().kn_upsert_objects(&p.id, &[indexed("view")]).unwrap();
+    assert!(cached_test_data_plan(&st, &p.id, &main, "orders").unwrap().is_none());
 
     let spec = |rows| databrain_query_engine::testdata::TestDataSpec {
         rows,

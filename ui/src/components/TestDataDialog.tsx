@@ -36,6 +36,19 @@ export function defaultColumns(cols: TestDataColumn[]): Set<string> {
   return new Set(cols.filter((c) => c.supported && !c.database_fills).map((c) => c.name));
 }
 
+/**
+ * The ticks once the live plan replaces the cached one: untouched ticks take
+ * the live defaults; the user's ticks stay for columns still there and still
+ * fillable, and new columns get their default.
+ */
+export function liveTicks(before: TestDataColumn[], after: TestDataColumn[], ticked: Set<string>): Set<string> {
+  const first = defaultColumns(before);
+  const live = defaultColumns(after);
+  if (first.size === ticked.size && [...first].every((n) => ticked.has(n))) return live;
+  const known = new Set(before.map((c) => c.name));
+  return new Set(after.filter((c) => (known.has(c.name) ? ticked.has(c.name) && c.supported && !c.computed : live.has(c.name))).map((c) => c.name));
+}
+
 /** The spec sent for the ticked columns. */
 export function specFor(
   cols: TestDataColumn[],
@@ -69,7 +82,11 @@ export function TestDataDialogHost() {
   return <TestDataDialog req={req} onClose={() => close(null)} />;
 }
 
-type Plan = { status: "loading" } | { status: "ready"; plan: TestDataPlan } | { status: "error"; message: string };
+/** `checking`: shown from the index/explorer cache while the table is read; `checkError`: that read failed. */
+type Plan =
+  | { status: "loading" }
+  | { status: "ready"; plan: TestDataPlan; checking?: boolean; checkError?: string }
+  | { status: "error"; message: string };
 
 function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () => void }) {
   const toast = useStore((s) => s.toast);
@@ -115,16 +132,36 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
     [],
   );
 
+  // What DataBrain already knows of the table (AI index, explorer cache)
+  // shows at once; the table read from the database replaces it.
   useEffect(() => {
     let live = true;
+    let settled = false;
+    let early: TestDataPlan | null = null;
+    api
+      .cachedTestDataPlan(req.connection_id, req.schema, req.table)
+      .then((p) => {
+        if (!live || settled || !p) return;
+        early = p;
+        setPlan({ status: "ready", plan: p, checking: true });
+        setTicked(defaultColumns(p.columns));
+      })
+      .catch(() => {});
     api
       .testDataPlan(req.connection_id, req.schema, req.table)
       .then((p) => {
         if (!live) return;
+        settled = true;
+        const before = early;
         setPlan({ status: "ready", plan: p });
-        setTicked(defaultColumns(p.columns));
+        setTicked((cur) => (before ? liveTicks(before.columns, p.columns, cur) : defaultColumns(p.columns)));
       })
-      .catch((e) => live && setPlan({ status: "error", message: toError(e).message }));
+      .catch((e) => {
+        if (!live) return;
+        settled = true;
+        const message = toError(e).message;
+        setPlan((cur) => (cur.status === "ready" ? { ...cur, checking: false, checkError: message } : { status: "error", message }));
+      });
     return () => {
       live = false;
     };
@@ -368,6 +405,16 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
               </label>
               {!parentKeys && <p className="text-warning">Made-up values will likely break these foreign keys when loaded.</p>}
             </div>
+          )}
+          {plan.checking && (
+            <p className="flex items-center gap-1.5 text-[11.5px] text-muted">
+              <Loader2 size={12} className="animate-spin" /> Checking the table's columns with the database…
+            </p>
+          )}
+          {plan.checkError && (
+            <p className="flex items-start gap-1.5 rounded-md bg-warning/10 px-2 py-1.5 text-[11.5px] text-warning" role="alert">
+              <AlertTriangle size={12} className="mt-0.5 shrink-0" /> Columns shown as last known; the table couldn't be read now: {plan.checkError}
+            </p>
           )}
           {p.warnings
             .filter((w) => !w.includes("foreign key"))

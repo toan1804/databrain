@@ -5,7 +5,7 @@ import { api } from "../lib/api";
 import type { ConnectionView, ProviderView, TestDataColumn, TestDataPlan } from "../lib/types";
 import { useStore } from "../store";
 import { suggestTable, testDataTable } from "./LoadIntoDialog";
-import { defaultColumns, MAX_SEED, seedProblem, specFor, TestDataDialogHost } from "./TestDataDialog";
+import { defaultColumns, liveTicks, MAX_SEED, seedProblem, specFor, TestDataDialogHost } from "./TestDataDialog";
 
 // No Tauri events in tests.
 vi.mock("../lib/api", async (importOriginal) => ({ ...(await importOriginal<typeof import("../lib/api")>()), onLoadProgress: () => Promise.resolve(() => {}) }));
@@ -59,6 +59,14 @@ describe("test data dialog", () => {
     expect(s.patterns).toEqual({ age: "18..90" });
   });
 
+  it("keeps the user's ticks when the live plan replaces the cached one", () => {
+    const live = [col("id", { database_fills: true, primary_key: true }), col("name"), col("note", { computed: true, database_fills: true }), col("added")];
+    // Untouched: the live defaults.
+    expect([...liveTicks(cols, live, defaultColumns(cols))].sort()).toEqual(["added", "name"]);
+    // Changed by the user: kept where still fillable; a new column gets its default.
+    expect([...liveTicks(cols, live, new Set(["id", "note"]))].sort()).toEqual(["added", "id"]);
+  });
+
   it("sends only seeds that a JavaScript number keeps exactly", () => {
     expect(specFor(cols, new Set(), 1, 0, String(MAX_SEED), true).seed).toBe(9007199254740991);
     expect(seedProblem("9007199254740991")).toBeNull();
@@ -110,5 +118,36 @@ describe("suggest patterns with AI", () => {
     await waitFor(() => expect(screen.getByLabelText("Pattern for age")).toHaveValue("20..60"));
     expect(screen.getByLabelText("Pattern for email")).toHaveValue("%@corp.vn");
     expect(useStore.getState().testDataPatterns["c1|public.people"]).toEqual({ age: "20..60", email: "%@corp.vn" });
+  });
+});
+
+describe("opening the dialog", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("shows the columns DataBrain already knows before the database answers", async () => {
+    const conn = {
+      id: "c1",
+      name: "Dev",
+      connected: true,
+      env: "dev",
+      has_secret: false,
+      created_at: 0,
+      updated_at: 0,
+      config: { kind: "postgres", auth: { kind: "none" }, ssl_mode: "prefer", read_only: false },
+      ai_policy: { ai_enabled: true, share_metadata: true, allowed_providers: [] },
+    } as unknown as ConnectionView;
+    const base = { table: '"public"."people"', foreign_keys: [], warnings: [] };
+    useStore.setState({ connections: [conn], testDataPatterns: {}, testDataDialog: { connection_id: "c1", schema: "public", table: "people" } });
+    vi.spyOn(api, "cachedTestDataPlan").mockResolvedValue({ ...base, columns: [col("name"), col("total")] });
+    let answer: (p: TestDataPlan) => void = () => {};
+    vi.spyOn(api, "testDataPlan").mockImplementation(() => new Promise((r) => (answer = r)));
+    render(<TestDataDialogHost />);
+    expect(await screen.findByLabelText("Fill total")).toBeChecked();
+    expect(screen.getByText(/Checking the table's columns/)).toBeInTheDocument();
+    // The database says `total` is computed: it can no longer be ticked.
+    await act(async () => answer({ ...base, columns: [col("name"), col("total", { computed: true, database_fills: true })] }));
+    expect(screen.queryByText(/Checking the table's columns/)).toBeNull();
+    expect(screen.getByLabelText("Fill total")).toBeDisabled();
+    expect(screen.getByLabelText("Fill total")).not.toBeChecked();
   });
 });

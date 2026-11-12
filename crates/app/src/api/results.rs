@@ -280,6 +280,17 @@ pub async fn test_data_plan(state: &AppState, connection_id: &str, schema: &str,
     state.engine.test_data_plan(connection_id, schema, name).await
 }
 
+/// The plan from the AI index or the explorer cache, without a database
+/// call (`None` when neither has the table): shown while the live plan loads.
+pub fn cached_test_data_plan(
+    state: &AppState,
+    connection_id: &str,
+    schema: &str,
+    name: &str,
+) -> Result<Option<databrain_query_engine::testdata::TestDataPlan>> {
+    state.engine.cached_test_data_plan(connection_id, schema, name)
+}
+
 /// Generated rows, stored as an output (grid preview, "Load into…").
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[ts(export)]
