@@ -272,6 +272,8 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 | Knowledge | `kn_objects`, `kn_notes`, `kn_state`, `kn_schema_state`, FTS5 `kn_fts`; learned from history: `kn_joins`, `kn_join_seen`, `kn_table_seen`, `kn_learn_state` |
 | Notebooks, jobs, outputs | `notebooks`, `jobs`, `job_runs` (with run logs and leases), `outputs` |
 
+How the explorer cache is filled, checked against the server and read by other features: [EXPLORER.md](EXPLORER.md).
+
 `connections.config_json` holds settings, and `has_secret` says whether the secret store has a password for it. Passwords inside connection strings are moved to the secret store, and passwords and keys are redacted from kept SQL, job logs, AI transcripts and the audit log.
 
 ---
