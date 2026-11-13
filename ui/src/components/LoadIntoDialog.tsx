@@ -64,7 +64,10 @@ export function LoadIntoDialog({
   }, [modes, mode]);
   const keyed = isKeyedMode(mode);
   const hint = modes.find((m) => m.mode === mode)?.hint;
-  const args = { target_connection_id: target, table, mode, key_columns: keyed ? keys : [], create_table: create, confirmed: false };
+  // A result cut short (row limit or memory): run its query again and stream every row (default).
+  const [everyRow, setEveryRow] = useState(info.truncated);
+  const streaming = info.truncated && everyRow;
+  const args = { target_connection_id: target, table, mode, key_columns: keyed ? keys : [], create_table: create, confirmed: false, every_row: streaming };
   const targetCheck = useLoadTarget(target, table);
   const blocked = loadTargetBlocked(targetCheck, mode, create);
   const ready = !!target && !!table.trim() && (!keyed || keys.length > 0) && !blocked;
@@ -93,7 +96,7 @@ export function LoadIntoDialog({
       // Progress and Stop once the load starts (after a production prompt).
       const r = await loadResultAsking(info.id, args, id, () => {
         runId.current = id;
-        setRun({ id, done: 0, total: info.total_rows });
+        setRun({ id, done: 0, total: streaming ? 0 : info.total_rows });
       });
       if (!r) return;
       setReport(r);
@@ -130,7 +133,7 @@ export function LoadIntoDialog({
               Cancel
             </button>
             <button className="btn-primary" disabled={!ready} onClick={() => void load()}>
-              <Upload size={13} /> Load {formatCount(info.total_rows)} rows
+              <Upload size={13} /> {streaming ? "Load every row" : `Load ${formatCount(info.total_rows)} rows`}
             </button>
           </>
         )
@@ -153,10 +156,17 @@ export function LoadIntoDialog({
       ) : (
         <div className="space-y-3 text-[12.5px]">
           {info.truncated && (
-            <p className="rounded-md bg-warning/10 px-2 py-1.5 text-[11.5px] text-warning">
-              The result stopped at {formatCount(info.total_rows)} rows (the row limit, or the memory a result may keep): only those are loaded. Raise the
-              row limit and run again, select fewer columns, or use a job, which loads every row when they fit.
-            </p>
+            <div className="space-y-1.5 rounded-md bg-warning/10 px-2 py-1.5 text-[11.5px]" role="radiogroup" aria-label="Rows to load">
+              <p className="text-warning">The result stopped at {formatCount(info.total_rows)} rows (the row limit, or the memory a result may keep).</p>
+              <label className="flex cursor-pointer items-start gap-2">
+                <input type="radio" name="every-row" className="mt-0.5" checked={everyRow} onChange={() => setEveryRow(true)} />
+                <span>Every row: run the query again and write its rows as they arrive (they aren't all kept in memory)</span>
+              </label>
+              <label className="flex cursor-pointer items-start gap-2">
+                <input type="radio" name="every-row" className="mt-0.5" checked={!everyRow} onChange={() => setEveryRow(false)} />
+                <span>Only the {formatCount(info.total_rows)} rows of the result</span>
+              </label>
+            </div>
           )}
           <div className="grid grid-cols-2 gap-2">
             <label className="space-y-1">
@@ -212,10 +222,15 @@ export function LoadIntoDialog({
           {run && (
             <div className="space-y-1" role="status">
               <div className="flex items-center gap-2 text-[11.5px] text-muted">
-                <Loader2 size={12} className="animate-spin" /> Writing {formatCount(run.done)} of {formatCount(run.total)} rows…
+                <Loader2 size={12} className="animate-spin" /> Writing {formatCount(run.done)}
+                {run.total ? ` of ${formatCount(run.total)}` : ""} rows…
               </div>
               <div className="h-1.5 overflow-hidden rounded bg-hover">
-                <div className="h-full bg-accent transition-all" style={{ width: `${run.total ? Math.min(100, (run.done / run.total) * 100) : 0}%` }} />
+                {run.total ? (
+                  <div className="h-full bg-accent transition-all" style={{ width: `${Math.min(100, (run.done / run.total) * 100)}%` }} />
+                ) : (
+                  <div className="h-full w-1/3 animate-pulse bg-accent" />
+                )}
               </div>
             </div>
           )}

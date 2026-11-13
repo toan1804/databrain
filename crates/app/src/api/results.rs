@@ -193,6 +193,10 @@ pub struct LoadResultArgs {
     /// The user confirmed writing into a production connection.
     #[serde(default)]
     pub confirmed: bool,
+    /// The result was cut short (row limit or memory): run its query again
+    /// and load every row it returns, streamed, instead of the rows held.
+    #[serde(default)]
+    pub every_row: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -244,7 +248,17 @@ pub async fn load_result(state: &AppState, result_id: &str, args: LoadResultArgs
     LOADS.lock().insert(load_id.to_string(), cancel.clone());
     let tab = format!("__load__:{load_id}");
     let obs = LoadProgress { ui: state.ui.clone(), id: load_id.to_string() };
-    let r = state.engine.write_output(&o.handle, &args.target_connection_id, &tab, &args.spec(), &cancel, &obs).await;
+    let r = if args.every_row == Some(true) && o.truncated {
+        // Masks and the AI's rules applied to what the AI or a client ran:
+        // only the user's own query is run again as the user.
+        if o.origin != databrain_workspace::Origin::User {
+            LOADS.lock().remove(load_id);
+            return Err(invalid("Only your own queries run again for a load; this result came from the AI or a client. Load the rows it holds instead."));
+        }
+        state.engine.load_query(&o.connection_id, &o.session_key, &o.sql, &args.target_connection_id, &tab, &args.spec(), &cancel, &obs).await
+    } else {
+        state.engine.write_output(&o.handle, &args.target_connection_id, &tab, &args.spec(), &cancel, &obs).await
+    };
     LOADS.lock().remove(load_id);
     state.engine.close_tab(&tab);
     r

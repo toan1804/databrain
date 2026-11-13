@@ -228,7 +228,8 @@ pub async fn compare_load_source(state: &AppState, source: CompareSource, tab_id
             (connection_id.clone(), databrain_connector_core::traits::preview_query(kind, schema, table, COMPARE_SOURCE_ROW_LIMIT))
         }
         CompareSource::File { path, sheet } => {
-            let scan = file_scan(path, sheet.as_deref())?;
+            let (path, sheet) = (path.clone(), sheet.clone());
+            let scan = super::blocking(move || file_scan(&path, sheet.as_deref())).await?;
             (results_connection(state)?, format!("SELECT * FROM {scan} LIMIT {COMPARE_SOURCE_ROW_LIMIT}"))
         }
     };
@@ -261,21 +262,16 @@ pub async fn compare_load_source(state: &AppState, source: CompareSource, tab_id
 }
 
 /// DuckDB expression that reads a data file (an Excel sheet: `sheet`, else
-/// the first with data).
+/// the first with data). Only that sheet is read.
 #[cfg(feature = "duckdb-engine")]
 fn file_scan(path: &str, sheet: Option<&str>) -> Result<String> {
-    use databrain_connector_duckdb::{FileFormat, detect_format, excel_sources, file_scan_expr};
+    use databrain_connector_duckdb::{FileFormat, detect_format, excel_sheet_source, file_scan_expr};
     let fmt = detect_format(path)
         .ok_or_else(|| EngineError::new("invalid", "unsupported file type (use .csv/.tsv/.parquet/.json/.ndjson/.xlsx or a Delta/Iceberg folder)"))?;
     if fmt != FileFormat::Excel {
         return Ok(file_scan_expr(path, fmt));
     }
-    let sheets = excel_sources(path, true).map_err(|e| EngineError::new("invalid", e.to_string()))?;
-    let pick = match sheet {
-        Some(want) => sheets.into_iter().find(|(n, _)| n == want).ok_or_else(|| EngineError::new("invalid", format!("the workbook has no sheet {want}")))?,
-        None => sheets.into_iter().next().ok_or_else(|| EngineError::new("invalid", "every sheet in this workbook is empty"))?,
-    };
-    Ok(pick.1)
+    Ok(excel_sheet_source(path, sheet).map_err(|e| EngineError::new("invalid", e.to_string()))?.sql)
 }
 
 #[cfg(not(feature = "duckdb-engine"))]

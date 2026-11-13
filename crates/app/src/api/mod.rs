@@ -213,7 +213,7 @@ fn invalid(msg: impl Into<String>) -> EngineError {
 }
 
 /// Run CPU-heavy work off the async runtime threads.
-async fn blocking<T, F>(f: F) -> Result<T>
+pub(crate) async fn blocking<T, F>(f: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,

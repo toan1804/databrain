@@ -692,6 +692,7 @@ async fn test_data_generates_and_loads_sqlite() {
         key_columns: vec![],
         create_table: false,
         confirmed: false,
+        every_row: None,
     };
     let dry = dry_run_result_load(&st, &made.output.result_id, args.clone()).await.unwrap();
     assert!(dry.ok, "{dry:?}");
@@ -724,6 +725,7 @@ async fn test_data_generates_and_loads_sqlite() {
         key_columns: vec![],
         create_table: false,
         confirmed: false,
+        every_row: None,
     };
     let e = load_result(&st, &made.output.result_id, args, "l2").await.unwrap_err();
     assert!(e.message.contains("read-only"), "{}", e.message);
@@ -793,6 +795,7 @@ async fn test_data_takes_ai_rows_for_text_columns() {
         key_columns: vec![],
         create_table: false,
         confirmed: false,
+        every_row: None,
     };
     load_result(&st, &made.output.result_id, args, "ai-load").await.unwrap();
     let s = st.engine.session_for_tests(&p.id).await.unwrap();
@@ -833,6 +836,7 @@ async fn test_data_takes_ai_rows_for_text_columns() {
         key_columns: vec![],
         create_table: false,
         confirmed: false,
+        every_row: None,
     };
     load_result(&st, &made.output.result_id, args, "pattern-load").await.unwrap();
     let rows = databrain_connector_core::query_text(

@@ -5,14 +5,14 @@ use crate::error::map_err;
 use crate::files::{FileFormat, scan_expr};
 use crate::xlsx;
 
-/// Like [`scan_expr`], but Excel files are read with [`excel_scan`] (first
-/// sheet). Opens a private in-memory DuckDB for the checks.
+/// Like [`scan_expr`], but Excel files are read with [`excel_scan`] (the
+/// first sheet with data). Opens a private in-memory DuckDB for the checks.
 pub fn file_scan_expr(path: &str, format: FileFormat) -> String {
     if format != FileFormat::Excel {
         return scan_expr(path, format);
     }
     match excel_sources(path, false) {
-        Ok(mut v) if !v.is_empty() => v.remove(0).1,
+        Ok(mut v) if !v.is_empty() => v.remove(0).sql,
         _ => scan_expr(path, format),
     }
 }
@@ -28,17 +28,79 @@ pub(crate) fn excel_conn() -> Result<duckdb::Connection> {
     Ok(conn)
 }
 
-/// (sheet name, SQL source) for the first sheet, or for every non-empty
-/// sheet when `all_sheets`.
-pub fn excel_sources(path: &str, all_sheets: bool) -> Result<Vec<(String, String)>> {
+/// One sheet to read.
+#[derive(Debug, Clone)]
+pub struct ExcelSource {
+    pub sheet: String,
+    /// DuckDB SQL that reads it, for `FROM`.
+    pub sql: String,
+    /// Cells with values left out of the read (title rows, stray cells far
+    /// from the table), as "reads A3:F30 of A1:KO5001".
+    pub left_out: Option<String>,
+}
+
+/// The first sheet with data, or every sheet with data when `all_sheets`.
+pub fn excel_sources(path: &str, all_sheets: bool) -> Result<Vec<ExcelSource>> {
     let conn = excel_conn()?;
     excel_sources_with(&conn, path, all_sheets)
 }
 
-pub(crate) fn excel_sources_with(conn: &duckdb::Connection, path: &str, all_sheets: bool) -> Result<Vec<(String, String)>> {
-    let sheets = xlsx::sheets(path).map_err(|e| ConnectorError::new(ErrorKind::Config, e))?;
-    let picked: Vec<&xlsx::SheetInfo> = if all_sheets { sheets.iter().filter(|s| s.range.is_some()).collect() } else { sheets.iter().take(1).collect() };
-    Ok(picked.into_iter().map(|s| (s.name.clone(), excel_scan(conn, path, Some(s)))).collect())
+/// The sheet named `sheet`, or the first sheet with data when `sheet` is
+/// None. Only that sheet is read.
+pub fn excel_sheet_source(path: &str, sheet: Option<&str>) -> Result<ExcelSource> {
+    let sheets = xlsx::sheets_with(path, sheet.is_none()).map_err(|e| ConnectorError::new(ErrorKind::Config, e))?;
+    let pick = match sheet {
+        Some(want) => {
+            sheets.iter().find(|s| s.name == want).ok_or_else(|| ConnectorError::new(ErrorKind::Config, format!("the workbook has no sheet {want}")))?
+        }
+        None => sheets.iter().find(|s| s.range.is_some()).ok_or_else(|| ConnectorError::new(ErrorKind::Config, "every sheet in this workbook is empty"))?,
+    };
+    if pick.range.is_none() {
+        return Err(ConnectorError::new(ErrorKind::Config, format!("sheet {} is empty", pick.name)));
+    }
+    let conn = excel_conn()?;
+    Ok(ExcelSource { sheet: pick.name.clone(), sql: excel_scan(&conn, path, Some(pick)), left_out: pick.left_out() })
+}
+
+/// Sheets with data: the first one, or all of them.
+pub(crate) fn excel_sources_with(conn: &duckdb::Connection, path: &str, all_sheets: bool) -> Result<Vec<ExcelSource>> {
+    let sheets = xlsx::sheets_with(path, !all_sheets).map_err(|e| ConnectorError::new(ErrorKind::Config, e))?;
+    let used = sheets.iter().filter(|s| s.range.is_some());
+    let picked: Vec<&xlsx::SheetInfo> = if all_sheets { used.collect() } else { used.take(1).collect() };
+    let srcs = scan_sheets(conn, path, &picked);
+    Ok(picked.into_iter().zip(srcs).map(|(s, sql)| ExcelSource { sheet: s.name.clone(), sql, left_out: s.left_out() }).collect())
+}
+
+/// [`excel_scan`] for each sheet, several at a time: each sheet takes a few
+/// reads of the file, so a workbook with many sheets is slow one by one.
+fn scan_sheets(conn: &duckdb::Connection, path: &str, sheets: &[&xlsx::SheetInfo]) -> Vec<String> {
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(sheets.len());
+    // Extra connections to the same database (the Excel extension is loaded on it).
+    let extra: Vec<duckdb::Connection> = (1..workers).map_while(|_| conn.try_clone().ok()).collect();
+    if extra.is_empty() {
+        return sheets.iter().map(|s| excel_scan(conn, path, Some(s))).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: std::sync::Mutex<Vec<Option<String>>> = std::sync::Mutex::new(vec![None; sheets.len()]);
+    let work = &|c: &duckdb::Connection| {
+        loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(s) = sheets.get(i) else { break };
+            let src = excel_scan(c, path, Some(s));
+            if let Ok(mut o) = out.lock() {
+                o[i] = Some(src);
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        for c in extra {
+            scope.spawn(move || work(&c));
+        }
+        work(conn);
+    });
+    let out = out.into_inner().unwrap_or_else(|e| e.into_inner());
+    // A worker that panicked leaves its sheet unread: read it here.
+    out.into_iter().zip(sheets).map(|(src, s)| src.unwrap_or_else(|| excel_scan(conn, path, Some(s)))).collect()
 }
 
 /// Read one sheet of an .xlsx file completely, with column types that fit
@@ -69,31 +131,32 @@ pub fn excel_scan(conn: &duckdb::Connection, path: &str, sheet: Option<&xlsx::Sh
         let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).ok()?;
         rows.collect::<std::result::Result<Vec<_>, _>>().ok()
     };
-    // Header cells (None = blank), and whether the first row is a header.
-    let mut header_cells: Option<Vec<Option<String>>> = None;
+    let layout = sheet.and_then(|s| s.layout.as_ref()).filter(|_| range.is_some());
+    // Per column, whether its header cell has a value (None: no header row).
+    let mut header_cells: Option<Vec<bool>> = None;
     if let Some((r, ((c0, r0), (c1, r1)))) = range {
-        let first = format!("{}{r0}:{}{r0}", xlsx::col_letters(c0), xlsx::col_letters(c1));
-        let src = format!("read_xlsx({base}, header = false, range = {})", quote_literal(&first));
-        let types = describe(&src).unwrap_or_default();
-        let vals: Option<Vec<Option<String>>> = conn
-            .prepare(&format!("SELECT * FROM read_xlsx({base}, header = false, all_varchar = true, range = {})", quote_literal(&first)))
-            .and_then(|mut st| st.query_row([], |row| (0..types.len()).map(|i| row.get::<_, Option<String>>(i)).collect::<std::result::Result<Vec<_>, _>>()))
-            .ok();
-        if let Some(vals) = vals {
-            let vals: Vec<Option<String>> = vals.into_iter().map(|v| v.filter(|x| !x.trim().is_empty())).collect();
-            let is_header = r1 > r0 && vals.iter().any(Option::is_some) && vals.iter().zip(&types).all(|(v, (_, t))| v.is_none() || t == "VARCHAR");
-            if is_header {
-                header_cells = Some(vals);
+        header_cells = match layout {
+            Some(l) => l.header.clone(),
+            None => {
+                // A header row has only text (or blank) cells, and something below it.
+                let first = format!("{}{r0}:{}{r0}", xlsx::col_letters(c0), xlsx::col_letters(c1));
+                let src = format!("SELECT * FROM read_xlsx({base}, header = false, range = {})", quote_literal(&first));
+                first_row_text(conn, &src)
+                    .filter(|vals| r1 > r0 && vals.iter().any(|v| matches!(v, Some(Some(_)))) && vals.iter().all(|v| v.is_some()))
+                    .map(|vals| vals.into_iter().map(|v| matches!(v, Some(Some(_)))).collect())
             }
-        }
+        };
         base.push_str(&format!(", header = {}, range = {}, stop_at_empty = false", header_cells.is_some(), quote_literal(r)));
     }
     let plain = format!("read_xlsx({base})");
     let text = format!("read_xlsx({base}, all_varchar = true)");
     let Some(typed) = describe(&plain) else { return plain };
-    let Some(texts) = describe(&text) else { return plain };
-    if typed.iter().map(|c| &c.0).ne(texts.iter().map(|c| &c.0)) {
-        return text;
+    // With a range, `header` is given, so the text read has the same names.
+    if range.is_none() {
+        let Some(texts) = describe(&text) else { return plain };
+        if typed.iter().map(|c| &c.0).ne(texts.iter().map(|c| &c.0)) {
+            return text;
+        }
     }
     // Output names: blank header cells (or no header) → column_<letter>.
     let c0 = range.map(|(_, ((c, _), _))| c).unwrap_or(1);
@@ -101,7 +164,7 @@ pub fn excel_scan(conn: &duckdb::Connection, path: &str, sheet: Option<&xlsx::Sh
         .iter()
         .enumerate()
         .map(|(i, (n, _))| match &header_cells {
-            Some(h) if h.get(i).is_some_and(|v| v.is_none()) => format!("column_{}", xlsx::col_letters(c0 + i as u32)),
+            Some(h) if h.get(i) == Some(&false) => format!("column_{}", xlsx::col_letters(c0 + i as u32)),
             _ => n.clone(),
         })
         .collect();
@@ -118,19 +181,47 @@ pub fn excel_scan(conn: &duckdb::Connection, path: &str, sheet: Option<&xlsx::Sh
             _ => Some(format!("{present} AND (TRY_CAST({v} AS DOUBLE) IS NULL OR regexp_matches(trim({v}), '^[+-]?0[0-9]'))")),
         }
     };
-    let checks: Vec<(usize, String)> = typed.iter().enumerate().filter_map(|(i, (n, t))| misfit(n, t).map(|w| (i, w))).collect();
+    // What the scan of the sheet already tells, per column: true = read as
+    // text, false = the type fits, None = check every cell. A column whose
+    // cells are all of the kind its type came from fits; a typed column with
+    // no number in it (its first data cell was blank) is text.
+    let known: Vec<Option<bool>> = typed
+        .iter()
+        .enumerate()
+        .map(|(i, (_, t))| {
+            let k = *layout.filter(|l| l.kinds.len() == typed.len())?.kinds.get(i)?;
+            match t.as_str() {
+                "VARCHAR" => Some(false),
+                _ if k == 0 => Some(false),
+                "BOOLEAN" => (k == xlsx::BOOL).then_some(false),
+                _ if k == xlsx::NUMBER => Some(false),
+                _ if k & xlsx::NUMBER == 0 => Some(true),
+                _ => None,
+            }
+        })
+        .collect();
+    let checks: Vec<(usize, String)> =
+        typed.iter().enumerate().filter(|(i, _)| known[*i].is_none()).filter_map(|(i, (n, t))| misfit(n, t).map(|w| (i, w))).collect();
     let all_null = typed.iter().map(|(n, _)| format!("({0} IS NULL OR trim({0}) = '')", qi(n))).collect::<Vec<_>>().join(" AND ");
+    let known_empty = layout.map(|l| l.empty_rows);
     let mut aggs: Vec<String> = checks.iter().map(|(_, w)| format!("count(*) FILTER (WHERE {w})")).collect();
-    aggs.push(format!("count(*) FILTER (WHERE {all_null})"));
-    let counts: Vec<i64> = match conn
-        .prepare(&format!("SELECT {} FROM {text}", aggs.join(", ")))
-        .and_then(|mut st| st.query_row([], |r| (0..aggs.len()).map(|i| r.get::<_, i64>(i)).collect::<std::result::Result<Vec<_>, _>>()))
-    {
-        Ok(b) => b,
-        Err(_) => return plain,
+    if known_empty.is_none() {
+        aggs.push(format!("count(*) FILTER (WHERE {all_null})"));
+    }
+    // A full read of the sheet: only when the scan could not tell.
+    let counts: Vec<i64> = if aggs.is_empty() {
+        Vec::new()
+    } else {
+        match conn
+            .prepare(&format!("SELECT {} FROM {text}", aggs.join(", ")))
+            .and_then(|mut st| st.query_row([], |r| (0..aggs.len()).map(|i| r.get::<_, i64>(i)).collect::<std::result::Result<Vec<_>, _>>()))
+        {
+            Ok(b) => b,
+            Err(_) => return plain,
+        }
     };
-    let empty_rows = counts.last().copied().unwrap_or(0) > 0;
-    let mut to_text = vec![false; typed.len()];
+    let empty_rows = known_empty.unwrap_or_else(|| counts.last().copied().unwrap_or(0) > 0);
+    let mut to_text: Vec<bool> = known.iter().map(|k| k.unwrap_or(false)).collect();
     for ((i, _), n) in checks.iter().zip(&counts) {
         to_text[*i] = *n > 0;
     }
@@ -173,6 +264,33 @@ pub fn excel_scan(conn: &duckdb::Connection, path: &str, sheet: Option<&xlsx::Sh
         .collect::<Vec<_>>()
         .join(", ");
     format!("(SELECT {cols} FROM {})", skip_empty(&text))
+}
+
+/// Cells of the one-row query `sql`: None for a cell that is not text,
+/// Some(None) for a blank one, Some(Some(text)) otherwise.
+fn first_row_text(conn: &duckdb::Connection, sql: &str) -> Option<Vec<Option<Option<String>>>> {
+    use duckdb::arrow::array::{Array, AsArray};
+    use duckdb::arrow::datatypes::DataType;
+    let mut st = conn.prepare(sql).ok()?;
+    let batch = st.query_arrow([]).ok()?.find(|b| b.num_rows() > 0)?;
+    Some(
+        batch
+            .columns()
+            .iter()
+            .map(|col| {
+                if col.is_null(0) {
+                    return Some(None);
+                }
+                let text = match col.data_type() {
+                    DataType::Utf8 => col.as_string::<i32>().value(0).to_string(),
+                    DataType::LargeUtf8 => col.as_string::<i64>().value(0).to_string(),
+                    DataType::Utf8View => col.as_string_view().value(0).to_string(),
+                    _ => return None,
+                };
+                Some(Some(text).filter(|t| !t.trim().is_empty()))
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -231,7 +349,7 @@ mod excel_types {
         // DuckDB's own inference (first row only) fails on this sheet.
         let plain = c.prepare(&format!("SELECT * FROM read_xlsx({})", quote_literal(&path))).and_then(|mut s| s.query_arrow([]).map(|r| r.count()));
         assert!(plain.is_err(), "expected read_xlsx to fail on mixed columns");
-        let src = excel_sources_with(&c, &path, false).unwrap().remove(0).1;
+        let src = excel_sources_with(&c, &path, false).unwrap().remove(0).sql;
         let types: Vec<(String, String)> =
             c.prepare(&format!("DESCRIBE SELECT * FROM {src}")).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect();
         let ty = |n: &str| types.iter().find(|t| t.0 == n).map(|t| t.1.as_str()).unwrap();
@@ -264,7 +382,7 @@ mod excel_types {
             quote_literal(&p.to_string_lossy())
         ))
         .unwrap();
-        let src = excel_sources_with(&c, &p.to_string_lossy(), false).unwrap().remove(0).1;
+        let src = excel_sources_with(&c, &p.to_string_lossy(), false).unwrap().remove(0).sql;
         assert!(src.starts_with("read_xlsx("), "no wrapper needed: {src}");
         assert!(src.contains("range = 'A1:B6'"), "{src}");
     }
@@ -309,7 +427,7 @@ mod excel_types {
         let p = dir.path().join("ragged.xlsx");
         ragged_book(&p);
         let path = p.to_string_lossy().to_string();
-        let src = excel_sources_with(&c, &path, false).unwrap().remove(0).1;
+        let src = excel_sources_with(&c, &path, false).unwrap().remove(0).sql;
         assert_eq!(names(&c, &src), vec!["id", "column_B", "amount", "column_D"], "{src}");
         let r = rows(&c, &format!("SELECT CAST(id AS VARCHAR), column_B, column_D FROM {src}"));
         assert_eq!(r.len(), 4, "empty row dropped, row after the gap kept: {r:?}");
@@ -330,12 +448,114 @@ mod excel_types {
             vec![("Sales", Some("A1:D6")), ("Q2 & plan", Some("A1:A2")), ("Empty", None)]
         );
         let all = excel_sources_with(&c, &path, true).unwrap();
-        assert_eq!(all.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(), vec!["Sales", "Q2 & plan"], "empty sheets skipped");
-        assert_eq!(rows(&c, &format!("SELECT CAST(k AS VARCHAR) FROM {}", all[1].1)), vec![vec![Some("7.0".into())]]);
+        assert_eq!(all.iter().map(|s| s.sheet.as_str()).collect::<Vec<_>>(), vec!["Sales", "Q2 & plan"], "empty sheets skipped");
+        assert_eq!(rows(&c, &format!("SELECT CAST(k AS VARCHAR) FROM {}", all[1].sql)), vec![vec![Some("7.0".into())]]);
         // Attached as views: first sheet keeps the file name.
         c.execute_batch("CREATE SCHEMA IF NOT EXISTS files").unwrap();
         attach_files(&c, std::slice::from_ref(&path), true).unwrap();
         let views = rows(&c, "SELECT view_name FROM duckdb_views() WHERE schema_name = 'files' ORDER BY 1");
         assert_eq!(views, vec![vec![Some("book".into())], vec![Some("book_q2___plan".into())]]);
+    }
+
+    /// Many sheets are read several at a time; sources keep workbook order.
+    #[test]
+    fn many_sheets_keep_their_order() {
+        let Some(c) = conn() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("many.xlsx");
+        let mut wb = Workbook::new();
+        wb.add_worksheet().set_name("Cover").unwrap();
+        for s in 0..20u32 {
+            let ws = wb.add_worksheet().set_name(format!("S{s}")).unwrap();
+            ws.write_string(0, 0, "n").unwrap();
+            ws.write_number(1, 0, s as f64).unwrap();
+            if s % 2 == 0 {
+                ws.write_string(2, 0, "text below").unwrap(); // read as text
+            }
+        }
+        wb.save(&p).unwrap();
+        let path = p.to_string_lossy().to_string();
+        let all = excel_sources_with(&c, &path, true).unwrap();
+        assert_eq!(all.iter().map(|s| s.sheet.clone()).collect::<Vec<_>>(), (0..20).map(|s| format!("S{s}")).collect::<Vec<_>>(), "empty cover skipped");
+        for (s, ExcelSource { sql: src, .. }) in all.iter().enumerate() {
+            let first = rows(&c, &format!("SELECT CAST(n AS VARCHAR) FROM {src}"));
+            assert_eq!(first[0][0].as_deref().map(|v| v.trim_end_matches(".0")), Some(s.to_string().as_str()), "{src}");
+        }
+        // The first sheet with data, not the empty cover.
+        assert_eq!(excel_sources_with(&c, &path, false).unwrap()[0].sheet, "S0");
+    }
+
+    #[test]
+    fn one_sheet_by_name() {
+        if conn().is_none() {
+            return;
+        }
+        if let Some(dir) = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/resources/duckdb-extensions").to_str() {
+            crate::set_extension_dir(Some(dir.to_string()));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("book.xlsx");
+        ragged_book(&p);
+        let path = p.to_string_lossy().to_string();
+        let ExcelSource { sheet: name, sql: src, .. } = excel_sheet_source(&path, Some("Q2 & plan")).unwrap();
+        assert_eq!(name, "Q2 & plan");
+        assert!(src.contains("sheet = 'Q2 & plan'") && !src.contains("Sales"), "{src}");
+        assert_eq!(excel_sheet_source(&path, None).unwrap().sheet, "Sales");
+        assert!(excel_sheet_source(&path, Some("Empty")).unwrap_err().to_string().contains("empty"));
+        assert!(excel_sheet_source(&path, Some("Nope")).unwrap_err().to_string().contains("no sheet Nope"));
+    }
+
+    /// A title above the table and a stray cell far from it are left out of
+    /// the read, and the SQL says so.
+    #[test]
+    fn title_rows_and_stray_cells_are_left_out() {
+        let Some(c) = conn() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("report.xlsx");
+        let mut wb = Workbook::new();
+        let ws = wb.add_worksheet().set_name("Report").unwrap();
+        ws.merge_range(0, 0, 0, 3, "Quarterly report", &Format::new()).unwrap();
+        ws.write_string(1, 0, "Generated 2024-01-01").unwrap();
+        for (i, h) in ["id", "name", "amount", "day"].iter().enumerate() {
+            ws.write_string(3, i as u16, *h).unwrap();
+        }
+        for r in 4..30u32 {
+            ws.write_number(r, 0, r as f64).unwrap();
+            ws.write_string(r, 1, format!("n{r}")).unwrap();
+            ws.write_number(r, 2, r as f64 * 2.0).unwrap();
+        }
+        ws.write_string(5000, 300, "far away").unwrap();
+        wb.save(&p).unwrap();
+        let path = p.to_string_lossy().to_string();
+        let s = &xlsx::sheets(&path).unwrap()[0];
+        assert_eq!((s.used.as_deref(), s.range.as_deref()), (Some("A1:KO5001"), Some("A4:D30")));
+        assert_eq!(s.left_out().as_deref(), Some("reads A4:D30 of A1:KO5001"));
+        let l = s.layout.as_ref().unwrap();
+        assert_eq!(l.header, Some(vec![true, true, true, true]));
+        assert_eq!(l.kinds, vec![xlsx::NUMBER, xlsx::TEXT, xlsx::NUMBER, 0]);
+        assert!(!l.empty_rows);
+        let src = excel_sources_with(&c, &path, false).unwrap().remove(0);
+        assert_eq!(src.left_out.as_deref(), Some("reads A4:D30 of A1:KO5001"));
+        assert_eq!(names(&c, &src.sql), vec!["id", "name", "amount", "day"], "{}", src.sql);
+        assert_eq!(rows(&c, &format!("SELECT CAST(count(*) AS VARCHAR) FROM {}", src.sql)), vec![vec![Some("26".into())]]);
+    }
+
+    /// The scan tells which columns fit their type, so a clean sheet needs no
+    /// read of every row; a column mixing numbers and text is still checked.
+    #[test]
+    fn the_scan_decides_types_without_a_full_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("mixed.xlsx");
+        mixed_sheet(&p);
+        let s = &xlsx::sheets(&p.to_string_lossy()).unwrap()[0];
+        let l = s.layout.as_ref().unwrap();
+        // id, code (number then text), name (blank then text), when (date then text), amount, day
+        assert_eq!(l.kinds, vec![xlsx::NUMBER, xlsx::NUMBER | xlsx::TEXT, xlsx::TEXT, xlsx::NUMBER | xlsx::TEXT, xlsx::NUMBER, xlsx::NUMBER]);
+        // The same sheet without a layout (the scan failed) gives the same SQL.
+        let Some(c) = conn() else { return };
+        let path = p.to_string_lossy().to_string();
+        let with = excel_scan(&c, &path, Some(s));
+        let without = excel_scan(&c, &path, Some(&xlsx::SheetInfo { layout: None, ..s.clone() }));
+        assert_eq!(with, without);
     }
 }

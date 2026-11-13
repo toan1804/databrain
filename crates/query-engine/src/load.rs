@@ -30,7 +30,9 @@ use databrain_connector_core::arrow::array::RecordBatch;
 use databrain_connector_core::arrow::datatypes::{Field, Schema, SchemaRef};
 use databrain_connector_core::sql::{StatementKind, classify, split_statements};
 use databrain_connector_core::traits::NameLevels;
-use databrain_connector_core::{CancellationToken, ConnectorKind, ErrorKind, ExecOptions, ObjectKind, Session, quote_ident, split_path};
+use databrain_connector_core::{
+    CancellationToken, ConnectorKind, ErrorKind, ExecOptions, ObjectKind, QueryStream, Session, StreamEvent, quote_ident, split_path,
+};
 use databrain_export::load as sqlgen;
 use databrain_workspace::LoadMode;
 use serde::Serialize;
@@ -431,10 +433,68 @@ impl QueryEngine {
         cancel: &CancellationToken,
         obs: &dyn LoadObserver,
     ) -> Result<LoadReport> {
+        self.load_with(rows, None, connection_id, tab, spec, cancel, obs).await
+    }
+
+    /// Run `sql` (one read) on the session `session` of connection `source`
+    /// and write every row it returns as `spec` says, a batch at a time as
+    /// they arrive: the rows are never all in memory, so neither the row
+    /// limit nor the memory a result may keep cuts them short.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_query(
+        &self,
+        source: &str,
+        session: &str,
+        sql: &str,
+        connection_id: &str,
+        tab: &str,
+        spec: &LoadSpec,
+        cancel: &CancellationToken,
+        obs: &dyn LoadObserver,
+    ) -> Result<LoadReport> {
+        let kind = self.workspace.get_connection(source)?.config.kind;
+        if !classify(sql, kind).kind.is_read() {
+            return Err(EngineError::new("invalid", "Only a query that reads rows can run again for a load; load the rows the result holds instead."));
+        }
+        // The query runs on the tab's session (its temp tables, settings):
+        // hold it, like a full export, so nothing else runs there meanwhile.
+        let _claim = self.claim(source, session, cancel.clone(), "A query is running in this tab: wait for it, then load every row")?;
+        let src = self.session_for(source, session, databrain_workspace::Origin::User).await?;
+        let opts = ExecOptions { batch_size: 2000, cancel: cancel.clone(), max_rows: None, output_masks: None };
+        let mut stream = src.execute(sql, opts).await?;
+        // The schema, then the first batch (none when there are no rows).
+        let (mut schema, mut first) = (None, None);
+        while first.is_none() {
+            match stream.next().await {
+                Some(Ok(StreamEvent::Schema(s))) => schema = Some(s),
+                Some(Ok(StreamEvent::Batch(b))) if b.num_rows() > 0 => first = Some(b),
+                Some(Ok(StreamEvent::Done(_))) | None => break,
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e.into()),
+            }
+        }
+        let schema = schema.or_else(|| first.as_ref().map(|b| b.schema())).ok_or_else(|| EngineError::new("invalid", "The query returns no rows to load"))?;
+        let more = first.is_some();
+        let rows = LoadRows { schema, batches: first.into_iter().collect() };
+        self.load_with(&rows, more.then_some(&mut stream), connection_id, tab, spec, cancel, obs).await
+    }
+
+    /// Write `rows`, then the batches still to come from `rest`.
+    #[allow(clippy::too_many_arguments)]
+    async fn load_with(
+        &self,
+        rows: &LoadRows,
+        mut rest: Option<&mut QueryStream>,
+        connection_id: &str,
+        tab: &str,
+        spec: &LoadSpec,
+        cancel: &CancellationToken,
+        obs: &dyn LoadObserver,
+    ) -> Result<LoadReport> {
         let p = self.prepare_load(connection_id, tab, spec, Some(rows), false).await?;
         obs.event(LoadEvent::Info(format!(
             "Writing {} rows into {} on {} ({}, INSERTs of up to {} rows / {} KB): {}",
-            rows.count(),
+            if rest.is_some() { "every".to_string() } else { rows.count().to_string() },
             p.table,
             p.connection,
             mode_text(spec.mode),
@@ -449,7 +509,7 @@ impl QueryEngine {
             timed(&p.session, "Start the transaction", tx.begin, cancel, obs).await.map_err(|e| labelled("Start the transaction", e))?;
         }
         let result = async {
-            let n = run_plan(&p, rows, cancel, None, obs).await?;
+            let n = run_plan(&p, rows, rest.as_deref_mut(), cancel, None, obs).await?;
             if let Some(tx) = &p.tx {
                 timed(&p.session, "Commit", tx.commit, cancel, obs).await.map_err(|e| labelled("Commit", e))?;
             }
@@ -540,7 +600,7 @@ impl QueryEngine {
                 report.method = "transaction".into();
                 match exec(&p.session, tx.begin, &cancel).await {
                     Ok(_) => {
-                        let _ = run_plan(&p, data, &cancel, Some(&mut checks), &NoLoadObserver).await;
+                        let _ = run_plan(&p, data, None, &cancel, Some(&mut checks), &NoLoadObserver).await;
                         if let Err(e) = exec(&p.session, tx.rollback, &cancel).await {
                             checks.push(LoadCheck { label: "Roll back".into(), sql: tx.rollback.into(), status: "error".into(), message: Some(e.message) });
                         }
@@ -1046,9 +1106,22 @@ fn created_notice(p: &Prepared, rows: &LoadRows) -> String {
 /// Run the plan; rows written. With `record`, each step is recorded and the
 /// run stops at the first error (dry run).
 /// Run the plan; returns the rows written and the rows Sync deleted.
+/// The next batch with rows of a query being loaded (None at its end).
+async fn next_batch(stream: &mut QueryStream) -> Result<Option<RecordBatch>> {
+    loop {
+        match stream.next().await {
+            Some(Ok(StreamEvent::Batch(b))) if b.num_rows() > 0 => return Ok(Some(b)),
+            Some(Ok(StreamEvent::Done(_))) | None => return Ok(None),
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(EngineError::from(e)),
+        }
+    }
+}
+
 async fn run_plan(
     p: &Prepared,
     rows: &LoadRows,
+    mut rest: Option<&mut QueryStream>,
     cancel: &CancellationToken,
     mut record: Option<&mut Vec<LoadCheck>>,
     obs: &dyn LoadObserver,
@@ -1088,11 +1161,28 @@ async fn run_plan(
                 let b = sqlgen::InsertSql::new(p.dialect, table, &schema, p.batch);
                 let (mut n, mut statements, mut first) = (0u64, 0usize, String::new());
                 let mut r: Result<()> = Ok(());
-                let total = rows.count();
+                // Rows still streaming in: the total isn't known (0).
+                let total = if rest.is_some() { 0 } else { rows.count() };
                 let started = std::time::Instant::now();
                 let phase = if *target { "Inserting rows" } else { "Staging rows" };
                 obs.event(LoadEvent::Progress { phase: phase.into(), done: 0, total });
-                'rows: for batch in &rows.batches {
+                let mut held = rows.batches.iter().cloned();
+                'rows: loop {
+                    let batch = match held.next() {
+                        Some(b) => b,
+                        None => match rest.as_deref_mut() {
+                            None => break,
+                            Some(stream) => match next_batch(stream).await {
+                                Ok(Some(b)) => b,
+                                Ok(None) => break,
+                                Err(e) => {
+                                    r = Err(e);
+                                    break;
+                                }
+                            },
+                        },
+                    };
+                    let batch = &batch;
                     // Batches carry the rows' names; the statement uses the target's.
                     let mut at = 0;
                     loop {

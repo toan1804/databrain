@@ -309,6 +309,21 @@ async fn query_local_file_suggestions_run() {
     assert_eq!(cell(&query(&st, &id, &glob).await, 0, 0), "3000");
 }
 
+/// A wide DuckDB result is measured by what it really holds: its batches
+/// come through Arrow IPC with every column in one buffer, which used to be
+/// counted once per column (80× for 40 columns) and cut the result short.
+#[tokio::test]
+async fn wide_duckdb_results_are_not_cut_short() {
+    let st = state();
+    st.engine.outputs().set_budget(0); // the 16 MB floor: 8 MB per result
+    let id = add_connection(&st, "scratch", ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None));
+    let cols = (0..40).map(|i| format!("'value ' || (range % 1000) AS c{i}")).collect::<Vec<_>>().join(", ");
+    let out = run_named(&st, &id, "wide", &format!("SELECT {cols} FROM range(5000)"), None, None).await;
+    let r = out[0].result.as_ref().unwrap_or_else(|| panic!("{:?}", out[0].error));
+    assert!(!r.truncated && r.total_rows == 5000, "{} rows, truncated {}", r.total_rows, r.truncated);
+    assert!(r.bytes < 8 << 20, "{} bytes", r.bytes);
+}
+
 /// Excel workbook with several sheets and a blank header cell: first sheet by
 /// default, every sheet on request, all columns read.
 #[tokio::test]
@@ -320,6 +335,8 @@ async fn query_local_excel_sheets() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("book.xlsx");
     let mut wb = rust_xlsxwriter::Workbook::new();
+    // A blank cover sheet first: "first sheet" means the first with data.
+    wb.add_worksheet().set_name("Cover").unwrap();
     let a = wb.add_worksheet().set_name("Orders").unwrap();
     a.write_string(0, 0, "id").unwrap();
     a.write_string(0, 2, "total").unwrap(); // B1 blank
@@ -335,7 +352,7 @@ async fn query_local_excel_sheets() {
     let path = p.to_string_lossy().to_string();
 
     let sheets = api::excel_sheets(&path).unwrap();
-    assert_eq!(sheets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["Orders", "Customers"]);
+    assert_eq!(sheets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["Cover", "Orders", "Customers"]);
 
     let st = state();
     let id = add_connection(&st, "scratch", ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None));

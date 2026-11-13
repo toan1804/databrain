@@ -126,3 +126,80 @@ impl StreamSender {
         self.tx.is_closed()
     }
 }
+
+/// Bytes `batches` keep in memory, counting each allocation once however
+/// many arrays (or batches) share it.
+///
+/// `RecordBatch::get_array_memory_size` counts a buffer once per array that
+/// points into it. A batch decoded from Arrow IPC (DuckDB, Databricks) has
+/// every column inside one message buffer, so it was counted once per
+/// column: 16 times the real size for 8 columns, 80 times for 40.
+pub fn memory_size<'a>(batches: impl IntoIterator<Item = &'a RecordBatch>) -> usize {
+    fn walk(d: &arrow::array::ArrayData, seen: &mut std::collections::HashSet<usize>, total: &mut usize) {
+        let mut add = |b: &arrow::buffer::Buffer| {
+            if seen.insert(b.data_ptr().as_ptr() as usize) {
+                *total += b.capacity();
+            }
+        };
+        d.buffers().iter().for_each(&mut add);
+        if let Some(n) = d.nulls() {
+            add(n.buffer());
+        }
+        for c in d.child_data() {
+            walk(c, seen, total);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0;
+    for b in batches {
+        for col in b.columns() {
+            walk(&col.to_data(), &mut seen, &mut total);
+        }
+    }
+    total
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use std::sync::Arc;
+
+    fn batch(cols: usize, rows: usize) -> RecordBatch {
+        let arrays: Vec<(String, ArrayRef)> =
+            (0..cols).map(|i| (format!("c{i}"), Arc::new(StringArray::from_iter_values((0..rows).map(|r| format!("value {r}")))) as ArrayRef)).collect();
+        RecordBatch::try_from_iter(arrays).unwrap()
+    }
+
+    fn ipc_round_trip(b: &RecordBatch) -> RecordBatch {
+        let mut buf = Vec::new();
+        let mut w = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &b.schema()).unwrap();
+        w.write(b).unwrap();
+        w.finish().unwrap();
+        drop(w);
+        arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(buf), None).unwrap().next().unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_shared_buffer_is_counted_once() {
+        let b = ipc_round_trip(&batch(40, 2000));
+        let real = memory_size([&b]);
+        // Every column points into the one IPC buffer.
+        assert!(b.get_array_memory_size() > 30 * real, "{} vs {real}", b.get_array_memory_size());
+        let raw: usize = b.columns().iter().map(|c| c.to_data().buffers().iter().map(|x| x.len()).sum::<usize>()).sum();
+        assert!(real >= raw && real < raw * 2, "{real} vs {raw}");
+    }
+
+    #[test]
+    fn separate_buffers_and_slices() {
+        let b = batch(3, 1000);
+        // Arrays of their own: same as Arrow's count, less the struct overhead.
+        assert!(memory_size([&b]) <= b.get_array_memory_size());
+        assert!(memory_size([&b]) * 2 > b.get_array_memory_size());
+        // Slices keep their parent's buffers: counted once across batches.
+        let (x, y) = (b.slice(0, 500), b.slice(500, 500));
+        assert_eq!(memory_size([&x, &y]), memory_size([&b]));
+        let n = RecordBatch::try_from_iter([("n", Arc::new(Int64Array::from(vec![Some(1), None])) as ArrayRef)]).unwrap();
+        assert_eq!(memory_size([&n]), n.column(0).to_data().buffers()[0].capacity() + n.column(0).nulls().unwrap().buffer().capacity());
+    }
+}
