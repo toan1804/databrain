@@ -64,6 +64,8 @@ pub fn headless_state(dir: &Path) -> Result<AppState> {
     state.jobs = Arc::new(crate::jobs::JobsState::new("cli"));
     state.set_credential_store(store, dir.to_path_buf());
     state.set_snapshot_dir(dir.join("outputs"));
+    api::apply_results_memory(&state);
+    api::set_duckdb_spill_dir(dir);
     api::apply_oracle_client_setting(&state);
     api::setup_oracle_agent(&state, dir);
     #[cfg(feature = "duckdb-engine")]

@@ -152,6 +152,7 @@ import type { CachedExplorer } from "./bindings/CachedExplorer";
 import type { ConnectionView } from "./bindings/ConnectionView";
 import type { CredentialStoreView } from "./bindings/CredentialStoreView";
 import type { ExcelSheet } from "./bindings/ExcelSheet";
+import type { ResultsMemory } from "./bindings/ResultsMemory";
 import type { ExplorerRevalidation } from "./bindings/ExplorerRevalidation";
 import type { SchemaRefresh } from "./bindings/SchemaRefresh";
 import type { LineageCheck } from "./bindings/LineageCheck";
@@ -333,6 +334,7 @@ export type {
   ConnectionView,
   CredentialStoreView,
   ExcelSheet,
+  ResultsMemory,
   ExplorerRevalidation,
   SchemaRefresh,
   LineageCheck,

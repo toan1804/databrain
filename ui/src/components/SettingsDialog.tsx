@@ -14,6 +14,7 @@ import { UsageDetails } from "./ProviderUsage";
 import { DuckdbEngineSettings } from "./DuckdbEngine";
 import { UpdateSettings } from "./UpdateBanner";
 import { BackgroundJobsSettings } from "./BackgroundJobsSettings";
+import { ResultsMemorySettings } from "./ResultsMemorySettings";
 
 export const PROVIDER_KINDS: { kind: ProviderKind; label: string; base: string; auth: ProviderAuth[]; model: string; hint?: string }[] = [
   {
@@ -151,6 +152,7 @@ function Queries() {
       </p>
       <ConnectTimeout />
       <IdleDisconnect />
+      <ResultsMemorySettings />
       <h3 className="pt-3 text-[13px] font-medium">History</h3>
       <HistoryRetention
         setting="history_retention_days"

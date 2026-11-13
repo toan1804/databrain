@@ -1841,6 +1841,7 @@ dependencies = [
  "dirs 7.0.0",
  "flate2",
  "futures",
+ "libc",
  "openssl",
  "parking_lot",
  "quick-xml 0.42.0",

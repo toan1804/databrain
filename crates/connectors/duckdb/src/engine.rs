@@ -1,4 +1,4 @@
-use databrain_connector_core::{ConnectorError, Result};
+use databrain_connector_core::{ConnectorError, Result, quote_literal};
 
 use crate::error::map_err;
 
@@ -97,6 +97,42 @@ pub fn set_extension_dir(dir: Option<String>) {
 
 pub fn extension_dir() -> Option<String> {
     EXTENSION_DIR.read().ok().and_then(|g| g.clone())
+}
+
+/// Where sessions spill (sorts, joins, aggregates bigger than their memory)
+/// and how much memory they may use; set by the app (None: DuckDB's own).
+static SPILL_DIR: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+static MEMORY_LIMIT: std::sync::RwLock<Option<u64>> = std::sync::RwLock::new(None);
+
+/// Spill into `dir` for new sessions. DuckDB's default for an in-memory
+/// database is `.tmp` in the current directory, which is `/` (read-only)
+/// for an app started from Finder: work bigger than memory failed there.
+pub fn set_spill_dir(dir: Option<String>) {
+    if let Ok(mut g) = SPILL_DIR.write() {
+        *g = dir;
+    }
+}
+
+/// Memory each new DuckDB database may use, in bytes (DuckDB's default is
+/// 80% of the computer's, which doesn't leave room for the results budget).
+pub fn set_memory_limit(bytes: Option<u64>) {
+    if let Ok(mut g) = MEMORY_LIMIT.write() {
+        *g = bytes;
+    }
+}
+
+/// `SET` statements for a new session from [`set_spill_dir`] and
+/// [`set_memory_limit`] (empty when neither is set). Run before the
+/// sandbox locks the configuration.
+pub(crate) fn session_settings() -> String {
+    let mut sql = String::new();
+    if let Some(dir) = SPILL_DIR.read().ok().and_then(|g| g.clone()) {
+        sql.push_str(&format!("SET temp_directory = {};", quote_literal(&dir)));
+    }
+    if let Some(b) = MEMORY_LIMIT.read().ok().and_then(|g| *g) {
+        sql.push_str(&format!("SET memory_limit = '{}MB';", (b / (1024 * 1024)).max(64)));
+    }
+    sql
 }
 
 /// DuckDB version and platform of this build, e.g. ("v1.5.6", "osx_arm64").

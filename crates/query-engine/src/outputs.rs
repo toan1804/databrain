@@ -37,7 +37,49 @@ const SNAPSHOT_CHUNK: usize = 65_536;
 const KEEP_VERSIONS: usize = 5;
 /// Metadata entries kept for evicted outputs.
 const MAX_ENTRIES: usize = 400;
+/// Budget when the computer's memory is unknown.
 const DEFAULT_BUDGET: usize = 1024 * 1024 * 1024;
+const MB: u64 = 1024 * 1024;
+const GB: u64 = 1024 * MB;
+
+/// The budget for a computer with `total` bytes of memory: a quarter of it,
+/// between 512 MB and 16 GB, so results don't push other programs into swap
+/// on a small machine and do use a big one (1 GB when unknown).
+pub fn auto_budget(total: Option<u64>) -> usize {
+    match total {
+        Some(t) if t > 0 => (t / 4).clamp(512 * MB, 16 * GB) as usize,
+        _ => DEFAULT_BUDGET,
+    }
+}
+
+/// Free memory a result leaves the computer: a tenth of it, at least 500 MB.
+pub fn free_floor(total: Option<u64>) -> u64 {
+    total.map_or(0, |t| t / 10).max(500 * MB)
+}
+
+/// `1.5 GB`, `512 MB`.
+pub fn size_text(bytes: usize) -> String {
+    let b = bytes as u64;
+    if b >= GB {
+        let g = b as f64 / GB as f64;
+        if (g - g.round()).abs() < 0.05 { format!("{} GB", g.round()) } else { format!("{g:.1} GB") }
+    } else {
+        format!("{} MB", b.div_ceil(MB))
+    }
+}
+
+/// Reads the computer's free (available) memory in bytes; None when unknown.
+pub type FreeMemoryProbe = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// How often the free memory is read while results load.
+const FREE_CHECK_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+
+struct FreeCheck {
+    probe: FreeMemoryProbe,
+    floor: u64,
+    /// When it was last read, and whether it was below the floor then.
+    last: Option<(std::time::Instant, Option<u64>)>,
+}
 /// Largest active output saved on quit (in-memory size).
 pub const AUTO_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Total size of active outputs saved on quit.
@@ -158,6 +200,7 @@ pub struct OutputRegistry {
     workspace: Arc<Workspace>,
     snapshot_dir: Mutex<Option<PathBuf>>,
     budget: Mutex<usize>,
+    free: Mutex<Option<FreeCheck>>,
 }
 
 /// Name rules: identifier-like, not `r<digits>`, no `__` (version suffix).
@@ -188,6 +231,7 @@ impl OutputRegistry {
             workspace,
             snapshot_dir: Mutex::new(None),
             budget: Mutex::new(DEFAULT_BUDGET),
+            free: Mutex::new(None),
         })
     }
 
@@ -199,6 +243,32 @@ impl OutputRegistry {
     pub fn set_budget(&self, bytes: usize) {
         *self.budget.lock() = bytes.max(16 * 1024 * 1024);
         self.enforce_budget();
+    }
+
+    /// Bytes the outputs in memory use now.
+    pub fn used(&self) -> usize {
+        self.inner.lock().by_handle.values().filter(|o| o.state == OutputState::Live).map(|o| o.bytes).sum()
+    }
+
+    /// Stop loading a result when the computer's free memory (read by
+    /// `probe`) drops below `floor` bytes; None turns the check off.
+    pub fn set_free_memory_probe(&self, probe: Option<FreeMemoryProbe>, floor: u64) {
+        *self.free.lock() = probe.map(|probe| FreeCheck { probe, floor, last: None });
+    }
+
+    /// The computer's free memory when it is below the floor (read at most
+    /// every 200 ms; between reads the last answer holds).
+    pub fn low_memory(&self) -> Option<u64> {
+        let mut g = self.free.lock();
+        let c = g.as_mut()?;
+        if let Some((at, low)) = c.last
+            && at.elapsed() < FREE_CHECK_EVERY
+        {
+            return low;
+        }
+        let low = (c.probe)().filter(|free| *free < c.floor);
+        c.last = Some((std::time::Instant::now(), low));
+        low
     }
 
     /// Enable snapshots of pinned outputs and restore the saved ones.

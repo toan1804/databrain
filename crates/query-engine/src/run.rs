@@ -419,6 +419,8 @@ impl QueryEngine {
         // other outputs (active ones are never freed).
         let max_bytes = self.outputs.budget() / 2;
         let mut too_big = false;
+        // Free memory of the computer when it ran low (and the result stopped).
+        let mut low_free: Option<u64> = None;
         let t0 = Instant::now();
         let mut last_progress = Instant::now();
 
@@ -453,6 +455,16 @@ impl QueryEngine {
                         batch = databrain_connector_core::arrow::compute::take_record_batch(&batch, &idx).unwrap_or_else(|_| batch.slice(0, idx.len()));
                         truncated = true;
                         too_big = true;
+                    }
+                    // The computer is low on free memory (other programs, other
+                    // results): stop before taking more, keeping the rows so far.
+                    if !truncated
+                        && rows > 0
+                        && let Some(free) = self.outputs.low_memory()
+                    {
+                        low_free = Some(free);
+                        cancel.cancel();
+                        break;
                     }
                     rows += batch.num_rows();
                     bytes += databrain_connector_core::memory_size([&batch]);
@@ -507,10 +519,15 @@ impl QueryEngine {
             g.info()
         });
         unfinished.armed = false;
-        notices.push(if too_big {
+        notices.push(if let Some(free) = low_free {
             format!(
-                "Showing the first {rows} rows: they fill the {} MB a result may keep in memory. Select fewer columns, or export the query to get every row.",
-                max_bytes / (1024 * 1024)
+                "Showing the first {rows} rows: the computer is low on free memory ({} free). Close other programs or results, or export the query to get every row.",
+                crate::outputs::size_text(free as usize)
+            )
+        } else if too_big {
+            format!(
+                "Showing the first {rows} rows: they fill the {} a result may keep in memory. Select fewer columns, or export the query to get every row.",
+                crate::outputs::size_text(max_bytes)
             )
         } else {
             format!("Showing the first {rows} rows. Increase the row limit to fetch more.")

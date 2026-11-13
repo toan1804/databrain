@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Eraser, GitCompare, HardDrive, Layers, Pin, Search, TerminalSquare, Trash2 } from "lucide-react";
+import { api, isTauri } from "../lib/api";
 import type { OutputInfo } from "../lib/types";
 import { formatBytes, formatCount, sqlPreview } from "../lib/util";
 import { useStore } from "../store";
@@ -28,6 +29,15 @@ export function OutputsPanel() {
   }, [outputs, q, filter]);
 
   const live = outputs.filter((o) => o.state === "live").reduce((n, o) => n + o.bytes, 0);
+  // The budget can change in Settings: read it again when the outputs do.
+  const [budget, setBudget] = useState<number | null>(null);
+  useEffect(() => {
+    if (!isTauri()) return;
+    api
+      .resultsMemory()
+      .then((m) => setBudget(m.budget))
+      .catch(() => {});
+  }, [outputs]);
   const starter = () => {
     const named = outputs.filter((o) => o.state !== "evicted").slice(0, 2);
     const sql = named.length
@@ -75,8 +85,12 @@ export function OutputsPanel() {
               {f}
             </button>
           ))}
-          <span className="ml-auto self-center text-[10.5px] text-muted" title="Memory used by outputs">
+          <span
+            className="ml-auto self-center text-[10.5px] text-muted"
+            title="Memory used by outputs, of what results may use (Settings → Queries). Past it, the least recently used older outputs free their rows."
+          >
             {formatBytes(live)}
+            {budget ? ` of ${formatBytes(budget)}` : ""}
           </span>
         </div>
       </div>

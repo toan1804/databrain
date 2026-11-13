@@ -22,7 +22,7 @@ mod session;
 mod test_util;
 pub mod xlsx;
 
-pub use engine::{EngineStatus, engine_status, extension_dir, load_engine, set_extension_dir, version_and_platform};
+pub use engine::{EngineStatus, engine_status, extension_dir, load_engine, set_extension_dir, set_memory_limit, set_spill_dir, version_and_platform};
 pub use excel::{ExcelSource, excel_scan, excel_sheet_source, excel_sources, file_scan_expr};
 pub use files::{FileFormat, detect_format, scan_expr, view_name};
 pub use outputs::RESULTS_SCHEMA_ID;
@@ -98,6 +98,12 @@ impl Connector for DuckdbConnector {
                     let _ = conn.execute_batch(&format!("SET extension_directory = {}", quote_literal(&dir)));
                 }
                 let _ = conn.execute_batch("SET autoinstall_known_extensions = true; SET autoload_known_extensions = true;");
+                // Spill folder and memory limit from the app (before the sandbox
+                // lock); DuckDB's defaults stay when they can't be set.
+                let limits = engine::session_settings();
+                if !limits.is_empty() {
+                    let _ = conn.execute_batch(&limits);
+                }
                 attach_files(conn, &files, all_sheets)?;
                 if sandbox {
                     seal(conn, &files)?;

@@ -51,6 +51,7 @@ import type {
   ChartData,
   ChartSpec,
   OutputInfo,
+  ResultsMemory,
   CompareOptions,
   ComparePair,
   CompareRun,
@@ -378,6 +379,10 @@ export const api = {
   excelSheets: (path: string) => call<ExcelSheet[]>("excel_sheets", { path }),
 
   listOutputs: () => call<OutputInfo[]>("list_outputs"),
+  /** The memory results may use (Settings → Queries) and how much they use now. */
+  resultsMemory: () => call<ResultsMemory>("results_memory"),
+  /** `mb`: a chosen size; null: automatic (a quarter of the computer's memory). */
+  setResultsMemory: (mb: number | null) => call<ResultsMemory>("set_results_memory", { mb }),
   getOutput: (reference: string) => call<OutputInfo>("get_output", { reference }),
   dropOutput: (reference: string) => call<OutputInfo>("drop_output", { reference }),
   dropUnpinnedOutputs: () => call<number>("drop_unpinned_outputs"),

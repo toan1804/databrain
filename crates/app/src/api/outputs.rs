@@ -343,3 +343,103 @@ pub async fn chart_data(
     let rs = state.results().get(&result_id)?;
     blocking(move || Ok(rs.lock().chart(&view, &spec)?)).await
 }
+
+// ------------------------------------------------------------ results memory
+
+/// Setting: the memory results may use, in MB (absent or null: automatic,
+/// from the computer's memory).
+pub const RESULTS_MEMORY_SETTING: &str = "results_memory_mb";
+
+/// Smallest size that can be chosen.
+const RESULTS_MEMORY_MIN_MB: u64 = 256;
+
+/// The memory query results may use (Settings → Results).
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct ResultsMemory {
+    /// The budget in use, in bytes (one result keeps at most half).
+    #[ts(type = "number")]
+    pub budget: u64,
+    /// What "Automatic" is on this computer, in bytes.
+    #[ts(type = "number")]
+    pub auto: u64,
+    /// The size chosen in MB; None = automatic.
+    #[ts(type = "number | null")]
+    pub custom_mb: Option<u64>,
+    /// The computer's memory in bytes (None when it can't be read).
+    #[ts(type = "number | null")]
+    pub total: Option<u64>,
+    /// Bytes the outputs in memory use now.
+    #[ts(type = "number")]
+    pub used: u64,
+}
+
+fn custom_results_mb(ws: &databrain_workspace::Workspace) -> Option<u64> {
+    ws.get_setting(RESULTS_MEMORY_SETTING).ok().flatten().and_then(|v| v.as_u64())
+}
+
+/// Memory DuckDB may use for its own work (scans, sorts, joins): what the
+/// results budget and the free-memory floor leave, at most DuckDB's default
+/// 80% and at least 512 MB; spilling to disk covers the rest.
+pub fn duckdb_memory_limit(total: u64, budget: u64, floor: u64) -> u64 {
+    total.saturating_sub(budget).saturating_sub(floor).min(total / 10 * 8).max(512 * 1024 * 1024)
+}
+
+/// Set the results budget from the setting (or the computer's memory), stop
+/// loading a result when the computer runs low on free memory, and give
+/// DuckDB the memory left over.
+pub fn apply_results_memory(state: &AppState) {
+    apply_results_memory_to(&state.engine)
+}
+
+/// [`apply_results_memory`] for an engine without the app (the MCP server).
+pub fn apply_results_memory_to(engine: &databrain_query_engine::QueryEngine) {
+    use databrain_query_engine::outputs::{auto_budget, free_floor};
+    let total = crate::sysmem::total();
+    let budget = custom_results_mb(engine.workspace()).map_or(auto_budget(total) as u64, |mb| mb * 1024 * 1024);
+    let outputs = engine.outputs();
+    outputs.set_budget(budget as usize);
+    outputs.set_free_memory_probe(Some(Arc::new(crate::sysmem::available)), free_floor(total));
+    #[cfg(feature = "duckdb-engine")]
+    databrain_connector_duckdb::set_memory_limit(total.map(|t| duckdb_memory_limit(t, budget, free_floor(Some(t)))));
+}
+
+/// Where DuckDB spills work bigger than its memory: `<app dir>/duckdb_spill`.
+pub fn set_duckdb_spill_dir(app_dir: &std::path::Path) {
+    #[cfg(feature = "duckdb-engine")]
+    databrain_connector_duckdb::set_spill_dir(Some(app_dir.join("duckdb_spill").to_string_lossy().into_owned()));
+    #[cfg(not(feature = "duckdb-engine"))]
+    let _ = app_dir;
+}
+
+pub fn results_memory(state: &AppState) -> ResultsMemory {
+    let total = crate::sysmem::total();
+    let outputs = state.engine.outputs();
+    ResultsMemory {
+        budget: outputs.budget() as u64,
+        auto: databrain_query_engine::outputs::auto_budget(total) as u64,
+        custom_mb: custom_results_mb(&state.workspace),
+        total,
+        used: outputs.used() as u64,
+    }
+}
+
+/// Choose the memory results may use (`mb`), or automatic (None). Lowering
+/// it frees older results at once.
+pub fn set_results_memory(state: &AppState, mb: Option<u64>) -> Result<ResultsMemory> {
+    if let Some(mb) = mb {
+        let max_mb = crate::sysmem::total().map(|t| t / (1024 * 1024));
+        if mb < RESULTS_MEMORY_MIN_MB || max_mb.is_some_and(|m| mb > m) {
+            return Err(EngineError::new(
+                "invalid",
+                match max_mb {
+                    Some(m) => format!("Choose between {RESULTS_MEMORY_MIN_MB} MB and this computer's {m} MB"),
+                    None => format!("Choose at least {RESULTS_MEMORY_MIN_MB} MB"),
+                },
+            ));
+        }
+    }
+    state.workspace.set_setting(RESULTS_MEMORY_SETTING, &mb.map_or(serde_json::Value::Null, |m| serde_json::json!(m)))?;
+    apply_results_memory(state);
+    Ok(results_memory(state))
+}

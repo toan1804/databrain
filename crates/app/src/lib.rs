@@ -11,6 +11,7 @@ pub mod logging;
 pub mod meta_writer;
 pub mod paths;
 pub mod sql_files;
+pub mod sysmem;
 pub mod updates;
 
 use std::sync::Arc;
@@ -145,6 +146,8 @@ pub fn run() {
             state.set_credential_store(store, dir.clone());
             state.move_uri_passwords();
             state.set_snapshot_dir(dir.join("outputs"));
+            api::apply_results_memory(&state);
+            api::set_duckdb_spill_dir(&dir);
             api::apply_oracle_client_setting(&state);
             api::setup_oracle_agent(&state, &dir);
             // System-engine builds: find the DuckDB library installed on the computer.
@@ -291,6 +294,8 @@ pub fn run() {
             commands::library::set_setting,
             commands::connections::move_to_folder,
             commands::outputs::list_outputs,
+            commands::outputs::results_memory,
+            commands::outputs::set_results_memory,
             commands::outputs::get_output,
             commands::outputs::load_output,
             commands::outputs::rename_output,
