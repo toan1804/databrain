@@ -4,6 +4,13 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Fixed
+
+- Safety: PII masking of AI results no longer lets a masked column through when the SQL reshapes it in ways lineage didn't follow: `SELECT * REPLACE (email AS name)`, `UNPIVOT`, table functions over the column (Snowflake `FLATTEN`, Postgres `string_to_table`), Databricks `LATERAL VIEW`, SQL Server `CROSS APPLY`, and expressions mixing a placed column with one that can't be placed (`o.id || email` in a join). A column lineage can only trace in part is now masked whenever the SQL names a sensitive column.
+- Lineage: column lists (`WITH c(a, b)`, `(…) s(a, b)`) no longer cut the chain; `* EXCLUDE / REPLACE / RENAME`, `PIVOT` / `UNPIVOT`, table functions, `LATERAL VIEW` and `CROSS / OUTER APPLY` are traced; columns named `level`, `user` or `rowid` are columns except where the database has them as values; select aliases in `HAVING` / `QUALIFY` and lambda parameters no longer warn; `INSERT` without a column list no longer invents columns; `BEGIN`, `COMMIT`, `SET` and `USE` no longer warn, and `USE` / `SET search_path` choose the schema of later bare names; a view's definition reads its own schema's tables, and a bare name several schemas have is the connection's default schema's; `"Orders"` and `orders` are two tables where the database says so; a table dropped and created again is drawn as a new table.
+- Lineage of long scripts is much faster (400 chained statements: seconds to a fraction of one) and no longer holds up the app while it runs.
+- Learning from query history: the same query with a negative number, or with another number of `VALUES` rows, counts as the same query.
+
 ## 0.4.1 - 2026-11-13
 
 ### Added

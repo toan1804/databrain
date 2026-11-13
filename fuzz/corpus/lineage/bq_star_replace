@@ -1,0 +1,1 @@
+select * replace (email as name) from users

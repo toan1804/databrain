@@ -1,4 +1,4 @@
-# Fuzz targets for the statement splitter, classifier and identifier quoting
+# Fuzz targets for the statement splitter, classifier, identifier quoting and lineage
 # (cargo-fuzz, nightly Rust). Not part of the main workspace:
 #   cargo +nightly fuzz run split_classify -- -max_total_time=300
 # The properties checked are in connector-core's `invariants` module, which
@@ -15,6 +15,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 databrain-connector-core = { path = "../crates/connector-core" }
+databrain-lineage = { path = "../crates/lineage" }
 
 # Its own workspace: kept out of the main one.
 [workspace]
@@ -33,6 +34,13 @@ bench = false
 [[bin]]
 name = "quoting"
 path = "fuzz_targets/quoting.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lineage"
+path = "fuzz_targets/lineage.rs"
 test = false
 doc = false
 bench = false

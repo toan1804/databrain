@@ -53,12 +53,12 @@ pub fn masked_columns(sql: &str, kind: ConnectorKind, columns: &[String], rule_c
                 return true;
             }
             let Some(r) = result.filter(|_| !g.partial) else { return mentions || row_used };
-            let sources = sources(&g, &r.id, c);
-            if sources.is_empty() {
-                // Not traced (an expression the lineage can't place): masked
-                // when the SQL names a sensitive column, or a ruled table's
-                // whole row, at all.
-                return mentions || row_used;
+            let (sources, untraced) = sources(&g, &r.id, c);
+            // Not traced, or only in part (an expression the lineage can't
+            // place, a name it had to guess): masked when the SQL names a
+            // sensitive column, or a ruled table's whole row, at all.
+            if (sources.is_empty() || untraced) && (mentions || row_used) {
+                return true;
             }
             sources.iter().any(|(t, col)| if col == "*" { is_pii(Some(t), c) } else { is_pii(Some(t), col) || is_pii(None, col) || whole_row(t, col) })
         })
@@ -140,15 +140,20 @@ fn non_sql_masks(sql: &str, kind: ConnectorKind, columns: &[String], rule_column
 
 /// `(table, column)` pairs whose values reach `column` of node `id`
 /// (copied, computed or aggregated; not filters or joins). `*`: the whole
-/// table, column by column.
-fn sources(g: &Lineage, id: &str, column: &str) -> Vec<(String, String)> {
+/// table, column by column. And whether any column on the way is
+/// [`databrain_lineage::Column::untraced`] (the pairs may not be all).
+fn sources(g: &Lineage, id: &str, column: &str) -> (Vec<(String, String)>, bool) {
     let nodes: HashMap<&str, &databrain_lineage::Node> = g.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let mut out = Vec::new();
     let mut seen = HashSet::new();
+    let mut untraced = false;
     let mut todo = vec![(id.to_string(), column.to_ascii_lowercase())];
     while let Some((node, col)) = todo.pop() {
         if !seen.insert((node.clone(), col.clone())) {
             continue;
+        }
+        if let Some(n) = nodes.get(node.as_str()) {
+            untraced |= n.columns.iter().any(|c| c.untraced && c.name.eq_ignore_ascii_case(&col));
         }
         for e in &g.edges {
             if e.to != node || matches!(e.kind, EdgeKind::Filter | EdgeKind::Join) {
@@ -168,7 +173,7 @@ fn sources(g: &Lineage, id: &str, column: &str) -> Vec<(String, String)> {
             }
         }
     }
-    out
+    (out, untraced)
 }
 
 /// Whether `sql` names any of `names` as a word (case-insensitive).
@@ -240,6 +245,57 @@ mod tests {
         assert_eq!(pg(&["ssn"], "select ssn as s, id from people", &["s", "id"]), [true, false]);
         // No rules: nothing masked.
         assert_eq!(pg(&[], "select email from users", &["email"]), [false]);
+    }
+
+    #[test]
+    fn masks_what_lineage_traces_wrongly_or_in_part() {
+        use ConnectorKind::*;
+        let users = &["users.email"];
+        // `* REPLACE`: `name` holds the emails.
+        for kind in [Bigquery, Duckdb, Snowflake, Clickhouse] {
+            assert_eq!(masked(kind, users, "select * replace (email as name) from users", &["id", "name"]), [false, true], "{kind:?}");
+            assert_eq!(masked(kind, users, "select * replace (upper(name) as name) from users", &["id", "name"]), [false, false], "{kind:?}");
+        }
+        // `* RENAME` / `* EXCLUDE`.
+        assert_eq!(masked(Snowflake, users, "select * rename (email as contact) from users", &["id", "contact"]), [false, true]);
+        assert_eq!(masked(Duckdb, users, "select * exclude (email) from users", &["id", "name"]), [false, false]);
+        // UNPIVOT: the listed columns' values end up in `val`.
+        for kind in [Snowflake, Duckdb] {
+            let sql = "select * from users unpivot (val for col in (email, name)) p";
+            assert_eq!(masked(kind, users, sql, &["id", "col", "val"]), [false, false, true], "{kind:?}");
+            let sql = "select * from users unpivot (val for col in (city, name)) p";
+            assert_eq!(masked(kind, users, sql, &["id", "col", "val"]), [false, false, false], "{kind:?}");
+        }
+        // PIVOT over the masked column.
+        let sql = "select * from (select id, kind, email from users) s pivot (max(email) for kind in ('a', 'b')) p";
+        assert_eq!(masked(Snowflake, users, sql, &["id", "'a'", "'b'"]), [true, true, true]);
+        // Table functions over a column.
+        let sql = "select f.value from users u, lateral flatten(input => u.email) f";
+        assert_eq!(masked(Snowflake, users, sql, &["value"]), [true]);
+        let sql = "select f.value from users u, lateral flatten(input => u.tags) f";
+        assert_eq!(masked(Snowflake, users, sql, &["value"]), [false]);
+        let sql = "select g.v from users u, lateral string_to_table(u.email, '@') as g(v)";
+        assert_eq!(pg(users, sql, &["v"]), [true]);
+        let sql = "select g.v from users u, lateral string_to_table(u.city, '@') as g(v)";
+        assert_eq!(pg(users, sql, &["v"]), [false]);
+        let sql = "select x from users u cross join lateral unnest(string_to_array(u.email, '@')) as x";
+        assert_eq!(pg(users, sql, &["x"]), [true]);
+        // Hive / Databricks LATERAL VIEW.
+        let sql = "select t.tag from users u lateral view explode(split(u.email, '@')) t as tag";
+        assert_eq!(masked(Databricks, users, sql, &["tag"]), [true]);
+        let sql = "select t.tag from users u lateral view explode(u.tags) t as tag";
+        assert_eq!(masked(Databricks, users, sql, &["tag"]), [false]);
+        // SQL Server APPLY sees the tables before it.
+        let sql = "select x.e from users u cross apply (select u.email as e) x";
+        assert_eq!(masked(Mssql, users, sql, &["e"]), [true]);
+        // Partly traced: `o.id` is placed, the bare `email` (two tables, columns unknown) is not.
+        let sql = "select o.id || email as x, o.id from orders o join users u on u.id = o.user_id";
+        assert_eq!(pg(users, sql, &["x", "id"]), [true, false]);
+        let sql = "select o.id || note as x from orders o join users u on u.id = o.user_id";
+        assert_eq!(pg(users, sql, &["x"]), [false], "it names no sensitive column");
+        // A qualifier that is no source: a guess, not a trace.
+        let sql = "select o.id, uu.email as x from orders o join users u on u.id = o.user_id";
+        assert_eq!(pg(users, sql, &["id", "x"]), [false, true]);
     }
 
     #[test]

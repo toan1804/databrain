@@ -17,6 +17,7 @@
 mod builder;
 mod fingerprint;
 mod flows;
+pub mod invariants;
 mod model;
 mod refs;
 

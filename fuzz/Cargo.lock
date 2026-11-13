@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-auth"
-version = "0.2.1"
+version = "0.4.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "databrain-connector-core"
-version = "0.2.1"
+version = "0.4.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -706,7 +706,18 @@ name = "databrain-fuzz"
 version = "0.0.0"
 dependencies = [
  "databrain-connector-core",
+ "databrain-lineage",
  "libfuzzer-sys",
+]
+
+[[package]]
+name = "databrain-lineage"
+version = "0.4.1"
+dependencies = [
+ "databrain-connector-core",
+ "serde",
+ "sqlparser",
+ "ts-rs",
 ]
 
 [[package]]

@@ -50,11 +50,18 @@ pub struct Column {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[ts(as = "Option<Vec<usize>>", optional)]
     pub used_by: Vec<usize>,
+    /// Some of what the column is made of couldn't be placed (a name that
+    /// matches no source, or matches several; a guessed struct field): its
+    /// edges may not be all of its sources. PII masking treats it like a
+    /// column without any.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub untraced: bool,
 }
 
 impl Column {
     pub(crate) fn named(name: impl Into<String>) -> Self {
-        Column { name: name.into(), span: None, expr: None, used: false, used_by: vec![] }
+        Column { name: name.into(), span: None, expr: None, used: false, used_by: vec![], untraced: false }
     }
 }
 
@@ -158,7 +165,8 @@ pub struct StatementInfo {
     pub index: usize,
     /// `select`, `select_into`, `create_table_as`, `create_table`,
     /// `create_view`, `insert`, `update`, `delete`, `merge`, `drop`,
-    /// `truncate`, `alter`, `other`, `error`.
+    /// `truncate`, `alter`, `session` (`USE`, `SET`, `BEGIN`, `COMMIT`…:
+    /// nothing to trace), `other`, `error`.
     pub kind: String,
     pub range: Range,
     /// The query part to check with the database (`EXPLAIN`), when it is a query.

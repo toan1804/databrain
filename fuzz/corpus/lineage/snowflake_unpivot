@@ -1,0 +1,1 @@
+select * from users unpivot (val for col in (email, name)) p

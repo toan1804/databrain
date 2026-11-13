@@ -206,12 +206,7 @@ impl<'a> Resolver<'a> {
 
     /// `schema` is (the tail of) the connection's defaults.
     fn is_default(&self, schema: &str) -> bool {
-        let parts: Vec<&str> = schema.split('.').collect();
-        if parts.len() > self.defaults.len() {
-            return false;
-        }
-        let tail = &self.defaults[self.defaults.len() - parts.len()..];
-        parts.iter().zip(tail).all(|(p, d)| d.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(p)))
+        crate::access::is_default_schema(&self.defaults, schema)
     }
 
     fn lookup(&self, parts: &[String]) -> Option<(String, String)> {

@@ -1,4 +1,5 @@
-use sqlparser::ast::{Expr, Ident, JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, TableAlias, Visit, Visitor};
+use databrain_connector_core::ConnectorKind;
+use sqlparser::ast::{Expr, Ident, JoinOperator, ObjectName, ObjectNamePart, OneOrManyWithParens, Query, SelectItem, SetExpr, Visit, Visitor};
 use std::ops::ControlFlow;
 
 #[derive(Clone)]
@@ -28,9 +29,12 @@ impl Env {
 pub(crate) struct Refs {
     pub(crate) cols: Vec<Vec<Ident>>,
     pub(crate) aggregate: bool,
-    pub(crate) window: bool,
     pub(crate) subqueries: Vec<Query>,
-    pub(crate) depth: usize,
+    depth: usize,
+    /// Bare words that are values in this dialect (see [`pseudo`]).
+    pseudo: &'static [&'static str],
+    /// Parameters of the lambdas being visited (`x -> x + 1`), lower case.
+    lambda: Vec<Vec<String>>,
 }
 
 pub(crate) const AGGREGATES: &[&str] = &[
@@ -78,19 +82,14 @@ pub(crate) const AGGREGATES: &[&str] = &[
     "covar_samp",
 ];
 
-/// Bare words that are values, not columns.
-pub(crate) const PSEUDO: &[&str] = &[
-    "sysdate",
-    "systimestamp",
+/// Bare words that are values, not columns, in every dialect.
+const VALUES: &[&str] = &[
     "current_date",
     "current_timestamp",
     "current_time",
     "current_user",
     "session_user",
-    "user",
-    "rownum",
-    "rowid",
-    "level",
+    "current_role",
     "localtimestamp",
     "localtime",
     "true",
@@ -98,6 +97,32 @@ pub(crate) const PSEUDO: &[&str] = &[
     "null",
     "default",
 ];
+
+/// Bare words that are values (pseudo-columns, niladic functions) where the
+/// dialect has them; elsewhere they are ordinary column names (`level`,
+/// `user` and `rowid` are common ones: SQLite's `rowid` is the row's key).
+pub(crate) fn pseudo(kind: ConnectorKind) -> &'static [&'static str] {
+    match kind {
+        ConnectorKind::Oracle => {
+            &["sysdate", "systimestamp", "user", "uid", "rownum", "rowid", "level", "connect_by_isleaf", "connect_by_iscycle", "ora_rowscn"]
+        }
+        ConnectorKind::Postgres => &["user", "current_catalog", "current_schema"],
+        ConnectorKind::Mssql => &["user", "system_user"],
+        _ => &[],
+    }
+}
+
+impl Refs {
+    fn is_value(&self, i: &Ident) -> bool {
+        let v = i.value.to_lowercase();
+        i.quote_style.is_none() && (VALUES.contains(&v.as_str()) || self.pseudo.contains(&v.as_str()))
+    }
+
+    fn is_lambda_param(&self, i: &Ident) -> bool {
+        let v = i.value.to_lowercase();
+        self.lambda.iter().any(|ps| ps.contains(&v))
+    }
+}
 
 impl Visitor for Refs {
     type Break = ();
@@ -117,12 +142,18 @@ impl Visitor for Refs {
             return ControlFlow::Continue(());
         }
         match e {
-            Expr::Identifier(i) if i.quote_style.is_some() || !PSEUDO.contains(&i.value.to_lowercase().as_str()) => self.cols.push(vec![i.clone()]),
-            Expr::CompoundIdentifier(v) => self.cols.push(v.clone()),
+            Expr::Identifier(i) if !self.is_value(i) && !self.is_lambda_param(i) => self.cols.push(vec![i.clone()]),
+            Expr::CompoundIdentifier(v) if !v.first().is_some_and(|i| self.is_lambda_param(i)) => self.cols.push(v.clone()),
+            Expr::Lambda(l) => {
+                let names = match &l.params {
+                    OneOrManyWithParens::One(p) => vec![p.name.value.to_lowercase()],
+                    OneOrManyWithParens::Many(ps) => ps.iter().map(|p| p.name.value.to_lowercase()).collect(),
+                };
+                self.lambda.push(names);
+            }
             Expr::Function(f) => {
-                if f.over.is_some() {
-                    self.window = true;
-                } else if let Some(ObjectNamePart::Identifier(n)) = f.name.0.last()
+                if f.over.is_none()
+                    && let Some(ObjectNamePart::Identifier(n)) = f.name.0.last()
                     && AGGREGATES.contains(&n.value.to_lowercase().as_str())
                 {
                     self.aggregate = true;
@@ -132,11 +163,23 @@ impl Visitor for Refs {
         }
         ControlFlow::Continue(())
     }
+    fn post_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        if self.depth == 0 && matches!(e, Expr::Lambda(_)) {
+            self.lambda.pop();
+        }
+        ControlFlow::Continue(())
+    }
 }
 
-pub(crate) fn refs(e: &Expr) -> Refs {
-    let mut r = Refs::default();
-    let _ = e.visit(&mut r);
+/// What `e` reads, with the bare words of `kind`'s dialect that are values left out.
+pub(crate) fn refs(e: &Expr, kind: ConnectorKind) -> Refs {
+    refs_in(e, kind)
+}
+
+/// [`refs`] of any part of a statement (a table function's arguments).
+pub(crate) fn refs_in<V: Visit + ?Sized>(v: &V, kind: ConnectorKind) -> Refs {
+    let mut r = Refs { pseudo: pseudo(kind), ..Default::default() };
+    let _ = v.visit(&mut r);
     r
 }
 
@@ -206,8 +249,14 @@ pub(crate) fn reads_itself(q: &Query, name: &str) -> bool {
     found
 }
 
-pub(crate) fn alias_or_name(alias: &Option<TableAlias>, name: &ObjectName) -> String {
-    alias.as_ref().map(|a| a.name.value.to_lowercase()).unwrap_or_else(|| name_parts(name).last().cloned().unwrap_or_default().to_lowercase())
+/// The parts of a name as identifiers (with their quotes).
+pub(crate) fn idents(n: &ObjectName) -> Vec<Ident> {
+    n.0.iter()
+        .map(|p| match p {
+            ObjectNamePart::Identifier(i) => i.clone(),
+            other => Ident::new(other.to_string()),
+        })
+        .collect()
 }
 
 /// `SELECT … INTO t FROM …` (a new table; not MySQL's `INTO @var` / `OUTFILE`):

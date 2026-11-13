@@ -1,0 +1,1 @@
+select level, name from t start with p is null connect by prior id = p

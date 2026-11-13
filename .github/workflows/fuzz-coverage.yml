@@ -1,4 +1,4 @@
-# Weekly (and on demand): fuzz the statement splitter, classifier and
+# Weekly (and on demand): fuzz the statement splitter, classifier, lineage and
 # identifier quoting, and measure test coverage. Separate from CI because
 # both rebuild everything with instrumentation.
 name: Fuzz and coverage
@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [split_classify, quoting]
+        target: [split_classify, quoting, lineage]
     env:
       CARGO_TERM_COLOR: always
     steps:

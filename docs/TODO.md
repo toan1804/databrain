@@ -49,36 +49,14 @@ Left from the final review of the metadata store (2026-11-13):
 
 ## Lineage (review of 2026-11-13; see [LINEAGE.md](LINEAGE.md))
 
-PII masking (`crates/ai/src/pii.rs`) masks a result column by what lineage traces it to, and falls back to "the SQL names a sensitive column" only when a column has no source at all. Where lineage traces a column wrongly or only in part, the value reaches the AI unmasked. Each of these was run with the rule `users.email`:
+Every finding of the review was fixed on 2026-11-13: columns traced only in part are `untraced` and PII masking treats them like untraced ones; `* EXCLUDE / REPLACE / RENAME`, `PIVOT` / `UNPIVOT`, table functions, `LATERAL VIEW` and `APPLY` keep edges from what they read; column lists rename their edges; pseudo-columns, `HAVING` / `QUALIFY` aliases, lambda parameters, `INSERT` without a column list, session statements, `USE` / `search_path`, view schemas, quoted names, `CONNECT BY`, re-created tables and CTEs of untraced statements; edge and warning sets and a bit-set `mark_used` (400 chained `CREATE TABLE … AS` statements: 11.5 s → 0.4 s in a debug build); the app traces on a blocking thread and reads bare names from the connection's default schema; fingerprints fold signs and `VALUES` rows; a `lineage` fuzz target and seeded invariants test.
 
-- **`* REPLACE`** (BigQuery, DuckDB, Snowflake, ClickHouse): `select * replace (email as name) from users` returns the emails as `name`, unmasked. `expand_star` ignores the wildcard's options: `REPLACE` expressions aren't traced, and `EXCLUDE` / `EXCEPT` columns are still drawn as flowing (that one only over-masks).
-- **`UNPIVOT` / `PIVOT`**: `select * from users unpivot (val for col in (email, name)) p` returns emails in `val`, unmasked. The source becomes a `Table` node named after its whole text (`users UNPIVOT(…) p`), which no rule matches, and the table under it (`users`) is not a node at all. The same node lands in `unknown_tables`, so "Check with database" searches the server for that text.
-- **Table functions over a column**: `select f.value from users u, lateral flatten(input => u.email) f` (Snowflake) and `… lateral string_to_table(u.email, '@') as g(v)` (Postgres) are unmasked: the function is a `Table` node with no link to its arguments. `UNNEST` is traced; other functions are not.
-- **Hive / Databricks `LATERAL VIEW`**: `select t.tag from users u lateral view explode(split(u.email, '@')) t as tag` is unmasked. `select.lateral_views` isn't read, so `t.tag` falls to the struct-access guess below.
-- **A partly traced expression**: `select o.id || email as x from orders o join users u on …` is unmasked. `email` can't be placed (two tables, columns unknown: a warning, no edge) but `o.id` is, so `x` has a source and the fallback never runs. Masking always passes `NoCatalog`, so every unqualified column in a join is in this case.
-- **Struct-access guess**: `alias.col` with an alias that is no source is read as field `col` of a column named `alias` (`resolve_source`), without a warning when a table with unknown columns can take it. A wrong trace instead of none.
+Left:
 
-Fix direction: lineage reports per output column whether every reference in it was placed (an `untraced` flag on `Column`), and `masked_columns` treats such a column like one with no source; `expand_star` honours `EXCLUDE` / `REPLACE` / `RENAME`; `PIVOT`, `UNPIVOT` and table functions keep an edge from the table or columns they read. Each needs a masked and an unmasked test in `pii.rs`.
-
-Wrong or missing lineage (the diagram):
-
-- **Column lists cut the chain**: `with c(a, b) as (select id, name from users) select a from c`, `(select …) s(a, b)` and a recursive `r(n)`: `rename_columns` renames the node's columns but the edges into it keep the old names, so nothing feeds `c.a`.
-- **Columns named like a pseudo-column are dropped silently**: `select level, name from users` gives `level` no edge and no warning (`refs::PSEUDO` holds `level`, `user`, `rowid`, `rownum`, `sysdate`… for every dialect). They should be values only where the dialect has them and no source has such a column.
-- **Select aliases in `HAVING` / `QUALIFY`** (`having total > 5`, `qualify rn = 1`: MySQL, Snowflake, BigQuery, DuckDB): a false "Unknown column total", and no filter edge.
-- **`CROSS APPLY` / `OUTER APPLY`** subqueries don't see the tables before them (only `LATERAL` does): false "Unknown table or alias" warnings, and the correlation isn't a join edge.
-- **Lambda parameters** (`list_transform(tags, x -> x + 1)`) are read as columns: a false "Unknown column x".
-- **`INSERT` without a column list** into a table whose columns aren't known, or with more values than the table has columns, names the target columns after the query's (`insert into orders select …, id as extra` adds `extra` to `orders`, no warning).
-- **`BEGIN`, `COMMIT`, `SET`, `USE`** each warn "… statements are not traced yet; their tables are shown without columns". `USE` and `SET search_path` are not followed: later bare names resolve as before them.
-- **Bare names** resolve to the cached object with the shortest schema id (`Workspace::meta_get`), not the session's schema; inside a view's definition they should resolve from the view's schema.
-- **Case**: `"Orders"` and `orders` are one table node, and `"U"` and `"u"` one alias.
-- `CONNECT BY` / `START WITH` columns aren't marked used. A table dropped and created again keeps the edges of its first version. `other()` lists the CTE names of an untraced statement as tables. `Refs::window` is set and never read.
-
-Cost:
-
-- **Quadratic in edges**: `Builder::edge` scans every edge for a duplicate, `add_out` and `warn` scan too. 400 `create table … as select *` statements over 30 columns (24,000 edges) take 13 s in a debug build; four CTEs over a 1,500-column table 0.6 s. Keep a set of edge keys.
-- The app runs `analyze` on the async runtime (up to ten times per "Check with database"), and history learning runs `join_pairs` once per entry: neither is bounded or moved to a blocking thread.
-- `fingerprint`: `a = -1` and `a = 1` differ (the sign is a token), and `VALUES (…), (…)` differs by row count, so the same query with other values can count as new.
-- No fuzz target or corpus (the splitter and classifier have both).
+- **Catalog case**: the explorer cache matches table names case-insensitively (`meta_get`, `tables_named`), so on Postgres, Oracle and Snowflake a cached `"Orders"` and `orders` can still be read as one table's columns. Lineage keeps them apart only when neither is cached.
+- **Database-level `USE`** (SQL Server, Snowflake's `USE db`) doesn't change where bare names are looked up: the schema inside the new database isn't known without the server.
+- **`* ILIKE 'pattern'`** (Snowflake) keeps every column of the source: only over-masks.
+- `add_out` compares each new output name with the node's others (four CTEs over a 1,500-column table: 0.3 s in a debug build).
 
 ## Connector core (review of 2026-11-12; see [CONNECTOR_CORE.md](CONNECTOR_CORE.md))
 

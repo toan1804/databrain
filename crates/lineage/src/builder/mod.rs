@@ -44,6 +44,12 @@ fn build(sql: &str, kind: ConnectorKind, catalog: &dyn Catalog) -> (Lineage, Vec
         joins: vec![],
         clause: 0,
         uses: Default::default(),
+        edge_keys: Default::default(),
+        warned: Default::default(),
+        missed: false,
+        search: vec![],
+        view_schema: vec![],
+        untraced_nodes: Default::default(),
     };
     let spans = split_statements(sql, kind);
     let many = spans.len() > 1;
@@ -110,6 +116,39 @@ struct Builder<'a> {
     /// Columns the SQL names itself (node, column): where [`Builder::mark_used`] starts.
     /// (node, column, statement).
     uses: std::collections::HashSet<(usize, String, usize)>,
+    /// Every edge's key, so adding one doesn't scan them all.
+    edge_keys: std::collections::HashSet<EdgeKey>,
+    /// Messages already warned about.
+    warned: std::collections::HashSet<String>,
+    /// Set when a reference couldn't be placed (or was guessed): the column
+    /// being built is [`Column::untraced`].
+    missed: bool,
+    /// Schemas a bare table name is looked up in first, set by `USE` and
+    /// `SET search_path` (each one the name's parts before the table).
+    search: Vec<Vec<String>>,
+    /// The schema of each view whose definition is being traced: bare names
+    /// there are the view's schema's.
+    view_schema: Vec<Vec<String>>,
+    /// Nodes with open columns that couldn't be fully traced (a table
+    /// function reading a name it couldn't place): every column the SQL
+    /// names on them is [`Column::untraced`].
+    untraced_nodes: std::collections::HashSet<usize>,
+}
+
+/// See [`Builder::fold`].
+pub(super) fn fold_ident(kind: ConnectorKind, i: &Ident) -> String {
+    match kind {
+        ConnectorKind::Clickhouse => i.value.clone(),
+        ConnectorKind::Postgres if i.quote_style.is_some() && i.value != i.value.to_lowercase() => format!("\"{}\"", i.value),
+        ConnectorKind::Oracle | ConnectorKind::Snowflake if i.quote_style.is_some() && i.value != i.value.to_uppercase() => format!("\"{}\"", i.value),
+        _ => i.value.to_lowercase(),
+    }
+}
+
+type EdgeKey = (String, Option<String>, String, Option<String>, EdgeKind);
+
+fn edge_key(e: &Edge) -> EdgeKey {
+    (e.from.clone(), e.from_column.clone(), e.to.clone(), e.to_column.clone(), e.kind)
 }
 
 impl<'a> Builder<'a> {
@@ -135,7 +174,7 @@ impl<'a> Builder<'a> {
     }
 
     fn warn(&mut self, message: String, span: Option<Range>) {
-        if !self.g.warnings.iter().any(|w| w.message == message) {
+        if self.warned.insert(message.clone()) {
             self.g.warnings.push(Warning { message, span });
         }
     }
@@ -159,19 +198,80 @@ impl<'a> Builder<'a> {
         i
     }
 
+    /// The catalog's table for a name as written: a bare name is looked up
+    /// in the view's schema (inside a view's definition) or the schemas
+    /// `USE` / `SET search_path` chose first. With the qualified name it
+    /// was found by.
+    fn lookup(&self, parts: &[String]) -> (Option<CatalogTable>, Vec<String>) {
+        if parts.len() == 1 {
+            let chosen: &[Vec<String>] = if self.in_view > 0 { self.view_schema.last().map(std::slice::from_ref).unwrap_or_default() } else { &self.search };
+            let prefixes: Vec<&Vec<String>> = chosen.iter().filter(|p| !p.is_empty()).collect();
+            for prefix in &prefixes {
+                let full: Vec<String> = prefix.iter().chain(parts).cloned().collect();
+                if let Some(t) = self.cat.table(&full) {
+                    return (Some(t), full);
+                }
+            }
+            // Not cached there: still the chosen schema's table, not one of
+            // the same name elsewhere.
+            if let Some(prefix) = prefixes.first() {
+                return (None, prefix.iter().chain(parts).cloned().collect());
+            }
+        }
+        (self.cat.table(parts), parts.to_vec())
+    }
+
+    /// One part of a name as the dialect compares it: unquoted names fold
+    /// to lower case; quoted ones keep their case where the dialect does
+    /// (`"Orders"` is not `orders` on Postgres, Oracle and Snowflake; on
+    /// ClickHouse every name keeps it), marked so they can't meet a folded one.
+    pub(super) fn fold(&self, i: &Ident) -> String {
+        fold_ident(self.kind, i)
+    }
+
+    /// The name a table is referred to by in a statement: its alias, else its name's last part.
+    pub(super) fn alias_key(&self, alias: &Option<TableAlias>, name: &ObjectName) -> String {
+        alias.as_ref().map(|a| self.fold(&a.name)).unwrap_or_else(|| self.fold_name(name).last().cloned().unwrap_or_default())
+    }
+
+    pub(super) fn fold_name(&self, name: &ObjectName) -> Vec<String> {
+        name.0
+            .iter()
+            .map(|p| match p {
+                sqlparser::ast::ObjectNamePart::Identifier(i) => self.fold(i),
+                other => other.to_string().to_lowercase(),
+            })
+            .collect()
+    }
+
+    /// The key of the table node for `name` (see [`Self::table_node`]).
+    fn table_key(&self, name: &ObjectName) -> String {
+        let (found, full) = self.lookup(&name_parts(name));
+        match found {
+            Some(t) => t.name.to_lowercase(),
+            None if full.len() > name.0.len() => {
+                let mut k: Vec<String> = full[..full.len() - 1].iter().map(|p| p.to_lowercase()).collect();
+                k.extend(self.fold_name(name));
+                k.join(".")
+            }
+            None => self.fold_name(name).join("."),
+        }
+    }
+
     fn table_node(&mut self, name: &ObjectName) -> usize {
         let parts = name_parts(name);
-        let found = self.cat.table(&parts);
-        let display = found.as_ref().map(|t| t.name.clone()).unwrap_or_else(|| parts.join("."));
-        let key = display.to_lowercase();
+        let (found, full) = self.lookup(&parts);
+        let display = found.as_ref().map(|t| t.name.clone()).unwrap_or_else(|| full.join("."));
+        let key = self.table_key(name);
         if let Some(&i) = self.tables.get(&key) {
             return i;
         }
+        let parts = full;
         // A table the script writes, named once with its schema and once
         // without (`create table tmp …; select … from public.tmp`): one node.
         // Not when the catalog knows the name (it is that table), and never
         // two different schemas.
-        let last = parts.last().map(|p| p.to_lowercase()).unwrap_or_default();
+        let last = key.rsplit('.').next().unwrap_or_default().to_string();
         let mut same: Vec<usize> = if found.is_some() {
             vec![]
         } else {
@@ -205,6 +305,19 @@ impl<'a> Builder<'a> {
         i
     }
 
+    /// Mark column `col` of `node` [`Column::untraced`].
+    fn set_untraced(&mut self, node: usize, col: &str) {
+        if let Some(i) = self.col_index(node, col) {
+            self.g.nodes[node].columns[i].untraced = true;
+        }
+    }
+
+    /// Columns of this node are only known by the names the SQL uses (a
+    /// database table not in the catalog, a table function).
+    fn open_columns(&self, node: usize) -> bool {
+        !self.g.nodes[node].columns_known
+    }
+
     fn col_index(&self, node: usize, name: &str) -> Option<usize> {
         let cols = &self.g.nodes[node].columns;
         cols.iter().position(|c| c.name == name).or_else(|| cols.iter().position(|c| c.name.eq_ignore_ascii_case(name)))
@@ -226,7 +339,9 @@ impl<'a> Builder<'a> {
         match self.col_index(node, name) {
             Some(i) => self.g.nodes[node].columns[i].name.clone(),
             None => {
-                self.g.nodes[node].columns.push(Column::named(name));
+                let mut c = Column::named(name);
+                c.untraced = self.untraced_nodes.contains(&node);
+                self.g.nodes[node].columns.push(c);
                 name.to_string()
             }
         }
@@ -240,24 +355,69 @@ impl<'a> Builder<'a> {
             n = format!("{name}_{k}");
             k += 1;
         }
-        self.g.nodes[node].columns.push(Column { name: n.clone(), span, expr, used: false, used_by: vec![] });
+        self.g.nodes[node].columns.push(Column { name: n.clone(), span, expr, used: false, used_by: vec![], untraced: false });
         n
     }
 
     fn edge(&mut self, from: usize, from_column: Option<String>, to: usize, to_column: Option<String>, kind: EdgeKind, span: Option<Range>) {
         let (from, to) = (self.g.nodes[from].id.clone(), self.g.nodes[to].id.clone());
-        let dup = self.g.edges.iter().any(|e| e.from == from && e.from_column == from_column && e.to == to && e.to_column == to_column && e.kind == kind);
-        if !dup {
-            self.g.edges.push(Edge { from, from_column, to, to_column, kind, span, detail: None, statement: Some(self.stmt) });
+        let e = Edge { from, from_column, to, to_column, kind, span, detail: None, statement: Some(self.stmt) };
+        if self.edge_keys.insert(edge_key(&e)) {
+            self.g.edges.push(e);
         }
     }
 
+    /// Rewrite edges in place (`f` returns whether it changed one), keeping the keys in step.
+    fn rewrite_edges(&mut self, mut f: impl FnMut(&mut Edge) -> bool) {
+        let mut changed = false;
+        for e in &mut self.g.edges {
+            changed |= f(e);
+        }
+        if changed {
+            // Two edges may be one now.
+            self.edge_keys.clear();
+            let edges = std::mem::take(&mut self.g.edges);
+            for e in edges {
+                if self.edge_keys.insert(edge_key(&e)) {
+                    self.g.edges.push(e);
+                }
+            }
+        }
+    }
+
+    /// A column list (`c(a, b)`, `(…) s(a, b)`) names `node`'s columns in
+    /// order; the edges into and out of them follow.
     fn rename_columns(&mut self, node: usize, alias: &TableAlias) {
+        let id = self.g.nodes[node].id.clone();
+        let mut renamed: Vec<(String, String)> = Vec::new();
         for (i, c) in alias.columns.iter().enumerate() {
-            if let Some(col) = self.g.nodes[node].columns.get_mut(i) {
+            if let Some(col) = self.g.nodes[node].columns.get_mut(i)
+                && col.name != c.name.value
+            {
+                renamed.push((col.name.clone(), c.name.value.clone()));
                 col.name = c.name.value.clone();
             }
         }
+        if renamed.is_empty() {
+            return;
+        }
+        let new = |old: &str| renamed.iter().find(|(o, _)| o == old).map(|(_, n)| n.clone());
+        self.rewrite_edges(|e| {
+            let mut changed = false;
+            if e.to == id
+                && let Some(n) = e.to_column.as_deref().and_then(new)
+            {
+                e.to_column = Some(n);
+                changed = true;
+            }
+            if e.from == id
+                && let Some(n) = e.from_column.as_deref().and_then(new)
+            {
+                e.from_column = Some(n);
+                changed = true;
+            }
+            changed
+        });
     }
 
     /// The statement creates `t` with exactly these columns. Edges of an
@@ -281,44 +441,70 @@ impl<'a> Builder<'a> {
     /// Each column also lists the statements that use it ([`Column::used_by`]):
     /// those naming it, and those whose results or writes it feeds.
     fn mark_used(&mut self) {
-        use std::collections::{BTreeSet, HashSet};
+        // Each (node, column) gets the set of statements using it (a bit
+        // set); sets flow backwards along value edges until nothing changes.
+        // Every set only grows, so this ends, and a column is revisited only
+        // when new statements reach it (not once per statement).
         let index: HashMap<&str, usize> = self.g.nodes.iter().enumerate().map(|(i, n)| (n.id.as_str(), i)).collect();
-        let mut into: HashMap<(usize, &str), Vec<(usize, &str)>> = HashMap::new();
-        // (node, column, the statement it is used for).
-        let mut todo: Vec<(usize, String, usize)> = self.uses.iter().cloned().collect();
+        let words = self.g.statements.len().max(self.stmt + 1).div_ceil(64);
+        let mut ids: HashMap<(usize, String), usize> = HashMap::new();
+        let mut sets: Vec<Vec<u64>> = Vec::new();
+        let mut preds: Vec<Vec<usize>> = Vec::new();
+        let mut id = |n: usize, c: &str, sets: &mut Vec<Vec<u64>>, preds: &mut Vec<Vec<usize>>| -> usize {
+            *ids.entry((n, c.to_string())).or_insert_with(|| {
+                sets.push(vec![0; words]);
+                preds.push(vec![]);
+                sets.len() - 1
+            })
+        };
+        let set_bit = |set: &mut Vec<u64>, s: usize| set[s / 64] |= 1 << (s % 64);
+        for (n, c, s) in &self.uses {
+            let k = id(*n, c, &mut sets, &mut preds);
+            set_bit(&mut sets[k], *s);
+        }
         for e in &self.g.edges {
             let (Some(&f), Some(&t)) = (index.get(e.from.as_str()), index.get(e.to.as_str())) else { continue };
             let Some(fc) = e.from_column.as_deref() else { continue };
+            let from = id(f, fc, &mut sets, &mut preds);
             match e.to_column.as_deref() {
-                Some(tc) => into.entry((t, tc)).or_default().push((f, fc)),
-                None => todo.push((f, fc.to_string(), e.statement.unwrap_or(0))),
+                Some(tc) => {
+                    let to = id(t, tc, &mut sets, &mut preds);
+                    preds[to].push(from);
+                }
+                None => set_bit(&mut sets[from], e.statement.unwrap_or(0)),
             }
         }
         for (i, n) in self.g.nodes.iter().enumerate() {
             if n.kind == NodeKind::Result {
-                todo.extend(n.columns.iter().map(|c| (i, c.name.clone(), n.statement.unwrap_or(0))));
+                for c in &n.columns {
+                    let k = id(i, &c.name, &mut sets, &mut preds);
+                    set_bit(&mut sets[k], n.statement.unwrap_or(0));
+                }
             }
         }
-        let mut seen: HashSet<(usize, String, usize)> = HashSet::new();
-        let mut by: HashMap<(usize, String), BTreeSet<usize>> = HashMap::new();
+        let mut todo: Vec<usize> = (0..sets.len()).filter(|&k| sets[k].iter().any(|w| *w != 0)).collect();
         while let Some(k) = todo.pop() {
-            if seen.contains(&k) {
-                continue;
+            let from = sets[k].clone();
+            for &p in &preds[k] {
+                let mut changed = false;
+                for (w, bits) in sets[p].iter_mut().zip(&from) {
+                    changed |= *w | bits != *w;
+                    *w |= bits;
+                }
+                if changed {
+                    todo.push(p);
+                }
             }
-            if let Some(from) = into.get(&(k.0, k.1.as_str())) {
-                todo.extend(from.iter().map(|&(f, c)| (f, c.to_string(), k.2)));
-            }
-            by.entry((k.0, k.1.clone())).or_default().insert(k.2);
-            seen.insert(k);
         }
         let several = self.g.statements.len() > 1;
         for (i, n) in self.g.nodes.iter_mut().enumerate() {
             if n.kind == NodeKind::Table {
                 for c in &mut n.columns {
-                    let stmts = by.get(&(i, c.name.clone()));
-                    c.used = stmts.is_some();
+                    let set = ids.get(&(i, c.name.clone())).map(|&k| &sets[k]);
+                    let stmts: Vec<usize> = set.map(|s| (0..words * 64).filter(|b| s[b / 64] & (1 << (b % 64)) != 0).collect()).unwrap_or_default();
+                    c.used = !stmts.is_empty();
                     // Only scripts of several statements need to tell them apart.
-                    c.used_by = if several { stmts.map(|s| s.iter().copied().collect()).unwrap_or_default() } else { vec![] };
+                    c.used_by = if several { stmts } else { vec![] };
                 }
             }
         }
@@ -326,14 +512,20 @@ impl<'a> Builder<'a> {
 
     /// `CREATE … IF NOT EXISTS` of a table the catalog knows: it stays as it is.
     fn exists_already(&self, name: &ObjectName, if_not_exists: bool) -> bool {
-        if_not_exists && self.cat.table(&name_parts(name)).is_some()
+        if_not_exists && self.lookup(&name_parts(name)).0.is_some()
     }
 
     /// Edges added since `at` from a node into itself (`SET a = a + 1`,
     /// `WHERE` on the target's own columns): not lineage.
     fn drop_self_edges(&mut self, at: usize) {
-        let tail: Vec<Edge> = self.g.edges.drain(at..).filter(|e| e.from != e.to).collect();
-        self.g.edges.extend(tail);
+        let tail: Vec<Edge> = self.g.edges.drain(at..).collect();
+        for e in tail {
+            if e.from == e.to {
+                self.edge_keys.remove(&edge_key(&e));
+            } else {
+                self.g.edges.push(e);
+            }
+        }
     }
 
     /// A statement that does not parse: tables after FROM/JOIN/INTO/UPDATE/TABLE, without lineage.

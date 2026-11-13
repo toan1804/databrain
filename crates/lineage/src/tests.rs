@@ -559,3 +559,213 @@ fn columns_list_the_statements_that_use_them() {
     let g = run("select name from customers");
     assert!(g.nodes.iter().flat_map(|n| &n.columns).all(|c| c.used_by.is_empty()));
 }
+
+fn warnings(g: &Lineage) -> Vec<String> {
+    g.warnings.iter().map(|w| w.message.clone()).collect()
+}
+
+#[test]
+fn column_lists_rename_the_edges_too() {
+    let g = run("with c(a, b) as (select id, name from customers) select a from c");
+    assert!(edges(&g).contains(&"sales.customers.id -direct-> c.a".to_string()), "{:?}", edges(&g));
+    assert!(edges(&g).contains(&"c.a -direct-> Result.a".to_string()), "{:?}", edges(&g));
+    let g = run("select s.b from (select id, name from customers) s(a, b)");
+    assert!(edges(&g).contains(&"sales.customers.name -direct-> s.b".to_string()), "{:?}", edges(&g));
+    assert!(warnings(&g).is_empty(), "{:?}", warnings(&g));
+    let g = run("with recursive r(n) as (select id from orders union all select n + 1 from r where n < 5) select n from r");
+    assert!(warnings(&g).is_empty(), "{:?}", warnings(&g));
+    assert!(edges(&g).iter().any(|e| e.starts_with("sales.orders.id -direct->")), "{:?}", edges(&g));
+}
+
+#[test]
+fn pseudo_columns_are_values_only_where_the_dialect_has_them() {
+    // Postgres: `level` is a column, `user` the current user.
+    let g = analyze("select level, user from t", K::Postgres, &NoCatalog);
+    assert_eq!(edges(&g), ["t.level -direct-> Result.level"]);
+    // Oracle: both are values; CONNECT BY decides the rows.
+    let g = analyze("select level, name from t start with parent_id is null connect by prior id = parent_id", K::Oracle, &NoCatalog);
+    let e = edges(&g);
+    assert!(e.contains(&"t.name -direct-> Result.name".to_string()), "{e:?}");
+    assert!(!e.iter().any(|e| e.starts_with("t.level")), "{e:?}");
+    assert!(e.contains(&"t.id -filter-> Result".to_string()) && e.contains(&"t.parent_id -filter-> Result".to_string()), "{e:?}");
+    // SQLite's rowid is the row's key: a column.
+    let g = analyze("select rowid from t", K::Sqlite, &NoCatalog);
+    assert_eq!(edges(&g), ["t.rowid -direct-> Result.rowid"]);
+}
+
+#[test]
+fn select_aliases_in_having_and_qualify() {
+    let g = run("select customer_id, sum(amount) total from orders group by customer_id having total > 5");
+    assert!(warnings(&g).is_empty(), "{:?}", warnings(&g));
+    assert!(edges(&g).contains(&"sales.orders.amount -filter-> Result".to_string()), "{:?}", edges(&g));
+    let g = analyze("select id, row_number() over (partition by customer_id order by amount) rn from orders qualify rn = 1", K::Snowflake, &cat);
+    assert!(warnings(&g).is_empty(), "{:?}", warnings(&g));
+    // A real column of that name wins.
+    let g = run("select id as amount from orders having amount > 5");
+    assert!(edges(&g).contains(&"sales.orders.amount -filter-> Result".to_string()), "{:?}", edges(&g));
+    assert!(!edges(&g).contains(&"sales.orders.id -filter-> Result".to_string()), "{:?}", edges(&g));
+}
+
+#[test]
+fn apply_sees_the_tables_before_it() {
+    let g = analyze("select o.id, x.n from orders o cross apply (select count(*) n from customers c where c.id = o.customer_id) x", K::Mssql, &cat);
+    assert!(warnings(&g).is_empty(), "{:?}", warnings(&g));
+    assert!(edges(&g).contains(&"sales.orders.customer_id -filter-> x".to_string()), "{:?}", edges(&g));
+    // Without APPLY a derived table doesn't.
+    let g = analyze("select o.id from orders o cross join (select count(*) n from customers c where c.id = o.customer_id) x", K::Mssql, &cat);
+    assert!(!warnings(&g).is_empty());
+}
+
+#[test]
+fn lambda_parameters_are_not_columns() {
+    let g = analyze("select list_filter([1, 2], x -> x > amount) f from orders", K::Duckdb, &cat);
+    assert!(warnings(&g).is_empty(), "{:?}", warnings(&g));
+    assert_eq!(edges(&g), ["sales.orders.amount -transform-> Result.f"]);
+}
+
+#[test]
+fn insert_without_a_column_list() {
+    // Columns of the target unknown: into the table as a whole, with a warning.
+    let g = run("insert into archive select id, amount from orders");
+    let e = edges(&g);
+    assert!(e.contains(&"SELECT.id -direct-> archive".to_string()) && e.contains(&"SELECT.amount -direct-> archive".to_string()), "{e:?}");
+    assert!(g.nodes.iter().find(|n| n.name == "archive").unwrap().columns.is_empty());
+    assert!(warnings(&g).iter().any(|w| w.contains("archive")), "{:?}", warnings(&g));
+    // Known: by position; values beyond its columns are left out, with a warning.
+    let g = run("insert into customers select id, status, status, amount from orders");
+    let e = edges(&g);
+    assert!(e.contains(&"SELECT.status -direct-> sales.customers.name".to_string()), "{e:?}");
+    assert!(!e.iter().any(|e| e.contains("customers.amount")), "{e:?}");
+    assert!(warnings(&g).iter().any(|w| w.contains("4 values for 3 columns")), "{:?}", warnings(&g));
+    // A column list: those columns.
+    let g = run("insert into customers (name) select status from orders");
+    assert!(edges(&g).contains(&"SELECT.status -direct-> sales.customers.name".to_string()));
+    assert!(warnings(&g).is_empty(), "{:?}", warnings(&g));
+}
+
+/// Two schemas with an `orders` each: `hr.orders` is the one a bare name finds.
+fn two_schemas(parts: &[String]) -> Option<CatalogTable> {
+    let (schema, name) = match parts {
+        [n] => ("hr", n.to_lowercase()),
+        [s, n] => (s.as_str(), n.to_lowercase()),
+        _ => return None,
+    };
+    let cols: &[&str] = match (schema.to_lowercase().as_str(), name.as_str()) {
+        ("hr", "orders") => &["id", "salary"],
+        ("sales", "orders") => &["id", "amount"],
+        ("sales", "v") => &["id", "amount"],
+        _ => return None,
+    };
+    let view_sql = (name == "v").then(|| "create view v as select id, amount from orders".to_string());
+    Some(CatalogTable { name: format!("{}.{name}", schema.to_lowercase()), columns: cols.iter().map(|c| c.to_string()).collect(), view_sql })
+}
+
+#[test]
+fn use_and_search_path_choose_the_schema_of_bare_names() {
+    let tables = |g: &Lineage| g.nodes.iter().filter(|n| n.kind == NodeKind::Table).map(|n| n.name.clone()).collect::<Vec<_>>();
+    let g = analyze("select * from orders", K::Postgres, &two_schemas);
+    assert_eq!(tables(&g), ["hr.orders"]);
+    let g = analyze("set search_path to sales, public; select * from orders", K::Postgres, &two_schemas);
+    assert_eq!(tables(&g), ["sales.orders"]);
+    assert!(warnings(&g).is_empty(), "{:?}", warnings(&g));
+    assert_eq!(g.statements[0].kind, "session");
+    let g = analyze("use sales; select * from orders", K::Mysql, &two_schemas);
+    assert_eq!(tables(&g), ["sales.orders"]);
+    // A table the chosen schema doesn't have (in the cache) is still its.
+    let g = analyze("use sales; select * from lines", K::Mysql, &two_schemas);
+    assert_eq!(tables(&g), ["sales.lines"]);
+    // SQL Server's USE names a database: no schema chosen.
+    let g = analyze("use sales; select * from orders", K::Mssql, &two_schemas);
+    assert_eq!(tables(&g), ["hr.orders"]);
+    // A view's definition reads its own schema's tables.
+    let g = analyze("select amount from sales.v", K::Postgres, &two_schemas);
+    assert!(tables(&g).contains(&"sales.orders".to_string()), "{:?}", tables(&g));
+    assert!(!tables(&g).contains(&"hr.orders".to_string()), "{:?}", tables(&g));
+}
+
+#[test]
+fn session_statements_are_not_warned_about() {
+    let g = analyze("begin; set statement_timeout = 5; select id from orders; savepoint a; release savepoint a; commit", K::Postgres, &cat);
+    assert!(warnings(&g).is_empty(), "{:?}", warnings(&g));
+    assert_eq!(g.statements.iter().map(|s| s.kind.as_str()).collect::<Vec<_>>(), ["session", "session", "select", "session", "session", "session"]);
+    let g = analyze("start transaction; select id from orders; rollback", K::Mysql, &cat);
+    assert!(warnings(&g).is_empty(), "{:?}", warnings(&g));
+}
+
+#[test]
+fn quoted_names_keep_their_case_where_the_dialect_does() {
+    let tables = |g: &Lineage| g.nodes.iter().filter(|n| n.kind == NodeKind::Table).count();
+    // Postgres: "Orders" and orders are two tables; "orders" is orders.
+    assert_eq!(tables(&analyze(r#"select a.x, b.y from "Orders" a join orders b on a.id = b.id"#, K::Postgres, &NoCatalog)), 2);
+    assert_eq!(tables(&analyze(r#"select a.x, b.y from "orders" a join orders b on a.id = b.id"#, K::Postgres, &NoCatalog)), 1);
+    // Snowflake folds to upper case: "ORDERS" is orders.
+    assert_eq!(tables(&analyze(r#"select a.x, b.y from "ORDERS" a join orders b on a.id = b.id"#, K::Snowflake, &NoCatalog)), 1);
+    assert_eq!(tables(&analyze(r#"select a.x, b.y from "orders" a join orders b on a.id = b.id"#, K::Snowflake, &NoCatalog)), 2);
+    // MySQL: one table.
+    assert_eq!(tables(&analyze("select a.x, b.y from `Orders` a join orders b on a.id = b.id", K::Mysql, &NoCatalog)), 1);
+    // Aliases too: "U" is not u on Postgres (`u.id` can only be a guess: field `id` of a column `u`).
+    let untraced = |sql: &str| g_result(&analyze(sql, K::Postgres, &NoCatalog)).columns[0].untraced;
+    assert!(untraced(r#"select u.id from users "U""#));
+    assert!(!untraced(r#"select "U".id from users "U""#));
+    assert!(!untraced(r#"select u.id from users "u""#));
+}
+
+#[test]
+fn a_table_created_again_is_a_new_node() {
+    let g = run("create table t as select id from orders; drop table t; create table t as select name from customers; select * from t");
+    let ts: Vec<&Node> = g.nodes.iter().filter(|n| n.name == "t").collect();
+    assert_eq!(ts.len(), 2);
+    assert_eq!(ts[1].columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["name"]);
+    let result = g.nodes.iter().find(|n| n.kind == NodeKind::Result).unwrap();
+    assert_eq!(result.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["name"]);
+}
+
+#[test]
+fn ctes_of_an_untraced_statement_are_not_tables() {
+    let g = run("explain with x as (select id from orders) select * from x");
+    assert!(!g.nodes.iter().any(|n| n.name == "x"), "{:?}", g.nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+    assert!(!g.unknown_tables.contains(&"x".to_string()));
+}
+
+#[test]
+fn star_options() {
+    // Known columns: EXCLUDE drops, REPLACE computes, RENAME renames.
+    let g = analyze("select * exclude (status) replace (amount * 2 as amount) rename (id as order_id) from orders", K::Snowflake, &cat);
+    let result = g.nodes.iter().find(|n| n.kind == NodeKind::Result).unwrap();
+    assert_eq!(result.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["order_id", "customer_id", "amount", "created_at"]);
+    let e = edges(&g);
+    assert!(e.contains(&"sales.orders.amount -transform-> Result.amount".to_string()), "{e:?}");
+    assert!(e.contains(&"sales.orders.id -direct-> Result.order_id".to_string()), "{e:?}");
+    assert!(!e.iter().any(|e| e.contains("status")), "{e:?}");
+}
+
+#[test]
+fn table_functions_keep_an_edge_from_what_they_read() {
+    let g = analyze("select f.value from users u, lateral flatten(input => u.tags) f", K::Snowflake, &NoCatalog);
+    let e = edges(&g);
+    assert!(e.contains(&"users.tags -transform-> f".to_string()), "{e:?}");
+    assert!(g.unknown_tables == ["users"], "{:?}", g.unknown_tables);
+    let g = analyze("select * from orders unpivot (val for col in (amount, status)) p", K::Snowflake, &cat);
+    let e = edges(&g);
+    assert!(e.contains(&"sales.orders.amount -direct-> p.val".to_string()), "{e:?}");
+    assert!(g.unknown_tables.is_empty(), "{:?}", g.unknown_tables);
+}
+
+#[test]
+fn many_statements_stay_fast() {
+    // Every edge used to be compared with every other one.
+    let cols: Vec<String> = (0..30).map(|i| format!("c{i}")).collect();
+    let mut sql = format!("create table t0 as select {} from src;", cols.join(", "));
+    for i in 1..400 {
+        sql.push_str(&format!("create table t{i} as select * from t{};", i - 1));
+    }
+    let start = std::time::Instant::now();
+    let g = run(&sql);
+    // Each statement: the table into its SELECT, the SELECT into the new table.
+    assert_eq!(g.edges.len(), 400 * 30 * 2);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
+}
+
+fn g_result(g: &Lineage) -> &Node {
+    g.nodes.iter().find(|n| n.kind == NodeKind::Result).unwrap()
+}

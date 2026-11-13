@@ -62,9 +62,20 @@ pub fn like(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+/// Whether `schema` (`sales`, `db.sales`) is (the tail of) the connection's
+/// `defaults`: where an unqualified name is looked up.
+pub fn is_default_schema(defaults: &[Option<String>], schema: &str) -> bool {
+    let parts: Vec<&str> = schema.split('.').collect();
+    if parts.len() > defaults.len() {
+        return false;
+    }
+    let tail = &defaults[defaults.len() - parts.len()..];
+    parts.iter().zip(tail).all(|(p, d)| d.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(p)))
+}
+
 /// Levels of names on this engine (table included) and the defaults that
 /// complete an unqualified name, outermost first (`None` = not known).
-pub(crate) fn defaults(profile: &ConnectionProfile) -> Vec<Option<String>> {
+pub fn defaults(profile: &ConnectionProfile) -> Vec<Option<String>> {
     let c = &profile.config;
     let opt = |k: &str| c.opt(k).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
     let db = c.database.clone().filter(|d| !d.trim().is_empty());

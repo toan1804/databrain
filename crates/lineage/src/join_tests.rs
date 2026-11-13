@@ -229,4 +229,12 @@ fn fingerprint_ignores_values_spacing_comments_and_case() {
     assert_ne!(fingerprint(r#"select "Id" from t"#, K::Postgres), fingerprint("select id from t", K::Postgres));
     // Stable value (FNV-1a): must not change between releases.
     assert_eq!(fingerprint("select 1", K::Postgres), fingerprint("SELECT 2", K::Postgres));
+    // A sign belongs to its number; a minus after a value subtracts.
+    assert_eq!(fingerprint("select * from t where a = -1", K::Postgres), fingerprint("select * from t where a = 1", K::Postgres));
+    assert_eq!(fingerprint("select * from t where a in (-1, 2)", K::Postgres), fingerprint("select * from t where a in (3)", K::Postgres));
+    assert_ne!(fingerprint("select a - 1 from t", K::Postgres), fingerprint("select a from t", K::Postgres));
+    assert_ne!(fingerprint("select a - 1 from t", K::Postgres), fingerprint("select a 1 from t", K::Postgres));
+    // Any number of rows of literals.
+    assert_eq!(fingerprint("insert into t values (1, 'a'), (2, 'b'), (3, 'c')", K::Postgres), fingerprint("insert into t values (4, 'd')", K::Postgres));
+    assert_ne!(fingerprint("insert into t values (1), (now())", K::Postgres), fingerprint("insert into t values (1)", K::Postgres));
 }
