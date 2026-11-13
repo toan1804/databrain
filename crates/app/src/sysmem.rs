@@ -12,6 +12,50 @@ pub fn available() -> Option<u64> {
     imp::available()
 }
 
+/// (free, total) bytes of the disk holding `path` (an existing folder);
+/// free = what this user may still write.
+pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
+    disk::space(path)
+}
+
+// System calls with plain out-parameters; nothing is kept past the call.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod disk {
+    pub fn space(path: &std::path::Path) -> Option<(u64, u64)> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: zeroed POD struct filled by statvfs; `c` is a valid C string.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let unit = st.f_frsize as u64;
+        Some((st.f_bavail as u64 * unit, st.f_blocks as u64 * unit))
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod disk {
+    pub fn space(path: &std::path::Path) -> Option<(u64, u64)> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let (mut free, mut total) = (0u64, 0u64);
+        // SAFETY: `wide` is NUL-terminated; the out-parameters are valid u64s.
+        let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut()) };
+        (ok != 0).then_some((free, total))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod disk {
+    pub fn space(_path: &std::path::Path) -> Option<(u64, u64)> {
+        None
+    }
+}
+
 // System calls with plain out-parameters; nothing is kept past the call.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
@@ -117,6 +161,12 @@ mod tests {
             assert!(t > 256 << 20, "{t}");
             assert!(a > 0 && a <= t, "{a} of {t}");
         }
+    }
+
+    #[test]
+    fn reads_this_disk() {
+        let (free, total) = disk_space(&std::env::temp_dir()).expect("disk space");
+        assert!(total > 0 && free <= total, "{free} of {total}");
     }
 
     #[test]

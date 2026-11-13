@@ -466,3 +466,165 @@ async fn every_row_runs_a_cut_result_again() {
     assert!(e.message.contains("Only a query that reads"), "{}", e.message);
     assert!(run(&st, &duck, "select * from x").await.error.is_some(), "nothing ran");
 }
+
+/// A result larger than the memory it may keep continues on disk instead of
+/// being cut: every row stays, pages read from the files, results.<name>
+/// sees them all (exact decimals as DECIMAL), export and "Load into…" stream
+/// them, and freeing the result deletes its files.
+#[tokio::test(flavor = "multi_thread")]
+async fn results_larger_than_memory_continue_on_disk() {
+    use databrain_workspace::Origin;
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    let app_dir = tempfile::tempdir().unwrap();
+    api::set_results_spill(&st.engine, app_dir.path());
+    st.engine.outputs().set_budget(0); // the 16 MB floor: 8 MB per result
+    let duck = st.engine.results_connection().unwrap().id;
+    let n = 400_000;
+    let sql = format!("select i as id, md5(i::varchar) as s, (i / 100)::decimal(12,2) as amount from range({n}) t(i)");
+    let out = run_as(&st, &duck, &sql, None, Origin::User).await;
+    let info = out.result.clone().unwrap_or_else(|| panic!("{:?}", out.error));
+    assert!(!info.truncated && info.total_rows == n, "{} rows, truncated {}", info.total_rows, info.truncated);
+    assert!(info.on_disk && info.disk_bytes > 0 && info.bytes < 8 << 20, "{info:?}");
+    assert!(out.notices.iter().any(|m| m.contains("on disk")), "{:?}", out.notices);
+
+    // Any page, read from the files.
+    let page = api::fetch_page(&st, info.id.clone(), Default::default(), 350_000, 3).await.unwrap();
+    assert_eq!(page.rows.iter().map(|r| r[0].clone().unwrap()).collect::<Vec<_>>(), vec!["350000", "350001", "350002"]);
+    assert_eq!(page.row_ids, vec![350_000, 350_001, 350_002]);
+    // Sort, filter, find and statistics: over every row, out of memory.
+    use databrain_result_store::{ColumnFilter, FilterOp, SortKey, ViewSpec};
+    let sorted = ViewSpec { sort: vec![SortKey { column: 2, descending: true }, SortKey { column: 0, descending: false }], ..Default::default() };
+    let page = api::fetch_page(&st, info.id.clone(), sorted.clone(), 0, 3).await.unwrap();
+    assert_eq!(page.view_rows, n);
+    // amount = id / 100 (2 decimals): the largest are 3999.99 (399999), 3999.98 (399998)...
+    assert_eq!(page.rows.iter().map(|r| r[0].clone().unwrap()).collect::<Vec<_>>(), vec!["399999", "399998", "399997"]);
+    assert_eq!(page.row_ids, vec![399_999, 399_998, 399_997]);
+    let filtered =
+        ViewSpec { filters: vec![ColumnFilter { column: 0, op: FilterOp::Gte, value: "399990".into() }], quick_filter: Some("9".into()), ..Default::default() };
+    let page = api::fetch_page(&st, info.id.clone(), filtered.clone(), 0, 20).await.unwrap();
+    assert_eq!(page.view_rows, 10, "ids 399990..=399999 all contain a 9");
+    assert_eq!(page.row_ids.first(), Some(&399_990));
+    let found = api::find_in_result(&st, info.id.clone(), filtered, "39999".into(), Some(vec![0]), 100, false).await.unwrap();
+    assert_eq!(found.matches.len(), 10);
+    let stats = api::column_stats(&st, info.id.clone(), ViewSpec::default(), 0).await.unwrap();
+    assert_eq!((stats.count, stats.nulls, stats.distinct), (n as u64, 0, n as u64));
+    assert_eq!((stats.min.as_deref(), stats.max.as_deref()), (Some("0"), Some("399999")));
+    // Export of a sorted view: in that order.
+    let top = app_dir.path().join("top.csv");
+    api::export_result(
+        &st,
+        info.id.clone(),
+        sorted,
+        databrain_export::ExportOptions::new(databrain_export::ExportFormat::Csv),
+        top.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    assert!(std::fs::read_to_string(&top).unwrap().lines().nth(1).unwrap().starts_with("399999,"));
+
+    // results.<handle>: every row, the decimal as a number.
+    let handle = st.engine.outputs().by_result(&info.id).unwrap().handle;
+    let agg = run_as(&st, &duck, &format!("select count(*), sum(amount), typeof(amount) from results.{handle} group by 3"), None, Origin::User).await;
+    let agg = agg.result.unwrap_or_else(|| panic!("{:?}", agg.error));
+    let row = api::fetch_page(&st, agg.id, Default::default(), 0, 1).await.unwrap().rows.remove(0);
+    // `i / 100` is exact division in DuckDB: Σi / 100, a whole number here.
+    let expected_sum: i64 = (0..n as i64).sum::<i64>() / 100;
+    assert_eq!(row[0].as_deref(), Some(n.to_string().as_str()));
+    assert_eq!(row[1].as_deref().map(|s| s.trim_end_matches(".00")), Some(expected_sum.to_string().as_str()));
+    assert!(row[2].as_deref().unwrap().starts_with("DECIMAL"), "{row:?}");
+
+    // With masks (the assistant's statements): streamed in, the column hidden.
+    let masks = databrain_connector_core::external::OutputMasks(std::collections::HashMap::from([(info.id.clone(), vec!["s".to_string()])]));
+    let masked = st
+        .engine
+        .run_and_wait(
+            &st.hub,
+            RunRequest {
+                connection_id: duck.clone(),
+                tab_id: "masked".into(),
+                sql: format!("select count(*), count(distinct s), min(s) from results.{handle}"),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+                output_masks: Some(Arc::new(masks)),
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    let masked = masked.result.unwrap_or_else(|| panic!("{:?}", masked.error));
+    let row = api::fetch_page(&st, masked.id, Default::default(), 0, 1).await.unwrap().rows.remove(0);
+    assert_eq!(row, vec![Some(n.to_string()), Some("1".into()), Some("***".into())]);
+
+    // Export: every row, streamed.
+    let csv = app_dir.path().join("all.csv");
+    let wrote = api::export_result(
+        &st,
+        info.id.clone(),
+        Default::default(),
+        databrain_export::ExportOptions::new(databrain_export::ExportFormat::Csv),
+        csv.to_string_lossy().into_owned(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(wrote, n as u64);
+    assert_eq!(std::fs::read_to_string(&csv).unwrap().lines().count(), n + 1);
+
+    // Load into another connection: every row, streamed.
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
+    c.file_path = Some(dir.path().join("target.db").to_string_lossy().into_owned());
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "target".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    let target =
+        api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    let args = LoadResultArgs {
+        target_connection_id: target,
+        table: "big".into(),
+        mode: LoadMode::Append,
+        key_columns: vec![],
+        create_table: true,
+        confirmed: false,
+        every_row: None,
+    };
+    assert_eq!(api::load_result(&st, &info.id, args, "disk").await.unwrap().rows, n as u64);
+
+    // Freed: the files go too.
+    let spill_dir = st.engine.results().spill_dir(&info.id).unwrap();
+    assert!(spill_dir.is_dir());
+    assert!(api::release_result(&st, &info.id));
+    assert!(!spill_dir.exists(), "{}", spill_dir.display());
+}
+
+/// Folders left by a process that quit are deleted at start; a live
+/// process's folder (its lock held) is kept.
+#[test]
+fn stale_spill_folders_are_deleted_live_ones_kept() {
+    let base = tempfile::tempdir().unwrap();
+    let stale = base.path().join("results_spill").join("123-1");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("000000.parquet"), b"x").unwrap();
+    let live = databrain_result_store::ResultStore::new();
+    live.set_spill_root(base.path().join("results_spill"));
+    let live_dir = live.spill_root().unwrap();
+    assert!(!stale.exists(), "nobody held it");
+    let other = databrain_result_store::ResultStore::new();
+    other.set_spill_root(base.path().join("results_spill"));
+    assert!(live_dir.exists(), "held by the first store");
+    assert_ne!(other.spill_root().unwrap(), live_dir);
+}

@@ -3,7 +3,9 @@
 
 pub mod chart;
 mod decimal;
+mod disk_view;
 pub mod display;
+pub mod spill;
 pub mod view;
 mod wide;
 
@@ -32,6 +34,12 @@ pub enum Error {
     InvalidFilterValue(String),
     #[error("arrow: {0}")]
     Arrow(#[from] ArrowError),
+    /// Writing or reading the result's files on disk failed.
+    #[error("result on disk: {0}")]
+    Spill(String),
+    /// Needs every row in memory, and the result is on disk.
+    #[error("{0} isn't available yet for a result kept on disk (larger than memory)")]
+    OnDisk(&'static str),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -142,7 +150,40 @@ pub struct ResultInfo {
     pub complete: bool,
     /// Stopped at the row limit; more rows exist on the server.
     pub truncated: bool,
+    /// Bytes in memory.
     pub bytes: usize,
+    /// Rows past the memory a result may keep are on disk (read as they're
+    /// shown); `disk_bytes` of files.
+    pub on_disk: bool,
+    #[ts(type = "number")]
+    pub disk_bytes: u64,
+}
+
+/// A sort of a result on disk, done out of memory (by DuckDB in the app).
+#[derive(Debug, Clone)]
+pub struct SortJob {
+    /// Parquet files of the rows to keep: `__row_id` (UInt64) then the sort
+    /// keys `k0`, `k1`… as they're compared (exact decimals as bytes).
+    pub keys: Vec<std::path::PathBuf>,
+    /// The result's files and the first row of each.
+    pub data: Vec<(std::path::PathBuf, usize)>,
+    /// Per key: descending. Nulls always last; ties in result order.
+    pub descending: Vec<bool>,
+    /// Where to write the kept rows in order: the result's columns, then
+    /// `__row_id`, in row groups of [`spill::CHUNK_ROWS`].
+    pub out: std::path::PathBuf,
+}
+
+/// Sorts results that are on disk (see [`SortJob`]).
+pub trait DiskSorter: Send + Sync {
+    fn sort(&self, job: &SortJob) -> std::result::Result<(), String>;
+}
+
+/// The view (filters, sort) of a result on disk, kept on disk too: the
+/// result's columns plus `__row_id`.
+struct DiskView {
+    spec: ViewSpec,
+    rows: spill::Spill,
 }
 
 struct ViewCache {
@@ -164,6 +205,13 @@ pub struct ResultSet {
     display_cache: DisplayCache,
     /// Bytes per text/binary column before 64-bit offsets are used (tests lower it).
     wide_limit: usize,
+    /// Set once the result outgrew its memory: every row is there (the
+    /// in-memory batches moved in), `batches` stays empty.
+    spill: Option<spill::Spill>,
+    /// Writing to disk failed: no rows were added after it.
+    spill_error: Option<String>,
+    disk_view: Option<DiskView>,
+    sorter: Option<Arc<dyn DiskSorter>>,
 }
 
 impl ResultSet {
@@ -179,6 +227,10 @@ impl ResultSet {
             view_cache: None,
             display_cache: DisplayCache::default(),
             wide_limit: display::MAX_SMALL_BYTES,
+            spill: None,
+            spill_error: None,
+            disk_view: None,
+            sorter: None,
         }
     }
 
@@ -191,7 +243,15 @@ impl ResultSet {
     }
 
     pub fn push(&mut self, batch: RecordBatch) {
-        if batch.num_rows() == 0 {
+        if batch.num_rows() == 0 || self.spill_error.is_some() {
+            return;
+        }
+        if let Some(sp) = &mut self.spill {
+            if let Err(e) = sp.push(batch) {
+                self.spill_error = Some(e.to_string());
+                return;
+            }
+            self.total_rows = sp.rows();
             return;
         }
         self.total_rows += batch.num_rows();
@@ -200,15 +260,84 @@ impl ResultSet {
     }
 
     pub fn finish(&mut self, truncated: bool) {
+        if let Some(sp) = &mut self.spill
+            && let Err(e) = sp.finish()
+        {
+            self.spill_error = Some(e.to_string());
+        }
         self.complete = true;
         self.truncated = truncated;
     }
 
+    /// Keep the rows on disk in `dir` from now on: the rows so far move
+    /// there, and memory holds only a few pages. Fails (and changes nothing)
+    /// when the files can't be written.
+    pub fn spill_to(&mut self, dir: std::path::PathBuf) -> Result<()> {
+        if self.spill.is_some() {
+            return Ok(());
+        }
+        let mut sp = spill::Spill::create(dir, self.schema.clone())?;
+        // The narrow batches, not a combined one with 64-bit offsets.
+        let batches = if self.combined.is_some() && self.batches.len() == 1 {
+            self.view_batches(&ViewSpec::default(), spill::CHUNK_ROWS)?
+        } else {
+            std::mem::take(&mut self.batches)
+        };
+        for b in &batches {
+            sp.push(b.clone())?;
+        }
+        self.batches.clear();
+        self.combined = None;
+        self.view_cache = None;
+        self.display_cache = DisplayCache::default();
+        self.spill = Some(sp);
+        Ok(())
+    }
+
+    pub fn is_on_disk(&self) -> bool {
+        self.spill.is_some()
+    }
+
+    /// Why rows stopped being added (writing to disk failed).
+    pub fn spill_error(&self) -> Option<&str> {
+        self.spill_error.as_deref()
+    }
+
+    /// The schema SQL sees for a result on disk (see [`spill::Spill::sql_schema`]).
+    pub fn disk_sql_schema(&self) -> Option<SchemaRef> {
+        self.spill.as_ref().map(spill::Spill::sql_schema)
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// The result's files on disk (complete files only), in row order.
+    pub fn spill_files(&self) -> Option<Vec<std::path::PathBuf>> {
+        self.spill.as_ref().map(spill::Spill::files)
+    }
+
     pub fn memory_bytes(&self) -> usize {
+        if let Some(sp) = &self.spill {
+            return sp.memory_bytes();
+        }
         match &self.combined {
             Some(c) => databrain_connector_core::memory_size([c]),
             None => databrain_connector_core::memory_size(&self.batches),
         }
+    }
+
+    /// Every row of the view, a batch at a time (at most `chunk` rows, the
+    /// result's own types), without keeping them all: for exports and loads
+    /// of results on disk too (their view must be the plain result).
+    pub fn for_each_batch(&mut self, spec: &ViewSpec, chunk: usize, f: &mut dyn FnMut(RecordBatch) -> Result<()>) -> Result<()> {
+        if self.spill.is_some() {
+            return self.disk_for_each(spec, chunk, f);
+        }
+        for b in self.view_batches(spec, chunk)? {
+            f(b)?;
+        }
+        Ok(())
     }
 
     pub fn info(&self) -> ResultInfo {
@@ -219,6 +348,8 @@ impl ResultSet {
             complete: self.complete,
             truncated: self.truncated,
             bytes: self.memory_bytes(),
+            on_disk: self.spill.is_some(),
+            disk_bytes: self.spill.as_ref().map_or(0, spill::Spill::disk_bytes),
         }
     }
 
@@ -227,6 +358,9 @@ impl ResultSet {
     /// (`LargeUtf8`/`LargeBinary`); use [`ResultSet::view_batches`] for
     /// batches with the result's own types.
     pub fn combined(&mut self) -> Result<RecordBatch> {
+        if self.spill.is_some() {
+            return Err(Error::OnDisk("This"));
+        }
         if let Some(c) = &self.combined {
             return Ok(c.clone());
         }
@@ -244,6 +378,9 @@ impl ResultSet {
         if spec.is_identity() {
             return Ok(None);
         }
+        if self.spill.is_some() {
+            return Err(Error::OnDisk("Sorting and filtering"));
+        }
         if let Some(c) = &self.view_cache
             && &c.spec == spec
             && c.rows == self.total_rows
@@ -257,6 +394,9 @@ impl ResultSet {
     }
 
     pub fn view_len(&mut self, spec: &ViewSpec) -> Result<usize> {
+        if self.spill.is_some() && !spec.is_identity() {
+            return Ok(self.disk_view(spec)?.rows());
+        }
         Ok(match self.view_indices(spec)? {
             Some(i) => i.len(),
             None => self.total_rows,
@@ -331,6 +471,16 @@ impl ResultSet {
 
     /// Rows `[offset, offset+limit)` of the view as a batch plus original ids.
     pub fn view_slice(&mut self, spec: &ViewSpec, offset: usize, limit: usize) -> Result<(RecordBatch, Vec<u32>)> {
+        if self.spill.is_some() && !spec.is_identity() {
+            let schema = self.schema.clone();
+            let b = self.disk_view(spec)?.slice(offset, limit)?;
+            return disk_view::split_ids(&b, &schema);
+        }
+        if let Some(sp) = &mut self.spill {
+            let b = sp.slice(offset, limit)?;
+            let start = offset.min(sp.rows());
+            return Ok((b.clone(), (start as u32..(start + b.num_rows()) as u32).collect()));
+        }
         let batch = self.combined()?;
         let (b, ids) = match self.view_indices(spec)? {
             None => {
@@ -382,6 +532,9 @@ impl ResultSet {
         if query.is_empty() || self.total_rows == 0 {
             return Ok(FindResult { matches, truncated: false });
         }
+        if self.spill.is_some() {
+            return self.disk_find(spec, query, columns, limit, whole_word);
+        }
         let batch = self.combined()?;
         let idx = self.view_indices(spec)?;
         let pattern = format!("%{}%", view::like_escape(query));
@@ -429,6 +582,9 @@ impl ResultSet {
     pub fn column_stats(&mut self, spec: &ViewSpec, column: usize) -> Result<ColumnStats> {
         if column >= self.schema.fields().len() {
             return Err(Error::InvalidColumn(column));
+        }
+        if self.spill.is_some() {
+            return self.disk_column_stats(spec, column);
         }
         let n = self.view_len(spec)?;
         let (batch, _) = self.view_slice(spec, 0, n)?;
@@ -478,6 +634,10 @@ impl ResultSet {
     /// `chunk` rows each, always with the result's own column types: a chunk
     /// whose text passes 2 GiB is split further.
     pub fn view_batches(&mut self, spec: &ViewSpec, chunk: usize) -> Result<Vec<RecordBatch>> {
+        if self.spill.is_some() {
+            // Every row in memory is what spilling avoids: use for_each_batch.
+            return Err(Error::OnDisk("Reading every row at once"));
+        }
         let n = self.view_len(spec)?;
         let chunk = chunk.max(1);
         let mut out = Vec::with_capacity(n.div_ceil(chunk));
@@ -512,11 +672,63 @@ impl ResultSet {
 #[derive(Default)]
 pub struct ResultStore {
     results: Mutex<HashMap<String, Arc<Mutex<ResultSet>>>>,
+    /// Folder for results kept on disk (None: results never spill).
+    spill_root: Mutex<Option<std::path::PathBuf>>,
+    /// Held while this process uses its spill folder (see [`Self::set_spill_root`]).
+    spill_lock: Mutex<Option<std::fs::File>>,
+    sorter: Mutex<Option<Arc<dyn DiskSorter>>>,
 }
 
 impl ResultStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Keep results that outgrow memory under `base`, in a folder of this
+    /// process's own (the app, the jobs runner and the MCP server can run at
+    /// once). Each process holds a lock on its folder; folders nobody holds
+    /// (left by a process that quit or crashed) are deleted: results on disk
+    /// don't outlive their process.
+    pub fn set_spill_root(&self, base: std::path::PathBuf) {
+        let _ = std::fs::create_dir_all(&base);
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for e in entries.flatten() {
+                let dir = e.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let held = std::fs::OpenOptions::new().write(true).open(dir.join("lock")).is_ok_and(|f| f.try_lock().is_err());
+                if !held {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            }
+        }
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let mine = base.join(format!("{}-{nanos}", std::process::id()));
+        let lock = std::fs::create_dir_all(&mine).and_then(|_| std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(mine.join("lock")));
+        match lock.and_then(|f| f.lock().map(|_| f)) {
+            Ok(f) => {
+                *self.spill_lock.lock() = Some(f);
+                *self.spill_root.lock() = Some(mine);
+            }
+            // No folder of our own: results don't spill (they stop at memory).
+            Err(_) => *self.spill_root.lock() = None,
+        }
+    }
+
+    /// Sorts results on disk (DuckDB; without one they can't be sorted).
+    pub fn set_disk_sorter(&self, sorter: Option<Arc<dyn DiskSorter>>) {
+        *self.sorter.lock() = sorter;
+    }
+
+    pub fn spill_root(&self) -> Option<std::path::PathBuf> {
+        self.spill_root.lock().clone()
+    }
+
+    /// The folder for result `id`'s files (None when results don't spill).
+    pub fn spill_dir(&self, id: &str) -> Option<std::path::PathBuf> {
+        let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+        self.spill_root.lock().as_ref().map(|r| r.join(safe))
     }
 
     /// Insert a complete result (e.g. restored from a snapshot).
@@ -542,7 +754,9 @@ impl ResultStore {
 
     pub fn create(&self, id: impl Into<String>, schema: SchemaRef) -> Arc<Mutex<ResultSet>> {
         let id = id.into();
-        let rs = Arc::new(Mutex::new(ResultSet::new(id.clone(), schema)));
+        let mut set = ResultSet::new(id.clone(), schema);
+        set.sorter = self.sorter.lock().clone();
+        let rs = Arc::new(Mutex::new(set));
         self.results.lock().insert(id, rs.clone());
         rs
     }

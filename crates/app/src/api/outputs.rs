@@ -404,6 +404,21 @@ pub fn apply_results_memory_to(engine: &databrain_query_engine::QueryEngine) {
     databrain_connector_duckdb::set_memory_limit(total.map(|t| duckdb_memory_limit(t, budget, free_floor(Some(t)))));
 }
 
+/// Results larger than memory continue on disk in `<app dir>/results_spill`
+/// (this process's own folder), until the disk's free space drops below 5%
+/// of it, between 1 and 4 GB (a fuller disk is common: a tenth of a 1 TB disk
+/// would stop results with 90 GB free).
+pub fn set_results_spill(engine: &databrain_query_engine::QueryEngine, app_dir: &std::path::Path) {
+    let base = app_dir.join("results_spill");
+    engine.results().set_spill_root(base);
+    #[cfg(feature = "duckdb-engine")]
+    engine.results().set_disk_sorter(Some(Arc::new(DuckdbSorter)));
+    let total = crate::sysmem::disk_space(app_dir).map(|(_, t)| t);
+    let floor = total.map_or(1 << 30, |t| (t / 20).clamp(1 << 30, 4 << 30));
+    let at = app_dir.to_path_buf();
+    engine.outputs().set_free_disk_probe(Some(Arc::new(move || crate::sysmem::disk_space(&at).map(|(free, _)| free))), floor);
+}
+
 /// Where DuckDB spills work bigger than its memory: `<app dir>/duckdb_spill`.
 pub fn set_duckdb_spill_dir(app_dir: &std::path::Path) {
     #[cfg(feature = "duckdb-engine")]
@@ -442,4 +457,48 @@ pub fn set_results_memory(state: &AppState, mb: Option<u64>) -> Result<ResultsMe
     state.workspace.set_setting(RESULTS_MEMORY_SETTING, &mb.map_or(serde_json::Value::Null, |m| serde_json::json!(m)))?;
     apply_results_memory(state);
     Ok(results_memory(state))
+}
+
+/// Sorts results on disk with DuckDB, out of memory (its spill folder).
+#[cfg(feature = "duckdb-engine")]
+pub struct DuckdbSorter;
+
+#[cfg(feature = "duckdb-engine")]
+impl databrain_result_store::DiskSorter for DuckdbSorter {
+    fn sort(&self, job: &databrain_result_store::SortJob) -> std::result::Result<(), String> {
+        databrain_connector_duckdb::run_private(&sort_sql(job)).map_err(|e| e.to_string())
+    }
+}
+
+/// DuckDB SQL for a [`databrain_result_store::SortJob`]: the kept rows'
+/// keys joined to the result's rows (`__row_id` from each file's start and
+/// row number), in key order (nulls last, ties in result order), written as
+/// Parquet in row groups the result store pages by.
+pub fn sort_sql(job: &databrain_result_store::SortJob) -> String {
+    use databrain_connector_core::quote_literal;
+    let lit = |p: &std::path::Path| quote_literal(&p.to_string_lossy());
+    let list = |ps: &mut dyn Iterator<Item = &std::path::PathBuf>| ps.map(|p| lit(p)).collect::<Vec<_>>().join(", ");
+    let starts = job.data.iter().map(|(p, s)| format!("({}, {s})", lit(p))).collect::<Vec<_>>().join(", ");
+    let order = job
+        .descending
+        .iter()
+        .enumerate()
+        .map(|(i, d)| format!("k.k{i} {} NULLS LAST", if *d { "DESC" } else { "ASC" }))
+        .chain(std::iter::once("k.__row_id".to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SET preserve_insertion_order = true;\n\
+         COPY (\n\
+           WITH starts(f, s) AS (VALUES {starts}),\n\
+           d AS (SELECT p.* EXCLUDE (\"__databrain_file\", file_row_number), CAST(starts.s + p.file_row_number AS UBIGINT) AS __row_id\n\
+                 FROM read_parquet([{data}], filename = '__databrain_file', file_row_number = true) p JOIN starts ON p.\"__databrain_file\" = starts.f)\n\
+           SELECT d.* FROM read_parquet([{keys}]) k JOIN d ON d.__row_id = k.__row_id\n\
+           ORDER BY {order}\n\
+         ) TO {out} (FORMAT parquet, ROW_GROUP_SIZE {rg}, COMPRESSION zstd)",
+        data = list(&mut job.data.iter().map(|(p, _)| p)),
+        keys = list(&mut job.keys.iter()),
+        out = lit(&job.out),
+        rg = databrain_result_store::spill::CHUNK_ROWS,
+    )
 }

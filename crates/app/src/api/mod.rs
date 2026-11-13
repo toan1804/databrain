@@ -10,7 +10,7 @@ use std::sync::Arc;
 use databrain_auth::{SecretRef, SecretStore};
 use databrain_connector_core::sql::{split_statements, statement_at};
 use databrain_connector_core::{ConnectionConfig, ConnectorInfo, ConnectorKind, ConnectorRegistry, DbObject, ObjectDetail, SchemaInfo};
-use databrain_export::{ExportOptions, export_file, export_to_string};
+use databrain_export::{ExportOptions, export_to_string};
 use databrain_query_engine::{EngineError, EventHub, EventSink, QueryEngine, Result, RunRequest, RunResponse, TestResult};
 use databrain_result_store::{ColumnStats, FindResult, Page, ResultInfo, ResultStore, ViewSpec};
 use databrain_workspace::{ConnectionProfile, Folder, FolderKind, HistoryEntry, HistoryQuery, SavedQuery, TabState, Workspace};

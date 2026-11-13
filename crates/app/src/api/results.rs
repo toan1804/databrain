@@ -53,11 +53,24 @@ pub async fn export_result(state: &AppState, result_id: String, view: ViewSpec, 
     }
     let rs = state.results().get(&result_id)?;
     blocking(move || {
-        let (schema, batches) = {
-            let mut g = rs.lock();
-            (g.schema(), g.view_batches(&view, 10_000)?)
-        };
-        write_export(&path, schema, &batches, options)
+        // Written a batch at a time: a result on disk is never read whole.
+        let named = |e: databrain_export::ExportError| EngineError::new("invalid", format!("{}: {e}", path.display()));
+        let mut g = rs.lock();
+        let mut w = databrain_export::FileWriter::create(&path, g.schema(), options).map_err(named)?;
+        let mut failed = None;
+        let r = g.for_each_batch(&view, 10_000, &mut |b| {
+            w.write(&b).map_err(|e| {
+                let msg = e.to_string();
+                failed = Some(e);
+                databrain_result_store::Error::Spill(msg)
+            })
+        });
+        drop(g);
+        match (r, failed) {
+            (_, Some(e)) => Err(named(e)),
+            (Err(e), None) => Err(e.into()),
+            (Ok(()), None) => w.finish().map_err(named),
+        }
     })
     .await
 }
@@ -82,17 +95,6 @@ pub async fn export_full_result(state: &AppState, result_id: &str, options: Expo
         ui.emit(EXPORT_EVENT, v);
     };
     state.engine.export_query(export_id, &o.connection_id, Some(o.session()), &o.sql, &path, options, &progress).await
-}
-
-fn write_export(
-    path: &Path,
-    schema: databrain_connector_core::arrow::datatypes::SchemaRef,
-    batches: &[databrain_connector_core::arrow::array::RecordBatch],
-    options: ExportOptions,
-) -> Result<u64> {
-    // Written to a new temp file beside it and renamed (see FileWriter), so a
-    // failed export never leaves a half-written file under the chosen name.
-    export_file(path, schema, batches, options).map_err(|e| EngineError::new("invalid", format!("{}: {e}", path.display())))
 }
 
 /// Serialize rows `[offset, offset+limit)` of the view (optionally a subset of

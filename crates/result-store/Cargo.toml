@@ -12,9 +12,12 @@ workspace = true
 [dependencies]
 databrain-connector-core = { version = "0.4.1", path = "../connector-core" }
 parking_lot = "0.12.5"
+# Same version and features as the export crate: no new code in the app.
+parquet = { version = "59.3.0", default-features = false, features = ["arrow", "zstd"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
 ts-rs = { version = "11.1", features = ["serde-json-impl", "no-serde-warnings"] }
 
 [dev-dependencies]
 serde_json = "1.0.151"
+tempfile = "3.27.0"

@@ -5,4 +5,13 @@ export type ResultInfo = { id: string, columns: Array<ColumnMeta>, total_rows: n
 /**
  * Stopped at the row limit; more rows exist on the server.
  */
-truncated: boolean, bytes: number, };
+truncated: boolean, 
+/**
+ * Bytes in memory.
+ */
+bytes: number, 
+/**
+ * Rows past the memory a result may keep are on disk (read as they're
+ * shown); `disk_bytes` of files.
+ */
+on_disk: boolean, disk_bytes: number, };

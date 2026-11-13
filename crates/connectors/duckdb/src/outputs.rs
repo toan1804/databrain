@@ -2,7 +2,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use databrain_connector_core::external::{ExternalTablesSlot, OutputMasks, RESULTS_SCHEMA, referenced_results};
-use databrain_connector_core::{ColumnInfo, ConnectorError, ConnectorKind, DbObject, ObjectKind, Result, TableColumns, quote_ident};
+use databrain_connector_core::{ColumnInfo, ConnectorError, ConnectorKind, DbObject, ObjectKind, Result, TableColumns, quote_ident, quote_literal};
 
 use crate::database::Loaded;
 use crate::error::map_err;
@@ -47,6 +47,7 @@ impl DuckSession {
 /// sensitive columns masked. A database file's instance is shared with the
 /// user's sessions (`shared`), whose `results` tables a masked load would
 /// replace, so masked outputs are refused there.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_outputs(
     conn: &duckdb::Connection,
     sql: &str,
@@ -54,6 +55,7 @@ pub(crate) fn load_outputs(
     loaded: &Loaded,
     masks: Option<&OutputMasks>,
     shared: bool,
+    sandboxed: bool,
 ) -> Result<Vec<String>> {
     let names = referenced_results(sql);
     if names.is_empty() {
@@ -100,6 +102,53 @@ pub(crate) fn load_outputs(
         if !attached {
             conn.execute_batch(&format!("ATTACH ':memory:' AS {RESULTS_SCHEMA}")).map_err(map_err)?;
         }
+        let table = quote_ident(ConnectorKind::Duckdb, &name);
+        // Rows on disk: a view over the files where the session may read
+        // them and nothing is masked; otherwise streamed in (masked).
+        if !t.files.is_empty() {
+            let drop = drop_existing(conn, &name)?;
+            if !sandboxed && !t.hide.iter().any(|h| *h) {
+                let list = t.files.iter().map(|f| quote_literal(&f.to_string_lossy())).collect::<Vec<_>>().join(", ");
+                // Exact decimals are text in the files: the SQL type the output has.
+                let cols = normalize_schema(&t.schema)
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        let c = quote_ident(ConnectorKind::Duckdb, f.name());
+                        match f.data_type() {
+                            Dt::Decimal128(..) | Dt::Float64 => format!("CAST({c} AS {}) AS {c}", duck_type(f.data_type())),
+                            _ => c,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                conn.execute_batch(&format!("{drop} CREATE VIEW {RESULTS_SCHEMA}.main.{table} AS SELECT {cols} FROM read_parquet([{list}])"))
+                    .map_err(map_err)?;
+            } else {
+                let schema = normalize_schema(&t.schema);
+                let cols = schema
+                    .fields()
+                    .iter()
+                    .map(|f| format!("{} {}", quote_ident(ConnectorKind::Duckdb, f.name()), duck_type(f.data_type())))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                conn.execute_batch(&format!("{drop} CREATE TABLE {RESULTS_SCHEMA}.main.{table} ({cols})")).map_err(map_err)?;
+                let mut app = conn.appender_to_catalog_and_db(&name, RESULTS_SCHEMA, "main").map_err(map_err)?;
+                tables
+                    .for_each_batch(&name, &mut |b| {
+                        let b = databrain_connector_core::external::mask_batch(&b, &t.hide)?;
+                        let b = normalize_for_duckdb(&b).map_err(|e| e.to_string())?;
+                        if b.num_rows() > 0 {
+                            app.append_record_batch(to_arrow58(&b).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                        }
+                        Ok(())
+                    })
+                    .map_err(ConnectorError::query)?;
+                app.flush().map_err(map_err)?;
+            }
+            loaded.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?.insert(key, t.version_key);
+            continue;
+        }
         let batches: Vec<_> = t.batches.iter().map(normalize_for_duckdb).collect::<Result<_>>()?;
         let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| normalize_schema(&t.schema));
         let cols = schema
@@ -108,8 +157,8 @@ pub(crate) fn load_outputs(
             .map(|f| format!("{} {}", quote_ident(ConnectorKind::Duckdb, f.name()), duck_type(f.data_type())))
             .collect::<Vec<_>>()
             .join(", ");
-        let table = quote_ident(ConnectorKind::Duckdb, &name);
-        conn.execute_batch(&format!("CREATE OR REPLACE TABLE {RESULTS_SCHEMA}.main.{table} ({cols})")).map_err(map_err)?;
+        let drop = drop_existing(conn, &name)?;
+        conn.execute_batch(&format!("{drop} CREATE TABLE {RESULTS_SCHEMA}.main.{table} ({cols})")).map_err(map_err)?;
         {
             let mut app = conn.appender_to_catalog_and_db(&name, RESULTS_SCHEMA, "main").map_err(map_err)?;
             for b in &batches {
@@ -122,6 +171,20 @@ pub(crate) fn load_outputs(
         loaded.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?.insert(key, t.version_key);
     }
     Ok(notices)
+}
+
+/// SQL that drops what `results.<name>` is now (a table, or a view over an
+/// output's files): DuckDB refuses `DROP VIEW` of a table, even `IF EXISTS`.
+fn drop_existing(conn: &duckdb::Connection, name: &str) -> Result<String> {
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_views() WHERE database_name = 'results' AND lower(view_name) = lower(?1)) THEN 'VIEW' \
+             WHEN EXISTS (SELECT 1 FROM duckdb_tables() WHERE database_name = 'results' AND lower(table_name) = lower(?1)) THEN 'TABLE' END",
+            [name],
+            |r| r.get(0),
+        )
+        .map_err(map_err)?;
+    Ok(kind.map_or_else(String::new, |k| format!("DROP {k} {RESULTS_SCHEMA}.main.{};", quote_ident(ConnectorKind::Duckdb, name))))
 }
 
 use databrain_connector_core::arrow::array::RecordBatch as Batch59;
@@ -248,6 +311,8 @@ mod tests {
                 schema,
                 batches: vec![batch],
                 notice: Some("capped".into()),
+                files: vec![],
+                hide: vec![],
             })
         }
         fn names(&self) -> Vec<String> {

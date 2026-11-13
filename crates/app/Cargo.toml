@@ -79,7 +79,7 @@ ts-rs = { version = "11.1", features = ["serde-json-impl", "no-serde-warnings"] 
 # Linux: build OpenSSL from source and link it statically, so the binary
 # does not depend on the distribution's libssl version.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59.0", features = ["Win32_System_Console", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59.0", features = ["Win32_System_Console", "Win32_System_SystemInformation", "Win32_Storage_FileSystem"] }
 
 # Memory figures for the results budget (sysmem.rs); already in Cargo.lock.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -87,6 +87,8 @@ libc = "0.2.189"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl = { version = "0.10.81", features = ["vendored"] }
+# Free disk space for results kept on disk (sysmem.rs); already in Cargo.lock.
+libc = "0.2.189"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -201,6 +201,7 @@ pub struct OutputRegistry {
     snapshot_dir: Mutex<Option<PathBuf>>,
     budget: Mutex<usize>,
     free: Mutex<Option<FreeCheck>>,
+    disk: Mutex<Option<FreeCheck>>,
 }
 
 /// Name rules: identifier-like, not `r<digits>`, no `__` (version suffix).
@@ -232,6 +233,7 @@ impl OutputRegistry {
             snapshot_dir: Mutex::new(None),
             budget: Mutex::new(DEFAULT_BUDGET),
             free: Mutex::new(None),
+            disk: Mutex::new(None),
         })
     }
 
@@ -256,10 +258,25 @@ impl OutputRegistry {
         *self.free.lock() = probe.map(|probe| FreeCheck { probe, floor, last: None });
     }
 
+    /// Stop writing a result to disk when the free space where results
+    /// spill (read by `probe`) drops below `floor` bytes; None: no check.
+    pub fn set_free_disk_probe(&self, probe: Option<FreeMemoryProbe>, floor: u64) {
+        *self.disk.lock() = probe.map(|probe| FreeCheck { probe, floor, last: None });
+    }
+
+    /// Free disk space where results spill, when below the floor.
+    pub fn low_disk(&self) -> Option<u64> {
+        Self::check(&self.disk)
+    }
+
     /// The computer's free memory when it is below the floor (read at most
     /// every 200 ms; between reads the last answer holds).
     pub fn low_memory(&self) -> Option<u64> {
-        let mut g = self.free.lock();
+        Self::check(&self.free)
+    }
+
+    fn check(slot: &Mutex<Option<FreeCheck>>) -> Option<u64> {
+        let mut g = slot.lock();
         let c = g.as_mut()?;
         if let Some((at, low)) = c.last
             && at.elapsed() < FREE_CHECK_EVERY
@@ -710,6 +727,9 @@ impl OutputRegistry {
                 let existed = path.exists();
                 let save = || -> Result<()> {
                     let rs = self.results.get(&info.result_id).map_err(|e| EngineError::new("not_found", e.to_string()))?;
+                    if rs.lock().is_on_disk() {
+                        return Err(EngineError::new("invalid", "A result larger than memory (its rows are on disk) can't be pinned; export it to keep it."));
+                    }
                     let (schema, batches) = {
                         let mut g = rs.lock();
                         (g.schema(), g.view_batches(&ViewSpec::default(), SNAPSHOT_CHUNK).map_err(|e| EngineError::new("internal", e.to_string()))?)
@@ -913,6 +933,19 @@ impl ExternalTables for OutputTables {
     fn resolve(&self, name: &str) -> std::result::Result<ExternalTable, String> {
         let o = self.0.ensure_loaded(name).map_err(|e| e.message)?;
         let rs = self.0.results.get(&o.result_id).map_err(|e| e.to_string())?;
+        // Larger than memory: its Parquet files (read, or streamed in).
+        let disk = {
+            let g = rs.lock();
+            match (g.spill_files(), g.disk_sql_schema()) {
+                (Some(files), Some(schema)) if g.is_complete() => Some((files, schema)),
+                (Some(_), _) => return Err(format!("results.{name} is still loading; run this again when its query has finished")),
+                _ => None,
+            }
+        };
+        if let Some((files, schema)) = disk {
+            let notice = o.truncated.then(|| format!("results.{name} ({}) holds only the first {} rows — totals over it may be incomplete.", o.handle, o.rows));
+            return Ok(ExternalTable { name: name.to_string(), version_key: o.result_id, schema, batches: vec![], notice, files, hide: vec![] });
+        }
         // Chunks with the result's own types (a single combined batch can need
         // 64-bit offsets, which DuckDB's appender would cast back and overflow).
         let (schema, chunks) = {
@@ -928,7 +961,31 @@ impl ExternalTables for OutputTables {
                 o.row_limit.map(|l| format!(" (row limit {l})")).unwrap_or_default()
             )
         });
-        Ok(ExternalTable { name: name.to_string(), version_key: o.result_id, schema, batches, notice })
+        Ok(ExternalTable { name: name.to_string(), version_key: o.result_id, schema, batches, notice, files: vec![], hide: vec![] })
+    }
+
+    fn for_each_batch(&self, name: &str, f: &mut dyn FnMut(RecordBatch) -> std::result::Result<(), String>) -> std::result::Result<(), String> {
+        let o = self.0.ensure_loaded(name).map_err(|e| e.message)?;
+        let rs = self.0.results.get(&o.result_id).map_err(|e| e.to_string())?;
+        let mut g = rs.lock();
+        let target = g.disk_sql_schema().unwrap_or_else(|| g.schema());
+        let mut failed = None;
+        g.for_each_batch(&ViewSpec::default(), SNAPSHOT_CHUNK, &mut |b| {
+            // The SQL types (exact decimals as DECIMAL), as resolve() said.
+            let cols = b
+                .columns()
+                .iter()
+                .zip(target.fields())
+                .map(|(c, t)| if c.data_type() == t.data_type() { Ok(c.clone()) } else { cast(c, t.data_type()) })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let b = RecordBatch::try_new(target.clone(), cols)?;
+            if let Err(e) = f(b) {
+                failed = Some(e);
+                return Err(databrain_result_store::Error::Spill("stopped".into()));
+            }
+            Ok(())
+        })
+        .map_err(|e| failed.take().unwrap_or_else(|| e.to_string()))
     }
 
     fn names(&self) -> Vec<String> {

@@ -284,6 +284,11 @@ impl ToolContext {
         let rs = self.engine.results().get(id).map_err(|e| AiError::Internal(e.to_string()))?;
         let (names, batches) = {
             let mut g = rs.lock();
+            if g.is_on_disk() {
+                return Err(AiError::Internal(
+                    "this result is larger than memory (its rows are on disk): query it with query_outputs as results.<name> instead".into(),
+                ));
+            }
             let names: Vec<String> = g.schema().fields().iter().map(|f| f.name().clone()).collect();
             (names, g.view_batches(&ViewSpec::default(), 50_000).map_err(|e| AiError::Internal(e.to_string()))?)
         };

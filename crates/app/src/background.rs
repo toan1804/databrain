@@ -66,6 +66,7 @@ pub fn headless_state(dir: &Path) -> Result<AppState> {
     state.set_snapshot_dir(dir.join("outputs"));
     api::apply_results_memory(&state);
     api::set_duckdb_spill_dir(dir);
+    api::set_results_spill(&state.engine, dir);
     api::apply_oracle_client_setting(&state);
     api::setup_oracle_agent(&state, dir);
     #[cfg(feature = "duckdb-engine")]

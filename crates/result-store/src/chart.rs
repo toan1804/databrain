@@ -117,6 +117,10 @@ impl ResultSet {
                 return Err(Error::InvalidColumn(c));
             }
         }
+        if self.is_on_disk() {
+            // Charting reads every row at once, which spilling avoids.
+            return Err(Error::OnDisk("A chart (aggregate it with SQL over results.<name> first)"));
+        }
         let n = self.view_len(view)?;
         let (batch, _) = self.view_slice(view, 0, n)?;
         let xfam = display::family(schema.field(spec.x));

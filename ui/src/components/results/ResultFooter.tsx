@@ -31,6 +31,14 @@ export function ResultFooter({
         limited to {formatCount(info.total_rows)}
       </span>
     )}
+    {info.on_disk && (
+      <span
+        className="rounded bg-hover px-1.5"
+        title="Larger than the memory a result may keep: its rows are on disk and read as you scroll. Sorting, filtering and find read them from disk, so they take longer."
+      >
+        on disk · {formatBytes(info.disk_bytes)}
+      </span>
+    )}
     <span>{info.columns.length} columns</span>
     {stmt.durationMs !== undefined && <span>{formatDuration(stmt.durationMs)}</span>}
     <span className="ml-auto" />

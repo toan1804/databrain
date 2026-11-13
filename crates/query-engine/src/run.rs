@@ -362,6 +362,16 @@ impl QueryEngine {
         emit(JobEvent::JobFinished { job_id, tab_id: req.tab_id, status, duration_ms: job_start.elapsed().as_millis() as u64, in_transaction });
     }
 
+    /// Move result `rs` to disk (its own folder): false when results don't
+    /// spill here, the disk is low, or its rows can't be written.
+    fn spill(&self, rs: &Arc<parking_lot::Mutex<databrain_result_store::ResultSet>>, id: &str) -> bool {
+        let Some(dir) = self.results.spill_dir(id) else { return false };
+        if self.outputs.low_disk().is_some() {
+            return false;
+        }
+        rs.lock().spill_to(dir).is_ok()
+    }
+
     pub(crate) async fn run_statement(
         &self,
         job_id: &str,
@@ -421,6 +431,11 @@ impl QueryEngine {
         let mut too_big = false;
         // Free memory of the computer when it ran low (and the result stopped).
         let mut low_free: Option<u64> = None;
+        // Past its memory the result moves to disk and keeps loading; it stops
+        // only when the disk runs low (`low_disk`) or writing fails.
+        let mut on_disk = false;
+        let mut low_disk: Option<u64> = None;
+        let mut spill_failed: Option<String> = None;
         let t0 = Instant::now();
         let mut last_progress = Instant::now();
 
@@ -443,32 +458,50 @@ impl QueryEngine {
                             batch = batch.slice(0, room);
                         }
                     }
-                    // Stop at the memory a result may keep, like the row
-                    // cap: the rows that fit, copied so the rest of the
-                    // batch's buffers are freed.
                     let size = databrain_connector_core::memory_size([&batch]);
-                    if bytes + size > max_bytes && batch.num_rows() > 0 {
-                        let keep = ((max_bytes.saturating_sub(bytes) as u128 * batch.num_rows() as u128) / size as u128) as usize;
-                        // At least one row, so the result shows what it holds.
-                        let keep = if rows == 0 { keep.max(1) } else { keep };
-                        let idx = databrain_connector_core::arrow::array::UInt32Array::from_iter_values(0..keep.min(batch.num_rows()) as u32);
-                        batch = databrain_connector_core::arrow::compute::take_record_batch(&batch, &idx).unwrap_or_else(|_| batch.slice(0, idx.len()));
-                        truncated = true;
-                        too_big = true;
+                    if on_disk {
+                        if let Some(free) = self.outputs.low_disk() {
+                            low_disk = Some(free);
+                            cancel.cancel();
+                            break;
+                        }
+                    } else if batch.num_rows() > 0 {
+                        // Past the memory a result may keep, or the computer low on
+                        // free memory: move the result to disk and keep loading.
+                        let low = if !truncated && rows > 0 { self.outputs.low_memory() } else { None };
+                        if (bytes + size > max_bytes || low.is_some()) && self.spill(rs, &result_id) {
+                            on_disk = true;
+                        } else if let Some(free) = low {
+                            // Can't spill: stop before taking more, keeping the rows so far.
+                            low_free = Some(free);
+                            cancel.cancel();
+                            break;
+                        } else if bytes + size > max_bytes {
+                            // Can't spill: the rows that fit, copied so the rest of
+                            // the batch's buffers are freed.
+                            let keep = ((max_bytes.saturating_sub(bytes) as u128 * batch.num_rows() as u128) / size as u128) as usize;
+                            // At least one row, so the result shows what it holds.
+                            let keep = if rows == 0 { keep.max(1) } else { keep };
+                            let idx = databrain_connector_core::arrow::array::UInt32Array::from_iter_values(0..keep.min(batch.num_rows()) as u32);
+                            batch = databrain_connector_core::arrow::compute::take_record_batch(&batch, &idx).unwrap_or_else(|_| batch.slice(0, idx.len()));
+                            truncated = true;
+                            too_big = true;
+                        }
                     }
-                    // The computer is low on free memory (other programs, other
-                    // results): stop before taking more, keeping the rows so far.
-                    if !truncated
-                        && rows > 0
-                        && let Some(free) = self.outputs.low_memory()
-                    {
-                        low_free = Some(free);
+                    rows += batch.num_rows();
+                    if !on_disk {
+                        bytes += databrain_connector_core::memory_size([&batch]);
+                    }
+                    let failed = {
+                        let mut g = rs.lock();
+                        g.push(batch);
+                        g.spill_error().map(str::to_string)
+                    };
+                    if let Some(e) = failed {
+                        spill_failed = Some(e);
                         cancel.cancel();
                         break;
                     }
-                    rows += batch.num_rows();
-                    bytes += databrain_connector_core::memory_size([&batch]);
-                    rs.lock().push(batch);
                     if truncated {
                         cancel.cancel();
                         break;
@@ -500,11 +533,17 @@ impl QueryEngine {
                     });
                 }
                 Ok(StreamEvent::Done(summary)) => {
-                    let info = result.as_ref().map(|rs| {
+                    let (info, failed) = result.as_ref().map_or((None, None), |rs| {
                         let mut g = rs.lock();
                         g.finish(false);
-                        g.info()
+                        (Some(g.info()), g.spill_error().map(str::to_string))
                     });
+                    if let Some(e) = failed {
+                        return Err(EngineError::new("internal", format!("Writing the result to disk failed: {e}")));
+                    }
+                    if let Some(i) = info.as_ref().filter(|i| i.on_disk) {
+                        notices.push(on_disk_notice(i.disk_bytes));
+                    }
                     unfinished.armed = false;
                     return Ok(StatementOutcome { result: info, rows_affected: summary.rows_affected, notices, server_ms });
                 }
@@ -519,7 +558,17 @@ impl QueryEngine {
             g.info()
         });
         unfinished.armed = false;
-        notices.push(if let Some(free) = low_free {
+        if let Some(i) = info.as_ref().filter(|i| i.on_disk) {
+            notices.push(on_disk_notice(i.disk_bytes));
+        }
+        notices.push(if let Some(free) = low_disk {
+            format!(
+                "Showing the first {rows} rows: the disk has only {} free. Free some disk space, or export the query to get every row.",
+                crate::outputs::size_text(free as usize)
+            )
+        } else if let Some(e) = &spill_failed {
+            format!("Showing the first {rows} rows: writing the result to disk failed ({e}).")
+        } else if let Some(free) = low_free {
             format!(
                 "Showing the first {rows} rows: the computer is low on free memory ({} free). Close other programs or results, or export the query to get every row.",
                 crate::outputs::size_text(free as usize)
@@ -597,4 +646,12 @@ impl Drop for Unfinished<'_> {
             self.results.remove(self.id);
         }
     }
+}
+
+/// What a result kept on disk tells the user.
+fn on_disk_notice(disk_bytes: u64) -> String {
+    format!(
+        "This result is larger than the memory a result may keep: its rows are on disk ({}) and read as you scroll. Sorting, filtering and find read them from disk, so they take longer.",
+        crate::outputs::size_text(disk_bytes as usize)
+    )
 }

@@ -399,13 +399,44 @@ impl QueryEngine {
         self.result_rows(&o.result_id)
     }
 
-    /// Rows of a result in the store.
+    /// Rows of a result in the store (for a result on disk, its first
+    /// 65,536 rows: a sample; [`Self::write_output`] streams them all).
     pub fn result_rows(&self, result_id: &str) -> Result<LoadRows> {
         let rs = self.results.get(result_id)?;
         let mut rs = rs.lock();
         let schema = rs.schema();
+        if rs.is_on_disk() {
+            let (b, _) = rs.view_slice(&databrain_result_store::ViewSpec::default(), 0, 65_536)?;
+            return Ok(LoadRows { schema, batches: vec![b] });
+        }
         let batches = rs.view_batches(&databrain_result_store::ViewSpec::default(), 65_536)?;
         Ok(LoadRows { schema, batches })
+    }
+
+    /// Every row of a result on disk as a stream, read on a blocking thread
+    /// (None when the result is in memory).
+    fn disk_stream(&self, result_id: &str) -> Result<Option<QueryStream>> {
+        let rs = self.results.get(result_id)?;
+        if !rs.lock().is_on_disk() {
+            return Ok(None);
+        }
+        let (tx, stream) = QueryStream::channel(4);
+        tokio::task::spawn_blocking(move || {
+            let mut g = rs.lock();
+            if !tx.blocking_send(Ok(StreamEvent::Schema(g.schema()))) {
+                return;
+            }
+            let r = g.for_each_batch(&databrain_result_store::ViewSpec::default(), 2000, &mut |b| {
+                // The load stopped reading: stop too.
+                if tx.blocking_send(Ok(StreamEvent::Batch(b))) { Ok(()) } else { Err(databrain_result_store::Error::Spill("stopped".into())) }
+            });
+            let end = match r {
+                Ok(()) => Ok(StreamEvent::Done(Default::default())),
+                Err(e) => Err(databrain_connector_core::ConnectorError::internal(e.to_string())),
+            };
+            tx.blocking_send(end);
+        });
+        Ok(Some(stream))
     }
 
     /// Copy the rows of an output into a table of another connection (job
@@ -419,6 +450,11 @@ impl QueryEngine {
         cancel: &CancellationToken,
         obs: &dyn LoadObserver,
     ) -> Result<LoadReport> {
+        // A result on disk is streamed: its rows are never all in memory.
+        let o = self.outputs.ensure_loaded(reference)?;
+        if let Some(stream) = self.disk_stream(&o.result_id)? {
+            return self.load_stream(stream, connection_id, tab, spec, cancel, obs).await;
+        }
         let rows = self.output_rows(reference)?;
         self.load_rows(&rows, connection_id, tab, spec, cancel, obs).await
     }
@@ -461,7 +497,20 @@ impl QueryEngine {
         let _claim = self.claim(source, session, cancel.clone(), "A query is running in this tab: wait for it, then load every row")?;
         let src = self.session_for(source, session, databrain_workspace::Origin::User).await?;
         let opts = ExecOptions { batch_size: 2000, cancel: cancel.clone(), max_rows: None, output_masks: None };
-        let mut stream = src.execute(sql, opts).await?;
+        let stream = src.execute(sql, opts).await?;
+        self.load_stream(stream, connection_id, tab, spec, cancel, obs).await
+    }
+
+    /// Write every row of `stream` as `spec` says, as they arrive.
+    async fn load_stream(
+        &self,
+        mut stream: QueryStream,
+        connection_id: &str,
+        tab: &str,
+        spec: &LoadSpec,
+        cancel: &CancellationToken,
+        obs: &dyn LoadObserver,
+    ) -> Result<LoadReport> {
         // The schema, then the first batch (none when there are no rows).
         let (mut schema, mut first) = (None, None);
         while first.is_none() {

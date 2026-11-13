@@ -21,6 +21,7 @@ pub(crate) fn convert_batch(b: &arrow58::record_batch::RecordBatch) -> Result<da
     r.next().ok_or_else(|| ConnectorError::internal("empty IPC stream"))?.map_err(Into::into)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     conn: &duckdb::Connection,
     sql: &str,
@@ -29,8 +30,9 @@ pub(crate) fn run(
     outputs: Option<&ExternalTablesSlot>,
     loaded: &Loaded,
     shared: bool,
+    sandboxed: bool,
 ) -> Result<()> {
-    for n in load_outputs(conn, sql, outputs, loaded, opts.output_masks.as_deref(), shared)? {
+    for n in load_outputs(conn, sql, outputs, loaded, opts.output_masks.as_deref(), shared, sandboxed)? {
         tx.blocking_send(Ok(StreamEvent::Notice(n)));
     }
     // Load the extension a query needs (bundled copy first).
