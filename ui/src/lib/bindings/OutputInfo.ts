@@ -18,9 +18,14 @@ version_of: [string, number] | null, result_id: string, connection_id: string, c
  */
 truncated: boolean, row_limit: number | null, bytes: number, pinned: boolean, state: OutputState, origin: Origin, last_used: number, 
 /**
- * Latest run of its tab (shown in the UI).
+ * Latest run of its tab, or kept from an earlier one (shown in the UI).
  */
 active: boolean, 
+/**
+ * Kept in its tab's results when the tab runs again (the user's
+ * "Keep"): it stays active, so it isn't freed while it is shown.
+ */
+kept: boolean, 
 /**
  * Database session the statement ran on, when not `tab_id` (a
  * notebook's cells share `nb:{notebook}`).

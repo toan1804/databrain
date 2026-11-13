@@ -10,7 +10,7 @@ import { createUiSlice } from "./uiSlice";
 import type { State } from "./types";
 
 export * from "./types";
-export { RESTORED_NOTICE, applyTheme, baseName, chosenSchemaIds, nextSignIn, parseSchemaFilter, restoredRun } from "./helpers";
+export { RESTORED_NOTICE, applyTheme, baseName, chosenSchemaIds, nextSignIn, parseSchemaFilter, restoredRun, shownStatement } from "./helpers";
 export { _earlyEventCount } from "./runsSlice";
 
 export const useStore = create<State>()((...a) => ({

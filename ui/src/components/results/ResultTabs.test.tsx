@@ -1,7 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { StatementRun } from "../../store";
 import { ResultTabs } from "./ResultTabs";
 
@@ -63,5 +63,22 @@ describe("ResultTabs", () => {
   it("offers the list only when there are many results or they don't fit", () => {
     render(<Harness n={3} />);
     expect(screen.queryByRole("button", { name: "All results" })).not.toBeInTheDocument();
+  });
+
+  it("shows kept results first, unnumbered, and lets go of one", async () => {
+    const user = userEvent.setup();
+    const kept = { ...stmt(0), plan: { index: -1, sql: "select * from orders_by_month" } } as StatementRun;
+    const onRelease = vi.fn();
+    const onSelect = vi.fn();
+    render(<ResultTabs statements={[kept, stmt(0), stmt(1)]} active={0} onSelect={onSelect} onRelease={onRelease} />);
+    const tabs = screen.getAllByRole("tab");
+    expect(tabs).toHaveLength(3);
+    expect(tabs[0]).toHaveTextContent("select * from orders");
+    expect(tabs[0]).not.toHaveTextContent(/^0\./);
+    expect(tabs[1]).toHaveTextContent("1. Result");
+    await user.click(tabs[0]);
+    expect(onSelect).toHaveBeenCalledWith(-1);
+    await user.click(screen.getByRole("button", { name: /Stop keeping/ }));
+    expect(onRelease).toHaveBeenCalledWith(kept);
   });
 });

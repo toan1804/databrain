@@ -10,6 +10,7 @@ export {
   nextSignIn,
   parseSchemaFilter,
   restoredRun,
+  shownStatement,
   useActiveTab,
   useStore,
 } from "./store/index";

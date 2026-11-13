@@ -53,6 +53,13 @@ pub async fn pin_output(state: &AppState, handle: String, pinned: bool) -> Resul
     Ok(o)
 }
 
+/// Keep a result in its tab's results when the tab runs again, or let go.
+pub async fn keep_output(state: &AppState, handle: String, kept: bool) -> Result<OutputInfo> {
+    let o = state.engine.outputs().set_kept(&handle, kept)?;
+    state.engine.outputs_changed();
+    Ok(o)
+}
+
 /// DuckDB SQL comparing two outputs (rows added / removed / changed).
 /// `mapping`: extra (before column, after column) pairs chosen by the user;
 /// equal names and names equal ignoring case are matched automatically.

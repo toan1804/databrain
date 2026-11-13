@@ -17,7 +17,7 @@ import type {
   UiContext,
 } from "./lib/types";
 import { uid } from "./lib/util";
-import { useStore } from "./store";
+import { shownStatement, useStore } from "./store";
 import { editorBridge } from "./editorBridge";
 import { referencedOutputs, withDuckdbHeader } from "./lib/dataflow";
 import { resultsConnection } from "./outputs";
@@ -259,7 +259,7 @@ export function runContext(key: string | null | undefined): {
 } {
   const run = key ? useStore.getState().runs[key] : undefined;
   if (!run) return { resultId: null, error: null, failed: null };
-  const active = run.activeIndex !== null ? run.statements[run.activeIndex] : undefined;
+  const active = shownStatement(run);
   const failed = run.statements.find((s) => s.status === "error");
   return {
     resultId: active?.result?.id ?? run.statements.find((s) => s.result)?.result?.id ?? null,

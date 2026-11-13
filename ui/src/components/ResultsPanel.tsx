@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { MessageSquareText, Table2 } from "lucide-react";
-import { useStore } from "../store";
+import { shownStatement, useStore } from "../store";
 import { kbd } from "../lib/platform";
 import { DoneView, ErrorView, Messages, RunningView, RunSummary } from "./results/RunStatus";
 import { ResultTabs } from "./results/ResultTabs";
@@ -21,6 +21,7 @@ export interface ResultsPanelProps {
 export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPanelProps) {
   const run = useStore((s) => s.runs[tabId]);
   const setActive = useStore((s) => s.setActiveStatement);
+  const keepResult = useStore((s) => s.keepResult);
   const [showMessages, setShowMessages] = useState(false);
 
   useEffect(() => setShowMessages(false), [run?.jobId]);
@@ -49,8 +50,8 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
     );
   }
 
-  const withOutput = run.statements.filter((s) => s.result || s.error || s.status === "running");
-  const active = run.activeIndex !== null ? run.statements[run.activeIndex] : undefined;
+  const withOutput = [...(run.kept ?? []), ...run.statements.filter((s) => s.result || s.error || s.status === "running")];
+  const active = shownStatement(run);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -62,6 +63,7 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
             setShowMessages(false);
             setActive(tabId, index);
           }}
+          onRelease={(s) => s.output && void keepResult(tabId, s.output, false)}
         />
         <button
           onClick={() => setShowMessages(true)}

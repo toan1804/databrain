@@ -383,6 +383,7 @@ export const api = {
   loadOutput: (reference: string) => call<OutputInfo>("load_output", { reference }),
   renameOutput: (handle: string, name: string | null) => call<OutputInfo>("rename_output", { handle, name }),
   pinOutput: (handle: string, pinned: boolean) => call<OutputInfo>("pin_output", { handle, pinned }),
+  keepOutput: (handle: string, kept: boolean) => call<OutputInfo>("keep_output", { handle, kept }),
   /** `exact`: `mapping` is every pair to compare (no automatic matching). */
   outputDiffSql: (before: string, after: string, keys: string[], mapping: [string, string][] = [], exact = false, options: CompareOptions | null = null) =>
     call<string>("output_diff_sql", { before, after, keys, mapping, exact, options }),

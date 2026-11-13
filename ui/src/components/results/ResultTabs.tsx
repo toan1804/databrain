@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ChevronLeft, ChevronRight, List } from "lucide-react";
+import { ChevronLeft, ChevronRight, List, Pin, X } from "lucide-react";
 import { outputLabel } from "../../outputs";
 import { formatCount, sqlPreview } from "../../lib/util";
 import type { StatementRun } from "../../store";
@@ -13,6 +13,9 @@ function statusLabel(s: StatementRun) {
   return s.result ? "Result" : s.error ? (s.status === "cancelled" ? "Cancelled" : "Error") : "Running";
 }
 
+/** A result kept from an earlier run (its `plan.index` is negative). */
+export const isCarried = (s: StatementRun) => s.plan.index < 0;
+
 /**
  * The run's results as tabs: a strip that scrolls sideways (wheel, the
  * arrows, or by keyboard) and keeps the shown result in view, plus a list of
@@ -22,19 +25,22 @@ export function ResultTabs({
   statements,
   active,
   onSelect,
+  onRelease,
 }: {
-  /** Statements that have something to show. */
+  /** Statements that have something to show (kept ones from earlier runs first). */
   statements: StatementRun[];
   /** `plan.index` of the result shown; `null` while Messages is shown. */
   active: number | null;
   onSelect: (index: number) => void;
+  /** Let go of a result kept from an earlier run. */
+  onRelease?: (s: StatementRun) => void;
 }) {
   const strip = useRef<HTMLDivElement>(null);
   /** Where the arrows' smooth scroll is going (see `page`). */
   const goal = useRef<number | null>(null);
   const [edges, setEdges] = useState({ left: false, right: false });
   const [list, setList] = useState<{ x: number; y: number; height: number } | null>(null);
-  const many = statements.length > 1;
+  const many = statements.filter((s) => !isCarried(s)).length > 1;
 
   const measure = () => {
     const el = strip.current;
@@ -121,9 +127,10 @@ export function ResultTabs({
         onKeyDown={onKey}
         className="no-scrollbar flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto"
       >
-        {statements.map((s) => {
+        {statements.map((s, i) => {
           const isActive = active === s.plan.index;
-          return (
+          const carried = isCarried(s);
+          const tab = (
             <button
               key={s.plan.index}
               data-index={s.plan.index}
@@ -131,19 +138,33 @@ export function ResultTabs({
               aria-selected={isActive}
               tabIndex={isActive || (active === null && s === statements[0]) ? 0 : -1}
               onClick={() => select(s.plan.index)}
-              title={s.plan.sql}
+              title={carried ? `Kept from an earlier run:\n${s.plan.sql}` : s.plan.sql}
               className={`flex h-7 max-w-[220px] shrink-0 items-center gap-1.5 rounded-md px-2 text-[12px] ${
                 isActive ? "bg-hover text-fg" : "text-muted hover:text-fg"
               }`}
             >
-              <StatusIcon s={s} />
-              <span className="truncate">
-                {many ? `${s.plan.index + 1}. ` : ""}
-                {statusLabel(s)}
-              </span>
+              {carried || s.output?.kept ? <Pin size={11} className="shrink-0 text-accent" aria-label="Kept" /> : <StatusIcon s={s} />}
+              <span className="truncate">{carried ? sqlPreview(s.plan.sql, 28) : `${many ? `${s.plan.index + 1}. ` : ""}${statusLabel(s)}`}</span>
               {s.result && <span className="text-[11px] text-muted">{formatCount(s.result.total_rows)}</span>}
               {s.output && <span className="font-mono text-[10.5px] text-muted">{outputLabel(s.output)}</span>}
             </button>
+          );
+          if (!carried) return tab;
+          const last = !isCarried(statements[i + 1] ?? s) || i === statements.length - 1;
+          return (
+            <span key={s.plan.index} className={`flex shrink-0 items-center ${last ? "mr-1 border-r border-line pr-1" : ""}`}>
+              {tab}
+              {onRelease && (
+                <button
+                  className="icon-btn h-5 w-5 shrink-0 text-muted"
+                  aria-label={`Stop keeping ${s.output ? outputLabel(s.output) : "this result"}`}
+                  title="Stop keeping this result (it leaves the tab)"
+                  onClick={() => onRelease(s)}
+                >
+                  <X size={11} />
+                </button>
+              )}
+            </span>
           );
         })}
       </div>
@@ -266,7 +287,7 @@ function ResultList({
             }`}
           >
             <StatusIcon s={s} />
-            <span className="w-8 shrink-0 text-right tabular-nums">{s.plan.index + 1}.</span>
+            <span className="w-8 shrink-0 text-right tabular-nums">{isCarried(s) ? <Pin size={11} className="ml-auto text-accent" aria-label="Kept" /> : `${s.plan.index + 1}.`}</span>
             <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-fg">{sqlPreview(s.plan.sql, 90)}</span>
             {s.result && <span className="shrink-0 text-[11px]">{formatCount(s.result.total_rows)} rows</span>}
             {!s.result && <span className="shrink-0 text-[11px]">{statusLabel(s)}</span>}

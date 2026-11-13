@@ -29,6 +29,11 @@ pub(crate) async fn pin_output(state: State<'_, AppState>, handle: String, pinne
 }
 
 #[tauri::command]
+pub(crate) async fn keep_output(state: State<'_, AppState>, handle: String, kept: bool) -> R<api::OutputInfo> {
+    api::keep_output(&state, handle, kept).await
+}
+
+#[tauri::command]
 pub(crate) async fn output_diff_sql(
     state: State<'_, AppState>,
     before: String,

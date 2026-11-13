@@ -112,7 +112,11 @@ export interface TabRun {
   finishedStatus?: RunStatus;
   durationMs?: number;
   statements: StatementRun[];
-  /** Index into `statements` of the result shown in the grid. */
+  /** Results kept from earlier runs of the tab (the user's "Keep"), shown
+   * before this run's. Their `plan.index` is negative, so it never clashes
+   * with a statement of this run. */
+  kept?: StatementRun[];
+  /** `plan.index` of the result shown in the grid (negative: a kept one). */
   activeIndex: number | null;
   errorRange?: { from: number; to: number };
   /** Suggestions to improve the query, computed after it ran. */

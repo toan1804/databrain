@@ -4,7 +4,7 @@ import { computeRunTips, slowStatements } from "../queryTips";
 import type { JobEvent, OutputInfo, ParamValue } from "../lib/types";
 import { errorRange } from "../lib/util";
 import { ddlEffect } from "./explorerSlice";
-import { restoredRun } from "./helpers";
+import { keptIndex, restoredRun } from "./helpers";
 import { isQueryTab, type RunInput, type State, type StatementRun, type TabRun } from "./types";
 
 /**
@@ -66,6 +66,8 @@ export interface RunsSlice {
   ) => Promise<boolean>;
   cancelTab: (tabId: string) => Promise<void>;
   setActiveStatement: (tabId: string, index: number) => void;
+  /** Keep a result in the tab when it runs again, or let go of a kept one. */
+  keepResult: (tabId: string, output: OutputInfo, kept: boolean) => Promise<void>;
   handleJobEvent: (e: JobEvent) => void;
   /** Index / partition / cluster-key tips for the run's slow statements. */
   computeTips: (runKey: string, jobId: string) => Promise<void>;
@@ -125,9 +127,15 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       const gone = new Set(handles);
       const runs = { ...s.runs };
       for (const [k, r] of Object.entries(runs)) {
-        if (!r.statements.some((x) => x.output && gone.has(x.output.handle))) continue;
+        const keptGone = r.kept?.some((x) => x.output && gone.has(x.output.handle));
+        if (!r.statements.some((x) => x.output && gone.has(x.output.handle)) && !keptGone) continue;
+        // A dropped kept result leaves the tab; the shown one moves on if it was that.
+        const kept = r.kept?.filter((x) => !(x.output && gone.has(x.output.handle)));
+        const shownGone = r.activeIndex !== null && r.activeIndex < 0 && !kept?.some((x) => x.plan.index === r.activeIndex);
         runs[k] = {
           ...r,
+          kept,
+          activeIndex: shownGone ? lastShown(r.statements) : r.activeIndex,
           statements: r.statements.map((x) =>
             x.output && gone.has(x.output.handle) ? { ...x, output: undefined, result: undefined, notices: [...x.notices, `Output ${x.output.handle} was dropped. Run again to see rows.`] } : x,
           ),
@@ -141,8 +149,10 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     set((s) => {
       const runs = { ...s.runs };
       for (const [k, r] of Object.entries(runs)) {
-        if (r.statements.some((x) => x.output?.handle === o.handle)) {
-          runs[k] = { ...r, statements: r.statements.map((x) => (x.output?.handle === o.handle ? { ...x, output: o } : x)) };
+        const mine = (x: StatementRun) => x.output?.handle === o.handle;
+        if (r.statements.some(mine) || r.kept?.some(mine)) {
+          const update = (x: StatementRun) => (mine(x) ? { ...x, output: o } : x);
+          runs[k] = { ...r, statements: r.statements.map(update), kept: r.kept?.map(update) };
         }
       }
       return { runs, outputs: s.outputs.map((x) => (x.handle === o.handle ? o : x)) };
@@ -266,6 +276,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
               running: true,
               startedAt: Date.now(),
               statements: resp.statements.map((p) => ({ plan: p, status: "pending", notices: [] })),
+              kept: carriedResults(st.runs[runKey]),
               activeIndex: null,
               connectionId,
             },
@@ -324,6 +335,25 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       if (!run) return {};
       return { runs: { ...s.runs, [tabId]: { ...run, activeIndex: index } } };
     }),
+
+  keepResult: async (tabId, output, kept) => {
+    try {
+      const o = await api.keepOutput(output.handle, kept);
+      get().applyOutput(o);
+      if (!kept) {
+        // A kept result of an earlier run leaves the tab now.
+        set((s) => {
+          const run = s.runs[tabId];
+          const gone = run?.kept?.find((x) => x.output?.handle === o.handle);
+          if (!run || !gone) return {};
+          const shown = run.activeIndex === gone.plan.index ? lastShown(run.statements) : run.activeIndex;
+          return { runs: { ...s.runs, [tabId]: { ...run, kept: run.kept?.filter((x) => x !== gone), activeIndex: shown } } };
+        });
+      }
+    } catch (e) {
+      get().toast(toError(e).message, "error");
+    }
+  },
 
   handleJobEvent: (e) => {
     if (e.type === "outputs_changed") {
@@ -457,3 +487,19 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     }
   },
 });
+
+/** The results a new run of the tab keeps showing: those kept before, and
+ * this run's the user kept (renumbered so they don't clash with the new run). */
+function carriedResults(prev: TabRun | undefined): StatementRun[] | undefined {
+  if (!prev) return undefined;
+  const now = prev.statements.filter((s) => s.output?.kept && s.result).map((s) => ({ ...s, plan: { ...s.plan, index: keptIndex() } }));
+  const all = [...(prev.kept ?? []), ...now];
+  return all.length ? all : undefined;
+}
+
+/** `plan.index` of the last statement with something to show, else the
+ * last one (as when a run finishes), else null. */
+function lastShown(statements: StatementRun[]): number | null {
+  const s = [...statements].reverse().find((x) => x.result || x.error) ?? statements.at(-1);
+  return s ? s.plan.index : null;
+}

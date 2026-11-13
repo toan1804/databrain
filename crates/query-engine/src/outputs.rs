@@ -83,9 +83,13 @@ pub struct OutputInfo {
     pub origin: Origin,
     #[ts(as = "f64")]
     pub last_used: i64,
-    /// Latest run of its tab (shown in the UI).
+    /// Latest run of its tab, or kept from an earlier one (shown in the UI).
     #[serde(default)]
     pub active: bool,
+    /// Kept in its tab's results when the tab runs again (the user's
+    /// "Keep"): it stays active, so it isn't freed while it is shown.
+    #[serde(default)]
+    pub kept: bool,
     /// Database session the statement ran on, when not `tab_id` (a
     /// notebook's cells share `nb:{notebook}`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -139,8 +143,12 @@ struct Inner {
     by_result: HashMap<String, String>,
     /// lowercase name → handles, newest first.
     names: HashMap<String, Vec<String>>,
-    /// tab → handles of its latest run.
+    /// tab → handles of its latest run, and kept ones from earlier runs.
     active: HashMap<String, Vec<String>>,
+    /// Kept outputs carried over from an earlier run of their tab: letting
+    /// go of one makes it inactive at once (one of the latest run stays
+    /// active until the tab runs again).
+    carried: HashSet<String>,
     seq: u64,
 }
 
@@ -215,6 +223,12 @@ impl OutputRegistry {
             info.active = tab_output;
             if tab_output {
                 g.active.entry(info.tab_id.clone()).or_default().push(info.handle.clone());
+                // Shown apart from the tab's last results after a restart.
+                if info.kept {
+                    g.carried.insert(info.handle.clone());
+                }
+            } else {
+                info.kept = false;
             }
             info.version_of = None;
             if let Some(n) = &info.name {
@@ -305,16 +319,53 @@ impl OutputRegistry {
 
     // ------------------------------------------------------------ lifecycle
 
-    /// A new run of `tab` starts: its previous outputs become recent.
+    /// A new run of `tab` starts: its previous outputs become recent, except
+    /// kept ones, which stay active (and shown) next to the new results.
     pub fn begin_run(&self, tab: &str) {
         let mut g = self.inner.lock();
-        if let Some(prev) = g.active.remove(tab) {
-            for h in prev {
-                if let Some(o) = g.by_handle.get_mut(&h) {
+        let g = &mut *g;
+        let Some(prev) = g.active.remove(tab) else { return };
+        let mut kept = Vec::new();
+        for h in prev {
+            if let Some(o) = g.by_handle.get_mut(&h) {
+                if o.kept && o.state != OutputState::Evicted {
+                    g.carried.insert(h.clone());
+                    kept.push(h);
+                } else {
                     o.active = false;
                 }
             }
         }
+        if !kept.is_empty() {
+            g.active.insert(tab.to_string(), kept);
+        }
+    }
+
+    /// Keep an output in its tab's results across runs, or let go of it.
+    /// A kept output is active: never freed for the memory budget, and
+    /// saved with the tab's results on quit.
+    pub fn set_kept(&self, handle: &str, kept: bool) -> Result<OutputInfo> {
+        {
+            let mut g = self.inner.lock();
+            let g = &mut *g;
+            let o = g.by_handle.get_mut(handle).ok_or_else(|| EngineError::new("not_found", format!("output {handle} not found")))?;
+            if kept && (o.state == OutputState::Evicted || !o.active) {
+                return Err(EngineError::new("invalid", format!("{handle} isn't one of its tab's results any more; run its query again to keep it")));
+            }
+            o.kept = kept;
+            if !kept && g.carried.remove(handle) {
+                o.active = false;
+                let tab = o.tab_id.clone();
+                if let Some(list) = g.active.get_mut(&tab) {
+                    list.retain(|h| h != handle);
+                }
+                g.active.retain(|_, v| !v.is_empty());
+            }
+        }
+        if !kept {
+            self.enforce_budget();
+        }
+        self.get(handle).ok_or_else(|| EngineError::new("not_found", format!("output {handle} not found")))
     }
 
     pub fn add(&self, n: NewOutput) -> OutputInfo {
@@ -341,6 +392,7 @@ impl OutputRegistry {
                 row_limit: n.row_limit,
                 bytes: n.result.bytes,
                 pinned: false,
+                kept: false,
                 state: OutputState::Live,
                 origin: n.origin,
                 last_used: now,
@@ -363,11 +415,14 @@ impl OutputRegistry {
     pub fn close_tab(&self, tab: &str) {
         let freed: Vec<String> = {
             let mut g = self.inner.lock();
+            let g = &mut *g;
             g.active.remove(tab);
             let mut freed = Vec::new();
             for o in g.by_handle.values_mut() {
                 if o.tab_id == tab {
                     o.active = false;
+                    o.kept = false;
+                    g.carried.remove(&o.handle);
                     if !o.pinned && o.name.is_none() && o.state == OutputState::Live {
                         o.state = OutputState::Evicted;
                         freed.push(o.result_id.clone());
@@ -511,6 +566,7 @@ impl OutputRegistry {
             let g = &mut *g;
             g.by_handle.remove(&o.handle);
             g.by_result.remove(&o.result_id);
+            g.carried.remove(&o.handle);
             for list in g.active.values_mut() {
                 list.retain(|h| h != &o.handle);
             }
@@ -1638,6 +1694,44 @@ mod tests {
             origin: Origin::User,
             session_key: String::new(),
         })
+    }
+
+    /// A kept result stays in its tab's results across runs (active, so
+    /// never freed for the budget) until let go; others drop off as before.
+    #[test]
+    fn kept_outputs_stay_in_their_tab_across_runs() {
+        let r = reg();
+        r.begin_run("t");
+        let keep = add(&r, "t", 3);
+        let other = add(&r, "t", 2);
+        assert!(r.set_kept(&keep.handle, true).unwrap().kept);
+        r.begin_run("t");
+        let new = add(&r, "t", 1);
+        let shown = |r: &OutputRegistry| r.for_tab("t").into_iter().map(|o| o.handle).collect::<Vec<_>>();
+        assert_eq!(shown(&r), [keep.handle.clone(), new.handle.clone()]);
+        assert!(r.get(&keep.handle).unwrap().active);
+        assert!(!r.get(&other.handle).unwrap().active, "not kept: recent, as before");
+        // Still kept after another run.
+        r.begin_run("t");
+        assert_eq!(shown(&r), std::slice::from_ref(&keep.handle));
+        // A result that isn't shown any more can't be kept.
+        assert!(r.set_kept(&other.handle, true).is_err());
+        // Letting go of a carried one: inactive at once, so the budget may free it.
+        let o = r.set_kept(&keep.handle, false).unwrap();
+        assert!(!o.kept && !o.active);
+        assert!(shown(&r).is_empty());
+        // Letting go of one from the latest run: shown until the next run.
+        r.begin_run("t");
+        let latest = add(&r, "t", 1);
+        r.set_kept(&latest.handle, true).unwrap();
+        assert!(r.set_kept(&latest.handle, false).unwrap().active);
+        r.begin_run("t");
+        assert!(!r.get(&latest.handle).unwrap().active);
+        // Closing the tab frees kept ones too.
+        let k = add(&r, "t", 1);
+        r.set_kept(&k.handle, true).unwrap();
+        r.close_tab("t");
+        assert_eq!(r.get(&k.handle).unwrap().state, OutputState::Evicted);
     }
 
     #[test]

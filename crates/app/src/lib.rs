@@ -295,6 +295,7 @@ pub fn run() {
             commands::outputs::load_output,
             commands::outputs::rename_output,
             commands::outputs::pin_output,
+            commands::outputs::keep_output,
             commands::outputs::output_diff_sql,
             commands::outputs::output_compare_pairs,
             commands::outputs::compare_outputs,

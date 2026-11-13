@@ -41,10 +41,11 @@ vi.mock("./lib/api", () => ({
     },
     listNotebooks: async () => [],
     loadOutput: async (handle: string) => ({ ...outputs.find((o) => o.handle === handle)!, state: "live" }),
+    keepOutput: async (handle: string, kept: boolean) => ({ ...outputs.find((o) => o.handle === handle)!, kept }),
   },
 }));
 
-const { useStore, _earlyEventCount, restoredRun, RESTORED_NOTICE } = await import("./store");
+const { useStore, _earlyEventCount, restoredRun, shownStatement, RESTORED_NOTICE } = await import("./store");
 
 beforeEach(() => {
   handler = (e) => useStore.getState().handleJobEvent(e);
@@ -143,6 +144,57 @@ describe("deleting a connection", () => {
     expect(st.tabs[0].connection_id).toBeNull();
     expect(Object.keys(st.schemas)).toEqual(["c2"]);
     expect(Object.keys(st.objects)).toEqual(["c2|main"]);
+  });
+});
+
+describe("keeping a result across runs", () => {
+  it("shows a kept result next to the next run's, until let go", async () => {
+    const o1 = out("r1", "t", 0, { state: "live" });
+    outputs = [o1];
+    useStore.setState({ outputs, runs: { t: restoredRun("t", [o1])! } });
+    await useStore.getState().keepResult("t", o1, true);
+    expect(useStore.getState().runs.t.statements[0].output?.kept).toBe(true);
+    // The next run: r1 moves to the kept results, under a negative index.
+    await useStore.getState().runSql("t", "c", "select 2");
+    let run = useStore.getState().runs.t;
+    expect(run.kept?.map((s) => s.output?.handle)).toEqual(["r1"]);
+    const k = run.kept![0].plan.index;
+    expect(k).toBeLessThan(0);
+    expect(run.statements.map((s) => s.plan.sql)).toEqual(["select 2"]);
+    // Shown when picked; still there after another run.
+    useStore.getState().setActiveStatement("t", k);
+    expect(shownStatement(useStore.getState().runs.t)?.output?.handle).toBe("r1");
+    await useStore.getState().runSql("t", "c", "select 3");
+    expect(useStore.getState().runs.t.kept?.map((s) => s.plan.index)).toEqual([k]);
+    // Let go while shown: it leaves the tab and the latest result is shown.
+    useStore.getState().setActiveStatement("t", k);
+    await useStore.getState().keepResult("t", o1, false);
+    run = useStore.getState().runs.t;
+    expect(run.kept).toEqual([]);
+    expect(run.activeIndex).toBe(0);
+  });
+
+  it("a result that isn't kept is replaced as before", async () => {
+    const o1 = out("r1", "t", 0, { state: "live" });
+    useStore.setState({ runs: { t: restoredRun("t", [o1])! } });
+    await useStore.getState().runSql("t", "c", "select 2");
+    expect(useStore.getState().runs.t.kept).toBeUndefined();
+  });
+
+  it("restores kept results apart from the tab's last results", () => {
+    const run = restoredRun("t", [out("r1", "t", 0, { kept: true, created_at: 1 }), out("r2", "t", 0, { created_at: 2 })])!;
+    expect(run.kept?.map((s) => s.output?.handle)).toEqual(["r1"]);
+    expect(run.statements.map((s) => s.output?.handle)).toEqual(["r2"]);
+    expect(run.activeIndex).toBe(0);
+  });
+
+  it("dropping a kept output removes it from the tab", () => {
+    const o1 = out("r1", "t", 0, { state: "live", kept: true });
+    const run = restoredRun("t", [o1])!;
+    useStore.setState({ outputs: [o1], runs: { t: { ...run, activeIndex: run.kept![0].plan.index } } });
+    useStore.getState().forgetOutputs(["r1"]);
+    expect(useStore.getState().runs.t.kept).toEqual([]);
+    expect(useStore.getState().runs.t.activeIndex).toBeNull();
   });
 });
 

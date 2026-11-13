@@ -1,11 +1,11 @@
 import type { Dispatch, SetStateAction } from "react";
-import { BarChart3, Braces, Download, Filter, GitCompare, ListFilter, Loader2, Pencil, Search, Sparkles, Table2, Upload, X } from "lucide-react";
+import { BarChart3, Braces, Download, Filter, GitCompare, ListFilter, Loader2, Pencil, Pin, Search, Sparkles, Table2, Upload, X } from "lucide-react";
 import type { SendInput } from "../../aiStore";
 import { OutputChip } from "../OutputChip";
 import { GridViewsMenu } from "../GridViewsMenu";
 import { tableLabel } from "../../lib/gridViews";
 import { mentionInAi, outputLabel } from "../../outputs";
-import type { EditTarget, ResultInfo, ViewSpec } from "../../lib/types";
+import type { EditTarget, OutputInfo, ResultInfo, ViewSpec } from "../../lib/types";
 import { filterLabel } from "../../lib/util";
 import { useStore, type StatementRun } from "../../store";
 import { kbd } from "../../lib/platform";
@@ -61,6 +61,7 @@ export function ResultToolbar({
   return (
     <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-2">
       {stmt.output && <OutputChip output={stmt.output} />}
+      {stmt.output && <KeepButton tabId={tabId} output={stmt.output} />}
       <div className="flex shrink-0 rounded-md border border-line p-0.5" role="radiogroup" aria-label="View">
         {(["grid", "chart"] as const).map((m) => (
           <button
@@ -196,5 +197,25 @@ export function ResultToolbar({
         <Download size={13} /> <span className="hidden @3xl:inline">Export</span>
       </button>
     </div>
+  );
+}
+
+/** Keep this result in the tab when another query runs there, or let go. */
+function KeepButton({ tabId, output }: { tabId: string; output: OutputInfo }) {
+  const keepResult = useStore((s) => s.keepResult);
+  return (
+    <button
+      className={`btn-ghost shrink-0 whitespace-nowrap border py-1 ${output.kept ? "border-accent text-accent" : "border-line"}`}
+      aria-pressed={output.kept}
+      aria-label="Keep result"
+      title={
+        output.kept
+          ? "Kept: this result stays in the tab when you run another query. Click to stop keeping it."
+          : "Keep this result in the tab when you run another query, to look at it next to the new results"
+      }
+      onClick={() => void keepResult(tabId, output, !output.kept)}
+    >
+      <Pin size={13} /> <span className="hidden @3xl:inline">{output.kept ? "Kept" : "Keep"}</span>
+    </button>
   );
 }

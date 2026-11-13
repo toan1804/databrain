@@ -89,7 +89,7 @@ RunRequest ──► start_run (run.rs, synchronous)
    4. not confirmed and safety_reasons non-empty  → RunResponse::NeedsConfirmation
    5. output name: validate_name, check_owner (job steps own their names)
    6. jobs lock: tab or session key already there → "busy"; else insert JobHandle
-   7. outputs.begin_run(tab): the tab's previous outputs become evictable
+   7. outputs.begin_run(tab): the tab's previous outputs become evictable, except kept ones
    8. tokio::spawn(run_job)                       → RunResponse::Started { job_id, statements }
 
 run_job, per statement, stops at the first error or cancel
@@ -160,7 +160,8 @@ Every result set of a run becomes an output (`OutputRegistry::add`): handle `rN`
 
 | State | Meaning |
 |---|---|
-| `active` | From its tab's latest run (`begin_run` clears it). Never evicted. |
+| `active` | From its tab's latest run (`begin_run` clears it), or kept. Never evicted. |
+| kept | The user's "Keep" on a result (`set_kept`): `begin_run` leaves it active, so it stays in its tab's results (and is saved with them on quit) until let go or the tab closes. Letting go of one carried from an earlier run makes it recent at once. |
 | recent | `Live`, not active, not pinned. Freed least recently used first above the budget (`enforce_budget`, 1 GB by default, counted from the size at registration). |
 | pinned | Never evicted; `set_pinned` writes a Parquet snapshot under `<app data>/outputs/` and an `outputs` row. Loaded on first use after a restart (`OnDisk` → `ensure_loaded`). |
 | `Evicted` | Rows gone, metadata kept; at most `MAX_ENTRIES` (400) entries in all, oldest evicted ones dropped first (`trim_entries`). |

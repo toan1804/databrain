@@ -2,7 +2,7 @@ import { applyAppearance, type Appearance } from "../lib/appearance";
 import { api, isTauri } from "../lib/api";
 import type { AuthEvent, OutputInfo, ParamValue, SchemaInfo } from "../lib/types";
 import type { QuickFilterEntry } from "../lib/gridViews";
-import type { SignInState, Tab, TabRun, Theme } from "./types";
+import type { SignInState, StatementRun, Tab, TabRun, Theme } from "./types";
 
 /**
  * Next sign-in dialog state for an auth event. A dialog opened by an explicit
@@ -51,20 +51,40 @@ export const RESTORED_NOTICE = "Restored from your last session. Run again for f
 export function restoredRun(tabId: string, outputs: OutputInfo[]): TabRun | null {
   const mine = outputs.filter((o) => o.tab_id === tabId && o.active && o.state !== "evicted").sort((a, b) => a.statement_index - b.statement_index);
   if (!mine.length) return null;
+  const shown = (o: OutputInfo, index: number): StatementRun => ({
+    plan: { index, sql: o.sql, start: 0, end: 0, classification: { kind: "read", missing_where: false, keyword: "" } },
+    status: "done",
+    result: { id: o.result_id, columns: o.columns, total_rows: o.rows, complete: true, truncated: o.truncated, bytes: o.bytes },
+    output: o,
+    notices: [RESTORED_NOTICE],
+  });
+  // Kept results apart (oldest first), as before the restart.
+  const kept = mine.filter((o) => o.kept).sort((a, b) => a.created_at - b.created_at);
+  const statements = mine.filter((o) => !o.kept).map((o, i) => shown(o, i));
+  const keptRuns = kept.map((o) => shown(o, keptIndex()));
   return {
     jobId: null,
     running: false,
     startedAt: Math.min(...mine.map((o) => o.created_at)),
     finishedStatus: "success",
-    statements: mine.map((o) => ({
-      plan: { index: o.statement_index, sql: o.sql, start: 0, end: 0, classification: { kind: "read", missing_where: false, keyword: "" } },
-      status: "done",
-      result: { id: o.result_id, columns: o.columns, total_rows: o.rows, complete: true, truncated: o.truncated, bytes: o.bytes },
-      output: o,
-      notices: [RESTORED_NOTICE],
-    })),
-    activeIndex: mine.length - 1,
+    statements,
+    kept: keptRuns,
+    activeIndex: statements.length ? statements.length - 1 : (keptRuns.at(-1)?.plan.index ?? null),
   };
+}
+
+let keptSeq = 0;
+/** A new `plan.index` for a kept result: negative and never reused. */
+export function keptIndex(): number {
+  keptSeq += 1;
+  return -keptSeq;
+}
+
+/** The result a tab shows: one of this run's, or a kept one. */
+export function shownStatement(run: TabRun): StatementRun | undefined {
+  const i = run.activeIndex;
+  if (i === null) return undefined;
+  return i < 0 ? run.kept?.find((s) => s.plan.index === i) : run.statements[i];
 }
 
 let tabSaveTimer: ReturnType<typeof setTimeout> | undefined;
