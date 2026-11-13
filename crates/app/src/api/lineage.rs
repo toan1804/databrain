@@ -74,22 +74,41 @@ pub async fn lineage(
     }
     let ws = state.engine.workspace().clone();
     let masked = mask_parameters(sql, kind);
+    // A bare name is the table of the connection's default schema when
+    // several schemas have one (else the one the cache finds first).
+    let defaults = connection_id.and_then(|id| ws.get_connection(id).ok()).map(|p| databrain_ai::access::defaults(&p)).unwrap_or_default();
     // View definitions read from the server for this view (lower-case
     // `schema.name` → DDL; empty = asked, none to trace).
     let mut views: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let cat = |id: Option<String>, views: &std::collections::HashMap<String, String>| {
         let ws = ws.clone();
         let views = views.clone();
+        let defaults = defaults.clone();
         move |parts: &[String]| -> Option<databrain_lineage::CatalogTable> {
             let id = id.as_deref()?;
-            let (schema, name) = ws.meta_get(id, &parts.join(".")).ok().flatten()?;
+            let preferred = match parts {
+                [bare] => ws.tables_named(id, bare).ok().and_then(|mut found| {
+                    if found.len() > 1 {
+                        found.retain(|(s, _)| databrain_ai::access::is_default_schema(&defaults, s));
+                    }
+                    <[_; 1]>::try_from(found).ok().map(|[one]| one)
+                }),
+                _ => None,
+            };
+            let (schema, name) = preferred.or_else(|| ws.meta_get(id, &parts.join(".")).ok().flatten())?;
             let columns = ws.kn_column_names(id, &schema, &name).ok().flatten()?;
             let view_sql = views.get(&format!("{schema}.{name}").to_lowercase()).filter(|d| !d.trim().is_empty()).cloned();
             Some(databrain_lineage::CatalogTable { name: format!("{schema}.{name}"), columns, view_sql })
         }
     };
     let conn = connection_id.map(str::to_string);
-    let mut graph = databrain_lineage::analyze(&masked, kind, &cat(conn.clone(), &views));
+    // Off the async runtime: a long script takes a while to trace.
+    let trace = |views: &std::collections::HashMap<String, String>| {
+        let c = cat(conn.clone(), views);
+        let text = masked.clone();
+        blocking(move || Ok(databrain_lineage::analyze(&text, kind, &c)))
+    };
+    let mut graph = trace(&views).await?;
     let mut described = Vec::new();
     if let (Some(id), true) = (connection_id, check) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -117,7 +136,7 @@ pub async fn lineage(
         }
         if refreshed {
             state.meta.flush().await;
-            graph = databrain_lineage::analyze(&masked, kind, &cat(conn.clone(), &views));
+            graph = trace(&views).await?;
         }
         // Rounds: describe the tables whose columns aren't known, then read the
         // definitions of the views among them; a view's definition names more
@@ -160,7 +179,7 @@ pub async fn lineage(
             if changed {
                 // The described columns are read back from the cache.
                 state.meta.flush().await;
-                graph = databrain_lineage::analyze(&masked, kind, &cat(conn.clone(), &views));
+                graph = trace(&views).await?;
             }
             // Views the SQL (or a view's definition) reads: their definitions.
             let mut names: Vec<String> =
@@ -188,7 +207,7 @@ pub async fn lineage(
                 }
             }
             if read_views {
-                graph = databrain_lineage::analyze(&masked, kind, &cat(conn.clone(), &views));
+                graph = trace(&views).await?;
             }
             if !changed && !read_views {
                 break;

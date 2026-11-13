@@ -5,7 +5,8 @@ export type LineageStatement = { index: number,
 /**
  * `select`, `select_into`, `create_table_as`, `create_table`,
  * `create_view`, `insert`, `update`, `delete`, `merge`, `drop`,
- * `truncate`, `alter`, `other`, `error`.
+ * `truncate`, `alter`, `session` (`USE`, `SET`, `BEGIN`, `COMMIT`…:
+ * nothing to trace), `other`, `error`.
  */
 kind: string, range: LineageRange, 
 /**

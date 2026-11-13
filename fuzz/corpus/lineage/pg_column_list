@@ -1,0 +1,1 @@
+with recursive r(n) as (select 1 union all select n + 1 from r where n < 5) select n from r; use x; set search_path to a, b

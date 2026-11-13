@@ -47,6 +47,17 @@ Left from the final review of the metadata store (2026-11-13):
 - `index_tables` answers "not available" for connection, sign-in and permission errors too (one answer for missing and refused tables), which hides why a read failed.
 - The pre-check in `index_tables` and `describe_named` resolve a bare name with the explorer cache, not the AI's scope; the check after the describe is what decides.
 
+## Lineage (review of 2026-11-13; see [LINEAGE.md](LINEAGE.md))
+
+Every finding of the review was fixed on 2026-11-13: columns traced only in part are `untraced` and PII masking treats them like untraced ones; `* EXCLUDE / REPLACE / RENAME`, `PIVOT` / `UNPIVOT`, table functions, `LATERAL VIEW` and `APPLY` keep edges from what they read; column lists rename their edges; pseudo-columns, `HAVING` / `QUALIFY` aliases, lambda parameters, `INSERT` without a column list, session statements, `USE` / `search_path`, view schemas, quoted names, `CONNECT BY`, re-created tables and CTEs of untraced statements; edge and warning sets and a bit-set `mark_used` (400 chained `CREATE TABLE … AS` statements: 11.5 s → 0.4 s in a debug build); the app traces on a blocking thread and reads bare names from the connection's default schema; fingerprints fold signs and `VALUES` rows; a `lineage` fuzz target and seeded invariants test.
+
+Left:
+
+- **Catalog case**: the explorer cache matches table names case-insensitively (`meta_get`, `tables_named`), so on Postgres, Oracle and Snowflake a cached `"Orders"` and `orders` can still be read as one table's columns. Lineage keeps them apart only when neither is cached.
+- **Database-level `USE`** (SQL Server, Snowflake's `USE db`) doesn't change where bare names are looked up: the schema inside the new database isn't known without the server.
+- **`* ILIKE 'pattern'`** (Snowflake) keeps every column of the source: only over-masks.
+- `add_out` compares each new output name with the node's others (four CTEs over a 1,500-column table: 0.3 s in a debug build).
+
 ## Connector core (review of 2026-11-12; see [CONNECTOR_CORE.md](CONNECTOR_CORE.md))
 
 Every finding of the review was fixed on 2026-11-13, with the never-read corpus and the whole-vs-pieces property (`crates/connector-core/tests/classify_corpus.rs`), tri-state `Session::transaction_state` with the unused `Capabilities` fields removed, keyword and positional secrets in redaction, and one scanner for strings and comments (`skip_token`). A `Session::supports(Feature)` enum wasn't added: the optional features already say "not supported" through their own return values (`object_versions` → `None`, `check_sql` → `false`). The redaction functions keep their own, dialect-free lexing on purpose: they scrub any text (history, logs, error messages) without knowing its database.

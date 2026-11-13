@@ -1009,6 +1009,53 @@ async fn lineage_describes_and_checks_sqlite() {
     assert_eq!(v.graph.edges.len(), 1);
 }
 
+/// A bare name that several schemas have is the default schema's table
+/// (SQLite: `main`), not the one with the shortest schema name.
+#[tokio::test]
+async fn lineage_reads_bare_names_from_the_default_schema() {
+    let (st, _sink, dir) = state();
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(dir.path().join("d.db").to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let p = save_profile(&st, "d", cfg, None);
+    let ws = st.engine.workspace();
+    let col = |c: &str| databrain_connector_core::ColumnInfo {
+        name: c.into(),
+        data_type: "int".into(),
+        nullable: true,
+        is_primary_key: false,
+        default: None,
+        comment: None,
+    };
+    let table = |schema: &str| DbObject {
+        schema: schema.into(),
+        name: "orders".into(),
+        kind: databrain_connector_core::ObjectKind::Table,
+        comment: None,
+        row_estimate: None,
+    };
+    for (schema, cols) in [("aa", ["x", "y"]), ("main", ["id", "amount"])] {
+        ws.meta_put_schema(&p.id, schema, &[table(schema)]).unwrap();
+        ws.meta_put_columns(&p.id, schema, "orders", &cols.map(col)).unwrap();
+    }
+    let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select * from orders", Default::default(), false).await.unwrap();
+    let res = v.graph.nodes.iter().find(|n| n.kind == databrain_lineage::NodeKind::Result).unwrap();
+    assert_eq!(res.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["id", "amount"]);
+    // Named with its schema: that one.
+    let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select * from aa.orders", Default::default(), false).await.unwrap();
+    let res = v.graph.nodes.iter().find(|n| n.kind == databrain_lineage::NodeKind::Result).unwrap();
+    assert_eq!(res.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["x", "y"]);
+}
+
 #[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
 #[tokio::test(flavor = "multi_thread")]
 async fn lineage_check_live_postgres_position() {

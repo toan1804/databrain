@@ -1,6 +1,7 @@
 use sqlparser::ast::{
     AlterTableOperation, Assignment, AssignmentTarget, ConflictTarget, Delete, Expr, FromTable, Insert, Merge, MergeAction, MergeInsertKind, MergeUpdateKind,
-    ObjectName, ObjectType, OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject, Update, UpdateTableFromKind,
+    ObjectName, ObjectType, OnConflictAction, OnInsert, Query, SelectItem, Set, SetExpr, Statement, TableFactor, TableObject, Update, UpdateTableFromKind, Use,
+    Visit, Visitor,
 };
 use sqlparser::tokenizer::Span;
 use std::ops::ControlFlow;
@@ -134,9 +135,33 @@ impl<'a> Builder<'a> {
                 let id = self.merge(m, &Env::default());
                 self.g.statements.push(info("merge", None, id));
             }
-            Statement::Drop { object_type: ObjectType::Table | ObjectType::View | ObjectType::MaterializedView, .. } => {
-                // Nothing flows; a table only dropped isn't drawn (nor described).
+            Statement::Drop { object_type: ObjectType::Table | ObjectType::View | ObjectType::MaterializedView, names, .. } => {
+                // Nothing flows; a table only dropped isn't drawn (nor
+                // described). One created again after is a new node, so the
+                // old version's edges aren't the new one's.
+                for name in names {
+                    let key = self.table_key(name);
+                    self.tables.remove(&key);
+                }
                 self.g.statements.push(info("drop", None, None));
+            }
+            Statement::Use(u) => {
+                self.use_schema(u);
+                self.g.statements.push(info("session", None, None));
+            }
+            Statement::Set(set) => {
+                self.set_search_path(set);
+                self.g.statements.push(info("session", None, None));
+            }
+            Statement::StartTransaction { .. }
+            | Statement::Commit { .. }
+            | Statement::Rollback { .. }
+            | Statement::Savepoint { .. }
+            | Statement::ReleaseSavepoint { .. }
+            | Statement::ShowVariable { .. }
+            | Statement::ShowVariables { .. } => {
+                // Nothing to trace.
+                self.g.statements.push(info("session", None, None));
             }
             Statement::Truncate(t) => {
                 for n in &t.table_names {
@@ -166,14 +191,58 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// `USE x` / `USE SCHEMA x`: bare names after it are looked up in `x`
+    /// first. A database-level `USE` (SQL Server, Snowflake's `USE db`) says
+    /// nothing about the schema; it is left alone.
+    fn use_schema(&mut self, u: &Use) {
+        let name = match u {
+            Use::Schema(n) => Some(n),
+            Use::Object(n) | Use::Database(n)
+                if matches!(self.kind, ConnectorKind::Mysql | ConnectorKind::Clickhouse | ConnectorKind::Databricks | ConnectorKind::Duckdb) =>
+            {
+                Some(n)
+            }
+            _ => None,
+        };
+        if let Some(n) = name {
+            self.search = vec![name_parts(n)];
+        }
+    }
+
+    /// `SET search_path TO a, b`, `SET schema 'x'`, `SET CURRENT_SCHEMA = x`.
+    fn set_search_path(&mut self, set: &Set) {
+        let Set::SingleAssignment { variable, values, .. } = set else { return };
+        let var = name_parts(variable).join(".").to_lowercase();
+        if !matches!(var.as_str(), "search_path" | "schema" | "current_schema") {
+            return;
+        }
+        let schemas: Vec<Vec<String>> = values
+            .iter()
+            .filter_map(|v| match v {
+                Expr::Identifier(i) => Some(vec![i.value.clone()]),
+                Expr::CompoundIdentifier(p) => Some(p.iter().map(|i| i.value.clone()).collect()),
+                Expr::Value(v) => v.value.clone().into_string().map(|s| vec![s]),
+                _ => None,
+            })
+            .filter(|p| !p.iter().any(|s| s.starts_with('$')))
+            .collect();
+        self.search = schemas;
+    }
+
     /// Unsupported statement: its tables, without lineage.
     pub(super) fn other(&mut self, st: &Statement, range: Range) {
+        // The CTEs it defines are not tables.
+        let mut ctes: Vec<String> = Vec::new();
+        let _ = st.visit(&mut CteNames(&mut ctes));
         let mut names = Vec::new();
         let _ = sqlparser::ast::visit_relations(st, |r| {
             names.push(r.clone());
             ControlFlow::<()>::Continue(())
         });
         for n in &names {
+            if n.0.len() == 1 && name_parts(n).first().is_some_and(|p| ctes.contains(&p.to_lowercase())) {
+                continue;
+            }
             self.table_node(n);
         }
         let kw = st.to_string().split_whitespace().next().unwrap_or("").to_uppercase();
@@ -194,12 +263,30 @@ impl<'a> Builder<'a> {
             let defined: Vec<String> = outs.iter().enumerate().map(|(i, o)| names.get(i).cloned().unwrap_or_else(|| o.clone())).collect();
             self.define_columns(t, &defined);
         }
+        let table = self.g.nodes[t].name.clone();
+        if !defines && names.is_empty() && !self.g.nodes[t].columns_known {
+            // `INSERT INTO t SELECT …` with t's columns unknown: which value
+            // goes where can't be told, so they feed the table as a whole.
+            for o in &outs {
+                self.edge(r, Some(o.clone()), t, None, EdgeKind::Direct, None);
+            }
+            self.warn(
+                format!(
+                    "Columns of {table} are not cached: the inserted values are drawn into the table as a whole (list the columns, or open it in the explorer)"
+                ),
+                None,
+            );
+            return self.g.nodes[t].id.clone();
+        }
+        // Target column: listed names (when defining, the query's own after
+        // them), else the table's own order.
         let known: Vec<String> = self.g.nodes[t].columns.iter().map(|c| c.name.clone()).collect();
-        for (i, o) in outs.iter().enumerate() {
-            // Target column: listed names, else the table's own order (INSERT), else the query's name.
-            let target = names.get(i).cloned().or_else(|| (!names.is_empty()).then(String::new)).filter(|s| !s.is_empty());
-            let target = target.or_else(|| known.get(i).cloned()).unwrap_or_else(|| o.clone());
-            let tc = self.ensure_col(t, &target);
+        let targets: &[String] = if names.is_empty() || defines { &known } else { names };
+        if outs.len() > targets.len() {
+            self.warn(format!("{table}: {} values for {} columns; the extra ones are not drawn", outs.len(), targets.len()), None);
+        }
+        for (o, target) in outs.iter().zip(targets) {
+            let tc = self.ensure_col(t, target);
             self.edge(r, Some(o.clone()), t, Some(tc), EdgeKind::Direct, None);
         }
         self.g.nodes[t].id.clone()
@@ -216,7 +303,7 @@ impl<'a> Builder<'a> {
         let t = self.table_node(name);
         self.g.nodes[t].written = true;
         let at = self.g.edges.len();
-        let mut sources = vec![Source { alias: alias_or_name(alias, name), node: t }];
+        let mut sources = vec![Source { alias: self.alias_key(alias, name), node: t }];
         self.add_joins(&u.table.joins, &env, &mut sources, t);
         if let Some(UpdateTableFromKind::BeforeSet(f) | UpdateTableFromKind::AfterSet(f)) = &u.from {
             for twj in f {
@@ -243,11 +330,7 @@ impl<'a> Builder<'a> {
     /// columns they name are used.
     fn insert_clauses(&mut self, ins: &Insert, name: &ObjectName) {
         let t = self.table_node(name);
-        let alias = ins
-            .table_alias
-            .as_ref()
-            .map(|a| a.alias.value.to_lowercase())
-            .unwrap_or_else(|| name_parts(name).last().cloned().unwrap_or_default().to_lowercase());
+        let alias = ins.table_alias.as_ref().map(|a| self.fold(&a.alias)).unwrap_or_else(|| self.fold_name(name).last().cloned().unwrap_or_default());
         let sources = vec![Source { alias, node: t }, Source { alias: "excluded".into(), node: t }];
         let at = self.g.edges.len();
         let (assignments, selection, target) = match &ins.on {
@@ -292,7 +375,7 @@ impl<'a> Builder<'a> {
                     continue;
                 }
             };
-            for parts in refs(e).cols {
+            for parts in refs(e, self.kind).cols {
                 self.resolve(sources, &[], &parts);
             }
         }
@@ -314,7 +397,7 @@ impl<'a> Builder<'a> {
             let parts = name_parts(target);
             let col = parts.last().cloned().unwrap_or_default();
             let into = match parts.len() {
-                n if n > 1 => self.find_source(sources, &parts[..n - 1]).map(|s| s.node).unwrap_or(t),
+                n if n > 1 => self.find_source(sources, &idents(target)[..n - 1]).map(|s| s.node).unwrap_or(t),
                 _ => t,
             };
             self.g.nodes[into].written = true;
@@ -325,7 +408,7 @@ impl<'a> Builder<'a> {
     /// Column `col` of table `t` gets the value of `e`.
     pub(super) fn value_into(&mut self, t: usize, col: &str, e: &Expr, sources: &[Source], env: &Env) {
         let tc = self.ensure_col(t, col);
-        let r = refs(e);
+        let r = refs(e, self.kind);
         let kind = if is_plain(e) {
             EdgeKind::Direct
         } else if r.aggregate {
@@ -359,7 +442,7 @@ impl<'a> Builder<'a> {
         for twj in from {
             for f in std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation)) {
                 if let TableFactor::Table { name, alias, .. } = f {
-                    named.push((alias_or_name(alias, name), name.clone()));
+                    named.push((self.alias_key(alias, name), name.clone()));
                 }
             }
         }
@@ -413,8 +496,8 @@ impl<'a> Builder<'a> {
         let t = self.table_node(name);
         self.g.nodes[t].written = true;
         let at = self.g.edges.len();
-        let mut sources = vec![Source { alias: alias_or_name(alias, name), node: t }];
-        self.factor(&m.source, &env, &mut sources, t);
+        let mut sources = vec![Source { alias: self.alias_key(alias, name), node: t }];
+        self.factor(&m.source, &env, &mut sources, t, false);
         let scope = Env { ctes: env.ctes.clone(), outer: sources.clone() };
         let e = self.g.edges.len();
         self.equi_joins(&m.on, JoinKind::Inner, &sources, &env.outer);
@@ -482,5 +565,18 @@ impl<'a> Builder<'a> {
             self.edge(r, Some(c.name), n, Some(o), EdgeKind::Direct, None);
         }
         n
+    }
+}
+
+/// Names of the CTEs a statement defines (lower case).
+struct CteNames<'v>(&'v mut Vec<String>);
+
+impl Visitor for CteNames<'_> {
+    type Break = ();
+    fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+        if let Some(w) = &q.with {
+            self.0.extend(w.cte_tables.iter().map(|c| c.alias.name.value.to_lowercase()));
+        }
+        ControlFlow::Continue(())
     }
 }

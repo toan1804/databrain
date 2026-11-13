@@ -22,4 +22,11 @@ used?: boolean,
  * In a script of several statements: the statements (0-based) that use
  * the column, so a diagram of one statement lists only its own.
  */
-used_by?: Array<number>, };
+used_by?: Array<number>, 
+/**
+ * Some of what the column is made of couldn't be placed (a name that
+ * matches no source, or matches several; a guessed struct field): its
+ * edges may not be all of its sources. PII masking treats it like a
+ * column without any.
+ */
+untraced?: boolean, };

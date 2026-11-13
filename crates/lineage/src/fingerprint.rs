@@ -3,6 +3,7 @@
 
 use databrain_connector_core::ConnectorKind;
 use databrain_connector_core::sql::dialect_for;
+use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
 /// Hex fingerprint of `sql` with literals and placeholders replaced by `?`
@@ -14,8 +15,17 @@ pub fn fingerprint(sql: &str, kind: ConnectorKind) -> String {
     let mut parts: Vec<String> = Vec::new();
     match Tokenizer::new(&*dialect, sql).tokenize() {
         Ok(tokens) => {
-            for t in tokens {
-                let p = match t {
+            let tokens: Vec<Token> = tokens.into_iter().filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF)).collect();
+            for (i, t) in tokens.iter().enumerate() {
+                // A sign is part of the number after it (`a = -1` is `a = 1`)
+                // unless it follows a value (`a - 1`).
+                if matches!(t, Token::Minus | Token::Plus)
+                    && matches!(tokens.get(i + 1), Some(Token::Number(..)))
+                    && !after_value(i.checked_sub(1).map(|p| &tokens[p]))
+                {
+                    continue;
+                }
+                let p = match t.clone() {
                     Token::Whitespace(_) | Token::EOF => continue,
                     Token::Word(w) if w.quote_style.is_none() => w.value.to_lowercase(),
                     Token::Number(..)
@@ -47,6 +57,10 @@ pub fn fingerprint(sql: &str, kind: ConnectorKind) -> String {
                     continue;
                 }
                 parts.push(p);
+                // `VALUES (?), (?)` → `VALUES (?)`: rows of literals, any number.
+                if parts.len() >= 8 && parts[parts.len() - 8..] == ["values", "(", "?", ")", ",", "(", "?", ")"] {
+                    parts.truncate(parts.len() - 4);
+                }
             }
             // A trailing `;` doesn't make another query.
             while parts.last().is_some_and(|p| p == ";") {
@@ -56,6 +70,15 @@ pub fn fingerprint(sql: &str, kind: ConnectorKind) -> String {
         Err(_) => parts = sql.split_whitespace().map(str::to_lowercase).collect(),
     }
     format!("{:016x}", fnv1a(parts.join(" ").as_bytes()))
+}
+
+/// Whether `prev` ends a value, so a `-` after it subtracts.
+fn after_value(prev: Option<&Token>) -> bool {
+    match prev {
+        Some(Token::Word(w)) => w.quote_style.is_some() || w.keyword == Keyword::NoKeyword,
+        Some(Token::RParen | Token::RBracket | Token::Number(..) | Token::Placeholder(_) | Token::SingleQuotedString(_)) => true,
+        _ => false,
+    }
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
