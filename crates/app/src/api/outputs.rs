@@ -416,7 +416,9 @@ pub fn set_results_spill(engine: &databrain_query_engine::QueryEngine, app_dir: 
     let total = crate::sysmem::disk_space(app_dir).map(|(_, t)| t);
     let floor = total.map_or(1 << 30, |t| (t / 20).clamp(1 << 30, 4 << 30));
     let at = app_dir.to_path_buf();
-    engine.outputs().set_free_disk_probe(Some(Arc::new(move || crate::sysmem::disk_space(&at).map(|(free, _)| free))), floor);
+    let free: Arc<dyn Fn() -> Option<u64> + Send + Sync> = Arc::new(move || crate::sysmem::disk_space(&at).map(|(free, _)| free));
+    engine.outputs().set_free_disk_probe(Some(free.clone()), floor);
+    engine.results().set_space_check(Some(databrain_result_store::SpaceCheck { free, floor }));
 }
 
 /// Where DuckDB spills work bigger than its memory: `<app dir>/duckdb_spill`.
@@ -484,21 +486,22 @@ pub fn sort_sql(job: &databrain_result_store::SortJob) -> String {
         .iter()
         .enumerate()
         .map(|(i, d)| format!("k.k{i} {} NULLS LAST", if *d { "DESC" } else { "ASC" }))
-        .chain(std::iter::once("k.__row_id".to_string()))
+        .chain(std::iter::once(format!("k.{}", databrain_result_store::ROW_ID)))
         .collect::<Vec<_>>()
         .join(", ");
+    let id = databrain_result_store::ROW_ID;
     format!(
         "SET preserve_insertion_order = true;\n\
          COPY (\n\
            WITH starts(f, s) AS (VALUES {starts}),\n\
-           d AS (SELECT p.* EXCLUDE (\"__databrain_file\", file_row_number), CAST(starts.s + p.file_row_number AS UBIGINT) AS __row_id\n\
+           d AS (SELECT p.* EXCLUDE (\"__databrain_file\", file_row_number), CAST(starts.s + p.file_row_number AS UBIGINT) AS {id}\n\
                  FROM read_parquet([{data}], filename = '__databrain_file', file_row_number = true) p JOIN starts ON p.\"__databrain_file\" = starts.f)\n\
-           SELECT d.* FROM read_parquet([{keys}]) k JOIN d ON d.__row_id = k.__row_id\n\
+           SELECT d.* FROM read_parquet([{keys}]) k JOIN d ON d.{id} = k.{id}\n\
            ORDER BY {order}\n\
          ) TO {out} (FORMAT parquet, ROW_GROUP_SIZE {rg}, COMPRESSION zstd)",
         data = list(&mut job.data.iter().map(|(p, _)| p)),
         keys = list(&mut job.keys.iter()),
         out = lit(&job.out),
-        rg = databrain_result_store::spill::CHUNK_ROWS,
+        rg = job.row_group_rows.max(1),
     )
 }

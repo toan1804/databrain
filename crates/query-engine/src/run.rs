@@ -364,12 +364,18 @@ impl QueryEngine {
 
     /// Move result `rs` to disk (its own folder): false when results don't
     /// spill here, the disk is low, or its rows can't be written.
-    fn spill(&self, rs: &Arc<parking_lot::Mutex<databrain_result_store::ResultSet>>, id: &str) -> bool {
+    fn spill(
+        &self,
+        rs: &Arc<parking_lot::Mutex<databrain_result_store::ResultSet>>,
+        id: &str,
+        sample: &databrain_connector_core::arrow::array::RecordBatch,
+    ) -> bool {
         let Some(dir) = self.results.spill_dir(id) else { return false };
         if self.outputs.low_disk().is_some() {
             return false;
         }
-        rs.lock().spill_to(dir).is_ok()
+        // Writes up to half the budget: not on an async worker's time.
+        blocking_io(|| rs.lock().spill_to(dir, sample).is_ok())
     }
 
     pub(crate) async fn run_statement(
@@ -459,9 +465,21 @@ impl QueryEngine {
                         }
                     }
                     let size = databrain_connector_core::memory_size([&batch]);
+                    // Row ids in the grid are 32-bit: a result stops there.
+                    let room = (u32::MAX as usize).saturating_sub(rows);
+                    if batch.num_rows() > room {
+                        batch = batch.slice(0, room);
+                        truncated = true;
+                    }
                     if on_disk {
                         if let Some(free) = self.outputs.low_disk() {
                             low_disk = Some(free);
+                            cancel.cancel();
+                            break;
+                        }
+                        // Pages and files waiting still use memory: other programs first.
+                        if let Some(free) = self.outputs.low_memory() {
+                            low_free = Some(free);
                             cancel.cancel();
                             break;
                         }
@@ -469,7 +487,7 @@ impl QueryEngine {
                         // Past the memory a result may keep, or the computer low on
                         // free memory: move the result to disk and keep loading.
                         let low = if !truncated && rows > 0 { self.outputs.low_memory() } else { None };
-                        if (bytes + size > max_bytes || low.is_some()) && self.spill(rs, &result_id) {
+                        if (bytes + size > max_bytes || low.is_some()) && self.spill(rs, &result_id, &batch) {
                             on_disk = true;
                         } else if let Some(free) = low {
                             // Can't spill: stop before taking more, keeping the rows so far.
@@ -492,11 +510,13 @@ impl QueryEngine {
                     if !on_disk {
                         bytes += databrain_connector_core::memory_size([&batch]);
                     }
-                    let failed = {
+                    let push = || {
                         let mut g = rs.lock();
                         g.push(batch);
                         g.spill_error().map(str::to_string)
                     };
+                    // On disk a push may write a file.
+                    let failed = if on_disk { blocking_io(push) } else { push() };
                     if let Some(e) = failed {
                         spill_failed = Some(e);
                         cancel.cancel();
@@ -534,15 +554,22 @@ impl QueryEngine {
                 }
                 Ok(StreamEvent::Done(summary)) => {
                     let (info, failed) = result.as_ref().map_or((None, None), |rs| {
-                        let mut g = rs.lock();
-                        g.finish(false);
-                        (Some(g.info()), g.spill_error().map(str::to_string))
+                        blocking_io(|| {
+                            let mut g = rs.lock();
+                            g.finish(false);
+                            let failed = g.spill_error().map(str::to_string);
+                            // The last file couldn't be written: the rows in files stay.
+                            if failed.is_some() {
+                                g.finish(true);
+                            }
+                            (Some(g.info()), failed)
+                        })
                     });
-                    if let Some(e) = failed {
-                        return Err(EngineError::new("internal", format!("Writing the result to disk failed: {e}")));
-                    }
                     if let Some(i) = info.as_ref().filter(|i| i.on_disk) {
                         notices.push(on_disk_notice(i.disk_bytes));
+                    }
+                    if let (Some(e), Some(i)) = (&failed, &info) {
+                        notices.push(format!("Showing the first {} rows: writing the last of the result to disk failed ({e}).", i.total_rows));
                     }
                     unfinished.armed = false;
                     return Ok(StatementOutcome { result: info, rows_affected: summary.rows_affected, notices, server_ms });
@@ -553,14 +580,18 @@ impl QueryEngine {
 
         // Only reached when stopped at the row cap.
         let info = result.as_ref().map(|rs| {
-            let mut g = rs.lock();
-            g.finish(true);
-            g.info()
+            blocking_io(|| {
+                let mut g = rs.lock();
+                g.finish(true);
+                g.info()
+            })
         });
         unfinished.armed = false;
         if let Some(i) = info.as_ref().filter(|i| i.on_disk) {
             notices.push(on_disk_notice(i.disk_bytes));
         }
+        // What the result holds (a failed write drops the rows not yet in a file).
+        let rows = info.as_ref().map_or(rows, |i| i.total_rows);
         notices.push(if let Some(free) = low_disk {
             format!(
                 "Showing the first {rows} rows: the disk has only {} free. Free some disk space, or export the query to get every row.",
@@ -654,4 +685,13 @@ fn on_disk_notice(disk_bytes: u64) -> String {
         "This result is larger than the memory a result may keep: its rows are on disk ({}) and read as you scroll. Sorting, filtering and find read them from disk, so they take longer.",
         crate::outputs::size_text(disk_bytes as usize)
     )
+}
+
+/// Run file I/O from async code without stalling the runtime's worker
+/// (when the runtime has others to take over; a single-threaded one just runs it).
+fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
 }

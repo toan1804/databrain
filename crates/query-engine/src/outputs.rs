@@ -789,8 +789,9 @@ impl OutputRegistry {
     }
 
     pub fn get(&self, handle: &str) -> Option<OutputInfo> {
-        let g = self.inner.lock();
-        let mut o = g.by_handle.get(handle).cloned()?;
+        // The registry isn't held while the result's size is read: a long
+        // export or sort of it holds the result's lock.
+        let mut o = self.inner.lock().by_handle.get(handle).cloned()?;
         if o.state == OutputState::Live {
             o.bytes = self.results.bytes_of(&o.result_id);
         }
@@ -967,10 +968,13 @@ impl ExternalTables for OutputTables {
     fn for_each_batch(&self, name: &str, f: &mut dyn FnMut(RecordBatch) -> std::result::Result<(), String>) -> std::result::Result<(), String> {
         let o = self.0.ensure_loaded(name).map_err(|e| e.message)?;
         let rs = self.0.results.get(&o.result_id).map_err(|e| e.to_string())?;
-        let mut g = rs.lock();
-        let target = g.disk_sql_schema().unwrap_or_else(|| g.schema());
+        let target = {
+            let g = rs.lock();
+            g.disk_sql_schema().unwrap_or_else(|| g.schema())
+        };
         let mut failed = None;
-        g.for_each_batch(&ViewSpec::default(), SNAPSHOT_CHUNK, &mut |b| {
+        // Read without the result's lock (see `databrain_result_store::for_each_batch`).
+        databrain_result_store::for_each_batch(&rs, &ViewSpec::default(), SNAPSHOT_CHUNK, &mut |b| {
             // The SQL types (exact decimals as DECIMAL), as resolve() said.
             let cols = b
                 .columns()
@@ -1063,10 +1067,10 @@ fn decimal_type<'a>(cols: impl Iterator<Item = &'a dyn Array>) -> DataType {
     for col in cols {
         let Some(s) = col.as_any().downcast_ref::<StringArray>() else { return DataType::Float64 };
         for v in s.iter().flatten() {
-            let v = v.trim().trim_start_matches(['-', '+']);
-            if v.contains(['e', 'E']) || v.eq_ignore_ascii_case("nan") || v.contains("inf") {
+            if !databrain_result_store::spill::is_plain_decimal(v) {
                 return DataType::Float64;
             }
+            let v = v.trim().trim_start_matches(['-', '+']);
             let (i, f) = v.split_once('.').unwrap_or((v, ""));
             int_digits = int_digits.max(i.trim_start_matches('0').len().max(1));
             scale = scale.max(f.len());

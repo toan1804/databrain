@@ -11,7 +11,12 @@ pub fn result_info(state: &AppState, result_id: &str) -> Result<ResultInfo> {
 
 pub async fn fetch_page(state: &AppState, result_id: String, view: ViewSpec, offset: usize, limit: usize) -> Result<Page> {
     let rs = state.results().get(&result_id)?;
-    blocking(move || Ok(rs.lock().page(&view, offset, limit.min(MAX_PAGE))?)).await
+    blocking(move || {
+        // A result on disk: its view is built without holding its lock.
+        databrain_result_store::prepare_view(&rs, &view)?;
+        Ok(rs.lock().page(&view, offset, limit.min(MAX_PAGE))?)
+    })
+    .await
 }
 
 pub async fn find_in_result(
@@ -24,7 +29,7 @@ pub async fn find_in_result(
     whole_word: bool,
 ) -> Result<FindResult> {
     let rs = state.results().get(&result_id)?;
-    blocking(move || Ok(rs.lock().find_with(&view, &query, columns.as_deref(), limit.clamp(1, 100_000), whole_word)?)).await
+    blocking(move || Ok(databrain_result_store::find(&rs, &view, &query, columns.as_deref(), limit.clamp(1, 100_000), whole_word)?)).await
 }
 
 /// Count / distinct / sum / min / max / avg of the selected cells.
@@ -37,12 +42,16 @@ pub async fn summarize_selection(
     limit: usize,
 ) -> Result<databrain_result_store::SelectionSummary> {
     let rs = state.results().get(&result_id)?;
-    blocking(move || Ok(rs.lock().summarize(&view, &columns, offset, limit.min(MAX_COPY_ROWS))?)).await
+    blocking(move || {
+        databrain_result_store::prepare_view(&rs, &view)?;
+        Ok(rs.lock().summarize(&view, &columns, offset, limit.min(MAX_COPY_ROWS))?)
+    })
+    .await
 }
 
 pub async fn column_stats(state: &AppState, result_id: String, view: ViewSpec, column: usize) -> Result<ColumnStats> {
     let rs = state.results().get(&result_id)?;
-    blocking(move || Ok(rs.lock().column_stats(&view, column)?)).await
+    blocking(move || Ok(databrain_result_store::column_stats(&rs, &view, column)?)).await
 }
 
 /// Export the view to a user-chosen file. Returns rows written.
@@ -55,17 +64,16 @@ pub async fn export_result(state: &AppState, result_id: String, view: ViewSpec, 
     blocking(move || {
         // Written a batch at a time: a result on disk is never read whole.
         let named = |e: databrain_export::ExportError| EngineError::new("invalid", format!("{}: {e}", path.display()));
-        let mut g = rs.lock();
-        let mut w = databrain_export::FileWriter::create(&path, g.schema(), options).map_err(named)?;
+        let schema = rs.lock().schema();
+        let mut w = databrain_export::FileWriter::create(&path, schema, options).map_err(named)?;
         let mut failed = None;
-        let r = g.for_each_batch(&view, 10_000, &mut |b| {
+        let r = databrain_result_store::for_each_batch(&rs, &view, 10_000, &mut |b| {
             w.write(&b).map_err(|e| {
                 let msg = e.to_string();
                 failed = Some(e);
                 databrain_result_store::Error::Spill(msg)
             })
         });
-        drop(g);
         match (r, failed) {
             (_, Some(e)) => Err(named(e)),
             (Err(e), None) => Err(e.into()),
@@ -103,6 +111,7 @@ pub async fn copy_rows(state: &AppState, result_id: String, view: ViewSpec, offs
     let rs = state.results().get(&result_id)?;
     blocking(move || {
         let (schema, batch) = {
+            databrain_result_store::prepare_view(&rs, &view)?;
             let mut g = rs.lock();
             let (b, _) = g.view_slice(&view, offset, limit.min(MAX_COPY_ROWS))?;
             (g.schema(), b)

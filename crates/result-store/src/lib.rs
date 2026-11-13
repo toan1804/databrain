@@ -4,6 +4,7 @@
 pub mod chart;
 mod decimal;
 mod disk_view;
+pub use disk_view::{ROW_ID, SpaceCheck, column_stats, find, for_each_batch, prepare_view};
 pub mod display;
 pub mod spill;
 pub mod view;
@@ -136,6 +137,9 @@ pub struct ColumnStats {
     pub nulls: u64,
     #[ts(as = "f64")]
     pub distinct: u64,
+    /// More distinct values than were counted (a result on disk counts up
+    /// to a million).
+    pub distinct_capped: bool,
     pub min: Option<String>,
     pub max: Option<String>,
     pub top: Vec<TopValue>,
@@ -162,7 +166,7 @@ pub struct ResultInfo {
 /// A sort of a result on disk, done out of memory (by DuckDB in the app).
 #[derive(Debug, Clone)]
 pub struct SortJob {
-    /// Parquet files of the rows to keep: `__row_id` (UInt64) then the sort
+    /// Parquet files of the rows to keep: [`ROW_ID`] (UInt64) then the sort
     /// keys `k0`, `k1`… as they're compared (exact decimals as bytes).
     pub keys: Vec<std::path::PathBuf>,
     /// The result's files and the first row of each.
@@ -170,8 +174,10 @@ pub struct SortJob {
     /// Per key: descending. Nulls always last; ties in result order.
     pub descending: Vec<bool>,
     /// Where to write the kept rows in order: the result's columns, then
-    /// `__row_id`, in row groups of [`spill::CHUNK_ROWS`].
+    /// [`ROW_ID`], in row groups of `row_group_rows`.
     pub out: std::path::PathBuf,
+    /// Rows per row group (fewer for wide rows, so a page reads little).
+    pub row_group_rows: usize,
 }
 
 /// Sorts results that are on disk (see [`SortJob`]).
@@ -212,6 +218,9 @@ pub struct ResultSet {
     spill_error: Option<String>,
     disk_view: Option<DiskView>,
     sorter: Option<Arc<dyn DiskSorter>>,
+    space: Option<SpaceCheck>,
+    /// One view build at a time (outside the lock: see [`prepare_view`]).
+    view_build: Arc<Mutex<()>>,
 }
 
 impl ResultSet {
@@ -231,6 +240,8 @@ impl ResultSet {
             spill_error: None,
             disk_view: None,
             sorter: None,
+            space: None,
+            view_build: Arc::new(Mutex::new(())),
         }
     }
 
@@ -247,9 +258,10 @@ impl ResultSet {
             return;
         }
         if let Some(sp) = &mut self.spill {
+            // A failed write drops the rows waiting for a file: the count
+            // follows, so every reader sees the same rows.
             if let Err(e) = sp.push(batch) {
                 self.spill_error = Some(e.to_string());
-                return;
             }
             self.total_rows = sp.rows();
             return;
@@ -260,36 +272,42 @@ impl ResultSet {
     }
 
     pub fn finish(&mut self, truncated: bool) {
-        if let Some(sp) = &mut self.spill
-            && let Err(e) = sp.finish()
-        {
-            self.spill_error = Some(e.to_string());
+        if let Some(sp) = &mut self.spill {
+            if let Err(e) = sp.finish() {
+                self.spill_error = Some(e.to_string());
+            }
+            self.total_rows = sp.rows();
         }
         self.complete = true;
         self.truncated = truncated;
     }
 
     /// Keep the rows on disk in `dir` from now on: the rows so far move
-    /// there, and memory holds only a few pages. Fails (and changes nothing)
-    /// when the files can't be written.
-    pub fn spill_to(&mut self, dir: std::path::PathBuf) -> Result<()> {
+    /// there, and memory holds only a few pages. `sample` (the next rows)
+    /// is tried first: when these rows can't be written as Parquet, or a
+    /// write fails, nothing changes (the rows stay in memory) and the error
+    /// is returned.
+    pub fn spill_to(&mut self, dir: std::path::PathBuf, sample: &RecordBatch) -> Result<()> {
         if self.spill.is_some() {
             return Ok(());
         }
+        let probe = self.batches.first().unwrap_or(sample);
+        if !spill::can_write(probe) || !spill::can_write(sample) {
+            return Err(Error::Spill("these column types can't be written to disk".into()));
+        }
         let mut sp = spill::Spill::create(dir, self.schema.clone())?;
-        // The narrow batches, not a combined one with 64-bit offsets.
-        let batches = if self.combined.is_some() && self.batches.len() == 1 {
-            self.view_batches(&ViewSpec::default(), spill::CHUNK_ROWS)?
-        } else {
-            std::mem::take(&mut self.batches)
-        };
-        for b in &batches {
-            sp.push(b.clone())?;
+        // The narrow batches, not a combined one with 64-bit offsets; the
+        // in-memory rows are let go only once all of them are written.
+        let batches =
+            if self.combined.is_some() && self.batches.len() == 1 { self.view_batches(&ViewSpec::default(), spill::CHUNK_ROWS)? } else { self.batches.clone() };
+        for b in batches {
+            sp.push(b)?;
         }
         self.batches.clear();
         self.combined = None;
         self.view_cache = None;
         self.display_cache = DisplayCache::default();
+        self.total_rows = sp.rows();
         self.spill = Some(sp);
         Ok(())
     }
@@ -319,7 +337,7 @@ impl ResultSet {
 
     pub fn memory_bytes(&self) -> usize {
         if let Some(sp) = &self.spill {
-            return sp.memory_bytes();
+            return sp.memory_bytes() + self.disk_view.as_ref().map_or(0, |v| v.rows.memory_bytes());
         }
         match &self.combined {
             Some(c) => databrain_connector_core::memory_size([c]),
@@ -627,7 +645,7 @@ impl ResultSet {
         top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let top = top.into_iter().take(10).map(|(v, count)| TopValue { value: v.map(|s| s.to_string()), count }).collect();
 
-        Ok(ColumnStats { column, count: col.len() as u64, nulls, distinct, min, max, top })
+        Ok(ColumnStats { column, count: col.len() as u64, nulls, distinct, distinct_capped: false, min, max, top })
     }
 
     /// The view as a sequence of batches (for export, outputs), at most
@@ -677,6 +695,7 @@ pub struct ResultStore {
     /// Held while this process uses its spill folder (see [`Self::set_spill_root`]).
     spill_lock: Mutex<Option<std::fs::File>>,
     sorter: Mutex<Option<Arc<dyn DiskSorter>>>,
+    space: Mutex<Option<SpaceCheck>>,
 }
 
 impl ResultStore {
@@ -698,7 +717,16 @@ impl ResultStore {
                     continue;
                 }
                 let held = std::fs::OpenOptions::new().write(true).open(dir.join("lock")).is_ok_and(|f| f.try_lock().is_err());
-                if !held {
+                // A process starting right now may not have locked its folder
+                // yet: only folders untouched for a minute are stale.
+                let fresh = |p: &std::path::Path| {
+                    std::fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age < std::time::Duration::from_secs(60))
+                };
+                if !held && !fresh(&dir) && !fresh(&dir.join("lock")) {
                     let _ = std::fs::remove_dir_all(&dir);
                 }
             }
@@ -714,6 +742,12 @@ impl ResultStore {
             // No folder of our own: results don't spill (they stop at memory).
             Err(_) => *self.spill_root.lock() = None,
         }
+    }
+
+    /// Free disk space where results spill, checked before a view of a
+    /// result on disk writes its copy.
+    pub fn set_space_check(&self, check: Option<SpaceCheck>) {
+        *self.space.lock() = check;
     }
 
     /// Sorts results on disk (DuckDB; without one they can't be sorted).
@@ -748,14 +782,18 @@ impl ResultStore {
         self.results.lock().contains_key(id)
     }
 
+    /// Bytes `id` keeps in memory. The store's map isn't held while the
+    /// result's lock is waited for (a long export or sort holds it).
     pub fn bytes_of(&self, id: &str) -> usize {
-        self.results.lock().get(id).map(|r| r.lock().memory_bytes()).unwrap_or(0)
+        let rs = self.results.lock().get(id).cloned();
+        rs.map(|r| r.lock().memory_bytes()).unwrap_or(0)
     }
 
     pub fn create(&self, id: impl Into<String>, schema: SchemaRef) -> Arc<Mutex<ResultSet>> {
         let id = id.into();
         let mut set = ResultSet::new(id.clone(), schema);
         set.sorter = self.sorter.lock().clone();
+        set.space = self.space.lock().clone();
         let rs = Arc::new(Mutex::new(set));
         self.results.lock().insert(id, rs.clone());
         rs
@@ -770,7 +808,38 @@ impl ResultStore {
     }
 
     pub fn total_bytes(&self) -> usize {
-        self.results.lock().values().map(|r| r.lock().memory_bytes()).sum()
+        let all: Vec<_> = self.results.lock().values().cloned().collect();
+        all.iter().map(|r| r.lock().memory_bytes()).sum()
+    }
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+    use databrain_connector_core::arrow::array::{Int64Array, IntervalMonthDayNanoArray};
+    use databrain_connector_core::arrow::datatypes::{Field, IntervalMonthDayNano, IntervalUnit, Schema};
+
+    /// Rows whose types have no Parquet form (intervals) stay in memory:
+    /// moving to disk is refused before anything moves, and every row is kept.
+    #[test]
+    fn rows_that_cant_be_written_stay_in_memory() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false), Field::new("age", DataType::Interval(IntervalUnit::MonthDayNano), true)]));
+        let b = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..40_000)),
+                Arc::new(IntervalMonthDayNanoArray::from(vec![Some(IntervalMonthDayNano::new(1, 2, 3)); 40_000])),
+            ],
+        )
+        .unwrap();
+        let mut rs = ResultSet::new("r", schema);
+        rs.push(b.clone());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(rs.spill_to(dir.path().join("r"), &b).is_err());
+        assert!(!rs.is_on_disk());
+        assert_eq!(rs.total_rows(), 40_000);
+        assert_eq!(rs.view_slice(&ViewSpec::default(), 39_999, 5).unwrap().0.num_rows(), 1, "every row still there");
     }
 }
 

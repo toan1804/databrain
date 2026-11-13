@@ -506,6 +506,9 @@ async fn results_larger_than_memory_continue_on_disk() {
     assert_eq!(page.row_ids.first(), Some(&399_990));
     let found = api::find_in_result(&st, info.id.clone(), filtered, "39999".into(), Some(vec![0]), 100, false).await.unwrap();
     assert_eq!(found.matches.len(), 10);
+    // A sort of nothing (the filter keeps no row): an empty grid, not an error.
+    let none = ViewSpec { filters: vec![ColumnFilter { column: 0, op: FilterOp::Lt, value: "-1".into() }], sort: sorted.sort.clone(), ..Default::default() };
+    assert_eq!(api::fetch_page(&st, info.id.clone(), none, 0, 5).await.unwrap().view_rows, 0);
     let stats = api::column_stats(&st, info.id.clone(), ViewSpec::default(), 0).await.unwrap();
     assert_eq!((stats.count, stats.nulls, stats.distinct), (n as u64, 0, n as u64));
     assert_eq!((stats.min.as_deref(), stats.max.as_deref()), (Some("0"), Some("399999")));
@@ -619,10 +622,18 @@ fn stale_spill_folders_are_deleted_live_ones_kept() {
     let stale = base.path().join("results_spill").join("123-1");
     std::fs::create_dir_all(&stale).unwrap();
     std::fs::write(stale.join("000000.parquet"), b"x").unwrap();
+    // Left by a process that quit a while ago (a folder created this minute may be starting up).
+    // (Unix only: Windows can't open a folder to set its time.)
+    #[cfg(unix)]
+    std::fs::File::open(&stale).unwrap().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600)).unwrap();
+    let fresh = base.path().join("results_spill").join("456-1");
+    std::fs::create_dir_all(&fresh).unwrap();
     let live = databrain_result_store::ResultStore::new();
     live.set_spill_root(base.path().join("results_spill"));
     let live_dir = live.spill_root().unwrap();
+    #[cfg(unix)]
     assert!(!stale.exists(), "nobody held it");
+    assert!(fresh.exists(), "just created: its process may be about to lock it");
     let other = databrain_result_store::ResultStore::new();
     other.set_spill_root(base.path().join("results_spill"));
     assert!(live_dir.exists(), "held by the first store");

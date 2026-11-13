@@ -393,7 +393,9 @@ fn match_column<'a>(name: &str, target: &'a [String]) -> Option<&'a String> {
 }
 
 impl QueryEngine {
-    /// Rows of an output (all of them), for a load.
+    /// Rows of an output, for a load: all of them in memory; for an output
+    /// on disk a sample (its first 65,536 rows). [`Self::write_output`]
+    /// streams every row of either.
     pub fn output_rows(&self, reference: &str) -> Result<LoadRows> {
         let o = self.outputs.ensure_loaded(reference)?;
         self.result_rows(&o.result_id)
@@ -422,11 +424,13 @@ impl QueryEngine {
         }
         let (tx, stream) = QueryStream::channel(4);
         tokio::task::spawn_blocking(move || {
-            let mut g = rs.lock();
-            if !tx.blocking_send(Ok(StreamEvent::Schema(g.schema()))) {
+            // The files are read without the result's lock: a load's
+            // before-SQL may read results.<this output> meanwhile.
+            let schema = rs.lock().schema();
+            if !tx.blocking_send(Ok(StreamEvent::Schema(schema))) {
                 return;
             }
-            let r = g.for_each_batch(&databrain_result_store::ViewSpec::default(), 2000, &mut |b| {
+            let r = databrain_result_store::for_each_batch(&rs, &databrain_result_store::ViewSpec::default(), 2000, &mut |b| {
                 // The load stopped reading: stop too.
                 if tx.blocking_send(Ok(StreamEvent::Batch(b))) { Ok(()) } else { Err(databrain_result_store::Error::Spill("stopped".into())) }
             });

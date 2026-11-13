@@ -109,15 +109,19 @@ pub(crate) fn load_outputs(
             let drop = drop_existing(conn, &name)?;
             if !sandboxed && !t.hide.iter().any(|h| *h) {
                 let list = t.files.iter().map(|f| quote_literal(&f.to_string_lossy())).collect::<Vec<_>>().join(", ");
-                // Exact decimals are text in the files: the SQL type the output has.
-                let cols = normalize_schema(&t.schema)
+                // The types an output in memory has: exact decimals (text in
+                // the files) as DECIMAL, types the appender can't take as text.
+                let normal = normalize_schema(&t.schema);
+                let cols = normal
                     .fields()
                     .iter()
-                    .map(|f| {
+                    .zip(t.schema.fields())
+                    .map(|(f, orig)| {
                         let c = quote_ident(ConnectorKind::Duckdb, f.name());
-                        match f.data_type() {
-                            Dt::Decimal128(..) | Dt::Float64 => format!("CAST({c} AS {}) AS {c}", duck_type(f.data_type())),
-                            _ => c,
+                        if matches!(f.data_type(), Dt::Decimal128(..) | Dt::Float64) || f.data_type() != orig.data_type() {
+                            format!("CAST({c} AS {}) AS {c}", duck_type(f.data_type()))
+                        } else {
+                            c
                         }
                     })
                     .collect::<Vec<_>>()
@@ -361,6 +365,74 @@ mod tests {
         // Nothing to mask: fine there too.
         let none = OutputMasks([("v1".to_string(), vec![])].into());
         assert_eq!(file.execute("select * from results.sales", opts(none)).await.unwrap().collect().await.unwrap().batches[0].num_rows(), 4);
+    }
+
+    /// An output on disk: its file holds 5 rows, the stream gives 3, so a
+    /// count tells which way a session read it.
+    struct DiskOutput(std::path::PathBuf);
+    impl databrain_connector_core::external::ExternalTables for DiskOutput {
+        fn resolve(&self, name: &str) -> std::result::Result<databrain_connector_core::external::ExternalTable, String> {
+            use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
+            let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+            Ok(databrain_connector_core::external::ExternalTable {
+                name: name.into(),
+                version_key: "disk".into(),
+                schema,
+                batches: vec![],
+                notice: None,
+                files: vec![self.0.clone()],
+                hide: vec![],
+            })
+        }
+        fn names(&self) -> Vec<String> {
+            vec!["big".into()]
+        }
+        fn for_each_batch(
+            &self,
+            _name: &str,
+            f: &mut dyn FnMut(databrain_connector_core::arrow::array::RecordBatch) -> std::result::Result<(), String>,
+        ) -> std::result::Result<(), String> {
+            use databrain_connector_core::arrow::array::Int64Array;
+            use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
+            let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+            f(databrain_connector_core::arrow::array::RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap())
+        }
+    }
+
+    async fn count(s: &dyn databrain_connector_core::Session, sql: &str) -> databrain_connector_core::Result<i64> {
+        s.execute(sql, ExecOptions::default()).await?.collect().await.map(|r| r.batches[0].column(0).as_primitive::<Int64Type>().value(0))
+    }
+
+    /// A sandboxed (AI) session gets an output on disk streamed in and can't
+    /// read the result's files itself; a plain session reads the files.
+    #[tokio::test]
+    async fn outputs_on_disk_reach_sandboxed_sessions_only_as_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("000000.parquet");
+        let path = file.to_string_lossy().into_owned();
+        session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None))
+            .await
+            .execute(&format!("COPY (SELECT range AS n FROM range(5)) TO {} (FORMAT parquet)", quote_literal(&path)), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let open = |sandbox: bool| {
+            let slot = ExternalTablesSlot::new();
+            slot.set(Arc::new(DiskOutput(file.clone())));
+            let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+            if sandbox {
+                cfg.options.insert(databrain_connector_core::SANDBOX_OPTION.into(), "1".into());
+            }
+            async move { DuckdbConnector::with_outputs(slot).connect(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::None, None))).await.unwrap() }
+        };
+        let plain = open(false).await;
+        assert_eq!(count(plain.as_ref(), "select count(*) from results.big").await.unwrap(), 5, "the files");
+        let sandboxed = open(true).await;
+        assert_eq!(count(sandboxed.as_ref(), "select count(*) from results.big").await.unwrap(), 3, "streamed in");
+        let direct = count(sandboxed.as_ref(), &format!("select count(*) from read_parquet({})", quote_literal(&path))).await;
+        assert!(direct.is_err(), "a sandboxed session can't read the result's files");
     }
 
     #[tokio::test]

@@ -108,7 +108,7 @@ export function ColumnMenu({
           <div className="space-y-1.5 text-[11.5px]">
             <div className="grid grid-cols-3 gap-1">
               <Stat label="Rows" value={formatCount(stats.count)} />
-              <Stat label="Distinct" value={formatCount(stats.distinct)} />
+              <Stat label="Distinct" value={`${formatCount(stats.distinct)}${stats.distinct_capped ? "+" : ""}`} />
               <Stat label="Nulls" value={formatCount(stats.nulls)} />
             </div>
             {stats.min !== null && (
