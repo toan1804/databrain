@@ -810,6 +810,29 @@ async fn a_result_stops_when_free_memory_runs_low() {
     assert!(notices.iter().any(|n| n.contains("low on free memory (300 MB free)")), "{notices:?}");
 }
 
+/// Low on free memory, a result moves to disk and keeps loading; only
+/// critically low memory (under half the floor) stops it there.
+#[tokio::test(flavor = "multi_thread")]
+async fn low_memory_moves_a_result_to_disk() {
+    let f = fixture(EnvTag::Dev);
+    let dir = tempfile::tempdir().unwrap();
+    f.engine.results().set_spill_root(dir.path().to_path_buf());
+    let sql = "with recursive n(i) as (select 1 union all select i + 1 from n where i < 20000) select i, 'row ' || i as s from n";
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(300 << 20)); // under the 500 MB floor
+    let probe = free.clone();
+    f.engine.outputs().set_free_memory_probe(Some(Arc::new(move || Some(probe.load(std::sync::atomic::Ordering::Relaxed)))), 500 << 20);
+    let mut r = req(&f, sql);
+    r.row_limit = None;
+    let (info, notices) = outcome(&wait_job(&f, &started(f.engine.run(r.clone()).unwrap())).await);
+    assert!(info.on_disk && !info.truncated && info.total_rows == 20000, "{info:?} {notices:?}");
+
+    free.store(100 << 20, std::sync::atomic::Ordering::Relaxed); // critically low
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let (info, notices) = outcome(&wait_job(&f, &started(f.engine.run(r).unwrap())).await);
+    assert!(info.truncated && info.total_rows < 20000, "{info:?}");
+    assert!(notices.iter().any(|n| n.contains("low on free memory")), "{notices:?}");
+}
+
 /// The free memory is read at most every 200 ms while rows load.
 #[test]
 fn free_memory_is_read_sparingly() {

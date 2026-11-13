@@ -13,8 +13,7 @@ pub async fn fetch_page(state: &AppState, result_id: String, view: ViewSpec, off
     let rs = state.results().get(&result_id)?;
     blocking(move || {
         // A result on disk: its view is built without holding its lock.
-        databrain_result_store::prepare_view(&rs, &view)?;
-        Ok(rs.lock().page(&view, offset, limit.min(MAX_PAGE))?)
+        Ok(databrain_result_store::with_view(&rs, &view, |g| g.page(&view, offset, limit.min(MAX_PAGE)))?)
     })
     .await
 }
@@ -42,11 +41,7 @@ pub async fn summarize_selection(
     limit: usize,
 ) -> Result<databrain_result_store::SelectionSummary> {
     let rs = state.results().get(&result_id)?;
-    blocking(move || {
-        databrain_result_store::prepare_view(&rs, &view)?;
-        Ok(rs.lock().summarize(&view, &columns, offset, limit.min(MAX_COPY_ROWS))?)
-    })
-    .await
+    blocking(move || Ok(databrain_result_store::with_view(&rs, &view, |g| g.summarize(&view, &columns, offset, limit.min(MAX_COPY_ROWS)))?)).await
 }
 
 pub async fn column_stats(state: &AppState, result_id: String, view: ViewSpec, column: usize) -> Result<ColumnStats> {
@@ -110,12 +105,10 @@ pub async fn export_full_result(state: &AppState, result_id: &str, options: Expo
 pub async fn copy_rows(state: &AppState, result_id: String, view: ViewSpec, offset: usize, limit: usize, options: ExportOptions) -> Result<String> {
     let rs = state.results().get(&result_id)?;
     blocking(move || {
-        let (schema, batch) = {
-            databrain_result_store::prepare_view(&rs, &view)?;
-            let mut g = rs.lock();
+        let (schema, batch) = databrain_result_store::with_view(&rs, &view, |g| {
             let (b, _) = g.view_slice(&view, offset, limit.min(MAX_COPY_ROWS))?;
-            (g.schema(), b)
-        };
+            Ok((g.schema(), b))
+        })?;
         export_to_string(schema, [&batch], options).map_err(|e| EngineError::new("internal", e.to_string()))
     })
     .await

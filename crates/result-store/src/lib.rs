@@ -4,7 +4,7 @@
 pub mod chart;
 mod decimal;
 mod disk_view;
-pub use disk_view::{ROW_ID, SpaceCheck, column_stats, find, for_each_batch, prepare_view};
+pub use disk_view::{ROW_ID, SpaceCheck, column_stats, find, for_each_batch, prepare_view, with_view};
 pub mod display;
 pub mod spill;
 pub mod view;

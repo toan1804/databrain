@@ -67,11 +67,17 @@ fn stopped(r: Result<()>) -> Result<()> {
 }
 
 /// Types DuckDB gives back as they were (a sorted view goes through it):
-/// not 256-bit decimals (back as DOUBLE), nanosecond times, intervals,
-/// durations or unions.
+/// not 256-bit decimals (back as DOUBLE), nanosecond times or zoned
+/// timestamps, intervals, durations or unions.
 fn survives_duckdb(dt: &DataType) -> bool {
     match dt {
-        DataType::Decimal256(..) | DataType::Time64(TimeUnit::Nanosecond) | DataType::Interval(_) | DataType::Duration(_) | DataType::Union(..) => false,
+        // Nanosecond timestamps with a time zone come back as microseconds.
+        DataType::Decimal256(..)
+        | DataType::Time64(TimeUnit::Nanosecond)
+        | DataType::Timestamp(TimeUnit::Nanosecond, Some(_))
+        | DataType::Interval(_)
+        | DataType::Duration(_)
+        | DataType::Union(..) => false,
         DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) | DataType::Map(f, _) => survives_duckdb(f.data_type()),
         DataType::Struct(fs) => fs.iter().all(|f| survives_duckdb(f.data_type())),
         _ => true,
@@ -93,6 +99,12 @@ pub(crate) struct Plan {
 impl ResultSet {
     fn has_view(&self, spec: &ViewSpec) -> bool {
         self.disk_view.as_ref().is_some_and(|v| &v.spec == spec)
+    }
+
+    /// Reading `spec` needs no view to be built (in memory, the identity
+    /// view, or the view already there).
+    fn view_ready(&self, spec: &ViewSpec) -> bool {
+        !self.is_on_disk() || spec.is_identity() || self.has_view(spec)
     }
 
     pub(crate) fn view_plan(&self) -> Result<Plan> {
@@ -199,7 +211,7 @@ fn build_view(plan: Plan, spec: &ViewSpec) -> Result<Spill> {
     // A sort: DuckDB reads the files, so names it adds can't be columns,
     // and every type must come back as it went.
     for f in plan.schema.fields() {
-        if [ROW_ID, "file_row_number", "__databrain_file"].contains(&f.name().as_str()) {
+        if [ROW_ID, "file_row_number", "__databrain_file"].iter().any(|n| f.name().eq_ignore_ascii_case(n)) {
             return Err(Error::Spill(format!("a result with a column named {} can't be sorted on disk", f.name())));
         }
         if !survives_duckdb(f.data_type()) {
@@ -242,10 +254,8 @@ fn build_view(plan: Plan, spec: &ViewSpec) -> Result<Spill> {
     };
     sorter.sort(&job).map_err(Error::Spill)?;
     drop(keys);
-    // `out` (empty) hands the folder over to the sorted file's rows.
-    let rows = Spill::from_file(plan.dir, file, ext)?;
-    std::mem::forget(out);
-    Ok(rows)
+    // The sorted file's rows, sharing the folder with `out` (empty).
+    out.with_file(file)
 }
 
 /// Build the view of `spec` for a result on disk (once), reading its files
@@ -277,16 +287,30 @@ pub fn prepare_view(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec) -> Result<()> {
     Ok(())
 }
 
+/// Run `f` on the result with the view of `spec` ready, built without the
+/// lock. A request for another view can replace it in between: then it is
+/// built again (a few times) before `f` would build it under the lock.
+pub fn with_view<T>(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec, f: impl FnOnce(&mut ResultSet) -> Result<T>) -> Result<T> {
+    for _ in 0..3 {
+        prepare_view(rs, spec)?;
+        let mut g = rs.lock();
+        if g.view_ready(spec) {
+            return f(&mut g);
+        }
+    }
+    f(&mut rs.lock())
+}
+
 /// The rows of `spec` to read without the lock (None: the result is in memory).
 fn snapshot(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec) -> Result<Option<(Files, bool, SchemaRef)>> {
-    prepare_view(rs, spec)?;
-    let mut g = rs.lock();
-    if !g.is_on_disk() {
-        return Ok(None);
-    }
-    let schema = g.schema();
-    let (files, ids) = g.disk_snapshot(spec)?;
-    Ok(Some((files, ids, schema)))
+    with_view(rs, spec, |g| {
+        if !g.is_on_disk() {
+            return Ok(None);
+        }
+        let schema = g.schema();
+        let (files, ids) = g.disk_snapshot(spec)?;
+        Ok(Some((files, ids, schema)))
+    })
 }
 
 /// Every row of the view, a batch at a time (the result's own types). A
@@ -294,7 +318,11 @@ fn snapshot(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec) -> Result<Option<(Files
 pub fn for_each_batch(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec, chunk: usize, f: &mut dyn FnMut(RecordBatch) -> Result<()>) -> Result<()> {
     match snapshot(rs, spec)? {
         Some((files, ids, schema)) => each(&files, ids, &schema, chunk, f),
-        None => rs.lock().for_each_batch(spec, chunk, f),
+        None => {
+            // In memory: the batches are taken under the lock, used after it.
+            let batches = rs.lock().view_batches(spec, chunk)?;
+            batches.into_iter().try_for_each(f)
+        }
     }
 }
 

@@ -175,8 +175,17 @@ impl Spill {
     /// groups) in `dir`, which goes with it. Columns are cast back to
     /// `schema`'s types (an error when a value doesn't fit, never NULL).
     pub fn from_file(dir: PathBuf, file: PathBuf, schema: SchemaRef) -> Result<Self> {
+        Self::from_file_in(Arc::new(DirGuard(dir)), file, schema)
+    }
+
+    /// The rows of `file` (in this spill's folder), in a new [`Spill`] that
+    /// shares the folder: it stays while either does.
+    pub fn with_file(&self, file: PathBuf) -> Result<Self> {
+        Self::from_file_in(self.dir.clone(), file, self.schema.clone())
+    }
+
+    fn from_file_in(guard: Arc<DirGuard>, file: PathBuf, schema: SchemaRef) -> Result<Self> {
         use parquet::file::reader::FileReader;
-        let guard = Arc::new(DirGuard(dir));
         let reader = parquet::file::reader::SerializedFileReader::new(std::fs::File::open(&file).map_err(io)?).map_err(io)?;
         let meta = reader.metadata();
         let mut chunks = Vec::new();
@@ -307,8 +316,10 @@ impl Spill {
         self.pending = vec![all.clone()];
         let bytes = written?;
         self.chunks.push(Chunk { path, row_group: 0, start, rows, bytes });
+        // `rest` is a slice of the whole: its share of the bytes, not the
+        // whole buffers' size (which would write needlessly small files).
+        self.pending_bytes = (self.pending_bytes as u128 * rest.num_rows() as u128 / all.num_rows().max(1) as u128) as usize;
         self.pending_rows = rest.num_rows();
-        self.pending_bytes = databrain_connector_core::memory_size([&rest]);
         self.pending = if rest.num_rows() > 0 { vec![rest] } else { Vec::new() };
         Ok(())
     }

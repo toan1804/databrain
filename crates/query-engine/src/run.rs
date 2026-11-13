@@ -477,8 +477,9 @@ impl QueryEngine {
                             cancel.cancel();
                             break;
                         }
-                        // Pages and files waiting still use memory: other programs first.
-                        if let Some(free) = self.outputs.low_memory() {
+                        // On disk the result holds little memory (a file's rows and a
+                        // few pages): it stops only when memory is critically low.
+                        if let Some(free) = self.outputs.critically_low_memory() {
                             low_free = Some(free);
                             cancel.cancel();
                             break;

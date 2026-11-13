@@ -77,7 +77,7 @@ const FREE_CHECK_EVERY: std::time::Duration = std::time::Duration::from_millis(2
 struct FreeCheck {
     probe: FreeMemoryProbe,
     floor: u64,
-    /// When it was last read, and whether it was below the floor then.
+    /// When it was last read, and what it read.
     last: Option<(std::time::Instant, Option<u64>)>,
 }
 /// Largest active output saved on quit (in-memory size).
@@ -276,16 +276,31 @@ impl OutputRegistry {
     }
 
     fn check(slot: &Mutex<Option<FreeCheck>>) -> Option<u64> {
+        Self::read(slot, 1)
+    }
+
+    /// The free amount when it's below `floor / divisor` (read at most
+    /// every 200 ms; between reads the last reading holds).
+    fn read(slot: &Mutex<Option<FreeCheck>>, divisor: u64) -> Option<u64> {
         let mut g = slot.lock();
         let c = g.as_mut()?;
-        if let Some((at, low)) = c.last
-            && at.elapsed() < FREE_CHECK_EVERY
-        {
-            return low;
-        }
-        let low = (c.probe)().filter(|free| *free < c.floor);
-        c.last = Some((std::time::Instant::now(), low));
-        low
+        let free = match c.last {
+            Some((at, free)) if at.elapsed() < FREE_CHECK_EVERY => free,
+            _ => {
+                let free = (c.probe)();
+                c.last = Some((std::time::Instant::now(), free));
+                free
+            }
+        };
+        let floor = c.floor / divisor.max(1);
+        free.filter(|f| *f < floor)
+    }
+
+    /// The computer's free memory when it is below half the floor: a result
+    /// already on disk holds little memory (a file's rows and a few pages),
+    /// so it stops only then.
+    pub fn critically_low_memory(&self) -> Option<u64> {
+        Self::read(&self.free, 2)
     }
 
     /// Enable snapshots of pinned outputs and restore the saved ones.
