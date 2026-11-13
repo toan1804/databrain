@@ -4,6 +4,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.4.1 - 2026-11-13
+
 ### Added
 
 - Keep a result: **Keep** on a result's toolbar keeps it in the tab when you run another query, as a tab of its own (with a pin) before the new results, so you can switch between them. It stays in memory, and after a restart, until you stop keeping it (× on its tab, or **Kept** on the toolbar) or close the editor tab.
