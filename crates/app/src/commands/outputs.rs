@@ -107,3 +107,13 @@ pub(crate) async fn compare_suggest_keys(
 ) -> R<Vec<String>> {
     api::compare_suggest_keys(&state, &before, &after, mapping.unwrap_or_default(), exact.unwrap_or(false)).await
 }
+
+#[tauri::command]
+pub(crate) fn results_memory(state: State<'_, AppState>) -> api::ResultsMemory {
+    api::results_memory(&state)
+}
+
+#[tauri::command]
+pub(crate) fn set_results_memory(state: State<'_, AppState>, mb: Option<u64>) -> R<api::ResultsMemory> {
+    api::set_results_memory(&state, mb)
+}

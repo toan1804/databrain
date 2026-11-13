@@ -126,7 +126,7 @@ pub fn checked_duckdb_library(path: &str) -> Result<PathBuf> {
 
 /// Settings the webview may not write directly: they name code that the app
 /// loads or downloads, so they change only through their own commands.
-pub const PROTECTED_SETTINGS: &[&str] = &[crate::api::DUCKDB_LIBRARY_SETTING, crate::api::ORACLE_AGENT_URL_SETTING];
+pub const PROTECTED_SETTINGS: &[&str] = &[crate::api::DUCKDB_LIBRARY_SETTING, crate::api::ORACLE_AGENT_URL_SETTING, crate::api::RESULTS_MEMORY_SETTING];
 
 #[cfg(test)]
 mod tests {

@@ -116,7 +116,7 @@ after the loop
 | What | How |
 |---|---|
 | A run | `cancel(job_id)` cancels the job's token. Each statement runs with a child token passed to the connector in `ExecOptions::cancel`; the connector stops the server side and the stream ends with a `cancelled` error. The loop checks the token before each statement. Status `Cancelled`. |
-| Row limit reached | `collect_stream` cancels only that statement's child token, then reads the stream to its end (15 s at most) so the cancel can't hit the next statement. The same happens when the rows kept reach half the outputs budget (512 MB by default): the batch is cut to what fits (at least one row) and copied, and the notice says so. A job export or load step refuses a capped output, its own or one it reads. |
+| Row limit reached | `collect_stream` cancels only that statement's child token, then reads the stream to its end (15 s at most) so the cancel can't hit the next statement. The same happens when the rows kept reach half the outputs budget (counted with `memory_size`, each buffer once): the batch is cut to what fits (at least one row) and copied, and the notice says so; and when the computer's free memory drops below the floor (`low_memory`: the app's probe, read at most every 200 ms; a tenth of the memory, at least 500 MB), the result keeps its rows so far. A job export or load step refuses a capped output, its own or one it reads. |
 | Closing a tab | `close_tab` cancels its jobs, drops its sessions, frees its unnamed, unpinned outputs. |
 | `run_and_wait` | forwards the caller's token to `cancel` once. |
 | Export, connection test | `cancel_export`, `cancel_test`: own token maps. |
@@ -162,7 +162,7 @@ Every result set of a run becomes an output (`OutputRegistry::add`): handle `rN`
 |---|---|
 | `active` | From its tab's latest run (`begin_run` clears it), or kept. Never evicted. |
 | kept | The user's "Keep" on a result (`set_kept`): `begin_run` leaves it active, so it stays in its tab's results (and is saved with them on quit) until let go or the tab closes. Letting go of one carried from an earlier run makes it recent at once. |
-| recent | `Live`, not active, not pinned. Freed least recently used first above the budget (`enforce_budget`, 1 GB by default, counted from the size at registration). |
+| recent | `Live`, not active, not pinned. Freed least recently used first above the budget (`enforce_budget`, counted from the size at registration). The app sets the budget at start (`apply_results_memory`): a quarter of the computer's memory between 512 MB and 16 GB (`auto_budget`; 1 GB when unknown), or the `results_memory_mb` setting. |
 | pinned | Never evicted; `set_pinned` writes a Parquet snapshot under `<app data>/outputs/` and an `outputs` row. Loaded on first use after a restart (`OnDisk` → `ensure_loaded`). |
 | `Evicted` | Rows gone, metadata kept; at most `MAX_ENTRIES` (400) entries in all, oldest evicted ones dropped first (`trim_entries`). |
 

@@ -1809,3 +1809,44 @@ async fn cost_preview_is_refused_without_an_estimate() {
     assert_eq!(e.kind, "unsupported", "{}", e.message);
     assert!(e.message.contains("SQLite"), "{}", e.message);
 }
+
+/// Settings → Results memory: automatic from the computer's memory, or a
+/// chosen size within 256 MB and the computer's memory; set only here.
+#[test]
+fn results_memory_is_automatic_or_chosen() {
+    let (st, _sink, _dir) = state();
+    apply_results_memory(&st);
+    let m = results_memory(&st);
+    assert_eq!((m.custom_mb, m.budget), (None, m.auto), "automatic by default");
+    assert_eq!(m.auto as usize, databrain_query_engine::outputs::auto_budget(crate::sysmem::total()));
+
+    let m = set_results_memory(&st, Some(768)).unwrap();
+    assert_eq!((m.custom_mb, m.budget), (Some(768), 768 << 20));
+    assert_eq!(st.engine.outputs().budget(), 768 << 20, "applied at once");
+
+    assert!(set_results_memory(&st, Some(100)).unwrap_err().message.contains("256 MB"));
+    if let Some(t) = crate::sysmem::total() {
+        let too_big = t / (1024 * 1024) + 1;
+        assert!(set_results_memory(&st, Some(too_big)).is_err());
+    }
+    assert_eq!(results_memory(&st).custom_mb, Some(768), "a refused size changes nothing");
+    assert!(set_setting(&st, RESULTS_MEMORY_SETTING, serde_json::json!(1)).is_err(), "not through set_setting");
+
+    let m = set_results_memory(&st, None).unwrap();
+    assert_eq!((m.custom_mb, m.budget), (None, m.auto), "back to automatic");
+}
+
+/// DuckDB gets what the results budget and the free-memory floor leave: at
+/// most its default 80%, at least 512 MB.
+#[test]
+fn duckdb_gets_the_memory_left_over() {
+    const GB: u64 = 1 << 30;
+    let limit = |total: u64| {
+        let budget = databrain_query_engine::outputs::auto_budget(Some(total)) as u64;
+        duckdb_memory_limit(total, budget, databrain_query_engine::outputs::free_floor(Some(total)))
+    };
+    assert_eq!(limit(16 * GB), 16 * GB - 4 * GB - 16 * GB / 10);
+    assert_eq!(limit(8 * GB), 8 * GB - 2 * GB - 8 * GB / 10);
+    assert_eq!(limit(GB), 512 << 20, "at least 512 MB");
+    assert_eq!(duckdb_memory_limit(100 * GB, GB, GB), 80 * GB, "at most 80%");
+}

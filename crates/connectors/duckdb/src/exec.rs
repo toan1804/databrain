@@ -144,4 +144,32 @@ mod tests {
         assert!(r.unwrap_err().to_string().contains("boom"));
         assert_eq!(q(s.as_ref(), "select 1").await.num_rows(), 1, "the session still works");
     }
+
+    /// New sessions spill into the app's folder within the memory limit it
+    /// sets, sandboxed ones too: a sort bigger than memory finishes there,
+    /// where DuckDB's default (`.tmp` in the current directory, `/` for an app
+    /// started from Finder) failed.
+    #[tokio::test]
+    async fn sessions_spill_into_the_apps_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("duckdb_spill").to_string_lossy().into_owned();
+        crate::set_spill_dir(Some(spill.clone()));
+        crate::set_memory_limit(Some(200 * 1024 * 1024));
+        let mut sandboxed = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+        sandboxed.options.insert(databrain_connector_core::SANDBOX_OPTION.into(), "1".into());
+        let plain = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        let sandboxed = session(sandboxed).await;
+        crate::set_spill_dir(None);
+        crate::set_memory_limit(None);
+        for s in [plain.as_ref(), sandboxed.as_ref()] {
+            let r = q(s, "select current_setting('temp_directory'), current_setting('memory_limit')").await;
+            let b = &r.batches[0];
+            let col = |i: usize| databrain_connector_core::arrow::array::AsArray::as_string::<i32>(b.column(i)).value(0).to_string();
+            assert_eq!(col(0), spill);
+            assert!(col(1).starts_with("190") || col(1).starts_with("200"), "{}", col(1));
+            // ~1 GB of rows to sort with 200 MB: spilled, not failed.
+            let r = q(s, "select count(*) from (select range, md5(range::varchar) s from range(8000000) order by s)").await;
+            assert_eq!(r.num_rows(), 1);
+        }
+    }
 }

@@ -57,9 +57,11 @@ async fn serve() -> ExitCode {
     }
     let engine = QueryEngine::new(crate::api::registry_with_outputs(Some(slot.clone())), ws, secrets, Arc::new(ResultStore::new()), hub.clone());
     slot.set(engine.external_tables());
+    crate::api::apply_results_memory_to(&engine);
     // Pinned outputs saved by the app are readable (read-only use) here too.
     if let Some(dir) = path.parent() {
         engine.outputs().set_snapshot_dir(dir.join("outputs"));
+        crate::api::set_duckdb_spill_dir(dir);
         // Extensions copied there by the app.
         #[cfg(feature = "duckdb")]
         databrain_connector_duckdb::set_extension_dir(Some(dir.join("duckdb_extensions").to_string_lossy().into_owned()));

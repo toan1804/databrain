@@ -172,6 +172,26 @@ jobs:
           cp "$b"/appimage/*.AppImage.sig updater/ 2>/dev/null || true
           ls -l updater
 
+      # The no-DuckDB build must stay under 30 MB (AGENTS.md): fail the
+      # release before anything is attached when a download is bigger.
+      - name: Check the no-DuckDB download size
+        if: matrix.script == 'app:build:no-duckdb'
+        shell: bash
+        run: |
+          limit=30000000
+          fail=0
+          b="target/${{ matrix.target }}/release/bundle"
+          for f in "$b"/dmg/*.dmg "$b"/macos/*.app.tar.gz; do
+            [ -f "$f" ] || continue
+            size=$(wc -c < "$f" | tr -d ' ')
+            echo "$(basename "$f"): $size bytes (limit $limit)"
+            if [ "$size" -gt "$limit" ]; then
+              echo "::error::$(basename "$f") is $size bytes, over the 30 MB limit for the no-DuckDB build"
+              fail=1
+            fi
+          done
+          exit $fail
+
       # Signed statement that these files were built by this workflow from
       # this commit, recorded in the repository's attestations.
       - name: Attest build provenance

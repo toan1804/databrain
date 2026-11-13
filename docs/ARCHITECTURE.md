@@ -243,7 +243,7 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 
 - Every result set gets a handle `rN` (the counter persists), an optional name, and provenance: SQL, connection, row limit, whether it was truncated.
 - A rerun of a named output keeps up to 5 versions (`name`, `name__1`, ...).
-- The outputs of each tab's latest run, and results the user kept in the tab ("Keep": shown next to later runs' results), are never evicted. Older unpinned outputs are freed least recently used first above a 1 GB budget; their metadata stays.
+- The outputs of each tab's latest run, and results the user kept in the tab ("Keep": shown next to later runs' results), are never evicted. Older unpinned outputs are freed least recently used first above the results budget (a quarter of the computer's memory, 512 MB to 16 GB, or the size chosen in Settings → Queries); their metadata stays.
 - Pinned outputs are written as Parquet under `<app data>/outputs/` and recorded in the workspace `outputs` table; they load lazily after a restart. Each tab's latest outputs are also saved on quit (up to 64 MB each) so a reopened tab shows its last result.
 
 **SQL over outputs.** The DuckDB connector attaches an in-memory `results` catalog (`ATTACH ':memory:' AS results`). An output is loaded into it when SQL references `results.<handle or name>`, and reloaded when the name points at new data. The "Results (DuckDB)" connection is created on first use; it joins outputs from different databases, runs result diffs (generated `ANTI JOIN` / `IS DISTINCT FROM` SQL, or `EXCEPT ALL` without keys) and backs job steps that combine connections.

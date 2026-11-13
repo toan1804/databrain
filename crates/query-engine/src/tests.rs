@@ -763,6 +763,95 @@ async fn a_result_stops_at_the_memory_cap() {
     assert!(notices.iter().any(|n| n.contains("8 MB a result may keep")), "{notices:?}");
 }
 
+/// The budget follows the computer's memory: a quarter, between 512 MB and
+/// 16 GB; 1 GB when unknown. A result leaves a tenth free, at least 500 MB.
+#[test]
+fn the_budget_follows_the_computers_memory() {
+    use crate::outputs::{auto_budget, free_floor, size_text};
+    const GB: u64 = 1 << 30;
+    assert_eq!(auto_budget(Some(8 * GB)), (2 * GB) as usize);
+    assert_eq!(auto_budget(Some(16 * GB)), (4 * GB) as usize);
+    assert_eq!(auto_budget(Some(GB)), 512 << 20, "at least 512 MB");
+    assert_eq!(auto_budget(Some(256 * GB)), (16 * GB) as usize, "at most 16 GB");
+    assert_eq!(auto_budget(None), GB as usize);
+    assert_eq!(free_floor(Some(16 * GB)), 16 * GB / 10);
+    assert_eq!(free_floor(Some(2 * GB)), 500 << 20);
+    assert_eq!(free_floor(None), 500 << 20);
+    assert_eq!((size_text(2 << 30), size_text(1536 << 20), size_text(512 << 20)), ("2 GB".into(), "1.5 GB".into(), "512 MB".into()));
+}
+
+fn outcome(evs: &[JobEvent]) -> (databrain_result_store::ResultInfo, Vec<String>) {
+    evs.iter()
+        .find_map(|e| match e {
+            JobEvent::StatementFinished { result: Some(r), notices, .. } => Some((r.clone(), notices.clone())),
+            _ => None,
+        })
+        .expect("finished")
+}
+
+/// A result stops loading when the computer runs low on free memory, keeping
+/// the rows so far and saying why; with memory to spare it loads in full.
+#[tokio::test]
+async fn a_result_stops_when_free_memory_runs_low() {
+    let f = fixture(EnvTag::Dev);
+    let sql = "with recursive n(i) as (select 1 union all select i + 1 from n where i < 20000) select i, 'row ' || i as s from n";
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(8 << 30));
+    let probe = free.clone();
+    f.engine.outputs().set_free_memory_probe(Some(Arc::new(move || Some(probe.load(std::sync::atomic::Ordering::Relaxed)))), 500 << 20);
+    let mut r = req(&f, sql);
+    r.row_limit = None;
+    let (info, _) = outcome(&wait_job(&f, &started(f.engine.run(r.clone()).unwrap())).await);
+    assert!(!info.truncated && info.total_rows == 20000, "{info:?}");
+
+    free.store(300 << 20, std::sync::atomic::Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(250)); // past the 200 ms between reads
+    let (info, notices) = outcome(&wait_job(&f, &started(f.engine.run(r).unwrap())).await);
+    assert!(info.truncated && info.total_rows > 0 && info.total_rows < 20000, "{info:?}");
+    assert!(notices.iter().any(|n| n.contains("low on free memory (300 MB free)")), "{notices:?}");
+}
+
+/// The free memory is read at most every 200 ms while rows load.
+#[test]
+fn free_memory_is_read_sparingly() {
+    let f = fixture(EnvTag::Dev);
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n = reads.clone();
+    f.engine.outputs().set_free_memory_probe(
+        Some(Arc::new(move || {
+            n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(100)
+        })),
+        500,
+    );
+    for _ in 0..1000 {
+        assert_eq!(f.engine.outputs().low_memory(), Some(100));
+    }
+    assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+    f.engine.outputs().set_free_memory_probe(None, 0);
+    assert_eq!(f.engine.outputs().low_memory(), None, "off");
+}
+
+/// Lowering the budget frees older results at once (the latest of a tab stays).
+#[tokio::test]
+async fn a_lower_budget_frees_older_results() {
+    let f = fixture(EnvTag::Dev);
+    let sql = "with recursive n(i) as (select 1 union all select i + 1 from n where i < 300) select i, randomblob(100000) as b from n"; // ~30 MB each: above the 16 MB floor
+    for _ in 0..2 {
+        // A new run in the tab makes its earlier result an older one.
+        f.engine.outputs().begin_run("a");
+        let mut r = req(&f, sql);
+        r.tab_id = "a".into();
+        r.row_limit = None;
+        wait_job(&f, &started(f.engine.run(r).unwrap())).await;
+    }
+    let live = |f: &Fixture| f.engine.outputs().list().into_iter().filter(|o| o.state == crate::outputs::OutputState::Live).count();
+    assert_eq!(live(&f), 2);
+    let used = f.engine.outputs().used();
+    f.engine.outputs().set_budget(used - 1);
+    assert_eq!(live(&f), 1, "the older result is freed");
+    assert!(f.engine.outputs().used() < used);
+}
+
 /// Freeing a result that has an output drops the output too: no output
 /// stays listed (Live) whose rows are gone.
 #[tokio::test]

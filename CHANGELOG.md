@@ -4,8 +4,13 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Changed
+
+- The memory query results may use follows the computer instead of a fixed 1 GB: a quarter of its memory, between 512 MB and 16 GB (2 GB on an 8 GB laptop, 16 GB on a 64 GB workstation), or a size chosen in Settings → Queries → Memory for results. One result still keeps at most half. A result also stops early, keeping the rows it has, when the computer runs low on free memory (under a tenth of it, at least 500 MB), so other programs aren't pushed into swap. The Outputs panel shows the memory used of the budget. DuckDB gets the memory left over for its own work (at most its default 80%), so the two can't promise more than the computer has.
+
 ### Fixed
 
+- DuckDB work bigger than memory (a large sort, join or `GROUP BY` over a big file or Iceberg table) failed in the installed app with "Failed to create directory .tmp: Read-only file system": in-memory DuckDB spills into its current directory, which is `/` for an app started from Finder. It now spills into DataBrain's own folder (`duckdb_spill`), sandboxed AI sessions included.
 - Opening an Excel workbook with many sheets is much faster (40 sheets: 12 s → 0.5 s) and no longer stalls the app while it reads. Sheets are read as a stream, so a sheet with a million rows opens in about a second and a half instead of ten, without holding its whole XML in memory; DuckDB reads every row only when a column mixes numbers and text. Comparing one sheet of a workbook reads only that sheet.
 - Results from DuckDB (local files included) and Databricks were measured at many times their real size, so wide results stopped far too early with "they fill the 512 MB a result may keep": a 40-column result after a few thousand rows, a 1,000,000-row Excel sheet at 824,347. Each buffer is now counted once, however many columns share it; results and outputs keep what really fits.
 - DuckDB results stream: a query without `LIMIT` (a whole file, a big table) shows its first rows as soon as they're read instead of after DuckDB has built the entire result, and stopping at the row limit doesn't read the rest.
