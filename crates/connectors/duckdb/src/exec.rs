@@ -136,14 +136,17 @@ mod tests {
         .expect("the first rows come before the whole result is made");
         assert_eq!(first, 1000);
         cancel.cancel();
-        drop(st);
+        // Read the stopped stream to its end before the next statement, as
+        // the engine does: otherwise the interrupt can hit the next one.
+        while st.next().await.is_some() {}
         let r = s
             .execute("select case when range < 300000 then range else error('boom at ' || range) end as v from range(400000)", ExecOptions::default())
             .await
             .unwrap()
             .collect()
             .await;
-        assert!(r.unwrap_err().to_string().contains("boom"));
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("boom"), "{e}");
         assert_eq!(q(s.as_ref(), "select 1").await.num_rows(), 1, "the session still works");
     }
 
