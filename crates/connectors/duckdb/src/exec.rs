@@ -51,18 +51,22 @@ pub(crate) fn run(
         tx.blocking_send(Ok(StreamEvent::Done(ExecSummary { rows_affected: Some(n as u64) })));
         return Ok(());
     }
-    let arrow = stmt.query_arrow([]).map_err(map_err)?;
-    let schema = arrow.get_schema();
+    // Streamed: chunks are fetched as they are read, so a run that stops at
+    // the row limit (or is cancelled) doesn't wait for the whole result,
+    // which `query_arrow` would build first (a whole file, for a read without
+    // LIMIT). `step` reports a failed chunk as an error.
+    let schema = stmt.stream_arrow([]).map_err(map_err)?.get_schema();
     // Schema first (even for empty results).
     let empty = arrow58::record_batch::RecordBatch::new_empty(schema);
     let first = convert_batch(&empty)?;
     if !tx.blocking_send(Ok(StreamEvent::Schema(first.schema()))) {
         return Ok(());
     }
-    for b in arrow {
+    while let Some(array) = stmt.step().map_err(map_err)? {
         if opts.cancel.is_cancelled() {
             return Err(ConnectorError::cancelled());
         }
+        let b = arrow58::record_batch::RecordBatch::from(&array);
         // Re-chunk to the requested batch size.
         let size = opts.batch_size.max(1);
         let mut off = 0;
@@ -102,5 +106,42 @@ mod tests {
         let e = tokio::time::timeout(std::time::Duration::from_secs(10), st.collect()).await.unwrap().unwrap_err();
         assert!(e.is_cancelled(), "{e:?}");
         assert_eq!(q(s.as_ref(), "select 1").await.num_rows(), 1);
+    }
+
+    /// Rows come as they are made: the first batch of a huge result arrives
+    /// before the rest is computed, and a failure part way through is an
+    /// error (not a panic), after the rows before it.
+    #[tokio::test]
+    async fn results_stream() {
+        let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        let cancel = databrain_connector_core::CancellationToken::new();
+        let mut st = s
+            .execute(
+                "select a.range, md5(a.range::varchar) from range(2000000000) a",
+                ExecOptions { batch_size: 1000, cancel: cancel.clone(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(ev) = st.next().await {
+                if let databrain_connector_core::StreamEvent::Batch(b) = ev.unwrap() {
+                    return b.num_rows();
+                }
+            }
+            0
+        })
+        .await
+        .expect("the first rows come before the whole result is made");
+        assert_eq!(first, 1000);
+        cancel.cancel();
+        drop(st);
+        let r = s
+            .execute("select case when range < 300000 then range else error('boom at ' || range) end as v from range(400000)", ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(r.unwrap_err().to_string().contains("boom"));
+        assert_eq!(q(s.as_ref(), "select 1").await.num_rows(), 1, "the session still works");
     }
 }

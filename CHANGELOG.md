@@ -4,6 +4,16 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Fixed
+
+- Opening an Excel workbook with many sheets is much faster (40 sheets: 12 s → 0.5 s) and no longer stalls the app while it reads. Sheets are read as a stream, so a sheet with a million rows opens in about a second and a half instead of ten, without holding its whole XML in memory; DuckDB reads every row only when a column mixes numbers and text. Comparing one sheet of a workbook reads only that sheet.
+- Results from DuckDB (local files included) and Databricks were measured at many times their real size, so wide results stopped far too early with "they fill the 512 MB a result may keep": a 40-column result after a few thousand rows, a 1,000,000-row Excel sheet at 824,347. Each buffer is now counted once, however many columns share it; results and outputs keep what really fits.
+- DuckDB results stream: a query without `LIMIT` (a whole file, a big table) shows its first rows as soon as they're read instead of after DuckDB has built the entire result, and stopping at the row limit doesn't read the rest.
+- Importing a file loaded only its first 1,000 rows (the preview's `LIMIT`). An import now reads the whole file.
+- "Load into…" on a result that stopped at the row limit or the memory a result may keep can load every row: it runs your query again and writes the rows as they arrive, so none of the limits apply and the rows are never all in memory (the default for a cut result; "Only the rows of the result" keeps the old behavior). Only your own read queries run again, not ones the AI or a client ran.
+- An Excel workbook whose first sheet is empty (a blank cover sheet) opens its first sheet with data instead of failing with "No rows found in xlsx file".
+- Excel: a title above the table ("Quarterly report" over the real header) is no longer taken for the header, and a stray value far from the table (e.g. in `KO5001`) no longer turns the sheet into hundreds of empty columns. The SQL notes the cells it leaves out (`-- The table reads A4:D30 of A1:KO5001 …`).
+
 ## 0.4.1 - 2026-11-13
 
 ### Added

@@ -4,9 +4,14 @@
 use super::*;
 
 #[tauri::command]
-pub(crate) async fn file_scan_sql(path: String, all_sheets: Option<bool>) -> R<String> {
+pub(crate) async fn file_scan_sql(path: String, all_sheets: Option<bool>, preview: Option<bool>) -> R<String> {
+    // Reads the workbook (a few reads per sheet): off the async runtime.
     #[cfg(feature = "duckdb-engine")]
-    return api::file_scan_sql(&paths::checked_str(&path, paths::Purpose::Read)?, all_sheets.unwrap_or(false));
+    return api::blocking({
+        let path = paths::checked_str(&path, paths::Purpose::Read)?;
+        move || api::file_scan_sql_with(&path, all_sheets.unwrap_or(false), preview.unwrap_or(true))
+    })
+    .await;
     #[cfg(not(feature = "duckdb-engine"))]
     Err(databrain_query_engine::EngineError::new("invalid", format!("DuckDB support is not built in ({path})")))
 }
@@ -14,7 +19,11 @@ pub(crate) async fn file_scan_sql(path: String, all_sheets: Option<bool>) -> R<S
 #[tauri::command]
 pub(crate) async fn excel_sheets(path: String) -> R<Vec<api::ExcelSheet>> {
     #[cfg(feature = "duckdb-engine")]
-    return api::excel_sheets(&paths::checked_str(&path, paths::Purpose::Read)?);
+    return api::blocking({
+        let path = paths::checked_str(&path, paths::Purpose::Read)?;
+        move || api::excel_sheets(&path)
+    })
+    .await;
     #[cfg(not(feature = "duckdb-engine"))]
     Err(databrain_query_engine::EngineError::new("invalid", format!("DuckDB support is not built in ({path})")))
 }

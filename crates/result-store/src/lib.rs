@@ -206,8 +206,8 @@ impl ResultSet {
 
     pub fn memory_bytes(&self) -> usize {
         match &self.combined {
-            Some(c) => c.get_array_memory_size(),
-            None => self.batches.iter().map(|b| b.get_array_memory_size()).sum(),
+            Some(c) => databrain_connector_core::memory_size([c]),
+            None => databrain_connector_core::memory_size(&self.batches),
         }
     }
 

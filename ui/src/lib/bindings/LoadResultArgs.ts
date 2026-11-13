@@ -8,4 +8,9 @@ export type LoadResultArgs = { target_connection_id: string, table: string, mode
 /**
  * The user confirmed writing into a production connection.
  */
-confirmed: boolean, };
+confirmed: boolean, 
+/**
+ * The result was cut short (row limit or memory): run its query again
+ * and load every row it returns, streamed, instead of the rows held.
+ */
+every_row?: boolean | null, };

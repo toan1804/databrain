@@ -31,7 +31,7 @@ pub use conn_state::ConnState;
 pub use error::{ConnectorError, ErrorKind, Result};
 pub use quote::*;
 pub use sqlparser;
-pub use stream::{Collected, ExecOptions, ExecSummary, QueryStream, StreamEvent, StreamSender};
+pub use stream::{Collected, ExecOptions, ExecSummary, QueryStream, StreamEvent, StreamSender, memory_size};
 pub use tokio_util::sync::CancellationToken;
 pub use traits::{QueryLanguage, SourceTraits};
 pub use types::*;

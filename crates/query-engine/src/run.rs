@@ -444,7 +444,7 @@ impl QueryEngine {
                     // Stop at the memory a result may keep, like the row
                     // cap: the rows that fit, copied so the rest of the
                     // batch's buffers are freed.
-                    let size = batch.get_array_memory_size();
+                    let size = databrain_connector_core::memory_size([&batch]);
                     if bytes + size > max_bytes && batch.num_rows() > 0 {
                         let keep = ((max_bytes.saturating_sub(bytes) as u128 * batch.num_rows() as u128) / size as u128) as usize;
                         // At least one row, so the result shows what it holds.
@@ -455,7 +455,7 @@ impl QueryEngine {
                         too_big = true;
                     }
                     rows += batch.num_rows();
-                    bytes += batch.get_array_memory_size();
+                    bytes += databrain_connector_core::memory_size([&batch]);
                     rs.lock().push(batch);
                     if truncated {
                         cancel.cancel();

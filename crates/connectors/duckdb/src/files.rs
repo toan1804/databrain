@@ -2,7 +2,7 @@ use databrain_connector_core::{ConnectionConfig, ConnectorError, ConnectorKind, 
 
 use crate::engine::load_extension;
 use crate::error::map_err;
-use crate::excel::{excel_scan, excel_sources_with};
+use crate::excel::{ExcelSource, excel_scan, excel_sources_with};
 
 /// How a file is read, from its extension (or directory layout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,15 +120,19 @@ pub(crate) fn attach_files(conn: &duckdb::Connection, files: &[String], all_shee
         // (view name, source, comment): one per sheet for Excel with all sheets.
         let mut views: Vec<(String, String, String)> = Vec::new();
         if fmt == FileFormat::Excel {
-            let srcs = excel_sources_with(conn, f, all_sheets).unwrap_or_else(|_| vec![(String::new(), excel_scan(conn, f, None))]);
+            let srcs = excel_sources_with(conn, f, all_sheets)
+                .unwrap_or_else(|_| vec![ExcelSource { sheet: String::new(), sql: excel_scan(conn, f, None), left_out: None }]);
             let many = srcs.len() > 1;
-            for (i, (sheet, src)) in srcs.into_iter().enumerate() {
+            for (i, ExcelSource { sheet, sql: src, left_out }) in srcs.into_iter().enumerate() {
                 // First sheet keeps the file's name; others are <file>_<sheet>.
                 let safe: String = sheet.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
                 let base = if many && i > 0 { format!("{}_{safe}", f.trim_end_matches(".xlsx").trim_end_matches(".XLSX")) } else { f.clone() };
                 let name = view_name(&base, &taken);
                 taken.push(name.clone());
-                let note = if sheet.is_empty() { format!("File: {f}") } else { format!("File: {f} · sheet {sheet}") };
+                let mut note = if sheet.is_empty() { format!("File: {f}") } else { format!("File: {f} · sheet {sheet}") };
+                if let Some(l) = left_out {
+                    note.push_str(&format!(" · {l}"));
+                }
                 views.push((name, src, note));
             }
         } else {

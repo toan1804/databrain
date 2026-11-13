@@ -4,7 +4,7 @@ import { create } from "zustand";
 import type { ExcelSheet } from "../lib/types";
 import { Modal } from "./ui";
 
-/** Answer of the sheet picker: false = first sheet, true = every sheet, null = cancelled. */
+/** Answer of the sheet picker: false = first sheet with data, true = every sheet with data, null = cancelled. */
 type Pick = boolean | null;
 
 interface State {
@@ -13,7 +13,7 @@ interface State {
 
 const useSheetAsk = create<State>(() => ({ ask: null }));
 
-/** Ask whether to read the first sheet or every sheet of a workbook. */
+/** Ask whether to read the first sheet with data or every one of a workbook. */
 export function askExcelSheets(file: string, sheets: ExcelSheet[]): Promise<Pick> {
   return new Promise((resolve) => useSheetAsk.setState({ ask: { file, sheets, resolve } }));
 }
@@ -54,7 +54,7 @@ export function ExcelSheetDialog() {
         <label className="flex cursor-pointer items-start gap-2">
           <input type="radio" name="sheets" className="mt-1" checked={!all} onChange={() => setAll(false)} />
           <span>
-            First sheet only <span className="font-mono text-muted">({ask.sheets[0]?.name})</span>
+            First sheet with data <span className="font-mono text-muted">({used[0]?.name})</span>
           </span>
         </label>
         <label className="flex cursor-pointer items-start gap-2">

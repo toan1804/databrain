@@ -397,6 +397,14 @@ pub async fn schema_diff(
 /// Excel: the first sheet, or one statement per non-empty sheet with `all_sheets`.
 #[cfg(feature = "duckdb-engine")]
 pub fn file_scan_sql(path: &str, all_sheets: bool) -> Result<String> {
+    file_scan_sql_with(path, all_sheets, true)
+}
+
+/// [`file_scan_sql`]; without `preview`, the statements read every row (no
+/// `LIMIT`), for an import.
+#[cfg(feature = "duckdb-engine")]
+pub fn file_scan_sql_with(path: &str, all_sheets: bool, preview: bool) -> Result<String> {
+    let limit = if preview { "\nLIMIT 1000;" } else { ";" };
     use databrain_connector_duckdb::{FileFormat, detect_format, excel_sources, file_scan_expr};
     let fmt = detect_format(path)
         .ok_or_else(|| EngineError::new("invalid", "unsupported file type (use .csv/.tsv/.parquet/.json/.ndjson/.xlsx or a Delta/Iceberg folder)"))?;
@@ -408,14 +416,17 @@ pub fn file_scan_sql(path: &str, all_sheets: bool) -> Result<String> {
         let many = srcs.len() > 1;
         return Ok(srcs
             .into_iter()
-            .map(|(sheet, src)| {
-                let label = if many { format!("-- Sheet: {sheet}\n") } else { String::new() };
-                format!("{label}SELECT *\nFROM {src}\nLIMIT 1000;")
+            .map(|s| {
+                let mut label = if many { format!("-- Sheet: {}\n", s.sheet) } else { String::new() };
+                if let Some(l) = &s.left_out {
+                    label.push_str(&format!("-- The table {l}: title rows above it and cells far from it are left out\n"));
+                }
+                format!("{label}SELECT *\nFROM {}{limit}", s.sql)
             })
             .collect::<Vec<_>>()
             .join("\n\n"));
     }
-    Ok(format!("SELECT *\nFROM {}\nLIMIT 1000;", file_scan_expr(path, fmt)))
+    Ok(format!("SELECT *\nFROM {}{limit}", file_scan_expr(path, fmt)))
 }
 
 #[derive(Debug, Serialize, ts_rs::TS)]

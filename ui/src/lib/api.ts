@@ -373,7 +373,8 @@ export const api = {
   getNotebook: (id: string) => call<Notebook>("get_notebook", { id }),
   saveNotebook: (notebook: Notebook) => call<Notebook>("save_notebook", { notebook }),
   deleteNotebook: (id: string) => call<void>("delete_notebook", { id }),
-  fileScanSql: (path: string, allSheets = false) => call<string>("file_scan_sql", { path, allSheets }),
+  /** `preview`: `LIMIT 1000` on each statement; false reads every row (an import). */
+  fileScanSql: (path: string, allSheets = false, preview = true) => call<string>("file_scan_sql", { path, allSheets, preview }),
   excelSheets: (path: string) => call<ExcelSheet[]>("excel_sheets", { path }),
 
   listOutputs: () => call<OutputInfo[]>("list_outputs"),

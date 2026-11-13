@@ -8,10 +8,24 @@ import { useStore } from "../../store";
 
 /**
  * Open a local file with DuckDB: reuse/create a "Local files" connection and
- * run a scan query. `importIt`: every row is read (no row limit) and
- * "Load into…" opens on the result, to copy the file into a table.
+ * run a scan query. `importIt`: the query reads every row (no `LIMIT`), the
+ * tab shows the first ones, and "Load into…" opens on the result to copy the
+ * whole file into a table (it streams every row when the result was cut).
  */
+let reading = false;
+
 export async function queryLocalFile(importIt = false) {
+  // Reading a big workbook takes a moment: a second click must not start another.
+  if (reading) return;
+  reading = true;
+  try {
+    await openLocalFile(importIt);
+  } finally {
+    reading = false;
+  }
+}
+
+async function openLocalFile(importIt: boolean) {
   const st = useStore.getState();
   const picked = await openDialog({
     multiple: false,
@@ -20,17 +34,25 @@ export async function queryLocalFile(importIt = false) {
   });
   if (typeof picked !== "string") return;
   try {
-    // Workbooks with several sheets: first sheet (default) or all of them.
+    // Workbooks with several sheets: first sheet with data (default) or all of them.
     let allSheets = false;
     if (/\.xlsx$/i.test(picked)) {
       const sheets = await api.excelSheets(picked);
-      if (sheets.filter((s) => s.range).length > 1) {
+      const used = sheets.filter((s) => s.range).length;
+      if (used === 0) {
+        st.toast("Every sheet in this workbook is empty", "info");
+        return;
+      }
+      if (used > 1) {
         const pick = await askExcelSheets(picked, sheets);
         if (pick === null) return;
         allSheets = pick;
+        if (allSheets) st.toast(`Reading ${used} sheets…`, "info");
       }
     }
-    const sql = await api.fileScanSql(picked, allSheets);
+    // An import reads every row: no LIMIT. The tab shows the first rows (the
+    // row limit); "Load into…" then streams every row of the file.
+    const sql = await api.fileScanSql(picked, allSheets, !importIt);
     let conn = st.connections.find((c) => c.config.kind === "duckdb" && !c.config.file_path);
     if (!conn) {
       const saved = await api.saveConnection({
@@ -51,7 +73,7 @@ export async function queryLocalFile(importIt = false) {
     const id = useStore.getState().newTab({ title: picked.split(/[\\/]/).pop() ?? "file", sql, connection_id: conn.id });
     if (importIt) {
       useStore.getState().setLoadIntoOnResult(id, true);
-      void useStore.getState().runSql(id, conn.id, sql, 0, undefined, undefined, undefined, null);
+      void useStore.getState().runSql(id, conn.id, sql, 0);
     } else void useStore.getState().runTab(id, "all", { doc: sql, selFrom: 0, selTo: 0, cursor: 0 });
   } catch (e) {
     st.toast(toError(e).message, "error");

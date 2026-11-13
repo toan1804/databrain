@@ -77,6 +77,7 @@ async fn loads_a_result_into_another_connection() {
         key_columns: vec!["id".into()],
         create_table: true,
         confirmed: false,
+        every_row: None,
     };
 
     // Dry run keeps nothing.
@@ -187,6 +188,7 @@ async fn checks_the_target_path_before_loading() {
         key_columns: vec![],
         create_table: true,
         confirmed: false,
+        every_row: None,
     };
     let e = api::load_result(&st, &info.id, args.clone(), "x1").await.unwrap_err();
     assert!(e.message.contains("nosuch doesn't exist") && e.message.contains("ATTACH DATABASE"), "{}", e.message);
@@ -242,6 +244,7 @@ async fn loads_into_clickhouse_live() {
         key_columns: vec!["id".into()],
         create_table: true,
         confirmed: false,
+        every_row: None,
     };
     async fn count(st: &AppState, target: &str) -> (String, String) {
         let r = run(st, target, "select count() as n, countIf(name is null) as nulls from databrain_load.people").await.result.unwrap();
@@ -301,6 +304,7 @@ async fn clickhouse_refuses_keyed_loads_up_front() {
             key_columns: vec!["id".into()],
             create_table: true,
             confirmed: false,
+            every_row: None,
         };
         let e = api::load_result(&st, &info.id, args, "k").await.unwrap_err();
         assert!(e.message.contains("ClickHouse can't update rows by key") && e.message.contains("Replace table"), "{}", e.message);
@@ -339,6 +343,7 @@ async fn sync_mirrors_the_rows_by_key() {
         key_columns: vec!["id".into()],
         create_table: true,
         confirmed: false,
+        every_row: None,
     };
 
     let first = run(&st, &duck, "select i as id, 'name ' || i as name from range(25) t(i)").await.result.unwrap();
@@ -367,4 +372,97 @@ async fn sync_mirrors_the_rows_by_key() {
     assert!(e.message.contains("Sync would delete every row"), "{}", e.message);
     let n = run(&st, &target, "select count(*) from people").await.result.unwrap();
     assert_eq!(api::fetch_page(&st, n.id, Default::default(), 0, 1).await.unwrap().rows[0][0].as_deref(), Some("23"));
+}
+
+async fn run_as(
+    st: &AppState,
+    conn: &str,
+    sql: &str,
+    row_limit: Option<usize>,
+    origin: databrain_workspace::Origin,
+) -> databrain_query_engine::StatementOutcomeView {
+    let out = st
+        .engine
+        .run_and_wait(
+            &st.hub,
+            RunRequest {
+                connection_id: conn.into(),
+                tab_id: "t".into(),
+                sql: sql.into(),
+                base_offset: 0,
+                row_limit,
+                confirmed: true,
+                origin,
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+                output_masks: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    out.into_iter().next_back().unwrap()
+}
+
+/// A result cut short by the row limit: "every row" runs its query again and
+/// writes all its rows as they arrive; without it only the rows held load.
+/// Only the user's own reads run again.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_row_runs_a_cut_result_again() {
+    use databrain_workspace::Origin;
+    let st = AppState::new(Arc::new(Workspace::open_in_memory().unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+    let duck = st.engine.results_connection().unwrap().id;
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = ConnectionConfig::new(ConnectorKind::Sqlite, AuthMethod::None);
+    c.file_path = Some(dir.path().join("target.db").to_string_lossy().into_owned());
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "target".into(),
+        config: c,
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    let target =
+        api::save_connection(&st, api::SaveConnectionArgs { profile, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap().id;
+    let sql = "select i as id, 'name ' || i as name from range(30000) t(i)";
+    let info = run_as(&st, &duck, sql, Some(100), Origin::User).await.result.unwrap();
+    assert!(info.truncated && info.total_rows == 100);
+    let args = |every: Option<bool>| LoadResultArgs {
+        target_connection_id: target.clone(),
+        table: "people".into(),
+        mode: LoadMode::Truncate,
+        key_columns: vec![],
+        create_table: true,
+        confirmed: false,
+        every_row: every,
+    };
+
+    let rep = api::load_result(&st, &info.id, args(None), "held").await.unwrap();
+    assert_eq!(rep.rows, 100, "the rows the result holds");
+    let rep = api::load_result(&st, &info.id, args(Some(true)), "every").await.unwrap();
+    assert_eq!(rep.rows, 30000, "every row of the query");
+    let counted = run(&st, &target, "select count(*) as n from people").await.result.unwrap();
+    let page = api::fetch_page(&st, counted.id, Default::default(), 0, 1).await.unwrap();
+    assert_eq!(page.rows[0][0].as_deref(), Some("30000"));
+
+    // A result the AI ran isn't run again as the user.
+    let ai = run_as(&st, &duck, sql, Some(100), Origin::Ai).await.result.unwrap();
+    let e = api::load_result(&st, &ai.id, args(Some(true)), "ai").await.unwrap_err();
+    assert!(e.message.contains("Only your own queries"), "{}", e.message);
+    // Only a read runs again.
+    let spec = databrain_query_engine::LoadSpec { table: "people".into(), create_table: true, ..Default::default() };
+    let cancel = databrain_connector_core::CancellationToken::new();
+    let e = st
+        .engine
+        .load_query(&duck, "t", "create table x as select 1 as a", &target, "w", &spec, &cancel, &databrain_query_engine::NoLoadObserver)
+        .await
+        .unwrap_err();
+    assert!(e.message.contains("Only a query that reads"), "{}", e.message);
+    assert!(run(&st, &duck, "select * from x").await.error.is_some(), "nothing ran");
 }
