@@ -62,6 +62,7 @@ async fn serve() -> ExitCode {
     if let Some(dir) = path.parent() {
         engine.outputs().set_snapshot_dir(dir.join("outputs"));
         crate::api::set_duckdb_spill_dir(dir);
+        crate::api::set_results_spill(&engine, dir);
         // Extensions copied there by the app.
         #[cfg(feature = "duckdb")]
         databrain_connector_duckdb::set_extension_dir(Some(dir.join("duckdb_extensions").to_string_lossy().into_owned()));

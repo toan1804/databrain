@@ -54,7 +54,7 @@ export function restoredRun(tabId: string, outputs: OutputInfo[]): TabRun | null
   const shown = (o: OutputInfo, index: number): StatementRun => ({
     plan: { index, sql: o.sql, start: 0, end: 0, classification: { kind: "read", missing_where: false, keyword: "" } },
     status: "done",
-    result: { id: o.result_id, columns: o.columns, total_rows: o.rows, complete: true, truncated: o.truncated, bytes: o.bytes },
+    result: { id: o.result_id, columns: o.columns, total_rows: o.rows, complete: true, truncated: o.truncated, bytes: o.bytes, on_disk: false, disk_bytes: 0 },
     output: o,
     notices: [RESTORED_NOTICE],
   });

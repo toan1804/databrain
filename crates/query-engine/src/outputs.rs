@@ -77,7 +77,7 @@ const FREE_CHECK_EVERY: std::time::Duration = std::time::Duration::from_millis(2
 struct FreeCheck {
     probe: FreeMemoryProbe,
     floor: u64,
-    /// When it was last read, and whether it was below the floor then.
+    /// When it was last read, and what it read.
     last: Option<(std::time::Instant, Option<u64>)>,
 }
 /// Largest active output saved on quit (in-memory size).
@@ -201,6 +201,7 @@ pub struct OutputRegistry {
     snapshot_dir: Mutex<Option<PathBuf>>,
     budget: Mutex<usize>,
     free: Mutex<Option<FreeCheck>>,
+    disk: Mutex<Option<FreeCheck>>,
 }
 
 /// Name rules: identifier-like, not `r<digits>`, no `__` (version suffix).
@@ -232,6 +233,7 @@ impl OutputRegistry {
             snapshot_dir: Mutex::new(None),
             budget: Mutex::new(DEFAULT_BUDGET),
             free: Mutex::new(None),
+            disk: Mutex::new(None),
         })
     }
 
@@ -256,19 +258,49 @@ impl OutputRegistry {
         *self.free.lock() = probe.map(|probe| FreeCheck { probe, floor, last: None });
     }
 
+    /// Stop writing a result to disk when the free space where results
+    /// spill (read by `probe`) drops below `floor` bytes; None: no check.
+    pub fn set_free_disk_probe(&self, probe: Option<FreeMemoryProbe>, floor: u64) {
+        *self.disk.lock() = probe.map(|probe| FreeCheck { probe, floor, last: None });
+    }
+
+    /// Free disk space where results spill, when below the floor.
+    pub fn low_disk(&self) -> Option<u64> {
+        Self::check(&self.disk)
+    }
+
     /// The computer's free memory when it is below the floor (read at most
     /// every 200 ms; between reads the last answer holds).
     pub fn low_memory(&self) -> Option<u64> {
-        let mut g = self.free.lock();
+        Self::check(&self.free)
+    }
+
+    fn check(slot: &Mutex<Option<FreeCheck>>) -> Option<u64> {
+        Self::read(slot, 1)
+    }
+
+    /// The free amount when it's below `floor / divisor` (read at most
+    /// every 200 ms; between reads the last reading holds).
+    fn read(slot: &Mutex<Option<FreeCheck>>, divisor: u64) -> Option<u64> {
+        let mut g = slot.lock();
         let c = g.as_mut()?;
-        if let Some((at, low)) = c.last
-            && at.elapsed() < FREE_CHECK_EVERY
-        {
-            return low;
-        }
-        let low = (c.probe)().filter(|free| *free < c.floor);
-        c.last = Some((std::time::Instant::now(), low));
-        low
+        let free = match c.last {
+            Some((at, free)) if at.elapsed() < FREE_CHECK_EVERY => free,
+            _ => {
+                let free = (c.probe)();
+                c.last = Some((std::time::Instant::now(), free));
+                free
+            }
+        };
+        let floor = c.floor / divisor.max(1);
+        free.filter(|f| *f < floor)
+    }
+
+    /// The computer's free memory when it is below half the floor: a result
+    /// already on disk holds little memory (a file's rows and a few pages),
+    /// so it stops only then.
+    pub fn critically_low_memory(&self) -> Option<u64> {
+        Self::read(&self.free, 2)
     }
 
     /// Enable snapshots of pinned outputs and restore the saved ones.
@@ -710,6 +742,9 @@ impl OutputRegistry {
                 let existed = path.exists();
                 let save = || -> Result<()> {
                     let rs = self.results.get(&info.result_id).map_err(|e| EngineError::new("not_found", e.to_string()))?;
+                    if rs.lock().is_on_disk() {
+                        return Err(EngineError::new("invalid", "A result larger than memory (its rows are on disk) can't be pinned; export it to keep it."));
+                    }
                     let (schema, batches) = {
                         let mut g = rs.lock();
                         (g.schema(), g.view_batches(&ViewSpec::default(), SNAPSHOT_CHUNK).map_err(|e| EngineError::new("internal", e.to_string()))?)
@@ -769,8 +804,9 @@ impl OutputRegistry {
     }
 
     pub fn get(&self, handle: &str) -> Option<OutputInfo> {
-        let g = self.inner.lock();
-        let mut o = g.by_handle.get(handle).cloned()?;
+        // The registry isn't held while the result's size is read: a long
+        // export or sort of it holds the result's lock.
+        let mut o = self.inner.lock().by_handle.get(handle).cloned()?;
         if o.state == OutputState::Live {
             o.bytes = self.results.bytes_of(&o.result_id);
         }
@@ -913,6 +949,19 @@ impl ExternalTables for OutputTables {
     fn resolve(&self, name: &str) -> std::result::Result<ExternalTable, String> {
         let o = self.0.ensure_loaded(name).map_err(|e| e.message)?;
         let rs = self.0.results.get(&o.result_id).map_err(|e| e.to_string())?;
+        // Larger than memory: its Parquet files (read, or streamed in).
+        let disk = {
+            let g = rs.lock();
+            match (g.spill_files(), g.disk_sql_schema()) {
+                (Some(files), Some(schema)) if g.is_complete() => Some((files, schema)),
+                (Some(_), _) => return Err(format!("results.{name} is still loading; run this again when its query has finished")),
+                _ => None,
+            }
+        };
+        if let Some((files, schema)) = disk {
+            let notice = o.truncated.then(|| format!("results.{name} ({}) holds only the first {} rows — totals over it may be incomplete.", o.handle, o.rows));
+            return Ok(ExternalTable { name: name.to_string(), version_key: o.result_id, schema, batches: vec![], notice, files, hide: vec![] });
+        }
         // Chunks with the result's own types (a single combined batch can need
         // 64-bit offsets, which DuckDB's appender would cast back and overflow).
         let (schema, chunks) = {
@@ -928,7 +977,34 @@ impl ExternalTables for OutputTables {
                 o.row_limit.map(|l| format!(" (row limit {l})")).unwrap_or_default()
             )
         });
-        Ok(ExternalTable { name: name.to_string(), version_key: o.result_id, schema, batches, notice })
+        Ok(ExternalTable { name: name.to_string(), version_key: o.result_id, schema, batches, notice, files: vec![], hide: vec![] })
+    }
+
+    fn for_each_batch(&self, name: &str, f: &mut dyn FnMut(RecordBatch) -> std::result::Result<(), String>) -> std::result::Result<(), String> {
+        let o = self.0.ensure_loaded(name).map_err(|e| e.message)?;
+        let rs = self.0.results.get(&o.result_id).map_err(|e| e.to_string())?;
+        let target = {
+            let g = rs.lock();
+            g.disk_sql_schema().unwrap_or_else(|| g.schema())
+        };
+        let mut failed = None;
+        // Read without the result's lock (see `databrain_result_store::for_each_batch`).
+        databrain_result_store::for_each_batch(&rs, &ViewSpec::default(), SNAPSHOT_CHUNK, &mut |b| {
+            // The SQL types (exact decimals as DECIMAL), as resolve() said.
+            let cols = b
+                .columns()
+                .iter()
+                .zip(target.fields())
+                .map(|(c, t)| if c.data_type() == t.data_type() { Ok(c.clone()) } else { cast(c, t.data_type()) })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let b = RecordBatch::try_new(target.clone(), cols)?;
+            if let Err(e) = f(b) {
+                failed = Some(e);
+                return Err(databrain_result_store::Error::Spill("stopped".into()));
+            }
+            Ok(())
+        })
+        .map_err(|e| failed.take().unwrap_or_else(|| e.to_string()))
     }
 
     fn names(&self) -> Vec<String> {
@@ -1006,10 +1082,10 @@ fn decimal_type<'a>(cols: impl Iterator<Item = &'a dyn Array>) -> DataType {
     for col in cols {
         let Some(s) = col.as_any().downcast_ref::<StringArray>() else { return DataType::Float64 };
         for v in s.iter().flatten() {
-            let v = v.trim().trim_start_matches(['-', '+']);
-            if v.contains(['e', 'E']) || v.eq_ignore_ascii_case("nan") || v.contains("inf") {
+            if !databrain_result_store::spill::is_plain_decimal(v) {
                 return DataType::Float64;
             }
+            let v = v.trim().trim_start_matches(['-', '+']);
             let (i, f) = v.split_once('.').unwrap_or((v, ""));
             int_digits = int_digits.max(i.trim_start_matches('0').len().max(1));
             scale = scale.max(f.len());

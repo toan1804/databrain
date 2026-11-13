@@ -2130,8 +2130,10 @@ version = "0.4.1"
 dependencies = [
  "databrain-connector-core",
  "parking_lot",
+ "parquet",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "ts-rs",
 ]

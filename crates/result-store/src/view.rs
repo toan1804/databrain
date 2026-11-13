@@ -120,7 +120,7 @@ impl DisplayCache {
     }
 }
 
-fn filter_mask(batch: &RecordBatch, f: &ColumnFilter, cache: &mut DisplayCache) -> Result<BooleanArray> {
+fn column_mask(batch: &RecordBatch, f: &ColumnFilter, cache: &mut DisplayCache) -> Result<BooleanArray> {
     if f.column >= batch.num_columns() {
         return Err(Error::InvalidColumn(f.column));
     }
@@ -199,12 +199,22 @@ fn true_indices(mask: &BooleanArray) -> UInt32Array {
     UInt32Array::from(out)
 }
 
-/// Compute the row indices (into `batch`) that make up the view.
-pub fn compute_view(batch: &RecordBatch, spec: &ViewSpec, cache: &mut DisplayCache) -> Result<UInt32Array> {
-    let n = batch.num_rows();
+/// Rows of `batch` the filters keep (None: no filter), in order.
+pub(crate) fn kept_rows(batch: &RecordBatch, spec: &ViewSpec, cache: &mut DisplayCache) -> Result<Option<UInt32Array>> {
+    Ok(filter_mask(batch, spec, cache)?.map(|m| true_indices(&m)))
+}
+
+/// The sort keys of `batch` as they're compared (exact decimals as
+/// order-preserving bytes).
+pub(crate) fn sort_keys(batch: &RecordBatch, spec: &ViewSpec) -> Result<Vec<ArrayRef>> {
+    spec.sort.iter().map(|k| if k.column >= batch.num_columns() { Err(Error::InvalidColumn(k.column)) } else { comparable(batch, k.column) }).collect()
+}
+
+/// The filters and quick filter of `spec` as one mask (None: no filter).
+fn filter_mask(batch: &RecordBatch, spec: &ViewSpec, cache: &mut DisplayCache) -> Result<Option<BooleanArray>> {
     let mut mask: Option<BooleanArray> = None;
     for f in &spec.filters {
-        let m = filter_mask(batch, f, cache)?;
+        let m = column_mask(batch, f, cache)?;
         mask = Some(match mask {
             None => m,
             Some(prev) => and_kleene(&prev, &m)?,
@@ -217,6 +227,13 @@ pub fn compute_view(batch: &RecordBatch, spec: &ViewSpec, cache: &mut DisplayCac
             Some(prev) => and_kleene(&prev, &m)?,
         });
     }
+    Ok(mask)
+}
+
+/// Compute the row indices (into `batch`) that make up the view.
+pub fn compute_view(batch: &RecordBatch, spec: &ViewSpec, cache: &mut DisplayCache) -> Result<UInt32Array> {
+    let n = batch.num_rows();
+    let mask = filter_mask(batch, spec, cache)?;
     let idx = match &mask {
         Some(m) => true_indices(m),
         None => UInt32Array::from_iter_values(0..n as u32),

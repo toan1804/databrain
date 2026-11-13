@@ -25,6 +25,13 @@ pub struct ExternalTable {
     /// Warning surfaced to the user when the table is used (e.g. the output
     /// was cut at the row limit, so aggregates over it may be incomplete).
     pub notice: Option<String>,
+    /// The rows are on disk in these Parquet files (the output is larger
+    /// than memory); `batches` is then empty. A session that may read files
+    /// views them; another streams them ([`ExternalTables::for_each_batch`]).
+    pub files: Vec<std::path::PathBuf>,
+    /// Columns to show as `***` (set by [`OutputMasks::apply`] for rows on
+    /// disk, which are masked as they are streamed).
+    pub hide: Vec<bool>,
 }
 
 pub trait ExternalTables: Send + Sync {
@@ -36,6 +43,11 @@ pub trait ExternalTables: Send + Sync {
     /// columns, without loading data. Defaults to names only.
     fn catalog(&self) -> Vec<ExternalInfo> {
         self.names().into_iter().map(|name| ExternalInfo { name, ..Default::default() }).collect()
+    }
+    /// Every row of an output on disk, a batch at a time, without keeping
+    /// them all (for sessions that can't read its files).
+    fn for_each_batch(&self, name: &str, _f: &mut dyn FnMut(RecordBatch) -> Result<(), String>) -> Result<(), String> {
+        Err(format!("results.{name} can't be streamed"))
     }
 }
 
@@ -70,7 +82,9 @@ impl OutputMasks {
         let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| mask_schema(&t.schema, &hide));
         let mut sorted = cols.iter().map(|c| c.to_ascii_lowercase()).collect::<Vec<_>>();
         sorted.sort();
-        Ok(ExternalTable { version_key: format!("{}#masked:{}", t.version_key, sorted.join(",")), schema, batches, ..t })
+        // Rows on disk are masked as they're streamed in.
+        let hide = if t.files.is_empty() { Vec::new() } else { hide };
+        Ok(ExternalTable { version_key: format!("{}#masked:{}", t.version_key, sorted.join(",")), schema, batches, hide, ..t })
     }
 }
 
@@ -237,7 +251,7 @@ mod mask_tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false), Field::new("Email", DataType::Utf8, true)]));
         let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(StringArray::from(vec![Some("a@x.io"), None]))])
             .unwrap();
-        ExternalTable { name: "people".into(), version_key: "r1".into(), schema, batches: vec![b], notice: None }
+        ExternalTable { name: "people".into(), version_key: "r1".into(), schema, batches: vec![b], notice: None, files: vec![], hide: vec![] }
     }
 
     #[test]

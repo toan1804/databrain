@@ -8,6 +8,15 @@ Found in reviews and left for a later release on purpose. Each says what goes wr
 - If an MCP client kills `databrain-mcp.exe` without closing its stdin, the child `databrain.exe mcp` may keep running (no job object ties them).
 - `databrain-jobs run` / `list` output in a terminal goes through the GUI-subsystem launcher's console attach; check it prints in cmd and PowerShell.
 
+## Results on disk (left from the spill work of 2026-11-14)
+
+- A sort or filter of a result on disk runs on the thread that asked for the page, with no progress and no Stop: on a very large result the grid waits until it's done.
+- Charts and pinning refuse a result on disk, and the AI's local aggregate tool sends the AI to `query_outputs` instead.
+- A result on disk isn't saved when the app quits (tab results are saved up to 64 MB anyway), so its tab shows nothing after a restart.
+- Files of results on disk are plain Parquet in DataBrain's folder, sensitive columns included (they're masked only on the way to the AI). They're deleted with the result, or at the next start after a crash; until then they're as readable as the user's other files.
+- Column statistics of a result on disk count distinct values up to a million ("+" past it); the top values come from the values counted.
+- A sorted view of a result on disk is refused for columns DuckDB can't give back as they were (256-bit decimals, nanosecond times, intervals) and for a column named `file_row_number`.
+
 ## Query engine (review of 2026-11-12; see [QUERY_ENGINE.md](QUERY_ENGINE.md))
 
 The review's findings are fixed (loads can't control their transaction and ask on production connections, a run's job guard, one transaction dialect with a savepoint for grid edits, session claims for plans, edits, Commit/Rollback and exports, a memory cap per result, outputs freed with their rows, and the low items). Left, as refactors:

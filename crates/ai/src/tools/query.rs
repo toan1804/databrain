@@ -217,10 +217,14 @@ impl ToolContext {
         let info = g.info();
         let view = ViewSpec::default();
         let mut s = String::from("Columns:\n");
+        if info.on_disk {
+            // A full read per column: SQL does it better for a result this size.
+            s = String::from("Columns (the result is larger than memory: query it with query_outputs for statistics):\n");
+        }
         for (i, c) in info.columns.iter().enumerate() {
             let pii = mask.get(i).copied().unwrap_or(true);
             s.push_str(&format!("- {} ({})", c.name, c.db_type.clone().unwrap_or_else(|| c.data_type.clone())));
-            if !pii && info.total_rows > 0 {
+            if !pii && info.total_rows > 0 && !info.on_disk {
                 if let Ok(st) = g.column_stats(&view, i) {
                     s.push_str(&format!(" nulls={} distinct={}", st.nulls, st.distinct));
                     if (pol.share_sample_values || pol.share_result_rows)
@@ -284,6 +288,11 @@ impl ToolContext {
         let rs = self.engine.results().get(id).map_err(|e| AiError::Internal(e.to_string()))?;
         let (names, batches) = {
             let mut g = rs.lock();
+            if g.is_on_disk() {
+                return Err(AiError::Internal(
+                    "this result is larger than memory (its rows are on disk): query it with query_outputs as results.<name> instead".into(),
+                ));
+            }
             let names: Vec<String> = g.schema().fields().iter().map(|f| f.name().clone()).collect();
             (names, g.view_batches(&ViewSpec::default(), 50_000).map_err(|e| AiError::Internal(e.to_string()))?)
         };

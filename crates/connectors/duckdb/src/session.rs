@@ -120,7 +120,7 @@ impl Session for DuckSession {
                 tx.blocking_send(Err(ConnectorError::internal("lock poisoned")));
                 return;
             };
-            if let Err(e) = run(&g, &sql, &opts, &tx, outputs.as_deref(), &loaded, shared) {
+            if let Err(e) = run(&g, &sql, &opts, &tx, outputs.as_deref(), &loaded, shared, sandboxed) {
                 let e = if opts.cancel.is_cancelled() {
                     ConnectorError::cancelled()
                 } else if sandboxed {
