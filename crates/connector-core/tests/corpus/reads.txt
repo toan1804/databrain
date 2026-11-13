@@ -31,3 +31,5 @@ snowflake | select * from table(db.information_schema.query_history())
 snowflake | select f.value from t, lateral flatten(input => t.v) f
 snowflake | select * from table(generator(rowcount => 10))
 snowflake | select * from table(snowflake.core.get_lineage('t', 'table', 'downstream'))
+snowflake | select * from table(information_schema . query_history())
+snowflake | select * from table( flatten ( input => parse_json('[1]') ))

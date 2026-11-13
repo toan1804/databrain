@@ -4,6 +4,11 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Fixed
+
+- Safety: a Snowflake procedure called as a table function with spaces or a comment around the dot in its name (`table(myschema . proc())`) is no longer taken for a read.
+- Passwords kept out of history and logs inside function and `DO` bodies (`$$ … identified by 'pw' … $$`, which 0.4.0 stopped reading) and inside statements run from a string (`EXECUTE 'alter role … password ''pw'''`, `EXECUTE IMMEDIATE '…'`).
+
 ## 0.4.0 - 2026-11-13
 
 ### Changed

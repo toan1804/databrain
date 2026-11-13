@@ -373,18 +373,27 @@ fn snowflake_table_call(sql: &str, kind: ConnectorKind) -> bool {
             continue;
         }
         i = skip_ws(i + 1);
-        let start = i;
-        while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'.' | b'"' | b'$')) {
-            i += 1;
+        // The name's parts, with whitespace (and comments, blanked by
+        // code_text) allowed around the dots: `myschema . evil_proc()`.
+        let mut parts: Vec<&str> = Vec::new();
+        loop {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || matches!(b[i], b'_' | b'"' | b'$')) {
+                i += 1;
+            }
+            parts.push(&code[start..i]);
+            let j = skip_ws(i);
+            if b.get(j) != Some(&b'.') {
+                break;
+            }
+            i = skip_ws(j + 1);
         }
-        let name = &code[start..i];
-        if name.is_empty() || b.get(skip_ws(i)) != Some(&b'(') {
+        if parts.iter().all(|p| p.is_empty()) || b.get(skip_ws(i)) != Some(&b'(') {
             continue;
         }
         // Built-in table functions aren't qualified, except under
         // INFORMATION_SCHEMA or SNOWFLAKE: `myschema.flatten` is the user's.
         // A quoted name is never trusted.
-        let parts: Vec<&str> = name.split('.').map(str::trim).collect();
         let quoted = parts.iter().any(|p| p.contains(super::splitter::QUOTED_WORD));
         let trusted = match parts.as_slice() {
             [f] => SNOWFLAKE_TABLE_FUNCTIONS.contains(f),

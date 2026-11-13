@@ -160,7 +160,15 @@ fn secret_spans(sql: &str, backslash: bool) -> Vec<(usize, usize, Option<u8>)> {
     let mut i = 0;
     while i < n {
         match b[i] {
-            b'\'' | b'"' | b'`' => {
+            // A string can hold SQL that runs (`EXECUTE 'alter role r
+            // password ''pw'''`, `EXECUTE IMMEDIATE '…'`): read inside it too.
+            b'\'' => {
+                let end = literal_end(i);
+                cut.extend(nested_spans(sql, i, end, backslash));
+                i = end;
+                continue;
+            }
+            b'"' | b'`' => {
                 i = literal_end(i);
                 continue;
             }
@@ -174,9 +182,12 @@ fn secret_spans(sql: &str, backslash: bool) -> Vec<(usize, usize, Option<u8>)> {
                 i = sql[i + 2..].find("*/").map(|k| i + 4 + k).unwrap_or(n);
                 continue;
             }
-            // `$$Bob's table$$`: one literal, its quote is text.
+            // `$$Bob's table$$`: one literal, its quote is text. Its body is
+            // read on its own (a function or `DO` body holds statements).
             b'$' if dollar_literal(sql, i).is_some() => {
-                i = dollar_literal(sql, i).map_or(n, |(_, _, end)| end);
+                let (tag_end, body_end, end) = dollar_literal(sql, i).unwrap_or((n, n, n));
+                cut.extend(secret_spans(&sql[tag_end..body_end], backslash).into_iter().map(|(s, e, q)| (s + tag_end, e + tag_end, q)));
+                i = end;
                 continue;
             }
             _ => {}
@@ -293,6 +304,49 @@ fn secret_spans(sql: &str, backslash: bool) -> Vec<(usize, usize, Option<u8>)> {
         i = e;
     }
     cut
+}
+
+/// Secrets in the SQL a `'…'` literal holds (`sql[start..end]`, quotes
+/// included): its text with `''` (and `\'` when `backslash`) read as one
+/// quote, scanned like any SQL, and the spans mapped back to `sql`. A
+/// secret that was a quoted literal inside becomes `''***''` in place, so
+/// the outer string still ends where it did.
+fn nested_spans(sql: &str, start: usize, end: usize, backslash: bool) -> Vec<(usize, usize, Option<u8>)> {
+    let b = sql.as_bytes();
+    let body_end = if end > start + 1 && end <= b.len() && b[end - 1] == b'\'' { end - 1 } else { end.min(b.len()) };
+    // Only a string that reads as a statement: data that merely mentions a
+    // password (`'password ''x'''`) stays as typed.
+    let first = sql[start + 1..body_end].split(|c: char| !c.is_ascii_alphabetic()).find(|w| !w.is_empty()).unwrap_or("").to_ascii_lowercase();
+    if body_end <= start + 1 || !matches!(first.as_str(), "create" | "alter" | "set" | "grant" | "begin" | "declare" | "do" | "exec" | "execute" | "call") {
+        return Vec::new();
+    }
+    // The inner text, and for each of its bytes (and its end) the offset in `sql`.
+    let mut inner = Vec::with_capacity(body_end - start);
+    let mut at = Vec::with_capacity(body_end - start + 1);
+    let mut j = start + 1;
+    while j < body_end {
+        at.push(j);
+        if (b[j] == b'\'' || (backslash && b[j] == b'\\')) && j + 1 < body_end && b[j + 1] == b'\'' {
+            inner.push(b'\'');
+            j += 2;
+        } else {
+            inner.push(b[j]);
+            j += 1;
+        }
+    }
+    at.push(body_end);
+    let Ok(inner) = String::from_utf8(inner) else { return Vec::new() };
+    let ib = inner.as_bytes();
+    secret_spans(&inner, backslash)
+        .into_iter()
+        .filter_map(|(s, e, q)| {
+            // A quoted secret: its text between the quotes, unquoted (an
+            // unterminated one runs to the end).
+            let s = if q.is_some() { s + 1 } else { s };
+            let e = if q.is_some_and(|q| e > s && ib.get(e - 1) == Some(&q)) { e - 1 } else { e };
+            (e > s).then(|| (at[s], at[e], None))
+        })
+        .collect()
 }
 
 /// Quoted arguments of calls in [`POSITIONAL_SECRETS`] that hold a secret:
@@ -844,6 +898,37 @@ mod redaction_tests {
         // Text that only looks like it stays.
         assert_eq!(redact_text("select 'C:\\' as p, 1"), "select 'C:\\' as p, 1");
         assert_eq!(redact_text("select bearer from t"), "select bearer from t");
+    }
+
+    /// Secrets in SQL that a dollar-quoted body or a string holds (function
+    /// and DO bodies, EXECUTE / EXECUTE IMMEDIATE), and what stays as it was.
+    #[test]
+    fn redacts_secrets_in_bodies_and_strings() {
+        for (text, secret) in [
+            ("create procedure p() as $$ begin alter user u identified by 'PW3'; end $$", "PW3"),
+            ("do $$ begin execute 'alter role r password ''PW1'''; end $$", "PW1"),
+            ("select $a$ from t; alter role r password 'PW5'; select $a$ from t", "PW5"),
+            ("begin execute immediate 'create user u identified by PW7'; end;", "PW7"),
+            ("begin execute immediate 'alter user u identified by \"PW8\"'; end;", "PW8"),
+            ("exec('create login l with password = ''PW9''')", "PW9"),
+            ("do $f$ begin perform dblink_exec('alter role r password ''PW10'''); end $f$", "PW10"),
+        ] {
+            for out in [redact_secrets(text), redact_text(text)] {
+                assert!(!out.contains(secret), "{text}\n→ {out}");
+            }
+        }
+        // The outer string still ends where it did.
+        assert_eq!(redact_secrets("do $$ begin execute 'alter role r password ''pw'''; end $$"), "do $$ begin execute 'alter role r password ''***'''; end $$");
+        assert_eq!(redact_secrets("execute immediate 'create user u identified by pw'"), "execute immediate 'create user u identified by ***'");
+        // Strings and bodies without secrets stay.
+        for text in [
+            "select 'my password is long' as hint, 'it''s' from t",
+            "comment on table t is $$Bob's table$$",
+            "insert into t values ('identified', 'password')",
+            "create function f() returns int as $$ select 1 $$ language sql",
+        ] {
+            assert_eq!(redact_secrets(text), text);
+        }
     }
 
     #[test]
