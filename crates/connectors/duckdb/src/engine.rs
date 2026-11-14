@@ -1,3 +1,4 @@
+use databrain_connector_core::spill_dir::ProcessDir;
 use databrain_connector_core::{ConnectorError, Result, quote_literal};
 
 use crate::error::map_err;
@@ -101,15 +102,21 @@ pub fn extension_dir() -> Option<String> {
 
 /// Where sessions spill (sorts, joins, aggregates bigger than their memory)
 /// and how much memory they may use; set by the app (None: DuckDB's own).
-static SPILL_DIR: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+/// The spill folder is this process's own under the app's (see
+/// [`ProcessDir`]), and each instance spills into a folder under it.
+static SPILL_DIR: std::sync::RwLock<Option<ProcessDir>> = std::sync::RwLock::new(None);
 static MEMORY_LIMIT: std::sync::RwLock<Option<u64>> = std::sync::RwLock::new(None);
 
-/// Spill into `dir` for new sessions. DuckDB's default for an in-memory
-/// database is `.tmp` in the current directory, which is `/` (read-only)
-/// for an app started from Finder: work bigger than memory failed there.
+/// Spill into a folder under `dir` for new sessions. DuckDB's default for an
+/// in-memory database is `.tmp` in the current directory, which is `/`
+/// (read-only) for an app started from Finder: work bigger than memory
+/// failed there. Folders left under `dir` by processes that ended are
+/// deleted. When this process can't have a folder of its own there, DuckDB
+/// keeps its default.
 pub fn set_spill_dir(dir: Option<String>) {
+    let claimed = dir.and_then(|d| ProcessDir::claim(std::path::Path::new(&d)).ok());
     if let Ok(mut g) = SPILL_DIR.write() {
-        *g = dir;
+        *g = claimed;
     }
 }
 
@@ -126,7 +133,11 @@ pub fn set_memory_limit(bytes: Option<u64>) {
 /// sandbox locks the configuration.
 pub(crate) fn session_settings() -> String {
     let mut sql = String::new();
-    if let Some(dir) = SPILL_DIR.read().ok().and_then(|g| g.clone()) {
+    // A folder per instance: DuckDB names its temp files the same in every
+    // instance, opens them without an exclusive create and deletes every
+    // `duckdb_temp_*` file in the folder when an instance closes, so two
+    // instances sharing one overwrite or delete each other's blocks.
+    if let Some(dir) = instance_spill_dir("") {
         sql.push_str(&format!("SET temp_directory = {};", quote_literal(&dir)));
     }
     if let Some(b) = MEMORY_LIMIT.read().ok().and_then(|g| *g) {
@@ -135,14 +146,26 @@ pub(crate) fn session_settings() -> String {
     sql
 }
 
-/// A spill folder for one sandboxed instance, under the app's
+/// A spill folder for one sandboxed instance, under this process's
 /// ([`set_spill_dir`]; `None` when the app set none): a sealed instance can
 /// read and write its `temp_directory`, so it doesn't share the others'.
 pub(crate) fn sandbox_spill_dir() -> Option<String> {
+    instance_spill_dir("sandbox-")
+}
+
+/// `<process folder>/<prefix><n>`, a new `n` each call. DuckDB creates the
+/// folder when it first spills.
+fn instance_spill_dir(prefix: &str) -> Option<String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let root = SPILL_DIR.read().ok().and_then(|g| g.clone())?;
+    let g = SPILL_DIR.read().ok()?;
+    let root = g.as_ref()?.path();
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Some(std::path::Path::new(&root).join(format!("sandbox-{}-{n}", std::process::id())).to_string_lossy().into_owned())
+    Some(root.join(format!("{prefix}{n}")).to_string_lossy().into_owned())
+}
+
+/// This process's spill folder (instances spill into folders under it).
+pub fn spill_dir() -> Option<std::path::PathBuf> {
+    SPILL_DIR.read().ok().and_then(|g| g.as_ref().map(|d| d.path().to_path_buf()))
 }
 
 /// DuckDB version and platform of this build, e.g. ("v1.5.6", "osx_arm64").

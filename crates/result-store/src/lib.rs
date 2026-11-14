@@ -675,7 +675,7 @@ pub struct ResultStore {
     /// Folder for results kept on disk (None: results never spill).
     spill_root: Mutex<Option<std::path::PathBuf>>,
     /// Held while this process uses its spill folder (see [`Self::set_spill_root`]).
-    spill_lock: Mutex<Option<std::fs::File>>,
+    spill_lock: Mutex<Option<databrain_connector_core::spill_dir::ProcessDir>>,
 }
 
 impl ResultStore {
@@ -689,35 +689,10 @@ impl ResultStore {
     /// (left by a process that quit or crashed) are deleted: results on disk
     /// don't outlive their process.
     pub fn set_spill_root(&self, base: std::path::PathBuf) {
-        let _ = std::fs::create_dir_all(&base);
-        if let Ok(entries) = std::fs::read_dir(&base) {
-            for e in entries.flatten() {
-                let dir = e.path();
-                if !dir.is_dir() {
-                    continue;
-                }
-                let held = std::fs::OpenOptions::new().write(true).open(dir.join("lock")).is_ok_and(|f| f.try_lock().is_err());
-                // A process starting right now may not have locked its folder
-                // yet: only folders untouched for a minute are stale.
-                let fresh = |p: &std::path::Path| {
-                    std::fs::metadata(p)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_some_and(|age| age < std::time::Duration::from_secs(60))
-                };
-                if !held && !fresh(&dir) && !fresh(&dir.join("lock")) {
-                    let _ = std::fs::remove_dir_all(&dir);
-                }
-            }
-        }
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
-        let mine = base.join(format!("{}-{nanos}", std::process::id()));
-        let lock = std::fs::create_dir_all(&mine).and_then(|_| std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(mine.join("lock")));
-        match lock.and_then(|f| f.lock().map(|_| f)) {
-            Ok(f) => {
-                *self.spill_lock.lock() = Some(f);
-                *self.spill_root.lock() = Some(mine);
+        match databrain_connector_core::spill_dir::ProcessDir::claim(&base) {
+            Ok(d) => {
+                *self.spill_root.lock() = Some(d.path().to_path_buf());
+                *self.spill_lock.lock() = Some(d);
             }
             // No folder of our own: results don't spill (they stop at memory).
             Err(_) => *self.spill_root.lock() = None,

@@ -11,6 +11,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- DuckDB: two tabs (or a tab and a job, the Results connection, the assistant) whose queries spilled to disk at the same time shared one folder for their temporary files, so one could overwrite the other's (wrong answers or corrupt-block errors), and closing one deleted the other's files mid-query. Each DuckDB database now spills into a folder of its own, and folders left by a DataBrain process that ended are deleted.
 - A table or schema whose name holds a backslash and a quote could run SQL of its own when DataBrain read its indexes or columns (opening it in the explorer, indexing it for the AI): on MySQL the rest of the name ran as further statements, on Snowflake, Databricks, Redshift and Postgres it changed the catalog query. Names now stay inside their literal on every one of them, and a BigQuery dataset path that isn't a name is refused.
 - MongoDB commands and Cypher queries with text outside ASCII (an accented field name, a comment in Vietnamese, a pasted no-break space) crashed the query, and for MongoDB the check that decides whether it is a read. MongoDB collection names with such letters are accepted (`db.khách.find()`).
 - Databricks: when a statement's result could not be downloaded from cloud storage, the statement was run a second time with inline results, also when it was an `INSERT`, `UPDATE` or `MERGE` (which then ran twice) or after Stop. Only a query that reads is run again.

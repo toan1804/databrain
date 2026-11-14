@@ -12,6 +12,7 @@ pub mod external;
 pub mod invariants;
 pub mod language;
 pub mod quote;
+pub mod spill_dir;
 pub mod sql;
 pub mod stream;
 pub mod tables;

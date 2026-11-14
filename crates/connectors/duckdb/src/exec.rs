@@ -201,33 +201,44 @@ mod tests {
     /// sets, sandboxed ones too: a sort bigger than memory finishes there,
     /// where DuckDB's default (`.tmp` in the current directory, `/` for an app
     /// started from Finder) failed.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn sessions_spill_into_the_apps_folder() {
         let dir = tempfile::tempdir().unwrap();
         let spill = dir.path().join("duckdb_spill").to_string_lossy().into_owned();
         crate::set_spill_dir(Some(spill.clone()));
         crate::set_memory_limit(Some(200 * 1024 * 1024));
+        let mine = crate::engine::spill_dir().unwrap().to_string_lossy().into_owned();
         let mut sandboxed = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
         sandboxed.options.insert(databrain_connector_core::SANDBOX_OPTION.into(), "1".into());
         let plain = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        let other = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
         let sandboxed = session(sandboxed).await;
         crate::set_spill_dir(None);
         crate::set_memory_limit(None);
         let dir_of = |r: &databrain_connector_core::Collected| {
             databrain_connector_core::arrow::array::AsArray::as_string::<i32>(r.batches[0].column(0)).value(0).to_string()
         };
-        assert_eq!(dir_of(&q(plain.as_ref(), "select current_setting('temp_directory')").await), spill);
-        assert_ne!(dir_of(&q(sandboxed.as_ref(), "select current_setting('temp_directory')").await), spill, "not the folder other sessions spill into");
-        for s in [plain.as_ref(), sandboxed.as_ref()] {
+        let mut dirs = Vec::new();
+        for s in [plain.as_ref(), other.as_ref(), sandboxed.as_ref()] {
             let r = q(s, "select current_setting('temp_directory'), current_setting('memory_limit')").await;
             let b = &r.batches[0];
             let col = |i: usize| databrain_connector_core::arrow::array::AsArray::as_string::<i32>(b.column(i)).value(0).to_string();
-            // The sandboxed one in a folder of its own under it (it may read its temp_directory).
-            assert!(col(0) == spill || col(0).starts_with(&format!("{spill}{}sandbox-", std::path::MAIN_SEPARATOR)), "{}", col(0));
+            // Each in a folder of its own under this process's (DuckDB's temp
+            // file names repeat in every instance).
+            assert!(col(0).starts_with(&format!("{mine}{}", std::path::MAIN_SEPARATOR)), "{} under {mine}", col(0));
+            assert!(mine.starts_with(&spill));
             assert!(col(1).starts_with("190") || col(1).starts_with("200"), "{}", col(1));
-            // ~1 GB of rows to sort with 200 MB: spilled, not failed.
-            let r = q(s, "select count(*) from (select range, md5(range::varchar) s from range(8000000) order by s)").await;
-            assert_eq!(r.num_rows(), 1);
+            dirs.push(dir_of(&r));
         }
+        dirs.sort();
+        dirs.dedup();
+        assert_eq!(dirs.len(), 3, "no two instances share a spill folder: {dirs:?}");
+        assert!(dirs.iter().any(|d| d.contains("sandbox-")));
+        // ~1 GB of rows to sort with 200 MB in each, at the same time:
+        // spilled, not failed, and neither reads the other's blocks.
+        let sort = "select sum(i * range)::varchar from (select range, row_number() over (order by md5(range::varchar)) i from range(8000000))";
+        let (a, b, c) = tokio::join!(q(plain.as_ref(), sort), q(other.as_ref(), sort), q(sandboxed.as_ref(), sort));
+        assert_eq!(dir_of(&a), dir_of(&b));
+        assert_eq!(dir_of(&a), dir_of(&c));
     }
 }
