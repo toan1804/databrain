@@ -48,6 +48,13 @@ const POSITIONAL_SECRETS: &[(&str, &[usize], usize)] = &[
     // password): both places hidden when there are five.
     ("remote", &[3, 4], 4),
     ("remotesecure", &[3, 4], 4),
+    // Postgres pgcrypto and MySQL: (data, key/password, …).
+    ("pgp_sym_encrypt", &[1], 2),
+    ("pgp_sym_encrypt_bytea", &[1], 2),
+    ("pgp_sym_decrypt", &[1], 2),
+    ("pgp_sym_decrypt_bytea", &[1], 2),
+    ("aes_encrypt", &[1], 2),
+    ("aes_decrypt", &[1], 2),
     // SQL Server procedures.
     ("sp_addlinkedsrvlogin", &[4], 5),
     ("sp_addlogin", &[1], 2),
@@ -133,7 +140,8 @@ fn secret_spans(sql: &str, backslash: bool) -> Vec<(usize, usize, Option<u8>)> {
         let q = b[i];
         let mut j = i + 1;
         while j < n {
-            if backslash && b[j] == b'\\' && q == b'\'' && j + 1 < n {
+            // `\'` in '…' and `\"` in "…" (MySQL reads both so).
+            if backslash && b[j] == b'\\' && matches!(q, b'\'' | b'"') && j + 1 < n {
                 j += 2;
                 continue;
             }
@@ -832,7 +840,20 @@ pub fn redact_key_values(text: &str) -> String {
             i = end;
             continue;
         }
-        if in_string.is_none() {
+        // Outside strings a bare value is kept (`where password = hash`),
+        // except where the text is a connection string, an environment
+        // variable or a URL, not SQL: the pair right after `;`
+        // (`Server=h;Password=pw;`), an upper-case prefixed name with no
+        // spaces (`PGPASSWORD=pw`, `MYSQL_PWD=pw`), a query parameter
+        // (`?access_token=t`). Always `name=value`, no space around `=`.
+        let tight = e < n && b[e] == b'=' && j > e && j < n && !b[j].is_ascii_whitespace();
+        let prev = text[..i].trim_end_matches([' ', '\t']).bytes().last();
+        let bare_here = tight
+            && (matches!(prev, Some(b';'))
+                || (i > 0 && matches!(b[i - 1], b'?' | b'&'))
+                || (text[i..e].bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+                    && !matches!(name.as_str(), "password" | "passwd" | "pwd" | "secret" | "token")));
+        if in_string.is_none() && !bare_here {
             i = e;
             continue;
         }
@@ -894,6 +915,35 @@ mod redaction_tests {
         ] {
             let out = redact_text(text);
             assert!(!out.contains(secret), "{text}\n→ {out}");
+        }
+        // Found by the 2026-11-13 review: settings and connection strings
+        // outside quotes (AI text), URL tokens, `\"` in a double-quoted
+        // password, and positional keys of encryption functions.
+        for (text, secret) in [
+            ("Use Server=db1;Database=app;User Id=sa;Password=pw10;", "pw10"),
+            ("conn: Host=h; Port=5432; Pwd=pw11", "pw11"),
+            ("run it with PGPASSWORD=pw12 psql -h db", "pw12"),
+            ("export MYSQL_PWD=pw13 && mysql", "pw13"),
+            ("AWS_SECRET_ACCESS_KEY=sk14 aws s3 ls", "sk14"),
+            ("GET https://api.x/v1/data?access_token=tok15&page=2", "tok15"),
+            ("see /cb?code=1&refresh_token=tok16", "tok16"),
+            ("create user u identified by \"p\\\"w17\"", "w17"),
+            ("select pgp_sym_encrypt(card, 'key18') from t", "key18"),
+            ("select pgp_sym_decrypt(col::bytea, 'key19')", "key19"),
+            ("insert into t values (aes_encrypt('data', 'key20'))", "key20"),
+        ] {
+            let out = redact_text(text);
+            assert!(!out.contains(secret), "{text}\n→ {out}");
+        }
+        // SQL comparing a column stays readable, outside quotes.
+        for sql in [
+            "select * from users where password = hash",
+            "select * from users where password=hash",
+            "update u set PASSWORD=crypt(x) where id = 1",
+            "select token, secret from t",
+            "select aes_encrypt(x) from t",
+        ] {
+            assert_eq!(redact_text(sql), sql);
         }
         // Text that only looks like it stays.
         assert_eq!(redact_text("select 'C:\\' as p, 1"), "select 'C:\\' as p, 1");

@@ -14,7 +14,6 @@ Every finding of the review was fixed on 2026-11-13, with the never-read corpus 
 
 Left from the final review (2026-11-13):
 
-- Redaction keeps: connection strings and settings outside quotes in AI text (`Server=h;Password=pw;`, `PGPASSWORD=pw`), URL query tokens (`?access_token=…`), the part after `\"` in `identified by "p\"w"`, and positional `pgp_sym_encrypt(data, 'pw')` / `aes_encrypt(x, 'key')`.
 
 Ideas still open:
 
