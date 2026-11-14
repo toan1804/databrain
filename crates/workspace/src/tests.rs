@@ -449,3 +449,29 @@ fn clears_are_one_transaction_each() {
     assert!(ws.kn_clear("c").is_err());
     assert_eq!(count(&ws), 1, "nothing was cleared");
 }
+
+/// Several processes opening (and so upgrading) one workspace at once
+/// (the app and databrain-mcp) apply each migration once: every open
+/// succeeds, none fails with "table already exists".
+#[test]
+fn concurrent_opens_migrate_once() {
+    let dir = std::env::temp_dir().join(format!("dbtest-ws-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("workspace.db");
+    let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let opens: Vec<_> = (0..8)
+        .map(|_| {
+            let (path, start) = (path.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                Workspace::open(&path).map(drop).map_err(|e| e.to_string())
+            })
+        })
+        .collect();
+    for o in opens {
+        assert_eq!(o.join().unwrap(), Ok(()));
+    }
+    let v: i64 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(v as usize, MIGRATIONS.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}

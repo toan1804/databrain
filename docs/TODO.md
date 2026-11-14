@@ -17,7 +17,6 @@ Left from the final review of the metadata store (2026-11-13):
 - A table's search text includes the names of the tables its foreign keys point at, so searching for a table outside the scope ranks allowed tables that reference it (the keys themselves are scrubbed).
 - Scope rules match names ignoring case: on Postgres, allowing `sales` also allows `"Sales"`.
 - The scope survives pointing a connection at another server (`meta_check_identity` keeps the rules): schemas allowed on the old server are allowed on the new one once browsed. Decide whether a server change should clear it.
-- `user_version` is read outside the migration transaction: two processes upgrading at once (the app and `databrain-mcp`) can make one fail with "table already exists" (it opens on the next try).
 - An index run's empty foreign key list never clears keys cached before (bulk metadata often has none): keys dropped on the server stay in the ER diagram and the AI's joins until the table is described again.
 - An AI note's target is stored as `schema.table` unquoted: a name with `.`, a space, `&` or `,` reads back differently.
 - `index_tables` answers "not available" for connection, sign-in and permission errors too (one answer for missing and refused tables), which hides why a read failed.
