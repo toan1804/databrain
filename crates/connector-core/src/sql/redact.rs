@@ -112,12 +112,15 @@ pub fn redact_secrets(sql: &str) -> String {
 /// (`***`, a bare word or the text of a dollar-quoted string).
 type Span = (usize, usize, Option<u8>);
 
-/// How quoted text is read: `\'` in `'…'` and `\"` in `"…"` as escaped
-/// quotes or not (`backslash`: MySQL, Postgres `E'…'`), and `$$…$$` /
-/// `$tag$…$tag$` as quoted text or not (`dollar`: Postgres, DuckDB, Snowflake).
+/// How quoted text is read: `\'` in `'…'` as an escaped quote or not
+/// (`backslash`: MySQL, Postgres `E'…'`, DuckDB), `\"` in `"…"` too or not
+/// (`backslash_double`: MySQL; Postgres and DuckDB names don't escape), and
+/// `$$…$$` / `$tag$…$tag$` as quoted text or not (`dollar`: Postgres,
+/// DuckDB, Snowflake).
 #[derive(Debug, Clone, Copy)]
 struct Reading {
     backslash: bool,
+    backslash_double: bool,
     dollar: bool,
     /// `[name]` as a quoted name (SQL Server, SQLite) and `q'[…]'` as
     /// quoted text (Oracle): `[it's]` and `q'[it's]'` open no string.
@@ -128,22 +131,27 @@ struct Reading {
 }
 
 impl Reading {
-    const fn new(backslash: bool, dollar: bool) -> Self {
-        Self { backslash, dollar, brackets: false, hash: false }
+    /// `backslash`: none, in `'…'` only, or in `'…'` and `"…"`.
+    const fn new(backslash: (bool, bool), dollar: bool) -> Self {
+        Self { backslash: backslash.0, backslash_double: backslash.1, dollar, brackets: false, hash: false }
     }
 
     /// Every reading. The last two are for the servers their syntax
     /// belongs to (neither reads dollar quotes; SQL Server and Oracle no
     /// backslash escapes, MySQL and ClickHouse do); they are extra
     /// readings, so `a[1]`, `#temp` and `a # b` are still read as on the
-    /// other servers by the first four.
-    const ALL: [Self; 6] = [
-        Self::new(false, true),
-        Self::new(true, true),
-        Self::new(false, false),
-        Self::new(true, false),
-        Self { brackets: true, ..Self::new(false, false) },
-        Self { hash: true, ..Self::new(true, false) },
+    /// other servers by the first six. Backslashes escape in `'…'` only
+    /// (Postgres `E'…'`, DuckDB) or in both quotes (MySQL): `E'\''` then
+    /// `"c\"` ends the name on the first and not on the second.
+    const ALL: [Self; 8] = [
+        Self::new((false, false), true),
+        Self::new((true, false), true),
+        Self::new((true, true), true),
+        Self::new((false, false), false),
+        Self::new((true, false), false),
+        Self::new((true, true), false),
+        Self { brackets: true, ..Self::new((false, false), false) },
+        Self { hash: true, ..Self::new((true, true), false) },
     ];
 }
 
@@ -216,7 +224,14 @@ impl<'a> Lexer<'a> {
         match c {
             b'-' if b.get(i + 1) == Some(&b'-') => tok(Kind::Comment, self.sql[i..].find('\n').map_or(n, |k| i + k)),
             b'/' if b.get(i + 1) == Some(&b'*') => tok(Kind::Comment, self.sql[i + 2..].find("*/").map_or(n, |k| i + 4 + k)),
-            b'\'' | b'"' | b'`' => tok(Kind::Quoted { quote: c, open: i }, self.quoted_end(i, self.reading.backslash && c != b'`')),
+            b'\'' | b'"' | b'`' => {
+                let escapes = match c {
+                    b'\'' => self.reading.backslash,
+                    b'"' => self.reading.backslash_double,
+                    _ => false,
+                };
+                tok(Kind::Quoted { quote: c, open: i }, self.quoted_end(i, escapes))
+            }
             b'#' if self.reading.hash => tok(Kind::Comment, self.sql[i..].find('\n').map_or(n, |k| i + k)),
             // `[name]` on one line, `]]` an escaped bracket; an array
             // subscript or a `[` that never closes is one character.
@@ -1430,6 +1445,11 @@ mod review_tests {
             ("execute immediate q'[alter user u identified by \"pw1\"]'", "execute immediate q'[alter user u identified by \"***\"]'"),
             ("select [it's], aes_encrypt(a,'k1')", "select [it's], aes_encrypt(a,'***')"),
             ("create user u identified by 1234abc", "create user u identified by ***"),
+            // Backslashes escape in `'…'` only (Postgres E'…', DuckDB): the name `"c\"` ends at its quote.
+            (r#"select e'\'' as "c\"; alter role r password 'pw1' -- ""#, r#"select e'\'' as "c\"; alter role r password '***' -- ""#),
+            (r#"select E'\'' as "c\", aes_encrypt(a, 'k1')"#, r#"select E'\'' as "c\", aes_encrypt(a, '***')"#),
+            // And in both (MySQL): the name `"c\""` runs on.
+            (r#"select 'a\'' as "c\"", aes_encrypt(a, 'k1')"#, r#"select 'a\'' as "c\"", aes_encrypt(a, '***')"#),
         ] {
             assert_eq!(redact_secrets(sql), want, "{sql}");
         }
