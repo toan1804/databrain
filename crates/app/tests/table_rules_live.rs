@@ -235,3 +235,68 @@ async fn table_rules_follow_a_roles_search_path() {
         run(&st, &admin.id, sql).await;
     }
 }
+
+/// DataBrain's own catalog queries keep a table's name inside its string
+/// literal, whatever the name holds. MySQL reads `\` as an escape, so a
+/// name with `\'` used to end the literal early and run the rest as SQL
+/// (statements can be stacked there): the canary table must still exist,
+/// and the layout must be that of the oddly named table.
+#[tokio::test(flavor = "multi_thread")]
+async fn hostile_table_names_stay_inside_the_literal() {
+    let st = state();
+    if let Some(p) = connect(
+        &st,
+        "DATABRAIN_MYSQL",
+        ConnectorKind::Mysql,
+        &var("DATABRAIN_MYSQL", "USER").unwrap_or("root".into()),
+        var("DATABRAIN_MYSQL", "PASSWORD"),
+        Some("mysql"),
+        AiPolicy::default(),
+    ) {
+        let name = r"x\';DROP TABLE dbr_names.canary;#";
+        for sql in [
+            "drop database if exists dbr_names".to_string(),
+            "create database dbr_names".to_string(),
+            "create table dbr_names.canary (a int)".to_string(),
+            format!("create table dbr_names.`{name}` (id int primary key, v int, key by_v (v))"),
+        ] {
+            run(&st, &p.id, &sql).await;
+        }
+        let layout = st.engine.table_layout(&p.id, "dbr_names", name).await.unwrap();
+        let mut indexes: Vec<&str> = layout.indexes.iter().map(|i| i.name.as_str()).collect();
+        indexes.sort_unstable();
+        assert_eq!(indexes, ["PRIMARY", "by_v"], "the table of that name was read");
+        // Still there: nothing after the name ran.
+        run(&st, &p.id, "select count(*) from dbr_names.canary").await;
+        run(&st, &p.id, "drop database dbr_names").await;
+    }
+    if let Some(p) = connect(
+        &st,
+        "DATABRAIN_PG",
+        ConnectorKind::Postgres,
+        &var("DATABRAIN_PG", "USER").unwrap_or("postgres".into()),
+        var("DATABRAIN_PG", "PASSWORD"),
+        Some("postgres"),
+        AiPolicy::default(),
+    ) {
+        let name = r"x\' union select 'a','b',true,true,'c' --";
+        for sql in [
+            "drop schema if exists dbr_names cascade".to_string(),
+            "create schema dbr_names".to_string(),
+            format!("create table dbr_names.\"{name}\" (id int primary key, v int)"),
+            format!("create index by_v on dbr_names.\"{name}\" (v)"),
+        ] {
+            run(&st, &p.id, &sql).await;
+        }
+        // Also with backslashes read as escapes on this session's role (the old default).
+        for scs in ["on", "off"] {
+            run(&st, &p.id, &format!("alter role current_user set standard_conforming_strings = {scs}")).await;
+            st.engine.disconnect(&p.id);
+            let layout = st.engine.table_layout(&p.id, "dbr_names", name).await.unwrap();
+            assert_eq!(layout.indexes.len(), 2, "standard_conforming_strings = {scs}: {:?}", layout.indexes.iter().map(|i| &i.name).collect::<Vec<_>>());
+            assert!(layout.indexes.iter().any(|i| i.name == "by_v"));
+        }
+        run(&st, &p.id, "alter role current_user reset standard_conforming_strings").await;
+        run(&st, &p.id, "drop schema dbr_names cascade").await;
+    }
+}

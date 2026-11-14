@@ -32,6 +32,9 @@ pub(crate) fn run(
     shared: bool,
     sandboxed: bool,
 ) -> Result<()> {
+    if sandboxed {
+        crate::sandbox::refuse_file_writes(sql)?;
+    }
     for n in load_outputs(conn, sql, outputs, loaded, opts.output_masks.as_deref(), shared, sandboxed)? {
         tx.blocking_send(Ok(StreamEvent::Notice(n)));
     }
@@ -210,11 +213,17 @@ mod tests {
         let sandboxed = session(sandboxed).await;
         crate::set_spill_dir(None);
         crate::set_memory_limit(None);
+        let dir_of = |r: &databrain_connector_core::Collected| {
+            databrain_connector_core::arrow::array::AsArray::as_string::<i32>(r.batches[0].column(0)).value(0).to_string()
+        };
+        assert_eq!(dir_of(&q(plain.as_ref(), "select current_setting('temp_directory')").await), spill);
+        assert_ne!(dir_of(&q(sandboxed.as_ref(), "select current_setting('temp_directory')").await), spill, "not the folder other sessions spill into");
         for s in [plain.as_ref(), sandboxed.as_ref()] {
             let r = q(s, "select current_setting('temp_directory'), current_setting('memory_limit')").await;
             let b = &r.batches[0];
             let col = |i: usize| databrain_connector_core::arrow::array::AsArray::as_string::<i32>(b.column(i)).value(0).to_string();
-            assert_eq!(col(0), spill);
+            // The sandboxed one in a folder of its own under it (it may read its temp_directory).
+            assert!(col(0) == spill || col(0).starts_with(&format!("{spill}{}sandbox-", std::path::MAIN_SEPARATOR)), "{}", col(0));
             assert!(col(1).starts_with("190") || col(1).starts_with("200"), "{}", col(1));
             // ~1 GB of rows to sort with 200 MB: spilled, not failed.
             let r = q(s, "select count(*) from (select range, md5(range::varchar) s from range(8000000) order by s)").await;

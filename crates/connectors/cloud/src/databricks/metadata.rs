@@ -1,9 +1,13 @@
 //! Catalog/schema metadata queries (columns, fingerprints, per-catalog bulk loads).
 
 use super::client::Inner;
-use databrain_connector_core::{
-    ColumnInfo, ConnectorError, ConnectorKind, DbObject, ObjectKind, Result, SchemaMetadata, TableColumns, quote_ident, quote_literal,
-};
+use databrain_connector_core::{ColumnInfo, ConnectorError, ConnectorKind, DbObject, ObjectKind, Result, SchemaMetadata, TableColumns, quote_ident};
+
+/// A string literal in Databricks's own escaping: a backslash is an escape
+/// there, so a name holding `\'` must not end the literal early.
+fn quote_literal(s: &str) -> String {
+    databrain_connector_core::sql::quote_string(s, databrain_connector_core::ConnectorKind::Databricks)
+}
 
 pub(super) fn split_schema(path: &str) -> Result<(&str, &str)> {
     path.split_once('.').ok_or_else(|| ConnectorError::query(format!("expected catalog.schema, got {path}")))

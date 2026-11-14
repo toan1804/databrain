@@ -57,6 +57,13 @@ pub(crate) fn load_outputs(
     shared: bool,
     sandboxed: bool,
 ) -> Result<Vec<String>> {
+    // The assistant's runs see an output only as `results.<name>`, where
+    // it is checked and masked. With `results` as the default catalog (or
+    // on the search path) a bare `sales` would be the output as it was last
+    // loaded, by anyone: refused, as is switching to it.
+    if masks.is_some() {
+        refuse_results_as_default(conn, sql)?;
+    }
     let names = referenced_results(sql);
     if names.is_empty() {
         return Ok(vec![]);
@@ -175,6 +182,33 @@ pub(crate) fn load_outputs(
         loaded.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?.insert(key, t.version_key);
     }
     Ok(notices)
+}
+
+/// See [`load_outputs`]: for the assistant's runs, `results` is never the
+/// default catalog and never on the search path.
+fn refuse_results_as_default(conn: &duckdb::Connection, sql: &str) -> Result<()> {
+    let names_results = |text: &str| text.to_ascii_lowercase().split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == RESULTS_SCHEMA);
+    let keyword = databrain_connector_core::sql::leading_keyword(sql);
+    let switches = matches!(keyword.as_str(), "USE" | "SET" | "RESET" | "PRAGMA");
+    if switches && names_results(sql) {
+        return Err(ConnectorError::query(
+            "outputs are read as results.<name>; making `results` the default catalog or schema isn't allowed for the assistant",
+        ));
+    }
+    // A statement that changes the default is how to get out of it.
+    if switches {
+        return Ok(());
+    }
+    let (db, path): (String, String) =
+        conn.query_row("SELECT current_database(), coalesce(current_setting('search_path'), '')", [], |r| Ok((r.get(0)?, r.get(1)?))).map_err(map_err)?;
+    let on_path =
+        path.split(',').any(|p| p.trim().trim_matches('"').split('.').next().is_some_and(|c| c.trim_matches('"').eq_ignore_ascii_case(RESULTS_SCHEMA)));
+    if db.eq_ignore_ascii_case(RESULTS_SCHEMA) || on_path {
+        return Err(ConnectorError::query(
+            "`results` is this session's default catalog or on its search path, so a table name without `results.` in front would read an output unchecked. Run `USE memory` (or the database's name) first, and read outputs as results.<name>",
+        ));
+    }
+    Ok(())
 }
 
 /// SQL that drops what `results.<name>` is now (a table, or a view over an
@@ -352,6 +386,41 @@ mod tests {
         // The same session without masks (the user's run) gets the values back.
         let r = q(mem.as_ref(), "select string_agg(distinct region, ',' order by region) from results.sales").await;
         assert_eq!(r.batches[0].column(0).as_string::<i32>().value(0), "EU,US");
+        // After the user's (unmasked) load, the assistant's run still gets the
+        // mask, also when comments sit between `results`, the dot and the name.
+        for sql in [
+            "select string_agg(distinct region, ',') from results/**/.sales",
+            "select string_agg(distinct region, ',') from results -- x\n . /* y */ sales",
+            "select string_agg(distinct region, ',') from results/* a /* b */ */.sales",
+        ] {
+            let _ = q(mem.as_ref(), "select count(*) from results.sales").await;
+            let r = mem.execute(databrain_connector_core::Statement::internal(sql), opts(masked())).await.unwrap().collect().await;
+            match r {
+                Ok(r) => assert_eq!(r.batches[0].column(0).as_string::<i32>().value(0), "***", "{sql}"),
+                // Refused is fine too (a comment DuckDB reads otherwise); the values are not.
+                Err(e) => assert!(!e.message.contains("EU"), "{sql}: {}", e.message),
+            }
+        }
+        // `results` can't become the default catalog for the assistant, and
+        // where it already is (the user switched), a bare name is refused.
+        let run = |sql: &'static str, o: ExecOptions| {
+            let mem = &mem;
+            async move {
+                match mem.execute(databrain_connector_core::Statement::internal(sql), o).await {
+                    Ok(s) => s.collect().await,
+                    Err(e) => Err(e),
+                }
+            }
+        };
+        let e = run("use results", opts(masked())).await.unwrap_err();
+        assert!(e.message.contains("default catalog"), "{}", e.message);
+        let _ = q(mem.as_ref(), "select count(*) from results.sales").await;
+        run("use results", ExecOptions::default()).await.unwrap();
+        let e = run("select string_agg(distinct region, ',') from sales", opts(masked())).await.unwrap_err();
+        assert!(e.message.contains("default catalog") && !e.message.contains("EU"), "{}", e.message);
+        run("use memory", opts(masked())).await.unwrap();
+        let r = run("select string_agg(distinct region, ',') from results.sales", opts(masked())).await.unwrap();
+        assert_eq!(r.batches[0].column(0).as_string::<i32>().value(0), "***");
         // An output the caller didn't check is refused.
         let e = mem
             .execute(databrain_connector_core::Statement::internal("select * from results.sales"), opts(OutputMasks::default()))

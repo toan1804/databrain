@@ -135,6 +135,16 @@ pub(crate) fn session_settings() -> String {
     sql
 }
 
+/// A spill folder for one sandboxed instance, under the app's
+/// ([`set_spill_dir`]; `None` when the app set none): a sealed instance can
+/// read and write its `temp_directory`, so it doesn't share the others'.
+pub(crate) fn sandbox_spill_dir() -> Option<String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = SPILL_DIR.read().ok().and_then(|g| g.clone())?;
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(std::path::Path::new(&root).join(format!("sandbox-{}-{n}", std::process::id())).to_string_lossy().into_owned())
+}
+
 /// DuckDB version and platform of this build, e.g. ("v1.5.6", "osx_arm64").
 pub fn version_and_platform() -> Result<(String, String)> {
     engine()?;

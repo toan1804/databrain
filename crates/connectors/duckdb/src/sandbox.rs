@@ -25,7 +25,37 @@ pub(crate) fn seal(conn: &duckdb::Connection, files: &[String]) -> Result<()> {
     if !paths.is_empty() {
         conn.execute_batch(&format!("SET allowed_paths = [{}]", list(&paths))).map_err(map_err)?;
     }
+    // A spill folder of its own: DuckDB lets a sealed instance read and
+    // write its temp_directory, which would otherwise be the one every
+    // other session spills into.
+    if let Some(dir) = crate::engine::sandbox_spill_dir() {
+        let _ = conn.execute_batch(&format!("SET temp_directory = {}", quote_literal(&dir)));
+    }
     conn.execute_batch("SET enable_external_access = false; SET lock_configuration = true;").map_err(map_err)
+}
+
+/// Statements a sealed session doesn't run at all. The attached files and
+/// folders are allowed by name so that they can be read; DuckDB then lets
+/// them be written too (`COPY … TO` a new file in an attached folder, or
+/// over an attached file with `USE_TMP_FILE false`), and `ATTACH` would
+/// create a database file there. Checked on the words of the whole text,
+/// strings and comments included: a query that merely mentions them is
+/// refused as well, which errs on the safe side.
+pub(crate) fn refuse_file_writes(sql: &str) -> Result<()> {
+    let lower = sql.to_ascii_lowercase();
+    let has = |w: &str| lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|x| x == w);
+    let what = if has("copy") && has("to") {
+        "COPY … TO"
+    } else if has("export") && has("database") {
+        "EXPORT DATABASE"
+    } else if has("attach") {
+        "ATTACH"
+    } else {
+        return Ok(());
+    };
+    Err(databrain_connector_core::ConnectorError::query(format!(
+        "{what} is not run here: SQL from the assistant runs in a DuckDB sandbox that reads the attached files and never writes files. Use a job's export step, or run it yourself."
+    )))
 }
 
 /// (folders, files) a sealed instance may still read: the attached files
@@ -107,6 +137,30 @@ mod tests {
         q_err(&*s, &format!("copy (select 1) to {}", quote_literal(&out.to_string_lossy()))).await;
         assert!(!out.exists());
         q_err(&*s, &format!("attach {} as other", quote_literal(&dir.path().join("x.duckdb").to_string_lossy()))).await;
+        // The attached file and folder are readable by name, never writable:
+        // not over the file, not a new file beside the folder's, not a
+        // database created there, however the statement is wrapped.
+        let in_parts = parts.join("z.parquet");
+        let planted = quote_literal(&in_parts.to_string_lossy());
+        let over = quote_literal(&csv.to_string_lossy());
+        for sql in [
+            format!("copy (select 1 as id) to {planted} (format parquet)"),
+            format!("COPY (select 'x' as region) TO {over} (use_tmp_file false)"),
+            format!("copy/**/(select 1 as id)/**/to {planted} (format parquet)"),
+            format!("explain analyze copy (select 1 as id) to {planted} (format parquet)"),
+            format!("prepare p as copy (select 1 as id) to {planted} (format parquet)"),
+            format!("export database {}", quote_literal(&parts.to_string_lossy())),
+            format!("attach {} as planted", quote_literal(&parts.join("new.duckdb").to_string_lossy())),
+        ] {
+            let e = q_err(&*s, &sql).await;
+            assert!(e.message.contains("sandbox"), "{sql}: {}", e.message);
+        }
+        assert!(!in_parts.exists() && !parts.join("new.duckdb").exists());
+        assert_eq!(std::fs::read_to_string(&csv).unwrap(), "region,amount\nEU,10\nUS,5\n");
+        assert_eq!(std::fs::read_dir(&parts).unwrap().count(), 1, "only the file that was there");
+        // Reading them still works, also into a table of the session.
+        assert_eq!(q(&*s, "create temp table mine as select * from files.sales").await.num_rows(), 0);
+        assert_eq!(q(&*s, "select * from mine").await.num_rows(), 2);
         q_err(&*s, "select * from read_csv('https://example.com/a.csv')").await;
         for set in
             ["SET enable_external_access = true", "SET allowed_directories = ['/']", "SET allowed_paths = ['/etc/passwd']", "SET lock_configuration = false"]

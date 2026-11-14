@@ -58,6 +58,12 @@ impl StreamFail {
     }
 }
 
+/// Whether a statement that already ran may be run a second time to get
+/// its result another way: only one the classifier calls a read.
+pub(super) fn safe_to_run_again(sql: &str) -> bool {
+    databrain_connector_core::sql::classify(sql, databrain_connector_core::ConnectorKind::Databricks).kind.is_read()
+}
+
 /// Server errors about the requested result format.
 pub(super) fn mentions_format(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
@@ -78,6 +84,14 @@ impl Inner {
             r = self.stream_as(sql, opts, tx, Disposition::ExternalLinks).await;
         }
         match r {
+            // The statement already ran; only its result could not be
+            // fetched. Running it again is safe for a read, never for
+            // anything else (an INSERT would insert twice), and not after Stop.
+            Err(StreamFail::Links(_)) if opts.cancel.is_cancelled() => Err(ConnectorError::cancelled()),
+            Err(StreamFail::Links(e)) if !safe_to_run_again(sql) => Err(ConnectorError::query(format!(
+                "The statement ran on Databricks, but its result could not be downloaded from cloud storage ({}). It was not run again, as it is not a query that only reads. Set \"Result transfer\" to Inline on this connection to get such results.",
+                e.message
+            ))),
             Err(StreamFail::Links(e)) => {
                 tx.send(StreamEvent::Notice(format!(
                     "Could not download the result from cloud storage ({}); ran again with inline results (25 MiB limit). Set \"Result transfer\" to Inline on this connection to skip the first try.",
@@ -408,6 +422,23 @@ mod tests {
         let r = s.execute(databrain_connector_core::Statement::internal("SELECT * FROM big"), ExecOptions::default()).await.unwrap().collect().await.unwrap();
         assert_eq!(texts(&r), vec!["inline"]);
         assert!(r.notices.iter().any(|n| n.contains("inline")), "{:?}", r.notices);
+        // A statement that isn't a read ran once already: it is not submitted
+        // again for its result (an INSERT would insert twice).
+        let (origin, log) = mock::serve("blocked").await;
+        let s = mock::session(&origin, false);
+        let e = match s.execute(databrain_connector_core::Statement::internal("INSERT INTO t SELECT * FROM big"), ExecOptions::default()).await {
+            Ok(stream) => stream.collect().await.map(|_| ()),
+            Err(e) => Err(e),
+        }
+        .unwrap_err();
+        assert!(e.message.contains("not run again"), "{}", e.message);
+        let submits = log.lock().unwrap().requests.iter().filter(|(m, _, _, body)| m == "POST" && body.contains("INSERT INTO t")).count();
+        assert_eq!(submits, 1, "submitted once");
+        assert!(safe_to_run_again("select 1") && safe_to_run_again("with x as (select 1) select * from x"));
+        for sql in ["insert into t values (1)", "update t set a = 1", "merge into t using s on t.id = s.id when matched then delete", "call p()", "optimize t"]
+        {
+            assert!(!safe_to_run_again(sql), "{sql}");
+        }
         // Inline-only connections never try links.
         let (origin, log) = mock::serve("ok").await;
         let r = mock::session(&origin, true)

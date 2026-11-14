@@ -17,13 +17,19 @@ use databrain_connector_core::value::Column;
 use databrain_connector_core::{
     Capabilities, ColType, ColumnInfo, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, CostEstimate, DbObject, ErrorKind,
     ExecOptions, ExecSummary, FieldSpec, ForeignKey, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, Session, StreamEvent, StreamSender,
-    TableColumns, Value, quote_ident, quote_literal,
+    TableColumns, Value, quote_ident,
 };
 use secrecy::ExposeSecret;
 use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::common::{Backoff, RowSink, http, net_err, truncate};
+
+/// A string literal in Snowflake's own escaping: a backslash is an escape
+/// there, so a name holding `\'` must not end the literal early.
+fn quote_literal(s: &str) -> String {
+    databrain_connector_core::sql::quote_string(s, databrain_connector_core::ConnectorKind::Snowflake)
+}
 
 #[derive(Debug, Default)]
 pub struct SnowflakeConnector;
@@ -783,7 +789,7 @@ impl Session for SfSession {
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
-        use databrain_connector_core::{TableLayout, parse_call_list, query_text, quote_literal};
+        use databrain_connector_core::{TableLayout, parse_call_list, query_text};
         let (db, sch) = schema.split_once('.').ok_or_else(|| ConnectorError::query("expected database.schema"))?;
         let mut l = TableLayout::from_columns(&self.describe(schema, name).await?.columns);
         if let Some(pk) = l.indexes.first_mut() {
@@ -1146,5 +1152,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.num_rows(), 50000);
+    }
+}
+
+#[cfg(test)]
+mod literal_tests {
+    /// Snowflake reads `\` as an escape: a name holding `\'` stays one literal.
+    #[test]
+    fn names_with_a_backslash_stay_inside_the_literal() {
+        assert_eq!(super::quote_literal("ORDERS"), "'ORDERS'");
+        assert_eq!(super::quote_literal(r"X\' OR 1=1 --"), r"'X\\'' OR 1=1 --'");
+        assert_eq!(super::quote_literal(r"ends\"), r"'ends\\'");
     }
 }

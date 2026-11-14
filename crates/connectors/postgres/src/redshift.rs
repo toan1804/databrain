@@ -5,7 +5,7 @@
 //! Metadata is read with plain text queries (no bound parameters).
 
 use databrain_connector_core::{
-    ColumnInfo, DbObject, ForeignKey, ObjectDetail, ObjectKind, Result, TableColumns, TableLayout, query_text, quote_literal, split_key_list,
+    ColumnInfo, DbObject, ForeignKey, ObjectDetail, ObjectKind, Result, TableColumns, TableLayout, query_text, quote_literal_pg, split_key_list,
 };
 
 use crate::ddl::quote;
@@ -112,7 +112,7 @@ impl PgSession {
     }
 
     pub(crate) async fn rs_list_objects(&self, schema: &str, names: Option<&[String]>) -> Result<Vec<DbObject>> {
-        let s = quote_literal(schema);
+        let s = quote_literal_pg(schema);
         let mut out = self.rs_objects(&format!("n.nspname = {s} order by c.relkind = 'v', c.relname")).await?;
         out.extend(self.rs_routines(&format!("n.nspname = {s}")).await?);
         if let Some(names) = names {
@@ -122,14 +122,14 @@ impl PgSession {
     }
 
     pub(crate) async fn rs_search_objects(&self, term: &str) -> Result<Vec<DbObject>> {
-        self.rs_objects(&format!("{NOT_SYSTEM} and strpos(lower(c.relname), {}) > 0 limit 2000", quote_literal(term))).await
+        self.rs_objects(&format!("{NOT_SYSTEM} and strpos(lower(c.relname), {}) > 0 limit 2000", quote_literal_pg(term))).await
     }
 
     pub(crate) async fn rs_search_schema(&self, schema: &str, term: &str, limit: usize) -> Result<Vec<DbObject>> {
-        let t = quote_literal(term);
+        let t = quote_literal_pg(term);
         self.rs_objects(&format!(
             "n.nspname = {} and strpos(lower(c.relname), {t}) > 0 order by strpos(lower(c.relname), {t}) <> 1, length(c.relname), c.relname limit {}",
-            quote_literal(schema),
+            quote_literal_pg(schema),
             limit.clamp(1, 1000)
         ))
         .await
@@ -137,16 +137,16 @@ impl PgSession {
 
     pub(crate) async fn rs_search_routines(&self, schema: Option<&str>, term: &str) -> Result<Vec<DbObject>> {
         let scope = match schema {
-            Some(s) => format!("n.nspname = {}", quote_literal(s)),
+            Some(s) => format!("n.nspname = {}", quote_literal_pg(s)),
             None => "n.nspname = current_schema()".into(),
         };
-        self.rs_routines(&format!("{scope} and strpos(lower(p.proname), {}) > 0", quote_literal(term))).await
+        self.rs_routines(&format!("{scope} and strpos(lower(p.proname), {}) > 0", quote_literal_pg(term))).await
     }
 
     /// Columns (with the informational primary key) of one table, or of every table and view of the schema.
     async fn rs_columns(&self, schema: &str, table: Option<&str>) -> Result<Vec<(String, ColumnInfo)>> {
-        let s = quote_literal(schema);
-        let t = table.map(|t| format!(" and c.relname = {}", quote_literal(t))).unwrap_or_default();
+        let s = quote_literal_pg(schema);
+        let t = table.map(|t| format!(" and c.relname = {}", quote_literal_pg(t))).unwrap_or_default();
         let rows = query_text(
             self,
             &format!(
@@ -197,14 +197,14 @@ impl PgSession {
     }
 
     async fn rs_foreign_keys(&self, schema: &str, table: Option<&str>) -> Result<Vec<(String, ForeignKey)>> {
-        let t = table.map(|t| format!(" and c.relname = {}", quote_literal(t))).unwrap_or_default();
+        let t = table.map(|t| format!(" and c.relname = {}", quote_literal_pg(t))).unwrap_or_default();
         let rows = query_text(
             self,
             &format!(
                 "select c.relname::text, pg_catalog.pg_get_constraintdef(k.oid) from pg_catalog.pg_constraint k \
                  join pg_catalog.pg_class c on c.oid = k.conrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
                  where k.contype = 'f' and n.nspname = {}{t}",
-                quote_literal(schema)
+                quote_literal_pg(schema)
             ),
         )
         .await
@@ -214,7 +214,7 @@ impl PgSession {
 
     pub(crate) async fn rs_describe(&self, schema: &str, name: &str) -> Result<ObjectDetail> {
         let obj = self
-            .rs_objects(&format!("n.nspname = {} and c.relname = {}", quote_literal(schema), quote_literal(name)))
+            .rs_objects(&format!("n.nspname = {} and c.relname = {}", quote_literal_pg(schema), quote_literal_pg(name)))
             .await?
             .into_iter()
             .next()
@@ -270,7 +270,7 @@ impl PgSession {
 
     /// Distribution style and key, sort keys and row count (what makes Redshift queries fast).
     pub(crate) async fn rs_table_layout(&self, schema: &str, name: &str) -> Result<TableLayout> {
-        let (s, t) = (quote_literal(schema), quote_literal(name));
+        let (s, t) = (quote_literal_pg(schema), quote_literal_pg(name));
         let keys = query_text(
             self,
             &format!(
