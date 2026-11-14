@@ -548,9 +548,13 @@ impl QueryEngine {
             run(set.replace("{}", SAVEPOINT)).await?;
         }
         for (i, s) in stmts.iter().enumerate() {
+            let mut from_db = false;
             let r = match run(s.sql.clone()).await {
                 Ok(n) => check(i, s, n).map(|_| n),
-                Err(e) => Err(e.into()),
+                Err(e) => {
+                    from_db = true;
+                    Err(e.into())
+                }
             };
             match r {
                 Ok(n) => report.rows += n.unwrap_or(0),
@@ -566,12 +570,12 @@ impl QueryEngine {
                     if style.is_none() && !in_tx && i > 0 {
                         e.message.push_str(&format!(" (the {i} change(s) before it were saved: this database has no transactions)"));
                     }
-                    // In an open transaction without a savepoint, the changes
-                    // before it stay pending: not "nothing was saved".
-                    if in_tx && !rolled_back && i > 0 {
-                        e.message = e.message.replace("; nothing was saved", "");
-                        e.message
-                            .push_str(&format!(" (the {i} change(s) before it are pending in your open transaction: Commit keeps them, Rollback undoes them)"));
+                    if in_tx {
+                        let failed = Failure { kind, savepoint: savepoint.is_some(), rolled_back, from_db, before: i };
+                        if let Some(note) = failed.in_transaction_note() {
+                            e.message = e.message.replace("; nothing was saved", "");
+                            e.message.push_str(&note);
+                        }
                     }
                     return Err(e);
                 }
@@ -591,10 +595,66 @@ impl QueryEngine {
     }
 }
 
+/// A change that failed inside the user's open transaction.
+struct Failure {
+    kind: ConnectorKind,
+    /// The apply set a savepoint, and undoing to it worked.
+    savepoint: bool,
+    rolled_back: bool,
+    /// The database refused the statement (not a row-count conflict).
+    from_db: bool,
+    /// Changes of this apply that ran before it.
+    before: usize,
+}
+
+impl Failure {
+    /// What became of the transaction, when "nothing was saved" isn't
+    /// the whole story; None when the savepoint undid exactly this apply.
+    fn in_transaction_note(&self) -> Option<String> {
+        let i = self.before;
+        // Undoing to the savepoint failed: the error ended the whole
+        // transaction (SQL Server's XACT_ABORT, a deadlock victim). A
+        // database error in DuckDB's aborts it (it has no savepoints).
+        if self.savepoint && !self.rolled_back {
+            return Some(
+                " The error ended your open transaction: the database rolled it back, with your earlier pending changes. Nothing is pending now; check the data before you go on."
+                    .into(),
+            );
+        }
+        if !self.savepoint && self.from_db && self.kind == ConnectorKind::Duckdb {
+            return Some(" The error aborted your open transaction: none of its changes can be committed any more. Rollback ends it.".into());
+        }
+        // No savepoint: the changes before it stay pending.
+        if !self.savepoint && i > 0 {
+            return Some(format!(" (the {i} change(s) before it are pending in your open transaction: Commit keeps them, Rollback undoes them)"));
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ConnectorKind::*;
+
+    #[test]
+    fn a_failed_change_says_what_became_of_the_open_transaction() {
+        let f = |kind, savepoint, rolled_back, from_db, before| Failure { kind, savepoint, rolled_back, from_db, before }.in_transaction_note();
+        // The savepoint undid this apply only: "nothing was saved" is the whole story.
+        assert_eq!(f(Postgres, true, true, true, 2), None);
+        assert_eq!(f(Mssql, true, true, false, 0), None);
+        // Undoing to it failed: the transaction is gone, earlier changes too.
+        for kind in [Mssql, Mysql, Postgres] {
+            let n = f(kind, true, false, true, 0).unwrap();
+            assert!(n.contains("ended your open transaction") && n.contains("Nothing is pending"), "{kind:?}: {n}");
+        }
+        // DuckDB: a database error aborts it; a row-count conflict doesn't.
+        assert!(f(Duckdb, false, false, true, 1).unwrap().contains("aborted your open transaction"));
+        assert!(f(Duckdb, false, false, false, 1).unwrap().contains("the 1 change(s) before it are pending"));
+        // Snowflake (no savepoint, errors don't end it): the earlier ones stay pending.
+        assert!(f(Snowflake, false, false, true, 2).unwrap().contains("the 2 change(s) before it are pending"));
+        assert_eq!(f(Snowflake, false, false, true, 0), None);
+    }
 
     fn src(sql: &str, k: ConnectorKind) -> Option<SourceTable> {
         source_table(sql, k)
