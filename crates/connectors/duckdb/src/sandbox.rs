@@ -26,10 +26,15 @@ pub(crate) fn seal(conn: &duckdb::Connection, files: &[String]) -> Result<()> {
         conn.execute_batch(&format!("SET allowed_paths = [{}]", list(&paths))).map_err(map_err)?;
     }
     // A spill folder of its own: DuckDB lets a sealed instance read and
-    // write its temp_directory, which would otherwise be the one every
-    // other session spills into.
+    // write its temp_directory, which would otherwise be another one's (or
+    // DuckDB's default, `.tmp` in the current folder). Not sealed without it.
     if let Some(dir) = crate::engine::sandbox_spill_dir() {
-        let _ = conn.execute_batch(&format!("SET temp_directory = {}", quote_literal(&dir)));
+        conn.execute_batch(&format!("SET temp_directory = {}", quote_literal(&dir))).map_err(map_err)?;
+        let set: String = conn.query_row("SELECT current_setting('temp_directory')", [], |r| r.get(0)).map_err(map_err)?;
+        let norm = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_string();
+        if norm(&set) != norm(&dir) {
+            return Err(databrain_connector_core::ConnectorError::internal(format!("the sandbox's spill folder could not be set (DuckDB uses {set})")));
+        }
     }
     conn.execute_batch("SET enable_external_access = false; SET lock_configuration = true;").map_err(map_err)
 }
@@ -85,6 +90,28 @@ mod tests {
     use databrain_auth::AuthMethod;
 
     use databrain_connector_core::{ConnectionConfig, ConnectorError, ConnectorKind, ExecOptions, SANDBOX_OPTION, Session, quote_literal};
+
+    /// No sealed instance without a spill folder of its own: when it can't
+    /// be set (here the configuration is locked already), sealing fails
+    /// instead of keeping the folder it had; with it set, sealing works.
+    #[test]
+    fn sealing_needs_its_own_spill_folder() {
+        let _g = crate::engine::SPILL_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        crate::set_spill_dir(Some(dir.path().to_string_lossy().into_owned()));
+        crate::engine::engine().unwrap();
+        let ok = duckdb::Connection::open_in_memory().unwrap();
+        let sealed = seal(&ok, &[]);
+        let locked = duckdb::Connection::open_in_memory().unwrap();
+        locked.execute_batch("SET lock_configuration = true").unwrap();
+        let refused = seal(&locked, &[]);
+        crate::set_spill_dir(None);
+        sealed.unwrap();
+        let set: String = ok.query_row("SELECT current_setting('temp_directory')", [], |r| r.get(0)).unwrap();
+        assert!(set.contains("sandbox-"), "{set}");
+        let e = refused.unwrap_err().to_string();
+        assert!(e.contains("temp_directory"), "{e}");
+    }
 
     async fn q_err(s: &dyn Session, sql: &str) -> ConnectorError {
         match s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await {

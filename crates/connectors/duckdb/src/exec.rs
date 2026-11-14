@@ -232,6 +232,7 @@ mod tests {
     /// started from Finder) failed.
     #[tokio::test(flavor = "multi_thread")]
     async fn sessions_spill_into_the_apps_folder() {
+        let _g = crate::engine::SPILL_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let spill = dir.path().join("duckdb_spill").to_string_lossy().into_owned();
         crate::set_spill_dir(Some(spill.clone()));

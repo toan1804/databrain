@@ -107,6 +107,10 @@ pub fn extension_dir() -> Option<String> {
 static SPILL_DIR: std::sync::RwLock<Option<ProcessDir>> = std::sync::RwLock::new(None);
 static MEMORY_LIMIT: std::sync::RwLock<Option<u64>> = std::sync::RwLock::new(None);
 
+/// Tests that set the process's spill folder take turns.
+#[cfg(test)]
+pub(crate) static SPILL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Spill into a folder under `dir` for new sessions. DuckDB's default for an
 /// in-memory database is `.tmp` in the current directory, which is `/`
 /// (read-only) for an app started from Finder: work bigger than memory
