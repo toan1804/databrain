@@ -280,6 +280,42 @@ impl OutputRegistry {
         Self::check(&self.disk)
     }
 
+    /// The disk where results spill is low: free the results kept on disk
+    /// that no tab shows (inactive, not pinned), least recently used first,
+    /// until it isn't. The free space when it is still low (nothing left to
+    /// free, or files still being read elsewhere), and how many results
+    /// went. Deletes files: call off the async workers.
+    pub fn free_disk(&self) -> (Option<u64>, usize) {
+        let mut freed = 0;
+        let still_low = loop {
+            let Some(free) = self.low_disk() else { break None };
+            let victim = {
+                let mut g = self.inner.lock();
+                let oldest = g
+                    .by_handle
+                    .values()
+                    .filter(|o| o.state == OutputState::Live && o.spilled && !o.pinned && !o.active)
+                    .min_by_key(|o| (o.last_used, o.created_at))
+                    .map(|o| o.handle.clone());
+                oldest.and_then(|h| g.by_handle.get_mut(&h)).map(|o| {
+                    o.state = OutputState::Evicted;
+                    o.result_id.clone()
+                })
+            };
+            let Some(id) = victim else { break Some(free) };
+            self.results.remove(&id);
+            freed += 1;
+            // Read the disk again, not the last reading.
+            if let Some(c) = self.disk.lock().as_mut() {
+                c.last = None;
+            }
+        };
+        if freed > 0 {
+            self.trim_entries();
+        }
+        (still_low, freed)
+    }
+
     /// The computer's free memory when it is below the floor (read at most
     /// every 200 ms; between reads the last answer holds).
     pub fn low_memory(&self) -> Option<u64> {

@@ -900,6 +900,42 @@ async fn low_memory_moves_a_result_to_disk() {
     assert!(notices.iter().any(|n| n.contains("low on free memory")), "{notices:?}");
 }
 
+/// When the disk where results spill runs low, older results kept on disk
+/// that no tab shows are freed (least recently used first) so the new one
+/// keeps loading; one a tab still shows is never freed for it, and the new
+/// result then stops, saying why.
+#[tokio::test(flavor = "multi_thread")]
+async fn low_disk_frees_older_results_on_disk() {
+    let f = fixture(EnvTag::Dev);
+    let dir = tempfile::tempdir().unwrap();
+    f.engine.results().set_spill_root(dir.path().to_path_buf());
+    let sql = "with recursive n(i) as (select 1 union all select i + 1 from n where i < 20000) select i, 'row ' || i as s from n";
+    // Low free memory sends each result to disk.
+    f.engine.outputs().set_free_memory_probe(Some(Arc::new(|| Some(300 << 20))), 500 << 20);
+    let mut r = req(&f, sql);
+    r.row_limit = None;
+    let (first, _) = outcome(&wait_job(&f, &started(f.engine.run(r.clone()).unwrap())).await);
+    assert!(first.on_disk && first.total_rows == 20000, "{first:?}");
+    let first_dir = f.engine.results().spill_dir(&first.id).unwrap();
+    assert!(first_dir.exists());
+    // The disk is low while the first result's files are there.
+    let d = first_dir.clone();
+    f.engine.outputs().set_free_disk_probe(Some(Arc::new(move || Some(if d.exists() { 100 } else { 10_000 }))), 1_000);
+
+    // Shown in its tab (the tab's latest result): kept; the new one, in another tab, stops.
+    let other = RunRequest { tab_id: "tab2".into(), ..r.clone() };
+    let (stopped, _) = outcome(&wait_job(&f, &started(f.engine.run(other).unwrap())).await);
+    assert!(first_dir.exists(), "a result a tab shows isn't freed");
+    assert!(stopped.truncated && !stopped.on_disk && stopped.total_rows < 20000, "{stopped:?}");
+
+    // Run again in the first tab: its earlier result is no longer shown, so it goes.
+    let (second, notices) = outcome(&wait_job(&f, &started(f.engine.run(r).unwrap())).await);
+    assert!(!first_dir.exists(), "the older result's files are deleted");
+    assert!(second.on_disk && !second.truncated && second.total_rows == 20000, "{second:?} {notices:?}");
+    let o = f.engine.outputs().by_result(&first.id).unwrap();
+    assert_eq!(o.state, crate::outputs::OutputState::Evicted);
+}
+
 /// The free memory is read at most every 200 ms while rows load.
 #[test]
 fn free_memory_is_read_sparingly() {

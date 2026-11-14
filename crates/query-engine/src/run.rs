@@ -340,11 +340,23 @@ impl QueryEngine {
         sample: &databrain_connector_core::arrow::array::RecordBatch,
     ) -> bool {
         let Some(dir) = self.results.spill_dir(id) else { return false };
-        if self.outputs.low_disk().is_some() {
+        if self.disk_still_low().is_some() {
             return false;
         }
         // Writes up to half the budget: not on an async worker's time.
         blocking_io(|| rs.lock().spill_to(dir, sample).is_ok())
+    }
+
+    /// The free disk space when the disk where results spill is low even
+    /// after freeing older results kept there that no tab shows
+    /// ([`OutputRegistry::free_disk`]); None when there is room.
+    fn disk_still_low(&self) -> Option<u64> {
+        self.outputs.low_disk()?;
+        let (low, freed) = blocking_io(|| self.outputs.free_disk());
+        if freed > 0 {
+            self.outputs_changed();
+        }
+        low
     }
 
     pub(crate) async fn run_statement(
@@ -444,7 +456,7 @@ impl QueryEngine {
                         truncated = true;
                     }
                     if on_disk {
-                        if let Some(free) = self.outputs.low_disk() {
+                        if let Some(free) = self.disk_still_low() {
                             low_disk = Some(free);
                             cancel.cancel();
                             break;
