@@ -813,6 +813,39 @@ fn outcome(evs: &[JobEvent]) -> (databrain_result_store::ResultInfo, Vec<String>
         .expect("finished")
 }
 
+/// A script's results share the memory a result may keep: with the budget
+/// at its 16 MB floor (8 MB a result), a second ~5 MB result after a first
+/// one stops at what's left, at least 4 MB (no spill folder here), while
+/// either alone fits.
+#[tokio::test]
+async fn a_scripts_results_share_the_memory_a_result_may_keep() {
+    let f = fixture(EnvTag::Dev);
+    f.engine.outputs().set_budget(0);
+    let one = "with recursive n(i) as (select 1 union all select i + 1 from n where i < 70000) select i, printf('%040d', i) as s from n";
+    let run = |sql: String| {
+        let mut r = req(&f, &sql);
+        r.row_limit = None;
+        r
+    };
+    let evs = wait_job(&f, &started(f.engine.run(run(one.to_string())).unwrap())).await;
+    let (alone, _) = outcome(&evs);
+    assert!(!alone.truncated && alone.total_rows == 70000, "alone it fits: {alone:?}");
+    let evs = wait_job(&f, &started(f.engine.run(run(format!("{one};\n{one}"))).unwrap())).await;
+    let infos: Vec<_> = evs
+        .iter()
+        .filter_map(|e| match e {
+            JobEvent::StatementFinished { result: Some(r), .. } => Some(r.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(infos.len(), 2);
+    assert!(!infos[0].truncated && infos[0].total_rows == 70000, "{:?}", infos[0]);
+    assert!(infos[1].truncated && infos[1].total_rows < 70000, "the second stops at what's left: {:?}", infos[1]);
+    // What's left of the 8 MB, or the 4 MB every result may keep.
+    let left = (8usize << 20).saturating_sub(infos[0].bytes).max(4 << 20);
+    assert!(infos[1].bytes <= left, "{} > {left}", infos[1].bytes);
+}
+
 /// A result stops loading when the computer runs low on free memory, keeping
 /// the rows so far and saying why; with memory to spare it loads in full.
 #[tokio::test]

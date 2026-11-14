@@ -404,9 +404,12 @@ impl QueryEngine {
         let mut rows = 0usize;
         // Bytes kept: a row limit alone doesn't bound wide rows.
         let mut bytes = 0usize;
-        // Half the outputs budget: one result can't take all of it from the
-        // other outputs (active ones are never freed).
-        let max_bytes = self.outputs.budget() / 2;
+        // Half the outputs budget, less what this run's earlier results hold
+        // in memory: a script's results are all active (never freed), so
+        // together they stay within it too. At least 4 MB, so a small
+        // result still shows.
+        let earlier: usize = (0..stmt.index).map(|i| self.results.bytes_of(&format!("{job_id}:{i}"))).sum();
+        let max_bytes = (self.outputs.budget() / 2).saturating_sub(earlier).max(4 << 20);
         let mut too_big = false;
         // Free memory of the computer when it ran low (and the result stopped).
         let mut low_free: Option<u64> = None;
