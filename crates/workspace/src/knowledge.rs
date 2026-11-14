@@ -836,12 +836,17 @@ impl Workspace {
         // One transaction: all of it goes, or none.
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
+        Self::kn_clear_tx(&tx, connection_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn kn_clear_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str) -> Result<()> {
         tx.execute("DELETE FROM kn_objects WHERE connection_id = ?1", [connection_id])?;
         // Search rows go with `ai_tables` (kept in step); the scope stays.
-        Self::ai_forget_tx(&tx, connection_id)?;
+        Self::ai_forget_tx(tx, connection_id)?;
         tx.execute("DELETE FROM kn_state WHERE connection_id = ?1", [connection_id])?;
         tx.execute("DELETE FROM kn_schema_state WHERE connection_id = ?1", [connection_id])?;
-        tx.commit()?;
         Ok(())
     }
 

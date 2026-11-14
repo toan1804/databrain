@@ -198,8 +198,11 @@ impl Workspace {
             ],
         )?;
         drop(c);
-        // Another server (or user): the cached explorer describes something else.
-        self.meta_check_identity(&p.id, &p.config)?;
+        // Another server (or user): the cached explorer describes something
+        // else, and what the AI may use was chosen for the old one.
+        if self.meta_check_identity(&p.id, &p.config)? {
+            tracing::info!(connection = %p.id, "points at another server: explorer cache, AI index and AI scope cleared");
+        }
         self.get_connection(&p.id)
     }
 

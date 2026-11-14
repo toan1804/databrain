@@ -487,26 +487,34 @@ impl Workspace {
     }
 
     /// Clear the cache when the connection now points at another server/user,
-    /// and the AI's index of its objects with it (they describe the old
-    /// server; notes and learned joins are the user's and stay).
-    pub fn meta_check_identity(&self, connection_id: &str, cfg: &ConnectionConfig) -> Result<()> {
+    /// the AI's index of its objects, and what the AI may use there (its
+    /// scope): rules chosen for the old server's schemas would otherwise
+    /// allow same-named schemas of the new one, which the user never chose.
+    /// Notes and learned joins are the user's and stay. One transaction.
+    /// Whether anything was cleared.
+    pub fn meta_check_identity(&self, connection_id: &str, cfg: &ConnectionConfig) -> Result<bool> {
         let id = identity(cfg);
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
         let old: Option<Option<String>> =
-            self.conn.lock().query_row("SELECT identity FROM meta_conn_state WHERE connection_id = ?1", [connection_id], |r| r.get(0)).optional()?;
-        match old.flatten() {
-            Some(o) if o == id => return Ok(()),
+            tx.query_row("SELECT identity FROM meta_conn_state WHERE connection_id = ?1", [connection_id], |r| r.get(0)).optional()?;
+        let moved = match old.flatten() {
+            Some(o) if o == id => return Ok(false),
             // Cached before identities were recorded: assume it is the same server.
-            None => {}
+            None => false,
             Some(_) => {
-                self.meta_clear(connection_id)?;
-                self.kn_clear(connection_id)?;
+                Self::meta_clear_tx(&tx, connection_id)?;
+                Self::kn_clear_tx(&tx, connection_id)?;
+                tx.execute("DELETE FROM ai_scope WHERE connection_id = ?1", [connection_id])?;
+                true
             }
-        }
-        self.conn.lock().execute(
+        };
+        tx.execute(
             "INSERT INTO meta_conn_state (connection_id, identity) VALUES (?1, ?2) ON CONFLICT (connection_id) DO UPDATE SET identity = excluded.identity",
             params![connection_id, id],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(moved)
     }
 
     /// Columns of a table (from a describe).
@@ -770,14 +778,19 @@ impl Workspace {
         // the AI's tables pointing at a cache that was gone).
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
+        Self::meta_clear_tx(&tx, connection_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn meta_clear_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str) -> Result<()> {
         tx.execute("DELETE FROM meta_objects WHERE connection_id = ?1", [connection_id])?;
         tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1", [connection_id])?;
         tx.execute("DELETE FROM meta_schemas WHERE connection_id = ?1", [connection_id])?;
         tx.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [connection_id])?;
         tx.execute("UPDATE meta_conn_state SET catalogs_at = NULL, schemas_at = NULL, checked_at = NULL WHERE connection_id = ?1", [connection_id])?;
         // The tables the AI could use are gone with them (its scope stays).
-        Self::ai_forget_tx(&tx, connection_id)?;
-        tx.commit()?;
+        Self::ai_forget_tx(tx, connection_id)?;
         Ok(())
     }
 }
@@ -1058,16 +1071,24 @@ mod tests {
         ws.kn_save_note(note).unwrap();
         ws.meta_put_schemas("c", None, &[sch("s", None)]).unwrap();
         ws.meta_put_schema("c", "s", &[o("s", "t", ObjectKind::Table)]).unwrap();
+        ws.ai_put_rule("c", &crate::ScopeRule { schema: "s".into(), table: String::new(), allow: true }).unwrap();
         cfg.read_only = true;
-        ws.meta_check_identity("c", &cfg).unwrap();
+        assert!(!ws.meta_check_identity("c", &cfg).unwrap(), "nothing cleared");
         assert!(ws.meta_listing("c", "s").unwrap().is_some(), "same server");
         cfg.options.insert("connect_timeout_secs".into(), "90".into());
         cfg.options.insert("idle_disconnect_minutes".into(), "0".into());
         ws.meta_check_identity("c", &cfg).unwrap();
         assert!(ws.meta_listing("c", "s").unwrap().is_some(), "session settings don't change the server");
         assert_eq!(ws.kn_count("c").unwrap(), 1, "the index stays for the same server");
+        assert!(!ws.ai_scope("c").unwrap().is_empty(), "and what the AI may use");
         cfg.host = Some("db2".into());
-        ws.meta_check_identity("c", &cfg).unwrap();
+        assert!(ws.meta_check_identity("c", &cfg).unwrap(), "cleared");
+        // What the AI may use was chosen for the old server's schemas: a
+        // same-named schema on the new one isn't allowed by it.
+        assert!(ws.ai_scope("c").unwrap().is_empty());
+        ws.meta_put_schema("c", "s", &[o("s", "t", ObjectKind::Table)]).unwrap();
+        assert!(ws.ai_catalog("c").objects().unwrap().is_empty(), "the new server's s.t isn't allowed");
+        ws.meta_clear("c").unwrap();
         assert!(ws.meta_listing("c", "s").unwrap().is_none());
         assert!(ws.meta_schemas("c", None).unwrap().is_none());
         assert_eq!(ws.meta_count("c").unwrap(), 0);

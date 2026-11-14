@@ -25,6 +25,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 - When the assistant asks to index a table and the database can't be reached or signed in to, it now says so instead of "not available". A bare table name in several schemas is read from the one the AI may use.
 - What the AI may use (Knowledge → Index) matched schema and table names ignoring case: on PostgreSQL, Oracle, Snowflake and others, allowing `sales` also allowed a different schema `"Sales"`. Names now match exactly, except on SQL Server, whose names ignore case.
 - A note about a table whose name contains a dot (`sales."orders.2024"`) is kept against that table instead of being refused.
+- Pointing a connection at another server (or database, or user) now also clears what the AI may use there: schemas allowed on the old server were allowed on the new one as soon as they were browsed. Choose them again in Knowledge → Index.
+- Searching the AI's tables no longer finds allowed tables through a foreign key to a table outside its scope.
 - Saving grid edits checks the connection again: one made read-only after the editor opened is refused instead of saved.
 - An Excel workbook whose first sheet is empty (a blank cover sheet) opens its first sheet with data instead of failing with "No rows found in xlsx file".
 - Excel: a title above the table ("Quarterly report" over the real header) is no longer taken for the header, and a stray value far from the table (e.g. in `KO5001`) no longer turns the sheet into hundreds of empty columns. The SQL notes the cells it leaves out (`-- The table reads A4:D30 of A1:KO5001 …`).
