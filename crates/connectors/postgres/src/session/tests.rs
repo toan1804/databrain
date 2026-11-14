@@ -237,7 +237,7 @@ async fn live_bulk_metadata_and_fingerprints() {
          comment on table kb_a.customers is 'People'; \
          create table kb_b.orders (id int primary key, customer_id int references kb_a.customers(id), total numeric(10,2)); \
          create view kb_b.big_orders as select * from kb_b.orders where total > 100; \
-         create table kb_c.untouched (x int)")
+         create table kb_c.untouched (x int); insert into kb_c.untouched select generate_series(1, 100); analyze kb_c.untouched")
     .await;
     let m = s.bulk_metadata(&["kb_a".into(), "kb_b".into()]).await.unwrap();
     assert_eq!(m[0].objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["customers"]);
@@ -268,8 +268,9 @@ async fn live_bulk_metadata_and_fingerprints() {
     assert_ne!(fp(&f2, "kb_b"), fp(&f3, "kb_b"), "renamed column");
     run("drop view kb_b.big_orders").await;
     assert_ne!(fp(&f3, "kb_b"), fp(&s.explorer_fingerprints().await.unwrap().unwrap(), "kb_b"), "dropped view");
+    // 100 -> 101 rows: the estimate stays in its power of two (a table that doubles does change the value).
     run("insert into kb_c.untouched values (1); analyze kb_c.untouched").await;
-    assert_eq!(fp(&f3, "kb_c"), fp(&s.explorer_fingerprints().await.unwrap().unwrap(), "kb_c"), "data changes are not schema changes");
+    assert_eq!(fp(&f3, "kb_c"), fp(&s.explorer_fingerprints().await.unwrap().unwrap(), "kb_c"), "small data changes are not schema changes");
     run("drop schema kb_a cascade; drop schema kb_b cascade; drop schema kb_c cascade").await;
 }
 
