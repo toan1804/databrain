@@ -30,6 +30,7 @@ pub use error::*;
 pub use events::*;
 use guard::{Guarded, Hold, Intent};
 pub use load::{LoadCheck, LoadDryRun, LoadEvent, LoadObserver, LoadReport, LoadRows, LoadSpec, LoadTarget, NoLoadObserver};
+pub use metadata::DefaultNamespace;
 pub use outputs::{NewOutput, OutputInfo, OutputRegistry, OutputState, OutputTables};
 
 use databrain_auth::{

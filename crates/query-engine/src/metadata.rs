@@ -2,6 +2,18 @@
 
 use super::*;
 
+/// Where an unqualified table name resolves on a connection
+/// ([`QueryEngine::default_namespace`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultNamespace {
+    /// Outermost first (database or catalog, then schema); `None` where the
+    /// server has none set.
+    pub levels: Vec<Option<String>>,
+    /// The innermost level is only the first place searched: a name not
+    /// found there resolves elsewhere (a Postgres `search_path` of several
+    /// schemas, SQL Server falling back from the user's schema to `dbo`).
+    pub ambiguous: bool,
+}
 impl QueryEngine {
     /// Connect (if needed) and return the server version.
     pub async fn connect(&self, connection_id: &str) -> Result<String> {
@@ -64,10 +76,13 @@ impl QueryEngine {
     /// `search_path` or default schema may not be the engine's usual one.
     /// `None` for engines not asked (their default is fixed or unknown).
     /// At most 10 s.
-    pub async fn default_namespace(&self, connection_id: &str) -> Result<Option<Vec<Option<String>>>> {
+    pub async fn default_namespace(&self, connection_id: &str) -> Result<Option<DefaultNamespace>> {
         use databrain_connector_core::ConnectorKind as K;
-        let sql = match self.workspace.get_connection(connection_id)?.config.kind {
-            K::Postgres | K::Snowflake => "select current_database(), current_schema()",
+        let kind = self.workspace.get_connection(connection_id)?.config.kind;
+        let sql = match kind {
+            // Postgres looks through every schema of the search_path that exists.
+            K::Postgres => "select current_database(), current_schema(), cardinality(current_schemas(false))::text",
+            K::Snowflake => "select current_database(), current_schema()",
             K::Mssql => "select db_name(), schema_name()",
             K::Databricks => "select current_catalog(), current_schema()",
             K::Mysql => "select database()",
@@ -78,10 +93,21 @@ impl QueryEngine {
         let read = self.with_meta(connection_id, |s| async move {
             databrain_connector_core::query_table(s.as_ref(), databrain_connector_core::Statement::internal(sql)).await
         });
-        match tokio::time::timeout(Duration::from_secs(10), read).await {
-            Ok(r) => Ok(r?.1.into_iter().next().map(|row| row.into_iter().map(|v| v.filter(|v| !v.trim().is_empty())).collect())),
-            Err(_) => Err(EngineError::new("timeout", "The database took more than 10 s to say its current schema")),
-        }
+        let row = match tokio::time::timeout(Duration::from_secs(10), read).await {
+            Ok(r) => r?.1.into_iter().next(),
+            Err(_) => return Err(EngineError::new("timeout", "The database took more than 10 s to say its current schema")),
+        };
+        let Some(row) = row else { return Ok(None) };
+        let mut levels: Vec<Option<String>> = row.into_iter().map(|v| v.filter(|v| !v.trim().is_empty())).collect();
+        let ambiguous = match kind {
+            // More than one schema searched: a name missing from the first
+            // is found in a later one (none: only pg_catalog is).
+            K::Postgres => levels.pop().flatten().and_then(|n| n.trim().parse::<u32>().ok()) != Some(1),
+            // A default schema other than `dbo` falls back to `dbo`.
+            K::Mssql => levels.get(1).cloned().flatten().is_some_and(|s| !s.eq_ignore_ascii_case("dbo")),
+            _ => false,
+        };
+        Ok(Some(DefaultNamespace { levels, ambiguous }))
     }
 
     pub async fn explorer_fingerprints(&self, connection_id: &str) -> Result<Option<HashMap<String, String>>> {

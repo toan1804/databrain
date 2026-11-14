@@ -90,6 +90,10 @@ fn some(v: &str) -> Option<String> {
     Some(v.to_string())
 }
 
+fn ns(levels: &[&str], ambiguous: bool) -> databrain_query_engine::DefaultNamespace {
+    databrain_query_engine::DefaultNamespace { levels: levels.iter().map(|l| some(l)).collect(), ambiguous }
+}
+
 /// Each server says its current database and schema, in the levels the
 /// table rules use for it.
 #[tokio::test(flavor = "multi_thread")]
@@ -105,7 +109,7 @@ async fn servers_say_their_current_schema() {
         Some("postgres"),
         admin(),
     ) {
-        assert_eq!(st.engine.default_namespace(&p.id).await.unwrap(), Some(vec![some("postgres"), some("public")]), "Postgres");
+        assert_eq!(st.engine.default_namespace(&p.id).await.unwrap(), Some(ns(&["postgres", "public"], false)), "Postgres");
     }
     if let Some(p) = connect(
         &st,
@@ -116,7 +120,7 @@ async fn servers_say_their_current_schema() {
         Some("mysql"),
         admin(),
     ) {
-        assert_eq!(st.engine.default_namespace(&p.id).await.unwrap(), Some(vec![some("mysql")]), "MySQL");
+        assert_eq!(st.engine.default_namespace(&p.id).await.unwrap().map(|n| n.levels), Some(vec![some("mysql")]), "MySQL");
     }
     // Oracle connects through its helper: only where one is installed (`DATABRAIN_ORACLE_AGENT`).
     if std::env::var("DATABRAIN_ORACLE_AGENT").is_ok()
@@ -131,7 +135,7 @@ async fn servers_say_their_current_schema() {
         )
     {
         let user = p.config.auth.user().unwrap_or_default().to_ascii_uppercase();
-        assert_eq!(st.engine.default_namespace(&p.id).await.unwrap(), Some(vec![Some(user)]), "Oracle");
+        assert_eq!(st.engine.default_namespace(&p.id).await.unwrap().map(|n| n.levels), Some(vec![Some(user)]), "Oracle");
     }
     if let Some(p) = connect(
         &st,
@@ -142,7 +146,7 @@ async fn servers_say_their_current_schema() {
         None,
         admin(),
     ) {
-        assert_eq!(st.engine.default_namespace(&p.id).await.unwrap(), Some(vec![some("default")]), "ClickHouse");
+        assert_eq!(st.engine.default_namespace(&p.id).await.unwrap().map(|n| n.levels), Some(vec![some("default")]), "ClickHouse");
     }
     if let Some(p) = connect(
         &st,
@@ -153,7 +157,7 @@ async fn servers_say_their_current_schema() {
         None,
         admin(),
     ) {
-        assert_eq!(st.engine.default_namespace(&p.id).await.unwrap(), Some(vec![some("master"), some("dbo")]), "SQL Server");
+        assert_eq!(st.engine.default_namespace(&p.id).await.unwrap(), Some(ns(&["master", "dbo"], false)), "SQL Server");
     }
 }
 
@@ -187,9 +191,12 @@ async fn capped_reads_run_on_the_server() {
     }
 }
 
-/// Postgres: a role whose `search_path` starts with another schema reads
-/// that schema's table when it writes an unqualified name, and the table
-/// rules check that table, not `public`'s.
+/// Postgres: a role whose `search_path` holds several schemas may read any
+/// of them through an unqualified name (the first that has the table), so
+/// the table rules can't tell which table `dbr_pay` is: rules that depend
+/// on the schema refuse it, also when the table exists only in a later
+/// schema. With one schema on the path, its tables are checked, not
+/// `public`'s.
 #[tokio::test(flavor = "multi_thread")]
 async fn table_rules_follow_a_roles_search_path() {
     use databrain_ai::policy::{Decision, review_sql};
@@ -207,31 +214,48 @@ async fn table_rules_follow_a_roles_search_path() {
     };
     for sql in [
         "drop schema if exists dbr_hr cascade",
+        "drop table if exists public.dbr_salaries",
         "drop role if exists dbr_rules_role",
         "create schema dbr_hr",
         "create table dbr_hr.dbr_pay (amount int)",
         "create table if not exists public.dbr_pay (amount int)",
+        "create table public.dbr_salaries (amount int)",
         "create role dbr_rules_role login password 'dbr-rules-pw'",
         "alter role dbr_rules_role set search_path = dbr_hr, public",
         "grant usage on schema dbr_hr to dbr_rules_role",
         "grant select on dbr_hr.dbr_pay to dbr_rules_role",
+        "grant select on public.dbr_salaries to dbr_rules_role",
     ] {
         run(&st, &admin.id, sql).await;
     }
-    let rules = AiPolicy { run_query: RunQueryPolicy::AutoRead, read_deny: vec!["%.dbr_hr.%".into()], ..Default::default() };
+    let rules = AiPolicy { run_query: RunQueryPolicy::AutoRead, read_deny: vec!["%.dbr_hr.%".into(), "public.dbr_salaries".into()], ..Default::default() };
     let role = connect(&st, "DATABRAIN_PG", ConnectorKind::Postgres, "dbr_rules_role", Some("dbr-rules-pw".into()), Some("postgres"), rules).unwrap();
-    assert_eq!(st.engine.default_namespace(&role.id).await.unwrap(), Some(vec![some("postgres"), some("dbr_hr")]));
+    assert_eq!(st.engine.default_namespace(&role.id).await.unwrap(), Some(ns(&["postgres", "dbr_hr"], true)));
+    // The role reads public.dbr_salaries through the bare name.
+    run(&st, &role.id, "select * from dbr_salaries").await;
     // Before the server is asked, the usual default (`public`) is assumed: the read looks allowed.
     assert_eq!(review_sql(&role, "select * from dbr_pay").decision, Decision::Allow);
+    databrain_ai::access::learn_defaults(&st.engine, &role).await;
+    for sql in ["select * from dbr_pay", "select * from dbr_salaries"] {
+        match review_sql(&role, sql).decision {
+            Decision::Deny(r) => assert!(r.contains("full name"), "{r}"),
+            d => panic!("{sql}: the schema it reads can't be told, the rules deny some: {d:?}"),
+        }
+    }
+    // A name that says its schema is what it says.
+    assert_eq!(review_sql(&role, "select * from public.dbr_pay").decision, Decision::Allow);
+    assert!(matches!(review_sql(&role, "select * from public.dbr_salaries").decision, Decision::Deny(_)));
+    // One schema on the path: its tables are checked.
+    run(&st, &admin.id, "alter role dbr_rules_role set search_path = dbr_hr").await;
+    st.engine.disconnect(&role.id);
+    assert_eq!(st.engine.default_namespace(&role.id).await.unwrap(), Some(ns(&["postgres", "dbr_hr"], false)));
     databrain_ai::access::learn_defaults(&st.engine, &role).await;
     match review_sql(&role, "select * from dbr_pay").decision {
         Decision::Deny(r) => assert!(r.contains("postgres.dbr_hr.dbr_pay"), "{r}"),
         d => panic!("the role reads dbr_hr.dbr_pay, which the rules deny: {d:?}"),
     }
-    // A name that says its schema is what it says.
-    assert_eq!(review_sql(&role, "select * from public.dbr_pay").decision, Decision::Allow);
     st.engine.disconnect(&role.id);
-    for sql in ["drop schema dbr_hr cascade", "drop table public.dbr_pay", "drop role dbr_rules_role"] {
+    for sql in ["drop schema dbr_hr cascade", "drop table public.dbr_pay", "drop table public.dbr_salaries", "drop role dbr_rules_role"] {
         run(&st, &admin.id, sql).await;
     }
 }

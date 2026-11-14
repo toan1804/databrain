@@ -65,27 +65,46 @@ pub fn like(pattern: &str, text: &str) -> bool {
 
 /// What the server said an unqualified name resolves to, per connection id
 /// ([`learn_defaults`]).
-static LEARNED: std::sync::LazyLock<parking_lot::RwLock<std::collections::HashMap<String, Vec<Option<String>>>>> = std::sync::LazyLock::new(Default::default);
+static LEARNED: std::sync::LazyLock<parking_lot::RwLock<std::collections::HashMap<String, Learned>>> = std::sync::LazyLock::new(Default::default);
+
+#[derive(Debug, Clone)]
+struct Learned {
+    /// Outermost first; `None` keeps the usual default of that level.
+    levels: Vec<Option<String>>,
+    /// The schema an unqualified name ends up in can't be told (several
+    /// searched, or the server couldn't be asked).
+    ambiguous: bool,
+}
 
 /// Ask the server where an unqualified name resolves on this connection
 /// (its current database and schema) and use that for the table rules from
 /// now on, instead of the engine's usual default (`public`, `dbo`, the
 /// user): a role with another `search_path` or default schema would
 /// otherwise have `orders` checked as `public.orders` while it reads
-/// `hr.orders`. Only asked when the connection has table rules; when the
-/// server can't be asked, what was learned before (or the usual default)
-/// stays.
+/// `hr.orders`. Only asked when the connection has table rules.
+///
+/// Fail-closed: when the name may resolve in more than one schema (a
+/// `search_path` of several, a SQL Server schema other than `dbo`), or the
+/// server can't be asked, the schema of an unqualified name counts as
+/// unknown, so rules that depend on it refuse the name.
 pub async fn learn_defaults(engine: &databrain_query_engine::QueryEngine, profile: &ConnectionProfile) {
     if !has_rules(&profile.ai_policy) {
         return;
     }
-    if let Ok(Some(ns)) = engine.default_namespace(&profile.id).await {
-        remember_defaults(&profile.id, ns);
+    match engine.default_namespace(&profile.id).await {
+        Ok(Some(ns)) => remember(&profile.id, Learned { levels: ns.levels, ambiguous: ns.ambiguous }),
+        Ok(None) => {}
+        Err(_) => remember(&profile.id, Learned { levels: vec![], ambiguous: true }),
     }
 }
 
+#[cfg(test)]
 pub(crate) fn remember_defaults(connection_id: &str, namespace: Vec<Option<String>>) {
-    LEARNED.write().insert(connection_id.to_string(), namespace);
+    remember(connection_id, Learned { levels: namespace, ambiguous: false });
+}
+
+fn remember(connection_id: &str, learned: Learned) {
+    LEARNED.write().insert(connection_id.to_string(), learned);
 }
 
 /// Levels of names on this engine (table included) and the defaults that
@@ -93,10 +112,14 @@ pub(crate) fn remember_defaults(connection_id: &str, namespace: Vec<Option<Strin
 /// what the server said ([`learn_defaults`]), else the engine's usual ones.
 pub(crate) fn defaults(profile: &ConnectionProfile) -> Vec<Option<String>> {
     let usual = usual_defaults(profile);
-    match LEARNED.read().get(&profile.id) {
-        Some(learned) if learned.len() == usual.len() => learned.iter().zip(usual).map(|(l, u)| l.clone().or(u)).collect(),
-        _ => usual,
+    let Some(learned) = LEARNED.read().get(&profile.id).cloned() else { return usual };
+    let mut d = if learned.levels.len() == usual.len() { learned.levels.into_iter().zip(usual).map(|(l, u)| l.or(u)).collect() } else { usual };
+    if learned.ambiguous
+        && let Some(schema) = d.last_mut()
+    {
+        *schema = None;
     }
+    d
 }
 
 fn usual_defaults(profile: &ConnectionProfile) -> Vec<Option<String>> {
@@ -347,6 +370,42 @@ mod tests {
         other.id = "learned-defaults-other".into();
         remember_defaults(&p.id, vec![Some("app".into()), Some("hr".into())]);
         assert!(check_sql(&other, "select * from pay").is_ok());
+    }
+
+    /// A name that may resolve in more than one schema (a search_path of
+    /// several, a SQL Server schema other than `dbo`), or whose schema the
+    /// server couldn't say, is refused by rules that depend on its schema;
+    /// a name with its schema, and rules that don't name one, still work.
+    #[test]
+    fn ambiguous_or_unlearned_schemas_refuse_unqualified_names() {
+        // search_path = hr, public; `salaries` exists only in public, which the rules deny.
+        let pol = AiPolicy { read_deny: parse_patterns("public.salaries"), ..Default::default() };
+        let mut p = profile(ConnectorKind::Postgres, Some("app"), pol);
+        p.id = "ambiguous-defaults-test".into();
+        remember(&p.id, Learned { levels: vec![Some("app".into()), Some("hr".into())], ambiguous: true });
+        assert!(check_sql(&p, "select * from salaries").unwrap_err().contains("full name"));
+        assert!(check_sql(&p, "select * from public.salaries").unwrap_err().contains("deny"));
+        assert!(check_sql(&p, "select * from hr.salaries").is_ok());
+        // An allow-list of one schema doesn't let the other's tables through a bare name.
+        let mut allow = profile(ConnectorKind::Postgres, Some("app"), AiPolicy { read_allow: parse_patterns("%.hr.%"), ..Default::default() });
+        allow.id = "ambiguous-allow-test".into();
+        remember(&allow.id, Learned { levels: vec![Some("app".into()), Some("hr".into())], ambiguous: true });
+        assert!(check_sql(&allow, "select * from pay").is_err());
+        assert!(check_sql(&allow, "select * from hr.pay").is_ok());
+        // A rule on the table's name alone doesn't depend on the schema.
+        let mut bare = profile(ConnectorKind::Postgres, Some("app"), AiPolicy { read_deny: parse_patterns("salaries"), ..Default::default() });
+        bare.id = "ambiguous-bare-test".into();
+        remember(&bare.id, Learned { levels: vec![], ambiguous: true });
+        assert!(check_sql(&bare, "select * from pay").is_ok());
+        assert!(check_sql(&bare, "select * from salaries").is_err());
+        // SQL Server: the lookup failed.
+        let mut ms = profile(ConnectorKind::Mssql, Some("app"), AiPolicy { read_deny: parse_patterns("app.dbo.pay"), ..Default::default() });
+        ms.id = "ambiguous-mssql-test".into();
+        assert!(check_sql(&ms, "select * from pay").is_err(), "the usual dbo");
+        assert!(check_sql(&ms, "select * from other").is_ok());
+        remember(&ms.id, Learned { levels: vec![], ambiguous: true });
+        assert!(check_sql(&ms, "select * from other").unwrap_err().contains("full name"));
+        assert!(check_sql(&ms, "select * from app.sales.other").is_ok());
     }
 
     #[test]
