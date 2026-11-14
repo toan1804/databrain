@@ -1,57 +1,47 @@
-//! Views (filters, quick filter, sort), find and column statistics of a
-//! result on disk, file by file: the rows are never all in memory. Filters
-//! and text matching are the in-memory code run on each file (same answers);
-//! sorting goes to the [`DiskSorter`] (DuckDB, out of memory) with the keys
-//! the in-memory sort compares, and the sorted rows are kept on disk too.
+//! Sorts and filters of a result on disk apply to its first rows only (a
+//! window: the rows the grid has loaded, `ViewSpec::first_rows`), read into
+//! memory once and sorted and filtered there by the in-memory code. Find,
+//! statistics and export of the plain result read every row, file by file:
+//! the rows are never all in memory.
 //!
-//! Long work (building a view, find, statistics, streaming every row) reads
-//! a snapshot of the files ([`Files`]) without holding the result's lock, so
-//! the grid, the outputs list and new queries never wait on it. The free
-//! functions here take the shared result; the `ResultSet` methods of the
+//! Long work (reading the window, find, statistics, streaming every row)
+//! reads a snapshot of the files ([`Files`]) without holding the result's
+//! lock, so the grid, the outputs list and new queries never wait on it. The
+//! free functions here take the shared result; the `ResultSet` methods of the
 //! same name do the same work under the lock (callers that already hold it).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use databrain_connector_core::arrow::array::{Array, ArrayRef, AsArray, BinaryArray, RecordBatch, UInt32Array, UInt64Array};
+use databrain_connector_core::arrow::array::{Array, ArrayRef, BinaryArray, RecordBatch};
 use databrain_connector_core::arrow::compute;
-use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit, UInt64Type};
+use databrain_connector_core::arrow::datatypes::SchemaRef;
 use parking_lot::Mutex;
 
 use crate::display::{self, is_decimal_text};
-use crate::spill::{CHUNK_ROWS, Files, Spill};
+use crate::spill::{CHUNK_ROWS, Files};
 use crate::view::{self, DisplayCache, ViewSpec};
-use crate::{CellMatch, ColumnStats, DiskSorter, DiskView, Error, FindResult, Result, ResultSet, SortJob, TopValue, decimal};
+use crate::{CellMatch, ColumnStats, Error, FindResult, Result, ResultSet, TopValue, decimal};
 
 /// Distinct values counted for column statistics of a result on disk.
 const MAX_DISTINCT: usize = 1_000_000;
 
-/// The row's place in the result, in a view's files (and the sort's keys).
-pub const ROW_ID: &str = "__databrain_row_id";
+/// Memory a window may take at most (fewer rows than asked past it).
+pub const WINDOW_BYTES: usize = 256 << 20;
 
-static VIEW_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Free disk space where results spill, and the floor to keep.
-#[derive(Clone)]
-pub struct SpaceCheck {
-    pub free: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
-    pub floor: u64,
+/// The first rows of a result on disk, in memory, that its sorts and
+/// filters apply to.
+pub(crate) struct Window {
+    /// Rows asked for ([`asked`]); `set` has fewer when the result has
+    /// fewer or they passed [`WINDOW_BYTES`].
+    asked: usize,
+    pub(crate) set: Box<ResultSet>,
 }
 
-/// `schema` plus the [`ROW_ID`] column.
-fn with_row_id(schema: &SchemaRef) -> SchemaRef {
-    let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-    fields.push(Field::new(ROW_ID, DataType::UInt64, false));
-    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
-}
-
-/// Split the [`ROW_ID`] column off a view batch.
-pub(crate) fn split_ids(b: &RecordBatch, schema: &SchemaRef) -> Result<(RecordBatch, Vec<u32>)> {
-    let n = b.num_columns() - 1;
-    let ids = b.column(n).as_primitive::<UInt64Type>().values().iter().map(|&i| i as u32).collect();
-    Ok((RecordBatch::try_new(schema.clone(), b.columns()[..n].to_vec())?, ids))
+/// Rows of the window `spec` asks for (all, up to [`WINDOW_BYTES`], when
+/// it doesn't say).
+fn asked(spec: &ViewSpec) -> usize {
+    spec.first_rows.map_or(usize::MAX, |n| n.max(1))
 }
 
 /// Stops a `for_each` early (not an error).
@@ -66,230 +56,121 @@ fn stopped(r: Result<()>) -> Result<()> {
     }
 }
 
-/// Types DuckDB gives back as they were (a sorted view goes through it):
-/// not 256-bit decimals (back as DOUBLE), nanosecond times or zoned
-/// timestamps, intervals, durations or unions.
-fn survives_duckdb(dt: &DataType) -> bool {
-    match dt {
-        // Nanosecond timestamps with a time zone come back as microseconds.
-        DataType::Decimal256(..)
-        | DataType::Time64(TimeUnit::Nanosecond)
-        | DataType::Timestamp(TimeUnit::Nanosecond, Some(_))
-        | DataType::Interval(_)
-        | DataType::Duration(_)
-        | DataType::Union(..) => false,
-        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) | DataType::Map(f, _) => survives_duckdb(f.data_type()),
-        DataType::Struct(fs) => fs.iter().all(|f| survives_duckdb(f.data_type())),
-        _ => true,
-    }
-}
-
-/// What a view of a result on disk is built from, taken under the lock.
-pub(crate) struct Plan {
-    data: Files,
-    starts: Vec<(PathBuf, usize)>,
-    schema: SchemaRef,
-    dir: PathBuf,
-    sorter: Option<Arc<dyn DiskSorter>>,
-    space: Option<SpaceCheck>,
-    disk_bytes: u64,
-    rows_per_group: usize,
-}
-
 impl ResultSet {
-    fn has_view(&self, spec: &ViewSpec) -> bool {
-        self.disk_view.as_ref().is_some_and(|v| &v.spec == spec)
+    fn has_window(&self, spec: &ViewSpec) -> bool {
+        self.window.as_ref().is_some_and(|w| w.asked == asked(spec))
     }
 
-    /// Reading `spec` needs no view to be built (in memory, the identity
-    /// view, or the view already there).
+    /// Reading `spec` needs no window to be read (in memory, the plain
+    /// result, or the window already there).
     fn view_ready(&self, spec: &ViewSpec) -> bool {
-        !self.is_on_disk() || spec.is_identity() || self.has_view(spec)
+        !self.is_on_disk() || spec.is_identity() || self.has_window(spec)
     }
 
-    pub(crate) fn view_plan(&self) -> Result<Plan> {
+    fn window_plan(&self) -> Result<(Files, SchemaRef, String)> {
         if !self.complete {
             return Err(Error::OnDisk("Sorting and filtering while rows are still loading"));
         }
         let sp = self.spill.as_ref().ok_or(Error::OnDisk("This"))?;
-        Ok(Plan {
-            data: sp.snapshot(),
-            starts: sp.file_starts(),
-            schema: self.schema.clone(),
-            dir: sp.dir().join(format!("view-{}", VIEW_SEQ.fetch_add(1, Ordering::Relaxed))),
-            sorter: self.sorter.clone(),
-            space: self.space.clone(),
-            disk_bytes: sp.disk_bytes(),
-            rows_per_group: sp.rows_per_group(),
-        })
+        Ok((sp.snapshot(), self.schema.clone(), self.id.clone()))
     }
 
-    fn install_view(&mut self, spec: &ViewSpec, rows: Spill) {
-        self.disk_view = Some(DiskView { spec: spec.clone(), rows });
-    }
-
-    /// The view of a result on disk for `spec` (not the identity), built
-    /// once per spec under the lock (see [`prepare_view`] to build it
-    /// without): a [`Spill`] of the kept rows in order, plus [`ROW_ID`].
-    pub(crate) fn disk_view(&mut self, spec: &ViewSpec) -> Result<&mut Spill> {
-        if !self.has_view(spec) {
-            let plan = self.view_plan()?;
-            // The previous view's files go first.
-            self.disk_view = None;
-            let rows = build_view(plan, spec)?;
-            self.install_view(spec, rows);
+    /// The window `spec` applies to (a result on disk, a sort or filter),
+    /// read under the lock if it isn't there (see [`prepare_view`] to read
+    /// it without).
+    pub(crate) fn window(&mut self, spec: &ViewSpec) -> Result<&mut ResultSet> {
+        if !self.has_window(spec) {
+            let (files, schema, id) = self.window_plan()?;
+            self.window = None;
+            let set = read_window(&files, schema, id, asked(spec))?;
+            self.window = Some(Window { asked: asked(spec), set: Box::new(set) });
         }
-        Ok(&mut self.disk_view.as_mut().expect("just built").rows)
+        Ok(&mut self.window.as_mut().expect("just read").set)
     }
 
-    /// The rows of `spec` on disk as a snapshot, and whether they carry
-    /// [`ROW_ID`] (a view).
-    pub(crate) fn disk_snapshot(&mut self, spec: &ViewSpec) -> Result<(Files, bool)> {
-        if spec.is_identity() {
-            return Ok((self.spill.as_ref().ok_or(Error::OnDisk("This"))?.snapshot(), false));
-        }
-        Ok((self.disk_view(spec)?.snapshot(), true))
+    /// Every row of a result on disk, a batch at a time.
+    pub(crate) fn disk_for_each(&mut self, chunk: usize, f: &mut dyn FnMut(RecordBatch) -> Result<()>) -> Result<()> {
+        let files = self.spill.as_ref().ok_or(Error::OnDisk("This"))?.snapshot();
+        files.for_each(chunk, f)
     }
 
-    /// Every view batch of a result on disk, without [`ROW_ID`].
-    pub(crate) fn disk_for_each(&mut self, spec: &ViewSpec, chunk: usize, f: &mut dyn FnMut(RecordBatch) -> Result<()>) -> Result<()> {
-        let (files, ids) = self.disk_snapshot(spec)?;
-        each(&files, ids, &self.schema.clone(), chunk, f)
-    }
-
-    pub(crate) fn disk_find(&mut self, spec: &ViewSpec, query: &str, columns: Option<&[usize]>, limit: usize, whole_word: bool) -> Result<FindResult> {
-        let (files, _) = self.disk_snapshot(spec)?;
+    pub(crate) fn disk_find(&mut self, query: &str, columns: Option<&[usize]>, limit: usize, whole_word: bool) -> Result<FindResult> {
+        let files = self.spill.as_ref().ok_or(Error::OnDisk("This"))?.snapshot();
         find_in(&files, self.schema.fields().len(), query, columns, limit, whole_word)
     }
 
-    pub(crate) fn disk_column_stats(&mut self, spec: &ViewSpec, column: usize) -> Result<ColumnStats> {
-        let (files, _) = self.disk_snapshot(spec)?;
+    pub(crate) fn disk_column_stats(&mut self, column: usize) -> Result<ColumnStats> {
+        let files = self.spill.as_ref().ok_or(Error::OnDisk("This"))?.snapshot();
         stats_in(&files, &self.schema.clone(), column)
     }
 }
 
-fn each(files: &Files, ids: bool, schema: &SchemaRef, chunk: usize, f: &mut dyn FnMut(RecordBatch) -> Result<()>) -> Result<()> {
-    files.for_each(chunk, &mut |b| if ids { f(split_ids(&b, schema)?.0) } else { f(b) })
+/// The first `rows` rows of `files` (fewer past [`WINDOW_BYTES`]) as a
+/// complete result in memory: row `i` of it is row `i` of the result.
+fn read_window(files: &Files, schema: SchemaRef, id: String, rows: usize) -> Result<ResultSet> {
+    let mut set = ResultSet::new(id, schema);
+    let (mut have, mut bytes) = (0usize, 0usize);
+    let r = files.for_each(CHUNK_ROWS, &mut |b| {
+        let n = b.num_rows();
+        let size = b.get_array_memory_size().max(1);
+        // Rows of this batch that fit: all, or a share by size (at least one row overall).
+        let mut take = n.min(rows - have);
+        if bytes + size > WINDOW_BYTES {
+            let room = WINDOW_BYTES.saturating_sub(bytes);
+            take = take.min((n as u128 * room as u128 / size as u128) as usize);
+            if have + take == 0 {
+                take = 1;
+            }
+        }
+        if take > 0 {
+            set.push(b.slice(0, take));
+            have += take;
+            bytes += size;
+        }
+        if have >= rows || take < n {
+            return Err(stop());
+        }
+        Ok(())
+    });
+    stopped(r)?;
+    set.finish(false);
+    // One copy of the rows, not the files' whole chunks they were sliced from.
+    set.combined()?;
+    Ok(set)
 }
 
-/// Build a view (out of any lock): filters file by file; a sort through the
-/// sorter. Refused when the disk lacks room for the copy it writes.
-fn build_view(plan: Plan, spec: &ViewSpec) -> Result<Spill> {
-    if let Some(sc) = &plan.space
-        && let Some(free) = (sc.free)()
-    {
-        // A copy of the rows, and DuckDB's own temporary files for a sort.
-        let need = sc.floor + plan.disk_bytes * if spec.sort.is_empty() { 1 } else { 2 };
-        if free < need {
-            return Err(Error::Spill(format!(
-                "not enough free disk space to {} this result ({} MB free, about {} MB needed)",
-                if spec.sort.is_empty() { "filter" } else { "sort" },
-                free >> 20,
-                need >> 20
-            )));
-        }
-    }
-    let ext = with_row_id(&plan.schema);
-    let mut base = 0u64;
-    if spec.sort.is_empty() {
-        let mut out = Spill::create(plan.dir, ext.clone())?;
-        plan.data.for_each(CHUNK_ROWS, &mut |b| {
-            let n = b.num_rows() as u64;
-            let kept = view::kept_rows(&b, spec, &mut DisplayCache::default())?;
-            let (rows, ids) = match kept {
-                None => (b, UInt64Array::from_iter_values(base..base + n)),
-                Some(idx) => (compute::take_record_batch(&b, &idx)?, UInt64Array::from_iter_values(idx.values().iter().map(|&i| base + i as u64))),
-            };
-            base += n;
-            let mut cols = rows.columns().to_vec();
-            cols.push(Arc::new(ids));
-            out.push(RecordBatch::try_new(ext.clone(), cols)?)
-        })?;
-        out.finish()?;
-        return Ok(out);
-    }
-    // A sort: DuckDB reads the files, so names it adds can't be columns,
-    // and every type must come back as it went.
-    for f in plan.schema.fields() {
-        if [ROW_ID, "file_row_number", "__databrain_file"].iter().any(|n| f.name().eq_ignore_ascii_case(n)) {
-            return Err(Error::Spill(format!("a result with a column named {} can't be sorted on disk", f.name())));
-        }
-        if !survives_duckdb(f.data_type()) {
-            return Err(Error::Spill(format!("a result with a {} column can't be sorted on disk", f.data_type())));
-        }
-    }
-    let sorter = plan.sorter.ok_or(Error::OnDisk("Sorting (it needs DuckDB)"))?;
-    let mut key_fields = vec![Field::new(ROW_ID, DataType::UInt64, false)];
-    for (i, k) in spec.sort.iter().enumerate() {
-        let f = plan.schema.fields().get(k.column).ok_or(Error::InvalidColumn(k.column))?;
-        let dt = if is_decimal_text(f) { DataType::Binary } else { f.data_type().clone() };
-        key_fields.push(Field::new(format!("k{i}"), dt, true));
-    }
-    let key_schema: SchemaRef = Arc::new(Schema::new(key_fields));
-    // The view's folder: removed if anything below fails.
-    let out = Spill::create(plan.dir.clone(), ext.clone())?;
-    let mut keys = Spill::create(plan.dir.join("keys"), key_schema.clone())?;
-    plan.data.for_each(CHUNK_ROWS, &mut |b| {
-        let n = b.num_rows() as u64;
-        let idx = view::kept_rows(&b, spec, &mut DisplayCache::default())?.unwrap_or_else(|| UInt32Array::from_iter_values(0..n as u32));
-        let mut cols: Vec<ArrayRef> = vec![Arc::new(UInt64Array::from_iter_values(idx.values().iter().map(|&i| base + i as u64)))];
-        for k in view::sort_keys(&b, spec)? {
-            cols.push(compute::take(k.as_ref(), &idx, None)?);
-        }
-        base += n;
-        keys.push(RecordBatch::try_new(key_schema.clone(), cols)?)
-    })?;
-    keys.finish()?;
-    if keys.rows() == 0 {
-        // The filters keep nothing: an empty view (nothing to sort).
-        return Ok(out);
-    }
-    let file = plan.dir.join("sorted.parquet");
-    let job = SortJob {
-        keys: keys.files(),
-        data: plan.starts,
-        descending: spec.sort.iter().map(|k| k.descending).collect(),
-        out: file.clone(),
-        row_group_rows: plan.rows_per_group,
-    };
-    sorter.sort(&job).map_err(Error::Spill)?;
-    drop(keys);
-    // The sorted file's rows, sharing the folder with `out` (empty).
-    out.with_file(file)
-}
-
-/// Build the view of `spec` for a result on disk (once), reading its files
-/// without holding the result's lock; one build at a time per result.
-/// Nothing to do in memory or for the identity view.
+/// Read the window `spec` applies to for a result on disk (once), without
+/// holding the result's lock; one read at a time per result. Nothing to do
+/// in memory or for the plain result.
 pub fn prepare_view(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec) -> Result<()> {
     if spec.is_identity() {
         return Ok(());
     }
     let build = {
         let g = rs.lock();
-        if !g.is_on_disk() || g.has_view(spec) {
+        if g.view_ready(spec) {
             return Ok(());
         }
         g.view_build.clone()
     };
     let _one = build.lock();
-    let plan = {
+    let (files, schema, id) = {
         let mut g = rs.lock();
-        if g.has_view(spec) {
+        if g.view_ready(spec) {
             return Ok(());
         }
-        // The previous view's files go first.
-        g.disk_view = None;
-        g.view_plan()?
+        // The previous window goes first.
+        g.window = None;
+        g.window_plan()?
     };
-    let rows = build_view(plan, spec)?;
-    rs.lock().install_view(spec, rows);
+    let set = read_window(&files, schema, id, asked(spec))?;
+    rs.lock().window = Some(Window { asked: asked(spec), set: Box::new(set) });
     Ok(())
 }
 
-/// Run `f` on the result with the view of `spec` ready, built without the
-/// lock. A request for another view can replace it in between: then it is
-/// built again (a few times) before `f` would build it under the lock.
+/// Run `f` on the result with the window of `spec` ready, read without the
+/// lock. A request for another window can replace it in between: then it is
+/// read again (a few times) before `f` would read it under the lock.
 pub fn with_view<T>(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec, f: impl FnOnce(&mut ResultSet) -> Result<T>) -> Result<T> {
     for _ in 0..3 {
         prepare_view(rs, spec)?;
@@ -301,49 +182,47 @@ pub fn with_view<T>(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec, f: impl FnOnce(
     f(&mut rs.lock())
 }
 
-/// The rows of `spec` to read without the lock (None: the result is in memory).
-fn snapshot(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec) -> Result<Option<(Files, bool, SchemaRef)>> {
-    with_view(rs, spec, |g| {
-        if !g.is_on_disk() {
-            return Ok(None);
-        }
-        let schema = g.schema();
-        let (files, ids) = g.disk_snapshot(spec)?;
-        Ok(Some((files, ids, schema)))
-    })
+/// The files of a result on disk to read without the lock, for the plain
+/// result (None: in memory, or a sort or filter, which reads the window).
+fn snapshot(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec) -> Option<(Files, SchemaRef)> {
+    let g = rs.lock();
+    if !spec.is_identity() {
+        return None;
+    }
+    g.spill.as_ref().map(|sp| (sp.snapshot(), g.schema()))
 }
 
-/// Every row of the view, a batch at a time (the result's own types). A
-/// result on disk is read without holding its lock.
+/// Every row of the view, a batch at a time (the result's own types). The
+/// files of a result on disk are read without holding its lock.
 pub fn for_each_batch(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec, chunk: usize, f: &mut dyn FnMut(RecordBatch) -> Result<()>) -> Result<()> {
-    match snapshot(rs, spec)? {
-        Some((files, ids, schema)) => each(&files, ids, &schema, chunk, f),
+    match snapshot(rs, spec) {
+        Some((files, _)) => files.for_each(chunk, f),
         None => {
             // In memory: the batches are taken under the lock, used after it.
-            let batches = rs.lock().view_batches(spec, chunk)?;
+            let batches = with_view(rs, spec, |g| g.view_batches(spec, chunk))?;
             batches.into_iter().try_for_each(f)
         }
     }
 }
 
-/// [`ResultSet::find_with`]; a result on disk is read without its lock.
+/// [`ResultSet::find_with`]; the files of a result on disk are read without its lock.
 pub fn find(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec, query: &str, columns: Option<&[usize]>, limit: usize, whole_word: bool) -> Result<FindResult> {
-    match snapshot(rs, spec)? {
-        Some((files, _, schema)) => find_in(&files, schema.fields().len(), query, columns, limit, whole_word),
-        None => rs.lock().find_with(spec, query, columns, limit, whole_word),
+    match snapshot(rs, spec) {
+        Some((files, schema)) => find_in(&files, schema.fields().len(), query, columns, limit, whole_word),
+        None => with_view(rs, spec, |g| g.find_with(spec, query, columns, limit, whole_word)),
     }
 }
 
-/// [`ResultSet::column_stats`]; a result on disk is read without its lock.
+/// [`ResultSet::column_stats`]; the files of a result on disk are read without its lock.
 pub fn column_stats(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec, column: usize) -> Result<ColumnStats> {
-    match snapshot(rs, spec)? {
-        Some((files, _, schema)) => {
+    match snapshot(rs, spec) {
+        Some((files, schema)) => {
             if column >= schema.fields().len() {
                 return Err(Error::InvalidColumn(column));
             }
             stats_in(&files, &schema, column)
         }
-        None => rs.lock().column_stats(spec, column),
+        None => with_view(rs, spec, |g| g.column_stats(spec, column)),
     }
 }
 

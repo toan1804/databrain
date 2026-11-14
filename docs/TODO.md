@@ -10,12 +10,11 @@ Found in reviews and left for a later release on purpose. Each says what goes wr
 
 ## Results on disk (left from the spill work of 2026-11-14)
 
-- A sort or filter of a result on disk runs on the thread that asked for the page, with no progress and no Stop: on a very large result the grid waits until it's done.
 - Charts and pinning refuse a result on disk, and the AI's local aggregate tool sends the AI to `query_outputs` instead.
 - A result on disk isn't saved when the app quits (tab results are saved up to 64 MB anyway), so its tab shows nothing after a restart.
 - Files of results on disk are plain Parquet in DataBrain's folder, sensitive columns included (they're masked only on the way to the AI). They're deleted with the result, or at the next start after a crash; until then they're as readable as the user's other files.
 - Column statistics of a result on disk count distinct values up to a million ("+" past it); the top values come from the values counted.
-- A sorted view of a result on disk is refused for columns DuckDB can't give back as they were (256-bit decimals, nanosecond times, intervals) and for a column named `file_row_number`.
+- A sort or filter of a result on disk applies to the rows loaded in the grid only (at most 256 MB of them, `WINDOW_BYTES`); every row needs SQL on `results.<name>`.
 
 ## Query engine (review of 2026-11-12; see [QUERY_ENGINE.md](QUERY_ENGINE.md))
 

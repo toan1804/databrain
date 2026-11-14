@@ -491,28 +491,35 @@ async fn results_larger_than_memory_continue_on_disk() {
     let page = api::fetch_page(&st, info.id.clone(), Default::default(), 350_000, 3).await.unwrap();
     assert_eq!(page.rows.iter().map(|r| r[0].clone().unwrap()).collect::<Vec<_>>(), vec!["350000", "350001", "350002"]);
     assert_eq!(page.row_ids, vec![350_000, 350_001, 350_002]);
-    // Sort, filter, find and statistics: over every row, out of memory.
+    // Sort and filter: of the rows the grid has loaded (the first 1,000),
+    // in memory; none given, of every row that fits in the window.
     use databrain_result_store::{ColumnFilter, FilterOp, SortKey, ViewSpec};
-    let sorted = ViewSpec { sort: vec![SortKey { column: 2, descending: true }, SortKey { column: 0, descending: false }], ..Default::default() };
+    let keys = vec![SortKey { column: 2, descending: true }, SortKey { column: 0, descending: false }];
+    let sorted = ViewSpec { sort: keys.clone(), first_rows: Some(1000), ..Default::default() };
     let page = api::fetch_page(&st, info.id.clone(), sorted.clone(), 0, 3).await.unwrap();
-    assert_eq!(page.view_rows, n);
-    // amount = id / 100 (2 decimals): the largest are 3999.99 (399999), 3999.98 (399998)...
-    assert_eq!(page.rows.iter().map(|r| r[0].clone().unwrap()).collect::<Vec<_>>(), vec!["399999", "399998", "399997"]);
-    assert_eq!(page.row_ids, vec![399_999, 399_998, 399_997]);
-    let filtered =
-        ViewSpec { filters: vec![ColumnFilter { column: 0, op: FilterOp::Gte, value: "399990".into() }], quick_filter: Some("9".into()), ..Default::default() };
+    assert_eq!((page.view_rows, page.total_rows, page.window_rows), (1000, n, Some(1000)));
+    // amount = id / 100 (2 decimals): the largest of the first 1,000 are 9.99 (999), 9.98 (998)...
+    assert_eq!(page.rows.iter().map(|r| r[0].clone().unwrap()).collect::<Vec<_>>(), vec!["999", "998", "997"]);
+    assert_eq!(page.row_ids, vec![999, 998, 997]);
+    let every = ViewSpec { sort: keys.clone(), ..Default::default() };
+    let page = api::fetch_page(&st, info.id.clone(), every, 0, 1).await.unwrap();
+    assert_eq!((page.view_rows, page.window_rows, page.row_ids.clone()), (n, Some(n), vec![399_999]));
+    let filter = vec![ColumnFilter { column: 0, op: FilterOp::Gte, value: "399990".into() }];
+    let loaded = ViewSpec { filters: filter.clone(), first_rows: Some(1000), ..Default::default() };
+    assert_eq!(api::fetch_page(&st, info.id.clone(), loaded, 0, 5).await.unwrap().view_rows, 0, "rows past the first 1,000 aren't filtered");
+    let filtered = ViewSpec { filters: filter, quick_filter: Some("9".into()), ..Default::default() };
     let page = api::fetch_page(&st, info.id.clone(), filtered.clone(), 0, 20).await.unwrap();
     assert_eq!(page.view_rows, 10, "ids 399990..=399999 all contain a 9");
     assert_eq!(page.row_ids.first(), Some(&399_990));
     let found = api::find_in_result(&st, info.id.clone(), filtered, "39999".into(), Some(vec![0]), 100, false).await.unwrap();
     assert_eq!(found.matches.len(), 10);
-    // A sort of nothing (the filter keeps no row): an empty grid, not an error.
-    let none = ViewSpec { filters: vec![ColumnFilter { column: 0, op: FilterOp::Lt, value: "-1".into() }], sort: sorted.sort.clone(), ..Default::default() };
-    assert_eq!(api::fetch_page(&st, info.id.clone(), none, 0, 5).await.unwrap().view_rows, 0);
+    // Find and statistics of the plain result: every row, from the files.
+    let found = api::find_in_result(&st, info.id.clone(), ViewSpec::default(), "399999".into(), Some(vec![0]), 100, false).await.unwrap();
+    assert_eq!(found.matches.len(), 1);
     let stats = api::column_stats(&st, info.id.clone(), ViewSpec::default(), 0).await.unwrap();
     assert_eq!((stats.count, stats.nulls, stats.distinct), (n as u64, 0, n as u64));
     assert_eq!((stats.min.as_deref(), stats.max.as_deref()), (Some("0"), Some("399999")));
-    // Export of a sorted view: in that order.
+    // Export of a sorted view: its rows, in that order.
     let top = app_dir.path().join("top.csv");
     api::export_result(
         &st,
@@ -523,7 +530,9 @@ async fn results_larger_than_memory_continue_on_disk() {
     )
     .await
     .unwrap();
-    assert!(std::fs::read_to_string(&top).unwrap().lines().nth(1).unwrap().starts_with("399999,"));
+    let csv = std::fs::read_to_string(&top).unwrap();
+    assert!(csv.lines().nth(1).unwrap().starts_with("999,"), "{}", csv.lines().nth(1).unwrap());
+    assert_eq!(csv.lines().count(), 1001, "a header and the 1,000 rows");
 
     // results.<handle>: every row, the decimal as a number.
     let handle = st.engine.outputs().by_result(&info.id).unwrap().handle;

@@ -196,6 +196,7 @@ export function ExportDialog({
           <label className="flex items-center gap-2">
             <input type="radio" checked={scope === "view"} disabled={busy} onChange={() => setScope("view")} />
             Current view {filtered ? "(filtered/sorted)" : ""} — {formatCount(viewRows)} rows
+            {filtered && info.on_disk ? " (of the rows loaded in the grid)" : ""}
           </label>
           <label className="flex items-center gap-2">
             <input type="radio" checked={scope === "fetched"} disabled={busy} onChange={() => setScope("fetched")} />

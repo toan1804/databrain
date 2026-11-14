@@ -10,4 +10,10 @@ export type ViewSpec = { filters: Array<ColumnFilter>,
 /**
  * Keep rows where any cell contains this text (case-insensitive).
  */
-quick_filter?: string | null, sort: Array<SortKey>, };
+quick_filter?: string | null, sort: Array<SortKey>, 
+/**
+ * For a result on disk: sorts and filters apply to its first rows
+ * only, this many (the rows the grid has loaded); None: as many as fit
+ * in [`crate::WINDOW_BYTES`]. Results in memory use every row.
+ */
+first_rows?: number | null, };

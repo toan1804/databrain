@@ -1,7 +1,7 @@
 //! Rows of a result kept on disk once it outgrows its share of memory:
 //! Parquet files of at most [`CHUNK_ROWS`] rows and about [`CHUNK_BYTES`]
 //! each (one row group), so a page reads one file, and DuckDB can read them
-//! all (`read_parquet`) to sort or join a result bigger than memory. Rows
+//! all (`read_parquet`) to query a result bigger than memory. Rows
 //! not yet a whole file wait in memory. The folder goes when the result and
 //! every reader of it ([`Files`]) do.
 
@@ -171,41 +171,8 @@ impl Spill {
         })
     }
 
-    /// The rows of an existing Parquet file (written by DuckDB: many row
-    /// groups) in `dir`, which goes with it. Columns are cast back to
-    /// `schema`'s types (an error when a value doesn't fit, never NULL).
-    pub fn from_file(dir: PathBuf, file: PathBuf, schema: SchemaRef) -> Result<Self> {
-        Self::from_file_in(Arc::new(DirGuard(dir)), file, schema)
-    }
-
-    /// The rows of `file` (in this spill's folder), in a new [`Spill`] that
-    /// shares the folder: it stays while either does.
-    pub fn with_file(&self, file: PathBuf) -> Result<Self> {
-        Self::from_file_in(self.dir.clone(), file, self.schema.clone())
-    }
-
-    fn from_file_in(guard: Arc<DirGuard>, file: PathBuf, schema: SchemaRef) -> Result<Self> {
-        use parquet::file::reader::FileReader;
-        let reader = parquet::file::reader::SerializedFileReader::new(std::fs::File::open(&file).map_err(io)?).map_err(io)?;
-        let meta = reader.metadata();
-        let mut chunks = Vec::new();
-        let mut start = 0usize;
-        for rg in 0..meta.num_row_groups() {
-            let g = meta.row_group(rg);
-            let rows = g.num_rows() as usize;
-            chunks.push(Chunk { path: file.clone(), row_group: rg, start, rows, bytes: g.compressed_size().max(0) as u64 });
-            start += rows;
-        }
-        Ok(Self { dir: guard, schema, chunks, pending: Vec::new(), pending_rows: 0, pending_bytes: 0, cache: VecDeque::new(), decimals: Vec::new() })
-    }
-
     pub fn dir(&self) -> &Path {
         &self.dir.0
-    }
-
-    /// Each file and the result row it starts at (files we wrote).
-    pub fn file_starts(&self) -> Vec<(PathBuf, usize)> {
-        self.chunks.iter().filter(|c| c.row_group == 0).map(|c| (c.path.clone(), c.start)).collect()
     }
 
     pub fn rows(&self) -> usize {
@@ -248,13 +215,6 @@ impl Spill {
     /// The rows as they are now, to read without this [`Spill`].
     pub fn snapshot(&self) -> Files {
         Files { _dir: self.dir.clone(), schema: self.schema.clone(), chunks: self.chunks.clone(), tail: self.pending.clone() }
-    }
-
-    /// Average bytes per row in memory so far (for row groups others write).
-    pub fn rows_per_group(&self) -> usize {
-        let (rows, bytes) = self.chunks.iter().fold((0usize, 0u64), |(r, b), c| (r + c.rows, b + c.bytes));
-        // Files are compressed: estimate memory as 4× their size.
-        if rows == 0 || bytes == 0 { CHUNK_ROWS } else { ((CHUNK_BYTES as u64 * rows as u64) / (bytes * 4)).clamp(256, CHUNK_ROWS as u64) as usize }
     }
 
     /// Add rows; files are written as they fill (by rows or bytes). On a

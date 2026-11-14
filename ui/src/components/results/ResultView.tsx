@@ -40,7 +40,22 @@ export function ResultView({
   const connId = connectionId !== undefined ? connectionId : tab?.connection_id;
   const conn = useStore((s) => s.connections.find((c) => c.id === connId));
   const send = useAi((s) => s.send);
-  const [view, setView] = useState<ViewSpec>(emptyView);
+  const [baseView, setView] = useState<ViewSpec>(emptyView);
+  // A sort or filter of a result on disk applies to the rows the grid has
+  // loaded (the furthest it was scrolled), counted when the sort or filter starts.
+  const [loaded, setLoaded] = useState({ id: info.id, n: 0 });
+  const onLoadedRows = useCallback((n: number) => setLoaded((l) => (l.id !== info.id ? { id: info.id, n } : n > l.n ? { id: l.id, n } : l)), [info.id]);
+  const narrowed = info.on_disk && (baseView.sort.length > 0 || baseView.filters.length > 0 || !!baseView.quick_filter);
+  const [firstRows, setFirstRows] = useState<number | null>(null);
+  if (narrowed && firstRows === null) setFirstRows(Math.max(1, loaded.id === info.id ? loaded.n : 0));
+  if (!narrowed && firstRows !== null) setFirstRows(null);
+  const view = useMemo<ViewSpec>(() => (narrowed && firstRows !== null ? { ...baseView, first_rows: firstRows } : baseView), [baseView, narrowed, firstRows]);
+  const [viewRows, setViewRows] = useState(info.total_rows);
+  const [windowRows, setWindowRows] = useState<number | null>(null);
+  const onViewRows = useCallback((n: number, w: number | null) => {
+    setViewRows(n);
+    setWindowRows(w);
+  }, []);
   const [quick, setQuick] = useState("");
   const quickRef = useRef(quick);
   quickRef.current = quick;
@@ -48,7 +63,6 @@ export function ResultView({
   const [sourceKey, setSourceKey] = useState<string | null>(null);
   const sourceRef = useRef<string | null>(null);
   const keptQuick = useStore((s) => (sourceKey ? s.quickFilters[sourceKey]?.q : undefined));
-  const [viewRows, setViewRows] = useState(info.total_rows);
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState("");
   const [find, setFind] = useState<{ matches: { row: number; col: number }[]; truncated: boolean }>({ matches: [], truncated: false });
@@ -299,7 +313,8 @@ export function ResultView({
           info={info}
           view={view}
           onViewChange={setView}
-          onViewRows={setViewRows}
+          onViewRows={onViewRows}
+          onLoadedRows={onLoadedRows}
           onHeaderMenu={(col, x, y) => setHeaderMenu({ col, x, y })}
           findMatches={find.matches}
           findCurrent={findIdx}
@@ -318,7 +333,7 @@ export function ResultView({
         )}
       </div>
 
-      <ResultFooter stmt={stmt} info={info} view={view} mode={mode} filtered={filtered} viewRows={viewRows} selRange={selRange} />
+      <ResultFooter stmt={stmt} info={info} view={view} mode={mode} filtered={filtered} viewRows={viewRows} windowRows={windowRows} selRange={selRange} />
       {transpose && <TransposeDialog info={info} view={view} range={transpose} onClose={() => setTranspose(null)} />}
       {pinning && stmt.output && connId && (
         <PinChartDialog info={info} spec={pinning.spec} kind={pinning.kind} sql={stmt.output.sql} connectionId={stmt.output.connection_id || connId} defaultTitle={title ?? tab?.title ?? "Chart"} onClose={() => setPinning(null)} />

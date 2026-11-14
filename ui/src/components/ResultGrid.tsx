@@ -123,7 +123,10 @@ interface Props {
   view: ViewSpec;
   onViewChange: (v: ViewSpec) => void;
   onHeaderMenu: (col: number, x: number, y: number) => void;
-  onViewRows: (n: number) => void;
+  /** Rows in the view, and for a sort or filter of a result on disk the first rows it applies to. */
+  onViewRows: (n: number, windowRows: number | null) => void;
+  /** Rows of the plain result loaded so far (the furthest page read). */
+  onLoadedRows?: (n: number) => void;
   findMatches: { row: number; col: number }[];
   findCurrent: number;
   dialect: string | undefined;
@@ -146,7 +149,7 @@ const DELETED_BG = "rgba(239, 68, 68, 0.14)";
 const NEW_BG = "rgba(34, 197, 94, 0.12)";
 
 export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
-  { info, view, onViewChange, onHeaderMenu, onViewRows, findMatches, findCurrent, dialect, onSelectionRange, onTranspose, edit, onOpenRelated, onFocusCell, onViewValue },
+  { info, view, onViewChange, onHeaderMenu, onViewRows, onLoadedRows, findMatches, findCurrent, dialect, onSelectionRange, onTranspose, edit, onOpenRelated, onFocusCell, onViewValue },
   ref,
 ) {
   const theme = useGridTheme();
@@ -194,7 +197,8 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         pages.current.set(p, page.rows);
         pageIds.current.set(p, page.row_ids);
         setRows(page.view_rows);
-        onViewRows(page.view_rows);
+        onViewRows(page.view_rows, page.window_rows);
+        if (!view.sort.length && !view.filters.length && !view.quick_filter) onLoadedRows?.(p * PAGE + page.rows.length);
         if (!autoSized.current && p === 0) {
           autoSized.current = true;
           const w: Record<number, number> = {};
@@ -210,7 +214,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         inflight.current.delete(p);
       }
     },
-    [info.id, info.columns, view, onViewRows, toast],
+    [info.id, info.columns, view, onViewRows, onLoadedRows, toast],
   );
 
   // Read when the view changes; a growing total must not reset the cache.

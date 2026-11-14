@@ -135,19 +135,6 @@ pub(crate) fn session_settings() -> String {
     sql
 }
 
-/// Run `sql` on a private in-memory DuckDB (with the app's spill folder and
-/// memory limit): work on files that has nothing to do with a connection,
-/// such as sorting a result kept on disk.
-pub fn run_private(sql: &str) -> Result<()> {
-    engine()?;
-    let conn = duckdb::Connection::open_in_memory().map_err(map_err)?;
-    let limits = session_settings();
-    if !limits.is_empty() {
-        let _ = conn.execute_batch(&limits);
-    }
-    conn.execute_batch(sql).map_err(map_err)
-}
-
 /// DuckDB version and platform of this build, e.g. ("v1.5.6", "osx_arm64").
 pub fn version_and_platform() -> Result<(String, String)> {
     engine()?;
