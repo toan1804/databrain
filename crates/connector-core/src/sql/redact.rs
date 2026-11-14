@@ -37,9 +37,26 @@ const POSITIONAL_SECRETS: &[(&str, &[usize], usize)] = &[
     ("oss", &[2], 3),
     ("cosn", &[2], 3),
     ("s3cluster", &[3], 4),
+    // Data lakes on S3: (url, key id, secret, …); clusters (cluster, url, key id, secret, …).
+    ("iceberg", &[2], 3),
+    ("icebergs3", &[2], 3),
+    ("deltalake", &[2], 3),
+    ("deltalakes3", &[2], 3),
+    ("hudi", &[2], 3),
+    ("icebergcluster", &[3], 4),
+    ("icebergs3cluster", &[3], 4),
+    ("deltalakecluster", &[3], 4),
+    ("deltalakes3cluster", &[3], 4),
+    ("hudicluster", &[3], 4),
     // (connection string, container, blob, account name, account key, …).
     ("azureblobstorage", &[4], 5),
     ("azureblobstoragecluster", &[5], 6),
+    ("icebergazure", &[4], 5),
+    ("deltalakeazure", &[4], 5),
+    ("icebergazurecluster", &[5], 6),
+    ("deltalakeazurecluster", &[5], 6),
+    // (location, dataset, user, password).
+    ("arrowflight", &[3], 4),
     // (host, db, table, user, password, …).
     ("mysql", &[4], 5),
     ("postgresql", &[4], 5),
@@ -1455,6 +1472,13 @@ mod review_tests {
             ("execute immediate q'[alter user u identified by \"pw1\"]'", "execute immediate q'[alter user u identified by \"***\"]'"),
             ("select [it's], aes_encrypt(a,'k1')", "select [it's], aes_encrypt(a,'***')"),
             ("create user u identified by 1234abc", "create user u identified by ***"),
+            ("select * from iceberg('https://b.s3.amazonaws.com/t/', 'k', 's1')", "select * from iceberg('https://b.s3.amazonaws.com/t/', 'k', '***')"),
+            ("select * from deltaLakeCluster('c', 'https://b/t/', 'k', 's1')", "select * from deltaLakeCluster('c', 'https://b/t/', 'k', '***')"),
+            (
+                "select * from icebergAzure('DefaultEndpointsProtocol=https', 'c', 'p', 'acct', 'key1')",
+                "select * from icebergAzure('DefaultEndpointsProtocol=https', 'c', 'p', 'acct', '***')",
+            ),
+            ("select * from arrowFlight('h:8815', 'ds', 'u', 'pw1')", "select * from arrowFlight('h:8815', 'ds', 'u', '***')"),
             // Backslashes escape in `'…'` only (Postgres E'…', DuckDB): the name `"c\"` ends at its quote.
             (r#"select e'\'' as "c\"; alter role r password 'pw1' -- ""#, r#"select e'\'' as "c\"; alter role r password '***' -- ""#),
             (r#"select E'\'' as "c\", aes_encrypt(a, 'k1')"#, r#"select E'\'' as "c\", aes_encrypt(a, '***')"#),
