@@ -397,6 +397,17 @@ pub(crate) const QUOTED_WORD: &str = "QUOTED_TEXT_";
 /// [`QUOTED_WORD`]. Read with the dialect's own scanner ([`skip_token`]),
 /// so it ends strings and comments where the splitter does.
 pub(crate) fn code_text(sql: &str, kind: crate::types::ConnectorKind) -> String {
+    code_text_with(sql, kind, false)
+}
+
+/// [`code_text`], except that quoted text of one plain word (`'false'`,
+/// `"0"`) stays as that word: a setting's value may be quoted
+/// (`autocommit = 'false'`).
+pub(crate) fn code_text_values(sql: &str, kind: crate::types::ConnectorKind) -> String {
+    code_text_with(sql, kind, true)
+}
+
+fn code_text_with(sql: &str, kind: crate::types::ConnectorKind, values: bool) -> String {
     let syntax = kind.traits().syntax;
     let mut code = String::with_capacity(sql.len());
     let (mut i, mut last) = (0, 0);
@@ -404,10 +415,25 @@ pub(crate) fn code_text(sql: &str, kind: crate::types::ConnectorKind) -> String 
         match skip_token(sql, i, &syntax) {
             Some((end, what)) => {
                 code.push_str(&sql[last..i]);
-                // A quoted name stays part of a dotted path (`a."b"(` reads
-                // `a.QUOTED_TEXT_(`); everything else becomes a space.
-                code.push_str(if what == Skipped::Quoted { QUOTED_WORD } else { " " });
-                i = end.max(i + 1).min(sql.len());
+                let end = end.max(i + 1).min(sql.len());
+                let inner = sql.get(i + 1..end.saturating_sub(1)).unwrap_or("");
+                let quote = sql.as_bytes()[i];
+                let plain = values
+                    && what != Skipped::Comment
+                    && matches!(quote, b'\'' | b'"')
+                    && sql.as_bytes()[end - 1] == quote
+                    && !inner.is_empty()
+                    && inner.bytes().all(|c| c.is_ascii_alphanumeric());
+                if plain {
+                    code.push(' ');
+                    code.push_str(inner);
+                    code.push(' ');
+                } else {
+                    // A quoted name stays part of a dotted path (`a."b"(` reads
+                    // `a.QUOTED_TEXT_(`); everything else becomes a space.
+                    code.push_str(if what == Skipped::Quoted { QUOTED_WORD } else { " " });
+                }
+                i = end;
                 last = i;
             }
             None => i += 1,

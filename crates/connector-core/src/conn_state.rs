@@ -112,23 +112,11 @@ impl ConnState {
         }
         // Implicit transactions on or off: SQL Server's
         // `IMPLICIT_TRANSACTIONS` (also through `ANSI_DEFAULTS`), autocommit
-        // elsewhere. The value may be quoted (`autocommit = 'false'`), so
-        // it's read from the text with quotes as spaces.
-        let unquoted: Vec<String> = words(&sql.replace(['\'', '"'], " ")).map(str::to_ascii_uppercase).collect();
-        for (i, w) in unquoted.iter().enumerate() {
-            let setting = match w.as_str() {
-                "IMPLICIT_TRANSACTIONS" => true,
-                "ANSI_DEFAULTS" if mssql => true,
-                "AUTOCOMMIT" => false,
-                _ => continue,
-            };
-            // Only as a setting: `SET x ON`, `x = FALSE`, `SET x TO 0`.
-            let value = unquoted[i + 1..].iter().find(|v| !matches!(v.as_str(), "TO")).map(String::as_str);
-            match value {
-                Some("ON" | "TRUE" | "1") => self.implicit.store(setting, Ordering::SeqCst),
-                Some("OFF" | "FALSE" | "0") => self.implicit.store(!setting, Ordering::SeqCst),
-                _ => {}
-            }
+        // elsewhere. Read only from code (not comments or strings), as a
+        // setting: `SET x ON`, `SET SESSION x = 0`, `ALTER SESSION SET x =
+        // 'false'`. A value may be quoted.
+        if let Some(on) = implicit_setting(sql, kind) {
+            self.implicit.store(on, Ordering::SeqCst);
         }
         // While writes open a transaction by themselves, a write did:
         // one is open until COMMIT or ROLLBACK (Commit and Rollback show).
@@ -240,6 +228,108 @@ const STATEMENT_WORDS: &[&str] = &[
 /// Upper-cased words of `sql` outside comments and quoted strings.
 fn code_words(sql: &str, kind: ConnectorKind) -> Vec<String> {
     words(&crate::sql::code_text(sql, kind)).map(str::to_ascii_uppercase).collect()
+}
+
+/// SQL Server options that can share one `SET a, b, c ON`.
+const MSSQL_SET_OPTIONS: &[&str] = &[
+    "ANSI_DEFAULTS",
+    "ANSI_NULLS",
+    "ANSI_NULL_DFLT_OFF",
+    "ANSI_NULL_DFLT_ON",
+    "ANSI_PADDING",
+    "ANSI_WARNINGS",
+    "ARITHABORT",
+    "ARITHIGNORE",
+    "CONCAT_NULL_YIELDS_NULL",
+    "CURSOR_CLOSE_ON_COMMIT",
+    "IMPLICIT_TRANSACTIONS",
+    "NOCOUNT",
+    "NUMERIC_ROUNDABORT",
+    "QUOTED_IDENTIFIER",
+    "XACT_ABORT",
+];
+
+/// Whether this batch turns implicit transactions on (`Some(true)`: writes
+/// open a transaction by themselves) or off, read from its settings only:
+/// SQL Server `SET IMPLICIT_TRANSACTIONS ON` (also `ANSI_DEFAULTS`, and in
+/// a list `SET ANSI_NULLS, IMPLICIT_TRANSACTIONS ON`), Snowflake `ALTER
+/// SESSION SET AUTOCOMMIT = FALSE` / `UNSET AUTOCOMMIT`, MySQL `SET
+/// [SESSION] autocommit = 0`. Comments, strings and other statements that
+/// name the word (`where note = 'autocommit off'`, `update t set
+/// implicit_transactions = 1`) don't count. The last setting wins.
+fn implicit_setting(sql: &str, kind: ConnectorKind) -> Option<bool> {
+    let mssql = kind == ConnectorKind::Mssql;
+    let code = crate::sql::code_text_values(sql, kind);
+    let mut result = None;
+    // `Some(true)` for ON, `Some(false)` for OFF, after an optional `TO`.
+    let value = |w: &[String], i: usize| -> Option<bool> {
+        let v = w.get(i).filter(|v| *v != "TO").or_else(|| w.get(i + 1))?;
+        match v.as_str() {
+            "ON" | "TRUE" | "1" => Some(true),
+            "OFF" | "FALSE" | "0" => Some(false),
+            _ => None,
+        }
+    };
+    for stmt in code.split(';') {
+        let w: Vec<String> = words(stmt).map(str::to_ascii_uppercase).collect();
+        let at = |i: usize| w.get(i).map(String::as_str);
+        if at(0) == Some("ALTER") && at(1) == Some("SESSION") {
+            match at(2) {
+                // Back to the default: autocommit on.
+                Some("UNSET") if w.iter().any(|x| x == "AUTOCOMMIT") => result = Some(false),
+                // Snowflake: `SET a = 1 b = 2`, one statement.
+                Some("SET") => {
+                    for i in 3..w.len() {
+                        if w[i] == "AUTOCOMMIT"
+                            && let Some(on) = value(&w, i + 1)
+                        {
+                            result = Some(!on);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        // Snowflake's `SET x = …` sets a variable.
+        if kind == ConnectorKind::Snowflake {
+            continue;
+        }
+        for j in (0..w.len()).filter(|&j| w[j] == "SET" && starts_statement(&w, j, mssql)) {
+            let mut i = j + 1;
+            if mssql {
+                let mut implicit = false;
+                while let Some(opt) = at(i).filter(|o| MSSQL_SET_OPTIONS.contains(o)) {
+                    implicit |= matches!(opt, "IMPLICIT_TRANSACTIONS" | "ANSI_DEFAULTS");
+                    i += 1;
+                }
+                if implicit && let Some(on) = value(&w, i) {
+                    result = Some(on);
+                }
+            } else {
+                // `SET SESSION autocommit`, `SET @@session.autocommit`, `SET LOCAL …`.
+                while matches!(at(i), Some("SESSION" | "LOCAL")) {
+                    i += 1;
+                }
+                if at(i) == Some("AUTOCOMMIT")
+                    && let Some(on) = value(&w, i + 1)
+                {
+                    result = Some(!on);
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Whether the `SET` at `w[j]` starts a statement. Elsewhere statements
+/// are split at `;`; a T-SQL batch needs none, so there a `SET` starts one
+/// unless it belongs to an `UPDATE` (or a `MERGE`'s `UPDATE SET`).
+fn starts_statement(w: &[String], j: usize, mssql: bool) -> bool {
+    if j == 0 {
+        return true;
+    }
+    mssql && w[..j].iter().rev().find(|x| STATEMENT_WORDS.contains(&x.as_str())).is_none_or(|x| x != "UPDATE" && x != "MERGE")
 }
 
 #[cfg(test)]
@@ -402,6 +492,55 @@ mod tests {
         assert_eq!(state(Snowflake, &["alter session set autocommit = false", "alter session set autocommit = true"]).0, TxState::None);
         assert!(!state(Snowflake, &["alter session set timezone = 'UTC'"]).1, "a session parameter is session state");
         assert_eq!(state(Mssql, &["set implicit_transactions on", "begin tran"]).0, TxState::Open);
+    }
+
+    /// Only a setting turns implicit transactions on: the words in a
+    /// string, a comment, a column or a variable don't, so a write after
+    /// them doesn't look like it opened a transaction (manual commit then
+    /// sends BEGIN, and Rollback undoes it).
+    #[test]
+    fn implicit_transactions_from_settings_only() {
+        let state = |kind, stmts: &[&str]| {
+            let s = ConnState::new();
+            for q in stmts {
+                s.observe(q, kind);
+            }
+            s.tx_state()
+        };
+        let write = "update audit set seen = 1 where id = 1";
+        for (kind, signal) in [
+            (Snowflake, "select * from audit where note = 'autocommit off'"),
+            (Snowflake, "select 1 -- alter session set autocommit = false"),
+            (Snowflake, "set autocommit = false"),
+            (Snowflake, "select autocommit, false from settings"),
+            (Mssql, "select * from audit where note = 'set implicit_transactions on'"),
+            (Mssql, "update t set implicit_transactions = 1"),
+            (Mssql, "/* set implicit_transactions on */ select 1"),
+            (Mssql, "merge t using s on t.id = s.id when matched then update set ansi_defaults = 1;"),
+            (Mysql, "select * from audit where note = 'autocommit = 0'"),
+            (Mysql, "update t set autocommit = 0"),
+        ] {
+            assert_eq!(state(kind, &[signal]), TxState::None, "{kind:?}: {signal}");
+            assert_eq!(state(kind, &[signal, write]), TxState::None, "{kind:?}: {signal}");
+        }
+        // Settings do, in each form.
+        for (kind, setting) in [
+            (Snowflake, "alter session set autocommit = false"),
+            (Snowflake, "ALTER SESSION SET TIMEZONE = 'UTC' AUTOCOMMIT = 'FALSE'"),
+            (Mssql, "set implicit_transactions on"),
+            (Mssql, "set nocount on\nset implicit_transactions on"),
+            (Mssql, "set ansi_nulls, implicit_transactions on"),
+            (Mssql, "declare @a int set @a = 1 set implicit_transactions on"),
+            (Mssql, "-- turn it on\nSET IMPLICIT_TRANSACTIONS ON"),
+            (Mysql, "set autocommit = 0"),
+            (Mysql, "set session autocommit = 'OFF'"),
+            (Mysql, "select 1; set @@session.autocommit = 0"),
+        ] {
+            assert_eq!(state(kind, &[setting]), TxState::Unknown, "{kind:?}: {setting}");
+            assert_eq!(state(kind, &[setting, write]), TxState::Open, "{kind:?}: {setting}");
+        }
+        assert_eq!(state(Snowflake, &["alter session set autocommit = false", "alter session unset autocommit"]), TxState::None);
+        assert_eq!(state(Mssql, &["set implicit_transactions on; set implicit_transactions off"]), TxState::None, "the last wins");
     }
 
     #[test]

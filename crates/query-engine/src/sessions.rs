@@ -381,7 +381,14 @@ impl QueryEngine {
             s = self.session_for(&req.connection_id, req.session_key(), req.origin) => s?,
             _ = cancel.cancelled() => return Err(databrain_connector_core::ConnectorError::cancelled().into()),
         };
-        if !needs_begin(kind, session.transaction_state()) {
+        let state = session.transaction_state();
+        if state == TxState::Open {
+            return Ok(());
+        }
+        // `Unknown` comes from a heuristic over statement text: before
+        // skipping BEGIN, the server confirms writes open a transaction by
+        // themselves (else this write would commit at once).
+        if !needs_begin(kind, state) && implicit_transactions_on(kind, session.as_ref()).await {
             return Ok(());
         }
         session.execute(Statement::internal(begin), ExecOptions::default()).await?.collect().await?;
@@ -451,17 +458,44 @@ impl QueryEngine {
 }
 
 /// Manual commit opens a transaction before a write unless one is open.
-/// `Unknown` from SQL Server and Snowflake means writes open one by
+/// `Unknown` from SQL Server and Snowflake suggests writes open one by
 /// themselves (implicit transactions, autocommit off): no BEGIN, which
-/// would nest on SQL Server (one COMMIT wouldn't end it). From others,
-/// BEGIN anyway: "already in a transaction" from the server is better than
-/// a write that commits on its own in manual mode.
+/// would nest on SQL Server (one COMMIT wouldn't end it), once the server
+/// confirms it ([`implicit_transactions_on`]). From others, BEGIN anyway:
+/// "already in a transaction" from the server is better than a write that
+/// commits on its own in manual mode.
 fn needs_begin(kind: databrain_connector_core::ConnectorKind, state: TxState) -> bool {
     use databrain_connector_core::ConnectorKind as K;
     match state {
         TxState::Open => false,
         TxState::Unknown => !matches!(kind, K::Mssql | K::Snowflake),
         TxState::None => true,
+    }
+}
+
+/// The server says writes open a transaction by themselves on this session
+/// (SQL Server `IMPLICIT_TRANSACTIONS` in `@@OPTIONS`, Snowflake's
+/// `AUTOCOMMIT` parameter off). `false` when it can't be asked: then a
+/// BEGIN is sent, which at worst fails as "already in a transaction".
+async fn implicit_transactions_on(kind: databrain_connector_core::ConnectorKind, session: &dyn Session) -> bool {
+    use databrain_connector_core::ConnectorKind as K;
+    let sql = match kind {
+        K::Mssql => "select cast(@@OPTIONS & 2 as int) as implicit",
+        K::Snowflake => "show parameters like 'AUTOCOMMIT' in session",
+        _ => return false,
+    };
+    let Ok((cols, rows)) = databrain_connector_core::query_table(session, Statement::internal(sql)).await else { return false };
+    implicit_from(kind, &cols, &rows)
+}
+
+/// [`implicit_transactions_on`] from the server's answer.
+fn implicit_from(kind: databrain_connector_core::ConnectorKind, cols: &[String], rows: &[Vec<Option<String>>]) -> bool {
+    use databrain_connector_core::ConnectorKind as K;
+    let col = if kind == K::Mssql { Some(0) } else { cols.iter().position(|c| c.eq_ignore_ascii_case("value")) };
+    let value = col.and_then(|i| rows.first().and_then(|r| r.get(i).cloned().flatten())).unwrap_or_default();
+    match kind {
+        K::Mssql => value.trim().parse::<i64>().is_ok_and(|v| v != 0),
+        _ => value.trim().eq_ignore_ascii_case("false"),
     }
 }
 
@@ -533,6 +567,22 @@ mod minutes_tests {
         assert!(!needs_begin(Mssql, TxState::Unknown) && !needs_begin(Snowflake, TxState::Unknown));
         // A connector that can't tell: BEGIN anyway.
         assert!(needs_begin(Sqlite, TxState::Unknown) && needs_begin(Oracle, TxState::Unknown));
+    }
+
+    /// BEGIN is skipped only when the server says writes open a
+    /// transaction by themselves; an answer it can't read means BEGIN.
+    #[test]
+    fn the_server_confirms_implicit_transactions() {
+        use databrain_connector_core::ConnectorKind::*;
+        let row = |v: &str| vec![vec![Some(v.to_string())]];
+        assert!(implicit_from(Mssql, &["implicit".into()], &row("2")));
+        assert!(!implicit_from(Mssql, &["implicit".into()], &row("0")), "off: BEGIN");
+        assert!(!implicit_from(Mssql, &["implicit".into()], &[]));
+        let cols: Vec<String> = ["key", "value", "default", "level"].map(String::from).into();
+        let sf = |v: &str| vec![vec![Some("AUTOCOMMIT".into()), Some(v.into()), Some("true".into()), Some("SESSION".into())]];
+        assert!(implicit_from(Snowflake, &cols, &sf("false")));
+        assert!(!implicit_from(Snowflake, &cols, &sf("true")), "autocommit on: BEGIN");
+        assert!(!implicit_from(Snowflake, &["key".into()], &row("AUTOCOMMIT")), "no value column");
     }
 
     #[test]
