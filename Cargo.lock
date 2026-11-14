@@ -1894,6 +1894,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "databrain-bench"
+version = "0.4.1"
+dependencies = [
+ "databrain-ai",
+ "databrain-auth",
+ "databrain-connector-core",
+ "databrain-connector-sqlite",
+ "databrain-export",
+ "databrain-lineage",
+ "databrain-query-engine",
+ "databrain-result-store",
+ "databrain-workspace",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "databrain-connector-clickhouse"
 version = "0.4.1"
 dependencies = [

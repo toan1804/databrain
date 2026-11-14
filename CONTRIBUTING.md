@@ -19,7 +19,7 @@ cargo test --workspace
 cd ui && npm run lint && npm test && npm run build
 ```
 
-CI runs the same checks, plus `cargo deny check`, the UI smoke tests and the database tests against service containers.
+CI runs the same checks, plus `cargo deny check`, the UI smoke tests, the database tests against service containers and the speed budgets (`cargo run --release -p databrain-bench -- --check`; see [docs/PERFORMANCE.md](docs/PERFORMANCE.md) when you change a path it times).
 
 - `cargo test` regenerates the TypeScript bindings in `ui/src/lib/bindings`. Commit them with the Rust change.
 - Tests that need a database server are `#[ignore]`d. Run the ones your change touches with `--ignored` and the `DATABRAIN_*` variables listed in the README.

@@ -111,6 +111,19 @@ jobs:
       # The app embeds ui/dist; a placeholder page is enough to check it compiles.
       - run: mkdir -p ui/dist && echo '<!doctype html>' > ui/dist/index.html && cargo check --workspace --all-targets
 
+  # The critical paths stay within their budgets (docs/PERFORMANCE.md): a
+  # budget is many times the usual time, so only a real slowdown fails.
+  bench:
+    name: speed budgets
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --release -p databrain-bench -- --check --quick
+
   # The UI in Chromium against a mocked backend (ui/e2e): the explorer, the
   # job canvas and the AI panel.
   e2e:

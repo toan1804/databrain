@@ -22,6 +22,7 @@ members = [
     "crates/lineage",
     "crates/ai",
     "crates/app",
+    "crates/bench",
 ]
 
 [workspace.package]

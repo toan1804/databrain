@@ -12,6 +12,22 @@
 
 Push a tag `vX.Y.Z` (matching `version` in `crates/app/tauri.conf.json`): the Release workflow (`.github/workflows/release.yml`) builds the installers for macOS (Apple Silicon, with and without DuckDB, and Intel), Windows and Linux and attaches them to a draft release, whose description is the version's section of `CHANGELOG.md` (`scripts/release-notes.mjs`; the same text goes into `latest.json`). Add the `## X.Y.Z - date` heading over the Unreleased entries in the release commit, or the release has no description. Publish the draft; running apps then see it in their update check (and, with an updater key, `latest.json` for in-app updates). The CI workflow builds and tests every push and pull request on macOS, Linux and Windows.
 
+## Speed check before a release
+
+On the machine `crates/bench/baseline.json` is from (it is named in the file):
+
+```sh
+cargo run --release -p databrain-bench -- --max-slowdown 1.3
+```
+
+It fails when a critical path is 30% slower than at the last release, or over its budget. Fix it, or say why in the CHANGELOG; then write the new baseline and commit it with the release:
+
+```sh
+cargo run --release -p databrain-bench -- --save
+```
+
+See [PERFORMANCE.md](PERFORMANCE.md) for the paths and how to read the output.
+
 ## Checksums and provenance
 
 Each installer and updater bundle gets a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations) from the Release workflow, and the release gets a `SHA256SUMS` file listing every file on it (also attested). To check a download:

@@ -1,0 +1,25 @@
+[package]
+name = "databrain-bench"
+description = "Timings of DataBrain's critical paths (not part of the app)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+databrain-ai = { version = "0.4.1", path = "../ai" }
+databrain-auth = { version = "0.4.1", path = "../auth" }
+databrain-connector-core = { version = "0.4.1", path = "../connector-core" }
+databrain-connector-sqlite = { version = "0.4.1", path = "../connectors/sqlite" }
+databrain-export = { version = "0.4.1", path = "../export" }
+databrain-lineage = { version = "0.4.1", path = "../lineage" }
+databrain-query-engine = { version = "0.4.1", path = "../query-engine" }
+databrain-result-store = { version = "0.4.1", path = "../result-store" }
+databrain-workspace = { version = "0.4.1", path = "../workspace" }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "time"] }
+uuid = { version = "1.26.1", features = ["v4"] }
