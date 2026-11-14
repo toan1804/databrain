@@ -475,3 +475,28 @@ fn concurrent_opens_migrate_once() {
     assert_eq!(v as usize, MIGRATIONS.len());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Scope rules match names as the database does: on Postgres `sales` and
+/// `"Sales"` are two schemas (allowing one doesn't allow the other); on
+/// SQL Server they are one.
+#[test]
+fn scope_rules_match_names_as_the_database_does() {
+    let ws = Workspace::open_in_memory().unwrap();
+    let pg = ws.save_connection(profile("pg")).unwrap();
+    let mut ms = profile("ms");
+    ms.config.kind = ConnectorKind::Mssql;
+    let ms = ws.save_connection(ms).unwrap();
+    let t = |schema: &str, name: &str| DbObject { schema: schema.into(), name: name.into(), kind: ObjectKind::Table, comment: None, row_estimate: None };
+    for c in [&pg.id, &ms.id] {
+        ws.meta_put_schema(c, "sales", &[t("sales", "orders")]).unwrap();
+        ws.meta_put_schema(c, "Sales", &[t("Sales", "secrets")]).unwrap();
+        ws.ai_put_rule(c, &ScopeRule { schema: "sales".into(), table: String::new(), allow: true }).unwrap();
+    }
+    let names = |c: &str| ws.ai_catalog(c).objects().unwrap().into_iter().map(|o| o.full_name()).collect::<Vec<_>>();
+    assert_eq!(names(&pg.id), vec!["sales.orders"], "Postgres: \"Sales\" is another schema");
+    assert_eq!(names(&ms.id), vec!["Sales.secrets", "sales.orders"], "SQL Server: one schema");
+    // Excluding works the same way.
+    ws.ai_put_rule(&pg.id, &ScopeRule { schema: "Sales".into(), table: String::new(), allow: false }).unwrap();
+    assert!(ws.ai_excluded(&pg.id, "Sales", "secrets").unwrap());
+    assert!(!ws.ai_excluded(&pg.id, "sales", "orders").unwrap());
+}
