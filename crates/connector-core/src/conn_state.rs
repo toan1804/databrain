@@ -175,14 +175,19 @@ impl ConnState {
 
     /// Whether this batch may have changed the transaction depth so that
     /// asking the server is worth a round trip: it names transaction control
-    /// (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`, `SAVE`, `XACT_ABORT`), or writes
-    /// open transactions by themselves (implicit transactions), or it failed
-    /// inside one (a deadlock or `XACT_ABORT` ends it).
+    /// (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`, `SAVE`, `XACT_ABORT`), or calls a
+    /// procedure (`EXEC`: one may open a transaction and return, which the
+    /// text can't show), or writes open transactions by themselves
+    /// (implicit transactions), or it failed (a deadlock or `XACT_ABORT`
+    /// ends one; a procedure called by name alone that left one open fails
+    /// with error 266).
     pub fn may_change_depth(&self, sql: &str, failed: bool) -> bool {
         let w = |k: &str| words(sql).any(|x| x.eq_ignore_ascii_case(k));
-        ["BEGIN", "COMMIT", "ROLLBACK", "SAVE", "TRAN", "TRANSACTION", "XACT_ABORT", "IMPLICIT_TRANSACTIONS", "ANSI_DEFAULTS"].iter().any(|k| w(k))
+        ["BEGIN", "COMMIT", "ROLLBACK", "SAVE", "TRAN", "TRANSACTION", "XACT_ABORT", "IMPLICIT_TRANSACTIONS", "ANSI_DEFAULTS", "EXEC", "EXECUTE"]
+            .iter()
+            .any(|k| w(k))
             || self.implicit.load(Ordering::SeqCst)
-            || (failed && self.in_transaction())
+            || failed
     }
 
     /// A new connection replaced the old one: nothing is carried any more.
@@ -449,7 +454,9 @@ mod tests {
         assert_eq!(s.tx_state(), TxState::None, "the server: committed");
         assert!(s.may_change_depth("if @@trancount > 0 commit tran", false));
         assert!(!s.may_change_depth("select * from t", false), "a plain read: no round trip");
-        assert!(!s.may_change_depth("select * from t", true), "failed outside a transaction");
+        assert!(s.may_change_depth("my_proc", true), "failed: a procedure may have left one open (error 266)");
+        assert!(s.may_change_depth("exec dbo.open_tran", false), "a procedure may open one and return");
+        assert!(s.may_change_depth("EXECUTE sp_executesql N'begin tran'", false));
         s.set_depth(1);
         assert!(s.may_change_depth("update t set a = 1", true), "failed inside one (deadlock, XACT_ABORT)");
         let i = ConnState::new();
