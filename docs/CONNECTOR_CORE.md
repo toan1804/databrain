@@ -222,11 +222,13 @@ How `classify` gets there:
 
 | Pass | Hides |
 |---|---|
-| `redact_secrets` | The literal after a word of `SECRET_WORDS` (optionally `=`, `(`, `PASSWORD(`), and after `IDENTIFIED BY` / `IDENTIFIED WITH plugin BY|AS`; quoted, `E'…'`, `N'…'`, dollar-quoted, or a bare word after `IDENTIFIED BY`. Run again on text inside double quotes, because error messages quote SQL that way |
+| `redact_secrets` | The literal after a word of `SECRET_WORDS` (optionally `=`, `(`, `PASSWORD(`), and after `IDENTIFIED BY` / `IDENTIFIED WITH plugin BY|AS` (and `REPLACE old`); quoted, `E'…'`, `N'…'`, dollar-quoted, or a bare word after `IDENTIFIED BY`. The secret arguments of the calls in `POSITIONAL_SECRETS` (`s3(url, key, 'secret')`, `pgp_sym_encrypt(data, 'key')`, `sp_addlogin 'l', 'pw'`). SQL inside a statement-like string (`EXECUTE '…'`) and dollar-quoted bodies is read too. Run again on text inside double quotes, because error messages quote SQL that way |
 | `redact_url_passwords` | The password of `scheme://user:password@host` |
 | `redact_key_values` | The value of `name = value` / `name: value` when the name is a secret's (`secret_name`: the words above or a suffix such as `password`, `pwd`, `_token`, `api_key`). Outside strings only quoted values; inside strings and comments bare values too (connection strings) |
 
-A new secret syntax is added by word (`SECRET_WORDS`, `secret_name`) with a test for the hidden and the untouched case. Positional secrets (the fifth argument of a function) are not recognised.
+`redact_secrets` reads SQL through one tokenizer (`Lexer`: spaces, comments, words, quoted text, dollar-quoted text, other characters), and every rule (`secret_after`, `take_value`, `positional_secrets`, `nested_spans`) works on its tokens, so the rules can't disagree about where a string ends. The text's database is unknown, so it is read four ways: with and without backslash escapes (`'C:\'` ends a string on most servers, not on MySQL) and with and without dollar quotes (`$$it's$$` is one string on Postgres, a quote on MySQL). What any reading finds is hidden. `redact_url_passwords` and `redact_key_values` scan text that is often not SQL (connection strings, settings, JSON, AI answers) and keep their own reading.
+
+A new secret syntax is a word in `SECRET_WORDS` or `secret_name`, a row in `POSITIONAL_SECRETS`, or a rule in `secret_after`, with a test for the hidden and the untouched case.
 
 ## Other query languages (`language.rs`)
 
