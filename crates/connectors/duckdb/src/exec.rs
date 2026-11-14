@@ -64,8 +64,36 @@ pub(crate) fn run(
     if !tx.blocking_send(Ok(StreamEvent::Schema(first.schema()))) {
         return Ok(());
     }
-    while let Some(array) = stmt.step().map_err(map_err)? {
+    // A stopped or abandoned query is wound down while it's still the
+    // active one: interrupted, then read until DuckDB has stopped its work.
+    // Dropped mid-way, its tasks could finish later and interrupt the
+    // session's next statement.
+    let wind_down = |stmt: &duckdb::Statement<'_>| {
+        conn.interrupt_handle().interrupt();
+        while let Ok(Some(_)) = stmt.step() {}
+    };
+    loop {
+        let array = match stmt.step() {
+            Ok(Some(a)) => a,
+            Ok(None) => break,
+            Err(e) => {
+                let err = map_err(e);
+                if !err.is_cancelled() || opts.cancel.is_cancelled() {
+                    return Err(err);
+                }
+                // Interrupted, but not by the user: DuckDB stopped the query
+                // over an error found by another of its threads. A read is run
+                // once more, whole, to report that error itself.
+                let plain = matches!(kw.as_str(), "SELECT" | "WITH" | "FROM" | "VALUES" | "TABLE");
+                let real = plain.then(|| conn.prepare(sql).and_then(|mut s| s.query_arrow([]).map(|r| r.count()))).and_then(|r| r.err());
+                return Err(match real.map(map_err) {
+                    Some(e) if !e.is_cancelled() => e,
+                    _ => ConnectorError::query("DuckDB stopped the query while reading its rows (interrupted); run it again"),
+                });
+            }
+        };
         if opts.cancel.is_cancelled() {
+            wind_down(&stmt);
             return Err(ConnectorError::cancelled());
         }
         let b = arrow58::record_batch::RecordBatch::from(&array);
@@ -75,6 +103,8 @@ pub(crate) fn run(
         while off < b.num_rows() {
             let len = size.min(b.num_rows() - off);
             if !tx.blocking_send(Ok(StreamEvent::Batch(convert_batch(&b.slice(off, len))?))) {
+                // Nobody reads the rows any more.
+                wind_down(&stmt);
                 return Ok(());
             }
             off += len;
@@ -136,14 +166,17 @@ mod tests {
         .expect("the first rows come before the whole result is made");
         assert_eq!(first, 1000);
         cancel.cancel();
-        drop(st);
+        // Read the stopped stream to its end before the next statement, as
+        // the engine does: otherwise the interrupt can hit the next one.
+        while st.next().await.is_some() {}
         let r = s
             .execute("select case when range < 300000 then range else error('boom at ' || range) end as v from range(400000)", ExecOptions::default())
             .await
             .unwrap()
             .collect()
             .await;
-        assert!(r.unwrap_err().to_string().contains("boom"));
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("boom"), "{e}");
         assert_eq!(q(s.as_ref(), "select 1").await.num_rows(), 1, "the session still works");
     }
 
