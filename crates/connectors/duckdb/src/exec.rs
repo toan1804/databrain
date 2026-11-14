@@ -21,6 +21,12 @@ pub(crate) fn convert_batch(b: &arrow58::record_batch::RecordBatch) -> Result<da
     r.next().ok_or_else(|| ConnectorError::internal("empty IPC stream"))?.map_err(Into::into)
 }
 
+/// Whether a statement that ran (and failed) may be run a second time to
+/// find its error: only one the classifier calls a read.
+fn safe_to_run_again(sql: &str) -> bool {
+    databrain_connector_core::sql::classify(sql, databrain_connector_core::ConnectorKind::Duckdb).kind.is_read()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     conn: &duckdb::Connection,
@@ -86,8 +92,10 @@ pub(crate) fn run(
                 }
                 // Interrupted, but not by the user: DuckDB stopped the query
                 // over an error found by another of its threads. A read is run
-                // once more, whole, to report that error itself.
-                let plain = matches!(kw.as_str(), "SELECT" | "WITH" | "FROM" | "VALUES" | "TABLE");
+                // once more, whole, to report that error itself; anything
+                // else may have written already (`WITH … INSERT`), and a
+                // second run would write again.
+                let plain = safe_to_run_again(sql);
                 let real = plain.then(|| conn.prepare(sql).and_then(|mut s| s.query_arrow([]).map(|r| r.count()))).and_then(|r| r.err());
                 return Err(match real.map(map_err) {
                     Some(e) if !e.is_cancelled() => e,
@@ -120,6 +128,7 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
 
+    use super::safe_to_run_again;
     use crate::test_util::*;
     use databrain_auth::AuthMethod;
 
@@ -150,6 +159,26 @@ mod tests {
         let e = tokio::time::timeout(std::time::Duration::from_secs(10), st.collect()).await.unwrap().unwrap_err();
         assert!(e.is_cancelled(), "{e:?}");
         assert_eq!(q(s.as_ref(), "select 1").await.num_rows(), 1);
+    }
+
+    /// After DuckDB interrupts itself, only a read is run again to find the
+    /// error: a `WITH … INSERT` (or any write) may have committed by then.
+    #[test]
+    fn only_reads_run_again() {
+        for sql in ["select 1", "with x as (select 1) select * from x", "from range(3)", "values (1)"] {
+            assert!(safe_to_run_again(sql), "{sql}");
+        }
+        for sql in [
+            "with x as (select 1 a) insert into t select a from x",
+            "with x as (select 1) update t set a = 1",
+            "with x as (select 1) delete from t",
+            "insert into t select * from range(10)",
+            "create table t as select 1",
+            "copy (select 1) to 'x.csv'",
+            "select * from t; insert into t values (1)",
+        ] {
+            assert!(!safe_to_run_again(sql), "{sql}");
+        }
     }
 
     /// Rows come as they are made: the first batch of a huge result arrives
