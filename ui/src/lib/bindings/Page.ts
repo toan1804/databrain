@@ -11,7 +11,12 @@ view_rows: number,
 /**
  * Rows stored in the result (before filters).
  */
-total_rows: number, offset: number, 
+total_rows: number, 
+/**
+ * A sort or filter of a result on disk applies to its first rows only:
+ * this many (None: to every row).
+ */
+window_rows: number | null, offset: number, 
 /**
  * 0-based index of each row in the original result.
  */

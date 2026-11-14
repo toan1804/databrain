@@ -19,16 +19,16 @@ describe("charts", () => {
   });
 
   it("makes pie slices with an Other slice", () => {
-    const data: ChartData = { x: ["a", "b", "c", "d"], x_family: "text", series: [{ name: "v", values: [5, 3, 1, 1] }], truncated: false, rows: 4 };
+    const data: ChartData = { x: ["a", "b", "c", "d"], x_family: "text", series: [{ name: "v", values: [5, 3, 1, 1] }], truncated: false, rows: 4, window_rows: null };
     const s = pieSlices(data, 3);
     expect(s.map((x) => [x.label, x.value])).toEqual([["a", 5], ["b", 3], ["Other", 2]]);
     expect(s[0].share).toBeCloseTo(0.5);
   });
 
   it("reads scatter points from numbers and dates", () => {
-    const n: ChartData = { x: ["1", "2", "x"], x_family: "number", series: [{ name: "y", values: [10, null, 3] }], truncated: false, rows: 3 };
+    const n: ChartData = { x: ["1", "2", "x"], x_family: "number", series: [{ name: "y", values: [10, null, 3] }], truncated: false, rows: 3, window_rows: null };
     expect(scatterPoints(n).map((p) => [p.x, p.y])).toEqual([[1, 10]]);
-    const d: ChartData = { x: ["2026-01-02 03:04:05"], x_family: "date", series: [{ name: "y", values: [1] }], truncated: false, rows: 1 };
+    const d: ChartData = { x: ["2026-01-02 03:04:05"], x_family: "date", series: [{ name: "y", values: [1] }], truncated: false, rows: 1, window_rows: null };
     expect(scatterPoints(d)[0].x).toBe(Date.parse("2026-01-02T03:04:05"));
   });
 });

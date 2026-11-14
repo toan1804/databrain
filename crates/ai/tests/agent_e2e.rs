@@ -730,6 +730,28 @@ async fn ai_tools_use_output_handles_with_source_policies() {
     let mcp = databrain_ai::ToolContext { caller: databrain_ai::Caller::Mcp, profile: shared, ..ctx };
     let o = mcp.call("query_outputs", &json!({"sql": "select * from results.by_country"})).await;
     assert!(o.content.contains("not shared with MCP"), "{}", o.content);
+
+    // A result larger than memory (on disk): the local aggregate and the
+    // statistics say why they don't run (a long read from disk) and point
+    // to query_outputs, which reads the files.
+    let spill = tempfile::tempdir().unwrap();
+    engine.results().set_spill_root(spill.path().join("spill"));
+    engine.outputs().set_budget(0); // the 16 MB floor: 8 MB per result
+    let big = run(
+        open.id.clone(),
+        "with recursive n(i) as (select 1 union all select i + 1 from n where i < 1000000) select i, 'row number ' || i as s from n",
+        Some("big"),
+    )
+    .await;
+    assert!(big[0].result.as_ref().is_some_and(|r| r.on_disk), "{:?}", big[0].result);
+    let ctx = databrain_ai::ToolContext { caller: databrain_ai::Caller::Agent, profile: open.clone(), ..mcp };
+    let o = ctx.call("query_result", &json!({"result_id": "big", "sql": "select count(*) from result"})).await;
+    assert!(o.content.contains("on disk") && o.content.contains("long-running") && o.content.contains("query_outputs"), "{}", o.content);
+    let o = ctx.call("result_summary", &json!({"result_id": "big"})).await;
+    assert!(o.content.contains("long-running") && !o.content.contains("distinct="), "{}", o.content);
+    // query_outputs runs over every row.
+    let o = ctx.call("query_outputs", &json!({"sql": "select count(*) as n from results.big"})).await;
+    assert!(o.content.contains("1000000"), "{}", o.content);
 }
 
 /// Sensitive columns of an output stay masked in query_outputs and run_query

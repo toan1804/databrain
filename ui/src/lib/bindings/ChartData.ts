@@ -9,4 +9,9 @@ x_family: string, series: Array<ChartSeries>,
 /**
  * Categories or series were cut to the limit.
  */
-truncated: boolean, rows: number, };
+truncated: boolean, rows: number, 
+/**
+ * A result on disk is charted from its first rows only (the rows the
+ * grid has loaded): this many (None: every row).
+ */
+window_rows: number | null, };

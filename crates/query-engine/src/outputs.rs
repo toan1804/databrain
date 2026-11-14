@@ -58,6 +58,16 @@ pub fn free_floor(total: Option<u64>) -> u64 {
 }
 
 /// `1.5 GB`, `512 MB`.
+/// Why a result on disk can't be pinned.
+pub fn too_large_to_pin(o: &OutputInfo) -> String {
+    format!(
+        "Too large to pin: {} ({} rows) is larger than memory, so its rows are on disk, and pinning saves a copy of every row. Export it to keep it, or pin a smaller result (aggregate or filter it with SQL on {}).",
+        o.handle,
+        o.rows,
+        o.reference()
+    )
+}
+
 pub fn size_text(bytes: usize) -> String {
     let b = bytes as u64;
     if b >= GB {
@@ -121,6 +131,10 @@ pub struct OutputInfo {
     pub row_limit: Option<usize>,
     pub bytes: usize,
     pub pinned: bool,
+    /// Larger than memory: its rows are on disk (a live result), so it
+    /// can't be pinned.
+    #[serde(default)]
+    pub spilled: bool,
     pub state: OutputState,
     pub origin: Origin,
     #[ts(as = "f64")]
@@ -494,6 +508,7 @@ impl OutputRegistry {
                 row_limit: n.row_limit,
                 bytes: n.result.bytes,
                 pinned: false,
+                spilled: n.result.on_disk,
                 kept: false,
                 state: OutputState::Live,
                 origin: n.origin,
@@ -728,6 +743,9 @@ impl OutputRegistry {
         if pinned && info.pinned {
             return Ok(info); // already saved: nothing to write (or to undo)
         }
+        if pinned && info.spilled {
+            return Err(EngineError::new("invalid", too_large_to_pin(&info)));
+        }
         if info.state == OutputState::OnDisk {
             // Unpinning: keep the data for this session. Pinning a restored
             // result: its rows are on disk only; read them to save again.
@@ -743,7 +761,7 @@ impl OutputRegistry {
                 let save = || -> Result<()> {
                     let rs = self.results.get(&info.result_id).map_err(|e| EngineError::new("not_found", e.to_string()))?;
                     if rs.lock().is_on_disk() {
-                        return Err(EngineError::new("invalid", "A result larger than memory (its rows are on disk) can't be pinned; export it to keep it."));
+                        return Err(EngineError::new("invalid", too_large_to_pin(&info)));
                     }
                     let (schema, batches) = {
                         let mut g = rs.lock();
@@ -808,7 +826,7 @@ impl OutputRegistry {
         // export or sort of it holds the result's lock.
         let mut o = self.inner.lock().by_handle.get(handle).cloned()?;
         if o.state == OutputState::Live {
-            o.bytes = self.results.bytes_of(&o.result_id);
+            (o.bytes, o.spilled) = self.results.size_of(&o.result_id);
         }
         Some(o)
     }

@@ -22,9 +22,7 @@ mod session;
 mod test_util;
 pub mod xlsx;
 
-pub use engine::{
-    EngineStatus, engine_status, extension_dir, load_engine, run_private, set_extension_dir, set_memory_limit, set_spill_dir, version_and_platform,
-};
+pub use engine::{EngineStatus, engine_status, extension_dir, load_engine, set_extension_dir, set_memory_limit, set_spill_dir, version_and_platform};
 pub use excel::{ExcelSource, excel_scan, excel_sheet_source, excel_sources, file_scan_expr};
 pub use files::{FileFormat, detect_format, scan_expr, view_name};
 pub use outputs::RESULTS_SCHEMA_ID;

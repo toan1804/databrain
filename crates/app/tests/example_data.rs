@@ -199,6 +199,7 @@ async fn sqlite_explorer_and_queries() {
         filters: vec![ColumnFilter { column: 0, op: FilterOp::Equals, value: "Vietnam".into() }],
         quick_filter: None,
         sort: vec![SortKey { column: 1, descending: false }],
+        first_rows: None,
     };
     let (_, header, rows) = query_view(&st, &id, "SELECT 1; SELECT country, city, count(*) AS n FROM customers GROUP BY 1, 2", view).await;
     assert_eq!(header, vec!["country", "city", "n"]);

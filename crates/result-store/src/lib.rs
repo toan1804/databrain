@@ -4,7 +4,7 @@
 pub mod chart;
 mod decimal;
 mod disk_view;
-pub use disk_view::{ROW_ID, SpaceCheck, column_stats, find, for_each_batch, prepare_view, with_view};
+pub use disk_view::{WINDOW_BYTES, column_stats, find, for_each_batch, prepare_view, with_view, with_window};
 pub mod display;
 pub mod spill;
 pub mod view;
@@ -53,6 +53,9 @@ pub struct Page {
     pub view_rows: usize,
     /// Rows stored in the result (before filters).
     pub total_rows: usize,
+    /// A sort or filter of a result on disk applies to its first rows only:
+    /// this many (None: to every row).
+    pub window_rows: Option<usize>,
     pub offset: usize,
     /// 0-based index of each row in the original result.
     pub row_ids: Vec<u32>,
@@ -137,9 +140,6 @@ pub struct ColumnStats {
     pub nulls: u64,
     #[ts(as = "f64")]
     pub distinct: u64,
-    /// More distinct values than were counted (a result on disk counts up
-    /// to a million).
-    pub distinct_capped: bool,
     pub min: Option<String>,
     pub max: Option<String>,
     pub top: Vec<TopValue>,
@@ -161,35 +161,6 @@ pub struct ResultInfo {
     pub on_disk: bool,
     #[ts(type = "number")]
     pub disk_bytes: u64,
-}
-
-/// A sort of a result on disk, done out of memory (by DuckDB in the app).
-#[derive(Debug, Clone)]
-pub struct SortJob {
-    /// Parquet files of the rows to keep: [`ROW_ID`] (UInt64) then the sort
-    /// keys `k0`, `k1`… as they're compared (exact decimals as bytes).
-    pub keys: Vec<std::path::PathBuf>,
-    /// The result's files and the first row of each.
-    pub data: Vec<(std::path::PathBuf, usize)>,
-    /// Per key: descending. Nulls always last; ties in result order.
-    pub descending: Vec<bool>,
-    /// Where to write the kept rows in order: the result's columns, then
-    /// [`ROW_ID`], in row groups of `row_group_rows`.
-    pub out: std::path::PathBuf,
-    /// Rows per row group (fewer for wide rows, so a page reads little).
-    pub row_group_rows: usize,
-}
-
-/// Sorts results that are on disk (see [`SortJob`]).
-pub trait DiskSorter: Send + Sync {
-    fn sort(&self, job: &SortJob) -> std::result::Result<(), String>;
-}
-
-/// The view (filters, sort) of a result on disk, kept on disk too: the
-/// result's columns plus `__row_id`.
-struct DiskView {
-    spec: ViewSpec,
-    rows: spill::Spill,
 }
 
 struct ViewCache {
@@ -216,10 +187,9 @@ pub struct ResultSet {
     spill: Option<spill::Spill>,
     /// Writing to disk failed: no rows were added after it.
     spill_error: Option<String>,
-    disk_view: Option<DiskView>,
-    sorter: Option<Arc<dyn DiskSorter>>,
-    space: Option<SpaceCheck>,
-    /// One view build at a time (outside the lock: see [`prepare_view`]).
+    /// The first rows a sort or filter of a result on disk applies to.
+    window: Option<disk_view::Window>,
+    /// One window read at a time (outside the lock: see [`prepare_view`]).
     view_build: Arc<Mutex<()>>,
 }
 
@@ -238,9 +208,7 @@ impl ResultSet {
             wide_limit: display::MAX_SMALL_BYTES,
             spill: None,
             spill_error: None,
-            disk_view: None,
-            sorter: None,
-            space: None,
+            window: None,
             view_build: Arc::new(Mutex::new(())),
         }
     }
@@ -337,7 +305,7 @@ impl ResultSet {
 
     pub fn memory_bytes(&self) -> usize {
         if let Some(sp) = &self.spill {
-            return sp.memory_bytes() + self.disk_view.as_ref().map_or(0, |v| v.rows.memory_bytes());
+            return sp.memory_bytes() + self.window.as_ref().map_or(0, |w| w.set.memory_bytes());
         }
         match &self.combined {
             Some(c) => databrain_connector_core::memory_size([c]),
@@ -347,10 +315,13 @@ impl ResultSet {
 
     /// Every row of the view, a batch at a time (at most `chunk` rows, the
     /// result's own types), without keeping them all: for exports and loads
-    /// of results on disk too (their view must be the plain result).
+    /// of results on disk too (a sort or filter of one: of its window).
     pub fn for_each_batch(&mut self, spec: &ViewSpec, chunk: usize, f: &mut dyn FnMut(RecordBatch) -> Result<()>) -> Result<()> {
         if self.spill.is_some() {
-            return self.disk_for_each(spec, chunk, f);
+            if spec.is_identity() {
+                return self.disk_for_each(chunk, f);
+            }
+            return self.window(spec)?.for_each_batch(spec, chunk, f);
         }
         for b in self.view_batches(spec, chunk)? {
             f(b)?;
@@ -397,7 +368,7 @@ impl ResultSet {
             return Ok(None);
         }
         if self.spill.is_some() {
-            return Err(Error::OnDisk("Sorting and filtering"));
+            return self.window(spec)?.view_indices(spec);
         }
         if let Some(c) = &self.view_cache
             && &c.spec == spec
@@ -413,7 +384,7 @@ impl ResultSet {
 
     pub fn view_len(&mut self, spec: &ViewSpec) -> Result<usize> {
         if self.spill.is_some() && !spec.is_identity() {
-            return Ok(self.disk_view(spec)?.rows());
+            return self.window(spec)?.view_len(spec);
         }
         Ok(match self.view_indices(spec)? {
             Some(i) => i.len(),
@@ -490,9 +461,7 @@ impl ResultSet {
     /// Rows `[offset, offset+limit)` of the view as a batch plus original ids.
     pub fn view_slice(&mut self, spec: &ViewSpec, offset: usize, limit: usize) -> Result<(RecordBatch, Vec<u32>)> {
         if self.spill.is_some() && !spec.is_identity() {
-            let schema = self.schema.clone();
-            let b = self.disk_view(spec)?.slice(offset, limit)?;
-            return disk_view::split_ids(&b, &schema);
+            return self.window(spec)?.view_slice(spec, offset, limit);
         }
         if let Some(sp) = &mut self.spill {
             let b = sp.slice(offset, limit)?;
@@ -524,12 +493,18 @@ impl ResultSet {
     }
 
     pub fn page(&mut self, spec: &ViewSpec, offset: usize, limit: usize) -> Result<Page> {
+        if self.spill.is_some() && !spec.is_identity() {
+            let total_rows = self.total_rows;
+            let w = self.window(spec)?;
+            let window_rows = Some(w.total_rows);
+            return Ok(Page { total_rows, window_rows, ..w.page(spec, offset, limit)? });
+        }
         let view_rows = self.view_len(spec)?;
         let (batch, row_ids) = self.view_slice(spec, offset, limit)?;
         let opts = display::format_options();
         let formatters: Vec<ArrayFormatter<'_>> = batch.columns().iter().map(|c| ArrayFormatter::try_new(c.as_ref(), &opts)).collect::<Result<_, _>>()?;
         let rows = (0..batch.num_rows()).map(|r| formatters.iter().zip(batch.columns()).map(|(f, a)| display::cell(f, a, r)).collect()).collect();
-        Ok(Page { view_rows, total_rows: self.total_rows, offset, row_ids, rows })
+        Ok(Page { view_rows, total_rows: self.total_rows, window_rows: None, offset, row_ids, rows })
     }
 
     /// Find cells containing `query` (case-insensitive) within the view.
@@ -551,7 +526,10 @@ impl ResultSet {
             return Ok(FindResult { matches, truncated: false });
         }
         if self.spill.is_some() {
-            return self.disk_find(spec, query, columns, limit, whole_word);
+            if spec.is_identity() {
+                return self.disk_find(query, columns, limit, whole_word);
+            }
+            return self.window(spec)?.find_with(spec, query, columns, limit, whole_word);
         }
         let batch = self.combined()?;
         let idx = self.view_indices(spec)?;
@@ -602,7 +580,8 @@ impl ResultSet {
             return Err(Error::InvalidColumn(column));
         }
         if self.spill.is_some() {
-            return self.disk_column_stats(spec, column);
+            // The rows in memory only (the window), never the files.
+            return self.window(spec)?.column_stats(spec, column);
         }
         let n = self.view_len(spec)?;
         let (batch, _) = self.view_slice(spec, 0, n)?;
@@ -645,7 +624,7 @@ impl ResultSet {
         top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let top = top.into_iter().take(10).map(|(v, count)| TopValue { value: v.map(|s| s.to_string()), count }).collect();
 
-        Ok(ColumnStats { column, count: col.len() as u64, nulls, distinct, distinct_capped: false, min, max, top })
+        Ok(ColumnStats { column, count: col.len() as u64, nulls, distinct, min, max, top })
     }
 
     /// The view as a sequence of batches (for export, outputs), at most
@@ -653,6 +632,9 @@ impl ResultSet {
     /// whose text passes 2 GiB is split further.
     pub fn view_batches(&mut self, spec: &ViewSpec, chunk: usize) -> Result<Vec<RecordBatch>> {
         if self.spill.is_some() {
+            if !spec.is_identity() {
+                return self.window(spec)?.view_batches(spec, chunk);
+            }
             // Every row in memory is what spilling avoids: use for_each_batch.
             return Err(Error::OnDisk("Reading every row at once"));
         }
@@ -694,8 +676,6 @@ pub struct ResultStore {
     spill_root: Mutex<Option<std::path::PathBuf>>,
     /// Held while this process uses its spill folder (see [`Self::set_spill_root`]).
     spill_lock: Mutex<Option<std::fs::File>>,
-    sorter: Mutex<Option<Arc<dyn DiskSorter>>>,
-    space: Mutex<Option<SpaceCheck>>,
 }
 
 impl ResultStore {
@@ -744,17 +724,6 @@ impl ResultStore {
         }
     }
 
-    /// Free disk space where results spill, checked before a view of a
-    /// result on disk writes its copy.
-    pub fn set_space_check(&self, check: Option<SpaceCheck>) {
-        *self.space.lock() = check;
-    }
-
-    /// Sorts results on disk (DuckDB; without one they can't be sorted).
-    pub fn set_disk_sorter(&self, sorter: Option<Arc<dyn DiskSorter>>) {
-        *self.sorter.lock() = sorter;
-    }
-
     pub fn spill_root(&self) -> Option<std::path::PathBuf> {
         self.spill_root.lock().clone()
     }
@@ -785,16 +754,22 @@ impl ResultStore {
     /// Bytes `id` keeps in memory. The store's map isn't held while the
     /// result's lock is waited for (a long export or sort holds it).
     pub fn bytes_of(&self, id: &str) -> usize {
+        self.size_of(id).0
+    }
+
+    /// Bytes `id` keeps in memory, and whether its rows are on disk.
+    pub fn size_of(&self, id: &str) -> (usize, bool) {
         let rs = self.results.lock().get(id).cloned();
-        rs.map(|r| r.lock().memory_bytes()).unwrap_or(0)
+        rs.map(|r| {
+            let g = r.lock();
+            (g.memory_bytes(), g.is_on_disk())
+        })
+        .unwrap_or((0, false))
     }
 
     pub fn create(&self, id: impl Into<String>, schema: SchemaRef) -> Arc<Mutex<ResultSet>> {
         let id = id.into();
-        let mut set = ResultSet::new(id.clone(), schema);
-        set.sorter = self.sorter.lock().clone();
-        set.space = self.space.lock().clone();
-        let rs = Arc::new(Mutex::new(set));
+        let rs = Arc::new(Mutex::new(ResultSet::new(id.clone(), schema)));
         self.results.lock().insert(id, rs.clone());
         rs
     }
@@ -840,6 +815,70 @@ mod spill_tests {
         assert!(!rs.is_on_disk());
         assert_eq!(rs.total_rows(), 40_000);
         assert_eq!(rs.view_slice(&ViewSpec::default(), 39_999, 5).unwrap().0.num_rows(), 1, "every row still there");
+    }
+
+    /// A sort or filter of a result on disk applies to its first rows only
+    /// (the rows the grid has loaded); the plain result, find and statistics
+    /// without a filter, and every-row reads see every row.
+    #[test]
+    fn sorts_and_filters_on_disk_apply_to_the_first_rows() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let n = 100_000i64;
+        let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from_iter_values(0..n))]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let rs = Arc::new(Mutex::new(ResultSet::new("r", schema)));
+        {
+            let mut g = rs.lock();
+            g.push(b.slice(0, 1000));
+            g.spill_to(dir.path().join("r"), &b).unwrap();
+            g.push(b.slice(1000, n as usize - 1000));
+            g.finish(false);
+            assert!(g.is_on_disk());
+        }
+        let first = |p: &Page| p.rows.iter().map(|r| r[0].clone().unwrap()).collect::<Vec<_>>();
+        let desc = |first_rows| ViewSpec { sort: vec![SortKey { column: 0, descending: true }], first_rows, ..Default::default() };
+
+        // The first 1,000 rows, sorted: 999 first; rows past them aren't in the view.
+        let p = with_view(&rs, &desc(Some(1000)), |g| g.page(&desc(Some(1000)), 0, 3)).unwrap();
+        assert_eq!((p.view_rows, p.total_rows, p.window_rows), (1000, n as usize, Some(1000)));
+        assert_eq!(first(&p), vec!["999", "998", "997"]);
+        assert_eq!(p.row_ids, vec![999, 998, 997]);
+        let past =
+            ViewSpec { filters: vec![ColumnFilter { column: 0, op: FilterOp::Gte, value: "1000".into() }], first_rows: Some(1000), ..Default::default() };
+        assert_eq!(with_view(&rs, &past, |g| g.view_len(&past)).unwrap(), 0, "a filter sees only the first rows");
+        assert_eq!(find(&rs, &past, "5", None, 10_000, false).unwrap().matches.len(), 0);
+        let stats = column_stats(&rs, &desc(Some(1000)), 0).unwrap();
+        assert_eq!((stats.count, stats.max.as_deref()), (1000, Some("999")));
+        let mut rows = 0;
+        for_each_batch(&rs, &desc(Some(1000)), 300, &mut |b| {
+            rows += b.num_rows();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, 1000, "export of a sorted view: its rows");
+
+        // More rows loaded: a larger window; none given: every row that fits.
+        assert_eq!(with_view(&rs, &desc(Some(5000)), |g| g.page(&desc(Some(5000)), 0, 1)).map(|p| first(&p)).unwrap(), vec!["4999"]);
+        let all = with_view(&rs, &desc(None), |g| g.page(&desc(None), 0, 1)).unwrap();
+        assert_eq!((first(&all), all.window_rows), (vec![(n - 1).to_string()], Some(n as usize)));
+
+        // The plain result and find in it: every row, from disk.
+        let plain = with_view(&rs, &ViewSpec::default(), |g| g.page(&ViewSpec::default(), 99_999, 1)).unwrap();
+        assert_eq!((first(&plain), plain.window_rows), (vec!["99999".to_string()], None));
+        // Statistics: of the rows in memory (the window), never the files.
+        let loaded = ViewSpec { first_rows: Some(500), ..Default::default() };
+        let s = column_stats(&rs, &loaded, 0).unwrap();
+        assert_eq!((s.count, s.distinct, s.max.as_deref()), (500, 500, Some("499")));
+        assert_eq!(find(&rs, &ViewSpec::default(), "99999", None, 10, false).unwrap().matches.len(), 1);
+        // A chart: of the window too, even of the plain result.
+        let count = ChartSpec { x: 0, y: vec![], agg: Agg::Count, series: None, limit: 5 };
+        let plain = ViewSpec { first_rows: Some(200), ..Default::default() };
+        let d = with_window(&rs, &plain, |g| g.chart(&plain, &count)).unwrap();
+        assert_eq!((d.rows, d.window_rows), (200, Some(200)));
+        let d = with_window(&rs, &desc(None), |g| g.chart(&desc(None), &count)).unwrap();
+        assert_eq!((d.rows, d.window_rows), (n as usize, Some(n as usize)));
+        // The window (the last one read: every row) counts as the result's memory.
+        assert!(rs.lock().memory_bytes() >= n as usize * 8);
     }
 }
 

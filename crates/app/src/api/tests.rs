@@ -142,6 +142,7 @@ async fn end_to_end_sqlite() {
         filters: vec![ColumnFilter { column: 2, op: FilterOp::Equals, value: "Hanoi".into() }],
         quick_filter: None,
         sort: vec![SortKey { column: 3, descending: true }],
+        first_rows: None,
     };
     let page = fetch_page(&st, rid.clone(), view.clone(), 0, 100).await.unwrap();
     assert_eq!(page.view_rows, 2);

@@ -148,8 +148,8 @@ export function OutputChip({
           />
           <MenuItem
             icon={o.pinned ? <PinOff size={13} /> : <Pin size={13} />}
-            label={o.pinned ? "Unpin" : "Pin (keep across runs and restarts)"}
-            disabled={o.state === "evicted"}
+            label={o.pinned ? "Unpin" : o.spilled ? "Can't pin: larger than memory (export it to keep it)" : "Pin (keep across runs and restarts)"}
+            disabled={o.state === "evicted" || (o.spilled && !o.pinned)}
             onClick={() => (setMenu(null), void togglePin(o))}
           />
           <MenuSeparator />

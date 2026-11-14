@@ -67,6 +67,11 @@ pub struct ViewSpec {
     pub quick_filter: Option<String>,
     #[serde(default)]
     pub sort: Vec<SortKey>,
+    /// For a result on disk: sorts and filters apply to its first rows
+    /// only, this many (the rows the grid has loaded); None: as many as fit
+    /// in [`crate::WINDOW_BYTES`]. Results in memory use every row.
+    #[serde(default)]
+    pub first_rows: Option<usize>,
 }
 
 impl ViewSpec {
@@ -197,17 +202,6 @@ fn true_indices(mask: &BooleanArray) -> UInt32Array {
         }
     }
     UInt32Array::from(out)
-}
-
-/// Rows of `batch` the filters keep (None: no filter), in order.
-pub(crate) fn kept_rows(batch: &RecordBatch, spec: &ViewSpec, cache: &mut DisplayCache) -> Result<Option<UInt32Array>> {
-    Ok(filter_mask(batch, spec, cache)?.map(|m| true_indices(&m)))
-}
-
-/// The sort keys of `batch` as they're compared (exact decimals as
-/// order-preserving bytes).
-pub(crate) fn sort_keys(batch: &RecordBatch, spec: &ViewSpec) -> Result<Vec<ArrayRef>> {
-    spec.sort.iter().map(|k| if k.column >= batch.num_columns() { Err(Error::InvalidColumn(k.column)) } else { comparable(batch, k.column) }).collect()
 }
 
 /// The filters and quick filter of `spec` as one mask (None: no filter).

@@ -219,7 +219,9 @@ impl ToolContext {
         let mut s = String::from("Columns:\n");
         if info.on_disk {
             // A full read per column: SQL does it better for a result this size.
-            s = String::from("Columns (the result is larger than memory: query it with query_outputs for statistics):\n");
+            s = String::from(
+                "Columns (no statistics: the result is larger than memory, so its rows are on disk and statistics would read them all, a long-running query; use query_outputs on results.<name> for the ones you need):\n",
+            );
         }
         for (i, c) in info.columns.iter().enumerate() {
             let pii = mask.get(i).copied().unwrap_or(true);
@@ -289,9 +291,10 @@ impl ToolContext {
         let (names, batches) = {
             let mut g = rs.lock();
             if g.is_on_disk() {
-                return Err(AiError::Internal(
-                    "this result is larger than memory (its rows are on disk): query it with query_outputs as results.<name> instead".into(),
-                ));
+                return Err(AiError::Internal(format!(
+                    "not run: this result ({} rows) is larger than memory, so its rows are on disk; a local aggregate loads every row into memory first, which would be a long-running query (or run out of memory). Query it with query_outputs as results.<name> instead: DuckDB reads the files from disk without loading them",
+                    g.total_rows()
+                )));
             }
             let names: Vec<String> = g.schema().fields().iter().map(|f| f.name().clone()).collect();
             (names, g.view_batches(&ViewSpec::default(), 50_000).map_err(|e| AiError::Internal(e.to_string()))?)

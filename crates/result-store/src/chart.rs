@@ -65,6 +65,9 @@ pub struct ChartData {
     /// Categories or series were cut to the limit.
     pub truncated: bool,
     pub rows: usize,
+    /// A result on disk is charted from its first rows only (the rows the
+    /// grid has loaded): this many (None: every row).
+    pub window_rows: Option<usize>,
 }
 
 const MAX_SERIES: usize = 20;
@@ -118,8 +121,10 @@ impl ResultSet {
             }
         }
         if self.is_on_disk() {
-            // Charting reads every row at once, which spilling avoids.
-            return Err(Error::OnDisk("A chart (aggregate it with SQL over results.<name> first)"));
+            // Every row at once is what spilling avoids: the first rows (in memory).
+            let w = self.window(view)?;
+            let window_rows = Some(w.total_rows());
+            return Ok(ChartData { window_rows, ..w.chart(view, spec)? });
         }
         let n = self.view_len(view)?;
         let (batch, _) = self.view_slice(view, 0, n)?;
@@ -155,7 +160,7 @@ impl ResultSet {
                 .zip(&ynames)
                 .map(|(a, name)| ChartSeries { name: name.clone(), values: (0..take).map(|i| (!a.is_null(i)).then(|| a.value(i))).collect() })
                 .collect();
-            return Ok(ChartData { x, x_family: family_str(xfam).into(), series, truncated: take < n, rows: n });
+            return Ok(ChartData { x, x_family: family_str(xfam).into(), series, truncated: take < n, rows: n, window_rows: None });
         }
 
         // Group: x → (series key → accumulators per y).
@@ -245,7 +250,7 @@ impl ResultSet {
                 series.push(ChartSeries { name: name.clone(), values: xs_idx.iter().map(|&xi| accs[xi].first().and_then(|s| s[yi].get(spec.agg))).collect() });
             }
         }
-        Ok(ChartData { x, x_family: family_str(xfam).into(), series, truncated, rows: n })
+        Ok(ChartData { x, x_family: family_str(xfam).into(), series, truncated, rows: n, window_rows: None })
     }
 }
 
