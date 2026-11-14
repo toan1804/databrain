@@ -301,9 +301,13 @@ pub async fn index_tables(
     };
     let mut out = Vec::new();
     let mut fresh = Vec::new();
+    let allowed = |schema: &str, name: &str| !refused(schema, name);
     for want in names.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
-        if let Ok(Some((schema, name))) = ws.meta_get(connection_id, want)
-            && refused(&schema, &name)
+        // Every table the name may mean is refused: not read at all. (A bare
+        // name also in an allowed schema resolves to that one below.)
+        if let Ok(cands) = ws.meta_find_named(connection_id, want)
+            && !cands.is_empty()
+            && cands.iter().all(|(s, n)| refused(s, n))
         {
             out.push((want.to_string(), Err(not_available(want))));
             continue;
@@ -312,7 +316,11 @@ pub async fn index_tables(
         // connect, a sign-in, a busy metadata session, a large catalog);
         // Stop cancels it. Only a stuck server gives up, after INDEX_TABLE_TIMEOUT.
         let work = async {
-            let d = describe_named(engine, connection_id, want).await?;
+            let d = describe_named(engine, connection_id, want, &allowed).await.map_err(|e| {
+                // Unreachable or not signed in: told as it is (nothing about
+                // the table). Anything else is one answer, below.
+                if unreachable_error(&e) { format!("could not read `{want}`: {}", e.message) } else { not_available(want) }
+            })?;
             if !d.object.kind.is_relation() {
                 return Err(format!("`{}.{}` is not a table or view", d.object.schema, d.object.name));
             }
@@ -331,10 +339,11 @@ pub async fn index_tables(
             _ = cancel.cancelled() => return Err(AiError::Cancelled),
         };
         let r = r.and_then(|o| if refused(&o.schema, &o.name) { Err(not_available(want)) } else { Ok(o) });
-        // One answer for a table that isn't there and one that is refused,
-        // so the reply doesn't tell them apart; only a database that didn't
-        // answer is said as such.
-        let r = r.map_err(|e| if e.starts_with("no answer from the database") { e } else { not_available(want) });
+        // One answer for a table that isn't there and one that is refused
+        // (by DataBrain or the database's permissions: they can't be told
+        // apart), so the reply doesn't tell them apart; a database that
+        // didn't answer, couldn't be reached or signed in to is said as such.
+        let r = r.map_err(|e| if e.starts_with("no answer from the database") || e.starts_with("could not read") { e } else { not_available(want) });
         if let Ok(o) = &r {
             fresh.push(o.clone());
         }
@@ -361,14 +370,30 @@ const INDEX_TABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Describe `schema.table` (or a bare `table`) as written: a qualified name is
 /// described directly (no catalog search); otherwise, or when that fails
 /// (different case, a name only the search knows), it is looked up first.
-async fn describe_named(engine: &QueryEngine, connection_id: &str, want: &str) -> std::result::Result<databrain_connector_core::ObjectDetail, String> {
-    if let Some((schema, name)) = want.rsplit_once('.').filter(|(s, n)| !s.is_empty() && !n.is_empty())
-        && let Ok(d) = engine.describe(connection_id, schema, name).await
-    {
-        return Ok(d);
+/// A bare name in several schemas resolves to one `allowed` says the AI may
+/// use. Errors keep their kind (a failed connection or sign-in says so).
+async fn describe_named(
+    engine: &QueryEngine,
+    connection_id: &str,
+    want: &str,
+    allowed: &(dyn Fn(&str, &str) -> bool + Sync),
+) -> std::result::Result<databrain_connector_core::ObjectDetail, databrain_query_engine::EngineError> {
+    if let Some((schema, name)) = want.rsplit_once('.').filter(|(s, n)| !s.is_empty() && !n.is_empty()) {
+        match engine.describe(connection_id, schema, name).await {
+            Ok(d) => return Ok(d),
+            Err(e) if unreachable_error(&e) => return Err(e),
+            Err(_) => {}
+        }
     }
-    let (schema, name) = resolve_table(engine, connection_id, want).await?.ok_or_else(|| format!("no table or view named `{want}` on this connection"))?;
-    engine.describe(connection_id, &schema, &name).await.map_err(|e| e.message)
+    let not_found = || databrain_query_engine::EngineError::new("not_found", format!("no table or view named `{want}` on this connection"));
+    let (schema, name) = resolve_table_where(engine, connection_id, want, allowed).await?.ok_or_else(not_found)?;
+    engine.describe(connection_id, &schema, &name).await
+}
+
+/// The database couldn't be reached or signed in to: says nothing about
+/// the table, so it is told as it is.
+fn unreachable_error(e: &databrain_query_engine::EngineError) -> bool {
+    matches!(e.kind.as_str(), "connection" | "auth" | "reauth_required" | "timeout")
 }
 
 /// Compact DDL-like description for prompts. PII columns are listed but
@@ -793,20 +818,35 @@ pub async fn check_note_target(engine: &QueryEngine, connection_id: &str, target
 /// `main.sales.orders`) to (schema id, table name): knowledge index first,
 /// then the live connection.
 pub async fn resolve_table(engine: &QueryEngine, connection_id: &str, path: &str) -> std::result::Result<Option<(String, String)>, String> {
-    if let Ok(Some(hit)) = engine.workspace().meta_get(connection_id, path) {
+    resolve_table_where(engine, connection_id, path, &|_, _| true).await.map_err(|e| e.message)
+}
+
+/// [`resolve_table`] among the tables `keep` accepts (the AI's scope): a
+/// bare name in several schemas resolves to one it may use, not the first
+/// the explorer cache has.
+async fn resolve_table_where(
+    engine: &QueryEngine,
+    connection_id: &str,
+    path: &str,
+    keep: &(dyn Fn(&str, &str) -> bool + Sync),
+) -> std::result::Result<Option<(String, String)>, databrain_query_engine::EngineError> {
+    if let Ok(cached) = engine.workspace().meta_find_named(connection_id, path)
+        && let Some(hit) = cached.into_iter().find(|(s, n)| keep(s, n))
+    {
         return Ok(Some(hit));
     }
     let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();
     let Some(table) = parts.last() else { return Ok(None) };
     let schema_written = parts[..parts.len() - 1].join(".").to_ascii_lowercase();
-    let hits = engine.search_objects(connection_id, table, 50).await.map_err(|e| e.message)?;
+    let hits = engine.search_objects(connection_id, table, 50).await?;
     Ok(hits
         .into_iter()
         .filter(|o| o.kind.is_relation() && o.name.eq_ignore_ascii_case(table))
-        .find(|o| {
+        .filter(|o| {
             let s = o.schema.to_ascii_lowercase();
             schema_written.is_empty() || s == schema_written || s.ends_with(&format!(".{schema_written}"))
         })
+        .find(|o| keep(&o.schema, &o.name))
         .map(|o| (o.schema, o.name)))
 }
 

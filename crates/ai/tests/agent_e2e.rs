@@ -1476,6 +1476,47 @@ async fn index_tables_adds_missing_tables_after_approval() {
     assert!(f.ws.kn_state(&f.conn).unwrap().is_some_and(|s| s.objects == 2));
 }
 
+/// A bare name in several schemas is read from the one the AI's scope
+/// allows (not the explorer cache's first); a database that can't be
+/// reached is said as such, not "not available".
+#[tokio::test]
+async fn index_tables_resolves_by_scope_and_says_why_a_read_failed() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let port = mock_openai(requests.clone()).await;
+    let f = fixture(port, AiPolicy::default()).await;
+    f.ws.kn_clear(&f.conn).unwrap();
+    // `hr.orders` (seen in the explorer, shorter schema: the cache's first
+    // pick for `orders`) is excluded; `main.orders` isn't.
+    let o = |schema: &str| databrain_connector_core::DbObject {
+        schema: schema.into(),
+        name: "orders".into(),
+        kind: databrain_connector_core::ObjectKind::Table,
+        comment: None,
+        row_estimate: None,
+    };
+    f.ws.meta_add_objects(&f.conn, &[o("hr"), o("main")]).unwrap();
+    f.ws.ai_put_rule(&f.conn, &databrain_workspace::ScopeRule { schema: "hr".into(), table: String::new(), allow: false }).unwrap();
+    let cancel = Default::default();
+    let r = databrain_ai::knowledge::index_tables(&f.engine, &f.conn, &["orders".into()], &cancel).await.unwrap();
+    let got = r[0].1.as_ref().map(|o| format!("{}.{}", o.schema, o.name));
+    assert_eq!(got.as_deref(), Ok("main.orders"));
+    // Only the excluded one: refused, in the words for a missing table.
+    let r = databrain_ai::knowledge::index_tables(&f.engine, &f.conn, &["hr.orders".into()], &cancel).await.unwrap();
+    assert!(r[0].1.as_ref().unwrap_err().contains("not available"), "{:?}", r[0].1);
+
+    // The database can't be opened (a folder where its file was).
+    let mut p = f.ws.get_connection(&f.conn).unwrap();
+    let broken = std::env::temp_dir().join(format!("databrain-ai-broken-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&broken).unwrap();
+    p.config.file_path = Some(broken.to_string_lossy().into());
+    f.ws.save_connection(p).unwrap();
+    f.engine.disconnect(&f.conn);
+    let r = databrain_ai::knowledge::index_tables(&f.engine, &f.conn, &["main.customers".into()], &cancel).await.unwrap();
+    let e = r[0].1.as_ref().unwrap_err();
+    assert!(e.starts_with("could not read `main.customers`") && !e.contains("not available"), "{e}");
+    let _ = std::fs::remove_dir_all(&broken);
+}
+
 /// Joins written down in a document (or said by the user) are recorded
 /// against the knowledge index: real tables, real columns. The assistant's
 /// wait for review unless notes are saved directly; an MCP client's are

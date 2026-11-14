@@ -62,7 +62,10 @@ fn open(path: &str, read_only: bool) -> Result<rusqlite::Connection> {
     }
     let mut flags = OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     flags |= if read_only { OpenFlags::SQLITE_OPEN_READ_ONLY } else { OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE };
-    let conn = rusqlite::Connection::open_with_flags(path, flags).map_err(map_err)?;
+    // Not opening the file is not reaching the database (a connection
+    // error, as for a server), not a query that failed.
+    let conn =
+        rusqlite::Connection::open_with_flags(path, flags).map_err(|e| ConnectorError::connection(format!("cannot open {path}: {}", map_err(e).message)))?;
     conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(map_err)?;
     Ok(conn)
 }

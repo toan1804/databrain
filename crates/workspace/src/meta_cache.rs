@@ -689,6 +689,26 @@ impl Workspace {
             .optional()?)
     }
 
+    /// Every cached table/view `reference` may mean (as [`Self::meta_get`]
+    /// reads it), shortest schema first: a bare name can be in several
+    /// schemas, and the caller picks one it may use.
+    pub fn meta_find_named(&self, connection_id: &str, reference: &str) -> Result<Vec<(String, String)>> {
+        let (schema, name) = match reference.rsplit_once('.') {
+            Some((s, n)) => (Some(s.replace(['"', '`', '[', ']'], "")), n),
+            None => (None, reference),
+        };
+        let name = name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT DISTINCT schema_name, name FROM meta_objects \
+             WHERE connection_id = ?1 AND lower(name) = lower(?2) AND kind NOT IN ('function', 'procedure', 'package', 'sequence', 'other') \
+               AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR lower(schema_name) LIKE '%.' || lower(?3)) \
+             ORDER BY length(schema_name), schema_name",
+        )?;
+        let rows = st.query_map(params![connection_id, name, schema], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// A cached object of `schema` named `name` (any case): tables and views
     /// before routines, the exact-case name first, a table before a view.
     pub fn meta_object(&self, connection_id: &str, schema: &str, name: &str) -> Result<Option<DbObject>> {
