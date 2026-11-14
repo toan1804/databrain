@@ -140,9 +140,6 @@ pub struct ColumnStats {
     pub nulls: u64,
     #[ts(as = "f64")]
     pub distinct: u64,
-    /// More distinct values than were counted (a result on disk counts up
-    /// to a million).
-    pub distinct_capped: bool,
     pub min: Option<String>,
     pub max: Option<String>,
     pub top: Vec<TopValue>,
@@ -583,9 +580,7 @@ impl ResultSet {
             return Err(Error::InvalidColumn(column));
         }
         if self.spill.is_some() {
-            if spec.is_identity() {
-                return self.disk_column_stats(column);
-            }
+            // The rows in memory only (the window), never the files.
             return self.window(spec)?.column_stats(spec, column);
         }
         let n = self.view_len(spec)?;
@@ -629,7 +624,7 @@ impl ResultSet {
         top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let top = top.into_iter().take(10).map(|(v, count)| TopValue { value: v.map(|s| s.to_string()), count }).collect();
 
-        Ok(ColumnStats { column, count: col.len() as u64, nulls, distinct, distinct_capped: false, min, max, top })
+        Ok(ColumnStats { column, count: col.len() as u64, nulls, distinct, min, max, top })
     }
 
     /// The view as a sequence of batches (for export, outputs), at most
@@ -867,10 +862,13 @@ mod spill_tests {
         let all = with_view(&rs, &desc(None), |g| g.page(&desc(None), 0, 1)).unwrap();
         assert_eq!((first(&all), all.window_rows), (vec![(n - 1).to_string()], Some(n as usize)));
 
-        // The plain result and its find and statistics: every row, from disk.
+        // The plain result and find in it: every row, from disk.
         let plain = with_view(&rs, &ViewSpec::default(), |g| g.page(&ViewSpec::default(), 99_999, 1)).unwrap();
         assert_eq!((first(&plain), plain.window_rows), (vec!["99999".to_string()], None));
-        assert_eq!(column_stats(&rs, &ViewSpec::default(), 0).unwrap().count, n as u64);
+        // Statistics: of the rows in memory (the window), never the files.
+        let loaded = ViewSpec { first_rows: Some(500), ..Default::default() };
+        let s = column_stats(&rs, &loaded, 0).unwrap();
+        assert_eq!((s.count, s.distinct, s.max.as_deref()), (500, 500, Some("499")));
         assert_eq!(find(&rs, &ViewSpec::default(), "99999", None, 10, false).unwrap().matches.len(), 1);
         // A chart: of the window too, even of the plain result.
         let count = ChartSpec { x: 0, y: vec![], agg: Agg::Count, series: None, limit: 5 };

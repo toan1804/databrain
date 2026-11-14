@@ -44,7 +44,7 @@ export function ResultFooter({
     {info.on_disk && (
       <span
         className="rounded bg-hover px-1.5"
-        title="Larger than the memory a result may keep: its rows are on disk and read as you scroll. Sorting and filtering apply to the rows loaded in the grid; find, statistics and export of the whole result read every row from disk."
+        title="Larger than the memory a result may keep: its rows are on disk and read as you scroll. Sorting, filtering, charts and column statistics apply to the rows loaded in the grid; find and export of the whole result read every row from disk."
       >
         on disk · {formatBytes(info.disk_bytes)}
       </span>

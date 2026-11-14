@@ -1,8 +1,8 @@
 //! Sorts and filters of a result on disk apply to its first rows only (a
 //! window: the rows the grid has loaded, `ViewSpec::first_rows`), read into
-//! memory once and sorted and filtered there by the in-memory code. Find,
-//! statistics and export of the plain result read every row, file by file:
-//! the rows are never all in memory.
+//! memory once and sorted and filtered there by the in-memory code; charts
+//! and column statistics use it too. Find and export of the plain result
+//! read every row, file by file: the rows are never all in memory.
 //!
 //! Long work (reading the window, find, statistics, streaming every row)
 //! reads a snapshot of the files ([`Files`]) without holding the result's
@@ -10,21 +10,16 @@
 //! free functions here take the shared result; the `ResultSet` methods of the
 //! same name do the same work under the lock (callers that already hold it).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use databrain_connector_core::arrow::array::{Array, ArrayRef, BinaryArray, RecordBatch};
-use databrain_connector_core::arrow::compute;
+use databrain_connector_core::arrow::array::{Array, RecordBatch};
 use databrain_connector_core::arrow::datatypes::SchemaRef;
 use parking_lot::Mutex;
 
-use crate::display::{self, is_decimal_text};
+use crate::display;
 use crate::spill::{CHUNK_ROWS, Files};
 use crate::view::{self, DisplayCache, ViewSpec};
-use crate::{CellMatch, ColumnStats, Error, FindResult, Result, ResultSet, TopValue, decimal};
-
-/// Distinct values counted for column statistics of a result on disk.
-const MAX_DISTINCT: usize = 1_000_000;
+use crate::{CellMatch, ColumnStats, Error, FindResult, Result, ResultSet};
 
 /// Memory a window may take at most (fewer rows than asked past it).
 pub const WINDOW_BYTES: usize = 256 << 20;
@@ -97,11 +92,6 @@ impl ResultSet {
     pub(crate) fn disk_find(&mut self, query: &str, columns: Option<&[usize]>, limit: usize, whole_word: bool) -> Result<FindResult> {
         let files = self.spill.as_ref().ok_or(Error::OnDisk("This"))?.snapshot();
         find_in(&files, self.schema.fields().len(), query, columns, limit, whole_word)
-    }
-
-    pub(crate) fn disk_column_stats(&mut self, column: usize) -> Result<ColumnStats> {
-        let files = self.spill.as_ref().ok_or(Error::OnDisk("This"))?.snapshot();
-        stats_in(&files, &self.schema.clone(), column)
     }
 }
 
@@ -234,17 +224,10 @@ pub fn find(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec, query: &str, columns: O
     }
 }
 
-/// [`ResultSet::column_stats`]; the files of a result on disk are read without its lock.
+/// [`ResultSet::column_stats`]: of the rows in memory (a result on disk:
+/// its window, read without the lock), never the files.
 pub fn column_stats(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec, column: usize) -> Result<ColumnStats> {
-    match snapshot(rs, spec) {
-        Some((files, schema)) => {
-            if column >= schema.fields().len() {
-                return Err(Error::InvalidColumn(column));
-            }
-            stats_in(&files, &schema, column)
-        }
-        None => with_view(rs, spec, |g| g.column_stats(spec, column)),
-    }
+    with_window(rs, spec, |g| g.column_stats(spec, column))
 }
 
 /// Cells containing `query` (as in memory), file by file.
@@ -285,63 +268,4 @@ fn find_in(files: &Files, ncols: usize, query: &str, columns: Option<&[usize]>, 
     });
     stopped(r)?;
     Ok(FindResult { matches, truncated })
-}
-
-/// Column statistics (as in memory), file by file; distinct values are
-/// counted up to a million (`distinct_capped` past it).
-fn stats_in(files: &Files, schema: &SchemaRef, column: usize) -> Result<ColumnStats> {
-    let field = schema.field(column).clone();
-    let decimal_text = is_decimal_text(&field);
-    let (mut count, mut nulls, mut capped) = (0u64, 0u64, false);
-    // Each file's smallest and largest value (as compared, and as shown).
-    let mut ends: Vec<(ArrayRef, String)> = Vec::new();
-    let mut counts: HashMap<Option<Vec<u8>>, (Option<String>, u64)> = HashMap::new();
-    files.for_each(CHUNK_ROWS, &mut |b| {
-        let col = b.column(column).clone();
-        count += col.len() as u64;
-        nulls += col.null_count() as u64;
-        let sortable = if decimal_text { Arc::new(decimal::keys(col.as_ref())?) as ArrayRef } else { col.clone() };
-        let text = display::to_display(col.as_ref())?;
-        if col.len() > col.null_count()
-            && let Ok(order) = compute::sort_to_indices(sortable.as_ref(), Some(compute::SortOptions { descending: false, nulls_first: false }), None)
-        {
-            let non_null: Vec<u32> = order.values().iter().copied().filter(|i| !sortable.is_null(*i as usize)).collect();
-            for i in [non_null.first(), non_null.last()].into_iter().flatten() {
-                ends.push((sortable.slice(*i as usize, 1), text.value(*i as usize).to_string()));
-            }
-        }
-        let keys = decimal_text.then(|| sortable.as_any().downcast_ref::<BinaryArray>().cloned()).flatten();
-        for i in 0..text.len() {
-            let k = if text.is_null(i) {
-                None
-            } else {
-                Some(match &keys {
-                    Some(k) if k.is_valid(i) => k.value(i).to_vec(),
-                    _ => text.value(i).as_bytes().to_vec(),
-                })
-            };
-            if let Some(e) = counts.get_mut(&k) {
-                e.1 += 1;
-            } else if counts.len() < MAX_DISTINCT {
-                let shown = (!text.is_null(i)).then(|| text.value(i).to_string());
-                counts.insert(k, (shown, 1));
-            } else {
-                capped = true;
-            }
-        }
-        Ok(())
-    })?;
-    let (mut min, mut max) = (None, None);
-    if !ends.is_empty() {
-        let arrays: Vec<&dyn Array> = ends.iter().map(|(a, _)| a.as_ref()).collect();
-        let all = compute::concat(&arrays)?;
-        let order = compute::sort_to_indices(all.as_ref(), None, None)?;
-        min = order.values().first().map(|&i| ends[i as usize].1.clone());
-        max = order.values().last().map(|&i| ends[i as usize].1.clone());
-    }
-    let distinct = counts.keys().filter(|k| k.is_some()).count() as u64;
-    let mut top: Vec<(Option<String>, u64)> = counts.into_values().collect();
-    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let top = top.into_iter().take(10).map(|(value, count)| TopValue { value, count }).collect();
-    Ok(ColumnStats { column, count, nulls, distinct, distinct_capped: capped, min, max, top })
 }

@@ -11,7 +11,6 @@ Found in reviews and left for a later release on purpose. Each says what goes wr
 ## Results on disk (left from the spill work of 2026-11-14)
 
 - A result on disk isn't saved when the app quits (tab results are saved up to 64 MB anyway), so its tab shows nothing after a restart.
-- Column statistics of a result on disk count distinct values up to a million ("+" past it); the top values come from the values counted.
 
 ## Query engine (review of 2026-11-12; see [QUERY_ENGINE.md](QUERY_ENGINE.md))
 

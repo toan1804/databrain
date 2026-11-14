@@ -513,12 +513,14 @@ async fn results_larger_than_memory_continue_on_disk() {
     assert_eq!(page.row_ids.first(), Some(&399_990));
     let found = api::find_in_result(&st, info.id.clone(), filtered, "39999".into(), Some(vec![0]), 100, false).await.unwrap();
     assert_eq!(found.matches.len(), 10);
-    // Find and statistics of the plain result: every row, from the files.
+    // Find in the plain result: every row, from the files.
     let found = api::find_in_result(&st, info.id.clone(), ViewSpec::default(), "399999".into(), Some(vec![0]), 100, false).await.unwrap();
     assert_eq!(found.matches.len(), 1);
-    let stats = api::column_stats(&st, info.id.clone(), ViewSpec::default(), 0).await.unwrap();
-    assert_eq!((stats.count, stats.nulls, stats.distinct), (n as u64, 0, n as u64));
-    assert_eq!((stats.min.as_deref(), stats.max.as_deref()), (Some("0"), Some("399999")));
+    // Column statistics: of the rows loaded in the grid (in memory), not the files.
+    let loaded = ViewSpec { first_rows: Some(1000), ..Default::default() };
+    let stats = api::column_stats(&st, info.id.clone(), loaded, 0).await.unwrap();
+    assert_eq!((stats.count, stats.nulls, stats.distinct), (1000, 0, 1000));
+    assert_eq!((stats.min.as_deref(), stats.max.as_deref()), (Some("0"), Some("999")));
     // Export of a sorted view: its rows, in that order.
     let top = app_dir.path().join("top.csv");
     api::export_result(

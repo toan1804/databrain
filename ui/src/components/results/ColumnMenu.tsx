@@ -11,6 +11,7 @@ export function ColumnMenu({
   x,
   y,
   view,
+  statsView = view,
   onView,
   onClose,
 }: {
@@ -19,6 +20,8 @@ export function ColumnMenu({
   x: number;
   y: number;
   view: ViewSpec;
+  /** The view statistics are of (a result on disk: the rows loaded in the grid). */
+  statsView?: ViewSpec;
   onView: (v: ViewSpec) => void;
   onClose: () => void;
 }) {
@@ -33,13 +36,13 @@ export function ColumnMenu({
   useEffect(() => {
     let alive = true;
     api
-      .columnStats(info.id, view, col)
+      .columnStats(info.id, statsView, col)
       .then((s) => alive && setStats(s))
       .catch((e) => alive && setStatsError(toError(e).message));
     return () => {
       alive = false;
     };
-  }, [info.id, view, col]);
+  }, [info.id, statsView, col]);
 
   const apply = () => {
     onView({ ...view, filters: upsertFilter(view.filters.filter((f) => f.column !== col), { column: col, op, value }) });
@@ -102,13 +105,18 @@ export function ColumnMenu({
         <div className="mb-1 flex items-center gap-1 text-[11px] font-medium text-muted">
           <BarChart3 size={11} /> Statistics
         </div>
+        {info.on_disk && stats && (
+          <div className="mb-1 text-[11px] text-muted" role="note">
+            Of the rows loaded in the grid only, not all {formatCount(info.total_rows)}: the result is on disk.
+          </div>
+        )}
         {statsError && <div className="text-[11.5px] text-danger">{statsError}</div>}
         {!stats && !statsError && <Loader2 size={13} className="animate-spin text-muted" />}
         {stats && (
           <div className="space-y-1.5 text-[11.5px]">
             <div className="grid grid-cols-3 gap-1">
               <Stat label="Rows" value={formatCount(stats.count)} />
-              <Stat label="Distinct" value={`${formatCount(stats.distinct)}${stats.distinct_capped ? "+" : ""}`} />
+              <Stat label="Distinct" value={formatCount(stats.distinct)} />
               <Stat label="Nulls" value={formatCount(stats.nulls)} />
             </div>
             {stats.min !== null && (
