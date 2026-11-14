@@ -169,6 +169,37 @@ struct ViewCache {
     indices: Arc<UInt32Array>,
 }
 
+/// A result's rows so far, to write to disk outside its lock
+/// ([`ResultSet::spill_start`]).
+pub struct SpillStart {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    rows: usize,
+}
+
+impl SpillStart {
+    /// Write the rows to `dir`. `sample` (the next rows) is tried first:
+    /// when these rows can't be written as Parquet, or a write fails, the
+    /// folder is removed and the error returned.
+    pub fn write(self, dir: std::path::PathBuf, sample: &RecordBatch) -> Result<SpillReady> {
+        let probe = self.batches.first().unwrap_or(sample);
+        if !spill::can_write(probe) || !spill::can_write(sample) {
+            return Err(Error::Spill("these column types can't be written to disk".into()));
+        }
+        let mut sp = spill::Spill::create(dir, self.schema)?;
+        for b in self.batches {
+            sp.push(b)?;
+        }
+        Ok(SpillReady { spill: sp, rows: self.rows })
+    }
+}
+
+/// Rows written by [`SpillStart::write`], for [`ResultSet::spill_adopt`].
+pub struct SpillReady {
+    spill: spill::Spill,
+    rows: usize,
+}
+
 /// One query's result. Batches are appended while the query streams.
 pub struct ResultSet {
     id: String,
@@ -254,23 +285,34 @@ impl ResultSet {
     /// there, and memory holds only a few pages. `sample` (the next rows)
     /// is tried first: when these rows can't be written as Parquet, or a
     /// write fails, nothing changes (the rows stay in memory) and the error
-    /// is returned.
+    /// is returned. [`Self::spill_start`], [`SpillStart::write`] and
+    /// [`Self::spill_adopt`] do the same with the writing outside the lock.
     pub fn spill_to(&mut self, dir: std::path::PathBuf, sample: &RecordBatch) -> Result<()> {
+        let Some(start) = self.spill_start()? else { return Ok(()) };
+        let ready = start.write(dir, sample)?;
+        self.spill_adopt(ready)
+    }
+
+    /// The rows so far, to write to disk without holding the result's lock
+    /// (None: already on disk). The batches are shared, not copied.
+    pub fn spill_start(&mut self) -> Result<Option<SpillStart>> {
         if self.spill.is_some() {
-            return Ok(());
+            return Ok(None);
         }
-        let probe = self.batches.first().unwrap_or(sample);
-        if !spill::can_write(probe) || !spill::can_write(sample) {
-            return Err(Error::Spill("these column types can't be written to disk".into()));
-        }
-        let mut sp = spill::Spill::create(dir, self.schema.clone())?;
-        // The narrow batches, not a combined one with 64-bit offsets; the
-        // in-memory rows are let go only once all of them are written.
+        // The narrow batches, not a combined one with 64-bit offsets.
         let batches =
             if self.combined.is_some() && self.batches.len() == 1 { self.view_batches(&ViewSpec::default(), spill::CHUNK_ROWS)? } else { self.batches.clone() };
-        for b in batches {
-            sp.push(b)?;
+        Ok(Some(SpillStart { schema: self.schema.clone(), batches, rows: self.total_rows }))
+    }
+
+    /// Move to the files [`SpillStart::write`] wrote: the in-memory rows are
+    /// let go. Refused (the files deleted, the rows kept in memory) when
+    /// rows were added in between or the result already moved.
+    pub fn spill_adopt(&mut self, ready: SpillReady) -> Result<()> {
+        if self.spill.is_some() || self.total_rows != ready.rows {
+            return Err(Error::Spill("the result changed while it was written to disk".into()));
         }
+        let sp = ready.spill;
         self.batches.clear();
         self.combined = None;
         self.view_cache = None;
@@ -804,6 +846,41 @@ mod spill_tests {
         assert!(!rs.is_on_disk());
         assert_eq!(rs.total_rows(), 40_000);
         assert_eq!(rs.view_slice(&ViewSpec::default(), 39_999, 5).unwrap().0.num_rows(), 1, "every row still there");
+    }
+
+    /// The first move to disk writes without the result's lock: readers see
+    /// the rows in memory until the files are in place; rows added in
+    /// between make the move refused (the files go, the rows stay).
+    #[test]
+    fn the_first_move_to_disk_writes_outside_the_lock() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let b = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from_iter_values(0..50_000))]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let rs = Arc::new(Mutex::new(ResultSet::new("r", schema)));
+        rs.lock().push(b.clone());
+        let start = rs.lock().spill_start().unwrap().unwrap();
+        let ready = std::thread::scope(|s| {
+            let writer = s.spawn(|| start.write(dir.path().join("r"), &b).unwrap());
+            // Meanwhile the result answers (its lock is free).
+            let g = rs.lock();
+            assert!(!g.is_on_disk() && g.total_rows() == 50_000);
+            drop(g);
+            writer.join().unwrap()
+        });
+        rs.lock().spill_adopt(ready).unwrap();
+        assert!(rs.lock().is_on_disk());
+        assert_eq!(rs.lock().total_rows(), 50_000);
+        assert_eq!(rs.lock().view_slice(&ViewSpec::default(), 49_999, 1).unwrap().0.num_rows(), 1);
+
+        // Rows added while it was written: refused, nothing lost.
+        let other = Arc::new(Mutex::new(ResultSet::new("o", b.schema())));
+        other.lock().push(b.slice(0, 1000));
+        let start = other.lock().spill_start().unwrap().unwrap();
+        let ready = start.write(dir.path().join("o"), &b).unwrap();
+        other.lock().push(b.slice(1000, 1000));
+        assert!(other.lock().spill_adopt(ready).is_err());
+        assert!(!other.lock().is_on_disk() && other.lock().total_rows() == 2000);
+        assert!(!dir.path().join("o").exists(), "its files are deleted");
     }
 
     /// A sort or filter of a result on disk applies to its first rows only

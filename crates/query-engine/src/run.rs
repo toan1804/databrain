@@ -343,8 +343,18 @@ impl QueryEngine {
         if self.disk_still_low().is_some() {
             return false;
         }
-        // Writes up to half the budget: not on an async worker's time.
-        blocking_io(|| rs.lock().spill_to(dir, sample).is_ok())
+        // Writes up to half the budget: not on an async worker's time, and
+        // not under the result's lock (the outputs list, the grid and
+        // `result_info` read it meanwhile). Only this run adds rows, so
+        // none come in between.
+        blocking_io(|| {
+            let start = match rs.lock().spill_start() {
+                Ok(Some(s)) => s,
+                Ok(None) => return true,
+                Err(_) => return false,
+            };
+            start.write(dir, sample).and_then(|ready| rs.lock().spill_adopt(ready)).is_ok()
+        })
     }
 
     /// The free disk space when the disk where results spill is low even
