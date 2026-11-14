@@ -368,6 +368,32 @@ fn transaction(dialect: ConnectorKind, plan: &[Act]) -> Option<Tx> {
             return None;
         }
     }
+    // MySQL also commits for statements that aren't DDL or transaction
+    // control (`SET PASSWORD`, `RESET …`, `LOAD INDEX INTO CACHE`, account
+    // statements): the before/after SQL may only read, change rows, or set
+    // harmless session values for the plan to run in one transaction.
+    if dialect == ConnectorKind::Mysql
+        && plan.iter().any(|a| match a {
+            Act::Sql { kind: ActKind::User, sql, .. } => {
+                // MySQL's implicit commits: DDL, account statements, admin
+                // statements (`ANALYZE TABLE`, `RESET`, `FLUSH`…), and of the
+                // ones classified otherwise `SET PASSWORD` (a session
+                // statement) and `LOAD INDEX INTO CACHE` (`LOAD` reads as
+                // DML for `LOAD DATA`).
+                let mut words = sql.split_whitespace().map(str::to_ascii_uppercase);
+                let two = (words.next().unwrap_or_default(), words.next().unwrap_or_default());
+                match classify(sql, dialect).kind {
+                    StatementKind::Read => false,
+                    StatementKind::Dml => two == ("LOAD".into(), "INDEX".into()),
+                    StatementKind::Session => two == ("SET".into(), "PASSWORD".into()),
+                    _ => true,
+                }
+            }
+            _ => false,
+        })
+    {
+        return None;
+    }
     Some(Tx { begin: t.begin, commit: t.commit, rollback: t.rollback })
 }
 
@@ -1452,6 +1478,18 @@ mod tests {
         assert!(transaction(ConnectorKind::Mysql, &[stage.clone(), ins.clone()]).is_some(), "temporary tables don't commit");
         assert!(transaction(ConnectorKind::Mysql, &[ddl, ins.clone()]).is_none());
         assert!(transaction(ConnectorKind::Mysql, &[user_ddl]).is_none());
+        // MySQL statements that commit without being DDL: no transaction
+        // (a dry run checks the plan instead of running it); reads, row
+        // changes and harmless session values keep it.
+        let user = |sql: &str| Act::Sql { label: String::new(), sql: sql.into(), kind: ActKind::User };
+        for sql in ["SET PASSWORD = 'x'", "RESET QUERY CACHE", "LOAD INDEX INTO CACHE t", "CREATE USER u", "GRANT SELECT ON t TO u", "ANALYZE TABLE t"] {
+            assert!(transaction(ConnectorKind::Mysql, &[user(sql), ins.clone()]).is_none(), "{sql}");
+        }
+        for sql in ["update t set a = 1 where id = 2", "select 1", "SET @batch = 1", "SET NAMES utf8mb4", "LOAD DATA LOCAL INFILE 'f' INTO TABLE t"] {
+            assert!(transaction(ConnectorKind::Mysql, &[user(sql), ins.clone()]).is_some(), "{sql}");
+        }
+        // Elsewhere those don't commit: the transaction stays.
+        assert!(transaction(ConnectorKind::Postgres, &[user("RESET search_path"), ins.clone()]).is_some());
         assert!(transaction(ConnectorKind::Oracle, std::slice::from_ref(&ins)).is_none());
         // Snowflake: an append runs in one; any DDL, a staging table too, commits.
         assert!(transaction(ConnectorKind::Snowflake, std::slice::from_ref(&ins)).is_some());
