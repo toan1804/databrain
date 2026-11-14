@@ -567,6 +567,10 @@ fn positional_secrets(lx: &Lexer) -> Vec<Span> {
     // The calls open at this point, the innermost last: a call in an
     // argument of another (`s3(url, id, aes_decrypt(c, 'key'))`) is read too.
     let mut open: Vec<Call> = Vec::new();
+    // How many of them are function calls (in parentheses): kept as a
+    // count, as a procedure name checks it each time (`sp_password` over
+    // and over on one line opens a call each).
+    let mut paren_calls = 0usize;
     let mut i = 0;
     while i < n {
         let t = lx.at(i);
@@ -585,11 +589,12 @@ fn positional_secrets(lx: &Lexer) -> Vec<Span> {
                     continue;
                 }
                 // A procedure is a statement of its own, never an argument.
-                if !parens && open.iter().any(|c| c.parens) {
+                if !parens && paren_calls > 0 {
                     continue;
                 }
                 if parens {
                     j += 1;
+                    paren_calls += 1;
                 }
                 open.push(Call { secret, min, parens, args: Vec::new(), start: j, depth: 0, named: false });
                 i = j;
@@ -598,11 +603,13 @@ fn positional_secrets(lx: &Lexer) -> Vec<Span> {
             // in them with it (only procedures are below a procedure).
             Kind::Space { newline: true } if open.first().is_some_and(|c| !c.parens) => {
                 while let Some(c) = open.pop() {
+                    paren_calls -= usize::from(c.parens);
                     close(c, t.start);
                 }
             }
             Kind::Other if lx.b[t.start] == b';' && open.first().is_some_and(|c| !c.parens) => {
                 while let Some(c) = open.pop() {
+                    paren_calls -= usize::from(c.parens);
                     close(c, t.start);
                 }
             }
@@ -611,7 +618,10 @@ fn positional_secrets(lx: &Lexer) -> Vec<Span> {
                 match lx.b[t.start] {
                     b'(' => c.depth += 1,
                     b')' if c.depth > 0 => c.depth -= 1,
-                    b')' if c.parens => close(open.pop().expect("checked"), t.start),
+                    b')' if c.parens => {
+                        paren_calls -= 1;
+                        close(open.pop().expect("checked"), t.start);
+                    }
                     b',' if c.depth == 0 => {
                         c.args.push((c.start, t.start));
                         c.start = t.end;
@@ -1474,5 +1484,10 @@ mod review_tests {
         let tags: String = (0..5_000).map(|i| format!("$t{i}$ ")).collect();
         let _ = redact_secrets(&tags);
         assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
+        // Procedure names over and over on one line: each opens a call
+        // (2.9 s at 40k in a release build when each looked through the others).
+        let t = std::time::Instant::now();
+        let _ = redact_secrets(&"sp_password ".repeat(40_000));
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
     }
 }
