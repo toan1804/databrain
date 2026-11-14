@@ -477,6 +477,14 @@ pub fn session_messages(state: &AppState, session_id: &str) -> Result<Vec<AiMess
     Ok(state.workspace.list_ai_messages(session_id)?)
 }
 
+/// A chat closed in the panel (still in history): its outputs stop being
+/// active, so the memory budget can free them; they stay listed.
+pub fn leave_session(state: &AppState, id: &str) {
+    for part in databrain_workspace::AiPart::ALL {
+        state.engine.leave_tab(&databrain_workspace::SessionRole::Ai { chat: id.to_string(), part }.key());
+    }
+}
+
 pub fn delete_session(state: &AppState, id: &str) -> Result<()> {
     // The chat's query tabs: their sessions and the outputs they kept active.
     for part in databrain_workspace::AiPart::ALL {

@@ -102,6 +102,12 @@ pub(crate) async fn ai_session_messages(state: State<'_, AppState>, session_id: 
 }
 
 #[tauri::command]
+pub(crate) async fn ai_leave_session(state: State<'_, AppState>, id: String) -> R<()> {
+    ai_api::leave_session(&state, &id);
+    Ok(())
+}
+
+#[tauri::command]
 pub(crate) async fn ai_delete_session(state: State<'_, AppState>, id: String) -> R<()> {
     ai_api::delete_session(&state, &id)
 }

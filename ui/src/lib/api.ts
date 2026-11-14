@@ -438,6 +438,8 @@ export const api = {
   aiSessions: (connectionId: string | null) => call<AiSessionRecord[]>("ai_sessions", { connectionId }),
   aiSessionMessages: (sessionId: string) => call<AiMessageRecord[]>("ai_session_messages", { sessionId }),
   aiDeleteSession: (id: string) => call<void>("ai_delete_session", { id }),
+  /** A chat closed in the panel (kept in history): its outputs may be freed for memory. */
+  aiLeaveSession: (id: string) => call<void>("ai_leave_session", { id }),
   aiAudit: () => call<AuditEntry[]>("ai_audit"),
   mcpConfig: () => call<unknown>("mcp_config"),
 

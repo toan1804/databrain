@@ -454,6 +454,14 @@ impl OutputRegistry {
         }
     }
 
+    /// Nobody looks at `tab` any more but it isn't closed (an assistant
+    /// chat closed in the panel, still in history): its outputs become
+    /// recent, as after a new run (evictable; kept ones stay active), and
+    /// stay listed.
+    pub fn leave_tab(&self, tab: &str) {
+        self.begin_run(tab);
+    }
+
     /// Keep an output in its tab's results across runs, or let go of it.
     /// A kept output is active: never freed for the memory budget, and
     /// saved with the tab's results on quit.
@@ -1033,6 +1041,25 @@ pub(crate) mod tests {
         r.set_kept(&k.handle, true).unwrap();
         r.close_tab("t");
         assert_eq!(r.get(&k.handle).unwrap().state, OutputState::Evicted);
+    }
+
+    /// A chat closed in the panel: its outputs stop being active (the
+    /// budget may free them) but stay listed; a kept one stays active.
+    #[test]
+    fn a_left_tab_lets_its_outputs_go_to_the_budget() {
+        let r = reg();
+        // 17.6 MB each: two pass the 16 MB budget floor.
+        let a = add(&r, "ai:s1", 2_200_000);
+        let kept = add(&r, "ai:s1", 2_200_000);
+        r.set_kept(&kept.handle, true).unwrap();
+        r.set_budget(1);
+        assert_eq!(r.get(&a.handle).unwrap().state, OutputState::Live, "active: never freed");
+        r.leave_tab("ai:s1");
+        r.enforce_budget();
+        let a = r.get(&a.handle).unwrap();
+        assert!(!a.active && a.state == OutputState::Evicted, "{a:?}");
+        let kept = r.get(&kept.handle).unwrap();
+        assert!(kept.active && kept.state == OutputState::Live, "{kept:?}");
     }
 
     /// A deleted history entry's result goes with its output, unless the

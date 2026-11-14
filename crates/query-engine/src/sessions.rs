@@ -437,6 +437,14 @@ impl QueryEngine {
         }
     }
 
+    /// Nobody looks at `tab` any more, but it isn't closed (see
+    /// [`OutputRegistry::leave_tab`]): its outputs may be freed for memory.
+    /// Its sessions close when idle.
+    pub fn leave_tab(&self, tab_id: &str) {
+        self.outputs.leave_tab(tab_id);
+        self.outputs_changed();
+    }
+
     /// Close the database sessions of a run key (keeps its outputs).
     pub fn release_sessions(&self, tab: &str) {
         self.drop_sessions(|(_, t), _| t == tab);

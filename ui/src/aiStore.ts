@@ -910,6 +910,8 @@ export const useAi = create<AiState>((set, get) => {
       const c = chat(id);
       if (!c) return;
       if (c.runId) void api.aiCancel(c.runId).catch(() => {});
+      // Its results stop being shown: the memory budget may free them.
+      if (c.sessionId) void api.aiLeaveSession(c.sessionId).catch(() => {});
       // Nobody will answer its open requests: decline them now.
       for (const i of c.items) {
         if (i.kind === "approval" && i.state === "pending") void api.aiRespond(i.requestId, { approved: false }).catch(() => {});
