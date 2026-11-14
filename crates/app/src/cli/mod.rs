@@ -35,6 +35,14 @@ pub fn mode(args: Vec<OsString>) -> Mode {
     }
 }
 
+/// The runtime of a command-line mode. Multi-thread, like the app's
+/// (Tauri's): the query engine's `blocking` hands a worker thread over
+/// for workspace and file writes only on a multi-thread runtime; on a
+/// current-thread one they'd stall every other task.
+pub(crate) fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()
+}
+
 /// Run a command-line mode; `None` when the app should open.
 pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
     match mode(args) {

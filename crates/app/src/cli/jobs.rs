@@ -38,7 +38,7 @@ pub fn main(args: Vec<String>) -> ExitCode {
     unsafe {
         windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
     }
-    match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    match super::runtime() {
         Ok(rt) => rt.block_on(run(args)),
         Err(e) => {
             eprintln!("databrain-jobs: {e}");

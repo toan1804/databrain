@@ -131,8 +131,10 @@ pub struct TestResult {
 
 /// Run blocking work (file and workspace writes) from async code without
 /// stalling the other tasks of a worker thread: on a multi-thread runtime
-/// the thread is handed over while `f` runs; elsewhere (tests, no runtime)
-/// `f` just runs.
+/// the thread is handed over while `f` runs; elsewhere `f` just runs.
+/// Every runtime DataBrain runs on is multi-thread (the app's, Tauri's;
+/// the MCP server's and the jobs runner's, `cli::runtime` in the app
+/// crate); a current-thread one is only a test's (`#[tokio::test]`).
 pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),

@@ -10,9 +10,7 @@ Found in reviews and left for a later release on purpose. Each says what goes wr
 
 ## Query engine (review of 2026-11-12; see [QUERY_ENGINE.md](QUERY_ENGINE.md))
 
-The review's findings are fixed (loads can't control their transaction and ask on production connections, a run's job guard, one transaction dialect with a savepoint for grid edits, session claims for plans, edits, Commit/Rollback and exports, a memory cap per result, outputs freed with their rows, and the low items). Left, as refactors:
-
-- `blocking()` (`lib.rs`) hands the worker thread over only on a multi-thread runtime; on a current-thread one the workspace and file writes still block it.
+The review's findings and its refactors are done (one guarded entry point, `outputs/` split, typed session roles, AI chats' outputs released when closed, `blocking()` on multi-thread runtimes only).
 
 Left from the final review (2026-11-13):
 
