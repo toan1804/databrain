@@ -204,11 +204,14 @@ impl QueryEngine {
         self.with_meta(connection_id, |s| async move { s.schema_object_counts().await }).await
     }
 
-    pub async fn schema_columns(&self, connection_id: &str, schema: &str) -> Result<Vec<databrain_connector_core::TableColumns>> {
+    /// Columns of every table of a schema, and whether the read covered
+    /// foreign keys ([`Session::schema_columns_read_keys`]): then a table
+    /// without keys has none.
+    pub async fn schema_columns(&self, connection_id: &str, schema: &str) -> Result<(Vec<databrain_connector_core::TableColumns>, bool)> {
         let schema = schema.to_string();
         self.with_meta(connection_id, |s| {
             let schema = schema.clone();
-            async move { s.schema_columns(&schema).await }
+            async move { Ok((s.schema_columns(&schema).await?, s.schema_columns_read_keys())) }
         })
         .await
     }

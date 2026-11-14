@@ -577,14 +577,16 @@ impl Workspace {
     }
 
     /// Every table of a schema as read from the server (the ER diagram), in
-    /// one transaction. An empty foreign key list keeps the keys cached
-    /// before: a bulk read may leave them out.
-    pub fn meta_put_schema_tables(&self, connection_id: &str, schema: &str, tables: &[TableColumns]) -> Result<()> {
+    /// one transaction. `keys_read`: the read covered foreign keys, so a
+    /// table's list replaces the cached one, an empty one too (a key
+    /// dropped on the server goes). Otherwise an empty list keeps the keys
+    /// cached before: that read leaves them out.
+    pub fn meta_put_schema_tables(&self, connection_id: &str, schema: &str, tables: &[TableColumns], keys_read: bool) -> Result<()> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         let now = now_ms();
         for t in tables {
-            let fks = (!t.foreign_keys.is_empty()).then(|| serde_json::to_string(&t.foreign_keys).unwrap_or_else(|_| "[]".into()));
+            let fks = (keys_read || !t.foreign_keys.is_empty()).then(|| serde_json::to_string(&t.foreign_keys).unwrap_or_else(|_| "[]".into()));
             tx.execute(
                 "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, seen_at = excluded.seen_at, \
@@ -871,14 +873,18 @@ mod tests {
             foreign_keys: fks,
         };
         assert_eq!(ws.meta_schema_tables("c", "s").unwrap(), (vec![], false), "nothing cached");
-        ws.meta_put_schema_tables("c", "s", &[t("orders", &["id", "customer_id"], vec![fk.clone()]), t("customers", &["id"], vec![])]).unwrap();
+        ws.meta_put_schema_tables("c", "s", &[t("orders", &["id", "customer_id"], vec![fk.clone()]), t("customers", &["id"], vec![])], true).unwrap();
         let (tables, _) = ws.meta_schema_tables("c", "s").unwrap();
         assert_eq!(tables, vec![t("customers", &["id"], vec![]), t("orders", &["id", "customer_id"], vec![fk.clone()])]);
         assert!(ws.meta_schema_tables("c", "other").unwrap().0.is_empty() && ws.meta_schema_tables("d", "s").unwrap().0.is_empty());
-        // A later read without keys (a bulk read) keeps them; new columns replace the old.
-        ws.meta_put_schema_tables("c", "s", &[t("orders", &["id", "customer_id", "total"], vec![])]).unwrap();
+        // A later read that leaves keys out (Snowflake, Databricks) keeps them; new columns replace the old.
+        ws.meta_put_schema_tables("c", "s", &[t("orders", &["id", "customer_id", "total"], vec![])], false).unwrap();
         let (tables, _) = ws.meta_schema_tables("c", "s").unwrap();
-        assert_eq!(tables[1], t("orders", &["id", "customer_id", "total"], vec![fk]));
+        assert_eq!(tables[1], t("orders", &["id", "customer_id", "total"], vec![fk.clone()]));
+        // One that reads keys and finds none: the key was dropped on the server.
+        ws.meta_put_schema_tables("c", "s", &[t("orders", &["id", "customer_id", "total"], vec![])], true).unwrap();
+        let (tables, _) = ws.meta_schema_tables("c", "s").unwrap();
+        assert_eq!(tables[1], t("orders", &["id", "customer_id", "total"], vec![]), "dropped key gone");
         // What a describe cached is there too.
         ws.meta_put_columns("c", "s", "items", &[col("id")]).unwrap();
         assert_eq!(ws.meta_schema_tables("c", "s").unwrap().0.iter().map(|t| t.table.as_str()).collect::<Vec<_>>(), vec!["customers", "items", "orders"]);

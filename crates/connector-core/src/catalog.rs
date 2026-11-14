@@ -135,9 +135,8 @@ pub async fn default_bulk_metadata<S: Session + ?Sized>(s: &S, schemas: &[String
                     Ok(c) => (c, None),
                     Err(e) => (vec![], Some(e.message)),
                 };
-                // `schema_columns` describes (keys included) unless the
-                // engine reads columns its own way; those have no keys.
-                SchemaMetadata { schema: sc.clone(), objects, columns, error, foreign_keys_read: true }
+                let foreign_keys_read = s.schema_columns_read_keys();
+                SchemaMetadata { schema: sc.clone(), objects, columns, error, foreign_keys_read }
             }
             Err(e) => SchemaMetadata { schema: sc.clone(), objects: vec![], columns: vec![], error: Some(e.message), foreign_keys_read: false },
         });

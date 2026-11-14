@@ -290,6 +290,10 @@ impl Session for DbxSession {
         self.0.schema_columns_filtered(schema, None).await
     }
 
+    fn schema_columns_read_keys(&self) -> bool {
+        false
+    }
+
     /// Two queries per catalog (tables + columns from the catalog's
     /// information schema) instead of two per schema.
     async fn bulk_metadata(&self, schemas: &[String]) -> Result<Vec<SchemaMetadata>> {

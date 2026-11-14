@@ -401,10 +401,10 @@ pub struct SchemaTables {
 /// read, the cached tables (and why), so the diagram works offline.
 pub async fn schema_tables(state: &AppState, id: &str, schema: &str) -> Result<SchemaTables> {
     match state.engine.schema_columns(id, schema).await {
-        Ok(mut tables) => {
+        Ok((mut tables, keys_read)) => {
             tables.sort_by(|a, b| a.table.cmp(&b.table));
             let (ws, id2, s2, t2) = (state.workspace.clone(), id.to_string(), schema.to_string(), tables.clone());
-            state.meta.push_blocking(move || drop(ws.meta_put_schema_tables(&id2, &s2, &t2)));
+            state.meta.push_blocking(move || drop(ws.meta_put_schema_tables(&id2, &s2, &t2, keys_read)));
             Ok(SchemaTables { tables, offline: None, stale: false })
         }
         Err(e) => {

@@ -843,6 +843,10 @@ impl Session for SfSession {
         self.columns(schema, None).await
     }
 
+    fn schema_columns_read_keys(&self) -> bool {
+        false
+    }
+
     /// HASH_AGG of table and column definitions per schema, one query per
     /// database (LAST_ALTERED is not used: data loads change it too).
     /// Tables, columns, functions, procedures and sequences per schema.

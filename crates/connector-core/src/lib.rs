@@ -269,6 +269,14 @@ pub trait Session: Send + Sync {
         }
         Ok(out)
     }
+
+    /// Whether [`Self::schema_columns`] reads foreign keys: then a table it
+    /// returns without keys has none (a key dropped on the server leaves the
+    /// cache). The default describes each table, keys included; override
+    /// with `false` when the engine's own column read leaves them out.
+    fn schema_columns_read_keys(&self) -> bool {
+        true
+    }
 }
 
 /// Connectors available in this build (populated by the app based on
