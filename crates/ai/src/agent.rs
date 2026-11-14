@@ -533,6 +533,17 @@ impl Agent {
                 updated_at: 0,
             })?,
         };
+        // A conversation begun on another connection (the chat follows the
+        // tab in front): its history holds that connection's schema and
+        // results, which go only to a provider that connection allows.
+        if let Some(began) = session.connection_id.as_deref().filter(|c| *c != profile.id).and_then(|c| ws.get_connection(c).ok())
+            && !crate::policy::provider_allowed(&began.ai_policy, Some(&rec.id))
+        {
+            return Err(AiError::Policy(format!(
+                "this conversation began on \"{}\", which doesn't allow the provider \"{}\": start a new conversation for \"{}\"",
+                began.name, rec.name, profile.name
+            )));
+        }
         let sid = session.id.clone();
         sink.emit(AgentEvent::Started { session_id: sid.clone(), run_id: run_id.clone() });
 

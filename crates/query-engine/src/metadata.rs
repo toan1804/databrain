@@ -58,6 +58,32 @@ impl QueryEngine {
         }
     }
 
+    /// Where an unqualified table name resolves on this connection right
+    /// now, outermost first (database or catalog, then schema, as far as
+    /// the engine has them): asked of the server, since a role's
+    /// `search_path` or default schema may not be the engine's usual one.
+    /// `None` for engines not asked (their default is fixed or unknown).
+    /// At most 10 s.
+    pub async fn default_namespace(&self, connection_id: &str) -> Result<Option<Vec<Option<String>>>> {
+        use databrain_connector_core::ConnectorKind as K;
+        let sql = match self.workspace.get_connection(connection_id)?.config.kind {
+            K::Postgres | K::Snowflake => "select current_database(), current_schema()",
+            K::Mssql => "select db_name(), schema_name()",
+            K::Databricks => "select current_catalog(), current_schema()",
+            K::Mysql => "select database()",
+            K::Clickhouse => "select currentDatabase()",
+            K::Oracle => "select sys_context('userenv', 'current_schema') from dual",
+            _ => return Ok(None),
+        };
+        let read = self.with_meta(connection_id, |s| async move {
+            databrain_connector_core::query_table(s.as_ref(), databrain_connector_core::Statement::internal(sql)).await
+        });
+        match tokio::time::timeout(Duration::from_secs(10), read).await {
+            Ok(r) => Ok(r?.1.into_iter().next().map(|row| row.into_iter().map(|v| v.filter(|v| !v.trim().is_empty())).collect())),
+            Err(_) => Err(EngineError::new("timeout", "The database took more than 10 s to say its current schema")),
+        }
+    }
+
     pub async fn explorer_fingerprints(&self, connection_id: &str) -> Result<Option<HashMap<String, String>>> {
         self.with_meta(connection_id, |s| async move { s.explorer_fingerprints().await }).await
     }

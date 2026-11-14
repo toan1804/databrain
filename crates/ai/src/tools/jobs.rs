@@ -65,6 +65,24 @@ impl ToolContext {
         Ok(out(text, json!({"job_id": job.id, "name": job.name})))
     }
 
+    /// The current schema of each connection the job's steps run on, for the
+    /// table rules ([`crate::access::learn_defaults`]).
+    async fn learn_job_defaults(&self, job: &databrain_workspace::Job) {
+        let mut ids: Vec<String> = Vec::new();
+        for n in &job.nodes {
+            for c in [&n.connection_id, &n.target_connection_id].into_iter().flatten() {
+                if !c.is_empty() && !ids.contains(c) {
+                    ids.push(c.clone());
+                }
+            }
+        }
+        for id in ids {
+            if let Ok(p) = self.engine.workspace().get_connection(&id) {
+                crate::access::learn_defaults(&self.engine, &p).await;
+            }
+        }
+    }
+
     /// [`crate::jobs::review`] as a decision: `Confirm` when only the user
     /// may approve (see there), else `ask`.
     pub(super) fn review_job(&self, job: &databrain_workspace::Job, only: &[String], ask: &str) -> Result<Decision> {
@@ -90,6 +108,7 @@ impl ToolContext {
             only_ids.push(n.id.clone());
         }
         let scope = if want.is_empty() { "all steps".to_string() } else { format!("steps {}", want.join(", ")) };
+        self.learn_job_defaults(&job).await;
         let decision = self.review_job(&job, &only_ids, "Run a job")?;
         // What a run changes: loads write tables, exports write files.
         let writes: Vec<String> = job
@@ -166,6 +185,7 @@ impl ToolContext {
         let refs = self.conn_refs()?;
         let (mut job, notes) = crate::jobs::merge_job(&old, args, &refs, &taken)?;
         crate::jobs::mark_ai_sql(&mut job, Some(&old));
+        self.learn_job_defaults(&job).await;
         let decision = self.review_job(&job, &[], "Change a job")?;
         let changes = crate::jobs::changes(&old, &job);
         if changes.is_empty() {
@@ -191,6 +211,7 @@ impl ToolContext {
         let refs = self.conn_refs()?;
         let (mut job, notes) = crate::jobs::build_job(args, &refs, &taken)?;
         crate::jobs::mark_ai_sql(&mut job, None);
+        self.learn_job_defaults(&job).await;
         let decision = self.review_job(&job, &[], "Create a job")?;
         let preview = crate::jobs::describe(&job, &refs);
         self.gate("create_job", decision, &format!("\"{}\" with {} steps", job.name, job.nodes.len()), &json!({"preview": preview, "name": job.name})).await?;

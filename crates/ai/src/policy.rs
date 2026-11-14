@@ -255,6 +255,15 @@ pub fn is_pii(policy: &AiPolicy, table: Option<&str>, column: &str) -> bool {
     })
 }
 
+/// Columns to mask when nothing says which table they come from (a result
+/// with no SQL to trace): one named like any rule's column, with or
+/// without a table in the rule (`users.email` masks `email`: it may be
+/// that table's; fail closed).
+pub fn masked_by_name(policy: &AiPolicy, columns: &[String]) -> Vec<bool> {
+    let rules: Vec<String> = policy.pii_columns.iter().filter_map(|p| name_parts(p).pop()).collect();
+    columns.iter().map(|c| rules.contains(&unquote(c))).collect()
+}
+
 /// The parts of a dotted name, unquoted and lower-cased (`"Public".users` → `public`, `users`).
 pub fn name_parts(name: &str) -> Vec<String> {
     name.split('.').map(unquote).filter(|p| !p.is_empty()).collect()
@@ -537,6 +546,16 @@ mod tests {
         assert!(is_pii(&p, Some("public.users"), "EMAIL"));
         assert!(!is_pii(&p, Some("orders"), "email"));
         assert!(is_pii(&p, None, "ssn"));
+    }
+
+    #[test]
+    fn columns_of_an_unknown_table_are_masked_by_name() {
+        let p = AiPolicy { pii_columns: vec!["users.email".into(), "crm.public.leads.phone".into(), "ssn".into()], ..Default::default() };
+        let cols: Vec<String> = ["id", "Email", "\"phone\"", "ssn", "name", "emails"].iter().map(|c| c.to_string()).collect();
+        assert_eq!(masked_by_name(&p, &cols), [false, true, true, true, false, false]);
+        // With the table unknown, `is_pii` alone leaves a rule with a table unmatched.
+        assert!(!is_pii(&p, None, "email"));
+        assert_eq!(masked_by_name(&AiPolicy::default(), &cols), [false; 6], "no rules: nothing masked");
     }
 
     #[test]

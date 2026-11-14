@@ -26,6 +26,8 @@ impl ToolContext {
             self.check_output_sources(&sql)?;
         }
         let purpose = args.get("purpose").and_then(|p| p.as_str()).unwrap_or("");
+        // Table rules complete unqualified names with the server's current schema.
+        crate::access::learn_defaults(&self.engine, &target).await;
         let review = policy::review_sql(&target, &sql);
         let on = if target.id == self.profile.id { String::new() } else { format!(" (on \"{}\")", target.name) };
         let approved = self
@@ -191,8 +193,8 @@ impl ToolContext {
     /// `SELECT *`, and outputs combined on DuckDB through their inputs).
     pub(super) fn pii_mask(&self, result_id: &str, columns: &[String], depth: usize) -> Vec<bool> {
         let Some(o) = self.engine.outputs().by_result(result_id) else {
-            // Not an output (no SQL to trace): by name, on this connection's rules.
-            return columns.iter().map(|c| is_pii(self.policy(), None, c)).collect();
+            // Not an output: no SQL to trace and no table to match a rule against.
+            return policy::masked_by_name(self.policy(), columns);
         };
         let src = if o.connection_id == self.profile.id { Ok(self.profile.clone()) } else { self.engine.workspace().get_connection(&o.connection_id) };
         let Ok(src) = src else { return vec![true; columns.len()] };

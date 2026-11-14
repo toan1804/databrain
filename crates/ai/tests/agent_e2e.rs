@@ -1851,4 +1851,31 @@ async fn a_connections_rules_hold_wherever_it_is_reached_from() {
     // Notes: a long one is refused; one the assistant wrote is marked as its own when given back.
     let o = c.call("add_knowledge_note", &json!({"note": "x".repeat(601)})).await.content;
     assert!(o.starts_with("ERROR") && o.contains("601 characters"), "{o}");
+
+    // A conversation begun on a connection that only allows another
+    // provider can't be continued here: its history would go to this one.
+    let session = |conn: &str| {
+        f.ws.save_ai_session(databrain_workspace::AiSessionRecord {
+            id: String::new(),
+            title: "t".into(),
+            connection_id: Some(conn.into()),
+            provider_id: None,
+            model: None,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap()
+        .id
+    };
+    let local_only = f.ws.list_connections().unwrap().into_iter().find(|p| p.name == "Local only").unwrap().id;
+    let agent = Agent { engine: f.engine.clone(), hub: f.hub.clone(), secrets: f.secrets.clone(), max_steps: 2 };
+    let turn = |sid: String| {
+        let r = AgentRequest { session_id: Some(sid), ..req(&f) };
+        agent.run(r, "run".into(), yes(), Arc::new(Events::default()), Default::default())
+    };
+    let e = turn(session(&local_only)).await.unwrap_err().to_string();
+    assert!(e.contains("began on \"Local only\""), "{e}");
+    // One begun on a connection without such a list goes on (to the provider: nothing listens on the fixture's port).
+    let e = turn(session(&copy.id)).await.unwrap_err().to_string();
+    assert!(!e.contains("began on"), "{e}");
 }
