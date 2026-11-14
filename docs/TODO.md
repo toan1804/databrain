@@ -14,7 +14,6 @@ The review's findings and its refactors are done (one guarded entry point, `outp
 
 Left from the final review (2026-11-13):
 
-- Implicit transactions (SQL Server `IMPLICIT_TRANSACTIONS ON`, Snowflake `AUTOCOMMIT = FALSE`) keep the session (`TxState::Unknown`) but don't show Commit/Rollback or warn on closing the tab (`QueryEngine::in_transaction` counts `Open` only). Not followed: `SET ANSI_DEFAULTS ON`, `autocommit = 'false'` written as a string. A one-batch `begin tran … commit` on SQL Server stays "open" (conservative). With implicit transactions on, manual commit's own `BEGIN` may nest on SQL Server.
 - Job steps: a DuckDB Query step reading a tab's row-limited `results.x` on purpose now fails before it runs (it would pass part of the rows on); say so in the job editor.
 - `loadResultAsking`: when the server asks (the UI didn't know the connection is production), progress and Stop already show during the prompt.
 

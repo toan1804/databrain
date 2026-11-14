@@ -381,11 +381,10 @@ impl QueryEngine {
             s = self.session_for(&req.connection_id, req.session_key(), req.origin) => s?,
             _ = cancel.cancelled() => return Err(databrain_connector_core::ConnectorError::cancelled().into()),
         };
-        // Unknown: BEGIN anyway; "already in a transaction" from the server
-        // is better than a write that commits on its own in manual mode.
-        if session.transaction_state() != TxState::Open {
-            session.execute(begin, ExecOptions::default()).await?.collect().await?;
+        if !needs_begin(kind, session.transaction_state()) {
+            return Ok(());
         }
+        session.execute(begin, ExecOptions::default()).await?.collect().await?;
         Ok(())
     }
 
@@ -451,6 +450,21 @@ impl QueryEngine {
     }
 }
 
+/// Manual commit opens a transaction before a write unless one is open.
+/// `Unknown` from SQL Server and Snowflake means writes open one by
+/// themselves (implicit transactions, autocommit off): no BEGIN, which
+/// would nest on SQL Server (one COMMIT wouldn't end it). From others,
+/// BEGIN anyway: "already in a transaction" from the server is better than
+/// a write that commits on its own in manual mode.
+fn needs_begin(kind: databrain_connector_core::ConnectorKind, state: TxState) -> bool {
+    use databrain_connector_core::ConnectorKind as K;
+    match state {
+        TxState::Open => false,
+        TxState::Unknown => !matches!(kind, K::Mssql | K::Snowflake),
+        TxState::None => true,
+    }
+}
+
 /// `m` minutes; a huge setting means "practically never", not an overflow.
 fn minutes(m: u64) -> Duration {
     Duration::from_secs(m.saturating_mul(60))
@@ -509,6 +523,17 @@ impl Drop for Claim<'_> {
 #[cfg(test)]
 mod minutes_tests {
     use super::*;
+
+    #[test]
+    fn manual_commit_begins_unless_writes_open_a_transaction_themselves() {
+        use databrain_connector_core::ConnectorKind::*;
+        assert!(needs_begin(Mssql, TxState::None) && needs_begin(Postgres, TxState::None));
+        assert!(!needs_begin(Mssql, TxState::Open) && !needs_begin(Postgres, TxState::Open));
+        // Implicit transactions: the write opens one; BEGIN would nest.
+        assert!(!needs_begin(Mssql, TxState::Unknown) && !needs_begin(Snowflake, TxState::Unknown));
+        // A connector that can't tell: BEGIN anyway.
+        assert!(needs_begin(Sqlite, TxState::Unknown) && needs_begin(Oracle, TxState::Unknown));
+    }
 
     #[test]
     fn huge_idle_minutes_dont_overflow() {

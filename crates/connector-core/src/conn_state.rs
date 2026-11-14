@@ -103,15 +103,33 @@ impl ConnState {
         if matches!(kw.as_str(), "COMMIT" | "ROLLBACK") && code.windows(2).any(|w| w[0] == "AND" && w[1] == "CHAIN") {
             let _ = self.tx_depth.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
         }
-        // Implicit transactions on or off.
-        for (i, w) in code.iter().enumerate() {
-            if w == "IMPLICIT_TRANSACTIONS" || w == "AUTOCOMMIT" {
-                match code.get(i + 1).map(String::as_str) {
-                    Some("ON" | "TRUE" | "1") => self.implicit.store(w == "IMPLICIT_TRANSACTIONS", Ordering::SeqCst),
-                    Some("OFF" | "FALSE" | "0") => self.implicit.store(w == "AUTOCOMMIT", Ordering::SeqCst),
-                    _ => {}
-                }
+        // Implicit transactions on or off: SQL Server's
+        // `IMPLICIT_TRANSACTIONS` (also through `ANSI_DEFAULTS`), autocommit
+        // elsewhere. The value may be quoted (`autocommit = 'false'`), so
+        // it's read from the text with quotes as spaces.
+        let unquoted: Vec<String> = words(&sql.replace(['\'', '"'], " ")).map(str::to_ascii_uppercase).collect();
+        for (i, w) in unquoted.iter().enumerate() {
+            let setting = match w.as_str() {
+                "IMPLICIT_TRANSACTIONS" => true,
+                "ANSI_DEFAULTS" if mssql => true,
+                "AUTOCOMMIT" => false,
+                _ => continue,
+            };
+            // Only as a setting: `SET x ON`, `x = FALSE`, `SET x TO 0`.
+            let value = unquoted[i + 1..].iter().find(|v| !matches!(v.as_str(), "TO")).map(String::as_str);
+            match value {
+                Some("ON" | "TRUE" | "1") => self.implicit.store(setting, Ordering::SeqCst),
+                Some("OFF" | "FALSE" | "0") => self.implicit.store(!setting, Ordering::SeqCst),
+                _ => {}
             }
+        }
+        // While writes open a transaction by themselves, a write did:
+        // one is open until COMMIT or ROLLBACK (Commit and Rollback show).
+        // SQL Server's DDL too (Snowflake's commits).
+        let write = matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+            || (mssql && matches!(kw.as_str(), "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "GRANT" | "REVOKE"));
+        if write && self.implicit.load(Ordering::SeqCst) {
+            let _ = self.tx_depth.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
         }
         // Snowflake's session parameters (`ALTER SESSION SET …`).
         if kw == "ALTER" && code.get(1).map(String::as_str) == Some("SESSION") {
@@ -135,9 +153,10 @@ impl ConnState {
     }
 
     /// What a session reports: `Unknown` while writes open transactions by
-    /// themselves and none is known to be open: the session is kept (idle
-    /// close, the row-limit replace), as if one were. The UI's Commit and
-    /// Rollback show for `Open` only.
+    /// themselves and none is known to be open (a read may have opened one
+    /// on SQL Server): the session is kept (idle close, the row-limit
+    /// replace), as if one were. A write in that mode opened one: `Open`,
+    /// so the UI's Commit and Rollback show (they show for `Open` only).
     pub fn tx_state(&self) -> TxState {
         if self.in_transaction() {
             TxState::Open
@@ -299,9 +318,27 @@ mod tests {
             }
             (s.tx_state(), s.replaceable())
         };
-        assert_eq!(state(Mssql, &["set implicit_transactions on", "insert into t values (1)"]), (TxState::Unknown, false));
+        // On, before a write: one may be open (a SELECT opens one on SQL Server).
+        assert_eq!(state(Mssql, &["set implicit_transactions on"]), (TxState::Unknown, false));
+        assert_eq!(state(Mssql, &["set implicit_transactions on", "select * from t"]).0, TxState::Unknown);
+        // A write opened one: open until it ends.
+        assert_eq!(state(Mssql, &["set implicit_transactions on", "insert into t values (1)"]), (TxState::Open, false));
+        assert_eq!(state(Mssql, &["set implicit_transactions on", "update t set a = 1", "commit"]).0, TxState::Unknown);
+        assert_eq!(state(Mssql, &["set implicit_transactions on", "create table x (a int)", "rollback"]).0, TxState::Unknown);
+        assert_eq!(state(Snowflake, &["alter session set autocommit = false", "delete from t where a = 1"]).0, TxState::Open);
+        assert_eq!(state(Snowflake, &["alter session set autocommit = false", "create table x (a int)"]).0, TxState::Unknown, "Snowflake DDL commits");
+        // Off: writes commit by themselves.
+        assert_eq!(state(Mssql, &["insert into t values (1)"]).0, TxState::None);
+        assert_eq!(state(Snowflake, &["alter session set autocommit = true", "insert into t values (1)"]).0, TxState::None);
+        // ANSI_DEFAULTS turns it on and off on SQL Server; quoted values count.
+        assert_eq!(state(Mssql, &["set ansi_defaults on", "insert into t values (1)"]).0, TxState::Open);
+        assert_eq!(state(Mssql, &["set ansi_defaults on", "set ansi_defaults off", "insert into t values (1)"]).0, TxState::None);
+        assert_eq!(state(Snowflake, &["alter session set autocommit = 'false'"]).0, TxState::Unknown);
+        assert_eq!(state(Snowflake, &["alter session set autocommit = 'false'", "alter session set autocommit = 'true'"]).0, TxState::None);
+        // The word in a query isn't a setting.
+        assert_eq!(state(Snowflake, &["select autocommit from settings"]).0, TxState::None);
         assert_eq!(state(Mssql, &["set implicit_transactions on", "set implicit_transactions off"]).0, TxState::None);
-        assert_eq!(state(Snowflake, &["alter session set autocommit = false", "insert into t values (1)"]), (TxState::Unknown, false));
+        assert_eq!(state(Snowflake, &["alter session set autocommit = false", "insert into t values (1)"]), (TxState::Open, false));
         assert_eq!(state(Snowflake, &["alter session set autocommit = false", "alter session set autocommit = true"]).0, TxState::None);
         assert!(!state(Snowflake, &["alter session set timezone = 'UTC'"]).1, "a session parameter is session state");
         assert_eq!(state(Mssql, &["set implicit_transactions on", "begin tran"]).0, TxState::Open);
