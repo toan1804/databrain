@@ -64,7 +64,7 @@ expand table ──► loadColumns
 
 ## Detecting stale entries
 
-- **Fingerprints** (`Session::explorer_fingerprints`, `None` when an engine has none): one catalog query, one opaque value per schema. Equal to `listed_fp` means the cached listing is right and nothing is read.
+- **Fingerprints** (`Session::explorer_fingerprints`, `None` when an engine has none): one catalog query, one opaque value per schema. Equal to `listed_fp` means the cached listing is right and nothing is read. Postgres counts row estimates coarsely (power of two of `reltuples`): when a table's estimate doubles or halves the fingerprint moves while no object version does, and `refresh_schema_at` lists the schema once for the estimates (columns stay fresh); the AI index re-reads it on its next run. Refresh does the same listing.
 - **Object versions** (`Session::object_versions`): one value per object (`kind:name`). `refresh_schema_at` compares them to `meta_objects.version`, fetches only new or changed objects with `list_objects_named` (500 names per call), deletes gone ones and marks the changed tables' columns stale (`meta_apply_changes`). Above 30 % changed and more than 20 objects (`FULL_RELIST_SHARE`) one full listing is cheaper.
 - **No versions:** a changed schema is listed again (`meta_put_listing`) and every table's columns become stale, unless the fingerprint is unchanged.
 - **`stale` on columns** means "show, but describe again when online". It is set only by the listing paths above (`columns_changed`), and cleared by any describe that writes the cache (`api::describe`, grid edits in `query-engine/src/edit.rs`).
@@ -102,7 +102,7 @@ expand table ──► loadColumns
 | Grid edits (`crates/query-engine/src/edit.rs`) | `meta_object` and non-stale `meta_columns`, else a describe that it writes back |
 | Test data (`crates/query-engine/src/testdata.rs`) | `cached_test_data_plan` → `meta_table` (columns and foreign keys), shown until the live `test_data_plan` answers |
 | AI note targets, `resolve_table` (`crates/ai/src/knowledge.rs`) | `meta_resolve_path`, `meta_get` before the server |
-| ER diagram (`ErTab.tsx` → `schema_tables`) | nothing: always live (`Session::schema_columns`), not cached |
+| ER diagram (`ErTab.tsx` → `schema_tables`) | read live (`Session::schema_columns`) and saved (`meta_put_schema_tables`: an empty foreign key list keeps the keys known); when the server can't be read, the cached tables of the schema (`meta_schema_tables`) with `offline` saying why (a note in the tab) |
 
 ## What the AI may use
 

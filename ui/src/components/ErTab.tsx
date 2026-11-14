@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useEvent, useWidth } from "../lib/hooks";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { ArrowDown, ArrowRight, ChevronDown, ClipboardCopy, Columns3, Download, Loader2, Maximize2, Minus, Plus, RefreshCw, Rows3, Search, Share2 } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowRight, ChevronDown, ClipboardCopy, Columns3, Download, Loader2, Maximize2, Minus, Plus, RefreshCw, Rows3, Search, Share2 } from "lucide-react";
 import { api, isTauri, toError } from "../lib/api";
 import { kbd } from "../lib/platform";
 import type { TableColumns } from "../lib/types";
@@ -13,7 +13,7 @@ import { copyText } from "./CatalogMenus";
 import { svgToPng, themeColors } from "./LineageTab";
 import { MenuItem, MenuSeparator, Popover } from "./ui";
 
-type Load = { status: "loading" } | { status: "ready"; tables: TableColumns[] } | { status: "error"; message: string };
+type Load = { status: "loading" } | { status: "ready"; tables: TableColumns[]; offline: string | null; stale: boolean } | { status: "error"; message: string };
 
 const DIR_KEY = "db.er.dir";
 
@@ -47,9 +47,9 @@ export function ErTab({ tabId, visible }: { tabId: string; visible: boolean }) {
     setLoad({ status: "loading" });
     if (!isTauri()) return setLoad({ status: "error", message: "ER diagrams need the DataBrain desktop app" });
     try {
-      const tables = await api.schemaTables(tab.connection_id, ref.schema);
+      const r = await api.schemaTables(tab.connection_id, ref.schema);
       if (my !== seq.current) return;
-      setLoad({ status: "ready", tables });
+      setLoad({ status: "ready", tables: r.tables, offline: r.offline, stale: r.stale });
       setPos({});
       setFocus(null);
     } catch (e) {
@@ -224,6 +224,15 @@ export function ErTab({ tabId, visible }: { tabId: string; visible: boolean }) {
             }}
           />
         </Popover>
+      )}
+      {load.status === "ready" && load.offline !== null && (
+        <div className="flex items-center gap-1.5 border-b border-line bg-warning/10 px-3 py-1 text-[11.5px] text-warning" role="note" title={load.offline}>
+          <AlertTriangle size={12} className="shrink-0" />
+          <span className="truncate">
+            Offline: the tables DataBrain has seen of this schema{load.stale ? ", some may have changed since" : ""} (the server couldn't be read: {load.offline}). Refresh
+            when it's back.
+          </span>
+        </div>
       )}
       <div
         ref={box}

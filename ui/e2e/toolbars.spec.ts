@@ -36,7 +36,7 @@ test.describe("toolbars fit when the AI panel is open", () => {
   test("ER tab: buttons drop their labels", async ({ page }) => {
     await openApp(
       page,
-      backend({ schema_tables: [{ table: "customers", columns: [{ name: "id", data_type: "integer", nullable: false, is_primary_key: true }], foreign_keys: [] }] }),
+      backend({ schema_tables: { offline: null, stale: false, tables: [{ table: "customers", columns: [{ name: "id", data_type: "integer", nullable: false, is_primary_key: true }], foreign_keys: [] }] } }),
     );
     await page.getByRole("treeitem").filter({ hasText: "Shop" }).first().click();
     await page.getByRole("treeitem").filter({ hasText: "public" }).click({ button: "right" });

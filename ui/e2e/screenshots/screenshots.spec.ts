@@ -80,7 +80,7 @@ test.describe("screenshots", () => {
     await openApp(
       page,
       backend({
-        schema_tables: [
+        schema_tables: { offline: null, stale: false, tables: [
           { table: "customers", columns: [c("id", "integer", true), c("name", "text"), c("email", "text"), c("country", "text")], foreign_keys: [] },
           { table: "products", columns: [c("id", "integer", true), c("sku", "text"), c("title", "text"), c("price", "numeric(12,2)")], foreign_keys: [] },
           {
@@ -96,7 +96,7 @@ test.describe("screenshots", () => {
               { columns: ["product_id"], ref_schema: "public", ref_table: "products", ref_columns: ["id"] },
             ],
           },
-        ],
+        ] },
       }),
     );
     await page.getByRole("treeitem").filter({ hasText: "Shop" }).first().click();

@@ -130,7 +130,7 @@ pub(crate) async fn describe_object(state: State<'_, AppState>, id: String, sche
 }
 
 #[tauri::command]
-pub(crate) async fn schema_tables(state: State<'_, AppState>, id: String, schema: String) -> R<Vec<databrain_connector_core::TableColumns>> {
+pub(crate) async fn schema_tables(state: State<'_, AppState>, id: String, schema: String) -> R<api::SchemaTables> {
     api::schema_tables(&state, &id, &schema).await
 }
 

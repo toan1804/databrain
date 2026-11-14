@@ -605,6 +605,48 @@ async fn explorer_cache_sqlite() {
     assert!(cached_explorer(&st, &p.id).unwrap().schemas.is_none());
 }
 
+/// The ER diagram reads live and keeps what it read; when the database
+/// can't be read, it shows the cached tables and says why.
+#[tokio::test]
+async fn er_diagram_works_offline_from_the_cache() {
+    let (st, _sink, dir) = state();
+    let db = dir.path().join("er.db");
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(db.to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let p = save_profile(&st, "er", cfg, None);
+    exec(
+        &st,
+        &p.id,
+        "create table customers (id integer primary key); create table orders (id integer primary key, customer_id integer references customers(id))",
+    )
+    .await;
+    let main = list_schemas(&st, &p.id).await.unwrap()[0].name.clone();
+    let live = schema_tables(&st, &p.id, &main).await.unwrap();
+    assert_eq!((live.offline.as_deref(), live.tables.len()), (None, 2));
+    assert_eq!(live.tables[1].foreign_keys.len(), 1);
+    st.meta.flush().await;
+
+    // The database can't be opened any more (a folder where the file was).
+    st.engine.disconnect(&p.id);
+    std::fs::remove_file(&db).unwrap();
+    std::fs::create_dir(&db).unwrap();
+    let off = schema_tables(&st, &p.id, &main).await.unwrap();
+    assert!(off.offline.is_some(), "says why");
+    assert_eq!(off.tables, live.tables, "what was read last, keys included");
+    // Nothing cached for a schema: the error, as before.
+    assert!(schema_tables(&st, &p.id, "other").await.is_err());
+}
+
 fn save_profile_update(st: &AppState, p: ConnectionProfile) {
     save_connection(st, SaveConnectionArgs { profile: p, secret: None, clear_secret: false, extra_secrets: Default::default() }).unwrap();
 }
@@ -938,6 +980,18 @@ async fn explorer_incremental_live_postgres() {
     assert!(cached_columns(&st, &p.id, "inc_a", "t1").unwrap().unwrap().stale);
     assert!(!cached_columns(&st, &p.id, "inc_a", "t2").unwrap().unwrap().stale, "untouched table keeps fresh columns");
     assert_eq!(refresh_schema(&st, &p.id, "inc_a").await.unwrap().mode, RefreshMode::Unchanged);
+
+    // Rows only (no definition changed): the estimate doubling moves the
+    // fingerprint; one listing reads the new estimates, columns stay fresh.
+    describe(&st, &p.id, "inc_b", "z").await.unwrap();
+    flush_explorer_cache(&st).await;
+    exec(&st, &p.id, "insert into inc_b.z select generate_series(1, 1000); analyze inc_b.z").await;
+    let r = revalidate_explorer(&st, &p.id, &[], true).await.unwrap();
+    let b = r.refreshed.iter().find(|x| x.schema == "inc_b").expect("inc_b's estimates moved");
+    assert_eq!((b.mode.clone(), b.changed), (RefreshMode::Full, 0), "{b:?}");
+    let z = cached_objects(&st, &p.id, "inc_b").unwrap().unwrap().objects.into_iter().find(|o| o.name == "z").unwrap();
+    assert_eq!(z.row_estimate, Some(1000), "{z:?}");
+    assert!(!cached_columns(&st, &p.id, "inc_b", "z").unwrap().unwrap().stale, "a row change isn't a definition change");
     exec(&st, &p.id, "drop schema inc_a cascade; drop schema inc_b cascade").await;
 }
 

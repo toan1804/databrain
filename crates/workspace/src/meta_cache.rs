@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use databrain_connector_core::{CatalogInfo, ColumnInfo, ConnectionConfig, DbObject, ForeignKey, ObjectKind, SchemaInfo, version_key};
+use databrain_connector_core::{CatalogInfo, ColumnInfo, ConnectionConfig, DbObject, ForeignKey, ObjectKind, SchemaInfo, TableColumns, version_key};
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
@@ -532,6 +532,57 @@ impl Workspace {
         Ok(())
     }
 
+    /// Every table of a schema as read from the server (the ER diagram), in
+    /// one transaction. An empty foreign key list keeps the keys cached
+    /// before: a bulk read may leave them out.
+    pub fn meta_put_schema_tables(&self, connection_id: &str, schema: &str, tables: &[TableColumns]) -> Result<()> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let now = now_ms();
+        for t in tables {
+            let fks = (!t.foreign_keys.is_empty()).then(|| serde_json::to_string(&t.foreign_keys).unwrap_or_else(|_| "[]".into()));
+            tx.execute(
+                "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, seen_at = excluded.seen_at, \
+                 fks_json = coalesce(excluded.fks_json, meta_columns.fks_json), stale = 0",
+                params![connection_id, schema, t.table, serde_json::to_string(&t.columns).unwrap_or_else(|_| "[]".into()), now, fks],
+            )?;
+            Self::ai_refresh_table_tx(&tx, connection_id, schema, &t.table)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every table of `schema` whose columns are cached, by name, with its
+    /// foreign keys when known (the ER diagram offline), and whether any
+    /// of them may be out of date.
+    pub fn meta_schema_tables(&self, connection_id: &str, schema: &str) -> Result<(Vec<TableColumns>, bool)> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(&format!(
+            "SELECT m.table_name, m.columns_json, m.fks_json, {STALE_SQL} FROM meta_columns m \
+             WHERE m.connection_id = ?1 AND m.schema_name = ?2 ORDER BY m.table_name"
+        ))?;
+        let mut stale = false;
+        let rows = st
+            .query_map(params![connection_id, schema, 0, now_ms() - UNLISTED_COLUMNS_TTL_MS], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, bool>(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let tables = rows
+            .into_iter()
+            .map(|(table, cols, fks, s)| {
+                stale |= s;
+                TableColumns {
+                    table,
+                    columns: serde_json::from_str(&cols).unwrap_or_default(),
+                    foreign_keys: fks.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default(),
+                }
+            })
+            .filter(|t| !t.columns.is_empty())
+            .collect();
+        Ok((tables, stale))
+    }
+
     /// A table as DataBrain knows it without asking the server (exact schema
     /// id, any-case name): its cached describe, from the explorer, a grid
     /// edit, lineage or an index run. `stale` when its schema changed since
@@ -717,6 +768,32 @@ mod tests {
 
     fn o(schema: &str, name: &str, kind: ObjectKind) -> DbObject {
         DbObject { schema: schema.into(), name: name.into(), kind, comment: None, row_estimate: None }
+    }
+
+    /// The ER diagram's tables: saved from a live read, read back offline;
+    /// an empty key list keeps the keys known before.
+    #[test]
+    fn schema_tables_round_trip_and_keep_known_keys() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let col = |n: &str| ColumnInfo { name: n.into(), data_type: "int".into(), nullable: false, is_primary_key: n == "id", default: None, comment: None };
+        let fk = ForeignKey { columns: vec!["customer_id".into()], ref_schema: "s".into(), ref_table: "customers".into(), ref_columns: vec!["id".into()] };
+        let t = |name: &str, cols: &[&str], fks: Vec<ForeignKey>| TableColumns {
+            table: name.into(),
+            columns: cols.iter().map(|c| col(c)).collect(),
+            foreign_keys: fks,
+        };
+        assert_eq!(ws.meta_schema_tables("c", "s").unwrap(), (vec![], false), "nothing cached");
+        ws.meta_put_schema_tables("c", "s", &[t("orders", &["id", "customer_id"], vec![fk.clone()]), t("customers", &["id"], vec![])]).unwrap();
+        let (tables, _) = ws.meta_schema_tables("c", "s").unwrap();
+        assert_eq!(tables, vec![t("customers", &["id"], vec![]), t("orders", &["id", "customer_id"], vec![fk.clone()])]);
+        assert!(ws.meta_schema_tables("c", "other").unwrap().0.is_empty() && ws.meta_schema_tables("d", "s").unwrap().0.is_empty());
+        // A later read without keys (a bulk read) keeps them; new columns replace the old.
+        ws.meta_put_schema_tables("c", "s", &[t("orders", &["id", "customer_id", "total"], vec![])]).unwrap();
+        let (tables, _) = ws.meta_schema_tables("c", "s").unwrap();
+        assert_eq!(tables[1], t("orders", &["id", "customer_id", "total"], vec![fk]));
+        // What a describe cached is there too.
+        ws.meta_put_columns("c", "s", "items", &[col("id")]).unwrap();
+        assert_eq!(ws.meta_schema_tables("c", "s").unwrap().0.iter().map(|t| t.table.as_str()).collect::<Vec<_>>(), vec!["customers", "items", "orders"]);
     }
 
     #[test]

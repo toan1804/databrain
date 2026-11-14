@@ -10,8 +10,6 @@ Found in reviews and left for a later release on purpose. Each says what goes wr
 
 ## Explorer and AI index (left from the review of 2026-11-12)
 
-- PostgreSQL row estimates are refreshed only when the schema changes: the explorer fingerprint leaves out `reltuples`, and since index runs use the same fingerprint (2026-11-13) they skip such schemas too, so the AI's row estimates go stale as well.
-- The ER diagram (`schema_tables`) is always read live and doesn't work offline.
 - `clear_explorer_cache` is a command the UI never calls.
 
 Left from the final review of the metadata store (2026-11-13):

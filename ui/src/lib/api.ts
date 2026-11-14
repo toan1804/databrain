@@ -71,7 +71,7 @@ import type {
   HistoryQuery,
   JobEvent,
   ObjectDetail,
-  TableColumns,
+  SchemaTables,
   Page,
   ResultInfo,
   SelectionSummary,
@@ -239,7 +239,8 @@ export const api = {
     call<string[] | null>("complete_columns_local", { id, schema, name }),
   describeObject: (id: string, schema: string, name: string) =>
     call<ObjectDetail>("describe_object", { id, schema, name }),
-  schemaTables: (id: string, schema: string) => call<TableColumns[]>("schema_tables", { id, schema }),
+  /** A schema's tables for the ER diagram: live, or the explorer cache's when the server can't be read (`offline` says why). */
+  schemaTables: (id: string, schema: string) => call<SchemaTables>("schema_tables", { id, schema }),
   tableLayout: (id: string, schema: string, name: string) => call<TableLayout>("table_layout", { id, schema, name }),
 
   /** Column lineage of a script; `check` = describe uncached tables and EXPLAIN each query (never runs it). */

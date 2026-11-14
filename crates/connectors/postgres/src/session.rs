@@ -362,7 +362,10 @@ impl Session for PgSession {
 
     /// Everything `list_objects` lists, per schema: relations and sequences
     /// (row version + columns + constraints + comments) and routines (all
-    /// overloads), so any DDL on any of them changes the value.
+    /// overloads), so any DDL on any of them changes the value. Row
+    /// estimates count coarsely, by power of two (`reltuples` changes with
+    /// every ANALYZE): a table that doubles or halves changes it, so the
+    /// listing's and the AI's estimates are read again then.
     async fn explorer_fingerprints(&self) -> Result<Option<std::collections::HashMap<String, String>>> {
         // Redshift: no xmin / hashtext on its catalog; schemas are listed again.
         if self.redshift {
@@ -371,10 +374,11 @@ impl Session for PgSession {
         let rows = self
             .client()
             .query(
-                "with rel as (select c.oid, c.relnamespace ns, c.xmin, c.relname from pg_catalog.pg_class c \
+                "with rel as (select c.oid, c.relnamespace ns, c.xmin, c.relname, c.reltuples from pg_catalog.pg_class c \
                               where c.relkind in ('r','p','v','m','f','S') and not c.relispartition), \
                  h as ( \
                    select ns, hashtext(oid::text || ':' || xmin::text || ':' || relname) h from rel \
+                   union all select ns, hashtext(oid::text || ':rows:' || floor(log(2, greatest(reltuples, 0)::numeric + 1))::text) from rel \
                    union all select r.ns, hashtext(a.attrelid::text || ':' || a.attnum || ':' || a.xmin::text) \
                      from pg_catalog.pg_attribute a join rel r on r.oid = a.attrelid where a.attnum > 0 \
                    union all select r.ns, hashtext(k.oid::text || ':' || k.xmin::text) from pg_catalog.pg_constraint k join rel r on r.oid = k.conrelid \
