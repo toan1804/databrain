@@ -35,9 +35,15 @@ impl QueryEngine {
         .await
     }
 
-    /// [`Session::check_sql`] on the metadata session, at most 10 s.
+    /// [`Session::check_sql`] on the metadata session, at most 10 s. Only
+    /// a query that reads: the check sends `EXPLAIN <sql>`, and what the
+    /// classifier can't call a read could run (a second statement, a
+    /// statement `EXPLAIN` executes).
     pub async fn check_sql(&self, connection_id: &str, sql: &str) -> Result<bool> {
         let sql = databrain_connector_core::Checked::new(sql, self.workspace.get_connection(connection_id)?.config.kind);
+        if !sql.kind().is_read() {
+            return Err(EngineError::new("invalid", format!("Only queries that read are checked with the database ({} is not)", sql.classification().keyword)));
+        }
         match tokio::time::timeout(
             Duration::from_secs(10),
             self.with_meta(connection_id, |s| {

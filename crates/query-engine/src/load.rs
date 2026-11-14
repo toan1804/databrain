@@ -1334,7 +1334,12 @@ async fn explain_plan(p: &Prepared, rows: &LoadRows, checks: &mut Vec<LoadCheck>
                 (label.clone(), sql, created_before || (!*target) || p.creates)
             }
         };
-        let checked = Checked::new(sql.clone(), p.dialect);
+        // The user's SQL as it was classified; the load's own, classified here
+        // (`check_sql` takes what a session may be asked to check).
+        let checked = match act {
+            Act::User { sql, .. } => sql.clone(),
+            _ => Checked::new(sql.clone(), p.dialect),
+        };
         let kind = checked.kind();
         let is_ddl = kind == StatementKind::Ddl || matches!(act, Act::Sql { kind: ActKind::Ddl | ActKind::Stage, .. });
         let mut c = LoadCheck { label, sql: short(&sql), status: "unchecked".into(), message: None };

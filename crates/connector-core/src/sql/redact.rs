@@ -74,13 +74,8 @@ pub fn redact_secrets(sql: &str) -> String {
     // Postgres but a quote on others. A secret after one is found by one
     // reading only: all are read, and what any finds is hidden.
     let mut cut = Vec::new();
-    for reading in [
-        Reading { backslash: false, dollar: true },
-        Reading { backslash: true, dollar: true },
-        Reading { backslash: false, dollar: false },
-        Reading { backslash: true, dollar: false },
-    ] {
-        cut.extend(secret_spans(sql, reading));
+    for reading in Reading::ALL {
+        cut.extend(secret_spans(sql, reading, 0));
     }
     if cut.is_empty() {
         return sql.to_string();
@@ -124,6 +119,32 @@ type Span = (usize, usize, Option<u8>);
 struct Reading {
     backslash: bool,
     dollar: bool,
+    /// `[name]` as a quoted name (SQL Server, SQLite) and `q'[…]'` as
+    /// quoted text (Oracle): `[it's]` and `q'[it's]'` open no string.
+    brackets: bool,
+    /// `#` starts a comment to the end of the line (MySQL, ClickHouse):
+    /// `# don't` opens no string.
+    hash: bool,
+}
+
+impl Reading {
+    const fn new(backslash: bool, dollar: bool) -> Self {
+        Self { backslash, dollar, brackets: false, hash: false }
+    }
+
+    /// Every reading. The last two are for the servers their syntax
+    /// belongs to (neither reads dollar quotes; SQL Server and Oracle no
+    /// backslash escapes, MySQL and ClickHouse do); they are extra
+    /// readings, so `a[1]`, `#temp` and `a # b` are still read as on the
+    /// other servers by the first four.
+    const ALL: [Self; 6] = [
+        Self::new(false, true),
+        Self::new(true, true),
+        Self::new(false, false),
+        Self::new(true, false),
+        Self { brackets: true, ..Self::new(false, false) },
+        Self { hash: true, ..Self::new(true, false) },
+    ];
 }
 
 /// What a token is, as redaction reads SQL.
@@ -196,6 +217,13 @@ impl<'a> Lexer<'a> {
             b'-' if b.get(i + 1) == Some(&b'-') => tok(Kind::Comment, self.sql[i..].find('\n').map_or(n, |k| i + k)),
             b'/' if b.get(i + 1) == Some(&b'*') => tok(Kind::Comment, self.sql[i + 2..].find("*/").map_or(n, |k| i + 4 + k)),
             b'\'' | b'"' | b'`' => tok(Kind::Quoted { quote: c, open: i }, self.quoted_end(i, self.reading.backslash && c != b'`')),
+            b'#' if self.reading.hash => tok(Kind::Comment, self.sql[i..].find('\n').map_or(n, |k| i + k)),
+            // `[name]` on one line, `]]` an escaped bracket; an array
+            // subscript or a `[` that never closes is one character.
+            b'[' if self.reading.brackets => match self.bracket_end(i) {
+                Some(end) => tok(Kind::Quoted { quote: b'[', open: i }, end),
+                None => tok(Kind::Other, i + 1),
+            },
             b'$' => match dollar_literal(self.sql, i).filter(|_| self.reading.dollar) {
                 Some((body, body_end, end)) => tok(Kind::Dollar { body, body_end }, end),
                 None => tok(Kind::Other, i + 1),
@@ -211,6 +239,15 @@ impl<'a> Lexer<'a> {
                 // E'…' (Postgres, backslashes escape), N'…' (SQL Server).
                 if j == i + 1 && matches!(c, b'E' | b'e' | b'N' | b'n') && b.get(j) == Some(&b'\'') {
                     return tok(Kind::Quoted { quote: b'\'', open: j }, self.quoted_end(j, self.reading.backslash));
+                }
+                // Oracle q'[…]', q'{…}', q'!…!' (and nq'…'): its text is read
+                // like a dollar-quoted one.
+                if self.reading.brackets
+                    && b.get(j) == Some(&b'\'')
+                    && matches!(self.sql[i..j].to_ascii_lowercase().as_str(), "q" | "nq")
+                    && let Some((body, body_end, end)) = self.q_quote(j)
+                {
+                    return tok(Kind::Dollar { body, body_end }, end);
                 }
                 tok(Kind::Word, j)
             }
@@ -240,6 +277,43 @@ impl<'a> Lexer<'a> {
             j += 1;
         }
         n
+    }
+
+    /// The end of the bracketed name at `i` (`[`), after its `]`: on one
+    /// line and at most 130 bytes (a name is at most 128 characters long).
+    fn bracket_end(&self, i: usize) -> Option<usize> {
+        let b = self.b;
+        let mut j = i + 1;
+        while j < b.len() && j < i + 130 && b[j] != b'\n' {
+            if b[j] == b']' {
+                if b.get(j + 1) == Some(&b']') {
+                    j += 2;
+                    continue;
+                }
+                return (j > i + 1).then_some(j + 1);
+            }
+            j += 1;
+        }
+        None
+    }
+
+    /// Oracle's `q'<d>…<d>'` whose `'` is at `i`: the start and end of its
+    /// text and the end of the literal (unterminated: the end of the SQL).
+    fn q_quote(&self, i: usize) -> Option<(usize, usize, usize)> {
+        let open = self.sql[i + 1..].chars().next().filter(|c| !c.is_whitespace() && *c != '\'')?;
+        let close = match open {
+            '[' => ']',
+            '{' => '}',
+            '(' => ')',
+            '<' => '>',
+            c => c,
+        };
+        let body = i + 1 + open.len_utf8();
+        let n = self.len();
+        Some(match self.sql[body..].find(&format!("{close}'")) {
+            Some(k) => (body, body + k, body + k + close.len_utf8() + 1),
+            None => (body, n, n),
+        })
     }
 
     /// The next token from `i` that isn't space or a comment.
@@ -274,8 +348,12 @@ impl<'a> Lexer<'a> {
     }
 }
 
-/// Spans of the secrets in `sql`, in one reading of its quotes.
-fn secret_spans(sql: &str, reading: Reading) -> Vec<Span> {
+/// How deep SQL inside quoted text is read (a body in a string in a body…).
+const MAX_DEPTH: usize = 8;
+
+/// Spans of the secrets in `sql`, in one reading of its quotes. `depth`:
+/// how many quoted texts this SQL is inside.
+fn secret_spans(sql: &str, reading: Reading, depth: usize) -> Vec<Span> {
     let lx = Lexer::new(sql, reading);
     let mut cut = positional_secrets(&lx);
     let mut i = 0;
@@ -285,11 +363,11 @@ fn secret_spans(sql: &str, reading: Reading) -> Vec<Span> {
         match t.kind {
             // A string can hold SQL that runs (`EXECUTE 'alter role r
             // password ''pw'''`, `EXECUTE IMMEDIATE '…'`): read inside it too.
-            Kind::Quoted { quote: b'\'', open } => cut.extend(nested_spans(sql, open, t.end, reading)),
+            Kind::Quoted { quote: b'\'', open } if depth < MAX_DEPTH => cut.extend(nested_spans(sql, open, t.end, reading, depth + 1)),
             // `$$Bob's table$$`: one literal, its quote is text. Its body is
             // read on its own (a function or `DO` body holds statements).
-            Kind::Dollar { body, body_end } => {
-                cut.extend(secret_spans(&sql[body..body_end], reading).into_iter().map(|(s, e, q)| (s + body, e + body, q)));
+            Kind::Dollar { body, body_end } if depth < MAX_DEPTH => {
+                cut.extend(secret_spans(&sql[body..body_end], reading, depth + 1).into_iter().map(|(s, e, q)| (s + body, e + body, q)));
             }
             Kind::Word => {
                 if let Some(end) = secret_after(&lx, t, &mut cut) {
@@ -330,8 +408,11 @@ fn secret_after(lx: &Lexer, word: Token, cut: &mut Vec<Span>) -> Option<usize> {
         // SET PASSWORD FOR 'bob'@'%' = 'x': the account, then `=` on the same line.
         if lx.word(j) == "for" {
             let mut k = j.end;
+            // An account is a few tokens (`'bob'@'%'`): no further.
+            let mut left = 32;
             j = loop {
-                let t = (k < lx.len()).then(|| lx.at(k))?;
+                left -= 1;
+                let t = (left > 0 && k < lx.len()).then(|| lx.at(k))?;
                 if lx.is(t, b';') || t.kind == (Kind::Space { newline: true }) {
                     return None;
                 }
@@ -375,7 +456,7 @@ fn take_value(lx: &Lexer, v: Token, bare: bool, cut: &mut Vec<Span>) -> Option<u
     match v.kind {
         Kind::Quoted { quote: quote @ (b'\'' | b'"'), open } => cut.push((open, v.end, Some(quote))),
         Kind::Dollar { body, body_end } => cut.push((body, body_end, None)),
-        Kind::Word | Kind::Other if bare && (v.kind == Kind::Word || lx.b[v.start] >= 0x80) => {
+        Kind::Word | Kind::Other if bare && (v.kind == Kind::Word || lx.b[v.start] >= 0x80 || lx.b[v.start].is_ascii_digit()) => {
             let end = lx.bare_end(v.start);
             cut.push((v.start, end, None));
             return Some(end);
@@ -390,7 +471,7 @@ fn take_value(lx: &Lexer, v: Token, bare: bool, cut: &mut Vec<Span>) -> Option<u
 /// quote, scanned like any SQL, and the spans mapped back to `sql`. A
 /// secret that was a quoted literal inside becomes `''***''` in place, so
 /// the outer string still ends where it did.
-fn nested_spans(sql: &str, start: usize, end: usize, reading: Reading) -> Vec<Span> {
+fn nested_spans(sql: &str, start: usize, end: usize, reading: Reading, depth: usize) -> Vec<Span> {
     let backslash = reading.backslash;
     let b = sql.as_bytes();
     let body_end = if end > start + 1 && end <= b.len() && b[end - 1] == b'\'' { end - 1 } else { end.min(b.len()) };
@@ -417,7 +498,7 @@ fn nested_spans(sql: &str, start: usize, end: usize, reading: Reading) -> Vec<Sp
     at.push(body_end);
     let Ok(inner) = String::from_utf8(inner) else { return Vec::new() };
     let ib = inner.as_bytes();
-    secret_spans(&inner, reading)
+    secret_spans(&inner, reading, depth)
         .into_iter()
         .filter_map(|(s, e, q)| {
             // A quoted secret: its text between the quotes, unquoted (an
@@ -436,67 +517,100 @@ fn nested_spans(sql: &str, start: usize, end: usize, reading: Reading) -> Vec<Sp
 /// start on the next line). Dollar-quoted bodies are read by
 /// [`secret_spans`] on their own.
 fn positional_secrets(lx: &Lexer) -> Vec<Span> {
+    /// A call being read: its secret arguments, how many it needs, and
+    /// the arguments so far.
+    struct Call {
+        secret: &'static [usize],
+        min: usize,
+        parens: bool,
+        args: Vec<(usize, usize)>,
+        start: usize,
+        depth: i32,
+        named: bool,
+    }
     let n = lx.len();
     let mut out = Vec::new();
+    let mut close = |mut c: Call, end: usize| {
+        c.args.push((c.start, end));
+        // A call with a named argument (`@rmtpassword = …`) is left to [`redact_key_values`].
+        if c.named || c.args.len() < c.min {
+            return;
+        }
+        for &k in c.secret {
+            let Some(&(s, e)) = c.args.get(k) else { continue };
+            let mut a = s;
+            while a < e && matches!(lx.at(a).kind, Kind::Space { .. }) {
+                a = lx.at(a).end;
+            }
+            if a < e
+                && let Kind::Quoted { quote: quote @ (b'\'' | b'"'), open } = lx.at(a).kind
+            {
+                out.push((open, lx.at(a).end, Some(quote)));
+            }
+        }
+    };
+    // The calls open at this point, the innermost last: a call in an
+    // argument of another (`s3(url, id, aes_decrypt(c, 'key'))`) is read too.
+    let mut open: Vec<Call> = Vec::new();
     let mut i = 0;
     while i < n {
         let t = lx.at(i);
         i = t.end;
-        let name = lx.word(t);
-        let Some((_, secret, min)) = POSITIONAL_SECRETS.iter().find(|(f, ..)| *f == name) else { continue };
-        let mut j = t.end;
-        let spaced = j < n && matches!(lx.at(j).kind, Kind::Space { .. });
-        if spaced {
-            j = lx.at(j).end;
-        }
-        let parens = j < n && lx.is(lx.at(j), b'(');
-        if !parens && (!spaced || !name.starts_with("sp_")) {
-            continue;
-        }
-        if parens {
-            j += 1;
-        }
-        // Arguments: (start, end) of each, top-level commas between.
-        let mut args: Vec<(usize, usize)> = Vec::new();
-        let (mut start, mut depth, mut named) = (j, 0i32, false);
-        while j < n {
-            let x = lx.at(j);
-            if x.kind == (Kind::Space { newline: true }) && !parens {
-                break;
+        match t.kind {
+            Kind::Word => {
+                let name = lx.word(t);
+                let Some(&(_, secret, min)) = POSITIONAL_SECRETS.iter().find(|(f, ..)| *f == name) else { continue };
+                let mut j = t.end;
+                let spaced = j < n && matches!(lx.at(j).kind, Kind::Space { .. });
+                if spaced {
+                    j = lx.at(j).end;
+                }
+                let parens = j < n && lx.is(lx.at(j), b'(');
+                if !parens && (!spaced || !name.starts_with("sp_")) {
+                    continue;
+                }
+                // A procedure is a statement of its own, never an argument.
+                if !parens && open.iter().any(|c| c.parens) {
+                    continue;
+                }
+                if parens {
+                    j += 1;
+                }
+                open.push(Call { secret, min, parens, args: Vec::new(), start: j, depth: 0, named: false });
+                i = j;
             }
-            if x.kind == Kind::Other {
-                match lx.b[x.start] {
-                    b'(' => depth += 1,
-                    b')' if depth > 0 => depth -= 1,
-                    b')' if parens => break,
-                    b';' if !parens => break,
-                    b',' if depth == 0 => {
-                        args.push((start, x.start));
-                        start = x.end;
+            // A procedure's arguments end with the line, and what is open
+            // in them with it (only procedures are below a procedure).
+            Kind::Space { newline: true } if open.first().is_some_and(|c| !c.parens) => {
+                while let Some(c) = open.pop() {
+                    close(c, t.start);
+                }
+            }
+            Kind::Other if lx.b[t.start] == b';' && open.first().is_some_and(|c| !c.parens) => {
+                while let Some(c) = open.pop() {
+                    close(c, t.start);
+                }
+            }
+            Kind::Other => {
+                let Some(c) = open.last_mut() else { continue };
+                match lx.b[t.start] {
+                    b'(' => c.depth += 1,
+                    b')' if c.depth > 0 => c.depth -= 1,
+                    b')' if c.parens => close(open.pop().expect("checked"), t.start),
+                    b',' if c.depth == 0 => {
+                        c.args.push((c.start, t.start));
+                        c.start = t.end;
                     }
-                    b'=' | b'@' if depth == 0 => named = true,
+                    b'=' | b'@' if c.depth == 0 => c.named = true,
                     _ => {}
                 }
             }
-            j = x.end;
+            _ => {}
         }
-        args.push((start, j));
-        // A call with a named argument (`@rmtpassword = …`) is left to [`redact_key_values`].
-        if !named && args.len() >= *min {
-            for &k in secret.iter() {
-                let Some(&(s, e)) = args.get(k) else { continue };
-                let mut a = s;
-                while a < e && matches!(lx.at(a).kind, Kind::Space { .. }) {
-                    a = lx.at(a).end;
-                }
-                if a < e
-                    && let Kind::Quoted { quote: quote @ (b'\'' | b'"'), open } = lx.at(a).kind
-                {
-                    out.push((open, lx.at(a).end, Some(quote)));
-                }
-            }
-        }
-        i = j;
+    }
+    // Calls that never close run to the end.
+    while let Some(c) = open.pop() {
+        close(c, n);
     }
     out
 }
@@ -1287,5 +1401,58 @@ mod redaction_tests {
         assert_eq!(redact_text("alter role r password \"pw\""), "alter role r password \"***\"");
         let plain = "column \"a\" of \"t\" says \"hello\"";
         assert_eq!(redact_text(plain), plain);
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    /// A call in another's argument, text after a `#` comment, a bracketed
+    /// name or an Oracle `q'[…]'` holding a quote, and a password led by a
+    /// digit: hidden; the same syntax without a secret: kept.
+    #[test]
+    fn secrets_after_other_servers_syntax() {
+        for (sql, want) in [
+            ("select * from s3('u', 'id', aes_decrypt(c, 'k1'))", "select * from s3('u', 'id', aes_decrypt(c, '***'))"),
+            ("select pgp_sym_decrypt(pgp_sym_encrypt('x','k1'),'k2')", "select pgp_sym_decrypt(pgp_sym_encrypt('x','***'),'***')"),
+            (
+                "select mysql('h', 'd', 't', 'u', aes_decrypt(p, 'k1'), s3('a', 'b', 'k2'))",
+                "select mysql('h', 'd', 't', 'u', aes_decrypt(p, '***'), s3('a', 'b', '***'))",
+            ),
+            ("exec sp_addlogin 'u', 'pw1'\nselect aes_encrypt(a, 'k1')", "exec sp_addlogin 'u', '***'\nselect aes_encrypt(a, '***')"),
+            ("# don't\nCREATE USER u IDENTIFIED BY 'pw'", "# don't\nCREATE USER u IDENTIFIED BY '***'"),
+            ("# don't\nselect aes_encrypt(a, 'k1')", "# don't\nselect aes_encrypt(a, '***')"),
+            ("select q'[it's]', aes_encrypt(a,'k1') from dual", "select q'[it's]', aes_encrypt(a,'***') from dual"),
+            ("select q'!it's!', aes_encrypt(a,'k1') from dual", "select q'!it's!', aes_encrypt(a,'***') from dual"),
+            // (The readings where it is a plain string take `]` for part of the bare password.)
+            ("execute immediate q'[alter user u identified by pw1]'", "execute immediate q'[alter user u identified by ***'"),
+            ("execute immediate q'[alter user u identified by \"pw1\"]'", "execute immediate q'[alter user u identified by \"***\"]'"),
+            ("select [it's], aes_encrypt(a,'k1')", "select [it's], aes_encrypt(a,'***')"),
+            ("create user u identified by 1234abc", "create user u identified by ***"),
+        ] {
+            assert_eq!(redact_secrets(sql), want, "{sql}");
+        }
+        for keep in [
+            "select a[1], b['k'] from t where c # d = 1",
+            "select * from #temp where name = [it's] and q = 'x'",
+            "select s3('u'), aes_encrypt(a, k), mysql('h', 'd', 't')",
+            "# password for bob\nselect 1",
+            "set password for bob, alice, carol, dave, erin, frank, grace, heidi, ivan = 1",
+        ] {
+            assert_eq!(redact_secrets(keep), keep);
+        }
+    }
+
+    /// Text built to make a rule read on to the end each time stays quick.
+    #[test]
+    fn long_repeats_stay_linear() {
+        let t = std::time::Instant::now();
+        for (piece, n) in [("password for x ", 20_000), ("s3(", 60_000), ("'set ", 50_000), ("exec sp_password ", 20_000), ("q'[ [a ", 30_000)] {
+            let _ = redact_secrets(&piece.repeat(n));
+        }
+        let tags: String = (0..5_000).map(|i| format!("$t{i}$ ")).collect();
+        let _ = redact_secrets(&tags);
+        assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
     }
 }

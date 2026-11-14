@@ -12,11 +12,11 @@ use serde::Serialize;
 use super::{Classification, ParamValue, StatementKind, classify, substitute_parameters};
 use crate::types::ConnectorKind;
 
-/// SQL handed to a session, and where it came from.
+/// SQL handed to a session: made only by [`Checked::statement`] or
+/// [`Statement::internal`].
 #[derive(Debug, Clone, Copy)]
 pub struct Statement<'a> {
     sql: &'a str,
-    kind: Option<StatementKind>,
 }
 
 impl<'a> Statement<'a> {
@@ -25,16 +25,11 @@ impl<'a> Statement<'a> {
     /// `EXPLAIN` around a [`Checked`] statement. Never text a user, the AI
     /// or a client typed: that is a [`Checked`].
     pub const fn internal(sql: &'a str) -> Self {
-        Self { sql, kind: None }
+        Self { sql }
     }
 
     pub fn sql(&self) -> &'a str {
         self.sql
-    }
-
-    /// The classified kind of checked text; `None` for internal SQL.
-    pub fn kind(&self) -> Option<StatementKind> {
-        self.kind
     }
 }
 
@@ -76,7 +71,7 @@ impl Checked {
 
     /// The statement to run.
     pub fn statement(&self) -> Statement<'_> {
-        Statement { sql: &self.sql, kind: Some(self.classification.kind) }
+        Statement { sql: &self.sql }
     }
 }
 
@@ -89,7 +84,7 @@ mod tests {
         let pg = ConnectorKind::Postgres;
         let c = Checked::new("select * from t where id = :id", pg);
         assert_eq!(c.kind(), StatementKind::Read);
-        assert_eq!(c.statement().kind(), Some(StatementKind::Read));
+        assert_eq!(c.statement().sql(), c.sql());
         let bound = c.clone().bind(pg, &HashMap::from([("id".to_string(), ParamValue { value: "7".into(), raw: false })])).unwrap();
         assert_eq!(bound.sql(), "select * from t where id = 7");
         assert_eq!(bound.kind(), StatementKind::Read);
@@ -97,6 +92,6 @@ mod tests {
         let w = Checked::new("select :x", pg).bind(pg, &HashMap::from([("x".to_string(), ParamValue { value: "1; drop table t".into(), raw: true })]));
         assert_ne!(w.unwrap().kind(), StatementKind::Read);
         assert_eq!(c.bind(pg, &HashMap::new()).unwrap_err(), vec!["id".to_string()]);
-        assert_eq!(Statement::internal("select 1").kind(), None);
+        assert_eq!(Statement::internal("select 1").sql(), "select 1");
     }
 }

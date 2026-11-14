@@ -536,6 +536,22 @@ async fn metadata_and_close_tab() {
     assert!(f.engine.connected_ids().is_empty());
 }
 
+/// "Check with database" sends `EXPLAIN <sql>`: a read is checked, what
+/// isn't one (a write, two statements) is refused before anything is sent.
+#[tokio::test]
+async fn check_sql_takes_reads_only() {
+    let f = fixture(EnvTag::None);
+    let job = started(f.engine.run(req(&f, "create table t (a int)")).unwrap());
+    wait_job(&f, &job).await;
+    assert!(f.engine.check_sql(&f.conn_id, "select a from t").await.unwrap());
+    assert!(f.engine.check_sql(&f.conn_id, "select nope from t").await.is_err());
+    for sql in ["drop table t", "select 1; drop table t", "insert into t values (1)"] {
+        let e = f.engine.check_sql(&f.conn_id, sql).await.unwrap_err();
+        assert!(e.kind == "invalid" && e.message.contains("Only queries that read"), "{sql}: {}", e.message);
+    }
+    assert!(f.engine.check_sql(&f.conn_id, "select a from t").await.unwrap(), "t is still there");
+}
+
 /// A read-only connection runs reads only, for every origin and even when
 /// confirmed (jobs and the AI confirm their runs): writes, transactions
 /// and session statements could make it writable.
