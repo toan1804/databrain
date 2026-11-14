@@ -37,6 +37,7 @@ use databrain_export::load as sqlgen;
 use databrain_workspace::LoadMode;
 use serde::Serialize;
 
+use crate::guard::{Hold, Intent};
 use crate::{EngineError, QueryEngine, Result};
 
 /// What a load step writes and how.
@@ -498,7 +499,8 @@ impl QueryEngine {
         }
         // The query runs on the tab's session (its temp tables, settings):
         // hold it, like a full export, so nothing else runs there meanwhile.
-        let _claim = self.claim(source, session, cancel.clone(), "A query is running in this tab: wait for it, then load every row")?;
+        let hold = Hold::session(session, cancel.clone(), "A query is running in this tab: wait for it, then load every row");
+        let (_, _claim) = self.guarded_or_refuse(source, Some(hold), Intent::Inspect)?;
         let src = self.session_for(source, session, databrain_workspace::Origin::User).await?;
         let opts = ExecOptions { batch_size: 2000, cancel: cancel.clone(), max_rows: None, output_masks: None };
         let stream = src.execute(sql, opts).await?;
@@ -886,17 +888,9 @@ impl QueryEngine {
         if table.is_empty() {
             return Err(EngineError::new("invalid", "Choose the table to write into"));
         }
-        let profile = self.workspace.get_connection(connection_id)?;
-        if profile.config.read_only {
-            return Err(EngineError::new("invalid", format!("Connection \"{}\" is read-only; nothing was written.", profile.name)));
-        }
-        // A dry run keeps nothing, so it doesn't ask.
-        if !dry && profile.env == databrain_workspace::EnvTag::Prod && !spec.confirmed {
-            return Err(EngineError {
-                code: Some("needs_confirmation".into()),
-                ..EngineError::new("invalid", format!("\"{}\" is a production connection: confirm writing rows into {table}.", profile.name))
-            });
-        }
+        // Read-only refuses; production asks (code `needs_confirmation`),
+        // except a dry run, which keeps nothing.
+        let (profile, _) = self.guarded_or_refuse(connection_id, None, Intent::Load { table: &table, confirmed: spec.confirmed, dry })?;
         let dialect = profile.config.kind;
         if !sqlgen::is_load_target(dialect) {
             return Err(EngineError::new(

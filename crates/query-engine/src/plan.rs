@@ -23,6 +23,7 @@ use databrain_connector_core::{ConnectorKind, Session, query_table};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::guard::{Hold, Intent};
 use crate::{EngineError, QueryEngine, Result};
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, ts_rs::TS)]
@@ -106,12 +107,9 @@ impl QueryEngine {
         if analyze && classify(sql, kind).kind != StatementKind::Read {
             return Err(EngineError::new("invalid", "ANALYZE runs the statement: it is only offered for read queries"));
         }
-        let _claim = self.claim(
-            connection_id,
-            session_key,
-            databrain_connector_core::CancellationToken::new(),
-            "A query is running in this tab: wait for it or stop it first",
-        )?;
+        let hold =
+            Hold::session(session_key, databrain_connector_core::CancellationToken::new(), "A query is running in this tab: wait for it or stop it first");
+        let (_, _claim) = self.guarded_or_refuse(connection_id, Some(hold), Intent::Inspect)?;
         let session = self.session(connection_id, session_key).await?;
         let stuck = std::sync::atomic::AtomicBool::new(false);
         let r = explain_on(&*session, kind, sql, analyze, &stuck).await;

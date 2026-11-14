@@ -14,6 +14,7 @@ pub mod edit;
 mod error;
 mod events;
 mod export;
+mod guard;
 pub mod load;
 mod metadata;
 pub mod outputs;
@@ -27,6 +28,7 @@ pub mod testdata;
 
 pub use error::*;
 pub use events::*;
+use guard::{Guarded, Hold, Intent};
 pub use load::{LoadCheck, LoadDryRun, LoadEvent, LoadObserver, LoadReport, LoadRows, LoadSpec, LoadTarget, NoLoadObserver};
 pub use outputs::{NewOutput, OutputInfo, OutputRegistry, OutputState, OutputTables};
 

@@ -974,3 +974,107 @@ async fn a_run_that_dies_frees_its_tab() {
     assert!(crate::run::finished(RunStatus::Error, vec![view(Some("syntax"))]).is_ok(), "a statement's error is in its outcome");
     assert!(crate::run::finished(RunStatus::Success, vec![view(None)]).is_ok());
 }
+
+// ------------------------------------------------------------------ guard
+
+fn set_conn(f: &Fixture, change: impl FnOnce(&mut ConnectionProfile)) {
+    let mut p = f.ws.get_connection(&f.conn_id).unwrap();
+    change(&mut p);
+    f.ws.save_connection(p).unwrap();
+}
+
+/// Each intent's rules: what a read-only connection refuses, what
+/// production asks, and what passes.
+#[test]
+fn intents_are_checked_against_the_connection() {
+    use crate::guard::Intent;
+    let f = fixture(EnvTag::None);
+    let profile = || f.ws.get_connection(&f.conn_id).unwrap();
+    let p = profile();
+    let read = f.engine.plan(&p, "select 1");
+    let write = f.engine.plan(&p, "update t set a = 1 where id = 1");
+    let check = |p: &ConnectionProfile, i: Intent| QueryEngine::check_intent(p, &i);
+
+    // Allowed on a plain connection: everything, nothing to confirm.
+    for i in [
+        Intent::Run { plan: &write, confirmed: false },
+        Intent::Load { table: "t", confirmed: false, dry: false },
+        Intent::Edit,
+        Intent::Inspect,
+        Intent::EndTransaction,
+    ] {
+        assert_eq!(check(&p, i).unwrap(), Vec::<String>::new());
+    }
+
+    // Read-only: reads, plans and Commit/Rollback only.
+    set_conn(&f, |p| p.config.read_only = true);
+    let ro = profile();
+    assert!(check(&ro, Intent::Run { plan: &read, confirmed: false }).unwrap().is_empty());
+    let e = check(&ro, Intent::Run { plan: &write, confirmed: true }).unwrap_err();
+    assert!(e.message.contains("is read-only; statement 1 (UPDATE) was not run"), "{}", e.message);
+    let e = check(&ro, Intent::Load { table: "t", confirmed: true, dry: true }).unwrap_err();
+    assert!(e.message.contains("read-only; nothing was written"), "{}", e.message);
+    assert_eq!(check(&ro, Intent::Edit).unwrap_err().message, "The connection is read-only");
+    assert!(check(&ro, Intent::Inspect).unwrap().is_empty() && check(&ro, Intent::EndTransaction).unwrap().is_empty());
+
+    // Production: writes ask until confirmed; a dry run and reads don't.
+    set_conn(&f, |p| {
+        p.config.read_only = false;
+        p.env = EnvTag::Prod;
+    });
+    let prod = profile();
+    assert!(check(&prod, Intent::Run { plan: &read, confirmed: false }).unwrap().is_empty());
+    let asks = check(&prod, Intent::Run { plan: &write, confirmed: false }).unwrap();
+    assert!(asks.iter().any(|r| r.contains("production connection")), "{asks:?}");
+    assert!(check(&prod, Intent::Run { plan: &write, confirmed: true }).unwrap().is_empty());
+    let asks = check(&prod, Intent::Load { table: "t", confirmed: false, dry: false }).unwrap();
+    assert!(asks[0].contains("confirm writing rows into t"), "{asks:?}");
+    assert!(check(&prod, Intent::Load { table: "t", confirmed: true, dry: false }).unwrap().is_empty());
+    assert!(check(&prod, Intent::Load { table: "t", confirmed: false, dry: true }).unwrap().is_empty());
+}
+
+/// A refused or unconfirmed start claims nothing (the tab stays free); an
+/// allowed one holds the session until its claim drops.
+#[test]
+fn the_guard_claims_only_what_it_lets_through() {
+    use crate::guard::{Guarded, Hold, Intent};
+    let f = fixture(EnvTag::Prod);
+    let p = f.ws.get_connection(&f.conn_id).unwrap();
+    let write = f.engine.plan(&p, "delete from t where id = 1");
+    let hold = || Some(Hold::session("tab1", Default::default(), "held"));
+    assert!(matches!(f.engine.guarded(&f.conn_id, hold(), Intent::Run { plan: &write, confirmed: false }).unwrap(), Guarded::Ask { .. }));
+    let e = f.engine.guarded_or_refuse(&f.conn_id, hold(), Intent::Load { table: "t", confirmed: false, dry: false }).err().unwrap();
+    assert_eq!(e.code.as_deref(), Some("needs_confirmation"));
+    set_conn(&f, |p| p.config.read_only = true);
+    assert!(f.engine.guarded(&f.conn_id, hold(), Intent::Edit).is_err());
+    // Nothing above holds tab1.
+    let (_, claim) = f.engine.guarded_or_refuse(&f.conn_id, hold(), Intent::Inspect).unwrap();
+    assert!(claim.is_some());
+    assert_eq!(f.engine.guarded_or_refuse(&f.conn_id, hold(), Intent::EndTransaction).err().map(|e| e.message).as_deref(), Some("held"));
+    drop(claim);
+    assert!(f.engine.guarded_or_refuse(&f.conn_id, hold(), Intent::EndTransaction).is_ok());
+}
+
+/// Saving grid edits checks the connection itself: made read-only after
+/// the editor read the target, the save is refused and nothing runs.
+#[tokio::test]
+async fn edits_are_refused_on_a_connection_made_read_only() {
+    let f = fixture(EnvTag::None);
+    wait_job(&f, &started(f.engine.run(req(&f, "create table t (id integer primary key, a text); insert into t values (1, 'x')")).unwrap())).await;
+    let target = crate::edit::EditTarget {
+        connection_id: f.conn_id.clone(),
+        schema: "main".into(),
+        table: "t".into(),
+        key_columns: vec![0],
+        columns: vec![Some("id".into()), Some("a".into())],
+        apply: "transaction".into(),
+    };
+    let stmts = [crate::edit::EditStatement { sql: "UPDATE t SET a = 'y' WHERE id = 1".into(), expect_rows: Some(1) }];
+    set_conn(&f, |p| p.config.read_only = true);
+    let e = f.engine.apply_edits(&target, "tab1", &stmts).await.unwrap_err();
+    assert_eq!(e.message, "The connection is read-only");
+    // Allowed again: saved (the refused save left the tab free).
+    set_conn(&f, |p| p.config.read_only = false);
+    let rep = f.engine.apply_edits(&target, "tab1", &stmts).await.unwrap();
+    assert_eq!(rep.statements, 1);
+}

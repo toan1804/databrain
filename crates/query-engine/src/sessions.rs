@@ -283,22 +283,30 @@ impl QueryEngine {
     /// lock), and closing the tab cancels `cancel`. `busy` is the message
     /// when something already holds it.
     pub(crate) fn claim(&self, connection_id: &str, session_key: &str, cancel: CancellationToken, busy: &str) -> Result<Claim<'_>> {
+        self.claim_as(connection_id, session_key, session_key, format!("claim:{}", uuid::Uuid::new_v4()), cancel, busy)
+    }
+
+    /// [`Self::claim`] as entry `id` for run key `tab_id` on session
+    /// `session_key` (a run: its job id; notebook cells share a session):
+    /// busy when anything holds either.
+    pub(crate) fn claim_as(
+        &self,
+        connection_id: &str,
+        tab_id: &str,
+        session_key: &str,
+        id: String,
+        cancel: CancellationToken,
+        busy: &str,
+    ) -> Result<Claim<'_>> {
         let mut jobs = self.jobs.lock();
-        if jobs.values().any(|j| j.session_key == session_key || j.tab_id == session_key) {
+        if jobs.values().any(|j| [j.tab_id.as_str(), j.session_key.as_str()].iter().any(|k| *k == tab_id || *k == session_key)) {
             return Err(EngineError::new("busy", busy));
         }
-        let id = format!("claim:{}", uuid::Uuid::new_v4());
         jobs.insert(
             id.clone(),
-            JobHandle {
-                connection_id: connection_id.to_string(),
-                tab_id: session_key.to_string(),
-                session_key: session_key.to_string(),
-                cancel,
-                tab_closed: false,
-            },
+            JobHandle { connection_id: connection_id.to_string(), tab_id: tab_id.to_string(), session_key: session_key.to_string(), cancel, tab_closed: false },
         );
-        Ok(Claim { engine: self, id })
+        Ok(Claim { engine: self, id, kept: false })
     }
 
     // -------------------------------------------------------------- transactions
@@ -326,7 +334,8 @@ impl QueryEngine {
     /// COMMIT or ROLLBACK the session's transaction. Returns whether one is
     /// still open afterwards. Nothing happens without a session.
     pub async fn end_transaction(&self, connection_id: &str, session_key: &str, commit: bool) -> Result<bool> {
-        let _claim = self.claim(connection_id, session_key, CancellationToken::new(), "A query is running in this tab: wait for it or stop it first")?;
+        let hold = Hold::session(session_key, CancellationToken::new(), "A query is running in this tab: wait for it or stop it first");
+        let (_, _claim) = self.guarded_or_refuse(connection_id, Some(hold), Intent::EndTransaction)?;
         let Some(session) = self.sessions.lock().get(&(connection_id.to_string(), session_key.to_string())).map(|l| l.session.clone()) else {
             return Ok(false);
         };
@@ -470,11 +479,22 @@ impl Drop for ConnectGate<'_> {
 pub(crate) struct Claim<'a> {
     engine: &'a QueryEngine,
     id: String,
+    kept: bool,
+}
+
+impl Claim<'_> {
+    /// Keep the entry after this claim drops: a run's job ends it (its
+    /// task removes the entry, see `JobGuard`).
+    pub(crate) fn keep(mut self) {
+        self.kept = true;
+    }
 }
 
 impl Drop for Claim<'_> {
     fn drop(&mut self) {
-        self.engine.jobs.lock().remove(&self.id);
+        if !self.kept {
+            self.engine.jobs.lock().remove(&self.id);
+        }
     }
 }
 

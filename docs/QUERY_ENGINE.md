@@ -17,6 +17,7 @@ Main files:
 | `compare.rs` | Compare SQL for two outputs (column pairs, canonical values, summary, key candidates) |
 | `load.rs` | Load steps: `load_rows`, `write_output`, `dry_run_load`, `check_load_target` |
 | `edit.rs` | Grid edits: `source_table`, `edit_target`, `edit_statements`, `apply_edits` |
+| `guard.rs` | `guarded`: the one way work starts on a connection: the read-only and production rules for its `Intent` (`check_intent`), then the session's claim |
 | `plan.rs` | `explain`, `estimate_cost`, plan parsers per engine |
 | `export.rs` | Full export: `export_query`, `cancel_export` |
 | `metadata.rs` | Catalog reads on the metadata session |
@@ -56,7 +57,7 @@ One `Arc<QueryEngine>` per process (`QueryEngine::new` in `lib.rs`). Every map i
 | `manual_commit` | set of session keys | `set_manual_commit(key, false)` (the app calls it on tab close) |
 | `outputs` | `Arc<OutputRegistry>` (own lock, see below) | |
 
-`jobs` is also the "busy" list: `start_run` checks and claims a tab and its session key under one lock. `explain`, `apply_edits`, `end_transaction` and an export on a tab's session take a `Claim` (`sessions.rs` `claim`): the same check and insert under one lock, removed when the claim drops, so nothing else starts on the session meanwhile. The cost preview only looks (it runs while you type, and must not make Run find the tab busy): it uses `Meta` (`__meta__`) when the tab is held.
+`jobs` is also the "busy" list. Every entry point starts with `guarded(connection, hold, intent)` (`guard.rs`): it reads the connection, applies the read-only and production rules for the `Intent` (`Run`, `Load`, `Edit`, `Inspect`, `EndTransaction`), and only then takes a `Claim` (`sessions.rs` `claim` / `claim_as`): the check and insert under one lock, removed when the claim drops (a run keeps it: its job ends it), so nothing else starts on the session meanwhile. A refused or unconfirmed start claims nothing. The cost preview only looks (it runs while you type, and must not make Run find the tab busy): it uses `Meta` (`__meta__`) when the tab is held.
 
 ## Sessions
 
@@ -90,12 +91,13 @@ Rules:
 RunRequest ──► start_run (run.rs, synchronous)
    1. plan: split_statements + classify           (connector-core)
    2. bind_parameters (:name), classify again
-   3. read-only connection: every statement must pass read_only_allows → else "invalid"
-   4. not confirmed and safety_reasons non-empty  → RunResponse::NeedsConfirmation
-   5. output name: validate_name, check_owner (job steps own their names)
-   6. jobs lock: tab or session key already there → "busy"; else insert JobHandle
-   7. outputs.begin_run(tab): the tab's previous outputs become evictable, except kept ones
-   8. tokio::spawn(run_job)                       → RunResponse::Started { job_id, statements }
+   3. output name: validate_name, check_owner (job steps own their names)
+   4. guarded(Intent::Run): read-only connection → every statement must pass
+      read_only_allows, else "invalid"; not confirmed and safety_reasons
+      non-empty → RunResponse::NeedsConfirmation; then claim_as (jobs lock:
+      tab or session key already there → "busy"; else insert JobHandle)
+   5. outputs.begin_run(tab): the tab's previous outputs become evictable, except kept ones
+   6. tokio::spawn(run_job)                       → RunResponse::Started { job_id, statements }
 
 run_job, per statement, stops at the first error or cancel
    StatementStarted
@@ -144,13 +146,13 @@ after the loop
 | Check | Where | Applies to |
 |---|---|---|
 | Classification (`Read`, `Dml`, `Ddl`, `Session`, `Transaction`, `Other`, `Unknown`) | `connector-core/src/sql/classify.rs` | everything below |
-| Read-only connection: only reads and harmless `USE` / `SET` | `start_run` (`read_only_allows`); `prepare_load`; `edit_target`. Postgres also sets the transaction read-only in its connector | runs, loads, grid edits |
+| Read-only connection: only reads and harmless `USE` / `SET` | `check_intent` (`guard.rs`) for every entry point: `Run` (`read_only_allows`), `Load`, `Edit` (opening the editor and saving). Postgres also sets the transaction read-only in its connector | runs, loads, grid edits |
 | UPDATE / DELETE without WHERE asks | `safety_reasons` | runs with `confirmed: false` |
 | Production connection: all but reads, transaction control and harmless `USE` / `SET` ask | `prod_needs_confirmation`, `safety_reasons` | runs with `confirmed: false` |
-| One run per tab / session | `start_run` (`jobs`), `claim` | runs, plans, grid edits, Commit/Rollback, exports on a tab's session |
+| One run per tab / session | `guarded` → `claim` / `claim_as` (`jobs`) | runs, plans, grid edits, Commit/Rollback, exports and loads' source queries on a tab's session |
 | Full export runs one read statement | `export_query` | export |
 | Plans: one statement; `EXPLAIN ANALYZE` only for reads | `explain` | plans |
-| Production connection: a load asks (`needs_confirmation`); job load steps count as confirmed | `prepare_load` (`LoadSpec::confirmed`) | loads, not dry runs |
+| Production connection: a load asks (`needs_confirmation`); job load steps count as confirmed | `check_intent` `Intent::Load` (`LoadSpec::confirmed`) | loads, not dry runs |
 | A result keeps at most half the outputs budget in memory | `collect_stream` | runs |
 | Cost preview: one statement, read or DML | `cost_statement` | cost preview |
 | DuckDB sandbox for AI and MCP SQL | `sandboxed`, `session_for`; enforced in the DuckDB connector | runs and loads with `origin` Ai / Mcp |

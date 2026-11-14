@@ -12,7 +12,6 @@ Found in reviews and left for a later release on purpose. Each says what goes wr
 
 The review's findings are fixed (loads can't control their transaction and ask on production connections, a run's job guard, one transaction dialect with a savepoint for grid edits, session claims for plans, edits, Commit/Rollback and exports, a memory cap per result, outputs freed with their rows, and the low items). Left, as refactors:
 
-- **One guarded entry point.** Read-only and production checks are still made by each entry point (`start_run`, `prepare_load`, `edit_target`), next to the `claim`. `engine.guarded(session_key, origin, intent)` returning the claim after those checks would keep a new entry point from skipping one.
 - **AI chat tabs** (`ai:{session}`) close when the chat is deleted, not when it is left: the last outputs of an open chat stay active (never evicted) until then or a restart.
 - `blocking()` (`lib.rs`) hands the worker thread over only on a multi-thread runtime; on a current-thread one the workspace and file writes still block it.
 

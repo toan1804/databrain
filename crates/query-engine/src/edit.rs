@@ -22,6 +22,7 @@ use databrain_connector_core::{ConnectorKind, DbObject, ExecOptions, ObjectDetai
 use databrain_export::load::edit_literal;
 use serde::{Deserialize, Serialize};
 
+use crate::guard::{Hold, Intent};
 use crate::{EngineError, OutputInfo, QueryEngine, Result};
 
 /// The table behind an editable result.
@@ -393,9 +394,8 @@ impl QueryEngine {
     pub async fn edit_target(&self, o: &OutputInfo, schema: &SchemaRef, cached: bool) -> Result<EditTarget> {
         let no = |why: &str| Err(EngineError::new("invalid", why.to_string()));
         let profile = self.workspace().get_connection(&o.connection_id)?;
-        if profile.config.read_only {
-            return no("The connection is read-only");
-        }
+        // Why it can't be edited, before anything else (the editor shows it).
+        Self::check_intent(&profile, &Intent::Edit)?;
         if !profile.config.kind.traits().language.is_sql() {
             return no("Only results of SQL databases can be edited");
         }
@@ -493,13 +493,11 @@ impl QueryEngine {
         if stmts.is_empty() {
             return Ok(ApplyReport::default());
         }
-        let kind = self.workspace().get_connection(&t.connection_id)?.config.kind;
-        let _claim = self.claim(
-            &t.connection_id,
-            session_key,
-            databrain_connector_core::CancellationToken::new(),
-            "A query is running in this tab: wait for it to finish, then apply",
-        )?;
+        let hold =
+            Hold::session(session_key, databrain_connector_core::CancellationToken::new(), "A query is running in this tab: wait for it to finish, then apply");
+        // The connection as it is now (made read-only since the target was read: refused).
+        let (profile, _claim) = self.guarded_or_refuse(&t.connection_id, Some(hold), Intent::Edit)?;
+        let kind = profile.config.kind;
         let session = self.session(&t.connection_id, session_key).await?;
         let run = |sql: String| {
             let s = session.clone();
