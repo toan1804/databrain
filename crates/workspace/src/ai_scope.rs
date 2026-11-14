@@ -61,6 +61,19 @@ fn specificity(rule: &ScopeRule, schema: &str, table: &str, ignore_case: bool) -
     }
 }
 
+/// A foreign key's target is one the AI may use. The key may name its
+/// schema without the catalog (`sales` for `main.sales`): read in the
+/// referencing table's catalog then.
+fn key_target_allowed(rules: &[ScopeRule], from_schema: &str, fk: &ForeignKey, ignore_case: bool) -> bool {
+    if scope_allows_by(rules, &fk.ref_schema, &fk.ref_table, ignore_case) {
+        return true;
+    }
+    match from_schema.rsplit_once('.') {
+        Some((catalog, _)) if !fk.ref_schema.contains('.') => scope_allows_by(rules, &format!("{catalog}.{}", fk.ref_schema), &fk.ref_table, ignore_case),
+        _ => false,
+    }
+}
+
 /// Databases whose schema and table names ignore case (SQL Server's default
 /// collation): there `Sales` and `sales` are one schema.
 pub fn names_ignore_case(kind: &str) -> bool {
@@ -238,7 +251,12 @@ impl Workspace {
         }
         let facts = Self::facts_tx(tx, connection_id, schema, None)?;
         let mut seen = std::collections::HashSet::new();
-        for o in facts.into_iter().filter(|o| scope_allows_by(&rules, &o.schema, &o.name, ic)) {
+        for mut o in facts.into_iter().filter(|o| scope_allows_by(&rules, &o.schema, &o.name, ic)) {
+            // Its search text names the tables its keys point at: only
+            // allowed ones, or a search for a table outside the scope would
+            // rank the tables that reference it.
+            let schema_of_o = o.schema.clone();
+            o.foreign_keys.retain(|fk| key_target_allowed(&rules, &schema_of_o, fk, ic));
             let key = (o.schema.clone(), o.name.clone());
             if !seen.insert(key.clone()) {
                 continue;
@@ -704,6 +722,32 @@ mod review_tests {
         )
         .unwrap();
         assert!(!names().contains(&"sales.salaries".to_string()));
+    }
+
+    /// A table's search text names the tables its keys point at only when
+    /// the AI may use them: a search for a table outside the scope finds
+    /// nothing through the tables that reference it.
+    #[test]
+    fn search_text_names_only_allowed_key_targets() {
+        let o = |schema: &str, name: &str, kind| DbObject { schema: schema.into(), name: name.into(), kind, comment: None, row_estimate: None };
+        let rule = |schema: &str, table: &str, allow| ScopeRule { schema: schema.into(), table: table.into(), allow };
+        let ws = Workspace::open_in_memory().unwrap();
+        let col = |n: &str| ColumnInfo { name: n.into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None };
+        ws.meta_put_schema("c", "sales", &[o("sales", "orders", ObjectKind::Table)]).unwrap();
+        ws.meta_put_schema("c", "hr", &[o("hr", "payroll", ObjectKind::Table)]).unwrap();
+        let fk = ForeignKey { columns: vec!["approved_by".into()], ref_schema: "hr".into(), ref_table: "payroll".into(), ref_columns: vec!["id".into()] };
+        ws.meta_put_table("c", "sales", "orders", &[col("id"), col("approved_by")], Some(std::slice::from_ref(&fk))).unwrap();
+        ws.ai_put_rule("c", &rule("sales", "", true)).unwrap();
+        let found = |q: &str| ws.ai_catalog("c").search(q, 10).unwrap().into_iter().map(|h| h.reference).collect::<Vec<_>>();
+        assert_eq!(found("orders"), vec!["sales.orders"]);
+        assert!(found("payroll").is_empty(), "hr.payroll is outside the scope: {:?}", found("payroll"));
+        // Allowed: the key counts again (and payroll is found itself).
+        ws.ai_put_rule("c", &rule("hr", "", true)).unwrap();
+        let hits = found("payroll");
+        assert!(hits.contains(&"sales.orders".to_string()) && hits.contains(&"hr.payroll".to_string()), "{hits:?}");
+        // Excluded again: the reference goes with it.
+        ws.ai_put_rule("c", &rule("hr", "payroll", false)).unwrap();
+        assert!(found("payroll").is_empty(), "{:?}", found("payroll"));
     }
 
     #[test]
