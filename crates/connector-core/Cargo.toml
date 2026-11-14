@@ -24,4 +24,5 @@ tokio-util = "0.7.19"
 ts-rs = { version = "11.1", features = ["serde-json-impl", "no-serde-warnings"] }
 
 [dev-dependencies]
+tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }

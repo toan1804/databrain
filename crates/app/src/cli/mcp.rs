@@ -71,9 +71,12 @@ async fn serve() -> ExitCode {
         #[cfg(feature = "oracle")]
         databrain_connector_oracle::agent::set_dir(Some(dir.join("oracle-agent")));
     }
-    let server = McpServer { engine, hub };
+    let server = McpServer { engine: engine.clone(), hub };
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    if let Err(e) = server.serve(stdin, tokio::io::stdout()).await {
+    let served = server.serve(stdin, tokio::io::stdout()).await;
+    // Results and DuckDB work kept on disk don't outlive the server.
+    crate::api::remove_spill_folders(&engine);
+    if let Err(e) = served {
         tracing::error!("MCP server stopped: {e}");
         return ExitCode::FAILURE;
     }

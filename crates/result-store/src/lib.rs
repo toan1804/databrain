@@ -703,6 +703,15 @@ impl ResultStore {
         self.spill_root.lock().clone()
     }
 
+    /// Delete this process's spill folder and every result's files in it
+    /// (the process is quitting); results no longer spill after this.
+    pub fn remove_spill_root(&self) {
+        *self.spill_root.lock() = None;
+        if let Some(d) = self.spill_lock.lock().take() {
+            d.remove();
+        }
+    }
+
     /// The folder for result `id`'s files (None when results don't spill).
     pub fn spill_dir(&self, id: &str) -> Option<std::path::PathBuf> {
         let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();

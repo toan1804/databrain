@@ -34,6 +34,15 @@ impl ProcessDir {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Let go of the folder and delete it, with what is in it (the process
+    /// is quitting). Files still open elsewhere may keep it on Windows; the
+    /// next process removes it then.
+    pub fn remove(self) {
+        let Self { path, _lock } = self;
+        drop(_lock);
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 /// Remove the folders under `base` whose lock nobody holds. A process
@@ -55,4 +64,26 @@ fn remove_unheld(base: &Path) {
 
 fn fresh(p: &Path) -> bool {
     std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age < Duration::from_secs(60))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two processes (here two claims) get folders of their own; neither
+    /// deletes the other's while it is held; one removed as it quits is
+    /// gone with its files, the other stays.
+    #[test]
+    fn claimed_folders_are_kept_while_held_and_removed_on_quit() {
+        let base = tempfile::tempdir().unwrap();
+        let a = ProcessDir::claim(base.path()).unwrap();
+        std::fs::write(a.path().join("rows.parquet"), b"x").unwrap();
+        let b = ProcessDir::claim(base.path()).unwrap();
+        assert_ne!(a.path(), b.path());
+        assert!(a.path().join("rows.parquet").exists(), "held: not removed by the other claim");
+        let (a_path, b_path) = (a.path().to_path_buf(), b.path().to_path_buf());
+        a.remove();
+        assert!(!a_path.exists(), "removed with its files");
+        assert!(b_path.exists());
+    }
 }

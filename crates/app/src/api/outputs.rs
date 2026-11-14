@@ -406,6 +406,16 @@ pub fn apply_results_memory_to(engine: &databrain_query_engine::QueryEngine) {
     databrain_connector_duckdb::set_memory_limit(total.map(|t| duckdb_memory_limit(t, budget, free_floor(Some(t)))));
 }
 
+/// Delete this process's folders under `results_spill` and `duckdb_spill`
+/// as it quits: results kept on disk are unmasked copies of query rows.
+/// After a crash they stay until the next DataBrain process (app, jobs
+/// runner or MCP server) starts and finds them held by nobody.
+pub fn remove_spill_folders(engine: &databrain_query_engine::QueryEngine) {
+    engine.results().remove_spill_root();
+    #[cfg(feature = "duckdb-engine")]
+    databrain_connector_duckdb::remove_spill_dir();
+}
+
 /// Results larger than memory continue on disk in `<app dir>/results_spill`
 /// (this process's own folder), until the disk's free space drops below 5%
 /// of it, between 1 and 4 GB (a fuller disk is common: a tenth of a 1 TB disk

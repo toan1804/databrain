@@ -58,6 +58,13 @@ async fn run(args: Vec<String>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let code = command(cmd, &args, &state).await;
+    // Results and DuckDB work kept on disk don't outlive the run.
+    crate::api::remove_spill_folders(&state.engine);
+    code
+}
+
+async fn command(cmd: &str, args: &[String], state: &crate::api::AppState) -> ExitCode {
     let ctx = state.job_ctx();
     match cmd {
         "tick" => {

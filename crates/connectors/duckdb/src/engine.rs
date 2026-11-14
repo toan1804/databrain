@@ -168,6 +168,15 @@ pub fn spill_dir() -> Option<std::path::PathBuf> {
     SPILL_DIR.read().ok().and_then(|g| g.as_ref().map(|d| d.path().to_path_buf()))
 }
 
+/// Delete this process's spill folder (the process is quitting); new
+/// sessions keep DuckDB's default after this.
+pub fn remove_spill_dir() {
+    let taken = SPILL_DIR.write().ok().and_then(|mut g| g.take());
+    if let Some(d) = taken {
+        d.remove();
+    }
+}
+
 /// DuckDB version and platform of this build, e.g. ("v1.5.6", "osx_arm64").
 pub fn version_and_platform() -> Result<(String, String)> {
     engine()?;

@@ -407,6 +407,8 @@ pub fn run() {
                 // Keep each tab's last result for the next start.
                 if let Some(state) = app.try_state::<AppState>() {
                     state.engine.outputs().persist_active();
+                    // Then the rows kept on disk go (unmasked copies of query results).
+                    api::remove_spill_folders(&state.engine);
                 }
             }
         });
