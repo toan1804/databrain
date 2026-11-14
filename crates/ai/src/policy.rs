@@ -202,28 +202,39 @@ fn function_writes(profile: &ConnectionProfile, pieces: &[ParsedStatement], why:
     })
 }
 
-/// Wrap a read query with a row cap unless it already has one.
+/// Whether `provider` (this conversation's, `None` when it has none: MCP)
+/// may receive a connection's schema and data: no list means any provider.
+pub fn provider_allowed(policy: &AiPolicy, provider: Option<&str>) -> bool {
+    policy.allowed_providers.is_empty() || provider.is_none_or(|p| policy.allowed_providers.iter().any(|a| a == p))
+}
+
+/// A read query with a row cap added on the server, where that is safe:
+/// one `SELECT` / `WITH` statement without a limit of its own, on an engine
+/// whose limit is a trailing `LIMIT n`. Everything else is returned as it
+/// is: the engine's row limit stops the fetch at the cap either way.
+///
+/// The cap is appended, never a wrapping subquery: a subquery needs every
+/// column named and unique (SQL Server, MySQL, Oracle refuse `count(*)` or
+/// two `id` columns in one), can't hold a `WITH` on SQL Server, and drops
+/// the order.
 pub fn cap_rows(kind: ConnectorKind, sql: &str, limit: usize) -> String {
-    let s = sql.trim().trim_end_matches(';').trim();
-    let lower = s.to_ascii_lowercase();
-    let has_limit = lower.split_whitespace().rev().take(4).any(|w| w == "limit" || w == "fetch" || w == "top");
-    let first = lower.split_whitespace().next().unwrap_or("");
-    // Wrapping an ordered query in a subquery does not keep its order in
-    // most engines; the engine's row limit still stops the fetch at the cap.
-    let ordered = lower.split_whitespace().collect::<Vec<_>>().windows(2).any(|w| w == ["order", "by"]);
-    if has_limit || ordered || !(first == "select" || first == "with") {
-        return s.to_string();
-    }
     use databrain_connector_core::traits::RowLimit;
-    if !kind.traits().language.is_sql() {
-        // Other languages cap rows through the session's row limit.
+    let s = sql.trim().trim_end_matches(';').trim();
+    let t = kind.traits();
+    if !t.language.is_sql() || t.row_limit != RowLimit::Limit || parse_script(s, kind).len() != 1 {
         return s.to_string();
     }
-    match kind.traits().row_limit {
-        RowLimit::Top => format!("SELECT TOP ({limit}) * FROM (\n{s}\n) AS _q"),
-        RowLimit::FetchFirst => format!("SELECT * FROM (\n{s}\n) WHERE ROWNUM <= {limit}"),
-        RowLimit::Limit => format!("SELECT * FROM (\n{s}\n) AS _q LIMIT {limit}"),
+    let lower = s.to_ascii_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).collect();
+    let first = words.first().copied().unwrap_or("");
+    // Clauses a trailing LIMIT can't follow (or that already limit), among
+    // the statement's last words.
+    let closing = words.iter().rev().take(6).any(|w| matches!(*w, "limit" | "fetch" | "offset" | "for" | "into" | "format" | "settings"));
+    if closing || !(first == "select" || first == "with") {
+        return s.to_string();
     }
+    // On its own line: the statement may end in a `--` comment.
+    format!("{s}\nLIMIT {limit}")
 }
 
 /// Whether a column name must be masked for this connection. A rule is
@@ -242,6 +253,15 @@ pub fn is_pii(policy: &AiPolicy, table: Option<&str>, column: &str) -> bool {
         }
         rule_table.is_empty() || table.is_some_and(|t| same_table(rule_table, &name_parts(t)))
     })
+}
+
+/// Columns to mask when nothing says which table they come from (a result
+/// with no SQL to trace): one named like any rule's column, with or
+/// without a table in the rule (`users.email` masks `email`: it may be
+/// that table's; fail closed).
+pub fn masked_by_name(policy: &AiPolicy, columns: &[String]) -> Vec<bool> {
+    let rules: Vec<String> = policy.pii_columns.iter().filter_map(|p| name_parts(p).pop()).collect();
+    columns.iter().map(|c| rules.contains(&unquote(c))).collect()
 }
 
 /// The parts of a dotted name, unquoted and lower-cased (`"Public".users` → `public`, `users`).
@@ -485,12 +505,39 @@ mod tests {
 
     #[test]
     fn caps_rows() {
-        assert_eq!(cap_rows(ConnectorKind::Postgres, "select * from t;", 50), "SELECT * FROM (\nselect * from t\n) AS _q LIMIT 50");
-        assert_eq!(cap_rows(ConnectorKind::Postgres, "select * from t limit 5", 50), "select * from t limit 5");
-        assert!(cap_rows(ConnectorKind::Mssql, "select 1", 10).starts_with("SELECT TOP (10)"));
-        assert_eq!(cap_rows(ConnectorKind::Postgres, "show tables", 10), "show tables");
-        // Ordered queries are not wrapped (a subquery would drop the order).
-        assert_eq!(cap_rows(ConnectorKind::Duckdb, "select * from t order by 2 desc", 10), "select * from t order by 2 desc");
+        use ConnectorKind::*;
+        assert_eq!(cap_rows(Postgres, "select * from t;", 50), "select * from t\nLIMIT 50");
+        assert_eq!(cap_rows(Postgres, "select * from t limit 5", 50), "select * from t limit 5");
+        assert_eq!(cap_rows(Postgres, "show tables", 10), "show tables");
+        // The order is kept, a WITH and a trailing comment too.
+        assert_eq!(cap_rows(Duckdb, "select * from t order by 2 desc", 10), "select * from t order by 2 desc\nLIMIT 10");
+        assert_eq!(cap_rows(Postgres, "with x as (select 1 a) select a from x -- all", 10), "with x as (select 1 a) select a from x -- all\nLIMIT 10");
+        assert_eq!(cap_rows(Mysql, "select a.id, b.id, count(*) from a join b on a.id = b.id group by 1, 2", 10).matches("select").count(), 1, "no subquery");
+        // Left as written (the engine's row limit caps the fetch): several
+        // statements, clauses a LIMIT can't follow, engines without LIMIT.
+        for (kind, sql) in [
+            (Postgres, "select 1; select 2"),
+            (Postgres, "select * from t for update"),
+            (Postgres, "select * from t offset 5"),
+            (Postgres, "select * from t fetch first 5 rows only"),
+            (Clickhouse, "select * from t format JSON"),
+            (Mssql, "select count(*) from t"),
+            (Mssql, "with x as (select 1 a) select a from x"),
+            (Oracle, "select a.id, b.id from a join b on a.id = b.id"),
+            (Mongodb, "db.t.find({})"),
+        ] {
+            assert_eq!(cap_rows(kind, sql, 10), sql, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn providers_a_connection_allows() {
+        let any = AiPolicy::default();
+        assert!(provider_allowed(&any, Some("p1")) && provider_allowed(&any, None));
+        let only = AiPolicy { allowed_providers: vec!["local".into()], ..Default::default() };
+        assert!(provider_allowed(&only, Some("local")));
+        assert!(!provider_allowed(&only, Some("cloud")), "another provider is refused");
+        assert!(provider_allowed(&only, None), "MCP has no DataBrain provider: mcp_enabled decides there");
     }
 
     #[test]
@@ -499,6 +546,16 @@ mod tests {
         assert!(is_pii(&p, Some("public.users"), "EMAIL"));
         assert!(!is_pii(&p, Some("orders"), "email"));
         assert!(is_pii(&p, None, "ssn"));
+    }
+
+    #[test]
+    fn columns_of_an_unknown_table_are_masked_by_name() {
+        let p = AiPolicy { pii_columns: vec!["users.email".into(), "crm.public.leads.phone".into(), "ssn".into()], ..Default::default() };
+        let cols: Vec<String> = ["id", "Email", "\"phone\"", "ssn", "name", "emails"].iter().map(|c| c.to_string()).collect();
+        assert_eq!(masked_by_name(&p, &cols), [false, true, true, true, false, false]);
+        // With the table unknown, `is_pii` alone leaves a rule with a table unmatched.
+        assert!(!is_pii(&p, None, "email"));
+        assert_eq!(masked_by_name(&AiPolicy::default(), &cols), [false; 6], "no rules: nothing masked");
     }
 
     #[test]

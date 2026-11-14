@@ -398,6 +398,34 @@ fn empty_reply_is_normal(stop_reason: Option<&str>) -> bool {
     matches!(stop_reason.map(str::to_ascii_lowercase).as_deref(), None | Some("stop" | "end" | "end_turn" | "stop_sequence"))
 }
 
+/// Characters of conversation sent with one request (about 50k tokens):
+/// a turn of many tool calls, each result up to 16k characters, would
+/// otherwise outgrow a model's context and fail at the provider.
+const CONTEXT_CHARS: usize = 200_000;
+
+/// What an old tool result is replaced by when the conversation is over
+/// [`CONTEXT_CHARS`].
+const RESULT_DROPPED: &str = "(This earlier tool result was dropped to keep the conversation within the model's context. Call the tool again if you need it.)";
+
+/// Keep what is sent within `budget` characters: the oldest tool results
+/// go first (the calls and the answers stay, so the model still knows what
+/// it did), never the last four messages. The saved conversation is not
+/// changed.
+fn fit_context(messages: &mut [Message], budget: usize) {
+    let size = |m: &Message| m.text.len() + m.tool_calls.iter().map(|c| c.arguments.to_string().len()).sum::<usize>();
+    let mut total: usize = messages.iter().map(size).sum();
+    let keep_from = messages.len().saturating_sub(4);
+    for m in messages[..keep_from].iter_mut().filter(|m| m.role == Role::Tool) {
+        if total <= budget {
+            break;
+        }
+        if m.text.len() > RESULT_DROPPED.len() {
+            total -= m.text.len() - RESULT_DROPPED.len();
+            m.text = RESULT_DROPPED.to_string();
+        }
+    }
+}
+
 fn history_text(messages: &[Message]) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut size = 0;
@@ -480,8 +508,7 @@ impl Agent {
             Some(id) => ws.get_ai_provider(id)?,
             None => providers.first().cloned().ok_or_else(|| AiError::Config("add an AI provider first (AI panel → Providers)".into()))?,
         };
-        let allowed = &profile.ai_policy.allowed_providers;
-        if !allowed.is_empty() && !allowed.contains(&rec.id) {
+        if !crate::policy::provider_allowed(&profile.ai_policy, Some(&rec.id)) {
             return Err(AiError::Policy(format!("provider \"{}\" is not allowed for this connection", rec.name)));
         }
         let (provider, cfg, _) = provider_for(&rec, self.secrets.clone())?;
@@ -506,6 +533,17 @@ impl Agent {
                 updated_at: 0,
             })?,
         };
+        // A conversation begun on another connection (the chat follows the
+        // tab in front): its history holds that connection's schema and
+        // results, which go only to a provider that connection allows.
+        if let Some(began) = session.connection_id.as_deref().filter(|c| *c != profile.id).and_then(|c| ws.get_connection(c).ok())
+            && !crate::policy::provider_allowed(&began.ai_policy, Some(&rec.id))
+        {
+            return Err(AiError::Policy(format!(
+                "this conversation began on \"{}\", which doesn't allow the provider \"{}\": start a new conversation for \"{}\"",
+                began.name, rec.name, profile.name
+            )));
+        }
         let sid = session.id.clone();
         sink.emit(AgentEvent::Started { session_id: sid.clone(), run_id: run_id.clone() });
 
@@ -557,6 +595,8 @@ impl Agent {
             if let Some(p) = all.iter().find(|&p| p.id == w || p.name.eq_ignore_ascii_case(w)).cloned()
                 && p.id != profile.id
                 && p.ai_policy.ai_enabled
+                // Its schema goes into the prompt: only to a provider it allows.
+                && crate::policy::provider_allowed(&p.ai_policy, Some(&rec.id))
                 && !others.iter().any(|o| o.id == p.id)
             {
                 others.push(p);
@@ -614,6 +654,7 @@ impl Agent {
             host,
             cancel: cancel.clone(),
             results: parking_lot::Mutex::new(req.context.result_id.clone().into_iter().chain(mentioned_ids).collect()),
+            provider_id: Some(rec.id.clone()),
         };
 
         if let Some(kiro) = provider.as_kiro() {
@@ -648,6 +689,7 @@ impl Agent {
 
         let mut final_text = String::new();
         for _step in 0..self.max_steps {
+            fit_context(&mut messages, CONTEXT_CHARS);
             let chat = ChatRequest {
                 model: model.clone(),
                 system: system.clone(),
@@ -738,7 +780,7 @@ impl Agent {
                     display: o.display.clone(),
                 });
                 let tm = Message::tool(&c, content);
-                ws.add_ai_message(&sid, "tool", &json!({"message": tm, "display": o.display}).get("message").cloned().unwrap_or_default(), (None, None))?;
+                ws.add_ai_message(&sid, "tool", &serde_json::to_value(&tm).unwrap_or_default(), (None, None))?;
                 messages.push(tm);
             }
         }
@@ -777,6 +819,33 @@ mod tests {
         // A complete history is unchanged.
         let fine = vec![Message::user("q"), Message::assistant("", vec![call("a")]), Message::tool(&call("a"), "ok"), Message::assistant("a", vec![])];
         assert_eq!(repair_tool_pairs(fine.clone()).len(), fine.len());
+    }
+
+    /// Over the budget, the oldest tool results are dropped first; the
+    /// calls, the answers and the last messages stay.
+    #[test]
+    fn old_tool_results_make_room() {
+        let call = |id: &str| ToolCall { id: id.into(), name: "run_query".into(), arguments: json!({}) };
+        let big = "x".repeat(10_000);
+        let mut msgs = vec![Message::user("q")];
+        for i in 0..6 {
+            let c = call(&i.to_string());
+            msgs.push(Message::assistant(format!("step {i}"), vec![c.clone()]));
+            msgs.push(Message::tool(&c, big.clone()));
+        }
+        let before = msgs.clone();
+        fit_context(&mut msgs, 1_000_000);
+        assert_eq!(msgs, before, "within the budget: unchanged");
+        fit_context(&mut msgs, 35_000);
+        let dropped: Vec<bool> = msgs.iter().filter(|m| m.role == Role::Tool).map(|m| m.text == RESULT_DROPPED).collect();
+        assert_eq!(dropped, [true, true, true, false, false, false], "oldest first, only as many as needed");
+        assert_eq!(msgs.len(), before.len());
+        assert!(msgs.iter().zip(&before).all(|(a, b)| a.role == b.role && a.tool_calls == b.tool_calls && a.tool_call_id == b.tool_call_id));
+        // The last four messages are never touched, whatever the budget.
+        fit_context(&mut msgs, 0);
+        assert_eq!(msgs[msgs.len() - 1].text, big);
+        assert_eq!(msgs[msgs.len() - 3].text, big);
+        assert_eq!(msgs[msgs.len() - 5].text, RESULT_DROPPED);
     }
 
     /// Empty assistant turns saved by older versions (a blocked reply) are

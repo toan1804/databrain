@@ -83,6 +83,9 @@ pub trait ToolHost: Send + Sync {
     async fn start_job(&self, _job_id: &str, _only: Option<Vec<String>>) -> std::result::Result<i64, String> {
         Err("running jobs is only available in the DataBrain app".into())
     }
+    /// Cancel the running job `job_id` (a run [`Self::start_job`] began,
+    /// when the user stops the assistant).
+    async fn stop_job(&self, _job_id: &str) {}
 }
 
 pub struct ToolContext {
@@ -95,6 +98,11 @@ pub struct ToolContext {
     pub cancel: tokio_util::sync::CancellationToken,
     /// Results produced by this session (allowed for query_result).
     pub results: parking_lot::Mutex<Vec<String>>,
+    /// The AI provider this conversation sends to (`None` over MCP, where the
+    /// client's own model reads the answers): a connection that only allows
+    /// some providers (`allowed_providers`) is closed to the others, also
+    /// when it is reached from another connection's conversation.
+    pub provider_id: Option<String>,
 }
 
 pub struct ToolOutput {
@@ -168,6 +176,17 @@ impl ToolContext {
         }
     }
 
+    /// `p`'s schema and data may go to this conversation's provider.
+    pub(crate) fn provider_allowed(&self, p: &ConnectionProfile) -> Result<()> {
+        if crate::policy::provider_allowed(&p.ai_policy, self.provider_id.as_deref()) {
+            return Ok(());
+        }
+        Err(AiError::Policy(format!(
+            "\"{}\" doesn't allow this conversation's AI provider (Connection → AI settings → allowed providers); its tables and data can't be used here",
+            p.name
+        )))
+    }
+
     /// Connection a schema tool looks at: `connection` (name or id) or the current one.
     fn schema_target(&self, args: &Value) -> Result<ConnectionProfile> {
         let Some(want) = args.get("connection").and_then(|c| c.as_str()).map(str::trim).filter(|c| !c.is_empty()) else {
@@ -183,6 +202,7 @@ impl ToolContext {
         if self.caller == Caller::Mcp && !p.ai_policy.mcp_enabled && !c.results {
             return Err(AiError::Policy(format!("\"{}\" is not shared with MCP", p.name)));
         }
+        self.provider_allowed(&p)?;
         Ok(p)
     }
 

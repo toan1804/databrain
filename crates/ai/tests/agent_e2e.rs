@@ -262,6 +262,7 @@ async fn denied_approval_and_blocked_writes() {
         host,
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     let o = ctx.call("run_query", &json!({"sql": "select 1"})).await;
     assert!(o.content.contains("declined"), "{}", o.content);
@@ -697,6 +698,7 @@ async fn ai_tools_use_output_handles_with_source_policies() {
         host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     // Handles work wherever a result id was accepted.
     let o = ctx.call("result_summary", &json!({"result_id": "by_country"})).await;
@@ -794,6 +796,7 @@ async fn output_columns_stay_masked_in_duckdb() {
         host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     for sql in [
         "with c(a, b, x) as (select * from results.people) select x from c order by a",
@@ -852,6 +855,7 @@ async fn table_access_rules() {
         host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     let o = ctx.call("run_query", &json!({"sql": "select country, sum(amount) from orders group by 1"})).await;
     assert!(o.content.contains("returned 2 rows"), "{}", o.content);
@@ -881,6 +885,7 @@ async fn table_access_rules() {
         host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     assert!(mcp.call("run_query", &json!({"sql": "select email from customers"})).await.content.starts_with("ERROR"));
 
@@ -1104,6 +1109,7 @@ async fn knowledge_note_tools_add_list_update() {
         host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     let o = ctx.call("add_knowledge_note", &json!({"target": "main.orders", "note": "status 2 = shipped"})).await;
     assert!(o.content.contains("review"), "{}", o.content);
@@ -1179,6 +1185,7 @@ async fn note_targets_must_be_real_tables() {
         host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     let o = ctx.call("add_knowledge_note", &json!({"target": "orders or ghost", "note": "x"})).await;
     assert!(o.content.starts_with("ERROR") && o.content.contains("ghost"), "{}", o.content);
@@ -1203,6 +1210,7 @@ async fn creates_a_job_across_connections() {
         host: Arc::new(Host { approvals: AtomicUsize::new(0), approve }),
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     let c = ctx(true);
     let conns = c.call("list_connections", &json!({})).await.content;
@@ -1296,6 +1304,7 @@ async fn jobs_follow_the_ai_policy() {
         host: host.clone(),
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     let save = |name: &str, policy: AiPolicy, env: EnvTag| {
         f.ws.save_connection(ConnectionProfile { id: String::new(), name: name.into(), ai_policy: policy, env, ..profile.clone() }).unwrap()
@@ -1385,6 +1394,7 @@ async fn functions_that_could_write_need_the_user() {
         host,
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     let declines = Arc::new(Host { approvals: AtomicUsize::new(0), approve: false });
     let agent = ctx(databrain_ai::Caller::Agent, declines.clone());
@@ -1456,6 +1466,7 @@ async fn index_tables_adds_missing_tables_after_approval() {
         host: Arc::new(Host { approvals: AtomicUsize::new(0), approve }),
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     let missing = ctx(true).call("describe_table", &json!({"table": "orders"})).await;
     assert!(missing.content.contains("index_tables"), "{}", missing.content);
@@ -1533,6 +1544,7 @@ async fn documented_joins_are_checked_reviewed_and_used() {
         host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     let join = |left: &str, lc: &[&str], right: &str, rc: &[&str], source: &str| json!({"left_table": left, "left_columns": lc, "right_table": right, "right_columns": rc, "source": source});
     // Checked: tables in the index, columns that exist, a source, matching sides.
@@ -1632,6 +1644,7 @@ async fn ai_tools_see_only_the_tables_the_scope_allows() {
         host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
         cancel: Default::default(),
         results: Mutex::new(vec![]),
+        provider_id: None,
     };
     let missing = |c: &str| c.starts_with("ERROR") && c.contains("not available to the AI");
     // describe_table
@@ -1690,4 +1703,179 @@ async fn ai_tools_see_only_the_tables_the_scope_allows() {
     f.ws.ai_delete_rule(&f.conn, "main", "customers").unwrap();
     let o = ctx.call("describe_table", &json!({"table": "customers"})).await;
     assert!(o.content.contains("email"), "{}", o.content);
+}
+
+// ------------------------------------------------------------------ each connection's own rules, wherever it is reached from
+
+/// The result in the grid, for `query_result` / `result_summary`.
+struct Grid(String);
+#[async_trait::async_trait]
+impl ToolHost for Grid {
+    async fn approve(&self, _tool: &str, _summary: &str, detail: &Value) -> Option<Value> {
+        Some(detail.clone())
+    }
+    fn current_result(&self) -> Option<String> {
+        Some(self.0.clone())
+    }
+}
+
+/// A connection's AI settings hold when it is reached from another
+/// connection's conversation, through the grid's current result, or through
+/// a job: allowed providers, "share metadata", AI off.
+#[tokio::test]
+async fn a_connections_rules_hold_wherever_it_is_reached_from() {
+    let f = fixture(1, AiPolicy { run_query: RunQueryPolicy::AutoRead, share_result_rows: true, ..Default::default() }).await;
+    let profile = f.ws.get_connection(&f.conn).unwrap();
+    let other = |name: &str, policy: AiPolicy| {
+        f.ws.save_connection(ConnectionProfile { id: String::new(), name: name.into(), ai_policy: policy, ..profile.clone() }).unwrap()
+    };
+    let auto = || AiPolicy { run_query: RunQueryPolicy::AutoRead, ..Default::default() };
+    other("Local only", AiPolicy { allowed_providers: vec!["local-model".into()], ..auto() });
+    let copy = other("Shop copy", auto());
+    let closed = other("Closed", AiPolicy { ai_enabled: false, ..Default::default() });
+    let ctx = |provider: &str, host: Arc<dyn ToolHost>| databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: profile.clone(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host,
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+        provider_id: Some(provider.into()),
+    };
+    let yes = || -> Arc<dyn ToolHost> { Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }) };
+
+    // Allowed providers: a conversation on another provider can't read the
+    // connection's tables or data through the `connection` argument.
+    let cloud = ctx("cloud", yes());
+    for (tool, args) in [
+        ("run_query", json!({"sql": "select count(*) n from customers", "connection": "Local only"})),
+        ("describe_table", json!({"table": "orders", "connection": "Local only"})),
+        ("list_tables", json!({"connection": "Local only"})),
+        ("search_schema", json!({"query": "orders", "connection": "Local only"})),
+    ] {
+        let o = cloud.call(tool, &args).await.content;
+        assert!(o.starts_with("ERROR") && o.contains("doesn't allow this conversation's AI provider"), "{tool}: {o}");
+    }
+    // The provider it allows, and connections without a list, work.
+    let o = ctx("local-model", yes()).call("run_query", &json!({"sql": "select count(*) n from customers", "connection": "Local only"})).await.content;
+    assert!(o.contains("returned 1 rows"), "{o}");
+    let o = cloud.call("run_query", &json!({"sql": "select count(*) n from customers", "connection": "Shop copy"})).await.content;
+    assert!(o.contains("returned 1 rows"), "{o}");
+
+    // Reads the assistant runs are capped by a trailing LIMIT, not a
+    // subquery: unnamed and repeated columns, and two statements, run.
+    let o = cloud
+        .call("run_query", &json!({"sql": "select c.id, o.id, count(*) from customers c join orders o on o.customer_id = c.id group by 1, 2"}))
+        .await
+        .content;
+    assert!(o.contains("returned 3 rows"), "{o}");
+    let o = cloud.call("run_query", &json!({"sql": "select 1 as a; select 2 as b"})).await.content;
+    assert!(o.contains("Statement 1 returned 1 rows") && o.contains("Statement 2 returned 1 rows"), "{o}");
+
+    // "Share metadata" off: describe_table gives the name only, index_tables is refused.
+    let mut names_only = profile.clone();
+    names_only.ai_policy.share_metadata = false;
+    let names_only = f.ws.save_connection(names_only).unwrap();
+    let hidden = databrain_ai::ToolContext { profile: names_only, ..ctx("cloud", yes()) };
+    let o = hidden.call("describe_table", &json!({"table": "orders"})).await.content;
+    assert!(o.contains("metadata sharing disabled") && !o.contains("customer_id") && !o.contains("amount"), "{o}");
+    let o = hidden.call("index_tables", &json!({"tables": ["main.orders"]})).await.content;
+    assert!(o.starts_with("ERROR") && o.contains("metadata is disabled"), "{o}");
+    f.ws.save_connection(profile.clone()).unwrap();
+    assert!(cloud.call("describe_table", &json!({"table": "orders"})).await.content.contains("customer_id"), "shared again");
+
+    // The grid's current result comes from a connection with AI off: it is
+    // not summarised and not aggregated.
+    let r = RunRequest {
+        connection_id: closed.id.clone(),
+        tab_id: uuid::Uuid::new_v4().to_string(),
+        sql: "select name, email from customers".into(),
+        base_offset: 0,
+        row_limit: None,
+        confirmed: true,
+        origin: Origin::User,
+        session_key: None,
+        output_name: None,
+        params: Default::default(),
+        output_masks: None,
+    };
+    let rid = f.engine.run_and_wait(&f.hub, r, None).await.unwrap()[0].result.as_ref().unwrap().id.clone();
+    let grid = ctx("cloud", Arc::new(Grid(rid.clone())));
+    for (tool, args) in [("query_result", json!({"result_id": rid, "sql": "select count(*) from result"})), ("result_summary", json!({"result_id": rid}))] {
+        let o = grid.call(tool, &args).await.content;
+        assert!(o.starts_with("ERROR") && o.contains("AI is disabled"), "{tool}: {o}");
+    }
+
+    // Jobs: one whose step is on a connection the assistant may not work on
+    // is not listed or read, and its steps no longer pass the review a run makes.
+    let c = ctx("cloud", yes());
+    let o = c
+        .call("create_job", &json!({"name": "Count customers", "steps": [{"name": "customer_count", "action": "query", "connection": "Shop copy", "sql": "select count(*) n from customers"}]}))
+        .await
+        .content;
+    assert!(o.contains("Created job"), "{o}");
+    assert!(c.call("list_jobs", &json!({})).await.content.contains("Count customers"));
+    let job = f.ws.get_job(&f.ws.list_jobs().unwrap()[0].id).unwrap();
+    assert!(databrain_ai::jobs::review_step(&f.engine, &job.nodes[0]).is_ok());
+    // A load that copies rows out of a connection that doesn't share its
+    // rows (Shop copy) needs the user's own approval, with the reason; one
+    // from a connection that shares them (Shop) is an ordinary approval.
+    other("Scratch", AiPolicy { allow_write: true, ..Default::default() });
+    let copy_job = |name: &str, step: &str, from: &str| {
+        json!({"name": name, "steps": [
+            {"name": step, "action": "query", "connection": from, "sql": "select name from customers"},
+            {"name": format!("{step}_saved"), "action": "load", "after": [step], "target_connection": "Scratch", "target_table": "names"}
+        ]})
+    };
+    for (name, step, from, asks_the_user) in [("Copy private", "private_names", "Shop copy", true), ("Copy shared", "shared_names", "Shop", false)] {
+        let o = c.call("create_job", &copy_job(name, step, from)).await.content;
+        assert!(o.contains("Created job"), "{o}");
+        let id = f.ws.list_jobs().unwrap().into_iter().find(|j| j.name == name).unwrap().id;
+        let reasons = databrain_ai::jobs::review(&f.engine, &f.ws.get_job(&id).unwrap(), &[]).unwrap();
+        assert_eq!(reasons.iter().any(|r| r.contains("copies rows from \"Shop copy\" into \"Scratch\"")), asks_the_user, "{name}: {reasons:?}");
+        f.ws.delete_job(&id).unwrap();
+    }
+    f.ws.save_connection(ConnectionProfile { ai_policy: AiPolicy { ai_enabled: false, ..Default::default() }, ..copy.clone() }).unwrap();
+    assert_eq!(c.call("list_jobs", &json!({})).await.content, "No jobs.");
+    let o = c.call("get_job", &json!({"job": "Count customers"})).await.content;
+    assert!(o.starts_with("ERROR") && o.contains("no job") && !o.contains("select count"), "{o}");
+    let e = databrain_ai::jobs::review_step(&f.engine, &job.nodes[0]).unwrap_err().to_string();
+    assert!(e.contains("AI is disabled"), "{e}");
+    // Shared with the assistant, not with MCP: an MCP client doesn't see it either.
+    f.ws.save_connection(copy.clone()).unwrap();
+    let mcp = databrain_ai::ToolContext { caller: databrain_ai::Caller::Mcp, provider_id: None, ..ctx("cloud", yes()) };
+    assert_eq!(mcp.call("list_jobs", &json!({})).await.content, "No jobs.");
+
+    // Notes: a long one is refused; one the assistant wrote is marked as its own when given back.
+    let o = c.call("add_knowledge_note", &json!({"note": "x".repeat(601)})).await.content;
+    assert!(o.starts_with("ERROR") && o.contains("601 characters"), "{o}");
+
+    // A conversation begun on a connection that only allows another
+    // provider can't be continued here: its history would go to this one.
+    let session = |conn: &str| {
+        f.ws.save_ai_session(databrain_workspace::AiSessionRecord {
+            id: String::new(),
+            title: "t".into(),
+            connection_id: Some(conn.into()),
+            provider_id: None,
+            model: None,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap()
+        .id
+    };
+    let local_only = f.ws.list_connections().unwrap().into_iter().find(|p| p.name == "Local only").unwrap().id;
+    let agent = Agent { engine: f.engine.clone(), hub: f.hub.clone(), secrets: f.secrets.clone(), max_steps: 2 };
+    let turn = |sid: String| {
+        let r = AgentRequest { session_id: Some(sid), ..req(&f) };
+        agent.run(r, "run".into(), yes(), Arc::new(Events::default()), Default::default())
+    };
+    let e = turn(session(&local_only)).await.unwrap_err().to_string();
+    assert!(e.contains("began on \"Local only\""), "{e}");
+    // One begun on a connection without such a list goes on (to the provider: nothing listens on the fixture's port).
+    let e = turn(session(&copy.id)).await.unwrap_err().to_string();
+    assert!(!e.contains("began on"), "{e}");
 }

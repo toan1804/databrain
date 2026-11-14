@@ -148,14 +148,32 @@ impl KeySource {
     }
 }
 
+/// The one HTTP client of every provider (its connections are reused, so
+/// an inline completion doesn't pay a TLS handshake each time).
+/// - No redirects: a redirect to another host would carry the API key
+///   (`x-api-key`, `api-key`, `x-goog-api-key` and custom headers are not
+///   dropped the way `Authorization` is) and the prompt with it.
+///   [`check`] says where the server pointed, for the base URL to be fixed.
+/// - An idle limit, not a total one: a long answer may stream for many
+///   minutes, a server that stops sending is given up on.
 fn http() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(600))
-        .user_agent(concat!("DataBrain/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("http client")
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(20))
+                .read_timeout(IDLE_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent(concat!("DataBrain/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .expect("http client")
+        })
+        .clone()
 }
+
+/// Longest silence from a provider (before its first byte, or between two
+/// parts of a streamed answer; local models can take minutes to start).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn net(e: reqwest::Error) -> AiError {
     AiError::Network(e.to_string())
@@ -166,6 +184,12 @@ async fn check(resp: reqwest::Response, provider: &str) -> Result<reqwest::Respo
         return Ok(resp);
     }
     let status = resp.status();
+    if status.is_redirection() {
+        let to = resp.headers().get(reqwest::header::LOCATION).and_then(|l| l.to_str().ok()).unwrap_or("another address");
+        return Err(AiError::Config(format!(
+            "{provider} ({status}): the server redirects to {to}. DataBrain doesn't follow redirects with an API key: set the provider's base URL to the final address."
+        )));
+    }
     let body = resp.text().await.unwrap_or_default();
     let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     let msg = v
@@ -371,11 +395,13 @@ impl LlmProvider for OpenAi {
                 .map(|t| json!({"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.parameters}}))
                 .collect();
         }
-        if let Some(t) = req.temperature {
+        // Reasoning models refuse `temperature` and `max_tokens`.
+        let reasoning = openai_reasoning_model(&req.model);
+        if let Some(t) = req.temperature.filter(|_| !reasoning) {
             body["temperature"] = json!(t);
         }
         if let Some(m) = req.max_tokens {
-            body["max_tokens"] = json!(m);
+            body[if reasoning { "max_completion_tokens" } else { "max_tokens" }] = json!(m);
         }
         let resp = self.req(reqwest::Method::POST, &path).await?.json(&body).send().await.map_err(net)?;
         let resp = check(resp, self.kind.as_str()).await?;
@@ -385,6 +411,38 @@ impl LlmProvider for OpenAi {
 
 /// Parse an OpenAI chat-completions SSE stream (tool-call argument deltas
 /// are assembled by index).
+/// OpenAI's reasoning models (o1, o3, o4-mini, gpt-5…, also behind a
+/// `vendor/` prefix): they take `max_completion_tokens` and no `temperature`.
+pub(crate) fn openai_reasoning_model(model: &str) -> bool {
+    let m = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    ["o1", "o3", "o4", "gpt-5"].iter().any(|p| m.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.', ':'])))
+}
+
+/// Ends a provider's stream with an error when it stopped without saying
+/// the reply was complete (no [`ChatEvent::Done`]): the connection closed
+/// mid-answer, or the provider sent something this code doesn't read. What
+/// came so far must not be saved as a finished answer.
+fn complete_or_error(events: BoxStream<'static, Result<ChatEvent>>, provider: &'static str) -> BoxStream<'static, Result<ChatEvent>> {
+    futures::stream::unfold((events, false, false), move |(mut ev, mut done, ended)| async move {
+        if ended {
+            return None;
+        }
+        match ev.next().await {
+            Some(e) => {
+                // An error is its own ending.
+                done |= matches!(e, Ok(ChatEvent::Done { .. }) | Err(_));
+                Some((e, (ev, done, false)))
+            }
+            None if done => None,
+            None => Some((
+                Err(AiError::Provider(format!("{provider}'s answer was cut off: the stream ended before the reply was complete. Try again."))),
+                (ev, done, true),
+            )),
+        }
+    })
+    .boxed()
+}
+
 pub fn openai_stream(bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>) -> BoxStream<'static, Result<ChatEvent>> {
     let events = sse::events(bytes);
     let state: (BTreeMap<u64, (String, String, String)>, bool) = (BTreeMap::new(), false);
@@ -431,12 +489,20 @@ pub fn openai_stream(bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>) -
                     out.push(Ok(ChatEvent::TextDelta(t.to_string())));
                 }
                 for tc in d["tool_calls"].as_array().cloned().unwrap_or_default() {
-                    let idx = tc["index"].as_u64().unwrap_or(0);
+                    // Servers that leave `index` out: a new id is a new call
+                    // (else two calls would run together as one).
+                    let id = tc["id"].as_str().filter(|i| !i.is_empty());
+                    let idx = tc["index"].as_u64().unwrap_or_else(|| match (calls.last_key_value(), id) {
+                        (Some((k, (last, _, _))), Some(id)) if !last.is_empty() && last != id => k + 1,
+                        (Some((k, _)), _) => *k,
+                        (None, _) => 0,
+                    });
                     let entry = calls.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
-                    if let Some(id) = tc["id"].as_str() {
+                    if let Some(id) = id {
                         entry.0 = id.to_string();
                     }
-                    if let Some(n) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
+                    // The name comes once (or in pieces); a server repeating it whole doesn't double it.
+                    if let Some(n) = tc.pointer("/function/name").and_then(|n| n.as_str()).filter(|n| *n != entry.1) {
                         entry.1.push_str(n);
                     }
                     if let Some(a) = tc.pointer("/function/arguments").and_then(|n| n.as_str()) {
@@ -562,7 +628,7 @@ pub fn anthropic_stream(bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>
     let events = sse::events(bytes);
     // block index -> (id, name, partial json)
     let blocks: BTreeMap<u64, (String, String, String)> = BTreeMap::new();
-    futures::stream::unfold((Box::pin(events), blocks, 0u32), |(mut ev, mut blocks, mut input_tokens)| async move {
+    let parsed = futures::stream::unfold((Box::pin(events), blocks, 0u32), |(mut ev, mut blocks, mut input_tokens)| async move {
         loop {
             let e = match ev.next().await? {
                 Ok(e) => e,
@@ -617,7 +683,8 @@ pub fn anthropic_stream(bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>
         }
     })
     .flat_map(futures::stream::iter)
-    .boxed()
+    .boxed();
+    complete_or_error(parsed, "Anthropic")
 }
 
 // ------------------------------------------------------------------ Gemini
@@ -722,43 +789,56 @@ impl LlmProvider for Gemini {
         body["generationConfig"] = gen_cfg;
         let r = self.auth(self.http.post(format!("{}/models/{}:streamGenerateContent?alt=sse", self.base, req.model))).await?;
         let resp = check(r.json(&body).send().await.map_err(net)?, "Gemini").await?;
-        let events = sse::events(resp.bytes_stream().boxed());
-        Ok(events
-            .map(|e| -> Vec<Result<ChatEvent>> {
-                let e = match e {
-                    Ok(e) => e,
-                    Err(err) => return vec![Err(AiError::Network(err))],
-                };
-                let Ok(v) = serde_json::from_str::<Value>(&e.data) else { return vec![] };
-                let mut out = Vec::new();
-                for p in v.pointer("/candidates/0/content/parts").and_then(|p| p.as_array()).cloned().unwrap_or_default() {
-                    if let Some(t) = p["text"].as_str() {
-                        out.push(Ok(ChatEvent::TextDelta(t.into())));
-                    }
-                    if let Some(fc) = p.get("functionCall") {
-                        out.push(Ok(ChatEvent::ToolCall(ToolCall {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            name: fc["name"].as_str().unwrap_or("").into(),
-                            arguments: fc.get("args").cloned().unwrap_or(json!({})),
-                        })));
-                    }
-                }
-                if let Some(u) = v.get("usageMetadata")
-                    && v.pointer("/candidates/0/finishReason").is_some()
-                {
-                    out.push(Ok(ChatEvent::Usage {
-                        input: u["promptTokenCount"].as_u64().unwrap_or(0) as u32,
-                        output: u["candidatesTokenCount"].as_u64().unwrap_or(0) as u32,
-                    }));
-                }
-                if let Some(r) = v.pointer("/candidates/0/finishReason").and_then(|r| r.as_str()) {
-                    out.push(Ok(ChatEvent::Done { stop_reason: r.to_lowercase() }));
-                }
-                out
-            })
-            .flat_map(futures::stream::iter)
-            .boxed())
+        Ok(gemini_stream(resp.bytes_stream().boxed()))
     }
+}
+
+pub fn gemini_stream(bytes: BoxStream<'static, reqwest::Result<bytes::Bytes>>) -> BoxStream<'static, Result<ChatEvent>> {
+    let parsed = sse::events(bytes)
+        .map(|e| -> Vec<Result<ChatEvent>> {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => return vec![Err(AiError::Network(err))],
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&e.data) else { return vec![] };
+            // An error in the stream (quota, overload) and a blocked
+            // prompt carry no candidate: said, not read as "nothing more".
+            if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+                let msg = err.get("message").and_then(|m| m.as_str()).map(str::to_string).unwrap_or_else(|| err.to_string());
+                return vec![Err(AiError::Provider(format!("Gemini: {msg}")))];
+            }
+            if let Some(r) = v.pointer("/promptFeedback/blockReason").and_then(|r| r.as_str()) {
+                return vec![Ok(ChatEvent::Done { stop_reason: r.to_lowercase() })];
+            }
+            let mut out = Vec::new();
+            for p in v.pointer("/candidates/0/content/parts").and_then(|p| p.as_array()).cloned().unwrap_or_default() {
+                if let Some(t) = p["text"].as_str() {
+                    out.push(Ok(ChatEvent::TextDelta(t.into())));
+                }
+                if let Some(fc) = p.get("functionCall") {
+                    out.push(Ok(ChatEvent::ToolCall(ToolCall {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: fc["name"].as_str().unwrap_or("").into(),
+                        arguments: fc.get("args").cloned().unwrap_or(json!({})),
+                    })));
+                }
+            }
+            if let Some(u) = v.get("usageMetadata")
+                && v.pointer("/candidates/0/finishReason").is_some()
+            {
+                out.push(Ok(ChatEvent::Usage {
+                    input: u["promptTokenCount"].as_u64().unwrap_or(0) as u32,
+                    output: u["candidatesTokenCount"].as_u64().unwrap_or(0) as u32,
+                }));
+            }
+            if let Some(r) = v.pointer("/candidates/0/finishReason").and_then(|r| r.as_str()) {
+                out.push(Ok(ChatEvent::Done { stop_reason: r.to_lowercase() }));
+            }
+            out
+        })
+        .flat_map(futures::stream::iter)
+        .boxed();
+    complete_or_error(parsed, "Gemini")
 }
 
 // ------------------------------------------------------------------ OpenRouter browser sign-in
@@ -892,6 +972,68 @@ mod tests {
     }
 
     /// Why a reply stopped reaches the agent: the specific reason comes first.
+    /// A stream that ends without saying the reply is complete, an error
+    /// sent inside it and a blocked prompt are reported, not read as the
+    /// end of a finished answer.
+    #[tokio::test]
+    async fn cut_off_and_failed_streams_are_errors() {
+        let all = |s: BoxStream<'static, Result<ChatEvent>>| async move { s.collect::<Vec<_>>().await };
+        // Anthropic: text, then the connection closes before message_stop.
+        let evs = all(anthropic_stream(bytes_stream(vec![
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Half an ans\"}}\n\n",
+        ])))
+        .await;
+        assert!(matches!(&evs[0], Ok(ChatEvent::TextDelta(t)) if t == "Half an ans"), "{evs:?}");
+        assert!(matches!(evs.last(), Some(Err(AiError::Provider(m))) if m.contains("cut off")), "{evs:?}");
+        assert_eq!(evs.len(), 2);
+        // Gemini: an error object mid-stream.
+        let evs = all(gemini_stream(bytes_stream(vec![
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Half\"}]}}]}\n\n",
+            "data: {\"error\":{\"code\":429,\"message\":\"Quota exceeded\"}}\n\n",
+        ])))
+        .await;
+        assert!(matches!(evs.last(), Some(Err(AiError::Provider(m))) if m.contains("Quota exceeded")), "{evs:?}");
+        assert_eq!(evs.len(), 2, "the error ends it, once: {evs:?}");
+        // Gemini: a blocked prompt says why; a complete answer is unchanged.
+        let evs = all(gemini_stream(bytes_stream(vec!["data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n"]))).await;
+        assert!(matches!(evs.as_slice(), [Ok(ChatEvent::Done { stop_reason })] if stop_reason == "safety"), "{evs:?}");
+        let evs = all(gemini_stream(bytes_stream(vec![
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":1}}\n\n",
+        ])))
+        .await;
+        assert_eq!(evs.len(), 3, "{evs:?}");
+        assert!(evs.iter().all(|e| e.is_ok()));
+    }
+
+    /// Tool calls sent without `index` are told apart by their id, and a
+    /// name sent again whole isn't doubled.
+    #[tokio::test]
+    async fn openai_tool_calls_without_an_index() {
+        let s = openai_stream(bytes_stream(vec![
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"a\",\"function\":{\"name\":\"run_query\",\"arguments\":\"{\\\"sql\\\":\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"a\",\"function\":{\"name\":\"run_query\",\"arguments\":\"\\\"select 1\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"b\",\"function\":{\"name\":\"list_tables\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        ]));
+        let calls: Vec<ToolCall> = s.filter_map(|e| async move { if let Ok(ChatEvent::ToolCall(c)) = e { Some(c) } else { None } }).collect().await;
+        assert_eq!(
+            calls,
+            vec![
+                ToolCall { id: "a".into(), name: "run_query".into(), arguments: json!({"sql": "select 1"}) },
+                ToolCall { id: "b".into(), name: "list_tables".into(), arguments: json!({}) },
+            ]
+        );
+    }
+
+    #[test]
+    fn reasoning_models_are_told_apart() {
+        for m in ["o1", "o3-mini", "o4-mini-2025-04-16", "gpt-5", "gpt-5.1", "openai/gpt-5-mini", "GPT-5"] {
+            assert!(openai_reasoning_model(m), "{m}");
+        }
+        for m in ["gpt-4o", "gpt-4.1-mini", "olympus", "o1x", "llama3", "claude-sonnet", "gpt-50"] {
+            assert!(!openai_reasoning_model(m), "{m}");
+        }
+    }
+
     #[tokio::test]
     async fn streams_report_why_a_reply_stopped() {
         let s = anthropic_stream(bytes_stream(vec![

@@ -63,9 +63,43 @@ pub fn like(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+/// What the server said an unqualified name resolves to, per connection id
+/// ([`learn_defaults`]).
+static LEARNED: std::sync::LazyLock<parking_lot::RwLock<std::collections::HashMap<String, Vec<Option<String>>>>> = std::sync::LazyLock::new(Default::default);
+
+/// Ask the server where an unqualified name resolves on this connection
+/// (its current database and schema) and use that for the table rules from
+/// now on, instead of the engine's usual default (`public`, `dbo`, the
+/// user): a role with another `search_path` or default schema would
+/// otherwise have `orders` checked as `public.orders` while it reads
+/// `hr.orders`. Only asked when the connection has table rules; when the
+/// server can't be asked, what was learned before (or the usual default)
+/// stays.
+pub async fn learn_defaults(engine: &databrain_query_engine::QueryEngine, profile: &ConnectionProfile) {
+    if !has_rules(&profile.ai_policy) {
+        return;
+    }
+    if let Ok(Some(ns)) = engine.default_namespace(&profile.id).await {
+        remember_defaults(&profile.id, ns);
+    }
+}
+
+pub(crate) fn remember_defaults(connection_id: &str, namespace: Vec<Option<String>>) {
+    LEARNED.write().insert(connection_id.to_string(), namespace);
+}
+
 /// Levels of names on this engine (table included) and the defaults that
-/// complete an unqualified name, outermost first (`None` = not known).
+/// complete an unqualified name, outermost first (`None` = not known):
+/// what the server said ([`learn_defaults`]), else the engine's usual ones.
 pub(crate) fn defaults(profile: &ConnectionProfile) -> Vec<Option<String>> {
+    let usual = usual_defaults(profile);
+    match LEARNED.read().get(&profile.id) {
+        Some(learned) if learned.len() == usual.len() => learned.iter().zip(usual).map(|(l, u)| l.clone().or(u)).collect(),
+        _ => usual,
+    }
+}
+
+fn usual_defaults(profile: &ConnectionProfile) -> Vec<Option<String>> {
     let c = &profile.config;
     let opt = |k: &str| c.opt(k).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
     let db = c.database.clone().filter(|d| !d.trim().is_empty());
@@ -292,6 +326,27 @@ mod tests {
         assert!(check_sql(&p, "call x()").unwrap_err().contains("can't be checked"));
         // No rules: anything goes (other checks still apply elsewhere).
         assert!(check_sql(&profile(ConnectorKind::Postgres, None, AiPolicy::default()), "call x()").is_ok());
+    }
+
+    /// The schema the server says is current replaces the engine's usual
+    /// one: a role whose search_path starts with `hr` reads `hr.pay` when
+    /// it writes `pay`.
+    #[test]
+    fn unqualified_names_follow_the_servers_current_schema() {
+        let pol = AiPolicy { read_deny: parse_patterns("%.hr.%"), ..Default::default() };
+        let mut p = profile(ConnectorKind::Postgres, Some("app"), pol);
+        p.id = "learned-defaults-test".into();
+        assert!(check_sql(&p, "select * from pay").is_ok(), "app.public.pay by the usual default");
+        remember_defaults(&p.id, vec![Some("app".into()), Some("hr".into())]);
+        assert!(check_sql(&p, "select * from pay").unwrap_err().contains("app.hr.pay"));
+        assert!(check_sql(&p, "select * from public.pay").is_ok(), "a qualified name is what it says");
+        // What the server didn't say keeps the usual default; another connection is not affected.
+        remember_defaults(&p.id, vec![None, None]);
+        assert!(check_sql(&p, "select * from pay").is_ok());
+        let mut other = p.clone();
+        other.id = "learned-defaults-other".into();
+        remember_defaults(&p.id, vec![Some("app".into()), Some("hr".into())]);
+        assert!(check_sql(&other, "select * from pay").is_ok());
     }
 
     #[test]

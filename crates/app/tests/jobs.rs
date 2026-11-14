@@ -1116,3 +1116,46 @@ async fn failed_scheduled_start_keeps_its_slot() {
     );
     assert!(st.workspace.job_lease(&job.id).unwrap().is_none(), "the lease is released");
 }
+
+/// A step whose SQL the assistant wrote is checked against the connection's
+/// AI settings each time it runs, not only when the job was approved: with
+/// AI turned off for the connection it stops, and says why. The user's own
+/// step on the same connection is not the assistant's and keeps running.
+#[tokio::test(flavor = "multi_thread")]
+async fn steps_the_assistant_wrote_follow_todays_ai_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = state();
+    let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
+    let mut written_by_ai = node("a", "ai_step", JobNodeKind::Query, Some(&src), "select 1 as one");
+    written_by_ai.ai_sql = true;
+    let mine = node("b", "my_step", JobNodeKind::Query, Some(&src), "select 2 as two");
+    let job = st.workspace.save_job(plain_job("Mixed", vec![written_by_ai, mine])).unwrap();
+    assert!(job.nodes[0].ai_sql && !job.nodes[1].ai_sql);
+    // Allowed: AI is on for the connection (the default) and the step reads.
+    let run = run_all(&st, &job).await;
+    assert_eq!((run.status.as_str(), step(&run, "ai_step").status.as_str(), step(&run, "my_step").status.as_str()), ("success", "success", "success"));
+    // Refused: AI is turned off for the connection afterwards.
+    let mut p = st.workspace.get_connection(&src).unwrap();
+    p.ai_policy.ai_enabled = false;
+    st.workspace.save_connection(p).unwrap();
+    let run = run_all(&st, &job).await;
+    let ai = step(&run, "ai_step");
+    assert_eq!(ai.status, "error");
+    let why = ai.error.unwrap_or_default();
+    assert!(why.contains("AI settings no longer allow") && why.contains("AI is disabled"), "{why}");
+    assert_eq!(step(&run, "my_step").status, "success", "the user's own step is not the assistant's");
+    // And a write the assistant wrote, once "AI may write" is off again.
+    let mut p = st.workspace.get_connection(&src).unwrap();
+    p.ai_policy.ai_enabled = true;
+    p.ai_policy.allow_write = true;
+    st.workspace.save_connection(p.clone()).unwrap();
+    let mut write = node("a", "ai_write", JobNodeKind::Query, Some(&src), "create table if not exists made_by_ai (x int)");
+    write.ai_sql = true;
+    let job = st.workspace.save_job(plain_job("Writes", vec![write])).unwrap();
+    assert_eq!(run_all(&st, &job).await.status, "success");
+    p.ai_policy.allow_write = false;
+    st.workspace.save_connection(p).unwrap();
+    let run = run_all(&st, &job).await;
+    let why = step(&run, "ai_write").error.unwrap_or_default();
+    assert!(run.status == "error" && why.contains("not allowed for the AI"), "{why}");
+}

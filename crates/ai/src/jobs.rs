@@ -97,8 +97,13 @@ pub fn resolve_conn<'a>(conns: &'a [ConnRef], want: &str) -> Result<&'a ConnRef>
         .find(|c| c.id == w)
         .or_else(|| conns.iter().find(|c| c.name.eq_ignore_ascii_case(w)))
         .or_else(|| {
-            let l = w.to_ascii_lowercase();
-            (l == "results" || l.contains("results") || l == "duckdb").then(|| conns.iter().find(|c| c.results)).flatten()
+            // The Results connection by the names the prompts use for it,
+            // not any name that merely contains "results" (a mistyped
+            // "sales_results" is an unknown connection, not DuckDB).
+            let l: String = w.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+            matches!(l.as_str(), "results" | "duckdb" | "resultsduckdb" | "resultsconnection" | "theresultsconnection")
+                .then(|| conns.iter().find(|c| c.results))
+                .flatten()
         })
         .ok_or_else(|| AiError::Policy(format!("no connection \"{w}\"; use one of: {}", names(conns))))?;
     if !c.ai_enabled {
@@ -137,7 +142,8 @@ pub fn results_refs(sql: &str) -> Vec<String> {
 
 fn valid_hhmm(t: &str) -> bool {
     let Some((h, m)) = t.split_once(':') else { return false };
-    h.len() <= 2 && m.len() == 2 && h.parse::<u8>().is_ok_and(|h| h < 24) && m.parse::<u8>().is_ok_and(|m| m < 60)
+    let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    digits(h) && digits(m) && h.len() <= 2 && m.len() == 2 && h.parse::<u8>().is_ok_and(|h| h < 24) && m.parse::<u8>().is_ok_and(|m| m < 60)
 }
 
 fn parse_schedule(v: Option<&Value>) -> Result<JobSchedule> {
@@ -146,7 +152,18 @@ fn parse_schedule(v: Option<&Value>) -> Result<JobSchedule> {
         return Ok(JobSchedule::default());
     }
     let mut sch = JobSchedule::default();
-    if let Some(m) = v.get("every_minutes").and_then(|m| m.as_u64()) {
+    // A whole number of minutes, also written as 30.0 or "30".
+    let minutes = match v.get("every_minutes") {
+        None | Some(Value::Null) => None,
+        Some(m) => Some(
+            m.as_u64()
+                .or_else(|| m.as_f64().filter(|f| f.fract() == 0.0 && *f >= 1.0).map(|f| f as u64))
+                .or_else(|| m.as_str().and_then(|t| t.trim().parse::<u64>().ok()))
+                .filter(|m| *m >= 1)
+                .ok_or_else(|| AiError::Policy(format!("schedule.every_minutes must be a whole number of minutes (1 or more), got {m}")))?,
+        ),
+    };
+    if let Some(m) = minutes {
         sch.enabled = true;
         sch.mode = ScheduleMode::Interval;
         sch.minutes = m.clamp(1, 10_080) as u32;
@@ -162,6 +179,12 @@ fn parse_schedule(v: Option<&Value>) -> Result<JobSchedule> {
             .and_then(|w| w.as_array())
             .map(|a| a.iter().filter_map(|d| d.as_u64()).filter(|d| *d <= 6).map(|d| d as u8).collect())
             .unwrap_or_default();
+    } else {
+        // Not read as "no schedule": that would save an unscheduled job (or
+        // turn an existing schedule off) while the answer says otherwise.
+        return Err(AiError::Policy(format!(
+            "schedule must be {{\"every_minutes\": n}}, {{\"daily_at\": \"HH:MM\", \"weekdays\": [0-6]}} or {{\"off\": true}}, got {v}"
+        )));
     }
     Ok(sch)
 }
@@ -281,7 +304,8 @@ pub fn build_job(args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Re
                 let fmt = match s(st, "format").unwrap_or("csv").to_ascii_lowercase().as_str() {
                     "parquet" => "parquet",
                     "json" | "ndjson" | "jsonl" => "json",
-                    _ => "csv",
+                    "csv" => "csv",
+                    other => return Err(AiError::Policy(format!("export step \"{n}\": format must be csv, parquet or json, got \"{other}\""))),
                 };
                 node["export_format"] = json!(fmt);
                 node["export_folder"] = json!(s(st, "folder"));
@@ -395,7 +419,7 @@ pub fn describe(job: &Job, conns: &[ConnRef]) -> String {
                 "  last run: {}{}{}\n",
                 r.status,
                 r.rows.map(|x| format!(", {x} rows")).unwrap_or_default(),
-                r.error.as_deref().map(|e| format!(", error: {e}")).unwrap_or_default()
+                r.error.as_deref().map(|e| format!(", error: {}", e.chars().take(600).collect::<String>())).unwrap_or_default()
             ));
         }
     }
@@ -434,7 +458,11 @@ pub fn spec_of(job: &Job, conns: &[ConnRef]) -> Value {
                 v["after"] = json!(after);
             }
             match n.kind {
-                JobNodeKind::Query => v["connection"] = json!(cname(n.connection_id.as_deref())),
+                // No connection = the Results (DuckDB) connection: named, so the spec can be sent back as it is.
+                JobNodeKind::Query => {
+                    v["connection"] =
+                        json!(cname(n.connection_id.as_deref().filter(|c| !c.is_empty())).or_else(|| conns.iter().find(|c| c.results).map(|c| c.name.clone())))
+                }
                 JobNodeKind::Load => {
                     v["target_connection"] = json!(cname(n.target_connection_id.as_deref()));
                     v["target_table"] = json!(n.target_table);
@@ -617,10 +645,15 @@ pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<Str
     let old_name = |new: &str| rename.iter().find(|(_, n)| n.eq_ignore_ascii_case(new)).map(|(o, _)| o.clone()).unwrap_or_else(|| new.to_string());
     let mut map: HashMap<String, String> = HashMap::new();
     for n in &job.nodes {
-        if let Some(o) = old.nodes.iter().find(|o| o.name.eq_ignore_ascii_case(&old_name(&n.name))) {
+        // Each old step is continued by one new step (a rename onto a name
+        // that also stays would otherwise give two steps one id).
+        if let Some(o) = old.nodes.iter().find(|o| o.name.eq_ignore_ascii_case(&old_name(&n.name)))
+            && !map.values().any(|taken| taken == &o.id)
+        {
             map.insert(n.id.clone(), o.id.clone());
         }
     }
+    let results_id = conns.iter().find(|c| c.results).map(|c| c.id.as_str());
     let max_x = old.nodes.iter().map(|n| n.x).fold(f64::MIN, f64::max);
     let new_ids: HashMap<String, String> =
         job.nodes.iter().filter(|n| !map.contains_key(&n.id)).map(|n| (n.id.clone(), databrain_workspace::new_id())).collect();
@@ -632,6 +665,14 @@ pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<Str
                 n.y = o.y;
                 n.last_run = o.last_run.clone();
                 n.id = o.id.clone();
+                // Settings the tool has no argument for stay as the user set them.
+                n.batch_rows = o.batch_rows;
+                n.batch_kb = o.batch_kb;
+                // A step with no connection runs on Results: sent back under
+                // that name it is the same step, not SQL the assistant moved.
+                if o.connection_id.as_deref().is_none_or(str::is_empty) && n.connection_id.as_deref() == results_id {
+                    n.connection_id = o.connection_id.clone();
+                }
             }
             None => {
                 // New steps go right of the existing ones.
@@ -657,6 +698,138 @@ pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<Str
         job.schedule = old.schedule.clone();
     }
     Ok((job, notes))
+}
+
+/// The rules the assistant's own queries pass, applied to the steps of a
+/// job (`only`: those step ids; empty = all), per step and connection.
+/// Checked when the assistant builds, changes or runs a job, and again by
+/// the job runner each time a step whose SQL the assistant wrote runs (the
+/// connection's AI settings may have changed since the job was approved):
+/// - query steps: [`review_sql`](crate::policy::review_sql) on their
+///   connection (writes need `allow_write`, never on production or
+///   read-only connections; table rules). Steps on the Results DuckDB, and
+///   the SQL of load and export steps (which runs there), only read;
+/// - load steps: the AI may write to the target connection and table, and
+///   its before / after SQL passes `review_sql` there.
+///
+/// `Err`: why a step may not run. `Ok`: what only the user can approve
+/// (empty when nothing): functions that could write where the AI may not,
+/// and loads that copy rows out of a connection whose PII masking or
+/// row-sharing settings don't follow the copy.
+pub fn review(engine: &databrain_query_engine::QueryEngine, job: &Job, only: &[String]) -> Result<Vec<String>> {
+    let ws = engine.workspace();
+    let mut confirm = Vec::new();
+    for n in job.nodes.iter().filter(|n| only.is_empty() || only.contains(&n.id)) {
+        confirm.extend(review_step(engine, n)?);
+        // Rows copied out of a connection that masks columns or doesn't
+        // share rows: in the target table they are plain rows the assistant
+        // can query, so the user decides.
+        let Some(c) = n.target_connection_id.as_deref().filter(|c| !c.is_empty() && n.kind == JobNodeKind::Load) else { continue };
+        let target = ws.get_connection(c).map(|p| p.name).unwrap_or_default();
+        for src in sources_of(job, &n.id).into_iter().filter(|s| s != c) {
+            let Ok(src) = ws.get_connection(&src) else { continue };
+            let p = &src.ai_policy;
+            if !p.pii_columns.is_empty() || !p.share_result_rows {
+                confirm.push(format!(
+                    "step {} copies rows from \"{}\" into \"{target}\": the PII masking and row-sharing settings of \"{}\" don't apply to the copy, which the assistant can then query",
+                    n.name, src.name, src.name
+                ));
+            }
+        }
+    }
+    Ok(confirm)
+}
+
+/// [`review`] for one step, by its own SQL and connections (not where its
+/// rows come from).
+pub fn review_step(engine: &databrain_query_engine::QueryEngine, n: &JobNode) -> Result<Vec<String>> {
+    use crate::policy::{self, Decision};
+    let ws = engine.workspace();
+    let mut confirm = Vec::new();
+    let step = |r: String| AiError::Policy(format!("step {}: {r}", n.name));
+    let conn = |id: &str| ws.get_connection(id).map_err(|_| step("its connection no longer exists".into()));
+    let mut review = |p: &databrain_workspace::ConnectionProfile, sql: &str| -> Result<()> {
+        match policy::review_sql(p, sql).decision {
+            Decision::Deny(r) => Err(step(r)),
+            Decision::Confirm(r) => {
+                confirm.push(format!("step {}: {r}", n.name));
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    };
+    // SQL that runs on the Results DuckDB.
+    let read_outputs = |sql: &str| -> Result<()> {
+        if sql.trim().is_empty() {
+            return Ok(());
+        }
+        let results = engine.results_connection().map_err(|e| AiError::Internal(e.message))?;
+        if policy::review_sql(&results, sql).kind.is_read() {
+            Ok(())
+        } else {
+            Err(step("SQL on DataBrain's outputs (the Results DuckDB) may only read; write into a connection with a load step".into()))
+        }
+    };
+    match n.kind {
+        JobNodeKind::Query => match n.connection_id.as_deref().filter(|c| !c.is_empty()) {
+            Some(c) => review(&conn(c)?, &n.sql)?,
+            None => read_outputs(&n.sql)?,
+        },
+        JobNodeKind::Load => {
+            read_outputs(&n.sql)?;
+            if let Some(c) = n.target_connection_id.as_deref().filter(|c| !c.is_empty()) {
+                let target = conn(c)?;
+                if let Some(r) = policy::write_denied(&target) {
+                    return Err(step(format!("it loads into \"{}\": {r}", target.name)));
+                }
+                if let Some(t) = n.target_table.as_deref() {
+                    crate::access::check_write_table(&target, t).map_err(step)?;
+                }
+                for sql in [&n.load_before_sql, &n.load_after_sql].into_iter().flatten().filter(|s| !s.trim().is_empty()) {
+                    review(&target, sql)?;
+                }
+            }
+        }
+        JobNodeKind::Export => read_outputs(&n.sql)?,
+    }
+    Ok(confirm)
+}
+
+/// Connections whose rows reach step `id`: those of the query steps before
+/// it, following the job's links.
+fn sources_of(job: &Job, id: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut todo = vec![id];
+    while let Some(at) = todo.pop() {
+        for e in job.edges.iter().filter(|e| e.to == at) {
+            if !seen.insert(e.from.as_str()) {
+                continue;
+            }
+            if let Some(n) = job.nodes.iter().find(|n| n.id == e.from) {
+                if let Some(c) = n.connection_id.as_deref().filter(|c| !c.is_empty() && n.kind == JobNodeKind::Query)
+                    && !out.iter().any(|o| o == c)
+                {
+                    out.push(c.to_string());
+                }
+                todo.push(e.from.as_str());
+            }
+        }
+    }
+    out
+}
+
+/// May this caller see a job at all (its steps' SQL, its errors)? Every
+/// connection its steps use must be one the assistant may work on: AI on,
+/// shared with MCP for an MCP client, and open to this conversation's
+/// provider.
+pub fn visible(ws: &databrain_workspace::Workspace, job: &Job, mcp: bool, provider: Option<&str>) -> bool {
+    job.nodes.iter().flat_map(|n| [n.connection_id.as_deref(), n.target_connection_id.as_deref()]).flatten().filter(|c| !c.is_empty()).all(|c| {
+        ws.get_connection(c).is_ok_and(|p| {
+            let a = &p.ai_policy;
+            a.ai_enabled && (!mcp || a.mcp_enabled) && crate::policy::provider_allowed(a, provider)
+        })
+    })
 }
 
 #[cfg(test)]
@@ -770,6 +943,97 @@ mod tests {
 
     fn old_step(_spec: &Value) -> Value {
         json!({"name": "orders", "connection": "Sales PG", "sql": "select * from orders"})
+    }
+
+    /// A schedule that can't be read is refused (never saved as "off"), an
+    /// unknown export format too, and only the Results connection's own
+    /// names mean it.
+    #[test]
+    fn unreadable_arguments_are_refused_not_guessed() {
+        let c = conns();
+        let job = |schedule: Value| {
+            build_job(&json!({"name": "j", "steps": [{"name": "a", "connection": "Sales PG", "sql": "select 1"}], "schedule": schedule}), &c, &HashSet::new())
+        };
+        for (v, minutes) in [(json!({"every_minutes": 30}), 30), (json!({"every_minutes": 30.0}), 30), (json!({"every_minutes": "45"}), 45)] {
+            let (j, _) = job(v.clone()).unwrap();
+            assert!(j.schedule.enabled && j.schedule.minutes == minutes, "{v}");
+        }
+        assert!(!job(json!({"off": true})).unwrap().0.schedule.enabled);
+        for v in [
+            json!({"every_minutes": "soon"}),
+            json!({"every_minutes": 0}),
+            json!({"every_minutes": 1.5}),
+            json!({"weekdays": [1]}),
+            json!({"cron": "* * * * *"}),
+        ] {
+            let e = job(v.clone()).unwrap_err().to_string();
+            assert!(e.contains("schedule"), "{v}: {e}");
+        }
+        assert!(valid_hhmm("7:05") && valid_hhmm("23:59") && !valid_hhmm("+7:+5") && !valid_hhmm("24:00") && !valid_hhmm("7:5"));
+        let export = |format: &str| {
+            build_job(
+                &json!({"name": "j", "steps": [{"name": "a", "connection": "Sales PG", "sql": "select 1"}, {"name": "f", "action": "export", "after": ["a"], "format": format}]}),
+                &c,
+                &HashSet::new(),
+            )
+        };
+        assert!(export("parquet").is_ok() && export("CSV").is_ok());
+        assert!(export("xlsx").unwrap_err().to_string().contains("csv, parquet or json"));
+        for name in ["Results", "results", "DuckDB", "Results (DuckDB)", "the Results connection"] {
+            assert!(resolve_conn(&c, name).is_ok_and(|r| r.results), "{name}");
+        }
+        assert!(resolve_conn(&c, "sales_results").unwrap_err().to_string().contains("no connection"), "a mistyped name is not DuckDB");
+    }
+
+    /// Sending a job's spec back unchanged changes nothing: the user's
+    /// batch settings stay, and their step on Results (no connection set)
+    /// stays theirs. Two new steps never continue one old step.
+    #[test]
+    fn an_unchanged_spec_is_the_same_job() {
+        let c = conns();
+        let (mut old, _) = build_job(
+            &json!({"name": "j", "steps": [
+                {"name": "src", "connection": "Sales PG", "sql": "select * from orders"},
+                {"name": "mine", "connection": "Results", "sql": "select * from results.src"},
+                {"name": "save", "action": "load", "after": ["mine"], "target_connection": "Sales PG", "target_table": "rpt.t"}
+            ]}),
+            &c,
+            &HashSet::new(),
+        )
+        .unwrap();
+        for (i, n) in old.nodes.iter_mut().enumerate() {
+            n.id = format!("id{i}");
+        }
+        for e in &mut old.edges {
+            e.from = e.from.replace('s', "id").replace("id1", "id0").replace("id2", "id1").replace("id3", "id2");
+            e.to = e.to.replace('s', "id").replace("id1", "id0").replace("id2", "id1").replace("id3", "id2");
+        }
+        // As the user made it on the canvas: a Results step has no connection; the load has batch settings.
+        old.nodes[1].connection_id = None;
+        old.nodes[2].batch_rows = Some(500);
+        old.nodes[2].batch_kb = Some(256);
+        let spec = spec_of(&old, &c);
+        assert_eq!(spec["steps"][1]["connection"], "Results", "{spec}");
+        let mut args = spec.clone();
+        args["job"] = json!("j");
+        let (mut same, _) = merge_job(&old, &args, &c, &HashSet::new()).unwrap();
+        mark_ai_sql(&mut same, Some(&old));
+        assert_eq!(same.nodes[1].connection_id, None);
+        assert!(same.nodes.iter().all(|n| !n.ai_sql), "nothing the assistant wrote");
+        assert_eq!((same.nodes[2].batch_rows, same.nodes[2].batch_kb), (Some(500), Some(256)));
+        assert!(changes(&old, &same).is_empty(), "{:?}", changes(&old, &same));
+        // `rename: {a: b}` while both `a` and `b` stay: two steps named for one old step get two ids.
+        let two = json!({"name": "k", "steps": [{"name": "a", "connection": "Sales PG", "sql": "select 1"}, {"name": "b", "connection": "Sales PG", "sql": "select 2"}]});
+        let (mut old, _) = build_job(&two, &c, &HashSet::new()).unwrap();
+        old.nodes[0].id = "ida".into();
+        old.nodes[1].id = "idb".into();
+        let mut args = two.clone();
+        args["rename"] = json!({"a": "b"});
+        let (renamed, _) = merge_job(&old, &args, &c, &HashSet::new()).unwrap();
+        let mut ids: Vec<&str> = renamed.nodes.iter().map(|n| n.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 2, "{:?}", renamed.nodes.iter().map(|n| (&n.name, &n.id)).collect::<Vec<_>>());
     }
 
     #[test]

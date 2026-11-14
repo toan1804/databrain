@@ -26,6 +26,8 @@ impl ToolContext {
             self.check_output_sources(&sql)?;
         }
         let purpose = args.get("purpose").and_then(|p| p.as_str()).unwrap_or("");
+        // Table rules complete unqualified names with the server's current schema.
+        crate::access::learn_defaults(&self.engine, &target).await;
         let review = policy::review_sql(&target, &sql);
         let on = if target.id == self.profile.id { String::new() } else { format!(" (on \"{}\")", target.name) };
         let approved = self
@@ -37,8 +39,10 @@ impl ToolContext {
             )
             .await?;
         let sql = approved.get("sql").and_then(|s| s.as_str()).unwrap_or(&sql).to_string();
-        // Re-review edited SQL (and the outputs it reads).
-        if let Decision::Deny(r) = policy::review_sql(&target, &sql).decision {
+        // Re-review edited SQL (and the outputs it reads): what runs is
+        // capped as what it is now, not as what was first proposed.
+        let review = policy::review_sql(&target, &sql);
+        if let Decision::Deny(r) = review.decision {
             return Err(AiError::Policy(r));
         }
         if duckdb {
@@ -129,6 +133,7 @@ impl ToolContext {
         if self.caller == Caller::Mcp && !src.ai_policy.mcp_enabled {
             return Err(AiError::Policy(format!("{} comes from \"{}\", which is not shared with MCP", o.handle, src.name)));
         }
+        self.provider_allowed(&src)?;
         Ok(src.ai_policy)
     }
 
@@ -145,6 +150,24 @@ impl ToolContext {
         };
         if let Err(r) = crate::access::check_sql(&src, &o.sql) {
             return Err(AiError::Policy(format!("{} can't be shared with the assistant: {r}", o.handle)));
+        }
+        // An input (a job step, a query on Results that reads another
+        // output): its own connection's rules hold through the output built
+        // on it, or a step on Results would open any connection's rows.
+        if depth > 0 {
+            if !src.ai_policy.ai_enabled {
+                return Err(AiError::Policy(format!("{} is built on rows from \"{}\", where AI is disabled", o.handle, src.name)));
+            }
+            if self.caller == Caller::Mcp && !src.ai_policy.mcp_enabled {
+                return Err(AiError::Policy(format!("{} is built on rows from \"{}\", which is not shared with MCP", o.handle, src.name)));
+            }
+            self.provider_allowed(&src)?;
+            if !src.ai_policy.share_result_rows && !self.allowed_result(&o.result_id) {
+                return Err(AiError::Policy(format!(
+                    "{} is built on rows from \"{}\", which does not share result rows with the assistant; mention it with @ to allow it",
+                    o.handle, src.name
+                )));
+            }
         }
         if depth < 5 && src.config.kind == databrain_connector_core::ConnectorKind::Duckdb {
             for input in self.engine.outputs().referenced(&o.sql) {
@@ -170,8 +193,8 @@ impl ToolContext {
     /// `SELECT *`, and outputs combined on DuckDB through their inputs).
     pub(super) fn pii_mask(&self, result_id: &str, columns: &[String], depth: usize) -> Vec<bool> {
         let Some(o) = self.engine.outputs().by_result(result_id) else {
-            // Not an output (no SQL to trace): by name, on this connection's rules.
-            return columns.iter().map(|c| is_pii(self.policy(), None, c)).collect();
+            // Not an output: no SQL to trace and no table to match a rule against.
+            return policy::masked_by_name(self.policy(), columns);
         };
         let src = if o.connection_id == self.profile.id { Ok(self.profile.clone()) } else { self.engine.workspace().get_connection(&o.connection_id) };
         let Ok(src) = src else { return vec![true; columns.len()] };
@@ -285,8 +308,12 @@ impl ToolContext {
         let id = id.as_str();
         let sql = arg(args, "sql")?;
         // Results of this conversation, the user's current/mentioned ones,
-        // or any output the source connection lets the AI read.
-        if !self.allowed_result(id) && !self.source_policy(id)?.share_result_rows {
+        // or any output the source connection lets the AI read. The source
+        // connection's own rules (AI on, its table rules, its providers)
+        // hold for all of them: the result in the grid may come from a
+        // connection or a table the AI may not read.
+        let source = self.source_policy(id)?;
+        if !self.allowed_result(id) && !source.share_result_rows {
             return Err(AiError::Policy("this output was not shared with the assistant (mention it with @, or enable result rows on its connection)".into()));
         }
         let rs = self.engine.results().get(id).map_err(|e| AiError::Internal(e.to_string()))?;

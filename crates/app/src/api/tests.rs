@@ -1695,6 +1695,7 @@ async fn run_query_on_duckdb_checks_output_sources() {
         host: std::sync::Arc::new(Yes),
         cancel: Default::default(),
         results: parking_lot::Mutex::new(vec![]),
+        provider_id: None,
     };
     let o = ctx.call("run_query", &serde_json::json!({"sql": "select * from results.salaries"})).await;
     assert!(o.content.starts_with("ERROR") && o.content.contains("AI is disabled"), "{}", o.content);
@@ -1743,6 +1744,7 @@ async fn stop_ends_the_approval_wait() {
         host: std::sync::Arc::new(Never),
         cancel: cancel.clone(),
         results: parking_lot::Mutex::new(vec![]),
+        provider_id: None,
     };
     let stop = cancel.clone();
     tokio::spawn(async move {

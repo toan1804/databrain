@@ -338,6 +338,9 @@ impl ToolHost for UiHost {
     async fn start_job(&self, job_id: &str, only: Option<Vec<String>>) -> std::result::Result<i64, String> {
         crate::jobs::start(&self.jobs, job_id, "ai", only).map(|r| r.id).map_err(|e| e.message)
     }
+    async fn stop_job(&self, job_id: &str) {
+        self.jobs.jobs.cancel(job_id);
+    }
     async fn approve(&self, tool: &str, summary: &str, detail: &Value) -> Option<Value> {
         let r = self
             .ai
