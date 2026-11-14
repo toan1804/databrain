@@ -536,6 +536,16 @@ async fn results_larger_than_memory_continue_on_disk() {
 
     // results.<handle>: every row, the decimal as a number.
     let handle = st.engine.outputs().by_result(&info.id).unwrap().handle;
+
+    // A chart: of the rows loaded in the grid (in memory), saying how many.
+    let count = databrain_result_store::ChartSpec { x: 0, y: vec![], agg: databrain_result_store::Agg::Count, series: None, limit: 5 };
+    let chart = api::chart_data(&st, info.id.clone(), ViewSpec { first_rows: Some(1000), ..Default::default() }, count).await.unwrap();
+    assert_eq!((chart.rows, chart.window_rows), (1000, Some(1000)));
+    // Pinning (a saved copy of every row): refused, saying why.
+    assert!(st.engine.outputs().get(&handle).unwrap().spilled);
+    let e = api::pin_output(&st, handle.clone(), true).await.unwrap_err();
+    assert!(e.message.starts_with("Too large to pin") && e.message.contains("Export it"), "{}", e.message);
+    assert!(!st.engine.outputs().get(&handle).unwrap().pinned);
     let agg = run_as(&st, &duck, &format!("select count(*), sum(amount), typeof(amount) from results.{handle} group by 3"), None, Origin::User).await;
     let agg = agg.result.unwrap_or_else(|| panic!("{:?}", agg.error));
     let row = api::fetch_page(&st, agg.id, Default::default(), 0, 1).await.unwrap().rows.remove(0);

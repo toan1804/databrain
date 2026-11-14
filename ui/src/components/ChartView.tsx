@@ -149,11 +149,27 @@ export function ChartView({
           </span>
         )}
         {onPin && (
-          <button className="btn-ghost ml-auto h-7 border border-line py-0 text-[12px]" title="Add this chart to a dashboard (its query runs again when the dashboard opens)" onClick={() => onPin(drawn, kind)}>
+          <button
+            className="btn-ghost ml-auto h-7 border border-line py-0 text-[12px]"
+            disabled={info.on_disk}
+            title={
+              info.on_disk
+                ? "Too large to pin: this result is larger than memory (its rows are on disk). Aggregate it with SQL on results.<name> and pin a chart of that."
+                : "Add this chart to a dashboard (its query runs again when the dashboard opens)"
+            }
+            onClick={() => onPin(drawn, kind)}
+          >
             <LayoutDashboard size={13} /> Pin to dashboard
           </button>
         )}
       </div>
+      )}
+      {data?.window_rows != null && (
+        <div className="flex items-center gap-1.5 border-b border-line bg-warning/10 px-2 py-1 text-[11.5px] text-warning" role="note">
+          <AlertTriangle size={12} className="shrink-0" />
+          Large result: charted from the first {formatCount(data.window_rows)} of {formatCount(info.total_rows)} rows{compact ? "" : " (the rows loaded in the grid)"}, since its rows are on
+          disk. To chart every row, aggregate it with SQL on results.&lt;name&gt; and chart that.
+        </div>
       )}
       <div className="min-h-0 flex-1 p-2">
         {error ? (

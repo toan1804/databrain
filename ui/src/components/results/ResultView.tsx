@@ -50,6 +50,9 @@ export function ResultView({
   if (narrowed && firstRows === null) setFirstRows(Math.max(1, loaded.id === info.id ? loaded.n : 0));
   if (!narrowed && firstRows !== null) setFirstRows(null);
   const view = useMemo<ViewSpec>(() => (narrowed && firstRows !== null ? { ...baseView, first_rows: firstRows } : baseView), [baseView, narrowed, firstRows]);
+  // A chart of a result on disk: of the rows loaded in the grid too.
+  const loadedRows = loaded.id === info.id ? loaded.n : 0;
+  const chartView = useMemo<ViewSpec>(() => (info.on_disk ? { ...view, first_rows: view.first_rows ?? Math.max(1, loadedRows) } : view), [info.on_disk, view, loadedRows]);
   const [viewRows, setViewRows] = useState(info.total_rows);
   const [windowRows, setWindowRows] = useState<number | null>(null);
   const onViewRows = useCallback((n: number, w: number | null) => {
@@ -306,7 +309,7 @@ export function ResultView({
       <div className="flex min-h-0 flex-1">
         <div className="min-h-0 min-w-0 flex-1">
         {mode === "chart" ? (
-          <ChartView info={info} view={view} onPin={stmt.output && connId ? (spec, kind) => setPinning({ spec, kind }) : undefined} />
+          <ChartView info={info} view={chartView} onPin={stmt.output && connId ? (spec, kind) => setPinning({ spec, kind }) : undefined} />
         ) : (
         <ResultGrid
           ref={grid}

@@ -16,7 +16,12 @@ version_of: [string, number] | null, result_id: string, connection_id: string, c
 /**
  * Cut at the row limit: more rows exist at the source.
  */
-truncated: boolean, row_limit: number | null, bytes: number, pinned: boolean, state: OutputState, origin: Origin, last_used: number, 
+truncated: boolean, row_limit: number | null, bytes: number, pinned: boolean, 
+/**
+ * Larger than memory: its rows are on disk (a live result), so it
+ * can't be pinned.
+ */
+spilled: boolean, state: OutputState, origin: Origin, last_used: number, 
 /**
  * Latest run of its tab, or kept from an earlier one (shown in the UI).
  */

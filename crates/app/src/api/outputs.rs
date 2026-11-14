@@ -341,7 +341,7 @@ pub async fn chart_data(
     spec: databrain_result_store::ChartSpec,
 ) -> Result<databrain_result_store::ChartData> {
     let rs = state.results().get(&result_id)?;
-    blocking(move || Ok(rs.lock().chart(&view, &spec)?)).await
+    blocking(move || Ok(databrain_result_store::with_window(&rs, &view, |g| g.chart(&view, &spec))?)).await
 }
 
 // ------------------------------------------------------------ results memory

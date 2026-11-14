@@ -146,9 +146,16 @@ pub fn prepare_view(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec) -> Result<()> {
     if spec.is_identity() {
         return Ok(());
     }
+    prepare_window(rs, spec)
+}
+
+/// Read the window of `spec` for a result on disk, even for the plain
+/// result (charts use it), without holding the lock.
+fn prepare_window(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec) -> Result<()> {
+    let ready = |g: &ResultSet| !g.is_on_disk() || g.has_window(spec);
     let build = {
         let g = rs.lock();
-        if g.view_ready(spec) {
+        if ready(&g) {
             return Ok(());
         }
         g.view_build.clone()
@@ -156,7 +163,7 @@ pub fn prepare_view(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec) -> Result<()> {
     let _one = build.lock();
     let (files, schema, id) = {
         let mut g = rs.lock();
-        if g.view_ready(spec) {
+        if ready(&g) {
             return Ok(());
         }
         // The previous window goes first.
@@ -176,6 +183,20 @@ pub fn with_view<T>(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec, f: impl FnOnce(
         prepare_view(rs, spec)?;
         let mut g = rs.lock();
         if g.view_ready(spec) {
+            return f(&mut g);
+        }
+    }
+    f(&mut rs.lock())
+}
+
+/// Run `f` on the result with the window of `spec` ready for a result on
+/// disk, also for the plain result (a chart reads its rows at once), read
+/// without the lock.
+pub fn with_window<T>(rs: &Arc<Mutex<ResultSet>>, spec: &ViewSpec, f: impl FnOnce(&mut ResultSet) -> Result<T>) -> Result<T> {
+    for _ in 0..3 {
+        prepare_window(rs, spec)?;
+        let mut g = rs.lock();
+        if !g.is_on_disk() || g.has_window(spec) {
             return f(&mut g);
         }
     }

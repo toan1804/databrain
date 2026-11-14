@@ -4,7 +4,7 @@
 pub mod chart;
 mod decimal;
 mod disk_view;
-pub use disk_view::{WINDOW_BYTES, column_stats, find, for_each_batch, prepare_view, with_view};
+pub use disk_view::{WINDOW_BYTES, column_stats, find, for_each_batch, prepare_view, with_view, with_window};
 pub mod display;
 pub mod spill;
 pub mod view;
@@ -759,8 +759,17 @@ impl ResultStore {
     /// Bytes `id` keeps in memory. The store's map isn't held while the
     /// result's lock is waited for (a long export or sort holds it).
     pub fn bytes_of(&self, id: &str) -> usize {
+        self.size_of(id).0
+    }
+
+    /// Bytes `id` keeps in memory, and whether its rows are on disk.
+    pub fn size_of(&self, id: &str) -> (usize, bool) {
         let rs = self.results.lock().get(id).cloned();
-        rs.map(|r| r.lock().memory_bytes()).unwrap_or(0)
+        rs.map(|r| {
+            let g = r.lock();
+            (g.memory_bytes(), g.is_on_disk())
+        })
+        .unwrap_or((0, false))
     }
 
     pub fn create(&self, id: impl Into<String>, schema: SchemaRef) -> Arc<Mutex<ResultSet>> {
@@ -863,6 +872,13 @@ mod spill_tests {
         assert_eq!((first(&plain), plain.window_rows), (vec!["99999".to_string()], None));
         assert_eq!(column_stats(&rs, &ViewSpec::default(), 0).unwrap().count, n as u64);
         assert_eq!(find(&rs, &ViewSpec::default(), "99999", None, 10, false).unwrap().matches.len(), 1);
+        // A chart: of the window too, even of the plain result.
+        let count = ChartSpec { x: 0, y: vec![], agg: Agg::Count, series: None, limit: 5 };
+        let plain = ViewSpec { first_rows: Some(200), ..Default::default() };
+        let d = with_window(&rs, &plain, |g| g.chart(&plain, &count)).unwrap();
+        assert_eq!((d.rows, d.window_rows), (200, Some(200)));
+        let d = with_window(&rs, &desc(None), |g| g.chart(&desc(None), &count)).unwrap();
+        assert_eq!((d.rows, d.window_rows), (n as usize, Some(n as usize)));
         // The window (the last one read: every row) counts as the result's memory.
         assert!(rs.lock().memory_bytes() >= n as usize * 8);
     }
