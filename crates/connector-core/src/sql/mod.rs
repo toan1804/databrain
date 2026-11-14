@@ -11,6 +11,7 @@ use crate::types::ConnectorKind;
 
 mod classify;
 mod params;
+mod parsed;
 mod read_only;
 mod redact;
 mod splitter;
@@ -19,6 +20,7 @@ mod statement;
 pub(crate) use classify::keyword_kind;
 pub use classify::{Classification, StatementKind, classify};
 pub use params::{ParamSpan, ParamValue, find_parameters, quote_string, render_param, substitute_parameters};
+pub use parsed::{ParsedStatement, parse_script};
 pub use read_only::{read_only_allows, unknown_functions};
 pub use redact::{redact_key_values, redact_secrets, redact_text, redact_url_passwords};
 pub use splitter::{StatementSpan, leading_keyword, split_statements, split_with, statement_at};

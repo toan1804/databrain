@@ -1,7 +1,6 @@
-use sqlparser::parser::Parser;
-
 use super::classify::{Classification, StatementKind};
-use super::{dialect_for, words};
+use super::parsed::Parse;
+use super::words;
 use crate::types::ConnectorKind;
 
 // ------------------------------------------------------------------ read-only
@@ -385,6 +384,14 @@ const PURE_FUNCTIONS: &[&str] = &[
 /// procedures' wrappers, `pkg.fn`, `dblink`, …): on a database without a
 /// read-only session mode, one of them could write.
 pub fn unknown_functions(sql: &str, kind: ConnectorKind) -> Vec<String> {
+    if !kind.traits().language.is_sql() {
+        return vec![];
+    }
+    functions_in(&Parse::of(sql, kind))
+}
+
+/// [`unknown_functions`] of a text the parser has read.
+pub(crate) fn functions_in(parse: &Parse) -> Vec<String> {
     use sqlparser::ast::{Expr, ObjectName, TableFactor, Visit, Visitor};
     use std::ops::ControlFlow;
     struct V(Vec<String>);
@@ -413,10 +420,7 @@ pub fn unknown_functions(sql: &str, kind: ConnectorKind) -> Vec<String> {
             ControlFlow::Continue(())
         }
     }
-    if !kind.traits().language.is_sql() {
-        return vec![];
-    }
-    match Parser::parse_sql(dialect_for(kind).as_ref(), sql) {
+    match &parse.statements {
         Ok(stmts) => {
             let mut v = V(vec![]);
             let _ = stmts.visit(&mut v);

@@ -13,9 +13,8 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{ObjectName, ObjectNamePart, ObjectType, Query, Statement, Visit, Visitor};
-use sqlparser::parser::Parser;
 
-use crate::sql::{dialect_for, leading_keyword, split_statements};
+use crate::sql::{ParsedStatement, leading_keyword, parse_script};
 use crate::traits::QueryLanguage;
 use crate::types::ConnectorKind;
 
@@ -69,32 +68,52 @@ pub fn table_refs(sql: &str, kind: ConnectorKind) -> TableRefs {
             _ => TableRefs { opaque: vec![leading_keyword(sql)], ..Default::default() },
         };
     }
-    let dialect = dialect_for(kind);
     let mut out = TableRefs::default();
-    for span in split_statements(sql, kind) {
-        let text = span.sql.trim();
-        if text.is_empty() {
-            continue;
-        }
-        let keyword = leading_keyword(text);
-        if changes_default(text) {
-            out.changes_default = true;
-            continue;
-        }
-        if OPAQUE_KEYWORDS.contains(&keyword.as_str()) {
-            out.opaque.push(keyword);
-            continue;
-        }
-        match Parser::parse_sql(dialect.as_ref(), text) {
-            Ok(stmts) if !stmts.is_empty() => {
-                for s in &stmts {
-                    collect(s, &mut out);
-                }
-            }
-            _ => out.opaque.push(keyword),
-        }
+    for p in parse_script(sql, kind) {
+        collect_statement(&p, &mut out);
     }
     out
+}
+
+/// Adds what one statement reads and writes to `out`.
+pub(crate) fn collect_statement(p: &ParsedStatement, out: &mut TableRefs) {
+    if !p.kind().traits().language.is_sql() {
+        merge(out, table_refs(p.sql(), p.kind()));
+        return;
+    }
+    let text = p.sql().trim();
+    if text.is_empty() {
+        return;
+    }
+    let keyword = leading_keyword(text);
+    if changes_default(text) {
+        out.changes_default = true;
+        return;
+    }
+    if OPAQUE_KEYWORDS.contains(&keyword.as_str()) {
+        out.opaque.push(keyword);
+        return;
+    }
+    match p.statements() {
+        Some(stmts) if !stmts.is_empty() => {
+            for s in stmts {
+                collect(s, out);
+            }
+        }
+        _ => out.opaque.push(keyword),
+    }
+}
+
+/// `other` added to `into`: tables once each, opaque statements all.
+pub fn merge(into: &mut TableRefs, other: TableRefs) {
+    for t in other.reads {
+        TableRefs::push(&mut into.reads, t);
+    }
+    for t in other.writes {
+        TableRefs::push(&mut into.writes, t);
+    }
+    into.opaque.extend(other.opaque);
+    into.changes_default |= other.changes_default;
 }
 
 /// `USE db`, `SET search_path …`, `SET SCHEMA …`, `ALTER SESSION SET CURRENT_SCHEMA …`, `USE CATALOG/SCHEMA …`.

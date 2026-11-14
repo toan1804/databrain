@@ -18,6 +18,8 @@ Main files (`crates/connector-core/src/`):
 | `sql/params.rs` | `find_parameters`, `render_param`, `quote_string`, `substitute_parameters` |
 | `sql/classify.rs` | `classify`, `StatementKind`, `Classification` |
 | `sql/read_only.rs` | `read_only_allows`, `unknown_functions` |
+| `sql/parsed.rs` | `ParsedStatement`, `parse_script`: each statement tokenized and parsed once |
+| `sql/statement.rs` | `Statement`, `Checked`: what a session may run |
 | `sql/redact.rs` | `redact_text`, `redact_secrets`, `redact_url_passwords`, `redact_key_values` |
 | `language.rs` | Classification and table references for Cypher and MongoDB commands |
 | `documents.rs` | `RowBatcher`: rows of documents or records to Arrow |
@@ -174,6 +176,12 @@ editor text
   ▼ run
   │ redact_text(sql or message)             sql/redact.rs      (history, job logs, AI transcripts and audit)
 ```
+
+### One reading per statement (`sql/parsed.rs`)
+
+`parse_script(text, kind)` splits the text with the splitter, then tokenizes each piece once with sqlparser and parses those tokens (what `Parser::parse_sql` does, without tokenizing again). A `ParsedStatement` keeps the span, the tokens and statements (or the error) and the classification, and answers `read_only_allows()`, `unknown_functions()` and `table_refs()` from that one reading; `classify` reads its tokens for the checks that need them (`->>`, `NEXT VALUE FOR`). The AI policy reads a script this way once instead of tokenizing each statement for every check. The text functions (`classify`, `unknown_functions`, `table_refs`) stay and give the same answers (`one_reading_agrees_with_the_text_functions`).
+
+The splitter, not sqlparser's tokens, decides where statements end: it reads strings as each server does (DuckDB's `e'\''`, MySQL's backslashes, `$$` bodies), and a text sqlparser can't tokenize must still split. Parameters (`find_parameters`) keep reading the text with `skip_token`, the splitter's scanner.
 
 `QueryEngine::plan` splits and classifies each statement into a `Checked`; `bind_parameters` substitutes and classifies again (`Checked::bind`), so the checks see the SQL that is sent, and only a `Checked` statement can run it (`query-engine/src/run.rs`).
 

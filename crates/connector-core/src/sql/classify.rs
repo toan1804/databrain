@@ -1,8 +1,9 @@
 use serde::Serialize;
 use sqlparser::ast::{Query, SetExpr, Statement};
-use sqlparser::parser::Parser;
+use sqlparser::tokenizer::Token;
 
-use super::{dialect_for, leading_keyword, words};
+use super::parsed::Parse;
+use super::{leading_keyword, words};
 use crate::types::ConnectorKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, ts_rs::TS)]
@@ -41,11 +42,20 @@ pub struct Classification {
 /// Classify one statement. Uses the SQL parser when possible and falls back
 /// to keyword heuristics (conservatively) when parsing fails.
 pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
+    classify_with(sql, kind, None)
+}
+
+/// [`classify`] with the parser's reading of `sql` when the caller has one
+/// ([`super::ParsedStatement`]); read here otherwise.
+pub(crate) fn classify_with(sql: &str, kind: ConnectorKind, parse: Option<&Parse>) -> Classification {
     let language = kind.traits().language;
     if !language.is_sql() {
         return crate::language::classify(sql, language);
     }
-    let c = classify_sql(sql, kind);
+    let c = match parse {
+        Some(p) => classify_sql(sql, kind, p),
+        None => classify_text(sql, kind),
+    };
     // MySQL and MariaDB run what is inside `/*! … */` and `/*M! … */`
     // (MariaDB only), which the parser takes for a comment or reads only in
     // part: `select * from t /*M! into outfile '/tmp/x' */` writes a file.
@@ -59,7 +69,7 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
     if kind.traits().syntax.backslash_in_backticks && sql.contains("\\`") {
         let pieces = super::split_statements(sql, kind);
         if pieces.len() > 1 {
-            let worst = pieces.iter().map(|p| classify_sql(&p.sql, kind).kind).max().unwrap_or(StatementKind::Read);
+            let worst = pieces.iter().map(|p| classify_text(&p.sql, kind).kind).max().unwrap_or(StatementKind::Read);
             return Classification { kind: c.kind.max(worst).max(StatementKind::Unknown), ..c };
         }
     }
@@ -83,7 +93,7 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
     if sql.contains(';') {
         let pieces = super::split_statements(sql, kind);
         if pieces.len() > 1 {
-            let worst = pieces.iter().map(|p| classify_sql(&p.sql, kind).kind).max().unwrap_or(StatementKind::Read);
+            let worst = pieces.iter().map(|p| classify_text(&p.sql, kind).kind).max().unwrap_or(StatementKind::Read);
             return Classification { kind: c.kind.max(worst), ..c };
         }
     }
@@ -104,26 +114,32 @@ fn no_backslash_kind(sql: &str, kind: ConnectorKind) -> StatementKind {
     }
     // One statement whose string never ends that way (`'O\'Brien'`): the
     // server rejects it and runs nothing.
-    if sqlparser::tokenizer::Tokenizer::new(dialect_for(kind).as_ref(), &doubled).tokenize().is_err() {
+    let parse = Parse::of(&doubled, kind);
+    if parse.tokens.is_none() {
         return StatementKind::Read;
     }
-    classify_sql(&doubled, kind).kind
+    classify_sql(&doubled, kind, &parse).kind
 }
 
-fn classify_sql(sql: &str, kind: ConnectorKind) -> Classification {
+/// [`classify_sql`] of a text read here.
+fn classify_text(sql: &str, kind: ConnectorKind) -> Classification {
+    classify_sql(sql, kind, &Parse::of(sql, kind))
+}
+
+fn classify_sql(sql: &str, kind: ConnectorKind, parse: &Parse) -> Classification {
     let keyword = leading_keyword(sql);
-    let dialect = dialect_for(kind);
-    match Parser::parse_sql(dialect.as_ref(), sql) {
+    let tokens = parse.tokens.as_deref();
+    match &parse.statements {
         Ok(stmts) if !stmts.is_empty() => {
             let mut out = Classification { kind: StatementKind::Read, missing_where: false, keyword: keyword.clone() };
-            for s in &stmts {
+            for s in stmts {
                 let (k, mw) = classify_ast(s);
                 out.kind = out.kind.max(k);
                 out.missing_where |= mw;
             }
             out.kind = check_control(out.kind, &keyword, sql);
             // `select pg_terminate_backend(…)` acts like `KILL`.
-            if out.kind < StatementKind::Dml && (stmts.iter().any(|s| calls_acting_function(s, kind)) || next_value_for(sql, dialect.as_ref())) {
+            if out.kind < StatementKind::Dml && (stmts.iter().any(|s| calls_acting_function(s, kind)) || next_value_for(sql, tokens)) {
                 out.kind = StatementKind::Other;
             }
             // What the parser accepted may not be what the server runs:
@@ -135,7 +151,7 @@ fn classify_sql(sql: &str, kind: ConnectorKind) -> Classification {
             if snowflake_table_call(sql, kind) {
                 out.kind = out.kind.max(StatementKind::Unknown);
             }
-            if out.kind.is_read() && (hides_statement(&stmts, kind) || chains_statements(sql, kind) || escaped_identifier(sql)) {
+            if out.kind.is_read() && (hides_statement(stmts, kind) || chains_statements(sql, kind, tokens) || escaped_identifier(sql)) {
                 out.kind = StatementKind::Unknown;
             }
             out
@@ -303,14 +319,13 @@ fn hides_statement(stmts: &[Statement], kind: ConnectorKind) -> bool {
 /// result of the one before (`select 1 ->> delete from t`); sqlparser reads
 /// it as the JSON operator. Any `->>` token there means more than one
 /// statement.
-fn chains_statements(sql: &str, kind: ConnectorKind) -> bool {
-    use sqlparser::tokenizer::{Token, Tokenizer};
+fn chains_statements(sql: &str, kind: ConnectorKind, tokens: Option<&[Token]>) -> bool {
     if kind != ConnectorKind::Snowflake {
         return false;
     }
-    match Tokenizer::new(dialect_for(kind).as_ref(), sql).tokenize() {
-        Ok(tokens) => tokens.iter().any(|t| matches!(t, Token::LongArrow)),
-        Err(_) => sql.contains("->>"),
+    match tokens {
+        Some(tokens) => tokens.iter().any(|t| matches!(t, Token::LongArrow)),
+        None => sql.contains("->>"),
     }
 }
 
@@ -850,8 +865,7 @@ fn calls_acting_function(s: &Statement, kind: ConnectorKind) -> bool {
 /// SQL Server / standard `NEXT VALUE FOR seq`, which advances the sequence
 /// (sqlparser reads it as columns and aliases). Also inside a string: a
 /// read is never claimed when unsure.
-fn next_value_for(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> bool {
-    use sqlparser::tokenizer::{Token, Tokenizer};
+fn next_value_for(sql: &str, tokens: Option<&[Token]>) -> bool {
     let is = |w: &&str, k: &str| w.eq_ignore_ascii_case(k);
     let three = |w: &[&str]| w.windows(3).any(|w| is(&w[0], "next") && is(&w[1], "value") && is(&w[2], "for"));
     // The words as written, comments and strings included: never a miss
@@ -862,8 +876,8 @@ fn next_value_for(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> bool 
     // The dialect's tokens without whitespace and comments
     // (`next /* c */ value for s`); strings and quoted names stay whole, and
     // block comments nest only where the dialect's do.
-    match Tokenizer::new(dialect, sql).tokenize() {
-        Ok(tokens) => {
+    match tokens {
+        Some(tokens) => {
             let w: Vec<&str> = tokens
                 .iter()
                 .filter(|t| !matches!(t, Token::Whitespace(_)))
@@ -876,7 +890,7 @@ fn next_value_for(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> bool 
         }
         // Not tokenizable: any comment could hide the gap, so the three words
         // anywhere in order are enough.
-        Err(_) => {
+        None => {
             let w: Vec<&str> = words(sql).collect();
             let at = |k: &str, from: usize| w.iter().skip(from).position(|x| is(x, k)).map(|i| i + from + 1);
             at("next", 0).and_then(|i| at("value", i)).and_then(|i| at("for", i)).is_some()

@@ -12,7 +12,8 @@
 //! schema (`USE`, `SET search_path`), is refused.
 
 use databrain_connector_core::ConnectorKind;
-use databrain_connector_core::tables::{TableName, table_refs};
+use databrain_connector_core::sql::ParsedStatement;
+use databrain_connector_core::tables::{TableName, TableRefs, table_refs};
 use databrain_workspace::{AiPolicy, ConnectionProfile};
 
 /// Whether any table rule is set.
@@ -170,7 +171,26 @@ pub fn check_sql(profile: &ConnectionProfile, sql: &str) -> Result<(), String> {
     if !has_rules(&profile.ai_policy) {
         return Ok(());
     }
-    let r = table_refs(sql, profile.config.kind);
+    check_refs(profile, table_refs(sql, profile.config.kind))
+}
+
+/// [`check_sql`] for a script already read ([`parse_script`](databrain_connector_core::sql::parse_script)).
+pub fn check_parsed(profile: &ConnectionProfile, sql: &str, pieces: &[ParsedStatement]) -> Result<(), String> {
+    if !has_rules(&profile.ai_policy) {
+        return Ok(());
+    }
+    // Other query languages read the script whole (MongoDB `$lookup`).
+    if !profile.config.kind.traits().language.is_sql() {
+        return check_sql(profile, sql);
+    }
+    let mut r = TableRefs::default();
+    for p in pieces {
+        databrain_connector_core::tables::merge(&mut r, p.table_refs());
+    }
+    check_refs(profile, r)
+}
+
+fn check_refs(profile: &ConnectionProfile, r: TableRefs) -> Result<(), String> {
     if r.changes_default {
         return Err(
             "changing the default database or schema (USE, SET search_path…) isn't allowed while table access rules are set; qualify the table names instead"
