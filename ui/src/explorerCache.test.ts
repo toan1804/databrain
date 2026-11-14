@@ -36,6 +36,9 @@ vi.mock("./lib/api", () => ({
       live(`revalidate:${open.join(",")}`, { refreshed: !cache ? [] : [{ schema: "main.sales", mode: "incremental", added: 1, changed: 0, removed: 0, objects: [t("main.sales", "orders"), t("main.sales", "new_one")] }], unchanged: 3, deferred: [], fingerprints: true, skipped: false }),
     describeObject: (_id: string, s: string, n: string) => live(`describe:${s}.${n}`, { columns: [{ name: "id" }, { name: "added_col" }] }),
     setSetting: async () => {},
+    clearExplorerCache: async (id: string) => {
+      calls.push(`clear:${id}`);
+    },
   },
 }));
 
@@ -55,6 +58,37 @@ beforeEach(() => {
 const settle = () => sleep(60);
 
 describe("explorer cache", () => {
+  it("clearing a connection's cache asks, forgets only its entries and reads it again", async () => {
+    useStore.setState({
+      catalogs: { c: [{ name: "old", is_default: true }], other: [{ name: "keep", is_default: true }] },
+      objects: { "c|main.sales": [t("main.sales", "gone")], "other|s": [t("s", "kept")] },
+      columns: { "c|main.sales|gone": [], "cx|s|t": [] },
+      confirm: null,
+    });
+    // Said no: nothing happens.
+    const no = useStore.getState().clearExplorerCache("c");
+    await vi.waitFor(() => expect(useStore.getState().confirm).not.toBeNull());
+    useStore.getState().confirm!.onCancel?.();
+    expect(await no).toBe(false);
+    expect(calls).toEqual([]);
+    // Yes: cleared on the backend, this connection's entries gone (not
+    // another's, not one whose id only starts the same), read again.
+    useStore.setState({ confirm: null });
+    const yes = useStore.getState().clearExplorerCache("c");
+    await vi.waitFor(() => expect(useStore.getState().confirm).not.toBeNull());
+    await useStore.getState().confirm!.onConfirm();
+    expect(await yes).toBe(true);
+    expect(calls[0]).toBe("clear:c");
+    const st = useStore.getState();
+    expect(st.objects["c|main.sales"]).toBeUndefined();
+    expect(st.columns["c|main.sales|gone"]).toBeUndefined();
+    expect(st.objects["other|s"]).toBeDefined();
+    expect(st.columns["cx|s|t"]).toBeDefined();
+    expect(st.catalogs.other).toBeDefined();
+    await vi.waitFor(() => expect(useStore.getState().catalogs.c?.map((c) => c.name)).toEqual(["main", "dev"]));
+    expect(calls).toContain("reconnect");
+  });
+
   it("lists catalogs first, schemas of a catalog when opened, and prefetches the default catalog in the background", async () => {
     await useStore.getState().openExplorer("c");
     expect(useStore.getState().catalogs.c.map((c) => c.name)).toEqual(["main", "dev"]);

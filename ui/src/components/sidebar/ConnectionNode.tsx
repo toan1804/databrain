@@ -5,6 +5,7 @@ import {
   Eye,
   FileCode2,
   LogIn,
+  Eraser,
   NotebookPen,
   Sparkles,
   ListChecks,
@@ -180,6 +181,17 @@ export function ConnectionNode({ conn }: { conn: ConnectionView }) {
               setMenu(null);
               void useAi.getState().indexKnowledge(conn.id);
               useAi.getState().setOpen(true, "knowledge");
+            }}
+          />
+          <MenuItem
+            icon={<Eraser size={13} />}
+            label="Clear cached metadata…"
+            onClick={() => {
+              setMenu(null);
+              void useStore
+                .getState()
+                .clearExplorerCache(conn.id)
+                .then((cleared) => cleared && setExpanded(true));
             }}
           />
           {conn.connected && (
