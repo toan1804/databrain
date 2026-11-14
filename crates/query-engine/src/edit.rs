@@ -501,7 +501,9 @@ impl QueryEngine {
         let session = self.session(&t.connection_id, session_key).await?;
         let run = |sql: String| {
             let s = session.clone();
-            async move { s.execute(&sql, ExecOptions::default()).await?.collect().await.map(|c| c.summary.rows_affected) }
+            async move {
+                s.execute(databrain_connector_core::Statement::internal(&sql), ExecOptions::default()).await?.collect().await.map(|c| c.summary.rows_affected)
+            }
         };
         let in_tx = session.in_transaction();
         let mut report = ApplyReport { statements: stmts.len(), in_open_transaction: in_tx, ..Default::default() };

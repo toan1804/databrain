@@ -107,7 +107,8 @@ impl Session for MysqlSession {
         self.conn.lock().await.ping().await.map_err(map_err)
     }
 
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+    async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
+        let sql = stmt.sql();
         let (tx, stream) = QueryStream::channel(4);
         let ctx = Ctx {
             conn: self.conn.clone(),
@@ -429,7 +430,7 @@ mod tests {
         let s = MysqlConnector.connect(&cfg, creds).await.unwrap();
         let run = |sql: &'static str| {
             let s = &s;
-            async move { s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap() }
+            async move { s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await.unwrap().collect().await.unwrap() }
         };
         run("drop database if exists ex_a").await;
         run("create database ex_a").await;
@@ -475,16 +476,28 @@ mod tests {
             std::env::var("DATABRAIN_MYSQL_PASSWORD").ok().map(secrecy::SecretString::from),
         ));
         let s = MysqlConnector.connect(&cfg, creds).await.unwrap();
-        let r = s.execute("select 1 as a, 'x' as b, now() as c, 1.5 as d", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let r = s
+            .execute(databrain_connector_core::Statement::internal("select 1 as a, 'x' as b, now() as c, 1.5 as d"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(r.num_rows(), 1);
         let cancel = databrain_connector_core::CancellationToken::new();
-        let stream = s.execute("select sleep(30)", ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() }).await.unwrap();
+        let stream = s
+            .execute(
+                databrain_connector_core::Statement::internal("select sleep(30)"),
+                ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() },
+            )
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         cancel.cancel();
         let _ = stream.collect().await;
         assert!(!s.list_schemas().await.unwrap().is_empty());
         if let Ok(db) = std::env::var("DATABRAIN_MYSQL_DB") {
-            let run = |sql: &'static str| s.execute(sql, ExecOptions::default());
+            let run = |sql: &'static str| s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default());
             run("drop table if exists databrain_layout_t").await.unwrap().collect().await.unwrap();
             run("create table databrain_layout_t (id int, day date, cust varchar(20), primary key (id, day), key i_cust (cust, day)) partition by range columns (day) (partition p0 values less than ('2030-01-01'))")
                 .await.unwrap().collect().await.unwrap();

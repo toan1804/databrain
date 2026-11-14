@@ -280,7 +280,8 @@ impl Session for SqliteSession {
         self.with_conn(|c| c.query_row("select 1", [], |_| Ok(())).map_err(map_err)).await
     }
 
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+    async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
+        let sql = stmt.sql();
         let (tx, stream) = QueryStream::channel(4);
         let conn = self.conn.clone();
         let sql = sql.to_string();
@@ -519,7 +520,7 @@ mod tests {
     }
 
     async fn exec(s: &dyn Session, sql: &str) -> databrain_connector_core::Collected {
-        s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap()
+        s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await.unwrap().collect().await.unwrap()
     }
 
     #[tokio::test]
@@ -556,7 +557,10 @@ mod tests {
         let s = session().await;
         let opts = ExecOptions { batch_size: 100, cancel: CancellationToken::new(), ..Default::default() };
         let r = s
-            .execute("with recursive c(x) as (select 1 union all select x+1 from c where x < 1050) select x from c", opts)
+            .execute(
+                databrain_connector_core::Statement::internal("with recursive c(x) as (select 1 union all select x+1 from c where x < 1050) select x from c"),
+                opts,
+            )
             .await
             .unwrap()
             .collect()
@@ -573,7 +577,13 @@ mod tests {
         let s = session().await;
         let cancel = CancellationToken::new();
         let opts = ExecOptions { batch_size: 1000, cancel: cancel.clone(), ..Default::default() };
-        let stream = s.execute("with recursive c(x) as (select 1 union all select x+1 from c) select count(*) from c", opts).await.unwrap();
+        let stream = s
+            .execute(
+                databrain_connector_core::Statement::internal("with recursive c(x) as (select 1 union all select x+1 from c) select count(*) from c"),
+                opts,
+            )
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         cancel.cancel();
         let err = tokio::time::timeout(std::time::Duration::from_secs(5), stream.collect()).await.expect("cancel should finish quickly").unwrap_err();
@@ -585,7 +595,7 @@ mod tests {
     #[tokio::test]
     async fn syntax_error_has_message() {
         let s = session().await;
-        let err = s.execute("selec 1", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
+        let err = s.execute(databrain_connector_core::Statement::internal("selec 1"), ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
         assert_eq!(err.kind, ErrorKind::Query);
         assert!(err.message.contains("syntax error"), "{}", err.message);
     }
@@ -643,7 +653,13 @@ mod tests {
         c.read_only = true;
         let creds = Arc::new(InlineCredentialSource::new(AuthMethod::None, None));
         let s = SqliteConnector.connect(&c, creds).await.unwrap();
-        let err = s.execute("insert into t values (1)", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
+        let err = s
+            .execute(databrain_connector_core::Statement::internal("insert into t values (1)"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
         assert!(err.message.to_lowercase().contains("readonly"), "{}", err.message);
         let _ = std::fs::remove_file(&path);
     }

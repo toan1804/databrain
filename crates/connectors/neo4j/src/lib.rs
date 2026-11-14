@@ -383,7 +383,8 @@ impl Session for Neo4jSession {
         self.rows(query("RETURN 1 AS ok")).await.map(|_| ())
     }
 
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+    async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
+        let sql = stmt.sql();
         let (tx, stream) = QueryStream::channel(4);
         let graph = self.graph.clone();
         let text = sql.to_string();
@@ -568,7 +569,7 @@ mod tests {
         let q = |t: &str| {
             let t = t.to_string();
             let s = &s;
-            async move { s.execute(&t, ExecOptions::default()).await.unwrap().collect().await }
+            async move { s.execute(databrain_connector_core::Statement::internal(&t), ExecOptions::default()).await.unwrap().collect().await }
         };
         q("MATCH (n:DbTest) DETACH DELETE n").await.unwrap();
         q("CREATE (:DbTest {name: 'An', age: 30})-[:KNOWS {since: date('2020-01-02')}]->(:DbTest {name: 'Binh', age: 41})").await.unwrap();

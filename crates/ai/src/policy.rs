@@ -2,7 +2,7 @@
 //! approval, or is blocked. Enforced in code, never delegated to the model.
 
 use databrain_connector_core::ConnectorKind;
-use databrain_connector_core::sql::{Classification, StatementKind, classify, split_statements};
+use databrain_connector_core::sql::{Classification, ParsedStatement, StatementKind, parse_script};
 use databrain_workspace::{AiPolicy, ConnectionProfile, EnvTag, RunQueryPolicy};
 use serde::Serialize;
 
@@ -29,12 +29,14 @@ pub struct SqlReview {
 pub fn review_sql(profile: &ConnectionProfile, sql: &str) -> SqlReview {
     let kind = profile.config.kind;
     let policy = &profile.ai_policy;
-    let pieces = split_statements(sql, kind);
-    let stmts: Vec<Classification> = pieces.iter().map(|s| classify(&s.sql, kind)).collect();
+    // Read once: classification, the read-only rule, the function check
+    // and the table rules all work from these.
+    let pieces = parse_script(sql, kind);
+    let stmts: Vec<Classification> = pieces.iter().map(|p| p.classification().clone()).collect();
     let worst = stmts.iter().map(|c| c.kind).max().unwrap_or(StatementKind::Unknown);
     let mut decision = decide(profile, policy, &stmts, worst);
     if profile.config.read_only && !matches!(decision, Decision::Deny(_)) {
-        decision = read_only_decision(profile, &pieces, &stmts).unwrap_or(decision);
+        decision = read_only_decision(profile, &pieces).unwrap_or(decision);
     } else if !matches!(decision, Decision::Deny(_)) {
         match write_denied(profile) {
             // The AI may not write here (writes off, production…): a "read"
@@ -43,7 +45,7 @@ pub fn review_sql(profile: &ConnectionProfile, sql: &str) -> SqlReview {
             // It may: writes always ask, so a "read" that could write
             // (unknown functions, SQL that can't be parsed) asks too.
             None if decision == Decision::Allow => {
-                let fns = could_write(profile, &pieces);
+                let fns = could_write(&pieces);
                 if !fns.is_empty() {
                     decision = Decision::Ask(format!("This query calls {}, which could write", fns.join(", ")));
                 }
@@ -54,7 +56,7 @@ pub fn review_sql(profile: &ConnectionProfile, sql: &str) -> SqlReview {
     // Tables the AI may read / write (checked after the connection-wide rules,
     // so their reasons come first).
     if !matches!(decision, Decision::Deny(_))
-        && let Err(reason) = crate::access::check_sql(profile, sql)
+        && let Err(reason) = crate::access::check_parsed(profile, sql, &pieces)
     {
         decision = Decision::Deny(reason);
     }
@@ -126,10 +128,9 @@ pub fn write_denied(profile: &ConnectionProfile) -> Option<String> {
 ///   default_transaction_read_only = off`, `BEGIN READ WRITE`), except a
 ///   harmless `USE` or `SET` (see `read_only_allows`).
 /// - Functions that could write need the user (see [`function_writes`]).
-fn read_only_decision(profile: &ConnectionProfile, pieces: &[databrain_connector_core::sql::StatementSpan], stmts: &[Classification]) -> Option<Decision> {
-    use databrain_connector_core::sql::read_only_allows;
-    if let Some((_, c)) = pieces.iter().zip(stmts).find(|(p, c)| !read_only_allows(&p.sql, c)) {
-        return Some(Decision::Deny(format!("the connection is read-only: {} statements are not run on it", c.keyword)));
+fn read_only_decision(profile: &ConnectionProfile, pieces: &[ParsedStatement]) -> Option<Decision> {
+    if let Some(p) = pieces.iter().find(|p| !p.read_only_allows()) {
+        return Some(Decision::Deny(format!("the connection is read-only: {} statements are not run on it", p.classification().keyword)));
     }
     function_writes(profile, pieces, "the connection is read-only")
 }
@@ -155,9 +156,9 @@ const OUTSIDE_READ_ONLY: &[&str] = &[
 
 /// Functions `pieces` call that are not known built-ins (each once), or a
 /// note that the SQL can't be parsed.
-fn could_write(profile: &ConnectionProfile, pieces: &[databrain_connector_core::sql::StatementSpan]) -> Vec<String> {
+fn could_write(pieces: &[ParsedStatement]) -> Vec<String> {
     let mut fns: Vec<String> = Vec::new();
-    for f in pieces.iter().flat_map(|p| databrain_connector_core::sql::unknown_functions(&p.sql, profile.config.kind)) {
+    for f in pieces.iter().flat_map(ParsedStatement::unknown_functions) {
         if !fns.contains(&f) {
             fns.push(f);
         }
@@ -179,11 +180,11 @@ fn outside_read_only(f: &str) -> bool {
 /// ClickHouse) stops writes in functions, but only on a connection set to
 /// read-only: elsewhere the session can write, so every unknown function
 /// counts. Functions acting outside that mode count even then.
-fn function_writes(profile: &ConnectionProfile, pieces: &[databrain_connector_core::sql::StatementSpan], why: &str) -> Option<Decision> {
+fn function_writes(profile: &ConnectionProfile, pieces: &[ParsedStatement], why: &str) -> Option<Decision> {
     let kind = profile.config.kind;
     let session_read_only = profile.config.read_only && kind.server_read_only();
     let mut fns: Vec<String> = Vec::new();
-    for f in could_write(profile, pieces) {
+    for f in could_write(pieces) {
         if session_read_only && !outside_read_only(&f) {
             continue;
         }

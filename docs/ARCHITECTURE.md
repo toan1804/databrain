@@ -121,7 +121,7 @@ pub trait Session: Send + Sync {
     fn kind(&self) -> ConnectorKind;
     async fn server_version(&self) -> Result<String>;
     async fn ping(&self) -> Result<()>;
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream>;
+    async fn execute(&self, stmt: Statement<'_>, opts: ExecOptions) -> Result<QueryStream>;
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>>;
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>>;
     async fn describe(&self, schema: &str, name: &str) -> Result<ObjectDetail>;

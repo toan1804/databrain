@@ -10,5 +10,5 @@ pub(crate) async fn session(cfg: ConnectionConfig) -> Box<dyn Session> {
 }
 
 pub(crate) async fn q(s: &dyn Session, sql: &str) -> databrain_connector_core::Collected {
-    s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap()
+    s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await.unwrap().collect().await.unwrap()
 }

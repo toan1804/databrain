@@ -149,7 +149,7 @@ mod tests {
             "create function kb_ddl.twice(x int) returns int deterministic return x * 2",
             "create procedure kb_ddl.noop() begin end",
         ] {
-            s.execute(stmt, ExecOptions::default()).await.unwrap().collect().await.unwrap();
+            s.execute(databrain_connector_core::Statement::internal(stmt), ExecOptions::default()).await.unwrap().collect().await.unwrap();
         }
         let ddl = |n: &'static str, k: ObjectKind| {
             let s = &s;
@@ -159,12 +159,12 @@ mod tests {
         assert!(ddl("v", ObjectKind::View).await.contains("VIEW `kb_ddl`.`v` AS"));
         assert!(ddl("twice", ObjectKind::Function).await.contains("FUNCTION `twice`"));
         assert!(ddl("noop", ObjectKind::Procedure).await.contains("PROCEDURE `noop`"));
-        s.execute("drop database kb_ddl", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        s.execute(databrain_connector_core::Statement::internal("drop database kb_ddl"), ExecOptions::default()).await.unwrap().collect().await.unwrap();
         let run = |sql: &'static str| {
             let s = &s;
             async move {
                 for stmt in sql.split(';').map(str::trim).filter(|x| !x.is_empty()) {
-                    s.execute(stmt, ExecOptions::default()).await.unwrap().collect().await.unwrap();
+                    s.execute(databrain_connector_core::Statement::internal(stmt), ExecOptions::default()).await.unwrap().collect().await.unwrap();
                 }
             }
         };

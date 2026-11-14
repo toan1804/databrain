@@ -343,7 +343,7 @@ mod tests {
         let s = mock::session(&origin, false);
         let opts = ExecOptions { max_rows: Some(1001), ..Default::default() };
         let t0 = std::time::Instant::now();
-        let r = s.execute("SELECT * FROM big", opts).await.unwrap().collect().await.unwrap();
+        let r = s.execute(databrain_connector_core::Statement::internal("SELECT * FROM big"), opts).await.unwrap().collect().await.unwrap();
         let took = t0.elapsed();
         let n = mock::CHUNKS as i64;
         assert_eq!(ints(&r), (0..n * 2).collect::<Vec<_>>(), "rows in chunk order, n cast to BIGINT");
@@ -370,7 +370,13 @@ mod tests {
     #[tokio::test]
     async fn arrow_refused_uses_json_links() {
         let (origin, log) = mock::serve("no_arrow").await;
-        let r = mock::session(&origin, false).execute("SELECT * FROM big", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let r = mock::session(&origin, false)
+            .execute(databrain_connector_core::Statement::internal("SELECT * FROM big"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(texts(&r), vec!["r0", "NULL", "r2", "NULL"]);
         assert!(r.notices.is_empty(), "{:?}", r.notices);
         assert!(log.lock().unwrap().requests.iter().any(|(_, p, _, _)| p.starts_with("/blob/json/")));
@@ -390,7 +396,7 @@ mod tests {
     async fn expired_link_is_renewed() {
         let (origin, log) = mock::serve("expire_once").await;
         let s = mock::session(&origin, false);
-        let r = s.execute("SELECT * FROM big", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let r = s.execute(databrain_connector_core::Statement::internal("SELECT * FROM big"), ExecOptions::default()).await.unwrap().collect().await.unwrap();
         assert_eq!(r.num_rows(), mock::CHUNKS as usize * 2);
         assert!(log.lock().unwrap().requests.iter().any(|(_, p, _, _)| p == "/api/2.0/sql/statements/st1/result/chunks/0"), "fresh link requested");
     }
@@ -399,12 +405,18 @@ mod tests {
     async fn blocked_storage_falls_back_to_inline() {
         let (origin, _) = mock::serve("blocked").await;
         let s = mock::session(&origin, false);
-        let r = s.execute("SELECT * FROM big", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let r = s.execute(databrain_connector_core::Statement::internal("SELECT * FROM big"), ExecOptions::default()).await.unwrap().collect().await.unwrap();
         assert_eq!(texts(&r), vec!["inline"]);
         assert!(r.notices.iter().any(|n| n.contains("inline")), "{:?}", r.notices);
         // Inline-only connections never try links.
         let (origin, log) = mock::serve("ok").await;
-        let r = mock::session(&origin, true).execute("SELECT 1", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let r = mock::session(&origin, true)
+            .execute(databrain_connector_core::Statement::internal("SELECT 1"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(texts(&r), vec!["inline"]);
         assert!(log.lock().unwrap().requests.iter().all(|(_, p, _, _)| !p.starts_with("/blob/")));
     }
@@ -412,7 +424,13 @@ mod tests {
     #[tokio::test]
     async fn dropped_connections_and_503_are_retried() {
         let (origin, log) = mock::serve("flaky").await;
-        let r = mock::session(&origin, false).execute("SELECT * FROM big", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let r = mock::session(&origin, false)
+            .execute(databrain_connector_core::Statement::internal("SELECT * FROM big"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(ints(&r), (0..mock::CHUNKS as i64 * 2).collect::<Vec<_>>());
         let log = log.lock().unwrap();
         assert!(log.hits.values().all(|h| *h == 3), "drop, 503, then ok for every chunk: {:?}", log.hits);
@@ -421,7 +439,13 @@ mod tests {
     #[tokio::test]
     async fn expired_links_are_renewed_before_download() {
         let (origin, log) = mock::serve("stale_links").await;
-        let r = mock::session(&origin, false).execute("SELECT * FROM big", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let r = mock::session(&origin, false)
+            .execute(databrain_connector_core::Statement::internal("SELECT * FROM big"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(r.num_rows(), mock::CHUNKS as usize * 2);
         {
             let log = log.lock().unwrap();

@@ -18,6 +18,8 @@ Main files (`crates/connector-core/src/`):
 | `sql/params.rs` | `find_parameters`, `render_param`, `quote_string`, `substitute_parameters` |
 | `sql/classify.rs` | `classify`, `StatementKind`, `Classification` |
 | `sql/read_only.rs` | `read_only_allows`, `unknown_functions` |
+| `sql/parsed.rs` | `ParsedStatement`, `parse_script`: each statement tokenized and parsed once |
+| `sql/statement.rs` | `Statement`, `Checked`: what a session may run |
 | `sql/redact.rs` | `redact_text`, `redact_secrets`, `redact_url_passwords`, `redact_key_values` |
 | `language.rs` | Classification and table references for Cypher and MongoDB commands |
 | `documents.rs` | `RowBatcher`: rows of documents or records to Arrow |
@@ -78,11 +80,22 @@ Required: `kind`, `server_version`, `ping`, `execute`, `list_schemas`, `list_obj
 | `bulk_metadata(schemas)` | `default_bulk_metadata`: `list_objects` + `schema_columns` per schema | Two or more queries per schema; a schema's error is in its entry, not the call's |
 | `schema_columns(schema)` | `describe` per object; objects that fail are skipped | One round trip per table |
 | `schema_object_counts()` | `None` | The index can't be sized before it runs |
-| `check_sql(sql)` | runs `traits().explain` + `sql` through `execute`, shifts the error position back | `Ok(false)` when `explain` is `None`. The text is sent as given: the caller passes one statement it has classified as a read |
+| `check_sql(&Checked)` | runs `traits().explain` + the statement through `execute`, shifts the error position back | `Ok(false)` when `explain` is `None`. The text is sent as given: the caller passes one statement and checks its kind |
 | `table_layout(schema, name)` | primary key from `describe` | No index or partition hints |
-| `estimate_cost(sql)` | `None` | Must agree with `SourceTraits::cost_preview` |
+| `estimate_cost(&Checked)` | `None` | Must agree with `SourceTraits::cost_preview` |
 
-`execute(sql, opts)` takes one statement and returns a `QueryStream` (below). Nothing in the core checks that `sql` is one statement; the splitter is what makes it so, and what a driver does with text holding several is the connector's business.
+`execute(stmt, opts)` takes one statement and returns a `QueryStream` (below). Nothing in the core checks that it is one statement; the splitter is what makes it so, and what a driver does with text holding several is the connector's business.
+
+### `Statement` and `Checked` (`sql/statement.rs`)
+
+What `execute`, `check_sql`, `estimate_cost` and `query_table` take is a `Statement`, and there are two ways to make one:
+
+| From | For | Made by |
+|---|---|---|
+| `Checked::statement()` | Text a user, the AI, a job or a client typed | `Checked::new(sql, kind)` classifies it; `Checked::bind(kind, params)` puts in the `:name` values and classifies again |
+| `Statement::internal(sql)` | SQL DataBrain writes: catalog queries (`query_text`), `BEGIN`/`COMMIT`, grid edits, load statements, `EXPLAIN` around a `Checked` statement | Nothing checks it; each use is a place to review |
+
+So typed text can't reach a database without the classification the safety checks read: `PlannedStatement` holds a `Checked`, exports, loads that run a query again, a load's before/after SQL (`Act::User`), plans, cost previews and "Check with database" build one. A `Checked` is classified, not allowed: whoever builds one still decides on its kind (`QueryEngine::check_sql` refuses what isn't a read). A connector reads the text with `stmt.sql()`.
 
 ## `SourceTraits` and the generated JSON
 
@@ -164,7 +177,13 @@ editor text
   │ redact_text(sql or message)             sql/redact.rs      (history, job logs, AI transcripts and audit)
 ```
 
-`QueryEngine::plan` splits and classifies; `bind_parameters` substitutes and classifies again, so the checks see the SQL that is sent (`query-engine/src/run.rs`).
+### One reading per statement (`sql/parsed.rs`)
+
+`parse_script(text, kind)` splits the text with the splitter, then tokenizes each piece once with sqlparser and parses those tokens (what `Parser::parse_sql` does, without tokenizing again). A `ParsedStatement` keeps the span, the tokens and statements (or the error) and the classification, and answers `read_only_allows()`, `unknown_functions()` and `table_refs()` from that one reading; `classify` reads its tokens for the checks that need them (`->>`, `NEXT VALUE FOR`). The AI policy reads a script this way once instead of tokenizing each statement for every check. The text functions (`classify`, `unknown_functions`, `table_refs`) stay and give the same answers (`one_reading_agrees_with_the_text_functions`).
+
+The splitter, not sqlparser's tokens, decides where statements end: it reads strings as each server does (DuckDB's `e'\''`, MySQL's backslashes, `$$` bodies), and a text sqlparser can't tokenize must still split. Parameters (`find_parameters`) keep reading the text with `skip_token`, the splitter's scanner.
+
+`QueryEngine::plan` splits and classifies each statement into a `Checked`; `bind_parameters` substitutes and classifies again (`Checked::bind`), so the checks see the SQL that is sent, and only a `Checked` statement can run it (`query-engine/src/run.rs`).
 
 | Stage | Guarantees | Assumes |
 |---|---|---|
@@ -222,11 +241,13 @@ How `classify` gets there:
 
 | Pass | Hides |
 |---|---|
-| `redact_secrets` | The literal after a word of `SECRET_WORDS` (optionally `=`, `(`, `PASSWORD(`), and after `IDENTIFIED BY` / `IDENTIFIED WITH plugin BY|AS`; quoted, `E'…'`, `N'…'`, dollar-quoted, or a bare word after `IDENTIFIED BY`. Run again on text inside double quotes, because error messages quote SQL that way |
+| `redact_secrets` | The literal after a word of `SECRET_WORDS` (optionally `=`, `(`, `PASSWORD(`), and after `IDENTIFIED BY` / `IDENTIFIED WITH plugin BY|AS` (and `REPLACE old`); quoted, `E'…'`, `N'…'`, dollar-quoted, or a bare word after `IDENTIFIED BY`. The secret arguments of the calls in `POSITIONAL_SECRETS` (`s3(url, key, 'secret')`, `pgp_sym_encrypt(data, 'key')`, `sp_addlogin 'l', 'pw'`). SQL inside a statement-like string (`EXECUTE '…'`) and dollar-quoted bodies is read too. Run again on text inside double quotes, because error messages quote SQL that way |
 | `redact_url_passwords` | The password of `scheme://user:password@host` |
 | `redact_key_values` | The value of `name = value` / `name: value` when the name is a secret's (`secret_name`: the words above or a suffix such as `password`, `pwd`, `_token`, `api_key`). Outside strings only quoted values; inside strings and comments bare values too (connection strings) |
 
-A new secret syntax is added by word (`SECRET_WORDS`, `secret_name`) with a test for the hidden and the untouched case. Positional secrets (the fifth argument of a function) are not recognised.
+`redact_secrets` reads SQL through one tokenizer (`Lexer`: spaces, comments, words, quoted text, dollar-quoted text, other characters), and every rule (`secret_after`, `take_value`, `positional_secrets`, `nested_spans`) works on its tokens, so the rules can't disagree about where a string ends. The text's database is unknown, so it is read six ways (`Reading::ALL`): with and without backslash escapes (`'C:\'` ends a string on most servers, not on MySQL) and with and without dollar quotes (`$$it's$$` is one string on Postgres, a quote on MySQL), then once more with `[name]` and Oracle's `q'[…]'` as quoted text (SQL Server, SQLite, Oracle) and once with `#` starting a comment (MySQL, ClickHouse). What any reading finds is hidden, so a reading is only ever added. `positional_secrets` keeps the open calls on a stack, so a call in another's argument is read too, in one pass. SQL inside quoted text is read at most `MAX_DEPTH` (8) levels deep, and the `PASSWORD FOR account =` rule looks 16 tokens ahead: long or hostile text stays linear (`long_repeats_stay_linear`). `redact_url_passwords` and `redact_key_values` scan text that is often not SQL (connection strings, settings, JSON, AI answers) and keep their own reading.
+
+A new secret syntax is a word in `SECRET_WORDS` or `secret_name`, a row in `POSITIONAL_SECRETS`, or a rule in `secret_after`, with a test for the hidden and the untouched case.
 
 ## Other query languages (`language.rs`)
 

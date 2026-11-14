@@ -33,7 +33,8 @@ impl Session for DbxSession {
         self.0.run_small("SELECT 1").await.map(|_| ())
     }
 
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+    async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
+        let sql = stmt.sql();
         let (tx, stream) = QueryStream::channel(4);
         let inner = self.0.clone();
         let sql = sql.to_string();
@@ -227,7 +228,8 @@ impl Session for DbxSession {
     /// `EXPLAIN COST`: the optimized plan with Spark's size and row
     /// estimates from table statistics. Nothing runs, but the warehouse
     /// must be up to answer (a stopped one starts).
-    async fn estimate_cost(&self, sql: &str) -> Result<Option<CostEstimate>> {
+    async fn estimate_cost(&self, sql: &databrain_connector_core::Checked) -> Result<Option<CostEstimate>> {
+        let sql = sql.sql();
         let rows = databrain_connector_core::query_text(self, &format!("EXPLAIN COST {sql}")).await?;
         let text = rows.iter().filter_map(|r| r.first().cloned().flatten()).collect::<Vec<_>>().join("\n");
         explain_cost_estimate(&text).map(Some)
@@ -238,7 +240,9 @@ impl Session for DbxSession {
         let full = format!("{}.{}", databrain_connector_core::quote_path(ConnectorKind::Databricks, schema), quote_ident(ConnectorKind::Databricks, name));
         let mut l = TableLayout::default();
         // Views and non-Delta tables have no detail: no hints, not an error.
-        let Ok((names, rows)) = query_table(self, &format!("DESCRIBE DETAIL {full}")).await else { return Ok(l) };
+        let Ok((names, rows)) = query_table(self, databrain_connector_core::Statement::internal(&format!("DESCRIBE DETAIL {full}"))).await else {
+            return Ok(l);
+        };
         let Some(r) = rows.first() else { return Ok(l) };
         let get = |n: &str| names.iter().position(|x| x.eq_ignore_ascii_case(n)).and_then(|i| r.get(i).cloned().flatten());
         l.partition_by = get("partitionColumns").as_deref().map(parse_list_text).unwrap_or_default();
@@ -251,7 +255,7 @@ impl Session for DbxSession {
         }
         l.size_bytes = get("sizeInBytes").and_then(|b| b.parse().ok());
         // Rows: only from statistics (ANALYZE TABLE … COMPUTE STATISTICS), never a scan.
-        if let Ok((names, rows)) = query_table(self, &format!("DESCRIBE TABLE EXTENDED {full}")).await {
+        if let Ok((names, rows)) = query_table(self, databrain_connector_core::Statement::internal(&format!("DESCRIBE TABLE EXTENDED {full}"))).await {
             let col = |n: &str| names.iter().position(|x| x.eq_ignore_ascii_case(n));
             if let (Some(k), Some(v)) = (col("col_name"), col("data_type")) {
                 let stats = rows.iter().find(|r| r.get(k).cloned().flatten().as_deref() == Some("Statistics")).and_then(|r| r.get(v).cloned().flatten());

@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use databrain_connector_core::arrow::array::RecordBatch;
 use databrain_connector_core::arrow::datatypes::{Field, Schema, SchemaRef};
-use databrain_connector_core::sql::{StatementKind, classify, split_statements};
+use databrain_connector_core::sql::{Checked, Statement, StatementKind, split_statements};
 use databrain_connector_core::traits::NameLevels;
 use databrain_connector_core::{
     CancellationToken, ConnectorKind, ErrorKind, ExecOptions, ObjectKind, QueryStream, Session, StreamEvent, quote_ident, split_path,
@@ -192,8 +192,6 @@ impl LoadRows {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActKind {
-    /// Before/after SQL of the user.
-    User,
     /// DDL this step adds (create/drop the target).
     Ddl,
     /// Staging table create/drop (temporary on most engines).
@@ -208,28 +206,20 @@ enum ActKind {
 
 #[derive(Debug, Clone)]
 enum Act {
-    Sql {
-        label: String,
-        sql: String,
-        kind: ActKind,
-    },
+    /// Before/after SQL of the user, classified.
+    User { label: String, sql: Checked },
+    /// SQL the load writes.
+    Sql { label: String, sql: String, kind: ActKind },
     /// Insert the rows into `table`; `target` = the step's table (not staging).
-    Insert {
-        label: String,
-        table: String,
-        target: bool,
-    },
+    Insert { label: String, table: String, target: bool },
     /// Can't be built (no rows to plan with).
-    Skip {
-        label: String,
-        reason: String,
-    },
+    Skip { label: String, reason: String },
 }
 
 impl Act {
     fn label(&self) -> &str {
         match self {
-            Act::Sql { label, .. } | Act::Insert { label, .. } | Act::Skip { label, .. } => label,
+            Act::User { label, .. } | Act::Sql { label, .. } | Act::Insert { label, .. } | Act::Skip { label, .. } => label,
         }
     }
 }
@@ -246,12 +236,12 @@ fn mode_text(m: LoadMode) -> &'static str {
 }
 
 /// [`exec`], reported to `obs` as one statement.
-async fn timed(session: &Arc<dyn Session>, label: &str, sql: &str, cancel: &CancellationToken, obs: &dyn LoadObserver) -> Result<Option<u64>> {
+async fn timed(session: &Arc<dyn Session>, label: &str, stmt: Statement<'_>, cancel: &CancellationToken, obs: &dyn LoadObserver) -> Result<Option<u64>> {
     let t = std::time::Instant::now();
-    let r = exec(session, sql, cancel).await;
+    let r = exec(session, stmt, cancel).await;
     obs.event(LoadEvent::Statement {
         label: label.into(),
-        sql: sql.into(),
+        sql: stmt.sql().into(),
         rows: r.as_ref().ok().copied().flatten(),
         duration_ms: t.elapsed().as_millis() as u64,
         error: r.as_ref().err().map(|e| e.message.clone()),
@@ -289,10 +279,10 @@ struct Prepared {
 /// The step's own before/after SQL, checked once: transaction control is
 /// refused (the load commits or rolls back its own work, and a dry run
 /// rolls back everything), and whether a statement may commit by itself.
-fn check_user_sql(stmts: &[String], dialect: ConnectorKind) -> Result<bool> {
+fn check_user_sql(stmts: &[Checked], dialect: ConnectorKind) -> Result<bool> {
     let mut may_commit = false;
-    for s in stmts {
-        let c = classify(s, dialect);
+    for checked in stmts {
+        let (s, c) = (checked.sql(), checked.classification());
         let lower = s.to_ascii_lowercase();
         let kw = databrain_connector_core::sql::leading_keyword(s);
         let words: Vec<String> = lower.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).filter(|w| !w.is_empty()).map(str::to_string).collect();
@@ -346,8 +336,11 @@ fn engine_name(k: ConnectorKind) -> &'static str {
 }
 
 /// Statements of before/after SQL.
-fn user_statements(sql: Option<&str>, dialect: ConnectorKind) -> Vec<String> {
-    sql.map(|s| split_statements(s, dialect).into_iter().map(|st| st.sql.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default()
+fn user_statements(sql: Option<&str>, dialect: ConnectorKind) -> Vec<Checked> {
+    sql.map(|s| {
+        split_statements(s, dialect).into_iter().map(|st| st.sql.trim().to_string()).filter(|s| !s.is_empty()).map(|s| Checked::new(s, dialect)).collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Transaction statements when the whole plan can run in one.
@@ -361,7 +354,7 @@ fn transaction(dialect: ConnectorKind, plan: &[Act]) -> Option<Tx> {
         let ddl = plan.iter().any(|a| match a {
             Act::Sql { kind: ActKind::Ddl, .. } => true,
             Act::Sql { kind: ActKind::Stage, .. } => any,
-            Act::Sql { kind: ActKind::User, sql, .. } => classify(sql, dialect).kind == StatementKind::Ddl,
+            Act::User { sql, .. } => sql.kind() == StatementKind::Ddl,
             _ => false,
         });
         if ddl {
@@ -374,15 +367,15 @@ fn transaction(dialect: ConnectorKind, plan: &[Act]) -> Option<Tx> {
     // harmless session values for the plan to run in one transaction.
     if dialect == ConnectorKind::Mysql
         && plan.iter().any(|a| match a {
-            Act::Sql { kind: ActKind::User, sql, .. } => {
+            Act::User { sql, .. } => {
                 // MySQL's implicit commits: DDL, account statements, admin
                 // statements (`ANALYZE TABLE`, `RESET`, `FLUSH`…), and of the
                 // ones classified otherwise `SET PASSWORD` (a session
                 // statement) and `LOAD INDEX INTO CACHE` (`LOAD` reads as
                 // DML for `LOAD DATA`).
-                let mut words = sql.split_whitespace().map(str::to_ascii_uppercase);
+                let mut words = sql.sql().split_whitespace().map(str::to_ascii_uppercase);
                 let two = (words.next().unwrap_or_default(), words.next().unwrap_or_default());
-                match classify(sql, dialect).kind {
+                match sql.kind() {
                     StatementKind::Read => false,
                     StatementKind::Dml => two == ("LOAD".into(), "INDEX".into()),
                     StatementKind::Session => two == ("SET".into(), "PASSWORD".into()),
@@ -398,7 +391,7 @@ fn transaction(dialect: ConnectorKind, plan: &[Act]) -> Option<Tx> {
 }
 
 /// Run one statement; rows affected when the driver reports them.
-async fn exec(session: &Arc<dyn Session>, sql: &str, cancel: &CancellationToken) -> Result<Option<u64>> {
+async fn exec(session: &Arc<dyn Session>, sql: Statement<'_>, cancel: &CancellationToken) -> Result<Option<u64>> {
     if cancel.is_cancelled() {
         return Err(EngineError::new("cancelled", "Cancelled"));
     }
@@ -520,7 +513,8 @@ impl QueryEngine {
         obs: &dyn LoadObserver,
     ) -> Result<LoadReport> {
         let kind = self.workspace.get_connection(source)?.config.kind;
-        if !classify(sql, kind).kind.is_read() {
+        let sql = Checked::new(sql, kind);
+        if !sql.kind().is_read() {
             return Err(EngineError::new("invalid", "Only a query that reads rows can run again for a load; load the rows the result holds instead."));
         }
         // The query runs on the tab's session (its temp tables, settings):
@@ -529,7 +523,7 @@ impl QueryEngine {
         let (_, _claim) = self.guarded_or_refuse(source, Some(hold), Intent::Inspect)?;
         let src = self.session_for(source, session, databrain_workspace::Origin::User).await?;
         let opts = ExecOptions { batch_size: 2000, cancel: cancel.clone(), max_rows: None, output_masks: None };
-        let stream = src.execute(sql, opts).await?;
+        let stream = src.execute(sql.statement(), opts).await?;
         self.load_stream(stream, connection_id, tab, spec, cancel, obs).await
     }
 
@@ -587,12 +581,12 @@ impl QueryEngine {
             obs.event(LoadEvent::Info(n.clone()));
         }
         if let Some(tx) = &p.tx {
-            timed(&p.session, "Start the transaction", tx.begin, cancel, obs).await.map_err(|e| labelled("Start the transaction", e))?;
+            timed(&p.session, "Start the transaction", Statement::internal(tx.begin), cancel, obs).await.map_err(|e| labelled("Start the transaction", e))?;
         }
         let result = async {
             let n = run_plan(&p, rows, rest.as_deref_mut(), cancel, None, obs).await?;
             if let Some(tx) = &p.tx {
-                timed(&p.session, "Commit", tx.commit, cancel, obs).await.map_err(|e| labelled("Commit", e))?;
+                timed(&p.session, "Commit", Statement::internal(tx.commit), cancel, obs).await.map_err(|e| labelled("Commit", e))?;
             }
             Ok::<(u64, u64), EngineError>(n)
         }
@@ -639,10 +633,10 @@ impl QueryEngine {
         let fresh = CancellationToken::new();
         let wait = std::time::Duration::from_secs(10);
         if let Some(tx) = &p.tx {
-            let _ = tokio::time::timeout(wait, exec(&p.session, tx.rollback, &fresh)).await;
+            let _ = tokio::time::timeout(wait, exec(&p.session, Statement::internal(tx.rollback), &fresh)).await;
         }
         if let Some(stage) = &p.permanent_stage {
-            let _ = tokio::time::timeout(wait, exec(&p.session, &sqlgen::drop_stage_sql(p.dialect, stage), &fresh)).await;
+            let _ = tokio::time::timeout(wait, exec(&p.session, Statement::internal(&sqlgen::drop_stage_sql(p.dialect, stage)), &fresh)).await;
         }
         self.drop_session(connection_id, tab);
     }
@@ -679,10 +673,10 @@ impl QueryEngine {
         match p.tx.as_ref().filter(|_| !p.may_commit) {
             Some(tx) => {
                 report.method = "transaction".into();
-                match exec(&p.session, tx.begin, &cancel).await {
+                match exec(&p.session, Statement::internal(tx.begin), &cancel).await {
                     Ok(_) => {
                         let _ = run_plan(&p, data, None, &cancel, Some(&mut checks), &NoLoadObserver).await;
-                        if let Err(e) = exec(&p.session, tx.rollback, &cancel).await {
+                        if let Err(e) = exec(&p.session, Statement::internal(tx.rollback), &cancel).await {
                             checks.push(LoadCheck { label: "Roll back".into(), sql: tx.rollback.into(), status: "error".into(), message: Some(e.message) });
                         }
                     }
@@ -1031,7 +1025,7 @@ impl QueryEngine {
 
         let mut plan = Vec::new();
         for (i, s) in before.iter().enumerate() {
-            plan.push(Act::Sql { label: format!("Before SQL {}", i + 1), sql: s.clone(), kind: ActKind::User });
+            plan.push(Act::User { label: format!("Before SQL {}", i + 1), sql: s.clone() });
         }
         let mut creates = false;
         let mut permanent_stage = None;
@@ -1146,7 +1140,7 @@ impl QueryEngine {
             }
         }
         for (i, s) in after.iter().enumerate() {
-            plan.push(Act::Sql { label: format!("After SQL {}", i + 1), sql: s.clone(), kind: ActKind::User });
+            plan.push(Act::User { label: format!("After SQL {}", i + 1), sql: s.clone() });
         }
         let (batch, lowered) = sqlgen::batch_limits(dialect).resolve(spec.batch_rows, spec.batch_kb);
         notices.extend(lowered);
@@ -1218,8 +1212,13 @@ async fn run_plan(
     };
     for act in &p.plan {
         match act {
+            Act::User { label, sql } => {
+                let r = timed(&p.session, label, sql.statement(), cancel, obs).await.map(|_| ());
+                push(&mut record, label, sql.sql(), &r, None);
+                r.map_err(|e| labelled(label, e))?;
+            }
             Act::Sql { label, sql, kind } => {
-                let r = timed(&p.session, label, sql, cancel, obs).await;
+                let r = timed(&p.session, label, Statement::internal(sql), cancel, obs).await;
                 match (&r, kind) {
                     (Ok(Some(n)), ActKind::Write) => affected = Some(affected.unwrap_or(0) + n),
                     (Ok(Some(n)), ActKind::Remove) => removed += n,
@@ -1270,7 +1269,7 @@ async fn run_plan(
                         if first.is_empty() {
                             first = sql.clone();
                         }
-                        if let Err(e) = exec(&p.session, &sql, cancel).await {
+                        if let Err(e) = exec(&p.session, Statement::internal(&sql), cancel).await {
                             first = sql;
                             r = Err(e);
                             break 'rows;
@@ -1322,7 +1321,8 @@ async fn explain_plan(p: &Prepared, rows: &LoadRows, checks: &mut Vec<LoadCheck>
                 checks.push(LoadCheck { label: label.clone(), sql: String::new(), status: "unchecked".into(), message: Some(reason.clone()) });
                 continue;
             }
-            Act::Sql { label, sql, kind } => (label.clone(), sql.clone(), *kind != ActKind::User && created_before && *kind != ActKind::Ddl),
+            Act::User { label, sql } => (label.clone(), sql.sql().to_string(), false),
+            Act::Sql { label, sql, kind } => (label.clone(), sql.clone(), created_before && *kind != ActKind::Ddl),
             Act::Insert { label, table, target } => {
                 let schema = p.schema.clone().unwrap_or_else(|| rows.schema.clone());
                 let b = sqlgen::InsertSql::new(p.dialect, table, &schema, p.batch);
@@ -1334,7 +1334,13 @@ async fn explain_plan(p: &Prepared, rows: &LoadRows, checks: &mut Vec<LoadCheck>
                 (label.clone(), sql, created_before || (!*target) || p.creates)
             }
         };
-        let kind = classify(&sql, p.dialect).kind;
+        // The user's SQL as it was classified; the load's own, classified here
+        // (`check_sql` takes what a session may be asked to check).
+        let checked = match act {
+            Act::User { sql, .. } => sql.clone(),
+            _ => Checked::new(sql.clone(), p.dialect),
+        };
+        let kind = checked.kind();
         let is_ddl = kind == StatementKind::Ddl || matches!(act, Act::Sql { kind: ActKind::Ddl | ActKind::Stage, .. });
         let mut c = LoadCheck { label, sql: short(&sql), status: "unchecked".into(), message: None };
         if is_ddl {
@@ -1345,7 +1351,7 @@ async fn explain_plan(p: &Prepared, rows: &LoadRows, checks: &mut Vec<LoadCheck>
         } else if !matches!(kind, StatementKind::Read | StatementKind::Dml) {
             c.message = Some("Not checked (only queries and DML can be checked without running)".into());
         } else {
-            match p.session.check_sql(&sql).await {
+            match p.session.check_sql(&checked).await {
                 Ok(true) => c.status = "ok".into(),
                 Ok(false) => c.message = Some(format!("{engine} has no way to check a statement without running it")),
                 Err(e) => {
@@ -1364,7 +1370,7 @@ async fn explain_plan(p: &Prepared, rows: &LoadRows, checks: &mut Vec<LoadCheck>
 
 /// `SELECT … WHERE 1 = 0` on `table`: (exists, its columns, why not).
 async fn probe(session: &Arc<dyn Session>, dialect: ConnectorKind, table: &str) -> Result<(bool, Option<Vec<String>>, Option<String>)> {
-    Ok(match session.execute(&sqlgen::probe_sql(dialect, table), ExecOptions::default()).await {
+    Ok(match session.execute(Statement::internal(&sqlgen::probe_sql(dialect, table)), ExecOptions::default()).await {
         Ok(s) => match s.collect().await {
             Ok(c) => (true, c.schema.map(|s| s.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>()), None),
             Err(e) if matches!(e.kind, ErrorKind::Connection | ErrorKind::Auth | ErrorKind::Cancelled) => return Err(e.into()),
@@ -1432,7 +1438,7 @@ mod tests {
     #[test]
     fn load_sql_is_checked_for_transaction_control() {
         use ConnectorKind::*;
-        let check = |sql: &str, k: ConnectorKind| check_user_sql(&[sql.to_string()], k);
+        let check = |sql: &str, k: ConnectorKind| check_user_sql(&[Checked::new(sql, k)], k);
         for (sql, k) in [
             ("COMMIT", Postgres),
             ("rollback", Mysql),
@@ -1471,7 +1477,7 @@ mod tests {
     fn transactions_per_engine() {
         let ins = Act::Insert { label: String::new(), table: "t".into(), target: true };
         let ddl = Act::Sql { label: String::new(), sql: "CREATE TABLE t (a int)".into(), kind: ActKind::Ddl };
-        let user_ddl = Act::Sql { label: String::new(), sql: "alter table t add b int".into(), kind: ActKind::User };
+        let user_ddl = Act::User { label: String::new(), sql: Checked::new("alter table t add b int", ConnectorKind::Mysql) };
         let stage = Act::Sql { label: String::new(), sql: "CREATE TEMPORARY TABLE s AS SELECT * FROM t WHERE 1 = 0".into(), kind: ActKind::Stage };
         assert!(transaction(ConnectorKind::Postgres, &[ddl.clone(), ins.clone()]).is_some());
         assert!(transaction(ConnectorKind::Mssql, std::slice::from_ref(&ddl)).is_some());
@@ -1481,7 +1487,7 @@ mod tests {
         // MySQL statements that commit without being DDL: no transaction
         // (a dry run checks the plan instead of running it); reads, row
         // changes and harmless session values keep it.
-        let user = |sql: &str| Act::Sql { label: String::new(), sql: sql.into(), kind: ActKind::User };
+        let user = |sql: &str| Act::User { label: String::new(), sql: Checked::new(sql, ConnectorKind::Mysql) };
         for sql in ["SET PASSWORD = 'x'", "RESET QUERY CACHE", "LOAD INDEX INTO CACHE t", "CREATE USER u", "GRANT SELECT ON t TO u", "ANALYZE TABLE t"] {
             assert!(transaction(ConnectorKind::Mysql, &[user(sql), ins.clone()]).is_none(), "{sql}");
         }
@@ -1503,7 +1509,7 @@ mod tests {
         assert_eq!(match_column("name", &t).unwrap(), "name", "exact first");
         assert!(match_column("x", &t).is_none());
         assert_eq!(
-            user_statements(Some("delete from t where d = 1;\n\n update s set x = 1;"), ConnectorKind::Postgres),
+            user_statements(Some("delete from t where d = 1;\n\n update s set x = 1;"), ConnectorKind::Postgres).iter().map(Checked::sql).collect::<Vec<_>>(),
             vec!["delete from t where d = 1", "update s set x = 1"]
         );
         assert!(user_statements(Some("  "), ConnectorKind::Postgres).is_empty());

@@ -44,7 +44,8 @@ impl Session for ChSession {
         self.0.rows("SELECT 1", false).await.map(|_| ())
     }
 
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+    async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
+        let sql = stmt.sql();
         let (tx, stream) = QueryStream::channel(4);
         let inner = self.0.clone();
         let sql = sql.to_string();
@@ -240,7 +241,13 @@ mod tests {
             cfg.port = Some(port);
             let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user: "default".into() }, Some(secrecy::SecretString::from("pw"))));
             let s = ClickhouseConnector.connect(&cfg, creds).await.unwrap();
-            let e = s.execute("SELECT throwIf(number = 100)", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
+            let e = s
+                .execute(databrain_connector_core::Statement::internal("SELECT throwIf(number = 100)"), ExecOptions::default())
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap_err();
             if with_error {
                 assert!(e.message.contains("boom") && !e.message.contains("abcdefghijklmnop"), "{e:?}");
             } else {
@@ -269,7 +276,9 @@ mod tests {
         let s = ClickhouseConnector.connect(&cfg, creds).await.unwrap();
         assert!(s.server_version().await.unwrap().starts_with("ClickHouse "));
         let s = &s;
-        let run = |sql: &'static str| async move { s.execute(sql, ExecOptions::default()).await.unwrap().collect().await };
+        let run = |sql: &'static str| async move {
+            s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await.unwrap().collect().await
+        };
         run("CREATE DATABASE IF NOT EXISTS databrain_t").await.unwrap();
         run("USE databrain_t").await.unwrap();
         run("CREATE OR REPLACE TABLE t (id UInt64, name Nullable(String), d Date, ts DateTime64(3), amt Decimal(18, 4)) ENGINE = MergeTree PARTITION BY toYYYYMM(d) ORDER BY id")
@@ -312,12 +321,31 @@ mod tests {
             std::env::var("DATABRAIN_CLICKHOUSE_PASSWORD").ok().map(secrecy::SecretString::from),
         ));
         let r = ClickhouseConnector.connect(&ro, creds).await.unwrap();
-        assert!(r.execute("INSERT INTO databrain_t.t (id) VALUES (3)", ExecOptions::default()).await.unwrap().collect().await.is_err());
-        assert_eq!(r.execute("SELECT count() FROM databrain_t.t", ExecOptions::default()).await.unwrap().collect().await.unwrap().num_rows(), 1);
+        assert!(
+            r.execute(databrain_connector_core::Statement::internal("INSERT INTO databrain_t.t (id) VALUES (3)"), ExecOptions::default())
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            r.execute(databrain_connector_core::Statement::internal("SELECT count() FROM databrain_t.t"), ExecOptions::default())
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap()
+                .num_rows(),
+            1
+        );
         // Cancel a long query.
         let cancel = databrain_connector_core::CancellationToken::new();
         let stream = s
-            .execute("SELECT sleepEachRow(1) FROM numbers(30) SETTINGS max_block_size = 1", ExecOptions { cancel: cancel.clone(), ..Default::default() })
+            .execute(
+                databrain_connector_core::Statement::internal("SELECT sleepEachRow(1) FROM numbers(30) SETTINGS max_block_size = 1"),
+                ExecOptions { cancel: cancel.clone(), ..Default::default() },
+            )
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;

@@ -9,12 +9,12 @@ use crate::*;
 /// Run a small metadata query and return every cell as text (NULL → None;
 /// lists as `[a, b]`). For catalog queries in `table_layout` implementations.
 pub async fn query_text<S: Session + ?Sized>(s: &S, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
-    Ok(query_table(s, sql).await?.1)
+    Ok(query_table(s, Statement::internal(sql)).await?.1)
 }
 
 /// [`query_text`] plus the column names.
 #[allow(clippy::type_complexity)]
-pub async fn query_table<S: Session + ?Sized>(s: &S, sql: &str) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
+pub async fn query_table<S: Session + ?Sized>(s: &S, sql: Statement<'_>) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
     use arrow::array::Array;
     use arrow::util::display::{ArrayFormatter, FormatOptions};
     let c = s.execute(sql, ExecOptions::default()).await?.collect().await?;

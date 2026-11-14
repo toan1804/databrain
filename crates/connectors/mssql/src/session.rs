@@ -180,7 +180,8 @@ impl Session for MssqlSession {
         self.rows("select 1", vec![]).await.map(|_| ())
     }
 
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+    async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
+        let sql = stmt.sql();
         let (tx, stream) = QueryStream::channel(4);
         let conn = self.conn.clone();
         let state = self.state.clone();
@@ -567,7 +568,10 @@ mod tests {
         ));
         let s = MssqlConnector.connect(&cfg, creds).await.unwrap();
         let r = s
-            .execute("select 1 as a, N'x' as b, sysdatetime() as c, cast(1.5 as decimal(5,2)) as d", ExecOptions::default())
+            .execute(
+                databrain_connector_core::Statement::internal("select 1 as a, N'x' as b, sysdatetime() as c, cast(1.5 as decimal(5,2)) as d"),
+                ExecOptions::default(),
+            )
             .await
             .unwrap()
             .collect()
@@ -576,11 +580,20 @@ mod tests {
         assert_eq!(r.num_rows(), 1);
         assert!(!s.list_schemas().await.unwrap().is_empty());
         let cancel = databrain_connector_core::CancellationToken::new();
-        let st = s.execute("waitfor delay '00:00:30'", ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() }).await.unwrap();
+        let st = s
+            .execute(
+                databrain_connector_core::Statement::internal("waitfor delay '00:00:30'"),
+                ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() },
+            )
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         cancel.cancel();
         assert!(st.collect().await.unwrap_err().is_cancelled());
-        assert_eq!(s.execute("select 2", ExecOptions::default()).await.unwrap().collect().await.unwrap().num_rows(), 1);
+        assert_eq!(
+            s.execute(databrain_connector_core::Statement::internal("select 2"), ExecOptions::default()).await.unwrap().collect().await.unwrap().num_rows(),
+            1
+        );
 
         // The transaction depth as the server counts it (@@TRANCOUNT), where
         // the text can't tell: a one-batch begin…commit, a guarded COMMIT,
@@ -588,7 +601,7 @@ mod tests {
         use databrain_connector_core::TxState;
         let exec = |sql: &'static str| {
             let s = &s;
-            async move { s.execute(sql, ExecOptions::default()).await.unwrap().collect().await }
+            async move { s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await.unwrap().collect().await }
         };
         exec("begin tran; select 1 as a; commit tran").await.unwrap();
         assert_eq!(s.transaction_state(), TxState::None, "committed in the same batch");
@@ -605,7 +618,14 @@ mod tests {
         // Show DDL: a table with every kind of constraint and an index, recreated from its DDL.
         let run = |sql: String| {
             let s = &s;
-            async move { s.execute(&sql, ExecOptions::default()).await.unwrap().collect().await.unwrap_or_else(|e| panic!("{sql}: {e}")) }
+            async move {
+                s.execute(databrain_connector_core::Statement::internal(&sql), ExecOptions::default())
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            }
         };
         for stmt in [
             "if object_id('dbo.kb_orders') is not null drop table dbo.kb_orders",

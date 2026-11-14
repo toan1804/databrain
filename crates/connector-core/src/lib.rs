@@ -30,6 +30,7 @@ pub use catalog::*;
 pub use conn_state::ConnState;
 pub use error::{ConnectorError, ErrorKind, Result};
 pub use quote::*;
+pub use sql::{Checked, Statement};
 pub use sqlparser;
 pub use stream::{Collected, ExecOptions, ExecSummary, QueryStream, StreamEvent, StreamSender, memory_size};
 pub use tokio_util::sync::CancellationToken;
@@ -123,8 +124,9 @@ pub trait Session: Send + Sync {
         self.transaction_state() != TxState::None
     }
 
-    /// Execute a single statement and stream its result.
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream>;
+    /// Execute a single statement and stream its result. User text comes
+    /// as [`Checked`]; DataBrain's own SQL as [`Statement::internal`].
+    async fn execute(&self, stmt: Statement<'_>, opts: ExecOptions) -> Result<QueryStream>;
 
     async fn list_schemas(&self) -> Result<Vec<SchemaInfo>>;
 
@@ -226,13 +228,14 @@ pub trait Session: Send + Sync {
     /// `ANALYZE`): unknown tables/columns and type errors come back as the
     /// error, with `position` (1-based character in `sql`) when the engine
     /// gives one. `Ok(false)` = this engine has no cheap check.
-    async fn check_sql(&self, sql: &str) -> Result<bool> {
+    async fn check_sql(&self, sql: &Checked) -> Result<bool> {
         let Some(prefix) = self.kind().traits().explain else { return Ok(false) };
+        let sql = sql.sql();
         let shift = |mut e: ConnectorError| {
             e.position = e.position.and_then(|p| p.checked_sub(prefix.chars().count() as u32)).filter(|p| *p > 0);
             e
         };
-        let stream = self.execute(&format!("{prefix}{sql}"), ExecOptions::default()).await.map_err(shift)?;
+        let stream = self.execute(Statement::internal(&format!("{prefix}{sql}")), ExecOptions::default()).await.map_err(shift)?;
         stream.collect().await.map_err(shift)?;
         Ok(true)
     }
@@ -247,7 +250,7 @@ pub trait Session: Send + Sync {
     /// it (BigQuery dry run, Snowflake and Databricks `EXPLAIN`): the
     /// editor's cost preview. `Ok(None)` = this engine has no estimate
     /// (`SourceTraits::cost_preview` is false).
-    async fn estimate_cost(&self, _sql: &str) -> Result<Option<CostEstimate>> {
+    async fn estimate_cost(&self, _sql: &Checked) -> Result<Option<CostEstimate>> {
         Ok(None)
     }
 

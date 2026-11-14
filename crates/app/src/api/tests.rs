@@ -544,7 +544,7 @@ fn save_profile(st: &AppState, name: &str, config: ConnectionConfig, secret: Opt
 async fn exec(st: &AppState, id: &str, sql: &str) {
     let s = st.engine.session_for_tests(id).await.unwrap();
     for stmt in sql.split(';').map(str::trim).filter(|x| !x.is_empty()) {
-        s.execute(stmt, Default::default()).await.unwrap().collect().await.unwrap();
+        s.execute(databrain_connector_core::Statement::internal(stmt), Default::default()).await.unwrap().collect().await.unwrap();
     }
 }
 
@@ -744,7 +744,9 @@ async fn test_data_generates_and_loads_sqlite() {
     let s = st.engine.session_for_tests(&p.id).await.unwrap();
     let (_, rows) = databrain_connector_core::query_table(
         &*s,
-        "select count(*), min(id), sum(customer_id not in (10, 20)), sum(shape is not null) from orders where id <> 5",
+        databrain_connector_core::Statement::internal(
+            "select count(*), min(id), sum(customer_id not in (10, 20)), sum(shape is not null) from orders where id <> 5",
+        ),
     )
     .await
     .unwrap();
