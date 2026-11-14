@@ -1,7 +1,9 @@
 //! Live: where an unqualified table name resolves, asked of real servers
 //! (`QueryEngine::default_namespace`), and the AI's table rules following
-//! it. Each database is skipped unless its `DATABRAIN_<DB>_HOST` is set
-//! (as in CI's live job; locally e.g. with podman containers).
+//! it. `#[ignore]`d: run with `cargo test -- --ignored` (CI's live job;
+//! locally e.g. with podman containers). Within a test, each database is
+//! skipped unless its `DATABRAIN_<DB>_HOST` is set; the search-path test
+//! needs Postgres.
 
 use std::sync::Arc;
 
@@ -147,6 +149,7 @@ async fn finished(st: &AppState, job: &str) -> JobRun {
 /// Each server says its current database and schema, in the levels the
 /// table rules use for it.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: needs DATABRAIN_<DB>_HOST (cargo test -- --ignored)"]
 async fn servers_say_their_current_schema() {
     let st = state();
     let admin = AiPolicy::default;
@@ -215,6 +218,7 @@ async fn servers_say_their_current_schema() {
 /// runs: repeated and unnamed columns, a `WITH`, an order, a trailing
 /// comment (a wrapping subquery, as before, failed on several of these).
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: needs DATABRAIN_<DB>_HOST (cargo test -- --ignored)"]
 async fn capped_reads_run_on_the_server() {
     use databrain_ai::policy::cap_rows;
     let st = state();
@@ -248,6 +252,7 @@ async fn capped_reads_run_on_the_server() {
 /// schema. With one schema on the path, its tables are checked, not
 /// `public`'s.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: needs DATABRAIN_<DB>_HOST (cargo test -- --ignored)"]
 async fn table_rules_follow_a_roles_search_path() {
     use databrain_ai::policy::{Decision, review_sql};
     let st = state();
@@ -260,7 +265,7 @@ async fn table_rules_follow_a_roles_search_path() {
         Some("postgres"),
         AiPolicy::default(),
     ) else {
-        return;
+        panic!("needs a Postgres server: set DATABRAIN_PG_HOST");
     };
     for sql in [
         "drop schema if exists dbr_hr cascade",
@@ -327,6 +332,7 @@ async fn table_rules_follow_a_roles_search_path() {
 /// (statements can be stacked there): the canary table must still exist,
 /// and the layout must be that of the oddly named table.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: needs DATABRAIN_<DB>_HOST (cargo test -- --ignored)"]
 async fn hostile_table_names_stay_inside_the_literal() {
     let st = state();
     if let Some(p) = connect(
