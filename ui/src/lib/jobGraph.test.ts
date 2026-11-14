@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { cellStepBase, stepsFromCells, addDownstream, addEdge, exportFileName, nameProblem, newNode, updateStep, ancestors, descendants, edgeProblem, missingLinks, nodeStatus, parseKeyColumns, changeAction, actionSettings, usesDefaultRows, batchValue, removeNode, scheduleText, uniqueName } from "./jobGraph";
-import type { Job, JobNode } from "./types";
+import { cellStepBase, stepsFromCells, addDownstream, addEdge, exportFileName, nameProblem, newNode, updateStep, ancestors, descendants, cappedReads, edgeProblem, missingLinks, nodeStatus, parseKeyColumns, changeAction, actionSettings, usesDefaultRows, batchValue, removeNode, scheduleText, uniqueName } from "./jobGraph";
+import type { Job, JobNode, OutputInfo } from "./types";
 
 const n = (id: string, name: string, sql = "", x = 0, y = 0): JobNode => ({ id, name, kind: "query", sql, x, y, load_mode: "append" });
 const job = (nodes: JobNode[], edges: [string, string][] = []): Job => ({
@@ -11,6 +11,25 @@ const job = (nodes: JobNode[], edges: [string, string][] = []): Job => ({
   schedule: { enabled: false, mode: "interval", minutes: 60, at: "08:00", weekdays: [] },
   created_at: 0,
   updated_at: 0,
+});
+
+describe("capped outputs a step reads", () => {
+  const out = (name: string | null, handle: string, truncated: boolean, rows = 1000) => ({ name, handle, truncated, rows }) as OutputInfo;
+  const outputs = [out("top", "r1", true), out("full", "r2", false), out(null, "r3", true, 500)];
+  it("warns DuckDB steps reading a capped output from outside the job, by name or handle", () => {
+    const j = job([n("a", "first", "select * from results.top join results.R3 using (id)"), n("b", "second", "select * from results.full")]);
+    expect(cappedReads(j, outputs)).toEqual([
+      { node: "a", reads: "top", rows: 1000 },
+      { node: "a", reads: "R3", rows: 500 },
+    ]);
+  });
+  it("not a job step of the same name, nor a query on another database", () => {
+    const j = job([n("a", "top"), n("b", "next", "select * from results.top"), { ...n("c", "remote", "select * from results.top"), connection_id: "pg" }]);
+    expect(cappedReads(j, outputs)).toEqual([]);
+    const k = job([{ ...n("c", "remote", "select * from results.full, results.r1"), connection_id: "pg" }, { ...n("d", "dl", "select * from results.r1"), kind: "load" }]);
+    expect(cappedReads(k, outputs)).toEqual([{ node: "d", reads: "r1", rows: 1000 }]);
+    expect(cappedReads(k, outputs, "pg").map((w) => w.node)).toEqual(["c", "d"]);
+  });
 });
 
 describe("job graph", () => {

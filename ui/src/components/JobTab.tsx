@@ -7,7 +7,7 @@ import { AlertTriangle, FileDown, ArrowDownToLine, CalendarClock, Copy, Database
 import { api, toError } from "../lib/api";
 import { kbd, modalOpen } from "../lib/platform";
 import type { RunParams, Job, JobEdge, JobNode } from "../lib/types";
-import { NODE_H, NODE_W, addDownstream, addEdge, ancestors, descendants, edgeProblem, missingLinks, newNode, nodeStatus, readSql, removeEdge, removeNode, scheduleText, updateStep, upstreamOf } from "../lib/jobGraph";
+import { NODE_H, NODE_W, addDownstream, addEdge, ancestors, cappedReads, descendants, edgeProblem, missingLinks, newNode, nodeStatus, readSql, removeEdge, removeNode, scheduleText, updateStep, upstreamOf } from "../lib/jobGraph";
 import { isQueryTab, useStore } from "../store";
 import { useJobs } from "../jobsStore";
 import { openOutput, resultsConnection } from "../outputs";
@@ -326,6 +326,12 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
     return { up: ancestors(job, selected.id), down: descendants(job, selected.id) };
   }, [job, selected]);
   const warnings = useMemo(() => (job ? missingLinks(job) : []), [job]);
+  // Steps reading a query tab's output that stopped at its row limit or memory: they'd fail.
+  const outputs = useStore((s) => s.outputs);
+  const capped = useMemo(() => {
+    const resultsId = connections.find((c) => c.config.kind === "duckdb" && c.config.options?.databrain_results === "1")?.id;
+    return job ? cappedReads(job, outputs, resultsId) : [];
+  }, [job, outputs, connections]);
 
   if (loadError) return <div className="p-6 text-[13px] text-danger">{loadError}</div>;
   if (!job) {
@@ -484,8 +490,21 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
           <div className="pointer-events-none absolute bottom-2 left-2 rounded-md border border-line bg-panel/90 px-2 py-1 text-[10.5px] text-muted">
             Drag a step's ● handle onto another step to run it after · right-click a step to add downstream steps · drag steps to move · {kbd("⌘")}+scroll to zoom
           </div>
-          {warnings.length > 0 && (
+          {warnings.length + capped.length > 0 && (
             <div className="absolute right-2 top-2 max-w-sm space-y-1">
+              {capped.map((w) => (
+                <div
+                  key={`capped:${w.node}:${w.reads}`}
+                  role="alert"
+                  className="flex w-full items-start gap-1.5 rounded-md border border-warning/40 bg-panel px-2 py-1 text-[11.5px] text-warning shadow"
+                >
+                  <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                  <span>
+                    {byId.get(w.node)?.name} reads results.{w.reads}, which holds only its first {w.rows.toLocaleString()} rows (a row limit or the memory a
+                    result may keep): the step fails before it runs. Run that query without a row limit first.
+                  </span>
+                </div>
+              ))}
               {warnings.map((w) => (
                 <button
                   key={`${w.node}:${w.reads}`}
