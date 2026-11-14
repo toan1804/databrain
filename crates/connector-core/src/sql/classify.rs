@@ -123,7 +123,7 @@ fn classify_sql(sql: &str, kind: ConnectorKind) -> Classification {
             }
             out.kind = check_control(out.kind, &keyword, sql);
             // `select pg_terminate_backend(…)` acts like `KILL`.
-            if out.kind < StatementKind::Dml && (stmts.iter().any(calls_acting_function) || next_value_for(sql, dialect.as_ref())) {
+            if out.kind < StatementKind::Dml && (stmts.iter().any(|s| calls_acting_function(s, kind)) || next_value_for(sql, dialect.as_ref())) {
                 out.kind = StatementKind::Other;
             }
             // What the parser accepted may not be what the server runs:
@@ -671,6 +671,18 @@ const ACTING_FUNCTIONS: &[&str] = &[
     "pg_stat_reset_slru",
     "pg_stat_reset_replication_slot",
     "pg_stat_statements_reset",
+    "pg_stat_reset_subscription_stats",
+    "pg_sync_replication_slots",
+    "pg_replication_origin_session_reset",
+    // Postgres: index maintenance callable from a SELECT.
+    "brin_summarize_new_values",
+    "brin_summarize_range",
+    "brin_desummarize_range",
+    "gin_clean_pending_list",
+    // DuckDB: attaching a SQLite file (writable by default).
+    "sqlite_attach",
+    // Databricks: HTTP requests to other services.
+    "http_request",
     "pg_import_system_collations",
     "pg_notify",
     "set_config",
@@ -763,22 +775,63 @@ fn is_acting_function(name: &str) -> bool {
     ACTING_FUNCTIONS.contains(&name.as_str())
 }
 
-fn calls_acting_function(s: &Statement) -> bool {
-    use sqlparser::ast::{Expr, ObjectName, TableFactor, Visit, Visitor};
+/// ClickHouse table functions that reach other servers, services or the
+/// server's files (`url()`, `remote()`, `s3()`…): not reads of this
+/// database. Only there: the names are common words elsewhere.
+const CLICKHOUSE_EXTERNAL: &[&str] = &[
+    "url",
+    "urlcluster",
+    "remote",
+    "remotesecure",
+    "cluster",
+    "clusterallreplicas",
+    "mysql",
+    "postgresql",
+    "mongodb",
+    "redis",
+    "sqlite",
+    "jdbc",
+    "odbc",
+    "s3",
+    "s3cluster",
+    "gcs",
+    "hdfs",
+    "hdfscluster",
+    "azureblobstorage",
+    "azureblobstoragecluster",
+    "file",
+    "filecluster",
+    "executable",
+];
+
+/// [`is_acting_function`] on `kind` (ClickHouse's external table functions too).
+fn acts_on(name: &str, kind: ConnectorKind) -> bool {
+    is_acting_function(name)
+        || (kind == ConnectorKind::Clickhouse && CLICKHOUSE_EXTERNAL.contains(&name.trim_matches(['"', '`']).to_ascii_lowercase().as_str()))
+}
+
+/// The statement calls a function that acts (see [`ACTING_FUNCTIONS`]), or
+/// locks the rows it reads (`SELECT … FOR UPDATE / FOR SHARE`: a lock held
+/// until the transaction ends, which Oracle allows on a read-only connection).
+fn calls_acting_function(s: &Statement, kind: ConnectorKind) -> bool {
+    use sqlparser::ast::{Expr, ObjectName, Query, TableFactor, Visit, Visitor};
     use std::ops::ControlFlow;
-    struct V;
-    fn acts(name: &ObjectName) -> ControlFlow<()> {
+    struct V(ConnectorKind);
+    fn acts(name: &ObjectName, kind: ConnectorKind) -> ControlFlow<()> {
         // The function's own name: `pg_catalog.pg_terminate_backend` too.
         match name.0.last() {
-            Some(part) if is_acting_function(&part.to_string()) => ControlFlow::Break(()),
+            Some(part) if acts_on(&part.to_string(), kind) => ControlFlow::Break(()),
             _ => ControlFlow::Continue(()),
         }
     }
     impl Visitor for V {
         type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if q.locks.is_empty() { ControlFlow::Continue(()) } else { ControlFlow::Break(()) }
+        }
         fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
             match e {
-                Expr::Function(f) => acts(&f.name),
+                Expr::Function(f) => acts(&f.name, self.0),
                 // Oracle `orders_seq.nextval` advances the sequence.
                 Expr::CompoundIdentifier(parts) if parts.last().is_some_and(|p| p.value.eq_ignore_ascii_case("nextval")) => ControlFlow::Break(()),
                 _ => ControlFlow::Continue(()),
@@ -786,12 +839,12 @@ fn calls_acting_function(s: &Statement) -> bool {
         }
         fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
             match t {
-                TableFactor::Table { name, args: Some(_), .. } | TableFactor::Function { name, .. } => acts(name),
+                TableFactor::Table { name, args: Some(_), .. } | TableFactor::Function { name, .. } => acts(name, self.0),
                 _ => ControlFlow::Continue(()),
             }
         }
     }
-    s.visit(&mut V).is_break()
+    s.visit(&mut V(kind)).is_break()
 }
 
 /// SQL Server / standard `NEXT VALUE FOR seq`, which advances the sequence
@@ -966,6 +1019,48 @@ mod tests {
         }
         // Unparsed SQL naming one is asked about.
         assert_eq!(classify("select pg_terminate_backend(1) ))) (((", Postgres).kind, StatementKind::Unknown);
+    }
+
+    /// Functions with side effects found in the final review, ClickHouse's
+    /// external table functions (only there), and row locks.
+    #[test]
+    fn more_acting_functions_and_row_locks_are_not_reads() {
+        for (kind, sql) in [
+            (Postgres, "select brin_summarize_new_values('orders_brin')"),
+            (Postgres, "select brin_summarize_range('i', 0)"),
+            (Postgres, "select gin_clean_pending_list('gin_idx')"),
+            (Postgres, "select pg_stat_reset_subscription_stats(null)"),
+            (Postgres, "select pg_sync_replication_slots()"),
+            (Postgres, "select pg_replication_origin_session_reset()"),
+            (Duckdb, "select * from sqlite_attach('/tmp/x.db')"),
+            (Duckdb, "call sqlite_attach('/tmp/x.db')"),
+            (Databricks, "select http_request(conn => 'c', method => 'POST', path => '/x')"),
+            (Clickhouse, "select * from url('http://x/y.csv', CSV)"),
+            (Clickhouse, "select count() from remote('other:9000', db.t)"),
+            (Clickhouse, "select * from mysql('h:3306', 'db', 't', 'u', 'p')"),
+            (Clickhouse, "select * from s3('https://b.s3.amazonaws.com/x.parquet')"),
+            // Row locks: held until the transaction ends.
+            (Postgres, "select * from accounts where id = 1 for update"),
+            (Postgres, "select * from accounts for share skip locked"),
+            (Mysql, "select * from t where id = 1 for update"),
+            (Oracle, "select * from t where id = 1 for update nowait"),
+        ] {
+            let c = classify(sql, kind);
+            assert!(!c.kind.is_read(), "{kind:?}: {sql} is {:?}", c.kind);
+            assert!(!crate::sql::read_only_allows(sql, &c), "{kind:?}: {sql}");
+        }
+        // The same words are reads where they don't act: ClickHouse's
+        // names elsewhere, a column called url, and plain selects.
+        for (kind, sql) in [
+            (Postgres, "select url(path) from pages"),
+            (Postgres, "select * from remote"),
+            (Mysql, "select s3 from buckets"),
+            (Clickhouse, "select url from pages"),
+            (Clickhouse, "select * from system.tables"),
+            (Postgres, "select * from accounts where note = 'for update'"),
+        ] {
+            assert_eq!(classify(sql, kind).kind, StatementKind::Read, "{kind:?}: {sql}");
+        }
     }
 
     #[test]
