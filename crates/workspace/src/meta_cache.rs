@@ -750,14 +750,18 @@ impl Workspace {
     }
 
     pub fn meta_clear(&self, connection_id: &str) -> Result<()> {
-        let c = self.conn.lock();
-        c.execute("DELETE FROM meta_objects WHERE connection_id = ?1", [connection_id])?;
-        c.execute("DELETE FROM meta_columns WHERE connection_id = ?1", [connection_id])?;
-        c.execute("DELETE FROM meta_schemas WHERE connection_id = ?1", [connection_id])?;
-        c.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [connection_id])?;
-        c.execute("UPDATE meta_conn_state SET catalogs_at = NULL, schemas_at = NULL, checked_at = NULL WHERE connection_id = ?1", [connection_id])?;
+        // One transaction: all of it goes, or none (an error halfway left
+        // the AI's tables pointing at a cache that was gone).
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM meta_objects WHERE connection_id = ?1", [connection_id])?;
+        tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1", [connection_id])?;
+        tx.execute("DELETE FROM meta_schemas WHERE connection_id = ?1", [connection_id])?;
+        tx.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [connection_id])?;
+        tx.execute("UPDATE meta_conn_state SET catalogs_at = NULL, schemas_at = NULL, checked_at = NULL WHERE connection_id = ?1", [connection_id])?;
         // The tables the AI could use are gone with them (its scope stays).
-        Self::ai_forget_tx(&c, connection_id)?;
+        Self::ai_forget_tx(&tx, connection_id)?;
+        tx.commit()?;
         Ok(())
     }
 }

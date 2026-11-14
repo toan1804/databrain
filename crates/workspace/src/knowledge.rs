@@ -772,12 +772,15 @@ impl Workspace {
     }
 
     pub fn kn_clear(&self, connection_id: &str) -> Result<()> {
-        let c = self.conn.lock();
-        c.execute("DELETE FROM kn_objects WHERE connection_id = ?1", [connection_id])?;
+        // One transaction: all of it goes, or none.
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM kn_objects WHERE connection_id = ?1", [connection_id])?;
         // Search rows go with `ai_tables` (kept in step); the scope stays.
-        Self::ai_forget_tx(&c, connection_id)?;
-        c.execute("DELETE FROM kn_state WHERE connection_id = ?1", [connection_id])?;
-        c.execute("DELETE FROM kn_schema_state WHERE connection_id = ?1", [connection_id])?;
+        Self::ai_forget_tx(&tx, connection_id)?;
+        tx.execute("DELETE FROM kn_state WHERE connection_id = ?1", [connection_id])?;
+        tx.execute("DELETE FROM kn_schema_state WHERE connection_id = ?1", [connection_id])?;
+        tx.commit()?;
         Ok(())
     }
 
