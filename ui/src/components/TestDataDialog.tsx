@@ -303,10 +303,19 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
     try {
       const out = await generate();
       const id = uid();
-      const r = await loadResultAsking(out.output.result_id, args(out.table), id, () => {
-        loadId.current = id;
-        setProgress({ id, done: 0, total: out.output.rows });
-      });
+      const r = await loadResultAsking(
+        out.output.result_id,
+        args(out.table),
+        id,
+        () => {
+          loadId.current = id;
+          setProgress({ id, done: 0, total: out.output.rows });
+        },
+        () => {
+          loadId.current = null;
+          setProgress(null);
+        },
+      );
       if (!r) return;
       setReport(r);
       toast(`Loaded ${formatCount(r.rows)} test rows into ${req.table}`, "success");

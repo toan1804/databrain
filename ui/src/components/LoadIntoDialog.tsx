@@ -94,10 +94,19 @@ export function LoadIntoDialog({
     const id = uid();
     try {
       // Progress and Stop once the load starts (after a production prompt).
-      const r = await loadResultAsking(info.id, args, id, () => {
-        runId.current = id;
-        setRun({ id, done: 0, total: streaming ? 0 : info.total_rows });
-      });
+      const r = await loadResultAsking(
+        info.id,
+        args,
+        id,
+        () => {
+          runId.current = id;
+          setRun({ id, done: 0, total: streaming ? 0 : info.total_rows });
+        },
+        () => {
+          runId.current = null;
+          setRun(null);
+        },
+      );
       if (!r) return;
       setReport(r);
       toast(`Loaded ${formatCount(r.rows)} rows into ${table}`, "success");

@@ -332,9 +332,16 @@ function confirmProdLoad(reason: string): Promise<boolean> {
 
 /** Load a result. A production target asks first (and the server refuses
  * an unconfirmed load there with code `needs_confirmation`, asked then
- * too). `onStart` runs once the load really starts; `null` when the user
- * said no. */
-export async function loadResultAsking(resultId: string, args: LoadResultArgs, loadId: string, onStart?: () => void): Promise<LoadReport | null> {
+ * too). `onStart` runs once the load really starts; `onPause` when the
+ * server asks after it started (progress and Stop go while the prompt is
+ * open; `onStart` again if the user agrees); `null` when the user said no. */
+export async function loadResultAsking(
+  resultId: string,
+  args: LoadResultArgs,
+  loadId: string,
+  onStart?: () => void,
+  onPause?: () => void,
+): Promise<LoadReport | null> {
   const conn = useStore.getState().connections.find((c) => c.id === args.target_connection_id);
   let confirmed = false;
   if (conn?.env === "prod") {
@@ -347,7 +354,10 @@ export async function loadResultAsking(resultId: string, args: LoadResultArgs, l
   } catch (e) {
     const err = toError(e);
     if (confirmed || err.code !== "needs_confirmation") throw e;
+    // Nothing runs while the user decides.
+    onPause?.();
     if (!(await confirmProdLoad(err.message))) return null;
+    onStart?.();
     return api.loadResult(resultId, { ...args, confirmed: true }, loadId);
   }
 }

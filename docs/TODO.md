@@ -8,14 +8,6 @@ Found in reviews and left for a later release on purpose. Each says what goes wr
 - If an MCP client kills `databrain-mcp.exe` without closing its stdin, the child `databrain.exe mcp` may keep running (no job object ties them).
 - `databrain-jobs run` / `list` output in a terminal goes through the GUI-subsystem launcher's console attach; check it prints in cmd and PowerShell.
 
-## Query engine (review of 2026-11-12; see [QUERY_ENGINE.md](QUERY_ENGINE.md))
-
-The review's findings and its refactors are done (one guarded entry point, `outputs/` split, typed session roles, AI chats' outputs released when closed, `blocking()` on multi-thread runtimes only).
-
-Left from the final review (2026-11-13):
-
-- `loadResultAsking`: when the server asks (the UI didn't know the connection is production), progress and Stop already show during the prompt.
-
 ## Explorer and AI index (left from the review of 2026-11-12)
 
 - PostgreSQL row estimates are refreshed only when the schema changes: the explorer fingerprint leaves out `reltuples`, and since index runs use the same fingerprint (2026-11-13) they skip such schemas too, so the AI's row estimates go stale as well.
