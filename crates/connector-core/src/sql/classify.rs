@@ -875,6 +875,16 @@ fn calls_acting_function(s: &Statement, kind: ConnectorKind) -> bool {
             }
         }
         fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            // SQL Server lock hints that hold locks until the transaction
+            // ends (or take exclusive ones), as `FOR UPDATE` does elsewhere.
+            if let TableFactor::Table { with_hints, .. } = t
+                && with_hints.iter().any(|h| {
+                    let h = h.to_string().to_ascii_uppercase();
+                    ["UPDLOCK", "XLOCK", "HOLDLOCK", "TABLOCKX", "SERIALIZABLE", "REPEATABLEREAD"].iter().any(|l| h.contains(l))
+                })
+            {
+                return ControlFlow::Break(());
+            }
             match t {
                 TableFactor::Table { name, args: Some(_), .. } | TableFactor::Function { name, .. } => acts(name, self.0),
                 _ => ControlFlow::Continue(()),
@@ -1086,6 +1096,12 @@ mod tests {
             (Postgres, "select * from accounts for share skip locked"),
             (Mysql, "select * from t where id = 1 for update"),
             (Oracle, "select * from t where id = 1 for update nowait"),
+            // SQL Server lock hints that hold locks to the transaction's end.
+            (Mssql, "select * from t with (updlock) where id = 1"),
+            (Mssql, "select * from t with (xlock, holdlock)"),
+            (Mssql, "select * from t with (tablockx)"),
+            (Mssql, "select * from t with (serializable)"),
+            (Mssql, "select * from t a join u with (repeatableread) on a.id = u.id"),
         ] {
             let c = classify(sql, kind);
             assert!(!c.kind.is_read(), "{kind:?}: {sql} is {:?}", c.kind);
@@ -1100,6 +1116,9 @@ mod tests {
             (Clickhouse, "select url from pages"),
             (Clickhouse, "select * from system.tables"),
             (Postgres, "select * from accounts where note = 'for update'"),
+            // Hints that don't hold locks past the statement.
+            (Mssql, "select * from t with (nolock)"),
+            (Mssql, "select * from t with (readpast, index(ix_a))"),
         ] {
             assert_eq!(classify(sql, kind).kind, StatementKind::Read, "{kind:?}: {sql}");
         }
