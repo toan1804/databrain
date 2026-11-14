@@ -544,6 +544,29 @@ impl Agent {
                 began.name, rec.name, profile.name
             )));
         }
+        // Continued with another provider than its last turn's: its history
+        // may hold the schema and rows of any connection a tool, an
+        // @mention or an output reached, which aren't recorded. Only when no
+        // connection the AI may use refuses this provider; then the
+        // conversation follows it.
+        let session = if req.session_id.is_some() && session.provider_id.as_deref() != Some(rec.id.as_str()) {
+            let refuse: Vec<String> = ws
+                .list_connections()?
+                .into_iter()
+                .filter(|c| c.ai_policy.ai_enabled && !crate::policy::provider_allowed(&c.ai_policy, Some(&rec.id)))
+                .map(|c| format!("\"{}\"", c.name))
+                .collect();
+            if !refuse.is_empty() {
+                return Err(AiError::Policy(format!(
+                    "this conversation ran on another AI provider and may hold data from {}, which doesn't allow \"{}\": continue it with the provider it used, or start a new conversation",
+                    refuse.join(", "),
+                    rec.name
+                )));
+            }
+            ws.save_ai_session(AiSessionRecord { provider_id: Some(rec.id.clone()), model: Some(model.clone()), ..session })?
+        } else {
+            session
+        };
         let sid = session.id.clone();
         sink.emit(AgentEvent::Started { session_id: sid.clone(), run_id: run_id.clone() });
 

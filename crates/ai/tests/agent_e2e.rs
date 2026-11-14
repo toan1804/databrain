@@ -1854,12 +1854,12 @@ async fn a_connections_rules_hold_wherever_it_is_reached_from() {
 
     // A conversation begun on a connection that only allows another
     // provider can't be continued here: its history would go to this one.
-    let session = |conn: &str| {
+    let session = |conn: &str, provider: &str| {
         f.ws.save_ai_session(databrain_workspace::AiSessionRecord {
             id: String::new(),
             title: "t".into(),
             connection_id: Some(conn.into()),
-            provider_id: None,
+            provider_id: Some(provider.into()),
             model: None,
             created_at: 0,
             updated_at: 0,
@@ -1873,9 +1873,23 @@ async fn a_connections_rules_hold_wherever_it_is_reached_from() {
         let r = AgentRequest { session_id: Some(sid), ..req(&f) };
         agent.run(r, "run".into(), yes(), Arc::new(Events::default()), Default::default())
     };
-    let e = turn(session(&local_only)).await.unwrap_err().to_string();
+    let e = turn(session(&local_only, &f.provider)).await.unwrap_err().to_string();
     assert!(e.contains("began on \"Local only\""), "{e}");
     // One begun on a connection without such a list goes on (to the provider: nothing listens on the fixture's port).
-    let e = turn(session(&copy.id)).await.unwrap_err().to_string();
-    assert!(!e.contains("began on"), "{e}");
+    let e = turn(session(&copy.id, &f.provider)).await.unwrap_err().to_string();
+    assert!(!e.contains("began on") && !e.contains("another AI provider"), "{e}");
+    // Continued with another provider than it ran on: its history may hold
+    // rows of any connection it reached, so a connection refusing the new
+    // provider stops it.
+    let switched = session(&copy.id, "an-earlier-provider");
+    let e = turn(switched.clone()).await.unwrap_err().to_string();
+    assert!(e.contains("ran on another AI provider") && e.contains("\"Local only\""), "{e}");
+    assert_eq!(f.ws.get_ai_session(&switched).unwrap().provider_id.as_deref(), Some("an-earlier-provider"), "unchanged");
+    // With no connection refusing it, the conversation goes on with the new provider.
+    let mut lo = f.ws.get_connection(&local_only).unwrap();
+    lo.ai_policy.allowed_providers.clear();
+    f.ws.save_connection(lo).unwrap();
+    let e = turn(switched.clone()).await.unwrap_err().to_string();
+    assert!(!e.contains("another AI provider"), "{e}");
+    assert_eq!(f.ws.get_ai_session(&switched).unwrap().provider_id.as_deref(), Some(f.provider.as_str()));
 }
