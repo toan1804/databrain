@@ -340,7 +340,11 @@ system prompt (dialect, rules) + tool specs
 loop until no tool calls or max_steps (12, set by the app):
     provider.chat_stream → TextDelta / ToolCall / Usage to the UI ("ai-event")
     each ToolCall → ToolContext::call → policy gate → result (cut at 16,000 chars)
+    past 200,000 characters of conversation, the oldest tool results are dropped from what is sent
 ```
+
+- A connection's own settings hold wherever it is reached from: a tool's `connection` argument, the other connections chosen for a question, an output's source and a job's steps all check `ai_enabled`, the MCP share and `allowed_providers` (`ToolContext::provider_allowed`) of that connection, not only of the chat's.
+- Jobs the assistant wrote are reviewed twice: when it creates, changes or runs them (`jobs::review`, with the user's approval), and by the job runner each time such a step runs (`jobs::review_step`), so a connection later tagged production, set read-only or closed to AI writes stops the step.
 
 - Modes: `Chat`, `Generate`, `Edit`, `FixError`, `Explain`, `AnalyzeResult`, `Optimize`. A question about connection settings runs without tools.
 - Approvals: the app emits an `approval_request` on `ai-event` and waits up to 10 minutes for `ai_respond`. The user can edit the SQL before approving; edited SQL is reviewed again.
@@ -378,8 +382,8 @@ Only tables allowed by the connection's table access rules reach the model, and 
 | Field | Default | Meaning |
 |---|---|---|
 | `ai_enabled` | true | AI may use the connection |
-| `allowed_providers` | empty (any) | provider ids allowed |
-| `share_metadata`, `share_sample_values`, `share_result_rows` | true, false, false | what may be sent to the model |
+| `allowed_providers` | empty (any) | provider ids allowed; also for another connection's chat reaching this one |
+| `share_metadata`, `share_sample_values`, `share_result_rows` | true, false, false | what may be sent to the model (`share_metadata` off: table names only, in the prompt and in `describe_table`) |
 | `run_query` | `ask` | `never`, `ask`, or `auto_read` (reads run without asking) |
 | `allow_write` | false | AI may propose writes (always with approval) |
 | `max_rows_to_model` | 50 | rows sent to the model |

@@ -5,6 +5,19 @@ use super::{ToolContext, ToolOutput, arg, out, trunc};
 use crate::types::{AiError, Result};
 use crate::{access, knowledge};
 
+/// The `note` argument: short, as later prompts carry it whole.
+fn note_arg(args: &Value) -> Result<&str> {
+    let note = arg(args, "note")?;
+    let n = note.chars().count();
+    if n > crate::knowledge::MAX_NOTE_CHARS {
+        return Err(AiError::Policy(format!(
+            "the note is {n} characters; keep it under {} (one fact per note, no result values)",
+            crate::knowledge::MAX_NOTE_CHARS
+        )));
+    }
+    Ok(note)
+}
+
 impl ToolContext {
     pub(super) fn ai_note_status(&self) -> NoteStatus {
         if self.policy().auto_approve_notes { NoteStatus::Approved } else { NoteStatus::Proposed }
@@ -45,7 +58,7 @@ impl ToolContext {
     }
 
     pub(super) async fn add_note(&self, args: &Value) -> Result<ToolOutput> {
-        let note = arg(args, "note")?;
+        let note = note_arg(args)?;
         let target = self.checked_target(args.get("target").and_then(|t| t.as_str())).await?;
         let ws = self.engine.workspace();
         // Same text already there: nothing to add.
@@ -72,7 +85,7 @@ impl ToolContext {
 
     pub(super) async fn update_note(&self, args: &Value) -> Result<ToolOutput> {
         let id = arg(args, "id")?;
-        let note = arg(args, "note")?;
+        let note = note_arg(args)?;
         let ws = self.engine.workspace();
         let tables = crate::catalog::AiTables::with_profile(ws, &self.profile);
         let old = ws
@@ -85,8 +98,9 @@ impl ToolContext {
             None => old.target.clone(),
         };
         let status = self.ai_note_status();
-        let saved = if old.status == NoteStatus::Proposed {
-            // Revising its own pending proposal: edit it in place.
+        let saved = if old.status == NoteStatus::Proposed && matches!(old.author.as_str(), "ai" | "mcp") {
+            // Revising its own pending proposal: edit it in place (someone
+            // else's is kept until the user approves the replacement).
             ws.kn_save_note(KnNote { body: note.to_string(), target, ..old.clone() })?
         } else {
             ws.kn_save_note(KnNote {
@@ -109,7 +123,9 @@ impl ToolContext {
     pub(super) fn add_join(&self, args: &Value) -> Result<ToolOutput> {
         let ws = self.engine.workspace();
         let id = &self.profile.id;
-        let source = arg(args, "source")?.trim();
+        // One short line: it is shown to the model with the join, later.
+        let source = crate::knowledge::one_line(arg(args, "source")?, 120);
+        let source = source.as_str();
         if source.is_empty() {
             return Err(AiError::Policy("say where the join is written (source), e.g. a document's name or 'the user'".into()));
         }

@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use databrain_query_engine::QueryEngine;
-use databrain_workspace::{ConnectionProfile, KnObject, KnState, LearnedJoin, NoteStatus, Workspace, join_target, now_ms, split_target, target_mentions};
+use databrain_workspace::{
+    AiPolicy, ConnectionProfile, KnNote, KnObject, KnState, LearnedJoin, NoteStatus, Workspace, join_target, now_ms, split_target, target_mentions,
+};
 use serde::Serialize;
 
 use crate::catalog::AiTables;
@@ -47,7 +49,8 @@ pub fn scope_matches(scope: &[String], schema: &str) -> bool {
         let w = w.trim();
         w == "*"
             || w.eq_ignore_ascii_case(schema)
-            || w.strip_suffix(".*").is_some_and(|c| schema.len() > c.len() && schema[..c.len()].eq_ignore_ascii_case(c) && schema.as_bytes()[c.len()] == b'.')
+            || w.strip_suffix(".*")
+                .is_some_and(|c| schema.get(..c.len()).is_some_and(|head| head.eq_ignore_ascii_case(c)) && schema.as_bytes().get(c.len()) == Some(&b'.'))
     })
 }
 
@@ -399,8 +402,15 @@ fn unreachable_error(e: &databrain_query_engine::EngineError) -> bool {
 }
 
 /// Compact DDL-like description for prompts. PII columns are listed but
-/// flagged so the model avoids selecting them.
-pub fn render_object(o: &KnObject, pii: &dyn Fn(&str) -> bool, notes: &[String]) -> String {
+/// flagged so the model avoids selecting them. With "share metadata" off
+/// (`policy`) only the name is given: decided here, so no caller can
+/// forget it.
+pub fn render_object(o: &KnObject, policy: &AiPolicy, notes: &[String]) -> String {
+    let full = o.full_name();
+    if !policy.share_metadata {
+        return format!("-- {} {full} (metadata sharing disabled)", o.kind);
+    }
+    let pii = |c: &str| is_pii(policy, Some(&full), c);
     let mut s = format!("-- {} {}", o.kind, o.full_name());
     if let Some(n) = o.row_estimate.filter(|n| *n > 0) {
         s.push_str(&format!(" (~{n} rows)"));
@@ -441,9 +451,25 @@ pub fn render_object(o: &KnObject, pii: &dyn Fn(&str) -> bool, notes: &[String])
     s
 }
 
-fn one_line(s: &str, n: usize) -> String {
-    let t: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+/// Stored text (comments, notes, a join's source) as it enters a prompt: one
+/// line, at most `n` characters, and no code fence of its own (the schema
+/// is sent inside one, which such text could otherwise close).
+pub(crate) fn one_line(s: &str, n: usize) -> String {
+    let t: String = s.split_whitespace().collect::<Vec<_>>().join(" ").replace("```", "'''");
     if t.chars().count() > n { t.chars().take(n).collect::<String>() + "…" } else { t }
+}
+
+/// Longest note or glossary entry given to the model (older and imported
+/// notes are cut to it).
+const NOTE_PROMPT_CHARS: usize = 600;
+/// Longest note the assistant may save.
+pub const MAX_NOTE_CHARS: usize = 600;
+
+/// A note's text for a prompt: one line, capped, and marked when the
+/// assistant (or an MCP client) wrote it rather than the user.
+pub fn note_for_prompt(n: &KnNote) -> String {
+    let body = one_line(&n.body, NOTE_PROMPT_CHARS);
+    if matches!(n.author.as_str(), "ai" | "mcp") { format!("(written by the assistant) {body}") } else { body }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -483,10 +509,13 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
         if h.source == "note" {
             if let Some(n) = notes_all.iter().find(|n| n.id == h.reference) {
                 if n.target.is_none() {
-                    glossary.push(n.body.clone());
+                    glossary.push(note_for_prompt(n));
                 } else {
                     // Every table the note is about (`a & b`, `a or b`).
                     for (_, p) in split_target(n.target.as_deref().unwrap_or("")) {
+                        if chosen.len() >= max_tables + 3 {
+                            break;
+                        }
                         if let Some((o, _)) = t.resolve_path(&p)?
                             && seen.insert(o.full_name())
                         {
@@ -552,13 +581,11 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
             .iter()
             .filter(|n| n.target.as_deref().is_some_and(|t| target_mentions(t, &o.schema, &o.name)))
             .map(|n| match n.target.as_deref() {
-                Some(t) if !t.eq_ignore_ascii_case(&full) => format!("{t}: {}", n.body),
-                _ => n.body.clone(),
+                Some(t) if !t.eq_ignore_ascii_case(&full) => format!("{t}: {}", note_for_prompt(n)),
+                _ => note_for_prompt(n),
             })
             .collect();
-        let pii = |c: &str| is_pii(&policy, Some(&full), c);
-        let mut block =
-            if policy.share_metadata { render_object(o, &pii, &table_notes) } else { format!("-- {} {} (metadata sharing disabled)", o.kind, full) };
+        let mut block = render_object(o, &policy, &table_notes);
         let lines = join_lines(&full, &learned);
         for l in &lines {
             block.push('\n');
@@ -566,6 +593,12 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
         }
         if !text.is_empty() && text.len() + block.len() > budget_chars {
             break;
+        }
+        // The first table alone over the budget (a very wide one): cut, not sent whole.
+        if block.len() > budget_chars {
+            let end = block.char_indices().map(|(i, _)| i).take_while(|i| *i <= budget_chars).last().unwrap_or(0);
+            block.truncate(end);
+            block.push_str("\n  … (more columns: use describe_table)");
         }
         text.push_str(&block);
         text.push_str("\n\n");
@@ -650,7 +683,7 @@ fn evidence(j: &LearnedJoin) -> String {
         n => format!(", used in {n} past queries"),
     };
     match (&j.documented, j.status) {
-        (Some(d), _) if learn::documented(j) => format!("documented ({}){used}", d.source),
+        (Some(d), _) if learn::documented(j) => format!("documented ({}){used}", one_line(&d.source, 120)),
         (_, databrain_workspace::JoinStatus::Confirmed) => "confirmed by the user".into(),
         _ if j.queries >= 2 => format!("learned from {} past queries", j.queries),
         _ => format!("learned from a past query run on {} days", j.days),
@@ -929,7 +962,11 @@ mod tests {
                 ref_columns: vec!["id".into()],
             }],
         };
-        let s = render_object(&o, &|c| c == "email", &["Cancelled orders have status = 'X'".into()]);
+        let s = render_object(&o, &AiPolicy { pii_columns: vec!["email".into()], ..Default::default() }, &["Cancelled orders have status = 'X'".into()]);
+        let hidden = render_object(&o, &AiPolicy { share_metadata: false, ..Default::default() }, &["a note".into()]);
+        assert_eq!(hidden, "-- table public.orders (metadata sharing disabled)", "names only when metadata isn't shared");
+        assert_eq!(one_line("a\n```\nb", 50), "a ''' b", "stored text can't close the prompt's code fence");
+        assert!(scope_matches(&["dev.*".into()], "dev.sales") && !scope_matches(&["dev.*".into()], "pré.sales"), "no slice inside a character");
         assert!(s.contains("-- table public.orders (~1200 rows): Web orders"));
         assert!(s.contains("id int PK NOT NULL"));
         assert!(s.contains("email text [PII: do not select] -- buyer"));

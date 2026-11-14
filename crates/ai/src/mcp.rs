@@ -298,6 +298,7 @@ impl McpServer {
             host: Arc::new(McpHost { peer: peer.clone(), progress, cancel: cancel.clone() }),
             cancel,
             results: parking_lot::Mutex::new(vec![]),
+            provider_id: None,
         };
         let o = ctx.call(name, args).await;
         let is_err = o.content.starts_with("ERROR");

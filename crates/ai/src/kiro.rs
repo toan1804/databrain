@@ -760,7 +760,7 @@ impl Acp {
             }
             // Process ended: fail everything still waiting.
             let tail = errbuf.lock().trim().to_string();
-            let why = if tail.is_empty() { "kiro-cli exited".to_string() } else { format!("kiro-cli exited: {}", trunc(&tail, 600)) };
+            let why = if tail.is_empty() { "kiro-cli exited".to_string() } else { format!("kiro-cli exited: {}", trunc(&redact_keys(&tail), 600)) };
             for (_, w) in p.lock().drain() {
                 let _ = w.send(Err(AiError::Provider(why.clone())));
             }
@@ -815,7 +815,7 @@ impl Acp {
                 _ = &mut deadline => {
                     self.pending.lock().remove(&id);
                     let tail = self.stderr.lock().trim().to_string();
-                    return Err(AiError::Provider(format!("Kiro did not answer {method} in time{}", if tail.is_empty() { String::new() } else { format!(": {}", trunc(&tail, 300)) })));
+                    return Err(AiError::Provider(format!("Kiro did not answer {method} in time{}", if tail.is_empty() { String::new() } else { format!(": {}", trunc(&redact_keys(&tail), 300)) })));
                 }
             }
         }

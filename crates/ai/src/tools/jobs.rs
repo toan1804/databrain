@@ -1,14 +1,15 @@
-use databrain_workspace::ConnectionProfile;
 use serde_json::{Value, json};
 
 use super::{ToolContext, ToolOutput, arg, out, trunc};
-use crate::policy::{self, Decision};
+use crate::policy::Decision;
 use crate::types::{AiError, Result};
 
 impl ToolContext {
     pub(super) fn list_jobs(&self, args: &Value) -> Result<ToolOutput> {
         let f = args.get("filter").and_then(|f| f.as_str()).unwrap_or("").to_lowercase();
-        let jobs = self.engine.workspace().list_jobs()?;
+        let ws = self.engine.workspace();
+        // Only jobs whose connections the assistant may work on.
+        let jobs: Vec<_> = ws.list_jobs()?.into_iter().filter(|j| ws.get_job(&j.id).is_ok_and(|job| self.job_visible(&job))).collect();
         let mut text = String::new();
         for j in jobs.iter().filter(|j| f.is_empty() || j.name.to_lowercase().contains(&f) || j.step_names.iter().any(|n| n.to_lowercase().contains(&f))) {
             let last = j.last_run.as_ref().map(|r| format!(" · last run {}", r.status)).unwrap_or_default();
@@ -22,16 +23,21 @@ impl ToolContext {
         Ok(out(text, json!({"count": jobs.len()})))
     }
 
-    /// The job a tool argument names (name or id).
+    fn job_visible(&self, job: &databrain_workspace::Job) -> bool {
+        crate::jobs::visible(self.engine.workspace(), job, self.caller == super::Caller::Mcp, self.provider_id.as_deref())
+    }
+
+    /// The job a tool argument names (name or id). A job on a connection
+    /// the assistant may not work on is answered like one that isn't there.
     pub(super) fn find_job(&self, want: &str) -> Result<databrain_workspace::Job> {
         let ws = self.engine.workspace();
-        let id = ws
-            .list_jobs()?
-            .into_iter()
-            .find(|j| j.id == want || j.name.eq_ignore_ascii_case(want))
-            .map(|j| j.id)
-            .ok_or_else(|| AiError::Policy(format!("no job \"{want}\" (see list_jobs)")))?;
-        Ok(ws.get_job(&id)?)
+        let missing = || AiError::Policy(format!("no job \"{want}\" (see list_jobs)"));
+        let id = ws.list_jobs()?.into_iter().find(|j| j.id == want || j.name.eq_ignore_ascii_case(want)).map(|j| j.id).ok_or_else(missing)?;
+        let job = ws.get_job(&id)?;
+        if !self.job_visible(&job) {
+            return Err(missing());
+        }
+        Ok(job)
     }
 
     pub(super) fn get_job(&self, args: &Value) -> Result<ToolOutput> {
@@ -59,72 +65,10 @@ impl ToolContext {
         Ok(out(text, json!({"job_id": job.id, "name": job.name})))
     }
 
-    /// Steps of a job the AI builds or runs pass the rules its own queries
-    /// do, per step and connection (runs don't prompt, so this is where
-    /// they apply):
-    /// - query steps: `review_sql` on their connection (writes need
-    ///   `allow_write`, never on production or read-only connections; table
-    ///   rules). Steps on the Results DuckDB, and the SQL of load and export
-    ///   steps (which runs there), only read, like `query_outputs`;
-    /// - load steps: the AI may write to the target connection and table,
-    ///   and its before / after SQL passes `review_sql` there.
-    ///
-    /// Returns how the user approves: `Confirm` when a step calls functions
-    /// that could write where the AI may not (see `review_sql`), else `ask`.
+    /// [`crate::jobs::review`] as a decision: `Confirm` when only the user
+    /// may approve (see there), else `ask`.
     pub(super) fn review_job(&self, job: &databrain_workspace::Job, only: &[String], ask: &str) -> Result<Decision> {
-        let ws = self.engine.workspace();
-        let mut confirm = Vec::new();
-        let results = std::cell::OnceCell::new();
-        for n in job.nodes.iter().filter(|n| only.is_empty() || only.contains(&n.id)) {
-            let step = |r: String| AiError::Policy(format!("step {}: {r}", n.name));
-            let conn = |id: &str| ws.get_connection(id).map_err(|_| step("its connection no longer exists".into()));
-            let mut review = |p: &ConnectionProfile, sql: &str| -> Result<()> {
-                match policy::review_sql(p, sql).decision {
-                    Decision::Deny(r) => Err(step(r)),
-                    Decision::Confirm(r) => {
-                        confirm.push(format!("step {}: {r}", n.name));
-                        Ok(())
-                    }
-                    _ => Ok(()),
-                }
-            };
-            // SQL that runs on the Results DuckDB.
-            let read_outputs = |sql: &str| -> Result<()> {
-                if sql.trim().is_empty() {
-                    return Ok(());
-                }
-                if results.get().is_none() {
-                    let _ = results.set(self.engine.results_connection().map_err(|e| AiError::Internal(e.message))?);
-                }
-                if policy::review_sql(results.get().expect("set above"), sql).kind.is_read() {
-                    Ok(())
-                } else {
-                    Err(step("SQL on DataBrain's outputs (the Results DuckDB) may only read; write into a connection with a load step".into()))
-                }
-            };
-            match n.kind {
-                databrain_workspace::JobNodeKind::Query => match n.connection_id.as_deref().filter(|c| !c.is_empty()) {
-                    Some(c) => review(&conn(c)?, &n.sql)?,
-                    None => read_outputs(&n.sql)?,
-                },
-                databrain_workspace::JobNodeKind::Load => {
-                    read_outputs(&n.sql)?;
-                    if let Some(c) = n.target_connection_id.as_deref().filter(|c| !c.is_empty()) {
-                        let target = conn(c)?;
-                        if let Some(r) = policy::write_denied(&target) {
-                            return Err(step(format!("it loads into \"{}\": {r}", target.name)));
-                        }
-                        if let Some(t) = n.target_table.as_deref() {
-                            crate::access::check_write_table(&target, t).map_err(step)?;
-                        }
-                        for sql in [&n.load_before_sql, &n.load_after_sql].into_iter().flatten().filter(|s| !s.trim().is_empty()) {
-                            review(&target, sql)?;
-                        }
-                    }
-                }
-                databrain_workspace::JobNodeKind::Export => read_outputs(&n.sql)?,
-            }
-        }
+        let confirm = crate::jobs::review(&self.engine, job, only)?;
         Ok(if confirm.is_empty() { Decision::Ask(ask.into()) } else { Decision::Confirm(confirm.join("; ")) })
     }
 
@@ -178,7 +122,12 @@ impl ToolContext {
                 break None;
             }
             tokio::select! {
-                _ = self.cancel.cancelled() => return Err(AiError::Cancelled),
+                _ = self.cancel.cancelled() => {
+                    // Stop ends the run the assistant started, not only the wait for it.
+                    self.host.stop_job(&job.id).await;
+                    self.audit("run_job", args, "stopped", Some("the user stopped the assistant; the run was cancelled"));
+                    return Err(AiError::Cancelled);
+                }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
             }
         };

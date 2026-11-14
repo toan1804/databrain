@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use super::{ToolContext, ToolOutput, arg, out};
 use crate::catalog::AiTables;
 use crate::knowledge;
-use crate::policy::{Decision, is_pii};
+use crate::policy::Decision;
 use crate::types::{AiError, Result};
 
 impl ToolContext {
@@ -62,17 +62,21 @@ impl ToolContext {
             .filter(|n| n.status == NoteStatus::Approved && n.target.as_deref().is_some_and(|x| databrain_workspace::target_mentions(x, &o.schema, &o.name)))
             .filter(|n| tables.note_visible(n.target.as_deref()))
             .map(|n| match n.target.as_deref() {
-                Some(t) if !t.eq_ignore_ascii_case(&full) => format!("{t}: {}", n.body),
-                _ => n.body,
+                Some(t) if !t.eq_ignore_ascii_case(&full) => format!("{t}: {}", knowledge::note_for_prompt(&n)),
+                _ => knowledge::note_for_prompt(&n),
             })
             .collect();
-        let pol = target.ai_policy.clone();
-        let mut text = knowledge::render_object(&o, &|c| is_pii(&pol, Some(&full), c), &notes);
+        // "Share metadata" off: the name only, as in the prompt (no columns, keys or notes).
+        if !target.ai_policy.share_metadata {
+            self.audit("describe_table", args, "allowed", Some("name only: metadata sharing is off"));
+            return Ok(out(knowledge::render_object(&o, &target.ai_policy, &[]), json!({"table": full})));
+        }
+        let mut text = knowledge::render_object(&o, &target.ai_policy, &notes);
         // Tables that reference this one.
         let refs: Vec<String> = tables
             .objects()?
             .into_iter()
-            .filter(|x| x.foreign_keys.iter().any(|f| f.ref_table.eq_ignore_ascii_case(&o.name)))
+            .filter(|x| x.foreign_keys.iter().any(|f| f.ref_table.eq_ignore_ascii_case(&o.name) && f.ref_schema.eq_ignore_ascii_case(&o.schema)))
             .map(|x| x.full_name())
             .take(10)
             .collect();
@@ -123,6 +127,9 @@ impl ToolContext {
 
     pub(super) async fn index_tables(&self, args: &Value) -> Result<ToolOutput> {
         let target = self.schema_target(args)?;
+        if !target.ai_policy.share_metadata {
+            return Err(AiError::Policy("sharing table metadata is disabled for this connection".into()));
+        }
         let tables: Vec<String> = match args.get("tables") {
             Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect(),
             Some(Value::String(t)) => t.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect(),
@@ -146,7 +153,6 @@ impl ToolContext {
         let detail = json!({"tables": tables, "connection": target.name});
         self.gate("index_tables", Decision::Ask("Index tables".into()), &summary, &detail).await?;
         let results = knowledge::index_tables(&self.engine, &target.id, &tables, &self.cancel).await?;
-        let pol = target.ai_policy.clone();
         let tables = AiTables::with_profile(self.engine.workspace(), &target);
         let mut text = String::new();
         let mut ok = Vec::new();
@@ -160,7 +166,7 @@ impl ToolContext {
             match &shown {
                 Ok(o) => {
                     let full = o.full_name();
-                    text.push_str(&knowledge::render_object(o, &|c| is_pii(&pol, Some(&full), c), &[]));
+                    text.push_str(&knowledge::render_object(o, &target.ai_policy, &[]));
                     text.push('\n');
                     ok.push(full);
                 }

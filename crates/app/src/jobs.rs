@@ -914,6 +914,13 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     if sql.trim().is_empty() {
         return Err(EngineError::new("invalid", "This step has no SQL"));
     }
+    // SQL the assistant wrote (and every step of a run it started) passes
+    // the connection's AI rules as they are now: the job was approved under
+    // the rules of that day, and since then the connection may have become
+    // production or read-only, or lost "AI may write" or a table.
+    if t.step_origin(node) == Origin::Ai {
+        ai_rules_now(ctx, node, &sql, &connection_id, t)?;
+    }
     // Checked before the query runs, so a missing folder fails fast.
     let folder = if node.kind == JobNodeKind::Export { Some(export_folder(node)?) } else { None };
     let duck_id = connection_id.clone();
@@ -1015,6 +1022,34 @@ pub fn load_spec(node: &JobNode) -> LoadSpec {
         // The job was saved to write there; its runs don't ask.
         confirmed: true,
     }
+}
+
+/// A step's SQL as it will run (`sql`, with the run's `:name` values in
+/// place where they are known), checked like the assistant's own queries
+/// ([`databrain_ai::jobs::review_step`]). What only the user could approve
+/// was approved with the job and is not asked again.
+fn ai_rules_now(ctx: &JobCtx, node: &JobNode, sql: &str, connection_id: &str, t: &Tracer) -> Result<()> {
+    let params = t.params().unwrap_or_default();
+    let filled = |sql: &str, connection: Option<&str>| -> String {
+        let kind = connection.and_then(|c| ctx.workspace.get_connection(c).ok()).map(|p| p.config.kind);
+        kind.and_then(|k| databrain_connector_core::sql::substitute_parameters(sql, k, &params).ok()).unwrap_or_else(|| sql.to_string())
+    };
+    let mut checked = node.clone();
+    checked.sql = filled(sql, Some(connection_id));
+    let target = node.target_connection_id.clone();
+    for s in [&mut checked.load_before_sql, &mut checked.load_after_sql].into_iter().flatten() {
+        *s = filled(s, target.as_deref());
+    }
+    databrain_ai::jobs::review_step(&ctx.engine, &checked).map(|_| ()).map_err(|e| {
+        let why = match e {
+            databrain_ai::AiError::Policy(r) => r,
+            other => other.to_string(),
+        };
+        EngineError::new(
+            "invalid",
+            format!("Not run: the connection's AI settings no longer allow what the assistant wrote ({why}). See the connection's AI settings."),
+        )
+    })
 }
 
 /// Whose SQL a step's is outside a run (dry runs, loads): the AI's when it
