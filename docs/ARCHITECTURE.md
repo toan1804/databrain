@@ -239,7 +239,7 @@ UI: fetch_page(result_id, view, offset, limit ≤ 5,000) → rows as display str
 
 **Result store** (`crates/result-store`). Results stay in memory as Arrow batches. Views (column filters, quick filter, multi-column sort), find, column stats and selection summaries run on Arrow compute kernels (comparison, `ilike`, `cast`, `take`). `chart.rs` groups and aggregates chart data in Rust. `wide.rs` switches columns past 2 GiB to `LargeUtf8`/`LargeBinary`. Pages go to the UI as JSON arrays of display strings, at most 5,000 rows per request, which is enough for a virtualized window.
 
-**Outputs** (`crates/query-engine/src/outputs.rs`, `OutputRegistry`):
+**Outputs** (`crates/query-engine/src/outputs/`: `registry.rs` with `OutputRegistry`, `duckdb.rs`; comparing in `compare.rs`):
 
 - Every result set gets a handle `rN` (the counter persists), an optional name, and provenance: SQL, connection, row limit, whether it was truncated.
 - A rerun of a named output keeps up to 5 versions (`name`, `name__1`, ...).

@@ -778,6 +778,11 @@ impl ResultStore {
         self.results.lock().get(id).cloned().ok_or_else(|| Error::NotFound(id.to_string()))
     }
 
+    /// Forget a result's rows. For the query engine's `OutputRegistry`
+    /// only (and a statement's unfinished result): everything else calls
+    /// `OutputRegistry::release_result` or `drop_history_result`, so no
+    /// output is left listed whose rows are gone.
+    #[doc(hidden)]
     pub fn remove(&self, id: &str) -> bool {
         self.results.lock().remove(id).is_some()
     }

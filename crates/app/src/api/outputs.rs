@@ -65,7 +65,7 @@ pub async fn keep_output(state: &AppState, handle: String, kept: bool) -> Result
 /// equal names and names equal ignoring case are matched automatically.
 /// `exact`: `mapping` is the complete list of pairs (no automatic matching).
 /// `options`: how values compare (types normalized by default, see
-/// [`CompareOptions`](databrain_query_engine::outputs::CompareOptions)).
+/// [`CompareOptions`](databrain_query_engine::compare::CompareOptions)).
 pub fn output_diff_sql(
     state: &AppState,
     before: &str,
@@ -73,11 +73,11 @@ pub fn output_diff_sql(
     keys: Vec<String>,
     mapping: Vec<(String, String)>,
     exact: bool,
-    options: &databrain_query_engine::outputs::CompareOptions,
+    options: &databrain_query_engine::compare::CompareOptions,
 ) -> Result<String> {
     let b = get_output(state, before)?;
     let a = get_output(state, after)?;
-    databrain_query_engine::outputs::diff_sql_opts(&b, &a, &keys, &mapping, !exact, options)
+    databrain_query_engine::compare::diff_sql_opts(&b, &a, &keys, &mapping, !exact, options)
 }
 
 /// The column pairs a compare would use, with their types and how each is
@@ -88,11 +88,11 @@ pub fn output_compare_pairs(
     after: &str,
     mapping: Vec<(String, String)>,
     exact: bool,
-    options: &databrain_query_engine::outputs::CompareOptions,
-) -> Result<Vec<databrain_query_engine::outputs::ComparePair>> {
+    options: &databrain_query_engine::compare::CompareOptions,
+) -> Result<Vec<databrain_query_engine::compare::ComparePair>> {
     let b = get_output(state, before)?;
     let a = get_output(state, after)?;
-    databrain_query_engine::outputs::compare_pairs(&b, &a, &mapping, !exact, options)
+    databrain_query_engine::compare::compare_pairs(&b, &a, &mapping, !exact, options)
 }
 
 /// What a compare tab compares (the dialog's choices).
@@ -110,20 +110,20 @@ pub struct CompareSpec {
     #[serde(default)]
     pub exact: bool,
     #[serde(default)]
-    pub options: databrain_query_engine::outputs::CompareOptions,
+    pub options: databrain_query_engine::compare::CompareOptions,
 }
 
 /// A compare's counts and its rows (a result to page through).
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[ts(export)]
 pub struct CompareRun {
-    pub summary: databrain_query_engine::outputs::CompareSummary,
+    pub summary: databrain_query_engine::compare::CompareSummary,
     /// `_change` (`added`, `removed`, `changed`), the after output's columns,
     /// `<col> (before)` and `_changed` for changed rows.
     pub result: databrain_result_store::ResultInfo,
     /// The diff SQL (DuckDB, on the Results connection).
     pub sql: String,
-    pub pairs: Vec<databrain_query_engine::outputs::ComparePair>,
+    pub pairs: Vec<databrain_query_engine::compare::ComparePair>,
     /// Key columns (after-side names).
     pub keys: Vec<String>,
     pub before: OutputInfo,
@@ -136,17 +136,17 @@ pub const COMPARE_ROW_LIMIT: usize = 100_000;
 /// Compare two outputs: the counts (one summary query) and the differing
 /// rows, both run on the Results connection. `tab_id` groups the runs.
 pub async fn compare_outputs(state: &AppState, spec: CompareSpec, tab_id: &str) -> Result<CompareRun> {
-    use databrain_query_engine::outputs as o;
+    use databrain_query_engine::compare;
     let before = load_output(state, spec.before.clone()).await?;
     let after = load_output(state, spec.after.clone()).await?;
     if before.handle == after.handle {
         return Err(EngineError::new("invalid", "choose two different outputs"));
     }
     let auto = !spec.exact;
-    let pairs = o::compare_pairs(&before, &after, &spec.mapping, auto, &spec.options)?;
-    let keys = o::compare_keys(&before, &after, &spec.keys, &spec.mapping, auto, &spec.options)?;
-    let (summary_sql, columns) = o::compare_summary_sql(&before, &after, &spec.keys, &spec.mapping, auto, &spec.options)?;
-    let sql = o::diff_sql_opts(&before, &after, &spec.keys, &spec.mapping, auto, &spec.options)?;
+    let pairs = compare::compare_pairs(&before, &after, &spec.mapping, auto, &spec.options)?;
+    let keys = compare::compare_keys(&before, &after, &spec.keys, &spec.mapping, auto, &spec.options)?;
+    let (summary_sql, columns) = compare::compare_summary_sql(&before, &after, &spec.keys, &spec.mapping, auto, &spec.options)?;
+    let sql = compare::diff_sql_opts(&before, &after, &spec.keys, &spec.mapping, auto, &spec.options)?;
     let conn = results_connection(state)?;
     let run = |sql: String, limit: Option<usize>| {
         let st = state.engine.clone();
@@ -183,7 +183,7 @@ pub async fn compare_outputs(state: &AppState, spec: CompareSpec, tab_id: &str) 
     if let Some(h) = state.engine.outputs().by_result(&s.id).map(|x| x.handle) {
         let _ = drop_output(state, h).await;
     }
-    let summary = o::CompareSummary::from_row(&row, &columns)?;
+    let summary = compare::CompareSummary::from_row(&row, &columns)?;
     let result = run(sql.clone(), Some(COMPARE_ROW_LIMIT)).await?;
     Ok(CompareRun { summary, result, sql, pairs, keys, before, after })
 }
@@ -283,15 +283,15 @@ fn file_scan(path: &str, _sheet: Option<&str>) -> Result<String> {
 /// column (id-like names first), else the first pair of them, whose values
 /// are unique and not NULL on both sides. Empty when none is.
 pub async fn compare_suggest_keys(state: &AppState, before: &str, after: &str, mapping: Vec<(String, String)>, exact: bool) -> Result<Vec<String>> {
-    use databrain_query_engine::outputs as o;
+    use databrain_query_engine::compare;
     let b = load_output(state, before.to_string()).await?;
     let a = load_output(state, after.to_string()).await?;
-    let pairs = o::column_pairs_with(&b, &a, &mapping, !exact)?;
-    let cands = o::key_candidates(&pairs);
+    let pairs = compare::column_pairs_with(&b, &a, &mapping, !exact)?;
+    let cands = compare::key_candidates(&pairs);
     if cands.is_empty() {
         return Ok(vec![]);
     }
-    let sql = o::unique_check_sql(&b, &a, &pairs, &cands);
+    let sql = compare::unique_check_sql(&b, &a, &pairs, &cands);
     let conn = results_connection(state)?;
     let out = state
         .engine
@@ -326,7 +326,7 @@ pub async fn compare_suggest_keys(state: &AppState, before: &str, after: &str, m
     if let Some(h) = state.engine.outputs().by_result(&r.id).map(|x| x.handle) {
         let _ = drop_output(state, h).await;
     }
-    Ok(o::pick_key(&cands, &row))
+    Ok(compare::pick_key(&cands, &row))
 }
 
 /// Id of the local DuckDB connection for `results.*` queries.

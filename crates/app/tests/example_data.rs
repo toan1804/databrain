@@ -556,7 +556,7 @@ async fn outputs_handles_cross_source_queries_diff_chart_and_pins() {
 /// reports real differences.
 #[tokio::test]
 async fn compare_outputs_ignores_how_each_database_types_values() {
-    use databrain_query_engine::outputs::{CompareKind, CompareOptions};
+    use databrain_query_engine::compare::{CompareKind, CompareOptions};
     let st = state();
     let res = api::results_connection(&st).unwrap();
     let sq = sqlite_conn(&st);
@@ -725,7 +725,7 @@ async fn compare_reads_time_zone_values_in_utc() {
 /// differently (dates and booleans as text in SQLite), so nothing differs.
 #[tokio::test]
 async fn compare_a_table_with_a_file_without_writing_queries() {
-    use databrain_query_engine::outputs::CompareOptions;
+    use databrain_query_engine::compare::CompareOptions;
     let st = state();
     let sq = sqlite_conn(&st);
     let table = api::CompareSource::Table { connection_id: sq.clone(), schema: "main".into(), table: "customers".into() };

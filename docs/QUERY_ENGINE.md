@@ -12,7 +12,9 @@ Main files:
 | `sessions.rs` | `session_for`, idle close, `disconnect`, `reconnect`, `close_tab`, manual commit, `with_meta` / `with_tab` |
 | `run.rs` | `plan`, `bind_parameters`, `safety_reasons`, `start_run`, `run_and_wait`, `run_job`, `collect_stream`, `cancel` |
 | `events.rs` | `JobEvent`, `EventSink`, `EventHub`, `StatementOutcomeView`, export progress types |
-| `outputs.rs` | `OutputRegistry` (handles, names, versions, pinning, budget, snapshots), `OutputTables` (DuckDB `results.<name>`), compare SQL |
+| `outputs/registry.rs` | `OutputRegistry` (handles, names, versions, pinning, budget, snapshots); the only code that frees a result's rows (`release_result`, `drop_history_result`; `ResultStore::remove` is for it alone) |
+| `outputs/duckdb.rs` | `OutputTables` (DuckDB `results.<name>`), the types SQL sees (`sql_ready`) |
+| `compare.rs` | Compare SQL for two outputs (column pairs, canonical values, summary, key candidates) |
 | `load.rs` | Load steps: `load_rows`, `write_output`, `dry_run_load`, `check_load_target` |
 | `edit.rs` | Grid edits: `source_table`, `edit_target`, `edit_statements`, `apply_edits` |
 | `plan.rs` | `explain`, `estimate_cost`, plan parsers per engine |
@@ -208,7 +210,7 @@ Refusals (read-only, busy, nothing to run) are returned by `start_run`. Statemen
 | Where | Covers |
 |---|---|
 | `crates/query-engine/src/tests.rs` (SQLite file, `CollectingSink`) | parameters, notebook sessions, history, row limit, manual commit, idle close, error offsets, cancel, one run per tab, confirmation, read-only, `reconnect`, credential-store timeout, unfinished results, outputs of a closed tab |
-| Unit tests in `outputs.rs`, `load.rs`, `edit.rs`, `plan.rs`, `schema_diff.rs`, `related.rs`, `probe.rs`, `sessions.rs`, `testdata*.rs` | registry lifecycle and compare SQL, plan parsing, column mapping, script text, gates |
+| Unit tests in `outputs/`, `compare.rs`, `load.rs`, `edit.rs`, `plan.rs`, `schema_diff.rs`, `related.rs`, `probe.rs`, `sessions.rs`, `testdata*.rs` | registry lifecycle and compare SQL, plan parsing, column mapping, script text, gates |
 | `crates/app/tests/` (`load_result.rs`, `edit_result.rs`, `export_full.rs`, `plan.rs`, `jobs.rs`, `example_data.rs`) | the same paths through the app's API |
 | `crates/ai/tests/agent_e2e.rs` | AI and MCP runs through `run_and_wait`, the sandbox |
 | Connector live tests (`#[ignore]`, `DATABRAIN_*`) | real servers |
