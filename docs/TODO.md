@@ -14,7 +14,6 @@ Every finding of the review was fixed on 2026-11-13, with the never-read corpus 
 
 Left from the final review (2026-11-13):
 
-- Databricks raw strings `r'…'` end at the first `'` on the server but are read with backslash escapes by the splitter (only matters if the API ever runs several statements).
 - DuckDB `select e'\''; drop …`: the whole text classifies as a read while its pieces don't (sqlparser's DuckDB dialect has no E-strings); runs classify the pieces.
 - Functions with side effects still read as reads: Postgres `brin_summarize_new_values`, `brin_summarize_range`, `gin_clean_pending_list`, `pg_stat_reset_subscription_stats`, `pg_sync_replication_slots`, `pg_replication_origin_session_reset`; DuckDB `sqlite_attach`; Databricks `http_request`; ClickHouse `url()`, `remote()`, `mysql()`, `s3()` (its server applies read-only itself). `SELECT … FOR UPDATE` is a read (locks; Oracle doesn't refuse it in read-only mode).
 - Transaction tracking: a failing `COMMIT` (or `commit prepared`) on Postgres resets the count while the transaction stays open (statements are observed before they run). SQL Server could ask the server for `@@TRANCOUNT` instead of following text.

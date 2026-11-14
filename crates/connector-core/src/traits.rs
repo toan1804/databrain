@@ -142,6 +142,9 @@ pub struct SqlSyntax {
     /// server reads them so: elsewhere `E'a\'` is a name and a string that
     /// ends at `\'`.
     pub escape_strings: bool,
+    /// Raw strings `r'…'` / `R"…"`: no escapes, they end at the first
+    /// closing quote (Databricks / Spark SQL).
+    pub raw_strings: bool,
     /// `q'[…]'` strings with their own delimiter (Oracle; `[]`, `{}`, `()`,
     /// `<>` pair up, any other character closes itself).
     pub q_quotes: bool,
@@ -401,6 +404,7 @@ pub const STANDARD_SYNTAX: SqlSyntax = SqlSyntax {
     dollar: DollarQuotes::None,
     triple_quotes: false,
     escape_strings: false,
+    raw_strings: false,
     q_quotes: false,
     delimiter_directive: false,
     block_end: BlockEnd::None,
@@ -692,7 +696,7 @@ pub const DATABRICKS: SourceTraits = SourceTraits {
     catalog_noun: "catalog",
     cloud: true,
     formatter: "spark",
-    syntax: SqlSyntax { backslash_escapes: true, backslash_in_double_quotes: true, backtick: true, ..STANDARD_SYNTAX },
+    syntax: SqlSyntax { backslash_escapes: true, backslash_in_double_quotes: true, backtick: true, raw_strings: true, ..STANDARD_SYNTAX },
     load: Some(LoadTraits {
         types: TypeNames { decimal: "DECIMAL(38, 10)", binary: "BINARY", text: "STRING", ..STANDARD_TYPES },
         max_bytes: 16 * MB,

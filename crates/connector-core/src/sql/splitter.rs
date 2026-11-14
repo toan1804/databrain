@@ -57,6 +57,12 @@ pub(crate) fn skip_token(text: &str, i: usize, syntax: &SqlSyntax) -> Option<(us
             }
             _ => return None,
         },
+        // Databricks r'…' / R"…": raw, no escapes (the first closing quote ends it).
+        b'R' | b'r' if syntax.raw_strings && matches!(next, Some(b'\'' | b'"')) && !ident(i) => {
+            let q = b[i + 1];
+            let end = b[i + 2..].iter().position(|&x| x == q).map_or(n, |p| i + 2 + p + 1);
+            return Some((end, Skipped::Quoted));
+        }
         // Postgres/DuckDB E'…': backslashes escape inside.
         b'E' | b'e' if syntax.escape_strings && next == Some(b'\'') && !ident(i) => skip_quoted(b, i + 1, b'\'', true),
         // Oracle q'[…]' / nq'{…}': up to the closing delimiter and quote.
@@ -513,6 +519,17 @@ mod tests {
     #[test]
     fn split_cloud_dialects() {
         assert_eq!(sqls("select `a;b` from t; select 'x\\';y'", Databricks).len(), 2);
+        // Raw strings: no escapes, the first quote ends them, so what
+        // follows `r'C:\'` is another statement the classifier sees.
+        let v = sqls("select r'C:\\'; drop table t", Databricks);
+        assert_eq!(v, vec!["select r'C:\\'", "drop table t"], "{v:?}");
+        assert_eq!(sqls("select R\"a\\\"; select 2", Databricks).len(), 2);
+        assert_eq!(sqls("select r'a;b' as x; select 2", Databricks).len(), 2, "a ; in a raw string");
+        // Not a prefix: a name ending in r, and plain strings keep escapes.
+        assert_eq!(sqls("select colr'x\\';y' from t", Databricks).len(), 1);
+        assert_eq!(sqls("select 'x\\';y'", Databricks).len(), 1);
+        // Elsewhere r'…' is a name and a string with that engine's rules.
+        assert_eq!(sqls("select r'C:\\'; drop table t", Mysql).len(), 1);
         assert_eq!(sqls("select '''a;b''' # c;\n; select 2", Bigquery).len(), 2);
         let v = sqls("create procedure p() returns int language sql as $$ begin return 1; end $$; // c;\nselect 1", Snowflake);
         assert_eq!(v.len(), 2, "{v:?}");
