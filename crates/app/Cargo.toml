@@ -79,7 +79,7 @@ ts-rs = { version = "11.1", features = ["serde-json-impl", "no-serde-warnings"] 
 # Linux: build OpenSSL from source and link it statically, so the binary
 # does not depend on the distribution's libssl version.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59.0", features = ["Win32_System_Console", "Win32_System_SystemInformation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_System_SystemInformation", "Win32_Storage_FileSystem"] }
 
 # Memory figures for the results budget (sysmem.rs); already in Cargo.lock.
 [target.'cfg(target_os = "macos")'.dependencies]
