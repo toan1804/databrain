@@ -24,7 +24,7 @@ test.describe("explorer", () => {
     await openApp(
       page,
       backend({
-        schema_tables: [
+        schema_tables: { offline: null, stale: false, tables: [
           { table: "customers", columns: [{ name: "id", data_type: "integer", nullable: false, is_primary_key: true }], foreign_keys: [] },
           {
             table: "orders",
@@ -34,7 +34,7 @@ test.describe("explorer", () => {
             ],
             foreign_keys: [{ columns: ["customer_id"], ref_schema: "public", ref_table: "customers", ref_columns: ["id"] }],
           },
-        ],
+        ] },
       }),
     );
     await page.getByRole("treeitem").filter({ hasText: "Shop" }).first().click();
@@ -51,9 +51,22 @@ test.describe("explorer", () => {
     await page.getByRole("textbox", { name: "Filter tables" }).fill("cust");
     await expect(node("public.orders")).toHaveCount(0);
     await expect(node("public.customers")).toBeVisible();
-    await answer(page, "schema_tables", []);
+    // Offline: the cached tables, and a note saying why.
+    await page.getByRole("textbox", { name: "Filter tables" }).fill("");
+    await answer(page, "schema_tables", {
+      offline: "Connection refused by db.local:5432",
+      stale: true,
+      tables: [{ table: "customers", columns: [{ name: "id", data_type: "integer", nullable: false, is_primary_key: true }], foreign_keys: [] }],
+    });
+    await page.getByRole("button", { name: "Refresh" }).click();
+    await expect(page.getByRole("note")).toContainText("Offline");
+    await expect(page.getByRole("note")).toContainText("Connection refused by db.local:5432");
+    await expect(node("public.customers")).toBeVisible();
+    await expect(node("public.orders")).toHaveCount(0);
+    await answer(page, "schema_tables", { offline: null, stale: false, tables: [] });
     await page.getByRole("button", { name: "Refresh" }).click();
     await expect(page.getByText("This schema has no tables.")).toBeVisible();
+    await expect(page.getByRole("note")).toHaveCount(0);
   });
 
   test("an unreachable schema shows the error", async ({ page }) => {

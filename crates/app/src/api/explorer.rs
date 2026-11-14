@@ -149,10 +149,14 @@ pub struct SchemaRefresh {
 /// Bring one schema's listing up to date, table by table when the engine
 /// has object versions and the schema was listed before; otherwise list it.
 pub async fn refresh_schema(state: &AppState, id: &str, schema: &str) -> Result<SchemaRefresh> {
-    refresh_schema_at(state, id, schema, None).await
+    refresh_schema_at(state, id, schema, None, true).await
 }
 
-async fn refresh_schema_at(state: &AppState, id: &str, schema: &str, fingerprint: Option<&str>) -> Result<SchemaRefresh> {
+/// `fingerprint`: the schema's new one, when revalidation found it moved.
+/// `asked`: the user's Refresh. Either re-lists a schema whose objects
+/// didn't change, for its row estimates (in the fingerprint, not in
+/// object versions).
+async fn refresh_schema_at(state: &AppState, id: &str, schema: &str, fingerprint: Option<&str>, asked: bool) -> Result<SchemaRefresh> {
     // Compare against the listings saved so far, not ones still queued.
     state.meta.flush().await;
     let ws = state.engine.workspace();
@@ -191,10 +195,18 @@ async fn refresh_schema_at(state: &AppState, id: &str, schema: &str, fingerprint
     touched.dedup();
     let changed = touched.len().saturating_sub(added);
     if touched.is_empty() && removed.is_empty() {
-        if let Some(fp) = fingerprint {
-            ws.meta_set_listed_fp(id, schema, fp)?;
+        if fingerprint.is_none() && !asked {
+            return Ok(SchemaRefresh { schema: schema.into(), mode: RefreshMode::Unchanged, added: 0, changed: 0, removed: 0, objects: listed.objects });
         }
-        return Ok(SchemaRefresh { schema: schema.into(), mode: RefreshMode::Unchanged, added: 0, changed: 0, removed: 0, objects: listed.objects });
+        // No definition changed, but the fingerprint moved (row estimates
+        // count there) or the user asked: one listing reads the estimates.
+        // Same versions, so no table's columns become stale.
+        // Refresh reports no change of definitions (its objects carry the
+        // new estimates); revalidation a listing, so the explorer takes them.
+        let objs = state.engine.list_objects(id, schema).await?;
+        ws.meta_put_listing(id, schema, &objs, Some(&new), fingerprint)?;
+        let mode = if asked { RefreshMode::Unchanged } else { RefreshMode::Full };
+        return Ok(SchemaRefresh { schema: schema.into(), mode, added: 0, changed: 0, removed: 0, objects: objs });
     }
     if touched.len() as f64 > (new.len().max(1) as f64) * FULL_RELIST_SHARE && touched.len() > 20 {
         let objs = state.engine.list_objects(id, schema).await?;
@@ -281,7 +293,7 @@ pub async fn revalidate_explorer(state: &AppState, id: &str, open: &[String], fo
             out.deferred.push(schema);
             continue;
         }
-        match refresh_schema_at(state, id, &schema, fp.as_deref()).await {
+        match refresh_schema_at(state, id, &schema, fp.as_deref(), false).await {
             Ok(r) => out.refreshed.push(r),
             // E.g. dropped meanwhile: the schema list refresh removes it.
             Err(_) => out.deferred.push(schema),
@@ -372,11 +384,37 @@ pub async fn describe(state: &AppState, id: &str, schema: &str, name: &str) -> R
     Ok(d)
 }
 
-/// Every table of a schema with its columns and foreign keys (ER diagram).
-pub async fn schema_tables(state: &AppState, id: &str, schema: &str) -> Result<Vec<databrain_connector_core::TableColumns>> {
-    let mut tables = state.engine.schema_columns(id, schema).await?;
-    tables.sort_by(|a, b| a.table.cmp(&b.table));
-    Ok(tables)
+/// A schema's tables for the ER diagram, and where they came from.
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct SchemaTables {
+    pub tables: Vec<databrain_connector_core::TableColumns>,
+    /// Why the server couldn't be read, when the tables are the explorer
+    /// cache's (offline): what DataBrain has seen of the schema.
+    pub offline: Option<String>,
+    /// Cached tables that may have changed since they were read.
+    pub stale: bool,
+}
+
+/// Every table of a schema with its columns and foreign keys (ER diagram):
+/// read live and kept in the explorer cache; when the server can't be
+/// read, the cached tables (and why), so the diagram works offline.
+pub async fn schema_tables(state: &AppState, id: &str, schema: &str) -> Result<SchemaTables> {
+    match state.engine.schema_columns(id, schema).await {
+        Ok(mut tables) => {
+            tables.sort_by(|a, b| a.table.cmp(&b.table));
+            let (ws, id2, s2, t2) = (state.workspace.clone(), id.to_string(), schema.to_string(), tables.clone());
+            state.meta.push_blocking(move || drop(ws.meta_put_schema_tables(&id2, &s2, &t2)));
+            Ok(SchemaTables { tables, offline: None, stale: false })
+        }
+        Err(e) => {
+            let (tables, stale) = state.workspace.meta_schema_tables(id, schema)?;
+            if tables.is_empty() {
+                return Err(e);
+            }
+            Ok(SchemaTables { tables, offline: Some(e.message), stale })
+        }
+    }
 }
 
 pub async fn table_layout(state: &AppState, id: &str, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {

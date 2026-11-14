@@ -123,7 +123,7 @@ impl PgSession {
             })
             .collect();
         let fks = self.foreign_keys_in(&names, None).await?;
-        Ok(databrain_connector_core::assemble_metadata(schemas, objects, columns, fks))
+        Ok(databrain_connector_core::assemble_metadata(schemas, objects, columns, Some(fks)))
     }
 
     /// Foreign keys of the tables of several schemas: (schema, table, key).

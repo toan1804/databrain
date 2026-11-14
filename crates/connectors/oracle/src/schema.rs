@@ -111,7 +111,7 @@ impl OracleSession {
                 last = Some(key);
             }
         }
-        Ok(databrain_connector_core::assemble_metadata(schemas, objects, columns, fks))
+        Ok(databrain_connector_core::assemble_metadata(schemas, objects, columns, Some(fks)))
     }
 
     pub(crate) async fn columns(&self, owner: &str, table: Option<&str>) -> Result<Vec<(String, ColumnInfo)>> {

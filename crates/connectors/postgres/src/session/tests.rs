@@ -185,8 +185,18 @@ async fn live_explorer_versions() {
     assert_ne!(v1["table:t2"], v2["table:t2"], "new column");
     assert_ne!(v1["table:t1"], v2["table:t1"], "comment");
     assert_eq!(v1["view:v1"], v2["view:v1"], "untouched");
+    let f2 = s.explorer_fingerprints().await.unwrap().unwrap();
     run("insert into ex_a.t2 values (1, 'a'); analyze ex_a.t2").await;
     assert_eq!(v2, s.object_versions("ex_a").await.unwrap().unwrap(), "data changes are not definition changes");
+    // Row estimates count by power of two: 0 → 1 row changes the
+    // schema's fingerprint (its estimates are read again), 1100 → 1200 doesn't.
+    let f3 = s.explorer_fingerprints().await.unwrap().unwrap();
+    assert_ne!(fp(&f2, "ex_a"), fp(&f3, "ex_a"), "estimate doubled");
+    run("insert into ex_a.t2 select g, 'x' from generate_series(2, 1100) g; analyze ex_a.t2").await;
+    let f4 = s.explorer_fingerprints().await.unwrap().unwrap();
+    run("insert into ex_a.t2 select g, 'x' from generate_series(1101, 1200) g; analyze ex_a.t2").await;
+    assert_eq!(fp(&f4, "ex_a"), fp(&s.explorer_fingerprints().await.unwrap().unwrap(), "ex_a"), "a 10% change keeps it");
+    assert_eq!(fp(&f3, "ex_b"), fp(&f4, "ex_b"), "other schemas untouched");
 
     let named = s.list_objects_named("ex_a", &["t2".into(), "f".into()]).await.unwrap();
     let mut n: Vec<String> = named.iter().map(|o| databrain_connector_core::version_key(o.kind, &o.name)).collect();

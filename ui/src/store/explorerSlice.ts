@@ -85,6 +85,11 @@ export interface ExplorerSlice {
    * shown without a Refresh click. Calls within a moment are merged.
    */
   schemaChanged: (connId: string, schemaList?: boolean) => void;
+  /**
+   * Forget the connection's cached schemas, tables and columns (asks first)
+   * and read them again from the server. `false` when the user said no.
+   */
+  clearExplorerCache: (connId: string) => Promise<boolean>;
 }
 
 /** Schemas of `connId` the tree shows expanded. */
@@ -125,7 +130,46 @@ const ddlTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; schema
 /** How long DDL rechecks wait for more statements of the same script. */
 export const DDL_RECHECK_MS = 400;
 
+/** `record` without the keys of `connId` (`connId` itself or `connId|…`). */
+function withoutConn<T>(record: Record<string, T>, connId: string): Record<string, T> {
+  return Object.fromEntries(Object.entries(record).filter(([k]) => k !== connId && !k.startsWith(`${connId}|`)));
+}
+
 export const createExplorerSlice: StateCreator<State, [], [], ExplorerSlice> = (set, get) => ({
+  clearExplorerCache: (connId) =>
+    new Promise<boolean>((resolve) => {
+      const conn = get().connections.find((c) => c.id === connId);
+      if (!conn) return resolve(false);
+      get().askConfirm({
+        title: `Clear cached metadata of "${conn.name}"?`,
+        reasons: [
+          "Forgets the schemas, tables, columns and keys DataBrain keeps for this connection, and reads them again from the server.",
+          "Until a schema is read again, the AI can't use its tables (what it may use stays chosen). Notes and AI knowledge choices are kept.",
+        ],
+        confirmLabel: "Clear and reload",
+        onCancel: () => resolve(false),
+        onConfirm: async () => {
+          try {
+            await api.clearExplorerCache(connId);
+          } catch (e) {
+            get().toast(toError(e).message, "error");
+            return resolve(false);
+          }
+          set((s) => ({
+            schemas: withoutConn(s.schemas, connId),
+            objects: withoutConn(s.objects, connId),
+            columns: withoutConn(s.columns, connId),
+            catalogs: withoutConn(s.catalogs, connId),
+            catalogSchemas: withoutConn(s.catalogSchemas, connId),
+            explorer: withoutConn(s.explorer, connId),
+          }));
+          resolve(true);
+          await get()
+            .openExplorer(connId, true)
+            .catch((e) => get().toast(`${conn.name}: ${toError(e).message}`, "error"));
+        },
+      });
+    }),
   schemas: {},
   objects: {},
   columns: {},

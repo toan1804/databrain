@@ -59,7 +59,7 @@ impl ToolContext {
         let notes: Vec<String> = ws
             .kn_notes(&target.id)?
             .into_iter()
-            .filter(|n| n.status == NoteStatus::Approved && n.target.as_deref().is_some_and(|x| databrain_workspace::target_mentions(x, &full, &o.name)))
+            .filter(|n| n.status == NoteStatus::Approved && n.target.as_deref().is_some_and(|x| databrain_workspace::target_mentions(x, &o.schema, &o.name)))
             .filter(|n| tables.note_visible(n.target.as_deref()))
             .map(|n| match n.target.as_deref() {
                 Some(t) if !t.eq_ignore_ascii_case(&full) => format!("{t}: {}", n.body),

@@ -3,6 +3,7 @@ use crate::migrations::MIGRATIONS;
 use databrain_auth::AuthMethod;
 use databrain_connector_core::ConnectionConfig;
 use databrain_connector_core::ConnectorKind;
+use databrain_connector_core::{DbObject, ObjectKind};
 use rusqlite::params;
 
 fn profile(name: &str) -> ConnectionProfile {
@@ -169,7 +170,13 @@ fn schema_version_guard_and_backup() {
             )
             .unwrap();
         }
-        c.execute("INSERT INTO kn_state (connection_id, indexed_at, objects, schemas_json, error) VALUES ('c', 1, 2, '[\"s\"]', NULL)", []).unwrap();
+        // `bad`'s read failed in the last run (nothing kept); `empty` was read: no tables, its fingerprint.
+        c.execute(
+            "INSERT INTO kn_state (connection_id, indexed_at, objects, schemas_json, error) VALUES ('c', 1, 2, '[\"s\", \"bad\", \"empty\"]', 'bad: permission denied')",
+            [],
+        )
+        .unwrap();
+        c.execute("INSERT INTO kn_schema_state (connection_id, schema_name, fingerprint, indexed_at) VALUES ('c', 'empty', 'f', 1)", []).unwrap();
         c.execute("INSERT INTO meta_objects (connection_id, schema_name, name, kind, seen_at) VALUES ('c', 'hr', 'salaries', 'table', 1)", []).unwrap();
     }
     let ws = Workspace::open(&path).unwrap();
@@ -181,6 +188,9 @@ fn schema_version_guard_and_backup() {
     assert_eq!(ai.search("orders", 5).unwrap().len(), 1);
     assert_eq!(ai.objects().unwrap().into_iter().map(|o| o.full_name()).collect::<Vec<_>>(), vec!["hr.teams", "s.orders"]);
     assert!(ws.ai_scope("c").unwrap().iter().all(|r| r.schema != "*"));
+    let rules: Vec<String> = ws.ai_scope("c").unwrap().into_iter().filter(|r| r.table.is_empty()).map(|r| r.schema).collect();
+    assert!(rules.contains(&"s".to_string()) && rules.contains(&"empty".to_string()), "{rules:?}");
+    assert!(!rules.contains(&"bad".to_string()), "a schema whose read failed gets no rule: {rules:?}");
     let backup = dir.join(format!("workspace.db.bak-before-v{}", MIGRATIONS.len()));
     let b = Connection::open(&backup).unwrap();
     let bv: i64 = b.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
@@ -416,4 +426,77 @@ fn approving_an_update_replaces_the_note() {
     let notes = ws.kn_notes(&a.id).unwrap();
     assert_eq!(notes.len(), 1);
     assert!(notes[0].body.contains("archived") && notes[0].replaces.is_none());
+}
+
+/// Clearing the explorer cache or the index is all or nothing: a failure
+/// halfway leaves everything as it was.
+#[test]
+fn clears_are_one_transaction_each() {
+    let ws = Workspace::open_in_memory().unwrap();
+    let obj = DbObject { schema: "s".into(), name: "orders".into(), kind: ObjectKind::Table, comment: None, row_estimate: None };
+    ws.meta_put_schema("c", "s", std::slice::from_ref(&obj)).unwrap();
+    // The last statement of each clear fails (its table is gone).
+    ws.conn.lock().execute_batch("DROP TABLE meta_conn_state").unwrap();
+    assert!(ws.meta_clear("c").is_err());
+    assert_eq!(ws.meta_count("c").unwrap(), 1, "nothing was cleared");
+
+    let kn =
+        KnObject { schema: "s".into(), name: "orders".into(), kind: "table".into(), comment: None, row_estimate: None, columns: vec![], foreign_keys: vec![] };
+    ws.kn_replace_schema("c", "s", &[kn]).unwrap();
+    let count = |ws: &Workspace| ws.conn.lock().query_row("SELECT count(*) FROM kn_objects WHERE connection_id = 'c'", [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(count(&ws), 1);
+    ws.conn.lock().execute_batch("DROP TABLE kn_schema_state").unwrap();
+    assert!(ws.kn_clear("c").is_err());
+    assert_eq!(count(&ws), 1, "nothing was cleared");
+}
+
+/// Several processes opening (and so upgrading) one workspace at once
+/// (the app and databrain-mcp) apply each migration once: every open
+/// succeeds, none fails with "table already exists".
+#[test]
+fn concurrent_opens_migrate_once() {
+    let dir = std::env::temp_dir().join(format!("dbtest-ws-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("workspace.db");
+    let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let opens: Vec<_> = (0..8)
+        .map(|_| {
+            let (path, start) = (path.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                Workspace::open(&path).map(drop).map_err(|e| e.to_string())
+            })
+        })
+        .collect();
+    for o in opens {
+        assert_eq!(o.join().unwrap(), Ok(()));
+    }
+    let v: i64 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(v as usize, MIGRATIONS.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scope rules match names as the database does: on Postgres `sales` and
+/// `"Sales"` are two schemas (allowing one doesn't allow the other); on
+/// SQL Server they are one.
+#[test]
+fn scope_rules_match_names_as_the_database_does() {
+    let ws = Workspace::open_in_memory().unwrap();
+    let pg = ws.save_connection(profile("pg")).unwrap();
+    let mut ms = profile("ms");
+    ms.config.kind = ConnectorKind::Mssql;
+    let ms = ws.save_connection(ms).unwrap();
+    let t = |schema: &str, name: &str| DbObject { schema: schema.into(), name: name.into(), kind: ObjectKind::Table, comment: None, row_estimate: None };
+    for c in [&pg.id, &ms.id] {
+        ws.meta_put_schema(c, "sales", &[t("sales", "orders")]).unwrap();
+        ws.meta_put_schema(c, "Sales", &[t("Sales", "secrets")]).unwrap();
+        ws.ai_put_rule(c, &ScopeRule { schema: "sales".into(), table: String::new(), allow: true }).unwrap();
+    }
+    let names = |c: &str| ws.ai_catalog(c).objects().unwrap().into_iter().map(|o| o.full_name()).collect::<Vec<_>>();
+    assert_eq!(names(&pg.id), vec!["sales.orders"], "Postgres: \"Sales\" is another schema");
+    assert_eq!(names(&ms.id), vec!["Sales.secrets", "sales.orders"], "SQL Server: one schema");
+    // Excluding works the same way.
+    ws.ai_put_rule(&pg.id, &ScopeRule { schema: "Sales".into(), table: String::new(), allow: false }).unwrap();
+    assert!(ws.ai_excluded(&pg.id, "Sales", "secrets").unwrap());
+    assert!(!ws.ai_excluded(&pg.id, "sales", "orders").unwrap());
 }

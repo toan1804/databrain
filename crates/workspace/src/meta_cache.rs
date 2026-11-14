@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use databrain_connector_core::{CatalogInfo, ColumnInfo, ConnectionConfig, DbObject, ForeignKey, ObjectKind, SchemaInfo, version_key};
+use databrain_connector_core::{CatalogInfo, ColumnInfo, ConnectionConfig, DbObject, ForeignKey, ObjectKind, SchemaInfo, TableColumns, version_key};
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
@@ -487,26 +487,34 @@ impl Workspace {
     }
 
     /// Clear the cache when the connection now points at another server/user,
-    /// and the AI's index of its objects with it (they describe the old
-    /// server; notes and learned joins are the user's and stay).
-    pub fn meta_check_identity(&self, connection_id: &str, cfg: &ConnectionConfig) -> Result<()> {
+    /// the AI's index of its objects, and what the AI may use there (its
+    /// scope): rules chosen for the old server's schemas would otherwise
+    /// allow same-named schemas of the new one, which the user never chose.
+    /// Notes and learned joins are the user's and stay. One transaction.
+    /// Whether anything was cleared.
+    pub fn meta_check_identity(&self, connection_id: &str, cfg: &ConnectionConfig) -> Result<bool> {
         let id = identity(cfg);
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
         let old: Option<Option<String>> =
-            self.conn.lock().query_row("SELECT identity FROM meta_conn_state WHERE connection_id = ?1", [connection_id], |r| r.get(0)).optional()?;
-        match old.flatten() {
-            Some(o) if o == id => return Ok(()),
+            tx.query_row("SELECT identity FROM meta_conn_state WHERE connection_id = ?1", [connection_id], |r| r.get(0)).optional()?;
+        let moved = match old.flatten() {
+            Some(o) if o == id => return Ok(false),
             // Cached before identities were recorded: assume it is the same server.
-            None => {}
+            None => false,
             Some(_) => {
-                self.meta_clear(connection_id)?;
-                self.kn_clear(connection_id)?;
+                Self::meta_clear_tx(&tx, connection_id)?;
+                Self::kn_clear_tx(&tx, connection_id)?;
+                tx.execute("DELETE FROM ai_scope WHERE connection_id = ?1", [connection_id])?;
+                true
             }
-        }
-        self.conn.lock().execute(
+        };
+        tx.execute(
             "INSERT INTO meta_conn_state (connection_id, identity) VALUES (?1, ?2) ON CONFLICT (connection_id) DO UPDATE SET identity = excluded.identity",
             params![connection_id, id],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(moved)
     }
 
     /// Columns of a table (from a describe).
@@ -530,6 +538,57 @@ impl Workspace {
         Self::ai_refresh_table_tx(&tx, connection_id, schema, table)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Every table of a schema as read from the server (the ER diagram), in
+    /// one transaction. An empty foreign key list keeps the keys cached
+    /// before: a bulk read may leave them out.
+    pub fn meta_put_schema_tables(&self, connection_id: &str, schema: &str, tables: &[TableColumns]) -> Result<()> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let now = now_ms();
+        for t in tables {
+            let fks = (!t.foreign_keys.is_empty()).then(|| serde_json::to_string(&t.foreign_keys).unwrap_or_else(|_| "[]".into()));
+            tx.execute(
+                "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, seen_at = excluded.seen_at, \
+                 fks_json = coalesce(excluded.fks_json, meta_columns.fks_json), stale = 0",
+                params![connection_id, schema, t.table, serde_json::to_string(&t.columns).unwrap_or_else(|_| "[]".into()), now, fks],
+            )?;
+            Self::ai_refresh_table_tx(&tx, connection_id, schema, &t.table)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every table of `schema` whose columns are cached, by name, with its
+    /// foreign keys when known (the ER diagram offline), and whether any
+    /// of them may be out of date.
+    pub fn meta_schema_tables(&self, connection_id: &str, schema: &str) -> Result<(Vec<TableColumns>, bool)> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(&format!(
+            "SELECT m.table_name, m.columns_json, m.fks_json, {STALE_SQL} FROM meta_columns m \
+             WHERE m.connection_id = ?1 AND m.schema_name = ?2 ORDER BY m.table_name"
+        ))?;
+        let mut stale = false;
+        let rows = st
+            .query_map(params![connection_id, schema, 0, now_ms() - UNLISTED_COLUMNS_TTL_MS], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, bool>(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let tables = rows
+            .into_iter()
+            .map(|(table, cols, fks, s)| {
+                stale |= s;
+                TableColumns {
+                    table,
+                    columns: serde_json::from_str(&cols).unwrap_or_default(),
+                    foreign_keys: fks.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default(),
+                }
+            })
+            .filter(|t| !t.columns.is_empty())
+            .collect();
+        Ok((tables, stale))
     }
 
     /// A table as DataBrain knows it without asking the server (exact schema
@@ -619,11 +678,8 @@ impl Workspace {
     /// `schema.name` or bare `name` (case-insensitive; the schema may be the
     /// last part of a `catalog.schema` id). Returns (schema, name).
     pub fn meta_get(&self, connection_id: &str, reference: &str) -> Result<Option<(String, String)>> {
-        let (schema, name) = match reference.rsplit_once('.') {
-            Some((s, n)) => (Some(s.replace(['"', '`', '[', ']'], "")), n),
-            None => (None, reference),
-        };
-        let name = name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
+        // The last name is the table (a quoted one may contain dots).
+        let (schema, name) = crate::paths::split_reference(reference);
         Ok(self
             .conn
             .lock()
@@ -636,6 +692,23 @@ impl Workspace {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
+    }
+
+    /// Every cached table/view `reference` may mean (as [`Self::meta_get`]
+    /// reads it), shortest schema first: a bare name can be in several
+    /// schemas, and the caller picks one it may use.
+    pub fn meta_find_named(&self, connection_id: &str, reference: &str) -> Result<Vec<(String, String)>> {
+        // The last name is the table (a quoted one may contain dots).
+        let (schema, name) = crate::paths::split_reference(reference);
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT DISTINCT schema_name, name FROM meta_objects \
+             WHERE connection_id = ?1 AND lower(name) = lower(?2) AND kind NOT IN ('function', 'procedure', 'package', 'sequence', 'other') \
+               AND (?3 IS NULL OR lower(schema_name) = lower(?3) OR lower(schema_name) LIKE '%.' || lower(?3)) \
+             ORDER BY length(schema_name), schema_name",
+        )?;
+        let rows = st.query_map(params![connection_id, name, schema], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// A cached object of `schema` named `name` (any case): tables and views
@@ -658,13 +731,15 @@ impl Workspace {
     /// `Ok(None)` when the table, or a column that was asked for, is not
     /// cached (columns are cached only for tables that were opened).
     pub fn meta_resolve_path(&self, connection_id: &str, path: &str) -> Result<Option<String>> {
+        use crate::paths::{path_parts, path_text, table_path};
         if let Some((s, n)) = self.meta_get(connection_id, path)? {
-            return Ok(Some(format!("{s}.{n}")));
+            return Ok(Some(table_path(&s, &n, None)));
         }
-        let Some((table, col)) = path.rsplit_once('.') else { return Ok(None) };
-        let Some((s, n)) = self.meta_get(connection_id, table)? else { return Ok(None) };
+        let mut parts = path_parts(path);
+        let Some(col) = parts.pop().filter(|_| !parts.is_empty()) else { return Ok(None) };
+        let Some((s, n)) = self.meta_get(connection_id, &path_text(&parts))? else { return Ok(None) };
         let cols = self.meta_column_names(connection_id, &s, &n)?.unwrap_or_default();
-        Ok(cols.into_iter().find(|c| c.eq_ignore_ascii_case(col)).map(|c| format!("{s}.{n}.{c}")))
+        Ok(cols.into_iter().find(|c| c.eq_ignore_ascii_case(&col)).map(|c| table_path(&s, &n, Some(&c))))
     }
 
     /// Cached functions/procedures/packages whose name contains `query`, in
@@ -699,14 +774,23 @@ impl Workspace {
     }
 
     pub fn meta_clear(&self, connection_id: &str) -> Result<()> {
-        let c = self.conn.lock();
-        c.execute("DELETE FROM meta_objects WHERE connection_id = ?1", [connection_id])?;
-        c.execute("DELETE FROM meta_columns WHERE connection_id = ?1", [connection_id])?;
-        c.execute("DELETE FROM meta_schemas WHERE connection_id = ?1", [connection_id])?;
-        c.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [connection_id])?;
-        c.execute("UPDATE meta_conn_state SET catalogs_at = NULL, schemas_at = NULL, checked_at = NULL WHERE connection_id = ?1", [connection_id])?;
+        // One transaction: all of it goes, or none (an error halfway left
+        // the AI's tables pointing at a cache that was gone).
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        Self::meta_clear_tx(&tx, connection_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn meta_clear_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str) -> Result<()> {
+        tx.execute("DELETE FROM meta_objects WHERE connection_id = ?1", [connection_id])?;
+        tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1", [connection_id])?;
+        tx.execute("DELETE FROM meta_schemas WHERE connection_id = ?1", [connection_id])?;
+        tx.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [connection_id])?;
+        tx.execute("UPDATE meta_conn_state SET catalogs_at = NULL, schemas_at = NULL, checked_at = NULL WHERE connection_id = ?1", [connection_id])?;
         // The tables the AI could use are gone with them (its scope stays).
-        Self::ai_forget_tx(&c, connection_id)?;
+        Self::ai_forget_tx(tx, connection_id)?;
         Ok(())
     }
 }
@@ -717,6 +801,51 @@ mod tests {
 
     fn o(schema: &str, name: &str, kind: ObjectKind) -> DbObject {
         DbObject { schema: schema.into(), name: name.into(), kind, comment: None, row_estimate: None }
+    }
+
+    /// A table whose name contains a dot is found by its quoted path, and
+    /// paths come back quoted (a note target reads back the same table).
+    #[test]
+    fn dotted_table_names_resolve_when_quoted() {
+        let ws = Workspace::open_in_memory().unwrap();
+        ws.meta_put_schema("c", "sales", &[o("sales", "orders.2024", ObjectKind::Table), o("sales", "orders", ObjectKind::Table)]).unwrap();
+        let cols = vec![ColumnInfo { name: "amount".into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None }];
+        ws.meta_put_columns("c", "sales", "orders.2024", &cols).unwrap();
+        assert_eq!(ws.meta_get("c", r#"sales."orders.2024""#).unwrap(), Some(("sales".into(), "orders.2024".into())));
+        assert_eq!(ws.meta_get("c", r#""orders.2024""#).unwrap(), Some(("sales".into(), "orders.2024".into())), "bare, quoted");
+        assert_eq!(ws.meta_resolve_path("c", r#"sales."orders.2024""#).unwrap().as_deref(), Some(r#"sales."orders.2024""#));
+        assert_eq!(ws.meta_resolve_path("c", r#"sales."orders.2024".AMOUNT"#).unwrap().as_deref(), Some(r#"sales."orders.2024".amount"#));
+        // Unquoted, the dots are levels: table `2024` of schema `sales.orders`.
+        assert_eq!(ws.meta_get("c", "sales.orders.2024").unwrap(), None);
+        assert_eq!(ws.meta_find_named("c", r#"sales."orders.2024""#).unwrap(), vec![("sales".to_string(), "orders.2024".to_string())]);
+        // Plain names as before.
+        assert_eq!(ws.meta_resolve_path("c", "sales.orders").unwrap().as_deref(), Some("sales.orders"));
+    }
+
+    /// The ER diagram's tables: saved from a live read, read back offline;
+    /// an empty key list keeps the keys known before.
+    #[test]
+    fn schema_tables_round_trip_and_keep_known_keys() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let col = |n: &str| ColumnInfo { name: n.into(), data_type: "int".into(), nullable: false, is_primary_key: n == "id", default: None, comment: None };
+        let fk = ForeignKey { columns: vec!["customer_id".into()], ref_schema: "s".into(), ref_table: "customers".into(), ref_columns: vec!["id".into()] };
+        let t = |name: &str, cols: &[&str], fks: Vec<ForeignKey>| TableColumns {
+            table: name.into(),
+            columns: cols.iter().map(|c| col(c)).collect(),
+            foreign_keys: fks,
+        };
+        assert_eq!(ws.meta_schema_tables("c", "s").unwrap(), (vec![], false), "nothing cached");
+        ws.meta_put_schema_tables("c", "s", &[t("orders", &["id", "customer_id"], vec![fk.clone()]), t("customers", &["id"], vec![])]).unwrap();
+        let (tables, _) = ws.meta_schema_tables("c", "s").unwrap();
+        assert_eq!(tables, vec![t("customers", &["id"], vec![]), t("orders", &["id", "customer_id"], vec![fk.clone()])]);
+        assert!(ws.meta_schema_tables("c", "other").unwrap().0.is_empty() && ws.meta_schema_tables("d", "s").unwrap().0.is_empty());
+        // A later read without keys (a bulk read) keeps them; new columns replace the old.
+        ws.meta_put_schema_tables("c", "s", &[t("orders", &["id", "customer_id", "total"], vec![])]).unwrap();
+        let (tables, _) = ws.meta_schema_tables("c", "s").unwrap();
+        assert_eq!(tables[1], t("orders", &["id", "customer_id", "total"], vec![fk]));
+        // What a describe cached is there too.
+        ws.meta_put_columns("c", "s", "items", &[col("id")]).unwrap();
+        assert_eq!(ws.meta_schema_tables("c", "s").unwrap().0.iter().map(|t| t.table.as_str()).collect::<Vec<_>>(), vec!["customers", "items", "orders"]);
     }
 
     #[test]
@@ -942,16 +1071,24 @@ mod tests {
         ws.kn_save_note(note).unwrap();
         ws.meta_put_schemas("c", None, &[sch("s", None)]).unwrap();
         ws.meta_put_schema("c", "s", &[o("s", "t", ObjectKind::Table)]).unwrap();
+        ws.ai_put_rule("c", &crate::ScopeRule { schema: "s".into(), table: String::new(), allow: true }).unwrap();
         cfg.read_only = true;
-        ws.meta_check_identity("c", &cfg).unwrap();
+        assert!(!ws.meta_check_identity("c", &cfg).unwrap(), "nothing cleared");
         assert!(ws.meta_listing("c", "s").unwrap().is_some(), "same server");
         cfg.options.insert("connect_timeout_secs".into(), "90".into());
         cfg.options.insert("idle_disconnect_minutes".into(), "0".into());
         ws.meta_check_identity("c", &cfg).unwrap();
         assert!(ws.meta_listing("c", "s").unwrap().is_some(), "session settings don't change the server");
         assert_eq!(ws.kn_count("c").unwrap(), 1, "the index stays for the same server");
+        assert!(!ws.ai_scope("c").unwrap().is_empty(), "and what the AI may use");
         cfg.host = Some("db2".into());
-        ws.meta_check_identity("c", &cfg).unwrap();
+        assert!(ws.meta_check_identity("c", &cfg).unwrap(), "cleared");
+        // What the AI may use was chosen for the old server's schemas: a
+        // same-named schema on the new one isn't allowed by it.
+        assert!(ws.ai_scope("c").unwrap().is_empty());
+        ws.meta_put_schema("c", "s", &[o("s", "t", ObjectKind::Table)]).unwrap();
+        assert!(ws.ai_catalog("c").objects().unwrap().is_empty(), "the new server's s.t isn't allowed");
+        ws.meta_clear("c").unwrap();
         assert!(ws.meta_listing("c", "s").unwrap().is_none());
         assert!(ws.meta_schemas("c", None).unwrap().is_none());
         assert_eq!(ws.meta_count("c").unwrap(), 0);

@@ -343,8 +343,10 @@ mod tests {
                 ("a".into(), "t".into(), col("name")),
                 ("b".into(), "u".into(), col("a_id")),
             ],
-            vec![("b".into(), "u".into(), fk.clone()), ("b".into(), "missing".into(), fk.clone())],
+            Some(vec![("b".into(), "u".into(), fk.clone()), ("b".into(), "missing".into(), fk.clone())]),
         );
+        assert!(m.iter().all(|s| s.foreign_keys_read));
+        assert!(assemble_metadata(&["a".into()], vec![], vec![], None).iter().all(|s| !s.foreign_keys_read), "keys not read");
         assert_eq!(m.iter().map(|s| s.schema.as_str()).collect::<Vec<_>>(), vec!["a", "b", "empty"]);
         assert_eq!(
             m[0].columns[0].columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),

@@ -8,24 +8,6 @@ Found in reviews and left for a later release on purpose. Each says what goes wr
 - If an MCP client kills `databrain-mcp.exe` without closing its stdin, the child `databrain.exe mcp` may keep running (no job object ties them).
 - `databrain-jobs run` / `list` output in a terminal goes through the GUI-subsystem launcher's console attach; check it prints in cmd and PowerShell.
 
-## Explorer and AI index (left from the review of 2026-11-12)
-
-- PostgreSQL row estimates are refreshed only when the schema changes: the explorer fingerprint leaves out `reltuples`, and since index runs use the same fingerprint (2026-11-13) they skip such schemas too, so the AI's row estimates go stale as well.
-- The ER diagram (`schema_tables`) is always read live and doesn't work offline.
-- `clear_explorer_cache` is a command the UI never calls.
-
-Left from the final review of the metadata store (2026-11-13):
-
-- A table's search text includes the names of the tables its foreign keys point at, so searching for a table outside the scope ranks allowed tables that reference it (the keys themselves are scrubbed).
-- Scope rules match names ignoring case: on Postgres, allowing `sales` also allows `"Sales"`.
-- The scope survives pointing a connection at another server (`meta_check_identity` keeps the rules): schemas allowed on the old server are allowed on the new one once browsed. Decide whether a server change should clear it.
-- `meta_clear` and `kn_clear` are not one transaction each. The v20 migration gives a schema whose last index run failed a rule too.
-- `user_version` is read outside the migration transaction: two processes upgrading at once (the app and `databrain-mcp`) can make one fail with "table already exists" (it opens on the next try).
-- An index run's empty foreign key list never clears keys cached before (bulk metadata often has none): keys dropped on the server stay in the ER diagram and the AI's joins until the table is described again.
-- An AI note's target is stored as `schema.table` unquoted: a name with `.`, a space, `&` or `,` reads back differently.
-- `index_tables` answers "not available" for connection, sign-in and permission errors too (one answer for missing and refused tables), which hides why a read failed.
-- The pre-check in `index_tables` and `describe_named` resolve a bare name with the explorer cache, not the AI's scope; the check after the describe is what decides.
-
 ## Connector core (review of 2026-11-12; see [CONNECTOR_CORE.md](CONNECTOR_CORE.md))
 
 Every finding of the review was fixed on 2026-11-13, with the never-read corpus and the whole-vs-pieces property (`crates/connector-core/tests/classify_corpus.rs`), tri-state `Session::transaction_state` with the unused `Capabilities` fields removed, keyword and positional secrets in redaction, and one scanner for strings and comments (`skip_token`). A `Session::supports(Feature)` enum wasn't added: the optional features already say "not supported" through their own return values (`object_versions` → `None`, `check_sql` → `false`). The redaction functions keep their own, dialect-free lexing on purpose: they scrub any text (history, logs, error messages) without knowing its database.

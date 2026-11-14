@@ -18,6 +18,7 @@ mod migrations;
 pub mod notebooks;
 pub mod outputs;
 pub mod params;
+pub mod paths;
 mod session_role;
 mod tabs_settings;
 #[cfg(test)]
@@ -37,6 +38,7 @@ pub use meta_cache::{CachedColumns, CachedListing, CachedTable, ExplorerCacheSta
 pub use notebooks::{CellKind, CellRunSummary, Notebook, NotebookCell, NotebookSummary};
 pub use outputs::OutputRecord;
 pub use params::ParamSet;
+pub use paths::{path_parts, quote_name, split_reference, table_path};
 pub use session_role::{AiPart, SessionRole};
 
 pub use connections::{AiPolicy, ConnectionProfile, EnvTag, RunQueryPolicy};
@@ -84,15 +86,38 @@ impl Workspace {
             std::fs::create_dir_all(parent).map_err(|e| Error::Invalid(format!("cannot create {}: {e}", parent.display())))?;
         }
         let conn = Connection::open(&path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Another process may be opening it too (the app and databrain-mcp).
+        conn.busy_timeout(std::time::Duration::from_secs(120))?;
+        // WAL (kept in the file once set). Switching needs a moment no other
+        // connection reads, and SQLite doesn't wait for it: try again.
+        let mut tries = 0;
+        while let Err(e) = conn.pragma_update(None, "journal_mode", "WAL") {
+            let busy =
+                matches!(&e, rusqlite::Error::SqliteFailure(f, _) if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked));
+            tries += 1;
+            if !busy || tries > 200 {
+                return Err(e.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         let version = check_schema_version(&conn)?;
         // Before changing an existing workspace's schema, a copy as it was
         // (`workspace.db.bak-before-v<new>`), kept beside it.
         if version > 0 && (version as usize) < MIGRATIONS.len() {
             let backup = std::path::PathBuf::from(format!("{}.bak-before-v{}", path.as_ref().display(), MIGRATIONS.len()));
             if !backup.exists() {
-                conn.execute_batch(&format!("VACUUM INTO '{}'", backup.to_string_lossy().replace('\'', "''")))
-                    .map_err(|e| Error::Invalid(format!("cannot back up the workspace before updating it ({}): {e}", backup.display())))?;
+                // Written beside it, then moved into place: another process
+                // backing up at the same moment doesn't write the same file.
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let tmp = std::path::PathBuf::from(format!("{}.tmp-{}-{n}", backup.display(), std::process::id()));
+                let fail = |e: String| Error::Invalid(format!("cannot back up the workspace before updating it ({}): {e}", backup.display()));
+                conn.execute_batch(&format!("VACUUM INTO '{}'", tmp.to_string_lossy().replace('\'', "''"))).map_err(|e| fail(e.to_string()))?;
+                if backup.exists() {
+                    let _ = std::fs::remove_file(&tmp);
+                } else {
+                    std::fs::rename(&tmp, &backup).map_err(|e| fail(e.to_string()))?;
+                }
             }
         }
         Self::init(conn)
@@ -105,19 +130,25 @@ impl Workspace {
     /// The schema version this DataBrain knows (applied migrations).
     pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Deleted or overwritten content (old SQL, connection settings) is
         // zeroed, not left in free pages of the file.
         conn.pragma_update(None, "secure_delete", "ON")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let version = check_schema_version(&conn)?;
-        for (i, m) in MIGRATIONS.iter().enumerate().skip(version as usize) {
-            let tx = conn.unchecked_transaction()?;
+        // Migrations: each step takes the write lock first and reads the
+        // version under it, so two processes upgrading at once (the app and
+        // databrain-mcp) apply each step once: the second waits, then finds
+        // it done. A long migration may keep it waiting: a longer timeout.
+        conn.busy_timeout(std::time::Duration::from_secs(120))?;
+        loop {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let version = check_schema_version(&tx)?;
+            let Some(m) = MIGRATIONS.get(version as usize) else { break };
             tx.execute_batch(m)?;
-            tx.pragma_update(None, "user_version", (i + 1) as i64)?;
+            tx.pragma_update(None, "user_version", version + 1)?;
             tx.commit()?;
         }
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let ws = Self { conn: Mutex::new(conn) };
         // Best effort: a failure must not keep the workspace from opening.
         let _ = ws.redact_kept_sql();

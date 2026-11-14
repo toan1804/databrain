@@ -107,22 +107,61 @@ pub const TARGET_SEPARATORS: [&str; 4] = ["&", ",", "and", "or"];
 
 /// Table paths of a note target with the separator before each one (`""` for
 /// the first): `sales.orders & crm.customers.id` → [("", "sales.orders"), ("&", "crm.customers.id")].
-/// Identifier quotes are dropped. A target without a separator is one path.
+/// A quoted name (`"…"`, `` `…` ``, `[…]`; `""` inside `"…"` is one quote)
+/// is one name, dots, spaces, `&`, `,` and `and`/`or` in it included. Each
+/// path comes back as [`crate::paths::path_text`] writes it: plain names
+/// plain, others in double quotes. A target without a separator is one path.
 pub fn split_target(target: &str) -> Vec<(String, String)> {
-    let spaced = target.replace('&', " & ").replace(',', " , ");
+    // Tokens: separators (`&`, `,`, unquoted `and`/`or`) and paths, the
+    // paths as written (quotes kept, read by `path_parts`).
+    let mut tokens: Vec<(String, bool)> = Vec::new(); // (text, a separator)
+    let mut cur = String::new();
+    let mut chars = target.chars().peekable();
+    let flush = |cur: &mut String, tokens: &mut Vec<(String, bool)>| {
+        if !cur.is_empty() {
+            let low = cur.to_ascii_lowercase();
+            let sep = low == "and" || low == "or";
+            tokens.push((if sep { low } else { std::mem::take(cur) }, sep));
+        }
+        cur.clear();
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '"' | '`' | '[' => {
+                let close = if c == '[' { ']' } else { c };
+                cur.push(c);
+                while let Some(d) = chars.next() {
+                    cur.push(d);
+                    if d == close {
+                        if close != ']' && chars.peek() == Some(&close) {
+                            cur.push(chars.next().unwrap_or(close));
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            '&' | ',' => {
+                flush(&mut cur, &mut tokens);
+                tokens.push((c.to_string(), true));
+            }
+            c if c.is_whitespace() => flush(&mut cur, &mut tokens),
+            c => cur.push(c),
+        }
+    }
+    flush(&mut cur, &mut tokens);
     let mut out: Vec<(String, String)> = Vec::new();
     let mut sep = String::new();
-    for tok in spaced.split_whitespace() {
-        let low = tok.to_ascii_lowercase();
-        if TARGET_SEPARATORS.contains(&low.as_str()) {
-            sep = low;
+    for (tok, is_sep) in tokens {
+        if is_sep {
+            sep = tok;
             continue;
         }
-        let path: String = tok.chars().filter(|c| !matches!(c, '"' | '`' | '[' | ']')).collect();
-        let path = path.trim_matches('.').to_string();
-        if path.is_empty() {
+        let parts = crate::paths::path_parts(&tok);
+        if parts.is_empty() {
             continue;
         }
+        let path = crate::paths::path_text(&parts);
         // Two paths with no separator between them: treat as "&".
         let s = if out.is_empty() {
             String::new()
@@ -138,6 +177,8 @@ pub fn split_target(target: &str) -> Vec<(String, String)> {
 }
 
 /// Join paths back into a target, e.g. `sales.orders & crm.customers`.
+/// Paths are written as [`crate::paths::table_path`] / [`split_target`]
+/// give them (names quoted where needed).
 pub fn join_target(parts: &[(String, String)]) -> String {
     let mut s = String::new();
     for (sep, path) in parts {
@@ -156,13 +197,18 @@ pub fn join_target(parts: &[(String, String)]) -> String {
     s
 }
 
-/// Does the note target mention the table `full` (`schema.table`), alone, in a
-/// list, or through one of its columns?
-pub fn target_mentions(target: &str, full: &str, name: &str) -> bool {
-    let full = full.to_ascii_lowercase();
+/// Does the note target mention the table `name` of `schema` (an id, its
+/// dots are levels), alone, in a list, or through one of its columns? The
+/// schema may be written without its catalog (`sales.t` for `main.sales.t`).
+pub fn target_mentions(target: &str, schema: &str, name: &str) -> bool {
+    let lower = |v: Vec<String>| v.into_iter().map(|p| p.to_lowercase()).collect::<Vec<_>>();
+    let mut full: Vec<String> = schema.split('.').filter(|s| !s.is_empty()).map(str::to_lowercase).collect();
+    full.push(name.to_lowercase());
     split_target(target).iter().any(|(_, p)| {
-        let p = p.to_ascii_lowercase();
-        p == full || p.eq_ignore_ascii_case(name) || p.starts_with(&format!("{full}.")) || full.ends_with(&format!(".{p}"))
+        let p = lower(crate::paths::path_parts(p));
+        // A suffix of the table's path (bare name, schema without catalog),
+        // or the whole path and a column.
+        (!p.is_empty() && p.len() <= full.len() && full.ends_with(&p)) || (p.len() == full.len() + 1 && p.starts_with(&full))
     })
 }
 
@@ -403,6 +449,13 @@ impl Workspace {
     /// the one store the AI reads (`ai_objects`); its search rows follow
     /// from there.
     pub fn kn_replace_schema(&self, connection_id: &str, schema: &str, objects: &[KnObject]) -> Result<IndexDelta> {
+        self.kn_replace_schema_read(connection_id, schema, objects, false)
+    }
+
+    /// [`Self::kn_replace_schema`]; `keys_read`: the read covered foreign
+    /// keys, so a table's list replaces the cached one, an empty list too
+    /// (keys dropped on the server go). Otherwise keys read before stay.
+    pub fn kn_replace_schema_read(&self, connection_id: &str, schema: &str, objects: &[KnObject], keys_read: bool) -> Result<IndexDelta> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         let existing: std::collections::HashMap<String, String> = {
@@ -427,7 +480,7 @@ impl Workspace {
             delta.removed += 1;
         }
         for o in objects {
-            Self::meta_put_known_tx(&tx, connection_id, o, now)?;
+            Self::meta_put_known_tx(&tx, connection_id, o, now, keys_read)?;
             let hash = o.hash();
             if existing.get(&o.name).is_some_and(|h| *h == hash) {
                 delta.unchanged += 1;
@@ -467,7 +520,7 @@ impl Workspace {
 
     /// An indexed object's facts into the explorer cache: the object, and
     /// its columns and foreign keys as read now.
-    fn meta_put_known_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str, o: &KnObject, now: i64) -> Result<()> {
+    fn meta_put_known_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str, o: &KnObject, now: i64, keys_read: bool) -> Result<()> {
         // One table-like object per name: a table that became a view isn't both.
         tx.prepare_cached(
             "DELETE FROM meta_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3 AND kind <> ?4 \
@@ -482,17 +535,25 @@ impl Workspace {
         .execute(params![connection_id, o.schema, o.name, o.kind, o.comment, o.row_estimate, now])?;
         // No columns: the run couldn't read them (a failed column query
         // gives the object alone); what the explorer has is kept. No keys:
-        // many engines' bulk reads don't give them, so keys read before
-        // (a describe) are kept too.
+        // when the read didn't cover them (many engines' bulk reads), keys
+        // read before (a describe) are kept; when it did, the table has none.
         if o.columns.is_empty() {
             return Ok(());
         }
         tx.prepare_cached(
             "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, \
-             seen_at = excluded.seen_at, fks_json = CASE WHEN excluded.fks_json = '[]' THEN fks_json ELSE excluded.fks_json END, stale = 0",
+             seen_at = excluded.seen_at, fks_json = CASE WHEN excluded.fks_json = '[]' AND NOT ?7 THEN fks_json ELSE excluded.fks_json END, stale = 0",
         )?
-        .execute(params![connection_id, o.schema, o.name, serde_json::to_string(&o.columns)?, now, serde_json::to_string(&o.foreign_keys)?])?;
+        .execute(params![
+            connection_id,
+            o.schema,
+            o.name,
+            serde_json::to_string(&o.columns)?,
+            now,
+            serde_json::to_string(&o.foreign_keys)?,
+            keys_read
+        ])?;
         Ok(())
     }
 
@@ -527,7 +588,7 @@ impl Workspace {
         let now = now_ms();
         let mut changed = 0;
         for o in objects {
-            Self::meta_put_known_tx(&tx, connection_id, o, now)?;
+            Self::meta_put_known_tx(&tx, connection_id, o, now, false)?;
             let hash = o.hash();
             let old: Option<String> = tx
                 .query_row(
@@ -772,12 +833,20 @@ impl Workspace {
     }
 
     pub fn kn_clear(&self, connection_id: &str) -> Result<()> {
-        let c = self.conn.lock();
-        c.execute("DELETE FROM kn_objects WHERE connection_id = ?1", [connection_id])?;
+        // One transaction: all of it goes, or none.
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        Self::kn_clear_tx(&tx, connection_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn kn_clear_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str) -> Result<()> {
+        tx.execute("DELETE FROM kn_objects WHERE connection_id = ?1", [connection_id])?;
         // Search rows go with `ai_tables` (kept in step); the scope stays.
-        Self::ai_forget_tx(&c, connection_id)?;
-        c.execute("DELETE FROM kn_state WHERE connection_id = ?1", [connection_id])?;
-        c.execute("DELETE FROM kn_schema_state WHERE connection_id = ?1", [connection_id])?;
+        Self::ai_forget_tx(tx, connection_id)?;
+        tx.execute("DELETE FROM kn_state WHERE connection_id = ?1", [connection_id])?;
+        tx.execute("DELETE FROM kn_schema_state WHERE connection_id = ?1", [connection_id])?;
         Ok(())
     }
 
@@ -953,6 +1022,15 @@ mod tests {
         ws.kn_replace_schema("c", "sales", &[obj("sales", "orders", &["id", "cid", "total"], None)]).unwrap();
         let t = ws.meta_table("c", "sales", "orders").unwrap().unwrap();
         assert_eq!((t.columns.len(), t.foreign_keys.map(|f| f.len())), (3, Some(1)));
+        // A read that covered keys and found none: the key was dropped on the server.
+        ws.kn_replace_schema_read("c", "sales", &[obj("sales", "orders", &["id", "cid", "total"], None)], true).unwrap();
+        let t = ws.meta_table("c", "sales", "orders").unwrap().unwrap();
+        assert_eq!(t.foreign_keys.as_deref(), Some(&[][..]), "dropped keys go");
+        // And one that found it again keeps it.
+        let mut with_key = obj("sales", "orders", &["id", "cid", "total"], None);
+        with_key.foreign_keys = vec![fk.clone()];
+        ws.kn_replace_schema_read("c", "sales", &[with_key], true).unwrap();
+        assert_eq!(ws.meta_table("c", "sales", "orders").unwrap().unwrap().foreign_keys, Some(vec![fk]));
     }
 
     #[test]
@@ -1049,9 +1127,33 @@ mod tests {
         assert_eq!(join_target(&p), "sales.orders & crm.customers and x.y or dim.date, a.b.c");
         assert_eq!(split_target("a.b c.d").last().unwrap().0, "&", "missing separator means &");
         assert!(split_target("  & ").is_empty());
-        assert!(target_mentions("sales.orders & crm.customers.id", "crm.customers", "customers"));
-        assert!(target_mentions("main.orders", "memory.main.orders", "orders"), "schema written without catalog");
-        assert!(!target_mentions("sales.orders_old", "sales.orders", "orders"));
+        assert!(target_mentions("sales.orders & crm.customers.id", "crm", "customers"));
+        assert!(target_mentions("main.orders", "memory.main", "orders"), "schema written without catalog");
+        assert!(target_mentions("orders", "sales", "orders"), "bare name");
+        assert!(!target_mentions("sales.orders_old", "sales", "orders"));
+    }
+
+    /// Names with a dot, a space, `&`, `,`, a quote or the word `and` are
+    /// one name when quoted, and stored quoted: they read back the same.
+    #[test]
+    fn note_targets_keep_unusual_names() {
+        use crate::paths::table_path;
+        let parts = vec![
+            (String::new(), table_path("sales", "order items", None)),
+            ("&".to_string(), table_path("crm", "R&D, old", None)),
+            ("and".to_string(), table_path("dim", "and", None)),
+            ("or".to_string(), table_path("x", "say \"hi\"", None)),
+            ("&".to_string(), table_path("sales", "orders.2024", Some("amount"))),
+        ];
+        let stored = join_target(&parts);
+        assert_eq!(stored, r#"sales."order items" & crm."R&D, old" and dim."and" or x."say ""hi""" & sales."orders.2024".amount"#);
+        assert_eq!(split_target(&stored), parts, "reads back as written");
+        assert!(target_mentions(&stored, "sales", "order items"));
+        assert!(target_mentions(&stored, "crm", "R&D, old"));
+        assert!(target_mentions(&stored, "sales", "orders.2024"), "through its column");
+        assert!(!target_mentions(&stored, "sales.orders", "2024"), "not a table `2024` of `sales.orders`");
+        // Brackets and backticks are read too, and written in double quotes.
+        assert_eq!(split_target("[my schema].`my table` & a.b")[0].1, r#""my schema"."my table""#);
     }
 
     #[test]

@@ -26,8 +26,10 @@ impl Inner {
                  WHERE table_schema IN ({list}) ORDER BY table_schema, table_name, ordinal_position"
             ))
             .await?;
-        let mut out: Vec<SchemaMetadata> =
-            schemas.iter().map(|s| SchemaMetadata { schema: format!("{cat}.{s}"), objects: vec![], columns: vec![], error: None }).collect();
+        let mut out: Vec<SchemaMetadata> = schemas
+            .iter()
+            .map(|s| SchemaMetadata { schema: format!("{cat}.{s}"), objects: vec![], columns: vec![], error: None, foreign_keys_read: false })
+            .collect();
         let idx = |s: &str| schemas.iter().position(|x| x == s);
         for r in &tables {
             let (Some(s), Some(name)) = (cell(r, 0), cell(r, 1)) else { continue };

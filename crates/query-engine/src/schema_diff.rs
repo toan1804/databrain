@@ -350,6 +350,7 @@ mod tests {
                 .collect(),
             columns: tables.into_iter().map(|(n, c)| TableColumns { table: n.into(), columns: c, foreign_keys: vec![] }).collect(),
             error: None,
+            foreign_keys_read: true,
         }
     }
 

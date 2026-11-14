@@ -410,10 +410,14 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     -- The scope keeps exactly what the AI sees today: every schema an index
     -- run read in full (kn_state.schemas; `*` in index_schemas is carried by
     -- these, never as a rule that would also allow system schemas), and
-    -- each table indexed on its own (index_tables) as a table rule.
+    -- each table indexed on its own (index_tables) as a table rule. A
+    -- schema whose last read failed left nothing (no objects, no
+    -- fingerprint): the AI never saw it, so it gets no rule.
     INSERT OR IGNORE INTO ai_scope (connection_id, schema_rule, table_name, allow)
         SELECT s.connection_id, trim(j.value), '', 1 FROM kn_state s, json_each(s.schemas_json) j
-        WHERE trim(j.value) <> '';
+        WHERE trim(j.value) <> ''
+          AND (EXISTS (SELECT 1 FROM kn_objects k WHERE k.connection_id = s.connection_id AND k.schema_name = trim(j.value))
+               OR EXISTS (SELECT 1 FROM kn_schema_state f WHERE f.connection_id = s.connection_id AND f.schema_name = trim(j.value)));
     INSERT OR IGNORE INTO ai_scope (connection_id, schema_rule, table_name, allow)
         SELECT k.connection_id, k.schema_name, k.name, 1 FROM kn_objects k
         WHERE NOT EXISTS (SELECT 1 FROM ai_scope a WHERE a.connection_id = k.connection_id

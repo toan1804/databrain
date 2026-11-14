@@ -35,15 +35,19 @@ pub struct ScopeRule {
 
 /// How specific a rule is for `schema`.`table`; `None` when it doesn't match.
 /// A table rule beats a schema id, which beats `catalog.*`, which beats `*`.
-fn specificity(rule: &ScopeRule, schema: &str, table: &str) -> Option<u8> {
+/// Names match exactly (`sales` is not `"Sales"` on Postgres), or ignoring
+/// case on a database that does (`ignore_case`).
+fn specificity(rule: &ScopeRule, schema: &str, table: &str, ignore_case: bool) -> Option<u8> {
+    let same = |a: &str, b: &str| if ignore_case { a.eq_ignore_ascii_case(b) } else { a == b };
     let s = rule.schema.trim();
     let schema_level = if s == "*" {
         0
-    } else if s.eq_ignore_ascii_case(schema) {
+    } else if same(s, schema) {
         2
     } else if let Some(c) = s.strip_suffix(".*")
         && schema.len() > c.len()
-        && schema[..c.len()].eq_ignore_ascii_case(c)
+        && schema.is_char_boundary(c.len())
+        && same(&schema[..c.len()], c)
         && schema.as_bytes()[c.len()] == b'.'
     {
         1
@@ -52,18 +56,42 @@ fn specificity(rule: &ScopeRule, schema: &str, table: &str) -> Option<u8> {
     };
     match rule.table.trim() {
         "" => Some(schema_level),
-        t if schema_level == 2 && t.eq_ignore_ascii_case(table) => Some(3),
+        t if schema_level == 2 && same(t, table) => Some(3),
         _ => None,
     }
+}
+
+/// A foreign key's target is one the AI may use. The key may name its
+/// schema without the catalog (`sales` for `main.sales`): read in the
+/// referencing table's catalog then.
+fn key_target_allowed(rules: &[ScopeRule], from_schema: &str, fk: &ForeignKey, ignore_case: bool) -> bool {
+    if scope_allows_by(rules, &fk.ref_schema, &fk.ref_table, ignore_case) {
+        return true;
+    }
+    match from_schema.rsplit_once('.') {
+        Some((catalog, _)) if !fk.ref_schema.contains('.') => scope_allows_by(rules, &format!("{catalog}.{}", fk.ref_schema), &fk.ref_table, ignore_case),
+        _ => false,
+    }
+}
+
+/// Databases whose schema and table names ignore case (SQL Server's default
+/// collation): there `Sales` and `sales` are one schema.
+pub fn names_ignore_case(kind: &str) -> bool {
+    kind == "mssql"
 }
 
 /// Whether the rules let the AI use `schema`.`table`: the most specific
 /// matching rule decides, and an exclusion wins over an allowance of the
 /// same level. No matching rule: no.
 pub fn scope_allows(rules: &[ScopeRule], schema: &str, table: &str) -> bool {
+    scope_allows_by(rules, schema, table, false)
+}
+
+/// [`scope_allows`]; `ignore_case`: the database ignores the case of names.
+pub fn scope_allows_by(rules: &[ScopeRule], schema: &str, table: &str, ignore_case: bool) -> bool {
     let mut best: Option<(u8, bool)> = None;
     for r in rules {
-        if let Some(level) = specificity(r, schema, table) {
+        if let Some(level) = specificity(r, schema, table, ignore_case) {
             best = match best {
                 Some((l, a)) if l > level || (l == level && !a) => Some((l, a)),
                 _ => Some((level, r.allow)),
@@ -80,6 +108,12 @@ impl Workspace {
     /// The AI scope of a connection.
     pub fn ai_scope(&self, connection_id: &str) -> Result<Vec<ScopeRule>> {
         Self::scope_tx(&self.conn.lock(), connection_id)
+    }
+
+    /// Whether the connection's database ignores the case of names (see
+    /// [`names_ignore_case`]); no such connection: exact.
+    fn ignore_case_tx(c: &rusqlite::Connection, connection_id: &str) -> bool {
+        c.query_row("SELECT kind FROM connections WHERE id = ?1", [connection_id], |r| r.get::<_, String>(0)).is_ok_and(|k| names_ignore_case(&k))
     }
 
     fn scope_tx(c: &rusqlite::Connection, connection_id: &str) -> Result<Vec<ScopeRule>> {
@@ -119,7 +153,7 @@ impl Workspace {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         tx.execute(
-            "DELETE FROM ai_scope WHERE connection_id = ?1 AND schema_rule = ?2 AND lower(table_name) = lower(?3)",
+            "DELETE FROM ai_scope WHERE connection_id = ?1 AND schema_rule = ?2 AND table_name = ?3",
             params![connection_id, schema.trim(), table.trim()],
         )?;
         Self::ai_refresh_tx(&tx, connection_id, None)?;
@@ -149,7 +183,7 @@ impl Workspace {
         let tx = c.transaction()?;
         tx.execute(
             "DELETE FROM ai_scope WHERE connection_id = ?1 AND table_name = '' AND allow = 1 \
-               AND lower(schema_rule) IN (SELECT lower(value) FROM json_each(?2))",
+               AND schema_rule IN (SELECT value FROM json_each(?2))",
             params![connection_id, serde_json::to_string(schemas)?],
         )?;
         Self::ai_refresh_tx(&tx, connection_id, None)?;
@@ -163,8 +197,9 @@ impl Workspace {
     pub(crate) fn put_rule_if_absent(tx: &Transaction<'_>, connection_id: &str, r: &ScopeRule) -> Result<()> {
         if r.allow {
             let rules = Self::scope_tx(tx, connection_id)?;
+            let ic = Self::ignore_case_tx(tx, connection_id);
             let (schema, table) = (r.schema.trim(), r.table.trim());
-            if rules.iter().any(|x| specificity(x, schema, table).is_some()) && !scope_allows(&rules, schema, table) {
+            if rules.iter().any(|x| specificity(x, schema, table, ic).is_some()) && !scope_allows_by(&rules, schema, table, ic) {
                 return Ok(());
             }
         }
@@ -180,8 +215,9 @@ impl Workspace {
     /// AI may ask to use such a table.)
     pub fn ai_excluded(&self, connection_id: &str, schema: &str, table: &str) -> Result<bool> {
         let rules = self.ai_scope(connection_id)?;
-        let matched = rules.iter().any(|r| specificity(r, schema, table).is_some());
-        Ok(matched && !scope_allows(&rules, schema, table))
+        let ic = Self::ignore_case_tx(&self.conn.lock(), connection_id);
+        let matched = rules.iter().any(|r| specificity(r, schema, table, ic).is_some());
+        Ok(matched && !scope_allows_by(&rules, schema, table, ic))
     }
 
     pub(crate) fn put_rule(tx: &Transaction<'_>, connection_id: &str, r: &ScopeRule) -> Result<()> {
@@ -200,6 +236,7 @@ impl Workspace {
     /// so a recompute never scans the search table.
     pub(crate) fn ai_refresh_tx(tx: &Transaction<'_>, connection_id: &str, schema: Option<&str>) -> Result<()> {
         let rules = Self::scope_tx(tx, connection_id)?;
+        let ic = Self::ignore_case_tx(tx, connection_id);
         type Old = std::collections::HashMap<(String, String), (Option<i64>, Option<String>)>;
         let mut old: Old = {
             let mut st = tx.prepare_cached(
@@ -214,7 +251,12 @@ impl Workspace {
         }
         let facts = Self::facts_tx(tx, connection_id, schema, None)?;
         let mut seen = std::collections::HashSet::new();
-        for o in facts.into_iter().filter(|o| scope_allows(&rules, &o.schema, &o.name)) {
+        for mut o in facts.into_iter().filter(|o| scope_allows_by(&rules, &o.schema, &o.name, ic)) {
+            // Its search text names the tables its keys point at: only
+            // allowed ones, or a search for a table outside the scope would
+            // rank the tables that reference it.
+            let schema_of_o = o.schema.clone();
+            o.foreign_keys.retain(|fk| key_target_allowed(&rules, &schema_of_o, fk, ic));
             let key = (o.schema.clone(), o.name.clone());
             if !seen.insert(key.clone()) {
                 continue;
@@ -362,11 +404,8 @@ impl AiCatalog<'_> {
     /// A table by `schema.name` or bare `name` (case-insensitive; the schema
     /// may be the last part of a `catalog.schema` id).
     pub fn get(&self, reference: &str) -> Result<Option<KnObject>> {
-        let (schema, name) = match reference.rsplit_once('.') {
-            Some((s, n)) => (Some(s.replace(['"', '`', '[', ']'], "")), n.to_string()),
-            None => (None, reference.to_string()),
-        };
-        let name = name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']').to_string();
+        // The last name is the table (a quoted one may contain dots).
+        let (schema, name) = crate::paths::split_reference(reference);
         let c = self.ws.conn.lock();
         Ok(c.query_row(
             &format!(
@@ -387,9 +426,10 @@ impl AiCatalog<'_> {
         if let Some(o) = self.get(path)? {
             return Ok(Some((o, None)));
         }
-        let Some((table, col)) = path.rsplit_once('.') else { return Ok(None) };
-        if let Some(o) = self.get(table)?
-            && let Some(c) = o.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)).map(|c| c.name.clone())
+        let mut parts = crate::paths::path_parts(path);
+        let Some(col) = parts.pop().filter(|_| !parts.is_empty()) else { return Ok(None) };
+        if let Some(o) = self.get(&crate::paths::path_text(&parts))?
+            && let Some(c) = o.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&col)).map(|c| c.name.clone())
         {
             return Ok(Some((o, Some(c))));
         }
@@ -506,11 +546,23 @@ mod tests {
         // allowed alone in a schema that is off.
         let rules = [rule("sales", "", true), rule("sales", "salaries", false), rule("hr", "teams", true)];
         assert!(r(&rules, "sales", "orders"));
-        assert!(!r(&rules, "SALES", "Salaries"), "names are case-insensitive");
+        assert!(!r(&rules, "sales", "salaries"));
         assert!(r(&rules, "hr", "teams"));
         assert!(!r(&rules, "hr", "staff"));
+        // Names match exactly: on Postgres `sales` and `"Sales"` are two
+        // schemas, `orders` and `"Orders"` two tables.
+        assert!(!r(&rules, "Sales", "orders"), "another schema");
+        assert!(!r(&[rule("hr", "teams", true)], "hr", "Teams"), "another table");
+        assert!(r(&[rule("sales", "", true), rule("sales", "Salaries", false)], "sales", "salaries"), "the exclusion is of another table");
+        // Where the database ignores case (SQL Server), so do the rules.
+        assert!(scope_allows_by(&rules, "SALES", "orders", true));
+        assert!(!scope_allows_by(&rules, "SALES", "Salaries", true));
+        assert!(!scope_allows_by(&[rule("main.*", "", true)], "MAINframe.x", "t", true));
+        assert!(scope_allows_by(&[rule("main.*", "", true)], "MAIN.x", "t", true));
+        assert!(!r(&[rule("main.*", "", true)], "MAIN.x", "t"));
         // At one level, an exclusion wins.
-        assert!(!r(&[rule("sales", "", true), rule("SALES", "", false)], "sales", "t"));
+        assert!(!r(&[rule("sales", "", true), rule("sales", "", false)], "sales", "t"));
+        assert!(!scope_allows_by(&[rule("sales", "", true), rule("SALES", "", false)], "sales", "t", true));
         // `catalog.*` needs the dot: `main.*` doesn't cover `mainframe.x`.
         assert!(!r(&[rule("main.*", "", true)], "mainframe.x", "t"));
         // A table rule needs its schema exactly.
@@ -670,6 +722,32 @@ mod review_tests {
         )
         .unwrap();
         assert!(!names().contains(&"sales.salaries".to_string()));
+    }
+
+    /// A table's search text names the tables its keys point at only when
+    /// the AI may use them: a search for a table outside the scope finds
+    /// nothing through the tables that reference it.
+    #[test]
+    fn search_text_names_only_allowed_key_targets() {
+        let o = |schema: &str, name: &str, kind| DbObject { schema: schema.into(), name: name.into(), kind, comment: None, row_estimate: None };
+        let rule = |schema: &str, table: &str, allow| ScopeRule { schema: schema.into(), table: table.into(), allow };
+        let ws = Workspace::open_in_memory().unwrap();
+        let col = |n: &str| ColumnInfo { name: n.into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None };
+        ws.meta_put_schema("c", "sales", &[o("sales", "orders", ObjectKind::Table)]).unwrap();
+        ws.meta_put_schema("c", "hr", &[o("hr", "payroll", ObjectKind::Table)]).unwrap();
+        let fk = ForeignKey { columns: vec!["approved_by".into()], ref_schema: "hr".into(), ref_table: "payroll".into(), ref_columns: vec!["id".into()] };
+        ws.meta_put_table("c", "sales", "orders", &[col("id"), col("approved_by")], Some(std::slice::from_ref(&fk))).unwrap();
+        ws.ai_put_rule("c", &rule("sales", "", true)).unwrap();
+        let found = |q: &str| ws.ai_catalog("c").search(q, 10).unwrap().into_iter().map(|h| h.reference).collect::<Vec<_>>();
+        assert_eq!(found("orders"), vec!["sales.orders"]);
+        assert!(found("payroll").is_empty(), "hr.payroll is outside the scope: {:?}", found("payroll"));
+        // Allowed: the key counts again (and payroll is found itself).
+        ws.ai_put_rule("c", &rule("hr", "", true)).unwrap();
+        let hits = found("payroll");
+        assert!(hits.contains(&"sales.orders".to_string()) && hits.contains(&"hr.payroll".to_string()), "{hits:?}");
+        // Excluded again: the reference goes with it.
+        ws.ai_put_rule("c", &rule("hr", "payroll", false)).unwrap();
+        assert!(found("payroll").is_empty(), "{:?}", found("payroll"));
     }
 
     #[test]
