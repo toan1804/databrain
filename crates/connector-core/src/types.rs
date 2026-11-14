@@ -650,6 +650,10 @@ pub struct SchemaMetadata {
     pub objects: Vec<DbObject>,
     pub columns: Vec<TableColumns>,
     pub error: Option<String>,
+    /// The read covered foreign keys: a table with none has none. `false`
+    /// when the engine's bulk read leaves them out (keys known from a
+    /// describe are kept then).
+    pub foreign_keys_read: bool,
 }
 
 /// Column metadata for a whole schema (bulk introspection for knowledge, ER diagrams).

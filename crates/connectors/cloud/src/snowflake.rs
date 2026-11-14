@@ -947,7 +947,7 @@ impl SfSession {
                 ));
             }
         }
-        Ok(databrain_connector_core::assemble_metadata(schemas, objects, columns, vec![]))
+        Ok(databrain_connector_core::assemble_metadata(schemas, objects, columns, None))
     }
 
     async fn columns(&self, schema: &str, table: Option<&str>) -> Result<Vec<TableColumns>> {

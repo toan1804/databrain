@@ -140,7 +140,7 @@ impl MssqlSession {
             }
         }
         let ids: Vec<String> = schemas.iter().map(|x| self.id(db, x)).collect();
-        Ok(databrain_connector_core::assemble_metadata(&ids, objects, columns, fks))
+        Ok(databrain_connector_core::assemble_metadata(&ids, objects, columns, Some(fks)))
     }
 
     pub(crate) async fn foreign_keys(&self, schema_id: &str, table: Option<&str>) -> Result<Vec<(String, ForeignKey)>> {

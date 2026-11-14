@@ -84,13 +84,17 @@ pub fn truthy(v: &Option<String>) -> bool {
 /// Per-schema metadata (the default for [`Session::bulk_metadata`]).
 /// Group flat catalog rows (from one multi-schema query each) into
 /// [`SchemaMetadata`] per requested schema. Linear time, whatever the size.
+/// `foreign_keys`: `None` when the engine's bulk read doesn't get them.
 pub fn assemble_metadata(
     schemas: &[String],
     objects: Vec<DbObject>,
     columns: Vec<(String, String, ColumnInfo)>,
-    foreign_keys: Vec<(String, String, ForeignKey)>,
+    foreign_keys: Option<Vec<(String, String, ForeignKey)>>,
 ) -> Vec<SchemaMetadata> {
-    let mut out: Vec<SchemaMetadata> = schemas.iter().map(|s| SchemaMetadata { schema: s.clone(), objects: vec![], columns: vec![], error: None }).collect();
+    let foreign_keys_read = foreign_keys.is_some();
+    let foreign_keys = foreign_keys.unwrap_or_default();
+    let mut out: Vec<SchemaMetadata> =
+        schemas.iter().map(|s| SchemaMetadata { schema: s.clone(), objects: vec![], columns: vec![], error: None, foreign_keys_read }).collect();
     let pos: HashMap<&str, usize> = schemas.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
     let mut tables: HashMap<(usize, String), usize> = HashMap::new();
     for o in objects {
@@ -131,9 +135,11 @@ pub async fn default_bulk_metadata<S: Session + ?Sized>(s: &S, schemas: &[String
                     Ok(c) => (c, None),
                     Err(e) => (vec![], Some(e.message)),
                 };
-                SchemaMetadata { schema: sc.clone(), objects, columns, error }
+                // `schema_columns` describes (keys included) unless the
+                // engine reads columns its own way; those have no keys.
+                SchemaMetadata { schema: sc.clone(), objects, columns, error, foreign_keys_read: true }
             }
-            Err(e) => SchemaMetadata { schema: sc.clone(), objects: vec![], columns: vec![], error: Some(e.message) },
+            Err(e) => SchemaMetadata { schema: sc.clone(), objects: vec![], columns: vec![], error: Some(e.message), foreign_keys_read: false },
         });
     }
     Ok(out)

@@ -403,6 +403,13 @@ impl Workspace {
     /// the one store the AI reads (`ai_objects`); its search rows follow
     /// from there.
     pub fn kn_replace_schema(&self, connection_id: &str, schema: &str, objects: &[KnObject]) -> Result<IndexDelta> {
+        self.kn_replace_schema_read(connection_id, schema, objects, false)
+    }
+
+    /// [`Self::kn_replace_schema`]; `keys_read`: the read covered foreign
+    /// keys, so a table's list replaces the cached one, an empty list too
+    /// (keys dropped on the server go). Otherwise keys read before stay.
+    pub fn kn_replace_schema_read(&self, connection_id: &str, schema: &str, objects: &[KnObject], keys_read: bool) -> Result<IndexDelta> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         let existing: std::collections::HashMap<String, String> = {
@@ -427,7 +434,7 @@ impl Workspace {
             delta.removed += 1;
         }
         for o in objects {
-            Self::meta_put_known_tx(&tx, connection_id, o, now)?;
+            Self::meta_put_known_tx(&tx, connection_id, o, now, keys_read)?;
             let hash = o.hash();
             if existing.get(&o.name).is_some_and(|h| *h == hash) {
                 delta.unchanged += 1;
@@ -467,7 +474,7 @@ impl Workspace {
 
     /// An indexed object's facts into the explorer cache: the object, and
     /// its columns and foreign keys as read now.
-    fn meta_put_known_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str, o: &KnObject, now: i64) -> Result<()> {
+    fn meta_put_known_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str, o: &KnObject, now: i64, keys_read: bool) -> Result<()> {
         // One table-like object per name: a table that became a view isn't both.
         tx.prepare_cached(
             "DELETE FROM meta_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3 AND kind <> ?4 \
@@ -482,17 +489,25 @@ impl Workspace {
         .execute(params![connection_id, o.schema, o.name, o.kind, o.comment, o.row_estimate, now])?;
         // No columns: the run couldn't read them (a failed column query
         // gives the object alone); what the explorer has is kept. No keys:
-        // many engines' bulk reads don't give them, so keys read before
-        // (a describe) are kept too.
+        // when the read didn't cover them (many engines' bulk reads), keys
+        // read before (a describe) are kept; when it did, the table has none.
         if o.columns.is_empty() {
             return Ok(());
         }
         tx.prepare_cached(
             "INSERT INTO meta_columns (connection_id, schema_name, table_name, columns_json, seen_at, fks_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT (connection_id, schema_name, table_name) DO UPDATE SET columns_json = excluded.columns_json, \
-             seen_at = excluded.seen_at, fks_json = CASE WHEN excluded.fks_json = '[]' THEN fks_json ELSE excluded.fks_json END, stale = 0",
+             seen_at = excluded.seen_at, fks_json = CASE WHEN excluded.fks_json = '[]' AND NOT ?7 THEN fks_json ELSE excluded.fks_json END, stale = 0",
         )?
-        .execute(params![connection_id, o.schema, o.name, serde_json::to_string(&o.columns)?, now, serde_json::to_string(&o.foreign_keys)?])?;
+        .execute(params![
+            connection_id,
+            o.schema,
+            o.name,
+            serde_json::to_string(&o.columns)?,
+            now,
+            serde_json::to_string(&o.foreign_keys)?,
+            keys_read
+        ])?;
         Ok(())
     }
 
@@ -527,7 +542,7 @@ impl Workspace {
         let now = now_ms();
         let mut changed = 0;
         for o in objects {
-            Self::meta_put_known_tx(&tx, connection_id, o, now)?;
+            Self::meta_put_known_tx(&tx, connection_id, o, now, false)?;
             let hash = o.hash();
             let old: Option<String> = tx
                 .query_row(
@@ -956,6 +971,15 @@ mod tests {
         ws.kn_replace_schema("c", "sales", &[obj("sales", "orders", &["id", "cid", "total"], None)]).unwrap();
         let t = ws.meta_table("c", "sales", "orders").unwrap().unwrap();
         assert_eq!((t.columns.len(), t.foreign_keys.map(|f| f.len())), (3, Some(1)));
+        // A read that covered keys and found none: the key was dropped on the server.
+        ws.kn_replace_schema_read("c", "sales", &[obj("sales", "orders", &["id", "cid", "total"], None)], true).unwrap();
+        let t = ws.meta_table("c", "sales", "orders").unwrap().unwrap();
+        assert_eq!(t.foreign_keys.as_deref(), Some(&[][..]), "dropped keys go");
+        // And one that found it again keeps it.
+        let mut with_key = obj("sales", "orders", &["id", "cid", "total"], None);
+        with_key.foreign_keys = vec![fk.clone()];
+        ws.kn_replace_schema_read("c", "sales", &[with_key], true).unwrap();
+        assert_eq!(ws.meta_table("c", "sales", "orders").unwrap().unwrap().foreign_keys, Some(vec![fk]));
     }
 
     #[test]
