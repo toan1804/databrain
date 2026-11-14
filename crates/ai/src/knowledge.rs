@@ -378,8 +378,10 @@ async fn describe_named(
     want: &str,
     allowed: &(dyn Fn(&str, &str) -> bool + Sync),
 ) -> std::result::Result<databrain_connector_core::ObjectDetail, databrain_query_engine::EngineError> {
-    if let Some((schema, name)) = want.rsplit_once('.').filter(|(s, n)| !s.is_empty() && !n.is_empty()) {
-        match engine.describe(connection_id, schema, name).await {
+    if let (Some(schema), name) = databrain_workspace::split_reference(want)
+        && !name.is_empty()
+    {
+        match engine.describe(connection_id, &schema, &name).await {
             Ok(d) => return Ok(d),
             Err(e) if unreachable_error(&e) => return Err(e),
             Err(_) => {}
@@ -548,7 +550,7 @@ pub fn retrieve(ws: &Workspace, connection_id: &str, question: &str, max_tables:
         let full = o.full_name();
         let table_notes: Vec<String> = notes_all
             .iter()
-            .filter(|n| n.target.as_deref().is_some_and(|t| target_mentions(t, &full, &o.name)))
+            .filter(|n| n.target.as_deref().is_some_and(|t| target_mentions(t, &o.schema, &o.name)))
             .map(|n| match n.target.as_deref() {
                 Some(t) if !t.eq_ignore_ascii_case(&full) => format!("{t}: {}", n.body),
                 _ => n.body.clone(),
@@ -835,7 +837,7 @@ async fn resolve_table_where(
     {
         return Ok(Some(hit));
     }
-    let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();
+    let parts = databrain_workspace::path_parts(path);
     let Some(table) = parts.last() else { return Ok(None) };
     let schema_written = parts[..parts.len() - 1].join(".").to_ascii_lowercase();
     let hits = engine.search_objects(connection_id, table, 50).await?;
@@ -862,7 +864,8 @@ async fn live_limited<T>(f: impl std::future::Future<Output = std::result::Resul
 
 /// `path` = `[catalog.]schema.table[.column]` or a bare `table`, looked up live.
 async fn resolve_live(engine: &QueryEngine, connection_id: &str, path: &str) -> std::result::Result<Option<String>, String> {
-    let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();
+    let parts = databrain_workspace::path_parts(path);
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
     // Splits where the table is part k and at most one column follows.
     for k in (0..parts.len()).rev() {
         let rest = &parts[k + 1..];
@@ -877,11 +880,10 @@ async fn resolve_live(engine: &QueryEngine, connection_id: &str, path: &str) -> 
             schema_written.is_empty() || s == schema_written || s.ends_with(&format!(".{schema_written}"))
         });
         let Some(o) = hit else { continue };
-        let full = format!("{}.{}", o.schema, o.name);
-        let Some(col) = rest.first() else { return Ok(Some(full)) };
+        let Some(col) = rest.first() else { return Ok(Some(databrain_workspace::table_path(&o.schema, &o.name, None))) };
         let d = engine.describe(connection_id, &o.schema, &o.name).await.map_err(|e| e.message)?;
         if let Some(c) = d.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)) {
-            return Ok(Some(format!("{full}.{}", c.name)));
+            return Ok(Some(databrain_workspace::table_path(&o.schema, &o.name, Some(&c.name))));
         }
     }
     Ok(None)

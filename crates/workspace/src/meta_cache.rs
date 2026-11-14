@@ -670,11 +670,8 @@ impl Workspace {
     /// `schema.name` or bare `name` (case-insensitive; the schema may be the
     /// last part of a `catalog.schema` id). Returns (schema, name).
     pub fn meta_get(&self, connection_id: &str, reference: &str) -> Result<Option<(String, String)>> {
-        let (schema, name) = match reference.rsplit_once('.') {
-            Some((s, n)) => (Some(s.replace(['"', '`', '[', ']'], "")), n),
-            None => (None, reference),
-        };
-        let name = name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
+        // The last name is the table (a quoted one may contain dots).
+        let (schema, name) = crate::paths::split_reference(reference);
         Ok(self
             .conn
             .lock()
@@ -693,11 +690,8 @@ impl Workspace {
     /// reads it), shortest schema first: a bare name can be in several
     /// schemas, and the caller picks one it may use.
     pub fn meta_find_named(&self, connection_id: &str, reference: &str) -> Result<Vec<(String, String)>> {
-        let (schema, name) = match reference.rsplit_once('.') {
-            Some((s, n)) => (Some(s.replace(['"', '`', '[', ']'], "")), n),
-            None => (None, reference),
-        };
-        let name = name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
+        // The last name is the table (a quoted one may contain dots).
+        let (schema, name) = crate::paths::split_reference(reference);
         let c = self.conn.lock();
         let mut st = c.prepare_cached(
             "SELECT DISTINCT schema_name, name FROM meta_objects \
@@ -729,13 +723,15 @@ impl Workspace {
     /// `Ok(None)` when the table, or a column that was asked for, is not
     /// cached (columns are cached only for tables that were opened).
     pub fn meta_resolve_path(&self, connection_id: &str, path: &str) -> Result<Option<String>> {
+        use crate::paths::{path_parts, path_text, table_path};
         if let Some((s, n)) = self.meta_get(connection_id, path)? {
-            return Ok(Some(format!("{s}.{n}")));
+            return Ok(Some(table_path(&s, &n, None)));
         }
-        let Some((table, col)) = path.rsplit_once('.') else { return Ok(None) };
-        let Some((s, n)) = self.meta_get(connection_id, table)? else { return Ok(None) };
+        let mut parts = path_parts(path);
+        let Some(col) = parts.pop().filter(|_| !parts.is_empty()) else { return Ok(None) };
+        let Some((s, n)) = self.meta_get(connection_id, &path_text(&parts))? else { return Ok(None) };
         let cols = self.meta_column_names(connection_id, &s, &n)?.unwrap_or_default();
-        Ok(cols.into_iter().find(|c| c.eq_ignore_ascii_case(col)).map(|c| format!("{s}.{n}.{c}")))
+        Ok(cols.into_iter().find(|c| c.eq_ignore_ascii_case(&col)).map(|c| table_path(&s, &n, Some(&c))))
     }
 
     /// Cached functions/procedures/packages whose name contains `query`, in
@@ -792,6 +788,25 @@ mod tests {
 
     fn o(schema: &str, name: &str, kind: ObjectKind) -> DbObject {
         DbObject { schema: schema.into(), name: name.into(), kind, comment: None, row_estimate: None }
+    }
+
+    /// A table whose name contains a dot is found by its quoted path, and
+    /// paths come back quoted (a note target reads back the same table).
+    #[test]
+    fn dotted_table_names_resolve_when_quoted() {
+        let ws = Workspace::open_in_memory().unwrap();
+        ws.meta_put_schema("c", "sales", &[o("sales", "orders.2024", ObjectKind::Table), o("sales", "orders", ObjectKind::Table)]).unwrap();
+        let cols = vec![ColumnInfo { name: "amount".into(), data_type: "int".into(), nullable: true, is_primary_key: false, default: None, comment: None }];
+        ws.meta_put_columns("c", "sales", "orders.2024", &cols).unwrap();
+        assert_eq!(ws.meta_get("c", r#"sales."orders.2024""#).unwrap(), Some(("sales".into(), "orders.2024".into())));
+        assert_eq!(ws.meta_get("c", r#""orders.2024""#).unwrap(), Some(("sales".into(), "orders.2024".into())), "bare, quoted");
+        assert_eq!(ws.meta_resolve_path("c", r#"sales."orders.2024""#).unwrap().as_deref(), Some(r#"sales."orders.2024""#));
+        assert_eq!(ws.meta_resolve_path("c", r#"sales."orders.2024".AMOUNT"#).unwrap().as_deref(), Some(r#"sales."orders.2024".amount"#));
+        // Unquoted, the dots are levels: table `2024` of schema `sales.orders`.
+        assert_eq!(ws.meta_get("c", "sales.orders.2024").unwrap(), None);
+        assert_eq!(ws.meta_find_named("c", r#"sales."orders.2024""#).unwrap(), vec![("sales".to_string(), "orders.2024".to_string())]);
+        // Plain names as before.
+        assert_eq!(ws.meta_resolve_path("c", "sales.orders").unwrap().as_deref(), Some("sales.orders"));
     }
 
     /// The ER diagram's tables: saved from a live read, read back offline;

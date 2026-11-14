@@ -18,6 +18,7 @@ mod migrations;
 pub mod notebooks;
 pub mod outputs;
 pub mod params;
+pub mod paths;
 mod session_role;
 mod tabs_settings;
 #[cfg(test)]
@@ -37,6 +38,7 @@ pub use meta_cache::{CachedColumns, CachedListing, CachedTable, ExplorerCacheSta
 pub use notebooks::{CellKind, CellRunSummary, Notebook, NotebookCell, NotebookSummary};
 pub use outputs::OutputRecord;
 pub use params::ParamSet;
+pub use paths::{path_parts, quote_name, split_reference, table_path};
 pub use session_role::{AiPart, SessionRole};
 
 pub use connections::{AiPolicy, ConnectionProfile, EnvTag, RunQueryPolicy};

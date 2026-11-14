@@ -108,50 +108,48 @@ pub const TARGET_SEPARATORS: [&str; 4] = ["&", ",", "and", "or"];
 /// Table paths of a note target with the separator before each one (`""` for
 /// the first): `sales.orders & crm.customers.id` → [("", "sales.orders"), ("&", "crm.customers.id")].
 /// A quoted name (`"…"`, `` `…` ``, `[…]`; `""` inside `"…"` is one quote)
-/// is one name, spaces, `&`, `,` and `and`/`or` in it included; the quotes
-/// are dropped. A target without a separator is one path.
+/// is one name, dots, spaces, `&`, `,` and `and`/`or` in it included. Each
+/// path comes back as [`crate::paths::path_text`] writes it: plain names
+/// plain, others in double quotes. A target without a separator is one path.
 pub fn split_target(target: &str) -> Vec<(String, String)> {
-    // Tokens: separators (`&`, `,`, unquoted `and`/`or`) and paths.
+    // Tokens: separators (`&`, `,`, unquoted `and`/`or`) and paths, the
+    // paths as written (quotes kept, read by `path_parts`).
     let mut tokens: Vec<(String, bool)> = Vec::new(); // (text, a separator)
     let mut cur = String::new();
-    let mut quoted = false;
     let mut chars = target.chars().peekable();
-    let flush = |cur: &mut String, quoted: &mut bool, tokens: &mut Vec<(String, bool)>| {
+    let flush = |cur: &mut String, tokens: &mut Vec<(String, bool)>| {
         if !cur.is_empty() {
             let low = cur.to_ascii_lowercase();
-            let sep = !*quoted && (low == "and" || low == "or");
+            let sep = low == "and" || low == "or";
             tokens.push((if sep { low } else { std::mem::take(cur) }, sep));
         }
         cur.clear();
-        *quoted = false;
     };
     while let Some(c) = chars.next() {
         match c {
             '"' | '`' | '[' => {
                 let close = if c == '[' { ']' } else { c };
-                quoted = true;
+                cur.push(c);
                 while let Some(d) = chars.next() {
+                    cur.push(d);
                     if d == close {
-                        // `""` (and ``` `` ```) inside: one quote character.
                         if close != ']' && chars.peek() == Some(&close) {
-                            chars.next();
-                            cur.push(close);
+                            cur.push(chars.next().unwrap_or(close));
                             continue;
                         }
                         break;
                     }
-                    cur.push(d);
                 }
             }
             '&' | ',' => {
-                flush(&mut cur, &mut quoted, &mut tokens);
+                flush(&mut cur, &mut tokens);
                 tokens.push((c.to_string(), true));
             }
-            c if c.is_whitespace() => flush(&mut cur, &mut quoted, &mut tokens),
+            c if c.is_whitespace() => flush(&mut cur, &mut tokens),
             c => cur.push(c),
         }
     }
-    flush(&mut cur, &mut quoted, &mut tokens);
+    flush(&mut cur, &mut tokens);
     let mut out: Vec<(String, String)> = Vec::new();
     let mut sep = String::new();
     for (tok, is_sep) in tokens {
@@ -159,10 +157,11 @@ pub fn split_target(target: &str) -> Vec<(String, String)> {
             sep = tok;
             continue;
         }
-        let path = tok.trim_matches('.').to_string();
-        if path.is_empty() {
+        let parts = crate::paths::path_parts(&tok);
+        if parts.is_empty() {
             continue;
         }
+        let path = crate::paths::path_text(&parts);
         // Two paths with no separator between them: treat as "&".
         let s = if out.is_empty() {
             String::new()
@@ -177,24 +176,9 @@ pub fn split_target(target: &str) -> Vec<(String, String)> {
     out
 }
 
-/// A path's names quoted where [`split_target`] would read them otherwise
-/// (a space, `&`, `,`, a quote, or the word `and`/`or`).
-fn quote_path(path: &str) -> String {
-    path.split('.')
-        .map(|n| {
-            let low = n.to_ascii_lowercase();
-            if n.chars().any(|c| c.is_whitespace() || matches!(c, '&' | ',' | '"' | '`' | '[' | ']')) || low == "and" || low == "or" {
-                format!("\"{}\"", n.replace('"', "\"\""))
-            } else {
-                n.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-/// Join paths back into a target, e.g. `sales.orders & crm.customers`;
-/// names [`split_target`] would read otherwise are quoted.
+/// Join paths back into a target, e.g. `sales.orders & crm.customers`.
+/// Paths are written as [`crate::paths::table_path`] / [`split_target`]
+/// give them (names quoted where needed).
 pub fn join_target(parts: &[(String, String)]) -> String {
     let mut s = String::new();
     for (sep, path) in parts {
@@ -208,18 +192,23 @@ pub fn join_target(parts: &[(String, String)]) -> String {
                 }
             }
         }
-        s.push_str(&quote_path(path));
+        s.push_str(path);
     }
     s
 }
 
-/// Does the note target mention the table `full` (`schema.table`), alone, in a
-/// list, or through one of its columns?
-pub fn target_mentions(target: &str, full: &str, name: &str) -> bool {
-    let full = full.to_ascii_lowercase();
+/// Does the note target mention the table `name` of `schema` (an id, its
+/// dots are levels), alone, in a list, or through one of its columns? The
+/// schema may be written without its catalog (`sales.t` for `main.sales.t`).
+pub fn target_mentions(target: &str, schema: &str, name: &str) -> bool {
+    let lower = |v: Vec<String>| v.into_iter().map(|p| p.to_lowercase()).collect::<Vec<_>>();
+    let mut full: Vec<String> = schema.split('.').filter(|s| !s.is_empty()).map(str::to_lowercase).collect();
+    full.push(name.to_lowercase());
     split_target(target).iter().any(|(_, p)| {
-        let p = p.to_ascii_lowercase();
-        p == full || p.eq_ignore_ascii_case(name) || p.starts_with(&format!("{full}.")) || full.ends_with(&format!(".{p}"))
+        let p = lower(crate::paths::path_parts(p));
+        // A suffix of the table's path (bare name, schema without catalog),
+        // or the whole path and a column.
+        (!p.is_empty() && p.len() <= full.len() && full.ends_with(&p)) || (p.len() == full.len() + 1 && p.starts_with(&full))
     })
 }
 
@@ -1133,29 +1122,33 @@ mod tests {
         assert_eq!(join_target(&p), "sales.orders & crm.customers and x.y or dim.date, a.b.c");
         assert_eq!(split_target("a.b c.d").last().unwrap().0, "&", "missing separator means &");
         assert!(split_target("  & ").is_empty());
-        assert!(target_mentions("sales.orders & crm.customers.id", "crm.customers", "customers"));
-        assert!(target_mentions("main.orders", "memory.main.orders", "orders"), "schema written without catalog");
-        assert!(!target_mentions("sales.orders_old", "sales.orders", "orders"));
+        assert!(target_mentions("sales.orders & crm.customers.id", "crm", "customers"));
+        assert!(target_mentions("main.orders", "memory.main", "orders"), "schema written without catalog");
+        assert!(target_mentions("orders", "sales", "orders"), "bare name");
+        assert!(!target_mentions("sales.orders_old", "sales", "orders"));
     }
 
-    /// Names with a space, `&`, `,`, a quote or the word `and` are one
-    /// name when quoted, and stored quoted: they read back the same.
+    /// Names with a dot, a space, `&`, `,`, a quote or the word `and` are
+    /// one name when quoted, and stored quoted: they read back the same.
     #[test]
     fn note_targets_keep_unusual_names() {
+        use crate::paths::table_path;
         let parts = vec![
-            (String::new(), "sales.order items".to_string()),
-            ("&".to_string(), "crm.R&D, old".to_string()),
-            ("and".to_string(), "dim.and".to_string()),
-            ("or".to_string(), "x.say \"hi\"".to_string()),
+            (String::new(), table_path("sales", "order items", None)),
+            ("&".to_string(), table_path("crm", "R&D, old", None)),
+            ("and".to_string(), table_path("dim", "and", None)),
+            ("or".to_string(), table_path("x", "say \"hi\"", None)),
+            ("&".to_string(), table_path("sales", "orders.2024", Some("amount"))),
         ];
         let stored = join_target(&parts);
-        assert_eq!(stored, r#"sales."order items" & crm."R&D, old" and dim."and" or x."say ""hi""""#);
+        assert_eq!(stored, r#"sales."order items" & crm."R&D, old" and dim."and" or x."say ""hi""" & sales."orders.2024".amount"#);
         assert_eq!(split_target(&stored), parts, "reads back as written");
-        assert_eq!(join_target(&split_target(&stored)), stored);
-        assert!(target_mentions(&stored, "sales.order items", "order items"));
-        assert!(target_mentions(&stored, "crm.R&D, old", "R&D, old"));
-        // Brackets and backticks too; unquoted names as before.
-        assert_eq!(split_target("[my schema].`my table` & a.b")[0].1, "my schema.my table");
+        assert!(target_mentions(&stored, "sales", "order items"));
+        assert!(target_mentions(&stored, "crm", "R&D, old"));
+        assert!(target_mentions(&stored, "sales", "orders.2024"), "through its column");
+        assert!(!target_mentions(&stored, "sales.orders", "2024"), "not a table `2024` of `sales.orders`");
+        // Brackets and backticks are read too, and written in double quotes.
+        assert_eq!(split_target("[my schema].`my table` & a.b")[0].1, r#""my schema"."my table""#);
     }
 
     #[test]

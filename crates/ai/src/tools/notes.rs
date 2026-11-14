@@ -32,7 +32,7 @@ impl ToolContext {
                     let Some((o, col)) = tables.resolve_path(&p).ok().flatten() else {
                         return Err(AiError::Policy(format!("invalid target `{t}`: {}", knowledge::not_available(&p))));
                     };
-                    canonical.push((sep, col.map_or_else(|| o.full_name(), |c| format!("{}.{c}", o.full_name()))));
+                    canonical.push((sep, databrain_workspace::table_path(&o.schema, &o.name, col.as_deref())));
                 }
                 let t = databrain_workspace::join_target(&canonical);
                 knowledge::check_note_target(&self.engine, &self.profile.id, &t).await.map(Some).map_err(|e| {

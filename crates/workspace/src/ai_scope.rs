@@ -362,11 +362,8 @@ impl AiCatalog<'_> {
     /// A table by `schema.name` or bare `name` (case-insensitive; the schema
     /// may be the last part of a `catalog.schema` id).
     pub fn get(&self, reference: &str) -> Result<Option<KnObject>> {
-        let (schema, name) = match reference.rsplit_once('.') {
-            Some((s, n)) => (Some(s.replace(['"', '`', '[', ']'], "")), n.to_string()),
-            None => (None, reference.to_string()),
-        };
-        let name = name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']').to_string();
+        // The last name is the table (a quoted one may contain dots).
+        let (schema, name) = crate::paths::split_reference(reference);
         let c = self.ws.conn.lock();
         Ok(c.query_row(
             &format!(
@@ -387,9 +384,10 @@ impl AiCatalog<'_> {
         if let Some(o) = self.get(path)? {
             return Ok(Some((o, None)));
         }
-        let Some((table, col)) = path.rsplit_once('.') else { return Ok(None) };
-        if let Some(o) = self.get(table)?
-            && let Some(c) = o.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col)).map(|c| c.name.clone())
+        let mut parts = crate::paths::path_parts(path);
+        let Some(col) = parts.pop().filter(|_| !parts.is_empty()) else { return Ok(None) };
+        if let Some(o) = self.get(&crate::paths::path_text(&parts))?
+            && let Some(c) = o.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&col)).map(|c| c.name.clone())
         {
             return Ok(Some((o, Some(c))));
         }
