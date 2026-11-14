@@ -9,7 +9,7 @@ use databrain_app::api::{self, AppState, SaveConnectionArgs};
 use databrain_auth::{AuthMethod, MemoryStore};
 use databrain_connector_core::{ConnectionConfig, ConnectorKind};
 use databrain_query_engine::{EventSink, JobEvent, RunRequest};
-use databrain_workspace::{AiPolicy, ConnectionProfile, EnvTag, RunQueryPolicy, Workspace};
+use databrain_workspace::{AiPolicy, ConnectionProfile, EnvTag, FileFormat, Job, JobNode, JobNodeKind, JobRun, LoadMode, RunQueryPolicy, Workspace};
 
 struct Quiet;
 impl EventSink for Quiet {
@@ -92,6 +92,56 @@ fn some(v: &str) -> Option<String> {
 
 fn ns(levels: &[&str], ambiguous: bool) -> databrain_query_engine::DefaultNamespace {
     databrain_query_engine::DefaultNamespace { levels: levels.iter().map(|l| some(l)).collect(), ambiguous }
+}
+
+/// A job of one query step whose SQL the assistant wrote.
+fn ai_job(connection_id: &str, sql: &str) -> Job {
+    let step = JobNode {
+        id: "a".into(),
+        name: "ai_step".into(),
+        kind: JobNodeKind::Query,
+        connection_id: Some(connection_id.into()),
+        sql: sql.into(),
+        x: 0.0,
+        y: 0.0,
+        target_connection_id: None,
+        target_table: None,
+        load_mode: LoadMode::Append,
+        load_before_sql: None,
+        load_after_sql: None,
+        key_columns: vec![],
+        create_table: true,
+        batch_rows: None,
+        batch_kb: None,
+        export_folder: None,
+        export_file: None,
+        export_format: FileFormat::Csv,
+        ai_sql: true,
+        last_run: None,
+    };
+    Job {
+        id: String::new(),
+        name: "AI step".into(),
+        nodes: vec![step],
+        edges: vec![],
+        schedule: Default::default(),
+        last_scheduled_at: None,
+        params: Default::default(),
+        param_set: None,
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
+async fn finished(st: &AppState, job: &str) -> JobRun {
+    for _ in 0..400 {
+        let run = st.workspace.job_runs(job, 1).unwrap().remove(0);
+        if run.status != "running" && !st.jobs.is_running(job) {
+            return run;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("job did not finish");
 }
 
 /// Each server says its current database and schema, in the levels the
@@ -255,6 +305,17 @@ async fn table_rules_follow_a_roles_search_path() {
         d => panic!("the role reads dbr_hr.dbr_pay, which the rules deny: {d:?}"),
     }
     st.engine.disconnect(&role.id);
+    // A job step the assistant wrote, on a connection whose schema wasn't
+    // learned in this process (as in `databrain-jobs tick`): asked before it runs.
+    let rules = AiPolicy { run_query: RunQueryPolicy::AutoRead, read_deny: vec!["%.dbr_hr.%".into()], ..Default::default() };
+    let fresh = connect(&st, "DATABRAIN_PG", ConnectorKind::Postgres, "dbr_rules_role", Some("dbr-rules-pw".into()), Some("postgres"), rules).unwrap();
+    assert_eq!(review_sql(&fresh, "select * from dbr_pay").decision, Decision::Allow, "not learned yet");
+    let job = st.workspace.save_job(ai_job(&fresh.id, "select * from dbr_pay")).unwrap();
+    api::run_job(&st, &job.id, None).unwrap();
+    let job_run = finished(&st, &job.id).await;
+    let why = job_run.nodes[0].summary.error.clone().unwrap_or_default();
+    assert!(job_run.status == "error" && why.contains("no longer allow") && why.contains("dbr_hr"), "{job_run:?}");
+    st.engine.disconnect(&fresh.id);
     for sql in ["drop schema dbr_hr cascade", "drop table public.dbr_pay", "drop table public.dbr_salaries", "drop role dbr_rules_role"] {
         run(&st, &admin.id, sql).await;
     }

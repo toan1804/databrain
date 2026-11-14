@@ -919,7 +919,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     // the rules of that day, and since then the connection may have become
     // production or read-only, or lost "AI may write" or a table.
     if t.step_origin(node) == Origin::Ai {
-        ai_rules_now(ctx, node, &sql, &connection_id, t)?;
+        ai_rules_now(ctx, node, &sql, &connection_id, t).await?;
     }
     // Checked before the query runs, so a missing folder fails fast.
     let folder = if node.kind == JobNodeKind::Export { Some(export_folder(node)?) } else { None };
@@ -1027,8 +1027,22 @@ pub fn load_spec(node: &JobNode) -> LoadSpec {
 /// A step's SQL as it will run (`sql`, with the run's `:name` values in
 /// place where they are known), checked like the assistant's own queries
 /// ([`databrain_ai::jobs::review_step`]). What only the user could approve
-/// was approved with the job and is not asked again.
-fn ai_rules_now(ctx: &JobCtx, node: &JobNode, sql: &str, connection_id: &str, t: &Tracer) -> Result<()> {
+/// was approved with the job and is not asked again. The table rules
+/// complete unqualified names with the schema each connection's server
+/// says is current, asked now: `databrain-jobs tick` is a new process each
+/// time, and in the app what was learned before may be out of date.
+async fn ai_rules_now(ctx: &JobCtx, node: &JobNode, sql: &str, connection_id: &str, t: &Tracer) -> Result<()> {
+    let mut ids: Vec<&str> = vec![connection_id];
+    for c in [&node.connection_id, &node.target_connection_id].into_iter().flatten() {
+        if !c.is_empty() && !ids.contains(&c.as_str()) {
+            ids.push(c);
+        }
+    }
+    for id in ids {
+        if let Ok(p) = ctx.workspace.get_connection(id) {
+            databrain_ai::access::learn_defaults(&ctx.engine, &p).await;
+        }
+    }
     let params = t.params().unwrap_or_default();
     let filled = |sql: &str, connection: Option<&str>| -> String {
         let kind = connection.and_then(|c| ctx.workspace.get_connection(c).ok()).map(|p| p.config.kind);
