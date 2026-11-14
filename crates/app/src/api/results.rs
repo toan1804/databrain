@@ -250,7 +250,7 @@ pub async fn load_result(state: &AppState, result_id: &str, args: LoadResultArgs
     }
     let cancel = databrain_connector_core::CancellationToken::new();
     LOADS.lock().insert(load_id.to_string(), cancel.clone());
-    let tab = format!("__load__:{load_id}");
+    let tab = databrain_workspace::SessionRole::Load(load_id.to_string()).key();
     let obs = LoadProgress { ui: state.ui.clone(), id: load_id.to_string() };
     let r = if args.every_row == Some(true) && o.truncated {
         // Masks and the AI's rules applied to what the AI or a client ran:
@@ -287,7 +287,7 @@ pub async fn dry_run_result_load(state: &AppState, result_id: &str, args: LoadRe
         left -= n;
     }
     let rows = databrain_query_engine::LoadRows { schema: rows.schema, batches: sample };
-    let tab = format!("__loadcheck__:{}", uuid::Uuid::new_v4());
+    let tab = databrain_workspace::SessionRole::Load(format!("check:{}", uuid::Uuid::new_v4())).key();
     let r = state.engine.dry_run_load(Some(&rows), None, &args.target_connection_id, &tab, &args.spec()).await;
     state.engine.close_tab(&tab);
     Ok(r)
@@ -410,7 +410,7 @@ pub(crate) fn store_test_data(
     data: databrain_query_engine::testdata::TestData,
 ) -> Result<TestDataOutput> {
     let profile = state.workspace.get_connection(connection_id)?;
-    let tab = format!("__testdata__:{connection_id}:{schema}.{name}");
+    let tab = databrain_workspace::SessionRole::TestData(format!("{connection_id}:{schema}.{name}")).key();
     let outputs = state.engine.outputs();
     outputs.close_tab(&tab);
     let id = uuid::Uuid::new_v4().to_string();

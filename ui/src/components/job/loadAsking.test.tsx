@@ -52,9 +52,36 @@ describe("loading into a production connection", () => {
       .spyOn(api, "loadResult")
       .mockRejectedValueOnce({ kind: "invalid", message: "\"Main\" is a production connection", code: "needs_confirmation" })
       .mockResolvedValueOnce(report);
-    const p = loadResultAsking("r", args, "l");
+    const steps: string[] = [];
+    const p = loadResultAsking(
+      "r",
+      args,
+      "l",
+      () => steps.push("start"),
+      () => steps.push("pause"),
+    );
+    await vi.waitFor(() => expect(useStore.getState().confirm).not.toBeNull());
+    // Progress and Stop are gone while the prompt is open.
+    expect(steps).toEqual(["start", "pause"]);
     await answer(true);
     expect(await p).toEqual(report);
+    expect(steps).toEqual(["start", "pause", "start"]);
     expect(load.mock.calls.map((c) => c[1].confirmed)).toEqual([false, true]);
+  });
+
+  it("when the server asks and the user says no, nothing shows as running", async () => {
+    withEnv("dev");
+    vi.spyOn(api, "loadResult").mockRejectedValueOnce({ kind: "invalid", message: "production", code: "needs_confirmation" });
+    const steps: string[] = [];
+    const p = loadResultAsking(
+      "r",
+      args,
+      "l",
+      () => steps.push("start"),
+      () => steps.push("pause"),
+    );
+    await answer(false);
+    expect(await p).toBeNull();
+    expect(steps).toEqual(["start", "pause"]);
   });
 });

@@ -41,17 +41,15 @@ impl QueryEngine {
         // The original session, when its transaction holds rows others can't see.
         let shared = session_key.filter(|k| self.sessions.lock().get(&(connection_id.to_string(), k.to_string())).is_some_and(|s| s.session.in_transaction()));
         // Busy like a running query until the export ends.
-        let claim = match shared {
-            Some(k) => match self.claim(connection_id, k, cancel.clone(), "A query is running in this tab: wait for it, or commit, to export everything") {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    self.exports.lock().remove(export_id);
-                    return Err(e);
-                }
-            },
-            None => None,
+        let hold = shared.map(|k| Hold::session(k, cancel.clone(), "A query is running in this tab: wait for it, or commit, to export everything"));
+        let claim = match self.guarded_or_refuse(connection_id, hold, Intent::Inspect) {
+            Ok((_, c)) => c,
+            Err(e) => {
+                self.exports.lock().remove(export_id);
+                return Err(e);
+            }
         };
-        let tab = shared.map_or_else(|| format!("__export__:{export_id}"), str::to_string);
+        let tab = shared.map_or_else(|| SessionRole::Export(export_id.to_string()).key(), str::to_string);
         let out = self.export_stream(connection_id, &tab, sql, path, opts, &cancel, progress).await;
         self.exports.lock().remove(export_id);
         if claim.is_none() {

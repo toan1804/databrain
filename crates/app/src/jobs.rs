@@ -146,7 +146,17 @@ pub struct JobCtx {
 
 /// Session/run key of a step.
 fn node_tab(job: &str, node: &str) -> String {
-    format!("job:{job}:{node}")
+    databrain_workspace::SessionRole::JobStep { job: job.into(), node: node.into() }.key()
+}
+
+/// Session of a step's load (writing rows into its target).
+fn step_load(step: &str) -> String {
+    databrain_workspace::SessionRole::Load(step.into()).key()
+}
+
+/// Session of a step's export (DuckDB writing the file).
+fn step_export(step: &str) -> String {
+    databrain_workspace::SessionRole::Export(step.into()).key()
 }
 
 fn emit(ctx: &JobCtx, run: &JobRun) {
@@ -674,8 +684,8 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
     }
     for n in &job.nodes {
         ctx.engine.release_sessions(&node_tab(&job.id, &n.id));
-        ctx.engine.release_sessions(&format!("{}:load", node_tab(&job.id, &n.id)));
-        ctx.engine.release_sessions(&format!("{}:export", node_tab(&job.id, &n.id)));
+        ctx.engine.release_sessions(&step_load(&node_tab(&job.id, &n.id)));
+        ctx.engine.release_sessions(&step_export(&node_tab(&job.id, &n.id)));
     }
     let any = |s: &str| status.values().any(|v| *v == s);
     for (id, st) in &status {
@@ -960,7 +970,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
         // By handle: exactly this run's rows, even if another step has the same name.
         let select = format!("select * from results.{}", output.handle);
         t.log("info", format!("Writing {} rows to {}", output.rows, path.display()), None, None, None);
-        let r = run_sql(ctx, duck_id, format!("{tab}:export"), copy_sql(&select, &tmp, node.export_format), None, Origin::Job, cancel, t).await;
+        let r = run_sql(ctx, duck_id, step_export(&tab), copy_sql(&select, &tmp, node.export_format), None, Origin::Job, cancel, t).await;
         if let Err(e) = r.and_then(|_| finish_export(&tmp, &path, replace).map_err(|e| EngineError::new("io", format!("cannot save {}: {e}", path.display()))))
         {
             let _ = std::fs::remove_file(&tmp);
@@ -985,7 +995,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
             )
         })?;
     }
-    let report = ctx.engine.write_output(&output.handle, target, &format!("{tab}:load"), &spec, cancel, t).await?;
+    let report = ctx.engine.write_output(&output.handle, target, &step_load(&tab), &spec, cancel, t).await?;
     Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices })
 }
 
@@ -1032,7 +1042,7 @@ pub async fn dry_run(ctx: &JobCtx, job: &Job, node_id: &str) -> Result<LoadDryRu
     let sql = if node.sql.trim().is_empty() { default_load_sql(&ups) } else { Some(node.sql.clone()) };
     // Not a `job:` tab: its result is not the step's output. One per dry
     // run: two at once on one session would share (and end) a transaction.
-    let tab = format!("dryrun:{}:{}:{}", job.id, node.id, uuid::Uuid::new_v4().simple());
+    let tab = databrain_workspace::SessionRole::DryRun(format!("{}:{}:{}", job.id, node.id, uuid::Uuid::new_v4().simple())).key();
     let cancel = CancellationToken::new();
     let (rows, rows_error) = match sql {
         None => (None, Some("Write the SQL that selects the rows to load, or connect an upstream step".to_string())),
@@ -1068,9 +1078,9 @@ pub async fn dry_run(ctx: &JobCtx, job: &Job, node_id: &str) -> Result<LoadDryRu
             }
         }
     };
-    let report = ctx.engine.dry_run_load(rows.as_ref(), rows_error, target, &format!("{tab}:load"), &load_spec(node)).await;
+    let report = ctx.engine.dry_run_load(rows.as_ref(), rows_error, target, &step_load(&tab), &load_spec(node)).await;
     ctx.engine.close_tab(&tab);
-    ctx.engine.release_sessions(&format!("{tab}:load"));
+    ctx.engine.release_sessions(&step_load(&tab));
     Ok(report)
 }
 

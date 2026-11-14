@@ -25,7 +25,7 @@ fn workspace_path() -> std::path::PathBuf {
 
 /// Serve MCP on stdin/stdout until the client closes it.
 pub fn main(_args: Vec<String>) -> ExitCode {
-    match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    match super::runtime() {
         Ok(rt) => rt.block_on(serve()),
         Err(e) => {
             eprintln!("databrain-mcp: {e}");

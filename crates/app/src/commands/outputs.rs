@@ -41,7 +41,7 @@ pub(crate) async fn output_diff_sql(
     keys: Vec<String>,
     mapping: Option<Vec<(String, String)>>,
     exact: Option<bool>,
-    options: Option<databrain_query_engine::outputs::CompareOptions>,
+    options: Option<databrain_query_engine::compare::CompareOptions>,
 ) -> R<String> {
     api::output_diff_sql(&state, &before, &after, keys, mapping.unwrap_or_default(), exact.unwrap_or(false), &options.unwrap_or_default())
 }
@@ -53,8 +53,8 @@ pub(crate) async fn output_compare_pairs(
     after: String,
     mapping: Option<Vec<(String, String)>>,
     exact: Option<bool>,
-    options: Option<databrain_query_engine::outputs::CompareOptions>,
-) -> R<Vec<databrain_query_engine::outputs::ComparePair>> {
+    options: Option<databrain_query_engine::compare::CompareOptions>,
+) -> R<Vec<databrain_query_engine::compare::ComparePair>> {
     api::output_compare_pairs(&state, &before, &after, mapping.unwrap_or_default(), exact.unwrap_or(false), &options.unwrap_or_default())
 }
 

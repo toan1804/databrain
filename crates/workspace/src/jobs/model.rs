@@ -119,7 +119,7 @@ pub struct StepOwner {
 impl StepOwner {
     /// Run key of the step (`RunRequest.tab_id` of its runs).
     pub fn tab(&self) -> String {
-        format!("job:{}:{}", self.job_id, self.node_id)
+        crate::SessionRole::JobStep { job: self.job_id.clone(), node: self.node_id.clone() }.key()
     }
     pub fn describe(&self) -> String {
         format!("step \"{}\" of job \"{}\"", self.step, self.job_name)

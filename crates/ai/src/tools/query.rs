@@ -46,7 +46,9 @@ impl ToolContext {
         }
         let cap = 1000usize;
         let run_sql = if review.kind.is_read() { policy::cap_rows(target.config.kind, &sql, cap) } else { sql.clone() };
-        let tab = format!("ai:{}", self.session_id.clone().unwrap_or_else(|| "mcp".into()));
+        let tab =
+            databrain_workspace::SessionRole::Ai { chat: self.session_id.clone().unwrap_or_else(|| "mcp".into()), part: databrain_workspace::AiPart::Query }
+                .key();
         let outcomes = self
             .engine
             .run_and_wait(
@@ -438,7 +440,11 @@ impl ToolContext {
                 &self.hub,
                 RunRequest {
                     connection_id: results_conn.id.clone(),
-                    tab_id: format!("ai-outputs:{}", self.session_id.clone().unwrap_or_else(|| "mcp".into())),
+                    tab_id: databrain_workspace::SessionRole::Ai {
+                        chat: self.session_id.clone().unwrap_or_else(|| "mcp".into()),
+                        part: databrain_workspace::AiPart::Outputs,
+                    }
+                    .key(),
                     output_masks: Some(self.output_masks(&sql)),
                     sql: policy::cap_rows(databrain_connector_core::ConnectorKind::Duckdb, &sql, 1000),
                     base_offset: 0,
@@ -514,7 +520,11 @@ impl ToolContext {
                 &self.hub,
                 RunRequest {
                     connection_id: self.profile.id.clone(),
-                    tab_id: format!("ai-sample:{}", self.session_id.clone().unwrap_or_default()),
+                    tab_id: databrain_workspace::SessionRole::Ai {
+                        chat: self.session_id.clone().unwrap_or_default(),
+                        part: databrain_workspace::AiPart::Sample,
+                    }
+                    .key(),
                     sql,
                     base_offset: 0,
                     row_limit: Some(n),

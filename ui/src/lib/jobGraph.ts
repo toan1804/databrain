@@ -1,6 +1,6 @@
 // Pure helpers for the job editor (graph edits, names, statuses). Tested
 // without a UI.
-import type { Job, JobEdge, JobNode, JobNodeKind, JobRun, NodeRunSummary } from "./types";
+import type { Job, JobEdge, JobNode, JobNodeKind, JobRun, NodeRunSummary, OutputInfo } from "./types";
 import { uid } from "./util";
 
 export const NODE_W = 220;
@@ -141,6 +141,28 @@ export function missingLinks(job: Job): { node: string; reads: string }[] {
     for (const m of n.sql.matchAll(/\bresults\s*\.\s*"?([A-Za-z_][A-Za-z0-9_]*)"?/gi)) {
       const other = job.nodes.find((x) => x.name.toLowerCase() === m[1].toLowerCase());
       if (other && other.id !== n.id && !ups.has(other.id) && !out.some((o) => o.node === n.id && o.reads === other.id)) out.push({ node: n.id, reads: other.id });
+    }
+  }
+  return out;
+}
+
+/**
+ * Steps that read a capped output from outside the job (`results.x` of a
+ * query tab that stopped at its row limit or memory): the run refuses them
+ * before they start, so they'd fail. As the runner checks: steps on DuckDB
+ * (a query step without a connection, every load and export step).
+ */
+export function cappedReads(job: Job, outputs: OutputInfo[], resultsConnectionId?: string | null): { node: string; reads: string; rows: number }[] {
+  const out: { node: string; reads: string; rows: number }[] = [];
+  const steps = new Set(job.nodes.map((n) => n.name.toLowerCase()));
+  for (const n of job.nodes) {
+    const onDuckdb = n.kind !== "query" || !n.connection_id || n.connection_id === resultsConnectionId;
+    if (!onDuckdb) continue;
+    for (const m of n.sql.matchAll(/\bresults\s*\.\s*"?([A-Za-z_][A-Za-z0-9_]*)"?/gi)) {
+      const name = m[1].toLowerCase();
+      if (steps.has(name) || out.some((o) => o.node === n.id && o.reads.toLowerCase() === name)) continue;
+      const o = outputs.find((o) => o.name?.toLowerCase() === name) ?? outputs.find((o) => o.handle.toLowerCase() === name);
+      if (o?.truncated) out.push({ node: n.id, reads: m[1], rows: o.rows });
     }
   }
   return out;

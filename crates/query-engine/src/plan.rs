@@ -23,6 +23,7 @@ use databrain_connector_core::{ConnectorKind, Session, query_table};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::guard::{Hold, Intent};
 use crate::{EngineError, QueryEngine, Result};
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, ts_rs::TS)]
@@ -106,12 +107,9 @@ impl QueryEngine {
         if analyze && classify(sql, kind).kind != StatementKind::Read {
             return Err(EngineError::new("invalid", "ANALYZE runs the statement: it is only offered for read queries"));
         }
-        let _claim = self.claim(
-            connection_id,
-            session_key,
-            databrain_connector_core::CancellationToken::new(),
-            "A query is running in this tab: wait for it or stop it first",
-        )?;
+        let hold =
+            Hold::session(session_key, databrain_connector_core::CancellationToken::new(), "A query is running in this tab: wait for it or stop it first");
+        let (_, _claim) = self.guarded_or_refuse(connection_id, Some(hold), Intent::Inspect)?;
         let session = self.session(connection_id, session_key).await?;
         let stuck = std::sync::atomic::AtomicBool::new(false);
         let r = explain_on(&*session, kind, sql, analyze, &stuck).await;
@@ -165,11 +163,24 @@ impl QueryEngine {
         // one). Looked at, not claimed: the editor asks for an estimate
         // while you type, and Run must not find the tab busy because of it.
         let busy = self.jobs.lock().values().any(|j| j.session_key == session_key || j.tab_id == session_key);
-        let tab = if busy || session_key.is_empty() { crate::META_TAB } else { session_key };
-        let run = self.with_tab(connection_id, tab, |s| {
+        let meta = crate::meta_tab();
+        let tab = if busy || session_key.is_empty() { meta.as_str() } else { session_key };
+        let estimate = |s: Arc<dyn databrain_connector_core::Session>| {
             let sql = sql.clone();
             async move { s.estimate_cost(&sql).await }
-        });
+        };
+        let run = async {
+            if tab == meta {
+                // The metadata session: reconnected once on a dropped connection.
+                return self.with_tab(connection_id, tab, estimate).await;
+            }
+            // The tab's session as it is, never reconnected from here: a
+            // script that started meanwhile would go on in a new session
+            // (without its transaction and temp tables). A dropped
+            // connection fails the estimate; the tab's next run reconnects.
+            let s = self.session(connection_id, tab).await?;
+            Ok(estimate(s).await?)
+        };
         match tokio::time::timeout(std::time::Duration::from_secs(60), run).await {
             Ok(r) => r?.ok_or_else(|| EngineError::new("unsupported", format!("{} gives no cost estimate before a run", kind.traits().name))),
             Err(_) => Err(EngineError::new("timeout", "The database took more than 60 s to estimate the query")),

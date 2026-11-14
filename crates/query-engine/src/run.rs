@@ -87,52 +87,25 @@ impl QueryEngine {
             return Err(EngineError::new("invalid", "Nothing to run"));
         }
         Self::bind_parameters(&mut plan, profile.config.kind, &req.params)?;
-        if profile.config.read_only {
-            // Only reads (and harmless USE/SET): a transaction or session
-            // statement could turn read-only off for what follows.
-            if let Some(p) = plan.iter().find(|p| !databrain_connector_core::sql::read_only_allows(&p.sql, &p.classification)) {
-                let why = if p.classification.kind.is_write() {
-                    ""
-                } else if p.classification.kind == StatementKind::Unknown {
-                    ": DataBrain can't tell that it only reads (it doesn't parse for this database, or part of it may run as a statement of its own)"
-                } else {
-                    ": on a read-only connection only queries run (transactions and session settings could make it writable)"
-                };
-                return Err(EngineError::new(
-                    "invalid",
-                    format!("Connection \"{}\" is read-only; statement {} ({}) was not run{why}.", profile.name, p.index + 1, p.classification.keyword),
-                ));
-            }
-        }
-        if !req.confirmed {
-            let reasons = Self::safety_reasons(&profile, &plan);
-            if !reasons.is_empty() {
-                return Ok(RunResponse::NeedsConfirmation { reasons, statements: plan });
-            }
-        }
         if let Some(n) = req.output_name.as_deref().filter(|n| !n.is_empty()) {
             outputs::validate_name(n)?;
             self.outputs.check_owner(n, &req.tab_id)?;
         }
         let job_id = uuid::Uuid::new_v4().to_string();
         let cancel = CancellationToken::new();
-        {
-            // Checked and claimed under one lock: two runs started at once
-            // on the same tab or session can't both pass the check.
-            let mut jobs = self.jobs.lock();
-            if jobs.values().any(|j| j.tab_id == req.tab_id || j.session_key == req.session_key()) {
-                return Err(EngineError::new("busy", "A query is already running in this tab"));
-            }
-            jobs.insert(
-                job_id.clone(),
-                JobHandle {
-                    connection_id: req.connection_id.clone(),
-                    tab_id: req.tab_id.clone(),
-                    session_key: req.session_key().to_string(),
-                    cancel: cancel.clone(),
-                    tab_closed: false,
-                },
-            );
+        // Read-only and production checks, then the tab and its session
+        // claimed under one lock: two runs started at once on the same tab
+        // or session can't both pass.
+        let hold = Hold {
+            session_key: req.session_key(),
+            cancel: cancel.clone(),
+            busy: "A query is already running in this tab",
+            run: Some((&req.tab_id, job_id.clone())),
+        };
+        match self.guarded(&req.connection_id, Some(hold), Intent::Run { plan: &plan, confirmed: req.confirmed })? {
+            Guarded::Ask { reasons } => return Ok(RunResponse::NeedsConfirmation { reasons, statements: plan }),
+            // The job's task ends the entry (`JobGuard`, `run_job`).
+            Guarded::Go { claim, .. } => claim.expect("held").keep(),
         }
         // Previous outputs of this tab become "recent" (evictable).
         self.outputs.begin_run(&req.tab_id);
@@ -431,9 +404,12 @@ impl QueryEngine {
         let mut rows = 0usize;
         // Bytes kept: a row limit alone doesn't bound wide rows.
         let mut bytes = 0usize;
-        // Half the outputs budget: one result can't take all of it from the
-        // other outputs (active ones are never freed).
-        let max_bytes = self.outputs.budget() / 2;
+        // Half the outputs budget, less what this run's earlier results hold
+        // in memory: a script's results are all active (never freed), so
+        // together they stay within it too. At least 4 MB, so a small
+        // result still shows.
+        let earlier: usize = (0..stmt.index).map(|i| self.results.bytes_of(&format!("{job_id}:{i}"))).sum();
+        let max_bytes = (self.outputs.budget() / 2).saturating_sub(earlier).max(4 << 20);
         let mut too_big = false;
         // Free memory of the computer when it ran low (and the result stopped).
         let mut low_free: Option<u64> = None;

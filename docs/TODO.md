@@ -8,27 +8,6 @@ Found in reviews and left for a later release on purpose. Each says what goes wr
 - If an MCP client kills `databrain-mcp.exe` without closing its stdin, the child `databrain.exe mcp` may keep running (no job object ties them).
 - `databrain-jobs run` / `list` output in a terminal goes through the GUI-subsystem launcher's console attach; check it prints in cmd and PowerShell.
 
-## Query engine (review of 2026-11-12; see [QUERY_ENGINE.md](QUERY_ENGINE.md))
-
-The review's findings are fixed (loads can't control their transaction and ask on production connections, a run's job guard, one transaction dialect with a savepoint for grid edits, session claims for plans, edits, Commit/Rollback and exports, a memory cap per result, outputs freed with their rows, and the low items). Left, as refactors:
-
-- **One guarded entry point.** Read-only and production checks are still made by each entry point (`start_run`, `prepare_load`, `edit_target`), next to the `claim`. `engine.guarded(session_key, origin, intent)` returning the claim after those checks would keep a new entry point from skipping one.
-- **Split `outputs.rs`** into `outputs/registry.rs`, `outputs/duckdb.rs` and `compare.rs`. `ResultStore::remove` is still public: other crates are expected to call `OutputRegistry::release_result` (an output whose rows are gone would stay listed otherwise); making it crate-private needs the result store's other users (`library.rs`) to go through the registry too.
-- **AI chat tabs** (`ai:{session}`) close when the chat is deleted, not when it is left: the last outputs of an open chat stay active (never evicted) until then or a restart.
-- **Typed session roles.** `enum SessionRole { Tab, Notebook, Meta, Index, Ai, JobStep, Load, Export }` instead of string keys (`__meta__`, `ai:…`), with idle close, reconnect, sandbox and cleanup decided per role.
-- `blocking()` (`lib.rs`) hands the worker thread over only on a multi-thread runtime; on a current-thread one the workspace and file writes still block it.
-
-Left from the final review (2026-11-13):
-
-- MySQL statements that commit by themselves without being transaction control (`SET PASSWORD`, `RESET …`, `LOAD INDEX INTO CACHE`) in a load's before/after SQL: a dry run on MySQL uses a transaction and would keep its sample rows after one. Use the transaction method on MySQL only when every user statement is a read or DML.
-- A grid edit that fails with an error that ends the whole transaction (SQL Server `XACT_ABORT`, a deadlock, DuckDB's aborted transaction): the savepoint rollback fails and the message says the earlier changes are pending when they are gone.
-- The cost preview only looks at the tab (it must not make Run busy): when it reconnects after a connection error while a script runs, the script's next statement lands on the new session.
-- The memory cap is per result: a script whose results are all active can hold several times the budget; `get_array_memory_size` counts buffers shared between batches once per batch.
-- `release_result` on a pinned output when no snapshot directory is set removes the output (only the AI's sample path calls it).
-- Implicit transactions (SQL Server `IMPLICIT_TRANSACTIONS ON`, Snowflake `AUTOCOMMIT = FALSE`) keep the session (`TxState::Unknown`) but don't show Commit/Rollback or warn on closing the tab (`QueryEngine::in_transaction` counts `Open` only). Not followed: `SET ANSI_DEFAULTS ON`, `autocommit = 'false'` written as a string. A one-batch `begin tran … commit` on SQL Server stays "open" (conservative). With implicit transactions on, manual commit's own `BEGIN` may nest on SQL Server.
-- Job steps: a DuckDB Query step reading a tab's row-limited `results.x` on purpose now fails before it runs (it would pass part of the rows on); say so in the job editor.
-- `loadResultAsking`: when the server asks (the UI didn't know the connection is production), progress and Stop already show during the prompt.
-
 ## Explorer and AI index (left from the review of 2026-11-12)
 
 - PostgreSQL row estimates are refreshed only when the schema changes: the explorer fingerprint leaves out `reltuples`, and since index runs use the same fingerprint (2026-11-13) they skip such schemas too, so the AI's row estimates go stale as well.

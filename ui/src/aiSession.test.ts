@@ -8,6 +8,7 @@ const sent: { session_id?: string | null; context?: { connections?: string[] } }
 let n = 0;
 const responses: { request_id: string; body: unknown }[] = [];
 const cancelled: string[] = [];
+const left: string[] = [];
 /** When set, ai_send only returns the run id; the test sends the events. */
 let manual = false;
 /** What ai_respond answers: delivered (true), nothing waits (false), or a failure. */
@@ -28,6 +29,9 @@ vi.mock("./lib/api", () => ({
     aiCancel: async (run_id: string) => {
       cancelled.push(run_id);
       return true;
+    },
+    aiLeaveSession: async (id: string) => {
+      left.push(id);
     },
     aiSessions: async () => [],
     aiSessionMessages: async () => [],
@@ -147,9 +151,10 @@ describe("several conversations", () => {
     expect(chatA().unread).toBe(false);
     expect(ai().items).toBe(chatA().items);
 
-    // Closing B stops its run; A stays.
+    // Closing B stops its run and lets its results go (it stays in history); A stays.
     ai().closeChat(b);
     expect(cancelled).toContain(runB);
+    expect(left).toEqual(["sB"]);
     expect(ai().chats.some((c) => c.id === b)).toBe(false);
     expect(ai().activeChatId).toBe(a);
     manual = false;

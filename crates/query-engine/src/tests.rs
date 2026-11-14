@@ -272,6 +272,30 @@ async fn per_connection_idle_time_and_connect_timeout() {
     assert_eq!(f.engine.connect_timeout_for(&cfg), Duration::from_secs(3), "kept within 3–600");
 }
 
+/// A load's or export's session its owner didn't close goes at the next
+/// sweep even when sessions never close when idle; a tab's stays, and one
+/// still in use stays.
+#[tokio::test]
+async fn left_over_one_off_sessions_close_at_the_next_sweep() {
+    let f = fixture(EnvTag::None);
+    let keys = |f: &Fixture| {
+        let mut v: Vec<String> = f.engine.sessions.lock().keys().map(|(_, t)| t.clone()).collect();
+        v.sort();
+        v
+    };
+    let tab = SessionRole::Tab("tab1".into()).key();
+    let load = SessionRole::Load("l1".into()).key();
+    let export = SessionRole::Export("e1".into()).key();
+    drop(f.engine.session(&f.conn_id, &tab).await.unwrap());
+    drop(f.engine.session(&f.conn_id, &load).await.unwrap());
+    let held = f.engine.session(&f.conn_id, &export).await.unwrap();
+    assert_eq!(f.engine.close_idle_with(None), 1, "never idle-closes, but the load's goes");
+    assert_eq!(keys(&f), vec![export.clone(), tab.clone()]);
+    drop(held);
+    assert_eq!(f.engine.close_idle_with(None), 1, "the export's, once nobody uses it");
+    assert_eq!(keys(&f), vec![tab]);
+}
+
 #[tokio::test]
 async fn idle_sessions_close_but_not_mid_transaction() {
     let f = fixture(EnvTag::None);
@@ -451,7 +475,7 @@ async fn reconnect_closes_metadata_and_idle_tabs_only() {
         v.sort();
         v
     };
-    assert_eq!(keys(&f), vec![META_TAB.to_string(), "tab1".to_string()]);
+    assert_eq!(keys(&f), vec![meta_tab(), "tab1".to_string()]);
     assert_eq!(f.engine.reconnect(&f.conn_id), 2);
     assert!(f.engine.connected_ids().is_empty());
     // The next catalog call reconnects on its own.
@@ -789,6 +813,39 @@ fn outcome(evs: &[JobEvent]) -> (databrain_result_store::ResultInfo, Vec<String>
         .expect("finished")
 }
 
+/// A script's results share the memory a result may keep: with the budget
+/// at its 16 MB floor (8 MB a result), a second ~5 MB result after a first
+/// one stops at what's left, at least 4 MB (no spill folder here), while
+/// either alone fits.
+#[tokio::test]
+async fn a_scripts_results_share_the_memory_a_result_may_keep() {
+    let f = fixture(EnvTag::Dev);
+    f.engine.outputs().set_budget(0);
+    let one = "with recursive n(i) as (select 1 union all select i + 1 from n where i < 70000) select i, printf('%040d', i) as s from n";
+    let run = |sql: String| {
+        let mut r = req(&f, &sql);
+        r.row_limit = None;
+        r
+    };
+    let evs = wait_job(&f, &started(f.engine.run(run(one.to_string())).unwrap())).await;
+    let (alone, _) = outcome(&evs);
+    assert!(!alone.truncated && alone.total_rows == 70000, "alone it fits: {alone:?}");
+    let evs = wait_job(&f, &started(f.engine.run(run(format!("{one};\n{one}"))).unwrap())).await;
+    let infos: Vec<_> = evs
+        .iter()
+        .filter_map(|e| match e {
+            JobEvent::StatementFinished { result: Some(r), .. } => Some(r.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(infos.len(), 2);
+    assert!(!infos[0].truncated && infos[0].total_rows == 70000, "{:?}", infos[0]);
+    assert!(infos[1].truncated && infos[1].total_rows < 70000, "the second stops at what's left: {:?}", infos[1]);
+    // What's left of the 8 MB, or the 4 MB every result may keep.
+    let left = (8usize << 20).saturating_sub(infos[0].bytes).max(4 << 20);
+    assert!(infos[1].bytes <= left, "{} > {left}", infos[1].bytes);
+}
+
 /// A result stops loading when the computer runs low on free memory, keeping
 /// the rows so far and saying why; with memory to spare it loads in full.
 #[tokio::test]
@@ -949,4 +1006,200 @@ async fn a_run_that_dies_frees_its_tab() {
     assert!(crate::run::finished(RunStatus::Error, vec![view(None)]).is_err(), "died");
     assert!(crate::run::finished(RunStatus::Error, vec![view(Some("syntax"))]).is_ok(), "a statement's error is in its outcome");
     assert!(crate::run::finished(RunStatus::Success, vec![view(None)]).is_ok());
+}
+
+// ------------------------------------------------------------------ guard
+
+fn set_conn(f: &Fixture, change: impl FnOnce(&mut ConnectionProfile)) {
+    let mut p = f.ws.get_connection(&f.conn_id).unwrap();
+    change(&mut p);
+    f.ws.save_connection(p).unwrap();
+}
+
+/// Each intent's rules: what a read-only connection refuses, what
+/// production asks, and what passes.
+#[test]
+fn intents_are_checked_against_the_connection() {
+    use crate::guard::Intent;
+    let f = fixture(EnvTag::None);
+    let profile = || f.ws.get_connection(&f.conn_id).unwrap();
+    let p = profile();
+    let read = f.engine.plan(&p, "select 1");
+    let write = f.engine.plan(&p, "update t set a = 1 where id = 1");
+    let check = |p: &ConnectionProfile, i: Intent| QueryEngine::check_intent(p, &i);
+
+    // Allowed on a plain connection: everything, nothing to confirm.
+    for i in [
+        Intent::Run { plan: &write, confirmed: false },
+        Intent::Load { table: "t", confirmed: false, dry: false },
+        Intent::Edit,
+        Intent::Inspect,
+        Intent::EndTransaction,
+    ] {
+        assert_eq!(check(&p, i).unwrap(), Vec::<String>::new());
+    }
+
+    // Read-only: reads, plans and Commit/Rollback only.
+    set_conn(&f, |p| p.config.read_only = true);
+    let ro = profile();
+    assert!(check(&ro, Intent::Run { plan: &read, confirmed: false }).unwrap().is_empty());
+    let e = check(&ro, Intent::Run { plan: &write, confirmed: true }).unwrap_err();
+    assert!(e.message.contains("is read-only; statement 1 (UPDATE) was not run"), "{}", e.message);
+    let e = check(&ro, Intent::Load { table: "t", confirmed: true, dry: true }).unwrap_err();
+    assert!(e.message.contains("read-only; nothing was written"), "{}", e.message);
+    assert_eq!(check(&ro, Intent::Edit).unwrap_err().message, "The connection is read-only");
+    assert!(check(&ro, Intent::Inspect).unwrap().is_empty() && check(&ro, Intent::EndTransaction).unwrap().is_empty());
+
+    // Production: writes ask until confirmed; a dry run and reads don't.
+    set_conn(&f, |p| {
+        p.config.read_only = false;
+        p.env = EnvTag::Prod;
+    });
+    let prod = profile();
+    assert!(check(&prod, Intent::Run { plan: &read, confirmed: false }).unwrap().is_empty());
+    let asks = check(&prod, Intent::Run { plan: &write, confirmed: false }).unwrap();
+    assert!(asks.iter().any(|r| r.contains("production connection")), "{asks:?}");
+    assert!(check(&prod, Intent::Run { plan: &write, confirmed: true }).unwrap().is_empty());
+    let asks = check(&prod, Intent::Load { table: "t", confirmed: false, dry: false }).unwrap();
+    assert!(asks[0].contains("confirm writing rows into t"), "{asks:?}");
+    assert!(check(&prod, Intent::Load { table: "t", confirmed: true, dry: false }).unwrap().is_empty());
+    assert!(check(&prod, Intent::Load { table: "t", confirmed: false, dry: true }).unwrap().is_empty());
+}
+
+/// A refused or unconfirmed start claims nothing (the tab stays free); an
+/// allowed one holds the session until its claim drops.
+#[test]
+fn the_guard_claims_only_what_it_lets_through() {
+    use crate::guard::{Guarded, Hold, Intent};
+    let f = fixture(EnvTag::Prod);
+    let p = f.ws.get_connection(&f.conn_id).unwrap();
+    let write = f.engine.plan(&p, "delete from t where id = 1");
+    let hold = || Some(Hold::session("tab1", Default::default(), "held"));
+    assert!(matches!(f.engine.guarded(&f.conn_id, hold(), Intent::Run { plan: &write, confirmed: false }).unwrap(), Guarded::Ask { .. }));
+    let e = f.engine.guarded_or_refuse(&f.conn_id, hold(), Intent::Load { table: "t", confirmed: false, dry: false }).err().unwrap();
+    assert_eq!(e.code.as_deref(), Some("needs_confirmation"));
+    set_conn(&f, |p| p.config.read_only = true);
+    assert!(f.engine.guarded(&f.conn_id, hold(), Intent::Edit).is_err());
+    // Nothing above holds tab1.
+    let (_, claim) = f.engine.guarded_or_refuse(&f.conn_id, hold(), Intent::Inspect).unwrap();
+    assert!(claim.is_some());
+    assert_eq!(f.engine.guarded_or_refuse(&f.conn_id, hold(), Intent::EndTransaction).err().map(|e| e.message).as_deref(), Some("held"));
+    drop(claim);
+    assert!(f.engine.guarded_or_refuse(&f.conn_id, hold(), Intent::EndTransaction).is_ok());
+}
+
+/// Saving grid edits checks the connection itself: made read-only after
+/// the editor read the target, the save is refused and nothing runs.
+#[tokio::test]
+async fn edits_are_refused_on_a_connection_made_read_only() {
+    let f = fixture(EnvTag::None);
+    wait_job(&f, &started(f.engine.run(req(&f, "create table t (id integer primary key, a text); insert into t values (1, 'x')")).unwrap())).await;
+    let target = crate::edit::EditTarget {
+        connection_id: f.conn_id.clone(),
+        schema: "main".into(),
+        table: "t".into(),
+        key_columns: vec![0],
+        columns: vec![Some("id".into()), Some("a".into())],
+        apply: "transaction".into(),
+    };
+    let stmts = [crate::edit::EditStatement { sql: "UPDATE t SET a = 'y' WHERE id = 1".into(), expect_rows: Some(1) }];
+    set_conn(&f, |p| p.config.read_only = true);
+    let e = f.engine.apply_edits(&target, "tab1", &stmts).await.unwrap_err();
+    assert_eq!(e.message, "The connection is read-only");
+    // Allowed again: saved (the refused save left the tab free).
+    set_conn(&f, |p| p.config.read_only = false);
+    let rep = f.engine.apply_edits(&target, "tab1", &stmts).await.unwrap();
+    assert_eq!(rep.statements, 1);
+}
+
+// ------------------------------------------------------------------ cost preview
+
+/// A Snowflake stand-in whose estimates fail with a dropped connection.
+struct DroppingConnector(Arc<std::sync::atomic::AtomicUsize>);
+struct DroppingSession;
+
+#[async_trait::async_trait]
+impl databrain_connector_core::Connector for DroppingConnector {
+    fn info(&self) -> databrain_connector_core::ConnectorInfo {
+        databrain_connector_core::ConnectorInfo {
+            kind: ConnectorKind::Snowflake,
+            traits: ConnectorKind::Snowflake.traits(),
+            display_name: "Snowflake (test)",
+            default_port: None,
+            uses_file: false,
+            auth_methods: vec![],
+            capabilities: databrain_connector_core::Capabilities { ssh: false },
+            fields: vec![],
+            note: None,
+        }
+    }
+    async fn connect(&self, _: &ConnectionConfig, _: Arc<dyn CredentialSource>) -> databrain_connector_core::Result<Box<dyn Session>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(DroppingSession))
+    }
+}
+
+#[async_trait::async_trait]
+impl Session for DroppingSession {
+    fn kind(&self) -> ConnectorKind {
+        ConnectorKind::Snowflake
+    }
+    async fn server_version(&self) -> databrain_connector_core::Result<String> {
+        Ok("test".into())
+    }
+    async fn ping(&self) -> databrain_connector_core::Result<()> {
+        Ok(())
+    }
+    async fn execute(&self, _: &str, _: ExecOptions) -> databrain_connector_core::Result<databrain_connector_core::QueryStream> {
+        Err(ConnectorError::connection("gone"))
+    }
+    async fn list_schemas(&self) -> databrain_connector_core::Result<Vec<SchemaInfo>> {
+        Ok(vec![])
+    }
+    async fn list_objects(&self, _: &str) -> databrain_connector_core::Result<Vec<DbObject>> {
+        Ok(vec![])
+    }
+    async fn describe(&self, _: &str, _: &str) -> databrain_connector_core::Result<ObjectDetail> {
+        Err(ConnectorError::connection("gone"))
+    }
+    async fn estimate_cost(&self, _: &str) -> databrain_connector_core::Result<Option<databrain_connector_core::CostEstimate>> {
+        Err(ConnectorError::connection("connection reset"))
+    }
+}
+
+/// The cost preview never replaces the tab's session: after a dropped
+/// connection the estimate fails and the session a script may be using
+/// stays; on the metadata session it reconnects once.
+#[tokio::test]
+async fn the_cost_preview_never_reconnects_the_tabs_session() {
+    let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut reg = ConnectorRegistry::new();
+    reg.register(Arc::new(DroppingConnector(connects.clone())));
+    let ws = Arc::new(Workspace::open_in_memory().unwrap());
+    let p = ws
+        .save_connection(ConnectionProfile {
+            id: String::new(),
+            name: "Snow".into(),
+            config: ConnectionConfig::new(ConnectorKind::Snowflake, AuthMethod::None),
+            color: None,
+            env: EnvTag::None,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    let engine = QueryEngine::new(reg, ws, Arc::new(MemoryStore::default()), Arc::new(ResultStore::new()), Arc::new(CollectingSink::default()));
+    let tab = engine.session(&p.id, "tab1").await.unwrap();
+    let n = || connects.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(n(), 1);
+    let e = engine.estimate_cost(&p.id, "tab1", "select 1").await.unwrap_err();
+    assert!(e.message.contains("connection reset"), "{}", e.message);
+    assert_eq!(n(), 1, "no new session for the tab");
+    let now = engine.sessions.lock().get(&(p.id.clone(), "tab1".to_string())).map(|l| l.session.clone()).unwrap();
+    assert!(Arc::ptr_eq(&now, &tab), "the tab keeps its session");
+    // The metadata session (the tab busy, or no tab): one reconnect.
+    assert!(engine.estimate_cost(&p.id, "", "select 1").await.is_err());
+    assert_eq!(n(), 3, "metadata: connect, then reconnect once");
 }

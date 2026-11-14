@@ -12,9 +12,12 @@ Main files:
 | `sessions.rs` | `session_for`, idle close, `disconnect`, `reconnect`, `close_tab`, manual commit, `with_meta` / `with_tab` |
 | `run.rs` | `plan`, `bind_parameters`, `safety_reasons`, `start_run`, `run_and_wait`, `run_job`, `collect_stream`, `cancel` |
 | `events.rs` | `JobEvent`, `EventSink`, `EventHub`, `StatementOutcomeView`, export progress types |
-| `outputs.rs` | `OutputRegistry` (handles, names, versions, pinning, budget, snapshots), `OutputTables` (DuckDB `results.<name>`), compare SQL |
+| `outputs/registry.rs` | `OutputRegistry` (handles, names, versions, pinning, budget, snapshots); the only code that frees a result's rows (`release_result`, `drop_history_result`; `ResultStore::remove` is for it alone) |
+| `outputs/duckdb.rs` | `OutputTables` (DuckDB `results.<name>`), the types SQL sees (`sql_ready`) |
+| `compare.rs` | Compare SQL for two outputs (column pairs, canonical values, summary, key candidates) |
 | `load.rs` | Load steps: `load_rows`, `write_output`, `dry_run_load`, `check_load_target` |
 | `edit.rs` | Grid edits: `source_table`, `edit_target`, `edit_statements`, `apply_edits` |
+| `guard.rs` | `guarded`: the one way work starts on a connection: the read-only and production rules for its `Intent` (`check_intent`), then the session's claim |
 | `plan.rs` | `explain`, `estimate_cost`, plan parsers per engine |
 | `export.rs` | Full export: `export_query`, `cancel_export` |
 | `metadata.rs` | Catalog reads on the metadata session |
@@ -54,22 +57,25 @@ One `Arc<QueryEngine>` per process (`QueryEngine::new` in `lib.rs`). Every map i
 | `manual_commit` | set of session keys | `set_manual_commit(key, false)` (the app calls it on tab close) |
 | `outputs` | `Arc<OutputRegistry>` (own lock, see below) | |
 
-`jobs` is also the "busy" list: `start_run` checks and claims a tab and its session key under one lock. `explain`, `apply_edits`, `end_transaction` and an export on a tab's session take a `Claim` (`sessions.rs` `claim`): the same check and insert under one lock, removed when the claim drops, so nothing else starts on the session meanwhile. The cost preview only looks (it runs while you type, and must not make Run find the tab busy): it uses `__meta__` when the tab is held.
+`jobs` is also the "busy" list. Every entry point starts with `guarded(connection, hold, intent)` (`guard.rs`): it reads the connection, applies the read-only and production rules for the `Intent` (`Run`, `Load`, `Edit`, `Inspect`, `EndTransaction`), and only then takes a `Claim` (`sessions.rs` `claim` / `claim_as`): the check and insert under one lock, removed when the claim drops (a run keeps it: its job ends it), so nothing else starts on the session meanwhile. A refused or unconfirmed start claims nothing. The cost preview only looks (it runs while you type, and must not make Run find the tab busy): it uses `Meta` (`__meta__`) when the tab is held.
 
 ## Sessions
 
 A session is one database connection, found by `(connection_id, tab)`. `session_for` (`sessions.rs`) returns the live one or connects: `Connector::prepare`, `preflight` (`probe.rs`), then tunnel + stored secret + handshake inside the connect timeout (`connect_timeout_for`; not applied to browser sign-in or local files). A refused sign-in refreshes the credential once and tries again.
 
-| Tab key | Used by | Closed by |
+Keys are built and read as a `SessionRole` (`databrain_workspace::SessionRole`: `parse(key)` / `key()`); what happens to a session is decided by its role: `catalog_only` (Meta, Index: closed by Refresh and the DuckDB sandbox switch at any time), `one_off` (Load, Export, DryRun: closed by their owner, or at the next idle sweep when left over, even with idle disconnect off), `is_ai`.
+
+| Role (key) | Used by | Closed by |
 |---|---|---|
-| the editor tab id | runs of the tab, its plans, grid edits, Commit / Rollback | `close_tab`, idle close |
-| `nb:{notebook}` (`RunRequest::session_key`) | every cell of a notebook; each cell keeps its own `tab_id` for results | `close_tab` from `api/library.rs` |
-| `__meta__` (`META_TAB`) | explorer, completion, `check_sql`, `describe`, test data's reads, cost preview while the tab is busy | `reconnect`, idle close |
-| `__index__` (`INDEX_TAB`) | `bulk_metadata`: reading columns for the AI, schema compare, related rows. Local files use `__meta__` (`index_tab`) | `end_index_session`, `reconnect` |
-| `ai:{session}`, `ai-outputs:{session}`, `ai-sample:{session}` | AI and MCP tools (`crates/ai/src/tools/query.rs`) | idle close |
-| `job:{job}:{node}`, `…:load`, `…:export`, `dryrun:…` | job steps (`crates/app/src/jobs.rs`) | `release_sessions`, `close_tab` |
-| `__load__:{id}`, `__loadcheck__:{uuid}` | "Load into…" and its dry run (`api/results.rs`) | `close_tab` right after |
-| `__export__:{id}` | a full export on its own session | `drop_session` when it ends |
+| `Tab` (the editor tab id) | runs of the tab, its plans, grid edits, Commit / Rollback | `close_tab`, idle close |
+| `Notebook` (`nb:{notebook}`, cells `nb:{notebook}:{cell}`) | every cell of a notebook shares `nb:{notebook}` (`RunRequest::session_key`); each cell keeps its own `tab_id` for results | `close_tab` from `api/library.rs` |
+| `Meta` (`__meta__`) | explorer, completion, `check_sql`, `describe`, test data's reads, cost preview while the tab is busy | `reconnect`, idle close |
+| `Index` (`__index__`) | `bulk_metadata`: reading columns for the AI, schema compare, related rows. Local files use `Meta` (`index_tab`) | `end_index_session`, `reconnect` |
+| `Ai { chat, part }` (`ai:`, `ai-outputs:`, `ai-sample:` + chat) | AI and MCP tools (`crates/ai/src/tools/query.rs`) | idle close; `close_tab` of each part when the chat is deleted |
+| `JobStep` (`job:{job}:{node}`), `Load`/`Export` of a step, `DryRun` (`dryrun:…`) | job steps (`crates/app/src/jobs.rs`) | `release_sessions`, `close_tab` |
+| `Load` (`__load__:{id}`, `__load__:check:{uuid}`) | "Load into…" and its dry run (`api/results.rs`) | `close_tab` right after |
+| `Export` (`__export__:{id}`) | a full export on its own session | `drop_session` when it ends |
+| `TestData` (`__testdata__:…`) | owns generated test data's output; no session | — |
 
 Rules:
 
@@ -85,12 +91,13 @@ Rules:
 RunRequest ──► start_run (run.rs, synchronous)
    1. plan: split_statements + classify           (connector-core)
    2. bind_parameters (:name), classify again
-   3. read-only connection: every statement must pass read_only_allows → else "invalid"
-   4. not confirmed and safety_reasons non-empty  → RunResponse::NeedsConfirmation
-   5. output name: validate_name, check_owner (job steps own their names)
-   6. jobs lock: tab or session key already there → "busy"; else insert JobHandle
-   7. outputs.begin_run(tab): the tab's previous outputs become evictable, except kept ones
-   8. tokio::spawn(run_job)                       → RunResponse::Started { job_id, statements }
+   3. output name: validate_name, check_owner (job steps own their names)
+   4. guarded(Intent::Run): read-only connection → every statement must pass
+      read_only_allows, else "invalid"; not confirmed and safety_reasons
+      non-empty → RunResponse::NeedsConfirmation; then claim_as (jobs lock:
+      tab or session key already there → "busy"; else insert JobHandle)
+   5. outputs.begin_run(tab): the tab's previous outputs become evictable, except kept ones
+   6. tokio::spawn(run_job)                       → RunResponse::Started { job_id, statements }
 
 run_job, per statement, stops at the first error or cancel
    StatementStarted
@@ -128,7 +135,8 @@ after the loop
 ## Transactions
 
 - **Auto-commit** is the default: the engine sends statements as written.
-- **Manual commit** (`set_manual_commit`, per session key; the UI offers it for Postgres, MySQL, SQL Server, SQLite, DuckDB and Snowflake, `TX_KINDS` in `EditorPane.tsx`): before DML (and DDL, except on MySQL) `begin_if_manual` sends the engine's BEGIN (`edit::apply_style`) when `in_transaction()` is false.
+- **Manual commit** (`set_manual_commit`, per session key; the UI offers it for Postgres, MySQL, SQL Server, SQLite, DuckDB and Snowflake, `TX_KINDS` in `EditorPane.tsx`): before DML (and DDL, except on MySQL) `begin_if_manual` sends the engine's BEGIN (`edit::apply_style`) unless one is open (`needs_begin`: not for `Open`, nor for `Unknown` on SQL Server and Snowflake, where it means implicit transactions: the write opens one, and a BEGIN would nest).
+- **Implicit transactions** (SQL Server `IMPLICIT_TRANSACTIONS ON`, also through `ANSI_DEFAULTS ON`; `AUTOCOMMIT = FALSE`, quoted or not) are followed from the statements (`ConnState`): the session reports `Unknown` (kept, as if open) until a write, then `Open` (Commit/Rollback show, closing the tab warns) until COMMIT or ROLLBACK. Conservative by design: a one-batch `begin tran … commit` on SQL Server stays open (the batch's first word counts).
 - **State** is `Session::transaction_state()`: the badge (`QueryEngine::in_transaction`, `JobFinished.in_transaction`) and Commit/Rollback use only a known open one; idle close and Refresh keep a session whose state is unknown.
 - **Commit / Rollback**: `end_transaction` refuses while a job uses the session, then sends `COMMIT` (repeated while a transaction is still open, for SQL Server's nesting; 32 at most) or `ROLLBACK`.
 - A session with an open transaction is never closed for being idle and survives `reconnect`. `disconnect` and `close_tab` drop it, which rolls back on the server.
@@ -139,13 +147,13 @@ after the loop
 | Check | Where | Applies to |
 |---|---|---|
 | Classification (`Read`, `Dml`, `Ddl`, `Session`, `Transaction`, `Other`, `Unknown`) | `connector-core/src/sql/classify.rs` | everything below |
-| Read-only connection: only reads and harmless `USE` / `SET` | `start_run` (`read_only_allows`); `prepare_load`; `edit_target`. Postgres also sets the transaction read-only in its connector | runs, loads, grid edits |
+| Read-only connection: only reads and harmless `USE` / `SET` | `check_intent` (`guard.rs`) for every entry point: `Run` (`read_only_allows`), `Load`, `Edit` (opening the editor and saving). Postgres also sets the transaction read-only in its connector | runs, loads, grid edits |
 | UPDATE / DELETE without WHERE asks | `safety_reasons` | runs with `confirmed: false` |
 | Production connection: all but reads, transaction control and harmless `USE` / `SET` ask | `prod_needs_confirmation`, `safety_reasons` | runs with `confirmed: false` |
-| One run per tab / session | `start_run` (`jobs`), `claim` | runs, plans, grid edits, Commit/Rollback, exports on a tab's session |
+| One run per tab / session | `guarded` → `claim` / `claim_as` (`jobs`) | runs, plans, grid edits, Commit/Rollback, exports and loads' source queries on a tab's session |
 | Full export runs one read statement | `export_query` | export |
 | Plans: one statement; `EXPLAIN ANALYZE` only for reads | `explain` | plans |
-| Production connection: a load asks (`needs_confirmation`); job load steps count as confirmed | `prepare_load` (`LoadSpec::confirmed`) | loads, not dry runs |
+| Production connection: a load asks (`needs_confirmation`); job load steps count as confirmed | `check_intent` `Intent::Load` (`LoadSpec::confirmed`) | loads, not dry runs |
 | A result keeps at most half the outputs budget in memory | `collect_stream` | runs |
 | Cost preview: one statement, read or DML | `cost_statement` | cost preview |
 | DuckDB sandbox for AI and MCP SQL | `sandboxed`, `session_for`; enforced in the DuckDB connector | runs and loads with `origin` Ai / Mcp |
@@ -168,7 +176,7 @@ Every result set of a run becomes an output (`OutputRegistry::add`): handle `rN`
 | `Evicted` | Rows gone, metadata kept; at most `MAX_ENTRIES` (400) entries in all, oldest evicted ones dropped first (`trim_entries`). |
 
 - **Names.** `set_name` moves a name to the newest output; older ones become `name__1` … (`KEEP_VERSIONS` = 5). A job step's name belongs to it (`check_owner`).
-- **Freed by:** `close_tab` (the tab's unnamed, unpinned outputs; an AI chat's tab `ai:{session}` closes when the chat is deleted), `enforce_budget`, `remove` / `remove_unpinned`, `release_result` (the AI's sample rows, the UI's release: the output goes with its rows), a version past the fifth, an unfinished statement (`Unfinished` in `run.rs`). A pin whose snapshot can't be written is undone.
+- **Freed by:** `close_tab` (the tab's unnamed, unpinned outputs; an AI chat's tabs close when the chat is deleted; closing a chat in the panel, which keeps it in history, only makes its outputs evictable: `leave_tab`), `enforce_budget`, `remove` / `remove_unpinned`, `release_result` (the AI's sample rows, the UI's release: the output goes with its rows), a version past the fifth, an unfinished statement (`Unfinished` in `run.rs`). A pin whose snapshot can't be written is undone.
 - **On quit** `persist_active` saves each tab's latest outputs (64 MB each, 512 MB in all; a result on disk isn't saved, so its tab is empty after a restart) and drops saved ones that are no longer current; `set_snapshot_dir` restores them for tabs that still exist.
 - **SQL over outputs.** `OutputTables` implements `ExternalTables`: DuckDB sessions read `results.<handle or name>` through `ensure_loaded` and `sql_ready_all` (decimal text becomes `DECIMAL`).
 - **Compare.** `diff_sql_opts`, `compare_summary_sql`, `key_candidates`, `unique_check_sql` build DuckDB SQL over two outputs; the app runs it on the "Results (DuckDB)" connection (`results_connection`).
@@ -208,7 +216,7 @@ Refusals (read-only, busy, nothing to run) are returned by `start_run`. Statemen
 | Where | Covers |
 |---|---|
 | `crates/query-engine/src/tests.rs` (SQLite file, `CollectingSink`) | parameters, notebook sessions, history, row limit, manual commit, idle close, error offsets, cancel, one run per tab, confirmation, read-only, `reconnect`, credential-store timeout, unfinished results, outputs of a closed tab |
-| Unit tests in `outputs.rs`, `load.rs`, `edit.rs`, `plan.rs`, `schema_diff.rs`, `related.rs`, `probe.rs`, `sessions.rs`, `testdata*.rs` | registry lifecycle and compare SQL, plan parsing, column mapping, script text, gates |
+| Unit tests in `outputs/`, `compare.rs`, `load.rs`, `edit.rs`, `plan.rs`, `schema_diff.rs`, `related.rs`, `probe.rs`, `sessions.rs`, `testdata*.rs` | registry lifecycle and compare SQL, plan parsing, column mapping, script text, gates |
 | `crates/app/tests/` (`load_result.rs`, `edit_result.rs`, `export_full.rs`, `plan.rs`, `jobs.rs`, `example_data.rs`) | the same paths through the app's API |
 | `crates/ai/tests/agent_e2e.rs` | AI and MCP runs through `run_and_wait`, the sandbox |
 | Connector live tests (`#[ignore]`, `DATABRAIN_*`) | real servers |

@@ -51,7 +51,8 @@ impl QueryEngine {
             // that hold no state (the assistant's, or the explorer's).
             self.drop_sessions(|(c, t), live| {
                 let other = c == connection_id && live.sandboxed != sandbox;
-                let stateless = !sandbox || t == META_TAB || t == INDEX_TAB;
+                // The assistant's sessions (sandboxed) and catalog-only ones.
+                let stateless = !sandbox || SessionRole::parse(t).catalog_only();
                 other && stateless && Arc::strong_count(&live.session) == 1 && !live.session.in_transaction()
             });
         }
@@ -196,9 +197,17 @@ impl QueryEngine {
             })
             .collect();
         self.drop_sessions(|(c, key), live| {
-            let Some(idle) = limits.get(c).copied().flatten() else { return false };
             let in_use = busy.contains(key) || Arc::strong_count(&live.session) > 1;
-            !(in_use || live.session.in_transaction() || now.duration_since(*live.last_used.lock()) < idle)
+            if in_use || live.session.in_transaction() {
+                return false;
+            }
+            // A load's or export's session nobody uses any more (its owner
+            // ended without closing it): nothing comes back to it.
+            if SessionRole::parse(key).one_off() {
+                return true;
+            }
+            let Some(idle) = limits.get(c).copied().flatten() else { return false };
+            now.duration_since(*live.last_used.lock()) >= idle
         })
     }
 
@@ -232,7 +241,7 @@ impl QueryEngine {
                 return false;
             }
             // A catalog call still running keeps its handle; the map forgets it.
-            if key == META_TAB {
+            if SessionRole::parse(key) == SessionRole::Meta {
                 return true;
             }
             !(busy.contains(key) || Arc::strong_count(&live.session) > 1 || live.session.in_transaction())
@@ -242,7 +251,7 @@ impl QueryEngine {
     /// A session on a separate tab, for tests that set up data.
     #[doc(hidden)]
     pub async fn session_for_tests(&self, connection_id: &str) -> Result<Arc<dyn Session>> {
-        self.session(connection_id, "__tests__").await
+        self.session(connection_id, &SessionRole::Tests.key()).await
     }
 
     /// Connection ids that currently have at least one open session.
@@ -274,22 +283,30 @@ impl QueryEngine {
     /// lock), and closing the tab cancels `cancel`. `busy` is the message
     /// when something already holds it.
     pub(crate) fn claim(&self, connection_id: &str, session_key: &str, cancel: CancellationToken, busy: &str) -> Result<Claim<'_>> {
+        self.claim_as(connection_id, session_key, session_key, format!("claim:{}", uuid::Uuid::new_v4()), cancel, busy)
+    }
+
+    /// [`Self::claim`] as entry `id` for run key `tab_id` on session
+    /// `session_key` (a run: its job id; notebook cells share a session):
+    /// busy when anything holds either.
+    pub(crate) fn claim_as(
+        &self,
+        connection_id: &str,
+        tab_id: &str,
+        session_key: &str,
+        id: String,
+        cancel: CancellationToken,
+        busy: &str,
+    ) -> Result<Claim<'_>> {
         let mut jobs = self.jobs.lock();
-        if jobs.values().any(|j| j.session_key == session_key || j.tab_id == session_key) {
+        if jobs.values().any(|j| [j.tab_id.as_str(), j.session_key.as_str()].iter().any(|k| *k == tab_id || *k == session_key)) {
             return Err(EngineError::new("busy", busy));
         }
-        let id = format!("claim:{}", uuid::Uuid::new_v4());
         jobs.insert(
             id.clone(),
-            JobHandle {
-                connection_id: connection_id.to_string(),
-                tab_id: session_key.to_string(),
-                session_key: session_key.to_string(),
-                cancel,
-                tab_closed: false,
-            },
+            JobHandle { connection_id: connection_id.to_string(), tab_id: tab_id.to_string(), session_key: session_key.to_string(), cancel, tab_closed: false },
         );
-        Ok(Claim { engine: self, id })
+        Ok(Claim { engine: self, id, kept: false })
     }
 
     // -------------------------------------------------------------- transactions
@@ -317,7 +334,8 @@ impl QueryEngine {
     /// COMMIT or ROLLBACK the session's transaction. Returns whether one is
     /// still open afterwards. Nothing happens without a session.
     pub async fn end_transaction(&self, connection_id: &str, session_key: &str, commit: bool) -> Result<bool> {
-        let _claim = self.claim(connection_id, session_key, CancellationToken::new(), "A query is running in this tab: wait for it or stop it first")?;
+        let hold = Hold::session(session_key, CancellationToken::new(), "A query is running in this tab: wait for it or stop it first");
+        let (_, _claim) = self.guarded_or_refuse(connection_id, Some(hold), Intent::EndTransaction)?;
         let Some(session) = self.sessions.lock().get(&(connection_id.to_string(), session_key.to_string())).map(|l| l.session.clone()) else {
             return Ok(false);
         };
@@ -363,11 +381,10 @@ impl QueryEngine {
             s = self.session_for(&req.connection_id, req.session_key(), req.origin) => s?,
             _ = cancel.cancelled() => return Err(databrain_connector_core::ConnectorError::cancelled().into()),
         };
-        // Unknown: BEGIN anyway; "already in a transaction" from the server
-        // is better than a write that commits on its own in manual mode.
-        if session.transaction_state() != TxState::Open {
-            session.execute(begin, ExecOptions::default()).await?.collect().await?;
+        if !needs_begin(kind, session.transaction_state()) {
+            return Ok(());
         }
+        session.execute(begin, ExecOptions::default()).await?.collect().await?;
         Ok(())
     }
 
@@ -378,7 +395,7 @@ impl QueryEngine {
         F: Fn(Arc<dyn Session>) -> Fut,
         Fut: std::future::Future<Output = databrain_connector_core::Result<T>>,
     {
-        self.with_tab(connection_id, META_TAB, f).await
+        self.with_tab(connection_id, &meta_tab(), f).await
     }
 
     pub(crate) async fn with_tab<T, F, Fut>(&self, connection_id: &str, tab: &str, f: F) -> Result<T>
@@ -403,24 +420,48 @@ impl QueryEngine {
 
     /// Session used by AI indexing: its own for server databases; local
     /// files (SQLite, DuckDB) share the metadata session (one handle per file).
-    pub(crate) fn index_tab(&self, connection_id: &str) -> &'static str {
+    pub(crate) fn index_tab(&self, connection_id: &str) -> String {
         match self.workspace.get_connection(connection_id).map(|p| p.config.kind) {
-            Ok(k) if !k.traits().local => INDEX_TAB,
-            _ => META_TAB,
+            Ok(k) if !k.traits().local => SessionRole::Index.key(),
+            _ => meta_tab(),
         }
     }
 
     /// Close indexing's session (after a run or a cancel). Dropping it ends
     /// the server session, which also stops a statement still running there.
     pub fn end_index_session(&self, connection_id: &str) {
-        if self.index_tab(connection_id) == INDEX_TAB {
-            self.drop_session(connection_id, INDEX_TAB);
+        let tab = self.index_tab(connection_id);
+        if SessionRole::parse(&tab) == SessionRole::Index {
+            self.drop_session(connection_id, &tab);
         }
+    }
+
+    /// Nobody looks at `tab` any more, but it isn't closed (see
+    /// [`OutputRegistry::leave_tab`]): its outputs may be freed for memory.
+    /// Its sessions close when idle.
+    pub fn leave_tab(&self, tab_id: &str) {
+        self.outputs.leave_tab(tab_id);
+        self.outputs_changed();
     }
 
     /// Close the database sessions of a run key (keeps its outputs).
     pub fn release_sessions(&self, tab: &str) {
         self.drop_sessions(|(_, t), _| t == tab);
+    }
+}
+
+/// Manual commit opens a transaction before a write unless one is open.
+/// `Unknown` from SQL Server and Snowflake means writes open one by
+/// themselves (implicit transactions, autocommit off): no BEGIN, which
+/// would nest on SQL Server (one COMMIT wouldn't end it). From others,
+/// BEGIN anyway: "already in a transaction" from the server is better than
+/// a write that commits on its own in manual mode.
+fn needs_begin(kind: databrain_connector_core::ConnectorKind, state: TxState) -> bool {
+    use databrain_connector_core::ConnectorKind as K;
+    match state {
+        TxState::Open => false,
+        TxState::Unknown => !matches!(kind, K::Mssql | K::Snowflake),
+        TxState::None => true,
     }
 }
 
@@ -460,17 +501,39 @@ impl Drop for ConnectGate<'_> {
 pub(crate) struct Claim<'a> {
     engine: &'a QueryEngine,
     id: String,
+    kept: bool,
+}
+
+impl Claim<'_> {
+    /// Keep the entry after this claim drops: a run's job ends it (its
+    /// task removes the entry, see `JobGuard`).
+    pub(crate) fn keep(mut self) {
+        self.kept = true;
+    }
 }
 
 impl Drop for Claim<'_> {
     fn drop(&mut self) {
-        self.engine.jobs.lock().remove(&self.id);
+        if !self.kept {
+            self.engine.jobs.lock().remove(&self.id);
+        }
     }
 }
 
 #[cfg(test)]
 mod minutes_tests {
     use super::*;
+
+    #[test]
+    fn manual_commit_begins_unless_writes_open_a_transaction_themselves() {
+        use databrain_connector_core::ConnectorKind::*;
+        assert!(needs_begin(Mssql, TxState::None) && needs_begin(Postgres, TxState::None));
+        assert!(!needs_begin(Mssql, TxState::Open) && !needs_begin(Postgres, TxState::Open));
+        // Implicit transactions: the write opens one; BEGIN would nest.
+        assert!(!needs_begin(Mssql, TxState::Unknown) && !needs_begin(Snowflake, TxState::Unknown));
+        // A connector that can't tell: BEGIN anyway.
+        assert!(needs_begin(Sqlite, TxState::Unknown) && needs_begin(Oracle, TxState::Unknown));
+    }
 
     #[test]
     fn huge_idle_minutes_dont_overflow() {

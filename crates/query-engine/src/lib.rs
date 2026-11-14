@@ -8,11 +8,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub mod compare;
 mod connect;
 pub mod edit;
 mod error;
 mod events;
 mod export;
+mod guard;
 pub mod load;
 mod metadata;
 pub mod outputs;
@@ -26,6 +28,7 @@ pub mod testdata;
 
 pub use error::*;
 pub use events::*;
+use guard::{Guarded, Hold, Intent};
 pub use load::{LoadCheck, LoadDryRun, LoadEvent, LoadObserver, LoadReport, LoadRows, LoadSpec, LoadTarget, NoLoadObserver};
 pub use outputs::{NewOutput, OutputInfo, OutputRegistry, OutputState, OutputTables};
 
@@ -39,7 +42,7 @@ use databrain_connector_core::{
 };
 use databrain_result_store::{ResultInfo, ResultStore};
 use databrain_ssh_tunnel::{SshSecret, Tunnel, TunnelSpec};
-use databrain_workspace::{ConnectionProfile, EnvTag, NewHistory, Origin, RunStatus, Workspace, now_ms};
+use databrain_workspace::{ConnectionProfile, EnvTag, NewHistory, Origin, RunStatus, SessionRole, Workspace, now_ms};
 use parking_lot::Mutex;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -128,8 +131,10 @@ pub struct TestResult {
 
 /// Run blocking work (file and workspace writes) from async code without
 /// stalling the other tasks of a worker thread: on a multi-thread runtime
-/// the thread is handed over while `f` runs; elsewhere (tests, no runtime)
-/// `f` just runs.
+/// the thread is handed over while `f` runs; elsewhere `f` just runs.
+/// Every runtime DataBrain runs on is multi-thread (the app's, Tauri's;
+/// the MCP server's and the jobs runner's, `cli::runtime` in the app
+/// crate); a current-thread one is only a test's (`#[tokio::test]`).
 pub(crate) fn blocking<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
@@ -153,10 +158,10 @@ type Waiter = tokio::sync::mpsc::UnboundedSender<JobEvent>;
 
 type SessionKey = (String, String); // (connection_id, tab_id)
 
-const META_TAB: &str = "__meta__";
-/// AI indexing's own session (server databases): long catalog reads never
-/// make the explorer or completion wait, and cancelling can close it.
-const INDEX_TAB: &str = "__index__";
+/// The explorer's catalog session ([`SessionRole::Meta`]).
+fn meta_tab() -> String {
+    SessionRole::Meta.key()
+}
 /// Connection option marking the "Results (DuckDB)" connection.
 pub const RESULTS_MARKER: &str = "databrain_results";
 

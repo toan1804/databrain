@@ -54,16 +54,7 @@ pub fn delete_history_entry(state: &AppState, id: i64) -> Result<()> {
 /// Results of deleted history entries go too: their outputs (memory and
 /// saved snapshots), except pinned ones and those still shown in a tab.
 pub fn drop_history_results(engine: &QueryEngine, result_ids: &[String]) -> usize {
-    let outs = engine.outputs();
-    let mut n = 0;
-    for id in result_ids {
-        match outs.by_result(id) {
-            Some(o) if !o.pinned && !o.active => n += usize::from(outs.remove(&o.handle).is_ok()),
-            Some(_) => {}
-            // Not an output (any more): just free the stored rows.
-            None => n += usize::from(engine.results().remove(id)),
-        }
-    }
+    let n = result_ids.iter().filter(|id| engine.outputs().drop_history_result(id)).count();
     if n > 0 {
         engine.outputs_changed();
     }
@@ -86,10 +77,10 @@ pub fn save_notebook(state: &AppState, notebook: databrain_workspace::Notebook) 
 pub fn delete_notebook(state: &AppState, id: &str) -> Result<()> {
     if let Ok(nb) = state.workspace.get_notebook(id) {
         for c in nb.cells {
-            state.engine.close_tab(&format!("nb:{id}:{}", c.id));
+            state.engine.close_tab(&SessionRole::Notebook { notebook: id.into(), cell: Some(c.id) }.key());
         }
     }
-    state.engine.close_tab(&format!("nb:{id}"));
+    state.engine.close_tab(&SessionRole::Notebook { notebook: id.into(), cell: None }.key());
     Ok(state.workspace.delete_notebook(id)?)
 }
 

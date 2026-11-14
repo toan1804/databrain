@@ -364,6 +364,7 @@ pub fn run() {
             commands::ai::ai_sessions,
             commands::ai::ai_session_messages,
             commands::ai::ai_delete_session,
+            commands::ai::ai_leave_session,
             commands::ai::ai_audit,
             commands::ai::mcp_config,
             commands::ai::kn_get,
