@@ -19,6 +19,7 @@ const plan = (schemas: PlanSchema[], scope: string[] = [], large = true): IndexP
   total_objects: schemas.reduce((n, x) => n + (x.objects ?? 0), 0),
   large,
   batch: 25,
+  ask: false,
 });
 
 const p = plan([
@@ -66,5 +67,13 @@ describe("index scope", () => {
     expect(estimateQueries("databricks", big, every, 0)).toBe(80);
     expect(selectedObjects(p, new Set(["dev.a", "main.crm"]))).toBe(105);
     expect(selectedObjects(plan([{ ...s("x", "y", 0), objects: null }]), new Set(["x.y"]))).toBeNull();
+  });
+});
+
+describe("initialSelection after a server move", () => {
+  it("starts with the default schema only, as for a large connection", () => {
+    const small = plan([s("main", "sales", 10, { is_default: true }), s("main", "crm", 5)], [], false);
+    expect([...initialSelection(small)].sort()).toEqual(["main.crm", "main.sales"]);
+    expect([...initialSelection({ ...small, ask: true })]).toEqual(["main.sales"]);
   });
 });

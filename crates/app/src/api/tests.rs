@@ -1759,6 +1759,41 @@ async fn stop_ends_the_approval_wait() {
     assert!(o.content.starts_with("ERROR"), "{}", o.content);
 }
 
+/// After the connection points at another server, an index run without a
+/// scope is refused until the user chooses one (the old one was cleared);
+/// with a scope it runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_after_a_server_move_asks_first() {
+    use databrain_workspace::{AiPolicy, ConnectionProfile};
+    let (st, _, _dir) = state();
+    let mut cfg = databrain_connector_core::ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "me".into() });
+    cfg.host = Some("db1".into());
+    let p = st
+        .workspace
+        .save_connection(ConnectionProfile {
+            id: String::new(),
+            name: "pg".into(),
+            config: cfg,
+            color: None,
+            env: EnvTag::Dev,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: AiPolicy { index_schemas: vec!["hr".into()], ..Default::default() },
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    let mut moved = p.clone();
+    moved.config.host = Some("db2".into());
+    st.workspace.save_connection(moved).unwrap();
+    let e = crate::ai_api::index_knowledge(&st, &p.id, None, None, false).unwrap_err();
+    assert!(e.message.contains("another server"), "{}", e.message);
+    // Choosing a scope is the answer (the run itself fails later: no server here).
+    assert!(crate::ai_api::index_knowledge(&st, &p.id, Some(vec!["public".into()]), None, false).is_ok());
+    assert!(!st.workspace.ai_index_must_choose(&p.id));
+    assert_eq!(st.workspace.get_connection(&p.id).unwrap().ai_policy.index_schemas, ["public"]);
+}
+
 /// The background learner, the Learned view's reasons, and clearing
 /// history with and without forgetting what was learned.
 #[test]

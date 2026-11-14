@@ -500,3 +500,24 @@ fn scope_rules_match_names_as_the_database_does() {
     assert!(ws.ai_excluded(&pg.id, "Sales", "secrets").unwrap());
     assert!(!ws.ai_excluded(&pg.id, "sales", "orders").unwrap());
 }
+
+/// Pointing a connection at another server forgets the schemas chosen for
+/// the AI index there, and the next index waits for the user to choose
+/// again; saving it unchanged, or on the same server, asks nothing.
+#[test]
+fn a_server_move_forgets_the_index_scope_and_asks() {
+    let ws = Workspace::open_in_memory().unwrap();
+    let mut p = profile("db");
+    p.ai_policy.index_schemas = vec!["hr".into(), "sales".into()];
+    let p = ws.save_connection(p).unwrap();
+    assert!(!ws.ai_index_must_choose(&p.id), "a new connection: nothing to ask");
+    let mut same = ws.save_connection(p.clone()).unwrap();
+    assert_eq!(same.ai_policy.index_schemas, ["hr", "sales"], "same server: kept");
+    assert!(!ws.ai_index_must_choose(&p.id));
+    same.config.host = Some("other.local".into());
+    let moved = ws.save_connection(same).unwrap();
+    assert!(moved.ai_policy.index_schemas.is_empty(), "chosen for the old server");
+    assert!(ws.ai_index_must_choose(&p.id), "the next index asks");
+    ws.ai_index_chosen(&p.id).unwrap();
+    assert!(!ws.ai_index_must_choose(&p.id));
+}

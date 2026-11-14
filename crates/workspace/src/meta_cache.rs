@@ -77,6 +77,11 @@ pub struct ExplorerCacheState {
 
 /// Which server a connection points at (kind, address, database, user,
 /// options, SSH hop). A change makes the cached explorer meaningless.
+/// Settings key: the connection moved; its next index asks first.
+fn index_ask_key(connection_id: &str) -> String {
+    format!("ai_index_ask.{connection_id}")
+}
+
 fn identity(cfg: &ConnectionConfig) -> String {
     // Session handling (timeouts) doesn't change what the connection points at.
     let options: std::collections::BTreeMap<&String, &String> =
@@ -506,6 +511,21 @@ impl Workspace {
                 Self::meta_clear_tx(&tx, connection_id)?;
                 Self::kn_clear_tx(&tx, connection_id)?;
                 tx.execute("DELETE FROM ai_scope WHERE connection_id = ?1", [connection_id])?;
+                // The schemas chosen for indexing too: the next "Index for
+                // AI" would read them (and allow each again) without asking.
+                // It asks: until the user chooses, an index run is refused.
+                let policy: Option<Option<String>> =
+                    tx.query_row("SELECT ai_policy_json FROM connections WHERE id = ?1", [connection_id], |r| r.get(0)).optional()?;
+                if let Some(mut p) = policy.flatten().and_then(|j| serde_json::from_str::<crate::AiPolicy>(&j).ok())
+                    && !p.index_schemas.is_empty()
+                {
+                    p.index_schemas.clear();
+                    tx.execute("UPDATE connections SET ai_policy_json = ?2 WHERE id = ?1", params![connection_id, serde_json::to_string(&p)?])?;
+                }
+                tx.execute(
+                    "INSERT INTO settings (key, value_json) VALUES (?1, 'true') ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+                    [index_ask_key(connection_id)],
+                )?;
                 true
             }
         };
@@ -515,6 +535,22 @@ impl Workspace {
         )?;
         tx.commit()?;
         Ok(moved)
+    }
+
+    /// The connection moved to another server since its index scope was
+    /// chosen ([`Self::meta_check_identity`]): an index run must wait for
+    /// the user to choose what the AI may use there.
+    pub fn ai_index_must_choose(&self, connection_id: &str) -> bool {
+        self.get_setting(&index_ask_key(connection_id)).ok().flatten().and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+
+    /// The user chose the index scope (after a move, see
+    /// [`Self::ai_index_must_choose`]).
+    pub fn ai_index_chosen(&self, connection_id: &str) -> Result<()> {
+        if self.ai_index_must_choose(connection_id) {
+            self.set_setting(&index_ask_key(connection_id), &serde_json::json!(false))?;
+        }
+        Ok(())
     }
 
     /// Columns of a table (from a describe).

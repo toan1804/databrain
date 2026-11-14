@@ -547,6 +547,9 @@ pub async fn knowledge_plan(state: &AppState, connection_id: &str) -> Result<dat
 /// Index in the background. Only schemas whose definitions changed since the
 /// last run are re-read, unless `full`.
 pub fn index_knowledge(state: &AppState, connection_id: &str, scope: Option<Vec<String>>, batch: Option<u32>, full: bool) -> Result<()> {
+    if scope.is_none() && state.workspace.ai_index_must_choose(connection_id) {
+        return Err(EngineError::new("invalid", databrain_ai::knowledge::MUST_CHOOSE));
+    }
     if scope.is_some() || batch.is_some() {
         let mut p = state.workspace.get_connection(connection_id)?;
         if let Some(sc) = &scope {
@@ -562,6 +565,7 @@ pub fn index_knowledge(state: &AppState, connection_id: &str, scope: Option<Vec<
                 let named: Vec<String> = sc.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
                 state.workspace.ai_set_schema_rules(connection_id, &named).map_err(EngineError::from)?;
             }
+            state.workspace.ai_index_chosen(connection_id).map_err(EngineError::from)?;
         }
         if let Some(b) = batch {
             p.ai_policy.index_batch = b.clamp(1, databrain_ai::knowledge::MAX_BATCH as u32);

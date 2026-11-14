@@ -87,6 +87,9 @@ pub struct IndexPlan {
     pub large: bool,
     /// Saved schemas-per-batch setting.
     pub batch: usize,
+    /// The connection points at another server since the scope was chosen:
+    /// the user chooses again before anything is indexed.
+    pub ask: bool,
 }
 
 /// What an index run would cover: one schema listing (+ one count query
@@ -115,8 +118,12 @@ pub async fn plan(engine: &Arc<QueryEngine>, connection_id: &str) -> Result<Inde
     let user = schemas.iter().filter(|s| !s.system).count();
     let large = user > LARGE_SCHEMAS || catalogs > LARGE_CATALOGS || total_objects.is_some_and(|n| n > LARGE_OBJECTS);
     let batch = (profile.ai_policy.index_batch as usize).clamp(1, MAX_BATCH);
-    Ok(IndexPlan { schemas, scope, catalogs, total_objects, large, batch })
+    let ask = engine.workspace().ai_index_must_choose(connection_id);
+    Ok(IndexPlan { schemas, scope, catalogs, total_objects, large, batch, ask })
 }
+
+/// Why an index run waits for the user after the connection moved.
+pub const MUST_CHOOSE: &str = "This connection now points at another server: choose the catalogs and schemas the AI may use there first (AI may use…).";
 
 /// Default schemas per metadata batch: progress and cancellation happen
 /// between batches (engines with bulk metadata use ~2 queries per batch).
@@ -159,6 +166,9 @@ pub async fn index_connection_with(
     let _end = EndSession(engine, connection_id);
     let ws = engine.workspace().clone();
     let profile = ws.get_connection(connection_id)?;
+    if scope.is_none() && ws.ai_index_must_choose(connection_id) {
+        return Err(AiError::Policy(MUST_CHOOSE.into()));
+    }
     let wanted: Vec<String> = scope.map(<[String]>::to_vec).unwrap_or_else(|| profile.ai_policy.index_schemas.clone());
     let listed = tokio::select! {
         r = engine.list_schemas(connection_id) => r?,

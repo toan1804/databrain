@@ -25,8 +25,9 @@ export function planCatalogs(plan: IndexPlan, withSystem = false): CatalogRow[] 
 /** Initial selection: the saved scope, or (never chosen) the default schemas. */
 export function initialSelection(plan: IndexPlan): Set<string> {
   if (plan.scope.length > 0) return new Set(plan.schemas.filter((s) => s.selected).map((s) => s.name));
-  // Large and never chosen: start with the session's default schema only.
-  if (plan.large) {
+  // Large and never chosen, or moved to another server: start with the
+  // session's default schema only.
+  if (plan.large || plan.ask) {
     const d = plan.schemas.filter((s) => s.is_default && !s.system);
     if (d.length) return new Set(d.map((s) => s.name));
   }

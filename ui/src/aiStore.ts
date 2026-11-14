@@ -1051,7 +1051,7 @@ export const useAi = create<AiState>((set, get) => {
           return;
         }
         set((s) => ({ knowledgeProgress: { ...s.knowledgeProgress, [connectionId]: undefined } }));
-        if (opts.choose || (plan.large && plan.scope.length === 0)) {
+        if (opts.choose || plan.ask || (plan.large && plan.scope.length === 0)) {
           set({ indexPicker: { connectionId, plan } });
           return;
         }

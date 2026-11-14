@@ -14,4 +14,9 @@ large: boolean,
 /**
  * Saved schemas-per-batch setting.
  */
-batch: number, };
+batch: number, 
+/**
+ * The connection points at another server since the scope was chosen:
+ * the user chooses again before anything is indexed.
+ */
+ask: boolean, };
