@@ -210,12 +210,15 @@ impl Session for MssqlSession {
             let user_rowcount = user_rowcount.load(std::sync::atomic::Ordering::SeqCst);
             let c = g.as_mut().expect("connected");
             let res = tokio::select! {
-                r = run(c, &sql, &opts, &tx, replaceable, user_rowcount) => r,
+                r = run(c, &sql, &opts, &tx, replaceable, user_rowcount, &state) => r,
                 _ = opts.cancel.cancelled() => Err(ConnectorError::cancelled()),
             };
             match res {
                 Ok(Ended::Complete) => {}
                 Ok(Ended::Stopped { last, unread }) => {
+                    if !unread && let Some(c) = g.as_mut() {
+                        crate::exec::sync_depth(c, &state, &sql, false).await;
+                    }
                     if unread {
                         // Stopped mid-result: reading the rest would take as
                         // long as the whole result. Close this connection
@@ -232,6 +235,13 @@ impl Session for MssqlSession {
                     tx.send(StreamEvent::Done(ExecSummary::default())).await;
                 }
                 Err(mut e) => {
+                    // A deadlock or XACT_ABORT may have ended the transaction.
+                    if !e.is_cancelled()
+                        && e.kind != databrain_connector_core::ErrorKind::Connection
+                        && let Some(c) = g.as_mut()
+                    {
+                        crate::exec::sync_depth(c, &state, &sql, true).await;
+                    }
                     if e.is_cancelled() || e.kind == databrain_connector_core::ErrorKind::Connection {
                         // Connection state is unknown after an aborted read.
                         *g = None;
@@ -571,6 +581,26 @@ mod tests {
         cancel.cancel();
         assert!(st.collect().await.unwrap_err().is_cancelled());
         assert_eq!(s.execute("select 2", ExecOptions::default()).await.unwrap().collect().await.unwrap().num_rows(), 1);
+
+        // The transaction depth as the server counts it (@@TRANCOUNT), where
+        // the text can't tell: a one-batch begin…commit, a guarded COMMIT,
+        // and an error that ended the transaction (XACT_ABORT).
+        use databrain_connector_core::TxState;
+        let exec = |sql: &'static str| {
+            let s = &s;
+            async move { s.execute(sql, ExecOptions::default()).await.unwrap().collect().await }
+        };
+        exec("begin tran; select 1 as a; commit tran").await.unwrap();
+        assert_eq!(s.transaction_state(), TxState::None, "committed in the same batch");
+        exec("begin tran").await.unwrap();
+        assert_eq!(s.transaction_state(), TxState::Open);
+        exec("if @@trancount > 0 commit tran").await.unwrap();
+        assert_eq!(s.transaction_state(), TxState::None, "the guarded COMMIT ran");
+        exec("set xact_abort on").await.unwrap();
+        exec("begin tran").await.unwrap();
+        assert!(exec("select 1 / 0").await.is_err());
+        assert_eq!(s.transaction_state(), TxState::None, "XACT_ABORT rolled it back");
+        exec("set xact_abort off").await.unwrap();
 
         // Show DDL: a table with every kind of constraint and an index, recreated from its DDL.
         let run = |sql: String| {
