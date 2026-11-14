@@ -840,13 +840,16 @@ impl OutputRegistry {
     /// listed whose rows are gone). Only this registry removes results that
     /// may have an output; other crates call this, not `ResultStore::remove`.
     /// A pinned output keeps its saved copy: only its rows in memory go
-    /// (it loads again from disk on use).
+    /// (it loads again from disk on use). Without a saved copy (no
+    /// snapshot folder) a pinned output keeps its rows: pinning promised
+    /// them. Whether anything was freed.
     pub fn release_result(&self, result_id: &str) -> bool {
         match self.by_result(result_id) {
             Some(o) if o.pinned && self.snapshot_path(result_id).is_some_and(|p| p.exists()) => {
                 self.update(&o.handle, |x| x.state = OutputState::OnDisk);
                 self.results.remove(result_id)
             }
+            Some(o) if o.pinned => false,
             Some(o) => self.remove(&o.handle).is_ok(),
             None => self.results.remove(result_id),
         }
@@ -1041,6 +1044,20 @@ pub(crate) mod tests {
         r.set_kept(&k.handle, true).unwrap();
         r.close_tab("t");
         assert_eq!(r.get(&k.handle).unwrap().state, OutputState::Evicted);
+    }
+
+    /// Releasing a pinned output that has no saved copy (no snapshot
+    /// folder) keeps it and its rows; an unpinned one goes.
+    #[test]
+    fn a_pinned_output_without_a_saved_copy_keeps_its_rows() {
+        let r = reg();
+        let pinned = add(&r, "t1", 3);
+        r.update(&pinned.handle, |o| o.pinned = true);
+        assert!(!r.release_result(&pinned.result_id));
+        assert!(r.get(&pinned.handle).is_some_and(|o| o.state == OutputState::Live) && r.results.contains(&pinned.result_id));
+        let plain = add(&r, "t1", 3);
+        assert!(r.release_result(&plain.result_id));
+        assert!(r.get(&plain.handle).is_none() && !r.results.contains(&plain.result_id));
     }
 
     /// A chat closed in the panel: its outputs stop being active (the

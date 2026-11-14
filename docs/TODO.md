@@ -14,11 +14,9 @@ The review's findings and its refactors are done (one guarded entry point, `outp
 
 Left from the final review (2026-11-13):
 
-- MySQL statements that commit by themselves without being transaction control (`SET PASSWORD`, `RESET …`, `LOAD INDEX INTO CACHE`) in a load's before/after SQL: a dry run on MySQL uses a transaction and would keep its sample rows after one. Use the transaction method on MySQL only when every user statement is a read or DML.
 - A grid edit that fails with an error that ends the whole transaction (SQL Server `XACT_ABORT`, a deadlock, DuckDB's aborted transaction): the savepoint rollback fails and the message says the earlier changes are pending when they are gone.
 - The cost preview only looks at the tab (it must not make Run busy): when it reconnects after a connection error while a script runs, the script's next statement lands on the new session.
 - The memory cap is per result: a script whose results are all active can hold several times the budget; `get_array_memory_size` counts buffers shared between batches once per batch.
-- `release_result` on a pinned output when no snapshot directory is set removes the output (only the AI's sample path calls it).
 - Implicit transactions (SQL Server `IMPLICIT_TRANSACTIONS ON`, Snowflake `AUTOCOMMIT = FALSE`) keep the session (`TxState::Unknown`) but don't show Commit/Rollback or warn on closing the tab (`QueryEngine::in_transaction` counts `Open` only). Not followed: `SET ANSI_DEFAULTS ON`, `autocommit = 'false'` written as a string. A one-batch `begin tran … commit` on SQL Server stays "open" (conservative). With implicit transactions on, manual commit's own `BEGIN` may nest on SQL Server.
 - Job steps: a DuckDB Query step reading a tab's row-limited `results.x` on purpose now fails before it runs (it would pass part of the rows on); say so in the job editor.
 - `loadResultAsking`: when the server asks (the UI didn't know the connection is production), progress and Stop already show during the prompt.
