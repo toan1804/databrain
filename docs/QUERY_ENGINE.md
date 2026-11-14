@@ -169,7 +169,7 @@ Every result set of a run becomes an output (`OutputRegistry::add`): handle `rN`
 
 - **Names.** `set_name` moves a name to the newest output; older ones become `name__1` … (`KEEP_VERSIONS` = 5). A job step's name belongs to it (`check_owner`).
 - **Freed by:** `close_tab` (the tab's unnamed, unpinned outputs; an AI chat's tab `ai:{session}` closes when the chat is deleted), `enforce_budget`, `remove` / `remove_unpinned`, `release_result` (the AI's sample rows, the UI's release: the output goes with its rows), a version past the fifth, an unfinished statement (`Unfinished` in `run.rs`). A pin whose snapshot can't be written is undone.
-- **On quit** `persist_active` saves each tab's latest outputs (64 MB each, 512 MB in all) and drops saved ones that are no longer current; `set_snapshot_dir` restores them for tabs that still exist.
+- **On quit** `persist_active` saves each tab's latest outputs (64 MB each, 512 MB in all; a result on disk isn't saved, so its tab is empty after a restart) and drops saved ones that are no longer current; `set_snapshot_dir` restores them for tabs that still exist.
 - **SQL over outputs.** `OutputTables` implements `ExternalTables`: DuckDB sessions read `results.<handle or name>` through `ensure_loaded` and `sql_ready_all` (decimal text becomes `DECIMAL`).
 - **Compare.** `diff_sql_opts`, `compare_summary_sql`, `key_candidates`, `unique_check_sql` build DuckDB SQL over two outputs; the app runs it on the "Results (DuckDB)" connection (`results_connection`).
 

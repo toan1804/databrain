@@ -8,10 +8,6 @@ Found in reviews and left for a later release on purpose. Each says what goes wr
 - If an MCP client kills `databrain-mcp.exe` without closing its stdin, the child `databrain.exe mcp` may keep running (no job object ties them).
 - `databrain-jobs run` / `list` output in a terminal goes through the GUI-subsystem launcher's console attach; check it prints in cmd and PowerShell.
 
-## Results on disk (left from the spill work of 2026-11-14)
-
-- A result on disk isn't saved when the app quits (tab results are saved up to 64 MB anyway), so its tab shows nothing after a restart.
-
 ## Query engine (review of 2026-11-12; see [QUERY_ENGINE.md](QUERY_ENGINE.md))
 
 The review's findings are fixed (loads can't control their transaction and ask on production connections, a run's job guard, one transaction dialect with a savepoint for grid edits, session claims for plans, edits, Commit/Rollback and exports, a memory cap per result, outputs freed with their rows, and the low items). Left, as refactors:
