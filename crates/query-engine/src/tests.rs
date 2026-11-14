@@ -1078,3 +1078,95 @@ async fn edits_are_refused_on_a_connection_made_read_only() {
     let rep = f.engine.apply_edits(&target, "tab1", &stmts).await.unwrap();
     assert_eq!(rep.statements, 1);
 }
+
+// ------------------------------------------------------------------ cost preview
+
+/// A Snowflake stand-in whose estimates fail with a dropped connection.
+struct DroppingConnector(Arc<std::sync::atomic::AtomicUsize>);
+struct DroppingSession;
+
+#[async_trait::async_trait]
+impl databrain_connector_core::Connector for DroppingConnector {
+    fn info(&self) -> databrain_connector_core::ConnectorInfo {
+        databrain_connector_core::ConnectorInfo {
+            kind: ConnectorKind::Snowflake,
+            traits: ConnectorKind::Snowflake.traits(),
+            display_name: "Snowflake (test)",
+            default_port: None,
+            uses_file: false,
+            auth_methods: vec![],
+            capabilities: databrain_connector_core::Capabilities { ssh: false },
+            fields: vec![],
+            note: None,
+        }
+    }
+    async fn connect(&self, _: &ConnectionConfig, _: Arc<dyn CredentialSource>) -> databrain_connector_core::Result<Box<dyn Session>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(DroppingSession))
+    }
+}
+
+#[async_trait::async_trait]
+impl Session for DroppingSession {
+    fn kind(&self) -> ConnectorKind {
+        ConnectorKind::Snowflake
+    }
+    async fn server_version(&self) -> databrain_connector_core::Result<String> {
+        Ok("test".into())
+    }
+    async fn ping(&self) -> databrain_connector_core::Result<()> {
+        Ok(())
+    }
+    async fn execute(&self, _: &str, _: ExecOptions) -> databrain_connector_core::Result<databrain_connector_core::QueryStream> {
+        Err(ConnectorError::connection("gone"))
+    }
+    async fn list_schemas(&self) -> databrain_connector_core::Result<Vec<SchemaInfo>> {
+        Ok(vec![])
+    }
+    async fn list_objects(&self, _: &str) -> databrain_connector_core::Result<Vec<DbObject>> {
+        Ok(vec![])
+    }
+    async fn describe(&self, _: &str, _: &str) -> databrain_connector_core::Result<ObjectDetail> {
+        Err(ConnectorError::connection("gone"))
+    }
+    async fn estimate_cost(&self, _: &str) -> databrain_connector_core::Result<Option<databrain_connector_core::CostEstimate>> {
+        Err(ConnectorError::connection("connection reset"))
+    }
+}
+
+/// The cost preview never replaces the tab's session: after a dropped
+/// connection the estimate fails and the session a script may be using
+/// stays; on the metadata session it reconnects once.
+#[tokio::test]
+async fn the_cost_preview_never_reconnects_the_tabs_session() {
+    let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut reg = ConnectorRegistry::new();
+    reg.register(Arc::new(DroppingConnector(connects.clone())));
+    let ws = Arc::new(Workspace::open_in_memory().unwrap());
+    let p = ws
+        .save_connection(ConnectionProfile {
+            id: String::new(),
+            name: "Snow".into(),
+            config: ConnectionConfig::new(ConnectorKind::Snowflake, AuthMethod::None),
+            color: None,
+            env: EnvTag::None,
+            folder_id: None,
+            has_secret: false,
+            ai_policy: Default::default(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    let engine = QueryEngine::new(reg, ws, Arc::new(MemoryStore::default()), Arc::new(ResultStore::new()), Arc::new(CollectingSink::default()));
+    let tab = engine.session(&p.id, "tab1").await.unwrap();
+    let n = || connects.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(n(), 1);
+    let e = engine.estimate_cost(&p.id, "tab1", "select 1").await.unwrap_err();
+    assert!(e.message.contains("connection reset"), "{}", e.message);
+    assert_eq!(n(), 1, "no new session for the tab");
+    let now = engine.sessions.lock().get(&(p.id.clone(), "tab1".to_string())).map(|l| l.session.clone()).unwrap();
+    assert!(Arc::ptr_eq(&now, &tab), "the tab keeps its session");
+    // The metadata session (the tab busy, or no tab): one reconnect.
+    assert!(engine.estimate_cost(&p.id, "", "select 1").await.is_err());
+    assert_eq!(n(), 3, "metadata: connect, then reconnect once");
+}

@@ -165,10 +165,22 @@ impl QueryEngine {
         let busy = self.jobs.lock().values().any(|j| j.session_key == session_key || j.tab_id == session_key);
         let meta = crate::meta_tab();
         let tab = if busy || session_key.is_empty() { meta.as_str() } else { session_key };
-        let run = self.with_tab(connection_id, tab, |s| {
+        let estimate = |s: Arc<dyn databrain_connector_core::Session>| {
             let sql = sql.clone();
             async move { s.estimate_cost(&sql).await }
-        });
+        };
+        let run = async {
+            if tab == meta {
+                // The metadata session: reconnected once on a dropped connection.
+                return self.with_tab(connection_id, tab, estimate).await;
+            }
+            // The tab's session as it is, never reconnected from here: a
+            // script that started meanwhile would go on in a new session
+            // (without its transaction and temp tables). A dropped
+            // connection fails the estimate; the tab's next run reconnects.
+            let s = self.session(connection_id, tab).await?;
+            Ok(estimate(s).await?)
+        };
         match tokio::time::timeout(std::time::Duration::from_secs(60), run).await {
             Ok(r) => r?.ok_or_else(|| EngineError::new("unsupported", format!("{} gives no cost estimate before a run", kind.traits().name))),
             Err(_) => Err(EngineError::new("timeout", "The database took more than 60 s to estimate the query")),

@@ -14,7 +14,6 @@ The review's findings and its refactors are done (one guarded entry point, `outp
 
 Left from the final review (2026-11-13):
 
-- The cost preview only looks at the tab (it must not make Run busy): when it reconnects after a connection error while a script runs, the script's next statement lands on the new session.
 - The memory cap is per result: a script whose results are all active can hold several times the budget; `get_array_memory_size` counts buffers shared between batches once per batch.
 - Implicit transactions (SQL Server `IMPLICIT_TRANSACTIONS ON`, Snowflake `AUTOCOMMIT = FALSE`) keep the session (`TxState::Unknown`) but don't show Commit/Rollback or warn on closing the tab (`QueryEngine::in_transaction` counts `Open` only). Not followed: `SET ANSI_DEFAULTS ON`, `autocommit = 'false'` written as a string. A one-batch `begin tran … commit` on SQL Server stays "open" (conservative). With implicit transactions on, manual commit's own `BEGIN` may nest on SQL Server.
 - Job steps: a DuckDB Query step reading a tab's row-limited `results.x` on purpose now fails before it runs (it would pass part of the rows on); say so in the job editor.
