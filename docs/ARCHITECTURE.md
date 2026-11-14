@@ -78,6 +78,7 @@ crates/
   ai/               providers, agent, tools, policy, table access, knowledge,
                     MCP server, Kiro, inline completion
   auth/             credential sources, OAuth, JWT, cloud CLI reuse, secret stores
+  bench/            timings of the critical paths (docs/PERFORMANCE.md); not in the app
   ssh-tunnel/       SSH local forwarding with host-key pinning
 ui/                 React app
 ```
