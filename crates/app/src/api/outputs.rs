@@ -380,7 +380,9 @@ fn custom_results_mb(ws: &databrain_workspace::Workspace) -> Option<u64> {
 
 /// Memory DuckDB may use for its own work (scans, sorts, joins): what the
 /// results budget and the free-memory floor leave, at most DuckDB's default
-/// 80% and at least 512 MB; spilling to disk covers the rest.
+/// 80% and at least 512 MB; spilling to disk covers the rest. The limit is
+/// per database (DuckDB instance): several working at once can together go
+/// over it, as DuckDB has no limit shared between instances.
 pub fn duckdb_memory_limit(total: u64, budget: u64, floor: u64) -> u64 {
     total.saturating_sub(budget).saturating_sub(floor).min(total / 10 * 8).max(512 * 1024 * 1024)
 }
