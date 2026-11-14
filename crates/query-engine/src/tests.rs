@@ -100,7 +100,7 @@ async fn parameters_are_bound_before_running() {
     r.params.insert("n".into(), databrain_connector_core::sql::ParamValue { value: "2000".into(), raw: false });
     let resp = f.engine.run(r).unwrap();
     let RunResponse::Started { job_id, statements } = resp else { panic!() };
-    assert_eq!(statements[0].sql, "select '2026-09-09' as d, 2000 as n, typeof(2000) as t, ':d' as lit");
+    assert_eq!(statements[0].sql(), "select '2026-09-09' as d, 2000 as n, typeof(2000) as t, ':d' as lit");
     assert_eq!((statements[0].start, statements[0].end), (0, sql.len()), "spans of the editor text");
     let evs = wait_job(&f, &job_id).await;
     let rid = evs
@@ -221,7 +221,7 @@ async fn manual_commit_opens_a_transaction_until_commit_or_rollback() {
         let id = f.conn_id.clone();
         async move {
             let s = ws.session_for_tests(&id).await.unwrap();
-            let c = s.execute("select * from t", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+            let c = s.execute(databrain_connector_core::Statement::internal("select * from t"), ExecOptions::default()).await.unwrap().collect().await.unwrap();
             c.batches.iter().map(|b| b.num_rows()).sum::<usize>()
         }
     };
@@ -424,13 +424,7 @@ fn prod_confirmation_covers_admin_statements() {
         let plan: Vec<PlannedStatement> = databrain_connector_core::sql::split_statements(sql, kind)
             .into_iter()
             .enumerate()
-            .map(|(index, s)| PlannedStatement {
-                index,
-                classification: databrain_connector_core::sql::classify(&s.sql, kind),
-                sql: s.sql,
-                start: s.start,
-                end: s.end,
-            })
+            .map(|(index, s)| PlannedStatement { index, checked: databrain_connector_core::Checked::new(s.sql, kind), start: s.start, end: s.end })
             .collect();
         !QueryEngine::safety_reasons(&p, &plan).is_empty()
     };
@@ -675,7 +669,7 @@ async fn load_sql_that_controls_the_transaction_is_refused() {
     use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
     let f = fixture(EnvTag::Dev);
     let s = f.engine.session_for_tests(&f.conn_id).await.unwrap();
-    s.execute("create table t (id integer)", Default::default()).await.unwrap().collect().await.unwrap();
+    s.execute(databrain_connector_core::Statement::internal("create table t (id integer)"), Default::default()).await.unwrap().collect().await.unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
     let batch = databrain_connector_core::arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
     let rows = crate::load::LoadRows { schema, batches: vec![batch] };
@@ -722,7 +716,7 @@ async fn load_into_production_needs_confirmation() {
     for env in [EnvTag::Prod, EnvTag::Dev] {
         let f = fixture(env);
         let s = f.engine.session_for_tests(&f.conn_id).await.unwrap();
-        s.execute("create table t (id integer)", Default::default()).await.unwrap().collect().await.unwrap();
+        s.execute(databrain_connector_core::Statement::internal("create table t (id integer)"), Default::default()).await.unwrap().collect().await.unwrap();
         let count = || async {
             let s = f.engine.session_for_tests(&f.conn_id).await.unwrap();
             databrain_connector_core::query_text(&*s, "select count(*) from t").await.unwrap()[0][0].clone().unwrap()
@@ -1150,7 +1144,11 @@ impl Session for DroppingSession {
     async fn ping(&self) -> databrain_connector_core::Result<()> {
         Ok(())
     }
-    async fn execute(&self, _: &str, _: ExecOptions) -> databrain_connector_core::Result<databrain_connector_core::QueryStream> {
+    async fn execute(
+        &self,
+        _: databrain_connector_core::Statement<'_>,
+        _: ExecOptions,
+    ) -> databrain_connector_core::Result<databrain_connector_core::QueryStream> {
         Err(ConnectorError::connection("gone"))
     }
     async fn list_schemas(&self) -> databrain_connector_core::Result<Vec<SchemaInfo>> {
@@ -1162,7 +1160,7 @@ impl Session for DroppingSession {
     async fn describe(&self, _: &str, _: &str) -> databrain_connector_core::Result<ObjectDetail> {
         Err(ConnectorError::connection("gone"))
     }
-    async fn estimate_cost(&self, _: &str) -> databrain_connector_core::Result<Option<databrain_connector_core::CostEstimate>> {
+    async fn estimate_cost(&self, _: &databrain_connector_core::Checked) -> databrain_connector_core::Result<Option<databrain_connector_core::CostEstimate>> {
         Err(ConnectorError::connection("connection reset"))
     }
 }

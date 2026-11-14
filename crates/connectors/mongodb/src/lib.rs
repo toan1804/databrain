@@ -298,7 +298,8 @@ impl Session for MongoSession {
         self.client.database("admin").run_command(doc! {"ping": 1}).await.map(|_| ()).map_err(err)
     }
 
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+    async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
+        let sql = stmt.sql();
         let (tx, stream) = QueryStream::channel(4);
         let s = MongoSession { client: self.client.clone(), database: self.database.clone() };
         let text = sql.to_string();
@@ -469,7 +470,7 @@ mod tests {
         let q = |t: &str| {
             let t = t.to_string();
             let s = &s;
-            async move { s.execute(&t, ExecOptions::default()).await.unwrap().collect().await }
+            async move { s.execute(databrain_connector_core::Statement::internal(&t), ExecOptions::default()).await.unwrap().collect().await }
         };
         q("db.people.drop()").await.ok();
         assert_eq!(q("db.people.insertMany([{name: 'An', age: 30, tags: ['a']}, {name: 'Binh', age: 41.5}])").await.unwrap().summary.rows_affected, Some(2));

@@ -159,7 +159,13 @@ mod tests {
         c.options.insert("http_path".into(), path);
         let creds = Arc::new(InlineCredentialSource::new(AuthMethod::ApiToken { user: None }, Some(token.into())));
         let s = DatabricksConnector.connect(&c, creds).await.unwrap();
-        let r = s.execute("SELECT 1 AS a, 'x' AS b, current_timestamp() AS c", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let r = s
+            .execute(databrain_connector_core::Statement::internal("SELECT 1 AS a, 'x' AS b, current_timestamp() AS c"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(r.num_rows(), 1);
         assert!(!s.list_schemas().await.unwrap().is_empty());
     }

@@ -125,12 +125,21 @@ mod tests {
     #[tokio::test]
     async fn batches_and_cancel() {
         let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
-        let r = s.execute("select * from range(5000)", ExecOptions { batch_size: 1000, ..Default::default() }).await.unwrap().collect().await.unwrap();
+        let r = s
+            .execute(databrain_connector_core::Statement::internal("select * from range(5000)"), ExecOptions { batch_size: 1000, ..Default::default() })
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(r.num_rows(), 5000);
         assert!(r.batches.iter().all(|b| b.num_rows() <= 1000));
         let cancel = databrain_connector_core::CancellationToken::new();
         let st = s
-            .execute("select count(*) from range(10000000000) a, range(1000) b", ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() })
+            .execute(
+                databrain_connector_core::Statement::internal("select count(*) from range(10000000000) a, range(1000) b"),
+                ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() },
+            )
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -149,7 +158,7 @@ mod tests {
         let cancel = databrain_connector_core::CancellationToken::new();
         let mut st = s
             .execute(
-                "select a.range, md5(a.range::varchar) from range(2000000000) a",
+                databrain_connector_core::Statement::internal("select a.range, md5(a.range::varchar) from range(2000000000) a"),
                 ExecOptions { batch_size: 1000, cancel: cancel.clone(), ..Default::default() },
             )
             .await
@@ -170,7 +179,12 @@ mod tests {
         // the engine does: otherwise the interrupt can hit the next one.
         while st.next().await.is_some() {}
         let r = s
-            .execute("select case when range < 300000 then range else error('boom at ' || range) end as v from range(400000)", ExecOptions::default())
+            .execute(
+                databrain_connector_core::Statement::internal(
+                    "select case when range < 300000 then range else error('boom at ' || range) end as v from range(400000)",
+                ),
+                ExecOptions::default(),
+            )
             .await
             .unwrap()
             .collect()

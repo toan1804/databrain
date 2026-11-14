@@ -439,7 +439,8 @@ impl Session for BqSession {
         self.0.run_small("SELECT 1").await.map(|_| ())
     }
 
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+    async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
+        let sql = stmt.sql();
         let (tx, stream) = QueryStream::channel(4);
         let inner = self.0.clone();
         let sql = sql.to_string();
@@ -531,7 +532,8 @@ impl Session for BqSession {
         Ok(out)
     }
 
-    async fn estimate_cost(&self, sql: &str) -> Result<Option<CostEstimate>> {
+    async fn estimate_cost(&self, sql: &databrain_connector_core::Checked) -> Result<Option<CostEstimate>> {
+        let sql = sql.sql();
         self.0.dry_run(sql).await.map(Some)
     }
 
@@ -678,7 +680,13 @@ mod tests {
         c.options.insert("project".into(), project);
         let creds = credential_source(&c.auth, "t", Arc::new(MemoryStore::default()), Arc::new(NonInteractive), BigQueryConnector.auth_context(&c)).unwrap();
         let s = BigQueryConnector.connect(&c, creds).await.unwrap();
-        let r = s.execute("SELECT 1 AS a, 'x' AS b, CURRENT_TIMESTAMP() AS c, [1,2] AS d", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let r = s
+            .execute(databrain_connector_core::Statement::internal("SELECT 1 AS a, 'x' AS b, CURRENT_TIMESTAMP() AS c, [1,2] AS d"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(r.num_rows(), 1);
     }
 }

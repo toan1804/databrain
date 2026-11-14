@@ -581,7 +581,8 @@ impl Session for SfSession {
         self.0.run_small("select 1").await.map(|_| ())
     }
 
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+    async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
+        let sql = stmt.sql();
         self.0.state.observe(sql, ConnectorKind::Snowflake);
         let (tx, stream) = QueryStream::channel(4);
         let inner = self.0.clone();
@@ -774,7 +775,8 @@ impl Session for SfSession {
     /// `EXPLAIN USING JSON`: Snowflake compiles the statement (pruning
     /// included) without running it, and `GlobalStats` says how many
     /// micro-partitions and bytes it would scan. Uses cloud services only.
-    async fn estimate_cost(&self, sql: &str) -> Result<Option<CostEstimate>> {
+    async fn estimate_cost(&self, sql: &databrain_connector_core::Checked) -> Result<Option<CostEstimate>> {
+        let sql = sql.sql();
         let rows = databrain_connector_core::query_text(self, &format!("EXPLAIN USING JSON {sql}")).await?;
         let raw = rows.first().and_then(|r| r.first().cloned().flatten()).unwrap_or_default();
         Ok(Some(explain_global_stats(&raw)))
@@ -1126,14 +1128,23 @@ mod tests {
         let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, Some(pw.into())));
         let s = SnowflakeConnector.connect(&c, creds).await.unwrap();
         let r = s
-            .execute("select 1 as a, 'x' as b, current_timestamp() as c, 1.5::number(5,2) as d", ExecOptions::default())
+            .execute(
+                databrain_connector_core::Statement::internal("select 1 as a, 'x' as b, current_timestamp() as c, 1.5::number(5,2) as d"),
+                ExecOptions::default(),
+            )
             .await
             .unwrap()
             .collect()
             .await
             .unwrap();
         assert_eq!(r.num_rows(), 1);
-        let r = s.execute("select seq4() from table(generator(rowcount => 50000))", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let r = s
+            .execute(databrain_connector_core::Statement::internal("select seq4() from table(generator(rowcount => 50000))"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(r.num_rows(), 50000);
     }
 }

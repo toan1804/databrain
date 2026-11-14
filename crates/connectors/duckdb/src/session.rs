@@ -89,7 +89,8 @@ impl Session for DuckSession {
         self.strings("select 1".into(), vec![]).await.map(|_| ())
     }
 
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+    async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
+        let sql = stmt.sql();
         self.state.observe(sql, ConnectorKind::Duckdb);
         let (tx, stream) = QueryStream::channel(4);
         let conn = self.conn.clone();

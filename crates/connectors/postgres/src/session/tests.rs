@@ -24,7 +24,14 @@ async fn live_object_ddl() {
         panic!("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
     };
     let s = &s;
-    let run = |sql: String| async move { s.execute(&sql, ExecOptions::default()).await.unwrap().collect().await.unwrap_or_else(|e| panic!("{sql}: {e}")) };
+    let run = |sql: String| async move {
+        s.execute(databrain_connector_core::Statement::internal(&sql), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    };
     for stmt in [
         "drop schema if exists kb_ddl cascade",
         "create schema kb_ddl",
@@ -91,7 +98,14 @@ async fn live_redshift_metadata() {
     let s = PostgresConnector.connect(&cfg, creds).await.unwrap();
     assert!(s.server_version().await.unwrap().contains("Redshift"));
     let s = &s;
-    let run = |sql: &'static str| async move { s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap_or_else(|e| panic!("{sql}: {e}")) };
+    let run = |sql: &'static str| async move {
+        s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    };
     run("drop schema if exists databrain_rs cascade").await;
     run("create schema databrain_rs").await;
     run("create table databrain_rs.customers (id int primary key, name varchar(40)) diststyle all").await;
@@ -131,7 +145,7 @@ async fn live_search_routines() {
         "create function kb_r.kb_total_tax(x int) returns int language sql as 'select x'",
         "create procedure kb_r.kb_refresh() language sql as 'select 1'",
     ] {
-        s.execute(stmt, ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        s.execute(databrain_connector_core::Statement::internal(stmt), ExecOptions::default()).await.unwrap().collect().await.unwrap();
     }
     let names = |v: Vec<DbObject>| v.into_iter().map(|o| format!("{}.{} {:?}", o.schema, o.name, o.kind)).collect::<Vec<_>>();
     // No schema: the search path only (kb_r is not on it); no pg_catalog functions.
@@ -139,7 +153,7 @@ async fn live_search_routines() {
     assert!(s.search_routines(None, "now", 50).await.unwrap().is_empty());
     assert_eq!(names(s.search_routines(Some("kb_r"), "kb", 50).await.unwrap()), vec!["kb_r.kb_refresh Procedure", "kb_r.kb_total_tax Function"]);
     for stmt in ["drop schema kb_r cascade", "drop function public.kb_total(int)"] {
-        s.execute(stmt, ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        s.execute(databrain_connector_core::Statement::internal(stmt), ExecOptions::default()).await.unwrap().collect().await.unwrap();
     }
 }
 
@@ -153,7 +167,7 @@ async fn live_explorer_versions() {
     };
     let run = |sql: &'static str| async {
         for stmt in sql.split(';').map(str::trim).filter(|x| !x.is_empty()) {
-            s.execute(stmt, ExecOptions::default()).await.unwrap().collect().await.unwrap();
+            s.execute(databrain_connector_core::Statement::internal(stmt), ExecOptions::default()).await.unwrap().collect().await.unwrap();
         }
     };
     run("drop schema if exists ex_a cascade; drop schema if exists ex_b cascade").await;
@@ -214,7 +228,7 @@ async fn live_bulk_metadata_and_fingerprints() {
     };
     let run = |sql: &'static str| async {
         for stmt in sql.split(';').map(str::trim).filter(|x| !x.is_empty()) {
-            s.execute(stmt, ExecOptions::default()).await.unwrap().collect().await.unwrap();
+            s.execute(databrain_connector_core::Statement::internal(stmt), ExecOptions::default()).await.unwrap().collect().await.unwrap();
         }
     };
     run("drop schema if exists kb_a cascade; drop schema if exists kb_b cascade; drop schema if exists kb_c cascade").await;
@@ -277,7 +291,10 @@ async fn live_roundtrip() {
     let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user }, pw.map(secrecy::SecretString::from)));
     let s = PostgresConnector.connect(&cfg, creds).await.unwrap();
     let r = s
-        .execute("select 1::int as a, 'x'::text as b, now() as c, 1.5::numeric as d, null::date as e", ExecOptions::default())
+        .execute(
+            databrain_connector_core::Statement::internal("select 1::int as a, 'x'::text as b, now() as c, 1.5::numeric as d, null::date as e"),
+            ExecOptions::default(),
+        )
         .await
         .unwrap()
         .collect()
@@ -285,13 +302,19 @@ async fn live_roundtrip() {
         .unwrap();
     assert_eq!(r.num_rows(), 1);
     let cancel = databrain_connector_core::CancellationToken::new();
-    let stream = s.execute("select pg_sleep(30)", ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() }).await.unwrap();
+    let stream = s
+        .execute(
+            databrain_connector_core::Statement::internal("select pg_sleep(30)"),
+            ExecOptions { batch_size: 10, cancel: cancel.clone(), ..Default::default() },
+        )
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     cancel.cancel();
     assert!(stream.collect().await.unwrap_err().is_cancelled());
     assert!(!s.list_schemas().await.unwrap().is_empty());
     // Indexes + partition key for query hints.
-    let run = |sql: &'static str| s.execute(sql, ExecOptions::default());
+    let run = |sql: &'static str| s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default());
     run("drop table if exists databrain_layout_t").await.unwrap().collect().await.unwrap();
     run("create table databrain_layout_t (id int, day date not null, cust text, primary key (id, day)) partition by range (day)")
         .await

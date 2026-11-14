@@ -78,11 +78,22 @@ Required: `kind`, `server_version`, `ping`, `execute`, `list_schemas`, `list_obj
 | `bulk_metadata(schemas)` | `default_bulk_metadata`: `list_objects` + `schema_columns` per schema | Two or more queries per schema; a schema's error is in its entry, not the call's |
 | `schema_columns(schema)` | `describe` per object; objects that fail are skipped | One round trip per table |
 | `schema_object_counts()` | `None` | The index can't be sized before it runs |
-| `check_sql(sql)` | runs `traits().explain` + `sql` through `execute`, shifts the error position back | `Ok(false)` when `explain` is `None`. The text is sent as given: the caller passes one statement it has classified as a read |
+| `check_sql(&Checked)` | runs `traits().explain` + the statement through `execute`, shifts the error position back | `Ok(false)` when `explain` is `None`. The text is sent as given: the caller passes one statement and checks its kind |
 | `table_layout(schema, name)` | primary key from `describe` | No index or partition hints |
-| `estimate_cost(sql)` | `None` | Must agree with `SourceTraits::cost_preview` |
+| `estimate_cost(&Checked)` | `None` | Must agree with `SourceTraits::cost_preview` |
 
-`execute(sql, opts)` takes one statement and returns a `QueryStream` (below). Nothing in the core checks that `sql` is one statement; the splitter is what makes it so, and what a driver does with text holding several is the connector's business.
+`execute(stmt, opts)` takes one statement and returns a `QueryStream` (below). Nothing in the core checks that it is one statement; the splitter is what makes it so, and what a driver does with text holding several is the connector's business.
+
+### `Statement` and `Checked` (`sql/statement.rs`)
+
+What `execute`, `check_sql`, `estimate_cost` and `query_table` take is a `Statement`, and there are two ways to make one:
+
+| From | For | Made by |
+|---|---|---|
+| `Checked::statement()` | Text a user, the AI, a job or a client typed | `Checked::new(sql, kind)` classifies it; `Checked::bind(kind, params)` puts in the `:name` values and classifies again |
+| `Statement::internal(sql)` | SQL DataBrain writes: catalog queries (`query_text`), `BEGIN`/`COMMIT`, grid edits, load statements, `EXPLAIN` around a `Checked` statement | Nothing checks it; each use is a place to review |
+
+So typed text can't reach a database without the classification the safety checks read: `PlannedStatement` holds a `Checked`, exports, loads that run a query again, a load's before/after SQL (`Act::User`), plans, cost previews and "Check with database" build one. `Statement::kind()` is the classified kind (`None` for internal SQL). A connector reads the text with `stmt.sql()`.
 
 ## `SourceTraits` and the generated JSON
 
@@ -164,7 +175,7 @@ editor text
   │ redact_text(sql or message)             sql/redact.rs      (history, job logs, AI transcripts and audit)
 ```
 
-`QueryEngine::plan` splits and classifies; `bind_parameters` substitutes and classifies again, so the checks see the SQL that is sent (`query-engine/src/run.rs`).
+`QueryEngine::plan` splits and classifies each statement into a `Checked`; `bind_parameters` substitutes and classifies again (`Checked::bind`), so the checks see the SQL that is sent, and only a `Checked` statement can run it (`query-engine/src/run.rs`).
 
 | Stage | Guarantees | Assumes |
 |---|---|---|

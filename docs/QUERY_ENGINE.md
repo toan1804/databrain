@@ -89,8 +89,8 @@ Rules:
 
 ```
 RunRequest ──► start_run (run.rs, synchronous)
-   1. plan: split_statements + classify           (connector-core)
-   2. bind_parameters (:name), classify again
+   1. plan: split_statements + Checked::new (classify)   (connector-core)
+   2. bind_parameters (:name): Checked::bind, classify again
    3. output name: validate_name, check_owner (job steps own their names)
    4. guarded(Intent::Run): read-only connection → every statement must pass
       read_only_allows, else "invalid"; not confirmed and safety_reasons

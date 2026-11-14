@@ -35,7 +35,7 @@ pub use outputs::{NewOutput, OutputInfo, OutputRegistry, OutputState, OutputTabl
 use databrain_auth::{
     AuthStatus, CredentialSource, ExposeSecret, InlineCredentialSource, Interaction, NonInteractive, SecretRef, SecretStore, credential_source,
 };
-use databrain_connector_core::sql::{Classification, StatementKind, classify, split_statements};
+use databrain_connector_core::sql::{Checked, Classification, Statement, StatementKind, split_statements};
 use databrain_connector_core::{
     CancellationToken, ConnectionConfig, ConnectorError, ConnectorRegistry, DbObject, ErrorKind, ExecOptions, ObjectDetail, SchemaInfo, Session, StreamEvent,
     TableLayout,
@@ -98,10 +98,23 @@ impl RunRequest {
 #[ts(export)]
 pub struct PlannedStatement {
     pub index: usize,
-    pub sql: String,
     pub start: usize,
     pub end: usize,
-    pub classification: Classification,
+    /// Its text (parameters bound) and classification: what runs is what
+    /// the safety checks read.
+    #[serde(flatten)]
+    #[ts(flatten)]
+    pub checked: Checked,
+}
+
+impl PlannedStatement {
+    pub fn sql(&self) -> &str {
+        self.checked.sql()
+    }
+
+    pub fn classification(&self) -> &Classification {
+        self.checked.classification()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]

@@ -48,7 +48,8 @@ impl Session for PgSession {
         self.client().simple_query("select 1").await.map(|_| ()).map_err(|e| map_err(&e))
     }
 
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+    async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
+        let sql = stmt.sql();
         let (tx, stream) = QueryStream::channel(4);
         let link = self.link.clone();
         let cancel_token = link.client().cancel_token();

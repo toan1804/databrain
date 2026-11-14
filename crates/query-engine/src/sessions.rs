@@ -348,7 +348,7 @@ impl QueryEngine {
         };
         // SQL Server nests BEGIN TRAN: each COMMIT ends one level.
         for _ in 0..32 {
-            session.execute(sql, ExecOptions::default()).await?.collect().await?;
+            session.execute(Statement::internal(sql), ExecOptions::default()).await?.collect().await?;
             // Only a known open one: an unknown state would repeat COMMIT 32 times.
             if !commit || session.transaction_state() != TxState::Open {
                 break;
@@ -366,7 +366,7 @@ impl QueryEngine {
         cancel: &CancellationToken,
     ) -> Result<()> {
         use databrain_connector_core::sql::StatementKind as K;
-        let write = match stmt.classification.kind {
+        let write = match stmt.classification().kind {
             K::Dml => true,
             // MySQL commits DDL at once; elsewhere DDL is transactional.
             K::Ddl => kind != databrain_connector_core::ConnectorKind::Mysql,
@@ -384,7 +384,7 @@ impl QueryEngine {
         if !needs_begin(kind, session.transaction_state()) {
             return Ok(());
         }
-        session.execute(begin, ExecOptions::default()).await?.collect().await?;
+        session.execute(Statement::internal(begin), ExecOptions::default()).await?.collect().await?;
         Ok(())
     }
 

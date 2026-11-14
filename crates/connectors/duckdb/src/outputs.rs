@@ -347,24 +347,46 @@ mod tests {
         let mem = conn.connect(&ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None), creds()).await.unwrap();
         // Renamed through a CTE column list: still the mask.
         let sql = "with c(a, b) as (select * from results.sales) select string_agg(distinct a, ',') from c";
-        let r = mem.execute(sql, opts(masked())).await.unwrap().collect().await.unwrap();
+        let r = mem.execute(databrain_connector_core::Statement::internal(sql), opts(masked())).await.unwrap().collect().await.unwrap();
         assert_eq!(r.batches[0].column(0).as_string::<i32>().value(0), "***");
         // The same session without masks (the user's run) gets the values back.
         let r = q(mem.as_ref(), "select string_agg(distinct region, ',' order by region) from results.sales").await;
         assert_eq!(r.batches[0].column(0).as_string::<i32>().value(0), "EU,US");
         // An output the caller didn't check is refused.
-        let e = mem.execute("select * from results.sales", opts(OutputMasks::default())).await.unwrap().collect().await.unwrap_err();
+        let e = mem
+            .execute(databrain_connector_core::Statement::internal("select * from results.sales"), opts(OutputMasks::default()))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
         assert!(e.message.contains("not checked"), "{}", e.message);
         // A database file is shared with other sessions: no masked loads there.
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
         cfg.file_path = Some(dir.path().join("m.duckdb").to_string_lossy().into_owned());
         let file = conn.connect(&cfg, creds()).await.unwrap();
-        let e = file.execute("select * from results.sales", opts(masked())).await.unwrap().collect().await.unwrap_err();
+        let e = file
+            .execute(databrain_connector_core::Statement::internal("select * from results.sales"), opts(masked()))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
         assert!(e.message.contains("sensitive columns"), "{}", e.message);
         // Nothing to mask: fine there too.
         let none = OutputMasks([("v1".to_string(), vec![])].into());
-        assert_eq!(file.execute("select * from results.sales", opts(none)).await.unwrap().collect().await.unwrap().batches[0].num_rows(), 4);
+        assert_eq!(
+            file.execute(databrain_connector_core::Statement::internal("select * from results.sales"), opts(none))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap()
+                .batches[0]
+                .num_rows(),
+            4
+        );
     }
 
     /// An output on disk: its file holds 5 rows, the stream gives 3, so a
@@ -400,7 +422,11 @@ mod tests {
     }
 
     async fn count(s: &dyn databrain_connector_core::Session, sql: &str) -> databrain_connector_core::Result<i64> {
-        s.execute(sql, ExecOptions::default()).await?.collect().await.map(|r| r.batches[0].column(0).as_primitive::<Int64Type>().value(0))
+        s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default())
+            .await?
+            .collect()
+            .await
+            .map(|r| r.batches[0].column(0).as_primitive::<Int64Type>().value(0))
     }
 
     /// A sandboxed (AI) session gets an output on disk streamed in and can't
@@ -412,7 +438,10 @@ mod tests {
         let path = file.to_string_lossy().into_owned();
         session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None))
             .await
-            .execute(&format!("COPY (SELECT range AS n FROM range(5)) TO {} (FORMAT parquet)", quote_literal(&path)), ExecOptions::default())
+            .execute(
+                databrain_connector_core::Statement::internal(&format!("COPY (SELECT range AS n FROM range(5)) TO {} (FORMAT parquet)", quote_literal(&path))),
+                ExecOptions::default(),
+            )
             .await
             .unwrap()
             .collect()
@@ -451,7 +480,13 @@ mod tests {
         *fake.0.lock().unwrap() = ("v2".into(), 10);
         let r = q(s.as_ref(), "select count(*) from results.sales a join results.sales b using (amount)").await;
         assert_eq!(r.batches[0].column(0).as_primitive::<Int64Type>().value(0), 10);
-        let e = s.execute("select * from results.nope", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
+        let e = s
+            .execute(databrain_connector_core::Statement::internal("select * from results.nope"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
         assert!(e.message.contains("results.nope") && e.message.contains("results.sales"), "{}", e.message);
         // Explorer: outputs are listed (with columns) under results.main,
         // also after `results` was attached by the queries above.
@@ -465,7 +500,13 @@ mod tests {
         assert_eq!(s.schema_object_counts().await.unwrap().unwrap().get(RESULTS_SCHEMA_ID), Some(&1));
         // Without a provider, results.* is a clear error.
         let plain = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
-        let e = plain.execute("select * from results.sales", ExecOptions::default()).await.unwrap().collect().await.unwrap_err();
+        let e = plain
+            .execute(databrain_connector_core::Statement::internal("select * from results.sales"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
         assert!(e.message.contains("not available"), "{}", e.message);
     }
 }

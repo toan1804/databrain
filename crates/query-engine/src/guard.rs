@@ -61,17 +61,22 @@ impl QueryEngine {
                 if read_only {
                     // Only reads (and harmless USE/SET): a transaction or session
                     // statement could turn read-only off for what follows.
-                    if let Some(p) = plan.iter().find(|p| !databrain_connector_core::sql::read_only_allows(&p.sql, &p.classification)) {
-                        let why = if p.classification.kind.is_write() {
+                    if let Some(p) = plan.iter().find(|p| !databrain_connector_core::sql::read_only_allows(p.sql(), p.classification())) {
+                        let why = if p.classification().kind.is_write() {
                             ""
-                        } else if p.classification.kind == StatementKind::Unknown {
+                        } else if p.classification().kind == StatementKind::Unknown {
                             ": DataBrain can't tell that it only reads (it doesn't parse for this database, or part of it may run as a statement of its own)"
                         } else {
                             ": on a read-only connection only queries run (transactions and session settings could make it writable)"
                         };
                         return Err(EngineError::new(
                             "invalid",
-                            format!("Connection \"{}\" is read-only; statement {} ({}) was not run{why}.", profile.name, p.index + 1, p.classification.keyword),
+                            format!(
+                                "Connection \"{}\" is read-only; statement {} ({}) was not run{why}.",
+                                profile.name,
+                                p.index + 1,
+                                p.classification().keyword
+                            ),
                         ));
                     }
                 }

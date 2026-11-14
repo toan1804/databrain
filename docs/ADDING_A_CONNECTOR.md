@@ -39,7 +39,7 @@ This guide is for developers and AI coding agents adding a new connector (databa
    | `config.rs` | `ConnectionConfig` → driver settings (host, port, TLS, options) |
    | `error.rs` | Driver errors → `ConnectorError` with the right `ErrorKind` (Auth, Connection, Query, Cancelled…), `code` and `position` |
    | `types.rs` | Native types → Arrow `ColType` |
-   | `exec.rs` | `execute`: stream rows as Arrow batches (`BatchBuilder`), honour `ExecOptions` (row limit, cancel) |
+   | `exec.rs` | `execute`: run `stmt.sql()` and stream rows as Arrow batches (`BatchBuilder`), honour `ExecOptions` (row limit, cancel) |
    | `schema.rs` | Catalog queries |
    | `session.rs` | `impl Session`, plus the live tests |
 

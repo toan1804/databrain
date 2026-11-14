@@ -11,9 +11,9 @@ use super::*;
 /// statements with effects beyond the session (`SET GLOBAL …`) ask too, as
 /// they do for the AI.
 pub(crate) fn prod_needs_confirmation(p: &PlannedStatement) -> bool {
-    match p.classification.kind {
+    match p.classification().kind {
         StatementKind::Read | StatementKind::Transaction => false,
-        StatementKind::Session => !databrain_connector_core::sql::read_only_allows(&p.sql, &p.classification),
+        StatementKind::Session => !databrain_connector_core::sql::read_only_allows(p.sql(), p.classification()),
         StatementKind::Dml | StatementKind::Ddl | StatementKind::Other | StatementKind::Unknown => true,
     }
 }
@@ -26,7 +26,7 @@ impl QueryEngine {
         split_statements(sql, kind)
             .into_iter()
             .enumerate()
-            .map(|(index, s)| PlannedStatement { index, classification: classify(&s.sql, kind), sql: s.sql, start: s.start, end: s.end })
+            .map(|(index, s)| PlannedStatement { index, checked: Checked::new(s.sql, kind), start: s.start, end: s.end })
             .collect()
     }
 
@@ -39,12 +39,8 @@ impl QueryEngine {
     ) -> Result<()> {
         let mut missing: Vec<String> = Vec::new();
         for p in plan.iter_mut() {
-            match databrain_connector_core::sql::substitute_parameters(&p.sql, kind, params) {
-                Ok(sql) if sql != p.sql => {
-                    p.classification = classify(&sql, kind);
-                    p.sql = sql;
-                }
-                Ok(_) => {}
+            match p.checked.clone().bind(kind, params) {
+                Ok(bound) => p.checked = bound,
                 Err(names) => missing.extend(names.into_iter().filter(|n| !missing.contains(n)).collect::<Vec<_>>()),
             }
         }
@@ -59,7 +55,7 @@ impl QueryEngine {
     pub(crate) fn safety_reasons(profile: &ConnectionProfile, plan: &[PlannedStatement]) -> Vec<String> {
         let mut reasons = Vec::new();
         for p in plan {
-            let c = &p.classification;
+            let c = p.classification();
             if c.missing_where {
                 reasons.push(format!("Statement {} is {} without a WHERE clause and will affect every row.", p.index + 1, c.keyword));
             }
@@ -144,7 +140,7 @@ impl QueryEngine {
             .iter()
             .map(|p| StatementOutcomeView {
                 index: p.index,
-                sql: p.sql.clone(),
+                sql: p.sql().to_string(),
                 result: None,
                 rows_affected: None,
                 error: None,
@@ -237,7 +233,7 @@ impl QueryEngine {
                 status = RunStatus::Cancelled;
                 break;
             }
-            self.events.emit(JobEvent::StatementStarted { job_id: job_id.clone(), tab_id: req.tab_id.clone(), index: stmt.index, sql: stmt.sql.clone() });
+            self.events.emit(JobEvent::StatementStarted { job_id: job_id.clone(), tab_id: req.tab_id.clone(), index: stmt.index, sql: stmt.sql().to_string() });
             let started_at = now_ms();
             let t0 = Instant::now();
             let outcome = match self.begin_if_manual(&req, conn_kind, stmt, &cancel).await {
@@ -252,7 +248,7 @@ impl QueryEngine {
                     connection_id: req.connection_id.clone(),
                     connection_name: conn_name.clone(),
                     kind: conn_kind,
-                    sql: stmt.sql.clone(),
+                    sql: stmt.sql().to_string(),
                     tab_id: req.tab_id.clone(),
                     statement_index: stmt.index,
                     row_limit: limit,
@@ -273,7 +269,7 @@ impl QueryEngine {
                 self.workspace.add_history(NewHistory {
                     origin: req.origin,
                     connection_id: Some(req.connection_id.clone()),
-                    sql: stmt.sql.clone(),
+                    sql: stmt.sql().to_string(),
                     started_at,
                     duration_ms: duration_ms as i64,
                     rows,
@@ -367,7 +363,7 @@ impl QueryEngine {
         let batch_size = limit.map(|l| l.clamp(1, 2000)).unwrap_or(2000);
         let stream = session
             .execute(
-                &stmt.sql,
+                stmt.checked.statement(),
                 ExecOptions {
                     batch_size,
                     cancel: cancel.clone(),

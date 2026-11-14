@@ -14,6 +14,7 @@ mod params;
 mod read_only;
 mod redact;
 mod splitter;
+mod statement;
 
 pub(crate) use classify::keyword_kind;
 pub use classify::{Classification, StatementKind, classify};
@@ -22,6 +23,7 @@ pub use read_only::{read_only_allows, unknown_functions};
 pub use redact::{redact_key_values, redact_secrets, redact_text, redact_url_passwords};
 pub use splitter::{StatementSpan, leading_keyword, split_statements, split_with, statement_at};
 pub(crate) use splitter::{code_text, skip_token, words};
+pub use statement::{Checked, Statement};
 
 pub fn dialect_for(kind: ConnectorKind) -> Box<dyn Dialect> {
     dialect_of(kind.traits().parser)

@@ -37,7 +37,7 @@ impl QueryEngine {
 
     /// [`Session::check_sql`] on the metadata session, at most 10 s.
     pub async fn check_sql(&self, connection_id: &str, sql: &str) -> Result<bool> {
-        let sql = sql.to_string();
+        let sql = databrain_connector_core::Checked::new(sql, self.workspace.get_connection(connection_id)?.config.kind);
         match tokio::time::timeout(
             Duration::from_secs(10),
             self.with_meta(connection_id, |s| {

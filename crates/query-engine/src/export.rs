@@ -32,9 +32,12 @@ impl QueryEngine {
         if split_statements(sql, kind).len() != 1 {
             return Err(EngineError::new("invalid", "Only a single statement can be exported again"));
         }
-        let c = classify(sql, kind);
-        if !c.kind.is_read() {
-            return Err(EngineError::new("invalid", format!("Only queries that read data are run again for an export ({} would run again)", c.keyword)));
+        let checked = Checked::new(sql, kind);
+        if !checked.kind().is_read() {
+            return Err(EngineError::new(
+                "invalid",
+                format!("Only queries that read data are run again for an export ({} would run again)", checked.classification().keyword),
+            ));
         }
         let cancel = CancellationToken::new();
         self.exports.lock().insert(export_id.to_string(), cancel.clone());
@@ -50,7 +53,7 @@ impl QueryEngine {
             }
         };
         let tab = shared.map_or_else(|| SessionRole::Export(export_id.to_string()).key(), str::to_string);
-        let out = self.export_stream(connection_id, &tab, sql, path, opts, &cancel, progress).await;
+        let out = self.export_stream(connection_id, &tab, &checked, path, opts, &cancel, progress).await;
         self.exports.lock().remove(export_id);
         if claim.is_none() {
             self.drop_session(connection_id, &tab);
@@ -73,7 +76,7 @@ impl QueryEngine {
         &self,
         connection_id: &str,
         tab: &str,
-        sql: &str,
+        sql: &Checked,
         path: &std::path::Path,
         opts: databrain_export::ExportOptions,
         cancel: &CancellationToken,
@@ -90,7 +93,8 @@ impl QueryEngine {
             _ = cancel.cancelled() => return Err(ConnectorError::cancelled().into()),
         };
         report(ExportPhase::Running, 0, None);
-        let mut stream = session.execute(sql, ExecOptions { batch_size: 10_000, cancel: cancel.clone(), max_rows: None, output_masks: None }).await?;
+        let mut stream =
+            session.execute(sql.statement(), ExecOptions { batch_size: 10_000, cancel: cancel.clone(), max_rows: None, output_masks: None }).await?;
         let mut writer: Option<databrain_export::FileWriter> = None;
         let fail = |e: databrain_export::ExportError| EngineError::new("invalid", e.to_string());
         let mut rows = 0u64;

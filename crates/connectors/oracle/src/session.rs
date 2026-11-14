@@ -145,7 +145,8 @@ impl Session for OracleSession {
         self.with_conn(|c| c.ping().map_err(map_err)).await
     }
 
-    async fn execute(&self, sql: &str, opts: ExecOptions) -> Result<QueryStream> {
+    async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
+        let sql = stmt.sql();
         let (conn, lock) = match &self.backend {
             Backend::Thin(a) => return Ok(thin_execute(a.clone(), sql, opts)),
             Backend::Thick { conn, lock } => (conn.clone(), lock.clone()),
@@ -529,7 +530,12 @@ mod tests {
     }
 
     async fn run(s: &OracleSession, sql: &str) {
-        s.execute(sql, ExecOptions::default()).await.unwrap().collect().await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 
     /// Routine completion: standalone functions/procedures, packages and
@@ -596,7 +602,7 @@ mod tests {
         };
         let run = |sql: &'static str| {
             let s = &s;
-            async move { s.execute(sql, ExecOptions::default()).await.unwrap().collect().await }
+            async move { s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await.unwrap().collect().await }
         };
         assert!(s.server_version().await.unwrap().contains("Oracle"));
         s.ping().await.unwrap();
@@ -635,8 +641,13 @@ mod tests {
         run("comment on table kb_thin is 'thin test'").await.unwrap();
         let ins = run("insert into kb_thin select level, 'n' || level, null from dual connect by level <= 25000").await.unwrap();
         assert_eq!(ins.summary.rows_affected, Some(25000));
-        let all =
-            s.execute("select * from kb_thin order by id", ExecOptions { batch_size: 1000, ..Default::default() }).await.unwrap().collect().await.unwrap();
+        let all = s
+            .execute(databrain_connector_core::Statement::internal("select * from kb_thin order by id"), ExecOptions { batch_size: 1000, ..Default::default() })
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!((all.num_rows(), all.batches.len()), (25000, 25));
         let me = s.list_schemas().await.unwrap().into_iter().find(|x| x.is_default).unwrap().name;
         let m = s.bulk_metadata(std::slice::from_ref(&me)).await.unwrap();
@@ -664,7 +675,10 @@ mod tests {
         // Cancel a long query; the session stays usable.
         let cancel = databrain_connector_core::CancellationToken::new();
         let st = s
-            .execute("select count(*) from all_objects a, all_objects b, all_objects c", ExecOptions { cancel: cancel.clone(), ..Default::default() })
+            .execute(
+                databrain_connector_core::Statement::internal("select count(*) from all_objects a, all_objects b, all_objects c"),
+                ExecOptions { cancel: cancel.clone(), ..Default::default() },
+            )
             .await
             .unwrap();
         let c2 = cancel.clone();
@@ -679,21 +693,37 @@ mod tests {
         assert_eq!(run("select 7 from dual").await.unwrap().num_rows(), 1);
 
         // Row cap: stops early.
-        let capped = s.execute("select * from kb_thin", ExecOptions { max_rows: Some(10), ..Default::default() }).await.unwrap().collect().await.unwrap();
+        let capped = s
+            .execute(databrain_connector_core::Statement::internal("select * from kb_thin"), ExecOptions { max_rows: Some(10), ..Default::default() })
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(capped.num_rows(), 10);
         run("drop table kb_thin purge").await.unwrap();
 
         // Read-only connections: reads work, writes are refused by the server.
         let ro = live_with(driver, true).await.unwrap();
-        assert_eq!(ro.execute("select 1 from dual", ExecOptions::default()).await.unwrap().collect().await.unwrap().num_rows(), 1);
-        let e = ro.execute("create table kb_ro (x int)", ExecOptions::default()).await.unwrap().collect().await;
-        let e2 = ro.execute("insert into kb_ro values (1)", ExecOptions::default()).await.unwrap().collect().await;
+        assert_eq!(
+            ro.execute(databrain_connector_core::Statement::internal("select 1 from dual"), ExecOptions::default())
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap()
+                .num_rows(),
+            1
+        );
+        let e = ro.execute(databrain_connector_core::Statement::internal("create table kb_ro (x int)"), ExecOptions::default()).await.unwrap().collect().await;
+        let e2 =
+            ro.execute(databrain_connector_core::Statement::internal("insert into kb_ro values (1)"), ExecOptions::default()).await.unwrap().collect().await;
         // (The engine refuses writes on read-only connections before they reach
         // the driver; this checks the server-side guard of the thin driver.)
         if driver == "thin" {
             assert!(e.is_err() || e2.is_err(), "write refused on a read-only connection");
         }
-        let _ = s.execute("drop table kb_ro purge", ExecOptions::default()).await.unwrap().collect().await;
+        let _ = s.execute(databrain_connector_core::Statement::internal("drop table kb_ro purge"), ExecOptions::default()).await.unwrap().collect().await;
     }
 
     /// Live: DATABRAIN_ORACLE_HOST, _USER, _PASSWORD, _SERVICE (e.g. gvenzl/oracle-free).
@@ -707,7 +737,13 @@ mod tests {
         let Some(s) = live(&std::env::var("DATABRAIN_ORACLE_DRIVER").unwrap_or_else(|_| "thin".into())).await else {
             panic!("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
         };
-        let r = s.execute("select 1 as a, 'x' as b, sysdate as c, 1.5 as d from dual;", ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        let r = s
+            .execute(databrain_connector_core::Statement::internal("select 1 as a, 'x' as b, sysdate as c, 1.5 as d from dual;"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         assert_eq!(r.num_rows(), 1);
         assert!(!s.list_schemas().await.unwrap().is_empty());
     }

@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use databrain_connector_core::sql::{StatementKind, classify, split_statements};
+use databrain_connector_core::sql::{Checked, Statement, StatementKind, split_statements};
 use databrain_connector_core::{ConnectorKind, Session, query_table};
 use serde::Serialize;
 use serde_json::Value;
@@ -104,7 +104,8 @@ impl QueryEngine {
         if analyze && !can_analyze {
             return Err(EngineError::new("unsupported", format!("{} plans can't be analyzed here: use Explain for the estimated plan", kind.traits().name)));
         }
-        if analyze && classify(sql, kind).kind != StatementKind::Read {
+        let sql = Checked::new(sql, kind);
+        if analyze && sql.kind() != StatementKind::Read {
             return Err(EngineError::new("invalid", "ANALYZE runs the statement: it is only offered for read queries"));
         }
         let hold =
@@ -112,7 +113,7 @@ impl QueryEngine {
         let (_, _claim) = self.guarded_or_refuse(connection_id, Some(hold), Intent::Inspect)?;
         let session = self.session(connection_id, session_key).await?;
         let stuck = std::sync::atomic::AtomicBool::new(false);
-        let r = explain_on(&*session, kind, sql, analyze, &stuck).await;
+        let r = explain_on(&*session, kind, &sql, analyze, &stuck).await;
         if stuck.load(std::sync::atomic::Ordering::Relaxed) {
             // Still in plan-only mode: its next statements wouldn't run.
             self.drop_session_if(connection_id, session_key, &session);
@@ -130,7 +131,7 @@ type Rows = (Vec<String>, Vec<Vec<Option<String>>>);
 /// classifier can't place are refused, so a preview never looks like a
 /// check that a schema change or unknown statement is fine. (BigQuery's dry
 /// run and Snowflake's and Databricks' EXPLAIN never run the statement.)
-pub fn cost_statement(kind: ConnectorKind, sql: &str) -> Result<String> {
+pub fn cost_statement(kind: ConnectorKind, sql: &str) -> Result<Checked> {
     if !kind.traits().cost_preview {
         return Err(EngineError::new(
             "unsupported",
@@ -144,8 +145,9 @@ pub fn cost_statement(kind: ConnectorKind, sql: &str) -> Result<String> {
     if databrain_connector_core::sql::split_statements(sql, kind).len() > 1 {
         return Err(EngineError::new("invalid", "Estimate one statement at a time: select it, or put the cursor in it"));
     }
-    match classify(sql, kind).kind {
-        StatementKind::Read | StatementKind::Dml => Ok(sql.to_string()),
+    let sql = Checked::new(sql, kind);
+    match sql.kind() {
+        StatementKind::Read | StatementKind::Dml => Ok(sql),
         _ => {
             Err(EngineError::new("invalid", "The cost preview estimates queries and data changes (SELECT, INSERT, UPDATE, DELETE, MERGE), not this statement"))
         }
@@ -193,35 +195,37 @@ impl QueryEngine {
 async fn explain_on(
     s: &dyn Session,
     kind: ConnectorKind,
-    sql: &str,
+    checked: &Checked,
     analyze: bool,
     stuck: &std::sync::atomic::AtomicBool,
 ) -> databrain_connector_core::Result<QueryPlan> {
     use ConnectorKind::*;
+    // `EXPLAIN` (SQL DataBrain writes) around the checked statement.
+    let sql = checked.sql();
     let first_cell = |r: &Rows| r.1.iter().filter_map(|row| row.first().cloned().flatten()).collect::<Vec<_>>().join("\n");
     match kind {
         Postgres => {
             let opts = if analyze { "FORMAT JSON, ANALYZE, BUFFERS" } else { "FORMAT JSON" };
-            let raw = first_cell(&query_table(s, &format!("EXPLAIN ({opts}) {sql}")).await?);
+            let raw = first_cell(&query_table(s, Statement::internal(&format!("EXPLAIN ({opts}) {sql}"))).await?);
             Ok(postgres_plan(&raw, analyze))
         }
         Mysql => {
             let q = if analyze { format!("EXPLAIN ANALYZE {sql}") } else { format!("EXPLAIN FORMAT=TREE {sql}") };
-            match query_table(s, &q).await {
+            match query_table(s, Statement::internal(&q)).await {
                 Ok(r) => {
                     let raw = first_cell(&r);
                     Ok(QueryPlan { analyzed: analyze, roots: arrow_tree(&raw), raw, ..Default::default() })
                 }
                 // MariaDB / old MySQL: the classic table.
                 Err(e) if !analyze => {
-                    let r = query_table(s, &format!("EXPLAIN {sql}")).await.map_err(|_| e)?;
+                    let r = query_table(s, Statement::internal(&format!("EXPLAIN {sql}"))).await.map_err(|_| e)?;
                     Ok(QueryPlan { roots: table_rows(&r), raw: rows_text(&r), ..Default::default() })
                 }
                 Err(e) => Err(e),
             }
         }
         Sqlite => {
-            let r = query_table(s, &format!("EXPLAIN QUERY PLAN {sql}")).await?;
+            let r = query_table(s, Statement::internal(&format!("EXPLAIN QUERY PLAN {sql}"))).await?;
             let col = |n: &str| r.0.iter().position(|c| c.eq_ignore_ascii_case(n));
             let (id, parent, detail) = (col("id").unwrap_or(0), col("parent").unwrap_or(1), col("detail").unwrap_or(3));
             let items = r.1.iter().map(|row| {
@@ -232,16 +236,16 @@ async fn explain_on(
         }
         Duckdb => {
             let opts = if analyze { "ANALYZE, FORMAT JSON" } else { "FORMAT JSON" };
-            let r = query_table(s, &format!("EXPLAIN ({opts}) {sql}")).await?;
+            let r = query_table(s, Statement::internal(&format!("EXPLAIN ({opts}) {sql}"))).await?;
             // (explain_key, explain_value): the JSON is in the last column.
             let raw = r.1.iter().filter_map(|row| row.last().cloned().flatten()).collect::<Vec<_>>().join("\n");
             Ok(duckdb_plan(&raw, analyze))
         }
         Mssql => {
-            s.execute("SET SHOWPLAN_ALL ON", Default::default()).await?.collect().await?;
-            let r = query_table(s, sql).await;
+            s.execute(Statement::internal("SET SHOWPLAN_ALL ON"), Default::default()).await?.collect().await?;
+            let r = query_table(s, checked.statement()).await;
             // Always back off, also after an error.
-            let off = async { s.execute("SET SHOWPLAN_ALL OFF", Default::default()).await?.collect().await };
+            let off = async { s.execute(Statement::internal("SET SHOWPLAN_ALL OFF"), Default::default()).await?.collect().await };
             if let Err(e) = off.await {
                 stuck.store(true, std::sync::atomic::Ordering::Relaxed);
                 return Err(e);
@@ -251,28 +255,28 @@ async fn explain_on(
         }
         Oracle => {
             let id = format!("DB{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
-            s.execute(&format!("EXPLAIN PLAN SET STATEMENT_ID = '{id}' FOR {sql}"), Default::default()).await?.collect().await?;
+            s.execute(Statement::internal(&format!("EXPLAIN PLAN SET STATEMENT_ID = '{id}' FOR {sql}")), Default::default()).await?.collect().await?;
             let r = query_table(
                 s,
-                &format!(
+                Statement::internal(&format!(
                     "SELECT id, parent_id, operation, options, object_owner, object_name, object_alias, cost, cardinality, bytes, access_predicates, filter_predicates, partition_start, partition_stop \
                      FROM plan_table WHERE statement_id = '{id}' ORDER BY id"
-                ),
+                )),
             )
             .await;
             // Best effort, but run to the end before the session is reused.
-            if let Ok(st) = s.execute(&format!("DELETE FROM plan_table WHERE statement_id = '{id}'"), Default::default()).await {
+            if let Ok(st) = s.execute(Statement::internal(&format!("DELETE FROM plan_table WHERE statement_id = '{id}'")), Default::default()).await {
                 let _ = st.collect().await;
             }
             let r = r?;
             Ok(QueryPlan { roots: oracle_rows(&r), raw: rows_text(&r), ..Default::default() })
         }
         Snowflake => {
-            let raw = first_cell(&query_table(s, &format!("EXPLAIN USING JSON {sql}")).await?);
+            let raw = first_cell(&query_table(s, Statement::internal(&format!("EXPLAIN USING JSON {sql}"))).await?);
             Ok(snowflake_plan(&raw))
         }
         Databricks => {
-            let raw = first_cell(&query_table(s, &format!("EXPLAIN FORMATTED {sql}")).await?);
+            let raw = first_cell(&query_table(s, Statement::internal(&format!("EXPLAIN FORMATTED {sql}"))).await?);
             Ok(QueryPlan { raw, ..Default::default() })
         }
         _ => Err(databrain_connector_core::ConnectorError::unsupported("query plans")),
@@ -616,7 +620,7 @@ mod tests {
         use ConnectorKind::*;
         // Allowed: reads and DML, on the engines that estimate.
         for k in [Bigquery, Snowflake, Databricks] {
-            assert_eq!(cost_statement(k, "  SELECT * FROM t WHERE d > 1;  ").unwrap(), "SELECT * FROM t WHERE d > 1");
+            assert_eq!(cost_statement(k, "  SELECT * FROM t WHERE d > 1;  ").unwrap().sql(), "SELECT * FROM t WHERE d > 1");
             assert!(cost_statement(k, "INSERT INTO t SELECT * FROM s").is_ok(), "{k:?}");
             assert!(cost_statement(k, "WITH x AS (SELECT 1 a) SELECT a FROM x").is_ok(), "{k:?}");
         }

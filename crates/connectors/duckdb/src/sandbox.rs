@@ -57,7 +57,7 @@ mod tests {
     use databrain_connector_core::{ConnectionConfig, ConnectorError, ConnectorKind, ExecOptions, SANDBOX_OPTION, Session, quote_literal};
 
     async fn q_err(s: &dyn Session, sql: &str) -> ConnectorError {
-        match s.execute(sql, ExecOptions::default()).await {
+        match s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await {
             Ok(st) => st.collect().await.err().unwrap_or_else(|| panic!("{sql} ran in the sandbox")),
             Err(e) => e,
         }
