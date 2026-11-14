@@ -17,7 +17,7 @@ Left from the final review of the metadata store (2026-11-13):
 - A table's search text includes the names of the tables its foreign keys point at, so searching for a table outside the scope ranks allowed tables that reference it (the keys themselves are scrubbed).
 - Scope rules match names ignoring case: on Postgres, allowing `sales` also allows `"Sales"`.
 - The scope survives pointing a connection at another server (`meta_check_identity` keeps the rules): schemas allowed on the old server are allowed on the new one once browsed. Decide whether a server change should clear it.
-- An AI note's target is stored as `schema.table` unquoted: a name with `.`, a space, `&` or `,` reads back differently.
+- A table whose name contains `.` in an AI note's target reads back as `schema.a.b`, and the resolvers (`meta_get`, the AI scope's `get`) split it at the last dot, as they do everywhere: such a table can't be a note's target. (Spaces, `&`, `,`, quotes and `and`/`or` in names are quoted and read back.)
 - `index_tables` answers "not available" for connection, sign-in and permission errors too (one answer for missing and refused tables), which hides why a read failed.
 - The pre-check in `index_tables` and `describe_named` resolve a bare name with the explorer cache, not the AI's scope; the check after the describe is what decides.
 
