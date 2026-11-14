@@ -59,7 +59,7 @@ impl QueryEngine {
     /// [`Self::explorer_fingerprints`] on the indexing session, so an index
     /// run's catalog query doesn't hold up the explorer.
     pub async fn index_fingerprints(&self, connection_id: &str) -> Result<Option<HashMap<String, String>>> {
-        self.with_tab(connection_id, self.index_tab(connection_id), |s| async move { s.explorer_fingerprints().await }).await
+        self.with_tab(connection_id, &self.index_tab(connection_id), |s| async move { s.explorer_fingerprints().await }).await
     }
 
     pub async fn object_versions(&self, connection_id: &str, schema: &str) -> Result<Option<HashMap<String, String>>> {
@@ -135,7 +135,7 @@ impl QueryEngine {
 
     pub async fn bulk_metadata(&self, connection_id: &str, schemas: &[String]) -> Result<Vec<databrain_connector_core::SchemaMetadata>> {
         let schemas = schemas.to_vec();
-        self.with_tab(connection_id, self.index_tab(connection_id), |s| {
+        self.with_tab(connection_id, &self.index_tab(connection_id), |s| {
             let schemas = schemas.clone();
             async move { s.bulk_metadata(&schemas).await }
         })

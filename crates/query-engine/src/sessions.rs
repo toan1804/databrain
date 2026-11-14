@@ -51,7 +51,8 @@ impl QueryEngine {
             // that hold no state (the assistant's, or the explorer's).
             self.drop_sessions(|(c, t), live| {
                 let other = c == connection_id && live.sandboxed != sandbox;
-                let stateless = !sandbox || t == META_TAB || t == INDEX_TAB;
+                // The assistant's sessions (sandboxed) and catalog-only ones.
+                let stateless = !sandbox || SessionRole::parse(t).catalog_only();
                 other && stateless && Arc::strong_count(&live.session) == 1 && !live.session.in_transaction()
             });
         }
@@ -196,9 +197,17 @@ impl QueryEngine {
             })
             .collect();
         self.drop_sessions(|(c, key), live| {
-            let Some(idle) = limits.get(c).copied().flatten() else { return false };
             let in_use = busy.contains(key) || Arc::strong_count(&live.session) > 1;
-            !(in_use || live.session.in_transaction() || now.duration_since(*live.last_used.lock()) < idle)
+            if in_use || live.session.in_transaction() {
+                return false;
+            }
+            // A load's or export's session nobody uses any more (its owner
+            // ended without closing it): nothing comes back to it.
+            if SessionRole::parse(key).one_off() {
+                return true;
+            }
+            let Some(idle) = limits.get(c).copied().flatten() else { return false };
+            now.duration_since(*live.last_used.lock()) >= idle
         })
     }
 
@@ -232,7 +241,7 @@ impl QueryEngine {
                 return false;
             }
             // A catalog call still running keeps its handle; the map forgets it.
-            if key == META_TAB {
+            if SessionRole::parse(key) == SessionRole::Meta {
                 return true;
             }
             !(busy.contains(key) || Arc::strong_count(&live.session) > 1 || live.session.in_transaction())
@@ -242,7 +251,7 @@ impl QueryEngine {
     /// A session on a separate tab, for tests that set up data.
     #[doc(hidden)]
     pub async fn session_for_tests(&self, connection_id: &str) -> Result<Arc<dyn Session>> {
-        self.session(connection_id, "__tests__").await
+        self.session(connection_id, &SessionRole::Tests.key()).await
     }
 
     /// Connection ids that currently have at least one open session.
@@ -378,7 +387,7 @@ impl QueryEngine {
         F: Fn(Arc<dyn Session>) -> Fut,
         Fut: std::future::Future<Output = databrain_connector_core::Result<T>>,
     {
-        self.with_tab(connection_id, META_TAB, f).await
+        self.with_tab(connection_id, &meta_tab(), f).await
     }
 
     pub(crate) async fn with_tab<T, F, Fut>(&self, connection_id: &str, tab: &str, f: F) -> Result<T>
@@ -403,18 +412,19 @@ impl QueryEngine {
 
     /// Session used by AI indexing: its own for server databases; local
     /// files (SQLite, DuckDB) share the metadata session (one handle per file).
-    pub(crate) fn index_tab(&self, connection_id: &str) -> &'static str {
+    pub(crate) fn index_tab(&self, connection_id: &str) -> String {
         match self.workspace.get_connection(connection_id).map(|p| p.config.kind) {
-            Ok(k) if !k.traits().local => INDEX_TAB,
-            _ => META_TAB,
+            Ok(k) if !k.traits().local => SessionRole::Index.key(),
+            _ => meta_tab(),
         }
     }
 
     /// Close indexing's session (after a run or a cancel). Dropping it ends
     /// the server session, which also stops a statement still running there.
     pub fn end_index_session(&self, connection_id: &str) {
-        if self.index_tab(connection_id) == INDEX_TAB {
-            self.drop_session(connection_id, INDEX_TAB);
+        let tab = self.index_tab(connection_id);
+        if SessionRole::parse(&tab) == SessionRole::Index {
+            self.drop_session(connection_id, &tab);
         }
     }
 

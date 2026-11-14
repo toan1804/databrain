@@ -40,7 +40,7 @@ use databrain_connector_core::{
 };
 use databrain_result_store::{ResultInfo, ResultStore};
 use databrain_ssh_tunnel::{SshSecret, Tunnel, TunnelSpec};
-use databrain_workspace::{ConnectionProfile, EnvTag, NewHistory, Origin, RunStatus, Workspace, now_ms};
+use databrain_workspace::{ConnectionProfile, EnvTag, NewHistory, Origin, RunStatus, SessionRole, Workspace, now_ms};
 use parking_lot::Mutex;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -154,10 +154,10 @@ type Waiter = tokio::sync::mpsc::UnboundedSender<JobEvent>;
 
 type SessionKey = (String, String); // (connection_id, tab_id)
 
-const META_TAB: &str = "__meta__";
-/// AI indexing's own session (server databases): long catalog reads never
-/// make the explorer or completion wait, and cancelling can close it.
-const INDEX_TAB: &str = "__index__";
+/// The explorer's catalog session ([`SessionRole::Meta`]).
+fn meta_tab() -> String {
+    SessionRole::Meta.key()
+}
 /// Connection option marking the "Results (DuckDB)" connection.
 pub const RESULTS_MARKER: &str = "databrain_results";
 

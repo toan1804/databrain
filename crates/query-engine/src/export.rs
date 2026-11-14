@@ -51,7 +51,7 @@ impl QueryEngine {
             },
             None => None,
         };
-        let tab = shared.map_or_else(|| format!("__export__:{export_id}"), str::to_string);
+        let tab = shared.map_or_else(|| SessionRole::Export(export_id.to_string()).key(), str::to_string);
         let out = self.export_stream(connection_id, &tab, sql, path, opts, &cancel, progress).await;
         self.exports.lock().remove(export_id);
         if claim.is_none() {

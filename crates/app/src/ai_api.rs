@@ -479,8 +479,8 @@ pub fn session_messages(state: &AppState, session_id: &str) -> Result<Vec<AiMess
 
 pub fn delete_session(state: &AppState, id: &str) -> Result<()> {
     // The chat's query tabs: their sessions and the outputs they kept active.
-    for tab in ["ai", "ai-outputs", "ai-sample"] {
-        state.engine.close_tab(&format!("{tab}:{id}"));
+    for part in databrain_workspace::AiPart::ALL {
+        state.engine.close_tab(&databrain_workspace::SessionRole::Ai { chat: id.to_string(), part }.key());
     }
     Ok(state.workspace.delete_ai_session(id)?)
 }

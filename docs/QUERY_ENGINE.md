@@ -56,22 +56,25 @@ One `Arc<QueryEngine>` per process (`QueryEngine::new` in `lib.rs`). Every map i
 | `manual_commit` | set of session keys | `set_manual_commit(key, false)` (the app calls it on tab close) |
 | `outputs` | `Arc<OutputRegistry>` (own lock, see below) | |
 
-`jobs` is also the "busy" list: `start_run` checks and claims a tab and its session key under one lock. `explain`, `apply_edits`, `end_transaction` and an export on a tab's session take a `Claim` (`sessions.rs` `claim`): the same check and insert under one lock, removed when the claim drops, so nothing else starts on the session meanwhile. The cost preview only looks (it runs while you type, and must not make Run find the tab busy): it uses `__meta__` when the tab is held.
+`jobs` is also the "busy" list: `start_run` checks and claims a tab and its session key under one lock. `explain`, `apply_edits`, `end_transaction` and an export on a tab's session take a `Claim` (`sessions.rs` `claim`): the same check and insert under one lock, removed when the claim drops, so nothing else starts on the session meanwhile. The cost preview only looks (it runs while you type, and must not make Run find the tab busy): it uses `Meta` (`__meta__`) when the tab is held.
 
 ## Sessions
 
 A session is one database connection, found by `(connection_id, tab)`. `session_for` (`sessions.rs`) returns the live one or connects: `Connector::prepare`, `preflight` (`probe.rs`), then tunnel + stored secret + handshake inside the connect timeout (`connect_timeout_for`; not applied to browser sign-in or local files). A refused sign-in refreshes the credential once and tries again.
 
-| Tab key | Used by | Closed by |
+Keys are built and read as a `SessionRole` (`databrain_workspace::SessionRole`: `parse(key)` / `key()`); what happens to a session is decided by its role: `catalog_only` (Meta, Index: closed by Refresh and the DuckDB sandbox switch at any time), `one_off` (Load, Export, DryRun: closed by their owner, or at the next idle sweep when left over, even with idle disconnect off), `is_ai`.
+
+| Role (key) | Used by | Closed by |
 |---|---|---|
-| the editor tab id | runs of the tab, its plans, grid edits, Commit / Rollback | `close_tab`, idle close |
-| `nb:{notebook}` (`RunRequest::session_key`) | every cell of a notebook; each cell keeps its own `tab_id` for results | `close_tab` from `api/library.rs` |
-| `__meta__` (`META_TAB`) | explorer, completion, `check_sql`, `describe`, test data's reads, cost preview while the tab is busy | `reconnect`, idle close |
-| `__index__` (`INDEX_TAB`) | `bulk_metadata`: reading columns for the AI, schema compare, related rows. Local files use `__meta__` (`index_tab`) | `end_index_session`, `reconnect` |
-| `ai:{session}`, `ai-outputs:{session}`, `ai-sample:{session}` | AI and MCP tools (`crates/ai/src/tools/query.rs`) | idle close |
-| `job:{job}:{node}`, `…:load`, `…:export`, `dryrun:…` | job steps (`crates/app/src/jobs.rs`) | `release_sessions`, `close_tab` |
-| `__load__:{id}`, `__loadcheck__:{uuid}` | "Load into…" and its dry run (`api/results.rs`) | `close_tab` right after |
-| `__export__:{id}` | a full export on its own session | `drop_session` when it ends |
+| `Tab` (the editor tab id) | runs of the tab, its plans, grid edits, Commit / Rollback | `close_tab`, idle close |
+| `Notebook` (`nb:{notebook}`, cells `nb:{notebook}:{cell}`) | every cell of a notebook shares `nb:{notebook}` (`RunRequest::session_key`); each cell keeps its own `tab_id` for results | `close_tab` from `api/library.rs` |
+| `Meta` (`__meta__`) | explorer, completion, `check_sql`, `describe`, test data's reads, cost preview while the tab is busy | `reconnect`, idle close |
+| `Index` (`__index__`) | `bulk_metadata`: reading columns for the AI, schema compare, related rows. Local files use `Meta` (`index_tab`) | `end_index_session`, `reconnect` |
+| `Ai { chat, part }` (`ai:`, `ai-outputs:`, `ai-sample:` + chat) | AI and MCP tools (`crates/ai/src/tools/query.rs`) | idle close; `close_tab` of each part when the chat is deleted |
+| `JobStep` (`job:{job}:{node}`), `Load`/`Export` of a step, `DryRun` (`dryrun:…`) | job steps (`crates/app/src/jobs.rs`) | `release_sessions`, `close_tab` |
+| `Load` (`__load__:{id}`, `__load__:check:{uuid}`) | "Load into…" and its dry run (`api/results.rs`) | `close_tab` right after |
+| `Export` (`__export__:{id}`) | a full export on its own session | `drop_session` when it ends |
+| `TestData` (`__testdata__:…`) | owns generated test data's output; no session | — |
 
 Rules:
 

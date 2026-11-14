@@ -165,7 +165,8 @@ impl QueryEngine {
         // one). Looked at, not claimed: the editor asks for an estimate
         // while you type, and Run must not find the tab busy because of it.
         let busy = self.jobs.lock().values().any(|j| j.session_key == session_key || j.tab_id == session_key);
-        let tab = if busy || session_key.is_empty() { crate::META_TAB } else { session_key };
+        let meta = crate::meta_tab();
+        let tab = if busy || session_key.is_empty() { meta.as_str() } else { session_key };
         let run = self.with_tab(connection_id, tab, |s| {
             let sql = sql.clone();
             async move { s.estimate_cost(&sql).await }

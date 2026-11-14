@@ -73,9 +73,9 @@ pub fn output_name_user(state: &AppState, name: &str, job_id: &str) -> Result<Op
     // Outputs of job steps don't count: step names decide (a renamed or
     // deleted step's old outputs don't keep its name taken).
     if let Some(o) = state.engine.outputs().resolve(name).filter(|o| o.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name)))
-        && !o.tab_id.starts_with("job:")
+        && !matches!(SessionRole::parse(&o.tab_id), SessionRole::JobStep { .. })
     {
-        let from = if o.tab_id.starts_with("nb:") { "a notebook cell" } else { "a query tab" };
+        let from = if matches!(SessionRole::parse(&o.tab_id), SessionRole::Notebook { .. }) { "a notebook cell" } else { "a query tab" };
         return Ok(Some(format!("output {} (from {from}); rename or remove it first", o.handle)));
     }
     for nb in state.workspace.list_notebooks()? {
@@ -91,7 +91,7 @@ pub fn delete_job(state: &AppState, id: &str) -> Result<()> {
     state.jobs.cancel(id);
     if let Ok(job) = state.workspace.get_job(id) {
         for n in job.nodes {
-            state.engine.close_tab(&format!("job:{id}:{}", n.id));
+            state.engine.close_tab(&SessionRole::JobStep { job: id.into(), node: n.id }.key());
         }
     }
     Ok(state.workspace.delete_job(id)?)

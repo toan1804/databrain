@@ -272,6 +272,30 @@ async fn per_connection_idle_time_and_connect_timeout() {
     assert_eq!(f.engine.connect_timeout_for(&cfg), Duration::from_secs(3), "kept within 3–600");
 }
 
+/// A load's or export's session its owner didn't close goes at the next
+/// sweep even when sessions never close when idle; a tab's stays, and one
+/// still in use stays.
+#[tokio::test]
+async fn left_over_one_off_sessions_close_at_the_next_sweep() {
+    let f = fixture(EnvTag::None);
+    let keys = |f: &Fixture| {
+        let mut v: Vec<String> = f.engine.sessions.lock().keys().map(|(_, t)| t.clone()).collect();
+        v.sort();
+        v
+    };
+    let tab = SessionRole::Tab("tab1".into()).key();
+    let load = SessionRole::Load("l1".into()).key();
+    let export = SessionRole::Export("e1".into()).key();
+    drop(f.engine.session(&f.conn_id, &tab).await.unwrap());
+    drop(f.engine.session(&f.conn_id, &load).await.unwrap());
+    let held = f.engine.session(&f.conn_id, &export).await.unwrap();
+    assert_eq!(f.engine.close_idle_with(None), 1, "never idle-closes, but the load's goes");
+    assert_eq!(keys(&f), vec![export.clone(), tab.clone()]);
+    drop(held);
+    assert_eq!(f.engine.close_idle_with(None), 1, "the export's, once nobody uses it");
+    assert_eq!(keys(&f), vec![tab]);
+}
+
 #[tokio::test]
 async fn idle_sessions_close_but_not_mid_transaction() {
     let f = fixture(EnvTag::None);
@@ -451,7 +475,7 @@ async fn reconnect_closes_metadata_and_idle_tabs_only() {
         v.sort();
         v
     };
-    assert_eq!(keys(&f), vec![META_TAB.to_string(), "tab1".to_string()]);
+    assert_eq!(keys(&f), vec![meta_tab(), "tab1".to_string()]);
     assert_eq!(f.engine.reconnect(&f.conn_id), 2);
     assert!(f.engine.connected_ids().is_empty());
     // The next catalog call reconnects on its own.

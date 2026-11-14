@@ -77,10 +77,10 @@ pub fn save_notebook(state: &AppState, notebook: databrain_workspace::Notebook) 
 pub fn delete_notebook(state: &AppState, id: &str) -> Result<()> {
     if let Ok(nb) = state.workspace.get_notebook(id) {
         for c in nb.cells {
-            state.engine.close_tab(&format!("nb:{id}:{}", c.id));
+            state.engine.close_tab(&SessionRole::Notebook { notebook: id.into(), cell: Some(c.id) }.key());
         }
     }
-    state.engine.close_tab(&format!("nb:{id}"));
+    state.engine.close_tab(&SessionRole::Notebook { notebook: id.into(), cell: None }.key());
     Ok(state.workspace.delete_notebook(id)?)
 }
 

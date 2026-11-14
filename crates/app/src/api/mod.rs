@@ -13,7 +13,7 @@ use databrain_connector_core::{ConnectionConfig, ConnectorInfo, ConnectorKind, C
 use databrain_export::{ExportOptions, export_to_string};
 use databrain_query_engine::{EngineError, EventHub, EventSink, QueryEngine, Result, RunRequest, RunResponse, TestResult};
 use databrain_result_store::{ColumnStats, FindResult, Page, ResultInfo, ResultStore, ViewSpec};
-use databrain_workspace::{ConnectionProfile, Folder, FolderKind, HistoryEntry, HistoryQuery, SavedQuery, TabState, Workspace};
+use databrain_workspace::{ConnectionProfile, Folder, FolderKind, HistoryEntry, HistoryQuery, SavedQuery, SessionRole, TabState, Workspace};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
