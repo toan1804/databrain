@@ -196,8 +196,10 @@ impl Session for MysqlSession {
     }
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
-        use databrain_connector_core::{TableLayout, group_indexes, query_text, quote_literal, truthy};
-        let (s, t) = (quote_literal(schema), quote_literal(name));
+        use databrain_connector_core::{TableLayout, group_indexes, query_text, truthy};
+        // MySQL reads `\` as an escape: a name holding `\'` must not end the literal.
+        let lit = |v: &str| databrain_connector_core::sql::quote_string(v, ConnectorKind::Mysql);
+        let (s, t) = (lit(schema), lit(name));
         let idx = query_text(
             self,
             &format!(

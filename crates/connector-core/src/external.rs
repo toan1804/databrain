@@ -150,11 +150,49 @@ pub fn referenced_results(sql: &str) -> Vec<String> {
     let n = b.len();
     // Identifier bytes: ASCII word characters and any UTF-8 byte.
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
-    let ws = |mut j: usize| {
-        while j < n && b[j].is_ascii_whitespace() {
-            j += 1;
+    // Where the next token may start after `j`: past whitespace and
+    // comments. DuckDB reads `results /* x */ . sales` and `results -- x\n
+    // .sales` as `results.sales`, so the scanner must too (or the name goes
+    // unseen, with its mask and its sharing check). A block comment holding
+    // `/*` ends at two possible places (nested or not); both are followed,
+    // so a reference is found whichever way the engine reads it.
+    let gaps = |start: usize| -> Vec<usize> {
+        let (mut ends, mut todo) = (Vec::new(), vec![start]);
+        while let Some(mut j) = todo.pop() {
+            while j < n && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j + 1 < n && b[j] == b'-' && b[j + 1] == b'-' {
+                todo.push((j..n).find(|&k| b[k] == b'\n').map_or(n, |k| k + 1));
+            } else if j + 1 < n && b[j] == b'/' && b[j + 1] == b'*' {
+                // The first `*/`, and the `*/` that closes every `/*` opened.
+                let plain = (j + 2..n.saturating_sub(1)).find(|&k| b[k] == b'*' && b[k + 1] == b'/').map_or(n, |k| k + 2);
+                let (mut depth, mut k, mut nested) = (1, j + 2, n);
+                while k + 1 < n {
+                    if b[k] == b'/' && b[k + 1] == b'*' {
+                        depth += 1;
+                        k += 2;
+                    } else if b[k] == b'*' && b[k + 1] == b'/' {
+                        depth -= 1;
+                        k += 2;
+                        if depth == 0 {
+                            nested = k;
+                            break;
+                        }
+                    } else {
+                        k += 1;
+                    }
+                }
+                for e in [plain, nested] {
+                    if !todo.contains(&e) && todo.len() + ends.len() < 16 {
+                        todo.push(e);
+                    }
+                }
+            } else if !ends.contains(&j) {
+                ends.push(j);
+            }
         }
-        j
+        ends
     };
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
@@ -178,46 +216,42 @@ pub fn referenced_results(sql: &str) -> Vec<String> {
             };
             continue;
         };
-        let mut j = ws(schema_end);
-        if j >= n || b[j] != b'.' {
-            i = schema_end;
-            continue;
-        }
-        j = ws(j + 1);
-        let name = if j < n && b[j] == b'"' {
-            // `"…"` with `""` for a quote.
-            let mut name = String::new();
-            let mut k = j + 1;
-            let mut from = k;
-            while k < n {
-                if b[k] == b'"' {
-                    name.push_str(&sql[from..k]);
-                    if b.get(k + 1) == Some(&b'"') {
-                        name.push('"');
-                        k += 2;
-                        from = k;
-                        continue;
+        // Every place the `.` and then the name may be, see `gaps`.
+        for dot in gaps(schema_end).into_iter().filter(|&d| d < n && b[d] == b'.') {
+            for j in gaps(dot + 1) {
+                let name = if j < n && b[j] == b'"' {
+                    // `"…"` with `""` for a quote.
+                    let mut name = String::new();
+                    let mut k = j + 1;
+                    let mut from = k;
+                    while k < n {
+                        if b[k] == b'"' {
+                            name.push_str(&sql[from..k]);
+                            if b.get(k + 1) == Some(&b'"') {
+                                name.push('"');
+                                k += 2;
+                                from = k;
+                                continue;
+                            }
+                            break;
+                        }
+                        k += 1;
                     }
-                    break;
+                    if k >= n {
+                        name.push_str(&sql[from..n]);
+                    }
+                    name
+                } else {
+                    let end = (j..n).find(|&k| !ident(b[k])).unwrap_or(n);
+                    sql[j..end].to_string()
+                };
+                if !name.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&name)) {
+                    out.push(name);
                 }
-                k += 1;
             }
-            if k >= n {
-                name.push_str(&sql[from..n]);
-            }
-            j = (k + 1).min(n);
-            name
-        } else {
-            let start = j;
-            while j < n && ident(b[j]) {
-                j += 1;
-            }
-            sql[start..j].to_string()
-        };
-        if !name.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&name)) {
-            out.push(name);
         }
-        i = j;
+        // On from the schema name: what follows is scanned as usual.
+        i = schema_end;
     }
     out
 }
@@ -232,6 +266,21 @@ mod tests {
                    where x = 'results.skip' and y in (select v from results . sales_2024) /* results.c */ \
                    union all select * from results.r12, myresults.x, results_tbl.y, \"results\".\"Big Name\"";
         assert_eq!(referenced_results(sql), vec!["r12", "revenue__1", "sales_2024", "Big Name"]);
+        // Comments between the parts don't hide a reference.
+        for sql in [
+            "select * from results/**/.sales",
+            "select * from results /* a */ . /* b */ sales",
+            "select * from results -- x\n . -- y\n sales",
+            "select * from \"results\"/* a /* nested */ */.\"sales\"",
+            "select * from results/**/./**/sales/**/",
+        ] {
+            assert_eq!(referenced_results(sql), vec!["sales"], "{sql}");
+        }
+        assert!(referenced_results("select results /* not a reference */ from t").is_empty());
+        // A comment holding `/*`: found whether the engine nests comments or not.
+        let mut both = referenced_results("select * from results/* a /* b */ .x */ .y");
+        both.sort();
+        assert_eq!(both, vec!["x", "y"]);
         assert!(referenced_results("select 'it''s results.x'").is_empty());
         assert_eq!(referenced_results("SELECT * FROM results.revenue__2 r"), vec!["revenue__2"]);
         assert!(referenced_results("select results from t").is_empty());

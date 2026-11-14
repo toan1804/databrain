@@ -6,11 +6,17 @@ use serde_json::json;
 
 use databrain_connector_core::{
     ConnectorError, ConnectorKind, CostEstimate, DbObject, ExecOptions, ObjectDetail, ObjectKind, QueryStream, Result, SchemaInfo, SchemaMetadata, Session,
-    TableColumns, quote_ident, quote_literal,
+    TableColumns, quote_ident,
 };
 
 use super::client::DbxSession;
 use super::metadata::{cell, databricks_stat_rows, split_schema};
+
+/// A string literal in Databricks's own escaping: a backslash is an escape
+/// there, so a name holding `\'` must not end the literal early.
+fn quote_literal(s: &str) -> String {
+    databrain_connector_core::sql::quote_string(s, databrain_connector_core::ConnectorKind::Databricks)
+}
 
 #[async_trait]
 impl Session for DbxSession {
@@ -458,5 +464,17 @@ Aggregate [region#1], [region#1, count(1) AS n#5L], Statistics(sizeInBytes=48.0 
         assert!(e.bytes.is_none() && e.notes[0].contains("ANALYZE TABLE"), "{e:?}");
         let err = explain_cost_estimate("Error occurred during query planning: \n[TABLE_OR_VIEW_NOT_FOUND] nope").unwrap_err();
         assert!(err.message.contains("TABLE_OR_VIEW_NOT_FOUND"), "{}", err.message);
+    }
+}
+
+#[cfg(test)]
+mod literal_tests {
+    /// Databricks reads `\` as an escape and takes `\'` for a quote.
+    #[test]
+    fn names_with_a_backslash_or_quote_stay_inside_the_literal() {
+        assert_eq!(super::quote_literal("sales"), "'sales'");
+        assert_eq!(super::quote_literal("a'b"), r"'a\'b'");
+        assert_eq!(super::quote_literal(r"x\' or 1=1 --"), r"'x\\\' or 1=1 --'");
+        assert_eq!(super::quote_literal(r"ends\"), r"'ends\\'");
     }
 }

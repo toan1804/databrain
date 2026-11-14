@@ -158,9 +158,10 @@ pub fn return_columns(cypher: &str) -> Vec<String> {
                 }
             }
             _ if depth == 0 => {
-                let rest = body[i..].to_ascii_uppercase();
+                // Bytes, not `body[i..]`: `i` may be inside a character (`họ`).
+                let starts = |k: &str| b.get(i..i + k.len()).is_some_and(|w| w.eq_ignore_ascii_case(k.as_bytes()));
                 let boundary = i == 0 || !b[i - 1].is_ascii_alphanumeric();
-                if boundary && ["ORDER BY", "SKIP ", "LIMIT ", "UNION"].iter().any(|k| rest.starts_with(k)) {
+                if boundary && ["ORDER BY", "SKIP ", "LIMIT ", "UNION"].iter().any(|k| starts(k)) {
                     end = i;
                     break;
                 }
@@ -532,6 +533,12 @@ mod tests {
         assert_eq!(return_columns("RETURN {a: 1, b: [1, 2]} AS m, 'x, y' AS `odd name`"), ["m", "odd name"]);
         assert_eq!(return_columns("MATCH (n) WITH n RETURN n.returned_at"), ["n.returned_at"]);
         assert!(return_columns("CREATE (n:X)").is_empty());
+        // Names outside ASCII are read, not a crash.
+        assert_eq!(return_columns("MATCH (n) RETURN n.họ_tên, n.tuổi AS tuổi ORDER BY tuổi LIMIT 5"), ["n.họ_tên", "tuổi"]);
+        assert_eq!(return_columns("MATCH (n:Người) RETURN n.`tên đầy đủ` AS `tên`, '日本, 語' AS s"), ["tên", "s"]);
+        for q in ["RETURN é", "RETURN 'ê", "MATCH (n) RETURN n.🙂 limit 1", "RETURN\u{a0}1", "é RETURN"] {
+            let _ = return_columns(q);
+        }
     }
 
     #[test]

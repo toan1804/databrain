@@ -416,8 +416,34 @@ fn urlencode(s: &str) -> String {
         .collect()
 }
 
+/// `project.dataset` as two names. They go into DataBrain's own SQL between
+/// backticks and into request paths, so one that could end the quoted path
+/// (a backtick, a backslash) or isn't a name at all (spaces, `/`, `?`,
+/// control characters) is refused: no real project or dataset id has them.
 fn split_dataset(path: &str) -> Result<(&str, &str)> {
-    path.split_once('.').ok_or_else(|| ConnectorError::query(format!("expected project.dataset, got {path}")))
+    let (project, dataset) = path.split_once('.').ok_or_else(|| ConnectorError::query(format!("expected project.dataset, got {path}")))?;
+    let name =
+        |n: &str| !n.is_empty() && !n.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '`' | '\\' | '/' | '?' | '#' | '\'' | '"' | ';'));
+    if !name(project) || !name(dataset) {
+        return Err(ConnectorError::query(format!("not a BigQuery project.dataset: {}", crate::common::truncate(path, 120))));
+    }
+    Ok((project, dataset))
+}
+
+#[cfg(test)]
+mod dataset_path_tests {
+    use super::split_dataset;
+
+    #[test]
+    fn dataset_paths_are_names() {
+        assert_eq!(split_dataset("my-project.sales_2024").unwrap(), ("my-project", "sales_2024"));
+        assert_eq!(split_dataset("example.com:proj.ds").unwrap(), ("example", "com:proj.ds"));
+        for bad in
+            ["p.d.INFORMATION_SCHEMA.TABLES`; DROP TABLE `p.d.t`; SELECT * FROM `p.d", "p.d\\", "p.d x", "p.d/../../other", "p.d?x=1", "p.", ".d", "nodot"]
+        {
+            assert!(split_dataset(bad).is_err(), "{bad}");
+        }
+    }
 }
 
 #[async_trait]

@@ -92,7 +92,47 @@ pub fn split_path(kind: ConnectorKind, path: &str) -> Vec<String> {
     parts
 }
 
-/// Quote a string literal with single quotes.
+/// Quote a string literal with single quotes, for engines where a
+/// backslash in a literal is an ordinary character (DuckDB, SQLite, SQL
+/// Server, Oracle). Where it may be an escape, `\'` would end the literal
+/// early and the rest of the value would be read as SQL: MySQL, Snowflake,
+/// Databricks, BigQuery and ClickHouse take
+/// [`quote_string`](crate::sql::quote_string) with their kind; Postgres
+/// and Redshift take [`quote_literal_pg`].
 pub fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// A string literal for Postgres and Redshift that means the same text
+/// whether or not the server reads backslashes as escapes (Redshift does;
+/// Postgres does with `standard_conforming_strings = off`): the literal
+/// holds no backslash, each one is spliced in as `chr(92)`.
+pub fn quote_literal_pg(s: &str) -> String {
+    let quoted = |part: &str| format!("'{}'", part.replace('\'', "''"));
+    if !s.contains('\\') {
+        return quoted(s);
+    }
+    format!("({})", s.split('\\').map(quoted).collect::<Vec<_>>().join("||chr(92)||"))
+}
+
+#[cfg(test)]
+mod literal_tests {
+    use super::*;
+
+    /// A value with a backslash before a quote can't end a Postgres or
+    /// Redshift literal early, whichever way the server reads backslashes.
+    #[test]
+    fn pg_literals_hold_no_backslash() {
+        assert_eq!(quote_literal_pg("orders"), "'orders'");
+        assert_eq!(quote_literal_pg("o'brien"), "'o''brien'");
+        assert_eq!(quote_literal_pg(r"a\b"), "('a'||chr(92)||'b')");
+        assert_eq!(quote_literal_pg(r"x\' union select 1 --"), "('x'||chr(92)||''' union select 1 --')");
+        assert_eq!(quote_literal_pg(r"\"), "(''||chr(92)||'')");
+        for v in [r"x\' or 1=1 --", r"trailing\", r"\\'", "plain"] {
+            let lit = quote_literal_pg(v);
+            assert!(!lit.contains('\\'), "{lit}");
+            // Every quote inside the literal is doubled: an even count in all.
+            assert_eq!(lit.matches('\'').count() % 2, 0, "{lit}");
+        }
+    }
 }

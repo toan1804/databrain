@@ -269,7 +269,9 @@ fn chain(text: &str) -> Result<Vec<Seg>, String> {
     let mut out = Vec::new();
     let ident = |i: &mut usize| {
         let s = *i;
-        while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_' || b[*i] == b'$' || b[*i] == b'-') {
+        // Any byte of a character outside ASCII counts as part of a name
+        // (`db.khách`): names end at an ASCII delimiter, so on a boundary.
+        while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_' || b[*i] == b'$' || b[*i] == b'-' || b[*i] >= 0x80) {
             *i += 1;
         }
         text[s..*i].to_string()
@@ -294,7 +296,7 @@ fn chain(text: &str) -> Result<Vec<Seg>, String> {
                     i = end + 1;
                     continue;
                 }
-                c => return Err(format!("unexpected `{}` at {}", c as char, i + 1)),
+                _ => return Err(format!("unexpected `{}` at {}", String::from_utf8_lossy(&b[i..]).chars().next().unwrap_or('?'), i + 1)),
             }
             skip_ws(&mut i);
         }
@@ -416,8 +418,11 @@ fn helpers(text: &str) -> String {
                 continue;
             }
         }
-        out.push(c as char);
-        i += 1;
+        // A whole character at a time: `i` stays on a character boundary,
+        // which the slices above need (a byte at a time would cut `ê` in two).
+        let ch = text[i..].chars().next().unwrap_or(char::REPLACEMENT_CHARACTER);
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -463,6 +468,35 @@ fn int_arg(args: &[serde_json::Value], i: usize, m: &str) -> Result<i64, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Text outside ASCII (field names, values, comments, a pasted
+    /// no-break space) is read, never a crash: the parser also runs for
+    /// classification and the AI's table rules.
+    #[test]
+    fn text_outside_ascii_is_read() {
+        let p = parse("db.khách.find({tên: 'Nguyễn', \"họ\": 'Trần'})", Some(10)).unwrap();
+        assert_eq!(p.command.get_str("find").unwrap(), "khách");
+        let f = p.command.get_document("filter").unwrap();
+        assert_eq!((f.get_str("tên").unwrap(), f.get_str("họ").unwrap()), ("Nguyễn", "Trần"));
+        let p = parse("db.t.find({_id: ObjectId('65a1b2c3d4e5f60718293a4b'), ghi_chú: 'đã xong'})", None).unwrap();
+        assert!(matches!(p.command.get_document("filter").unwrap().get("_id"), Some(Bson::ObjectId(_))));
+        // Whatever the text, an answer (a command or an error).
+        for text in [
+            "db.t.find({a: 1}) // tìm tất cả",
+            "db.t.find({a:\u{a0}1})",
+            "db.t.find({é",
+            "db.tên.aggregate([{$match: {\"đ\": 1}}])",
+            "é",
+            "db.t.find({a: 'ê\\",
+            "db.t.find({a: Date('ngày')})",
+            "db.t🙂.find()",
+            "db.t.find()🙂",
+            "{\"find\": \"đơn_hàng\"}",
+        ] {
+            let _ = parse(text, Some(10));
+            let _ = crate::analyze::analyze(text);
+        }
+    }
 
     #[test]
     fn shell_calls_become_commands() {

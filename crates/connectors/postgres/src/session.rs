@@ -429,8 +429,8 @@ impl Session for PgSession {
         if self.redshift {
             return self.rs_table_layout(schema, name).await;
         }
-        use databrain_connector_core::{TableLayout, group_indexes, parse_call_list, query_text, quote_literal, truthy};
-        let (s, t) = (quote_literal(schema), quote_literal(name));
+        use databrain_connector_core::{TableLayout, group_indexes, parse_call_list, query_text, quote_literal_pg, truthy};
+        let (s, t) = (quote_literal_pg(schema), quote_literal_pg(name));
         let idx = query_text(
             self,
             &format!(

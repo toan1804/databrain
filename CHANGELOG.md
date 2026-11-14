@@ -11,6 +11,11 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- A table or schema whose name holds a backslash and a quote could run SQL of its own when DataBrain read its indexes or columns (opening it in the explorer, indexing it for the AI): on MySQL the rest of the name ran as further statements, on Snowflake, Databricks, Redshift and Postgres it changed the catalog query. Names now stay inside their literal on every one of them, and a BigQuery dataset path that isn't a name is refused.
+- MongoDB commands and Cypher queries with text outside ASCII (an accented field name, a comment in Vietnamese, a pasted no-break space) crashed the query, and for MongoDB the check that decides whether it is a read. MongoDB collection names with such letters are accepted (`db.khách.find()`).
+- Databricks: when a statement's result could not be downloaded from cloud storage, the statement was run a second time with inline results, also when it was an `INSERT`, `UPDATE` or `MERGE` (which then ran twice) or after Stop. Only a query that reads is run again.
+- The assistant could read an output without its PII mask or sharing check by putting a comment between `results`, the dot and the name (`results/**/.sales`), or by making `results` the default catalog. Both are closed.
+- SQL from the assistant on DuckDB (its sandbox) could write a new file into a folder attached to the connection, or attach a database file there, and could read the folder every session spills into. `COPY … TO`, `EXPORT DATABASE` and `ATTACH` are refused there, and each sandboxed database spills into a folder of its own.
 - The assistant, across connections: a connection that only allows some AI providers was still read by a chat on another connection using a different provider (through the `connection` a tool names, the other connections chosen for a question, or an output from it). Its allowed providers now hold wherever it is reached from.
 - With "share metadata" off, the assistant could still read a table's columns, keys and comments with `describe_table` or `index_tables`; it now gets the table's name only, as in the prompt.
 - The assistant could aggregate the result shown in the grid even when it came from a connection with AI turned off or a table the AI may not read.
