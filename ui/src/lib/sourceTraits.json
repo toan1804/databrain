@@ -71,6 +71,7 @@
       "escape_strings": false,
       "hash_comment": true,
       "q_quotes": false,
+      "raw_strings": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": true
@@ -151,6 +152,7 @@
       "escape_strings": false,
       "hash_comment": true,
       "q_quotes": false,
+      "raw_strings": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -231,6 +233,7 @@
       "escape_strings": false,
       "hash_comment": false,
       "q_quotes": false,
+      "raw_strings": true,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -311,6 +314,7 @@
       "escape_strings": true,
       "hash_comment": false,
       "q_quotes": false,
+      "raw_strings": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -364,6 +368,7 @@
       "escape_strings": false,
       "hash_comment": false,
       "q_quotes": false,
+      "raw_strings": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -450,6 +455,7 @@
       "escape_strings": false,
       "hash_comment": false,
       "q_quotes": false,
+      "raw_strings": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -545,6 +551,7 @@
       "escape_strings": false,
       "hash_comment": true,
       "q_quotes": false,
+      "raw_strings": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -601,6 +608,7 @@
       "escape_strings": false,
       "hash_comment": false,
       "q_quotes": false,
+      "raw_strings": false,
       "slash_comment": true,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -690,6 +698,7 @@
       "escape_strings": false,
       "hash_comment": false,
       "q_quotes": true,
+      "raw_strings": false,
       "slash_comment": false,
       "trigger_row_binds": true,
       "triple_quotes": false
@@ -773,6 +782,7 @@
       "escape_strings": true,
       "hash_comment": false,
       "q_quotes": false,
+      "raw_strings": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -866,6 +876,7 @@
       "escape_strings": false,
       "hash_comment": false,
       "q_quotes": false,
+      "raw_strings": false,
       "slash_comment": true,
       "trigger_row_binds": false,
       "triple_quotes": false
@@ -955,6 +966,7 @@
       "escape_strings": false,
       "hash_comment": false,
       "q_quotes": false,
+      "raw_strings": false,
       "slash_comment": false,
       "trigger_row_binds": false,
       "triple_quotes": false

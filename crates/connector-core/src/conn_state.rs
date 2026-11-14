@@ -88,6 +88,13 @@ impl ConnState {
         match kw.as_str() {
             // ROLLBACK TO SAVEPOINT keeps the transaction.
             "ROLLBACK" if to_savepoint || keeps => {}
+            // Postgres `COMMIT PREPARED 'x'` / `ROLLBACK PREPARED 'x'` end a
+            // two-phase transaction, not this session's: inside one they
+            // fail and leave it open (aborted, waiting for ROLLBACK).
+            "COMMIT" | "ROLLBACK" if at(1) == Some("PREPARED") => {}
+            // Postgres `PREPARE TRANSACTION 'x'`: the transaction leaves the
+            // session (for a later COMMIT PREPARED): none is open here.
+            "PREPARE" if at(1) == Some("TRANSACTION") => self.tx_depth.store(0, Ordering::SeqCst),
             "COMMIT" | "END" if mssql => {
                 // `try_update` is the new name but needs Rust 1.95; the MSRV is 1.89.
                 #[allow(deprecated)]
@@ -170,6 +177,24 @@ impl ConnState {
     /// The connection can be replaced without losing anything.
     pub fn replaceable(&self) -> bool {
         self.tx_state() == TxState::None && !self.settings.load(Ordering::SeqCst)
+    }
+
+    /// The open transactions as the server counts them (SQL Server's
+    /// `@@TRANCOUNT`): replaces what the statements' text suggested.
+    pub fn set_depth(&self, depth: u32) {
+        self.tx_depth.store(depth, Ordering::SeqCst);
+    }
+
+    /// Whether this batch may have changed the transaction depth so that
+    /// asking the server is worth a round trip: it names transaction control
+    /// (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`, `SAVE`, `XACT_ABORT`), or writes
+    /// open transactions by themselves (implicit transactions), or it failed
+    /// inside one (a deadlock or `XACT_ABORT` ends it).
+    pub fn may_change_depth(&self, sql: &str, failed: bool) -> bool {
+        let w = |k: &str| words(sql).any(|x| x.eq_ignore_ascii_case(k));
+        ["BEGIN", "COMMIT", "ROLLBACK", "SAVE", "TRAN", "TRANSACTION", "XACT_ABORT", "IMPLICIT_TRANSACTIONS", "ANSI_DEFAULTS"].iter().any(|k| w(k))
+            || self.implicit.load(Ordering::SeqCst)
+            || (failed && self.in_transaction())
     }
 
     /// A new connection replaced the old one: nothing is carried any more.
@@ -305,6 +330,41 @@ mod tests {
         assert!(after(Mysql, &["# c\nbegin"]).1);
         assert!(after(Postgres, &["begin isolation level serializable"]).1);
         assert!(after(Sqlite, &["begin immediate"]).1);
+    }
+
+    #[test]
+    fn prepared_commits_leave_the_sessions_transaction_alone() {
+        let state = |stmts: &[&str]| {
+            let s = ConnState::new();
+            for q in stmts {
+                s.observe(q, Postgres);
+            }
+            s.tx_state()
+        };
+        assert_eq!(state(&["begin", "commit prepared 'tx1'"]), TxState::Open, "fails inside a transaction: still open");
+        assert_eq!(state(&["begin", "rollback prepared 'tx1'"]), TxState::Open);
+        assert_eq!(state(&["commit prepared 'tx1'"]), TxState::None);
+        assert_eq!(state(&["begin", "commit"]), TxState::None, "a plain COMMIT ends it");
+        assert_eq!(state(&["begin", "prepare transaction 'tx1'"]), TxState::None, "PREPARE TRANSACTION hands it over");
+    }
+
+    /// The server's count replaces what the text suggested (SQL Server's
+    /// `@@TRANCOUNT`); which batches are worth asking about.
+    #[test]
+    fn the_servers_depth_wins() {
+        let s = ConnState::new();
+        s.observe("begin tran; insert into t values (1); commit", Mssql);
+        assert_eq!(s.tx_state(), TxState::Open, "the text: conservative");
+        s.set_depth(0);
+        assert_eq!(s.tx_state(), TxState::None, "the server: committed");
+        assert!(s.may_change_depth("if @@trancount > 0 commit tran", false));
+        assert!(!s.may_change_depth("select * from t", false), "a plain read: no round trip");
+        assert!(!s.may_change_depth("select * from t", true), "failed outside a transaction");
+        s.set_depth(1);
+        assert!(s.may_change_depth("update t set a = 1", true), "failed inside one (deadlock, XACT_ABORT)");
+        let i = ConnState::new();
+        i.observe("set implicit_transactions on", Mssql);
+        assert!(i.may_change_depth("select * from t", false), "implicit: a read may open one");
     }
 
     /// Writes that open a transaction by themselves: one may be open at

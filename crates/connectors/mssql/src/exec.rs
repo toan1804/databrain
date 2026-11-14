@@ -5,6 +5,7 @@ use crate::error::map_err;
 use crate::types::col_type;
 use crate::types::convert;
 use databrain_connector_core::BatchBuilder;
+use databrain_connector_core::ConnState;
 use databrain_connector_core::ConnectorKind;
 use databrain_connector_core::ExecOptions;
 use databrain_connector_core::ExecSummary;
@@ -43,18 +44,45 @@ pub(crate) enum Ended {
 /// statements stop reading at the limit: `replaceable` (the connection
 /// carries no session state) at once, otherwise after reading the rest so
 /// the connection, and its transaction or settings, stay usable.
-pub(crate) async fn run(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &StreamSender, replaceable: bool, user_rowcount: bool) -> Result<Ended> {
+/// The open transactions as the server counts them (`@@TRANCOUNT`), when
+/// the batch may have changed them ([`ConnState::may_change_depth`]): text
+/// can't follow a batch's branches (`IF … COMMIT`), a one-batch
+/// `begin tran … commit`, or an error that ended the transaction. Done
+/// before the batch's end is reported, so its state is right by then.
+pub(crate) async fn sync_depth(conn: &mut Conn, state: &ConnState, sql: &str, failed: bool) {
+    if !state.may_change_depth(sql, failed) {
+        return;
+    }
+    let Ok(stream) = conn.simple_query("SELECT @@TRANCOUNT").await else { return };
+    if let Ok(Some(row)) = stream.into_row().await
+        && let Ok(Some(n)) = row.try_get::<i32, _>(0)
+    {
+        state.set_depth(n.max(0) as u32);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run(
+    conn: &mut Conn,
+    sql: &str,
+    opts: &ExecOptions,
+    tx: &StreamSender,
+    replaceable: bool,
+    user_rowcount: bool,
+    state: &ConnState,
+) -> Result<Ended> {
     if is_dml(sql) {
         let r = conn.execute(sql, &[]).await.map_err(map_err)?;
+        sync_depth(conn, state, sql, false).await;
         tx.send(StreamEvent::Done(ExecSummary { rows_affected: Some(r.rows_affected().iter().sum()) })).await;
         return Ok(Ended::Complete);
     }
     let server_cap = opts.max_rows.filter(|_| !user_rowcount && databrain_connector_core::sql::classify(sql, ConnectorKind::Mssql).kind.is_read());
     let Some(n) = server_cap else {
-        return read(conn, sql, opts, tx, replaceable).await;
+        return read(conn, sql, opts, tx, replaceable, state).await;
     };
     // Same line: error line numbers stay those of the user's SQL.
-    let r = read(conn, &format!("set rowcount {n}; {sql}"), opts, tx, false).await;
+    let r = read(conn, &format!("set rowcount {n}; {sql}"), opts, tx, false, state).await;
     let reset = match conn.simple_query("set rowcount 0").await {
         Ok(s) => s.into_results().await.map(|_| ()).map_err(map_err),
         Err(e) => Err(map_err(e)),
@@ -65,7 +93,7 @@ pub(crate) async fn run(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &Str
     Ok(ended)
 }
 
-pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &StreamSender, replaceable: bool) -> Result<Ended> {
+pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &StreamSender, replaceable: bool, state: &ConnState) -> Result<Ended> {
     let mut stream = conn.simple_query(sql).await.map_err(map_err)?;
     let mut builder: Option<BatchBuilder> = None;
     let mut extra_sets = 0usize;
@@ -132,6 +160,8 @@ pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &St
     if extra_sets > 0 {
         tx.send(StreamEvent::Notice(format!("{extra_sets} additional result set(s) not shown"))).await;
     }
+    drop(stream);
+    sync_depth(conn, state, sql, false).await;
     tx.send(StreamEvent::Done(ExecSummary::default())).await;
     Ok(Ended::Complete)
 }
