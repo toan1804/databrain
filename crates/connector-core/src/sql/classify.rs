@@ -75,6 +75,18 @@ pub fn classify(sql: &str, kind: ConnectorKind) -> Classification {
         let other = super::split_statements(sql, kind).iter().map(|p| no_backslash_kind(&p.sql, kind)).max().unwrap_or(StatementKind::Read);
         return Classification { kind: c.kind.max(other), ..c };
     }
+    // Several statements as DataBrain splits the text (it reads strings as
+    // the server does): the worst of them counts, whatever the parser saw.
+    // The parser may read a string differently and see one statement:
+    // DuckDB's `e'\''` is one quote to the server, the end of `e'\'` and a
+    // new string to the parser, so `select e'\''; drop table t` was a read.
+    if sql.contains(';') {
+        let pieces = super::split_statements(sql, kind);
+        if pieces.len() > 1 {
+            let worst = pieces.iter().map(|p| classify_sql(&p.sql, kind).kind).max().unwrap_or(StatementKind::Read);
+            return Classification { kind: c.kind.max(worst), ..c };
+        }
+    }
     c
 }
 
@@ -979,6 +991,27 @@ mod tests {
         ] {
             assert_eq!(classify(sql, kind).kind, StatementKind::Read, "{sql}");
         }
+    }
+
+    /// Several statements as the server reads the text: the worst counts,
+    /// though the parser reads a string differently and sees one.
+    #[test]
+    fn the_worst_statement_counts_where_the_parser_reads_a_string_differently() {
+        // DuckDB `e'\''` is a quote (the server); the parser ends the string early.
+        for sql in ["select e'\\''; drop table t", "select E'\\'' as q; delete from t where 1=1", "select e'a\\'b'; update t set a = 1 where id = 2"] {
+            let k = classify(sql, Duckdb).kind;
+            assert!(k.is_write() || k == StatementKind::Unknown, "{sql}: {k:?}");
+        }
+        // Reads stay reads, one statement or several; one the parser can't
+        // read is asked about (never a read).
+        for sql in ["select ';' as semi", "select 1; select 'a;b'"] {
+            assert_eq!(classify(sql, Duckdb).kind, StatementKind::Read, "{sql}");
+        }
+        for sql in ["select e'\\''", "select 1; select e'\\''"] {
+            assert_eq!(classify(sql, Duckdb).kind, StatementKind::Unknown, "{sql}");
+        }
+        assert_eq!(classify("select 1; select 2", Postgres).kind, StatementKind::Read);
+        assert!(classify("select 1; drop table t", Postgres).kind.is_write());
     }
 
     #[test]
