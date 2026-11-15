@@ -62,6 +62,10 @@ pub(crate) type FileKey = (std::path::PathBuf, bool, bool);
 pub(crate) static FILE_DBS: std::sync::LazyLock<Mutex<std::collections::HashMap<FileKey, std::sync::Weak<FileDb>>>> =
     std::sync::LazyLock::new(Default::default);
 
+/// How long a session waits for an instance of its file in the other access
+/// mode to close before it is refused.
+const OTHER_MODE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A new connection to the database file at `path`, opening it unless a
 /// live session already has it open (same access mode). A new instance is
 /// prepared with `init` before any session gets it. A sandboxed instance
@@ -102,7 +106,12 @@ pub(crate) fn connect_file(
         }
         // An instance of this file (any access mode) whose last session ended.
         let closing = dbs.iter().any(|(k, w)| k.0 == key.0 && w.strong_count() == 0);
-        if !closing {
+        // One in the other access mode may be about to close too: its last
+        // session lets go of it a moment after it ends (on another thread),
+        // so a session opened right after waits a little for that before
+        // the refusal below.
+        let other_mode = dbs.keys().any(|k| k.0 == key.0 && k.2 == sandbox && k.1 != read_only);
+        if !closing && !(other_mode && closing_since.elapsed() < OTHER_MODE_GRACE) {
             break dbs;
         }
         drop(dbs);
@@ -217,6 +226,41 @@ mod tests {
         assert_eq!(q(&*c, "select * from t").await.num_rows(), 1, "read-only once the other closed");
         let e = connect(rw.clone()).await.err().expect("read-write refused while open read-only");
         assert!(e.message.contains("open read-only"), "{}", e.message);
+    }
+
+    /// The other access mode's last session lets go of the file a moment
+    /// after it ends (on another thread): a session opened right then waits
+    /// for that instead of being refused; one still open is refused after
+    /// the wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn waits_a_moment_for_the_other_access_mode_to_close() {
+        use databrain_connector_core::Connector;
+        let dir = tempfile::tempdir().unwrap();
+        let mut rw = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+        rw.file_path = Some(dir.path().join("lake.duckdb").to_string_lossy().into_owned());
+        let mut ro = rw.clone();
+        ro.read_only = true;
+        let connect = |cfg: ConnectionConfig| async move {
+            crate::DuckdbConnector::new().connect(&cfg, std::sync::Arc::new(databrain_auth::InlineCredentialSource::new(AuthMethod::None, None))).await
+        };
+        q(&*connect(rw.clone()).await.unwrap(), "create table t as select 1 as x").await;
+        // Read-only, let go 300 ms later on another thread: read-write waits and opens.
+        let a = connect(ro.clone()).await.unwrap();
+        let later = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(a);
+        });
+        let b = connect(rw.clone()).await.expect("opened once the read-only instance closed");
+        q(&*b, "insert into t values (2)").await;
+        later.join().unwrap();
+        drop(b);
+        // Still open read-only: refused, after the wait.
+        let c = connect(ro.clone()).await.unwrap();
+        let t = std::time::Instant::now();
+        let e = connect(rw.clone()).await.err().expect("refused while open read-only");
+        assert!(e.message.contains("open read-only"), "{}", e.message);
+        assert!(t.elapsed() >= super::OTHER_MODE_GRACE, "{:?}", t.elapsed());
+        drop(c);
     }
 
     /// A transaction opened with BEGIN is reported, so the session isn't
