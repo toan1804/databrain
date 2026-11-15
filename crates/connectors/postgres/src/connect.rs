@@ -6,11 +6,29 @@ use tokio_postgres::Client;
 
 use crate::error::map_err;
 
-pub(crate) fn tls_connector(mode: SslMode) -> Result<MakeTlsConnector> {
+/// The connection's option holding a CA certificate (PEM file) to verify
+/// the server against (libpq's `sslrootcert`).
+pub const SSL_ROOT_CERT: &str = "ssl_root_cert";
+
+/// TLS for the connection, with libpq's meaning: prefer and require
+/// encrypt without checking the server's certificate, verify-full checks
+/// the chain and host name. With a CA file (`ssl_root_cert`) the
+/// certificate must chain to that CA (only to it) in every mode, as libpq
+/// does when a root certificate is given; verify-full also checks the host.
+pub(crate) fn tls_connector(cfg: &ConnectionConfig) -> Result<MakeTlsConnector> {
+    let mode = cfg.ssl_mode;
     let mut b = native_tls::TlsConnector::builder();
-    // libpq semantics: prefer/require encrypt but do not verify the server
-    // certificate; verify-full verifies chain and host name.
-    if mode != SslMode::VerifyFull {
+    let root = cfg.opt(SSL_ROOT_CERT).map(str::trim).filter(|p| !p.is_empty() && mode != SslMode::Disable);
+    if let Some(p) = root {
+        let pem = std::fs::read(p).map_err(|e| ConnectorError::config(format!("CA certificate file {p}: {e}")))?;
+        let ca =
+            native_tls::Certificate::from_pem(&pem).map_err(|e| ConnectorError::config(format!("CA certificate file {p} isn't a PEM certificate: {e}")))?;
+        b.add_root_certificate(ca);
+        b.disable_built_in_roots(true);
+        if mode != SslMode::VerifyFull {
+            b.danger_accept_invalid_hostnames(true);
+        }
+    } else if mode != SslMode::VerifyFull {
         b.danger_accept_invalid_certs(true);
         b.danger_accept_invalid_hostnames(true);
     }
@@ -92,5 +110,41 @@ impl Link {
         old_task.abort();
         self.state.reset();
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use databrain_auth::AuthMethod;
+    use databrain_connector_core::ConnectorKind;
+
+    fn cfg(mode: SslMode, root: Option<&str>) -> ConnectionConfig {
+        let mut c = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "u".into() });
+        c.ssl_mode = mode;
+        if let Some(r) = root {
+            c.options.insert(SSL_ROOT_CERT.into(), r.into());
+        }
+        c
+    }
+
+    /// A CA file that can't be read or isn't a certificate is refused (the
+    /// connection would otherwise not verify what it was set to); with SSL
+    /// off it isn't read; without one, every mode still builds.
+    #[test]
+    fn ca_file_is_read_and_checked() {
+        for mode in [SslMode::Prefer, SslMode::Require, SslMode::VerifyFull] {
+            let e = tls_connector(&cfg(mode, Some("/nonexistent/root.crt"))).err().expect("missing file refused");
+            assert!(e.message.contains("CA certificate file /nonexistent/root.crt"), "{}", e.message);
+            assert!(tls_connector(&cfg(mode, None)).is_ok(), "{mode:?}");
+        }
+        let dir = std::env::temp_dir().join(format!("db-pg-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("bad.crt");
+        std::fs::write(&bad, "not a certificate").unwrap();
+        let e = tls_connector(&cfg(SslMode::Require, Some(&bad.to_string_lossy()))).err().expect("not PEM refused");
+        assert!(e.message.contains("isn't a PEM certificate"), "{}", e.message);
+        assert!(tls_connector(&cfg(SslMode::Disable, Some("/nonexistent/root.crt"))).is_ok(), "SSL off: not read");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

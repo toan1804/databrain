@@ -54,6 +54,9 @@ impl Connector for PostgresConnector {
                 FieldSpec::new("host", "Host").required().placeholder("localhost"),
                 FieldSpec::new("port", "Port").placeholder("5432"),
                 FieldSpec::new("database", "Database").placeholder("postgres"),
+                FieldSpec::new(connect::SSL_ROOT_CERT, "CA certificate").placeholder("/path/to/root.crt").help(
+                    "PEM file of the CA that signed the server's certificate (libpq's sslrootcert): with SSL Prefer or Require the certificate must chain to it, with Verify its host name must match too.",
+                ),
                 FieldSpec::new("cluster_id", "Cluster ID").placeholder("from the host").help("IAM sign-in, provisioned clusters"),
                 FieldSpec::new("workgroup", "Workgroup").placeholder("from the host").help("IAM sign-in, Redshift Serverless"),
                 FieldSpec::new("aws_region", "AWS region").placeholder("from the host or profile"),
@@ -138,7 +141,7 @@ impl Connector for PostgresConnector {
         };
         pg.ssl_mode(mode);
         plain.ssl_mode(mode);
-        let tls = tls_connector(cfg.ssl_mode)?;
+        let tls = tls_connector(cfg)?;
         let mut init = redshift.then(|| REDSHIFT_INIT.to_string());
         let (client, task) = match open_link(&pg, tls.clone(), init.as_deref(), temporary).await {
             // A Redshift endpoint the host didn't reveal (SSH tunnel, DNS alias).
