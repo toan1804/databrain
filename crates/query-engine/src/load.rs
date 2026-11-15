@@ -373,12 +373,16 @@ fn transaction(dialect: ConnectorKind, plan: &[Act]) -> Option<Tx> {
                 // ones classified otherwise `SET PASSWORD` (a session
                 // statement) and `LOAD INDEX INTO CACHE` (`LOAD` reads as
                 // DML for `LOAD DATA`).
-                let mut words = sql.sql().split_whitespace().map(str::to_ascii_uppercase);
-                let two = (words.next().unwrap_or_default(), words.next().unwrap_or_default());
+                // The words of its code, past comments (`/* x */ SET PASSWORD …`)
+                // and strings.
+                let code = databrain_connector_core::sql::code_text(sql.sql(), ConnectorKind::Mysql).to_ascii_uppercase();
+                let words: Vec<&str> = code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '@')).filter(|w| !w.is_empty()).collect();
+                let two = (words.first().copied().unwrap_or_default(), words.get(1).copied().unwrap_or_default());
                 match sql.kind() {
                     StatementKind::Read => false,
-                    StatementKind::Dml => two == ("LOAD".into(), "INDEX".into()),
-                    StatementKind::Session => two == ("SET".into(), "PASSWORD".into()),
+                    StatementKind::Dml => two == ("LOAD", "INDEX"),
+                    // `SET autocommit = 1` commits what is open, as `SET PASSWORD` does.
+                    StatementKind::Session => two == ("SET", "PASSWORD") || words.iter().any(|w| matches!(*w, "AUTOCOMMIT" | "@@AUTOCOMMIT")),
                     _ => true,
                 }
             }
@@ -1488,10 +1492,31 @@ mod tests {
         // (a dry run checks the plan instead of running it); reads, row
         // changes and harmless session values keep it.
         let user = |sql: &str| Act::User { label: String::new(), sql: Checked::new(sql, ConnectorKind::Mysql) };
-        for sql in ["SET PASSWORD = 'x'", "RESET QUERY CACHE", "LOAD INDEX INTO CACHE t", "CREATE USER u", "GRANT SELECT ON t TO u", "ANALYZE TABLE t"] {
+        for sql in [
+            "SET PASSWORD = 'x'",
+            "/* rotate */ SET PASSWORD = 'x'",
+            "SET -- now\n PASSWORD FOR u = 'x'",
+            "SET autocommit = 1",
+            "SET @@autocommit = 1",
+            "SET SESSION autocommit = 1",
+            "RESET QUERY CACHE",
+            "LOAD INDEX INTO CACHE t",
+            "/* warm */ LOAD INDEX INTO CACHE t",
+            "CREATE USER u",
+            "GRANT SELECT ON t TO u",
+            "ANALYZE TABLE t",
+        ] {
             assert!(transaction(ConnectorKind::Mysql, &[user(sql), ins.clone()]).is_none(), "{sql}");
         }
-        for sql in ["update t set a = 1 where id = 2", "select 1", "SET @batch = 1", "SET NAMES utf8mb4", "LOAD DATA LOCAL INFILE 'f' INTO TABLE t"] {
+        for sql in [
+            "update t set a = 1 where id = 2",
+            "select 1",
+            "SET @batch = 1",
+            "SET NAMES utf8mb4",
+            "SET @note = 'autocommit'",
+            "/* x */ SET @batch = 2",
+            "LOAD DATA LOCAL INFILE 'f' INTO TABLE t",
+        ] {
             assert!(transaction(ConnectorKind::Mysql, &[user(sql), ins.clone()]).is_some(), "{sql}");
         }
         // Elsewhere those don't commit: the transaction stays.

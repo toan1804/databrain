@@ -143,14 +143,18 @@ struct Reading {
     /// quoted text (Oracle): `[it's]` and `q'[it's]'` open no string.
     brackets: bool,
     /// `#` starts a comment to the end of the line (MySQL, ClickHouse):
-    /// `# don't` opens no string.
+    /// `# don't` opens no string. MySQL's other comments go with it: `--`
+    /// is one only before a space (`5--1` is arithmetic), and `/*!…*/` is
+    /// code the server runs (only its `/*!80000` opener is a comment).
     hash: bool,
+    /// `/* … */` comments nest (Postgres): `/* a /* b */ ' */` is one comment.
+    nested: bool,
 }
 
 impl Reading {
     /// `backslash`: none, in `'…'` only, or in `'…'` and `"…"`.
     const fn new(backslash: (bool, bool), dollar: bool) -> Self {
-        Self { backslash: backslash.0, backslash_double: backslash.1, dollar, brackets: false, hash: false }
+        Self { backslash: backslash.0, backslash_double: backslash.1, dollar, brackets: false, hash: false, nested: false }
     }
 
     /// Every reading. The last two are for the servers their syntax
@@ -160,7 +164,7 @@ impl Reading {
     /// other servers by the first six. Backslashes escape in `'…'` only
     /// (Postgres `E'…'`, DuckDB) or in both quotes (MySQL): `E'\''` then
     /// `"c\"` ends the name on the first and not on the second.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::new((false, false), true),
         Self::new((true, false), true),
         Self::new((true, true), true),
@@ -169,6 +173,7 @@ impl Reading {
         Self::new((true, true), false),
         Self { brackets: true, ..Self::new((false, false), false) },
         Self { hash: true, ..Self::new((true, true), false) },
+        Self { nested: true, ..Self::new((false, false), true) },
     ];
 }
 
@@ -239,8 +244,20 @@ impl<'a> Lexer<'a> {
         }
         let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
         match c {
-            b'-' if b.get(i + 1) == Some(&b'-') => tok(Kind::Comment, self.sql[i..].find('\n').map_or(n, |k| i + k)),
-            b'/' if b.get(i + 1) == Some(&b'*') => tok(Kind::Comment, self.sql[i + 2..].find("*/").map_or(n, |k| i + 4 + k)),
+            // MySQL: `--` is a comment only before a space or the end (`5--1` is 5 - -1).
+            b'-' if b.get(i + 1) == Some(&b'-') && !(self.reading.hash && b.get(i + 2).is_some_and(|c| !c.is_ascii_whitespace() && !c.is_ascii_control())) => {
+                tok(Kind::Comment, self.sql[i..].find('\n').map_or(n, |k| i + k))
+            }
+            // MySQL runs `/*!80000 … */`: only the opener is a comment, the
+            // rest is read as SQL (its `*/` as two characters).
+            b'/' if self.reading.hash && b.get(i + 1) == Some(&b'*') && b.get(i + 2) == Some(&b'!') => {
+                let mut j = i + 3;
+                while j < n && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                tok(Kind::Comment, j)
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => tok(Kind::Comment, self.comment_end(i)),
             b'\'' | b'"' | b'`' => {
                 let escapes = match c {
                     b'\'' => self.reading.backslash,
@@ -272,6 +289,17 @@ impl<'a> Lexer<'a> {
                 if j == i + 1 && matches!(c, b'E' | b'e' | b'N' | b'n') && b.get(j) == Some(&b'\'') {
                     return tok(Kind::Quoted { quote: b'\'', open: j }, self.quoted_end(j, self.reading.backslash));
                 }
+                // A prefix written against its quote: raw strings r'…' (Databricks,
+                // BigQuery: backslashes don't escape), bytes b'…' / rb'…', hex
+                // x'…', and MySQL's character set introducer `_utf8mb4'…'`.
+                if let Some(&q @ (b'\'' | b'"')) = b.get(j) {
+                    let prefix = self.sql[i..j].to_ascii_lowercase();
+                    let raw = matches!(prefix.as_str(), "r" | "rb" | "br");
+                    if raw || prefix == "b" || prefix == "x" || (c == b'_' && j > i + 1) {
+                        let escapes = !raw && if q == b'\'' { self.reading.backslash } else { self.reading.backslash_double };
+                        return tok(Kind::Quoted { quote: q, open: j }, self.quoted_end(j, escapes));
+                    }
+                }
                 // Oracle q'[…]', q'{…}', q'!…!' (and nq'…'): its text is read
                 // like a dollar-quoted one.
                 if self.reading.brackets
@@ -286,6 +314,31 @@ impl<'a> Lexer<'a> {
             // One character (a whole UTF-8 one, so slices stay on boundaries).
             _ => tok(Kind::Other, i + self.sql[i..].chars().next().map_or(1, char::len_utf8)),
         }
+    }
+
+    /// The end of the `/* … */` comment at `i`, after its `*/` (nested ones
+    /// counted when the reading nests them); unterminated: the end.
+    fn comment_end(&self, i: usize) -> usize {
+        let (b, n) = (self.b, self.b.len());
+        if !self.reading.nested {
+            return self.sql[i + 2..].find("*/").map_or(n, |k| i + 4 + k);
+        }
+        let (mut depth, mut j) = (0usize, i);
+        while j + 1 < n {
+            if b[j] == b'/' && b[j + 1] == b'*' {
+                depth += 1;
+                j += 2;
+            } else if b[j] == b'*' && b[j + 1] == b'/' {
+                depth -= 1;
+                j += 2;
+                if depth == 0 {
+                    return j;
+                }
+            } else {
+                j += 1;
+            }
+        }
+        n
     }
 
     /// The end of the quoted text at `i`, after its closing quote (doubled
@@ -571,7 +624,8 @@ fn positional_secrets(lx: &Lexer) -> Vec<Span> {
         for &k in c.secret {
             let Some(&(s, e)) = c.args.get(k) else { continue };
             let mut a = s;
-            while a < e && matches!(lx.at(a).kind, Kind::Space { .. }) {
+            // Past spaces and comments (`NULL, /* user */ 'u', -- pw\n 'pw'`).
+            while a < e && matches!(lx.at(a).kind, Kind::Space { .. } | Kind::Comment) {
                 a = lx.at(a).end;
             }
             if a < e
@@ -589,9 +643,14 @@ fn positional_secrets(lx: &Lexer) -> Vec<Span> {
     // and over on one line opens a call each).
     let mut paren_calls = 0usize;
     let mut i = 0;
+    // The last token that wasn't space or a comment was a `,`.
+    let mut after_comma = false;
     while i < n {
         let t = lx.at(i);
         i = t.end;
+        if !matches!(t.kind, Kind::Space { .. } | Kind::Comment) {
+            after_comma = lx.is(t, b',');
+        }
         match t.kind {
             Kind::Word => {
                 let name = lx.word(t);
@@ -617,8 +676,10 @@ fn positional_secrets(lx: &Lexer) -> Vec<Span> {
                 i = j;
             }
             // A procedure's arguments end with the line, and what is open
-            // in them with it (only procedures are below a procedure).
-            Kind::Space { newline: true } if open.first().is_some_and(|c| !c.parens) => {
+            // in them with it (only procedures are below a procedure), unless
+            // they go on: a comma ends the line (before a comment, too) or
+            // starts the next one.
+            Kind::Space { newline: true } if open.first().is_some_and(|c| !c.parens) && !after_comma && !lx.next(t.end).is_some_and(|x| lx.is(x, b',')) => {
                 while let Some(c) = open.pop() {
                     paren_calls -= usize::from(c.parens);
                     close(c, t.start);
@@ -698,6 +759,10 @@ pub fn redact_url_passwords(text: &str) -> String {
     let stop = |c: char| matches!(c, '\'' | '"' | '`' | '<' | '>' | '(' | ')');
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
+    // The next `@`, `://` and line end from a point on, remembered: the
+    // point only moves on, so the text is searched once (searching from each
+    // URL to the end was quadratic: `"a://b:c ".repeat(n)`).
+    let (mut next_at, mut next_scheme, mut next_line) = (Next::default(), Next::default(), Next::default());
     while let Some(i) = rest.find("://") {
         let start = i + 3;
         out.push_str(&rest[..start]);
@@ -756,9 +821,13 @@ pub fn redact_url_passwords(text: &str) -> String {
             // `u:pa ss@h`: a password with a space in it, up to the next `@`
             // on the line (the last `@` of that word), not into another URL.
             None if !port => {
-                let line = rest.find(|c: char| stop(c) || matches!(c, '\n' | '\r')).unwrap_or(rest.len());
+                let base = text.len() - rest.len();
+                let from = base + token;
+                let line = next_line.find(text, from, |s| s.find(|c: char| stop(c) || matches!(c, '\n' | '\r'))).unwrap_or(text.len()) - base;
                 let more = &rest[token..line];
-                more.find('@').filter(|a| !more[..*a].contains("://")).and_then(|a| {
+                let a = next_at.find(text, from, |s| s.find('@')).map(|a| a - from).filter(|&a| a < more.len());
+                let scheme = next_scheme.find(text, from, |s| s.find("://")).map(|k| k - from);
+                a.filter(|&a| scheme.is_none_or(|k| k >= a)).and_then(|a| {
                     let word = more[a..].find(char::is_whitespace).map_or(more.len(), |w| a + w);
                     more[..word].rfind('@').map(|a| token + a)
                 })
@@ -782,6 +851,24 @@ pub fn redact_url_passwords(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Where something next occurs in a text at or after a point that only
+/// moves on: found once, kept until the point passes it.
+#[derive(Default)]
+struct Next(Option<Option<usize>>);
+
+impl Next {
+    fn find(&mut self, text: &str, from: usize, search: impl Fn(&str) -> Option<usize>) -> Option<usize> {
+        match self.0 {
+            Some(None) => return None,
+            Some(Some(p)) if p >= from => return Some(p),
+            _ => {}
+        }
+        let found = search(&text[from..]).map(|k| from + k);
+        self.0 = Some(found);
+        found
+    }
 }
 
 /// Text up to the next whitespace.
@@ -1513,5 +1600,65 @@ mod review_tests {
         let t = std::time::Instant::now();
         let _ = redact_secrets(&"sp_password ".repeat(40_000));
         assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    /// Secrets the review of 2026-11-15 found kept: each is hidden now.
+    #[test]
+    fn secrets_in_prefixed_strings_mysql_code_comments_and_continued_arguments() {
+        for (sql, secret) in [
+            // Databricks raw strings, BigQuery raw and bytes.
+            ("create connection c type mysql options (host 'h', user 'u', password r'PW1')", "PW1"),
+            ("create connection c type mysql options (password R\"PW1b\")", "PW1b"),
+            ("alter user u identified by rb'PW1c'", "PW1c"),
+            // MySQL runs /*!…*/; `5--1` is no comment.
+            ("/*!80000 create user u identified by 'PW2' */", "PW2"),
+            ("select 5--1; create user u identified by 'PW4'", "PW4"),
+            // A Postgres nested comment hiding a quote.
+            ("/* a /* b */ ' */ alter role r password 'PW3'", "PW3"),
+            // A character set introducer.
+            ("create user u identified by _utf8mb4'PW5'", "PW5"),
+            ("set password for u = _latin1'PW5b'", "PW5b"),
+            // Procedure arguments after a comment or a line break.
+            ("exec sp_addlinkedsrvlogin 'S', 'false', NULL,\n 'u', 'PW7'", "PW7"),
+            ("exec sp_addlinkedsrvlogin 'S', 'false', NULL, 'u', -- c\n 'PW8'", "PW8"),
+            ("exec sp_addlinkedsrvlogin 'S', 'false', NULL, 'u'\n, 'PW9'", "PW9"),
+            ("exec sp_addlinkedsrvlogin 'S', 'false', NULL, /* who */ 'u', /* pw */ 'PW10'", "PW10"),
+        ] {
+            let r = redact_secrets(sql);
+            assert!(!r.contains(secret), "{sql:?} -> {r:?}");
+        }
+    }
+
+    /// What isn't a secret stays as written.
+    #[test]
+    fn ordinary_sql_with_these_forms_is_kept() {
+        for sql in [
+            "select 5--1, 'x' from t",
+            "select _utf8mb4'hello', x'0A', b'1', r'a\\b' from t",
+            "/*!40101 SET NAMES utf8mb4 */",
+            "/* a /* b */ c */ select 'kept'",
+            "exec sp_addlinkedsrvlogin 'S'\nselect 'kept' as c",
+            "select a--b\nfrom t",
+        ] {
+            assert_eq!(redact_secrets(sql), sql);
+        }
+    }
+
+    /// Linear: `"a://b:c ".repeat(n)` took 9 s at 80 KB.
+    #[test]
+    fn url_passwords_in_long_text_are_linear() {
+        let text = "a://b:c ".repeat(10_000);
+        let t = std::time::Instant::now();
+        assert_eq!(redact_url_passwords(&text), text);
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "{:?}", t.elapsed());
+        // Still found far apart: a password with a space runs to the next `@` on the line.
+        let far = format!("x://u:pa ss{}@h/db", " w".repeat(5_000));
+        assert!(!redact_url_passwords(&far).contains("pa ss"));
+        assert_eq!(redact_url_passwords("p://u:pw@h/db then q://v:pw2@h2"), "p://u:***@h/db then q://v:***@h2");
     }
 }
