@@ -57,6 +57,21 @@ pub fn net_err(e: reqwest::Error) -> ConnectorError {
     ConnectorError::connection(msg)
 }
 
+/// Whether a query may still be running on the server after waiting for it
+/// failed with `e`: the connection broke, the server answered with
+/// something unexpected (5xx, not JSON), or the sign-in lapsed. Not when the
+/// server reported the query's own failure (a query error, a 4xx) or it was
+/// cancelled: then there is nothing left to stop.
+pub fn may_still_run(e: &ConnectorError) -> bool {
+    !matches!(e.kind, ErrorKind::Query | ErrorKind::Cancelled)
+}
+
+/// Whether nobody waits for a statement's rows any more: cancelled, or its
+/// stream dropped (the receiver gone).
+pub fn abandoned(cancel: &databrain_connector_core::CancellationToken, tx: Option<&StreamSender>) -> bool {
+    cancel.is_cancelled() || tx.is_some_and(StreamSender::is_closed)
+}
+
 /// Read a JSON response body, turning HTTP errors into connector errors.
 pub async fn json_body(resp: reqwest::Response, service: &str) -> Result<serde_json::Value> {
     let status = resp.status();
