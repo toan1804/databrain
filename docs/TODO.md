@@ -32,17 +32,15 @@ The review's privacy gaps and bugs were fixed on 2026-11-15 (a connection's rule
 
 Fixed on 2026-11-15: catalog queries built with a literal a backslash could end (MySQL, Snowflake, Databricks, Redshift, Postgres, BigQuery paths), the crashes on text outside ASCII (MongoDB, Neo4j), Databricks running a write twice, `results.<name>` hidden behind a comment, and the DuckDB sandbox writing into attached folders. Left, most serious first:
 
-**Stop and the row limit**
-- **Oracle:** Stop during a large fetch drops a half-read frame from the helper; the session is then dead or hangs (`oracle/src/exec.rs`, `Agent::read` is not cancel-safe). One reader task owning the helper's output would fix the class. A statement cancelled while it waits for the session still runs (both drivers).
-- **MySQL:** cancel waits on the connection mutex its own statement still holds when the kill fails or takes more than 10 s: the session blocks for good (`mysql/src/session.rs`). A cancel during row streaming often sends no `KILL QUERY`.
-- **MySQL, SQL Server:** the row limit inside `CALL p()` / `EXEC p` abandons the rest of the procedure and reports success. Only classified reads should be abandoned.
+**Stop and the row limit** (Oracle, MySQL, the procedure row limit and the cloud polls fixed on 2026-11-15)
 - **Postgres:** inside a transaction the row limit reads the whole result to its end before finishing; a cancel that races a ready row is not sent to the server.
-- **SQLite, DuckDB, Oracle (thick):** cancelling a statement that waits for the session interrupts the one that is running, and the cancelled one then runs.
+- **SQLite, DuckDB:** cancelling a statement that waits for the session interrupts the one that is running, and the cancelled one then runs.
 - **MongoDB, Neo4j:** cancel and the row limit only drop the local future; the server keeps working. **ClickHouse** relies on the server noticing the closed response.
-- **Snowflake, BigQuery, Databricks:** a failed poll returns the error without cancelling the query on the server. Snowflake's submit URL carries two `requestId`s (the abort sends the first; which one the server uses is not confirmed). BigQuery polls and cancels with the configured location, not the job's.
+- **Snowflake, BigQuery, Databricks:** the cancel on a failed poll is tested against a mock server only, not a live account; a Databricks or BigQuery submit that fails before the server answers can't be cancelled (no statement or job id yet).
+- **Oracle (Instant Client), SQL Server:** Stop, the wait-for-session check (Oracle) and the row limit on `EXEC` (SQL Server) are not tested live.
 
 **Wrong results or state** (fixed on 2026-11-15 except as follows; the rest was checked by unit tests only, live where noted)
-- **Oracle:** the thin driver's fixes need the helper release `oracle-agent/v0.1.3` published (`docs/RELEASING.md`) before an app release ships them. The Instant Client (thick) path, its per-statement read-only transaction and `DBMS_OUTPUT`, is not tested live (the thin one is, on Oracle Free 23). A `DBMS_OUTPUT` line longer than 8000 bytes is cut. Read-only is not enforced by the server (confirmed live on 23): a `COMMIT` inside a block, or DDL, ends the READ ONLY transaction, and what is committed after it stays; the classifier refuses blocks and DDL on a read-only connection, and what isn't committed is rolled back as the statement ends.
+- **Oracle:** the Instant Client (thick) path, its per-statement read-only transaction and `DBMS_OUTPUT`, is not tested live (the thin one is, on Oracle Free 23). A `DBMS_OUTPUT` line longer than 8000 bytes is cut. Read-only is not enforced by the server (confirmed live on 23): a `COMMIT` inside a block, or DDL, ends the READ ONLY transaction, and what is committed after it stays; the classifier refuses blocks and DDL on a read-only connection, and what isn't committed is rolled back as the statement ends.
 - **SQL Server:** `money` comes from the driver as a float, so values beyond about ±900 billion may be off in the last digit; `datetimeoffset` is text with its offset, so it sorts as text, not by instant. Not run against a live server (the container never finished a login).
 - **SQLite:** a value that doesn't fit its column's type after the first batch (the type is chosen from the first batch) shows as NULL, with a notice.
 - **Neo4j:** whether the server decodes `\uXXXX` outside strings is not confirmed; the classifier reads both ways. Durations are read from the driver's debug output (neo4rs 0.8.0): recheck when upgrading.

@@ -359,11 +359,17 @@ fn sf_cell(t: ColType, v: &serde_json::Value) -> Value {
 
 impl Inner {
     async fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+        self.post_as(path, &uuid::Uuid::new_v4().to_string(), body).await
+    }
+
+    /// POST with this `requestId`, the one an abort names (one per request:
+    /// `path` carries none of its own).
+    async fn post_as(&self, path: &str, request_id: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let tok = self.token.lock().await.session.clone();
         let resp = self
             .http
             .post(format!("{}{path}", self.base))
-            .query(&[("requestId", uuid::Uuid::new_v4().to_string())])
+            .query(&[("requestId", request_id)])
             .header("Accept", "application/snowflake")
             .header("Authorization", format!("Snowflake Token=\"{tok}\""))
             .json(&body)
@@ -377,7 +383,7 @@ impl Inner {
         // Session expired: renew with the master token and retry once.
         if v["code"].as_str() == Some("390112") {
             self.renew().await?;
-            return Box::pin(self.post(path, body)).await;
+            return Box::pin(self.post_as(path, request_id, body)).await;
         }
         Ok(v)
     }
@@ -431,15 +437,32 @@ impl Inner {
         Err(ConnectorError::query(msg).with_code(code).with_position(pos))
     }
 
-    /// Submit and wait; returns the completed `data` object.
-    async fn query(&self, sql: &str, request_id: &str, cancel: &databrain_connector_core::CancellationToken) -> Result<serde_json::Value> {
+    /// Submit and wait; returns the completed `data` object. When waiting
+    /// fails in a way that may leave the query running (the connection
+    /// broke, an unexpected answer), or nobody waits for it any more (`tx`
+    /// dropped), the query is aborted on the server before returning.
+    async fn query(
+        &self,
+        sql: &str,
+        request_id: &str,
+        cancel: &databrain_connector_core::CancellationToken,
+        tx: Option<&StreamSender>,
+    ) -> Result<serde_json::Value> {
         let seq = self.request_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let body = json!({ "sqlText": sql, "asyncExec": false, "sequenceId": seq, "querySubmissionTime": now_secs() * 1000 });
-        let path = format!("/queries/v1/query-request?requestId={request_id}");
-        let submit = self.post(&path, body);
+        let submit = self.post_as("/queries/v1/query-request", request_id, body);
         tokio::pin!(submit);
         let mut v = tokio::select! {
-            r = &mut submit => r?,
+            r = &mut submit => match r {
+                Ok(v) => v,
+                Err(e) => {
+                    // The request may have reached the server (a timeout, a dropped connection).
+                    if crate::common::may_still_run(&e) {
+                        self.abort(sql, request_id).await;
+                    }
+                    return Err(e);
+                }
+            },
             _ = cancel.cancelled() => {
                 self.abort(sql, request_id).await;
                 return Err(ConnectorError::cancelled());
@@ -456,7 +479,24 @@ impl Inner {
                     return Err(ConnectorError::cancelled());
                 }
             }
-            v = self.get(&url).await?;
+            if crate::common::abandoned(cancel, tx) {
+                self.abort(sql, request_id).await;
+                return Err(ConnectorError::cancelled());
+            }
+            v = match self.get(&url).await {
+                Ok(v) => v,
+                Err(e) => {
+                    if crate::common::may_still_run(&e) {
+                        self.abort(sql, request_id).await;
+                    }
+                    return Err(e);
+                }
+            };
+            // Not Snowflake's answer about the query (no `success`): it may still run.
+            if v.get("success").is_none() {
+                self.abort(sql, request_id).await;
+                return Err(ConnectorError::connection(format!("Snowflake: unexpected answer while waiting for the query: {}", truncate(&v.to_string(), 300))));
+            }
         }
         Self::check(&v)?;
         Ok(v["data"].clone())
@@ -468,7 +508,7 @@ impl Inner {
 
     async fn run_small(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
         let rid = uuid::Uuid::new_v4().to_string();
-        let data = self.query(sql, &rid, &databrain_connector_core::CancellationToken::new()).await?;
+        let data = self.query(sql, &rid, &databrain_connector_core::CancellationToken::new(), None).await?;
         let mut rows: Vec<Vec<Option<String>>> = data["rowset"]
             .as_array()
             .map(|a| a.iter().map(|r| r.as_array().map(|c| c.iter().map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default()).collect())
@@ -515,7 +555,7 @@ impl Inner {
 
     async fn stream(&self, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
         let rid = uuid::Uuid::new_v4().to_string();
-        let data = self.query(sql, &rid, &opts.cancel).await?;
+        let data = self.query(sql, &rid, &opts.cancel, Some(tx)).await?;
         tx.send(StreamEvent::Downloading(chunks_notice(&data))).await;
         let rowtype = data["rowtype"].as_array().cloned().unwrap_or_default();
         let stmt_type = data["statementTypeId"].as_i64().unwrap_or(0);
@@ -1161,11 +1201,85 @@ mod tests {
 
 #[cfg(test)]
 mod literal_tests {
+    use super::*;
+
     /// Snowflake reads `\` as an escape: a name holding `\'` stays one literal.
     #[test]
     fn names_with_a_backslash_stay_inside_the_literal() {
         assert_eq!(super::quote_literal("ORDERS"), "'ORDERS'");
         assert_eq!(super::quote_literal(r"X\' OR 1=1 --"), r"'X\\'' OR 1=1 --'");
         assert_eq!(super::quote_literal(r"ends\"), r"'ends\\'");
+    }
+
+    fn inner(origin: &str) -> Inner {
+        Inner {
+            base: origin.to_string(),
+            http: crate::common::http(),
+            token: Mutex::new(Tokens { session: "s".into(), master: "m".into() }),
+            request_seq: std::sync::atomic::AtomicU64::new(0),
+            state: databrain_connector_core::conn_state::ConnState::new(),
+        }
+    }
+
+    /// The query runs on: the submit answers "in progress", then each poll
+    /// gets `poll` (status 0: the connection drops).
+    async fn running(poll: (u16, &'static str)) -> (Inner, crate::mock_http::Log) {
+        let (origin, log) = crate::mock_http::serve(move |m, p, _| {
+            if m == "POST" && p.starts_with("/queries/v1/query-request?") {
+                (200, json!({"success": true, "code": "333334", "data": {"getResultUrl": "/queries/q1/result"}}).to_string())
+            } else if m == "GET" && p == "/queries/q1/result" {
+                (poll.0, poll.1.to_string())
+            } else if p.starts_with("/queries/v1/abort-request?") {
+                (200, json!({"success": true}).to_string())
+            } else {
+                (404, "{}".into())
+            }
+        })
+        .await;
+        (inner(&origin), log)
+    }
+
+    fn aborts(log: &crate::mock_http::Log) -> Vec<String> {
+        log.lock().unwrap().iter().filter(|(_, p, _)| p.starts_with("/queries/v1/abort-request")).map(|(_, _, b)| b.clone()).collect()
+    }
+
+    /// The submit carries one requestId, and an abort names that one.
+    #[tokio::test]
+    async fn a_failed_poll_aborts_the_query_it_submitted() {
+        for poll in [(0, ""), (502, "<html>Bad gateway</html>"), (200, "{\"unexpected\": 1}")] {
+            let (i, log) = running(poll).await;
+            let err = i.query("select 1", "rid-1", &databrain_connector_core::CancellationToken::new(), None).await.unwrap_err();
+            assert!(err.kind != ErrorKind::Query, "{poll:?}: {err:?}");
+            let submit = log.lock().unwrap().iter().find(|(_, p, _)| p.starts_with("/queries/v1/query-request")).unwrap().1.clone();
+            assert_eq!(submit.matches("requestId=").count(), 1, "{submit}");
+            assert!(submit.ends_with("requestId=rid-1"), "{submit}");
+            let a = aborts(&log);
+            assert_eq!(a.len(), 1, "{poll:?}");
+            assert!(a[0].contains("\"requestId\":\"rid-1\""), "{}", a[0]);
+        }
+    }
+
+    /// The server said how the query ended (failed, or done): nothing to abort.
+    #[tokio::test]
+    async fn a_query_that_ended_is_not_aborted() {
+        let failed: &'static str = r#"{"success": false, "code": "002003", "message": "Object 'T' does not exist", "data": {}}"#;
+        let done: &'static str = r#"{"success": true, "code": null, "data": {"rowtype": [], "rowset": []}}"#;
+        for (poll, ok) in [(failed, false), (done, true)] {
+            let (i, log) = running((200, poll)).await;
+            let r = i.query("select 1", "rid-2", &databrain_connector_core::CancellationToken::new(), None).await;
+            assert_eq!(r.is_ok(), ok);
+            assert!(aborts(&log).is_empty(), "{poll}");
+        }
+    }
+
+    /// Nobody reads the rows any more (the stream dropped): the query is aborted.
+    #[tokio::test]
+    async fn a_dropped_stream_aborts_the_query() {
+        let (i, log) = running((200, r#"{"success": true, "code": "333334", "data": {"getResultUrl": "/queries/q1/result"}}"#)).await;
+        let (tx, stream) = databrain_connector_core::QueryStream::channel(1);
+        drop(stream);
+        let err = i.query("select 1", "rid-3", &databrain_connector_core::CancellationToken::new(), Some(&tx)).await.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Cancelled);
+        assert_eq!(aborts(&log).len(), 1);
     }
 }

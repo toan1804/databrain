@@ -260,11 +260,13 @@ pub(crate) async fn thin_run(a: &agent::Agent, sql: &str, is_query: bool, opts: 
         let lines: Vec<String> = j["output"].as_array()?.iter().map(|l| l.as_str().unwrap_or("").to_string()).collect();
         output_notice(&lines, j["output_more"].as_bool().unwrap_or(false))
     }
-    let (id, mut r) = a.start(req).await?;
+    // Stopped while another statement holds the session: never sent.
+    let (id, mut r) = a.start_unless(req, &opts.cancel).await?;
     let mut builder: Option<(BatchBuilder, usize)> = None;
     let mut cancelled = false;
     // Stop asked (Stop button / row cap / consumer gone): tell the helper,
-    // then keep reading until it ends the request.
+    // then keep reading until it ends the request. Dropping a read in
+    // progress for it is safe: the reader keeps a part-read frame.
     loop {
         let frame = tokio::select! {
             f = agent::Agent::next(&mut r, id) => f?,

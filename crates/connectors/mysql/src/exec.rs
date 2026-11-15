@@ -73,6 +73,7 @@ async fn run_statement(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSend
         // be changed while that transaction runs).
         guard.query_drop("SET SESSION TRANSACTION READ ONLY").await.map_err(map_err)?;
     }
+    let sql_text = sql.clone();
     let mut result = guard.query_iter(sql).await.map_err(map_err)?;
 
     let columns = result.columns().unwrap_or_else(|| Arc::from(Vec::new()));
@@ -94,14 +95,23 @@ async fn run_statement(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSend
 
     let max = opts.max_rows.unwrap_or(usize::MAX);
     let mut rows = 0usize;
-    // Stopped before the end: the row limit, or the consumer went away.
+    // Stopped before the end: the row limit, the consumer went away, or Stop.
     let mut stopped = false;
+    let mut cancelled = false;
+    // At the row limit a statement that isn't a read (`CALL p()`, whose
+    // writes may come after its rows) runs to its end, its other rows
+    // discarded: stopping it would cut its work short and report success.
+    let mut ran_on = false;
     while let Some(row) = result.next().await.map_err(map_err)? {
         let vals = row.unwrap();
         builder.push_row(vals.into_iter().zip(types.iter()).map(|(v, t)| convert(*t, v)));
         rows += 1;
         if rows >= max {
-            stopped = true;
+            if databrain_connector_core::sql::classify(&sql_text, ConnectorKind::Mysql).kind.is_read() {
+                stopped = true;
+            } else {
+                ran_on = true;
+            }
             break;
         }
         if builder.is_full() && !tx.send(StreamEvent::Batch(builder.finish()?)).await {
@@ -109,10 +119,19 @@ async fn run_statement(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSend
             break;
         }
         if opts.cancel.is_cancelled() {
-            return Err(ConnectorError::cancelled());
+            // Stopped as the row limit stops it: the statement is ended on
+            // the server and the connection left ready (returning here left
+            // the result unread, and often no KILL QUERY was sent).
+            stopped = true;
+            cancelled = true;
+            break;
         }
     }
-    if stopped {
+    if ran_on {
+        // Every result set of the statement, to its end (Stop still kills it).
+        result.drop_result().await.map_err(map_err)?;
+        ctx.finished.store(true, Ordering::SeqCst);
+    } else if stopped {
         // The rest of the result is still coming. Reading it takes as long
         // as the whole result; a clean connection is replaced instead.
         drop(result);
@@ -131,6 +150,15 @@ async fn run_statement(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSend
         ctx.finished.store(true, Ordering::SeqCst);
     }
     drop(guard);
+    if cancelled {
+        return Err(ConnectorError::cancelled());
+    }
+    if ran_on {
+        tx.send(StreamEvent::Notice(format!(
+            "The statement isn't a read, so it ran to its end; only its first {rows} rows were kept (the rest were read and discarded)."
+        )))
+        .await;
+    }
     if !builder.is_empty() && !tx.send(StreamEvent::Batch(builder.finish()?)).await {
         return Ok(());
     }
@@ -139,6 +167,19 @@ async fn run_statement(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSend
     }
     tx.send(StreamEvent::Done(ExecSummary::default())).await;
     Ok(())
+}
+
+/// A cancel whose statement didn't stop within its wait: the connection
+/// was replaced (`replaced`), or couldn't be.
+pub(crate) fn stuck_cancel(replaced: bool) -> ConnectorError {
+    ConnectorError::new(
+        databrain_connector_core::ErrorKind::Cancelled,
+        if replaced {
+            "Query cancelled. It didn't stop within 10 s, so DataBrain ended its connection and opened a new one: an open transaction was rolled back and session settings were reset."
+        } else {
+            "Query cancelled. It didn't stop within 10 s, and a new connection couldn't be opened: reconnect before running more."
+        },
+    )
 }
 
 /// Open a new connection in place of `conn`, which is still receiving a

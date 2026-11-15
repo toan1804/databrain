@@ -59,10 +59,13 @@ impl OracleSession {
         let mut guard = BreakOnDrop { conn: conn.clone(), state: state.clone(), armed: true };
         let r = blocking(move || {
             let _g = lock.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?;
+            // Running first, then the check: a caller that gives up in
+            // between sees it running and breaks it, or it sees the caller gone.
+            state.running.store(true, Ordering::SeqCst);
             if state.abandoned.load(Ordering::SeqCst) {
+                state.running.store(false, Ordering::SeqCst);
                 return Err(ConnectorError::cancelled());
             }
-            state.running.store(true, Ordering::SeqCst);
             let r = f(&conn);
             state.running.store(false, Ordering::SeqCst);
             r
@@ -158,10 +161,16 @@ impl Session for OracleSession {
         let done = tokio_util_token();
         let (cancel, done2) = (opts.cancel.clone(), done.clone());
         let breaker = conn.clone();
+        // Stop breaks this statement only once it holds the session: while
+        // it waits, the statement running is another one's.
+        let state = Arc::new(CallState::default());
+        let st = state.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    let _ = tokio::task::spawn_blocking(move || breaker.break_execution()).await;
+                    if st.running.load(Ordering::SeqCst) {
+                        let _ = tokio::task::spawn_blocking(move || breaker.break_execution()).await;
+                    }
                 }
                 _ = done2.cancelled() => {}
             }
@@ -172,6 +181,13 @@ impl Session for OracleSession {
                 tx.blocking_send(Err(ConnectorError::internal("lock poisoned")));
                 return;
             };
+            // Stopped while it waited for the session: it doesn't run.
+            // Running is set first, so a Stop from now on breaks it.
+            state.running.store(true, Ordering::SeqCst);
+            if opts.cancel.is_cancelled() {
+                tx.blocking_send(Err(ConnectorError::cancelled()));
+                return;
+            }
             // Read-only: a new READ ONLY transaction per statement, so each
             // reads the data as it is now (one transaction reads as of its
             // start, which was the connect), and a COMMIT run in it can't
@@ -861,6 +877,60 @@ mod tests {
         assert_eq!(e.kind, ErrorKind::Cancelled, "{e:?}");
         assert!(t0.elapsed() < std::time::Duration::from_secs(10));
         assert_eq!(run("select 7 from dual").await.unwrap().num_rows(), 1);
+
+        // Stop in the middle of a large fetch (frames of up to 8 MB, so the
+        // Stop lands inside one): the session still answers, each time.
+        for _ in 0..5 {
+            let cancel = databrain_connector_core::CancellationToken::new();
+            let mut st = s
+                .execute(
+                    databrain_connector_core::Statement::internal("select level n, rpad('x', 2000, 'x') s from dual connect by level <= 300000"),
+                    ExecOptions { cancel: cancel.clone(), ..Default::default() },
+                )
+                .await
+                .unwrap();
+            while let Some(ev) = st.next().await {
+                if matches!(ev, Ok(databrain_connector_core::StreamEvent::Batch(_))) {
+                    cancel.cancel();
+                }
+                if ev.is_err() {
+                    break;
+                }
+            }
+            let ok = tokio::time::timeout(std::time::Duration::from_secs(20), run("select 7 from dual")).await;
+            assert_eq!(ok.expect("{driver}: session hangs after Stop").unwrap().num_rows(), 1, "{driver}");
+        }
+
+        // Stopped while another statement holds the session: it never runs.
+        let _ = run("drop table kb_wait purge").await;
+        run("create table kb_wait (n number)").await.unwrap();
+        let slow_cancel = databrain_connector_core::CancellationToken::new();
+        let slow = s
+            .execute(
+                databrain_connector_core::Statement::internal("select count(*) from all_objects a, all_objects b, all_objects c"),
+                ExecOptions { cancel: slow_cancel.clone(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let wait_cancel = databrain_connector_core::CancellationToken::new();
+        let waiting = s
+            .execute(
+                databrain_connector_core::Statement::internal("insert into kb_wait values (1)"),
+                ExecOptions { cancel: wait_cancel.clone(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        wait_cancel.cancel();
+        // Stopping the waiting one doesn't stop the running one.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        slow_cancel.cancel();
+        assert_eq!(waiting.collect().await.unwrap_err().kind, ErrorKind::Cancelled, "{driver}");
+        assert_eq!(slow.collect().await.unwrap_err().kind, ErrorKind::Cancelled, "{driver}");
+        let other = live_session(driver, false).await.unwrap();
+        assert_eq!(first(&other, "select count(*) from kb_wait").await, "0", "{driver}: the stopped insert didn't run");
+        run("drop table kb_wait purge").await.unwrap();
 
         // Row cap: stops early.
         let capped = s
