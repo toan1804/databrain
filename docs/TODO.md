@@ -41,16 +41,13 @@ Fixed on 2026-11-15: catalog queries built with a literal a backslash could end 
 - **MongoDB, Neo4j:** cancel and the row limit only drop the local future; the server keeps working. **ClickHouse** relies on the server noticing the closed response.
 - **Snowflake, BigQuery, Databricks:** a failed poll returns the error without cancelling the query on the server. Snowflake's submit URL carries two `requestId`s (the abort sends the first; which one the server uses is not confirmed). BigQuery polls and cancels with the configured location, not the job's.
 
-**Wrong results or state**
-- **Oracle:** `create … procedure` whose `end;` starts a line loses its final `;` (`prepare_sql` looks for `" END"`); a thick read-only session reads as of connect time; the thin read-only transaction may reconnect per statement (not confirmed); materialized views list as tables; `RAW` shows as `RAW(0)`; `DBMS_OUTPUT` is not read.
-- **Postgres, MySQL:** `transaction_state` is wrong after a failed `COMMIT` (Postgres observes the text before running it) and after DDL commits implicitly (MySQL).
-- **SQL Server:** `decimal(18,0)` shows as `12345.0`, `datetime` fractions are truncated, `money` goes through a float, `datetimeoffset` loses its offset; the `Prefer` fallback to no encryption never runs (tiberius returns an error, the code expects a panic); a database named `a.b` is split wrongly in all-databases mode.
-- **ClickHouse:** an exception mid-stream in a one-column result is shown as a row.
-- **MongoDB:** options the shell parser doesn't know are dropped (a `collation` on `deleteMany`), `deleteMany()` without a filter deletes everything, integers above 9.0e15 lose digits; `mapReduce` with an `out` document and `createCollection … viewOn` don't report the collections they touch.
-- **Neo4j:** durations and temporal values inside lists or maps are shown wrongly; a Cypher `\uXXXX` escape could hide a write keyword from the classifier (server behaviour not confirmed).
-- **SQLite:** a value that doesn't match its column's declared type shows as NULL; `max_rows` is not read; tables named `sqlite?…` are hidden (`_` is a LIKE wildcard).
-- **DuckDB:** attached-file views are created in the user's database (`files` schema), which fails on a read-only file and persists views in a writable one; a hostile `.xlsx` can use unbounded memory; `RETURNING` after a newline is not seen; Decimal256 outputs load as DOUBLE; one file can be opened twice (read-only and read-write); an output loaded inside a rolled-back transaction is remembered as loaded. A view the assistant made over `results.<name>` in one chat can be read by another chat on the same sandboxed instance.
-- **Databricks:** catalog reads are cut at 100,000 rows without notice; BINARY shows in three forms.
+**Wrong results or state** (fixed on 2026-11-15 except as follows; the rest was checked by unit tests only, live where noted)
+- **Oracle:** the thin driver's fixes need the helper release `oracle-agent/v0.1.3` published (`docs/RELEASING.md`) before an app release ships them. The Instant Client (thick) path, its per-statement read-only transaction and `DBMS_OUTPUT`, is not tested live (the thin one is, on Oracle Free 23). A `DBMS_OUTPUT` line longer than 8000 bytes is cut.
+- **SQL Server:** `money` comes from the driver as a float, so values beyond about ±900 billion may be off in the last digit; `datetimeoffset` is text with its offset, so it sorts as text, not by instant. Not run against a live server (the container never finished a login).
+- **SQLite:** a value that doesn't fit its column's type after the first batch (the type is chosen from the first batch) shows as NULL, with a notice.
+- **Neo4j:** whether the server decodes `\uXXXX` outside strings is not confirmed; the classifier reads both ways. Durations are read from the driver's debug output (neo4rs 0.8.0): recheck when upgrading.
+- **Databricks:** the 100,000-row metadata check relies on `manifest.truncated` (as documented; not seen on a live workspace).
+- **ClickHouse:** the mid-stream exception fix is tested against a fake server only.
 
 **Connections and secrets**
 - **TLS:** Postgres and MySQL `Prefer` falls back to plaintext, `Require` accepts any certificate (as libpq does); MySQL's fallback also triggers on a wrong password. Only `VerifyFull` verifies; there is no CA-file option.

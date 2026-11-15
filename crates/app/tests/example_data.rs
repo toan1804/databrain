@@ -230,7 +230,8 @@ async fn duckdb_attached_csv_and_parquet_files() {
     let id = duck_conn(&st);
 
     let schemas = api::list_schemas(&st, &id).await.unwrap();
-    let files = schemas.iter().find(|s| s.name.ends_with(".files")).expect("files schema").name.clone();
+    // Attached files are a catalog of their own (`files`), not a schema of the user's database.
+    let files = schemas.iter().find(|s| s.name == "files.main").unwrap_or_else(|| panic!("files catalog in {schemas:?}")).name.clone();
     let objects = api::list_objects(&st, &id, &files).await.unwrap();
     assert_eq!(objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["customers", "order_items", "orders", "orders_by_year", "products"]);
     assert!(objects.iter().all(|o| o.kind == ObjectKind::View));
