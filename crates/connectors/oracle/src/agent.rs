@@ -13,7 +13,7 @@ use std::sync::{Arc, RwLock};
 
 use databrain_connector_core::{ConnectorError, ErrorKind, Result, Value};
 use serde_json::{Value as Json, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// Wire protocol version (`Version` in main.go).
@@ -328,9 +328,79 @@ impl Frame {
 pub struct Agent {
     stdin: tokio::sync::Mutex<ChildStdin>,
     /// Held for the whole of a request (one request at a time).
-    stdout: tokio::sync::Mutex<BufReader<ChildStdout>>,
+    stdout: tokio::sync::Mutex<Reader>,
     next: AtomicU64,
     _child: std::sync::Mutex<Child>,
+}
+
+/// The helper's output, read a frame at a time.
+pub type Reader = FrameReader<BufReader<ChildStdout>>;
+
+/// Reads frames, keeping a frame read in part in itself, not in the
+/// future reading it: a read dropped midway (Stop during a fetch, a
+/// caller's timeout) loses no bytes, and the next read goes on where it
+/// stopped. Reading the stream in a future that can be dropped
+/// (`read_exact`) left the rest of a frame to be read as the next frame's
+/// header, and the session dead or hung.
+pub struct FrameReader<R> {
+    r: R,
+    /// The header read so far (5 bytes: u32 length, kind).
+    head: Vec<u8>,
+    /// The body read so far, once the header is complete.
+    body: Vec<u8>,
+}
+
+impl<R: AsyncBufRead + Unpin> FrameReader<R> {
+    pub fn new(r: R) -> Self {
+        FrameReader { r, head: Vec::with_capacity(5), body: Vec::new() }
+    }
+
+    /// Up to `want` more bytes into the header or the body. Cancel-safe:
+    /// `fill_buf` keeps what it read in the buffer, and bytes leave it
+    /// (`consume`) only once stored here, with no await in between.
+    async fn fill(&mut self, body: bool, want: usize) -> Result<()> {
+        let buf = self.r.fill_buf().await.map_err(dead)?;
+        if buf.is_empty() {
+            return Err(dead("end of output"));
+        }
+        let n = buf.len().min(want);
+        let into = if body { &mut self.body } else { &mut self.head };
+        into.extend_from_slice(&buf[..n]);
+        self.r.consume(n);
+        Ok(())
+    }
+
+    /// The next frame. Cancel-safe (see [`FrameReader`]).
+    pub async fn read(&mut self) -> Result<Frame> {
+        while self.head.len() < 5 {
+            self.fill(false, 5 - self.head.len()).await?;
+        }
+        let n = u32::from_be_bytes([self.head[0], self.head[1], self.head[2], self.head[3]]) as usize;
+        // The helper refuses a larger row; a larger length is a broken stream.
+        if n > MAX_FRAME {
+            return Err(dead(format!("a reply of {n} bytes is larger than a frame holds")));
+        }
+        if self.body.capacity() < n {
+            self.body.reserve_exact(n - self.body.len());
+        }
+        while self.body.len() < n {
+            self.fill(true, n - self.body.len()).await?;
+        }
+        let kind = self.head[4];
+        self.head.clear();
+        let mut b = std::mem::take(&mut self.body);
+        match kind {
+            b'J' => Ok(Frame::Json(serde_json::from_slice(&b).map_err(|e| dead(format!("bad reply: {e}")))?)),
+            b'B' if b.len() >= 16 => {
+                let id = u64::from_be_bytes(b[0..8].try_into().unwrap());
+                let ncols = u32::from_be_bytes(b[8..12].try_into().unwrap()) as usize;
+                let nrows = u32::from_be_bytes(b[12..16].try_into().unwrap()) as usize;
+                b.drain(..16);
+                Ok(Frame::Batch { id, ncols, nrows, data: b })
+            }
+            k => Err(dead(format!("unknown frame kind {k}"))),
+        }
+    }
 }
 
 fn dead(e: impl std::fmt::Display) -> ConnectorError {
@@ -372,7 +442,7 @@ impl Agent {
         let stdout = child.stdout.take().ok_or_else(|| dead("no stdout"))?;
         let a = Arc::new(Agent {
             stdin: tokio::sync::Mutex::new(stdin),
-            stdout: tokio::sync::Mutex::new(BufReader::with_capacity(1 << 20, stdout)),
+            stdout: tokio::sync::Mutex::new(FrameReader::new(BufReader::with_capacity(1 << 20, stdout))),
             next: AtomicU64::new(1),
             _child: std::sync::Mutex::new(child),
         });
@@ -395,32 +465,28 @@ impl Agent {
         w.flush().await.map_err(dead)
     }
 
-    async fn read(r: &mut BufReader<ChildStdout>) -> Result<Frame> {
-        let mut h = [0u8; 5];
-        r.read_exact(&mut h).await.map_err(dead)?;
-        let n = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
-        // The helper refuses a larger row; a larger length is a broken stream.
-        if n > MAX_FRAME {
-            return Err(dead(format!("a reply of {n} bytes is larger than a frame holds")));
-        }
-        let mut b = vec![0u8; n];
-        r.read_exact(&mut b).await.map_err(dead)?;
-        match h[4] {
-            b'J' => Ok(Frame::Json(serde_json::from_slice(&b).map_err(|e| dead(format!("bad reply: {e}")))?)),
-            b'B' if b.len() >= 16 => {
-                let id = u64::from_be_bytes(b[0..8].try_into().unwrap());
-                let ncols = u32::from_be_bytes(b[8..12].try_into().unwrap()) as usize;
-                let nrows = u32::from_be_bytes(b[12..16].try_into().unwrap()) as usize;
-                b.drain(..16);
-                Ok(Frame::Batch { id, ncols, nrows, data: b })
-            }
-            k => Err(dead(format!("unknown frame kind {k}"))),
-        }
+    /// Start a request; returns its id and the reader (held until done).
+    pub async fn start(&self, req: Json) -> Result<(u64, tokio::sync::MutexGuard<'_, Reader>)> {
+        let guard = self.stdout.lock().await;
+        self.start_with(guard, req).await
     }
 
-    /// Start a request; returns its id and the reader (held until done).
-    pub async fn start(&self, mut req: Json) -> Result<(u64, tokio::sync::MutexGuard<'_, BufReader<ChildStdout>>)> {
-        let guard = self.stdout.lock().await;
+    /// [`Self::start`], unless `cancel` fires while it waits for the helper
+    /// (another request holds it): then nothing is sent and the statement
+    /// doesn't run.
+    pub async fn start_unless(&self, req: Json, cancel: &databrain_connector_core::CancellationToken) -> Result<(u64, tokio::sync::MutexGuard<'_, Reader>)> {
+        let guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ConnectorError::cancelled()),
+            g = self.stdout.lock() => g,
+        };
+        if cancel.is_cancelled() {
+            return Err(ConnectorError::cancelled());
+        }
+        self.start_with(guard, req).await
+    }
+
+    async fn start_with<'a>(&self, guard: tokio::sync::MutexGuard<'a, Reader>, mut req: Json) -> Result<(u64, tokio::sync::MutexGuard<'a, Reader>)> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         req["id"] = json!(id);
         self.send(&req).await?;
@@ -428,13 +494,8 @@ impl Agent {
     }
 
     /// Next frame of request `id` (frames of abandoned earlier requests are skipped).
-    pub async fn next(r: &mut BufReader<ChildStdout>, id: u64) -> Result<Frame> {
-        loop {
-            let f = Self::read(r).await?;
-            if f.id() == id {
-                return Ok(f);
-            }
-        }
+    pub async fn next(r: &mut Reader, id: u64) -> Result<Frame> {
+        next_of(r, id).await
     }
 
     /// A request with a single reply (`ok`, `rows`, `done`); errors mapped.
@@ -467,6 +528,16 @@ impl Agent {
             .as_array()
             .map(|rows| rows.iter().map(|r| r.as_array().map(|c| c.iter().map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default()).collect())
             .unwrap_or_default())
+    }
+}
+
+/// Next frame of request `id` from `r` (see [`Agent::next`]).
+async fn next_of<R: AsyncBufRead + Unpin>(r: &mut FrameReader<R>, id: u64) -> Result<Frame> {
+    loop {
+        let f = r.read().await?;
+        if f.id() == id {
+            return Ok(f);
+        }
     }
 }
 
@@ -523,6 +594,95 @@ pub fn decode_rows(data: &[u8], ncols: usize, nrows: usize, mut row: impl FnMut(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn frame(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut f = (body.len() as u32).to_be_bytes().to_vec();
+        f.push(kind);
+        f.extend_from_slice(body);
+        f
+    }
+
+    /// A read dropped midway (Stop during a fetch: the read loses the
+    /// `select!` to the cancel) keeps what it read: the next read finishes
+    /// that frame, and the frames after it are read whole. Before, the
+    /// rest of the frame was read as the next header.
+    #[tokio::test]
+    async fn a_read_dropped_midway_loses_nothing() {
+        // A hang fails the test instead of blocking the run.
+        tokio::time::timeout(std::time::Duration::from_secs(10), a_read_dropped_midway_loses_nothing_body()).await.expect("hangs");
+    }
+
+    async fn a_read_dropped_midway_loses_nothing_body() {
+        let (mut w, r) = tokio::io::duplex(1 << 16);
+        let mut rd = FrameReader::new(BufReader::new(r));
+        let mut batch = 9u64.to_be_bytes().to_vec();
+        batch.extend_from_slice(&1u32.to_be_bytes());
+        batch.extend_from_slice(&1u32.to_be_bytes());
+        batch.extend_from_slice(&[0u8; 300]);
+        let mut bytes = frame(b'B', &batch);
+        bytes.extend(frame(b'J', br#"{"id":9,"type":"done"}"#));
+        let wait = std::time::Duration::from_millis(50);
+        // Part of the header, then part of the body: each read is dropped.
+        for cut in [3usize, 120] {
+            let at = if cut == 3 { 0 } else { 3 };
+            w.write_all(&bytes[at..cut]).await.unwrap();
+            assert!(tokio::time::timeout(wait, rd.read()).await.is_err(), "waits for the rest");
+        }
+        w.write_all(&bytes[120..]).await.unwrap();
+        match tokio::time::timeout(wait, rd.read()).await.unwrap().unwrap() {
+            Frame::Batch { id, ncols, nrows, data } => assert_eq!((id, ncols, nrows, data.len()), (9, 1, 1, 300)),
+            Frame::Json(j) => panic!("batch expected, got {j}"),
+        }
+        match tokio::time::timeout(wait, rd.read()).await.unwrap().unwrap() {
+            Frame::Json(j) => assert_eq!(j["type"], "done"),
+            Frame::Batch { .. } => panic!("the reply after it"),
+        }
+    }
+
+    /// A request stopped while another holds the helper is never sent.
+    /// `cat` stands in for the helper: it sends each request back, so what
+    /// it sends shows what was sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_request_stopped_while_waiting_is_not_sent() {
+        // A hang fails the test instead of blocking the run.
+        tokio::time::timeout(std::time::Duration::from_secs(10), a_request_stopped_while_waiting_is_not_sent_body()).await.expect("hangs");
+    }
+
+    #[cfg(unix)]
+    async fn a_request_stopped_while_waiting_is_not_sent_body() {
+        let mut child = Command::new("cat").stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        let a = Arc::new(Agent {
+            stdin: tokio::sync::Mutex::new(child.stdin.take().unwrap()),
+            stdout: tokio::sync::Mutex::new(FrameReader::new(BufReader::new(child.stdout.take().unwrap()))),
+            next: AtomicU64::new(1),
+            _child: std::sync::Mutex::new(child),
+        });
+        // Another request holds the helper; this one is stopped meanwhile.
+        let held = a.stdout.lock().await;
+        let cancel = databrain_connector_core::CancellationToken::new();
+        let (a2, c2) = (a.clone(), cancel.clone());
+        let waiting = tokio::spawn(async move { a2.start_unless(json!({"op": "exec", "sql": "delete from t"}), &c2).await.map(|(id, _)| id) });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        cancel.cancel();
+        let r = waiting.await.unwrap();
+        assert!(r.is_err_and(|e| e.kind == ErrorKind::Cancelled));
+        drop(held);
+        // The next request's echo is the first thing out: the stopped one never went.
+        let (id, mut r) = a.start(json!({"op": "ping"})).await.unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), r.read()).await.unwrap().unwrap() {
+            Frame::Json(j) => assert_eq!((j["op"].as_str(), j["id"].as_u64()), (Some("ping"), Some(id))),
+            Frame::Batch { .. } => panic!("echo expected"),
+        }
+        drop(r); // the request is done: the helper is free
+        // Not stopped: sent as before.
+        let (id, mut r) = a.start_unless(json!({"op": "exec"}), &databrain_connector_core::CancellationToken::new()).await.unwrap();
+        match r.read().await.unwrap() {
+            Frame::Json(j) => assert_eq!(j["id"].as_u64(), Some(id)),
+            Frame::Batch { .. } => panic!("echo expected"),
+        }
+    }
 
     /// Download + checksum, from a local server serving `target/oracle-agent/dist`.
     #[tokio::test]
