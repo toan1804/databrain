@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use databrain_auth::{Credential, CredentialSource};
-use databrain_connector_core::{ConnectorError, Result};
+use databrain_connector_core::{ConnectorError, Result, StreamSender};
 use secrecy::ExposeSecret;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -87,8 +87,21 @@ impl Inner {
         self.request(reqwest::Method::POST, self.base.clone(), Some(body)).await
     }
 
-    /// Wait until the statement finishes; returns the final response.
-    pub(super) async fn wait(&self, mut resp: serde_json::Value, cancel: &databrain_connector_core::CancellationToken) -> Result<serde_json::Value> {
+    /// Cancel a statement on the server, best effort.
+    async fn cancel_statement(&self, id: &str) {
+        let _ = self.request(reqwest::Method::POST, format!("{}/{id}/cancel", self.base), None).await;
+    }
+
+    /// Wait until the statement finishes; returns the final response. When
+    /// waiting fails in a way that may leave it running (the connection
+    /// broke, an unexpected answer), or nobody waits for it any more (`tx`
+    /// dropped), the statement is cancelled on the server before returning.
+    pub(super) async fn wait(
+        &self,
+        mut resp: serde_json::Value,
+        cancel: &databrain_connector_core::CancellationToken,
+        tx: Option<&StreamSender>,
+    ) -> Result<serde_json::Value> {
         let id = resp["statement_id"].as_str().unwrap_or_default().to_string();
         let mut backoff = Backoff::new();
         loop {
@@ -100,16 +113,35 @@ impl Inner {
                     return Err(ConnectorError::query(msg.to_string()).with_code(code.to_string()));
                 }
                 "CANCELED" => return Err(ConnectorError::cancelled()),
-                _ => {}
+                "PENDING" | "RUNNING" => {}
+                // Not an answer about the statement: it may still run.
+                _ => {
+                    if !id.is_empty() {
+                        self.cancel_statement(&id).await;
+                    }
+                    return Err(ConnectorError::connection(format!(
+                        "Databricks: unexpected answer while waiting for the statement: {}",
+                        crate::common::truncate(&resp.to_string(), 300)
+                    )));
+                }
             }
             tokio::select! {
                 _ = backoff.wait() => {}
-                _ = cancel.cancelled() => {
-                    let _ = self.request(reqwest::Method::POST, format!("{}/{id}/cancel", self.base), None).await;
-                    return Err(ConnectorError::cancelled());
-                }
+                _ = cancel.cancelled() => {}
             }
-            resp = self.request(reqwest::Method::GET, format!("{}/{id}", self.base), None).await?;
+            if crate::common::abandoned(cancel, tx) {
+                self.cancel_statement(&id).await;
+                return Err(ConnectorError::cancelled());
+            }
+            resp = match self.request(reqwest::Method::GET, format!("{}/{id}", self.base), None).await {
+                Ok(r) => r,
+                Err(e) => {
+                    if crate::common::may_still_run(&e) {
+                        self.cancel_statement(&id).await;
+                    }
+                    return Err(e);
+                }
+            };
         }
     }
 
@@ -119,11 +151,11 @@ impl Inner {
     pub(super) async fn run_small(&self, sql: &str) -> Result<Vec<Vec<serde_json::Value>>> {
         let cancel = databrain_connector_core::CancellationToken::new();
         let resp = self.submit(sql, Some(SMALL_ROWS)).await?;
-        let resp = match self.wait(resp, &cancel).await {
+        let resp = match self.wait(resp, &cancel, None).await {
             // Metadata of a huge catalog can pass 25 MiB: fetch it through links.
             Err(e) if is_inline_limit(&e.message) && !self.inline_only => {
                 let resp = self.submit_as(sql, Some(SMALL_ROWS), Disposition::ExternalLinks).await?;
-                self.wait(resp, &cancel).await?
+                self.wait(resp, &cancel, None).await?
             }
             r => r?,
         };
@@ -176,5 +208,69 @@ impl Inner {
         } else {
             *self.schema.lock().await = Some(t);
         }
+    }
+}
+
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+    use databrain_connector_core::{CancellationToken, ErrorKind, QueryStream};
+
+    /// A statement still running; each poll gets `poll` (status 0: the connection drops).
+    async fn running(poll: (u16, &'static str)) -> (Arc<Inner>, crate::mock_http::Log) {
+        let (origin, log) = crate::mock_http::serve(move |m, p, _| {
+            if m == "GET" && p == "/api/2.0/sql/statements/s9" {
+                (poll.0, poll.1.to_string())
+            } else if m == "POST" && p == "/api/2.0/sql/statements/s9/cancel" {
+                (200, "{}".into())
+            } else {
+                (404, "{}".into())
+            }
+        })
+        .await;
+        (super::super::testutil::mock::session(&origin, false).0, log)
+    }
+
+    fn cancels(log: &crate::mock_http::Log) -> usize {
+        log.lock().unwrap().iter().filter(|(m, p, _)| m == "POST" && p.ends_with("/s9/cancel")).count()
+    }
+
+    fn in_progress() -> serde_json::Value {
+        json!({"statement_id": "s9", "status": {"state": "RUNNING"}})
+    }
+
+    /// A poll that fails without the server saying how the statement ended: it is cancelled.
+    #[tokio::test]
+    async fn a_failed_poll_cancels_the_statement() {
+        for poll in [(0, ""), (502, "<html>Bad gateway</html>"), (200, r#"{"weird": 1}"#)] {
+            let (i, log) = running(poll).await;
+            let err = i.wait(in_progress(), &CancellationToken::new(), None).await.unwrap_err();
+            assert!(err.kind != ErrorKind::Query, "{poll:?}: {err:?}");
+            assert_eq!(cancels(&log), 1, "{poll:?}");
+        }
+    }
+
+    /// The server said how the statement ended (failed, done, or gone): nothing to cancel.
+    #[tokio::test]
+    async fn a_statement_that_ended_is_not_cancelled() {
+        let failed: &'static str = r#"{"statement_id": "s9", "status": {"state": "FAILED", "error": {"message": "TABLE_OR_VIEW_NOT_FOUND"}}}"#;
+        let done: &'static str = r#"{"statement_id": "s9", "status": {"state": "SUCCEEDED"}}"#;
+        let missing: &'static str = r#"{"error_code": "NOT_FOUND", "message": "statement s9 not found"}"#;
+        for (poll, ok) in [((200, failed), false), ((200, done), true), ((404, missing), false)] {
+            let (i, log) = running(poll).await;
+            assert_eq!(i.wait(in_progress(), &CancellationToken::new(), None).await.is_ok(), ok, "{poll:?}");
+            assert_eq!(cancels(&log), 0, "{poll:?}");
+        }
+    }
+
+    /// Nobody reads the rows any more (the stream dropped): the statement is cancelled.
+    #[tokio::test]
+    async fn a_dropped_stream_cancels_the_statement() {
+        let (i, log) = running((200, r#"{"statement_id": "s9", "status": {"state": "RUNNING"}}"#)).await;
+        let (tx, stream) = QueryStream::channel(1);
+        drop(stream);
+        let err = i.wait(in_progress(), &CancellationToken::new(), Some(&tx)).await.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Cancelled);
+        assert_eq!(cancels(&log), 1);
     }
 }

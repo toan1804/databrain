@@ -105,7 +105,13 @@ impl Inner {
     }
 
     /// Submit and wait, classifying failures for the fallbacks.
-    pub(super) async fn run_statement(&self, sql: &str, opts: &ExecOptions, disposition: Disposition) -> std::result::Result<serde_json::Value, StreamFail> {
+    pub(super) async fn run_statement(
+        &self,
+        sql: &str,
+        opts: &ExecOptions,
+        tx: &StreamSender,
+        disposition: Disposition,
+    ) -> std::result::Result<serde_json::Value, StreamFail> {
         let classify = |e: ConnectorError| {
             if disposition == Disposition::ArrowLinks && mentions_format(&e.message) {
                 StreamFail::Format(e)
@@ -116,7 +122,7 @@ impl Inner {
             }
         };
         let resp = self.submit_as(sql, opts.max_rows, disposition).await.map_err(classify)?;
-        let resp = self.wait(resp, &opts.cancel).await.map_err(classify)?;
+        let resp = self.wait(resp, &opts.cancel, Some(tx)).await.map_err(classify)?;
         if databrain_connector_core::sql::leading_keyword(sql) == "USE" {
             self.apply_use(sql).await;
         }
@@ -127,7 +133,7 @@ impl Inner {
     /// `fetch_parallel` at a time, decoded off the async runtime, and sent in order.
     pub(super) async fn stream_arrow(&self, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> std::result::Result<(), StreamFail> {
         use futures::StreamExt as _;
-        let resp = self.run_statement(sql, opts, Disposition::ArrowLinks).await?;
+        let resp = self.run_statement(sql, opts, tx, Disposition::ArrowLinks).await?;
         tx.send(StreamEvent::Downloading(links_notice(&resp))).await;
         let statement_id = resp["statement_id"].as_str().unwrap_or_default().to_string();
         let columns = manifest_columns(&resp);
@@ -191,7 +197,7 @@ impl Inner {
     }
 
     pub(super) async fn stream_as(&self, sql: &str, opts: &ExecOptions, tx: &StreamSender, disposition: Disposition) -> std::result::Result<(), StreamFail> {
-        let resp = self.run_statement(sql, opts, disposition).await?;
+        let resp = self.run_statement(sql, opts, tx, disposition).await?;
         tx.send(StreamEvent::Downloading(if disposition == Disposition::Inline { None } else { links_notice(&resp) })).await;
         let statement_id = resp["statement_id"].as_str().unwrap_or_default().to_string();
         let columns = manifest_columns(&resp);
