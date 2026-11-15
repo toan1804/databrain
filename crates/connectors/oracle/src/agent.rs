@@ -22,7 +22,11 @@ pub const PROTOCOL: &str = "1";
 /// 0.1.1: reconnects after a lost connection ("sql: connection is already closed").
 /// 0.1.2: columns go-ora can't decode (SDO_GEOMETRY, XMLTYPE, objects: "TTC
 ///        error") are converted to text on the server and the first page retried.
-pub const RELEASE: &str = "0.1.2";
+/// 0.1.3: a read-only connection's READ ONLY transaction is begun per
+///        statement on a context of its own (it was rolled back after each
+///        request, so every statement reconnected), and DBMS_OUTPUT is read
+///        after a block or CALL (`output` in the exec reply).
+pub const RELEASE: &str = "0.1.3";
 /// Where releases are published: `{base}/v{RELEASE}/{file}.gz`.
 pub const DEFAULT_BASE_URL: &str = "https://github.com/toan1804/databrain/releases/download/oracle-agent";
 /// `sha256  file` lines of the uncompressed binaries of [`RELEASE`].

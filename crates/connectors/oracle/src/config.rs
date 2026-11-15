@@ -69,14 +69,17 @@ pub(crate) async fn open(cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource
             // Read-only: one READ ONLY transaction, never committed (with
             // autocommit on, it would end right after it starts).
             c.set_autocommit(!read_only);
+            let _ = c.execute("alter session set nls_date_format = 'YYYY-MM-DD HH24:MI:SS'", &[]);
+            // put_line output is kept for the app to read after each block
+            // (no limit: the app reads it after every block or CALL).
+            let _ = c.execute("begin dbms_output.enable(null); end;", &[]);
             if read_only {
                 c.execute("set transaction read only", &[]).map_err(map_err)?;
             }
-            let _ = c.execute("alter session set nls_date_format = 'YYYY-MM-DD HH24:MI:SS'", &[]);
             Ok(c)
         })
         .await?;
-        Ok(OracleSession { backend: Backend::Thick { conn: Arc::new(conn), lock: Arc::new(Mutex::new(())) } })
+        Ok(OracleSession { backend: Backend::Thick { conn: Arc::new(conn), lock: Arc::new(Mutex::new(())), read_only } })
     }
 }
 

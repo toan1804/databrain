@@ -64,6 +64,8 @@ type request struct {
 	Binds     map[string]*string `json:"binds,omitempty"`
 	BatchSize int                `json:"batch_size,omitempty"`
 	MaxRows   int                `json:"max_rows,omitempty"`
+	// exec: read DBMS_OUTPUT afterwards ("output" in the reply).
+	Output bool `json:"output,omitempty"`
 
 	// db_type shown for columns converted to text by a retry (by position).
 	labels map[int]string
@@ -139,8 +141,23 @@ func errReply(id uint64, err error) map[string]any {
 	if errors.Is(err, context.Canceled) {
 		m["code"] = "cancelled"
 	}
+	var out *outputError
+	if errors.As(err, &out) {
+		m["output"] = out.lines
+		m["output_more"] = out.more
+	}
 	return m
 }
+
+// outputError: a failed statement and the DBMS_OUTPUT it wrote first.
+type outputError struct {
+	err   error
+	lines []string
+	more  bool
+}
+
+func (e *outputError) Error() string { return e.err.Error() }
+func (e *outputError) Unwrap() error { return e.err }
 
 // ---------------------------------------------------------------- connection
 
@@ -248,22 +265,79 @@ type q interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
+// target: the connection, or on a read-only connection a new READ ONLY
+// transaction for this statement. A new one each time: one transaction
+// reads the data as of its start, and the last one may have been ended
+// (a COMMIT run in it). It is begun with a context of its own: database/sql
+// rolls a transaction back when its context ends, and the request's ends
+// with the request (the next statement then found it gone and reconnected).
 func (s *session) target(ctx context.Context) (q, error) {
 	if !s.ro {
 		return s.conn, nil
 	}
-	if s.tx == nil {
-		tx, err := s.conn.BeginTx(ctx, nil)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := tx.ExecContext(ctx, "set transaction read only"); err != nil {
-			_ = tx.Rollback()
-			return nil, err
-		}
-		s.tx = tx
+	if s.tx != nil {
+		_ = s.tx.Rollback()
+		s.tx = nil
 	}
+	tx, err := s.conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, "set transaction read only"); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	s.tx = tx
 	return s.tx, nil
+}
+
+// outputSQL reads DBMS_OUTPUT lines, up to 8000 bytes per call (go-ora's
+// out-binds hold about 8 KB, and a call that fails loses the lines it
+// read): :1 the lines (each ended by a line break), :2 1 when none are
+// left, :3 a line that didn't fit in :1 (a longer one cut, ending in …).
+// Kept in sync with OUTPUT_SQL in src/exec.rs.
+const outputSQL = "declare l varchar2(32767); s integer := 0; b varchar2(8000); c varchar2(8000); " +
+	"begin loop dbms_output.get_line(l, s); exit when s <> 0; " +
+	"if nvl(lengthb(b), 0) + nvl(lengthb(l), 0) + 1 > 8000 then " +
+	"c := case when lengthb(l) > 8000 then substrb(l, 1, 7990) || '…' else l end; exit; end if; " +
+	"b := b || l || chr(10); end loop; :1 := b; :2 := s; :3 := c; end;"
+
+// Caps on the DBMS_OUTPUT read after one statement (as in src/exec.rs).
+const (
+	outputMaxLines = 10000
+	outputMaxBytes = 1 << 20
+)
+
+// readOutput returns the DBMS_OUTPUT lines the last statement wrote, and
+// whether more were left unread (past the caps). Errors end the reading:
+// the output is a convenience, never the statement's failure.
+func readOutput(ctx context.Context, t q) ([]string, bool) {
+	lines, bytes := []string{}, 0
+	for {
+		var chunk, carry sql.NullString
+		var done int64
+		if _, err := t.ExecContext(ctx, outputSQL,
+			go_ora.Out{Dest: &chunk, Size: 8000}, go_ora.Out{Dest: &done}, go_ora.Out{Dest: &carry, Size: 8000}); err != nil {
+			return lines, false
+		}
+		var got []string
+		if chunk.Valid {
+			got = strings.Split(strings.TrimSuffix(chunk.String, "\n"), "\n")
+		}
+		if carry.Valid {
+			got = append(got, carry.String)
+		}
+		for _, l := range got {
+			if len(lines) >= outputMaxLines || bytes+len(l) > outputMaxBytes {
+				return lines, true
+			}
+			bytes += len(l)
+			lines = append(lines, l)
+		}
+		if done != 0 {
+			return lines, false
+		}
+	}
 }
 
 // dsn builds the go-ora URL. `connect_string` may be an Easy Connect string
@@ -405,6 +479,8 @@ func (s *session) connect(ctx context.Context, r *request) error {
 		return err
 	}
 	_, _ = conn.ExecContext(ctx, "alter session set nls_date_format = 'YYYY-MM-DD HH24:MI:SS'")
+	// put_line output is kept for the app to read after each block or CALL.
+	_, _ = conn.ExecContext(ctx, "begin dbms_output.enable(null); end;")
 	s.db, s.conn, s.ro, s.req = db, conn, r.ReadOnly, r
 	return nil
 }
@@ -762,12 +838,24 @@ func (s *session) exec(ctx context.Context, w *writer, r *request) error {
 	}
 	res, err := t.ExecContext(ctx, r.SQL, args(r.Binds)...)
 	if err != nil {
+		// What the block printed before it failed goes with the error.
+		if r.Output && !lostConn(err) {
+			if lines, more := readOutput(context.Background(), t); len(lines) > 0 {
+				return &outputError{err: err, lines: lines, more: more}
+			}
+		}
 		return err
 	}
 	if isAlterSession(r.SQL) {
 		s.remember(r.SQL)
 	}
 	reply := map[string]any{"id": r.ID, "type": "done"}
+	if r.Output {
+		if lines, more := readOutput(ctx, t); len(lines) > 0 {
+			reply["output"] = lines
+			reply["output_more"] = more
+		}
+	}
 	if n, err := res.RowsAffected(); err == nil {
 		reply["rows_affected"] = n
 	}

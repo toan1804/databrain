@@ -55,16 +55,14 @@ impl OracleSession {
                    select cc.owner, cc.table_name, cc.column_name from all_constraints k \
                    join all_cons_columns cc on cc.owner = k.owner and cc.constraint_name = k.constraint_name \
                    where k.constraint_type = 'P' and k.owner in ({owners})) \
-                 select c.owner, c.table_name, c.column_name, \
-                   c.data_type || case when c.data_type in ('VARCHAR2','NVARCHAR2','CHAR','NCHAR','RAW') then '(' || c.char_length || ')' \
-                                       when c.data_type = 'NUMBER' and c.data_precision is not null then '(' || c.data_precision || ',' || c.data_scale || ')' \
-                                       else '' end, \
+                 select c.owner, c.table_name, c.column_name, {}, \
                    c.nullable, case when pk.column_name is not null then 'Y' else 'N' end, cm.comments \
                  from all_tab_columns c \
                  left join pk on pk.owner = c.owner and pk.table_name = c.table_name and pk.column_name = c.column_name \
                  left join all_col_comments cm on cm.owner = c.owner and cm.table_name = c.table_name and cm.column_name = c.column_name \
                  where c.owner in ({owners}) and c.table_name not like 'BIN$%' \
-                 order by c.owner, c.table_name, c.column_id"
+                 order by c.owner, c.table_name, c.column_id",
+                column_type_sql!()
             ))
             .await?;
         let columns = col_rows
@@ -117,11 +115,10 @@ impl OracleSession {
     pub(crate) async fn columns(&self, owner: &str, table: Option<&str>) -> Result<Vec<(String, ColumnInfo)>> {
         let rows = self
             .query_named(
-                "select c.table_name, c.column_name, \
-                   c.data_type || case when c.data_type in ('VARCHAR2','NVARCHAR2','CHAR','NCHAR','RAW') then '(' || c.char_length || ')' \
-                                       when c.data_type = 'NUMBER' and c.data_precision is not null then '(' || c.data_precision || ',' || c.data_scale || ')' \
-                                       else '' end, \
-                   c.nullable, \
+                concat!(
+                    "select c.table_name, c.column_name, ",
+                    column_type_sql!(),
+                    ", c.nullable, \
                    case when exists (select 1 from all_cons_columns cc join all_constraints k \
                         on k.owner = cc.owner and k.constraint_name = cc.constraint_name \
                         where k.constraint_type = 'P' and cc.owner = c.owner and cc.table_name = c.table_name and cc.column_name = c.column_name) \
@@ -130,7 +127,8 @@ impl OracleSession {
                  from all_tab_columns c \
                  left join all_col_comments cm on cm.owner = c.owner and cm.table_name = c.table_name and cm.column_name = c.column_name \
                  where c.owner = :owner and (:tbl is null or c.table_name = :tbl) \
-                 order by c.table_name, c.column_id",
+                 order by c.table_name, c.column_id"
+                ),
                 vec![("owner", Some(owner.to_string())), ("tbl", table.map(str::to_string))],
             )
             .await?;
@@ -289,6 +287,31 @@ pub(crate) fn binds(owner: &str, name: &str) -> Vec<(&'static str, Option<String
     vec![("o", Some(owner.to_string())), ("n", Some(name.to_string()))]
 }
 
+/// Names of the materialized views among catalog rows (`name_i`: the
+/// object name, `type_i`: its `object_type`).
+pub(crate) fn mview_names(rows: &[Vec<Option<String>>], name_i: usize, type_i: usize) -> std::collections::HashSet<String> {
+    rows.iter().filter(|r| r.get(type_i).cloned().flatten().as_deref() == Some("MATERIALIZED VIEW")).filter_map(|r| r.get(name_i).cloned().flatten()).collect()
+}
+
+/// The TABLE row Oracle also lists for a materialized view (its container
+/// table): left out, so the object is a materialized view, not a table.
+pub(crate) fn is_mview_table(r: &[Option<String>], name_i: usize, type_i: usize, mviews: &std::collections::HashSet<String>) -> bool {
+    r.get(type_i).cloned().flatten().as_deref() == Some("TABLE") && r.get(name_i).cloned().flatten().is_some_and(|n| mviews.contains(&n))
+}
+
+/// A column's type as the explorer shows it (`c`: ALL_TAB_COLUMNS):
+/// lengths in characters for text, in bytes for RAW (whose `char_length`
+/// is 0), precision and scale for NUMBER. A literal, for `concat!`.
+macro_rules! column_type_sql {
+    () => {
+        "c.data_type || case when c.data_type in ('VARCHAR2','NVARCHAR2','CHAR','NCHAR') then '(' || c.char_length || ')' \
+         when c.data_type = 'RAW' then '(' || c.data_length || ')' \
+         when c.data_type = 'NUMBER' and c.data_precision is not null then '(' || c.data_precision || ',' || c.data_scale || ')' \
+         else '' end"
+    };
+}
+pub(crate) use column_type_sql;
+
 pub(crate) fn kind_of(object_type: &str) -> ObjectKind {
     match object_type {
         "VIEW" => ObjectKind::View,
@@ -299,5 +322,33 @@ pub(crate) fn kind_of(object_type: &str) -> ObjectKind {
         "SEQUENCE" => ObjectKind::Sequence,
         "TYPE" => ObjectKind::Other,
         _ => ObjectKind::Table,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(name: &str, t: &str) -> Vec<Option<String>> {
+        vec![Some(name.into()), Some(t.into())]
+    }
+
+    /// A materialized view is listed as one, not as the TABLE Oracle also
+    /// lists under its name; a plain table stays.
+    #[test]
+    fn a_materialized_view_is_not_listed_as_its_table() {
+        let rows = vec![row("SALES_MV", "TABLE"), row("ORDERS", "TABLE"), row("SALES_MV", "MATERIALIZED VIEW")];
+        let mv = mview_names(&rows, 0, 1);
+        let kept: Vec<(String, String)> =
+            rows.iter().filter(|r| !is_mview_table(r, 0, 1, &mv)).map(|r| (r[0].clone().unwrap(), r[1].clone().unwrap())).collect();
+        assert_eq!(kept, [("ORDERS".to_string(), "TABLE".to_string()), ("SALES_MV".to_string(), "MATERIALIZED VIEW".to_string())]);
+    }
+
+    /// RAW's length is its data_length (char_length is 0 for it).
+    #[test]
+    fn raw_length_is_in_bytes() {
+        let sql = column_type_sql!();
+        assert!(sql.contains("when c.data_type = 'RAW' then '(' || c.data_length || ')'"));
+        assert!(!sql.contains("'NCHAR','RAW'"));
     }
 }
