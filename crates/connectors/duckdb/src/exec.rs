@@ -4,7 +4,6 @@ use databrain_connector_core::arrow::ipc::reader::StreamReader;
 use databrain_connector_core::external::ExternalTablesSlot;
 use databrain_connector_core::{ConnectorError, ExecOptions, ExecSummary, Result, StreamEvent, StreamSender};
 
-use crate::database::Loaded;
 use crate::engine::load_extension;
 use crate::error::map_err;
 use crate::outputs::load_outputs;
@@ -23,6 +22,19 @@ pub(crate) fn convert_batch(b: &arrow58::record_batch::RecordBatch) -> Result<da
 
 /// Whether a statement that ran (and failed) may be run a second time to
 /// find its error: only one the classifier calls a read.
+/// Whether `sql` gives rows: a query, or a write with `RETURNING` (as a
+/// word of the code, after any space or line break; not in a string or a
+/// comment).
+fn returns_rows(sql: &str) -> bool {
+    let kw = databrain_connector_core::sql::leading_keyword(sql);
+    matches!(
+        kw.as_str(),
+        "SELECT" | "WITH" | "FROM" | "VALUES" | "TABLE" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "SUMMARIZE" | "PRAGMA" | "PIVOT" | "UNPIVOT" | "CALL"
+    ) || databrain_connector_core::sql::code_text(sql, databrain_connector_core::ConnectorKind::Duckdb)
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|w| w.eq_ignore_ascii_case("returning"))
+}
+
 fn safe_to_run_again(sql: &str) -> bool {
     databrain_connector_core::sql::classify(sql, databrain_connector_core::ConnectorKind::Duckdb).kind.is_read()
 }
@@ -34,14 +46,16 @@ pub(crate) fn run(
     opts: &ExecOptions,
     tx: &StreamSender,
     outputs: Option<&ExternalTablesSlot>,
-    loaded: &Loaded,
     shared: bool,
     sandboxed: bool,
 ) -> Result<()> {
     if sandboxed {
         crate::sandbox::refuse_file_writes(sql)?;
+        if shared {
+            crate::sandbox::refuse_shared_views(sql)?;
+        }
     }
-    for n in load_outputs(conn, sql, outputs, loaded, opts.output_masks.as_deref(), shared, sandboxed)? {
+    for n in load_outputs(conn, sql, outputs, opts.output_masks.as_deref(), shared, sandboxed)? {
         tx.blocking_send(Ok(StreamEvent::Notice(n)));
     }
     // Load the extension a query needs (bundled copy first).
@@ -52,12 +66,7 @@ pub(crate) fn run(
         }
     }
     let mut stmt = conn.prepare(sql).map_err(map_err)?;
-    let kw = databrain_connector_core::sql::leading_keyword(sql);
-    let returns_rows = matches!(
-        kw.as_str(),
-        "SELECT" | "WITH" | "FROM" | "VALUES" | "TABLE" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "SUMMARIZE" | "PRAGMA" | "PIVOT" | "UNPIVOT" | "CALL"
-    ) || lower.contains(" returning ");
-    if !returns_rows {
+    if !returns_rows(sql) {
         let n = stmt.execute([]).map_err(map_err)?;
         tx.blocking_send(Ok(StreamEvent::Done(ExecSummary { rows_affected: Some(n as u64) })));
         return Ok(());
@@ -128,7 +137,7 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
 
-    use super::safe_to_run_again;
+    use super::{returns_rows, safe_to_run_again};
     use crate::test_util::*;
     use databrain_auth::AuthMethod;
 
@@ -159,6 +168,39 @@ mod tests {
         let e = tokio::time::timeout(std::time::Duration::from_secs(10), st.collect()).await.unwrap().unwrap_err();
         assert!(e.is_cancelled(), "{e:?}");
         assert_eq!(q(s.as_ref(), "select 1").await.num_rows(), 1);
+    }
+
+    /// `RETURNING` after a line break, a tab or a parenthesis gives rows; the
+    /// word in a string or a comment doesn't.
+    #[test]
+    fn returning_anywhere_in_the_code() {
+        for sql in [
+            "insert into t values (1)\nreturning *",
+            "insert into t values (1)\treturning a",
+            "update t set a = 1\nRETURNING(a)",
+            "delete from t where a = 1 returning *",
+            "select 1",
+        ] {
+            assert!(returns_rows(sql), "{sql:?}");
+        }
+        for sql in [
+            "insert into t values ('returning')",
+            "insert into t values (1) -- returning *",
+            "update t set a = 1 /* returning a */",
+            "insert into t (returning_x) values (1)",
+            "create table t (a int)",
+        ] {
+            assert!(!returns_rows(sql), "{sql:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_returning_after_a_newline_gives_its_rows() {
+        let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        q(s.as_ref(), "create table t (a int)").await;
+        let r = q(s.as_ref(), "insert into t values (7), (8)\nreturning a * 10 as x").await;
+        assert_eq!(r.num_rows(), 2);
+        assert_eq!(r.batches[0].schema().field(0).name(), "x");
     }
 
     /// After DuckDB interrupts itself, only a read is run again to find the

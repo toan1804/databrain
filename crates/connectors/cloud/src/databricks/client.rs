@@ -14,6 +14,9 @@ use crate::common::{Backoff, json_body, net_err};
 use super::download::first_link;
 use super::stream::{Disposition, is_inline_limit};
 
+/// Most rows a metadata query ([`Inner::run_small`]) reads.
+pub(super) const SMALL_ROWS: usize = 100_000;
+
 pub struct DbxSession(pub(super) Arc<Inner>);
 
 pub(super) struct Inner {
@@ -110,17 +113,25 @@ impl Inner {
         }
     }
 
+    /// Rows of a metadata query, at most [`SMALL_ROWS`]. Past that it fails
+    /// rather than returning part of the list as if it were all of it: a
+    /// catalog's bulk read then goes schema by schema.
     pub(super) async fn run_small(&self, sql: &str) -> Result<Vec<Vec<serde_json::Value>>> {
         let cancel = databrain_connector_core::CancellationToken::new();
-        let resp = self.submit(sql, Some(100_000)).await?;
+        let resp = self.submit(sql, Some(SMALL_ROWS)).await?;
         let resp = match self.wait(resp, &cancel).await {
             // Metadata of a huge catalog can pass 25 MiB: fetch it through links.
             Err(e) if is_inline_limit(&e.message) && !self.inline_only => {
-                let resp = self.submit_as(sql, Some(100_000), Disposition::ExternalLinks).await?;
+                let resp = self.submit_as(sql, Some(SMALL_ROWS), Disposition::ExternalLinks).await?;
                 self.wait(resp, &cancel).await?
             }
             r => r?,
         };
+        if resp.pointer("/manifest/truncated").and_then(|t| t.as_bool()) == Some(true) {
+            return Err(ConnectorError::query(format!(
+                "Databricks returned only the first {SMALL_ROWS} rows of this metadata query; the list would be incomplete"
+            )));
+        }
         let id = resp["statement_id"].as_str().unwrap_or_default().to_string();
         let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
         let mut chunk = resp.get("result").cloned();

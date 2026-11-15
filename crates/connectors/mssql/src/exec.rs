@@ -3,7 +3,7 @@
 use crate::config::Conn;
 use crate::error::map_err;
 use crate::types::col_type;
-use crate::types::convert;
+use crate::types::convert_typed;
 use databrain_connector_core::BatchBuilder;
 use databrain_connector_core::ConnState;
 use databrain_connector_core::ConnectorKind;
@@ -96,6 +96,8 @@ pub(crate) async fn run(
 pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &StreamSender, replaceable: bool, state: &ConnState) -> Result<Ended> {
     let mut stream = conn.simple_query(sql).await.map_err(map_err)?;
     let mut builder: Option<BatchBuilder> = None;
+    // Per column: money (the driver's float is turned back into exact text).
+    let mut money: Vec<bool> = Vec::new();
     let mut extra_sets = 0usize;
     let mut rows = 0usize;
     let max = opts.max_rows.unwrap_or(usize::MAX);
@@ -107,6 +109,7 @@ pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &St
                     extra_sets += 1;
                     continue;
                 }
+                money = meta.columns().iter().map(|c| matches!(c.column_type(), tiberius::ColumnType::Money | tiberius::ColumnType::Money4)).collect();
                 let cols: Vec<Column> = meta
                     .columns()
                     .iter()
@@ -126,7 +129,7 @@ pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &St
                     continue;
                 }
                 let Some(b) = builder.as_mut() else { continue };
-                b.push_row(row.into_iter().map(convert));
+                b.push_row(row.into_iter().enumerate().map(|(i, v)| convert_typed(v, money.get(i).copied().unwrap_or(false))));
                 rows += 1;
                 if rows >= max {
                     // The caller keeps no more rows.

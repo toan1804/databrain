@@ -460,6 +460,59 @@ mod tests {
         run("drop database ex_a").await;
     }
 
+    /// Live: the transaction state follows the server. DDL commits the open
+    /// transaction by itself (BEGIN's text said one was open); a failed
+    /// statement inside one, or a read, leaves it open.
+    #[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_transaction_state_follows_the_server() {
+        use databrain_connector_core::TxState;
+        let Ok(host) = std::env::var("DATABRAIN_MYSQL_HOST") else {
+            panic!("live test: DATABRAIN_MYSQL_HOST not set (run with --ignored)");
+        };
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        let user = std::env::var("DATABRAIN_MYSQL_USER").unwrap_or_else(|_| "root".into());
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Mysql, AuthMethod::Password { user: user.clone() });
+        cfg.host = Some(host);
+        cfg.port = std::env::var("DATABRAIN_MYSQL_PORT").ok().and_then(|p| p.parse().ok());
+        let creds = Arc::new(InlineCredentialSource::new(
+            AuthMethod::Password { user },
+            std::env::var("DATABRAIN_MYSQL_PASSWORD").ok().map(secrecy::SecretString::from),
+        ));
+        let s = MysqlConnector.connect(&cfg, creds).await.unwrap();
+        let run = |sql: &'static str| {
+            let s = &s;
+            async move {
+                match s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await {
+                    Ok(st) => st.collect().await.is_ok(),
+                    Err(_) => false,
+                }
+            }
+        };
+        for sql in ["drop database if exists kb_tx", "create database kb_tx", "create table kb_tx.t (id int primary key) engine=innodb", "begin"] {
+            assert!(run(sql).await, "{sql}");
+        }
+        // Still open: a write, a read and a failed statement keep it.
+        assert!(run("insert into kb_tx.t values (1)").await);
+        assert!(run("select * from kb_tx.t").await);
+        assert!(!run("select * from kb_tx.missing").await);
+        assert_eq!(s.transaction_state(), TxState::Open);
+        // DDL commits it.
+        assert!(run("create table kb_tx.u (x int)").await);
+        assert_eq!(s.transaction_state(), TxState::None, "DDL committed the transaction");
+        // A failed statement that names one: what the server says.
+        assert!(!run("start transaction bogus").await);
+        assert_eq!(s.transaction_state(), TxState::None);
+        // Autocommit off: a write opens one, DDL ends it.
+        assert!(run("set autocommit = 0").await);
+        assert!(run("insert into kb_tx.t values (2)").await);
+        assert_eq!(s.transaction_state(), TxState::Open);
+        assert!(run("drop table kb_tx.u").await);
+        assert_eq!(s.transaction_state(), TxState::None);
+        assert!(run("set autocommit = 1").await);
+        assert!(run("drop database kb_tx").await);
+    }
+
     /// Live test: set DATABRAIN_MYSQL_HOST (+ _USER, _PASSWORD, _DB).
     #[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
     #[tokio::test]

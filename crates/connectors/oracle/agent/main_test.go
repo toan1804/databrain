@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"syscall"
 	"testing"
 
@@ -48,5 +52,110 @@ func TestRetriesAfterReconnect(t *testing.T) {
 	// No connect request yet: nothing to reconnect with, the error is returned as is.
 	if !errors.Is(err, sql.ErrConnDone) || calls != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
+
+func TestSessionSetupReplaysTheLastValue(t *testing.T) {
+	s := &session{}
+	for _, q := range []string{
+		"alter session set current_schema = A",
+		"alter session set nls_date_format = 'YYYY-MM-DD HH24:MI:SS'",
+		"ALTER SESSION SET CURRENT_SCHEMA=B",
+		"/* again */ alter session set current_schema = A",
+		"alter session enable parallel dml",
+		"alter session disable parallel dml",
+	} {
+		if !isAlterSession(q) {
+			t.Fatalf("%q: not ALTER SESSION", q)
+		}
+		s.remember(q)
+	}
+	var got []string
+	for _, x := range s.setup {
+		got = append(got, x.sql)
+	}
+	want := []string{
+		"alter session set nls_date_format = 'YYYY-MM-DD HH24:MI:SS'",
+		"/* again */ alter session set current_schema = A",
+		"alter session disable parallel dml",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("replay %q, want %q", got, want)
+	}
+
+	// More settings than the old cap of 64: none is lost, one per setting.
+	s = &session{}
+	for i := 0; i < 200; i++ {
+		s.remember(fmt.Sprintf("alter session set p%d = %d", i%100, i))
+	}
+	if len(s.setup) != 100 || s.setup[99].sql != "alter session set p99 = 199" {
+		t.Fatalf("%d kept, last %q", len(s.setup), s.setup[len(s.setup)-1].sql)
+	}
+
+	// A statement setting two keeps its place until both are set again.
+	s = &session{}
+	s.remember("alter session set a = 1 b = 'x y'")
+	s.remember("alter session set a = 2")
+	if len(s.setup) != 2 {
+		t.Fatalf("b is still set by the first: %v", s.setup)
+	}
+	s.remember("alter session set b = 3")
+	if len(s.setup) != 2 || s.setup[0].sql != "alter session set a = 2" {
+		t.Fatalf("the first is replaced by the two after it: %v", s.setup)
+	}
+	// Unread forms are kept by their text.
+	s = &session{}
+	s.remember("alter session set events '10046 trace name context forever'")
+	s.remember("alter session set events '10046 trace name context off'")
+	if len(s.setup) != 2 {
+		t.Fatalf("events kept in order: %v", s.setup)
+	}
+	if isAlterSession("select 1 from dual") || isAlterSession("-- alter session set x = 1\nselect 1 from dual") {
+		t.Fatal("not ALTER SESSION")
+	}
+}
+
+func TestTnsAliasAfterIfileAndInIt(t *testing.T) {
+	text := "IFILE = /x/other.ora\nSALES = (DESCRIPTION=(ADDRESS=(HOST=h)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=s)))\n"
+	if d, ok := findAlias(text, "sales"); !ok || d[:12] != "(DESCRIPTION" {
+		t.Fatalf("alias after IFILE: %q %v", d, ok)
+	}
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(p, s string) {
+		if err := os.WriteFile(p, []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(dir, "tnsnames.ora"), "# main\nIFILE = sub/more.ora\nLOOP = (DESCRIPTION=(x))\n")
+	write(filepath.Join(sub, "more.ora"), "HR.WORLD = (DESCRIPTION=(hr))\nIFILE = more.ora\n")
+	if d, err := tnsLookupIn([]string{dir}, "hr"); err != nil || d != "(DESCRIPTION=(hr))" {
+		t.Fatalf("alias in an IFILE: %q %v", d, err)
+	}
+	if d, err := tnsLookupIn([]string{dir}, "loop"); err != nil || d != "(DESCRIPTION=(x))" {
+		t.Fatalf("alias after an IFILE that includes itself: %q %v", d, err)
+	}
+	if _, err := tnsLookupIn([]string{dir}, "nope"); err == nil {
+		t.Fatal("missing alias found")
+	}
+}
+
+func TestFrameLimit(t *testing.T) {
+	old := maxFrame
+	maxFrame = 100
+	defer func() { maxFrame = old }()
+	var buf bytes.Buffer
+	w := &writer{w: bufio.NewWriter(&buf)}
+	if err := w.frame('B', make([]byte, 101)); err == nil {
+		t.Fatal("an oversized frame was written")
+	}
+	if buf.Len() != 0 {
+		t.Fatal("part of it reached the stream")
+	}
+	if err := w.frame('B', make([]byte, 100)); err != nil || buf.Len() != 105 {
+		t.Fatalf("%v, %d bytes", err, buf.Len())
 	}
 }

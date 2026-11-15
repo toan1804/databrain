@@ -11,7 +11,48 @@ use crate::types::{col_type, parse_text, type_name};
 use crate::wkb;
 
 pub(crate) async fn run(link: Arc<Link>, sql: String, opts: ExecOptions, tx: StreamSender, finished: Arc<AtomicBool>) -> Result<()> {
+    // The statement's text says what it does to the transaction before it
+    // runs; one that failed may not have done it (`BEGIN ISOLATION LEVEL
+    // bogus`, `COMMIT AND CHAIN` outside a transaction or after a failed
+    // deferred constraint): then the server is asked.
     link.state.observe(&sql, ConnectorKind::Postgres);
+    let res = run_statement(&link, sql.clone(), opts, tx, finished).await;
+    if res.is_err() && names_transaction(&sql) {
+        let client = link.client();
+        if let Some(open) = server_in_transaction(&client).await {
+            link.state.set_depth(u32::from(open));
+        }
+    }
+    res
+}
+
+/// The statement may begin or end a transaction: it has one of the words
+/// (in a comment too: then only a needless question to the server).
+pub(crate) fn names_transaction(sql: &str) -> bool {
+    sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|w| ["BEGIN", "START", "COMMIT", "ROLLBACK", "END", "ABORT", "PREPARE", "CHAIN"].iter().any(|k| w.eq_ignore_ascii_case(k)))
+}
+
+/// Whether a transaction is open, asked of the server: a savepoint can only
+/// be set inside one (released at once), and inside one that failed the
+/// server refuses it with its own code. None when the answer is neither
+/// (Redshift, a lost connection): the statement's text stays the guess.
+pub(crate) async fn server_in_transaction(client: &tokio_postgres::Client) -> Option<bool> {
+    use tokio_postgres::error::SqlState;
+    match client.simple_query("SAVEPOINT databrain_tx_probe").await {
+        Ok(_) => {
+            let _ = client.simple_query("RELEASE SAVEPOINT databrain_tx_probe").await;
+            Some(true)
+        }
+        Err(e) => match e.code() {
+            Some(c) if *c == SqlState::NO_ACTIVE_SQL_TRANSACTION => Some(false),
+            Some(c) if *c == SqlState::IN_FAILED_SQL_TRANSACTION => Some(true),
+            _ => None,
+        },
+    }
+}
+
+async fn run_statement(link: &Arc<Link>, sql: String, opts: ExecOptions, tx: StreamSender, finished: Arc<AtomicBool>) -> Result<()> {
     let client = link.client();
     let stmt = client.prepare(&sql).await.map_err(|e| map_err(&e))?;
 

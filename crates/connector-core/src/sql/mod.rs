@@ -23,8 +23,8 @@ pub use params::{ParamSpan, ParamValue, find_parameters, quote_string, render_pa
 pub use parsed::{ParsedStatement, parse_script};
 pub use read_only::{read_only_allows, unknown_functions};
 pub use redact::{redact_key_values, redact_secrets, redact_text, redact_url_passwords};
-pub use splitter::{StatementSpan, leading_keyword, split_statements, split_with, statement_at};
-pub(crate) use splitter::{code_text, code_text_values, skip_token, words};
+pub use splitter::{StatementSpan, code_text, leading_keyword, split_statements, split_with, statement_at};
+pub(crate) use splitter::{code_text_values, skip_token, words};
 pub use statement::{Checked, Statement};
 
 pub fn dialect_for(kind: ConnectorKind) -> Box<dyn Dialect> {

@@ -21,30 +21,92 @@ pub fn split_whole(text: &str) -> Vec<StatementSpan> {
 /// Read, write or schema change, by the language's own keywords.
 pub fn classify(text: &str, language: QueryLanguage) -> Classification {
     let keyword = leading_keyword(text);
-    let has = |list: &[&str]| words(text).any(|w| list.iter().any(|k| w.eq_ignore_ascii_case(k)));
     let kind = match language {
         QueryLanguage::Sql => unreachable!("SQL is classified in sql::classify"),
         QueryLanguage::Cypher => {
-            if has(&["CONSTRAINT", "INDEX"]) && has(&["CREATE", "DROP"]) {
-                StatementKind::Ddl
-            } else if has(&["CREATE", "INSERT", "MERGE", "SET", "DELETE", "DETACH", "REMOVE", "DROP", "LOAD", "FOREACH"]) {
-                // INSERT: Neo4j 5's GQL spelling of CREATE.
-                StatementKind::Dml
-            } else if has(&["TERMINATE"]) {
-                // `SHOW TRANSACTIONS YIELD … TERMINATE TRANSACTIONS …` ends others' work.
-                StatementKind::Other
-            } else if has(&["CALL"]) {
-                // Procedures may write.
-                StatementKind::Unknown
-            } else if matches!(keyword.as_str(), "MATCH" | "OPTIONAL" | "WITH" | "RETURN" | "UNWIND" | "SHOW" | "EXPLAIN" | "PROFILE") {
-                StatementKind::Read
+            let written = cypher_kind(text);
+            // Cypher has `\uXXXX` escapes. Should the server decode them
+            // before it reads keywords (as Java character streams may),
+            // `CREATE` is CREATE: read both ways, the stricter wins.
+            // An escape that can't be decoded: Unknown.
+            if text.contains("\\u") || text.contains("\\U") {
+                match decode_unicode_escapes(text) {
+                    Some(decoded) => written.max(cypher_kind(&decoded)),
+                    None => StatementKind::Unknown,
+                }
             } else {
-                StatementKind::Unknown
+                written
             }
         }
         QueryLanguage::MongoJson => mongo_kind(text),
     };
-    Classification { kind, missing_where: false, keyword }
+    // `deleteMany({})`, `updateMany({}, …)`: confirmed as a write without
+    // WHERE is, named by its method (`DELETEMANY`, not the leading `db`).
+    let missing_where = language == QueryLanguage::MongoJson && mongo_info(text).flatten().is_some_and(|i| i.every_document);
+    let keyword = if missing_where { mongo_op(&text.to_ascii_lowercase()).map(|o| o.to_ascii_uppercase()).unwrap_or(keyword) } else { keyword };
+    Classification { kind, missing_where, keyword }
+}
+
+/// A Cypher statement by its keywords (anywhere in the text: a word in a
+/// string counts too, the safe side).
+fn cypher_kind(text: &str) -> StatementKind {
+    let keyword = leading_keyword(text);
+    let has = |list: &[&str]| words(text).any(|w| list.iter().any(|k| w.eq_ignore_ascii_case(k)));
+    if has(&["CONSTRAINT", "INDEX"]) && has(&["CREATE", "DROP"]) {
+        StatementKind::Ddl
+    } else if has(&["CREATE", "INSERT", "MERGE", "SET", "DELETE", "DETACH", "REMOVE", "DROP", "LOAD", "FOREACH"]) {
+        // INSERT: Neo4j 5's GQL spelling of CREATE.
+        StatementKind::Dml
+    } else if has(&["TERMINATE"]) {
+        // `SHOW TRANSACTIONS YIELD … TERMINATE TRANSACTIONS …` ends others' work.
+        StatementKind::Other
+    } else if has(&["CALL"]) {
+        // Procedures may write.
+        StatementKind::Unknown
+    } else if matches!(keyword.as_str(), "MATCH" | "OPTIONAL" | "WITH" | "RETURN" | "UNWIND" | "SHOW" | "EXPLAIN" | "PROFILE") {
+        StatementKind::Read
+    } else {
+        StatementKind::Unknown
+    }
+}
+
+/// `text` with every `\uXXXX` and `\UXXXXXXXX` replaced by its character
+/// (a UTF-16 surrogate pair as one); `None` when one is malformed.
+fn decode_unicode_escapes(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find('\\') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let digits = match after.as_bytes().first() {
+            Some(b'u') => 4,
+            Some(b'U') => 8,
+            // `\\`: a backslash, never the start of an escape (`'C:\\users'`).
+            Some(b'\\') => {
+                out.push_str("\\\\");
+                rest = &after[1..];
+                continue;
+            }
+            _ => {
+                out.push('\\');
+                rest = after;
+                continue;
+            }
+        };
+        let hex = after.get(1..1 + digits).filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))?;
+        let mut code = u32::from_str_radix(hex, 16).ok()?;
+        rest = &after[1 + digits..];
+        if (0xD800..0xDC00).contains(&code) {
+            // A high surrogate: its low half follows as `\uXXXX`.
+            let low =
+                rest.strip_prefix("\\u").and_then(|r| r.get(..4)).and_then(|h| u32::from_str_radix(h, 16).ok()).filter(|l| (0xDC00..0xE000).contains(l))?;
+            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+            rest = &rest[6..];
+        }
+        out.push(char::from_u32(code)?);
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// What a MongoDB command does, from the shell parser the MongoDB connector
@@ -55,6 +117,9 @@ pub struct MongoInfo {
     /// Collections read and written, `[db, coll]` or `[coll]`.
     pub reads: Vec<Vec<String>>,
     pub writes: Vec<Vec<String>>,
+    /// An update or delete of many documents with an empty filter: it
+    /// changes every document of the collection (SQL's write without WHERE).
+    pub every_document: bool,
     /// `$lookup` equalities between the aggregated collection's fields and
     /// another collection's (only where the field still is the collection's:
     /// see the connector's analyzer).
@@ -318,6 +383,27 @@ mod tests {
         // Still reads: the words in a string or a property name aren't statements.
         assert_eq!(k("SHOW TRANSACTIONS", L::Cypher), S::Read);
         assert_eq!(k("MATCH (n) RETURN n.inserted_at", L::Cypher), S::Read);
+    }
+
+    /// A `\uXXXX` escape can't hide a write keyword: the text is read as
+    /// written and decoded, and the stricter reading wins.
+    #[test]
+    fn cypher_unicode_escapes_dont_hide_writes() {
+        let k = |t: &str| classify(t, QueryLanguage::Cypher).kind;
+        use StatementKind as S;
+        // Refused as a read.
+        assert_eq!(k(r"MATCH (n) \u0043REATE (m:X)"), S::Dml);
+        assert_eq!(k(r"MATCH (n) \u0064\u0065\u006c\u0065\u0074\u0065 n"), S::Dml);
+        assert_eq!(k(r"MATCH (n) \U00000044ELETE n"), S::Dml);
+        assert_eq!(k(r"MATCH (n) RETURN '\u0027 \u0043REATE (x) //'"), S::Dml, "an escaped quote that may end the string");
+        assert_eq!(k(r"\u0043ALL db.x()"), S::Unknown);
+        assert_eq!(k(r"MATCH (n) RETURN '\u00ZZ'"), S::Unknown, "malformed: can't tell");
+        assert_eq!(k(r"RETURN '\uD83D'"), S::Unknown, "a lone surrogate");
+        // Still reads.
+        assert_eq!(k(r"MATCH (n) WHERE n.name = 'caf\u00e9' RETURN n"), S::Read);
+        assert_eq!(k(r"RETURN '\uD83D\uDE00' AS smile"), S::Read);
+        assert_eq!(k(r"MATCH (n) WHERE n.path = 'C:\\users\\an' RETURN n"), S::Read);
+        assert_eq!(decode_unicode_escapes(r"a\u0043\\u0043\U0001F600").as_deref(), Some(r"aC\\u0043😀"));
     }
 
     #[test]

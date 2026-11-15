@@ -17,7 +17,19 @@ pub fn analyze(text: &str) -> Option<MongoInfo> {
     let mut a = Acc { db: plan.db.clone(), reads: vec![], writes: vec![] };
     let kind = command_kind(&plan.command, &mut a, 0);
     let joins = lookups(&plan.command, plan.db.as_deref());
-    Some(MongoInfo { kind, reads: a.reads, writes: a.writes, joins })
+    Some(MongoInfo { kind, reads: a.reads, writes: a.writes, every_document: every_document(&plan.command), joins })
+}
+
+/// A delete of every match (`limit: 0`) or an update of every match
+/// (`multi: true`) whose filter is empty: every document of the collection.
+fn every_document(cmd: &Document) -> bool {
+    let empty = |d: &Document| d.get_document("q").is_ok_and(Document::is_empty);
+    let statements = |key: &str| cmd.get_array(key).into_iter().flatten().filter_map(Bson::as_document);
+    match command_name(cmd).map(str::to_ascii_lowercase).as_deref() {
+        Some("delete") => statements("deletes").any(|d| empty(d) && d.get("limit").is_some_and(|l| l.as_i64().or(l.as_i32().map(i64::from)) == Some(0))),
+        Some("update") => statements("updates").any(|d| empty(d) && d.get_bool("multi").unwrap_or(false)),
+        _ => false,
+    }
 }
 
 /// Equality `$lookup`s (`localField` / `foreignField`) at the top of an
@@ -119,6 +131,15 @@ fn command_kind(cmd: &Document, a: &mut Acc, depth: usize) -> StatementKind {
         }
         "create" | "drop" | "createindexes" | "dropindexes" | "collmod" => {
             main(a, true);
+            // A view (`createCollection("v", {viewOn: "orders", pipeline})`)
+            // shows its source's documents: it reads them, and what its
+            // pipeline looks up.
+            if let Ok(source) = cmd.get_str("viewOn") {
+                a.read(None, source);
+            }
+            if let Ok(p) = cmd.get_array("pipeline") {
+                pipeline(p, a, depth);
+            }
             K::Ddl
         }
         "renamecollection" | "dropdatabase" => K::Ddl,
@@ -130,7 +151,16 @@ fn command_kind(cmd: &Document, a: &mut Acc, depth: usize) -> StatementKind {
                     a.write(None, c);
                     K::Dml
                 }
-                _ => K::Dml,
+                // `{replace | merge | reduce: "coll", db: "other"}`.
+                Some(Bson::Document(d)) => match ["replace", "merge", "reduce"].iter().find_map(|k| d.get_str(k).ok()) {
+                    Some(c) => {
+                        a.write(d.get_str("db").ok(), c);
+                        K::Dml
+                    }
+                    None => K::Unknown,
+                },
+                // Where it writes can't be told.
+                _ => K::Unknown,
             }
         }
         // EXPLAIN of a command counts as the command (as in SQL).
@@ -297,5 +327,53 @@ mod tests {
         assert_eq!(kind("db.orders.aggregate([{$facet: {x: [{$facet: {y: [{$match: {}}]}}]}}])"), StatementKind::Read);
         let i = analyze("db.getSiblingDB('hr').getCollection('pay').deleteMany({})").unwrap();
         assert_eq!(names(&i.writes), ["hr.pay"]);
+    }
+
+    /// A delete or update of every document asks, as SQL without WHERE does.
+    #[test]
+    fn writes_to_every_document() {
+        let every = |t: &str| analyze(t).unwrap().every_document;
+        for t in [
+            "db.t.deleteMany({})",
+            "db.t.updateMany({}, {$set: {a: 1}})",
+            r#"{"delete": "t", "deletes": [{"q": {}, "limit": 0}]}"#,
+            r#"db.runCommand({update: 't', updates: [{q: {a: 1}, u: {}}, {q: {}, u: {$set: {b: 1}}, multi: true}]})"#,
+        ] {
+            assert!(every(t), "{t}");
+        }
+        for t in ["db.t.deleteMany({a: 1})", "db.t.deleteOne({})", "db.t.updateOne({}, {$set: {a: 1}})", "db.t.replaceOne({}, {a: 1})", "db.t.find({})"] {
+            assert!(!every(t), "{t}");
+        }
+        // As the app classifies it: confirmed, named by its method.
+        databrain_connector_core::language::set_mongo_analyzer(analyze);
+        let c = databrain_connector_core::language::classify("db.orders.deleteMany({})", databrain_connector_core::traits::QueryLanguage::MongoJson);
+        assert!(c.missing_where && c.kind == StatementKind::Dml);
+        assert_eq!(c.keyword, "DELETEMANY");
+        let c = databrain_connector_core::language::classify("db.orders.deleteMany({a: 1})", databrain_connector_core::traits::QueryLanguage::MongoJson);
+        assert!(!c.missing_where && c.kind == StatementKind::Dml);
+        // No filter at all: not run (as in mongosh), and never a read.
+        assert_eq!(
+            databrain_connector_core::language::classify("db.orders.deleteMany()", databrain_connector_core::traits::QueryLanguage::MongoJson).kind,
+            StatementKind::Unknown
+        );
+    }
+
+    /// mapReduce into a collection and a view report the collections they touch.
+    #[test]
+    fn map_reduce_outputs_and_views() {
+        let i = analyze("use shop\ndb.runCommand({mapReduce: 'orders', map: 'function(){}', reduce: 'function(){}', out: {merge: 'totals', db: 'reports'}})")
+            .unwrap();
+        assert_eq!((i.kind, names(&i.reads), names(&i.writes)), (StatementKind::Dml, vec!["shop.orders".to_string()], vec!["reports.totals".to_string()]));
+        let i = analyze("db.runCommand({mapReduce: 'orders', map: 'f', reduce: 'g', out: {replace: 'totals'}})").unwrap();
+        assert_eq!(names(&i.writes), ["totals"]);
+        assert_eq!(kind("db.runCommand({mapReduce: 'orders', map: 'f', reduce: 'g', out: {inline: 1}})"), StatementKind::Read);
+        assert_eq!(kind("db.runCommand({mapReduce: 'orders', map: 'f', reduce: 'g', out: {elsewhere: 1}})"), StatementKind::Unknown);
+        assert_eq!(kind("db.runCommand({mapReduce: 'orders', map: 'f', reduce: 'g'})"), StatementKind::Unknown);
+        let i = analyze("use shop\ndb.createCollection('big_orders', {viewOn: 'orders', pipeline: [{$match: {total: {$gt: 100}}}, {$lookup: {from: 'customers', localField: 'c', foreignField: '_id', as: 'c'}}]})").unwrap();
+        assert_eq!(i.kind, StatementKind::Ddl);
+        assert_eq!(names(&i.reads), ["shop.orders", "shop.customers"]);
+        assert_eq!(names(&i.writes), ["shop.big_orders"]);
+        let i = analyze("db.runCommand({collMod: 'v', viewOn: 'payroll', pipeline: []})").unwrap();
+        assert_eq!(names(&i.reads), ["payroll"]);
     }
 }

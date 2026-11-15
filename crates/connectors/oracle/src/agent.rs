@@ -22,7 +22,11 @@ pub const PROTOCOL: &str = "1";
 /// 0.1.1: reconnects after a lost connection ("sql: connection is already closed").
 /// 0.1.2: columns go-ora can't decode (SDO_GEOMETRY, XMLTYPE, objects: "TTC
 ///        error") are converted to text on the server and the first page retried.
-pub const RELEASE: &str = "0.1.2";
+/// 0.1.3: a read-only connection's READ ONLY transaction is begun per
+///        statement on a context of its own (it was rolled back after each
+///        request, so every statement reconnected), and DBMS_OUTPUT is read
+///        after a block or CALL (`output` in the exec reply).
+pub const RELEASE: &str = "0.1.3";
 /// Where releases are published: `{base}/v{RELEASE}/{file}.gz`.
 pub const DEFAULT_BASE_URL: &str = "https://github.com/toan1804/databrain/releases/download/oracle-agent";
 /// `sha256  file` lines of the uncompressed binaries of [`RELEASE`].
@@ -44,6 +48,10 @@ static PROGRESS: RwLock<Option<ProgressHook>> = RwLock::new(None);
 pub fn set_dir(dir: Option<PathBuf>) {
     *DIR.write().unwrap() = dir;
 }
+
+/// The largest frame the helper sends (`maxFrame` in agent/main.go): it
+/// refuses a row larger than this rather than wrap the 32-bit length.
+const MAX_FRAME: usize = 1 << 30;
 
 /// Override the download location (setting / `DATABRAIN_ORACLE_AGENT_URL`).
 pub fn set_base_url(url: Option<String>) {
@@ -391,6 +399,10 @@ impl Agent {
         let mut h = [0u8; 5];
         r.read_exact(&mut h).await.map_err(dead)?;
         let n = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+        // The helper refuses a larger row; a larger length is a broken stream.
+        if n > MAX_FRAME {
+            return Err(dead(format!("a reply of {n} bytes is larger than a frame holds")));
+        }
         let mut b = vec![0u8; n];
         r.read_exact(&mut b).await.map_err(dead)?;
         match h[4] {

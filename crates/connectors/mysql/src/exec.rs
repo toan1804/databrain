@@ -41,6 +41,28 @@ pub(crate) struct Ctx {
 }
 
 pub(crate) async fn run(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSender) -> Result<()> {
+    let res = run_statement(ctx, sql, opts, tx).await;
+    // The statement's text guessed the transaction (BEGIN, COMMIT…); the
+    // server says after each statement whether one is open, which also
+    // covers DDL and other statements that commit by themselves. A failed
+    // statement leaves no new answer: a `DO 0` asks.
+    let mut conn = ctx.conn.lock().await;
+    if res.is_err() {
+        let _ = conn.query_drop("DO 0").await;
+    }
+    sync_transaction(&ctx.state, &conn);
+    res
+}
+
+/// The transaction as the server last reported it (its OK packet's
+/// `SERVER_STATUS_IN_TRANS`) replaces the guess from statement text.
+pub(crate) fn sync_transaction(state: &ConnState, conn: &Conn) {
+    if let Some(p) = conn.last_ok_packet() {
+        state.set_depth(u32::from(p.status_flags().contains(StatusFlags::SERVER_STATUS_IN_TRANS)));
+    }
+}
+
+async fn run_statement(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSender) -> Result<()> {
     let mut guard = ctx.conn.lock().await;
     ctx.state.observe(&sql, ConnectorKind::Mysql);
     // An open transaction counts too, also one a procedure started.

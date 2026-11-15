@@ -15,7 +15,7 @@ use crate::files::detect_format;
 pub(crate) fn seal(conn: &duckdb::Connection, files: &[String]) -> Result<()> {
     let attached: bool = conn.query_row("SELECT count(*) > 0 FROM duckdb_databases() WHERE database_name = 'results'", [], |r| r.get(0)).map_err(map_err)?;
     if !attached {
-        conn.execute_batch(&format!("ATTACH ':memory:' AS {RESULTS_SCHEMA}")).map_err(map_err)?;
+        conn.execute_batch(&format!("ATTACH ':memory:' AS {RESULTS_SCHEMA} (READ_WRITE)")).map_err(map_err)?;
     }
     let (dirs, paths) = sandbox_allowed(files);
     let list = |v: &[String]| v.iter().map(|p| quote_literal(p)).collect::<Vec<_>>().join(", ");
@@ -61,6 +61,52 @@ pub(crate) fn refuse_file_writes(sql: &str) -> Result<()> {
     Err(databrain_connector_core::ConnectorError::query(format!(
         "{what} is not run here: SQL from the assistant runs in a DuckDB sandbox that reads the attached files and never writes files. Use a job's export step, or run it yourself."
     )))
+}
+
+/// For a sealed instance on a database file other chats share: no view or
+/// macro is kept in the file (nor anywhere but this session's `temp`) that
+/// could read DataBrain's outputs. `results.<name>` holds what was loaded
+/// last, by any chat, and only a statement that names `results.<name>` is
+/// checked: a kept view over it would let another chat read an output it
+/// was never given. Read on the words of the whole text, strings and
+/// comments included (`query('select * from results.x')` counts), and
+/// `query` / `query_table` (which can build the name) count as well: a
+/// statement that merely mentions them is refused too, which errs on the
+/// safe side. `CREATE TEMP VIEW` stays: only this session sees it.
+pub(crate) fn refuse_shared_views(sql: &str) -> Result<()> {
+    let code: Vec<String> = databrain_connector_core::sql::code_text(sql, databrain_connector_core::ConnectorKind::Duckdb)
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect();
+    // CREATE [OR REPLACE] [TEMP | TEMPORARY] {VIEW | MACRO | FUNCTION}, or ALTER VIEW.
+    let mut w = code.iter().map(String::as_str);
+    let kept = match w.next() {
+        Some("CREATE") => {
+            let mut rest: Vec<&str> = w.take(4).collect();
+            if rest.first() == Some(&"OR") {
+                rest.drain(..rest.len().min(2));
+            }
+            match rest.first() {
+                Some(&("TEMP" | "TEMPORARY")) => false,
+                Some(&("VIEW" | "MACRO" | "FUNCTION")) => true,
+                _ => false,
+            }
+        }
+        Some("ALTER") => w.next() == Some("VIEW"),
+        _ => false,
+    };
+    if !kept {
+        return Ok(());
+    }
+    let lower = sql.to_ascii_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).collect();
+    if !words.iter().any(|w| matches!(*w, "results" | "query" | "query_table")) {
+        return Ok(());
+    }
+    Err(databrain_connector_core::ConnectorError::query(
+        "A view or macro over DataBrain outputs (results.<name>) is not kept in a database file other chats use: they would read the output through it. Make it temporary (CREATE TEMP VIEW …), which only this chat sees.",
+    ))
 }
 
 /// (folders, files) a sealed instance may still read: the attached files
@@ -215,6 +261,63 @@ mod tests {
         assert_eq!(q(&*s2, "select * from files.sales").await.num_rows(), 2);
         let e = q_err(&*s2, &format!("select * from read_csv({})", quote_literal(&dir.path().join("secret.csv").to_string_lossy()))).await;
         assert!(e.message.contains("sandbox"), "{}", e.message);
+    }
+
+    /// What a sealed session on a shared file may keep: views and macros
+    /// that can't read `results`, and temporary ones of any kind.
+    #[test]
+    fn kept_views_over_outputs_are_refused() {
+        for sql in [
+            "create temp view v as select * from results.sales",
+            "CREATE OR REPLACE TEMPORARY VIEW v AS SELECT * FROM results.sales",
+            "create temp macro m() as table select * from results.sales",
+            "create view v as select * from t",
+            "create table t2 as select * from t",
+            "select * from results.sales",
+            "create macro twice(x) as x * 2",
+        ] {
+            assert!(refuse_shared_views(sql).is_ok(), "{sql}");
+        }
+        for sql in [
+            "create view v as select * from results.sales",
+            "CREATE OR REPLACE VIEW v AS SELECT * FROM results /* x */ . sales",
+            "create view v as select * from \"results\".sales",
+            "create view v as select * from query('select * from results.sales')",
+            "create view v as select * from query_table('res' || 'ults.sales')",
+            "create macro m() as table select * from results.sales",
+            "create or replace function f() as table select * from results.sales",
+            "/* note */ create view v as select * from results.sales",
+            "alter view v rename to results",
+        ] {
+            let e = refuse_shared_views(sql).expect_err(sql);
+            assert!(e.message.contains("CREATE TEMP VIEW"), "{sql}: {}", e.message);
+        }
+    }
+
+    /// Two chats' sandboxed sessions on one database file: a kept view that
+    /// could read outputs is refused there (not in a private in-memory
+    /// sandbox), and a temporary one is seen only by the session that made it.
+    #[tokio::test]
+    async fn chats_sharing_a_file_cant_leave_views_over_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("local.duckdb");
+        duckdb::Connection::open(&db).unwrap().execute_batch("CREATE TABLE t AS SELECT 1 AS a").unwrap();
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+        cfg.file_path = Some(db.to_string_lossy().into_owned());
+        cfg.options.insert(SANDBOX_OPTION.into(), "1".into());
+        let a = session(cfg.clone()).await;
+        let b = session(cfg).await;
+        let e = q_err(&*a, "create view leak as select 1 as results").await;
+        assert!(e.message.contains("CREATE TEMP VIEW"), "{}", e.message);
+        q(&*a, "create view plain as select * from t").await;
+        q(&*a, "create temp view mine as select 1 as results").await;
+        assert_eq!(q(&*a, "select * from mine").await.num_rows(), 1);
+        assert!(b.execute(databrain_connector_core::Statement::internal("select * from mine"), ExecOptions::default()).await.unwrap().collect().await.is_err());
+        assert_eq!(q(&*b, "select * from plain").await.num_rows(), 1);
+        // A private sandbox (in memory, one session) may keep it.
+        let mut mem = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+        mem.options.insert(SANDBOX_OPTION.into(), "1".into());
+        q(&*session(mem).await, "create view kept as select 1 as results").await;
     }
 
     #[test]

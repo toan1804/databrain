@@ -104,13 +104,57 @@ pub(crate) fn files_of(cfg: &ConnectionConfig) -> Vec<String> {
     cfg.opt("files").map(|f| f.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect()).unwrap_or_default()
 }
 
-/// Create `files.<name>` views over attached files. Unreadable files are
-/// skipped with a comment on the view list rather than failing the connection.
+/// The catalog the attached files' views live in: an in-memory database
+/// attached to the instance, so they are never written into the user's
+/// database (a read-only file can't take them; a writable one would keep
+/// them). Named `files`, so `files.<name>` reads them, unless the user's
+/// database has a `files` schema of its own (then `attached_files`).
+pub const FILES_CATALOG: &str = "files";
+const FILES_CATALOG_ALT: &str = "attached_files";
+
+/// Drop the `files.<name>` views earlier versions created in the user's
+/// database (each commented `File: …`), and the schema once it is empty. A
+/// read-only file keeps them (nothing is written).
+fn drop_old_file_views(conn: &duckdb::Connection) {
+    let old: Vec<String> = conn
+        .prepare(
+            "select view_name from duckdb_views() where database_name = current_database() and schema_name = 'files' \
+             and not internal and starts_with(coalesce(comment, ''), 'File: ')",
+        )
+        .and_then(|mut s| s.query_map([], |r| r.get::<_, String>(0))?.collect())
+        .unwrap_or_default();
+    for v in old {
+        let _ = conn.execute_batch(&format!("DROP VIEW IF EXISTS files.{}", quote_ident(ConnectorKind::Duckdb, &v)));
+    }
+    if !old_files_schema_has_objects(conn) {
+        let _ = conn.execute_batch("DROP SCHEMA IF EXISTS files");
+    }
+}
+
+fn old_files_schema_has_objects(conn: &duckdb::Connection) -> bool {
+    conn.query_row(
+        "select count(*) > 0 from (select 1 from duckdb_tables() where database_name = current_database() and schema_name = 'files' \
+         union all select 1 from duckdb_views() where database_name = current_database() and schema_name = 'files' and not internal)",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or(true)
+}
+
+/// Whether the user's database has a `files` schema (which `files.x` would also name).
+fn has_files_schema(conn: &duckdb::Connection) -> bool {
+    conn.query_row("select count(*) > 0 from duckdb_schemas() where database_name = current_database() and schema_name = 'files'", [], |r| r.get(0))
+        .unwrap_or(false)
+}
+
+/// Create `files.<name>` views over attached files, in [`FILES_CATALOG`].
 pub(crate) fn attach_files(conn: &duckdb::Connection, files: &[String], all_sheets: bool) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
-    conn.execute_batch("CREATE SCHEMA IF NOT EXISTS files").map_err(map_err)?;
+    drop_old_file_views(conn);
+    let catalog = if has_files_schema(conn) { FILES_CATALOG_ALT } else { FILES_CATALOG };
+    conn.execute_batch(&format!("ATTACH IF NOT EXISTS ':memory:' AS {catalog} (READ_WRITE)")).map_err(map_err)?;
     let mut taken = Vec::new();
     for f in files {
         let Some(fmt) = detect_format(f) else { continue };
@@ -141,11 +185,12 @@ pub(crate) fn attach_files(conn: &duckdb::Connection, files: &[String], all_shee
             views.push((name, scan_expr(f, fmt), format!("File: {f}")));
         }
         for (name, src, note) in views {
-            let sql = format!("CREATE OR REPLACE VIEW files.{} AS SELECT * FROM {src}", quote_ident(ConnectorKind::Duckdb, &name));
+            let view = format!("{catalog}.main.{}", quote_ident(ConnectorKind::Duckdb, &name));
+            let sql = format!("CREATE OR REPLACE VIEW {view} AS SELECT * FROM {src}");
             if let Err(e) = conn.execute_batch(&sql) {
                 return Err(ConnectorError::new(ErrorKind::Config, format!("cannot read {f}: {e}")));
             }
-            let _ = conn.execute_batch(&format!("COMMENT ON VIEW files.{} IS {}", quote_ident(ConnectorKind::Duckdb, &name), quote_literal(&note)));
+            let _ = conn.execute_batch(&format!("COMMENT ON VIEW {view} IS {}", quote_literal(&note)));
         }
     }
     Ok(())
@@ -191,12 +236,11 @@ mod tests {
         cfg.options.insert("files".into(), format!("{}\n{}", csv.display(), json.display()));
         let s = session(cfg).await;
 
-        // Attached files appear in the explorer as views.
+        // Attached files appear in the explorer as views, in their own catalog.
         let schemas = s.list_schemas().await.unwrap();
-        let files = schemas.iter().find(|x| x.name.ends_with(".files")).unwrap();
+        let files = schemas.iter().find(|x| x.name == "files.main").unwrap();
         let files_schema = files.name.clone();
-        // Three-level names: database (catalog) → schema.
-        assert_eq!(files.name, format!("{}.files", files.catalog.as_deref().unwrap()));
+        assert_eq!(files.catalog.as_deref(), Some("files"));
         let hits = s.search_objects("ale", 10).await.unwrap();
         assert_eq!(hits.iter().map(|o| (o.schema.as_str(), o.name.as_str())).collect::<Vec<_>>(), vec![(files_schema.as_str(), "sales")]);
         assert_eq!(s.search_objects("files.ev", 10).await.unwrap()[0].name, "events");
@@ -245,6 +289,67 @@ mod tests {
             assert_eq!(names, cols, "{name}");
             assert_eq!(r.num_rows(), rows, "{name}");
         }
+    }
+
+    /// The views over attached files are never written into the database
+    /// file: a read-only file takes them, a writable one doesn't keep them,
+    /// and the views an earlier version kept there are dropped (a schema
+    /// `files` of the user's own stays, and the views move aside).
+    #[tokio::test]
+    async fn attached_files_stay_out_of_the_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("sales.csv");
+        std::fs::write(&csv, "region,amount\nEU,10\nUS,5\n").unwrap();
+        let db = dir.path().join("lake.duckdb").to_string_lossy().into_owned();
+        let plain = || {
+            let mut c = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+            c.file_path = Some(db.clone());
+            c
+        };
+        let with_files = |read_only: bool| {
+            let mut c = plain();
+            c.read_only = read_only;
+            c.options.insert("files".into(), csv.display().to_string());
+            c
+        };
+        let files_schema_in_file = || async {
+            let s = session(plain()).await;
+            let r = q(s.as_ref(), "select count(*) from duckdb_schemas() where database_name = current_database() and schema_name = 'files'").await;
+            r.batches[0].column(0).as_primitive::<Int64Type>().value(0)
+        };
+
+        // An earlier version's views, kept in the file.
+        {
+            let s = session(plain()).await;
+            q(s.as_ref(), "create schema files").await;
+            q(s.as_ref(), &format!("create view files.sales as select * from read_csv('{}')", csv.display())).await;
+            q(s.as_ref(), "comment on view files.sales is 'File: old'").await;
+        }
+        // Writable: they go, and the new ones aren't written.
+        {
+            let s = session(with_files(false)).await;
+            assert_eq!(q(s.as_ref(), "select sum(amount) from files.sales").await.num_rows(), 1);
+        }
+        assert_eq!(files_schema_in_file().await, 0, "nothing of `files` kept in the database");
+
+        // Read-only: attaching files works.
+        {
+            let s = session(with_files(true)).await;
+            assert_eq!(q(s.as_ref(), "select * from files.sales").await.num_rows(), 2);
+        }
+
+        // A `files` schema of the user's own stays; the views move aside.
+        {
+            let s = session(plain()).await;
+            q(s.as_ref(), "create schema files").await;
+            q(s.as_ref(), "create table files.mine as select 1 as x").await;
+        }
+        {
+            let s = session(with_files(false)).await;
+            assert_eq!(q(s.as_ref(), "select * from files.mine").await.num_rows(), 1);
+            assert_eq!(q(s.as_ref(), "select * from attached_files.sales").await.num_rows(), 2);
+        }
+        assert_eq!(files_schema_in_file().await, 1);
     }
 
     #[tokio::test]

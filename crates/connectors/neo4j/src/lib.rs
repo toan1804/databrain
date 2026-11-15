@@ -299,10 +299,10 @@ fn cell(v: BoltType) -> Cell {
             let (nt, off) = <(NaiveTime, chrono::FixedOffset)>::from(&t);
             Cell::new(Value::Text(format!("{nt}{off}")), "zoned time")
         }
-        BoltType::Duration(d) => {
-            let d: std::time::Duration = d.into();
-            Cell::new(Value::Text(format!("PT{}S", d.as_secs_f64())), "duration")
-        }
+        // Months, days and seconds apart, as Neo4j writes it (`P1Y2M3DT4H`):
+        // the driver's conversion counts a month as 30.4 days and wraps
+        // negative durations.
+        BoltType::Duration(d) => Cell::new(Value::Text(iso_duration(&d)), "duration"),
         v @ BoltType::Node(_) => Cell::json(&json(&v), "node"),
         v @ (BoltType::Relation(_) | BoltType::UnboundedRelation(_)) => Cell::json(&json(&v), "relationship"),
         v @ BoltType::Path(_) => Cell::json(&json(&v), "path"),
@@ -349,13 +349,79 @@ fn json(v: &BoltType) -> serde_json::Value {
         BoltType::Path(p) => json!({"nodes": self::json(&BoltType::List(p.nodes.clone())), "relationships": self::json(&BoltType::List(p.rels.clone()))}),
         BoltType::Point2D(p) => json!({"srid": p.sr_id.value, "x": p.x.value, "y": p.y.value}),
         BoltType::Point3D(p) => json!({"srid": p.sr_id.value, "x": p.x.value, "y": p.y.value, "z": p.z.value}),
-        other => match cell(other.clone()).value {
-            Value::Text(s) => J::String(s),
-            Value::Int(i) | Value::Timestamp(i) | Value::TimestampTz(i) | Value::Time(i) => J::from(i),
-            Value::Date(d) => J::from(d),
-            _ => J::Null,
-        },
+        // Inside a list or map a value has no column type: dates, times and
+        // durations as Neo4j writes them, not day or microsecond counts.
+        BoltType::Bytes(b) => J::Array(b.value.iter().map(|x| J::from(*x)).collect()),
+        other => J::String(temporal_text(other)),
     }
+}
+
+/// A temporal value as Neo4j writes it: `2020-01-02`,
+/// `2020-01-02T03:04:05.5+01:00[Europe/Paris]`, `03:04:05Z`, `P1M2DT3S`.
+fn temporal_text(v: &BoltType) -> String {
+    use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat};
+    const T: &str = "%H:%M:%S%.f";
+    let ok = match v {
+        BoltType::Date(d) => NaiveDate::try_from(d).ok().map(|d| d.to_string()),
+        BoltType::LocalDateTime(d) => NaiveDateTime::try_from(d).ok().map(|t| t.format(&format!("%Y-%m-%dT{T}")).to_string()),
+        BoltType::DateTime(d) => DateTime::<FixedOffset>::try_from(d).ok().map(|t| t.to_rfc3339_opts(SecondsFormat::AutoSi, true)),
+        BoltType::DateTimeZoneId(d) => {
+            DateTime::<FixedOffset>::try_from(d).ok().map(|t| format!("{}[{}]", t.to_rfc3339_opts(SecondsFormat::AutoSi, true), d.tz_id()))
+        }
+        BoltType::LocalTime(t) => Some(NaiveTime::from(t).format(T).to_string()),
+        BoltType::Time(t) => {
+            let (nt, off) = <(NaiveTime, FixedOffset)>::from(t);
+            Some(format!("{}{}", nt.format(T), if off.local_minus_utc() == 0 { "Z".to_string() } else { off.to_string() }))
+        }
+        BoltType::Duration(d) => Some(iso_duration(d)),
+        _ => None,
+    };
+    ok.unwrap_or_else(|| format!("{v:?}"))
+}
+
+/// Months, days, seconds and nanoseconds of a duration (the driver keeps
+/// them private; its `Debug` lists them in this order).
+fn duration_parts(d: &neo4rs::BoltDuration) -> Option<[i64; 4]> {
+    let text = format!("{d:?}");
+    let mut out = [0i64; 4];
+    let mut it = text.split("value: ").skip(1);
+    for slot in &mut out {
+        let n = it.next()?;
+        let end = n.find(|c: char| !(c == '-' || c.is_ascii_digit())).unwrap_or(n.len());
+        *slot = n[..end].parse().ok()?;
+    }
+    Some(out)
+}
+
+/// A duration as Neo4j writes it: `P1Y2M3DT4H5M6.000000007S`, `PT-1H30M`
+/// (a sign per part), `PT0S`.
+fn iso_duration(d: &neo4rs::BoltDuration) -> String {
+    let Some([months, days, seconds, nanos]) = duration_parts(d) else { return format!("{d:?}") };
+    let mut s = String::from("P");
+    for (n, unit) in [(months / 12, 'Y'), (months % 12, 'M'), (days, 'D')] {
+        if n != 0 {
+            s.push_str(&format!("{n}{unit}"));
+        }
+    }
+    let total = seconds as i128 * 1_000_000_000 + nanos as i128;
+    if total != 0 {
+        s.push('T');
+        let (sign, abs) = (if total < 0 { "-" } else { "" }, total.unsigned_abs());
+        let (h, rest) = (abs / 3_600_000_000_000, abs % 3_600_000_000_000);
+        let (m, rest) = (rest / 60_000_000_000, rest % 60_000_000_000);
+        let (sec, frac) = (rest / 1_000_000_000, rest % 1_000_000_000);
+        if h != 0 {
+            s.push_str(&format!("{sign}{h}H"));
+        }
+        if m != 0 {
+            s.push_str(&format!("{sign}{m}M"));
+        }
+        if sec != 0 || frac != 0 {
+            let frac = if frac == 0 { String::new() } else { format!(".{frac:09}").trim_end_matches('0').to_string() };
+            s.push_str(&format!("{sign}{sec}{frac}S"));
+        }
+    }
+    if s == "P" { "PT0S".into() } else { s }
 }
 
 #[async_trait]
@@ -558,6 +624,49 @@ mod tests {
         let r = row_of(rec, &["n".into(), "total".into()]);
         assert_eq!(r[0].0, "n._id");
         assert_eq!(r.last().unwrap(), &("total".to_string(), Cell::new(Value::Float(1.5), "float")));
+    }
+
+    fn duration(months: i64, days: i64, seconds: i64, nanos: i64) -> neo4rs::BoltDuration {
+        neo4rs::BoltDuration::new(months.into(), days.into(), seconds.into(), nanos.into())
+    }
+
+    /// Durations keep their months and days, and their sign.
+    #[test]
+    fn durations_as_neo4j_writes_them() {
+        assert_eq!(iso_duration(&duration(14, 3, 3723, 5)), "P1Y2M3DT1H2M3.000000005S");
+        assert_eq!(iso_duration(&duration(1, 0, 0, 0)), "P1M", "a month is not 30.4 days");
+        assert_eq!(iso_duration(&duration(0, 0, -5400, 0)), "PT-1H-30M", "not wrapped around");
+        assert_eq!(iso_duration(&duration(0, 0, 0, 500_000_000)), "PT0.5S");
+        assert_eq!(iso_duration(&duration(0, 0, 0, 0)), "PT0S");
+        assert_eq!(cell(BoltType::Duration(duration(0, 2, 60, 0))), Cell::new(Value::Text("P2DT1M".into()), "duration"));
+    }
+
+    /// Dates, times and durations inside a list or a map are written as
+    /// Neo4j writes them, not as day or microsecond counts.
+    #[test]
+    fn temporal_values_inside_lists_and_maps() {
+        use chrono::{FixedOffset, NaiveDate, NaiveTime, TimeZone};
+        let day = NaiveDate::from_ymd_opt(2020, 1, 2).unwrap();
+        let at = day.and_hms_milli_opt(3, 4, 5, 500).unwrap();
+        let paris = FixedOffset::east_opt(3600).unwrap();
+        let list = BoltType::List(neo4rs::BoltList::from(vec![
+            BoltType::Date(day.into()),
+            BoltType::LocalDateTime(at.into()),
+            BoltType::DateTime(paris.from_local_datetime(&at).unwrap().into()),
+            BoltType::LocalTime(NaiveTime::from_hms_opt(3, 4, 5).unwrap().into()),
+            BoltType::Time((NaiveTime::from_hms_opt(3, 4, 5).unwrap(), paris).into()),
+            BoltType::Duration(duration(1, 2, 3, 0)),
+        ]));
+        assert_eq!(
+            json(&list),
+            serde_json::json!(["2020-01-02", "2020-01-02T03:04:05.500", "2020-01-02T03:04:05.500+01:00", "03:04:05", "03:04:05+01:00", "P1M2DT3S"])
+        );
+        let mut m = BoltMap::new();
+        m.put("since".into(), BoltType::Date(day.into()));
+        m.put("zoned".into(), BoltType::DateTimeZoneId((at, "Europe/Paris").into()));
+        let j = json(&BoltType::Map(m));
+        assert_eq!(j["since"], "2020-01-02");
+        assert!(j["zoned"].as_str().unwrap().ends_with("[Europe/Paris]"), "{j}");
     }
 
     /// Live: DATABRAIN_NEO4J_URI=neo4j://localhost:7687 DATABRAIN_NEO4J_PASSWORD=… cargo test -p databrain-connector-neo4j -- --nocapture

@@ -139,12 +139,18 @@ fn coll_method(
 ) -> Result<Plan, String> {
     let opt_doc = |i: usize| -> Result<Option<Document>, String> { if args.len() > i { Ok(Some(doc_arg(args, i, method)?)) } else { Ok(None) } };
     let plan = |command: Document, output| Ok(Plan { db: db.clone(), command, output });
+    // Arguments past the last one a method takes are refused, not ignored.
+    let at_most = |n: usize| -> Result<(), String> {
+        if args.len() > n { Err(format!("{method}() takes at most {n} argument{}", if n == 1 { "" } else { "s" })) } else { Ok(()) }
+    };
     match method {
         "find" | "findOne" => {
+            at_most(3)?;
             let mut c = doc! {"find": coll, "filter": opt_doc(0)?.unwrap_or_default()};
             if let Some(p) = opt_doc(1)? {
                 c.insert("projection", p);
             }
+            c.extend(options(args, 2, method, FIND_OPTIONS)?);
             for (m, a) in modifiers {
                 match m.as_str() {
                     "sort" => c.insert("sort", doc_arg(a, 0, m)?),
@@ -154,6 +160,9 @@ fn coll_method(
                     "hint" => c.insert("hint", a.first().map(json_to_bson).transpose()?.unwrap_or(Bson::Null)),
                     "maxTimeMS" => c.insert("maxTimeMS", int_arg(a, 0, m)?),
                     "batchSize" => c.insert("batchSize", int_arg(a, 0, m)?),
+                    "collation" => c.insert("collation", doc_arg(a, 0, m)?),
+                    "comment" => c.insert("comment", a.first().map(json_to_bson).transpose()?.unwrap_or(Bson::Null)),
+                    "allowDiskUse" => c.insert("allowDiskUse", a.first().and_then(serde_json::Value::as_bool).unwrap_or(true)),
                     "toArray" | "pretty" => None,
                     "count" => return plan(doc! {"count": coll, "query": c.get_document("filter").cloned().unwrap_or_default()}, Output::Count),
                     _ => return Err(format!(".{m}() is not supported after find")),
@@ -173,6 +182,7 @@ fn coll_method(
             plan(c, Output::Cursor)
         }
         "aggregate" => {
+            at_most(2)?;
             let pipeline = args.first().ok_or("aggregate needs a pipeline: aggregate([{$match: {}}])")?;
             let stages = match json_to_bson(pipeline)? {
                 Bson::Array(a) => a,
@@ -185,21 +195,42 @@ fn coll_method(
             }
             plan(c, Output::Cursor)
         }
-        "countDocuments" | "count" => plan(doc! {"count": coll, "query": opt_doc(0)?.unwrap_or_default()}, Output::Count),
-        "estimatedDocumentCount" => plan(doc! {"count": coll}, Output::Count),
-        "distinct" => {
-            let key = str_arg(args, 0, method)?;
-            plan(doc! {"distinct": coll, "key": key.clone(), "query": opt_doc(1)?.unwrap_or_default()}, Output::Distinct(key))
+        "countDocuments" | "count" => {
+            at_most(2)?;
+            let mut c = doc! {"count": coll, "query": opt_doc(0)?.unwrap_or_default()};
+            c.extend(options(args, 1, method, COUNT_OPTIONS)?);
+            plan(c, Output::Count)
         }
-        "insertOne" => plan(doc! {"insert": coll, "documents": [doc_arg(args, 0, method)?]}, Output::Write),
-        "insertMany" => {
-            let docs = match args.first().map(json_to_bson).transpose()? {
-                Some(Bson::Array(a)) => a,
-                _ => return Err("insertMany needs an array of documents".into()),
+        "estimatedDocumentCount" => {
+            at_most(1)?;
+            let mut c = doc! {"count": coll};
+            c.extend(options(args, 0, method, &["maxTimeMS", "comment"])?);
+            plan(c, Output::Count)
+        }
+        "distinct" => {
+            at_most(3)?;
+            let key = str_arg(args, 0, method)?;
+            let mut c = doc! {"distinct": coll, "key": key.clone(), "query": opt_doc(1)?.unwrap_or_default()};
+            c.extend(options(args, 2, method, DISTINCT_OPTIONS)?);
+            plan(c, Output::Distinct(key))
+        }
+        "insertOne" | "insertMany" => {
+            at_most(2)?;
+            let docs = if method == "insertOne" {
+                vec![Bson::Document(doc_arg(args, 0, method)?)]
+            } else {
+                match args.first().map(json_to_bson).transpose()? {
+                    Some(Bson::Array(a)) => a,
+                    _ => return Err("insertMany needs an array of documents".into()),
+                }
             };
-            plan(doc! {"insert": coll, "documents": docs}, Output::Write)
+            let allowed = if method == "insertMany" { INSERT_MANY_OPTIONS } else { &INSERT_MANY_OPTIONS[1..] };
+            let mut c = doc! {"insert": coll, "documents": docs};
+            c.extend(options(args, 1, method, allowed)?);
+            plan(c, Output::Write)
         }
         "updateOne" | "updateMany" | "replaceOne" => {
+            at_most(3)?;
             let q = doc_arg(args, 0, method)?;
             let u = args.get(1).ok_or(format!("{method} needs a filter and an update"))?;
             let u = json_to_bson(u)?;
@@ -207,16 +238,23 @@ fn coll_method(
                 return Err(format!("{method}: the update must be a document or a pipeline"));
             }
             let mut one = doc! {"q": q, "u": u, "multi": method == "updateMany"};
-            if let Some(o) = opt_doc(2)?
-                && let Some(up) = o.get("upsert")
-            {
-                one.insert("upsert", up.clone());
-            }
-            plan(doc! {"update": coll, "updates": [one]}, Output::Write)
+            let allowed = if method == "replaceOne" { REPLACE_OPTIONS } else { UPDATE_OPTIONS };
+            let (opts, statement) = split_options(options(args, 2, method, allowed)?, &["upsert", "collation", "arrayFilters", "hint"]);
+            one.extend(statement);
+            let mut c = doc! {"update": coll, "updates": [one]};
+            c.extend(opts);
+            plan(c, Output::Write)
         }
         "deleteOne" | "deleteMany" => {
-            let q = opt_doc(0)?.unwrap_or_default();
-            plan(doc! {"delete": coll, "deletes": [{"q": q, "limit": if method == "deleteOne" { 1 } else { 0 }}]}, Output::Write)
+            at_most(2)?;
+            // As in mongosh, a filter is required: `{}` (every document) is written out.
+            let q = doc_arg(args, 0, method).map_err(|_| format!("{method}() needs a filter: {method}({{…}}), or {method}({{}}) for every document"))?;
+            let (opts, statement) = split_options(options(args, 1, method, DELETE_OPTIONS)?, &["collation", "hint"]);
+            let mut one = doc! {"q": q, "limit": if method == "deleteOne" { 1 } else { 0 }};
+            one.extend(statement);
+            let mut c = doc! {"delete": coll, "deletes": [one]};
+            c.extend(opts);
+            plan(c, Output::Write)
         }
         "createIndex" => {
             let key = doc_arg(args, 0, method)?;
@@ -227,14 +265,83 @@ fn coll_method(
             plan(doc! {"createIndexes": coll, "indexes": [index]}, Output::Document)
         }
         "dropIndex" => {
+            at_most(1)?;
             let index = args.first().map(json_to_bson).transpose()?.ok_or("dropIndex needs a name or key")?;
             plan(doc! {"dropIndexes": coll, "index": index}, Output::Document)
         }
-        "getIndexes" => plan(doc! {"listIndexes": coll}, Output::Cursor),
-        "drop" => plan(doc! {"drop": coll}, Output::Document),
-        "stats" => plan(doc! {"collStats": coll}, Output::Document),
+        "getIndexes" => {
+            at_most(0)?;
+            plan(doc! {"listIndexes": coll}, Output::Cursor)
+        }
+        "drop" => {
+            at_most(1)?;
+            let mut c = doc! {"drop": coll};
+            c.extend(options(args, 0, method, &["writeConcern", "comment"])?);
+            plan(c, Output::Document)
+        }
+        "stats" => {
+            at_most(0)?;
+            plan(doc! {"collStats": coll}, Output::Document)
+        }
         m => Err(format!(".{m}() is not supported; use find, aggregate, countDocuments, distinct, insert/update/delete…, or db.runCommand({{…}})")),
     }
+}
+
+/// Options of `find(filter, projection, options)` (fields of the `find` command).
+const FIND_OPTIONS: &[&str] = &[
+    "sort",
+    "projection",
+    "limit",
+    "skip",
+    "hint",
+    "collation",
+    "maxTimeMS",
+    "batchSize",
+    "comment",
+    "allowDiskUse",
+    "let",
+    "readConcern",
+    "min",
+    "max",
+    "returnKey",
+    "showRecordId",
+    "noCursorTimeout",
+    "allowPartialResults",
+];
+const COUNT_OPTIONS: &[&str] = &["limit", "skip", "hint", "collation", "maxTimeMS", "comment", "readConcern"];
+const DISTINCT_OPTIONS: &[&str] = &["collation", "maxTimeMS", "comment", "readConcern", "hint"];
+/// insertMany's; insertOne takes all but `ordered`.
+const INSERT_MANY_OPTIONS: &[&str] = &["ordered", "writeConcern", "bypassDocumentValidation", "comment"];
+const UPDATE_OPTIONS: &[&str] = &["upsert", "collation", "arrayFilters", "hint", "writeConcern", "comment", "let", "bypassDocumentValidation"];
+const REPLACE_OPTIONS: &[&str] = &["upsert", "collation", "hint", "writeConcern", "comment", "let", "bypassDocumentValidation"];
+const DELETE_OPTIONS: &[&str] = &["collation", "hint", "writeConcern", "comment", "let"];
+
+/// The options document at `i` (empty when not given). An option this
+/// method doesn't take here is refused, never dropped: `deleteMany(f,
+/// {collation: …})` without its collation would match other documents.
+fn options(args: &[serde_json::Value], i: usize, method: &str, allowed: &[&str]) -> Result<Document, String> {
+    if args.len() <= i {
+        return Ok(Document::new());
+    }
+    let o = doc_arg(args, i, method)?;
+    if let Some(k) = o.keys().find(|k| !allowed.contains(&k.as_str())) {
+        return Err(format!("{method}(): the option {k} is not supported here (it takes {}); use db.runCommand({{…}})", allowed.join(", ")));
+    }
+    Ok(o)
+}
+
+/// Options split into the command's (`writeConcern`, `comment`…) and the
+/// one statement's (those named in `statement`: `collation`, `hint`…).
+fn split_options(o: Document, statement: &[&str]) -> (Document, Document) {
+    let (mut cmd, mut one) = (Document::new(), Document::new());
+    for (k, v) in o {
+        if statement.contains(&k.as_str()) {
+            one.insert(k, v);
+        } else {
+            cmd.insert(k, v);
+        }
+    }
+    (cmd, one)
 }
 
 /// `{a: 1, b: -1}` → `a_1_b_-1` (MongoDB's default index name).
@@ -359,7 +466,22 @@ fn args(text: &str) -> Result<Vec<serde_json::Value>, String> {
 fn value(text: &str) -> Result<serde_json::Value, String> {
     let v: serde_json::Value =
         json5::from_str(&helpers(text)).map_err(|e| format!("Could not read the arguments: {}", e.to_string().lines().next().unwrap_or_default()))?;
+    if let Some(n) = too_large(&v) {
+        return Err(format!("{n} is larger than a 64-bit integer holds (it would be rounded): write it as NumberDecimal(\"{n}\")"));
+    }
     Ok(integers(v))
+}
+
+/// A whole number past the 64-bit range (read as an unsigned one): stored
+/// as a double it would lose digits.
+fn too_large(v: &serde_json::Value) -> Option<u64> {
+    use serde_json::Value as J;
+    match v {
+        J::Number(n) if n.as_i64().is_none() => n.as_u64(),
+        J::Array(a) => a.iter().find_map(too_large),
+        J::Object(o) => o.values().find_map(too_large),
+        _ => None,
+    }
 }
 
 /// JSON5 reads every number as a float: whole numbers written without a
@@ -539,6 +661,60 @@ mod tests {
         assert_eq!(p.output, Output::Cursor);
         assert_eq!(parse("db.runCommand({ping: 1})", None).unwrap().output, Output::Document);
         assert_eq!(parse("db.adminCommand({listDatabases: 1})", None).unwrap().db.as_deref(), Some("admin"));
+    }
+
+    /// Integers keep every digit up to the 64-bit limit (past 2^53, where a
+    /// double would round them); a larger one is refused, not rounded.
+    #[test]
+    fn large_integers_keep_their_digits() {
+        let p = parse("db.t.find({a: 9007199254740993, b: -9223372036854775807, c: NumberLong(12345678901234567)})", None).unwrap();
+        let f = p.command.get_document("filter").unwrap();
+        assert_eq!(f.get_i64("a").unwrap(), 9_007_199_254_740_993);
+        assert_eq!(f.get_i64("b").unwrap(), -9_223_372_036_854_775_807);
+        assert_eq!(f.get_i64("c").unwrap(), 12_345_678_901_234_567);
+        let p = parse(r#"{"insert": "t", "documents": [{"n": 12345678901234567}]}"#, None).unwrap();
+        assert_eq!(p.command.get_array("documents").unwrap()[0].as_document().unwrap().get_i64("n").unwrap(), 12_345_678_901_234_567);
+        assert!(parse("db.t.find({a: 18446744073709551615})", None).unwrap_err().contains("NumberDecimal"));
+        // Written as a decimal number: a double, as in mongosh.
+        assert!(matches!(parse("db.t.find({a: 1.5e16})", None).unwrap().command.get_document("filter").unwrap().get("a"), Some(Bson::Double(_))));
+    }
+
+    /// An option is sent where the server reads it, or the command is
+    /// refused: never dropped (a delete without its collation matches other
+    /// documents).
+    #[test]
+    fn options_are_sent_or_refused() {
+        let one = |p: &Plan, key: &str| p.command.get_array(key).unwrap()[0].as_document().unwrap().clone();
+        let p = parse("db.t.deleteMany({name: 'é'}, {collation: {locale: 'fr', strength: 1}, writeConcern: {w: 1}})", None).unwrap();
+        assert_eq!(p.command.keys().next().unwrap(), "delete");
+        assert_eq!(one(&p, "deletes").get_document("collation").unwrap().get_str("locale").unwrap(), "fr");
+        assert!(p.command.get_document("writeConcern").is_ok(), "the command's own options stay on the command");
+        let p = parse("db.t.updateMany({a: 1}, {$set: {'x.$[e]': 0}}, {arrayFilters: [{e: 1}], upsert: true, comment: 'c'})", None).unwrap();
+        let u = one(&p, "updates");
+        assert!(u.get_array("arrayFilters").is_ok() && u.get_bool("upsert").unwrap());
+        assert_eq!(p.command.get_str("comment").unwrap(), "c");
+        let p = parse("db.t.find({a: 1}, {a: 1}, {collation: {locale: 'en'}, hint: {a: 1}})", Some(10)).unwrap();
+        assert!(p.command.get_document("collation").is_ok() && p.command.get_document("hint").is_ok());
+        assert!(parse("db.t.find({}).collation({locale: 'en'})", None).unwrap().command.get_document("collation").is_ok());
+        assert_eq!(parse("db.t.countDocuments({}, {limit: 5})", None).unwrap().command.get_i32("limit").unwrap(), 5);
+        assert!(!parse("db.t.insertMany([{a: 1}], {ordered: false})", None).unwrap().command.get_bool("ordered").unwrap());
+        assert!(parse("db.t.distinct('k', {}, {collation: {locale: 'en'}})", None).unwrap().command.get_document("collation").is_ok());
+        // Refused: an option the method doesn't take, an argument too many.
+        assert!(parse("db.t.deleteMany({}, {colation: {locale: 'fr'}})", None).unwrap_err().contains("colation"));
+        assert!(parse("db.t.insertOne({a: 1}, {ordered: false})", None).unwrap_err().contains("ordered"));
+        assert!(parse("db.t.replaceOne({}, {a: 1}, {arrayFilters: []})", None).unwrap_err().contains("arrayFilters"));
+        assert!(parse("db.t.deleteOne({a: 1}, {}, {})", None).unwrap_err().contains("at most 2"));
+        assert!(parse("db.t.find({}, {}, {}, {})", None).unwrap_err().contains("at most 3"));
+        assert!(parse("db.t.getIndexes({})", None).is_err());
+    }
+
+    /// As in mongosh, a delete names its filter; `{}` is every document.
+    #[test]
+    fn deletes_need_a_filter() {
+        assert!(parse("db.t.deleteMany()", None).unwrap_err().contains("needs a filter"));
+        assert!(parse("db.t.deleteOne()", None).unwrap_err().contains("needs a filter"));
+        let p = parse("db.t.deleteMany({})", None).unwrap();
+        assert!(p.command.get_array("deletes").unwrap()[0].as_document().unwrap().get_document("q").unwrap().is_empty());
     }
 
     #[test]

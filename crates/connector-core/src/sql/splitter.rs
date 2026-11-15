@@ -396,7 +396,7 @@ pub(crate) const QUOTED_WORD: &str = "QUOTED_TEXT_";
 /// space), other quoted text (`"…"`, `[…]`, `` `…` ``, `$$…$$`) one
 /// [`QUOTED_WORD`]. Read with the dialect's own scanner ([`skip_token`]),
 /// so it ends strings and comments where the splitter does.
-pub(crate) fn code_text(sql: &str, kind: crate::types::ConnectorKind) -> String {
+pub fn code_text(sql: &str, kind: crate::types::ConnectorKind) -> String {
     code_text_with(sql, kind, false)
 }
 

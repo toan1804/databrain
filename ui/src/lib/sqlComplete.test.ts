@@ -135,6 +135,24 @@ describe("completion", () => {
     expect(await at("select * from files.order_items f where f.q|", p)).toEqual(["qty"]);
   });
 
+  it("inserts DuckDB attached files from their own catalog as files.<name>", async () => {
+    const files: DbObject[] = [t("files.main", "order_items", "view")];
+    const p: MetaProvider = {
+      kind: "duckdb",
+      schemas: () => [
+        { name: "memory.main", catalog: "memory", is_default: true },
+        { name: "files.main", catalog: "files", is_default: false },
+      ],
+      objects: async (s) => (s === "files.main" ? files : []),
+      cachedObjects: () => files,
+      searchTables: async () => files,
+      columns: async () => ["order_id", "qty"],
+    };
+    expect(await at("select * from item|", p)).toEqual(["files.order_items oi"]);
+    expect(await at("select * from files.ite|", p)).toEqual(["order_items oi"]);
+    expect(await at("select * from files.order_items f where f.q|", p)).toEqual(["qty"]);
+  });
+
   it("knows DuckDB results outputs", async () => {
     const p = provider("duckdb");
     expect(await at("select * from results.|", p)).toEqual(["revenue r"]);
