@@ -70,10 +70,10 @@ function useInstall(info: UpdateInfo | null | undefined, onFresh?: (i: UpdateInf
   };
   const label = !progress
     ? info?.installable
-      ? "Install and restart"
+      ? "Update and relaunch"
       : "Download"
     : progress.finished
-      ? "Restarting…"
+      ? "Relaunching…"
       : progress.total
         ? `Downloading ${Math.round((progress.done / progress.total) * 100)}%`
         : "Downloading…";
@@ -115,7 +115,7 @@ export function UpdateBanner() {
       <span className="min-w-0 flex-1">
         DataBrain {info.latest} is available (you have {info.current}).
       </span>
-      <button className="btn shrink-0 py-0.5" disabled={busy} onClick={() => void install()} title={info.installable ? "Download, check its signature, install and restart DataBrain" : (info.download_name ?? "Release page")}>
+      <button className="btn shrink-0 py-0.5" disabled={busy} onClick={() => void install()} title={info.installable ? "Download the update, check its signature, install it and relaunch DataBrain" : (info.download_name ?? "Release page")}>
         {busy && <Loader2 size={12} className="animate-spin" />} {label}
       </button>
       {(info.download || info.installable) && (
@@ -174,7 +174,7 @@ export function UpdateSettings() {
       </label>
       <p className="text-[11.5px] text-muted">
         DataBrain asks GitHub for its latest release (only the app's version is sent) and shows a banner. Signed releases install from the banner:
-        the update is downloaded, its signature is checked against the key built into DataBrain, and the app restarts. Otherwise the banner links to
+        the update is downloaded, its signature is checked against the key built into DataBrain, and the app relaunches. Otherwise the banner links to
         the download for this computer. Nothing is installed without you clicking.
       </p>
       <button className="btn-ghost border border-line" disabled={busy} onClick={() => void checkNow()}>

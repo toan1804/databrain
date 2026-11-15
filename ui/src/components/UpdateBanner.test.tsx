@@ -41,7 +41,7 @@ describe("update banner", () => {
     localStorage.setItem("db.update.info", JSON.stringify(info({ current: "0.3.4", installable: false })));
     answer = info({});
     render(<UpdateBanner />);
-    await screen.findByText("Install and restart");
+    await screen.findByText("Update and relaunch");
     expect(calls.check).toBe(1);
   });
 
