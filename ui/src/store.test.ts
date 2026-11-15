@@ -17,6 +17,9 @@ let gate: Promise<void> | null = null;
 const cancelled: string[] = [];
 const closedTabs: string[] = [];
 const reran: string[] = [];
+/** pin_output calls, and whether they are refused (a result on disk). */
+const pins: [string, boolean][] = [];
+let pinRefused = false;
 
 vi.mock("./lib/api", () => ({
   isTauri: () => false,
@@ -66,6 +69,11 @@ vi.mock("./lib/api", () => ({
     listNotebooks: async () => [],
     loadOutput: async (handle: string) => ({ ...outputs.find((o) => o.handle === handle)!, state: "live" }),
     keepOutput: async (handle: string, kept: boolean) => ({ ...outputs.find((o) => o.handle === handle)!, kept }),
+    pinOutput: async (handle: string, pinned: boolean) => {
+      pins.push([handle, pinned]);
+      if (pinRefused) throw new Error("A result on disk can't be pinned.");
+      return { ...outputs.find((o) => o.handle === handle)!, pinned };
+    },
   },
 }));
 
@@ -474,5 +482,86 @@ describe("a notebook cell deleted while its run starts", () => {
     expect(await useStore.getState().runSql("nb:nb1:cellB", "conn", "select 1", 0, "nb:nb1")).toBe(true);
     expect(useStore.getState().runs["nb:nb1:cellB"]?.running).toBe(true);
     expect(cancelled).toEqual([]);
+  });
+});
+
+describe("results added from another tab", () => {
+  const other = (h: string, extra: Record<string, unknown> = {}) => out(h, "other", 0, { state: "live", connection_id: "c2", connection_name: "Warehouse", last_used: 1, ...extra });
+  beforeEach(() => {
+    pins.length = 0;
+    pinRefused = false;
+    useStore.setState({ addedResults: {}, tabs: [{ id: "t", title: "Q", sql: "", connection_id: "c" }, { id: "u", title: "Q2", sql: "", connection_id: "c" }] });
+  });
+
+  it("shows it read-only, pinned so it stays, and carries it across the tab's runs", async () => {
+    const o = other("w1");
+    outputs = [o];
+    useStore.setState({ outputs });
+    await useStore.getState().addResult("t", o);
+    let run = useStore.getState().runs.t;
+    expect(run.kept?.map((s) => [s.output?.handle, s.added])).toEqual([["w1", true]]);
+    expect(shownStatement(run)?.output?.handle).toBe("w1");
+    expect(pins).toEqual([["w1", true]]);
+    expect(useStore.getState().addedResults.t).toEqual([{ handle: "w1", pinned: true }]);
+    // Added twice: shown, not added again.
+    await useStore.getState().addResult("t", o);
+    expect(useStore.getState().runs.t.kept).toHaveLength(1);
+    // The tab runs: the added result stays next to the new results.
+    await useStore.getState().runSql("t", "c", "select 2");
+    run = useStore.getState().runs.t;
+    expect(run.kept?.map((s) => s.output?.handle)).toEqual(["w1"]);
+    expect(run.statements.map((s) => s.plan.sql)).toEqual(["select 2"]);
+  });
+
+  it("closing it unpins what adding pinned, unless another tab still shows it", async () => {
+    const o = other("w2");
+    outputs = [o];
+    useStore.setState({ outputs });
+    await useStore.getState().addResult("t", o);
+    await useStore.getState().addResult("u", o);
+    await useStore.getState().removeAddedResult("t", "w2");
+    expect(useStore.getState().runs.t).toBeUndefined();
+    expect(pins.filter(([, p]) => !p)).toEqual([]);
+    // The last tab showing it closes: unpinned.
+    useStore.getState().closeTab("u");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(pins.at(-1)).toEqual(["w2", false]);
+    expect(useStore.getState().addedResults).toEqual({});
+  });
+
+  it("an output pinned before stays pinned, and one that can't be pinned is still shown", async () => {
+    const pinned = other("w3", { pinned: true });
+    const onDisk = other("w4", { state: "on_disk" });
+    outputs = [pinned, onDisk];
+    useStore.setState({ outputs });
+    await useStore.getState().addResult("t", pinned);
+    expect(pins).toEqual([]);
+    pinRefused = true;
+    await useStore.getState().addResult("t", onDisk);
+    expect(useStore.getState().runs.t.kept?.map((s) => s.output?.handle)).toEqual(["w3", "w4"]);
+    expect(useStore.getState().addedResults.t).toEqual([
+      { handle: "w3", pinned: false },
+      { handle: "w4", pinned: false },
+    ]);
+    await useStore.getState().removeAddedResult("t", "w3");
+    expect(pins.filter(([, p]) => !p)).toEqual([]);
+  });
+
+  it("comes back after a restart while its output exists", async () => {
+    const o = other("w5");
+    outputs = [o];
+    useStore.setState({ outputs, runs: {}, addedResults: { t: [{ handle: "w5", pinned: true }], u: [{ handle: "gone", pinned: true }] } });
+    await useStore.getState().restoreTabOutputs();
+    const run = useStore.getState().runs.t;
+    expect(run.kept?.map((s) => [s.output?.handle, s.added])).toEqual([["w5", true]]);
+    expect(run.activeIndex).toBe(run.kept![0].plan.index);
+    expect(useStore.getState().runs.u).toBeUndefined();
+  });
+
+  it("is read from the setting for tabs that still exist", async () => {
+    const { parseAdded } = await import("./store/helpers");
+    expect(parseAdded({ t: [{ handle: "a", pinned: true }, { nope: 1 }], gone: [{ handle: "b" }] }, ["t"])).toEqual({ t: [{ handle: "a", pinned: true }] });
+    expect(parseAdded(null, ["t"])).toEqual({});
   });
 });

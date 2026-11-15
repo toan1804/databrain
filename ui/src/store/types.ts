@@ -103,6 +103,15 @@ export interface StatementRun {
   downloading?: boolean;
   /** Time it took on the server (excluding the download), when known. */
   serverMs?: number;
+  /** Another tab's result added to this one's (+ in the result tabs): read-only, in `kept`. */
+  added?: boolean;
+}
+
+/** A result added to a tab from elsewhere, remembered across restarts. */
+export interface AddedResult {
+  handle: string;
+  /** Adding pinned it (so it outlives its own tab); closing it unpins it. */
+  pinned: boolean;
 }
 
 export interface TabRun {

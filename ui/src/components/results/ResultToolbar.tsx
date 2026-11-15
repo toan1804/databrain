@@ -1,5 +1,5 @@
 import type { Dispatch, SetStateAction } from "react";
-import { BarChart3, Braces, Download, Filter, GitCompare, ListFilter, Loader2, Pencil, Pin, Search, Sparkles, Table2, Upload, X } from "lucide-react";
+import { BarChart3, Braces, Download, Filter, GitCompare, ListFilter, Loader2, Lock, Pencil, Pin, Search, Sparkles, Table2, Upload, X } from "lucide-react";
 import type { SendInput } from "../../aiStore";
 import { OutputChip } from "../OutputChip";
 import { GridViewsMenu } from "../GridViewsMenu";
@@ -34,6 +34,7 @@ export function ResultToolbar({
   stopEditing,
   setLoadOpen,
   setExportOpen,
+  readOnly,
 }: {
   stmt: Pick<StatementRun, "durationMs" | "output">;
   info: ResultInfo;
@@ -57,11 +58,18 @@ export function ResultToolbar({
   stopEditing: () => void;
   setLoadOpen: Dispatch<SetStateAction<boolean>>;
   setExportOpen: Dispatch<SetStateAction<boolean>>;
+  /** No Edit and no Keep (another tab's result, added here). */
+  readOnly?: boolean;
 }) {
   return (
     <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-2">
       {stmt.output && <OutputChip output={stmt.output} />}
-      {stmt.output && <KeepButton tabId={tabId} output={stmt.output} />}
+      {stmt.output && !readOnly && <KeepButton tabId={tabId} output={stmt.output} />}
+      {readOnly && (
+        <span className="flex shrink-0 items-center gap-1 rounded border border-line px-1.5 py-0.5 text-[11px] text-muted" title="Added from another tab: read-only here">
+          <Lock size={11} /> Read-only
+        </span>
+      )}
       <div className="flex shrink-0 rounded-md border border-line p-0.5" role="radiogroup" aria-label="View">
         {(["grid", "chart"] as const).map((m) => (
           <button
@@ -159,7 +167,7 @@ export function ResultToolbar({
       >
         <Sparkles size={13} /> <span className="hidden @3xl:inline">Ask AI</span>
       </button>
-      <button
+      {!readOnly && <button
         className={`btn-ghost shrink-0 whitespace-nowrap border py-1 ${target ? "border-accent text-accent" : "border-line"}`}
         aria-pressed={!!target}
         aria-label="Edit"
@@ -169,7 +177,7 @@ export function ResultToolbar({
         title="Edit cells, add and delete rows of the table this result comes from (needs a primary key)"
       >
         {checkingEdit ? <Loader2 size={13} className="animate-spin" /> : <Pencil size={13} />} <span className="hidden @3xl:inline">Edit</span>
-      </button>
+      </button>}
       <button
         className="btn-ghost shrink-0 whitespace-nowrap border border-line py-1"
         aria-label="Load into…"

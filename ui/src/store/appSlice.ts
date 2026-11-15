@@ -10,7 +10,7 @@ import { parseInlineAiProvider } from "../lib/inlineAi";
 import { parseTestDataAi } from "../lib/testDataAi";
 import { parseStoredPatterns } from "../lib/testDataPatterns";
 import { parseQuickFilters, parseViews } from "../lib/gridViews";
-import { applyTheme, nextSignIn, parseParams, parseSchemaFilter } from "./helpers";
+import { applyTheme, nextSignIn, parseAdded, parseParams, parseSchemaFilter } from "./helpers";
 import type { State, Tab } from "./types";
 
 let storeInitStarted = false;
@@ -88,6 +88,7 @@ export const createAppSlice: StateCreator<State, [], [], AppSlice> = (set, get) 
         savedQueries,
         schemaFilter: parseSchemaFilter(settings.explorer_schemas),
         params: parseParams(settings.editor_params, restored.map((t) => t.id)),
+        addedResults: parseAdded(settings.editor_added_results, restored.map((t) => t.id)),
         recentFiles: Array.isArray(settings.recent_sql_files) ? settings.recent_sql_files.filter((p): p is string => typeof p === "string") : [],
         dashboards: Array.isArray(settings.dashboards) ? (settings.dashboards as Dashboard[]).filter((d) => d && typeof d.id === "string" && Array.isArray(d.charts)) : [],
       });

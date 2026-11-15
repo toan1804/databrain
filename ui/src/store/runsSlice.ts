@@ -4,9 +4,9 @@ import { computeRunTips, slowStatements } from "../queryTips";
 import type { JobEvent, OutputInfo, ParamValue } from "../lib/types";
 import { errorRange } from "../lib/util";
 import { ddlEffect } from "./explorerSlice";
-import { keptIndex, persistTabs, restoredRun } from "./helpers";
+import { keptIndex, outputRun, persistAdded, persistTabs, restoredRun } from "./helpers";
 import { uid } from "../lib/util";
-import { isQueryTab, type RunInput, type State, type StatementRun, type TabRun } from "./types";
+import { isQueryTab, type AddedResult, type RunInput, type State, type StatementRun, type TabRun } from "./types";
 
 /**
  * Job events that arrived before the `run_query` response told us the job id.
@@ -97,6 +97,14 @@ export interface RunsSlice {
   setActiveStatement: (tabId: string, index: number) => void;
   /** Keep a result in the tab when it runs again, or let go of a kept one. */
   keepResult: (tabId: string, output: OutputInfo, kept: boolean) => Promise<void>;
+  /** Results added to each tab from elsewhere (+ in its result tabs), remembered across restarts. */
+  addedResults: Record<string, AddedResult[]>;
+  /** Show another result in this tab, read-only, until it is closed there; it is pinned so it stays. */
+  addResult: (tabId: string, output: OutputInfo) => Promise<void>;
+  /** Close a result added to the tab (unpinned when adding pinned it and no other tab shows it). */
+  removeAddedResult: (tabId: string, handle: string) => Promise<void>;
+  /** A tab closed: its added results go (unpinned as above). */
+  dropAddedResults: (tabId: string) => void;
   handleJobEvent: (e: JobEvent) => void;
   /** Index / partition / cluster-key tips for the run's slow statements. */
   computeTips: (runKey: string, jobId: string) => Promise<void>;
@@ -137,13 +145,22 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
   restoreTabOutputs: async () => {
     const { tabs, activeTabId } = get();
     const order = [...tabs].filter(isQueryTab).sort((a, b) => Number(b.id === activeTabId) - Number(a.id === activeTabId));
+    const load = (o: OutputInfo) => (o.state === "on_disk" ? api.loadOutput(o.handle) : Promise.resolve(o));
     for (const t of order) {
       const outs = get().outputs.filter((o) => o.tab_id === t.id && o.active);
-      if (!outs.length || get().runs[t.id]) continue;
+      // Results added from other tabs that still exist.
+      const added = (get().addedResults[t.id] ?? []).map((a) => get().outputs.find((o) => o.handle === a.handle && o.state !== "evicted")).filter((o): o is OutputInfo => !!o);
+      if ((!outs.length && !added.length) || get().runs[t.id]) continue;
       try {
         // Saved results are read from disk on first use.
-        const loaded = await Promise.all(outs.map((o) => (o.state === "on_disk" ? api.loadOutput(o.handle) : Promise.resolve(o))));
-        const run = restoredRun(t.id, loaded);
+        const loaded = await Promise.all(outs.map(load));
+        const extra = (await Promise.allSettled(added.map(load))).flatMap((r) => (r.status === "fulfilled" ? [{ ...outputRun(r.value, keptIndex()), added: true }] : []));
+        const own = restoredRun(t.id, loaded);
+        const run: TabRun | null = own
+          ? { ...own, kept: [...(own.kept ?? []), ...extra] }
+          : extra.length
+            ? { jobId: null, running: false, startedAt: Date.now(), finishedStatus: "success", statements: [], kept: extra, activeIndex: extra.at(-1)!.plan.index }
+            : null;
         // The user may have run the tab meanwhile.
         if (run && !get().runs[t.id]) set((s) => ({ runs: { ...s.runs, [t.id]: run } }));
       } catch {
@@ -175,7 +192,13 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       if (tabs.length === 0) tabs = [{ id: uid(), title: "Query 1", sql: "", connection_id: s.tabs.find((t) => t.connection_id)?.connection_id ?? null }];
       if (tabs.length !== s.tabs.length) persistTabs(tabs);
       const activeTabId = tabs.some((t) => t.id === s.activeTabId) ? s.activeTabId : (tabs[0]?.id ?? null);
-      return { runs, tabs, activeTabId, outputs: s.outputs.filter((o) => !gone.has(o.handle)) };
+      // Added results whose output is gone are forgotten.
+      let addedResults = s.addedResults;
+      if (Object.values(addedResults).some((l) => l.some((a) => gone.has(a.handle)))) {
+        addedResults = Object.fromEntries(Object.entries(addedResults).map(([k, l]) => [k, l.filter((a) => !gone.has(a.handle))]).filter(([, l]) => l.length));
+        persistAdded(addedResults);
+      }
+      return { runs, tabs, activeTabId, addedResults, outputs: s.outputs.filter((o) => !gone.has(o.handle)) };
     }),
   applyOutput: (o) =>
     set((s) => {
@@ -451,6 +474,82 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     }
   },
 
+  addedResults: {},
+  addResult: async (tabId, output) => {
+    const st = get();
+    const run = st.runs[tabId];
+    const shown = (x: StatementRun) => x.output?.handle === output.handle;
+    if (output.tab_id === tabId || run?.statements.some(shown) || run?.kept?.some(shown)) {
+      // Already here: shown instead.
+      const at = run?.kept?.find(shown) ?? run?.statements.find(shown);
+      if (at) st.setActiveStatement(tabId, at.plan.index);
+      return;
+    }
+    let o = output;
+    let pinned = false;
+    try {
+      // Pinned so it stays when its own tab runs again or closes, and after a restart.
+      if (!o.pinned) {
+        o = await api.pinOutput(o.handle, true);
+        pinned = true;
+        get().applyOutput(o);
+      }
+    } catch (e) {
+      // A result on disk can't be pinned: it is shown while its own tab keeps it.
+      get().toast(`${toError(e).message} It is shown here while its own tab keeps it.`, "info");
+    }
+    try {
+      if (o.state === "on_disk") o = await api.loadOutput(o.handle);
+    } catch (e) {
+      get().toast(toError(e).message, "error");
+      return;
+    }
+    const added: StatementRun = { ...outputRun(o, keptIndex()), added: true };
+    set((s) => {
+      const r = s.runs[tabId];
+      const next: TabRun = r
+        ? { ...r, kept: [...(r.kept ?? []), added], activeIndex: added.plan.index }
+        : { jobId: null, running: false, startedAt: Date.now(), finishedStatus: "success", statements: [], kept: [added], activeIndex: added.plan.index };
+      const addedResults = { ...s.addedResults, [tabId]: [...(s.addedResults[tabId] ?? []), { handle: o.handle, pinned }] };
+      persistAdded(addedResults);
+      return { runs: { ...s.runs, [tabId]: next }, addedResults };
+    });
+  },
+  removeAddedResult: async (tabId, handle) => {
+    const st = get();
+    const ref = st.addedResults[tabId]?.find((a) => a.handle === handle);
+    set((s) => {
+      const r = s.runs[tabId];
+      const runs = { ...s.runs };
+      if (r) {
+        const gone = r.kept?.find((x) => x.added && x.output?.handle === handle);
+        const kept = r.kept?.filter((x) => x !== gone);
+        const activeIndex = gone && r.activeIndex === gone.plan.index ? (lastShown(r.statements) ?? kept?.at(-1)?.plan.index ?? null) : r.activeIndex;
+        // Nothing left to show: the tab is as before anything ran.
+        if (!r.statements.length && !kept?.length) delete runs[tabId];
+        else runs[tabId] = { ...r, kept, activeIndex };
+      }
+      const list = (s.addedResults[tabId] ?? []).filter((a) => a.handle !== handle);
+      const addedResults = { ...s.addedResults };
+      if (list.length) addedResults[tabId] = list;
+      else delete addedResults[tabId];
+      persistAdded(addedResults);
+      return { runs, addedResults };
+    });
+    if (ref?.pinned) await unpinIfUnused(get, handle);
+  },
+  dropAddedResults: (tabId) => {
+    const refs = get().addedResults[tabId];
+    if (!refs) return;
+    set((s) => {
+      const addedResults = { ...s.addedResults };
+      delete addedResults[tabId];
+      persistAdded(addedResults);
+      return { addedResults };
+    });
+    for (const a of refs) if (a.pinned) void unpinIfUnused(get, a.handle);
+  },
+
   handleJobEvent: (e) => {
     if (e.type === "outputs_changed") {
       clearTimeout(outputsTimer);
@@ -590,6 +689,16 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     }
   },
 });
+
+/** Unpin an output adding pinned, unless another tab still shows it as added. */
+async function unpinIfUnused(get: () => State, handle: string) {
+  if (Object.values(get().addedResults).some((l) => l.some((a) => a.handle === handle))) return;
+  try {
+    get().applyOutput(await api.pinOutput(handle, false));
+  } catch {
+    // Already dropped.
+  }
+}
 
 /** The results a new run of the tab keeps showing: those kept before, and
  * this run's the user kept (renumbered so they don't clash with the new run). */
