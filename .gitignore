@@ -15,3 +15,6 @@ crates/app/resources/duckdb-extensions/v*/
 
 # A `go build` in the Oracle helper folder (releases are built by scripts/build-oracle-agent.mjs)
 /crates/connectors/oracle/agent/oracle-agent
+
+# TypeScript build state (tsc -b), changed by every build
+/ui/*.tsbuildinfo
