@@ -20,6 +20,9 @@ const reran: string[] = [];
 /** pin_output calls, and whether they are refused (a result on disk). */
 const pins: [string, boolean][] = [];
 let pinRefused = false;
+/** While set, pin_output waits for it; loadOutput fails while loadFails. */
+let pinGate: Promise<void> | null = null;
+let loadFails = false;
 
 vi.mock("./lib/api", () => ({
   isTauri: () => false,
@@ -67,10 +70,14 @@ vi.mock("./lib/api", () => ({
       return { ...nb, id: "nb-new" };
     },
     listNotebooks: async () => [],
-    loadOutput: async (handle: string) => ({ ...outputs.find((o) => o.handle === handle)!, state: "live" }),
+    loadOutput: async (handle: string) => {
+      if (loadFails) throw new Error("snapshot unreadable");
+      return { ...outputs.find((o) => o.handle === handle)!, state: "live" };
+    },
     keepOutput: async (handle: string, kept: boolean) => ({ ...outputs.find((o) => o.handle === handle)!, kept }),
     pinOutput: async (handle: string, pinned: boolean) => {
       pins.push([handle, pinned]);
+      if (pinGate) await pinGate;
       if (pinRefused) throw new Error("A result on disk can't be pinned.");
       return { ...outputs.find((o) => o.handle === handle)!, pinned };
     },
@@ -490,6 +497,8 @@ describe("results added from another tab", () => {
   beforeEach(() => {
     pins.length = 0;
     pinRefused = false;
+    pinGate = null;
+    loadFails = false;
     useStore.setState({ addedResults: {}, tabs: [{ id: "t", title: "Q", sql: "", connection_id: "c" }, { id: "u", title: "Q2", sql: "", connection_id: "c" }] });
   });
 
@@ -513,21 +522,55 @@ describe("results added from another tab", () => {
     expect(run.statements.map((s) => s.plan.sql)).toEqual(["select 2"]);
   });
 
-  it("closing it unpins what adding pinned, unless another tab still shows it", async () => {
+  it("closing it unpins what adding pinned, when the last tab showing it lets go", async () => {
     const o = other("w2");
     outputs = [o];
     useStore.setState({ outputs });
     await useStore.getState().addResult("t", o);
-    await useStore.getState().addResult("u", o);
+    // The second tab picks it from the list as it is now: already pinned (by the first add).
+    const now = useStore.getState().outputs.find((x) => x.handle === "w2")!;
+    expect(now.pinned).toBe(true);
+    await useStore.getState().addResult("u", now);
+    expect(pins).toEqual([["w2", true]]);
     await useStore.getState().removeAddedResult("t", "w2");
     expect(useStore.getState().runs.t).toBeUndefined();
     expect(pins.filter(([, p]) => !p)).toEqual([]);
     // The last tab showing it closes: unpinned.
     useStore.getState().closeTab("u");
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(pins.at(-1)).toEqual(["w2", false]);
+    await vi.waitFor(() => expect(pins.at(-1)).toEqual(["w2", false]));
     expect(useStore.getState().addedResults).toEqual({});
+  });
+
+  it("a tab closed while its result is being added gets nothing back, and the pin is undone", async () => {
+    const o = other("w6");
+    outputs = [o];
+    useStore.setState({ outputs });
+    let open!: () => void;
+    pinGate = new Promise((r) => (open = r));
+    const adding = useStore.getState().addResult("t", o);
+    useStore.getState().closeTab("t");
+    open();
+    await adding;
+    expect(useStore.getState().runs.t).toBeUndefined();
+    expect(useStore.getState().addedResults.t).toBeUndefined();
+    expect(pins).toEqual([
+      ["w6", true],
+      ["w6", false],
+    ]);
+  });
+
+  it("a result that can't be loaded isn't added, and its pin is undone", async () => {
+    const o = other("w7", { state: "on_disk" });
+    outputs = [o];
+    useStore.setState({ outputs });
+    loadFails = true;
+    await useStore.getState().addResult("t", o);
+    expect(useStore.getState().runs.t).toBeUndefined();
+    expect(useStore.getState().addedResults.t).toBeUndefined();
+    expect(pins).toEqual([
+      ["w7", true],
+      ["w7", false],
+    ]);
   });
 
   it("an output pinned before stays pinned, and one that can't be pinned is still shown", async () => {

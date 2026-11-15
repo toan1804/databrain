@@ -63,7 +63,7 @@ export function ResultToolbar({
 }) {
   return (
     <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-2">
-      {stmt.output && <OutputChip output={stmt.output} />}
+      {stmt.output && <OutputChip output={stmt.output} readOnly={readOnly} />}
       {stmt.output && !readOnly && <KeepButton tabId={tabId} output={stmt.output} />}
       {readOnly && (
         <span className="flex shrink-0 items-center gap-1 rounded border border-line px-1.5 py-0.5 text-[11px] text-muted" title="Added from another tab: read-only here">

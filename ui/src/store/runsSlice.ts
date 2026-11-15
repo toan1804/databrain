@@ -485,25 +485,36 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       if (at) st.setActiveStatement(tabId, at.plan.index);
       return;
     }
-    let o = output;
-    let pinned = false;
+    const tabOpen = () => get().tabs.some((t) => t.id === tabId);
+    let o = get().outputs.find((x) => x.handle === output.handle) ?? output;
+    // Pinned by adding already (another tab added it): this tab shares that,
+    // so whichever lets go last unpins it.
+    let pinned = pinnedByAdding(get(), o.handle);
+    let pinnedNow = false;
     try {
       // Pinned so it stays when its own tab runs again or closes, and after a restart.
       if (!o.pinned) {
         o = await api.pinOutput(o.handle, true);
-        pinned = true;
+        pinned = pinnedNow = true;
         get().applyOutput(o);
       }
     } catch (e) {
       // A result on disk can't be pinned: it is shown while its own tab keeps it.
       get().toast(`${toError(e).message} It is shown here while its own tab keeps it.`, "info");
     }
+    // Every way out without adding undoes the pin made here.
+    const undo = async () => {
+      if (pinnedNow) await unpinIfUnused(get, o.handle);
+    };
+    if (!tabOpen()) return void (await undo());
     try {
       if (o.state === "on_disk") o = await api.loadOutput(o.handle);
     } catch (e) {
       get().toast(toError(e).message, "error");
-      return;
+      return void (await undo());
     }
+    // The tab closed meanwhile: nothing comes back for it.
+    if (!tabOpen()) return void (await undo());
     const added: StatementRun = { ...outputRun(o, keptIndex()), added: true };
     set((s) => {
       const r = s.runs[tabId];
@@ -516,8 +527,8 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     });
   },
   removeAddedResult: async (tabId, handle) => {
-    const st = get();
-    const ref = st.addedResults[tabId]?.find((a) => a.handle === handle);
+    // Whether adding pinned it, by any tab: the last one to let go unpins it.
+    const pinned = pinnedByAdding(get(), handle);
     set((s) => {
       const r = s.runs[tabId];
       const runs = { ...s.runs };
@@ -536,18 +547,19 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       persistAdded(addedResults);
       return { runs, addedResults };
     });
-    if (ref?.pinned) await unpinIfUnused(get, handle);
+    if (pinned) await unpinIfUnused(get, handle);
   },
   dropAddedResults: (tabId) => {
     const refs = get().addedResults[tabId];
     if (!refs) return;
+    const pinned = new Set(refs.filter((a) => pinnedByAdding(get(), a.handle)).map((a) => a.handle));
     set((s) => {
       const addedResults = { ...s.addedResults };
       delete addedResults[tabId];
       persistAdded(addedResults);
       return { addedResults };
     });
-    for (const a of refs) if (a.pinned) void unpinIfUnused(get, a.handle);
+    for (const h of pinned) void unpinIfUnused(get, h);
   },
 
   handleJobEvent: (e) => {
@@ -689,6 +701,11 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     }
   },
 });
+
+/** Whether adding pinned this output, as any tab recorded it (the first to add pins it, the others share that). */
+function pinnedByAdding(st: State, handle: string): boolean {
+  return Object.values(st.addedResults).some((l) => l.some((a) => a.handle === handle && a.pinned));
+}
 
 /** Unpin an output adding pinned, unless another tab still shows it as added. */
 async function unpinIfUnused(get: () => State, handle: string) {

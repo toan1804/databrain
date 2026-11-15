@@ -49,9 +49,12 @@ export const OutputQueryTarget = createContext<
 export function OutputChip({
   output,
   compact,
+  readOnly,
 }: {
   output: OutputInfo;
   compact?: boolean;
+  /** Another tab's output shown here: no rename, pin or drop (they change it for its own tab). */
+  readOnly?: boolean;
 }) {
   const live =
     useStore((s) => s.outputs.find((o) => o.handle === output.handle)) ??
@@ -91,7 +94,7 @@ export function OutputChip({
           title={`${outputRef(o)} — click for actions${o.truncated ? "\nOnly the first rows are stored (row limit)" : ""}`}
           aria-label={`Output ${label}`}
           onClick={(e) => setMenu({ x: e.clientX, y: e.clientY + 8 })}
-          onDoubleClick={() => setRenaming(true)}
+          onDoubleClick={() => !readOnly && setRenaming(true)}
         >
           {o.pinned ? <Pin size={10} /> : <span className="text-muted">#</span>}
           {label}
@@ -141,17 +144,23 @@ export function OutputChip({
             label={`Copy ${outputRef(o)}`}
             onClick={() => (setMenu(null), void copyOutputRef(o))}
           />
-          <MenuItem
-            icon={<Pencil size={13} />}
-            label={o.name ? "Rename…" : "Name this output…"}
-            onClick={() => (setMenu(null), setRenaming(true))}
-          />
-          <MenuItem
-            icon={o.pinned ? <PinOff size={13} /> : <Pin size={13} />}
-            label={o.pinned ? "Unpin" : o.spilled ? "Can't pin: larger than memory (export it to keep it)" : "Pin (keep across runs and restarts)"}
-            disabled={o.state === "evicted" || (o.spilled && !o.pinned)}
-            onClick={() => (setMenu(null), void togglePin(o))}
-          />
+          {readOnly ? (
+            <div className="px-2 py-1 text-[11px] text-muted">Added from another tab: rename, pin or drop it there.</div>
+          ) : (
+            <>
+              <MenuItem
+                icon={<Pencil size={13} />}
+                label={o.name ? "Rename…" : "Name this output…"}
+                onClick={() => (setMenu(null), setRenaming(true))}
+              />
+              <MenuItem
+                icon={o.pinned ? <PinOff size={13} /> : <Pin size={13} />}
+                label={o.pinned ? "Unpin" : o.spilled ? "Can't pin: larger than memory (export it to keep it)" : "Pin (keep across runs and restarts)"}
+                disabled={o.state === "evicted" || (o.spilled && !o.pinned)}
+                onClick={() => (setMenu(null), void togglePin(o))}
+              />
+            </>
+          )}
           <MenuSeparator />
           <MenuItem
             icon={<TerminalSquare size={13} />}
@@ -188,13 +197,17 @@ export function OutputChip({
               onClick={() => (setMenu(null), void api.loadOutput(o.handle))}
             />
           )}
-          <MenuSeparator />
-          <MenuItem
-            icon={<Trash2 size={13} />}
-            label="Drop output…"
-            danger
-            onClick={() => (setMenu(null), dropOutput(o))}
-          />
+          {!readOnly && (
+            <>
+              <MenuSeparator />
+              <MenuItem
+                icon={<Trash2 size={13} />}
+                label="Drop output…"
+                danger
+                onClick={() => (setMenu(null), dropOutput(o))}
+              />
+            </>
+          )}
         </Popover>
       )}
       {compare && (

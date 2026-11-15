@@ -58,6 +58,15 @@ test("+ adds another tab's result here, read-only, and × closes it", async ({ p
   await expect.poll(async () => (await calls(page, "pin_output")).at(-1)).toEqual({ handle: "r7", pinned: true });
   await page.screenshot({ path: "test-results/add-result.png" });
 
+  // Its output chip: read actions only; rename, pin and drop belong to its own tab.
+  await page.getByRole("button", { name: "Output orders_dwh" }).click();
+  await expect(page.getByText("Added from another tab: rename, pin or drop it there.")).toBeVisible();
+  for (const name of [/Rename|Name this output/, /^Unpin|^Pin/, /Drop output/]) await expect(page.getByRole("button", { name })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Copy results\.orders_dwh/ })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "Output orders_dwh" }).dblclick();
+  await expect(page.getByLabel("Output name")).toHaveCount(0);
+
   // Not offered again while it is here.
   await page.getByRole("button", { name: "Add a result", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Add a result" })).toContainText("No other results yet");
