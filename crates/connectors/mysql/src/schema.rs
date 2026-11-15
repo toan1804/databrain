@@ -191,7 +191,10 @@ mod tests {
         // Only this test's schemas: tests running alongside create and change
         // theirs (`kb_tx`, made by the transaction-state test, also starts with `kb_`).
         let ours = |f: &std::collections::HashMap<String, String>| {
-            f.iter().filter(|(k, _)| matches!(k.as_str(), "kb_a" | "kb_b" | "kb_c")).map(|(k, v)| (k.clone(), v.clone())).collect::<std::collections::BTreeMap<_, _>>()
+            f.iter()
+                .filter(|(k, _)| matches!(k.as_str(), "kb_a" | "kb_b" | "kb_c"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>()
         };
         assert_eq!(ours(&f0), ours(&fps().await), "stable");
         run("alter table kb_a.customers add column name text").await;
