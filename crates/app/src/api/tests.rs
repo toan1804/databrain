@@ -1949,3 +1949,56 @@ fn duckdb_gets_the_memory_left_over() {
     assert_eq!(limit(GB), 512 << 20, "at least 512 MB");
     assert_eq!(duckdb_memory_limit(100 * GB, GB, GB), 80 * GB, "at most 80%");
 }
+
+/// A conversation closed while its cancelled turn still runs a statement:
+/// the statement's output, made after the leave, is let go when the turn
+/// ends, and the conversation is then forgotten.
+#[tokio::test]
+async fn a_conversation_left_during_a_turn_lets_late_outputs_go() {
+    let (st, _sink, dir) = state();
+    let cfg = ConnectionConfig {
+        kind: ConnectorKind::Sqlite,
+        host: None,
+        port: None,
+        database: None,
+        file_path: Some(dir.path().join("chat.db").to_string_lossy().into()),
+        auth: AuthMethod::None,
+        ssl_mode: Default::default(),
+        read_only: false,
+        options: Default::default(),
+        ssh: None,
+    };
+    let p = save_profile(&st, "chat", cfg, None);
+    let key = databrain_workspace::SessionRole::Ai { chat: "s".into(), part: databrain_workspace::AiPart::Query }.key();
+    let run = |sql: &str| databrain_query_engine::RunRequest {
+        connection_id: p.id.clone(),
+        tab_id: key.clone(),
+        sql: sql.into(),
+        base_offset: 0,
+        row_limit: None,
+        confirmed: true,
+        origin: Default::default(),
+        session_key: None,
+        output_name: None,
+        params: Default::default(),
+        output_masks: None,
+    };
+    let active = || st.engine.outputs().list().into_iter().filter(|o| o.tab_id == key && o.active).count();
+    st.engine.run_and_wait(&st.hub, run("select 1"), None).await.unwrap();
+    assert_eq!(active(), 1);
+    // A turn runs; the conversation is closed.
+    st.ai.runs.lock().insert("turn".into(), Default::default());
+    crate::ai_api::leave_session(&st, "s");
+    assert_eq!(active(), 0);
+    // Its statement finishes after the leave: active again.
+    st.engine.run_and_wait(&st.hub, run("select 2"), None).await.unwrap();
+    assert_eq!(active(), 1);
+    // The turn ends: let go, and nothing is left to remember.
+    st.ai.runs.lock().remove("turn");
+    crate::ai_api::release_left(&st.engine, &st.ai.left, &st.ai.runs);
+    assert_eq!(active(), 0);
+    assert!(st.ai.left.lock().is_empty());
+    // Left with no turn running: nothing to remember.
+    crate::ai_api::leave_session(&st, "t");
+    assert!(st.ai.left.lock().is_empty());
+}

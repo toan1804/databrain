@@ -394,7 +394,7 @@ impl ToolContext {
             let mut g = rs.lock();
             if g.is_on_disk() {
                 return Err(AiError::Internal(format!(
-                    "not run: this result ({} rows) is larger than memory, so its rows are on disk; a local aggregate loads every row into memory first, which would be a long-running query (or run out of memory). Query it with query_outputs as results.<name> instead: DuckDB reads the files from disk without loading them",
+                    "not run: this result ({} rows) is larger than memory, so its rows are on disk; a local aggregate loads every row into memory first, which would be a long-running query (or run out of memory). Query it with query_outputs as results.<name> instead: DuckDB reads its files in batches rather than all at once (still a long read for every row, so filter or aggregate in the SQL)",
                     g.total_rows()
                 )));
             }

@@ -453,10 +453,9 @@ impl QueryEngine {
         let mut bytes = 0usize;
         // Half the outputs budget, less what this run's earlier results hold
         // in memory: a script's results are all active (never freed), so
-        // together they stay within it too. At least 4 MB, so a small
-        // result still shows.
+        // together they stay within it too (see `result_memory_cap`).
         let earlier: usize = (0..stmt.index).map(|i| self.results.bytes_of(&format!("{job_id}:{i}"))).sum();
-        let max_bytes = (self.outputs.budget() / 2).saturating_sub(earlier).max(4 << 20);
+        let max_bytes = result_memory_cap(self.outputs.budget(), earlier);
         let mut too_big = false;
         // Free memory of the computer when it ran low (and the result stopped).
         let mut low_free: Option<u64> = None;
@@ -723,6 +722,17 @@ impl Drop for Unfinished<'_> {
 }
 
 /// What a result kept on disk tells the user.
+/// The memory statement N of a script may keep, `earlier` being what the
+/// statements before it keep: half the budget less that, and at least 4 MB
+/// (so a small result still shows) while the script is within the budget.
+/// Past it, 64 KB (and at least one row; the rest goes to disk where results
+/// spill, or is cut): each statement got 4 MB more before, never freed, so
+/// N statements kept N × 4 MB.
+pub(crate) fn result_memory_cap(budget: usize, earlier: usize) -> usize {
+    let floor = if earlier.saturating_add(4 << 20) <= budget { 4 << 20 } else { 64 << 10 };
+    (budget / 2).saturating_sub(earlier).max(floor)
+}
+
 /// Why a result stayed in memory ([`QueryEngine::spill`]).
 enum Spilled {
     Yes,
@@ -746,7 +756,7 @@ fn write_files(rs: &parking_lot::Mutex<databrain_result_store::ResultSet>, mut j
 
 fn on_disk_notice(disk_bytes: u64) -> String {
     format!(
-        "This result is larger than the memory a result may keep: its rows are on disk ({}) and read as you scroll. Sorting, filtering and find read them from disk, so they take longer.",
+        "This result is larger than the memory a result may keep: its rows are on disk ({}) and read as you scroll. Sorting, filtering, column statistics and charts apply to the rows loaded in the grid (scroll further to include more); find in the whole result, export, \"Load into…\" and SQL on results.<name> read every row.",
         crate::outputs::size_text(disk_bytes as usize)
     )
 }

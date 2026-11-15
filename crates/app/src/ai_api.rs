@@ -41,11 +41,15 @@ pub struct AiState {
     /// Pending UI requests (approval / editor proposal / editor state).
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     /// Running agent turns, cancellable by run id.
-    runs: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    pub(crate) runs: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// Cancels the in-progress interactive sign-in.
     pub sign_in_cancel: Arc<Mutex<CancellationToken>>,
     /// Knowledge index runs, cancellable by connection id.
     indexing: Arc<Mutex<HashMap<String, (u64, CancellationToken)>>>,
+    /// Conversations closed (left) while a turn may still run: a statement
+    /// of a cancelled turn can finish after the leave and make its outputs
+    /// active again, so each is left again when a turn ends.
+    pub(crate) left: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl AiState {
@@ -396,11 +400,15 @@ pub fn ai_send(state: &AppState, args: AiSendArgs) -> Result<String> {
     let runs = state.ai.runs.clone();
     let rid = run_id.clone();
     let session_id = args.request.session_id.clone().unwrap_or_default();
+    // Continued: no longer left.
+    state.ai.left.lock().remove(&session_id);
+    let (engine, left) = (state.engine.clone(), state.ai.left.clone());
     tokio::spawn(async move {
         if let Err(error) = agent.run(args.request, rid.clone(), host, sink.clone(), cancel).await {
             sink.emit(AgentEvent::Failed { session_id, run_id: rid.clone(), error });
         }
         runs.lock().remove(&rid);
+        release_left(&engine, &left, &runs);
     });
     Ok(run_id)
 }
@@ -483,8 +491,33 @@ pub fn session_messages(state: &AppState, session_id: &str) -> Result<Vec<AiMess
 /// A chat closed in the panel (still in history): its outputs stop being
 /// active, so the memory budget can free them; they stay listed.
 pub fn leave_session(state: &AppState, id: &str) {
+    leave_tabs(&state.engine, id);
+    // A turn still running (cancelled, finishing a statement) leaves it again when it ends.
+    if !state.ai.runs.lock().is_empty() {
+        state.ai.left.lock().insert(id.to_string());
+    }
+}
+
+fn leave_tabs(engine: &databrain_query_engine::QueryEngine, id: &str) {
     for part in databrain_workspace::AiPart::ALL {
-        state.engine.leave_tab(&databrain_workspace::SessionRole::Ai { chat: id.to_string(), part }.key());
+        engine.leave_tab(&databrain_workspace::SessionRole::Ai { chat: id.to_string(), part }.key());
+    }
+}
+
+/// A turn ended: the conversations left meanwhile are left again (outputs
+/// of a statement that finished after the leave stop being active); once no
+/// turn runs, none needs it any more.
+pub(crate) fn release_left(
+    engine: &databrain_query_engine::QueryEngine,
+    left: &Mutex<std::collections::HashSet<String>>,
+    runs: &Mutex<HashMap<String, CancellationToken>>,
+) {
+    let ids: Vec<String> = left.lock().iter().cloned().collect();
+    for id in &ids {
+        leave_tabs(engine, id);
+    }
+    if runs.lock().is_empty() {
+        left.lock().clear();
     }
 }
 

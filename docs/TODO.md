@@ -34,7 +34,7 @@ Fixed on 2026-11-15: catalog queries built with a literal a backslash could end 
 
 **Stop and the row limit** (Oracle, MySQL, the procedure row limit and the cloud polls fixed on 2026-11-15)
 - **Postgres:** inside a transaction the row limit reads the whole result to its end before finishing; a cancel that races a ready row is not sent to the server.
-- **SQLite, DuckDB:** cancelling a statement that waits for the session interrupts the one that is running, and the cancelled one then runs.
+- **SQLite, DuckDB:** cancelling a statement that waits for the session interrupts the one that is running, and the cancelled one then runs. SQLite: a statement cut at its memory cap (its stream cancelled) can interrupt the next statement of the script, which then fails as cancelled (seen with several large results in a row).
 - **MongoDB, Neo4j:** cancel and the row limit only drop the local future; the server keeps working. **ClickHouse** relies on the server noticing the closed response.
 - **Snowflake, BigQuery, Databricks:** the cancel on a failed poll is tested against a mock server only, not a live account; a Databricks or BigQuery submit that fails before the server answers can't be cancelled (no statement or job id yet).
 - **Oracle (Instant Client), SQL Server:** Stop, the wait-for-session check (Oracle) and the row limit on `EXEC` (SQL Server) are not tested live.
@@ -64,15 +64,9 @@ A review of the 54 commits since v0.4.1 (PRs #40–#53). Findings were checked o
 
 **Smaller**
 
-- The on-disk notice (`run.rs` `on_disk_notice`) still says sorting and filtering read from disk; since 0258ea8 they apply to the first rows loaded in the grid. It reaches the AI too.
-- The AI's `query_outputs` advice (`ai/src/tools/query.rs`) says DuckDB reads the files "without loading them"; in the sandbox every row is copied into an in-memory table that also spills, unchecked by `low_disk`.
-- Excel import silently drops end blocks with under 5% of the cells after a 3-row gap (`connectors/duckdb/src/xlsx.rs` `table_span`); the only trace is a SQL comment. Show `left_out` as a notice or in the import dialog.
-- macOS free memory (`app/src/sysmem.rs`): `mach_host_self()` is called on every read and its port reference never released; speculative and purgeable pages are left out, so free memory reads low and results go to disk early.
-- Each statement of a script keeps at least 4 MB that is never evicted (`run.rs`, `.max(4 << 20)`), so N statements can keep N × 4 MB.
+- In the AI's DuckDB sandbox, an output on disk is copied into a table of its own that also spills to disk, unchecked by `low_disk`.
 - The `get_array_memory_size` entry (buffers shared between batches counted once per batch) was removed from this file in #45 without a fix.
-- Closing a chat races its cancelled run (`aiCancel` and `aiLeaveSession` aren't ordered), so outputs of a statement that finishes after `leave_tab` stay active.
 - `SessionRole::is_ai()` is never used: nothing checks that AI or MCP SQL runs on an AI-role session key.
-- `ui/tsconfig.tsbuildinfo`, a build artifact, is committed (changed in 4529fa5).
 
 ## UI (second review, 2026-11-15)
 
