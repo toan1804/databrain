@@ -960,6 +960,34 @@ fn free_memory_is_read_sparingly() {
     assert_eq!(f.engine.outputs().low_memory(), None, "off");
 }
 
+/// A script whose results are each cut at their memory cap (the run loop
+/// stops each statement's stream) runs every statement: the stop of one
+/// never reaches the next (SQLite's interrupt is for the whole connection).
+#[tokio::test(flavor = "multi_thread")]
+async fn results_cut_at_their_cap_dont_stop_the_next_statement() {
+    let f = fixture(EnvTag::Dev);
+    f.engine.outputs().set_budget(0); // the 16 MB floor
+    let one = "with recursive n(i) as (select 1 union all select i + 1 from n where i < 100) select i, randomblob(100000) as b from n";
+    let sql = [one; 6].join(";\n");
+    for round in 0..10 {
+        let mut r = req(&f, &sql);
+        // Every other round each result is cut at once (a row limit of one).
+        r.row_limit = if round % 2 == 0 { None } else { Some(1) };
+        r.tab_id = format!("cut{round}");
+        let evs = tokio::time::timeout(Duration::from_secs(60), wait_job(&f, &started(f.engine.run(r).unwrap()))).await.expect("no hang");
+        let failed: Vec<String> = evs
+            .iter()
+            .filter_map(|e| match e {
+                JobEvent::StatementFailed { index, error, .. } => Some(format!("{index}: {}", error.message)),
+                _ => None,
+            })
+            .collect();
+        assert!(failed.is_empty(), "round {round}: {failed:?}");
+        let done = evs.iter().filter(|e| matches!(e, JobEvent::StatementFinished { result: Some(_), .. })).count();
+        assert_eq!(done, 6, "round {round}");
+    }
+}
+
 /// Lowering the budget frees older results at once (the latest of a tab stays).
 #[tokio::test]
 async fn a_lower_budget_frees_older_results() {

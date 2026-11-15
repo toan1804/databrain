@@ -51,7 +51,7 @@ impl Connector for SqliteConnector {
             cfg.file_path.clone().filter(|p| !p.trim().is_empty()).ok_or_else(|| ConnectorError::config("SQLite connection needs a database file path"))?;
         let read_only = cfg.read_only;
         let conn = tokio::task::spawn_blocking(move || open(&path, read_only)).await.map_err(|e| ConnectorError::internal(e.to_string()))??;
-        Ok(Box::new(SqliteSession { interrupt: Arc::new(conn.get_interrupt_handle()), conn: Arc::new(Mutex::new(conn)) }))
+        Ok(Box::new(SqliteSession { interrupt: Arc::new(conn.get_interrupt_handle()), conn: Arc::new(Mutex::new(conn)), running: Default::default() }))
     }
 }
 
@@ -89,6 +89,51 @@ fn map_err(e: rusqlite::Error) -> ConnectorError {
 pub struct SqliteSession {
     conn: Arc<Mutex<rusqlite::Connection>>,
     interrupt: Arc<rusqlite::InterruptHandle>,
+    running: Arc<Running>,
+}
+
+/// Which statement holds the connection, so Stop interrupts only its own
+/// statement: SQLite's interrupt stops whatever runs on the connection, so
+/// a Stop for a statement still waiting for it stopped the one running, and
+/// a Stop that arrived as a statement ended (the run loop cutting a result
+/// at its memory cap) could stop the next one.
+#[derive(Default)]
+struct Running {
+    current: Mutex<u64>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl Running {
+    /// A new statement's number (never 0).
+    fn ticket(&self) -> u64 {
+        self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
+    /// Statement `id` holds the connection (called with the connection's
+    /// lock held) until the returned guard drops.
+    fn start(self: &Arc<Self>, id: u64) -> RunningGuard {
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = id;
+        RunningGuard(self.clone(), id)
+    }
+
+    /// Run `f` (the interrupt) only while statement `id` holds the connection.
+    fn interrupt_if(&self, id: u64, f: impl FnOnce()) {
+        let current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        if *current == id {
+            f();
+        }
+    }
+}
+
+struct RunningGuard(Arc<Running>, u64);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        let mut current = self.0.current.lock().unwrap_or_else(|e| e.into_inner());
+        if *current == self.1 {
+            *current = 0;
+        }
+    }
 }
 
 impl SqliteSession {
@@ -318,15 +363,19 @@ impl Session for SqliteSession {
         let conn = self.conn.clone();
         let sql = sql.to_string();
 
-        // Interrupt the running statement when cancellation is requested.
+        // Interrupt this statement when cancellation is requested: only
+        // while it holds the connection (see [`Running`]).
         let interrupt_token = opts.cancel.clone();
         let done = tokio_util::sync::CancellationToken::new();
         let done_guard = done.clone();
         let interrupt = self.interrupt.clone();
+        let (running, id) = (self.running.clone(), self.running.ticket());
+        let watch = running.clone();
         tokio::spawn(async move {
             tokio::select! {
-                _ = interrupt_token.cancelled() => interrupt.interrupt(),
+                biased;
                 _ = done.cancelled() => {}
+                _ = interrupt_token.cancelled() => watch.interrupt_if(id, || interrupt.interrupt()),
             }
         });
 
@@ -339,6 +388,13 @@ impl Session for SqliteSession {
                     return;
                 }
             };
+            // Ends (before the connection is let go) when the statement does.
+            let _running = running.start(id);
+            // Stopped while it waited for the connection: it doesn't run.
+            if opts.cancel.is_cancelled() {
+                tx.blocking_send(Err(ConnectorError::cancelled()));
+                return;
+            }
             if let Err(e) = run_query(&guard, &sql, &opts, &tx) {
                 let e = if opts.cancel.is_cancelled() && e.kind != ErrorKind::Cancelled { ConnectorError::cancelled() } else { e };
                 tx.blocking_send(Err(e));
@@ -670,6 +726,78 @@ mod tests {
         assert!(err.is_cancelled(), "{err:?}");
         // Session is still usable afterwards.
         assert_eq!(exec(s.as_ref(), "select 1").await.num_rows(), 1);
+    }
+
+    /// Stop of a statement still waiting for the connection stops only it:
+    /// the one running goes on, and the stopped one never runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_while_waiting_stops_only_that_statement() {
+        let t = std::time::Duration::from_secs(10);
+        let s = session().await;
+        let long = "with recursive c(x) as (select 1 union all select x+1 from c where x < 3000000) select count(*) from c";
+        let running = s.execute(databrain_connector_core::Statement::internal(long), ExecOptions::default()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let stop = CancellationToken::new();
+        let waiting = s
+            .execute(databrain_connector_core::Statement::internal("create table stopped(a)"), ExecOptions { cancel: stop.clone(), ..Default::default() })
+            .await
+            .unwrap();
+        stop.cancel();
+        let r = tokio::time::timeout(t, running.collect()).await.expect("no hang").expect("the running statement isn't stopped");
+        assert_eq!(r.num_rows(), 1);
+        let e = tokio::time::timeout(t, waiting.collect()).await.expect("no hang").unwrap_err();
+        assert!(e.is_cancelled(), "{e:?}");
+        let n = tokio::time::timeout(t, exec(s.as_ref(), "select count(*) from sqlite_master where name = 'stopped'")).await.expect("no hang");
+        assert_eq!(n.batches[0].column(0).as_primitive::<Int64Type>().value(0), 0, "it never ran");
+    }
+
+    /// The interrupt reaches a statement only while it holds the connection:
+    /// a Stop whose watcher runs late (after its statement ended, or before
+    /// it started) interrupts nothing, whatever runs then.
+    #[test]
+    fn an_interrupt_reaches_only_its_own_statement() {
+        let r = Arc::new(Running::default());
+        let (a, b) = (r.ticket(), r.ticket());
+        let hits = std::cell::Cell::new(0);
+        r.interrupt_if(a, || hits.set(hits.get() + 1));
+        assert_eq!(hits.get(), 0, "a hasn't started: nothing to interrupt");
+        let held = r.start(a);
+        r.interrupt_if(a, || hits.set(hits.get() + 1));
+        r.interrupt_if(b, || hits.set(hits.get() + 10));
+        assert_eq!(hits.get(), 1, "a running: only a's Stop reaches it");
+        drop(held);
+        let _b = r.start(b);
+        r.interrupt_if(a, || hits.set(hits.get() + 100));
+        assert_eq!(hits.get(), 1, "a's late Stop doesn't reach b");
+    }
+
+    /// A Stop that arrives as its statement ends (the run loop cutting a
+    /// result at its memory cap) never stops the next statement.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_stop_never_reaches_the_next_statement() {
+        let t = std::time::Duration::from_secs(10);
+        let s = session().await;
+        let rows = "with recursive c(x) as (select 1 union all select x+1 from c where x < 20000) select x from c";
+        for _ in 0..50 {
+            let stop = CancellationToken::new();
+            let mut stream = s
+                .execute(databrain_connector_core::Statement::internal(rows), ExecOptions { batch_size: 100, cancel: stop.clone(), ..Default::default() })
+                .await
+                .unwrap();
+            // A batch is in: cut it here, as the run loop does, and read what is left.
+            while let Some(ev) = tokio::time::timeout(t, stream.next()).await.expect("no hang") {
+                if matches!(ev, Ok(StreamEvent::Batch(_))) {
+                    break;
+                }
+            }
+            stop.cancel();
+            while tokio::time::timeout(t, stream.next()).await.expect("no hang").is_some() {}
+            // The next statement runs to its end.
+            let next = tokio::time::timeout(t, s.execute(databrain_connector_core::Statement::internal(rows), ExecOptions::default()).await.unwrap().collect())
+                .await
+                .expect("no hang");
+            assert_eq!(next.expect("not stopped by the last one's Stop").num_rows(), 20000);
+        }
     }
 
     #[tokio::test]
