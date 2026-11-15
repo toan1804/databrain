@@ -3,6 +3,7 @@ import { announceSshHostKey, api, isTauri, toError } from "../lib/api";
 import { computeRunTips, slowStatements } from "../queryTips";
 import type { JobEvent, OutputInfo, ParamValue } from "../lib/types";
 import { errorRange } from "../lib/util";
+import { outputLabel } from "../lib/dataflow";
 import { ddlEffect } from "./explorerSlice";
 import { keptIndex, outputRun, persistAdded, persistTabs, restoredRun } from "./helpers";
 import { uid } from "../lib/util";
@@ -99,11 +100,11 @@ export interface RunsSlice {
   keepResult: (tabId: string, output: OutputInfo, kept: boolean) => Promise<void>;
   /** Results added to each tab from elsewhere (+ in its result tabs), remembered across restarts. */
   addedResults: Record<string, AddedResult[]>;
-  /** Show another result in this tab, read-only, until it is closed there; it is pinned so it stays. */
+  /** Show another tab's result in this tab, read-only, while its own tab keeps it (nothing is pinned or saved). */
   addResult: (tabId: string, output: OutputInfo) => Promise<void>;
-  /** Close a result added to the tab (unpinned when adding pinned it and no other tab shows it). */
-  removeAddedResult: (tabId: string, handle: string) => Promise<void>;
-  /** A tab closed: its added results go (unpinned as above). */
+  /** Close a result added to the tab. */
+  removeAddedResult: (tabId: string, handle: string) => void;
+  /** A tab closed: its added results are forgotten. */
   dropAddedResults: (tabId: string) => void;
   handleJobEvent: (e: JobEvent) => void;
   /** Index / partition / cluster-key tips for the run's slow statements. */
@@ -128,7 +129,13 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
         const catalogs = Object.fromEntries(
           Object.entries(s.catalogs).filter(([id, list]) => !(duck.has(id) && outputs.length > 0 && !list.some((x) => x.name === "results"))),
         );
-        return { outputs, objects, columns, schemas, catalogs };
+        // Added results last as long as their own tab keeps the output.
+        const live = new Set(outputs.filter((o) => o.state !== "evicted").map((o) => o.handle));
+        let gone: Partial<State> = {};
+        for (const [tabId, refs] of Object.entries(s.addedResults)) {
+          for (const r of refs) if (!live.has(r.handle)) gone = { ...gone, ...withoutAdded({ ...s, ...gone } as State, tabId, r.handle) };
+        }
+        return { outputs, objects, columns, schemas, catalogs, ...gone };
       });
       // Reload what the explorer shows open.
       const st = get();
@@ -178,10 +185,15 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
         // A dropped kept result leaves the tab; the shown one moves on if it was that.
         const kept = r.kept?.filter((x) => !(x.output && gone.has(x.output.handle)));
         const shownGone = r.activeIndex !== null && r.activeIndex < 0 && !kept?.some((x) => x.plan.index === r.activeIndex);
+        // Only added results there, all gone: the tab is as before anything ran.
+        if (!r.statements.length && !kept?.length && !r.running && r.kept?.every((x) => x.added)) {
+          delete runs[k];
+          continue;
+        }
         runs[k] = {
           ...r,
           kept,
-          activeIndex: shownGone ? lastShown(r.statements) : r.activeIndex,
+          activeIndex: shownGone ? (lastShown(r.statements) ?? kept?.at(-1)?.plan.index ?? null) : r.activeIndex,
           statements: r.statements.map((x) =>
             x.output && gone.has(x.output.handle) ? { ...x, output: undefined, result: undefined, notices: [...x.notices, `Output ${x.output.handle} was dropped. Run again to see rows.`] } : x,
           ),
@@ -485,82 +497,43 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       if (at) st.setActiveStatement(tabId, at.plan.index);
       return;
     }
-    const tabOpen = () => get().tabs.some((t) => t.id === tabId);
-    let o = get().outputs.find((x) => x.handle === output.handle) ?? output;
-    // Pinned by adding already (another tab added it): this tab shares that,
-    // so whichever lets go last unpins it.
-    let pinned = pinnedByAdding(get(), o.handle);
-    let pinnedNow = false;
-    try {
-      // Pinned so it stays when its own tab runs again or closes, and after a restart.
-      if (!o.pinned) {
-        o = await api.pinOutput(o.handle, true);
-        pinned = pinnedNow = true;
-        get().applyOutput(o);
-      }
-    } catch (e) {
-      // A result on disk can't be pinned: it is shown while its own tab keeps it.
-      get().toast(`${toError(e).message} It is shown here while its own tab keeps it.`, "info");
+    // Not pinned (that would save every row in the workspace and keep it
+    // for good): it is shown while its own tab keeps it.
+    // As it is now: it may have been freed or dropped since the list was opened.
+    const now = get().outputs.find((x) => x.handle === output.handle);
+    if (!now || now.state === "evicted") {
+      get().toast(`${outputLabel(output)} is no longer kept by its tab: run its query again to see it.`, "info");
+      return;
     }
-    // Every way out without adding undoes the pin made here.
-    const undo = async () => {
-      if (pinnedNow) await unpinIfUnused(get, o.handle);
-    };
-    if (!tabOpen()) return void (await undo());
+    let o = now;
     try {
       if (o.state === "on_disk") o = await api.loadOutput(o.handle);
     } catch (e) {
       get().toast(toError(e).message, "error");
-      return void (await undo());
+      return;
     }
-    // The tab closed meanwhile: nothing comes back for it.
-    if (!tabOpen()) return void (await undo());
     const added: StatementRun = { ...outputRun(o, keptIndex()), added: true };
     set((s) => {
+      // The tab closed meanwhile: nothing comes back for it.
+      if (!s.tabs.some((t) => t.id === tabId)) return {};
       const r = s.runs[tabId];
       const next: TabRun = r
         ? { ...r, kept: [...(r.kept ?? []), added], activeIndex: added.plan.index }
         : { jobId: null, running: false, startedAt: Date.now(), finishedStatus: "success", statements: [], kept: [added], activeIndex: added.plan.index };
-      const addedResults = { ...s.addedResults, [tabId]: [...(s.addedResults[tabId] ?? []), { handle: o.handle, pinned }] };
+      const addedResults = { ...s.addedResults, [tabId]: [...(s.addedResults[tabId] ?? []), { handle: o.handle }] };
       persistAdded(addedResults);
       return { runs: { ...s.runs, [tabId]: next }, addedResults };
     });
   },
-  removeAddedResult: async (tabId, handle) => {
-    // Whether adding pinned it, by any tab: the last one to let go unpins it.
-    const pinned = pinnedByAdding(get(), handle);
+  removeAddedResult: (tabId, handle) => set((s) => withoutAdded(s, tabId, handle)),
+  dropAddedResults: (tabId) =>
     set((s) => {
-      const r = s.runs[tabId];
-      const runs = { ...s.runs };
-      if (r) {
-        const gone = r.kept?.find((x) => x.added && x.output?.handle === handle);
-        const kept = r.kept?.filter((x) => x !== gone);
-        const activeIndex = gone && r.activeIndex === gone.plan.index ? (lastShown(r.statements) ?? kept?.at(-1)?.plan.index ?? null) : r.activeIndex;
-        // Nothing left to show: the tab is as before anything ran.
-        if (!r.statements.length && !kept?.length) delete runs[tabId];
-        else runs[tabId] = { ...r, kept, activeIndex };
-      }
-      const list = (s.addedResults[tabId] ?? []).filter((a) => a.handle !== handle);
-      const addedResults = { ...s.addedResults };
-      if (list.length) addedResults[tabId] = list;
-      else delete addedResults[tabId];
-      persistAdded(addedResults);
-      return { runs, addedResults };
-    });
-    if (pinned) await unpinIfUnused(get, handle);
-  },
-  dropAddedResults: (tabId) => {
-    const refs = get().addedResults[tabId];
-    if (!refs) return;
-    const pinned = new Set(refs.filter((a) => pinnedByAdding(get(), a.handle)).map((a) => a.handle));
-    set((s) => {
+      if (!s.addedResults[tabId]) return {};
       const addedResults = { ...s.addedResults };
       delete addedResults[tabId];
       persistAdded(addedResults);
       return { addedResults };
-    });
-    for (const h of pinned) void unpinIfUnused(get, h);
-  },
+    }),
 
   handleJobEvent: (e) => {
     if (e.type === "outputs_changed") {
@@ -702,19 +675,25 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
   },
 });
 
-/** Whether adding pinned this output, as any tab recorded it (the first to add pins it, the others share that). */
-function pinnedByAdding(st: State, handle: string): boolean {
-  return Object.values(st.addedResults).some((l) => l.some((a) => a.handle === handle && a.pinned));
-}
-
-/** Unpin an output adding pinned, unless another tab still shows it as added. */
-async function unpinIfUnused(get: () => State, handle: string) {
-  if (Object.values(get().addedResults).some((l) => l.some((a) => a.handle === handle))) return;
-  try {
-    get().applyOutput(await api.pinOutput(handle, false));
-  } catch {
-    // Already dropped.
+/** State without result `handle` added to tab `tabId`: its tab leaves the run
+ * (the shown one moves on), and the tab no longer remembers it. */
+function withoutAdded(s: State, tabId: string, handle: string): Partial<State> {
+  const r = s.runs[tabId];
+  const runs = { ...s.runs };
+  if (r) {
+    const gone = r.kept?.find((x) => x.added && x.output?.handle === handle);
+    const kept = r.kept?.filter((x) => x !== gone);
+    const activeIndex = gone && r.activeIndex === gone.plan.index ? (lastShown(r.statements) ?? kept?.at(-1)?.plan.index ?? null) : r.activeIndex;
+    // Nothing left to show: the tab is as before anything ran.
+    if (!r.statements.length && !kept?.length) delete runs[tabId];
+    else runs[tabId] = { ...r, kept, activeIndex };
   }
+  const list = (s.addedResults[tabId] ?? []).filter((a) => a.handle !== handle);
+  const addedResults = { ...s.addedResults };
+  if (list.length) addedResults[tabId] = list;
+  else delete addedResults[tabId];
+  persistAdded(addedResults);
+  return { runs, addedResults };
 }
 
 /** The results a new run of the tab keeps showing: those kept before, and

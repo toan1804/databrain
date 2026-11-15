@@ -76,7 +76,7 @@ export function AddResultPicker({ tabId, x, y, shown, onClose }: { tabId: string
             ))
           )}
         </div>
-        <div className="border-t border-line px-2 pt-1.5 text-[11px] text-muted">Shown read-only in this tab until you close it; it stays after a restart.</div>
+        <div className="border-t border-line px-2 pt-1.5 text-[11px] text-muted">Shown read-only here until you close it, or its own tab lets the result go (closed, dropped or freed). Nothing is pinned or saved.</div>
       </div>
     </Popover>
   );

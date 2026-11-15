@@ -125,14 +125,14 @@ export function parseParams(v: unknown, tabIds: string[]): Record<string, Record
   return out;
 }
 
-/** `editor_added_results` setting: { tabId: [{ handle, pinned }] }, for tabs that still exist. */
+/** `editor_added_results` setting: { tabId: [{ handle }] }, for tabs that still exist. */
 export function parseAdded(v: unknown, tabIds: string[]): Record<string, AddedResult[]> {
   const out: Record<string, AddedResult[]> = {};
   if (!v || typeof v !== "object") return out;
   for (const id of tabIds) {
     const list = (v as Record<string, unknown>)[id];
     if (!Array.isArray(list)) continue;
-    const ok = list.filter((x): x is AddedResult => !!x && typeof x === "object" && typeof (x as AddedResult).handle === "string").map((x) => ({ handle: x.handle, pinned: !!x.pinned }));
+    const ok = list.filter((x): x is AddedResult => !!x && typeof x === "object" && typeof (x as AddedResult).handle === "string").map((x) => ({ handle: x.handle }));
     if (ok.length) out[id] = ok;
   }
   return out;

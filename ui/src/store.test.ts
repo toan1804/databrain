@@ -17,11 +17,9 @@ let gate: Promise<void> | null = null;
 const cancelled: string[] = [];
 const closedTabs: string[] = [];
 const reran: string[] = [];
-/** pin_output calls, and whether they are refused (a result on disk). */
+/** pin_output calls (adding a result must make none). */
 const pins: [string, boolean][] = [];
-let pinRefused = false;
-/** While set, pin_output waits for it; loadOutput fails while loadFails. */
-let pinGate: Promise<void> | null = null;
+/** loadOutput fails while set. */
 let loadFails = false;
 
 vi.mock("./lib/api", () => ({
@@ -77,8 +75,6 @@ vi.mock("./lib/api", () => ({
     keepOutput: async (handle: string, kept: boolean) => ({ ...outputs.find((o) => o.handle === handle)!, kept }),
     pinOutput: async (handle: string, pinned: boolean) => {
       pins.push([handle, pinned]);
-      if (pinGate) await pinGate;
-      if (pinRefused) throw new Error("A result on disk can't be pinned.");
       return { ...outputs.find((o) => o.handle === handle)!, pinned };
     },
   },
@@ -496,13 +492,11 @@ describe("results added from another tab", () => {
   const other = (h: string, extra: Record<string, unknown> = {}) => out(h, "other", 0, { state: "live", connection_id: "c2", connection_name: "Warehouse", last_used: 1, ...extra });
   beforeEach(() => {
     pins.length = 0;
-    pinRefused = false;
-    pinGate = null;
     loadFails = false;
     useStore.setState({ addedResults: {}, tabs: [{ id: "t", title: "Q", sql: "", connection_id: "c" }, { id: "u", title: "Q2", sql: "", connection_id: "c" }] });
   });
 
-  it("shows it read-only, pinned so it stays, and carries it across the tab's runs", async () => {
+  it("shows it read-only without pinning it, and carries it across the tab's runs", async () => {
     const o = other("w1");
     outputs = [o];
     useStore.setState({ outputs });
@@ -510,8 +504,9 @@ describe("results added from another tab", () => {
     let run = useStore.getState().runs.t;
     expect(run.kept?.map((s) => [s.output?.handle, s.added])).toEqual([["w1", true]]);
     expect(shownStatement(run)?.output?.handle).toBe("w1");
-    expect(pins).toEqual([["w1", true]]);
-    expect(useStore.getState().addedResults.t).toEqual([{ handle: "w1", pinned: true }]);
+    expect(useStore.getState().addedResults.t).toEqual([{ handle: "w1" }]);
+    // Nothing pinned or saved for it.
+    expect(pins).toEqual([]);
     // Added twice: shown, not added again.
     await useStore.getState().addResult("t", o);
     expect(useStore.getState().runs.t.kept).toHaveLength(1);
@@ -522,79 +517,70 @@ describe("results added from another tab", () => {
     expect(run.statements.map((s) => s.plan.sql)).toEqual(["select 2"]);
   });
 
-  it("closing it unpins what adding pinned, when the last tab showing it lets go", async () => {
-    const o = other("w2");
-    outputs = [o];
+  it("leaves when its own tab lets the output go (dropped, freed, or the tab closed)", async () => {
+    const [a, b] = [other("w2"), other("w3")];
+    outputs = [a, b];
     useStore.setState({ outputs });
-    await useStore.getState().addResult("t", o);
-    // The second tab picks it from the list as it is now: already pinned (by the first add).
-    const now = useStore.getState().outputs.find((x) => x.handle === "w2")!;
-    expect(now.pinned).toBe(true);
-    await useStore.getState().addResult("u", now);
-    expect(pins).toEqual([["w2", true]]);
-    await useStore.getState().removeAddedResult("t", "w2");
+    await useStore.getState().addResult("t", a);
+    await useStore.getState().addResult("u", b);
+    // w2 dropped: gone from the tab that showed it.
+    useStore.getState().forgetOutputs(["w2"]);
     expect(useStore.getState().runs.t).toBeUndefined();
-    expect(pins.filter(([, p]) => !p)).toEqual([]);
-    // The last tab showing it closes: unpinned.
-    useStore.getState().closeTab("u");
-    await vi.waitFor(() => expect(pins.at(-1)).toEqual(["w2", false]));
+    expect(useStore.getState().addedResults.t).toBeUndefined();
+    // w3 freed (evicted) or gone from the list: it leaves at the next refresh.
+    const { api } = await import("./lib/api");
+    const listed = vi.fn(async () => [{ ...b, state: "evicted" }]);
+    (api as unknown as Record<string, unknown>).listOutputs = listed;
+    const real = await import("./lib/api");
+    const tauri = vi.spyOn(real, "isTauri").mockReturnValue(true);
+    await useStore.getState().refreshOutputs();
+    tauri.mockRestore();
+    expect(listed).toHaveBeenCalled();
+    expect(useStore.getState().runs.u).toBeUndefined();
     expect(useStore.getState().addedResults).toEqual({});
   });
 
-  it("a tab closed while its result is being added gets nothing back, and the pin is undone", async () => {
-    const o = other("w6");
+  it("a tab closed while its result loads gets nothing back; one that can't be loaded isn't added", async () => {
+    const o = other("w6", { state: "on_disk" });
     outputs = [o];
     useStore.setState({ outputs });
-    let open!: () => void;
-    pinGate = new Promise((r) => (open = r));
     const adding = useStore.getState().addResult("t", o);
     useStore.getState().closeTab("t");
-    open();
     await adding;
     expect(useStore.getState().runs.t).toBeUndefined();
     expect(useStore.getState().addedResults.t).toBeUndefined();
-    expect(pins).toEqual([
-      ["w6", true],
-      ["w6", false],
-    ]);
-  });
-
-  it("a result that can't be loaded isn't added, and its pin is undone", async () => {
-    const o = other("w7", { state: "on_disk" });
-    outputs = [o];
-    useStore.setState({ outputs });
     loadFails = true;
+    await useStore.getState().addResult("u", o);
+    expect(useStore.getState().runs.u).toBeUndefined();
+    expect(useStore.getState().addedResults.u).toBeUndefined();
+  });
+
+  it("one freed or dropped since the list opened isn't added, with one message", async () => {
+    const o = other("w8", { state: "evicted" });
+    outputs = [o];
+    const toasts: string[] = [];
+    const toast = useStore.getState().toast;
+    useStore.setState({ outputs, toast: (m: string) => void toasts.push(m) });
+    let loads = 0;
+    const { api } = await import("./lib/api");
+    const load = api.loadOutput;
+    (api as unknown as Record<string, unknown>).loadOutput = async (h: string) => (loads++, load(h));
+    await useStore.getState().addResult("t", { ...o, state: "live" });
+    useStore.setState({ outputs: [] });
     await useStore.getState().addResult("t", o);
+    (api as unknown as Record<string, unknown>).loadOutput = load;
+    useStore.setState({ toast });
     expect(useStore.getState().runs.t).toBeUndefined();
-    expect(useStore.getState().addedResults.t).toBeUndefined();
-    expect(pins).toEqual([
-      ["w7", true],
-      ["w7", false],
-    ]);
+    expect(loads).toBe(0);
+    // Freed, then gone from the list: one message each time, nothing loaded.
+    expect(toasts).toHaveLength(2);
+    for (const t of toasts) expect(t).toMatch(/^w8 is no longer kept by its tab: run its query again to see it\.$/);
   });
 
-  it("an output pinned before stays pinned, and one that can't be pinned is still shown", async () => {
-    const pinned = other("w3", { pinned: true });
-    const onDisk = other("w4", { state: "on_disk" });
-    outputs = [pinned, onDisk];
-    useStore.setState({ outputs });
-    await useStore.getState().addResult("t", pinned);
-    expect(pins).toEqual([]);
-    pinRefused = true;
-    await useStore.getState().addResult("t", onDisk);
-    expect(useStore.getState().runs.t.kept?.map((s) => s.output?.handle)).toEqual(["w3", "w4"]);
-    expect(useStore.getState().addedResults.t).toEqual([
-      { handle: "w3", pinned: false },
-      { handle: "w4", pinned: false },
-    ]);
-    await useStore.getState().removeAddedResult("t", "w3");
-    expect(pins.filter(([, p]) => !p)).toEqual([]);
-  });
-
-  it("comes back after a restart while its output exists", async () => {
+  it("comes back after a restart only while its output exists", async () => {
     const o = other("w5");
     outputs = [o];
-    useStore.setState({ outputs, runs: {}, addedResults: { t: [{ handle: "w5", pinned: true }], u: [{ handle: "gone", pinned: true }] } });
+    useStore.setState({ outputs, runs: {}, addedResults: { t: [{ handle: "w5" }], u: [{ handle: "gone" }] } });
     await useStore.getState().restoreTabOutputs();
     const run = useStore.getState().runs.t;
     expect(run.kept?.map((s) => [s.output?.handle, s.added])).toEqual([["w5", true]]);
@@ -604,7 +590,7 @@ describe("results added from another tab", () => {
 
   it("is read from the setting for tabs that still exist", async () => {
     const { parseAdded } = await import("./store/helpers");
-    expect(parseAdded({ t: [{ handle: "a", pinned: true }, { nope: 1 }], gone: [{ handle: "b" }] }, ["t"])).toEqual({ t: [{ handle: "a", pinned: true }] });
+    expect(parseAdded({ t: [{ handle: "a", pinned: true }, { nope: 1 }], gone: [{ handle: "b" }] }, ["t"])).toEqual({ t: [{ handle: "a" }] });
     expect(parseAdded(null, ["t"])).toEqual({});
   });
 });
