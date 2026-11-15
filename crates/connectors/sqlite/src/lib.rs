@@ -167,6 +167,22 @@ fn to_value(v: ValueRef<'_>) -> (Value, ValueKind) {
     }
 }
 
+/// Whether column type `t` holds `v` as it is (not NULL, not rounded).
+fn fits(t: ColType, v: &Value) -> bool {
+    match (t, v) {
+        (_, Value::Null) => true,
+        (ColType::Int64, Value::Int(_)) => true,
+        // Whole numbers SQLite keeps as REAL fit within 2^53.
+        (ColType::Int64, Value::Float(f)) => f.fract() == 0.0 && f.abs() < 9.0e15,
+        (ColType::Float64, Value::Float(_)) => true,
+        (ColType::Float64, Value::Int(i)) => i.unsigned_abs() <= 1 << 53,
+        (ColType::Bool, Value::Int(i)) => *i == 0 || *i == 1,
+        (ColType::Binary, Value::Bytes(_) | Value::Text(_)) => true,
+        (ColType::Utf8, _) => true,
+        _ => false,
+    }
+}
+
 /// Runs on a blocking thread; streams rows through `tx`.
 fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
     let mut stmt = conn.prepare(sql).map_err(map_err)?;
@@ -186,7 +202,14 @@ fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &St
     let mut first: Vec<Vec<Value>> = Vec::with_capacity(batch_size);
     let mut kinds: Vec<Vec<ValueKind>> = vec![Vec::new(); ncols];
     let mut exhausted = false;
+    // The row limit: SQLite makes rows as they're read, so it stops there.
+    let max = opts.max_rows.unwrap_or(usize::MAX);
+    let mut taken = 0usize;
     while first.len() < batch_size {
+        if first.len() >= max {
+            exhausted = true;
+            break;
+        }
         if opts.cancel.is_cancelled() {
             return Err(ConnectorError::cancelled());
         }
@@ -210,8 +233,12 @@ fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &St
     let columns: Vec<Column> = meta
         .iter()
         .zip(kinds.iter())
-        .map(|((name, decl), k)| {
-            let t = affinity(decl).unwrap_or_else(|| infer(k.iter().copied()));
+        .enumerate()
+        .map(|(i, ((name, decl), k))| {
+            // SQLite keeps any value in any column: the declared type only
+            // when every value read fits it (`'n/a'` in an INTEGER column
+            // would show as NULL), else the type the values need.
+            let t = affinity(decl).filter(|t| first.iter().all(|r| fits(*t, &r[i]))).unwrap_or_else(|| infer(k.iter().copied()));
             let db_type = if decl.is_empty() { "ANY" } else { decl };
             Column::new(name.clone(), t, db_type)
         })
@@ -223,10 +250,14 @@ fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &St
     }
     for r in first {
         builder.push_row(r);
+        taken += 1;
     }
 
     if !exhausted {
         loop {
+            if taken >= max {
+                break;
+            }
             if builder.is_full() && !tx.blocking_send(Ok(StreamEvent::Batch(builder.finish()?))) {
                 return Ok(());
             }
@@ -240,6 +271,7 @@ fn run_query(conn: &rusqlite::Connection, sql: &str, opts: &ExecOptions, tx: &St
                         r.push(to_value(row.get_ref(i).map_err(map_err)?).0);
                     }
                     builder.push_row(r);
+                    taken += 1;
                 }
                 None => break,
             }
@@ -346,7 +378,7 @@ impl Session for SqliteSession {
         self.with_conn(move |c| {
             let sql = format!(
                 "SELECT name, type FROM {}.sqlite_master \
-                 WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name",
+                 WHERE type IN ('table','view') AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY type, name",
                 quote_ident(ConnectorKind::Sqlite, &schema)
             );
             let mut stmt = c.prepare(&sql).map_err(map_err)?;
@@ -550,6 +582,54 @@ mod tests {
         assert_eq!(schema.field(3).data_type(), &DataType::Binary);
         assert_eq!(schema.field(4).data_type(), &DataType::Float64); // inferred
         assert_eq!(r.num_rows(), 2);
+    }
+
+    /// A value that doesn't fit its column's declared type (SQLite keeps
+    /// it): the column takes the type the values need, nothing shows as
+    /// NULL. Columns whose values fit keep their declared type.
+    #[tokio::test]
+    async fn values_that_dont_fit_the_declared_type_are_kept() {
+        let s = session().await;
+        exec(s.as_ref(), "create table t(n integer, r real, flag boolean, ok integer)").await;
+        exec(s.as_ref(), "insert into t values (1, 1.5, 1, 7), ('n/a', 'unknown', 2, 8), (2.5, x'00', 0, 9)").await;
+        let r = exec(s.as_ref(), "select * from t").await;
+        let schema = r.schema.clone().unwrap();
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(2).data_type(), &DataType::Int64, "2 is not a boolean");
+        assert_eq!(schema.field(3).data_type(), &DataType::Int64, "fits: declared type kept");
+        let b = &r.batches[0];
+        assert_eq!(b.column(0).null_count(), 0);
+        assert_eq!(b.column(0).as_string::<i32>().value(1), "n/a");
+        assert_eq!(b.column(1).as_string::<i32>().value(1), "unknown");
+        assert!(r.notices.is_empty(), "{:?}", r.notices);
+    }
+
+    /// The row limit stops reading: only `max_rows` rows come back.
+    #[tokio::test]
+    async fn max_rows_is_read() {
+        let s = session().await;
+        let sql = "with recursive c(x) as (select 1 union all select x+1 from c where x < 5000) select x from c";
+        for (batch, max) in [(100, 250), (1000, 250), (100, 5000), (100, 1)] {
+            let opts = ExecOptions { batch_size: batch, max_rows: Some(max), cancel: CancellationToken::new(), ..Default::default() };
+            let r = s.execute(databrain_connector_core::Statement::internal(sql), opts).await.unwrap().collect().await.unwrap();
+            assert_eq!(r.num_rows(), max, "batch {batch}");
+        }
+    }
+
+    /// SQLite's own tables (`sqlite_…`) are left out; a table whose name
+    /// only starts like one (`sqlitex`, `sqlite1`) is listed.
+    #[tokio::test]
+    async fn tables_named_like_sqlite_are_listed() {
+        let s = session().await;
+        for sql in
+            ["create table sqlitex(a)", "create table sqlite1(a)", "create table s(a integer primary key autoincrement)", "insert into s(a) values (null)"]
+        {
+            exec(s.as_ref(), sql).await;
+        }
+        let names: Vec<String> = s.list_objects("main").await.unwrap().into_iter().map(|o| o.name).collect();
+        assert!(names.contains(&"sqlitex".to_string()) && names.contains(&"sqlite1".to_string()), "{names:?}");
+        assert!(!names.iter().any(|n| n == "sqlite_sequence"), "{names:?}");
     }
 
     #[tokio::test]
