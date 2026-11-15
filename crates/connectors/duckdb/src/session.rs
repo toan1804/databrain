@@ -23,6 +23,52 @@ pub struct DuckSession {
     /// Transactions, followed from the statements run: the driver's
     /// `is_autocommit()` always says yes.
     pub(crate) state: Arc<databrain_connector_core::conn_state::ConnState>,
+    /// Which statement holds the connection (see [`Running`]).
+    pub(crate) running: Arc<Running>,
+}
+
+/// Which statement holds the connection, so Stop interrupts only its own
+/// statement: DuckDB's interrupt stops whatever runs on the connection, so a
+/// Stop for a statement still waiting for it stopped the one running (and
+/// the stopped one then ran), and a Stop whose watcher ran late could reach
+/// the next statement.
+#[derive(Default)]
+pub(crate) struct Running {
+    current: Mutex<u64>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl Running {
+    /// A new statement's number (never 0).
+    fn ticket(&self) -> u64 {
+        self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
+    /// Statement `id` holds the connection (called with the connection's
+    /// lock held) until the returned guard drops.
+    fn start(self: &Arc<Self>, id: u64) -> RunningGuard {
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = id;
+        RunningGuard(self.clone(), id)
+    }
+
+    /// Run `f` (the interrupt) only while statement `id` holds the connection.
+    fn interrupt_if(&self, id: u64, f: impl FnOnce()) {
+        let current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        if *current == id {
+            f();
+        }
+    }
+}
+
+pub(crate) struct RunningGuard(Arc<Running>, u64);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        let mut current = self.0.current.lock().unwrap_or_else(|e| e.into_inner());
+        if *current == self.1 {
+            *current = 0;
+        }
+    }
 }
 
 impl DuckSession {
@@ -89,7 +135,7 @@ impl Session for DuckSession {
 
     async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
         let sql = stmt.sql();
-        self.state.observe(sql, ConnectorKind::Duckdb);
+        let state = self.state.clone();
         let (tx, stream) = QueryStream::channel(4);
         let conn = self.conn.clone();
         let sql = sql.to_string();
@@ -105,11 +151,14 @@ impl Session for DuckSession {
         // alive until this task ends; `biased` checks `done` first so a query
         // that already finished is never interrupted.
         let keepalive = conn.clone();
+        // Interrupted only while this statement holds the connection.
+        let (running, id) = (self.running.clone(), self.running.ticket());
+        let watch = running.clone();
         tokio::spawn(async move {
             tokio::select! {
                 biased;
                 _ = done.cancelled() => {}
-                _ = cancel.cancelled() => interrupt.interrupt(),
+                _ = cancel.cancelled() => watch.interrupt_if(id, || interrupt.interrupt()),
             }
             drop(keepalive);
         });
@@ -119,6 +168,15 @@ impl Session for DuckSession {
                 tx.blocking_send(Err(ConnectorError::internal("lock poisoned")));
                 return;
             };
+            // Ends (before the connection is let go) when the statement does.
+            let _running = running.start(id);
+            // Stopped while it waited for the connection: it doesn't run.
+            if opts.cancel.is_cancelled() {
+                tx.blocking_send(Err(ConnectorError::cancelled()));
+                return;
+            }
+            // Followed as it runs (a statement stopped before it ran changes nothing).
+            state.observe(&sql, ConnectorKind::Duckdb);
             if let Err(e) = run(&g, &sql, &opts, &tx, outputs.as_deref(), shared, sandboxed) {
                 let e = if opts.cancel.is_cancelled() {
                     ConnectorError::cancelled()
@@ -422,7 +480,55 @@ mod tests {
     use crate::test_util::*;
     use databrain_auth::AuthMethod;
 
-    use databrain_connector_core::{ConnectionConfig, ConnectorKind};
+    use databrain_connector_core::{CancellationToken, ConnectionConfig, ConnectorKind, ExecOptions, Statement};
+
+    /// Stop of a statement still waiting for the connection stops only it:
+    /// the one running goes on, and the stopped one never runs. A Stop of the
+    /// running one still stops it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_while_waiting_stops_only_that_statement() {
+        let t = std::time::Duration::from_secs(20);
+        let s = session(ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None)).await;
+        let long = "select count(*) from range(400000000) a where a.range % 7 = 3";
+        let running = s.execute(Statement::internal(long), ExecOptions::default()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let stop = CancellationToken::new();
+        let waiting = s.execute(Statement::internal("create table stopped(a int)"), ExecOptions { cancel: stop.clone(), ..Default::default() }).await.unwrap();
+        stop.cancel();
+        let r = tokio::time::timeout(t, running.collect()).await.expect("no hang").expect("the running statement isn't stopped");
+        assert_eq!(r.num_rows(), 1);
+        let e = tokio::time::timeout(t, waiting.collect()).await.expect("no hang").unwrap_err();
+        assert!(e.is_cancelled(), "{e:?}");
+        let n = tokio::time::timeout(t, q(&*s, "select count(*) from duckdb_tables() where table_name = 'stopped'")).await.expect("no hang");
+        let n = databrain_connector_core::arrow::util::display::array_value_to_string(n.batches[0].column(0), 0).unwrap();
+        assert_eq!(n, "0", "it never ran");
+        // A real Stop still stops the running statement.
+        let stop = CancellationToken::new();
+        let running = s.execute(Statement::internal(long), ExecOptions { cancel: stop.clone(), ..Default::default() }).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stop.cancel();
+        let e = tokio::time::timeout(t, running.collect()).await.expect("stopped quickly").unwrap_err();
+        assert!(e.is_cancelled(), "{e:?}");
+        assert_eq!(tokio::time::timeout(t, q(&*s, "select 1")).await.expect("no hang").num_rows(), 1, "still usable");
+    }
+
+    /// The interrupt reaches a statement only while it holds the connection.
+    #[test]
+    fn an_interrupt_reaches_only_its_own_statement() {
+        let r = Arc::new(Running::default());
+        let (a, b) = (r.ticket(), r.ticket());
+        let hits = std::cell::Cell::new(0);
+        r.interrupt_if(a, || hits.set(hits.get() + 1));
+        assert_eq!(hits.get(), 0, "not started");
+        let held = r.start(a);
+        r.interrupt_if(b, || hits.set(hits.get() + 10));
+        r.interrupt_if(a, || hits.set(hits.get() + 1));
+        assert_eq!(hits.get(), 1);
+        drop(held);
+        let _b = r.start(b);
+        r.interrupt_if(a, || hits.set(hits.get() + 100));
+        assert_eq!(hits.get(), 1, "a's late Stop doesn't reach b");
+    }
 
     #[tokio::test]
     async fn catalogs_first() {
