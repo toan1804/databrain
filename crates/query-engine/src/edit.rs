@@ -395,7 +395,7 @@ impl QueryEngine {
         let no = |why: &str| Err(EngineError::new("invalid", why.to_string()));
         let profile = self.workspace().get_connection(&o.connection_id)?;
         // Why it can't be edited, before anything else (the editor shows it).
-        Self::check_intent(&profile, &Intent::Edit)?;
+        Self::check_intent(&profile, &Intent::Edit { confirmed: true })?;
         if !profile.config.kind.traits().language.is_sql() {
             return no("Only results of SQL databases can be edited");
         }
@@ -490,13 +490,20 @@ impl QueryEngine {
     /// Run the statements on the session `session_key` (the tab's), all or
     /// nothing where the database allows it.
     pub async fn apply_edits(&self, t: &EditTarget, session_key: &str, stmts: &[EditStatement]) -> Result<ApplyReport> {
+        self.apply_edits_with(t, session_key, stmts, false).await
+    }
+
+    /// [`Self::apply_edits`]; `confirmed`: the user agreed to save on a
+    /// production connection (without it the save is refused there with
+    /// `needs_confirmation`, as a run or a load is).
+    pub async fn apply_edits_with(&self, t: &EditTarget, session_key: &str, stmts: &[EditStatement], confirmed: bool) -> Result<ApplyReport> {
         if stmts.is_empty() {
             return Ok(ApplyReport::default());
         }
         let hold =
             Hold::session(session_key, databrain_connector_core::CancellationToken::new(), "A query is running in this tab: wait for it to finish, then apply");
         // The connection as it is now (made read-only since the target was read: refused).
-        let (profile, _claim) = self.guarded_or_refuse(&t.connection_id, Some(hold), Intent::Edit)?;
+        let (profile, _claim) = self.guarded_or_refuse(&t.connection_id, Some(hold), Intent::Edit { confirmed })?;
         let kind = profile.config.kind;
         let session = self.session(&t.connection_id, session_key).await?;
         let run = |sql: String| {

@@ -17,8 +17,9 @@ pub(crate) enum Intent<'p> {
     /// Write rows into `table` (loads). A dry run keeps nothing, so it
     /// doesn't ask on production.
     Load { table: &'p str, confirmed: bool, dry: bool },
-    /// Save grid edits (the user reviewed the statements before saving).
-    Edit,
+    /// Save grid edits. `confirmed`: the user agreed to the prompt on a
+    /// production connection (also set where only editability is asked).
+    Edit { confirmed: bool },
     /// Only read: a plan, a query run again for an export or a load's
     /// rows. The caller has checked that the statement reads.
     Inspect,
@@ -91,9 +92,13 @@ impl QueryEngine {
                 }
                 Ok(Vec::new())
             }
-            Intent::Edit => {
+            Intent::Edit { confirmed } => {
                 if read_only {
                     return Err(EngineError::new("invalid", "The connection is read-only"));
+                }
+                // Like a run or a load: writes to production are confirmed.
+                if !confirmed && profile.env == EnvTag::Prod {
+                    return Ok(vec![format!("\"{}\" is a production connection: confirm saving the edited rows.", profile.name)]);
                 }
                 Ok(Vec::new())
             }

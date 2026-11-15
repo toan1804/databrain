@@ -100,6 +100,37 @@ export function Check({ checked, onChange, label, help }: { checked: boolean; on
 
 export type Section = "general" | "auth" | "ssh" | "ai";
 
+/** `a, b, c` as a list: trimmed, without empty entries. */
+export function parseCommaList(text: string): string[] {
+  return text
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+/**
+ * A comma-separated list, kept as typed while editing and parsed on every
+ * change. Showing the parsed list back instead would drop the comma just
+ * typed, so the next entry joined the one before it (`email, phone`
+ * became the single pattern `emailphone`, which matches nothing).
+ */
+export function CommaListInput({ id, value, onChange, placeholder }: { id: string; value: string[]; onChange: (list: string[]) => void; placeholder?: string }) {
+  const [text, setText] = useState(() => value.join(", "));
+  return (
+    <input
+      id={id}
+      className="field font-mono text-[12px]"
+      value={text}
+      placeholder={placeholder}
+      spellCheck={false}
+      onChange={(e) => {
+        setText(e.target.value);
+        onChange(parseCommaList(e.target.value));
+      }}
+    />
+  );
+}
+
 /** Read and write table rules for the AI (LIKE patterns), with a "try a table" check. */
 export function TableAccessFields({ policy, setPolicy }: { policy: AiPolicy; setPolicy: (p: AiPolicy) => void }) {
   // Kept as typed while editing; parsed into the policy on every change.

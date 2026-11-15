@@ -54,7 +54,8 @@ export const editorBridge = {
     return { sql: v.state.doc.toString(), selection: to > from ? v.state.sliceDoc(from, to) : null };
   },
   /**
-   * Apply an accepted AI proposal. Returns false if the editor is gone.
+   * Apply an accepted AI proposal. Returns false if the editor is gone, or
+   * the text a `replace_selection` proposal was made for is no longer there.
    * `target` is the text the proposal was made for (the selection then): a
    * `replace_selection` edit replaces it even if the selection has moved since.
    */
@@ -73,6 +74,12 @@ export const editorBridge = {
       if (best >= 0) {
         from = best;
         to = best + target.length;
+      } else {
+        // The text the proposal was made for is no longer in the editor
+        // (it was edited since): nothing says where the proposal belongs,
+        // and replacing whatever is selected now, or the whole script,
+        // would lose text the proposal never saw.
+        return false;
       }
     }
     const change =

@@ -85,3 +85,37 @@ describe("loading into a production connection", () => {
     expect(steps).toEqual(["start", "pause"]);
   });
 });
+
+describe("loading with a mode that removes rows", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    useStore.setState({ connections: [], confirm: null });
+  });
+
+  it("asks on any connection, naming the table and what happens", async () => {
+    withEnv("dev");
+    const load = vi.spyOn(api, "loadResult").mockResolvedValue(report);
+    for (const mode of ["truncate", "replace", "sync"] as const) {
+      const p = loadResultAsking("r", { ...args, mode }, "l");
+      await vi.waitFor(() => expect(useStore.getState().confirm).not.toBeNull());
+      const text = useStore.getState().confirm!.reasons.join(" ");
+      expect(text).toContain('t on "Main"');
+      await answer(false);
+      expect(await p).toBeNull();
+    }
+    expect(load).not.toHaveBeenCalled();
+    // Agreed: loaded (not marked as a production confirmation: it isn't one).
+    const p = loadResultAsking("r", { ...args, mode: "truncate" }, "l");
+    await answer(true);
+    expect(await p).toEqual(report);
+    expect(load).toHaveBeenCalledWith("r", { ...args, mode: "truncate", confirmed: false }, "l");
+  });
+
+  it("does not ask for an append outside production", async () => {
+    withEnv("dev");
+    const load = vi.spyOn(api, "loadResult").mockResolvedValue(report);
+    expect(await loadResultAsking("r", args, "l")).toEqual(report);
+    expect(useStore.getState().confirm).toBeNull();
+    expect(load).toHaveBeenCalledOnce();
+  });
+});

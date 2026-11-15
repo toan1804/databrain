@@ -161,12 +161,23 @@ pub async fn apply_edits(
     result_id: &str,
     changes: Vec<databrain_query_engine::edit::RowChange>,
 ) -> Result<databrain_query_engine::edit::ApplyReport> {
+    apply_edits_confirmed(state, result_id, changes, false).await
+}
+
+/// [`apply_edits`]; `confirmed`: the user agreed to save on a production
+/// connection (refused there without it, code `needs_confirmation`).
+pub async fn apply_edits_confirmed(
+    state: &AppState,
+    result_id: &str,
+    changes: Vec<databrain_query_engine::edit::RowChange>,
+    confirmed: bool,
+) -> Result<databrain_query_engine::edit::ApplyReport> {
     let (o, schema) = edit_source(state, result_id)?;
     // The target again (not the UI's copy), read from the database: the key
     // and columns it allows now.
     let target = state.engine.edit_target(&o, &schema, false).await?;
     let stmts = state.engine.edit_statements(&target, &schema, &changes)?;
-    state.engine.apply_edits(&target, o.session(), &stmts).await
+    state.engine.apply_edits_with(&target, o.session(), &stmts, confirmed).await
 }
 
 /// Foreign keys from and to the table a result was read from.

@@ -143,7 +143,8 @@ export function columnUses(stmt: string): ColUse[] {
       const use: ColUse = { qual: m[1] ? unquote(m[1]).toLowerCase() : undefined, name, from, to: from + raw.length };
       if (/^\s*::/.test(after)) {
         use.wrappedBy = "::";
-        use.wrapText = (m[0] + after.match(/^\s*::\s*\w+/)![0]).trim();
+        // A cast to a quoted type (`::"char"`) has no bare word after `::`.
+        use.wrapText = (m[0] + (after.match(/^\s*::\s*(?:\w+|"[^"]*")/)?.[0] ?? "::")).trim();
       } else {
         // Innermost unclosed "(" before the column, inside this predicate.
         let depth = 0;

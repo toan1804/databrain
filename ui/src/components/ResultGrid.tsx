@@ -344,11 +344,42 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
     edit.onEdits(setCell(edit.edits, who.id, who.key, col, original, value));
   };
 
-  /** View rows of the selection (or the focused cell's row). */
+  /**
+   * View rows of the selection (or the focused cell's row): exactly the
+   * rows picked, not what lies between them (Cmd-click picks rows apart).
+   */
   const selectedRows = (): number[] => {
+    if (selection.rows.length > 0) return selection.rows.toArray();
     const r = selectedRange();
     if (!r) return [];
-    return Array.from({ length: Math.min(r.limit, 10_000) }, (_, i) => r.offset + i);
+    return Array.from({ length: r.limit }, (_, i) => r.offset + i);
+  };
+
+  /** Rows picked apart from each other: a range can't say them. */
+  const rowsApart = useCallback((): boolean => {
+    const n = selection.rows.length;
+    return n > 1 && selection.rows.last()! - selection.rows.first()! + 1 !== n;
+  }, [selection]);
+
+  /**
+   * The selected rows for an action that changes them, or null (with the
+   * reason shown) when it can't act on all of them: a row whose page was
+   * never loaded has no key here, and silently leaving it out would look
+   * as if the whole selection was done.
+   */
+  const rowsToChange = (what: string): { id: number; key: (string | null)[] }[] | null => {
+    const picked = selectedRows().filter((r) => r < rows);
+    if (picked.length > 10_000) {
+      toast(`${picked.length.toLocaleString()} rows are selected: ${what} at most 10,000 at a time`, "error");
+      return null;
+    }
+    const who = picked.map(rowIdentity);
+    const missing = who.filter((x) => !x).length;
+    if (missing > 0) {
+      toast(`${missing.toLocaleString()} of the selected rows aren't loaded yet (scroll through them first): nothing was changed`, "error");
+      return null;
+    }
+    return who as { id: number; key: (string | null)[] }[];
   };
 
   const highlights = useMemo<Highlight[]>(() => {
@@ -394,6 +425,11 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
   const copy = useCallback(
     async (format: ExportFormat, header: boolean, range = selectedRange()) => {
       if (!range) return;
+      // A range is first-to-last: rows picked apart would copy what lies between them too.
+      if (rowsApart()) {
+        toast("The selected rows are not next to each other: select a block of rows to copy", "error");
+        return;
+      }
       try {
         const text = await api.copyRows(info.id, view, range.offset, range.limit, {
           format,
@@ -410,7 +446,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         toast(toError(e).message, "error");
       }
     },
-    [info.id, view, dialect, selectedRange, toast],
+    [info.id, view, dialect, selectedRange, rowsApart, toast],
   );
 
   const editCellNow = useEvent((col: number, row: number, value: string | null) => editCell(col, row, value));
@@ -608,7 +644,8 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
               onClick={() => {
                 setMenu(null);
                 const r = selectedRange();
-                if (r) onTranspose({ cols: r.cols, offset: r.offset, limit: r.limit });
+                if (rowsApart()) toast("The selected rows are not next to each other: select a block of rows to transpose", "error");
+                else if (r) onTranspose({ cols: r.cols, offset: r.offset, limit: r.limit });
               }}
             />
           )}
@@ -641,8 +678,8 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
                     label="Delete / undelete row(s)"
                     onClick={() => {
                       setMenu(null);
-                      const who = selectedRows().filter((r) => r < rows).map(rowIdentity).filter((x): x is { id: number; key: (string | null)[] } => !!x);
-                      edit.onEdits(toggleDelete(edit.edits, who));
+                      const who = rowsToChange("delete");
+                      if (who) edit.onEdits(toggleDelete(edit.edits, who));
                     }}
                   />
                   <MenuItem
@@ -650,8 +687,8 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
                     label="Revert row changes"
                     onClick={() => {
                       setMenu(null);
-                      const ids = selectedRows().map((r) => rowIdentity(r)?.id).filter((x): x is number => x !== undefined);
-                      edit.onEdits(revertRows(edit.edits, ids));
+                      const who = rowsToChange("revert");
+                      if (who) edit.onEdits(revertRows(edit.edits, who.map((x) => x.id)));
                     }}
                   />
                 </>

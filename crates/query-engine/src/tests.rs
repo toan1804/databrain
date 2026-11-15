@@ -1078,7 +1078,7 @@ fn intents_are_checked_against_the_connection() {
     for i in [
         Intent::Run { plan: &write, confirmed: false },
         Intent::Load { table: "t", confirmed: false, dry: false },
-        Intent::Edit,
+        Intent::Edit { confirmed: false },
         Intent::Inspect,
         Intent::EndTransaction,
     ] {
@@ -1093,7 +1093,7 @@ fn intents_are_checked_against_the_connection() {
     assert!(e.message.contains("is read-only; statement 1 (UPDATE) was not run"), "{}", e.message);
     let e = check(&ro, Intent::Load { table: "t", confirmed: true, dry: true }).unwrap_err();
     assert!(e.message.contains("read-only; nothing was written"), "{}", e.message);
-    assert_eq!(check(&ro, Intent::Edit).unwrap_err().message, "The connection is read-only");
+    assert_eq!(check(&ro, Intent::Edit { confirmed: true }).unwrap_err().message, "The connection is read-only");
     assert!(check(&ro, Intent::Inspect).unwrap().is_empty() && check(&ro, Intent::EndTransaction).unwrap().is_empty());
 
     // Production: writes ask until confirmed; a dry run and reads don't.
@@ -1110,6 +1110,10 @@ fn intents_are_checked_against_the_connection() {
     assert!(asks[0].contains("confirm writing rows into t"), "{asks:?}");
     assert!(check(&prod, Intent::Load { table: "t", confirmed: true, dry: false }).unwrap().is_empty());
     assert!(check(&prod, Intent::Load { table: "t", confirmed: false, dry: true }).unwrap().is_empty());
+    // Saving grid edits writes too: asked on production, allowed once confirmed.
+    let asks = check(&prod, Intent::Edit { confirmed: false }).unwrap();
+    assert!(asks[0].contains("production connection") && asks[0].contains("edited rows"), "{asks:?}");
+    assert!(check(&prod, Intent::Edit { confirmed: true }).unwrap().is_empty());
 }
 
 /// A refused or unconfirmed start claims nothing (the tab stays free); an
@@ -1125,7 +1129,7 @@ fn the_guard_claims_only_what_it_lets_through() {
     let e = f.engine.guarded_or_refuse(&f.conn_id, hold(), Intent::Load { table: "t", confirmed: false, dry: false }).err().unwrap();
     assert_eq!(e.code.as_deref(), Some("needs_confirmation"));
     set_conn(&f, |p| p.config.read_only = true);
-    assert!(f.engine.guarded(&f.conn_id, hold(), Intent::Edit).is_err());
+    assert!(f.engine.guarded(&f.conn_id, hold(), Intent::Edit { confirmed: true }).is_err());
     // Nothing above holds tab1.
     let (_, claim) = f.engine.guarded_or_refuse(&f.conn_id, hold(), Intent::Inspect).unwrap();
     assert!(claim.is_some());
@@ -1155,6 +1159,13 @@ async fn edits_are_refused_on_a_connection_made_read_only() {
     // Allowed again: saved (the refused save left the tab free).
     set_conn(&f, |p| p.config.read_only = false);
     let rep = f.engine.apply_edits(&target, "tab1", &stmts).await.unwrap();
+    assert_eq!(rep.statements, 1);
+    // Production: refused until the user confirmed (nothing runs, the tab stays free), then saved.
+    set_conn(&f, |p| p.env = EnvTag::Prod);
+    let e = f.engine.apply_edits(&target, "tab1", &stmts).await.unwrap_err();
+    assert_eq!(e.code.as_deref(), Some("needs_confirmation"), "{}", e.message);
+    assert!(e.message.contains("production connection"), "{}", e.message);
+    let rep = f.engine.apply_edits_with(&target, "tab1", &stmts, true).await.unwrap();
     assert_eq!(rep.statements, 1);
 }
 

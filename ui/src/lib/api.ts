@@ -282,7 +282,8 @@ export const api = {
   /** The one table a result's query reads (null: another kind of query). */
   resultSource: (resultId: string) => call<ResultSource | null>("result_source", { resultId }),
   editPreview: (resultId: string, target: EditTarget, changes: RowChange[]) => call<EditStatement[]>("edit_preview", { resultId, target, changes }),
-  applyEdits: (resultId: string, changes: RowChange[]) => call<ApplyReport>("apply_edits", { resultId, changes }),
+  /** `confirmed`: the user agreed to save on a production connection (refused there without it). */
+  applyEdits: (resultId: string, changes: RowChange[], confirmed = false) => call<ApplyReport>("apply_edits", { resultId, changes, confirmed }),
   /** Compare two schemas; the script makes `target` like `source` (not run). */
   schemaDiff: (source: { connection_id: string; schema: string }, target: { connection_id: string; schema: string }) => call<SchemaDiff>("schema_diff", { source, target }),
   /** Foreign keys from and to the table a result was read from. */

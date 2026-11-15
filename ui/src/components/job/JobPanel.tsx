@@ -194,7 +194,7 @@ export function JobPanel({
             {s.mode === "interval" ? (
               <div className="flex items-center gap-2">
                 <span>Every</span>
-                <input type="number" min={1} className={`${field} w-20`} value={s.minutes} onChange={(e) => set({ minutes: Math.max(1, Number(e.target.value) || 1) })} aria-label="Minutes" />
+                <MinutesInput className={`${field} w-20`} value={s.minutes} onCommit={(minutes) => set({ minutes })} />
                 <span>min</span>
                 <select className={`${field} w-auto`} value="" onChange={(e) => e.target.value && set({ minutes: Number(e.target.value) })} aria-label="Common intervals">
                   <option value="">Presets…</option>
@@ -219,6 +219,8 @@ export function JobPanel({
                         onClick={() => {
                           const cur = s.weekdays.length === 0 ? ORDER : s.weekdays;
                           const next = on ? cur.filter((x) => x !== d) : [...cur, d];
+                          // An empty list means every day: the last day can't be turned off into that.
+                          if (next.length === 0) return;
                           set({ weekdays: next.length === 7 ? [] : next });
                         }}
                       >
@@ -318,5 +320,38 @@ function RunDetails({ job, run: r, newest, canResume, onResume, onSelect }: { jo
       )}
       <RunLog job={job} run={r} onSelect={onSelect} />
     </div>
+  );
+}
+
+/**
+ * Minutes between runs, typed freely and saved when it is a number (on
+ * blur or Enter). Saving every keystroke turned a cleared field into "every
+ * 1 minute", which the scheduler then ran.
+ */
+function MinutesInput({ value, onCommit, className }: { value: number; onCommit: (minutes: number) => void; className: string }) {
+  const [text, setText] = useState(String(value));
+  useEffect(() => setText(String(value)), [value]);
+  const commit = () => {
+    const n = Math.round(Number(text));
+    if (text.trim() !== "" && Number.isFinite(n) && n >= 1) {
+      if (n !== value) onCommit(n);
+      setText(String(n));
+    } else {
+      setText(String(value));
+    }
+  };
+  return (
+    <input
+      type="number"
+      min={1}
+      className={className}
+      value={text}
+      aria-label="Minutes"
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") commit();
+      }}
+    />
   );
 }

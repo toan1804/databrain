@@ -20,11 +20,11 @@ export function ConnectionDialog() {
 
 function ConnectionForm({ initial, folderId }: { initial: ConnectionProfile | null; folderId: string | null }) {
   const f = useConnectionForm(initial, folderId);
-  const { testSecs, close, isEdit, sorted, section, kind, info, busy, testResult, changeKind, usesFile, buildProfile, missing, canSubmit, test, cancelTest, save, remove, sectionBtn } = f;
+  const { testSecs, close, requestClose, isEdit, sorted, section, kind, info, busy, testResult, changeKind, usesFile, buildProfile, missing, canSubmit, test, cancelTest, save, remove, sectionBtn } = f;
   return (
     <Modal
       title={isEdit ? "Edit connection" : "New connection"}
-      onClose={close}
+      onClose={requestClose}
       width={640}
       footer={
         <>

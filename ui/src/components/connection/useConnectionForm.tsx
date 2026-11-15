@@ -278,6 +278,10 @@ export function useConnectionForm(initial: ConnectionProfile | null, folderId: s
         setAuthStatus(await api.authStatus(saved.id).catch(() => null));
         if (!isEdit) close();
         else useStore.getState().openConnectionDialog({ ...saved, connected: false });
+      } else if (!isEdit) {
+        // It was saved: go on editing that connection. Staying on the "new"
+        // form would save another copy on every further try.
+        useStore.getState().openConnectionDialog({ ...saved, connected: false });
       }
     }
     setBusy(null);
@@ -334,7 +338,28 @@ export function useConnectionForm(initial: ConnectionProfile | null, folderId: s
 
   const secretPlaceholder = initial?.has_secret && !clearSecret ? "•••••••• (saved in keychain)" : "";
 
-  return { initial, folderId, connectors, closeDialog, testId, testSecs, setTestSecs, close, toast, isEdit, sorted, section, setSection, kind, setKind, info, name, setName, values, setValues, setValue, initialAuth, authKind, setAuthKind, user, setUser, oauth, setOauth, cliProfile, setCliProfile, secret, setSecret, passphrase, setPassphrase, clearSecret, setClearSecret, authStatus, setAuthStatus, sshOn, setSshOn, ssh, setSsh, sshSecret, setSshSecret, ssl, setSsl, readOnly, setReadOnly, color, setColor, env, setEnv, policy, setPolicy, busy, setBusy, testResult, setTestResult, interactive, changeKind, usesFile, fields, buildAuth, buildProfile, defaultName, needsUser, needsClientId, portValid, missing, canSubmit, secretSlots, test, cancelTest, persist, save, signIn, signOut, remove, browseDb, addFiles, sectionBtn, secretPlaceholder };
+  // What the form held once it had opened: Escape, the backdrop or the X
+  // ask before throwing away anything typed since (a long list of table
+  // rules is one key press from gone otherwise).
+  const fingerprint = () => {
+    try {
+      return JSON.stringify([buildProfile(), secret, passphrase, clearSecret]);
+    } catch {
+      return "";
+    }
+  };
+  const opened = useRef<string | null>(null);
+  useEffect(() => {
+    opened.current = fingerprint();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- taken once, when the form opens: what it held before any typing
+  }, []);
+  const requestClose = () => {
+    const dirty = opened.current !== null && opened.current !== fingerprint();
+    if (dirty && !window.confirm("Discard the changes to this connection?")) return;
+    close();
+  };
+
+  return { initial, folderId, connectors, closeDialog, testId, testSecs, setTestSecs, close, requestClose, toast, isEdit, sorted, section, setSection, kind, setKind, info, name, setName, values, setValues, setValue, initialAuth, authKind, setAuthKind, user, setUser, oauth, setOauth, cliProfile, setCliProfile, secret, setSecret, passphrase, setPassphrase, clearSecret, setClearSecret, authStatus, setAuthStatus, sshOn, setSshOn, ssh, setSsh, sshSecret, setSshSecret, ssl, setSsl, readOnly, setReadOnly, color, setColor, env, setEnv, policy, setPolicy, busy, setBusy, testResult, setTestResult, interactive, changeKind, usesFile, fields, buildAuth, buildProfile, defaultName, needsUser, needsClientId, portValid, missing, canSubmit, secretSlots, test, cancelTest, persist, save, signIn, signOut, remove, browseDb, addFiles, sectionBtn, secretPlaceholder };
 }
 
 export type ConnectionFormState = ReturnType<typeof useConnectionForm>;

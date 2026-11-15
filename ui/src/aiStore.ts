@@ -48,6 +48,8 @@ export type ChatItem =
       auto?: boolean;
       /** The answer is being sent; shown as decided once the backend took it. */
       sending?: boolean;
+      /** The SQL as the user changed it in the card (what an approval sends, by hand or automatic). */
+      editedSql?: string;
     }
   | {
       id: string;
@@ -59,6 +61,8 @@ export type ChatItem =
       state: "pending" | "accepted" | "rejected" | "expired";
       /** Applied by "Auto-approve" rather than by hand. */
       auto?: boolean;
+      /** Being applied and answered: a second Accept (a double click) does nothing. */
+      sending?: boolean;
     }
   | {
       id: string;
@@ -226,6 +230,8 @@ interface AiState extends Mirrored {
   sendQueued: (id: string) => void;
   loadSession: (id: string) => Promise<void>;
   respondApproval: (itemId: string, approved: boolean, editedSql?: string, auto?: boolean) => Promise<void>;
+  /** Keep the SQL the user typed in an approval card (kept across panel switches; sent by any approval of it). */
+  setApprovalSql: (itemId: string, sql: string) => void;
   respondEdit: (itemId: string, accepted: boolean, auto?: boolean) => Promise<void>;
   /** Approve every request of the shown conversation (queries, writes, jobs, edits) without asking. Off for a new or another conversation. */
   setAutoApprove: (on: boolean) => void;
@@ -829,7 +835,13 @@ export const useAi = create<AiState>((set, get) => {
       // One conversation across questions, also after switching connections
       // (each turn is told which connection it is on). New chat starts over.
       const sessionId = c.sessionId;
+      // Auto-approve was given for the connection the conversation was on:
+      // it doesn't follow the conversation to another one (a chat on a
+      // test database asked from a production tab would run there unasked).
+      const moved = c.autoApprove && !!c.connectionId && c.connectionId !== conn;
+      if (moved) st.toast("Auto-approve was turned off: this question is on another connection than the conversation was", "info");
       update(id, (c) => ({
+        ...(moved ? { autoApprove: false } : {}),
         items: [...c.items, { id: uid(), kind: "user", text: message, mode }],
         running: true,
         runId: null,
@@ -977,7 +989,9 @@ export const useAi = create<AiState>((set, get) => {
       const c = chatOfItem(itemId);
       const item = c?.items.find((i) => i.id === itemId);
       if (!c || !item || item.kind !== "approval" || item.state !== "pending" || item.sending) return;
-      const detail = editedSql !== undefined ? { ...item.detail, sql: editedSql } : item.detail;
+      // What the card shows is what is approved: the user's edit, however the approval comes.
+      const sql = editedSql ?? item.editedSql;
+      const detail = approved && sql !== undefined ? { ...item.detail, sql } : item.detail;
       patchItem(c.id, itemId, { sending: true } as Partial<ChatItem>);
       try {
         // Shown as decided only once the backend took the answer; false = nothing waits any more.
@@ -989,10 +1003,17 @@ export const useAi = create<AiState>((set, get) => {
       }
     },
 
+    setApprovalSql: (itemId, sql) => {
+      const c = chatOfItem(itemId);
+      const item = c?.items.find((i) => i.id === itemId);
+      if (c && item?.kind === "approval" && item.state === "pending" && !item.sending) patchItem(c.id, itemId, { editedSql: sql } as Partial<ChatItem>);
+    },
+
     respondEdit: async (itemId, accepted, auto) => {
       const c = chatOfItem(itemId);
       const item = c?.items.find((i) => i.id === itemId);
-      if (!c || !item || item.kind !== "edit" || item.state !== "pending") return;
+      if (!c || !item || item.kind !== "edit" || item.state !== "pending" || item.sending) return;
+      patchItem(c.id, itemId, { sending: true } as Partial<ChatItem>);
       const chatConn = c.connectionId;
       let ok = accepted;
       if (accepted) {
@@ -1013,14 +1034,17 @@ export const useAi = create<AiState>((set, get) => {
           const results = await resultsConnection().catch(() => null);
           const sql = withDuckdbHeader(item.proposal.sql);
           if (!editorBridge.apply(item.targetKey, { ...item.proposal, sql })) {
-            st.toast("The target editor was closed", "error");
+            st.toast("Not applied: the target editor was closed", "error");
             ok = false;
           } else if (results) {
             st.updateTab(tab.id, { connection_id: results });
             st.toast("This query reads outputs, so the tab now runs on Results (DuckDB)", "info");
           }
         } else if (!editorBridge.apply(item.targetKey, item.proposal, item.before)) {
-          useStore.getState().toast("The target editor was closed", "error");
+          useStore.getState().toast(
+            editorBridge.get(item.targetKey) ? "Not applied: the SQL this change was made for is no longer in the editor (it was edited since). Ask again." : "Not applied: the target editor was closed",
+            "error",
+          );
           ok = false;
         } else if (readsOutputs && tab && tabKind !== "duckdb") {
           st.toast("The inserted SQL reads outputs (results.<name>); run it on the Results (DuckDB) connection", "info");
@@ -1029,10 +1053,10 @@ export const useAi = create<AiState>((set, get) => {
       // The editor change (if any) is done; tell the assistant, and say so when it stopped waiting.
       try {
         const delivered = await api.aiRespond(item.requestId, { accepted: ok });
-        patchItem(c.id, itemId, { state: ok ? "accepted" : delivered ? "rejected" : "expired", auto: ok && !!auto } as Partial<ChatItem>);
+        patchItem(c.id, itemId, { state: ok ? "accepted" : delivered ? "rejected" : "expired", auto: ok && !!auto, sending: false } as Partial<ChatItem>);
         if (ok && !delivered) useStore.getState().toast("Applied in the editor; the assistant had already stopped waiting", "info");
       } catch (e) {
-        patchItem(c.id, itemId, { state: ok ? "accepted" : "rejected", auto: ok && !!auto } as Partial<ChatItem>);
+        patchItem(c.id, itemId, { state: ok ? "accepted" : "rejected", auto: ok && !!auto, sending: false } as Partial<ChatItem>);
         useStore.getState().toast(`The assistant was not told: ${toError(e).message}`, "error");
       }
     },

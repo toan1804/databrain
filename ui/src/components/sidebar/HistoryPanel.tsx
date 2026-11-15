@@ -29,10 +29,26 @@ function HistoryOutput({ handle }: { handle: string }) {
   );
 }
 
-/** Open `sql` in a new tab on `connectionId` and run it (all statements). */
+/**
+ * History keeps secrets as `***` (a password in `ALTER USER`, a key passed
+ * to a function). Such text is not what ran: running it would set the
+ * password to three asterisks.
+ */
+export function hasHiddenSecret(sql: string): boolean {
+  return sql.includes("***");
+}
+
+/**
+ * Open `sql` in a new tab on `connectionId` and run it (all statements).
+ * Text with a hidden secret is only opened, for the secret to be put back.
+ */
 function runAgain(sql: string, connectionId: string | null) {
   const st = useStore.getState();
   const id = st.newTab({ sql, connection_id: connectionId ?? undefined });
+  if (hasHiddenSecret(sql)) {
+    st.toast("Not run: history hid a secret in this statement (shown as ***). Put it back, then run.", "info");
+    return;
+  }
   void st.runTab(id, "all", { doc: sql, selFrom: 0, selTo: 0, cursor: 0 });
 }
 

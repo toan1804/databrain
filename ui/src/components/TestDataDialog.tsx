@@ -124,6 +124,8 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   // The AI rows field as typed (committed on blur, so it can be cleared).
   const [aiRowsText, setAiRowsText] = useState(String(aiSettings.rows));
   const running = useRef<string | null>(null);
+  // Counts the settings' changes: rows made for earlier settings are not the ones asked for now.
+  const settingsVersion = useRef(0);
   // Closing the dialog stops a request still running.
   useEffect(
     () => () => {
@@ -175,6 +177,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   // Settings changed: earlier rows and checks no longer match them.
   const tickedKey = [...ticked].sort().join(",");
   useEffect(() => {
+    settingsVersion.current += 1;
     setMade(null);
     setDry(null);
   }, [rows, nulls, seed, parentKeys, tickedKey, aiSettings, panelProvider, panelModel, conn?.ai_policy, patterns]);
@@ -247,6 +250,7 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   /** Rows for the current settings (made once, reused by preview, dry run and load). */
   const generate = async (): Promise<TestDataOutput> => {
     if (made) return made;
+    const version = settingsVersion.current;
     const askAi = aiRequest(ai, target, aiColumns.length);
     const run = askAi ? uid() : null;
     running.current = run;
@@ -264,6 +268,9 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
     const oldTab = old && st.tabs.find((t) => t.output_ref === old);
     if (oldTab && old !== out.output.handle) st.closeTab(oldTab.id);
     previews.set(key, out.output.handle);
+    // The settings changed while these rows were being made (100,000 rows
+    // asked, then 10): they are not kept, and not previewed, checked or loaded.
+    if (version !== settingsVersion.current) throw new Error("The settings changed while the rows were being made: nothing was done. Try again.");
     setMade(out);
     return out;
   };
@@ -339,7 +346,8 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
   return (
     <Modal
       title={`Generate test data · ${req.table}`}
-      onClose={() => !progress && onClose()}
+      // Not while it generates for a load or loads: closing would leave the load running unseen.
+      onClose={() => !progress && busy !== "load" && onClose()}
       width={820}
       footer={
         report ? (

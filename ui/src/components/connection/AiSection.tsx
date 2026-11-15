@@ -1,6 +1,6 @@
 // Connection form, AI: what the assistant may see and do on this connection.
 import type { AiPolicy } from "../../lib/types";
-import { Check, Label, TableAccessFields } from "./parts";
+import { Check, CommaListInput, Label, TableAccessFields } from "./parts";
 import { ConnectionFormState } from "./useConnectionForm";
 
 export function AiSection({ f }: { f: ConnectionFormState }) {
@@ -61,23 +61,16 @@ export function AiSection({ f }: { f: ConnectionFormState }) {
         </div>
         <div>
           <Label htmlFor="ai-pii">Sensitive columns (never sent; patterns, comma separated)</Label>
-          <input
-            id="ai-pii"
-            className="field font-mono text-[12px]"
-            value={policy.pii_columns.join(", ")}
-            placeholder="email, *phone*, users.ssn"
-            onChange={(e) => setPolicy({ ...policy, pii_columns: e.target.value.split(",").map((x) => x.trim()).filter(Boolean) })}
-          />
+          <CommaListInput id="ai-pii" value={policy.pii_columns} placeholder="email, *phone*, users.ssn" onChange={(pii_columns) => setPolicy({ ...policy, pii_columns })} />
         </div>
         <TableAccessFields policy={policy} setPolicy={setPolicy} />
         <div>
           <Label htmlFor="ai-schemas">Schemas to index for knowledge (empty = ask for large databases, * = all)</Label>
-          <input
+          <CommaListInput
             id="ai-schemas"
-            className="field font-mono text-[12px]"
-            value={policy.index_schemas.join(", ")}
+            value={policy.index_schemas}
             placeholder="public, analytics, main.*"
-            onChange={(e) => setPolicy({ ...policy, index_schemas: e.target.value.split(",").map((x) => x.trim()).filter(Boolean) })}
+            onChange={(index_schemas) => setPolicy({ ...policy, index_schemas })}
           />
         </div>
         <Check

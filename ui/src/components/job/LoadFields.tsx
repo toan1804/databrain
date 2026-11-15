@@ -317,12 +317,23 @@ export function useLoadTarget(connectionId: string | null | undefined, table: st
   return state;
 }
 
-/** Ask before writing into a production connection; false when the user says no. */
-function confirmProdLoad(reason: string): Promise<boolean> {
+/** What a load mode does to the rows already in the table, when it removes any. */
+export function destructiveLoad(mode: LoadMode): string | null {
+  return mode === "truncate"
+    ? "deletes every row of the table before loading"
+    : mode === "replace"
+      ? "drops the table and creates it again"
+      : mode === "sync"
+        ? "deletes the rows of the table that are not in this result"
+        : null;
+}
+
+/** Ask before a load that writes to production or removes rows; false when the user says no. */
+function confirmProdLoad(reasons: string[], title = "Write into a production connection?"): Promise<boolean> {
   return new Promise<boolean>((resolve) =>
     useStore.getState().askConfirm({
-      title: "Write into a production connection?",
-      reasons: [reason],
+      title,
+      reasons,
       confirmLabel: "Load anyway",
       onConfirm: () => resolve(true),
       onCancel: () => resolve(false),
@@ -344,9 +355,17 @@ export async function loadResultAsking(
 ): Promise<LoadReport | null> {
   const conn = useStore.getState().connections.find((c) => c.id === args.target_connection_id);
   let confirmed = false;
-  if (conn?.env === "prod") {
-    if (!(await confirmProdLoad(`"${conn.name}" is a production connection: confirm writing rows into ${args.table}.`))) return null;
-    confirmed = true;
+  // Production, and on any connection a mode that removes what is in the
+  // table: asked first, naming the connection, the table and what happens.
+  const removes = destructiveLoad(args.mode);
+  if (conn?.env === "prod" || removes) {
+    const name = conn?.name ?? "the connection";
+    const reasons = [
+      ...(conn?.env === "prod" ? [`"${name}" is a production connection: confirm writing rows into ${args.table}.`] : []),
+      ...(removes ? [`This load ${removes}: ${args.table} on "${name}".`] : []),
+    ];
+    if (!(await confirmProdLoad(reasons, removes ? `Load into ${args.table} and remove what is there?` : undefined))) return null;
+    confirmed = conn?.env === "prod";
   }
   onStart?.();
   try {
@@ -356,7 +375,7 @@ export async function loadResultAsking(
     if (confirmed || err.code !== "needs_confirmation") throw e;
     // Nothing runs while the user decides.
     onPause?.();
-    if (!(await confirmProdLoad(err.message))) return null;
+    if (!(await confirmProdLoad([err.message]))) return null;
     onStart?.();
     return api.loadResult(resultId, { ...args, confirmed: true }, loadId);
   }
