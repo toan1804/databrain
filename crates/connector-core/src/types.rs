@@ -150,7 +150,53 @@ pub struct ConnectionConfig {
     pub ssh: Option<SshConfig>,
 }
 
+/// Options that never change where a connection's secrets go or how they
+/// travel (which schema or warehouse is used, how results come back,
+/// session timeouts). Every other option counts, so an option a connector
+/// adds later is taken as part of the destination until listed here.
+const SECRET_SAFE_OPTIONS: &[&str] = &[
+    "catalog",
+    "schema",
+    "dataset",
+    "database",
+    "warehouse_id",
+    "cluster_id",
+    "http_path",
+    "role",
+    "location",
+    "workgroup",
+    "fetch_parallel",
+    "result_transfer",
+    "maximum_bytes_billed",
+    "files",
+    "excel_sheets",
+    "connect_timeout_secs",
+    "idle_disconnect_minutes",
+];
+
 impl ConnectionConfig {
+    /// Where this connection's saved secrets go and how: the type, server,
+    /// port and file, the sign-in method and user, the encryption setting,
+    /// the SSH tunnel's server and user, and every option but those that
+    /// can't send a secret elsewhere ([`SECRET_SAFE_OPTIONS`]: a connection
+    /// string, an account, a TLS switch all count). Two configs with a
+    /// different destination must not share a saved password.
+    pub fn secret_destination(&self) -> String {
+        let options: Vec<(&String, &String)> = self.options.iter().filter(|(k, _)| !SECRET_SAFE_OPTIONS.contains(&k.as_str())).collect();
+        let ssh = self.ssh.as_ref().map(|s| (s.host.as_str(), s.port, s.user.as_str()));
+        serde_json::json!({
+            "kind": self.kind,
+            "host": self.host,
+            "port": self.port,
+            "file": self.file_path,
+            "auth": self.auth,
+            "ssl": self.ssl_mode,
+            "ssh": ssh,
+            "options": options,
+        })
+        .to_string()
+    }
+
     /// The settings with stray whitespace removed from what is never meant
     /// to have it: host, database, file path, user names, option values,
     /// the SSH host and user (pasted values often end with a space or
@@ -740,5 +786,63 @@ mod tests {
         assert_eq!(n.auth, AuthMethod::Password { user: "admin".into() });
         let s = n.ssh.unwrap();
         assert_eq!((s.host.as_str(), s.user.as_str()), ("bastion", "ec2-user"));
+    }
+}
+
+#[cfg(test)]
+mod secret_destination_tests {
+    use super::*;
+    use databrain_auth::AuthMethod;
+
+    fn pg() -> ConnectionConfig {
+        let mut c = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "app".into() });
+        c.host = Some("db.example.com".into());
+        c.port = Some(5432);
+        c
+    }
+
+    /// Anything that sends the secret elsewhere, or less protected, changes it.
+    #[test]
+    fn a_new_server_user_or_encryption_is_another_destination() {
+        let base = pg().secret_destination();
+        let changed: Vec<Box<dyn Fn(&mut ConnectionConfig)>> = vec![
+            Box::new(|c| c.host = Some("evil.example.com".into())),
+            Box::new(|c| c.port = Some(6543)),
+            Box::new(|c| c.auth = AuthMethod::Password { user: "admin".into() }),
+            Box::new(|c| c.kind = ConnectorKind::Mysql),
+            Box::new(|c| c.ssl_mode = SslMode::Disable),
+            Box::new(|c| {
+                c.options.insert("uri".into(), "mongodb://evil.example.com".into());
+            }),
+            Box::new(|c| {
+                c.options.insert("connect_string".into(), "evil:1521/x".into());
+            }),
+            Box::new(|c| {
+                c.options.insert("trust_cert".into(), "true".into());
+            }),
+            Box::new(|c| {
+                c.options.insert("tls".into(), "false".into());
+            }),
+            Box::new(|c| {
+                c.options.insert("some_future_option".into(), "x".into());
+            }),
+        ];
+        for (i, f) in changed.iter().enumerate() {
+            let mut c = pg();
+            f(&mut c);
+            assert_ne!(c.secret_destination(), base, "change {i}");
+        }
+    }
+
+    /// What can't send it elsewhere leaves it.
+    #[test]
+    fn schema_timeouts_and_read_only_are_the_same_destination() {
+        let base = pg().secret_destination();
+        let mut c = pg();
+        c.database = Some("other".into());
+        c.read_only = true;
+        c.options.insert("schema".into(), "sales".into());
+        c.options.insert("connect_timeout_secs".into(), "30".into());
+        assert_eq!(c.secret_destination(), base);
     }
 }

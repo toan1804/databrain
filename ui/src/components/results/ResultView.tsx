@@ -156,23 +156,29 @@ export function ResultView({
   };
   const saveEdits = async () => {
     if (!target || !changes || savingRef.current) return;
+    // From the first moment: edits made while the statements are previewed
+    // or the confirmation is open would otherwise be cleared unsent.
+    savingRef.current = true;
+    setSaving(true);
     const sent = toChanges(edits);
-    // Production: the statements are shown and confirmed first, as a run or a load is.
-    let confirmed = false;
-    if (conn?.env === "prod") {
+    // The connection the rows are saved on is the result's (the tab may be
+    // on another one since), as the server checks it.
+    const resultConn = useStore.getState().connections.find((c) => c.id === (stmt.output?.connection_id ?? connId));
+    /** Shows the statements and asks; false when the user says no. */
+    const confirmProd = async (why?: string): Promise<boolean> => {
       let stmts: EditStatement[];
       try {
         stmts = await api.editPreview(info.id, target, sent);
       } catch (e) {
         toast(toError(e).message, "error");
-        return;
+        return false;
       }
       const shown = stmts.slice(0, 8).map((s) => (s.sql.length > 300 ? `${s.sql.slice(0, 300)}…` : s.sql));
-      const ok = await new Promise<boolean>((resolve) =>
+      return new Promise<boolean>((resolve) =>
         useStore.getState().askConfirm({
           title: `Save ${stmts.length} change${stmts.length === 1 ? "" : "s"} on production?`,
           reasons: [
-            `"${conn.name}" is a production connection: these statements run on it.`,
+            why ?? `"${resultConn?.name ?? "This connection"}" is a production connection: these statements run on it.`,
             ...shown,
             ...(stmts.length > shown.length ? [`… and ${stmts.length - shown.length} more (Preview SQL shows them all).`] : []),
           ],
@@ -181,13 +187,22 @@ export function ResultView({
           onCancel: () => resolve(false),
         }),
       );
-      if (!ok) return;
-      confirmed = true;
-    }
-    savingRef.current = true;
-    setSaving(true);
+    };
     try {
-      const r = await api.applyEdits(info.id, sent, confirmed);
+      let confirmed = false;
+      if (resultConn?.env === "prod") {
+        if (!(await confirmProd())) return;
+        confirmed = true;
+      }
+      let r;
+      try {
+        r = await api.applyEdits(info.id, sent, confirmed);
+      } catch (e) {
+        // The server asks (the connection became production meanwhile): asked here too.
+        const err = toError(e);
+        if (confirmed || err.code !== "needs_confirmation" || !(await confirmProd(err.message))) throw e;
+        r = await api.applyEdits(info.id, sent, true);
+      }
       setPreview(null);
       setEdits(emptyEdits());
       toast(

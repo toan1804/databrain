@@ -29,13 +29,22 @@ function savedPart(): Part {
 export function Knowledge() {
   const connections = useStore((s) => s.connections);
   const activeConn = useStore((s) => s.tabs.find((t) => t.id === s.activeTabId)?.connection_id ?? null);
+  const focus = useAi((s) => s.knowledgeFocus);
+  const [connId, setConnId] = useState<string | null>(focus ?? activeConn ?? connections[0]?.id ?? null);
+  // One panel per connection: switching starts a new one, so nothing the
+  // last connection showed (notes, rules, learned joins, the table list) or
+  // still loads can be shown or acted on under this one.
+  return <KnowledgeFor key={connId ?? ""} connId={connId} setConnId={setConnId} />;
+}
+
+function KnowledgeFor({ connId, setConnId }: { connId: string | null; setConnId: (id: string | null) => void }) {
+  const connections = useStore((s) => s.connections);
   const toast = useStore((s) => s.toast);
   const progress = useAi((s) => s.knowledgeProgress);
   const version = useAi((s) => s.knowledgeVersion);
   const indexKnowledge = useAi((s) => s.indexKnowledge);
   const cancelIndex = useAi((s) => s.cancelIndex);
   const focus = useAi((s) => s.knowledgeFocus);
-  const [connId, setConnId] = useState<string | null>(focus ?? activeConn ?? connections[0]?.id ?? null);
   const [data, setData] = useState<KnowledgeView | null>(null);
   // The AI scope's rules: excluded tables are listed to allow them again.
   const [rules, setRules] = useState<ScopeRule[]>([]);
@@ -57,10 +66,16 @@ export function Knowledge() {
   // Opened for a connection (the chat hint): that one, on Index.
   useEffect(() => {
     if (!focus) return;
-    setConnId(focus);
+    // Index, also in the panel the switch starts.
+    try {
+      localStorage.setItem(PART_KEY, "index");
+    } catch {
+      // Remembering the tab is a convenience only.
+    }
     setPartState("index");
     useAi.setState({ knowledgeFocus: null });
-  }, [focus]);
+    setConnId(focus);
+  }, [focus, setConnId]);
   const [learned, setLearned] = useState<LearnedView | null>(null);
   const prog = connId ? progress[connId] : undefined;
   const connName = connections.find((c) => c.id === connId)?.name ?? "notes";

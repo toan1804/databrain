@@ -2,7 +2,7 @@
 // filters can skip data and which ones defeat it. Pure logic over SQL text;
 // components/queryHintsExt.ts puts the results in the editor.
 import { splitPath, unquote } from "./sqlComplete";
-import { blankLiterals } from "./sqlText";
+import { blankLiterals, lexOptionsFor } from "./sqlText";
 import type { ConnectorKind, TableLayout } from "./types";
 
 export type HintLevel = "warn" | "info";
@@ -53,8 +53,8 @@ export function compact(n: number): string {
 }
 
 /** Tables a statement reads or changes, with positions (INSERT targets excluded). */
-export function refsWithPos(stmt: string): RefAt[] {
-  const clean = blankLiterals(stmt);
+export function refsWithPos(stmt: string, kind?: ConnectorKind): RefAt[] {
+  const clean = blankLiterals(stmt, lexOptionsFor(kind));
   const out: RefAt[] = [];
   const re = new RegExp(String.raw`\b(from|join|update)\s+(${PATH})(?:\s+(?:as\s+)?(${IDENT}))?`, "gi");
   const push = (path: string, at: number, alias?: string) => {
@@ -122,8 +122,8 @@ interface ColUse {
 }
 
 /** Column references inside predicates. */
-export function columnUses(stmt: string): ColUse[] {
-  const clean = blankLiterals(stmt);
+export function columnUses(stmt: string, kind?: ConnectorKind): ColUse[] {
+  const clean = blankLiterals(stmt, lexOptionsFor(kind));
   const out: ColUse[] = [];
   const seen = new Set<number>();
   // What is looked at around each name is bounded: a generated predicate of
@@ -132,6 +132,7 @@ export function columnUses(stmt: string): ColUse[] {
   const NEAR = 64;
   for (const [a, b] of predicateRanges(clean)) {
     const seg = clean.slice(a, b);
+    const closeOf = new Map<number, number>();
     const re = new RegExp(String.raw`(?:(${IDENT})\s*\.\s*)?(${IDENT})`, "g");
     let m: RegExpExecArray | null;
     while ((m = re.exec(seg))) {
@@ -168,18 +169,23 @@ export function columnUses(stmt: string): ColUse[] {
             const f = fn?.[1].toLowerCase();
             const isCall = !!f && (!KEYWORDS.has(f) || f === "cast" || f === "date");
             if (isCall) {
-              // Closing paren of this call.
-              let d = 0;
-              let k = j;
-              for (; k < seg.length; k++) {
-                if (seg[k] === "(") d++;
-                else if (seg[k] === ")" && --d === 0) break;
+              // Closing paren of this call (found once per call: every column
+              // inside a long call asked for it again).
+              let k = closeOf.get(j);
+              if (k === undefined) {
+                let d = 0;
+                k = j;
+                for (; k < seg.length; k++) {
+                  if (seg[k] === "(") d++;
+                  else if (seg[k] === ")" && --d === 0) break;
+                }
+                closeOf.set(j, k);
               }
               use.wrappedBy = f;
               use.wrapText = stmt.slice(a + (fn!.index ?? 0), a + k + 1).trim();
             }
             break;
-          } else if (/[=<>]/.test(c) || /\b(and|or)\s*$/i.test(seg.slice(Math.max(0, j - 4), j + 1)) || m.index - j > 4096) break;
+          } else if (/[=<>]/.test(c) || /\b(and|or)\s*$/i.test(seg.slice(Math.max(0, j - 4), j + 1)) || m.index - j > NEAR * 8) break;
         }
       }
       // Literals are blanked in `clean`; read the pattern from the original text.
@@ -235,7 +241,7 @@ export const LARGE_TABLE_ROWS = 100_000;
  */
 export function analyzeStatement(stmt: string, tables: LayoutRef[], kind?: ConnectorKind): Hint[] {
   if (!tables.length) return [];
-  const uses = columnUses(stmt);
+  const uses = columnUses(stmt, kind);
   const hints: Hint[] = [];
   const name = (t: LayoutRef) => t.ref.parts[t.ref.parts.length - 1];
   const single = tables.length === 1;

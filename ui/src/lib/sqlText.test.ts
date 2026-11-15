@@ -74,3 +74,22 @@ describe("sqlText: results.<name> references", () => {
     expect(renameOutputRefs("select * from results.a", "a", "with space")).toBe('select * from results."with space"');
   });
 });
+
+describe("sqlText: per dialect", () => {
+  it("reads dollar quotes only where the database has them", async () => {
+    const { lexOptionsFor } = await import("./sqlText");
+    const body = "create procedure p() begin select 1; end $$\nselect * from t where ";
+    // MySQL: `DELIMITER $$` is no string; the code after it is code.
+    expect(blankLiterals(body, lexOptionsFor("mysql")).endsWith("where ")).toBe(true);
+    expect(blankLiterals("select $q$ x $q$", lexOptionsFor("postgres"))).toBe("select " + " ".repeat(9));
+    // Snowflake: only `$$`.
+    expect(blankLiterals("select $$ x $$, $q$", lexOptionsFor("snowflake"))).toBe("select " + " ".repeat(7) + ", $q$");
+  });
+
+  it("reads E'…' strings, where \\' doesn't end them", () => {
+    const sql = "select e'it\\'s', * from results.after_it";
+    expect(outputNames(sql)).toEqual(["after_it"]);
+    // `type'…'` (a typed literal) is no escape string.
+    expect(sqlSpans("select date'2024-01-01'")[0].start).toBe(11);
+  });
+});

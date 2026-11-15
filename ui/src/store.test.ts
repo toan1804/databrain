@@ -432,3 +432,21 @@ describe("dropping an output", () => {
     expect(activeTabId).toBe(tabs[0].id);
   });
 });
+
+describe("refreshing a result of a run restored after a restart", () => {
+  it("updates that statement, by its index, not the position", async () => {
+    reran.length = 0;
+    // Restored: only statements 1 and 3 had results; the refresh is of statement 1 (at position 0).
+    const plan = (i: number) => ({ index: i, sql: `select ${i}`, start: i * 10, end: i * 10 + 8, classification: { kind: "read" as const, missing_where: false, keyword: "SELECT" } });
+    const done = (i: number) => ({ plan: plan(i), status: "done" as const, notices: [], output: out(`r${i}`, "t", i) });
+    useStore.setState({
+      tabs: [{ id: "t", title: "q", sql: "", connection_id: "conn" } as never],
+      runs: { t: { jobId: null, running: false, startedAt: 0, finishedStatus: "success", statements: [done(1), done(3)], activeIndex: 3, connectionId: "conn" } },
+    });
+    expect(await useStore.getState().refreshResult("t", 0)).toBe(true);
+    const run = useStore.getState().runs.t;
+    expect(run.statements.map((x) => x.output?.handle)).toEqual(["r9", "r3"]);
+    expect(run.statements.map((x) => x.status)).toEqual(["done", "done"]);
+    expect(run.running).toBe(false);
+  });
+});

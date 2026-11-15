@@ -114,19 +114,9 @@ export function layout(g: LineageGraph, direction: Direction = "lr", display: Di
   // Rank = longest path from a source, over the edges that close no cycle:
   // with a cycle (two tables referencing each other) every pass raised both
   // ranks, and a schema of 200 tables ended up hundreds of ranks wide.
-  const forward = withoutBackEdges(nodes.map((n) => n.id), edges);
-  const rank = new Map(nodes.map((n) => [n.id, 0]));
-  for (let pass = 0; pass < nodes.length; pass++) {
-    let changed = false;
-    for (const e of forward) {
-      const r = rank.get(e.from)! + 1;
-      if (r > rank.get(e.to)!) {
-        rank.set(e.to, r);
-        changed = true;
-      }
-    }
-    if (!changed) break;
-  }
+  // In one pass, in topological order (a pass per rank was O(V·E): 20 s
+  // for a chain of 20,000 tables listed backwards).
+  const rank = longestPaths(nodes.map((n) => n.id), withoutBackEdges(nodes.map((n) => n.id), edges));
 
   const laid: LaidNode[] = nodes.map((node) => {
     const open = display.expanded === "all" || display.expanded.has(node.id);
@@ -346,7 +336,11 @@ export const EDGE_LABEL: Record<LineageEdge["kind"], string> = {
  */
 export function withoutBackEdges<E extends { from: string; to: string }>(ids: string[], edges: E[]): E[] {
   const out = new Map<string, E[]>();
-  for (const e of edges) out.set(e.from, [...(out.get(e.from) ?? []), e]);
+  for (const e of edges) {
+    const list = out.get(e.from);
+    if (list) list.push(e);
+    else out.set(e.from, [e]);
+  }
   const state = new Map<string, 1 | 2>(); // 1: on the current path, 2: done
   const back = new Set<E>();
   for (const root of ids) {
@@ -372,4 +366,30 @@ export function withoutBackEdges<E extends { from: string; to: string }>(ids: st
     }
   }
   return edges.filter((e) => !back.has(e));
+}
+
+/** Rank of each node: the longest path to it from a source, over `edges` (which have no cycle). O(V + E). */
+export function longestPaths<E extends { from: string; to: string }>(ids: string[], edges: E[]): Map<string, number> {
+  const rank = new Map(ids.map((id) => [id, 0]));
+  const indegree = new Map(ids.map((id) => [id, 0]));
+  const out = new Map<string, string[]>();
+  for (const e of edges) {
+    if (!rank.has(e.from) || !rank.has(e.to)) continue;
+    indegree.set(e.to, indegree.get(e.to)! + 1);
+    const list = out.get(e.from);
+    if (list) list.push(e.to);
+    else out.set(e.from, [e.to]);
+  }
+  const queue = ids.filter((id) => indegree.get(id) === 0);
+  for (let head = 0; head < queue.length; head++) {
+    const id = queue[head];
+    const r = rank.get(id)! + 1;
+    for (const to of out.get(id) ?? []) {
+      if (r > rank.get(to)!) rank.set(to, r);
+      const left = indegree.get(to)! - 1;
+      indegree.set(to, left);
+      if (left === 0) queue.push(to);
+    }
+  }
+  return rank;
 }

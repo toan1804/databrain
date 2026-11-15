@@ -150,7 +150,7 @@ impl ToolContext {
             target.name,
             if reason.is_empty() { String::new() } else { format!(" ({reason})") }
         );
-        let detail = json!({"tables": tables, "connection": target.name});
+        let detail = json!({"tables": tables, "connection": target.name, "connection_id": target.id});
         self.gate("index_tables", Decision::Ask("Index tables".into()), &summary, &detail).await?;
         let results = knowledge::index_tables(&self.engine, &target.id, &tables, &self.cancel).await?;
         let tables = AiTables::with_profile(self.engine.workspace(), &target);

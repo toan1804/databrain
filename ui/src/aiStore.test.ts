@@ -20,7 +20,13 @@ vi.mock("./lib/api", () => ({
       return backendKnowsRun.value;
     },
     aiSessionMessages: async () => [{ role: "user", content: { text: "hello" } }],
-    aiSessions: async () => [{ id: "s-old", title: "old", connection_id: null }],
+    aiSessions: async () => [
+      { id: "s-old", title: "old", connection_id: "conn-of-session" },
+      { id: "s-two", title: "two", connection_id: "conn-of-session" },
+    ],
+    aiSend: async () => {
+      throw "provider unreachable";
+    },
   },
 }));
 const modelCalls: string[] = [];
@@ -177,5 +183,46 @@ describe("aiStore: Stop, queued questions and History", () => {
     await useAi.getState().loadSession("s-old");
     const shown = useAi.getState().chats.find((c) => c.sessionId === "s-old")!;
     expect(shown.autoApprove).toBe(false);
+  });
+});
+
+describe("aiStore: what Auto-approve may answer", () => {
+  it("only calls on the conversation's own connection, never jobs or what only the user may approve", async () => {
+    const { autoApprovable } = await import("./aiStore");
+    const { useStore } = await import("./store");
+    useStore.setState({ connections: [{ id: "dev", name: "Dev" } as never, { id: "prod", name: "Prod" } as never] });
+    // Allowed: its own connection, by id or name, or a call that names none (a note, an editor read).
+    expect(autoApprovable("dev", "run_query", { sql: "delete from t", connection_id: "dev" })).toBe(true);
+    expect(autoApprovable("dev", "index_tables", { connection: "Dev" })).toBe(true);
+    expect(autoApprovable("dev", "save_query", { name: "x" })).toBe(true);
+    // Refused: another connection, a job, an only-the-user approval.
+    expect(autoApprovable("dev", "run_query", { sql: "delete from orders", connection_id: "prod", connection: "Prod" })).toBe(false);
+    expect(autoApprovable("dev", "run_query", { sql: "delete from orders", connection: "Prod" })).toBe(false);
+    for (const tool of ["create_job", "update_job", "run_job"]) expect(autoApprovable("dev", tool, { connection_id: "dev" })).toBe(false);
+    expect(autoApprovable("dev", "run_query", { sql: "select dbo.f()", connection_id: "dev", only_user: true })).toBe(false);
+  });
+});
+
+describe("aiStore: a failed start and History", () => {
+  it("a failed start leaves no Stop armed for the next question", async () => {
+    const { useAi } = await import("./aiStore");
+    const { useStore } = await import("./store");
+    useStore.setState({ backendAvailable: true });
+    useAi.setState({ providerId: "p1" });
+    await setShown({ running: false, runId: null, stopAsked: true, connectionId: "conn", items: [] });
+    await useAi.getState().send({ message: "hello", connectionId: "conn" });
+    const shown = useAi.getState().chats.find((c) => c.id === useAi.getState().activeChatId)!;
+    expect(shown.running).toBe(false);
+    expect(shown.stopAsked).toBe(false);
+    await setShown({ items: [] });
+  });
+
+  it("a History conversation opened into an empty chat is on its own connection", async () => {
+    const { useAi } = await import("./aiStore");
+    await useAi.getState().newChat();
+    await setShown({ sessionId: null, running: false, items: [], queued: [], connectionId: "blank-chats-connection" });
+    await useAi.getState().loadSession("s-two");
+    const shown = useAi.getState().chats.find((c) => c.sessionId === "s-two")!;
+    expect(shown.connectionId).toBe("conn-of-session");
   });
 });

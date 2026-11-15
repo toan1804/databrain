@@ -58,6 +58,8 @@ export type ChatItem =
       targetKey: string | null;
       proposal: EditProposal;
       before: string;
+      /** The editor when it was proposed: its selection (`null`: none) and whole text. */
+      at?: { selection: string | null; doc: string };
       state: "pending" | "accepted" | "rejected" | "expired";
       /** Applied by "Auto-approve" rather than by hand. */
       auto?: boolean;
@@ -297,6 +299,23 @@ export function lineOf(doc: string, offset: number): number {
   let n = 1;
   for (let i = doc.indexOf("\n"); i >= 0 && i < offset; i = doc.indexOf("\n", i + 1)) n++;
   return n;
+}
+
+/** Tools whose approval is never given by Auto-approve: a job reaches other connections, and runs later without asking. */
+const NEVER_AUTO = new Set(["create_job", "update_job", "run_job"]);
+
+/**
+ * Whether Auto-approve may answer this request for the user: it was given
+ * for the conversation's own connection. A call aimed at another connection
+ * (`connection: "Prod"` from a test chat), one only the user may approve
+ * (`only_user`: a function that could write where the AI may not), and
+ * jobs wait for a click.
+ */
+export function autoApprovable(chatConnection: string | null, tool: string, detail: Record<string, unknown>): boolean {
+  if (detail.only_user === true || NEVER_AUTO.has(tool)) return false;
+  if (typeof detail.connection_id === "string") return detail.connection_id === chatConnection;
+  if (typeof detail.connection === "string") return useStore.getState().connections.find((c) => c.id === chatConnection)?.name === detail.connection;
+  return true;
 }
 
 function defaultTargetKey(): string | null {
@@ -586,7 +605,7 @@ export const useAi = create<AiState>((set, get) => {
         unread: c.unread || unread,
         items: [...c.items, { id: itemId, kind: "approval", requestId: r.request_id, tool: r.tool, summary: r.summary, detail: r.detail ?? {}, state: "pending" }],
       }));
-      if (c.autoApprove) void get().respondApproval(itemId, true, undefined, true);
+      if (c.autoApprove && autoApprovable(c.connectionId, r.tool, r.detail ?? {})) void get().respondApproval(itemId, true, undefined, true);
       return;
     }
     if (c.items.some((i) => i.kind === "edit" && i.requestId === r.request_id)) return;
@@ -603,6 +622,8 @@ export const useAi = create<AiState>((set, get) => {
           targetKey: target,
           proposal: r.proposal,
           before: target ? (editorBridge.snapshot(target)?.selection ?? editorBridge.snapshot(target)?.sql ?? "") : "",
+          // The editor as the proposal saw it: applied only onto that.
+          at: target ? { selection: editorBridge.snapshot(target)?.selection ?? null, doc: editorBridge.snapshot(target)?.sql ?? "" } : undefined,
           state: "pending",
         },
       ],
@@ -897,6 +918,8 @@ export const useAi = create<AiState>((set, get) => {
         const providerId = get().providerId;
         update(id, (c) => ({
           running: false,
+          // A Stop pressed while it was starting has nothing left to stop (the next question must not be stopped by it).
+          stopAsked: false,
           items: [...c.items, { id: uid(), kind: "error", text: err.message, providerId: needsProviderSettings(err) ? providerId : undefined, retry: plain }],
         }));
       }
@@ -1000,8 +1023,9 @@ export const useAi = create<AiState>((set, get) => {
       let id: string;
       if (shown && isBlank(shown)) {
         id = shown.id;
-        // Auto-approve was set for the empty chat, not for a conversation opened into it.
-        update(id, () => ({ sessionId, autoApprove: false }));
+        // Auto-approve was set for the empty chat, not for a conversation
+        // opened into it; nor is its connection the conversation's (read from the session).
+        update(id, () => ({ sessionId, autoApprove: false, connectionId: null }));
         set({ view: "chat" });
       } else {
         const c = { ...emptyConversation(), sessionId };
@@ -1018,7 +1042,7 @@ export const useAi = create<AiState>((set, get) => {
       if (!on) return;
       // What is already waiting is approved too.
       for (const i of chat(id)?.items ?? []) {
-        if (i.kind === "approval" && i.state === "pending") void get().respondApproval(i.id, true, undefined, true);
+        if (i.kind === "approval" && i.state === "pending" && autoApprovable(chat(id)?.connectionId ?? null, i.tool, i.detail)) void get().respondApproval(i.id, true, undefined, true);
         if (i.kind === "edit" && i.state === "pending") void get().respondEdit(i.id, true, true);
       }
     },
@@ -1071,14 +1095,14 @@ export const useAi = create<AiState>((set, get) => {
           // The whole query tab becomes a query over outputs: switch it to Results.
           const results = await resultsConnection().catch(() => null);
           const sql = withDuckdbHeader(item.proposal.sql);
-          if (!editorBridge.apply(item.targetKey, { ...item.proposal, sql })) {
+          if (!editorBridge.apply(item.targetKey, { ...item.proposal, sql }, item.at)) {
             st.toast("Not applied: the target editor was closed", "error");
             ok = false;
           } else if (results) {
             st.updateTab(tab.id, { connection_id: results });
             st.toast("This query reads outputs, so the tab now runs on Results (DuckDB)", "info");
           }
-        } else if (!editorBridge.apply(item.targetKey, item.proposal, item.before)) {
+        } else if (!editorBridge.apply(item.targetKey, item.proposal, item.at ?? (item.before ? { selection: item.before, doc: "" } : undefined))) {
           useStore.getState().toast(
             editorBridge.get(item.targetKey) ? "Not applied: the SQL this change was made for is no longer in the editor (it was edited since). Ask again." : "Not applied: the target editor was closed",
             "error",

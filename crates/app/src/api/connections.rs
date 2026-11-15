@@ -59,6 +59,18 @@ pub(crate) fn store_connection(state: &AppState, mut args: SaveConnectionArgs) -
     }
     let mut profile = args.profile;
     let before = if profile.id.is_empty() { None } else { state.workspace.get_connection(&profile.id).ok() };
+    // Saved with another server, user or encryption setting and no new
+    // secret: the old secrets are not kept for it (Connect would send them
+    // there). The user types them again.
+    let moved = before.as_ref().is_some_and(|b| b.config.secret_destination() != profile.config.secret_destination());
+    if moved && args.secret.is_none() {
+        args.clear_secret = true;
+        for slot in SECRET_SLOTS {
+            if !args.extra_secrets.contains_key(*slot) {
+                args.extra_secrets.insert((*slot).to_string(), String::new());
+            }
+        }
+    }
     let new_secrets = args.secret.is_some() || args.clear_secret || !args.extra_secrets.is_empty();
     if args.secret.is_some() {
         profile.has_secret = true;
@@ -159,6 +171,20 @@ pub async fn test_connection(
     test_id: Option<String>,
 ) -> Result<TestResult> {
     validate_config(state, &config)?;
+    // The saved secrets go only where they were saved for: another server,
+    // user or encryption setting typed in the form doesn't get them.
+    let mut connection_id = connection_id;
+    if let Some(saved) = connection_id.as_deref().and_then(|id| state.workspace.get_connection(id).ok())
+        && saved.config.secret_destination() != config.secret_destination()
+    {
+        if saved.has_secret && secret.is_none() {
+            return Err(EngineError::new(
+                "invalid",
+                "The server, user or encryption settings changed: type the password (or key) to test against them. The saved one is only sent where it was saved for.",
+            ));
+        }
+        connection_id = None;
+    }
     state.engine.test_connection(&config, secret, connection_id.as_deref(), ssh_secret, test_id.as_deref()).await
 }
 

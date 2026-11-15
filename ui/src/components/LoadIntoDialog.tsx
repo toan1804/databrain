@@ -48,10 +48,11 @@ export function LoadIntoDialog({
   const connections = useStore((s) => s.connections);
   const writable = useMemo(() => connections.filter((c) => !c.config.read_only), [connections]);
   const generated = testDataTable(sql) !== null;
-  // The connection the rows came from when it can be written to; with one
-  // writable connection, that one; otherwise none, for the user to choose
-  // (the first in the list is nobody's choice).
-  const [target, setTarget] = useState(writable.find((c) => c.id === connectionId)?.id ?? (writable.length === 1 ? writable[0].id : ""));
+  // Generated test data goes back into the table it was made for, on its
+  // own connection. Any other result has no default: its own connection
+  // would offer its own table with Append (rows loaded twice), and the
+  // first in the list is nobody's choice.
+  const [target, setTarget] = useState((generated && writable.find((c) => c.id === connectionId)?.id) || "");
   const [table, setTable] = useState(() => suggestTable(sql, outputName));
   const [mode, setMode] = useState<LoadMode>("append");
   const [keys, setKeys] = useState<string[]>([]);

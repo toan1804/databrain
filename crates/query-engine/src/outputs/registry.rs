@@ -202,6 +202,9 @@ struct Inner {
     /// go of one makes it inactive at once (one of the latest run stays
     /// active until the tab runs again).
     carried: HashSet<String>,
+    /// (tab, statement index) of a kept output being refreshed
+    /// ([`OutputRegistry::retire`]): the output that replaces it is kept too.
+    keep_next: HashSet<(String, usize)>,
     seq: u64,
 }
 
@@ -500,8 +503,12 @@ impl OutputRegistry {
             list.retain(|h| h != handle);
         }
         g.active.retain(|_, v| !v.is_empty());
-        g.carried.remove(handle);
+        let carried = g.carried.remove(handle);
         if let Some(o) = g.by_handle.get_mut(handle) {
+            // Kept by the user: the new version is kept in its place.
+            if o.kept || carried {
+                g.keep_next.insert((tab.to_string(), o.statement_index));
+            }
             o.active = false;
             o.kept = false;
         }
@@ -574,6 +581,8 @@ impl OutputRegistry {
                 active: true,
                 session_key: if n.session_key == n.tab_id { String::new() } else { n.session_key },
             };
+            let mut info = info;
+            info.kept = g.keep_next.remove(&(info.tab_id.clone(), info.statement_index));
             g.by_result.insert(info.result_id.clone(), handle.clone());
             g.active.entry(n.tab_id).or_default().push(handle.clone());
             g.by_handle.insert(handle, info.clone());
@@ -1078,6 +1087,18 @@ pub(crate) mod tests {
         // Another tab is untouched; a new run of the tab retires all as before.
         r.begin_run("t");
         assert!(r.for_tab("t").is_empty());
+        // A kept result refreshed stays kept.
+        r.begin_run("k");
+        let kept = add(&r, "k", 1);
+        r.set_kept(&kept.handle, true).unwrap();
+        r.retire("k", &kept.handle);
+        let again = add(&r, "k", 1);
+        assert!(r.get(&again.handle).unwrap().kept, "the new version keeps Keep");
+        assert!(!r.get(&kept.handle).unwrap().kept);
+        // Not kept: the new version isn't either.
+        let plain = add(&r, "k", 1);
+        r.retire("k", &plain.handle);
+        assert!(!r.get(&add(&r, "k", 1).handle).unwrap().kept);
     }
 
     /// A kept result stays in its tab's results across runs (active, so

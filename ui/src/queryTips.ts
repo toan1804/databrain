@@ -106,7 +106,7 @@ export async function computeRunTips(
   const out: RunTips = { tips: [], tables: [], statements: [], unavailable: [] };
   const todo = statements.filter(analysable).slice(0, 20);
   const refs = todo.map((s) =>
-    refsWithPos(s.plan.sql).filter((r) => !(kind === "duckdb" && r.parts[0]?.toLowerCase() === "results")),
+    refsWithPos(s.plan.sql, kind).filter((r) => !(kind === "duckdb" && r.parts[0]?.toLowerCase() === "results")),
   );
   const written = refs.flat().map((r) => r.parts.join("."));
   if (!written.length) return out;

@@ -111,6 +111,15 @@ function estimateWidth(name: string, sample: (string | null)[]): number {
   return Math.max(70, Math.min(420, Math.round(chars * 7.6 + 24)));
 }
 
+/**
+ * Whether a copy is one value (copied as it is) or several cells (copied
+ * spreadsheet-safe). No columns listed means all of them, a whole row:
+ * one value only when the result has a single column.
+ */
+export function isOneCell(rows: number, cols: number[], columnCount: number): boolean {
+  return rows === 1 && (cols.length === 1 || (cols.length === 0 && columnCount === 1));
+}
+
 /** Rows the backend copies at most (`MAX_COPY_ROWS` in crates/app/src/api/mod.rs). */
 const MAX_COPY_ROWS = 100_000;
 
@@ -460,7 +469,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
       try {
         // What is really copied: the rows there are, up to the clipboard cap.
         const n = Math.max(0, Math.min(range.limit, rows - range.offset, MAX_COPY_ROWS));
-        const oneCell = n === 1 && range.cols.length <= 1;
+        const oneCell = isOneCell(n, range.cols, info.columns.length);
         const text = await api.copyRows(info.id, view, range.offset, n, {
           format,
           header,
@@ -485,7 +494,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         toast(toError(e).message, "error");
       }
     },
-    [info.id, view, dialect, selectedRange, rowsApart, toast, rows, edit],
+    [info.id, info.columns.length, view, dialect, selectedRange, rowsApart, toast, rows, edit],
   );
 
   const editCellNow = useEvent((col: number, row: number, value: string | null) => editCell(col, row, value));
@@ -573,6 +582,10 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         columns={columns}
         rows={rows + (edit ? edit.edits.inserts.length : 0)}
         getCellContent={getCellContent}
+        // Delete/Backspace on a selection would write '' into every editable
+        // cell of it (glide's default): an edit is typed into a cell, and a
+        // row is deleted from its menu.
+        onDelete={() => false}
         onCellEdited={
           edit
             ? ([col, row], v) => {
@@ -616,13 +629,11 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         }}
         onCellContextMenu={(cell, e) => {
           e.preventDefault();
-          const inSel =
-            selection.current &&
-            cell[0] >= selection.current.range.x &&
-            cell[0] < selection.current.range.x + selection.current.range.width &&
-            cell[1] >= selection.current.range.y &&
-            cell[1] < selection.current.range.y + selection.current.range.height;
-          if (!inSel && !selection.rows.hasIndex(cell[1])) {
+          // In any block of the selection (Cmd/Ctrl-drag adds blocks), a selected row or a selected column: kept.
+          const inside = (r: Rectangle) => cell[0] >= r.x && cell[0] < r.x + r.width && cell[1] >= r.y && cell[1] < r.y + r.height;
+          const cur = selection.current;
+          const inSel = !!cur && (inside(cur.range) || cur.rangeStack.some(inside));
+          if (!inSel && !selection.rows.hasIndex(cell[1]) && !selection.columns.hasIndex(cell[0])) {
             setSelection({
               columns: CompactSelection.empty(),
               rows: CompactSelection.empty(),

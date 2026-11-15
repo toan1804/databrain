@@ -55,16 +55,25 @@ export const editorBridge = {
   },
   /**
    * Apply an accepted AI proposal. Returns false if the editor is gone, or
-   * the text a `replace_selection` proposal was made for is no longer there.
-   * `target` is the text the proposal was made for (the selection then): a
-   * `replace_selection` edit replaces it even if the selection has moved since.
+   * the text it was made for is no longer there. `at`: the editor when it
+   * was made, its selection (`null`: none) and its whole text. A
+   * `replace_selection` edit replaces that selection even if the cursor has
+   * moved since; one that replaces the whole text (`replace_all`, or no
+   * selection then) only when the text is still the same: it would
+   * otherwise throw away what was typed since, unseen.
    */
-  apply(key: string | null | undefined, p: EditProposal, target?: string): boolean {
+  apply(key: string | null | undefined, p: EditProposal, at?: { selection: string | null; doc: string }): boolean {
     const v = this.get(key);
     if (!v) return false;
     let { from, to } = v.state.selection.main;
     const len = v.state.doc.length;
-    if (p.mode === "replace_selection" && target && v.state.sliceDoc(from, to) !== target) {
+    const whole = p.mode === "replace_all" || (p.mode === "replace_selection" && !!at && at.selection === null);
+    if (at && whole && v.state.doc.toString() !== at.doc) return false;
+    const target = at?.selection;
+    if (p.mode === "replace_selection" && at && at.selection === null) {
+      from = 0;
+      to = len;
+    } else if (p.mode === "replace_selection" && target && v.state.sliceDoc(from, to) !== target) {
       const doc = v.state.doc.toString();
       // The occurrence nearest to the cursor.
       let best = -1;

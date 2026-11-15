@@ -36,9 +36,10 @@ export const _earlyEventCount = () => earlyEvents.size;
  * (`dash:{dashboard}:{chart}`), whose notebook or dashboard is in a tab.
  */
 function runKeyOpen(s: State, key: string): boolean {
-  const [kind, id] = key.split(":");
+  const [kind, id, part] = key.split(":");
   if (kind === "nb" && id) return s.tabs.some((t) => t.notebook_id === id);
-  if (kind === "dash" && id) return s.tabs.some((t) => t.dashboard_id === id);
+  // A dashboard's chart: its dashboard open and the chart still on it.
+  if (kind === "dash" && id) return s.tabs.some((t) => t.dashboard_id === id) && (!part || !!s.dashboards.find((d) => d.id === id)?.charts.some((c) => c.id === part));
   return s.tabs.some((t) => t.id === key);
 }
 
@@ -267,6 +268,8 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     // `:name` parameters: every one in the statement needs a value.
     const values = await get().paramsFor(tabId, conn.config.kind, sql);
     if (!values) return;
+    // Closed while the statement or its parameters were looked up: nothing to run it for.
+    if (!get().tabs.some((t) => t.id === tabId)) return;
 
     await get().runSql(tabId, conn.id, sql, base, undefined, undefined, values);
   },
@@ -314,9 +317,13 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
         set((st) => {
           const prev = st.runs[runKey];
           const at = resp.statements[0]?.index;
+          // Where that statement is in the run: by its index, not as a
+          // position (a run restored after a restart lists only the
+          // statements that had results).
+          const pos = prev && at !== undefined ? prev.statements.findIndex((x) => x.plan.index === at) : -1;
           // One result refreshed: the run's other results stay as they were;
           // its statement keeps the place it has in the editor.
-          if (replaces && prev && resp.statements.length === 1 && at !== undefined && prev.statements[at]) {
+          if (replaces && prev && resp.statements.length === 1 && pos >= 0) {
             return {
               runs: {
                 ...st.runs,
@@ -325,7 +332,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
                   jobId: resp.job_id,
                   running: true,
                   startedAt: Date.now(),
-                  statements: prev.statements.map((x, i) => (i === at ? { plan: x.plan, status: "pending", notices: [] } : x)),
+                  statements: prev.statements.map((x, i) => (i === pos ? { plan: x.plan, status: "pending", notices: [] } : x)),
                   activeIndex: at,
                   errorRange: undefined,
                   refreshOf: at,
@@ -446,8 +453,13 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       const run = s.runs[e.tab_id];
       if (!run || run.jobId !== e.job_id) return {};
       const statements = run.statements.slice();
+      // An event names a statement by its index; the run lists statements by
+      // position. The same in a run as it started; not in one restored after
+      // a restart (only statements that had results), which a refresh updates.
+      const posOf = (i: number) => (statements[i]?.plan.index === i ? i : statements.findIndex((x) => x.plan.index === i));
       const upd = (i: number, patch: Partial<StatementRun>) => {
-        if (statements[i]) statements[i] = { ...statements[i], ...patch };
+        const p = posOf(i);
+        if (statements[p]) statements[p] = { ...statements[p], ...patch };
       };
       let next: TabRun = { ...run, statements };
       switch (e.type) {
@@ -460,7 +472,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
             const { tab_id, job_id, index } = e;
             setTimeout(() => {
               const r = get().runs[tab_id];
-              if (r?.jobId === job_id && r.statements[index]?.status === "running") void get().computeTips(tab_id, job_id);
+              if (r?.jobId === job_id && r.statements.find((x) => x.plan.index === index)?.status === "running") void get().computeTips(tab_id, job_id);
             }, ms + 50);
           }
           break;
@@ -469,7 +481,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           upd(e.index, { progressRows: e.rows });
           break;
         case "downloading": {
-          const cur = statements[e.index];
+          const cur = statements[posOf(e.index)];
           upd(e.index, { downloading: true, serverMs: e.elapsed_ms, notices: e.notice && cur ? [...cur.notices, e.notice] : (cur?.notices ?? []) });
           break;
         }
@@ -482,12 +494,12 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
             durationMs: e.duration_ms,
             notices: e.notices,
             downloading: false,
-            serverMs: e.server_ms ?? statements[e.index]?.serverMs,
+            serverMs: e.server_ms ?? statements[posOf(e.index)]?.serverMs,
           });
           if (e.result) next.activeIndex = e.index;
           if (run.connectionId) {
             const id = run.connectionId;
-            const plan = statements[e.index]?.plan;
+            const plan = statements[posOf(e.index)]?.plan;
             const effect = plan ? ddlEffect(plan.sql, plan.classification.kind) : null;
             setTimeout(() => {
               get().markOnline(id);
@@ -504,7 +516,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
             error: e.error,
             durationMs: e.duration_ms,
           });
-          const st = statements[e.index];
+          const st = statements[posOf(e.index)];
           if (!cancelled && st) next.errorRange = errorRange(st.plan, e.error.position);
           if (next.activeIndex === null || !cancelled) next.activeIndex = e.index;
           break;

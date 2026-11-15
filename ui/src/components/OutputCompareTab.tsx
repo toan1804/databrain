@@ -79,17 +79,28 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
   // First page whenever the compare, the filter or the column changes.
   useEffect(() => {
     viewGen.current += 1;
-    moreBusy.current = false;
-    setLoadingMore(false);
+    // Until this view's first page is in, the rows shown are the last
+    // view's: "Show more" would count from them and mix the two.
+    moreBusy.current = true;
+    setLoadingMore(true);
     if (!run || !layout) return;
     let alive = true;
+    const ready = () => {
+      if (!alive) return;
+      moreBusy.current = false;
+      setLoadingMore(false);
+    };
     api.fetchPage(run.result.id, diffView(layout, filter, column), 0, PAGE).then(
       (p) => {
         if (!alive) return;
         setRows(p.rows);
         setViewRows(p.view_rows);
+        ready();
       },
-      (e) => alive && toast(toError(e).message, "error"),
+      (e) => {
+        if (alive) toast(toError(e).message, "error");
+        ready();
+      },
     );
     return () => {
       alive = false;

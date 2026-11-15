@@ -182,8 +182,8 @@ export function AutoApproveToggle() {
       aria-label="Auto-approve this conversation"
       title={
         on
-          ? "Auto-approve is on for this conversation: queries (writes too), job changes and runs, and edits are approved without asking. Click to ask again."
-          : "Auto-approve: approve every request of this conversation (queries, writes, jobs, editor changes) without asking. Only for this conversation; a new chat asks again."
+          ? "Auto-approve is on for this conversation: its queries (writes too) on its own connection, and editor changes, are approved without asking. Calls on another connection, jobs, and what only you may approve still ask. Click to ask again."
+          : "Auto-approve: approve this conversation's queries on its own connection (writes too) and its editor changes without asking. Calls on another connection, jobs, and what only you may approve still ask. Only for this conversation; a new chat asks again."
       }
       onClick={() => set(!on)}
       className={`flex h-6 shrink-0 items-center gap-1 rounded border px-1.5 text-[11px] ${

@@ -65,3 +65,16 @@ describe("ER layout with foreign-key cycles", () => {
     expect(xs.every((x, i) => i === 0 || x - xs[i - 1] === step)).toBe(true);
   });
 });
+
+describe("ER layout on a large schema", () => {
+  it("ranks a 20,000-table chain listed backwards in well under a second", () => {
+    const fk = (to: string) => ({ columns: ["ref"], ref_schema: "s", ref_table: to, ref_columns: ["id"] });
+    const list: TableColumns[] = [];
+    for (let i = 20_000 - 1; i >= 0; i--) list.push({ table: `t${i}`, columns: [col("id", true), col("ref")], foreign_keys: i ? [fk(`t${i - 1}`)] : [] });
+    const g = erGraph("s", list).graph;
+    const t0 = performance.now();
+    const l = layout(g, "tb", { expanded: "all" });
+    expect(performance.now() - t0).toBeLessThan(3000);
+    expect(new Set(l.nodes.map((n) => n.rank)).size).toBe(20_000);
+  });
+});

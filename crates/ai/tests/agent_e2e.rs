@@ -1893,3 +1893,39 @@ async fn a_connections_rules_hold_wherever_it_is_reached_from() {
     assert!(!e.contains("another AI provider"), "{e}");
     assert_eq!(f.ws.get_ai_session(&switched).unwrap().provider_id.as_deref(), Some(f.provider.as_str()));
 }
+
+/// What the policy says only the user may approve (a function that could
+/// write where the AI may not) reaches the app marked `only_user`, so its
+/// Auto-approve leaves it to a click; an ordinary approval isn't marked.
+#[tokio::test]
+async fn approvals_only_the_user_may_give_are_marked() {
+    struct Recorder(Mutex<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl ToolHost for Recorder {
+        async fn approve(&self, _tool: &str, _summary: &str, detail: &Value) -> Option<Value> {
+            self.0.lock().push(detail.clone());
+            None
+        }
+    }
+    let f = fixture(1, AiPolicy::default()).await;
+    let host = Arc::new(Recorder(Mutex::new(vec![])));
+    let ctx = databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: f.ws.get_connection(&f.conn).unwrap(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: host.clone(),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+        provider_id: None,
+    };
+    ctx.call("run_query", &json!({"sql": "select write_fn()"})).await;
+    ctx.call("run_query", &json!({"sql": "select count(*) from orders"})).await;
+    let asked = host.0.lock().clone();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert_eq!(asked[0]["only_user"], json!(true), "{:?}", asked[0]);
+    assert!(asked[1].get("only_user").is_none(), "{:?}", asked[1]);
+    // The connection is named by id too (names aren't unique).
+    assert_eq!(asked[1]["connection_id"], json!(f.conn));
+}

@@ -11,6 +11,9 @@
  * quote inside.
  */
 
+import { traitsOf } from "./sourceTraits";
+import type { ConnectorKind } from "./types";
+
 /** A stretch of text that is not plain SQL: a comment, a string, or a quoted name. */
 export interface Span {
   kind: "comment" | "string" | "name";
@@ -23,11 +26,35 @@ export interface Span {
 
 const DOLLAR = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/;
 
+/** How a dialect writes strings (from its traits; see {@link lexOptionsFor}). */
+export interface LexOptions {
+  /** `\'` doesn't end a `'…'` string (MySQL, BigQuery, ClickHouse…). */
+  backslash?: boolean;
+  /** Dollar quotes: `$tag$…$tag$` (Postgres, DuckDB), only `$$…$$` (Snowflake), or none (MySQL's `DELIMITER $$` is no string). */
+  dollar?: "none" | "plain" | "tagged";
+  /** `E'…'` strings, where `\'` doesn't end them (Postgres, DuckDB). */
+  escapeStrings?: boolean;
+}
+
+/** DuckDB's: what `results.<name>` SQL is written in, and the reading when the dialect isn't known. */
+export const DUCKDB_LEX: LexOptions = { dollar: "tagged", escapeStrings: true };
+
+/** A dialect's reading, from its traits. */
+export function lexOptionsFor(kind: ConnectorKind | null | undefined): LexOptions {
+  if (!kind) return DUCKDB_LEX;
+  const syntax = (traitsOf(kind) as unknown as { syntax?: { backslash_escapes?: boolean; dollar?: string; escape_strings?: boolean } }).syntax ?? {};
+  const dollar = syntax.dollar === "tagged" || syntax.dollar === "plain" ? syntax.dollar : "none";
+  return { backslash: syntax.backslash_escapes === true, dollar, escapeStrings: syntax.escape_strings === true };
+}
+
+const lex = (o: LexOptions | boolean | undefined): LexOptions => (typeof o === "boolean" ? { ...DUCKDB_LEX, backslash: o } : (o ?? DUCKDB_LEX));
+
 /**
- * The comments, strings and quoted names of `sql`, in order. `backslash`:
- * `\'` doesn't end a string (MySQL, BigQuery, ClickHouse…).
+ * The comments, strings and quoted names of `sql`, in order, read as the
+ * dialect does (`opts`; a boolean: DuckDB's reading with that backslash rule).
  */
-export function sqlSpans(sql: string, backslash = false): Span[] {
+export function sqlSpans(sql: string, opts?: LexOptions | boolean): Span[] {
+  const { backslash = false, dollar = "tagged", escapeStrings = false } = lex(opts);
   const out: Span[] = [];
   const n = sql.length;
   let i = 0;
@@ -45,8 +72,11 @@ export function sqlSpans(sql: string, backslash = false): Span[] {
       out.push({ kind: "comment", start: i, end, closed: j >= 0 });
       i = end;
     } else if (c === "'") {
+      // `E'it\'s'`: an escape string (the E not part of a longer name).
+      const esc = escapeStrings && (sql[i - 1] === "e" || sql[i - 1] === "E") && !/[\w$]/.test(sql[i - 2] ?? "");
+      const bs = backslash || esc;
       let j = i + 1;
-      while (j < n && !(sql[j] === "'" && sql[j + 1] !== "'")) j += sql[j] === "'" || (backslash && sql[j] === "\\") ? 2 : 1;
+      while (j < n && !(sql[j] === "'" && sql[j + 1] !== "'")) j += sql[j] === "'" || (bs && sql[j] === "\\") ? 2 : 1;
       const closed = j < n;
       const end = Math.min(n, j + 1);
       out.push({ kind: "string", start: i, end, closed });
@@ -58,9 +88,9 @@ export function sqlSpans(sql: string, backslash = false): Span[] {
       const end = Math.min(n, j + 1);
       out.push({ kind: "name", start: i, end, closed });
       i = end;
-    } else if (c === "$" && !/[\w$]/.test(sql[i - 1] ?? "")) {
+    } else if (c === "$" && dollar !== "none" && !/[\w$]/.test(sql[i - 1] ?? "")) {
       const m = DOLLAR.exec(sql.slice(i, i + 66));
-      if (!m) {
+      if (!m || (dollar === "plain" && m[0] !== "$$")) {
         i++;
         continue;
       }
@@ -81,10 +111,10 @@ export function sqlSpans(sql: string, backslash = false): Span[] {
  * offsets and lines stay). Quoted names are kept as they are, so an
  * apostrophe in one doesn't open a string.
  */
-export function blankLiterals(sql: string, backslash = false): string {
+export function blankLiterals(sql: string, opts?: LexOptions | boolean): string {
   let out = "";
   let at = 0;
-  for (const s of sqlSpans(sql, backslash)) {
+  for (const s of sqlSpans(sql, opts)) {
     if (s.kind === "name") continue;
     out += sql.slice(at, s.start) + sql.slice(s.start, s.end).replace(/[^\n]/g, " ");
     at = s.end;
@@ -93,8 +123,8 @@ export function blankLiterals(sql: string, backslash = false): string {
 }
 
 /** Whether `pos` (a cursor) is inside a string or comment of `sql`. */
-export function inStringOrComment(sql: string, pos: number, backslash = false): boolean {
-  for (const s of sqlSpans(sql, backslash)) {
+export function inStringOrComment(sql: string, pos: number, opts?: LexOptions | boolean): boolean {
+  for (const s of sqlSpans(sql, opts)) {
     if (s.start >= pos) return false;
     if (s.kind === "name") continue;
     // After a closing quote is outside; an open string, or a `--` comment, runs on to the cursor.

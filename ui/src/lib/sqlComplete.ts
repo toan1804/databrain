@@ -5,7 +5,7 @@
 import type { ConnectorKind, DbObject, SchemaInfo } from "./types";
 import { mayHaveCatalog, schemaLabel } from "./catalog";
 import { traitsOf } from "./sourceTraits";
-import { blankLiterals } from "./sqlText";
+import { blankLiterals, lexOptionsFor } from "./sqlText";
 import { quoteIdent } from "./util";
 
 export interface MetaProvider {
@@ -469,7 +469,7 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
   // Read the schema list once per request (it is consulted per table option).
   const schemaList = provider.schemas();
   const p: MetaProvider = { ...provider, schemas: () => schemaList };
-  const clean = blankLiterals(doc, backslashEscapes(provider.kind));
+  const clean = blankLiterals(doc, lexOptionsFor(provider.kind));
   // Inside a string or comment: no completion.
   if (clean[pos - 1] === " " && doc[pos - 1] !== " " && doc[pos - 1] !== "\n" && doc[pos - 1] !== "\t") return null;
   const [s0] = statementBounds(clean, pos);

@@ -163,3 +163,66 @@ fn imported_ssh_keys_are_not_trusted() {
     assert_eq!(b.engine.trust_ssh_host_key("bastion", 22, "SHA256:other").unwrap(), 0, "an existing pin is never replaced");
     assert_eq!(b.engine.trust_ssh_host_key("bastion", 2222, "SHA256:x").unwrap(), 0);
 }
+
+/// A saved password goes only where it was saved for: Test with another
+/// server in the form doesn't get it, and saving the connection with
+/// another server, user or encryption setting drops it (Connect would
+/// send it there). A change that can't send it elsewhere keeps it.
+#[tokio::test]
+async fn saved_secrets_stay_with_their_server() {
+    let (st, secrets) = state();
+    let mut c = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "app".into() });
+    c.host = Some("db.example.com".into());
+    c.port = Some(5432);
+    let profile = ConnectionProfile {
+        id: String::new(),
+        name: "Main".into(),
+        config: c.clone(),
+        color: None,
+        env: EnvTag::None,
+        folder_id: None,
+        has_secret: false,
+        ai_policy: Default::default(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    let args = |profile: ConnectionProfile, secret: Option<&str>| api::SaveConnectionArgs {
+        profile,
+        secret: secret.map(String::from),
+        clear_secret: false,
+        extra_secrets: Default::default(),
+    };
+    let saved = api::save_connection(&st, args(profile, Some("hunter2"))).unwrap();
+    let pw = SecretRef::for_connection(&saved.id);
+    assert!(secrets.get(&pw).unwrap().is_some());
+
+    // Test against another host with the saved id: refused, before anything connects.
+    let mut moved = c.clone();
+    moved.host = Some("evil.example.com".into());
+    let e = api::test_connection(&st, moved.clone(), None, Some(saved.id.clone()), None, None).await.unwrap_err();
+    assert!(e.message.contains("type the password"), "{}", e.message);
+
+    // A schema change keeps the secret on save.
+    let mut same = saved.clone();
+    same.config.options.insert("schema".into(), "sales".into());
+    let kept = api::save_connection(&st, args(same, None)).unwrap();
+    assert!(kept.has_secret && secrets.get(&pw).unwrap().is_some());
+
+    // Another host saved without a new password: the old one is dropped.
+    for change in [
+        Box::new(|c: &mut ConnectionConfig| c.host = Some("evil.example.com".into())) as Box<dyn Fn(&mut ConnectionConfig)>,
+        Box::new(|c: &mut ConnectionConfig| c.ssl_mode = databrain_connector_core::SslMode::Disable),
+    ] {
+        api::save_connection(&st, args(ConnectionProfile { config: c.clone(), ..kept.clone() }, Some("hunter2"))).unwrap();
+        let mut p = st.workspace.get_connection(&saved.id).unwrap();
+        change(&mut p.config);
+        let after = api::save_connection(&st, args(p, None)).unwrap();
+        assert!(!after.has_secret, "{:?}", after.config);
+        assert!(secrets.get(&pw).unwrap().is_none());
+    }
+    // With a new password typed for the new host, that one is saved.
+    let mut p = st.workspace.get_connection(&saved.id).unwrap();
+    p.config.host = Some("new.example.com".into());
+    let after = api::save_connection(&st, args(p, Some("new-pw"))).unwrap();
+    assert!(after.has_secret);
+}
