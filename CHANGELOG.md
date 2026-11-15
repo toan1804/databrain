@@ -4,11 +4,11 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+## 0.4.2 - 2026-11-15
+
 ### Added
 
 - Add a result from another tab to a tab's results: + next to the result tabs lists other tabs' results and named outputs; the one you pick opens as a read-only tab of its own (no Edit, no Keep, no rename, pin or drop of its output) next to this tab's results. It is shown while its own tab keeps the result (nothing is pinned or saved for it), also when this tab runs again and after a restart, until you close it.
-
-## 0.4.2 - 2026-11-15
 
 ### Changed
 
