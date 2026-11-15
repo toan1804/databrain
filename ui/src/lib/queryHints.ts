@@ -124,6 +124,11 @@ interface ColUse {
 export function columnUses(stmt: string): ColUse[] {
   const clean = blankLiterals(stmt);
   const out: ColUse[] = [];
+  const seen = new Set<number>();
+  // What is looked at around each name is bounded: a generated predicate of
+  // thousands of terms (`id = 1 OR id = 2 …`) copied and scanned the whole
+  // text before and after every name.
+  const NEAR = 64;
   for (const [a, b] of predicateRanges(clean)) {
     const seg = clean.slice(a, b);
     const re = new RegExp(String.raw`(?:(${IDENT})\s*\.\s*)?(${IDENT})`, "g");
@@ -134,8 +139,8 @@ export function columnUses(stmt: string): ColUse[] {
       const prevCh = seg[m.index - 1];
       if (prevCh === "." || /^\d/.test(raw)) continue;
       // Type names: x::text, cast(x as varchar).
-      if (/(::|\bas)\s*$/i.test(seg.slice(0, m.index))) continue;
-      const after = seg.slice(m.index + m[0].length);
+      if (/(::|\bas)\s*$/i.test(seg.slice(Math.max(0, m.index - NEAR), m.index))) continue;
+      const after = seg.slice(m.index + m[0].length, m.index + m[0].length + NEAR);
       if (/^\s*\(/.test(after)) continue; // function name
       if (!m[1] && KEYWORDS.has(name.toLowerCase())) continue;
       if (/^\s*\./.test(after)) continue; // qualifier of a longer path
@@ -156,7 +161,9 @@ export function columnUses(stmt: string): ColUse[] {
               depth--;
               continue;
             }
-            const fn = /([A-Za-z_][\w$]*)\s*$/.exec(seg.slice(0, j));
+            const fnFrom = Math.max(0, j - NEAR);
+            const fnm = /([A-Za-z_][\w$]*)\s*$/.exec(seg.slice(fnFrom, j));
+            const fn = fnm ? { 1: fnm[1], index: fnFrom + fnm.index } : null;
             const f = fn?.[1].toLowerCase();
             const isCall = !!f && (!KEYWORDS.has(f) || f === "cast" || f === "date");
             if (isCall) {
@@ -171,12 +178,15 @@ export function columnUses(stmt: string): ColUse[] {
               use.wrapText = stmt.slice(a + (fn!.index ?? 0), a + k + 1).trim();
             }
             break;
-          } else if (/[=<>]/.test(c) || /\b(and|or)\s*$/i.test(seg.slice(Math.max(0, j - 4), j + 1))) break;
+          } else if (/[=<>]/.test(c) || /\b(and|or)\s*$/i.test(seg.slice(Math.max(0, j - 4), j + 1)) || m.index - j > 4096) break;
         }
       }
       // Literals are blanked in `clean`; read the pattern from the original text.
-      if (/^\s*(?:not\s+)?i?like\s+'[%_]/i.test(stmt.slice(from + raw.length))) use.leadingWildcard = true;
-      if (!out.some((o) => o.from === use.from)) out.push(use);
+      if (/^\s*(?:not\s+)?i?like\s+'[%_]/i.test(stmt.slice(from + raw.length, from + raw.length + NEAR))) use.leadingWildcard = true;
+      if (!seen.has(use.from)) {
+        seen.add(use.from);
+        out.push(use);
+      }
     }
   }
   return out;

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useJobs } from "./jobsStore";
 import { Command, Moon, Settings2, Sparkles, Sun, TriangleAlert } from "lucide-react";
 import { useStore } from "./store";
+import { toError } from "./lib/api";
 import { editorBridge } from "./editorBridge";
 import { Sidebar } from "./components/Sidebar";
 import { EditorPane } from "./components/EditorPane";
@@ -118,12 +119,15 @@ export default function App() {
   const setAiOpen = useAi((s) => s.setOpen);
 
   useEffect(() => {
+    // Each part on its own: a failed one says so and doesn't keep the
+    // others from starting (a failed AI start left jobs without their
+    // run events, silently).
+    const toast = (what: string) => (e: unknown) => useStore.getState().toast(`${what} did not start: ${toError(e).message}`, "error");
     void useStore
       .getState()
       .init()
-      .then(() => useAi.getState().init())
-      .then(() => useJobs.getState().init())
-      .catch(() => {});
+      .catch(toast("DataBrain"))
+      .then(() => Promise.allSettled([useAi.getState().init().catch(toast("The assistant")), useJobs.getState().init().catch(toast("Jobs"))]));
   }, []);
 
   useEffect(() => {

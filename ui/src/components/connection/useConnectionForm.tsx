@@ -211,7 +211,17 @@ export function useConnectionForm(initial: ConnectionProfile | null, folderId: s
     const tick = setInterval(() => setTestSecs(Math.floor((Date.now() - started) / 1000)), 1000);
     try {
       const p = buildProfile();
-      const r = await api.testConnection(p.config, secret || null, isEdit && !clearSecret ? p.id : null, sshSecret || null, id);
+      // The saved password and keys go only to where they were saved for:
+      // with the server or the user changed, Test doesn't send them there.
+      const moved = !!initial && endpointOf(initial.config) !== endpointOf(p.config);
+      if (moved && initial?.has_secret && !secret && !clearSecret) {
+        setTestResult({
+          ok: false,
+          text: "The server or user changed: type the password (or key) to test against it. The saved one is only sent to the server it was saved for.",
+        });
+        return;
+      }
+      const r = await api.testConnection(p.config, secret || null, isEdit && !clearSecret && !moved ? p.id : null, sshSecret || null, id);
       if (testId.current === id) setTestResult({ ok: true, text: `Connected in ${r.latency_ms} ms — ${r.server_version}` });
     } catch (e) {
       const err = toError(e);
@@ -363,3 +373,17 @@ export function useConnectionForm(initial: ConnectionProfile | null, folderId: s
 }
 
 export type ConnectionFormState = ReturnType<typeof useConnectionForm>;
+
+/**
+ * Where a connection's credentials go: its type, host and port, the user
+ * and sign-in method, the SSH tunnel's host and user, and options that name a server (account, workspace,
+ * endpoint…). A change here means the saved secret would reach another
+ * server or account.
+ */
+export function endpointOf(c: ConnectionProfile["config"]): string {
+  const opts = Object.entries(c.options ?? {})
+    .filter(([k]) => /host|account|server|url|endpoint|workspace|region|tenant|project|dsn|service/i.test(k))
+    .sort(([a], [b]) => a.localeCompare(b));
+  const ssh = c.ssh ? [c.ssh.host, c.ssh.port, c.ssh.user] : null;
+  return JSON.stringify([c.kind, c.host ?? null, c.port ?? null, c.auth ?? null, c.file_path ?? null, opts, ssh]);
+}

@@ -113,3 +113,20 @@ describe("queryHints: summaries", () => {
     expect(columnRoles(events)).toEqual({ event_date: "partition key", user_id: "cluster key" });
   });
 });
+
+describe("query tips on a very long predicate", () => {
+  it("reads a generated OR of 10,000 terms in linear time", () => {
+    const terms = Array.from({ length: 10_000 }, (_, i) => `id = ${i}`).join(" OR ");
+    const sql = `select * from t where ${terms} and lower(email) = 'x' and name like '%x'`;
+    const t0 = performance.now();
+    const uses = columnUses(sql);
+    const ms = performance.now() - t0;
+    expect(uses.filter((u) => u.name === "id")).toHaveLength(10_000);
+    const email = uses.find((u) => u.name === "email")!;
+    expect(email.wrappedBy).toBe("lower");
+    expect(email.wrapText).toBe("lower(email)");
+    expect(uses.find((u) => u.name === "name")?.leadingWildcard).toBe(true);
+    // Was several seconds (copies of the whole text per name).
+    expect(ms).toBeLessThan(1500);
+  });
+});

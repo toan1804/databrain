@@ -4,7 +4,8 @@ import { computeRunTips, slowStatements } from "../queryTips";
 import type { JobEvent, OutputInfo, ParamValue } from "../lib/types";
 import { errorRange } from "../lib/util";
 import { ddlEffect } from "./explorerSlice";
-import { keptIndex, restoredRun } from "./helpers";
+import { keptIndex, persistTabs, restoredRun } from "./helpers";
+import { uid } from "../lib/util";
 import { isQueryTab, type RunInput, type State, type StatementRun, type TabRun } from "./types";
 
 /**
@@ -158,7 +159,10 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           ),
         };
       }
-      const tabs = s.tabs.filter((t) => !(t.output_ref && gone.has(t.output_ref)));
+      let tabs = s.tabs.filter((t) => !(t.output_ref && gone.has(t.output_ref)));
+      // Never no tab at all (as when the last tab is closed), and the list as it is now is kept for the next start.
+      if (tabs.length === 0) tabs = [{ id: uid(), title: "Query 1", sql: "", connection_id: s.tabs.find((t) => t.connection_id)?.connection_id ?? null }];
+      if (tabs.length !== s.tabs.length) persistTabs(tabs);
       const activeTabId = tabs.some((t) => t.id === s.activeTabId) ? s.activeTabId : (tabs[0]?.id ?? null);
       return { runs, tabs, activeTabId, outputs: s.outputs.filter((o) => !gone.has(o.handle)) };
     }),

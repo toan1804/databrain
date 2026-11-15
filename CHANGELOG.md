@@ -11,6 +11,13 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Start-up: when the assistant or jobs failed to start, nothing said so, and a failed assistant start also kept jobs from starting (no run events, an empty Jobs list). Each part starts on its own and reports a failure; the jobs list is looked at again every 30 s even when the first look failed.
+- The connection dialog's Test no longer sends the saved password to a server, port, user or SSH host that was changed in the form: it asks for the password to test against the new one.
+- Dropping the output shown in the last tab no longer leaves no tab open, and the tab list is saved.
+- History shows the results of the latest search when an older one answers last; double-clicking a table in catalog search inserts its name (the first click closed the search).
+- Completion after a quoted name with a space (`"my schema".`) offers its tables.
+- Diagrams of schemas whose tables reference each other are as wide as their longest chain (two tables referencing each other made them hundreds of columns wide). Query tips stay fast on generated predicates of thousands of terms.
+- Typing in a notebook re-renders only the cell typed in; dependencies and parameters are read again once typing pauses.
 - Jobs: when the assistant changes a job open with changes not saved yet (or a save that failed), you choose which version stays (yours were dropped without a word). A step renamed and left at once (another step clicked) keeps its new name. A query step whose connection was deleted says so, instead of showing "Results (DuckDB)". A step name made unique (`sales_` taken) no longer becomes `sales__2`, which reads as a version and which the editor refuses.
 - "Load into…" waits for the check of the target table before Load can be pressed, so "exists: it is dropped…" is seen first.
 - The assistant: Stop works while a question is still starting (it stops once the run is known), and ends a conversation whose run the app no longer knows, which stayed "running" for good with every new question only queued. A question asked while the assistant works is sent later about the editor it was asked from, not the one in front then. A History conversation opened into an empty chat no longer inherits that chat's Auto-approve.

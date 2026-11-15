@@ -420,3 +420,15 @@ describe("a tab closed while its run starts", () => {
     expect(cancelled).toEqual([]);
   });
 });
+
+describe("dropping an output", () => {
+  it("never leaves no tab open", async () => {
+    const o = out("r7", "t", 0, { state: "live" });
+    useStore.setState({ outputs: [o], tabs: [{ id: "view", title: "r7", sql: "", connection_id: "conn", output_ref: "r7" } as never], activeTabId: "view", runs: {} });
+    useStore.getState().forgetOutputs(["r7"]);
+    const { tabs, activeTabId } = useStore.getState();
+    expect(tabs).toHaveLength(1);
+    expect(tabs[0].output_ref).toBeFalsy();
+    expect(activeTabId).toBe(tabs[0].id);
+  });
+});

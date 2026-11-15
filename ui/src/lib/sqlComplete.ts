@@ -519,7 +519,20 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
 
   // Current token: dotted path ending at the cursor.
   let start = pos;
-  while (start > s0 && /[\w$."`[\]]/.test(clean[start - 1])) start--;
+  while (start > s0) {
+    const c = clean[start - 1];
+    // A quoted part as a whole: it may hold spaces (`"my schema".`).
+    const open = c === '"' || c === "`" ? c : c === "]" ? "[" : null;
+    if (open && start - 1 > s0) {
+      const at = clean.lastIndexOf(open, start - 2);
+      if (at >= s0 && !clean.slice(at, start).includes("\n")) {
+        start = at;
+        continue;
+      }
+    }
+    if (!/[\w$."`[\]]/.test(c)) break;
+    start--;
+  }
   let token = clean.slice(start, pos);
   if (!PATH_RE.test(token)) {
     // Keep only the trailing simple word.

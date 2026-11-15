@@ -271,3 +271,16 @@ describe("comments", () => {
     expect((await completeSql("select * from da", 16, p))?.options.some((o) => o.label === "fct_rev")).toBeFalsy();
   });
 });
+
+describe("completion after a quoted name with a space", () => {
+  it("offers the tables of `\"my schema\".`", async () => {
+    const base = provider();
+    const spaced: MetaProvider = {
+      ...base,
+      schemas: () => [{ name: "public", is_default: true }, { name: "my schema", is_default: false }],
+      objects: async (s) => (s === "my schema" ? [t("my schema", "sales_eu")] : await base.objects("public", undefined as never)),
+    };
+    const got = await at('select * from "my schema".|', spaced, true);
+    expect(got.some((x) => x.includes("sales_eu")), got.join(", ")).toBe(true);
+  });
+});

@@ -11,6 +11,10 @@ import { ObjectMenu } from "./CatalogMenus";
 import { kbd } from "../lib/platform";
 
 /** SQL reference for an object (DuckDB attached files are addressed as `files.x`). */
+
+/** How long a click waits for a second one before it acts as a single click. */
+const DOUBLE_CLICK_MS = 250;
+
 export function objectRef(conn: ConnectionView, obj: DbObject): string {
   return tablePath(conn.config.kind, obj.schema, obj.name);
 }
@@ -324,6 +328,10 @@ function HitRow({
 }) {
   const m = matchRange(query, obj.name);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  // A click reveals the table in the explorer, which closes the search (and
+  // this row): it waits for a possible second click, so a double click can insert.
+  const clickTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(clickTimer.current), []);
   const isView = obj.kind === "view" || obj.kind === "materialized_view";
   const where = path.catalog ? `${path.catalog} › ${path.schema}` : path.schema;
   return (
@@ -332,8 +340,15 @@ function HitRow({
       aria-selected={selected}
       title={`${where} › ${obj.name}${obj.comment ? `\n${obj.comment}` : ""}`}
       onMouseMove={onHover}
-      onClick={onReveal}
-      onDoubleClick={onInsert}
+      onClick={(e) => {
+        clearTimeout(clickTimer.current);
+        if (e.detail > 1) return;
+        clickTimer.current = setTimeout(onReveal, DOUBLE_CLICK_MS);
+      }}
+      onDoubleClick={() => {
+        clearTimeout(clickTimer.current);
+        onInsert();
+      }}
       onContextMenu={(e) => {
         e.preventDefault();
         setMenu({ x: e.clientX, y: e.clientY });

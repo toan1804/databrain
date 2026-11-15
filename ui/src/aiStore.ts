@@ -752,7 +752,9 @@ export const useAi = create<AiState>((set, get) => {
       // The shown restored conversation is read now; the others when opened.
       const shown = chat(get().activeChatId);
       if (shown?.needsLoad && shown.sessionId) void loadMessages(shown.id, shown.sessionId);
-      const [settings] = await Promise.all([api.getSettings(), get().refreshProviders()]);
+      // Listeners are in place; providers that can't be listed now are
+      // listed again from the panel, so the start doesn't stop here.
+      const [settings] = await Promise.all([api.getSettings().catch(() => ({}) as Record<string, unknown>), get().refreshProviders().catch(() => {})]);
       const pid = typeof settings.ai_provider === "string" ? settings.ai_provider : null;
       const providers = get().providers;
       const provider = providers.find((p) => p.id === pid) ?? providers[0];
