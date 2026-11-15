@@ -45,7 +45,7 @@ Each part turns on when its secrets are set (Settings → Secrets and variables 
 
 ### macOS: Developer ID and notarization
 
-Without it, macOS blocks the first open of a downloaded build (right-click → Open, or System Settings → Privacy & Security → Open Anyway).
+Without it, macOS blocks the first open of a downloaded build, or calls it damaged: users clear the quarantine flag with `sudo xattr -cr /Applications/DataBrain.app` (right-click → Open is not always enough).
 
 | Secret | What |
 | --- | --- |

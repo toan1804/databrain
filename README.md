@@ -22,7 +22,11 @@ A desktop SQL client for many databases, with column lineage, scheduled jobs and
 All versions are on the [Releases](https://github.com/toan1804/databrain/releases) page, with a `SHA256SUMS` file to check downloads ([how](docs/RELEASING.md#checksums-and-provenance)). The app checks for updates once a day and installs one from its banner (**Update and relaunch**); Linux `.deb` and `.rpm` installs link to the download instead.
 
 > [!NOTE]
-> Until a release is signed with a Developer ID (see [Signing](docs/RELEASING.md#signing-and-in-app-updates)), move DataBrain.app to Applications, then right-click it → **Open** the first time.
+> DataBrain isn't signed with an Apple Developer ID yet (see [Signing](docs/RELEASING.md#signing-and-in-app-updates)), so macOS blocks it the first time, or says it "is damaged and can't be opened". Move DataBrain.app to Applications, then clear the quarantine flag once in Terminal:
+>
+> ```sh
+> sudo xattr -cr /Applications/DataBrain.app
+> ```
 
 The "without DuckDB" build is a 24 MB download instead of 78 MB and uses the DuckDB library installed on the computer (1.5 or newer, e.g. `brew install duckdb`).
 
