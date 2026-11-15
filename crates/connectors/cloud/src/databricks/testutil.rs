@@ -122,10 +122,19 @@ pub mod mock {
                     let mut raw: Option<Vec<u8>> = None;
                     let (status, out) = if method == "POST" && path == "/api/2.0/sql/statements" {
                         let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                        if v["disposition"] == "INLINE" {
+                        if v["disposition"] == "INLINE" && blob_mode == "binary" {
+                            // BINARY in a JSON result: base64 text ("hi", and bytes that aren't UTF-8).
+                            let bin = json!({"columns": [{"name": "b", "type_name": "BINARY", "type_text": "BINARY"}]});
                             (
                                 200,
-                                json!({"statement_id": "st2", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": cols}, "result": {"data_array": [["7", "inline"]]}}),
+                                json!({"statement_id": "st2", "status": {"state": "SUCCEEDED"}, "manifest": {"schema": bin}, "result": {"data_array": [["aGk="], ["/wA="], [null]]}}),
+                            )
+                        } else if v["disposition"] == "INLINE" {
+                            // "truncated": the server stopped at the row limit.
+                            let manifest = if blob_mode == "truncated" { json!({"schema": cols, "truncated": true}) } else { json!({"schema": cols}) };
+                            (
+                                200,
+                                json!({"statement_id": "st2", "status": {"state": "SUCCEEDED"}, "manifest": manifest, "result": {"data_array": [["7", "inline"]]}}),
                             )
                         } else if v["format"] == "ARROW_STREAM" && blob_mode == "no_arrow" {
                             (400, json!({"message": "ARROW_STREAM format is not supported for this warehouse"}))

@@ -7,11 +7,11 @@ use databrain_connector_core::arrow::array::{Array, RecordBatch};
 use databrain_connector_core::arrow::datatypes::SchemaRef;
 use databrain_connector_core::{ConnectorError, ExecOptions, ExecSummary, Result, StreamEvent, StreamSender};
 
-use crate::common::{RowSink, json_cell};
+use crate::common::RowSink;
 
 use super::client::Inner;
 use super::download::*;
-use super::types::manifest_columns;
+use super::types::{cell, manifest_columns};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Disposition {
@@ -219,7 +219,7 @@ impl Inner {
             };
             for r in &rows {
                 let row = r.as_array().cloned().unwrap_or_default();
-                let vals = sink.types.clone().into_iter().enumerate().map(|(i, t)| json_cell(t, row.get(i).unwrap_or(&serde_json::Value::Null)));
+                let vals = sink.types.clone().into_iter().enumerate().map(|(i, t)| cell(t, row.get(i).unwrap_or(&serde_json::Value::Null)));
                 if !sink.push(vals).await.map_err(StreamFail::Other)? {
                     break 'outer;
                 }
@@ -394,6 +394,51 @@ mod tests {
         assert_eq!(texts(&r), vec!["r0", "NULL", "r2", "NULL"]);
         assert!(r.notices.is_empty(), "{:?}", r.notices);
         assert!(log.lock().unwrap().requests.iter().any(|(_, p, _, _)| p.starts_with("/blob/json/")));
+    }
+
+    /// BINARY is bytes whichever way it comes: base64 in a JSON result,
+    /// binary in an Arrow chunk (not text that is UTF-8 one time, hex another).
+    #[tokio::test]
+    async fn binary_is_bytes_in_json_and_arrow_results() {
+        use databrain_connector_core::arrow::array::{AsArray, BinaryArray};
+        let (origin, _) = mock::serve("binary").await;
+        let r = mock::session(&origin, true)
+            .execute(databrain_connector_core::Statement::internal("SELECT b FROM t"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = r.batches[0].column(0).as_binary::<i32>();
+        assert_eq!((col.value(0), col.value(1), col.is_null(2)), (&b"hi"[..], &[0xff, 0x00][..], true));
+
+        let cols = vec![Column::new("b", ColType::Binary, "binary")];
+        let schema = databrain_connector_core::value::schema_for(&cols);
+        let arrow_schema = Arc::new(databrain_connector_core::arrow::datatypes::Schema::new(vec![databrain_connector_core::arrow::datatypes::Field::new(
+            "b",
+            databrain_connector_core::arrow::datatypes::DataType::Binary,
+            true,
+        )]));
+        let b = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(BinaryArray::from(vec![&b"hi"[..], &[0xff, 0x00][..]]))]).unwrap();
+        let mut buf = Vec::new();
+        let mut w = databrain_connector_core::arrow::ipc::writer::StreamWriter::try_new(&mut buf, &arrow_schema).unwrap();
+        w.write(&b).unwrap();
+        w.finish().unwrap();
+        drop(w);
+        let out = decode_arrow(&buf, &schema).unwrap();
+        let col = out[0].column(0).as_binary::<i32>();
+        assert_eq!((col.value(0), col.value(1)), (&b"hi"[..], &[0xff, 0x00][..]));
+    }
+
+    /// A metadata read the server cut at its row limit fails instead of
+    /// returning part of the list as all of it.
+    #[tokio::test]
+    async fn a_cut_metadata_read_is_an_error() {
+        let (origin, _) = mock::serve("truncated").await;
+        let e = mock::session(&origin, true).0.run_small("SELECT table_name FROM information_schema.tables").await.unwrap_err();
+        assert!(e.message.contains("only the first 100000 rows"), "{}", e.message);
+        let (origin, _) = mock::serve("ok").await;
+        assert_eq!(mock::session(&origin, true).0.run_small("SELECT 1").await.unwrap().len(), 1);
     }
 
     #[test]
