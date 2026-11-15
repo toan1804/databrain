@@ -84,7 +84,12 @@ pub async fn lineage(
             let id = id.as_deref()?;
             let (schema, name) = ws.meta_get(id, &parts.join(".")).ok().flatten()?;
             let columns = ws.kn_column_names(id, &schema, &name).ok().flatten()?;
-            let view_sql = views.get(&format!("{schema}.{name}").to_lowercase()).filter(|d| !d.trim().is_empty()).cloned();
+            // Read for this view, or kept from an earlier read (Show DDL, masking).
+            let view_sql = views
+                .get(&format!("{schema}.{name}").to_lowercase())
+                .filter(|d| !d.trim().is_empty())
+                .cloned()
+                .or_else(|| ws.meta_view_sql(id, &schema, &name).ok().flatten());
             Some(databrain_lineage::CatalogTable { name: format!("{schema}.{name}"), columns, view_sql })
         }
     };

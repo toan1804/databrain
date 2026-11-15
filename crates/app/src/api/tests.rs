@@ -1584,9 +1584,14 @@ async fn lineage_expands_views_with_the_database() {
     assert_eq!(g.nodes.iter().filter(|n| n.view).count(), 2, "{:?}", g.nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
     let amount = g.edges.iter().find(|e| by_id(&e.from) == "main.orders" && e.from_column.as_deref() == Some("amount")).expect("orders.amount is traced");
     assert_eq!(amount.to_column.as_deref(), Some("doubled"));
-    // Without the check: views stay boxes (nothing is read from the server).
+    // Without the check: nothing is read from the server; the definitions
+    // read above are kept, so the views are still traced.
     let v = lineage(&st, Some(&p.id), ConnectorKind::Sqlite, "select d from top", Default::default(), false).await.unwrap();
-    assert!(v.graph.nodes.iter().all(|n| !n.view));
+    assert_eq!(v.graph.nodes.iter().filter(|n| n.view).count(), 2);
+    assert!(v.described.is_empty());
+    // A new connection's views, never read: boxes.
+    let fresh = lineage(&st, None, ConnectorKind::Sqlite, "select d from top", Default::default(), false).await.unwrap();
+    assert!(fresh.graph.nodes.iter().all(|n| !n.view));
 }
 
 /// MongoDB commands are classified by the parser that runs them: a `$out`

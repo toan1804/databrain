@@ -185,6 +185,12 @@ mod boundary {
             // Joins learned from the user's own history; shown only when
             // both tables pass AiTables (knowledge.rs).
             ("learn.rs", ".tables_named("),
+            // PII masking traces views to the tables they read (any view,
+            // in the AI's scope or not: masking must see them all); nothing
+            // of it goes to the model (tools/query.rs `view_catalog`,
+            // `read_view_definitions`).
+            ("query.rs", ".meta_get("),
+            ("query.rs", ".kn_column_names("),
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut bad = vec![];

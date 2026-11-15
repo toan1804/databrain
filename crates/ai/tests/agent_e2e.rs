@@ -824,6 +824,61 @@ async fn output_columns_stay_masked_in_duckdb() {
     assert_eq!(page.rows[0][2].as_deref(), Some("a@x.io"));
 }
 
+/// A PII rule on a table also masks what a view gives of it, under another
+/// name: the view's definition is read (and kept) before the rows go to the
+/// model, in run_query, query_result, sample_rows and query_outputs.
+#[tokio::test]
+async fn pii_rules_follow_tables_through_views() {
+    let f = fixture(1, AiPolicy::default()).await;
+    {
+        let c = rusqlite::Connection::open(f._dir.0.join("shop.db")).unwrap();
+        c.execute_batch("create view v_people as select id, name, email as contact from customers;").unwrap();
+    }
+    let mut conn = f.ws.get_connection(&f.conn).unwrap();
+    conn.ai_policy.run_query = RunQueryPolicy::AutoRead;
+    conn.ai_policy.share_result_rows = true;
+    conn.ai_policy.share_sample_values = true;
+    conn.ai_policy.pii_columns = vec!["main.customers.email".into()];
+    let conn = f.ws.save_connection(conn).unwrap();
+    // The view is listed (as a view), its definition not read yet.
+    databrain_ai::knowledge::index_connection(&f.engine, &conn.id, None, &|_, _, _| {}, &Default::default()).await.unwrap();
+    assert_eq!(f.ws.meta_view_sql(&conn.id, "main", "v_people").unwrap(), None);
+    let ctx = databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile: conn.clone(),
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: Arc::new(Host { approvals: AtomicUsize::new(0), approve: true }),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+        provider_id: None,
+    };
+    let o = ctx.call("run_query", &json!({"sql": "select id, name, contact from v_people order by id"})).await;
+    assert!(!o.content.contains("@x.io"), "run_query: {}", o.content);
+    assert!(o.content.contains("Binh"), "other columns still shown: {}", o.content);
+    assert!(f.ws.meta_view_sql(&conn.id, "main", "v_people").unwrap().is_some_and(|d| d.contains("email as contact")), "the definition is kept");
+    let id = ctx.results.lock().last().cloned().expect("a result");
+    // The view's column is PII now: refused by name, the others answered.
+    let o = ctx.call("query_result", &json!({"result_id": id.clone(), "sql": "select contact from result"})).await;
+    assert!(!o.content.contains("@x.io") && o.content.contains("PII"), "query_result: {}", o.content);
+    let o = ctx.call("query_result", &json!({"result_id": id, "sql": "select name from result order by name"})).await;
+    assert!(o.content.contains("Chi"), "query_result: {}", o.content);
+    let o = ctx.call("get_sample_rows", &json!({"table": "main.v_people"})).await;
+    assert!(!o.content.contains("@x.io") && o.content.contains("An"), "sample_rows: {}", o.content);
+    // Redefined since (SQLite gives no versions): read again before masking.
+    {
+        let c = rusqlite::Connection::open(f._dir.0.join("shop.db")).unwrap();
+        c.execute_batch("drop view v_people; create view v_people as select id, name, email as reach from customers;").unwrap();
+    }
+    let o = ctx.call("run_query", &json!({"sql": "select id, reach from v_people order by id"})).await;
+    assert!(!o.content.contains("@x.io"), "redefined view: {}", o.content);
+    assert!(f.ws.meta_view_sql(&conn.id, "main", "v_people").unwrap().is_some_and(|d| d.contains("email as reach")), "read again");
+    // A plain table read stays as before: the rule masks the column itself, not others.
+    let o = ctx.call("run_query", &json!({"sql": "select id, country from orders order by id"})).await;
+    assert!(o.content.contains("Vietnam") && !o.content.contains("***"), "{}", o.content);
+}
+
 /// Table access rules: run_query, sample_rows, outputs the user made from a
 /// denied table, and jobs the AI builds all respect them; MCP too.
 #[tokio::test]

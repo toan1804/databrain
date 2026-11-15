@@ -8,7 +8,7 @@ use std::ops::ControlFlow;
 use databrain_connector_core::ConnectorKind;
 use databrain_connector_core::sqlparser::ast::{Expr, ObjectNamePart, TableFactor, Visit, Visitor};
 use databrain_connector_core::sqlparser::parser::Parser;
-use databrain_lineage::{EdgeKind, Lineage, NoCatalog, NodeKind, analyze};
+use databrain_lineage::{Catalog, EdgeKind, Lineage, NodeKind, analyze};
 
 use crate::policy::{name_parts, same_table};
 
@@ -16,10 +16,24 @@ use crate::policy::{name_parts, same_table};
 /// unknown) is sensitive.
 pub type IsPii<'a> = dyn Fn(Option<&str>, &str) -> bool + 'a;
 
+/// Views of the database, as masking reads them: `catalog` gives a view's
+/// definition when it is known (the lineage then traces the view to the
+/// tables it reads: a rule on `users.email` masks `v_users.contact` when the
+/// view selects `email AS contact`); `opaque` says a table the lineage
+/// reached is a view whose definition isn't known, so all it gives is
+/// masked (fail closed). Tables are left to the rules by name.
+pub struct Views<'a> {
+    pub catalog: &'a dyn Catalog,
+    pub opaque: &'a dyn Fn(&str) -> bool,
+}
+
+/// No views known: every table is taken as a table.
+pub const NO_VIEWS: Views<'static> = Views { catalog: &databrain_lineage::NoCatalog, opaque: &|_| false };
+
 /// One flag per result column (`columns`, in order). `rule_columns`: the
 /// column part of every PII rule, for when the SQL can't be traced (then a
 /// column is masked if the SQL mentions any of them: fail closed).
-pub fn masked_columns(sql: &str, kind: ConnectorKind, columns: &[String], rule_columns: &[String], is_pii: &IsPii) -> Vec<bool> {
+pub fn masked_columns(sql: &str, kind: ConnectorKind, columns: &[String], rule_columns: &[String], is_pii: &IsPii, views: &Views) -> Vec<bool> {
     if rule_columns.is_empty() {
         return vec![false; columns.len()];
     }
@@ -27,8 +41,13 @@ pub fn masked_columns(sql: &str, kind: ConnectorKind, columns: &[String], rule_c
     if !kind.traits().language.is_sql() {
         return non_sql_masks(sql, kind, columns, rule_columns, is_pii, mentions);
     }
-    let g = analyze(sql, kind, &NoCatalog);
+    let g = analyze(sql, kind, views.catalog);
     let tables: Vec<&str> = g.nodes.iter().filter(|n| n.kind == NodeKind::Table).map(|n| n.name.as_str()).collect();
+    // A view read whose definition isn't known: what comes from it is masked.
+    let opaque: Vec<&str> = tables.iter().copied().filter(|t| (views.opaque)(t)).collect();
+    // A view expanded: a column that can't be traced through it is masked
+    // (its definition may not be what the view is now).
+    let through_view = g.nodes.iter().any(|n| n.view);
     let result = g.nodes.iter().rev().find(|n| n.kind == NodeKind::Result);
     let names = names_in(sql, kind);
     // `row_to_json(u)`, `to_jsonb(users)`, `u::text`, `SELECT u FROM users u`:
@@ -52,15 +71,17 @@ pub fn masked_columns(sql: &str, kind: ConnectorKind, columns: &[String], rule_c
             if is_pii(None, c) || tables.iter().any(|t| is_pii(Some(t), c)) {
                 return true;
             }
-            let Some(r) = result.filter(|_| !g.partial) else { return mentions || row_used };
+            let Some(r) = result.filter(|_| !g.partial) else { return mentions || row_used || !opaque.is_empty() };
             let sources = sources(&g, &r.id, c);
             if sources.is_empty() {
                 // Not traced (an expression the lineage can't place): masked
                 // when the SQL names a sensitive column, or a ruled table's
-                // whole row, at all.
-                return mentions || row_used;
+                // whole row, at all, or reads a view it can't see into.
+                return mentions || row_used || !opaque.is_empty() || through_view;
             }
-            sources.iter().any(|(t, col)| if col == "*" { is_pii(Some(t), c) } else { is_pii(Some(t), col) || is_pii(None, col) || whole_row(t, col) })
+            sources.iter().any(|(t, col)| {
+                opaque.contains(&t.as_str()) || if col == "*" { is_pii(Some(t), c) } else { is_pii(Some(t), col) || is_pii(None, col) || whole_row(t, col) }
+            })
         })
         .collect()
 }
@@ -160,6 +181,8 @@ fn sources(g: &Lineage, id: &str, column: &str) -> Vec<(String, String)> {
             }
             let from_col = e.from_column.clone().map(|c| c.to_ascii_lowercase()).filter(|c| !c.ends_with('*')).unwrap_or_else(|| col.clone());
             match nodes.get(e.from.as_str()) {
+                // A view the lineage expanded: on to the tables it reads.
+                Some(n) if n.kind == NodeKind::Table && n.view => todo.push((e.from.clone(), from_col)),
                 Some(n) if n.kind == NodeKind::Table => {
                     out.push((n.name.clone(), if e.from_column.as_deref().is_none_or(|c| c.ends_with('*')) { "*".into() } else { from_col }))
                 }
@@ -188,7 +211,7 @@ mod tests {
         let pol = AiPolicy { pii_columns: rules.iter().map(|r| r.to_string()).collect(), ..Default::default() };
         let rule_columns: Vec<String> = pol.pii_columns.iter().map(|p| p.rsplit('.').next().unwrap_or("").to_ascii_lowercase()).collect();
         let cols: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
-        masked_columns(sql, kind, &cols, &rule_columns, &|t, c| is_pii(&pol, t, c))
+        masked_columns(sql, kind, &cols, &rule_columns, &|t, c| is_pii(&pol, t, c), &NO_VIEWS)
     }
 
     fn pg(rules: &[&str], sql: &str, columns: &[&str]) -> Vec<bool> {
@@ -295,5 +318,53 @@ mod tests {
             ),
             [false, false]
         );
+    }
+
+    /// Views: a rule on a table masks what a view gives of it (under any
+    /// name, through a view of a view); a view whose definition isn't known
+    /// is masked whole; what the view takes from elsewhere isn't masked.
+    #[test]
+    fn rules_follow_tables_through_views() {
+        let defs = |parts: &[String]| -> Option<databrain_lineage::CatalogTable> {
+            let name = parts.last()?.as_str();
+            let (cols, sql) = match name {
+                "v_users" => (vec!["id", "contact"], Some("CREATE VIEW public.v_users AS SELECT id, email AS contact FROM public.users")),
+                "v_top" => (vec!["who"], Some("select contact as who from public.v_users")),
+                "v_secret" => (vec!["id", "contact"], None),
+                _ => return None,
+            };
+            Some(databrain_lineage::CatalogTable {
+                name: format!("public.{name}"),
+                columns: cols.into_iter().map(String::from).collect(),
+                view_sql: sql.map(String::from),
+            })
+        };
+        let opaque = |t: &str| t.eq_ignore_ascii_case("public.v_secret");
+        let views = Views { catalog: &defs, opaque: &opaque };
+        let pol = AiPolicy { pii_columns: vec!["public.users.email".into()], ..Default::default() };
+        let check = |sql: &str, cols: &[&str]| {
+            let cols: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+            masked_columns(sql, ConnectorKind::Postgres, &cols, &["email".to_string()], &|t, c| is_pii(&pol, t, c), &views)
+        };
+        // Refused: the email through a view, renamed, and through a view of it.
+        assert_eq!(check("select id, contact from v_users", &["id", "contact"]), [false, true]);
+        assert_eq!(check("select * from public.v_users", &["id", "contact"]), [false, true]);
+        assert_eq!(check("select upper(who) as w from v_top", &["w"]), [true]);
+        // A view it can't see into: all of it.
+        assert_eq!(check("select id, contact from v_secret", &["id", "contact"]), [true, true]);
+        // Allowed: what doesn't come from the ruled column, and other tables.
+        assert_eq!(check("select id from v_users", &["id"]), [false]);
+        assert_eq!(check("select id, name from public.orders", &["id", "name"]), [false, false]);
+        // Without the view's definition (no catalog), the renamed column would pass.
+        let pol2 = &pol;
+        let none = masked_columns(
+            "select contact from v_users",
+            ConnectorKind::Postgres,
+            &["contact".into()],
+            &["email".to_string()],
+            &|t, c| is_pii(pol2, t, c),
+            &NO_VIEWS,
+        );
+        assert_eq!(none, [false], "what this change fixes");
     }
 }
