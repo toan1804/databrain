@@ -125,6 +125,8 @@ impl Inner {
         let mut header: Vec<Vec<Option<String>>> = Vec::new();
         let mut sink: Option<(BatchBuilder, Vec<ColType>)> = None;
         let mut exception: Option<String> = None;
+        // A line that reads like an exception, until the next one shows whether it was a row.
+        let mut held: Option<Vec<u8>> = None;
         let max = opts.max_rows.unwrap_or(usize::MAX);
         let mut rows = 0usize;
         'read: loop {
@@ -186,20 +188,36 @@ impl Inner {
                     continue;
                 }
                 let Some((b, types)) = sink.as_mut() else { continue };
-                let cells = split_tsv(line);
-                b.push_row(types.iter().enumerate().map(|(i, t)| cell(*t, cells.get(i).cloned().flatten())));
-                rows += 1;
-                if b.is_full() && !tx.send(StreamEvent::Batch(b.finish()?)).await {
-                    return Ok(());
+                // An exception after the result started has as many fields
+                // as a row when the result has one column (no tab in it):
+                // a line that reads like one is held, and is the error when
+                // the result ends right after it (a row when another follows).
+                let mut ready: Vec<Vec<u8>> = held.take().into_iter().collect();
+                if is_exception_line(line) {
+                    held = Some(line.to_vec());
+                } else {
+                    ready.push(line.to_vec());
                 }
-                if rows >= max {
-                    // Dropping the response stops a read-only query on the server.
-                    break 'read;
+                for line in ready {
+                    let cells = split_tsv(&line);
+                    b.push_row(types.iter().enumerate().map(|(i, t)| cell(*t, cells.get(i).cloned().flatten())));
+                    rows += 1;
+                    if b.is_full() && !tx.send(StreamEvent::Batch(b.finish()?)).await {
+                        return Ok(());
+                    }
+                    if rows >= max {
+                        // Dropping the response stops a read-only query on the server.
+                        held = None;
+                        break 'read;
+                    }
                 }
             }
             if done {
                 break;
             }
+        }
+        if let Some(h) = held {
+            exception = Some(String::from_utf8_lossy(&h).into_owned());
         }
         if let Some(e) = exception {
             return Err(server_error(None, 500, e.trim()));
@@ -220,6 +238,14 @@ impl Inner {
         tx.send(StreamEvent::Done(ExecSummary { rows_affected: written })).await;
         Ok(())
     }
+}
+
+/// A line as ClickHouse writes an exception into a result it already
+/// started: `Code: 241. DB::Exception: …`.
+pub(crate) fn is_exception_line(line: &[u8]) -> bool {
+    let Some(rest) = line.strip_prefix(b"Code: ") else { return false };
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    digits > 0 && rest[digits..].starts_with(b". DB::Exception:")
 }
 
 /// The database a `USE db` statement switches to.

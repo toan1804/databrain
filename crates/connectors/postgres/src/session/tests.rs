@@ -331,3 +331,51 @@ async fn live_roundtrip() {
     assert!(l.indexes[0].primary && l.indexes[0].columns == vec!["id", "day"], "{l:?}");
     assert_eq!(l.indexes[1].columns, vec!["cust", "lower(cust)"], "{l:?}");
 }
+
+/// Live: the transaction state follows the server when a statement that
+/// begins or ends one fails (its text said otherwise): a refused BEGIN or
+/// `COMMIT AND CHAIN` leaves none open; a failed one inside a transaction
+/// leaves it open (aborted, waiting for ROLLBACK).
+#[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
+#[tokio::test]
+async fn live_transaction_state_after_a_failed_statement() {
+    use databrain_connector_core::TxState;
+    let Some(s) = live_session().await else {
+        panic!("live test: DATABRAIN_PG_HOST not set (run with --ignored)");
+    };
+    let s = &s;
+    let run = |sql: &'static str| async move {
+        match s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await {
+            Ok(st) => st.collect().await.is_ok(),
+            Err(_) => false,
+        }
+    };
+    // Refused: no transaction began.
+    assert!(!run("begin isolation level bogus").await);
+    assert_eq!(s.transaction_state(), TxState::None, "a BEGIN that failed");
+    assert!(!run("commit and chain").await);
+    assert_eq!(s.transaction_state(), TxState::None, "COMMIT AND CHAIN outside a transaction");
+
+    // A deferred constraint fails the COMMIT: the transaction is gone, no chain.
+    for sql in [
+        "drop table if exists kb_tx_child, kb_tx_parent",
+        "create table kb_tx_parent (id int primary key)",
+        "create table kb_tx_child (p int references kb_tx_parent(id) deferrable initially deferred)",
+        "begin",
+        "insert into kb_tx_child values (1)",
+    ] {
+        assert!(run(sql).await, "{sql}");
+    }
+    assert_eq!(s.transaction_state(), TxState::Open);
+    assert!(!run("commit and chain").await);
+    assert_eq!(s.transaction_state(), TxState::None, "a failed COMMIT AND CHAIN ended it");
+
+    // Inside a transaction a failed statement leaves it open (aborted).
+    assert!(run("begin").await);
+    assert!(!run("rollback to savepoint nosuch").await);
+    assert_eq!(s.transaction_state(), TxState::Open, "still open, aborted");
+    assert!(!run("select 1").await, "aborted: commands are refused");
+    assert!(run("rollback").await);
+    assert_eq!(s.transaction_state(), TxState::None);
+    assert!(run("drop table kb_tx_child, kb_tx_parent").await);
+}
