@@ -182,7 +182,9 @@ fn outside_read_only(f: &str) -> bool {
 /// counts. Functions acting outside that mode count even then.
 fn function_writes(profile: &ConnectionProfile, pieces: &[ParsedStatement], why: &str) -> Option<Decision> {
     let kind = profile.config.kind;
-    let session_read_only = profile.config.read_only && kind.server_read_only();
+    // Not Redshift: its read-only session isn't known to be enforced.
+    let server_read_only = profile.config.server_read_only();
+    let session_read_only = profile.config.read_only && server_read_only;
     let mut fns: Vec<String> = Vec::new();
     for f in could_write(pieces) {
         if session_read_only && !outside_read_only(&f) {
@@ -193,10 +195,11 @@ fn function_writes(profile: &ConnectionProfile, pieces: &[ParsedStatement], why:
     (!fns.is_empty()).then(|| {
         let reason = if session_read_only {
             format!("this query calls {}, which acts outside {}'s read-only session ({why})", fns.join(", "), kind.traits().name)
-        } else if kind.server_read_only() {
+        } else if server_read_only {
             format!("this query calls {}, which could write: the connection isn't read-only ({why})", fns.join(", "))
         } else {
-            format!("{} has no read-only mode on the server, and this query calls {}, which could write ({why})", kind.traits().name, fns.join(", "))
+            let name = if profile.config.is_redshift() { "Amazon Redshift" } else { kind.traits().name };
+            format!("{name} has no read-only mode on the server, and this query calls {}, which could write ({why})", fns.join(", "))
         };
         Decision::Confirm(reason)
     })
@@ -467,6 +470,27 @@ mod tests {
             Decision::Ask(_)
         ));
         assert_eq!(review_sql(&on(Postgres, false, auto_read()), "select count(*), lower(name) from t").decision, Decision::Allow);
+    }
+
+    /// Redshift's read-only session isn't known to be enforced (it rests on
+    /// a deprecated SET): a function call on a read-only Redshift connection
+    /// asks, as on engines without the mode; plain Postgres still trusts it.
+    #[test]
+    fn redshift_read_only_does_not_vouch_for_functions() {
+        let mut rs = on(ConnectorKind::Postgres, true, auto_read());
+        rs.config.options.insert("flavor".into(), "redshift".into());
+        assert!(!rs.config.server_read_only() && on(ConnectorKind::Postgres, true, auto_read()).config.server_read_only());
+        match review_sql(&rs, "select public.write_fn()").decision {
+            Decision::Confirm(r) => assert!(r.contains("Amazon Redshift has no read-only mode") && r.contains("public.write_fn"), "{r}"),
+            d => panic!("{d:?}"),
+        }
+        // By host too.
+        let mut by_host = on(ConnectorKind::Postgres, true, auto_read());
+        by_host.config.host = Some("wh.abc123.eu-west-1.redshift.amazonaws.com".into());
+        assert!(matches!(review_sql(&by_host, "select public.write_fn()").decision, Decision::Confirm(_)));
+        // Ordinary reads still pass, and plain Postgres is unchanged.
+        assert_eq!(review_sql(&rs, "select count(*), lower(name) from t").decision, Decision::Allow);
+        assert_eq!(review_sql(&on(ConnectorKind::Postgres, true, auto_read()), "select public.write_fn()").decision, Decision::Allow);
     }
 
     #[test]

@@ -251,6 +251,16 @@ impl ConnectionConfig {
         h.ends_with(".redshift.amazonaws.com") || h.ends_with(".redshift-serverless.amazonaws.com")
     }
 
+    /// The server keeps this connection, when set to read-only, from
+    /// writing ([`ConnectorKind::server_read_only`]), as far as DataBrain can
+    /// tell. Not Redshift: its read-only session rests on `SET SESSION
+    /// CHARACTERISTICS AS TRANSACTION READ ONLY`, which AWS documents as
+    /// deprecated, so DataBrain's classifier is what refuses writes there,
+    /// and a function call is treated as a possible write.
+    pub fn server_read_only(&self) -> bool {
+        self.kind.server_read_only() && !self.is_redshift()
+    }
+
     /// The port to use: the configured one, else `default` (Redshift: 5439).
     pub fn port_or(&self, default: Option<u16>) -> Option<u16> {
         self.port.or(if self.is_redshift() { Some(5439) } else { default })

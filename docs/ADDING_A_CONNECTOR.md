@@ -151,7 +151,7 @@ History, the job log and the AI audit log store SQL through `redact_text`. If th
 
 - `classify(sql, kind)` (`crates/connector-core/src/sql/classify.rs`) decides read, write (`Dml`), schema change (`Ddl`), session state or `Unknown`. Test the database's own write forms: procedure calls, `EXPLAIN ANALYZE` of a write, `SELECT … INTO`, writes inside CTEs, statements without a separator.
 - `read_only_allows` and `unknown_functions` (`crates/connector-core/src/sql/read_only.rs`) decide what runs on a read-only connection and which function calls need confirmation.
-- `server_read_only()` decides whether a read-only connection is enforced by the server or only by DataBrain's classifier. Implement it in `connect()` when the config says `read_only` (a read-only transaction, session or file), and test that a write fails on the server.
+- `server_read_only()` decides whether a read-only connection is enforced by the server or only by DataBrain's classifier. Implement it in `connect()` when the config says `read_only` (a read-only transaction, session or file), and test that a write fails on the server. A flavor whose read-only mode isn't confirmed (Redshift) is left out by `ConnectionConfig::server_read_only`, which the AI policy reads.
 - `connector-core/src/invariants.rs` runs splitting, classification and quoting properties over `ConnectorKind::ALL`, and `fuzz/` fuzzes them. Run them for the new kind.
 
 ## 4. Lists kept by hand
@@ -189,7 +189,7 @@ What each connector supports today, from the code above. Add a column for the ne
 | Query language | SQL | SQL | SQL | SQL | SQL | SQL | SQL | SQL | SQL | SQL | Shell commands | Cypher |
 | Name levels | 2 | 2 | 2 | 3 | 2 | 3 | 3 | 3 | 3 | 2 | 2 | 2 |
 | SSH tunnel | – | ✓ | ✓ | ✓ | ✓ | – | – | – | – | ✓ | ✓ | ✓ |
-| Read-only enforced by the server | ✓ | ✓ | ✓ | – | – | – | – | – | ✓ | ✓ | – | – |
+| Read-only enforced by the server | ✓ | ✓ (not Redshift) | ✓ | – | – | – | – | – | ✓ | ✓ | – | – |
 | Manual commit | ✓ | ✓ | ✓ | ✓ | – | – | – | – | – | – | – | – |
 | Check SQL before run (EXPLAIN) | ✓ | ✓ | ✓ | – | – | ✓ | – | – | ✓ | ✓ | – | ✓ |
 | Plan tab | Explain | Explain + Analyze | Explain + Analyze | Explain | Explain | Explain | Explain | – | Explain + Analyze | – | – | – |
