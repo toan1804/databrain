@@ -104,6 +104,7 @@ impl Connector for BigQueryConnector {
             creds,
             http: http(),
             session_id: Mutex::new(None),
+            api: API.to_string(),
         }));
         // Validate access.
         s.0.call(reqwest::Method::GET, format!("{API}/projects/{}/datasets?maxResults=1", s.0.project), None).await?;
@@ -121,6 +122,31 @@ struct Inner {
     creds: Arc<dyn CredentialSource>,
     http: reqwest::Client,
     session_id: Mutex<Option<String>>,
+    /// The API's base URL for query jobs ([`API`]; a local server in tests).
+    api: String,
+}
+
+/// A query job: its id and where it runs. `jobs.query` answers with the
+/// job's own location (`jobReference.location`), which is where it is
+/// polled and cancelled; the connection's location is only a default.
+struct JobRef {
+    id: String,
+    location: Option<String>,
+}
+
+impl JobRef {
+    fn of(resp: &serde_json::Value, default_location: Option<&str>) -> Self {
+        let r = &resp["jobReference"];
+        JobRef {
+            id: r["jobId"].as_str().unwrap_or_default().to_string(),
+            location: r["location"].as_str().map(str::to_string).or(default_location.map(str::to_string)),
+        }
+    }
+
+    /// `location=…` for a request's query string (empty when unknown).
+    fn loc_param(&self) -> String {
+        self.location.as_deref().map(|l| format!("location={}", urlencode(l))).unwrap_or_default()
+    }
 }
 
 fn col_type(t: &str) -> ColType {
@@ -214,10 +240,6 @@ impl Inner {
         unreachable!()
     }
 
-    fn loc_param(&self) -> String {
-        self.location.as_ref().map(|l| format!("&location={l}")).unwrap_or_default()
-    }
-
     /// Start a query job. `in_session` attaches it to this tab's session.
     async fn start(&self, sql: &str, in_session: bool, max_results: u32) -> Result<serde_json::Value> {
         let mut body = json!({
@@ -243,7 +265,7 @@ impl Inner {
                 None => body["createSession"] = json!(true),
             }
         }
-        let resp = self.call(reqwest::Method::POST, format!("{API}/projects/{}/queries", self.project), Some(body)).await?;
+        let resp = self.call(reqwest::Method::POST, format!("{}/projects/{}/queries", self.api, self.project), Some(body)).await?;
         if in_session && let Some(id) = resp.pointer("/sessionInfo/sessionId").and_then(|s| s.as_str()) {
             *self.session_id.lock().await = Some(id.to_string());
         }
@@ -264,16 +286,18 @@ impl Inner {
         if let Some(id) = self.session_id.lock().await.clone() {
             body["connectionProperties"] = json!([{ "key": "session_id", "value": id }]);
         }
-        let resp = self.call(reqwest::Method::POST, format!("{API}/projects/{}/queries", self.project), Some(body)).await?;
+        let resp = self.call(reqwest::Method::POST, format!("{}/projects/{}/queries", self.api, self.project), Some(body)).await?;
         Ok(dry_run_estimate(&resp, self.max_bytes.as_deref()))
     }
 
-    async fn page(&self, job_id: &str, token: Option<&str>, max: u32) -> Result<serde_json::Value> {
-        let mut url = format!(
-            "{API}/projects/{}/queries/{job_id}?maxResults={max}&timeoutMs=10000&formatOptions.useInt64Timestamp=true{}",
-            self.project,
-            self.loc_param()
-        );
+    async fn page(&self, job: &JobRef, token: Option<&str>, max: u32) -> Result<serde_json::Value> {
+        let mut url =
+            format!("{}/projects/{}/queries/{}?maxResults={max}&timeoutMs=10000&formatOptions.useInt64Timestamp=true", self.api, self.project, job.id);
+        let loc = job.loc_param();
+        if !loc.is_empty() {
+            url.push('&');
+            url.push_str(&loc);
+        }
         if let Some(t) = token {
             url.push_str("&pageToken=");
             url.push_str(&urlencode(t));
@@ -281,21 +305,63 @@ impl Inner {
         self.call(reqwest::Method::GET, url, None).await
     }
 
-    async fn run_small(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
-        let mut resp = self.start(sql, false, 10_000).await?;
-        let job_id = resp.pointer("/jobReference/jobId").and_then(|j| j.as_str()).unwrap_or_default().to_string();
+    /// Cancel a job on the server, best effort.
+    async fn cancel_job(&self, job: &JobRef) {
+        let mut url = format!("{}/projects/{}/jobs/{}/cancel", self.api, self.project, job.id);
+        let loc = job.loc_param();
+        if !loc.is_empty() {
+            url.push('?');
+            url.push_str(&loc);
+        }
+        let _ = self.call(reqwest::Method::POST, url, None).await;
+    }
+
+    /// Wait for a job: `resp` until `jobComplete`. When waiting fails in a
+    /// way that may leave the job running (the connection broke, an
+    /// unexpected answer), or nobody waits for it any more, the job is
+    /// cancelled on the server before returning.
+    async fn wait_job(
+        &self,
+        job: &JobRef,
+        mut resp: serde_json::Value,
+        max: u32,
+        cancel: &databrain_connector_core::CancellationToken,
+        tx: Option<&StreamSender>,
+    ) -> Result<serde_json::Value> {
         let mut backoff = Backoff::new();
         while !resp["jobComplete"].as_bool().unwrap_or(false) {
-            backoff.wait().await;
-            resp = self.page(&job_id, None, 10_000).await?;
+            tokio::select! {
+                _ = backoff.wait() => {}
+                _ = cancel.cancelled() => {}
+            }
+            if crate::common::abandoned(cancel, tx) {
+                self.cancel_job(job).await;
+                return Err(ConnectorError::cancelled());
+            }
+            resp = match self.page(job, None, max).await {
+                Ok(r) => r,
+                Err(e) => {
+                    if crate::common::may_still_run(&e) {
+                        self.cancel_job(job).await;
+                    }
+                    return Err(e);
+                }
+            };
         }
+        Ok(resp)
+    }
+
+    async fn run_small(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+        let resp = self.start(sql, false, 10_000).await?;
+        let job = JobRef::of(&resp, self.location.as_deref());
+        let mut resp = self.wait_job(&job, resp, 10_000, &databrain_connector_core::CancellationToken::new(), None).await?;
         let mut out = Vec::new();
         loop {
             for r in resp["rows"].as_array().cloned().unwrap_or_default() {
                 out.push(r["f"].as_array().cloned().unwrap_or_default().iter().map(|c| c["v"].as_str().map(str::to_string)).collect());
             }
             match resp["pageToken"].as_str().map(str::to_string) {
-                Some(t) => resp = self.page(&job_id, Some(&t), 10_000).await?,
+                Some(t) => resp = self.page(&job, Some(&t), 10_000).await?,
                 None => break,
             }
         }
@@ -304,21 +370,9 @@ impl Inner {
 
     async fn stream(&self, sql: &str, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
         let page = opts.batch_size.clamp(100, 10_000) as u32;
-        let mut resp = self.start(sql, true, page).await?;
-        let job_id = resp.pointer("/jobReference/jobId").and_then(|j| j.as_str()).unwrap_or_default().to_string();
-        let mut backoff = Backoff::new();
-        while !resp["jobComplete"].as_bool().unwrap_or(false) {
-            tokio::select! {
-                _ = backoff.wait() => {}
-                _ = opts.cancel.cancelled() => {
-                    let _ = self
-                        .call(reqwest::Method::POST, format!("{API}/projects/{}/jobs/{job_id}/cancel?{}", self.project, self.loc_param().trim_start_matches('&')), None)
-                        .await;
-                    return Err(ConnectorError::cancelled());
-                }
-            }
-            resp = self.page(&job_id, None, page).await?;
-        }
+        let resp = self.start(sql, true, page).await?;
+        let job = JobRef::of(&resp, self.location.as_deref());
+        let mut resp = self.wait_job(&job, resp, page, &opts.cancel, Some(tx)).await?;
         if let Some(err) = resp.pointer("/errors/0/message").and_then(|m| m.as_str()) {
             return Err(ConnectorError::query(err.to_string()));
         }
@@ -362,7 +416,7 @@ impl Inner {
                 return Err(ConnectorError::cancelled());
             }
             match resp["pageToken"].as_str().map(str::to_string) {
-                Some(t) => resp = self.page(&job_id, Some(&t), page).await?,
+                Some(t) => resp = self.page(&job, Some(&t), page).await?,
                 None => break,
             }
         }
@@ -714,5 +768,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.num_rows(), 1);
+    }
+
+    /// A job running in `asia-southeast1` on a connection set to `US`: the
+    /// first poll gets `poll` (status 0: the connection drops).
+    async fn running_job(poll: (u16, &'static str)) -> (Inner, crate::mock_http::Log) {
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        let (origin, log) = crate::mock_http::serve(move |m, p, _| {
+            if m == "POST" && p == "/projects/p1/queries" {
+                (200, json!({"jobReference": {"projectId": "p1", "jobId": "j1", "location": "asia-southeast1"}, "jobComplete": false}).to_string())
+            } else if m == "GET" && p.starts_with("/projects/p1/queries/j1?") {
+                (poll.0, poll.1.to_string())
+            } else if m == "POST" && p.starts_with("/projects/p1/jobs/j1/cancel") {
+                (200, "{}".into())
+            } else {
+                (404, "{}".into())
+            }
+        })
+        .await;
+        let inner = Inner {
+            project: "p1".into(),
+            location: Some("US".into()),
+            dataset: None,
+            max_bytes: None,
+            creds: Arc::new(InlineCredentialSource::new(AuthMethod::ApiToken { user: None }, Some("tok".to_string().into()))),
+            http: http(),
+            session_id: Mutex::new(None),
+            api: origin,
+        };
+        (inner, log)
+    }
+
+    fn cancels(log: &crate::mock_http::Log) -> Vec<String> {
+        log.lock().unwrap().iter().filter(|(m, p, _)| m == "POST" && p.contains("/jobs/j1/cancel")).map(|(_, p, _)| p.clone()).collect()
+    }
+
+    /// A poll that fails without the server saying how the job ended: the
+    /// job is cancelled, where it runs (its own location, not the connection's).
+    #[tokio::test]
+    async fn a_failed_poll_cancels_the_job_where_it_runs() {
+        for poll in [(0, ""), (503, "<html>unavailable</html>")] {
+            let (i, log) = running_job(poll).await;
+            assert!(i.run_small("select 1").await.is_err());
+            let polls: Vec<String> = log.lock().unwrap().iter().filter(|(m, _, _)| m == "GET").map(|(_, p, _)| p.clone()).collect();
+            assert!(polls.iter().all(|p| p.ends_with("&location=asia-southeast1")), "{polls:?}");
+            assert_eq!(cancels(&log), ["/projects/p1/jobs/j1/cancel?location=asia-southeast1"], "{poll:?}");
+        }
+    }
+
+    /// The server said how the job ended (failed, or done): nothing to cancel.
+    #[tokio::test]
+    async fn a_job_that_ended_is_not_cancelled() {
+        let failed: &'static str = r#"{"error": {"code": 400, "message": "Syntax error: Unexpected end of script"}}"#;
+        let done: &'static str = r#"{"jobComplete": true, "rows": [], "schema": {"fields": []}}"#;
+        for (poll, ok) in [((400, failed), false), ((200, done), true)] {
+            let (i, log) = running_job(poll).await;
+            assert_eq!(i.run_small("select 1").await.is_ok(), ok, "{poll:?}");
+            assert!(cancels(&log).is_empty(), "{poll:?}");
+        }
+    }
+
+    /// Nobody reads the rows any more (the stream dropped): the job is cancelled.
+    #[tokio::test]
+    async fn a_dropped_stream_cancels_the_job() {
+        let (i, log) = running_job((200, r#"{"jobComplete": false}"#)).await;
+        let (tx, stream) = databrain_connector_core::QueryStream::channel(1);
+        drop(stream);
+        let job = JobRef { id: "j1".into(), location: Some("asia-southeast1".into()) };
+        let err = i.wait_job(&job, json!({"jobComplete": false}), 100, &databrain_connector_core::CancellationToken::new(), Some(&tx)).await.unwrap_err();
+        assert_eq!(err.kind, databrain_connector_core::ErrorKind::Cancelled);
+        assert_eq!(cancels(&log).len(), 1);
     }
 }
