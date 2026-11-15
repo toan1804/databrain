@@ -490,6 +490,23 @@ impl OutputRegistry {
         }
     }
 
+    /// Output `handle` of `tab` is being replaced by a new run of its own
+    /// statement ([`QueryEngine::rerun_output`](crate::QueryEngine::rerun_output)):
+    /// it alone becomes recent; the tab's other results stay active.
+    pub fn retire(&self, tab: &str, handle: &str) {
+        let mut g = self.inner.lock();
+        let g = &mut *g;
+        if let Some(list) = g.active.get_mut(tab) {
+            list.retain(|h| h != handle);
+        }
+        g.active.retain(|_, v| !v.is_empty());
+        g.carried.remove(handle);
+        if let Some(o) = g.by_handle.get_mut(handle) {
+            o.active = false;
+            o.kept = false;
+        }
+    }
+
     /// Nobody looks at `tab` any more but it isn't closed (an assistant
     /// chat closed in the panel, still in history): its outputs become
     /// recent, as after a new run (evictable; kept ones stay active), and
@@ -1042,6 +1059,25 @@ pub(crate) mod tests {
             origin: Origin::User,
             session_key: String::new(),
         })
+    }
+
+    /// Refreshing one result retires only it: the tab's other results stay.
+    #[test]
+    fn retiring_one_output_keeps_the_others() {
+        let r = reg();
+        r.begin_run("t");
+        let a = add(&r, "t", 1);
+        let b = add(&r, "t", 2);
+        let c = add(&r, "t", 3);
+        r.retire("t", &b.handle);
+        let fresh = add(&r, "t", 2);
+        let shown = r.for_tab("t").into_iter().map(|o| o.handle).collect::<Vec<_>>();
+        assert_eq!(shown, [a.handle.clone(), c.handle.clone(), fresh.handle.clone()]);
+        assert!(!r.get(&b.handle).unwrap().active, "the replaced one is recent (evictable)");
+        assert!(r.get(&a.handle).unwrap().active && r.get(&c.handle).unwrap().active);
+        // Another tab is untouched; a new run of the tab retires all as before.
+        r.begin_run("t");
+        assert!(r.for_tab("t").is_empty());
     }
 
     /// A kept result stays in its tab's results across runs (active, so

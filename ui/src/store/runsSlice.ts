@@ -29,6 +29,18 @@ function bufferEarly(e: JobEvent) {
 /** Test hook. */
 export const _earlyEventCount = () => earlyEvents.size;
 
+/**
+ * Whether what `key` runs for is still open: a query tab (its id), a
+ * notebook's cell (`nb:{notebook}:{cell}`) or a dashboard's chart
+ * (`dash:{dashboard}:{chart}`), whose notebook or dashboard is in a tab.
+ */
+function runKeyOpen(s: State, key: string): boolean {
+  const [kind, id] = key.split(":");
+  if (kind === "nb" && id) return s.tabs.some((t) => t.notebook_id === id);
+  if (kind === "dash" && id) return s.tabs.some((t) => t.dashboard_id === id);
+  return s.tabs.some((t) => t.id === key);
+}
+
 export interface RunsSlice {
   /** All known outputs (newest first); refreshed on `outputs_changed`. */
   outputs: OutputInfo[];
@@ -63,7 +75,12 @@ export interface RunsSlice {
     params?: Record<string, ParamValue>,
     /** Override the row limit (null = every row). */
     rowLimit?: number | null,
+    /** Run it as a new version of this output only (saved grid edits shown
+     * again): the run's other results stay. `sql` is that output's statement. */
+    replaces?: string,
   ) => Promise<boolean>;
+  /** Run the statement of result `index` of the run again, as that result only. */
+  refreshResult: (runKey: string, index: number) => Promise<boolean>;
   cancelTab: (tabId: string) => Promise<void>;
   setActiveStatement: (tabId: string, index: number) => void;
   /** Keep a result in the tab when it runs again, or let go of a kept one. */
@@ -250,11 +267,16 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     await get().runSql(tabId, conn.id, sql, base, undefined, undefined, values);
   },
 
-  runSql: async (runKey, connectionId, sql, base = 0, sessionKey, outputName, params, rowLimit) => {
+  runSql: async (runKey, connectionId, sql, base = 0, sessionKey, outputName, params, rowLimit, replaces) => {
     const conn = get().connections.find((c) => c.id === connectionId);
+    // Closed while the run was starting (connecting, a confirmation, a
+    // sign-in): what started is stopped and nothing is shown for it.
+    const openAtStart = runKeyOpen(get(), runKey);
+    const closed = () => openAtStart && !runKeyOpen(get(), runKey);
     const submit = async (confirmed: boolean): Promise<boolean> => {
+      if (closed()) return false;
       try {
-        const resp = await api.runQuery({
+        const req = {
           connection_id: connectionId,
           tab_id: runKey,
           sql,
@@ -264,7 +286,16 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           session_key: sessionKey ?? null,
           output_name: outputName ?? null,
           params: params ?? {},
-        });
+        };
+        const resp = replaces ? await api.rerunOutput(req, replaces) : await api.runQuery(req);
+        if (resp.status === "started" && closed()) {
+          earlyEvents.delete(resp.job_id);
+          void api.cancelQuery(resp.job_id).catch(() => false);
+          // Its session and results too: the tab's close went out before this run existed.
+          void api.closeTab(runKey).catch(() => {});
+          if (sessionKey) void api.closeTab(sessionKey).catch(() => {});
+          return false;
+        }
         if (resp.status === "needs_confirmation") {
           return await new Promise<boolean>((resolve) =>
             get().askConfirm({
@@ -276,20 +307,43 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
             }),
           );
         }
-        set((st) => ({
-          runs: {
-            ...st.runs,
-            [runKey]: {
-              jobId: resp.job_id,
-              running: true,
-              startedAt: Date.now(),
-              statements: resp.statements.map((p) => ({ plan: p, status: "pending", notices: [] })),
-              kept: carriedResults(st.runs[runKey]),
-              activeIndex: null,
-              connectionId,
+        set((st) => {
+          const prev = st.runs[runKey];
+          const at = resp.statements[0]?.index;
+          // One result refreshed: the run's other results stay as they were;
+          // its statement keeps the place it has in the editor.
+          if (replaces && prev && resp.statements.length === 1 && at !== undefined && prev.statements[at]) {
+            return {
+              runs: {
+                ...st.runs,
+                [runKey]: {
+                  ...prev,
+                  jobId: resp.job_id,
+                  running: true,
+                  startedAt: Date.now(),
+                  statements: prev.statements.map((x, i) => (i === at ? { plan: x.plan, status: "pending", notices: [] } : x)),
+                  activeIndex: at,
+                  errorRange: undefined,
+                  refreshOf: at,
+                },
+              },
+            };
+          }
+          return {
+            runs: {
+              ...st.runs,
+              [runKey]: {
+                jobId: resp.job_id,
+                running: true,
+                startedAt: Date.now(),
+                statements: resp.statements.map((p) => ({ plan: p, status: "pending", notices: [] })),
+                kept: carriedResults(st.runs[runKey]),
+                activeIndex: null,
+                connectionId,
+              },
             },
-          },
-        }));
+          };
+        });
         const early = earlyEvents.get(resp.job_id);
         if (early) {
           earlyEvents.delete(resp.job_id);
@@ -308,6 +362,13 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       }
     };
     return submit(false);
+  },
+  refreshResult: async (runKey, index) => {
+    const run = get().runs[runKey];
+    const o = run?.statements[index]?.output;
+    if (!run || run.running || !o) return false;
+    // Its own SQL (parameters already in it), on its own session, under its name.
+    return get().runSql(runKey, o.connection_id, o.sql, 0, o.session_key || undefined, o.name ?? null, {}, undefined, o.handle);
   },
   cancelTab: async (tabId) => {
     const run = get().runs[tabId];
@@ -448,8 +509,10 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           next = {
             ...next,
             running: false,
-            finishedStatus: e.status,
-            durationMs: e.duration_ms,
+            // A refreshed result: the run's own status and time stand, unless the refresh failed.
+            finishedStatus: run.refreshOf !== undefined && e.status === "success" ? run.finishedStatus : e.status,
+            durationMs: run.refreshOf !== undefined ? run.durationMs : e.duration_ms,
+            refreshOf: undefined,
             statements: statements.map((x) =>
               x.status === "pending" || x.status === "running"
                 ? { ...x, status: e.status === "cancelled" ? "cancelled" : x.status }

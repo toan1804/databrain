@@ -18,7 +18,7 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { ArrowDown, ArrowDownLeft, ArrowUp, ArrowUpRight, Ban, Braces, Copy, Filter, FilterX, Rows3, Trash2, Undo2, X } from "lucide-react";
 import { api, toError } from "../lib/api";
 import type { ColumnMeta, EditTarget, ExportFormat, ResultInfo, ResultLink, ViewSpec } from "../lib/types";
-import { addRow, removeNewRow, revertRows, setCell, setNewCell, toggleDelete, type PendingEdits } from "../lib/gridEdits";
+import { addRow, editCount, removeNewRow, revertRows, setCell, setNewCell, toggleDelete, type PendingEdits } from "../lib/gridEdits";
 import { pageRange, toggleSort, upsertFilter } from "../lib/util";
 import { columnTypeInfo, engineName } from "../lib/columnType";
 import { useStore } from "../store";
@@ -111,6 +111,9 @@ function estimateWidth(name: string, sample: (string | null)[]): number {
   return Math.max(70, Math.min(420, Math.round(chars * 7.6 + 24)));
 }
 
+/** Rows the backend copies at most (`MAX_COPY_ROWS` in crates/app/src/api/mod.rs). */
+const MAX_COPY_ROWS = 100_000;
+
 export interface GridHandle {
   scrollToCell: (col: number, row: number) => void;
   copySelection: (format: ExportFormat, header: boolean) => Promise<void>;
@@ -163,6 +166,8 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
   const visible = useRef<Rectangle>({ x: 0, y: 0, width: 10, height: 40 });
   const [version, setVersion] = useState(0);
   const [rows, setRows] = useState(0);
+  /** A page could not be read: shown over the grid with Retry (nothing else asks again: with no rows yet, nothing scrolls). */
+  const [pageError, setPageError] = useState<string | null>(null);
   const [widths, setWidths] = useState<Record<number, number>>({});
   const [selection, setSelection] = useState<GridSelection>({
     columns: CompactSelection.empty(),
@@ -208,14 +213,23 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
           setWidths((old) => ({ ...w, ...old }));
         }
         setVersion((v) => v + 1);
+        setPageError(null);
       } catch (e) {
-        if (gen === generation.current) toast(toError(e).message, "error");
+        if (gen === generation.current) setPageError(toError(e).message);
       } finally {
         inflight.current.delete(p);
       }
     },
-    [info.id, info.columns, view, onViewRows, onLoadedRows, toast],
+    [info.id, info.columns, view, onViewRows, onLoadedRows],
   );
+
+  /** Read again what failed: the first page and the pages in view. */
+  const retryPages = () => {
+    setPageError(null);
+    const r = visible.current;
+    void fetchPage(0);
+    for (const p of pageRange(r.y, r.height, PAGE, Math.max(rows, storedTotal()))) if (p !== 0) void fetchPage(p);
+  };
 
   // Read when the view changes; a growing total must not reset the cache.
   const storedTotal = useEvent(() => info.total_rows);
@@ -225,6 +239,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
     pages.current.clear();
     pageIds.current.clear();
     inflight.current.clear();
+    setPageError(null);
     const r = visible.current;
     void fetchPage(0);
     // Row count of the new view is unknown until page 0 arrives; clamp to the stored total.
@@ -350,15 +365,27 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
    */
   const selectedRows = (): number[] => {
     if (selection.rows.length > 0) return selection.rows.toArray();
+    const cur = selection.current;
+    // Every block selected (Cmd/Ctrl-drag adds blocks), not only the last one.
+    if (cur && cur.rangeStack.length > 0 && selection.columns.length === 0) {
+      const all = new Set<number>();
+      for (const b of [cur.range, ...cur.rangeStack]) for (let i = 0; i < b.height; i++) all.add(b.y + i);
+      return [...all].sort((a, b) => a - b);
+    }
     const r = selectedRange();
     if (!r) return [];
     return Array.from({ length: r.limit }, (_, i) => r.offset + i);
   };
 
-  /** Rows picked apart from each other: a range can't say them. */
+  /**
+   * What one range can't say: rows picked apart from each other, or several
+   * blocks of cells. Copy and Transpose take one block; acting on only the
+   * last block, or on what lies between, would not be what was selected.
+   */
   const rowsApart = useCallback((): boolean => {
     const n = selection.rows.length;
-    return n > 1 && selection.rows.last()! - selection.rows.first()! + 1 !== n;
+    if (n > 1 && selection.rows.last()! - selection.rows.first()! + 1 !== n) return true;
+    return n === 0 && selection.columns.length === 0 && (selection.current?.rangeStack.length ?? 0) > 0;
   }, [selection]);
 
   /**
@@ -427,26 +454,38 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
       if (!range) return;
       // A range is first-to-last: rows picked apart would copy what lies between them too.
       if (rowsApart()) {
-        toast("The selected rows are not next to each other: select a block of rows to copy", "error");
+        toast("The selection is not one block (rows apart, or several blocks): select one block to copy", "error");
         return;
       }
       try {
-        const text = await api.copyRows(info.id, view, range.offset, range.limit, {
+        // What is really copied: the rows there are, up to the clipboard cap.
+        const n = Math.max(0, Math.min(range.limit, rows - range.offset, MAX_COPY_ROWS));
+        const oneCell = n === 1 && range.cols.length <= 1;
+        const text = await api.copyRows(info.id, view, range.offset, n, {
           format,
           header,
           columns: range.cols,
           table_name: "result",
           dialect: (dialect as never) ?? null,
+          // Several cells go to a spreadsheet: a value like `=HYPERLINK(…)` must
+          // paste as text, not run as a formula. One cell is copied as it is.
+          excel_safe: (format === "tsv" || format === "csv") && !oneCell,
         });
         // Single value without header: copy the raw value without a newline.
         await writeText(!header && format === "tsv" ? text.replace(/\n$/, "") : text);
-        const n = range.limit;
-        toast(`Copied ${n.toLocaleString()} row${n === 1 ? "" : "s"}`, "success");
+        const capped = Math.min(range.limit, rows - range.offset) > n;
+        const pending = edit && editCount(edit.edits) > 0 ? " (as saved: changes not saved yet are not in it)" : "";
+        toast(
+          capped
+            ? `Copied the first ${n.toLocaleString()} of ${Math.min(range.limit, rows - range.offset).toLocaleString()} rows (the clipboard limit); export the result for all of them${pending}`
+            : `Copied ${n.toLocaleString()} row${n === 1 ? "" : "s"}${pending}`,
+          capped || pending ? "info" : "success",
+        );
       } catch (e) {
         toast(toError(e).message, "error");
       }
     },
-    [info.id, view, dialect, selectedRange, rowsApart, toast],
+    [info.id, view, dialect, selectedRange, rowsApart, toast, rows, edit],
   );
 
   const editCellNow = useEvent((col: number, row: number, value: string | null) => editCell(col, row, value));
@@ -518,6 +557,14 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
         }
       }}
     >
+      {pageError && (
+        <div role="alert" className="absolute inset-x-0 top-9 z-10 mx-auto flex w-fit max-w-[90%] items-center gap-2 rounded-md border border-danger/50 bg-panel px-3 py-1.5 text-[12px] shadow">
+          <span className="text-danger">Rows could not be read: {pageError}</span>
+          <button className="btn-ghost py-0.5" onClick={retryPages}>
+            Retry
+          </button>
+        </div>
+      )}
       <DataEditor
         ref={gridRef}
         width="100%"
@@ -644,7 +691,7 @@ export const ResultGrid = forwardRef<GridHandle, Props>(function ResultGrid(
               onClick={() => {
                 setMenu(null);
                 const r = selectedRange();
-                if (rowsApart()) toast("The selected rows are not next to each other: select a block of rows to transpose", "error");
+                if (rowsApart()) toast("The selection is not one block (rows apart, or several blocks): select one block to transpose", "error");
                 else if (r) onTranspose({ cols: r.cols, offset: r.offset, limit: r.limit });
               }}
             />

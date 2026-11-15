@@ -257,6 +257,8 @@ export const api = {
     call<Span | null>("statement_at_cursor", { kind, text, cursor }),
   statementSpans: (kind: ConnectorKind, text: string) => call<Span[]>("statement_spans", { kind, text }),
   runQuery: (req: RunRequest) => call<RunResponse>("run_query", { req }),
+  /** Run the statement of output `handle` again as that result only; the tab's other results stay. */
+  rerunOutput: (req: RunRequest, handle: string) => call<RunResponse>("rerun_output", { req, handle }),
   cancelQuery: (jobId: string) => call<boolean>("cancel_query", { jobId }),
   closeTab: (tabId: string) => call<void>("close_tab", { tabId }),
   readSqlFile: (path: string) => call<SqlFile>("read_sql_file", { path }),

@@ -1264,3 +1264,33 @@ async fn the_cost_preview_never_reconnects_the_tabs_session() {
     assert!(engine.estimate_cost(&p.id, "", "select 1").await.is_err());
     assert_eq!(n(), 3, "metadata: connect, then reconnect once");
 }
+
+/// Refreshing one result of a script (the grid's saved edits shown again)
+/// runs that statement only, under its own statement index, and leaves the
+/// script's other results as they were.
+#[tokio::test]
+async fn rerunning_one_output_keeps_the_tabs_other_results() {
+    let f = fixture(EnvTag::None);
+    wait_job(&f, &started(f.engine.run(req(&f, "select 1 as a; select 2 as b; select 3 as c")).unwrap())).await;
+    let before = f.engine.outputs().for_tab("tab1");
+    assert_eq!(before.len(), 3);
+    let middle = before.iter().find(|o| o.statement_index == 1).unwrap().clone();
+    let job = started(f.engine.rerun_output(req(&f, &middle.sql), &middle.handle).unwrap());
+    let evs = wait_job(&f, &job).await;
+    // The events say statement 1, where the result belongs.
+    assert!(evs.iter().any(|e| matches!(e, JobEvent::StatementFinished { index: 1, .. })), "{evs:?}");
+    let after = f.engine.outputs().for_tab("tab1");
+    let indexes: std::collections::BTreeSet<usize> = after.iter().map(|o| o.statement_index).collect();
+    assert_eq!(indexes, [0, 1, 2].into(), "{after:?}");
+    assert!(after.iter().all(|o| o.handle != middle.handle), "the old result of statement 1 is replaced");
+    for i in [0, 2] {
+        let old = before.iter().find(|o| o.statement_index == i).unwrap();
+        assert!(after.iter().any(|o| o.handle == old.handle), "statement {i}'s result stays");
+    }
+    // Only one statement, on the output's own tab.
+    let e = f.engine.rerun_output(req(&f, "select 1; select 2"), &after[0].handle).unwrap_err();
+    assert!(e.message.contains("one statement"), "{}", e.message);
+    let other = RunRequest { tab_id: "tab2".into(), ..req(&f, "select 1") };
+    let e = f.engine.rerun_output(other, &after[0].handle).unwrap_err();
+    assert!(e.message.contains("another tab"), "{}", e.message);
+}
