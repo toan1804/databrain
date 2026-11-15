@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Database, Eye, EyeOff, FileDown, FileUp, ListChecks, Loader2, RefreshCw, Trash2, X } from "lucide-react";
 import { api, toError } from "../../lib/api";
 import type { KnNote, KnObject, KnowledgeView, LearnedView, NotesImportPreview, ScopeRule } from "../../lib/types";
@@ -87,12 +87,20 @@ export function Knowledge() {
     }
   };
 
+  // The connection whose notes are shown: an answer for another one (a
+  // switch while it loaded) is dropped, and nothing of the last one stays
+  // on screen to be approved under this one.
+  const shownConn = useRef(connId);
+  useEffect(() => {
+    if (shownConn.current !== connId) setData(null);
+    shownConn.current = connId;
+  }, [connId]);
   const load = useCallback(() => {
     if (!connId) return;
     api
       .knGet(connId)
-      .then(setData)
-      .catch((e) => toast(toError(e).message, "error"));
+      .then((d) => shownConn.current === connId && setData(d))
+      .catch((e) => shownConn.current === connId && toast(toError(e).message, "error"));
     api
       .aiScope(connId)
       .then((r) => setRules(r ?? []))
@@ -151,6 +159,11 @@ export function Knowledge() {
   const saveNote = async (n: Partial<KnNote>) => {
     if (!connId) return;
     try {
+      // A note of another connection (shown before a switch) is not saved under this one.
+      if (n.connection_id && n.connection_id !== connId) {
+        toast("This note belongs to another connection: it was not saved", "error");
+        return false;
+      }
       await api.knSaveNote({
         id: n.id ?? "",
         connection_id: connId,

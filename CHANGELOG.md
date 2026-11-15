@@ -11,6 +11,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- The assistant: Stop works while a question is still starting (it stops once the run is known), and ends a conversation whose run the app no longer knows, which stayed "running" for good with every new question only queued. A question asked while the assistant works is sent later about the editor it was asked from, not the one in front then. A History conversation opened into an empty chat no longer inherits that chat's Auto-approve.
+- Knowledge no longer shows the previous connection's notes after switching, so a note can't be approved under the wrong connection. Notes merged with "AI merge" are given to the assistant as data to merge, marked as such, never as part of its instructions. Deleting a conversation asks first.
 - After saving edited rows, only that result is read again: the script's other results stay (they disappeared, and an error in the re-read pointed at the start of the editor). The new result keeps its statement's place.
 - Closing a tab while its query was still starting (connecting, signing in, waiting for a confirmation) left the query running with nothing to show it or stop it. It is stopped now.
 - A result whose first rows could not be read stayed blank, as if loading, until the query ran again. The grid says why and offers Retry.
