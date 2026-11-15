@@ -422,6 +422,32 @@ fn file_sha256(path: &Path) -> Result<String, String> {
     Ok(hex::encode(h.finalize()))
 }
 
+/// A new folder in `parent` for a download: named unpredictably, made only
+/// if it didn't exist (never one someone else made, or a link), and on Unix
+/// readable and writable by this user only.
+fn private_dir(parent: &Path) -> Result<PathBuf, String> {
+    use std::hash::{BuildHasher, Hasher};
+    for _ in 0..8 {
+        // RandomState is seeded from the OS's random source for each process.
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        h.write_u32(std::process::id());
+        let dir = parent.join(format!(".download-{:016x}", h.finish()));
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        match b.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("can't make a folder for the download in {}: {e}", parent.display())),
+        }
+    }
+    Err(format!("can't make a folder for the download in {}", parent.display()))
+}
+
 /// Download and install the pinned Basic package into `dest`
 /// (`<dest>/instantclient_<ver>`). Returns the library directory.
 ///
@@ -432,10 +458,11 @@ pub fn install(dest: &Path, progress: &dyn Fn(InstallProgress), cancel: &AtomicB
     let p = platform();
     let url = p.download_url.ok_or("no Instant Client build for this platform; use the download page")?;
     let want = p.sha256.ok_or("no checksum for this platform's Instant Client; use the download page")?;
-    let tmp = std::env::temp_dir().join(format!("databrain-instantclient-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    // Not a predictable folder in a shared /tmp (another user could make it
+    // first, or swap the package between its checksum and its extraction):
+    // a new, owner-only folder in the destination.
+    let tmp = private_dir(dest)?;
     let file = tmp.join(url.rsplit('/').next().unwrap_or("instantclient"));
     let result = (|| {
         download(url, &file, progress, cancel)?;
@@ -496,6 +523,24 @@ pub fn install(dest: &Path, progress: &dyn Fn(InstallProgress), cancel: &AtomicB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The download folder: new each time, in the destination (not a shared
+    /// /tmp), owner-only on Unix.
+    #[test]
+    fn downloads_go_to_a_new_private_folder() {
+        let parent = std::env::temp_dir().join(format!("dbtest-ic-private-{}", std::process::id()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let (a, b) = (private_dir(&parent).unwrap(), private_dir(&parent).unwrap());
+        assert_ne!(a, b);
+        assert!(a.starts_with(&parent) && a.is_dir() && b.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        assert!(private_dir(&parent.join("missing")).is_err(), "no parent: refused, not made");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
 
     /// Only a chosen folder, the default one or one in DataBrain's own
     /// folders is loaded; whatever is in Downloads, the home folder or the
