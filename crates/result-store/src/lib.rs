@@ -270,6 +270,60 @@ impl ResultSet {
         self.combined = None;
     }
 
+    /// [`Self::push`] for a result on disk, without writing a file under
+    /// the result's lock: a file due is returned, to write with
+    /// [`spill::FileJob::write`] after letting the lock go and hand to
+    /// [`Self::adopt_file`] (which returns the next one due). In memory, or
+    /// after a failed write, it is [`Self::push`] and returns None.
+    pub fn push_deferred(&mut self, batch: RecordBatch) -> Option<spill::FileJob> {
+        if batch.num_rows() == 0 || self.spill_error.is_some() {
+            return None;
+        }
+        let Some(sp) = &mut self.spill else {
+            self.push(batch);
+            return None;
+        };
+        sp.add(batch);
+        self.total_rows = sp.rows();
+        self.next_file(false)
+    }
+
+    /// The rows still waiting for a file, to write outside the lock before
+    /// [`Self::finish`] (which then writes nothing); None in memory.
+    pub fn flush_deferred(&mut self) -> Option<spill::FileJob> {
+        if self.spill_error.is_some() {
+            return None;
+        }
+        self.next_file(true)
+    }
+
+    /// Take a file written outside the lock; the next one due, if any.
+    pub fn adopt_file(&mut self, done: Result<spill::FileWritten>, all: bool) -> Option<spill::FileJob> {
+        let sp = self.spill.as_mut()?;
+        // A failed write drops the rows waiting for a file: the count
+        // follows, so every reader sees the same rows.
+        let r = sp.adopt_file(done);
+        self.total_rows = sp.rows();
+        if let Err(e) = r {
+            self.spill_error = Some(e.to_string());
+            return None;
+        }
+        self.next_file(all)
+    }
+
+    fn next_file(&mut self, all: bool) -> Option<spill::FileJob> {
+        let sp = self.spill.as_mut()?;
+        match sp.next_file(all) {
+            Ok(job) => job,
+            Err(e) => {
+                sp.discard_pending();
+                self.total_rows = sp.rows();
+                self.spill_error = Some(e.to_string());
+                None
+            }
+        }
+    }
+
     pub fn finish(&mut self, truncated: bool) {
         if let Some(sp) = &mut self.spill {
             if let Err(e) = sp.finish() {
@@ -881,6 +935,61 @@ mod spill_tests {
         assert!(other.lock().spill_adopt(ready).is_err());
         assert!(!other.lock().is_on_disk() && other.lock().total_rows() == 2000);
         assert!(!dir.path().join("o").exists(), "its files are deleted");
+    }
+
+    /// Later files of a result on disk are written without its lock too:
+    /// while one is written the result answers, with its rows (still in
+    /// memory) counted and readable; a failed write drops the rows waiting
+    /// for a file, as a write under the lock did.
+    #[test]
+    fn later_files_are_written_outside_the_lock() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let b = |from: i64, n: i64| RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from_iter_values(from..from + n))]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let rs = Arc::new(Mutex::new(ResultSet::new("r", schema.clone())));
+        rs.lock().push(b(0, 1000));
+        rs.lock().spill_to(dir.path().join("r"), &b(1000, 1)).unwrap();
+        let files = || std::fs::read_dir(dir.path().join("r")).unwrap().count();
+        let before = files();
+
+        // A file's worth of rows: due, not written yet.
+        let job = rs.lock().push_deferred(b(1000, spill::CHUNK_ROWS as i64)).expect("a file is due");
+        assert_eq!(files(), before, "nothing written under the lock");
+        let done = std::thread::scope(|s| {
+            let writer = s.spawn(|| job.write());
+            let mut g = rs.lock();
+            assert_eq!(g.total_rows(), 1000 + spill::CHUNK_ROWS);
+            let last = g.view_slice(&ViewSpec::default(), 1000 + spill::CHUNK_ROWS - 1, 1).unwrap().0;
+            assert_eq!(last.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0), 1000 + spill::CHUNK_ROWS as i64 - 1);
+            drop(g);
+            writer.join().unwrap()
+        });
+        assert!(rs.lock().adopt_file(done, false).is_none());
+        assert_eq!(files(), before + 1);
+        assert_eq!(rs.lock().total_rows(), 1000 + spill::CHUNK_ROWS);
+
+        // The rest at the end, outside the lock too; finish then writes nothing.
+        rs.lock().push_deferred(b(50_000, 10));
+        let last = rs.lock().flush_deferred().expect("rows wait");
+        let done = last.write();
+        assert!(rs.lock().adopt_file(done, true).is_none());
+        rs.lock().finish(false);
+        assert_eq!(rs.lock().total_rows(), 1000 + spill::CHUNK_ROWS + 10);
+        assert!(rs.lock().spill_error().is_none());
+
+        // A failed write: the waiting rows go, the count follows, and nothing more is taken.
+        let other = Arc::new(Mutex::new(ResultSet::new("o", schema.clone())));
+        other.lock().push(b(0, spill::CHUNK_ROWS as i64));
+        other.lock().spill_to(dir.path().join("o"), &b(0, 1)).unwrap();
+        let written = other.lock().total_rows();
+        let job = other.lock().push_deferred(b(0, spill::CHUNK_ROWS as i64)).unwrap();
+        std::fs::remove_dir_all(dir.path().join("o")).unwrap();
+        assert!(other.lock().adopt_file(job.write(), false).is_none());
+        let g = other.lock();
+        assert!(g.spill_error().is_some());
+        assert_eq!(g.total_rows(), written, "only the rows in files");
+        drop(g);
+        assert!(other.lock().push_deferred(b(0, 5)).is_none());
     }
 
     /// A sort or filter of a result on disk applies to its first rows only

@@ -805,7 +805,8 @@ mod secret_destination_tests {
     #[test]
     fn a_new_server_user_or_encryption_is_another_destination() {
         let base = pg().secret_destination();
-        let changed: Vec<Box<dyn Fn(&mut ConnectionConfig)>> = vec![
+        type Change = Box<dyn Fn(&mut ConnectionConfig)>;
+        let changed: Vec<Change> = vec![
             Box::new(|c| c.host = Some("evil.example.com".into())),
             Box::new(|c| c.port = Some(6543)),
             Box::new(|c| c.auth = AuthMethod::Password { user: "admin".into() }),

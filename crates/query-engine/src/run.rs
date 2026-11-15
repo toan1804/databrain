@@ -358,17 +358,16 @@ impl QueryEngine {
         emit(JobEvent::JobFinished { job_id, tab_id: req.tab_id, status, duration_ms: job_start.elapsed().as_millis() as u64, in_transaction });
     }
 
-    /// Move result `rs` to disk (its own folder): false when results don't
-    /// spill here, the disk is low, or its rows can't be written.
+    /// Move result `rs` to disk (its own folder), or why it wasn't.
     fn spill(
         &self,
         rs: &Arc<parking_lot::Mutex<databrain_result_store::ResultSet>>,
         id: &str,
         sample: &databrain_connector_core::arrow::array::RecordBatch,
-    ) -> bool {
-        let Some(dir) = self.results.spill_dir(id) else { return false };
-        if self.disk_still_low().is_some() {
-            return false;
+    ) -> Spilled {
+        let Some(dir) = self.results.spill_dir(id) else { return Spilled::NotHere };
+        if let Some(free) = self.disk_still_low() {
+            return Spilled::LowDisk(free);
         }
         // Writes up to half the budget: not on an async worker's time, and
         // not under the result's lock (the outputs list, the grid and
@@ -377,10 +376,13 @@ impl QueryEngine {
         blocking_io(|| {
             let start = match rs.lock().spill_start() {
                 Ok(Some(s)) => s,
-                Ok(None) => return true,
-                Err(_) => return false,
+                Ok(None) => return Spilled::Yes,
+                Err(e) => return Spilled::Failed(e.to_string()),
             };
-            start.write(dir, sample).and_then(|ready| rs.lock().spill_adopt(ready)).is_ok()
+            match start.write(dir, sample).and_then(|ready| rs.lock().spill_adopt(ready)) {
+                Ok(()) => Spilled::Yes,
+                Err(e) => Spilled::Failed(e.to_string()),
+            }
         })
     }
 
@@ -463,6 +465,8 @@ impl QueryEngine {
         let mut on_disk = false;
         let mut low_disk: Option<u64> = None;
         let mut spill_failed: Option<String> = None;
+        // Stopped at the grid's 32-bit row ids.
+        let mut at_id_cap = false;
         let t0 = Instant::now();
         let mut last_progress = Instant::now();
 
@@ -491,6 +495,7 @@ impl QueryEngine {
                     if batch.num_rows() > room {
                         batch = batch.slice(0, room);
                         truncated = true;
+                        at_id_cap = true;
                     }
                     if on_disk {
                         if let Some(free) = self.disk_still_low() {
@@ -509,7 +514,16 @@ impl QueryEngine {
                         // Past the memory a result may keep, or the computer low on
                         // free memory: move the result to disk and keep loading.
                         let low = if !truncated && rows > 0 { self.outputs.low_memory() } else { None };
-                        if (bytes + size > max_bytes || low.is_some()) && self.spill(rs, &result_id, &batch) {
+                        let spilled = if bytes + size > max_bytes || low.is_some() { self.spill(rs, &result_id, &batch) } else { Spilled::NotHere };
+                        // Why it stays in memory, for the stop message: the
+                        // disk, not the memory, when that's what refused.
+                        let moved = matches!(spilled, Spilled::Yes);
+                        match spilled {
+                            Spilled::LowDisk(free) => low_disk = Some(free),
+                            Spilled::Failed(e) => spill_failed = Some(e),
+                            Spilled::Yes | Spilled::NotHere => {}
+                        }
+                        if moved {
                             on_disk = true;
                         } else if let Some(free) = low {
                             // Can't spill: stop before taking more, keeping the rows so far.
@@ -532,13 +546,13 @@ impl QueryEngine {
                     if !on_disk {
                         bytes += databrain_connector_core::memory_size([&batch]);
                     }
-                    let push = || {
-                        let mut g = rs.lock();
-                        g.push(batch);
-                        g.spill_error().map(str::to_string)
-                    };
-                    // On disk a push may write a file.
-                    let failed = if on_disk { blocking_io(push) } else { push() };
+                    // On disk a file due is written outside the lock (the
+                    // grid and the outputs list read the result meanwhile).
+                    let job = rs.lock().push_deferred(batch);
+                    if job.is_some() {
+                        blocking_io(|| write_files(rs, job, false));
+                    }
+                    let failed = if on_disk { rs.lock().spill_error().map(str::to_string) } else { None };
                     if let Some(e) = failed {
                         spill_failed = Some(e);
                         cancel.cancel();
@@ -577,6 +591,9 @@ impl QueryEngine {
                 Ok(StreamEvent::Done(summary)) => {
                     let (info, failed) = result.as_ref().map_or((None, None), |rs| {
                         blocking_io(|| {
+                            // The last file, outside the lock.
+                            let last = rs.lock().flush_deferred();
+                            write_files(rs, last, true);
                             let mut g = rs.lock();
                             g.finish(false);
                             let failed = g.spill_error().map(str::to_string);
@@ -603,6 +620,8 @@ impl QueryEngine {
         // Only reached when stopped at the row cap.
         let info = result.as_ref().map(|rs| {
             blocking_io(|| {
+                let last = rs.lock().flush_deferred();
+                write_files(rs, last, true);
                 let mut g = rs.lock();
                 g.finish(true);
                 g.info()
@@ -626,6 +645,8 @@ impl QueryEngine {
                 "Showing the first {rows} rows: the computer is low on free memory ({} free). Close other programs or results, or export the query to get every row.",
                 crate::outputs::size_text(free as usize)
             )
+        } else if at_id_cap {
+            format!("Showing the first {rows} rows: a result holds at most 4,294,967,295 rows. Export the query to get every row.")
         } else if too_big {
             format!(
                 "Showing the first {rows} rows: they fill the {} a result may keep in memory. Select fewer columns, or export the query to get every row.",
@@ -702,6 +723,27 @@ impl Drop for Unfinished<'_> {
 }
 
 /// What a result kept on disk tells the user.
+/// Why a result stayed in memory ([`QueryEngine::spill`]).
+enum Spilled {
+    Yes,
+    /// Results don't move to disk here (no spill folder).
+    NotHere,
+    /// The disk is low: its free bytes.
+    LowDisk(u64),
+    /// Its rows couldn't be written.
+    Failed(String),
+}
+
+/// Write `job` and the files due after it, each outside `rs`'s lock
+/// (`all`: the rows still waiting too). A failed write is kept as the
+/// result's `spill_error`.
+fn write_files(rs: &parking_lot::Mutex<databrain_result_store::ResultSet>, mut job: Option<databrain_result_store::spill::FileJob>, all: bool) {
+    while let Some(j) = job {
+        let done = j.write();
+        job = rs.lock().adopt_file(done, all);
+    }
+}
+
 fn on_disk_notice(disk_bytes: u64) -> String {
     format!(
         "This result is larger than the memory a result may keep: its rows are on disk ({}) and read as you scroll. Sorting, filtering and find read them from disk, so they take longer.",

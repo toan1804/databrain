@@ -57,6 +57,29 @@ pub struct Spill {
     decimals: Vec<Option<DecimalFit>>,
 }
 
+/// A file due ([`Spill::next_file`]): written with [`Self::write`], which
+/// needs neither the [`Spill`] nor the result's lock.
+pub struct FileJob {
+    path: PathBuf,
+    start: usize,
+    rows: RecordBatch,
+}
+
+/// A file [`FileJob::write`] wrote, for [`Spill::adopt_file`].
+pub struct FileWritten {
+    path: PathBuf,
+    start: usize,
+    rows: usize,
+    bytes: u64,
+}
+
+impl FileJob {
+    pub fn write(self) -> Result<FileWritten> {
+        let bytes = write_parquet(&self.path, &self.rows)?;
+        Ok(FileWritten { path: self.path, start: self.start, rows: self.rows.num_rows(), bytes })
+    }
+}
+
 /// The DECIMAL that holds every value of a text column of exact decimals
 /// (as `outputs::sql_ready_all` picks it for results in memory), or DOUBLE
 /// for exponents, NaN/infinity or more than 38 digits.
@@ -221,8 +244,29 @@ impl Spill {
     /// write error the rows waiting for a file are dropped (see
     /// [`Self::discard_pending`]) and the error returned.
     pub fn push(&mut self, batch: RecordBatch) -> Result<()> {
+        self.add(batch);
+        self.write_due(false)
+    }
+
+    /// Write the rows still waiting (the result is complete).
+    pub fn finish(&mut self) -> Result<()> {
+        self.write_due(true)
+    }
+
+    /// Write every file due here (`all`: the rows still waiting too).
+    fn write_due(&mut self, all: bool) -> Result<()> {
+        while let Some(job) = self.next_file(all)? {
+            let done = job.write();
+            self.adopt_file(done)?;
+        }
+        Ok(())
+    }
+
+    /// Add rows without writing a file: [`Self::next_file`] says when one is
+    /// due, to write outside the result's lock.
+    pub fn add(&mut self, batch: RecordBatch) {
         if batch.num_rows() == 0 {
-            return Ok(());
+            return;
         }
         for (fit, col) in self.decimals.iter_mut().zip(batch.columns()) {
             if let Some(fit) = fit {
@@ -232,26 +276,47 @@ impl Spill {
         self.pending_rows += batch.num_rows();
         self.pending_bytes += databrain_connector_core::memory_size([&batch]);
         self.pending.push(batch);
-        while self.pending_rows >= CHUNK_ROWS || (self.pending_bytes >= CHUNK_BYTES && self.pending_rows > 0) {
-            // A file of whole rows within the byte size (at least one row).
-            let per_row = (self.pending_bytes / self.pending_rows).max(1);
-            let rows = (CHUNK_BYTES / per_row).clamp(1, CHUNK_ROWS).min(self.pending_rows);
-            if let Err(e) = self.write_chunk(rows) {
+    }
+
+    /// The next file to write: when the waiting rows fill one (by rows or
+    /// bytes), or any rows wait and `all`. The rows stay waiting (readable
+    /// from memory) until [`Self::adopt_file`] takes the written file; write
+    /// one file at a time, adopting it before asking for the next.
+    pub fn next_file(&mut self, all: bool) -> Result<Option<FileJob>> {
+        let due = self.pending_rows >= CHUNK_ROWS || (self.pending_bytes >= CHUNK_BYTES && self.pending_rows > 0);
+        if !due && !(all && self.pending_rows > 0) {
+            return Ok(None);
+        }
+        // A file of whole rows within the byte size (at least one row).
+        let per_row = (self.pending_bytes / self.pending_rows).max(1);
+        let rows = (CHUNK_BYTES / per_row).clamp(1, CHUNK_ROWS).min(self.pending_rows);
+        let waiting = concat_batches(&self.schema, &self.pending)?;
+        self.pending = vec![waiting.clone()];
+        let path = self.dir.0.join(format!("{:06}.parquet", self.chunks.len()));
+        Ok(Some(FileJob { path, start: self.written_rows(), rows: waiting.slice(0, rows) }))
+    }
+
+    /// Take a file [`FileJob::write`] wrote: its rows stop waiting. A failed
+    /// write drops the rows waiting for a file (see [`Self::discard_pending`])
+    /// and returns the error.
+    pub fn adopt_file(&mut self, done: Result<FileWritten>) -> Result<()> {
+        let done = match done {
+            Ok(d) => d,
+            Err(e) => {
                 self.discard_pending();
                 return Err(e);
             }
-        }
-        Ok(())
-    }
-
-    /// Write the rows still waiting (the result is complete).
-    pub fn finish(&mut self) -> Result<()> {
-        if self.pending_rows > 0
-            && let Err(e) = self.write_chunk(self.pending_rows)
-        {
-            self.discard_pending();
-            return Err(e);
-        }
+        };
+        let FileWritten { path, start, rows, bytes } = done;
+        let all = concat_batches(&self.schema, &self.pending)?;
+        let rows = rows.min(all.num_rows());
+        let rest = all.slice(rows, all.num_rows() - rows);
+        self.chunks.push(Chunk { path, row_group: 0, start, rows, bytes });
+        // `rest` is a slice of the whole: its share of the bytes, not the
+        // whole buffers' size (which would write needlessly small files).
+        self.pending_bytes = (self.pending_bytes as u128 * rest.num_rows() as u128 / all.num_rows().max(1) as u128) as usize;
+        self.pending_rows = rest.num_rows();
+        self.pending = if rest.num_rows() > 0 { vec![rest] } else { Vec::new() };
         Ok(())
     }
 
@@ -261,27 +326,6 @@ impl Spill {
         self.pending.clear();
         self.pending_rows = 0;
         self.pending_bytes = 0;
-    }
-
-    /// Write the first `rows` waiting rows as one file.
-    fn write_chunk(&mut self, rows: usize) -> Result<()> {
-        let all = concat_batches(&self.schema, &self.pending)?;
-        self.pending.clear();
-        let (head, rest) = (all.slice(0, rows), all.slice(rows, all.num_rows() - rows));
-        let start = self.written_rows();
-        let path = self.dir.0.join(format!("{:06}.parquet", self.chunks.len()));
-        let written = write_parquet(&path, &head);
-        // Keep the rows either way (a failed write drops them in the caller).
-        self.pending_rows = all.num_rows();
-        self.pending = vec![all.clone()];
-        let bytes = written?;
-        self.chunks.push(Chunk { path, row_group: 0, start, rows, bytes });
-        // `rest` is a slice of the whole: its share of the bytes, not the
-        // whole buffers' size (which would write needlessly small files).
-        self.pending_bytes = (self.pending_bytes as u128 * rest.num_rows() as u128 / all.num_rows().max(1) as u128) as usize;
-        self.pending_rows = rest.num_rows();
-        self.pending = if rest.num_rows() > 0 { vec![rest] } else { Vec::new() };
-        Ok(())
     }
 
     fn chunk(&mut self, i: usize) -> Result<RecordBatch> {

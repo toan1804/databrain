@@ -924,9 +924,12 @@ async fn low_disk_frees_older_results_on_disk() {
 
     // Shown in its tab (the tab's latest result): kept; the new one, in another tab, stops.
     let other = RunRequest { tab_id: "tab2".into(), ..r.clone() };
-    let (stopped, _) = outcome(&wait_job(&f, &started(f.engine.run(other).unwrap())).await);
+    let (stopped, notices) = outcome(&wait_job(&f, &started(f.engine.run(other).unwrap())).await);
     assert!(first_dir.exists(), "a result a tab shows isn't freed");
     assert!(stopped.truncated && !stopped.on_disk && stopped.total_rows < 20000, "{stopped:?}");
+    // Still in memory, refused a move for the disk: the stop names the disk, not the memory.
+    assert!(notices.iter().any(|n| n.contains("the disk has only")), "{notices:?}");
+    assert!(!notices.iter().any(|n| n.contains("memory")), "{notices:?}");
 
     // Run again in the first tab: its earlier result is no longer shown, so it goes.
     let (second, notices) = outcome(&wait_job(&f, &started(f.engine.run(r).unwrap())).await);
