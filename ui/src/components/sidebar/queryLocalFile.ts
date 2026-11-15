@@ -3,6 +3,7 @@ import { api, toError } from "../../lib/api";
 import { DEFAULT_POLICY } from "../connection/parts";
 import { askExcelSheets } from "../ExcelSheetDialog";
 import { useStore } from "../../store";
+import type { ExcelSheet } from "../../lib/types";
 
 // ------------------------------------------------------------------ connections
 
@@ -49,6 +50,10 @@ async function openLocalFile(importIt: boolean) {
         allSheets = pick;
         if (allSheets) st.toast(`Reading ${used} sheets…`, "info");
       }
+      // Cells left out of what is read (a title above the table, a block
+      // far from it) are said, not only in the SQL's comment.
+      const read = sheets.filter((s) => s.range).slice(0, allSheets ? undefined : 1).filter((s) => s.left_out);
+      if (read.length) st.toast(leftOutMessage(read), "info");
     }
     // An import reads every row: no LIMIT. The tab shows the first rows (the
     // row limit); "Load into…" then streams every row of the file.
@@ -78,4 +83,10 @@ async function openLocalFile(importIt: boolean) {
   } catch (e) {
     st.toast(toError(e).message, "error");
   }
+}
+
+/** What a workbook's read leaves out, per sheet: `Sales reads A4:D30 of A1:KO5001`. */
+export function leftOutMessage(sheets: Pick<ExcelSheet, "name" | "left_out">[]): string {
+  const parts = sheets.map((s) => `${s.name} ${s.left_out}`);
+  return `${parts.join("; ")}: title rows above the table and cells far from it are left out (the SQL says so too).`;
 }

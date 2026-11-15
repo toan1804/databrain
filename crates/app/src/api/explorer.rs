@@ -473,6 +473,11 @@ pub struct ExcelSheet {
     pub name: String,
     pub range: Option<String>,
     pub hidden: bool,
+    /// What is read when cells are left out (title rows above the table,
+    /// blocks far from it), e.g. `reads A4:D30 of A1:KO5001`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub left_out: Option<String>,
 }
 
 /// Sheets of an .xlsx file (workbook order) with their used ranges.
@@ -481,6 +486,6 @@ pub fn excel_sheets(path: &str) -> Result<Vec<ExcelSheet>> {
     Ok(databrain_connector_duckdb::xlsx::sheets(path)
         .map_err(|e| EngineError::new("invalid", e))?
         .into_iter()
-        .map(|s| ExcelSheet { name: s.name, range: s.range, hidden: s.hidden })
+        .map(|s| ExcelSheet { left_out: s.left_out(), name: s.name, range: s.range, hidden: s.hidden })
         .collect())
 }

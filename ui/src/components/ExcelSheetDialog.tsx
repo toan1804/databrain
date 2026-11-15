@@ -68,8 +68,8 @@ export function ExcelSheetDialog() {
           {ask.sheets.map((s, i) => (
             <li key={s.name + i} className={`flex gap-2 ${s.range ? "" : "text-muted"}`}>
               <span className="min-w-0 truncate">{s.name}</span>
-              <span className="ml-auto shrink-0 text-muted">
-                {s.range ?? "empty"}
+              <span className="ml-auto shrink-0 text-muted" title={s.left_out ? "Title rows above the table and cells far from it are left out" : undefined}>
+                {s.left_out ?? s.range ?? "empty"}
                 {s.hidden ? " · hidden" : ""}
               </span>
             </li>
