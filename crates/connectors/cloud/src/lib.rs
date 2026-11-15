@@ -6,6 +6,8 @@ pub mod bigquery;
 mod common;
 #[cfg(feature = "databricks")]
 pub mod databricks;
+#[cfg(test)]
+mod mock_http;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
 
