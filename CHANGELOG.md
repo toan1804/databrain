@@ -11,6 +11,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- The editor, notebooks and jobs now read SQL text one way (strings, comments, quoted names, dollar quotes), so they agree: a job no longer takes `results.x` inside a string or comment for a link to step `x` (nor renames it there), notebooks and jobs see `results/**/.x` as a reference like DuckDB does, and inline suggestions are not offered inside a comment or string that spans several lines.
 - Start-up: when the assistant or jobs failed to start, nothing said so, and a failed assistant start also kept jobs from starting (no run events, an empty Jobs list). Each part starts on its own and reports a failure; the jobs list is looked at again every 30 s even when the first look failed.
 - The connection dialog's Test no longer sends the saved password to a server, port, user or SSH host that was changed in the form: it asks for the password to test against the new one.
 - Dropping the output shown in the last tab no longer leaves no tab open, and the tab list is saved.

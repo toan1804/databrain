@@ -1,7 +1,8 @@
 // Query hints from table layout (indexes, partitions, cluster keys): which
 // filters can skip data and which ones defeat it. Pure logic over SQL text;
 // components/queryHintsExt.ts puts the results in the editor.
-import { blankLiterals, splitPath, unquote } from "./sqlComplete";
+import { splitPath, unquote } from "./sqlComplete";
+import { blankLiterals } from "./sqlText";
 import type { ConnectorKind, TableLayout } from "./types";
 
 export type HintLevel = "warn" | "info";

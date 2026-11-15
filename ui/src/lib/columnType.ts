@@ -1,5 +1,6 @@
 import type { ColumnMeta, OutputInfo } from "./types";
 import { engineName } from "./sourceTraits";
+import { outputNames, outputRefs } from "./sqlText";
 
 export { engineName };
 
@@ -13,14 +14,13 @@ export interface ColumnTypeInfo {
   sources: { ref: string; connection: string; engine: string; type: string }[];
 }
 
-const REF = /\bresults\.(?:"([^"]+)"|([A-Za-z_][\w]*))/gi;
 
 /** Outputs a DuckDB query reads as `results.<handle or name>`. */
 export function referencedOutputs(sql: string, outputs: OutputInfo[]): OutputInfo[] {
   const seen = new Set<string>();
   const out: OutputInfo[] = [];
-  for (const m of sql.matchAll(REF)) {
-    const want = (m[1] ?? m[2]).toLowerCase();
+  for (const name of outputNames(sql)) {
+    const want = name.toLowerCase();
     const o = outputs.find((x) => x.handle.toLowerCase() === want) ?? outputs.find((x) => x.name?.toLowerCase() === want && x.active);
     if (o && !seen.has(o.result_id)) {
       seen.add(o.result_id);
@@ -35,7 +35,7 @@ export function columnTypeInfo(col: ColumnMeta, resultId: string, outputs: Outpu
   const own = outputs.find((o) => o.result_id === resultId);
   const info: ColumnTypeInfo = { name: col.name, type: col.db_type || col.data_type, engine: own?.kind ?? null, sources: [] };
   // Results (DuckDB) over outputs: also the type the column has where it came from.
-  if (own?.kind === "duckdb" && /\bresults\./i.test(own.sql)) {
+  if (own?.kind === "duckdb" && outputRefs(own.sql).length > 0) {
     for (const src of referencedOutputs(own.sql, outputs)) {
       if (src.result_id === resultId) continue;
       const c = src.columns.find((x) => x.name === col.name) ?? src.columns.find((x) => x.name.toLowerCase() === col.name.toLowerCase());

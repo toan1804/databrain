@@ -1,6 +1,8 @@
 // Pure rules for inline AI ("ghost") completion: when to ask, what text to
 // send, and how to fit the model's answer at the cursor.
 
+import { inStringOrComment } from "./sqlText";
+
 const PREFIX_CHARS = 4000;
 const SUFFIX_CHARS = 1500;
 const MAX_LINES = 6;
@@ -16,13 +18,11 @@ export function ghostWindow(doc: string, pos: number): { prefix: string; suffix:
  * `--` comment or a string, and the statement isn't finished (`;`).
  */
 export function canSuggest(doc: string, pos: number): boolean {
-  const lineStart = doc.lastIndexOf("\n", pos - 1) + 1;
   const lineEndIdx = doc.indexOf("\n", pos);
   const after = doc.slice(pos, lineEndIdx < 0 ? doc.length : lineEndIdx);
   if (!/^[\s)\]'"`;,]*$/.test(after)) return false;
-  const before = doc.slice(lineStart, pos);
-  if (/--/.test(before.replace(/'[^']*'/g, ""))) return false;
-  if ((before.match(/'/g)?.length ?? 0) % 2 === 1) return false;
+  // Not inside a string or a comment (read across lines: a block comment or a string can span several).
+  if (inStringOrComment(doc, pos)) return false;
   const recent = doc.slice(Math.max(0, pos - 400), pos);
   const last = recent.trimEnd().slice(-1);
   if (!last || last === ";") return false;

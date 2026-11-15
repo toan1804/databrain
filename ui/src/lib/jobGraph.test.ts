@@ -180,3 +180,10 @@ describe("batchValue", () => {
     expect(batchValue("5000", 1000)).toBe(1000);
   });
 });
+
+describe("job steps read outputs as the shared scanner does", () => {
+  it("doesn't take results.x in a string or comment for a link, and sees one behind a comment", () => {
+    const k = job([n("a", "orders"), n("b", "x", "select 'results.orders' as label -- results.orders"), n("c", "y", "select * from results/**/.orders")]);
+    expect(missingLinks(k)).toEqual([{ node: "c", reads: "a" }]);
+  });
+});
