@@ -49,7 +49,6 @@ Fixed on 2026-11-15: catalog queries built with a literal a backslash could end 
 
 **Connections and secrets**
 - **TLS:** Postgres and MySQL `Prefer` falls back to plaintext, `Require` accepts any certificate (as libpq does); MySQL's fallback also triggers on a wrong password. Only `VerifyFull` verifies; there is no CA-file option.
-- **Hosts are not validated** (Snowflake account, Databricks host): `evil.com/a` or `host@evil.com` sends the credential elsewhere; an imported connection is the realistic route. Snowflake's presigned chunk URL can appear in an error message.
 - **SQL Server and MySQL keep the credential** for reconnects (an Entra token expires after about an hour).
 - **Oracle:** the Instant Client install uses a predictable folder in a shared `/tmp` on Linux; `DATABRAIN_ORACLE_AGENT` runs an unverified helper; the helper keeps running a statement after DataBrain dies.
 - **Redshift read-only** rests on `SET SESSION CHARACTERISTICS … READ ONLY`, which may be a no-op there (not confirmed).

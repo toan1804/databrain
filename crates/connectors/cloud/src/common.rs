@@ -47,12 +47,19 @@ pub fn error_chain(e: &dyn std::error::Error) -> String {
 }
 
 pub fn net_err(e: reqwest::Error) -> ConnectorError {
+    // Not the URL: a presigned result link (Snowflake's chunks, Databricks'
+    // external links) carries its signature in it. The host says where.
+    let host = e.url().and_then(|u| u.host_str()).map(str::to_string);
+    let e = e.without_url();
     let mut msg = e.to_string();
     let mut src = std::error::Error::source(&e);
     while let Some(s) = src {
         msg.push_str(": ");
         msg.push_str(&s.to_string());
         src = s.source();
+    }
+    if let Some(h) = host {
+        msg.push_str(&format!(" ({h})"));
     }
     ConnectorError::connection(msg)
 }
@@ -203,6 +210,30 @@ pub fn normalize_host(h: &str) -> String {
     h.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string()
 }
 
+/// A host credentials may be sent to: a host name (letters, digits, `-`,
+/// `_` and `.`), optionally with `:port`, once `https://` and a trailing `/`
+/// are dropped. Anything else changes where a URL built from it goes
+/// (`evil.com/a`, `host@evil.com`, `host?x`, `host#x`, a space), so it is
+/// refused instead of sending the sign-in or token there.
+pub fn checked_host(h: &str) -> std::result::Result<String, String> {
+    let n = normalize_host(h);
+    let (name, port) = match n.rsplit_once(':') {
+        Some((a, p)) => (a, Some(p)),
+        None => (n.as_str(), None),
+    };
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n > 0));
+    let name_ok = !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|l| {
+            !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+    if name_ok && port_ok {
+        Ok(n)
+    } else {
+        Err(format!("\"{}\" is not a host name: use only letters, digits, '-', '_' and '.' (and :port), with nothing after it", h.trim()))
+    }
+}
+
 /// Results above this size are "large" (Databricks' INLINE limit, 25 MiB).
 pub const LARGE_RESULT_BYTES: u64 = 25 * 1024 * 1024;
 
@@ -271,5 +302,36 @@ mod notice_tests {
         assert!(n.starts_with("The data is large (1.4 GB, 3200000 rows in 52 chunks), so it is downloaded from Databricks's external links: https://st.blob.core.windows.net/r/0?…."), "{n}");
         assert!(!n.contains("SECRET"));
         assert!(large_result_notice("Snowflake", None, None, 4, None).unwrap().contains("(4 chunks)"));
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn checked_host_allows_host_names_only() {
+        for (h, want) in [
+            ("adb-1.azuredatabricks.net", "adb-1.azuredatabricks.net"),
+            (" https://dbc-1.cloud.databricks.com/ ", "dbc-1.cloud.databricks.com"),
+            ("my_org-acct.snowflakecomputing.com", "my_org-acct.snowflakecomputing.com"),
+            ("localhost:8443", "localhost:8443"),
+        ] {
+            assert_eq!(checked_host(h).unwrap(), want);
+        }
+        for h in
+            ["", "evil.com/a", "host@evil.com", "host?x", "host#x", "a b", "a..b", "-a.com", "a.com:", "a.com:0", "a.com:70000", "a.com:1@evil.com", "a.com/x/"]
+        {
+            assert!(checked_host(h).is_err(), "{h}");
+        }
+    }
+
+    /// A network error names the host, not the URL (a presigned link's signature).
+    #[tokio::test]
+    async fn network_errors_leave_the_url_out() {
+        let e = http().get("http://127.0.0.1:1/chunk?X-Amz-Signature=secret123").send().await.unwrap_err();
+        let msg = net_err(e).message;
+        assert!(!msg.contains("secret123") && !msg.contains("X-Amz"), "{msg}");
+        assert!(msg.contains("127.0.0.1"), "{msg}");
     }
 }
