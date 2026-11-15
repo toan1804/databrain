@@ -12,3 +12,6 @@ examples/data/_staging
 
 # Fetched at build time
 crates/app/resources/duckdb-extensions/v*/
+
+# A `go build` in the Oracle helper folder (releases are built by scripts/build-oracle-agent.mjs)
+/crates/connectors/oracle/agent/oracle-agent

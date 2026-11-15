@@ -180,7 +180,13 @@ impl Session for OracleSession {
                 tx.blocking_send(Err(map_err(e)));
                 return;
             }
-            if let Err(e) = run(&conn, &sql, &opts, &tx) {
+            let r = run(&conn, &sql, &opts, &tx);
+            // And ends with it: what a block ran after a COMMIT inside it
+            // (no longer read-only), not committed, is rolled back now.
+            if read_only {
+                let _ = conn.rollback();
+            }
+            if let Err(e) = r {
                 let e = if opts.cancel.is_cancelled() { ConnectorError::cancelled() } else { e };
                 tx.blocking_send(Err(e));
             }
@@ -700,6 +706,15 @@ mod tests {
         const COUNT: &str = "select count(*) from kb_raw";
         const SID: &str = "select sys_context('USERENV','SID') from dual";
         let sid0 = cell(&ro, SID).await;
+        // A read-only transaction can't read a table created seconds before
+        // it (ORA-01466, the DDL time's granularity): wait for that.
+        for _ in 0..20 {
+            let r = ro.execute(databrain_connector_core::Statement::internal(COUNT), ExecOptions::default()).await.unwrap().collect().await;
+            match r {
+                Err(e) if e.code.as_deref() == Some("ORA-01466") => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+                _ => break,
+            }
+        }
         assert_eq!(cell(&ro, COUNT).await, "0");
         exec("insert into kb_raw values (hextoraw('ff'), 1)").await.unwrap();
         assert_eq!(cell(&ro, COUNT).await, "1", "{driver}: the read-only session sees the new row");
@@ -713,6 +728,33 @@ mod tests {
             .collect()
             .await;
         assert!(w.is_err(), "{driver}: write refused after COMMIT");
+
+        // Oracle doesn't enforce read-only beyond the transaction: a COMMIT
+        // or DDL ends it. These are run here past the classifier, which is
+        // what refuses them on a read-only connection (checked first).
+        let ro_run = |sql: &'static str| {
+            let ro = &ro;
+            async move { ro.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await.unwrap().collect().await }
+        };
+        for sql in [
+            "begin commit; update kb_raw set n = 3 where n = 1; end;",
+            "begin commit; insert into kb_raw values (null, 4); commit; end;",
+            "create table kb_ro_ddl (x number)",
+        ] {
+            let c = databrain_connector_core::sql::classify(sql, ConnectorKind::Oracle);
+            assert!(!databrain_connector_core::sql::read_only_allows(sql, &c), "{driver}: the classifier refuses {sql}");
+        }
+        // A write after a COMMIT in a block, not committed: rolled back as the
+        // statement ends, so it holds no lock (it held the row until the next statement).
+        ro_run("begin commit; update kb_raw set n = 3 where n = 1; end;").await.unwrap();
+        exec("select n from kb_raw where n = 1 for update nowait").await.unwrap_or_else(|e| panic!("{driver}: the row is still locked: {e}"));
+        exec("rollback").await.unwrap();
+        assert_eq!(first(&s, "select count(*) from kb_raw where n = 3").await, "0", "{driver}: not kept");
+        // Committed inside the block, or DDL (which commits itself): the server keeps it.
+        ro_run("begin commit; insert into kb_raw values (null, 4); commit; end;").await.unwrap();
+        assert_eq!(first(&s, "select count(*) from kb_raw where n = 4").await, "1", "{driver}: not enforced by the server");
+        ro_run("create table kb_ro_ddl (x number)").await.unwrap();
+        exec("drop table kb_ro_ddl purge").await.unwrap();
 
         exec("drop materialized view kb_mv").await.unwrap();
         exec("drop table kb_raw purge").await.unwrap();

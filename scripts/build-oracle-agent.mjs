@@ -49,7 +49,7 @@ const sums = [];
 for (const [os, arch] of targets) {
   const file = `databrain-oracle-agent-${os}-${arch}${os === "windows" ? ".exe" : ""}`;
   const dest = join(out, file);
-  execFileSync("go", ["build", "-trimpath", "-ldflags", "-s -w -buildid=", "-o", dest, "."], {
+  execFileSync("go", ["build", "-trimpath", "-buildvcs=false", "-ldflags", "-s -w -buildid=", "-o", dest, "."], {
     cwd: src,
     stdio: "inherit",
     env: { ...process.env, CGO_ENABLED: "0", GOOS: os, GOARCH: arch, GOFLAGS: "-mod=readonly" },

@@ -49,6 +49,10 @@ pub fn set_dir(dir: Option<PathBuf>) {
     *DIR.write().unwrap() = dir;
 }
 
+/// The largest frame the helper sends (`maxFrame` in agent/main.go): it
+/// refuses a row larger than this rather than wrap the 32-bit length.
+const MAX_FRAME: usize = 1 << 30;
+
 /// Override the download location (setting / `DATABRAIN_ORACLE_AGENT_URL`).
 pub fn set_base_url(url: Option<String>) {
     *BASE_URL.write().unwrap() = url.filter(|u| !u.trim().is_empty());
@@ -395,6 +399,10 @@ impl Agent {
         let mut h = [0u8; 5];
         r.read_exact(&mut h).await.map_err(dead)?;
         let n = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+        // The helper refuses a larger row; a larger length is a broken stream.
+        if n > MAX_FRAME {
+            return Err(dead(format!("a reply of {n} bytes is larger than a frame holds")));
+        }
         let mut b = vec![0u8; n];
         r.read_exact(&mut b).await.map_err(dead)?;
         match h[4] {

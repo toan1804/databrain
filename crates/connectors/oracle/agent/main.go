@@ -86,7 +86,15 @@ type writer struct {
 	frames uint64
 }
 
+// maxFrame is the largest frame either side sends or accepts (the
+// header's length is 32 bits; a row larger than this is refused). Kept in
+// sync with MAX_FRAME in src/agent.rs; a variable for tests.
+var maxFrame = 1 << 30
+
 func (w *writer) frame(kind byte, payload []byte) error {
+	if len(payload) > maxFrame {
+		return fmt.Errorf("a reply of %d bytes is larger than the %d bytes a frame holds", len(payload), maxFrame)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.frames++
@@ -169,26 +177,161 @@ type session struct {
 	// The connect request, to reconnect after the connection is lost.
 	req *request
 	// ALTER SESSION statements run so far, replayed after a reconnect
-	// (e.g. current_schema, which unqualified names depend on).
-	setup []string
+	// (e.g. current_schema, which unqualified names depend on), in the
+	// order they last ran; see remember.
+	setup []setupStmt
 }
 
-// maxSetup bounds the remembered ALTER SESSION statements.
-const maxSetup = 64
+// setupStmt is a remembered ALTER SESSION statement and what it sets.
+type setupStmt struct {
+	sql  string
+	keys []string
+}
 
+// isAlterSession: ALTER SESSION, past leading comments.
 func isAlterSession(sql string) bool {
-	f := strings.Fields(strings.ToUpper(sql))
+	f := strings.Fields(strings.ToUpper(stripComments(sql)))
 	return len(f) >= 2 && f[0] == "ALTER" && f[1] == "SESSION"
 }
 
-func (s *session) remember(sql string) {
-	for _, x := range s.setup {
-		if x == sql {
-			return
+// stripComments drops leading whitespace and `--` / `/* */` comments.
+func stripComments(sql string) string {
+	for {
+		sql = strings.TrimLeft(sql, " \t\r\n")
+		switch {
+		case strings.HasPrefix(sql, "--"):
+			i := strings.IndexByte(sql, '\n')
+			if i < 0 {
+				return ""
+			}
+			sql = sql[i+1:]
+		case strings.HasPrefix(sql, "/*"):
+			i := strings.Index(sql[2:], "*/")
+			if i < 0 {
+				return ""
+			}
+			sql = sql[i+4:]
+		default:
+			return sql
 		}
 	}
-	if len(s.setup) < maxSetup {
-		s.setup = append(s.setup, sql)
+}
+
+// sessionKeys: what an ALTER SESSION statement sets, so a later statement
+// can take its place: the parameters of SET (`SET a = 1 b = 'x y'`: A, B),
+// the feature of ENABLE/DISABLE/FORCE (`ENABLE PARALLEL DML 4`: PARALLEL
+// DML). Anything else (SET EVENTS, ADVISE, a statement it can't read) is
+// keyed by its whole text: replaced only by the same statement.
+func sessionKeys(sql string) []string {
+	body := strings.TrimSpace(stripComments(sql))
+	body = strings.TrimRight(body, "; \t\r\n")
+	whole := []string{"=" + strings.ToUpper(strings.Join(strings.Fields(body), " "))}
+	f := strings.Fields(body)
+	if len(f) < 3 {
+		return whole
+	}
+	verb := strings.ToUpper(f[2])
+	switch verb {
+	case "ENABLE", "DISABLE", "FORCE":
+		rest := make([]string, 0, len(f)-3)
+		for _, x := range f[3:] {
+			rest = append(rest, strings.ToUpper(x))
+		}
+		if len(rest) >= 2 && rest[0] == "PARALLEL" {
+			return []string{"PARALLEL " + rest[1]}
+		}
+		if len(rest) == 0 {
+			return whole
+		}
+		return []string{strings.Join(rest, " ")}
+	case "SET":
+	default:
+		return whole
+	}
+	// SET name = value [name = value …]; values may be quoted.
+	i := strings.Index(strings.ToUpper(body), "SET") + 3
+	var keys []string
+	for {
+		for i < len(body) && strings.ContainsRune(" \t\r\n", rune(body[i])) {
+			i++
+		}
+		if i >= len(body) {
+			break
+		}
+		j := i
+		for j < len(body) && (body[j] == '_' || body[j] == '$' || body[j] == '#' || body[j] == '.' ||
+			(body[j] >= 'a' && body[j] <= 'z') || (body[j] >= 'A' && body[j] <= 'Z') || (body[j] >= '0' && body[j] <= '9')) {
+			j++
+		}
+		if j == i {
+			return whole
+		}
+		name := strings.ToUpper(body[i:j])
+		for j < len(body) && strings.ContainsRune(" \t\r\n", rune(body[j])) {
+			j++
+		}
+		if j >= len(body) || body[j] != '=' {
+			return whole // SET EVENTS '…', SET CONTAINER = … is fine above
+		}
+		j++
+		for j < len(body) && strings.ContainsRune(" \t\r\n", rune(body[j])) {
+			j++
+		}
+		if j < len(body) && (body[j] == '\'' || body[j] == '"') {
+			qc := body[j]
+			j++
+			for j < len(body) {
+				if body[j] == qc {
+					if j+1 < len(body) && body[j+1] == qc {
+						j += 2
+						continue
+					}
+					break
+				}
+				j++
+			}
+			if j >= len(body) {
+				return whole
+			}
+			j++
+		} else {
+			for j < len(body) && !strings.ContainsRune(" \t\r\n", rune(body[j])) {
+				j++
+			}
+		}
+		keys = append(keys, name)
+		i = j
+	}
+	if len(keys) == 0 {
+		return whole
+	}
+	return keys
+}
+
+// remember keeps an ALTER SESSION statement that ran, to replay after a
+// reconnect. Statements are replayed in the order they last ran, and one
+// whose settings later statements all set again is dropped:
+// `set current_schema = A`, `= B`, `= A` replays as just A. So the list
+// holds at most one statement per setting, and needs no cap.
+func (s *session) remember(sql string) {
+	all := append(s.setup, setupStmt{sql: sql, keys: sessionKeys(sql)})
+	// From the newest back: a statement stays when it sets something no
+	// later statement sets again.
+	set := map[string]bool{}
+	keep := make([]bool, len(all))
+	for i := len(all) - 1; i >= 0; i-- {
+		for _, k := range all[i].keys {
+			if !set[k] {
+				keep[i] = true
+				set[k] = true
+			}
+		}
+	}
+	s.setup = s.setup[:0:0]
+	for i, x := range all {
+		if keep[i] {
+			s.setup = append(s.setup, x)
+		}
 	}
 }
 
@@ -231,7 +374,7 @@ func (s *session) reconnect(ctx context.Context) error {
 		return err
 	}
 	for _, q := range s.setup {
-		_, _ = s.conn.ExecContext(ctx, q)
+		_, _ = s.conn.ExecContext(ctx, q.sql)
 	}
 	return nil
 }
@@ -289,6 +432,14 @@ func (s *session) target(ctx context.Context) (q, error) {
 	}
 	s.tx = tx
 	return s.tx, nil
+}
+
+// endReadOnly rolls back and ends a read-only connection's transaction.
+func (s *session) endReadOnly() {
+	if s.tx != nil {
+		_ = s.tx.Rollback()
+		s.tx = nil
+	}
 }
 
 // outputSQL reads DBMS_OUTPUT lines, up to 8000 bytes per call (go-ora's
@@ -386,6 +537,10 @@ func dsn(r *request) (string, error) {
 // tnsLookup finds `alias = (DESCRIPTION=…)` in tnsnames.ora ($TNS_ADMIN,
 // $ORACLE_HOME/network/admin, ~/.oracle).
 func tnsLookup(alias string) (string, error) {
+	return tnsLookupIn(tnsDirs(), alias)
+}
+
+func tnsDirs() []string {
 	var dirs []string
 	if d := os.Getenv("TNS_ADMIN"); d != "" {
 		dirs = append(dirs, d)
@@ -396,19 +551,46 @@ func tnsLookup(alias string) (string, error) {
 	if h, err := os.UserHomeDir(); err == nil {
 		dirs = append(dirs, filepath.Join(h, ".oracle"))
 	}
+	return dirs
+}
+
+// maxIfileDepth bounds IFILE nesting (and a file that includes itself).
+const maxIfileDepth = 8
+
+func tnsLookupIn(dirs []string, alias string) (string, error) {
 	for _, d := range dirs {
-		b, err := os.ReadFile(filepath.Join(d, "tnsnames.ora"))
-		if err != nil {
-			continue
-		}
-		if desc, ok := findAlias(string(b), alias); ok {
+		if desc, ok := findAliasInFile(filepath.Join(d, "tnsnames.ora"), alias, 0); ok {
 			return desc, nil
 		}
 	}
 	return "", fmt.Errorf("TNS alias %q not found (looked for tnsnames.ora in TNS_ADMIN, ORACLE_HOME/network/admin, ~/.oracle)", alias)
 }
 
+// findAliasInFile reads a tnsnames.ora and the files its IFILE entries
+// name (relative to it), in order.
+func findAliasInFile(path, alias string, depth int) (string, bool) {
+	if depth > maxIfileDepth {
+		return "", false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	return findAliasWith(string(b), alias, func(inc string) (string, bool) {
+		if !filepath.IsAbs(inc) {
+			inc = filepath.Join(filepath.Dir(path), inc)
+		}
+		return findAliasInFile(inc, alias, depth+1)
+	})
+}
+
 func findAlias(text, alias string) (string, bool) {
+	return findAliasWith(text, alias, nil)
+}
+
+// findAliasWith finds `alias = (DESCRIPTION=…)`; an `IFILE = path` entry
+// is looked up with include (nil: skipped) where it stands.
+func findAliasWith(text, alias string, include func(string) (string, bool)) (string, bool) {
 	// Drop comments.
 	var b strings.Builder
 	for _, line := range strings.Split(text, "\n") {
@@ -432,7 +614,18 @@ func findAlias(text, alias string) (string, bool) {
 			j++
 		}
 		if j >= len(s) || s[j] != '(' {
-			i = j
+			// A value without parentheses (IFILE = /x/other.ora) ends
+			// with its line; the next entry starts after it.
+			end := strings.IndexByte(s[j:], '\n')
+			if end < 0 {
+				end = len(s) - j
+			}
+			if strings.EqualFold(lastLine(names), "IFILE") && include != nil {
+				if desc, ok := include(strings.Trim(strings.TrimSpace(s[j:j+end]), `"'`)); ok {
+					return desc, true
+				}
+			}
+			i = j + end
 			continue
 		}
 		depth, k := 0, j
@@ -446,7 +639,7 @@ func findAlias(text, alias string) (string, bool) {
 				}
 			}
 		}
-		for _, n := range strings.Split(names, ",") {
+		for _, n := range strings.Split(lastLine(names), ",") {
 			n = strings.TrimSpace(n)
 			if strings.EqualFold(n, alias) || strings.EqualFold(strings.SplitN(n, ".", 2)[0], alias) {
 				return s[j : k+1], true
@@ -455,6 +648,16 @@ func findAlias(text, alias string) (string, bool) {
 		i = k + 1
 	}
 	return "", false
+}
+
+// lastLine: an entry's names are on the line of its `=` (text before it
+// is the end of the last entry, e.g. a stray line).
+func lastLine(names string) string {
+	names = strings.TrimSpace(names)
+	if i := strings.LastIndexByte(names, '\n'); i >= 0 {
+		names = names[i+1:]
+	}
+	return strings.TrimSpace(names)
 }
 
 func (s *session) connect(ctx context.Context, r *request) error {
@@ -768,8 +971,14 @@ func (s *session) query(ctx context.Context, w *writer, r *request) error {
 		if err := rows.Scan(dests...); err != nil {
 			return err
 		}
+		start := len(e.b)
 		for i := range cols {
 			e.value(cols[i], dests[i])
+		}
+		// One frame holds a row: a larger one (LOBs read inline) is
+		// refused before it is sent, and the stream stays whole.
+		if len(e.b)-start > maxFrame-16 {
+			return fmt.Errorf("row %d is larger than %d MB (its LOB values are read whole): select the LOBs shorter (dbms_lob.substr) or fewer of them", total+1, maxFrame>>20)
 		}
 		n++
 		total++
@@ -950,6 +1159,11 @@ func main() {
 		running, cancel = r.ID, c
 		mu.Unlock()
 		err := s.handle(ctx, w, r)
+		// A read-only connection's transaction ends with its statement: a
+		// COMMIT inside a block ends READ ONLY, and what ran after it in
+		// the block, not committed, is rolled back now, not left holding
+		// locks until the next statement.
+		s.endReadOnly()
 		mu.Lock()
 		running, cancel = 0, nil
 		mu.Unlock()
