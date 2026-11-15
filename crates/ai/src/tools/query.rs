@@ -9,6 +9,36 @@ use crate::policy::{self, Decision, is_pii};
 use crate::resultsql;
 use crate::types::{AiError, Result};
 
+/// The connection's views as masking reads them, from the explorer cache: a
+/// view with its kept definition; one without is added to `opaque` (lower
+/// case `schema.name`), and one whose definition isn't tied to a version
+/// to `unversioned` (it may have changed: read again before masking).
+/// Tables aren't given (their rules match by name).
+fn view_catalog<'a>(
+    ws: &'a databrain_workspace::Workspace,
+    connection_id: &'a str,
+    opaque: &'a std::cell::RefCell<std::collections::HashSet<String>>,
+    unversioned: Option<&'a std::cell::RefCell<std::collections::HashSet<String>>>,
+) -> impl Fn(&[String]) -> Option<databrain_lineage::CatalogTable> + 'a {
+    move |parts: &[String]| {
+        let (schema, name) = ws.meta_get(connection_id, &parts.join(".")).ok().flatten()?;
+        if !ws.meta_is_view(connection_id, &schema, &name).unwrap_or(false) {
+            return None;
+        }
+        let full = format!("{schema}.{name}");
+        let view_sql = ws.meta_view_sql(connection_id, &schema, &name).ok().flatten();
+        if view_sql.is_none() {
+            opaque.borrow_mut().insert(full.to_ascii_lowercase());
+        } else if let Some(u) = unversioned
+            && !ws.meta_view_sql_versioned(connection_id, &schema, &name).unwrap_or(false)
+        {
+            u.borrow_mut().insert(full.to_ascii_lowercase());
+        }
+        let columns = ws.kn_column_names(connection_id, &schema, &name).ok().flatten().unwrap_or_default();
+        Some(databrain_lineage::CatalogTable { name: full, columns, view_sql })
+    }
+}
+
 impl ToolContext {
     pub(super) async fn run_query(&self, args: &Value) -> Result<ToolOutput> {
         let sql = arg(args, "sql")?.to_string();
@@ -95,6 +125,8 @@ impl ToolContext {
                         o.duration_ms,
                         r.id
                     ));
+                    // Views it reads: their definitions, so masking traces them.
+                    self.read_view_definitions(&r.id).await;
                     text.push_str(&self.summarize(&r.id)?);
                     display.push(json!({"index": o.index, "result": r, "duration_ms": o.duration_ms}));
                 }
@@ -229,7 +261,47 @@ impl ToolContext {
             Some(t) if t.starts_with("results.") => false,
             t => is_pii(pol, t.as_deref(), c),
         };
-        crate::pii::masked_columns(&o.sql, src.config.kind, columns, &rule_columns, &check)
+        let opaque = std::cell::RefCell::new(std::collections::HashSet::new());
+        let catalog = view_catalog(self.engine.workspace(), &o.connection_id, &opaque, None);
+        // A view whose definition isn't known hides where its columns come
+        // from: masked whole, when a rule names a table (a rule on a column
+        // alone already matches by name).
+        let table_rules = pol.pii_columns.iter().any(|p| crate::policy::name_parts(p).len() > 1);
+        let is_opaque = |t: &str| table_rules && opaque.borrow().contains(&t.to_ascii_lowercase());
+        crate::pii::masked_columns(&o.sql, src.config.kind, columns, &rule_columns, &check, &crate::pii::Views { catalog: &catalog, opaque: &is_opaque })
+    }
+
+    /// Read the definitions of the views the SQL of result `result_id` reads
+    /// (and the views those read, a few levels down) that aren't kept yet,
+    /// so masking traces them; at most a few seconds. Only when the source
+    /// connection has a PII rule naming a table.
+    pub(super) async fn read_view_definitions(&self, result_id: &str) {
+        let Some(o) = self.engine.outputs().by_result(result_id) else { return };
+        let ws = self.engine.workspace();
+        let Ok(src) = (if o.connection_id == self.profile.id { Ok(self.profile.clone()) } else { ws.get_connection(&o.connection_id) }) else { return };
+        if !src.config.kind.traits().language.is_sql() || !src.ai_policy.pii_columns.iter().any(|p| crate::policy::name_parts(p).len() > 1) {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut tried = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let opaque = std::cell::RefCell::new(std::collections::HashSet::new());
+            let unversioned = std::cell::RefCell::new(std::collections::HashSet::new());
+            databrain_lineage::analyze(&o.sql, src.config.kind, &view_catalog(ws, &o.connection_id, &opaque, Some(&unversioned)));
+            // Not kept, or kept without a version the database gives (a
+            // change wouldn't be seen): read now, once per view.
+            let missing: Vec<String> = opaque.into_inner().into_iter().chain(unversioned.into_inner()).filter(|v| tried.insert(v.clone())).collect();
+            if missing.is_empty() {
+                return;
+            }
+            for v in missing {
+                let Some((schema, name)) = ws.meta_get(&o.connection_id, &v).ok().flatten() else { continue };
+                let read = self.engine.object_ddl(&o.connection_id, &schema, &name, databrain_connector_core::ObjectKind::View);
+                if tokio::time::timeout_at(deadline, read).await.is_err() {
+                    return;
+                }
+            }
+        }
     }
 
     pub(super) fn summarize(&self, result_id: &str) -> Result<String> {
@@ -306,6 +378,7 @@ impl ToolContext {
     pub(super) async fn query_result(&self, args: &Value) -> Result<ToolOutput> {
         let id = self.resolve_result(arg(args, "result_id")?)?;
         let id = id.as_str();
+        self.read_view_definitions(id).await;
         let sql = arg(args, "sql")?;
         // Results of this conversation, the user's current/mentioned ones,
         // or any output the source connection lets the AI read. The source
@@ -456,6 +529,9 @@ impl ToolContext {
             return Err(AiError::Policy("reference outputs as results.<handle or name> (see list_outputs)".into()));
         }
         self.check_output_sources(&sql)?;
+        for o in &refs {
+            self.read_view_definitions(&o.result_id).await;
+        }
         // Local DuckDB, but still reads only.
         let results_conn = self.engine.results_connection().map_err(|e| AiError::Internal(e.message))?;
         if !policy::review_sql(&results_conn, &sql).kind.is_read() {
@@ -573,17 +649,21 @@ impl ToolContext {
         let rs = self.engine.results().get(&r.id).map_err(|e| AiError::Internal(e.to_string()))?;
         let page = rs.lock().page(&ViewSpec::default(), 0, n).map_err(|e| AiError::Internal(e.to_string()))?;
         let pol = self.policy().clone();
+        // A view sampled: masked through its definition too (a rule on the
+        // table it reads), not only by its own name.
+        self.read_view_definitions(&r.id).await;
+        let names: Vec<String> = r.columns.iter().map(|c| c.name.clone()).collect();
+        let traced = self.pii_mask(&r.id, &names, 0);
         let mut text = r.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join("\t");
         text.push('\n');
         for row in page.rows {
             text.push_str(
                 &row.iter()
                     .zip(&r.columns)
-                    .map(
-                        |(v, c)| {
-                            if is_pii(&pol, Some(&full), &c.name) { "***".into() } else { v.as_deref().map(|x| trunc(x, 60)).unwrap_or_else(|| "NULL".into()) }
-                        },
-                    )
+                    .zip(&traced)
+                    .map(|((v, c), &t)| {
+                        if t || is_pii(&pol, Some(&full), &c.name) { "***".into() } else { v.as_deref().map(|x| trunc(x, 60)).unwrap_or_else(|| "NULL".into()) }
+                    })
                     .collect::<Vec<_>>()
                     .join("\t"),
             );

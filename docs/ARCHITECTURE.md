@@ -373,7 +373,7 @@ Defined once in `specs()` in `crates/ai/src/tools.rs`, with hand-written JSON Sc
 | `save_query` | Save to saved queries | approval |
 | `get_editor`, `write_editor` | Read the editor; propose SQL as a diff (insert, replace selection, replace all, new tab) | the user accepts or rejects the diff |
 
-Only tables allowed by the connection's table access rules reach the model, and columns listed in `pii_columns` are masked (`pii.rs` follows aliases, expressions and `SELECT *`).
+Only tables allowed by the connection's table access rules reach the model, and columns listed in `pii_columns` are masked (`pii.rs` follows aliases, expressions and `SELECT *`, and views: a view's definition, kept in the explorer cache's `meta_views` with the view's version, is expanded by the lineage so a rule on `users.email` masks `v_users.contact`; the AI's query tools read the definitions of the views a result reads before masking it, again each time for databases that don't version views; a view whose definition isn't known, or a column a view gives that its definition doesn't explain, is masked).
 
 ### 13.4 Policy
 

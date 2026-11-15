@@ -811,6 +811,73 @@ impl Workspace {
         Ok(self.conn.lock().query_row("SELECT count(*) FROM meta_objects WHERE connection_id = ?1", [connection_id], |r| r.get(0))?)
     }
 
+    /// Whether `schema.name` is a view (or materialized view) as the cache lists it.
+    pub fn meta_is_view(&self, connection_id: &str, schema: &str, name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT 1 FROM meta_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3 AND kind IN ('view', 'materialized_view') LIMIT 1",
+                params![connection_id, schema, name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Keep a view's definition (its DDL as the database gives it), with the
+    /// view's current version.
+    pub fn meta_view_sql_put(&self, connection_id: &str, schema: &str, name: &str, sql: &str) -> Result<()> {
+        let c = self.conn.lock();
+        let version: Option<String> = c
+            .query_row(
+                "SELECT version FROM meta_objects WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3 AND kind IN ('view', 'materialized_view') LIMIT 1",
+                params![connection_id, schema, name],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        c.execute(
+            "INSERT INTO meta_views (connection_id, schema_name, name, sql, version, seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (connection_id, schema_name, name) DO UPDATE SET sql = excluded.sql, version = excluded.version, seen_at = excluded.seen_at",
+            params![connection_id, schema, name, sql, version, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a view's kept definition is tied to a version the database
+    /// gives (so a change is seen); false: none kept, or the database gives
+    /// no versions (read it again before trusting it).
+    pub fn meta_view_sql_versioned(&self, connection_id: &str, schema: &str, name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT 1 FROM meta_views WHERE connection_id = ?1 AND schema_name = ?2 AND name = ?3 AND version IS NOT NULL",
+                params![connection_id, schema, name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// A view's kept definition, while it is current: the view is still
+    /// listed, as a view, at the version it was read at (where the database
+    /// gives versions). `None`: not known.
+    pub fn meta_view_sql(&self, connection_id: &str, schema: &str, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT v.sql FROM meta_views v JOIN meta_objects o ON o.connection_id = v.connection_id AND o.schema_name = v.schema_name \
+                   AND o.name = v.name AND o.kind IN ('view', 'materialized_view') \
+                 WHERE v.connection_id = ?1 AND v.schema_name = ?2 AND v.name = ?3 AND v.version IS o.version LIMIT 1",
+                params![connection_id, schema, name],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn meta_clear(&self, connection_id: &str) -> Result<()> {
         // One transaction: all of it goes, or none (an error halfway left
         // the AI's tables pointing at a cache that was gone).
@@ -824,6 +891,7 @@ impl Workspace {
     pub(crate) fn meta_clear_tx(tx: &rusqlite::Transaction<'_>, connection_id: &str) -> Result<()> {
         tx.execute("DELETE FROM meta_objects WHERE connection_id = ?1", [connection_id])?;
         tx.execute("DELETE FROM meta_columns WHERE connection_id = ?1", [connection_id])?;
+        tx.execute("DELETE FROM meta_views WHERE connection_id = ?1", [connection_id])?;
         tx.execute("DELETE FROM meta_schemas WHERE connection_id = ?1", [connection_id])?;
         tx.execute("DELETE FROM meta_catalogs WHERE connection_id = ?1", [connection_id])?;
         tx.execute("UPDATE meta_conn_state SET catalogs_at = NULL, schemas_at = NULL, checked_at = NULL WHERE connection_id = ?1", [connection_id])?;
@@ -839,6 +907,34 @@ mod tests {
 
     fn o(schema: &str, name: &str, kind: ObjectKind) -> DbObject {
         DbObject { schema: schema.into(), name: name.into(), kind, comment: None, row_estimate: None }
+    }
+
+    /// A view's kept definition is given while it is current: still listed
+    /// as a view at the version it was read at; never for a table, a
+    /// changed or dropped view, or after the cache is cleared.
+    #[test]
+    fn view_definitions_are_kept_while_current() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let v = |x: &str| [("view:v".to_string(), x.to_string())].into_iter().collect::<HashMap<_, _>>();
+        ws.meta_put_listing("c", "s", &[o("s", "v", ObjectKind::View), o("s", "t", ObjectKind::Table)], Some(&v("1")), None).unwrap();
+        assert!(ws.meta_is_view("c", "s", "v").unwrap() && !ws.meta_is_view("c", "s", "t").unwrap());
+        assert_eq!(ws.meta_view_sql("c", "s", "v").unwrap(), None, "not read yet");
+        ws.meta_view_sql_put("c", "s", "v", "create view s.v as select a from s.t").unwrap();
+        assert_eq!(ws.meta_view_sql("c", "s", "v").unwrap().as_deref(), Some("create view s.v as select a from s.t"));
+        ws.meta_view_sql_put("c", "s", "t", "not a view").unwrap();
+        assert_eq!(ws.meta_view_sql("c", "s", "t").unwrap(), None, "a table has none");
+        // Changed since (another version): not given.
+        ws.meta_put_listing("c", "s", &[o("s", "v", ObjectKind::View)], Some(&v("2")), None).unwrap();
+        assert_eq!(ws.meta_view_sql("c", "s", "v").unwrap(), None);
+        // Read again, then dropped, then the cache cleared.
+        ws.meta_view_sql_put("c", "s", "v", "create view s.v as select b from s.t").unwrap();
+        assert!(ws.meta_view_sql("c", "s", "v").unwrap().is_some());
+        ws.meta_put_listing("c", "s", &[], Some(&HashMap::new()), None).unwrap();
+        assert_eq!(ws.meta_view_sql("c", "s", "v").unwrap(), None, "dropped");
+        ws.meta_put_listing("c", "s", &[o("s", "v", ObjectKind::View)], Some(&v("2")), None).unwrap();
+        assert!(ws.meta_view_sql("c", "s", "v").unwrap().is_some(), "listed again at the version it was read at");
+        ws.meta_clear("c").unwrap();
+        assert_eq!(ws.meta_view_sql("c", "s", "v").unwrap(), None);
     }
 
     /// A table whose name contains a dot is found by its quoted path, and

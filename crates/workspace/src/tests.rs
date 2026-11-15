@@ -153,11 +153,13 @@ fn schema_version_guard_and_backup() {
     assert!(e.to_string().contains("newer DataBrain"), "{e}");
     let v: i64 = Connection::open(&path).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
     assert_eq!(v as usize, MIGRATIONS.len() + 3);
-    // Older (one migration behind): backed up as it was, then updated.
+    // Older (two migrations behind: before v20's AI tables and v21's view
+    // definitions): backed up as it was, then updated.
     {
         let c = Connection::open(&path).unwrap();
-        c.pragma_update(None, "user_version", (MIGRATIONS.len() - 1) as i64).unwrap();
-        // Undo the last migration, as an older version left it: schema `s`
+        c.pragma_update(None, "user_version", (MIGRATIONS.len() - 2) as i64).unwrap();
+        c.execute_batch("DROP TABLE meta_views;").unwrap();
+        // Undo v20, as an older version left it: schema `s`
         // indexed in full (index scope `*`), `hr.teams` indexed on its own,
         // and `hr.salaries` only seen in the explorer.
         let cols = r#"[{"name":"id","data_type":"int","nullable":false,"is_primary_key":true}]"#;
@@ -194,7 +196,7 @@ fn schema_version_guard_and_backup() {
     let backup = dir.join(format!("workspace.db.bak-before-v{}", MIGRATIONS.len()));
     let b = Connection::open(&backup).unwrap();
     let bv: i64 = b.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(bv as usize, MIGRATIONS.len() - 1, "the backup is the workspace before the update");
+    assert_eq!(bv as usize, MIGRATIONS.len() - 2, "the backup is the workspace before the update");
     drop((ws, b));
     let _ = std::fs::remove_dir_all(&dir);
 }

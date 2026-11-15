@@ -4,6 +4,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Fixed
+
+- PII rules follow a table into the views over it: a rule on `customers.email` also masks a view's `email AS contact` (and a view of that view) for the assistant and MCP, in query results, result summaries, sample rows and queries over outputs. The view's definition is read before its rows go to the model (again each time where the database doesn't version views); a view whose definition can't be read is masked whole while the connection has PII rules on tables. Definitions read once are kept, so the Lineage tab traces views without asking the server again.
+
 ## 0.4.2 - 2026-11-15
 
 ### Added

@@ -437,6 +437,19 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     -- Object search rows are rebuilt from ai_objects.
     DELETE FROM kn_fts WHERE source = 'object';
     "#,
+    // v21: view definitions, so PII masking traces a view to the tables it
+    // reads (kept with the view's version; used only while it is current)
+    r#"
+    CREATE TABLE meta_views (
+        connection_id TEXT NOT NULL,
+        schema_name   TEXT NOT NULL,
+        name          TEXT NOT NULL,
+        sql           TEXT NOT NULL,
+        version       TEXT,
+        seen_at       INTEGER NOT NULL,
+        PRIMARY KEY (connection_id, schema_name, name)
+    );
+    "#,
 ];
 
 impl Workspace {

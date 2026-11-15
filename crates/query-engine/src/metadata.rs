@@ -162,12 +162,21 @@ impl QueryEngine {
 
     /// Full DDL of an object (`None`: not available for this engine/kind).
     pub async fn object_ddl(&self, connection_id: &str, schema: &str, name: &str, kind: databrain_connector_core::ObjectKind) -> Result<Option<String>> {
-        let (schema, name) = (schema.to_string(), name.to_string());
-        self.with_meta(connection_id, |s| {
-            let (schema, name) = (schema.clone(), name.clone());
-            async move { s.object_ddl(&schema, &name, kind).await }
-        })
-        .await
+        let (schema_s, name_s) = (schema.to_string(), name.to_string());
+        let ddl = self
+            .with_meta(connection_id, |s| {
+                let (schema, name) = (schema_s.clone(), name_s.clone());
+                async move { s.object_ddl(&schema, &name, kind).await }
+            })
+            .await?;
+        // A view's definition is kept: PII masking traces a view to the
+        // tables it reads through it.
+        if matches!(kind, databrain_connector_core::ObjectKind::View | databrain_connector_core::ObjectKind::MaterializedView)
+            && let Some(d) = ddl.as_deref().filter(|d| !d.trim().is_empty())
+        {
+            let _ = self.workspace().meta_view_sql_put(connection_id, schema, name, d);
+        }
+        Ok(ddl)
     }
 
     /// Functions/procedures of a package (Oracle).
