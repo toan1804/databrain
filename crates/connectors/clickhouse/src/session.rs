@@ -257,6 +257,59 @@ mod tests {
         }
     }
 
+    /// A fake server that answers every query with `body` (after the
+    /// sign-in check), ending the response normally: as ClickHouse before
+    /// 24.11 writes an exception into a result it already started.
+    fn whole_body_server(body: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                let mut req = Vec::new();
+                let mut b = [0u8; 4096];
+                loop {
+                    let n = c.read(&mut b).unwrap();
+                    req.extend_from_slice(&b[..n]);
+                    let text = String::from_utf8_lossy(&req).to_lowercase();
+                    let Some(end) = text.find("\r\n\r\n") else { continue };
+                    let len = text.lines().find_map(|l| l.strip_prefix("content-length:")).map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                    if n == 0 || req.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+                let body = if String::from_utf8_lossy(&req).contains("currentDatabase()") { "currentDatabase()\nString\ndefault\n" } else { body };
+                let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        port
+    }
+
+    /// One column: the exception line has as many fields as a row. It is
+    /// the error when the result ends after it; a value that only reads
+    /// like one (more rows follow) stays a row.
+    #[tokio::test]
+    async fn an_exception_in_a_one_column_result_is_an_error() {
+        use databrain_auth::InlineCredentialSource;
+        let run = |body: &'static str| async move {
+            let port = whole_body_server(body);
+            let mut cfg = ConnectionConfig::new(ConnectorKind::Clickhouse, AuthMethod::Password { user: "default".into() });
+            cfg.host = Some("127.0.0.1".into());
+            cfg.port = Some(port);
+            let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user: "default".into() }, Some(secrecy::SecretString::from("pw"))));
+            let s = ClickhouseConnector.connect(&cfg, creds).await.unwrap();
+            s.execute(databrain_connector_core::Statement::internal("SELECT x"), ExecOptions::default()).await.unwrap().collect().await
+        };
+        let e = run("x\nString\na\nb\nCode: 395. DB::Exception: Value passed to 'throwIf' function is non-zero: boom. (FUNCTION_THROW_IF_VALUE_IS_NON_ZERO) (version 24.3.1.1)\n")
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("boom"), "{e:?}");
+        let r = run("x\nString\nCode: 1. DB::Exception: just text\nb\n").await.unwrap();
+        assert_eq!(r.num_rows(), 2, "a value like an exception, then another row");
+        let r = run("x\nString\nCode: 1 is not an exception\n").await.unwrap();
+        assert_eq!(r.num_rows(), 1);
+    }
+
     /// Live test: set DATABRAIN_CLICKHOUSE_HOST (+ _PORT, _USER, _PASSWORD).
     #[ignore = "live: needs DATABRAIN_CLICKHOUSE_HOST (cargo test -- --ignored)"]
     #[tokio::test]
