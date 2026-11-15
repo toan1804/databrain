@@ -32,6 +32,8 @@ export function NodeCard({
   onContextMenu: (e: React.MouseEvent) => void;
 }) {
   const conn = useStore((s) => s.connections.find((c) => c.id === node.connection_id));
+  // A connection set on the step and no longer saved (once the list is known).
+  const connGone = useStore((s) => s.connections.length > 0 && !!node.connection_id && !s.connections.some((c) => c.id === node.connection_id));
   const target = useStore((s) => s.connections.find((c) => c.id === node.target_connection_id));
   const tone =
     status?.status === "error" ? "border-danger/70" : status?.status === "running" ? "border-accent" : status?.status === "success" ? "border-success/60" : "border-line";
@@ -68,6 +70,8 @@ export function NodeCard({
             DuckDB → {target?.name ?? "choose a connection"}
             {node.target_table ? `.${node.target_table}` : ""}
           </span>
+        ) : node.kind === "query" && connGone ? (
+          <span className="truncate text-danger">Connection deleted: choose one</span>
         ) : conn && !isResults(conn) ? (
           <>
             <ConnDot color={conn.color} />

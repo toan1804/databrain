@@ -79,6 +79,8 @@ export function NodePanel({
   const nameProblem = localProblem ?? (remote?.name === name && remote.user ? `results.${name} is already used by ${remote.user}` : null);
   const results = connections.find(isResults);
   const runsOn = node.kind !== "query" || !node.connection_id ? results : connections.find((c) => c.id === node.connection_id);
+  // Set to a connection that was deleted since: said so, not shown as Results (where it doesn't run).
+  const connGone = node.kind === "query" && !!node.connection_id && connections.length > 0 && !runsOn;
   const others = connections.filter((c) => !isResults(c));
   const mentions = (u: JobNode) => new RegExp(`\\bresults\\s*\\.\\s*"?${u.name}"?\\b`, "i").test(node.sql);
 
@@ -94,7 +96,17 @@ export function NodePanel({
             className={`${field} font-mono ${nameProblem ? "border-danger" : ""}`}
             value={name}
             onChange={(e) => setName(e.target.value)}
-            onBlur={() => nameProblem && setName(node.name)}
+            onBlur={() => {
+              if (nameProblem) return setName(node.name);
+              // Leaving the field (another step clicked): the new name is kept
+              // now, not only after the check's pause, which leaving would cancel.
+              if (!localProblem && name !== node.name) {
+                void api
+                  .outputNameUser(name, job.id)
+                  .then((user) => !user && rename(name))
+                  .catch(() => {});
+              }
+            }}
           />
           {nameProblem ? (
             <div className="mt-0.5 text-[11px] text-danger">{nameProblem}. Kept: {node.name}</div>
@@ -180,7 +192,17 @@ export function NodePanel({
             <label className={label} htmlFor={`conn-${node.id}`}>
               Connection
             </label>
-            <select id={`conn-${node.id}`} className={field} value={runsOn && runsOn !== results ? runsOn.id : ""} onChange={(e) => onChange({ connection_id: e.target.value || null })}>
+            <select
+              id={`conn-${node.id}`}
+              className={`${field} ${connGone ? "border-danger" : ""}`}
+              value={connGone ? "__gone" : runsOn && runsOn !== results ? runsOn.id : ""}
+              onChange={(e) => e.target.value !== "__gone" && onChange({ connection_id: e.target.value || null })}
+            >
+              {connGone && (
+                <option value="__gone" disabled>
+                  Deleted connection: choose one
+                </option>
+              )}
               <option value="">Results (DuckDB) · reads other steps</option>
               {others.map((c) => (
                 <option key={c.id} value={c.id}>

@@ -73,7 +73,10 @@ export function LoadIntoDialog({
   const args = { target_connection_id: target, table, mode, key_columns: keyed ? keys : [], create_table: create, confirmed: false, every_row: streaming };
   const targetCheck = useLoadTarget(target, table);
   const blocked = loadTargetBlocked(targetCheck, mode, create);
-  const ready = !!target && !!table.trim() && (!keyed || keys.length > 0) && !blocked;
+  // Not while the table is being checked: what it says (it exists and is
+  // dropped, or its columns don't fit) is what the user loads on.
+  const checking = targetCheck.status === "checking";
+  const ready = !!target && !!table.trim() && (!keyed || keys.length > 0) && !blocked && !checking;
   // A dry run is about the settings it was made with.
   const keyList = keys.join(",");
   useEffect(() => setDry({ busy: false }), [target, table, mode, keyList, create]);
@@ -144,7 +147,7 @@ export function LoadIntoDialog({
             <button className="btn-ghost" onClick={onClose}>
               Cancel
             </button>
-            <button className="btn-primary" disabled={!ready} onClick={() => void load()}>
+            <button className="btn-primary" disabled={!ready} title={checking ? "Checking the table first…" : undefined} onClick={() => void load()}>
               <Upload size={13} /> {streaming ? "Load every row" : `Load ${formatCount(info.total_rows)} rows`}
             </button>
           </>

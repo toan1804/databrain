@@ -29,7 +29,10 @@ export function uniqueName(nodes: JobNode[], base: string, except?: string, take
   if (/^r\d+$/i.test(clean)) clean += "_out";
   const used = new Set([...nodes.filter((n) => n.id !== except).map((n) => n.name.toLowerCase()), ...[...taken].map((t) => t.toLowerCase())]);
   if (!used.has(clean.toLowerCase())) return clean;
-  for (let i = 2; ; i++) if (!used.has(`${clean}_${i}`.toLowerCase())) return `${clean}_${i}`;
+  // `sales_` + `_2` would be `sales__2`, which reads as version 2 of `sales`
+  // (and the editor refuses it): the suffix goes on the name without its trailing `_`.
+  const stem = clean.replace(/_+$/, "") || "step";
+  for (let i = 2; ; i++) if (!used.has(`${stem}_${i}`.toLowerCase())) return `${stem}_${i}`;
 }
 
 export const upstreamOf = (job: Job, id: string) => job.edges.filter((e) => e.to === id).map((e) => e.from);

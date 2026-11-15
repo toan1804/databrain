@@ -61,8 +61,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
       })
       .catch((e) => setLoadError(toError(e).message));
     // Changed elsewhere (the assistant's update_job): show the saved version.
-    const onChanged = (ev: Event) => {
-      if ((ev as CustomEvent<{ id: string }>).detail?.id !== jobId) return;
+    const showSaved = () => {
       clearTimeout(timer.current);
       dirty.current = false;
       void api
@@ -73,6 +72,23 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
           setSave({ state: "saved" });
         })
         .catch(() => {});
+    };
+    const onChanged = (ev: Event) => {
+      if ((ev as CustomEvent<{ id: string }>).detail?.id !== jobId) return;
+      if (!dirty.current) return showSaved();
+      // Edits here not saved yet (the last moment's, or a save that failed):
+      // the user chooses, rather than losing them without a word.
+      clearTimeout(timer.current);
+      useStore.getState().askConfirm({
+        title: "The assistant changed this job",
+        reasons: [
+          "You have changes to it that are not saved yet.",
+          "Show the assistant's version: your unsaved changes are lost. Keep mine: yours are saved, over the assistant's change.",
+        ],
+        confirmLabel: "Show the assistant's version",
+        onConfirm: showSaved,
+        onCancel: () => void persistRef.current(),
+      });
     };
     window.addEventListener("db:job-changed", onChanged);
     return () => window.removeEventListener("db:job-changed", onChanged);
@@ -90,10 +106,14 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
       void useJobs.getState().refresh().catch(() => {});
       return true;
     } catch (e) {
+      // Still not saved: a change from elsewhere must not drop it, and closing the tab tries again.
+      if (latest.current === j) dirty.current = true;
       setSave({ state: "error", message: toError(e).message });
       return false;
     }
   }, []);
+  const persistRef = useRef(persist);
+  persistRef.current = persist;
 
   /** Change the job locally and save it shortly after. */
   const update = useCallback(

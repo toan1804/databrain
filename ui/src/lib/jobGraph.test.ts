@@ -67,6 +67,13 @@ describe("job graph", () => {
     expect(uniqueName(j.nodes, "orders")).toBe("orders_2");
     expect(uniqueName(j.nodes, "Query 1")).toBe("Query_1");
     expect(uniqueName(j.nodes, "1st")).toBe("_1st");
+    // A taken name ending in `_` gets a suffix the editor accepts, never `__`.
+    for (const base of ["sales_", "sales__", "Sales!", `${"a".repeat(55)}_x`]) {
+      const name = uniqueName([], base, undefined, [uniqueName([], base)]);
+      expect(nameProblem(name), `${base} → ${name}`).toBeNull();
+      expect(name.includes("__")).toBe(false);
+    }
+    expect(uniqueName([], "sales_", undefined, ["sales_"])).toBe("sales_2");
     const r = removeNode(j, "c");
     expect(r.edges).toEqual([]);
     const w = job([n("a", "orders"), n("b", "x", "select * from results.orders o join results.missing m")]);

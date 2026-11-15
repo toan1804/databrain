@@ -11,6 +11,8 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- Jobs: when the assistant changes a job open with changes not saved yet (or a save that failed), you choose which version stays (yours were dropped without a word). A step renamed and left at once (another step clicked) keeps its new name. A query step whose connection was deleted says so, instead of showing "Results (DuckDB)". A step name made unique (`sales_` taken) no longer becomes `sales__2`, which reads as a version and which the editor refuses.
+- "Load into…" waits for the check of the target table before Load can be pressed, so "exists: it is dropped…" is seen first.
 - The assistant: Stop works while a question is still starting (it stops once the run is known), and ends a conversation whose run the app no longer knows, which stayed "running" for good with every new question only queued. A question asked while the assistant works is sent later about the editor it was asked from, not the one in front then. A History conversation opened into an empty chat no longer inherits that chat's Auto-approve.
 - Knowledge no longer shows the previous connection's notes after switching, so a note can't be approved under the wrong connection. Notes merged with "AI merge" are given to the assistant as data to merge, marked as such, never as part of its instructions. Deleting a conversation asks first.
 - After saving edited rows, only that result is read again: the script's other results stay (they disappeared, and an error in the re-read pointed at the start of the editor). The new result keeps its statement's place.
