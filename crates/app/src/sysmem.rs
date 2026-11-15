@@ -68,21 +68,32 @@ mod imp {
         (rc == 0).then_some(v)
     }
 
-    /// Free and inactive pages (inactive ones are reclaimed first, as
-    /// Activity Monitor's "available" counts them).
+    /// The host port, taken once: each `mach_host_self` adds a reference
+    /// to the port that is never given back, and memory is read every few
+    /// hundred milliseconds while rows load.
+    fn host() -> libc::mach_port_t {
+        static HOST: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+        // SAFETY: returns this task's send right to the host port.
+        #[allow(deprecated)] // libc points to the `mach2` crate: one call doesn't warrant a dependency.
+        *HOST.get_or_init(|| unsafe { libc::mach_host_self() })
+    }
+
+    /// Pages the system can hand out without paging anything out: free,
+    /// speculative (read ahead, not used yet), inactive (reclaimed first)
+    /// and purgeable (an app gave them back to be dropped), as Activity
+    /// Monitor counts what is available.
     pub fn available() -> Option<u64> {
         // SAFETY: zeroed POD struct filled by the kernel; `count` is its size in integers.
         let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
         let mut count = libc::HOST_VM_INFO64_COUNT;
-        #[allow(deprecated)] // libc points to the `mach2` crate: one call doesn't warrant a dependency.
-        let host = unsafe { libc::mach_host_self() };
-        let rc = unsafe { libc::host_statistics64(host, libc::HOST_VM_INFO64, (&mut stats as *mut libc::vm_statistics64).cast(), &mut count) };
+        let rc = unsafe { libc::host_statistics64(host(), libc::HOST_VM_INFO64, (&mut stats as *mut libc::vm_statistics64).cast(), &mut count) };
         if rc != 0 {
             return None;
         }
         // SAFETY: plain sysconf query.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        (page > 0).then(|| (stats.free_count as u64 + stats.inactive_count as u64) * page as u64)
+        let pages = stats.free_count as u64 + stats.speculative_count as u64 + stats.inactive_count as u64 + stats.purgeable_count as u64;
+        (page > 0).then(|| pages * page as u64)
     }
 }
 
@@ -151,6 +162,17 @@ fn meminfo_value(text: &str, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_host_port_is_taken_once() {
+        // Reading memory often (as loading rows does) takes no new port reference.
+        let a = super::imp::available().expect("available");
+        for _ in 0..1000 {
+            assert!(super::imp::available().is_some());
+        }
+        assert!(a <= super::total().unwrap());
+    }
 
     #[test]
     fn reads_this_computer() {
