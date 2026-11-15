@@ -17,7 +17,6 @@ use databrain_connector_core::StreamEvent;
 use databrain_connector_core::StreamSender;
 use databrain_connector_core::value::Column;
 use mysql_async::Conn;
-use mysql_async::Opts;
 use mysql_async::consts::StatusFlags;
 use mysql_async::prelude::*;
 use std::sync::Arc;
@@ -32,7 +31,7 @@ pub(crate) struct Ctx {
     pub(crate) conn: Arc<Mutex<Conn>>,
     /// Thread id of the current connection (for KILL).
     pub(crate) conn_id: Arc<AtomicU32>,
-    pub(crate) opts: Opts,
+    pub(crate) opener: Arc<crate::config::Opener>,
     pub(crate) state: Arc<ConnState>,
     /// Set once the statement no longer needs the server: a late cancel must
     /// not KILL whatever runs next on the connection.
@@ -140,7 +139,7 @@ async fn run_statement(ctx: &Ctx, sql: String, opts: ExecOptions, tx: StreamSend
         if !replaced {
             // Keep the connection (transaction, settings): stop the
             // statement on the server, then read what is left.
-            MysqlSession::kill_query(ctx.opts.clone(), ctx.conn_id.load(Ordering::SeqCst)).await;
+            MysqlSession::kill_query(&ctx.opener, ctx.conn_id.load(Ordering::SeqCst)).await;
             settle_kill(&mut guard).await;
         }
     } else {
@@ -187,7 +186,7 @@ pub(crate) fn stuck_cancel(replaced: bool) -> ConnectorError {
 /// connection: no extra login). False when no new connection could be
 /// opened; `conn` is then unchanged.
 pub(crate) async fn replace_conn(ctx: &Ctx, conn: &mut Conn) -> bool {
-    let Ok(Ok(mut fresh)) = tokio::time::timeout(Duration::from_secs(5), Conn::new(ctx.opts.clone())).await else {
+    let Some(mut fresh) = ctx.opener.open(Duration::from_secs(5)).await else {
         return false;
     };
     let old_id = conn.id();
