@@ -1,7 +1,6 @@
 //! The SQL Server session: connection handling, query execution and schema introspection.
 
 use crate::config::Conn;
-use crate::config::open;
 use crate::error::map_err;
 use crate::exec::Ended;
 use crate::exec::run;
@@ -33,12 +32,12 @@ use databrain_connector_core::StreamEvent;
 use databrain_connector_core::TableColumns;
 use databrain_connector_core::quote_ident;
 use std::sync::Arc;
-use tiberius::Config;
 use tokio::sync::Mutex;
 
 pub struct MssqlSession {
-    pub(crate) config: Config,
-    pub(crate) use_browser: bool,
+    /// Opens a connection (the first, and after a lost or replaced one) with
+    /// a credential asked for then.
+    pub(crate) opener: Arc<crate::config::Opener>,
     pub(crate) conn: Arc<Mutex<Option<Conn>>>,
     /// What the connection carries (transactions, SET, #temp tables).
     pub(crate) state: Arc<databrain_connector_core::ConnState>,
@@ -72,7 +71,7 @@ impl MssqlSession {
     pub(crate) async fn with_conn<T>(&self, f: impl for<'c> FnOnce(&'c mut Conn) -> futures::future::BoxFuture<'c, Result<T>>) -> Result<T> {
         let mut g = self.conn.lock().await;
         if g.is_none() {
-            *g = Some(open(&self.config, self.use_browser).await?);
+            *g = Some(self.opener.open().await?);
             self.state.reset();
         }
         let r = f(g.as_mut().expect("connected")).await;
@@ -224,12 +223,12 @@ impl Session for MssqlSession {
         let conn = self.conn.clone();
         let state = self.state.clone();
         let user_rowcount = self.user_rowcount.clone();
-        let (config, browser) = (self.config.clone(), self.use_browser);
+        let opener = self.opener.clone();
         let sql = sql.to_string();
         tokio::spawn(async move {
             let mut g = conn.lock().await;
             if g.is_none() {
-                match open(&config, browser).await {
+                match opener.open().await {
                     Ok(c) => {
                         *g = Some(c);
                         state.reset();

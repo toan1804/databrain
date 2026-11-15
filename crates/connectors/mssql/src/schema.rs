@@ -316,8 +316,11 @@ mod tests {
         assert_eq!(b.matches("begin try exec").count(), 2);
         assert!(b.contains("[b].sys.sp_executesql"));
         let s = MssqlSession {
-            config: Config::new(),
-            use_browser: false,
+            opener: Arc::new(crate::config::Opener {
+                config: Config::new(),
+                use_browser: false,
+                creds: Arc::new(databrain_auth::InlineCredentialSource::new(databrain_auth::AuthMethod::None, None)),
+            }),
             conn: Arc::new(Mutex::new(None)),
             state: Default::default(),
             user_rowcount: Default::default(),
