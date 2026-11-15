@@ -186,8 +186,16 @@ function ApprovalCard({
   onRespond: (id: string, approved: boolean, sql?: string) => void;
 }) {
   const initialSql = typeof item.detail.sql === "string" ? item.detail.sql : undefined;
-  const [sql, setSql] = useState(initialSql ?? "");
+  // Kept on the item, not here: it survives leaving the chat view, and an
+  // automatic approval sends it too.
+  const setApprovalSql = useAi((s) => s.setApprovalSql);
+  const sql = item.editedSql ?? initialSql ?? "";
   const pending = item.state === "pending";
+  // Where it runs: named on the card (the picker beside the chat follows the tab in front).
+  const connName = typeof item.detail.connection === "string" ? item.detail.connection : undefined;
+  const conn = useStore((s) => (connName ? s.connections.find((c) => c.name === connName) : undefined));
+  const kind = typeof item.detail.kind === "string" ? item.detail.kind : undefined;
+  const lines = sql.split("\n").length;
   return (
     <div className={`rounded-lg border p-2 text-[12.5px] ${pending ? "border-warning/50 bg-warning/5" : "border-line"}`}>
       <div className="mb-1 flex items-center gap-1.5 font-medium">
@@ -199,15 +207,29 @@ function ApprovalCard({
           </span>
         )}
       </div>
+      {(connName || kind) && (
+        <div className="mb-1 flex flex-wrap items-center gap-1 text-[11px]">
+          {connName && <span className="rounded border border-line px-1 py-px">on “{connName}”</span>}
+          {conn?.env === "prod" && <span className="rounded border border-danger/60 bg-danger/10 px-1 py-px font-medium text-danger">PRODUCTION</span>}
+          {conn?.config.read_only && <span className="rounded border border-line px-1 py-px text-muted">read-only</span>}
+          {kind && kind !== "read" && <span className="rounded border border-warning/60 bg-warning/10 px-1 py-px text-warning">{kind === "dml" ? "changes data" : kind === "ddl" ? "changes the schema" : `not a plain read (${kind})`}</span>}
+        </div>
+      )}
       <div className="mb-1.5 text-[11.5px] text-muted">{item.summary}</div>
       {initialSql !== undefined &&
         (pending ? (
-          <textarea
-            className="field min-h-[70px] font-mono text-[11.5px]"
-            value={sql}
-            aria-label="SQL to run (editable)"
-            onChange={(e) => setSql(e.target.value)}
-          />
+          <>
+            <textarea
+              className="field font-mono text-[11.5px]"
+              // The whole statement in view (up to 24 lines), not a four-line window onto it.
+              rows={Math.min(Math.max(lines, 3), 24)}
+              value={sql}
+              aria-label="SQL to run (editable)"
+              spellCheck={false}
+              onChange={(e) => setApprovalSql(item.id, e.target.value)}
+            />
+            {lines > 24 && <div className="mt-0.5 text-[11px] text-warning">{lines} lines: scroll the box to read all of it before allowing.</div>}
+          </>
         ) : (
           <pre className="whitespace-pre-wrap font-mono text-[11.5px] select-text">{sql}</pre>
         ))}
@@ -281,10 +303,10 @@ function EditCard({ item, onRespond }: { item: Extract<ChatItem, { kind: "edit" 
           )}
           {pending && (
             <>
-              <button className="btn-ghost py-1" onClick={() => onRespond(item.id, false)}>
+              <button className="btn-ghost py-1" onClick={() => onRespond(item.id, false)} disabled={item.sending}>
                 Reject
               </button>
-              <button className="btn-primary py-1" onClick={() => onRespond(item.id, true)}>
+              <button className="btn-primary py-1" onClick={() => onRespond(item.id, true)} disabled={item.sending}>
                 <Check size={12} /> Accept
               </button>
             </>

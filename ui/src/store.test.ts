@@ -312,3 +312,28 @@ describe("notebook cell runs", () => {
     expect(Object.keys(st().runs)).toEqual(["t"]);
   });
 });
+
+describe("Run all", () => {
+  it("runs the whole script, whatever is selected", async () => {
+    const sent: string[] = [];
+    const { api } = await import("./lib/api");
+    const real = api.runQuery;
+    (api as { runQuery: typeof api.runQuery }).runQuery = async (req) => {
+      sent.push(req.sql);
+      return real(req);
+    };
+    try {
+      const conn = { id: "conn", name: "c", env: "none", config: { kind: "postgres", read_only: false } };
+      useStore.setState({ connections: [conn as never], tabs: [{ id: "t1", title: "q", sql: "", connection_id: "conn" } as never], activeTabId: "t1", runs: {} });
+      const doc = "delete from t\nwhere id = 1";
+      // `delete from t` is selected; Run all must not run it without its WHERE.
+      await useStore.getState().runTab("t1", "all", { doc, selFrom: 0, selTo: 13, cursor: 13 });
+      expect(sent).toEqual([doc]);
+      // Run (the statement or the selection) still runs the selection.
+      await useStore.getState().runTab("t1", "statement", { doc, selFrom: 0, selTo: 13, cursor: 13 });
+      expect(sent[1]).toBe("delete from t");
+    } finally {
+      (api as { runQuery: typeof api.runQuery }).runQuery = real;
+    }
+  });
+});

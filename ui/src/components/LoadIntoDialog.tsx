@@ -48,7 +48,10 @@ export function LoadIntoDialog({
   const connections = useStore((s) => s.connections);
   const writable = useMemo(() => connections.filter((c) => !c.config.read_only), [connections]);
   const generated = testDataTable(sql) !== null;
-  const [target, setTarget] = useState((generated && writable.find((c) => c.id === connectionId)?.id) || (writable[0]?.id ?? ""));
+  // The connection the rows came from when it can be written to; with one
+  // writable connection, that one; otherwise none, for the user to choose
+  // (the first in the list is nobody's choice).
+  const [target, setTarget] = useState(writable.find((c) => c.id === connectionId)?.id ?? (writable.length === 1 ? writable[0].id : ""));
   const [table, setTable] = useState(() => suggestTable(sql, outputName));
   const [mode, setMode] = useState<LoadMode>("append");
   const [keys, setKeys] = useState<string[]>([]);
@@ -182,6 +185,7 @@ export function LoadIntoDialog({
               <span className="block text-[11.5px] font-medium text-muted">Into connection</span>
               <select className="field" value={target} onChange={(e) => setTarget(e.target.value)}>
                 {writable.length === 0 && <option value="">No connection allows writes</option>}
+                {writable.length > 0 && target === "" && <option value="">Choose a connection…</option>}
                 {writable.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.name}

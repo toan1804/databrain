@@ -217,13 +217,21 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
 
     let sql: string;
     let base = 0;
-    if (input.selTo > input.selFrom) {
+    if (mode === "all") {
+      // Run all is the whole script, whatever is selected: a selected
+      // `DELETE FROM t` must not run without the WHERE on its next line.
+      sql = input.doc;
+    } else if (input.selTo > input.selFrom) {
       sql = input.doc.slice(input.selFrom, input.selTo);
       base = input.selFrom;
-    } else if (mode === "all") {
-      sql = input.doc;
     } else {
-      const span = await api.statementAtCursor(conn.config.kind, input.doc, input.cursor);
+      let span: Awaited<ReturnType<typeof api.statementAtCursor>>;
+      try {
+        span = await api.statementAtCursor(conn.config.kind, input.doc, input.cursor);
+      } catch (e) {
+        s.toast(toError(e).message, "error");
+        return;
+      }
       if (!span) {
         s.toast("Nothing to run", "info");
         return;

@@ -83,8 +83,19 @@ const EXPR_KEYWORDS = new Set(["select", "where", "on", "and", "or", "by", "havi
 
 // ------------------------------------------------------------------ lexing
 
-/** Replace strings and comments with spaces (offsets preserved). */
-export function blankLiterals(sql: string): string {
+/** Whether this database reads `\` as an escape inside `'…'` (MySQL, BigQuery, ClickHouse…). */
+export function backslashEscapes(kind: ConnectorKind): boolean {
+  return (traitsOf(kind) as unknown as { syntax?: { backslash_escapes?: boolean } }).syntax?.backslash_escapes === true;
+}
+
+/**
+ * Replace strings and comments with spaces (offsets preserved). Quoted
+ * names (`"it's"`, `` `x` ``) are kept as they are, so an apostrophe in one
+ * doesn't open a string. `backslash`: `\'` doesn't end a string (see
+ * {@link backslashEscapes}); without it `'O\'Brien'` would close early and
+ * the rest of the script would read as one unclosed string.
+ */
+export function blankLiterals(sql: string, backslash = false): string {
   let out = "";
   let i = 0;
   while (i < sql.length) {
@@ -102,9 +113,16 @@ export function blankLiterals(sql: string): string {
       i = end;
     } else if (c === "'") {
       let j = i + 1;
-      while (j < sql.length && !(sql[j] === "'" && sql[j + 1] !== "'")) j += sql[j] === "'" ? 2 : 1;
+      while (j < sql.length && !(sql[j] === "'" && sql[j + 1] !== "'")) j += sql[j] === "'" || (backslash && sql[j] === "\\") ? 2 : 1;
       const end = Math.min(sql.length, j + 1);
       out += " ".repeat(end - i);
+      i = end;
+    } else if (c === '"' || c === "`") {
+      // A quoted name: kept, up to its closing quote (a doubled one is part of it).
+      let j = i + 1;
+      while (j < sql.length && !(sql[j] === c && sql[j + 1] !== c)) j += sql[j] === c ? 2 : 1;
+      const end = Math.min(sql.length, j + 1);
+      out += sql.slice(i, end);
       i = end;
     } else {
       out += c;
@@ -491,7 +509,7 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
   // Read the schema list once per request (it is consulted per table option).
   const schemaList = provider.schemas();
   const p: MetaProvider = { ...provider, schemas: () => schemaList };
-  const clean = blankLiterals(doc);
+  const clean = blankLiterals(doc, backslashEscapes(provider.kind));
   // Inside a string or comment: no completion.
   if (clean[pos - 1] === " " && doc[pos - 1] !== " " && doc[pos - 1] !== "\n" && doc[pos - 1] !== "\t") return null;
   const [s0] = statementBounds(clean, pos);
@@ -635,7 +653,9 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
       const r = refs[i];
       opts.push({ label: r.alias ?? r.parts[r.parts.length - 1], type: "alias", detail: r.alias ? r.parts.join(".") : "table", apply: `${quoteIdent(k, r.alias ?? r.parts[r.parts.length - 1])}.`, reopen: true, boost: 4 });
     });
-    opts.push(...kw(fns, typed, 2, "function").map((f) => ({ ...f, apply: `${f.label}(` })));
+    // ClickHouse function names are case-sensitive (`toDate`, `countIf`): inserted as they are written, whatever case was typed.
+    const fnOptions = k === "clickhouse" ? fns.map((w): SqlOption => ({ label: w, type: "function", boost: 2 })) : kw(fns, typed, 2, "function");
+    opts.push(...fnOptions.map((f) => ({ ...f, apply: `${f.label}(` })));
     // The connection's own functions and packages (procedures can't be used in SQL).
     if (typed.length >= 1 && p.routines) {
       for (const o of await p.routines(null, typed)) if (o.kind !== "procedure") opts.push(routineOption(p, o, routineApply(p, o), 1));

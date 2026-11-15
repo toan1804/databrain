@@ -176,7 +176,14 @@ export const createUiSlice: StateCreator<State, [], [], UiSlice> = (set, get) =>
   setSidebarPanel: (sidebarPanel) => set({ sidebarPanel }),
   setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
   setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
-  askConfirm: (confirm) => set({ confirm }),
+  // One dialog at a time: the one it replaces is answered "no", so whoever
+  // waits for it goes on (and a click meant for it can't land on the new one's button unanswered).
+  askConfirm: (confirm) => {
+    const waiting = get().confirm;
+    set({ confirm });
+    // (`null` closes the dialog after its own answer: nothing left to cancel.)
+    if (confirm && waiting && waiting !== confirm) waiting.onCancel?.();
+  },
   openCompareDialog: (compareDialog) => set({ compareDialog }),
   openTestDataDialog: (testDataDialog) => set({ testDataDialog }),
 });

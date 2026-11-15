@@ -27,8 +27,9 @@ pub(crate) async fn apply_edits(
     state: State<'_, AppState>,
     result_id: String,
     changes: Vec<databrain_query_engine::edit::RowChange>,
+    confirmed: Option<bool>,
 ) -> R<databrain_query_engine::edit::ApplyReport> {
-    api::apply_edits(&state, &result_id, changes).await
+    api::apply_edits_confirmed(&state, &result_id, changes, confirmed.unwrap_or(false)).await
 }
 
 #[tauri::command]

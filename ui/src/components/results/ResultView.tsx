@@ -101,6 +101,13 @@ export function ResultView({
   const [edits, setEdits] = useState<PendingEdits>(emptyEdits);
   const [preview, setPreview] = useState<EditStatement[] | null>(null);
   const [saving, setSaving] = useState(false);
+  /** A save is on its way: the grid takes no edits meanwhile (they would be cleared with the saved ones, unsent). */
+  const savingRef = useRef(false);
+  const onEdits = useCallback((next: PendingEdits) => {
+    if (!savingRef.current) setEdits(next);
+  }, []);
+  // The same object while nothing changed: the grid's effects depend on it.
+  const gridEdit = useMemo(() => (target ? { target, edits, onEdits } : null), [target, edits, onEdits]);
   useEffect(() => {
     setTarget(null);
     setEdits(emptyEdits());
@@ -122,6 +129,7 @@ export function ResultView({
     }
   };
   const stopEditing = () => {
+    if (savingRef.current) return;
     if (changes && !window.confirm(`Discard ${changes} unsaved change${changes === 1 ? "" : "s"}?`)) return;
     setTarget(null);
     setEdits(emptyEdits());
@@ -147,10 +155,39 @@ export function ResultView({
     }
   };
   const saveEdits = async () => {
-    if (!target || !changes) return;
+    if (!target || !changes || savingRef.current) return;
+    const sent = toChanges(edits);
+    // Production: the statements are shown and confirmed first, as a run or a load is.
+    let confirmed = false;
+    if (conn?.env === "prod") {
+      let stmts: EditStatement[];
+      try {
+        stmts = await api.editPreview(info.id, target, sent);
+      } catch (e) {
+        toast(toError(e).message, "error");
+        return;
+      }
+      const shown = stmts.slice(0, 8).map((s) => (s.sql.length > 300 ? `${s.sql.slice(0, 300)}…` : s.sql));
+      const ok = await new Promise<boolean>((resolve) =>
+        useStore.getState().askConfirm({
+          title: `Save ${stmts.length} change${stmts.length === 1 ? "" : "s"} on production?`,
+          reasons: [
+            `"${conn.name}" is a production connection: these statements run on it.`,
+            ...shown,
+            ...(stmts.length > shown.length ? [`… and ${stmts.length - shown.length} more (Preview SQL shows them all).`] : []),
+          ],
+          confirmLabel: "Save changes",
+          onConfirm: () => resolve(true),
+          onCancel: () => resolve(false),
+        }),
+      );
+      if (!ok) return;
+      confirmed = true;
+    }
+    savingRef.current = true;
     setSaving(true);
     try {
-      const r = await api.applyEdits(info.id, toChanges(edits));
+      const r = await api.applyEdits(info.id, sent, confirmed);
       setPreview(null);
       setEdits(emptyEdits());
       toast(
@@ -167,6 +204,7 @@ export function ResultView({
     } catch (e) {
       toast(toError(e).message, "error");
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -324,7 +362,7 @@ export function ResultView({
           dialect={conn?.config.kind}
           onSelectionRange={setSelRange}
           onTranspose={setTranspose}
-          edit={target ? { target, edits, onEdits: setEdits } : null}
+          edit={gridEdit}
           onOpenRelated={connId ? (link, rows) => void openRelated(link, rows) : undefined}
           onFocusCell={setFocused}
           onViewValue={() => setValueOpen(true)}

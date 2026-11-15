@@ -85,3 +85,39 @@ A review of the 54 commits since v0.4.1 (PRs #40–#53). Findings were checked o
 - Redaction doesn't know Databricks raw strings: `options (password r'pw')` is kept.
 - `ui/tsconfig.tsbuildinfo`, a build artifact, is committed (changed in 4529fa5).
 - Pre-existing, unchanged since v0.4.1: `redact_url_passwords` is quadratic (`"a://b:c ".repeat(n)`: 9.2 s at 80 KB); secrets inside MySQL `/*! … */`, after a Postgres nested comment that hides a quote, after MySQL `5--1`, behind `_utf8mb4'pw'`, and in procedure arguments after a comment or a line break are kept.
+
+## UI (review of 2026-11-15)
+
+Fixed on 2026-11-15: saving grid edits on production without a confirmation, row actions on rows picked apart, History re-running text with a hidden secret, the comma-separated AI settings, the approval card (connection, production, the whole SQL, the edit kept), Auto-approve following a conversation to another connection, deleting a configured load or export step, the schedule interval and weekdays, loads that remove rows, the test-data dialog's stale rows, Run all with a selection, an AI edit whose text is gone, the confirm dialog's single slot, duplicate connections after a failed sign-in, completion after a backslash or a quoted name. Left:
+
+**Runs and edits**
+- **Saving grid edits re-runs one statement as the tab's whole run** (`ResultView.tsx`, `runSql`): after a five-statement script the other four results go, and an error range points at offset 0.
+- **A run is registered for a tab closed meanwhile** (`runsSlice.ts`): Cmd+W before `run_query` answers leaves the statement running with no UI and no Stop.
+- **The grid stays "loading" after a failed first page** (`ResultGrid.tsx`): nothing retries until the query is run again.
+- **Copying a whole column sends every row in one string** to the clipboard on the UI thread, with no cap; the toast reports the rows asked for, not copied; values starting with `=` paste as formulas (export has an Excel-safe option, copy has not); pending edits are not copied.
+- **Compare "Show more"** has no in-flight guard (a double click appends the same rows twice; rows of an older filter can be appended).
+- **Multi-rectangle selections**: only the current rectangle is used; the other rectangles are ignored.
+
+**Assistant**
+- **A conversation can stay "running"** when its last event is lost: Stop does nothing while the run id is unknown, and questions only queue (`aiStore.ts`).
+- **A queued question takes the editor in front when it is sent**, not the one it was asked from.
+- **Auto-approve set in an empty chat stays on when a History conversation is loaded into it.**
+- **Knowledge** can show the previous connection's notes for a moment after a switch; approving one then saves it under the new connection (not confirmed what the backend does with a changed connection on an existing note).
+- **Notes imported with "AI merge"** go into the prompt as part of the user's message, not marked as data.
+- **Sessions**: deleting a conversation (a running one too) takes one click.
+
+**Jobs and loads**
+- **A job changed by the assistant replaces the open job**, dropping edits of the last 600 ms or ones that failed to save.
+- **A step rename is lost** when another step is clicked within 250 ms.
+- **A query step whose connection was deleted shows "Results (DuckDB)".**
+- **"Load into…"**: the target check is debounced and Load can be pressed before "exists: it is dropped…" appears.
+- **`uniqueName`** can make a step name with `__`, which the editor itself refuses.
+
+**Other**
+- **Start-up**: a failed `ai.init` skips `jobs.init` (no job listeners, no message) and is never retried; a failed first jobs refresh skips the poll.
+- **Dropping an output** can leave no tab open and doesn't save the tab list.
+- **History and catalog search** have no guard against an older answer arriving last; double-click "insert name" in catalog search never fires (the first click unmounts the row).
+- **Completion**: `"my schema".` offers nothing; table references are scanned by five different string/comment readers (`blankLiterals`, `referencedOutputs`, `ghostText`, the `results.x` regexes, `columnType`).
+- **Diagrams**: foreign-key cycles make the left-to-right layout very wide (two ranks per pass); **query tips** are quadratic on a predicate of thousands of terms.
+- **Notebook**: every keystroke re-serialises all cells and re-renders every cell with its grid.
+- **Connection dialog**: Test on an edited connection with a changed host sends the saved secret to the new host.

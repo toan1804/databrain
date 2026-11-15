@@ -7,7 +7,7 @@ import { AlertTriangle, FileDown, ArrowDownToLine, CalendarClock, Copy, Database
 import { api, toError } from "../lib/api";
 import { kbd, modalOpen } from "../lib/platform";
 import type { RunParams, Job, JobEdge, JobNode } from "../lib/types";
-import { NODE_H, NODE_W, addDownstream, addEdge, ancestors, cappedReads, descendants, edgeProblem, missingLinks, newNode, nodeStatus, readSql, removeEdge, removeNode, scheduleText, updateStep, upstreamOf } from "../lib/jobGraph";
+import { NODE_H, NODE_W, actionSettings, addDownstream, addEdge, ancestors, cappedReads, descendants, edgeProblem, missingLinks, newNode, nodeStatus, readSql, removeEdge, removeNode, scheduleText, updateStep, upstreamOf } from "../lib/jobGraph";
 import { isQueryTab, useStore } from "../store";
 import { useJobs } from "../jobsStore";
 import { openOutput, resultsConnection } from "../outputs";
@@ -270,8 +270,12 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
         update((j) => removeNode(j, id));
         setSel(null);
       };
-      if (!n.sql.trim()) return go();
-      useStore.getState().askConfirm({ title: `Delete step "${n.name}"?`, reasons: ["Its SQL and links are removed from the job."], confirmLabel: "Delete", onConfirm: go });
+      // What the step holds, by its kind: a load or export step has no SQL of
+      // its own, and still a target, a mode and before/after SQL to lose.
+      const lost = actionSettings(n);
+      if (n.kind !== "query" && n.sql.trim()) lost.push("its SQL");
+      if (lost.length === 0) return go();
+      useStore.getState().askConfirm({ title: `Delete step "${n.name}"?`, reasons: [`Removed from the job with its links: ${lost.join(", ")}.`], confirmLabel: "Delete", onConfirm: go });
     },
     [update],
   );

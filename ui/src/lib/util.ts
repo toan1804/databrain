@@ -17,10 +17,10 @@ export function uid(): string {
 
 export function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms} ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)} s`;
-  const m = Math.floor(ms / 60_000);
-  const s = Math.round((ms % 60_000) / 1000);
-  return `${m}m ${s}s`;
+  if (ms < 59_950) return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)} s`;
+  // Rounded to whole seconds first: 119.6 s is 2m 0s, not 1m 60s.
+  const total = Math.round(ms / 1000);
+  return `${Math.floor(total / 60)}m ${total % 60}s`;
 }
 
 export function formatCount(n: number): string {
@@ -161,11 +161,22 @@ const RESERVED = new Set(
   ).split(" "),
 );
 
+/**
+ * Words reserved in one database only and common as column or schema names
+ * elsewhere (`comment`, `level`, `rank`): quoted there, left readable in
+ * the others.
+ */
+const RESERVED_IN: Partial<Record<ConnectorKind, Set<string>>> = {
+  oracle: new Set("audit comment file level mode number resource session share size start uid".split(" ")),
+  mysql: new Set("groups keys rank system".split(" ")),
+  bigquery: new Set("at current hash new no".split(" ")),
+};
+
 export function quoteIdent(kind: ConnectorKind, ident: string): string {
   const t = traitsOf(kind);
   // Unquoted identifiers fold to upper case in Oracle/Snowflake, lower elsewhere.
   const safe = t.upper_folding ? /^[A-Z_][A-Z0-9_$]*$/ : /^[a-z_][a-z0-9_]*$/;
-  if (safe.test(ident) && !RESERVED.has(ident.toLowerCase())) return ident;
+  if (safe.test(ident) && !RESERVED.has(ident.toLowerCase()) && !RESERVED_IN[kind]?.has(ident.toLowerCase())) return ident;
   switch (t.quote) {
     case "backtick":
       return "`" + ident.replace(/`/g, "``") + "`";
