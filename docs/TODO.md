@@ -90,7 +90,6 @@ A review of the 54 commits since v0.4.1 (PRs #40–#53). Findings were checked o
 
 A review of the fixes found fourteen bugs; they are fixed, with the refused case tested where it can be outside a running app. Left:
 
-- **A notebook cell deleted while its run starts** is not caught (the notebook is open, so the run goes on, with no cell to show it). Dashboard charts and query tabs are.
 - **No test runs these in a component**: the Knowledge panel starting fresh per connection, the production prompt before saving grid edits (and its retry when the server asks), the job conflict dialog, Compare's "Show more" waiting for a view's first page, right-click on an earlier block of a selection, Backspace in edit mode. Each was checked by reading only.
 - **Query tips** don't see a column more than about 500 characters into a call as wrapped by it (`coalesce(` with thousands of arguments): the price of keeping long predicates fast.
 - **SQL text with no known dialect** (a query tip without a connection) is read as DuckDB reads it: `$$` opens a string.

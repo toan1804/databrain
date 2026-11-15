@@ -31,6 +31,14 @@ function bufferEarly(e: JobEvent) {
 export const _earlyEventCount = () => earlyEvents.size;
 
 /**
+ * Run keys whose owner was removed for good (`retireRunKeys`: a notebook
+ * cell deleted). Cells live in their notebook's view, not in the store, so
+ * `runKeyOpen` can't see one go; a run still starting for such a key is
+ * stopped when its answer comes back. Keys are unique ids, never reused.
+ */
+const retiredKeys = new Set<string>();
+
+/**
  * Whether what `key` runs for is still open: a query tab (its id), a
  * notebook's cell (`nb:{notebook}:{cell}`) or a dashboard's chart
  * (`dash:{dashboard}:{chart}`), whose notebook or dashboard is in a tab.
@@ -56,6 +64,8 @@ export interface RunsSlice {
   runs: Record<string, TabRun>;
   /** Drop the runs of closed run keys (notebook cells removed or closed); `prefix` drops every key starting with it. */
   forgetRuns: (keys: string[], prefix?: string) => void;
+  /** Run keys whose owner is gone for good (a notebook cell deleted): their runs go, and a run of one still starting is stopped. */
+  retireRunKeys: (keys: string[]) => void;
   /** Tabs whose session has an open transaction → the connection it is on. */
   txOpen: Record<string, string>;
   /** Re-read whether the tab's session has an open transaction. */
@@ -180,6 +190,10 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       return { runs, outputs: s.outputs.map((x) => (x.handle === o.handle ? o : x)) };
     }),
   runs: {},
+  retireRunKeys: (keys) => {
+    for (const k of keys) retiredKeys.add(k);
+    get().forgetRuns(keys);
+  },
   forgetRuns: (keys, prefix) => {
     const gone = Object.keys(get().runs).filter((k) => keys.includes(k) || (prefix !== undefined && k.startsWith(prefix)));
     if (!gone.length) return;
@@ -279,7 +293,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     // Closed while the run was starting (connecting, a confirmation, a
     // sign-in): what started is stopped and nothing is shown for it.
     const openAtStart = runKeyOpen(get(), runKey);
-    const closed = () => openAtStart && !runKeyOpen(get(), runKey);
+    const closed = () => retiredKeys.has(runKey) || (openAtStart && !runKeyOpen(get(), runKey));
     const submit = async (confirmed: boolean): Promise<boolean> => {
       if (closed()) return false;
       try {
@@ -298,9 +312,11 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
         if (resp.status === "started" && closed()) {
           earlyEvents.delete(resp.job_id);
           void api.cancelQuery(resp.job_id).catch(() => false);
-          // Its session and results too: the tab's close went out before this run existed.
+          // Its results too: the close went out before this run existed. The
+          // shared session (a notebook's) only when what owns it closed: a
+          // deleted cell's notebook goes on using it.
           void api.closeTab(runKey).catch(() => {});
-          if (sessionKey) void api.closeTab(sessionKey).catch(() => {});
+          if (sessionKey && !runKeyOpen(get(), runKey)) void api.closeTab(sessionKey).catch(() => {});
           return false;
         }
         if (resp.status === "needs_confirmation") {

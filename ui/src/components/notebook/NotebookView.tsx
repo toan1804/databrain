@@ -316,7 +316,8 @@ export function NotebookView({
 
   const removeCell = (id: string) => {
     void api.closeTab(cellKey(notebookId, id)).catch(() => {});
-    useStore.getState().forgetRuns([cellKey(notebookId, id)]);
+    // For good: a run of it still starting is stopped when it answers.
+    useStore.getState().retireRunKeys([cellKey(notebookId, id)]);
     update((n) => ({ ...n, cells: n.cells.filter((c) => c.id !== id) }));
   };
 
