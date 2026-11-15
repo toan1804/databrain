@@ -28,12 +28,15 @@ export function ResultView({
   tabId,
   connectionId,
   title,
+  readOnly = false,
 }: {
   stmt: Pick<StatementRun, "durationMs" | "output">;
   info: ResultInfo;
   tabId: string;
   connectionId?: string | null;
   title?: string;
+  /** Another tab's result shown here: no editing, and not kept by this tab. */
+  readOnly?: boolean;
 }) {
   const [mode, setMode] = useState<"grid" | "chart">("grid");
   const tab = useStore((s) => s.tabs.find((t) => t.id === tabId));
@@ -327,6 +330,7 @@ export function ResultView({
         stopEditing={stopEditing}
         setLoadOpen={setLoadOpen}
         setExportOpen={setExportOpen}
+        readOnly={readOnly}
       />
 
       {findOpen && (

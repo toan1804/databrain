@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { MessageSquareText, Table2 } from "lucide-react";
+import { useEffect, useMemo, useState, type MouseEvent } from "react";
+import { MessageSquareText, Plus, Table2 } from "lucide-react";
 import { shownStatement, useStore } from "../store";
 import { kbd } from "../lib/platform";
 import { DoneView, ErrorView, Messages, RunningView, RunSummary } from "./results/RunStatus";
@@ -7,6 +7,7 @@ import { ResultTabs } from "./results/ResultTabs";
 import { CostBar } from "./results/CostBar";
 import { TipsBar } from "./results/TipsBar";
 import { ResultView } from "./results/ResultView";
+import { AddResultPicker } from "./results/AddResultPicker";
 
 export { ResultView };
 
@@ -22,7 +23,18 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
   const run = useStore((s) => s.runs[tabId]);
   const setActive = useStore((s) => s.setActiveStatement);
   const keepResult = useStore((s) => s.keepResult);
+  const removeAddedResult = useStore((s) => s.removeAddedResult);
   const [showMessages, setShowMessages] = useState(false);
+  const [picker, setPicker] = useState<{ x: number; y: number } | null>(null);
+  // Outputs already in this tab (its own and added ones): not offered again.
+  const shown = useMemo(() => new Set([...(run?.statements ?? []), ...(run?.kept ?? [])].flatMap((s) => (s.output ? [s.output.handle] : []))), [run]);
+  const openPicker = (e: MouseEvent<HTMLElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    setPicker({ x: r.left, y: r.bottom + 4 });
+  };
+  // Not in notebook cells: they have no result tabs of their own to add to.
+  const canAdd = !compact;
+  const pickerEl = picker && <AddResultPicker tabId={tabId} x={picker.x} y={picker.y} shown={shown} onClose={() => setPicker(null)} />;
 
   useEffect(() => setShowMessages(false), [run?.jobId]);
 
@@ -34,6 +46,12 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
         <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-[12.5px] text-muted">
           <Table2 size={26} className="opacity-40" />
           <div>Run a query to see results</div>
+          {canAdd && (
+            <button className="btn-ghost h-6 border border-line py-0 text-[11.5px]" onClick={openPicker}>
+              <Plus size={12} /> Add a result from another tab
+            </button>
+          )}
+          {pickerEl}
           <div className="flex gap-3 text-[11.5px]">
             <span>
               <span className="kbd">{kbd("⌘")}</span> <span className="kbd">↵</span> run statement
@@ -63,8 +81,14 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
             setShowMessages(false);
             setActive(tabId, index);
           }}
-          onRelease={(s) => s.output && void keepResult(tabId, s.output, false)}
+          onRelease={(s) => s.output && void (s.added ? removeAddedResult(tabId, s.output.handle) : keepResult(tabId, s.output, false))}
         />
+        {canAdd && (
+          <button className="icon-btn h-6 w-6 shrink-0" aria-label="Add a result" title="Add a result from another tab (read-only here)" onClick={openPicker}>
+            <Plus size={13} />
+          </button>
+        )}
+        {pickerEl}
         <button
           onClick={() => setShowMessages(true)}
           className={`flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-[12px] ${
@@ -88,8 +112,10 @@ export function ResultsPanel({ tabId, connectionId, title, compact }: ResultsPan
             stmt={active}
             info={active.result}
             tabId={tabId}
-            connectionId={connectionId}
-            title={title}
+            // An added result is another connection's maybe: its own.
+            connectionId={active.added && active.output ? active.output.connection_id : connectionId}
+            title={active.added && active.output ? (active.output.name ?? active.output.handle) : title}
+            readOnly={!!active.added}
           />
         ) : active?.error ? (
           <ErrorView stmt={active} tabId={tabId} connectionId={connectionId} count={run.statements.length} />

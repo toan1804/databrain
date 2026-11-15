@@ -205,6 +205,8 @@ export const createTabsSlice: StateCreator<State, [], [], TabsSlice> = (set, get
       ];
     }
     if (activeTabId === id) activeTabId = tabs[Math.min(idx, tabs.length - 1)].id;
+    // Results added to it from other tabs go (unpinned when adding pinned them).
+    s.dropAddedResults(id);
     const runs = { ...s.runs };
     delete runs[id];
     // A notebook's cells run under keys of their own (`nb:{notebook}:{cell}`).

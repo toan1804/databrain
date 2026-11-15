@@ -2,7 +2,7 @@ import { applyAppearance, type Appearance } from "../lib/appearance";
 import { api, isTauri } from "../lib/api";
 import type { AuthEvent, OutputInfo, ParamValue, SchemaInfo } from "../lib/types";
 import type { QuickFilterEntry } from "../lib/gridViews";
-import type { SignInState, StatementRun, Tab, TabRun, Theme } from "./types";
+import type { AddedResult, SignInState, StatementRun, Tab, TabRun, Theme } from "./types";
 
 /**
  * Next sign-in dialog state for an auth event. A dialog opened by an explicit
@@ -51,13 +51,7 @@ export const RESTORED_NOTICE = "Restored from your last session. Run again for f
 export function restoredRun(tabId: string, outputs: OutputInfo[]): TabRun | null {
   const mine = outputs.filter((o) => o.tab_id === tabId && o.active && o.state !== "evicted").sort((a, b) => a.statement_index - b.statement_index);
   if (!mine.length) return null;
-  const shown = (o: OutputInfo, index: number): StatementRun => ({
-    plan: { index, sql: o.sql, start: 0, end: 0, classification: { kind: "read", missing_where: false, keyword: "" } },
-    status: "done",
-    result: { id: o.result_id, columns: o.columns, total_rows: o.rows, complete: true, truncated: o.truncated, bytes: o.bytes, on_disk: false, disk_bytes: 0 },
-    output: o,
-    notices: [RESTORED_NOTICE],
-  });
+  const shown = (o: OutputInfo, index: number): StatementRun => outputRun(o, index, [RESTORED_NOTICE]);
   // Kept results apart (oldest first), as before the restart.
   const kept = mine.filter((o) => o.kept).sort((a, b) => a.created_at - b.created_at);
   const statements = mine.filter((o) => !o.kept).map((o, i) => shown(o, i));
@@ -129,6 +123,37 @@ export function parseParams(v: unknown, tabIds: string[]): Record<string, Record
     out[id] = vals;
   }
   return out;
+}
+
+/** `editor_added_results` setting: { tabId: [{ handle }] }, for tabs that still exist. */
+export function parseAdded(v: unknown, tabIds: string[]): Record<string, AddedResult[]> {
+  const out: Record<string, AddedResult[]> = {};
+  if (!v || typeof v !== "object") return out;
+  for (const id of tabIds) {
+    const list = (v as Record<string, unknown>)[id];
+    if (!Array.isArray(list)) continue;
+    const ok = list.filter((x): x is AddedResult => !!x && typeof x === "object" && typeof (x as AddedResult).handle === "string").map((x) => ({ handle: x.handle }));
+    if (ok.length) out[id] = ok;
+  }
+  return out;
+}
+
+let addedSaveTimer: ReturnType<typeof setTimeout> | undefined;
+export function persistAdded(added: Record<string, AddedResult[]>) {
+  if (!isTauri()) return;
+  clearTimeout(addedSaveTimer);
+  addedSaveTimer = setTimeout(() => void api.setSetting("editor_added_results", added).catch(() => {}), TAB_SAVE_DELAY);
+}
+
+/** An output shown as a finished result of a tab (restored, kept or added). */
+export function outputRun(o: OutputInfo, index: number, notices: string[] = []): StatementRun {
+  return {
+    plan: { index, sql: o.sql, start: 0, end: 0, classification: { kind: "read", missing_where: false, keyword: "" } },
+    status: "done",
+    result: { id: o.result_id, columns: o.columns, total_rows: o.rows, complete: true, truncated: o.truncated, bytes: o.bytes, on_disk: false, disk_bytes: 0 },
+    output: o,
+    notices,
+  };
 }
 
 let paramsSaveTimer: ReturnType<typeof setTimeout> | undefined;

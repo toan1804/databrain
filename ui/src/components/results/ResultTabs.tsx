@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { ChevronLeft, ChevronRight, List, Pin, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, List, Lock, Pin, X } from "lucide-react";
 import { outputLabel } from "../../outputs";
 import { formatCount, sqlPreview } from "../../lib/util";
 import type { StatementRun } from "../../store";
@@ -138,13 +138,19 @@ export function ResultTabs({
               aria-selected={isActive}
               tabIndex={isActive || (active === null && s === statements[0]) ? 0 : -1}
               onClick={() => select(s.plan.index)}
-              title={carried ? `Kept from an earlier run:\n${s.plan.sql}` : s.plan.sql}
+              title={s.added && s.output ? `Added from ${s.output.connection_name} (read-only):\n${s.plan.sql}` : carried ? `Kept from an earlier run:\n${s.plan.sql}` : s.plan.sql}
               className={`flex h-7 max-w-[220px] shrink-0 items-center gap-1.5 rounded-md px-2 text-[12px] ${
                 isActive ? "bg-hover text-fg" : "text-muted hover:text-fg"
               }`}
             >
-              {carried || s.output?.kept ? <Pin size={11} className="shrink-0 text-accent" aria-label="Kept" /> : <StatusIcon s={s} />}
-              <span className="truncate">{carried ? sqlPreview(s.plan.sql, 28) : `${many ? `${s.plan.index + 1}. ` : ""}${statusLabel(s)}`}</span>
+              {s.added ? (
+                <Lock size={11} className="shrink-0 text-muted" aria-label="Added, read-only" />
+              ) : carried || s.output?.kept ? (
+                <Pin size={11} className="shrink-0 text-accent" aria-label="Kept" />
+              ) : (
+                <StatusIcon s={s} />
+              )}
+              <span className="truncate">{s.added && s.output ? s.output.connection_name : carried ? sqlPreview(s.plan.sql, 28) : `${many ? `${s.plan.index + 1}. ` : ""}${statusLabel(s)}`}</span>
               {s.result && <span className="text-[11px] text-muted">{formatCount(s.result.total_rows)}</span>}
               {s.output && <span className="font-mono text-[10.5px] text-muted">{outputLabel(s.output)}</span>}
             </button>
@@ -157,8 +163,8 @@ export function ResultTabs({
               {onRelease && (
                 <button
                   className="icon-btn h-5 w-5 shrink-0 text-muted"
-                  aria-label={`Stop keeping ${s.output ? outputLabel(s.output) : "this result"}`}
-                  title="Stop keeping this result (it leaves the tab)"
+                  aria-label={`${s.added ? "Close" : "Stop keeping"} ${s.output ? outputLabel(s.output) : "this result"}`}
+                  title={s.added ? "Close this added result (its own tab keeps it)" : "Stop keeping this result (it leaves the tab)"}
                   onClick={() => onRelease(s)}
                 >
                   <X size={11} />

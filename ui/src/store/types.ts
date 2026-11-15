@@ -103,6 +103,13 @@ export interface StatementRun {
   downloading?: boolean;
   /** Time it took on the server (excluding the download), when known. */
   serverMs?: number;
+  /** Another tab's result added to this one's (+ in the result tabs): read-only, in `kept`, while its own tab keeps it. */
+  added?: boolean;
+}
+
+/** A result added to a tab from another tab (by its output), shown while that tab keeps it. */
+export interface AddedResult {
+  handle: string;
 }
 
 export interface TabRun {
