@@ -68,15 +68,12 @@ A review of the 54 commits since v0.4.1 (PRs #40–#53). Findings were checked o
 - The on-disk notice (`run.rs` `on_disk_notice`) still says sorting and filtering read from disk; since 0258ea8 they apply to the first rows loaded in the grid. It reaches the AI too.
 - The AI's `query_outputs` advice (`ai/src/tools/query.rs`) says DuckDB reads the files "without loading them"; in the sandbox every row is copied into an in-memory table that also spills, unchecked by `low_disk`.
 - Excel import silently drops end blocks with under 5% of the cells after a 3-row gap (`connectors/duckdb/src/xlsx.rs` `table_span`); the only trace is a SQL comment. Show `left_out` as a notice or in the import dialog.
-- MySQL loads: the implicit-commit check reads the first two whitespace words (`query-engine/src/load.rs`), so a comment before `SET PASSWORD` hides it and `SET autocommit = 1` (which commits) is treated as harmless. Use `code_words`.
 - macOS free memory (`app/src/sysmem.rs`): `mach_host_self()` is called on every read and its port reference never released; speculative and purgeable pages are left out, so free memory reads low and results go to disk early.
 - Each statement of a script keeps at least 4 MB that is never evicted (`run.rs`, `.max(4 << 20)`), so N statements can keep N × 4 MB.
 - The `get_array_memory_size` entry (buffers shared between batches counted once per batch) was removed from this file in #45 without a fix.
 - Closing a chat races its cancelled run (`aiCancel` and `aiLeaveSession` aren't ordered), so outputs of a statement that finishes after `leave_tab` stay active.
 - `SessionRole::is_ai()` is never used: nothing checks that AI or MCP SQL runs on an AI-role session key.
-- Redaction doesn't know Databricks raw strings: `options (password r'pw')` is kept.
 - `ui/tsconfig.tsbuildinfo`, a build artifact, is committed (changed in 4529fa5).
-- Pre-existing, unchanged since v0.4.1: `redact_url_passwords` is quadratic (`"a://b:c ".repeat(n)`: 9.2 s at 80 KB); secrets inside MySQL `/*! … */`, after a Postgres nested comment that hides a quote, after MySQL `5--1`, behind `_utf8mb4'pw'`, and in procedure arguments after a comment or a line break are kept.
 
 ## UI (second review, 2026-11-15)
 
