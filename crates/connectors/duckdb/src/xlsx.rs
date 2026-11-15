@@ -125,11 +125,20 @@ fn tags<'a>(xml: &'a str, local: &'a str) -> impl Iterator<Item = (&'a str, bool
     })
 }
 
+/// Most bytes read whole from a part of the file (the workbook and its
+/// relationships: kilobytes in real files). A file is a zip, and a small
+/// one can unpack to gigabytes.
+const MAX_ENTRY: u64 = 16 << 20;
+/// Most bytes of a sheet held at once: a row's XML (a real one is
+/// kilobytes; Excel's widest is 16,384 cells).
+const MAX_PIECE: usize = 32 << 20;
+
+/// A part read whole, up to [`MAX_ENTRY`] bytes (None past it).
 fn read_entry<R: Read + std::io::Seek>(z: &mut zip::ZipArchive<R>, name: &str) -> Option<String> {
-    let mut f = z.by_name(name).ok()?;
+    let f = z.by_name(name).ok()?;
     let mut s = String::new();
-    f.read_to_string(&mut s).ok()?;
-    Some(s)
+    f.take(MAX_ENTRY + 1).read_to_string(&mut s).ok()?;
+    (s.len() as u64 <= MAX_ENTRY).then_some(s)
 }
 
 /// Largest row and column Excel allows.
@@ -211,7 +220,10 @@ impl Scan {
         bump(&mut self.rows, row);
         bump(&mut self.cols, col);
         if let Some(h) = self.head.iter_mut().rev().take(2).find(|h| h.0 == row) {
-            h.1.push((col, kind));
+            // A row has at most MAX_COL cells; more are repeats of one cell.
+            if h.1.len() < MAX_COL as usize {
+                h.1.push((col, kind));
+            }
         } else if self.head.len() < HEAD_ROWS {
             self.head.push((row, vec![(col, kind)]));
         } else {
@@ -290,6 +302,8 @@ fn table_span(counts: &[u32]) -> (usize, usize) {
 }
 
 /// Read a sheet's XML as a stream, a piece (ending between rows) at a time.
+/// None when a row is larger than [`MAX_PIECE`] (no real sheet has one: the
+/// file is damaged or made to exhaust memory).
 fn scan_entry<R: Read + std::io::Seek>(z: &mut zip::ZipArchive<R>, name: &str) -> Option<Scan> {
     let mut f = z.by_name(name).ok()?;
     let mut scan = Scan::default();
@@ -300,13 +314,14 @@ fn scan_entry<R: Read + std::io::Seek>(z: &mut zip::ZipArchive<R>, name: &str) -
         if n == 0 {
             break;
         }
+        // Only the new bytes (and a tag split across reads) are searched.
+        let from = buf.len().saturating_sub(5);
         buf.extend_from_slice(&chunk[..n]);
-        let tail = buf.len().saturating_sub(n + 8);
-        if let Some(i) =
-            buf[tail..].windows(6).rposition(|w| w == b"</row>").map(|i| tail + i + 6).or_else(|| buf.windows(6).rposition(|w| w == b"</row>").map(|i| i + 6))
-        {
+        if let Some(i) = buf[from..].windows(6).rposition(|w| w == b"</row>").map(|i| from + i + 6) {
             scan.feed(&String::from_utf8_lossy(&buf[..i]));
             buf.drain(..i);
+        } else if buf.len() > MAX_PIECE {
+            return None;
         }
     }
     scan.feed(&String::from_utf8_lossy(&buf));
@@ -345,7 +360,7 @@ pub fn sheets_with(path: &str, first_used: bool) -> Result<Vec<SheetInfo>, Strin
     }
     let f = std::fs::File::open(path).map_err(|e| format!("cannot open {path}: {e}"))?;
     let mut z = zip::ZipArchive::new(f).map_err(|e| format!("{path} is not an .xlsx file: {e}"))?;
-    let wb = read_entry(&mut z, "xl/workbook.xml").ok_or_else(|| format!("{path}: missing xl/workbook.xml"))?;
+    let wb = read_entry(&mut z, "xl/workbook.xml").ok_or_else(|| format!("{path}: xl/workbook.xml is missing or over 16 MB (not a real workbook)"))?;
     let rels = read_entry(&mut z, "xl/_rels/workbook.xml.rels").unwrap_or_default();
     let target = |rid: &str| -> Option<String> {
         tags(&rels, "Relationship").find(|(t, _, _)| attr(t, "Id") == Some(rid)).and_then(|(t, _, _)| attr(t, "Target")).map(|t| {
@@ -471,6 +486,51 @@ mod tests {
         counts[0] = 1;
         assert_eq!(table_span(&counts), (4, 9));
         assert_eq!(table_span(&[0, 2, 0, 0, 0, 3]), (1, 5), "blocks of similar size stay");
+    }
+
+    /// A file that unpacks to more than a part or a row can hold is read
+    /// within those bounds: a sheet whose one row never ends isn't read (no
+    /// range), and an oversized workbook part counts as missing.
+    #[test]
+    fn hostile_files_are_read_within_bounds() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, workbook: &[u8], sheet: &mut dyn FnMut(&mut dyn Write)| {
+            let p = dir.path().join(name);
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&p).unwrap());
+            let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            z.start_file("xl/workbook.xml", o).unwrap();
+            z.write_all(workbook).unwrap();
+            z.start_file("xl/_rels/workbook.xml.rels", o).unwrap();
+            z.write_all(br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#).unwrap();
+            z.start_file("xl/worksheets/sheet1.xml", o).unwrap();
+            sheet(&mut z);
+            z.finish().unwrap();
+            p.to_string_lossy().to_string()
+        };
+        let wb = br#"<workbook><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        // One row that never ends: about 40 MB of cells.
+        let endless = write("endless.xlsx", wb, &mut |w| {
+            w.write_all(b"<worksheet><sheetData><row r=\"1\">").unwrap();
+            let cells = b"<c r=\"A1\"><v>1</v></c>".repeat(1 << 16);
+            for _ in 0..(40 << 20) / cells.len() {
+                w.write_all(&cells).unwrap();
+            }
+        });
+        let s = sheets(&endless).unwrap();
+        assert_eq!((s[0].name.as_str(), s[0].range.as_deref()), ("S", None));
+
+        // A workbook part past the bound.
+        let mut big = br#"<workbook><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets>"#.to_vec();
+        big.extend(std::iter::repeat_n(b' ', (MAX_ENTRY as usize) + 1));
+        big.extend_from_slice(b"</workbook>");
+        let huge = write("huge.xlsx", &big, &mut |w| w.write_all(b"<worksheet/>").unwrap());
+        assert!(sheets(&huge).unwrap_err().contains("xl/workbook.xml is missing or over 16 MB"));
+
+        // The same shapes within bounds read as before.
+        let ok =
+            write("ok.xlsx", wb, &mut |w| w.write_all(br#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#).unwrap());
+        assert_eq!(sheets(&ok).unwrap()[0].range.as_deref(), Some("A1:A1"));
     }
 
     /// A sheet larger than one piece of the stream reads like a small one.

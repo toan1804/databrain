@@ -7,7 +7,7 @@ use databrain_connector_core::{
     quote_literal,
 };
 
-use crate::database::{FileConn, Loaded};
+use crate::database::FileConn;
 use crate::error::{map_err, sandbox_hint};
 use crate::exec::run;
 use crate::outputs::RESULTS_SCHEMA_ID;
@@ -16,8 +16,6 @@ pub struct DuckSession {
     pub(crate) conn: Arc<Mutex<FileConn>>,
     pub(crate) interrupt: Arc<duckdb::InterruptHandle>,
     pub(crate) outputs: Option<Arc<ExternalTablesSlot>>,
-    /// Output tables loaded in the database: lowercase name → version key.
-    pub(crate) loaded: Arc<Loaded>,
     /// Runs in a sealed instance (see [`seal`](crate::sandbox::seal)).
     pub(crate) sandboxed: bool,
     /// The session's connection is to a database file other sessions share.
@@ -96,7 +94,7 @@ impl Session for DuckSession {
         let conn = self.conn.clone();
         let sql = sql.to_string();
         let (cancel, interrupt) = (opts.cancel.clone(), self.interrupt.clone());
-        let (outputs, loaded) = (self.outputs.clone(), self.loaded.clone());
+        let outputs = self.outputs.clone();
         let sandboxed = self.sandboxed;
         let shared = self.shared;
         let done = tokio_util::sync::CancellationToken::new();
@@ -121,7 +119,7 @@ impl Session for DuckSession {
                 tx.blocking_send(Err(ConnectorError::internal("lock poisoned")));
                 return;
             };
-            if let Err(e) = run(&g, &sql, &opts, &tx, outputs.as_deref(), &loaded, shared, sandboxed) {
+            if let Err(e) = run(&g, &sql, &opts, &tx, outputs.as_deref(), shared, sandboxed) {
                 let e = if opts.cancel.is_cancelled() {
                     ConnectorError::cancelled()
                 } else if sandboxed {
@@ -142,7 +140,7 @@ impl Session for DuckSession {
                  from duckdb_schemas() \
                  where (not internal or (schema_name = 'main' and database_name not in ('system', 'temp'))) \
                    and schema_name <> 'pg_catalog' and database_name <> 'results' \
-                 order by database_name = current_database() desc, schema_name = 'files' desc, 1, 2"
+                 order by database_name = current_database() desc, database_name in ('files', 'attached_files') desc, 1, 2"
                     .into(),
                 vec![],
             )
@@ -259,7 +257,11 @@ impl Session for DuckSession {
                 })
             })
             .chain(self.output_objects())
-            .filter(|o| databrain_connector_core::object_matches(query, &o.schema, &o.name))
+            // `files.sales` names the `files` catalog's `main` too, as DuckDB reads it.
+            .filter(|o| {
+                databrain_connector_core::object_matches(query, &o.schema, &o.name)
+                    || o.schema.strip_suffix(".main").is_some_and(|cat| databrain_connector_core::object_matches(query, cat, &o.name))
+            })
             .collect();
         databrain_connector_core::rank_matches(query, &mut hits, limit);
         Ok(hits)

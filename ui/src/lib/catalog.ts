@@ -297,8 +297,21 @@ function splitIdent(schema: string): string[] {
 /** Explorer schema id under which DuckDB connections list DataBrain outputs. */
 export const RESULTS_SCHEMA_ID = "results.main";
 
+/**
+ * DuckDB attached files: the catalog their views are written with
+ * (`files.<name>`), from the explorer schema id: `files.main` (an in-memory
+ * catalog), `attached_files.main` when the database has a `files` schema of
+ * its own, or `<db>.files` (where earlier versions kept them, in the database).
+ */
+export function duckFilesPrefix(schema: string): string | null {
+  if (schema === "files.main" || schema.endsWith(".files")) return "files";
+  if (schema === "attached_files.main") return "attached_files";
+  return null;
+}
+
 export function tablePath(kind: ConnectorKind, schema: string, name: string): string {
-  if (kind === "duckdb" && schema.endsWith(".files")) return `files.${quoteIdent(kind, name)}`;
+  const files = kind === "duckdb" ? duckFilesPrefix(schema) : null;
+  if (files) return `${files}.${quoteIdent(kind, name)}`;
   if (kind === "duckdb" && schema === RESULTS_SCHEMA_ID) return `results.${quoteIdent(kind, name)}`;
   return qualifiedName(kind, schema, name);
 }

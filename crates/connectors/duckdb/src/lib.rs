@@ -133,7 +133,6 @@ impl Connector for DuckdbConnector {
             interrupt: conn.interrupt_handle(),
             shared: db.is_some(),
             outputs: self.outputs.clone(),
-            loaded: db.as_ref().map(|d| d.loaded.clone()).unwrap_or_default(),
             sandboxed: sandbox,
             conn: Arc::new(Mutex::new(FileConn { conn, _db: db })),
             state: Default::default(),

@@ -451,9 +451,8 @@ mod excel_types {
         assert_eq!(all.iter().map(|s| s.sheet.as_str()).collect::<Vec<_>>(), vec!["Sales", "Q2 & plan"], "empty sheets skipped");
         assert_eq!(rows(&c, &format!("SELECT CAST(k AS VARCHAR) FROM {}", all[1].sql)), vec![vec![Some("7.0".into())]]);
         // Attached as views: first sheet keeps the file name.
-        c.execute_batch("CREATE SCHEMA IF NOT EXISTS files").unwrap();
         attach_files(&c, std::slice::from_ref(&path), true).unwrap();
-        let views = rows(&c, "SELECT view_name FROM duckdb_views() WHERE schema_name = 'files' ORDER BY 1");
+        let views = rows(&c, "SELECT view_name FROM duckdb_views() WHERE database_name = 'files' ORDER BY 1");
         assert_eq!(views, vec![vec![Some("book".into())], vec![Some("book_q2___plan".into())]]);
     }
 

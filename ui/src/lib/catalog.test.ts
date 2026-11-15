@@ -81,6 +81,9 @@ describe("copy names", () => {
     expect(tablePath("databricks", "main.sales", "orders")).toBe("main.sales.orders");
     expect(tablePath("mssql", "dbo", "Order Items")).toBe("dbo.[Order Items]");
     expect(tablePath("duckdb", "memory.files", "sales")).toBe("files.sales");
+    expect(tablePath("duckdb", "files.main", "sales")).toBe("files.sales");
+    expect(tablePath("duckdb", "attached_files.main", "sales")).toBe("attached_files.sales");
+    expect(tablePath("duckdb", "lake.main", "sales")).toBe("lake.main.sales");
     expect(tablePath("duckdb", "results.main", "revenue")).toBe("results.revenue");
   });
 
