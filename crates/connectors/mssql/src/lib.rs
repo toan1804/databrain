@@ -162,18 +162,15 @@ impl Connector for MssqlConnector {
         });
         let use_browser = cfg.opt("instance").is_some() && cfg.port.is_none();
         let all_dbs = cfg.database.as_deref().is_none_or(|d| d.trim().is_empty());
-        let conn = if cfg.ssl_mode == SslMode::Prefer {
-            // tiberius panics when the server can't encrypt; Prefer then
-            // means a plain connection (as encrypt=false in other drivers).
-            match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(open(&c, use_browser))).await {
-                Ok(r) => r?,
-                Err(_) => {
-                    c.encryption(EncryptionLevel::NotSupported);
-                    open(&c, use_browser).await?
-                }
+        let conn = match open(&c, use_browser).await {
+            Ok(conn) => conn,
+            // A server that can't encrypt: Prefer means a plain connection
+            // (as encrypt=false in other drivers); reconnects keep it.
+            Err(e) if error::prefer_falls_back(cfg.ssl_mode, &e) => {
+                c.encryption(EncryptionLevel::NotSupported);
+                open(&c, use_browser).await?
             }
-        } else {
-            open(&c, use_browser).await?
+            Err(e) => return Err(e),
         };
         Ok(Box::new(MssqlSession {
             config: c,
@@ -182,6 +179,7 @@ impl Connector for MssqlConnector {
             state: Default::default(),
             user_rowcount: Default::default(),
             all_dbs,
+            db_cache: Default::default(),
         }))
     }
 }

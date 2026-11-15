@@ -47,6 +47,25 @@ pub struct MssqlSession {
     /// No database configured: every accessible database is a catalog and
     /// schema ids are `database.schema` (like Databricks catalogs).
     pub(crate) all_dbs: bool,
+    /// The databases last listed (all-databases mode): a schema id is split
+    /// after the longest of them, as a database name may hold a dot (`a.b`).
+    pub(crate) db_cache: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+fn known_prefix(id: &str, db: &str) -> bool {
+    id.len() > db.len() && id.starts_with(db) && id.as_bytes()[db.len()] == b'.'
+}
+
+/// `(database, schema)` of a schema id: after the longest of `dbs` it
+/// starts with, else at the first dot (None: no dot).
+pub(crate) fn split_id<'a>(id: &'a str, dbs: &[String]) -> (Option<&'a str>, &'a str) {
+    if let Some(d) = dbs.iter().filter(|d| known_prefix(id, d)).max_by_key(|d| d.len()) {
+        return (Some(&id[..d.len()]), &id[d.len() + 1..]);
+    }
+    match id.split_once('.') {
+        Some((db, s)) => (Some(db), s),
+        None => (None, id),
+    }
 }
 
 impl MssqlSession {
@@ -74,12 +93,27 @@ impl MssqlSession {
         .await
     }
 
-    /// Split a schema id: `(database, schema)` in all-databases mode.
+    /// Split a schema id: `(database, schema)` in all-databases mode, after
+    /// the longest database listed that the id starts with (a name may hold
+    /// a dot), else at the first dot.
     pub(crate) fn split<'a>(&self, schema: &'a str) -> (Option<&'a str>, &'a str) {
-        match (self.all_dbs, schema.split_once('.')) {
-            (true, Some((db, s))) => (Some(db), s),
-            _ => (None, schema),
+        if !self.all_dbs {
+            return (None, schema);
         }
+        let dbs = self.db_cache.lock().map(|g| g.clone()).unwrap_or_default();
+        split_id(schema, &dbs)
+    }
+
+    /// [`Self::split`], listing the databases first when the id may name
+    /// one with a dot that isn't listed yet.
+    pub(crate) async fn split_id<'a>(&self, schema: &'a str) -> (Option<&'a str>, &'a str) {
+        if self.all_dbs && schema.matches('.').count() > 1 {
+            let known = self.db_cache.lock().map(|g| g.iter().any(|d| known_prefix(schema, d))).unwrap_or(false);
+            if !known {
+                let _ = self.databases().await;
+            }
+        }
+        self.split(schema)
     }
 
     /// The schema id of `schema` in `db` (`db.schema` in all-databases mode).
@@ -114,7 +148,11 @@ impl MssqlSession {
                 vec![],
             )
             .await?;
-        Ok(rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<bool, _>(1).unwrap_or(false)))).collect())
+        let dbs: Vec<(String, bool)> = rows.iter().filter_map(|r| Some((r.get::<&str, _>(0)?.to_string(), r.get::<bool, _>(1).unwrap_or(false)))).collect();
+        if let Ok(mut g) = self.db_cache.lock() {
+            *g = dbs.iter().map(|d| d.0.clone()).collect();
+        }
+        Ok(dbs)
     }
 
     pub(crate) async fn db_names(&self) -> Result<Vec<String>> {
@@ -143,7 +181,7 @@ impl MssqlSession {
             .filter(|o| o.name == name)
             .min_by_key(|o| !o.kind.is_relation())
             .ok_or_else(|| ConnectorError::query(format!("object not found: {schema}.{name}")))?;
-        let (db, sch) = self.split(schema);
+        let (db, sch) = self.split_id(schema).await;
         let rows = self.rows_in(db, COLUMNS_SQL, vec![sch.into(), name.into()]).await?;
         let columns: Vec<ColumnInfo> = rows.iter().map(|r| column_from(r).1).collect();
         let fills: Vec<Option<String>> = rows.iter().map(column_fill).collect();
@@ -338,7 +376,7 @@ impl Session for MssqlSession {
     }
 
     async fn list_objects(&self, schema: &str) -> Result<Vec<DbObject>> {
-        let (db, sch) = self.split(schema);
+        let (db, sch) = self.split_id(schema).await;
         let rows = self
             .rows_in(
                 db,
@@ -371,7 +409,7 @@ impl Session for MssqlSession {
 
     async fn table_layout(&self, schema: &str, name: &str) -> Result<databrain_connector_core::TableLayout> {
         use databrain_connector_core::{TableLayout, group_indexes, quote_literal, truthy};
-        let (db, schema) = self.split(schema);
+        let (db, schema) = self.split_id(schema).await;
         let obj = format!("N{}", quote_literal(&format!("{}.{}", quote_ident(ConnectorKind::Mssql, schema), quote_ident(ConnectorKind::Mssql, name))));
         let idx = self
             .query_text_in(
@@ -438,7 +476,7 @@ impl Session for MssqlSession {
         if d.object.kind != ObjectKind::Table {
             return Ok(d.ddl);
         }
-        let (db, schema) = self.split(schema);
+        let (db, schema) = self.split_id(schema).await;
         let full = format!("{}.{}", quote_ident(ConnectorKind::Mssql, schema), quote_ident(ConnectorKind::Mssql, name));
         // One row per extra line: (0 = inside CREATE TABLE, 1 = after it, text).
         let extra = self.rows_in(db, MSSQL_TABLE_EXTRAS, vec![full.clone()]).await;
@@ -482,7 +520,7 @@ impl Session for MssqlSession {
 
     /// modify_date per object (any ALTER, column change) + its comments.
     async fn object_versions(&self, schema: &str) -> Result<Option<std::collections::HashMap<String, String>>> {
-        let (db, schema) = self.split(schema);
+        let (db, schema) = self.split_id(schema).await;
         let rows = self
             .rows_in(
                 db,
@@ -518,7 +556,7 @@ impl Session for MssqlSession {
     }
 
     async fn schema_columns(&self, schema: &str) -> Result<Vec<TableColumns>> {
-        let (db, sch) = self.split(schema);
+        let (db, sch) = self.split_id(schema).await;
         let rows = self.rows_in(db, COLUMNS_SQL, vec![sch.into(), String::new()]).await?;
         let mut out: Vec<TableColumns> = Vec::new();
         for r in &rows {
@@ -579,6 +617,51 @@ mod tests {
             .unwrap();
         assert_eq!(r.num_rows(), 1);
         assert!(!s.list_schemas().await.unwrap().is_empty());
+
+        // Values as SQL Server shows them: a scale-0 decimal without ".0",
+        // money exact, datetime to the millisecond, datetimeoffset with its offset.
+        {
+            use databrain_connector_core::arrow::array::{Array, StringArray, TimestampMicrosecondArray};
+            let r = s
+                .execute(
+                    databrain_connector_core::Statement::internal(
+                        "select cast(12345 as decimal(18,0)) as a, cast(900000000000.1234 as money) as m, cast(-1.5 as smallmoney) as sm, \
+                         cast('2024-05-01T23:59:59.997' as datetime) as d, cast('2024-05-01T10:30:00.1234567+07:00' as datetimeoffset) as o",
+                    ),
+                    ExecOptions::default(),
+                )
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let r = &r.batches[0];
+            let text = |i: usize| {
+                r.column(i).as_any().downcast_ref::<StringArray>().unwrap_or_else(|| panic!("column {i}: {:?}", r.column(i).data_type())).value(0).to_string()
+            };
+            assert_eq!(text(0), "12345");
+            assert_eq!(text(1), "900000000000.1234");
+            assert_eq!(text(2), "-1.5000");
+            let d = r.column(3).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(0);
+            assert!(databrain_connector_core::value::format_timestamp(d).ends_with("23:59:59.997"), "{}", databrain_connector_core::value::format_timestamp(d));
+            assert_eq!(text(4), "2024-05-01 10:30:00.1234567 +07:00");
+            assert!(!r.column(4).is_null(0));
+        }
+
+        // All-databases mode: a database whose name holds a dot is one catalog.
+        if cfg.database.is_none() {
+            let run1 = |sql: &'static str| {
+                let s = &s;
+                async move { s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await.unwrap().collect().await.unwrap() }
+            };
+            run1("if db_id('kb.dots') is null create database [kb.dots]").await;
+            run1("exec [kb.dots].sys.sp_executesql N'if object_id(''dbo.dotted'') is null create table dbo.dotted (id int primary key)'").await;
+            let schemas = s.list_schemas().await.unwrap();
+            assert!(schemas.iter().any(|x| x.name == "kb.dots.dbo" && x.catalog.as_deref() == Some("kb.dots")), "{schemas:?}");
+            let objs = s.list_objects("kb.dots.dbo").await.unwrap();
+            assert!(objs.iter().any(|o| o.name == "dotted"), "{objs:?}");
+            run1("drop database [kb.dots]").await;
+        }
         let cancel = databrain_connector_core::CancellationToken::new();
         let st = s
             .execute(
