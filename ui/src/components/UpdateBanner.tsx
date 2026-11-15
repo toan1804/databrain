@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Download, Loader2, X } from "lucide-react";
+import { getVersion } from "@tauri-apps/api/app";
 import { api, isTauri, onUpdateEvent, toError } from "../lib/api";
 import type { UpdateInfo } from "../lib/types";
 import { readStored } from "../lib/storage";
@@ -21,13 +22,39 @@ async function checkEnabled(): Promise<boolean> {
   return s.update_check !== false;
 }
 
-/** Install the update in place (signed builds), else open the download. */
-function useInstall(info: UpdateInfo | null | undefined) {
+/** Ask again and keep the answer for the banner (at most once a day otherwise). */
+async function freshCheck(): Promise<UpdateInfo | null> {
+  const i = await api.checkForUpdate();
+  localStorage.setItem(LAST_CHECK, String(Date.now()));
+  if (i) localStorage.setItem("db.update.info", JSON.stringify(i));
+  return i;
+}
+
+/**
+ * Install the update in place (signed builds), else open the download. A
+ * click asks again first: the banner may show a result kept from an
+ * earlier check, made by the version installed before this one (which
+ * couldn't install updates) or before the release had its signed update.
+ */
+function useInstall(info: UpdateInfo | null | undefined, onFresh?: (i: UpdateInfo | null) => void) {
   const toast = useStore((s) => s.toast);
   const [progress, setProgress] = useState<{ done: number; total: number | null; finished: boolean } | null>(null);
   const install = async () => {
     if (!info) return;
-    if (!info.installable) return void api.openLink(info.download ?? info.url);
+    let now = info;
+    if (!info.installable) {
+      setProgress({ done: 0, total: null, finished: false });
+      const fresh = await freshCheck().catch(() => null);
+      setProgress(null);
+      if (fresh) {
+        onFresh?.(fresh);
+        now = fresh;
+      }
+    }
+    if (!now.installable) {
+      if (now.install_note) toast(`Can't install it from the app (${now.install_note}): opening the download.`, "info");
+      return void api.openLink(now.download ?? now.url);
+    }
     setProgress({ done: 0, total: null, finished: false });
     const off = await onUpdateEvent((e) => setProgress((p) => ({ done: e.downloaded ?? p?.done ?? 0, total: e.total ?? p?.total ?? null, finished: !!e.finished || !!p?.finished })));
     try {
@@ -36,7 +63,7 @@ function useInstall(info: UpdateInfo | null | undefined) {
     } catch (e) {
       setProgress(null);
       toast(`${toError(e).message}. Opening the download instead.`, "error");
-      void api.openLink(info.download ?? info.url);
+      void api.openLink(now.download ?? now.url);
     } finally {
       off();
     }
@@ -56,13 +83,21 @@ function useInstall(info: UpdateInfo | null | undefined) {
 /** A banner when a newer DataBrain is released (checked at most once a day). */
 export function UpdateBanner() {
   const [info, setInfo] = useState<UpdateInfo | null>(null);
-  const { install, busy, label } = useInstall(info);
+  const { install, busy, label } = useInstall(info, setInfo);
   useEffect(() => {
     if (!isTauri()) return;
     const last = Number(localStorage.getItem(LAST_CHECK) ?? 0);
+    const cached = readStored<UpdateInfo | null>("db.update.info", null, isUpdateInfo);
     if (Date.now() - last < EVERY_MS) {
-      const cached = readStored<UpdateInfo | null>("db.update.info", null, isUpdateInfo);
-      if (cached) setInfo(cached);
+      // A result kept by the version installed before this one is not this
+      // version's answer (it couldn't install updates, say): asked again.
+      void getVersion()
+        .catch(() => cached?.current)
+        .then((running) => {
+          if (!cached) return;
+          if (cached.current === running) return setInfo(cached);
+          void checkEnabled().then(async (on) => on && setInfo(await freshCheck().catch(() => null)));
+        });
       return;
     }
     void checkEnabled().then(async (on) => {
@@ -109,17 +144,14 @@ export function UpdateSettings() {
   const [on, setOn] = useState(true);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<UpdateInfo | null | undefined>(undefined);
-  const { install, busy: installing, label } = useInstall(result);
+  const { install, busy: installing, label } = useInstall(result, setResult);
   useEffect(() => {
     void checkEnabled().then(setOn);
   }, []);
   const checkNow = async () => {
     setBusy(true);
     try {
-      const i = await api.checkForUpdate();
-      setResult(i);
-      localStorage.setItem(LAST_CHECK, String(Date.now()));
-      if (i) localStorage.setItem("db.update.info", JSON.stringify(i));
+      setResult(await freshCheck());
     } catch (e) {
       toast(toError(e).message, "error");
     } finally {

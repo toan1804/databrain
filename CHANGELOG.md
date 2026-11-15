@@ -11,6 +11,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- The update banner could offer only a download link on a version that installs updates itself: it showed the result of a check kept for a day, made by the version installed before (which couldn't). A result from another version is checked again at start, a click on Download checks again and installs when it can, and when it really can't, the message says why.
 - Auto-approve answers only the conversation's queries on its own connection: a call it makes on another connection (`connection: "Prod"` from a test chat), a job, and what only you may approve (a function that could write where the AI may not) now wait for a click. The approval card finds its connection by id, so a second connection of the same name can't give it the wrong badge.
 - A saved password is only sent where it was saved for. The app decides this, for Test and for Save: another server, port, user, sign-in method, encryption setting (SSL off, trusting any certificate, TLS off), SSH host or connection string (MongoDB, Neo4j, Oracle) gets no saved secret, and saving the connection that way removes it (you type it again). Test works again on unchanged Databricks, Snowflake and cloud sign-in connections.
 - Knowledge starts fresh for each connection: rules, learned joins and the table list of the previous one can no longer be shown or acted on (Allow on a stale exclusion could widen what the AI may read).

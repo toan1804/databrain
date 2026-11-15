@@ -42,6 +42,9 @@ pub struct UpdateInfo {
     /// The update can be installed from the app (signed update for this build found).
     #[serde(default)]
     pub installable: bool,
+    /// Why it can't be (shown with the download link), when it can't.
+    #[serde(default)]
+    pub install_note: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +120,7 @@ fn info_for(current: &str, releases: Vec<Release>, os: &str, arch: &str, no_duck
         notes: r.body.map(|b| b.chars().take(2000).collect()),
         published_at: r.published_at,
         installable: false,
+        install_note: None,
     })
 }
 

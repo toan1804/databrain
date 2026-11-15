@@ -12,4 +12,8 @@ download: string | null, download_name: string | null, notes: string | null, pub
 /**
  * The update can be installed from the app (signed update for this build found).
  */
-installable: boolean, };
+installable: boolean, 
+/**
+ * Why it can't be (shown with the download link), when it can't.
+ */
+install_note: string | null, };
