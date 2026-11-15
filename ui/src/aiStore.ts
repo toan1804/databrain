@@ -103,6 +103,8 @@ export interface Conversation {
   tokens: { input: number; output: number };
   credits: number;
   contextPercent: number | null;
+  /** Stop was pressed before the run's id came back: the run is stopped as soon as it does. */
+  stopAsked?: boolean;
   queued: (SendInput & { id: string })[];
   lastInput: SendInput | null;
   autoApprove: boolean;
@@ -794,8 +796,10 @@ export const useAi = create<AiState>((set, get) => {
       const { chatId: _ignored, ...plain } = input;
       void _ignored;
       if (c.running) {
-        // Asked while this conversation works: sent when its answer is done.
-        update(id, (c) => ({ queued: [...c.queued, { ...plain, id: uid() }] }));
+        // Asked while this conversation works: sent when its answer is done,
+        // about the editor it was asked from (not whichever is in front then).
+        const asked = targetKey !== undefined ? targetKey : defaultTargetKey();
+        update(id, (c) => ({ queued: [...c.queued, { ...plain, targetKey: asked, connectionId: connectionId ?? connectionForKey(asked), id: uid() }] }));
         return;
       }
       if (!get().providerId) {
@@ -868,6 +872,12 @@ export const useAi = create<AiState>((set, get) => {
           void api.aiCancel(runId);
           return;
         }
+        // Stop pressed while it was starting: stopped now that it can be named.
+        if (chat(id)?.stopAsked) {
+          update(id, () => ({ runId, stopAsked: false }));
+          void get().cancel(id);
+          return;
+        }
         update(id, () => ({ runId }));
         // Replay what this run sent before its id was known.
         const evs = early.filter((x) => x.run_id === runId);
@@ -891,8 +901,33 @@ export const useAi = create<AiState>((set, get) => {
     },
 
     cancel: async (chatId) => {
-      const id = chat(chatId ?? get().activeChatId)?.runId;
-      if (id) await api.aiCancel(id);
+      const c = chat(chatId ?? get().activeChatId);
+      if (!c?.running) return;
+      const runId = c.runId;
+      // Not started yet (its id isn't known): stopped when it comes back.
+      if (!runId) {
+        update(c.id, () => ({ stopAsked: true }));
+        return;
+      }
+      const found = await api.aiCancel(runId).catch(() => false);
+      if (found) return;
+      // The backend no longer knows this run (it ended and its last event
+      // was lost): the conversation is ended here, or it would stay
+      // "running" for good and every question would only queue.
+      update(c.id, (x) =>
+        x.runId !== runId
+          ? {}
+          : {
+              running: false,
+              runId: null,
+              items: x.items.map((i): ChatItem => {
+                if (i.kind === "assistant") return { ...i, streaming: false };
+                if (i.kind === "tool" && !i.done) return { ...i, done: true };
+                if ((i.kind === "approval" || i.kind === "edit") && i.state === "pending") return { ...i, state: "expired" };
+                return i;
+              }),
+            },
+      );
     },
 
     newChat: (opts = {}) => {
@@ -963,7 +998,8 @@ export const useAi = create<AiState>((set, get) => {
       let id: string;
       if (shown && isBlank(shown)) {
         id = shown.id;
-        update(id, () => ({ sessionId }));
+        // Auto-approve was set for the empty chat, not for a conversation opened into it.
+        update(id, () => ({ sessionId, autoApprove: false }));
         set({ view: "chat" });
       } else {
         const c = { ...emptyConversation(), sessionId };

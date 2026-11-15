@@ -88,15 +88,7 @@ A review of the 54 commits since v0.4.1 (PRs #40–#53). Findings were checked o
 
 ## UI (review of 2026-11-15)
 
-Fixed later on 2026-11-15: refreshing one result after saving edits (it dropped the script's other results), runs of a tab closed while starting, the grid stuck after a failed page, copying (cap, count, formulas, unsaved changes), Compare's Show more, several selected blocks. Fixed on 2026-11-15: saving grid edits on production without a confirmation, row actions on rows picked apart, History re-running text with a hidden secret, the comma-separated AI settings, the approval card (connection, production, the whole SQL, the edit kept), Auto-approve following a conversation to another connection, deleting a configured load or export step, the schedule interval and weekdays, loads that remove rows, the test-data dialog's stale rows, Run all with a selection, an AI edit whose text is gone, the confirm dialog's single slot, duplicate connections after a failed sign-in, completion after a backslash or a quoted name. Left:
-
-**Assistant**
-- **A conversation can stay "running"** when its last event is lost: Stop does nothing while the run id is unknown, and questions only queue (`aiStore.ts`).
-- **A queued question takes the editor in front when it is sent**, not the one it was asked from.
-- **Auto-approve set in an empty chat stays on when a History conversation is loaded into it.**
-- **Knowledge** can show the previous connection's notes for a moment after a switch; approving one then saves it under the new connection (not confirmed what the backend does with a changed connection on an existing note).
-- **Notes imported with "AI merge"** go into the prompt as part of the user's message, not marked as data.
-- **Sessions**: deleting a conversation (a running one too) takes one click.
+Fixed later on 2026-11-15: refreshing one result after saving edits (it dropped the script's other results), runs of a tab closed while starting, the grid stuck after a failed page, copying (cap, count, formulas, unsaved changes), Compare's Show more, several selected blocks; in the assistant, Stop on a run that never reported back, a queued question's editor, Auto-approve on a History conversation, Knowledge after a connection switch, imported notes in the AI-merge prompt, deleting a conversation in one click. Fixed on 2026-11-15: saving grid edits on production without a confirmation, row actions on rows picked apart, History re-running text with a hidden secret, the comma-separated AI settings, the approval card (connection, production, the whole SQL, the edit kept), Auto-approve following a conversation to another connection, deleting a configured load or export step, the schedule interval and weekdays, loads that remove rows, the test-data dialog's stale rows, Run all with a selection, an AI edit whose text is gone, the confirm dialog's single slot, duplicate connections after a failed sign-in, completion after a backslash or a quoted name. Left:
 
 **Jobs and loads**
 - **A job changed by the assistant replaces the open job**, dropping edits of the last 600 ms or ones that failed to save.

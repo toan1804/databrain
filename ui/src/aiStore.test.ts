@@ -15,9 +15,17 @@ vi.mock("./lib/api", () => ({
       modelCalls.push(id);
       return [{ id: `${id}-a` }, { id: `${id}-b` }];
     },
+    aiCancel: async (id: string) => {
+      cancelCalls.push(id);
+      return backendKnowsRun.value;
+    },
+    aiSessionMessages: async () => [{ role: "user", content: { text: "hello" } }],
+    aiSessions: async () => [{ id: "s-old", title: "old", connection_id: null }],
   },
 }));
 const modelCalls: string[] = [];
+const cancelCalls: string[] = [];
+const backendKnowsRun = { value: true };
 
 /** Change the shown conversation (as the store does: in `chats`, mirrored at the top). */
 async function setShown(patch: Record<string, unknown>) {
@@ -123,5 +131,51 @@ describe("aiStore: resend a failed question", () => {
     expect(useAi.getState().items).toEqual([]);
     expect(useAi.getState().queued.map((q) => q.message)).toEqual(["top customers?"]);
     await setShown({ running: false, queued: [] });
+  });
+});
+
+describe("aiStore: Stop, queued questions and History", () => {
+  it("a queued question keeps the editor it was asked from", async () => {
+    const { useAi } = await import("./aiStore");
+    const { useStore } = await import("./store");
+    useStore.setState({ backendAvailable: true, tabs: [{ id: "tab-a", title: "a", sql: "", connection_id: null } as never], activeTabId: "tab-a" });
+    await setShown({ running: true, queued: [] });
+    await useAi.getState().send({ message: "and by month?" });
+    // Another tab comes to the front before it is sent.
+    useStore.setState({ tabs: [{ id: "tab-a" } as never, { id: "tab-b", title: "b", sql: "", connection_id: null } as never], activeTabId: "tab-b" });
+    expect(useAi.getState().queued[0].targetKey).toBe("tab-a");
+    useAi.getState().removeQueued(useAi.getState().queued[0].id);
+    await setShown({ running: false });
+  });
+
+  it("Stop before the run's id is known stops it once it is; a run the backend lost ends here", async () => {
+    const { useAi } = await import("./aiStore");
+    cancelCalls.length = 0;
+    await setShown({ running: true, runId: null });
+    await useAi.getState().cancel();
+    const shown = () => useAi.getState().chats.find((c) => c.id === useAi.getState().activeChatId)!;
+    expect(shown().stopAsked).toBe(true);
+    expect(cancelCalls).toEqual([]);
+    // The backend no longer knows the run: the conversation is not left "running".
+    backendKnowsRun.value = false;
+    await setShown({ running: true, runId: "lost", stopAsked: false, items: [{ id: "a", kind: "assistant", text: "half", streaming: true }] });
+    await useAi.getState().cancel();
+    expect(cancelCalls).toEqual(["lost"]);
+    expect(shown().running).toBe(false);
+    expect(shown().items[0]).toMatchObject({ streaming: false });
+    // It does know it: its own end event finishes it, nothing changes here.
+    backendKnowsRun.value = true;
+    await setShown({ running: true, runId: "live" });
+    await useAi.getState().cancel();
+    expect(shown().running).toBe(true);
+    await setShown({ running: false, runId: null, items: [] });
+  });
+
+  it("a History conversation opened into an empty chat doesn't inherit its Auto-approve", async () => {
+    const { useAi } = await import("./aiStore");
+    await setShown({ sessionId: null, running: false, items: [], queued: [], autoApprove: true });
+    await useAi.getState().loadSession("s-old");
+    const shown = useAi.getState().chats.find((c) => c.sessionId === "s-old")!;
+    expect(shown.autoApprove).toBe(false);
   });
 });

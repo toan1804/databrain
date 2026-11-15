@@ -61,9 +61,20 @@ export function Sessions() {
                   aria-label={`Delete ${s.title}`}
                   onClick={(e) => {
                     e.stopPropagation();
-                    void api.aiDeleteSession(s.id).then(() => {
-                      useAi.getState().forgetSession(s.id);
-                      return load();
+                    // Asked first: it can't be undone, and a running one is stopped.
+                    const running = useAi.getState().chats.some((c) => c.sessionId === s.id && c.running);
+                    useStore.getState().askConfirm({
+                      title: `Delete the conversation "${s.title}"?`,
+                      reasons: [running ? "It is still working: it is stopped, and its messages are deleted." : "Its messages are deleted; this can't be undone."],
+                      confirmLabel: "Delete",
+                      onConfirm: () =>
+                        void api
+                          .aiDeleteSession(s.id)
+                          .then(() => {
+                            useAi.getState().forgetSession(s.id);
+                            return load();
+                          })
+                          .catch((err) => toast(toError(err).message, "error")),
                     });
                   }}
                 >
