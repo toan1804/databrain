@@ -46,7 +46,19 @@ export function NodePanel({
   const queryTabs = useMemo(() => allTabs.filter(isQueryTab), [allTabs]);
   const output = useStore((s) => s.outputs.find((x) => x.tab_id === EDITOR_KEY(job.id, node.id) && x.active && x.state !== "evicted"));
   const [name, setName] = useState(node.name);
-  const rename = useEvent((name: string) => onChange({ name }));
+  /** The last name this panel gave the step. */
+  const [sent, setSent] = useState(node.name);
+  const rename = useEvent((name: string) => {
+    setSent(name);
+    onChange({ name });
+  });
+  // Renamed elsewhere (the assistant's version shown): the field shows that
+  // name, or the name typed here would be checked and saved over it.
+  const [seen, setSeen] = useState(node.name);
+  if (seen !== node.name) {
+    setSeen(node.name);
+    if (node.name !== sent) setName(node.name);
+  }
   const ups = upstreamOf(job, node.id).map((id) => job.nodes.find((n) => n.id === id)!).filter(Boolean);
   const downs = job.edges.filter((e) => e.from === node.id).map((e) => job.nodes.find((n) => n.id === e.to)!).filter(Boolean);
   // Known at once: format, this job's steps, other jobs' steps and named outputs.

@@ -308,3 +308,54 @@ test("text that differs only in characters you can't see", async ({ page }) => {
   await page.getByLabel("Show hidden characters").uncheck();
   await expect(table.locator("[data-chars]")).toHaveCount(0);
 });
+
+test("Show more waits for a new view's first page instead of counting from the last view's rows", async ({ page }) => {
+  await openApp(page, backend({ list_outputs: [AFTER, BEFORE] }));
+  await answer(page, "output_compare_pairs", PAIRS);
+  await answer(page, "compare_outputs", {
+    summary: { before_rows: 300, after_rows: 500, same: 0, changed: 300, added: 200, removed: 0, before_duplicate_keys: 0, after_duplicate_keys: 0, columns: [{ column: "amt", changed: 300 }] },
+    result: { id: "diff-3", columns: RESULT_COLS.map((n) => meta(n, "Utf8", "text")), total_rows: 500, complete: true, truncated: false, bytes: 100 },
+    sql: "SELECT 1;",
+    pairs: PAIRS,
+    keys: ["id"],
+    before: BEFORE,
+    after: AFTER,
+  });
+  // 200 added rows then 300 changed ones; the Changed view's first page waits for the test.
+  await page.evaluate(() => {
+    const w = window as unknown as { __DB_MOCK__: { handlers: Record<string, unknown> }; __changedFirst?: () => void };
+    const all = Array.from({ length: 500 }, (_, i) =>
+      i < 200 ? ["added", `a${i}`, "n/a", "1", "x", null, null, null, null] : ["changed", `c${i}`, "2026-11-13", "5.01", "y", "2026-11-13", "5.004", "Y", "amt"],
+    );
+    w.__DB_MOCK__.handlers.fetch_page = (a: { view: { filters: { column: number; value: string }[] }; offset: number; limit: number }) => {
+      const keep = all.filter((r) => a.view.filters.every((f) => (f.column === 0 ? r[0] === f.value : (r[f.column] ?? "").includes(f.value))));
+      const rows = keep.slice(a.offset, a.offset + a.limit);
+      const page = { view_rows: keep.length, total_rows: 500, offset: a.offset, row_ids: rows.map((_, i) => a.offset + i), rows };
+      return a.offset === 0 && a.view.filters.some((f) => f.value === "changed") ? new Promise((r) => (w.__changedFirst = () => r(page))) : page;
+    };
+  });
+
+  await page.getByRole("button", { name: "Outputs", exact: true }).click();
+  await page.getByRole("button", { name: "Compare outputs" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByText("id", { exact: true }).first().click();
+  await dialog.getByRole("button", { name: "Show differences" }).click();
+  await expect(page.getByRole("button", { name: "Show 200 more of 300" })).toBeEnabled();
+  const pages = async () => (await calls(page, "fetch_page")).map((c) => [(c.view as { filters: { value: string }[] }).filters.map((f) => f.value).join(","), c.offset]);
+
+  // Changed: until its first page is in, the rows shown are the last view's, so Show more waits.
+  await page.getByRole("button", { name: /300\s*Changed/ }).click();
+  await expect.poll(async () => (await pages()).some(([f]) => f === "changed")).toBe(true);
+  const more = page.getByRole("button", { name: /^Show \d+ more of/ });
+  await expect(more).toBeDisabled();
+  await more.click({ force: true });
+  expect((await pages()).filter(([f, o]) => f === "changed" && o !== 0)).toHaveLength(0);
+
+  // In: 200 changed rows shown, and Show more continues from them, in the Changed view.
+  await page.evaluate(() => (window as unknown as { __changedFirst: () => void }).__changedFirst());
+  await expect(page.getByRole("button", { name: "Show 100 more of 100" })).toBeEnabled();
+  await page.getByRole("button", { name: "Show 100 more of 100" }).click();
+  await expect.poll(async () => (await pages()).at(-1)).toEqual(["changed", 200]);
+  await expect(page.locator("table").last().locator("tbody tr")).toHaveCount(300);
+  await expect(page.locator("table").last()).not.toContainText("only after");
+});

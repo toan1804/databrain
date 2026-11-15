@@ -251,7 +251,10 @@ export function ResultView({
   // Debounced quick filter (remembered for the result's table).
   useEffect(() => {
     const t = setTimeout(() => {
-      setView((v) => ({ ...v, quick_filter: quick.trim() || null }));
+      // The same view when the filter didn't change: a new one reads the
+      // first page again and clears the grid's selection.
+      const q = quick.trim() || null;
+      setView((v) => (v.quick_filter === q ? v : { ...v, quick_filter: q }));
       if (sourceRef.current) useStore.getState().setQuickFilter(sourceRef.current, quick);
     }, 250);
     return () => clearTimeout(t);

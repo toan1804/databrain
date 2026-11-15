@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { backend, calls, openApp } from "./app";
+import { backend, calls, openApp, SHOP } from "./app";
 
 const TABLES = ["customers", "orders", "order_items", "products", "payments", "shipments", "invoices", "returns"];
 const join = (id: number, l: string, r: string, lc: string, rc: string, over: Record<string, unknown> = {}) => ({
@@ -157,4 +157,32 @@ test("joins recorded from a document: to review, approved or discarded, and mark
   await ok.getByRole("button", { name: /segments/ }).first().click();
   await expect(ok.getByText(/recorded by an MCP client/).last()).toBeVisible();
   await expect(ok.getByText("Given to the AI")).toBeVisible();
+});
+
+test("Knowledge starts fresh for each connection: the last one's excluded tables can't be allowed under this one", async ({ page }) => {
+  const DWH = { ...SHOP, id: "conn-dwh", name: "Shop DWH" };
+  await openApp(page, backend({ list_connections: [SHOP, DWH], kn_get: { state: null, notes: [] }, kn_objects: { objects: [], total: 0 } }));
+  // Shop answers at once; Shop DWH's rules come when the test says.
+  await page.evaluate(() => {
+    const w = window as unknown as { __DB_MOCK__: { handlers: Record<string, unknown> }; __dwhRules?: (r: unknown) => void };
+    w.__DB_MOCK__.handlers.ai_scope = (a: { connectionId: string }) =>
+      a.connectionId === "conn-shop" ? [{ schema: "public", table: "orders", allow: false }] : new Promise((r) => (w.__dwhRules = r));
+  });
+  await page.getByRole("button", { name: "AI assistant" }).first().click();
+  await page.getByRole("tab", { name: /Knowledge/ }).click();
+  await page.getByRole("tablist", { name: "Knowledge" }).getByRole("tab", { name: /Index/ }).click();
+  await expect(page.getByText("public.orders")).toBeVisible();
+
+  // Switched: Shop's exclusion is gone while Shop DWH's rules load (Allow would have acted on Shop DWH).
+  await page.getByRole("combobox", { name: "Connection" }).last().selectOption({ label: "Shop DWH" });
+  await expect.poll(async () => (await calls(page, "ai_scope")).some((c) => c.connectionId === "conn-dwh")).toBe(true);
+  await expect(page.getByText("public.orders")).toHaveCount(0);
+  await expect(page.getByText("Excluded tables")).toHaveCount(0);
+
+  // Shop DWH's own exclusion, allowed on Shop DWH.
+  await page.evaluate(() => (window as unknown as { __dwhRules: (r: unknown) => void }).__dwhRules([{ schema: "sales", table: "secrets", allow: false }]));
+  await expect(page.getByText("sales.secrets")).toBeVisible();
+  await page.getByRole("button", { name: "Allow", exact: true }).click();
+  await expect.poll(async () => (await calls(page, "ai_delete_rule")).at(-1)).toEqual({ connectionId: "conn-dwh", schema: "sales", table: "secrets" });
+  expect((await calls(page, "ai_delete_rule")).filter((c) => c.connectionId === "conn-shop")).toHaveLength(0);
 });
