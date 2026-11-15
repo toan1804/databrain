@@ -7,7 +7,7 @@ use databrain_auth::{AuthContext, AuthMethod, AuthMethodKind, CliKind, ClientAut
 use databrain_connector_core::{Capabilities, ConnectionConfig, Connector, ConnectorError, ConnectorInfo, ConnectorKind, FieldSpec, Result, Session};
 use tokio::sync::Mutex;
 
-use crate::common::{http, normalize_host};
+use crate::common::http;
 
 use super::DEFAULT_CLIENT_ID;
 use super::client::{DbxSession, Inner};
@@ -37,6 +37,9 @@ impl Connector for DatabricksConnector {
     fn validate(&self, cfg: &ConnectionConfig) -> std::result::Result<(), String> {
         if cfg.opt("http_path").is_none() && cfg.opt("warehouse_id").is_none() {
             return Err("SQL warehouse HTTP path is required".into());
+        }
+        if let Some(h) = cfg.host.as_deref().filter(|h| !h.trim().is_empty()) {
+            crate::common::checked_host(h)?;
         }
         Ok(())
     }
@@ -70,7 +73,8 @@ impl Connector for DatabricksConnector {
     }
 
     fn auth_context(&self, cfg: &ConnectionConfig) -> AuthContext {
-        let host = normalize_host(cfg.host.as_deref().unwrap_or_default());
+        // Nowhere to sign in when the host isn't one (validate says why).
+        let host = crate::common::checked_host(cfg.host.as_deref().unwrap_or_default()).unwrap_or_default();
         let p = cfg.auth.oauth_params().cloned().unwrap_or_default();
         let m2m = matches!(cfg.auth, AuthMethod::ClientCredentials(_));
         let scopes = p
@@ -100,7 +104,9 @@ impl Connector for DatabricksConnector {
     }
 
     async fn connect(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>> {
-        let host = normalize_host(cfg.host.as_deref().filter(|h| !h.is_empty()).ok_or_else(|| ConnectorError::config("workspace host is required"))?);
+        let host =
+            crate::common::checked_host(cfg.host.as_deref().filter(|h| !h.is_empty()).ok_or_else(|| ConnectorError::config("workspace host is required"))?)
+                .map_err(ConnectorError::config)?;
         let s = DbxSession(Arc::new(Inner {
             base: format!("https://{host}/api/2.0/sql/statements"),
             origin: format!("https://{host}"),
@@ -168,5 +174,22 @@ mod tests {
             .unwrap();
         assert_eq!(r.num_rows(), 1);
         assert!(!s.list_schemas().await.unwrap().is_empty());
+    }
+
+    /// A workspace host that would send the token elsewhere is refused, in
+    /// the dialog (validate), at connect and for browser sign-in.
+    #[test]
+    fn a_host_that_leaves_the_workspace_is_refused() {
+        let mut c = ConnectionConfig::new(ConnectorKind::Databricks, databrain_auth::AuthMethod::None);
+        c.options.insert("http_path".into(), "/sql/1.0/warehouses/abc".into());
+        for good in ["adb-1.azuredatabricks.net", "https://dbc-1.cloud.databricks.com/", "host.internal:8443"] {
+            c.host = Some(good.into());
+            assert!(DatabricksConnector.validate(&c).is_ok(), "{good}");
+        }
+        for bad in ["evil.com/a", "adb-1.azuredatabricks.net@evil.com", "evil.com#adb-1.azuredatabricks.net", "adb-1.net?x", "a b"] {
+            c.host = Some(bad.into());
+            assert!(DatabricksConnector.validate(&c).is_err(), "{bad}");
+            assert!(DatabricksConnector.auth_context(&c).oauth.unwrap().token_url.starts_with("https:///"), "{bad}");
+        }
     }
 }

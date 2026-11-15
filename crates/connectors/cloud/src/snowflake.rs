@@ -49,13 +49,22 @@ fn account(cfg: &ConnectionConfig) -> Result<String> {
         .map(|a| a.trim().trim_start_matches("https://").trim_end_matches('/').trim_end_matches(".snowflakecomputing.com").to_string())
         .filter(|a| !a.is_empty())
         .ok_or_else(|| ConnectorError::config("Snowflake account identifier is required (e.g. myorg-myaccount)"))?;
+    // It becomes the host the password or key goes to: nothing that could
+    // end the host name (`acct.evil.com/`, `x@evil.com`).
+    if !a.split('.').all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')) {
+        return Err(ConnectorError::config(format!(
+            "\"{a}\" is not a Snowflake account identifier: use letters, digits, '-', '_' and '.' (e.g. myorg-myaccount or xy12345.eu-west-1)"
+        )));
+    }
     Ok(a)
 }
 
-fn host(cfg: &ConnectionConfig, account: &str) -> String {
+/// The host requests and credentials go to: the host set on the connection
+/// (checked, see [`crate::common::checked_host`]), else the account's.
+fn host(cfg: &ConnectionConfig, account: &str) -> Result<String> {
     match cfg.host.as_deref().filter(|h| h.contains('.')) {
-        Some(h) => h.trim().trim_start_matches("https://").trim_end_matches('/').to_string(),
-        None => format!("{account}.snowflakecomputing.com"),
+        Some(h) => crate::common::checked_host(h).map_err(ConnectorError::config),
+        None => Ok(format!("{account}.snowflakecomputing.com")),
     }
 }
 
@@ -71,6 +80,8 @@ impl Connector for SnowflakeConnector {
         if cfg.opt("account").is_none() && cfg.host.as_deref().is_none_or(str::is_empty) {
             return Err("Snowflake account identifier is required".into());
         }
+        let acct = account(cfg).map_err(|e| e.message)?;
+        host(cfg, &acct).map_err(|e| e.message)?;
         Ok(())
     }
 
@@ -104,8 +115,8 @@ impl Connector for SnowflakeConnector {
     }
 
     fn auth_context(&self, cfg: &ConnectionConfig) -> AuthContext {
-        let acct = account(cfg).unwrap_or_default();
-        let h = host(cfg, &acct);
+        // Nowhere to sign in when the account or host isn't one (validate says why).
+        let h = account(cfg).and_then(|a| host(cfg, &a)).unwrap_or_default();
         let p = cfg.auth.oauth_params().cloned().unwrap_or_default();
         let mut scopes: Vec<String> = p.scopes.as_deref().map(|s| s.split_whitespace().map(str::to_string).collect()).unwrap_or_default();
         if scopes.is_empty() {
@@ -137,7 +148,7 @@ impl Connector for SnowflakeConnector {
 
     async fn connect(&self, cfg: &ConnectionConfig, creds: Arc<dyn CredentialSource>) -> Result<Box<dyn Session>> {
         let acct = account(cfg)?;
-        let base = format!("https://{}", host(cfg, &acct));
+        let base = format!("https://{}", host(cfg, &acct)?);
         let http = http();
         let token = login(&http, &base, &acct, cfg, creds.as_ref()).await?;
         let inner = Arc::new(Inner {
@@ -1132,10 +1143,36 @@ mod tests {
         let mut c = ConnectionConfig::new(ConnectorKind::Snowflake, AuthMethod::Password { user: "u".into() });
         c.options.insert("account".into(), "xy12345.eu-west-1".into());
         let a = account(&c).unwrap();
-        assert_eq!(host(&c, &a), "xy12345.eu-west-1.snowflakecomputing.com");
+        assert_eq!(host(&c, &a).unwrap(), "xy12345.eu-west-1.snowflakecomputing.com");
         assert_eq!(jwt_account(&a), "XY12345");
         c.options.insert("account".into(), "https://myorg-acct.snowflakecomputing.com/".into());
         assert_eq!(account(&c).unwrap(), "myorg-acct");
+        c.options.insert("account".into(), "my_org-acct".into());
+        assert!(SnowflakeConnector.validate(&c).is_ok());
+        // A private-link host set on the connection.
+        c.host = Some("https://xy12345.privatelink.snowflakecomputing.com/".into());
+        assert_eq!(host(&c, "x").unwrap(), "xy12345.privatelink.snowflakecomputing.com");
+        assert!(SnowflakeConnector.validate(&c).is_ok());
+    }
+
+    /// An account or host that would send the password elsewhere is refused,
+    /// in the dialog (validate), at connect and for browser sign-in.
+    #[test]
+    fn account_or_host_that_leaves_snowflake_is_refused() {
+        for bad in ["evil.com/a", "acct@evil.com", "acct.evil.com/x", "acct?x=1", "acct#x", "acct evil", "acct:443@evil.com"] {
+            let mut c = ConnectionConfig::new(ConnectorKind::Snowflake, AuthMethod::Password { user: "u".into() });
+            c.options.insert("account".into(), bad.into());
+            assert!(account(&c).is_err(), "account {bad}");
+            assert!(SnowflakeConnector.validate(&c).is_err(), "account {bad}");
+            assert!(SnowflakeConnector.auth_context(&c).oauth.unwrap().token_url.starts_with("https:///"), "account {bad}");
+        }
+        for bad in ["host.example.com@evil.com", "evil.com/host.snowflakecomputing.com", "a.snowflakecomputing.com?x", "a.b:99999"] {
+            let mut c = ConnectionConfig::new(ConnectorKind::Snowflake, AuthMethod::Password { user: "u".into() });
+            c.options.insert("account".into(), "myorg-acct".into());
+            c.host = Some(bad.into());
+            assert!(host(&c, "myorg-acct").is_err(), "host {bad}");
+            assert!(SnowflakeConnector.validate(&c).is_err(), "host {bad}");
+        }
     }
 
     #[test]
