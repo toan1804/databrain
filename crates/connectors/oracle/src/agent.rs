@@ -26,7 +26,7 @@ pub const PROTOCOL: &str = "1";
 ///        statement on a context of its own (it was rolled back after each
 ///        request, so every statement reconnected), and DBMS_OUTPUT is read
 ///        after a block or CALL (`output` in the exec reply).
-pub const RELEASE: &str = "0.1.3";
+pub const RELEASE: &str = "0.1.4";
 /// Where releases are published: `{base}/v{RELEASE}/{file}.gz`.
 pub const DEFAULT_BASE_URL: &str = "https://github.com/toan1804/databrain/releases/download/oracle-agent";
 /// `sha256  file` lines of the uncompressed binaries of [`RELEASE`].
