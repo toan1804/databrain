@@ -2,14 +2,17 @@
 
 use crate::error::map_err;
 use crate::exec::Ctx;
+use crate::exec::replace_conn;
 use crate::exec::run;
 use crate::exec::settle_kill;
+use crate::exec::stuck_cancel;
 use async_trait::async_trait;
 use databrain_connector_core::ColumnInfo;
 use databrain_connector_core::ConnState;
 use databrain_connector_core::ConnectorError;
 use databrain_connector_core::ConnectorKind;
 use databrain_connector_core::DbObject;
+use databrain_connector_core::ErrorKind;
 use databrain_connector_core::ExecOptions;
 use databrain_connector_core::ObjectDetail;
 use databrain_connector_core::ObjectKind;
@@ -64,7 +67,9 @@ impl MysqlSession {
         Ok(Some(out))
     }
 
-    /// Kill the running query using a short-lived side connection.
+    /// Kill the running query using a short-lived side connection. Its
+    /// side connection is given 5 s; a statement it didn't stop is handled
+    /// by the caller (see `execute`).
     pub(crate) async fn kill_query(opts: Opts, id: u32) {
         if let Ok(Ok(mut c)) = tokio::time::timeout(Duration::from_secs(5), Conn::new(opts)).await {
             let _ = c.query_drop(format!("KILL QUERY {id}")).await;
@@ -121,8 +126,8 @@ impl Session for MysqlSession {
         let sql = sql.to_string();
         tokio::spawn(async move {
             let cancel = opts.cancel.clone();
-            let work = run(&ctx, sql, opts, tx.clone());
-            tokio::pin!(work);
+            // Boxed so it can be dropped while it holds the connection.
+            let mut work = Box::pin(run(&ctx, sql, opts, tx.clone()));
             let res = tokio::select! {
                 r = &mut work => r,
                 _ = cancel.cancelled() => {
@@ -132,18 +137,35 @@ impl Session for MysqlSession {
                     if kill {
                         Self::kill_query(ctx.opts.clone(), ctx.conn_id.load(Ordering::SeqCst)).await;
                     }
-                    let r = match tokio::time::timeout(Duration::from_secs(10), &mut work).await {
-                        Ok(Ok(())) => Ok(()),
-                        _ => Err(ConnectorError::cancelled()),
-                    };
-                    if kill {
-                        settle_kill(&mut *ctx.conn.lock().await).await;
+                    match tokio::time::timeout(Duration::from_secs(10), &mut work).await {
+                        Ok(r) => {
+                            if kill {
+                                settle_kill(&mut *ctx.conn.lock().await).await;
+                            }
+                            match r {
+                                Ok(()) => Ok(()),
+                                Err(_) => Err(ConnectorError::cancelled()),
+                            }
+                        }
+                        Err(_) => {
+                            // The kill didn't stop it (it failed, or the
+                            // server is slow to notice). The statement holds
+                            // the connection: dropping it lets go, and a new
+                            // connection takes the stuck one's place (a KILL
+                            // from it ends the old one), so the session
+                            // answers again instead of waiting on it for good.
+                            drop(work);
+                            let replaced = match tokio::time::timeout(Duration::from_secs(5), ctx.conn.lock()).await {
+                                Ok(mut c) => replace_conn(&ctx, &mut c).await,
+                                Err(_) => false,
+                            };
+                            Err(stuck_cancel(replaced))
+                        }
                     }
-                    r
                 }
             };
             if let Err(e) = res {
-                let e = if cancel.is_cancelled() { ConnectorError::cancelled() } else { e };
+                let e = if cancel.is_cancelled() && e.kind != ErrorKind::Cancelled { ConnectorError::cancelled() } else { e };
                 tx.send_err(e).await;
             }
         });
@@ -511,6 +533,202 @@ mod tests {
         assert_eq!(s.transaction_state(), TxState::None);
         assert!(run("set autocommit = 1").await);
         assert!(run("drop database kb_tx").await);
+    }
+
+    /// A live session as `user` (root's password from the environment when None).
+    async fn live_as(user: Option<(&str, &str)>) -> Box<dyn Session> {
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        let host = std::env::var("DATABRAIN_MYSQL_HOST").expect("live test: DATABRAIN_MYSQL_HOST not set (run with --ignored)");
+        let (name, pw) = match user {
+            Some((u, p)) => (u.to_string(), Some(p.to_string())),
+            None => (std::env::var("DATABRAIN_MYSQL_USER").unwrap_or_else(|_| "root".into()), std::env::var("DATABRAIN_MYSQL_PASSWORD").ok()),
+        };
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Mysql, AuthMethod::Password { user: name.clone() });
+        cfg.host = Some(host);
+        cfg.port = std::env::var("DATABRAIN_MYSQL_PORT").ok().and_then(|p| p.parse().ok());
+        let creds = Arc::new(InlineCredentialSource::new(AuthMethod::Password { user: name }, pw.map(secrecy::SecretString::from)));
+        MysqlConnector.connect(&cfg, creds).await.unwrap()
+    }
+
+    async fn live_run(s: &dyn Session, sql: &str, opts: ExecOptions) -> Result<databrain_connector_core::Collected> {
+        s.execute(databrain_connector_core::Statement::internal(sql), opts).await?.collect().await
+    }
+
+    /// The row limit stops a read, but a procedure (not a read) runs to its
+    /// end: its write after the rows happens, and a notice says the rest of
+    /// its rows were discarded.
+    #[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_row_limit_cuts_reads_not_procedures() {
+        let s = live_as(None).await;
+        let ok = |sql: &'static str| {
+            let s = &*s;
+            async move { live_run(s, sql, ExecOptions::default()).await.unwrap_or_else(|e| panic!("{sql}: {e}")) }
+        };
+        ok("drop database if exists kb_stop").await;
+        ok("create database kb_stop").await;
+        ok("create table kb_stop.log (id int primary key auto_increment, note varchar(20))").await;
+        ok("create procedure kb_stop.rows_then_write() begin \
+              with recursive n(i) as (select 1 union all select i + 1 from n where i < 500) select i from n; \
+              insert into kb_stop.log (note) values ('done'); end")
+        .await;
+        ok("set cte_max_recursion_depth = 10000000").await;
+        let limit = ExecOptions { max_rows: Some(11), batch_size: 4, ..Default::default() };
+        // A read: the first 11 rows.
+        let r = live_run(&*s, "with recursive n(i) as (select 1 union all select i + 1 from n where i < 500000) select i from n", limit.clone()).await.unwrap();
+        assert_eq!(r.num_rows(), 11);
+        assert!(r.notices.is_empty(), "{:?}", r.notices);
+        // A procedure: its rows cut at 11, its write done.
+        let r = live_run(&*s, "call kb_stop.rows_then_write()", limit).await.unwrap();
+        assert_eq!(r.num_rows(), 11);
+        assert!(r.notices.iter().any(|n| n.contains("ran to its end")), "{:?}", r.notices);
+        let r = ok("select count(*) from kb_stop.log where note = 'done'").await;
+        assert_eq!(
+            databrain_connector_core::arrow::util::display::array_value_to_string(r.batches[0].column(0), 0).unwrap(),
+            "1",
+            "the procedure's insert ran"
+        );
+        ok("drop database kb_stop").await;
+    }
+
+    /// Stop while rows stream sends KILL QUERY (the statement ends on the
+    /// server) inside a transaction, and the session answers at once; when
+    /// the kill can't be sent, the session is given a new connection after
+    /// 10 s instead of waiting on the stuck one for good.
+    #[ignore = "live: needs DATABRAIN_MYSQL_HOST (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_stop_ends_the_statement_and_never_blocks() {
+        /// `f`, failing the test with `what` when it takes longer than `secs`
+        /// (a session that blocks after Stop would otherwise hang the test).
+        async fn step<T>(what: &str, secs: u64, f: impl std::future::Future<Output = T>) -> T {
+            tokio::time::timeout(Duration::from_secs(secs), f).await.unwrap_or_else(|_| panic!("blocked for {secs} s: {what}"))
+        }
+        async fn ok(s: &dyn Session, sql: String) -> databrain_connector_core::Collected {
+            step(&sql.clone(), 20, live_run(s, &sql, ExecOptions::default())).await.unwrap_or_else(|e| panic!("{sql}: {e}"))
+        }
+        fn cell(r: &databrain_connector_core::Collected) -> String {
+            databrain_connector_core::arrow::util::display::array_value_to_string(r.batches[0].column(0), 0).unwrap()
+        }
+        /// Statements whose text holds `marker` running on the server.
+        async fn running(s: &dyn Session, marker: &str) -> String {
+            cell(&ok(s, format!("select count(*) from information_schema.processlist where info like '%{marker}%' and info not like '%processlist%'")).await)
+        }
+        let root = live_as(None).await;
+
+        // Stop mid-stream, in a transaction (the connection is kept): KILL QUERY sent.
+        let s = live_as(None).await;
+        ok(&*s, "set cte_max_recursion_depth = 10000000".into()).await;
+        ok(&*s, "begin".into()).await;
+        let cancel = databrain_connector_core::CancellationToken::new();
+        let mut st = s
+            .execute(
+                databrain_connector_core::Statement::internal("select /*kb_stream*/ i, sleep(0.001) from (with recursive n(i) as (select 1 union all select i + 1 from n where i < 2000000) select i from n) t"),
+                ExecOptions { batch_size: 2, cancel: cancel.clone(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        let got = step("the first rows", 20, async {
+            while let Some(ev) = st.next().await {
+                if matches!(ev.as_ref().unwrap_or_else(|e| panic!("{e}")), databrain_connector_core::StreamEvent::Batch(_)) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert!(got, "rows were streaming");
+        assert_eq!(running(&*root, "kb_stream").await, "1", "running on the server");
+        cancel.cancel();
+        let t = std::time::Instant::now();
+        step("the stream ending after Stop", 20, async { while st.next().await.is_some() {} }).await;
+        assert!(t.elapsed() < Duration::from_secs(5), "stopped in {:?}", t.elapsed());
+        assert_eq!(running(&*root, "kb_stream").await, "0", "ended on the server");
+        assert_eq!(cell(&ok(&*s, "select 7".into()).await), "7");
+        assert_eq!(s.transaction_state(), databrain_connector_core::TxState::Open, "the transaction is kept");
+        ok(&*s, "rollback".into()).await;
+
+        // The statement itself notices Stop between rows (before the outer
+        // cancel does): it ends the statement on the server too. `run`
+        // directly, with no outer cancel to send the kill.
+        {
+            let opts = Opts::from_url(&format!(
+                "mysql://{}:{}@{}:{}",
+                std::env::var("DATABRAIN_MYSQL_USER").unwrap_or_else(|_| "root".into()),
+                std::env::var("DATABRAIN_MYSQL_PASSWORD").unwrap_or_default(),
+                std::env::var("DATABRAIN_MYSQL_HOST").unwrap(),
+                std::env::var("DATABRAIN_MYSQL_PORT").unwrap_or_else(|_| "3306".into())
+            ))
+            .unwrap();
+            let conn = Conn::new(opts.clone()).await.unwrap();
+            let ctx = crate::exec::Ctx {
+                conn_id: Arc::new(AtomicU32::new(conn.id())),
+                conn: Arc::new(Mutex::new(conn)),
+                opts,
+                state: Default::default(),
+                finished: Arc::new(AtomicBool::new(false)),
+                read_only: false,
+            };
+            ctx.conn.lock().await.query_drop("set cte_max_recursion_depth = 10000000").await.unwrap();
+            ctx.conn.lock().await.query_drop("begin").await.unwrap();
+            let cancel = databrain_connector_core::CancellationToken::new();
+            let (tx, mut stream) = QueryStream::channel(4);
+            let c2 = cancel.clone();
+            let reader = tokio::spawn(async move {
+                while let Some(ev) = stream.next().await {
+                    if matches!(ev, Ok(databrain_connector_core::StreamEvent::Batch(_))) {
+                        c2.cancel();
+                    }
+                }
+            });
+            // Before the fix `run` read the rest of the result here (DO 0 after
+            // the error): 2 million rows, half an hour.
+            let r = step(
+                "the statement returning after Stop between rows",
+                20,
+                run(
+                    &ctx,
+                    "select /*kb_inner*/ i, sleep(0.001) from (with recursive n(i) as (select 1 union all select i + 1 from n where i < 2000000) select i from n) t".into(),
+                    ExecOptions { batch_size: 2, cancel: cancel.clone(), ..Default::default() },
+                    tx,
+                ),
+            )
+            .await;
+            step("the reader ending", 20, reader).await.unwrap();
+            assert_eq!(r.unwrap_err().kind, ErrorKind::Cancelled);
+            assert_eq!(running(&*root, "kb_inner").await, "0", "ended on the server");
+            let one: Option<i64> = step("the connection answering", 20, async { ctx.conn.lock().await.query_first("select 1").await.unwrap() }).await;
+            assert_eq!(one, Some(1), "the connection answers");
+        }
+
+        // The kill can't be sent (no connection to send it from): after 10 s
+        // the stuck connection is replaced and the session answers.
+        ok(&*root, "drop user if exists 'kb_two'@'%'".into()).await;
+        ok(&*root, "create user 'kb_two'@'%' identified by 'kb-two-pw' with max_user_connections 2".into()).await;
+        let s = live_as(Some(("kb_two", "kb-two-pw"))).await;
+        let blocker = live_as(Some(("kb_two", "kb-two-pw"))).await;
+        let cancel = databrain_connector_core::CancellationToken::new();
+        let st = s
+            .execute(
+                databrain_connector_core::Statement::internal("select /*kb_stuck*/ sleep(120)"),
+                ExecOptions { cancel: cancel.clone(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cancel.cancel();
+        // Both connections the user may have are taken until then.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        drop(blocker);
+        let t = std::time::Instant::now();
+        let e = step("the stuck statement's stream ending", 30, st.collect()).await.expect_err("cancelled");
+        assert!(t.elapsed() < Duration::from_secs(20), "returned after {:?}", t.elapsed());
+        assert_eq!(e.kind, ErrorKind::Cancelled);
+        assert!(e.message.contains("opened a new one"), "{}", e.message);
+        assert_eq!(running(&*root, "kb_stuck").await, "0", "the stuck statement's connection was ended");
+        let r = tokio::time::timeout(Duration::from_secs(5), live_run(&*s, "select 8", ExecOptions::default())).await.expect("the session answers");
+        assert_eq!(cell(&r.unwrap()), "8");
+        drop(s);
+        ok(&*root, "drop user 'kb_two'@'%'".into()).await;
     }
 
     /// Live test: set DATABRAIN_MYSQL_HOST (+ _USER, _PASSWORD, _DB).
