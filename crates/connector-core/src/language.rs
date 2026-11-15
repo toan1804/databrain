@@ -44,7 +44,11 @@ pub fn classify(text: &str, language: QueryLanguage) -> Classification {
         }
         QueryLanguage::MongoJson => mongo_kind(text),
     };
-    Classification { kind, missing_where: false, keyword }
+    // `deleteMany({})`, `updateMany({}, …)`: confirmed as a write without
+    // WHERE is, named by its method (`DELETEMANY`, not the leading `db`).
+    let missing_where = language == QueryLanguage::MongoJson && mongo_info(text).flatten().is_some_and(|i| i.every_document);
+    let keyword = if missing_where { mongo_op(&text.to_ascii_lowercase()).map(|o| o.to_ascii_uppercase()).unwrap_or(keyword) } else { keyword };
+    Classification { kind, missing_where, keyword }
 }
 
 /// What a MongoDB command does, from the shell parser the MongoDB connector
@@ -55,6 +59,9 @@ pub struct MongoInfo {
     /// Collections read and written, `[db, coll]` or `[coll]`.
     pub reads: Vec<Vec<String>>,
     pub writes: Vec<Vec<String>>,
+    /// An update or delete of many documents with an empty filter: it
+    /// changes every document of the collection (SQL's write without WHERE).
+    pub every_document: bool,
     /// `$lookup` equalities between the aggregated collection's fields and
     /// another collection's (only where the field still is the collection's:
     /// see the connector's analyzer).
