@@ -35,6 +35,8 @@ pub(crate) enum Backend {
         conn: Arc<Connection>,
         /// Serializes statements on the connection.
         lock: Arc<Mutex<()>>,
+        /// Every statement runs in a READ ONLY transaction of its own.
+        read_only: bool,
     },
     Thin(Arc<agent::Agent>),
 }
@@ -45,7 +47,7 @@ pub struct OracleSession {
 
 impl OracleSession {
     pub(crate) async fn with_conn<T: Send + 'static>(&self, f: impl FnOnce(&Connection) -> Result<T> + Send + 'static) -> Result<T> {
-        let Backend::Thick { conn, lock } = &self.backend else {
+        let Backend::Thick { conn, lock, .. } = &self.backend else {
             return Err(ConnectorError::internal("Instant Client call on a thin connection"));
         };
         let (conn, lock) = (conn.clone(), lock.clone());
@@ -147,9 +149,9 @@ impl Session for OracleSession {
 
     async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
         let sql = stmt.sql();
-        let (conn, lock) = match &self.backend {
+        let (conn, lock, read_only) = match &self.backend {
             Backend::Thin(a) => return Ok(thin_execute(a.clone(), sql, opts)),
-            Backend::Thick { conn, lock } => (conn.clone(), lock.clone()),
+            Backend::Thick { conn, lock, read_only } => (conn.clone(), lock.clone(), *read_only),
         };
         let (tx, stream) = QueryStream::channel(4);
         let sql = sql.to_string();
@@ -170,6 +172,14 @@ impl Session for OracleSession {
                 tx.blocking_send(Err(ConnectorError::internal("lock poisoned")));
                 return;
             };
+            // Read-only: a new READ ONLY transaction per statement, so each
+            // reads the data as it is now (one transaction reads as of its
+            // start, which was the connect), and a COMMIT run in it can't
+            // leave the session writable.
+            if read_only && let Err(e) = conn.rollback().and_then(|_| conn.execute("set transaction read only", &[]).map(|_| ())) {
+                tx.blocking_send(Err(map_err(e)));
+                return;
+            }
             if let Err(e) = run(&conn, &sql, &opts, &tx) {
                 let e = if opts.cancel.is_cancelled() { ConnectorError::cancelled() } else { e };
                 tx.blocking_send(Err(e));
@@ -217,8 +227,10 @@ impl Session for OracleSession {
             )
             .await?;
         let mut seen = std::collections::HashSet::new();
+        let mviews = crate::schema::mview_names(&rows, 0, 1);
         Ok(rows
             .into_iter()
+            .filter(|r| !crate::schema::is_mview_table(r, 0, 1, &mviews))
             .filter_map(|r| {
                 let g = |i: usize| r.get(i).cloned().flatten();
                 let name = g(0)?;
@@ -231,7 +243,7 @@ impl Session for OracleSession {
                     "SEQUENCE" => ObjectKind::Sequence,
                     _ => ObjectKind::Function,
                 };
-                // A materialized view also appears as a TABLE.
+                // Another object of the same name (a package and its body…): the first.
                 if !seen.insert(name.clone()) {
                     return None;
                 }
@@ -427,7 +439,11 @@ impl Session for OracleSession {
             .await?;
         let mut seen = std::collections::HashSet::new();
         let mut out = std::collections::HashMap::new();
+        let mviews = crate::schema::mview_names(&rows, 0, 1);
         for r in rows {
+            if crate::schema::is_mview_table(&r, 0, 1, &mviews) {
+                continue;
+            }
             let g = |i: usize| r.get(i).cloned().flatten();
             let (Some(name), Some(t)) = (g(0), g(1)) else { continue };
             if !seen.insert(name.clone()) {
@@ -571,8 +587,9 @@ mod tests {
         let p = s.object_ddl(&me, "DB_PKG_SALES", ObjectKind::Package).await.unwrap().unwrap();
         let up = p.to_uppercase();
         assert!(up.contains("CREATE OR REPLACE PACKAGE DB_PKG_SALES") && up.contains("CREATE OR REPLACE PACKAGE BODY DB_PKG_SALES"), "{driver}: {p}");
-        assert!(s.object_ddl(&me, "DB_FN_TOTAL", ObjectKind::Function).await.unwrap().unwrap().contains("FUNCTION"));
-        assert!(s.object_ddl(&me, "DB_PROC_LOG", ObjectKind::Procedure).await.unwrap().unwrap().contains("PROCEDURE"));
+        // The source keeps the case it was written in (Oracle 23 doesn't upper-case it).
+        assert!(s.object_ddl(&me, "DB_FN_TOTAL", ObjectKind::Function).await.unwrap().unwrap().to_uppercase().contains("FUNCTION"));
+        assert!(s.object_ddl(&me, "DB_PROC_LOG", ObjectKind::Procedure).await.unwrap().unwrap().to_uppercase().contains("PROCEDURE"));
         let sys = s.package_members("SYS", "DBMS_OUTPUT").await.unwrap();
         assert!(sys.iter().any(|o| o.name == "PUT_LINE" && o.kind == ObjectKind::Procedure), "{driver}");
         for d in ["drop function db_fn_total", "drop procedure db_proc_log", "drop package db_pkg_sales"] {
@@ -594,9 +611,120 @@ mod tests {
         eprintln!("{driver}: next catalog query answered {:?} after abandoning a slow one", t.elapsed());
     }
 
+    /// The first value of `sql`'s result, run as a statement (`execute`).
+    async fn cell(s: &OracleSession, sql: &'static str) -> String {
+        let c = s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await.unwrap().collect().await.unwrap();
+        databrain_connector_core::arrow::util::display::ArrayFormatter::try_new(c.batches[0].column(0).as_ref(), &Default::default())
+            .unwrap()
+            .value(0)
+            .to_string()
+    }
+
+    /// The first value of `sql`'s first row, as text (a catalog query).
+    async fn first(s: &OracleSession, sql: &str) -> String {
+        s.query_dynamic(sql.to_string()).await.unwrap_or_else(|e| panic!("{sql}: {e}"))[0][0].clone().unwrap_or_default()
+    }
+
+    /// PL/SQL units whose `end;` starts a line, DBMS_OUTPUT, materialized
+    /// views, RAW lengths, and a read-only session that sees new data
+    /// without reconnecting.
+    async fn check_plsql_catalog_and_read_only(driver: &str) {
+        let s = live_session(driver, false).await.expect("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
+        let exec = |sql: &'static str| {
+            let s = &s;
+            async move { s.execute(databrain_connector_core::Statement::internal(sql), ExecOptions::default()).await.unwrap().collect().await }
+        };
+        // `end;` at the start of a line keeps its `;`: the procedure compiles.
+        exec("create or replace procedure kb_endline is\nbegin\n  null;\nend;").await.unwrap();
+        assert_eq!(first(&s, "select status from user_objects where object_name = 'KB_ENDLINE'").await, "VALID", "{driver}");
+        exec("create or replace type kb_pair as object (a number, b number);").await.unwrap();
+        assert_eq!(first(&s, "select status from user_objects where object_name = 'KB_PAIR'").await, "VALID", "{driver}");
+        // A view with CASE … END is SQL: its `;` goes.
+        exec("create or replace view kb_case_v as select case when 1 = 1 then 'y' end as c from dual;").await.unwrap();
+
+        // DBMS_OUTPUT of a block, as one notice; nothing after a plain query.
+        let r = exec("begin dbms_output.put_line('hello'); dbms_output.put_line(''); dbms_output.put_line('world'); end;").await.unwrap();
+        assert_eq!(r.notices, ["hello\n\nworld"], "{driver}");
+        let r = exec("declare x number; begin for i in 1 .. 3000 loop dbms_output.put_line(rpad('x', 20, 'x') || i); end loop; end;").await.unwrap();
+        assert_eq!(r.notices.len(), 1, "{driver}");
+        assert_eq!(r.notices[0].lines().count(), 3000, "{driver}: lines over several reads");
+        // A line longer than one read holds: cut, marked, and the next one kept.
+        let r = exec("begin dbms_output.put_line(rpad('y', 32767, 'y')); dbms_output.put_line('next'); end;").await.unwrap();
+        let lines: Vec<&str> = r.notices[0].lines().collect();
+        assert!(
+            lines.len() == 2 && lines[0].ends_with('…') && lines[0].len() <= 8000 && lines[1] == "next",
+            "{driver}: {:?}",
+            lines.iter().map(|l| l.len()).collect::<Vec<_>>()
+        );
+        assert!(exec("select 1 from dual").await.unwrap().notices.is_empty(), "{driver}");
+        // Printed before an error: still shown.
+        let e = s
+            .execute(
+                databrain_connector_core::Statement::internal("begin dbms_output.put_line('before'); raise_application_error(-20001, 'boom'); end;"),
+                ExecOptions::default(),
+            )
+            .await
+            .unwrap();
+        let mut notices = Vec::new();
+        let mut failed = false;
+        let mut e = e;
+        while let Some(ev) = e.next().await {
+            match ev {
+                Ok(databrain_connector_core::StreamEvent::Notice(n)) => notices.push(n),
+                Err(_) => failed = true,
+                _ => {}
+            }
+        }
+        assert!(failed && notices == ["before"], "{driver}: {notices:?}");
+
+        // A materialized view lists as one (not as its table); RAW keeps its length.
+        let _ = exec("drop materialized view kb_mv").await;
+        let _ = exec("drop table kb_raw purge").await;
+        exec("create table kb_raw (id raw(16), n number)").await.unwrap();
+        exec("create materialized view kb_mv as select n from kb_raw").await.unwrap();
+        let me = first(&s, "select sys_context('USERENV','CURRENT_SCHEMA') from dual").await;
+        let objs = s.list_objects(&me).await.unwrap();
+        let mv: Vec<ObjectKind> = objs.iter().filter(|o| o.name == "KB_MV").map(|o| o.kind).collect();
+        assert_eq!(mv, [ObjectKind::MaterializedView], "{driver}");
+        let versions = s.object_versions(&me).await.unwrap().unwrap();
+        assert!(versions.contains_key(&databrain_connector_core::version_key(ObjectKind::MaterializedView, "KB_MV")), "{driver}");
+        assert!(!versions.contains_key(&databrain_connector_core::version_key(ObjectKind::Table, "KB_MV")), "{driver}");
+        let cols = s.columns(&me, Some("KB_RAW")).await.unwrap();
+        assert_eq!(cols[0].1.data_type, "RAW(16)", "{driver}");
+        let m = s.bulk_metadata(std::slice::from_ref(&me)).await.unwrap();
+        let t = m[0].columns.iter().find(|t| t.table == "KB_RAW").unwrap();
+        assert_eq!(t.columns[0].data_type, "RAW(16)", "{driver}");
+
+        // Read-only: each statement sees the data as it is now, on the same session.
+        let ro = live_session(driver, true).await.unwrap();
+        const COUNT: &str = "select count(*) from kb_raw";
+        const SID: &str = "select sys_context('USERENV','SID') from dual";
+        let sid0 = cell(&ro, SID).await;
+        assert_eq!(cell(&ro, COUNT).await, "0");
+        exec("insert into kb_raw values (hextoraw('ff'), 1)").await.unwrap();
+        assert_eq!(cell(&ro, COUNT).await, "1", "{driver}: the read-only session sees the new row");
+        assert_eq!(cell(&ro, SID).await, sid0, "{driver}: no reconnect between statements");
+        // Still read-only after a COMMIT run on it.
+        let _ = ro.execute(databrain_connector_core::Statement::internal("commit"), ExecOptions::default()).await.unwrap().collect().await;
+        let w = ro
+            .execute(databrain_connector_core::Statement::internal("insert into kb_raw values (null, 2)"), ExecOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(w.is_err(), "{driver}: write refused after COMMIT");
+
+        exec("drop materialized view kb_mv").await.unwrap();
+        exec("drop table kb_raw purge").await.unwrap();
+        exec("drop view kb_case_v").await.unwrap();
+        exec("drop procedure kb_endline").await.unwrap();
+        exec("drop type kb_pair").await.unwrap();
+    }
+
     async fn check_driver(driver: &str) {
         check_abandoned_catalog_query(driver).await;
         check_routines(driver).await;
+        check_plsql_catalog_and_read_only(driver).await;
         let Some(s) = live(driver).await else {
             panic!("live test: DATABRAIN_ORACLE_HOST not set (run with --ignored)");
         };
