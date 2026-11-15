@@ -89,3 +89,60 @@ test.describe("job canvas", () => {
     await expect(card).toContainText('relation "orders" does not exist');
   });
 });
+
+test.describe("the assistant changes a job with unsaved edits here", () => {
+  const step = { id: "n1", name: "orders_today", kind: "query", connection_id: "conn-shop", sql: "select * from orders", x: 80, y: 80, load_mode: "insert" };
+  const job = { id: "job-orders", name: "Orders", nodes: [step], edges: [], schedule: { enabled: false, mode: "interval", minutes: 60, at: "08:00", weekdays: [] }, created_at: 1, updated_at: 1 };
+
+  /** The job open, its step renamed here but not saved (the save fails), then the assistant's update_job. */
+  async function conflict(page: Page) {
+    await openApp(page, backend({ __jobs: [job] }));
+    await page.getByRole("button", { name: "Jobs", exact: true }).click();
+    await page.getByText("Orders", { exact: true }).click();
+    const card = page.getByLabel("Job steps").locator("[data-node]").first();
+    await expect(card).toContainText("orders_today");
+    await answer(page, "save_job", { __error: { kind: "internal", message: "disk full" } });
+    await card.click();
+    await page.getByLabel("Step details").getByRole("textbox").first().fill("mine");
+    await expect.poll(async () => (await calls(page, "save_job")).length).toBe(1);
+    // The assistant saved its version meanwhile; saving works again.
+    await page.evaluate((j) => {
+      const w = window as unknown as { __DB_MOCK__: { handlers: Record<string, unknown>; db: { jobs: unknown[] } } };
+      delete w.__DB_MOCK__.handlers.save_job;
+      w.__DB_MOCK__.db.jobs = [{ ...j, nodes: [{ ...j.nodes[0], name: "assistants" }], updated_at: 2 }];
+      window.dispatchEvent(new CustomEvent("db:job-changed", { detail: { id: j.id } }));
+    }, job);
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toContainText("The assistant changed this job");
+    return { card, dialog };
+  }
+
+  test("closing the question shows the assistant's version and saves nothing over it", async ({ page }) => {
+    const { card, dialog } = await conflict(page);
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+    await expect(card).toContainText("assistants");
+    await expect(page.getByLabel("Step details").getByRole("textbox").first()).toHaveValue("assistants");
+    // Longer than the name check (250 ms) and the save delay (600 ms) together.
+    await page.waitForTimeout(1500);
+    expect(await calls(page, "save_job")).toHaveLength(1);
+  });
+
+  test("Cancel shows the assistant's version too", async ({ page }) => {
+    const { card, dialog } = await conflict(page);
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(card).toContainText("assistants");
+    await expect(page.getByLabel("Step details").getByRole("textbox").first()).toHaveValue("assistants");
+    await page.waitForTimeout(1500);
+    expect(await calls(page, "save_job")).toHaveLength(1);
+  });
+
+  test("Keep my changes saves them over the assistant's", async ({ page }) => {
+    const { card, dialog } = await conflict(page);
+    await dialog.getByRole("button", { name: "Keep my changes" }).click();
+    await expect.poll(async () => (await lastSaved(page))?.nodes[0].name).toBe("mine");
+    await expect(card).toContainText("mine");
+    await page.waitForTimeout(1500);
+    expect(await calls(page, "save_job")).toHaveLength(2);
+  });
+});
