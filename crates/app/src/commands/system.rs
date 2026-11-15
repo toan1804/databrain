@@ -137,13 +137,14 @@ pub(crate) async fn check_for_update(app: AppHandle) -> R<Option<updates::Update
     }
     let mut info = r?;
     if let Some(i) = info.as_mut().filter(|i| i.newer) {
-        i.installable = match signed_update(&app).await {
-            Ok(u) => u.is_some(),
+        match signed_update(&app).await {
+            Ok(Some(_)) => i.installable = true,
+            Ok(None) => i.install_note = Some(format!("the release has no signed update newer than {} for this computer", i.current)),
             Err(e) => {
-                tracing::info!(error = %e, "no installable update (download link only)");
-                false
+                tracing::warn!(error = %e, "no installable update (download link only)");
+                i.install_note = Some(e);
             }
-        };
+        }
     }
     Ok(info)
 }
