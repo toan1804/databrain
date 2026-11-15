@@ -122,6 +122,8 @@ export interface TabRun {
   /** Suggestions to improve the query, computed after it ran. */
   tips?: RunTips;
   connectionId?: string;
+  /** This job refreshes one result of the run (its statement index); the others stay as they were. */
+  refreshOf?: number;
 }
 
 export interface Toast {

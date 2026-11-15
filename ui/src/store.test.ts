@@ -12,6 +12,11 @@ const out = (handle: string, tab: string, index: number, extra: Record<string, u
 let outputs: OutputInfo[] = [];
 const deleted: string[] = [];
 const savedNotebooks: Record<string, unknown>[] = [];
+/** While set, run_query waits for it (a slow connect). */
+let gate: Promise<void> | null = null;
+const cancelled: string[] = [];
+const closedTabs: string[] = [];
+const reran: string[] = [];
 
 vi.mock("./lib/api", () => ({
   isTauri: () => false,
@@ -20,6 +25,7 @@ vi.mock("./lib/api", () => ({
   onAuthEvent: async () => () => {},
   api: {
     runQuery: async (req: RunRequest) => {
+      if (gate) await gate;
       const job_id = `job-${++jobSeq}`;
       const plan = { index: 0, sql: req.sql, start: 0, end: req.sql.length, classification: { kind: "read", missing_where: false, keyword: "SELECT" } };
       if (emitBeforeResolve) {
@@ -30,7 +36,25 @@ vi.mock("./lib/api", () => ({
       }
       return { status: "started", job_id, statements: [plan] };
     },
-    cancelQuery: async () => cancelResult.value,
+    cancelQuery: async (id: string) => {
+      cancelled.push(id);
+      return cancelResult.value;
+    },
+    closeTab: async (id: string) => {
+      closedTabs.push(id);
+    },
+    // Statement 1 of the tab's run, again: a new output in its place.
+    rerunOutput: async (req: RunRequest, handle: string) => {
+      reran.push(handle);
+      const job_id = `job-${++jobSeq}`;
+      const t = req.tab_id;
+      const plan = { index: 1, sql: req.sql, start: 0, end: req.sql.length, classification: { kind: "read", missing_where: false, keyword: "SELECT" } };
+      const output = { ...out("r9", t, 1), state: "live" };
+      handler?.({ type: "statement_started", job_id, tab_id: t, index: 1, sql: req.sql });
+      handler?.({ type: "statement_finished", job_id, tab_id: t, index: 1, result: null, output, rows_affected: 0, duration_ms: 3, notices: [] } as never);
+      handler?.({ type: "job_finished", job_id, tab_id: t, status: "success", duration_ms: 7, in_transaction: false });
+      return { status: "started", job_id, statements: [plan] };
+    },
     deleteConnection: async (id: string) => {
       deleted.push(id);
     },
@@ -335,5 +359,64 @@ describe("Run all", () => {
     } finally {
       (api as { runQuery: typeof api.runQuery }).runQuery = real;
     }
+  });
+});
+
+describe("refreshing one result after saving edits", () => {
+  it("runs that statement only; the run's other results, status and time stay", async () => {
+    const plan = (i: number) => ({ index: i, sql: `select ${i}`, start: i * 10, end: i * 10 + 8, classification: { kind: "read" as const, missing_where: false, keyword: "SELECT" } });
+    const done = (i: number) => ({ plan: plan(i), status: "done" as const, notices: [], output: out(`r${i + 1}`, "t", i) });
+    useStore.setState({
+      tabs: [{ id: "t", title: "q", sql: "", connection_id: "conn" } as never],
+      runs: { t: { jobId: "old", running: false, startedAt: 0, finishedStatus: "success", durationMs: 500, statements: [done(0), done(1), done(2)], activeIndex: 2, connectionId: "conn" } },
+    });
+    expect(await useStore.getState().refreshResult("t", 1)).toBe(true);
+    expect(reran).toEqual(["r2"]);
+    const run = useStore.getState().runs.t;
+    expect(run.statements.map((x) => x.output?.handle)).toEqual(["r1", "r9", "r3"]);
+    // Its place in the editor is the statement's own, not offset 0 of the re-run text.
+    expect(run.statements[1].plan.start).toBe(10);
+    expect(run.activeIndex).toBe(1);
+    expect(run.running).toBe(false);
+    expect(run.durationMs).toBe(500);
+    expect(run.finishedStatus).toBe("success");
+    expect(run.refreshOf).toBeUndefined();
+  });
+
+  it("does nothing for a statement without a result, or while the tab runs", async () => {
+    reran.length = 0;
+    useStore.setState({ runs: { t: { jobId: "j", running: true, startedAt: 0, statements: [{ plan: { index: 0 } as never, status: "running", notices: [], output: out("r1", "t", 0) }], activeIndex: 0 } } });
+    expect(await useStore.getState().refreshResult("t", 0)).toBe(false);
+    expect(await useStore.getState().refreshResult("t", 5)).toBe(false);
+    expect(reran).toEqual([]);
+  });
+});
+
+describe("a tab closed while its run starts", () => {
+  it("stops what started and shows nothing for it", async () => {
+    emitBeforeResolve = false;
+    cancelled.length = 0;
+    closedTabs.length = 0;
+    let open!: () => void;
+    gate = new Promise<void>((r) => (open = r));
+    useStore.setState({ tabs: [{ id: "slow", title: "q", sql: "", connection_id: "conn" } as never], runs: {} });
+    const p = useStore.getState().runSql("slow", "conn", "update t set a = 1 where id = 1");
+    // Cmd+W before run_query answers.
+    useStore.setState({ tabs: [] });
+    open();
+    gate = null;
+    expect(await p).toBe(false);
+    expect(useStore.getState().runs.slow).toBeUndefined();
+    expect(cancelled).toEqual([`job-${jobSeq}`]);
+    expect(closedTabs).toContain("slow");
+  });
+
+  it("runs as before while the tab stays open", async () => {
+    emitBeforeResolve = false;
+    cancelled.length = 0;
+    useStore.setState({ tabs: [{ id: "open", title: "q", sql: "", connection_id: "conn" } as never], runs: {} });
+    expect(await useStore.getState().runSql("open", "conn", "select 1")).toBe(true);
+    expect(useStore.getState().runs.open?.running).toBe(true);
+    expect(cancelled).toEqual([]);
   });
 });

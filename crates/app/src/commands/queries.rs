@@ -65,6 +65,11 @@ pub(crate) async fn run_query(state: State<'_, AppState>, req: RunRequest) -> R<
 }
 
 #[tauri::command]
+pub(crate) async fn rerun_output(state: State<'_, AppState>, req: RunRequest, handle: String) -> R<RunResponse> {
+    api::rerun_output(&state, req, &handle)
+}
+
+#[tauri::command]
 pub(crate) async fn cancel_query(state: State<'_, AppState>, job_id: String) -> R<bool> {
     Ok(api::cancel_query(&state, &job_id))
 }

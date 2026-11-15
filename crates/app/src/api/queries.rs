@@ -65,12 +65,25 @@ pub fn preview_parameters(
     values.into_iter().map(|(k, v)| (k, databrain_connector_core::sql::render_param(&v, kind))).collect()
 }
 
-pub fn run_query(state: &AppState, mut req: RunRequest) -> Result<RunResponse> {
+pub fn run_query(state: &AppState, req: RunRequest) -> Result<RunResponse> {
+    run_query_replacing(state, req, None)
+}
+
+/// Run the statement of output `handle` again as that result only (the
+/// grid's saved edits shown again): the tab's other results stay.
+pub fn rerun_output(state: &AppState, req: RunRequest, handle: &str) -> Result<RunResponse> {
+    run_query_replacing(state, req, Some(handle))
+}
+
+fn run_query_replacing(state: &AppState, mut req: RunRequest, replaces: Option<&str>) -> Result<RunResponse> {
     let text = req.sql.clone();
     // The engine works in bytes; the UI's base offset is UTF-16.
     let base_utf16 = req.base_offset;
     req.base_offset = 0;
-    let mut resp = state.engine.run(req)?;
+    let mut resp = match replaces {
+        Some(h) => state.engine.rerun_output(req, h)?,
+        None => state.engine.run(req)?,
+    };
     let statements = match &mut resp {
         RunResponse::Started { statements, .. } => statements,
         RunResponse::NeedsConfirmation { statements, .. } => statements,

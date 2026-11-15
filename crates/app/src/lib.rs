@@ -259,6 +259,7 @@ pub fn run() {
             commands::queries::save_base64_file,
             commands::queries::preview_parameters,
             commands::queries::run_query,
+            commands::queries::rerun_output,
             commands::queries::cancel_query,
             commands::queries::close_tab,
             commands::queries::set_auto_commit,

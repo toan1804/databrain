@@ -11,6 +11,11 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- After saving edited rows, only that result is read again: the script's other results stay (they disappeared, and an error in the re-read pointed at the start of the editor). The new result keeps its statement's place.
+- Closing a tab while its query was still starting (connecting, signing in, waiting for a confirmation) left the query running with nothing to show it or stop it. It is stopped now.
+- A result whose first rows could not be read stayed blank, as if loading, until the query ran again. The grid says why and offers Retry.
+- Copying from the grid says how many rows were really copied (at most 100,000; it said the number selected), copies several cells so that a value like `=HYPERLINK(…)` pastes into a spreadsheet as text, and says when changes not saved yet are left out. Copying or transposing several separate blocks asks for one; Delete and Revert take the rows of every block.
+- Compare's "Show more" can't append the same rows twice (a double click) or rows of the filter used before.
 - Saving edited rows on a production connection asks first and shows the statements (before, Save ran them at once; running a query or loading rows there already asked). Cells changed while a save is on its way are no longer dropped: the grid takes no edits until the save is done.
 - In the result grid, picking rows apart from each other (Cmd/Ctrl-click) and choosing Delete or Revert acted on every row between them. The actions now take exactly the rows picked, and say so instead of skipping rows that aren't loaded yet; Copy and Transpose ask for rows next to each other.
 - History's Run again no longer runs a statement whose secret was hidden when it was saved (`IDENTIFIED BY '***'` would have set that password): it opens it for the secret to be put back.

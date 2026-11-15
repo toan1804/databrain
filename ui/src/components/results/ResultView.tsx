@@ -194,13 +194,13 @@ export function ResultView({
         `${formatCount(r.rows)} row${r.rows === 1 ? "" : "s"} changed${r.in_open_transaction ? " in the open transaction — COMMIT to keep" : ""}`,
         "success",
       );
-      // Refresh the result from the database (same run key and session).
-      const sql = stmt.output?.sql;
-      if (connId && isQueryTab(tab)) void useStore.getState().refreshTxState(tabId, connId);
-      if (sql && connId && isQueryTab(tab)) void useStore.getState().runSql(tabId, connId, sql);
-      else if (sql && connId && tabId.startsWith("nb:"))
-        void useStore.getState().runSql(tabId, connId, sql, 0, tabId.split(":").slice(0, 2).join(":"), stmt.output?.name);
-      else toast("Re-run the query to see the saved rows", "info");
+      // This result again from the database (same run key and session); the
+      // run's other results stay as they are.
+      const st = useStore.getState();
+      if (connId && isQueryTab(tab)) void st.refreshTxState(tabId, connId);
+      const handle = stmt.output?.handle;
+      const at = handle ? (st.runs[tabId]?.statements.findIndex((x) => x.output?.handle === handle) ?? -1) : -1;
+      if (at < 0 || !(await st.refreshResult(tabId, at))) toast("Re-run the query to see the saved rows", "info");
     } catch (e) {
       toast(toError(e).message, "error");
     } finally {

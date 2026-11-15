@@ -73,16 +73,39 @@ impl QueryEngine {
         self.start_run(req, None)
     }
 
+    /// Run the statement that made output `handle` again, as that result
+    /// only (the grid shows saved edits): the tab's other results stay
+    /// active and shown, and the new result takes the old one's statement
+    /// index, so events and the output say where it belongs. `req` holds
+    /// that one statement, on the output's tab.
+    pub fn rerun_output(self: &Arc<Self>, req: RunRequest, handle: &str) -> Result<RunResponse> {
+        self.start(req, None, Some(handle))
+    }
+
     /// [`Self::run`]; `waiter` also gets this run's outcome events
     /// (statement finished/failed, job finished), so a caller waiting for it
     /// can't miss them the way a lagging broadcast subscriber can.
     pub(crate) fn start_run(self: &Arc<Self>, req: RunRequest, waiter: Option<Waiter>) -> Result<RunResponse> {
+        self.start(req, waiter, None)
+    }
+
+    fn start(self: &Arc<Self>, req: RunRequest, waiter: Option<Waiter>, replaces: Option<&str>) -> Result<RunResponse> {
         let profile = self.workspace.get_connection(&req.connection_id)?;
         let mut plan = self.plan(&profile, &req.sql);
         if plan.is_empty() {
             return Err(EngineError::new("invalid", "Nothing to run"));
         }
         Self::bind_parameters(&mut plan, profile.config.kind, &req.params)?;
+        if let Some(h) = replaces {
+            let o = self.outputs.get(h).ok_or_else(|| EngineError::new("not_found", format!("output {h} not found")))?;
+            if o.tab_id != req.tab_id {
+                return Err(EngineError::new("invalid", format!("{h} is a result of another tab")));
+            }
+            if plan.len() != 1 {
+                return Err(EngineError::new("invalid", "A result is refreshed by one statement"));
+            }
+            plan[0].index = o.statement_index;
+        }
         if let Some(n) = req.output_name.as_deref().filter(|n| !n.is_empty()) {
             outputs::validate_name(n)?;
             self.outputs.check_owner(n, &req.tab_id)?;
@@ -103,8 +126,12 @@ impl QueryEngine {
             // The job's task ends the entry (`JobGuard`, `run_job`).
             Guarded::Go { claim, .. } => claim.expect("held").keep(),
         }
-        // Previous outputs of this tab become "recent" (evictable).
-        self.outputs.begin_run(&req.tab_id);
+        // Previous outputs of this tab become "recent" (evictable); a
+        // refreshed result only replaces its own.
+        match replaces {
+            Some(h) => self.outputs.retire(&req.tab_id, h),
+            None => self.outputs.begin_run(&req.tab_id),
+        }
 
         let engine = self.clone();
         let jid = job_id.clone();

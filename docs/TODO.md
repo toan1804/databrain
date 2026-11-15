@@ -88,15 +88,7 @@ A review of the 54 commits since v0.4.1 (PRs #40–#53). Findings were checked o
 
 ## UI (review of 2026-11-15)
 
-Fixed on 2026-11-15: saving grid edits on production without a confirmation, row actions on rows picked apart, History re-running text with a hidden secret, the comma-separated AI settings, the approval card (connection, production, the whole SQL, the edit kept), Auto-approve following a conversation to another connection, deleting a configured load or export step, the schedule interval and weekdays, loads that remove rows, the test-data dialog's stale rows, Run all with a selection, an AI edit whose text is gone, the confirm dialog's single slot, duplicate connections after a failed sign-in, completion after a backslash or a quoted name. Left:
-
-**Runs and edits**
-- **Saving grid edits re-runs one statement as the tab's whole run** (`ResultView.tsx`, `runSql`): after a five-statement script the other four results go, and an error range points at offset 0.
-- **A run is registered for a tab closed meanwhile** (`runsSlice.ts`): Cmd+W before `run_query` answers leaves the statement running with no UI and no Stop.
-- **The grid stays "loading" after a failed first page** (`ResultGrid.tsx`): nothing retries until the query is run again.
-- **Copying a whole column sends every row in one string** to the clipboard on the UI thread, with no cap; the toast reports the rows asked for, not copied; values starting with `=` paste as formulas (export has an Excel-safe option, copy has not); pending edits are not copied.
-- **Compare "Show more"** has no in-flight guard (a double click appends the same rows twice; rows of an older filter can be appended).
-- **Multi-rectangle selections**: only the current rectangle is used; the other rectangles are ignored.
+Fixed later on 2026-11-15: refreshing one result after saving edits (it dropped the script's other results), runs of a tab closed while starting, the grid stuck after a failed page, copying (cap, count, formulas, unsaved changes), Compare's Show more, several selected blocks. Fixed on 2026-11-15: saving grid edits on production without a confirmation, row actions on rows picked apart, History re-running text with a hidden secret, the comma-separated AI settings, the approval card (connection, production, the whole SQL, the edit kept), Auto-approve following a conversation to another connection, deleting a configured load or export step, the schedule interval and weekdays, loads that remove rows, the test-data dialog's stale rows, Run all with a selection, an AI edit whose text is gone, the confirm dialog's single slot, duplicate connections after a failed sign-in, completion after a backslash or a quoted name. Left:
 
 **Assistant**
 - **A conversation can stay "running"** when its last event is lost: Stop does nothing while the run id is unknown, and questions only queue (`aiStore.ts`).

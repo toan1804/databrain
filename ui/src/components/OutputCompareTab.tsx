@@ -2,7 +2,7 @@
 // rows per column, and the differing rows with changed cells shown as
 // before → after. Counts are exact (a summary query); rows are paged from
 // the diff result, filtered on the backend.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { charDiff, differsUnseen, type TextChar } from "../lib/textDiff";
 import { AlertTriangle, ArrowLeftRight, FileCode2, Loader2, RefreshCw, Settings2, Table2 } from "lucide-react";
 import { api, toError } from "../lib/api";
@@ -71,8 +71,16 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
     [onlyDiffering, run, values, changedCount],
   );
 
+  /** Counts the views (compare, filter, column): a page asked for an older one is not appended. */
+  const viewGen = useRef(0);
+  /** "Show more" is on its way: a second click waits for it (it would append the same rows again). */
+  const [loadingMore, setLoadingMore] = useState(false);
+  const moreBusy = useRef(false);
   // First page whenever the compare, the filter or the column changes.
   useEffect(() => {
+    viewGen.current += 1;
+    moreBusy.current = false;
+    setLoadingMore(false);
     if (!run || !layout) return;
     let alive = true;
     api.fetchPage(run.result.id, diffView(layout, filter, column), 0, PAGE).then(
@@ -88,11 +96,22 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
     };
   }, [run, layout, filter, column, toast]);
   const more = () => {
-    if (!run || !layout) return;
+    if (!run || !layout || moreBusy.current) return;
+    moreBusy.current = true;
+    setLoadingMore(true);
+    const gen = viewGen.current;
+    const from = rows.length;
+    const current = () => gen === viewGen.current;
     api
-      .fetchPage(run.result.id, diffView(layout, filter, column), rows.length, PAGE)
-      .then((p) => setRows((r) => [...r, ...p.rows]))
-      .catch((e) => toast(toError(e).message, "error"));
+      .fetchPage(run.result.id, diffView(layout, filter, column), from, PAGE)
+      // Only onto the rows it continues (same view, nothing appended since).
+      .then((p) => current() && setRows((r) => (r.length === from ? [...r, ...p.rows] : r)))
+      .catch((e) => current() && toast(toError(e).message, "error"))
+      .finally(() => {
+        if (!current()) return;
+        moreBusy.current = false;
+        setLoadingMore(false);
+      });
   };
 
   if (!tab || !spec) return null;
@@ -288,7 +307,7 @@ export function OutputCompareTab({ tabId, visible }: { tabId: string; visible: b
             )}
             {rows.length < viewRows && (
               <div className="p-2 text-center">
-                <button className="btn-ghost py-0.5 text-[11.5px]" onClick={more}>
+                <button className="btn-ghost py-0.5 text-[11.5px]" onClick={more} disabled={loadingMore}>
                   Show {formatCount(Math.min(PAGE, viewRows - rows.length))} more of {formatCount(viewRows - rows.length)}
                 </button>
               </div>
