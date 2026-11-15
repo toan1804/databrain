@@ -77,12 +77,14 @@ pub(crate) async fn run(
         tx.send(StreamEvent::Done(ExecSummary { rows_affected: Some(r.rows_affected().iter().sum()) })).await;
         return Ok(Ended::Complete);
     }
-    let server_cap = opts.max_rows.filter(|_| !user_rowcount && databrain_connector_core::sql::classify(sql, ConnectorKind::Mssql).kind.is_read());
+    let limit = Limit::of(sql, replaceable);
+    let server_cap = opts.max_rows.filter(|_| !user_rowcount && limit.is_read);
     let Some(n) = server_cap else {
-        return read(conn, sql, opts, tx, replaceable, state).await;
+        return read(conn, sql, opts, tx, limit, state).await;
     };
-    // Same line: error line numbers stay those of the user's SQL.
-    let r = read(conn, &format!("set rowcount {n}; {sql}"), opts, tx, false, state).await;
+    // Same line: error line numbers stay those of the user's SQL. The
+    // server stops at the limit, so reading the rest costs nothing.
+    let r = read(conn, &format!("set rowcount {n}; {sql}"), opts, tx, Limit { abandon: false, ..limit }, state).await;
     let reset = match conn.simple_query("set rowcount 0").await {
         Ok(s) => s.into_results().await.map(|_| ()).map_err(map_err),
         Err(e) => Err(map_err(e)),
@@ -93,7 +95,30 @@ pub(crate) async fn run(
     Ok(ended)
 }
 
-pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &StreamSender, replaceable: bool, state: &ConnState) -> Result<Ended> {
+/// What [`read`] does at the row limit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Limit {
+    /// Stop without reading the rest (the connection is closed); otherwise
+    /// the rest is read and dropped.
+    pub abandon: bool,
+    /// The statement is a classified read (else a notice says it ran to its end).
+    pub is_read: bool,
+}
+
+impl Limit {
+    /// Only a classified read on a connection that carries no session
+    /// state may be abandoned at the row limit. Anything else (`EXEC p`, a
+    /// batch that writes after its SELECT) is read to its end: closing the
+    /// connection would stop the procedure half-way while the run looked
+    /// finished.
+    pub(crate) fn of(sql: &str, replaceable: bool) -> Limit {
+        let is_read = databrain_connector_core::sql::classify(sql, ConnectorKind::Mssql).kind.is_read();
+        Limit { abandon: replaceable && is_read, is_read }
+    }
+}
+
+/// Read `sql`'s results.
+pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &StreamSender, limit: Limit, state: &ConnState) -> Result<Ended> {
     let mut stream = conn.simple_query(sql).await.map_err(map_err)?;
     let mut builder: Option<BatchBuilder> = None;
     // Per column: money (the driver's float is turned back into exact text).
@@ -137,11 +162,17 @@ pub(crate) async fn read(conn: &mut Conn, sql: &str, opts: &ExecOptions, tx: &St
                     for n in b.notices(None) {
                         tx.send(StreamEvent::Notice(n)).await;
                     }
-                    if replaceable {
+                    if limit.abandon {
                         return Ok(Ended::Stopped { last, unread: true });
                     }
+                    // Read to its end (a procedure finishes its work, and an
+                    // error after the limit is still reported); the rows
+                    // past the limit are dropped.
                     while let Some(item) = stream.next().await {
                         item.map_err(map_err)?;
+                    }
+                    if !limit.is_read {
+                        tx.send(StreamEvent::Notice(format!("The statement ran to its end; only its first {max} rows are kept."))).await;
                     }
                     return Ok(Ended::Stopped { last, unread: false });
                 }
@@ -180,5 +211,26 @@ mod tests {
         assert!(!is_dml("select 1"));
         assert!(!is_dml("exec sp_who"));
         assert!(!is_dml("create procedure p as select 1"), "DDL runs as a batch");
+    }
+
+    /// Only a plain read may be cut off at the row limit; a procedure or a
+    /// batch that writes runs to its end.
+    #[test]
+    fn only_reads_are_abandoned_at_the_row_limit() {
+        for sql in ["select * from t", "with x as (select 1 as a) select * from x", "SELECT TOP 10 * FROM sys.objects"] {
+            assert_eq!(Limit::of(sql, true), Limit { abandon: true, is_read: true }, "{sql}");
+            assert_eq!(Limit::of(sql, false), Limit { abandon: false, is_read: true }, "{sql}: the connection's state is kept");
+        }
+        for sql in [
+            "exec p",
+            "EXECUTE dbo.load_orders @day = '2026-01-01'",
+            "p",
+            "select * from t; insert into t values (1)",
+            "select * from t\nupdate t set a = 1",
+            "insert into t output inserted.id select id from s",
+            "declare @x int; select @x = 1; select * from t",
+        ] {
+            assert_eq!(Limit::of(sql, true), Limit { abandon: false, is_read: false }, "{sql}");
+        }
     }
 }
