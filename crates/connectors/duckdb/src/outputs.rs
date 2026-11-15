@@ -4,7 +4,6 @@ use std::sync::Arc;
 use databrain_connector_core::external::{ExternalTablesSlot, OutputMasks, RESULTS_SCHEMA, referenced_results};
 use databrain_connector_core::{ColumnInfo, ConnectorError, ConnectorKind, DbObject, ObjectKind, Result, TableColumns, quote_ident, quote_literal};
 
-use crate::database::Loaded;
 use crate::error::map_err;
 use crate::session::DuckSession;
 
@@ -52,7 +51,6 @@ pub(crate) fn load_outputs(
     conn: &duckdb::Connection,
     sql: &str,
     slot: Option<&ExternalTablesSlot>,
-    loaded: &Loaded,
     masks: Option<&OutputMasks>,
     shared: bool,
     sandboxed: bool,
@@ -99,15 +97,16 @@ pub(crate) fn load_outputs(
         if let Some(n) = &t.notice {
             notices.push(n.clone());
         }
-        let key = name.to_ascii_lowercase();
-        let current = loaded.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?.get(&key).cloned();
-        if current.as_deref() == Some(t.version_key.as_str()) {
+        // What `results.<name>` holds is the version in its comment: written
+        // with the load, so a load rolled back (inside BEGIN … ROLLBACK)
+        // takes its version with it, and the next statement loads again.
+        if loaded_version(conn, &name)?.as_deref() == Some(t.version_key.as_str()) {
             continue;
         }
         let attached: bool =
             conn.query_row("SELECT count(*) > 0 FROM duckdb_databases() WHERE database_name = 'results'", [], |r| r.get(0)).map_err(map_err)?;
         if !attached {
-            conn.execute_batch(&format!("ATTACH ':memory:' AS {RESULTS_SCHEMA}")).map_err(map_err)?;
+            conn.execute_batch(&format!("ATTACH ':memory:' AS {RESULTS_SCHEMA} (READ_WRITE)")).map_err(map_err)?;
         }
         let table = quote_ident(ConnectorKind::Duckdb, &name);
         // Rows on disk: a view over the files where the session may read
@@ -157,7 +156,7 @@ pub(crate) fn load_outputs(
                     .map_err(ConnectorError::query)?;
                 app.flush().map_err(map_err)?;
             }
-            loaded.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?.insert(key, t.version_key);
+            mark_loaded(conn, &name, &t.version_key)?;
             continue;
         }
         let batches: Vec<_> = t.batches.iter().map(normalize_for_duckdb).collect::<Result<_>>()?;
@@ -179,7 +178,7 @@ pub(crate) fn load_outputs(
             }
             app.flush().map_err(map_err)?;
         }
-        loaded.lock().map_err(|_| ConnectorError::internal("lock poisoned"))?.insert(key, t.version_key);
+        mark_loaded(conn, &name, &t.version_key)?;
     }
     Ok(notices)
 }
@@ -211,18 +210,41 @@ fn refuse_results_as_default(conn: &duckdb::Connection, sql: &str) -> Result<()>
     Ok(())
 }
 
+/// What `results.<name>` is now: `VIEW` (over an output's files), `TABLE`, or None.
+fn object_kind(conn: &duckdb::Connection, name: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_views() WHERE database_name = 'results' AND lower(view_name) = lower(?1)) THEN 'VIEW' \
+         WHEN EXISTS (SELECT 1 FROM duckdb_tables() WHERE database_name = 'results' AND lower(table_name) = lower(?1)) THEN 'TABLE' END",
+        [name],
+        |r| r.get(0),
+    )
+    .map_err(map_err)
+}
+
 /// SQL that drops what `results.<name>` is now (a table, or a view over an
 /// output's files): DuckDB refuses `DROP VIEW` of a table, even `IF EXISTS`.
 fn drop_existing(conn: &duckdb::Connection, name: &str) -> Result<String> {
-    let kind: Option<String> = conn
-        .query_row(
-            "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_views() WHERE database_name = 'results' AND lower(view_name) = lower(?1)) THEN 'VIEW' \
-             WHEN EXISTS (SELECT 1 FROM duckdb_tables() WHERE database_name = 'results' AND lower(table_name) = lower(?1)) THEN 'TABLE' END",
-            [name],
-            |r| r.get(0),
-        )
-        .map_err(map_err)?;
-    Ok(kind.map_or_else(String::new, |k| format!("DROP {k} {RESULTS_SCHEMA}.main.{};", quote_ident(ConnectorKind::Duckdb, name))))
+    Ok(object_kind(conn, name)?.map_or_else(String::new, |k| format!("DROP {k} {RESULTS_SCHEMA}.main.{};", quote_ident(ConnectorKind::Duckdb, name))))
+}
+
+/// The output version `results.<name>` holds (its comment), if loaded.
+fn loaded_version(conn: &duckdb::Connection, name: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT comment FROM (SELECT view_name n, comment FROM duckdb_views() WHERE database_name = 'results' \
+         UNION ALL SELECT table_name, comment FROM duckdb_tables() WHERE database_name = 'results') WHERE lower(n) = lower(?1) LIMIT 1",
+        [name],
+        |r| r.get(0),
+    )
+    .or_else(|e| if matches!(e, duckdb::Error::QueryReturnedNoRows) { Ok(None) } else { Err(e) })
+    .map_err(map_err)
+}
+
+/// Record the output version `results.<name>` now holds, in its comment
+/// (in the same transaction as the load).
+fn mark_loaded(conn: &duckdb::Connection, name: &str, version: &str) -> Result<()> {
+    let Some(kind) = object_kind(conn, name)? else { return Ok(()) };
+    conn.execute_batch(&format!("COMMENT ON {kind} {RESULTS_SCHEMA}.main.{} IS {}", quote_ident(ConnectorKind::Duckdb, name), quote_literal(version)))
+        .map_err(map_err)
 }
 
 use databrain_connector_core::arrow::array::RecordBatch as Batch59;
@@ -254,7 +276,9 @@ pub(crate) fn native(dt: &Dt) -> Option<Dt> {
         Dt::Time32(_) | Dt::Time64(_) => Dt::Time64(TimeUnit::Microsecond),
         Dt::Decimal128(p, _) if *p <= 38 => dt.clone(),
         Dt::Decimal32(p, s) | Dt::Decimal64(p, s) => Dt::Decimal128(*p, *s),
-        Dt::Decimal256(..) => Dt::Float64,
+        // Exact, never DOUBLE: DuckDB's DECIMAL holds 38 digits; wider
+        // values stay exact as text (as a wider Decimal128 does).
+        Dt::Decimal256(p, s) if *p <= 38 => Dt::Decimal128(*p, *s),
         _ => return None,
     })
 }
@@ -531,6 +555,67 @@ mod tests {
         assert_eq!(count(sandboxed.as_ref(), "select count(*) from results.big").await.unwrap(), 3, "streamed in");
         let direct = count(sandboxed.as_ref(), &format!("select count(*) from read_parquet({})", quote_literal(&path))).await;
         assert!(direct.is_err(), "a sandboxed session can't read the result's files");
+    }
+
+    /// An output loaded inside a transaction that is rolled back is gone
+    /// with it: the next statement loads it again (also when the rollback
+    /// brings back an older version), instead of reading a missing or stale table.
+    #[tokio::test]
+    async fn an_output_loaded_in_a_rolled_back_transaction_is_loaded_again() {
+        let slot = ExternalTablesSlot::new();
+        let fake = Arc::new(FakeOutputs(std::sync::Mutex::new(("v1".into(), 4))));
+        slot.set(fake.clone());
+        let s = DuckdbConnector::with_outputs(slot)
+            .connect(&ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None), Arc::new(InlineCredentialSource::new(AuthMethod::None, None)))
+            .await
+            .unwrap();
+        let n = |r: databrain_connector_core::Collected| r.batches[0].column(0).as_primitive::<Int64Type>().value(0);
+        q(s.as_ref(), "begin").await;
+        assert_eq!(n(q(s.as_ref(), "select count(*) from results.sales").await), 4);
+        q(s.as_ref(), "rollback").await;
+        assert_eq!(n(q(s.as_ref(), "select count(*) from results.sales").await), 4, "loaded again after the rollback");
+        // v1 stays; v2 is loaded in a transaction that is rolled back (v1 comes back): v2 again.
+        *fake.0.lock().unwrap() = ("v2".into(), 10);
+        q(s.as_ref(), "begin").await;
+        assert_eq!(n(q(s.as_ref(), "select count(*) from results.sales").await), 10);
+        q(s.as_ref(), "rollback").await;
+        assert_eq!(n(q(s.as_ref(), "select count(*) from results.sales").await), 10, "not the older version the rollback restored");
+    }
+
+    /// A read-only database file still reads outputs: `results` is an
+    /// in-memory catalog of its own, attached read-write.
+    #[tokio::test]
+    async fn outputs_load_on_a_read_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.duckdb");
+        duckdb::Connection::open(&path).unwrap().execute_batch("CREATE TABLE t AS SELECT 1 AS a").unwrap();
+        let slot = ExternalTablesSlot::new();
+        slot.set(Arc::new(FakeOutputs(std::sync::Mutex::new(("v1".into(), 4)))));
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+        cfg.file_path = Some(path.to_string_lossy().into_owned());
+        cfg.read_only = true;
+        let s = DuckdbConnector::with_outputs(slot).connect(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::None, None))).await.unwrap();
+        let r = q(s.as_ref(), "select count(*) from results.sales join t on true").await;
+        assert_eq!(r.batches[0].column(0).as_primitive::<Int64Type>().value(0), 4);
+        let e = s.execute(databrain_connector_core::Statement::internal("create table u (x int)"), ExecOptions::default()).await.unwrap().collect().await;
+        assert!(e.is_err(), "the file itself stays read-only");
+    }
+
+    /// Decimal256 outputs stay exact: up to 38 digits as DECIMAL, wider as text.
+    #[test]
+    fn wide_decimals_stay_exact() {
+        use databrain_connector_core::arrow::array::{Array, Decimal256Array};
+        use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema, i256};
+        assert_eq!(native(&DataType::Decimal256(20, 2)), Some(DataType::Decimal128(20, 2)));
+        assert_eq!(native(&DataType::Decimal256(60, 2)), None, "text");
+        for (p, v) in [(20u8, "123456789012345678.91"), (60, "1234567890123456789012345678901234567890123456.78")] {
+            let raw = i256::from_string(&v.replace('.', "")).unwrap();
+            let col = Decimal256Array::from(vec![raw]).with_precision_and_scale(p, 2).unwrap();
+            let b = Batch59::try_new(Arc::new(Schema::new(vec![Field::new("d", col.data_type().clone(), true)])), vec![Arc::new(col)]).unwrap();
+            let out = normalize_for_duckdb(&b).unwrap();
+            let shown = databrain_connector_core::arrow::util::display::array_value_to_string(out.column(0), 0).unwrap();
+            assert_eq!(shown, v, "precision {p}");
+        }
     }
 
     #[tokio::test]

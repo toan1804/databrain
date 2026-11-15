@@ -3,7 +3,7 @@
 // and `schema.` / `alias.` paths. Pure logic over a metadata provider (tested
 // without CodeMirror); see components/sqlAssist.ts for the editor adapter.
 import type { ConnectorKind, DbObject, SchemaInfo } from "./types";
-import { mayHaveCatalog, schemaLabel } from "./catalog";
+import { duckFilesPrefix, mayHaveCatalog, schemaLabel } from "./catalog";
 import { traitsOf } from "./sourceTraits";
 import { blankLiterals, lexOptionsFor } from "./sqlText";
 import { quoteIdent } from "./util";
@@ -290,7 +290,9 @@ function findSchema(p: MetaProvider, written: string[]): SchemaInfo | undefined 
   if (written.length !== 1) return undefined;
   const def = defaultSchema(schemas);
   const byLabel = schemas.filter((s) => eq(schemaLabel(s), written[0]) || eq(s.name, written[0]));
-  return byLabel.find((s) => s.catalog && def?.catalog && s.catalog === def.catalog) ?? byLabel[0];
+  const found = byLabel.find((s) => s.catalog && def?.catalog && s.catalog === def.catalog) ?? byLabel[0];
+  // DuckDB reads `catalog.table` as the catalog's `main` (attached files: `files.sales`).
+  return found ?? (p.kind === "duckdb" ? schemas.find((s) => eq(s.name, `${written[0]}.main`)) : undefined);
 }
 
 /** Resolve a table reference to (schema id, table) using known metadata. */
@@ -333,7 +335,8 @@ export function tableApply(p: MetaProvider, o: DbObject): string {
   const k = p.kind;
   const def = defaultSchema(p.schemas());
   const known = (p.schemas() ?? []).find((s) => s.name === o.schema);
-  if (k === "duckdb" && o.schema.endsWith(".files")) return `files.${quoteIdent(k, o.name)}`;
+  const files = k === "duckdb" ? duckFilesPrefix(o.schema) : null;
+  if (files) return `${files}.${quoteIdent(k, o.name)}`;
   if (k === "duckdb" && o.schema === "results.main") return `results.${quoteIdent(k, o.name)}`;
   let parts: string[];
   if (threeLevel(k) && (known?.catalog || o.schema.includes("."))) {

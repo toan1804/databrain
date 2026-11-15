@@ -25,8 +25,6 @@ impl std::ops::DerefMut for FileConn {
     }
 }
 
-pub(crate) type Loaded = Mutex<std::collections::HashMap<String, String>>;
-
 /// One opened database file, shared by every session on it in this process.
 /// DuckDB allows a file to be opened by one database instance at a time
 /// (on Windows even within a process: a second open fails with "File is
@@ -34,8 +32,6 @@ pub(crate) type Loaded = Mutex<std::collections::HashMap<String, String>>;
 pub(crate) struct FileDb {
     /// The instance's last connection (sessions' connections close first).
     pub(crate) root: Mutex<Option<duckdb::Connection>>,
-    /// The `results` catalog is per instance, so is what was loaded into it.
-    pub(crate) loaded: Arc<Loaded>,
     pub(crate) key: FileKey,
 }
 
@@ -124,10 +120,21 @@ pub(crate) fn connect_file(
             format!("The assistant is using {path} right now; try again when it finishes.")
         }));
     }
+    // One instance per file: a read-only one next to a read-write one would
+    // be a second instance on a file being written (and DuckDB refuses a
+    // second configuration of a file it has open). The read-only session
+    // can't use the read-write instance either: its access mode is what
+    // keeps it read-only.
+    if let Some(k) = dbs.keys().find(|k| k.0 == key.0 && k.2 == sandbox && k.1 != read_only) {
+        let (open, want) = if k.1 { ("read-only", "read-write") } else { ("read-write", "read-only") };
+        return Err(ConnectorError::config(format!(
+            "{path} is open {open} in DataBrain (another connection to it), so it can't also be opened {want}. Close the tabs on that connection, or connect to the file the same way."
+        )));
+    }
     let root = open_file(path, read_only)?;
     init(&root)?;
     let conn = root.try_clone().map_err(|e| ConnectorError::connection(e.to_string()))?;
-    let db = Arc::new(FileDb { root: Mutex::new(Some(root)), loaded: Arc::default(), key: key.clone() });
+    let db = Arc::new(FileDb { root: Mutex::new(Some(root)), key: key.clone() });
     dbs.insert(key, Arc::downgrade(&db));
     Ok((conn, db))
 }
@@ -182,6 +189,34 @@ mod tests {
         conn.execute_batch("create table t as select 1 as x").unwrap();
         drop((conn, db));
         assert!(!super::FILE_DBS.lock().unwrap().contains_key(&key), "closed and left the registry");
+    }
+
+    /// A file is open in one access mode at a time: while a read-write
+    /// session has it, a read-only one is refused (and the reverse); the same
+    /// mode shares the instance, and once the first closes the other opens.
+    #[tokio::test]
+    async fn a_file_is_not_opened_read_only_and_read_write_at_once() {
+        use databrain_connector_core::Connector;
+        let dir = tempfile::tempdir().unwrap();
+        let mut rw = ConnectionConfig::new(ConnectorKind::Duckdb, AuthMethod::None);
+        rw.file_path = Some(dir.path().join("lake.duckdb").to_string_lossy().into_owned());
+        let mut ro = rw.clone();
+        ro.read_only = true;
+        let connect = |cfg: ConnectionConfig| async move {
+            crate::DuckdbConnector::new().connect(&cfg, std::sync::Arc::new(databrain_auth::InlineCredentialSource::new(AuthMethod::None, None))).await
+        };
+        let a = connect(rw.clone()).await.unwrap();
+        q(&*a, "create table t as select 1 as x").await;
+        let b = connect(rw.clone()).await.unwrap();
+        assert_eq!(q(&*b, "select * from t").await.num_rows(), 1, "same mode: shared");
+        let e = connect(ro.clone()).await.err().expect("read-only refused while open read-write");
+        assert_eq!(e.kind, databrain_connector_core::ErrorKind::Config);
+        assert!(e.message.contains("open read-write"), "{}", e.message);
+        drop((a, b));
+        let c = connect(ro.clone()).await.unwrap();
+        assert_eq!(q(&*c, "select * from t").await.num_rows(), 1, "read-only once the other closed");
+        let e = connect(rw.clone()).await.err().expect("read-write refused while open read-only");
+        assert!(e.message.contains("open read-only"), "{}", e.message);
     }
 
     /// A transaction opened with BEGIN is reported, so the session isn't
