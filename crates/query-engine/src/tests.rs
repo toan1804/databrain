@@ -960,6 +960,24 @@ fn free_memory_is_read_sparingly() {
     assert_eq!(f.engine.outputs().low_memory(), None, "off");
 }
 
+/// A script's statements together stay near the budget: once it is used,
+/// each statement may keep 64 KB, not another 4 MB never freed.
+#[test]
+fn a_scripts_results_stay_near_the_budget() {
+    use crate::run::result_memory_cap as cap;
+    const MB: usize = 1 << 20;
+    assert_eq!(cap(16 * MB, 0), 8 * MB, "half the budget");
+    assert_eq!(cap(16 * MB, 8 * MB), 4 * MB, "the floor, within the budget");
+    assert_eq!(cap(16 * MB, 12 * MB), 4 * MB);
+    assert_eq!(cap(16 * MB, 16 * MB), 64 << 10, "past it");
+    // Ten statements that each fill what they may keep.
+    let mut kept = 0;
+    for _ in 0..10 {
+        kept += cap(16 * MB, kept);
+    }
+    assert!(kept <= 16 * MB + 10 * (64 << 10), "{} MB", kept / MB);
+}
+
 /// Lowering the budget frees older results at once (the latest of a tab stays).
 #[tokio::test]
 async fn a_lower_budget_frees_older_results() {
