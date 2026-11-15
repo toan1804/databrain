@@ -6,6 +6,12 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ### Fixed
 
+- macOS: free memory is read without taking a new reference to the system each time (one was kept per read, several times a second while rows load), and counts the memory macOS can hand out at once (speculative and purgeable pages too), so results no longer move to disk early.
+- A script's results together stay near the memory budget: past it, each statement keeps 64 KB (at least one row) and the rest goes to disk or is cut, instead of another 4 MB each that was never freed.
+- Excel: when a sheet's read leaves cells out (title rows above the table, a block far from it), opening the file says so ("Sales reads A4:D30 of A1:KO5001"), and the sheet picker shows it per sheet; it was only a comment in the SQL.
+- The notice of a result on disk says what reads every row and what applies to the rows loaded in the grid (it said sorting and filtering read from disk), and the assistant is no longer told DuckDB reads such a result "without loading it".
+- Closing a conversation while its cancelled turn still finishes a statement lets that statement's result go too (it stayed in memory as if shown).
+
 - PII rules follow a table into the views over it: a rule on `customers.email` also masks a view's `email AS contact` (and a view of that view) for the assistant and MCP, in query results, result summaries, sample rows and queries over outputs. The view's definition is read before its rows go to the model (again each time where the database doesn't version views); a view whose definition can't be read is masked whole while the connection has PII rules on tables. Definitions read once are kept, so the Lineage tab traces views without asking the server again.
 
 ## 0.4.2 - 2026-11-15
