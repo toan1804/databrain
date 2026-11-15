@@ -6,6 +6,18 @@ use crate::types::{AiError, Result};
 
 impl ToolContext {
     pub(super) async fn gate(&self, tool: &str, decision: Decision, summary: &str, detail: &Value) -> Result<Value> {
+        // What only the user may approve says so to the host, so nothing
+        // approves it for them (the app's Auto-approve).
+        let only_user = matches!(decision, Decision::Confirm(_));
+        let asked = match detail {
+            Value::Object(m) if only_user => {
+                let mut m = m.clone();
+                m.insert("only_user".into(), Value::Bool(true));
+                Value::Object(m)
+            }
+            _ => detail.clone(),
+        };
+        let detail = &asked;
         match decision {
             Decision::Allow => {
                 self.audit(tool, detail, "allowed", None);

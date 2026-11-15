@@ -1,7 +1,8 @@
 // Query hints from table layout (indexes, partitions, cluster keys): which
 // filters can skip data and which ones defeat it. Pure logic over SQL text;
 // components/queryHintsExt.ts puts the results in the editor.
-import { blankLiterals, splitPath, unquote } from "./sqlComplete";
+import { splitPath, unquote } from "./sqlComplete";
+import { blankLiterals, lexOptionsFor } from "./sqlText";
 import type { ConnectorKind, TableLayout } from "./types";
 
 export type HintLevel = "warn" | "info";
@@ -52,8 +53,8 @@ export function compact(n: number): string {
 }
 
 /** Tables a statement reads or changes, with positions (INSERT targets excluded). */
-export function refsWithPos(stmt: string): RefAt[] {
-  const clean = blankLiterals(stmt);
+export function refsWithPos(stmt: string, kind?: ConnectorKind): RefAt[] {
+  const clean = blankLiterals(stmt, lexOptionsFor(kind));
   const out: RefAt[] = [];
   const re = new RegExp(String.raw`\b(from|join|update)\s+(${PATH})(?:\s+(?:as\s+)?(${IDENT}))?`, "gi");
   const push = (path: string, at: number, alias?: string) => {
@@ -121,11 +122,17 @@ interface ColUse {
 }
 
 /** Column references inside predicates. */
-export function columnUses(stmt: string): ColUse[] {
-  const clean = blankLiterals(stmt);
+export function columnUses(stmt: string, kind?: ConnectorKind): ColUse[] {
+  const clean = blankLiterals(stmt, lexOptionsFor(kind));
   const out: ColUse[] = [];
+  const seen = new Set<number>();
+  // What is looked at around each name is bounded: a generated predicate of
+  // thousands of terms (`id = 1 OR id = 2 …`) copied and scanned the whole
+  // text before and after every name.
+  const NEAR = 64;
   for (const [a, b] of predicateRanges(clean)) {
     const seg = clean.slice(a, b);
+    const closeOf = new Map<number, number>();
     const re = new RegExp(String.raw`(?:(${IDENT})\s*\.\s*)?(${IDENT})`, "g");
     let m: RegExpExecArray | null;
     while ((m = re.exec(seg))) {
@@ -134,8 +141,8 @@ export function columnUses(stmt: string): ColUse[] {
       const prevCh = seg[m.index - 1];
       if (prevCh === "." || /^\d/.test(raw)) continue;
       // Type names: x::text, cast(x as varchar).
-      if (/(::|\bas)\s*$/i.test(seg.slice(0, m.index))) continue;
-      const after = seg.slice(m.index + m[0].length);
+      if (/(::|\bas)\s*$/i.test(seg.slice(Math.max(0, m.index - NEAR), m.index))) continue;
+      const after = seg.slice(m.index + m[0].length, m.index + m[0].length + NEAR);
       if (/^\s*\(/.test(after)) continue; // function name
       if (!m[1] && KEYWORDS.has(name.toLowerCase())) continue;
       if (/^\s*\./.test(after)) continue; // qualifier of a longer path
@@ -156,27 +163,37 @@ export function columnUses(stmt: string): ColUse[] {
               depth--;
               continue;
             }
-            const fn = /([A-Za-z_][\w$]*)\s*$/.exec(seg.slice(0, j));
+            const fnFrom = Math.max(0, j - NEAR);
+            const fnm = /([A-Za-z_][\w$]*)\s*$/.exec(seg.slice(fnFrom, j));
+            const fn = fnm ? { 1: fnm[1], index: fnFrom + fnm.index } : null;
             const f = fn?.[1].toLowerCase();
             const isCall = !!f && (!KEYWORDS.has(f) || f === "cast" || f === "date");
             if (isCall) {
-              // Closing paren of this call.
-              let d = 0;
-              let k = j;
-              for (; k < seg.length; k++) {
-                if (seg[k] === "(") d++;
-                else if (seg[k] === ")" && --d === 0) break;
+              // Closing paren of this call (found once per call: every column
+              // inside a long call asked for it again).
+              let k = closeOf.get(j);
+              if (k === undefined) {
+                let d = 0;
+                k = j;
+                for (; k < seg.length; k++) {
+                  if (seg[k] === "(") d++;
+                  else if (seg[k] === ")" && --d === 0) break;
+                }
+                closeOf.set(j, k);
               }
               use.wrappedBy = f;
               use.wrapText = stmt.slice(a + (fn!.index ?? 0), a + k + 1).trim();
             }
             break;
-          } else if (/[=<>]/.test(c) || /\b(and|or)\s*$/i.test(seg.slice(Math.max(0, j - 4), j + 1))) break;
+          } else if (/[=<>]/.test(c) || /\b(and|or)\s*$/i.test(seg.slice(Math.max(0, j - 4), j + 1)) || m.index - j > NEAR * 8) break;
         }
       }
       // Literals are blanked in `clean`; read the pattern from the original text.
-      if (/^\s*(?:not\s+)?i?like\s+'[%_]/i.test(stmt.slice(from + raw.length))) use.leadingWildcard = true;
-      if (!out.some((o) => o.from === use.from)) out.push(use);
+      if (/^\s*(?:not\s+)?i?like\s+'[%_]/i.test(stmt.slice(from + raw.length, from + raw.length + NEAR))) use.leadingWildcard = true;
+      if (!seen.has(use.from)) {
+        seen.add(use.from);
+        out.push(use);
+      }
     }
   }
   return out;
@@ -224,7 +241,7 @@ export const LARGE_TABLE_ROWS = 100_000;
  */
 export function analyzeStatement(stmt: string, tables: LayoutRef[], kind?: ConnectorKind): Hint[] {
   if (!tables.length) return [];
-  const uses = columnUses(stmt);
+  const uses = columnUses(stmt, kind);
   const hints: Hint[] = [];
   const name = (t: LayoutRef) => t.ref.parts[t.ref.parts.length - 1];
   const single = tables.length === 1;

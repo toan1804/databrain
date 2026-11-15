@@ -82,34 +82,45 @@ export function HistoryPanel() {
     [search, showAi, connFilter, statusFilter],
   );
 
+  /** Counts the searches: an answer for an older one (typed over since) is dropped. */
+  const seq = useRef(0);
   const load = useCallback(async () => {
+    const my = ++seq.current;
     setLoading(true);
     busy.current = true;
     try {
       const page = await query(null);
+      if (my !== seq.current) return;
       setItems(page);
       setMore(page.length === HISTORY_PAGE);
     } catch (e) {
-      toast(toError(e).message, "error");
+      if (my === seq.current) toast(toError(e).message, "error");
     } finally {
-      busy.current = false;
-      setLoading(false);
+      if (my === seq.current) {
+        busy.current = false;
+        setLoading(false);
+      }
     }
   }, [query, toast]);
 
   const loadMore = useCallback(async () => {
     if (busy.current || !more || items.length === 0) return;
+    // More of this search only: a new search meanwhile drops the page.
+    const my = seq.current;
     busy.current = true;
     setLoading(true);
     try {
       const page = await query(items[items.length - 1].id);
+      if (my !== seq.current) return;
       setItems((cur) => [...cur, ...page.filter((p) => !cur.some((c) => c.id === p.id))]);
       setMore(page.length === HISTORY_PAGE);
     } catch (e) {
-      toast(toError(e).message, "error");
+      if (my === seq.current) toast(toError(e).message, "error");
     } finally {
-      busy.current = false;
-      setLoading(false);
+      if (my === seq.current) {
+        busy.current = false;
+        setLoading(false);
+      }
     }
   }, [items, more, query, toast]);
 

@@ -15,6 +15,7 @@ import { ExportFields } from "./ExportFields";
 import { LoadFields } from "./LoadFields";
 import { RunLog } from "./RunLog";
 import { EDITOR_KEY, NodeList, ProgressBar, StatusIcon, actionIcon, field, isResults, label, latestTab, statusText } from "./shared";
+import { outputNames } from "../../lib/sqlText";
 
 export function NodePanel({
   job,
@@ -82,7 +83,7 @@ export function NodePanel({
   // Set to a connection that was deleted since: said so, not shown as Results (where it doesn't run).
   const connGone = node.kind === "query" && !!node.connection_id && connections.length > 0 && !runsOn;
   const others = connections.filter((c) => !isResults(c));
-  const mentions = (u: JobNode) => new RegExp(`\\bresults\\s*\\.\\s*"?${u.name}"?\\b`, "i").test(node.sql);
+  const mentions = (u: JobNode) => outputNames(node.sql).some((n) => n.toLowerCase() === u.name.toLowerCase());
 
   return (
     <div className="space-y-3 p-3">

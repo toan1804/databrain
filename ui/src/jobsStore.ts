@@ -144,12 +144,14 @@ export const useJobs = create<JobsState>((set, get) => ({
         }
       }
     });
-    await get().refresh();
-    // Runs of the background runner (another process) send no events: look again now and then.
+    // Runs of the background runner (another process) send no events: look
+    // again now and then. Set up before the first look, which may fail (and
+    // is then tried again by these).
     if (typeof window !== "undefined") {
       setInterval(() => void get().refresh().catch(() => {}), 30_000);
       window.addEventListener("focus", () => void get().refresh().catch(() => {}));
     }
+    await get().refresh();
     // Scheduled runs started at launch, before this listener existed.
     for (const j of get().jobs) if (j.last_run && get().running[j.id]) announceScheduled(get().jobs, j.last_run);
   },

@@ -4,7 +4,8 @@
 // keeps its own results, while all cells share one database session
 // (`nb:{notebook}`), so temp tables and session settings carry across cells.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEvent } from "../../lib/hooks";
 import {
   Code2,
   FileText,
@@ -30,7 +31,7 @@ import { paramNames, textualNames } from "../paramsExt";
 import { ConnDot, EnvBadge } from "../ui";
 import { OutputQueryTarget } from "../OutputChip";
 import { resultsConnection } from "../../outputs";
-import { cellDeps, referencedOutputs } from "../../lib/dataflow";
+import { cellDeps, referencedOutputs, type CellDeps } from "../../lib/dataflow";
 import { Cell } from "./Cell";
 import { cellKey, waitForRun } from "./shared";
 
@@ -163,13 +164,16 @@ export function NotebookView({
       .map((o) => o.name ?? o.handle)
       .join("\u0000"),
   );
-  const deps = useMemo(
-    () =>
-      nb
-        ? cellDeps(nb.cells, outputNames ? outputNames.split("\u0000") : [])
-        : {},
-    [nb, outputNames],
-  );
+  // The cells as they were when typing paused: what reads every cell's
+  // text (dependencies, parameters) works from these, not on each keystroke.
+  const [settled, setSettled] = useState<NotebookCell[] | null>(null);
+  const cells = nb?.cells;
+  useEffect(() => {
+    const t = setTimeout(() => setSettled(cells ?? null), settled ? 300 : 0);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `settled` only picks the first delay
+  }, [cells]);
+  const deps = useMemo(() => (settled ? cellDeps(settled, outputNames ? outputNames.split("\u0000") : []) : {}), [settled, outputNames]);
   const runDependents = async (id: string) => {
     const order = latest.current?.cells ?? [];
     const seen = new Set<string>();
@@ -256,7 +260,10 @@ export function NotebookView({
 
   // Parameters of every SQL cell, for the bar at the top (debounced).
   // Each cell is scanned on its own (an unclosed quote in one cell must not hide the next one's).
-  const sqlSources = JSON.stringify(nb?.cells.filter((c) => c.kind === "sql" && (c.source.includes(":") || c.source.includes("&"))).map((c) => c.source) ?? []);
+  const sqlSources = useMemo(
+    () => JSON.stringify(settled?.filter((c) => c.kind === "sql" && (c.source.includes(":") || c.source.includes("&"))).map((c) => c.source) ?? []),
+    [settled],
+  );
   const nbKind = conn?.config.kind;
   useEffect(() => {
     if (!isTauri()) return;
@@ -309,7 +316,8 @@ export function NotebookView({
 
   const removeCell = (id: string) => {
     void api.closeTab(cellKey(notebookId, id)).catch(() => {});
-    useStore.getState().forgetRuns([cellKey(notebookId, id)]);
+    // For good: a run of it still starting is stopped when it answers.
+    useStore.getState().retireRunKeys([cellKey(notebookId, id)]);
     update((n) => ({ ...n, cells: n.cells.filter((c) => c.id !== id) }));
   };
 
@@ -322,6 +330,35 @@ export function NotebookView({
       [cells[i], cells[j]] = [cells[j], cells[i]];
       return { ...n, cells };
     });
+
+  // One set of handlers for every cell, stable across renders and reading
+  // the notebook as it is when called: a cell that didn't change is not
+  // rendered again while another one is typed in.
+  const cellById = (id: string) => latest.current?.cells.find((x) => x.id === id);
+  const indexOf = (id: string) => latest.current?.cells.findIndex((x) => x.id === id) ?? -1;
+  const onFocusCell = useEvent((id: string) => setFocused(id));
+  const onChangeCell = useEvent((id: string, patch: Partial<NotebookCell>) => updateCell(id, patch));
+  const onRunCell = useEvent((id: string) => {
+    const c = cellById(id);
+    if (c) void runCell(c);
+  });
+  const onRunAdvanceCell = useEvent((id: string) => {
+    const c = cellById(id);
+    if (c) void runAndAdvance(c);
+  });
+  const onRunFrom = useEvent((id: string) => {
+    const i = indexOf(id);
+    if (i >= 0) void runAll(i);
+  });
+  const onDeleteCell = useEvent((id: string) => removeCell(id));
+  const onMoveCell = useEvent((id: string, d: -1 | 1) => moveCell(id, d));
+  const onAddBelow = useEvent((id: string, k: CellKind, sql?: string) => void addCell(k, id, sql));
+  const cellIndexOf = useEvent((id: string) => indexOf(id) + 1);
+  const onRunDependents = useEvent((id: string) => void runDependents(id));
+  const handlers = useMemo<CellHandlers>(
+    () => ({ onFocusCell, onChangeCell, onRunCell, onRunAdvanceCell, onRunFrom, onDeleteCell, onMoveCell, onAddBelow, cellIndexOf, onRunDependents }),
+    [onFocusCell, onChangeCell, onRunCell, onRunAdvanceCell, onRunFrom, onDeleteCell, onMoveCell, onAddBelow, cellIndexOf, onRunDependents],
+  );
 
   /** ⇧↵: run and move to the next cell (adds one at the end). */
   const runAndAdvance = async (c: NotebookCell) => {
@@ -455,33 +492,18 @@ export function NotebookView({
       <div className="min-h-0 flex-1 overflow-auto bg-bg/40 px-4 py-4">
         <div className="mx-auto max-w-[1100px] space-y-3">
           {nb.cells.map((c, i) => (
-            // "Query with SQL" on an output in this cell adds a cell below it.
-            <OutputQueryTarget.Provider
+            <CellSlot
               key={c.id}
-              value={(sql) => void addCell("sql", c.id, sql)}
-            >
-              <Cell
-                key={c.id}
-                nbId={notebookId}
-                cell={c}
-                index={i}
-                total={nb.cells.length}
-                connectionId={cellConn(c)}
-                notebookConnection={connId}
-                focused={focused === c.id}
-                onFocus={() => setFocused(c.id)}
-                onChange={(patch) => updateCell(c.id, patch)}
-                onRun={() => void runCell(c)}
-                onRunAdvance={() => void runAndAdvance(c)}
-                onRunFromHere={() => void runAll(i)}
-                onDelete={() => removeCell(c.id)}
-                onMove={(d) => moveCell(c.id, d)}
-                onAddBelow={(k) => addCell(k, c.id)}
-                deps={deps[c.id]}
-                cellIndexOf={(id) => nb.cells.findIndex((x) => x.id === id) + 1}
-                onRunDependents={() => void runDependents(c.id)}
-              />
-            </OutputQueryTarget.Provider>
+              nbId={notebookId}
+              cell={c}
+              index={i}
+              total={nb.cells.length}
+              connectionId={cellConn(c)}
+              notebookConnection={connId}
+              focused={focused === c.id}
+              deps={deps[c.id]}
+              h={handlers}
+            />
           ))}
           <div className="flex justify-center gap-2 pt-1 pb-10">
             <button
@@ -502,3 +524,72 @@ export function NotebookView({
     </div>
   );
 }
+
+interface CellHandlers {
+  onFocusCell: (id: string) => void;
+  onChangeCell: (id: string, patch: Partial<NotebookCell>) => void;
+  onRunCell: (id: string) => void;
+  onRunAdvanceCell: (id: string) => void;
+  onRunFrom: (id: string) => void;
+  onDeleteCell: (id: string) => void;
+  onMoveCell: (id: string, d: -1 | 1) => void;
+  onAddBelow: (id: string, k: CellKind, sql?: string) => void;
+  cellIndexOf: (id: string) => number;
+  onRunDependents: (id: string) => void;
+}
+
+interface CellSlotProps {
+  nbId: string;
+  cell: NotebookCell;
+  index: number;
+  total: number;
+  connectionId: string | null;
+  notebookConnection: string | null;
+  focused: boolean;
+  deps?: CellDeps;
+  h: CellHandlers;
+}
+
+/** One cell, rendered again only when what it shows changed (its own cell, place, connection, focus, dependencies). */
+const CellSlot = memo(
+  function CellSlot({ nbId, cell, index, total, connectionId, notebookConnection, focused, deps, h }: CellSlotProps) {
+    const id = cell.id;
+    // "Query with SQL" on an output in this cell adds a cell below it.
+    const queryTarget = useCallback((sql: string) => h.onAddBelow(id, "sql", sql), [h, id]);
+    return (
+      <OutputQueryTarget.Provider value={queryTarget}>
+        <Cell
+          nbId={nbId}
+          cell={cell}
+          index={index}
+          total={total}
+          connectionId={connectionId}
+          notebookConnection={notebookConnection}
+          focused={focused}
+          onFocus={() => h.onFocusCell(id)}
+          onChange={(patch) => h.onChangeCell(id, patch)}
+          onRun={() => h.onRunCell(id)}
+          onRunAdvance={() => h.onRunAdvanceCell(id)}
+          onRunFromHere={() => h.onRunFrom(id)}
+          onDelete={() => h.onDeleteCell(id)}
+          onMove={(d) => h.onMoveCell(id, d)}
+          onAddBelow={(k) => h.onAddBelow(id, k)}
+          deps={deps}
+          cellIndexOf={h.cellIndexOf}
+          onRunDependents={() => h.onRunDependents(id)}
+        />
+      </OutputQueryTarget.Provider>
+    );
+  },
+  (a, b) =>
+    a.cell === b.cell &&
+    a.index === b.index &&
+    a.total === b.total &&
+    a.connectionId === b.connectionId &&
+    a.notebookConnection === b.notebookConnection &&
+    a.focused === b.focused &&
+    a.nbId === b.nbId &&
+    a.h === b.h &&
+    // Recomputed objects: the same when what they say is.
+    JSON.stringify(a.deps ?? null) === JSON.stringify(b.deps ?? null),
+);

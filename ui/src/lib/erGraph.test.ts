@@ -44,3 +44,37 @@ describe("ER diagram layout", () => {
     expect(moreLabel(l.byId.get("sales.customers")!)).toBe("+3 unused columns");
   });
 });
+
+describe("ER layout with foreign-key cycles", () => {
+  it("stays as wide as the longest chain, not one rank per pass", () => {
+    // a <-> b reference each other, and a chain of 200 tables hangs off b.
+    const fk = (to: string) => ({ columns: ["ref"], ref_schema: "s", ref_table: to, ref_columns: ["id"] });
+    const t = (name: string, refs: string[]): TableColumns => ({ table: name, columns: [col("id", true), col("ref")], foreign_keys: refs.map(fk) });
+    const list: TableColumns[] = [t("a", ["b"]), t("b", ["a"])];
+    for (let i = 0; i < 200; i++) list.push(t(`c${i}`, [i === 0 ? "b" : `c${i - 1}`]));
+    const l = layout(erGraph("s", list).graph, "lr", { expanded: "all" });
+    const ranks = new Set(l.nodes.map((n) => n.rank));
+    // The ranks themselves stay small (they grew by two per pass, to ~600, and set the width).
+    expect(Math.max(...ranks)).toBeLessThan(210);
+    expect(Math.min(...l.nodes.map((n) => n.x))).toBe(Math.min(...layout(erGraph("s", [t("x", [])]).graph, "lr", { expanded: "all" }).nodes.map((n) => n.x)));
+    // 202 tables in a chain (plus one table of the cycle): at most 203 columns, none empty.
+    expect(ranks.size).toBeLessThanOrEqual(203);
+    const xs = [...new Set(l.nodes.map((n) => n.x))].sort((p, q) => p - q);
+    expect(xs.length).toBe(ranks.size);
+    const step = xs[1] - xs[0];
+    expect(xs.every((x, i) => i === 0 || x - xs[i - 1] === step)).toBe(true);
+  });
+});
+
+describe("ER layout on a large schema", () => {
+  it("ranks a 20,000-table chain listed backwards in well under a second", () => {
+    const fk = (to: string) => ({ columns: ["ref"], ref_schema: "s", ref_table: to, ref_columns: ["id"] });
+    const list: TableColumns[] = [];
+    for (let i = 20_000 - 1; i >= 0; i--) list.push({ table: `t${i}`, columns: [col("id", true), col("ref")], foreign_keys: i ? [fk(`t${i - 1}`)] : [] });
+    const g = erGraph("s", list).graph;
+    const t0 = performance.now();
+    const l = layout(g, "tb", { expanded: "all" });
+    expect(performance.now() - t0).toBeLessThan(3000);
+    expect(new Set(l.nodes.map((n) => n.rank)).size).toBe(20_000);
+  });
+});

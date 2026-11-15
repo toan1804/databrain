@@ -113,3 +113,33 @@ describe("queryHints: summaries", () => {
     expect(columnRoles(events)).toEqual({ event_date: "partition key", user_id: "cluster key" });
   });
 });
+
+describe("query tips on a very long predicate", () => {
+  it("reads a generated OR of 10,000 terms in linear time", () => {
+    const terms = Array.from({ length: 10_000 }, (_, i) => `id = ${i}`).join(" OR ");
+    const sql = `select * from t where ${terms} and lower(email) = 'x' and name like '%x'`;
+    const t0 = performance.now();
+    const uses = columnUses(sql);
+    const ms = performance.now() - t0;
+    expect(uses.filter((u) => u.name === "id")).toHaveLength(10_000);
+    const email = uses.find((u) => u.name === "email")!;
+    expect(email.wrappedBy).toBe("lower");
+    expect(email.wrapText).toBe("lower(email)");
+    expect(uses.find((u) => u.name === "name")?.leadingWildcard).toBe(true);
+    // Was several seconds (copies of the whole text per name).
+    expect(ms).toBeLessThan(1500);
+  });
+});
+
+describe("query tips on long predicates other than OR", () => {
+  it("an IN list and a long call stay fast, and a column after a comma is still seen as wrapped", () => {
+    const list = Array.from({ length: 20_000 }, (_, i) => String(i)).join(", ");
+    const args = Array.from({ length: 5_000 }, (_, i) => `c${i}`).join(", ");
+    const sql = `select * from t where id in (${list}) and coalesce(${args}) = 1 and date_trunc('day', created_at) = '2024-01-01'`;
+    const t0 = performance.now();
+    const uses = columnUses(sql);
+    expect(performance.now() - t0).toBeLessThan(800);
+    expect(uses.find((u) => u.name === "c3")?.wrappedBy).toBe("coalesce");
+    expect(uses.find((u) => u.name === "created_at")?.wrappedBy).toBe("date_trunc");
+  });
+});

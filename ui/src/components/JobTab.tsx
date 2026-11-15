@@ -79,15 +79,17 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
       // Edits here not saved yet (the last moment's, or a save that failed):
       // the user chooses, rather than losing them without a word.
       clearTimeout(timer.current);
+      // Saving over the assistant's change needs the click: closing the
+      // dialog (Escape, or another dialog taking its place) shows its version.
       useStore.getState().askConfirm({
         title: "The assistant changed this job",
         reasons: [
           "You have changes to it that are not saved yet.",
-          "Show the assistant's version: your unsaved changes are lost. Keep mine: yours are saved, over the assistant's change.",
+          "Keep my changes: yours are saved, over the assistant's change. Cancel: the assistant's version is shown, and your unsaved changes are lost.",
         ],
-        confirmLabel: "Show the assistant's version",
-        onConfirm: showSaved,
-        onCancel: () => void persistRef.current(),
+        confirmLabel: "Keep my changes",
+        onConfirm: () => void persistRef.current(),
+        onCancel: showSaved,
       });
     };
     window.addEventListener("db:job-changed", onChanged);

@@ -1,6 +1,7 @@
 // Pure helpers for output references, @mentions and notebook dataflow.
 
 import type { NotebookCell, OutputInfo } from "./types";
+import { outputNames } from "./sqlText";
 
 /** `results.revenue`, `results.revenue__1` or `results.r12`. */
 export function outputRef(o: Pick<OutputInfo, "handle" | "name" | "version_of">): string {
@@ -39,13 +40,7 @@ export function withDuckdbHeader(sql: string): string {
 }
 
 export function referencedOutputs(sql: string): string[] {
-  const clean = sql.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "").replace(/'(?:[^']|'')*'/g, "''");
-  const out: string[] = [];
-  for (const m of clean.matchAll(/(?<![\w.])results\s*\.\s*(?:"((?:[^"]|"")+)"|([A-Za-z_]\w*))/gi)) {
-    const n = (m[1] ?? m[2]).replace(/""/g, '"');
-    if (!out.some((x) => x.toLowerCase() === n.toLowerCase())) out.push(n);
-  }
-  return out;
+  return outputNames(sql);
 }
 
 export interface CellDeps {

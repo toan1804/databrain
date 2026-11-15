@@ -193,7 +193,9 @@ function ApprovalCard({
   const pending = item.state === "pending";
   // Where it runs: named on the card (the picker beside the chat follows the tab in front).
   const connName = typeof item.detail.connection === "string" ? item.detail.connection : undefined;
-  const conn = useStore((s) => (connName ? s.connections.find((c) => c.name === connName) : undefined));
+  // By id (names aren't unique: another connection of the same name could show the wrong badge).
+  const connId = typeof item.detail.connection_id === "string" ? item.detail.connection_id : undefined;
+  const conn = useStore((s) => (connId ? s.connections.find((c) => c.id === connId) : connName ? s.connections.find((c) => c.name === connName) : undefined));
   const kind = typeof item.detail.kind === "string" ? item.detail.kind : undefined;
   const lines = sql.split("\n").length;
   return (
@@ -212,6 +214,7 @@ function ApprovalCard({
           {connName && <span className="rounded border border-line px-1 py-px">on “{connName}”</span>}
           {conn?.env === "prod" && <span className="rounded border border-danger/60 bg-danger/10 px-1 py-px font-medium text-danger">PRODUCTION</span>}
           {conn?.config.read_only && <span className="rounded border border-line px-1 py-px text-muted">read-only</span>}
+          {item.detail.only_user === true && <span className="rounded border border-warning/60 px-1 py-px text-warning">only you can approve this</span>}
           {kind && kind !== "read" && <span className="rounded border border-warning/60 bg-warning/10 px-1 py-px text-warning">{kind === "dml" ? "changes data" : kind === "ddl" ? "changes the schema" : `not a plain read (${kind})`}</span>}
         </div>
       )}

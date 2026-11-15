@@ -160,7 +160,7 @@ after the loop
 | Output columns the AI must not see | `RunRequest::output_masks` → `ExecOptions` | AI runs on DuckDB |
 | AI policy, table rules, approval, row cap, PII | `crates/ai/src/policy.rs`, `access.rs`, `pii.rs`, before `run_and_wait` | AI and MCP |
 
-Not asked by the engine: grid edits (`apply_edits`) and `end_transaction` do not go through `safety_reasons`; they check read-only only. A load asks on a production connection (above); its before / after SQL may not control the transaction (`check_user_sql`). Grid edits show their statements in the UI first; the app builds them again on the server (`api/results.rs` `apply_edits`), so the UI can't send SQL of its own.
+Grid edits (`apply_edits`) don't go through `safety_reasons`: they are refused on a read-only connection and asked on a production one (`Intent::Edit`, code `needs_confirmation` until the user confirmed). `end_transaction` checks read-only only. `rerun_output` runs one output's statement again as that result (saved edits shown again): the tab's other outputs stay active. A load asks on a production connection (above); its before / after SQL may not control the transaction (`check_user_sql`). Grid edits show their statements in the UI first; the app builds them again on the server (`api/results.rs` `apply_edits`), so the UI can't send SQL of its own.
 
 ## Outputs
 

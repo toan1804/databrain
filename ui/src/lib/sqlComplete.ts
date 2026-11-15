@@ -5,6 +5,7 @@
 import type { ConnectorKind, DbObject, SchemaInfo } from "./types";
 import { mayHaveCatalog, schemaLabel } from "./catalog";
 import { traitsOf } from "./sourceTraits";
+import { blankLiterals, lexOptionsFor } from "./sqlText";
 import { quoteIdent } from "./util";
 
 export interface MetaProvider {
@@ -88,49 +89,8 @@ export function backslashEscapes(kind: ConnectorKind): boolean {
   return (traitsOf(kind) as unknown as { syntax?: { backslash_escapes?: boolean } }).syntax?.backslash_escapes === true;
 }
 
-/**
- * Replace strings and comments with spaces (offsets preserved). Quoted
- * names (`"it's"`, `` `x` ``) are kept as they are, so an apostrophe in one
- * doesn't open a string. `backslash`: `\'` doesn't end a string (see
- * {@link backslashEscapes}); without it `'O\'Brien'` would close early and
- * the rest of the script would read as one unclosed string.
- */
-export function blankLiterals(sql: string, backslash = false): string {
-  let out = "";
-  let i = 0;
-  while (i < sql.length) {
-    const c = sql[i];
-    const n = sql[i + 1];
-    if (c === "-" && n === "-") {
-      const j = sql.indexOf("\n", i);
-      const end = j < 0 ? sql.length : j;
-      out += " ".repeat(end - i);
-      i = end;
-    } else if (c === "/" && n === "*") {
-      const j = sql.indexOf("*/", i + 2);
-      const end = j < 0 ? sql.length : j + 2;
-      out += sql.slice(i, end).replace(/[^\n]/g, " ");
-      i = end;
-    } else if (c === "'") {
-      let j = i + 1;
-      while (j < sql.length && !(sql[j] === "'" && sql[j + 1] !== "'")) j += sql[j] === "'" || (backslash && sql[j] === "\\") ? 2 : 1;
-      const end = Math.min(sql.length, j + 1);
-      out += " ".repeat(end - i);
-      i = end;
-    } else if (c === '"' || c === "`") {
-      // A quoted name: kept, up to its closing quote (a doubled one is part of it).
-      let j = i + 1;
-      while (j < sql.length && !(sql[j] === c && sql[j + 1] !== c)) j += sql[j] === c ? 2 : 1;
-      const end = Math.min(sql.length, j + 1);
-      out += sql.slice(i, end);
-      i = end;
-    } else {
-      out += c;
-      i++;
-    }
-  }
-  return out;
-}
+// The lexer is shared with the rest of the UI (lib/sqlText.ts).
+export { blankLiterals } from "./sqlText";
 
 /** [start, end) of the statement around `pos` (split on `;`). */
 export function statementBounds(clean: string, pos: number): [number, number] {
@@ -509,7 +469,7 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
   // Read the schema list once per request (it is consulted per table option).
   const schemaList = provider.schemas();
   const p: MetaProvider = { ...provider, schemas: () => schemaList };
-  const clean = blankLiterals(doc, backslashEscapes(provider.kind));
+  const clean = blankLiterals(doc, lexOptionsFor(provider.kind));
   // Inside a string or comment: no completion.
   if (clean[pos - 1] === " " && doc[pos - 1] !== " " && doc[pos - 1] !== "\n" && doc[pos - 1] !== "\t") return null;
   const [s0] = statementBounds(clean, pos);
@@ -519,7 +479,20 @@ export async function completeSql(doc: string, pos: number, provider: MetaProvid
 
   // Current token: dotted path ending at the cursor.
   let start = pos;
-  while (start > s0 && /[\w$."`[\]]/.test(clean[start - 1])) start--;
+  while (start > s0) {
+    const c = clean[start - 1];
+    // A quoted part as a whole: it may hold spaces (`"my schema".`).
+    const open = c === '"' || c === "`" ? c : c === "]" ? "[" : null;
+    if (open && start - 1 > s0) {
+      const at = clean.lastIndexOf(open, start - 2);
+      if (at >= s0 && !clean.slice(at, start).includes("\n")) {
+        start = at;
+        continue;
+      }
+    }
+    if (!/[\w$."`[\]]/.test(c)) break;
+    start--;
+  }
   let token = clean.slice(start, pos);
   if (!PATH_RE.test(token)) {
     // Keep only the trailing simple word.

@@ -420,3 +420,59 @@ describe("a tab closed while its run starts", () => {
     expect(cancelled).toEqual([]);
   });
 });
+
+describe("dropping an output", () => {
+  it("never leaves no tab open", async () => {
+    const o = out("r7", "t", 0, { state: "live" });
+    useStore.setState({ outputs: [o], tabs: [{ id: "view", title: "r7", sql: "", connection_id: "conn", output_ref: "r7" } as never], activeTabId: "view", runs: {} });
+    useStore.getState().forgetOutputs(["r7"]);
+    const { tabs, activeTabId } = useStore.getState();
+    expect(tabs).toHaveLength(1);
+    expect(tabs[0].output_ref).toBeFalsy();
+    expect(activeTabId).toBe(tabs[0].id);
+  });
+});
+
+describe("refreshing a result of a run restored after a restart", () => {
+  it("updates that statement, by its index, not the position", async () => {
+    reran.length = 0;
+    // Restored: only statements 1 and 3 had results; the refresh is of statement 1 (at position 0).
+    const plan = (i: number) => ({ index: i, sql: `select ${i}`, start: i * 10, end: i * 10 + 8, classification: { kind: "read" as const, missing_where: false, keyword: "SELECT" } });
+    const done = (i: number) => ({ plan: plan(i), status: "done" as const, notices: [], output: out(`r${i}`, "t", i) });
+    useStore.setState({
+      tabs: [{ id: "t", title: "q", sql: "", connection_id: "conn" } as never],
+      runs: { t: { jobId: null, running: false, startedAt: 0, finishedStatus: "success", statements: [done(1), done(3)], activeIndex: 3, connectionId: "conn" } },
+    });
+    expect(await useStore.getState().refreshResult("t", 0)).toBe(true);
+    const run = useStore.getState().runs.t;
+    expect(run.statements.map((x) => x.output?.handle)).toEqual(["r9", "r3"]);
+    expect(run.statements.map((x) => x.status)).toEqual(["done", "done"]);
+    expect(run.running).toBe(false);
+  });
+});
+
+describe("a notebook cell deleted while its run starts", () => {
+  it("stops what started and shows nothing for it; other cells run as before", async () => {
+    emitBeforeResolve = false;
+    cancelled.length = 0;
+    closedTabs.length = 0;
+    useStore.setState({ tabs: [{ id: "nbtab", title: "n", sql: "", connection_id: "conn", notebook_id: "nb1" } as never], runs: {} });
+    let open!: () => void;
+    gate = new Promise<void>((r) => (open = r));
+    const p = useStore.getState().runSql("nb:nb1:cellA", "conn", "update t set a = 1 where id = 1", 0, "nb:nb1");
+    // The cell is deleted (its notebook stays open) before run_query answers.
+    useStore.getState().retireRunKeys(["nb:nb1:cellA"]);
+    open();
+    gate = null;
+    expect(await p).toBe(false);
+    expect(useStore.getState().runs["nb:nb1:cellA"]).toBeUndefined();
+    expect(cancelled).toEqual([`job-${jobSeq}`]);
+    // The cell's own results; not the notebook's shared session, which the other cells use.
+    expect(closedTabs).toEqual(["nb:nb1:cellA"]);
+    // Another cell of the same notebook is not affected.
+    cancelled.length = 0;
+    expect(await useStore.getState().runSql("nb:nb1:cellB", "conn", "select 1", 0, "nb:nb1")).toBe(true);
+    expect(useStore.getState().runs["nb:nb1:cellB"]?.running).toBe(true);
+    expect(cancelled).toEqual([]);
+  });
+});

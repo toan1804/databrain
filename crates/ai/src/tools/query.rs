@@ -35,7 +35,7 @@ impl ToolContext {
                 "run_query",
                 review.decision.clone(),
                 &format!("{purpose}{on}"),
-                &json!({"sql": sql, "purpose": purpose, "kind": review.kind, "connection": target.name}),
+                &json!({"sql": sql, "purpose": purpose, "kind": review.kind, "connection": target.name, "connection_id": target.id}),
             )
             .await?;
         let sql = approved.get("sql").and_then(|s| s.as_str()).unwrap_or(&sql).to_string();

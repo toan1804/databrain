@@ -2,6 +2,7 @@
 // without a UI.
 import type { Job, JobEdge, JobNode, JobNodeKind, JobRun, NodeRunSummary, OutputInfo } from "./types";
 import { uid } from "./util";
+import { outputNames, renameOutputRefs } from "./sqlText";
 
 export const NODE_W = 220;
 export const NODE_H = 76;
@@ -141,8 +142,8 @@ export function missingLinks(job: Job): { node: string; reads: string }[] {
   const out: { node: string; reads: string }[] = [];
   for (const n of job.nodes) {
     const ups = new Set(upstreamOf(job, n.id));
-    for (const m of n.sql.matchAll(/\bresults\s*\.\s*"?([A-Za-z_][A-Za-z0-9_]*)"?/gi)) {
-      const other = job.nodes.find((x) => x.name.toLowerCase() === m[1].toLowerCase());
+    for (const read of outputNames(n.sql)) {
+      const other = job.nodes.find((x) => x.name.toLowerCase() === read.toLowerCase());
       if (other && other.id !== n.id && !ups.has(other.id) && !out.some((o) => o.node === n.id && o.reads === other.id)) out.push({ node: n.id, reads: other.id });
     }
   }
@@ -161,11 +162,11 @@ export function cappedReads(job: Job, outputs: OutputInfo[], resultsConnectionId
   for (const n of job.nodes) {
     const onDuckdb = n.kind !== "query" || !n.connection_id || n.connection_id === resultsConnectionId;
     if (!onDuckdb) continue;
-    for (const m of n.sql.matchAll(/\bresults\s*\.\s*"?([A-Za-z_][A-Za-z0-9_]*)"?/gi)) {
-      const name = m[1].toLowerCase();
+    for (const read of outputNames(n.sql)) {
+      const name = read.toLowerCase();
       if (steps.has(name) || out.some((o) => o.node === n.id && o.reads.toLowerCase() === name)) continue;
       const o = outputs.find((o) => o.name?.toLowerCase() === name) ?? outputs.find((o) => o.handle.toLowerCase() === name);
-      if (o?.truncated) out.push({ node: n.id, reads: m[1], rows: o.rows });
+      if (o?.truncated) out.push({ node: n.id, reads: read, rows: o.rows });
     }
   }
   return out;
@@ -190,13 +191,13 @@ export function scheduleText(s: Job["schedule"]): string {
 export function updateStep(job: Job, id: string, patch: Partial<JobNode>): Job {
   const old = job.nodes.find((n) => n.id === id)?.name;
   const renamed = patch.name !== undefined && old !== undefined && patch.name !== old;
-  const re = renamed ? new RegExp(`\\bresults(\\s*\\.\\s*)"?${old}"?(?![A-Za-z0-9_])`, "gi") : null;
+  const to = patch.name;
   const reads = new Set(downstreamOf(job, id));
   return {
     ...job,
     nodes: job.nodes.map((n) => {
       if (n.id === id) return { ...n, ...patch };
-      if (re && reads.has(n.id)) return { ...n, sql: n.sql.replace(re, (_m, dot: string) => `results${dot}${patch.name}`) };
+      if (renamed && to !== undefined && reads.has(n.id)) return { ...n, sql: renameOutputRefs(n.sql, old, to) };
       return n;
     }),
   };
@@ -232,11 +233,11 @@ export interface CellSource {
  */
 export function stepsFromCells(cells: CellSource[], names: string[], defaultConn: string | null, resultsConn?: string | null): { nodes: JobNode[]; edges: JobEdge[] } {
   const nodes: JobNode[] = [];
-  const renames: [RegExp, string][] = [];
+  const renames: [string, string][] = [];
   cells.forEach((c, i) => {
     if (!c.source.trim()) return;
     let sql = c.source;
-    for (const [re, to] of renames) sql = sql.replace(re, (_m, dot: string) => `results${dot}${to}`);
+    for (const [from, to] of renames) sql = renameOutputRefs(sql, from, to);
     const conn = c.connection_id ?? defaultConn;
     nodes.push({
       id: uid(),
@@ -253,7 +254,7 @@ export function stepsFromCells(cells: CellSource[], names: string[], defaultConn
       last_run: null,
     });
     const out = c.output_name?.trim();
-    if (out && out.toLowerCase() !== names[i].toLowerCase()) renames.push([new RegExp(`\\bresults(\\s*\\.\\s*)"?${out}"?(?![A-Za-z0-9_])`, "gi"), names[i]]);
+    if (out && out.toLowerCase() !== names[i].toLowerCase()) renames.push([out, names[i]]);
   });
   const edges = nodes.slice(1).map((n, i) => ({ from: nodes[i].id, to: n.id }));
   return { nodes, edges };

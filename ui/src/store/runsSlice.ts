@@ -4,7 +4,8 @@ import { computeRunTips, slowStatements } from "../queryTips";
 import type { JobEvent, OutputInfo, ParamValue } from "../lib/types";
 import { errorRange } from "../lib/util";
 import { ddlEffect } from "./explorerSlice";
-import { keptIndex, restoredRun } from "./helpers";
+import { keptIndex, persistTabs, restoredRun } from "./helpers";
+import { uid } from "../lib/util";
 import { isQueryTab, type RunInput, type State, type StatementRun, type TabRun } from "./types";
 
 /**
@@ -30,14 +31,23 @@ function bufferEarly(e: JobEvent) {
 export const _earlyEventCount = () => earlyEvents.size;
 
 /**
+ * Run keys whose owner was removed for good (`retireRunKeys`: a notebook
+ * cell deleted). Cells live in their notebook's view, not in the store, so
+ * `runKeyOpen` can't see one go; a run still starting for such a key is
+ * stopped when its answer comes back. Keys are unique ids, never reused.
+ */
+const retiredKeys = new Set<string>();
+
+/**
  * Whether what `key` runs for is still open: a query tab (its id), a
  * notebook's cell (`nb:{notebook}:{cell}`) or a dashboard's chart
  * (`dash:{dashboard}:{chart}`), whose notebook or dashboard is in a tab.
  */
 function runKeyOpen(s: State, key: string): boolean {
-  const [kind, id] = key.split(":");
+  const [kind, id, part] = key.split(":");
   if (kind === "nb" && id) return s.tabs.some((t) => t.notebook_id === id);
-  if (kind === "dash" && id) return s.tabs.some((t) => t.dashboard_id === id);
+  // A dashboard's chart: its dashboard open and the chart still on it.
+  if (kind === "dash" && id) return s.tabs.some((t) => t.dashboard_id === id) && (!part || !!s.dashboards.find((d) => d.id === id)?.charts.some((c) => c.id === part));
   return s.tabs.some((t) => t.id === key);
 }
 
@@ -54,6 +64,8 @@ export interface RunsSlice {
   runs: Record<string, TabRun>;
   /** Drop the runs of closed run keys (notebook cells removed or closed); `prefix` drops every key starting with it. */
   forgetRuns: (keys: string[], prefix?: string) => void;
+  /** Run keys whose owner is gone for good (a notebook cell deleted): their runs go, and a run of one still starting is stopped. */
+  retireRunKeys: (keys: string[]) => void;
   /** Tabs whose session has an open transaction → the connection it is on. */
   txOpen: Record<string, string>;
   /** Re-read whether the tab's session has an open transaction. */
@@ -158,7 +170,10 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           ),
         };
       }
-      const tabs = s.tabs.filter((t) => !(t.output_ref && gone.has(t.output_ref)));
+      let tabs = s.tabs.filter((t) => !(t.output_ref && gone.has(t.output_ref)));
+      // Never no tab at all (as when the last tab is closed), and the list as it is now is kept for the next start.
+      if (tabs.length === 0) tabs = [{ id: uid(), title: "Query 1", sql: "", connection_id: s.tabs.find((t) => t.connection_id)?.connection_id ?? null }];
+      if (tabs.length !== s.tabs.length) persistTabs(tabs);
       const activeTabId = tabs.some((t) => t.id === s.activeTabId) ? s.activeTabId : (tabs[0]?.id ?? null);
       return { runs, tabs, activeTabId, outputs: s.outputs.filter((o) => !gone.has(o.handle)) };
     }),
@@ -175,6 +190,10 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       return { runs, outputs: s.outputs.map((x) => (x.handle === o.handle ? o : x)) };
     }),
   runs: {},
+  retireRunKeys: (keys) => {
+    for (const k of keys) retiredKeys.add(k);
+    get().forgetRuns(keys);
+  },
   forgetRuns: (keys, prefix) => {
     const gone = Object.keys(get().runs).filter((k) => keys.includes(k) || (prefix !== undefined && k.startsWith(prefix)));
     if (!gone.length) return;
@@ -263,6 +282,8 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     // `:name` parameters: every one in the statement needs a value.
     const values = await get().paramsFor(tabId, conn.config.kind, sql);
     if (!values) return;
+    // Closed while the statement or its parameters were looked up: nothing to run it for.
+    if (!get().tabs.some((t) => t.id === tabId)) return;
 
     await get().runSql(tabId, conn.id, sql, base, undefined, undefined, values);
   },
@@ -272,7 +293,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
     // Closed while the run was starting (connecting, a confirmation, a
     // sign-in): what started is stopped and nothing is shown for it.
     const openAtStart = runKeyOpen(get(), runKey);
-    const closed = () => openAtStart && !runKeyOpen(get(), runKey);
+    const closed = () => retiredKeys.has(runKey) || (openAtStart && !runKeyOpen(get(), runKey));
     const submit = async (confirmed: boolean): Promise<boolean> => {
       if (closed()) return false;
       try {
@@ -291,9 +312,11 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
         if (resp.status === "started" && closed()) {
           earlyEvents.delete(resp.job_id);
           void api.cancelQuery(resp.job_id).catch(() => false);
-          // Its session and results too: the tab's close went out before this run existed.
+          // Its results too: the close went out before this run existed. The
+          // shared session (a notebook's) only when what owns it closed: a
+          // deleted cell's notebook goes on using it.
           void api.closeTab(runKey).catch(() => {});
-          if (sessionKey) void api.closeTab(sessionKey).catch(() => {});
+          if (sessionKey && !runKeyOpen(get(), runKey)) void api.closeTab(sessionKey).catch(() => {});
           return false;
         }
         if (resp.status === "needs_confirmation") {
@@ -310,9 +333,13 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
         set((st) => {
           const prev = st.runs[runKey];
           const at = resp.statements[0]?.index;
+          // Where that statement is in the run: by its index, not as a
+          // position (a run restored after a restart lists only the
+          // statements that had results).
+          const pos = prev && at !== undefined ? prev.statements.findIndex((x) => x.plan.index === at) : -1;
           // One result refreshed: the run's other results stay as they were;
           // its statement keeps the place it has in the editor.
-          if (replaces && prev && resp.statements.length === 1 && at !== undefined && prev.statements[at]) {
+          if (replaces && prev && resp.statements.length === 1 && pos >= 0) {
             return {
               runs: {
                 ...st.runs,
@@ -321,7 +348,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
                   jobId: resp.job_id,
                   running: true,
                   startedAt: Date.now(),
-                  statements: prev.statements.map((x, i) => (i === at ? { plan: x.plan, status: "pending", notices: [] } : x)),
+                  statements: prev.statements.map((x, i) => (i === pos ? { plan: x.plan, status: "pending", notices: [] } : x)),
                   activeIndex: at,
                   errorRange: undefined,
                   refreshOf: at,
@@ -442,8 +469,13 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
       const run = s.runs[e.tab_id];
       if (!run || run.jobId !== e.job_id) return {};
       const statements = run.statements.slice();
+      // An event names a statement by its index; the run lists statements by
+      // position. The same in a run as it started; not in one restored after
+      // a restart (only statements that had results), which a refresh updates.
+      const posOf = (i: number) => (statements[i]?.plan.index === i ? i : statements.findIndex((x) => x.plan.index === i));
       const upd = (i: number, patch: Partial<StatementRun>) => {
-        if (statements[i]) statements[i] = { ...statements[i], ...patch };
+        const p = posOf(i);
+        if (statements[p]) statements[p] = { ...statements[p], ...patch };
       };
       let next: TabRun = { ...run, statements };
       switch (e.type) {
@@ -456,7 +488,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
             const { tab_id, job_id, index } = e;
             setTimeout(() => {
               const r = get().runs[tab_id];
-              if (r?.jobId === job_id && r.statements[index]?.status === "running") void get().computeTips(tab_id, job_id);
+              if (r?.jobId === job_id && r.statements.find((x) => x.plan.index === index)?.status === "running") void get().computeTips(tab_id, job_id);
             }, ms + 50);
           }
           break;
@@ -465,7 +497,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
           upd(e.index, { progressRows: e.rows });
           break;
         case "downloading": {
-          const cur = statements[e.index];
+          const cur = statements[posOf(e.index)];
           upd(e.index, { downloading: true, serverMs: e.elapsed_ms, notices: e.notice && cur ? [...cur.notices, e.notice] : (cur?.notices ?? []) });
           break;
         }
@@ -478,12 +510,12 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
             durationMs: e.duration_ms,
             notices: e.notices,
             downloading: false,
-            serverMs: e.server_ms ?? statements[e.index]?.serverMs,
+            serverMs: e.server_ms ?? statements[posOf(e.index)]?.serverMs,
           });
           if (e.result) next.activeIndex = e.index;
           if (run.connectionId) {
             const id = run.connectionId;
-            const plan = statements[e.index]?.plan;
+            const plan = statements[posOf(e.index)]?.plan;
             const effect = plan ? ddlEffect(plan.sql, plan.classification.kind) : null;
             setTimeout(() => {
               get().markOnline(id);
@@ -500,7 +532,7 @@ export const createRunsSlice: StateCreator<State, [], [], RunsSlice> = (set, get
             error: e.error,
             durationMs: e.duration_ms,
           });
-          const st = statements[e.index];
+          const st = statements[posOf(e.index)];
           if (!cancelled && st) next.errorRange = errorRange(st.plan, e.error.position);
           if (next.activeIndex === null || !cancelled) next.activeIndex = e.index;
           break;

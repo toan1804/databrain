@@ -211,6 +211,8 @@ export function useConnectionForm(initial: ConnectionProfile | null, folderId: s
     const tick = setInterval(() => setTestSecs(Math.floor((Date.now() - started) / 1000)), 1000);
     try {
       const p = buildProfile();
+      // The backend refuses to send the saved password to a server, user or
+      // encryption setting other than the saved one (and says why).
       const r = await api.testConnection(p.config, secret || null, isEdit && !clearSecret ? p.id : null, sshSecret || null, id);
       if (testId.current === id) setTestResult({ ok: true, text: `Connected in ${r.latency_ms} ms — ${r.server_version}` });
     } catch (e) {
@@ -251,6 +253,9 @@ export function useConnectionForm(initial: ConnectionProfile | null, folderId: s
       });
       const tab = st.tabs.find((t) => t.id === st.activeTabId);
       if (tab && !tab.connection_id && !tab.notebook_id) st.updateTab(tab.id, { connection_id: saved.id });
+      // Saved for another server, user or encryption setting without a new one: the backend dropped it.
+      if (initial?.has_secret && !saved.has_secret && !secret && !clearSecret)
+        toast("The server, user or encryption settings changed, so the saved password was removed: type it again to connect.", "info");
       return saved;
     } catch (e) {
       toast(toError(e).message, "error");

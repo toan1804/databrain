@@ -111,19 +111,12 @@ export function layout(g: LineageGraph, direction: Direction = "lr", display: Di
   const nodes = g.nodes.filter((n) => n.name !== "" || n.columns.length > 0);
   const ids = new Set(nodes.map((n) => n.id));
   const edges = g.edges.filter((e) => ids.has(e.from) && ids.has(e.to) && e.from !== e.to);
-  // Rank = longest path from a source (cycles are cut by the iteration cap).
-  const rank = new Map(nodes.map((n) => [n.id, 0]));
-  for (let pass = 0; pass < nodes.length; pass++) {
-    let changed = false;
-    for (const e of edges) {
-      const r = rank.get(e.from)! + 1;
-      if (r > rank.get(e.to)!) {
-        rank.set(e.to, r);
-        changed = true;
-      }
-    }
-    if (!changed) break;
-  }
+  // Rank = longest path from a source, over the edges that close no cycle:
+  // with a cycle (two tables referencing each other) every pass raised both
+  // ranks, and a schema of 200 tables ended up hundreds of ranks wide.
+  // In one pass, in topological order (a pass per rank was O(V·E): 20 s
+  // for a chain of 20,000 tables listed backwards).
+  const rank = longestPaths(nodes.map((n) => n.id), withoutBackEdges(nodes.map((n) => n.id), edges));
 
   const laid: LaidNode[] = nodes.map((node) => {
     const open = display.expanded === "all" || display.expanded.has(node.id);
@@ -186,6 +179,7 @@ export function layout(g: LineageGraph, direction: Direction = "lr", display: Di
     }
   }
   // Main axis: ranks left to right (fixed width), or top to bottom (tallest node of the rank).
+  const rankIndex = new Map([...ranks].map((r, i) => [r, i]));
   const rankTop = new Map<number, number>();
   let top = MARGIN;
   for (const r of ranks) {
@@ -193,7 +187,8 @@ export function layout(g: LineageGraph, direction: Direction = "lr", display: Di
     top += Math.max(...byRank.get(r)!.map((n) => n.h)) + GAP_RANK_TB;
   }
   for (const n of laid) {
-    if (lr) n.x = MARGIN + n.rank * (NODE_W + GAP_X);
+    // By the rank's place among the ranks used: no empty column for a rank nothing has.
+    if (lr) n.x = MARGIN + rankIndex.get(n.rank)! * (NODE_W + GAP_X);
     else n.y = rankTop.get(n.rank)!;
   }
   return finish(laid, direction);
@@ -333,3 +328,68 @@ export const EDGE_LABEL: Record<LineageEdge["kind"], string> = {
   filter: "filters rows",
   join: "joins on",
 };
+
+/**
+ * `edges` without those that close a cycle (found by a depth-first walk
+ * from each node in order): what is left has no cycle, so longest paths
+ * over it are finite and small.
+ */
+export function withoutBackEdges<E extends { from: string; to: string }>(ids: string[], edges: E[]): E[] {
+  const out = new Map<string, E[]>();
+  for (const e of edges) {
+    const list = out.get(e.from);
+    if (list) list.push(e);
+    else out.set(e.from, [e]);
+  }
+  const state = new Map<string, 1 | 2>(); // 1: on the current path, 2: done
+  const back = new Set<E>();
+  for (const root of ids) {
+    if (state.has(root)) continue;
+    // Iterative, so a long chain doesn't overflow the stack.
+    const stack: { id: string; next: number }[] = [{ id: root, next: 0 }];
+    state.set(root, 1);
+    while (stack.length) {
+      const top = stack[stack.length - 1];
+      const list = out.get(top.id) ?? [];
+      if (top.next >= list.length) {
+        state.set(top.id, 2);
+        stack.pop();
+        continue;
+      }
+      const e = list[top.next++];
+      const s = state.get(e.to);
+      if (s === 1) back.add(e);
+      else if (s === undefined) {
+        state.set(e.to, 1);
+        stack.push({ id: e.to, next: 0 });
+      }
+    }
+  }
+  return edges.filter((e) => !back.has(e));
+}
+
+/** Rank of each node: the longest path to it from a source, over `edges` (which have no cycle). O(V + E). */
+export function longestPaths<E extends { from: string; to: string }>(ids: string[], edges: E[]): Map<string, number> {
+  const rank = new Map(ids.map((id) => [id, 0]));
+  const indegree = new Map(ids.map((id) => [id, 0]));
+  const out = new Map<string, string[]>();
+  for (const e of edges) {
+    if (!rank.has(e.from) || !rank.has(e.to)) continue;
+    indegree.set(e.to, indegree.get(e.to)! + 1);
+    const list = out.get(e.from);
+    if (list) list.push(e.to);
+    else out.set(e.from, [e.to]);
+  }
+  const queue = ids.filter((id) => indegree.get(id) === 0);
+  for (let head = 0; head < queue.length; head++) {
+    const id = queue[head];
+    const r = rank.get(id)! + 1;
+    for (const to of out.get(id) ?? []) {
+      if (r > rank.get(to)!) rank.set(to, r);
+      const left = indegree.get(to)! - 1;
+      indegree.set(to, left);
+      if (left === 0) queue.push(to);
+    }
+  }
+  return rank;
+}

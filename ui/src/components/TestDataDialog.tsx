@@ -174,13 +174,16 @@ function TestDataDialog({ req, onClose }: { req: TestDataRequest; onClose: () =>
     return () => void un.then((f) => f());
   }, []);
 
-  // Settings changed: earlier rows and checks no longer match them.
+  // Settings changed: earlier rows and checks no longer match them. The
+  // connection's AI policy by value: a refresh of the connection list
+  // makes a new object of the same policy.
+  const policyKey = JSON.stringify(conn?.ai_policy ?? null);
   const tickedKey = [...ticked].sort().join(",");
   useEffect(() => {
     settingsVersion.current += 1;
     setMade(null);
     setDry(null);
-  }, [rows, nulls, seed, parentKeys, tickedKey, aiSettings, panelProvider, panelModel, conn?.ai_policy, patterns]);
+  }, [rows, nulls, seed, parentKeys, tickedKey, aiSettings, panelProvider, panelModel, policyKey, patterns]);
 
   if (plan.status !== "ready") {
     return (
