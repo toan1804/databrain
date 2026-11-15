@@ -41,7 +41,7 @@ impl MssqlSession {
         // One database at a time (all-databases mode), each with three queries.
         let mut by_db: Vec<(Option<String>, Vec<String>)> = Vec::new();
         for id in schemas {
-            let (db, sch) = self.split(id);
+            let (db, sch) = self.split_id(id).await;
             let db = db.map(str::to_string);
             match by_db.iter_mut().find(|(d, _)| *d == db) {
                 Some((_, l)) => l.push(sch.to_string()),
@@ -144,7 +144,7 @@ impl MssqlSession {
     }
 
     pub(crate) async fn foreign_keys(&self, schema_id: &str, table: Option<&str>) -> Result<Vec<(String, ForeignKey)>> {
-        let (db, schema) = self.split(schema_id);
+        let (db, schema) = self.split_id(schema_id).await;
         let rows = self
             .rows_in(
                 db,
@@ -322,8 +322,15 @@ mod tests {
             state: Default::default(),
             user_rowcount: Default::default(),
             all_dbs: true,
+            db_cache: Default::default(),
         };
         assert_eq!(s.split("shop.dbo"), (Some("shop"), "dbo"));
+        // A database whose name holds a dot, once listed.
+        *s.db_cache.lock().unwrap() = vec!["a".into(), "a.b".into(), "shop".into()];
+        assert_eq!(s.split("a.b.dbo"), (Some("a.b"), "dbo"));
+        assert_eq!(s.split("a.dbo"), (Some("a"), "dbo"));
+        assert_eq!(s.split("shop.my.schema"), (Some("shop"), "my.schema"));
+        assert_eq!(s.split("other.dbo"), (Some("other"), "dbo"));
         assert_eq!(s.id(Some("shop"), "dbo"), "shop.dbo");
         let two = MssqlSession { all_dbs: false, ..s };
         assert_eq!(two.split("dbo"), (None, "dbo"));
