@@ -60,6 +60,8 @@ pub struct LoadSpec {
     /// step counts as agreed: the job was saved to do it). Unset, a load
     /// into a production connection fails with code `needs_confirmation`.
     pub confirmed: bool,
+    /// Rows go in INSERTs only: no bulk path (Postgres `COPY`).
+    pub insert_only: bool,
 }
 
 /// Outcome of a load.
@@ -280,6 +282,8 @@ struct Prepared {
     /// procedure): a dry run doesn't run the plan, and a failure can't
     /// promise that nothing was kept.
     may_commit: bool,
+    /// [`LoadSpec::insert_only`].
+    insert_only: bool,
 }
 
 /// The step's own before/after SQL, checked once: transaction control is
@@ -602,7 +606,7 @@ impl QueryEngine {
         // Preparing only reads (the target, its columns); the before SQL runs in the plan.
         let p = self.prepare_load(connection_id, tab, spec, Some(rows), false).await.map_err(|e| before_writing(obs, e))?;
         obs.event(LoadEvent::Info(format!(
-            "Writing {} rows into {} on {} ({}, INSERTs of up to {} rows / {} KB): {}",
+            "Writing {} rows into {} on {} ({}, in batches of up to {} rows / {} KB): {}",
             if rest.is_some() { "every".to_string() } else { rows.count().to_string() },
             p.table,
             p.connection,
@@ -970,6 +974,9 @@ impl QueryEngine {
             return Err(EngineError::new("invalid", "Choose the key columns that identify a row (Update and Merge match rows by them)"));
         }
         let session = self.session_for(connection_id, tab, spec.origin).await?;
+        // Redshift has no COPY from the client (nor `to_regclass`, nor
+        // SAVEPOINT, which aborts the transaction there): INSERTs.
+        let insert_only = inserts_only(spec.insert_only, &profile.config, session.detected_flavor());
 
         // Does the table exist, and with which columns?
         let mut table = table;
@@ -1195,7 +1202,22 @@ impl QueryEngine {
                 None => format!("{} doesn't run this step in a transaction: if it fails partway, what ran before stays.", engine_name(dialect)),
             });
         }
-        Ok(Prepared { dialect, connection: conn, table, session, exists: Some(exists), creates, plan, schema, tx, batch, permanent_stage, notices, may_commit })
+        Ok(Prepared {
+            dialect,
+            connection: conn,
+            table,
+            session,
+            exists: Some(exists),
+            creates,
+            plan,
+            schema,
+            tx,
+            batch,
+            permanent_stage,
+            notices,
+            may_commit,
+            insert_only,
+        })
     }
 }
 
@@ -1224,6 +1246,263 @@ async fn next_batch(stream: &mut QueryStream) -> Result<Option<RecordBatch>> {
             Some(Err(e)) => return Err(EngineError::from(e)),
         }
     }
+}
+
+/// What a group of INSERTs (or a COPY) wrote.
+struct Written {
+    rows: u64,
+    statements: usize,
+    /// The first statement, or the one that failed.
+    sql: String,
+    result: Result<()>,
+}
+
+/// The rows of a load: those held, then those still streaming in.
+struct Feed<'a, 'b> {
+    held: std::slice::Iter<'a, RecordBatch>,
+    rest: Option<&'b mut QueryStream>,
+}
+
+impl Feed<'_, '_> {
+    async fn next(&mut self) -> Result<Option<RecordBatch>> {
+        if let Some(b) = self.held.next() {
+            return Ok(Some(b.clone()));
+        }
+        match self.rest.as_deref_mut() {
+            None => Ok(None),
+            Some(stream) => next_batch(stream).await,
+        }
+    }
+}
+
+/// Batched INSERTs, built one at a time while the rows are sent.
+async fn insert_rows(
+    p: &Prepared,
+    table: &str,
+    schema: &SchemaRef,
+    mut feed: Feed<'_, '_>,
+    cancel: &CancellationToken,
+    progress: &(dyn Fn(u64) + Sync),
+) -> Written {
+    let b = sqlgen::InsertSql::new(p.dialect, table, schema, p.batch);
+    let mut w = Written { rows: 0, statements: 0, sql: String::new(), result: Ok(()) };
+    'rows: loop {
+        let batch = match feed.next().await {
+            Ok(Some(b)) => b,
+            Ok(None) => break,
+            Err(e) => {
+                w.result = Err(e);
+                break;
+            }
+        };
+        // Batches carry the rows' names; the statement uses the target's.
+        let mut at = 0;
+        loop {
+            let (sql, k) = match b.next(&batch, at, None) {
+                Ok(Some(x)) => x,
+                Ok(None) => break,
+                Err(e) => {
+                    w.result = Err(EngineError::new("internal", e.to_string()));
+                    break 'rows;
+                }
+            };
+            if w.sql.is_empty() {
+                w.sql = sql.clone();
+            }
+            if let Err(e) = exec(&p.session, Statement::internal(&sql), cancel).await {
+                w.sql = sql;
+                w.result = Err(e);
+                break 'rows;
+            }
+            at += k;
+            w.rows += k as u64;
+            w.statements += 1;
+            progress(w.rows);
+        }
+    }
+    w
+}
+
+/// Rows go in INSERTs only: the step says so, or the connection is Amazon
+/// Redshift, however it was recognised (the flavor setting in any case,
+/// the host name, or found at connect time).
+fn inserts_only(step: bool, config: &databrain_connector_core::ConnectionConfig, session_flavor: Option<&str>) -> bool {
+    step || config.is_redshift() || session_flavor.is_some_and(|f| f.eq_ignore_ascii_case("redshift"))
+}
+
+/// Why a load doesn't use COPY: the rows go in INSERTs instead
+/// ([`CopyCheck::Inserts`]), or the check left the transaction unusable
+/// and the load must stop ([`CopyCheck::Fatal`]).
+enum CopyCheck {
+    Inserts(String),
+    Fatal(EngineError),
+}
+
+/// Postgres `COPY … FROM STDIN` for these rows into `table`, when it writes
+/// what the INSERTs would (`Ok(None)` when the session has no COPY, `Err`
+/// says why not): every column's rows fit the table's column type
+/// ([`sqlgen::pg_copy_fits`]), and the table is a plain or partitioned table
+/// without rules (COPY doesn't apply rules) or row-level security (COPY
+/// refuses a table whose policies apply to the user).
+async fn bulk_copy(p: &Prepared, table: &str, schema: &SchemaRef, cancel: &CancellationToken) -> std::result::Result<Option<sqlgen::PgCopy>, CopyCheck> {
+    if p.insert_only || p.dialect != ConnectorKind::Postgres {
+        return Ok(None);
+    }
+    let path = databrain_connector_core::quote_path(p.dialect, table);
+    let sql = format!(
+        "SELECT c.relkind::text, c.relhasrules::text, a.attname::text, format_type(a.atttypid, NULL), c.relrowsecurity::text, \
+         a.attidentity::text, a.attgenerated::text \
+         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
+         WHERE c.oid = to_regclass({})",
+        databrain_connector_core::quote_literal(&path)
+    );
+    // A failure of the savepoint itself (or of going back to it) leaves the
+    // transaction aborted: the load stops with that error, not with the
+    // INSERT's "current transaction is aborted" that would follow.
+    let fatal =
+        |what: &str, e: EngineError| CopyCheck::Fatal(if e.kind == "cancelled" { e } else { EngineError { message: format!("{what}: {}", e.message), ..e } });
+    // In the load's transaction, a failed lookup would abort it (and the
+    // INSERTs after it): it runs behind a savepoint, given up on failure.
+    let savepoint = p.tx.is_some();
+    if savepoint && let Err(e) = exec(&p.session, Statement::internal("SAVEPOINT databrain_copy_check"), cancel).await {
+        return Err(fatal("Checking whether COPY can be used (SAVEPOINT)", e));
+    }
+    let opts = ExecOptions { cancel: cancel.clone(), ..Default::default() };
+    let got = match p.session.execute(Statement::internal(&sql), opts).await {
+        Ok(s) => s.collect().await,
+        Err(e) => Err(e),
+    };
+    if savepoint {
+        let end = if got.is_ok() { "RELEASE SAVEPOINT databrain_copy_check" } else { "ROLLBACK TO SAVEPOINT databrain_copy_check" };
+        if let Err(e) = exec(&p.session, Statement::internal(end), cancel).await {
+            return Err(fatal(&format!("Checking whether COPY can be used ({})", end.split(" SAVEPOINT").next().unwrap_or(end)), e));
+        }
+    }
+    let c = match got {
+        Ok(c) => c,
+        Err(e) if e.is_cancelled() => return Err(CopyCheck::Fatal(EngineError::new("cancelled", "Cancelled"))),
+        Err(e) => return Err(CopyCheck::Inserts(format!("the table's column types couldn't be read: {}", e.message))),
+    };
+    let columns: Vec<CopyColumn> = c
+        .batches
+        .iter()
+        .flat_map(|b| {
+            let cell =
+                move |col: usize, row: usize| databrain_connector_core::arrow::util::display::array_value_to_string(b.column(col), row).unwrap_or_default();
+            (0..b.num_rows()).map(move |r| CopyColumn {
+                relkind: cell(0, r),
+                rules: cell(1, r) == "true",
+                name: cell(2, r),
+                ty: cell(3, r),
+                rls: cell(4, r) == "true",
+                identity: cell(5, r),
+                generated: cell(6, r),
+            })
+        })
+        .collect();
+    copy_fits(&columns, schema).map_err(CopyCheck::Inserts)?;
+    Ok(Some(sqlgen::PgCopy::new(table, schema)))
+}
+
+/// One column of the target, as the COPY check reads it.
+struct CopyColumn {
+    relkind: String,
+    rules: bool,
+    name: String,
+    ty: String,
+    rls: bool,
+    /// `attidentity`: `a` GENERATED ALWAYS, `d` BY DEFAULT, empty otherwise.
+    identity: String,
+    /// `attgenerated`: `s` a stored generated column, empty otherwise.
+    generated: String,
+}
+
+/// Whether COPY writes into the table what the INSERTs would; `Err` says
+/// why not. COPY skips what an INSERT is refused or rewritten by: rules,
+/// row-level security (COPY refuses it), and it writes a value into a
+/// GENERATED ALWAYS identity column, which an INSERT refuses.
+fn copy_fits(columns: &[CopyColumn], schema: &SchemaRef) -> std::result::Result<(), String> {
+    let Some(first) = columns.first() else { return Err("the table's column types couldn't be read".into()) };
+    if !matches!(first.relkind.as_str(), "r" | "p") {
+        return Err("not a plain table".into());
+    }
+    if first.rules {
+        return Err("the table has rules, which COPY doesn't apply".into());
+    }
+    if first.rls {
+        return Err("the table has row-level security, which COPY refuses".into());
+    }
+    for f in schema.fields() {
+        let Some(c) = columns.iter().find(|c| &c.name == f.name()) else { return Err(format!("no column {}", f.name())) };
+        if c.identity == "a" {
+            return Err(format!("{} is GENERATED ALWAYS AS IDENTITY: COPY would write it, an INSERT refuses it", c.name));
+        }
+        if !c.generated.is_empty() {
+            return Err(format!("{} is a generated column", c.name));
+        }
+        sqlgen::pg_copy_fits(f, &c.ty)?;
+    }
+    Ok(())
+}
+
+/// The rows by COPY: one COPY for all of them, sent in chunks of about the
+/// batch's byte size. Stopped or failed, the COPY is abandoned (nothing of
+/// it is kept).
+async fn copy_rows(
+    p: &Prepared,
+    c: &sqlgen::PgCopy,
+    mut writer: Box<dyn databrain_connector_core::BulkWriter>,
+    mut feed: Feed<'_, '_>,
+    progress: &(dyn Fn(u64) + Sync),
+) -> Written {
+    let mut w = Written { rows: 0, statements: 1, sql: c.sql.clone(), result: Ok(()) };
+    'rows: loop {
+        let batch = match feed.next().await {
+            Ok(Some(b)) => b,
+            Ok(None) => break,
+            Err(e) => {
+                w.result = Err(e);
+                break;
+            }
+        };
+        let mut at = 0;
+        loop {
+            let (data, k) = match c.next(&batch, at, p.batch.bytes) {
+                Ok(Some(x)) => x,
+                Ok(None) => break,
+                Err(e) => {
+                    w.result = Err(EngineError::new("internal", e.to_string()));
+                    break 'rows;
+                }
+            };
+            // The writer watches `cancel` itself and asks the server to stop
+            // the COPY: not raced here, which would drop it before it asked.
+            let sent = writer.write(data).await.map_err(EngineError::from);
+            if let Err(e) = sent {
+                w.result = Err(e);
+                break 'rows;
+            }
+            at += k;
+            w.rows += k as u64;
+            progress(w.rows);
+        }
+    }
+    if w.result.is_err() {
+        // Dropped unfinished: the server aborts the COPY, nothing of it is kept.
+        drop(writer);
+        w.rows = 0;
+        return w;
+    }
+    let done = writer.finish().await.map_err(EngineError::from);
+    match done {
+        Ok(n) => w.rows = n,
+        // A bad row is reported here, at the end: none of the COPY is kept.
+        Err(e) => {
+            w.rows = 0;
+            w.result = Err(e);
+        }
+    }
+    w
 }
 
 async fn run_plan(
@@ -1271,56 +1550,57 @@ async fn run_plan(
             }
             Act::Insert { label, table, target } => {
                 let schema = p.schema.clone().unwrap_or_else(|| rows.schema.clone());
-                let b = sqlgen::InsertSql::new(p.dialect, table, &schema, p.batch);
-                let (mut n, mut statements, mut first) = (0u64, 0usize, String::new());
-                let mut r: Result<()> = Ok(());
                 // Rows still streaming in: the total isn't known (0).
                 let total = if rest.is_some() { 0 } else { rows.count() };
                 let started = std::time::Instant::now();
                 let phase = if *target { "Inserting rows" } else { "Staging rows" };
-                obs.event(LoadEvent::Progress { phase: phase.into(), done: 0, total });
-                let mut held = rows.batches.iter().cloned();
-                'rows: loop {
-                    let batch = match held.next() {
-                        Some(b) => b,
-                        None => match rest.as_deref_mut() {
-                            None => break,
-                            Some(stream) => match next_batch(stream).await {
-                                Ok(Some(b)) => b,
-                                Ok(None) => break,
-                                Err(e) => {
-                                    r = Err(e);
-                                    break;
-                                }
-                            },
-                        },
-                    };
-                    let batch = &batch;
-                    // Batches carry the rows' names; the statement uses the target's.
-                    let mut at = 0;
-                    loop {
-                        let next = match b.next(batch, at, None) {
-                            Ok(x) => x,
-                            Err(e) => {
-                                r = Err(EngineError::new("internal", e.to_string()));
-                                break 'rows;
-                            }
-                        };
-                        let Some((sql, k)) = next else { break };
-                        if first.is_empty() {
-                            first = sql.clone();
-                        }
-                        if let Err(e) = exec(&p.session, Statement::internal(&sql), cancel).await {
-                            first = sql;
-                            r = Err(e);
-                            break 'rows;
-                        }
-                        at += k;
-                        n += k as u64;
-                        statements += 1;
-                        obs.event(LoadEvent::Progress { phase: phase.into(), done: n, total });
+                let mut why_not = None;
+                let copy = match bulk_copy(p, table, &schema, cancel).await {
+                    Ok(c) => c,
+                    Err(CopyCheck::Inserts(why)) => {
+                        why_not = Some(why);
+                        None
                     }
+                    Err(CopyCheck::Fatal(e)) => {
+                        push(&mut record, label, "", &Err(e.clone()), None);
+                        return Err(labelled(label, e));
+                    }
+                };
+                // The COPY starts here (it waits for the table's lock); a
+                // session without one sends INSERTs.
+                let writer = match &copy {
+                    Some(c) => match p.session.bulk_load(&c.sql, cancel.clone()).await {
+                        Ok(Some(w)) => Some((c, w)),
+                        Ok(None) => {
+                            why_not = Some("this connection has no COPY".into());
+                            None
+                        }
+                        Err(e) => {
+                            let e = EngineError::from(e);
+                            push(&mut record, label, &c.sql, &Err(e.clone()), None);
+                            return Err(labelled(label, e));
+                        }
+                    },
+                    None => None,
+                };
+                let how = match (&writer, &why_not) {
+                    (Some((c, _)), _) => format!("bulk load ({})", c.sql),
+                    (None, Some(why)) => format!("INSERTs, not COPY ({why})"),
+                    (None, None) => String::new(),
+                };
+                if !how.is_empty() {
+                    obs.event(LoadEvent::Info(format!("{label}: {how}")));
+                    // The dry run says which one the load would use.
+                    push(&mut record, &format!("{label}: how"), "", &Ok(()), Some(how));
                 }
+                obs.event(LoadEvent::Progress { phase: phase.into(), done: 0, total });
+                let feed = Feed { held: rows.batches.iter(), rest: rest.as_deref_mut() };
+                let progress = |done: u64| obs.event(LoadEvent::Progress { phase: phase.into(), done, total });
+                let w = match writer {
+                    Some((c, writer)) => copy_rows(p, c, writer, feed, &progress).await,
+                    None => insert_rows(p, table, &schema, feed, cancel, &progress).await,
+                };
+                let Written { rows: n, statements, sql: first, result: r } = w;
                 obs.event(LoadEvent::Inserted {
                     label: label.clone(),
                     table: table.clone(),
@@ -1475,6 +1755,63 @@ fn create_schema_sql(kind: ConnectorKind, path: &str, name: &str) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Redshift loads go in INSERTs (no COPY, and no SAVEPOINT for its
+    /// check, which aborts a Redshift transaction), however the connection
+    /// is recognised as Redshift; plain Postgres may use COPY.
+    #[test]
+    fn redshift_loads_never_use_copy() {
+        use databrain_auth::AuthMethod;
+        use databrain_connector_core::ConnectionConfig;
+        let cfg = |host: &str, flavor: Option<&str>| {
+            let mut c = ConnectionConfig::new(ConnectorKind::Postgres, AuthMethod::Password { user: "u".into() });
+            c.host = Some(host.into());
+            if let Some(f) = flavor {
+                c.options.insert("flavor".into(), f.into());
+            }
+            c
+        };
+        // Refused: the host alone, the flavor in any case, found at connect time, or the step's choice.
+        assert!(inserts_only(false, &cfg("x.abc.us-east-1.redshift.amazonaws.com", None), None));
+        assert!(inserts_only(false, &cfg("wg.123.eu-west-1.redshift-serverless.amazonaws.com", None), None));
+        assert!(inserts_only(false, &cfg("db.internal", Some("Redshift")), None));
+        assert!(inserts_only(false, &cfg("db.internal", Some("redshift")), None));
+        assert!(inserts_only(false, &cfg("tunnel.local", None), Some("redshift")));
+        assert!(inserts_only(true, &cfg("db.internal", None), None));
+        // Allowed: plain Postgres.
+        assert!(!inserts_only(false, &cfg("db.internal", None), None));
+        assert!(!inserts_only(false, &cfg("db.internal", Some("postgres")), None));
+    }
+
+    /// COPY only where it writes what the INSERTs would: not into a
+    /// GENERATED ALWAYS identity column (an INSERT refuses it, COPY would
+    /// write it) or a generated column; a BY DEFAULT identity takes the
+    /// value either way.
+    #[test]
+    fn copy_skips_identity_always_and_generated_columns() {
+        use databrain_connector_core::arrow::datatypes::DataType;
+        let col = |name: &str, identity: &str, generated: &str| CopyColumn {
+            relkind: "r".into(),
+            rules: false,
+            name: name.into(),
+            ty: "bigint".into(),
+            rls: false,
+            identity: identity.into(),
+            generated: generated.into(),
+        };
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true), Field::new("v", DataType::Int64, true)]));
+        assert!(copy_fits(&[col("id", "", ""), col("v", "", "")], &schema).is_ok());
+        assert!(copy_fits(&[col("id", "d", ""), col("v", "", "")], &schema).is_ok());
+        assert!(copy_fits(&[col("id", "a", ""), col("v", "", "")], &schema).unwrap_err().contains("GENERATED ALWAYS AS IDENTITY"));
+        assert!(copy_fits(&[col("id", "", ""), col("v", "", "s")], &schema).unwrap_err().contains("generated column"));
+        // A table column the rows don't have isn't checked.
+        let only_v: SchemaRef = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        assert!(copy_fits(&[col("id", "a", ""), col("v", "", "")], &only_v).is_ok());
+        // No columns read, rules, RLS: INSERTs.
+        assert!(copy_fits(&[], &schema).is_err());
+        let rls = CopyColumn { rls: true, ..col("id", "", "") };
+        assert!(copy_fits(&[rls, col("v", "", "")], &schema).unwrap_err().contains("row-level security"));
+    }
 
     #[test]
     fn load_sql_is_checked_for_transaction_control() {

@@ -224,6 +224,11 @@ pub struct JobNode {
     /// Load: most KB of SQL text per INSERT statement (`None` = default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_kb: Option<u32>,
+    /// Load: rows go in INSERTs only. Off (the default), a load uses the
+    /// database's bulk path where it writes the same (Postgres `COPY`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub load_insert_only: bool,
     /// Export: folder of the file (empty = Downloads).
     #[serde(default)]
     pub export_folder: Option<String>,
@@ -303,6 +308,7 @@ impl JobNode {
             self.create_table = true;
             self.batch_rows = None;
             self.batch_kb = None;
+            self.load_insert_only = false;
         } else if !self.load_mode.needs_keys() {
             self.key_columns.clear();
         }

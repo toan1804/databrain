@@ -1693,6 +1693,7 @@ pub fn load_spec(node: &JobNode) -> LoadSpec {
         origin: sql_origin(node),
         // The job was saved to write there; its runs don't ask.
         confirmed: true,
+        insert_only: node.load_insert_only,
     }
 }
 

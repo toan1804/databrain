@@ -372,6 +372,7 @@ export function changeAction(node: JobNode, kind: JobNodeKind, upstreams: string
     create_table: true,
     batch_rows: null,
     batch_kb: null,
+    load_insert_only: false,
     export_folder: null,
     export_file: null,
     export_format: "csv",

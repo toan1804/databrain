@@ -286,6 +286,25 @@ pub trait Session: Send + Sync {
     fn schema_columns_read_keys(&self) -> bool {
         true
     }
+
+    /// Start a bulk load with `sql` (Postgres: `COPY t (cols) FROM STDIN`,
+    /// its data in COPY text format). `Ok(None)`: this session has no bulk
+    /// path, rows go in INSERTs. Loads (job steps and "Load into…") use it.
+    /// `cancel` stops it on the server too, also while it waits (a lock):
+    /// the start, each write and the finish then fail as cancelled.
+    async fn bulk_load(&self, _sql: &str, _cancel: CancellationToken) -> Result<Option<Box<dyn BulkWriter>>> {
+        Ok(None)
+    }
+}
+
+/// Data of a bulk load ([`Session::bulk_load`]), sent in chunks. Dropped
+/// before [`BulkWriter::finish`], the load is aborted (nothing of it kept).
+/// The server may report a bad row only at the finish.
+#[async_trait]
+pub trait BulkWriter: Send {
+    async fn write(&mut self, data: Vec<u8>) -> Result<()>;
+    /// End the data; rows written.
+    async fn finish(self: Box<Self>) -> Result<u64>;
 }
 
 /// Connectors available in this build (populated by the app based on
