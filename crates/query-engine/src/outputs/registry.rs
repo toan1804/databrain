@@ -11,6 +11,18 @@
 //!   then the least recently used are evicted (metadata stays, data is freed);
 //! - *pinned* outputs are never evicted and, when a snapshot directory is set,
 //!   are saved as Parquet and restored on the next start;
+//! - job steps' outputs (run key `job:<job>:<step>`) have a budget of their
+//!   own ([`OutputRegistry::job_budget`], a quarter of the budget, taken
+//!   out of the tabs' share so the setting stays the ceiling): they never
+//!   free a tab's outputs, nor a tab's theirs; past it a step's result
+//!   moves to disk where results spill instead of being cut for memory
+//!   (where the disk refuses, it is cut at the tabs' cap, as before); a
+//!   running step reserves its share ([`OutputRegistry::reserve_job_share`])
+//!   so steps running at once stay within it together; the latest outputs
+//!   of a job that isn't running (and that nobody used in the last minute)
+//!   are freed least recently used first when the job budget needs room;
+//!   a run frees its steps' earlier versions when it ends
+//!   ([`OutputRegistry::release_earlier`]);
 //! - each tab's latest (active) outputs are saved when the app quits
 //!   ([`OutputRegistry::persist_active`], up to [`AUTO_MAX_BYTES`] each) and
 //!   restored with the tab, so a reopened tab still shows its last result.
@@ -38,6 +50,32 @@ const MAX_ENTRIES: usize = 400;
 const DEFAULT_BUDGET: usize = 1024 * 1024 * 1024;
 const MB: u64 = 1024 * 1024;
 const GB: u64 = 1024 * MB;
+
+/// Run key of a job step (`job:<job>:<step>`): its outputs count against
+/// the job budget ([`OutputRegistry::job_budget`]).
+pub fn is_job_tab(tab: &str) -> bool {
+    job_of_tab(tab).is_some()
+}
+
+/// The job of a job step's run key (`job:<job>:<step>`, as
+/// [`databrain_workspace::SessionRole::parse`] reads it), without allocating.
+pub fn job_of_tab(tab: &str) -> Option<&str> {
+    tab.strip_prefix("job:")?.split_once(':').map(|(job, _)| job)
+}
+
+/// A job output used this recently (the user's "View output", the
+/// assistant reading it) counts as in use while its job doesn't run.
+const RECENT_USE_MS: i64 = 60_000;
+
+/// Read since it was made (opened, queried), in the last [`RECENT_USE_MS`].
+fn used_recently(o: &OutputInfo, now: i64) -> bool {
+    o.last_used > o.created_at && now - o.last_used <= RECENT_USE_MS
+}
+
+/// The job steps' share of a budget.
+fn job_share(budget: usize) -> usize {
+    budget / 4
+}
 
 /// The budget for a computer with `total` bytes of memory: a quarter of it,
 /// between 512 MB and 16 GB, so results don't push other programs into swap
@@ -206,6 +244,39 @@ struct Inner {
     /// ([`OutputRegistry::retire`]): the output that replaces it is kept too.
     keep_next: HashSet<(String, usize)>,
     seq: u64,
+    /// Jobs running in this process (how many runs), whose steps' outputs
+    /// the job budget doesn't free.
+    running_jobs: HashMap<String, usize>,
+    /// Memory a job step loading now may still take, by result id (its
+    /// tab, bytes): counted until its output is registered.
+    reserved: HashMap<String, (String, usize)>,
+}
+
+impl Inner {
+    /// A job step's output the job budget may free: not pinned, and either
+    /// an earlier version or the latest of a job that isn't running and
+    /// that nobody used in the last minute.
+    fn job_output_idle(&self, o: &OutputInfo, now: i64) -> bool {
+        if o.pinned {
+            return false;
+        }
+        if !o.active {
+            return true;
+        }
+        let running = job_of_tab(&o.tab_id).is_some_and(|j| self.running_jobs.contains_key(j));
+        !running && !used_recently(o, now)
+    }
+
+    /// See [`OutputRegistry::job_active_bytes`].
+    fn job_active(&self, except: &str, now: i64) -> usize {
+        let kept: usize = self
+            .by_handle
+            .values()
+            .filter(|o| o.state == OutputState::Live && o.tab_id != except && is_job_tab(&o.tab_id) && !self.job_output_idle(o, now))
+            .map(|o| o.bytes)
+            .sum();
+        kept + self.reserved.values().filter(|(tab, _)| tab != except).map(|(_, b)| b).sum::<usize>()
+    }
 }
 
 pub struct OutputRegistry {
@@ -216,6 +287,19 @@ pub struct OutputRegistry {
     budget: Mutex<usize>,
     free: Mutex<Option<FreeCheck>>,
     disk: Mutex<Option<FreeCheck>>,
+}
+
+/// Memory a job step's result reserved while it loads
+/// ([`OutputRegistry::reserve_job_memory`]); released when dropped.
+pub struct JobReservation {
+    outputs: Arc<OutputRegistry>,
+    result_id: String,
+}
+
+impl Drop for JobReservation {
+    fn drop(&mut self) {
+        self.outputs.inner.lock().reserved.remove(&self.result_id);
+    }
 }
 
 /// Name rules: identifier-like, not `r<digits>`, no `__` (version suffix).
@@ -256,9 +340,100 @@ impl OutputRegistry {
         *self.budget.lock()
     }
 
+    /// The tabs' share of the budget: what the job steps' share leaves.
+    pub fn tabs_budget(&self) -> usize {
+        let b = self.budget();
+        b - job_share(b)
+    }
+
     pub fn set_budget(&self, bytes: usize) {
         *self.budget.lock() = bytes.max(16 * 1024 * 1024);
         self.enforce_budget();
+    }
+
+    /// Memory job steps' outputs may keep together, a quarter of the
+    /// budget. They count against it, not against the budget of the tabs'
+    /// outputs, so a job never frees what a tab keeps (see the module doc).
+    pub fn job_budget(&self) -> usize {
+        job_share(self.budget())
+    }
+
+    /// Bytes of the job budget taken: job steps' outputs in memory that
+    /// the budget can't free (pinned, or the latest of a running job, or
+    /// used in the last minute) and the memory steps loading now reserved,
+    /// but those of step `except` (its rerun replaces them). Outputs of
+    /// jobs that aren't running don't count: they make room when needed.
+    pub fn job_active_bytes(&self, except: &str) -> usize {
+        self.inner.lock().job_active(except, now_ms())
+    }
+
+    /// Reserve a job step's share of the job budget for result `result_id`
+    /// (of run key `tab`): `cap` turns the part of the job budget not taken
+    /// ([`Self::job_active_bytes`]) into the bytes the result may keep.
+    /// Worked out and reserved under one lock, so steps starting at once
+    /// don't each take the same free memory; then idle job outputs are freed
+    /// until the job outputs and reservations fit the job budget. Returns
+    /// the bytes and the reservation ([`Self::reserve_job_memory`]).
+    pub fn reserve_job_share(self: &Arc<Self>, result_id: &str, tab: &str, cap: impl FnOnce(usize) -> usize) -> (usize, JobReservation) {
+        let budget = self.job_budget();
+        let bytes = {
+            let mut g = self.inner.lock();
+            let bytes = cap(budget.saturating_sub(g.job_active(tab, now_ms())));
+            g.reserved.insert(result_id.to_string(), (tab.to_string(), bytes));
+            bytes
+        };
+        self.enforce_budget();
+        (bytes, JobReservation { outputs: self.clone(), result_id: result_id.to_string() })
+    }
+
+    /// Job `job_id` started (`true`) or ended a run in this process: while
+    /// it runs, its steps' latest outputs stay (later steps read them).
+    pub fn job_running(&self, job_id: &str, running: bool) {
+        let mut g = self.inner.lock();
+        if running {
+            *g.running_jobs.entry(job_id.to_string()).or_default() += 1;
+        } else if let Some(n) = g.running_jobs.get_mut(job_id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                g.running_jobs.remove(job_id);
+            }
+        }
+    }
+
+    /// A job step's result `result_id` (of run key `tab`) may take up to
+    /// `bytes` while it loads: counted in [`Self::job_active_bytes`], so
+    /// steps loading at the same time share the job budget instead of each
+    /// taking half of what's free. Released when the output is registered,
+    /// or when the returned guard is dropped (the statement failed).
+    pub fn reserve_job_memory(self: &Arc<Self>, result_id: &str, tab: &str, bytes: usize) -> JobReservation {
+        self.inner.lock().reserved.insert(result_id.to_string(), (tab.to_string(), bytes));
+        JobReservation { outputs: self.clone(), result_id: result_id.to_string() }
+    }
+
+    /// A job step's run ended: free the data of its earlier runs' outputs
+    /// (`results.<step>__1`… and unnamed ones), which no step reads (steps
+    /// read `results.<step>`, the latest). Its latest run's outputs, the
+    /// output that still holds the step's name (its rerun failed before
+    /// making a new one), pinned or kept ones, and one used in the last
+    /// minute (shown, or read by the assistant) stay. Returns how many were freed.
+    pub fn release_earlier(&self, tab: &str) -> usize {
+        let now = now_ms();
+        let freed: Vec<String> = {
+            let mut g = self.inner.lock();
+            g.by_handle
+                .values_mut()
+                .filter(|o| o.tab_id == tab && o.state == OutputState::Live && !o.active && !o.pinned && !o.kept && o.name.is_none() && !used_recently(o, now))
+                .map(|o| {
+                    o.state = OutputState::Evicted;
+                    o.result_id.clone()
+                })
+                .collect()
+        };
+        for id in &freed {
+            self.results.remove(id);
+        }
+        self.trim_entries();
+        freed.len()
     }
 
     /// Bytes the outputs in memory use now.
@@ -288,17 +463,23 @@ impl OutputRegistry {
     /// until it isn't. The free space when it is still low (nothing left to
     /// free, or files still being read elsewhere), and how many results
     /// went. Deletes files: call off the async workers.
-    pub fn free_disk(&self) -> (Option<u64>, usize) {
+    /// `jobs`: the result needing room is a job step's; results of its own
+    /// kind (job steps' or tabs') go first, then the other kind's. Idle
+    /// job outputs (see [`Self::job_active_bytes`]) count as not shown.
+    pub fn free_disk(&self, jobs: bool) -> (Option<u64>, usize) {
         let mut freed = 0;
         let still_low = loop {
             let Some(free) = self.low_disk() else { break None };
             let victim = {
+                let now = now_ms();
                 let mut g = self.inner.lock();
                 let oldest = g
                     .by_handle
                     .values()
-                    .filter(|o| o.state == OutputState::Live && o.spilled && !o.pinned && !o.active)
-                    .min_by_key(|o| (o.last_used, o.created_at))
+                    .filter(|o| {
+                        o.state == OutputState::Live && o.spilled && !o.pinned && if is_job_tab(&o.tab_id) { g.job_output_idle(o, now) } else { !o.active }
+                    })
+                    .min_by_key(|o| (is_job_tab(&o.tab_id) != jobs, o.last_used, o.created_at))
                     .map(|o| o.handle.clone());
                 oldest.and_then(|h| g.by_handle.get_mut(&h)).map(|o| {
                     o.state = OutputState::Evicted;
@@ -553,6 +734,8 @@ impl OutputRegistry {
         let now = now_ms();
         let info = {
             let mut g = self.inner.lock();
+            // Its memory counts as the output's now, not as reserved.
+            g.reserved.remove(&n.result.id);
             g.seq += 1;
             let handle = format!("r{}", g.seq);
             let info = OutputInfo {
@@ -622,16 +805,27 @@ impl OutputRegistry {
     }
 
     /// Free data of the least recently used, inactive, unpinned outputs until
-    /// the budget is respected.
+    /// the budget is respected: the tabs' outputs within the budget, job
+    /// steps' within [`Self::job_budget`], each group freeing only its own.
     pub fn enforce_budget(&self) {
         let budget = *self.budget.lock();
         let mut freed = Vec::new();
         {
+            let now = now_ms();
             let mut g = self.inner.lock();
-            let mut total: usize = g.by_handle.values().filter(|o| o.state == OutputState::Live).map(|o| o.bytes).sum();
-            if total > budget {
-                let mut cands: Vec<(i64, String)> =
-                    g.by_handle.values().filter(|o| o.state == OutputState::Live && !o.pinned && !o.active).map(|o| (o.last_used, o.handle.clone())).collect();
+            for (jobs, budget) in [(false, budget - job_share(budget)), (true, job_share(budget))] {
+                let mine = |o: &OutputInfo| o.state == OutputState::Live && is_job_tab(&o.tab_id) == jobs;
+                // Job steps loading now count with their reservations: idle
+                // job outputs make room for them before they take it.
+                let reserved: usize = if jobs { g.reserved.values().map(|(_, b)| b).sum() } else { 0 };
+                let mut total: usize = g.by_handle.values().filter(|o| mine(o)).map(|o| o.bytes).sum::<usize>() + reserved;
+                if total <= budget {
+                    continue;
+                }
+                // A job's latest outputs may go once it doesn't run (and
+                // nobody used them in the last minute); a tab's never.
+                let may_go = |o: &OutputInfo| if jobs { g.job_output_idle(o, now) } else { !o.pinned && !o.active };
+                let mut cands: Vec<(i64, String)> = g.by_handle.values().filter(|o| mine(o) && may_go(o)).map(|o| (o.last_used, o.handle.clone())).collect();
                 cands.sort();
                 for (_, h) in cands {
                     if total <= budget {
@@ -1068,6 +1262,137 @@ pub(crate) mod tests {
             origin: Origin::User,
             session_key: String::new(),
         })
+    }
+
+    /// The job steps' active bytes leave out the step being run again (its
+    /// rerun replaces them), not the other steps', nor tabs' outputs.
+    #[test]
+    fn job_active_bytes_leave_out_the_rerun_step() {
+        let r = reg();
+        let (a, b) = ("job:j1:a", "job:j1:b");
+        for t in [a, b, "tab1"] {
+            r.begin_run(t);
+        }
+        r.job_running("j1", true);
+        let oa = add(&r, a, 100);
+        let ob = add(&r, b, 50);
+        add(&r, "tab1", 1000);
+        assert_eq!(r.job_active_bytes(""), oa.bytes + ob.bytes);
+        assert_eq!(r.job_active_bytes(a), ob.bytes);
+        assert_eq!(r.job_active_bytes(b), oa.bytes);
+    }
+
+    /// A job that isn't running doesn't take the job budget: its latest
+    /// outputs make room (freed least recently used first) for another
+    /// job's step, unless pinned or read in the last minute. Steps loading
+    /// now count with what they reserved, until their output is registered.
+    #[test]
+    fn idle_jobs_make_room_and_loading_steps_reserve_theirs() {
+        let r = reg();
+        let (old, new) = ("job:old:a", "job:new:a");
+        r.begin_run(old);
+        let o = add(&r, old, 10_000);
+        assert_eq!(r.job_active_bytes(new), 0, "an ended job's latest output doesn't shrink another's share");
+        r.job_running("old", true);
+        assert_eq!(r.job_active_bytes(new), o.bytes, "while its job runs it stays");
+        r.job_running("old", false);
+        // Read since (View output): in use for a minute.
+        r.update(&o.handle, |x| x.last_used = x.created_at + 1);
+        assert_eq!(r.job_active_bytes(new), o.bytes);
+        r.update(&o.handle, |x| x.last_used = x.created_at);
+        // Reserved by a step loading now, counted for the others, not for itself.
+        let held = r.reserve_job_memory("res-1", "job:new:b", 4096);
+        assert_eq!(r.job_active_bytes(new), 4096);
+        assert_eq!(r.job_active_bytes("job:new:b"), 0);
+        drop(held);
+        assert_eq!(r.job_active_bytes(new), 0, "released when the statement ends");
+        // The job budget frees the idle job's output for room; a tab's active one never.
+        r.begin_run("tab");
+        let t = add(&r, "tab", 10_000);
+        *r.budget.lock() = 4 * (o.bytes - 1);
+        r.enforce_budget();
+        assert_eq!(r.get(&o.handle).unwrap().state, OutputState::Evicted);
+        assert_eq!(r.get(&t.handle).unwrap().state, OutputState::Live);
+    }
+
+    /// Steps starting at the same time (on several threads) each take half
+    /// of what the others left them: worked out and reserved under one
+    /// lock, together they stay within the job budget.
+    #[test]
+    fn steps_running_at_once_share_the_job_budget() {
+        let r = reg();
+        r.set_budget(1 << 30);
+        // The default steps at once (more each still keep a minimum share).
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let taken: Vec<(usize, JobReservation)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|i| {
+                    let (r, start) = (r.clone(), start.clone());
+                    s.spawn(move || {
+                        start.wait();
+                        r.reserve_job_share(&format!("res{i}"), &format!("job:j:s{i}"), |free| crate::run::result_memory_cap(free, 0))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let caps: usize = taken.iter().map(|(b, _)| b).sum();
+        assert!(caps <= r.job_budget(), "{caps} > {}", r.job_budget());
+        drop(taken);
+        assert_eq!(r.job_active_bytes(""), 0, "released");
+    }
+
+    /// Reserving a step's share frees an idle job's output when the job
+    /// budget has no room for both (it would stay in memory until the
+    /// step's output is registered, past the setting meanwhile).
+    #[test]
+    fn a_reservation_makes_room_at_once() {
+        let r = reg();
+        r.begin_run("job:old:a");
+        let o = add(&r, "job:old:a", 10_000);
+        *r.budget.lock() = 4 * (o.bytes + 100);
+        let (bytes, _held) = r.reserve_job_share("res", "job:new:a", |free| free / 2);
+        assert!(bytes > 0);
+        assert_eq!(r.get(&o.handle).unwrap().state, OutputState::Evicted, "freed for the reservation");
+    }
+
+    /// The tabs' share and the job steps' share together are the budget:
+    /// tabs' outputs are freed at three quarters of it.
+    #[test]
+    fn tabs_and_jobs_stay_within_the_setting() {
+        let r = reg();
+        let a = add(&r, "t", 10_000);
+        r.begin_run("t");
+        let b = add(&r, "t", 10_000);
+        // Both would fit the whole budget, not the tabs' three quarters of it.
+        *r.budget.lock() = a.bytes + b.bytes;
+        assert_eq!(r.tabs_budget() + r.job_budget(), r.budget());
+        r.enforce_budget();
+        assert_eq!(r.get(&a.handle).unwrap().state, OutputState::Evicted);
+        assert_eq!(r.get(&b.handle).unwrap().state, OutputState::Live);
+    }
+
+    /// A step's run frees its earlier outputs, but not the one that still
+    /// holds the step's name (its rerun failed before making a new one),
+    /// nor one read in the last minute.
+    #[test]
+    fn release_earlier_keeps_what_is_still_used() {
+        let r = reg();
+        let tab = "job:j:a";
+        r.begin_run(tab);
+        let good = add(&r, tab, 10);
+        r.set_name(&good.handle, Some("step_a")).unwrap();
+        // The rerun failed: nothing new; the old output is no longer active.
+        r.begin_run(tab);
+        let unnamed = add(&r, tab, 10);
+        r.begin_run(tab);
+        let looked_at = add(&r, tab, 10);
+        r.begin_run(tab);
+        r.update(&looked_at.handle, |x| x.last_used = x.created_at + 1);
+        assert_eq!(r.release_earlier(tab), 1);
+        assert_eq!(r.get(&good.handle).unwrap().state, OutputState::Live, "holds results.step_a");
+        assert_eq!(r.get(&unnamed.handle).unwrap().state, OutputState::Evicted);
+        assert_eq!(r.get(&looked_at.handle).unwrap().state, OutputState::Live, "read in the last minute");
     }
 
     /// Refreshing one result retires only it: the tab's other results stay.

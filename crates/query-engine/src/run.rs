@@ -364,9 +364,10 @@ impl QueryEngine {
         rs: &Arc<parking_lot::Mutex<databrain_result_store::ResultSet>>,
         id: &str,
         sample: &databrain_connector_core::arrow::array::RecordBatch,
+        jobs: bool,
     ) -> Spilled {
         let Some(dir) = self.results.spill_dir(id) else { return Spilled::NotHere };
-        if let Some(free) = self.disk_still_low() {
+        if let Some(free) = self.disk_still_low(jobs) {
             return Spilled::LowDisk(free);
         }
         // Writes up to half the budget: not on an async worker's time, and
@@ -389,9 +390,11 @@ impl QueryEngine {
     /// The free disk space when the disk where results spill is low even
     /// after freeing older results kept there that no tab shows
     /// ([`OutputRegistry::free_disk`]); None when there is room.
-    fn disk_still_low(&self) -> Option<u64> {
+    /// `jobs`: the result needing room is a job step's (results of its own
+    /// kind are freed first).
+    fn disk_still_low(&self, jobs: bool) -> Option<u64> {
         self.outputs.low_disk()?;
-        let (low, freed) = blocking_io(|| self.outputs.free_disk());
+        let (low, freed) = blocking_io(|| self.outputs.free_disk(jobs));
         if freed > 0 {
             self.outputs_changed();
         }
@@ -455,7 +458,26 @@ impl QueryEngine {
         // in memory: a script's results are all active (never freed), so
         // together they stay within it too (see `result_memory_cap`).
         let earlier: usize = (0..stmt.index).map(|i| self.results.bytes_of(&format!("{job_id}:{i}"))).sum();
-        let max_bytes = result_memory_cap(self.outputs.budget(), earlier);
+        // A job step's result counts against the job budget, less what the
+        // other steps hold or reserved, so a job never takes the memory the
+        // tabs' results have; past it the result goes to disk. Where results
+        // can't spill, or the disk refuses, it keeps the tabs' cap, so it
+        // isn't cut sooner than before.
+        let job_tab = crate::outputs::is_job_tab(&req.tab_id);
+        let tabs_cap = result_memory_cap(self.outputs.tabs_budget(), earlier);
+        let job_step = job_tab && self.results.spill_root().is_some();
+        // Steps loading at the same time share the job budget: this one's
+        // share is worked out and reserved at once, and counts for the
+        // others until its output is registered.
+        let (max_bytes, _reserved) = if job_step {
+            let (b, r) = self.outputs.reserve_job_share(&result_id, &req.tab_id, |free| result_memory_cap(free, earlier));
+            (b, Some(r))
+        } else {
+            (tabs_cap, None)
+        };
+        // Where it stays in memory (the disk refused a move), a job step's
+        // result is cut where a tab's would be.
+        let cut_bytes = if job_step { max_bytes.max(tabs_cap) } else { max_bytes };
         let mut too_big = false;
         // Free memory of the computer when it ran low (and the result stopped).
         let mut low_free: Option<u64> = None;
@@ -497,7 +519,7 @@ impl QueryEngine {
                         at_id_cap = true;
                     }
                     if on_disk {
-                        if let Some(free) = self.disk_still_low() {
+                        if let Some(free) = self.disk_still_low(job_tab) {
                             low_disk = Some(free);
                             cancel.cancel();
                             break;
@@ -513,7 +535,15 @@ impl QueryEngine {
                         // Past the memory a result may keep, or the computer low on
                         // free memory: move the result to disk and keep loading.
                         let low = if !truncated && rows > 0 { self.outputs.low_memory() } else { None };
-                        let spilled = if bytes + size > max_bytes || low.is_some() { self.spill(rs, &result_id, &batch) } else { Spilled::NotHere };
+                        // Once the disk refused (low, or a write failed), not tried
+                        // again for each batch (a job step's cut comes later than
+                        // its share: each try would rewrite the rows so far).
+                        let refused = low_disk.is_some() || spill_failed.is_some();
+                        let spilled = if !refused && (bytes + size > max_bytes || low.is_some()) {
+                            self.spill(rs, &result_id, &batch, job_tab)
+                        } else {
+                            Spilled::NotHere
+                        };
                         // Why it stays in memory, for the stop message: the
                         // disk, not the memory, when that's what refused.
                         let moved = matches!(spilled, Spilled::Yes);
@@ -529,10 +559,10 @@ impl QueryEngine {
                             low_free = Some(free);
                             cancel.cancel();
                             break;
-                        } else if bytes + size > max_bytes {
+                        } else if bytes + size > cut_bytes {
                             // Can't spill: the rows that fit, copied so the rest of
                             // the batch's buffers are freed.
-                            let keep = ((max_bytes.saturating_sub(bytes) as u128 * batch.num_rows() as u128) / size as u128) as usize;
+                            let keep = ((cut_bytes.saturating_sub(bytes) as u128 * batch.num_rows() as u128) / size as u128) as usize;
                             // At least one row, so the result shows what it holds.
                             let keep = if rows == 0 { keep.max(1) } else { keep };
                             let idx = databrain_connector_core::arrow::array::UInt32Array::from_iter_values(0..keep.min(batch.num_rows()) as u32);
