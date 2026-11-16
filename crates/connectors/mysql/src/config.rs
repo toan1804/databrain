@@ -91,8 +91,9 @@ impl Opener {
 
     /// A new connection, within `limit`.
     pub(crate) async fn open(&self, limit: Duration) -> Option<Conn> {
-        let opts = self.opts().await.ok()?;
-        tokio::time::timeout(limit, Conn::new(opts)).await.ok()?.ok()
+        // Reading the credential is within the limit too: a keychain prompt
+        // that nobody answers must not hold up Stop.
+        tokio::time::timeout(limit, async { Conn::new(self.opts().await.ok()?).await.ok() }).await.ok()?
     }
 }
 
