@@ -15,28 +15,24 @@ mod schema;
 mod session;
 mod types;
 
-use crate::config::open;
+use crate::config::Opener;
 use async_trait::async_trait;
 use databrain_auth::AuthContext;
 use databrain_auth::AuthMethodKind;
 use databrain_auth::CliKind;
 use databrain_auth::ClientAuthStyle;
-use databrain_auth::Credential;
 use databrain_auth::CredentialSource;
 use databrain_auth::OAuthConfig;
 use databrain_connector_core::Capabilities;
 use databrain_connector_core::ConnectionConfig;
 use databrain_connector_core::Connector;
-use databrain_connector_core::ConnectorError;
 use databrain_connector_core::ConnectorInfo;
 use databrain_connector_core::ConnectorKind;
 use databrain_connector_core::FieldSpec;
 use databrain_connector_core::Result;
 use databrain_connector_core::Session;
 use databrain_connector_core::SslMode;
-use secrecy::ExposeSecret;
 use std::sync::Arc;
-use tiberius::AuthMethod as TdsAuth;
 use tiberius::Config;
 use tiberius::EncryptionLevel;
 use tokio::sync::Mutex;
@@ -149,32 +145,23 @@ impl Connector for MssqlConnector {
         if trust {
             c.trust_cert();
         }
-        c.authentication(match creds.get().await? {
-            #[cfg(windows)]
-            Credential::Password { user, password } if user.contains('\\') => TdsAuth::windows(&user, password.expose_secret()),
-            #[cfg(not(windows))]
-            Credential::Password { user, .. } if user.contains('\\') => {
-                return Err(ConnectorError::config("Windows (DOMAIN\\user) logins are only supported on Windows; use a SQL login or Entra ID"));
-            }
-            Credential::Password { user, password } => TdsAuth::sql_server(user, password.expose_secret()),
-            Credential::Bearer { token, .. } => TdsAuth::aad_token(token.expose_secret()),
-            _ => return Err(ConnectorError::config("unsupported authentication method for SQL Server")),
-        });
         let use_browser = cfg.opt("instance").is_some() && cfg.port.is_none();
         let all_dbs = cfg.database.as_deref().is_none_or(|d| d.trim().is_empty());
-        let conn = match open(&c, use_browser).await {
+        // The login is asked for at each connection (reconnects too): a kept
+        // Entra token would expire after about an hour.
+        let mut opener = Opener { config: c, use_browser, creds };
+        let conn = match opener.open().await {
             Ok(conn) => conn,
             // A server that can't encrypt: Prefer means a plain connection
             // (as encrypt=false in other drivers); reconnects keep it.
             Err(e) if error::prefer_falls_back(cfg.ssl_mode, &e) => {
-                c.encryption(EncryptionLevel::NotSupported);
-                open(&c, use_browser).await?
+                opener.config.encryption(EncryptionLevel::NotSupported);
+                opener.open().await?
             }
             Err(e) => return Err(e),
         };
         Ok(Box::new(MssqlSession {
-            config: c,
-            use_browser,
+            opener: Arc::new(opener),
             conn: Arc::new(Mutex::new(Some(conn))),
             state: Default::default(),
             user_rowcount: Default::default(),
