@@ -606,7 +606,7 @@ impl QueryEngine {
         // Preparing only reads (the target, its columns); the before SQL runs in the plan.
         let p = self.prepare_load(connection_id, tab, spec, Some(rows), false).await.map_err(|e| before_writing(obs, e))?;
         obs.event(LoadEvent::Info(format!(
-            "Writing {} rows into {} on {} ({}, INSERTs of up to {} rows / {} KB): {}",
+            "Writing {} rows into {} on {} ({}, in batches of up to {} rows / {} KB): {}",
             if rest.is_some() { "every".to_string() } else { rows.count().to_string() },
             p.table,
             p.connection,
@@ -1453,11 +1453,9 @@ async fn copy_rows(
     c: &sqlgen::PgCopy,
     mut writer: Box<dyn databrain_connector_core::BulkWriter>,
     mut feed: Feed<'_, '_>,
-    cancel: &CancellationToken,
     progress: &(dyn Fn(u64) + Sync),
 ) -> Written {
     let mut w = Written { rows: 0, statements: 1, sql: c.sql.clone(), result: Ok(()) };
-    let cancelled = || EngineError::new("cancelled", "Cancelled");
     'rows: loop {
         let batch = match feed.next().await {
             Ok(Some(b)) => b,
@@ -1477,10 +1475,9 @@ async fn copy_rows(
                     break 'rows;
                 }
             };
-            let sent = tokio::select! {
-                r = writer.write(data) => r.map_err(EngineError::from),
-                _ = cancel.cancelled() => Err(cancelled()),
-            };
+            // The writer watches `cancel` itself and asks the server to stop
+            // the COPY: not raced here, which would drop it before it asked.
+            let sent = writer.write(data).await.map_err(EngineError::from);
             if let Err(e) = sent {
                 w.result = Err(e);
                 break 'rows;
@@ -1496,10 +1493,7 @@ async fn copy_rows(
         w.rows = 0;
         return w;
     }
-    let done = tokio::select! {
-        r = writer.finish() => r.map_err(EngineError::from),
-        _ = cancel.cancelled() => Err(cancelled()),
-    };
+    let done = writer.finish().await.map_err(EngineError::from);
     match done {
         Ok(n) => w.rows = n,
         // A bad row is reported here, at the end: none of the COPY is kept.
@@ -1603,7 +1597,7 @@ async fn run_plan(
                 let feed = Feed { held: rows.batches.iter(), rest: rest.as_deref_mut() };
                 let progress = |done: u64| obs.event(LoadEvent::Progress { phase: phase.into(), done, total });
                 let w = match writer {
-                    Some((c, writer)) => copy_rows(p, c, writer, feed, cancel, &progress).await,
+                    Some((c, writer)) => copy_rows(p, c, writer, feed, &progress).await,
                     None => insert_rows(p, table, &schema, feed, cancel, &progress).await,
                 };
                 let Written { rows: n, statements, sql: first, result: r } = w;
