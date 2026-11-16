@@ -368,6 +368,9 @@ async fn capped_results_are_not_exported_or_loaded() {
     let mut load = node("l", "big_copy", JobNodeKind::Load, None, "");
     load.target_connection_id = Some(dst.clone());
     load.target_table = Some("big".into());
+    // A query on a DuckDB file reads `results.*` too: refused the same way.
+    let file = duckdb(&st, "file", &dir.path().join("file.duckdb"));
+    let on_file = node("q", "big_count", JobNodeKind::Query, Some(&file), "select count(*) as n from results.big");
     let job = st
         .workspace
         .save_job(Job {
@@ -383,8 +386,13 @@ async fn capped_results_are_not_exported_or_loaded() {
                 ),
                 export,
                 load,
+                on_file,
             ],
-            edges: vec![JobEdge { from: "a".into(), to: "e".into() }, JobEdge { from: "a".into(), to: "l".into() }],
+            edges: vec![
+                JobEdge { from: "a".into(), to: "e".into() },
+                JobEdge { from: "a".into(), to: "l".into() },
+                JobEdge { from: "a".into(), to: "q".into() },
+            ],
             schedule: Default::default(),
             last_scheduled_at: None,
             params: Default::default(),
@@ -398,7 +406,7 @@ async fn capped_results_are_not_exported_or_loaded() {
     let rec = |n: &str| run.nodes.iter().find(|r| r.name == n).unwrap().summary.clone();
     assert!(rec("big").error.is_none(), "a capped query step runs (it says so)");
     // The steps that read it fail before they write anything.
-    for n in ["big_file", "big_copy"] {
+    for n in ["big_file", "big_copy", "big_count"] {
         let e = rec(n).error.unwrap_or_default();
         assert!(e.contains("holds only its first"), "{n}: {e}");
     }

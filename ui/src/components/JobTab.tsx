@@ -99,7 +99,10 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
         const theirs = await api.getJob(jobId);
         const base = basis.current;
         const mine = latest.current;
-        if (!base || !mine) return showSaved();
+        if (!base || !mine) {
+          asking.current = false;
+          return showSaved();
+        }
         const merged = rebaseJob(base, mine, theirs);
         const clashes = rebaseClashes(base, mine, theirs);
         basis.current = theirs;
@@ -154,42 +157,54 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
 
   const persist = useCallback(async () => {
     clearTimeout(timer.current);
-    // One save at a time: each is based on the version the one before saved.
-    await saving.current;
-    const j = latest.current;
-    if (!j) return true;
-    dirty.current = false;
-    setSave({ state: "saving" });
-    const gen = shown.current;
-    const call = api.saveJob(j);
-    inFlight.current = true;
-    saving.current = call.catch(() => {}).finally(() => (inFlight.current = false));
+    // One save at a time, each based on the version the one before saved.
+    // The slot is taken before waiting: two calls waiting on the same save
+    // would otherwise both send the same version, and the second would be
+    // refused as "changed elsewhere".
+    const prev = saving.current;
+    let done!: () => void;
+    saving.current = new Promise<void>((r) => (done = r));
     try {
-      // The job as saved: the app's version (which steps are the
-      // assistant's, when it was saved), the base of the next save.
-      const saved = await call;
-      basis.current = saved;
-      const next = latest.current === j ? saved : rebaseJob(j, latest.current ?? j, saved);
-      latest.current = next;
-      setJob(next);
-      setSave({ state: dirty.current ? "pending" : "saved" });
-      void useJobs.getState().refresh().catch(() => {});
-      return true;
-    } catch (e) {
-      // The edits it carried were given up meanwhile (Cancel showed the saved version).
-      if (gen !== shown.current) return false;
-      // Still not saved: a change from elsewhere must not drop it, and closing the tab tries again.
-      if (latest.current === j) dirty.current = true;
-      const err = toError(e);
-      // Saved elsewhere since this version was loaded: the user chooses.
-      if (err.kind === "conflict") {
-        dirty.current = true;
+      await prev;
+      const j = latest.current;
+      if (!j) return true;
+      // Nothing changed since the save before this one: already saved.
+      if (!dirty.current && j === basis.current) return true;
+      dirty.current = false;
+      setSave({ state: "saving" });
+      const gen = shown.current;
+      inFlight.current = true;
+      const call = api.saveJob(j);
+      try {
+        // The job as saved: the app's version (which steps are the
+        // assistant's, when it was saved), the base of the next save.
+        const saved = await call;
+        basis.current = saved;
+        const next = latest.current === j ? saved : rebaseJob(j, latest.current ?? j, saved);
+        latest.current = next;
+        setJob(next);
+        setSave({ state: dirty.current ? "pending" : "saved" });
+        void useJobs.getState().refresh().catch(() => {});
+        return true;
+      } catch (e) {
+        // The edits it carried were given up meanwhile (Cancel showed the saved version).
+        if (gen !== shown.current) return false;
+        // Still not saved: a change from elsewhere must not drop it, and closing the tab tries again.
+        if (latest.current === j) dirty.current = true;
+        const err = toError(e);
+        // Saved elsewhere since this version was loaded: the user chooses.
+        if (err.kind === "conflict") {
+          dirty.current = true;
+          setSave({ state: "error", message: err.message });
+          conflict.current();
+          return false;
+        }
         setSave({ state: "error", message: err.message });
-        conflict.current();
         return false;
       }
-      setSave({ state: "error", message: err.message });
-      return false;
+    } finally {
+      inFlight.current = false;
+      done();
     }
   }, []);
   const persistRef = useRef(persist);

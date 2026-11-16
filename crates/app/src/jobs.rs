@@ -966,10 +966,9 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
             ),
         )
     };
-    // (A query on another database naming `results.x` reads its own table.)
-    if (node.kind != JobNodeKind::Query || connection_id == ctx.engine.results_connection()?.id)
-        && let Some(o) = ctx.engine.outputs().referenced(&sql).into_iter().find(|o| o.truncated)
-    {
+    // Every DuckDB connection reads `results.*` (the same rule as above); a
+    // query on another database naming `results.x` reads its own table.
+    if on_results && let Some(o) = ctx.engine.outputs().referenced(&sql).into_iter().find(|o| o.truncated) {
         return Err(capped(&o, "run"));
     }
     let outcomes = run_sql(ctx, connection_id, tab.clone(), sql, Some(node.name.clone()), origin, cancel, t).await?;

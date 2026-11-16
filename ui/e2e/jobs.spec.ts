@@ -228,6 +228,46 @@ test.describe("the assistant changes a job with unsaved edits here", () => {
     });
   }
 
+  // Edits keep coming while a save is slow: the saves waiting behind it go
+  // out one after another, each on the version the one before saved, so
+  // none is refused as "changed elsewhere" when nothing else changed.
+  test("saves waiting behind a slow one aren't refused as changed elsewhere", async ({ page }) => {
+    await openApp(page, backend({ __jobs: [job] }));
+    await page.getByRole("button", { name: "Jobs", exact: true }).click();
+    await page.getByText("Orders", { exact: true }).click();
+    const card = page.getByLabel("Job steps").locator("[data-node]").first();
+    await expect(card).toContainText("orders_today");
+    // Hold the first save.
+    await page.evaluate(() => {
+      const w = window as unknown as {
+        __DB_MOCK__: { handlers: Record<string, unknown>; builtins: Record<string, (a: unknown) => unknown> };
+        __release?: () => void;
+      };
+      w.__DB_MOCK__.handlers.save_job = (a: unknown) =>
+        new Promise((res) => {
+          w.__release = () => {
+            delete w.__DB_MOCK__.handlers.save_job;
+            res(w.__DB_MOCK__.builtins.save_job(a));
+          };
+        });
+    });
+    await card.click();
+    const name = page.getByLabel("Step details").getByRole("textbox").first();
+    await name.fill("first");
+    await expect.poll(async () => (await calls(page, "save_job")).length).toBe(1);
+    // Two more edits, each saved after the pause (two saves now wait).
+    await name.fill("second");
+    await page.waitForTimeout(900);
+    await name.fill("third");
+    await page.waitForTimeout(900);
+    await page.evaluate(() => (window as unknown as { __release: () => void }).__release());
+    await expect.poll(async () => (await lastSaved(page))?.nodes[0].name).toBe("third");
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    const stored = await page.evaluate(() => (window as unknown as { __DB_MOCK__: { db: { jobs: { nodes: { name: string }[] }[] } } }).__DB_MOCK__.db.jobs[0].nodes[0].name);
+    expect(stored).toBe("third");
+    await expect(page.getByText(/changed elsewhere/)).toHaveCount(0);
+  });
+
   test("a save refused as made on an older version asks too", async ({ page }) => {
     await openApp(page, backend({ __jobs: [job] }));
     await page.getByRole("button", { name: "Jobs", exact: true }).click();
