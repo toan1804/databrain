@@ -17,7 +17,7 @@
 //!   free a tab's outputs, nor a tab's theirs; past it a step's result
 //!   moves to disk where results spill instead of being cut for memory
 //!   (where the disk refuses, it is cut at the tabs' cap, as before); a
-//!   running step reserves its share ([`OutputRegistry::reserve_job_memory`])
+//!   running step reserves its share ([`OutputRegistry::reserve_job_share`])
 //!   so steps running at once stay within it together; the latest outputs
 //!   of a job that isn't running (and that nobody used in the last minute)
 //!   are freed least recently used first when the job budget needs room;
@@ -266,6 +266,17 @@ impl Inner {
         let running = job_of_tab(&o.tab_id).is_some_and(|j| self.running_jobs.contains_key(j));
         !running && !used_recently(o, now)
     }
+
+    /// See [`OutputRegistry::job_active_bytes`].
+    fn job_active(&self, except: &str, now: i64) -> usize {
+        let kept: usize = self
+            .by_handle
+            .values()
+            .filter(|o| o.state == OutputState::Live && o.tab_id != except && is_job_tab(&o.tab_id) && !self.job_output_idle(o, now))
+            .map(|o| o.bytes)
+            .sum();
+        kept + self.reserved.values().filter(|(tab, _)| tab != except).map(|(_, b)| b).sum::<usize>()
+    }
 }
 
 pub struct OutputRegistry {
@@ -353,15 +364,26 @@ impl OutputRegistry {
     /// but those of step `except` (its rerun replaces them). Outputs of
     /// jobs that aren't running don't count: they make room when needed.
     pub fn job_active_bytes(&self, except: &str) -> usize {
-        let now = now_ms();
-        let g = self.inner.lock();
-        let kept: usize = g
-            .by_handle
-            .values()
-            .filter(|o| o.state == OutputState::Live && o.tab_id != except && is_job_tab(&o.tab_id) && !g.job_output_idle(o, now))
-            .map(|o| o.bytes)
-            .sum();
-        kept + g.reserved.values().filter(|(tab, _)| tab != except).map(|(_, b)| b).sum::<usize>()
+        self.inner.lock().job_active(except, now_ms())
+    }
+
+    /// Reserve a job step's share of the job budget for result `result_id`
+    /// (of run key `tab`): `cap` turns the part of the job budget not taken
+    /// ([`Self::job_active_bytes`]) into the bytes the result may keep.
+    /// Worked out and reserved under one lock, so steps starting at once
+    /// don't each take the same free memory; then idle job outputs are freed
+    /// until the job outputs and reservations fit the job budget. Returns
+    /// the bytes and the reservation ([`Self::reserve_job_memory`]).
+    pub fn reserve_job_share(self: &Arc<Self>, result_id: &str, tab: &str, cap: impl FnOnce(usize) -> usize) -> (usize, JobReservation) {
+        let budget = self.job_budget();
+        let bytes = {
+            let mut g = self.inner.lock();
+            let bytes = cap(budget.saturating_sub(g.job_active(tab, now_ms())));
+            g.reserved.insert(result_id.to_string(), (tab.to_string(), bytes));
+            bytes
+        };
+        self.enforce_budget();
+        (bytes, JobReservation { outputs: self.clone(), result_id: result_id.to_string() })
     }
 
     /// Job `job_id` started (`true`) or ended a run in this process: while
@@ -793,7 +815,10 @@ impl OutputRegistry {
             let mut g = self.inner.lock();
             for (jobs, budget) in [(false, budget - job_share(budget)), (true, job_share(budget))] {
                 let mine = |o: &OutputInfo| o.state == OutputState::Live && is_job_tab(&o.tab_id) == jobs;
-                let mut total: usize = g.by_handle.values().filter(|o| mine(o)).map(|o| o.bytes).sum();
+                // Job steps loading now count with their reservations: idle
+                // job outputs make room for them before they take it.
+                let reserved: usize = if jobs { g.reserved.values().map(|(_, b)| b).sum() } else { 0 };
+                let mut total: usize = g.by_handle.values().filter(|o| mine(o)).map(|o| o.bytes).sum::<usize>() + reserved;
                 if total <= budget {
                     continue;
                 }
@@ -1290,21 +1315,45 @@ pub(crate) mod tests {
         assert_eq!(r.get(&t.handle).unwrap().state, OutputState::Live);
     }
 
-    /// Steps starting at the same time each take half of what the others
-    /// left them: together they stay within the job budget.
+    /// Steps starting at the same time (on several threads) each take half
+    /// of what the others left them: worked out and reserved under one
+    /// lock, together they stay within the job budget.
     #[test]
     fn steps_running_at_once_share_the_job_budget() {
         let r = reg();
         r.set_budget(1 << 30);
-        let mut held = Vec::new();
-        let mut caps = 0;
-        for i in 0..4 {
-            let tab = format!("job:j:s{i}");
-            let cap = crate::run::result_memory_cap(r.job_budget().saturating_sub(r.job_active_bytes(&tab)), 0);
-            caps += cap;
-            held.push(r.reserve_job_memory(&format!("res{i}"), &tab, cap));
-        }
+        // The default steps at once (more each still keep a minimum share).
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let taken: Vec<(usize, JobReservation)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|i| {
+                    let (r, start) = (r.clone(), start.clone());
+                    s.spawn(move || {
+                        start.wait();
+                        r.reserve_job_share(&format!("res{i}"), &format!("job:j:s{i}"), |free| crate::run::result_memory_cap(free, 0))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let caps: usize = taken.iter().map(|(b, _)| b).sum();
         assert!(caps <= r.job_budget(), "{caps} > {}", r.job_budget());
+        drop(taken);
+        assert_eq!(r.job_active_bytes(""), 0, "released");
+    }
+
+    /// Reserving a step's share frees an idle job's output when the job
+    /// budget has no room for both (it would stay in memory until the
+    /// step's output is registered, past the setting meanwhile).
+    #[test]
+    fn a_reservation_makes_room_at_once() {
+        let r = reg();
+        r.begin_run("job:old:a");
+        let o = add(&r, "job:old:a", 10_000);
+        *r.budget.lock() = 4 * (o.bytes + 100);
+        let (bytes, _held) = r.reserve_job_share("res", "job:new:a", |free| free / 2);
+        assert!(bytes > 0);
+        assert_eq!(r.get(&o.handle).unwrap().state, OutputState::Evicted, "freed for the reservation");
     }
 
     /// The tabs' share and the job steps' share together are the budget:

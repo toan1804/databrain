@@ -5,7 +5,7 @@
  */
 export type ResultsMemory = { 
 /**
- * The budget in use, in bytes (one result keeps at most half).
+ * The budget in use, in bytes (tabs' results share three quarters of it, job steps' a quarter; one result keeps at most half of its share).
  */
 budget: number, 
 /**

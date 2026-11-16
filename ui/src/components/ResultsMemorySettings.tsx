@@ -60,8 +60,8 @@ export function ResultsMemorySettings() {
         </label>
       </div>
       <p className="text-[11.5px] text-muted">
-        Results are kept in memory so the grid, sorting and filters are fast; {formatBytes(m.used)} of {formatBytes(m.budget)} is in use now. One
-        result keeps at most half, and stops early (keeping the rows it has) when the computer runs low on free memory. When results need more,
+        Results are kept in memory so the grid, sorting and filters are fast; {formatBytes(m.used)} of {formatBytes(m.budget)} is in use now. Tabs
+        share three quarters of it and job steps a quarter; one result keeps at most half of its share, and stops early (keeping the rows it has) when the computer runs low on free memory. When results need more,
         the least recently used older ones free their rows (a tab's latest result and pinned ones stay). Export or "Load into…" get every row
         without keeping them in memory.
       </p>

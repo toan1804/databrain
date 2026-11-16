@@ -2240,7 +2240,16 @@ async fn job_outputs_have_their_own_memory() {
         assert_eq!(step(&run, "big_rows").rows, Some(200_000));
         let first = st.engine.outputs().resolve("big_rows").expect("results.big_rows");
         assert!(!first.truncated && first.spilled && first.rows == 200_000, "{first:?}");
-        assert!(st.engine.outputs().job_active_bytes("") <= st.engine.outputs().job_budget(), "{first:?}");
+        // What job steps keep in memory (not what is on disk) fits their share.
+        let in_memory: usize = st
+            .engine
+            .outputs()
+            .list()
+            .iter()
+            .filter(|o| o.tab_id.starts_with("job:") && o.state == databrain_query_engine::OutputState::Live && !o.spilled)
+            .map(|o| o.bytes)
+            .sum();
+        assert!(in_memory <= st.engine.outputs().job_budget(), "{in_memory} in memory: {first:?}");
         // The tab's results are still there, the one it no longer shows too.
         assert_eq!(st.engine.outputs().get(&earlier.handle).unwrap().state, databrain_query_engine::OutputState::Live);
 

@@ -357,7 +357,7 @@ const RESULTS_MEMORY_MIN_MB: u64 = 256;
 #[derive(Debug, Serialize, ts_rs::TS)]
 #[ts(export)]
 pub struct ResultsMemory {
-    /// The budget in use, in bytes (one result keeps at most half).
+    /// The budget in use, in bytes (tabs' results share three quarters of it, job steps' a quarter; one result keeps at most half of its share).
     #[ts(type = "number")]
     pub budget: u64,
     /// What "Automatic" is on this computer, in bytes.

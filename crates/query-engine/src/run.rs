@@ -466,11 +466,15 @@ impl QueryEngine {
         let job_tab = crate::outputs::is_job_tab(&req.tab_id);
         let tabs_cap = result_memory_cap(self.outputs.tabs_budget(), earlier);
         let job_step = job_tab && self.results.spill_root().is_some();
-        let max_bytes =
-            if job_step { result_memory_cap(self.outputs.job_budget().saturating_sub(self.outputs.job_active_bytes(&req.tab_id)), earlier) } else { tabs_cap };
         // Steps loading at the same time share the job budget: this one's
-        // share counts for the others until its output is registered.
-        let _reserved = job_step.then(|| self.outputs.reserve_job_memory(&result_id, &req.tab_id, max_bytes));
+        // share is worked out and reserved at once, and counts for the
+        // others until its output is registered.
+        let (max_bytes, _reserved) = if job_step {
+            let (b, r) = self.outputs.reserve_job_share(&result_id, &req.tab_id, |free| result_memory_cap(free, earlier));
+            (b, Some(r))
+        } else {
+            (tabs_cap, None)
+        };
         // Where it stays in memory (the disk refused a move), a job step's
         // result is cut where a tab's would be.
         let cut_bytes = if job_step { max_bytes.max(tabs_cap) } else { max_bytes };
@@ -531,7 +535,15 @@ impl QueryEngine {
                         // Past the memory a result may keep, or the computer low on
                         // free memory: move the result to disk and keep loading.
                         let low = if !truncated && rows > 0 { self.outputs.low_memory() } else { None };
-                        let spilled = if bytes + size > max_bytes || low.is_some() { self.spill(rs, &result_id, &batch, job_tab) } else { Spilled::NotHere };
+                        // Once the disk refused (low, or a write failed), not tried
+                        // again for each batch (a job step's cut comes later than
+                        // its share: each try would rewrite the rows so far).
+                        let refused = low_disk.is_some() || spill_failed.is_some();
+                        let spilled = if !refused && (bytes + size > max_bytes || low.is_some()) {
+                            self.spill(rs, &result_id, &batch, job_tab)
+                        } else {
+                            Spilled::NotHere
+                        };
                         // Why it stays in memory, for the stop message: the
                         // disk, not the memory, when that's what refused.
                         let moved = matches!(spilled, Spilled::Yes);
