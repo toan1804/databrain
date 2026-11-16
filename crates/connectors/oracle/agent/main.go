@@ -442,16 +442,21 @@ func (s *session) endReadOnly() {
 	}
 }
 
-// outputSQL reads DBMS_OUTPUT lines, up to 8000 bytes per call (go-ora's
-// out-binds hold about 8 KB, and a call that fails loses the lines it
-// read): :1 the lines (each ended by a line break), :2 1 when none are
-// left, :3 a line that didn't fit in :1 (a longer one cut, ending in …).
-// Kept in sync with OUTPUT_SQL in src/exec.rs.
-const outputSQL = "declare l varchar2(32767); s integer := 0; b varchar2(8000); c varchar2(8000); " +
-	"begin loop dbms_output.get_line(l, s); exit when s <> 0; " +
-	"if nvl(lengthb(b), 0) + nvl(lengthb(l), 0) + 1 > 8000 then " +
-	"c := case when lengthb(l) > 8000 then substrb(l, 1, 7990) || '…' else l end; exit; end if; " +
-	"b := b || l || chr(10); end loop; :1 := b; :2 := s; :3 := c; end;"
+// outputSQL reads the DBMS_OUTPUT lines into a CLOB in one call (go-ora's
+// string out-binds hold about 8 KB, which cut longer lines; a line is up to
+// 32767 bytes): :1 and :2 the caps (lines, characters), :3 the lines (each
+// ended by a line break), :4 1 when none are left, 2 when the caps stopped
+// it with lines still waiting. go-ora binds in the order the placeholders
+// appear, so they appear in that order.
+const outputSQL = "declare mx_lines integer := :1; mx_chars integer := :2; " +
+	"l varchar2(32767); s integer := 0; n integer := 0; r clob; " +
+	"begin dbms_lob.createtemporary(r, true); " +
+	"loop if n >= mx_lines or dbms_lob.getlength(r) >= mx_chars then s := 2; exit; end if; " +
+	"dbms_output.get_line(l, s); exit when s <> 0; " +
+	// The line and its break apart: a 32767-byte line plus one is past a varchar2.
+	"if l is not null then dbms_lob.writeappend(r, length(l), l); end if; " +
+	"dbms_lob.writeappend(r, 1, chr(10)); n := n + 1; end loop; " +
+	":3 := r; :4 := s; end;"
 
 // Caps on the DBMS_OUTPUT read after one statement (as in src/exec.rs).
 const (
@@ -464,31 +469,21 @@ const (
 // the output is a convenience, never the statement's failure.
 func readOutput(ctx context.Context, t q) ([]string, bool) {
 	lines, bytes := []string{}, 0
-	for {
-		var chunk, carry sql.NullString
-		var done int64
-		if _, err := t.ExecContext(ctx, outputSQL,
-			go_ora.Out{Dest: &chunk, Size: 8000}, go_ora.Out{Dest: &done}, go_ora.Out{Dest: &carry, Size: 8000}); err != nil {
-			return lines, false
-		}
-		var got []string
-		if chunk.Valid {
-			got = strings.Split(strings.TrimSuffix(chunk.String, "\n"), "\n")
-		}
-		if carry.Valid {
-			got = append(got, carry.String)
-		}
-		for _, l := range got {
+	var out go_ora.Clob
+	var status int64
+	if _, err := t.ExecContext(ctx, outputSQL, outputMaxLines, outputMaxBytes, go_ora.Out{Dest: &out}, go_ora.Out{Dest: &status}); err != nil {
+		return lines, false
+	}
+	if out.Valid && out.String != "" {
+		for _, l := range strings.Split(strings.TrimSuffix(out.String, "\n"), "\n") {
 			if len(lines) >= outputMaxLines || bytes+len(l) > outputMaxBytes {
 				return lines, true
 			}
 			bytes += len(l)
 			lines = append(lines, l)
 		}
-		if done != 0 {
-			return lines, false
-		}
 	}
+	return lines, status == 2
 }
 
 // dsn builds the go-ora URL. `connect_string` may be an Easy Connect string
@@ -1113,20 +1108,65 @@ func main() {
 		fmt.Println(Version)
 		return
 	}
-	in := bufio.NewReaderSize(os.Stdin, 1<<16)
-	w := &writer{w: bufio.NewWriterSize(os.Stdout, 1<<20)}
+	s := &session{}
+	defer s.close()
+	serve(os.Stdin, os.Stdout, func(ctx context.Context, w *writer, r *request) error {
+		err := s.handle(ctx, w, r)
+		// A read-only connection's transaction ends with its statement: a
+		// COMMIT inside a block ends READ ONLY, and what ran after it in
+		// the block, not committed, is rolled back now, not left holding
+		// locks until the next statement.
+		s.endReadOnly()
+		return err
+	}, func() {
+		// The statement didn't stop: leave anyway (the connection closing
+		// with the process ends the session on the server).
+		os.Exit(1)
+	})
+}
+
+// gracePeriod is how long a statement may take to stop after DataBrain went
+// away before the helper exits anyway (a variable for tests).
+var gracePeriod = 10 * time.Second
+
+// serve reads requests from `stdin` and runs them one at a time with
+// `handle`, answering on `stdout`. When stdin closes (DataBrain quit or
+// died), the running statement is cancelled, queued requests are dropped,
+// and serve returns; if the statement doesn't stop within gracePeriod,
+// `stuck` is called (the process exits).
+func serve(stdin io.Reader, stdout io.Writer, handle func(context.Context, *writer, *request) error, stuck func()) {
+	in := bufio.NewReaderSize(stdin, 1<<16)
+	w := &writer{w: bufio.NewWriterSize(stdout, 1<<20)}
 	work := make(chan *request, 16)
 
 	var mu sync.Mutex
 	var running uint64
 	var cancel context.CancelFunc
+	var gone bool
+	finished := make(chan struct{})
+	defer close(finished)
 
 	go func() {
 		defer close(work)
 		for {
 			kind, b, err := readFrame(in)
 			if err != nil {
-				return // stdin closed: DataBrain went away
+				// stdin closed: DataBrain went away. What runs is stopped
+				// (it would keep running on the server for nobody).
+				mu.Lock()
+				gone = true
+				if cancel != nil {
+					cancel()
+					go func() {
+						select {
+						case <-finished:
+						case <-time.After(gracePeriod):
+							stuck()
+						}
+					}()
+				}
+				mu.Unlock()
+				return
 			}
 			if kind != 'J' {
 				continue
@@ -1148,22 +1188,21 @@ func main() {
 		}
 	}()
 
-	s := &session{}
-	defer s.close()
 	for r := range work {
 		if r.Op == "close" {
 			return
 		}
 		ctx, c := context.WithCancel(context.Background())
 		mu.Lock()
+		if gone {
+			// Queued before DataBrain went away: nobody waits for it.
+			mu.Unlock()
+			c()
+			continue
+		}
 		running, cancel = r.ID, c
 		mu.Unlock()
-		err := s.handle(ctx, w, r)
-		// A read-only connection's transaction ends with its statement: a
-		// COMMIT inside a block ends READ ONLY, and what ran after it in
-		// the block, not committed, is rolled back now, not left holding
-		// locks until the next statement.
-		s.endReadOnly()
+		err := handle(ctx, w, r)
 		mu.Lock()
 		running, cancel = 0, nil
 		mu.Unlock()

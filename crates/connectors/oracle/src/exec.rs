@@ -121,16 +121,16 @@ fn head_words(sql: &str, n: usize) -> Vec<String> {
 pub(crate) const OUTPUT_MAX_LINES: usize = 10_000;
 pub(crate) const OUTPUT_MAX_BYTES: usize = 1 << 20;
 
-/// Read DBMS_OUTPUT lines, up to 8000 bytes per call (the thin driver's
-/// out-binds hold about 8 KB, and a call that fails loses the lines it
-/// read): `:1` the lines (each ended by a line break), `:2` 1 when none are
-/// left, `:3` a line that didn't fit in `:1` (taken from the buffer, so
-/// returned on its own; one longer than 8000 bytes cut, ending in `…`).
-/// Kept in sync with `outputSQL` in agent/main.go.
-pub(crate) const OUTPUT_SQL: &str = "declare l varchar2(32767); s integer := 0; b varchar2(8000); c varchar2(8000); \
+/// Read DBMS_OUTPUT lines on the Instant Client driver, up to 32767 bytes
+/// per call (a call that fails loses the lines it read): `:1` the lines
+/// (each ended by a line break), `:2` 1 when none are left, `:3` a line that
+/// didn't fit in `:1` (taken from the buffer, so returned on its own). A
+/// line is at most 32767 bytes, so none is cut. The thin driver's helper
+/// reads them into a CLOB instead (`outputSQL` in agent/main.go: its string
+/// out-binds hold about 8 KB).
+pub(crate) const OUTPUT_SQL: &str = "declare l varchar2(32767); s integer := 0; b varchar2(32767); c varchar2(32767); \
      begin loop dbms_output.get_line(l, s); exit when s <> 0; \
-     if nvl(lengthb(b), 0) + nvl(lengthb(l), 0) + 1 > 8000 then \
-     c := case when lengthb(l) > 8000 then substrb(l, 1, 7990) || '…' else l end; exit; end if; \
+     if nvl(lengthb(b), 0) + nvl(lengthb(l), 0) + 1 > 32767 then c := l; exit; end if; \
      b := b || l || chr(10); end loop; :1 := b; :2 := s; :3 := c; end;";
 
 /// The notice for DBMS_OUTPUT lines (None when there are none).
@@ -166,7 +166,7 @@ fn read_output(conn: &Connection) -> Option<String> {
     let mut more = false;
     loop {
         let Ok(mut st) = conn.statement(OUTPUT_SQL).build() else { break };
-        if st.execute(&[&OracleType::Varchar2(8000), &OracleType::Int64, &OracleType::Varchar2(8000)]).is_err() {
+        if st.execute(&[&OracleType::Varchar2(32767), &OracleType::Int64, &OracleType::Varchar2(32767)]).is_err() {
             break;
         }
         let chunk: Option<String> = st.bind_value(1).ok().flatten();
