@@ -12,6 +12,10 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 - Jobs run at most 4 steps at once, and 2 on one connection, unless the job's limits say otherwise. A step that doesn't stop within 30 s of being stopped is left behind, so the run ends.
 - A load step's dry run gets the job's parameters (SQL using them failed before).
+- The assistant's job tools refuse arguments they can't set by name (an unknown field or step name), instead of dropping them silently.
+- An export step writes to a temporary `.databrain-<job>-<step>.….part` file next to the target, then moves it into place: a failed or stopped export leaves the old file whole. Leftover temporary files of the step's earlier runs are removed.
+- A load step whose try failed is tried again only when the load said it kept nothing; a step whose earlier try was left behind and still runs fails saying so, instead of "A query is already running in this tab". Steps at once are capped at 64 whatever the saved job says, and a step's time limit accepts `0s` or `0m` for none.
+
 ### Security
 
 - **Jobs and the AI assistant:** SQL or rows the assistant chose no longer end up running as yours, outside its rules (found by an internal review; in 0.4.2 and earlier):

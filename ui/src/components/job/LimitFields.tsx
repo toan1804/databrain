@@ -117,7 +117,7 @@ const countText = (v: number | null | undefined) => (v == null ? "" : String(v))
 const DURATION_PROBLEM = "Type a duration such as 90s, 30m, 2h or 1h30m (a plain number is minutes)";
 
 /** A step's time limit: a duration, or 0 to turn the job's off. */
-const durationOrOff = (t: string) => (t.trim() === "0" ? 0 : parseDuration(t));
+export const durationOrOff = (t: string) => (/^(?:0+(?:h|m|min|s)?)+$/.test(t.trim().toLowerCase().replace(/\s+/g, "")) ? 0 : parseDuration(t));
 const showOrOff = (v: number | null | undefined) => (v === 0 ? "0" : durationText(v));
 
 /** Drop empty fields, so a job without limits saves none (left out, not null: the runner reads a missing field as none). */

@@ -10,6 +10,9 @@ pub const DEFAULT_MAX_PARALLEL: u32 = 4;
 /// Steps of a run on one connection at once when the job doesn't say
 /// (each opens its own session on the server).
 pub const DEFAULT_MAX_PER_CONNECTION: u32 = 2;
+/// Most steps at once a job may allow, in all and on one connection (what
+/// the editor accepts; a larger saved value is read as this).
+pub const MAX_STEPS_AT_ONCE: u32 = 64;
 /// Most retries a step may have.
 pub const MAX_RETRIES: u32 = 10;
 /// Wait before the first retry; each next one waits 4 times longer, up to
@@ -56,10 +59,10 @@ impl RunLimits {
         secs(self.run_timeout_secs)
     }
     pub fn max_parallel(&self) -> usize {
-        self.max_parallel.filter(|n| *n > 0).unwrap_or(DEFAULT_MAX_PARALLEL) as usize
+        steps_at_once(self.max_parallel, DEFAULT_MAX_PARALLEL)
     }
     pub fn max_per_connection(&self) -> usize {
-        self.max_per_connection.filter(|n| *n > 0).unwrap_or(DEFAULT_MAX_PER_CONNECTION) as usize
+        steps_at_once(self.max_per_connection, DEFAULT_MAX_PER_CONNECTION)
     }
 }
 
@@ -89,6 +92,11 @@ impl StepLimits {
     pub fn retries(&self, job: &RunLimits) -> u32 {
         self.retries.or(job.retries).unwrap_or(0).min(MAX_RETRIES)
     }
+}
+
+/// A steps-at-once limit: `default` when unset or 0, at most [`MAX_STEPS_AT_ONCE`].
+fn steps_at_once(n: Option<u32>, default: u32) -> usize {
+    n.filter(|n| *n > 0).unwrap_or(default).min(MAX_STEPS_AT_ONCE) as usize
 }
 
 fn secs(s: Option<u32>) -> Option<Duration> {
@@ -135,6 +143,11 @@ mod tests {
         assert_eq!((none.max_parallel(), none.max_per_connection()), (4, 2));
         let zero = RunLimits { max_parallel: Some(0), max_per_connection: Some(0), run_timeout_secs: Some(0), ..Default::default() };
         assert_eq!((zero.max_parallel(), zero.max_per_connection(), zero.run_timeout()), (4, 2, None));
+        // Past what the editor accepts (a hand-edited or old file): capped.
+        let big = RunLimits { max_parallel: Some(u32::MAX), max_per_connection: Some(1000), ..Default::default() };
+        assert_eq!((big.max_parallel(), big.max_per_connection()), (64, 64));
+        let one = RunLimits { max_parallel: Some(1), max_per_connection: Some(64), ..Default::default() };
+        assert_eq!((one.max_parallel(), one.max_per_connection()), (1, 64));
     }
 
     #[test]

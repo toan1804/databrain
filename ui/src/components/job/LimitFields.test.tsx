@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { Job, JobNode } from "../../lib/types";
 import { newNode } from "../../lib/jobGraph";
-import { JobLimits, StepLimitFields, durationText, parseCount, parseDuration } from "./LimitFields";
+import { JobLimits, StepLimitFields, durationOrOff, durationText, parseCount, parseDuration } from "./LimitFields";
 import { applyPatch, statusText } from "./shared";
 
 const job = (limits?: Job["limits"]): Job => ({ id: "j1", name: "Job", nodes: [], edges: [], schedule: { enabled: false } as never, created_at: 0, updated_at: 0, limits }) as never;
@@ -24,6 +24,13 @@ describe("job limits", () => {
     expect(durationText(null)).toBe("");
     // What is shown reads back the same.
     for (const s of [45, 60, 3600, 3725]) expect(parseDuration(durationText(s))).toBe(s);
+  });
+
+  it("reads 0 in any unit as no time limit for a step", () => {
+    for (const off of ["0", "0s", "0m", "0 min", "0h", "0h0m", "00"]) expect(durationOrOff(off), off).toBe(0);
+    expect(durationOrOff("30m")).toBe(1800);
+    expect(durationOrOff("")).toBeNull();
+    for (const bad of ["-0", "0d", "0x", "s"]) expect(durationOrOff(bad), bad).toBe("invalid");
   });
 
   it("reads counts within their range", () => {

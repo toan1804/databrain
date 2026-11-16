@@ -165,10 +165,11 @@ pub enum LoadEvent {
     Progress { phase: String, done: u64, total: u64 },
     /// A group of INSERTs finished (or failed: `error`, `sql` = the failing one).
     Inserted { label: String, table: String, rows: u64, statements: usize, sql: String, duration_ms: u64, error: Option<String> },
-    /// The load failed after it started writing. `kept_nothing`: it ran in
-    /// one transaction that was rolled back before any commit was sent, and
-    /// nothing in it commits on its own, so running it again can't write the
-    /// rows twice. (A load that fails before it writes sends nothing.)
+    /// The load failed (sent once, by every failure of a load). `kept_nothing`:
+    /// it failed before it wrote anything, or it ran in one transaction that
+    /// was rolled back before any commit was sent and nothing in it commits
+    /// on its own ([`kept_nothing`]), so running it again can't write the
+    /// rows twice.
     Failed { kept_nothing: bool },
 }
 
@@ -399,6 +400,22 @@ fn transaction(dialect: ConnectorKind, plan: &[Act]) -> Option<Tx> {
     Some(Tx { begin: t.begin, commit: t.commit, rollback: t.rollback })
 }
 
+/// A load failed before it wrote anything: say so (a retry can't write twice).
+fn before_writing(obs: &dyn LoadObserver, e: EngineError) -> EngineError {
+    obs.event(LoadEvent::Failed { kept_nothing: true });
+    e
+}
+
+/// Whether a load that failed once it started writing kept nothing: it ran
+/// in one transaction (`transaction`) that was rolled back before its commit
+/// was sent (`committing`: a lost connection may come after the server
+/// committed), and none of its before/after SQL may commit on its own
+/// (`may_commit`). A database without transactions keeps every statement
+/// that ended.
+fn kept_nothing(transaction: bool, may_commit: bool, committing: bool) -> bool {
+    transaction && !may_commit && !committing
+}
+
 /// Run one statement; rows affected when the driver reports them.
 async fn exec(session: &Arc<dyn Session>, sql: Statement<'_>, cancel: &CancellationToken) -> Result<Option<u64>> {
     if cancel.is_cancelled() {
@@ -483,12 +500,13 @@ impl QueryEngine {
         cancel: &CancellationToken,
         obs: &dyn LoadObserver,
     ) -> Result<LoadReport> {
+        let unwritten = |e: EngineError| before_writing(obs, e);
         // A result on disk is streamed: its rows are never all in memory.
-        let o = self.outputs.ensure_loaded(reference)?;
-        if let Some(stream) = self.disk_stream(&o.result_id)? {
+        let o = self.outputs.ensure_loaded(reference).map_err(unwritten)?;
+        if let Some(stream) = self.disk_stream(&o.result_id).map_err(unwritten)? {
             return self.load_stream(stream, connection_id, tab, spec, cancel, obs).await;
         }
-        let rows = self.output_rows(reference)?;
+        let rows = self.output_rows(reference).map_err(unwritten)?;
         self.load_rows(&rows, connection_id, tab, spec, cancel, obs).await
     }
 
@@ -521,18 +539,22 @@ impl QueryEngine {
         cancel: &CancellationToken,
         obs: &dyn LoadObserver,
     ) -> Result<LoadReport> {
-        let kind = self.workspace.get_connection(source)?.config.kind;
+        let unwritten = |e: EngineError| before_writing(obs, e);
+        let kind = self.workspace.get_connection(source).map_err(|e| unwritten(e.into()))?.config.kind;
         let sql = Checked::new(sql, kind);
         if !sql.kind().is_read() {
-            return Err(EngineError::new("invalid", "Only a query that reads rows can run again for a load; load the rows the result holds instead."));
+            return Err(unwritten(EngineError::new(
+                "invalid",
+                "Only a query that reads rows can run again for a load; load the rows the result holds instead.",
+            )));
         }
         // The query runs on the tab's session (its temp tables, settings):
         // hold it, like a full export, so nothing else runs there meanwhile.
         let hold = Hold::session(session, cancel.clone(), "A query is running in this tab: wait for it, then load every row");
-        let (_, _claim) = self.guarded_or_refuse(source, Some(hold), Intent::Inspect)?;
-        let src = self.session_for(source, session, databrain_workspace::Origin::User).await?;
+        let (_, _claim) = self.guarded_or_refuse(source, Some(hold), Intent::Inspect).map_err(unwritten)?;
+        let src = self.session_for(source, session, databrain_workspace::Origin::User).await.map_err(unwritten)?;
         let opts = ExecOptions { batch_size: 2000, cancel: cancel.clone(), max_rows: None, output_masks: None };
-        let stream = src.execute(sql.statement(), opts).await?;
+        let stream = src.execute(sql.statement(), opts).await.map_err(|e| unwritten(e.into()))?;
         self.load_stream(stream, connection_id, tab, spec, cancel, obs).await
     }
 
@@ -554,10 +576,12 @@ impl QueryEngine {
                 Some(Ok(StreamEvent::Batch(b))) if b.num_rows() > 0 => first = Some(b),
                 Some(Ok(StreamEvent::Done(_))) | None => break,
                 Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(e.into()),
+                Some(Err(e)) => return Err(before_writing(obs, e.into())),
             }
         }
-        let schema = schema.or_else(|| first.as_ref().map(|b| b.schema())).ok_or_else(|| EngineError::new("invalid", "The query returns no rows to load"))?;
+        let schema = schema
+            .or_else(|| first.as_ref().map(|b| b.schema()))
+            .ok_or_else(|| before_writing(obs, EngineError::new("invalid", "The query returns no rows to load")))?;
         let more = first.is_some();
         let rows = LoadRows { schema, batches: first.into_iter().collect() };
         self.load_with(&rows, more.then_some(&mut stream), connection_id, tab, spec, cancel, obs).await
@@ -575,7 +599,8 @@ impl QueryEngine {
         cancel: &CancellationToken,
         obs: &dyn LoadObserver,
     ) -> Result<LoadReport> {
-        let p = self.prepare_load(connection_id, tab, spec, Some(rows), false).await?;
+        // Preparing only reads (the target, its columns); the before SQL runs in the plan.
+        let p = self.prepare_load(connection_id, tab, spec, Some(rows), false).await.map_err(|e| before_writing(obs, e))?;
         obs.event(LoadEvent::Info(format!(
             "Writing {} rows into {} on {} ({}, INSERTs of up to {} rows / {} KB): {}",
             if rest.is_some() { "every".to_string() } else { rows.count().to_string() },
@@ -590,7 +615,9 @@ impl QueryEngine {
             obs.event(LoadEvent::Info(n.clone()));
         }
         if let Some(tx) = &p.tx {
-            timed(&p.session, "Start the transaction", Statement::internal(tx.begin), cancel, obs).await.map_err(|e| labelled("Start the transaction", e))?;
+            timed(&p.session, "Start the transaction", Statement::internal(tx.begin), cancel, obs)
+                .await
+                .map_err(|e| before_writing(obs, labelled("Start the transaction", e)))?;
         }
         // Once the commit is sent, a failure (a lost connection) may come
         // after the server committed.
@@ -620,7 +647,7 @@ impl QueryEngine {
                 Ok(LoadReport { rows: n, deleted, created_table: p.creates, transaction: p.tx.is_some(), notices })
             }
             Err(e) => {
-                obs.event(LoadEvent::Failed { kept_nothing: p.tx.is_some() && !p.may_commit && !committing });
+                obs.event(LoadEvent::Failed { kept_nothing: kept_nothing(p.tx.is_some(), p.may_commit, committing) });
                 if p.tx.is_some() && e.kind != "cancelled" {
                     obs.event(LoadEvent::Info("Rolling back the transaction: nothing is kept".into()));
                 }
@@ -1485,6 +1512,17 @@ mod tests {
         for (sql, k) in [("call refresh_totals()", Postgres), ("exec dbo.rebuild", Mssql), ("BEGIN pkg.run; END;", Oracle)] {
             assert!(check(sql, k).unwrap(), "{k:?}: {sql}");
         }
+    }
+
+    /// Only a load that ran in one transaction, rolled back before its
+    /// commit was sent, with no before/after SQL that may commit on its own,
+    /// kept nothing.
+    #[test]
+    fn kept_nothing_only_when_rolled_back_as_a_whole() {
+        assert!(kept_nothing(true, false, false), "rolled back");
+        assert!(!kept_nothing(false, false, false), "no transaction: each statement that ended was kept");
+        assert!(!kept_nothing(true, true, false), "before/after SQL that may commit");
+        assert!(!kept_nothing(true, false, true), "the commit was sent: the server may have committed");
     }
 
     #[test]

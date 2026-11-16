@@ -972,6 +972,49 @@ async fn stop_one_step() {
     .await;
 }
 
+/// A step whose session something still holds (an earlier try left
+/// behind: it didn't stop when asked) fails saying so, not "a query is
+/// already running in this tab"; once that ends, the step runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn step_still_held_by_a_try_left_behind_fails_clearly() {
+    guarded(async {
+        let st = state();
+        let dir = tempfile::tempdir().unwrap();
+        let a = sqlite(&st, "A", &dir.path().join("a.db"), false);
+        let job = limited_job(&st, "Held", vec![node("n1", "held_step", JobNodeKind::Query, Some(&a), "select 1")], vec![], Default::default());
+        // What a try left behind looks like: a statement still running on the step's tab.
+        let tab = databrain_workspace::SessionRole::JobStep { job: job.id.clone(), node: "n1".into() }.key();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (engine, hub, (conn, key, stop)) = (st.engine.clone(), st.hub.clone(), (a.clone(), tab.clone(), cancel.clone()));
+        let old = tokio::spawn(async move {
+            let req = RunRequest {
+                connection_id: conn,
+                tab_id: key,
+                sql: SLOW.into(),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+                output_masks: None,
+            };
+            let _ = engine.run_and_wait(&hub, req, Some(stop)).await;
+        });
+        until("the old try running", 30, || st.engine.in_use(&tab)).await;
+        let run = run_all(&st, &job).await;
+        let s = step(&run, "held_step");
+        assert_eq!(s.status, "error", "{run:?}");
+        assert!(s.error.as_deref().unwrap().contains("earlier try of this step is still running"), "{s:?}");
+        cancel.cancel();
+        old.await.unwrap();
+        until("the old try ended", 30, || !st.engine.in_use(&tab)).await;
+        assert_eq!(step(&run_all(&st, &job).await, "held_step").status, "success");
+    })
+    .await;
+}
+
 /// A step on a connection that can't connect fails quickly, every time.
 #[tokio::test(flavor = "multi_thread")]
 async fn unreachable_connection_fails_each_run() {

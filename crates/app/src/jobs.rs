@@ -96,6 +96,8 @@ async fn renew_lease(ws: &Workspace, job_id: &str, owner: &str) -> Option<bool> 
 /// statement the database doesn't let go of can't keep the run (and its
 /// lease) alive.
 const STOP_GRACE: Duration = Duration::from_secs(30);
+/// A step whose earlier try, left behind, still runs.
+const STILL_RUNNING: &str = "An earlier try of this step is still running (it didn't stop when asked and was left behind): wait for it to end, or stop it on the server, then run the step again";
 
 /// How long a job's lease lasts; renewed every [`LEASE_RENEW`] while it runs.
 const LEASE_MS: i64 = 90_000;
@@ -247,9 +249,8 @@ pub struct Tracer {
     node: Option<(String, String)>,
     /// `:name` values of the run (or why there are none: its steps fail with it).
     params: Arc<std::result::Result<HashMap<String, ParamValue>, String>>,
-    /// The step's load failed after it started writing: whether it kept
-    /// nothing ([`LoadEvent::Failed`]); `None` while it wrote nothing.
-    load_failed: Arc<Mutex<Option<bool>>>,
+    /// How far the step's load got, for [`retry_refused`].
+    load: Arc<Mutex<LoadState>>,
 }
 
 impl Tracer {
@@ -259,7 +260,7 @@ impl Tracer {
             live: Arc::new(Mutex::new(Live { run, log: Vec::new(), dropped: 0, last_emit: Instant::now() })),
             node: None,
             params: Arc::new(Ok(HashMap::new())),
-            load_failed: Arc::default(),
+            load: Arc::default(),
         }
     }
 
@@ -269,12 +270,12 @@ impl Tracer {
     }
 
     fn for_node(&self, node: &JobNode) -> Self {
-        Tracer { node: Some((node.id.clone(), node.name.clone())), load_failed: Arc::default(), ..self.clone() }
+        Tracer { node: Some((node.id.clone(), node.name.clone())), load: Arc::default(), ..self.clone() }
     }
 
     /// Show which try of the step this is ("attempt 2 of 3"), with a fresh start.
     fn attempt(&self, n: u32, of: u32) {
-        *self.load_failed.lock() = None;
+        *self.load.lock() = LoadState::NotStarted;
         let Some((id, _)) = &self.node else { return };
         let snapshot = {
             let mut l = self.live.lock();
@@ -376,6 +377,20 @@ impl Tracer {
     }
 }
 
+/// How far a step's load got in its last try. Unsure is not "kept nothing".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LoadState {
+    /// The load wasn't called (the step failed before it).
+    #[default]
+    NotStarted,
+    /// Called, and it reported no failure: it may have written.
+    Started,
+    /// It failed and said it kept nothing ([`LoadEvent::Failed`]).
+    KeptNothing,
+    /// It failed and may have kept some of its writes.
+    MayHaveKept,
+}
+
 impl LoadObserver for Tracer {
     fn event(&self, e: LoadEvent) {
         match e {
@@ -391,7 +406,7 @@ impl LoadObserver for Tracer {
                 Some(e) => self.log("error", format!("{label} failed: {e}"), Some(&sql), None, Some(duration_ms as i64)),
             },
             LoadEvent::Progress { phase, done, total } => self.progress(StepProgress { phase, done, total }),
-            LoadEvent::Failed { kept_nothing } => *self.load_failed.lock() = Some(kept_nothing),
+            LoadEvent::Failed { kept_nothing } => *self.load.lock() = if kept_nothing { LoadState::KeptNothing } else { LoadState::MayHaveKept },
             LoadEvent::Inserted { label, table, rows, statements, sql, duration_ms, error } => {
                 let batches = format!("{statements} batch{}", if statements == 1 { "" } else { "es" });
                 match error {
@@ -785,6 +800,9 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
             biased;
             done = set.join_next() => done,
             _ = waiting_stopped, if !cancel.is_cancelled() => continue,
+            // Stop: steps waiting on upstream steps (no token of their own)
+            // show as not started now, not when a running step returns.
+            _ = cancel.cancelled(), if !cancel.is_cancelled() => continue,
             _ = tokio::time::sleep_until(deadline.unwrap_or(far)), if deadline.is_some() && !timed_out && !cancel.is_cancelled() => {
                 timed_out = true;
                 tracer.log("error", format!("Stopping: {}", timed_out_text(run_limit.unwrap_or_default())), None, None, None);
@@ -989,6 +1007,12 @@ async fn one_try(
     t: &Tracer,
     limit: Option<Duration>,
 ) -> Result<NodeOut> {
+    // A try of an earlier run left behind (it didn't stop when asked) may
+    // still hold the step's sessions: say so, not "a query is already running".
+    let tab = node_tab(job_id, &node.id);
+    if [tab.clone(), step_load(&tab), step_export(&tab)].iter().any(|k| ctx.engine.in_use(k)) {
+        return Err(EngineError::new("busy", STILL_RUNNING));
+    }
     let stop = cancel.child_token();
     // A panic fails this step only (the run must still finish).
     let work = std::panic::AssertUnwindSafe(run_node(ctx, job_id, job_name, node, upstreams, &stop, t)).catch_unwind();
@@ -1049,10 +1073,17 @@ fn retry_refused(ctx: &JobCtx, node: &JobNode, t: &Tracer) -> Option<String> {
         JobNodeKind::Query => (!reads(&node.sql, node.connection_id.as_deref())).then(|| may_write.to_string()),
         JobNodeKind::Load | JobNodeKind::Export if !node.sql.trim().is_empty() && !reads(&node.sql, None) => Some(may_write.into()),
         JobNodeKind::Export => None,
-        JobNodeKind::Load => match *t.load_failed.lock() {
-            None | Some(true) => None,
-            Some(false) => Some("the load may have kept some of its writes (it didn't run in one transaction that was rolled back)".into()),
-        },
+        JobNodeKind::Load => load_retry_refused(*t.load.lock()).map(str::to_string),
+    }
+}
+
+/// Why a load step's try must not run again, by how far its load got:
+/// only when it never started or said it kept nothing.
+fn load_retry_refused(load: LoadState) -> Option<&'static str> {
+    match load {
+        LoadState::NotStarted | LoadState::KeptNothing => None,
+        LoadState::Started => Some("the load didn't say whether it kept any of its writes"),
+        LoadState::MayHaveKept => Some("the load may have kept some of its writes (it didn't run in one transaction that was rolled back)"),
     }
 }
 
@@ -1411,6 +1442,8 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     let target =
         node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;
     let spec = load_spec_now(ctx, node, target, origin, t)?;
+    // From here a failure may have written: a retry needs the load to say it kept nothing.
+    *t.load.lock() = LoadState::Started;
     let report = ctx.engine.write_output(&output.handle, target, &step_load(&tab), &spec, cancel, t).await?;
     Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices })
 }
@@ -1516,15 +1549,15 @@ fn sql_origin(node: &JobNode) -> Origin {
 /// Rows a dry run selects to try the load with.
 pub const DRY_RUN_ROWS: usize = 1000;
 
-/// Check a load step of `job` (as edited, not necessarily saved) without
-/// keeping any change: its SQL selects up to [`DRY_RUN_ROWS`] rows on
-/// DuckDB, then the load is tried with them (see
-/// [`QueryEngine::dry_run_load`]).
 /// `:name` values a dry run selects its rows with: the job's.
 fn dry_run_params(ctx: &JobCtx, job: &Job) -> HashMap<String, ParamValue> {
     effective_params(&ctx.workspace, job, None).map(|(p, _)| p.into_iter().collect()).unwrap_or_default()
 }
 
+/// Check a load step of `job` (as edited, not necessarily saved) without
+/// keeping any change: its SQL selects up to [`DRY_RUN_ROWS`] rows on
+/// DuckDB, then the load is tried with them (see
+/// [`QueryEngine::dry_run_load`]).
 pub async fn dry_run(ctx: &JobCtx, job: &Job, node_id: &str) -> Result<LoadDryRun> {
     let node = job.nodes.iter().find(|n| n.id == node_id).ok_or_else(|| EngineError::new("not_found", "Step not found"))?;
     if node.kind != JobNodeKind::Load {
@@ -1660,6 +1693,17 @@ pub async fn wait_for(ctx: &JobCtx, ids: &[String]) {
 mod tests {
     use super::*;
     use databrain_connector_core::ConnectorKind::{Duckdb, Mongodb, Mysql, Postgres};
+
+    /// A load step's try runs again only when its load never started or said
+    /// it kept nothing; a load that started and didn't say (or said it may
+    /// have kept writes) isn't tried again.
+    #[test]
+    fn load_retry_needs_the_load_to_say_it_kept_nothing() {
+        assert_eq!(load_retry_refused(LoadState::NotStarted), None);
+        assert_eq!(load_retry_refused(LoadState::KeptNothing), None);
+        assert!(load_retry_refused(LoadState::Started).is_some_and(|w| w.contains("didn't say")));
+        assert!(load_retry_refused(LoadState::MayHaveKept).is_some_and(|w| w.contains("may have kept")));
+    }
 
     /// An export's temporary file goes when the step ends without moving it
     /// into place (dropped by a time limit or left behind too), stays once
