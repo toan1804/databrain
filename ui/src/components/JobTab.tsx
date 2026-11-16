@@ -161,18 +161,21 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
     // The slot is taken before waiting: two calls waiting on the same save
     // would otherwise both send the same version, and the second would be
     // refused as "changed elsewhere".
+    // Read before waiting: a Cancel meanwhile gave up the edits this save
+    // would carry (`latest` may still hold them until the saved version loads).
+    const gen = shown.current;
     const prev = saving.current;
     let done!: () => void;
     saving.current = new Promise<void>((r) => (done = r));
     try {
       await prev;
+      if (gen !== shown.current) return false;
       const j = latest.current;
       if (!j) return true;
       // Nothing changed since the save before this one: already saved.
       if (!dirty.current && j === basis.current) return true;
       dirty.current = false;
       setSave({ state: "saving" });
-      const gen = shown.current;
       inFlight.current = true;
       const call = api.saveJob(j);
       try {

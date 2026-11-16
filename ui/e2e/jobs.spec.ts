@@ -268,6 +268,68 @@ test.describe("the assistant changes a job with unsaved edits here", () => {
     await expect(page.getByText(/changed elsewhere/)).toHaveCount(0);
   });
 
+  // Cancel gives up the edits of a save waiting behind a slow one too: it
+  // isn't sent once the slow one answers, even before the assistant's
+  // version has loaded, so no second dialog asks about them.
+  test("Cancel drops a save waiting behind a slow one", async ({ page }) => {
+    await openApp(page, backend({ __jobs: [job] }));
+    await page.getByRole("button", { name: "Jobs", exact: true }).click();
+    await page.getByText("Orders", { exact: true }).click();
+    const card = page.getByLabel("Job steps").locator("[data-node]").first();
+    await expect(card).toContainText("orders_today");
+    // Hold the first save.
+    await page.evaluate(() => {
+      const w = window as unknown as {
+        __DB_MOCK__: { handlers: Record<string, unknown>; builtins: Record<string, (a: unknown) => unknown> };
+        __release?: () => void;
+      };
+      w.__DB_MOCK__.handlers.save_job = (a: unknown) =>
+        new Promise((res) => {
+          w.__release = () => {
+            delete w.__DB_MOCK__.handlers.save_job;
+            res(w.__DB_MOCK__.builtins.save_job(a));
+          };
+        });
+    });
+    await card.click();
+    const name = page.getByLabel("Step details").getByRole("textbox").first();
+    await name.fill("first");
+    await expect.poll(async () => (await calls(page, "save_job")).length).toBe(1);
+    // A second edit: its save waits behind the first.
+    await name.fill("second");
+    await page.waitForTimeout(900);
+    // The assistant saves; loading its version is slow.
+    await page.evaluate((j) => {
+      const w = window as unknown as {
+        __DB_MOCK__: { handlers: Record<string, unknown>; builtins: Record<string, (a: unknown) => unknown>; db: { jobs: unknown[] } };
+        __loaded?: () => void;
+      };
+      w.__DB_MOCK__.db.jobs = [{ ...j, nodes: [{ ...j.nodes[0], name: "assistants" }], updated_at: 50 }];
+      w.__DB_MOCK__.handlers.get_job = (a: unknown) =>
+        new Promise((res) => {
+          w.__loaded = () => {
+            delete w.__DB_MOCK__.handlers.get_job;
+            res(w.__DB_MOCK__.builtins.get_job(a));
+          };
+        });
+      window.dispatchEvent(new CustomEvent("db:job-changed", { detail: { id: j.id } }));
+    }, job);
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toContainText("This job was changed elsewhere");
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog).toHaveCount(0);
+    // The first save is refused (an older version); the one behind it is dropped.
+    await page.evaluate(() => (window as unknown as { __release: () => void }).__release());
+    await page.waitForTimeout(500);
+    await page.evaluate(() => (window as unknown as { __loaded: () => void }).__loaded());
+    await expect(card).toContainText("assistants");
+    await page.waitForTimeout(1500);
+    await expect(dialog).toHaveCount(0);
+    expect(await calls(page, "save_job")).toHaveLength(1);
+    const stored = await page.evaluate(() => (window as unknown as { __DB_MOCK__: { db: { jobs: { nodes: { name: string }[] }[] } } }).__DB_MOCK__.db.jobs[0].nodes[0].name);
+    expect(stored).toBe("assistants");
+  });
+
   test("a save refused as made on an older version asks too", async ({ page }) => {
     await openApp(page, backend({ __jobs: [job] }));
     await page.getByRole("button", { name: "Jobs", exact: true }).click();
