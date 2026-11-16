@@ -13,8 +13,8 @@ workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 # Already built for arrow (connector-core): no new crate or size.
 chrono-tz = "0.10.4"
-databrain-auth = { version = "0.4.2", path = "../auth" }
-databrain-connector-core = { version = "0.4.2", path = "../connector-core" }
+databrain-auth = { version = "0.4.3", path = "../auth" }
+databrain-connector-core = { version = "0.4.3", path = "../connector-core" }
 parking_lot = "0.12.5"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
