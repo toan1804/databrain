@@ -123,7 +123,7 @@ pub fn create_job_schema() -> Value {
                 "properties": {
                     "off": {"type": "boolean"},
                     "every_minutes": {"type": "integer", "minimum": 1},
-                    "daily_at": {"type": "string", "description": "HH:MM local time"},
+                    "daily_at": {"type": "string", "description": "HH:MM in the job's time zone (the computer's unless the user picked one)"},
                     "weekdays": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 6}, "description": "0 = Sunday; empty = every day"}
                 },
                 "additionalProperties": false
@@ -247,7 +247,23 @@ fn valid_hhmm(t: &str) -> bool {
 }
 
 fn parse_schedule(v: Option<&Value>) -> Result<JobSchedule> {
-    let Some(v) = v.filter(|v| v.is_object()) else { return Ok(JobSchedule::default()) };
+    // Omitted or null: no schedule given. Anything else that isn't an object
+    // (`false`, `"off"`, a number) is refused: read as "no schedule" it would
+    // wipe the user's schedule while the approval says something else.
+    let v = match v {
+        None | Some(Value::Null) => return Ok(JobSchedule::default()),
+        Some(v) if v.is_object() => v,
+        Some(other) => {
+            return Err(AiError::Policy(format!(
+                "schedule must be an object ({{\"every_minutes\": n}}, {{\"daily_at\": \"HH:MM\"}} or {{\"off\": true}}), or omitted to keep it; got {other}"
+            )));
+        }
+    };
+    if v.get("set_in_app").is_some() {
+        return Err(AiError::Policy(
+            "schedule: this job's schedule was set in the app (get_job's `set_in_app`) and the assistant can't write it: omit `schedule` to keep it".into(),
+        ));
+    }
     refuse_unknown(v, SCHEDULE_KEYS, "schedule")?;
     if v.get("off").and_then(|o| o.as_bool()) == Some(true) {
         return Ok(JobSchedule::default());
@@ -275,11 +291,17 @@ fn parse_schedule(v: Option<&Value>) -> Result<JobSchedule> {
         sch.enabled = true;
         sch.mode = ScheduleMode::Daily;
         sch.at = at.to_string();
-        sch.weekdays = v
-            .get("weekdays")
-            .and_then(|w| w.as_array())
-            .map(|a| a.iter().filter_map(|d| d.as_u64()).filter(|d| *d <= 6).map(|d| d as u8).collect())
-            .unwrap_or_default();
+        // A day that isn't 0–6 (cron's 7 for Sunday, a name) is refused: dropped,
+        // `[7]` would become `[]`, every day.
+        sch.weekdays = match v.get("weekdays") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|d| d.as_u64().filter(|d| *d <= 6).map(|d| d as u8))
+                .collect::<Option<Vec<u8>>>()
+                .ok_or_else(|| AiError::Policy(format!("schedule.weekdays are days 0 (Sunday) to 6 (Saturday), got {}", v["weekdays"])))?,
+            Some(w) => return Err(AiError::Policy(format!("schedule.weekdays must be a list of days 0 (Sunday) to 6 (Saturday), got {w}"))),
+        };
     } else {
         // Not read as "no schedule": that would save an unscheduled job (or
         // turn an existing schedule off) while the answer says otherwise.
@@ -468,19 +490,37 @@ fn conn_name(conns: &[ConnRef], id: Option<&str>) -> String {
     }
 }
 
+/// "every 30 min", "daily at 06:30 on days [1, 2]", "cron 0 6 * * *", with the time zone.
+fn schedule_text(s: &JobSchedule) -> String {
+    let times = if s.times.is_empty() { s.at.clone() } else { s.times.join(", ") };
+    let text = match s.mode {
+        ScheduleMode::Interval => format!("every {} min", s.minutes),
+        ScheduleMode::Daily => format!("daily at {times}{}", if s.weekdays.is_empty() { String::new() } else { format!(" on days {:?}", s.weekdays) }),
+        ScheduleMode::Monthly => {
+            format!("monthly on days {:?} (-1 = last day) at {times}", if s.month_days.is_empty() { vec![1] } else { s.month_days.clone() })
+        }
+        ScheduleMode::Cron => format!("cron {}", s.cron),
+    };
+    if s.time_zone.trim().is_empty() { text } else { format!("{text} ({})", s.time_zone.trim()) }
+}
+
 /// A job as text, for the model and the approval prompt.
 pub fn describe(job: &Job, conns: &[ConnRef]) -> String {
     let name_of = |id: &str| job.nodes.iter().find(|n| n.id == id).map(|n| n.name.clone()).unwrap_or_default();
     let mut t = format!("Job \"{}\"", job.name);
-    if job.schedule.enabled {
-        t.push_str(&match job.schedule.mode {
-            ScheduleMode::Interval => format!(" · every {} min", job.schedule.minutes),
-            ScheduleMode::Daily => format!(
-                " · daily at {}{}",
-                job.schedule.at,
-                if job.schedule.weekdays.is_empty() { String::new() } else { format!(" on days {:?}", job.schedule.weekdays) }
-            ),
+    let sch = &job.schedule;
+    if sch.enabled {
+        t.push_str(&format!(" · {}", schedule_text(sch)));
+        t.push_str(match sch.missed {
+            databrain_workspace::MissedRuns::Once => " · runs missed while the computer was off: one run",
+            databrain_workspace::MissedRuns::Skip => " · runs missed while the computer was off: skipped",
+            databrain_workspace::MissedRuns::Each => " · runs missed while the computer was off: each one (up to 24)",
         });
+    } else if !sch.time_zone.trim().is_empty() {
+        t.push_str(&format!(" · no time schedule (its times are in {})", sch.time_zone.trim()));
+    }
+    if !sch.after_jobs.is_empty() {
+        t.push_str(&format!(" · also runs after {} other job(s) succeed", sch.after_jobs.len()));
     }
     t.push('\n');
     for n in &job.nodes {
@@ -608,7 +648,9 @@ pub fn spec_of(job: &Job, conns: &[ConnRef]) -> Value {
     if job.schedule.enabled {
         out["schedule"] = match job.schedule.mode {
             ScheduleMode::Interval => json!({"every_minutes": job.schedule.minutes}),
-            ScheduleMode::Daily => json!({"daily_at": job.schedule.at, "weekdays": job.schedule.weekdays}),
+            ScheduleMode::Daily if job.schedule.times.len() <= 1 => json!({"daily_at": job.schedule.at, "weekdays": job.schedule.weekdays}),
+            // Set in the app; update_job keeps it when `schedule` is omitted.
+            _ => json!({"set_in_app": schedule_text(&job.schedule), "note": "omit schedule in update_job to keep it"}),
         };
     }
     out
@@ -715,9 +757,47 @@ pub fn changes(old: &Job, new: &Job) -> Vec<String> {
         out.push("changes the job's time limits, retries or steps at once".into());
     }
     if old.schedule != new.schedule {
-        out.push(if new.schedule.enabled { "changes the schedule".to_string() } else { "turns the schedule off".to_string() });
+        let (o, n) = (&old.schedule, &new.schedule);
+        out.push(if n.enabled {
+            "changes the schedule".to_string()
+        } else if o.enabled && !n.after_jobs.is_empty() {
+            format!("turns the time schedule off; it still runs after the {} job(s) it follows succeed", n.after_jobs.len())
+        } else if o.enabled {
+            "turns the schedule off".to_string()
+        } else {
+            "changes the (disabled) schedule's settings".to_string()
+        });
+        if n.time_zone != o.time_zone {
+            out.push(format!("time zone: {}", if n.time_zone.trim().is_empty() { "the computer's" } else { n.time_zone.trim() }));
+        }
+        if n.missed != o.missed {
+            out.push(format!("missed runs: {:?}", n.missed).to_lowercase());
+        }
+        if n.after_jobs != o.after_jobs {
+            out.push("changes the jobs it runs after".into());
+        }
     }
     out
+}
+
+/// The schedule `new` (what `update_job` read) is `old` as the tool shows it
+/// ([`spec_of`]): the same interval, or the same one daily time and days.
+fn same_simple_schedule(old: &JobSchedule, new: &JobSchedule) -> bool {
+    if !old.enabled || !new.enabled || old.mode != new.mode {
+        return false;
+    }
+    match old.mode {
+        ScheduleMode::Interval => old.minutes == new.minutes,
+        ScheduleMode::Daily => {
+            let one = |s: &JobSchedule| match s.times.as_slice() {
+                [] => Some(s.at.trim().to_string()),
+                [t] => Some(t.trim().to_string()),
+                _ => None,
+            };
+            one(old).is_some() && one(old) == one(new) && old.weekdays == new.weekdays
+        }
+        _ => false,
+    }
 }
 
 /// Mark the steps whose SQL the AI wrote (`JobNode::ai_sql`): every step of
@@ -860,8 +940,20 @@ pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<Str
     job.param_set = old.param_set.clone();
     // So are its time limits, retries and steps at once.
     job.limits = old.limits.clone();
-    if args.get("schedule").is_none() {
+    let off = args.get("schedule").and_then(|v| v.get("off")).and_then(Value::as_bool) == Some(true);
+    if args.get("schedule").is_none_or(Value::is_null) || same_simple_schedule(&old.schedule, &job.schedule) {
+        // Omitted, or sent back as it is (a daily time set in the app has
+        // `times`, which the tool doesn't write): unchanged.
         job.schedule = old.schedule.clone();
+    } else if off {
+        // Off: only that. The user's times, cron, days, zone and "run after" stay.
+        job.schedule = old.schedule.clone();
+        job.schedule.enabled = false;
+    } else {
+        // What the assistant doesn't set is the user's: kept.
+        job.schedule.time_zone = old.schedule.time_zone.clone();
+        job.schedule.missed = old.schedule.missed;
+        job.schedule.after_jobs = old.schedule.after_jobs.clone();
     }
     Ok((job, notes))
 }
@@ -883,27 +975,76 @@ pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<Str
 /// and loads that copy rows out of a connection whose PII masking or
 /// row-sharing settings don't follow the copy.
 pub fn review(engine: &databrain_query_engine::QueryEngine, job: &Job, only: &[String]) -> Result<Vec<String>> {
-    let ws = engine.workspace();
     let mut confirm = Vec::new();
     for n in job.nodes.iter().filter(|n| only.is_empty() || only.contains(&n.id)) {
         confirm.extend(review_step(engine, n)?);
-        // Rows copied out of a connection that masks columns or doesn't
-        // share rows: in the target table they are plain rows the assistant
-        // can query, so the user decides.
-        let Some(c) = n.target_connection_id.as_deref().filter(|c| !c.is_empty() && n.kind == JobNodeKind::Load) else { continue };
-        let target = ws.get_connection(c).map(|p| p.name).unwrap_or_default();
-        for src in sources_of(job, &n.id).into_iter().filter(|s| s != c) {
-            let Ok(src) = ws.get_connection(&src) else { continue };
-            let p = &src.ai_policy;
-            if !p.pii_columns.is_empty() || !p.share_result_rows {
-                confirm.push(format!(
-                    "step {} copies rows from \"{}\" into \"{target}\": the PII masking and row-sharing settings of \"{}\" don't apply to the copy, which the assistant can then query",
-                    n.name, src.name, src.name
-                ));
+        confirm.extend(copy_confirms(engine, job, n));
+    }
+    Ok(confirm)
+}
+
+/// Rows copied by load step `n` out of a connection that masks columns or
+/// doesn't share rows: in the target table they are plain rows the
+/// assistant can query, so the user decides (part of [`review`]).
+pub fn copy_confirms(engine: &databrain_query_engine::QueryEngine, job: &Job, n: &JobNode) -> Vec<String> {
+    let ws = engine.workspace();
+    let mut confirm = Vec::new();
+    let Some(c) = n.target_connection_id.as_deref().filter(|c| !c.is_empty() && n.kind == JobNodeKind::Load) else { return confirm };
+    let target = ws.get_connection(c).map(|p| p.name).unwrap_or_default();
+    for src in sources_of(job, &n.id).into_iter().filter(|s| s != c) {
+        let Ok(src) = ws.get_connection(&src) else { continue };
+        let p = &src.ai_policy;
+        if !p.pii_columns.is_empty() || !p.share_result_rows {
+            confirm.push(format!(
+                "step {} copies rows from \"{}\" into \"{target}\": the PII masking and row-sharing settings of \"{}\" don't apply to the copy, which the assistant can then query",
+                n.name, src.name, src.name
+            ));
+        }
+    }
+    confirm
+}
+
+/// What happens to a job that runs after one the assistant started: it
+/// runs under the AI rules, and nobody can be asked then, so a step that
+/// the rules refuse, or that needs the user's approval ([`review`]'s
+/// confirm items), fails while its other steps still run. One line per
+/// such step; empty when every step may run.
+pub fn follower_problems(engine: &databrain_query_engine::QueryEngine, job: &Job) -> Vec<String> {
+    let mut out = Vec::new();
+    for n in &job.nodes {
+        match review_step(engine, n) {
+            Err(e) => out.push(e.to_string()),
+            Ok(mut c) => {
+                c.extend(copy_confirms(engine, job, n));
+                if !c.is_empty() {
+                    out.push(format!("step {} needs your approval, which a job started after another can't ask ({})", n.name, c.join("; ")));
+                }
             }
         }
     }
-    Ok(confirm)
+    out
+}
+
+/// What a step changes when it runs, for the run approval: a load writes
+/// a table, an export a file, a query that isn't a plain read (the
+/// classifier's verdict on its own connection) may change data there.
+pub fn step_writes(engine: &databrain_query_engine::QueryEngine, n: &JobNode) -> Option<String> {
+    match n.kind {
+        JobNodeKind::Load => Some(format!("{} loads into {}", n.name, n.target_table.as_deref().unwrap_or("a table"))),
+        JobNodeKind::Export => Some(format!("{} writes a {} file", n.name, n.export_format.extension())),
+        JobNodeKind::Query => {
+            let ws = engine.workspace();
+            let profile = match n.connection_id.as_deref().filter(|c| !c.trim().is_empty()) {
+                Some(c) => ws.get_connection(c).ok(),
+                None => engine.results_connection().ok(),
+            };
+            let read = profile.as_ref().is_some_and(|p| crate::policy::review_sql(p, &n.sql).kind.is_read());
+            (!read).then(|| match profile {
+                Some(p) => format!("{} may change data on \"{}\"", n.name, p.name),
+                None => format!("{} may change data", n.name),
+            })
+        }
+    }
 }
 
 /// [`review`] for one step, by its own SQL and connections (not where its
@@ -1064,6 +1205,37 @@ mod tests {
         );
     }
 
+    /// A schedule set in the app that the assistant can't write (monthly,
+    /// cron, several times) is shown, and kept when `schedule` is omitted;
+    /// one it sets keeps the user's time zone, missed-run policy and "run after".
+    #[test]
+    fn edits_keep_the_schedule_settings_the_assistant_does_not_set() {
+        let c = conns();
+        let args = json!({"name": "j", "steps": [{"name": "orders", "connection": "Sales PG", "sql": "select 1"}]});
+        let (mut old, _) = build_job(&args, &c, &HashSet::new()).unwrap();
+        old.id = "J".into();
+        old.nodes[0].id = "n0".into();
+        old.schedule = JobSchedule {
+            enabled: true,
+            mode: ScheduleMode::Cron,
+            cron: "0 6 * * 1-5".into(),
+            time_zone: "Europe/Paris".into(),
+            missed: databrain_workspace::MissedRuns::Skip,
+            after_jobs: vec!["other".into()],
+            ..Default::default()
+        };
+        assert!(describe(&old, &c).contains("cron 0 6 * * 1-5 (Europe/Paris)"));
+        let mut spec = spec_of(&old, &c);
+        assert!(spec["schedule"]["set_in_app"].as_str().unwrap().contains("cron"));
+        spec["job"] = json!("j");
+        spec.as_object_mut().unwrap().remove("schedule");
+        assert_eq!(merge_job(&old, &spec, &c, &HashSet::new()).unwrap().0.schedule, old.schedule);
+        spec["schedule"] = json!({"daily_at": "07:00"});
+        let new = merge_job(&old, &spec, &c, &HashSet::new()).unwrap().0.schedule;
+        assert_eq!((new.mode, new.at.as_str(), new.time_zone.as_str()), (ScheduleMode::Daily, "07:00", "Europe/Paris"));
+        assert_eq!((new.missed, new.after_jobs), (databrain_workspace::MissedRuns::Skip, vec!["other".to_string()]));
+    }
+
     #[test]
     fn edits_keep_steps_and_follow_renames() {
         let c = conns();
@@ -1138,8 +1310,70 @@ mod tests {
         assert!(q.nodes[1].batch_rows.is_none());
     }
 
+    /// `{"off": true}` turns only the time schedule off: the user's times,
+    /// zone and "run after" stay, and the approval says the job still runs
+    /// after the jobs it follows. Already off: nothing changes.
+    #[test]
+    fn turning_the_schedule_off_keeps_the_users_settings() {
+        let c = conns();
+        let args = json!({"name": "j", "steps": [{"name": "orders", "connection": "Sales PG", "sql": "select 1"}]});
+        let (mut old, _) = build_job(&args, &c, &HashSet::new()).unwrap();
+        old.nodes[0].id = "n0".into();
+        old.schedule = JobSchedule {
+            enabled: true,
+            mode: ScheduleMode::Cron,
+            cron: "0 6 * * 1-5".into(),
+            time_zone: "Europe/Paris".into(),
+            after_jobs: vec!["other".into()],
+            ..Default::default()
+        };
+        let off = json!({"job": "j", "steps": [{"name": "orders", "connection": "Sales PG", "sql": "select 1"}], "schedule": {"off": true}});
+        let (new, _) = merge_job(&old, &off, &c, &HashSet::new()).unwrap();
+        assert!(!new.schedule.enabled);
+        assert_eq!((new.schedule.cron.as_str(), new.schedule.time_zone.as_str()), ("0 6 * * 1-5", "Europe/Paris"));
+        assert_eq!(changes(&old, &new), vec!["turns the time schedule off; it still runs after the 1 job(s) it follows succeed".to_string()]);
+        // Without "run after": plainly off.
+        old.schedule.after_jobs.clear();
+        let (new, _) = merge_job(&old, &off, &c, &HashSet::new()).unwrap();
+        assert_eq!(changes(&old, &new), vec!["turns the schedule off".to_string()]);
+        // Already off: nothing changes, and the zone still shows.
+        let (again, _) = merge_job(&new, &off, &c, &HashSet::new()).unwrap();
+        assert!(changes(&new, &again).is_empty() && again.schedule == new.schedule);
+        assert!(describe(&new, &c).contains("no time schedule (its times are in Europe/Paris)"), "{}", describe(&new, &c));
+    }
+
+    /// A daily time set in the app (`times`) round-trips through the spec
+    /// without a change; the missed-run policy shows.
+    #[test]
+    fn a_daily_time_set_in_the_app_round_trips() {
+        let c = conns();
+        let args = json!({"name": "j", "steps": [{"name": "orders", "connection": "Sales PG", "sql": "select 1"}]});
+        let (mut old, _) = build_job(&args, &c, &HashSet::new()).unwrap();
+        old.nodes[0].id = "n0".into();
+        old.schedule = JobSchedule {
+            enabled: true,
+            mode: ScheduleMode::Daily,
+            at: "06:30".into(),
+            times: vec!["06:30".into()],
+            weekdays: vec![1, 2],
+            missed: databrain_workspace::MissedRuns::Each,
+            ..Default::default()
+        };
+        let mut spec = spec_of(&old, &c);
+        spec["job"] = json!("j");
+        let (same, _) = merge_job(&old, &spec, &c, &HashSet::new()).unwrap();
+        assert!(changes(&old, &same).is_empty(), "{:?}", changes(&old, &same));
+        assert_eq!(same.schedule, old.schedule);
+        assert!(describe(&old, &c).contains("missed while the computer was off: each one"), "{}", describe(&old, &c));
+        // Another time is a change.
+        spec["schedule"]["daily_at"] = json!("07:00");
+        let (moved, _) = merge_job(&old, &spec, &c, &HashSet::new()).unwrap();
+        assert_eq!(changes(&old, &moved), vec!["changes the schedule".to_string()]);
+    }
+
     /// Settings the assistant can't make are refused by name, not dropped:
-    /// in a step, in the schedule, at the top.
+    /// in a step, in the schedule, at the top. A schedule set in the app,
+    /// sent back as `get_job` shows it, is refused with how to keep it.
     #[test]
     fn arguments_the_assistant_cannot_set_are_refused() {
         let c = conns();
@@ -1159,10 +1393,17 @@ mod tests {
                 .map_err(|e| e.to_string())
         };
         assert!(sched(json!({"daily_at": "06:30", "weekdays": [1]})).is_ok());
+        // A day outside 0–6 is refused, not dropped (`[7]` would become every day).
+        for bad in [json!([7]), json!([1, 7]), json!(["mon"]), json!("1")] {
+            let e = sched(json!({"daily_at": "06:30", "weekdays": bad})).unwrap_err();
+            assert!(e.contains("weekdays"), "{bad}: {e}");
+        }
         let e = sched(json!({"daily_at": "06:30", "time_zone": "UTC"})).unwrap_err();
         assert!(e.contains("`time_zone`"), "{e}");
         let e = sched(json!({"after_jobs": ["x"]})).unwrap_err();
         assert!(e.contains("`after_jobs`"), "{e}");
+        let e = sched(json!({"set_in_app": "cron 0 6 * * *", "note": "omit schedule in update_job to keep it"})).unwrap_err();
+        assert!(e.contains("omit `schedule` to keep it"), "{e}");
         assert!(refuse_unknown(&json!({"job": "j", "steps": [], "rename": {}}), &["job", "name", "steps", "schedule", "rename"], "update_job").is_ok());
         let e = refuse_unknown(&json!({"name": "j", "steps": [], "limits": {}}), &["name", "steps", "schedule"], "create_job").unwrap_err().to_string();
         assert!(e.contains("create_job") && e.contains("`limits`"), "{e}");
@@ -1274,6 +1515,32 @@ mod tests {
     #[test]
     fn finds_results_references() {
         assert_eq!(results_refs("select * from results.a join RESULTS.\"b\" x, myresults.c, results.a"), vec!["a", "b"]);
+    }
+
+    /// `"schedule": null` keeps the schedule (as omitting it does); any other
+    /// value that isn't an object is refused, not read as "no schedule".
+    #[test]
+    fn a_null_schedule_keeps_it_and_other_values_are_refused() {
+        let c = conns();
+        let args = json!({"name": "j", "steps": [{"name": "orders", "connection": "Sales PG", "sql": "select 1"}]});
+        let (mut old, _) = build_job(&args, &c, &HashSet::new()).unwrap();
+        old.nodes[0].id = "n0".into();
+        old.schedule = JobSchedule { enabled: true, mode: ScheduleMode::Cron, cron: "0 6 * * 1-5".into(), ..Default::default() };
+        let mut upd = json!({"job": "j", "steps": [{"name": "orders", "connection": "Sales PG", "sql": "select 1"}], "schedule": null});
+        let (new, _) = merge_job(&old, &upd, &c, &HashSet::new()).unwrap();
+        assert_eq!(new.schedule, old.schedule);
+        assert!(changes(&old, &new).is_empty(), "{:?}", changes(&old, &new));
+        for bad in [json!(false), json!("off"), json!(0), json!([]), json!(true)] {
+            upd["schedule"] = bad.clone();
+            let e = merge_job(&old, &upd, &c, &HashSet::new()).unwrap_err().to_string();
+            assert!(e.contains("schedule must be an object"), "{bad}: {e}");
+        }
+        // create_job: null is no schedule; `false` is refused there too.
+        let mut create = args.clone();
+        create["schedule"] = Value::Null;
+        assert!(!build_job(&create, &c, &HashSet::new()).unwrap().0.schedule.enabled);
+        create["schedule"] = json!(false);
+        assert!(build_job(&create, &c, &HashSet::new()).is_err());
     }
 
     /// Where and how a step writes is part of who it belongs to: the

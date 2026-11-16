@@ -27,8 +27,8 @@ mod tests;
 pub use ai::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry};
 pub use ai_scope::{AiCatalog, ScopeRule, scope_allows};
 pub use jobs::{
-    FileFormat, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, JobSummary, LoadMode, NodeRunRecord, NodeRunSummary, RETRY_DELAY, RunLimits,
-    RunLogEntry, ScheduleMode, StepLimits, StepOwner, StepProgress, duration_text, retry_delay,
+    FileFormat, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, JobSummary, LoadMode, MissedRuns, NodeRunRecord, NodeRunSummary, RETRY_DELAY,
+    RunLimits, RunLogEntry, ScheduleMode, StepLimits, StepOwner, StepProgress, duration_text, retry_delay,
 };
 pub use knowledge::{
     ImportAction, ImportItem, ImportKind, IndexDelta, KnHit, KnNote, KnObject, KnState, NoteEntry, NoteStatus, NotesFile, NotesSource, join_target,
@@ -150,6 +150,9 @@ impl Workspace {
         }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let ws = Self { conn: Mutex::new(conn) };
+        // A workspace a development build upgraded to an earlier draft of
+        // v22 (it changed before it was released): brought to the final one.
+        ws.repair_v22()?;
         // Best effort: a failure must not keep the workspace from opening.
         let _ = ws.redact_kept_sql();
         let _ = ws.redact_kept_transcripts();

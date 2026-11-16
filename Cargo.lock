@@ -2175,6 +2175,7 @@ name = "databrain-workspace"
 version = "0.4.2"
 dependencies = [
  "chrono",
+ "chrono-tz 0.10.4",
  "databrain-auth",
  "databrain-connector-core",
  "parking_lot",

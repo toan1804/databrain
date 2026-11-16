@@ -188,7 +188,7 @@ export function JobsPanel() {
               </div>
               <div className="mt-0.5 flex flex-wrap items-center gap-x-2 pl-5 text-[10.5px] text-muted">
                 <span>{j.node_count} steps</span>
-                <span>{scheduleText(j.schedule)}</span>
+                <span>{scheduleText(j.schedule, (id) => jobs.find((x) => x.id === id)?.name)}</span>
                 {elsewhere[j.id] && !isRunning && (
                   <span className="text-accent" title="The background runner is running it now (Settings → Jobs)">
                     running in background

@@ -11,6 +11,8 @@ workspace = true
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+# Already built for arrow (connector-core): no new crate or size.
+chrono-tz = "0.10.4"
 databrain-auth = { version = "0.4.2", path = "../auth" }
 databrain-connector-core = { version = "0.4.2", path = "../connector-core" }
 parking_lot = "0.12.5"

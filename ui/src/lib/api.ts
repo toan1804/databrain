@@ -373,6 +373,12 @@ export const api = {
   revealLogs: () => call<void>("reveal_logs"),
   /** Log of one run of a job, oldest first. */
   jobRunLog: (id: string, runId: number) => call<RunLogEntry[]>("job_run_log", { id, runId }),
+  /** Why a cron expression can't be a job's schedule (what a save says), or null. */
+  checkJobCron: (cron: string) => call<string | null>("check_job_cron", { cron }),
+  /** Why a time zone can't be a job's, or null. */
+  checkJobTimeZone: (timeZone: string) => call<string | null>("check_job_time_zone", { timeZone }),
+  /** The IANA time zone names a job may use. */
+  jobTimeZones: () => call<string[]>("job_time_zones"),
   jobRuns: (id: string, limit?: number) => call<JobRun[]>("job_runs", { id, limit: limit ?? null }),
   listNotebooks: () => call<NotebookSummary[]>("list_notebooks"),
   getNotebook: (id: string) => call<Notebook>("get_notebook", { id }),

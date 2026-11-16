@@ -40,11 +40,51 @@ impl ToolContext {
         Ok(job)
     }
 
+    /// The jobs that run after `job` when it succeeds (transitively, each
+    /// once): those the assistant may see, and how many it may not.
+    fn followers(&self, job: &databrain_workspace::Job) -> (Vec<databrain_workspace::Job>, usize) {
+        let ws = self.engine.workspace();
+        let (mut seen, mut shown, mut hidden) = (vec![job.id.clone()], Vec::new(), 0);
+        let mut next = vec![job.id.clone()];
+        while let Some(id) = next.pop() {
+            for (f, _) in ws.jobs_after(&id).unwrap_or_default() {
+                if seen.contains(&f) {
+                    continue;
+                }
+                seen.push(f.clone());
+                match ws.get_job(&f) {
+                    Ok(j) if self.job_visible(&j) => shown.push(j),
+                    _ => hidden += 1,
+                }
+                next.push(f);
+            }
+        }
+        (shown, hidden)
+    }
+
+    /// "Runs after it succeeds: …" for [`Self::followers`], or empty.
+    fn followers_text(&self, job: &databrain_workspace::Job, lead: &str) -> String {
+        let (shown, hidden) = self.followers(job);
+        if shown.is_empty() && hidden == 0 {
+            return String::new();
+        }
+        let mut parts: Vec<String> = shown.iter().map(|j| format!("\"{}\"", j.name)).collect();
+        if hidden > 0 {
+            parts.push(format!("{hidden} other job(s) the assistant can't see"));
+        }
+        format!("{lead}{}.", parts.join(", "))
+    }
+
     pub(super) fn get_job(&self, args: &Value) -> Result<ToolOutput> {
         let job = self.find_job(arg(args, "job")?)?;
         let ws = self.engine.workspace();
         let refs = self.conn_refs()?;
         let mut text = crate::jobs::describe(&job, &refs);
+        let after = self.followers_text(&job, "When it succeeds, these jobs run after it: ");
+        if !after.is_empty() {
+            text.push_str(&after);
+            text.push('\n');
+        }
         // Latest run: what failed, with the statement (to fix it).
         if let Some(run) = ws.job_runs(&job.id, 1)?.into_iter().next() {
             text.push_str(&format!("\nLatest run ({}, {}){}\n", run.trigger, run.status, run.error.as_deref().map(|e| format!(": {e}")).unwrap_or_default()));
@@ -109,22 +149,45 @@ impl ToolContext {
         }
         let scope = if want.is_empty() { "all steps".to_string() } else { format!("steps {}", want.join(", ")) };
         self.learn_job_defaults(&job).await;
-        let decision = self.review_job(&job, &only_ids, "Run a job")?;
-        // What a run changes: loads write tables, exports write files.
-        let writes: Vec<String> = job
-            .nodes
-            .iter()
-            .filter(|n| only_ids.is_empty() || only_ids.contains(&n.id))
-            .filter_map(|n| match n.kind {
-                databrain_workspace::JobNodeKind::Load => Some(format!("{} loads into {}", n.name, n.target_table.as_deref().unwrap_or("a table"))),
-                databrain_workspace::JobNodeKind::Export => Some(format!("{} writes a {} file", n.name, n.export_format.extension())),
-                _ => None,
-            })
-            .collect();
+        let confirm = crate::jobs::review(&self.engine, &job, &only_ids)?;
+        // What a run changes: loads write tables, exports write files, and
+        // queries that aren't plain reads may change data.
+        let writes_of = |j: &databrain_workspace::Job, only: &[String], prefix: &str| -> Vec<String> {
+            j.nodes
+                .iter()
+                .filter(|n| only.is_empty() || only.contains(&n.id))
+                .filter_map(|n| crate::jobs::step_writes(&self.engine, n))
+                .map(|w| format!("{prefix}{w}"))
+                .collect()
+        };
+        let mut writes = writes_of(&job, &only_ids, "");
+        // A whole run that succeeds starts the jobs that run after it, under
+        // the AI rules too (the job runner passes the AI origin on), with no
+        // one to ask: a step the rules refuse, or that needs the user's
+        // approval, fails there while the job's other steps run. Said per
+        // step for the jobs the assistant can see; counted for the others.
+        let mut after = String::new();
+        let mut refused = Vec::new();
+        if only_ids.is_empty() {
+            let (shown, hidden) = self.followers(&job);
+            after = self.followers_text(&job, " When it succeeds, these jobs run after it, under the same AI rules: ");
+            for f in &shown {
+                self.learn_job_defaults(f).await;
+                for p in crate::jobs::follower_problems(&self.engine, f) {
+                    refused.push(format!("job \"{}\" runs, but its {p}, so that step fails (its other steps still run)", f.name));
+                }
+                writes.extend(writes_of(f, &[], &format!("job \"{}\": ", f.name)));
+            }
+            if hidden > 0 {
+                writes.push(format!("{hidden} other job(s) (not shown) also run and may change data; any of their steps that would need your approval fails"));
+            }
+        }
+        let decision = if confirm.is_empty() { Decision::Ask("Run a job".into()) } else { Decision::Confirm(confirm.join("; ")) };
         let preview = format!(
-            "Runs {scope} of \"{}\".{}\n\n{}",
+            "Runs {scope} of \"{}\".{}{after}{}\n\n{}",
             job.name,
             if writes.is_empty() { " It only reads data.".to_string() } else { format!(" It changes data: {}.", writes.join("; ")) },
+            refused.iter().map(|r| format!(" {r}.")).collect::<String>(),
             crate::jobs::describe(&job, &refs)
         );
         self.gate("run_job", decision, &format!("\"{}\" ({scope})", job.name), &json!({"preview": preview, "name": job.name})).await?;

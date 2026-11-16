@@ -13,6 +13,8 @@ import type { JobEdge } from "./bindings/JobEdge";
 import type { JobSchedule } from "./bindings/JobSchedule";
 import type { RunLimits } from "./bindings/RunLimits";
 import type { StepLimits } from "./bindings/StepLimits";
+import type { MissedRuns } from "./bindings/MissedRuns";
+import type { ScheduleMode } from "./bindings/ScheduleMode";
 import type { Job } from "./bindings/Job";
 import type { JobSummary } from "./bindings/JobSummary";
 import type { NodeRunRecord } from "./bindings/NodeRunRecord";
@@ -199,6 +201,8 @@ export type {
   JobSchedule,
   RunLimits,
   StepLimits,
+  MissedRuns,
+  ScheduleMode,
   Job,
   JobSummary,
   NodeRunRecord,

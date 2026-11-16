@@ -4,9 +4,10 @@ import type { ParamValue } from "./ParamValue";
 
 export type JobRun = { id: number, job_id: string, 
 /**
- * "manual", "schedule" or "ai" (the assistant, after approval).
+ * "manual", "schedule" or "ai" (the assistant, after approval), …, or
+ * "after:<job name>" (started when that job succeeded).
  */
-trigger: "manual" | "schedule" | "ai" | "resume" | "background" | "cli", started_at: number, finished_at?: number | null, 
+trigger: "manual" | "schedule" | "ai" | "resume" | "background" | "cli" | `after:${string}`, started_at: number, finished_at?: number | null, 
 /**
  * "running", "success", "error", "cancelled".
  */
@@ -14,4 +15,10 @@ status: "running" | "success" | "error" | "cancelled", nodes: Array<NodeRunRecor
 /**
  * `:name` values the steps got (a resume runs with the same).
  */
-params?: { [key in string]?: ParamValue }, };
+params?: { [key in string]?: ParamValue }, 
+/**
+ * Every step runs under the AI rules (`Origin::Ai`) though the trigger
+ * isn't `ai`: a "run after" start from a run the assistant started
+ * (or from such a run, in turn).
+ */
+ai?: boolean, };

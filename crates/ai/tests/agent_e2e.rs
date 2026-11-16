@@ -1344,6 +1344,24 @@ async fn creates_a_job_across_connections() {
     extra["limits"] = json!({"retries": 3});
     let e = c.call("update_job", &extra).await.content;
     assert!(e.contains("`limits`"), "{e}");
+
+    // The jobs that run after it (in turn too) are named where it may see
+    // them, counted where it may not; a run's approval names them as well.
+    let follow = |name: &str, conn: &str| json!({"name": name, "steps": [{"name": format!("{}_step", name.to_lowercase().replace(' ', "_")), "connection": conn, "sql": "select 1 as x"}]});
+    assert!(c.call("create_job", &follow("Follower A", &profile.name)).await.content.starts_with("Created job"));
+    assert!(c.call("create_job", &follow("Hidden one", "Shop copy")).await.content.starts_with("Created job"));
+    let id_of = |name: &str| f.ws.list_jobs().unwrap().into_iter().find(|j| j.name == name).unwrap().id;
+    for (name, after) in [("Follower A", j.id.clone()), ("Hidden one", id_of("Follower A"))] {
+        let mut x = f.ws.get_job(&id_of(name)).unwrap();
+        x.schedule.after_jobs = vec![after];
+        f.ws.save_job(x).unwrap();
+    }
+    let mut shop = f.ws.list_connections().unwrap().into_iter().find(|p| p.name == "Shop copy").unwrap();
+    shop.ai_policy.ai_enabled = false;
+    f.ws.save_connection(shop).unwrap();
+    let g = c.call("get_job", &json!({"job": "Revenue by country"})).await.content;
+    assert!(g.contains("these jobs run after it: \"Follower A\", 1 other job(s) the assistant can't see."), "{g}");
+    assert!(!g.contains("Hidden one"), "{g}");
 }
 
 /// The assistant's steps can't take a name the user's notebooks (or query
@@ -2055,4 +2073,101 @@ async fn approvals_only_the_user_may_give_are_marked() {
     assert!(asked[1].get("only_user").is_none(), "{:?}", asked[1]);
     // The connection is named by id too (names aren't unique).
     assert_eq!(asked[1]["connection_id"], json!(f.conn));
+}
+
+/// run_job's approval covers the jobs that run after it: what they change
+/// is listed, a follower whose steps the AI rules refuse is said to not run,
+/// and followers the assistant can't see are counted (not named) as possibly
+/// changing data. A run of chosen steps starts no followers: none listed.
+#[tokio::test]
+async fn run_job_approval_covers_the_jobs_after_it() {
+    struct Recorder(Mutex<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl ToolHost for Recorder {
+        async fn approve(&self, _tool: &str, _summary: &str, detail: &Value) -> Option<Value> {
+            self.0.lock().push(detail.clone());
+            None
+        }
+    }
+    let f = fixture(1, AiPolicy::default()).await;
+    let profile = f.ws.get_connection(&f.conn).unwrap();
+    let hidden_conn =
+        f.ws.save_connection(ConnectionProfile {
+            id: String::new(),
+            name: "Hidden".into(),
+            ai_policy: AiPolicy { ai_enabled: false, ..AiPolicy::default() },
+            ..profile.clone()
+        })
+        .unwrap()
+        .id;
+    let job = |name: &str, after: &[&str], nodes: Value, edges: Value| -> databrain_workspace::Job {
+        let mut j: databrain_workspace::Job = serde_json::from_value(json!({"name": name, "nodes": nodes, "edges": edges})).unwrap();
+        j.schedule.after_jobs = after.iter().map(|s| s.to_string()).collect();
+        f.ws.save_job(j).unwrap()
+    };
+    let lead = job("Lead", &[], json!([{"id": "a", "name": "lead_rows", "kind": "query", "connection_id": f.conn, "sql": "select 1 as x"}]), json!([]));
+    let next = job(
+        "Next",
+        &[&lead.id],
+        json!([
+            {"id": "b", "name": "next_rows", "kind": "query", "connection_id": f.conn, "sql": "select 2 as y"},
+            {"id": "c", "name": "next_file", "kind": "export", "sql": "select * from results.next_rows"}
+        ]),
+        json!([{"from": "b", "to": "c"}]),
+    );
+    job("Writes", &[&next.id], json!([{"id": "d", "name": "next_delete", "kind": "query", "connection_id": f.conn, "sql": "delete from orders"}]), json!([]));
+    job("Secret one", &[&lead.id], json!([{"id": "e", "name": "secret_rows", "kind": "query", "connection_id": hidden_conn, "sql": "select 3"}]), json!([]));
+    let host = Arc::new(Recorder(Mutex::new(vec![])));
+    let ctx = databrain_ai::ToolContext {
+        engine: f.engine.clone(),
+        hub: f.hub.clone(),
+        profile,
+        session_id: Some("s".into()),
+        caller: databrain_ai::Caller::Agent,
+        host: host.clone(),
+        cancel: Default::default(),
+        results: Mutex::new(vec![]),
+        provider_id: None,
+    };
+    ctx.call("run_job", &json!({"job": "Lead"})).await;
+    let asked = host.0.lock().clone();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    let p = asked[0]["preview"].as_str().unwrap();
+    assert!(p.contains("these jobs run after it, under the same AI rules: \"Next\", \"Writes\", 1 other job(s) the assistant can't see"), "{p}");
+    // A query that isn't a plain read counts as changing data, also in a follower.
+    assert!(p.contains("job \"Next\": next_file writes a csv file"), "{p}");
+    assert!(p.contains("job \"Writes\": next_delete may change data on"), "{p}");
+    assert!(p.contains("1 other job(s) (not shown) also run and may change data"), "{p}");
+    // A refused step fails while its job still runs: said per step.
+    assert!(
+        p.contains("job \"Writes\" runs, but its") && p.contains("step next_delete") && p.contains("so that step fails (its other steps still run)"),
+        "{p}"
+    );
+    assert!(!p.contains("Secret one") && !p.contains("secret_rows"), "a hidden job isn't named: {p}");
+
+    // Only some steps: no followers start, none listed; it only reads.
+    ctx.call("run_job", &json!({"job": "Lead", "steps": ["lead_rows"]})).await;
+    let asked = host.0.lock().clone();
+    let p = asked[1]["preview"].as_str().unwrap();
+    assert!(p.contains("It only reads data.") && !p.contains("run after it") && !p.contains("Next"), "{p}");
+    // A job whose own query writes (where the assistant may write): not "It only reads data".
+    let writable =
+        f.ws.save_connection(ConnectionProfile {
+            id: String::new(),
+            name: "Writable".into(),
+            ai_policy: AiPolicy { allow_write: true, ..AiPolicy::default() },
+            ..f.ws.get_connection(&f.conn).unwrap()
+        })
+        .unwrap()
+        .id;
+    job(
+        "Own write",
+        &[],
+        json!([{"id": "w", "name": "own_delete", "kind": "query", "connection_id": writable, "sql": "delete from orders where 1 = 0"}]),
+        json!([]),
+    );
+    ctx.call("run_job", &json!({"job": "Own write"})).await;
+    let asked = host.0.lock().clone();
+    let p = asked.last().unwrap()["preview"].as_str().unwrap();
+    assert!(!p.contains("It only reads data.") && p.contains("own_delete may change data on"), "{p}");
 }

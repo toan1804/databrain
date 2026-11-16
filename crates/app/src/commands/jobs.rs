@@ -80,6 +80,24 @@ pub(crate) async fn job_run_log(state: State<'_, AppState>, id: String, run_id: 
     api::job_run_log(&state, &id, run_id)
 }
 
+/// Why a cron expression can't be a job's schedule (what a save would say), or none.
+#[tauri::command]
+pub(crate) fn check_job_cron(cron: String) -> Option<String> {
+    databrain_workspace::jobs::cron_problem(&cron)
+}
+
+/// Why a time zone can't be a job's, or none.
+#[tauri::command]
+pub(crate) fn check_job_time_zone(time_zone: String) -> Option<String> {
+    databrain_workspace::jobs::time_zone_problem(&time_zone)
+}
+
+/// The IANA time zone names a job may use.
+#[tauri::command]
+pub(crate) fn job_time_zones() -> Vec<&'static str> {
+    databrain_workspace::jobs::time_zone_names()
+}
+
 #[tauri::command]
 pub(crate) async fn job_runs(state: State<'_, AppState>, id: String, limit: Option<i64>) -> R<Vec<databrain_workspace::JobRun>> {
     api::job_runs(&state, &id, limit)

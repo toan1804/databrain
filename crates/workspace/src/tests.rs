@@ -157,8 +157,9 @@ fn schema_version_guard_and_backup() {
     // definitions): backed up as it was, then updated.
     {
         let c = Connection::open(&path).unwrap();
-        c.pragma_update(None, "user_version", (MIGRATIONS.len() - 2) as i64).unwrap();
-        c.execute_batch("DROP TABLE meta_views;").unwrap();
+        c.pragma_update(None, "user_version", (MIGRATIONS.len() - 3) as i64).unwrap();
+        // Undo v22 and v21.
+        c.execute_batch("DROP TABLE job_after_pending; ALTER TABLE job_runs DROP COLUMN ai; DROP TABLE meta_views;").unwrap();
         // Undo v20, as an older version left it: schema `s`
         // indexed in full (index scope `*`), `hr.teams` indexed on its own,
         // and `hr.salaries` only seen in the explorer.
@@ -196,7 +197,7 @@ fn schema_version_guard_and_backup() {
     let backup = dir.join(format!("workspace.db.bak-before-v{}", MIGRATIONS.len()));
     let b = Connection::open(&backup).unwrap();
     let bv: i64 = b.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(bv as usize, MIGRATIONS.len() - 2, "the backup is the workspace before the update");
+    assert_eq!(bv as usize, MIGRATIONS.len() - 3, "the backup is the workspace before the update");
     drop((ws, b));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -522,4 +523,42 @@ fn a_server_move_forgets_the_index_scope_and_asks() {
     assert!(ws.ai_index_must_choose(&p.id), "the next index asks");
     ws.ai_index_chosen(&p.id).unwrap();
     assert!(!ws.ai_index_must_choose(&p.id));
+}
+
+/// A workspace a development build upgraded to an earlier draft of v22
+/// (the run-after queue keyed by job only, no `ai` columns) is brought to
+/// the final v22 when opened: its queued starts are kept and queueing works
+/// again. One already at the final v22 is left alone.
+#[test]
+fn an_earlier_draft_of_v22_is_repaired() {
+    let dir = std::env::temp_dir().join(format!("dbtest-ws-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("workspace.db");
+    drop(Workspace::open(&path).unwrap());
+    {
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch(
+            "DROP TABLE job_after_pending; \
+             CREATE TABLE job_after_pending (job_id TEXT PRIMARY KEY, after TEXT NOT NULL, added_at INTEGER NOT NULL); \
+             INSERT INTO job_after_pending VALUES ('j1', 'Extract', 5); \
+             ALTER TABLE job_runs DROP COLUMN ai;",
+        )
+        .unwrap();
+    }
+    let ws = Workspace::open(&path).unwrap();
+    // The old queued start is kept, as the user's.
+    assert_eq!(ws.take_job_after("j1").unwrap(), Some(("Extract".to_string(), false)));
+    // Queueing works: a user's and an assistant's start of one job are kept apart.
+    ws.queue_job_after("j2", "A", false).unwrap();
+    ws.queue_job_after("j2", "A", true).unwrap();
+    ws.queue_job_after("j2", "A", true).unwrap();
+    let n: i64 = ws.conn.lock().query_row("SELECT count(*) FROM job_after_pending WHERE job_id = 'j2'", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 2);
+    let has: i64 = ws.conn.lock().query_row("SELECT count(*) FROM pragma_table_info('job_runs') WHERE name = 'ai'", [], |r| r.get(0)).unwrap();
+    assert_eq!(has, 1, "job_runs.ai");
+    drop(ws);
+    // At the final v22: opening again changes nothing.
+    let ws = Workspace::open(&path).unwrap();
+    let n: i64 = ws.conn.lock().query_row("SELECT count(*) FROM job_after_pending", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 2);
 }
