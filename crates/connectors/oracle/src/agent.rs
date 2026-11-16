@@ -111,35 +111,47 @@ pub fn built_from_source() -> Option<PathBuf> {
 /// An installed helper, if any: `DATABRAIN_ORACLE_AGENT`, the one built
 /// from this source tree, then the download folder.
 pub fn installed() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("DATABRAIN_ORACLE_AGENT").and_then(|p| trusted_override(Path::new(&p), cfg!(debug_assertions))) {
+    let d = DIR.read().unwrap().clone();
+    if let Some(p) = std::env::var_os("DATABRAIN_ORACLE_AGENT").and_then(|p| trusted_override(Path::new(&p), cfg!(debug_assertions), d.as_deref())) {
         return Some(p);
     }
     if let Some(p) = built_from_source() {
         return Some(p);
     }
-    let d = DIR.read().unwrap().clone()?;
-    installed_in(&d)
+    installed_in(&d?)
 }
 
 /// A helper named by `DATABRAIN_ORACLE_AGENT`: any file in a development
 /// build (`dev`); in a release, only the published helper of this release
 /// (its SHA-256 in SHA256SUMS), so the variable can't make DataBrain start
 /// another program and hand it the connection's password.
-fn trusted_override(p: &Path, dev: bool) -> Option<PathBuf> {
-    if !p.is_file() {
+///
+/// In a release the file is read once, its bytes checked, and a copy of
+/// those bytes put in DataBrain's own download folder (`root`), which is
+/// what starts (checked again there, as a download is): the named file
+/// could be changed between the check and the start. A link is refused.
+fn trusted_override(p: &Path, dev: bool, root: Option<&Path>) -> Option<PathBuf> {
+    if dev {
+        return p.is_file().then(|| p.to_path_buf());
+    }
+    if !std::fs::symlink_metadata(p).ok()?.is_file() {
+        tracing::warn!(path = %p.display(), "DATABRAIN_ORACLE_AGENT is not a plain file; not starting it");
         return None;
     }
-    if dev {
-        return Some(p.to_path_buf());
+    let file = file_name();
+    let want = expected_sha256(&file)?;
+    let bin = std::fs::read(p).ok()?;
+    if sha256_hex(&bin) != want {
+        tracing::warn!(path = %p.display(), "DATABRAIN_ORACLE_AGENT is not this release's Oracle driver (SHA-256); not starting it");
+        return None;
     }
-    let want = expected_sha256(&file_name())?;
-    match std::fs::read(p) {
-        Ok(bin) if sha256_hex(&bin) == want => Some(p.to_path_buf()),
-        _ => {
-            tracing::warn!(path = %p.display(), "DATABRAIN_ORACLE_AGENT is not this release's Oracle driver (SHA-256); not starting it");
-            None
-        }
+    // It is the published helper: the copy of the bytes just checked starts.
+    let root = root?;
+    if let Some(installed) = installed_in(root) {
+        return Some(installed);
     }
+    write_helper(&root.join(RELEASE), &file, &bin).ok()?;
+    installed_in(root)
 }
 
 /// The helper in the download folder `root`, checked against SHA256SUMS
@@ -621,9 +633,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let other = dir.join("not-the-helper");
         std::fs::write(&other, b"#!/bin/sh\necho hi\n").unwrap();
-        assert_eq!(trusted_override(&other, true).as_deref(), Some(other.as_path()), "development: used");
-        assert_eq!(trusted_override(&other, false), None, "release: not the published helper");
-        assert_eq!(trusted_override(&dir.join("missing"), true), None);
+        let root = dir.join("downloads");
+        assert_eq!(trusted_override(&other, true, Some(&root)).as_deref(), Some(other.as_path()), "development: used");
+        assert_eq!(trusted_override(&other, false, Some(&root)), None, "release: not the published helper");
+        assert_eq!(trusted_override(&dir.join("missing"), true, Some(&root)), None);
+        #[cfg(unix)]
+        {
+            // A link is refused in a release, whatever it points at.
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&other, &link).unwrap();
+            assert_eq!(trusted_override(&link, false, Some(&root)), None);
+        }
+        assert!(!root.exists(), "nothing copied for a file that isn't the helper");
         let _ = std::fs::remove_dir_all(&dir);
     }
     use tokio::io::AsyncReadExt;
