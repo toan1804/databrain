@@ -111,7 +111,7 @@ impl Connector for MongoConnector {
         }
         let database = cfg.database.clone().filter(|d| !d.trim().is_empty()).or_else(|| o.default_database.clone());
         let client = mongodb::Client::with_options(o).map_err(err)?;
-        let s = MongoSession { client, database };
+        let s = MongoSession { client, database, tags: Default::default() };
         // Fail now (wrong host, password…) rather than on the first query.
         s.ping().await?;
         Ok(Box::new(s))
@@ -132,6 +132,50 @@ pub struct MongoSession {
     client: mongodb::Client,
     /// The connection's database (`db.` refers to it).
     database: Option<String>,
+    /// Whether the server takes a `comment` on every command (4.4+), so a
+    /// command can be found and stopped on the server; read once.
+    tags: Arc<tokio::sync::OnceCell<bool>>,
+}
+
+/// A command's `comment` (a unique tag) when the server takes one on every
+/// command and the user didn't write their own: Stop finds the command by it.
+fn tag_command(cmd: &mut Document, tag: &str, tags: bool) {
+    if tags && !cmd.contains_key("comment") {
+        cmd.insert("comment", tag);
+    }
+}
+
+/// Stop the commands tagged `tag` on the server: found among this user's own
+/// operations (`$currentOp`; a `getMore` of its cursor carries the tag of
+/// the command that opened it) and killed (`killOp`; a user may always
+/// kill their own operations). Best effort, a few seconds at most.
+async fn kill_tagged(client: &mongodb::Client, tag: &str) {
+    let admin = client.database("admin");
+    let find = async {
+        let pipeline = vec![
+            doc! {"$currentOp": {"allUsers": false, "idleConnections": false}},
+            doc! {"$match": {"$or": [{"command.comment": tag}, {"cursor.originatingCommand.comment": tag}, {"originatingCommand.comment": tag}]}},
+        ];
+        let mut ops = Vec::new();
+        if let Ok(mut cur) = admin.aggregate(pipeline).await {
+            while let Some(Ok(op)) = cur.next().await {
+                if let Some(id) = op.get("opid") {
+                    ops.push(id.clone());
+                }
+            }
+        }
+        for id in ops {
+            let _ = admin.run_command(doc! {"killOp": 1, "op": id}).await;
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), find).await;
+}
+
+/// Whether the server takes `comment` on every command (MongoDB 4.4+).
+async fn takes_comments(client: &mongodb::Client) -> bool {
+    let Ok(d) = client.database("admin").run_command(doc! {"buildInfo": 1}).await else { return false };
+    let v: Vec<u32> = d.get_str("version").unwrap_or("0").split('.').filter_map(|p| p.parse().ok()).collect();
+    (v.first().copied().unwrap_or(0), v.get(1).copied().unwrap_or(0)) >= (4, 4)
 }
 
 impl MongoSession {
@@ -201,9 +245,18 @@ async fn emit(tx: &StreamSender, evs: Vec<StreamEvent>) -> bool {
     true
 }
 
-async fn run(s: &MongoSession, text: &str, opts: &ExecOptions, tx: &StreamSender) -> Result<()> {
-    let plan = shell::parse(text, opts.max_rows).map_err(ConnectorError::query)?;
+/// Resolves when nobody reads the stream any more.
+async fn receiver_gone(tx: &StreamSender) {
+    while !tx.is_closed() {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn run(s: &MongoSession, text: &str, opts: &ExecOptions, tx: &StreamSender, tag: &str) -> Result<()> {
+    let mut plan = shell::parse(text, opts.max_rows).map_err(ConnectorError::query)?;
     let db = s.db(plan.db.as_deref())?;
+    let tags = *s.tags.get_or_init(|| takes_comments(&s.client)).await;
+    tag_command(&mut plan.command, tag, tags);
     let mut rows = RowBatcher::new(opts.batch_size);
     let max = opts.max_rows.unwrap_or(usize::MAX);
     match plan.output {
@@ -301,12 +354,23 @@ impl Session for MongoSession {
     async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
         let sql = stmt.sql();
         let (tx, stream) = QueryStream::channel(4);
-        let s = MongoSession { client: self.client.clone(), database: self.database.clone() };
+        let s = MongoSession { client: self.client.clone(), database: self.database.clone(), tags: self.tags.clone() };
         let text = sql.to_string();
         tokio::spawn(async move {
+            // Its tag on the server: Stop (or nobody reading any more) stops
+            // the command there, not only here (a dropped open cursor is
+            // killed by the driver).
+            let tag = format!("databrain:{}", mongodb::bson::oid::ObjectId::new().to_hex());
             let r = tokio::select! {
-                r = run(&s, &text, &opts, &tx) => r,
-                _ = opts.cancel.cancelled() => Err(ConnectorError::cancelled()),
+                r = run(&s, &text, &opts, &tx, &tag) => r,
+                _ = opts.cancel.cancelled() => {
+                    kill_tagged(&s.client, &tag).await;
+                    Err(ConnectorError::cancelled())
+                }
+                _ = receiver_gone(&tx) => {
+                    kill_tagged(&s.client, &tag).await;
+                    return;
+                }
             };
             if let Err(e) = r {
                 tx.send_err(e).await;
@@ -453,6 +517,111 @@ mod tests {
         assert_eq!(r[2].1.value, Value::TimestampTz(1_000_000));
         assert_eq!(r[3].1, Cell::new(Value::Text("[\"a\"]".into()), "array"));
         assert_eq!(r[4].1.value, Value::Text("{\"city\":\"HN\"}".into()));
+    }
+
+    /// A command is tagged so Stop can find it on the server: not when the
+    /// user wrote a comment, nor on a server before 4.4 (it refuses a
+    /// comment on most commands).
+    #[test]
+    fn commands_are_tagged_for_stop() {
+        let mut c = doc! {"find": "people", "filter": {}};
+        tag_command(&mut c, "databrain:1", true);
+        assert_eq!(c.get_str("comment").unwrap(), "databrain:1");
+        let mut c = doc! {"find": "people", "comment": "mine"};
+        tag_command(&mut c, "databrain:1", true);
+        assert_eq!(c.get_str("comment").unwrap(), "mine");
+        let mut c = doc! {"count": "people"};
+        tag_command(&mut c, "databrain:1", false);
+        assert!(!c.contains_key("comment"));
+    }
+
+    /// Live: Stop ends the command on the server (it ran on before, its
+    /// future only dropped here); a finished command is left alone.
+    #[ignore = "live: needs DATABRAIN_MONGO_URI (cargo test -- --ignored)"]
+    #[tokio::test]
+    async fn live_stop_ends_the_command_on_the_server() {
+        let Ok(uri) = std::env::var("DATABRAIN_MONGO_URI") else {
+            panic!("live test: DATABRAIN_MONGO_URI not set (run with --ignored)");
+        };
+        use databrain_auth::{AuthMethod, InlineCredentialSource};
+        let mut cfg = ConnectionConfig::new(ConnectorKind::Mongodb, AuthMethod::None);
+        cfg.options.insert("uri".into(), uri.clone());
+        cfg.database = Some("databrain_stop".into());
+        let s = MongoConnector.connect(&cfg, Arc::new(InlineCredentialSource::new(AuthMethod::None, None))).await.unwrap();
+        let q = |t: &'static str| {
+            let s = &s;
+            async move { s.execute(databrain_connector_core::Statement::internal(t), ExecOptions::default()).await.unwrap().collect().await }
+        };
+        q("db.slow.drop()").await.ok();
+        q("db.slow.insertMany([{a: 1}, {a: 2}, {a: 3}, {a: 4}, {a: 5}, {a: 6}, {a: 7}, {a: 8}, {a: 9}, {a: 10}])").await.unwrap();
+        // 10 documents, 2 s each: 20 s on the server.
+        let cancel = databrain_connector_core::CancellationToken::new();
+        let stream = s
+            .execute(
+                databrain_connector_core::Statement::internal("db.slow.find({$where: 'sleep(2000) || true'})"),
+                ExecOptions { cancel: cancel.clone(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
+        // The find's operations on the server, and whether each is being killed.
+        let ops = || async {
+            let mut cur = client
+                .database("admin")
+                .aggregate(vec![doc! {"$currentOp": {"allUsers": true}}, doc! {"$match": {"ns": "databrain_stop.slow"}}])
+                .await
+                .unwrap();
+            let mut v = vec![];
+            while let Some(Ok(d)) = cur.next().await {
+                v.push(d.get_bool("killPending").unwrap_or(false));
+            }
+            v
+        };
+        assert_eq!(ops().await.len(), 1, "the find runs");
+        cancel.cancel();
+        let e = tokio::time::timeout(Duration::from_secs(10), stream.collect()).await.expect("stopped").unwrap_err();
+        assert_eq!(e.kind, databrain_connector_core::ErrorKind::Cancelled);
+        // Killed by the time Stop returns (not left for the server to notice
+        // the dropped connection, which many commands never check).
+        assert!(ops().await.iter().all(|killed| *killed), "the find was not killed on the server");
+        let running = || async {
+            let mut cur = client
+                .database("admin")
+                .aggregate(vec![doc! {"$currentOp": {"allUsers": true}}, doc! {"$match": {"ns": "databrain_stop.slow"}}])
+                .await
+                .unwrap();
+            let mut n = 0;
+            while let Some(Ok(_)) = cur.next().await {
+                n += 1;
+            }
+            n
+        };
+        let mut left = running().await;
+        for _ in 0..20 {
+            if left == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            left = running().await;
+        }
+        assert_eq!(left, 0, "the find still runs on the server");
+        // The kill itself, on a command whose connection stays open (the
+        // server never sees it dropped): only killOp by its tag stops it.
+        let other = mongodb::Client::with_uri_str(&uri).await.unwrap();
+        let slow = tokio::spawn(async move {
+            other
+                .database("databrain_stop")
+                .run_command(doc! {"find": "slow", "filter": {"$where": "sleep(2000) || true"}, "comment": "databrain:kept-open"})
+                .await
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        kill_tagged(&client, "databrain:kept-open").await;
+        let r = tokio::time::timeout(Duration::from_secs(5), slow).await.expect("killed on the server, not left to run 20 s").unwrap();
+        assert!(r.is_err_and(|e| e.to_string().to_lowercase().contains("interrupted")));
+        // A command that finished: answered as usual.
+        assert_eq!(q("db.slow.countDocuments({})").await.unwrap().num_rows(), 1);
+        q("db.slow.drop()").await.unwrap();
     }
 
     /// Live test: DATABRAIN_MONGO_URI=mongodb://localhost:27017 cargo test -p databrain-connector-mongodb -- --nocapture
