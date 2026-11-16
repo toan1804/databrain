@@ -532,7 +532,9 @@ impl Session for Neo4jSession {
                             terminate(&graph, &tag).await;
                         } else {
                             while s.next().await.map_err(err)?.is_some() {}
-                            tx.send(StreamEvent::Notice(format!("The statement ran to its end; only its first {max} rows are kept."))).await;
+                            // `max` is the row limit plus one (the engine asks for one more to tell it was cut).
+                            tx.send(StreamEvent::Notice(format!("The statement ran to its end; only its first {} rows are kept.", max.saturating_sub(1))))
+                                .await;
                         }
                         break;
                     }
