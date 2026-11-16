@@ -719,6 +719,65 @@ async fn load_sql_that_controls_the_transaction_is_refused() {
     assert_eq!(count().await, "3");
 }
 
+/// Every failed load says whether it kept nothing (what decides a job
+/// step's retry): yes when it failed before writing or its one transaction
+/// was rolled back; no when its before/after SQL may commit on its own.
+#[tokio::test]
+async fn failed_loads_say_whether_they_kept_nothing() {
+    use databrain_connector_core::arrow::array::Int64Array;
+    use databrain_connector_core::arrow::datatypes::{DataType, Field, Schema};
+    #[derive(Default)]
+    struct Failed(parking_lot::Mutex<Vec<bool>>);
+    impl crate::load::LoadObserver for Failed {
+        fn event(&self, e: crate::load::LoadEvent) {
+            if let crate::load::LoadEvent::Failed { kept_nothing } = e {
+                self.0.lock().push(kept_nothing);
+            }
+        }
+    }
+    let f = fixture(EnvTag::Dev);
+    let s = f.engine.session_for_tests(&f.conn_id).await.unwrap();
+    s.execute(databrain_connector_core::Statement::internal("create table t (id integer)"), Default::default()).await.unwrap().collect().await.unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let batch = databrain_connector_core::arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
+    let rows = crate::load::LoadRows { schema, batches: vec![batch] };
+    let count = || async {
+        let s = f.engine.session_for_tests(&f.conn_id).await.unwrap();
+        databrain_connector_core::query_text(&*s, "select count(*) from t").await.unwrap()[0][0].clone().unwrap()
+    };
+    let (fx, rows) = (&f, &rows);
+    let load = |spec: crate::load::LoadSpec| async move {
+        let obs = Failed::default();
+        let r = fx.engine.load_rows(rows, &fx.conn_id, "l", &spec, &Default::default(), &obs).await;
+        (r, obs.0.into_inner())
+    };
+    let spec = |table: &str, after: Option<&str>| crate::load::LoadSpec {
+        table: table.into(),
+        after_sql: after.map(str::to_string),
+        create_table: false,
+        ..Default::default()
+    };
+    // Rolled back as a whole: kept nothing.
+    let (r, sent) = load(spec("t", Some("update no_such_table set id = 1"))).await;
+    assert!(r.unwrap_err().message.contains("rolled back"));
+    assert_eq!(sent, [true]);
+    assert_eq!(count().await, "0");
+    // Before SQL that may commit on its own (classified Other): it can't say so.
+    let mut maybe = spec("t", Some("update no_such_table set id = 1"));
+    maybe.before_sql = Some("vacuum".into());
+    let (r, sent) = load(maybe).await;
+    assert!(r.is_err());
+    assert_eq!(sent, [false]);
+    // Failed before writing (the table is missing and not created): kept nothing.
+    let (r, sent) = load(spec("missing", None)).await;
+    assert!(r.is_err());
+    assert_eq!(sent, [true]);
+    // A load that succeeds sends no failure.
+    let (r, sent) = load(spec("t", None)).await;
+    assert_eq!(r.unwrap().rows, 3);
+    assert!(sent.is_empty());
+}
+
 /// A load into a production connection asks first, like a run: unconfirmed
 /// it writes nothing (code `needs_confirmation`); a dry run doesn't ask;
 /// confirmed, it loads. A non-production connection doesn't ask.

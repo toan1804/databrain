@@ -7,7 +7,8 @@ import { useStore } from "../../store";
 import { formatDuration, relativeTime } from "../../lib/util";
 import { useJobs } from "../../jobsStore";
 import { RunLog } from "./RunLog";
-import { ProgressBar, StatusIcon, field, label, statusText } from "./shared";
+import { JobLimits } from "./LimitFields";
+import { ProgressBar, StatusIcon, field, label, statusText, type Patch } from "./shared";
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const ORDER = [1, 2, 3, 4, 5, 6, 0];
@@ -24,6 +25,7 @@ function runCounts(r: JobRun): string {
     [n("skipped"), "skipped"],
     [n("cancelled"), "stopped"],
     [n("running"), "running"],
+    [n("waiting"), "waiting"],
   ]
     .filter(([c]) => c)
     .map(([c, w]) => `${c} ${w}`)
@@ -151,7 +153,7 @@ export function JobPanel({
   onResume: () => void;
   /** Run now with other parameter values. */
   onRunWith: (params: RunParams) => void;
-  onChange: (patch: Partial<Job>) => void;
+  onChange: (patch: Patch<Job>) => void;
   onSelect: (id: string) => void;
 }) {
   const summary = useJobs((s) => s.jobs.find((j) => j.id === job.id));
@@ -239,6 +241,8 @@ export function JobPanel({
           </div>
         )}
       </section>
+
+      <JobLimits job={job} onChange={onChange} />
 
       <section className="space-y-2">
         <div className={label}>Runs</div>

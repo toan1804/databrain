@@ -13,11 +13,20 @@
 //! - Export step: the same, then DuckDB writes the rows to a file
 //!   (`COPY … TO`, CSV / Parquet / JSON) in a chosen folder (Downloads by default).
 //!
+//! Limits ([`databrain_workspace::RunLimits`]): a run and each try of a
+//! step may have a time limit (then they are stopped and fail); a step that
+//! lost its connection is tried again after a growing wait when that can't
+//! write twice (reads, exports, a load rolled back as a whole); at most so
+//! many steps run at once, and so many on one connection (the rest wait).
+//!
 //! Runs don't prompt (the job was set up by hand, or approved when the AI
 //! assistant built or ran it: the assistant's policy is checked then);
 //! read-only connections are still refused. SQL the assistant wrote
 //! (`JobNode::ai_sql`), and every step of a run the assistant starts, runs
-//! as its own queries (the DuckDB sandbox applies), whoever starts the run.
+//! as its own queries, whoever starts the run: each step's SQL, a load's
+//! before/after SQL and its write (the DuckDB sandbox on DuckDB targets),
+//! after the connection's AI rules as they are now. SQL DataBrain writes
+//! for a step (an export's COPY, a load's INSERTs) is the job's.
 
 use futures::FutureExt;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -28,7 +37,9 @@ use std::time::{Duration, Instant};
 
 use databrain_query_engine::{EngineError, EventHub, LoadDryRun, LoadEvent, LoadObserver, LoadSpec, QueryEngine, Result, RunRequest};
 use databrain_workspace::jobs::LOG_KEPT;
-use databrain_workspace::{FileFormat, Job, JobNode, JobNodeKind, JobRun, NodeRunRecord, NodeRunSummary, Origin, RunLogEntry, StepProgress, Workspace, now_ms};
+use databrain_workspace::{
+    FileFormat, Job, JobNode, JobNodeKind, JobRun, NodeRunRecord, NodeRunSummary, Origin, RunLogEntry, StepProgress, Workspace, duration_text, now_ms,
+};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -80,6 +91,14 @@ async fn renew_lease(ws: &Workspace, job_id: &str, owner: &str) -> Option<bool> 
     None
 }
 
+/// After a run or a step is stopped (by the user, a time limit, a lost
+/// lease), how long its work has to end before it is left behind: a
+/// statement the database doesn't let go of can't keep the run (and its
+/// lease) alive.
+const STOP_GRACE: Duration = Duration::from_secs(30);
+/// A step whose earlier try, left behind, still runs.
+const STILL_RUNNING: &str = "An earlier try of this step is still running (it didn't stop when asked and was left behind): wait for it to end, or stop it on the server, then run the step again";
+
 /// How long a job's lease lasts; renewed every [`LEASE_RENEW`] while it runs.
 const LEASE_MS: i64 = 90_000;
 const LEASE_RENEW: Duration = Duration::from_secs(20);
@@ -92,6 +111,8 @@ pub struct JobsState {
     /// This process as a job runner (`app:<pid>:<n>` or `cli:<pid>:<n>`):
     /// a job runs in one process at a time (lease in the workspace).
     pub owner: String,
+    /// Wait before a step's first retry (ms; see [`databrain_workspace::retry_delay`]).
+    retry_base_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Default for JobsState {
@@ -104,7 +125,19 @@ impl JobsState {
     /// `kind`: `app` (the desktop app) or `cli` (the background runner).
     pub fn new(kind: &str) -> Self {
         let n = uuid::Uuid::new_v4().simple().to_string();
-        Self { running: Mutex::default(), steps: Mutex::default(), owner: format!("{kind}:{}:{}", std::process::id(), &n[..8]) }
+        Self {
+            running: Mutex::default(),
+            steps: Mutex::default(),
+            owner: format!("{kind}:{}:{}", std::process::id(), &n[..8]),
+            retry_base_ms: (databrain_workspace::RETRY_DELAY.as_millis() as u64).into(),
+        }
+    }
+    /// Change the wait before a step's first retry (tests).
+    pub fn set_retry_delay(&self, d: Duration) {
+        self.retry_base_ms.store(d.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn retry_base(&self) -> Duration {
+        Duration::from_millis(self.retry_base_ms.load(std::sync::atomic::Ordering::Relaxed))
     }
     pub fn is_running(&self, job_id: &str) -> bool {
         self.running.lock().contains_key(job_id)
@@ -216,6 +249,8 @@ pub struct Tracer {
     node: Option<(String, String)>,
     /// `:name` values of the run (or why there are none: its steps fail with it).
     params: Arc<std::result::Result<HashMap<String, ParamValue>, String>>,
+    /// How far the step's load got, for [`retry_refused`].
+    load: Arc<Mutex<LoadState>>,
 }
 
 impl Tracer {
@@ -225,6 +260,7 @@ impl Tracer {
             live: Arc::new(Mutex::new(Live { run, log: Vec::new(), dropped: 0, last_emit: Instant::now() })),
             node: None,
             params: Arc::new(Ok(HashMap::new())),
+            load: Arc::default(),
         }
     }
 
@@ -234,7 +270,24 @@ impl Tracer {
     }
 
     fn for_node(&self, node: &JobNode) -> Self {
-        Tracer { node: Some((node.id.clone(), node.name.clone())), ..self.clone() }
+        Tracer { node: Some((node.id.clone(), node.name.clone())), load: Arc::default(), ..self.clone() }
+    }
+
+    /// Show which try of the step this is ("attempt 2 of 3"), with a fresh start.
+    fn attempt(&self, n: u32, of: u32) {
+        *self.load.lock() = LoadState::NotStarted;
+        let Some((id, _)) = &self.node else { return };
+        let snapshot = {
+            let mut l = self.live.lock();
+            if let Some(r) = l.run.nodes.iter_mut().find(|r| &r.node_id == id) {
+                r.summary.attempt = Some(n);
+                r.summary.attempts = Some(of);
+                r.summary.progress = None;
+            }
+            l.last_emit = Instant::now();
+            l.run.clone()
+        };
+        emit(&self.ctx, &snapshot);
     }
 
     /// Add a line to the log (and send it to the UI).
@@ -324,6 +377,20 @@ impl Tracer {
     }
 }
 
+/// How far a step's load got in its last try. Unsure is not "kept nothing".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LoadState {
+    /// The load wasn't called (the step failed before it).
+    #[default]
+    NotStarted,
+    /// Called, and it reported no failure: it may have written.
+    Started,
+    /// It failed and said it kept nothing ([`LoadEvent::Failed`]).
+    KeptNothing,
+    /// It failed and may have kept some of its writes.
+    MayHaveKept,
+}
+
 impl LoadObserver for Tracer {
     fn event(&self, e: LoadEvent) {
         match e {
@@ -339,6 +406,7 @@ impl LoadObserver for Tracer {
                 Some(e) => self.log("error", format!("{label} failed: {e}"), Some(&sql), None, Some(duration_ms as i64)),
             },
             LoadEvent::Progress { phase, done, total } => self.progress(StepProgress { phase, done, total }),
+            LoadEvent::Failed { kept_nothing } => *self.load.lock() = if kept_nothing { LoadState::KeptNothing } else { LoadState::MayHaveKept },
             LoadEvent::Inserted { label, table, rows, statements, sql, duration_ms, error } => {
                 let batches = format!("{statements} batch{}", if statements == 1 { "" } else { "es" });
                 match error {
@@ -524,6 +592,8 @@ fn record(node: &JobNode, status: &str, started: Option<Instant>, rows: Option<i
             file: None,
             notices: vec![],
             progress: None,
+            attempt: None,
+            attempts: None,
         },
     }
 }
@@ -583,6 +653,31 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
     let mut status: HashMap<String, &'static str> = selected.iter().map(|id| (id.clone(), "pending")).collect();
     let mut set = tokio::task::JoinSet::new();
     let started_run = Instant::now();
+    // Steps at once: in the run, and per connection (`slot_key`).
+    let (max_parallel, max_per_connection) = (job.limits.max_parallel(), job.limits.max_per_connection());
+    let duck_id = ctx.engine.results_connection().ok().map(|c| c.id);
+    let slot_key = |n: &JobNode| -> Option<String> {
+        let c = match n.kind {
+            JobNodeKind::Query => n.connection_id.as_ref(),
+            JobNodeKind::Load => n.target_connection_id.as_ref(),
+            // DuckDB writes the file.
+            JobNodeKind::Export => None,
+        };
+        // The Results DuckDB is in this process: only the run's limit applies.
+        c.filter(|c| !c.is_empty() && Some(*c) != duck_id.as_ref()).cloned()
+    };
+    let mut running = 0usize;
+    let mut per_connection: HashMap<String, usize> = HashMap::new();
+    let mut waiting: HashSet<String> = HashSet::new();
+    // The run's time limit, and when stopped steps are left behind.
+    let run_limit = job.limits.run_timeout();
+    let far = tokio::time::Instant::now() + Duration::from_secs(365 * 86_400);
+    let deadline = run_limit.map(|d| tokio::time::Instant::now() + d);
+    let mut timed_out = false;
+    let mut left_by: Option<tokio::time::Instant> = None;
+    // Steps left behind were aborted: the loop only collects what ended.
+    let mut abandoned = false;
+    let timed_out_text = |d: Duration| format!("the run timed out after {} (the job's time limit)", duration_text(d));
     loop {
         // Start every step whose selected upstreams succeeded; skip those after a failure.
         let mut changed = true;
@@ -594,22 +689,35 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
                 }
                 let ups: Vec<String> = upstream(&n.id).into_iter().filter(|u| selected.contains(u)).collect();
                 let t = tracer.for_node(n);
+                let ready = ups.iter().all(|u| status.get(u) == Some(&"success"));
+                let key = slot_key(n);
+                let busy_connection = key.as_ref().is_some_and(|k| per_connection.get(k).copied().unwrap_or(0) >= max_per_connection);
+                let slot = running < max_parallel && !busy_connection;
                 // The lease is checked (and renewed) before each step: after the
                 // computer slept past it, another runner may have taken the job.
                 // (Only "another runner holds it" stops here; a workspace error
                 // is left to the heartbeat, which stops before the lease could expire.)
-                if !cancel.is_cancelled()
-                    && ups.iter().all(|u| status.get(u) == Some(&"success"))
-                    && renew_lease(&ctx.workspace, &job.id, &ctx.jobs.owner).await == Some(false)
-                {
+                if !cancel.is_cancelled() && ready && slot && renew_lease(&ctx.workspace, &job.id, &ctx.jobs.owner).await == Some(false) {
                     tracer.log("error", LEASE_LOST, None, None, None);
                     cancel.cancel();
                 }
+                // A step waiting for a slot that the user stopped on its own.
+                let stopped_waiting = waiting.contains(&n.id)
+                    && ctx.jobs.steps.lock().get(&(job.id.clone(), n.id.clone())).is_some_and(|t| t.is_cancelled())
+                    && !cancel.is_cancelled();
                 // Stopped: what hasn't run is cancelled, not skipped as if a step failed.
-                let stopped = cancel.is_cancelled() || ups.iter().any(|u| status.get(u) == Some(&"cancelled"));
+                let stopped = cancel.is_cancelled() || stopped_waiting || ups.iter().any(|u| status.get(u) == Some(&"cancelled"));
                 if stopped {
                     status.insert(n.id.clone(), "cancelled");
-                    t.log("warning", "Not started: the run was stopped", None, None, None);
+                    ctx.jobs.steps.lock().remove(&(job.id.clone(), n.id.clone()));
+                    let why = if timed_out {
+                        format!("Not started: {}", timed_out_text(run_limit.unwrap_or_default()))
+                    } else if stopped_waiting {
+                        "Not started: stopped by the user while it waited".into()
+                    } else {
+                        "Not started: the run was stopped".into()
+                    };
+                    t.log("warning", why, None, None, None);
                     t.with_run(|run| {
                         run.nodes.retain(|r| r.node_id != n.id);
                         run.nodes.push(record(n, "cancelled", None, None, None));
@@ -624,17 +732,43 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
                         run.nodes.push(record(n, "skipped", None, None, Some("an upstream step failed".into())));
                     });
                     changed = true;
-                } else if ups.iter().all(|u| status.get(u) == Some(&"success")) {
+                } else if ready && !slot {
+                    // Said once; it starts when a running step ends. Stop works on it
+                    // meanwhile (its token, also used once it runs).
+                    if waiting.insert(n.id.clone()) {
+                        ctx.jobs.steps.lock().entry((job.id.clone(), n.id.clone())).or_insert_with(|| cancel.child_token());
+                        let why = if busy_connection {
+                            let conn = key.as_ref().and_then(|k| ctx.workspace.get_connection(k).ok()).map(|p| p.name).unwrap_or_default();
+                            format!("{max_per_connection} steps are running on {conn} (the job's limit per connection)")
+                        } else {
+                            format!("{max_parallel} steps are running (the job's limit)")
+                        };
+                        t.log("info", format!("Waiting: {why}"), None, None, None);
+                        t.with_run(|run| {
+                            run.nodes.retain(|r| r.node_id != n.id);
+                            run.nodes.push(record(n, "waiting", None, None, Some(why)));
+                        });
+                    }
+                } else if ready {
                     status.insert(n.id.clone(), "running");
+                    running += 1;
+                    if let Some(k) = &key {
+                        *per_connection.entry(k.clone()).or_default() += 1;
+                    }
                     t.log("info", format!("Started ({})", action_text(n)), None, None, None);
-                    t.with_run(|run| run.nodes.push(record(n, "running", None, None, None)));
-                    let (c, node, job_id, job_name, cancel) = (ctx.clone(), n.clone(), job.id.clone(), job.name.clone(), cancel.child_token());
-                    ctx.jobs.steps.lock().insert((job.id.clone(), n.id.clone()), cancel.clone());
+                    t.with_run(|run| {
+                        run.nodes.retain(|r| r.node_id != n.id);
+                        run.nodes.push(record(n, "running", None, None, None));
+                    });
+                    let step_cancel = ctx.jobs.steps.lock().entry((job.id.clone(), n.id.clone())).or_insert_with(|| cancel.child_token()).clone();
+                    let (c, node, job_id, job_name, cancel) = (ctx.clone(), n.clone(), job.id.clone(), job.name.clone(), step_cancel);
                     let ups_names: Vec<String> = upstream(&n.id).iter().filter_map(|u| job.nodes.iter().find(|x| &x.id == u).map(|x| x.name.clone())).collect();
+                    let tries = (n.limits.timeout(&job.limits), n.limits.retries(&job.limits));
                     set.spawn(async move {
                         let started = Instant::now();
-                        // A panic fails this step only (the run must still finish).
-                        let out = std::panic::AssertUnwindSafe(run_node(&c, &job_id, &job_name, &node, &ups_names, &cancel, &t))
+                        // A panic anywhere in the step (also outside the SQL it runs)
+                        // fails it, so the step's slot is given back and the run goes on.
+                        let out = std::panic::AssertUnwindSafe(run_step(&c, &job_id, &job_name, &node, &ups_names, &cancel, &t, tries))
                             .catch_unwind()
                             .await
                             .unwrap_or_else(|_| Err(EngineError::new("internal", "the step stopped unexpectedly")));
@@ -645,8 +779,56 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
             }
         }
         tracer.save();
-        let Some(done) = set.join_next().await else { break };
+        if cancel.is_cancelled() && left_by.is_none() {
+            left_by = Some(tokio::time::Instant::now() + STOP_GRACE);
+        }
+        // A waiting step stopped on its own wakes the loop (it isn't in `set`).
+        let waiting_tokens: Vec<CancellationToken> = {
+            let steps = ctx.jobs.steps.lock();
+            waiting.iter().filter(|id| status.get(*id) == Some(&"pending")).filter_map(|id| steps.get(&(job.id.clone(), id.clone())).cloned()).collect()
+        };
+        let waiting_stopped = async {
+            if waiting_tokens.is_empty() {
+                std::future::pending::<()>().await
+            } else {
+                futures::future::select_all(waiting_tokens.iter().map(|t| Box::pin(t.cancelled()))).await;
+            }
+        };
+        let done = tokio::select! {
+            // Steps that ended first: a run whose last step ends as its time
+            // limit comes isn't marked timed out.
+            biased;
+            done = set.join_next() => done,
+            _ = waiting_stopped, if !cancel.is_cancelled() => continue,
+            // Stop: steps waiting on upstream steps (no token of their own)
+            // show as not started now, not when a running step returns.
+            _ = cancel.cancelled(), if !cancel.is_cancelled() => continue,
+            _ = tokio::time::sleep_until(deadline.unwrap_or(far)), if deadline.is_some() && !timed_out && !cancel.is_cancelled() => {
+                timed_out = true;
+                tracer.log("error", format!("Stopping: {}", timed_out_text(run_limit.unwrap_or_default())), None, None, None);
+                cancel.cancel();
+                continue;
+            }
+            // Steps that don't end once stopped are left behind (their
+            // sessions are closed below), so the run ends and lets go of the job.
+            _ = tokio::time::sleep_until(left_by.unwrap_or(far)), if left_by.is_some() && !abandoned && !set.is_empty() => {
+                tracer.log("warning", format!("{} steps did not stop within {}: left behind", set.len(), duration_text(STOP_GRACE)), None, None, None);
+                set.abort_all();
+                // The loop goes on until the set is empty: a step that
+                // finished meanwhile (an export moved into place) is
+                // recorded as it ended; the aborted ones are left behind.
+                abandoned = true;
+                continue;
+            }
+        };
+        let Some(done) = done else { break };
         let Ok((node, started, out, t)) = done else { continue };
+        running = running.saturating_sub(1);
+        if let Some(k) = slot_key(&node)
+            && let Some(c) = per_connection.get_mut(&k)
+        {
+            *c = c.saturating_sub(1);
+        }
         let step_token = ctx.jobs.steps.lock().remove(&(job.id.clone(), node.id.clone()));
         let step_stopped = step_token.is_some_and(|t| t.is_cancelled());
         let took = started.elapsed().as_millis() as i64;
@@ -667,7 +849,14 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
             }
             Err(e) if cancel.is_cancelled() || step_stopped || e.kind == "cancelled" => {
                 status.insert(node.id.clone(), "cancelled");
-                t.log("warning", if step_stopped && !cancel.is_cancelled() { "Stopped by the user" } else { "Cancelled" }, None, None, Some(took));
+                let why = if timed_out {
+                    format!("Stopped: {}", timed_out_text(run_limit.unwrap_or_default()))
+                } else if step_stopped && !cancel.is_cancelled() {
+                    "Stopped by the user".into()
+                } else {
+                    "Cancelled".into()
+                };
+                t.log("warning", why, None, None, Some(took));
                 record(&node, "cancelled", Some(started), None, Some(e.message))
             }
             Err(e) => {
@@ -678,9 +867,23 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
         };
         tracer.with_run(|run| {
             if let Some(r) = run.nodes.iter_mut().find(|r| r.node_id == node.id) {
+                let (attempt, attempts) = (r.summary.attempt, r.summary.attempts);
                 *r = rec;
+                (r.summary.attempt, r.summary.attempts) = (attempt, attempts);
             }
         });
+    }
+    // Steps left behind: stopped, as far as the run is concerned.
+    for n in &job.nodes {
+        if status.get(&n.id) == Some(&"running") {
+            status.insert(n.id.clone(), "cancelled");
+            ctx.jobs.steps.lock().remove(&(job.id.clone(), n.id.clone()));
+            tracer.with_run(|run| {
+                if let Some(r) = run.nodes.iter_mut().find(|r| r.node_id == n.id) {
+                    *r = record(n, "cancelled", None, None, Some(format!("did not stop within {}: left behind", duration_text(STOP_GRACE))));
+                }
+            });
+        }
     }
     for n in &job.nodes {
         ctx.engine.release_sessions(&node_tab(&job.id, &n.id));
@@ -693,7 +896,8 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
             tracing::warn!(job = %job.id, step = %id, "job step failed");
         }
     }
-    let final_status = if any("error") || any("skipped") {
+    // A run stopped by its time limit failed.
+    let final_status = if any("error") || any("skipped") || timed_out {
         "error"
     } else if any("cancelled") || cancel.is_cancelled() {
         "cancelled"
@@ -702,7 +906,10 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
     };
     let nodes = tracer.with_run(|run| {
         run.status = final_status.into();
-        run.error = run.nodes.iter().find(|r| r.summary.status == "error").map(|r| format!("{}: {}", r.name, r.summary.error.clone().unwrap_or_default()));
+        run.error = match run_limit.filter(|_| timed_out) {
+            Some(d) => Some(format!("Stopped: {}", timed_out_text(d))),
+            None => run.nodes.iter().find(|r| r.summary.status == "error").map(|r| format!("{}: {}", r.name, r.summary.error.clone().unwrap_or_default())),
+        };
         run.finished_at = Some(now_ms());
         run.nodes.clone()
     });
@@ -732,6 +939,165 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
     let _ = ctx.workspace.set_job_node_results(&job.id, &nodes);
     tracer.save();
     tracing::info!(job = %job.id, run = run.id, trigger = %run.trigger, status = final_status, steps = nodes.len(), ms = started_run.elapsed().as_millis() as u64, "job run finished");
+}
+
+/// Run one step: each try within its time limit (`tries.0`), tried again
+/// up to `tries.1` times after a connection error when that can't write
+/// twice ([`retry_refused`]), waiting longer each time.
+#[allow(clippy::too_many_arguments)]
+async fn run_step(
+    ctx: &JobCtx,
+    job_id: &str,
+    job_name: &str,
+    node: &JobNode,
+    upstreams: &[String],
+    cancel: &CancellationToken,
+    t: &Tracer,
+    tries: (Option<Duration>, u32),
+) -> Result<NodeOut> {
+    let (limit, retries) = tries;
+    let of = retries + 1;
+    let mut n = 1;
+    loop {
+        if of > 1 {
+            t.attempt(n, of);
+        }
+        let e = match one_try(ctx, job_id, job_name, node, upstreams, cancel, t, limit).await {
+            Ok(out) => return Ok(out),
+            Err(e) => e,
+        };
+        if n >= of || cancel.is_cancelled() || !retryable(&e) {
+            return Err(e);
+        }
+        if let Some(why) = retry_refused(ctx, node, t) {
+            t.log("warning", format!("Not tried again: {why}"), None, None, None);
+            return Err(e);
+        }
+        let wait = databrain_workspace::retry_delay(ctx.jobs.retry_base(), n);
+        t.log("warning", format!("Try {n} of {of} failed ({}): trying again in {}", e.message, duration_text(wait)), None, None, None);
+        // Saved now: the wait may be long (up to 30 min), and the app shows
+        // the background runner's runs from the workspace.
+        t.save();
+        // A new session: the old one may be broken.
+        let tab = node_tab(job_id, &node.id);
+        for key in [tab.clone(), step_load(&tab), step_export(&tab)] {
+            ctx.engine.release_sessions(&key);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = cancel.cancelled() => return Err(e),
+        }
+        n += 1;
+    }
+}
+
+/// One try of a step, stopped when it takes longer than `limit`. Once it
+/// is stopped (its time limit, the user stopping it or the run), it gets
+/// [`STOP_GRACE`] to end; then it is left behind (dropped, its sessions
+/// are closed when the run ends), so a statement that ignores Stop can't
+/// keep the run and its lease going.
+#[allow(clippy::too_many_arguments)]
+async fn one_try(
+    ctx: &JobCtx,
+    job_id: &str,
+    job_name: &str,
+    node: &JobNode,
+    upstreams: &[String],
+    cancel: &CancellationToken,
+    t: &Tracer,
+    limit: Option<Duration>,
+) -> Result<NodeOut> {
+    // A try of an earlier run left behind (it didn't stop when asked) may
+    // still hold the step's sessions: say so, not "a query is already running".
+    let tab = node_tab(job_id, &node.id);
+    if [tab.clone(), step_load(&tab), step_export(&tab)].iter().any(|k| ctx.engine.in_use(k)) {
+        return Err(EngineError::new("busy", STILL_RUNNING));
+    }
+    let stop = cancel.child_token();
+    // A panic fails this step only (the run must still finish).
+    let work = std::panic::AssertUnwindSafe(run_node(ctx, job_id, job_name, node, upstreams, &stop, t)).catch_unwind();
+    let panicked = |_| Err(EngineError::new("internal", "the step stopped unexpectedly"));
+    tokio::pin!(work);
+    let over_limit = async {
+        match limit {
+            Some(l) => tokio::time::sleep(l).await,
+            None => std::future::pending().await,
+        }
+    };
+    let left_behind = || EngineError::new("cancelled", format!("did not stop within {}: left behind", duration_text(STOP_GRACE)));
+    tokio::select! {
+        biased;
+        out = &mut work => out.unwrap_or_else(panicked),
+        _ = cancel.cancelled() => match tokio::time::timeout(STOP_GRACE, &mut work).await {
+            Ok(out) => out.unwrap_or_else(panicked),
+            Err(_) => {
+                t.log("warning", format!("The step did not stop within {}: left behind", duration_text(STOP_GRACE)), None, None, None);
+                Err(left_behind())
+            }
+        },
+        _ = over_limit => {
+            let limit = limit.unwrap_or_default();
+            t.log("error", format!("Time limit reached ({}): stopping the step", duration_text(limit)), None, None, None);
+            stop.cancel();
+            // What finished anyway is kept (a load may have committed).
+            match tokio::time::timeout(STOP_GRACE, &mut work).await {
+                Ok(Ok(Ok(out))) => Ok(out),
+                _ => Err(EngineError::new("timeout", format!("Timed out after {} (the step's time limit)", duration_text(limit)))),
+            }
+        }
+    }
+}
+
+/// Errors worth trying again: the connection (couldn't connect, lost it,
+/// timed out reaching the server). Not the step's own time limit, a
+/// refused sign-in, or an error in the SQL.
+fn retryable(e: &EngineError) -> bool {
+    e.kind == "connection"
+}
+
+/// Why a step that failed must not run again (`None`: it may), so a retry
+/// can't write twice: only SQL that reads is run again (every statement a
+/// read, no function that isn't a known built-in), and a load only when it
+/// wrote nothing or ran in one transaction that was rolled back.
+fn retry_refused(ctx: &JobCtx, node: &JobNode, t: &Tracer) -> Option<String> {
+    let Ok(params) = t.params() else { return Some("the run's parameter values are missing".into()) };
+    let reads = |sql: &str, connection: Option<&str>| {
+        let kind = match connection.filter(|c| !c.is_empty()) {
+            Some(c) => ctx.workspace.get_connection(c).ok().map(|p| p.config.kind),
+            None => Some(databrain_connector_core::ConnectorKind::Duckdb),
+        };
+        kind.is_some_and(|k| reads_only(sql, k, &params))
+    };
+    let may_write = "its SQL may write (only steps that read are tried again)";
+    match node.kind {
+        JobNodeKind::Query => (!reads(&node.sql, node.connection_id.as_deref())).then(|| may_write.to_string()),
+        JobNodeKind::Load | JobNodeKind::Export if !node.sql.trim().is_empty() && !reads(&node.sql, None) => Some(may_write.into()),
+        JobNodeKind::Export => None,
+        JobNodeKind::Load => load_retry_refused(*t.load.lock()).map(str::to_string),
+    }
+}
+
+/// Why a load step's try must not run again, by how far its load got:
+/// only when it never started or said it kept nothing.
+fn load_retry_refused(load: LoadState) -> Option<&'static str> {
+    match load {
+        LoadState::NotStarted | LoadState::KeptNothing => None,
+        LoadState::Started => Some("the load didn't say whether it kept any of its writes"),
+        LoadState::MayHaveKept => Some("the load may have kept some of its writes (it didn't run in one transaction that was rolled back)"),
+    }
+}
+
+/// Whether every statement of `sql` (with the run's `:name` values) only
+/// reads: classified as a read, calling no function that isn't a known
+/// built-in. Unsure is not a read.
+pub fn reads_only(sql: &str, kind: databrain_connector_core::ConnectorKind, params: &HashMap<String, ParamValue>) -> bool {
+    use databrain_connector_core::sql::{Checked, split_statements, unknown_functions};
+    let spans = split_statements(sql, kind);
+    !spans.is_empty()
+        && spans.iter().all(|s| match Checked::new(s.sql.clone(), kind).bind(kind, params) {
+            Ok(c) => c.kind().is_read() && unknown_functions(c.sql(), kind).is_empty(),
+            Err(_) => false,
+        })
 }
 
 /// SQL a load step runs when it has none: its upstream's output.
@@ -783,16 +1149,57 @@ pub fn export_target(folder: &std::path::Path, name: &str, written: &HashSet<Str
 
 /// Move the finished export `tmp` to `dest`. Without `replace` a file that
 /// appeared at `dest` meanwhile is kept (the export fails instead).
-fn finish_export(tmp: &std::path::Path, dest: &std::path::Path, replace: bool) -> std::io::Result<()> {
+/// `Ok(Some(notice))`: the file is in place, but the temporary file
+/// couldn't be removed (the export still counts: `dest` is written).
+fn finish_export(tmp: &std::path::Path, dest: &std::path::Path, replace: bool) -> std::io::Result<Option<String>> {
     if replace {
-        return std::fs::rename(tmp, dest);
+        return std::fs::rename(tmp, dest).map(|_| None);
     }
     match std::fs::hard_link(tmp, dest) {
-        Ok(()) => std::fs::remove_file(tmp),
+        Ok(()) => Ok(std::fs::remove_file(tmp).err().map(|e| format!("the temporary file {} could not be removed ({e}): delete it by hand", tmp.display()))),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
         // Folders without hard links (some network and FAT drives).
-        Err(_) if std::fs::symlink_metadata(dest).is_err() => std::fs::rename(tmp, dest),
+        Err(_) if std::fs::symlink_metadata(dest).is_err() => std::fs::rename(tmp, dest).map(|_| None),
         Err(e) => Err(e),
+    }
+}
+
+/// An export's temporary file, removed when the step ends without moving
+/// it into place, also when the step is dropped (its time limit, or left
+/// behind after Stop): [`PartFile::keep`] once it is in place.
+struct PartFile(Option<std::path::PathBuf>);
+
+impl PartFile {
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// The temporary file name of an export of step `node_id` of `job_id`:
+/// named after the step, so files a step left behind (DuckDB still writing
+/// when it was dropped, the app quit) are found and removed by its next run.
+fn part_prefix(job_id: &str, node_id: &str) -> String {
+    let clean = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect::<String>();
+    format!(".databrain-{}-{}.", clean(job_id), clean(node_id))
+}
+
+/// Remove the temporary files earlier runs of the step left in `folder`.
+fn sweep_parts(folder: &std::path::Path, prefix: &str) {
+    let Ok(dir) = std::fs::read_dir(folder) else { return };
+    for e in dir.flatten() {
+        let name = e.file_name();
+        let Some(n) = name.to_str() else { continue };
+        if n.starts_with(prefix) && n.ends_with(".part") {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 }
 
@@ -975,7 +1382,22 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     let last = outcomes.last();
     let rows = last.and_then(|o| o.result.as_ref().map(|r| r.total_rows as i64).or(o.rows_affected.map(|r| r as i64))).unwrap_or(0);
     if node.kind == JobNodeKind::Query {
-        // A capped result of its own fails the steps that read it (above).
+        // A capped result of its own fails the steps that read it (above);
+        // a step nothing reads still says it holds only part of the rows.
+        let own = ctx.engine.outputs().for_tab(&tab).into_iter().rev().find(|o| o.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&node.name)));
+        if let Some(o) = own.as_ref().filter(|o| o.truncated) {
+            t.log(
+                "warning",
+                format!(
+                    "{} holds only its first {} rows (capped by a row limit or by the memory a result may keep): a step that reads it fails",
+                    o.name.as_deref().unwrap_or(&o.handle),
+                    o.rows
+                ),
+                None,
+                None,
+                None,
+            );
+        }
         return Ok(NodeOut { rows, file: None, notices: vec![] });
     }
     // This step's result (a statement that returns rows ends with one).
@@ -999,23 +1421,39 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
             notices.push(format!("{name} already exists and wasn't written by this job: saved as {}", path.display()));
         }
         // Written next to the file, then moved into place: a failed or
-        // cancelled export leaves the old file whole.
-        let tmp = folder.join(format!(".{name}.{}.part", uuid::Uuid::new_v4().simple()));
+        // cancelled export leaves the old file whole. Its earlier runs'
+        // leftovers go first.
+        let prefix = part_prefix(job_id, &node.id);
+        sweep_parts(&folder, &prefix);
+        let tmp = folder.join(format!("{prefix}{}.part", uuid::Uuid::new_v4().simple()));
+        let part = PartFile(Some(tmp.clone()));
         // By handle: exactly this run's rows, even if another step has the same name.
         let select = format!("select * from results.{}", output.handle);
         t.log("info", format!("Writing {} rows to {}", output.rows, path.display()), None, None, None);
-        let r = run_sql(ctx, duck_id, step_export(&tab), copy_sql(&select, &tmp, node.export_format), None, Origin::Job, cancel, t).await;
-        if let Err(e) = r.and_then(|_| finish_export(&tmp, &path, replace).map_err(|e| EngineError::new("io", format!("cannot save {}: {e}", path.display()))))
-        {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
+        run_sql(ctx, duck_id, step_export(&tab), copy_sql(&select, &tmp, node.export_format), None, Origin::Job, cancel, t).await?;
+        let left = finish_export(&tmp, &path, replace).map_err(|e| EngineError::new("io", format!("cannot save {}: {e}", path.display())))?;
+        part.keep();
+        if let Some(n) = left {
+            t.log("warning", n.clone(), None, None, None);
+            notices.push(n);
         }
         return Ok(NodeOut { rows: output.rows as i64, file: Some(path.to_string_lossy().into_owned()), notices });
     }
     let target =
         node.target_connection_id.as_deref().filter(|c| !c.is_empty()).ok_or_else(|| EngineError::new("invalid", "Choose the connection to load into"))?;
-    // Before/after SQL get the run's `:name` values too.
+    let spec = load_spec_now(ctx, node, target, origin, t)?;
+    // From here a failure may have written: a retry needs the load to say it kept nothing.
+    *t.load.lock() = LoadState::Started;
+    let report = ctx.engine.write_output(&output.handle, target, &step_load(&tab), &spec, cancel, t).await?;
+    Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices })
+}
+
+/// [`load_spec`] with the run's `:name` values in the before/after SQL.
+fn load_spec_now(ctx: &JobCtx, node: &JobNode, target: &str, origin: Origin, t: &Tracer) -> Result<LoadSpec> {
     let mut spec = load_spec(node);
+    // Under the AI rules (a run it started, the assistant's SQL or rows),
+    // the user's before/after SQL runs as the assistant's too (sandboxed on
+    // a DuckDB target), as the step's own SQL.
     spec.origin = origin;
     let kind = ctx.workspace.get_connection(target)?.config.kind;
     let params = t.params()?;
@@ -1030,8 +1468,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
             )
         })?;
     }
-    let report = ctx.engine.write_output(&output.handle, target, &step_load(&tab), &spec, cancel, t).await?;
-    Ok(NodeOut { rows: report.rows as i64, file: None, notices: report.notices })
+    Ok(spec)
 }
 
 /// Whether SQL on `connection_id` can read the outputs (`results.*`): every
@@ -1112,6 +1549,11 @@ fn sql_origin(node: &JobNode) -> Origin {
 /// Rows a dry run selects to try the load with.
 pub const DRY_RUN_ROWS: usize = 1000;
 
+/// `:name` values a dry run selects its rows with: the job's.
+fn dry_run_params(ctx: &JobCtx, job: &Job) -> HashMap<String, ParamValue> {
+    effective_params(&ctx.workspace, job, None).map(|(p, _)| p.into_iter().collect()).unwrap_or_default()
+}
+
 /// Check a load step of `job` (as edited, not necessarily saved) without
 /// keeping any change: its SQL selects up to [`DRY_RUN_ROWS`] rows on
 /// DuckDB, then the load is tried with them (see
@@ -1144,7 +1586,7 @@ pub async fn dry_run(ctx: &JobCtx, job: &Job, node_id: &str) -> Result<LoadDryRu
                 origin: sql_origin(node),
                 session_key: None,
                 output_name: None,
-                params: HashMap::new(),
+                params: dry_run_params(ctx, job),
                 output_masks: None,
             };
             match ctx.engine.run_and_wait(&ctx.hub, req, Some(cancel.clone())).await {
@@ -1244,5 +1686,106 @@ pub async fn run_and_wait_with(ctx: &JobCtx, job_id: &str, trigger: &str, params
 pub async fn wait_for(ctx: &JobCtx, ids: &[String]) {
     while ids.iter().any(|id| ctx.jobs.is_running(id)) {
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use databrain_connector_core::ConnectorKind::{Duckdb, Mongodb, Mysql, Postgres};
+
+    /// A load step's try runs again only when its load never started or said
+    /// it kept nothing; a load that started and didn't say (or said it may
+    /// have kept writes) isn't tried again.
+    #[test]
+    fn load_retry_needs_the_load_to_say_it_kept_nothing() {
+        assert_eq!(load_retry_refused(LoadState::NotStarted), None);
+        assert_eq!(load_retry_refused(LoadState::KeptNothing), None);
+        assert!(load_retry_refused(LoadState::Started).is_some_and(|w| w.contains("didn't say")));
+        assert!(load_retry_refused(LoadState::MayHaveKept).is_some_and(|w| w.contains("may have kept")));
+    }
+
+    /// An export's temporary file goes when the step ends without moving it
+    /// into place (dropped by a time limit or left behind too), stays once
+    /// kept; the next run of the step removes what earlier ones left, and
+    /// only theirs.
+    #[test]
+    fn export_temp_files_never_stay_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = part_prefix("job/1", "n:1");
+        assert_eq!(prefix, ".databrain-job_1-n_1.");
+        let tmp = dir.path().join(format!("{prefix}abc.part"));
+        std::fs::write(&tmp, "x").unwrap();
+        drop(PartFile(Some(tmp.clone())));
+        assert!(!tmp.exists(), "dropped: removed");
+        std::fs::write(&tmp, "x").unwrap();
+        PartFile(Some(tmp.clone())).keep();
+        assert!(tmp.exists(), "kept once in place");
+        let other_step = dir.path().join(format!("{}abc.part", part_prefix("job/1", "n:2")));
+        let users = dir.path().join(".report.csv.part");
+        std::fs::write(&other_step, "x").unwrap();
+        std::fs::write(&users, "x").unwrap();
+        sweep_parts(dir.path(), &prefix);
+        assert!(!tmp.exists(), "the step's leftover goes");
+        assert!(other_step.exists() && users.exists(), "nothing else");
+    }
+
+    /// The file is in place even when its temporary file can't be removed
+    /// afterwards: the export counts as written, with a notice.
+    #[test]
+    fn a_finished_export_counts_when_its_temp_file_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".x.part");
+        let dest = dir.path().join("x.csv");
+        std::fs::write(&tmp, "a,b").unwrap();
+        assert_eq!(finish_export(&tmp, &dest, false).unwrap(), None);
+        assert!(dest.exists() && !tmp.exists());
+        // Replacing: a rename, nothing left.
+        std::fs::write(&tmp, "c,d").unwrap();
+        assert_eq!(finish_export(&tmp, &dest, true).unwrap(), None);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "c,d");
+    }
+
+    #[test]
+    fn only_reads_are_run_again() {
+        let none = HashMap::new();
+        // Reads.
+        for (sql, kind) in [
+            ("select 1", Postgres),
+            ("select * from orders where id > 3; select count(*) from customers", Postgres),
+            ("with x as (select 1 as a) select a from x", Mysql),
+            ("select * from results.orders", Duckdb),
+            (r#"{"find": "orders", "filter": {}}"#, Mongodb),
+        ] {
+            assert!(reads_only(sql, kind, &none), "{sql}");
+        }
+        // Writes, anything unsure, and reads calling a function that may write.
+        for (sql, kind) in [
+            ("insert into t values (1)", Postgres),
+            ("select 1; delete from t", Postgres),
+            ("create table t as select 1", Duckdb),
+            ("call refresh_stats()", Postgres),
+            ("select archive_old_rows()", Postgres),
+            ("select 1 into new_table", Postgres),
+            ("", Postgres),
+            ("vacuum", Postgres),
+            (r#"{"delete": "orders", "deletes": [{"q": {}, "limit": 0}]}"#, Mongodb),
+        ] {
+            assert!(!reads_only(sql, kind, &none), "{sql}");
+        }
+        // With the run's values in place: a missing value is not a read.
+        let p = HashMap::from([("id".to_string(), ParamValue { value: "7".into(), raw: false })]);
+        assert!(reads_only("select * from t where id = :id", Postgres, &p));
+        assert!(!reads_only("select * from t where id = :other", Postgres, &p));
+        let raw = HashMap::from([("q".to_string(), ParamValue { value: "1; drop table t".into(), raw: true })]);
+        assert!(!reads_only("select :q", Postgres, &raw));
+    }
+
+    #[test]
+    fn only_connection_errors_are_retried() {
+        assert!(retryable(&EngineError::new("connection", "connection reset by peer")));
+        for kind in ["query", "auth", "timeout", "cancelled", "invalid", "internal"] {
+            assert!(!retryable(&EngineError::new(kind, "x")), "{kind}");
+        }
     }
 }

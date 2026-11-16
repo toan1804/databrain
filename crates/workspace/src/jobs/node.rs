@@ -79,7 +79,7 @@ fn yes() -> bool {
 #[ts(optional_fields = nullable)]
 pub struct NodeRunSummary {
     #[serde(default)]
-    #[ts(type = "\"pending\" | \"running\" | \"success\" | \"error\" | \"skipped\" | \"cancelled\" | \"\"")]
+    #[ts(type = "\"pending\" | \"waiting\" | \"running\" | \"success\" | \"error\" | \"skipped\" | \"cancelled\" | \"\"")]
     pub status: String,
     #[serde(default)]
     #[ts(as = "f64")]
@@ -104,6 +104,14 @@ pub struct NodeRunSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub progress: Option<StepProgress>,
+    /// Try of a step that may be tried again (from 1), and how many it may
+    /// have (set when it has retries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, ts_rs::TS)]
@@ -235,6 +243,10 @@ pub struct JobNode {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[ts(as = "Option<bool>", optional)]
     pub ai_sql: bool,
+    /// Its own time limit and retries (over the job's).
+    #[serde(default, skip_serializing_if = "super::StepLimits::is_default")]
+    #[ts(as = "Option<super::StepLimits>", optional)]
+    pub limits: super::StepLimits,
     #[serde(default)]
     pub last_run: Option<NodeRunSummary>,
 }
@@ -242,13 +254,15 @@ pub struct JobNode {
 impl JobNode {
     /// Whether `other` runs the same SQL in the same place (what decides
     /// who the SQL belongs to, see [`JobNode::ai_sql`]).
+    /// Texts are compared trimmed, an empty one as none.
     pub fn same_sql(&self, other: &JobNode) -> bool {
+        let t = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
         self.kind == other.kind
             && self.sql.trim() == other.sql.trim()
-            && self.connection_id == other.connection_id
-            && self.target_connection_id == other.target_connection_id
-            && self.load_before_sql.as_deref().map(str::trim) == other.load_before_sql.as_deref().map(str::trim)
-            && self.load_after_sql.as_deref().map(str::trim) == other.load_after_sql.as_deref().map(str::trim)
+            && t(&self.connection_id) == t(&other.connection_id)
+            && t(&self.target_connection_id) == t(&other.target_connection_id)
+            && t(&self.load_before_sql) == t(&other.load_before_sql)
+            && t(&self.load_after_sql) == t(&other.load_after_sql)
     }
 
     /// [`Self::same_sql`], and where and how it writes: a load's table,
@@ -305,4 +319,78 @@ impl JobNode {
 pub struct JobEdge {
     pub from: String,
     pub to: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load() -> JobNode {
+        serde_json::from_value(serde_json::json!({
+            "id": "n", "name": "copy", "kind": "load", "sql": "select * from results.src ",
+            "target_connection_id": "pg", "target_table": "public.copy", "load_mode": "merge", "key_columns": ["id"],
+            "load_before_sql": "delete from t where day = :day"
+        }))
+        .unwrap()
+    }
+
+    /// The same step: equal after trimming, an empty text is none.
+    #[test]
+    fn the_same_step_ignores_spacing() {
+        let a = load();
+        let mut b = a.clone();
+        b.sql = "select * from results.src".into();
+        b.load_after_sql = Some("  ".into());
+        b.key_columns = vec![" id ".into()];
+        b.target_table = Some(" public.copy ".into());
+        b.export_folder = Some(String::new());
+        assert!(a.same_effect(&b) && a.same_sql(&b));
+    }
+
+    /// Names are compared exactly: `orders` and `"Orders"` are different
+    /// tables on Postgres, so another case is another effect (an edit by the
+    /// assistant makes the step its own).
+    #[test]
+    fn names_in_another_case_are_another_table() {
+        let a = load();
+        let mut b = a.clone();
+        b.target_table = Some("PUBLIC.COPY".into());
+        assert!(!a.same_effect(&b));
+        let mut b = a.clone();
+        b.key_columns = vec!["ID".into()];
+        assert!(!a.same_effect(&b));
+        // The SQL is the same: a user's save keeps the assistant's mark.
+        assert!(a.same_sql(&b));
+    }
+
+    /// Where or how it writes changes the effect (what an assistant's edit
+    /// is judged by): its target table, mode, keys, "create the table",
+    /// before/after SQL; an export's folder, file and format; the SQL and
+    /// the connections. Only the SQL, before/after SQL and the connections
+    /// change [`JobNode::same_sql`] (what a user's save is judged by).
+    #[test]
+    fn where_and_how_a_step_writes_is_part_of_its_effect() {
+        let a = load();
+        type Change = Box<dyn Fn(&mut JobNode)>;
+        let changed: Vec<(&str, bool, Change)> = vec![
+            ("table", false, Box::new(|n| n.target_table = Some("public.other".into()))),
+            ("mode", false, Box::new(|n| n.load_mode = LoadMode::Sync)),
+            ("keys", false, Box::new(|n| n.key_columns = vec!["id".into(), "day".into()])),
+            ("create", false, Box::new(|n| n.create_table = !n.create_table)),
+            ("target", true, Box::new(|n| n.target_connection_id = Some("other".into()))),
+            ("connection", true, Box::new(|n| n.connection_id = Some("other".into()))),
+            ("folder", false, Box::new(|n| n.export_folder = Some("/tmp".into()))),
+            ("file", false, Box::new(|n| n.export_file = Some("x.csv".into()))),
+            ("format", false, Box::new(|n| n.export_format = FileFormat::Parquet)),
+            ("before", true, Box::new(|n| n.load_before_sql = None)),
+            ("after", true, Box::new(|n| n.load_after_sql = Some("delete from t".into()))),
+            ("sql", true, Box::new(|n| n.sql = "select 1".into())),
+        ];
+        for (what, text, change) in changed {
+            let mut b = a.clone();
+            change(&mut b);
+            assert!(!a.same_effect(&b), "{what}");
+            assert_eq!(!a.same_sql(&b), text, "{what}");
+        }
+    }
 }

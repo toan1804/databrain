@@ -18,6 +18,8 @@ struct Spec {
     params: BTreeMap<String, databrain_connector_core::sql::ParamValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     param_set: Option<String>,
+    #[serde(default, skip_serializing_if = "RunLimits::is_default")]
+    limits: RunLimits,
 }
 
 impl Spec {
@@ -28,6 +30,7 @@ impl Spec {
             schedule: job.schedule.clone(),
             params: job.params.clone(),
             param_set: job.param_set.clone(),
+            limits: job.limits.clone(),
         }
     }
 }
@@ -148,6 +151,7 @@ impl Workspace {
                 schedule: spec.schedule,
                 params: spec.params,
                 param_set: spec.param_set,
+                limits: spec.limits,
                 last_scheduled_at: r.get(3)?,
                 created_at: r.get(4)?,
                 updated_at: r.get(5)?,
@@ -433,6 +437,7 @@ mod tests {
             export_file: None,
             export_format: FileFormat::Csv,
             ai_sql: false,
+            limits: Default::default(),
             last_run: None,
         }
     }
@@ -523,6 +528,7 @@ mod tests {
             last_scheduled_at: None,
             params: Default::default(),
             param_set: None,
+            limits: Default::default(),
             created_at: 0,
             updated_at: 0,
         }

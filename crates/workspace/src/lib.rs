@@ -27,8 +27,8 @@ mod tests;
 pub use ai::{AiMessageRecord, AiProviderRecord, AiSessionRecord, AuditEntry};
 pub use ai_scope::{AiCatalog, ScopeRule, scope_allows};
 pub use jobs::{
-    FileFormat, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, JobSummary, LoadMode, NodeRunRecord, NodeRunSummary, RunLogEntry, ScheduleMode,
-    StepOwner, StepProgress,
+    FileFormat, Job, JobEdge, JobNode, JobNodeKind, JobRun, JobSchedule, JobSummary, LoadMode, NodeRunRecord, NodeRunSummary, RETRY_DELAY, RunLimits,
+    RunLogEntry, ScheduleMode, StepLimits, StepOwner, StepProgress, duration_text, retry_delay,
 };
 pub use knowledge::{
     ImportAction, ImportItem, ImportKind, IndexDelta, KnHit, KnNote, KnObject, KnState, NoteEntry, NoteStatus, NotesFile, NotesSource, join_target,

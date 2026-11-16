@@ -280,6 +280,12 @@ impl QueryEngine {
         self.outputs_changed();
     }
 
+    /// Whether a run, export or other work holds `key` (as its tab or its
+    /// session) right now.
+    pub fn in_use(&self, key: &str) -> bool {
+        self.jobs.lock().values().any(|j| j.tab_id == key || j.session_key == key)
+    }
+
     /// Claim the session `session_key` like a running query until the
     /// returned [`Claim`] drops: a run, edit, plan, Commit/Rollback or
     /// export can't start on it meanwhile (checked and claimed under one

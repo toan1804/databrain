@@ -89,7 +89,7 @@ export function NodeCard({
       <div className={`mt-auto flex min-w-0 items-center gap-1 text-[10.5px] ${status?.status === "error" ? "text-danger" : "text-muted"}`} title={status?.error ?? undefined}>
         <StatusIcon status={status?.status} />
         <span className="min-w-0 flex-1 truncate">{node.sql.trim() || node.kind !== "query" ? statusText(status) : "No SQL yet"}</span>
-        {status?.status === "running" && (
+        {(status?.status === "running" || status?.status === "waiting") && (
           <button
             type="button"
             className="shrink-0 rounded px-1 text-danger hover:bg-danger/10"
