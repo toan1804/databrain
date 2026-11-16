@@ -205,7 +205,7 @@ export function GeneralSection({ f }: { f: ConnectionFormState }) {
             onChange={setReadOnly}
             label="Read-only"
             help={
-              ["postgres", "mysql", "sqlite", "duckdb", "clickhouse"].includes(kind)
+              ["postgres", "mysql", "sqlite", "duckdb", "clickhouse"].includes(kind) && !redshift
                 ? "Only queries run; the database session itself is read-only."
                 : "Only queries run. This database has no read-only session, so a function or procedure that writes can't be stopped: use a database user without write permissions for a guarantee."
             }
