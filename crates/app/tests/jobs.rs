@@ -2190,6 +2190,72 @@ async fn live_postgres_copy_columns_dry_run_and_stop() {
     .expect("in time");
 }
 
+/// Rows of 100+ characters: `n` of them are about `n` × 110 bytes in memory.
+fn wide_rows(n: u32) -> String {
+    format!(
+        "with recursive n(i) as (select 1 union all select i + 1 from n where i < {n}) select i, substr(replace(hex(zeroblob(50)), '0', 'x'), 1, 100) || i as s from n"
+    )
+}
+
+/// Job steps' results have a memory budget of their own (a quarter of the
+/// budget): past it a step's result moves to disk, whole, instead of being
+/// cut, and it never frees the results of the user's tabs. When a run ends,
+/// its steps' earlier versions are freed; the latest stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn job_outputs_have_their_own_memory() {
+    tokio::time::timeout(Duration::from_secs(180), async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        st.engine.results().set_spill_root(dir.path().join("spill"));
+        // 16 MB: a tab's result may keep 8 MB, the job steps' 4 MB together.
+        st.engine.outputs().set_budget(16 << 20);
+        let src = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        // A tab ran twice (about 4.4 MB each): the first result is no longer
+        // shown (the budget may free it), the second is.
+        let tab = "user-tab";
+        for _ in 0..2 {
+            let req = RunRequest {
+                connection_id: src.clone(),
+                tab_id: tab.into(),
+                sql: wide_rows(40_000),
+                base_offset: 0,
+                row_limit: None,
+                confirmed: true,
+                origin: Default::default(),
+                session_key: None,
+                output_name: None,
+                params: Default::default(),
+                output_masks: None,
+            };
+            let out = st.engine.run_and_wait(&st.hub, req, None).await.unwrap();
+            assert!(out.iter().all(|o| o.error.is_none()));
+        }
+        let earlier = st.engine.outputs().list().into_iter().find(|o| o.tab_id == tab && !o.active).expect("the tab's earlier result");
+        assert_eq!(earlier.state, databrain_query_engine::OutputState::Live);
+
+        // A step of about 22 MB: more than the whole budget.
+        let job = st.workspace.save_job(plain_job("big", vec![node("a", "big_rows", JobNodeKind::Query, Some(&src), &wide_rows(200_000))])).unwrap();
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert_eq!(step(&run, "big_rows").rows, Some(200_000));
+        let first = st.engine.outputs().resolve("big_rows").expect("results.big_rows");
+        assert!(!first.truncated && first.spilled && first.rows == 200_000, "{first:?}");
+        assert!(st.engine.outputs().job_active_bytes("") <= st.engine.outputs().job_budget(), "{first:?}");
+        // The tab's results are still there, the one it no longer shows too.
+        assert_eq!(st.engine.outputs().get(&earlier.handle).unwrap().state, databrain_query_engine::OutputState::Live);
+
+        // Again: the first run's result (now results.big_rows__1) is freed.
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert_eq!(st.engine.outputs().get(&first.handle).unwrap().state, databrain_query_engine::OutputState::Evicted);
+        let latest = st.engine.outputs().resolve("big_rows").unwrap();
+        assert!(latest.handle != first.handle && latest.state == databrain_query_engine::OutputState::Live && latest.rows == 200_000, "{latest:?}");
+        assert_eq!(st.engine.outputs().get(&earlier.handle).unwrap().state, databrain_query_engine::OutputState::Live);
+    })
+    .await
+    .expect("in time");
+}
+
 /// "Run after" a job that is busy: the start is queued, not lost, and the
 /// next scheduler pass starts it once the job is free.
 #[tokio::test(flavor = "multi_thread")]

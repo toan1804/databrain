@@ -660,7 +660,11 @@ fn start_as(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>>
         let (whole, name) = (only.is_none() || r.trigger == "resume", job.name.clone());
         // The jobs after a run the assistant started run under the AI rules too.
         let ai = r.trigger == "ai" || r.ai;
+        // While it runs, its steps' latest outputs stay in memory (later
+        // steps read them); afterwards they make room for other jobs'.
+        let running = JobRunning::new(&c, &id);
         execute(&c, job, r, only, cancel, params).await;
+        drop(running);
         beat.abort();
         c.jobs.stop_reasons.lock().remove(&id);
         let _ = c.workspace.release_job(&id, &c.jobs.owner);
@@ -757,6 +761,24 @@ fn sign_in_warning(ctx: &JobCtx, job: &Job, trigger: &str, failed: impl Fn(&str)
 /// Runs started with nobody at the computer (schedule, background runner, after another job).
 fn unattended(trigger: &str) -> bool {
     matches!(trigger, "schedule" | "background") || trigger.starts_with(AFTER_TRIGGER)
+}
+
+/// The job counts as running for the outputs' memory budget while held
+/// ([`databrain_query_engine::OutputRegistry::job_running`]).
+struct JobRunning(Arc<databrain_query_engine::OutputRegistry>, String);
+
+impl JobRunning {
+    fn new(ctx: &JobCtx, job_id: &str) -> Self {
+        let outputs = ctx.engine.outputs().clone();
+        outputs.job_running(job_id, true);
+        JobRunning(outputs, job_id.to_string())
+    }
+}
+
+impl Drop for JobRunning {
+    fn drop(&mut self) {
+        self.0.job_running(&self.1, false);
+    }
 }
 
 fn record(node: &JobNode, status: &str, started: Option<Instant>, rows: Option<i64>, error: Option<String>) -> NodeRunRecord {
@@ -1074,6 +1096,12 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
         ctx.engine.release_sessions(&node_tab(&job.id, &n.id));
         ctx.engine.release_sessions(&step_load(&node_tab(&job.id, &n.id)));
         ctx.engine.release_sessions(&step_export(&node_tab(&job.id, &n.id)));
+    }
+    // Earlier runs' outputs of the steps: no step reads them (they read the
+    // latest), and the user opens the latest ("View output").
+    let released: usize = job.nodes.iter().map(|n| ctx.engine.outputs().release_earlier(&node_tab(&job.id, &n.id))).sum();
+    if released > 0 {
+        ctx.engine.outputs_changed();
     }
     let any = |s: &str| status.values().any(|v| *v == s);
     for (id, st) in &status {

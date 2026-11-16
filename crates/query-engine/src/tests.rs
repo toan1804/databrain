@@ -841,7 +841,7 @@ async fn a_claimed_session_refuses_other_work() {
 #[tokio::test]
 async fn a_result_stops_at_the_memory_cap() {
     let f = fixture(EnvTag::Dev);
-    f.engine.outputs().set_budget(0); // the 16 MB floor: 8 MB per result
+    f.engine.outputs().set_budget(0); // the 16 MB floor: the tabs' 12 MB, 6 MB per result
     let mut r = req(&f, "with recursive n(i) as (select 1 union all select i + 1 from n where i < 400) select i, randomblob(100000) as b from n");
     r.row_limit = None;
     let evs = wait_job(&f, &started(f.engine.run(r).unwrap())).await;
@@ -852,8 +852,38 @@ async fn a_result_stops_at_the_memory_cap() {
             _ => None,
         })
         .expect("finished");
-    assert!(info.truncated && info.total_rows < 400 && info.total_rows > 0 && info.bytes <= 8 << 20, "{info:?}");
-    assert!(notices.iter().any(|n| n.contains("8 MB a result may keep")), "{notices:?}");
+    assert!(info.truncated && info.total_rows < 400 && info.total_rows > 0 && info.bytes <= 6 << 20, "{info:?}");
+    assert!(notices.iter().any(|n| n.contains("6 MB a result may keep")), "{notices:?}");
+}
+
+/// A job step's result that can't move to disk (the disk is low) stays in
+/// memory up to the tabs' cap, as before job steps had a budget of their
+/// own: it isn't cut at the job budget's smaller share.
+#[tokio::test]
+async fn a_job_step_refused_by_the_disk_keeps_the_tabs_cap() {
+    let f = fixture(EnvTag::Dev);
+    let dir = tempfile::tempdir().unwrap();
+    f.engine.results().set_spill_root(dir.path().to_path_buf());
+    f.engine.outputs().set_budget(0); // 16 MB: jobs 4 MB (a 4 MB result), tabs 12 MB (6 MB a result)
+    f.engine.outputs().set_free_disk_probe(Some(Arc::new(|| Some(100))), 1_000);
+    let mut r = req(&f, "with recursive n(i) as (select 1 union all select i + 1 from n where i < 400) select i, randomblob(100000) as b from n");
+    r.row_limit = None;
+    let finished = |evs: Vec<JobEvent>| {
+        evs.into_iter()
+            .find_map(|e| match e {
+                JobEvent::StatementFinished { result: Some(r), notices, .. } => Some((r, notices)),
+                _ => None,
+            })
+            .expect("finished")
+    };
+    let (tab, _) = finished(wait_job(&f, &started(f.engine.run(r.clone()).unwrap())).await);
+    r.tab_id = "job:j1:n1".into();
+    let (step, notices) = finished(wait_job(&f, &started(f.engine.run(r).unwrap())).await);
+    assert!(step.truncated && !step.on_disk, "{step:?}");
+    assert!(notices.iter().any(|n| n.contains("the disk has only")), "{notices:?}");
+    // The same rows as a tab keeps (6 MB), more than the job budget's 4 MB would.
+    assert_eq!(step.total_rows, tab.total_rows, "{step:?} {tab:?}");
+    assert!(step.bytes > 4 << 20, "{step:?}");
 }
 
 /// The budget follows the computer's memory: a quarter, between 512 MB and
