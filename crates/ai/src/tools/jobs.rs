@@ -184,6 +184,7 @@ impl ToolContext {
         let taken: std::collections::HashSet<String> = ws.job_step_names()?.into_iter().filter(|(_, o)| o.job_id != old.id).map(|(n, _)| n).collect();
         let refs = self.conn_refs()?;
         let (mut job, notes) = crate::jobs::merge_job(&old, args, &refs, &taken)?;
+        crate::jobs::names_used_elsewhere(&self.engine, &job, Some(&old))?;
         crate::jobs::mark_ai_sql(&mut job, Some(&old));
         self.learn_job_defaults(&job).await;
         let decision = self.review_job(&job, &[], "Change a job")?;
@@ -197,6 +198,16 @@ impl ToolContext {
             crate::jobs::describe(&job, &refs)
         );
         self.gate("update_job", decision, &format!("\"{}\": {}", old.name, changes.join("; ")), &json!({"preview": preview, "name": old.name})).await?;
+        // Saved over the version the user approved the change of: when the
+        // job was changed meanwhile (the user edited it while the approval
+        // waited), this change would undo theirs, so it is asked again.
+        let now = ws.get_job(&old.id)?;
+        if now.updated_at != old.updated_at {
+            return Err(AiError::Policy(format!(
+                "\"{}\" was changed while the change waited for approval; nothing was saved. Read it again (get_job) and send the change again.",
+                old.name
+            )));
+        }
         let saved = ws.save_job(job)?;
         let mut text = format!("Updated job \"{}\". It is not run; the user runs it (Run) or its schedule does.\n{preview}", saved.name);
         for n in notes {
@@ -210,6 +221,7 @@ impl ToolContext {
         let taken: std::collections::HashSet<String> = ws.job_step_names()?.into_iter().map(|(n, _)| n).collect();
         let refs = self.conn_refs()?;
         let (mut job, notes) = crate::jobs::build_job(args, &refs, &taken)?;
+        crate::jobs::names_used_elsewhere(&self.engine, &job, None)?;
         crate::jobs::mark_ai_sql(&mut job, None);
         self.learn_job_defaults(&job).await;
         let decision = self.review_job(&job, &[], "Create a job")?;

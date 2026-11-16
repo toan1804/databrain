@@ -28,6 +28,63 @@ pub struct ConnRef {
     pub results: bool,
 }
 
+/// What else uses the output name `name` (outside job `job_id`): another
+/// job's step, a named output of a query tab or notebook, or a notebook
+/// cell's output name. `None` when it's free. The user's job editor and the
+/// assistant's job tools check new step names with it: a step that took a
+/// name the user's tabs, notebooks or jobs read (`results.<name>`) would
+/// hand them its rows.
+pub fn output_name_user(engine: &databrain_query_engine::QueryEngine, name: &str, job_id: &str) -> Result<Option<String>> {
+    use databrain_workspace::SessionRole;
+    let ws = engine.workspace();
+    if let Some(o) = ws.job_step_owner(name)?
+        && o.job_id != job_id
+    {
+        return Ok(Some(o.describe()));
+    }
+    // Outputs of job steps don't count: step names decide (a renamed or
+    // deleted step's old outputs don't keep its name taken).
+    if let Some(o) = engine.outputs().resolve(name).filter(|o| o.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+        && !matches!(SessionRole::parse(&o.tab_id), SessionRole::JobStep { .. })
+    {
+        let from = if matches!(SessionRole::parse(&o.tab_id), SessionRole::Notebook { .. }) { "a notebook cell" } else { "a query tab" };
+        return Ok(Some(format!("output {} (from {from}); rename or remove it first", o.handle)));
+    }
+    for nb in ws.list_notebooks()? {
+        let Ok(nb) = ws.get_notebook(&nb.id) else { continue };
+        if nb.cells.iter().any(|c| c.output_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name))) {
+            return Ok(Some(format!("a cell of notebook \"{}\"", nb.name)));
+        }
+    }
+    Ok(None)
+}
+
+/// Step names of `job` that something else already uses (see
+/// [`output_name_user`]); names its saved version `old` has stay its own.
+pub fn names_used_elsewhere(engine: &databrain_query_engine::QueryEngine, job: &Job, old: Option<&Job>) -> Result<()> {
+    for n in &job.nodes {
+        if old.is_some_and(|o| o.nodes.iter().any(|x| x.name.eq_ignore_ascii_case(&n.name))) {
+            continue;
+        }
+        if let Some(why) = output_name_user(engine, &n.name, &job.id)? {
+            return Err(AiError::Policy(format!("results.{} is already used by {why}; choose another step name", n.name)));
+        }
+    }
+    Ok(())
+}
+
+/// The steps `id` runs after, in order (a load or export without SQL
+/// takes the rows of the first).
+fn upstreams(job: &Job, id: &str) -> Vec<String> {
+    job.edges.iter().filter(|e| e.to == id).map(|e| e.from.clone()).collect()
+}
+
+/// What a step reads besides its SQL: a load or export without SQL takes
+/// its first upstream's rows, so its links are part of what it does.
+fn reads_links(n: &JobNode) -> bool {
+    n.kind != JobNodeKind::Query && n.sql.trim().is_empty()
+}
+
 /// What the model may pass to `create_job`.
 pub fn create_job_schema() -> Value {
     json!({
@@ -399,10 +456,11 @@ pub fn describe(job: &Job, conns: &[ConnRef]) -> String {
                 },
             )),
             JobNodeKind::Export => t.push_str(&format!(
-                "- {} = save to a {} file in {}{after}\n",
+                "- {} = save to a {} file {} in {}{after}\n",
                 n.name,
                 n.export_format.extension(),
-                n.export_folder.as_deref().unwrap_or("Downloads"),
+                n.export_file.as_deref().map(str::trim).filter(|f| !f.is_empty()).unwrap_or("{step}_{date}_{time}"),
+                n.export_folder.as_deref().map(str::trim).filter(|f| !f.is_empty()).unwrap_or("Downloads"),
             )),
         }
         if !n.sql.trim().is_empty() {
@@ -556,11 +614,8 @@ pub fn changes(old: &Job, new: &Job) -> Vec<String> {
                 let (mut a, mut b) = (o.clone(), n.clone());
                 a.name.clear();
                 b.name.clear();
-                let deps = |j: &Job, id: &str| {
-                    let mut v: Vec<String> = j.edges.iter().filter(|e| e.to == id).map(|e| e.from.clone()).collect();
-                    v.sort();
-                    v
-                };
+                let name_in = |j: &Job, id: &str| j.nodes.iter().find(|x| x.id == id).map(|x| x.name.clone()).unwrap_or_default();
+                let deps = |j: &Job, id: &str| upstreams(j, id).iter().map(|u| name_in(j, u)).collect::<Vec<_>>();
                 let same = a.kind == b.kind
                     && a.sql == b.sql
                     && a.connection_id == b.connection_id
@@ -573,10 +628,28 @@ pub fn changes(old: &Job, new: &Job) -> Vec<String> {
                     && a.load_after_sql == b.load_after_sql
                     && a.export_format == b.export_format
                     && a.export_folder == b.export_folder
-                    && a.export_file == b.export_file
-                    && deps(old, &o.id) == deps(new, &n.id);
+                    && a.export_file == b.export_file;
                 if !same {
                     out.push(format!("changes step {}", n.name));
+                }
+                // Links in order: a load or export without SQL takes the
+                // rows of the first.
+                let (was, now) = (deps(old, &o.id), deps(new, &n.id));
+                if was != now {
+                    let list = |v: &[String]| if v.is_empty() { "no step".to_string() } else { v.join(", ") };
+                    out.push(format!(
+                        "step {} runs after {} (was {}){}",
+                        n.name,
+                        list(&now),
+                        list(&was),
+                        if reads_links(n) && was.first() != now.first() { "; it takes the rows of the first" } else { "" }
+                    ));
+                }
+                if !o.ai_sql && n.ai_sql {
+                    out.push(format!(
+                        "step {} becomes the assistant's: its SQL, connection or the rows it reads change, so it runs under the AI rules",
+                        n.name
+                    ));
                 }
             }
         }
@@ -598,21 +671,51 @@ pub fn changes(old: &Job, new: &Job) -> Vec<String> {
 /// Mark the steps whose SQL the AI wrote (`JobNode::ai_sql`): every step of
 /// a new job; in a changed job, the steps that are new or whose SQL moved
 /// or changed against `old`. A step the AI left as it was keeps its mark.
+/// A load or export without SQL reads its first upstream's rows: when the
+/// AI changes its links (which steps, in which order) it changes what the
+/// step writes, so the step becomes the AI's too.
 pub fn mark_ai_sql(job: &mut Job, old: Option<&Job>) {
+    let links: HashMap<String, Vec<String>> = job.nodes.iter().map(|n| (n.id.clone(), upstreams(job, &n.id))).collect();
     for n in &mut job.nodes {
-        n.ai_sql = match old.and_then(|o| o.nodes.iter().find(|x| x.id == n.id)) {
-            Some(before) if before.same_sql(n) => before.ai_sql,
+        n.ai_sql = match old.and_then(|o| o.nodes.iter().find(|x| x.id == n.id).map(|b| (o, b))) {
+            Some((o, before)) if before.same_sql(n) && (!reads_links(n) || upstreams(o, &n.id) == links[&n.id]) => before.ai_sql,
             _ => true,
         };
     }
 }
 
+/// The `rename` argument of `update_job`: `{old: new}`, each old name a step
+/// of the job and each new name a valid step name. A name renamed onto
+/// another renamed one (`{a: b, b: a}`, a chain or a circle) is refused:
+/// the renames are applied one after another, so steps reading both would
+/// end up reading the same one.
+fn renames_of(args: &Value, old: &Job) -> Result<Vec<(String, String)>> {
+    let Some(r) = args.get("rename").filter(|r| !r.is_null()) else { return Ok(vec![]) };
+    let m = r.as_object().ok_or_else(|| AiError::Policy("`rename` maps old step names to new ones ({\"old\": \"new\"})".into()))?;
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in m {
+        let (from, to) = (k.trim(), v.as_str().map(str::trim).unwrap_or_default());
+        if !old.nodes.iter().any(|n| n.name.eq_ignore_ascii_case(from)) {
+            return Err(AiError::Policy(format!("rename: \"{from}\" is not a step of job \"{}\"", old.name)));
+        }
+        if !valid_node_name(to) {
+            return Err(AiError::Policy(format!("rename: \"{to}\" must be a step name (letters, digits, _; no `__`; at most 63 characters)")));
+        }
+        if from.eq_ignore_ascii_case(to) || out.iter().any(|(f, _)| f.eq_ignore_ascii_case(from)) {
+            return Err(AiError::Policy(format!("rename: \"{from}\" is renamed once, to another name")));
+        }
+        out.push((from.to_string(), to.to_string()));
+    }
+    for (f, t) in &out {
+        if out.iter().any(|(f2, _)| f2.eq_ignore_ascii_case(t)) {
+            return Err(AiError::Policy(format!("rename: \"{f}\" → \"{t}\" renames onto a step that is renamed too; rename in two updates")));
+        }
+    }
+    Ok(out)
+}
+
 pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Result<(Job, Vec<String>)> {
-    let rename: Vec<(String, String)> = args
-        .get("rename")
-        .and_then(|r| r.as_object())
-        .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.trim().to_string(), v.trim().to_string()))).collect())
-        .unwrap_or_default();
+    let rename = renames_of(args, old)?;
     let mut a = args.clone();
     if s(&a, "name").is_none() {
         a["name"] = json!(old.name);
@@ -1081,6 +1184,93 @@ mod params_tests {
 #[cfg(test)]
 mod ai_sql_tests {
     use super::*;
+
+    /// A load or export without SQL takes its first upstream's rows: the
+    /// AI changing its links (adding one in front, reordering them) changes
+    /// what it writes, so it becomes the AI's and the change is listed; its
+    /// links left as they were keep it the user's.
+    #[test]
+    fn changed_links_make_a_users_load_the_ais() {
+        let mut old: Job = serde_json::from_value(json!({"name": "j", "nodes": [
+            {"id": "u", "name": "u", "kind": "query", "sql": "select 1"},
+            {"id": "w", "name": "w", "kind": "query", "sql": "select 2"},
+            {"id": "l", "name": "l", "kind": "load", "sql": "", "target_connection_id": "pg", "target_table": "t"}
+        ], "edges": [{"from": "u", "to": "l"}, {"from": "w", "to": "l"}]}))
+        .unwrap();
+        old.id = "J".into();
+        let with_edges = |edges: Value| {
+            let mut j = old.clone();
+            j.edges = serde_json::from_value(edges).unwrap();
+            j
+        };
+        // Left as it was: the user's.
+        let mut same = with_edges(json!([{"from": "u", "to": "l"}, {"from": "w", "to": "l"}]));
+        mark_ai_sql(&mut same, Some(&old));
+        assert!(!same.nodes[2].ai_sql);
+        assert!(changes(&old, &same).is_empty());
+        // Reordered: now takes w's rows.
+        let mut swapped = with_edges(json!([{"from": "w", "to": "l"}, {"from": "u", "to": "l"}]));
+        mark_ai_sql(&mut swapped, Some(&old));
+        assert!(swapped.nodes[2].ai_sql, "reordered links change what it writes");
+        let ch = changes(&old, &swapped);
+        assert!(ch.iter().any(|c| c == "step l runs after w, u (was u, w); it takes the rows of the first"), "{ch:?}");
+        assert!(ch.iter().any(|c| c.starts_with("step l becomes the assistant's")), "{ch:?}");
+        // A new step put in front.
+        let mut ahead = old.clone();
+        ahead.nodes.push(serde_json::from_value(json!({"id": "a", "name": "a", "kind": "query", "sql": "select 3"})).unwrap());
+        ahead.edges = serde_json::from_value(json!([{"from": "a", "to": "l"}, {"from": "u", "to": "l"}, {"from": "w", "to": "l"}])).unwrap();
+        mark_ai_sql(&mut ahead, Some(&old));
+        assert!(ahead.nodes[2].ai_sql);
+        // A query step's links don't change what it reads (its SQL does).
+        let mut q_old = old.clone();
+        q_old.edges = serde_json::from_value(json!([{"from": "u", "to": "w"}])).unwrap();
+        let mut q_new = old.clone();
+        q_new.edges = vec![];
+        mark_ai_sql(&mut q_new, Some(&q_old));
+        assert!(!q_new.nodes[1].ai_sql);
+        assert!(changes(&q_old, &q_new).iter().any(|c| c == "step w runs after no step (was u)"));
+    }
+
+    /// `rename` only renames steps of the job to step names, once each; a
+    /// name renamed onto another renamed one is refused.
+    #[test]
+    fn renames_rename_steps_only() {
+        let c = vec![
+            ConnRef { id: "pg".into(), name: "Sales PG".into(), kind: ConnectorKind::Postgres, read_only: false, ai_enabled: true, results: false },
+            ConnRef { id: "res".into(), name: "Results".into(), kind: ConnectorKind::Duckdb, read_only: false, ai_enabled: true, results: true },
+        ];
+        let args = json!({"name": "j", "steps": [
+            {"name": "orders", "connection": "Sales PG", "sql": "select * from orders"},
+            {"name": "fx", "connection": "Sales PG", "sql": "select * from fx"},
+            {"name": "daily", "connection": "Results", "sql": "select * from results.orders join results.fx using (d)"}
+        ]});
+        let (mut old, _) = build_job(&args, &c, &HashSet::new()).unwrap();
+        old.id = "J".into();
+        let try_rename = |rename: Value| {
+            let mut spec = spec_of(&old, &c);
+            spec["job"] = json!("j");
+            spec["rename"] = rename;
+            merge_job(&old, &spec, &c, &HashSet::new()).map(|_| ()).map_err(|e| e.to_string())
+        };
+        for (bad, why) in [
+            (json!({"nope": "x"}), "not a step"),
+            (json!({"orders": "orders, read_text('/etc/passwd') t"}), "must be a step name"),
+            (json!({"orders": "fx", "fx": "orders"}), "renamed too"),
+            (json!({"orders": "orders"}), "renamed once"),
+            (json!(["orders"]), "maps old step names"),
+        ] {
+            let e = try_rename(bad.clone()).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // Allowed: a step renamed to a free name (and null: no rename).
+        let mut spec = spec_of(&old, &c);
+        spec["job"] = json!("j");
+        spec["steps"][0]["name"] = json!("orders_2026");
+        spec["rename"] = json!({"orders": "orders_2026"});
+        let (new, _) = merge_job(&old, &spec, &c, &HashSet::new()).unwrap();
+        assert!(new.nodes[2].sql.contains("results.orders_2026"));
+        assert!(try_rename(Value::Null).is_ok());
+    }
 
     fn job(nodes: serde_json::Value) -> Job {
         serde_json::from_value(serde_json::json!({"name": "j", "nodes": nodes})).unwrap()
