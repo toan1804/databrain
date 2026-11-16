@@ -14,9 +14,108 @@
 //! process at a time, so it never runs a job the app is running.
 
 use std::process::ExitCode;
+use std::time::Duration;
+
+use databrain_workspace::{JobRun, Workspace};
 
 use crate::background;
 use crate::jobs;
+
+/// Longest one `tick` runs: then the runs still going are stopped and it
+/// exits. The OS doesn't start a new `tick` while one runs, so a run stuck
+/// on a dead connection (with no time limit) would otherwise stop every
+/// background schedule for good.
+pub const TICK_DEADLINE: Duration = Duration::from_secs(55 * 60);
+
+/// Why the runs still going at [`TICK_DEADLINE`] were stopped.
+const DEADLINE_STOP: &str =
+    "Stopped: the background runner ran for its longest time (55 minutes) and stopped its runs; set the job's time limits, or run it in DataBrain";
+
+/// One background pass: start the due jobs, wait for them and the jobs that
+/// run after them, then look again so missed runs made up one by one
+/// ("each") don't wait a minute apart; at most `deadline` in all (then the
+/// runs still going are stopped). Records the time of each pass for
+/// Settings. Returns the runs this process started, as saved when they
+/// ended, oldest first: never runs of another process (the app).
+pub async fn background_tick(state: &crate::api::AppState, deadline: Duration) -> Vec<JobRun> {
+    let ctx = state.job_ctx();
+    let _ = ctx.jobs.take_started();
+    let until = tokio::time::Instant::now() + deadline;
+    let pass = || {
+        let started = jobs::tick_as(&ctx, "background");
+        let _ = state.workspace.set_setting(background::LAST_TICK_SETTING, &serde_json::json!(databrain_workspace::now_ms()));
+        started
+    };
+    // Runs (and the jobs that run after them) all ended before the deadline.
+    let wait = || async { tokio::time::timeout_at(until, jobs::wait_all(&ctx)).await.is_ok() };
+    let mut started = pass();
+    let mut in_time = true;
+    for _ in 0..=databrain_workspace::jobs::MISSED_KEPT {
+        if started.is_empty() && ctx.jobs.running_ids().is_empty() {
+            break;
+        }
+        in_time = wait().await;
+        if !in_time {
+            break;
+        }
+        started = pass();
+    }
+    // Runs the last pass started: the runner never exits under them (a load
+    // would stop half-way, the run stay "running")…
+    if in_time {
+        in_time = wait().await;
+    }
+    // …unless the deadline came: they are stopped, and end within the stop grace.
+    if !in_time {
+        for id in ctx.jobs.running_ids() {
+            tracing::warn!(job = %id, "background runner deadline reached: stopping the run");
+            ctx.jobs.stop_for(&id, DEADLINE_STOP);
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(120), jobs::wait_all(&ctx)).await;
+    }
+    ctx.jobs.take_started().into_iter().filter_map(|(job, run)| state.workspace.job_run(&job, run).ok().flatten()).collect()
+}
+
+/// What `tick` prints, the desktop notifications it shows, and whether it
+/// fails (exit code 1).
+#[derive(Debug, Default, PartialEq)]
+pub struct TickReport {
+    pub lines: Vec<String>,
+    /// (title, text) per run that failed or was stopped.
+    pub notices: Vec<(String, String)>,
+    /// A run failed.
+    pub failed: bool,
+}
+
+/// [`TickReport`] of the runs a background pass started: each run (a job
+/// made up twice reports both), a notification for each that failed or was
+/// stopped (a lost lease, the deadline).
+pub fn tick_report(ws: &Workspace, runs: &[JobRun]) -> TickReport {
+    let mut r = TickReport::default();
+    for run in runs {
+        let name = ws.get_job(&run.job_id).map(|j| j.name).unwrap_or_else(|_| run.job_id.clone());
+        let after = run.trigger.strip_prefix(jobs::AFTER_TRIGGER);
+        let what = match after {
+            Some(up) => format!("{name} (after \"{up}\")"),
+            None => name.clone(),
+        };
+        r.lines.push(format!("{what}: {}", run.status));
+        let why = run.error.clone().unwrap_or_else(|| "see its runs in DataBrain".into());
+        match run.status.as_str() {
+            "error" => {
+                r.failed = true;
+                let title = match after {
+                    Some(up) => format!("DataBrain: job run after \"{up}\" failed"),
+                    None => "DataBrain: scheduled job failed".into(),
+                };
+                r.notices.push((title, format!("{name}: {why}")));
+            }
+            "cancelled" => r.notices.push(("DataBrain: scheduled job stopped".into(), format!("{name}: {why}"))),
+            _ => {}
+        }
+    }
+    r
+}
 
 fn usage() -> ExitCode {
     eprintln!("usage: databrain-jobs tick [--force] | run <job name or id> [--set <parameter set>] [--param name=value]... | list");
@@ -72,26 +171,15 @@ async fn command(cmd: &str, args: &[String], state: &crate::api::AppState) -> Ex
             if !background::enabled(&state.workspace) && !args.iter().any(|a| a == "--force") {
                 return ExitCode::SUCCESS;
             }
-            let started = jobs::tick_as(&ctx, "background");
-            let _ = state.workspace.set_setting(background::LAST_TICK_SETTING, &serde_json::json!(databrain_workspace::now_ms()));
-            if started.is_empty() {
-                return ExitCode::SUCCESS;
+            let runs = background_tick(state, TICK_DEADLINE).await;
+            let report = tick_report(&state.workspace, &runs);
+            for line in &report.lines {
+                println!("{} {line}", when(databrain_workspace::now_ms()));
             }
-            jobs::wait_for(&ctx, &started).await;
-            let mut failed = false;
-            for id in &started {
-                let job = state.workspace.get_job(id).ok();
-                let name = job.as_ref().map(|j| j.name.clone()).unwrap_or_else(|| id.clone());
-                let run = state.workspace.job_runs(id, 1).ok().and_then(|r| r.into_iter().next());
-                let status = run.as_ref().map(|r| r.status.clone()).unwrap_or_default();
-                println!("{} {name}: {status}", when(databrain_workspace::now_ms()));
-                if status == "error" {
-                    failed = true;
-                    let why = run.and_then(|r| r.error).unwrap_or_else(|| "see its runs in DataBrain".into());
-                    background::notify("DataBrain: scheduled job failed", &format!("{name}: {why}"));
-                }
+            for (title, body) in &report.notices {
+                background::notify(title, body);
             }
-            if failed { ExitCode::from(1) } else { ExitCode::SUCCESS }
+            if report.failed { ExitCode::from(1) } else { ExitCode::SUCCESS }
         }
         "run" => {
             let Some(which) = args.get(1) else { return usage() };
@@ -137,7 +225,15 @@ async fn command(cmd: &str, args: &[String], state: &crate::api::AppState) -> Ex
                         );
                     }
                     println!("{}: {}", job.name, run.status);
-                    if run.status == "success" { ExitCode::SUCCESS } else { ExitCode::from(1) }
+                    // Jobs that run after this one (it succeeded) run before the command ends.
+                    let mut ok = run.status == "success";
+                    for id in jobs::wait_all(&ctx).await {
+                        let Some(after) = state.workspace.job_runs(&id, 1).ok().and_then(|r| r.into_iter().next()) else { continue };
+                        let name = state.workspace.get_job(&id).map(|j| j.name).unwrap_or(id);
+                        println!("{name} (after {}): {}", job.name, after.status);
+                        ok &= after.status == "success";
+                    }
+                    if ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
                 }
                 Err(e) => {
                     eprintln!("databrain-jobs: {}", e.message);

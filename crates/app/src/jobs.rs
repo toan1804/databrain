@@ -22,8 +22,9 @@
 //! Runs don't prompt (the job was set up by hand, or approved when the AI
 //! assistant built or ran it: the assistant's policy is checked then);
 //! read-only connections are still refused. SQL the assistant wrote
-//! (`JobNode::ai_sql`), and every step of a run the assistant starts, runs
-//! as its own queries, whoever starts the run: each step's SQL, a load's
+//! (`JobNode::ai_sql`), and every step of a run under the AI rules (one the
+//! assistant started, or a "run after" job started by such a run), runs as
+//! its own queries, whoever starts the run: each step's SQL, a load's
 //! before/after SQL and its write (the DuckDB sandbox on DuckDB targets),
 //! after the connection's AI rules as they are now. SQL DataBrain writes
 //! for a step (an export's COPY, a load's INSERTs) is the job's.
@@ -36,6 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use databrain_query_engine::{EngineError, EventHub, LoadDryRun, LoadEvent, LoadObserver, LoadSpec, QueryEngine, Result, RunRequest};
+use databrain_workspace::jobs::Due;
 use databrain_workspace::jobs::LOG_KEPT;
 use databrain_workspace::{
     FileFormat, Job, JobNode, JobNodeKind, JobRun, NodeRunRecord, NodeRunSummary, Origin, RunLogEntry, StepProgress, Workspace, duration_text, now_ms,
@@ -74,6 +76,9 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(200);
 
 /// Logged when another runner holds the job now.
 const LEASE_LOST: &str = "Stopped: another runner took this job (its lease ran out, e.g. while the computer slept); it runs there, not twice";
+/// Why a run stopped when its lease couldn't be renewed.
+const LEASE_UNRENEWED: &str =
+    "Stopped: the job's lease could not be renewed (the workspace kept failing), so the run stopped before another runner could take the job";
 
 /// Renew `owner`'s lease of `job_id`: `Some(true)` held, `Some(false)`
 /// another runner holds it, `None` the workspace kept failing (a few
@@ -89,6 +94,33 @@ async fn renew_lease(ws: &Workspace, job_id: &str, owner: &str) -> Option<bool> 
         }
     }
     None
+}
+
+/// What the heartbeat of a run does after trying to renew its lease.
+#[derive(Debug, PartialEq, Eq)]
+enum Beat {
+    /// Renewed.
+    Held,
+    /// The workspace failed (busy, locked): not a lost lease; the run goes
+    /// on while the lease still holds.
+    Going,
+    /// Another runner holds it (the lease ran out, e.g. while the computer
+    /// slept): stop, so it doesn't run twice.
+    Lost,
+    /// The workspace kept failing until the lease would run out before the
+    /// next try: stop before another runner could take the job.
+    Unrenewed,
+}
+
+/// The heartbeat's decision from [`renew_lease`]'s answer and the time since
+/// the lease was last renewed.
+fn beat(renewed: Option<bool>, since: Duration) -> Beat {
+    match renewed {
+        Some(true) => Beat::Held,
+        Some(false) => Beat::Lost,
+        None if since + LEASE_RENEW >= Duration::from_millis(LEASE_MS as u64) => Beat::Unrenewed,
+        None => Beat::Going,
+    }
 }
 
 /// After a run or a step is stopped (by the user, a time limit, a lost
@@ -113,6 +145,12 @@ pub struct JobsState {
     pub owner: String,
     /// Wait before a step's first retry (ms; see [`databrain_workspace::retry_delay`]).
     retry_base_ms: std::sync::atomic::AtomicU64,
+    /// Runs started in this process, (job id, run id), in order: what the
+    /// background runner reports (never another process's runs).
+    started: Mutex<Vec<(String, i64)>>,
+    /// Why a running job was stopped by the runner itself (lease lost,
+    /// lease not renewed, the background runner's deadline): its run's error.
+    stop_reasons: Mutex<HashMap<String, String>>,
 }
 
 impl Default for JobsState {
@@ -130,7 +168,18 @@ impl JobsState {
             steps: Mutex::default(),
             owner: format!("{kind}:{}:{}", std::process::id(), &n[..8]),
             retry_base_ms: (databrain_workspace::RETRY_DELAY.as_millis() as u64).into(),
+            started: Mutex::default(),
+            stop_reasons: Mutex::default(),
         }
+    }
+    /// The runs started in this process since the last call, (job id, run id).
+    pub fn take_started(&self) -> Vec<(String, i64)> {
+        std::mem::take(&mut *self.started.lock())
+    }
+    /// Stop a running job for `why` (recorded as its run's error).
+    pub fn stop_for(&self, job_id: &str, why: &str) -> bool {
+        self.stop_reasons.lock().entry(job_id.to_string()).or_insert_with(|| why.to_string());
+        self.cancel(job_id)
     }
     /// Change the wait before a step's first retry (tests).
     pub fn set_retry_delay(&self, d: Duration) {
@@ -154,6 +203,16 @@ impl JobsState {
                 true
             }
             None => false,
+        }
+    }
+    /// Mark `job_id` as running in this process, or not (`false`), without a run (tests).
+    #[doc(hidden)]
+    pub fn hold_for_tests(&self, job_id: &str, hold: bool) {
+        let mut r = self.running.lock();
+        if hold {
+            r.insert(job_id.to_string(), CancellationToken::new());
+        } else {
+            r.remove(job_id);
         }
     }
     pub fn cancel(&self, job_id: &str) -> bool {
@@ -328,7 +387,16 @@ impl Tracer {
     /// a step (`COPY … TO` an export file) is not the AI's and runs as the
     /// job's.
     fn step_origin(&self, node: &JobNode) -> Origin {
-        if node.ai_sql || self.live.lock().run.trigger == "ai" { Origin::Ai } else { Origin::Job }
+        let live = self.live.lock();
+        if node.ai_sql || live.run.trigger == "ai" || live.run.ai { Origin::Ai } else { Origin::Job }
+    }
+
+    /// A run under the AI rules that nobody approved: a "run after" start
+    /// from a run the assistant started (the user approved that run, not
+    /// this job's steps one by one, and can't be asked now).
+    fn unattended_ai(&self) -> bool {
+        let live = self.live.lock();
+        live.run.ai && live.run.trigger != "ai"
     }
 
     /// Set this step's progress; the run is sent at most every [`PROGRESS_EVERY`]
@@ -489,6 +557,12 @@ pub fn start(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>
 
 /// [`start`] with `:name` values for this run (see [`effective_params`]).
 pub fn start_with(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>>, over: Option<RunParams>) -> Result<JobRun> {
+    start_as(ctx, job_id, trigger, only, over, false)
+}
+
+/// [`start_with`]; `ai`: every step runs under the AI rules ([`JobRun::ai`]),
+/// as in a run the assistant started: a "run after" start from such a run.
+fn start_as(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<String>>, over: Option<RunParams>, ai: bool) -> Result<JobRun> {
     let job = ctx.workspace.get_job(job_id)?;
     if job.nodes.is_empty() {
         return Err(EngineError::new("invalid", "This job has no steps"));
@@ -526,15 +600,30 @@ pub fn start_with(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<St
             return Err(e.into());
         }
     };
+    let mut run = run;
+    if ai {
+        // Recorded before any step runs: if it can't be, the run doesn't start.
+        if let Err(e) = ctx.workspace.set_job_run_ai(run.id) {
+            ctx.jobs.started.lock().push((job_id.to_string(), run.id));
+            run.status = "error".into();
+            run.error = Some(format!("could not record that it runs under the AI rules: {e}"));
+            run.finished_at = Some(now_ms());
+            let _ = ctx.workspace.update_job_run(&run);
+            ctx.jobs.running.lock().remove(job_id);
+            let _ = ctx.workspace.release_job(job_id, &owner);
+            return Err(e.into());
+        }
+        run.ai = true;
+    }
     let _ = ctx.workspace.touch_job_run(run.id, &owner);
     // A missing set doesn't stop the start: the run's steps fail with why,
     // so a scheduled run reports it like any failure.
     let params = effective_params(&ctx.workspace, &job, over.as_ref());
-    let mut run = run;
     if let Ok((p, _)) = &params {
         let _ = ctx.workspace.set_job_run_params(run.id, p);
         run.params = p.clone();
     }
+    ctx.jobs.started.lock().push((job_id.to_string(), run.id));
     tracing::info!(job = job_id, run = run.id, trigger, steps = only.as_ref().map_or(job.nodes.len(), Vec::len), "job run started");
     emit(ctx, &run);
     let c = ctx.clone();
@@ -544,39 +633,130 @@ pub fn start_with(ctx: &JobCtx, job_id: &str, trigger: &str, only: Option<Vec<St
         let run_id = r.id;
         // Keep the lease and tell other processes the run is alive.
         let beat = {
-            let (ws, id, owner, stop) = (c.workspace.clone(), id.clone(), c.jobs.owner.clone(), cancel.clone());
+            let (ws, id, owner, stop, jobs) = (c.workspace.clone(), id.clone(), c.jobs.owner.clone(), cancel.clone(), c.jobs.clone());
             tokio::spawn(async move {
                 let mut renewed = Instant::now();
                 loop {
                     tokio::time::sleep(LEASE_RENEW).await;
-                    match renew_lease(&ws, &id, &owner).await {
-                        Some(true) => renewed = Instant::now(),
-                        // Lost (another runner took it after the lease ran out, e.g.
-                        // while the computer slept): stop, so it doesn't run twice.
-                        Some(false) => {
-                            tracing::warn!(job = %id, run = run_id, "job lease lost to another runner: stopping this run");
-                            stop.cancel();
-                            break;
+                    let why = match beat(renew_lease(&ws, &id, &owner).await, renewed.elapsed()) {
+                        Beat::Held => {
+                            renewed = Instant::now();
+                            None
                         }
-                        // The workspace keeps failing: keep running while the lease
-                        // still holds, stop before another runner could take it.
-                        None if renewed.elapsed() + LEASE_RENEW >= Duration::from_millis(LEASE_MS as u64) => {
-                            tracing::warn!(job = %id, run = run_id, "job lease could not be renewed before it runs out: stopping this run");
-                            stop.cancel();
-                            break;
-                        }
-                        None => {}
+                        Beat::Going => None,
+                        Beat::Lost => Some(LEASE_LOST),
+                        Beat::Unrenewed => Some(LEASE_UNRENEWED),
+                    };
+                    if let Some(why) = why {
+                        tracing::warn!(job = %id, run = run_id, why, "stopping this run");
+                        jobs.stop_reasons.lock().entry(id.clone()).or_insert_with(|| why.to_string());
+                        stop.cancel();
+                        break;
                     }
                     let _ = ws.touch_job_run(run_id, &owner);
                 }
             })
         };
+        let (whole, name) = (only.is_none() || r.trigger == "resume", job.name.clone());
+        // The jobs after a run the assistant started run under the AI rules too.
+        let ai = r.trigger == "ai" || r.ai;
         execute(&c, job, r, only, cancel, params).await;
         beat.abort();
+        c.jobs.stop_reasons.lock().remove(&id);
         let _ = c.workspace.release_job(&id, &c.jobs.owner);
+        // Before this job leaves `running`, so a runner waiting for it waits for them too.
+        if whole && c.workspace.job_runs(&id, 1).ok().and_then(|r| r.into_iter().next()).is_some_and(|r| r.id == run_id && r.status == "success") {
+            start_after(&c, &id, &name, ai);
+        }
         c.jobs.running.lock().remove(&id);
     });
     Ok(run)
+}
+
+/// Trigger of a run started because another job succeeded: `after:<its name>`.
+pub const AFTER_TRIGGER: &str = "after:";
+
+/// Start the jobs that run after `job_id` (it just succeeded as a whole).
+/// One that is running (here or in another process) is queued: the next
+/// scheduler pass, in either process, starts it once it is free.
+/// `ai`: the run that succeeded ran under the AI rules (the assistant
+/// started it, or it ran after one it started): so do these.
+fn start_after(ctx: &JobCtx, job_id: &str, job_name: &str, ai: bool) {
+    for (id, _) in ctx.workspace.jobs_after(job_id).unwrap_or_default() {
+        let trigger = format!("{AFTER_TRIGGER}{job_name}");
+        match start_as(ctx, &id, &trigger, None, None, ai) {
+            Ok(_) => tracing::info!(job = %id, after = job_id, "job started after the job it follows succeeded"),
+            // Running (here or elsewhere), or the workspace failed for a moment:
+            // queued, so the start isn't lost.
+            Err(e) if transient(&e) => {
+                tracing::info!(job = %id, after = job_id, error = %e.message, "job to run after another can't start now: queued for the next scheduler pass");
+                if let Err(q) = ctx.workspace.queue_job_after(&id, &trigger, ai) {
+                    tracing::warn!(job = %id, error = %q, "job to run after another could not be queued");
+                }
+            }
+            Err(e) => tracing::warn!(job = %id, after = job_id, error = %e.message, "job to run after another did not start"),
+        }
+    }
+}
+
+/// A start that may work later: the job is running (here or in another
+/// process), or the workspace failed (busy, locked). Not: no steps, a
+/// deleted job.
+fn transient(e: &EngineError) -> bool {
+    matches!(e.kind.as_str(), "busy" | "internal")
+}
+
+/// Start the queued "run after" starts ([`start_after`]) whose job is free
+/// now. Returns the jobs started.
+fn start_queued_after(ctx: &JobCtx) -> Vec<String> {
+    let mut started = Vec::new();
+    for (id, _) in ctx.workspace.queued_job_after().unwrap_or_default() {
+        if ctx.jobs.is_running(&id) || ctx.workspace.job_lease(&id).ok().flatten().is_some_and(|(_, until)| until > now_ms()) {
+            continue;
+        }
+        // Taken first, so only one process starts it; put back if it can't start yet.
+        let Ok(Some((trigger, ai))) = ctx.workspace.take_job_after(&id) else { continue };
+        match start_as(ctx, &id, &trigger, None, None, ai) {
+            Ok(_) => started.push(id),
+            Err(e) if transient(&e) => {
+                let _ = ctx.workspace.queue_job_after(&id, &trigger, ai);
+            }
+            Err(e) => tracing::warn!(job = %id, error = %e.message, "queued job to run after another did not start"),
+        }
+    }
+    started
+}
+
+/// For a failed run nobody started by hand: the failed steps' connections
+/// that sign in through the browser (or a device code), whose sign-in ends
+/// and can't be renewed without someone at the computer.
+fn sign_in_warning(ctx: &JobCtx, job: &Job, trigger: &str, failed: impl Fn(&str) -> bool) -> Option<String> {
+    if !unattended(trigger) {
+        return None;
+    }
+    let mut names: Vec<String> = Vec::new();
+    for n in job.nodes.iter().filter(|n| failed(&n.id)) {
+        for c in [&n.connection_id, &n.target_connection_id].into_iter().flatten() {
+            if let Ok(p) = ctx.workspace.get_connection(c)
+                && p.config.auth.is_interactive()
+                && !names.contains(&p.name)
+            {
+                names.push(p.name);
+            }
+        }
+    }
+    (!names.is_empty()).then(|| {
+        format!(
+            "{} sign{} in through the browser: when the sign-in has ended, a run nobody watches can't renew it. Sign in again in DataBrain, or use a sign-in that doesn't need a browser (a key, token or service account) for scheduled jobs",
+            names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", "),
+            if names.len() == 1 { "s" } else { "" }
+        )
+    })
+}
+
+/// Runs started with nobody at the computer (schedule, background runner, after another job).
+fn unattended(trigger: &str) -> bool {
+    matches!(trigger, "schedule" | "background") || trigger.starts_with(AFTER_TRIGGER)
 }
 
 fn record(node: &JobNode, status: &str, started: Option<Instant>, rows: Option<i64>, error: Option<String>) -> NodeRunRecord {
@@ -628,12 +808,16 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
     };
     tracer.params = Arc::new(params.map(|(p, _)| p.into_iter().collect()));
     let trigger = match run.trigger.as_str() {
-        "schedule" => "on its schedule",
-        "ai" => "by the AI assistant (approved)",
-        "background" => "on its schedule, by the background runner (DataBrain closed)",
-        "cli" => "from the command line (databrain-jobs)",
-        "resume" => "by hand, resuming the steps that did not succeed",
-        _ => "by hand",
+        "schedule" => "on its schedule".to_string(),
+        "ai" => "by the AI assistant (approved)".into(),
+        "background" => "on its schedule, by the background runner (DataBrain closed)".into(),
+        "cli" => "from the command line (databrain-jobs)".into(),
+        "resume" => "by hand, resuming the steps that did not succeed".into(),
+        t => match t.strip_prefix(AFTER_TRIGGER) {
+            Some(up) if run.ai => format!("after job \"{up}\" succeeded (a run the AI assistant started: every step runs under the AI rules)"),
+            Some(up) => format!("after job \"{up}\" succeeded"),
+            None => "by hand".into(),
+        },
     };
     tracer.log(
         "info",
@@ -699,6 +883,7 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
                 // is left to the heartbeat, which stops before the lease could expire.)
                 if !cancel.is_cancelled() && ready && slot && renew_lease(&ctx.workspace, &job.id, &ctx.jobs.owner).await == Some(false) {
                     tracer.log("error", LEASE_LOST, None, None, None);
+                    ctx.jobs.stop_reasons.lock().entry(job.id.clone()).or_insert_with(|| LEASE_LOST.to_string());
                     cancel.cancel();
                 }
                 // A step waiting for a slot that the user stopped on its own.
@@ -904,12 +1089,25 @@ async fn execute(ctx: &JobCtx, job: Job, run: JobRun, only: Option<Vec<String>>,
     } else {
         "success"
     };
+    if final_status == "error"
+        && let Some(w) = sign_in_warning(ctx, &job, &run.trigger, |id| status.get(id) == Some(&"error"))
+    {
+        tracer.log("warning", w, None, None, None);
+    }
     let nodes = tracer.with_run(|run| {
         run.status = final_status.into();
         run.error = match run_limit.filter(|_| timed_out) {
             Some(d) => Some(format!("Stopped: {}", timed_out_text(d))),
             None => run.nodes.iter().find(|r| r.summary.status == "error").map(|r| format!("{}: {}", r.name, r.summary.error.clone().unwrap_or_default())),
         };
+        // Stopped by the runner itself (lease lost or not renewed, the
+        // background runner's deadline): say why.
+        if final_status == "cancelled"
+            && run.error.is_none()
+            && let Some(why) = ctx.jobs.stop_reasons.lock().get(&job.id).cloned()
+        {
+            run.error = Some(why);
+        }
         run.finished_at = Some(now_ms());
         run.nodes.clone()
     });
@@ -1354,7 +1552,7 @@ async fn run_node(ctx: &JobCtx, job_id: &str, job_name: &str, node: &JobNode, up
     // connection may have become production or read-only, or lost "AI may
     // write" or a table.
     if origin == Origin::Ai {
-        ai_rules_now(ctx, node, &sql, &connection_id, t).await?;
+        ai_rules_now(ctx, job_id, node, &sql, &connection_id, t).await?;
     }
     // Checked before the query runs, so a missing folder fails fast.
     let folder = if node.kind == JobNodeKind::Export { Some(export_folder(node)?) } else { None };
@@ -1505,7 +1703,7 @@ pub fn load_spec(node: &JobNode) -> LoadSpec {
 /// complete unqualified names with the schema each connection's server
 /// says is current, asked now: `databrain-jobs tick` is a new process each
 /// time, and in the app what was learned before may be out of date.
-async fn ai_rules_now(ctx: &JobCtx, node: &JobNode, sql: &str, connection_id: &str, t: &Tracer) -> Result<()> {
+async fn ai_rules_now(ctx: &JobCtx, job_id: &str, node: &JobNode, sql: &str, connection_id: &str, t: &Tracer) -> Result<()> {
     let mut ids: Vec<&str> = vec![connection_id];
     for c in [&node.connection_id, &node.target_connection_id].into_iter().flatten() {
         if !c.is_empty() && !ids.contains(&c.as_str()) {
@@ -1528,7 +1726,7 @@ async fn ai_rules_now(ctx: &JobCtx, node: &JobNode, sql: &str, connection_id: &s
     for s in [&mut checked.load_before_sql, &mut checked.load_after_sql].into_iter().flatten() {
         *s = filled(s, target.as_deref());
     }
-    databrain_ai::jobs::review_step(&ctx.engine, &checked).map(|_| ()).map_err(|e| {
+    let mut confirm = databrain_ai::jobs::review_step(&ctx.engine, &checked).map_err(|e| {
         let why = match e {
             databrain_ai::AiError::Policy(r) => r,
             other => other.to_string(),
@@ -1537,7 +1735,27 @@ async fn ai_rules_now(ctx: &JobCtx, node: &JobNode, sql: &str, connection_id: &s
             "invalid",
             format!("Not run: the connection's AI settings no longer allow what the assistant wrote ({why}). See the connection's AI settings."),
         )
-    })
+    })?;
+    // What only the user may approve (a function that could write, rows
+    // copied out of masked columns): approved with the job or the run the
+    // assistant started, but a job started after that run was approved as
+    // a whole, not step by step, and nobody can be asked now: refused (the
+    // run approval said so), never dropped.
+    if t.unattended_ai() {
+        if let Ok(job) = ctx.workspace.get_job(job_id) {
+            confirm.extend(databrain_ai::jobs::copy_confirms(&ctx.engine, &job, node));
+        }
+        if !confirm.is_empty() {
+            return Err(EngineError::new(
+                "invalid",
+                format!(
+                    "Not run: this job started after a run the assistant started, and this step needs your approval, which can't be asked now ({}). Run the job yourself to run it.",
+                    confirm.join("; ")
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whose SQL a step's is outside a run (dry runs, loads): the AI's when it
@@ -1636,10 +1854,11 @@ pub fn tick(ctx: &JobCtx) -> Vec<String> {
 pub fn tick_as(ctx: &JobCtx, trigger: &str) -> Vec<String> {
     // Runs whose runner stopped (another process closed or crashed).
     let _ = ctx.workspace.close_stale_job_runs();
-    let now = now_ms();
     let owner = ctx.jobs.owner.clone();
-    let mut started = Vec::new();
+    let mut started = start_queued_after(ctx);
     for j in ctx.workspace.list_jobs().unwrap_or_default() {
+        // Per job: the queued starts and earlier jobs take time.
+        let now = now_ms();
         if !j.schedule.enabled || ctx.jobs.is_running(&j.id) || j.next_run_at.is_none_or(|t| t > now) {
             continue;
         }
@@ -1647,27 +1866,108 @@ pub fn tick_as(ctx: &JobCtx, trigger: &str) -> Vec<String> {
         if !ctx.workspace.claim_job(&j.id, &owner, now_ms() + LEASE_MS).unwrap_or(false) {
             continue;
         }
+        let release = || let_go(ctx, &j.id);
         let fresh = ctx.workspace.get_job(&j.id).ok();
-        let due = fresh.as_ref().and_then(|f| f.schedule.next_after(f.schedule_base())).is_some_and(|t| t <= now);
-        if !due {
-            let _ = ctx.workspace.release_job(&j.id, &owner);
-            continue;
-        }
+        // Missed runs: one for all (marked now), none, or one per missed time
+        // (marked at that time, so the next pass finds the next one due).
+        let mark = match fresh.as_ref().map_or(Due::No, |f| f.schedule.due(f.schedule_base_at(now), now)) {
+            Due::Run { mark } => mark,
+            Due::No => {
+                release();
+                continue;
+            }
+            // Skip is for times missed while nothing ran the scheduler: a time
+            // missed because the job was still running (a run by hand, a slow
+            // run, a "run after" chain) runs once it ends.
+            Due::Skip { mark } if fresh.as_ref().is_some_and(|f| ran_at_its_time(ctx, f, now)) => mark,
+            Due::Skip { mark } => {
+                tracing::info!(job = %j.id, "scheduled runs missed while nothing was running are skipped (the job's setting)");
+                let _ = ctx.workspace.mark_job_scheduled(&j.id, mark);
+                release();
+                continue;
+            }
+        };
         // Marked while the lease is held (a fast run could otherwise end and
         // release it before the mark, and another runner start it again)…
         let before = fresh.and_then(|f| f.last_scheduled_at);
-        let _ = ctx.workspace.mark_job_scheduled(&j.id, now);
+        // …and not started unmarked: it would be due again as soon as it
+        // ended, and run over and over while marking keeps failing.
+        if let Err(e) = ctx.workspace.mark_job_scheduled(&j.id, mark) {
+            tracing::warn!(job = %j.id, error = %e, "scheduled job not started: its start could not be recorded; tried again on the next tick");
+            release();
+            continue;
+        }
         match start(ctx, &j.id, trigger, None) {
             Ok(_) => started.push(j.id),
-            // …and given back when the run didn't start: the slot isn't used up.
-            Err(e) => {
-                tracing::warn!(job = %j.id, error = %e.message, "scheduled job did not start; it is tried again on the next tick");
-                let _ = ctx.workspace.set_job_last_scheduled(&j.id, before);
-                let _ = ctx.workspace.release_job(&j.id, &owner);
-            }
+            Err(e) => give_back(ctx, &j.id, mark, before, &e),
         }
     }
     started
+}
+
+/// Whether one of `job`'s recent runs was going at a scheduled time not yet
+/// counted (missed for being busy, not while nothing was running).
+fn ran_at_its_time(ctx: &JobCtx, job: &Job, now: i64) -> bool {
+    let base = job.schedule_base_at(now);
+    ctx.workspace.job_runs(&job.id, 5).unwrap_or_default().iter().any(|r| {
+        let end = r.finished_at.unwrap_or(now).min(now);
+        job.schedule.next_after(base.max(r.started_at - 1)).is_some_and(|slot| slot <= end)
+    })
+}
+
+/// Let go of a job the scheduler claimed and didn't start: unless a run of
+/// the job started in this process meanwhile (a job that runs after
+/// another, between the scheduler's check and its claim), which holds the
+/// lease (same owner) and must keep it.
+#[doc(hidden)]
+pub fn let_go(ctx: &JobCtx, job_id: &str) {
+    release_unless_running(ctx, job_id);
+}
+
+/// Release this process's lease on `job_id` unless a run of it started
+/// here: checked and released under the `running` lock, so a run starting
+/// meanwhile ([`start_as`] adds itself there before it claims the lease)
+/// can't have its lease released under it.
+fn release_unless_running(ctx: &JobCtx, job_id: &str) {
+    let running = ctx.jobs.running.lock();
+    if !running.contains_key(job_id) {
+        let _ = ctx.workspace.release_job(job_id, &ctx.jobs.owner);
+    }
+}
+
+/// A scheduled start that failed after the job was claimed and marked
+/// `mark`. A start that may work later gives the slot back (the next tick
+/// tries again) and the lease; except:
+/// - a run of the job started in this process meanwhile (a job that runs
+///   after another) holds the lease (same owner) and uses the slot;
+/// - another process holds the job ("busy"): it ran or runs it, the slot
+///   is used;
+/// - a start that can't work (no steps, the job is gone): the slot stays
+///   used, so it isn't tried again every tick;
+/// - another runner marked the slot meanwhile (the stored mark isn't ours,
+///   or our lease is gone): left as it is ([`Workspace::give_back_job_slot`]).
+#[doc(hidden)]
+pub fn give_back(ctx: &JobCtx, job_id: &str, mark: i64, before: Option<i64>, e: &EngineError) {
+    if ctx.jobs.is_running(job_id) {
+        tracing::info!(job = %job_id, "scheduled job is already running here (started after another job): this slot is used by that run");
+        return;
+    }
+    if e.kind == "busy" {
+        tracing::info!(job = %job_id, error = %e.message, "scheduled job runs in another process: this slot is used there");
+        return;
+    }
+    if !transient(e) {
+        tracing::warn!(job = %job_id, error = %e.message, "scheduled job can't start; it is tried at its next time");
+        release_unless_running(ctx, job_id);
+        return;
+    }
+    tracing::warn!(job = %job_id, error = %e.message, "scheduled job did not start; it is tried again on the next tick");
+    match ctx.workspace.give_back_job_slot(job_id, &ctx.jobs.owner, mark, before) {
+        Ok(true) => {}
+        Ok(false) => tracing::info!(job = %job_id, "the slot was used by another runner meanwhile: left as it is"),
+        Err(err) => tracing::warn!(job = %job_id, error = %err, "the slot could not be given back"),
+    }
+    release_unless_running(ctx, job_id);
 }
 
 /// Start a run and wait for it to end (command line). Returns the run as saved.
@@ -1685,6 +1985,25 @@ pub async fn run_and_wait_with(ctx: &JobCtx, job_id: &str, trigger: &str, params
 /// Wait until these jobs are no longer running in this process.
 pub async fn wait_for(ctx: &JobCtx, ids: &[String]) {
     while ids.iter().any(|id| ctx.jobs.is_running(id)) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Wait until no job runs in this process, also those started meanwhile
+/// (jobs that run after one that succeeded). Returns every job seen
+/// running, in the order first seen.
+pub async fn wait_all(ctx: &JobCtx) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let now = ctx.jobs.running_ids();
+        for id in &now {
+            if !seen.contains(id) {
+                seen.push(id.clone());
+            }
+        }
+        if now.is_empty() {
+            return seen;
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -1744,6 +2063,20 @@ mod tests {
         std::fs::write(&tmp, "c,d").unwrap();
         assert_eq!(finish_export(&tmp, &dest, true).unwrap(), None);
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "c,d");
+    }
+
+    #[test]
+    fn the_heartbeat_stops_only_when_it_must() {
+        let lease = Duration::from_millis(LEASE_MS as u64);
+        assert_eq!(beat(Some(true), lease * 2), Beat::Held);
+        // Another runner holds it: lost, at once.
+        assert_eq!(beat(Some(false), Duration::ZERO), Beat::Lost);
+        // A busy workspace is not a lost lease: the run goes on while the lease holds…
+        assert_eq!(beat(None, Duration::ZERO), Beat::Going);
+        assert_eq!(beat(None, lease - LEASE_RENEW - Duration::from_secs(1)), Beat::Going);
+        // …and stops before it could run out (the next try would be too late).
+        assert_eq!(beat(None, lease - LEASE_RENEW), Beat::Unrenewed);
+        assert_eq!(beat(None, lease), Beat::Unrenewed);
     }
 
     #[test]

@@ -55,7 +55,53 @@ fn validate(job: &Job) -> Result<()> {
         let names: Vec<&str> = job.nodes.iter().filter(|n| cycle.contains(&n.id)).map(|n| n.name.as_str()).collect();
         return Err(Error::Invalid(format!("steps depend on each other in a loop: {}", names.join(", "))));
     }
+    if let Some(p) = job.schedule.problem() {
+        return Err(Error::Invalid(format!("schedule: {p}")));
+    }
     Ok(())
+}
+
+/// A loop of "run after" between jobs that `job` (with its new
+/// `after_jobs`) would close, as job names: `job`, …, `job`.
+fn after_loop(job: &Job, others: &[(String, String, Vec<String>)]) -> Option<Vec<String>> {
+    let after = |id: &str| -> Vec<String> {
+        if id == job.id { job.schedule.after_jobs.clone() } else { others.iter().find(|o| o.0 == id).map(|o| o.2.clone()).unwrap_or_default() }
+    };
+    let name = |id: &str| if id == job.id { job.name.trim().to_string() } else { others.iter().find(|o| o.0 == id).map(|o| o.1.clone()).unwrap_or_default() };
+    // Depth-first from the job through what it runs after, back to it.
+    let mut stack = vec![(job.id.clone(), vec![job.id.clone()])];
+    let mut seen = std::collections::HashSet::new();
+    while let Some((id, path)) = stack.pop() {
+        for up in after(&id) {
+            if up == job.id {
+                // In run order: the job, the one that runs after it, …, the job again.
+                let mut names = vec![name(&job.id)];
+                names.extend(path[1..].iter().rev().map(|i| name(i)));
+                names.push(name(&job.id));
+                return Some(names);
+            }
+            if seen.insert(up.clone()) {
+                let mut p = path.clone();
+                p.push(up.clone());
+                stack.push((up, p));
+            }
+        }
+    }
+    None
+}
+
+/// Every job but `except`: (id, name, the jobs it runs after), read on `c`
+/// (inside a transaction).
+fn after_lists(c: &rusqlite::Connection, except: &str) -> Result<Vec<(String, String, Vec<String>)>> {
+    let mut stmt = c.prepare("SELECT id, name, spec_json FROM jobs WHERE id <> ?1")?;
+    let rows = stmt.query_map([except], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, name, json) = row?;
+        let after = serde_json::from_str::<Spec>(&json).map(|s| s.schedule.after_jobs).unwrap_or_default();
+        out.push((id, name, after));
+    }
+    Ok(out)
 }
 
 fn run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobRun> {
@@ -69,10 +115,11 @@ fn run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JobRun> {
         nodes: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
         error: r.get(7)?,
         params: r.get::<_, Option<String>>(8)?.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default(),
+        ai: r.get::<_, i64>(9)? != 0,
     })
 }
 
-const RUN_COLS: &str = "id, job_id, trigger, started_at, finished_at, status, nodes_json, error, params_json";
+const RUN_COLS: &str = "id, job_id, trigger, started_at, finished_at, status, nodes_json, error, params_json, ai";
 
 impl Workspace {
     pub fn list_jobs(&self) -> Result<Vec<JobSummary>> {
@@ -197,14 +244,31 @@ impl Workspace {
             // when based on an older one): two in one millisecond differ too.
             now = now.max(prev + 1);
         }
+        // "Run after" other jobs: existing ones, once each, not itself, no loop.
+        // Read and written in one write transaction: another process (the
+        // background runner, an MCP client) saving the other half of a loop
+        // at the same moment waits, then sees this one.
+        let mut c = self.conn.lock();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let others = after_lists(&tx, &job.id)?;
+        let mut after: Vec<String> = Vec::new();
+        for a in std::mem::take(&mut job.schedule.after_jobs) {
+            if a != job.id && others.iter().any(|o| o.0 == a) && !after.contains(&a) {
+                after.push(a);
+            }
+        }
+        job.schedule.after_jobs = after;
+        if let Some(names) = after_loop(&job, &others) {
+            return Err(Error::Invalid(format!("jobs would run after each other in a loop: {}", names.join(" → "))));
+        }
         job.updated_at = now;
         let spec = serde_json::to_string(&Spec::of(&job)).map_err(|e| Error::Invalid(e.to_string()))?;
-        let c = self.conn.lock();
-        c.execute(
+        tx.execute(
             "INSERT INTO jobs (id, name, spec_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, spec_json = excluded.spec_json, updated_at = excluded.updated_at",
             params![job.id, job.name.trim(), spec, job.created_at, job.updated_at],
         )?;
+        tx.commit()?;
         drop(c);
         self.get_job(&job.id)
     }
@@ -227,11 +291,88 @@ impl Workspace {
         Ok(n)
     }
 
+    /// Delete a job, its runs and queued starts; the jobs that ran
+    /// after it no longer do (their edit time is kept). One write
+    /// transaction: a crash leaves all of it or none, and a save of one of
+    /// those jobs at the same moment (another process) isn't overwritten
+    /// with its older spec.
     pub fn delete_job(&self, id: &str) -> Result<()> {
-        let c = self.conn.lock();
-        c.execute("DELETE FROM job_runs WHERE job_id = ?1", [id])?;
-        c.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
+        let mut c = self.conn.lock();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for table in ["job_runs", "job_after_pending"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE job_id = ?1"), [id])?;
+        }
+        tx.execute("DELETE FROM jobs WHERE id = ?1", [id])?;
+        let specs: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT id, spec_json FROM jobs")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (other, json) in specs {
+            let Ok(mut spec) = serde_json::from_str::<Spec>(&json) else { continue };
+            if !spec.schedule.after_jobs.iter().any(|a| a == id) {
+                continue;
+            }
+            spec.schedule.after_jobs.retain(|a| a != id);
+            let json = serde_json::to_string(&spec).map_err(|e| Error::Invalid(e.to_string()))?;
+            tx.execute("UPDATE jobs SET spec_json = ?2 WHERE id = ?1", params![other, json])?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    fn job_ids(&self) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut stmt = c.prepare("SELECT id FROM jobs")?;
+        Ok(stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Jobs (id, name) that run after `id` succeeds.
+    pub fn jobs_after(&self, id: &str) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for other in self.job_ids()? {
+            if let Ok(j) = self.get_job(&other)
+                && j.schedule.after_jobs.iter().any(|a| a == id)
+            {
+                out.push((j.id, j.name));
+            }
+        }
+        out.sort_by_key(|a| a.1.to_lowercase());
+        Ok(out)
+    }
+
+    /// Queue a "run after" start of `job_id` that couldn't happen now (the
+    /// job was running): the next scheduler pass, in either process, starts
+    /// it. `ai`: under the AI rules ([`JobRun::ai`]). A start of the user's
+    /// and one under the AI rules are kept apart (each runs as whose it is,
+    /// the user's isn't put under the AI rules); the same kind queued twice
+    /// is one start, in its first place in the queue.
+    pub fn queue_job_after(&self, job_id: &str, after: &str, ai: bool) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO job_after_pending (job_id, after, added_at, ai) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (job_id, ai) DO UPDATE SET after = excluded.after",
+            params![job_id, after, now_ms(), ai as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Jobs with a queued "run after" start: (job id, the job it follows).
+    pub fn queued_job_after(&self) -> Result<Vec<(String, String)>> {
+        let c = self.conn.lock();
+        let mut stmt = c.prepare("SELECT job_id, after FROM job_after_pending ORDER BY added_at, ai")?;
+        Ok(stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Take the oldest queued start of `job_id` (one process does): its
+    /// trigger and whether it runs under the AI rules, `None` when it isn't
+    /// queued (any more).
+    pub fn take_job_after(&self, job_id: &str) -> Result<Option<(String, bool)>> {
+        let c = self.conn.lock();
+        let got: Option<(String, i64)> = c
+            .query_row("SELECT after, ai FROM job_after_pending WHERE job_id = ?1 ORDER BY added_at, ai LIMIT 1", [job_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((after, ai)) = got else { return Ok(None) };
+        let n = c.execute("DELETE FROM job_after_pending WHERE job_id = ?1 AND after = ?2 AND ai = ?3", params![job_id, after, ai])?;
+        Ok((n == 1).then_some((after, ai != 0)))
     }
 
     /// Record that the scheduler started the job at `at` (not a user edit).
@@ -241,13 +382,23 @@ impl Workspace {
         Ok(())
     }
 
+    /// Give a scheduled slot back after its start failed: `last_scheduled_at`
+    /// goes back to `before` only if it is still `mark` (this process's) and
+    /// `owner` still holds the job's lease. False when another runner has
+    /// used the slot meanwhile (its mark, or its lease): left as it is.
+    pub fn give_back_job_slot(&self, id: &str, owner: &str, mark: i64, before: Option<i64>) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "UPDATE jobs SET last_scheduled_at = ?4 WHERE id = ?1 AND last_scheduled_at = ?3 AND lease_owner = ?2 AND lease_until >= ?5",
+            params![id, owner, mark, before, now_ms()],
+        )?;
+        Ok(n == 1)
+    }
+
     pub fn mark_job_scheduled(&self, id: &str, at: i64) -> Result<()> {
         self.conn.lock().execute("UPDATE jobs SET last_scheduled_at = ?2 WHERE id = ?1", params![id, at])?;
         Ok(())
     }
 
-    /// Make a job look saved and last scheduled at `at` (tests of schedules).
-    #[doc(hidden)]
     /// Make the job's lease run out now (tests: a computer that slept).
     #[doc(hidden)]
     pub fn expire_job_lease_for_tests(&self, id: &str) -> Result<()> {
@@ -255,6 +406,32 @@ impl Workspace {
         Ok(())
     }
 
+    /// Make a run look started (and last heard from) at `at` (tests of the
+    /// stale-run check: a runner that died).
+    #[doc(hidden)]
+    pub fn backdate_job_run_for_tests(&self, run_id: i64, at: i64) -> Result<()> {
+        self.conn.lock().execute("UPDATE job_runs SET started_at = ?2, heartbeat_at = ?2 WHERE id = ?1", params![run_id, at])?;
+        Ok(())
+    }
+
+    /// Make recording a scheduled start fail (`true`) or work again (tests:
+    /// a workspace that refuses writes for a while). A trigger of this
+    /// connection only, never saved.
+    #[doc(hidden)]
+    pub fn fail_job_marks_for_tests(&self, fail: bool) -> Result<()> {
+        let c = self.conn.lock();
+        if fail {
+            c.execute_batch(
+                "CREATE TEMP TRIGGER IF NOT EXISTS fail_job_marks BEFORE UPDATE OF last_scheduled_at ON jobs BEGIN SELECT RAISE(ABORT, 'database is locked (test)'); END",
+            )?;
+        } else {
+            c.execute_batch("DROP TRIGGER IF EXISTS temp.fail_job_marks")?;
+        }
+        Ok(())
+    }
+
+    /// Make a job look saved and last scheduled at `at` (tests of schedules).
+    #[doc(hidden)]
     pub fn backdate_job_for_tests(&self, id: &str, at: i64) -> Result<()> {
         self.conn.lock().execute("UPDATE jobs SET last_scheduled_at = ?2, updated_at = ?2 WHERE id = ?1", params![id, at])?;
         Ok(())
@@ -295,7 +472,14 @@ impl Workspace {
             nodes: vec![],
             error: None,
             params: Default::default(),
+            ai: false,
         })
+    }
+
+    /// Mark run `run_id` as running every step under the AI rules ([`JobRun::ai`]).
+    pub fn set_job_run_ai(&self, run_id: i64) -> Result<()> {
+        self.conn.lock().execute("UPDATE job_runs SET ai = 1 WHERE id = ?1", [run_id])?;
+        Ok(())
     }
 
     /// Record the `:name` values a run's steps get.
@@ -348,6 +532,15 @@ impl Workspace {
     }
 
     /// Newest first.
+    /// One run of a job, by id.
+    pub fn job_run(&self, job_id: &str, run_id: i64) -> Result<Option<JobRun>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(&format!("SELECT {RUN_COLS} FROM job_runs WHERE job_id = ?1 AND id = ?2"), params![job_id, run_id], run_from_row)
+            .optional()?)
+    }
+
     pub fn job_runs(&self, job_id: &str, limit: i64) -> Result<Vec<JobRun>> {
         let c = self.conn.lock();
         let mut stmt = c.prepare(&format!("SELECT {RUN_COLS} FROM job_runs WHERE job_id = ?1 ORDER BY id DESC LIMIT ?2"))?;
@@ -638,5 +831,115 @@ mod tests {
         assert_eq!((l.connection_id.as_deref(), l.target_table.as_deref(), l.export_folder.as_deref()), (None, Some("t"), None));
         assert!(l.key_columns.is_empty(), "insert doesn't use keys");
         assert_eq!(m.key_columns, vec!["id"]);
+    }
+
+    /// "Run after" other jobs: unknown ids, the job itself and repeats are
+    /// dropped; a loop is refused with its jobs named; deleting a job takes
+    /// it out of the lists; a broken schedule is refused.
+    #[test]
+    fn jobs_run_after_others_without_loops() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let named = |name: &str, step: &str, after: Vec<String>| {
+            let mut j = job(vec![node(step)], vec![]);
+            j.name = name.into();
+            j.schedule.after_jobs = after;
+            j
+        };
+        let a = ws.save_job(named("Extract", "ex", vec![])).unwrap();
+        let b = ws.save_job(named("Transform", "tr", vec![a.id.clone(), a.id.clone(), "gone".into()])).unwrap();
+        assert_eq!(b.schedule.after_jobs, vec![a.id.clone()]);
+        let mut b2 = b.clone();
+        b2.schedule.after_jobs.push(b.id.clone());
+        assert_eq!(ws.save_job(b2).unwrap().schedule.after_jobs, vec![a.id.clone()], "not after itself");
+        let c = ws.save_job(named("Report", "rp", vec![b.id.clone()])).unwrap();
+        assert_eq!(ws.jobs_after(&a.id).unwrap(), vec![(b.id.clone(), "Transform".to_string())]);
+
+        // Extract after Report: Extract → Transform → Report → Extract.
+        let mut a2 = a.clone();
+        a2.schedule.after_jobs = vec![c.id.clone()];
+        let e = ws.save_job(a2).unwrap_err().to_string();
+        assert!(e.contains("Extract → Transform → Report → Extract"), "{e}");
+        assert!(ws.get_job(&a.id).unwrap().schedule.after_jobs.is_empty(), "not saved");
+
+        // A schedule that can't run is refused (only when it is on).
+        let mut bad = ws.get_job(&c.id).unwrap();
+        bad.schedule.mode = ScheduleMode::Cron;
+        bad.schedule.cron = "61 * * * *".into();
+        assert!(ws.save_job(bad.clone()).is_ok(), "off: kept as typed");
+        bad.schedule.enabled = true;
+        assert!(ws.save_job(bad.clone()).unwrap_err().to_string().contains("minute"));
+        bad.schedule.time_zone = "Nowhere/City".into();
+        bad.schedule.cron = "0 6 * * *".into();
+        assert!(ws.save_job(bad).unwrap_err().to_string().contains("Nowhere/City"));
+
+        let edited = ws.get_job(&c.id).unwrap().updated_at;
+        ws.delete_job(&b.id).unwrap();
+        let c = ws.get_job(&c.id).unwrap();
+        assert!(c.schedule.after_jobs.is_empty());
+        assert_eq!(c.updated_at, edited, "its schedule base is kept");
+    }
+
+    /// Two processes saving the two halves of a loop at the same moment
+    /// (the app and an MCP client): the check and the write are one
+    /// transaction, so one is saved and the other refused, never both.
+    #[test]
+    fn a_loop_saved_from_two_processes_at_once_is_refused() {
+        let dir = std::env::temp_dir().join(format!("dbtest-ws-loop-{}", crate::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ws.db");
+        let (w1, w2) = (Workspace::open(&path).unwrap(), Workspace::open(&path).unwrap());
+        let named = |name: &str, step: &str| {
+            let mut j = job(vec![node(step)], vec![]);
+            j.name = name.into();
+            j
+        };
+        for round in 0..10 {
+            let a = w1.save_job(named(&format!("A{round}"), &format!("a{round}"))).unwrap();
+            let b = w1.save_job(named(&format!("B{round}"), &format!("b{round}"))).unwrap();
+            let (mut a2, mut b2) = (a.clone(), b.clone());
+            a2.schedule.after_jobs = vec![b.id.clone()];
+            b2.schedule.after_jobs = vec![a.id.clone()];
+            let gate = std::sync::Barrier::new(2);
+            let (r1, r2) = std::thread::scope(|s| {
+                let t1 = s.spawn(|| {
+                    gate.wait();
+                    w1.save_job(a2).map(drop)
+                });
+                let t2 = s.spawn(|| {
+                    gate.wait();
+                    w2.save_job(b2).map(drop)
+                });
+                (t1.join().unwrap(), t2.join().unwrap())
+            });
+            assert_eq!(r1.is_ok() as u8 + r2.is_ok() as u8, 1, "round {round}: {r1:?} {r2:?}");
+            let (a, b) = (w1.get_job(&a.id).unwrap(), w1.get_job(&b.id).unwrap());
+            assert!(a.schedule.after_jobs.is_empty() || b.schedule.after_jobs.is_empty(), "round {round}: a loop was saved");
+        }
+        drop((w1, w2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a job takes it out of every list in one go, its queued
+    /// starts with it; the other jobs' own settings are kept.
+    #[test]
+    fn deleting_a_job_cleans_up_everything_of_it() {
+        let ws = Workspace::open_in_memory().unwrap();
+        let mut a = job(vec![node("da")], vec![]);
+        a.name = "Gone".into();
+        let a = ws.save_job(a).unwrap();
+        let mut b = job(vec![node("db")], vec![]);
+        b.name = "Stays".into();
+        b.schedule.after_jobs = vec![a.id.clone()];
+        b.schedule.time_zone = "Europe/Paris".into();
+        let b = ws.save_job(b).unwrap();
+        ws.queue_job_after(&a.id, "after:X", false).unwrap();
+        ws.queue_job_after(&b.id, "after:Gone", false).unwrap();
+        ws.delete_job(&a.id).unwrap();
+        assert!(ws.get_job(&a.id).is_err());
+        let b = ws.get_job(&b.id).unwrap();
+        assert!(b.schedule.after_jobs.is_empty());
+        assert_eq!(b.schedule.time_zone, "Europe/Paris");
+        // Its own queued start goes; one it triggered for another job stays (it runs once).
+        assert_eq!(ws.queued_job_after().unwrap(), vec![(b.id.clone(), "after:Gone".to_string())]);
     }
 }

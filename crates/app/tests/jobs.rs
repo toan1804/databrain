@@ -1260,25 +1260,32 @@ async fn lost_lease_stops_the_run() {
     .await;
 }
 
-/// A scheduled job whose start fails keeps its slot: it is still due on
-/// the next tick, instead of waiting for the next period.
+/// A scheduled job that can't start (no steps) uses up its slot: it isn't
+/// tried again every tick, only at its next time; its lease is let go.
+/// (A start that may work later gives the slot back: see
+/// `a_failed_scheduled_start_gives_back_only_its_own_slot`.)
 #[tokio::test(flavor = "multi_thread")]
-async fn failed_scheduled_start_keeps_its_slot() {
-    let st = state();
-    let mut job = plain_job("Empty", vec![]);
-    job.schedule = JobSchedule { enabled: true, minutes: 60, ..Default::default() };
-    let job = st.workspace.save_job(job).unwrap();
-    let before = databrain_workspace::now_ms() - 7_200_000;
-    st.workspace.backdate_job_for_tests(&job.id, before).unwrap();
-    assert!(databrain_app::jobs::tick(&st.job_ctx()).is_empty(), "a job without steps doesn't start");
-    let after = st.workspace.get_job(&job.id).unwrap();
-    assert_eq!(after.last_scheduled_at, Some(before), "the slot is given back");
-    assert!(
-        st.workspace.list_jobs().unwrap().iter().find(|j| j.id == job.id).unwrap().next_run_at.is_some_and(|t| t <= databrain_workspace::now_ms()),
-        "still due"
-    );
-    assert!(st.workspace.job_lease(&job.id).unwrap().is_none(), "the lease is released");
+async fn a_job_that_cant_start_waits_for_its_next_time() {
+    guarded(async {
+        let st = state();
+        let mut job = plain_job("Empty", vec![]);
+        job.schedule = JobSchedule { enabled: true, minutes: 60, ..Default::default() };
+        let job = st.workspace.save_job(job).unwrap();
+        let before = databrain_workspace::now_ms() - 7_200_000;
+        st.workspace.backdate_job_for_tests(&job.id, before).unwrap();
+        assert!(databrain_app::jobs::tick(&st.job_ctx()).is_empty(), "a job without steps doesn't start");
+        let after = st.workspace.get_job(&job.id).unwrap();
+        assert!(after.last_scheduled_at.is_some_and(|t| t > before), "the slot is used: {:?}", after.last_scheduled_at);
+        assert!(
+            st.workspace.list_jobs().unwrap().iter().find(|j| j.id == job.id).unwrap().next_run_at.is_some_and(|t| t > databrain_workspace::now_ms()),
+            "not due again until its next time"
+        );
+        assert!(st.workspace.job_lease(&job.id).unwrap().is_none(), "the lease is released");
+        assert!(databrain_app::jobs::tick(&st.job_ctx()).is_empty());
+    })
+    .await;
 }
+
 /// A step whose SQL the assistant wrote is checked against the connection's
 /// AI settings each time it runs, not only when the job was approved: with
 /// AI turned off for the connection it stops, and says why. The user's own
@@ -1321,6 +1328,335 @@ async fn steps_the_assistant_wrote_follow_todays_ai_settings() {
         let run = run_all(&st, &job).await;
         let why = step(&run, "ai_write").error.unwrap_or_default();
         assert!(run.status == "error" && why.contains("not allowed for the AI"), "{why}");
+    })
+    .await;
+}
+
+/// A run the assistant started passes the AI rules on to the jobs that run
+/// after it: their steps run as the AI's (sandbox, today's AI settings),
+/// so a job of the user's on a connection where AI is off is refused. The
+/// same job after a run the user started runs as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn jobs_after_an_ai_run_follow_the_ai_rules() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let open = sqlite(&st, "open", &dir.path().join("open.db"), false);
+        let closed = sqlite(&st, "no_ai", &dir.path().join("closed.db"), false);
+        let mut p = st.workspace.get_connection(&closed).unwrap();
+        p.ai_policy.ai_enabled = false;
+        st.workspace.save_connection(p).unwrap();
+        let up = st.workspace.save_job(plain_job("Upstream AI", vec![node("a", "up_ai", JobNodeKind::Query, Some(&open), "select 1 as x")])).unwrap();
+        let mut down = plain_job("Mine after", vec![node("b", "mine_after", JobNodeKind::Query, Some(&closed), "select 2 as y")]);
+        down.schedule.after_jobs = vec![up.id.clone()];
+        let down = st.workspace.save_job(down).unwrap();
+
+        // The user's run: the job after it runs as before.
+        api::run_job(&st, &up.id, None).unwrap();
+        assert_eq!(finished(&st, &up.id).await.status, "success");
+        let r = next_run(&st, &down.id, None).await;
+        assert_eq!((r.status.as_str(), r.ai), ("success", false), "{r:?}");
+
+        // The assistant's run: the job after it runs under the AI rules and is refused.
+        databrain_app::jobs::start(&st.job_ctx(), &up.id, "ai", None).unwrap();
+        assert_eq!(finished(&st, &up.id).await.status, "success");
+        let r2 = next_run(&st, &down.id, Some(r.id)).await;
+        assert!(r2.ai && r2.trigger == "after:Upstream AI", "{r2:?}");
+        let why = step(&r2, "mine_after").error.unwrap_or_default();
+        assert!(r2.status == "error" && why.contains("AI is disabled"), "{why}");
+        let log = st.workspace.job_run_log(&down.id, r2.id).unwrap();
+        assert!(log[0].message.contains("every step runs under the AI rules"), "{:?}", log[0]);
+    })
+    .await
+    .expect("test hung");
+}
+
+/// A job started after the assistant's run can't ask the user anything: a
+/// step that needs the user's approval (rows copied out of a connection
+/// that doesn't share its rows) is refused there, with why, while the
+/// job's other steps run. The same job run by the user, or by the
+/// assistant directly (approved with its steps), copies the rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_after_the_assistants_run_asks_nothing() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let open = sqlite(&st, "open", &dir.path().join("open.db"), false);
+        let masked = sqlite(&st, "masked", &dir.path().join("masked.db"), false);
+        let mut p = st.workspace.get_connection(&open).unwrap();
+        p.ai_policy.allow_write = true;
+        st.workspace.save_connection(p).unwrap();
+        let mut p = st.workspace.get_connection(&masked).unwrap();
+        p.ai_policy.share_result_rows = false;
+        st.workspace.save_connection(p).unwrap();
+        let up = st.workspace.save_job(plain_job("Ask up", vec![node("a", "ask_up", JobNodeKind::Query, Some(&open), "select 1 as x")])).unwrap();
+        let mut copy = node("c", "ask_copy", JobNodeKind::Load, None, "");
+        copy.target_connection_id = Some(open.clone());
+        copy.target_table = Some("copied".into());
+        let mut down = plain_job(
+            "Ask copy",
+            vec![
+                node("b", "ask_rows", JobNodeKind::Query, Some(&masked), "select 7 as v"),
+                copy,
+                node("d", "ask_other", JobNodeKind::Query, Some(&open), "select 2 as y"),
+            ],
+        );
+        down.edges = vec![JobEdge { from: "b".into(), to: "c".into() }];
+        down.schedule.after_jobs = vec![up.id.clone()];
+        let down = st.workspace.save_job(down).unwrap();
+
+        // Refused: started after the assistant's run.
+        databrain_app::jobs::start(&st.job_ctx(), &up.id, "ai", None).unwrap();
+        assert_eq!(finished(&st, &up.id).await.status, "success");
+        let r = next_run(&st, &down.id, None).await;
+        assert!(r.ai, "{r:?}");
+        let why = step(&r, "ask_copy").error.unwrap_or_default();
+        assert!(why.contains("needs your approval, which can't be asked now") && why.contains("copies rows from"), "{why}");
+        assert_eq!(step(&r, "ask_other").status, "success", "its other steps run");
+        assert!(rows(&st, &open, "select count(*) from sqlite_master where name = 'copied'").await == vec![vec!["0".to_string()]]);
+
+        // Allowed: the user's run of the same job.
+        api::run_job(&st, &down.id, None).unwrap();
+        let u = finished(&st, &down.id).await;
+        assert!(!u.ai && u.status == "success", "{u:?}");
+        assert_eq!(rows(&st, &open, "select v from copied").await, vec![vec!["7".to_string()]]);
+
+        // Allowed: the assistant's own approved run of it.
+        databrain_app::jobs::start(&st.job_ctx(), &down.id, "ai", None).unwrap();
+        let a = finished(&st, &down.id).await;
+        assert_eq!(a.status, "success", "{a:?}");
+    })
+    .await;
+}
+
+/// The AI rules pass along a chain of "run after" jobs, through the queue
+/// and to the background runner (another process taking the queued
+/// start): a job after one after the assistant's run is refused where AI is
+/// off. A run the user starts afterwards, of the same jobs, is the user's.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ai_rules_follow_chains_the_queue_and_the_runner() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.db");
+        let open_state = |kind: &str| {
+            let mut st = AppState::new(Arc::new(Workspace::open(&path).unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+            st.jobs = Arc::new(databrain_app::jobs::JobsState::new(kind));
+            st
+        };
+        let (app, cli) = (open_state("app"), open_state("cli"));
+        let open = sqlite(&app, "open", &dir.path().join("open.db"), false);
+        let closed = sqlite(&app, "no_ai", &dir.path().join("closed.db"), false);
+        let mut p = app.workspace.get_connection(&closed).unwrap();
+        p.ai_policy.ai_enabled = false;
+        app.workspace.save_connection(p).unwrap();
+        let up = app.workspace.save_job(plain_job("Chain up", vec![node("a", "chain_up", JobNodeKind::Query, Some(&open), "select 1 as x")])).unwrap();
+        let mut mid = plain_job("Chain mid", vec![node("b", "chain_mid", JobNodeKind::Query, Some(&open), "select 2 as y")]);
+        mid.schedule.after_jobs = vec![up.id.clone()];
+        let mid = app.workspace.save_job(mid).unwrap();
+        let mut leaf = plain_job("Chain leaf", vec![node("c", "chain_leaf", JobNodeKind::Query, Some(&closed), "select 3 as z")]);
+        leaf.schedule.after_jobs = vec![mid.id.clone()];
+        let leaf = app.workspace.save_job(leaf).unwrap();
+
+        // The assistant's run: mid and leaf run under the AI rules; leaf is refused.
+        databrain_app::jobs::start(&app.job_ctx(), &up.id, "ai", None).unwrap();
+        assert_eq!(finished(&app, &up.id).await.status, "success");
+        let m = next_run(&app, &mid.id, None).await;
+        assert!(m.ai && m.status == "success", "{m:?}");
+        let l = next_run(&app, &leaf.id, None).await;
+        assert!(l.ai && l.status == "error", "{l:?}");
+        assert!(step(&l, "chain_leaf").error.unwrap_or_default().contains("AI is disabled"));
+
+        // Mid is busy when the assistant's run succeeds: queued under the AI
+        // rules, and the background runner (another process) starts it so.
+        app.jobs.hold_for_tests(&mid.id, true);
+        databrain_app::jobs::start(&app.job_ctx(), &up.id, "ai", None).unwrap();
+        assert_eq!(finished(&app, &up.id).await.status, "success");
+        assert_eq!(app.workspace.queued_job_after().unwrap().len(), 1);
+        app.jobs.hold_for_tests(&mid.id, false);
+        assert!(databrain_app::jobs::tick_as(&cli.job_ctx(), "background").contains(&mid.id));
+        let m2 = next_run(&cli, &mid.id, Some(m.id)).await;
+        assert!(m2.ai && m2.status == "success" && m2.trigger == "after:Chain up", "{m2:?}");
+        // …and its follower too, still under the AI rules.
+        let l2 = next_run(&cli, &leaf.id, Some(l.id)).await;
+        assert!(l2.ai && l2.status == "error", "{l2:?}");
+
+        // The user's own run of the same jobs afterwards: theirs, all of it.
+        api::run_job(&app, &up.id, None).unwrap();
+        let u = finished(&app, &up.id).await;
+        assert!(!u.ai && u.status == "success", "{u:?}");
+        let m3 = next_run(&app, &mid.id, Some(m2.id)).await;
+        assert!(!m3.ai && m3.status == "success", "{m3:?}");
+        let l3 = next_run(&app, &leaf.id, Some(l2.id)).await;
+        assert!(!l3.ai && l3.status == "success", "{l3:?}");
+        // And a run of the leaf by hand: the user's.
+        api::run_job(&app, &leaf.id, None).unwrap();
+        let l4 = finished(&app, &leaf.id).await;
+        assert!(!l4.ai && l4.status == "success", "{l4:?}");
+    })
+    .await;
+}
+
+/// Wait (bounded) for `job`'s newest run to be one other than `not` and finished.
+async fn next_run(st: &AppState, job: &str, not: Option<i64>) -> JobRun {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(r) = st.workspace.job_runs(job, 1).unwrap().into_iter().next()
+                && Some(r.id) != not
+                && r.status != "running"
+                && !st.jobs.is_running(job)
+            {
+                return r;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the run finished")
+}
+
+/// "Run after": a job starts when the job it follows succeeds as a whole
+/// (trigger `after:<name>`, named in its log), not when it fails, nor for a
+/// run of chosen steps only.
+#[tokio::test(flavor = "multi_thread")]
+async fn jobs_run_after_the_job_they_follow_succeeds() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let conn = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let up = st.workspace.save_job(plain_job("Extract", vec![node("a", "extracted", JobNodeKind::Query, Some(&conn), "select 1 as x")])).unwrap();
+        let mut down = plain_job("Report", vec![node("b", "reported", JobNodeKind::Query, Some(&conn), "select 2 as y")]);
+        down.schedule.after_jobs = vec![up.id.clone()];
+        let down = st.workspace.save_job(down).unwrap();
+
+        api::run_job(&st, &up.id, None).unwrap();
+        assert_eq!(finished(&st, &up.id).await.status, "success");
+        let r = next_run(&st, &down.id, None).await;
+        assert_eq!((r.trigger.as_str(), r.status.as_str()), ("after:Extract", "success"), "{r:?}");
+        let log = st.workspace.job_run_log(&down.id, r.id).unwrap();
+        assert!(log[0].message.contains("started after job \"Extract\" succeeded"), "{:?}", log[0]);
+
+        // Only the chosen steps: not the job as a whole, the next one doesn't start.
+        // (A follower is started, or queued, before the job it follows leaves
+        // `running`: once `finished` returns, it would be there.)
+        api::run_job(&st, &up.id, Some(vec!["a".into()])).unwrap();
+        assert_eq!(finished(&st, &up.id).await.status, "success");
+        assert_eq!(st.workspace.job_runs(&down.id, 10).unwrap().len(), 1);
+        assert!(!st.jobs.is_running(&down.id) && st.workspace.queued_job_after().unwrap().is_empty());
+
+        // A failed run doesn't start it.
+        let mut broken = st.workspace.get_job(&up.id).unwrap();
+        broken.nodes[0].sql = "select * from no_such_table".into();
+        st.workspace.save_job(broken).unwrap();
+        api::run_job(&st, &up.id, None).unwrap();
+        assert_eq!(finished(&st, &up.id).await.status, "error");
+        assert_eq!(st.workspace.job_runs(&down.id, 10).unwrap().len(), 1);
+        assert!(!st.jobs.is_running(&down.id) && st.workspace.queued_job_after().unwrap().is_empty());
+
+        // A loop is refused when saved.
+        let mut looped = st.workspace.get_job(&up.id).unwrap();
+        looped.schedule.after_jobs = vec![down.id.clone()];
+        let e = api::save_job(&st, looped).unwrap_err();
+        assert!(e.message.contains("Extract → Report → Extract"), "{}", e.message);
+    })
+    .await;
+}
+
+/// Missed runs: "each" makes up every missed time, one run after the other
+/// (each counted from its own time); "skip" drops old ones without a run.
+#[tokio::test(flavor = "multi_thread")]
+async fn missed_runs_follow_the_jobs_policy() {
+    guarded(async {
+        use databrain_workspace::{MissedRuns, ScheduleMode};
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let conn = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let hour = 3_600_000;
+        let now = databrain_workspace::now_ms();
+        // Hourly in a zone whose hours start half an hour from now (an offset of
+        // whole minutes), so the test never meets a new hour while it runs.
+        let off = (hour / 2 - now).rem_euclid(hour) / 60_000;
+        let zone = format!("+00:{off:02}");
+        let slot = now - (now + off * 60_000).rem_euclid(hour); // the last hour start before now
+        // Last counted 3.5 h before it: 4 missed times.
+        let base = slot - 3 * hour - hour / 2;
+        let mut job = plain_job("Hourly", vec![node("a", "hourly_rows", JobNodeKind::Query, Some(&conn), "select 1 as x")]);
+        job.schedule = JobSchedule { enabled: true, minutes: 60, time_zone: zone, missed: MissedRuns::Each, ..Default::default() };
+        let job = st.workspace.save_job(job).unwrap();
+        st.workspace.backdate_job_for_tests(&job.id, base).unwrap();
+        let mut marks = Vec::new();
+        let mut last = None;
+        for _ in 0..10 {
+            if databrain_app::jobs::tick(&st.job_ctx()).is_empty() {
+                break;
+            }
+            let r = next_run(&st, &job.id, last).await;
+            assert_eq!((r.trigger.as_str(), r.status.as_str()), ("schedule", "success"));
+            last = Some(r.id);
+            marks.push(st.workspace.get_job(&job.id).unwrap().last_scheduled_at.unwrap());
+        }
+        let expected: Vec<i64> = (0..4).map(|i| base + hour / 2 + i * hour).collect();
+        assert_eq!(marks, expected, "one run per missed hour, oldest first");
+
+        // Skip: daily at a time 2 h ago, last counted days ago → no run, counted from now.
+        let two_h_ago = chrono::Utc::now() - chrono::Duration::hours(2);
+        let mut j = st.workspace.get_job(&job.id).unwrap();
+        j.schedule = JobSchedule {
+            enabled: true,
+            mode: ScheduleMode::Daily,
+            at: two_h_ago.format("%H:%M").to_string(),
+            time_zone: "UTC".into(),
+            missed: MissedRuns::Skip,
+            ..Default::default()
+        };
+        st.workspace.save_job(j).unwrap();
+        st.workspace.backdate_job_for_tests(&job.id, now - 3 * 24 * hour).unwrap();
+        let runs = st.workspace.job_runs(&job.id, 50).unwrap().len();
+        assert!(databrain_app::jobs::tick(&st.job_ctx()).is_empty());
+        assert_eq!(st.workspace.job_runs(&job.id, 50).unwrap().len(), runs);
+        assert!(st.workspace.get_job(&job.id).unwrap().last_scheduled_at.unwrap() >= now);
+        assert!(databrain_app::jobs::tick(&st.job_ctx()).is_empty(), "and it isn't due again until tomorrow");
+
+        // Skip, but the time was missed because the job was running then (a
+        // run by hand that lasted past it): it runs once that run has ended.
+        st.workspace.backdate_job_for_tests(&job.id, now - 3 * 24 * hour).unwrap();
+        let mut busy = st.workspace.start_job_run(&job.id, "manual").unwrap();
+        let slot = two_h_ago.timestamp_millis() / 60_000 * 60_000;
+        st.workspace.backdate_job_run_for_tests(busy.id, slot - 5 * 60_000).unwrap();
+        busy.status = "success".into();
+        busy.finished_at = Some(slot + 20 * 60_000);
+        st.workspace.update_job_run(&busy).unwrap();
+        assert_eq!(databrain_app::jobs::tick(&st.job_ctx()), vec![job.id.clone()], "missed while busy: it runs");
+        finished(&st, &job.id).await;
+    })
+    .await;
+}
+
+/// A scheduled run that fails on a connection with browser sign-in says so
+/// in its log; a run by hand doesn't.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_scheduled_run_names_browser_sign_in() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let conn = sqlite(&st, "warehouse", &dir.path().join("w.db"), false);
+        let mut p = st.workspace.get_connection(&conn).unwrap();
+        p.config.auth = AuthMethod::OauthBrowser(Default::default());
+        st.workspace.save_connection(p).unwrap();
+        let mut job = plain_job("Nightly", vec![node("a", "nightly_fail", JobNodeKind::Query, Some(&conn), "select * from no_such_table")]);
+        job.schedule = JobSchedule { enabled: true, minutes: 5, ..Default::default() };
+        let job = st.workspace.save_job(job).unwrap();
+
+        api::run_job(&st, &job.id, None).unwrap();
+        let r = finished(&st, &job.id).await;
+        assert_eq!(r.status, "error");
+        let hint = |run: &JobRun| st.workspace.job_run_log(&job.id, run.id).unwrap().iter().any(|l| l.message.contains("signs in through the browser"));
+        assert!(!hint(&r), "by hand: someone is there to sign in");
+
+        st.workspace.backdate_job_for_tests(&job.id, databrain_workspace::now_ms() - 3_600_000).unwrap();
+        assert_eq!(databrain_app::jobs::tick(&st.job_ctx()).len(), 1);
+        let r = next_run(&st, &job.id, Some(r.id)).await;
+        assert_eq!((r.trigger.as_str(), r.status.as_str()), ("schedule", "error"));
+        assert!(hint(&r), "{:?}", st.workspace.job_run_log(&job.id, r.id).unwrap());
     })
     .await;
 }
@@ -1499,6 +1835,113 @@ async fn steps_at_once_stay_within_the_limits() {
     .expect("test hung");
 }
 
+/// "Run after" a job that is busy: the start is queued, not lost, and the
+/// next scheduler pass starts it once the job is free.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_after_a_busy_job_is_queued() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state();
+        let conn = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let up = st.workspace.save_job(plain_job("Upstream", vec![node("a", "up_done", JobNodeKind::Query, Some(&conn), "select 1 as x")])).unwrap();
+        let mut down = plain_job("Follower", vec![node("b", "follower_done", JobNodeKind::Query, Some(&conn), "select 2 as y")]);
+        down.schedule.after_jobs = vec![up.id.clone()];
+        let down = st.workspace.save_job(down).unwrap();
+
+        // The follower is running here (held) while the upstream succeeds: queued.
+        st.jobs.hold_for_tests(&down.id, true);
+        api::run_job(&st, &up.id, None).unwrap();
+        assert_eq!(finished(&st, &up.id).await.status, "success");
+        assert_eq!(st.workspace.queued_job_after().unwrap(), vec![(down.id.clone(), "after:Upstream".to_string())]);
+        assert!(st.workspace.job_runs(&down.id, 5).unwrap().is_empty());
+        // Still busy: a pass leaves it queued.
+        assert!(!databrain_app::jobs::tick(&st.job_ctx()).contains(&down.id));
+        assert_eq!(st.workspace.queued_job_after().unwrap().len(), 1);
+
+        // Free: the next pass starts it, with the trigger it was queued with.
+        st.jobs.hold_for_tests(&down.id, false);
+        assert!(databrain_app::jobs::tick(&st.job_ctx()).contains(&down.id));
+        let run = finished(&st, &down.id).await;
+        assert_eq!((run.trigger.as_str(), run.status.as_str()), ("after:Upstream", "success"), "{run:?}");
+        assert!(st.workspace.queued_job_after().unwrap().is_empty());
+        // A user's start and one under the AI rules are kept apart, each run as
+        // whose it is (the user's isn't put under the AI rules), oldest first;
+        // the same kind queued twice is one start. Each is taken once.
+        st.workspace.queue_job_after(&down.id, "after:Upstream", false).unwrap();
+        st.workspace.queue_job_after(&down.id, "after:Upstream", true).unwrap();
+        st.workspace.queue_job_after(&down.id, "after:Upstream", false).unwrap();
+        assert_eq!(st.workspace.queued_job_after().unwrap().len(), 2);
+        assert_eq!(st.workspace.take_job_after(&down.id).unwrap(), Some(("after:Upstream".to_string(), false)));
+        assert_eq!(st.workspace.take_job_after(&down.id).unwrap(), Some(("after:Upstream".to_string(), true)));
+        assert_eq!(st.workspace.take_job_after(&down.id).unwrap(), None);
+    })
+    .await
+    .expect("in time");
+}
+
+/// A scheduled start that failed gives back its slot and lease when it may
+/// work later, and only its own: not while a run of the job started here
+/// meanwhile holds the lease, not when another process runs the job
+/// ("busy"), not when another runner has marked the slot since.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_scheduled_start_gives_back_only_its_own_slot() {
+    use databrain_query_engine::EngineError;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workspace.db");
+    let open = |kind: &str| {
+        let mut st = AppState::new(Arc::new(Workspace::open(&path).unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+        st.jobs = Arc::new(databrain_app::jobs::JobsState::new(kind));
+        st
+    };
+    let (app, cli) = (open("app"), open("cli"));
+    let ctx = app.job_ctx();
+    let job = app.workspace.save_job(plain_job("Slot", vec![node("a", "slot_step", JobNodeKind::Query, None, "select 1")])).unwrap();
+    let transient = EngineError::new("internal", "database is locked");
+    let before = Some(1_000);
+    let claim_and_mark = |mark: i64| {
+        assert!(app.workspace.claim_job(&job.id, &app.jobs.owner, databrain_workspace::now_ms() + 90_000).unwrap());
+        app.workspace.mark_job_scheduled(&job.id, mark).unwrap();
+    };
+    let lease = || app.workspace.job_lease(&job.id).unwrap().map(|(o, _)| o);
+    let slot = || app.workspace.get_job(&job.id).unwrap().last_scheduled_at;
+
+    // Allowed: our mark, our lease, a start that may work later → given back.
+    claim_and_mark(5_000);
+    databrain_app::jobs::give_back(&ctx, &job.id, 5_000, before, &transient);
+    assert_eq!((slot(), lease()), (before, None));
+
+    // Refused: a run of the job started here meanwhile holds the lease and uses the slot.
+    claim_and_mark(6_000);
+    app.jobs.hold_for_tests(&job.id, true);
+    databrain_app::jobs::give_back(&ctx, &job.id, 6_000, before, &transient);
+    assert_eq!((slot(), lease()), (Some(6_000), Some(app.jobs.owner.clone())));
+    // The scheduler's let-go (no run due, missed runs skipped) leaves it too.
+    databrain_app::jobs::let_go(&ctx, &job.id);
+    assert_eq!(lease(), Some(app.jobs.owner.clone()), "the running run keeps its lease");
+    app.jobs.hold_for_tests(&job.id, false);
+    databrain_app::jobs::let_go(&ctx, &job.id);
+    assert_eq!(lease(), None, "let go when nothing of the job runs here");
+
+    // Refused: another process holds the job ("busy"): it used the slot.
+    claim_and_mark(7_000);
+    databrain_app::jobs::give_back(&ctx, &job.id, 7_000, before, &EngineError::new("busy", "already running by the background runner"));
+    assert_eq!(slot(), Some(7_000));
+    app.workspace.release_job(&job.id, &app.jobs.owner).unwrap();
+
+    // Refused: our lease ran out and the background runner took the job and
+    // marked its own slot: ours isn't given back over it, its lease stays.
+    claim_and_mark(8_000);
+    app.workspace.expire_job_lease_for_tests(&job.id).unwrap();
+    assert!(cli.workspace.claim_job(&job.id, &cli.jobs.owner, databrain_workspace::now_ms() + 90_000).unwrap());
+    cli.workspace.mark_job_scheduled(&job.id, 9_000).unwrap();
+    databrain_app::jobs::give_back(&ctx, &job.id, 8_000, before, &transient);
+    assert_eq!((slot(), lease()), (Some(9_000), Some(cli.jobs.owner.clone())));
+    // Same mark but not our lease: not given back either.
+    cli.workspace.mark_job_scheduled(&job.id, 8_000).unwrap();
+    databrain_app::jobs::give_back(&ctx, &job.id, 8_000, before, &transient);
+    assert_eq!((slot(), lease()), (Some(8_000), Some(cli.jobs.owner.clone())));
+}
+
 /// A step waiting for a slot can be stopped on its own: it never starts,
 /// the steps after it are cancelled, the running one goes on.
 #[tokio::test(flavor = "multi_thread")]
@@ -1532,6 +1975,188 @@ async fn a_waiting_step_can_be_stopped() {
     })
     .await
     .expect("in time");
+}
+
+/// `databrain-jobs tick` end to end: every run it started is reported (a
+/// job made up twice: both), a failed one is notified and fails the
+/// command, and runs of another process (the app) aren't its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_background_tick_reports_its_own_runs() {
+    use databrain_app::cli::jobs::{background_tick, tick_report};
+    use databrain_workspace::MissedRuns;
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.db");
+        let open = |kind: &str| {
+            let mut st = AppState::new(Arc::new(Workspace::open(&path).unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+            st.jobs = Arc::new(databrain_app::jobs::JobsState::new(kind));
+            st
+        };
+        let (app, cli) = (open("app"), open("cli"));
+        let conn = sqlite(&app, "src", &dir.path().join("src.db"), false);
+        // The first run fails (the check wants 2 rows), the second succeeds.
+        rows(&app, &conn, "create table c (x integer); create table u (n integer check (n > 1)); select 1").await;
+        let sql = "insert into c values (1); insert into u select count(*) from c; select count(*) as n from c";
+        let mut job = plain_job("Twice", vec![node("a", "twice_rows", JobNodeKind::Query, Some(&conn), sql)]);
+        // Hourly, two missed hours, one run each; in a zone whose hours start
+        // half an hour from now, so no new hour comes while the test runs.
+        let hour = 3_600_000;
+        let now = databrain_workspace::now_ms();
+        let off = (hour / 2 - now).rem_euclid(hour) / 60_000;
+        job.schedule = JobSchedule { enabled: true, minutes: 60, time_zone: format!("+00:{off:02}"), missed: MissedRuns::Each, ..Default::default() };
+        let job = app.workspace.save_job(job).unwrap();
+        let slot = now - (now + off * 60_000).rem_euclid(hour);
+        app.workspace.backdate_job_for_tests(&job.id, slot - hour - hour / 2).unwrap();
+        // A job the app runs meanwhile: not the runner's.
+        let other = app.workspace.save_job(plain_job("App's", vec![node("a", "apps_rows", JobNodeKind::Query, Some(&conn), "select 1 as x")])).unwrap();
+        api::run_job(&app, &other.id, None).unwrap();
+
+        let runs = background_tick(&cli, Duration::from_secs(120)).await;
+        assert_eq!(
+            runs.iter().map(|r| (r.job_id.as_str(), r.trigger.as_str(), r.status.as_str())).collect::<Vec<_>>(),
+            vec![(job.id.as_str(), "background", "error"), (job.id.as_str(), "background", "success")]
+        );
+        let report = tick_report(&cli.workspace, &runs);
+        assert!(report.failed, "{report:?}");
+        assert_eq!(report.lines, vec!["Twice: error".to_string(), "Twice: success".to_string()]);
+        assert_eq!(report.notices.len(), 1, "{report:?}");
+        assert_eq!(report.notices[0].0, "DataBrain: scheduled job failed");
+        assert!(report.notices[0].1.starts_with("Twice: twice_rows:"), "{report:?}");
+        assert!(cli.workspace.get_setting(databrain_app::background::LAST_TICK_SETTING).unwrap().is_some());
+        finished(&app, &other.id).await;
+        // Nothing due: nothing reported, success.
+        let runs = background_tick(&cli, Duration::from_secs(60)).await;
+        assert!(runs.is_empty(), "{runs:?}");
+        assert_eq!(tick_report(&cli.workspace, &runs), Default::default());
+    })
+    .await;
+}
+
+/// The background runner's deadline: runs still going are stopped, reported
+/// and notified as stopped (not failed), and the runner ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_background_tick_stops_at_its_deadline() {
+    use databrain_app::cli::jobs::{background_tick, tick_report};
+    guarded(async {
+        let st = state();
+        let dir = tempfile::tempdir().unwrap();
+        let a = sqlite(&st, "A", &dir.path().join("a.db"), false);
+        let slow = "with recursive c(i) as (select 1 union all select i + 1 from c where i < 300000000) select count(*) from c";
+        let mut job = plain_job("Endless", vec![node("a", "endless_rows", JobNodeKind::Query, Some(&a), slow)]);
+        job.schedule = JobSchedule { enabled: true, minutes: 60, ..Default::default() };
+        let job = st.workspace.save_job(job).unwrap();
+        st.workspace.backdate_job_for_tests(&job.id, databrain_workspace::now_ms() - 7_200_000).unwrap();
+        let t = std::time::Instant::now();
+        let runs = background_tick(&st, Duration::from_secs(2)).await;
+        assert!(t.elapsed() < Duration::from_secs(60), "{:?}", t.elapsed());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "cancelled", "{:?}", runs[0]);
+        assert!(runs[0].error.as_deref().unwrap_or_default().contains("longest time"), "{:?}", runs[0]);
+        let report = tick_report(&st.workspace, &runs);
+        assert!(!report.failed);
+        assert_eq!(report.notices[0].0, "DataBrain: scheduled job stopped");
+        assert!(!st.jobs.is_running(&job.id));
+    })
+    .await;
+}
+
+/// A follower queued while another process holds it stays queued there;
+/// once free, the app and the runner look at the same moment and it starts
+/// once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_follower_held_elsewhere_starts_once() {
+    guarded(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.db");
+        let open = |kind: &str| {
+            let mut st = AppState::new(Arc::new(Workspace::open(&path).unwrap()), Arc::new(MemoryStore::default()), Arc::new(Quiet), Arc::new(NoUi));
+            st.jobs = Arc::new(databrain_app::jobs::JobsState::new(kind));
+            st
+        };
+        let (app, cli) = (open("app"), open("cli"));
+        let conn = sqlite(&app, "src", &dir.path().join("src.db"), false);
+        let up = app.workspace.save_job(plain_job("Leader", vec![node("a", "leader_rows", JobNodeKind::Query, Some(&conn), "select 1 as x")])).unwrap();
+        let mut down = plain_job("Held follower", vec![node("b", "held_rows", JobNodeKind::Query, Some(&conn), "select 2 as y")]);
+        down.schedule.after_jobs = vec![up.id.clone()];
+        let down = app.workspace.save_job(down).unwrap();
+
+        // The runner holds the follower: the leader's success queues it.
+        assert!(cli.workspace.claim_job(&down.id, &cli.jobs.owner, databrain_workspace::now_ms() + 90_000).unwrap());
+        api::run_job(&app, &up.id, None).unwrap();
+        assert_eq!(finished(&app, &up.id).await.status, "success");
+        assert_eq!(app.workspace.queued_job_after().unwrap().len(), 1);
+        // The app's pass leaves it while the other process holds it.
+        assert!(!databrain_app::jobs::tick(&app.job_ctx()).contains(&down.id));
+        assert_eq!(app.workspace.queued_job_after().unwrap().len(), 1, "still queued");
+        assert!(app.workspace.job_runs(&down.id, 5).unwrap().is_empty());
+
+        // Free: both look at once, one starts it.
+        cli.workspace.release_job(&down.id, &cli.jobs.owner).unwrap();
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let (actx, cctx) = (app.job_ctx(), cli.job_ctx());
+        let (g1, g2) = (gate.clone(), gate.clone());
+        let a = tokio::task::spawn_blocking(move || {
+            g1.wait();
+            databrain_app::jobs::tick(&actx)
+        });
+        let b = tokio::task::spawn_blocking(move || {
+            g2.wait();
+            databrain_app::jobs::tick_as(&cctx, "background")
+        });
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        let started = a.iter().chain(&b).filter(|id| **id == down.id).count();
+        assert_eq!(started, 1, "app {a:?}, runner {b:?}");
+        let ran_in = if a.contains(&down.id) { &app } else { &cli };
+        assert_eq!(finished(ran_in, &down.id).await.status, "success");
+        assert_eq!(app.workspace.job_runs(&down.id, 5).unwrap().len(), 1);
+        assert!(app.workspace.queued_job_after().unwrap().is_empty());
+    })
+    .await;
+}
+
+/// A runner that died (no word from it for two minutes): its run is
+/// closed and its lease let go, so the job runs again on schedule. A start
+/// that can't be recorded isn't run (it would run again and again).
+#[tokio::test(flavor = "multi_thread")]
+async fn dead_runners_and_unrecorded_starts() {
+    guarded(async {
+        let st = state();
+        let dir = tempfile::tempdir().unwrap();
+        let conn = sqlite(&st, "src", &dir.path().join("src.db"), false);
+        let mut job = plain_job("Hourly", vec![node("a", "hourly_rows", JobNodeKind::Query, Some(&conn), "select 1 as x")]);
+        job.schedule = JobSchedule { enabled: true, minutes: 60, ..Default::default() };
+        let job = st.workspace.save_job(job).unwrap();
+        let now = databrain_workspace::now_ms();
+        st.workspace.backdate_job_for_tests(&job.id, now - 7_200_000).unwrap();
+
+        // A dead runner's run and lease (its lease ran out; it last reported 5 minutes ago).
+        assert!(st.workspace.claim_job(&job.id, "cli:dead", now - 1).unwrap());
+        let dead = st.workspace.start_job_run(&job.id, "background").unwrap();
+        st.workspace.backdate_job_run_for_tests(dead.id, now - 300_000).unwrap();
+        // A live runner's run is left alone (allowed case of the check).
+        let live_job = st.workspace.save_job(plain_job("Live", vec![node("a", "live_rows", JobNodeKind::Query, Some(&conn), "select 1 as x")])).unwrap();
+        let live = st.workspace.start_job_run(&live_job.id, "background").unwrap();
+        st.workspace.touch_job_run(live.id, "cli:alive").unwrap();
+
+        // Recording the start fails: not started (and not again on the next pass).
+        st.workspace.fail_job_marks_for_tests(true).unwrap();
+        for _ in 0..3 {
+            assert!(databrain_app::jobs::tick(&st.job_ctx()).is_empty());
+        }
+        let closed = st.workspace.job_run(&job.id, dead.id).unwrap().unwrap();
+        assert_eq!(closed.status, "cancelled", "the dead runner's run is closed: {closed:?}");
+        assert_eq!(st.workspace.job_run(&live_job.id, live.id).unwrap().unwrap().status, "running", "a live runner's run is not");
+        assert_eq!(st.workspace.job_runs(&job.id, 10).unwrap().len(), 1, "no run started while its start can't be recorded");
+        assert_eq!(st.workspace.job_lease(&job.id).unwrap(), None, "the lease is let go");
+
+        // Recorded again: it runs, once.
+        st.workspace.fail_job_marks_for_tests(false).unwrap();
+        assert_eq!(databrain_app::jobs::tick(&st.job_ctx()), vec![job.id.clone()]);
+        assert_eq!(finished(&st, &job.id).await.status, "success");
+        assert!(databrain_app::jobs::tick(&st.job_ctx()).is_empty(), "not due again");
+        assert_eq!(st.workspace.job_runs(&job.id, 10).unwrap().len(), 2);
+    })
+    .await;
 }
 
 /// Rows the assistant's SQL selected stay the assistant's down the job: a

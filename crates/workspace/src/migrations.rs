@@ -450,9 +450,77 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (connection_id, schema_name, name)
     );
     "#,
+    // v22: "run after" starts that couldn't happen at once (the job was
+    // busy), for the next scheduler pass; runs whose steps all run under
+    // the AI rules though no step is the AI's (a "run after" start from a
+    // run the assistant started)
+    r#"
+    CREATE TABLE job_after_pending (
+        job_id   TEXT NOT NULL,
+        after    TEXT NOT NULL,
+        added_at INTEGER NOT NULL,
+        ai       INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (job_id, ai)
+    );
+    ALTER TABLE job_runs ADD COLUMN ai INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 impl Workspace {
+    /// v22 changed while it was unreleased: a workspace a development build
+    /// upgraded to an earlier draft of it lacks columns or keys the code
+    /// now uses (a `job_after_pending` keyed by job only would make every
+    /// queued "run after" start fail). Brings such a workspace to the final
+    /// v22; a workspace that has it is left alone. Rows are kept.
+    pub(crate) fn repair_v22(&self) -> Result<()> {
+        // (column, primary-key position) of each column of `table`.
+        fn cols(c: &rusqlite::Connection, table: &str) -> rusqlite::Result<Vec<(String, i64)>> {
+            let mut st = c.prepare(&format!("PRAGMA table_info({table})"))?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        }
+        fn has(cols: &[(String, i64)], name: &str) -> bool {
+            cols.iter().any(|(n, _)| n == name)
+        }
+        // What needs doing; empty when the workspace has the final v22.
+        fn todo(c: &rusqlite::Connection) -> rusqlite::Result<Vec<String>> {
+            let mut out = Vec::new();
+            let q = cols(c, "job_after_pending")?;
+            let keyed = q.iter().any(|(n, k)| n == "job_id" && *k > 0) && q.iter().any(|(n, k)| n == "ai" && *k > 0);
+            if !keyed {
+                let ai = if has(&q, "ai") { "ai" } else { "0" };
+                let copy = if q.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "INSERT OR IGNORE INTO job_after_pending_new (job_id, after, added_at, ai) SELECT job_id, after, added_at, {ai} FROM job_after_pending; \
+                         DROP TABLE job_after_pending;"
+                    )
+                };
+                out.push(format!(
+                    "CREATE TABLE job_after_pending_new (job_id TEXT NOT NULL, after TEXT NOT NULL, added_at INTEGER NOT NULL, ai INTEGER NOT NULL DEFAULT 0, \
+                     PRIMARY KEY (job_id, ai)); {copy} ALTER TABLE job_after_pending_new RENAME TO job_after_pending;"
+                ));
+            }
+            if !has(&cols(c, "job_runs")?, "ai") {
+                out.push("ALTER TABLE job_runs ADD COLUMN ai INTEGER NOT NULL DEFAULT 0;".into());
+            }
+            Ok(out)
+        }
+        let mut c = self.conn.lock();
+        if todo(&c)?.is_empty() {
+            return Ok(());
+        }
+        // Under the write lock, looked at again: another process opening the
+        // workspace at the same time may have just done it.
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for sql in todo(&tx)? {
+            tx.execute_batch(&sql)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Once: jobs saved before steps carried `JobNode::ai_sql` lost who
     /// wrote their SQL. Every step of a job the AI assistant (or an MCP
     /// client) created or changed, as the audit log records it by job name,

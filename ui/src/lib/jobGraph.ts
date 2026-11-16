@@ -172,16 +172,74 @@ export function cappedReads(job: Job, outputs: OutputInfo[], resultsConnectionId
   return out;
 }
 
-/** "every 15 min", "daily at 08:00", "Mon, Fri at 06:30". */
-export function scheduleText(s: Job["schedule"]): string {
-  if (!s.enabled) return "Not scheduled";
+const TRIGGER: Record<string, string> = { manual: "manual", schedule: "scheduled", ai: "by AI", resume: "resumed", background: "background", cli: "command line" };
+
+/** How a run was started, short: "scheduled", "after Extract". */
+export function triggerText(t: string): string {
+  return t.startsWith("after:") ? `after ${t.slice(6)}` : (TRIGGER[t] ?? t);
+}
+
+/** Times of day of a daily or monthly schedule, sorted ("HH:MM"). */
+export function scheduleTimes(s: Job["schedule"]): string[] {
+  return [...new Set(s.times?.length ? s.times : [s.at])].sort();
+}
+
+/** "1st", "2nd", "23rd", "last day". */
+export function monthDayText(d: number): string {
+  if (d === -1) return "last day";
+  const suffix = d % 10 === 1 && d !== 11 ? "st" : d % 10 === 2 && d !== 12 ? "nd" : d % 10 === 3 && d !== 13 ? "rd" : "th";
+  return `${d}${suffix}`;
+}
+
+/** Days of the month in order, the last day after the 31st. */
+function sortMonthDays(days: number[]): number[] {
+  return [...days].sort((a, b) => (a === -1 ? 99 : a) - (b === -1 ? 99 : b));
+}
+
+/** Turn a day of the month (1–31, -1 = last) on or off; at least one stays on. */
+export function toggleMonthDay(days: number[], d: number): number[] {
+  const cur = days.length ? days : [1];
+  const next = cur.includes(d) ? cur.filter((x) => x !== d) : [...cur, d];
+  return next.length ? sortMonthDays(next) : cur;
+}
+
+/**
+ * "every 15 min", "daily at 08:00", "Mon, Fri at 06:30, 18:00", "monthly
+ * on the 1st, last day at 05:00", "cron 30 6 * * 1-5", with the time zone
+ * when one is set, and "after Extract" for jobs it runs after.
+ */
+export function scheduleText(s: Job["schedule"], jobName?: (id: string) => string | undefined): string {
+  const after = (s.after_jobs ?? []).map((id) => jobName?.(id)).filter((n): n is string => !!n);
+  const afterText = after.length ? `after ${after.join(" or ")}` : (s.after_jobs?.length ?? 0) > 0 ? "after another job" : "";
+  if (!s.enabled) return afterText || "Not scheduled";
+  const tz = s.time_zone?.trim() ? ` (${s.time_zone.trim()})` : "";
+  let text: string;
   if (s.mode === "interval") {
     const m = Math.max(1, s.minutes);
-    return m % 1440 === 0 ? `every ${m / 1440} day${m > 1440 ? "s" : ""}` : m % 60 === 0 ? `every ${m / 60} h` : `every ${m} min`;
+    text = m % 1440 === 0 ? `every ${m / 1440} day${m > 1440 ? "s" : ""}` : m % 60 === 0 ? `every ${m / 60} h` : `every ${m} min`;
+  } else if (s.mode === "cron") {
+    text = `cron ${s.cron?.trim() || "(empty)"}`;
+  } else if (s.mode === "monthly") {
+    const days = s.month_days?.length ? s.month_days : [1];
+    text = `monthly on the ${sortMonthDays(days).map(monthDayText).join(", ")} at ${scheduleTimes(s).join(", ")}`;
+  } else {
+    const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const wd = [...s.weekdays].sort((a, b) => ((a + 6) % 7) - ((b + 6) % 7));
+    text = `${wd.length === 0 || wd.length === 7 ? "daily" : wd.map((d) => days[d]).join(", ")} at ${scheduleTimes(s).join(", ")}`;
   }
-  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  const wd = [...s.weekdays].sort((a, b) => ((a + 6) % 7) - ((b + 6) % 7));
-  return `${wd.length === 0 || wd.length === 7 ? "daily" : wd.map((d) => days[d]).join(", ")} at ${s.at}`;
+  return `${text}${tz}${afterText ? `, and ${afterText}` : ""}`;
+}
+
+/** Sign-in methods that need someone at the computer (browser or device code). */
+const INTERACTIVE_SIGN_IN = ["oauth_browser", "device_code", "external_browser"];
+
+/**
+ * Names of the job's connections (its steps' and load targets') that sign
+ * in through the browser: unattended runs fail once that sign-in ends.
+ */
+export function browserSignInConnections(job: Job, connections: { id: string; name: string; config: { auth: { method: string } } }[]): string[] {
+  const ids = new Set(job.nodes.flatMap((n) => [n.connection_id, n.target_connection_id]).filter((id): id is string => !!id));
+  return connections.filter((c) => ids.has(c.id) && INTERACTIVE_SIGN_IN.includes(c.config.auth.method)).map((c) => c.name);
 }
 
 /**
@@ -338,6 +396,163 @@ export function batchValue(text: string, max: number): number | null {
   const n = Math.floor(Number(text.trim()));
   if (!text.trim() || !Number.isFinite(n) || n <= 0) return null;
   return Math.min(n, max);
+}
+
+const CRON_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const CRON_DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const CRON_MACROS: Record<string, string> = {
+  "@hourly": "0 * * * *",
+  "@daily": "0 0 * * *",
+  "@midnight": "0 0 * * *",
+  "@weekly": "0 0 * * 0",
+  "@monthly": "0 0 1 * *",
+  "@yearly": "0 0 1 1 *",
+  "@annually": "0 0 1 1 *",
+};
+const U32_MAX = 4_294_967_295;
+
+/** Bits of one cron field (as the scheduler reads it), or what's wrong. */
+function cronField(f: string, lo: number, hi: number, names: string[], what: string): Set<number> | string {
+  const bits = new Set<number>();
+  const value = (v: string): number | string => {
+    const i = names.indexOf(v.toLowerCase());
+    const n = i >= 0 ? i + (names.length === 12 ? 1 : 0) : /^\d+$/.test(v) ? Number(v) : NaN;
+    if (Number.isNaN(n)) return `${what}: "${v}" is not a number`;
+    if (n < lo || n > hi) return `${what}: ${n} is out of range (${lo}–${hi})`;
+    return n;
+  };
+  for (const part of f.split(",")) {
+    const [range, stepText] = part.includes("/") ? [part.slice(0, part.indexOf("/")), part.slice(part.indexOf("/") + 1)] : [part, null];
+    let step = 1;
+    if (stepText != null) {
+      if (!/^\d+$/.test(stepText) || Number(stepText) < 1 || Number(stepText) > U32_MAX) return `${what}: bad step "${stepText}"`;
+      step = Number(stepText);
+    }
+    let a: number | string, b: number | string;
+    let named = false;
+    if (range === "*") [a, b] = [lo, hi];
+    else if (range.includes("-")) {
+      const [x, y] = [range.slice(0, range.indexOf("-")), range.slice(range.indexOf("-") + 1)];
+      named = /[a-z]/i.test(x + y);
+      [a, b] = [value(x), value(y)];
+    } else {
+      a = value(range);
+      b = stepText != null ? hi : a;
+    }
+    if (typeof a === "string") return a;
+    if (typeof b === "string") return b;
+    // Days of the week by name may go round the week ("fri-sun"); numbers stay in order.
+    let seq: number[];
+    if (a <= b) seq = Array.from({ length: b - a + 1 }, (_, k) => a + k);
+    else if (named && names.length === 7) seq = [...Array.from({ length: 7 - a }, (_, k) => a + k), ...Array.from({ length: b + 1 }, (_, k) => k)];
+    else return `${what}: range ${a}-${b} is backwards`;
+    seq.forEach((i, k) => {
+      if (k % step === 0) bits.add(i);
+    });
+  }
+  return bits;
+}
+
+/** Longest wait in days between two days matching all of `days`, `months` and `dows` over the calendar's 400-year cycle. */
+function cronLongestWait(days: Set<number>, months: Set<number>, dows: Set<number>): number {
+  const cycle = 146097;
+  let [y, m, d, wd] = [2000, 1, 1, 6]; // 2000-01-01 was a Saturday
+  let [first, last, most] = [-1, -1, 0];
+  const monthLen = (yy: number, mm: number) => (mm === 2 ? ((yy % 4 === 0 && yy % 100 !== 0) || yy % 400 === 0 ? 29 : 28) : [4, 6, 9, 11].includes(mm) ? 30 : 31);
+  for (let k = 0; k < cycle; k++) {
+    if (days.has(d) && months.has(m) && dows.has(wd)) {
+      if (last >= 0) most = Math.max(most, k - last);
+      if (first < 0) first = k;
+      last = k;
+    }
+    wd = (wd + 1) % 7;
+    if (++d > monthLen(y, m)) {
+      d = 1;
+      if (++m > 12) {
+        m = 1;
+        y++;
+      }
+    }
+  }
+  return first < 0 ? Infinity : Math.max(most, first + cycle - last);
+}
+
+/**
+ * What's wrong with a cron expression, or null: the scheduler's own rules
+ * (5 fields, ranges, steps, names, `@daily`…, and a day that can ever come,
+ * e.g. not `0 0 30 2 *`), so a bad one is said at the field instead of
+ * refusing the whole job's save.
+ */
+export function cronProblem(expr: string | null | undefined): string | null {
+  const e = (expr ?? "").trim();
+  if (!e) return "Type a cron expression";
+  const f = (CRON_MACROS[e.toLowerCase()] ?? e).split(/\s+/);
+  if (f.length !== 5) return `A cron expression has 5 fields (minute hour day month weekday), this has ${f.length}`;
+  const parts = [cronField(f[0], 0, 59, [], "minute"), cronField(f[1], 0, 23, [], "hour"), cronField(f[2], 1, 31, [], "day of month"), cronField(f[3], 1, 12, CRON_MONTHS, "month"), cronField(f[4], 0, 7, CRON_DAYS, "day of week")];
+  const bad = parts.find((p): p is string => typeof p === "string");
+  if (bad) return bad;
+  const [, , days, months, dows] = parts as Set<number>[];
+  // With a starred day field a day must match both: it must exist in a chosen month…
+  if (f[2].startsWith("*") || f[4].startsWith("*")) {
+    const len = (m: number) => (m === 2 ? 29 : [4, 6, 9, 11].includes(m) ? 30 : 31);
+    if (![...months].some((m) => [...days].some((d) => d <= len(m)))) return "No month has that day: this cron never runs";
+    // …and come often enough: the scheduler looks 8 years ahead (Feb 29 on a Sunday waits up to 28).
+    if (days.size < 31) {
+      const wait = cronLongestWait(days, months, new Set([...dows].map((d) => d % 7)));
+      if (wait > 366 * 8) return `Runs too rarely: it can wait ${Math.floor(wait / 365)} years between runs (at most 8)`;
+    }
+  }
+  return null;
+}
+
+/** What's wrong with a time zone as the scheduler reads it (empty/"local", UTC, ±hh:mm, an IANA name), or null. */
+export function timeZoneProblem(tz: string | null | undefined): string | null {
+  const t = (tz ?? "").trim();
+  if (!t || /^(local|utc|gmt)$/i.test(t)) return null;
+  const off = /^(?:UTC|GMT)?([+-])(.*)$/i.exec(t);
+  if (off) {
+    const [h, m = "0"] = off[2].split(":");
+    const num = (x: string) => (/^\d{1,2}$/.test(x) ? Number(x) : NaN);
+    return num(h) <= 14 && num(m) < 60 ? null : `"${t}" is not an offset like +05:30`;
+  }
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: t });
+    return null;
+  } catch {
+    return `Unknown time zone "${t}": an IANA name like Europe/Paris, UTC, or an offset like +05:30`;
+  }
+}
+
+/** Jobs `jobId` can't run after: those that (through their own "run after") already run after it, and itself. */
+export function afterLoopJobs(jobId: string, jobs: { id: string; schedule: { after_jobs?: string[] } }[]): Set<string> {
+  // A job J runs after jobId (directly or through others) when jobId is reachable from J's after_jobs.
+  const byId = new Map(jobs.map((j) => [j.id, j.schedule.after_jobs ?? []]));
+  const reaches = (from: string, seen = new Set<string>()): boolean => {
+    if (from === jobId) return true;
+    if (seen.has(from)) return false;
+    seen.add(from);
+    return (byId.get(from) ?? []).some((x) => reaches(x, seen));
+  };
+  return new Set(jobs.filter((j) => j.id === jobId || reaches(j.id)).map((j) => j.id));
+}
+
+/** Whether two schedules run the same (fields the editor sets; defaults filled in). */
+export function sameSchedule(a: Job["schedule"] | null | undefined, b: Job["schedule"] | null | undefined): boolean {
+  if (!a || !b) return false;
+  const norm = (s: Job["schedule"]) =>
+    JSON.stringify([
+      s.enabled,
+      s.mode,
+      s.minutes,
+      scheduleTimes(s),
+      [...(s.weekdays ?? [])].sort(),
+      [...(s.month_days ?? [])].sort(),
+      (s.cron ?? "").trim(),
+      (s.time_zone ?? "").trim(),
+      s.missed ?? "once",
+      [...(s.after_jobs ?? [])].sort(),
+    ]);
+  return norm(a) === norm(b);
 }
 
 /** A step's fields that decide whose SQL it is (as the app's `JobNode::same_sql`). */

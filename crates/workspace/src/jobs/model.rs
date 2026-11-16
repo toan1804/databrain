@@ -44,8 +44,16 @@ pub struct Job {
 impl Job {
     /// Time the next scheduled run is counted from: the last scheduled
     /// start, or the last edit (turning a schedule on doesn't run at once).
+    /// Never later than now: a mark made while the computer's clock was
+    /// ahead (then corrected) would hold the schedule until real time
+    /// caught up, possibly years.
     pub fn schedule_base(&self) -> i64 {
-        self.last_scheduled_at.unwrap_or(self.updated_at).max(self.updated_at)
+        self.schedule_base_at(crate::now_ms())
+    }
+
+    /// [`Self::schedule_base`] as of `now` (ms).
+    pub fn schedule_base_at(&self, now: i64) -> i64 {
+        self.last_scheduled_at.unwrap_or(self.updated_at).max(self.updated_at).min(now)
     }
 }
 
@@ -82,8 +90,9 @@ pub struct JobRun {
     #[ts(as = "f64")]
     pub id: i64,
     pub job_id: String,
-    /// "manual", "schedule" or "ai" (the assistant, after approval).
-    #[ts(type = "\"manual\" | \"schedule\" | \"ai\" | \"resume\" | \"background\" | \"cli\"")]
+    /// "manual", "schedule" or "ai" (the assistant, after approval), …, or
+    /// "after:<job name>" (started when that job succeeded).
+    #[ts(type = "\"manual\" | \"schedule\" | \"ai\" | \"resume\" | \"background\" | \"cli\" | `after:${string}`")]
     pub trigger: String,
     #[ts(as = "f64")]
     pub started_at: i64,
@@ -98,6 +107,12 @@ pub struct JobRun {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[ts(as = "Option<BTreeMap<String, databrain_connector_core::sql::ParamValue>>", optional)]
     pub params: BTreeMap<String, databrain_connector_core::sql::ParamValue>,
+    /// Every step runs under the AI rules (`Origin::Ai`) though the trigger
+    /// isn't `ai`: a "run after" start from a run the assistant started
+    /// (or from such a run, in turn).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub ai: bool,
 }
 
 /// Output names are SQL identifiers (`results.<name>`), same rules as

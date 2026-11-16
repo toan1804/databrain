@@ -74,7 +74,7 @@ A review of the fixes found fourteen bugs; they are fixed, with the refused case
 
 ## Jobs (improvements of 2026-11-16)
 
-- **The assistant's job tools** can't set limits or retries.
+- **The assistant's job tools** set only an interval or one daily time: not several times, monthly, cron, a time zone, the missed-run policy, "run after", limits or retries.
 - **No retry test with a load** that fails with a connection error midway; the decision is unit-tested (`reads_only`, `retryable`, `load_retry_refused`, `kept_nothing`), and what a failed load reports is tested on SQLite (rolled back, before SQL that may commit, failed before writing). A failed commit and a database without transactions are tested only through `kept_nothing`.
 - **A step left behind** (it didn't stop within 30 s) may still run: a query step's engine task keeps its tab until the statement ends (the next run of the step fails saying so), and a dropped load's last statement may go on on the server after its session is closed (on a database without transactions, a new load can overlap it). Nothing stops either on the server.
 - **Knowing what happened:** failures notify only on the desktop (no webhook or e-mail); a run doesn't record the job version it ran; 200 runs and 5,000 log lines per run are fixed, and a run's log can't be exported.

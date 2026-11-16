@@ -138,9 +138,10 @@ export const useJobs = create<JobsState>((set, get) => ({
         // Next run time and last status in the list.
         clearTimeout(refreshTimer);
         refreshTimer = setTimeout(() => void get().refresh().catch(() => {}), 200);
-        if (run.trigger === "schedule" && run.status === "error") {
+        if ((run.trigger === "schedule" || run.trigger.startsWith("after:")) && run.status === "error") {
           const name = get().jobs.find((j) => j.id === job_id)?.name ?? "A job";
-          useStore.getState().toast(`Scheduled job "${name}" failed: ${run.error ?? "see its runs"}`, "error");
+          const what = run.trigger === "schedule" ? `Scheduled job "${name}" failed` : `"${name}" (run after "${run.trigger.slice(6)}" succeeded) failed`;
+          useStore.getState().toast(`${what}: ${run.error ?? "see its runs"}`, "error");
         }
       }
     });

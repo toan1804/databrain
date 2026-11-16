@@ -1,20 +1,16 @@
 // Side panel with no step selected: the job's schedule and its runs.
 import { useEffect, useState } from "react";
-import { Info, CalendarClock, Play, RotateCcw, Variable } from "lucide-react";
+import { Play, RotateCcw, Variable } from "lucide-react";
 import { api } from "../../lib/api";
-import type { ConnectorKind, Job, JobRun, JobSchedule, ParamValue, RunParams } from "../../lib/types";
+import type { ConnectorKind, Job, JobRun, ParamValue, RunParams } from "../../lib/types";
 import { useStore } from "../../store";
 import { formatDuration, relativeTime } from "../../lib/util";
 import { useJobs } from "../../jobsStore";
 import { RunLog } from "./RunLog";
 import { JobLimits } from "./LimitFields";
+import { ScheduleSection } from "./ScheduleSection";
+import { triggerText } from "../../lib/jobGraph";
 import { ProgressBar, StatusIcon, field, label, statusText, type Patch } from "./shared";
-
-const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const ORDER = [1, 2, 3, 4, 5, 6, 0];
-
-
-const TRIGGER: Record<JobRun["trigger"], string> = { manual: "manual", schedule: "scheduled", ai: "by AI", resume: "resumed", background: "background", cli: "command line" };
 
 /** "2 succeeded · 1 failed" for a run's steps. */
 function runCounts(r: JobRun): string {
@@ -160,8 +156,6 @@ export function JobPanel({
   const [runs, setRuns] = useState<JobRun[]>([]);
   // The run shown in full; the newest one unless another was picked.
   const [picked, setPicked] = useState<number | null>(null);
-  const s = job.schedule;
-  const set = (patch: Partial<JobSchedule>) => onChange({ schedule: { ...s, ...patch } });
   useEffect(() => {
     if (run?.status === "running") return;
     api
@@ -177,70 +171,7 @@ export function JobPanel({
   return (
     <div className="space-y-4 p-3">
       <JobParams job={job} onChange={onChange} onRunWith={onRunWith} />
-      <section className="space-y-2">
-        <div className="flex items-center justify-between">
-          <div className={label}>Schedule</div>
-          <label className="flex items-center gap-1.5 text-[12px]">
-            <input type="checkbox" checked={s.enabled} onChange={(e) => set({ enabled: e.target.checked })} /> Run on a schedule
-          </label>
-        </div>
-        {s.enabled && (
-          <div className="space-y-2">
-            <div className="flex rounded-md border border-line p-0.5" role="group" aria-label="Schedule kind">
-              {(["interval", "daily"] as const).map((m) => (
-                <button key={m} className={`flex-1 rounded px-2 py-1 text-[11.5px] ${s.mode === m ? "bg-accent/15 font-medium text-accent" : "text-muted hover:text-fg"}`} onClick={() => set({ mode: m })}>
-                  {m === "interval" ? "Every…" : "At a time of day"}
-                </button>
-              ))}
-            </div>
-            {s.mode === "interval" ? (
-              <div className="flex items-center gap-2">
-                <span>Every</span>
-                <MinutesInput className={`${field} w-20`} value={s.minutes} onCommit={(minutes) => set({ minutes })} />
-                <span>min</span>
-                <select className={`${field} w-auto`} value="" onChange={(e) => e.target.value && set({ minutes: Number(e.target.value) })} aria-label="Common intervals">
-                  <option value="">Presets…</option>
-                  <option value="15">15 min</option>
-                  <option value="60">1 hour</option>
-                  <option value="360">6 hours</option>
-                  <option value="1440">1 day</option>
-                </select>
-              </div>
-            ) : (
-              <div className="flex flex-wrap items-center gap-2">
-                <span>At</span>
-                <input type="time" className={`${field} w-28`} value={s.at} onChange={(e) => set({ at: e.target.value || "08:00" })} aria-label="Time" />
-                <div className="flex min-w-[220px] flex-1 gap-1" role="group" aria-label="Days">
-                  {ORDER.map((d) => {
-                    const on = s.weekdays.length === 0 || s.weekdays.includes(d);
-                    return (
-                      <button
-                        key={d}
-                        aria-pressed={on}
-                        className={`flex-1 rounded border px-1 py-0.5 text-[11px] ${on ? "border-accent/50 bg-accent/10 text-accent" : "border-line text-muted"}`}
-                        onClick={() => {
-                          const cur = s.weekdays.length === 0 ? ORDER : s.weekdays;
-                          const next = on ? cur.filter((x) => x !== d) : [...cur, d];
-                          // An empty list means every day: the last day can't be turned off into that.
-                          if (next.length === 0) return;
-                          set({ weekdays: next.length === 7 ? [] : next });
-                        }}
-                      >
-                        {WEEKDAYS[d]}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-            <div className="flex items-center gap-1 text-[11.5px] text-muted" title="Runs while DataBrain is open (or by the background runner). A run missed while it was closed runs once at the next start.">
-              <CalendarClock size={12} />
-              {summary?.next_run_at ? `Next run ${new Date(summary.next_run_at).toLocaleString()}` : "Saving…"}
-              <Info size={11} className="shrink-0" />
-            </div>
-          </div>
-        )}
-      </section>
+      <ScheduleSection job={job} nextRunAt={summary?.next_run_at ?? null} onChange={onChange} />
 
       <JobLimits job={job} onChange={onChange} />
 
@@ -265,7 +196,7 @@ export function JobPanel({
                     {relativeTime(r.started_at)}
                   </span>
                   <span className="min-w-0 flex-1 truncate text-[11px] text-muted">
-                    {TRIGGER[r.trigger] ?? r.trigger} · {runCounts(r) || "no steps"}
+                    {triggerText(r.trigger)} · {runCounts(r) || "no steps"}
                   </span>
                   <span className="shrink-0 text-[11px] text-muted">{r.finished_at ? formatDuration(r.finished_at - r.started_at) : "running"}</span>
                 </button>
@@ -288,7 +219,7 @@ function RunDetails({ job, run: r, newest, canResume, onResume, onSelect }: { jo
         <StatusIcon status={r.status} />
         <span className="font-medium">{title}</span>
         <span className="min-w-0 flex-1 truncate text-[11px] text-muted" title={new Date(r.started_at).toLocaleString()}>
-          {relativeTime(r.started_at)} · {TRIGGER[r.trigger] ?? r.trigger}
+          {relativeTime(r.started_at)} · {triggerText(r.trigger)}
           {r.finished_at ? ` · ${formatDuration(r.finished_at - r.started_at)}` : ""}
         </span>
         {newest && canResume && (
@@ -324,38 +255,5 @@ function RunDetails({ job, run: r, newest, canResume, onResume, onSelect }: { jo
       )}
       <RunLog job={job} run={r} onSelect={onSelect} />
     </div>
-  );
-}
-
-/**
- * Minutes between runs, typed freely and saved when it is a number (on
- * blur or Enter). Saving every keystroke turned a cleared field into "every
- * 1 minute", which the scheduler then ran.
- */
-function MinutesInput({ value, onCommit, className }: { value: number; onCommit: (minutes: number) => void; className: string }) {
-  const [text, setText] = useState(String(value));
-  useEffect(() => setText(String(value)), [value]);
-  const commit = () => {
-    const n = Math.round(Number(text));
-    if (text.trim() !== "" && Number.isFinite(n) && n >= 1) {
-      if (n !== value) onCommit(n);
-      setText(String(n));
-    } else {
-      setText(String(value));
-    }
-  };
-  return (
-    <input
-      type="number"
-      min={1}
-      className={className}
-      value={text}
-      aria-label="Minutes"
-      onChange={(e) => setText(e.target.value)}
-      onBlur={commit}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") commit();
-      }}
-    />
   );
 }

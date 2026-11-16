@@ -7,10 +7,14 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 ### Added
 
 - **Jobs, limits and retries:** a time limit per run and per step (a step past its limit is stopped and fails), retries with growing waits after a connection error for steps that can't write twice (reads, saves to a file, loads rolled back as a whole), and a maximum of steps running at once in a job and on one connection (the others show as waiting).
+- **Jobs, schedules:** several times a day, monthly (including the last day) or a cron expression, in a chosen time zone; a setting for runs missed while the computer was off (run once, skip, or run each, up to 24); and "Run after" another job, which starts when that job succeeds. A scheduled job on a connection with browser sign-in shows a warning, and a failed run says why.
 
 ### Changed
 
 - Jobs run at most 4 steps at once, and 2 on one connection, unless the job's limits say otherwise. A step that doesn't stop within 30 s of being stopped is left behind, so the run ends.
+- When clocks change, a scheduled time that doesn't exist runs at the first time after it, and a repeated time runs once.
+- Schedules "every N minutes" follow the job's time zone: one that divides a day into hours (every 2 h, 6 h, 1 day) runs at the same clock times all year (every day at midnight, summer and winter alike; around a clock change one gap is an hour longer or shorter), and shorter ones keep exact gaps. A schedule of every 0 minutes is refused (it ran every minute).
+- "Skip" missed runs skips only times missed while nothing was running; a time missed because the job was still running (a run by hand, a slow run) runs once that run ends.
 - A load step's dry run gets the job's parameters (SQL using them failed before).
 - The assistant's job tools refuse arguments they can't set by name (an unknown field or step name), instead of dropping them silently.
 - An export step writes to a temporary `.databrain-<job>-<step>.….part` file next to the target, then moves it into place: a failed or stopped export leaves the old file whole. Leftover temporary files of the step's earlier runs are removed.

@@ -28,6 +28,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
   const toast = useStore((s) => s.toast);
   const connections = useStore((s) => s.connections);
   const run = useJobs((s) => s.runs[jobId]);
+  const jobNames = useJobs((s) => s.jobs);
   const taken = useTakenNames(jobId);
   // Running per the run's own events too (the job list can lag behind).
   const running = useJobs((s) => !!s.running[jobId] || s.runs[jobId]?.status === "running");
@@ -501,7 +502,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
           onChange={(e) => update((j) => ({ ...j, name: e.target.value }))}
         />
         <span className="flex items-center gap-1 text-[11.5px] text-muted" title={job.schedule.enabled ? "Runs while DataBrain is open" : undefined}>
-          <CalendarClock size={12} /> {scheduleText(job.schedule)}
+          <CalendarClock size={12} /> {scheduleText(job.schedule, (id) => jobNames.find((x) => x.id === id)?.name)}
         </span>
         <SaveState save={save} />
         <div className="ml-auto flex items-center gap-1">

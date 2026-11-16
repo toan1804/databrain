@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cellStepBase, stepsFromCells, addDownstream, addEdge, exportFileName, nameProblem, newNode, updateStep, ancestors, descendants, cappedReads, edgeProblem, missingLinks, nodeStatus, parseKeyColumns, changeAction, actionSettings, usesDefaultRows, batchValue, rebaseClashes, rebaseJob, removeNode, scheduleText, uniqueName } from "./jobGraph";
+import { cellStepBase, stepsFromCells, addDownstream, addEdge, exportFileName, nameProblem, newNode, updateStep, ancestors, descendants, cappedReads, edgeProblem, missingLinks, nodeStatus, parseKeyColumns, changeAction, actionSettings, usesDefaultRows, batchValue, removeNode, scheduleText, uniqueName, browserSignInConnections, monthDayText, scheduleTimes, toggleMonthDay, triggerText, cronProblem, timeZoneProblem, afterLoopJobs, sameSchedule, rebaseClashes, rebaseJob } from "./jobGraph";
 import type { Job, JobNode, OutputInfo } from "./types";
 
 const n = (id: string, name: string, sql = "", x = 0, y = 0): JobNode => ({ id, name, kind: "query", sql, x, y, load_mode: "append" });
@@ -185,6 +185,75 @@ describe("job steps read outputs as the shared scanner does", () => {
   it("doesn't take results.x in a string or comment for a link, and sees one behind a comment", () => {
     const k = job([n("a", "orders"), n("b", "x", "select 'results.orders' as label -- results.orders"), n("c", "y", "select * from results/**/.orders")]);
     expect(missingLinks(k)).toEqual([{ node: "c", reads: "a" }]);
+  });
+});
+
+describe("schedule editor", () => {
+  const s = job([]).schedule;
+  it("describes every kind of schedule, its time zone and the jobs it runs after", () => {
+    expect(scheduleText({ ...s, enabled: true, mode: "daily", times: ["18:00", "06:30"], weekdays: [1, 2, 3, 4, 5] })).toBe("Mon, Tue, Wed, Thu, Fri at 06:30, 18:00");
+    expect(scheduleText({ ...s, enabled: true, mode: "monthly", month_days: [-1, 15, 1], at: "05:00" })).toBe("monthly on the 1st, 15th, last day at 05:00");
+    expect(scheduleText({ ...s, enabled: true, mode: "monthly" })).toBe("monthly on the 1st at 08:00");
+    expect(scheduleText({ ...s, enabled: true, mode: "cron", cron: "30 6 * * 1-5", time_zone: "Europe/Paris" })).toBe("cron 30 6 * * 1-5 (Europe/Paris)");
+    const names = (id: string) => ({ a: "Extract", b: "Clean" })[id];
+    expect(scheduleText({ ...s, after_jobs: ["a", "b"] }, names)).toBe("after Extract or Clean");
+    expect(scheduleText({ ...s, after_jobs: ["gone"] }, names)).toBe("after another job");
+    expect(scheduleText({ ...s, enabled: true, minutes: 60, after_jobs: ["a"] }, names)).toBe("every 1 h, and after Extract");
+  });
+  it("times of day and days of the month", () => {
+    expect(scheduleTimes(s)).toEqual(["08:00"]);
+    expect(scheduleTimes({ ...s, times: ["18:00", "06:30", "18:00"] })).toEqual(["06:30", "18:00"]);
+    expect(toggleMonthDay([], 15)).toEqual([1, 15]);
+    expect(toggleMonthDay([1, 15], 1)).toEqual([15]);
+    expect(toggleMonthDay([15], 15)).toEqual([15]); // one stays on
+    expect(toggleMonthDay([-1, 31], 2)).toEqual([2, 31, -1]);
+    expect([1, 2, 3, 11, 12, 13, 21, 22, 23, 31, -1].map(monthDayText)).toEqual(["1st", "2nd", "3rd", "11th", "12th", "13th", "21st", "22nd", "23rd", "31st", "last day"]);
+  });
+  it("names connections with browser sign-in that the job's steps use", () => {
+    const k = job([{ ...n("a", "x"), connection_id: "sf" }, { ...n("b", "y"), kind: "load", target_connection_id: "pg" }, { ...n("c", "z"), connection_id: "bq" }]);
+    const conns = [
+      { id: "sf", name: "Snowflake SSO", config: { auth: { method: "external_browser" } } },
+      { id: "pg", name: "Warehouse", config: { auth: { method: "oauth_browser" } } },
+      { id: "bq", name: "BigQuery", config: { auth: { method: "service_account" } } },
+      { id: "other", name: "Unused", config: { auth: { method: "device_code" } } },
+    ];
+    expect(browserSignInConnections(k, conns)).toEqual(["Snowflake SSO", "Warehouse"]);
+  });
+  it("run triggers", () => {
+    expect(triggerText("schedule")).toBe("scheduled");
+    expect(triggerText("after:Extract")).toBe("after Extract");
+    expect(triggerText("cli")).toBe("command line");
+  });
+});
+
+describe("schedule checks at the field (the scheduler's rules)", () => {
+  it("accepts what the scheduler accepts", () => {
+    for (const ok of ["30 6 * * 1-5", "*/15 * * * *", "0 0 1 * *", "@daily", "@Weekly", "0 9 * JAN-MAR mon,wed,FRI", "5/15 * * * *", "0 0 * * 7", "0 0 31 * *", "0 0 29 2 *", "0 0 30 2 1", "1-59/4294967295 * * * *"]) {
+      expect(cronProblem(ok), ok).toBeNull();
+    }
+    for (const tz of ["", "local", "UTC", "gmt", "Europe/Paris", "America/New_York", "+05:30", "-08:00", "UTC+2", "+14:00"]) expect(timeZoneProblem(tz), tz).toBeNull();
+    // As the scheduler reads them: the UTC/GMT prefix in any case, day names going round the week.
+    for (const tz of ["utc+2", "gmt-3", "Utc+05:30"]) expect(timeZoneProblem(tz), tz).toBeNull();
+    for (const ok of ["0 9 * * fri-sun", "0 9 * * sat-mon", "0 9 * * fri-tue/2", "0 0 29 2 *", "0 0 13 * fri", "0 12 13 * */7"]) expect(cronProblem(ok), ok).toBeNull();
+    expect(cronProblem("0 9 * * 5-1")).toContain("backwards");
+    // Too rare for the scheduler's 8-year look ahead.
+    for (const rare of ["0 0 29 2 */7", "0 0 25 12 */7", "0 0 1 2 */7"]) expect(cronProblem(rare), rare).toContain("too rarely");
+  });
+
+  it("refuses what it refuses", () => {
+    for (const bad of ["", "* * * *", "60 * * * *", "* 24 * * *", "* * 0 * *", "* * * 13 *", "* * * * 8", "5-1 * * * *", "*/0 * * * *", "x * * * *", "0 0 30 2 *", "0 0 31 4,6 *"]) {
+      expect(cronProblem(bad), bad).not.toBeNull();
+    }
+    for (const tz of ["Europe/Pari", "+-5:00", "+5:-30", "+15:00", "+05:60", "Mars/Olympus"]) expect(timeZoneProblem(tz), tz).not.toBeNull();
+  });
+
+  it("finds the jobs that would loop, and compares schedules by what runs", () => {
+    const j = (id: string, after: string[] = []) => ({ id, schedule: { after_jobs: after } });
+    expect([...afterLoopJobs("a", [j("a"), j("b", ["a"]), j("c", ["b"]), j("d"), j("e", ["d", "c"])])].sort()).toEqual(["a", "b", "c", "e"]);
+    const s = { enabled: true, mode: "daily", minutes: 60, at: "06:00", weekdays: [1, 2] } as Job["schedule"];
+    expect(sameSchedule(s, { ...s, times: ["06:00"], weekdays: [2, 1], missed: "once" })).toBe(true);
+    expect(sameSchedule(s, { ...s, at: "07:00" })).toBe(false);
+    expect(sameSchedule(s, undefined)).toBe(false);
   });
 });
 
