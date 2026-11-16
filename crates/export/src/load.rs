@@ -613,6 +613,132 @@ impl InsertSql {
     }
 }
 
+/// Rows as PostgreSQL `COPY … FROM STDIN` text format (a tab between
+/// values, `\N` for NULL), each value the text its INSERT literal stands
+/// for, so the table ends up the same: NaN/±inf as the INSERT path writes
+/// them (the float's word, NULL in an exact number), booleans as
+/// `true`/`false`, binary as `\x` hex. Which columns may take this path:
+/// [`pg_copy_fits`].
+pub struct PgCopy {
+    kinds: Vec<Lit>,
+    /// `COPY table (cols) FROM STDIN`.
+    pub sql: String,
+}
+
+impl PgCopy {
+    pub fn new(table: &str, schema: &SchemaRef) -> Self {
+        let d = ConnectorKind::Postgres;
+        Self {
+            kinds: schema.fields().iter().map(|f| lit_kind(f)).collect(),
+            sql: format!(
+                "COPY {} ({}) FROM STDIN",
+                quote_path(d, table),
+                schema.fields().iter().map(|f| quote_ident(d, f.name())).collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+
+    /// Data for rows `start..` of `batch`, up to about `max_bytes` (at least
+    /// one row): the bytes and how many rows they hold. `None` past the end.
+    pub fn next(&self, batch: &RecordBatch, start: usize, max_bytes: usize) -> Result<Option<(Vec<u8>, usize)>> {
+        if start >= batch.num_rows() {
+            return Ok(None);
+        }
+        let fopts = format_options();
+        let fmts: Vec<ArrayFormatter<'_>> =
+            batch.columns().iter().map(|a| ArrayFormatter::try_new(a.as_ref(), &fopts)).collect::<std::result::Result<_, _>>()?;
+        let mut out = Vec::new();
+        let mut n = 0;
+        for r in start..batch.num_rows() {
+            if n > 0 && out.len() >= max_bytes {
+                break;
+            }
+            for (i, ((a, f), k)) in batch.columns().iter().zip(&fmts).zip(&self.kinds).enumerate() {
+                if i > 0 {
+                    out.push(b'\t');
+                }
+                let cell = (!a.is_null(r)).then(|| f.value(r).to_string());
+                pg_copy_value(&mut out, cell.as_deref(), *k);
+            }
+            out.push(b'\n');
+            n += 1;
+        }
+        Ok(Some((out, n)))
+    }
+}
+
+/// A negative zero written as text (`-0`, `-0.000`, `-0e5`): every digit
+/// of the number is 0. Read from the text, not as a float: `-1e-400`
+/// rounds to 0 as an f64 but is a negative number for `numeric`.
+fn is_negative_zero(s: &str) -> bool {
+    let Some(rest) = s.trim().strip_prefix('-') else { return false };
+    let mantissa = rest.split(['e', 'E']).next().unwrap_or_default();
+    let mut digits = mantissa.chars().filter(|c| *c != '.').peekable();
+    digits.peek().is_some() && mantissa.chars().all(|c| c.is_ascii_digit() || c == '.') && digits.all(|c| c == '0')
+}
+
+/// One value in COPY text format, as [`literal`] writes it for Postgres.
+fn pg_copy_value(out: &mut Vec<u8>, cell: Option<&str>, kind: Lit) {
+    const NULL: &[u8] = br"\N";
+    let Some(s) = cell else {
+        out.extend_from_slice(NULL);
+        return;
+    };
+    let text: std::borrow::Cow<str> = match kind {
+        Lit::Number | Lit::Float => match non_finite(s) {
+            // NULL in an exact number, the float's own word otherwise.
+            Some(v) if non_finite_literal(v, kind, ConnectorKind::Postgres) == "NULL" => {
+                out.extend_from_slice(NULL);
+                return;
+            }
+            Some(v) if v.is_nan() => "NaN".into(),
+            Some(v) if v > 0.0 => "Infinity".into(),
+            Some(_) => "-Infinity".into(),
+            // A negative zero: the INSERT's bare `-0.0` is the numeric 0
+            // negated, which stays 0, while float8in keeps -0.
+            None if is_negative_zero(s) => s.trim_start().trim_start_matches('-').into(),
+            None => s.into(),
+        },
+        Lit::Bool => s.to_ascii_lowercase().into(),
+        Lit::Binary => format!(r"\x{s}").into(),
+        _ => s.into(),
+    };
+    for b in text.bytes() {
+        match b {
+            b'\\' => out.extend_from_slice(br"\\"),
+            b'\n' => out.extend_from_slice(br"\n"),
+            b'\r' => out.extend_from_slice(br"\r"),
+            b'\t' => out.extend_from_slice(br"\t"),
+            _ => out.push(b),
+        }
+    }
+}
+
+/// Whether column `f` of the rows can go into a Postgres column of type
+/// `target` (as `format_type` names it) by COPY with the same result as its
+/// INSERT literal; `Err` says why not. An INSERT writes numbers and
+/// booleans bare and the database casts them (`12.5` into an integer is
+/// rounded, `TRUE` into text is `true`); COPY reads text with the column
+/// type's input, which refuses or keeps other text. Quoted literals (text,
+/// dates, timestamps) are read by that same input.
+pub fn pg_copy_fits(f: &Field, target: &str) -> std::result::Result<(), String> {
+    let t = target.trim().to_ascii_lowercase();
+    let t = t.split('(').next().unwrap_or_default().trim();
+    let integer = matches!(t, "smallint" | "integer" | "bigint");
+    let exact = matches!(t, "numeric" | "real" | "double precision");
+    let text = matches!(t, "text" | "character varying");
+    let ok = match lit_kind(f) {
+        Lit::Number if f.data_type().is_integer() => integer || exact,
+        Lit::Number | Lit::Float => exact,
+        Lit::Bool => t == "boolean" || text,
+        // Into text, an INSERT's bytea is cast by the server's
+        // `bytea_output` (hex or escape): COPY can't know which.
+        Lit::Binary => t == "bytea",
+        _ => true,
+    };
+    if ok { Ok(()) } else { Err(format!("{} ({}) into {target}", f.name(), f.data_type())) }
+}
+
 /// INSERT statements for every row, several rows per statement (the dialect's default batch size).
 pub fn insert_statements(dialect: ConnectorKind, table: &str, schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<String>> {
     let b = InsertSql::new(dialect, table, schema, batch_limits(dialect).default_size());
@@ -812,6 +938,106 @@ mod tests {
         assert_eq!(edit_literal(&f, Some(" -inf "), K::Postgres).unwrap(), "'-Infinity'::float8");
         assert_eq!(edit_literal(&f, Some(" 2.5 "), K::Mssql).unwrap(), "2.5");
         assert!(edit_literal(&Field::new("n", DataType::Int64, true), Some("inf"), K::Postgres).is_err());
+    }
+
+    /// COPY text: NULL as `\N`, the escapes COPY reads (backslash, tab,
+    /// newline, carriage return), NaN/inf as the INSERT literal has them,
+    /// booleans and binary as their literals' text.
+    #[test]
+    fn pg_copy_text() {
+        use databrain_connector_core::arrow::array::{BinaryArray, Decimal128Array, Float64Array};
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("ok", DataType::Boolean, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("d", DataType::Decimal128(10, 2), true),
+            Field::new("b", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("a\tb\nc\\d\re"), None, Some("ünï 'q' \"x\"")])),
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+                Arc::new(Float64Array::from(vec![Some(f64::NAN), Some(f64::NEG_INFINITY), Some(2.5)])),
+                Arc::new(Decimal128Array::from(vec![Some(150), None, Some(-325)]).with_precision_and_scale(10, 2).unwrap()),
+                Arc::new(BinaryArray::from(vec![Some(&b"\x00\xff"[..]), None, Some(&b""[..])])),
+            ],
+        )
+        .unwrap();
+        let c = PgCopy::new("s.t", &schema);
+        assert_eq!(c.sql, r#"COPY "s"."t" ("id", "name", "ok", "f", "d", "b") FROM STDIN"#);
+        let (data, n) = c.next(&batch, 0, usize::MAX).unwrap().unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(
+            String::from_utf8(data).unwrap(),
+            "1\ta\\tb\\nc\\\\d\\re\ttrue\tNaN\t1.50\t\\\\x00ff\n\
+             2\t\\N\tfalse\t-Infinity\t\\N\t\\N\n\
+             3\tünï 'q' \"x\"\t\\N\t2.5\t-3.25\t\\\\x\n"
+        );
+        // The INSERT literals of the same rows (what COPY must match).
+        let sql = insert_statements(ConnectorKind::Postgres, "s.t", &schema, std::slice::from_ref(&batch)).unwrap().join("");
+        assert!(sql.contains("'NaN'::float8") && sql.contains("'-Infinity'::float8") && sql.contains(r"'\x00ff'::bytea") && sql.contains("TRUE"), "{sql}");
+        // By size: at least one row a chunk, then as many as fit.
+        let (_, n) = c.next(&batch, 0, 1).unwrap().unwrap();
+        assert_eq!(n, 1);
+        let (_, n) = c.next(&batch, 1, 1).unwrap().unwrap();
+        assert_eq!(n, 1);
+        assert!(c.next(&batch, 3, 1).unwrap().is_none());
+        // NaN in an exact number is NULL, as its INSERT literal.
+        let mut out = Vec::new();
+        pg_copy_value(&mut out, Some("NaN"), Lit::Number);
+        assert_eq!(out, br"\N");
+        // A negative zero is written as 0, as the INSERT's `-0.0` stores it;
+        // other negatives keep their sign.
+        let tiny = format!("-0.{}1", "0".repeat(400));
+        for (v, want) in [
+            ("-0", "0"),
+            ("-0.0", "0.0"),
+            ("-0.000", "0.000"),
+            ("-0e5", "0e5"),
+            ("-0.5", "-0.5"),
+            ("-0.0001", "-0.0001"),
+            ("-1e-400", "-1e-400"),
+            (tiny.as_str(), tiny.as_str()),
+            ("0", "0"),
+        ] {
+            let mut out = Vec::new();
+            pg_copy_value(&mut out, Some(v), Lit::Float);
+            assert_eq!(String::from_utf8(out).unwrap(), want, "{v}");
+        }
+    }
+
+    /// Which columns may go by COPY: where the INSERT's bare literal and
+    /// COPY's text input give the same value.
+    #[test]
+    fn pg_copy_fits_per_type() {
+        let f = |t: DataType| Field::new("c", t, true);
+        // Integers: integer and exact/float columns, not text (`1e20` vs its cast) or json.
+        assert!(pg_copy_fits(&f(DataType::Int64), "bigint").is_ok());
+        assert!(pg_copy_fits(&f(DataType::Int32), "numeric(12,2)").is_ok());
+        assert!(pg_copy_fits(&f(DataType::Int32), "double precision").is_ok());
+        assert!(pg_copy_fits(&f(DataType::Int32), "text").is_err());
+        assert!(pg_copy_fits(&f(DataType::Int32), "jsonb").is_err());
+        // Fractions into an integer are rounded by the INSERT's cast, refused by COPY: INSERTs.
+        assert!(pg_copy_fits(&f(DataType::Float64), "integer").unwrap_err().contains("integer"));
+        assert!(pg_copy_fits(&f(DataType::Decimal128(10, 2)), "bigint").is_err());
+        assert!(pg_copy_fits(&f(DataType::Float64), "numeric").is_ok());
+        assert!(pg_copy_fits(&f(DataType::Float32), "real").is_ok());
+        // Booleans: boolean or text (both `true`); not an integer column.
+        assert!(pg_copy_fits(&f(DataType::Boolean), "boolean").is_ok());
+        assert!(pg_copy_fits(&f(DataType::Boolean), "character varying(10)").is_ok());
+        assert!(pg_copy_fits(&f(DataType::Boolean), "integer").is_err());
+        // Binary: bytea only (into text, the INSERT's cast follows the server's bytea_output).
+        assert!(pg_copy_fits(&f(DataType::Binary), "bytea").is_ok());
+        assert!(pg_copy_fits(&f(DataType::Binary), "text").is_err());
+        assert!(pg_copy_fits(&f(DataType::Binary), "uuid").is_err());
+        // Quoted literals are read by the column's own input either way.
+        for t in ["date", "timestamp with time zone", "uuid", "jsonb", "integer", "text[]"] {
+            assert!(pg_copy_fits(&f(DataType::Utf8), t).is_ok(), "{t}");
+        }
+        assert!(pg_copy_fits(&f(DataType::Date32), "date").is_ok());
     }
 
     /// Dates: Oracle gets typed literals (DATE for a date, TIMESTAMP when the

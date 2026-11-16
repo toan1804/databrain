@@ -115,6 +115,7 @@ fn ai_job(connection_id: &str, sql: &str) -> Job {
         create_table: true,
         batch_rows: None,
         batch_kb: None,
+        load_insert_only: false,
         export_folder: None,
         export_file: None,
         export_format: FileFormat::Csv,

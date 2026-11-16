@@ -8,6 +8,7 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 - **Jobs, limits and retries:** a time limit per run and per step (a step past its limit is stopped and fails), retries with growing waits after a connection error for steps that can't write twice (reads, saves to a file, loads rolled back as a whole), and a maximum of steps running at once in a job and on one connection (the others show as waiting).
 - **Jobs, schedules:** several times a day, monthly (including the last day) or a cron expression, in a chosen time zone; a setting for runs missed while the computer was off (run once, skip, or run each, up to 24); and "Run after" another job, which starts when that job succeeds. A scheduled job on a connection with browser sign-in shows a warning, and a failed run says why.
+- **Jobs, faster loads:** loads into PostgreSQL send rows with `COPY` instead of INSERTs when the table ends up the same (not into a table with rules or row-level security). "Bulk load when the database supports it" (on by default) turns it off; the run log says which was used and why not.
 
 ### Changed
 

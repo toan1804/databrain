@@ -41,6 +41,11 @@ batch_rows?: number | null,
  */
 batch_kb?: number | null, 
 /**
+ * Load: rows go in INSERTs only. Off (the default), a load uses the
+ * database's bulk path where it writes the same (Postgres `COPY`).
+ */
+load_insert_only?: boolean, 
+/**
  * Export: folder of the file (empty = Downloads).
  */
 export_folder?: string | null, 

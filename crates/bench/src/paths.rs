@@ -303,8 +303,21 @@ fn export_and_load(s: &mut Suite) {
         });
     }
     s.group("load");
+    let (copy_schema, copy_data) = (schema.clone(), data.clone());
     s.add("insert_sql_100k_rows", "a load writes its INSERT statements", 1500, rows, move || {
         databrain_export::load::insert_statements(ConnectorKind::Postgres, "app.orders", &schema, &data).map(|v| v.len()).expect("inserts")
+    });
+    s.add("pg_copy_100k_rows", "a Postgres load writes its COPY data", 1500, rows, move || {
+        let c = databrain_export::load::PgCopy::new("app.orders", &copy_schema);
+        let mut bytes = 0;
+        for b in &copy_data {
+            let mut at = 0;
+            while let Some((d, n)) = c.next(b, at, 1 << 20).expect("copy") {
+                bytes += d.len();
+                at += n;
+            }
+        }
+        bytes
     });
 }
 

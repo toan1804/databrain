@@ -256,6 +256,15 @@ export function LoadFields({ job, node, onChange }: { job: Job; node: JobNode; o
           </div>
         </div>
       )}
+      <div>
+        <label className="flex items-center gap-1.5 text-[12px]">
+          <input type="checkbox" checked={!node.load_insert_only} onChange={(e) => onChange({ load_insert_only: !e.target.checked })} />
+          Bulk load when the database supports it
+        </label>
+        <div className="mt-0.5 text-[11px] text-muted">
+          PostgreSQL gets the rows by COPY when it writes the same as the INSERTs. Off: always INSERTs.
+        </div>
+      </div>
       <BatchFields node={node} kind={target?.config.kind} onChange={onChange} />
       <div className="flex flex-wrap gap-1.5">
         {!showBefore && (

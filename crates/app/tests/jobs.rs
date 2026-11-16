@@ -73,6 +73,7 @@ fn node(id: &str, name: &str, kind: JobNodeKind, conn: Option<&str>, sql: &str) 
         create_table: true,
         batch_rows: None,
         batch_kb: None,
+        load_insert_only: false,
         export_folder: None,
         export_file: None,
         export_format: FileFormat::Csv,
@@ -1833,6 +1834,337 @@ async fn steps_at_once_stay_within_the_limits() {
     })
     .await
     .expect("test hung");
+}
+
+fn log_text(st: &AppState, job: &Job, run: &JobRun) -> Vec<String> {
+    api::job_run_log(st, &job.id, run.id).unwrap().iter().map(|e| e.message.clone()).collect()
+}
+
+/// A connection to the live server `env` (`DATABRAIN_PG`, …) of `kind`.
+fn live_conn(st: &AppState, env: &str, kind: ConnectorKind, user: &str, port: &str, database: &str) -> String {
+    let host = std::env::var(format!("{env}_HOST")).unwrap_or_else(|_| panic!("{env}_HOST"));
+    let mut c = ConnectionConfig::new(kind, AuthMethod::Password { user: std::env::var(format!("{env}_USER")).unwrap_or(user.into()) });
+    c.host = Some(host);
+    c.port = std::env::var(format!("{env}_PORT")).unwrap_or(port.into()).parse().ok();
+    c.database = Some(database.into());
+    api::save_connection(
+        st,
+        SaveConnectionArgs {
+            profile: ConnectionProfile {
+                id: String::new(),
+                name: "live".into(),
+                config: c,
+                color: None,
+                env: EnvTag::None,
+                folder_id: None,
+                has_secret: true,
+                ai_policy: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            },
+            secret: std::env::var(format!("{env}_PASSWORD")).ok(),
+            clear_secret: false,
+            extra_secrets: Default::default(),
+        },
+    )
+    .unwrap()
+    .id
+}
+
+/// Postgres: rows loaded by COPY end up exactly as the INSERT path writes
+/// them (NULLs, quotes, tabs, newlines, backslashes, unicode, decimals,
+/// NaN/inf, dates, timestamps with and without zone, binary, booleans),
+/// into a table the load creates and into one with other column types
+/// (text for booleans, numeric, jsonb, varchar); a column whose INSERT
+/// would be cast differently (a fraction into an integer), binary into
+/// text, and a table with row-level security go by INSERTs; a negative zero
+/// is stored as the INSERT stores it.
+#[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
+#[tokio::test(flavor = "multi_thread")]
+async fn live_postgres_copy_writes_what_inserts_write() {
+    tokio::time::timeout(Duration::from_secs(180), async {
+        let st = state();
+        let pg = live_conn(&st, "DATABRAIN_PG", ConnectorKind::Postgres, "postgres", "5432", "postgres");
+        // Tables of this run only: two live runs at once (CI, a developer) don't clash.
+        let sfx = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let t = |n: &str| format!("{n}_{sfx}");
+        let src = "select * from (values \
+            (1, 'it''s \"x\" ' || chr(9) || 'tab' || chr(10) || 'line' || chr(13) || 'cr \\ back', true, 2.5::double, 1.50::decimal(12, 3), date '2026-01-02', \
+             timestamp '2026-01-02 03:04:05.123456', timestamptz '2026-01-02 03:04:05+02', '\\x00\\xFF\\x5C'::blob, 'ünïcødé ✓ 日本', '{\"a\": [1, \"b\"]}'), \
+            (2, null, false, 'NaN'::double, -0.001::decimal(12, 3), null, null, null, ''::blob, '', 'null'), \
+            (3, '\\N', null, '-inf'::double, null, date '1999-12-31', timestamp '1970-01-01 00:00:00', timestamptz '2026-06-30 23:59:59.5+00', null, null, null), \
+            (4, '', null, 1e-7::double, 12345678.125::decimal(12, 3), null, null, null, null, 'end', '[]') \
+            ) t(id, name, ok, f, d, day, ts, tsz, bin, uni, j)";
+        let load = |id: &str, name: &str, table: &str, insert_only: bool, mode: LoadMode, before: Option<&str>| {
+            let mut n = node(id, name, JobNodeKind::Load, None, "");
+            n.target_connection_id = Some(pg.clone());
+            n.target_table = Some(table.into());
+            n.load_mode = mode;
+            n.load_insert_only = insert_only;
+            n.load_before_sql = before.map(str::to_string);
+            n
+        };
+        let pre = |t: &str| {
+            format!(
+                "drop table if exists {t}; create table {t} (id bigint, name text, ok text, f double precision, d numeric(14, 3), day date, ts timestamp, \
+                 tsz timestamptz, bin bytea, uni varchar(50), j jsonb)"
+            )
+        };
+        let (pre_copy, pre_ins) = (pre(&t("db_pre_copy")), pre(&t("db_pre_ins")));
+        let job = st
+            .workspace
+            .save_job(Job {
+                id: String::new(),
+                name: "copy vs inserts".into(),
+                nodes: vec![
+                    node("a", "copy_src", JobNodeKind::Query, None, src),
+                    load("b", "by_copy", &t("db_new_copy"), false, LoadMode::Replace, None),
+                    load("c", "by_inserts", &t("db_new_ins"), true, LoadMode::Replace, None),
+                    load("d", "pre_by_copy", &t("db_pre_copy"), false, LoadMode::Append, Some(&pre_copy)),
+                    load("e", "pre_by_inserts", &t("db_pre_ins"), true, LoadMode::Append, Some(&pre_ins)),
+                ],
+                edges: ["b", "c", "d", "e"].iter().map(|t| JobEdge { from: "a".into(), to: (*t).into() }).collect(),
+                schedule: Default::default(),
+                last_scheduled_at: None,
+                params: Default::default(),
+                param_set: None,
+                limits: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        let log = log_text(&st, &job, &run);
+        for (step_name, copy) in [("by_copy", true), ("by_inserts", false), ("pre_by_copy", true), ("pre_by_inserts", false)] {
+            assert_eq!(step(&run, step_name).rows, Some(4), "{step_name}");
+            let entries = api::job_run_log(&st, &job.id, run.id).unwrap();
+            let used = entries.iter().any(|e| e.step.as_deref() == Some(step_name) && e.message.contains("bulk load (COPY"));
+            assert_eq!(used, copy, "{step_name}: {log:#?}");
+        }
+        for (a, b) in [(&t("db_new_copy"), &t("db_new_ins")), (&t("db_pre_copy"), &t("db_pre_ins"))] {
+            let diff = format!(
+                "select (select count(*) from (select * from {a} except all select * from {b}) x) + (select count(*) from (select * from {b} except all select * from {a}) y)"
+            );
+            assert_eq!(rows(&st, &pg, &diff).await, vec![vec!["0"]], "{a} vs {b}");
+            // Column types the same too (the created tables).
+            let types = |t: &str| format!("select string_agg(column_name || ' ' || data_type, ', ' order by ordinal_position) from information_schema.columns where table_name = '{t}'");
+            assert_eq!(rows(&st, &pg, &types(a)).await, rows(&st, &pg, &types(b)).await);
+        }
+        let got = rows(&st, &pg, &format!("select name, ok, uni, encode(bin, 'hex'), f::text from db_pre_copy_{sfx} order by id")).await;
+        assert_eq!(got[0][0], "it's \"x\" \ttab\nline\rcr \\ back");
+        assert_eq!(got[0][1], "true");
+        assert_eq!(got[0][2], "ünïcødé ✓ 日本");
+        assert_eq!(got[0][3], "00ff5c");
+        assert_eq!((got[1][4].as_str(), got[2][4].as_str()), ("NaN", "-Infinity"));
+        assert_eq!(got[2][0], "\\N", "the text \\N is not NULL");
+
+        // A fraction into an integer column: the INSERT rounds it, COPY would refuse: INSERTs.
+        let mut ints = load("b", "to_ints", &t("db_ints"), false, LoadMode::Append, Some(&format!("drop table if exists db_ints_{sfx}; create table db_ints_{sfx} (f integer)")));
+        ints.sql = String::new();
+        let job = st
+            .workspace
+            .save_job(Job {
+                id: String::new(),
+                name: "ints".into(),
+                nodes: vec![node("a", "int_src", JobNodeKind::Query, None, "select 2.6::double as f"), ints],
+                edges: vec![JobEdge { from: "a".into(), to: "b".into() }],
+                schedule: Default::default(),
+                last_scheduled_at: None,
+                params: Default::default(),
+                param_set: None,
+                limits: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert!(log_text(&st, &job, &run).iter().any(|l| l.contains("INSERTs, not COPY (f (Float64) into integer)")), "{:#?}", log_text(&st, &job, &run));
+        assert_eq!(rows(&st, &pg, &format!("select f from db_ints_{sfx}")).await, vec![vec!["3"]]);
+
+        // Binary into text (the INSERT's cast follows bytea_output), a table
+        // with row-level security (COPY refuses it): INSERTs. A negative zero
+        // by COPY is stored as the INSERT stores it (0).
+        let one = |name: &str, table: &str, src: &str, before: &str| {
+            let mut l = load("b", name, table, false, LoadMode::Append, Some(before));
+            l.sql = String::new();
+            Job {
+                id: String::new(),
+                name: format!("job {name}"),
+                nodes: vec![node("a", &format!("{name}_src"), JobNodeKind::Query, None, src), l],
+                edges: vec![JobEdge { from: "a".into(), to: "b".into() }],
+                schedule: Default::default(),
+                last_scheduled_at: None,
+                params: Default::default(),
+                param_set: None,
+                limits: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            }
+        };
+        for (name, table, src, before, why) in [
+            ("to_text", &t("db_bin_text"), "select '\\x01ff'::blob as b", &format!("drop table if exists db_bin_text_{sfx}; create table db_bin_text_{sfx} (b text)"), Some("into text")),
+            (
+                "to_rls",
+                &t("db_rls"),
+                "select 1.5::double as f",
+                &format!("drop table if exists db_rls_{sfx}; create table db_rls_{sfx} (f double precision); alter table db_rls_{sfx} enable row level security; \
+                 alter table db_rls_{sfx} force row level security; create policy db_rls_all_{sfx} on db_rls_{sfx} using (true) with check (true)"),
+                Some("row-level security"),
+            ),
+            ("neg_zero", &t("db_negz"), "select -0.0::double as f", &format!("drop table if exists db_negz_{sfx}; create table db_negz_{sfx} (f double precision)"), None),
+        ] {
+            let job = st.workspace.save_job(one(name, table, src, before)).unwrap();
+            let run = run_all(&st, &job).await;
+            assert_eq!(run.status, "success", "{name}: {run:?}");
+            let log = log_text(&st, &job, &run);
+            match why {
+                Some(w) => assert!(log.iter().any(|l| l.contains("INSERTs, not COPY") && l.contains(w)), "{name}: {log:#?}"),
+                None => assert!(log.iter().any(|l| l.contains("bulk load (COPY")), "{name}: {log:#?}"),
+            }
+        }
+        assert_eq!(rows(&st, &pg, &format!("select f::text from db_negz_{sfx}")).await, vec![vec!["0"]]);
+        assert_eq!(rows(&st, &pg, &format!("select count(*) from db_rls_{sfx}")).await, vec![vec!["1"]]);
+        rows(&st, &pg, &format!("drop table db_new_copy_{sfx}, db_new_ins_{sfx}, db_pre_copy_{sfx}, db_pre_ins_{sfx}, db_ints_{sfx}, db_bin_text_{sfx}, db_rls_{sfx}, db_negz_{sfx}; select 1")).await;
+    })
+    .await
+    .expect("in time");
+}
+
+/// Postgres, columns COPY must leave to INSERTs: a GENERATED ALWAYS
+/// identity column the rows hold (COPY would write it; the INSERT refuses
+/// it, as before) and a stored generated column; a BY DEFAULT identity
+/// takes the rows' values either way (COPY). The dry run says which one a
+/// load would use. Stop ends a COPY waiting for the table's lock: nothing
+/// is kept and the connection loads again afterwards.
+#[ignore = "live: needs DATABRAIN_PG_HOST (cargo test -- --ignored)"]
+#[tokio::test(flavor = "multi_thread")]
+async fn live_postgres_copy_columns_dry_run_and_stop() {
+    tokio::time::timeout(Duration::from_secs(180), async {
+        let st = state();
+        let pg = live_conn(&st, "DATABRAIN_PG", ConnectorKind::Postgres, "postgres", "5432", "postgres");
+        let sfx = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let job_of = |name: &str, table: &str, src: &str, before: Option<&str>| {
+            let mut l = node("b", name, JobNodeKind::Load, None, "");
+            l.target_connection_id = Some(pg.clone());
+            l.target_table = Some(table.into());
+            l.load_mode = LoadMode::Append;
+            l.load_before_sql = before.map(str::to_string);
+            Job {
+                id: String::new(),
+                name: format!("job {name}"),
+                nodes: vec![node("a", &format!("{name}_src"), JobNodeKind::Query, None, src), l],
+                edges: vec![JobEdge { from: "a".into(), to: "b".into() }],
+                schedule: Default::default(),
+                last_scheduled_at: None,
+                params: Default::default(),
+                param_set: None,
+                limits: Default::default(),
+                created_at: 0,
+                updated_at: 0,
+            }
+        };
+        let (always, by_default, gen_t, locked) = (format!("db_idalw_{sfx}"), format!("db_iddef_{sfx}"), format!("db_gen_{sfx}"), format!("db_lock_{sfx}"));
+        rows(
+            &st,
+            &pg,
+            &format!(
+                "create table {always} (id bigint generated always as identity, v text); \
+                 create table {by_default} (id bigint generated by default as identity, v text); \
+                 create table {gen_t} (a int, b int generated always as (a * 2) stored); \
+                 create table {locked} (id bigint, v text); select 1"
+            ),
+        )
+        .await;
+
+        // Identity ALWAYS: INSERTs, which refuse the value, as before COPY existed.
+        let job = st.workspace.save_job(job_of(&format!("idalw_{sfx}"), &always, "select 5::bigint as id, 'x' as v", None)).unwrap();
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "error", "{run:?}");
+        let log = log_text(&st, &job, &run);
+        assert!(log.iter().any(|l| l.contains("INSERTs, not COPY") && l.contains("GENERATED ALWAYS AS IDENTITY")), "{log:#?}");
+        assert!(run.error.as_deref().unwrap_or_default().contains("non-DEFAULT value"), "{run:?}");
+        assert_eq!(rows(&st, &pg, &format!("select count(*) from {always}")).await, vec![vec!["0"]]);
+
+        // Identity BY DEFAULT: COPY, the rows' values kept (as an INSERT keeps them).
+        let job = st.workspace.save_job(job_of(&format!("iddef_{sfx}"), &by_default, "select 5::bigint as id, 'x' as v", None)).unwrap();
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert!(log_text(&st, &job, &run).iter().any(|l| l.contains("bulk load (COPY")), "{:#?}", log_text(&st, &job, &run));
+        assert_eq!(rows(&st, &pg, &format!("select id::text, v from {by_default}")).await, vec![vec!["5", "x"]]);
+        // The dry run says COPY would be used.
+        let r = api::dry_run_job_step(&st, job.clone(), "b").await.unwrap();
+        assert!(r.checks.iter().any(|c| c.message.as_deref().is_some_and(|m| m.contains("bulk load (COPY"))), "{r:?}");
+
+        // A stored generated column the rows hold: INSERTs (which refuse it); not held: COPY, computed.
+        let job = st.workspace.save_job(job_of(&format!("gen1_{sfx}"), &gen_t, "select 1 as a, 9 as b", None)).unwrap();
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "error", "{run:?}");
+        assert!(log_text(&st, &job, &run).iter().any(|l| l.contains("INSERTs, not COPY") && l.contains("generated column")));
+        let job = st.workspace.save_job(job_of(&format!("gen2_{sfx}"), &gen_t, "select 3 as a", None)).unwrap();
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert!(log_text(&st, &job, &run).iter().any(|l| l.contains("bulk load (COPY")));
+        assert_eq!(rows(&st, &pg, &format!("select a, b from {gen_t}")).await, vec![vec!["3", "6"]]);
+
+        // Stop while the COPY waits for the table's lock (held by another session).
+        let locker = format!("locker-{sfx}");
+        let hold = |sql: String| {
+            let st = &st;
+            let pg = pg.clone();
+            let locker = locker.clone();
+            async move {
+                let out = st
+                    .engine
+                    .run_and_wait(
+                        &st.hub,
+                        RunRequest {
+                            connection_id: pg,
+                            tab_id: locker,
+                            sql,
+                            base_offset: 0,
+                            row_limit: None,
+                            confirmed: true,
+                            origin: Default::default(),
+                            session_key: None,
+                            output_name: None,
+                            params: Default::default(),
+                            output_masks: None,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(out.iter().all(|o| o.error.is_none()), "{out:?}");
+            }
+        };
+        hold(format!("begin; lock table {locked} in share mode")).await;
+        let job = st.workspace.save_job(job_of(&format!("lock_{sfx}"), &locked, "select 1::bigint as id, 'x' as v", None)).unwrap();
+        api::run_job(&st, &job.id, None).unwrap();
+        let waiting = format!("select count(*) from pg_stat_activity where wait_event_type = 'Lock' and query like 'COPY %{locked}%'");
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while rows(&st, &pg, &waiting).await != vec![vec!["1"]] {
+            assert!(std::time::Instant::now() < end, "the COPY never waited for the lock");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let stopped = std::time::Instant::now();
+        assert!(api::cancel_job(&st, &job.id));
+        let run = finished(&st, &job.id).await;
+        assert!(stopped.elapsed() < Duration::from_secs(8), "stopped in {:?}", stopped.elapsed());
+        assert_eq!(run.status, "cancelled", "{run:?}");
+        assert_eq!(rows(&st, &pg, &waiting).await, vec![vec!["0"]], "the COPY ended on the server");
+        hold("rollback".into()).await;
+        assert_eq!(rows(&st, &pg, &format!("select count(*) from {locked}")).await, vec![vec!["0"]], "nothing kept");
+        // The load's connection works again.
+        let run = run_all(&st, &job).await;
+        assert_eq!(run.status, "success", "{run:?}");
+        assert_eq!(rows(&st, &pg, &format!("select count(*) from {locked}")).await, vec![vec!["1"]]);
+
+        rows(&st, &pg, &format!("drop table {always}, {by_default}, {gen_t}, {locked}; select 1")).await;
+    })
+    .await
+    .expect("in time");
 }
 
 /// "Run after" a job that is busy: the start is queued, not lost, and the

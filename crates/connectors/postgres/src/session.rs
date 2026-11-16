@@ -31,6 +31,71 @@ impl PgSession {
     }
 }
 
+/// Data of a `COPY … FROM STDIN`; dropped unfinished, the COPY is aborted.
+/// Stopped (`cancel`), the server is asked to cancel it too, so a COPY
+/// that waits (a lock, a trigger) ends there as well.
+struct CopyWriter {
+    sink: std::pin::Pin<Box<tokio_postgres::CopyInSink<std::io::Cursor<Vec<u8>>>>>,
+    cancel: databrain_connector_core::CancellationToken,
+    cancel_token: tokio_postgres::CancelToken,
+    tls: MakeTlsConnector,
+}
+
+/// How long a cancelled COPY may take to end once the server was asked.
+const COPY_CANCEL_WAIT: Duration = Duration::from_secs(10);
+
+/// A COPY's error with the server's CONTEXT (`COPY t, line 3, column x: …`):
+/// which row failed.
+fn copy_err(e: &tokio_postgres::Error) -> ConnectorError {
+    let mut c = map_err(e);
+    if !c.is_cancelled()
+        && let Some(w) = e.as_db_error().and_then(|d| d.where_())
+    {
+        c.message.push_str("\nCONTEXT: ");
+        c.message.push_str(w);
+    }
+    c
+}
+
+/// Run `work` (a step of a COPY) unless `cancel` fires first: then ask the
+/// server to cancel and give `work` a bounded time to end with that.
+async fn cancellable<T>(
+    work: impl std::future::Future<Output = std::result::Result<T, tokio_postgres::Error>>,
+    cancel: &databrain_connector_core::CancellationToken,
+    cancel_token: &tokio_postgres::CancelToken,
+    tls: &MakeTlsConnector,
+) -> Result<T> {
+    tokio::pin!(work);
+    tokio::select! {
+        r = &mut work => r.map_err(|e| copy_err(&e)),
+        _ = cancel.cancelled() => {
+            let _ = cancel_token.cancel_query(tls.clone()).await;
+            let _ = tokio::time::timeout(COPY_CANCEL_WAIT, &mut work).await;
+            Err(ConnectorError::cancelled())
+        }
+    }
+}
+
+#[async_trait]
+impl databrain_connector_core::BulkWriter for CopyWriter {
+    async fn write(&mut self, data: Vec<u8>) -> Result<()> {
+        use futures::SinkExt;
+        if self.cancel.is_cancelled() {
+            return Err(ConnectorError::cancelled());
+        }
+        let CopyWriter { sink, cancel, cancel_token, tls } = self;
+        cancellable(sink.send(std::io::Cursor::new(data)), cancel, cancel_token, tls).await
+    }
+
+    async fn finish(mut self: Box<Self>) -> Result<u64> {
+        if self.cancel.is_cancelled() {
+            return Err(ConnectorError::cancelled());
+        }
+        let CopyWriter { sink, cancel, cancel_token, tls } = &mut *self;
+        cancellable(sink.as_mut().finish(), cancel, cancel_token, tls).await
+    }
+}
+
 #[async_trait]
 impl Session for PgSession {
     fn detected_flavor(&self) -> Option<&'static str> {
@@ -52,6 +117,22 @@ impl Session for PgSession {
 
     async fn ping(&self) -> Result<()> {
         self.client().simple_query("select 1").await.map(|_| ()).map_err(|e| map_err(&e))
+    }
+
+    /// `COPY … FROM STDIN` (not on Redshift, which has no COPY from the
+    /// client, nor read-only: rows go in INSERTs, which are refused there).
+    async fn bulk_load(&self, sql: &str, cancel: databrain_connector_core::CancellationToken) -> Result<Option<Box<dyn databrain_connector_core::BulkWriter>>> {
+        if self.redshift || self.read_only {
+            return Ok(None);
+        }
+        if cancel.is_cancelled() {
+            return Err(ConnectorError::cancelled());
+        }
+        let client = self.client();
+        let cancel_token = client.cancel_token();
+        // The start waits for the table's lock: Stop ends that wait too.
+        let sink = cancellable(client.copy_in::<_, std::io::Cursor<Vec<u8>>>(sql), &cancel, &cancel_token, &self.tls).await?;
+        Ok(Some(Box::new(CopyWriter { sink: Box::pin(sink), cancel, cancel_token, tls: self.tls.clone() })))
     }
 
     async fn execute(&self, stmt: databrain_connector_core::Statement<'_>, opts: ExecOptions) -> Result<QueryStream> {
