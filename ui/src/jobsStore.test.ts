@@ -18,6 +18,10 @@ vi.mock("./lib/api", () => ({
         }
         if (name === "runJob") return { id: 1, job_id: "job1", trigger: "manual", started_at: 0, status: "running", nodes: [] };
         if (name === "listJobs") return { jobs: [], running: [] };
+        if (name === "cancelJobStep") {
+          if (arg === "boom") throw "the job store is busy";
+          return arg === "ended" ? false : true;
+        }
       },
     },
   ),
@@ -112,5 +116,20 @@ describe("live run logs", () => {
     const ids = Object.keys(logs).map(Number);
     expect(ids).toHaveLength(LIVE_LOG_RUNS);
     expect(Math.min(...ids)).toBe(4);
+  });
+});
+
+describe("stopping a step", () => {
+  it("says when it couldn't, and that the background runner's steps can't be stopped here", async () => {
+    const toast = vi.spyOn(useStore.getState(), "toast");
+    await useJobs.getState().cancelStep("ok", "n1");
+    expect(toast).not.toHaveBeenCalled();
+    await useJobs.getState().cancelStep("ended", "n1");
+    expect(toast).toHaveBeenLastCalledWith("The step wasn't stopped: it had already ended", "info");
+    await useJobs.getState().cancelStep("boom", "n1");
+    expect(toast).toHaveBeenLastCalledWith("The step couldn't be stopped: the job store is busy", "error");
+    useJobs.setState({ elsewhere: { bg: true }, running: {} });
+    await useJobs.getState().cancelStep("bg", "n1");
+    expect(toast).toHaveBeenLastCalledWith("This run belongs to the background runner: its steps can't be stopped from here", "info");
   });
 });

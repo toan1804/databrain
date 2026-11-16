@@ -113,7 +113,8 @@ pub fn create_job_schema() -> Value {
                         "folder": {"type": "string", "description": "export: folder (default Downloads)"},
                         "file": {"type": "string", "description": "export: file name; {step} {job} {date} {time} are filled in"}
                     },
-                    "required": ["name"]
+                    "required": ["name"],
+                    "additionalProperties": false
                 }
             },
             "schedule": {
@@ -124,11 +125,53 @@ pub fn create_job_schema() -> Value {
                     "every_minutes": {"type": "integer", "minimum": 1},
                     "daily_at": {"type": "string", "description": "HH:MM local time"},
                     "weekdays": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 6}, "description": "0 = Sunday; empty = every day"}
-                }
+                },
+                "additionalProperties": false
             }
         },
-        "required": ["name", "steps"]
+        "required": ["name", "steps"],
+        "additionalProperties": false
     })
+}
+
+/// Keys of a step in `create_job` / `update_job` (the schema's).
+const STEP_KEYS: &[&str] = &[
+    "name",
+    "action",
+    "connection",
+    "sql",
+    "after",
+    "target_connection",
+    "target_table",
+    "load_mode",
+    "key_columns",
+    "create_table",
+    "before_sql",
+    "after_sql",
+    "format",
+    "folder",
+    "file",
+];
+
+/// Keys of `schedule` the assistant may send.
+const SCHEDULE_KEYS: &[&str] = &["off", "every_minutes", "daily_at", "weekdays"];
+
+/// Refuse keys of `v` outside `allowed`, naming them: a setting the
+/// assistant can't make (a time zone, "run after", retries, an incremental
+/// column…) must not be dropped while the answer says it was set.
+pub fn refuse_unknown(v: &Value, allowed: &[&str], what: &str) -> Result<()> {
+    let Some(o) = v.as_object() else { return Ok(()) };
+    let unknown: Vec<&str> = o.keys().map(String::as_str).filter(|k| !allowed.contains(k)).collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(AiError::Policy(format!(
+        "{what} has no {} {}: the assistant can't set {}; only {} (the user sets the rest in the job panel)",
+        if unknown.len() == 1 { "argument" } else { "arguments" },
+        unknown.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", "),
+        if unknown.len() == 1 { "it" } else { "them" },
+        allowed.join(", ")
+    )))
 }
 
 fn s<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
@@ -205,6 +248,7 @@ fn valid_hhmm(t: &str) -> bool {
 
 fn parse_schedule(v: Option<&Value>) -> Result<JobSchedule> {
     let Some(v) = v.filter(|v| v.is_object()) else { return Ok(JobSchedule::default()) };
+    refuse_unknown(v, SCHEDULE_KEYS, "schedule")?;
     if v.get("off").and_then(|o| o.as_bool()) == Some(true) {
         return Ok(JobSchedule::default());
     }
@@ -257,6 +301,7 @@ pub fn build_job(args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Re
     let mut ids: HashMap<String, String> = HashMap::new();
     for (i, st) in steps.iter().enumerate() {
         let n = s(st, "name").ok_or_else(|| AiError::Policy(format!("step {} has no name", i + 1)))?;
+        refuse_unknown(st, STEP_KEYS, &format!("step \"{n}\""))?;
         if !valid_node_name(n) {
             return Err(AiError::Policy(format!("step name \"{n}\" must be a SQL identifier (letters, digits, _; no `__`; at most 63 characters)")));
         }
@@ -385,6 +430,7 @@ pub fn build_job(args: &Value, conns: &[ConnRef], taken: &HashSet<String>) -> Re
         last_scheduled_at: None,
         params: Default::default(),
         param_set: None,
+        limits: Default::default(),
         created_at: 0,
         updated_at: 0,
     };
@@ -616,19 +662,22 @@ pub fn changes(old: &Job, new: &Job) -> Vec<String> {
                 b.name.clear();
                 let name_in = |j: &Job, id: &str| j.nodes.iter().find(|x| x.id == id).map(|x| x.name.clone()).unwrap_or_default();
                 let deps = |j: &Job, id: &str| upstreams(j, id).iter().map(|u| name_in(j, u)).collect::<Vec<_>>();
+                // Compared as the tool writes them (trimmed, empty = none):
+                // a step sent back untouched is no change.
+                let t = |x: &Option<String>| x.as_deref().map(str::trim).filter(|x| !x.is_empty()).map(str::to_string);
                 let same = a.kind == b.kind
-                    && a.sql == b.sql
-                    && a.connection_id == b.connection_id
-                    && a.target_connection_id == b.target_connection_id
-                    && a.target_table == b.target_table
+                    && a.sql.trim() == b.sql.trim()
+                    && t(&a.connection_id) == t(&b.connection_id)
+                    && t(&a.target_connection_id) == t(&b.target_connection_id)
+                    && t(&a.target_table) == t(&b.target_table)
                     && a.load_mode == b.load_mode
                     && a.key_columns == b.key_columns
                     && a.create_table == b.create_table
-                    && a.load_before_sql == b.load_before_sql
-                    && a.load_after_sql == b.load_after_sql
+                    && t(&a.load_before_sql) == t(&b.load_before_sql)
+                    && t(&a.load_after_sql) == t(&b.load_after_sql)
                     && a.export_format == b.export_format
-                    && a.export_folder == b.export_folder
-                    && a.export_file == b.export_file;
+                    && t(&a.export_folder) == t(&b.export_folder)
+                    && t(&a.export_file) == t(&b.export_file);
                 if !same {
                     out.push(format!("changes step {}", n.name));
                 }
@@ -651,6 +700,9 @@ pub fn changes(old: &Job, new: &Job) -> Vec<String> {
                         n.name
                     ));
                 }
+                if a.limits != b.limits {
+                    out.push(format!("step {}: changes its time limit or retries", n.name));
+                }
             }
         }
     }
@@ -658,6 +710,9 @@ pub fn changes(old: &Job, new: &Job) -> Vec<String> {
         if !new.nodes.iter().any(|n| n.id == o.id) {
             out.push(format!("removes step {}", o.name));
         }
+    }
+    if old.limits != new.limits {
+        out.push("changes the job's time limits, retries or steps at once".into());
     }
     if old.schedule != new.schedule {
         out.push(if new.schedule.enabled { "changes the schedule".to_string() } else { "turns the schedule off".to_string() });
@@ -770,9 +825,13 @@ pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<Str
                 n.y = o.y;
                 n.last_run = o.last_run.clone();
                 n.id = o.id.clone();
-                // Settings the tool has no argument for stay as the user set them.
-                n.batch_rows = o.batch_rows;
-                n.batch_kb = o.batch_kb;
+                // Settings the tool has no argument for stay as the user set them
+                // (the load-only ones while the step still loads).
+                if n.kind == JobNodeKind::Load && o.kind == JobNodeKind::Load {
+                    n.batch_rows = o.batch_rows;
+                    n.batch_kb = o.batch_kb;
+                }
+                n.limits = o.limits.clone();
                 // A step with no connection runs on Results: sent back under
                 // that name it is the same step, not SQL the assistant moved.
                 if o.connection_id.as_deref().is_none_or(str::is_empty) && n.connection_id.as_deref() == results_id {
@@ -799,6 +858,8 @@ pub fn merge_job(old: &Job, args: &Value, conns: &[ConnRef], taken: &HashSet<Str
     // The job's parameter values and set are the user's: kept.
     job.params = old.params.clone();
     job.param_set = old.param_set.clone();
+    // So are its time limits, retries and steps at once.
+    job.limits = old.limits.clone();
     if args.get("schedule").is_none() {
         job.schedule = old.schedule.clone();
     }
@@ -1046,6 +1107,67 @@ mod tests {
         assert!(changes(&old, &fewer).iter().any(|x| x == "removes step daily"));
     }
 
+    /// A kept step keeps the settings the tool can't write (rows per
+    /// INSERT); a step that stops loading drops them.
+    #[test]
+    fn edits_keep_a_steps_load_settings() {
+        let c = conns();
+        let args = json!({"name": "j", "steps": [
+            {"name": "orders", "connection": "Sales PG", "sql": "select * from orders"},
+            {"name": "copy", "action": "load", "after": ["orders"], "target_connection": "Sales PG", "target_table": "public.copy"}
+        ]});
+        let (mut old, _) = build_job(&args, &c, &HashSet::new()).unwrap();
+        old.id = "J".into();
+        for (i, n) in old.nodes.iter_mut().enumerate() {
+            n.id = format!("n{i}");
+        }
+        old.edges = vec![databrain_workspace::JobEdge { from: "n0".into(), to: "n1".into() }];
+        old.nodes[1].batch_rows = Some(200);
+        let mut spec = spec_of(&old, &c);
+        spec["job"] = json!("j");
+        // Sent back as it is, or with other SQL: the settings stay.
+        let (same, _) = merge_job(&old, &spec, &c, &HashSet::new()).unwrap();
+        assert!(changes(&old, &same).is_empty(), "{:?}", changes(&old, &same));
+        spec["steps"][0]["sql"] = json!("select id, updated_at from orders");
+        let (new, _) = merge_job(&old, &spec, &c, &HashSet::new()).unwrap();
+        assert_eq!(new.nodes[1].batch_rows, Some(200));
+        assert_eq!(changes(&old, &new), vec!["changes step orders".to_string()]);
+        // A step that stops loading drops the load's settings.
+        spec["steps"][1] = json!({"name": "copy", "connection": "Results", "after": ["orders"], "sql": "select * from results.orders"});
+        let (q, _) = merge_job(&old, &spec, &c, &HashSet::new()).unwrap();
+        assert!(q.nodes[1].batch_rows.is_none());
+    }
+
+    /// Settings the assistant can't make are refused by name, not dropped:
+    /// in a step, in the schedule, at the top.
+    #[test]
+    fn arguments_the_assistant_cannot_set_are_refused() {
+        let c = conns();
+        let step = |extra: Value| {
+            let mut st = json!({"name": "orders", "connection": "Sales PG", "sql": "select 1"});
+            for (k, v) in extra.as_object().unwrap() {
+                st[k] = v.clone();
+            }
+            build_job(&json!({"name": "j", "steps": [st]}), &c, &HashSet::new()).map(|_| ()).map_err(|e| e.to_string())
+        };
+        assert!(step(json!({})).is_ok());
+        let e = step(json!({"incremental_column": "updated_at", "retries": 3})).unwrap_err();
+        assert!(e.contains("`incremental_column`") && e.contains("`retries`") && e.contains("step \"orders\""), "{e}");
+        let sched = |v: Value| {
+            build_job(&json!({"name": "j", "steps": [{"name": "orders", "connection": "Sales PG", "sql": "select 1"}], "schedule": v}), &c, &HashSet::new())
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        assert!(sched(json!({"daily_at": "06:30", "weekdays": [1]})).is_ok());
+        let e = sched(json!({"daily_at": "06:30", "time_zone": "UTC"})).unwrap_err();
+        assert!(e.contains("`time_zone`"), "{e}");
+        let e = sched(json!({"after_jobs": ["x"]})).unwrap_err();
+        assert!(e.contains("`after_jobs`"), "{e}");
+        assert!(refuse_unknown(&json!({"job": "j", "steps": [], "rename": {}}), &["job", "name", "steps", "schedule", "rename"], "update_job").is_ok());
+        let e = refuse_unknown(&json!({"name": "j", "steps": [], "limits": {}}), &["name", "steps", "schedule"], "create_job").unwrap_err().to_string();
+        assert!(e.contains("create_job") && e.contains("`limits`"), "{e}");
+    }
+
     fn old_step(_spec: &Value) -> Value {
         json!({"name": "orders", "connection": "Sales PG", "sql": "select * from orders"})
     }
@@ -1153,6 +1275,71 @@ mod tests {
     fn finds_results_references() {
         assert_eq!(results_refs("select * from results.a join RESULTS.\"b\" x, myresults.c, results.a"), vec!["a", "b"]);
     }
+
+    /// Where and how a step writes is part of who it belongs to: the
+    /// assistant pointing a user's load at another table, or switching it to
+    /// Sync, makes the step its own (the AI rules are checked on each run).
+    #[test]
+    fn changing_where_a_users_load_writes_makes_it_the_assistants() {
+        let c = conns();
+        let args = json!({"name": "j", "steps": [
+            {"name": "orders", "connection": "Sales PG", "sql": "select * from orders"},
+            {"name": "copy", "action": "load", "after": ["orders"], "target_connection": "Sales PG", "target_table": "public.copy"},
+            {"name": "file", "action": "export", "after": ["orders"], "folder": "/tmp/x"}
+        ]});
+        let (mut old, _) = build_job(&args, &c, &HashSet::new()).unwrap();
+        for (i, n) in old.nodes.iter_mut().enumerate() {
+            n.id = format!("n{i}");
+            n.ai_sql = false;
+        }
+        old.edges =
+            vec![databrain_workspace::JobEdge { from: "n0".into(), to: "n1".into() }, databrain_workspace::JobEdge { from: "n0".into(), to: "n2".into() }];
+        let mut spec = spec_of(&old, &c);
+        spec["job"] = json!("j");
+        // Unchanged: still the user's.
+        let (mut same, _) = merge_job(&old, &spec, &c, &HashSet::new()).unwrap();
+        mark_ai_sql(&mut same, Some(&old));
+        assert!(same.nodes.iter().all(|n| !n.ai_sql));
+        for (step, key, value) in
+            [(1, "target_table", json!("public.other")), (1, "load_mode", json!("sync")), (2, "folder", json!("/tmp/y")), (2, "format", json!("parquet"))]
+        {
+            let mut s2 = spec.clone();
+            s2["steps"][step][key] = value.clone();
+            if key == "load_mode" {
+                s2["steps"][step]["key_columns"] = json!(["id"]);
+            }
+            let (mut j, _) = merge_job(&old, &s2, &c, &HashSet::new()).unwrap();
+            mark_ai_sql(&mut j, Some(&old));
+            assert!(j.nodes[step].ai_sql, "{key} = {value}");
+            assert!(!j.nodes[0].ai_sql);
+        }
+    }
+
+    /// A step sent back untouched is no change, also when its SQL has
+    /// trailing spaces or a folder is empty (the tool trims what it reads).
+    #[test]
+    fn an_untouched_round_trip_is_no_change() {
+        let c = conns();
+        let args = json!({"name": "j", "steps": [
+            {"name": "orders", "connection": "Sales PG", "sql": "select 1"},
+            {"name": "file", "action": "export", "after": ["orders"]}
+        ]});
+        let (mut old, _) = build_job(&args, &c, &HashSet::new()).unwrap();
+        for (i, n) in old.nodes.iter_mut().enumerate() {
+            n.id = format!("n{i}");
+        }
+        old.edges = vec![databrain_workspace::JobEdge { from: "n0".into(), to: "n1".into() }];
+        old.nodes[0].sql = "select 1  \n".into();
+        old.nodes[1].export_folder = Some(String::new());
+        old.nodes[1].export_file = Some("  ".into());
+        let mut spec = spec_of(&old, &c);
+        spec["job"] = json!("j");
+        let (mut new, _) = merge_job(&old, &spec, &c, &HashSet::new()).unwrap();
+        assert!(changes(&old, &new).is_empty(), "{:?}", changes(&old, &new));
+        let before: Vec<bool> = old.nodes.iter().map(|n| n.ai_sql).collect();
+        mark_ai_sql(&mut new, Some(&old));
+        assert_eq!(new.nodes.iter().map(|n| n.ai_sql).collect::<Vec<_>>(), before);
+    }
 }
 
 #[cfg(test)]
@@ -1175,11 +1362,14 @@ mod params_tests {
                 .unwrap();
         old.params.insert("day".into(), databrain_connector_core::sql::ParamValue { value: "2026-11-01".into(), raw: false });
         old.param_set = Some("set1".into());
+        old.limits.retries = Some(2);
+        old.nodes[0].limits.timeout_secs = Some(60);
         let (merged, _) =
             merge_job(&old, &serde_json::json!({"steps": [{"name": "a", "connection": "Results", "sql": "select :day, 1"}]}), &refs, &Default::default())
                 .unwrap();
         assert_eq!(merged.params["day"].value, "2026-11-01");
         assert_eq!(merged.param_set.as_deref(), Some("set1"));
+        assert_eq!((merged.limits.retries, merged.nodes[0].limits.timeout_secs), (Some(2), Some(60)));
     }
 }
 

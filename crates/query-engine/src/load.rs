@@ -165,6 +165,11 @@ pub enum LoadEvent {
     Progress { phase: String, done: u64, total: u64 },
     /// A group of INSERTs finished (or failed: `error`, `sql` = the failing one).
     Inserted { label: String, table: String, rows: u64, statements: usize, sql: String, duration_ms: u64, error: Option<String> },
+    /// The load failed after it started writing. `kept_nothing`: it ran in
+    /// one transaction that was rolled back before any commit was sent, and
+    /// nothing in it commits on its own, so running it again can't write the
+    /// rows twice. (A load that fails before it writes sends nothing.)
+    Failed { kept_nothing: bool },
 }
 
 /// Receives [`LoadEvent`]s while a load runs.
@@ -587,9 +592,13 @@ impl QueryEngine {
         if let Some(tx) = &p.tx {
             timed(&p.session, "Start the transaction", Statement::internal(tx.begin), cancel, obs).await.map_err(|e| labelled("Start the transaction", e))?;
         }
+        // Once the commit is sent, a failure (a lost connection) may come
+        // after the server committed.
+        let mut committing = false;
         let result = async {
             let n = run_plan(&p, rows, rest.as_deref_mut(), cancel, None, obs).await?;
             if let Some(tx) = &p.tx {
+                committing = true;
                 timed(&p.session, "Commit", Statement::internal(tx.commit), cancel, obs).await.map_err(|e| labelled("Commit", e))?;
             }
             Ok::<(u64, u64), EngineError>(n)
@@ -611,6 +620,7 @@ impl QueryEngine {
                 Ok(LoadReport { rows: n, deleted, created_table: p.creates, transaction: p.tx.is_some(), notices })
             }
             Err(e) => {
+                obs.event(LoadEvent::Failed { kept_nothing: p.tx.is_some() && !p.may_commit && !committing });
                 if p.tx.is_some() && e.kind != "cancelled" {
                     obs.event(LoadEvent::Info("Rolling back the transaction: nothing is kept".into()));
                 }

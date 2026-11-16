@@ -179,6 +179,7 @@ impl ToolContext {
     }
 
     pub(super) async fn update_job(&self, args: &Value) -> Result<ToolOutput> {
+        crate::jobs::refuse_unknown(args, &["job", "name", "steps", "schedule", "rename"], "update_job")?;
         let old = self.find_job(arg(args, "job")?)?;
         let ws = self.engine.workspace();
         let taken: std::collections::HashSet<String> = ws.job_step_names()?.into_iter().filter(|(_, o)| o.job_id != old.id).map(|(n, _)| n).collect();
@@ -217,6 +218,7 @@ impl ToolContext {
     }
 
     pub(super) async fn create_job(&self, args: &Value) -> Result<ToolOutput> {
+        crate::jobs::refuse_unknown(args, &["name", "steps", "schedule"], "create_job")?;
         let ws = self.engine.workspace();
         let taken: std::collections::HashSet<String> = ws.job_step_names()?.into_iter().map(|(n, _)| n).collect();
         let refs = self.conn_refs()?;

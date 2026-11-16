@@ -4,6 +4,14 @@ Notable changes to DataBrain, newest first. The format follows [Keep a Changelog
 
 ## Unreleased
 
+### Added
+
+- **Jobs, limits and retries:** a time limit per run and per step (a step past its limit is stopped and fails), retries with growing waits after a connection error for steps that can't write twice (reads, saves to a file, loads rolled back as a whole), and a maximum of steps running at once in a job and on one connection (the others show as waiting).
+
+### Changed
+
+- Jobs run at most 4 steps at once, and 2 on one connection, unless the job's limits say otherwise. A step that doesn't stop within 30 s of being stopped is left behind, so the run ends.
+- A load step's dry run gets the job's parameters (SQL using them failed before).
 ### Security
 
 - **Jobs and the AI assistant:** SQL or rows the assistant chose no longer end up running as yours, outside its rules (found by an internal review; in 0.4.2 and earlier):

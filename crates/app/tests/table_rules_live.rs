@@ -119,6 +119,7 @@ fn ai_job(connection_id: &str, sql: &str) -> Job {
         export_file: None,
         export_format: FileFormat::Csv,
         ai_sql: true,
+        limits: Default::default(),
         last_run: None,
     };
     Job {
@@ -130,6 +131,7 @@ fn ai_job(connection_id: &str, sql: &str) -> Job {
         last_scheduled_at: None,
         params: Default::default(),
         param_set: None,
+        limits: Default::default(),
         created_at: 0,
         updated_at: 0,
     }

@@ -1,10 +1,38 @@
 // Pieces the job editor's parts share: status icon and text, progress bar,
 // step lists, field styles.
-import { FileDown, ArrowDownToLine, CheckCircle2, CircleDashed, Database, Loader2, XCircle } from "lucide-react";
+import { FileDown, ArrowDownToLine, CheckCircle2, CircleDashed, Database, Hourglass, Loader2, XCircle } from "lucide-react";
 import type { JobNode, NodeRunSummary, StepProgress } from "../../lib/types";
 import { formatCount, formatDuration, relativeTime } from "../../lib/util";
+import { useLayoutEffect, useRef } from "react";
 import { useStore } from "../../store";
 import { flushDrafts } from "../../drafts";
+
+/**
+ * Run `commit` (its latest version) when the component unmounts: a field
+ * saved on blur loses its text when the panel closes first (a click on a
+ * step unmounts it before the blur). A layout effect, so it runs before the
+ * job tab's own "save what's pending" on close.
+ */
+export function useCommitOnUnmount(commit: () => void) {
+  const ref = useRef(commit);
+  ref.current = commit;
+  useLayoutEffect(() => () => ref.current(), []);
+}
+
+/**
+ * A change to `T`: fields to set, or a function of the latest `T` (as it is
+ * when the change is applied) returning them, or null for no change. A
+ * field saved when the panel closes uses the function: the job may have
+ * changed meanwhile (the assistant's version shown), and spreading the copy
+ * it last saw would undo that.
+ */
+export type Patch<T> = Partial<T> | ((cur: T) => Partial<T> | null);
+
+/** `cur` with `patch` applied (`cur` itself when it changes nothing). */
+export function applyPatch<T extends object>(cur: T, patch: Patch<T>): T {
+  const p = typeof patch === "function" ? patch(cur) : patch;
+  return p ? { ...cur, ...p } : cur;
+}
 
 export const EDITOR_KEY = (job: string, node: string) => `job:${job}:${node}`;
 
@@ -24,6 +52,8 @@ export function StatusIcon({ status }: { status?: NodeRunSummary["status"] }) {
       return <CheckCircle2 size={12} className="shrink-0 text-success" />;
     case "error":
       return <XCircle size={12} className="shrink-0 text-danger" />;
+    case "waiting":
+      return <Hourglass size={12} className="shrink-0 text-muted" />;
     case "skipped":
     case "cancelled":
     case "pending":
@@ -33,19 +63,33 @@ export function StatusIcon({ status }: { status?: NodeRunSummary["status"] }) {
   }
 }
 
+/** "attempt 2 of 3" of a step that may be tried again (none for its first try while running). */
+export function attemptText(s: NodeRunSummary, running: boolean): string {
+  if (!s.attempt || !s.attempts || s.attempts < 2) return "";
+  if (running) return s.attempt > 1 ? `attempt ${s.attempt} of ${s.attempts}` : "";
+  return s.attempt > 1 ? `after ${s.attempt} tries` : "";
+}
+
 export function statusText(s: NodeRunSummary | null): string {
   if (!s || !s.status) return "Not run yet";
   switch (s.status) {
-    case "running":
-      return s.progress ? `${s.progress.phase}: ${formatCount(s.progress.done)} / ${formatCount(s.progress.total)}` : "Running…";
+    case "running": {
+      const tries = attemptText(s, true);
+      const doing = s.progress ? `${s.progress.phase}: ${formatCount(s.progress.done)} / ${formatCount(s.progress.total)}` : "Running…";
+      return tries ? `${doing} (${tries})` : doing;
+    }
     case "pending":
       return "Waiting for upstream steps";
+    case "waiting":
+      return s.error ? `Waiting: ${s.error}` : "Waiting for a free slot";
     case "skipped":
       return "Skipped: an upstream step failed";
     case "cancelled":
       return "Cancelled";
-    case "error":
-      return s.error ?? "Failed";
+    case "error": {
+      const tries = attemptText(s, false);
+      return `${s.error ?? "Failed"}${tries ? ` (${tries})` : ""}`;
+    }
     default:
       return `${s.rows != null ? `${formatCount(s.rows)} rows · ` : ""}${s.file ? `${s.file.split(/[/\\]/).pop()} · ` : ""}${formatDuration(s.duration_ms)}${s.finished_at ? ` · ${relativeTime(s.finished_at)}` : ""}`;
   }

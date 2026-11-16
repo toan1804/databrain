@@ -275,6 +275,13 @@ export const useJobs = create<JobsState>((set, get) => ({
     await api.cancelJob(id).catch(() => false);
   },
   cancelStep: async (id, nodeId) => {
-    await api.cancelJobStep(id, nodeId).catch(() => false);
+    const toast = useStore.getState().toast;
+    // The background runner's run is in another process: its steps can't be stopped from here.
+    if (get().elsewhere[id] && !get().running[id]) return toast("This run belongs to the background runner: its steps can't be stopped from here", "info");
+    try {
+      if (!(await api.cancelJobStep(id, nodeId))) toast("The step wasn't stopped: it had already ended", "info");
+    } catch (e) {
+      toast(`The step couldn't be stopped: ${toError(e).message}`, "error");
+    }
   },
 }));

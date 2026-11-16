@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;
 
-use super::{JobEdge, JobNode, JobSchedule, NodeRunSummary};
+use super::{JobEdge, JobNode, JobSchedule, NodeRunSummary, RunLimits};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export)]
@@ -29,6 +29,10 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub param_set: Option<String>,
+    /// Time limits, retries and steps at once of its runs.
+    #[serde(default, skip_serializing_if = "RunLimits::is_default")]
+    #[ts(as = "Option<RunLimits>", optional)]
+    pub limits: RunLimits,
     #[serde(default)]
     #[ts(as = "f64")]
     pub created_at: i64,

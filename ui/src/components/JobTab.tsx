@@ -16,7 +16,7 @@ import { MenuItem, MenuSeparator, Popover } from "./ui";
 import { JobPanel } from "./job/JobPanel";
 import { NodeCard } from "./job/NodeCard";
 import { NodePanel } from "./job/NodePanel";
-import { EDITOR_KEY, isResults, latestTab } from "./job/shared";
+import { EDITOR_KEY, applyPatch, isResults, latestTab, type Patch } from "./job/shared";
 
 const SAVE_DELAY = 600;
 const PANEL_KEY = "db.job.panel";
@@ -232,7 +232,16 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
   // Save what's pending when the tab closes.
   useEffect(() => () => void (dirty.current && persist()), [persist]);
 
-  const updateNode = useCallback((id: string, patch: Partial<JobNode>) => update((j) => updateStep(j, id, patch)), [update]);
+  const updateNode = useCallback(
+    (id: string, patch: Patch<JobNode>) =>
+      update((j) => {
+        const n = j.nodes.find((x) => x.id === id);
+        if (!n) return j;
+        const p = typeof patch === "function" ? patch(n) : patch;
+        return p ? updateStep(j, id, p) : j;
+      }),
+    [update],
+  );
 
   // The tab title follows the job's name.
   const name = job?.name;
@@ -679,7 +688,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
               canResume={canResume}
               onResume={() => void resume()}
               onRunWith={(params) => void start(undefined, params)}
-              onChange={(patch) => update((j) => ({ ...j, ...patch }))}
+              onChange={(patch) => update((j) => applyPatch(j, patch))}
               onSelect={(id) => setSel({ node: id })}
             />
           )}
@@ -689,7 +698,7 @@ export function JobTab({ tabId, jobId, visible }: { tabId: string; jobId: string
         <Popover x={menu.x} y={menu.y} onClose={() => setMenu(null)}>
           {menu.node ? (
             <>
-              {nodeStatus(byId.get(menu.node)!, run)?.status === "running" ? (
+              {["running", "waiting"].includes(nodeStatus(byId.get(menu.node)!, run)?.status ?? "") ? (
                 <MenuItem icon={<Square size={12} />} label="Stop this step" danger onClick={() => (setMenu(null), void useJobs.getState().cancelStep(jobId, menu.node!))} />
               ) : (
                 <MenuItem icon={<Play size={13} />} label="Run this step" disabled={running} onClick={() => (setMenu(null), void start([menu.node!]))} />

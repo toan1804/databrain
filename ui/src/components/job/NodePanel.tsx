@@ -13,8 +13,9 @@ import { openOutput } from "../../outputs";
 import { CellEditor } from "../Notebook";
 import { ExportFields } from "./ExportFields";
 import { LoadFields } from "./LoadFields";
+import { StepLimitFields } from "./LimitFields";
 import { RunLog } from "./RunLog";
-import { EDITOR_KEY, NodeList, ProgressBar, StatusIcon, actionIcon, field, isResults, label, latestTab, statusText } from "./shared";
+import { EDITOR_KEY, NodeList, ProgressBar, StatusIcon, actionIcon, field, isResults, label, latestTab, statusText, type Patch } from "./shared";
 import { outputNames } from "../../lib/sqlText";
 
 export function NodePanel({
@@ -36,7 +37,7 @@ export function NodePanel({
   /** The job's current or last run in this session. */
   run?: JobRun;
   running: boolean;
-  onChange: (patch: Partial<JobNode>) => void;
+  onChange: (patch: Patch<JobNode>) => void;
   onRun: () => void;
   onSelect: (id: string) => void;
   onDelete: () => void;
@@ -129,7 +130,7 @@ export function NodePanel({
             </div>
           )}
         </div>
-        {status?.status === "running" ? (
+        {status?.status === "running" || status?.status === "waiting" ? (
           <button className="btn-ghost mt-4 py-1 text-danger" onClick={() => void useJobs.getState().cancelStep(job.id, node.id)}>
             <Square size={12} /> Stop this step
           </button>
@@ -300,6 +301,8 @@ export function NodePanel({
       {node.kind === "export" && <ExportFields job={job} node={node} onChange={onChange} />}
 
       {node.kind === "load" && <LoadFields job={job} node={node} onChange={onChange} />}
+
+      <StepLimitFields job={job} node={node} onChange={onChange} />
 
       {(ups.length > 0 || downs.length > 0) && (
         <div className="grid grid-cols-2 gap-2 text-[11.5px]">

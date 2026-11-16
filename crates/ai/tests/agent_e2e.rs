@@ -1339,6 +1339,11 @@ async fn creates_a_job_across_connections() {
     assert!(c.call("run_job", &json!({"job": "Revenue by country", "steps": ["nope"]})).await.content.contains("has no step"));
     // Same again: nothing to change.
     assert!(c.call("update_job", &fix).await.content.starts_with("Nothing changes"));
+    // Arguments it can't set are refused by name (not dropped).
+    let mut extra = fix.clone();
+    extra["limits"] = json!({"retries": 3});
+    let e = c.call("update_job", &extra).await.content;
+    assert!(e.contains("`limits`"), "{e}");
 }
 
 /// The assistant's steps can't take a name the user's notebooks (or query

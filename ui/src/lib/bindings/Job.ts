@@ -3,6 +3,7 @@ import type { JobEdge } from "./JobEdge";
 import type { JobNode } from "./JobNode";
 import type { JobSchedule } from "./JobSchedule";
 import type { ParamValue } from "./ParamValue";
+import type { RunLimits } from "./RunLimits";
 
 export type Job = { id: string, name: string, nodes: Array<JobNode>, edges: Array<JobEdge>, schedule: JobSchedule, 
 /**
@@ -16,4 +17,8 @@ params?: { [key in string]?: ParamValue },
 /**
  * Saved parameter set (id) whose values the steps get.
  */
-param_set?: string, created_at: number, updated_at: number, };
+param_set?: string, 
+/**
+ * Time limits, retries and steps at once of its runs.
+ */
+limits?: RunLimits, created_at: number, updated_at: number, };

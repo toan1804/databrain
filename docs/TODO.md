@@ -72,6 +72,12 @@ A review of the fixes found fourteen bugs; they are fixed, with the refused case
 - **Query tips** don't see a column more than about 500 characters into a call as wrapped by it (`coalesce(` with thousands of arguments): the price of keeping long predicates fast.
 - **SQL text with no known dialect** (a query tip without a connection) is read as DuckDB reads it: `$$` opens a string.
 
+## Jobs (improvements of 2026-11-16)
+
+- **The assistant's job tools** can't set limits or retries.
+- **No retry test with a load** that fails with a connection error midway; the decision is unit-tested (`reads_only`, `retryable`, `LoadEvent::Failed { kept_nothing }`).
+- **Knowing what happened:** failures notify only on the desktop (no webhook or e-mail); a run doesn't record the job version it ran; 200 runs and 5,000 log lines per run are fixed, and a run's log can't be exported.
+- **Code:** step and run statuses are strings in Rust and the UI, not a shared enum; `execute` rescans every step after each one ends.
 ## AI job tools (review of 2026-11-17)
 
 The escapes found by the red-team review are fixed (see CHANGELOG, Security). Left:

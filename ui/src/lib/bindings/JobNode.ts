@@ -3,6 +3,7 @@ import type { FileFormat } from "./FileFormat";
 import type { JobNodeKind } from "./JobNodeKind";
 import type { LoadMode } from "./LoadMode";
 import type { NodeRunSummary } from "./NodeRunSummary";
+import type { StepLimits } from "./StepLimits";
 
 export type JobNode = { id: string, 
 /**
@@ -56,4 +57,8 @@ export_file?: string | null, export_format?: FileFormat,
  * step; a step the user changes becomes the user's, and the user can
  * clear it ("Trust this SQL"), never set it.
  */
-ai_sql?: boolean, last_run?: NodeRunSummary | null, };
+ai_sql?: boolean, 
+/**
+ * Its own time limit and retries (over the job's).
+ */
+limits?: StepLimits, last_run?: NodeRunSummary | null, };
